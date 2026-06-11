@@ -8,7 +8,7 @@ import type * as AST from '../../parser/ast.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { ColumnReferenceNode } from './reference.js';
-import { isAssertedKey } from '../util/fd-utils.js';
+import { isUniqueDeterminant } from '../util/fd-utils.js';
 
 export interface WindowSpec {
 	partitionBy: AST.Expression[];
@@ -262,7 +262,7 @@ export class WindowNode extends PlanNode implements UnaryRelationalNode {
 					const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 					if (leadIdx >= 0) {
 						const direction = this.windowSpec.orderBy[0]?.direction === 'desc' ? 'desc' : 'asc';
-						const strict = isAssertedKey(new Set([leadIdx]), sourcePhysical?.fds, sourceAttrs.length);
+						const strict = isUniqueDeterminant(new Set([leadIdx]), sourcePhysical?.fds, sourceAttrs.length, this.source.getType().isSet);
 						monotonicOn = [{ attrId: leadAttrId, direction, strict }];
 					}
 				}

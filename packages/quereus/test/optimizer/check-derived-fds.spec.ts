@@ -244,7 +244,7 @@ describe('extractCheckConstraints (unit)', () => {
 // ---------------------------------------------------------------------------
 
 interface PhysicalProps {
-	fds?: { determinants: number[]; dependents: number[] }[];
+	fds?: { determinants: number[]; dependents: number[]; kind: 'unique' | 'determination' }[];
 	equivClasses?: number[][];
 	constantBindings?: ConstantBinding[];
 	domainConstraints?: DomainConstraint[];
@@ -272,23 +272,25 @@ describe('CHECK-derived FDs/domains: end-to-end propagation', () => {
 	beforeEach(() => { db = new Database(); });
 	afterEach(async () => { await db.close(); });
 
-	// The one-way determination FD `{a}→{b}` from `check (b = a + 1)` is still
-	// *emitted* by check-extraction, but it folds onto the TableReference's
-	// physical FDs only when an endpoint is a real declared key — otherwise it is
-	// gated away (a narrow `select distinct a, b` over a non-keyed table would
-	// otherwise re-derive `{a}` as a phantom key and drop a REQUIRED DISTINCT,
-	// wrong results). Ticket `fd-oneway-determination-key-bag-overclaim`. Both
-	// arms pin the gate: absent when `a` is not a key, present when it is.
-	it('table with check (b = a + 1): the one-way FD a → b is GATED AWAY when a is not a key', async () => {
+	// The one-way determination FD `{a}→{b}` from `check (b = a + 1)` now folds
+	// onto the TableReference unconditionally as `kind: 'determination'`. The
+	// kind-aware readers (`isUniqueDeterminant`) never read a determination as a
+	// uniqueness claim, so a narrow `select distinct a, b` over a non-keyed table
+	// cannot re-derive `{a}` as a phantom key — the old producer-side gate
+	// (ticket fd-oneway-determination-key-bag-overclaim) is subsumed (ticket
+	// fd-determination-reader-side-rule). Both arms pin the kinds: a mere
+	// determination when `a` is not a key, upgradable to 'unique' when it is.
+	it('table with check (b = a + 1): the one-way FD a → b folds as a determination when a is not a key', async () => {
 		// `id` is the PK, so neither `a` (col 1) nor `b` (col 2) is a key.
 		await db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, CHECK (b = a + 1)) USING memory");
 		const rows = await planRows(db, 'SELECT * FROM t');
 		const props = physicalOf(rows, r => r.op === 'TABLEREF' || r.op === 'TABLEREFERENCE' || r.node_type === 'TableReference')
 			?? physicalOf(rows, r => r.op === 'SEQSCAN' || r.op === 'SEQ SCAN' || r.op === 'INDEXSCAN');
 		expect(props, 'expected physical props on a leaf').to.not.equal(undefined);
-		// `a` is column index 1, `b` is column index 2 — the one-way FD must be gated.
+		// `a` is column index 1, `b` is column index 2 — kept, as a pure value claim.
 		const fd = props!.fds?.find(fd => fd.determinants.length === 1 && fd.determinants[0] === 1 && fd.dependents.includes(2));
-		expect(fd, 'one-way FD a → b must be gated away (a is not a real key)').to.equal(undefined);
+		expect(fd, 'one-way FD a → b folds as a determination').to.not.equal(undefined);
+		expect(fd!.kind, 'a is not a key ⇒ a pure value claim').to.equal('determination');
 	});
 
 	it('table with check (b = a + 1): the one-way FD a → b is PRESENT when a is the PK', async () => {

@@ -89,24 +89,24 @@ describe('extractBindings: BindingMode per TableReference', () => {
 		expect((entry.mode as { kind: 'row'; keyColumns: number[] }).keyColumns).to.deep.equal([]);
 	});
 
-	it("emits 'row' on the implicit all-columns key for a CHECK (a=b) NON-keyed table (bi-FD gated)", async () => {
+	it("emits 'row' on the derived sub-key {a} for a CHECK (a=b) NON-keyed table", async () => {
 		// `t(a, b)` has no declared PK — only Quereus' implicit all-columns key
-		// {a,b} — so the classification is 'row' regardless. CHECK (a = b) emits the
-		// bi-directional determination FD {a}↔{b}, but the TableReference gate
-		// (ticket fd-check-assertion-key-bag-overclaim) folds that value-equality
-		// pair only when one endpoint is a genuine *declared* key; here neither is,
-		// so it is dropped. Dropping is the sound choice: deriving {a} as a sub-PK
-		// key is sound at this 2-col node only because the all-columns key co-holds,
-		// but the same FD survives a projection that strips that key (the
-		// wrong-results bug this ticket closes). With no FD-derived sub-PK key,
-		// equality on `a` binds on the full implicit key [0, 1]. (Pre-gate this
-		// asserted the tighter [0].)
+		// {a,b} — so the classification is 'row' regardless. CHECK (a = b) folds the
+		// bi-directional determination FD {a}↔{b} unconditionally (the producer
+		// gate from fd-check-assertion-key-bag-overclaim is gone). At this node the
+		// relation IS a set (the implicit all-columns key), so the kind-aware reader
+		// (`isUniqueDeterminant`, ticket fd-determination-reader-side-rule) derives
+		// the tighter genuine key {a}: two rows agreeing on `a` would agree on `b`
+		// too — a duplicate, impossible in a set. The old projection-stripping
+		// hazard is closed on the reader side: a projection that drops the
+		// all-columns key yields a bag, where the same determination derives
+		// nothing. Equality on `a` therefore binds on [0].
 		await db.exec("CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a = b)) USING memory");
 		const result = analyze(db, 'select * from t where a = 5');
 		const entry = findFor(result, 'main.t');
 		expect(entry.mode!.kind).to.equal('row');
 		const cols = (entry.mode as { kind: 'row'; keyColumns: number[] }).keyColumns;
-		expect(cols).to.deep.equal([0, 1]);
+		expect(cols).to.deep.equal([0]);
 	});
 
 	it("emits 'group' with groupColumns when GROUP BY pk covers PK", async () => {

@@ -531,11 +531,9 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		// crossProduct: fold pairwise — column-layout-wise identical to N
 		// applications of JoinNode(cross). Each child's FDs hold on its slice of
 		// the output row; concatenation preserves them after shifting column
-		// indices. NOTE: unlike JoinNode(cross) this fold never applied
-		// `dropSideKeyFds` to non-preserved sides — a known gap, deliberately NOT
-		// closed in the kind-provenance phase (the downgrade below records the
-		// uniqueness loss on the FD itself; the reader-side kind rule makes the
-		// drop obsolete).
+		// indices. The kind downgrade below records uniqueness loss on the FD
+		// itself; the kind-aware readers (ticket fd-determination-reader-side-rule)
+		// make any side-key FD drop unnecessary — JoinNode now matches.
 		//
 		// Kind downgrade: a child's 'unique' FD stays 'unique' only when every
 		// OTHER child is provably ≤1-row (the child's rows are never duplicated);
@@ -547,12 +545,11 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		// `inds` in this wave, so we leave it undefined rather than carry it
 		// through AsyncGather. Revisit when a consumer lands.
 		const childColCounts = this.children.map(c => c.getType().columns.length);
-		// NOTE: `hasSingletonFd` is pure closure coverage and can over-claim ≤1-row
-		// from 'determination' constant pins on a bag (phase-2 ticket
-		// fd-determination-reader-side-rule, bug 1). Its kind-aware rewrite there
-		// makes this probe — and therefore the keep-'unique' decision — sound.
+		// `hasSingletonFd` is kind-aware (ticket fd-determination-reader-side-rule):
+		// 'determination' constant pins on a bag no longer over-claim ≤1-row, so
+		// this probe — and therefore the keep-'unique' decision — is sound.
 		const childIsSingleton = childrenPhysical.map((phys, i) =>
-			hasSingletonFd(phys.fds, childColCounts[i]));
+			hasSingletonFd(phys.fds, childColCounts[i], this.children[i].getType().isSet));
 		const kindAdjustedFds = (idx: number): ReadonlyArray<FunctionalDependency> => {
 			const childFds = childrenPhysical[idx].fds ?? [];
 			const keepUnique = childIsSingleton.every((s, j) => j === idx || s);

@@ -8,7 +8,7 @@ import { StatusCode } from '../../common/types.js';
 import { PredicateCapable, type PredicateSourceCapable } from '../framework/characteristics.js';
 import { createTableInfoFromNode, extractConstraints } from '../analysis/constraint-extractor.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
-import { addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, foldSingleSingleGated, isSuperkey, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
+import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
 import { deriveFilterAttributeDefaults } from '../analysis/update-lineage.js';
 
 /**
@@ -98,7 +98,6 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			attrIdToIndex,
 			isColumnNonNullable,
 			isColumnNumeric,
-			sourceAttrs.length,
 		);
 		let fds: ReadonlyArray<FunctionalDependency> = activation.fds;
 		// A value-equality body activated by the guard contributes its equality as an EC
@@ -109,20 +108,16 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			constantBindings = closeConstantBindingsOverEcs(constantBindings, equivClasses);
 		}
 
-		// Predicate-derived FDs. The `∅ → col` constant FDs are always sound to fold.
-		// A `col1 = col2` conjunct also yields the bi-directional determination
-		// `{a}↔{b}` (via `extractEqualityFds`), which is a uniqueness claim only when
-		// one endpoint is a genuine key here. Over a narrow relation of non-unique
-		// columns (`select a, b from t where a = b`) it would otherwise let
-		// `deriveKeysFromFds` read a phantom all-columns key (a bag as a set). Gate the
-		// two-column determination FDs on endpoint superkey-ness against the filter's
-		// INPUT FDs (the genuine keys present before these equality FDs are added); the
-		// EC merge above already carries the equality unconditionally. `extractEqualityFds`
-		// is left untouched — it is shared with predicate-inference. (ticket
-		// fd-derived-key-bag-overclaim)
-		const inputFds = sourcePhysical?.fds ?? [];
-		const colCount = sourceAttrs.length;
-		fds = foldSingleSingleGated(fds, predFds, inputFds, colCount);
+		// Predicate-derived FDs fold unconditionally. They are all
+		// `kind: 'determination'` (`extractEqualityFds`: constant pins `∅ → col`
+		// and `col1 = col2` mirrors), and the kind-aware readers
+		// (`isUniqueDeterminant`) never read a determination as a uniqueness
+		// claim — the endpoint gate that used to live here is subsumed (ticket
+		// fd-determination-reader-side-rule, replacing the
+		// fd-derived-key-bag-overclaim producer gate).
+		for (const fd of predFds) {
+			fds = addFd(fds, fd);
+		}
 
 		// Attempt logical covered-key detection: if equality conjuncts cover a
 		// unique key on the source table, the Filter emits at-most-one row. Encode
@@ -231,34 +226,30 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 /**
  * Walk inherited FDs and, for each one carrying a `guard`, ask
  * `predicateImpliesGuard` whether the surrounding predicate entails the guard.
- * Entailed guarded FDs are replaced with their unconditional twin (`stripGuard`).
- * Unentailed guarded FDs pass through unchanged so a later Filter / Join can
- * still activate them once additional facts land.
+ * Entailed guarded FDs are replaced with their unconditional twin (`stripGuard`,
+ * kind-preserving). Unentailed guarded FDs pass through unchanged so a later
+ * Filter / Join can still activate them once additional facts land.
  *
- * Any activated **single↔single** determination FD `{a}→{b}` is read by
- * `deriveKeysFromFds` as a uniqueness claim — sound only when an endpoint is a
- * genuine key (else a narrow `select distinct a, b` re-derives a phantom
- * all-columns key, a bag as a set, and drops a REQUIRED DISTINCT). So the fold is
- * gated on endpoint superkey-ness against the filter's INPUT keys for **every**
- * single↔single activated FD, regardless of its origin: a guarded value-equality
- * body (`status <> 'active' or a = b` → mirror `{a}↔{b}`), a one-way determination
- * (`… or b = a + 1` → `{a}→{b}`), and an index-derived guarded pair all over-claim
- * identically. Gating on the FD SHAPE (not the `valueEquality` marker) is required
- * for soundness because `shiftFds`/`projectFds` DROP the marker, so a value-equality
- * FD activated through a join/projection arrives unmarked and would otherwise fold
- * ungated. (Multi-dependent key FDs like `{c}→{id,region,amt}` from a partial UNIQUE
- * are NOT single↔single and pass through — a genuinely unique determinant.)
+ * Activation is unconditional for every entailed FD — there is no endpoint
+ * gate. Soundness lives on the reader side: a guarded determination activates
+ * as a determination, which the kind-aware readers (`isUniqueDeterminant`)
+ * never read as a uniqueness claim; a guarded 'unique' FD (partial UNIQUE
+ * index) activates as 'unique', which is sound at the activating Filter (its
+ * rows all satisfy the guard, and filtering only shrinks the row set —
+ * fan-out hazards are handled by the join-side kind downgrade, not here).
+ * (ticket fd-determination-reader-side-rule, replacing the
+ * fd-guarded-activation / fd-oneway-guard-activation producer gates.)
  *
- * A genuine value-equality additionally surfaces its equality as an EC (returned via
- * `activatedEquivPairs`, lifted by the caller; `keysOf` never reads ECs, so the EC is
- * sound regardless of key-ness). The EC lift — and ONLY the EC lift — keys off the
- * `valueEquality` marker, NOT the FD shape, because a coincidental mutual-determination
- * mirror (two partial UNIQUE indexes on a 2-col table, or `b=a+1` + `a=b-1` checks) is
- * structurally identical to a value-equality pair but does NOT hold `a = b`; lifting an
- * EC there would be unsound. Losing the marker (join/projection path) therefore loses
- * only the EC optimization — an under-claim — never soundness. Returns the activated FD
- * set plus any value-equality pairs to lift as ECs.
- * (tickets fd-guarded-activation-key-bag-overclaim site 7, fd-oneway-guard-activation-key-bag-overclaim; mirrors site 5.)
+ * A genuine value-equality additionally surfaces its equality as an EC (returned
+ * via `activatedEquivPairs`, lifted by the caller; `keysOf` never reads ECs, so
+ * the EC is sound regardless of key-ness). The EC lift — and ONLY the EC lift —
+ * keys off the `valueEquality` marker, NOT the FD shape, because a coincidental
+ * mutual-determination mirror (two partial UNIQUE indexes on a 2-col table, or
+ * `b=a+1` + `a=b-1` checks) is structurally identical to a value-equality pair
+ * but does NOT hold `a = b`; lifting an EC there would be unsound. Losing the
+ * marker (the `shiftFds`/`projectFds` join/projection path — though phase 1 made
+ * it durable through both) would lose only the EC optimization — an under-claim —
+ * never soundness.
  */
 function activateGuardedFds(
 	sourceFds: ReadonlyArray<FunctionalDependency>,
@@ -268,7 +259,6 @@ function activateGuardedFds(
 	attrIdToIndex: ReadonlyMap<number, number>,
 	isColumnNonNullable: (col: number) => boolean,
 	isColumnNumeric: (col: number) => boolean,
-	colCount: number,
 ): { fds: FunctionalDependency[]; activatedEquivPairs: Array<[number, number]> } {
 	const out: FunctionalDependency[] = [];
 	const activatedEquivPairs: Array<[number, number]> = [];
@@ -278,30 +268,8 @@ function activateGuardedFds(
 			continue;
 		}
 		if (predicateImpliesGuard(predicate, fd.guard, ecs, bindings, attrIdToIndex, isColumnNonNullable, isColumnNumeric)) {
-			if (fd.determinants.length === 1 && fd.dependents.length === 1) {
-				// A single↔single activated determination FD `{a}→{b}` is read by
-				// `deriveKeysFromFds` as a uniqueness claim, sound only when an endpoint
-				// is a genuine key — else a narrow `select distinct a, b` re-derives a
-				// phantom all-columns key (a bag as a set) and drops a REQUIRED DISTINCT.
-				// Gate the fold on endpoint superkey-ness against the filter's INPUT keys
-				// for ALL single↔single activated FDs — NOT just `valueEquality`-tagged
-				// ones — because (a) the marker is dropped by shiftFds/projectFds, so a
-				// value-equality FD activated through a join/projection would otherwise
-				// fold ungated (wrong results), and (b) a one-way `{a}→{b}` (`b = a + 1`)
-				// over-claims identically. `isSuperkey` probes `sourceFds`, whose guarded
-				// FDs `computeClosure` skips, so only genuine unguarded input keys count
-				// (matching the site-4 / site-5 gates). A genuine value-equality
-				// additionally lifts its equality as an EC (sound, never read by `keysOf`);
-				// the `valueEquality` marker gates ONLY that EC lift, never the fold.
-				const a = fd.determinants[0];
-				const b = fd.dependents[0];
-				if (fd.valueEquality === true) {
-					activatedEquivPairs.push([a, b]);
-				}
-				if (!isSuperkey(new Set([a]), sourceFds, colCount)
-					&& !isSuperkey(new Set([b]), sourceFds, colCount)) {
-					continue;
-				}
+			if (fd.valueEquality === true && fd.determinants.length === 1 && fd.dependents.length === 1) {
+				activatedEquivPairs.push([fd.determinants[0], fd.dependents[0]]);
 			}
 			out.push(stripGuard(fd));
 		} else {

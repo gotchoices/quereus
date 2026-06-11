@@ -111,8 +111,8 @@ describe('FD kind provenance (phase 1)', () => {
 
 	describe('propagateJoinFds fan-out downgrade', () => {
 		// Left side: 3 columns. {0}→{1} is a 'unique' NON-key FD on the side (its
-		// closure misses column 2), so dropSideKeyFds keeps it and the downgrade
-		// is observable. The guarded twin must downgrade too.
+		// closure misses column 2), so the downgrade is observable on it. The
+		// guarded twin must downgrade too.
 		const leftFds: FunctionalDependency[] = [
 			{ determinants: [0], dependents: [1], kind: 'unique' },
 			{ determinants: [0], dependents: [1, 2], guard, kind: 'unique' },

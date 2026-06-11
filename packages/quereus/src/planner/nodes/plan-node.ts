@@ -30,9 +30,11 @@ export interface MonotonicOnInfo {
  * - `determinants` empty means "constant": the dependents take a single value
  *   for every row in the relation. An FD `∅ → all_cols` is the canonical
  *   marker for an "at-most-one-row" relation.
- * - A unique key `K` is encoded as the FD `K → (all_cols \ K)`. Consumers ask
- *   "is K a superkey?" via `isSuperkey(K, fds, columnCount)` from
- *   `planner/util/fd-utils.ts`.
+ * - A unique key `K` is encoded as the FD `K → (all_cols \ K)` with
+ *   `kind: 'unique'`. Consumers ask "is K row-unique?" via
+ *   `isUniqueDeterminant(K, fds, columnCount, isSet)` from
+ *   `planner/util/fd-utils.ts`; pure value coverage (no uniqueness claim) is
+ *   `closureCoversAll`.
  * - The set is non-canonical — only the FDs each operator can prove are
  *   stored. Use `computeClosure` to derive what a set of attributes implies.
  * - The full-relation case (`K = all_cols`, i.e. set semantics with no smaller
@@ -364,8 +366,8 @@ export interface PhysicalProperties {
    * Functional dependencies that hold over the output stream. The canonical
    * representation of "what determines what" — unique keys are encoded as
    * FDs `K → (all_cols \ K)`, and `∅ → all_cols` encodes "at-most-one-row".
-   * Use `computeClosure` / `isSuperkey` / `hasAnyKey` / `hasSingletonFd`
-   * from `planner/util/fd-utils.ts` to query them.
+   * Use `computeClosure` / `isUniqueDeterminant` / `hasAnyKey` /
+   * `hasSingletonFd` from `planner/util/fd-utils.ts` to query them.
    */
   fds?: ReadonlyArray<FunctionalDependency>;
 

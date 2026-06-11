@@ -8,7 +8,7 @@ import { StatusCode } from '../../common/types.js';
 import { extractOrderingFromSortKeys } from '../framework/physical-utils.js';
 import { SortCapable } from '../framework/characteristics.js';
 import { ColumnReferenceNode } from './reference.js';
-import { isAssertedKey } from '../util/fd-utils.js';
+import { isUniqueDeterminant } from '../util/fd-utils.js';
 
 /**
  * Represents a sort key for ordering results
@@ -78,8 +78,8 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		const ordering = extractOrderingFromSortKeys(this.sortKeys, sourceAttributes);
 
 		// Establish monotonicOn from the leading sort key when it is a trivial
-		// column reference. Strict iff the input was unique on that single column —
-		// equivalent to `{leadIdx}` being a superkey of the source's columns.
+		// column reference. Strict iff the input is provably row-unique on that
+		// single column (`isUniqueDeterminant` — kind-aware, not mere coverage).
 		let monotonicOn: readonly MonotonicOnInfo[] | undefined;
 		if (this.sortKeys.length > 0) {
 			const leadingKey = this.sortKeys[0];
@@ -87,7 +87,7 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 				const leadAttrId = leadingKey.expression.attributeId;
 				const leadIdx = this.source.getAttributeIndex().get(leadAttrId) ?? -1;
 				if (leadIdx >= 0) {
-					const strict = isAssertedKey(new Set([leadIdx]), sourcePhysical?.fds, sourceAttributes.length);
+					const strict = isUniqueDeterminant(new Set([leadIdx]), sourcePhysical?.fds, sourceAttributes.length, this.source.getType().isSet);
 					monotonicOn = [{
 						attrId: leadAttrId,
 						direction: leadingKey.direction,

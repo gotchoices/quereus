@@ -120,8 +120,8 @@ export class PlanNodeCharacteristics {
 
 	/**
 	 * True iff the relation is guaranteed to produce at most one row — i.e.,
-	 * the singleton FD `∅ → all_cols` holds. (Replaces the legacy `[[]]`
-	 * uniqueKeys marker.)
+	 * the kind-aware ≤1-row read (`hasSingletonFd`) holds. (Replaces the legacy
+	 * `[[]]` uniqueKeys marker.)
 	 */
 	static guaranteesUniqueRows(node: PlanNode): boolean {
 		if (!isRelationalNode(node)) return false;
@@ -131,18 +131,18 @@ export class PlanNodeCharacteristics {
 			// since the singleton FD isn't representable.
 			return node.physical.estimatedRows === 1;
 		}
-		return hasSingletonFd(node.physical.fds, colCount);
+		return hasSingletonFd(node.physical.fds, colCount, node.getType().isSet);
 	}
 
 	/**
 	 * True iff the relation has at least one non-trivial unique key — i.e., an
-	 * FD whose determinants form a superkey of all output columns, with the
-	 * determinant set strictly smaller than the full column list.
+	 * FD whose determinants are provably row-unique over all output columns,
+	 * with the determinant set strictly smaller than the full column list.
 	 */
 	static hasUniqueKeys(node: PlanNode): boolean {
 		if (!isRelationalNode(node)) return false;
 		const colCount = node.getAttributes().length;
-		return hasAnyKey(node.physical.fds, colCount);
+		return hasAnyKey(node.physical.fds, colCount, node.getType().isSet);
 	}
 
 	// Relational capabilities

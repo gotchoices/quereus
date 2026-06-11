@@ -258,9 +258,10 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
       const bareOut = map.get(srcIdx);
       if (bareOut === undefined || bareOut === outIdx) continue;
       // Injective-pair FDs are value bijections, not uniqueness claims —
-      // 'determination'. Note this site (unlike project-node) has no endpoint
-      // superkey gate; the 'determination' kind is what keeps that omission
-      // harmless once readers consult kind.
+      // 'determination', emitted unconditionally. The kind-aware readers
+      // (`isUniqueDeterminant`) never derive a key from a determination on a
+      // bag, so no endpoint gate is needed (project-node now matches; ticket
+      // fd-determination-reader-side-rule).
       fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx], kind: 'determination' }, { keyHints: projectedKeys });
       fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut], kind: 'determination' }, { keyHints: projectedKeys });
     }

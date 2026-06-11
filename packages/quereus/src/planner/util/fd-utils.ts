@@ -604,11 +604,16 @@ export function superkeyToFd(
 }
 
 /**
- * True iff the closure of `attrs` under `fds` covers `{0..columnCount-1}` —
- * i.e., `attrs` is a superkey of the relation. Replaces the legacy "covers a
- * `uniqueKeys` entry" check; FDs are the canonical surface now.
+ * True iff the closure of `attrs` under `fds` covers `{0..columnCount-1}`.
+ * COVERAGE ONLY — this is a pure value-determination claim and says NOTHING
+ * about row-uniqueness: over a bag, a determination-only closure path can
+ * cover every column while the relation still holds duplicate rows. For the
+ * uniqueness question ("at most one row per attrs-tuple?") use
+ * `isUniqueDeterminant`. (Renamed from `isSuperkey`, whose name read as a
+ * uniqueness claim and invited exactly that misuse — ticket
+ * `fd-determination-reader-side-rule`.)
  */
-export function isSuperkey(
+export function closureCoversAll(
 	attrs: ReadonlySet<number>,
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
@@ -622,78 +627,60 @@ export function isSuperkey(
 }
 
 /**
- * Fold each producer FD from `producerFds` onto `fds`, gating every
- * single↔single `{a}→{b}` FD on endpoint superkey-ness against `keyProbeFds`.
+ * True iff `attrs` is provably row-unique on the relation: its FD closure
+ * covers every column AND uniqueness is reachable —
+ *   - the relation is a set (two rows agreeing on `attrs` would agree on all
+ *     columns = a duplicate, impossible in a set), or
+ *   - some unguarded `kind: 'unique'` FD has determinants ⊆ closure(attrs)
+ *     (rows agreeing on `attrs` agree on that unique determinant set; ≤1 row
+ *     per its tuple ⇒ ≤1 row per attrs-tuple).
  *
- * A determination / value-equality FD whose determinant AND dependent are both
- * single columns is read by `deriveKeysFromFds` as a uniqueness claim — sound
- * only when one endpoint is a genuine key here. Over a narrow non-unique
- * relation (`check (a = b)` ⇒ `{a}↔{b}`, or `check (b = a + 1)` ⇒ `{a}→{b}`,
- * then `select distinct a, b`) it would otherwise let `deriveKeysFromFds` read
- * a phantom all-columns key (a bag as a set) and `rule-distinct-elimination`
- * drop a REQUIRED DISTINCT (wrong results). So a single↔single FD folds only
- * when `a` or `b` is a superkey of `keyProbeFds`; otherwise it is dropped — a
- * sound under-claim. The gate keys off the FD SHAPE, NOT any `valueEquality`
- * marker, because `shiftFds`/`projectFds` drop the marker and a marker-gated
- * fold would resurface the over-claim through a join/projection.
+ * Coverage alone (a determination-only closure path over a bag) proves
+ * nothing — that is the over-claim family the kind-aware readers exist to
+ * prevent (ticket `fd-determination-reader-side-rule`). This is the single
+ * reader-side uniqueness primitive; producers no longer gate determinations.
  *
- * Everything else passes through unchanged: `∅ → col` constant FDs and
- * multi-dependent key FDs (e.g. `{c}→{id,region,amt}` from a partial UNIQUE —
- * a genuinely unique determinant).
- *
- * `skipGuarded` controls guarded-FD handling. When set (table-reference
- * producer fold), a guarded FD passes through UNTOUCHED — it never participates
- * in key derivation until Filter activation, which gates it there instead
- * (`activateGuardedFds`). Filter predicate-derived FDs are already unguarded,
- * so that caller leaves `skipGuarded` off.
- *
- * Shared by `TableReferenceNode.computePhysical` (CHECK / assertion-hoisted
- * producers, `skipGuarded`) and `FilterNode.computePhysical` (predicate equality
- * FDs). The EC merge stays unconditional in each caller. See tickets
- * `fd-derived-key-bag-overclaim`, `fd-check-assertion-key-bag-overclaim`,
- * `fd-oneway-determination-key-bag-overclaim`.
+ * Guarded FDs participate in neither branch: `computeClosure` skips them, and
+ * only UNguarded 'unique' FDs can witness (a guarded uniqueness claim holds
+ * only under its predicate, which this layer cannot see).
  */
-export function foldSingleSingleGated(
-	fds: ReadonlyArray<FunctionalDependency>,
-	producerFds: ReadonlyArray<FunctionalDependency>,
-	keyProbeFds: ReadonlyArray<FunctionalDependency>,
-	colCount: number,
-	opts: { skipGuarded?: boolean } = {},
-): ReadonlyArray<FunctionalDependency> {
-	const skipGuarded = opts.skipGuarded === true;
-	let out = fds;
-	for (const fd of producerFds) {
-		if (
-			(!skipGuarded || fd.guard === undefined) &&
-			fd.determinants.length === 1 &&
-			fd.dependents.length === 1
-		) {
-			const a = fd.determinants[0];
-			const b = fd.dependents[0];
-			if (
-				!isSuperkey(new Set([a]), keyProbeFds, colCount) &&
-				!isSuperkey(new Set([b]), keyProbeFds, colCount)
-			) {
-				continue;
-			}
-		}
-		out = addFd(out, fd);
+export function isUniqueDeterminant(
+	attrs: ReadonlySet<number>,
+	fds: ReadonlyArray<FunctionalDependency> | undefined,
+	columnCount: number,
+	isSet: boolean,
+): boolean {
+	const fdList = fds ?? [];
+	const closure = computeClosure(attrs, fdList);
+	for (let i = 0; i < columnCount; i++) {
+		if (!closure.has(i)) return false;
 	}
-	return out;
+	if (isSet) return true;
+	return fdList.some(fd =>
+		fd.guard === undefined &&
+		fd.kind === 'unique' &&
+		fd.determinants.every(d => closure.has(d)),
+	);
 }
 
 /**
  * Enumerate the minimal full-cover key sets discoverable from `fds`: for each
- * FD `K → Y` whose closure covers all columns, return `K` (greedily minimized
- * within `K`). Deduplicated by set equality.
+ * FD `K → Y` where `K` is a provably row-unique determinant
+ * (`isUniqueDeterminant` — coverage AND uniqueness reachability), return `K`
+ * (greedily minimized within `K`). Deduplicated by set equality.
  *
- * Excludes the trivial "all-columns is a superkey" tautology — only FDs with
- * `K ⊊ all_cols` are considered, since the all-cols case is encoded via
- * `RelationType.isSet`.
+ * `minimalCover` preserves the closure, so the minimized key keeps both
+ * coverage and the unique witness (witness determinants ⊆ the unchanged
+ * closure).
+ *
+ * Excludes the trivial "all-columns is a key of a set" tautology — only FDs
+ * with `K ⊊ all_cols` are considered, since the all-cols case is encoded via
+ * `RelationType.isSet` (the `keysOf` fallback).
  */
 export function deriveKeysFromFds(
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
+	isSet: boolean,
 ): number[][] {
 	if (!fds || fds.length === 0) return [];
 	const results: number[][] = [];
@@ -702,10 +689,8 @@ export function deriveKeysFromFds(
 		if (fd.guard !== undefined) continue;
 		if (fd.determinants.length >= columnCount) continue;
 		const det = new Set(fd.determinants);
-		if (!isSuperkey(det, fds, columnCount)) continue;
+		if (!isUniqueDeterminant(det, fds, columnCount, isSet)) continue;
 		const minimal = minimalCover(det, fds);
-		// Ensure the minimal cover still covers all columns (it should — minimalCover
-		// only drops attrs whose removal doesn't change closure).
 		const sorted = Array.from(minimal).sort((a, b) => a - b);
 		const key = sorted.join(',');
 		if (seen.has(key)) continue;
@@ -717,39 +702,45 @@ export function deriveKeysFromFds(
 
 /**
  * True iff the FD set encodes any non-trivial key — i.e., there exists some
- * FD whose determinants form a superkey of `columnCount` columns with the
- * determinant set strictly smaller than all columns. This is the FD-surface
- * replacement for "the relation has a known unique key smaller than its full
- * column list" (the old `uniqueKeys.length > 0` check), excluding the
- * tautological all-columns case which carries no information.
+ * FD whose determinants are a provably row-unique determinant set
+ * (`isUniqueDeterminant`) strictly smaller than all columns. This is the
+ * FD-surface replacement for "the relation has a known unique key smaller
+ * than its full column list" (the old `uniqueKeys.length > 0` check),
+ * excluding the tautological all-columns case which carries no information.
  */
 export function hasAnyKey(
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
+	isSet: boolean,
 ): boolean {
 	if (!fds || fds.length === 0) return false;
 	return fds.some(fd =>
 		fd.guard === undefined &&
 		fd.determinants.length < columnCount &&
-		isSuperkey(new Set(fd.determinants), fds, columnCount),
+		isUniqueDeterminant(new Set(fd.determinants), fds, columnCount, isSet),
 	);
 }
 
 /**
- * True iff the relation has at-most-one-row — i.e., some FD `∅ → Y` exists
- * whose closure covers every column. Replaces the legacy `[[]]` singleton
- * marker on `uniqueKeys`.
+ * True iff the relation is provably at-most-one-row from its FD surface —
+ * `isUniqueDeterminant(∅, …)`: the closure of the empty set covers every
+ * column AND uniqueness is reachable (the relation is a set, or an unguarded
+ * 'unique' FD witnesses). Replaces the legacy `[[]]` singleton marker on
+ * `uniqueKeys`.
+ *
+ * On a bag, constant pins (`∅ → col` determinations from `where a = 1`) no
+ * longer over-claim ≤1-row; on a set, pinning every column IS a sound ≤1-row
+ * derivation. Zero-column relations return false — the `∅ → all_cols` FD is
+ * unrepresentable there, so the ≤1-row claim rides `estimatedRows` instead
+ * (see `characteristics.guaranteesUniqueRows`).
  */
 export function hasSingletonFd(
 	fds: ReadonlyArray<FunctionalDependency> | undefined,
 	columnCount: number,
+	isSet: boolean,
 ): boolean {
-	if (!fds) return false;
-	return fds.some(fd =>
-		fd.guard === undefined &&
-		fd.determinants.length === 0 &&
-		isSuperkey(new Set<number>(), fds, columnCount),
-	);
+	if (columnCount <= 0) return false;
+	return isUniqueDeterminant(new Set<number>(), fds, columnCount, isSet);
 }
 
 /**
@@ -783,35 +774,11 @@ export function addSingletonFd(
 	return singleton ? addFd(fds, singleton) : fds.slice();
 }
 
-/**
- * True iff `attrs` is asserted to be a unique key by the FD set — i.e., there
- * exists some FD whose determinants are a subset of `attrs` and whose closure
- * covers all columns. Stricter than `isSuperkey`: the trivial "all-cols is a
- * superkey of itself" tautology does NOT count, because no FD makes that claim.
- *
- * Use this when you need a positive uniqueness claim (e.g., the
- * sort/window strict-monotonicOn check). For "would attrs functionally
- * determine the rest of the relation under closure?" use `isSuperkey` directly.
- */
-export function isAssertedKey(
-	attrs: ReadonlySet<number>,
-	fds: ReadonlyArray<FunctionalDependency> | undefined,
-	columnCount: number,
-): boolean {
-	if (!fds || fds.length === 0) return false;
-	for (const fd of fds) {
-		if (fd.guard !== undefined) continue;
-		// Determinants must be a subset of attrs.
-		let subset = true;
-		for (const d of fd.determinants) {
-			if (!attrs.has(d)) { subset = false; break; }
-		}
-		if (!subset) continue;
-		// Determinants closure must cover all columns.
-		if (isSuperkey(new Set(fd.determinants), fds, columnCount)) return true;
-	}
-	return false;
-}
+// NOTE: the former `isAssertedKey` (per-FD determinant anchoring + coverage)
+// is subsumed by `isUniqueDeterminant`, which is strictly more general (the
+// closure composes multi-FD paths the per-FD anchoring missed) and genuinely a
+// uniqueness predicate. Former callers (the sort/window strict-monotonicOn
+// checks) call `isUniqueDeterminant` directly.
 
 // ---------------------------------------------------------------------------
 // Unified uniqueness read surface (keysOf / isUnique)
@@ -907,13 +874,15 @@ export function keysOf(rel: KeyRel): readonly (readonly number[])[] {
 		keys.push(key.map(ref => ref.index));
 	}
 
-	// 2. `∅ → all_cols` ⇒ at-most-one-row ⇒ the empty key.
-	if (hasSingletonFd(fds, columnCount)) {
+	// 2. Provable ≤1-row (kind-aware) ⇒ the empty key.
+	if (hasSingletonFd(fds, columnCount, type.isSet)) {
 		keys.push([]);
 	}
 
 	// 3. FD-derived keys (already bounded to FDs with det.length < columnCount).
-	for (const k of deriveKeysFromFds(fds, columnCount)) {
+	// `isSet` threads through so a determination-only covering determinant over
+	// a set (e.g. above a DISTINCT) derives a genuine key.
+	for (const k of deriveKeysFromFds(fds, columnCount, type.isSet)) {
 		keys.push(k);
 	}
 
@@ -936,14 +905,14 @@ export function keysOf(rel: KeyRel): readonly (readonly number[])[] {
  *   - `cols` is a (non-strict) superset of some `keysOf(rel)` entry (covers
  *     declared keys, the ≤1-row empty key, FD-derived keys, and the
  *     all-columns/set key), OR
- *   - `cols` is a **proper subset** of the columns whose FD closure covers all
- *     columns (`isSuperkey`) — this proves a superkey even when it is absent
- *     from the minimal `keysOf` list.
+ *   - `cols` is a provably row-unique determinant (`isUniqueDeterminant`:
+ *     closure coverage AND uniqueness reachability) — this proves a superkey
+ *     even when it is absent from the minimal `keysOf` list.
  *
- * The closure branch is deliberately restricted to proper subsets: the closure
- * of the full column set is trivially the full set, so without the guard a bag
- * would be falsely reported unique on its all-columns set. The all-columns case
- * is handled soundly by the `keysOf` branch above, which gates it on `isSet`.
+ * No all-columns guard is needed on the closure branch: an all-columns probe
+ * on a bag fails `isUniqueDeterminant` on its own (no unique FD ⇒ false; if a
+ * unique FD exists the relation cannot hold duplicate rows, so true is
+ * correct).
  */
 export function isUnique(cols: readonly number[], rel: KeyRel): boolean {
 	const type = rel.getType();
@@ -954,11 +923,7 @@ export function isUnique(cols: readonly number[], rel: KeyRel): boolean {
 		if (key.every(c => colSet.has(c))) return true;
 	}
 
-	if (colSet.size < columnCount && isSuperkey(colSet, rel.physical?.fds, columnCount)) {
-		return true;
-	}
-
-	return false;
+	return isUniqueDeterminant(colSet, rel.physical?.fds, columnCount, type.isSet);
 }
 
 /**

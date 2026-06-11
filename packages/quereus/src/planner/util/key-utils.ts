@@ -5,7 +5,7 @@ import type { TableSchema } from '../../schema/table.js';
 import { resolveReferencedColumns } from '../../schema/table.js';
 import { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
 import { LiteralNode } from '../nodes/scalar.js';
-import { isAtMostOneRow, isSuperkey, isUnique, keysOf, type KeyRel } from './fd-utils.js';
+import { isAtMostOneRow, isUnique, isUniqueDeterminant, keysOf, type KeyRel } from './fd-utils.js';
 
 /**
  * Project unique keys through a projection mapping.
@@ -415,16 +415,20 @@ export function analyzeJoinKeyCoverage(
 		return keys.some(key => key.length > 0 && key.every(idx => eqSet.has(idx)));
 	}
 
-	// A side's key is "covered" when the equi-pairs are a superkey of it. The
-	// single `isUnique` call folds the old `coversLogicalKey || isSuperkey` pair
-	// AND adds empty-key recognition: a ≤1-row side has `[]` in `keysOf`, and
-	// `[] ⊆ anything`, so `isUnique` reports it covered regardless of equi-pairs.
+	// A side's key is "covered" when the equi-pairs are row-unique on it. The
+	// single `isUnique` call folds the old two-surface check AND adds empty-key
+	// recognition: a ≤1-row side has `[]` in `keysOf`, and `[] ⊆ anything`, so
+	// `isUnique` reports it covered regardless of equi-pairs. The no-logical-type
+	// fallback uses the same kind-aware uniqueness primitive with a conservative
+	// `isSet: false` (set-ness is unknowable without the type) — coverage alone
+	// must never mint a preserved key, since `withKeyFds` turns preserved keys
+	// into 'unique' FDs downstream.
 	const leftKeyCovered = leftRel
 		? isUnique(equiPairs.map(p => p.left), leftRel)
-		: coversLogicalKey(leftLogicalKeys, leftEqSet) || isSuperkey(leftEqSet, leftPhys?.fds, leftColCount);
+		: coversLogicalKey(leftLogicalKeys, leftEqSet) || isUniqueDeterminant(leftEqSet, leftPhys?.fds, leftColCount, false);
 	const rightKeyCovered = rightRel
 		? isUnique(equiPairs.map(p => p.right), rightRel)
-		: coversLogicalKey(rightLogicalKeys, rightEqSet) || isSuperkey(rightEqSet, rightPhys?.fds, rightColCount);
+		: coversLogicalKey(rightLogicalKeys, rightEqSet) || isUniqueDeterminant(rightEqSet, rightPhys?.fds, rightColCount, false);
 
 	// ≤1-row sides: the named spelling of the at-most-one-row predicate.
 	const leftIsSingleton = leftRel ? isAtMostOneRow(leftRel) : false;

@@ -516,6 +516,34 @@
                 "fds": [
                   {
                     "dependents": [
+                      5,
+                      6
+                    ],
+                    "determinants": [
+                      4
+                    ],
+                    "kind": "determination"
+                  },
+                  {
+                    "dependents": [
+                      4
+                    ],
+                    "determinants": [
+                      3
+                    ],
+                    "kind": "determination"
+                  },
+                  {
+                    "dependents": [
+                      3
+                    ],
+                    "determinants": [
+                      4
+                    ],
+                    "kind": "determination"
+                  },
+                  {
+                    "dependents": [
                       1,
                       2,
                       3,
@@ -604,6 +632,34 @@
             ],
             "expectedLatencyMs": 0,
             "fds": [
+              {
+                "dependents": [
+                  5,
+                  6
+                ],
+                "determinants": [
+                  4
+                ],
+                "kind": "determination"
+              },
+              {
+                "dependents": [
+                  4
+                ],
+                "determinants": [
+                  3
+                ],
+                "kind": "determination"
+              },
+              {
+                "dependents": [
+                  3
+                ],
+                "determinants": [
+                  4
+                ],
+                "kind": "determination"
+              },
               {
                 "dependents": [
                   1,

@@ -1870,8 +1870,8 @@ describe('Property-Based Tests', () => {
 			if (atMostOne && !keysOf(node).some(k => k.length === 0)) {
 				throw new Error(`singleton disagreement: isAtMostOneRow holds but keysOf has no empty key on ${label}`);
 			}
-			// (b) the `∅ → all_cols` FD ⇒ canonical ≤1-row truth.
-			if (hasSingletonFd(node.physical?.fds, colCount) && !atMostOne) {
+			// (b) the FD-surface ≤1-row read ⇒ canonical ≤1-row truth.
+			if (hasSingletonFd(node.physical?.fds, colCount, node.getType().isSet) && !atMostOne) {
 				throw new Error(`singleton disagreement: ∅→all_cols FD present but isAtMostOneRow is false on ${label}`);
 			}
 		}
@@ -1900,7 +1900,7 @@ describe('Property-Based Tests', () => {
 		function checkIndependentSingletonChannels(label: string, node: RelationalPlanNode): void {
 			const colCount = node.getType().columns.length;
 			if (colCount === 0) return; // zero-column carve-out
-			if (declaredEmptyKeyOf(node) && !hasSingletonFd(node.physical?.fds, colCount)) {
+			if (declaredEmptyKeyOf(node) && !hasSingletonFd(node.physical?.fds, colCount, node.getType().isSet)) {
 				throw new Error(`independent-channel drift: ${label} declares the empty key but lacks the ∅→all_cols FD`);
 			}
 		}
@@ -1992,7 +1992,7 @@ describe('Property-Based Tests', () => {
 				expect(target, `expected a ${type} node in plan of \`${sql}\``).to.not.equal(undefined);
 				const colCount = target!.getType().columns.length;
 				expect(declaredEmptyKeyOf(target!), `${type} of \`${sql}\` declared-empty-key channel`).to.equal(key);
-				expect(hasSingletonFd(target!.physical?.fds, colCount), `${type} of \`${sql}\` singleton-FD channel`).to.equal(fd);
+				expect(hasSingletonFd(target!.physical?.fds, colCount, target!.getType().isSet), `${type} of \`${sql}\` singleton-FD channel`).to.equal(fd);
 			}
 		});
 	});

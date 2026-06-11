@@ -91,7 +91,7 @@ describe('CHECK contribution gated by permitsGrandfatheredCheckViolators', () =>
 		expect(hasBtoA, 'no b→a FD under cap').to.be.false;
 	});
 
-	it('default (cap absent): equality CHECK (a = b) lifts the EC (bi-FD gated by the key-bag fix)', async () => {
+	it('default (cap absent): equality CHECK (a = b) lifts the EC and the bi-FD as determinations', async () => {
 		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, CHECK (a = b)) USING memory');
 		const ref = buildReference(new MemoryTableModule());
 		const phys = ref.computePhysical([]);
@@ -100,23 +100,24 @@ describe('CHECK contribution gated by permitsGrandfatheredCheckViolators', () =>
 		// is always sound and ECs are not read by key derivation). The capability cap
 		// suppresses this (the paired "cap on" test asserts equivClasses undefined).
 		expect(phys.equivClasses, 'a≡b EC lifts without cap').to.deep.equal([[1, 2]]);
-		// The bi-directional determination FD {a}↔{b} is NOT folded here: neither a
-		// nor b is a declared key (the PK is `id`), so the TableReference key-bag gate
-		// (ticket fd-check-assertion-key-bag-overclaim) drops it — folding it would let
-		// `select a, b` read {a} as a key over the duplicate (a=b) rows (wrong results).
-		// Pre-gate this test asserted a→b and b→a present.
+		// The bi-directional FD {a}↔{b} folds unconditionally as
+		// `kind: 'determination'` — the kind-aware readers (`isUniqueDeterminant`,
+		// ticket fd-determination-reader-side-rule) never read a determination as
+		// a uniqueness claim, so `select a, b` cannot read {a} as a key over the
+		// duplicate (a=b) rows. (Replaces the producer-side gate from ticket
+		// fd-check-assertion-key-bag-overclaim, which dropped the pair here.)
 		const fds = phys.fds ?? [];
 		const aIdx = 1;
 		const bIdx = 2;
-		const hasAtoB = fds.some(fd =>
+		const aToB = fds.find(fd =>
 			fd.determinants.length === 1 && fd.determinants[0] === aIdx
 			&& fd.dependents.includes(bIdx),
 		);
-		const hasBtoA = fds.some(fd =>
+		const bToA = fds.find(fd =>
 			fd.determinants.length === 1 && fd.determinants[0] === bIdx
 			&& fd.dependents.includes(aIdx),
 		);
-		expect(hasAtoB, 'a→b bi-FD gated (a not a key)').to.be.false;
-		expect(hasBtoA, 'b→a bi-FD gated (b not a key)').to.be.false;
+		expect(aToB?.kind, 'a→b folds as a determination').to.equal('determination');
+		expect(bToA?.kind, 'b→a folds as a determination').to.equal('determination');
 	});
 });

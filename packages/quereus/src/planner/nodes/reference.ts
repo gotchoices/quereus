@@ -1,6 +1,6 @@
 import type { BaseType, ScalarType, RelationType } from '../../common/datatype.js';
 import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint, type InclusionDependency, type UpdateSite, type AttributeDefault } from './plan-node.js';
-import { addFd, closeConstantBindingsOverEcs, foldSingleSingleGated, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
+import { addFd, closeConstantBindingsOverEcs, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
 import { seedTableForeignKeyInds } from '../util/ind-utils.js';
 import { getCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
 import { getPartialUniqueGuardedFds } from '../analysis/partial-unique-extraction.js';
@@ -107,8 +107,8 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 	computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		// Seed FDs from declared keys: each declared key (PK + UNIQUE) becomes
 		// `key → other-columns`. This is the canonical encoding of "K is a unique
-		// key" — downstream consumers query `physical.fds` (via `isSuperkey` /
-		// `hasAnyKey`) without special-casing keys.
+		// key" — downstream consumers query `physical.fds` (via
+		// `isUniqueDeterminant` / `hasAnyKey`) without special-casing keys.
 		const relType = this.getType();
 		const colCount = relType.columns.length;
 		let fds: ReadonlyArray<FunctionalDependency> = [];
@@ -123,13 +123,6 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			if (dep.length === 0) continue;
 			fds = addFd(fds, { determinants: det, dependents: dep, kind: 'unique' });
 		}
-
-		// Immutable snapshot of the FD set built from declared PK/UNIQUE keys
-		// ONLY — captured before any CHECK / partial-unique / hoisted FD is folded.
-		// `addFd` returns a fresh array and never mutates its input, so this
-		// reference stays pinned to the declared-key FDs and is the gate's real-key
-		// probe. (ticket fd-check-assertion-key-bag-overclaim)
-		const realKeyFds = fds;
 
 		// Merge in CHECK-derived FDs/ECs/bindings/domains. Cached per-schema.
 		//
@@ -147,13 +140,16 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		const checkExt: CheckExtraction = permitsCheckViolators
 			? EMPTY_CHECK_EXTRACTION
 			: getCheckExtraction(this.tableSchema);
-		// Gate every single↔single determination/equality FD against the declared
-		// keys (`{a}↔{b}` from `check (a = b)`, `{a}→{b}` from `check (b = a + 1)`);
-		// only a real-declared-key endpoint lets it fold. Constant `∅→col` and
-		// multi-dependent key FDs pass through. Guarded FDs pass through untouched
-		// (`skipGuarded`) — gated at Filter activation instead. See
-		// `foldSingleSingleGated`; mirrors the filter consumption gate.
-		fds = foldSingleSingleGated(fds, checkExt.fds, realKeyFds, colCount, { skipGuarded: true });
+		// CHECK-derived FDs fold unconditionally. They are pure value claims
+		// (`kind: 'determination'`, or guarded), and the kind-aware readers
+		// (`isUniqueDeterminant`) never read a determination as a uniqueness
+		// claim — the endpoint gate that used to live here is subsumed (ticket
+		// fd-determination-reader-side-rule, replacing the
+		// fd-check-assertion-key-bag-overclaim producer gate). Guarded FDs fold
+		// untouched as before — they stay inert until Filter activation.
+		for (const fd of checkExt.fds) {
+			fds = addFd(fds, fd);
+		}
 
 		// Guarded FDs from partial UNIQUE constraints (`CREATE UNIQUE INDEX (K)
 		// WHERE P`). The unconditional UC path in relationTypeFromTableSchema
@@ -173,10 +169,12 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			? getAssertionHoistedConstraints(this.schemaManager, this.tableSchema)
 			: undefined;
 		if (hoisted) {
-			// Same single↔single gate as checkExt, against the shared declared-key
-			// probe. Folded AFTER checkExt so structurally-identical entries keep
+			// Unconditional fold, like checkExt (the readers are kind-aware).
+			// Folded AFTER checkExt so structurally-identical entries keep
 			// `declared-check` provenance.
-			fds = foldSingleSingleGated(fds, hoisted.fds, realKeyFds, colCount, { skipGuarded: true });
+			for (const fd of hoisted.fds) {
+				fds = addFd(fds, fd);
+			}
 		}
 
 		let equivClasses: ReadonlyArray<ReadonlyArray<number>> = [];

@@ -1,6 +1,18 @@
 /**
  * FD-derived key bag over-claim regression (ticket `fd-derived-key-bag-overclaim`).
  *
+ * HISTORICAL NOTE (ticket `fd-determination-reader-side-rule`): the producer-side
+ * gates this header describes (sites 1–9 below) have since been REMOVED. The
+ * over-claim is now prevented on the reader side: every FD carries a
+ * `kind: 'unique' | 'determination'` provenance (phase 1,
+ * `fd-kind-provenance-field`) and the uniqueness readers (`isUniqueDeterminant`,
+ * `deriveKeysFromFds`, `keysOf`, …) derive a key only when uniqueness is
+ * *reachable* — the relation is a set, or an unguarded 'unique' FD witnesses
+ * within the closure. Every repro and control below stays green under the
+ * reader rule; this spec is the proof the rule subsumes the old gates.
+ *
+ * Original gate description (kept for the per-site repro rationale):
+ *
  * `keysOf` reads a bag as a set when a *determination* / *equality* FD becomes
  * all-columns-covering on a narrow relation and `deriveKeysFromFds` then derives
  * a spurious unique key. The two FD shapes are structurally indistinguishable

@@ -1435,7 +1435,7 @@ describe('extractPartialUniqueGuardedFds', () => {
 // ---------------------------------------------------------------------------
 
 interface PhysicalProps {
-	fds?: { determinants: number[]; dependents: number[]; guard?: GuardPredicate }[];
+	fds?: { determinants: number[]; dependents: number[]; guard?: GuardPredicate; kind: 'unique' | 'determination' }[];
 	equivClasses?: number[][];
 }
 
@@ -1505,12 +1505,19 @@ describe('Conditional FDs: end-to-end propagation', () => {
 		const filterProps = physicalOf(rows, r => r.op === 'FILTER');
 		expect(filterProps, 'expected Filter physical props').to.not.equal(undefined);
 		// Columns: id=0, customer_region=1, assigned_region=2, status=3.
-		// After activation, the value-equality body `assigned_region = customer_region`
-		// surfaces as an EC {1,2} — NOT as the bi-directional determination FD. Neither
-		// endpoint is a key (PK is id), so folding `{1}↔{2}` would let a later narrow
-		// projection read a phantom key (ticket fd-guarded-activation-key-bag-overclaim).
-		expect(fdHas(filterProps!.fds, [1], [2]), 'bi-FD {1}->{2} gated').to.equal(false);
-		expect(fdHas(filterProps!.fds, [2], [1]), 'bi-FD {2}->{1} gated').to.equal(false);
+		// Activation strips the guard unconditionally (kind-preserving): the
+		// value-equality body `assigned_region = customer_region` surfaces both as
+		// the bi-directional FD `{1}↔{2}` with `kind: 'determination'` AND as the
+		// EC {1,2}. Neither endpoint is a key (PK is id) — soundness lives in the
+		// kind-aware readers, which never derive a key from a determination on a
+		// bag (ticket fd-determination-reader-side-rule, replacing the activation
+		// endpoint gate from fd-guarded-activation-key-bag-overclaim).
+		const aToB = filterProps!.fds?.find(fd =>
+			fd.guard === undefined && fd.determinants.length === 1 && fd.determinants[0] === 1 && fd.dependents.includes(2));
+		const bToA = filterProps!.fds?.find(fd =>
+			fd.guard === undefined && fd.determinants.length === 1 && fd.determinants[0] === 2 && fd.dependents.includes(1));
+		expect(aToB?.kind, 'activated bi-FD {1}->{2} is a determination').to.equal('determination');
+		expect(bToA?.kind, 'activated bi-FD {2}->{1} is a determination').to.equal('determination');
 		const ecs = filterProps!.equivClasses ?? [];
 		const hasEc = ecs.some(c => c.includes(1) && c.includes(2));
 		expect(hasEc, 'value-equality lifted as EC {1,2}').to.equal(true);

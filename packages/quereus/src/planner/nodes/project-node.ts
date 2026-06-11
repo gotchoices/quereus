@@ -4,7 +4,7 @@ import type { RelationType, ScalarType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { deriveProjectionColumnMap, projectKeys } from '../util/key-utils.js';
-import { addFd, isSuperkey, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
+import { addFd, projectConstantBindings, projectDomainConstraints, projectFds, projectInds, superkeyToFd } from '../util/fd-utils.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { formatProjection } from '../../util/plan-formatter.js';
 import { ColumnReferenceNode } from './reference.js';
@@ -281,9 +281,9 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 		// augmented map carries through and which additionally emit a
 		// bi-directional FD when both the bare and derived columns are projected.
 		let fds = projectFds(sourcePhysical?.fds ?? [], map);
-		// Key FDs from the projected source keys — the projection's *real* keys,
-		// independent of the injective determination FDs gated below. Used both as the
-		// FDs layered onto the output and as the superkey probe set for the gate.
+		// Key FDs from the projected source keys — the projection's *real* keys
+		// (`kind: 'unique'` via superkeyToFd), independent of the injective
+		// determination FDs emitted below.
 		const projectedKeyFds: FunctionalDependency[] = [];
 		for (const key of projectedKeys) {
 			const keyFd = superkeyToFd(key, outputColCount);
@@ -293,22 +293,16 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			fds = addFd(fds, keyFd, { keyHints: projectedKeys });
 		}
 		// An injective projection emits the bi-directional FD `{bareOut}↔{outIdx}`
-		// (`SELECT id, id+1`). That determination is a uniqueness claim only when one
-		// endpoint is a genuine superkey here; over a narrow projection of a non-unique
-		// column (`SELECT -c, c` with `c` non-unique) it would otherwise let
-		// `deriveKeysFromFds` read a phantom all-columns key (a bag as a set). Gate the
-		// pair on endpoint superkey-ness against the projected keys; when an endpoint is
-		// a real key the other direction still derives the correct synonym key. (ticket
-		// fd-derived-key-bag-overclaim)
+		// (`SELECT id, id+1`) unconditionally as 'determination' — a value
+		// bijection, never a uniqueness claim. The kind-aware readers
+		// (`isUniqueDeterminant`) never derive a key from it on a bag, so no
+		// endpoint gate is needed; key-ness, when an endpoint is a key, is carried
+		// by the projected key FDs above (addFd's 'unique'-wins merge keeps it).
+		// (ticket fd-determination-reader-side-rule, replacing the
+		// fd-derived-key-bag-overclaim producer gate; mirrors returning-node.)
 		for (const [srcIdx, outIdx] of injectivePairs) {
 			const bareOut = map.get(srcIdx);
 			if (bareOut === undefined || bareOut === outIdx) continue;
-			const endpointIsKey = isSuperkey(new Set([bareOut]), projectedKeyFds, outputColCount)
-				|| isSuperkey(new Set([outIdx]), projectedKeyFds, outputColCount);
-			if (!endpointIsKey) continue;
-			// Injective-pair FDs are value bijections, not uniqueness claims —
-			// 'determination'. (Key-ness, when an endpoint is a key, is carried by
-			// the projected key FDs above; addFd's 'unique'-wins merge keeps it.)
 			fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx], kind: 'determination' }, { keyHints: projectedKeys });
 			fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut], kind: 'determination' }, { keyHints: projectedKeys });
 		}
