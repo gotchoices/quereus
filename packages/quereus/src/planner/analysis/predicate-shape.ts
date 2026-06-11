@@ -29,6 +29,13 @@ export type ColumnIndexResolver = (expr: AST.Expression) => number | undefined;
  * table/alias qualifier on a `ColumnExpr` (`alias.col`) is **ignored** — bare
  * name resolution only; callers needing qualifier-awareness compose a
  * {@link ColumnIndexResolver}.
+ *
+ * The qualifier-blindness is load-bearing for CHECK extraction: `new.<col>`
+ * row-image references resolve to the bare column, which is deliberate — NEW
+ * is the stored row image, so NEW-qualified references are same-row facts.
+ * Self-table qualifiers (`t.col` on the owning table) resolve the same way.
+ * `old.<col>` references are NOT same-row; check-extraction screens those out
+ * wholesale (`containsOldRowImageRef`) before this resolver ever sees them.
  */
 export function columnIndexFromExpr(
 	expr: AST.Expression,

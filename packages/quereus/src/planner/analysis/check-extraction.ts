@@ -12,6 +12,7 @@
 
 import type { ConstantBinding, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate } from '../nodes/plan-node.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
+import { RowOpFlag } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
 import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison, walkAstNodes } from './predicate-shape.js';
@@ -76,11 +77,64 @@ export function extractCheckConstraints(
 
 	for (const check of checks) {
 		if (!check.expr) continue;
+		if (!isRowInvariantCheck(check)) continue;
 		if (containsNonDeterministicCall(check.expr, isDeterministic)) continue;
 		walkConjunction(check.expr, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
 	}
 
 	return { fds, equivPairs, constantBindings, domainConstraints };
+}
+
+/**
+ * Row-invariant gate: a CHECK only contributes value facts when every stored
+ * row image is guaranteed to satisfy it — i.e. it is enforced on every path a
+ * row can enter the table. Three legs, all required:
+ *
+ * 1. The operation mask covers both INSERT and UPDATE. Enforcement filters by
+ *    `shouldCheckConstraint(constraint, operation)` (constraint-builder.ts),
+ *    so e.g. a `check on insert (...)` never runs on UPDATE and an UPDATE can
+ *    legally store a violating row. DELETE membership is irrelevant — a
+ *    delete adds no row image. ALTER ADD CHECK backfill validation plus the
+ *    `permitsGrandfatheredCheckViolators` consumer gate cover the
+ *    pre-existing-rows path for qualifying checks.
+ *
+ * 2. Not deferred. A deferred check is enforced at commit, so
+ *    same-transaction reads can observe violating rows. No SQL today can set
+ *    these flags on a stored table CHECK (the parser rejects DEFERRABLE on
+ *    CHECK constraints); this leg is defensive against hand-built or future
+ *    schemas.
+ *
+ * 3. No `old.<col>` row-image reference. `old.a = b` is a transition
+ *    constraint over the previous row image, not a predicate on stored rows —
+ *    and OLD is registered nullable / NULL on the INSERT path, so even a
+ *    default-mask `check (old.a = b)` admits rows violating the same-row
+ *    reading. `new.<col>` stays allowed: NEW is the stored row image, so
+ *    NEW-qualified references are same-row (see `columnIndexFromExpr`, whose
+ *    bare-name resolution deliberately tolerates the qualifier).
+ */
+function isRowInvariantCheck(check: RowConstraintSchema): boolean {
+	const requiredOps = RowOpFlag.INSERT | RowOpFlag.UPDATE;
+	if ((check.operations & requiredOps) !== requiredOps) return false;
+	if (check.deferrable || check.initiallyDeferred) return false;
+	return !containsOldRowImageRef(check.expr);
+}
+
+/**
+ * True when any node in `expr`'s subtree is a column reference qualified with
+ * the `old` row-image marker (`old.a` parses as
+ * `ColumnExpr { name: 'a', table: 'old' }`). `walkAstNodes` discovers children
+ * reflectively, so guard disjuncts, compound operands, between bounds, and
+ * in-lists are all covered. Conservative edge: a table literally named `old`
+ * using self-qualified `old.col` refs also matches — sound, since the
+ * enforcement scope keys `old.<col>` to the OLD image there too.
+ */
+function containsOldRowImageRef(expr: AST.Expression): boolean {
+	for (const node of walkAstNodes(expr)) {
+		if (node.type === 'column' && (node as AST.ColumnExpr).table?.toLowerCase() === 'old') {
+			return true;
+		}
+	}
+	return false;
 }
 
 function walkConjunction(

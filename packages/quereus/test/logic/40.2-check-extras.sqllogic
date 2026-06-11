@@ -351,3 +351,67 @@ select c from chk_coll_def;
 insert into chk_coll_def values (2, 'xyz');
 -- error: CHECK
 drop table chk_coll_def;
+
+-- ===================================
+-- Row-invariant gate on CHECK-derived planner facts. Ticket
+-- check-extraction-rowop-mask-transition-checks. A CHECK contributes
+-- FDs/bindings/domains to the optimizer only when its operation mask covers
+-- insert+update and it has no `old.` row-image reference — otherwise rows the
+-- check never enforced can legally violate it, and folding a matching WHERE
+-- to empty returns wrong results.
+-- ===================================
+
+-- insert-only check never sees an UPDATE: the stored row may violate it, so
+-- no fact may be minted from it.
+create table t_riv_ins (id integer primary key, status text, check on insert (status = 'a')) using memory;
+insert into t_riv_ins values (1, 'a');
+update t_riv_ins set status = 'b' where id = 1;
+select * from t_riv_ins where status = 'b';
+→ [{"id":1,"status":"b"}]
+drop table t_riv_ins;
+
+-- update-only transition check `old.a = b` must not extract as the same-row
+-- equality a = b (it never ran on these inserts at all).
+create table t_riv_upd (id integer primary key, a text, b text unique, check on update (old.a = b)) using memory;
+insert into t_riv_upd values (1, 'x', 'y1'), (2, 'x', 'y2');
+select * from t_riv_upd where a = 'x' order by id;
+→ [{"id":1,"a":"x","b":"y1"},{"id":2,"a":"x","b":"y2"}]
+drop table t_riv_upd;
+
+-- old. under the DEFAULT mask: the check runs on insert but passes because
+-- OLD is NULL there — a transition constraint, not a row invariant, so the
+-- mask gate alone is insufficient and the old.-screen must catch it.
+create table t_riv_old (id integer primary key, a text, b text, check (old.a = b)) using memory;
+insert into t_riv_old values (1, 'x', 'y1');
+select * from t_riv_old where a = 'x';
+→ [{"id":1,"a":"x","b":"y1"}]
+drop table t_riv_old;
+
+-- delete-only check constrains no stored row at all.
+create table t_riv_del (id integer primary key, v integer, check on delete (v > 0)) using memory;
+insert into t_riv_del values (1, -5);
+select * from t_riv_del where v <= 0;
+→ [{"id":1,"v":-5}]
+drop table t_riv_del;
+
+-- control: default-mask check keeps folding contradictions to empty.
+create table t_riv_def (id integer primary key, v integer, check (v > 0)) using memory;
+insert into t_riv_def values (1, 5);
+select * from t_riv_def where v <= 0;
+→ []
+drop table t_riv_def;
+
+-- control: explicit insert,update mask qualifies exactly like the default.
+create table t_riv_iu (id integer primary key, v integer, check on insert, update (v > 0)) using memory;
+insert into t_riv_iu values (1, 5);
+select * from t_riv_iu where v <= 0;
+→ []
+drop table t_riv_iu;
+
+-- control: new.-qualified check is same-row (NEW is the stored image); its
+-- facts are sound and matching rows are returned correctly.
+create table t_riv_new (id integer primary key, a text, b text, check (new.a = b)) using memory;
+insert into t_riv_new values (1, 'x', 'x');
+select * from t_riv_new where a = 'x';
+→ [{"id":1,"a":"x","b":"x"}]
+drop table t_riv_new;

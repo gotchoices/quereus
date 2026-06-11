@@ -23,7 +23,8 @@ import type {
 	DomainConstraint,
 	FunctionalDependency,
 } from '../nodes/plan-node.js';
-import type { TableSchema, RowConstraintSchema, RowOpMask } from '../../schema/table.js';
+import type { TableSchema, RowConstraintSchema } from '../../schema/table.js';
+import { DEFAULT_ROWOP_MASK } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import type { SchemaChangeEvent } from '../../schema/change-events.js';
 import { extractCheckConstraints } from './check-extraction.js';
@@ -119,12 +120,15 @@ export function getAssertionHoistedConstraints(
 		if (candidate.baseTableQualifiedName !== targetName) continue;
 		if (!candidate.innerPredicate) continue;
 
-		// Synthetic check on T: per-row `not P`. `operations` is unused by
-		// extractCheckConstraints; defaulting to 0 is safe.
+		// Synthetic check on T: per-row `not P`. extractCheckConstraints' row-
+		// invariant gate requires the mask to cover INSERT|UPDATE; an assertion
+		// holds for every stored row regardless of how it got there, so the
+		// default mask is the honest encoding (a 0 mask would be silently
+		// dropped by the gate).
 		synthChecks.push({
 			name: `__assertion_${candidate.assertionName}`,
 			expr: negateAst(candidate.innerPredicate),
-			operations: 0 as RowOpMask,
+			operations: DEFAULT_ROWOP_MASK,
 		});
 		provenanceByCheckIdx.push({ kind: 'assertion', name: candidate.assertionName });
 		log('Hoisted assertion %s onto %s', candidate.assertionName, targetName);

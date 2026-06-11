@@ -4,8 +4,8 @@ import {
 	extractCheckConstraints,
 } from '../../src/planner/analysis/check-extraction.js';
 import type { ConstantBinding, DomainConstraint } from '../../src/planner/nodes/plan-node.js';
-import type { RowConstraintSchema } from '../../src/schema/table.js';
-import { DEFAULT_ROWOP_MASK } from '../../src/schema/table.js';
+import type { RowConstraintSchema, RowOpMask } from '../../src/schema/table.js';
+import { DEFAULT_ROWOP_MASK, RowOpFlag } from '../../src/schema/table.js';
 import type * as AST from '../../src/parser/ast.js';
 import type { DeclaredColumnInfo } from '../../src/planner/analysis/comparison-collation.js';
 import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
@@ -48,6 +48,14 @@ function fn(name: string, ...args: AST.Expression[]): AST.FunctionExpr {
 
 function check(expr: AST.Expression): RowConstraintSchema {
 	return { expr, operations: DEFAULT_ROWOP_MASK };
+}
+
+function qcol(table: string, name: string): AST.ColumnExpr {
+	return { type: 'column', name, table };
+}
+
+function checkWith(expr: AST.Expression, overrides: Partial<RowConstraintSchema>): RowConstraintSchema {
+	return { expr, operations: DEFAULT_ROWOP_MASK, ...overrides };
 }
 
 const colMap = new Map<string, number>([
@@ -256,6 +264,120 @@ describe('extractCheckConstraints (unit)', () => {
 		expect(result.fds).to.have.length(0);
 		expect(result.constantBindings).to.have.length(0);
 		expect(result.domainConstraints).to.have.length(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Row-invariant gate — ticket check-extraction-rowop-mask-transition-checks.
+// A CHECK contributes facts only when its operation mask covers INSERT and
+// UPDATE (enforcement filters by `shouldCheckConstraint`, so other masks
+// leave entry paths unenforced), it is not deferred, and it contains no
+// `old.` row-image reference (OLD is NULL on the INSERT path, so old.-form
+// checks are transition constraints, not row invariants).
+// ---------------------------------------------------------------------------
+
+describe('extractCheckConstraints row-invariant gate', () => {
+	function expectEmpty(result: ReturnType<typeof extractCheckConstraints>): void {
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		expect(result.domainConstraints).to.have.length(0);
+	}
+
+	const shapes: Array<[string, AST.Expression]> = [
+		['a = b', bin('=', col('a'), col('b'))],
+		['qty >= 0', bin('>=', col('qty'), lit(0))],
+		["status in ('a','i')", inExpr(col('status'), [lit('a'), lit('i')])],
+	];
+
+	const nonQualifyingMasks: Array<[string, RowOpMask]> = [
+		['insert-only', RowOpFlag.INSERT],
+		['update-only', RowOpFlag.UPDATE],
+		['delete-only', RowOpFlag.DELETE],
+		['insert|delete', (RowOpFlag.INSERT | RowOpFlag.DELETE) as RowOpMask],
+		['update|delete', (RowOpFlag.UPDATE | RowOpFlag.DELETE) as RowOpMask],
+	];
+
+	for (const [maskName, mask] of nonQualifyingMasks) {
+		it(`${maskName} mask extracts nothing (equality, range, and in shapes)`, () => {
+			for (const [, expr] of shapes) {
+				expectEmpty(extractCheckConstraints(
+					[checkWith(expr, { operations: mask })], colMap, allDeterministic, colMeta));
+			}
+		});
+	}
+
+	it('insert|update and insert|update|delete masks extract as before', () => {
+		const qualifying: RowOpMask[] = [
+			DEFAULT_ROWOP_MASK,
+			(RowOpFlag.INSERT | RowOpFlag.UPDATE | RowOpFlag.DELETE) as RowOpMask,
+		];
+		for (const mask of qualifying) {
+			const eq = extractCheckConstraints(
+				[checkWith(bin('=', col('a'), col('b')), { operations: mask })], colMap, allDeterministic, colMeta);
+			expect(eq.fds).to.have.length(2);
+			expect(eq.equivPairs).to.deep.equal([[0, 1]]);
+			const range = extractCheckConstraints(
+				[checkWith(bin('>=', col('qty'), lit(0)), { operations: mask })], colMap, allDeterministic, colMeta);
+			expect(range.domainConstraints).to.have.length(1);
+		}
+	});
+
+	it('deferrable / initiallyDeferred checks extract nothing (defensive — not declarable via SQL today)', () => {
+		expectEmpty(extractCheckConstraints(
+			[checkWith(bin('=', col('a'), col('b')), { deferrable: true })], colMap, allDeterministic, colMeta));
+		expectEmpty(extractCheckConstraints(
+			[checkWith(bin('=', col('a'), col('b')), { initiallyDeferred: true })], colMap, allDeterministic, colMeta));
+	});
+
+	it('old. as a plain operand kills the check (old.a = b)', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(bin('=', qcol('old', 'a'), col('b')))], colMap, allDeterministic, colMeta));
+	});
+
+	it('old. buried in a compound RHS kills the check (a = old.b + 1)', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(bin('=', col('a'), bin('+', qcol('old', 'b'), lit(1))))], colMap, allDeterministic, colMeta));
+	});
+
+	it('old. in an implication-form guard disjunct kills the check', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(or(bin('<>', qcol('old', 'status'), lit('x')), bin('=', col('a'), col('b'))))],
+			colMap, allDeterministic, colMeta));
+	});
+
+	it('old. in BETWEEN and IN shapes kills the check', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(between(qcol('old', 'qty'), lit(0), lit(100)))], colMap, allDeterministic, colMeta));
+		expectEmpty(extractCheckConstraints(
+			[check(inExpr(qcol('old', 'status'), [lit('a')]))], colMap, allDeterministic, colMeta));
+	});
+
+	it('OLD qualifier matches case-insensitively', () => {
+		expectEmpty(extractCheckConstraints(
+			[check(bin('=', qcol('OLD', 'a'), col('b')))], colMap, allDeterministic, colMeta));
+	});
+
+	it('a gated check does not suppress sibling checks in the same array', () => {
+		const result = extractCheckConstraints([
+			check(bin('=', qcol('old', 'a'), col('b'))),
+			checkWith(bin('=', col('x'), col('y')), { operations: RowOpFlag.INSERT }),
+			check(bin('>=', col('qty'), lit(0))),
+		], colMap, allDeterministic, colMeta);
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		expect(result.domainConstraints).to.have.length(1);
+		expect(result.domainConstraints[0].column).to.equal(6);
+	});
+
+	it('new.a = b extracts identically to a = b (NEW is the stored row image)', () => {
+		const qualified = extractCheckConstraints(
+			[check(bin('=', qcol('new', 'a'), col('b')))], colMap, allDeterministic, colMeta);
+		const bare = extractCheckConstraints(
+			[check(bin('=', col('a'), col('b')))], colMap, allDeterministic, colMeta);
+		expect(qualified).to.deep.equal(bare);
+		expect(qualified.equivPairs).to.deep.equal([[0, 1]]);
 	});
 });
 
