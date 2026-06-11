@@ -1372,12 +1372,12 @@ export class MemoryTableManager {
 					// old rows FIRST — the same whole-table effective iteration the
 					// `delete-by-prefix` arm scopes to a prefix — into a PK-keyed btree, so the
 					// diff is computed against a stable before-image regardless of the upserts
-					// applied below. Collation governs KEY identity only: keys are compared with the table's PK comparator (honoring
-					// PK-column collation), so a new row whose key only differs by collation
-					// (e.g. 'apple' vs a stored 'APPLE' under a NOCASE PK) matches its old row
-					// and resolves to an `update` — never a spurious insert + delete that would
-					// leak secondary-index bookkeeping. VALUE fidelity of a paired row is
-						// byte-faithful (`rowsValueIdentical`, below) — one discipline, not two.
+					// applied below. Collation governs KEY identity only: keys are compared with
+					// the table's PK comparator (honoring PK-column collation), so a new row whose
+					// key only differs by collation (e.g. 'apple' vs a stored 'APPLE' under a NOCASE
+					// PK) matches its old row and resolves to an `update` — never a spurious insert +
+					// delete that would leak secondary-index bookkeeping. VALUE fidelity of a paired
+					// row is byte-faithful (`rowsValueIdentical`, below) — one discipline, not two.
 					const oldByKey = new BTree<BTreeKeyForPrimary, { key: BTreeKeyForPrimary; row: Row }>(
 						e => e.key,
 						this.comparePrimaryKeys,

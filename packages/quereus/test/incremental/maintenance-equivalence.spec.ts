@@ -836,6 +836,10 @@ describe('Materialized-view maintenance equivalence (full-rebuild floor, NOCASE 
 	afterEach(async () => { await db.close(); });
 
 	it('a case-only PK rewrite (same NOCASE key) re-keys the stored bytes via the full rebuild', async () => {
+		// White-box guard: the NOCASE body really routes through the floor's `replace-all`
+		// (the fixed path), not a bounded-delta arm that would re-key via delete + insert and
+		// pass equivalence without exercising the byte-faithful skip under test.
+		expect(registeredPlanKind(db, 'mv'), 'NOCASE body maintained by the full-rebuild floor').to.equal('full-rebuild');
 		await assertEquivalent(db, body, 'baseline');
 		// 'apple' → 'APPLE' is the SAME PK under NOCASE but a different stored byte value. The
 		// rebuild's replace-all pairs the new 'APPLE' with the stored 'apple' (collation-aware
