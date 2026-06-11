@@ -3,7 +3,7 @@ import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
 import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
-import { resolveSlotBasisSource, collectColumnRefNames } from '../../schema/lens-prover.js';
+import { resolveSlotBasisSource, collectColumnRefNames, authoredForwardMap } from '../../schema/lens-prover.js';
 import {
 	logicalToBasisColumnMap,
 	resolveLogicalReferencedColumns,
@@ -11,7 +11,7 @@ import {
 	matchingBasisFks,
 	findLogicalParentFkRefs,
 } from '../../schema/lens-fk-discovery.js';
-import { transformScopedExpr, type ScopeContext } from './scope-transform.js';
+import { transformScopedExpr, transformExpr, type ScopeContext } from './scope-transform.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { PlanningContext } from '../planning-context.js';
 import { synthesizeFKExistsExpr, synthesizeFKNotExistsExpr } from '../building/foreign-key-builder.js';
@@ -106,7 +106,7 @@ export const LENS_BOUNDARY_ATTACHED_TAG = 'quereus.lens.boundary.attached';
  * diagnostic rather than mis-rewrite or fall through to a cryptic build crash. A foreign /
  * qualified ref in a tainted scope is still left untouched (its name is not a logical column).
  */
-function makeLensRewriteScope(map: ReadonlyMap<string, string>, logicalTableName: string): ScopeContext {
+function makeLensRewriteScope(map: ReadonlyMap<string, string>, forwards: ReadonlyMap<string, AST.Expression>, logicalTableName: string): ScopeContext {
 	const lcTable = logicalTableName.toLowerCase();
 	// A rewritten write-row ref is qualified `NEW.<basis>` — the write-row correlation
 	// name the constraint scope registers (`building/constraint-builder.ts` registers
@@ -121,9 +121,22 @@ function makeLensRewriteScope(map: ReadonlyMap<string, string>, logicalTableName
 	// `NEW.<basis>` resolves to the write row identically to the prior bare form, so the
 	// behavior is unchanged except in the collision corner. Mirrors the FK / set-level
 	// synthesizers, which likewise qualify their write-row side `NEW.*`.
+	//
+	// An **authored-inverse** column has no single basis spelling — substitute its
+	// forward `get` expression instead, every base ref `NEW.`-qualified for the same
+	// capture-safety reason, so the CHECK evaluates over the written basis row's
+	// logical image. `authoredForwardMap` admits only subquery-free forwards (whose
+	// refs are all basis columns of the single-source FROM), so the blanket
+	// re-qualification is total; the prover's CHECK realizability classifier accepts
+	// exactly that same set, keeping deploy and write-time in lockstep.
 	const resolve = (name: string): AST.Expression | undefined => {
 		const basisColumn = map.get(name);
-		return basisColumn !== undefined ? { type: 'column', name: basisColumn, table: 'NEW' } : undefined;
+		if (basisColumn !== undefined) return { type: 'column', name: basisColumn, table: 'NEW' };
+		const forward = forwards.get(name);
+		if (forward !== undefined) {
+			return transformExpr(forward, col => ({ type: 'column', name: col.name, table: 'NEW' }));
+		}
+		return undefined;
 	};
 	return {
 		makeSubstitute: (shadowed, tainted) => (col) => {
@@ -134,7 +147,7 @@ function makeLensRewriteScope(map: ReadonlyMap<string, string>, logicalTableName
 				return col.table.toLowerCase() === lcTable ? resolve(name) : undefined;
 			}
 			if (shadowed.has(name)) return undefined;
-			if (!map.has(name)) return undefined;
+			if (!map.has(name) && !forwards.has(name)) return undefined;
 			if (tainted) {
 				raiseMutationDiagnostic({
 					reason: 'unsupported-subquery-correlation',
@@ -169,9 +182,10 @@ function rewriteToBasisTerms(
 	ctx: PlanningContext,
 	expr: AST.Expression,
 	map: ReadonlyMap<string, string>,
+	forwards: ReadonlyMap<string, AST.Expression>,
 	logicalTableName: string,
 ): AST.Expression {
-	return transformScopedExpr(ctx, makeLensRewriteScope(map, logicalTableName), expr);
+	return transformScopedExpr(ctx, makeLensRewriteScope(map, forwards, logicalTableName), expr);
 }
 
 /**
@@ -195,12 +209,26 @@ function rewriteToBasisTerms(
  * falsely mapped, adding an extra basis name. That only ever makes the gate *defer* a
  * constraint it might have threaded — conservative, the same bias the gate already carries.
  * Deduped because a CHECK may reference a column more than once.
+ *
+ * An authored-inverse column contributes its forward `get` expression's basis
+ * refs (the columns the substituted CHECK actually reads on the write row).
  */
-function rowLocalReferencedBasisColumns(expr: AST.Expression, map: ReadonlyMap<string, string>): string[] {
+function rowLocalReferencedBasisColumns(
+	expr: AST.Expression,
+	map: ReadonlyMap<string, string>,
+	forwards: ReadonlyMap<string, AST.Expression>,
+): string[] {
 	const cols = new Set<string>();
 	for (const name of collectColumnRefNames(expr)) {
 		const basis = map.get(name.toLowerCase());
-		if (basis !== undefined) cols.add(basis.toLowerCase());
+		if (basis !== undefined) {
+			cols.add(basis.toLowerCase());
+			continue;
+		}
+		const forward = forwards.get(name.toLowerCase());
+		if (forward !== undefined) {
+			for (const f of collectColumnRefNames(forward)) cols.add(f.toLowerCase());
+		}
 	}
 	return [...cols];
 }
@@ -223,6 +251,7 @@ function rowLocalReferencedBasisColumns(expr: AST.Expression, map: ReadonlyMap<s
 export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensSlot): RowConstraintSchema[] {
 	if (!slot.obligations || slot.obligations.length === 0) return [];
 	const map = logicalToBasisColumnMap(slot);
+	const forwards = authoredForwardMap(slot);
 	const logicalTableName = slot.logicalTable.name;
 	const constraints: RowConstraintSchema[] = [];
 	for (const obligation of slot.obligations) {
@@ -231,11 +260,11 @@ export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensS
 		const source = obligation.constraint.constraint;
 		constraints.push({
 			name: source.name ? `lens:${source.name}` : 'lens:check',
-			expr: rewriteToBasisTerms(ctx, source.expr, map, logicalTableName),
+			expr: rewriteToBasisTerms(ctx, source.expr, map, forwards, logicalTableName),
 			// A logical CHECK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			// Prover-supplied write-row dependency set for the per-op decomposition gate.
-			referencedWriteRowColumns: rowLocalReferencedBasisColumns(source.expr, map),
+			referencedWriteRowColumns: rowLocalReferencedBasisColumns(source.expr, map, forwards),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}

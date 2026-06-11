@@ -22,6 +22,11 @@ import { computeSchemaHash } from "../../schema/schema-hasher.js";
 import type { PlanningContext } from "../../planner/planning-context.js";
 import { BuildTimeDependencyTracker } from "../../planner/planning-context.js";
 import { buildBlock } from "../../planner/building/block.js";
+import { resolveBaseSite } from "../../planner/analysis/update-lineage.js";
+import type { LensSlot } from "../../schema/lens.js";
+import { createLogger } from "../../common/logger.js";
+
+const log = createLogger('func:builtins:explain');
 
 interface NamedSchemaLike {
 	name: string;
@@ -730,6 +735,10 @@ export const effectiveLensFunc = createIntegratedTableValuedFunction(
 			columns: [
 				{ name: 'logical_column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'source', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// The put disposition: 'authored' (a `with inverse` clause supplies the
+				// put) · 'inferred' (registry invertibility / identity / passthrough) ·
+				// 'none' (computed, read-only). docs/lens.md § quereus_effective_lens.
+				{ name: 'inverse', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				// Advertisement-backed provenance: the member relationId of the resolved
 				// primary-storage decomposition that backs this column, or NULL when the
 				// column is name-match / override-only (docs/lens.md § The Default Mapper).
@@ -766,11 +775,45 @@ export const effectiveLensFunc = createIntegratedTableValuedFunction(
 		// backs each logical column — additive to the existing provenance rows.
 		const effectiveSql = astToString(slot.compiledBody);
 		const anchor = slot.advertisement?.storage?.anchorRelationId ?? null;
-		for (const p of slot.columnProvenance) {
-			yield [p.logicalColumn, p.source, p.advertisedBy ?? null, anchor, effectiveSql];
+		const inverse = lensInverseDispositions(db, slot);
+		for (let i = 0; i < slot.columnProvenance.length; i++) {
+			const p = slot.columnProvenance[i];
+			yield [p.logicalColumn, p.source, inverse[i] ?? 'none', p.advertisedBy ?? null, anchor, effectiveSql];
 		}
 	}
 );
+
+/**
+ * Per-logical-column put disposition for `quereus_effective_lens` — `'authored'`
+ * (a `with inverse` clause supplies the put) / `'inferred'` (an identity,
+ * passthrough, or registry-inverted base write path — including an optional
+ * member's null-extended base column, whose put the fan-out materializes) /
+ * `'none'` (computed, read-only). Read off the **logically** planned body's
+ * backward `updateLineage` (the same surface `column_info` reads, planned via
+ * `_buildPlan` for the same lineage-preservation reason), positionally aligned
+ * with the slot's column provenance — the compiled body's output columns are
+ * the logical columns in declaration order. A body that fails to plan degrades
+ * every column to `'none'` rather than failing the TVF.
+ */
+function lensInverseDispositions(db: Database, slot: LensSlot): string[] {
+	try {
+		const { plan } = db._buildPlan([slot.compiledBody as AST.Statement]);
+		const root = plan.getRelations()[0];
+		if (!root) return slot.columnProvenance.map(() => 'none');
+		const lineage = root.physical?.updateLineage;
+		const attrs = root.getAttributes();
+		return slot.columnProvenance.map((_p, i) => {
+			const attr = attrs[i];
+			const site = resolveBaseSite(attr ? lineage?.get(attr.id) : undefined);
+			if (site.authored) return 'authored';
+			if (site.baseColumn !== undefined) return 'inferred';
+			return 'none';
+		});
+	} catch (e) {
+		log('quereus_effective_lens: lens body failed to plan for inverse dispositions, reporting none: %O', e);
+		return slot.columnProvenance.map(() => 'none');
+	}
+}
 
 // Basis re-decomposition backfill introspection: per-new-basis-relation backfill
 // DDL the engine generates for a pure re-decomposition, tagged engine-generated

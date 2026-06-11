@@ -4,12 +4,15 @@ import type { TableSchema, UniqueConstraintSchema } from './table.js';
 import { resolvePkDefaultConflict } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
 import type * as AST from '../parser/ast.js';
-import type { FunctionalDependency, GuardClause, GuardPredicate, PlanNode, RelationalPlanNode } from '../planner/nodes/plan-node.js';
+import type { DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate, PlanNode, RelationalPlanNode } from '../planner/nodes/plan-node.js';
 import { addFd, superkeyToFd } from '../planner/util/fd-utils.js';
 import { proveEffectiveKeyUnique } from '../planner/analysis/coverage-prover.js';
 import { resolveBaseSite, type ResolvedBaseSite } from '../planner/analysis/update-lineage.js';
 import { viewComplement } from '../planner/analysis/view-complement.js';
+import { getCheckExtraction, containsNonDeterministicCall, type CheckExtraction } from '../planner/analysis/check-extraction.js';
+import { createRuntimeExpressionEvaluator } from '../planner/analysis/const-evaluator.js';
 import { classifyViewBody } from '../planner/mutation/propagate.js';
+import { substituteNewRefs, transformExpr } from '../planner/mutation/scope-transform.js';
 import { ProjectNode } from '../planner/nodes/project-node.js';
 import { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import { astToString, expressionToString } from '../emit/ast-stringify.js';
@@ -17,7 +20,9 @@ import { PhysicalType } from '../types/logical-type.js';
 import { getReservedTagByTemplate, LENS_WRITABLE_INTENT_TAG } from './reserved-tags.js';
 import type { AcknowledgedAdvisory } from './lens-ack.js';
 import { createLogger } from '../common/logger.js';
-import { ConflictResolution } from '../common/constants.js';
+import { ConflictResolution, FunctionFlags } from '../common/constants.js';
+import { compareSqlValues } from '../util/comparison.js';
+import type { SqlValue } from '../common/types.js';
 
 const log = createLogger('schema:lens-prover');
 
@@ -34,11 +39,11 @@ const log = createLogger('schema:lens-prover');
  * What it cannot prove, it reports — it never silently assumes coverage.
  *
  * Two outputs per slot ({@link LensProveResult}):
- *  - **diagnostics** — five errors (any one blocks the deploy) + four
- *    warning-severity diagnostics that flow to the deploy report: three pure
- *    advisories (no-backing-index / no-answering-structure / partial-override)
- *    plus the read-only verdict (`pk-not-reconstructible`). See `docs/lens.md`
- *    § Coverage checklist.
+ *  - **diagnostics** — the deploy-blocking errors (any one blocks the deploy)
+ *    plus the warning-severity diagnostics that flow to the deploy report: the
+ *    pure advisories (no-backing-index / no-answering-structure /
+ *    partial-override / getput-lossy) plus the read-only verdict
+ *    (`pk-not-reconstructible`). See `docs/lens.md` § Coverage checklist.
  *  - **obligations + readOnly** — per-constraint enforcement classification and
  *    the writable-or-read-only verdict, recorded on the {@link LensSlot}. The
  *    *live* per-write enforcement wiring (`lens-constraint-enforcement-wiring`)
@@ -76,6 +81,7 @@ export type LensErrorCode =
 	| 'lens.unrealizable-constraint'
 	| 'lens.unenforceable-conflict-action'
 	| 'lens.non-invertible'
+	| 'lens.putget-violation'
 	| 'lens.unknown-policy-code';
 
 /**
@@ -90,6 +96,7 @@ const ADVISORY_CODE_LIST = [
 	'lens.no-backing-index',
 	'lens.no-answering-structure',
 	'lens.partial-override',
+	'lens.getput-lossy',
 ] as const;
 
 /** An advisory (warning-severity) code — see {@link ADVISORY_CODE_LIST}. */
@@ -126,6 +133,14 @@ export interface FingerprintInputs {
 	readonly cardinalityBand?: string;
 	/** The basis relation backing the constraint (lowercased `schema.table`), when resolvable. */
 	readonly basisRelation?: string;
+	/**
+	 * The enumerable CHECK `in (...)` domain behind a round-trip advisory
+	 * (`lens.getput-lossy`), rendered + sorted — a domain change (the list gains
+	 * or loses a value) is a material fact that re-surfaces an acknowledgment.
+	 * Serialized into the fingerprint only when present, so advisories without a
+	 * domain keep their existing hashes.
+	 */
+	readonly domainValues?: readonly string[];
 }
 
 /** A sited, coded diagnostic. Errors block the deploy; warnings flow to the report. */
@@ -222,7 +237,7 @@ export function proveLens(slot: LensSlot, db: Database): LensProveResult {
 	checkColumnCoverage(ctx, errors);
 	checkTypeAndNullability(ctx, errors);
 	const readOnly = checkKeyReconstructibility(ctx, warnings);
-	errors.push(...proveRoundTrip(ctx));
+	proveRoundTrip(ctx, readOnly, errors, warnings);
 
 	const obligations = classifyObligations(ctx, readOnly, errors, warnings);
 
@@ -499,7 +514,7 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
  *    restriction the column's inverse carries is **entailed** by the residual
  *    predicate.
  *
- * The firing rule has two branches:
+ * The firing rule has three branches:
  *  1. a column the lens presents as writable (a `base` {@link ResolvedBaseSite})
  *     whose round-trip the analysis cannot prove faithful (`v.writable &&
  *     !v.faithful`) — the original rule, unchanged.
@@ -507,6 +522,17 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
  *     writable via the `quereus.lens.writable = true` intent tag
  *     ({@link intentWritable}): the round-trip law's stronger reading makes this
  *     an authoring error, not a derived column.
+ *  3. an **authored** (`with inverse`) column ({@link checkAuthoredInverse}):
+ *     writable by construction (it satisfies the writable intent exactly as an
+ *     inferred inverse does — branch 2 never fires for it). PutGet is checked by
+ *     *composition*: when the logical column carries an enumerable CHECK
+ *     `in (...)` domain, `forward(inverse(v))` is const-evaluated per domain
+ *     value — a value that fails to reproduce is the hard `lens.putget-violation`
+ *     error; no enumerable domain degrades to the safe admit. GetPut is
+ *     surrendered by design for a non-injective forward (a write-through
+ *     normalizes the base value) and surfaces as the acknowledgeable
+ *     `lens.getput-lossy` advisory — suppressed only when the enumeration also
+ *     proves the forward bijective over the basis domain.
  *
  * An opaque column carrying no intent tag (or `= false`) is *not* a deploy error
  * — it is an intentional read-only/derived column (its write reds `no-inverse` at
@@ -531,17 +557,24 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
  * See `docs/lens.md` § Round-trip and `docs/view-updateability.md`
  * § The predicate-honest complement.
  */
-function proveRoundTrip(ctx: ProveContext): LensDiagnostic[] {
+function proveRoundTrip(ctx: ProveContext, readOnly: boolean, errors: LensDiagnostic[], warnings: LensDiagnostic[]): void {
 	const root = planLogicalBody(ctx);
-	if (!root) return []; // body failed to plan logically → safe verdict
+	if (!root) return; // body failed to plan logically → safe verdict
 	const verdicts = computeRoundTrip(root);
-	if (!verdicts) return []; // out of fragment / indeterminate complement → safe verdict
+	if (!verdicts) return; // out of fragment / indeterminate complement → safe verdict
 
-	const errors: LensDiagnostic[] = [];
 	verdicts.forEach((v, i) => {
 		// Site at the *logical* column (the contract spelling), positionally aligned
 		// with the body output — the same space `column_info` derives writability in.
 		const column = ctx.outputColumns[i] ?? v.name;
+
+		// (3) An authored (`with inverse`) column: writable by construction (the
+		// intent branch below never fires), PutGet checked by composition, GetPut
+		// surrendered into the `lens.getput-lossy` advisory.
+		if (v.authored) {
+			checkAuthoredInverse(ctx, column, v.authored, v.forward, readOnly, errors, warnings);
+			return;
+		}
 
 		// (1) A column the lens presents as writable whose round-trip cannot be
 		// proved faithful — the original firing rule, unchanged.
@@ -567,7 +600,6 @@ function proveRoundTrip(ctx: ProveContext): LensDiagnostic[] {
 			});
 		}
 	});
-	return errors;
 }
 
 /**
@@ -612,6 +644,15 @@ export interface ColumnRoundTrip {
 	readonly faithful: boolean;
 	/** Names the obstruction for a writable-but-unfaithful column (else undefined). */
 	readonly obstruction?: string;
+	/**
+	 * The authored (`with inverse`) put payload, when the column's write path is
+	 * authored. Such a column is writable+faithful *structurally*; its law
+	 * treatment is the prover's authored branch ({@link checkAuthoredInverse}) —
+	 * PutGet by enumeration, GetPut surrendered into the lossy advisory.
+	 */
+	readonly authored?: AuthoredSite;
+	/** The forward `get` expression off the topmost projection (carried for the authored branch's composition). */
+	readonly forward?: AST.Expression;
 }
 
 /**
@@ -650,6 +691,13 @@ export function computeRoundTrip(root: RelationalPlanNode): ColumnRoundTrip[] | 
 		const site = resolveBaseSite(lineage.get(attr.id));
 		if (!site.writable) {
 			return { attrId: attr.id, name: attr.name, writable: false, faithful: false };
+		}
+		// An authored (`with inverse`) put: the structural obstructions below are
+		// inapplicable (no single verbatim base column, no registry inverse) — the
+		// verdict is writable+faithful with the authored payload attached for the
+		// prover's dedicated law treatment (enumeration + lossy advisory).
+		if (site.authored) {
+			return { attrId: attr.id, name: attr.name, writable: true, faithful: true, authored: site.authored, forward: forwardByAttr.get(attr.id) };
 		}
 		const obstruction = roundTripObstruction(site, hidden, forwardByAttr.get(attr.id), complement.residualPredicate);
 		return { attrId: attr.id, name: attr.name, writable: true, faithful: obstruction === undefined, obstruction };
@@ -863,6 +911,322 @@ function domainEntailedBy(domain: AST.Expression, residual: AST.Expression | und
 	split(residual);
 	const target = expressionToString(domain);
 	return conjuncts.some(c => expressionToString(c) === target);
+}
+
+// ---------------------------------------------------------------------------
+// Authored inverses (`with inverse`) — PutGet by enumeration, GetPut advisory.
+// See docs/lens.md § Computed and Generated Columns (authored inverses) and
+// docs/view-updateability.md § Authored inverses (law treatment).
+// ---------------------------------------------------------------------------
+
+/** The authored put payload off a resolved {@link ResolvedBaseSite}. */
+type AuthoredSite = NonNullable<ResolvedBaseSite['authored']>;
+
+/** Enumeration cap — a CHECK `in (...)` domain larger than this degrades to safe. */
+const ENUM_DOMAIN_CAP = 64;
+
+/** The outcome of the PutGet composition enumeration over one authored column. */
+type PutGetEnumeration =
+	| { readonly kind: 'proved'; readonly injective: boolean; readonly domain: readonly SqlValue[] }
+	| { readonly kind: 'violation'; readonly value: SqlValue; readonly got: SqlValue; readonly domain: readonly SqlValue[] }
+	| { readonly kind: 'indeterminate'; readonly domain?: readonly SqlValue[] };
+
+/**
+ * The law treatment for one authored-inverse column (firing-rule branch 3):
+ *
+ *  - **PutGet** (`forward(inverse(v)) ≡ v`) — checked by composition over the
+ *    logical column's enumerable CHECK `in (...)` domain
+ *    ({@link provePutGetByEnumeration}). A value that fails to reproduce is the
+ *    hard `lens.putget-violation` error (a put that loses the written value is
+ *    never acceptable), sited at the column and naming the offending value. No
+ *    enumerable domain / non-const-foldable composition → degrade to safe
+ *    (admit; mutation-time behavior governs — the prover's usual posture, no
+ *    advisory for the unverified case).
+ *  - **GetPut** — surrendered by design for a non-injective forward (a
+ *    write-through normalizes the base value to the inverse's representative):
+ *    the acknowledgeable `lens.getput-lossy` advisory, suppressed only when the
+ *    enumeration also proves the forward bijective
+ *    ({@link proveForwardInjective}). Suppressed wholesale on a read-only table
+ *    (mutations never run the put — same gate as `lens.no-backing-index`); the
+ *    PutGet error is NOT read-only-gated, mirroring branch (1)'s posture that a
+ *    provably unsound declared write path is an authoring error regardless.
+ *
+ * The advisory's fingerprint carries the rendered domain values, so a CHECK
+ * list change (the domain gains a value) re-surfaces an acknowledgment.
+ */
+function checkAuthoredInverse(
+	ctx: ProveContext,
+	column: string,
+	authored: AuthoredSite,
+	forward: AST.Expression | undefined,
+	readOnly: boolean,
+	errors: LensDiagnostic[],
+	warnings: LensDiagnostic[],
+): void {
+	const result = provePutGetByEnumeration(ctx, column, authored, forward);
+	if (result.kind === 'violation') {
+		errors.push({
+			code: 'lens.putget-violation',
+			severity: 'error',
+			site: { table: ctx.table.name, column },
+			message: `lens: authored inverse on '${ctx.table.name}.${column}' violates PutGet — writing ${renderSqlValue(result.value)} stores a basis image that reads back as ${renderSqlValue(result.got)}; forward(inverse(v)) must reproduce every value of the column's CHECK domain (fix the 'with inverse' expression or the forward mapping)`,
+		});
+		return;
+	}
+	if (result.kind === 'proved' && result.injective) return; // bijective over the enumerated domains ⇒ GetPut holds too
+	if (readOnly) return; // the put never runs on a read-only table — the lossy advisory is moot
+
+	warnings.push({
+		code: 'lens.getput-lossy',
+		severity: 'warning',
+		site: { table: ctx.table.name, column },
+		message: `lens: column '${ctx.table.name}.${column}' writes through an authored inverse whose forward mapping is not proven injective — GetPut is surrendered (a write-through normalizes the stored basis value to the inverse's representative). Acknowledge with 'quereus.lens.ack.getput-lossy:${column.toLowerCase()}' if intentional, or make the forward bijective over enumerable CHECK domains.`,
+		fingerprintInputs: {
+			...buildFingerprint(ctx, [column], false),
+			...(result.domain ? { domainValues: result.domain.map(renderSqlValue).sort() } : {}),
+		},
+	});
+}
+
+/**
+ * PutGet by composition: per logical-domain value `v`, lower `v` through every
+ * authored put (substituting the `new.<col>` refs with the literal), then re-read
+ * it through the forward `get` with each referenced base column bound to its put
+ * image — requiring `forward(inverse(v)) ≡ v` under SQL value equality.
+ *
+ * Preconditions (any miss ⇒ `indeterminate`, the degrade-to-safe signal):
+ * a forward expression resolved off the projection; a single basis source (the
+ * forward's column refs name-match against put targets — ambiguous past
+ * single-source); an inverse that is a function of the written column alone
+ * (every `new.*` ref resolves to this column); a deterministic, subquery-free
+ * forward + puts ({@link constEvaluable} — the composition is evaluated with the
+ * const evaluator only, never a vtab read); and every forward column ref covered
+ * by a put target. A definite per-value violation wins over another value's
+ * evaluation failure (it is a proven law break either way).
+ */
+function provePutGetByEnumeration(
+	ctx: ProveContext,
+	column: string,
+	authored: AuthoredSite,
+	forward: AST.Expression | undefined,
+): PutGetEnumeration {
+	const li = ctx.logicalColIndex.get(column.toLowerCase());
+	const domain = li !== undefined ? enumerableDomain(getCheckExtraction(ctx.table), li) : undefined;
+	if (!domain) return { kind: 'indeterminate' };
+
+	const oi = ctx.outputIndex.get(column.toLowerCase());
+	if (forward === undefined || ctx.basisSource === undefined || oi === undefined) return { kind: 'indeterminate', domain };
+	for (const refIdx of authored.newRefIndex.values()) {
+		if (refIdx !== oi) return { kind: 'indeterminate', domain };
+	}
+	if (!constEvaluable(ctx.db, forward) || authored.puts.some(p => !constEvaluable(ctx.db, p.expr))) {
+		return { kind: 'indeterminate', domain };
+	}
+	const putTargets = new Set(authored.puts.map(p => p.baseColumn.toLowerCase()));
+	if (collectColumnRefNames(forward).some(n => !putTargets.has(n.toLowerCase()))) {
+		return { kind: 'indeterminate', domain }; // the forward reads a base column the inverse does not determine
+	}
+
+	// `forward(inverse(v))`, or undefined when any step is not const-evaluable.
+	const composition = (v: SqlValue): SqlValue | undefined => {
+		const baseImage = new Map<string, SqlValue>();
+		for (const p of authored.puts) {
+			const bv = evalDeployConstant(ctx.db, substituteNewRefs(p.expr, () => ({ type: 'literal', value: v })));
+			if (bv === undefined) return undefined;
+			baseImage.set(p.baseColumn.toLowerCase(), bv);
+		}
+		return evalDeployConstant(ctx.db, substituteBaseRefs(forward, baseImage));
+	};
+
+	let indeterminate = false;
+	for (const v of domain) {
+		const got = composition(v);
+		if (got === undefined) { indeterminate = true; continue; }
+		if (!sqlValueEquals(got, v)) return { kind: 'violation', value: v, got, domain };
+	}
+	if (indeterminate) return { kind: 'indeterminate', domain };
+	return { kind: 'proved', injective: proveForwardInjective(ctx, authored, forward, domain), domain };
+}
+
+/**
+ * Forward injectivity over the basis column's own enumerable CHECK domain. With
+ * PutGet proved over the logical domain, an injective forward whose image stays
+ * *inside* that logical domain makes the pair bijective between the two
+ * enumerated domains, so GetPut holds (`put(get(b)) = b` for every basis value)
+ * and the lossy advisory is suppressed. Conservative: requires a single put
+ * target backed by a NOT NULL basis column (a nullable basis admits a value
+ * outside the enumeration) and a const-evaluable, never-NULL forward image at
+ * every basis value. The forward's refs ⊆ put targets was already established
+ * by the caller, so the single binding covers every ref.
+ */
+function proveForwardInjective(
+	ctx: ProveContext,
+	authored: AuthoredSite,
+	forward: AST.Expression,
+	logicalDomain: readonly SqlValue[],
+): boolean {
+	const basis = ctx.basisSource;
+	if (!basis || authored.puts.length !== 1) return false;
+	const put = authored.puts[0];
+	const bi = basis.columnIndexMap.get(put.baseColumn.toLowerCase());
+	if (bi === undefined || !basis.columns[bi]?.notNull) return false;
+	const basisDomain = enumerableDomain(getCheckExtraction(basis), bi);
+	if (!basisDomain) return false;
+
+	const seen: SqlValue[] = [];
+	for (const b of basisDomain) {
+		const got = evalDeployConstant(ctx.db, substituteBaseRefs(forward, new Map([[put.baseColumn.toLowerCase(), b]])));
+		if (got === undefined || got === null) return false;
+		if (!logicalDomain.some(v => sqlValueEquals(v, got))) return false; // image escapes the PutGet-proved domain
+		if (seen.some(s => sqlValueEquals(s, got))) return false;           // two basis values collapse — not injective
+		seen.push(got);
+	}
+	return true;
+}
+
+/**
+ * The enumerable CHECK domain of one column: the literal `in (...)` value list,
+ * intersected across multiple enum CHECKs and filtered through any recognized
+ * range CHECK on the same column — the enumeration must never include a value
+ * the declared CHECK surface already excludes, since a false
+ * `lens.putget-violation` would block a sound deploy. NULLs are dropped (an
+ * `in` list never admits one). Undefined when no enum constraint exists, the
+ * filtered domain is empty, or it exceeds {@link ENUM_DOMAIN_CAP}.
+ */
+function enumerableDomain(extraction: CheckExtraction, columnIndex: number): SqlValue[] | undefined {
+	let values: SqlValue[] | undefined;
+	for (const dc of extraction.domainConstraints) {
+		if (dc.column !== columnIndex || dc.kind !== 'enum') continue;
+		const list = dc.values.filter(v => v !== null);
+		values = values === undefined ? list : values.filter(v => list.some(w => sqlValueEquals(v, w)));
+	}
+	if (values === undefined) return undefined;
+	for (const dc of extraction.domainConstraints) {
+		if (dc.column !== columnIndex || dc.kind !== 'range') continue;
+		values = values.filter(v => withinRange(v, dc));
+	}
+	if (values.length === 0 || values.length > ENUM_DOMAIN_CAP) return undefined;
+	return values;
+}
+
+/** Whether `v` satisfies a recognized range domain constraint. */
+function withinRange(v: SqlValue, r: Extract<DomainConstraint, { kind: 'range' }>): boolean {
+	if (r.min !== undefined) {
+		const c = compareSqlValues(v, r.min);
+		if (r.minInclusive ? c < 0 : c <= 0) return false;
+	}
+	if (r.max !== undefined) {
+		const c = compareSqlValues(v, r.max);
+		if (r.maxInclusive ? c > 0 : c >= 0) return false;
+	}
+	return true;
+}
+
+/**
+ * Whether an expression is sound to fold at deploy with the const evaluator:
+ * deterministic functions only and no subquery —
+ * {@link containsNonDeterministicCall} flags both (a vtab read can never be a
+ * deploy-time constant). An unregistered function is treated deterministic; its
+ * evaluation failing falls through {@link evalDeployConstant}'s degrade anyway.
+ */
+function constEvaluable(db: Database, expr: AST.Expression): boolean {
+	const isDeterministic = (name: string, argc: number): boolean => {
+		const fn = db.schemaManager.findFunction(name, argc) ?? db.schemaManager.findFunction(name, -1);
+		return fn ? (fn.flags & FunctionFlags.DETERMINISTIC) !== 0 : true;
+	};
+	return !containsNonDeterministicCall(expr, isDeterministic);
+}
+
+/** Replace each (qualifier-agnostic) base-column reference with its literal image. */
+function substituteBaseRefs(expr: AST.Expression, baseImage: ReadonlyMap<string, SqlValue>): AST.Expression {
+	return transformExpr(expr, col => {
+		const v = baseImage.get(col.name.toLowerCase());
+		return v === undefined ? undefined : { type: 'literal', value: v };
+	});
+}
+
+/**
+ * Evaluate a column-free scalar expression at deploy via the engine's own const
+ * evaluator (`createRuntimeExpressionEvaluator`) — never a vtab read; the
+ * expression is planned as a bare one-column SELECT so it builds in an empty
+ * scope. Returns undefined (the degrade-to-safe signal) when the expression
+ * fails to build, evaluates asynchronously (not a deploy-time constant), or
+ * throws.
+ */
+function evalDeployConstant(db: Database, expr: AST.Expression): SqlValue | undefined {
+	try {
+		const stmt: AST.SelectStmt = { type: 'select', columns: [{ type: 'column', expr }] };
+		const { plan } = db._buildPlan([stmt as AST.Statement]);
+		const root = plan.getRelations()[0];
+		const node = root === undefined ? undefined : findProjectNode(root)?.getProjections()[0]?.node;
+		if (!node) return undefined;
+		const value = createRuntimeExpressionEvaluator(db)(node);
+		if (value instanceof Promise) {
+			void value.catch(() => undefined); // async ⇒ not a deploy-time constant; never crash the deploy on it
+			return undefined;
+		}
+		return value as SqlValue;
+	} catch (e) {
+		log('lens-prover: authored-inverse composition failed to const-evaluate, degrading to safe: %O', e);
+		return undefined;
+	}
+}
+
+/**
+ * Maps each authored-inverse logical column (lowercased) to its **forward** `get`
+ * expression (basis terms), when that forward is row-local-enforceable — a
+ * subquery-free scalar over basis column refs. This is the agreement predicate
+ * between the prover's CHECK realizability classifier
+ * ({@link classifyCheckConstraint}: a CHECK referencing an authored column is
+ * row-local exactly when this map has the column) and the write-time
+ * logical→basis rewrite (`planner/mutation/lens-enforcement.ts`), which
+ * substitutes the forward — `NEW.`-qualified — for the column ref so the CHECK
+ * evaluates over the basis write row's logical image. The two must accept the
+ * same set, or a deploy-admitted CHECK would crash at write plan time.
+ */
+export function authoredForwardMap(slot: LensSlot): Map<string, AST.Expression> {
+	const map = new Map<string, AST.Expression>();
+	slot.columnProvenance.forEach((p, i) => {
+		const rc = slot.compiledBody.columns[i];
+		if (rc && rc.type === 'column' && rc.inverse && rc.inverse.length > 0 && !containsRelationalOperand(rc.expr)) {
+			map.set(p.logicalColumn.toLowerCase(), rc.expr);
+		}
+	});
+	return map;
+}
+
+/** Reflective walk: does the expression contain a relational operand (subquery / exists / in-subquery)? */
+function containsRelationalOperand(expr: AST.Expression): boolean {
+	const stack: AST.AstNode[] = [expr as AST.AstNode];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.type === 'subquery' || node.type === 'exists') return true;
+		if (node.type === 'in' && (node as AST.InExpr).subquery) return true;
+		for (const key of Object.keys(node)) {
+			const value = (node as unknown as Record<string, unknown>)[key];
+			if (!value) continue;
+			if (Array.isArray(value)) {
+				for (const item of value) {
+					if (item && typeof item === 'object' && 'type' in item) stack.push(item as AST.AstNode);
+				}
+			} else if (typeof value === 'object' && 'type' in (value as object)) {
+				stack.push(value as AST.AstNode);
+			}
+		}
+	}
+	return false;
+}
+
+/** SQL value equality for the enumeration (NULL equals only NULL — identity, not three-valued `=`). */
+function sqlValueEquals(a: SqlValue, b: SqlValue): boolean {
+	if (a === null || b === null) return a === null && b === null;
+	return compareSqlValues(a, b) === 0;
+}
+
+/** Render a domain value for a sited message / fingerprint (text quoted, so '1' ≠ 1). */
+function renderSqlValue(v: SqlValue): string {
+	if (v === null) return 'NULL';
+	return typeof v === 'string' ? `'${v}'` : String(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,6 +1467,13 @@ function rejectRowTimeConflictAction(
  * path (computed lineage) is unrealizable (error). Otherwise it is row-local —
  * evaluable on the projected row at the write boundary. (Vacuous-by-body-predicate
  * detection is deferred; a row-local check is always sound, just possibly redundant.)
+ *
+ * An **authored-inverse** column ({@link authoredForwardMap}) has a write path —
+ * the put expressions — and its CHECK stays row-local: the write-time rewrite
+ * substitutes the column's forward `get` (`NEW.`-qualified basis terms) for the
+ * ref, so the CHECK evaluates over the written basis row's logical image. The
+ * map already excludes a forward the rewrite cannot substitute (subquery-
+ * bearing), keeping deploy acceptance and write-time enforceability in lockstep.
  */
 function classifyCheckConstraint(
 	ctx: ProveContext,
@@ -1110,10 +1481,11 @@ function classifyCheckConstraint(
 	errors: LensDiagnostic[],
 ): ConstraintObligation {
 	const label = constraintLabel(constraint);
+	const authoredForwards = authoredForwardMap(ctx.slot);
 	for (const ref of collectColumnRefNames(constraint.constraint.expr)) {
 		const li = ctx.logicalColIndex.get(ref.toLowerCase());
 		if (li === undefined) continue; // not a logical column of this table — leave to body resolution
-		if (!isReconstructibleColumn(ctx, ref)) {
+		if (!isReconstructibleColumn(ctx, ref) && !authoredForwards.has(ref.toLowerCase())) {
 			errors.push({
 				code: 'lens.unrealizable-constraint',
 				severity: 'error',

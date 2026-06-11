@@ -360,13 +360,43 @@ describe('lens ack: escalation policy', () => {
 });
 
 describe('lens ack: advisory vocabulary (drift guard)', () => {
-	it('ACKNOWLEDGEABLE_ADVISORY_CODES is exactly the four governable warning codes', () => {
+	it('ACKNOWLEDGEABLE_ADVISORY_CODES is exactly the five governable warning codes', () => {
 		expect([...ACKNOWLEDGEABLE_ADVISORY_CODES].sort()).to.deep.equal([
+			'lens.getput-lossy',
 			'lens.no-answering-structure',
 			'lens.no-backing-index',
 			'lens.partial-override',
 			'lens.pk-not-reconstructible',
 		]);
+	});
+});
+
+describe('lens ack: fingerprint domain sensitivity (lens.getput-lossy)', () => {
+	const site = { table: 't', column: 'grp' };
+
+	it('a CHECK in-list change moves the fingerprint (the ack re-surfaces)', () => {
+		const a = computeAdvisoryFingerprint('lens.getput-lossy', site, {
+			constraintColumns: ['grp'], domainValues: [`'A'`, `'B'`],
+		});
+		const b = computeAdvisoryFingerprint('lens.getput-lossy', site, {
+			constraintColumns: ['grp'], domainValues: [`'A'`, `'B'`, `'C'`],
+		});
+		expect(a).to.not.equal(b);
+	});
+
+	it('the domain is order-insensitive (canonicalized) and only serialized when present', () => {
+		const a = computeAdvisoryFingerprint('lens.getput-lossy', site, {
+			constraintColumns: ['grp'], domainValues: [`'B'`, `'A'`],
+		});
+		const b = computeAdvisoryFingerprint('lens.getput-lossy', site, {
+			constraintColumns: ['grp'], domainValues: [`'A'`, `'B'`],
+		});
+		expect(a).to.equal(b);
+
+		// Absent domain ⇒ the key is omitted entirely, so pre-existing advisory
+		// fingerprints (every code without a domain) are unchanged by the new field.
+		const without = computeAdvisoryFingerprint('lens.getput-lossy', site, { constraintColumns: ['grp'] });
+		expect(without).to.not.equal(a);
 	});
 });
 

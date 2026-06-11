@@ -173,6 +173,11 @@ export function computeAdvisoryFingerprint(
 		cover: inputs?.hasCoveringStructure ?? null,
 		band: inputs?.cardinalityBand ?? null,
 		basis: inputs?.basisRelation ?? null,
+		// Conditionally serialized: advisories carrying no domain (every code
+		// before `lens.getput-lossy`) keep their pre-existing hashes, while a
+		// CHECK `in (...)` list change moves a round-trip advisory's fingerprint
+		// and re-surfaces its acknowledgment.
+		...(inputs?.domainValues ? { domain: [...inputs.domainValues].sort() } : {}),
 	});
 	return toBase64Url(fnv1aHash(canonical)).slice(0, 12);
 }

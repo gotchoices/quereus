@@ -1,0 +1,477 @@
+-- Authored inverses at the lens boundary (docs/lens.md § Computed and
+-- Generated Columns; docs/view-updateability.md § Authored inverses;
+-- ticket `authored-inverse-lens-prover`).
+--
+-- Covers the prover's law treatment for `with inverse` columns through the full
+-- SQL pipeline: the acknowledgeable `lens.getput-lossy` advisory (+ ack and
+-- escalation governance), the `lens.putget-violation` hard error for an inverse
+-- the forward provably does not reproduce, the bijective-enumeration advisory
+-- suppression, the `inverse` disposition column on quereus_effective_lens, and
+-- writable-intent satisfaction by an authored inverse. (Fingerprint mechanics
+-- are unit-tested in test/lens-ack.spec.ts.)
+
+-- ===================================
+-- 1. Code-collapse lens: a non-injective forward with an authored inverse
+--    deploys with the lens.getput-lossy advisory; PutGet holds by enumeration;
+--    write-through normalizes the basis value (GetPut surrendered).
+-- ===================================
+
+declare schema ai1b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('A1', 'A2', 'B1', 'B2', 'C1'))
+	)
+}
+
+-- run
+
+apply schema ai1b;
+
+-- run
+
+insert into ai1b.Item values (1, 'A2'), (2, 'B2');
+
+-- run
+
+declare logical schema ai1x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	)
+}
+
+-- run
+
+declare lens for ai1x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai1x;
+
+-- run
+
+-- The advisory fires, sited at the authored column.
+select code, "column", status from quereus_lens_advisories('ai1x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "column": "grp", "status": "active"}]
+
+-- Reads collapse the basis codes through the forward.
+select * from ai1x.Item order by id;
+→ [{"id": 1, "grp": "A"}, {"id": 2, "grp": "B"}]
+
+-- effective-lens reports the authored disposition.
+select logical_column, inverse from quereus_effective_lens('ai1x', 'Item') order by logical_column;
+→ [{"logical_column": "grp", "inverse": "authored"}, {"logical_column": "id", "inverse": "inferred"}]
+
+-- run
+
+-- UPDATE lowers through the authored put.
+update ai1x.Item set grp = 'C' where id = 1;
+select code from ai1b.Item where id = 1;
+→ [{"code": "C1"}]
+
+-- GetPut surrendered: writing the read value back normalizes B2 → B1 (the
+-- inverse's representative) — exactly what the advisory warns about.
+update ai1x.Item set grp = grp where id = 2;
+select code from ai1b.Item where id = 2;
+→ [{"code": "B1"}]
+
+-- INSERT evaluates the put per supplied row.
+insert into ai1x.Item (id, grp) values (3, 'A');
+select code from ai1b.Item where id = 3;
+→ [{"code": "A1"}]
+
+-- run
+
+-- The logical CHECK is enforced at the lens boundary over the written image.
+insert into ai1x.Item (id, grp) values (4, 'Z');
+-- error: check
+
+-- ===================================
+-- 2. An in-source ack suppresses the advisory (unconditional — no fingerprint)
+-- ===================================
+
+declare logical schema ai2x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	) with tags (
+		"quereus.lens.ack.getput-lossy:grp" = 'collapse to the 1-suffix representative is intentional'
+	)
+}
+
+-- run
+
+declare lens for ai2x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai2x;
+
+-- run
+
+select code, status, rationale from quereus_lens_advisories('ai2x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "status": "acknowledged-unconditional", "rationale": "collapse to the 1-suffix representative is intentional"}]
+
+-- ===================================
+-- 3. Escalation: require-ack makes the un-acknowledged advisory a deploy error
+-- ===================================
+
+declare logical schema ai3x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	) with tags (
+		"quereus.lens.policy.require-ack" = 'lens.getput-lossy'
+	)
+}
+
+-- run
+
+declare lens for ai3x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai3x;
+-- error: lens.getput-lossy
+
+-- ===================================
+-- 4. Escalation: error-on is a hard error an ack cannot suppress
+-- ===================================
+
+declare logical schema ai4x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	) with tags (
+		"quereus.lens.policy.error-on" = 'lens.getput-lossy',
+		"quereus.lens.ack.getput-lossy:grp" = 'attempted suppression of a hard policy'
+	)
+}
+
+-- run
+
+declare lens for ai4x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai4x;
+-- error: lens.getput-lossy
+
+-- ===================================
+-- 5. A deliberately wrong inverse reds lens.putget-violation at deploy:
+--    inverse('A') = 'B1' but forward('B1') = 'B' ≠ 'A'.
+-- ===================================
+
+declare logical schema ai5x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai5x over ai1b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = case new.grp when 'A' then 'B1' else new.grp || '1' end)
+	from ai1b.Item
+}
+
+-- run
+
+apply schema ai5x;
+-- error: lens.putget-violation
+
+-- ===================================
+-- 6. A bijective enumerable mapping emits no advisory (forward proved injective
+--    over the basis CHECK domain, image inside the logical domain) — and GetPut
+--    operationally holds: write-back leaves the basis unchanged.
+-- ===================================
+
+declare schema ai6b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('a', 'b', 'c'))
+	)
+}
+
+-- run
+
+apply schema ai6b;
+
+-- run
+
+insert into ai6b.Item values (1, 'b');
+
+-- run
+
+declare logical schema ai6x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B', 'C'))
+	)
+}
+
+-- run
+
+declare lens for ai6x over ai6b {
+	view Item as select id, upper(code) as grp
+		with inverse (code = lower(new.grp))
+	from ai6b.Item
+}
+
+-- run
+
+apply schema ai6x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('ai6x') where code = 'lens.getput-lossy';
+→ [{"n": 0}]
+
+-- GetPut: writing the read value back leaves the basis byte-identical.
+update ai6x.Item set grp = grp where id = 1;
+select code from ai6b.Item where id = 1;
+→ [{"code": "b"}]
+
+-- PutGet write-through.
+update ai6x.Item set grp = 'C' where id = 1;
+select code from ai6b.Item where id = 1;
+→ [{"code": "c"}]
+
+-- ===================================
+-- 7. effective-lens `inverse` dispositions across a mixed table:
+--    authored / inferred (covered + gap-filled) / none (computed, read-only).
+-- ===================================
+
+declare schema ai7b {
+	table T (
+		id integer primary key,
+		name text null,
+		code text not null check (code in ('a', 'b'))
+	)
+}
+
+-- run
+
+apply schema ai7b;
+
+-- run
+
+insert into ai7b.T values (1, 'ada', 'a');
+
+-- run
+
+declare logical schema ai7x {
+	table T (
+		id integer primary key,
+		name text null,
+		grp text null check (grp in ('A', 'B')),
+		shout text null
+	)
+}
+
+-- run
+
+-- `name` is gap-filled (identity ⇒ inferred); `shout` is computed with no
+-- inverse (none); `grp` carries the authored put (authored).
+declare lens for ai7x over ai7b {
+	view T as select id, upper(code) as grp
+		with inverse (code = lower(new.grp)),
+		upper(name) as shout
+	from ai7b.T
+}
+
+-- run
+
+apply schema ai7x;
+
+-- run
+
+select logical_column, source, inverse from quereus_effective_lens('ai7x', 'T') order by logical_column;
+→ [{"logical_column": "grp", "source": "override", "inverse": "authored"}, {"logical_column": "id", "source": "override", "inverse": "inferred"}, {"logical_column": "name", "source": "default", "inverse": "inferred"}, {"logical_column": "shout", "source": "override", "inverse": "none"}]
+
+-- run
+
+select * from ai7x.T;
+→ [{"id": 1, "name": "ada", "grp": "A", "shout": "ADA"}]
+
+-- ===================================
+-- 8. quereus.lens.writable = true is satisfied by an authored inverse — no
+--    lens.non-invertible (the column is writable through the supplied put).
+-- ===================================
+
+declare schema ai8b {
+	table Core (
+		id integer primary key,
+		speed integer not null
+	)
+}
+
+-- run
+
+apply schema ai8b;
+
+-- run
+
+insert into ai8b.Core values (1, 30);
+
+-- run
+
+declare logical schema ai8x {
+	table Car (
+		id integer primary key,
+		mph integer null with tags ("quereus.lens.writable" = true)
+	)
+}
+
+-- run
+
+declare lens for ai8x over ai8b {
+	view Car as select id, speed * 3 as mph
+		with inverse (speed = new.mph / 3)
+	from ai8b.Core
+}
+
+-- run
+
+apply schema ai8x;
+
+-- run
+
+select * from ai8x.Car;
+→ [{"id": 1, "mph": 90}]
+
+update ai8x.Car set mph = 120 where id = 1;
+select speed from ai8b.Core where id = 1;
+→ [{"speed": 40}]
+
+-- ===================================
+-- 9. Out-of-fragment body (join) + authored inverse + writable intent:
+--    degrade-to-safe holds — no branch fires (no lens.non-invertible, no
+--    advisory), the documented completeness gap is not regressed.
+-- ===================================
+
+declare schema ai9b {
+	table Core (
+		id integer primary key,
+		code text not null
+	)
+	table Aux (
+		id integer primary key,
+		tag text null
+	)
+}
+
+-- run
+
+apply schema ai9b;
+
+-- run
+
+insert into ai9b.Core values (1, 'x');
+insert into ai9b.Aux values (1, 't');
+
+-- run
+
+declare logical schema ai9x {
+	table V (
+		id integer primary key,
+		label text null with tags ("quereus.lens.writable" = true)
+	)
+}
+
+-- run
+
+declare lens for ai9x over ai9b {
+	view V as select Core.id as id, upper(Core.code) as label
+		with inverse (code = lower(new.label))
+	from ai9b.Core inner join ai9b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai9x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('ai9x') where code = 'lens.getput-lossy';
+→ [{"n": 0}]
+
+select * from ai9x.V;
+→ [{"id": 1, "label": "X"}]
+
+-- ===================================
+-- 10. A non-constant-foldable inverse (subquery) over an enumerable domain
+--     degrades to safe — deploys with the advisory, never a crash; the
+--     mutation-time lowering still consumes the subquery put.
+-- ===================================
+
+declare schema ai10b {
+	table Item (
+		id integer primary key,
+		code text not null
+	)
+	table Lk (
+		grp text primary key,
+		rep text not null
+	)
+}
+
+-- run
+
+apply schema ai10b;
+
+-- run
+
+insert into ai10b.Item values (1, 'A1');
+insert into ai10b.Lk values ('A', 'A1'), ('B', 'B1');
+
+-- run
+
+declare logical schema ai10x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai10x over ai10b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = (select rep from ai10b.Lk where Lk.grp = new.grp))
+	from ai10b.Item
+}
+
+-- run
+
+apply schema ai10x;
+
+-- run
+
+-- Degrade-to-safe: the composition is not const-foldable, so PutGet is
+-- unverified (no error) and the advisory stands (not proved bijective).
+select code, status from quereus_lens_advisories('ai10x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "status": "active"}]
+
+-- The mutation-time put still evaluates the subquery per write.
+update ai10x.Item set grp = 'B' where id = 1;
+select code from ai10b.Item where id = 1;
+→ [{"code": "B1"}]
