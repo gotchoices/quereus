@@ -614,6 +614,13 @@ const checkColMap = new Map<string, number>([
 	['b', 8],
 ]);
 const allDeterministic = () => true;
+// BINARY-declared TEXT metadata — pass-through for the shapes below; the
+// collation gate's own behavior is covered in collation-soundness.spec.ts
+// and check-derived-fds.spec.ts.
+const checkColMeta = Array.from(
+	{ length: checkColMap.size },
+	() => ({ collation: 'BINARY', logicalType: TEXT_TYPE }),
+);
 
 describe('extractCheckConstraints (implication form)', () => {
 	it("check (status <> 'active' or assigned = region) emits two guarded FDs", () => {
@@ -621,7 +628,7 @@ describe('extractCheckConstraints (implication form)', () => {
 			bin('!=', colExpr('status'), lit('active')),
 			bin('=', colExpr('assigned'), colExpr('region')),
 		);
-		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
 		expect(result.equivPairs).to.have.length(0);
 		expect(result.constantBindings).to.have.length(0);
 		expect(result.domainConstraints).to.have.length(0);
@@ -644,7 +651,7 @@ describe('extractCheckConstraints (implication form)', () => {
 			un('IS NOT NULL', colExpr('deleted_at')),
 			bin('=', colExpr('x'), colExpr('y')),
 		);
-		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
 		expect(result.fds).to.have.length(2);
 		for (const fd of result.fds) {
 			expect(fd.guard!.clauses).to.have.length(1);
@@ -661,7 +668,7 @@ describe('extractCheckConstraints (implication form)', () => {
 			or(bin('!=', colExpr('a'), lit(1)), bin('!=', colExpr('b'), lit(2))),
 			bin('=', colExpr('x'), colExpr('y')),
 		);
-		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
 		expect(result.fds).to.have.length(2);
 		const guard = result.fds[0].guard!;
 		expect(guard.clauses).to.have.length(2);
@@ -674,7 +681,7 @@ describe('extractCheckConstraints (implication form)', () => {
 
 	it("check (status = 'active') falls through to unguarded equality recognition", () => {
 		const expr = bin('=', colExpr('status'), lit('active'));
-		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
 		expect(result.fds).to.have.length(1);
 		expect(result.fds[0].guard).to.equal(undefined);
 		expect(result.constantBindings).to.have.length(1);
@@ -685,7 +692,7 @@ describe('extractCheckConstraints (implication form)', () => {
 			bin('!=', colExpr('status'), lit('active')),
 			bin('>', colExpr('x'), colExpr('y')),
 		);
-		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
 		expect(result.fds).to.have.length(0);
 	});
 
@@ -700,7 +707,7 @@ describe('extractCheckConstraints (implication form)', () => {
 			bin('<', colExpr('region'), lit('eu')),
 			bin('=', colExpr('x'), colExpr('y')),
 		);
-		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
 		expect(result.fds).to.have.length(2);
 		for (const fd of result.fds) {
 			expect(fd.guard, 'expected guard on body FD').to.not.equal(undefined);
@@ -722,7 +729,7 @@ describe('extractCheckConstraints (implication form)', () => {
 			bin('>=', colExpr('region'), lit('eu')),
 			bin('=', colExpr('x'), colExpr('y')),
 		);
-		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
 		expect(result.fds).to.have.length(2);
 		const c = result.fds[0].guard!.clauses[0];
 		expect(c.kind).to.equal('range');
@@ -732,6 +739,44 @@ describe('extractCheckConstraints (implication form)', () => {
 		expect(c.maxInclusive).to.equal(false);
 		expect(c.minInclusive).to.equal(false);
 		expect(c.min).to.equal(undefined);
+	});
+
+	// --- collation gate on guarded bodies / guard scopes ----------------------
+
+	function collateAst(expr: AST.Expression, collation: string): AST.CollateExpr {
+		return { type: 'collate', expr, collation };
+	}
+
+	it('guarded body over a NOCASE-declared column mints no guarded FDs', () => {
+		const expr = or(
+			bin('!=', colExpr('status'), lit('active')),
+			bin('=', colExpr('assigned'), colExpr('region')),
+		);
+		const nocaseRegion = checkColMeta.slice();
+		nocaseRegion[2] = { collation: 'NOCASE', logicalType: TEXT_TYPE };
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, nocaseRegion);
+		expect(result.fds).to.have.length(0);
+	});
+
+	it('collate-wrapped guarded body mints no guarded FDs (one-way single-column shape)', () => {
+		const expr = or(
+			bin('!=', colExpr('status'), lit('active')),
+			bin('=', colExpr('x'), collateAst(colExpr('y'), 'NOCASE')),
+		);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
+		expect(result.fds).to.have.length(0);
+	});
+
+	it('a COLLATE wrapper inside a guard-scope disjunct keeps the whole CHECK skipped', () => {
+		// columnIndexFromExpr does not unwrap collate nodes, so the disjunct is
+		// not a recognized guard-negation shape — pinned: the implication form
+		// must not be recognized with a wrapper-altered guard scope.
+		const expr = or(
+			bin('!=', collateAst(colExpr('status'), 'NOCASE'), lit('active')),
+			bin('=', colExpr('x'), colExpr('y')),
+		);
+		const result = extractCheckConstraints([check(expr)], checkColMap, allDeterministic, checkColMeta);
+		expect(result.fds).to.have.length(0);
 	});
 });
 

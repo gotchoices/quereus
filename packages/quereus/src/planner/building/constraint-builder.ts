@@ -101,7 +101,11 @@ export function buildConstraintChecks(
           typeClass: 'scalar' as const,
           logicalType: tableColumn.logicalType,
           nullable: !tableColumn.notNull,
-          isReadOnly: false
+          isReadOnly: false,
+          // Write-time CHECK comparisons must resolve the column's declared
+          // collation, matching read-path queries, ALTER backfill validation,
+          // and assertion enforcement (all compile plain SQL over the schema).
+          collationName: tableColumn.collation
         };
 
         // NEW.column
@@ -122,7 +126,8 @@ export function buildConstraintChecks(
           typeClass: 'scalar' as const,
           logicalType: tableColumn.logicalType,
           nullable: true, // OLD values can be NULL (especially for INSERT)
-          isReadOnly: false
+          isReadOnly: false,
+          collationName: tableColumn.collation
         };
 
         // OLD.column

@@ -103,6 +103,38 @@ export function flattenDisjunction(expr: AST.Expression): AST.Expression[] {
 }
 
 /**
+ * Collect the collation name of every COLLATE node anywhere in `expr`'s
+ * subtree, as written (uninterpreted — no normalization). Empty array when the
+ * subtree contains none. Used by the schema-level value-discrimination gate
+ * (`comparison-collation.ts`) to detect non-BINARY wrappers inside compound
+ * comparison operands.
+ */
+export function collectCollateNames(expr: AST.Expression): string[] {
+	const out: string[] = [];
+	const stack: AST.AstNode[] = [expr as AST.AstNode];
+	while (stack.length > 0) {
+		const node = stack.pop()!;
+		if (node.type === 'collate') {
+			out.push((node as AST.CollateExpr).collation);
+		}
+		for (const key of Object.keys(node)) {
+			const v = (node as unknown as Record<string, unknown>)[key];
+			if (!v) continue;
+			if (Array.isArray(v)) {
+				for (const item of v) {
+					if (item && typeof item === 'object' && 'type' in item) {
+						stack.push(item as AST.AstNode);
+					}
+				}
+			} else if (typeof v === 'object' && 'type' in (v as object)) {
+				stack.push(v as AST.AstNode);
+			}
+		}
+	}
+	return out;
+}
+
+/**
  * Collect the set of column indices referenced by `expr`. Only column /
  * identifier nodes naming columns in `columnIndexMap` count. Returns an empty
  * set when the expression references zero recognized columns; the caller can

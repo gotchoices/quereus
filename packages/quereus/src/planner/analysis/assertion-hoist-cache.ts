@@ -146,6 +146,7 @@ export function getAssertionHoistedConstraints(
 				[synthChecks[i]],
 				table.columnIndexMap,
 				allDeterministic,
+				table.columns,
 			);
 			for (const fd of ext.fds) fds.push({ ...fd, source: prov });
 			for (const p of ext.equivPairs) equivPairs.push(p);

@@ -272,3 +272,82 @@ select qty from t_selfq_r;
 → [{"qty":10}]
 
 drop table t_selfq_r;
+
+-- ===================================
+-- CHECK comparisons resolve declared column collations, exactly like read-path
+-- queries (and ALTER backfill validation / assertion enforcement, which compile
+-- plain SQL). Ticket check-extraction-collation-blind-fds. Collation precedence
+-- is the engine's right-operand-first rule (`emitComparisonOp`) — see backlog
+-- comparison-collation-precedence-conformance for the SQLite left-first
+-- divergence — so `b = c` resolves c's NOCASE while `c = b` resolves b's
+-- (implicit) BINARY, matching `select ... where` of the same spelling.
+-- ===================================
+
+-- bare col = col, NOCASE on the RIGHT operand: comparison is NOCASE.
+create table chk_coll (id integer primary key, b text, c text collate nocase, check (b = c));
+insert into chk_coll values (1, 'X', 'x');
+insert into chk_coll values (2, 'abc', 'ABC');
+select count(*) as cnt from chk_coll;
+→ [{"cnt":2}]
+-- read path agrees: the same comparison matches both rows.
+select count(*) as cnt from chk_coll where b = c;
+→ [{"cnt":2}]
+insert into chk_coll values (3, 'X', 'y');
+-- error: CHECK
+drop table chk_coll;
+
+-- flipped spelling, BINARY-declared plain column on the RIGHT: comparison is
+-- BINARY — the case-variant pair is rejected, again matching the read path.
+create table chk_coll_flip (id integer primary key, b text, c text collate nocase, check (c = b));
+insert into chk_coll_flip values (1, 'x', 'x');
+insert into chk_coll_flip values (2, 'X', 'x');
+-- error: CHECK
+select count(*) as cnt from chk_coll_flip where c = b;
+→ [{"cnt":1}]
+drop table chk_coll_flip;
+
+-- col = literal: a literal contributes no collation, so the declared NOCASE
+-- drives the comparison from either side.
+create table chk_coll_lit (id integer primary key, c text collate nocase, check (c = 'abc'));
+insert into chk_coll_lit values (1, 'ABC');
+insert into chk_coll_lit values (2, 'aBc');
+select count(*) as cnt from chk_coll_lit;
+→ [{"cnt":2}]
+insert into chk_coll_lit values (3, 'abd');
+-- error: CHECK
+drop table chk_coll_lit;
+
+-- an explicit COLLATE BINARY wrapper still overrides the declared collation.
+create table chk_coll_bin (id integer primary key, b text, c text collate nocase, check (b = c collate binary));
+insert into chk_coll_bin values (1, 'x', 'x');
+insert into chk_coll_bin values (2, 'X', 'x');
+-- error: CHECK
+drop table chk_coll_bin;
+
+-- wrapper-honored control: an explicit NOCASE wrapper over plain BINARY
+-- columns keeps accepting case-variants (unchanged behavior).
+create table chk_coll_wrap (id integer primary key, b text, c text, check (b = c collate nocase));
+insert into chk_coll_wrap values (1, 'x', 'X');
+insert into chk_coll_wrap values (2, 'x', 'y');
+-- error: CHECK
+drop table chk_coll_wrap;
+
+-- UPDATE-path: an OLD reference resolves the same declared collation.
+create table chk_coll_upd (id integer primary key, c text collate nocase, constraint same_code check on update (old.c = c));
+insert into chk_coll_upd values (1, 'ABC');
+update chk_coll_upd set c = 'abc' where id = 1;
+select c from chk_coll_upd;
+→ [{"c":"abc"}]
+update chk_coll_upd set c = 'xyz' where id = 1;
+-- error: same_code
+drop table chk_coll_upd;
+
+-- deferred CHECK (auto-deferred by the subquery) resolves the same declared
+-- collation as the immediate path.
+create table chk_coll_def (id integer primary key, c text collate nocase, check (c = (select 'abc')));
+insert into chk_coll_def values (1, 'ABC');
+select c from chk_coll_def;
+→ [{"c":"ABC"}]
+insert into chk_coll_def values (2, 'xyz');
+-- error: CHECK
+drop table chk_coll_def;

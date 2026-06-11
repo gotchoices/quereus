@@ -17,8 +17,11 @@
  */
 
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
+import type * as AST from '../../parser/ast.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { normalizeCollationName } from '../../util/comparison.js';
 import { PhysicalType } from '../../types/logical-type.js';
+import { collectCollateNames, collectColumnNames, columnIndexFromExpr } from './predicate-shape.js';
 
 /**
  * The collation a single operand contributes to a comparison, normalized.
@@ -59,14 +62,22 @@ export function effectiveBetweenBoundCollation(expr: ScalarPlanNode, bound: Scal
 }
 
 /**
- * True when the operand's static type can never produce a text value at
- * runtime. `ANY` validates every value (it can hold text), so it is treated
- * as potentially textual despite carrying no `isTextual` marker.
+ * True when a logical type can never produce a text value at runtime. `ANY`
+ * validates every value (it can hold text), so it is treated as potentially
+ * textual despite carrying no `isTextual` marker. An absent type is unknown —
+ * potentially textual.
  */
-function isStaticallyNonTextual(node: ScalarPlanNode): boolean {
-	const lt = node.getType().logicalType;
+function isNonTextualLogicalType(lt: LogicalType | undefined): boolean {
 	if (lt === undefined) return false;
 	return lt.isTextual !== true && lt.physicalType !== PhysicalType.TEXT && lt.name !== 'ANY';
+}
+
+/**
+ * True when the operand's static type can never produce a text value at
+ * runtime.
+ */
+function isStaticallyNonTextual(node: ScalarPlanNode): boolean {
+	return isNonTextualLogicalType(node.getType().logicalType);
 }
 
 /**
@@ -96,4 +107,97 @@ export function isValueDiscriminatingEquality(left: ScalarPlanNode, right: Scala
 	// A non-BINARY collation is in play; it is inert only when text values can
 	// never meet at runtime.
 	return isStaticallyNonTextual(left) && isStaticallyNonTextual(right);
+}
+
+/**
+ * Per-column declared metadata consumed by the schema-level (AST) variant of
+ * the value-discrimination gate. `ColumnSchema` is structurally assignable;
+ * unit tests construct minimal literals. Absent collation means BINARY; absent
+ * logical type means textuality unknown (treated as textual).
+ */
+export interface DeclaredColumnInfo {
+	readonly collation?: string;
+	readonly logicalType?: LogicalType;
+}
+
+/**
+ * The collation(s) and textuality one AST comparison operand contributes,
+ * resolved against declared column metadata.
+ */
+interface AstOperandContribution {
+	/** Every collation this operand could contribute to the comparison is BINARY. */
+	readonly binary: boolean;
+	/** The operand's static type can never produce a text value at runtime. */
+	readonly nonTextual: boolean;
+}
+
+function astOperandContribution(
+	expr: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
+): AstOperandContribution {
+	const colIdx = columnIndexFromExpr(expr, columnIndexMap);
+	if (colIdx !== undefined) {
+		const meta = columns[colIdx];
+		return {
+			binary: normalizeCollationName(meta?.collation ?? 'BINARY') === 'BINARY',
+			nonTextual: isNonTextualLogicalType(meta?.logicalType),
+		};
+	}
+	if (expr.type === 'literal') {
+		// A bare literal carries no collation. Deferred (Promise) literal values
+		// have unknown textuality.
+		const v = (expr as AST.LiteralExpr).value;
+		return { binary: true, nonTextual: !(v instanceof Promise) && typeof v !== 'string' };
+	}
+	// Any other expression contributes BINARY only when nothing in its subtree
+	// could inject a non-BINARY collation: no non-BINARY COLLATE wrapper, and
+	// every column referenced inside is BINARY-declared or non-textual (robust
+	// to however collation propagates through planner node types). Textuality
+	// of the result is unknown — treat as textual.
+	for (const name of collectCollateNames(expr)) {
+		if (normalizeCollationName(name) !== 'BINARY') {
+			return { binary: false, nonTextual: false };
+		}
+	}
+	for (const idx of collectColumnNames(expr, columnIndexMap)) {
+		const meta = columns[idx];
+		if (normalizeCollationName(meta?.collation ?? 'BINARY') !== 'BINARY'
+			&& !isNonTextualLogicalType(meta?.logicalType)) {
+			return { binary: false, nonTextual: false };
+		}
+	}
+	return { binary: true, nonTextual: false };
+}
+
+/**
+ * Schema-level (AST + declared column metadata) variant of
+ * {@link isValueDiscriminatingEquality}, for fact producers that run on raw
+ * AST before any plan nodes exist (`check-extraction.ts`, assertion hoist).
+ *
+ * Mirrors **enforcement** semantics: write-time CHECK / assertion evaluation
+ * resolves declared column collations (constraint-builder threads
+ * `collationName` into the CHECK scope types) plus explicit COLLATE wrappers —
+ * so the comparison a declared constraint actually enforces is
+ * value-discriminating exactly when every collation either operand could
+ * contribute is BINARY, or both operands are statically non-textual.
+ *
+ * Used for ALL value-level CHECK contributions — equality facts (FDs, EC
+ * pairs, constant pins/bindings) AND domain facts (ranges, BETWEEN, IN enums):
+ * a text-typed domain extracted from a non-BINARY enforcement comparison
+ * over-claims just like an equality fact (`check (c in ('a','b'))` under
+ * NOCASE admits 'A'). Guard *scopes* are not gated here — discharge soundness
+ * lives in `buildPredicateFacts`' per-conjunct gate, which assumes guard
+ * scopes are evaluated under declared collations (true of enforcement).
+ */
+export function isValueDiscriminatingAstComparison(
+	left: AST.Expression,
+	right: AST.Expression,
+	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
+): boolean {
+	const l = astOperandContribution(left, columnIndexMap, columns);
+	const r = astOperandContribution(right, columnIndexMap, columns);
+	if (l.binary && r.binary) return true;
+	return l.nonTextual && r.nonTextual;
 }

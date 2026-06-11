@@ -15,6 +15,7 @@ import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
 import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison } from './predicate-shape.js';
+import { isValueDiscriminatingAstComparison, type DeclaredColumnInfo } from './comparison-collation.js';
 
 export interface CheckExtraction {
 	readonly fds: ReadonlyArray<FunctionalDependency>;
@@ -47,16 +48,26 @@ export function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
 			tableSchema.checkConstraints,
 			tableSchema.columnIndexMap,
 			allDeterministic,
+			tableSchema.columns,
 		);
 		cache.set(tableSchema, cached);
 	}
 	return cached;
 }
 
+/**
+ * `columns` carries each column's declared collation + logical type (indexed
+ * by column position; `ColumnSchema` is assignable) for the value-discrimination
+ * gate: a value-level fact (FD / EC / binding / domain) is minted only when
+ * the enforcement comparison it derives from is value-discriminating
+ * ({@link isValueDiscriminatingAstComparison}) — non-BINARY collations over
+ * textual operands pass value-different rows, so their facts would over-claim.
+ */
 export function extractCheckConstraints(
 	checks: ReadonlyArray<RowConstraintSchema>,
 	columnIndexMap: ReadonlyMap<string, number>,
 	isDeterministic: (fnName: string, argc: number) => boolean,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 ): CheckExtraction {
 	const fds: FunctionalDependency[] = [];
 	const equivPairs: Array<readonly [number, number]> = [];
@@ -66,7 +77,7 @@ export function extractCheckConstraints(
 	for (const check of checks) {
 		if (!check.expr) continue;
 		if (containsNonDeterministicCall(check.expr, isDeterministic)) continue;
-		walkConjunction(check.expr, columnIndexMap, fds, equivPairs, constantBindings, domainConstraints);
+		walkConjunction(check.expr, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
 	}
 
 	return { fds, equivPairs, constantBindings, domainConstraints };
@@ -75,6 +86,7 @@ export function extractCheckConstraints(
 function walkConjunction(
 	expr: AST.Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 	equivPairs: Array<readonly [number, number]>,
 	constantBindings: ConstantBinding[],
@@ -88,13 +100,14 @@ function walkConjunction(
 			stack.push(b.left, b.right);
 			continue;
 		}
-		recognize(cur, columnIndexMap, fds, equivPairs, constantBindings, domainConstraints);
+		recognize(cur, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
 	}
 }
 
 function recognize(
 	expr: AST.Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 	equivPairs: Array<readonly [number, number]>,
 	constantBindings: ConstantBinding[],
@@ -105,18 +118,18 @@ function recognize(
 		switch (b.operator) {
 			case '=':
 			case '==': {
-				handleEquality(b.left, b.right, columnIndexMap, fds, equivPairs, constantBindings);
+				handleEquality(b.left, b.right, columnIndexMap, columns, fds, equivPairs, constantBindings);
 				return;
 			}
 			case '<':
 			case '<=':
 			case '>':
 			case '>=': {
-				handleInequality(b, columnIndexMap, domainConstraints);
+				handleInequality(b, columnIndexMap, columns, domainConstraints);
 				return;
 			}
 			case 'OR': {
-				handleImplication(b, columnIndexMap, fds);
+				handleImplication(b, columnIndexMap, columns, fds);
 				return;
 			}
 			default:
@@ -131,6 +144,9 @@ function recognize(
 		const lo = literalValue(bt.lower);
 		const hi = literalValue(bt.upper);
 		if (lo === undefined || hi === undefined) return;
+		// Per-bound gate, mirroring emitBetween's per-bound collation resolution.
+		if (!isValueDiscriminatingAstComparison(bt.expr, bt.lower, columnIndexMap, columns)
+			|| !isValueDiscriminatingAstComparison(bt.expr, bt.upper, columnIndexMap, columns)) return;
 		domainConstraints.push({
 			kind: 'range',
 			column: colIdx,
@@ -150,6 +166,10 @@ function recognize(
 		for (const v of inExpr.values) {
 			const lit = literalValue(v);
 			if (lit === undefined) return;
+			// Per-value gate (conservative: emitIn resolves the condition operand's
+			// collation, but textuality of each listed value participates in the
+			// non-textual escape).
+			if (!isValueDiscriminatingAstComparison(inExpr.expr, v, columnIndexMap, columns)) return;
 			values.push(lit);
 		}
 		if (values.length === 0) return;
@@ -162,10 +182,16 @@ function handleEquality(
 	left: AST.Expression,
 	right: AST.Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 	equivPairs: Array<readonly [number, number]>,
 	constantBindings: ConstantBinding[],
 ): void {
+	// Value-discrimination gate: all three recognized shapes (col=col mirror
+	// FDs + EC pair, col=lit pin + binding, single-column col=expr one-way FD)
+	// are value-level claims over the enforcement comparison.
+	if (!isValueDiscriminatingAstComparison(left, right, columnIndexMap, columns)) return;
+
 	const lIdx = columnIndexFromExpr(left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(right, columnIndexMap);
 
@@ -216,8 +242,13 @@ function handleEquality(
 function handleInequality(
 	b: AST.BinaryExpr,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	domainConstraints: DomainConstraint[],
 ): void {
+	// A text-typed range under a non-BINARY enforcement collation over-claims
+	// (consumers compare domain bounds under BINARY) — same gate as equalities.
+	if (!isValueDiscriminatingAstComparison(b.left, b.right, columnIndexMap, columns)) return;
+
 	// Normalize so the column is on the left.
 	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
@@ -271,6 +302,7 @@ function handleInequality(
 function handleImplication(
 	root: AST.BinaryExpr,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 ): void {
 	const disjuncts = flattenDisjunction(root);
@@ -286,7 +318,7 @@ function handleImplication(
 
 	const body = disjuncts[disjuncts.length - 1];
 	const guard: GuardPredicate = { clauses: guardClauses };
-	recognizeGuardedBody(body, guard, columnIndexMap, fds);
+	recognizeGuardedBody(body, guard, columnIndexMap, columns, fds);
 }
 
 /**
@@ -393,11 +425,21 @@ function recognizeGuardedBody(
 	body: AST.Expression,
 	guard: GuardPredicate,
 	columnIndexMap: ReadonlyMap<string, number>,
+	columns: ReadonlyArray<DeclaredColumnInfo>,
 	fds: FunctionalDependency[],
 ): void {
 	if (body.type !== 'binary') return;
 	const b = body as AST.BinaryExpr;
 	if (b.operator !== '=' && b.operator !== '==') return;
+
+	// Same value-discrimination gate as unconditional equalities — especially
+	// load-bearing for the `valueEquality: true` mirror tags, which the Filter
+	// guard-activation path lifts into ECs. Guard *scopes* (recognizeNegatedGuard)
+	// are deliberately ungated: enforcement evaluates them under declared
+	// collations (Part A of ticket check-extraction-collation-blind-fds), and
+	// the discharge gate in `buildPredicateFacts` keeps filter rows within the
+	// declared-collation guard scope.
+	if (!isValueDiscriminatingAstComparison(b.left, b.right, columnIndexMap, columns)) return;
 
 	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);

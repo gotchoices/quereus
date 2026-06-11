@@ -1110,9 +1110,12 @@ interface FilterRange {
  * **Collation gate (per conjunct).** A fact may only discharge a guard when
  * the filter's runtime comparison keeps filter-rows ⊆ guard-scope-rows. The
  * guard predicate is evaluated under the column's *declared* collation at
- * index-maintenance time (guard recognition — `partial-unique-extraction.ts` —
- * only accepts bare column/literal AST shapes, so its comparisons resolve to
- * the declared collation), hence:
+ * enforcement time — index maintenance for partial-UNIQUE guards, write-time
+ * CHECK evaluation for implication-form CHECK guards (constraint-builder
+ * threads declared collations into the CHECK scope types) — and guard
+ * recognition (`partial-unique-extraction.ts`, `check-extraction.ts`) only
+ * accepts bare column/literal AST shapes, so guard comparisons resolve to the
+ * declared collation. Hence:
  *
  *  - `col = lit` / singleton-IN facts: sound when the conjunct's effective
  *    comparison collation is BINARY (value-equality implies equality under any

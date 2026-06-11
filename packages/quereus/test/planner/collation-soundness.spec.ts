@@ -221,6 +221,90 @@ describe('Collation soundness of plan-time equality facts', () => {
 		});
 	});
 
+	describe('CHECK extraction value-discrimination gate (check-extraction-collation-blind-fds)', () => {
+		it('R1: collate-wrapped CHECK body mints no value FDs (no false ≤1-row / empty-key claim)', async () => {
+			await db.exec('create table r1 (id integer primary key, b text unique, c text, check (b = c collate nocase)) using memory');
+			await db.exec("insert into r1 values (1,'x','X'), (2,'X','X')");
+			const q = "select * from r1 where c = 'X'";
+			const root = rootOf(db, q);
+			const rows = await collect(db, q);
+			expect(rows.length).to.equal(2);
+			expect(isAtMostOneRow(root), 'false ≤1-row claim').to.equal(false);
+			expect(keysOf(root).some(k => k.length === 0), 'empty key claimed').to.equal(false);
+		});
+
+		it('R3: guarded twin (implication-form CHECK with wrapped body) mints no guarded value FDs', async () => {
+			await db.exec("create table r3 (id integer primary key, status text, b text unique, c text, check (status <> 'active' or b = c collate nocase)) using memory");
+			await db.exec("insert into r3 values (1,'active','x','X'), (2,'active','X','X')");
+			const q = "select * from r3 where status = 'active' and c = 'X'";
+			const root = rootOf(db, q);
+			const rows = await collect(db, q);
+			expect(rows.length).to.equal(2);
+			expect(isAtMostOneRow(root), 'false ≤1-row claim').to.equal(false);
+			expect(keysOf(root).some(k => k.length === 0), 'empty key claimed').to.equal(false);
+		});
+
+		it('R6: guard disjuncts are enforced under the declared collation (NOCASE guard catches case-variant rows)', async () => {
+			await db.exec("create table g2 (id integer primary key, status text collate nocase, b text unique, c text, check (status <> 'active' or b = c)) using memory");
+			// 'ACTIVE' is NOCASE-equal to 'active': the guard disjunct is FALSE, so
+			// the body must hold — 'p' = 'X' fails. Pre-fix the BINARY guard
+			// evaluation let this row through, breaking the discharge gate's
+			// guard-scope assumption (the original false ≤1-row repro).
+			let rejected = false;
+			try {
+				await db.exec("insert into g2 values (1,'ACTIVE','p','X')");
+			} catch {
+				rejected = true;
+			}
+			expect(rejected, 'NOCASE guard-scope row bypassed the CHECK body').to.equal(true);
+		});
+
+		it('R6 control: declared-NOCASE guard discharge works end-to-end where genuinely sound', async () => {
+			await db.exec("create table g3 (id integer primary key, status text collate nocase, b text unique, c text, check (status <> 'active' or b = c)) using memory");
+			await db.exec("insert into g3 values (1,'ACTIVE','p','p'), (2,'active','q','q'), (3,'done','r','X')");
+			// Filter pins status='active' (effective NOCASE = declared, fact minted)
+			// and c='p' (BINARY); discharge activates b=c, closure covers the unique
+			// {b} — a TRUE ≤1-row claim.
+			const q = "select * from g3 where status = 'active' and c = 'p'";
+			const root = rootOf(db, q);
+			const rows = await collect(db, q);
+			expect(rows.length).to.equal(1);
+			expect(isAtMostOneRow(root), 'sound guard discharge lost').to.equal(true);
+		});
+
+		it('assertion-hoist over a collate-wrapped comparison mints no value FDs', async () => {
+			await db.exec('create table ah (id integer primary key, b text unique, c text) using memory');
+			await db.exec('create assertion ah_chk check (not exists (select 1 from ah where not (b = c collate nocase)))');
+			await db.exec("insert into ah values (1,'x','X'), (2,'X','X')");
+			const q = "select * from ah where c = 'X'";
+			const root = rootOf(db, q);
+			const rows = await collect(db, q);
+			expect(rows.length).to.equal(2);
+			expect(isAtMostOneRow(root), 'false ≤1-row claim from hoisted assertion').to.equal(false);
+			expect(keysOf(root).some(k => k.length === 0), 'empty key claimed').to.equal(false);
+		});
+
+		it('control: BINARY text columns keep CHECK-derived equality facts', async () => {
+			await db.exec('create table sc1 (id integer primary key, b text unique, c text, check (b = c)) using memory');
+			const root = rootOf(db, "select * from sc1 where c = 'x'");
+			// Pin c (BINARY) → EC/FD adds b → unique {b} covered → ≤1 row.
+			expect(isAtMostOneRow(root), 'sound CHECK FD lost').to.equal(true);
+		});
+
+		it('control: NOCASE-declared columns in the CHECK suppress the ≤1-row claim', async () => {
+			await db.exec('create table sc2 (id integer primary key, b text unique, c text collate nocase, check (b = c)) using memory');
+			// Post-enforcement-fix the CHECK comparison is NOCASE (right operand
+			// declared NOCASE): 'x'/'X' pairs satisfy it while b stays
+			// BINARY-distinct, so no value FD may be minted.
+			await db.exec("insert into sc2 values (1,'x','X'), (2,'X','X')");
+			const q = "select * from sc2 where b = c";
+			const rows = await collect(db, q);
+			expect(rows.length).to.equal(2);
+			const root = rootOf(db, "select * from sc2 where c = 'X'");
+			expect(isAtMostOneRow(root), 'false ≤1-row claim').to.equal(false);
+		});
+	});
+
 	describe('extractEqualityFds collation gate (unit)', () => {
 		function colRef(attrId: number, index: number, opts: { textual?: boolean; collation?: string } = {}): ColumnReferenceNode {
 			const expr: AST.ColumnExpr = { type: 'column', name: `c${attrId}` } as AST.ColumnExpr;

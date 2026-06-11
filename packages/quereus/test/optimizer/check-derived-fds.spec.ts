@@ -7,6 +7,8 @@ import type { ConstantBinding, DomainConstraint } from '../../src/planner/nodes/
 import type { RowConstraintSchema } from '../../src/schema/table.js';
 import { DEFAULT_ROWOP_MASK } from '../../src/schema/table.js';
 import type * as AST from '../../src/parser/ast.js';
+import type { DeclaredColumnInfo } from '../../src/planner/analysis/comparison-collation.js';
+import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
 
 // ---------------------------------------------------------------------------
 // AST builders for unit tests
@@ -61,13 +63,21 @@ const colMap = new Map<string, number>([
 
 const allDeterministic = () => true;
 
+// BINARY-declared TEXT metadata for every column — the value-discrimination
+// gate is a pass-through for these shapes; collation-gate behavior has its own
+// describe block below.
+const colMeta: DeclaredColumnInfo[] = Array.from(
+	{ length: colMap.size },
+	() => ({ collation: 'BINARY', logicalType: TEXT_TYPE }),
+);
+
 // ---------------------------------------------------------------------------
 // Unit tests for extractCheckConstraints
 // ---------------------------------------------------------------------------
 
 describe('extractCheckConstraints (unit)', () => {
 	it('check (a = b) emits bi-directional FDs and an EC pair', () => {
-		const result = extractCheckConstraints([check(bin('=', col('a'), col('b')))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('=', col('a'), col('b')))], colMap, allDeterministic, colMeta);
 		expect(result.fds).to.have.length(2);
 		expect(result.fds.some(fd => fd.determinants.includes(0) && fd.dependents.includes(1))).to.equal(true);
 		expect(result.fds.some(fd => fd.determinants.includes(1) && fd.dependents.includes(0))).to.equal(true);
@@ -77,7 +87,7 @@ describe('extractCheckConstraints (unit)', () => {
 	});
 
 	it("check (status = 'a') emits ∅ → status FD plus a literal binding", () => {
-		const result = extractCheckConstraints([check(bin('=', col('status'), lit('a')))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('=', col('status'), lit('a')))], colMap, allDeterministic, colMeta);
 		expect(result.fds).to.have.length(1);
 		expect(result.fds[0].determinants).to.deep.equal([]);
 		expect(result.fds[0].dependents).to.deep.equal([5]);
@@ -88,7 +98,7 @@ describe('extractCheckConstraints (unit)', () => {
 	});
 
 	it('check (qty >= 0) emits a range domain with inclusive lower bound', () => {
-		const result = extractCheckConstraints([check(bin('>=', col('qty'), lit(0)))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('>=', col('qty'), lit(0)))], colMap, allDeterministic, colMeta);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
 		expect(d.kind).to.equal('range');
@@ -105,6 +115,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(between(col('qty'), lit(0), lit(100)))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
@@ -122,6 +133,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(and(bin('>', col('qty'), lit(0)), bin('<', col('qty'), lit(100))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(2);
 		const lower = result.domainConstraints.find(d => d.kind === 'range' && d.min !== undefined) as DomainConstraint & { kind: 'range' } | undefined;
@@ -137,6 +149,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(inExpr(col('status'), [lit('a'), lit('i'), lit('d')]))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
@@ -151,6 +164,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(and(bin('=', col('a'), col('b')), bin('=', col('status'), lit('a'))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds.length).to.be.greaterThanOrEqual(3);
 		expect(result.equivPairs).to.deep.equal([[0, 1]]);
@@ -163,6 +177,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(or(bin('=', col('a'), col('b')), bin('=', col('x'), col('y'))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 		expect(result.equivPairs).to.have.length(0);
@@ -175,6 +190,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('>', col('a'), col('b')))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 		expect(result.domainConstraints).to.have.length(0);
@@ -185,6 +201,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('=', col('b'), bin('+', col('a'), lit(1))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(1);
 		expect(result.fds[0].determinants).to.deep.equal([0]);
@@ -199,6 +216,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('=', col('b'), bin('+', col('a'), col('c'))))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 	});
@@ -208,6 +226,7 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('<', lit(0), col('qty')))],
 			colMap,
 			allDeterministic,
+			colMeta,
 		);
 		expect(result.domainConstraints).to.have.length(1);
 		const d = result.domainConstraints[0];
@@ -221,7 +240,7 @@ describe('extractCheckConstraints (unit)', () => {
 	});
 
 	it('check (a == b) — the `==` operator alias is recognized as equality', () => {
-		const result = extractCheckConstraints([check(bin('==', col('a'), col('b')))], colMap, allDeterministic);
+		const result = extractCheckConstraints([check(bin('==', col('a'), col('b')))], colMap, allDeterministic, colMeta);
 		expect(result.fds).to.have.length(2);
 		expect(result.equivPairs).to.deep.equal([[0, 1]]);
 	});
@@ -232,9 +251,104 @@ describe('extractCheckConstraints (unit)', () => {
 			[check(bin('=', col('b'), fn('random_fn', col('a'))))],
 			colMap,
 			isDeterministic,
+			colMeta,
 		);
 		expect(result.fds).to.have.length(0);
 		expect(result.constantBindings).to.have.length(0);
+		expect(result.domainConstraints).to.have.length(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Value-discrimination (collation) gate — ticket
+// check-extraction-collation-blind-fds. Facts may only be minted when the
+// enforcement comparison is BINARY for textual operands (enforcement resolves
+// declared column collations plus explicit COLLATE wrappers).
+// ---------------------------------------------------------------------------
+
+describe('extractCheckConstraints collation gate', () => {
+	function collateAst(expr: AST.Expression, collation: string): AST.CollateExpr {
+		return { type: 'collate', expr, collation };
+	}
+
+	function metaWith(overrides: Record<number, DeclaredColumnInfo>): DeclaredColumnInfo[] {
+		const m = colMeta.slice();
+		for (const [idx, info] of Object.entries(overrides)) m[Number(idx)] = info;
+		return m;
+	}
+
+	const NOCASE_TEXT: DeclaredColumnInfo = { collation: 'NOCASE', logicalType: TEXT_TYPE };
+	const NOCASE_INT: DeclaredColumnInfo = { collation: 'NOCASE', logicalType: INTEGER_TYPE };
+
+	it('col = col with a NOCASE-declared side mints no FDs, EC pair, or bindings', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('a'), col('b')))],
+			colMap, allDeterministic, metaWith({ 0: NOCASE_TEXT }),
+		);
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+	});
+
+	it('col = literal on a NOCASE-declared text column mints no pin or binding', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('status'), lit('a')))],
+			colMap, allDeterministic, metaWith({ 5: NOCASE_TEXT }),
+		);
+		expect(result.fds).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+	});
+
+	it('col = (col collate nocase) mints no one-way FD even over BINARY-declared columns (R1 shape)', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('b'), collateAst(col('c'), 'NOCASE')))],
+			colMap, allDeterministic, colMeta,
+		);
+		expect(result.fds).to.have.length(0);
+	});
+
+	it('col = (col collate binary) keeps the one-way FD (BINARY wrapper subtree)', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('b'), collateAst(col('c'), 'binary')))],
+			colMap, allDeterministic, colMeta,
+		);
+		expect(result.fds).to.have.length(1);
+		expect(result.fds[0].determinants).to.deep.equal([2]);
+		expect(result.fds[0].dependents).to.deep.equal([1]);
+	});
+
+	it('an inert declared collation on a non-textual column keeps equality facts', () => {
+		const result = extractCheckConstraints(
+			[check(bin('=', col('qty'), lit(5)))],
+			colMap, allDeterministic, metaWith({ 6: NOCASE_INT }),
+		);
+		expect(result.fds).to.have.length(1);
+		expect(result.constantBindings).to.have.length(1);
+	});
+
+	it('text domains under a NOCASE-declared column are suppressed (range, BETWEEN, IN enum)', () => {
+		const m = metaWith({ 5: NOCASE_TEXT });
+		const range = extractCheckConstraints([check(bin('>=', col('status'), lit('m')))], colMap, allDeterministic, m);
+		expect(range.domainConstraints).to.have.length(0);
+		const btw = extractCheckConstraints([check(between(col('status'), lit('a'), lit('z')))], colMap, allDeterministic, m);
+		expect(btw.domainConstraints).to.have.length(0);
+		const enm = extractCheckConstraints([check(inExpr(col('status'), [lit('a'), lit('b')]))], colMap, allDeterministic, m);
+		expect(enm.domainConstraints).to.have.length(0);
+	});
+
+	it('numeric domains on a non-textual column keep extracting despite an inert declared collation', () => {
+		const m = metaWith({ 6: NOCASE_INT });
+		const range = extractCheckConstraints([check(bin('>=', col('qty'), lit(0)))], colMap, allDeterministic, m);
+		expect(range.domainConstraints).to.have.length(1);
+		const enm = extractCheckConstraints([check(inExpr(col('qty'), [lit(1), lit(2)]))], colMap, allDeterministic, m);
+		expect(enm.domainConstraints).to.have.length(1);
+	});
+
+	it('a NOCASE-collate-wrapped IN value suppresses the enum domain', () => {
+		const result = extractCheckConstraints(
+			[check(inExpr(col('status'), [lit('a'), collateAst(lit('b'), 'NOCASE')]))],
+			colMap, allDeterministic, colMeta,
+		);
 		expect(result.domainConstraints).to.have.length(0);
 	});
 });
