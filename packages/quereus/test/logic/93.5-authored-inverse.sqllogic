@@ -316,3 +316,100 @@ select * from aiapp.Car order by id;
 update aiapp.Car set mph = 200 where id = 1;
 select speed from aib.Core where id = 1;
 → [{"speed":100}]
+
+-- run
+
+-- ===================================
+-- Written-row binding: `new.<x>` where `x` is ALSO assigned in the same UPDATE
+-- binds that assignment's value (the written view row is the post-statement
+-- image), order-independently; an unassigned `x` keeps its forward read image.
+-- ===================================
+
+create table ma_t (id integer primary key, a integer, b integer);
+insert into ma_t values (1, 1, 2);
+create view ma_v as select id, a, b + 0 as b2 with inverse (b = new.b2 + new.a) from ma_t;
+
+-- co-assigned: new.a sees the NEW a (10), not the pre-update 1
+update ma_v set b2 = 5, a = 10 where id = 1;
+select a, b from ma_t where id = 1;
+→ [{"a":10,"b":15}]
+
+-- assignment order does not matter (every embedded value reads the pre-update row)
+update ma_v set a = 20, b2 = 7 where id = 1;
+select a, b from ma_t where id = 1;
+→ [{"a":20,"b":27}]
+
+-- unassigned sibling: new.a is the forward read image (current a = 20)
+update ma_v set b2 = 1 where id = 1;
+select b from ma_t where id = 1;
+→ [{"b":21}]
+
+-- ...and the same written-row binding through a join view: new.av co-assigned
+-- on the partner side substitutes the assigned value; unassigned it rides the
+-- captured partner read.
+create table mj_a (pid integer primary key, av text);
+create table mj_b (bid integer primary key, pid integer not null references mj_a(pid), bv text);
+insert into mj_a values (1, 'a');
+insert into mj_b values (10, 1, 'b');
+create view mj_v as select mj_a.pid as pid, mj_b.bid as bid, mj_a.av as av,
+		bv || '' as bv2 with inverse (bv = new.bv2 || '+' || new.av)
+	from mj_a join mj_b on mj_a.pid = mj_b.pid;
+
+update mj_v set bv2 = 'x', av = 'NEWA' where pid = 1;
+select av from mj_a;
+→ [{"av":"NEWA"}]
+select bv from mj_b;
+→ [{"bv":"x+NEWA"}]
+
+update mj_v set bv2 = 'y' where pid = 1;
+select bv from mj_b;
+→ [{"bv":"y+NEWA"}]
+
+-- ===================================
+-- Explicit `create view v(a, b)` column list: output names rename positionally;
+-- `new.<x>` refs (by SELECT-output name) stay bound through the index bridge on
+-- UPDATE and INSERT alike.
+-- ===================================
+
+create table cl_t (id integer primary key, raw text);
+create view cl_v (vid, vcode) as select id, raw || '~' as code with inverse (raw = new.code || '!') from cl_t;
+
+insert into cl_v (vid, vcode) values (1, 'a');
+select raw from cl_t where id = 1;
+→ [{"raw":"a!"}]
+
+update cl_v set vcode = 'b' where vid = 1;
+select raw from cl_t where id = 1;
+→ [{"raw":"b!"}]
+
+select * from cl_v;
+→ [{"vid":1,"vcode":"b!~"}]
+
+-- ===================================
+-- An aggregate result column cannot carry the clause: the aggregate phase never
+-- reaches the projection lineage the clause rides, so it is rejected loud
+-- rather than silently dropped.
+-- ===================================
+
+select sum(x) as s with inverse (x = new.s) from sr_t;
+-- error: WITH INVERSE cannot apply to an aggregate result column
+
+-- a bare (non-new-qualified) ref inside a window operand of an inverse
+-- expression is validated like any other in-scope reference
+select id, x + 0 as x2 with inverse (x = sum(new.x2) over (partition by x)) from sr_t;
+-- error: without the NEW qualifier
+
+-- ===================================
+-- RENAME propagation, star projection: `select *` exposes the renamed column's
+-- output name, so a sibling clause's `new.<old>` refs retarget with it.
+-- ===================================
+
+create table st_t (id integer primary key, tag text, payload text);
+insert into st_t values (1, 'T', 'p');
+create view st_v as select *, payload || '' as p2
+	with inverse (payload = new.p2 || ':' || new.tag) from st_t;
+
+alter table st_t rename column tag to tag2;
+update st_v set p2 = 'q' where id = 1;
+select payload from st_t where id = 1;
+→ [{"payload":"q:T"}]

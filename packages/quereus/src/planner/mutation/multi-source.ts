@@ -1398,6 +1398,17 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// matched partition. Tracked by the non-preserved side they drive.
 	const existenceInsertSides = new Set<number>();
 	const existenceDeleteSides = new Set<number>();
+	// `new.<x>` in an authored put binds the WRITTEN view row: when `x` is also
+	// assigned in this statement, that assignment's value (every embedded RHS reads
+	// the pre-update join row, so cross-references are order-independent); otherwise
+	// the column's forward read image. First occurrence wins on a duplicate target —
+	// the base builder's duplicate-assignment backstop rejects the statement anyway.
+	// Keyed by out-column index (the `newRefIndex` domain).
+	const assignedValueByIdx = new Map<number, AST.Expression>();
+	stmt.assignments.forEach(a => {
+		const i = analysis.outColumns.findIndex(c => c.name === a.column.toLowerCase());
+		if (i >= 0 && !assignedValueByIdx.has(i)) assignedValueByIdx.set(i, a.value);
+	});
 	for (const asg of stmt.assignments) {
 		const out = analysis.outColumns.find(c => c.name === asg.column.toLowerCase());
 		if (!out) {
@@ -1565,8 +1576,9 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// An authored (`with inverse`) column lowers to one base assignment per put,
 		// each routed to its owning join side — a two-sided target set yields two child
 		// ops, atomic, FK-parent-first ordered by the shared `orderSides` below. Inside
-		// each put, `new.<assigned col>` becomes the user's value and `new.<other col>`
-		// that view column's name — still in VIEW terms — then the standard lowering
+		// each put, `new.<x>` binds the WRITTEN view row: the assigned value when `x`
+		// is assigned in this statement (including this column itself), that view
+		// column's name otherwise — still in VIEW terms — then the standard lowering
 		// maps everything onto the put's side (the forward read image for non-assigned
 		// columns; a cross-side read rides the same captured-read machinery as a
 		// cross-source SET value). docs/view-updateability.md § Authored inverses.
@@ -1575,13 +1587,11 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// The assigned VALUE's top-level references must name view columns (parity
 			// with the plain route below).
 			guardTopLevelScope(asg.value, analysis, view);
-			const assignedIdx = analysis.outColumns.indexOf(out);
 			for (const put of authored.puts) {
 				const viewTermExpr = substituteNewRefs(put.expr, name => {
 					const idx = requireValidatedNewRefIndex(authored.newRefIndex, name, asg.column);
-					return idx === assignedIdx
-						? asg.value
-						: { type: 'column', name: analysis.outColumns[idx].displayName };
+					return assignedValueByIdx.get(idx)
+						?? { type: 'column', name: analysis.outColumns[idx].displayName };
 				});
 				perSide[put.sideIndex].push({
 					column: put.baseColumn,

@@ -12,7 +12,7 @@ import { type RelationalPlanNode } from '../nodes/plan-node.js';
 import type { Scope } from '../scopes/scope.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
-import { validateAuthoredInverses } from '../analysis/authored-inverse.js';
+import { validateAuthoredInverses, resultColumnOutputName } from '../analysis/authored-inverse.js';
 
 /**
  * Checks if an expression contains aggregate functions
@@ -176,6 +176,18 @@ export function analyzeSelectColumns(
 					...(authoredInverse ? { authoredInverse } : {})
 				});
 			} else if (isAggregateExpression(scalarNode)) {
+				if (authoredInverse) {
+					// An aggregate result column never reaches the projection lineage the
+					// clause rides (it is routed into the aggregate phase below), so the
+					// metadata would be dropped SILENTLY — fail loud instead, matching the
+					// clause's position-independent validation stance. Aggregate write
+					// propagation is reserved future work (docs/view-updateability.md
+					// § Current limitations).
+					throw new QuereusError(
+						`result column '${resultColumnOutputName(column)}': WITH INVERSE cannot apply to an aggregate result column (aggregate views are read-only)`,
+						StatusCode.ERROR, undefined, column.expr.loc?.start.line, column.expr.loc?.start.column,
+					);
+				}
 				hasAggregates = true;
 				if (CapabilityDetectors.isAggregateFunction(scalarNode)) {
 					// Direct aggregate — add as-is (existing behavior)

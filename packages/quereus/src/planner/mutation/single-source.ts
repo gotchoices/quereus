@@ -922,7 +922,10 @@ function rewriteAuthoredViewInsert(
 
 	// `new.<x>` binding for one row: the supplied cell when `x` is a target view
 	// column; the appended default expression when `x` resolves to a default-filled
-	// base column (the post-view-defaulting row image); NULL otherwise.
+	// base column (the post-view-defaulting row image); NULL otherwise. `x` is a
+	// SELECT-output name, so it bridges POSITIONALLY through the site's validated
+	// `newRefIndex` to the view column (an explicit `create view v(a, b)` column
+	// list renames outputs — a name lookup against `targetNames` would mis-bind).
 	const targetIndexByName = new Map<string, number>();
 	targetNames.forEach((n, i) => {
 		if (!targetIndexByName.has(n.toLowerCase())) targetIndexByName.set(n.toLowerCase(), i);
@@ -947,14 +950,16 @@ function rewriteAuthoredViewInsert(
 				message: `cannot insert through view '${view.name}': a VALUES row supplies ${row.length} value(s) but ${targetNames.length} view column(s) are targeted`,
 			});
 		}
-		const resolveNew = (name: string): AST.Expression => {
-			const ti = targetIndexByName.get(name.toLowerCase());
+		const resolveNewFor = (a: AuthoredTarget) => (name: string): AST.Expression => {
+			const idx = requireValidatedNewRefIndex(a.site.newRefIndex, name, a.viewColumn);
+			const viewName = analysis.viewColumns[idx]?.name;
+			const ti = viewName !== undefined ? targetIndexByName.get(viewName.toLowerCase()) : undefined;
 			if (ti !== undefined) return row[ti];
-			return appendExprFor(name) ?? { type: 'literal', value: null };
+			return (viewName !== undefined ? appendExprFor(viewName) : undefined) ?? { type: 'literal', value: null };
 		};
 		return [
 			...verbatim.map(v => row[v.srcIndex]),
-			...authored.flatMap(a => a.site.puts.map(p => substituteNewRefs(p.expr, resolveNew))),
+			...authored.flatMap(a => a.site.puts.map(p => substituteNewRefs(p.expr, resolveNewFor(a)))),
 			...appendExprs.map(cloneExpr),
 		];
 	});
@@ -1025,6 +1030,17 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		}
 		seenBaseColumns.set(key, viewColumn);
 	};
+	// `new.<x>` binds the WRITTEN view row: when `x` is also assigned in this
+	// statement, that assignment's value (every embedded RHS reads the pre-update
+	// row, exactly like the sibling assignment's own lowering — so cross-references
+	// are order-independent); otherwise the column's forward read image. First
+	// occurrence wins on a duplicate target — the collision guard below rejects the
+	// statement anyway. Keyed by view-column index (the `newRefIndex` domain).
+	const assignedValueByIdx = new Map<number, AST.Expression>();
+	stmt.assignments.forEach(a => {
+		const i = analysis.viewColumns.findIndex(c => c.name.toLowerCase() === a.column.toLowerCase());
+		if (i >= 0 && !assignedValueByIdx.has(i)) assignedValueByIdx.set(i, a.value);
+	});
 	const assignments = stmt.assignments.flatMap(asg => {
 		// Enforce view-column scope on the SET target (an unknown / base-only name is
 		// rejected here; a computed view column is found and surfaces `no-inverse` below).
@@ -1035,18 +1051,18 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		guardTopLevelScope(asg.value, analysis, view);
 		const site = analysis.writableSites.get(asg.column.toLowerCase());
 		// An authored (`with inverse`) column lowers to ONE base assignment per put:
-		// inside each authored expression, `new.<assigned col>` becomes the user's
-		// value and `new.<other col>` becomes that view column's name — still in VIEW
-		// terms — then the standard view→base lowering maps everything to base terms
-		// (the forward read image for the non-assigned columns). The result is a plain
-		// base-table `set` per target riding the existing spine
-		// (docs/view-updateability.md § Authored inverses).
+		// inside each authored expression, `new.<x>` becomes the assigned value when
+		// `x` is assigned in this statement (including `x` = this column) and that
+		// view column's name otherwise — still in VIEW terms — then the standard
+		// view→base lowering maps everything to base terms (the forward read image
+		// for the non-assigned columns). The result is a plain base-table `set` per
+		// target riding the existing spine (docs/view-updateability.md § Authored
+		// inverses).
 		if (site?.kind === 'authored') {
-			const assignedIdx = analysis.viewColumns.indexOf(vc);
 			return site.puts.map(put => {
 				const viewTermExpr = substituteNewRefs(put.expr, name => {
 					const idx = requireValidatedNewRefIndex(site.newRefIndex, name, asg.column);
-					return idx === assignedIdx ? asg.value : columnExpr(analysis.viewColumns[idx].name);
+					return assignedValueByIdx.get(idx) ?? columnExpr(analysis.viewColumns[idx].name);
 				});
 				const lowered = transformExpr(viewTermExpr, substitute, descend);
 				recordBaseColumn(put.baseColumn, asg.column);

@@ -138,8 +138,25 @@ function forEachInverseRef(
 		case 'exists':
 			forEachInverseQueryRef(expr.subquery, visit);
 			return;
+		case 'windowFunction':
+			// Window args / PARTITION BY / ORDER BY / frame bounds sit in the same
+			// scalar scope as the assignment expression — mirror `transformExpr`'s
+			// descent so a ref here is validated (and a `new.` ref registered) rather
+			// than escaping to an internal error at lowering.
+			expr.function.args.forEach(a => forEachInverseRef(a, insideSubquery, visit));
+			if (expr.window) {
+				(expr.window.partitionBy ?? []).forEach(p => forEachInverseRef(p, insideSubquery, visit));
+				(expr.window.orderBy ?? []).forEach(ob => forEachInverseRef(ob.expr, insideSubquery, visit));
+				const frame = expr.window.frame;
+				for (const bound of [frame?.start, frame?.end]) {
+					if (bound && (bound.type === 'preceding' || bound.type === 'following')) {
+						forEachInverseRef(bound.value, insideSubquery, visit);
+					}
+				}
+			}
+			return;
 		default:
-			// literal / identifier / parameter / windowFunction / functionSource —
+			// literal / identifier / parameter / functionSource —
 			// no column reference to validate.
 			return;
 	}

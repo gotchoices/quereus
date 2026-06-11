@@ -555,6 +555,30 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 							outputRenames.set(before.toLowerCase(), c.expr.name);
 						}
 					});
+					// A star projection covering the renamed table exposes the old column
+					// name as an OUTPUT name too — the rename shifts it exactly like an
+					// unaliased bare projection, so sibling `new.<old>` refs must follow.
+					// Skipped when an explicit projection still exposes the old name
+					// (first-occurrence resolution keeps `new.<old>` bound to it).
+					const hasInverseClauses = (stmt.columns ?? []).some(c => c.type === 'column' && !!c.inverse?.length);
+					if (hasInverseClauses && !outputRenames.has(state.oldCol)) {
+						const starCoversRenamed = (stmt.columns ?? []).some(c => {
+							if (c.type !== 'all') return false;
+							const boundToRenamed = frame.unaliased.has(state.tableName)
+								|| [...frame.aliasMap.values()].includes(state.tableName);
+							if (c.table === undefined) return boundToRenamed;
+							const q = c.table.toLowerCase();
+							return frame.aliasMap.get(q) === state.tableName
+								|| (q === state.tableName && frame.unaliased.has(state.tableName));
+						});
+						const oldStillExposed = (stmt.columns ?? []).some(c => c.type === 'column'
+							&& (c.alias
+								? c.alias.toLowerCase() === state.oldCol
+								: c.expr.type === 'column' && c.expr.name.toLowerCase() === state.oldCol));
+						if (starCoversRenamed && !oldStillExposed) {
+							outputRenames.set(state.oldCol, state.newCol);
+						}
+					}
 					if (outputRenames.size > 0) {
 						(stmt.columns ?? []).forEach(c => {
 							if (c.type !== 'column' || !c.inverse?.length) return;
