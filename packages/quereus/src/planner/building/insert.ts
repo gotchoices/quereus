@@ -30,7 +30,7 @@ import { validateDeterministicDefault, validateDeterministicGenerated } from '..
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildViewMutation } from './view-mutation-builder.js';
-import { maintainedTableViewLike } from '../../schema/derivation.js';
+import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
@@ -489,6 +489,16 @@ export function buildInsertStmt(
 
 	const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
 	const tableReference = tableRetrieve.tableRef; // Extract the actual TableReferenceNode
+
+	// Backstop on the RESOLVED table: the dispatch above defaults an unqualified
+	// name to the current schema, but buildTableReference resolves through the
+	// schema path, which can land on a maintained table the dispatch missed. A
+	// direct write would corrupt derived contents — route it through the same
+	// view-mutation rewrite.
+	const insertResolved = tableReference.tableSchema;
+	if (isMaintainedTable(insertResolved)) {
+		return buildViewMutation(contextWithSchemaPath, maintainedTableViewLike(insertResolved), { op: 'insert', stmt });
+	}
 
 	// Process mutation context assignments if present
 	const mutationContextValues = new Map<string, ScalarPlanNode>();

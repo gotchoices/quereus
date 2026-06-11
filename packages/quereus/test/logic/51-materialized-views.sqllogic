@@ -285,6 +285,29 @@ delete from um_mv where id = 2;
 select count(*) n from um_src;
 → [{"n":1}]
 
+-- ALTER TABLE on the maintained table: structural changes are rejected (the
+-- shape is defined by the body), tag actions steer to ALTER MATERIALIZED VIEW
+alter table um_mv add column extra integer;
+-- error: materialized view
+alter table um_mv rename column v to w;
+-- error: materialized view
+alter table um_mv set tags (purpose = 'x');
+-- error: ALTER MATERIALIZED VIEW
+
+-- ...but RENAME is an ordinary rename plus a maintenance re-key: write-through
+-- and row-time maintenance stay live under the new name
+alter table um_mv rename to um_mv2;
+insert into um_src values (3, 'c');
+select * from um_mv2 order by id;
+→ [{"id":1,"v":"a"},{"id":3,"v":"c"}]
+insert into um_mv2 values (4, 'd');
+select v from um_src where id = 4;
+→ [{"v":"d"}]
+select type, name from schema() where name like 'um_%' order by name;
+→ [{"type":"materialized_view","name":"um_mv2"},{"type":"table","name":"um_src"}]
+delete from um_mv2 where id > 1;
+alter table um_mv2 rename to um_mv;
+
 -- create-time tags live on the unified record and survive a refresh
 drop materialized view um_mv;
 create materialized view um_mv as select id, v from um_src with tags (purpose = 'demo');

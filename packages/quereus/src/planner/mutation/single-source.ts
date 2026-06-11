@@ -11,6 +11,7 @@ import { deriveViewColumns, resolveBaseSite, type ViewColumn } from '../analysis
 import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
+import { isMaintainedTable } from '../../schema/derivation.js';
 
 /**
  * Single-source view-mediated DML rewriting (the single-source spine of the
@@ -434,7 +435,11 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	// write-through + the maintenance cascade) is deferred; reject cleanly. The
 	// source→backing maintenance cascade is unaffected — that is the read/maintain
 	// direction; this guards only the MV-name *write* direction.
-	if (ctx.schemaManager.getMaintainedTable(fromTable.table.schema ?? null, fromTable.table.name)) {
+	// Checked both by name (current-schema default) and on the PLAN-resolved base
+	// table — the body's FROM resolves through the schema path, which can reach a
+	// maintained table the name lookup misses.
+	if (ctx.schemaManager.getMaintainedTable(fromTable.table.schema ?? null, fromTable.table.name)
+		|| isMaintainedTable(baseTable)) {
 		raiseMutationDiagnostic({
 			reason: 'nested-view',
 			table: view.name,

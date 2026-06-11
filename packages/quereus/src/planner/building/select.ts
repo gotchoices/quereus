@@ -5,6 +5,7 @@ import { StatusCode } from '../../common/types.js';
 import type { PlanningContext } from '../planning-context.js';
 import { SingleRowNode } from '../nodes/single-row.js';
 import { buildTableReference } from './table.js';
+import { isMaintainedTable } from '../../schema/derivation.js';
 import { AliasedScope } from '../scopes/aliased.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import type { Scope } from '../scopes/scope.js';
@@ -391,7 +392,14 @@ export function buildFrom(fromClause: AST.FromClause, parentContext: PlanningCon
 			// Check if this is a view
 			const schemaName = fromClause.table.schema || parentContext.db.schemaManager.getCurrentSchemaName();
 			const viewSchema = parentContext.db.schemaManager.getView(schemaName, fromClause.table.name);
-			const maintainedTable = viewSchema ? undefined : parentContext.db.schemaManager.getMaintainedTable(schemaName, fromClause.table.name);
+			let maintainedTable = viewSchema ? undefined : parentContext.db.schemaManager.getMaintainedTable(schemaName, fromClause.table.name);
+			if (!viewSchema && !maintainedTable && !fromClause.table.schema) {
+				// An unqualified name resolves through the schema path below
+				// (buildTableReference); mirror that here so a path-resolved
+				// maintained table still gets the stale re-validation guard.
+				const pathResolved = parentContext.db.schemaManager.findTable(fromClause.table.name, undefined, parentContext.schemaPath);
+				if (isMaintainedTable(pathResolved)) maintainedTable = pathResolved;
+			}
 
 			if (viewSchema) {
 				// Build the view's body. The body is a QueryExpr — today only

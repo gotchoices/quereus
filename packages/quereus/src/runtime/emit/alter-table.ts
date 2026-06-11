@@ -62,13 +62,16 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 
 		// A maintained table's shape is DEFINED by its derivation body — structural
 		// ALTERs would desynchronize (and, mechanically, drop the derivation when the
-		// module returns a fresh schema). Rename and tag actions remain allowed:
-		// rename is an ordinary table rename (re-keyed below) and tags are
-		// catalog-only metadata.
-		if (isMaintainedTable(tableSchema)
-			&& action.type !== 'renameTable' && action.type !== 'setTags' && action.type !== 'dropTags') {
+		// module returns a fresh schema). Only rename remains allowed (an ordinary
+		// table rename plus the maintenance re-key below). Tag actions must go
+		// through ALTER MATERIALIZED VIEW: the TABLE verb fires `table_modified`,
+		// not `materialized_view_modified`, so the tag edit would never reach the
+		// persisted `create materialized view` catalog entry.
+		if (isMaintainedTable(tableSchema) && action.type !== 'renameTable') {
 			throw new QuereusError(
-				`cannot ALTER '${tableSchema.name}': it is a materialized view — its shape is defined by the view body (drop and recreate to change it)`,
+				action.type === 'setTags' || action.type === 'dropTags'
+					? `cannot ALTER TABLE '${tableSchema.name}': it is a materialized view — use ALTER MATERIALIZED VIEW for tags`
+					: `cannot ALTER '${tableSchema.name}': it is a materialized view — its shape is defined by the view body (drop and recreate to change it)`,
 				StatusCode.ERROR,
 			);
 		}

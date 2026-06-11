@@ -295,7 +295,7 @@ The replacement is the foundation's emission unchanged — backing scan → resi
 
 ## Write boundary (write-through)
 
-`INSERT` / `UPDATE` / `DELETE` targeting an MV *name* is **rewritten to target the MV's source table `T`** and re-planned through the ordinary base-table builder — the identical AST-level rewrite plain-view mutation performs, reached via the same view dispatch wired into all three DML builders: each checks `getView(…)`, then falls back to the maintained table's `maintainedTableViewLike` adapter (`schema/derivation.ts`), which presents the derivation's body AST / column list / insert-defaults to the view-mutation rewrite. The plain-table DML path checks for a `derivation` **before** treating the name as an ordinary writable table. Every MV is (post row-time consolidation) a single-source projection-and-filter — a strict subset of the [view-updateability](view-updateability.md) projection-and-filter shape — so write-through is pure routing, with no MV-specific propagation code. The rewritten write hits `T`, which fires the row-time maintenance hook, so the backing is brought into sync **inside the same statement / transaction**: a subsequent `select … from mv` sees the write (reads-own-writes) and a rollback reverts source + backing in lockstep. A write-through to an MV is observably **indistinguishable from writing the source and reading the MV**.
+`INSERT` / `UPDATE` / `DELETE` targeting an MV *name* is **rewritten to target the MV's source table `T`** and re-planned through the ordinary base-table builder — the identical AST-level rewrite plain-view mutation performs, reached via the same view dispatch wired into all three DML builders: each checks `getView(…)`, then falls back to the maintained table's `maintainedTableViewLike` adapter (`schema/derivation.ts`), which presents the derivation's body AST / column list / insert-defaults to the view-mutation rewrite. The plain-table DML path checks for a `derivation` **before** treating the name as an ordinary writable table — both at name dispatch (current-schema default) and again on the schema-path-**resolved** table, so an unqualified name that reaches a maintained table through the schema path routes through the same rewrite rather than writing the derived contents directly. Every MV is (post row-time consolidation) a single-source projection-and-filter — a strict subset of the [view-updateability](view-updateability.md) projection-and-filter shape — so write-through is pure routing, with no MV-specific propagation code. The rewritten write hits `T`, which fires the row-time maintenance hook, so the backing is brought into sync **inside the same statement / transaction**: a subsequent `select … from mv` sees the write (reads-own-writes) and a rollback reverts source + backing in lockstep. A write-through to an MV is observably **indistinguishable from writing the source and reading the MV**.
 
 Per-column writeability is inherited verbatim from [view updateability](view-updateability.md):
 
@@ -523,10 +523,10 @@ The emit fires per qualifying source change rather than only on the `stale` fals
 
 ### ALTER TABLE on the maintained table itself
 
-Because a materialized view *is* a table, `ALTER TABLE` accepts its name — but only for actions that do not fight the derivation:
+Because a materialized view *is* a table, `ALTER TABLE` accepts its name — but only for the one action that does not fight the derivation:
 
 - **`RENAME TO`** is an ordinary table rename plus a maintenance re-key: the row-time plan is re-registered under the new name, and the persisted MV catalog entry moves with it (`materialized_view_removed` for the old name, `materialized_view_added` for the new).
-- **Tag actions** (`SET`/`ADD`/`DROP TAGS`) are allowed — catalog-only metadata.
+- **Tag actions** (`SET`/`ADD`/`DROP TAGS`) are rejected with a steer to `ALTER MATERIALIZED VIEW … TAGS`: the TABLE verb fires `table_modified` rather than `materialized_view_modified`, so a tag edit through it would never reach the persisted `create materialized view` catalog entry.
 - Every other **structural** action (add/drop/alter column, constraint changes, …) is rejected: *"cannot ALTER: it is a materialized view — its shape is defined by the view body (drop and recreate to change it)"*.
 
 ## Change-scope projection

@@ -21,7 +21,7 @@ import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-b
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
 import { buildViewMutation } from './view-mutation-builder.js';
-import { maintainedTableViewLike } from '../../schema/derivation.js';
+import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
@@ -75,6 +75,16 @@ export function buildUpdateStmt(
 
   const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
 	const tableReference = tableRetrieve.tableRef; // Extract the actual TableReferenceNode
+
+  // Backstop on the RESOLVED table: the dispatch above defaults an unqualified
+  // name to the current schema, but buildTableReference resolves through the
+  // schema path, which can land on a maintained table the dispatch missed. A
+  // direct write would corrupt derived contents — route it through the same
+  // view-mutation rewrite.
+  const updateResolved = tableReference.tableSchema;
+  if (isMaintainedTable(updateResolved)) {
+    return buildViewMutation(contextWithSchemaPath, maintainedTableViewLike(updateResolved), { op: 'update', stmt });
+  }
 
   // Process mutation context assignments if present
   const mutationContextValues = new Map<string, ScalarPlanNode>();
