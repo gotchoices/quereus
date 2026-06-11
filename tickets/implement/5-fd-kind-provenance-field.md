@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-11T00:35:06.778Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\5-fd-kind-provenance-field.implement.2026-06-11T00-35-06-778Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Phase 1 of FD direction B — add a required, durable `kind: 'unique' | 'determination'` provenance field to FunctionalDependency, set correctly at every construction site, preserved verbatim through every FD transform, downgraded at fan-out sites. Pure metadata: NO reader changes, NO gate removal, zero behavior change.
 files: packages/quereus/src/planner/nodes/plan-node.ts, packages/quereus/src/planner/util/fd-utils.ts, packages/quereus/src/planner/analysis/check-extraction.ts, packages/quereus/src/planner/analysis/partial-unique-extraction.ts, packages/quereus/src/planner/nodes/reference.ts, packages/quereus/src/planner/nodes/project-node.ts, packages/quereus/src/planner/nodes/returning-node.ts, packages/quereus/src/planner/nodes/join-utils.ts, packages/quereus/src/planner/nodes/async-gather-node.ts, docs/optimizer.md
 ----
