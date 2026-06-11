@@ -5,6 +5,7 @@ import { BinaryOpNode, UnaryOpNode, LiteralNode, BetweenNode } from '../nodes/sc
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { InNode } from '../nodes/subquery.js';
 import type * as AST from '../../parser/ast.js';
+import { effectiveComparisonCollation, effectiveInCollation } from './comparison-collation.js';
 
 /**
  * Normalize a predicate for push-down and constraint extraction.
@@ -192,8 +193,10 @@ function flipComparison(op: string): string | null {
 // Attempt to collapse OR of equalities into an IN list when:
 // - All disjuncts are of the form (col = literal)
 // - The same column is used
+// - Every disjunct's effective comparison collation equals the collation the
+//   rewritten IN compares under (the column operand's own collation)
 // - Literal list is small (<= 32) to avoid large INs
-function tryCollapseOrToIn(scope: Scope, disjuncts: ScalarPlanNode[]): ScalarPlanNode | null {
+function tryCollapseOrToIn(_scope: Scope, disjuncts: ScalarPlanNode[]): ScalarPlanNode | null {
     const values: LiteralNode[] = [];
     let column: ColumnReferenceNode | null = null;
 
@@ -212,6 +215,21 @@ function tryCollapseOrToIn(scope: Scope, disjuncts: ScalarPlanNode[]): ScalarPla
             col = b.right as ColumnReferenceNode;
             lit = b.left as LiteralNode;
         } else {
+            return null;
+        }
+
+        // Collation gate (ticket `or-equality-collapse-collation-blind`): the
+        // rewritten IN compares every value under the *condition (column)
+        // operand's* collation (`emitIn`), while this disjunct compares under
+        // its own effective collation (`emitComparisonOp`: right ?? left ??
+        // BINARY, in *written* operand order — constant folding keeps
+        // `'bob' COLLATE NOCASE` as a literal whose type carries NOCASE, so
+        // the shape checks above never see the wrapper). Collapse only when
+        // the two agree; both directions are unsound otherwise (a NOCASE
+        // disjunct over a BINARY column under-matches after the rewrite, a
+        // BINARY disjunct over a NOCASE column over-matches). Declining keeps
+        // the OR as-is — a completeness loss only, like the >32-values bail.
+        if (effectiveComparisonCollation(b.left, b.right) !== effectiveInCollation(col)) {
             return null;
         }
 

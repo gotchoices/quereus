@@ -17,7 +17,7 @@ import type { ConstraintOp, PredicateConstraint as VtabPredicateConstraint, Rang
 import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/reference.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
-import { effectiveComparisonCollation, operandCollation } from './comparison-collation.js';
+import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
 
 const log = createLogger('planner:analysis:constraint-extractor');
 
@@ -611,6 +611,56 @@ function flattenOrDisjuncts(expr: ScalarPlanNode): ScalarPlanNode[] {
 }
 
 /**
+ * Collation gate for one branch constraint of an OR collapse (ticket
+ * `or-equality-collapse-collation-blind`).
+ *
+ * Both collapsed forms compare under the *column operand's own* collation —
+ * `emitIn` resolves the condition (column) operand's collation for IN, and an
+ * OR_RANGE spec's bounds are interpreted in the index's declared-collation
+ * ordering — while each written disjunct compares under its own effective
+ * collation (`emitComparisonOp`: right ?? left ?? BINARY, in *written* operand
+ * order; constant folding keeps `'bob' COLLATE NOCASE` as a literal whose
+ * *type* carries NOCASE, so shape checks never see the wrapper). A collapse is
+ * sound only when those two collations are **equal** for the branch; both
+ * directions fail otherwise (under-match: a NOCASE disjunct over a BINARY
+ * column matches fewer rows after collapse; over-match: a BINARY disjunct over
+ * a NOCASE column matches more). Note `eff === 'BINARY'` alone is NOT
+ * sufficient here, unlike {@link equalityConstraintCollationOk}'s
+ * finer-than-enforcement rule — the over-match direction needs eff === the
+ * column's declared collation.
+ */
+function orBranchConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof BinaryOpNode) {
+		const colSide = columnSideOf(src, c.attributeId);
+		if (colSide === undefined) return false;
+		return effectiveComparisonCollation(src.left, src.right) === operandCollation(colSide);
+	}
+	if (src instanceof InNode) {
+		// Minted only by `extractInConstraint`, whose condition is a bare
+		// ColumnReferenceNode — `effectiveInCollation(condition)` IS the
+		// column's collation, so this is vacuously true today. Kept explicit so
+		// a future producer minting IN constraints from a non-bare condition
+		// stays gated.
+		return effectiveInCollation(src.condition) === operandCollation(src.condition);
+	}
+	if (src instanceof BetweenNode) {
+		// A BETWEEN branch contributes two constraints sharing this source;
+		// `emitBetween` resolves each bound's collation independently (bound ??
+		// tested expression), so both must match the column operand.
+		const target = operandCollation(src.expr);
+		return effectiveBetweenBoundCollation(src.expr, src.lower) === target
+			&& effectiveBetweenBoundCollation(src.expr, src.upper) === target;
+	}
+	// Conservative: an unrecognized shape cannot prove its effective collation,
+	// so the whole OR stays residual. This is the *opposite* polarity of
+	// `equalityConstraintCollationOk`'s permissive fallback — there a wrong
+	// answer only loses a covered-key witness; here it would rewrite the
+	// comparison a consuming seek performs and produce wrong rows.
+	return false;
+}
+
+/**
  * Attempt to extract index-friendly constraints from an OR expression.
  *
  * Handles two cases:
@@ -653,6 +703,24 @@ function tryExtractOrBranches(
 		}
 	}
 	if (allRelations.size !== 1) return null;
+
+	// Collation pre-gate covering both collapse cases below (IN and OR_RANGE
+	// both compare under the column's own collation): every branch constraint's
+	// effective collation must equal it, else the whole OR stays residual —
+	// a completeness loss only, never a semantics change. Reviewer note:
+	// `effectivePredicateCollation` (rule-select-access-path) still resolves an
+	// OR `sourceExpression` to BINARY, but post-gate every surviving collapsed
+	// constraint's true collation equals the column's declared collation, so
+	// the cover analysis is at worst conservative (BINARY-vs-NOCASE-index →
+	// COARSER_SAFE keeps the semantically-correct OR residual; ranges decline).
+	// Carrying the resolved collation on the constraint would make it precise —
+	// an optional follow-up, not required for correctness.
+	for (const b of branches) {
+		if (!b.constraints.every(orBranchConstraintCollationOk)) {
+			log('OR collapse declined: branch effective collation does not match column collation');
+			return null;
+		}
+	}
 
 	// Case 1: All branches are single equality or IN on the same column → collapse to IN
 	const allEqOrIn = branches.every(b =>

@@ -305,6 +305,61 @@ describe('Collation soundness of plan-time equality facts', () => {
 		});
 	});
 
+	describe('OR→IN / OR_RANGE collapse collation gate (or-equality-collapse-collation-blind)', () => {
+		it('keyed under-match: NOCASE disjuncts over a BINARY-keyed column match all case-variants', async () => {
+			await db.exec('create table t20 (b text primary key, y integer) using memory');
+			await db.exec("insert into t20 values ('Bob',1),('bob',2),('X',3),('x',4)");
+			const rows = await collect(db, "select y from t20 where b = 'bob' collate nocase or b = 'x' collate nocase order by y");
+			expect(rows.map(r => r.y)).to.deep.equal([1, 2, 3, 4]);
+		});
+
+		it('non-keyed spelling: the *evaluated* OR predicate is not rewritten into a BINARY IN', async () => {
+			await db.exec('create table t21 (id integer primary key, b text, y integer) using memory');
+			await db.exec("insert into t21 values (1,'Bob',1),(2,'bob',2),(3,'X',3),(4,'x',4)");
+			const rows = await collect(db, "select y from t21 where b = 'bob' collate nocase or b = 'x' collate nocase order by y");
+			expect(rows.map(r => r.y)).to.deep.equal([1, 2, 3, 4]);
+		});
+
+		it('over-match: BINARY disjuncts over a NOCASE-declared key match neither case-variant', async () => {
+			await db.exec('create table t22 (b text collate nocase primary key, y integer) using memory');
+			await db.exec("insert into t22 values ('Bob',1),('X',3)");
+			const rows = await collect(db, "select y from t22 where b = 'bob' collate binary or b = 'x' collate binary order by y");
+			expect(rows).to.deep.equal([]);
+		});
+
+		it('matched control: plain disjuncts over a plain column keep collapsing (BINARY semantics)', async () => {
+			await db.exec('create table t23 (b text primary key, y integer) using memory');
+			await db.exec("insert into t23 values ('Bob',1),('bob',2),('X',3),('x',4)");
+			const rows = await collect(db, "select y from t23 where b = 'bob' or b = 'x' order by y");
+			expect(rows.map(r => r.y)).to.deep.equal([2, 4]);
+		});
+
+		it('matched control: plain disjuncts over a NOCASE-declared column match case-insensitively', async () => {
+			await db.exec('create table t24 (b text collate nocase primary key, y integer) using memory');
+			await db.exec("insert into t24 values ('Bob',1),('X',3)");
+			const rows = await collect(db, "select y from t24 where b = 'bob' or b = 'x' order by y");
+			expect(rows.map(r => r.y)).to.deep.equal([1, 3]);
+		});
+
+		it('matched control: a single NOCASE disjunct still matches both case-variants', async () => {
+			await db.exec('create table t25 (b text primary key, y integer) using memory');
+			await db.exec("insert into t25 values ('Bob',1),('bob',2)");
+			const rows = await collect(db, "select y from t25 where b = 'bob' collate nocase order by y");
+			expect(rows.map(r => r.y)).to.deep.equal([1, 2]);
+		});
+
+		it('OR_RANGE shape: NOCASE equality + range disjunct keeps per-disjunct semantics', async () => {
+			// Passes at HEAD only because no seek consumes the OR_RANGE constraint
+			// and the residual OR still evaluates; pins that the gate (which now
+			// keeps the OR residual at the source) does not change the result and
+			// that no future seek consumption can.
+			await db.exec('create table t26 (id integer primary key, b text, y integer) using memory');
+			await db.exec("insert into t26 values (1,'Bob',1),(2,'bob',2),(3,'zz',3)");
+			const rows = await collect(db, "select y from t26 where b = 'bob' collate nocase or b > 'z' order by y");
+			expect(rows.map(r => r.y)).to.deep.equal([1, 2, 3]);
+		});
+	});
+
 	describe('extractEqualityFds collation gate (unit)', () => {
 		function colRef(attrId: number, index: number, opts: { textual?: boolean; collation?: string } = {}): ColumnReferenceNode {
 			const expr: AST.ColumnExpr = { type: 'column', name: `c${attrId}` } as AST.ColumnExpr;

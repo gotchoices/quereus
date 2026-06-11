@@ -5,7 +5,7 @@ import { BinaryOpNode, LiteralNode, BetweenNode, UnaryOpNode, CastNode } from '.
 import { ColumnReferenceNode, ParameterReferenceNode } from '../../src/planner/nodes/reference.js';
 import type { ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
 import type * as AST from '../../src/parser/ast.js';
-import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
+import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
 import { InNode } from '../../src/planner/nodes/subquery.js';
 import {
 	extractConstraints,
@@ -36,6 +36,31 @@ function colRef(attrId: number, name: string, index: number): ColumnReferenceNod
 function lit(value: unknown): LiteralNode {
 	const expr: AST.LiteralExpr = { type: 'literal', value } as unknown as AST.LiteralExpr;
 	return new LiteralNode(scope, expr);
+}
+
+/** TEXT-typed column reference, optionally carrying a declared collation (the existing colRef helper is INTEGER-typed). */
+function textColRef(attrId: number, name: string, index: number, collation?: string): ColumnReferenceNode {
+	const expr: AST.ColumnExpr = { type: 'column', schema: undefined as unknown as string, table: undefined as unknown as string, name } as unknown as AST.ColumnExpr;
+	const columnType = {
+		typeClass: 'scalar' as const,
+		logicalType: TEXT_TYPE,
+		collationName: collation,
+		nullable: false,
+		isReadOnly: false,
+	};
+	return new ColumnReferenceNode(scope, expr, columnType, attrId, index);
+}
+
+/** The folded-`COLLATE` shape: a literal whose *type* carries the collation (constant folding preserves type metadata). */
+function collatedLit(value: string, collation: string): LiteralNode {
+	const expr: AST.LiteralExpr = { type: 'literal', value } as unknown as AST.LiteralExpr;
+	return new LiteralNode(scope, expr, {
+		typeClass: 'scalar',
+		logicalType: TEXT_TYPE,
+		collationName: collation,
+		nullable: false,
+		isReadOnly: true,
+	});
 }
 
 function paramRef(name: string): ParameterReferenceNode {
@@ -1442,6 +1467,91 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].op).to.equal('IN');
 			expect(result.allConstraints[0].bindingKind).to.equal('mixed');
 			expect(result.allConstraints[0].valueExpr).to.exist;
+		});
+	});
+
+	// ===================================================================
+	// OR collapse collation gate (or-equality-collapse-collation-blind):
+	// a collapse is sound only when every disjunct's effective comparison
+	// collation equals the column operand's own collation (what the collapsed
+	// IN / OR_RANGE compares under). Mismatches must produce NO constraint and
+	// a residualPredicate — this is the "no seek strips the residual"
+	// guarantee at its source.
+	// ===================================================================
+	describe('OR collapse — collation gate', () => {
+		it('eq→IN under-match: NOCASE-collated literals over a plain TEXT column → no constraint, OR residual', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2), collatedLit('bob', 'NOCASE')),
+				binOp('=', textColRef(102, 'b', 2), collatedLit('x', 'NOCASE'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('eq→IN over-match: BINARY-collated literals over a NOCASE-declared column → no constraint, OR residual', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), collatedLit('bob', 'BINARY')),
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), collatedLit('x', 'BINARY'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('eq-as-range→OR_RANGE: NOCASE-collated equality + plain range over a plain column → no constraint, OR residual', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2), collatedLit('bob', 'NOCASE')),
+				binOp('>', textColRef(102, 'b', 2), lit('z'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('BETWEEN branch with a NOCASE-collated bound → no OR_RANGE, OR residual', () => {
+			const expr = orNode(
+				betweenNode(textColRef(102, 'b', 2), collatedLit('a', 'NOCASE'), lit('m')),
+				binOp('>', textColRef(102, 'b', 2), lit('z'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('matched: NOCASE-declared column with NOCASE-collated and plain literals → IN still fires', () => {
+			const expr = orNode(
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), collatedLit('bob', 'NOCASE')),
+				binOp('=', textColRef(102, 'b', 2, 'NOCASE'), lit('x'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].value).to.deep.equal(['bob', 'x']);
+			expect(result.residualPredicate).to.be.undefined;
+		});
+
+		it('matched: plain range disjuncts over a NOCASE-declared column → OR_RANGE still fires', () => {
+			const expr = orNode(
+				binOp('<', textColRef(102, 'b', 2, 'NOCASE'), lit('a')),
+				binOp('>', textColRef(102, 'b', 2, 'NOCASE'), lit('m'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('OR_RANGE');
+		});
+
+		it('written order is load-bearing: NOCASE-folded literal on the LEFT of a BINARY-declared column resolves to the column (right) collation → collapse allowed', () => {
+			// `'bob' COLLATE NOCASE = b` compares under b's collation
+			// (emitComparisonOp right-operand precedence), so the IN rewrite is
+			// sound when b is explicitly BINARY.
+			const expr = orNode(
+				binOp('=', collatedLit('bob', 'NOCASE'), textColRef(102, 'b', 2, 'BINARY')),
+				binOp('=', textColRef(102, 'b', 2, 'BINARY'), lit('x'))
+			);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
 		});
 	});
 
