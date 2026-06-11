@@ -475,3 +475,302 @@ select code, status from quereus_lens_advisories('ai10x') where code = 'lens.get
 update ai10x.Item set grp = 'B' where id = 1;
 select code from ai10b.Item where id = 1;
 → [{"code": "B1"}]
+
+-- ===================================
+-- 11. Bijectivity suppression requires the inverse's images to land INSIDE the
+--     basis domain. Here PutGet holds ('z' hits the forward's else arm) and the
+--     forward alone is injective over the basis domain ('a'→'A', 'b'→'B'), but
+--     inverse('B') = 'z' escapes the basis CHECK — the pair is not a bijection
+--     (GetPut fails for stored 'b'), so the advisory must stand.
+-- ===================================
+
+declare schema ai11b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('a', 'b'))
+	)
+}
+
+-- run
+
+apply schema ai11b;
+
+-- run
+
+insert into ai11b.Item values (1, 'b');
+
+-- run
+
+declare logical schema ai11x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai11x over ai11b {
+	view Item as select id, case code when 'a' then 'A' else 'B' end as grp
+		with inverse (code = case new.grp when 'A' then 'a' else 'z' end)
+	from ai11b.Item
+}
+
+-- run
+
+apply schema ai11x;
+
+-- run
+
+select code, "column", status from quereus_lens_advisories('ai11x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "column": "grp", "status": "active"}]
+
+-- The surrendered GetPut is operationally visible: write-back of the read
+-- value puts 'z', which the basis CHECK rejects.
+update ai11x.Item set grp = grp where id = 1;
+-- error: check
+
+-- ===================================
+-- 12. A logical CHECK over an authored column on a join body reds
+--     lens.unrealizable-constraint at deploy: the forward substitution is
+--     row-local only on a single-source body. (Here the forward happens to read
+--     only the put member — a conservative over-block — but the slot AST cannot
+--     prove that, and a cross-side forward would otherwise deploy a CHECK that
+--     silently never enforces; see the next scenario's shape.)
+-- ===================================
+
+declare schema ai12b {
+	table Core (
+		id integer primary key,
+		code text not null
+	)
+	table Aux (
+		id integer primary key,
+		tag text null
+	)
+}
+
+-- run
+
+apply schema ai12b;
+
+-- run
+
+insert into ai12b.Core values (1, 'x');
+insert into ai12b.Aux values (1, 't');
+
+-- run
+
+declare logical schema ai12x {
+	table V (
+		id integer primary key,
+		label text null check (label in ('X', 'Y'))
+	)
+}
+
+-- run
+
+declare lens for ai12x over ai12b {
+	view V as select Core.id as id, upper(Core.code) as label
+		with inverse (code = lower(new.label))
+	from ai12b.Core inner join ai12b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai12x;
+-- error: lens.unrealizable-constraint
+
+-- ===================================
+-- 13. Read-only gate: a lossy authored inverse on a read-only table (the PK is
+--     the authored column — not reconstructible) deploys WITHOUT the advisory
+--     (the put never runs), while the table is verifiably read-only.
+-- ===================================
+
+declare schema ai13b {
+	table Item (
+		code text primary key check (code in ('A1', 'A2', 'B1'))
+	)
+}
+
+-- run
+
+apply schema ai13b;
+
+-- run
+
+declare logical schema ai13x {
+	table Item (
+		grp text primary key check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+-- substr collapses A1/A2 — NOT injective over the basis domain, so absent the
+-- read-only gate the advisory would fire (scenario 1 pins exactly that).
+declare lens for ai13x over ai13b {
+	view Item as select substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from ai13b.Item
+}
+
+-- run
+
+apply schema ai13x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('ai13x') where code = 'lens.getput-lossy';
+→ [{"n": 0}]
+
+-- run
+
+insert into ai13x.Item values ('A');
+-- error: read-only
+
+-- ===================================
+-- 14. The PutGet error is NOT read-only-gated: the same read-only shape with a
+--     provably wrong inverse still blocks the deploy (a declared write path
+--     that loses the written value is an authoring error regardless).
+-- ===================================
+
+declare logical schema ai14x {
+	table Item (
+		grp text primary key check (grp in ('A', 'B'))
+	)
+}
+
+-- run
+
+declare lens for ai14x over ai13b {
+	view Item as select substr(code, 1, 1) as grp
+		with inverse (code = case new.grp when 'A' then 'B1' else new.grp || '1' end)
+	from ai13b.Item
+}
+
+-- run
+
+apply schema ai14x;
+-- error: lens.putget-violation
+
+-- ===================================
+-- 15. The motivating leak for the single-source gate above: a cross-side
+--     forward (reads Aux.tag, put writes Core.code). Were the CHECK admitted,
+--     the substituted NEW.tag would resolve NULL on the Core-member write and
+--     the CHECK would pass vacuously — an out-of-domain write would land
+--     silently. The deploy must reject instead.
+-- ===================================
+
+declare logical schema ai15x {
+	table V (
+		id integer primary key,
+		label text null check (label in ('Xt', 'Yt'))
+	)
+}
+
+-- run
+
+declare lens for ai15x over ai12b {
+	view V as select Core.id as id, upper(Core.code) || Aux.tag as label
+		with inverse (code = lower(substr(new.label, 1, 1)))
+	from ai12b.Core inner join ai12b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai15x;
+-- error: lens.unrealizable-constraint
+
+-- ===================================
+-- 16. Without a logical CHECK on the authored column, the same join-body
+--     authored inverse still deploys and writes through (the single-source gate
+--     constrains only CHECK realizability, not the write path).
+-- ===================================
+
+declare logical schema ai16x {
+	table V (
+		id integer primary key,
+		label text null
+	)
+}
+
+-- run
+
+declare lens for ai16x over ai12b {
+	view V as select Core.id as id, upper(Core.code) as label
+		with inverse (code = lower(new.label))
+	from ai12b.Core inner join ai12b.Aux on Core.id = Aux.id
+}
+
+-- run
+
+apply schema ai16x;
+
+-- run
+
+update ai16x.V set label = 'Y' where id = 1;
+select code from ai12b.Core where id = 1;
+→ [{"code": "y"}]
+
+-- ===================================
+-- 17. The enumeration honors the column's full declared CHECK surface: a range
+--     CHECK narrows the in-list (3 is excluded), so an inverse that is only
+--     correct for the surviving values {1, 2} deploys clean — enumerating the
+--     excluded value would red a false lens.putget-violation. Integer domain.
+-- ===================================
+
+declare schema ai17b {
+	table Item (
+		id integer primary key,
+		k integer not null
+	)
+}
+
+-- run
+
+apply schema ai17b;
+
+-- run
+
+insert into ai17b.Item values (1, 0);
+
+-- run
+
+declare logical schema ai17x {
+	table Item (
+		id integer primary key,
+		n integer null check (n in (1, 2, 3)),
+		check (n < 3)
+	)
+}
+
+-- run
+
+-- inverse(3) would store 99 and read back 100 ≠ 3 — but 3 is outside the
+-- effective domain, so the composition is never evaluated for it.
+declare lens for ai17x over ai17b {
+	view Item as select id, k + 1 as n
+		with inverse (k = case when new.n < 3 then new.n - 1 else 99 end)
+	from ai17b.Item
+}
+
+-- run
+
+apply schema ai17x;
+
+-- run
+
+-- No basis-side CHECK domain ⇒ bijectivity unproven ⇒ the advisory stands.
+select code, "column", status from quereus_lens_advisories('ai17x') where code = 'lens.getput-lossy';
+→ [{"code": "lens.getput-lossy", "column": "n", "status": "active"}]
+
+-- run
+
+update ai17x.Item set n = 2 where id = 1;
+select k from ai17b.Item where id = 1;
+→ [{"k": 1}]
+
+-- Both declared CHECKs enforce over the written image (NEW.k + 1).
+update ai17x.Item set n = 3 where id = 1;
+-- error: check

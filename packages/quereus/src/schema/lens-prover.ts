@@ -1027,43 +1027,56 @@ function provePutGetByEnumeration(
 		return { kind: 'indeterminate', domain }; // the forward reads a base column the inverse does not determine
 	}
 
-	// `forward(inverse(v))`, or undefined when any step is not const-evaluable.
-	const composition = (v: SqlValue): SqlValue | undefined => {
-		const baseImage = new Map<string, SqlValue>();
+	// `forward(inverse(v))` plus the inverse's basis image, or undefined when any
+	// step is not const-evaluable.
+	const composition = (v: SqlValue): { got: SqlValue; base: ReadonlyMap<string, SqlValue> } | undefined => {
+		const base = new Map<string, SqlValue>();
 		for (const p of authored.puts) {
 			const bv = evalDeployConstant(ctx.db, substituteNewRefs(p.expr, () => ({ type: 'literal', value: v })));
 			if (bv === undefined) return undefined;
-			baseImage.set(p.baseColumn.toLowerCase(), bv);
+			base.set(p.baseColumn.toLowerCase(), bv);
 		}
-		return evalDeployConstant(ctx.db, substituteBaseRefs(forward, baseImage));
+		const got = evalDeployConstant(ctx.db, substituteBaseRefs(forward, base));
+		return got === undefined ? undefined : { got, base };
 	};
 
 	let indeterminate = false;
+	const putImages: ReadonlyMap<string, SqlValue>[] = [];
 	for (const v of domain) {
-		const got = composition(v);
-		if (got === undefined) { indeterminate = true; continue; }
-		if (!sqlValueEquals(got, v)) return { kind: 'violation', value: v, got, domain };
+		const r = composition(v);
+		if (r === undefined) { indeterminate = true; continue; }
+		if (!sqlValueEquals(r.got, v)) return { kind: 'violation', value: v, got: r.got, domain };
+		putImages.push(r.base);
 	}
 	if (indeterminate) return { kind: 'indeterminate', domain };
-	return { kind: 'proved', injective: proveForwardInjective(ctx, authored, forward, domain), domain };
+	return { kind: 'proved', injective: proveForwardInjective(ctx, authored, forward, domain, putImages), domain };
 }
 
 /**
  * Forward injectivity over the basis column's own enumerable CHECK domain. With
  * PutGet proved over the logical domain, an injective forward whose image stays
- * *inside* that logical domain makes the pair bijective between the two
- * enumerated domains, so GetPut holds (`put(get(b)) = b` for every basis value)
- * and the lossy advisory is suppressed. Conservative: requires a single put
- * target backed by a NOT NULL basis column (a nullable basis admits a value
- * outside the enumeration) and a const-evaluable, never-NULL forward image at
- * every basis value. The forward's refs ⊆ put targets was already established
- * by the caller, so the single binding covers every ref.
+ * *inside* that logical domain — **and** an inverse whose images stay inside the
+ * basis domain (`putImages`, recorded by the PutGet enumeration) — makes the
+ * pair bijective between the two enumerated domains, so GetPut holds
+ * (`put(get(b)) = b` for every basis value) and the lossy advisory is
+ * suppressed. The put-image membership check is load-bearing: PutGet forces the
+ * inverse injective into the basis domain (|logical| ≤ |basis|), forward
+ * injectivity forces |basis| ≤ |logical|, so both are bijections and the
+ * inverse is exactly forward⁻¹ — without it, an inverse image *outside* the
+ * basis domain (which PutGet can still pass through the forward's catch-all
+ * arm) breaks the counting and GetPut fails for a real stored value.
+ * Conservative: requires a single put target backed by a NOT NULL basis column
+ * (a nullable basis admits a value outside the enumeration) and a
+ * const-evaluable, never-NULL forward image at every basis value. The forward's
+ * refs ⊆ put targets was already established by the caller, so the single
+ * binding covers every ref.
  */
 function proveForwardInjective(
 	ctx: ProveContext,
 	authored: AuthoredSite,
 	forward: AST.Expression,
 	logicalDomain: readonly SqlValue[],
+	putImages: ReadonlyArray<ReadonlyMap<string, SqlValue>>,
 ): boolean {
 	const basis = ctx.basisSource;
 	if (!basis || authored.puts.length !== 1) return false;
@@ -1072,6 +1085,13 @@ function proveForwardInjective(
 	if (bi === undefined || !basis.columns[bi]?.notNull) return false;
 	const basisDomain = enumerableDomain(getCheckExtraction(basis), bi);
 	if (!basisDomain) return false;
+
+	for (const image of putImages) {
+		const bv = image.get(put.baseColumn.toLowerCase());
+		if (bv === undefined || !basisDomain.some(b => sqlValueEquals(b, bv))) {
+			return false; // the inverse writes outside the basis domain — not a bijection witness
+		}
+	}
 
 	const seen: SqlValue[] = [];
 	for (const b of basisDomain) {
@@ -1175,17 +1195,29 @@ function evalDeployConstant(db: Database, expr: AST.Expression): SqlValue | unde
 /**
  * Maps each authored-inverse logical column (lowercased) to its **forward** `get`
  * expression (basis terms), when that forward is row-local-enforceable — a
- * subquery-free scalar over basis column refs. This is the agreement predicate
- * between the prover's CHECK realizability classifier
+ * subquery-free scalar over basis column refs of a **single-source** body. This
+ * is the agreement predicate between the prover's CHECK realizability classifier
  * ({@link classifyCheckConstraint}: a CHECK referencing an authored column is
  * row-local exactly when this map has the column) and the write-time
  * logical→basis rewrite (`planner/mutation/lens-enforcement.ts`), which
  * substitutes the forward — `NEW.`-qualified — for the column ref so the CHECK
  * evaluates over the basis write row's logical image. The two must accept the
  * same set, or a deploy-admitted CHECK would crash at write plan time.
+ *
+ * The single-source condition is load-bearing: on a multi-source body the
+ * forward may read a column of a *different member* than the one the put
+ * writes, and the substituted `NEW.<col>` on that member's write row does not
+ * carry the value — the CHECK would pass vacuously (3VL unknown) instead of
+ * enforcing. The clause's put targets are bare column names, so the slot AST
+ * alone cannot prove every forward ref lives on the put member; single-source
+ * is the decidable conservative gate (the same posture as the prover's PutGet
+ * enumeration). A multi-source CHECK over an authored column therefore reds
+ * `lens.unrealizable-constraint` at deploy rather than deploying un-enforced.
  */
 export function authoredForwardMap(slot: LensSlot): Map<string, AST.Expression> {
 	const map = new Map<string, AST.Expression>();
+	const from = slot.compiledBody.from;
+	if (!from || from.length !== 1 || from[0].type !== 'table') return map;
 	slot.columnProvenance.forEach((p, i) => {
 		const rc = slot.compiledBody.columns[i];
 		if (rc && rc.type === 'column' && rc.inverse && rc.inverse.length > 0 && !containsRelationalOperand(rc.expr)) {
