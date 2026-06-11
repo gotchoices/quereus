@@ -1,16 +1,16 @@
 /**
- * `refresh materialized view` re-derives the backing table's *shape*
- * (columns/types/PK/ordering) and rebuilds the backing table when a source
- * `alter` has shifted the re-planned body's output shape — instead of only
- * swapping the new rows into the stale create-time schema (which surfaced body
- * values under the wrong column labels: a latent direct-read corruption for
- * schema-shifting `select *` bodies). A refresh with no shape change keeps the
- * data-only fast path (backing identity + warm caches preserved).
+ * `refresh materialized view` re-derives the MV table's *shape*
+ * (columns/types/PK/ordering) and drops+recreates the table under the MV's own
+ * name when a source `alter` has shifted the re-planned body's output shape —
+ * instead of only swapping the new rows into the stale create-time schema (which
+ * surfaced body values under the wrong column labels: a latent direct-read
+ * corruption for schema-shifting `select *` bodies). A refresh with no shape
+ * change keeps the data-only fast path (table identity + warm caches preserved).
  *
  * See `mv-refresh-rebuilds-backing-schema`. The join-rewrite re-enable that the
  * realignment restores is covered in `query-rewrite-join.spec.ts`; this spec
  * covers the direct-read shape, the fast-path identity, the explicit-column
- * count-shift error, and row-time maintenance against the rebuilt backing.
+ * count-shift error, and row-time maintenance against the rebuilt table.
  */
 
 import { expect } from 'chai';
@@ -91,20 +91,20 @@ describe('materialized view refresh — backing-schema rebuild', () => {
 		}
 	});
 
-	it('fast path: a refresh with no source change preserves the backing TableSchema identity', async () => {
+	it('fast path: a refresh with no source change preserves the MV TableSchema identity', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table t (x integer primary key, y text)');
 			await db.exec("insert into t values (1,'a'),(2,'b')");
 			await db.exec('create materialized view mv as select x, y from t');
 
-			const before = db.schemaManager.getTable('main', '_mv_mv');
+			const before = db.schemaManager.getTable('main', 'mv');
 			await db.exec('refresh materialized view mv');
-			const after = db.schemaManager.getTable('main', '_mv_mv');
+			const after = db.schemaManager.getTable('main', 'mv');
 
 			// Same object ⇒ the conditional took the data-only fast path (no drop+recreate),
 			// so cached prepared plans and the MV body-root cache stay warm.
-			expect(after, 'fast-path keeps the same backing TableSchema object').to.equal(before);
+			expect(after, 'fast-path keeps the same TableSchema object').to.equal(before);
 			expect(await readObjectsSorted(db, 'select * from mv')).to.deep.equal([
 				'{"x":1,"y":"a"}', '{"x":2,"y":"b"}',
 			]);
@@ -121,7 +121,7 @@ describe('materialized view refresh — backing-schema rebuild', () => {
 			await db.exec('create materialized view mv(a, b) as select * from t'); // 2 declared, body 2
 
 			await db.exec('alter table t add column z integer null'); // body now 3 → marks mv stale
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale).to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
 
 			let err: Error | undefined;
 			try { await db.exec('refresh materialized view mv'); } catch (e) { err = e as Error; }
@@ -129,7 +129,7 @@ describe('materialized view refresh — backing-schema rebuild', () => {
 			expect(err!.message).to.match(/declared with 2 columns but its body now produces 3/);
 
 			// The MV stays stale (coherent) rather than silently widening the declared list.
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale).to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
 		} finally {
 			await db.close();
 		}
@@ -156,11 +156,12 @@ describe('materialized view refresh — backing-schema rebuild', () => {
 	});
 
 	it('a producer reshape cascades staleness to a consumer MV, which a refresh then realigns', async () => {
-		// MV-over-MV: the rebuild drops+recreates `_mv_p`, firing table_removed/table_added.
-		// The manager's source-tracking listener (a consumer's sourceTables include the
-		// producer's backing `_mv_p`) marks the consumer stale and detaches its row-time
-		// plan. Refreshing the consumer re-derives its shape over the now-3-col producer and
-		// picks up the new column — the producer→consumer cascade this ticket relies on.
+		// MV-over-MV: the rebuild drops+recreates the table `p` itself, firing
+		// table_removed/table_added. The manager's source-tracking listener (the
+		// consumer's sourceTables include `main.p`) marks the consumer stale and
+		// detaches its row-time plan. Refreshing the consumer re-derives its shape
+		// over the now-3-col producer and picks up the new column — the
+		// producer→consumer cascade this ticket relies on.
 		const db = new Database();
 		try {
 			await db.exec('create table t (id integer primary key, a integer not null)');
@@ -171,14 +172,14 @@ describe('materialized view refresh — backing-schema rebuild', () => {
 			expect(await readObjectsSorted(db, 'select * from c')).to.deep.equal(['{"id":1,"a":10}']);
 
 			await db.exec('alter table t add column b integer default 5');
-			await db.exec('refresh materialized view p'); // reshapes _mv_p
+			await db.exec('refresh materialized view p'); // reshapes the table `p`
 
-			// The producer's backing drop/recreate cascaded staleness to the consumer.
-			expect(db.schemaManager.getMaterializedView('main', 'c')!.stale, 'consumer marked stale by cascade').to.equal(true);
+			// The producer's drop/recreate cascaded staleness to the consumer.
+			expect(db.schemaManager.getMaintainedTable('main', 'c')!.derivation.stale, 'consumer marked stale by cascade').to.equal(true);
 
 			// Refreshing the consumer realigns it to the reshaped producer (gains `b`).
 			await db.exec('refresh materialized view c');
-			expect(db.schemaManager.getMaterializedView('main', 'c')!.stale).to.not.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'c')!.derivation.stale).to.not.equal(true);
 			expect(await readObjectsSorted(db, 'select * from c')).to.deep.equal(['{"id":1,"a":10,"b":5}']);
 		} finally {
 			await db.close();

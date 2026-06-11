@@ -3,6 +3,7 @@ import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
+import { dropMaintainedTable } from './materialized-view.js';
 
 export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instruction {
 	const schemaManager = ctx.db.schemaManager;
@@ -21,13 +22,14 @@ export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instru
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 
-		// A materialized view must be dropped with DROP MATERIALIZED VIEW (this also
-		// keeps the MV's hidden backing table from being dropped out from under it).
-		if (rctx.db.schemaManager.getMaterializedView(targetSchemaName, objectName)) {
-			throw new QuereusError(
-				`'${objectName}' is a materialized view — use DROP MATERIALIZED VIEW`,
-				StatusCode.ERROR
-			);
+		// A maintained table (materialized view) is one record: DROP TABLE drops
+		// the table AND its derivation — detach maintenance, unlink any covering
+		// link, and fire materialized_view_removed so persisted catalogs forget
+		// the `create materialized view` entry.
+		const maintained = rctx.db.schemaManager.getMaintainedTable(targetSchemaName, objectName);
+		if (maintained) {
+			await dropMaintainedTable(rctx.db, maintained);
+			return null;
 		}
 
 		await rctx.db.schemaManager.dropTable(targetSchemaName, objectName, stmt.ifExists);

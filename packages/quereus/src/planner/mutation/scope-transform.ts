@@ -390,7 +390,9 @@ function fromSourceColumnNames(ctx: PlanningContext, fc: AST.FromClause): Set<st
 	}
 }
 
-/** Lowercased column names of a base table / view / MV named in a FROM, or `null`. */
+/** Lowercased column names of a base table / view / MV named in a FROM, or `null`.
+ *  A maintained table (materialized view) resolves through the table branch —
+ *  its registered columns ARE the authoritative output names. */
 function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource): Set<string> | null {
 	const schemaName = src.table.schema;
 	const table = ctx.schemaManager.getTable(schemaName, src.table.name);
@@ -400,12 +402,6 @@ function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource): Set
 		return view.columns && view.columns.length > 0
 			? new Set(view.columns.map(c => c.toLowerCase()))
 			: projectionOutputNames(view.selectAst);
-	}
-	const mv = ctx.schemaManager.getMaterializedView(schemaName ?? null, src.table.name);
-	if (mv) {
-		return mv.columns && mv.columns.length > 0
-			? new Set(mv.columns.map(c => c.toLowerCase()))
-			: projectionOutputNames(mv.selectAst);
 	}
 	// Unknown name (a CTE reference, or a not-yet-resolvable source).
 	return null;

@@ -24,7 +24,9 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { generateViewDDL, generateMaterializedViewDDL } from '../src/schema/ddl-generator.js';
 import { parse } from '../src/parser/index.js';
-import { backingTableNameFor, computeBodyHash, normalizeBackingModule, type ViewSchema, type MaterializedViewSchema } from '../src/schema/view.js';
+import { computeBodyHash, normalizeBackingModule, type ViewSchema } from '../src/schema/view.js';
+import { isMaintainedTable, type MaintainedTableSchema } from '../src/schema/derivation.js';
+import type { TableSchema } from '../src/schema/table.js';
 import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
 import type { SchemaChangeEvent } from '../src/schema/change-events.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
@@ -33,6 +35,12 @@ async function rows(db: Database, sql: string): Promise<Record<string, unknown>[
 	const out: Record<string, unknown>[] = [];
 	for await (const r of db.eval(sql)) out.push(r as Record<string, unknown>);
 	return out;
+}
+
+/** Narrow a table-typed event payload to the maintained-table shape the MV DDL generator reads. */
+function asMaintained(t: TableSchema): MaintainedTableSchema {
+	if (!isMaintainedTable(t)) throw new Error('expected a maintained table (derivation missing)');
+	return t;
 }
 
 /** Collect every schema-change event a database fires while `fn` runs. */
@@ -200,10 +208,10 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 			// Silent — import must not re-emit a persistence event for the MV itself.
 			expect(events.filter(e => e.type === 'materialized_view_added'), 'import is silent').to.have.length(0);
 
-			// Registered with tags, and the backing table was rebuilt and filled.
-			const mv = db.schemaManager.getMaterializedView('main', 'mv');
+			// Registered with tags, and the maintained table was rebuilt and filled.
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv');
 			expect(mv?.tags).to.deep.equal({ purpose: 'test' });
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv')), 'backing registered').to.exist;
+			expect(db.schemaManager.getTable('main', 'mv'), 'maintained table registered under the MV name').to.exist;
 			expect(await rows(db, 'select id, v from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
 
@@ -226,9 +234,9 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 				'create materialized view mv as select id, name from t insert defaults (created = 777)',
 			]);
 			expect(result.materializedViews).to.deep.equal(['main.mv']);
-			const schema = db.schemaManager.getMaterializedView('main', 'mv');
-			expect(schema?.insertDefaults, 'clause survives re-materialization').to.have.length(1);
-			expect(schema?.insertDefaults?.[0].column).to.equal('created');
+			const schema = db.schemaManager.getMaintainedTable('main', 'mv');
+			expect(schema?.derivation.insertDefaults, 'clause survives re-materialization').to.have.length(1);
+			expect(schema?.derivation.insertDefaults?.[0].column).to.equal('created');
 			await db.exec("insert into mv values (1, 'a')");
 			expect(await rows(db, 'select id, name, created from t'))
 				.to.deep.equal([{ id: 1, name: 'a', created: 777 }]);
@@ -280,8 +288,8 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 			}
 			expect(threw, 'eligibility gate fails the import').to.equal(true);
 			// Rolled back: neither the MV record nor its half-built backing remain.
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'mv')).to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -302,8 +310,8 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 				expect((e as Error).message).to.match(/must be a set/i);
 			}
 			expect(threw, 'fill gate fails the import').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'mv')).to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -327,8 +335,8 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 				expect((e as Error).message).to.match(/cannot be used as a materialized view body/i);
 			}
 			expect(threw, 'DML body fails the import').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'mv')).to.be.undefined;
 			// Crucially: the source rows were NOT deleted by the rejected import.
 			expect(await rows(db, 'select id, v from base order by id'))
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
@@ -353,8 +361,8 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 				expect((e as Error).message).to.match(/3 declared columns but body produces 2/i);
 			}
 			expect(threw, 'arity gate fails the import').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'mv')).to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -374,10 +382,10 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 			]);
 			expect(result.materializedViews).to.deep.equal(['main.mv']);
 
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-			expect(mv.backingModuleName, 'clause honored on the rehydrated record').to.equal('mem2');
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))!.vtabModuleName).to.equal('mem2');
-			expect(mem2.tables.has(`main.${backingTableNameFor('mv')}`.toLowerCase()), 'backing in mem2').to.equal(true);
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName, 'clause honored on the rehydrated record').to.equal('mem2');
+			expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName).to.equal('mem2');
+			expect(mem2.tables.has('main.mv'), 'backing in mem2').to.equal(true);
 			expect(generateMaterializedViewDDL(mv), 'regenerated DDL keeps the clause').to.match(/using mem2/i);
 
 			await db.exec('insert into base values (2, 20)');
@@ -403,26 +411,26 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 				expect((e as Error).message).to.match(/no virtual table module named 'nosuch'/i);
 			}
 			expect(threw, 'unknown module fails the entry').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'mv')).to.be.undefined;
 			expect(await rows(db, 'select id, v from base')).to.deep.equal([{ id: 1, v: 10 }]);
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('a pre-existing backing-named table in the MV\'s OWN module is dropped and re-materialized', async () => {
+	it('a pre-existing same-named table in the MV\'s OWN module is dropped and re-materialized', async () => {
 		const db = new Database();
 		const mem2 = new MemoryTableModule();
 		db.registerModule('mem2', mem2);
 		try {
 			await db.exec('create table base (id integer primary key, v integer)');
 			await db.exec('insert into base values (1, 10)');
-			// Simulate a durable backing-host module that rehydrated its own
-			// `_mv_mv` table (phase 1) before the MV catalog entry imports (phase 3),
-			// with stale contents the refill must replace.
-			await db.exec(`create table ${backingTableNameFor('mv')} (id integer primary key, v integer) using mem2`);
-			await db.exec(`insert into ${backingTableNameFor('mv')} values (99, 99)`);
+			// Simulate a durable backing-host module that rehydrated the maintained
+			// table itself (phase 1: a plain `create table mv` bundle) before the MV
+			// catalog entry imports (phase 3), with stale contents the refill must replace.
+			await db.exec('create table mv (id integer primary key, v integer) using mem2');
+			await db.exec('insert into mv values (99, 99)');
 
 			const result = await db.schemaManager.importCatalog([
 				'create materialized view mv using mem2 as select id, v from base',
@@ -430,22 +438,22 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 			expect(result.materializedViews).to.deep.equal(['main.mv']);
 			// Refilled from the body — the stale rehydrated rows are gone.
 			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))!.vtabModuleName).to.equal('mem2');
+			expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName).to.equal('mem2');
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('a pre-existing backing-named table in a DIFFERENT module fails the entry without dropping it', async () => {
+	it('a pre-existing same-named table in a DIFFERENT module fails the entry without dropping it', async () => {
 		const db = new Database();
 		const mem2 = new MemoryTableModule();
 		db.registerModule('mem2', mem2);
 		try {
 			await db.exec('create table base (id integer primary key, v integer)');
-			// A user table that merely collides with the backing name, in the
+			// A user table that merely collides with the MV name, in the
 			// DEFAULT memory module — not the MV's declared mem2 backing.
-			await db.exec(`create table ${backingTableNameFor('mv')} (id integer primary key, v integer)`);
-			await db.exec(`insert into ${backingTableNameFor('mv')} values (7, 7)`);
+			await db.exec('create table mv (id integer primary key, v integer)');
+			await db.exec('insert into mv values (7, 7)');
 
 			let threw = false;
 			try {
@@ -457,9 +465,9 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 				expect((e as Error).message).to.match(/already exists in module 'memory', not the MV's backing module 'mem2'/i);
 			}
 			expect(threw, 'other-module collision fails the entry').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
 			// The colliding table (and its data) is NOT ours to drop.
-			expect(await rows(db, `select id, v from ${backingTableNameFor('mv')}`)).to.deep.equal([{ id: 7, v: 7 }]);
+			expect(await rows(db, 'select id, v from mv')).to.deep.equal([{ id: 7, v: 7 }]);
 		} finally {
 			await db.close();
 		}
@@ -485,9 +493,9 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 				expect((e as Error).message).to.match(/non-deterministic/i);
 			}
 			expect(threw, 'eligibility gate fails the import').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
-			expect(db.schemaManager.getTable('main', backingTableNameFor('mv'))).to.be.undefined;
-			expect(mem2.tables.has(`main.${backingTableNameFor('mv')}`.toLowerCase()),
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getTable('main', 'mv')).to.be.undefined;
+			expect(mem2.tables.has('main.mv'),
 				'no half-built backing left in mem2').to.equal(false);
 		} finally {
 			await db.close();
@@ -502,9 +510,9 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 				'create materialized view mv using memory() as select id, v from base',
 			]);
 			expect(result.materializedViews).to.deep.equal(['main.mv']);
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-			expect(mv.backingModuleName, 'explicit default normalizes to absent').to.be.undefined;
-			expect(mv.sql, 'stored DDL canonicalized clause-free').to.not.match(/using/i);
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName, 'explicit default normalizes to absent').to.be.undefined;
+			expect(generateMaterializedViewDDL(mv), 'canonical DDL renders clause-free').to.not.match(/using/i);
 		} finally {
 			await db.close();
 		}
@@ -536,28 +544,34 @@ function viewSchemaFromDDL(ddl: string): ViewSchema {
 	};
 }
 
-/** Lift a `create materialized view` DDL into a MaterializedViewSchema; the
- *  fields the generator never reads (backing / pk / hash / sources) are stubbed.
- *  The backing module goes through the same `normalizeBackingModule` the create
+/** Lift a `create materialized view` DDL into the minimal maintained-table
+ *  record (`TableSchema` + `derivation`) the generator reads; the fields it
+ *  never touches (table columns / pk / hash / sources) are stubbed. The
+ *  backing module goes through the same `normalizeBackingModule` the create
  *  builder applies, so `using memory()` lifts to the clause-free record. */
-function mvSchemaFromDDL(ddl: string): MaterializedViewSchema {
+function mvSchemaFromDDL(ddl: string): MaintainedTableSchema {
 	const stmt = parse(ddl);
 	if (stmt.type !== 'createMaterializedView') throw new Error(`not a create materialized view: ${stmt.type}`);
 	const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
 	return {
 		name: stmt.view.name,
 		schemaName: stmt.view.schema ?? 'main',
-		sql: ddl,
-		selectAst: stmt.select,
-		columns: stmt.columns ? [...stmt.columns] : undefined,
-		insertDefaults: stmt.insertDefaults,
+		columns: [],
+		columnIndexMap: new Map(),
+		primaryKeyDefinition: [],
+		checkConstraints: [],
+		vtabModuleName: backing.moduleName,
+		vtabArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
+		isView: false,
 		tags: stmt.tags,
-		backingTableName: backingTableNameFor(stmt.view.name),
-		backingModuleName: backing.storedModuleName,
-		backingModuleArgs: backing.storedModuleArgs,
-		primaryKey: [],
-		bodyHash: '',
-		sourceTables: [],
+		derivation: {
+			selectAst: stmt.select,
+			columns: stmt.columns ? [...stmt.columns] : undefined,
+			insertDefaults: stmt.insertDefaults,
+			bodyHash: '',
+			logicalKey: [],
+			sourceTables: [],
+		},
 	};
 }
 
@@ -686,7 +700,7 @@ describe('view persistence: generators over LIVE-created schemas', () => {
 			await src.exec('create table base (id integer primary key, v integer)');
 			await src.exec('insert into base values (1, 10), (2, 20)');
 			await src.exec("create materialized view mv as select id, v from base with tags (purpose = 'live')");
-			const mv = src.schemaManager.getMaterializedView('main', 'mv');
+			const mv = src.schemaManager.getMaintainedTable('main', 'mv');
 			expect(mv, 'live MV registered').to.exist;
 			const ddl = generateMaterializedViewDDL(mv!);
 			expect(parse(ddl).type, 'generated DDL re-parses to createMaterializedView').to.equal('createMaterializedView');
@@ -696,7 +710,7 @@ describe('view persistence: generators over LIVE-created schemas', () => {
 			await dst.exec('create table base (id integer primary key, v integer)');
 			await dst.exec('insert into base values (1, 10), (2, 20)');
 			await dst.exec(ddl);
-			const rehydrated = dst.schemaManager.getMaterializedView('main', 'mv');
+			const rehydrated = dst.schemaManager.getMaintainedTable('main', 'mv');
 			expect(rehydrated?.tags, 'tags survive generate→exec').to.deep.equal({ purpose: 'live' });
 			expect(await rows(dst, 'select id, v from mv')).to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
 		} finally {
@@ -855,11 +869,10 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
 			expect(modified[0].schemaName).to.equal('main');
-			const ddl = generateMaterializedViewDDL(modified[0].newObject);
+			const ddl = generateMaterializedViewDDL(asMaintained(modified[0].newObject));
 			expect(ddl, 'regenerated DDL references the new table name').to.match(/\bt2\b/);
 			expect(ddl, 'regenerated DDL no longer references a bare `from t`').to.not.match(/\bfrom\s+t\b/i);
 			expect(parse(ddl).type, 'regenerated DDL re-parses').to.equal('createMaterializedView');
-			expect(modified[0].newObject.sql, 'stored sql matches the regenerated DDL (no drift)').to.equal(ddl);
 		} finally {
 			await db.close();
 		}
@@ -874,15 +887,14 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
-			const ddl = generateMaterializedViewDDL(modified[0].newObject);
+			const ddl = generateMaterializedViewDDL(asMaintained(modified[0].newObject));
 			expect(ddl, 'regenerated DDL references the new column name').to.match(/\bw\b/);
-			expect(modified[0].newObject.sql, 'stored sql matches the regenerated DDL (no drift)').to.equal(ddl);
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('clause-only column rename fires one materialized_view_modified; DDL, sql, and bodyHash carry the rewritten clause', async () => {
+	it('clause-only column rename fires one materialized_view_modified; DDL and bodyHash carry the rewritten clause', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table t (id integer primary key, name text, created integer not null)');
@@ -893,16 +905,15 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 			// here and the catalog/DDL kept the stale clause.
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
-			const mv = modified[0].newObject;
+			const mv = asMaintained(modified[0].newObject);
 			const ddl = generateMaterializedViewDDL(mv);
 			expect(ddl, 'regenerated DDL names the new clause target').to.match(/insert defaults \(created_at = 55\)/);
 			expect(ddl, 'old clause target gone').to.not.match(/created\s*=/);
-			expect(mv.sql, 'stored sql matches the regenerated DDL (no drift)').to.equal(ddl);
 			// The hash must be computed from the POST-rename clause — exactly what
 			// the differ recomputes from the post-rename declared form.
-			expect(mv.bodyHash, 'bodyHash hashes the rewritten clause').to.equal(
-				computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.selectAst, mv.insertDefaults)));
-			expect(mv.stale, 'MV stays live after a clause-only rewrite').to.not.be.true;
+			expect(mv.derivation.bodyHash, 'bodyHash hashes the rewritten clause').to.equal(
+				computeBodyHash(viewDefinitionToCanonicalString(mv.derivation.columns, mv.derivation.selectAst, mv.derivation.insertDefaults)));
+			expect(mv.derivation.stale, 'MV stays live after a clause-only rewrite').to.not.be.true;
 		} finally {
 			await db.close();
 		}
@@ -918,10 +929,9 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
-			const ddl = generateMaterializedViewDDL(modified[0].newObject);
+			const ddl = generateMaterializedViewDDL(asMaintained(modified[0].newObject));
 			expect(ddl, 'regenerated DDL references the new table inside the expr subquery').to.match(/\baudit2\b/);
 			expect(ddl, 'old table name gone').to.not.match(/\baudit\b/);
-			expect(modified[0].newObject.sql, 'stored sql matches the regenerated DDL').to.equal(ddl);
 		} finally {
 			await db.close();
 		}

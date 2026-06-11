@@ -19,11 +19,12 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { AnyVirtualTableModule } from '../src/vtab/module.js';
-import { backingTableNameFor, computeBodyHash } from '../src/schema/view.js';
+import { computeBodyHash, normalizeBackingModule } from '../src/schema/view.js';
 import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
 import { generateMaterializedViewDDL } from '../src/schema/ddl-generator.js';
 
-const BACKING = backingTableNameFor('mv').toLowerCase();
+// The maintained table IS the backing — one TableSchema under the MV's own name.
+const BACKING = 'mv';
 const BACKING_KEY = `main.${BACKING}`;
 
 async function rows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
@@ -61,7 +62,7 @@ describe('mv backing module: create gate diagnostics', () => {
 				() => db.exec('create materialized view mv using nosuch() as select id, v from base'),
 				/no virtual table module named 'nosuch'/i,
 			);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -83,7 +84,7 @@ describe('mv backing module: create gate diagnostics', () => {
 				() => db.exec('create materialized view mv using nocap() as select id, v from base'),
 				/module 'nocap' cannot host a materialized-view backing table/i,
 			);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -97,16 +98,16 @@ describe('mv backing module: create gate diagnostics', () => {
 			await db.exec('create materialized view mv_b using memory() as select id, v from base');
 			await db.exec('create materialized view mv_c using mem as select id, v from base');
 			for (const name of ['mv_a', 'mv_b', 'mv_c']) {
-				const mv = db.schemaManager.getMaterializedView('main', name)!;
-				expect(mv.backingModuleName, `${name} records no module (memory default)`).to.be.undefined;
-				expect(mv.backingModuleArgs, `${name} records no args`).to.be.undefined;
-				expect(mv.sql, `${name} stored DDL is clause-free`).to.not.match(/using/i);
+				const mv = db.schemaManager.getMaintainedTable('main', name)!;
+				const stored = normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs);
+				expect(stored.storedModuleName, `${name} records no module (memory default)`).to.be.undefined;
+				expect(stored.storedModuleArgs, `${name} records no args`).to.be.undefined;
 				expect(generateMaterializedViewDDL(mv), `${name} generated DDL is clause-free`).to.not.match(/using/i);
-				expect(mem.tables.has(`main.${backingTableNameFor(name)}`.toLowerCase()),
+				expect(mem.tables.has(`main.${name}`.toLowerCase()),
 					`${name} backing lives in the default memory module`).to.equal(true);
 			}
 			// Identical body ⇒ identical bodyHash across all three spellings.
-			const hashes = ['mv_a', 'mv_b', 'mv_c'].map(n => db.schemaManager.getMaterializedView('main', n)!.bodyHash);
+			const hashes = ['mv_a', 'mv_b', 'mv_c'].map(n => db.schemaManager.getMaintainedTable('main', n)!.derivation.bodyHash);
 			expect(new Set(hashes).size).to.equal(1);
 		} finally {
 			await db.close();
@@ -118,9 +119,10 @@ describe('mv backing module: create gate diagnostics', () => {
 		try {
 			await db.exec('create table base (id integer primary key, v integer)');
 			await db.exec("create materialized view mv using memory (hint = 'x') as select id, v from base");
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-			expect(mv.backingModuleName).to.equal('memory');
-			expect(mv.backingModuleArgs).to.deep.equal({ hint: 'x' });
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			const stored = normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs);
+			expect(stored.storedModuleName).to.equal('memory');
+			expect(stored.storedModuleArgs).to.deep.equal({ hint: 'x' });
 			expect(generateMaterializedViewDDL(mv)).to.match(/using memory \(hint = /i);
 		} finally {
 			await db.close();
@@ -142,10 +144,9 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 			const backing = db.schemaManager.getTable('main', BACKING)!;
 			expect(backing.vtabModuleName).to.equal('mem2');
 
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-			expect(mv.backingModuleName).to.equal('mem2');
-			expect(mv.sql, 'stored DDL carries the clause').to.match(/using mem2/i);
-			expect(generateMaterializedViewDDL(mv)).to.match(/using mem2/i);
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName).to.equal('mem2');
+			expect(generateMaterializedViewDDL(mv), 'canonical DDL carries the clause').to.match(/using mem2/i);
 
 			expect(await rows(db, 'select id, v from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
@@ -178,13 +179,13 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 			await db.exec('create table base (id integer primary key, v integer)');
 			await db.exec('create materialized view mv_mem2 using mem2() as select id, v from base');
 			await db.exec('create materialized view mv_def as select id, v from base');
-			const a = db.schemaManager.getMaterializedView('main', 'mv_mem2')!;
-			const b = db.schemaManager.getMaterializedView('main', 'mv_def')!;
+			const a = db.schemaManager.getMaintainedTable('main', 'mv_mem2')!;
+			const b = db.schemaManager.getMaintainedTable('main', 'mv_def')!;
 			// The module is deliberately NOT folded into the hash — already-persisted
 			// memory-backed MVs must not see a formula drift from this ticket.
-			expect(a.bodyHash).to.equal(b.bodyHash);
-			expect(a.bodyHash).to.equal(
-				computeBodyHash(viewDefinitionToCanonicalString(a.columns, a.selectAst, a.insertDefaults)));
+			expect(a.derivation.bodyHash).to.equal(b.derivation.bodyHash);
+			expect(a.derivation.bodyHash).to.equal(
+				computeBodyHash(viewDefinitionToCanonicalString(a.derivation.columns, a.derivation.selectAst, a.derivation.insertDefaults)));
 		} finally {
 			await db.close();
 		}
@@ -226,8 +227,8 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 			expect(db.schemaManager.getTable('main', BACKING)!.vtabModuleName, 'rebuilt backing module').to.equal('mem2');
 			expect(mem2.tables.has(BACKING_KEY), 'rebuilt backing in mem2').to.equal(true);
 			expect(mem.tables.has(BACKING_KEY), 'no stray copy in default memory').to.equal(false);
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-			expect(mv.backingModuleName, 'schema field survives the rebuild').to.equal('mem2');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName, 'module identity survives the rebuild').to.equal('mem2');
 			expect(await rows(db, 'select id, v, w from mv'))
 				.to.deep.equal([{ id: 1, v: 10, w: 7 }]);
 		} finally {
@@ -243,9 +244,9 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 			await db.exec('create materialized view mv using mem2() as select id, v from base');
 
 			await db.exec('alter table base rename column v to w');
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-			expect(mv.stale, 'MV stays live through the rename').to.not.equal(true);
-			expect(mv.backingModuleName, 'module identity untouched by the rewrite clone').to.equal('mem2');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.derivation.stale, 'MV stays live through the rename').to.not.equal(true);
+			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName, 'module identity untouched by the rewrite clone').to.equal('mem2');
 			expect(generateMaterializedViewDDL(mv)).to.match(/using mem2/i);
 			expect(mem2.tables.has(BACKING_KEY)).to.equal(true);
 			expect(await rows(db, 'select id, w from mv')).to.deep.equal([{ id: 1, w: 10 }]);
@@ -265,7 +266,7 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 				() => db.exec('create materialized view mv using mem2() as select v from base'),
 				/must be a set/i,
 			);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
 			expect(db.schemaManager.getTable('main', BACKING)).to.be.undefined;
 			expect(mem2.tables.has(BACKING_KEY), 'no half-built backing left in mem2').to.equal(false);
 		} finally {
@@ -281,7 +282,7 @@ describe('mv backing module: covering-UNIQUE enforcement in mem2', () => {
 			await db.exec('create table t (id integer primary key, x integer not null, y integer not null, unique (x, y))');
 			// Covering shape: uc-cols + pk, ordered by the uc columns (prefix-scan path).
 			await db.exec('create materialized view ix using mem2() as select x, y, id from t order by x, y');
-			expect(mem2.tables.has(`main.${backingTableNameFor('ix')}`.toLowerCase())).to.equal(true);
+			expect(mem2.tables.has('main.ix')).to.equal(true);
 			const t = db.schemaManager.getTable('main', 't')!;
 			expect(t.uniqueConstraints![0].coveringStructureName, 'covering link established').to.equal('ix');
 
@@ -314,8 +315,8 @@ describe('mv backing module: MV-over-MV across modules', () => {
 			await db.exec('insert into base values (1, 10)');
 			await db.exec('create materialized view mv1 using mem2() as select id, v from base');
 			await db.exec('create materialized view mv2 as select id, v from mv1');
-			expect(mem2.tables.has(`main.${backingTableNameFor('mv1')}`.toLowerCase()), 'mv1 in mem2').to.equal(true);
-			expect(mem.tables.has(`main.${backingTableNameFor('mv2')}`.toLowerCase()), 'mv2 in memory').to.equal(true);
+			expect(mem2.tables.has('main.mv1'), 'mv1 in mem2').to.equal(true);
+			expect(mem.tables.has('main.mv2'), 'mv2 in memory').to.equal(true);
 
 			// One write flows through both backings.
 			await db.exec('insert into base values (2, 20)');

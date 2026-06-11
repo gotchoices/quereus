@@ -141,7 +141,9 @@ export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, va
 export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, NamedConstraintClass } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
-export type { MaterializedViewSchema, ViewSchema } from './schema/view.js';
+export type { ViewSchema } from './schema/view.js';
+export type { TableDerivation, MaintainedTableSchema } from './schema/derivation.js';
+export { isMaintainedTable } from './schema/derivation.js';
 export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
 export { isHiddenImplicitIndex, exposedImplicitIndexes } from './schema/catalog.js';
 export type { SyntheticExposedIndex } from './schema/catalog.js';

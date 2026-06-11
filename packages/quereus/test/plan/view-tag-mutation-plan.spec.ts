@@ -102,8 +102,8 @@ describe('View tag mutation vs. prepared write-through plans', () => {
 
 	it('recovers a prepared MV insert the same way (MATERIALIZED VIEW DROP TAGS)', async () => {
 		// An MV-mediated write routes through the same view-mutation substrate (the
-		// insert builder funnels `getView ?? getMaterializedView` into
-		// buildViewMutation), so the lazy-create / drop-to-recover contract matches.
+		// insert builder funnels `getView ?? maintainedTableViewLike(getMaintainedTable)`
+		// into buildViewMutation), so the lazy-create / drop-to-recover contract matches.
 		await db.exec(`
 			create table t (id integer primary key, created integer null);
 			create materialized view mv as select id from t

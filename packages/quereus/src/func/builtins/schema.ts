@@ -9,6 +9,8 @@ import { isScalarFunctionSchema, isTableValuedFunctionSchema, isAggregateFunctio
 import { isWindowFunction } from "../../schema/window-function.js";
 import { Schema } from "../../schema/schema.js";
 import { exposedImplicitIndexes, type SyntheticExposedIndex } from "../../schema/catalog.js";
+import { isMaintainedTable } from "../../schema/derivation.js";
+import { generateMaterializedViewDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
 import { ColumnSchema } from "../../schema/column.js";
 import { FunctionFlags } from "../../common/constants.js";
@@ -122,16 +124,22 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 				for (const tableSchema of schemaInstance.getAllTables()) {
 					let createSql: string | null = null;
 					try {
-						const columnsStr = tableSchema.columns.map((c: ColumnSchema) => `"${c.name}" ${c.logicalType.name}`).join(', ');
-						const argsStr = Object.entries(tableSchema.vtabArgs ?? {}).map(([key, value]) => `${key}=${value}`).join(', ');
-						createSql = `create table "${tableSchema.name}" (${columnsStr}) using ${tableSchema.vtabModuleName}(${argsStr})`;
+						if (isMaintainedTable(tableSchema)) {
+							// A maintained table (materialized view) lists exactly ONCE,
+							// as itself, with its canonical create-materialized-view DDL.
+							createSql = generateMaterializedViewDDL(tableSchema);
+						} else {
+							const columnsStr = tableSchema.columns.map((c: ColumnSchema) => `"${c.name}" ${c.logicalType.name}`).join(', ');
+							const argsStr = Object.entries(tableSchema.vtabArgs ?? {}).map(([key, value]) => `${key}=${value}`).join(', ');
+							createSql = `create table "${tableSchema.name}" (${columnsStr}) using ${tableSchema.vtabModuleName}(${argsStr})`;
+						}
 					} catch {
 						createSql = null;
 					}
 
 					yield [
 						schemaName,
-						tableSchema.isView ? 'view' : 'table',
+						tableSchema.isView ? 'view' : isMaintainedTable(tableSchema) ? 'materialized_view' : 'table',
 						tableSchema.name,
 						tableSchema.name,
 						createSql,
@@ -1061,9 +1069,9 @@ interface ColumnInfoRow {
  * `view_info`'s optional filter). A view body that fails to plan or yields no
  * relational output produces *no rows* (logged) — the conservative, never-throw
  * posture `view_info` takes, but at row granularity there is no all-`NO` row to
- * emit. Materialized views resolve to neither path (their backing table is the
- * reserved `_mv_<name>`), so an MV name throws not-found — consistent with
- * `view_info` excluding MVs.
+ * emit. A materialized view (a maintained table) resolves through the base-table
+ * branch and reports its registered columns — `view_info` continues to exclude
+ * MVs (its per-view lineage surface is plain-view-only).
  */
 function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 	// Base table first (mirrors table_info's `_findTable`-only resolution).

@@ -31,10 +31,10 @@ import type {
 	MappingAdvertisement,
 	SchemaChangeEvent as EngineSchemaChangeEvent,
 	ViewSchema,
-	MaterializedViewSchema,
+	MaintainedTableSchema,
 	BackingHost,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -1912,13 +1912,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * added to it, forcing dependents to refill).
 	 *
 	 * **MV-over-MV ordering** is handled by a fixpoint retry rather than a static topo
-	 * sort: the source `sourceTables` an MV resolves to (`_mv_<x>`) is computed at create
-	 * time and is NOT serialized in the DDL, so it is unavailable before import. Instead,
-	 * an MV whose body reads a not-yet-built MV simply fails this round and succeeds once
-	 * its dependency is built; the loop repeats while any MV makes progress. This is
-	 * robust to arbitrary nesting depth (and covers the common single-level case for
-	 * free). A genuinely unbuildable MV — a missing (e.g. memory) source, or an
-	 * unresolvable cycle — makes no progress in a round and is recorded in `errors`.
+	 * sort: an MV's resolved `sourceTables` are computed at import time, not serialized
+	 * in the DDL, so they are unavailable before import. Each round passes the names of
+	 * every OTHER still-pending MV entry as `pendingDerivations`; the engine defers any
+	 * entry whose body reads one (its source already pre-exists as a phase-1 plain
+	 * table, so the body would otherwise plan against content the upstream's own import
+	 * may be about to replace). The loop repeats while any MV makes progress — robust to
+	 * arbitrary nesting depth. A genuinely unbuildable MV — a missing (e.g. memory)
+	 * source, or an unresolvable cycle — makes no progress in a round and is recorded in
+	 * `errors`.
 	 *
 	 * Per-entry errors in any phase are collected (not fatal) so one bad object does not
 	 * abort the rest.
@@ -2003,6 +2005,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			let progressed = false;
 			for (const entry of pending) {
 				try {
+					// Ordering gate (unified model): a dependent's source may already
+					// pre-exist as the upstream's phase-1 *plain* table, so its body
+					// PLANS before the upstream's own MV entry has imported. Pass the
+					// names of every OTHER still-pending MV entry; the engine defers
+					// (throws → retried next round) any entry whose body reads one.
+					const pendingDerivations = new Set(
+						pending.filter(p => p !== entry).map(p => p.name),
+					);
 					// Trust this backing only under a clean shutdown AND when the MV was
 					// not stale-at-close — a stale-at-close MV's row-time maintenance was
 					// detached mid-session, so its durable backing may be behind. Refilling
@@ -2012,6 +2022,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					const imported = await db.schemaManager.importCatalog([entry.ddl], {
 						trustBackings: trusted && !staleAtClose.has(entry.name),
 						adoptedBackings,
+						pendingDerivations,
 					});
 					result.materializedViews.push(...imported.materializedViews);
 					progressed = true;
@@ -2112,11 +2123,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Persist a materialized view's catalog entry (DDL via `generateMaterializedViewDDL`),
-	 * keyed by its reserved MV prefix. Compare-write (skip identical) — see
+	 * Persist a materialized view's catalog entry (DDL via `generateMaterializedViewDDL`
+	 * over the maintained table — the unified record), keyed by its reserved MV
+	 * prefix. Compare-write (skip identical) — see
 	 * {@link persistObjectCatalogEntryIfChanged}.
 	 */
-	async saveMaterializedViewDDL(mv: MaterializedViewSchema): Promise<void> {
+	async saveMaterializedViewDDL(mv: MaintainedTableSchema): Promise<void> {
 		await this.persistObjectCatalogEntryIfChanged(
 			buildMaterializedViewCatalogKey(mv.schemaName, mv.name),
 			generateMaterializedViewDDL(mv),
@@ -2195,10 +2207,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * Unlike the table path there is **no** catalog-absent self-filter for view/MV
 	 * add/remove: one `StoreModule` instance serves one `Database`, so that database's
-	 * views/MVs belong in its catalog unconditionally. The MV **backing** table
-	 * (`_mv_<name>`, memory module) fires `table_added`/`table_removed`/`table_modified`;
-	 * those stay ignored (`table_added`/`table_removed` fall through; backing
-	 * `table_modified` is catalog-absent → skipped), so the backing is never persisted.
+	 * views/MVs belong in its catalog unconditionally. A MEMORY-hosted maintained table
+	 * fires `table_added`/`table_removed`/`table_modified` like any table; those stay
+	 * ignored (`table_added`/`table_removed` fall through; its `table_modified` is
+	 * catalog-absent → skipped), so only the MV entry persists for it. A STORE-hosted
+	 * maintained table additionally persists its own table bundle through the ordinary
+	 * store-table machinery (which phase-1 rehydrate connects for the adopt fast path).
 	 *
 	 * Synchronous by contract (`notifyChange` does not await listeners); every async write
 	 * rides `persistQueue`, drained by `closeAll`/`whenCatalogPersisted`.
@@ -2230,14 +2244,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			}
 			case 'materialized_view_added':
 			case 'materialized_view_modified': {
+				// Unified model: the payload is the maintained table itself. Narrow
+				// defensively — a derivation-less payload would be an engine bug.
 				const mv = event.newObject;
-				this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				if (isMaintainedTable(mv)) this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
 				return;
 			}
 			case 'materialized_view_refreshed': {
 				// DDL is usually unchanged by a REFRESH (body/tags identical) → compare-skip.
 				const mv = event.object;
-				this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				if (isMaintainedTable(mv)) this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
 				return;
 			}
 			case 'materialized_view_removed': {
@@ -2330,8 +2346,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// harmless: their catalog entries always refill (no phase-1 pre-existing backing),
 		// so withholding trust from them is a no-op.
 		const staleAtClose = this.subscribedDb
-			? this.subscribedDb.schemaManager.getAllMaterializedViews()
-				.filter(mv => mv.stale)
+			? this.subscribedDb.schemaManager.getAllMaintainedTables()
+				.filter(mv => mv.derivation.stale)
 				.map(mv => `${mv.schemaName}.${mv.name}`.toLowerCase())
 			: [];
 

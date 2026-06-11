@@ -1,7 +1,7 @@
 import type { TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
 import { getFunctionKey } from './function.js';
-import type { ViewSchema, MaterializedViewSchema } from './view.js';
+import type { ViewSchema } from './view.js';
 import { quereusError, QuereusError } from '../common/errors.js';
 import { createLogger } from '../common/logger.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
@@ -22,7 +22,6 @@ export class Schema {
 	private tables: Map<string, TableSchema> = new Map();
 	private functions: Map<string, FunctionSchema> = new Map();
 	private views: Map<string, ViewSchema> = new Map();
-	private materializedViews: Map<string, MaterializedViewSchema> = new Map();
 	private assertions: Map<string, IntegrityAssertionSchema> = new Map();
 	/** Per-logical-table lens slots (only populated when `kind === 'logical'`),
 	 *  keyed by lowercased logical table name. See {@link LensSlot}. */
@@ -56,12 +55,10 @@ export class Schema {
 	 * @throws QuereusError if a view with the same name exists
 	 */
 	addTable(table: TableSchema): void {
-		// Ensure no view conflict
+		// Ensure no view conflict (maintained tables — materialized views — live
+		// in this same map, so table-name uniqueness covers them too).
 		if (this.views.has(table.name.toLowerCase())) {
 			throw new QuereusError(`Schema '${this.name}': Cannot add table '${table.name}', a view with the same name already exists.`);
-		}
-		if (this.materializedViews.has(table.name.toLowerCase())) {
-			throw new QuereusError(`Schema '${this.name}': Cannot add table '${table.name}', a materialized view with the same name already exists.`);
 		}
 		this.tables.set(table.name.toLowerCase(), table);
 	}
@@ -110,9 +107,6 @@ export class Schema {
 		if (this.tables.has(view.name.toLowerCase())) {
 			throw new QuereusError(`Schema '${this.name}': Cannot add view '${view.name}', a table with the same name already exists.`);
 		}
-		if (this.materializedViews.has(view.name.toLowerCase())) {
-			throw new QuereusError(`Schema '${this.name}': Cannot add view '${view.name}', a materialized view with the same name already exists.`);
-		}
 		this.views.set(view.name.toLowerCase(), view);
 		log(`Added/Updated view '%s' in schema '%s'`, view.name, this.name);
 	}
@@ -157,64 +151,6 @@ export class Schema {
 	 */
 	clearViews(): void {
 		this.views.clear();
-	}
-
-	/**
-	 * Adds or replaces a materialized view definition. Name must be disjoint from
-	 * tables and (plain) views. The MV's backing table is registered separately
-	 * via `addTable` and carries a distinct conventional name.
-	 *
-	 * @throws QuereusError if the schema name mismatches or a table/view with the same name exists
-	 */
-	addMaterializedView(mv: MaterializedViewSchema): void {
-		if (mv.schemaName.toLowerCase() !== this.name.toLowerCase()) {
-			quereusError(`Materialized view ${mv.name} has wrong schema name ${mv.schemaName}, expected ${this.name}`);
-		}
-		const key = mv.name.toLowerCase();
-		if (this.tables.has(key)) {
-			throw new QuereusError(`Schema '${this.name}': Cannot add materialized view '${mv.name}', a table with the same name already exists.`);
-		}
-		if (this.views.has(key)) {
-			throw new QuereusError(`Schema '${this.name}': Cannot add materialized view '${mv.name}', a view with the same name already exists.`);
-		}
-		this.materializedViews.set(key, mv);
-		log(`Added/Updated materialized view '%s' in schema '%s'`, mv.name, this.name);
-	}
-
-	/**
-	 * Gets a materialized view definition by name (case-insensitive).
-	 */
-	getMaterializedView(name: string): MaterializedViewSchema | undefined {
-		return this.materializedViews.get(name.toLowerCase());
-	}
-
-	/**
-	 * Returns an iterator over all materialized views in the schema.
-	 */
-	getAllMaterializedViews(): IterableIterator<MaterializedViewSchema> {
-		return this.materializedViews.values();
-	}
-
-	/**
-	 * Removes a materialized view definition (does NOT drop its backing table).
-	 *
-	 * @returns true if found and removed, false otherwise
-	 */
-	removeMaterializedView(name: string): boolean {
-		const key = name.toLowerCase();
-		const exists = this.materializedViews.has(key);
-		if (exists) {
-			log(`Removed materialized view '%s' from schema '%s'`, name, this.name);
-			this.materializedViews.delete(key);
-		}
-		return exists;
-	}
-
-	/**
-	 * Clears all materialized views (does not drop backing tables).
-	 */
-	clearMaterializedViews(): void {
-		this.materializedViews.clear();
 	}
 
 	/** Assertions */

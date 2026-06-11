@@ -12,7 +12,7 @@ import type { VirtualTableConnection } from '../vtab/connection.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { Row, SqlValue } from '../common/types.js';
 import type { UniqueConstraintSchema } from '../schema/table.js';
-import type { MaterializedViewSchema } from '../schema/view.js';
+import type { MaintainedTableSchema } from '../schema/derivation.js';
 
 /**
  * One externally-applied row change to report through
@@ -129,7 +129,7 @@ export interface DatabaseInternal {
 		schemaName: string,
 		tableName: string,
 		uc: UniqueConstraintSchema,
-	): MaterializedViewSchema | undefined;
+	): MaintainedTableSchema | undefined;
 
 	/**
 	 * Point-look up a row-time covering MV's backing table for rows whose backing
@@ -139,7 +139,7 @@ export interface DatabaseInternal {
 	 * against its live source row and applies IGNORE/ABORT/REPLACE.
 	 */
 	_lookupCoveringConflicts(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		uc: UniqueConstraintSchema,
 		newRow: Row,
 		newSourcePk: readonly SqlValue[],

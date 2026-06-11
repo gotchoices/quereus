@@ -1,11 +1,13 @@
 import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, IndexColumnSchema, UniqueConstraintSchema } from './table.js';
-import type { ViewSchema, MaterializedViewSchema } from './view.js';
+import type { ViewSchema } from './view.js';
+import { normalizeBackingModule } from './view.js';
+import { isMaintainedTable, type MaintainedTableSchema } from './derivation.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { generateTableDDL, generateIndexDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
+import { generateTableDDL, generateIndexDDL, generateMaterializedViewDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
 
 /**
  * Represents a catalog snapshot of the current database schema state
@@ -157,18 +159,11 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 	const indexes: CatalogIndex[] = [];
 	const assertions: CatalogAssertion[] = [];
 
-	// Materialized-view backing tables are an implementation detail and are
-	// excluded from user-facing catalog enumeration (the same way `isView`
-	// tables are filtered below). The MV record itself round-trips as a
-	// `CatalogMaterializedView` (collected below).
-	const backingTableNames = new Set<string>();
-	for (const mv of schema.getAllMaterializedViews()) {
-		backingTableNames.add(mv.backingTableName.toLowerCase());
-	}
-
-	// Collect tables
+	// Collect tables. A maintained table (one carrying a `derivation`) is a
+	// materialized view: it round-trips as a `CatalogMaterializedView` below —
+	// one catalog entry per maintained table, never also listed as a plain table.
 	for (const tableSchema of schema.getAllTables()) {
-		if (backingTableNames.has(tableSchema.name.toLowerCase())) continue;
+		if (isMaintainedTable(tableSchema)) continue;
 		if (!tableSchema.isView) {
 			tables.push(tableSchemaToCatalog(tableSchema, db));
 
@@ -207,9 +202,11 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 		views.push(viewSchemaToCatalog(viewSchema));
 	}
 
-	// Collect materialized views
-	for (const mvSchema of schema.getAllMaterializedViews()) {
-		materializedViews.push(materializedViewSchemaToCatalog(mvSchema));
+	// Collect materialized views (maintained tables)
+	for (const tableSchema of schema.getAllTables()) {
+		if (isMaintainedTable(tableSchema)) {
+			materializedViews.push(materializedViewSchemaToCatalog(tableSchema));
+		}
 	}
 
 	// Collect assertions
@@ -309,14 +306,18 @@ function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 	};
 }
 
-function materializedViewSchemaToCatalog(mvSchema: MaterializedViewSchema): CatalogMaterializedView {
+function materializedViewSchemaToCatalog(table: MaintainedTableSchema): CatalogMaterializedView {
+	// Backing-module identity re-derives from the table's own module/args (the
+	// `normalizeBackingModule` rule keeps the memory default absent, preserving
+	// the differ's comparison keying).
+	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
 	return {
-		name: mvSchema.name,
-		ddl: mvSchema.sql,
-		bodyHash: mvSchema.bodyHash,
-		backingModuleName: mvSchema.backingModuleName,
-		backingModuleArgs: mvSchema.backingModuleArgs,
-		tags: mvSchema.tags,
+		name: table.name,
+		ddl: generateMaterializedViewDDL(table),
+		bodyHash: table.derivation.bodyHash,
+		backingModuleName: backing.storedModuleName,
+		backingModuleArgs: backing.storedModuleArgs,
+		tags: table.tags,
 	};
 }
 

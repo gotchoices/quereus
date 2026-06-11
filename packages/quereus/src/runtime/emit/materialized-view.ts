@@ -8,6 +8,8 @@ import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import { astToString } from '../../emit/ast-stringify.js';
+import type { Database } from '../../core/database.js';
+import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import {
 	materializeView,
 	deriveBackingShape,
@@ -24,7 +26,7 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 		const db = rctx.db;
 		const sm = db.schemaManager;
 
-		const existing = sm.getMaterializedView(plan.schemaName, plan.viewName);
+		const existing = sm.getMaintainedTable(plan.schemaName, plan.viewName);
 		if (existing) {
 			if (plan.ifNotExists) return null;
 			throw new QuereusError(
@@ -32,6 +34,8 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 				StatusCode.ERROR,
 			);
 		}
+		// One namespace now: a plain table occupies the same name a maintained
+		// table would. Keep the dedicated diagnostic for both directions.
 		if (sm.getTable(plan.schemaName, plan.viewName) || sm.getView(plan.schemaName, plan.viewName)) {
 			throw new QuereusError(
 				`Cannot create materialized view '${plan.schemaName}.${plan.viewName}': a table or view with the same name already exists`,
@@ -39,14 +43,13 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 			);
 		}
 
-		// The materialize core (derive backing shape → create + fill the backing
-		// in the declared host module → register record + row-time maintenance,
-		// rolling back on any throw) is shared with the catalog-import path — see
-		// materializeView.
+		// The materialize core (derive backing shape → create + fill the
+		// maintained table under the MV's own name in the declared host module →
+		// attach derivation + register row-time maintenance, rolling back on any
+		// throw) is shared with the catalog-import path — see materializeView.
 		const mv = await materializeView(db, {
 			schemaName: plan.schemaName,
 			viewName: plan.viewName,
-			sql: plan.sql,
 			selectAst: plan.selectStmt,
 			bodySql: plan.bodySql,
 			columns: plan.columns,
@@ -76,15 +79,22 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 		const db = rctx.db;
 		const sm = db.schemaManager;
 
-		const mv = sm.getMaterializedView(plan.schemaName, plan.viewName);
+		const mv = sm.getMaintainedTable(plan.schemaName, plan.viewName);
 		if (!mv) {
+			if (sm.getTable(plan.schemaName, plan.viewName)) {
+				throw new QuereusError(
+					`'${plan.viewName}' is a table, not a materialized view`,
+					StatusCode.ERROR,
+				);
+			}
 			throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
 		}
+		const d = mv.derivation;
 
-		const bodySql = astToString(mv.selectAst);
+		const bodySql = astToString(d.selectAst);
 
 		// A stale MV re-validates its body against current source schemas first.
-		if (mv.stale) {
+		if (d.stale) {
 			revalidateBody(db, mv.name, bodySql);
 		}
 
@@ -95,33 +105,30 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 		// new rows into the stale backing schema would surface body values under the wrong
 		// column labels (a latent direct-read corruption) and break the positional
 		// backing↔body alignment the join read-rewrite relies on. So compare the derived
-		// shape to the live backing and rebuild the backing table when it shifted.
-		const shape = deriveBackingShape(db, bodySql, mv.columns);
+		// shape to the live table and rebuild it when the shape shifted.
+		const shape = deriveBackingShape(db, bodySql, d.columns);
 
 		// An explicit column list is a declared interface. A body whose output count
 		// shifted under it (a source column add behind `mv(a, b, c)`) would silently
 		// widen/narrow that list — error instead of reshaping it. The MV stays stale, so
 		// the next read re-validates/errors rather than serving a reshaped interface.
-		if (mv.columns && mv.columns.length !== shape.columns.length) {
+		if (d.columns && d.columns.length !== shape.columns.length) {
 			throw new QuereusError(
-				`materialized view '${mv.schemaName}.${mv.name}' was declared with ${mv.columns.length} columns `
+				`materialized view '${mv.schemaName}.${mv.name}' was declared with ${d.columns.length} columns `
 					+ `but its body now produces ${shape.columns.length} after a source change — drop and recreate`,
 				StatusCode.ERROR,
 			);
 		}
 
-		const currentBacking = sm.getTable(mv.schemaName, mv.backingTableName);
-		if (currentBacking && backingShapeMatches(currentBacking, shape)) {
-			// FAST PATH: shape unchanged — data-only swap, backing identity + caches preserved.
+		let live: MaintainedTableSchema = mv;
+		if (backingShapeMatches(mv, shape)) {
+			// FAST PATH: shape unchanged — data-only swap, table identity + caches preserved.
 			await rebuildBacking(db, mv);
 		} else {
-			// REBUILD: the backing shape shifted — drop+recreate the backing to match the
-			// re-planned body, then keep the MV record consistent with the new shape.
-			await rebuildBackingTable(db, mv, shape);
-			mv.primaryKey = shape.primaryKey;
-			mv.coarsenedKey = shape.coarsenedKey;
-			mv.ordering = shape.ordering;
-			mv.sourceTables = shape.sourceTables;
+			// REBUILD: the shape shifted — drop+recreate the table under the SAME
+			// name (one catalog entry) to match the re-planned body; the helper
+			// re-attaches the (shape-updated) derivation and returns the new record.
+			live = await rebuildBackingTable(db, mv, shape);
 		}
 
 		// Re-register row-time write-through maintenance. A source schema change that
@@ -134,20 +141,52 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 		// `stale`: if registration ever threw (the eligibility gate re-runs here), leaving
 		// the MV stale makes the next read re-validate/error rather than silently serve an
 		// unmaintained snapshot.
-		db.registerMaterializedView(mv);
-		mv.stale = false;
+		db.registerMaterializedView(live);
+		live.derivation.stale = false;
 		sm.getChangeNotifier().notifyChange({
 			type: 'materialized_view_refreshed',
 			// Stored names of the refreshed MV, not the raw statement spelling — see
 			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
-			schemaName: mv.schemaName,
-			objectName: mv.name,
-			object: mv,
+			schemaName: live.schemaName,
+			objectName: live.name,
+			object: live,
 		});
 		return null;
 	}
 
 	return { params: [], run, note: `refreshMaterializedView(${plan.schemaName}.${plan.viewName})` };
+}
+
+/**
+ * Shared maintained-table teardown: detach the row-time maintenance plan,
+ * clear any constraint↔structure link, drop the table (fires `table_removed`),
+ * and fire `materialized_view_removed` so store catalog persistence forgets
+ * the `create materialized view` entry. Used by DROP MATERIALIZED VIEW and by
+ * DROP TABLE on a maintained table — in the unified model both drop the one
+ * record (table + derivation).
+ */
+export async function dropMaintainedTable(db: Database, mv: MaintainedTableSchema): Promise<void> {
+	const sm = db.schemaManager;
+
+	// Detach the row-time maintenance plan. The manager also reacts to the
+	// `materialized_view_removed` event below, but detaching first keeps the
+	// stale plan from firing on the table drop.
+	db.unregisterMaterializedView(mv.schemaName, mv.name);
+
+	// Clear any constraint↔structure link this MV established. No enforcement
+	// demotion: physical schemas still enforce via the implicit auto-index.
+	unlinkCoveredUniqueConstraints(db, mv);
+
+	// Drop the table (fires table_removed), then notify the MV channel.
+	await sm.dropTable(mv.schemaName, mv.name, /*ifExists*/ true);
+	sm.getChangeNotifier().notifyChange({
+		type: 'materialized_view_removed',
+		// Stored names of the dropped MV, not the raw statement spelling — see
+		// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
+		schemaName: mv.schemaName,
+		objectName: mv.name,
+		oldObject: mv,
+	});
 }
 
 export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: EmissionContext): Instruction {
@@ -156,7 +195,7 @@ export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: E
 		const db = rctx.db;
 		const sm = db.schemaManager;
 
-		const mv = sm.getMaterializedView(plan.schemaName, plan.viewName);
+		const mv = sm.getMaintainedTable(plan.schemaName, plan.viewName);
 		if (!mv) {
 			if (plan.ifExists) return null;
 			if (sm.getTable(plan.schemaName, plan.viewName)) {
@@ -174,26 +213,7 @@ export function emitDropMaterializedView(plan: DropMaterializedViewNode, _ctx: E
 			throw new QuereusError(`no such materialized view: ${plan.viewName}`, StatusCode.ERROR);
 		}
 
-		// Detach the row-time maintenance plan. The manager also reacts to the
-		// `materialized_view_removed` event below, but detaching first keeps the
-		// stale plan from firing on the backing-table drop.
-		db.unregisterMaterializedView(plan.schemaName, plan.viewName);
-
-		// Clear any constraint↔structure link this MV established. No enforcement
-		// demotion: physical schemas still enforce via the implicit auto-index.
-		unlinkCoveredUniqueConstraints(db, mv);
-
-		// Drop the backing table (fires table_removed) then unregister the MV.
-		await sm.dropTable(plan.schemaName, mv.backingTableName, /*ifExists*/ true);
-		sm.removeMaterializedView(plan.schemaName, plan.viewName);
-		sm.getChangeNotifier().notifyChange({
-			type: 'materialized_view_removed',
-			// Stored names of the dropped MV, not the raw statement spelling — see
-			// SchemaManager.canonicalSchemaName for the emitter/stored-name invariant.
-			schemaName: mv.schemaName,
-			objectName: mv.name,
-			oldObject: mv,
-		});
+		await dropMaintainedTable(db, mv);
 		return null;
 	}
 

@@ -120,13 +120,17 @@ create table plain (id integer primary key);
 drop materialized view plain;
 -- error: not a materialized view
 
--- DROP TABLE / DROP VIEW must not target a materialized view
+-- Unified model: DROP TABLE on a maintained table drops table + derivation
+-- (one record); DROP VIEW still redirects.
 create materialized view plain_mv as select id from plain;
-drop table plain_mv;
--- error: use DROP MATERIALIZED VIEW
 drop view plain_mv;
 -- error: use DROP MATERIALIZED VIEW
-drop materialized view plain_mv;
+drop table plain_mv;
+refresh materialized view plain_mv;
+-- error: no such materialized view
+-- the name is free again after the unified drop
+create table plain_mv (z integer primary key);
+drop table plain_mv;
 drop table plain;
 
 -- ===================================
@@ -248,3 +252,45 @@ select * from itxv where id = 20;
 drop materialized view itxv;
 drop table itx_ord;
 drop table itx_cust;
+
+-- ===================================
+-- 11. Unified maintained-table model: one catalog entry, one namespace,
+--     write-through dispatch order
+-- ===================================
+
+create table um_src (id integer primary key, v text not null);
+insert into um_src values (1, 'a');
+create materialized view um_mv as select id, v from um_src;
+
+-- exactly ONE catalog entry for the maintained table, surfaced as a
+-- materialized view with its canonical create-materialized-view DDL
+select type, name from schema() where name like 'um_%' order by name;
+→ [{"type":"materialized_view","name":"um_mv"},{"type":"table","name":"um_src"}]
+
+-- one namespace: a table cannot squat the MV's name, an MV cannot squat a table's
+create table um_mv (z integer primary key);
+-- error: already exists
+create materialized view um_src as select id from um_src;
+-- error: already exists
+
+-- DML naming the maintained table routes write-through to the SOURCE (never the
+-- direct table write), even though the name now plain-resolves as a table
+insert into um_mv values (2, 'b');
+select * from um_src order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+update um_mv set v = 'B' where id = 2;
+select v from um_src where id = 2;
+→ [{"v":"B"}]
+delete from um_mv where id = 2;
+select count(*) n from um_src;
+→ [{"n":1}]
+
+-- create-time tags live on the unified record and survive a refresh
+drop materialized view um_mv;
+create materialized view um_mv as select id, v from um_src with tags (purpose = 'demo');
+refresh materialized view um_mv;
+select tags from schema() where name = 'um_mv';
+→ [{"tags":"{\"purpose\":\"demo\"}"}]
+
+drop materialized view um_mv;
+drop table um_src;

@@ -1061,7 +1061,7 @@ function insertDefaultsClauseToString(insertDefaults: ReadonlyArray<AST.ViewInse
  * mirroring `CatalogIndex.definition`.
  *
  * Both diff sides funnel through here (the actual side from the live
- * `ViewSchema` / `MaterializedViewSchema` fields, the declared side from the
+ * `ViewSchema` / `TableDerivation` fields, the declared side from the
  * `CreateViewStmt` / `CreateMaterializedViewStmt` fields), and both ASTs come
  * from the same parser and render through this same emitter, so keyword case /
  * whitespace cannot churn. Deliberately NO identifier case-folding — unlike the

@@ -5,10 +5,12 @@ import type { Scope } from '../scopes/scope.js';
 import type { SqlValue } from '../../common/types.js';
 
 /**
- * Plan node for CREATE MATERIALIZED VIEW. Materializes the body into a backing
- * table and registers a `MaterializedViewSchema`. All heavy lifting (build +
- * optimize body, derive PK, create backing table, fill rows) happens in the
- * emitter at runtime — this node just carries the DDL.
+ * Plan node for CREATE MATERIALIZED VIEW. Materializes the body into a
+ * maintained table (a `TableSchema` carrying a `TableDerivation`) under the
+ * MV's own name. All heavy lifting (build + optimize body, derive PK, create
+ * table, fill rows) happens in the emitter at runtime — this node just carries
+ * the DDL. The canonical DDL text is rendered on demand from the unified
+ * record, so the node carries no `sql`.
  */
 export class CreateMaterializedViewNode extends VoidNode {
 	readonly nodeType = PlanNodeType.CreateMaterializedView;
@@ -19,12 +21,10 @@ export class CreateMaterializedViewNode extends VoidNode {
 		public readonly schemaName: string,
 		public readonly ifNotExists: boolean,
 		public readonly columns: string[] | undefined,
-		/** Body AST — retained on the schema for declarative emission + body-hash. */
+		/** Body AST — retained on the derivation for declarative emission + body-hash. */
 		public readonly selectStmt: AST.QueryExpr,
 		/** Canonical SQL of the body alone (re-planned at runtime to fill the backing table). */
 		public readonly bodySql: string,
-		/** Original full DDL text (round-trippable). */
-		public readonly sql: string,
 		public readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>,
 		public readonly tags?: Readonly<Record<string, SqlValue>>,
 		/** Normalized backing-host module from `using <module>(...)`; undefined = memory default. */

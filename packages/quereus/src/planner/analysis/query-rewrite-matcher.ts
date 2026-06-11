@@ -26,7 +26,7 @@
  * ## Where the predicates come from (the pristine-fragment requirement)
  *
  * The fragment's WHERE is read from the live plan's `FilterNode` predicate (its
- * `.expression` AST), and the MV's WHERE from `mv.selectAst.where`. Reading the
+ * `.expression` AST), and the MV's WHERE from `mv.derivation.selectAst.where`. Reading the
  * fragment WHERE from the plan is only sound while the predicate is still an
  * explicit `FilterNode` above the table access — *before* predicate-pushdown
  * absorbs it into a range-bounded scan (where the matcher could no longer see it
@@ -62,7 +62,7 @@ import { AggregateNode } from '../nodes/aggregate-node.js';
 import { AggregateFunctionCallNode } from '../nodes/aggregate-function.js';
 import { JoinNode } from '../nodes/join-node.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
-import type { MaterializedViewSchema } from '../../schema/view.js';
+import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
@@ -82,7 +82,7 @@ export type RewriteFailureReason =
 	| 'cost-declined';         // matched, but the MV scan is not cheaper (set by the rule, not the matcher)
 
 export interface RewriteMatch {
-	readonly mv: MaterializedViewSchema;
+	readonly mv: MaintainedTableSchema;
 	readonly backing: TableSchema;
 	/**
 	 * The recognized clauses of {@link residualConjuncts} — the extra predicate the
@@ -296,7 +296,7 @@ function walkScanFilterChain(
  */
 export function matchFragmentToMv(
 	shape: FragmentShape,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,
 ): RewriteResult {
@@ -304,24 +304,24 @@ export function matchFragmentToMv(
 
 	// ---- Candidate gates (a false-positive here only forgoes a speedup). ----
 	// Stale: the backing is an unmaintained snapshot — never read it.
-	if (mv.stale === true) return fail('no-candidate');
+	if (mv.derivation.stale === true) return fail('no-candidate');
 	// Registered + has a live backing table.
 	if (!backing) return fail('no-candidate');
 	// Deterministic body: a random()/now()/volatile-UDF body cannot substitute for
 	// live recomputation. Reuses the function-registry determinism metadata.
-	if (mvBodyHasNonDeterminism(mv.selectAst, isDeterministic)) return fail('no-candidate');
+	if (mvBodyHasNonDeterminism(mv.derivation.selectAst, isDeterministic)) return fail('no-candidate');
 
 	// Source-schema sanity: the MV must read exactly the one base table the
 	// fragment reads (single-source v1). `sourceTables` dedups, so a self-join
 	// collapses to one entry — the AST single-`table` FROM check below rejects it.
 	const qualified = `${baseTable.schemaName}.${baseTable.name}`.toLowerCase();
-	if (mv.sourceTables.length !== 1 || mv.sourceTables[0] !== qualified) {
+	if (mv.derivation.sourceTables.length !== 1 || mv.derivation.sourceTables[0] !== qualified) {
 		return fail('source-mismatch');
 	}
 
 	// ---- MV body shape (AST): single-source projection + optional filter. ----
-	if (mv.selectAst.type !== 'select') return fail('shape');
-	const sel = mv.selectAst;
+	if (mv.derivation.selectAst.type !== 'select') return fail('shape');
+	const sel = mv.derivation.selectAst;
 	if ((sel.groupBy && sel.groupBy.length > 0) || sel.having || sel.distinct
 		|| sel.limit !== undefined || sel.offset !== undefined
 		|| sel.union || sel.compound) {
@@ -403,7 +403,7 @@ export function matchFragmentToMv(
  */
 export function matchMaterializedViewRewrite(
 	root: RelationalPlanNode,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,
 ): RewriteResult {
@@ -545,25 +545,25 @@ interface MvStoredColumns {
  */
 export function matchAggregateFragmentToMv(
 	shape: AggregateFragmentShape,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,
 ): RewriteResult {
 	const baseTable = shape.baseTable;
 
 	// ---- Candidate gates (a false-positive here only forgoes a speedup). ----
-	if (mv.stale === true) return fail('no-candidate');
+	if (mv.derivation.stale === true) return fail('no-candidate');
 	if (!backing) return fail('no-candidate');
-	if (mvBodyHasNonDeterminism(mv.selectAst, isDeterministic)) return fail('no-candidate');
+	if (mvBodyHasNonDeterminism(mv.derivation.selectAst, isDeterministic)) return fail('no-candidate');
 
 	const qualified = `${baseTable.schemaName}.${baseTable.name}`.toLowerCase();
-	if (mv.sourceTables.length !== 1 || mv.sourceTables[0] !== qualified) {
+	if (mv.derivation.sourceTables.length !== 1 || mv.derivation.sourceTables[0] !== qualified) {
 		return fail('source-mismatch');
 	}
 
 	// ---- MV body shape: a single-source grouped aggregate, no HAVING/DISTINCT/cap. ----
-	if (mv.selectAst.type !== 'select') return fail('aggregate-shape');
-	const sel = mv.selectAst;
+	if (mv.derivation.selectAst.type !== 'select') return fail('aggregate-shape');
+	const sel = mv.derivation.selectAst;
 	if (!sel.groupBy || sel.groupBy.length === 0) return fail('aggregate-shape'); // not a grouped MV
 	if (sel.having || sel.distinct || sel.limit !== undefined || sel.offset !== undefined
 		|| sel.union || sel.compound) {
@@ -725,7 +725,7 @@ export function matchAggregateFragmentToMv(
  */
 export function matchAggregateMaterializedViewRewrite(
 	root: RelationalPlanNode,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,
 ): RewriteResult {
@@ -841,16 +841,16 @@ function walkToFragmentJoin(
  */
 export function matchJoinFragmentToMv(
 	shape: JoinFragmentShape,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	mvBodyRoot: RelationalPlanNode | undefined,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,
 ): RewriteResult {
 	// ---- Candidate gates (a false-positive here only forgoes a speedup). ----
-	if (mv.stale === true) return fail('no-candidate');
+	if (mv.derivation.stale === true) return fail('no-candidate');
 	if (!backing) return fail('no-candidate');
 	if (!mvBodyRoot) return fail('no-candidate'); // body did not plan
-	if (mvBodyHasNonDeterminism(mv.selectAst, isDeterministic)) return fail('no-candidate');
+	if (mvBodyHasNonDeterminism(mv.derivation.selectAst, isDeterministic)) return fail('no-candidate');
 
 	// ---- Backing alignment: the stored-column map keys each backing column by the
 	//      MV body's output *position*, which is only sound while the backing columns
@@ -865,7 +865,7 @@ export function matchJoinFragmentToMv(
 	// ---- Source-set match: the MV must read exactly the fragment's two tables. ----
 	const qualA = qualifiedOf(shape.tableRefs[0].tableSchema);
 	const qualB = qualifiedOf(shape.tableRefs[1].tableSchema);
-	const mvSources = new Set(mv.sourceTables);
+	const mvSources = new Set(mv.derivation.sourceTables);
 	if (mvSources.size !== 2 || !mvSources.has(qualA) || !mvSources.has(qualB)) {
 		return fail('source-mismatch');
 	}
@@ -930,7 +930,7 @@ export function matchJoinFragmentToMv(
  */
 export function matchJoinMaterializedViewRewrite(
 	root: RelationalPlanNode,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	mvBodyRoot: RelationalPlanNode | undefined,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,

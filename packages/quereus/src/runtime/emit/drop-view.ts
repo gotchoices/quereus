@@ -10,7 +10,7 @@ export function emitDropView(plan: DropViewNode, _ctx: EmissionContext): Instruc
 		await rctx.db._ensureTransaction();
 
 		// A materialized view must be dropped with DROP MATERIALIZED VIEW.
-		if (rctx.db.schemaManager.getMaterializedView(plan.schemaName, plan.viewName)) {
+		if (rctx.db.schemaManager.getMaintainedTable(plan.schemaName, plan.viewName)) {
 			throw new QuereusError(
 				`'${plan.viewName}' is a materialized view — use DROP MATERIALIZED VIEW`,
 				StatusCode.ERROR

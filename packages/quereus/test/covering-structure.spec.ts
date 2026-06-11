@@ -14,7 +14,7 @@ import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-di
 import { proveCoverage, proveEffectiveKeyUnique, type CoverageResult } from '../src/planner/analysis/coverage-prover.js';
 import type { FunctionalDependency, PhysicalProperties, RelationalPlanNode } from '../src/planner/nodes/plan-node.js';
 import type { ColRef, RelationType } from '../src/common/datatype.js';
-import type { MaterializedViewSchema } from '../src/schema/view.js';
+import type { MaintainedTableSchema } from '../src/schema/derivation.js';
 import { parseSelect } from '../src/parser/index.js';
 import type * as AST from '../src/parser/ast.js';
 import { INTEGER_TYPE } from '../src/types/builtin-types.js';
@@ -42,8 +42,8 @@ function bodyRoot(db: Database, bodySql: string): RelationalPlanNode {
  * Runs the prover directly against the named UNIQUE constraint on the named base
  * table so per-reason outcomes are observable. Prefers the registered MV, falling
  * back to a parsed-body stub when the body is row-time-ineligible (joins, LIMIT, …)
- * and thus cannot back a real MV — the prover reads only `mv.selectAst`, so the
- * stub is faithful (cf. {@link proveUnmaterialized}).
+ * and thus cannot back a real MV — the prover reads only `mv.derivation.selectAst`,
+ * so the stub is faithful (cf. {@link proveUnmaterialized}).
  */
 async function prove(
 	db: Database,
@@ -52,8 +52,8 @@ async function prove(
 	tableName: string,
 	ucIndex = 0,
 ): Promise<CoverageResult> {
-	const mv = db.schemaManager.getMaterializedView('main', mvName)
-		?? ({ selectAst: parseSelect(bodySql) } as unknown as MaterializedViewSchema);
+	const mv = db.schemaManager.getMaintainedTable('main', mvName)
+		?? ({ name: mvName, schemaName: 'main', derivation: { selectAst: parseSelect(bodySql) } } as unknown as MaintainedTableSchema);
 	const table = db.schemaManager.getTable('main', tableName)!;
 	const uc = table.uniqueConstraints![ucIndex];
 	return proveCoverage(bodyRoot(db, bodySql), mv, uc, table);
@@ -62,7 +62,7 @@ async function prove(
 /**
  * Runs the prover against a body that is *planned but not materialized*. The MV
  * materialization path (`collectBodyRows`) is out of scope here — `proveCoverage`
- * reads only `mv.selectAst`, so a stub carrying the parsed body suffices to
+ * reads only `mv.derivation.selectAst`, so a stub carrying the parsed body suffices to
  * exercise the prover's `'right'`-join branch end to end in isolation. (RIGHT
  * JOIN itself now executes at runtime; this helper just keeps the coverage unit
  * test focused on the prover rather than on materialization.)
@@ -75,7 +75,7 @@ function proveUnmaterialized(
 ): CoverageResult {
 	const table = db.schemaManager.getTable('main', tableName)!;
 	const uc = table.uniqueConstraints![ucIndex];
-	const mvStub = { selectAst: parseSelect(bodySql) } as unknown as MaterializedViewSchema;
+	const mvStub = { name: 'ix', schemaName: 'main', derivation: { selectAst: parseSelect(bodySql) } } as unknown as MaintainedTableSchema;
 	return proveCoverage(bodyRoot(db, bodySql), mvStub, uc, table);
 }
 
@@ -251,9 +251,8 @@ describe('eager prove-and-link', () => {
 			const uc = () => db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
 			expect(uc().coveringStructureName, 'forward pointer set').to.equal('ix_t_xy');
 
-			const mv = db.schemaManager.getMaterializedView('main', 'ix_t_xy')!;
-			expect(mv.origin).to.equal('explicit');
-			expect(mv.covers).to.deep.include({ schemaName: 'main', tableName: 't' });
+			const mv = db.schemaManager.getMaintainedTable('main', 'ix_t_xy')!;
+			expect(mv.derivation.covers).to.deep.include({ schemaName: 'main', tableName: 't' });
 
 			await db.exec('drop materialized view ix_t_xy');
 			expect(uc().coveringStructureName, 'forward pointer cleared on drop').to.be.undefined;
@@ -270,7 +269,7 @@ describe('eager prove-and-link', () => {
 		]);
 		try {
 			expect(db.schemaManager.getTable('main', 't')!.uniqueConstraints![0].coveringStructureName).to.be.undefined;
-			expect(db.schemaManager.getMaterializedView('main', 'ix')!.covers).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'ix')!.derivation.covers).to.be.undefined;
 		} finally {
 			await db.close();
 		}
@@ -399,7 +398,7 @@ describe('coverage prover — multi-source (join) bodies', () => {
 		const db = await freshDb(ORDERS_CUSTOMERS);
 		try {
 			await db.exec(`create materialized view ix as ${body}`); // accepted, no throw
-			expect(db.schemaManager.getMaterializedView('main', 'ix'), 'MV registered (no shape reject)').to.not.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'ix'), 'MV registered (no shape reject)').to.not.be.undefined;
 			// Soundness: a full-rebuild MV's backing is reconciled only at the end-of-statement
 			// flush, so it lags the source mid-statement and can NEVER answer a synchronous
 			// per-row UNIQUE probe. Enforcement must not resolve it as a covering structure —
@@ -622,7 +621,7 @@ describe('coverage prover — IND-derived no-row-loss (Wave 2)', () => {
 	function proveBody(db: Database, body: string, tableName: string, structuralOnly = false): CoverageResult {
 		const table = db.schemaManager.getTable('main', tableName)!;
 		const uc = table.uniqueConstraints![0];
-		const mvStub = { selectAst: parseSelect(body) } as unknown as MaterializedViewSchema;
+		const mvStub = { name: 'ix', schemaName: 'main', derivation: { selectAst: parseSelect(body) } } as unknown as MaintainedTableSchema;
 		return proveCoverage(bodyRoot(db, body), mvStub, uc, table, { structuralOnly });
 	}
 
@@ -812,8 +811,8 @@ describe('coverage prover — IND-derived no-row-loss (Wave 2)', () => {
  * This path is unreachable from SQL: the binder rejects every 3-part
  * `schema.table.column` reference in expression context before a plan (let alone
  * an MV) exists, so the 3-part ORDER BY term is **hand-built** and the prover is
- * exercised at its boundary only (`proveCoverage` reads `mv.selectAst` directly,
- * without re-binding). The two SQL-reachable orderings — bare `uc` and 2-part
+ * exercised at its boundary only (`proveCoverage` reads `mv.derivation.selectAst`
+ * directly, without re-binding). The two SQL-reachable orderings — bare `uc` and 2-part
  * `t.uc` (the `schema: undefined` case) — both correctly resolve to base `T`'s
  * column, so they are the regression floor.
  *
@@ -846,7 +845,7 @@ describe('coverage prover — cross-schema qualifier resolution (defense-in-dept
 		const selectAst = parseSelect(BODY) as AST.SelectStmt;
 		const orderExpr: AST.ColumnExpr = { type: 'column', name: 'uc', table: 't', schema };
 		selectAst.orderBy = [{ expr: orderExpr, direction: 'asc' }];
-		const mvStub = { selectAst } as unknown as MaterializedViewSchema;
+		const mvStub = { name: 'ix', schemaName: 'main', derivation: { selectAst } } as unknown as MaintainedTableSchema;
 		const table = db.schemaManager.getTable('main', 't')!;
 		const uc = table.uniqueConstraints![0];
 		return proveCoverage(bodyRoot(db, BODY), mvStub, uc, table);
@@ -1391,7 +1390,7 @@ describe('row-time covering enforcement', () => {
 		await db.exec('create table t (id integer primary key, name text collate NOCASE, unique (name))');
 		await db.exec('create materialized view ix as select name, id from t order by name');
 		await db.exec("insert into t values (1, 'Foo')");
-		const mv = db.schemaManager.getMaterializedView('main', 'ix')!;
+		const mv = db.schemaManager.getMaintainedTable('main', 'ix')!;
 		const uc = db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
 		// New row (id=2, name='foo') vs the backing ('Foo', id=1): a binary prefix scan
 		// would early-terminate and return []; the collation-correct full scan returns id=1.

@@ -21,7 +21,9 @@ import { expect } from 'chai';
 import type { Database } from '../../src/core/database.js';
 import type { TableSchema, RowConstraintSchema, IndexSchema, ForeignKeyConstraintSchema, UniqueConstraintSchema, PrimaryKeyColumnDefinition, IndexColumnSchema } from '../../src/schema/table.js';
 import type { ColumnSchema } from '../../src/schema/column.js';
-import type { ViewSchema, MaterializedViewSchema } from '../../src/schema/view.js';
+import type { ViewSchema } from '../../src/schema/view.js';
+import type { MaintainedTableSchema } from '../../src/schema/derivation.js';
+import { generateMaterializedViewDDL } from '../../src/schema/ddl-generator.js';
 import type { IntegrityAssertionSchema } from '../../src/schema/assertion.js';
 import type * as AST from '../../src/parser/ast.js';
 import type { SqlValue } from '../../src/common/types.js';
@@ -235,24 +237,28 @@ export function assertViewSchemaEqual(direct: ViewSchema, applied: ViewSchema, l
 }
 
 /**
- * Compare two `MaterializedViewSchema` instances. The body AST is compared
- * structurally (so a divergent body surfaces here), and `bodyHash` is compared
- * directly — it is the value the declarative differ keys rebuild detection on,
- * so a re-emit/re-parse round-trip that perturbs the canonical body SQL would
- * fail here even if the AST still compared equal.
+ * Compare two maintained tables (a `TableSchema` carrying a `derivation` —
+ * what `create materialized view` produces). The body AST is compared
+ * structurally (so a divergent body surfaces here), and `derivation.bodyHash`
+ * is compared directly — it is the value the declarative differ keys rebuild
+ * detection on, so a re-emit/re-parse round-trip that perturbs the canonical
+ * body SQL would fail here even if the AST still compared equal. The canonical
+ * `create materialized view` DDL — rendered on demand from the unified record
+ * — is also compared, covering the backing-module clause and tag rendering.
  */
-export function assertMaterializedViewSchemaEqual(direct: MaterializedViewSchema, applied: MaterializedViewSchema, label?: string): void {
+export function assertMaterializedViewSchemaEqual(direct: MaintainedTableSchema, applied: MaintainedTableSchema, label?: string): void {
 	const root = label ? `[${label}] ` : '';
 	eq(direct.name.toLowerCase(), applied.name.toLowerCase(), `${root}name`);
 	eq(direct.schemaName.toLowerCase(), applied.schemaName.toLowerCase(), `${root}schemaName`);
 	eqRecord(direct.tags ?? {}, applied.tags ?? {}, `${root}tags`);
-	const dCols = (direct.columns ?? []).map(c => c.toLowerCase());
-	const aCols = (applied.columns ?? []).map(c => c.toLowerCase());
-	eqArray(dCols, aCols, `${root}columns`);
-	eq(direct.bodyHash, applied.bodyHash, `${root}bodyHash`);
+	const dCols = (direct.derivation.columns ?? []).map(c => c.toLowerCase());
+	const aCols = (applied.derivation.columns ?? []).map(c => c.toLowerCase());
+	eqArray(dCols, aCols, `${root}derivation.columns`);
+	eq(direct.derivation.bodyHash, applied.derivation.bodyHash, `${root}derivation.bodyHash`);
+	eq(generateMaterializedViewDDL(direct), generateMaterializedViewDDL(applied), `${root}generatedDDL`);
 	try {
-		assertAstEquivalent(direct.selectAst, applied.selectAst, `${root}selectAst`);
-		assertAstEquivalent(direct.insertDefaults ?? [], applied.insertDefaults ?? [], `${root}insertDefaults`);
+		assertAstEquivalent(direct.derivation.selectAst, applied.derivation.selectAst, `${root}derivation.selectAst`);
+		assertAstEquivalent(direct.derivation.insertDefaults ?? [], applied.derivation.insertDefaults ?? [], `${root}derivation.insertDefaults`);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		expect.fail(msg);

@@ -31,7 +31,7 @@ describe('Schema-event name casing — cached-plan invalidation', () => {
 		`);
 		expect(db.schemaManager.getTable('main', 't')!.schemaName).to.equal('main');
 		expect(db.schemaManager.getView('main', 'v')!.schemaName).to.equal('main');
-		expect(db.schemaManager.getMaterializedView('main', 'mv')!.schemaName).to.equal('main');
+		expect(db.schemaManager.getMaintainedTable('main', 'mv')!.schemaName).to.equal('main');
 	});
 
 	it('CREATE INDEX with a case-differing table spelling invalidates a cached read plan', async () => {

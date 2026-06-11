@@ -30,6 +30,7 @@ import { StatusCode } from '../src/common/types.js';
 import { computeSchemaHash } from '../src/schema/schema-hasher.js';
 import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
+import { normalizeBackingModule } from '../src/schema/view.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import {
 	assertTableSchemaEqual,
@@ -117,8 +118,8 @@ async function runCase(c: Case): Promise<void> {
 			assertViewSchemaEqual(d!, a!, viewName);
 		}
 		for (const mvName of c.expectMaterializedViews ?? []) {
-			const d = direct.schemaManager.getMaterializedView('main', mvName);
-			const a = applied.schemaManager.getMaterializedView('main', mvName);
+			const d = direct.schemaManager.getMaintainedTable('main', mvName);
+			const a = applied.schemaManager.getMaintainedTable('main', mvName);
 			expect(d, `direct missing materialized view ${mvName}`).to.not.be.undefined;
 			expect(a, `applied missing materialized view ${mvName}`).to.not.be.undefined;
 			assertMaterializedViewSchemaEqual(d!, a!, mvName);
@@ -1270,7 +1271,7 @@ describe('declarative-equivalence: materialized views', () => {
 			const beforeRows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select id, x from mv')) beforeRows.push(r);
 			expect(beforeRows).to.deep.equal([{ id: 1, x: 10 }]);
-			const beforeHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
 			// Re-declare with a changed body (select y instead of x) and re-apply.
 			await db.exec(`declare schema main {
@@ -1284,7 +1285,7 @@ describe('declarative-equivalence: materialized views', () => {
 			for await (const r of db.eval('select id, y from mv')) afterRows.push(r);
 			expect(afterRows).to.deep.equal([{ id: 1, y: 100 }]);
 
-			const afterHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const afterHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 			expect(afterHash, 'bodyHash should change when the body changes').to.not.equal(beforeHash);
 
 			// The old column is gone after the rebuild.
@@ -1315,7 +1316,7 @@ describe('declarative-equivalence: materialized views', () => {
 			const before: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select created from t where id = 1')) before.push(r);
 			expect(before).to.deep.equal([{ created: 111 }]);
-			const beforeHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
 			// Same body, clause 111 → 222: must surface as a drop+recreate.
 			await db.exec(`declare schema main {
@@ -1335,7 +1336,7 @@ describe('declarative-equivalence: materialized views', () => {
 			for await (const r of db.eval('select created from t where id = 2')) after.push(r);
 			expect(after, 'write-through must use the NEW default').to.deep.equal([{ created: 222 }]);
 
-			const afterHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const afterHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 			expect(afterHash, 'bodyHash should change when the clause changes').to.not.equal(beforeHash);
 
 			// Converged: re-diff yields no create and no drop.
@@ -1360,7 +1361,7 @@ describe('declarative-equivalence: materialized views', () => {
 				materialized view mv (a, b) as select id, x from t
 			}`);
 			await db.exec('apply schema main');
-			const beforeHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
@@ -1378,7 +1379,7 @@ describe('declarative-equivalence: materialized views', () => {
 			const rows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select a, c from mv')) rows.push(r);
 			expect(rows).to.deep.equal([{ a: 1, c: 10 }]);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash).to.not.equal(beforeHash);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash).to.not.equal(beforeHash);
 		} finally {
 			await db.close();
 		}
@@ -1432,7 +1433,7 @@ describe('declarative-equivalence: materialized views', () => {
 			}`);
 			await db.exec('apply schema main');
 			await db.exec('insert into t values (1, 10)');
-			const beforeHash = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
 			// Same body, new backing module: only the module comparison fires.
 			await db.exec(`declare schema main {
@@ -1448,11 +1449,11 @@ describe('declarative-equivalence: materialized views', () => {
 			expect(diff.materializedViewsToCreate[0]).to.match(/using mem2/i);
 
 			await db.exec('apply schema main');
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-			expect(mv.backingModuleName).to.equal('mem2');
-			expect(db.schemaManager.getTable('main', '_mv_mv')!.vtabModuleName).to.equal('mem2');
-			expect(mem2.tables.has('main._mv_mv'), 'backing migrated into mem2').to.equal(true);
-			expect(mv.bodyHash, 'module identity is NOT folded into the hash').to.equal(beforeHash);
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName).to.equal('mem2');
+			expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName).to.equal('mem2');
+			expect(mem2.tables.has('main.mv'), 'backing migrated into mem2').to.equal(true);
+			expect(mv.derivation.bodyHash, 'module identity is NOT folded into the hash').to.equal(beforeHash);
 			const r: Array<Record<string, unknown>> = [];
 			for await (const row of db.eval('select id, x from mv')) r.push(row);
 			expect(r, 'rows survive the re-materialization').to.deep.equal([{ id: 1, x: 10 }]);
@@ -1476,8 +1477,9 @@ describe('declarative-equivalence: materialized views', () => {
 			);
 			expect(diff3.materializedViewsToDrop, 'reverse module change must drop').to.deep.equal(['mv']);
 			await db.exec('apply schema main');
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.backingModuleName).to.be.undefined;
-			expect(mem2.tables.has('main._mv_mv'), 'old mem2 backing destroyed').to.equal(false);
+			const mvBack = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(normalizeBackingModule(mvBack.vtabModuleName, mvBack.vtabArgs).storedModuleName).to.be.undefined;
+			expect(mem2.tables.has('main.mv'), 'old mem2 backing destroyed').to.equal(false);
 		} finally {
 			await db.close();
 		}
@@ -1634,7 +1636,7 @@ describe('declarative-equivalence: in-place view / MV / index tag drift', () => 
 			await db.exec('apply schema main');
 			await db.exec('insert into t values (1, 10)');
 			await db.exec('refresh materialized view mv');
-			const bodyHashBefore = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const bodyHashBefore = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
@@ -1650,10 +1652,10 @@ describe('declarative-equivalence: in-place view / MV / index tag drift', () => 
 			expect(diff.materializedViewTagsChanges).to.deep.equal([{ name: 'mv', tags: { owner: 'platform', tier: 'gold' } }]);
 
 			await db.exec('apply schema main');
-			const mvAfter = db.schemaManager.getMaterializedView('main', 'mv')!;
+			const mvAfter = db.schemaManager.getMaintainedTable('main', 'mv')!;
 			expect(mvAfter.tags).to.deep.equal({ owner: 'platform', tier: 'gold' });
 			// No re-materialization: the body hash is unchanged and the row survives.
-			expect(mvAfter.bodyHash, 'tag change must not perturb the body hash').to.equal(bodyHashBefore);
+			expect(mvAfter.derivation.bodyHash, 'tag change must not perturb the body hash').to.equal(bodyHashBefore);
 			const rows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select id, x from mv')) rows.push(r);
 			expect(rows).to.deep.equal([{ id: 1, x: 10 }]);
@@ -1694,7 +1696,7 @@ describe('declarative-equivalence: in-place view / MV / index tag drift', () => 
 
 			await db.exec('apply schema main');
 			// The recreate carried the new tags through the create path.
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.deep.equal({ owner: 'platform' });
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.tags).to.deep.equal({ owner: 'platform' });
 		} finally {
 			await db.close();
 		}

@@ -12,7 +12,7 @@ import type { Row, SqlValue } from '../src/common/types.js';
  * no relational output, and a full-rebuild-only body over a source past the size
  * threshold. Each still names the MV and steers to a plain `view` (live re-evaluation)
  * or `create table … as` (one-off snapshot) — NOT a refresh policy, and never leaking
- * the hidden `_mv_<name>` backing table.
+ * any internal `_mv_`-style implementation naming.
  *
  * The sqllogic harness (`53-materialized-views-rowtime.sqllogic` §7) covers positive
  * substrings; it cannot express the *negative* assertions below, so this focused spec
@@ -50,22 +50,22 @@ describe('Materialized view create-time gate diagnostic', () => {
 		expect(err.message).to.contain('create table');
 		// …never a refresh policy (the knob is gone)…
 		expect(err.message).to.not.contain('refresh');
-		// …and never leaking the hidden backing-table implementation detail.
+		// …and never leaking any internal `_mv_`-style naming.
 		expect(err.message).to.not.contain('_mv_');
 	});
 
-	it('rolls the backing table back so the MV name stays free after a failed create', async () => {
+	it('rolls the MV table back so the MV name stays free after a failed create', async () => {
 		await db.exec(`
 			create table orders (id integer primary key, status text);
 			insert into orders values (1, 'open'), (2, 'open'), (3, 'shipped');
 		`);
-		// An ineligible body (non-deterministic) fills the backing table, then the gate
-		// rejects it — so the rollback must drop the backing table it just created.
+		// An ineligible body (non-deterministic) fills the MV's table, then the gate
+		// rejects it — so the rollback must drop the table it just created.
 		await captureError('create materialized view mv_status as select id, random() as r from orders;');
 
 		// A row-time-eligible body (projects the source PK) over the same source must
 		// succeed — proving the failed create did not half-register the name or leave
-		// a backing table behind.
+		// a table behind.
 		await db.exec('create materialized view mv_status as select id, status from orders;');
 		const rows: Record<string, unknown>[] = [];
 		for await (const row of db.eval('select id, status from mv_status order by id')) {
@@ -78,7 +78,7 @@ describe('Materialized view create-time gate diagnostic', () => {
 
 	// A duplicate-producing ("bag") body fails the set contract at fill time (before
 	// the row-time gate is reached). This path is separate from the gate diagnostic
-	// above; it must still name the MV + set contract, never leak the backing table,
+	// above; it must still name the MV + set contract, never leak internal naming,
 	// and steer only to the keyed remedies (`create view` / `create table`).
 	it('a duplicate-producing body fails the set contract with a non-leaking diagnostic', async () => {
 		await db.exec(`
@@ -89,7 +89,7 @@ describe('Materialized view create-time gate diagnostic', () => {
 		const err = await captureError('create materialized view mv_status as select status from orders;');
 		expect(err.message).to.contain('must be a set');
 		expect(err.message).to.contain('mv_status');
-		// Never leaks the hidden backing-table name…
+		// Never leaks any internal `_mv_`-style naming…
 		expect(err.message).to.not.contain('_mv_');
 		// …and steers to the keyed remedies (`create view` / `create table`).
 		expect(err.message).to.match(/create view/);
@@ -97,7 +97,7 @@ describe('Materialized view create-time gate diagnostic', () => {
 
 		// The failed create rolled back, so the name is free for an eligible body.
 		await db.exec('create materialized view mv_status as select id, status from orders;');
-		expect(db.schemaManager.getMaterializedView('main', 'mv_status'), 'MV registered after rollback').to.not.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'mv_status'), 'MV registered after rollback').to.not.be.undefined;
 	});
 });
 
@@ -190,7 +190,7 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 	for (const [label, body] of acceptCases) {
 		it(`accepts ${label} (maintained by the floor) — no shape reject`, async () => {
 			await db.exec(`create materialized view ok_shape as ${body};`);
-			expect(db.schemaManager.getMaterializedView('main', 'ok_shape'), `${label} should register`).to.not.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'ok_shape'), `${label} should register`).to.not.be.undefined;
 			await db.exec('drop materialized view ok_shape;');
 		});
 	}
@@ -209,12 +209,12 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		expect(err.message).to.contain('cannot be materialized');
 		expect(err.message).to.contain('non-deterministic');
 		expect(err.message).to.contain('nondeterministic_schema'); // names the override
-		expect(db.schemaManager.getMaterializedView('main', 'nd'), 'rejected without the pragma').to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'nd'), 'rejected without the pragma').to.be.undefined;
 
 		// With the pragma the floor's gate is lifted and the body registers.
 		await db.exec('pragma nondeterministic_schema = true;');
 		await db.exec('create materialized view nd as select distinct random() as r from g;');
-		expect(db.schemaManager.getMaterializedView('main', 'nd'), 'accepted under the pragma').to.not.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'nd'), 'accepted under the pragma').to.not.be.undefined;
 	});
 
 	// A deterministic expression projection column (arithmetic / function) over the
@@ -223,7 +223,7 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 	// computed columns track source writes exactly as a plain view would.
 	it('accepts a deterministic expression projection column and maintains it on source writes', async () => {
 		await db.exec('create materialized view ev as select id, v + 1 as v1, abs(v) as av from g;');
-		expect(db.schemaManager.getMaterializedView('main', 'ev'), 'expression-projection MV registered').to.not.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'ev'), 'expression-projection MV registered').to.not.be.undefined;
 
 		const read = async (): Promise<Record<string, unknown>[]> => {
 			const rows: Record<string, unknown>[] = [];
@@ -247,7 +247,7 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 	it('accepts a single-source aggregate and maintains groups on source writes', async () => {
 		await db.exec('insert into g values (2, 100, 7), (3, 200, 1);');
 		await db.exec('create materialized view ga as select k, count(*) as c, sum(v) as s from g group by k;');
-		expect(db.schemaManager.getMaterializedView('main', 'ga'), 'aggregate MV registered').to.not.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'ga'), 'aggregate MV registered').to.not.be.undefined;
 
 		const read = async (): Promise<Record<string, unknown>[]> => {
 			const rows: Record<string, unknown>[] = [];
@@ -279,7 +279,7 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 	it('accepts a materialized view over a materialized view and cascades source writes through it', async () => {
 		await db.exec('create materialized view mv_base as select id, v from g;');
 		await db.exec('create materialized view mv_over as select id, v from mv_base;');
-		expect(db.schemaManager.getMaterializedView('main', 'mv_over'), 'MV-over-MV registered').to.not.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'mv_over'), 'MV-over-MV registered').to.not.be.undefined;
 
 		// A source insert cascades through mv_base's backing into mv_over.
 		await db.exec('insert into g values (2, 200, 7);');
@@ -319,13 +319,13 @@ describe('Materialized view `with refresh` is a parse error', () => {
 		const err = await captureError("create materialized view v1 as select id, x from t with refresh = 'row-time';");
 		// The trailing clause is reparsed as a stray statement → CTE-shaped parse error.
 		expect(err.message).to.contain('after CTE name');
-		expect(db.schemaManager.getMaterializedView('main', 'v1'), 'no MV registered on parse failure').to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'v1'), 'no MV registered on parse failure').to.be.undefined;
 	});
 
 	it('rejects an unknown `with refresh = \'bogus\'` literal identically (clause is never inspected)', async () => {
 		const err = await captureError("create materialized view v2 as select id, x from t with refresh = 'bogus';");
 		expect(err.message).to.contain('after CTE name');
-		expect(db.schemaManager.getMaterializedView('main', 'v2'), 'no MV registered on parse failure').to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'v2'), 'no MV registered on parse failure').to.be.undefined;
 	});
 });
 
@@ -363,7 +363,7 @@ describe('Materialized view lateral-TVF fan-out arm (prefix-delete)', () => {
 
 	it('accepts a lateral generate_series fan-out and maintains the slice on source writes', async () => {
 		await db.exec('create materialized view lf as select lt.id, lt.x, f.value from lt cross join lateral generate_series(1, lt.x) f;');
-		expect(db.schemaManager.getMaterializedView('main', 'lf'), 'lateral-TVF MV registered').to.not.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'lf'), 'lateral-TVF MV registered').to.not.be.undefined;
 
 		// id=1 → value 1,2 ; id=2 → value 1,2,3 ; id=3 (x=0) → empty fan-out.
 		expect(await read()).to.deep.equal([
@@ -433,7 +433,7 @@ describe('Materialized view lateral-TVF fan-out arm (prefix-delete)', () => {
 		const err = await captureError('create materialized view bad_nokey as select lt.id, s.n from lt cross join lateral fan_nokey(lt.x) s;');
 		expect(err.message).to.contain('cannot be materialized');
 		expect(err.message).to.contain('no provable unique key');
-		expect(db.schemaManager.getMaterializedView('main', 'bad_nokey'), 'no MV registered after the floor rejects the bag').to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'bad_nokey'), 'no MV registered after the floor rejects the bag').to.be.undefined;
 	});
 
 	it('rejects a non-deterministic lateral TVF (the fan-out must be reproducible)', async () => {
@@ -459,7 +459,7 @@ describe('Materialized view lateral-TVF fan-out arm (prefix-delete)', () => {
 		const err = await captureError('create materialized view bad_rnd as select lt.id, s.n from lt cross join lateral fan_rnd(lt.x) s;');
 		expect(err.message).to.contain('cannot be materialized');
 		expect(err.message).to.contain('non-deterministic table-valued function');
-		expect(db.schemaManager.getMaterializedView('main', 'bad_rnd'), 'no MV registered after determinism rejection').to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'bad_rnd'), 'no MV registered after determinism rejection').to.be.undefined;
 	});
 });
 
@@ -502,12 +502,12 @@ describe('Materialized view full-rebuild size reject + threshold option', () => 
 		const err = await captureError('create materialized view sz_mv as select distinct v from sz;');
 		expect(err.message).to.contain('cannot be materialized');
 		expect(err.message).to.contain('materialized_view_rebuild_row_threshold');
-		expect(db.schemaManager.getMaterializedView('main', 'sz_mv'), 'rejected MV not registered').to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'sz_mv'), 'rejected MV not registered').to.be.undefined;
 
 		// Disabling the reject (0) accepts the same body; the floor maintains it on writes.
 		await db.exec('pragma materialized_view_rebuild_row_threshold = 0;');
 		await db.exec('create materialized view sz_mv as select distinct v from sz;');
-		expect(db.schemaManager.getMaterializedView('main', 'sz_mv'), 'accepted once disabled').to.not.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'sz_mv'), 'accepted once disabled').to.not.be.undefined;
 		await db.exec('insert into sz values (6,6);');
 		const rows: number[] = [];
 		for await (const row of db.eval('select v from sz_mv order by v')) rows.push(Number(row.v));

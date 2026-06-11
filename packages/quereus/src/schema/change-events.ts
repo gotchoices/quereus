@@ -1,7 +1,7 @@
 import type { TableSchema } from './table.js';
 import type { FunctionSchema } from './function.js';
 import type { IntegrityAssertionSchema } from './assertion.js';
-import type { MaterializedViewSchema, ViewSchema } from './view.js';
+import type { ViewSchema } from './view.js';
 import { createLogger } from '../common/logger.js';
 
 const log = createLogger('schema:change-events');
@@ -75,9 +75,13 @@ export type ViewRemovedEvent = SchemaObjectRemoved<'view_removed', ViewSchema>;
 export type ViewModifiedEvent = SchemaObjectModified<'view_modified', ViewSchema>;
 
 // ── Materialized view events ───────────────────────────────────────
+// Keyed by the maintained table's own name (unified model: one `TableSchema`
+// carrying a `derivation`); payloads are that table. The channel survives so
+// store catalog persistence keeps re-saving the `create materialized view`
+// DDL on derivation changes, distinct from the table-bundle channel.
 
-export type MaterializedViewAddedEvent = SchemaObjectAdded<'materialized_view_added', MaterializedViewSchema>;
-export type MaterializedViewRemovedEvent = SchemaObjectRemoved<'materialized_view_removed', MaterializedViewSchema>;
+export type MaterializedViewAddedEvent = SchemaObjectAdded<'materialized_view_added', TableSchema>;
+export type MaterializedViewRemovedEvent = SchemaObjectRemoved<'materialized_view_removed', TableSchema>;
 
 /**
  * Emitted after an in-place change to an existing materialized view — currently
@@ -87,14 +91,14 @@ export type MaterializedViewRemovedEvent = SchemaObjectRemoved<'materialized_vie
  * write-through plans WITHOUT re-registering maintenance or rebuilding the
  * backing. No maintenance listener subscribes to this event.
  */
-export type MaterializedViewModifiedEvent = SchemaObjectModified<'materialized_view_modified', MaterializedViewSchema>;
+export type MaterializedViewModifiedEvent = SchemaObjectModified<'materialized_view_modified', TableSchema>;
 
 /** Emitted after a successful `REFRESH MATERIALIZED VIEW`. Carries the current schema. */
 export interface MaterializedViewRefreshedEvent {
 	type: 'materialized_view_refreshed';
 	schemaName: string;
 	objectName: string;
-	object: MaterializedViewSchema;
+	object: TableSchema;
 }
 
 // ── Module / collation events (name-only payload) ──────────────────

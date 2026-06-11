@@ -5,8 +5,9 @@ import { serializePlanTree } from '../../src/planner/debug.js';
 
 /**
  * Golden plan shapes for automatic materialized-view query rewrite (read side).
- * The rewrite substitutes an ordinary backing `TableReference`, so `query_plan()`
- * (here, `serializePlanTree`) shows the `_mv_<name>` scan for free. The dynamic
+ * The rewrite substitutes an ordinary `TableReference` over the MV's maintained
+ * table, so `query_plan()` (here, `serializePlanTree`) shows the MV-table scan
+ * for free (`"name": "<mv>"` in the serialized tableSchema). The dynamic
  * golden-plan harness can't create an MV before planning, so these are focused
  * execution-then-plan assertions (cf. `materialized-view-plan.spec.ts`).
  */
@@ -22,27 +23,28 @@ describe('Materialized-view query rewrite — golden plans', () => {
 	});
 	afterEach(async () => { await db.close(); });
 
-	it('a covering query rewrites to the backing scan with a residual', () => {
+	it('a covering query rewrites to the MV-table scan with a residual', () => {
 		const plan = serializePlanTree(db.getPlan('select customer_id, amt from sales where amt > 0 and customer_id = 7'));
-		// Backing-table scan…
-		expect(plan).to.contain('_mv_recent');
-		// …and the original base table is no longer recomputed.
-		expect(plan).to.not.contain('sales');
+		// MV-table scan…
+		expect(plan).to.contain('"name": "recent"');
+		// …and the original base table is no longer recomputed (the MV's derivation
+		// metadata still names `sales`, so probe for an actual `sales` table scan).
+		expect(plan).to.not.contain('"name": "sales"');
 	});
 
 	it('a near-miss (predicate not entailed) keeps the base recompute', () => {
 		// amt > -5 is NOT entailed by the MV's amt > 0, so no rewrite.
 		const plan = serializePlanTree(db.getPlan('select customer_id, amt from sales where amt > -5'));
-		expect(plan).to.not.contain('_mv_recent');
-		expect(plan).to.contain('sales');
+		expect(plan).to.not.contain('"name": "recent"');
+		expect(plan).to.contain('"name": "sales"');
 	});
 
 	it('a stale MV is not used (base recompute)', async () => {
 		await db.exec('alter table sales add column note text null');
-		expect(db.schemaManager.getMaterializedView('main', 'recent')!.stale).to.equal(true);
+		expect(db.schemaManager.getMaintainedTable('main', 'recent')!.derivation.stale).to.equal(true);
 		const plan = serializePlanTree(db.getPlan('select customer_id, amt from sales where amt > 0'));
-		expect(plan).to.not.contain('_mv_recent');
-		expect(plan).to.contain('sales');
+		expect(plan).to.not.contain('"name": "recent"');
+		expect(plan).to.contain('"name": "sales"');
 	});
 
 	it('cost gate declines a no-win case (MV with no WHERE answering a no-WHERE query)', async () => {
@@ -53,20 +55,19 @@ describe('Materialized-view query rewrite — golden plans', () => {
 				insert into tt values (1,10,20),(2,30,40);
 				create materialized view allt as select id, x, y from tt;
 			`);
-			// Backing == base cardinality and no filter saved → not strictly cheaper → decline.
+			// MV == base cardinality and no filter saved → not strictly cheaper → decline.
 			const plan = serializePlanTree(db2.getPlan('select x, y from tt'));
-			expect(plan, 'no-win case keeps the base recompute').to.not.contain('_mv_allt');
-			expect(plan).to.not.contain('_mv_');
+			expect(plan, 'no-win case keeps the base recompute').to.not.contain('"name": "allt"');
 		} finally {
 			await db2.close();
 		}
 	});
 
-	it('the substituted backing scan flows through normal physical access selection', () => {
-		// The replacement is an ordinary TableReference, so a SeqScan over the backing
-		// appears (query_plan visibility is free).
+	it('the substituted MV-table scan flows through normal physical access selection', () => {
+		// The replacement is an ordinary TableReference, so a SeqScan over the MV's
+		// table appears (query_plan visibility is free).
 		const plan = serializePlanTree(db.getPlan('select customer_id, amt from sales where amt > 0'));
-		expect(plan).to.contain('_mv_recent');
+		expect(plan).to.contain('"name": "recent"');
 		expect(plan).to.match(/SeqScan|IndexScan|Retrieve/);
 	});
 
@@ -81,8 +82,8 @@ describe('Materialized-view query rewrite — golden plans', () => {
 			`);
 			// Both MVs cover identically (equal cost) → stable lowercased-name tiebreak picks 'aaa'.
 			const plan = serializePlanTree(db2.getPlan('select x, y from t where x > 0'));
-			expect(plan).to.contain('_mv_aaa');
-			expect(plan).to.not.contain('_mv_bbb');
+			expect(plan).to.contain('"name": "aaa"');
+			expect(plan).to.not.contain('"name": "bbb"');
 		} finally {
 			await db2.close();
 		}
@@ -107,29 +108,29 @@ describe('Materialized-view query rewrite — aggregate rollup golden plans', ()
 	});
 	afterEach(async () => { await db.close(); });
 
-	it('exact-key aggregate (query key == MV key) → direct backing scan, no re-aggregation', () => {
+	it('exact-key aggregate (query key == MV key) → direct MV-table scan, no re-aggregation', () => {
 		const plan = serializePlanTree(db.getPlan('select d, sum(amt) from sales group by d'));
-		expect(plan, 'rewrote to backing').to.contain('_mv_daily');
-		expect(plan, 'base no longer recomputed').to.not.contain('"main.sales"');
+		expect(plan, 'rewrote to the MV table').to.contain('"name": "daily"');
+		expect(plan, 'base no longer recomputed').to.not.contain('"name": "sales"');
 		// Exact-key answers from a direct scan + Project — no StreamAggregate/HashAggregate.
 		expect(plan).to.not.match(/StreamAggregate|HashAggregate/);
 	});
 
-	it('global-scalar rollup → backing scan + a re-aggregate node', () => {
+	it('global-scalar rollup → MV-table scan + a re-aggregate node', () => {
 		const plan = serializePlanTree(db.getPlan('select sum(amt) from sales'));
-		expect(plan, 'rewrote to backing').to.contain('_mv_daily');
-		// Rollup re-aggregates the backing rows into one group.
+		expect(plan, 'rewrote to the MV table').to.contain('"name": "daily"');
+		// Rollup re-aggregates the MV rows into one group.
 		expect(plan).to.match(/StreamAggregate|HashAggregate/);
 	});
 
 	it('a near-miss (query key ⊄ MV key) keeps the base recompute', () => {
 		// `group by amt` is not a subset of the MV's {d} group key, so no rewrite.
 		const plan = serializePlanTree(db.getPlan('select amt, sum(d) from sales group by amt'));
-		expect(plan).to.not.contain('_mv_daily');
-		expect(plan).to.contain('sales');
+		expect(plan).to.not.contain('"name": "daily"');
+		expect(plan).to.contain('"name": "sales"');
 	});
 
-	it('rollup with a residual on a dropped MV group key rewrites to the backing + re-aggregate', async () => {
+	it('rollup with a residual on a dropped MV group key rewrites to the MV table + re-aggregate', async () => {
 		const db2 = new Database();
 		try {
 			await db2.exec(`
@@ -137,13 +138,13 @@ describe('Materialized-view query rewrite — aggregate rollup golden plans', ()
 				create materialized view byregion as select d, r, sum(amt) as total from regsales group by d, r;
 			`);
 			// rollup to {d} with a residual on r (a non-query-group MV group-key column): the
-			// residual partitions whole (d, r) backing groups, so it re-binds as a Filter on the
-			// backing scan before the re-aggregate down to {d}. (The base streaming-aggregate
+			// residual partitions whole (d, r) MV groups, so it re-binds as a Filter on the
+			// MV-table scan before the re-aggregate down to {d}. (The base streaming-aggregate
 			// filter-drop bug this used to dodge is fixed.)
 			const plan = serializePlanTree(db2.getPlan('select d, sum(amt) from regsales where r = 1 group by d'));
-			expect(plan, 'rewrote to backing').to.contain('_mv_byregion');
-			expect(plan, 'base no longer recomputed').to.not.contain('"main.regsales"');
-			// Rollup re-aggregates the surviving backing rows down to {d}.
+			expect(plan, 'rewrote to the MV table').to.contain('"name": "byregion"');
+			expect(plan, 'base no longer recomputed').to.not.contain('"name": "regsales"');
+			// Rollup re-aggregates the surviving MV rows down to {d}.
 			expect(plan).to.match(/StreamAggregate|HashAggregate/);
 		} finally {
 			await db2.close();

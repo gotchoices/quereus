@@ -66,9 +66,9 @@ function pristineJoinFragment(db: Database, sql: string): RelationalPlanNode {
 /** The MV body's fully-optimized relational root (rewrite suppressed), as the rule
  *  derives it. */
 function mvBodyRoot(db: Database, mvName: string): RelationalPlanNode {
-	const mv = db.schemaManager.getMaterializedView('main', mvName)!;
+	const mv = db.schemaManager.getMaintainedTable('main', mvName)!;
 	const root = db.schemaManager.withSuppressedMaterializedViewRewrite(
-		() => db.getPlan(mv.selectAst as AST.AstNode).getRelations()[0],
+		() => db.getPlan(mv.derivation.selectAst as AST.AstNode).getRelations()[0],
 	);
 	expect(root, 'MV body produced a relation').to.not.be.undefined;
 	return root as RelationalPlanNode;
@@ -76,8 +76,9 @@ function mvBodyRoot(db: Database, mvName: string): RelationalPlanNode {
 
 function matchJoin(db: Database, sql: string, mvName: string, isDet: DeterminismProbe = ALL_DETERMINISTIC): RewriteResult {
 	const root = pristineJoinFragment(db, sql);
-	const mv = db.schemaManager.getMaterializedView('main', mvName)!;
-	const backing = db.schemaManager.getTable('main', mv.backingTableName);
+	const mv = db.schemaManager.getMaintainedTable('main', mvName)!;
+	// The maintained table IS its own backing in the unified model.
+	const backing = db.schemaManager.getTable('main', mv.name);
 	return matchJoinMaterializedViewRewrite(root, mv, mvBodyRoot(db, mvName), backing, isDet);
 }
 
@@ -219,7 +220,7 @@ describe('join-subsumption matcher — per-reason negatives', () => {
 		const db = await freshDb(SCHEMA);
 		try {
 			await db.exec('alter table orders add column note text null');
-			expect(db.schemaManager.getMaterializedView('main', 'enriched')!.stale).to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'enriched')!.derivation.stale).to.equal(true);
 			const res = matchJoin(db, 'select o.id, o.amt, c.name from orders o join customers c on o.customer_id = c.id', 'enriched');
 			expect(res.match).to.be.undefined;
 			expect(reason(res)).to.equal('no-candidate');
@@ -230,13 +231,15 @@ describe('join-subsumption matcher — per-reason negatives', () => {
 });
 
 describe('join-subsumption — end-to-end rows + plan shape', () => {
-	it('rewrites a 1:1-join query to the backing scan (no join in the plan) and stays row-identical', async () => {
+	it('rewrites a 1:1-join query to the MV-table scan (no join in the plan) and stays row-identical', async () => {
 		const db = await freshDb([...SCHEMA, ...ROWS]);
 		try {
 			const q = 'select o.id, o.amt, c.name from orders o join customers c on o.customer_id = c.id where o.amt > 0 order by o.id';
 			const serialized = serializePlanTree(db.getPlan(q));
-			expect(serialized, 'rewrote to backing').to.contain('_mv_enriched');
-			expect(serialized, 'no join survives').to.not.match(/Join/i);
+			expect(serialized, 'rewrote to the MV table').to.contain('"name": "enriched"');
+			// (The MV derivation's rendered body contains the word "join", so probe
+			// for surviving join NODES rather than the bare word.)
+			expect(serialized, 'no join survives').to.not.match(/"nodeType": "\w*Join"/);
 
 			const enabled = await readRows(db, q);
 			db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite']) });
@@ -253,7 +256,7 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 		const db = await freshDb([...SCHEMA, ...ROWS]);
 		try {
 			const q = "select o.id, o.amt from orders o join customers c on o.customer_id = c.id where c.name = 'ann' order by o.id";
-			expect(serializePlanTree(db.getPlan(q)), 'rewrote to backing').to.contain('_mv_enriched');
+			expect(serializePlanTree(db.getPlan(q)), 'rewrote to the MV table').to.contain('"name": "enriched"');
 			const enabled = await readRows(db, q);
 			db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite']) });
 			const disabled = await readRows(db, q);
@@ -269,7 +272,7 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 		const db = await freshDb([...SCHEMA, ...ROWS]);
 		try {
 			const serialized = serializePlanTree(db.getPlan('select o.id, c.name from orders o join customers c on o.amt = c.id'));
-			expect(serialized, 'no rewrite for a non-1:1 join').to.not.contain('_mv_enriched');
+			expect(serialized, 'no rewrite for a non-1:1 join').to.not.contain('"name": "enriched"');
 		} finally {
 			await db.close();
 		}
@@ -281,30 +284,30 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 			const q = 'select o.id, c.name from orders o join customers c on o.customer_id = c.id order by o.id';
 			const expected = '[101,"ann"]|[102,"ann"]|[103,"bob"]|[104,null]';
 			// Rewrites and is correct while fresh.
-			expect(serializePlanTree(db.getPlan(q))).to.contain('_mv_enriched');
+			expect(serializePlanTree(db.getPlan(q))).to.contain('"name": "enriched"');
 			expect(await readRows(db, q)).to.equal(expected);
 
 			// A source ALTER marks the join MV stale → no rewrite, base recompute stays correct.
 			await db.exec('alter table orders add column note text null');
-			expect(db.schemaManager.getMaterializedView('main', 'enriched')!.stale).to.equal(true);
-			expect(serializePlanTree(db.getPlan(q)), 'no rewrite while stale').to.not.contain('_mv_enriched');
+			expect(db.schemaManager.getMaintainedTable('main', 'enriched')!.derivation.stale).to.equal(true);
+			expect(serializePlanTree(db.getPlan(q)), 'no rewrite while stale').to.not.contain('"name": "enriched"');
 			expect(await readRows(db, q)).to.equal(expected);
 
 			// Refresh clears staleness → the rewrite resumes against the re-derived body.
 			await db.exec('refresh materialized view enriched');
-			expect(db.schemaManager.getMaterializedView('main', 'enriched')!.stale).to.not.equal(true);
-			expect(serializePlanTree(db.getPlan(q)), 'rewrite resumes after refresh').to.contain('_mv_enriched');
+			expect(db.schemaManager.getMaintainedTable('main', 'enriched')!.derivation.stale).to.not.equal(true);
+			expect(serializePlanTree(db.getPlan(q)), 'rewrite resumes after refresh').to.contain('"name": "enriched"');
 			expect(await readRows(db, q)).to.equal(expected);
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('a select* join MV ALTER+refresh rebuilds the backing and RE-ENABLES the rewrite (no intervening query)', async () => {
+	it('a select* join MV ALTER+refresh rebuilds the MV table and RE-ENABLES the rewrite (no intervening query)', async () => {
 		// A source `alter` shifts a `select *` body's output order (the new source column
-		// interleaves) while the create-time backing did not reorder — desynchronizing the
-		// position-keyed stored-column map. `refresh` now re-derives the backing shape and
-		// rebuilds the backing table to match the re-planned body, restoring positional
+		// interleaves) while the create-time MV table did not reorder — desynchronizing the
+		// position-keyed stored-column map. `refresh` now re-derives the stored shape and
+		// rebuilds the MV's table to match the re-planned body, restoring positional
 		// alignment — so `backingAlignsWithBody` passes and the join rewrite resumes (it no
 		// longer forgoes). Critically there is NO query while the MV is stale (the only path
 		// that used to drop the cached body root), so the post-refresh plan re-validates on
@@ -321,18 +324,18 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 		try {
 			const q = 'select o.id, c.name from orders o join customers c on o.customer_id = c.id order by o.id';
 			const expected = '[101,"ann"]|[102,"bob"]';
-			// Fresh: the select* body aligns with the backing, so the rewrite fires.
-			expect(serializePlanTree(db.getPlan(q)), 'rewrites while fresh').to.contain('_mv_jstar');
+			// Fresh: the select* body aligns with the stored shape, so the rewrite fires.
+			expect(serializePlanTree(db.getPlan(q)), 'rewrites while fresh').to.contain('"name": "jstar"');
 			expect(await readRows(db, q)).to.equal(expected);
 
 			// Alter a non-last source column, then refresh — WITHOUT querying while stale.
 			await db.exec('alter table orders add column extra integer null');
 			await db.exec('refresh materialized view jstar');
-			expect(db.schemaManager.getMaterializedView('main', 'jstar')!.stale).to.not.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'jstar')!.derivation.stale).to.not.equal(true);
 
-			// The rebuild realigned the backing with the re-planned select* body, so the
+			// The rebuild realigned the MV table with the re-planned select* body, so the
 			// arm no longer forgoes — the rewrite fires again and rows stay correct.
-			expect(serializePlanTree(db.getPlan(q)), 'rewrite re-enabled after rebuild').to.contain('_mv_jstar');
+			expect(serializePlanTree(db.getPlan(q)), 'rewrite re-enabled after rebuild').to.contain('"name": "jstar"');
 			expect(await readRows(db, q)).to.equal(expected);
 
 			// Direct read of the reshaped MV exposes the new (interleaved) source column.
@@ -343,7 +346,7 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 		}
 	});
 
-	it('MV self-maintenance is never rewritten (a source write maintains the join backing)', async () => {
+	it('MV self-maintenance is never rewritten (a source write maintains the join MV)', async () => {
 		const db = await freshDb([...SCHEMA, ...ROWS]);
 		try {
 			expect(await readRows(db, 'select id from enriched')).to.equal('[101]|[102]|[103]|[104]');

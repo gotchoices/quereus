@@ -63,8 +63,9 @@ function match(db: Database, sql: string, mvName: string, isDet: DeterminismProb
 	const frag = analyzeQueryFragment(pristineFragment(db, sql));
 	expect(frag.ok, `fragment analyzable (${(frag as { reason?: string }).reason ?? ''})`).to.be.true;
 	if (!frag.ok) throw new Error('unreachable');
-	const mv = db.schemaManager.getMaterializedView('main', mvName)!;
-	const backing = db.schemaManager.getTable('main', mv.backingTableName);
+	const mv = db.schemaManager.getMaintainedTable('main', mvName)!;
+	// The maintained table IS its own backing in the unified model.
+	const backing = db.schemaManager.getTable('main', mv.name);
 	return matchFragmentToMv(frag.shape, mv, backing, isDet);
 }
 
@@ -202,7 +203,7 @@ describe('query-rewrite matcher — gates (no-candidate)', () => {
 		try {
 			// A compatible alter marks the MV stale but it still plans.
 			await db.exec('alter table sales add column note text null');
-			expect(db.schemaManager.getMaterializedView('main', 'recent')!.stale).to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'recent')!.derivation.stale).to.equal(true);
 			const res = match(db, 'select customer_id, amt from sales where amt > 0', 'recent');
 			expect(res.match).to.be.undefined;
 			expect((res as { reason: string }).reason).to.equal('no-candidate');
@@ -219,14 +220,15 @@ describe('query-rewrite matcher — gates (no-candidate)', () => {
 			const allNonDet: DeterminismProbe = () => false;
 			// The body has no function calls, so the probe alone never fires; instead
 			// confirm a body WITH a flagged function gates. Use a stub MV body.
-			const mv = db.schemaManager.getMaterializedView('main', 'recent')!;
-			const stub = { ...mv, selectAst: { ...(mv.selectAst as object), where: undefined, columns: [
+			const mv = db.schemaManager.getMaintainedTable('main', 'recent')!;
+			const stubAst = { ...(mv.derivation.selectAst as object), where: undefined, columns: [
 				{ type: 'column', expr: { type: 'function', name: 'random', args: [] } },
-			] } } as typeof mv;
+			] } as typeof mv.derivation.selectAst;
+			const stub = { ...mv, derivation: { ...mv.derivation, selectAst: stubAst } };
 			const frag = analyzeQueryFragment(pristineFragment(db, 'select customer_id, amt from sales where amt > 0'));
 			expect(frag.ok).to.be.true;
 			if (!frag.ok) throw new Error('unreachable');
-			const backing = db.schemaManager.getTable('main', mv.backingTableName);
+			const backing = db.schemaManager.getTable('main', mv.name);
 			const res = matchFragmentToMv(frag.shape, stub, backing, allNonDet);
 			expect(res.match).to.be.undefined;
 			expect((res as { reason: string }).reason).to.equal('no-candidate');
@@ -237,13 +239,13 @@ describe('query-rewrite matcher — gates (no-candidate)', () => {
 });
 
 describe('query-rewrite — end-to-end rows + plan shape', () => {
-	it('rewrites to the backing scan and returns identical rows', async () => {
+	it('rewrites to the MV-table scan and returns identical rows', async () => {
 		const db = await freshDb([...SALES, 'create materialized view recent as select id, customer_id, amt from sales where amt > 0']);
 		try {
 			const q = 'select customer_id, amt from sales where amt > 0 and customer_id = 7 order by amt';
-			// Plan shows the backing scan.
+			// Plan shows the MV-table scan.
 			const serialized = serializePlanTree(db.getPlan(q));
-			expect(serialized, 'rewrote to backing').to.contain('_mv_recent');
+			expect(serialized, 'rewrote to the MV table').to.contain('"name": "recent"');
 
 			// Rows identical to the rule-disabled recompute.
 			const enabled = await readRows(db, q);
@@ -263,7 +265,7 @@ describe('query-rewrite — end-to-end rows + plan shape', () => {
 			// Qualified source (`from sales s`) + qualified columns (`s.amt`): entailment
 			// resolves by bare name and the residual/outputs remap by columnIndex.
 			const q = 'select s.customer_id, s.amt from sales s where s.amt > 0 and s.customer_id = 7 order by s.amt';
-			expect(serializePlanTree(db.getPlan(q)), 'rewrote to backing').to.contain('_mv_recent');
+			expect(serializePlanTree(db.getPlan(q)), 'rewrote to the MV table').to.contain('"name": "recent"');
 
 			const enabled = await readRows(db, q);
 			db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite']) });
@@ -281,8 +283,8 @@ describe('query-rewrite — end-to-end rows + plan shape', () => {
 		try {
 			// Query wants amt > -5, which the amt>0 MV does NOT cover.
 			const serialized = serializePlanTree(db.getPlan('select customer_id, amt from sales where amt > -5'));
-			expect(serialized, 'no rewrite').to.not.contain('_mv_recent');
-			expect(serialized).to.contain('sales');
+			expect(serialized, 'no rewrite').to.not.contain('"name": "recent"');
+			expect(serialized).to.contain('"name": "sales"');
 		} finally {
 			await db.close();
 		}

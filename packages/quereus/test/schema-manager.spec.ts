@@ -408,18 +408,18 @@ describe('Schema Manager', () => {
 		it('should set materialized-view tags via setMaterializedViewTags without perturbing the body', async () => {
 			await db.exec('create table t (id integer primary key, x integer not null)');
 			await db.exec("create materialized view mv as select id, x from t with tags (owner = 'analytics')");
-			const bodyHashBefore = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const bodyHashBefore = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 			db.schemaManager.setMaterializedViewTags('mv', { owner: 'platform', tier: 'gold' });
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
 			expect(mv.tags).to.deep.equal({ owner: 'platform', tier: 'gold' });
-			expect(mv.bodyHash, 'body hash unchanged by a tag mutation').to.equal(bodyHashBefore);
+			expect(mv.derivation.bodyHash, 'body hash unchanged by a tag mutation').to.equal(bodyHashBefore);
 		});
 
 		it('should clear materialized-view tags when setting empty object', async () => {
 			await db.exec('create table t (id integer primary key, x integer not null)');
 			await db.exec("create materialized view mv as select id, x from t with tags (owner = 'analytics')");
 			db.schemaManager.setMaterializedViewTags('mv', {});
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.tags).to.be.undefined;
 		});
 
 		it('should throw NOTFOUND when setting tags on an unknown materialized view', () => {
@@ -505,27 +505,27 @@ describe('Schema Manager', () => {
 		it('should merge and drop materialized-view tags without perturbing the body', async () => {
 			await db.exec('create table t (id integer primary key, x integer not null)');
 			await db.exec("create materialized view mv as select id, x from t with tags (a = 1)");
-			const bodyHashBefore = db.schemaManager.getMaterializedView('main', 'mv')!.bodyHash;
+			const bodyHashBefore = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 			db.schemaManager.mergeMaterializedViewTags('mv', { b: 2 });
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.deep.equal({ a: 1, b: 2 });
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.tags).to.deep.equal({ a: 1, b: 2 });
 			db.schemaManager.dropMaterializedViewTags('mv', ['a']);
-			const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
 			expect(mv.tags).to.deep.equal({ b: 2 });
-			expect(mv.bodyHash, 'body hash unchanged by a tag merge/drop').to.equal(bodyHashBefore);
+			expect(mv.derivation.bodyHash, 'body hash unchanged by a tag merge/drop').to.equal(bodyHashBefore);
 		});
 
 		it('should collapse materialized-view tags to undefined when dropping the last key', async () => {
 			await db.exec('create table t (id integer primary key, x integer not null)');
 			await db.exec("create materialized view mv as select id, x from t with tags (a = 1)");
 			db.schemaManager.dropMaterializedViewTags('mv', ['a']);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.tags).to.be.undefined;
 		});
 
 		it('should throw NOTFOUND (atomic) on dropMaterializedViewTags with an absent key', async () => {
 			await db.exec('create table t (id integer primary key, x integer not null)');
 			await db.exec("create materialized view mv as select id, x from t with tags (a = 1)");
 			expect(() => db.schemaManager.dropMaterializedViewTags('mv', ['nope'])).to.throw(/nope/i);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.tags).to.deep.equal({ a: 1 });
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.tags).to.deep.equal({ a: 1 });
 		});
 
 		it('should throw NOTFOUND for merge/drop MV tags on an unknown materialized view', () => {

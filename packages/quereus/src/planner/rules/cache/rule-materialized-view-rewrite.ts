@@ -12,15 +12,15 @@
  *
  *     -- never names `recent`, but the optimizer answers from it:
  *     select customer_id, amt from sales where amt > 0 and customer_id = 7;
- *     --   → scan _mv_recent, residual filter (customer_id = 7), residual project
+ *     --   → scan recent, residual filter (customer_id = 7), residual project
  *
  * **Placement.** Logical→logical, in the Structural `rewrite` pass, at a priority
  * *below* `grow-retrieve` / `predicate-pushdown` so the fragment is still the
  * pristine `Project(Filter?(Retrieve(TableReference)))` when the matcher reads its
  * WHERE off the live plan (see `query-rewrite-matcher.ts` § pristine-fragment
- * requirement). The substituted backing `TableReference` then flows through the
- * normal Physical-pass access-path selection — so `query_plan()` shows an ordinary
- * `_mv_<name>` scan for free.
+ * requirement). The substituted maintained-table `TableReference` then flows
+ * through the normal Physical-pass access-path selection — so `query_plan()`
+ * shows an ordinary scan of the MV's own table for free.
  *
  * **`sideEffectMode: 'safe'`.** The matcher admits only a read-only
  * `Project(Filter?(scan(TableReference)))` fragment (recognized conjunctive
@@ -61,7 +61,7 @@ import {
 	type AggregateRecipe,
 	type DeterminismProbe,
 } from '../../analysis/query-rewrite-matcher.js';
-import type { MaterializedViewSchema } from '../../../schema/view.js';
+import type { MaintainedTableSchema, TableDerivation } from '../../../schema/derivation.js';
 import type * as AST from '../../../parser/ast.js';
 
 const log = createLogger('optimizer:rule:materialized-view-rewrite');
@@ -91,7 +91,7 @@ export function ruleMaterializedViewRewrite(node: PlanNode, context: OptContext)
 	// backing — that would read the snapshot being populated. See SchemaManager
 	// § mvRewriteSuppressed.
 	if (sm.isMaterializedViewRewriteSuppressed()) return null;
-	const mvs = sm.getAllMaterializedViews();
+	const mvs = sm.getAllMaintainedTables();
 	if (mvs.length === 0) return null;
 
 	// Mirror the create-time determinism gate: consult the function registry's
@@ -115,7 +115,7 @@ export function ruleMaterializedViewRewrite(node: PlanNode, context: OptContext)
 
 /** Materialized views are looked up by qualified source; this typed alias keeps the
  *  two arms' enumeration readable. */
-type MvList = ReturnType<OptContext['db']['schemaManager']['getAllMaterializedViews']>;
+type MvList = ReturnType<OptContext['db']['schemaManager']['getAllMaintainedTables']>;
 
 /** The projection-filter arm (the foundation): rewrite `Project(Filter?(scan))`. */
 function rewriteProjectionFilter(
@@ -131,10 +131,11 @@ function rewriteProjectionFilter(
 	const baseQualified = `${shape.baseTable.schemaName}.${shape.baseTable.name}`.toLowerCase();
 
 	// Enumerate candidate MVs single-sourced over this base table, then match.
+	// The maintained table IS its own backing in the unified model.
 	const matches: RewriteMatch[] = [];
 	for (const mv of mvs) {
-		if (mv.sourceTables.length !== 1 || mv.sourceTables[0] !== baseQualified) continue;
-		const backing = sm.getTable(mv.schemaName, mv.backingTableName);
+		if (mv.derivation.sourceTables.length !== 1 || mv.derivation.sourceTables[0] !== baseQualified) continue;
+		const backing = sm.getTable(mv.schemaName, mv.name);
 		const res = matchFragmentToMv(shape, mv, backing, isDeterministic);
 		if (res.match) matches.push(res.match);
 	}
@@ -147,7 +148,7 @@ function rewriteProjectionFilter(
 
 	let best: { match: RewriteMatch; cost: number } | undefined;
 	for (const m of matches) {
-		const mvHasWhere = m.mv.selectAst.type === 'select' && m.mv.selectAst.where !== undefined;
+		const mvHasWhere = m.mv.derivation.selectAst.type === 'select' && m.mv.derivation.selectAst.where !== undefined;
 		const backingRows = backingCardinality(context.stats.tableRows(m.backing), baseRows, mvHasWhere);
 		const cost = scanCost(backingRows, m.residualConjuncts.length > 0, m.outputColumnMap.length);
 		if (cost >= baseCost) continue; // not strictly cheaper → decline this match
@@ -185,8 +186,8 @@ function rewriteAggregate(
 
 	const matches: RewriteMatch[] = [];
 	for (const mv of mvs) {
-		if (mv.sourceTables.length !== 1 || mv.sourceTables[0] !== baseQualified) continue;
-		const backing = sm.getTable(mv.schemaName, mv.backingTableName);
+		if (mv.derivation.sourceTables.length !== 1 || mv.derivation.sourceTables[0] !== baseQualified) continue;
+		const backing = sm.getTable(mv.schemaName, mv.name);
 		const res = matchAggregateFragmentToMv(shape, mv, backing, isDeterministic);
 		if (res.match) matches.push(res.match);
 	}
@@ -248,10 +249,10 @@ function rewriteJoinFragment(
 	// Enumerate candidate MVs whose two source tables are exactly this join's tables.
 	const matches: RewriteMatch[] = [];
 	for (const mv of mvs) {
-		if (mv.sourceTables.length !== 2) continue;
-		const sources = new Set(mv.sourceTables);
+		if (mv.derivation.sourceTables.length !== 2) continue;
+		const sources = new Set(mv.derivation.sourceTables);
 		if (!sources.has(qualA) || !sources.has(qualB)) continue;
-		const backing = sm.getTable(mv.schemaName, mv.backingTableName);
+		const backing = sm.getTable(mv.schemaName, mv.name);
 		const mvBodyRoot = plannedMvBodyRoot(context.db, mv) ?? undefined;
 		const res = matchJoinFragmentToMv(shape, mv, mvBodyRoot, backing, isDeterministic);
 		if (res.match) matches.push(res.match);
@@ -307,25 +308,28 @@ function rewriteJoinFragment(
  * Only a successfully planned root is cached; a body that fails to plan is
  * re-attempted each fire.
  */
-const MV_BODY_ROOT_CACHE = new WeakMap<MaterializedViewSchema, RelationalPlanNode>();
+const MV_BODY_ROOT_CACHE = new WeakMap<TableDerivation, RelationalPlanNode>();
 
-function plannedMvBodyRoot(db: OptContext['db'], mv: MaterializedViewSchema): RelationalPlanNode | null {
-	if (mv.stale === true) {
-		MV_BODY_ROOT_CACHE.delete(mv);
+function plannedMvBodyRoot(db: OptContext['db'], mv: MaintainedTableSchema): RelationalPlanNode | null {
+	// Keyed on the derivation object — stable across catalog swaps of the owning
+	// table (tag updates spread a fresh TableSchema but share the derivation).
+	const d = mv.derivation;
+	if (d.stale === true) {
+		MV_BODY_ROOT_CACHE.delete(d);
 		return null;
 	}
-	const cached = MV_BODY_ROOT_CACHE.get(mv);
+	const cached = MV_BODY_ROOT_CACHE.get(d);
 	if (cached !== undefined && cachedBodyRootIsCurrent(cached, db)) return cached;
 	let root: RelationalPlanNode | null = null;
 	try {
 		root = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
-			const plan = db.getPlan(mv.selectAst as AST.AstNode);
+			const plan = db.getPlan(d.selectAst as AST.AstNode);
 			return (plan.getRelations()[0] as RelationalPlanNode | undefined) ?? null;
 		});
 	} catch {
 		root = null; // a body that no longer plans is simply not a candidate
 	}
-	if (root !== null) MV_BODY_ROOT_CACHE.set(mv, root); else MV_BODY_ROOT_CACHE.delete(mv);
+	if (root !== null) MV_BODY_ROOT_CACHE.set(d, root); else MV_BODY_ROOT_CACHE.delete(d);
 	return root;
 }
 
@@ -404,7 +408,7 @@ function estimateGroups(baseRows: number, groupByCount: number): number {
 
 /** Number of GROUP BY columns in a matched MV's body (≥1 for a grouped MV). */
 function mvGroupKeyCount(match: RewriteMatch): number {
-	const sel = match.mv.selectAst;
+	const sel = match.mv.derivation.selectAst;
 	return sel.type === 'select' && sel.groupBy ? sel.groupBy.length : 1;
 }
 

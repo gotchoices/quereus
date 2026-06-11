@@ -61,8 +61,9 @@ function pristineAggregateFragment(db: Database, sql: string): RelationalPlanNod
 
 function matchAgg(db: Database, sql: string, mvName: string, isDet: DeterminismProbe = ALL_DETERMINISTIC): RewriteResult {
 	const root = pristineAggregateFragment(db, sql);
-	const mv = db.schemaManager.getMaterializedView('main', mvName)!;
-	const backing = db.schemaManager.getTable('main', mv.backingTableName);
+	const mv = db.schemaManager.getMaintainedTable('main', mvName)!;
+	// The maintained table IS its own backing in the unified model.
+	const backing = db.schemaManager.getTable('main', mv.name);
 	return matchAggregateMaterializedViewRewrite(root, mv, backing, isDet);
 }
 
@@ -302,7 +303,7 @@ describe('aggregate-rollup matcher — per-reason negatives', () => {
 		const db = await freshDb(SALES);
 		try {
 			await db.exec('alter table sales add column note text null');
-			expect(db.schemaManager.getMaterializedView('main', 'byregion')!.stale).to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'byregion')!.derivation.stale).to.equal(true);
 			const res = matchAgg(db, 'select d, sum(amt) from sales group by d', 'byregion');
 			expect(res.match).to.be.undefined;
 			expect(reason(res)).to.equal('no-candidate');

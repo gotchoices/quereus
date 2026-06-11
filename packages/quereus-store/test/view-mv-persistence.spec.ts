@@ -233,7 +233,7 @@ describe('StoreModule view / materialized-view persistence', () => {
 
 		const { db: db2, result } = await reopen();
 		expect(result.errors, 'clean rehydrate').to.have.lengthOf(0);
-		expect(db2.schemaManager.getMaterializedView('main', 'mv')!.tags)
+		expect(db2.schemaManager.getMaintainedTable('main', 'mv')!.tags)
 			.to.deep.equal({ purpose: 'x', audit: true });
 	});
 
@@ -250,8 +250,8 @@ describe('StoreModule view / materialized-view persistence', () => {
 
 		const { db: db2, result } = await reopen();
 		expect(result.materializedViews, 'no MV rehydrated').to.deep.equal([]);
-		expect(db2.schemaManager.getMaterializedView('main', 'mv'), 'MV not registered').to.be.undefined;
-		expect(db2.schemaManager.getTable('main', '_mv_mv'), 'backing not registered').to.be.undefined;
+		expect(db2.schemaManager.getMaintainedTable('main', 'mv'), 'MV not registered').to.be.undefined;
+		expect(db2.schemaManager.getTable('main', 'mv'), 'backing table not registered').to.be.undefined;
 	});
 
 	it('REFRESH MATERIALIZED VIEW does not corrupt the catalog entry (DDL unchanged → skip)', async () => {
@@ -445,7 +445,7 @@ describe('StoreModule view / materialized-view persistence', () => {
 		const { db: db2, result } = await reopen();
 		// The MV entry persisted, but its source is gone → phase-3 import throws → error.
 		expect(result.errors, 'one MV failed to re-materialize').to.have.lengthOf(1);
-		expect(db2.schemaManager.getMaterializedView('main', 'mvm'), 'MV not registered').to.be.undefined;
+		expect(db2.schemaManager.getMaintainedTable('main', 'mvm'), 'MV not registered').to.be.undefined;
 	});
 
 	it('an ineligible MV body records a rehydration error; the rest still rehydrate', async () => {
@@ -469,8 +469,8 @@ describe('StoreModule view / materialized-view persistence', () => {
 		expect(result.errors, 'the bad MV recorded one error').to.have.lengthOf(1);
 		expect(result.errors[0].error.message).to.match(/non-deterministic/i);
 		expect(result.materializedViews, 'the good MV still rehydrated').to.deep.equal(['main.good']);
-		expect(db2.schemaManager.getMaterializedView('main', 'bad'), 'bad MV not registered').to.be.undefined;
-		expect(db2.schemaManager.getTable('main', '_mv_bad'), 'no half-built backing left behind').to.be.undefined;
+		expect(db2.schemaManager.getMaintainedTable('main', 'bad'), 'bad MV not registered').to.be.undefined;
+		expect(db2.schemaManager.getTable('main', 'bad'), 'no half-built backing left behind').to.be.undefined;
 		expect(await rows(db2, 'select id, v from good')).to.deep.equal([{ id: 1, v: 10 }]);
 	});
 });

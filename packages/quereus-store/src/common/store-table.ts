@@ -22,7 +22,7 @@ import {
 	type Database,
 	type DatabaseInternal,
 	type ColumnSchema,
-	type MaterializedViewSchema,
+	type MaintainedTableSchema,
 	type TableSchema,
 	type TableIndexSchema,
 	type UniqueConstraintSchema,
@@ -1377,7 +1377,7 @@ export class StoreTable extends VirtualTable {
 	 * than raised as a false conflict. Returns the first real conflict or null.
 	 */
 	private async findUniqueConflictViaCoveringMv(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		uc: UniqueConstraintSchema,
 		predicate: CompiledPredicate | undefined,
 		newRow: Row,

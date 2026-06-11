@@ -21,7 +21,9 @@ import type { Database } from '../core/database.js';
 import type { TableSchema, IndexSchema, RowConstraintSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './table.js';
 import { maskToOps, isSynthesizedAllColumnsKey } from './table.js';
 import type { ColumnSchema } from './column.js';
-import type { ViewSchema, MaterializedViewSchema } from './view.js';
+import type { ViewSchema } from './view.js';
+import { normalizeBackingModule } from './view.js';
+import type { MaintainedTableSchema } from './derivation.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
 import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, createMaterializedViewToString, alterIndexToString } from '../emit/ast-stringify.js';
@@ -168,27 +170,29 @@ export function generateViewDDL(view: ViewSchema): string {
 }
 
 /**
- * Generate canonical DDL for a materialized view from its schema.
+ * Generate canonical `create materialized view` DDL for a maintained table
+ * (a `TableSchema` carrying a {@link import('./derivation.js').TableDerivation}).
  *
  * Mirrors {@link generateViewDDL} via `createMaterializedViewToString`, reading
  * **current** `tags` so a `materialized_view_modified` (SET TAGS) round-trips.
- * The `using <module>(...)` clause is emitted from
- * `backingModuleName`/`backingModuleArgs`, which are present only when
- * non-default (the create path normalizes an explicit `using memory()` to
- * absent — see `normalizeBackingModule`), so the memory default stays
- * clause-free and canonical.
+ * The `using <module>(...)` clause is re-derived from the table's own
+ * `vtabModuleName`/`vtabArgs` through `normalizeBackingModule`, so the memory
+ * default stays clause-free and canonical while a non-default host module
+ * round-trips.
  */
-export function generateMaterializedViewDDL(mv: MaterializedViewSchema): string {
+export function generateMaterializedViewDDL(table: MaintainedTableSchema): string {
+	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
+	const d = table.derivation;
 	const stmt: AST.CreateMaterializedViewStmt = {
 		type: 'createMaterializedView',
-		view: { type: 'identifier', name: mv.name, schema: mv.schemaName },
+		view: { type: 'identifier', name: table.name, schema: table.schemaName },
 		ifNotExists: false,
-		columns: mv.columns ? [...mv.columns] : undefined,
-		select: mv.selectAst,
-		moduleName: mv.backingModuleName,
-		moduleArgs: mv.backingModuleArgs ? { ...mv.backingModuleArgs } : undefined,
-		insertDefaults: mv.insertDefaults,
-		tags: mv.tags ? { ...mv.tags } : undefined,
+		columns: d.columns ? [...d.columns] : undefined,
+		select: d.selectAst,
+		moduleName: backing.storedModuleName,
+		moduleArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
+		insertDefaults: d.insertDefaults,
+		tags: table.tags ? { ...table.tags } : undefined,
 	};
 	return createMaterializedViewToString(stmt);
 }

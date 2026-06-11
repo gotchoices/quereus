@@ -34,10 +34,10 @@ import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, trans
  * rewritten to its source `T` and re-planned identically; the existing row-time
  * maintenance hook then brings the backing into sync within the same statement
  * (reads-own-writes, rollback in lockstep). Hence the view parameter is the
- * minimal {@link MutableViewLike} structural shape both `ViewSchema` and
- * `MaterializedViewSchema` satisfy — the rewrite reads only `name` /
- * `schemaName` / `selectAst` / `columns`. See `docs/materialized-views.md`
- * § Write boundary and `docs/view-updateability.md`.
+ * minimal {@link MutableViewLike} structural shape both `ViewSchema` and a
+ * maintained table's `maintainedTableViewLike` adapter satisfy — the rewrite
+ * reads only `name` / `schemaName` / `selectAst` / `columns`. See
+ * `docs/materialized-views.md` § Write boundary and `docs/view-updateability.md`.
  *
  * RETURNING-through-views is supported: {@link rewriteViewReturning} rewrites the
  * clause into base terms and attaches it to the rewritten base statement, so the
@@ -48,8 +48,9 @@ import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, trans
 
 /**
  * The minimal view-schema surface the rewrite reads — satisfied by both
- * `ViewSchema` and `MaterializedViewSchema`. Keeping the parameter structural
- * lets MV write-through reuse the plain-view rewrite verbatim, with no MV-shaped
+ * `ViewSchema` and a maintained table's `maintainedTableViewLike` adapter
+ * (`schema/derivation.ts`). Keeping the parameter structural lets MV
+ * write-through reuse the plain-view rewrite verbatim, with no MV-shaped
  * special-casing in the three builders.
  */
 export interface MutableViewLike {
@@ -428,13 +429,12 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		});
 	}
 	// MV-over-MV (or a plain view over an MV): the body's single source is itself a
-	// materialized view, so `buildSelectStmt` resolved it to that MV's *backing* table —
-	// re-planning the rewrite against the backing name would hit a relation that is
-	// read-only to user DML. Write-through one level down (route to the inner MV's own
+	// maintained table, whose contents are derived — user DML may not write it
+	// directly. Write-through one level down (route to the inner MV's own
 	// write-through + the maintenance cascade) is deferred; reject cleanly. The
 	// source→backing maintenance cascade is unaffected — that is the read/maintain
 	// direction; this guards only the MV-name *write* direction.
-	if (ctx.schemaManager.getMaterializedView(fromTable.table.schema ?? null, fromTable.table.name)) {
+	if (ctx.schemaManager.getMaintainedTable(fromTable.table.schema ?? null, fromTable.table.name)) {
 		raiseMutationDiagnostic({
 			reason: 'nested-view',
 			table: view.name,

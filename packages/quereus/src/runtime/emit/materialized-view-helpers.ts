@@ -10,10 +10,10 @@ import { proveCoverage } from '../../planner/analysis/coverage-prover.js';
 import { deriveCoarsenedBackingKey, type CoarsenedBackingKey } from '../../planner/analysis/coarsened-key.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule } from '../../schema/table.js';
-import type { MaterializedViewSchema, CoarsenedKeyInfo } from '../../schema/view.js';
-import { backingTableNameFor, computeBodyHash } from '../../schema/view.js';
+import type { CoarsenedKeyInfo } from '../../schema/view.js';
+import { computeBodyHash, normalizeBackingModule } from '../../schema/view.js';
+import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from '../../schema/derivation.js';
 import type { Schema } from '../../schema/schema.js';
-import { generateMaterializedViewDDL } from '../../schema/ddl-generator.js';
 import { renameTableInAst, renameColumnInAst, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
 import type { BackingHost } from '../../vtab/backing-host.js';
@@ -199,8 +199,8 @@ function collectSourceTables(plan: PlanNode): string[] {
  * key (from `keysOf`) appended as a uniqueness-preserving tiebreaker. Without an
  * `order by`, the physical key is just the logical key.
  *
- * NOTE: this diverges from {@link MaterializedViewSchema.primaryKey}, which keeps
- * the logical `keysOf` identity. The covering ticket replaces this seeding with a
+ * NOTE: this diverges from `TableDerivation.logicalKey`, which keeps the
+ * logical `keysOf` identity. The covering ticket replaces this seeding with a
  * proper materialized index.
  */
 export function computeBackingPrimaryKey(shape: BackingShape): ReadonlyArray<{ index: number; desc: boolean }> {
@@ -231,6 +231,8 @@ export function buildBackingTableSchema(
 	shape: BackingShape,
 	moduleName?: string,
 	moduleArgs?: Readonly<Record<string, SqlValue>>,
+	/** Table-level metadata tags (the MV's `with tags (…)` — top-level on the unified record). */
+	tags?: Readonly<Record<string, SqlValue>>,
 ): TableSchema {
 	const resolvedModuleName = moduleName ?? 'memory';
 	const moduleInfo = db.schemaManager.getModule(resolvedModuleName);
@@ -270,6 +272,7 @@ export function buildBackingTableSchema(
 		vtabAuxData: moduleInfo.auxData,
 		isView: false,
 		estimatedRows: 0,
+		tags: tags && Object.keys(tags).length > 0 ? tags : undefined,
 	};
 }
 
@@ -302,9 +305,7 @@ export async function collectBodyRows(db: Database, bodySql: string): Promise<Ro
 export interface MaterializeViewDefinition {
 	schemaName: string;
 	viewName: string;
-	/** Canonical full `create materialized view` DDL text (round-trippable). */
-	sql: string;
-	/** Body AST — retained on the MV schema for refresh, declarative emission, and body-hash. */
+	/** Body AST — retained on the derivation for refresh, declarative emission, and body-hash. */
 	selectAst: AST.QueryExpr;
 	/** Canonical SQL of the body alone (re-planned here to derive and fill the backing). */
 	bodySql: string;
@@ -341,11 +342,11 @@ export function assertDeclaredColumnArity(def: MaterializeViewDefinition, shape:
 }
 
 /**
- * Builds the {@link MaterializedViewSchema} record for `def` over the derived
+ * Builds the {@link TableDerivation} record for `def` over the derived
  * `shape` — the single record formula shared by {@link materializeView} (refill)
  * and {@link adoptMaterializedView} (adopt), so the two paths cannot drift: an
- * adopted and a refilled MV record are indistinguishable (fixed point: export
- * DDL after adopt == after refill).
+ * adopted and a refilled maintained table are indistinguishable (fixed point:
+ * export DDL after adopt == after refill).
  *
  * `bodyHash` hashes the canonical DEFINITION (explicit columns + body +
  * insert-defaults clause), NOT the executable bodySql — the declarative differ
@@ -354,32 +355,41 @@ export function assertDeclaredColumnArity(def: MaterializeViewDefinition, shape:
  * select-only: it feeds execution (collectBodyRows / deriveBackingShape /
  * linkCoveredUniqueConstraints).
  */
-function buildMaterializedViewRecord(def: MaterializeViewDefinition, shape: BackingShape): MaterializedViewSchema {
+function buildTableDerivation(def: MaterializeViewDefinition, shape: BackingShape): TableDerivation {
 	return {
-		name: def.viewName,
-		schemaName: def.schemaName,
-		sql: def.sql,
 		selectAst: def.selectAst,
 		columns: def.columns,
 		insertDefaults: def.insertDefaults,
-		tags: def.tags,
-		backingTableName: backingTableNameFor(def.viewName),
-		backingModuleName: def.backingModuleName,
-		backingModuleArgs: def.backingModuleArgs,
-		primaryKey: shape.primaryKey,
+		logicalKey: shape.primaryKey,
 		coarsenedKey: shape.coarsenedKey,
 		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
 		ordering: shape.ordering,
 		sourceTables: shape.sourceTables,
 		stale: false,
-		origin: 'explicit',
 	};
+}
+
+/**
+ * Rejects a body that references the maintained table being created. The
+ * unified model makes self-reference *lexically* possible mid-create (the
+ * table registers under the MV's own name before the fill runs), so the
+ * create/import paths reject it up front — a self-referential derivation can
+ * never be maintained coherently.
+ */
+function assertNoSelfReference(def: MaterializeViewDefinition, shape: BackingShape): void {
+	const self = `${def.schemaName}.${def.viewName}`.toLowerCase();
+	if (shape.sourceTables.includes(self)) {
+		throw new QuereusError(
+			`materialized view '${def.schemaName}.${def.viewName}' body may not reference the view itself`,
+			StatusCode.ERROR,
+		);
+	}
 }
 
 /**
  * The key-coarsening warning `docs/migration.md` § Convergence hazards
  * specifies — emitted (structured logger, `warn` channel) when an MV
- * materializes over a coarsened backing key, with {@link MaterializedViewSchema.coarsenedKey}
+ * materializes over a coarsened backing key, with `TableDerivation.coarsenedKey`
  * as the record-side complement. Warn, don't reject: the merge-on-coarsen
  * behavior is often exactly what the migration intends.
  */
@@ -397,32 +407,38 @@ function warnKeyCoarsening(schemaName: string, viewName: string, info: Coarsened
 /**
  * The materialize core shared by `emitCreateMaterializedView` and the
  * catalog-import path (`SchemaManager.importMaterializedView`): derive the
- * backing shape from the planned body → create the backing table in the
- * declared backing-host module (memory default) → fill it from the body →
- * register the `MaterializedViewSchema` → compile + register row-time
- * write-through maintenance. Returns the registered schema.
+ * backing shape from the planned body → create the maintained table under the
+ * MV's own name in the declared backing-host module (memory default) → fill it
+ * from the body → attach the {@link TableDerivation} → compile + register
+ * row-time write-through maintenance. Returns the registered maintained table.
  *
- * Fires `table_added` for the backing table (it is created like any table) but
+ * Fires `table_added` for the table (it is created like any table) but
  * deliberately does NOT fire `materialized_view_added` — the create emitter
  * notifies after this returns, while import stays silent (a store rehydrating
  * its own catalog must not re-emit persistence events).
  *
  * Rollback-on-throw: a fill failure (including the "must be a set"
- * duplicate-key gate) drops the half-built backing; a registration failure (the
- * mandatory row-time eligibility gate runs there) also unlinks and deregisters
- * the MV record — either way the schema is left exactly as before the call.
+ * duplicate-key gate) drops the half-built table; a registration failure (the
+ * mandatory row-time eligibility gate runs there) drops the table — derivation
+ * and all — either way the schema is left exactly as before the call.
  * Existence/collision checks are the caller's job (the create emitter checks
- * before calling; on import a duplicate surfaces as a backing-table conflict).
+ * before calling; on import a duplicate surfaces as a table-name conflict).
+ *
+ * `preDerivedShape` short-circuits the shape derivation for a caller that
+ * already planned the body (the import path derives it once for its gates).
  */
-export async function materializeView(db: Database, def: MaterializeViewDefinition): Promise<MaterializedViewSchema> {
+export async function materializeView(db: Database, def: MaterializeViewDefinition, preDerivedShape?: BackingShape): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
 
-	const shape = deriveBackingShape(db, def.bodySql, def.columns);
+	const shape = preDerivedShape ?? deriveBackingShape(db, def.bodySql, def.columns);
 	// Lives here — not in deriveBackingShape — because the refresh path reaches a
 	// legitimate mismatch after a source ALTER (see the assert's docstring).
 	assertDeclaredColumnArity(def, shape);
-	const backingTableName = backingTableNameFor(def.viewName);
-	const backingSchema = buildBackingTableSchema(db, def.schemaName, backingTableName, shape, def.backingModuleName, def.backingModuleArgs);
+	// The table registers under the MV's own name BEFORE the fill runs, so a
+	// self-referential body must be rejected up front (it would otherwise read
+	// the empty table being populated).
+	assertNoSelfReference(def, shape);
+	const backingSchema = buildBackingTableSchema(db, def.schemaName, def.viewName, shape, def.backingModuleName, def.backingModuleArgs, def.tags);
 	const completeBacking = await sm.createBackingTable(backingSchema);
 
 	try {
@@ -430,42 +446,40 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		const host = resolveBackingHost(db, completeBacking);
 		await host.replaceContents(rows, () => materializedViewNotASetError(def.schemaName, def.viewName));
 	} catch (e) {
-		// Roll back: drop the backing table, do not register the MV.
+		// Roll back: drop the table, do not attach a derivation.
 		try {
-			await sm.dropTable(def.schemaName, backingTableName, /*ifExists*/ true);
+			await sm.dropTable(def.schemaName, def.viewName, /*ifExists*/ true);
 		} catch { /* best-effort cleanup */ }
 		throw e;
 	}
 
-	const mv = buildMaterializedViewRecord(def, shape);
+	const maintained = sm.attachDerivation(def.schemaName, def.viewName, buildTableDerivation(def, shape));
 	// Eagerly record the constraint↔structure link if this MV covers a UNIQUE
 	// constraint (informational — enforcement still routes through the
 	// synchronously-maintained auto-index).
-	linkCoveredUniqueConstraints(db, mv, def.bodySql);
-	sm.addMaterializedView(mv);
+	linkCoveredUniqueConstraints(db, maintained, def.bodySql);
 
 	// Compile + register row-time write-through maintenance. The mandatory
 	// eligibility gate runs here (it needs the analyzed body) and throws on a
 	// body that is not row-time maintainable — roll the whole MV back so an
 	// ineligible body errors cleanly.
 	try {
-		db.registerMaterializedView(mv);
+		db.registerMaterializedView(maintained);
 	} catch (e) {
-		unlinkCoveredUniqueConstraints(db, mv);
-		sm.removeMaterializedView(def.schemaName, def.viewName);
+		unlinkCoveredUniqueConstraints(db, maintained);
 		try {
-			await sm.dropTable(def.schemaName, backingTableName, /*ifExists*/ true);
+			await sm.dropTable(def.schemaName, def.viewName, /*ifExists*/ true);
 		} catch { /* best-effort cleanup */ }
 		throw e;
 	}
 
 	// After the MV fully materialized (a fill/registration failure must error, not
 	// warn): surface the key-coarsening hazard the coarsened backing key carries.
-	if (mv.coarsenedKey) {
-		warnKeyCoarsening(def.schemaName, def.viewName, mv.coarsenedKey);
+	if (maintained.derivation.coarsenedKey) {
+		warnKeyCoarsening(def.schemaName, def.viewName, maintained.derivation.coarsenedKey);
 	}
 
-	return mv;
+	return maintained;
 }
 
 /**
@@ -473,8 +487,8 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
  * registration tail without create+fill, for the catalog-import path
  * (`SchemaManager.importMaterializedView`) when a pre-existing durable backing
  * passed every adopt gate (same module, shape match, all sources same-module
- * with upstream `_mv_` backings themselves adopted, caller-attested
- * `trustBackings`). The backing's rows are trusted as-is — no body execution.
+ * with upstream maintained tables themselves adopted, caller-attested
+ * `trustBackings`). The table's rows are trusted as-is — no body execution.
  *
  * **Backing schema re-stamp.** `preExisting` is a phase-1 DDL round-trip and
  * loses ScalarType fidelity the refill path would carry (the registry-interned
@@ -492,58 +506,60 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
  * either way since the shapes are identical.
  *
  * Rollback on a registration failure (the mandatory row-time eligibility gate
- * runs there): unlink + `removeMaterializedView` + rethrow, but — unlike
- * {@link materializeView} — the backing table stays REGISTERED, reverting to
- * its plain-table state. Dropping a durable backing on a registration error
- * would destroy the very rows a later retry could adopt; the caller records
- * the throw as a per-entry rehydration error.
+ * runs there): unlink + detach the derivation + rethrow — the table stays
+ * REGISTERED, reverting to its plain (derivation-less) state. Dropping a
+ * durable backing on a registration error would destroy the very rows a later
+ * retry could adopt; the caller records the throw as a per-entry rehydration
+ * error.
  */
 export async function adoptMaterializedView(
 	db: Database,
 	def: MaterializeViewDefinition,
 	preExisting: TableSchema,
 	shape: BackingShape,
-): Promise<MaterializedViewSchema> {
+): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
-	const backingTableName = backingTableNameFor(def.viewName);
+	const schema = sm.getSchemaOrFail(def.schemaName);
 
-	const stamped = buildBackingTableSchema(db, def.schemaName, backingTableName, shape, def.backingModuleName, def.backingModuleArgs);
-	sm.getSchemaOrFail(def.schemaName).addTable({ ...stamped, estimatedRows: preExisting.estimatedRows ?? 0 });
+	assertNoSelfReference(def, shape);
+	const stamped = buildBackingTableSchema(db, def.schemaName, def.viewName, shape, def.backingModuleName, def.backingModuleArgs, def.tags);
+	schema.addTable({ ...stamped, estimatedRows: preExisting.estimatedRows ?? 0 });
 
-	const mv = buildMaterializedViewRecord(def, shape);
-	linkCoveredUniqueConstraints(db, mv, def.bodySql);
-	sm.addMaterializedView(mv);
+	const maintained = sm.attachDerivation(def.schemaName, def.viewName, buildTableDerivation(def, shape));
+	linkCoveredUniqueConstraints(db, maintained, def.bodySql);
 
 	try {
-		db.registerMaterializedView(mv);
+		db.registerMaterializedView(maintained);
 	} catch (e) {
-		unlinkCoveredUniqueConstraints(db, mv);
-		sm.removeMaterializedView(def.schemaName, def.viewName);
-		// Deliberately NOT dropping the backing: it reverts to a plain table
-		// (re-stamped schema is shape-identical to its phase-1 state).
+		unlinkCoveredUniqueConstraints(db, maintained);
+		// Detach the derivation: the table reverts to a plain table (re-stamped
+		// schema is shape-identical to its phase-1 state) — deliberately NOT dropped.
+		const { derivation: _derivation, ...plain } = maintained;
+		schema.addTable(plain);
 		throw e;
 	}
 
-	return mv;
+	return maintained;
 }
 
 /**
- * Full-rebuild of a materialized view's backing table: re-run the body to
- * completion and atomically swap the backing table's base layer. This is the
- * always-correct path shared by manual `refresh materialized view` and the
- * incremental manager's global / cost-fallback branch (`globalRelations`).
+ * Full-rebuild of a maintained table's contents: re-run the body to completion
+ * and atomically swap the table's base layer. This is the always-correct path
+ * shared by manual `refresh materialized view` and the incremental manager's
+ * global / cost-fallback branch (`globalRelations`).
  *
  * The caller is responsible for staleness re-validation when relevant; this
- * helper assumes `mv.selectAst` plans. Throws if the backing table is missing.
+ * helper assumes the derivation body plans. Throws if the table is missing
+ * from the catalog.
  */
-export async function rebuildBacking(db: Database, mv: MaterializedViewSchema): Promise<void> {
-	const bodySql = astToString(mv.selectAst);
+export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): Promise<void> {
+	const bodySql = astToString(mv.derivation.selectAst);
 	const rows: Row[] = await collectBodyRows(db, bodySql);
 
-	const backing = db.schemaManager.getTable(mv.schemaName, mv.backingTableName);
+	const backing = db.schemaManager.getTable(mv.schemaName, mv.name);
 	if (!backing) {
 		throw new QuereusError(
-			`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+			`Internal error: maintained table '${mv.name}' not found during rebuild`,
 			StatusCode.INTERNAL,
 		);
 	}
@@ -630,45 +646,58 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
 }
 
 /**
- * Drop-and-recreate rebuild of a materialized view's backing table when a source
- * schema change has shifted the body's output shape (columns/types/PK/ordering),
- * so the backing no longer corresponds column-for-column to the re-planned body.
+ * Drop-and-recreate rebuild of a maintained table when a source schema change
+ * has shifted the body's output shape (columns/types/PK/ordering), so the
+ * table no longer corresponds column-for-column to the re-planned body.
  * Mirrors the create path (`emitCreateMaterializedView`) exactly —
  * `buildBackingTableSchema` → `createBackingTable` → fill via the backing host's
- * `replaceContents` — so there is one code path for "make the backing match the body".
+ * `replaceContents` — so there is one code path for "make the backing match the
+ * body". The recreate registers under the SAME table name, one catalog entry,
+ * and re-attaches the (shape-updated) derivation; the rebuilt maintained table
+ * is returned for the caller to re-register maintenance on.
  *
- * The body rows are collected BEFORE the old backing is dropped (the body reads
- * the sources with the rewrite suppressed, never the backing it populates), so
- * the window in which no backing exists is minimal. The drop fires `table_removed`
- * and the create fires `table_added` on `_mv_<name>`, which (a) invalidate any
- * cached prepared plan scanning the backing directly and (b) cascade staleness to
- * any consumer MV whose source is this backing. On a fill failure (e.g. the
- * reshaped body is duplicate-producing under the new PK) the half-built backing is
- * dropped so the next read errors rather than serving an empty relation; the caller
- * leaves the MV `stale` (it clears the flag only on success).
+ * The body rows are collected BEFORE the old table is dropped (the body reads
+ * the sources with the rewrite suppressed, never the table it populates), so
+ * the window in which no table exists is minimal. The drop fires `table_removed`
+ * and the create fires `table_added` on the table's own name, which (a)
+ * invalidate any cached prepared plan scanning it directly and (b) cascade
+ * staleness to any consumer MV reading it. On a fill failure (e.g. the
+ * reshaped body is duplicate-producing under the new PK) the half-built table
+ * is dropped so the next read errors rather than serving an empty relation; the
+ * caller leaves the MV `stale` (it clears the flag only on success).
  */
 export async function rebuildBackingTable(
 	db: Database,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	shape: BackingShape,
-): Promise<void> {
+): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
-	const rows: Row[] = await collectBodyRows(db, astToString(mv.selectAst));
+	const rows: Row[] = await collectBodyRows(db, astToString(mv.derivation.selectAst));
 
-	await sm.dropTable(mv.schemaName, mv.backingTableName, /*ifExists*/ true);
-	// Rebuild into the MV's OWN backing module — falling back to memory here
+	// Rebuild into the table's OWN host module — falling back to memory here
 	// would silently migrate a non-default backing on the first shape rebuild.
-	const backingSchema = buildBackingTableSchema(db, mv.schemaName, mv.backingTableName, shape, mv.backingModuleName, mv.backingModuleArgs);
+	const backing = normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs);
+	await sm.dropTable(mv.schemaName, mv.name, /*ifExists*/ true);
+	// Preserve the live table-level tags across the reshape (a refresh never
+	// changes metadata).
+	const backingSchema = buildBackingTableSchema(db, mv.schemaName, mv.name, shape, backing.moduleName, backing.storedModuleArgs, mv.tags);
 	const completeBacking = await sm.createBackingTable(backingSchema);
 	try {
 		const host = resolveBackingHost(db, completeBacking);
 		await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
 	} catch (e) {
 		try {
-			await sm.dropTable(mv.schemaName, mv.backingTableName, /*ifExists*/ true);
+			await sm.dropTable(mv.schemaName, mv.name, /*ifExists*/ true);
 		} catch { /* best-effort cleanup */ }
 		throw e;
 	}
+	// Re-attach the derivation (updated to the new shape) onto the recreated
+	// table — one catalog entry, same name, derivation carried forward.
+	mv.derivation.logicalKey = shape.primaryKey;
+	mv.derivation.coarsenedKey = shape.coarsenedKey;
+	mv.derivation.ordering = shape.ordering;
+	mv.derivation.sourceTables = shape.sourceTables;
+	return sm.attachDerivation(mv.schemaName, mv.name, mv.derivation);
 }
 
 /**
@@ -708,7 +737,7 @@ export function resolveBackingHost(db: Database, backingSchema: TableSchema): Ba
  * shape derivation), so re-planning here is cheap and safe; a non-covering MV
  * simply records nothing.
  */
-export function linkCoveredUniqueConstraints(db: Database, mv: MaterializedViewSchema, bodySql: string): void {
+export function linkCoveredUniqueConstraints(db: Database, mv: MaintainedTableSchema, bodySql: string): void {
 	// The coverage prover reasons over the body's SOURCE table; suppress the
 	// read-side rewrite so the body is not re-pointed at this MV's own backing.
 	const root = db.schemaManager.withSuppressedMaterializedViewRewrite(
@@ -716,7 +745,7 @@ export function linkCoveredUniqueConstraints(db: Database, mv: MaterializedViewS
 	);
 	if (!root) return;
 	const sm = db.schemaManager;
-	for (const qualified of mv.sourceTables) {
+	for (const qualified of mv.derivation.sourceTables) {
 		const dot = qualified.indexOf('.');
 		const schemaName = dot >= 0 ? qualified.slice(0, dot) : 'main';
 		const tableName = dot >= 0 ? qualified.slice(dot + 1) : qualified;
@@ -725,8 +754,7 @@ export function linkCoveredUniqueConstraints(db: Database, mv: MaterializedViewS
 		for (const uc of table.uniqueConstraints) {
 			const result = proveCoverage(root, mv, uc, table);
 			if (result.covers) {
-				mv.origin = 'explicit';
-				mv.covers = { schemaName: table.schemaName, tableName: table.name, constraintName: uc.name };
+				mv.derivation.covers = { schemaName: table.schemaName, tableName: table.name, constraintName: uc.name };
 				// Forward pointer is the source of truth (see docs/schema.md).
 				uc.coveringStructureName = mv.name;
 				return; // singular back-pointer: link the first covered constraint.
@@ -741,9 +769,9 @@ export function linkCoveredUniqueConstraints(db: Database, mv: MaterializedViewS
  * works for unnamed constraints too; no enforcement demotion — physical schemas
  * still enforce via the implicit auto-index.
  */
-export function unlinkCoveredUniqueConstraints(db: Database, mv: MaterializedViewSchema): void {
-	if (!mv.covers) return;
-	const table = db.schemaManager.getTable(mv.covers.schemaName, mv.covers.tableName);
+export function unlinkCoveredUniqueConstraints(db: Database, mv: MaintainedTableSchema): void {
+	if (!mv.derivation.covers) return;
+	const table = db.schemaManager.getTable(mv.derivation.covers.schemaName, mv.derivation.covers.tableName);
 	if (!table?.uniqueConstraints) return;
 	for (const uc of table.uniqueConstraints) {
 		if (uc.coveringStructureName === mv.name) uc.coveringStructureName = undefined;
@@ -791,14 +819,20 @@ export function revalidateBody(db: Database, mvName: string, bodySql: string): R
  */
 export function snapshotStaleMaterializedViews(db: Database): ReadonlySet<string> {
 	const out = new Set<string>();
-	for (const mv of db.schemaManager.getAllMaterializedViews()) {
-		if (mv.stale) out.add(mvStaleKey(mv));
+	for (const mv of db.schemaManager.getAllMaintainedTables()) {
+		if (mv.derivation.stale) out.add(mvStaleKey(mv));
 	}
 	return out;
 }
 
-function mvStaleKey(mv: Pick<MaterializedViewSchema, 'schemaName' | 'name'>): string {
+function mvStaleKey(mv: Pick<MaintainedTableSchema, 'schemaName' | 'name'>): string {
 	return `${mv.schemaName}.${mv.name}`.toLowerCase();
+}
+
+/** All maintained tables registered in `schema`, snapshotted (the propagation
+ *  loops re-register tables mid-iteration). */
+function maintainedTablesOf(schema: Schema): MaintainedTableSchema[] {
+	return Array.from(schema.getAllTables()).filter(isMaintainedTable);
 }
 
 /**
@@ -831,18 +865,19 @@ export async function propagateTableRenameToMaterializedViews(
 	const schemaLower = renamedSchemaName.toLowerCase();
 	const oldBase = `${schemaLower}.${oldName.toLowerCase()}`;
 	const newBase = `${schemaLower}.${newName.toLowerCase()}`;
-	for (const mv of Array.from(schema.getAllMaterializedViews())) {
+	for (const mv of maintainedTablesOf(schema)) {
 		try {
-			const bodyChanged = renameTableInAst(mv.selectAst, oldName, newName, renamedSchemaName);
-			const clause = renameTableInInsertDefaults(mv.insertDefaults, oldName, newName, renamedSchemaName);
-			if (!bodyChanged && !clause?.changed && !mv.sourceTables.includes(oldBase)) continue;
-			const covers = mv.covers
-				&& mv.covers.schemaName.toLowerCase() === schemaLower
-				&& mv.covers.tableName.toLowerCase() === oldName.toLowerCase()
-				? { ...mv.covers, tableName: newName }
-				: mv.covers;
+			const d = mv.derivation;
+			const bodyChanged = renameTableInAst(d.selectAst, oldName, newName, renamedSchemaName);
+			const clause = renameTableInInsertDefaults(d.insertDefaults, oldName, newName, renamedSchemaName);
+			if (!bodyChanged && !clause?.changed && !d.sourceTables.includes(oldBase)) continue;
+			const covers = d.covers
+				&& d.covers.schemaName.toLowerCase() === schemaLower
+				&& d.covers.tableName.toLowerCase() === oldName.toLowerCase()
+				? { ...d.covers, tableName: newName }
+				: d.covers;
 			await applyMaterializedViewRewrite(db, schema, mv, {
-				sourceTables: mv.sourceTables.map(s => (s === oldBase ? newBase : s)),
+				sourceTables: d.sourceTables.map(s => (s === oldBase ? newBase : s)),
 				covers,
 			}, preStale, /*renamedColumns*/ false);
 		} catch (e) {
@@ -879,11 +914,12 @@ export async function propagateColumnRenameToMaterializedViews(
 	preStale: ReadonlySet<string>,
 	resolveColumnInSource: ResolveColumnInSource,
 ): Promise<void> {
-	for (const mv of Array.from(schema.getAllMaterializedViews())) {
+	for (const mv of maintainedTablesOf(schema)) {
 		try {
-			const bodyChanged = renameColumnInAst(mv.selectAst, tableName, oldCol, newCol, renamedSchemaName);
-			const clause = mv.insertDefaults?.length
-				? renameColumnInInsertDefaults(mv.insertDefaults, collectFromTableNames(mv.selectAst, renamedSchemaName), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
+			const d = mv.derivation;
+			const bodyChanged = renameColumnInAst(d.selectAst, tableName, oldCol, newCol, renamedSchemaName);
+			const clause = d.insertDefaults?.length
+				? renameColumnInInsertDefaults(d.insertDefaults, collectFromTableNames(d.selectAst, renamedSchemaName), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
 				: null;
 			if (!bodyChanged && !clause?.changed) continue;
 			await applyMaterializedViewRewrite(
@@ -925,39 +961,39 @@ export async function propagateColumnRenameToMaterializedViews(
 async function applyMaterializedViewRewrite(
 	db: Database,
 	schema: Schema,
-	mv: MaterializedViewSchema,
-	overrides: Partial<Pick<MaterializedViewSchema, 'sourceTables' | 'covers' | 'insertDefaults'>>,
+	mv: MaintainedTableSchema,
+	overrides: Partial<Pick<TableDerivation, 'sourceTables' | 'covers' | 'insertDefaults'>>,
 	preStale: ReadonlySet<string>,
 	renamedColumns: boolean,
 ): Promise<void> {
 	const wasPreStale = preStale.has(mvStaleKey(mv));
-	const bodySql = astToString(mv.selectAst);
-	const insertDefaults = overrides.insertDefaults ?? mv.insertDefaults;
-	const updated: MaterializedViewSchema = {
-		...mv,
-		...overrides,
-		// Canonical-definition hash (columns + body + POST-override insert-defaults
-		// clause) — must match the formula stamped at create / recomputed by the
-		// differ, or every post-rename diff would churn a spurious rebuild. `bodySql`
-		// (select-only) still feeds renameShiftedBackingColumns below.
-		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.selectAst, insertDefaults)),
-	};
-	updated.sql = generateMaterializedViewDDL(updated);
-	schema.addMaterializedView(updated);
+	const d = mv.derivation;
+	const bodySql = astToString(d.selectAst);
+	if (overrides.sourceTables) d.sourceTables = overrides.sourceTables;
+	if ('covers' in overrides) d.covers = overrides.covers;
+	if (overrides.insertDefaults) d.insertDefaults = overrides.insertDefaults;
+	// Canonical-definition hash (columns + body + POST-override insert-defaults
+	// clause) — must match the formula stamped at create / recomputed by the
+	// differ, or every post-rename diff would churn a spurious rebuild. `bodySql`
+	// (select-only) still feeds renameShiftedBackingColumns below. The DDL itself
+	// is rendered on demand from the unified record, so no stored `sql` to swap.
+	d.bodyHash = computeBodyHash(viewDefinitionToCanonicalString(d.columns, d.selectAst, d.insertDefaults));
 
 	if (!wasPreStale) {
 		// Only a changed BODY can shift output names; a table rename / clause-only
 		// change skips the backing-name pass (no re-plan needed).
-		await restoreMaterializedViewLive(db, schema, updated, renamedColumns ? { bodySql } : undefined);
+		await restoreMaterializedViewLive(db, schema, mv, renamedColumns ? { bodySql } : undefined);
 	}
 	// Fired for still-stale MVs too: the rewritten body must re-persist so a
-	// post-reopen REFRESH resolves the new name.
+	// post-reopen REFRESH resolves the new name. The registered table object is
+	// re-fetched — the backing-name pass may have swapped it.
+	const live = schema.getTable(mv.name) ?? mv;
 	db.schemaManager.getChangeNotifier().notifyChange({
 		type: 'materialized_view_modified',
-		schemaName: updated.schemaName,
-		objectName: updated.name,
+		schemaName: mv.schemaName,
+		objectName: mv.name,
 		oldObject: mv,
-		newObject: updated,
+		newObject: live,
 	});
 }
 
@@ -977,7 +1013,7 @@ async function applyMaterializedViewRewrite(
 async function restoreMaterializedViewLive(
 	db: Database,
 	schema: Schema,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	backingNames?: { bodySql: string; shape?: BackingShape },
 ): Promise<void> {
 	if (backingNames) {
@@ -985,8 +1021,11 @@ async function restoreMaterializedViewLive(
 	}
 	// Re-register BEFORE clearing `stale`: if registration throws, the caller's
 	// failure path leaves the MV stale rather than serving an unmaintained backing.
-	db.registerMaterializedView(mv);
-	mv.stale = false;
+	// Register the LIVE registered table (the backing-name pass may have swapped
+	// the catalog object); the shared derivation rides either way.
+	const live = schema.getTable(mv.name);
+	db.registerMaterializedView(isMaintainedTable(live) ? live : mv);
+	mv.derivation.stale = false;
 }
 
 /**
@@ -1029,29 +1068,30 @@ export async function restoreUnaffectedMaterializedViews(
 	db: Database,
 	preStale: ReadonlySet<string>,
 ): Promise<void> {
-	for (const mv of db.schemaManager.getAllMaterializedViews()) {
-		if (!mv.stale || preStale.has(mvStaleKey(mv))) continue;
+	for (const mv of db.schemaManager.getAllMaintainedTables()) {
+		if (!mv.derivation.stale || preStale.has(mvStaleKey(mv))) continue;
 		try {
 			const schema = db.schemaManager.getSchemaOrFail(mv.schemaName);
-			const bodySql = astToString(mv.selectAst);
+			const d = mv.derivation;
+			const bodySql = astToString(d.selectAst);
 			// Throws when the body no longer plans against the renamed catalog
 			// (e.g. a chained MV referencing a renamed-away output name) → catch
 			// below leaves it stale.
-			const shape = deriveBackingShape(db, bodySql, mv.columns);
+			const shape = deriveBackingShape(db, bodySql, d.columns);
 			// The retry of a failure-marked MV must not revive an inconsistent record: a
-			// rewrite that threw between the in-place AST mutation and the catalog swap
-			// leaves the OLD record (un-re-keyed `sourceTables`, old `sql`) holding the
+			// rewrite that threw between the in-place AST mutation and the derived-field
+			// re-key leaves the OLD derivation (un-re-keyed `sourceTables`) holding the
 			// rewritten body. Registering that would compute `sourceScope` (and key the
 			// read-side rewrite) off the wrong bases — leave it stale instead.
-			if (!sameSourceTables(mv.sourceTables, shape.sourceTables)) {
+			if (!sameSourceTables(d.sourceTables, shape.sourceTables)) {
 				log('Leaving materialized view %s.%s stale after rename: recorded sourceTables disagree with the re-planned body — REFRESH recovers',
 					mv.schemaName, mv.name);
 				continue;
 			}
-			const backing = schema.getTable(mv.backingTableName);
+			const backing = schema.getTable(mv.name);
 			if (!backing) {
 				throw new QuereusError(
-					`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+					`Internal error: maintained table '${mv.name}' not found during restore`,
 					StatusCode.INTERNAL,
 				);
 			}
@@ -1098,15 +1138,15 @@ function sameSourceTables(a: ReadonlyArray<string>, b: ReadonlyArray<string>): b
 async function renameShiftedBackingColumns(
 	db: Database,
 	schema: Schema,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	bodySql: string,
 	preDerivedShape?: BackingShape,
 ): Promise<void> {
-	const shape = preDerivedShape ?? deriveBackingShape(db, bodySql, mv.columns);
-	const backing = schema.getTable(mv.backingTableName);
+	const shape = preDerivedShape ?? deriveBackingShape(db, bodySql, mv.derivation.columns);
+	const backing = schema.getTable(mv.name);
 	if (!backing) {
 		throw new QuereusError(
-			`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+			`Internal error: maintained table '${mv.name}' not found during backing-column rename`,
 			StatusCode.INTERNAL,
 		);
 	}
@@ -1137,13 +1177,16 @@ async function renameShiftedBackingColumns(
 		});
 	}
 	if (current !== backing) {
-		schema.addTable(current);
+		// The module's alterTable returns a fresh TableSchema that does NOT carry
+		// the derivation — re-attach it so the registered record stays maintained.
+		const renamed: TableSchema = { ...current, derivation: mv.derivation };
+		schema.addTable(renamed);
 		db.schemaManager.getChangeNotifier().notifyChange({
 			type: 'table_modified',
 			schemaName: mv.schemaName,
 			objectName: backing.name,
 			oldObject: backing,
-			newObject: current,
+			newObject: renamed,
 		});
 	}
 }
@@ -1169,13 +1212,13 @@ function backingColumnDef(col: ColumnSchema, newName: string): AST.ColumnDef {
 function failMaterializedViewRenamePropagation(
 	db: Database,
 	schema: Schema,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	cause: unknown,
 ): void {
 	log('Rename propagation failed for materialized view %s.%s; leaving it stale: %s',
 		mv.schemaName, mv.name, cause instanceof Error ? cause.message : String(cause));
-	// The shallow clone may or may not have been swapped in before the throw —
-	// mark whichever object the catalog currently holds.
-	const live = schema.getMaterializedView(mv.name) ?? mv;
-	db.markMaterializedViewStale(live);
+	// A swap may or may not have landed before the throw — mark whichever object
+	// the catalog currently holds (the shared derivation rides either).
+	const live = schema.getTable(mv.name);
+	db.markMaterializedViewStale(isMaintainedTable(live) ? live : mv);
 }

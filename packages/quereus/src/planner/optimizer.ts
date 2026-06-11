@@ -115,9 +115,9 @@ export class Optimizer {
 		// the Filter and before the Physical pass absorbs a predicate into a range
 		// scan — where the matcher can read the fragment's WHERE off the live plan.
 		// Pass rules fire in REGISTRATION order (not by `priority`), so placement here
-		// is what guarantees first-fire. Logical→logical: the substituted backing
+		// is what guarantees first-fire. Logical→logical: the substituted maintained-table
 		// TableReference then flows through normal physical access selection, so
-		// `query_plan()` shows an ordinary `_mv_<name>` scan for free.
+		// `query_plan()` shows an ordinary scan of the MV's own table for free.
 		this.passManager.addRuleToPass(PassId.Structural, {
 			id: 'materialized-view-rewrite',
 			nodeType: PlanNodeType.Project,

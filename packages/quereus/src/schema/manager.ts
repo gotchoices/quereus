@@ -11,8 +11,9 @@ import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema } from './table.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema } from './constraint-builder.js';
-import type { ViewSchema, MaterializedViewSchema } from './view.js';
-import { backingTableNameFor, normalizeBackingModule } from './view.js';
+import type { ViewSchema } from './view.js';
+import { normalizeBackingModule } from './view.js';
+import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
 import { isHiddenImplicitIndex, findExposedImplicitConstraintIndex } from './catalog.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
@@ -29,7 +30,7 @@ import { ParameterScope } from '../planner/scopes/param.js';
 import type { ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { hasNativeEventSupport } from '../util/event-support.js';
 import type { VTableSchemaChangeEvent } from '../vtab/events.js';
-import { quoteIdentifier, createViewToString, createMaterializedViewToString, astToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, createViewToString, astToString } from '../emit/ast-stringify.js';
 import { materializeView, adoptMaterializedView, deriveBackingShape, backingShapeMatches, assertDeclaredColumnArity, type MaterializeViewDefinition, type BackingShape } from '../runtime/emit/materialized-view-helpers.js';
 
 const log = createLogger('schema:manager');
@@ -66,16 +67,27 @@ export interface ImportCatalogOptions {
 	trustBackings?: boolean;
 	/**
 	 * Shared adopt ledger for one rehydration session: lowercased qualified
-	 * names (`schema._mv_<name>`) of every backing adopted so far, appended on
-	 * each successful adopt. An MV whose body reads another MV's backing may
-	 * only adopt when that upstream backing is IN this set — an upstream that
-	 * was refilled this session may hold new content, so its dependents must
-	 * refill too; an upstream that adopted is unchanged, so trust composes.
-	 * Pass one Set across all `importCatalog` calls of the session (the store's
-	 * MV fixpoint rounds compose through it). Omitting it means no `_mv_`-source
-	 * MV can adopt.
+	 * names (`schema.<table>`) of every maintained table adopted so far,
+	 * appended on each successful adopt. A maintained table whose body reads
+	 * another maintained table may only adopt when that upstream is IN this
+	 * set — an upstream that was refilled this session may hold new content, so
+	 * its dependents must refill too; an upstream that adopted is unchanged, so
+	 * trust composes. Pass one Set across all `importCatalog` calls of the
+	 * session (the store's MV fixpoint rounds compose through it). Omitting it
+	 * means no maintained-table-sourced MV can adopt.
 	 */
 	adoptedBackings?: Set<string>;
+	/**
+	 * Lowercased qualified names (`schema.<table>`) of maintained tables whose
+	 * `create materialized view` catalog entries have NOT yet imported this
+	 * rehydration session. An entry whose body reads any of these is deferred
+	 * (throws, to be retried in a later fixpoint round): its source table
+	 * already exists as a *plain* pre-rehydrated table, so without this gate
+	 * the dependent would adopt/refill against content its upstream's own
+	 * import may be about to replace. (Pre-unification this ordering fell out
+	 * of the body failing to plan until the upstream MV record existed.)
+	 */
+	pendingDerivations?: ReadonlySet<string>;
 }
 
 /**
@@ -477,7 +489,6 @@ export class SchemaManager {
 			schema.clearFunctions();
 			schema.clearTables();
 			schema.clearViews();
-			schema.clearMaterializedViews();
 			schema.clearAssertions();
 			schema.clearLensSlots();
 			this.schemas.delete(lowerName);
@@ -579,71 +590,48 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Retrieves a materialized view schema definition.
+	 * Retrieves a maintained table (a table carrying a derivation — what
+	 * `create materialized view` produces) by name.
 	 *
 	 * @param schemaName The schema name ('main', etc.). Defaults to current schema
-	 * @param name The materialized view name
+	 * @param name The maintained table's name
 	 */
-	getMaterializedView(schemaName: string | null, name: string): MaterializedViewSchema | undefined {
-		const targetSchemaName = (schemaName ?? this.currentSchemaName).toLowerCase();
-		const schema = this.schemas.get(targetSchemaName);
-		return schema?.getMaterializedView(name);
+	getMaintainedTable(schemaName: string | null | undefined, name: string): MaintainedTableSchema | undefined {
+		const table = this.getTable(schemaName ?? undefined, name);
+		return isMaintainedTable(table) ? table : undefined;
 	}
 
 	/**
-	 * Reverse lookup: find the materialized view in `schemaName` whose backing
-	 * table is `backingName`. Backing tables follow the reserved `_mv_<name>`
-	 * convention (see {@link backingTableNameFor}), so the MV name is derived from
-	 * the prefix and confirmed against the MV's own `backingTableName`.
-	 *
-	 * Used by change-scope analysis to project a materialized view's backing-table
-	 * reference onto its sources. (It formerly also gated the row-time create path to
-	 * reject MV-over-MV bodies; that rejection is lifted — such bodies are now
-	 * maintained by the cascade in `database-materialized-views.ts`.) Returns undefined
-	 * when `backingName` is not a backing-table name, or no MV in that schema is backed
-	 * by it.
+	 * Returns all maintained tables (derivation-bearing tables) across all schemas.
 	 */
-	getMaterializedViewByBackingTable(schemaName: string | null, backingName: string): MaterializedViewSchema | undefined {
-		const lower = backingName.toLowerCase();
-		const prefix = backingTableNameFor('');
-		if (!lower.startsWith(prefix)) return undefined;
-		const targetSchemaName = (schemaName ?? this.currentSchemaName).toLowerCase();
-		const schema = this.schemas.get(targetSchemaName);
-		if (!schema) return undefined;
-		const mv = schema.getMaterializedView(lower.slice(prefix.length));
-		if (mv && mv.backingTableName.toLowerCase() === lower) return mv;
-		return undefined;
-	}
-
-	/**
-	 * Returns all materialized views across all schemas.
-	 */
-	getAllMaterializedViews(): MaterializedViewSchema[] {
-		const result: MaterializedViewSchema[] = [];
+	getAllMaintainedTables(): MaintainedTableSchema[] {
+		const result: MaintainedTableSchema[] = [];
 		for (const schema of this.schemas.values()) {
-			for (const mv of schema.getAllMaterializedViews()) result.push(mv);
+			for (const table of schema.getAllTables()) {
+				if (isMaintainedTable(table)) result.push(table);
+			}
 		}
 		return result;
 	}
 
 	/**
-	 * Registers a materialized view definition in the target schema.
-	 */
-	addMaterializedView(mv: MaterializedViewSchema): void {
-		const schema = this.getSchemaOrFail(mv.schemaName);
-		schema.addMaterializedView(mv);
-	}
-
-	/**
-	 * Removes a materialized view definition from the catalog (does NOT drop its
-	 * backing table — the caller drops that separately so `table_removed` fires).
+	 * Attaches (or replaces) a derivation on an already-registered table,
+	 * swapping the registered record for `{...table, derivation}`. Fires no
+	 * event — callers own the event discipline (create fires
+	 * `materialized_view_added`; import stays silent). Returns the swapped
+	 * maintained table.
 	 *
-	 * @returns true if found and removed, false otherwise
+	 * @throws QuereusError if the table is not registered.
 	 */
-	removeMaterializedView(schemaName: string, name: string): boolean {
-		const schema = this.schemas.get(schemaName.toLowerCase());
-		if (!schema) return false;
-		return schema.removeMaterializedView(name);
+	attachDerivation(schemaName: string, tableName: string, derivation: TableDerivation): MaintainedTableSchema {
+		const schema = this.getSchemaOrFail(schemaName);
+		const table = schema.getTable(tableName);
+		if (!table) {
+			throw new QuereusError(`Cannot attach derivation: table '${schemaName}.${tableName}' not found`, StatusCode.INTERNAL);
+		}
+		const maintained: MaintainedTableSchema = { ...table, derivation };
+		schema.addTable(maintained);
+		return maintained;
 	}
 
 	/**
@@ -991,33 +979,35 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Shared materialized-view-tag read-modify-write: fetches the live MV (NOTFOUND
-	 * if absent), computes its next tag record via `compute`, re-registers the
-	 * swapped {@link MaterializedViewSchema}, and fires `materialized_view_modified`.
-	 * The backing table and the row-time maintenance plan are untouched (tags do not
-	 * affect maintenance), so this never re-materializes — `_modified` is
-	 * deliberately distinct from `materialized_view_added` (what create emits): the
-	 * MV maintenance manager re-registers on `_added` but ignores `_modified`. The
-	 * event invalidates a cached write-through plan that recorded a `view` dependency
-	 * when the MV's tags change (tag validation re-runs at plan time). `compute` may throw
-	 * before any mutation (drop-of-absent NOTFOUND), leaving the catalog untouched.
+	 * Shared materialized-view-tag read-modify-write: fetches the live maintained
+	 * table (NOTFOUND if absent or derivation-less), computes its next tag record
+	 * via `compute`, re-registers the swapped table (the shared `derivation`
+	 * object rides the spread), and fires `materialized_view_modified`. The
+	 * table's contents and the row-time maintenance plan are untouched (tags do
+	 * not affect maintenance), so this never re-materializes — `_modified` is
+	 * deliberately distinct from `materialized_view_added` (what create emits):
+	 * the MV maintenance manager re-registers on `_added` but ignores
+	 * `_modified`. The event invalidates a cached write-through plan that
+	 * recorded a `view` dependency when the MV's tags change (tag validation
+	 * re-runs at plan time). `compute` may throw before any mutation
+	 * (drop-of-absent NOTFOUND), leaving the catalog untouched.
 	 */
 	private updateMaterializedViewTags(name: string, compute: TagCompute, schemaName?: string): void {
 		const targetSchemaName = schemaName ?? this.getCurrentSchemaName();
 		const schema = this.getSchemaOrFail(targetSchemaName);
-		const mv = schema.getMaterializedView(name);
-		if (!mv) {
+		const table = schema.getTable(name);
+		if (!isMaintainedTable(table)) {
 			throw new QuereusError(`Materialized view '${name}' not found in schema '${targetSchemaName}'`, StatusCode.NOTFOUND);
 		}
-		const updated: MaterializedViewSchema = { ...mv, tags: compute(mv.tags) };
-		schema.addMaterializedView(updated);
+		const updated: MaintainedTableSchema = { ...table, tags: compute(table.tags) };
+		schema.addTable(updated);
 		this.changeNotifier.notifyChange({
 			type: 'materialized_view_modified',
 			// Stored names of the swapped object, not the raw ALTER args — see
 			// canonicalSchemaName for the emitter/stored-name invariant.
 			schemaName: schema.name,
 			objectName: updated.name,
-			oldObject: mv,
+			oldObject: table,
 			newObject: updated,
 		});
 	}
@@ -1334,7 +1324,6 @@ export class SchemaManager {
 			schema.clearTables();
 			schema.clearFunctions();
 			schema.clearViews();
-			schema.clearMaterializedViews();
 			schema.clearAssertions();
 			schema.clearLensSlots();
 		});
@@ -2668,14 +2657,6 @@ export class SchemaManager {
 		const def: MaterializeViewDefinition = {
 			schemaName: targetSchemaName,
 			viewName,
-			// Canonicalize the stored DDL over the NORMALIZED module identity
-			// (mirrors the create builder): a hand-written `using memory()` entry
-			// rehydrates to the same clause-free record an omitted clause yields.
-			sql: createMaterializedViewToString({
-				...stmt,
-				moduleName: backing.storedModuleName,
-				moduleArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
-			}),
 			selectAst: stmt.select,
 			bodySql: astToString(stmt.select),
 			columns: stmt.columns,
@@ -2685,32 +2666,61 @@ export class SchemaManager {
 			backingModuleArgs: backing.storedModuleArgs,
 		};
 
-		// A durable backing-host module may have rehydrated its own `_mv_<name>`
-		// table (phase 1) before this MV catalog entry imports (phase 3), so the
-		// create-time "already exists" collision check would reject the import. A
-		// pre-existing table owned by the MV's own backing module IS that
+		// Derive the backing shape ONCE for the whole import (ordering gate, adopt
+		// gates, and the refill all read it). Throws when the body cannot plan —
+		// deliberately BEFORE any drop, so a not-yet-resolvable body (the store's
+		// MV-over-MV fixpoint: a dependent fails until its upstream's round lands)
+		// errors per-entry with any pre-existing backing preserved — data-safe.
+		const shape: BackingShape = deriveBackingShape(this.db, def.bodySql, def.columns);
+		// Declared-column arity mismatch: the entry can NEVER materialize, so throw
+		// with the backing preserved rather than dropping durable rows for nothing.
+		assertDeclaredColumnArity(def, shape);
+
+		// Ordering gate: a body source that is itself a pending maintained-table
+		// entry (its own `create materialized view` not yet imported this session)
+		// already pre-exists as a *plain* table, so the body PLANS — but its content
+		// may be about to be replaced by the upstream's own import. Defer this entry
+		// to a later fixpoint round (per-entry error; the store retries).
+		for (const src of shape.sourceTables) {
+			if (options?.pendingDerivations?.has(src)) {
+				throw new QuereusError(
+					`cannot import materialized view '${targetSchemaName}.${viewName}' yet: source '${src}' is a maintained table whose own catalog entry has not imported this session`,
+					StatusCode.ERROR,
+				);
+			}
+		}
+
+		// A durable backing-host module may have rehydrated the maintained table
+		// itself (phase 1: a plain `create table` bundle under the same name)
+		// before this MV catalog entry imports (phase 3). A pre-existing
+		// derivation-less table owned by the MV's own backing module IS that
 		// rehydrated backing: adopt it when every gate passes, else drop it and
 		// re-materialize from the body. A table in a DIFFERENT module is not
 		// ours — fail the entry rather than dropping user data. The create
 		// emitter keeps the plain collision error.
-		const backingTableName = backingTableNameFor(viewName);
-		const preExisting = this.getTable(targetSchemaName, backingTableName);
+		const preExisting = this.getTable(targetSchemaName, viewName);
 		if (preExisting) {
+			if (isMaintainedTable(preExisting)) {
+				throw new QuereusError(
+					`cannot import materialized view '${targetSchemaName}.${viewName}': a maintained table with the same name already exists`,
+					StatusCode.CONSTRAINT,
+				);
+			}
 			if ((preExisting.vtabModuleName ?? '').toLowerCase() === backing.moduleName) {
-				if (options?.trustBackings && await this.tryAdoptPreExistingBacking(def, preExisting, backing.moduleName, options.adoptedBackings)) {
+				if (options?.trustBackings && await this.tryAdoptPreExistingBacking(def, preExisting, backing.moduleName, options.adoptedBackings, shape)) {
 					log(`Adopted materialized view %s.%s (durable backing trusted; refill skipped)`, targetSchemaName, viewName);
 					return { type: 'materializedView', name: `${targetSchemaName}.${viewName}` };
 				}
-				await this.dropTable(targetSchemaName, backingTableName, /*ifExists*/ true);
+				await this.dropTable(targetSchemaName, viewName, /*ifExists*/ true);
 			} else {
 				throw new QuereusError(
-					`cannot import materialized view '${targetSchemaName}.${viewName}': table '${backingTableName}' already exists in module '${preExisting.vtabModuleName}', not the MV's backing module '${backing.moduleName}'`,
+					`cannot import materialized view '${targetSchemaName}.${viewName}': table '${viewName}' already exists in module '${preExisting.vtabModuleName}', not the MV's backing module '${backing.moduleName}'`,
 					StatusCode.CONSTRAINT,
 				);
 			}
 		}
 
-		await materializeView(this.db, def);
+		await materializeView(this.db, def, shape);
 		log(`Imported materialized view %s.%s`, targetSchemaName, viewName);
 
 		return { type: 'materializedView', name: `${targetSchemaName}.${viewName}` };
@@ -2719,21 +2729,14 @@ export class SchemaManager {
 	/**
 	 * The adopt-without-refill gate check + adopt for a pre-existing same-module
 	 * backing during MV import. Returns true when the backing was adopted; false
-	 * means "fall back to drop+refill". A body that cannot PLAN throws instead of
-	 * falling back: the backing must NOT be dropped on a planning failure — in
-	 * the store's fixpoint rehydration an MV-over-MV dependent legitimately fails
-	 * to plan until its upstream's round lands, and dropping here would destroy
-	 * the rows a later round could adopt (a genuinely un-plannable body then
-	 * errors per-entry with the backing preserved as a plain table — data-safe).
-	 * A declared-column arity mismatch likewise throws with the backing
-	 * preserved: such an entry can never materialize, so dropping first (as the
-	 * refill arm would) destroys durable rows for nothing.
+	 * means "fall back to drop+refill". `shape` is the caller's pre-derived
+	 * backing shape (derived before any drop — see {@link importMaterializedView}).
 	 * Gates, of five (the caller already verified gate 1, same-module, and
 	 * gate 5, `trustBackings`):
 	 *
-	 * 2. **Shape** — `backingShapeMatches(preExisting, deriveBackingShape(...))`:
-	 *    the persisted backing is column-for-column what the re-planned body
-	 *    would build (names, logical types, not-null, collation, physical PK).
+	 * 2. **Shape** — `backingShapeMatches(preExisting, shape)`: the persisted
+	 *    backing is column-for-column what the re-planned body would build
+	 *    (names, logical types, not-null, collation, physical PK).
 	 * 3. **bodyHash** — automatic by construction: the catalog persists DDL and
 	 *    import re-parses it, recomputing `computeBodyHash` from the same
 	 *    canonical definition — there is no independently persisted hash that
@@ -2742,26 +2745,24 @@ export class SchemaManager {
 	 *    the backing (one storage substrate ⇒ the divergence window is the
 	 *    documented crash window the marker attests against; a cross-module
 	 *    source — e.g. memory — was itself just recomputed, so persisted backing
-	 *    rows may be stale relative to it), AND every `_mv_` source was itself
-	 *    ADOPTED this session (`adoptedBackings`) — a refilled upstream may hold
-	 *    new content its dependents must reflect.
+	 *    rows may be stale relative to it), AND every source that is itself a
+	 *    maintained table was ADOPTED this session (`adoptedBackings`) — a
+	 *    refilled upstream may hold new content its dependents must reflect.
+	 *    (The caller's pending-derivations gate guarantees every maintained
+	 *    source's own entry has already imported, so derivation presence is
+	 *    decidable here.)
 	 *
 	 * A throw from `adoptMaterializedView` itself (the row-time eligibility gate
 	 * in registration) propagates — per-entry error, backing left registered as
-	 * a plain table (see the helper's rollback contract).
+	 * a plain (derivation-less) table.
 	 */
 	private async tryAdoptPreExistingBacking(
 		def: MaterializeViewDefinition,
 		preExisting: TableSchema,
 		backingModuleName: string,
 		adoptedBackings: Set<string> | undefined,
+		shape: BackingShape,
 	): Promise<boolean> {
-		// Throws when the body cannot plan — deliberately NOT caught (see docstring).
-		const shape: BackingShape = deriveBackingShape(this.db, def.bodySql, def.columns);
-		// Declared-column arity mismatch: the entry can NEVER materialize (the refill
-		// arm would raise the same sited error AFTER the caller dropped the backing),
-		// so throw it here — per-entry error, durable rows preserved.
-		assertDeclaredColumnArity(def, shape);
 		if (!backingShapeMatches(preExisting, shape)) return false;
 
 		for (const qualified of shape.sourceTables) {
@@ -2771,13 +2772,13 @@ export class SchemaManager {
 			const source = this.getTable(sourceSchema, sourceName);
 			if (!source) return false;
 			if ((source.vtabModuleName ?? '').toLowerCase() !== backingModuleName) return false;
-			// `_mv_`-prefixed sources are (by reserved-name convention) other MVs'
-			// backings; require they were adopted, not refilled, this session.
-			if (sourceName.startsWith('_mv_') && !adoptedBackings?.has(qualified)) return false;
+			// A maintained-table source is another MV's backing; require it was
+			// adopted, not refilled, this session.
+			if (isMaintainedTable(source) && !adoptedBackings?.has(qualified)) return false;
 		}
 
 		await adoptMaterializedView(this.db, def, preExisting, shape);
-		adoptedBackings?.add(`${def.schemaName}.${backingTableNameFor(def.viewName)}`.toLowerCase());
+		adoptedBackings?.add(`${def.schemaName}.${def.viewName}`.toLowerCase());
 		return true;
 	}
 

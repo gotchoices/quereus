@@ -617,12 +617,12 @@ export class Statement {
 		const sm = this.db.schemaManager;
 		return analyzeChangeScope(plan, {
 			...(effectiveParams !== undefined ? { params: effectiveParams } : {}),
-			// Project an MV's backing-table reference onto its cached source-union
-			// scope: the backing table is maintained at the DML boundary, off the user
+			// Project a maintained table's reference onto its cached source-union
+			// scope: the table is maintained at the DML boundary, off the user
 			// change log, so watching it directly would never fire. Ordinary tables
 			// resolve to `undefined` and keep reporting themselves.
 			resolveMaterializedViewSource: (table) =>
-				sm.getMaterializedViewByBackingTable(table.schema, table.table)?.sourceScope,
+				sm.getMaintainedTable(table.schema, table.table)?.derivation.sourceScope,
 		});
 	}
 

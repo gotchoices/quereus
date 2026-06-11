@@ -69,7 +69,7 @@ import type { BackingHost, BackingRowChange, MaintenanceOp } from '../vtab/backi
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
 import { compareSqlValues, rowsValueIdentical } from '../util/comparison.js';
-import type { MaterializedViewSchema } from '../schema/view.js';
+import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { Database } from './database.js';
 import type * as AST from '../parser/ast.js';
@@ -125,7 +125,7 @@ export type MaintenancePlan =
  * it is the driving table `T`'s PK (`'pk'`).
  */
 interface ForwardResidualPlan {
-	mv: MaterializedViewSchema;
+	mv: MaintainedTableSchema;
 	backingSchema: string;
 	backingTableName: string;
 	/** Cached scheduler for the key-filtered residual (the body with `injectKeyFilter`
@@ -170,7 +170,7 @@ export type BackingProjector =
  */
 interface MaintenancePlanCommon {
 	/** The MV this plan maintains. */
-	mv: MaterializedViewSchema;
+	mv: MaintainedTableSchema;
 	/** Lowercased `schema.table` of the single source `T`. */
 	sourceBase: string;
 	backingSchema: string;
@@ -434,10 +434,10 @@ export class MaterializedViewManager {
 		this.unsubscribeSchemaChanges = notifier.addListener((event: SchemaChangeEvent) => {
 			if (event.type === 'table_removed' || event.type === 'table_modified') {
 				const changed = `${event.schemaName}.${event.objectName}`.toLowerCase();
-				for (const mv of this.ctx.schemaManager.getAllMaterializedViews()) {
-					if (mv.sourceTables.includes(changed)) {
-						if (!mv.stale) {
-							mv.stale = true;
+				for (const mv of this.ctx.schemaManager.getAllMaintainedTables()) {
+					if (mv.derivation.sourceTables.includes(changed)) {
+						if (!mv.derivation.stale) {
+							mv.derivation.stale = true;
 							log('Marked materialized view %s.%s stale due to %s on %s', mv.schemaName, mv.name, event.type, changed);
 						}
 						// A source schema change invalidates the compiled row-time plan;
@@ -469,37 +469,37 @@ export class MaterializedViewManager {
 	 * recompiles → re-hits the build-time `stale` guard in `building/select.ts`.
 	 *
 	 * A `select … from mv` compiled while the MV was NOT stale resolves to a
-	 * `TableReference` against `_mv_<name>`, so its only schema dependency is the
-	 * backing table. The *source* change event that marks the MV stale never names the
-	 * backing table, so without this emit the cached plan would re-run the backing scan
-	 * and serve stale rows against a structurally-changed source — bypassing the guard a
-	 * fresh prepare would hit. (A plan compiled while the MV is *already* stale is
-	 * separately safe: the while-stale build-time re-validation resolves the body's
+	 * `TableReference` against the maintained table itself, so its only schema
+	 * dependency is that table. The *source* change event that marks the MV stale never
+	 * names the maintained table, so without this emit the cached plan would re-run the
+	 * scan and serve stale rows against a structurally-changed source — bypassing the
+	 * guard a fresh prepare would hit. (A plan compiled while the MV is *already* stale
+	 * is separately safe: the while-stale build-time re-validation resolves the body's
 	 * source tables and records them as direct statement dependencies, so a later source
 	 * change invalidates it without this emit — verified by the regression suite, which
 	 * stays green even with the emit removed for that case.) The `Statement` listener
 	 * maps `table_*` → `'table'` and matches on type + objectName (+ optional schemaName)
-	 * only, ignoring the payload, so the backing `TableSchema` is passed as both old/new.
+	 * only, ignoring the payload, so the maintained `TableSchema` is passed as both old/new.
 	 *
-	 * Safety: the event names the backing table (`_mv_<name>`), so this manager's own
-	 * listener treats it as a no-op for a plain MV (a backing table is not in any plain
-	 * MV's `sourceTables`); for an MV-over-MV chain it conservatively cascades staleness
-	 * down the producer→consumer DAG (acyclic — a consumer requires its producer to
-	 * pre-exist), so the nested notification terminates. The backing table still exists
-	 * even when the source was dropped; if its lookup unexpectedly fails the MV is
-	 * already in a broken state — skip the emit rather than fabricate a partial event.
+	 * Safety: the event names the maintained table itself, which is never in its OWN
+	 * `sourceTables` (self-reference is rejected at create), so this manager's listener
+	 * treats it as a no-op for a plain MV; for an MV-over-MV chain it conservatively
+	 * cascades staleness down the producer→consumer DAG (acyclic — a consumer requires
+	 * its producer to pre-exist), so the nested notification terminates. If the table
+	 * lookup unexpectedly fails the MV is already in a broken state — skip the emit
+	 * rather than fabricate a partial event.
 	 */
-	private emitBackingInvalidation(mv: MaterializedViewSchema): void {
-		const backing = this.ctx.schemaManager.getTable(mv.schemaName, mv.backingTableName);
+	private emitBackingInvalidation(mv: MaintainedTableSchema): void {
+		const backing = this.ctx.schemaManager.getTable(mv.schemaName, mv.name);
 		if (!backing) {
 			log('Skipping backing invalidation for %s.%s: backing table %s not found (MV already broken)',
-				mv.schemaName, mv.name, mv.backingTableName);
+				mv.schemaName, mv.name, mv.name);
 			return;
 		}
 		this.ctx.schemaManager.getChangeNotifier().notifyChange({
 			type: 'table_modified',
 			schemaName: mv.schemaName,
-			objectName: mv.backingTableName,
+			objectName: mv.name,
 			oldObject: backing,
 			newObject: backing,
 		});
@@ -511,14 +511,14 @@ export class MaterializedViewManager {
 	 * body that is not row-time maintainable — the create emitter rolls the MV back on
 	 * throw, so an ineligible body errors cleanly at create time.
 	 */
-	registerMaterializedView(mv: MaterializedViewSchema): void {
+	registerMaterializedView(mv: MaintainedTableSchema): void {
 		const key = mvKey(mv.schemaName, mv.name);
 		// Cache the source-union change-scope so a `select` from this MV projects to
 		// its sources in `analyzeChangeScope`: the backing table is maintained off the
 		// user change log (synchronously at the DML boundary), so a `Database.watch`
 		// on this MV must project to its sources rather than the never-change-logged
 		// backing table. v1 is the conservative union of a `full` watch per source.
-		mv.sourceScope = buildSourceUnionScope(mv.sourceTables);
+		mv.derivation.sourceScope = buildSourceUnionScope(mv.derivation.sourceTables);
 		this.releaseRowTime(key);
 		const plan = this.buildMaintenancePlan(mv); // throws on ineligible shape
 		this.rowTime.set(key, plan);
@@ -546,9 +546,9 @@ export class MaterializedViewManager {
 	 * (a dependent MV whose in-place body rewrite / backing rename / re-registration
 	 * failed mid-way must not keep serving its backing as if live).
 	 */
-	markMaterializedViewStale(mv: MaterializedViewSchema): void {
-		if (!mv.stale) {
-			mv.stale = true;
+	markMaterializedViewStale(mv: MaintainedTableSchema): void {
+		if (!mv.derivation.stale) {
+			mv.derivation.stale = true;
 			log('Marked materialized view %s.%s stale (forced)', mv.schemaName, mv.name);
 		}
 		this.releaseRowTime(mvKey(mv.schemaName, mv.name));
@@ -931,13 +931,13 @@ export class MaterializedViewManager {
 	 * cost gate, and full-rebuild is selected exactly when no bounded-delta arm is sound (an
 	 * empty sound set resolves to the floor) — so an existing eligible shape is unaffected.
 	 */
-	private buildMaintenancePlan(mv: MaterializedViewSchema): MaintenancePlan {
+	private buildMaintenancePlan(mv: MaintainedTableSchema): MaintenancePlan {
 		const db = this.ctx as unknown as Database;
 		// Analyze the MV's own body to compile maintenance; suppress the read-side
 		// rewrite so the body stays over its SOURCE table, not re-pointed at this
 		// MV's backing (which the maintenance plan is what keeps consistent).
 		const analyzed = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
-			const { plan } = this.ctx._buildPlan([mv.selectAst as AST.Statement]);
+			const { plan } = this.ctx._buildPlan([mv.derivation.selectAst as AST.Statement]);
 			return this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
 		});
 
@@ -954,7 +954,7 @@ export class MaterializedViewManager {
 	 * determinism diagnostic survives — see the individual builders); every other mismatch
 	 * is a `null` fall-through. Bag / no-output / size rejects live in the floor.
 	 */
-	private tryBuildBoundedDeltaArm(mv: MaterializedViewSchema, analyzed: BlockNode): MaintenancePlan | null {
+	private tryBuildBoundedDeltaArm(mv: MaintainedTableSchema, analyzed: BlockNode): MaintenancePlan | null {
 		// A body that reads no source table has no bounded-delta arm → floor (which rejects
 		// a sourceless body). (A self-join / TVF fan-out surfaces ≥2 refs or a TVF node.)
 		const tableRefs = [...collectTableRefs(analyzed).values()];
@@ -967,7 +967,7 @@ export class MaterializedViewManager {
 		if (containsNodeType(analyzed, PlanNodeType.Distinct)) return null;
 		if (containsNodeType(analyzed, PlanNodeType.SetOperation)) return null;
 		if (containsNodeType(analyzed, PlanNodeType.RecursiveCTE)) return null;
-		if (mv.selectAst.type === 'select' && (mv.selectAst.limit !== undefined || mv.selectAst.offset !== undefined)) {
+		if (mv.derivation.selectAst.type === 'select' && (mv.derivation.selectAst.limit !== undefined || mv.derivation.selectAst.offset !== undefined)) {
 			return null;
 		}
 
@@ -1020,7 +1020,7 @@ export class MaterializedViewManager {
 	 * determinism diagnostic must survive rather than fall through to the floor's generic one).
 	 */
 	private buildInverseProjectionPlan(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		analyzed: BlockNode,
 		tableRef: TableReferenceNode,
 		sourceBase: string,
@@ -1031,10 +1031,10 @@ export class MaterializedViewManager {
 		const sourcePkCols = sourceSchema.primaryKeyDefinition.map(d => d.index);
 		if (sourcePkCols.length === 0) return null; // source has no PK → floor
 
-		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		const backing = this.ctx._findTable(mv.name, mv.schemaName);
 		if (!backing) {
 			throw new QuereusError(
-				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				`Internal error: backing table '${mv.name}' for materialized view '${mv.name}' not found`,
 				StatusCode.INTERNAL,
 			);
 		}
@@ -1123,7 +1123,7 @@ export class MaterializedViewManager {
 		// cross-row references). `compilePredicate` throws on unsupported forms; an
 		// unsupported WHERE shape falls to the floor.
 		let predicate: CompiledPredicate | undefined;
-		const bodyWhere = mv.selectAst.type === 'select' ? mv.selectAst.where : undefined;
+		const bodyWhere = mv.derivation.selectAst.type === 'select' ? mv.derivation.selectAst.where : undefined;
 		if (bodyWhere) {
 			try {
 				predicate = compilePredicate(bodyWhere, sourceSchema.columns);
@@ -1160,7 +1160,7 @@ export class MaterializedViewManager {
 			mv,
 			sourceBase,
 			backingSchema: mv.schemaName,
-			backingTableName: mv.backingTableName,
+			backingTableName: mv.name,
 			chosenStrategy,
 			sourceStats,
 			backingPkDefinition,
@@ -1191,7 +1191,7 @@ export class MaterializedViewManager {
 	 * the backing is keyed by the group key regardless of whether it is a source key.
 	 */
 	private buildAggregateResidualPlan(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		analyzed: BlockNode,
 		tableRef: TableReferenceNode,
 		sourceBase: string,
@@ -1236,10 +1236,10 @@ export class MaterializedViewManager {
 
 		// Backing table + its physical PK. The aggregate's group-key FD
 		// (`propagateAggregateFds`) makes the group key the backing key (via `keysOf`).
-		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		const backing = this.ctx._findTable(mv.name, mv.schemaName);
 		if (!backing) {
 			throw new QuereusError(
-				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				`Internal error: backing table '${mv.name}' for materialized view '${mv.name}' not found`,
 				StatusCode.INTERNAL,
 			);
 		}
@@ -1272,7 +1272,7 @@ export class MaterializedViewManager {
 		// sound, so (as with inverse-projection) it is not a competitor here. We still
 		// record the chosen strategy + cost inputs for parity with the substrate.
 		const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
-		const hasPredicate = mv.selectAst.type === 'select' && mv.selectAst.where !== undefined;
+		const hasPredicate = mv.derivation.selectAst.type === 'select' && mv.derivation.selectAst.where !== undefined;
 		const sourceStats = this.estimateMaintenanceStats(tableRef.tableSchema, backing.columns.length, hasPredicate);
 		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
@@ -1288,7 +1288,7 @@ export class MaterializedViewManager {
 			mv,
 			sourceBase,
 			backingSchema: mv.schemaName,
-			backingTableName: mv.backingTableName,
+			backingTableName: mv.name,
 			chosenStrategy,
 			sourceStats,
 			binding: { kind: 'group', groupColumns: [...groupColumns] },
@@ -1328,7 +1328,7 @@ export class MaterializedViewManager {
 	 * {@link JoinResidualPlan}'s "WHERE handling" note and {@link applyLookupResidual}.
 	 */
 	private buildJoinResidualPlan(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		analyzed: BlockNode,
 		tableRefs: TableReferenceNode[],
 	): MaintenancePlan | null {
@@ -1338,10 +1338,10 @@ export class MaterializedViewManager {
 		if (tableRefs.length !== 2) return null;
 		if (findAggregate(analyzed)) return null;
 
-		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		const backing = this.ctx._findTable(mv.name, mv.schemaName);
 		if (!backing) {
 			throw new QuereusError(
-				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				`Internal error: backing table '${mv.name}' for materialized view '${mv.name}' not found`,
 				StatusCode.INTERNAL,
 			);
 		}
@@ -1447,7 +1447,7 @@ export class MaterializedViewManager {
 		// with the WHERE **stripped** and the key filter on `P` — it returns every currently
 		// referencing `T` row (regardless of scope) so its backing key can be deleted before the
 		// in-scope survivors are re-upserted. Absent for a no-WHERE / `T`-only-WHERE body.
-		const hasWhere = mv.selectAst.type === 'select' && mv.selectAst.where !== undefined;
+		const hasWhere = mv.derivation.selectAst.type === 'select' && mv.derivation.selectAst.where !== undefined;
 		// A volatile WHERE would make every residual (which embeds it) irreproducible → fall to
 		// the floor's pragma-gated whole-body determinism reject, not an unsound bounded-delta arm.
 		if (hasWhere && bodyWhereIsNonDeterministic(analyzed)) return null;
@@ -1477,7 +1477,7 @@ export class MaterializedViewManager {
 			mv,
 			sourceBase,
 			backingSchema: mv.schemaName,
-			backingTableName: mv.backingTableName,
+			backingTableName: mv.name,
 			chosenStrategy,
 			sourceStats,
 			binding: { kind: 'row', keyColumns: [...tPkCols] },
@@ -1512,12 +1512,12 @@ export class MaterializedViewManager {
 	 * shrink).
 	 */
 	private compileLookupMembershipResidual(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		lookupBase: string,
 		pPkCols: readonly number[],
 	): Scheduler | null {
 		const db = this.ctx as unknown as Database;
-		const strippedAst = { ...(mv.selectAst as AST.SelectStmt), where: undefined };
+		const strippedAst = { ...(mv.derivation.selectAst as AST.SelectStmt), where: undefined };
 		const stripped = db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
 			const { plan } = this.ctx._buildPlan([strippedAst as AST.Statement]);
 			return this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
@@ -1557,7 +1557,7 @@ export class MaterializedViewManager {
 	 *   ({@link isFullRebuildPathological}) — every DML write would re-scan that source.
 	 *   `0` disables the size reject (accept any size).
 	 */
-	private buildFullRebuildPlan(mv: MaterializedViewSchema, analyzed: BlockNode): FullRebuildPlan {
+	private buildFullRebuildPlan(mv: MaintainedTableSchema, analyzed: BlockNode): FullRebuildPlan {
 		const db = this.ctx as unknown as Database;
 
 		// Optimize the whole body ONCE — read-side MV rewrite suppressed so it reads its
@@ -1609,10 +1609,10 @@ export class MaterializedViewManager {
 		)];
 		if (sourceBases.length === 0) throw cannotMaterialize(mv.name, 'its body reads no source table');
 
-		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		const backing = this.ctx._findTable(mv.name, mv.schemaName);
 		if (!backing) {
 			throw new QuereusError(
-				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				`Internal error: backing table '${mv.name}' for materialized view '${mv.name}' not found`,
 				StatusCode.INTERNAL,
 			);
 		}
@@ -1663,7 +1663,7 @@ export class MaterializedViewManager {
 			mv,
 			sourceBase: sourceBases[0],
 			backingSchema: mv.schemaName,
-			backingTableName: mv.backingTableName,
+			backingTableName: mv.name,
 			chosenStrategy,
 			sourceStats,
 			bodyScheduler,
@@ -2009,7 +2009,7 @@ export class MaterializedViewManager {
 	 * arm-specific determinism diagnostic must survive).
 	 */
 	private buildLateralTvfPrefixDeletePlan(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		analyzed: BlockNode,
 		tableRef: TableReferenceNode,
 		sourceBase: string,
@@ -2054,10 +2054,10 @@ export class MaterializedViewManager {
 		if (sourcePkCols.length === 0) return null;
 
 		// Backing table + its physical PK (the composite product key).
-		const backing = this.ctx._findTable(mv.backingTableName, mv.schemaName);
+		const backing = this.ctx._findTable(mv.name, mv.schemaName);
 		if (!backing) {
 			throw new QuereusError(
-				`Internal error: backing table '${mv.backingTableName}' for materialized view '${mv.name}' not found`,
+				`Internal error: backing table '${mv.name}' for materialized view '${mv.name}' not found`,
 				StatusCode.INTERNAL,
 			);
 		}
@@ -2140,7 +2140,7 @@ export class MaterializedViewManager {
 		// it does for the other arms (a TVF whose fan-out is pathological is not detectable
 		// without fan-out stats — deferred with the fanning-keyed-join follow-up).
 		const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
-		const hasPredicate = mv.selectAst.type === 'select' && mv.selectAst.where !== undefined;
+		const hasPredicate = mv.derivation.selectAst.type === 'select' && mv.derivation.selectAst.where !== undefined;
 		const sourceStats = this.estimateMaintenanceStats(sourceSchema, backing.columns.length, hasPredicate);
 		const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 		const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
@@ -2156,7 +2156,7 @@ export class MaterializedViewManager {
 			mv,
 			sourceBase,
 			backingSchema: mv.schemaName,
-			backingTableName: mv.backingTableName,
+			backingTableName: mv.name,
 			chosenStrategy,
 			sourceStats,
 			binding: { kind: 'row', keyColumns: [...sourcePkCols] },
@@ -2372,7 +2372,7 @@ export class MaterializedViewManager {
 		schemaName: string,
 		tableName: string,
 		uc: UniqueConstraintSchema,
-	): MaterializedViewSchema | undefined {
+	): MaintainedTableSchema | undefined {
 		const sourceBase = `${schemaName}.${tableName}`.toLowerCase();
 		const keys = this.rowTimeBySource.get(sourceBase);
 		if (!keys || keys.size === 0) return undefined; // O(1) negative fast path
@@ -2386,7 +2386,7 @@ export class MaterializedViewManager {
 			// A deferred full-rebuild MV is not per-row consistent (reconciled only at
 			// the end-of-statement flush), so it cannot answer a synchronous probe.
 			if (plan.chosenStrategy === 'full-rebuild') return undefined;
-			if (mv.stale) return undefined; // not row-time consistent
+			if (mv.derivation.stale) return undefined; // not row-time consistent
 			return mv;
 		}
 		return undefined;
@@ -2445,7 +2445,7 @@ export class MaterializedViewManager {
 	 * validates each against the live source row.
 	 */
 	async lookupCoveringConflicts(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		uc: UniqueConstraintSchema,
 		newRow: Row,
 		newSourcePk: readonly SqlValue[],
@@ -2886,8 +2886,8 @@ function rootRelationalNode(block: BlockNode): RelationalPlanNode | undefined {
  * The diagnostic for a create-time **hard** reject — one of the four non-shape rejections
  * the cost-gated-with-floor model keeps (non-determinism, bag/no-key, no relational output,
  * size). Names the MV and steers to a plain `view` (live re-evaluation) or
- * `create table ... as <body>` (a one-off snapshot) — never a refresh policy, never the
- * hidden `_mv_<name>` backing table. Used by the arm builders (for their arm-specific
+ * `create table ... as <body>` (a one-off snapshot) — never a refresh policy, never an
+ * internal implementation detail. Used by the arm builders (for their arm-specific
  * determinism diagnostic) and by {@link MaterializedViewManager.buildFullRebuildPlan}.
  */
 function cannotMaterialize(mvName: string, detail: string): QuereusError {

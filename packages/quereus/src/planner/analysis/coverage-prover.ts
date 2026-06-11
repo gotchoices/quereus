@@ -185,7 +185,7 @@ import { RetrieveNode } from '../nodes/retrieve-node.js';
 import { BinaryOpNode } from '../nodes/scalar.js';
 import type { EquiJoinPair } from '../nodes/join-utils.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
-import type { MaterializedViewSchema } from '../../schema/view.js';
+import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
@@ -286,17 +286,18 @@ const BINARY_JOIN_TYPES: ReadonlySet<PlanNodeType> = new Set([
  */
 export function proveCoverage(
 	root: RelationalPlanNode,
-	mv: MaterializedViewSchema,
+	mv: MaintainedTableSchema,
 	uc: UniqueConstraintSchema,
 	baseTable: TableSchema,
 	opts: ProveCoverageOptions = {},
 ): CoverageResult {
+	const bodyAst = mv.derivation.selectAst;
 	// ---- Row cap: a LIMIT/OFFSET body materializes only a prefix of the
 	//      governed rows, so it can never be observation-equivalent. Read from the
 	//      AST (the faithful source): the optimizer may push the cap into an
 	//      `OrdinalSlice` over an ordinal-seek-capable leaf, which the shape walk
 	//      would otherwise traverse as a transparent link. ----
-	if (mv.selectAst.type === 'select' && (mv.selectAst.limit !== undefined || mv.selectAst.offset !== undefined)) {
+	if (bodyAst.type === 'select' && (bodyAst.limit !== undefined || bodyAst.offset !== undefined)) {
 		return notCovers('shape');
 	}
 
@@ -373,21 +374,21 @@ export function proveCoverage(
 	//      column is then handled on its own terms below (ORDER BY ⇒
 	//      `ordering-mismatch`, WHERE ⇒ `predicate-entailment`), never mis-mapped
 	//      onto `T`. For a single-source body this is plain bare-name resolution. ----
-	const resolveBodyColumn = makeBodyColumnResolver(mv.selectAst, baseTable, lookupNames);
+	const resolveBodyColumn = makeBodyColumnResolver(bodyAst, baseTable, lookupNames);
 
 	// ---- Ordering: the body's declared ORDER BY columns must be a permutation of
 	//      the UC columns. The prover never invents an ordering — a missing one
 	//      fails. Read from the body AST rather than `mv.ordering`: the optimizer
 	//      drops the Sort (leaving `physical.ordering` empty) whenever an index
 	//      scan already supplies the order, so the AST is the faithful source. ----
-	const orderingBaseCols = bodyOrderByColumns(mv.selectAst, resolveBodyColumn);
+	const orderingBaseCols = bodyOrderByColumns(bodyAst, resolveBodyColumn);
 	if (orderingBaseCols === undefined) return notCovers('ordering-mismatch');
 	if (!isPermutation(orderingBaseCols, uc.columns)) return notCovers('ordering-mismatch');
 
 	// ---- Predicate alignment: the materialized set (rows where the body's WHERE
 	//      holds) must equal the governed set (rows where uc.predicate holds,
 	//      NULL-excluded). The WHERE is read from the AST (see shape note). ----
-	const bodyWhere = mv.selectAst.type === 'select' ? mv.selectAst.where : undefined;
+	const bodyWhere = bodyAst.type === 'select' ? bodyAst.where : undefined;
 	return provePredicateAlignment(bodyWhere, uc, baseTable, resolveBodyColumn);
 }
 

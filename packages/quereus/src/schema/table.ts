@@ -96,6 +96,13 @@ export interface TableSchema {
 	generatedColumnTopoOrder?: ReadonlyArray<number>;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */
 	tags?: Readonly<Record<string, SqlValue>>;
+	/**
+	 * Optional maintenance contract: present iff this table is a **maintained
+	 * table** (what `create materialized view` produces). The derivation object
+	 * is shared by reference across catalog swaps of this table so its runtime
+	 * state survives them. See {@link import('./derivation.js').TableDerivation}.
+	 */
+	derivation?: import('./derivation.js').TableDerivation;
 }
 
 /**
@@ -624,7 +631,7 @@ export interface UniqueConstraintSchema {
 	 * the name of an auto-built secondary index (the implicit covering structure)
 	 * or of an explicit materialized view recognized by the coverage prover. This
 	 * is the **source of truth** for the constraint↔structure link; a covering
-	 * MV's {@link MaterializedViewSchema.covers} is the convenience reverse link.
+	 * MV's `TableDerivation.covers` is the convenience reverse link.
 	 * Set eagerly at MV-creation time, cleared when that MV is dropped. A
 	 * "constraint is logical, structure is optional" surface. When the named
 	 * structure is a covering MV (every MV is row-time maintained), UNIQUE conflict

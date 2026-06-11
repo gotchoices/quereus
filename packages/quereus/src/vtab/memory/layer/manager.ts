@@ -26,7 +26,7 @@ import { inferType } from '../../../types/registry.js';
 import type { Expression } from '../../../parser/ast.js';
 import { compilePredicate } from '../utils/predicate.js';
 import type { MemoryIndex } from '../index.js';
-import type { MaterializedViewSchema } from '../../../schema/view.js';
+import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
 
 let tableManagerCounter = 0;
@@ -52,7 +52,7 @@ const logger = createMemoryTableLoggers('layer:manager');
  */
 export type CoveringStructure =
 	| { kind: 'memory-index'; index: MemoryIndex }
-	| { kind: 'materialized-view'; view: MaterializedViewSchema };
+	| { kind: 'materialized-view'; view: MaintainedTableSchema };
 
 /** Origin + structure name for a UNIQUE constraint's implicit covering structure. */
 export interface ImplicitCoveringStructure {
@@ -1081,7 +1081,7 @@ export class MemoryTableManager {
 		targetLayer: TransactionLayer,
 		schema: TableSchema,
 		uc: UniqueConstraintSchema,
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		newRowData: Row,
 		newPrimaryKey: BTreeKeyForPrimary,
 		onConflict: ConflictResolution,

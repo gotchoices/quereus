@@ -729,10 +729,10 @@ interface ManagerHandle { readonly materializedViewManager: MvManagerInternals; 
  */
 function forceFullRebuild(db: Database, schemaName: string, name: string): FullRebuildPlanLike {
 	const mgr = (db as unknown as ManagerHandle).materializedViewManager;
-	const mv = db.schemaManager.getMaterializedView(schemaName, name);
+	const mv = db.schemaManager.getMaintainedTable(schemaName, name);
 	expect(mv, `${schemaName}.${name} MV registered`).to.exist;
 	const analyzed = db.schemaManager.withSuppressedMaterializedViewRewrite(
-		() => db.optimizer.optimizeForAnalysis(db._buildPlan([mv!.selectAst as AST.Statement]).plan, db),
+		() => db.optimizer.optimizeForAnalysis(db._buildPlan([mv!.derivation.selectAst as AST.Statement]).plan, db),
 	);
 	const plan = mgr.buildFullRebuildPlan(mv, analyzed);
 	const key = `${schemaName}.${name}`.toLowerCase();
@@ -1040,17 +1040,19 @@ describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 		db = new Database();
 		await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
 		await db.exec('insert into src (id, a, b, k) values (1, 0, 0, 6), (2, 3, 4, 2)');
-		// A real keyed-set MV so a backing (`_mv_okmv`, PK id) exists for the cases that pass
-		// the relational/determinism gates and reach the backing lookup.
+		// A real keyed-set MV so a backing (the maintained table `okmv` itself, PK id) exists
+		// for the cases that pass the relational/determinism gates and reach the backing lookup.
 		await db.exec('create materialized view okmv as select id, a from src');
 		mgr = (db as unknown as ManagerHandle).materializedViewManager;
 	});
 	afterEach(async () => { await db.close(); });
 
-	const okMv = (): unknown => db.schemaManager.getMaterializedView('main', 'okmv');
+	const okMv = (): unknown => db.schemaManager.getMaintainedTable('main', 'okmv');
 
 	it('rejects a bag body (no provable unique key — a key-dropping projection) as not-a-set', () => {
-		const fakeMv = { name: 'bag', schemaName: 'main', backingTableName: '_mv_bag' };
+		// The builder reads only name/schemaName before the bag gate throws (the maintained
+		// table IS the backing now, so no separate backingTableName exists).
+		const fakeMv = { name: 'bag', schemaName: 'main' };
 		let caught: unknown;
 		try { mgr.buildFullRebuildPlan(fakeMv, analyzeBody(db, 'select a from src')); }
 		catch (e) { caught = e; }

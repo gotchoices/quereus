@@ -6,7 +6,7 @@ import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { Statement } from './statement.js';
 import { SchemaManager } from '../schema/manager.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
-import type { MaterializedViewSchema } from '../schema/view.js';
+import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { FunctionSchema } from '../schema/function.js';
 import { BUILTIN_FUNCTIONS } from '../func/builtins/index.js';
 import { createScalarFunction, createAggregateFunction } from '../func/registration.js';
@@ -1833,7 +1833,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal Compile + register an MV for row-time write-through maintenance.
 	 *  Throws on a body that is not row-time maintainable (the mandatory create-time gate). */
-	public registerMaterializedView(mv: MaterializedViewSchema): void {
+	public registerMaterializedView(mv: MaintainedTableSchema): void {
 		this.materializedViewManager.registerMaterializedView(mv);
 	}
 
@@ -1845,7 +1845,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal Force-mark an MV stale: detach its row-time plan and invalidate cached
 	 *  backing reads so the next reference re-hits the build-time stale guard
 	 *  (ALTER … RENAME propagation failure path). */
-	public markMaterializedViewStale(mv: MaterializedViewSchema): void {
+	public markMaterializedViewStale(mv: MaintainedTableSchema): void {
 		this.materializedViewManager.markMaterializedViewStale(mv);
 	}
 
@@ -1911,7 +1911,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		schemaName: string,
 		tableName: string,
 		uc: UniqueConstraintSchema,
-	): MaterializedViewSchema | undefined {
+	): MaintainedTableSchema | undefined {
 		return this.materializedViewManager.findRowTimeCoveringStructure(schemaName, tableName, uc);
 	}
 
@@ -1921,7 +1921,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  through the backing table's coordinated connection. The caller validates each
 	 *  candidate against its live source row and applies IGNORE/ABORT/REPLACE. */
 	public async _lookupCoveringConflicts(
-		mv: MaterializedViewSchema,
+		mv: MaintainedTableSchema,
 		uc: UniqueConstraintSchema,
 		newRow: Row,
 		newSourcePk: readonly SqlValue[],

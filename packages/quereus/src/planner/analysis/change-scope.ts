@@ -768,7 +768,7 @@ function sortedDedupParamIndices(set: Set<number | string>): ReadonlyArray<numbe
  * refinement.
  *
  * @param sourceTables Qualified lowercased `schema.table` names, as recorded on
- *   `MaterializedViewSchema.sourceTables`.
+ *   `TableDerivation.sourceTables`.
  */
 export function buildSourceUnionScope(sourceTables: ReadonlyArray<string>): ChangeScope {
 	const watches: TableWatch[] = [];

@@ -117,7 +117,8 @@ describe('Materialized-view query rewrite — equivalence (rewritten == unrewrit
 	it('the harness is non-vacuous: the rewritable queries actually rewrite', () => {
 		for (const q of MUST_REWRITE) {
 			const plan = serializePlanTree(db.getPlan(q));
-			expect(plan, `expected a backing rewrite for: ${q}`).to.match(/_mv_/);
+			// A rewritten plan scans one of the MV tables (all named mv_*).
+			expect(plan, `expected an MV-table rewrite for: ${q}`).to.match(/"name": "mv_/);
 		}
 	});
 });
@@ -222,7 +223,7 @@ describe('Materialized-view query rewrite — aggregate-rollup equivalence (rewr
 	it('the harness is non-vacuous: the rewritable aggregate queries actually rewrite', () => {
 		for (const q of AGG_MUST_REWRITE) {
 			const plan = serializePlanTree(db.getPlan(q));
-			expect(plan, `expected a backing rewrite for: ${q}`).to.match(/_mv_/);
+			expect(plan, `expected an MV-table rewrite for: ${q}`).to.contain('"name": "amv_kj"');
 		}
 	});
 
@@ -374,8 +375,10 @@ describe('Materialized-view query rewrite — join-subsumption equivalence (rewr
 	it('the harness is non-vacuous: the rewritable join queries actually rewrite', () => {
 		for (const q of JOIN_MUST_REWRITE) {
 			const plan = serializePlanTree(db.getPlan(q));
-			expect(plan, `expected a backing rewrite for: ${q}`).to.match(/_mv_/);
-			expect(plan, `expected the join eliminated for: ${q}`).to.not.match(/Join/i);
+			expect(plan, `expected an MV-table rewrite for: ${q}`).to.contain('"name": "jmv"');
+			// (The MV derivation's rendered body contains the word "join", so probe
+			// for surviving join NODES rather than the bare word.)
+			expect(plan, `expected the join eliminated for: ${q}`).to.not.match(/"nodeType": "\w*Join"/);
 		}
 	});
 });

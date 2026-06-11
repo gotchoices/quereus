@@ -17,7 +17,7 @@ import { Database } from '../src/core/database.js';
 import { proveCoverage } from '../src/planner/analysis/coverage-prover.js';
 import type { RelationalPlanNode } from '../src/planner/nodes/plan-node.js';
 import type { TableSchema } from '../src/schema/table.js';
-import type { MaterializedViewSchema } from '../src/schema/view.js';
+import type { MaintainedTableSchema } from '../src/schema/derivation.js';
 import { parseSelect } from '../src/parser/index.js';
 
 async function expectExecError(db: Database, sql: string, messagePart: string): Promise<void> {
@@ -46,15 +46,15 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		await db.exec("insert into contact_v1 values ('Bob', 'b@x'), ('Carol', 'c@x')");
 		await db.exec('create materialized view contact_v2 as select handle collate nocase as handle, email from contact_v1');
 
-		const mv = db.schemaManager.getMaterializedView('main', 'contact_v2');
+		const mv = db.schemaManager.getMaintainedTable('main', 'contact_v2');
 		expect(mv, 'MV registered').to.exist;
-		expect(mv!.primaryKey).to.deep.equal([{ index: 0, desc: false }]);
-		expect(mv!.coarsenedKey, 'key-coarsening stamp').to.deep.equal({
+		expect(mv!.derivation.logicalKey).to.deep.equal([{ index: 0, desc: false }]);
+		expect(mv!.derivation.coarsenedKey, 'key-coarsening stamp').to.deep.equal({
 			columns: ['handle'],
 			weakened: [{ column: 'handle', sourceCollation: 'BINARY', outputCollation: 'NOCASE' }],
 		});
 
-		const backing = db.schemaManager.getTable('main', '_mv_contact_v2');
+		const backing = db.schemaManager.getTable('main', 'contact_v2');
 		expect(backing, 'backing table').to.exist;
 		expect(backing!.primaryKeyDefinition.length).to.equal(1);
 		expect(backing!.primaryKeyDefinition[0].index).to.equal(0);
@@ -64,33 +64,33 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 	it('a provable-key body stamps no coarsenedKey', async () => {
 		await db.exec('create table t (id integer primary key, v text)');
 		await db.exec('create materialized view mv as select id, v collate nocase as v from t');
-		const mv = db.schemaManager.getMaterializedView('main', 'mv');
+		const mv = db.schemaManager.getMaintainedTable('main', 'mv');
 		expect(mv).to.exist;
 		// The bare `id` passthrough preserves the source key, so K' is never derived.
-		expect(mv!.coarsenedKey).to.equal(undefined);
-		expect(mv!.primaryKey).to.deep.equal([{ index: 0, desc: false }]);
+		expect(mv!.derivation.coarsenedKey).to.equal(undefined);
+		expect(mv!.derivation.logicalKey).to.deep.equal([{ index: 0, desc: false }]);
 	});
 
 	it('a refining lineage key (NOCASE source → BINARY output) is accepted silently', async () => {
 		await db.exec('create table nck (h text collate nocase primary key, v integer)');
 		await db.exec("insert into nck values ('Bob', 1)");
 		await db.exec('create materialized view nck_v as select h collate binary as h, v from nck');
-		const mv = db.schemaManager.getMaterializedView('main', 'nck_v');
+		const mv = db.schemaManager.getMaintainedTable('main', 'nck_v');
 		expect(mv).to.exist;
 		// BINARY is the finest collation — the lineage key is a genuine unique key,
 		// so it keys the backing with no coarsening stamp.
-		expect(mv!.coarsenedKey).to.equal(undefined);
-		const backing = db.schemaManager.getTable('main', '_mv_nck_v')!;
+		expect(mv!.derivation.coarsenedKey).to.equal(undefined);
+		const backing = db.schemaManager.getTable('main', 'nck_v')!;
 		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase()).to.equal('BINARY');
 	});
 
 	it('a multi-column passthrough body derives a composite coarsened key', async () => {
 		await db.exec('create table mc (a text, b text, v integer, primary key (a, b))');
 		await db.exec('create materialized view mc_v as select a collate nocase as a, b, v from mc');
-		const mv = db.schemaManager.getMaterializedView('main', 'mc_v');
+		const mv = db.schemaManager.getMaintainedTable('main', 'mc_v');
 		expect(mv).to.exist;
-		expect(mv!.primaryKey).to.deep.equal([{ index: 0, desc: false }, { index: 1, desc: false }]);
-		expect(mv!.coarsenedKey).to.deep.equal({
+		expect(mv!.derivation.logicalKey).to.deep.equal([{ index: 0, desc: false }, { index: 1, desc: false }]);
+		expect(mv!.derivation.coarsenedKey).to.deep.equal({
 			columns: ['a', 'b'],
 			// Only the collation-weakened column is reported; `b` carried its collation through.
 			weakened: [{ column: 'a', sourceCollation: 'BINARY', outputCollation: 'NOCASE' }],
@@ -108,13 +108,13 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		await expectExecError(db,
 			'create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email',
 			'must be a set');
-		expect(db.schemaManager.getTable('main', '_mv_ord_v')).to.equal(undefined);
+		expect(db.schemaManager.getTable('main', 'ord_v')).to.equal(undefined);
 
 		// Over clean data: creates, physical PK is exactly the coarsened key at
 		// NOCASE, and a colliding insert LWW-merges (the contract the seed broke).
 		await db.exec("delete from ord_src where handle = 'bob'");
 		await db.exec('create materialized view ord_v as select handle collate nocase as handle, email from ord_src order by email');
-		const backing = db.schemaManager.getTable('main', '_mv_ord_v')!;
+		const backing = db.schemaManager.getTable('main', 'ord_v')!;
 		expect(backing.primaryKeyDefinition.map(d => d.index)).to.deep.equal([0]);
 		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase()).to.equal('NOCASE');
 		await db.exec("insert into ord_src values ('BOB', 'b3@x')");
@@ -127,8 +127,8 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		await db.exec('create table ord_nck (h text collate nocase primary key, v integer)');
 		await db.exec("insert into ord_nck values ('Bob', 2), ('Al', 1)");
 		await db.exec('create materialized view ord_nck_v as select h collate binary as h, v from ord_nck order by v');
-		expect(db.schemaManager.getMaterializedView('main', 'ord_nck_v')!.coarsenedKey).to.equal(undefined);
-		const backing = db.schemaManager.getTable('main', '_mv_ord_nck_v')!;
+		expect(db.schemaManager.getMaintainedTable('main', 'ord_nck_v')!.derivation.coarsenedKey).to.equal(undefined);
+		const backing = db.schemaManager.getTable('main', 'ord_nck_v')!;
 		// Physical PK leads with the order-by column, logical key appended — the
 		// same seeding a keysOf-proved key gets.
 		expect(backing.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
@@ -142,10 +142,10 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		// backing keys on h2 — not on the coarsening h1 the earlier output index
 		// would have picked.
 		await db.exec('create materialized view dual_v as select h collate nocase as h1, h collate binary as h2, v from dual');
-		const mv = db.schemaManager.getMaterializedView('main', 'dual_v')!;
-		expect(mv.coarsenedKey).to.equal(undefined);
-		expect(mv.primaryKey).to.deep.equal([{ index: 1, desc: false }]);
-		const backing = db.schemaManager.getTable('main', '_mv_dual_v')!;
+		const mv = db.schemaManager.getMaintainedTable('main', 'dual_v')!;
+		expect(mv.derivation.coarsenedKey).to.equal(undefined);
+		expect(mv.derivation.logicalKey).to.deep.equal([{ index: 1, desc: false }]);
+		const backing = db.schemaManager.getTable('main', 'dual_v')!;
 		expect(backing.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1]);
 		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase()).to.equal('BINARY');
 	});
@@ -162,10 +162,10 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 			'create materialized view bag2 as select v collate nocase as v, count(*) as n from t group by v collate nocase',
 			'no provable unique key');
 		// Neither half-registered.
-		expect(db.schemaManager.getMaterializedView('main', 'bag1')).to.equal(undefined);
-		expect(db.schemaManager.getMaterializedView('main', 'bag2')).to.equal(undefined);
-		expect(db.schemaManager.getTable('main', '_mv_bag1')).to.equal(undefined);
-		expect(db.schemaManager.getTable('main', '_mv_bag2')).to.equal(undefined);
+		expect(db.schemaManager.getMaintainedTable('main', 'bag1')).to.equal(undefined);
+		expect(db.schemaManager.getMaintainedTable('main', 'bag2')).to.equal(undefined);
+		expect(db.schemaManager.getTable('main', 'bag1')).to.equal(undefined);
+		expect(db.schemaManager.getTable('main', 'bag2')).to.equal(undefined);
 	});
 
 	it('colliding seed data fails loudly at fill with nothing registered', async () => {
@@ -174,8 +174,8 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		await expectExecError(db,
 			'create materialized view dup_v2 as select handle collate nocase as handle from dup_src',
 			'must be a set');
-		expect(db.schemaManager.getMaterializedView('main', 'dup_v2')).to.equal(undefined);
-		expect(db.schemaManager.getTable('main', '_mv_dup_v2')).to.equal(undefined);
+		expect(db.schemaManager.getMaintainedTable('main', 'dup_v2')).to.equal(undefined);
+		expect(db.schemaManager.getTable('main', 'dup_v2')).to.equal(undefined);
 	});
 
 	it('a coarsened body the inverse-projection arm declines is maintained by the floor (LWW)', async () => {
@@ -187,7 +187,7 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		// fits — the full-rebuild floor maintains the coarsened body, and its
 		// collation-keyed replace-all diff realizes the same LWW merge.
 		await db.exec('create materialized view m as select h collate nocase as h, e from t where e in (select e from allowed)');
-		expect(db.schemaManager.getMaterializedView('main', 'm')!.coarsenedKey).to.deep.equal({
+		expect(db.schemaManager.getMaintainedTable('main', 'm')!.derivation.coarsenedKey).to.deep.equal({
 			columns: ['h'],
 			weakened: [{ column: 'h', sourceCollation: 'BINARY', outputCollation: 'NOCASE' }],
 		});
@@ -203,12 +203,12 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		await db.exec('create materialized view m as select h collate nocase as h, v from src');
 		// Same derivation on refresh → the data-only fast path (backing identity kept).
 		await db.exec('refresh materialized view m');
-		const mv = db.schemaManager.getMaterializedView('main', 'm')!;
-		expect(mv.coarsenedKey).to.deep.equal({
+		const mv = db.schemaManager.getMaintainedTable('main', 'm')!;
+		expect(mv.derivation.coarsenedKey).to.deep.equal({
 			columns: ['h'],
 			weakened: [{ column: 'h', sourceCollation: 'BINARY', outputCollation: 'NOCASE' }],
 		});
-		const backing = db.schemaManager.getTable('main', '_mv_m')!;
+		const backing = db.schemaManager.getTable('main', 'm')!;
 		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase()).to.equal('NOCASE');
 	});
 });
@@ -223,7 +223,7 @@ describe('coverage prover — collation gate', () => {
 				() => db.getPlan(bodySql).getRelations()[0],
 			) as RelationalPlanNode;
 			const table = db.schemaManager.getTable('main', 't')!;
-			const mvStub = { selectAst: parseSelect(bodySql) } as unknown as MaterializedViewSchema;
+			const mvStub = { name: 'ix', schemaName: 'main', derivation: { selectAst: parseSelect(bodySql) } } as unknown as MaintainedTableSchema;
 
 			// Sanity: matching collations cover.
 			expect(proveCoverage(root, mvStub, table.uniqueConstraints![0], table).covers).to.be.true;

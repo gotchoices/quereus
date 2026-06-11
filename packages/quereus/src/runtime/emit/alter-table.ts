@@ -22,6 +22,7 @@ import {
 	propagateColumnRenameToMaterializedViews,
 	restoreUnaffectedMaterializedViews,
 } from './materialized-view-helpers.js';
+import { isMaintainedTable } from '../../schema/derivation.js';
 
 const log = createLogger('runtime:emit:alter-table');
 
@@ -58,6 +59,19 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 
 		const schemaManager = rctx.db.schemaManager;
 		const schema = schemaManager.getSchemaOrFail(tableSchema.schemaName);
+
+		// A maintained table's shape is DEFINED by its derivation body — structural
+		// ALTERs would desynchronize (and, mechanically, drop the derivation when the
+		// module returns a fresh schema). Rename and tag actions remain allowed:
+		// rename is an ordinary table rename (re-keyed below) and tags are
+		// catalog-only metadata.
+		if (isMaintainedTable(tableSchema)
+			&& action.type !== 'renameTable' && action.type !== 'setTags' && action.type !== 'dropTags') {
+			throw new QuereusError(
+				`cannot ALTER '${tableSchema.name}': it is a materialized view — its shape is defined by the view body (drop and recreate to change it)`,
+				StatusCode.ERROR,
+			);
+		}
 
 		switch (action.type) {
 			case 'renameTable':
@@ -189,6 +203,28 @@ async function runRenameTable(
 	// Best-effort AST rewrite — there is no global dependency tracker yet, so we
 	// walk the catalog and patch in-place.
 	await propagateTableRename(rctx, tableSchema.schemaName, oldName, newName, preStaleMvs);
+
+	// Renaming a MAINTAINED table is an ordinary table rename plus a maintenance
+	// re-key: the row-time plan is keyed by `schema.name`, so release the old key
+	// and re-register under the new one, then move the persisted MV catalog entry
+	// (`materialized_view_removed` old name → `materialized_view_added` new name).
+	if (isMaintainedTable(updatedTableSchema)) {
+		rctx.db.unregisterMaterializedView(tableSchema.schemaName, oldName);
+		rctx.db.registerMaterializedView(updatedTableSchema);
+		const notifier = rctx.db.schemaManager.getChangeNotifier();
+		notifier.notifyChange({
+			type: 'materialized_view_removed',
+			schemaName: tableSchema.schemaName,
+			objectName: oldName,
+			oldObject: tableSchema,
+		});
+		notifier.notifyChange({
+			type: 'materialized_view_added',
+			schemaName: tableSchema.schemaName,
+			objectName: newName,
+			newObject: updatedTableSchema,
+		});
+	}
 
 	log('Renamed table %s.%s to %s', tableSchema.schemaName, oldName, newName);
 	return null;

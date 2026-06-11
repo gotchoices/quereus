@@ -5,7 +5,7 @@
  * the store analogue of `quereus/test/mv-backing-module.spec.ts` (the `mem2`
  * suite this matrix mirrors).
  *
- * Covers: round-trip + catalog persistence of the `_mv_` table bundle,
+ * Covers: round-trip + catalog persistence of the backing table bundle,
  * row-time maintenance, mid-transaction visibility, rollback/commit lockstep,
  * savepoints, covering-UNIQUE enforcement through a store backing, MV-over-MV
  * cascade in every memory/store direction, refresh (data-only, in-transaction
@@ -26,7 +26,8 @@ import {
 	type KVStoreProvider,
 } from '../src/index.js';
 
-const BACKING = '_mv_mv';
+// Unified model: the MV's backing IS the table registered under the MV's own name.
+const BACKING = 'mv';
 
 interface TestProvider extends KVStoreProvider {
 	stores: Map<string, InMemoryKVStore>;
@@ -103,7 +104,7 @@ describe('materialized views `using store` (end-to-end)', () => {
 		return (await catalog.get(key)) !== undefined;
 	}
 
-	it('create round-trips: the backing lives in the store module and the catalog holds the _mv_ table bundle', async () => {
+	it('create round-trips: the backing lives in the store module and the catalog holds the table bundle', async () => {
 		await db.exec('create table src (id integer primary key, v integer) using store');
 		await db.exec('insert into src values (1, 10), (2, 20)');
 		await db.exec('create materialized view mv using store as select id, v from src');
@@ -119,14 +120,14 @@ describe('materialized views `using store` (end-to-end)', () => {
 
 		// The lazy first-access saveTableDDL fired during the create-fill
 		// (replaceContents opens the data store), so the catalog already holds the
-		// `_mv_mv` TABLE bundle — the adopt ticket's phase-1 rehydrate precondition.
-		expect(await catalogHas(buildCatalogKey('main', BACKING)), '_mv_ table bundle persisted').to.equal(true);
+		// `mv` TABLE bundle — the adopt ticket's phase-1 rehydrate precondition.
+		expect(await catalogHas(buildCatalogKey('main', BACKING)), 'table bundle persisted').to.equal(true);
 		// The MV's own catalog entry rides the async persist queue.
 		await storeModule.whenCatalogPersisted();
 		expect(await catalogHas(buildMaterializedViewCatalogKey('main', 'mv')), 'MV catalog entry persisted').to.equal(true);
 
-		const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-		expect(mv.backingModuleName).to.equal('store');
+		const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+		expect(mv.vtabModuleName).to.equal('store');
 	});
 
 	it('row-time maintenance keeps the store backing consistent through insert/update/delete', async () => {
@@ -371,7 +372,7 @@ describe('materialized views `using store` (end-to-end)', () => {
 			const backing = db.schemaManager.getTable('main', BACKING)!;
 			expect(backing.vtabModuleName, 'rebuilt backing module').to.equal('store');
 			expect(storeModule.getTable('main', BACKING), 'rebuilt backing in StoreModule map').to.not.be.undefined;
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.backingModuleName).to.equal('store');
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.vtabModuleName).to.equal('store');
 			expect(await rows(db, 'select id, v, w from mv')).to.deep.equal([{ id: 1, v: 10, w: 7 }]);
 
 			// Maintenance is live against the rebuilt incarnation.
@@ -392,11 +393,11 @@ describe('materialized views `using store` (end-to-end)', () => {
 		await db.exec('drop materialized view mv');
 		await storeModule.whenCatalogPersisted();
 
-		expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
 		expect(db.schemaManager.getTable('main', BACKING)).to.be.undefined;
 		expect(storeModule.getTable('main', BACKING), 'StoreModule map evicted').to.be.undefined;
 		expect(provider.stores.has(`main.${BACKING}`), 'physical backing store deleted').to.equal(false);
-		expect(await catalogHas(buildCatalogKey('main', BACKING)), '_mv_ table bundle removed').to.equal(false);
+		expect(await catalogHas(buildCatalogKey('main', BACKING)), 'table bundle removed').to.equal(false);
 		expect(await catalogHas(buildMaterializedViewCatalogKey('main', 'mv')), 'MV catalog entry removed').to.equal(false);
 	});
 
@@ -425,7 +426,7 @@ describe('materialized views `using store` (end-to-end)', () => {
 				() => db.exec('create materialized view mv using store as select name from src'),
 				/must be a set/i,
 			);
-			expect(db.schemaManager.getMaterializedView('main', 'mv')).to.be.undefined;
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')).to.be.undefined;
 			expect(db.schemaManager.getTable('main', BACKING), 'half-built backing rolled back').to.be.undefined;
 		});
 	});

@@ -63,10 +63,10 @@ describe('Statement.getChangeScope (integration)', () => {
 		expect(r.values).to.deep.equal([[99]]);
 	});
 
-	it('a materialized-view reference reports the SOURCE table, not the backing table', async () => {
-		// Every MV is row-time maintained: its backing table is written off the user
-		// change log (synchronously at the DML boundary) and never appears in it — so
-		// a watch on it would never fire. change-scope projects the reference onto the
+	it('a materialized-view reference reports the SOURCE table, not the MV itself', async () => {
+		// Every MV is row-time maintained: its table is written off the user change
+		// log (synchronously at the DML boundary) and never appears in it — so a
+		// watch on it would never fire. change-scope projects the reference onto the
 		// source instead.
 		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 		await db.exec("INSERT INTO src VALUES (1, 'a')");
@@ -75,8 +75,8 @@ describe('Statement.getChangeScope (integration)', () => {
 		const scope = db.prepare('select * from mvi').getChangeScope();
 		const tables = scope.watches.map(w => `${w.table.schema}.${w.table.table}`);
 		expect(tables).to.deep.equal(['main.src']);
-		// The backing table is NOT reported — nothing user-writes it.
-		expect(tables).to.not.include('main._mv_mvi');
+		// The MV's own table is NOT reported — nothing user-writes it.
+		expect(tables).to.not.include('main.mvi');
 	});
 
 	it('a query reading both an MV and its source reports the source once', async () => {
@@ -117,8 +117,8 @@ describe('Statement.getChangeScope (integration)', () => {
 
 	it('a read through a view reports the BASE table in its change scope (not the view)', async () => {
 		// View bodies inline to base table references, so change-scope reports the
-		// base (not the view) for free — the same property that makes an MV
-		// reference report its backing table.
+		// base (not the view) for free — the analogue of an MV reference projecting
+		// to its sources.
 		await db.exec('CREATE TABLE base (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 		await db.exec('CREATE VIEW vw AS SELECT id, v FROM base WHERE v IS NOT NULL');
 
@@ -291,7 +291,7 @@ describe('Database.watch (integration)', () => {
 
 	it('end-to-end: a watch on an MV fires on a SOURCE mutation', async () => {
 		// The MV reference projects to its source, so the watch is registered on
-		// `src` — a source mutation fires it (the backing table is never directly
+		// `src` — a source mutation fires it (the MV's table is never directly
 		// user-written; watching it would never fire).
 		await db.exec('CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING memory');
 		await db.exec("INSERT INTO src VALUES (1, 'a')");

@@ -21,6 +21,7 @@ import { buildParentSideFKChecks } from './foreign-key-builder.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { buildViewMutation } from './view-mutation-builder.js';
+import { maintainedTableViewLike } from '../../schema/derivation.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 
@@ -63,8 +64,11 @@ export function buildDeleteStmt(
   // base table and re-plan. An MV is a single-source projection-and-filter, so the
   // same rewrite routes write-through to its source `T`; the row-time maintenance
   // hook then syncs the backing. See docs/materialized-views.md § Write boundary.
+  // Dispatch order is load-bearing: a maintained table (derivation-bearing)
+  // must hit the view-mutation rewrite, never the direct table write.
+  const deleteMaintained = ctx.schemaManager.getMaintainedTable(stmt.table.schema ?? null, stmt.table.name);
   const deleteView = ctx.schemaManager.getView(stmt.table.schema ?? null, stmt.table.name)
-    ?? ctx.schemaManager.getMaterializedView(stmt.table.schema ?? null, stmt.table.name);
+    ?? (deleteMaintained ? maintainedTableViewLike(deleteMaintained) : undefined);
   if (deleteView) {
     // Route through the view-mutation substrate (single-source = one base op).
     return buildViewMutation(contextWithSchemaPath, deleteView, { op: 'delete', stmt });

@@ -3,9 +3,10 @@
  *
  * The reopen matrix for the durable-backing adopt fast path: under a clean
  * shutdown (attested by the single-use `\x00meta\x00clean_shutdown` catalog
- * marker), a store-hosted `_mv_` backing that phase 1 already rehydrated is
- * trusted as-is — the MV registers without re-running its body. Any failed
- * gate falls back to the always-correct drop+refill.
+ * marker), a store-hosted maintained table whose backing phase 1 already
+ * rehydrated (as a plain table under the MV's own name) is trusted as-is —
+ * the MV registers without re-running its body. Any failed gate falls back
+ * to the always-correct drop+refill.
  *
  * **Sentinel-divergence probe.** Each scenario plants a sentinel row directly
  * into the backing's physical KV store between sessions — content the body
@@ -130,7 +131,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 	it('adopts a store backing after a clean shutdown: the sentinel survives and serves', async () => {
 		await seedSession();
 		expect(await markerPresent(), 'closeAll wrote the marker').to.equal(true);
-		await plantSentinel('main._mv_mv', [99, 990]);
+		await plantSentinel('main.mv', [99, 990]);
 
 		const { db, result } = await reopen();
 		expect(result.errors, 'marker + tables + view + MV rehydrate cleanly').to.have.lengthOf(0);
@@ -147,15 +148,15 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		expect(await rows(db, 'select id, v from mv order by id'))
 			.to.deep.equal([{ id: 2, v: 20 }, { id: 3, v: 30 }, { id: 99, v: 990 }]);
 
-		const mv = db.schemaManager.getMaterializedView('main', 'mv')!;
-		expect(mv.backingModuleName).to.equal('store');
-		expect(mv.stale ?? false).to.equal(false);
-		expect(db.schemaManager.getTable('main', '_mv_mv')!.vtabModuleName).to.equal('store');
+		const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+		expect(mv.vtabModuleName).to.equal('store');
+		expect(mv.derivation.stale ?? false).to.equal(false);
+		expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName).to.equal('store');
 	});
 
 	it('the marker is single-use: a second rehydrate without an intervening close refills', async () => {
 		await seedSession();
-		await plantSentinel('main._mv_mv', [99, 990]);
+		await plantSentinel('main.mv', [99, 990]);
 
 		// First reopen consumes the marker and adopts (sentinel preserved).
 		const r1 = await reopen();
@@ -171,7 +172,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 
 		// A clean close re-arms the fast path for the next open.
 		await r2.mod.closeAll();
-		await plantSentinel('main._mv_mv', [98, 980]);
+		await plantSentinel('main.mv', [98, 980]);
 		const r3 = await reopen();
 		expect(r3.result.errors).to.have.lengthOf(0);
 		expect(await rows(r3.db, 'select id from mv where id = 98'), 'adopts again after clean close')
@@ -186,7 +187,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		// Flush the MV catalog entry WITHOUT the clean close (no marker written).
 		await mod.whenCatalogPersisted();
 		expect(await markerPresent(), 'no marker without closeAll').to.equal(false);
-		await plantSentinel('main._mv_mv', [99, 990]);
+		await plantSentinel('main.mv', [99, 990]);
 
 		const { db: db2, result } = await reopen();
 		expect(result.errors).to.have.lengthOf(0);
@@ -208,7 +209,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		expect(s2.result.errors).to.have.lengthOf(0);
 		await s2.db.exec('alter table src add column w integer default 7');
 		await s2.mod.closeAll();
-		await plantSentinel('main._mv_mv', [99, 990]);
+		await plantSentinel('main.mv', [99, 990]);
 
 		const { db: db3, result } = await reopen();
 		expect(result.errors).to.have.lengthOf(0);
@@ -230,7 +231,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		expect(s2.result.errors).to.have.lengthOf(0);
 		await s2.db.exec('alter table src add column w integer default 7');
 		await s2.mod.closeAll();
-		await plantSentinel('main._mv_mv', [99, 990]);
+		await plantSentinel('main.mv', [99, 990]);
 
 		// The `alter table src` marked mv stale, so closeAll's marker names it —
 		// which would force the *refill* path (drop-then-rebuild, covered by the
@@ -244,11 +245,11 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		const { db: db3, result } = await reopen();
 		expect(result.errors, 'one per-entry error').to.have.lengthOf(1);
 		expect(result.errors[0].error.message).to.match(/2 declared columns but body produces 3/i);
-		expect(db3.schemaManager.getMaterializedView('main', 'mv'), 'no MV record').to.be.undefined;
+		expect(db3.schemaManager.getMaintainedTable('main', 'mv'), 'no MV record').to.be.undefined;
 		// The durable backing was NOT dropped first (the refill arm would have
 		// destroyed the rows before raising the same error): it stays a plain table.
-		expect(db3.schemaManager.getTable('main', '_mv_mv'), 'backing still registered').to.not.be.undefined;
-		expect(await provider.stores.get('main._mv_mv')!.get(buildDataKey([99])), 'sentinel row preserved').to.not.be.undefined;
+		expect(db3.schemaManager.getTable('main', 'mv'), 'backing still registered').to.not.be.undefined;
+		expect(await provider.stores.get('main.mv')!.get(buildDataKey([99])), 'sentinel row preserved').to.not.be.undefined;
 	});
 
 	it('a memory source fails the same-module gate: refill every reopen', async () => {
@@ -259,7 +260,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		await db.exec('insert into memsrc values (1, 10)');
 		await db.exec('create materialized view mv using store as select id, v from memsrc');
 		await mod.closeAll();
-		await plantSentinel('main._mv_mv', [99, 990]);
+		await plantSentinel('main.mv', [99, 990]);
 
 		// The memory source does not persist — recreate it (fresh content) BEFORE
 		// rehydrating, so the body plans; the cross-module gate still forces refill
@@ -278,15 +279,16 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			const { db, mod } = open();
 			await db.exec('create table src (id integer primary key, v integer) using store');
 			await db.exec('insert into src values (1, 10), (2, 20)');
-			// `amv` reads `zmv` but sorts FIRST by catalog key order, so round 1
-			// cannot plan it (zmv not yet registered) — the adopt must survive the
-			// failed round (backing NOT dropped) and compose via the adopt ledger
-			// in round 2.
+			// `amv` reads `zmv` but sorts FIRST by catalog key order. zmv's plain
+			// table pre-exists from phase 1, so amv's body PLANS — the ordering gate
+			// defers it (zmv's own MV entry is still pending) — and the adopt must
+			// survive the deferred round (backing NOT dropped) and compose via the
+			// adopt ledger in round 2.
 			await db.exec('create materialized view zmv using store as select id, v from src');
 			await db.exec('create materialized view amv using store as select id, v from zmv');
 			await mod.closeAll();
-			await plantSentinel('main._mv_zmv', [98, 980]);
-			await plantSentinel('main._mv_amv', [99, 990]);
+			await plantSentinel('main.zmv', [98, 980]);
+			await plantSentinel('main.amv', [99, 990]);
 
 			const { db: db2, result } = await reopen();
 			expect(result.errors).to.have.lengthOf(0);
@@ -313,8 +315,8 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			expect(s2.result.errors).to.have.lengthOf(0);
 			await s2.db.exec('alter table src add column w integer default 7');
 			await s2.mod.closeAll();
-			await plantSentinel('main._mv_zmv', [98, 980]);
-			await plantSentinel('main._mv_amv', [99, 990]);
+			await plantSentinel('main.zmv', [98, 980]);
+			await plantSentinel('main.amv', [99, 990]);
 
 			const { db: db3, result } = await reopen();
 			expect(result.errors).to.have.lengthOf(0);
@@ -331,7 +333,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('create materialized view mv1 as select id, v from src');
 			await db.exec('create materialized view mv2 using store as select id, v from mv1');
 			await mod.closeAll();
-			await plantSentinel('main._mv_mv2', [99, 990]);
+			await plantSentinel('main.mv2', [99, 990]);
 
 			const { db: db2, result } = await reopen();
 			expect(result.errors).to.have.lengthOf(0);
@@ -352,16 +354,16 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			buildMaterializedViewCatalogKey('main', 'mv'),
 			new TextEncoder().encode('create materialized view main.mv using store as select id, v from src where random() is not null'),
 		);
-		await plantSentinel('main._mv_mv', [99, 990]);
+		await plantSentinel('main.mv', [99, 990]);
 
 		const { db, result } = await reopen();
 		expect(result.errors, 'one per-entry error').to.have.lengthOf(1);
 		expect(result.errors[0].error.message).to.match(/non-deterministic/i);
-		expect(db.schemaManager.getMaterializedView('main', 'mv'), 'no MV record').to.be.undefined;
+		expect(db.schemaManager.getMaintainedTable('main', 'mv'), 'no MV record').to.be.undefined;
 		// The durable backing was NOT dropped: it reverts to a plain table and the
 		// rows (sentinel included) survive for a later retry to adopt.
-		expect(db.schemaManager.getTable('main', '_mv_mv'), 'backing still registered').to.not.be.undefined;
-		const backingStore = provider.stores.get('main._mv_mv')!;
+		expect(db.schemaManager.getTable('main', 'mv'), 'backing still registered').to.not.be.undefined;
+		const backingStore = provider.stores.get('main.mv')!;
 		expect(await backingStore.get(buildDataKey([99])), 'sentinel row preserved').to.not.be.undefined;
 	});
 
@@ -411,13 +413,13 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			// `create index` fires `table_modified` on src ⇒ mv goes stale and its
 			// row-time maintenance detaches. Pin the trigger.
 			await db.exec('create index i on src(v)');
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale, 'create index marked the MV stale')
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale, 'create index marked the MV stale')
 				.to.equal(true);
 			// NOT propagated to the backing (maintenance detached) — the divergence.
 			await db.exec('insert into src values (3, 30)');
 			await mod.closeAll();
 			expect(await markerValue(), 'marker names the stale MV').to.equal('["main.mv"]');
-			await plantSentinel('main._mv_mv', [99, 990]);
+			await plantSentinel('main.mv', [99, 990]);
 
 			const { db: db2, result } = await reopen();
 			expect(result.errors, 'rehydrate clean').to.have.lengthOf(0);
@@ -425,7 +427,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			// behind-backing are scrubbed. A stale adopt would have served [1,2,99].
 			expect(await rows(db2, 'select id, v from mv order by id'), 'refilled to current source content')
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
-			expect(db2.schemaManager.getMaterializedView('main', 'mv')!.stale ?? false, 'refill cleared staleness')
+			expect(db2.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale ?? false, 'refill cleared staleness')
 				.to.equal(false);
 			// Re-armed, not merely flag-cleared: a post-reopen source write now reaches
 			// the refilled backing (the very maintenance that was detached at close).
@@ -440,16 +442,16 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('insert into src values (1, 10), (2, 20)');
 			await db.exec('create materialized view mv using store as select id, v from src');
 			await db.exec('create index i on src(v)');
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale).to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
 			// refresh re-materializes and re-arms maintenance, clearing `stale`.
 			await db.exec('refresh materialized view mv');
-			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale ?? false, 'refresh cleared staleness')
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale ?? false, 'refresh cleared staleness')
 				.to.equal(false);
 			// Post-refresh DML now propagates to the backing again.
 			await db.exec('insert into src values (3, 30)');
 			await mod.closeAll();
 			expect(await markerValue(), 'nothing stale at close').to.equal('[]');
-			await plantSentinel('main._mv_mv', [99, 990]);
+			await plantSentinel('main.mv', [99, 990]);
 
 			const { db: db2, result } = await reopen();
 			expect(result.errors).to.have.lengthOf(0);
@@ -468,12 +470,12 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('create materialized view bmv using store as select id, v from b');
 			// Only `a` is altered ⇒ only amv goes stale; bmv stays live.
 			await db.exec('create index ia on a(v)');
-			expect(db.schemaManager.getMaterializedView('main', 'amv')!.stale, 'amv stale').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'bmv')!.stale ?? false, 'bmv live').to.equal(false);
+			expect(db.schemaManager.getMaintainedTable('main', 'amv')!.derivation.stale, 'amv stale').to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'bmv')!.derivation.stale ?? false, 'bmv live').to.equal(false);
 			await mod.closeAll();
 			expect(await markerValue(), 'marker names only the stale MV').to.equal('["main.amv"]');
-			await plantSentinel('main._mv_amv', [99, 990]);
-			await plantSentinel('main._mv_bmv', [98, 980]);
+			await plantSentinel('main.amv', [99, 990]);
+			await plantSentinel('main.bmv', [98, 980]);
 
 			const { db: db2, result } = await reopen();
 			expect(result.errors).to.have.lengthOf(0);
@@ -490,15 +492,15 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('create materialized view mv1 using store as select id, v from src');
 			await db.exec('create materialized view mv2 using store as select id, v from mv1');
 			// Index on mv1's source marks mv1 stale; the backing-invalidation cascade
-			// (synthetic `table_modified` on `_mv_mv1`) marks mv2 stale too.
+			// (synthetic `table_modified` on `mv1`) marks mv2 stale too.
 			await db.exec('create index i on src(v)');
-			expect(db.schemaManager.getMaterializedView('main', 'mv1')!.stale, 'mv1 stale').to.equal(true);
-			expect(db.schemaManager.getMaterializedView('main', 'mv2')!.stale, 'mv2 stale (cascade)').to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv1')!.derivation.stale, 'mv1 stale').to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv2')!.derivation.stale, 'mv2 stale (cascade)').to.equal(true);
 			await mod.closeAll();
 			expect(JSON.parse((await markerValue())!), 'both MVs in the stale set')
 				.to.have.members(['main.mv1', 'main.mv2']);
-			await plantSentinel('main._mv_mv1', [98, 980]);
-			await plantSentinel('main._mv_mv2', [99, 990]);
+			await plantSentinel('main.mv1', [98, 980]);
+			await plantSentinel('main.mv2', [99, 990]);
 
 			const { db: db2, result } = await reopen();
 			expect(result.errors).to.have.lengthOf(0);
@@ -512,7 +514,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		it('a close with no subscribed db writes an empty stale set (next session adopts)', async () => {
 			// Session 1: seed + clean close.
 			await seedSession();
-			await plantSentinel('main._mv_mv', [99, 990]);
+			await plantSentinel('main.mv', [99, 990]);
 
 			// Session 2: a module that never rehydrates and never touches a store table.
 			// Its closeAll has no `subscribedDb` ⇒ writes an empty stale set, re-arming
@@ -534,7 +536,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			// parses to a number, not a string array ⇒ conservative parse ⇒ refill all.
 			const catalog = await provider.getCatalogStore();
 			await catalog.put(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME), new TextEncoder().encode('1'));
-			await plantSentinel('main._mv_mv', [99, 990]);
+			await plantSentinel('main.mv', [99, 990]);
 
 			const { db: db2, result } = await reopen();
 			expect(result.errors).to.have.lengthOf(0);
@@ -562,7 +564,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		it('without options, a pre-existing backing refills even when every other gate passes', async () => {
 			await seedSession();
 			expect(await markerPresent(), 'marker present but irrelevant to the engine').to.equal(true);
-			await plantSentinel('main._mv_mv', [99, 990]);
+			await plantSentinel('main.mv', [99, 990]);
 
 			const db = await manualImport(/* no options */);
 			expect(await rows(db, 'select id, v from mv order by id'), 'default is the always-correct refill')
@@ -571,7 +573,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 
 		it('with trustBackings, the engine adopts (gate check without the store wrapper)', async () => {
 			await seedSession();
-			await plantSentinel('main._mv_mv', [99, 990]);
+			await plantSentinel('main.mv', [99, 990]);
 
 			const db = await manualImport({ trustBackings: true, adoptedBackings: new Set() });
 			expect(await rows(db, 'select id from mv where id = 99')).to.deep.equal([{ id: 99 }]);
@@ -580,9 +582,9 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		it('trustBackings does not bypass the other-module CONSTRAINT arm', async () => {
 			const { db } = open();
 			await db.exec('create table src (id integer primary key, v integer) using store');
-			// A MEMORY table squatting on the reserved backing name: not ours to
-			// adopt OR drop, trust notwithstanding.
-			await db.exec('create table _mv_mv (id integer primary key, v integer)');
+			// A MEMORY table squatting on the MV's own name: not ours to adopt OR
+			// drop, trust notwithstanding.
+			await db.exec('create table mv (id integer primary key, v integer)');
 			let message = '';
 			try {
 				await db.schemaManager.importCatalog(
@@ -593,7 +595,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 				message = (e as Error).message;
 			}
 			expect(message).to.match(/already exists in module 'memory', not the MV's backing module 'store'/i);
-			expect(db.schemaManager.getTable('main', '_mv_mv')!.vtabModuleName, 'squatter untouched').to.equal('memory');
+			expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName, 'squatter untouched').to.equal('memory');
 		});
 	});
 });

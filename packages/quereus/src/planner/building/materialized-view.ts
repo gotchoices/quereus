@@ -6,7 +6,7 @@ import {
 	DropMaterializedViewNode,
 } from '../nodes/materialized-view-nodes.js';
 import { planViewBody } from './create-view.js';
-import { astToString, createMaterializedViewToString } from '../../emit/ast-stringify.js';
+import { astToString } from '../../emit/ast-stringify.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { normalizeBackingModule } from '../../schema/view.js';
@@ -63,13 +63,8 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 	// Row-time eligibility (the body must be a passthrough projection of a single
 	// keyed source) is checked entirely at runtime in the create emitter, against
 	// the optimized/analyzed body — there is no build-time AST rejection to do here.
-	// The stored DDL is canonicalized over the NORMALIZED module identity so an
-	// explicit `using memory()` round-trips identically to an omitted clause.
-	const sql = createMaterializedViewToString({
-		...stmt,
-		moduleName: backing.storedModuleName,
-		moduleArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
-	});
+	// The canonical DDL renders on demand from the unified record (normalized
+	// module identity included), so the node carries only the body SQL.
 	const bodySql = astToString(stmt.select);
 
 	return new CreateMaterializedViewNode(
@@ -80,7 +75,6 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 		stmt.columns,
 		stmt.select,
 		bodySql,
-		sql,
 		stmt.insertDefaults,
 		stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
 		backing.storedModuleName,
