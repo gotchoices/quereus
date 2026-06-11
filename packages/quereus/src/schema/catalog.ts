@@ -7,7 +7,7 @@ import type { IntegrityAssertionSchema } from './assertion.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, quoteIdentifier, expressionToString, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { generateTableDDL, generateIndexDDL, generateMaterializedViewDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
+import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
 
 /**
  * Represents a catalog snapshot of the current database schema state
@@ -313,7 +313,7 @@ function materializedViewSchemaToCatalog(table: MaintainedTableSchema): CatalogM
 	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
 	return {
 		name: table.name,
-		ddl: generateMaterializedViewDDL(table),
+		ddl: generateMaintainedTableDDL(table),
 		bodyHash: table.derivation.bodyHash,
 		backingModuleName: backing.storedModuleName,
 		backingModuleArgs: backing.storedModuleArgs,

@@ -2564,6 +2564,12 @@ export class Parser {
             }
 		}
 
+		// Optional `maintained as <body> [insert defaults (…)]` clause — the declared-shape
+		// maintained-table form. `maintained` is contextual (an IDENTIFIER lexeme match), and
+		// this position (after the column list / USING clause, before the WITH clauses) is
+		// unambiguous, so no look-ahead guard is needed.
+		const maintained = this.parseMaintainedClause();
+
 		// Parse trailing WITH clauses (CONTEXT, TAGS) in any order
 		let contextDefinitions: AST.MutationContextVar[] | undefined;
 		let tags: Record<string, SqlValue> | undefined;
@@ -2595,8 +2601,24 @@ export class Parser {
 			moduleArgs,
 			contextDefinitions,
 			tags,
+			maintained,
 			loc: _createLoc(startToken, this.previous()),
 		};
+	}
+
+	/**
+	 * Parse the optional `maintained as <query-expr> [insert defaults (col = expr, …)]`
+	 * clause of a CREATE TABLE (or a `declare schema` table item) — the declared-shape
+	 * maintained-table form. Returns undefined when the clause is absent.
+	 */
+	private parseMaintainedClause(): AST.MaintainedClause | undefined {
+		if (!this.matchKeyword('MAINTAINED')) return undefined;
+		this.consumeKeyword('AS', "Expected 'AS' after MAINTAINED.");
+		// Body is any QueryExpr — bare SELECT / VALUES / WITH … SELECT all qualify.
+		// DML bodies parse here but the planner rejects them.
+		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
+		const insertDefaults = this.parseInsertDefaultsClause();
+		return { select, insertDefaults };
 	}
 
 	/**
@@ -3108,6 +3130,11 @@ export class Parser {
 				// still parse as DROP COLUMN.
 				this.consumeKeyword('TAGS', "Expected 'TAGS'.");
 				action = { type: 'dropTags', target: { kind: 'table' }, keys: this.parseTagKeys() };
+			} else if (this.peekKeyword('MAINTAINED')) {
+				// DROP MAINTAINED — detach the table's derivation. The verb wins over a
+				// column literally named `maintained`; use DROP COLUMN maintained for that.
+				this.consumeKeyword('MAINTAINED', "Expected 'MAINTAINED'.");
+				action = { type: 'dropMaintained' };
 			} else if (this.matchKeyword('CONSTRAINT')) {
 				// DROP CONSTRAINT <name> — drop a named table-level constraint
 				// (CHECK / UNIQUE / FOREIGN KEY).
@@ -3119,11 +3146,20 @@ export class Parser {
 				action = { type: 'dropColumn', name };
 			}
 		} else if (this.peekKeyword('SET')) {
-			// Table-level `SET TAGS (...)` — whole-set tag replacement on the table.
 			this.consumeKeyword('SET', "Expected SET.");
-			this.consumeKeyword('TAGS', "Expected 'TAGS' after SET.");
-			const tags = this.parseTags();
-			action = { type: 'setTags', target: { kind: 'table' }, mode: 'replace', tags };
+			if (this.matchKeyword('MAINTAINED')) {
+				// SET MAINTAINED AS <body> [INSERT DEFAULTS (...)] — attach / re-attach a
+				// derivation. No `using` clause: the module is the table's identity.
+				this.consumeKeyword('AS', "Expected 'AS' after SET MAINTAINED.");
+				const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
+				const insertDefaults = this.parseInsertDefaultsClause();
+				action = { type: 'setMaintained', select, insertDefaults };
+			} else {
+				// Table-level `SET TAGS (...)` — whole-set tag replacement on the table.
+				this.consumeKeyword('TAGS', "Expected 'TAGS' or 'MAINTAINED' after SET.");
+				const tags = this.parseTags();
+				action = { type: 'setTags', target: { kind: 'table' }, mode: 'replace', tags };
+			}
 		} else if (this.peekKeyword('ALTER')) {
 			this.consumeKeyword('ALTER', "Expected ALTER.");
 			if (this.peekKeyword('COLUMN')) {
@@ -3560,6 +3596,11 @@ export class Parser {
 			this.consume(TokenType.RPAREN, "Expected ')' after table definition.");
 		}
 
+		// Optional `maintained as <body> [insert defaults (…)]` — the declared-shape
+		// maintained-table form, carried through the CreateTableStmt reuse. (Differ
+		// transition handling is a follow-up; the clause parses and round-trips.)
+		const maintained = this.parseMaintainedClause();
+
 		// Parse trailing WITH clauses (CONTEXT, TAGS) in any order
 		let contextDefinitions: AST.MutationContextVar[] | undefined;
 		let tags: Record<string, SqlValue> | undefined;
@@ -3590,7 +3631,8 @@ export class Parser {
 			moduleName,
 			moduleArgs,
 			contextDefinitions,
-			tags
+			tags,
+			maintained
 		};
 
 		return { type: 'declaredTable', tableStmt };

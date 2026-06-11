@@ -26,7 +26,7 @@ import { normalizeBackingModule } from './view.js';
 import type { MaintainedTableSchema } from './derivation.js';
 import type { SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, createMaterializedViewToString, alterIndexToString } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, tableConstraintsToString, createViewToString, maintainedClauseToString, alterIndexToString } from '../emit/ast-stringify.js';
 import { normalizeCollationName } from '../util/comparison.js';
 
 /**
@@ -50,7 +50,58 @@ function quoteName(name: string): string {
 /** Generate canonical DDL for a table from its schema. */
 export function generateTableDDL(tableSchema: TableSchema, db?: Database): string {
 	const ctx = resolveEmitContext(db);
+	// USING clause: emit when vtabModuleName differs from the session default,
+	// or always when no db context is provided.
+	return generateTableDDLInternal(tableSchema, ctx, formatUsingClause(tableSchema, ctx), null);
+}
 
+/**
+ * Generate canonical DDL for a **maintained table** (a `TableSchema` carrying a
+ * {@link import('./derivation.js').TableDerivation}) — the table form:
+ *
+ *   `create table <schema>.<name> (<declared shape>) [using <module>(args)]
+ *    maintained as <body> [insert defaults (…)] [with tags (…)]`
+ *
+ * This is the one canonical comparison/persistence surface for every maintained
+ * table regardless of authoring form (`create table … maintained as` or the
+ * `create materialized view` sugar). The declared column list is the live
+ * backing shape (the frozen basis), so a re-import verifies the body still
+ * derives exactly that shape. The `using` clause is re-derived from the table's
+ * own `vtabModuleName`/`vtabArgs` through `normalizeBackingModule`, so the
+ * memory default stays clause-free while a non-default host module round-trips.
+ * Current `tags` are read live, so a tag-only swap round-trips. Always emitted
+ * fully-qualified / fully-annotated (no session elision) — safe to persist and
+ * re-parse in any session.
+ */
+export function generateMaintainedTableDDL(table: MaintainedTableSchema): string {
+	const ctx = resolveEmitContext(undefined);
+	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
+	let usingClause: string | null = null;
+	if (backing.storedModuleName) {
+		usingClause = `USING ${quoteIdentifier(backing.storedModuleName)}`;
+		const args = backing.storedModuleArgs ?? {};
+		if (Object.keys(args).length > 0) usingClause += ` (${formatVtabArgs(args)})`;
+	}
+	const maintained = maintainedClauseToString({
+		select: table.derivation.selectAst,
+		insertDefaults: table.derivation.insertDefaults,
+	});
+	return generateTableDDLInternal(table, ctx, usingClause, maintained);
+}
+
+/**
+ * Shared CREATE TABLE body emitter. `usingClause` is pre-resolved by the caller
+ * (session-elided for {@link generateTableDDL}, backing-normalized for
+ * {@link generateMaintainedTableDDL}); `maintainedClause` is the rendered
+ * `maintained as …` clause or null. Clause order matches the parser grammar:
+ * `(columns) → using → maintained as … [insert defaults] → with tags`.
+ */
+function generateTableDDLInternal(
+	tableSchema: TableSchema,
+	ctx: EmitContext,
+	usingClause: string | null,
+	maintainedClause: string | null,
+): string {
 	const parts: string[] = ['CREATE'];
 	parts.push('TABLE', qualifiedName(tableSchema.schemaName, tableSchema.name, ctx.currentSchemaName));
 
@@ -67,12 +118,15 @@ export function generateTableDDL(tableSchema: TableSchema, db?: Database): strin
 
 	// Table-level PRIMARY KEY: empty () for singleton, (a, b, ...) for composite.
 	// Single-column PK is emitted inline on the column above. A synthesized
-	// all-columns key emits no clause at all (neither here nor inline).
+	// all-columns key emits no clause at all (neither here nor inline). Per-column
+	// DESC is emitted so a descending key component (e.g. an ordering-seeded
+	// maintained-table backing key) survives the round-trip instead of silently
+	// re-keying ascending on re-parse.
 	if (tableSchema.primaryKeyDefinition.length === 0) {
 		columnDefs.push('PRIMARY KEY ()');
 	} else if (!synthesizedKey && tableSchema.primaryKeyDefinition.length > 1) {
 		const pkCols = tableSchema.primaryKeyDefinition
-			.map(pk => quoteName(tableSchema.columns[pk.index].name))
+			.map(pk => quoteName(tableSchema.columns[pk.index].name) + (pk.desc ? ' DESC' : ''))
 			.join(', ');
 		columnDefs.push(`PRIMARY KEY (${pkCols})`);
 	}
@@ -90,10 +144,9 @@ export function generateTableDDL(tableSchema: TableSchema, db?: Database): strin
 
 	parts.push(`(${columnDefs.join(', ')})`);
 
-	// USING clause: emit when vtabModuleName differs from the session default,
-	// or always when no db context is provided.
-	const usingClause = formatUsingClause(tableSchema, ctx);
 	if (usingClause) parts.push(usingClause);
+
+	if (maintainedClause) parts.push(maintainedClause);
 
 	// Table-level WITH TAGS
 	if (hasTags(tableSchema.tags)) {
@@ -167,34 +220,6 @@ export function generateViewDDL(view: ViewSchema): string {
 		tags: view.tags ? { ...view.tags } : undefined,
 	};
 	return createViewToString(stmt);
-}
-
-/**
- * Generate canonical `create materialized view` DDL for a maintained table
- * (a `TableSchema` carrying a {@link import('./derivation.js').TableDerivation}).
- *
- * Mirrors {@link generateViewDDL} via `createMaterializedViewToString`, reading
- * **current** `tags` so a `materialized_view_modified` (SET TAGS) round-trips.
- * The `using <module>(...)` clause is re-derived from the table's own
- * `vtabModuleName`/`vtabArgs` through `normalizeBackingModule`, so the memory
- * default stays clause-free and canonical while a non-default host module
- * round-trips.
- */
-export function generateMaterializedViewDDL(table: MaintainedTableSchema): string {
-	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
-	const d = table.derivation;
-	const stmt: AST.CreateMaterializedViewStmt = {
-		type: 'createMaterializedView',
-		view: { type: 'identifier', name: table.name, schema: table.schemaName },
-		ifNotExists: false,
-		columns: d.columns ? [...d.columns] : undefined,
-		select: d.selectAst,
-		moduleName: backing.storedModuleName,
-		moduleArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
-		insertDefaults: d.insertDefaults,
-		tags: table.tags ? { ...table.tags } : undefined,
-	};
-	return createMaterializedViewToString(stmt);
 }
 
 /**
@@ -434,8 +459,10 @@ function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNot
 
 	// Inline column-level PK only for a genuine single-column declared PK. A
 	// synthesized single-column key (a one-column no-PK table) emits no PK clause.
+	// DESC is emitted so a descending key survives the round-trip (the re-parse
+	// would otherwise silently re-key ascending).
 	if (col.primaryKey && tableSchema.primaryKeyDefinition.length === 1 && !synthesizedKey) {
-		colDef += ' PRIMARY KEY';
+		colDef += tableSchema.primaryKeyDefinition[0].desc ? ' PRIMARY KEY DESC' : ' PRIMARY KEY';
 	}
 
 	if (col.defaultValue !== null && col.defaultValue !== undefined) {

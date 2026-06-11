@@ -58,7 +58,7 @@ import {
 	classifyCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
-import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaterializedViewDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
+import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
 
 /**
  * Result of catalog rehydration.
@@ -2123,7 +2123,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Persist a materialized view's catalog entry (DDL via `generateMaterializedViewDDL`
+	 * Persist a materialized view's catalog entry (DDL via `generateMaintainedTableDDL`
 	 * over the maintained table — the unified record), keyed by its reserved MV
 	 * prefix. Compare-write (skip identical) — see
 	 * {@link persistObjectCatalogEntryIfChanged}.
@@ -2131,7 +2131,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	async saveMaterializedViewDDL(mv: MaintainedTableSchema): Promise<void> {
 		await this.persistObjectCatalogEntryIfChanged(
 			buildMaterializedViewCatalogKey(mv.schemaName, mv.name),
-			generateMaterializedViewDDL(mv),
+			generateMaintainedTableDDL(mv),
 		);
 	}
 

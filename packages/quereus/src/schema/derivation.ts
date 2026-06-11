@@ -14,7 +14,7 @@ import type { TableSchema } from './table.js';
  * Identity (name/schema), storage (module/args), tags, and the physical primary
  * key all live on the owning `TableSchema`; the canonical
  * `create materialized view` DDL is rendered on demand from the unified record
- * (`generateMaterializedViewDDL`). The derivation object is shared by reference
+ * (`generateMaintainedTableDDL`). The derivation object is shared by reference
  * across catalog swaps of the owning table (tag updates, index appends), so its
  * runtime state (`stale`, `sourceScope`) survives those swaps.
  */

@@ -1226,6 +1226,14 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 			}
 			return `alter table ${table} drop tags ${body}`;
 		}
+		case 'setMaintained': {
+			const parts = [`alter table ${table} set maintained as`, astToString(stmt.action.select)];
+			const defaultsStr = insertDefaultsClauseToString(stmt.action.insertDefaults);
+			if (defaultsStr) parts.push(defaultsStr);
+			return parts.join(' ');
+		}
+		case 'dropMaintained':
+			return `alter table ${table} drop maintained`;
 	}
 }
 
@@ -1774,11 +1782,24 @@ export function createTableToString(stmt: AST.CreateTableStmt): string {
 	const using = moduleClauseToString(stmt);
 	if (using) parts.push(using);
 
+	const maintained = maintainedClauseToString(stmt.maintained);
+	if (maintained) parts.push(maintained);
+
 	const ctx = contextClauseToString(stmt);
 	if (ctx) parts.push(ctx);
 
 	const tagStr = tagsClauseToString(stmt.tags);
 	if (tagStr) parts.push(tagStr.trimStart());
 
+	return parts.join(' ');
+}
+
+/** `maintained as <body> [insert defaults (…)]` clause of a CREATE TABLE, or '' when absent.
+ *  Clause order matches the parser grammar: using → maintained as … → insert defaults → with tags. */
+export function maintainedClauseToString(maintained: AST.MaintainedClause | undefined): string {
+	if (!maintained) return '';
+	const parts = ['maintained as', astToString(maintained.select)];
+	const defaultsStr = insertDefaultsClauseToString(maintained.insertDefaults);
+	if (defaultsStr) parts.push(defaultsStr);
 	return parts.join(' ');
 }

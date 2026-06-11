@@ -10,7 +10,7 @@ import { isWindowFunction } from "../../schema/window-function.js";
 import { Schema } from "../../schema/schema.js";
 import { exposedImplicitIndexes, type SyntheticExposedIndex } from "../../schema/catalog.js";
 import { isMaintainedTable } from "../../schema/derivation.js";
-import { generateMaterializedViewDDL } from "../../schema/ddl-generator.js";
+import { generateMaintainedTableDDL } from "../../schema/ddl-generator.js";
 import { INTEGER_TYPE, TEXT_TYPE } from "../../types/builtin-types.js";
 import { ColumnSchema } from "../../schema/column.js";
 import { FunctionFlags } from "../../common/constants.js";
@@ -127,7 +127,7 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 						if (isMaintainedTable(tableSchema)) {
 							// A maintained table (materialized view) lists exactly ONCE,
 							// as itself, with its canonical create-materialized-view DDL.
-							createSql = generateMaterializedViewDDL(tableSchema);
+							createSql = generateMaintainedTableDDL(tableSchema);
 						} else {
 							const columnsStr = tableSchema.columns.map((c: ColumnSchema) => `"${c.name}" ${c.logicalType.name}`).join(', ');
 							const argsStr = Object.entries(tableSchema.vtabArgs ?? {}).map(([key, value]) => `${key}=${value}`).join(', ');

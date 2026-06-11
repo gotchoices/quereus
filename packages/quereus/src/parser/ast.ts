@@ -296,6 +296,21 @@ export type QueryExpr =
 	| UpdateStmt
 	| DeleteStmt;
 
+/**
+ * The `maintained as <body> [insert defaults (col = expr, …)]` clause of a
+ * CREATE TABLE — declares the table as a **maintained table** (the canonical
+ * table form of a materialized view): the declared column/PK shape is the
+ * frozen basis and the body must derive exactly that shape. Clause order:
+ * `(columns) → using → maintained as … → insert defaults → with tags`.
+ * `maintained` is contextual (no new reserved word).
+ */
+export interface MaintainedClause {
+	/** Derivation body — any relation-producing QueryExpr. */
+	select: QueryExpr;
+	/** Trailing `insert defaults (col = expr, …)` — omitted-insert defaults for write-through. */
+	insertDefaults?: ReadonlyArray<ViewInsertDefault>;
+}
+
 // CREATE TABLE statement
 export interface CreateTableStmt extends AstNode {
 	type: 'createTable';
@@ -307,6 +322,8 @@ export interface CreateTableStmt extends AstNode {
 	moduleArgs?: Record<string, SqlValue>; // Optional module arguments from USING clause
 	contextDefinitions?: MutationContextVar[]; // Optional mutation context variables
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
+	/** Optional `maintained as <body>` clause — declares a maintained table (declared-shape form). */
+	maintained?: MaintainedClause;
 }
 
 // CREATE INDEX statement
@@ -684,6 +701,27 @@ export type AlterTableAction =
 			| { kind: 'column'; columnName: string }
 			| { kind: 'constraint'; constraintName: string },
 		keys: string[] // empty list = no-op
+	}
+	| {
+		/**
+		 * ALTER TABLE … SET MAINTAINED AS <body> [INSERT DEFAULTS (…)] — attach
+		 * (or, on an already-maintained table, atomically replace) a derivation.
+		 * The body must derive the table's exact shape; attach reconciles the
+		 * table's current contents against the derived contents by keyed diff
+		 * (derived content wins). There is deliberately no `using` clause — the
+		 * module is the table's identity and never changes via attach.
+		 */
+		type: 'setMaintained',
+		select: QueryExpr,
+		insertDefaults?: ReadonlyArray<ViewInsertDefault>
+	}
+	| {
+		/**
+		 * ALTER TABLE … DROP MAINTAINED — detach the derivation. Nothing physical
+		 * changes: the table keeps its rows, row-time maintenance stops, and the
+		 * table becomes an ordinary user-writable table.
+		 */
+		type: 'dropMaintained'
 	};
 
 // Add PragmaStmt interface
