@@ -14,7 +14,7 @@ import type { ConstantBinding, DomainConstraint, FunctionalDependency, GuardClau
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
-import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison } from './predicate-shape.js';
+import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison, walkAstNodes } from './predicate-shape.js';
 import { isValueDiscriminatingAstComparison, type DeclaredColumnInfo } from './comparison-collation.js';
 
 export interface CheckExtraction {
@@ -499,27 +499,12 @@ export function containsNonDeterministicCall(
 	expr: AST.Expression,
 	isDeterministic: (fnName: string, argc: number) => boolean,
 ): boolean {
-	const stack: AST.AstNode[] = [expr as AST.AstNode];
-	while (stack.length > 0) {
-		const node = stack.pop()!;
+	for (const node of walkAstNodes(expr)) {
 		if (node.type === 'subquery' || node.type === 'exists') return true;
 		if (node.type === 'function') {
 			const fn = node as AST.FunctionExpr;
 			const argc = fn.args?.length ?? 0;
 			if (!isDeterministic(fn.name, argc)) return true;
-		}
-		for (const key of Object.keys(node)) {
-			const v = (node as unknown as Record<string, unknown>)[key];
-			if (!v) continue;
-			if (Array.isArray(v)) {
-				for (const item of v) {
-					if (item && typeof item === 'object' && 'type' in item) {
-						stack.push(item as AST.AstNode);
-					}
-				}
-			} else if (typeof v === 'object' && 'type' in (v as object)) {
-				stack.push(v as AST.AstNode);
-			}
 		}
 	}
 	return false;

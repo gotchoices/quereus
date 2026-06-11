@@ -103,20 +103,17 @@ export function flattenDisjunction(expr: AST.Expression): AST.Expression[] {
 }
 
 /**
- * Collect the collation name of every COLLATE node anywhere in `expr`'s
- * subtree, as written (uninterpreted — no normalization). Empty array when the
- * subtree contains none. Used by the schema-level value-discrimination gate
- * (`comparison-collation.ts`) to detect non-BINARY wrappers inside compound
- * comparison operands.
+ * Depth-first iteration over every AST node in `expr`'s subtree. Children are
+ * discovered reflectively (any object/array property carrying a `type` field)
+ * rather than via a typed visitor table, so soundness-sensitive walkers (the
+ * collation gate, the non-determinism screen) cannot silently miss node kinds
+ * a visitor enumeration forgot.
  */
-export function collectCollateNames(expr: AST.Expression): string[] {
-	const out: string[] = [];
+export function* walkAstNodes(expr: AST.Expression): IterableIterator<AST.AstNode> {
 	const stack: AST.AstNode[] = [expr as AST.AstNode];
 	while (stack.length > 0) {
 		const node = stack.pop()!;
-		if (node.type === 'collate') {
-			out.push((node as AST.CollateExpr).collation);
-		}
+		yield node;
 		for (const key of Object.keys(node)) {
 			const v = (node as unknown as Record<string, unknown>)[key];
 			if (!v) continue;
@@ -129,6 +126,22 @@ export function collectCollateNames(expr: AST.Expression): string[] {
 			} else if (typeof v === 'object' && 'type' in (v as object)) {
 				stack.push(v as AST.AstNode);
 			}
+		}
+	}
+}
+
+/**
+ * Collect the collation name of every COLLATE node anywhere in `expr`'s
+ * subtree, as written (uninterpreted — no normalization). Empty array when the
+ * subtree contains none. Used by the schema-level value-discrimination gate
+ * (`comparison-collation.ts`) to detect non-BINARY wrappers inside compound
+ * comparison operands.
+ */
+export function collectCollateNames(expr: AST.Expression): string[] {
+	const out: string[] = [];
+	for (const node of walkAstNodes(expr)) {
+		if (node.type === 'collate') {
+			out.push((node as AST.CollateExpr).collation);
 		}
 	}
 	return out;
@@ -146,26 +159,11 @@ export function collectColumnNames(
 	columnIndexMap: ReadonlyMap<string, number>,
 ): Set<number> {
 	const out = new Set<number>();
-	const stack: AST.AstNode[] = [expr as AST.AstNode];
-	while (stack.length > 0) {
-		const node = stack.pop()!;
+	for (const node of walkAstNodes(expr)) {
 		const idx = node.type === 'column' || node.type === 'identifier'
 			? columnIndexFromExpr(node as AST.Expression, columnIndexMap)
 			: undefined;
 		if (idx !== undefined) out.add(idx);
-		for (const key of Object.keys(node)) {
-			const v = (node as unknown as Record<string, unknown>)[key];
-			if (!v) continue;
-			if (Array.isArray(v)) {
-				for (const item of v) {
-					if (item && typeof item === 'object' && 'type' in item) {
-						stack.push(item as AST.AstNode);
-					}
-				}
-			} else if (typeof v === 'object' && 'type' in (v as object)) {
-				stack.push(v as AST.AstNode);
-			}
-		}
 	}
 	return out;
 }
