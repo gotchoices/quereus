@@ -118,8 +118,11 @@ function tryPushDown(child: RelationalPlanNode, predicate: ScalarPlanNode, scope
 			log('Pushing predicate below Project (eligible)');
 			const under = child.source;
 			const newUnder = new FilterNode(under.scope, under, predicate);
-			// Rebuild Project with same projections over the filtered source
-			return new ProjectNode(child.scope, newUnder, child.projections, undefined, undefined, child.preserveInputColumns);
+			// Rebuild Project with same projections over the filtered source,
+			// preserving the original attribute IDs — a computed projection would
+			// otherwise be assigned a fresh attribute ID, stranding upstream
+			// column references that still point at the old one.
+			return new ProjectNode(child.scope, newUnder, child.projections, undefined, child.getAttributes(), child.preserveInputColumns);
 		}
 		return null;
 	}
