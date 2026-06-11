@@ -547,6 +547,10 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		// `inds` in this wave, so we leave it undefined rather than carry it
 		// through AsyncGather. Revisit when a consumer lands.
 		const childColCounts = this.children.map(c => c.getType().columns.length);
+		// NOTE: `hasSingletonFd` is pure closure coverage and can over-claim ≤1-row
+		// from 'determination' constant pins on a bag (phase-2 ticket
+		// fd-determination-reader-side-rule, bug 1). Its kind-aware rewrite there
+		// makes this probe — and therefore the keep-'unique' decision — sound.
 		const childIsSingleton = childrenPhysical.map((phys, i) =>
 			hasSingletonFd(phys.fds, childColCounts[i]));
 		const kindAdjustedFds = (idx: number): ReadonlyArray<FunctionalDependency> => {

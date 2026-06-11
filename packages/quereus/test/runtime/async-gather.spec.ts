@@ -303,6 +303,33 @@ describe('AsyncGather', () => {
 			expect(bFd!.kind, "b downgrades (a fans it out)").to.equal('determination');
 		});
 
+		it("crossProduct requires EVERY other child to be ≤1-row, not just one (3 children)", () => {
+			// a's siblings are b (singleton) and c (not provably ≤1-row): one
+			// singleton sibling is not enough — c still fans a out, so a's 'unique'
+			// claim must downgrade. Pins the `.every` quantifier in the fold (a
+			// 2-child fixture cannot distinguish every-other from some-other).
+			const a = new MockRelationalNode(
+				[makeAttr('a0'), makeAttr('a1')],
+				[],
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] },
+			);
+			const b = new MockRelationalNode(
+				[makeAttr('b0')],
+				[],
+				{ deterministic: true, readonly: true, fds: [{ determinants: [], dependents: [0], kind: 'unique' }] },
+			);
+			const c = new MockRelationalNode(
+				[makeAttr('c0')],
+				[],
+				{ deterministic: true, readonly: true },
+			);
+			const node = new AsyncGatherNode(mockScope, [a, b, c], { kind: 'crossProduct' }, 4);
+			const fds = node.physical.fds!;
+			for (const fd of fds) {
+				expect(fd.kind, `FD over [${fd.determinants}]→[${fd.dependents}] must downgrade`).to.equal('determination');
+			}
+		});
+
 		it('withChildren arity-checks against original length', () => {
 			const a = new MockRelationalNode([makeAttr('c0')]);
 			const b = new MockRelationalNode([makeAttr('c0')]);
