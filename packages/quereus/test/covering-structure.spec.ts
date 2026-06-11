@@ -1114,7 +1114,7 @@ describe('coverage prover — effective-key (stub unit)', () => {
 	}
 
 	it('out-of-frame guard fires for indices below 0 or ≥ columnCount', () => {
-		const root = makeRoot({ columnCount: 2, fds: [{ determinants: [0], dependents: [1] }] });
+		const root = makeRoot({ columnCount: 2, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] });
 		expect(proveEffectiveKeyUnique(root, [2])).to.deep.equal({ proved: false, reason: 'out-of-frame' });
 		expect(proveEffectiveKeyUnique(root, [-1])).to.deep.equal({ proved: false, reason: 'out-of-frame' });
 		// A mix where one index is out of frame still reports out-of-frame.
@@ -1122,14 +1122,14 @@ describe('coverage prover — effective-key (stub unit)', () => {
 	});
 
 	it('delegates to isUnique: FD-derived key proves, non-key does not', () => {
-		const root = makeRoot({ columnCount: 2, fds: [{ determinants: [0], dependents: [1] }] });
+		const root = makeRoot({ columnCount: 2, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] });
 		expect(proveEffectiveKeyUnique(root, [0])).to.deep.equal({ proved: true });
 		expect(proveEffectiveKeyUnique(root, [1])).to.deep.equal({ proved: false, reason: 'not-a-key' });
 	});
 
 	it('empty key columns: proved only when the relation is ≤1 row', () => {
 		// ∅ → all_cols ⇒ the empty key holds ⇒ [] is unique.
-		const oneRow = makeRoot({ columnCount: 2, fds: [{ determinants: [], dependents: [0, 1] }] });
+		const oneRow = makeRoot({ columnCount: 2, fds: [{ determinants: [], dependents: [0, 1], kind: 'unique' }] });
 		expect(proveEffectiveKeyUnique(oneRow, [])).to.deep.equal({ proved: true });
 		// A bag with no ≤1-row guarantee: [] is not a key.
 		const bag = makeRoot({ columnCount: 2 });

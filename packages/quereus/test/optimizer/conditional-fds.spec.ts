@@ -674,7 +674,7 @@ describe('extractCheckConstraints (implication form)', () => {
 
 describe('fd-utils: guarded FD helpers', () => {
 	const guard: GuardPredicate = { clauses: [{ kind: 'eq-literal', column: 0, value: 'x' }] };
-	const fd: FunctionalDependency = { determinants: [1], dependents: [2], guard };
+	const fd: FunctionalDependency = { determinants: [1], dependents: [2], guard, kind: 'unique' };
 
 	it('shiftFds shifts guard columns alongside determinants/dependents', () => {
 		const shifted = shiftFds([fd], 10);
@@ -712,7 +712,7 @@ describe('fd-utils: guarded FD helpers', () => {
 	});
 
 	it('addFd keeps two same-det FDs side-by-side when only one is guarded', () => {
-		const unguarded: FunctionalDependency = { determinants: [1], dependents: [2] };
+		const unguarded: FunctionalDependency = { determinants: [1], dependents: [2], kind: 'determination' };
 		const after = addFd([unguarded], fd);
 		expect(after).to.have.length(2);
 	});
@@ -745,8 +745,8 @@ describe('fd-utils: guarded FD helpers', () => {
 				],
 			}],
 		};
-		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a };
-		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b };
+		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a, kind: 'unique' };
+		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b, kind: 'unique' };
 		const after = addFd([fdA], fdB);
 		expect(after).to.have.length(1);
 	});
@@ -770,8 +770,8 @@ describe('fd-utils: guarded FD helpers', () => {
 				],
 			}],
 		};
-		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a };
-		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b };
+		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a, kind: 'unique' };
+		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b, kind: 'unique' };
 		const after = addFd([fdA], fdB);
 		expect(after).to.have.length(2);
 	});
@@ -786,7 +786,7 @@ describe('fd-utils: guarded FD helpers', () => {
 				],
 			}],
 		};
-		const fdOr: FunctionalDependency = { determinants: [1], dependents: [2], guard: orGuard };
+		const fdOr: FunctionalDependency = { determinants: [1], dependents: [2], guard: orGuard, kind: 'unique' };
 		// Mapping omits column 5 (a nested sub-clause column).
 		const mapping = new Map<number, number>([[0, 50], [1, 100], [2, 200]]);
 		const out = projectFds([fdOr], mapping);
@@ -803,7 +803,7 @@ describe('fd-utils: guarded FD helpers', () => {
 				],
 			}],
 		};
-		const fdOr: FunctionalDependency = { determinants: [1], dependents: [2], guard: orGuard };
+		const fdOr: FunctionalDependency = { determinants: [1], dependents: [2], guard: orGuard, kind: 'unique' };
 		const mapping = new Map<number, number>([[0, 50], [1, 100], [2, 200], [5, 500]]);
 		const out = projectFds([fdOr], mapping);
 		expect(out).to.have.length(1);
@@ -824,7 +824,7 @@ describe('fd-utils: guarded FD helpers', () => {
 				],
 			}],
 		};
-		const fdOr: FunctionalDependency = { determinants: [2], dependents: [3], guard: orGuard };
+		const fdOr: FunctionalDependency = { determinants: [2], dependents: [3], guard: orGuard, kind: 'unique' };
 		const out = shiftFds([fdOr], 10);
 		expect(out[0].determinants).to.deep.equal([12]);
 		const c = out[0].guard!.clauses[0];
@@ -844,7 +844,7 @@ describe('fd-utils: guarded FD helpers', () => {
 		const rangeGuard: GuardPredicate = {
 			clauses: [{ kind: 'range', column: 0, min: 18, minInclusive: true, maxInclusive: false }],
 		};
-		const fdRange: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard };
+		const fdRange: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard, kind: 'unique' };
 		const out = shiftFds([fdRange], 10);
 		const c = out[0].guard!.clauses[0];
 		expect(c.kind).to.equal('range');
@@ -858,7 +858,7 @@ describe('fd-utils: guarded FD helpers', () => {
 		const rangeGuard: GuardPredicate = {
 			clauses: [{ kind: 'range', column: 0, min: 18, minInclusive: true, maxInclusive: false }],
 		};
-		const fdRange: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard };
+		const fdRange: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard, kind: 'unique' };
 		const mapping = new Map<number, number>([[1, 100], [2, 200]]);
 		expect(projectFds([fdRange], mapping)).to.have.length(0);
 	});
@@ -867,7 +867,7 @@ describe('fd-utils: guarded FD helpers', () => {
 		const rangeGuard: GuardPredicate = {
 			clauses: [{ kind: 'range', column: 0, min: 18, minInclusive: true, maxInclusive: false }],
 		};
-		const fdRange: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard };
+		const fdRange: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard, kind: 'unique' };
 		const mapping = new Map<number, number>([[0, 50], [1, 100], [2, 200]]);
 		const out = projectFds([fdRange], mapping);
 		expect(out).to.have.length(1);
@@ -881,11 +881,12 @@ describe('fd-utils: guarded FD helpers', () => {
 		const rangeGuard: GuardPredicate = {
 			clauses: [{ kind: 'range', column: 0, min: 18, minInclusive: true, maxInclusive: false }],
 		};
-		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard };
+		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: rangeGuard, kind: 'unique' };
 		const fdB: FunctionalDependency = {
 			determinants: [1],
 			dependents: [2],
 			guard: { clauses: [{ kind: 'range', column: 0, min: 18, minInclusive: true, maxInclusive: false }] },
+			kind: 'unique',
 		};
 		const after = addFd([fdA], fdB);
 		expect(after).to.have.length(1);
@@ -898,8 +899,8 @@ describe('fd-utils: guarded FD helpers', () => {
 		const b: GuardPredicate = {
 			clauses: [{ kind: 'range', column: 0, min: 21, minInclusive: true, maxInclusive: false }],
 		};
-		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a };
-		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b };
+		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a, kind: 'unique' };
+		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b, kind: 'unique' };
 		expect(addFd([fdA], fdB)).to.have.length(2);
 	});
 
@@ -910,8 +911,8 @@ describe('fd-utils: guarded FD helpers', () => {
 		const b: GuardPredicate = {
 			clauses: [{ kind: 'range', column: 0, min: 18, minInclusive: false, maxInclusive: false }],
 		};
-		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a };
-		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b };
+		const fdA: FunctionalDependency = { determinants: [1], dependents: [2], guard: a, kind: 'unique' };
+		const fdB: FunctionalDependency = { determinants: [1], dependents: [2], guard: b, kind: 'unique' };
 		expect(addFd([fdA], fdB)).to.have.length(2);
 	});
 });

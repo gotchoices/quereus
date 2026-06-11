@@ -129,7 +129,10 @@ export function extractPartialUniqueGuardedFds(
 		if (dep.length === 0) continue;
 
 		const guard: GuardPredicate = { clauses };
-		out.push({ determinants: det, dependents: dep, guard });
+		// 'unique' within the guard's scope: a partial UNIQUE index guarantees at
+		// most one row per determinant tuple among rows satisfying the predicate —
+		// precisely the guarded-'unique' semantics on FunctionalDependency.kind.
+		out.push({ determinants: det, dependents: dep, guard, kind: 'unique' });
 	}
 
 	return out;

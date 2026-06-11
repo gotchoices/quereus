@@ -15,6 +15,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import {
 	closeConstantBindingsOverEcs,
+	hasSingletonFd,
 	mergeConstantBindings,
 	mergeDomainConstraints,
 	mergeEquivClasses,
@@ -527,23 +528,44 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 			};
 		}
 
-		// crossProduct: fold pairwise — identical to N applications of
-		// JoinNode(cross). Each child's FDs hold on its slice of the output row;
-		// concatenation preserves them after shifting column indices.
+		// crossProduct: fold pairwise — column-layout-wise identical to N
+		// applications of JoinNode(cross). Each child's FDs hold on its slice of
+		// the output row; concatenation preserves them after shifting column
+		// indices. NOTE: unlike JoinNode(cross) this fold never applied
+		// `dropSideKeyFds` to non-preserved sides — a known gap, deliberately NOT
+		// closed in the kind-provenance phase (the downgrade below records the
+		// uniqueness loss on the FD itself; the reader-side kind rule makes the
+		// drop obsolete).
+		//
+		// Kind downgrade: a child's 'unique' FD stays 'unique' only when every
+		// OTHER child is provably ≤1-row (the child's rows are never duplicated);
+		// otherwise the cross product fans the child out and only the value claim
+		// ('determination') survives — guarded FDs included.
 		//
 		// INDs could shift+merge here exactly like FDs (a cross product preserves
 		// each child's per-row inclusion claims). Deferred — no consumer reads
 		// `inds` in this wave, so we leave it undefined rather than carry it
 		// through AsyncGather. Revisit when a consumer lands.
-		let fds: ReadonlyArray<FunctionalDependency> = childrenPhysical[0].fds ?? [];
+		const childColCounts = this.children.map(c => c.getType().columns.length);
+		const childIsSingleton = childrenPhysical.map((phys, i) =>
+			hasSingletonFd(phys.fds, childColCounts[i]));
+		const kindAdjustedFds = (idx: number): ReadonlyArray<FunctionalDependency> => {
+			const childFds = childrenPhysical[idx].fds ?? [];
+			const keepUnique = childIsSingleton.every((s, j) => j === idx || s);
+			return keepUnique
+				? childFds
+				: childFds.map(fd => (fd.kind === 'unique' ? { ...fd, kind: 'determination' as const } : fd));
+		};
+
+		let fds: ReadonlyArray<FunctionalDependency> = kindAdjustedFds(0);
 		let equiv: ReadonlyArray<ReadonlyArray<number>> = childrenPhysical[0].equivClasses ?? [];
 		let bindings: ReadonlyArray<ConstantBinding> = childrenPhysical[0].constantBindings ?? [];
 		let domains: ReadonlyArray<DomainConstraint> = childrenPhysical[0].domainConstraints ?? [];
-		let runningCols = this.children[0].getType().columns.length;
+		let runningCols = childColCounts[0];
 
 		for (let i = 1; i < this.children.length; i++) {
 			const rightPhys = childrenPhysical[i];
-			const rightFds = rightPhys.fds ?? [];
+			const rightFds = kindAdjustedFds(i);
 			const rightEC = rightPhys.equivClasses ?? [];
 			const rightBindings = rightPhys.constantBindings ?? [];
 			const rightDomains = rightPhys.domainConstraints ?? [];
@@ -557,7 +579,7 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 			bindings = closeConstantBindingsOverEcs(mergedBindings, equiv);
 			domains = mergeDomainConstraints(domains, shiftDomainConstraints(rightDomains, runningCols));
 
-			runningCols += this.children[i].getType().columns.length;
+			runningCols += childColCounts[i];
 		}
 
 		return {

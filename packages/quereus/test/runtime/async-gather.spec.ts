@@ -219,12 +219,12 @@ describe('AsyncGather', () => {
 			const a = new MockRelationalNode(
 				[makeAttr('c0')],
 				[[{ index: 0 }]],
-				{ deterministic: true, readonly: true, fds: [{ determinants: [], dependents: [0] }] },
+				{ deterministic: true, readonly: true, fds: [{ determinants: [], dependents: [0], kind: 'unique' }] },
 			);
 			const b = new MockRelationalNode(
 				[makeAttr('c0')],
 				[[{ index: 0 }]],
-				{ deterministic: true, readonly: true, fds: [{ determinants: [], dependents: [0] }] },
+				{ deterministic: true, readonly: true, fds: [{ determinants: [], dependents: [0], kind: 'unique' }] },
 			);
 			const node = new AsyncGatherNode(mockScope, [a, b], { kind: 'unionAll' }, 4);
 			const phys = node.physical;
@@ -239,12 +239,12 @@ describe('AsyncGather', () => {
 			const a = new MockRelationalNode(
 				[makeAttr('a0'), makeAttr('a1')],
 				[],
-				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1] }] },
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'determination' }] },
 			);
 			const b = new MockRelationalNode(
 				[makeAttr('b0'), makeAttr('b1')],
 				[],
-				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1] }] },
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'determination' }] },
 			);
 			const node = new AsyncGatherNode(mockScope, [a, b], { kind: 'crossProduct' }, 4);
 			const phys = node.physical;
@@ -255,6 +255,52 @@ describe('AsyncGather', () => {
 			const has23 = fds.some(f => f.determinants.length === 1 && f.determinants[0] === 2 && f.dependents.includes(3));
 			expect(has01).to.equal(true, 'left child FD must propagate');
 			expect(has23).to.equal(true, 'right child FD must propagate with shifted indices');
+		});
+
+		it("crossProduct downgrades a child's 'unique' FDs when another child fans it out", () => {
+			// Neither child is provably ≤1-row, so the product duplicates both
+			// children's rows — every 'unique' claim must downgrade to
+			// 'determination' (the value claim survives unchanged).
+			const a = new MockRelationalNode(
+				[makeAttr('a0'), makeAttr('a1')],
+				[],
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] },
+			);
+			const b = new MockRelationalNode(
+				[makeAttr('b0'), makeAttr('b1')],
+				[],
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] },
+			);
+			const node = new AsyncGatherNode(mockScope, [a, b], { kind: 'crossProduct' }, 4);
+			const fds = node.physical.fds!;
+			for (const fd of fds) {
+				expect(fd.kind).to.equal('determination');
+			}
+		});
+
+		it("crossProduct keeps a child's 'unique' FDs when every other child is ≤1-row", () => {
+			// Child b carries the singleton FD `∅ → all_cols` (provably ≤1 row), so
+			// child a's rows are never duplicated and a's 'unique' claim survives.
+			// The reverse does NOT hold: a is not a singleton, so b's rows ARE
+			// duplicated and b's own singleton claim must downgrade.
+			const a = new MockRelationalNode(
+				[makeAttr('a0'), makeAttr('a1')],
+				[],
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] },
+			);
+			const b = new MockRelationalNode(
+				[makeAttr('b0')],
+				[],
+				{ deterministic: true, readonly: true, fds: [{ determinants: [], dependents: [0], kind: 'unique' }] },
+			);
+			const node = new AsyncGatherNode(mockScope, [a, b], { kind: 'crossProduct' }, 4);
+			const fds = node.physical.fds!;
+			const aFd = fds.find(f => f.determinants.length === 1 && f.determinants[0] === 0);
+			const bFd = fds.find(f => f.determinants.length === 0);
+			expect(aFd, "a's FD propagates").to.not.equal(undefined);
+			expect(aFd!.kind, "a keeps 'unique' (b is ≤1-row)").to.equal('unique');
+			expect(bFd, "b's FD propagates").to.not.equal(undefined);
+			expect(bFd!.kind, "b downgrades (a fans it out)").to.equal('determination');
 		});
 
 		it('withChildren arity-checks against original length', () => {
@@ -422,12 +468,12 @@ describe('AsyncGather', () => {
 			const a = new MockRelationalNode(
 				[ka, makeAttr('a1')],
 				[[{ index: 0 }]],
-				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1] }] },
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] },
 			);
 			const b = new MockRelationalNode(
 				[kb, makeAttr('b1')],
 				[[{ index: 0 }]],
-				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1] }] },
+				{ deterministic: true, readonly: true, fds: [{ determinants: [0], dependents: [1], kind: 'unique' }] },
 			);
 			const node = new AsyncGatherNode(mockScope, [a, b],
 				{ kind: 'zipByKey', branchKeyAttrs: [[ka.id], [kb.id]], outputKeyAttrs: [PlanNode.nextAttrId()] }, 4);

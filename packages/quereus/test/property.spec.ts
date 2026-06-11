@@ -1946,7 +1946,7 @@ describe('Property-Based Tests', () => {
 			// Honest: empty key backed by the singleton `∅ → all_cols` FD.
 			const honest = {
 				getType: () => ({ columns: [{}, {}], keys: [[]] }),
-				physical: { fds: [{ determinants: [], dependents: [0, 1] }] },
+				physical: { fds: [{ determinants: [], dependents: [0, 1], kind: 'unique' }] },
 			} as unknown as RelationalPlanNode;
 			expect(() => checkIndependentSingletonChannels('honest', honest)).to.not.throw();
 

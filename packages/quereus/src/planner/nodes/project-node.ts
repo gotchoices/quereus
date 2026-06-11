@@ -306,8 +306,11 @@ export class ProjectNode extends PlanNode implements UnaryRelationalNode, Projec
 			const endpointIsKey = isSuperkey(new Set([bareOut]), projectedKeyFds, outputColCount)
 				|| isSuperkey(new Set([outIdx]), projectedKeyFds, outputColCount);
 			if (!endpointIsKey) continue;
-			fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx] }, { keyHints: projectedKeys });
-			fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut] }, { keyHints: projectedKeys });
+			// Injective-pair FDs are value bijections, not uniqueness claims —
+			// 'determination'. (Key-ness, when an endpoint is a key, is carried by
+			// the projected key FDs above; addFd's 'unique'-wins merge keeps it.)
+			fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx], kind: 'determination' }, { keyHints: projectedKeys });
+			fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut], kind: 'determination' }, { keyHints: projectedKeys });
 		}
 		const projectedEquiv: number[][] = [];
 		for (const cls of sourcePhysical?.equivClasses ?? []) {

@@ -199,6 +199,20 @@ function dropSideKeyFds(
 }
 
 /**
+ * Downgrade a fanned-out side's `'unique'` FDs to `'determination'`. A fanning
+ * join duplicates that side's rows, destroying determinant row-uniqueness
+ * while every value claim survives unchanged. Applies to guarded FDs too: a
+ * guarded partial-unique FD crossing a fanning join is no longer row-unique
+ * even within its guard's scope (the duplicated rows still satisfy the guard).
+ * Preserves object identity for FDs that are already determinations.
+ */
+function downgradeUniqueFds(
+	fds: ReadonlyArray<FunctionalDependency>,
+): ReadonlyArray<FunctionalDependency> {
+	return fds.map(fd => (fd.kind === 'unique' ? { ...fd, kind: 'determination' as const } : fd));
+}
+
+/**
  * Propagate functional dependencies and equivalence classes through a join.
  *
  * Rules:
@@ -210,7 +224,13 @@ function dropSideKeyFds(
  * - right outer: mirror of left outer.
  * - full outer: drop both sides' FDs/ECs (conservative).
  * - semi / anti: left's FDs/ECs survive; no right contribution and no equi-pair
- *   FDs (right columns are not in the output).
+ *   FDs (right columns are not in the output). Left rows pass ≤1:1, so kinds
+ *   are preserved verbatim.
+ * - Fan-out kind downgrade (inner/cross/left/right): a side that is NOT
+ *   preserved (no preserved key lies within it) is fanned out — its surviving
+ *   FDs, guarded ones included, are downgraded `'unique'` → `'determination'`
+ *   via `downgradeUniqueFds` so the kind invariant holds before any reader
+ *   trusts it.
  */
 export function propagateJoinFds(
 	joinType: JoinType,
@@ -277,8 +297,16 @@ export function propagateJoinFds(
 			const rightColumnCount = totalColumnCount - leftColumnCount;
 			const leftPreserved = preservedKeys.some(k => k.every(i => i < leftColumnCount));
 			const rightPreserved = preservedKeys.some(k => k.every(i => i >= leftColumnCount));
-			const keptLeftFds = leftPreserved ? leftFds : dropSideKeyFds(leftFds, leftColumnCount);
-			const keptRightFds = rightPreserved ? rightFds : dropSideKeyFds(rightFds, rightColumnCount);
+			// A non-preserved side is fanned out: drop its key FDs (legacy coverage
+			// readers) AND downgrade what survives to 'determination' — including
+			// guarded FDs, which dropSideKeyFds deliberately keeps but which are no
+			// longer row-unique either.
+			const keptLeftFds = leftPreserved
+				? leftFds
+				: downgradeUniqueFds(dropSideKeyFds(leftFds, leftColumnCount));
+			const keptRightFds = rightPreserved
+				? rightFds
+				: downgradeUniqueFds(dropSideKeyFds(rightFds, rightColumnCount));
 			let fds: ReadonlyArray<FunctionalDependency> = mergeFds(keptLeftFds, shiftFds(keptRightFds, leftColumnCount), opts);
 			let equiv: ReadonlyArray<ReadonlyArray<number>> = mergeEquivClasses(leftEC, shiftEquivClasses(rightEC, leftColumnCount));
 			// An equi-pair `{L}↔{R'}` is a value-equality determination, not inherently a
@@ -303,8 +331,10 @@ export function propagateJoinFds(
 				const endpointIsKey = isSuperkey(new Set([p.left]), equiKeyFds, totalColumnCount)
 					|| isSuperkey(new Set([rShifted]), equiKeyFds, totalColumnCount);
 				if (endpointIsKey) {
-					fds = addFd(fds, { determinants: [p.left], dependents: [rShifted] }, opts);
-					fds = addFd(fds, { determinants: [rShifted], dependents: [p.left] }, opts);
+					// Equi-pair FDs are value equalities — 'determination'; the
+					// uniqueness fact lives on the preserved-key FDs layered below.
+					fds = addFd(fds, { determinants: [p.left], dependents: [rShifted], kind: 'determination' }, opts);
+					fds = addFd(fds, { determinants: [rShifted], dependents: [p.left], kind: 'determination' }, opts);
 				}
 				equiv = addEquivalence(equiv, p.left, rShifted);
 			}
@@ -331,7 +361,11 @@ export function propagateJoinFds(
 			// inner/cross arm and ticket 4) so a downstream key-dropping projection cannot
 			// re-derive the left key as a spurious all-columns key (a bag read as a set).
 			const leftPreserved = preservedKeys.some(k => k.every(i => i < leftColumnCount));
-			const keptLeftFds = leftPreserved ? leftFds : dropSideKeyFds(leftFds, leftColumnCount);
+			// Fanned-out left side: drop key FDs and downgrade survivors (guarded
+			// included) — mirrors the inner/cross arm.
+			const keptLeftFds = leftPreserved
+				? leftFds
+				: downgradeUniqueFds(dropSideKeyFds(leftFds, leftColumnCount));
 			// Left's bindings survive on left's columns; right's are dropped (the
 			// NULL-padding from unmatched left rows breaks any right-side pin).
 			const fds = withKeyFds(keptLeftFds.slice());
@@ -344,7 +378,11 @@ export function propagateJoinFds(
 			// side, so a fanned right key cannot resurrect as an all-columns key.
 			const rightColumnCount = totalColumnCount - leftColumnCount;
 			const rightPreserved = preservedKeys.some(k => k.every(i => i >= leftColumnCount));
-			const keptRightFds = rightPreserved ? rightFds : dropSideKeyFds(rightFds, rightColumnCount);
+			// Fanned-out right side: drop key FDs and downgrade survivors (guarded
+			// included) — mirrors the inner/cross arm.
+			const keptRightFds = rightPreserved
+				? rightFds
+				: downgradeUniqueFds(dropSideKeyFds(rightFds, rightColumnCount));
 			let fds: ReadonlyArray<FunctionalDependency> = shiftFds(keptRightFds, leftColumnCount);
 			fds = withKeyFds(fds);
 			const equiv = shiftEquivClasses(rightEC, leftColumnCount);

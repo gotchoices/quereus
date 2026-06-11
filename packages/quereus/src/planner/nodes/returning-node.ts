@@ -257,8 +257,12 @@ export class ReturningNode extends PlanNode implements RelationalPlanNode {
     for (const [srcIdx, outIdx] of injectivePairs) {
       const bareOut = map.get(srcIdx);
       if (bareOut === undefined || bareOut === outIdx) continue;
-      fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx] }, { keyHints: projectedKeys });
-      fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut] }, { keyHints: projectedKeys });
+      // Injective-pair FDs are value bijections, not uniqueness claims —
+      // 'determination'. Note this site (unlike project-node) has no endpoint
+      // superkey gate; the 'determination' kind is what keeps that omission
+      // harmless once readers consult kind.
+      fds = addFd(fds, { determinants: [bareOut], dependents: [outIdx], kind: 'determination' }, { keyHints: projectedKeys });
+      fds = addFd(fds, { determinants: [outIdx], dependents: [bareOut], kind: 'determination' }, { keyHints: projectedKeys });
     }
     const projectedEquiv: number[][] = [];
     for (const cls of sourcePhysical?.equivClasses ?? []) {

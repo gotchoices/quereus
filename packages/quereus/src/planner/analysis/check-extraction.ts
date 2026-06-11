@@ -169,10 +169,12 @@ function handleEquality(
 	const lIdx = columnIndexFromExpr(left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(right, columnIndexMap);
 
+	// All CHECK-derived FDs are `kind: 'determination'` — a CHECK constrains
+	// values, never row counts, so it can never witness row-uniqueness.
 	if (lIdx !== undefined && rIdx !== undefined) {
 		if (lIdx === rIdx) return;
-		fds.push({ determinants: [lIdx], dependents: [rIdx] });
-		fds.push({ determinants: [rIdx], dependents: [lIdx] });
+		fds.push({ determinants: [lIdx], dependents: [rIdx], kind: 'determination' });
+		fds.push({ determinants: [rIdx], dependents: [lIdx], kind: 'determination' });
 		equivPairs.push([lIdx, rIdx]);
 		return;
 	}
@@ -180,7 +182,7 @@ function handleEquality(
 	if (lIdx !== undefined) {
 		const lit = literalValue(right);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [lIdx] });
+			fds.push({ determinants: [], dependents: [lIdx], kind: 'determination' });
 			constantBindings.push({ attrs: [lIdx], value: { kind: 'literal', value: lit } });
 			return;
 		}
@@ -188,7 +190,7 @@ function handleEquality(
 		if (cols.size === 1) {
 			const [singleCol] = cols;
 			if (singleCol !== lIdx) {
-				fds.push({ determinants: [singleCol], dependents: [lIdx] });
+				fds.push({ determinants: [singleCol], dependents: [lIdx], kind: 'determination' });
 			}
 		}
 		return;
@@ -197,7 +199,7 @@ function handleEquality(
 	if (rIdx !== undefined) {
 		const lit = literalValue(left);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [rIdx] });
+			fds.push({ determinants: [], dependents: [rIdx], kind: 'determination' });
 			constantBindings.push({ attrs: [rIdx], value: { kind: 'literal', value: lit } });
 			return;
 		}
@@ -205,7 +207,7 @@ function handleEquality(
 		if (cols.size === 1) {
 			const [singleCol] = cols;
 			if (singleCol !== rIdx) {
-				fds.push({ determinants: [singleCol], dependents: [rIdx] });
+				fds.push({ determinants: [singleCol], dependents: [rIdx], kind: 'determination' });
 			}
 		}
 	}
@@ -400,28 +402,31 @@ function recognizeGuardedBody(
 	const lIdx = columnIndexFromExpr(b.left, columnIndexMap);
 	const rIdx = columnIndexFromExpr(b.right, columnIndexMap);
 
+	// Guarded CHECK-derived FDs are `kind: 'determination'` like their
+	// unconditional twins — an implication-form CHECK still constrains values
+	// only, never row counts.
 	if (lIdx !== undefined && rIdx !== undefined) {
 		if (lIdx === rIdx) return;
 		// Tag the mirror pair as a genuine column value-equality so a downstream
 		// guard-activation (FilterNode) can soundly lift it as an EC — a one-way
 		// `col = expr` body (below) or an index-derived guarded mirror is NOT
 		// tagged and is never lifted (ticket fd-guarded-activation-key-bag-overclaim).
-		fds.push({ determinants: [lIdx], dependents: [rIdx], guard, valueEquality: true });
-		fds.push({ determinants: [rIdx], dependents: [lIdx], guard, valueEquality: true });
+		fds.push({ determinants: [lIdx], dependents: [rIdx], guard, valueEquality: true, kind: 'determination' });
+		fds.push({ determinants: [rIdx], dependents: [lIdx], guard, valueEquality: true, kind: 'determination' });
 		return;
 	}
 
 	if (lIdx !== undefined) {
 		const lit = literalValue(b.right);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [lIdx], guard });
+			fds.push({ determinants: [], dependents: [lIdx], guard, kind: 'determination' });
 			return;
 		}
 		const cols = collectColumnNames(b.right, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
 			if (singleCol !== lIdx) {
-				fds.push({ determinants: [singleCol], dependents: [lIdx], guard });
+				fds.push({ determinants: [singleCol], dependents: [lIdx], guard, kind: 'determination' });
 			}
 		}
 		return;
@@ -430,14 +435,14 @@ function recognizeGuardedBody(
 	if (rIdx !== undefined) {
 		const lit = literalValue(b.left);
 		if (lit !== undefined) {
-			fds.push({ determinants: [], dependents: [rIdx], guard });
+			fds.push({ determinants: [], dependents: [rIdx], guard, kind: 'determination' });
 			return;
 		}
 		const cols = collectColumnNames(b.left, columnIndexMap);
 		if (cols.size === 1) {
 			const [singleCol] = cols;
 			if (singleCol !== rIdx) {
-				fds.push({ determinants: [singleCol], dependents: [rIdx], guard });
+				fds.push({ determinants: [singleCol], dependents: [rIdx], guard, kind: 'determination' });
 			}
 		}
 	}

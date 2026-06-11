@@ -41,7 +41,8 @@
                                 ],
                                 "determinants": [
                                   0
-                                ]
+                                ],
+                                "kind": "unique"
                               }
                             ],
                             "idempotent": true,
@@ -124,7 +125,8 @@
                             ],
                             "determinants": [
                               0
-                            ]
+                            ],
+                            "kind": "unique"
                           }
                         ],
                         "idempotent": true,
@@ -201,7 +203,8 @@
                         ],
                         "determinants": [
                           0
-                        ]
+                        ],
+                        "kind": "unique"
                       }
                     ],
                     "idempotent": true,
@@ -291,7 +294,8 @@
                                 ],
                                 "determinants": [
                                   0
-                                ]
+                                ],
+                                "kind": "unique"
                               }
                             ],
                             "idempotent": true,
@@ -365,7 +369,8 @@
                             ],
                             "determinants": [
                               0
-                            ]
+                            ],
+                            "kind": "unique"
                           }
                         ],
                         "idempotent": true,
@@ -433,7 +438,8 @@
                         ],
                         "determinants": [
                           0
-                        ]
+                        ],
+                        "kind": "unique"
                       }
                     ],
                     "idempotent": true,
@@ -519,7 +525,8 @@
                     ],
                     "determinants": [
                       0
-                    ]
+                    ],
+                    "kind": "unique"
                   }
                 ],
                 "idempotent": true,
@@ -608,7 +615,8 @@
                 ],
                 "determinants": [
                   0
-                ]
+                ],
+                "kind": "unique"
               }
             ],
             "idempotent": true,

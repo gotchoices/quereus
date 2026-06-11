@@ -488,7 +488,7 @@ describe('Planner Framework', () => {
 			];
 			const node = relNode({
 				attributes: attrs,
-				physical: { fds: [{ determinants: [0, 1], dependents: [2] }] },
+				physical: { fds: [{ determinants: [0, 1], dependents: [2], kind: 'unique' }] },
 			});
 			expect(PlanNodeCharacteristics.hasUniqueKeys(node)).to.equal(true);
 		});

@@ -63,6 +63,26 @@ export interface FunctionalDependency {
    * dedup, like `source`.
    */
   readonly valueEquality?: boolean;
+  /**
+   * Uniqueness provenance. REQUIRED — there is no implicit third state.
+   *
+   * - `'unique'`: the relation has at most one row per distinct
+   *   determinant-tuple (for a guarded FD: restricted to rows satisfying the
+   *   guard). This is a semantic claim about THIS relation, not a historical
+   *   note about where the FD came from — any transform that can break
+   *   row-uniqueness of the determinant set (fan-out) MUST downgrade to
+   *   `'determination'`.
+   * - `'determination'`: only the value claim — rows agreeing on the
+   *   determinants agree on the dependents. Never implies row-uniqueness.
+   *
+   * Required (not optional) on purpose: every construction site must decide
+   * which claim it is making, and a transform that rebuilds FD objects without
+   * spreading the original fails to typecheck instead of silently losing the
+   * marker (the `valueEquality`-through-`shiftFds` trap). Like `source` and
+   * `valueEquality`, `kind` is ignored by structural dedup (`fdsEqual`) —
+   * `addFd` merges equal-determinant entries with an "'unique' wins" rule.
+   */
+  readonly kind: 'unique' | 'determination';
 }
 
 /**

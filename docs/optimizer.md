@@ -1341,6 +1341,7 @@ export interface FunctionalDependency {
   readonly determinants: readonly number[]; // empty = "constant"
   readonly dependents: readonly number[];
   readonly guard?: GuardPredicate;          // when present, activation-gated
+  readonly kind: 'unique' | 'determination'; // uniqueness provenance — REQUIRED
 }
 
 export interface GuardPredicate {
@@ -1384,6 +1385,37 @@ interface PhysicalProperties {
 Column indices are output-column indices. The FD list is **non-canonical** — each operator stores only what it can prove locally. Use `computeClosure(attrs, fds)` from `planner/util/fd-utils.ts` to derive what a set of attributes implies.
 
 The "all-columns is a key" claim (DISTINCT, schema-set tables with no smaller key) has no non-trivial FD encoding — it is communicated via `RelationType.isSet`. A uniqueness fact can therefore live on any of three surfaces: declared `RelationType.keys`, the `PhysicalProperties.fds` FD set, or `RelationType.isSet`.
+
+#### `kind`: uniqueness provenance
+
+Every FD carries a **required** `kind: 'unique' | 'determination'` field (ticket `fd-kind-provenance-field`, phase 1 of FD direction B):
+
+- **`'unique'`** — the relation has at most one row per distinct determinant tuple (for a guarded FD: restricted to rows satisfying the guard). This is a semantic claim about *this* relation, not a historical note about where the FD came from: any transform that can break determinant row-uniqueness (fan-out) **must downgrade** the FD to `'determination'`.
+- **`'determination'`** — only the value claim: rows agreeing on the determinants agree on the dependents. Never implies row-uniqueness. In particular, a `∅ → col` constant pin is `'determination'` — a pinned column does **not** imply ≤1 row.
+
+The field is required (not optional) on purpose: every construction site must decide which claim it makes, and a transform that rebuilds FD objects without spreading the original fails to typecheck instead of silently losing the marker (the historical `valueEquality`-through-`shiftFds` trap).
+
+**Kind at each construction site:**
+
+| Site | Kind | Why |
+| ---- | ---- | --- |
+| `superkeyToFd` (declared / projected keys, join `preservedKeys`, aggregate group key, set-op data-cols key, lens key obligations, TVF-declared keys) | `unique` | Every caller passes a genuine key. |
+| `singletonFd` / `addSingletonFd` (filter covered-key, values ≤1-row, `LIMIT 1`, pragma, analyze, declarative-schema, scalar aggregate, table-access) | `unique` | `∅` row-unique ⟺ ≤1 row — exactly what each caller proves. |
+| Declared PK/UNIQUE seeding (`TableReferenceNode`) | `unique` | Declared keys. |
+| Partial-UNIQUE guarded FDs (`partial-unique-extraction`) | `unique` | Row-unique *within the guard's scope* — the guarded-`'unique'` semantics. |
+| CHECK-derived FDs (all shapes, guarded and unconditional; `check-extraction`, assertion hoist) | `determination` | A CHECK constrains values, never row counts. |
+| Filter predicate equality FDs (`extractEqualityFds`: `{a}↔{b}`, `∅→col`) | `determination` | Equality / constant pins are value claims. |
+| EC-expansion FDs (`expandEcsToFds`) | `determination` | Ephemeral closure reasoning over equalities. |
+| Injective-pair FDs (`ProjectNode` / `ReturningNode`, `select id, id+1`) | `determination` | Injectivity is a value bijection; key-ness rides the projected key FDs. |
+| Join equi-pair FDs (`propagateJoinFds`) | `determination` | Value equalities; uniqueness rides the preserved-key FDs. |
+
+**Transforms preserve kind verbatim.** `shiftFds` (column relabel), `projectFds` (rows map 1:1; determinants must survive anyway), `stripGuard` (Filter activation — the activating filter's rows all satisfy the guard, and filtering only shrinks the row set), and the pass-through operators (Filter, Distinct, Sort, Limit, Cache) all carry `kind` — along with `source` and `valueEquality` — unchanged. Aggregate composes `projectFds` + `superkeyToFd`, which is sound: output rows are quotients of disjoint groups, so two output rows agreeing on a `'unique'` determinant would imply two source rows agreeing on it.
+
+**Fan-out downgrades.** A fanning operator duplicates one side's rows, destroying determinant row-uniqueness while every value claim survives. `propagateJoinFds` downgrades a non-preserved side's surviving FDs — **guarded FDs included**: a guarded partial-unique FD crossing a fanning join is no longer row-unique even within its guard's scope — on the inner/cross/left/right arms (`full` already drops everything; semi/anti pass left rows ≤1:1 and preserve kinds). The AsyncGather `crossProduct` fold applies the same rule: a child's `'unique'` FDs stay `'unique'` only when every *other* child is provably ≤1-row. `FanoutLookupJoinNode` inherits the downgrade by delegating to `propagateJoinFds` with no preserved keys.
+
+**Merge semantics: `'unique'` wins.** `fdsEqual` stays structural (`kind` is not compared, like `source` / `valueEquality`). When `addFd` merges entries with equal determinants and guards, the survivor's kind is `'unique'` if *either* side claims it — uniqueness is a property of the determinant set, so equal-determinant claims compose; a kept `'determination'` entry is upgraded in place when the subsumed newcomer is `'unique'`. `enforceCap` prefers keeping `'unique'` FDs over plain determinations when truncating (evicting a uniqueness witness is sound but causes under-claims).
+
+Phase 1 is metadata-only: no reader consults `kind` yet, and the producer-side single↔single drop gates remain in place. Phase 2 (`fd-determination-reader-side-rule`) flips the FD readers to be provenance-aware and removes those gates.
 
 #### `keysOf` / `isUnique`: the single uniqueness read path
 

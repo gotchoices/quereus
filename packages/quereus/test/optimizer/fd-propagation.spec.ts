@@ -69,22 +69,22 @@ describe('fd-utils', () => {
 		});
 
 		it('applies a single FD', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const c = computeClosure(new Set([1]), fds);
 			expect([...c].sort()).to.deep.equal([1, 2]);
 		});
 
 		it('iterates to fixpoint (a→b, b→c)', () => {
 			const fds: FunctionalDependency[] = [
-				{ determinants: [1], dependents: [2] },
-				{ determinants: [2], dependents: [3] },
+				{ determinants: [1], dependents: [2], kind: 'determination' },
+				{ determinants: [2], dependents: [3], kind: 'determination' },
 			];
 			const c = computeClosure(new Set([1]), fds);
 			expect([...c].sort()).to.deep.equal([1, 2, 3]);
 		});
 
 		it('handles constants (∅ → c)', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [], dependents: [5] }];
+			const fds: FunctionalDependency[] = [{ determinants: [], dependents: [5], kind: 'determination' }];
 			const c = computeClosure(new Set([1]), fds);
 			expect([...c].sort()).to.deep.equal([1, 5]);
 		});
@@ -97,14 +97,14 @@ describe('fd-utils', () => {
 
 		it('transitive determination', () => {
 			const fds: FunctionalDependency[] = [
-				{ determinants: [1], dependents: [2] },
-				{ determinants: [2], dependents: [3] },
+				{ determinants: [1], dependents: [2], kind: 'determination' },
+				{ determinants: [2], dependents: [3], kind: 'determination' },
 			];
 			expect(determines(new Set([1]), new Set([3]), fds)).to.equal(true);
 		});
 
 		it('does not determine when no chain', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			expect(determines(new Set([1]), new Set([3]), fds)).to.equal(false);
 		});
 	});
@@ -112,7 +112,7 @@ describe('fd-utils', () => {
 	describe('minimalCover', () => {
 		it('removes redundant attributes', () => {
 			// {1,2} where 1→2, so {1} is the minimal cover that yields the same closure
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const cover = minimalCover(new Set([1, 2]), fds);
 			expect([...cover].sort()).to.deep.equal([1]);
 		});
@@ -159,51 +159,51 @@ describe('fd-utils', () => {
 
 	describe('projectFds', () => {
 		it('drops FDs that lose a determinant column', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const mapping = new Map<number, number>([[2, 0]]);
 			const out = projectFds(fds, mapping);
 			expect(out).to.deep.equal([]);
 		});
 
 		it('drops FDs that lose a dependent column', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const mapping = new Map<number, number>([[1, 0]]);
 			const out = projectFds(fds, mapping);
 			expect(out).to.deep.equal([]);
 		});
 
 		it('remaps surviving FDs', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const mapping = new Map<number, number>([[1, 10], [2, 20]]);
 			const out = projectFds(fds, mapping);
-			expect(out).to.deep.equal([{ determinants: [10], dependents: [20] }]);
+			expect(out).to.deep.equal([{ determinants: [10], dependents: [20], kind: 'determination' }]);
 		});
 	});
 
 	describe('addFd / mergeFds', () => {
 		it('dedupes identical FDs', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
-			const out = addFd(fds, { determinants: [1], dependents: [2] });
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
+			const out = addFd(fds, { determinants: [1], dependents: [2], kind: 'determination' });
 			expect(out).to.have.length(1);
 		});
 
 		it('drops an existing FD when new one subsumes its dependents', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
-			const out = addFd(fds, { determinants: [1], dependents: [2, 3] });
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
+			const out = addFd(fds, { determinants: [1], dependents: [2, 3], kind: 'determination' });
 			expect(out).to.have.length(1);
 			expect(out[0].dependents.slice().sort()).to.deep.equal([2, 3]);
 		});
 
 		it('skips adding when an existing FD subsumes the new one', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2, 3] }];
-			const out = addFd(fds, { determinants: [1], dependents: [2] });
+			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2, 3], kind: 'determination' }];
+			const out = addFd(fds, { determinants: [1], dependents: [2], kind: 'determination' });
 			expect(out).to.have.length(1);
 			expect(out[0].dependents.slice().sort()).to.deep.equal([2, 3]);
 		});
 
 		it('mergeFds combines lists', () => {
-			const a: FunctionalDependency[] = [{ determinants: [1], dependents: [2] }];
-			const b: FunctionalDependency[] = [{ determinants: [3], dependents: [4] }];
+			const a: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
+			const b: FunctionalDependency[] = [{ determinants: [3], dependents: [4], kind: 'determination' }];
 			const out = mergeFds(a, b);
 			expect(out).to.have.length(2);
 		});
@@ -211,9 +211,9 @@ describe('fd-utils', () => {
 
 	describe('shiftFds / shiftEquivClasses', () => {
 		it('shifts all column indices', () => {
-			const fds: FunctionalDependency[] = [{ determinants: [0], dependents: [1] }];
+			const fds: FunctionalDependency[] = [{ determinants: [0], dependents: [1], kind: 'determination' }];
 			const shifted = shiftFds(fds, 5);
-			expect(shifted).to.deep.equal([{ determinants: [5], dependents: [6] }]);
+			expect(shifted).to.deep.equal([{ determinants: [5], dependents: [6], kind: 'determination' }]);
 			const classes = shiftEquivClasses([[0, 1]], 5);
 			expect(classes).to.deep.equal([[5, 6]]);
 		});

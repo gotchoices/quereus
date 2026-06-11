@@ -121,7 +121,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 				if (!detSet.has(i)) dep.push(i);
 			}
 			if (dep.length === 0) continue;
-			fds = addFd(fds, { determinants: det, dependents: dep });
+			fds = addFd(fds, { determinants: det, dependents: dep, kind: 'unique' });
 		}
 
 		// Immutable snapshot of the FD set built from declared PK/UNIQUE keys
