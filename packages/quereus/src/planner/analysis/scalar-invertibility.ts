@@ -56,8 +56,10 @@ function asIntegerLiteral(node: ScalarPlanNode): { expr: AST.LiteralExpr; value:
 	return null;
 }
 
-/** True for a `cast(x as T)` whose target logical type equals the operand's (a value-preserving no-op). */
-function isNoOpCast(node: CastNode): boolean {
+/** True for a `cast(x as T)` whose target logical type equals the operand's (a value-preserving no-op).
+ *  Exported for the coarsened-key derivation (`coarsened-key.ts`), whose value-preserving
+ *  unwrap must agree with this registry's passthrough classification. */
+export function isNoOpCast(node: CastNode): boolean {
 	return node.operand.getType().logicalType === node.getType().logicalType;
 }
 

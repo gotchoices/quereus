@@ -119,6 +119,7 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 			// re-planned body, then keep the MV record consistent with the new shape.
 			await rebuildBackingTable(db, mv, shape);
 			mv.primaryKey = shape.primaryKey;
+			mv.coarsenedKey = shape.coarsenedKey;
 			mv.ordering = shape.ordering;
 			mv.sourceTables = shape.sourceTables;
 		}

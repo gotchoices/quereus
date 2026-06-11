@@ -7,9 +7,10 @@ import type { PlanNode, RelationalPlanNode } from '../../planner/nodes/plan-node
 import { TableReferenceNode } from '../../planner/nodes/reference.js';
 import { keysOf } from '../../planner/util/fd-utils.js';
 import { proveCoverage } from '../../planner/analysis/coverage-prover.js';
+import { deriveCoarsenedBackingKey, type CoarsenedBackingKey } from '../../planner/analysis/coarsened-key.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule } from '../../schema/table.js';
-import type { MaterializedViewSchema } from '../../schema/view.js';
+import type { MaterializedViewSchema, CoarsenedKeyInfo } from '../../schema/view.js';
 import { backingTableNameFor, computeBodyHash } from '../../schema/view.js';
 import type { Schema } from '../../schema/schema.js';
 import { generateMaterializedViewDDL } from '../../schema/ddl-generator.js';
@@ -18,6 +19,7 @@ import { createLogger } from '../../common/logger.js';
 import type { BackingHost } from '../../vtab/backing-host.js';
 
 const log = createLogger('runtime:emit:materialized-view');
+const warnLog = log.extend('warn');
 
 // Canonical body-hash lives next to the MV schema definition so the declarative
 // differ can share it without depending on the runtime layer. Re-exported here
@@ -51,6 +53,14 @@ export interface BackingShape {
 	ordering?: ReadonlyArray<{ index: number; desc: boolean }>;
 	/** Qualified (lowercased `schema.table`) source tables the body reads. */
 	sourceTables: string[];
+	/** Present when `primaryKey` is a **collation-coarsened lineage key** — the body
+	 *  has no provable key and the backing identity was derived from source-key
+	 *  lineage with at least one collation-weakened column (the parallel-migration
+	 *  shape — `deriveCoarsenedBackingKey`). Drives the create-time key-coarsening
+	 *  warning and the MV-record stamp. Absent when `keysOf` proved a key, when the
+	 *  lineage key does not coarsen, or when no key was derivable at all (the
+	 *  all-columns fallback; such a body is rejected at registration). */
+	coarsenedKey?: CoarsenedKeyInfo;
 }
 
 /**
@@ -103,9 +113,28 @@ function deriveBackingShapeUnguarded(
 		generated: false,
 	}));
 
-	// First usable key from the unified surface; all-columns fallback when none.
+	// First usable key from the unified surface. A keyless body is then offered the
+	// coarsened lineage key (the parallel-migration shape — see coarsened-key.ts):
+	// the projected source key, keyed under the OUTPUT collations, so create-fill
+	// rejects collisions loudly and steady-state maintenance merges them LWW. The
+	// all-columns fallback remains for bodies with neither (rejected at
+	// registration as a bag, exactly as before).
 	const keys = keysOf(root);
-	const pkIndices = keys.length > 0 ? [...keys[0]] : columns.map((_c, i) => i);
+	let pkIndices: number[];
+	let coarsenedKey: CoarsenedKeyInfo | undefined;
+	if (keys.length > 0) {
+		pkIndices = [...keys[0]];
+	} else {
+		const lineageKey = deriveCoarsenedBackingKey(root);
+		if (lineageKey) {
+			pkIndices = [...lineageKey.keyIndices];
+			// Only a genuinely COARSENING key carries the warning payload; an
+			// equal/refining lineage key is a true unique key accepted silently.
+			if (lineageKey.coarsens) coarsenedKey = buildCoarsenedKeyInfo(lineageKey, columns);
+		} else {
+			pkIndices = columns.map((_c, i) => i);
+		}
+	}
 	const primaryKey = pkIndices.map(idx => ({ index: idx, desc: false }));
 
 	const ordering = root.physical?.ordering?.map(o => ({ index: o.column, desc: o.desc }));
@@ -115,6 +144,23 @@ function deriveBackingShapeUnguarded(
 		primaryKey,
 		ordering: ordering && ordering.length > 0 ? ordering : undefined,
 		sourceTables: collectSourceTables(plan),
+		coarsenedKey,
+	};
+}
+
+/** Lift the structural {@link CoarsenedBackingKey} into the named, record-facing
+ *  {@link CoarsenedKeyInfo} (backing column names instead of indices). */
+function buildCoarsenedKeyInfo(key: CoarsenedBackingKey, columns: readonly ColumnSchema[]): CoarsenedKeyInfo {
+	const nameOf = (idx: number): string => columns[idx]?.name ?? `col${idx}`;
+	return {
+		columns: key.keyIndices.map(nameOf),
+		weakened: key.columns
+			.filter(c => c.coarsens)
+			.map(c => ({
+				column: nameOf(c.outputIndex),
+				sourceCollation: c.sourceCollation,
+				outputCollation: c.outputCollation,
+			})),
 	};
 }
 
@@ -310,12 +356,31 @@ function buildMaterializedViewRecord(def: MaterializeViewDefinition, shape: Back
 		backingModuleName: def.backingModuleName,
 		backingModuleArgs: def.backingModuleArgs,
 		primaryKey: shape.primaryKey,
+		coarsenedKey: shape.coarsenedKey,
 		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
 		ordering: shape.ordering,
 		sourceTables: shape.sourceTables,
 		stale: false,
 		origin: 'explicit',
 	};
+}
+
+/**
+ * The key-coarsening warning `docs/migration.md` § Convergence hazards
+ * specifies — emitted (structured logger, `warn` channel) when an MV
+ * materializes over a coarsened backing key, with {@link MaterializedViewSchema.coarsenedKey}
+ * as the record-side complement. Warn, don't reject: the merge-on-coarsen
+ * behavior is often exactly what the migration intends.
+ */
+function warnKeyCoarsening(schemaName: string, viewName: string, info: CoarsenedKeyInfo): void {
+	const detail = info.weakened
+		.map(w => `${w.column}: collation ${w.sourceCollation} → ${w.outputCollation}`)
+		.join(', ');
+	warnLog(
+		`materialized view '%s.%s': backing key (%s) is coarser than the source primary key (%s); `
+			+ `colliding source rows will last-write-win until they are merged`,
+		schemaName, viewName, info.columns.join(', '), detail,
+	);
 }
 
 /**
@@ -381,6 +446,12 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 			await sm.dropTable(def.schemaName, backingTableName, /*ifExists*/ true);
 		} catch { /* best-effort cleanup */ }
 		throw e;
+	}
+
+	// After the MV fully materialized (a fill/registration failure must error, not
+	// warn): surface the key-coarsening hazard the coarsened backing key carries.
+	if (mv.coarsenedKey) {
+		warnKeyCoarsening(def.schemaName, def.viewName, mv.coarsenedKey);
 	}
 
 	return mv;

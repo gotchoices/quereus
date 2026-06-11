@@ -36,6 +36,27 @@ export interface ViewSchema {
 }
 
 /**
+ * Describes a materialized view whose backing key is **collation-coarser** than
+ * the source primary key it derives from — the parallel-migration-table shape
+ * (`docs/migration.md` § Convergence hazards): the body has no provable unique
+ * key, so the backing was keyed on the coarsened lineage key K' (see
+ * `planner/analysis/coarsened-key.ts`), and colliding source rows
+ * last-write-win until they are merged. Stamped alongside the create-time
+ * key-coarsening warning; purely informational (recomputed at create / import /
+ * refresh shape-rebuild from the body — never serialized into DDL).
+ */
+export interface CoarsenedKeyInfo {
+	/** Backing/output column names forming the coarsened key, in key order. */
+	readonly columns: readonly string[];
+	/** The columns whose collation weakened, with the source → output collations. */
+	readonly weakened: ReadonlyArray<{
+		readonly column: string;
+		readonly sourceCollation: string;
+		readonly outputCollation: string;
+	}>;
+}
+
+/**
  * Schema definition of a materialized view — a "keyed derived relation". The
  * query body is stored once into a backing virtual table (a normal
  * `TableSchema` in the `tables` map); references resolve to that backing table
@@ -93,9 +114,19 @@ export interface MaterializedViewSchema {
 
 	/** Inferred PK of the view output, derived from `keysOf` on the optimized body.
 	 *  NOTE: `keysOf` returns column-index arrays WITHOUT direction; `desc` defaults
-	 *  false. When `keysOf` yields no usable key, the all-columns key is used
-	 *  (Quereus default). Such an MV is incremental-ineligible until Phase 2. */
+	 *  false. When `keysOf` yields no usable key, a coarsened lineage key is tried
+	 *  (`coarsenedKey` below); the all-columns fallback remains for bodies with
+	 *  neither, and such an MV is rejected at registration (a bag). */
 	primaryKey: ReadonlyArray<{ index: number; desc: boolean }>;
+
+	/**
+	 * Present when the backing key is a collation-coarsened lineage key
+	 * ({@link CoarsenedKeyInfo}) — colliding source rows last-write-win in this
+	 * MV until merged. Informational (the key-coarsening warning's record-side
+	 * complement); recomputed wherever the backing shape is re-derived, never
+	 * serialized.
+	 */
+	coarsenedKey?: CoarsenedKeyInfo;
 
 	/** `toBase64Url(fnv1aHash(...))` of the canonical DEFINITION string —
 	 *  explicit column list + body + `insert defaults` clause, rendered by

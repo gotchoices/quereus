@@ -50,6 +50,7 @@ import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
 import { injectKeyFilter } from '../planner/analysis/key-filter.js';
 import { keysOf } from '../planner/util/fd-utils.js';
+import { deriveCoarsenedBackingKey, resolveValuePreservingSourceCol } from '../planner/analysis/coarsened-key.js';
 import { proveOneToOneJoin } from '../planner/analysis/coverage-prover.js';
 import { CapabilityDetectors } from '../planner/framework/characteristics.js';
 import {
@@ -1045,6 +1046,16 @@ export class MaterializedViewManager {
 		// per-row function — O(log n), no body re-execution). PK / backing-key columns
 		// must stay passthrough (the backing key and the inverse-projection conflict map
 		// depend on it); non-key columns may be computed.
+		//
+		// "Passthrough" is value-preserving lineage (`resolveValuePreservingSourceCol`):
+		// a bare column reference, OR one wrapped in `collate` / a no-op `cast` — those
+		// wrappers copy the source VALUE verbatim, so the column-copy maintenance is
+		// exact. This is what lets the collation-weakening migration shape (`select b
+		// collate nocase as b from t`) register here with its coarsened backing key:
+		// the per-row upsert is keyed under the backing PK's (output) collation, so a
+		// colliding source row last-write-wins into the shared backing row, and a
+		// delete of one colliding sibling removes the shared row (the documented
+		// anomaly — docs/materialized-views.md § Coarsened backing keys).
 		const sourceAttrToCol = new Map<number, number>();
 		const sourceDescriptor: RowDescriptor = [];
 		tableRef.getAttributes().forEach((a, i) => {
@@ -1058,7 +1069,7 @@ export class MaterializedViewManager {
 		const projectors: BackingProjector[] = [];
 		for (let outCol = 0; outCol < rootAttrs!.length; outCol++) {
 			const attr = rootAttrs![outCol];
-			const sourceCol = attr ? resolveSourceCol(attr.id, sourceAttrToCol, producingByAttrId) : undefined;
+			const sourceCol = attr ? resolveValuePreservingSourceCol(attr.id, sourceAttrToCol, producingByAttrId) : undefined;
 			if (sourceCol !== undefined) {
 				projectors.push({ kind: 'passthrough', sourceCol });
 				continue;
@@ -1564,7 +1575,15 @@ export class MaterializedViewManager {
 		// when the body is provably a set (`keysOf` gates it on `isSet`); a bag with an
 		// all-columns "key" still resolves to empty here and rejects, else duplicates would
 		// collide on the backing key.
-		if (keysOf(root).length === 0) {
+		//
+		// One carve-out: a keyless body whose source key survives through value-preserving
+		// passthrough lineage (the parallel-migration collation-weakening shape) is keyed on
+		// the COARSENED lineage key instead of rejected — the same `deriveCoarsenedBackingKey`
+		// derivation `deriveBackingShape` keyed the backing with, over the same fully-optimized
+		// body, so the two agree by construction. Colliding rows then last-write-win under the
+		// floor's collation-keyed `replace-all` diff (docs/materialized-views.md § Coarsened
+		// backing keys); the create emitter owns the key-coarsening warning.
+		if (keysOf(root).length === 0 && deriveCoarsenedBackingKey(root) === undefined) {
 			throw cannotMaterialize(mv.name, 'its body has no provable unique key — it is a bag (e.g. a key-dropping '
 				+ 'projection or a `union all` of overlapping inputs), so it must be a set');
 		}
@@ -2754,21 +2773,6 @@ function collectProducingExprs(node: PlanNode, out = new Map<number, ScalarPlanN
 	}
 	for (const child of node.getChildren()) collectProducingExprs(child as unknown as PlanNode, out);
 	return out;
-}
-
-/** Resolve an output attribute id back to a source column index, via provenance. */
-function resolveSourceCol(
-	outAttrId: number,
-	sourceAttrToCol: Map<number, number>,
-	producingByAttrId: Map<number, ScalarPlanNode>,
-): number | undefined {
-	const direct = sourceAttrToCol.get(outAttrId);
-	if (direct !== undefined) return direct;
-	const expr = producingByAttrId.get(outAttrId);
-	if (expr instanceof ColumnReferenceNode) {
-		return sourceAttrToCol.get(expr.attributeId);
-	}
-	return undefined;
 }
 
 /**

@@ -199,6 +199,7 @@ export type CoverageFailureReason =
 	| 'fanout'
 	| 'missing-uc-column'
 	| 'missing-pk-column'
+	| 'collation-mismatch'
 	| 'ordering-mismatch'
 	| 'predicate-entailment'
 	| 'missing-null-skip';
@@ -313,21 +314,42 @@ export function proveCoverage(
 
 	// ---- Projection coverage: map output attributes back to base columns via
 	//      stable attribute IDs (a bare column reference preserves the source
-	//      attribute's id through Project/Sort/scan nodes). ----
+	//      attribute's id through Project/Sort/scan nodes), keeping the first
+	//      covering output index for the collation gate below. ----
 	const baseAttrToCol = new Map<number, number>();
 	tableRef.getAttributes().forEach((attr, i) => baseAttrToCol.set(attr.id, i));
 
-	const coveredBaseCols = new Set<number>();
-	for (const attr of root.getAttributes()) {
+	const coveredBaseCols = new Map<number, number>();
+	root.getAttributes().forEach((attr, outIdx) => {
 		const col = baseAttrToCol.get(attr.id);
-		if (col !== undefined) coveredBaseCols.add(col);
-	}
+		if (col !== undefined && !coveredBaseCols.has(col)) coveredBaseCols.set(col, outIdx);
+	});
+
+	// ---- Collation gate: the projected output column must carry the SAME collation
+	//      as the constrained base column. The backing key inherits the OUTPUT
+	//      collation (`buildBackingTableSchema`), so a mismatched link would let a
+	//      coarser-keyed backing (e.g. NOCASE) answer a finer (BINARY) constraint's
+	//      uniqueness question — collation-equal/byte-different rows would merge in
+	//      the structure while the constraint must keep them distinct. Defense-in-depth
+	//      today: a collation-changing projection mints a fresh attribute id and
+	//      already fails the coverage maps above; this gate makes the requirement
+	//      explicit so no future id-preserving surface can link across a mismatch. ----
+	const outputColumns = root.getType().columns;
+	const collationMatches = (baseCol: number): boolean => {
+		const outIdx = coveredBaseCols.get(baseCol);
+		if (outIdx === undefined) return true; // absence is the missing-*-column reject's job
+		const outColl = (outputColumns[outIdx]?.type.collationName ?? 'BINARY').toUpperCase();
+		const baseColl = (baseTable.columns[baseCol]?.collation ?? 'BINARY').toUpperCase();
+		return outColl === baseColl;
+	};
 
 	for (const col of uc.columns) {
 		if (!coveredBaseCols.has(col)) return notCovers('missing-uc-column');
+		if (!collationMatches(col)) return notCovers('collation-mismatch');
 	}
 	for (const pk of baseTable.primaryKeyDefinition) {
 		if (!coveredBaseCols.has(pk.index)) return notCovers('missing-pk-column');
+		if (!collationMatches(pk.index)) return notCovers('collation-mismatch');
 	}
 
 	// ---- Lookup-side column names in the join's output frame (a `T` attribute is
