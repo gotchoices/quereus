@@ -13,7 +13,7 @@ import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows } from '../../../schema/constraint-builder.js';
-import { compareSqlValues } from '../../../util/comparison.js';
+import { compareSqlValues, rowsValueIdentical } from '../../../util/comparison.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
 import { scanLayer as scanLayerImpl } from './scan-layer.js';
@@ -1315,9 +1315,12 @@ export class MemoryTableManager {
 	 * `update` when it replaced an existing row, else `insert`; a `delete-by-prefix` →
 	 * one `delete` per matched row; a `replace-all` → the minimal keyed diff between the
 	 * new and old contents (insert/update/delete, identical rows skipped). A
-	 * `delete-key`/`delete-by-prefix` that matches nothing — or a `replace-all` whose new
-	 * contents equal the old — produces nothing. The MV-over-MV cascade feeds these onward
-	 * to MVs reading this backing table (see `database-materialized-views.ts` § cascade).
+	 * `delete-key`/`delete-by-prefix` that matches nothing, an `upsert` whose row is
+	 * **value-identical** to the effective existing row (`rowsValueIdentical` — written
+	 * nothing, reported nothing; the normative skip in `vtab/backing-host.ts`), or a
+	 * `replace-all` whose new contents equal the old — produces nothing. The MV-over-MV
+	 * cascade feeds these onward to MVs reading this backing table (see
+	 * `database-materialized-views.ts` § cascade).
 	 *
 	 * Async only because `delete-by-prefix` / `replace-all` reuse the async layer scan to
 	 * enumerate the affected (prefix / whole-table) slice; the point ops stay synchronous
@@ -1343,6 +1346,17 @@ export class MemoryTableManager {
 				case 'upsert': {
 					const key = this.primaryKeyFunctions.extractFromRow(op.row);
 					const existing = this.lookupEffectiveRow(key, layer);
+					if (existing && rowsValueIdentical(existing, op.row)) {
+						// Value-identical against the EFFECTIVE row (pending over committed):
+						// nothing changes, so write nothing and report nothing — the
+						// skip-identical upsert contract (vtab/backing-host.ts), the point-op
+						// analogue of the replace-all diff's identical-row skip. Identity is
+						// byte-faithful (`rowsValueIdentical`, BINARY per column) — narrower
+						// than replace-all's collation-aware `rowsEqual`, because a
+						// collation-equal / byte-different point upsert (a case-only rewrite
+						// under NOCASE) is a real change that must re-key the stored bytes.
+						break;
+					}
 					layer.recordUpsert(key, op.row, existing);
 					changes.push(existing
 						? { op: 'update', oldRow: existing, newRow: op.row }

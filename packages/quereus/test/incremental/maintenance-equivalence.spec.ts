@@ -1787,6 +1787,312 @@ describe('Materialized-view maintenance equivalence (full-rebuild floor, OR FAIL
 	});
 });
 
+/* ───────────────── no-op maintenance write suppression (per arm) ───────────────── */
+
+/**
+ * Value-identical (no-op) maintenance write suppression (`mv-noop-upsert-suppression`):
+ * a source write whose recomputed backing image is value-identical to the existing
+ * effective backing row produces **zero effective `BackingRowChange`s** — no backing op,
+ * no cascade — in every bounded-delta arm. Instrumented by wrapping the manager's
+ * `applyMaintenancePlan` dispatch: its return value is exactly what drives the
+ * MV-over-MV cascade, so these assertions pin what a consumer MV would observe.
+ * Regression cases pin that real changes, key-changing updates, emptied groups/fan-outs,
+ * and predicate-scope transitions still report — the suppression never skips a real
+ * change (the equivalence property suites above are the exhaustive oracle for that).
+ */
+describe('Materialized-view maintenance no-op write suppression', () => {
+	interface AppliedRecord { mv: string; kind: string; changes: Array<{ op: string }> }
+	interface DispatchingManager {
+		applyMaintenancePlan(plan: { kind: string; mv: { name: string } }, ...rest: unknown[]): Promise<Array<{ op: string }>>;
+	}
+
+	/** Record every applyMaintenancePlan invocation: plan kind, MV name, effective changes. */
+	function instrument(db: Database): AppliedRecord[] {
+		const records: AppliedRecord[] = [];
+		const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as DispatchingManager;
+		const orig = mgr.applyMaintenancePlan.bind(mgr);
+		mgr.applyMaintenancePlan = async (plan, ...rest) => {
+			const changes = await orig(plan, ...rest);
+			records.push({ mv: plan.mv.name, kind: plan.kind, changes });
+			return changes;
+		};
+		return records;
+	}
+
+	const allOps = (records: AppliedRecord[]): string[] => records.flatMap(r => r.changes.map(c => c.op));
+	const totalChanges = (records: AppliedRecord[]): number => allOps(records).length;
+
+	describe('inverse-projection arm', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+		const body = 'select id, a from src';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer)');
+			await db.exec('insert into src values (1, 10, 100), (2, 20, 200)');
+			await db.exec(`create materialized view mv as ${body}`);
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('an update to an unprojected column reports zero effective changes', async () => {
+			await db.exec('update src set b = 999 where id = 1');
+			expect(records.length, 'maintenance was dispatched').to.be.greaterThan(0);
+			expect(totalChanges(records), 'no effective backing change').to.equal(0);
+			await assertEquivalent(db, body, 'after unprojected-column update');
+		});
+
+		it('rewriting a projected column to its current value reports zero effective changes', async () => {
+			await db.exec('update src set a = 10 where id = 1');
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after same-value rewrite');
+		});
+
+		it('regression: a real same-key change still reports (delete + insert, as before)', async () => {
+			await db.exec('update src set a = 11 where id = 1');
+			expect(allOps(records).sort()).to.deep.equal(['delete', 'insert']);
+			await assertEquivalent(db, body, 'after real change');
+		});
+
+		it('regression: a key-changing update still reports both keys', async () => {
+			await db.exec('update src set id = 5 where id = 1');
+			expect(allOps(records).sort()).to.deep.equal(['delete', 'insert']);
+			await assertEquivalent(db, body, 'after key change');
+		});
+	});
+
+	describe('inverse-projection arm + partial WHERE', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+		const body = 'select id, a from src where a > 5';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer)');
+			await db.exec('insert into src values (1, 10, 100), (2, 2, 200)'); // id 1 in scope, id 2 out
+			await db.exec(`create materialized view mv as ${body}`);
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('an unprojected-column update on an in-scope row reports zero effective changes', async () => {
+			await db.exec('update src set b = 999 where id = 1');
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after in-scope unprojected update');
+		});
+
+		it('regression: a scope exit still reports its delete', async () => {
+			await db.exec('update src set a = 1 where id = 1');
+			expect(allOps(records)).to.deep.equal(['delete']);
+			await assertEquivalent(db, body, 'after scope exit');
+		});
+
+		it('regression: a scope entry still reports its insert', async () => {
+			await db.exec('update src set a = 9 where id = 2');
+			expect(allOps(records)).to.deep.equal(['insert']);
+			await assertEquivalent(db, body, 'after scope entry');
+		});
+	});
+
+	describe('residual-recompute (aggregate) arm', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+		const body = 'select k, count(*) as c, sum(a) as s from src group by k';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+			await db.exec('insert into src values (1, 1, 5, 1), (2, 2, 6, 1), (3, 3, 7, 2)');
+			await db.exec(`create materialized view mv as ${body}`);
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('an update outside the group key and aggregated columns reports zero effective changes', async () => {
+			await db.exec('update src set b = 99 where id = 1');
+			expect(records.length, 'maintenance was dispatched').to.be.greaterThan(0);
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after unaggregated-column update');
+		});
+
+		it('a same-value rewrite of an aggregated column reports zero effective changes', async () => {
+			await db.exec('update src set a = 1 where id = 1');
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after same-value rewrite');
+		});
+
+		it('regression: a real aggregate change reports a single update (no delete+insert churn)', async () => {
+			await db.exec('update src set a = 5 where id = 1');
+			expect(allOps(records)).to.deep.equal(['update']);
+			await assertEquivalent(db, body, 'after real aggregate change');
+		});
+
+		it('regression: an emptied group still reports its delete', async () => {
+			await db.exec('delete from src where k = 2'); // id 3 is the lone k=2 row
+			expect(allOps(records)).to.deep.equal(['delete']);
+			await assertEquivalent(db, body, 'after emptied group');
+		});
+
+		it('regression: a group-key move still reports both groups', async () => {
+			await db.exec('update src set k = 2 where id = 1');
+			expect(totalChanges(records), 'both groups recomputed and reported').to.be.greaterThan(0);
+			await assertEquivalent(db, body, 'after group move');
+		});
+	});
+
+	describe('prefix-delete (lateral TVF fan-out) arm', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+		const body = 'select src.id, f.value from src cross join lateral generate_series(1, src.a) f';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer)');
+			await db.exec('insert into src values (1, 3, 0), (2, 2, 0)');
+			await db.exec(`create materialized view mv as ${body}`);
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('an update outside the projection and fan-out driver reports zero effective changes', async () => {
+			await db.exec('update src set b = 42 where id = 1');
+			expect(records.length, 'maintenance was dispatched').to.be.greaterThan(0);
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after unprojected-column update');
+		});
+
+		it('a same-value rewrite of the fan-out driver reports zero effective changes', async () => {
+			await db.exec('update src set a = 3 where id = 1');
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after same-value rewrite');
+		});
+
+		it('regression: a shrunk fan-out reports exactly the disappeared row (minimal diff)', async () => {
+			await db.exec('update src set a = 2 where id = 1'); // 3 → 2: only (1,3) disappears
+			expect(allOps(records)).to.deep.equal(['delete']);
+			await assertEquivalent(db, body, 'after shrink');
+		});
+
+		it('regression: a grown fan-out reports exactly the appeared row', async () => {
+			await db.exec('update src set a = 4 where id = 1'); // 3 → 4: only (1,4) appears
+			expect(allOps(records)).to.deep.equal(['insert']);
+			await assertEquivalent(db, body, 'after growth');
+		});
+
+		it('regression: an emptied fan-out still reports every delete', async () => {
+			await db.exec('update src set a = 0 where id = 1'); // whole 3-row slice disappears
+			expect(allOps(records)).to.deep.equal(['delete', 'delete', 'delete']);
+			await assertEquivalent(db, body, 'after emptied fan-out');
+		});
+	});
+
+	describe('join-residual arm (forward and upsert-only lookup sides)', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+		const body = 'select t.id, t.fk, p.name from t join p on t.fk = p.id';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table p (id integer primary key, name text, pad integer)');
+			await db.exec('create table t (id integer primary key, fk integer not null references p(id), pad integer)');
+			await db.exec("insert into p values (1, 'a', 0), (2, 'b', 0)");
+			await db.exec('insert into t values (1, 1, 0), (2, 1, 0), (3, 2, 0)');
+			await db.exec(`create materialized view mv as ${body}`);
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('a driving-side (t) update to an unprojected column reports zero effective changes', async () => {
+			await db.exec('update t set pad = 7 where id = 1');
+			expect(records.length, 'maintenance was dispatched').to.be.greaterThan(0);
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after t unprojected update');
+		});
+
+		it('a lookup-side (p) update to an unprojected column reports zero effective changes', async () => {
+			await db.exec('update p set pad = 7 where id = 1'); // two referencing t rows recompute identically
+			expect(records.length, 'maintenance was dispatched').to.be.greaterThan(0);
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after p unprojected update');
+		});
+
+		it('regression: a lookup-side projected change reports one update per referencing row', async () => {
+			await db.exec("update p set name = 'X' where id = 1");
+			expect(allOps(records)).to.deep.equal(['update', 'update']);
+			await assertEquivalent(db, body, 'after p projected change');
+		});
+	});
+
+	describe('join-residual arm (delete-capable P-referencing WHERE)', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+		const body = 'select t.id, t.fk, p.name, p.score from t join p on t.fk = p.id where p.score > 5';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table p (id integer primary key, name text, score integer, pad integer)');
+			await db.exec('create table t (id integer primary key, fk integer not null references p(id))');
+			// p1 out of scope (score 3), p2 in scope (score 7); two t rows reference each.
+			await db.exec("insert into p values (1, 'a', 3, 0), (2, 'b', 7, 0)");
+			await db.exec('insert into t values (1, 1), (2, 1), (3, 2), (4, 2)');
+			await db.exec(`create materialized view mv as ${body}`);
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('an in-scope p update to an unprojected column reports zero effective changes (no member churn)', async () => {
+			// Formerly: every member deleted then re-upserted (delete+insert per referencing
+			// row). The keyed diff + host skip-identical upsert reduce it to nothing.
+			await db.exec('update p set pad = 1 where id = 2');
+			expect(records.length, 'maintenance was dispatched').to.be.greaterThan(0);
+			expect(totalChanges(records)).to.equal(0);
+			await assertEquivalent(db, body, 'after in-scope unprojected p update');
+		});
+
+		it('regression: a scope exit still deletes every member', async () => {
+			await db.exec('update p set score = 1 where id = 2');
+			expect(allOps(records).sort()).to.deep.equal(['delete', 'delete']);
+			await assertEquivalent(db, body, 'after scope exit');
+		});
+
+		it('regression: a scope entry still inserts every member', async () => {
+			await db.exec('update p set score = 9 where id = 1');
+			expect(allOps(records).sort()).to.deep.equal(['insert', 'insert']);
+			await assertEquivalent(db, body, 'after scope entry');
+		});
+	});
+
+	describe('MV-over-MV cascade suppression', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer)');
+			await db.exec('insert into src values (1, 10, 100)');
+			await db.exec('create materialized view mv1 as select id, a from src');
+			await db.exec('create materialized view mv2 as select id, a from mv1');
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('a suppressed producer write fires no consumer maintenance at all', async () => {
+			await db.exec('update src set b = 9 where id = 1'); // unprojected by mv1
+			const producer = records.filter(r => r.mv === 'mv1');
+			expect(producer.length, 'producer maintenance dispatched').to.be.greaterThan(0);
+			expect(totalChanges(producer), 'producer reported nothing').to.equal(0);
+			expect(records.filter(r => r.mv === 'mv2'), 'consumer never dispatched').to.deep.equal([]);
+		});
+
+		it('regression: a real producer change still cascades into the consumer', async () => {
+			await db.exec('update src set a = 11 where id = 1');
+			expect(records.some(r => r.mv === 'mv2' && r.changes.length > 0), 'consumer maintained').to.equal(true);
+			expect(await readMultiset(db, 'select * from mv2')).to.deep.equal([canonRow([1, 11])]);
+		});
+	});
+});
+
 /* ─────────── negative self-test (the net must not silently degenerate) ─────────── */
 
 /**

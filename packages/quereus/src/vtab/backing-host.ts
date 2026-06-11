@@ -21,7 +21,11 @@
  * Reporting the EFFECTIVE per-row changes from {@link BackingHost.applyMaintenance}
  * is part of the contract, not an optimization: the MV-over-MV cascade routes
  * each returned {@link BackingRowChange} back through `maintainRowTime`, so
- * over- or under-reporting corrupts consumer MVs.
+ * over- or under-reporting corrupts consumer MVs. Fidelity cuts both ways: an op
+ * that changes nothing — a `delete` of an absent key, a **value-identical
+ * `upsert`** (see {@link MaintenanceOp}) — reports nothing, so a no-op maintenance
+ * write fires no cascade and, for a change-logged (synced) backing, produces no
+ * change-log entry (no echo).
  *
  * ## Transactionality
  *
@@ -56,6 +60,21 @@ import type { BTreeKeyForPrimary } from './memory/types.js';
  *
  * - `delete-key` removes the row with this full primary key (no-op if absent).
  * - `upsert` replaces the row sharing this row's PK, or inserts when absent.
+ *   **Value-identical suppression (normative).** When the new row is value-identical
+ *   to the connection's *effective* existing row at that key (pending state layered
+ *   over committed — never committed-only), the host MUST write nothing and report
+ *   nothing: nothing changed, so reporting no {@link BackingRowChange} is what the
+ *   effective-change contract demands, and it is the echo-prevention seam for
+ *   change-logged (synced) backings. Value identity is **byte-faithful** — per-column
+ *   `compareSqlValues` under BINARY (`util/comparison.ts` `rowsValueIdentical`):
+ *   numeric-storage-class tolerant (bigint `5n` ≡ number `5`) but byte-exact for
+ *   text. It is deliberately NOT the column collation: a collation-equal /
+ *   byte-different upsert (e.g. a case-only rewrite under a NOCASE column) is a real
+ *   change that must replace the stored bytes and report an `update` (the column
+ *   collation still governs which existing row the upsert *replaces* — key identity —
+ *   just not the skip). This is intentionally narrower than `replace-all`'s wholesale
+ *   diff below, whose identical-row skip is collation-aware per its own pinned
+ *   semantics (`test/vtab/maintenance-replace-all.spec.ts`).
  * - `delete-by-prefix` removes **every** row whose leading PK columns equal
  *   `keyPrefix` (no-op when nothing matches). It replaces a whole prefix-keyed
  *   *slice* — used by the lateral-TVF fan-out arm (`'prefix-delete'`), where one
@@ -132,9 +151,11 @@ export interface BackingHost {
 	/** Privileged ordered op application into `conn`'s pending transaction
 	 *  state: bypasses user-DML read-only enforcement, keeps secondary-index /
 	 *  change-tracking bookkeeping, and returns the EFFECTIVE per-row changes
-	 *  realized (the cascade contract — no-op ops yield nothing; `replace-all`
-	 *  yields the minimal keyed diff). Later reads on `conn` (scanEffective,
-	 *  point lookups) must observe the applied ops (reads-own-writes). */
+	 *  realized (the cascade contract — no-op ops yield nothing: a value-identical
+	 *  `upsert` writes nothing and reports nothing, see {@link MaintenanceOp};
+	 *  `replace-all` yields the minimal keyed diff). Later reads on `conn`
+	 *  (scanEffective, point lookups) must observe the applied ops
+	 *  (reads-own-writes). */
 	applyMaintenance(conn: VirtualTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]>;
 	/** Atomically replace the COMMITTED contents with `rows` (create-fill /
 	 *  refresh). Throws `onDuplicateKey()` (or a generic CONSTRAINT) on a

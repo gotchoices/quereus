@@ -134,7 +134,6 @@ The pattern above is the design target; these pieces are pending (tracked as tic
 
 - **Authored inverses** (`with inverse (col = expr, …)` on result columns) — parser/AST, write-path consumption, lens-prover integration ([view-updateability.md § Authored inverses](view-updateability.md#authored-inverses-with-inverse)).
 - **First-class derivation lifecycle** — stable backing identity, adopt-on-create (attach a derivation to an existing table's data), attach/detach verbs (the flip and the contract phases), and declarative-differ recognition of attach/detach as non-destructive ([materialized-views.md § Current limitations](materialized-views.md#current-limitations)).
-- **Value-identical upsert suppression** in the bounded-delta maintenance arms (the full-rebuild floor already diffs).
 - **Replicable determinism class** for UDFs + host-declared requirements on the backing-host capability.
 - **Key-coarsening detection** — the static create-time warning and runtime collision telemetry.
 - **Sync-layer policies** — per-table change-logging opt-in for maintenance writes, unknown-table disposition + telemetry, retention-horizon-driven retirement, and mapped-since bookkeeping over `notifyLensDeployment`.

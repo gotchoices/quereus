@@ -229,6 +229,28 @@ export function compareSqlValues(a: SqlValue, b: SqlValue, collationName: string
 }
 
 /**
+ * Byte-faithful row value-identity: per-column {@link compareSqlValues} under the
+ * default BINARY collation — numeric-storage-class tolerant (a bigint `5n` equals a
+ * number `5`, so equal values of differing JS identity are not spuriously treated as
+ * changed) but byte-exact for text. Rows of differing width are never identical.
+ *
+ * This is the skip-identical comparison for value-identical maintenance-upsert
+ * suppression (the normative contract in `vtab/backing-host.ts`). It is deliberately
+ * collation-UNAWARE: a collation-equal / byte-different write (e.g. a case-only
+ * rewrite under a NOCASE column) is a real, observable change — `select` returns the
+ * stored bytes — that must replace the stored value and report an `update`, never be
+ * suppressed. Collation governs key *identity* (which row an upsert replaces); value
+ * *fidelity* is binary.
+ */
+export function rowsValueIdentical(a: readonly SqlValue[], b: readonly SqlValue[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (compareSqlValuesFast(a[i], b[i], BINARY_COLLATION) !== 0) return false;
+	}
+	return true;
+}
+
+/**
  * Optimized version of compareSqlValues that takes a pre-resolved collation function.
  * This avoids the collation lookup on every call.
  *

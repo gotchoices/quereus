@@ -125,6 +125,48 @@ describe('backing-host capability (memory reference implementation)', () => {
 			[[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
 	});
 
+	it('a value-identical upsert writes nothing and reports nothing (skip-identical contract)', async () => {
+		const host = resolveHost();
+		const conn = host.connect();
+
+		// [1,2,'b'] is the committed row, byte-identical → suppressed: no reported
+		// change, and the connection's effective state is untouched.
+		const changes = await host.applyMaintenance(conn, [{ kind: 'upsert', row: [1, 2, 'b'] }]);
+		expect(changes).to.deep.equal([]);
+		expect(await collect(host.scanEffective(conn, {}))).to.deep.equal(
+			[[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
+	});
+
+	it('the skip compares against the EFFECTIVE row (pending over committed), not committed-only', async () => {
+		const host = resolveHost();
+		const conn = host.connect();
+
+		// A prior same-transaction write changes the row's pending image…
+		expect(await host.applyMaintenance(conn, [{ kind: 'upsert', row: [1, 2, 'x'] }])).to.deep.equal(
+			[{ op: 'update', oldRow: [1, 2, 'b'], newRow: [1, 2, 'x'] }]);
+		// …so a second upsert back to the COMMITTED value is NOT a no-op relative to
+		// pending: it must report (and apply) the update.
+		expect(await host.applyMaintenance(conn, [{ kind: 'upsert', row: [1, 2, 'b'] }])).to.deep.equal(
+			[{ op: 'update', oldRow: [1, 2, 'x'], newRow: [1, 2, 'b'] }]);
+		expect(await collect(host.scanEffective(conn, { equalityPrefix: [1] }))).to.deep.equal(
+			[[1, 1, 'a'], [1, 2, 'b']]);
+	});
+
+	it('a collation-equal / byte-different upsert is NOT suppressed (re-keys the stored bytes)', async () => {
+		await db.exec("create table tc (name text collate nocase primary key, v integer) using memory");
+		await db.exec("insert into tc values ('Apple', 1)");
+		const host = resolveHost('tc');
+		const conn = host.connect();
+
+		// 'apple' NOCASE-matches the stored 'Apple' (key identity is collation-aware) but
+		// value identity is byte-faithful, so this is a real update that replaces the
+		// stored bytes — never a skip (see vtab/backing-host.ts § value-identical
+		// suppression; contrast with replace-all's collation-aware wholesale diff).
+		const changes = await host.applyMaintenance(conn, [{ kind: 'upsert', row: ['apple', 1] }]);
+		expect(changes).to.deep.equal([{ op: 'update', oldRow: ['Apple', 1], newRow: ['apple', 1] }]);
+		expect(await collect(host.scanEffective(conn, {}))).to.deep.equal([['apple', 1]]);
+	});
+
 	it('scanEffective honors equalityPrefix as a leading-PK range and descending order', async () => {
 		const host = resolveHost();
 		const conn = host.connect();

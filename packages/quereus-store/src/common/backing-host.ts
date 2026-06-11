@@ -43,6 +43,7 @@ import {
 	QuereusError,
 	StatusCode,
 	compareSqlValues,
+	rowsValueIdentical,
 	type Row,
 	type SqlValue,
 	type BackingHost,
@@ -127,13 +128,14 @@ export class StoreBackingHost implements BackingHost {
 				case 'upsert': {
 					const key = this.table.encodeDataKey(this.extractPk(op.row));
 					const existing = await this.table.readEffectiveRowByKey(key);
-					if (existing && this.rowsEqual(existing, op.row)) {
-						// Value-identical upsert (collation-aware, against the EFFECTIVE
-						// row): nothing changes, so queue no op and report nothing — the
-						// suppression contract from `mv-noop-upsert-suppression` (the
-						// normative statement lives in the engine's vtab/backing-host.ts
-						// contract comments), the point-op analogue of `replace-all`'s
-						// skip-identical diff.
+					if (existing && rowsValueIdentical(existing, op.row)) {
+						// Value-identical upsert (byte-faithful `rowsValueIdentical`,
+						// against the EFFECTIVE row): nothing changes, so queue no op and
+						// report nothing — the suppression contract whose normative
+						// statement lives in the engine's vtab/backing-host.ts. Deliberately
+						// collation-UNAWARE: a collation-equal / byte-different upsert is a
+						// real change that must replace the stored bytes and report an
+						// update.
 						break;
 					}
 					this.coordinator.put(key, serializeRow(op.row));
@@ -326,9 +328,11 @@ export class StoreBackingHost implements BackingHost {
 
 	/**
 	 * SQL-value row equality under each column's declared collation (mirrors the
-	 * memory manager's `rowsEqual`): the `replace-all` skip-identical comparison,
-	 * so equal values of differing JS identity (bigint vs number) are not
-	 * spuriously re-upserted. Rows of differing width compare unequal.
+	 * memory manager's `rowsEqual`): the **`replace-all`** wholesale diff's
+	 * skip-identical comparison ONLY, so equal values of differing JS identity
+	 * (bigint vs number) are not spuriously re-upserted. Rows of differing width
+	 * compare unequal. The point-op `upsert` skip instead uses the byte-faithful
+	 * `rowsValueIdentical` (see vtab/backing-host.ts for why the disciplines differ).
 	 */
 	private rowsEqual(a: Row, b: Row): boolean {
 		if (a.length !== b.length) return false;

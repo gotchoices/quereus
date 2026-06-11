@@ -67,7 +67,7 @@ import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import type { BackingHost, BackingRowChange, MaintenanceOp } from '../vtab/backing-host.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
-import { compareSqlValues } from '../util/comparison.js';
+import { compareSqlValues, rowsValueIdentical } from '../util/comparison.js';
 import type { MaterializedViewSchema } from '../schema/view.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { Database } from './database.js';
@@ -231,8 +231,10 @@ export interface FullRebuildPlan extends MaintenancePlanCommon {
 /**
  * The general-body residual-recompute arm: per source change, derive the affected
  * binding key(s) from the changed row, run a key-filtered residual of the body against
- * **live mid-transaction source state**, delete the old backing slice for that key, and
- * upsert the recomputed slice. Wired for the **single-source aggregate** shape
+ * **live mid-transaction source state**, and apply the keyed diff — upsert the recomputed
+ * slice (replacing the old row at the same backing key; a value-identical recompute is
+ * suppressed by the host, see vtab/backing-host.ts) or, when the residual returns
+ * nothing, delete the emptied key. Wired for the **single-source aggregate** shape
  * (`select g1,… , agg(…) from T [where P] group by g1,…` over bare group columns) by
  * `materialized-view-rowtime-residual-recompute`; the 1:1 row-preserving join shape
  * (`'row'` binding) reuses the same kernel in a follow-on ticket.
@@ -279,15 +281,17 @@ export interface ResidualRecomputePlan extends MaintenancePlanCommon {
  * `optimizer-keyed-cross-product-join-keys` advertises through `keysOf` over the lateral
  * join, with the base PK as its **leading prefix** (asserted at build).
  *
- * Per changed base row, maintenance is: **delete the whole fan-out slice by base-PK
- * prefix** (a `'delete-by-prefix'` {@link MaintenanceOp}, since one base row owns many
- * backing rows sharing the prefix), then re-run the TVF fan-out **residual** for that base
- * row and **upsert** each recomputed row. An UPDATE is delete-old-prefix + recompute-new
- * (the base PK may move); a DELETE is delete-old-prefix with no recompute; an INSERT is
- * recompute-and-upsert. This reuses the residual kernel of {@link ResidualRecomputePlan}
+ * Per changed base row, maintenance is a **keyed diff of the recomputed fan-out against
+ * the existing effective slice for the base-PK prefix** (read via the host's
+ * `scanEffective`, since one base row owns many backing rows sharing the prefix): re-run
+ * the TVF fan-out **residual** for that base row, delete only the existing keys the
+ * recompute no longer produces, and **upsert** each recomputed row (value-identical
+ * upserts are suppressed by the host). An UPDATE diffs both the OLD and NEW base keys
+ * (the base PK may move); a DELETE diffs the old slice to all-deletes; an INSERT diffs
+ * against an empty slice. This reuses the residual kernel of {@link ResidualRecomputePlan}
  * unchanged — the affected-key derivation, the `injectKeyFilter` residual (pinned to the
  * base `TableReferenceNode` with the `'pk'` prefix), reads-own-writes execution, the cost
- * gate — and differs only in the **prefix** delete (vs point-key) and the **N-row**
+ * gate — and differs only in the **prefix-slice** diff (vs point-key) and the **N-row**
  * residual (vs ≤1). The body's WHERE, if any, is part of the residual (so an out-of-scope
  * base row fans out to zero rows), exactly as in the aggregate arm.
  *
@@ -328,8 +332,9 @@ export interface PrefixDeletePlan extends MaintenancePlanCommon {
  *
  * Reuses the residual kernel of {@link ResidualRecomputePlan} on its **driving (`T`)**
  * side via {@link ForwardResidualPlan}: a `T`-keyed (`'pk'`) residual recomputes the one
- * joined row for a changed `T` row (delete old backing slice → run residual → upsert),
- * identical to a `'row'`-binding aggregate of size 1. `applyForwardResidual` drives it.
+ * joined row for a changed `T` row (run residual → upsert the recomputed row, or delete
+ * the key when it returns nothing), identical to a `'row'`-binding aggregate of size 1.
+ * `applyForwardResidual` drives it.
  *
  * The **lookup (`P`)** side is the join arm's distinct problem: the MV's `sourceTables`
  * includes `P`, so a write to `P` also fires maintenance, but the forward residual is
@@ -352,10 +357,10 @@ export interface PrefixDeletePlan extends MaintenancePlanCommon {
  *    and so add/remove a backing row, which upsert-only could never delete. The lookup side
  *    becomes **delete-capable**: `lookupMembershipResidualScheduler` is the body with
  *    `injectKeyFilter` on `P` but the WHERE **stripped** (membership only). Per affected `P`
- *    key {@link MaterializedViewManager.applyLookupResidual} runs it to delete **every**
- *    currently-referencing `T.pk` backing key, then runs the in-scope `lookupResidualScheduler`
- *    (WHERE retained) to upsert the survivors — a delete-then-upsert that converges the
- *    membership both ways.
+ *    key {@link MaterializedViewManager.applyLookupResidual} diffs it against the in-scope
+ *    `lookupResidualScheduler` (WHERE retained): membership keys the in-scope recompute no
+ *    longer produces are deleted, the in-scope rows are upserted — a keyed diff that converges
+ *    the membership both ways without churning the unchanged rows.
  *
  * Still inner/cross only; outer joins and **fanning** (non-1:1) joins continue to fall to the
  * full-rebuild floor. See `docs/incremental-maintenance.md` § join-residual and the soundness
@@ -788,7 +793,14 @@ export class MaterializedViewManager {
 	 * return the **effective** {@link BackingRowChange}(s) the backing layer realized.
 	 * An out-of-scope row (or a delete of an absent backing key) yields no change. This
 	 * body is the shipped covering-index maintenance, lifted verbatim from the former
-	 * `applyRowTimeChange`.
+	 * `applyRowTimeChange`, plus the equal-image short-circuit: an UPDATE whose old and
+	 * new projected images are value-identical (both in scope) projects to NO backing
+	 * delta — the dominant no-op echo (a source update touching only unprojected columns,
+	 * or rewriting a projected column to its existing value) is suppressed before any
+	 * backing-connection work. Accurate by the maintenance invariant (the backing row IS
+	 * the old image's projection), so nothing would have changed; the host's
+	 * value-identical upsert skip (vtab/backing-host.ts) remains the effective-state
+	 * backstop for the paths that do emit ops.
 	 */
 	private async applyInverseProjection(
 		plan: InverseProjectionPlan,
@@ -808,9 +820,24 @@ export class MaterializedViewManager {
 			if (inScope(change.oldRow)) ops.push({ kind: 'delete-key', key: keyOf(project(change.oldRow)) });
 		} else {
 			// UPDATE: delete the old image if it was in scope, upsert the new image if
-			// it is — covers predicate-scope transitions and key-changing updates.
-			if (inScope(change.oldRow)) ops.push({ kind: 'delete-key', key: keyOf(project(change.oldRow)) });
-			if (inScope(change.newRow)) ops.push({ kind: 'upsert', row: project(change.newRow) });
+			// it is — covers predicate-scope transitions and key-changing updates. The
+			// scope check reads the SOURCE row (the predicate may reference unprojected
+			// columns), so both images must be in scope for the equal-image short-circuit.
+			const oldIn = inScope(change.oldRow);
+			const newIn = inScope(change.newRow);
+			if (oldIn && newIn) {
+				const oldImage = project(change.oldRow);
+				const newImage = project(change.newRow);
+				// Byte-faithful identity (rowsValueIdentical): subsumes key equality, and a
+				// collation-equal / byte-different image is NOT suppressed (it must re-key
+				// the stored bytes) — the same discipline as the host-level upsert skip.
+				if (rowsValueIdentical(oldImage, newImage)) return [];
+				ops.push({ kind: 'delete-key', key: keyOf(oldImage) });
+				ops.push({ kind: 'upsert', row: newImage });
+			} else {
+				if (oldIn) ops.push({ kind: 'delete-key', key: keyOf(project(change.oldRow)) });
+				if (newIn) ops.push({ kind: 'upsert', row: project(change.newRow) });
+			}
 		}
 		if (ops.length === 0) return [];
 
@@ -1735,12 +1762,15 @@ export class MaterializedViewManager {
 
 	/**
 	 * Compute a **forward** key-filtered residual plan's per-row backing delta and apply it:
-	 * derive the affected binding key(s) from the changed row (OLD ∪ NEW, deduped), and for
-	 * each — delete the old backing slice for that key, re-run the key-filtered residual
-	 * against live source state, and upsert the recomputed slice. An emptied slice (residual
-	 * returns nothing) leaves only the delete, removing the stale backing row. Returns the
-	 * effective {@link BackingRowChange}(s) the backing layer realized, for the MV-over-MV
-	 * cascade.
+	 * derive the affected binding key(s) from the changed row (OLD ∪ NEW, deduped), re-run
+	 * the key-filtered residual against live source state for each, and apply the **keyed
+	 * diff**: a non-empty recomputed slice is upserted (the backing key IS the affected key,
+	 * so the upsert replaces the old row wholesale — no delete-first — and the host's
+	 * value-identical upsert skip turns a no-op recompute into ZERO effective changes
+	 * instead of delete+insert churn); an emptied slice (residual returns nothing) emits the
+	 * point delete, removing the stale backing row (nothing reported if it was already
+	 * absent). Returns the effective {@link BackingRowChange}(s) the backing layer realized,
+	 * for the MV-over-MV cascade — a real same-key change now reports one `update`.
 	 *
 	 * Shared by the single-source aggregate (`'residual-recompute'`, group key, ≤1 row per
 	 * key) and the 1:1-join (`'join-residual'`, the driving table `T`'s PK, exactly the one
@@ -1778,9 +1808,8 @@ export class MaterializedViewManager {
 
 		const ops: MaintenanceOp[] = [];
 		for (const { keyTuple, keyVals, deleteKey } of affected.values()) {
-			ops.push({ kind: 'delete-key', key: deleteKey });
 			const recomputed = await this.runResidual(plan.residualScheduler, plan.bindParamPrefix, keyTuple);
-			// Upsert only the recomputed rows whose backing key equals the affected key.
+			// Keep only the recomputed rows whose backing key equals the affected key.
 			// The residual for key K must only contribute K's slice; any other row is
 			// spurious and is dropped. This is the soundness net for an emptied group: when
 			// no source row matches the key, a *correct* grouped residual returns zero rows,
@@ -1790,8 +1819,16 @@ export class MaterializedViewManager {
 			// `fix/optimizer-constant-group-aggregate-empty-input-spurious-row`). That row's
 			// key ≠ K, so it is filtered here and the delete-without-upsert correctly removes
 			// the emptied group's backing row.
-			for (const row of recomputed) {
-				if (this.residualRowMatchesKey(plan, row, keyVals)) ops.push({ kind: 'upsert', row });
+			const slice = recomputed.filter(row => this.residualRowMatchesKey(plan, row, keyVals));
+			if (slice.length === 0) {
+				// Emptied slice: delete-without-upsert removes the stale backing row (the
+				// host reports nothing if the key was already absent).
+				ops.push({ kind: 'delete-key', key: deleteKey });
+			} else {
+				// The slice shares the affected backing key, so each upsert REPLACES the old
+				// backing row — no delete-first — and the host's value-identical skip
+				// (vtab/backing-host.ts) suppresses a recompute that changed nothing.
+				for (const row of slice) ops.push({ kind: 'upsert', row });
 			}
 		}
 		if (ops.length === 0) return [];
@@ -1864,14 +1901,16 @@ export class MaterializedViewManager {
 	 * `P`, a `P` write can flip a joined row's WHERE truth and so add or remove its backing row —
 	 * which the in-scope upsert above (it returns *only* in-scope rows) could never delete. The
 	 * builder then supplies `lookupMembershipResidualScheduler` (the body with the WHERE stripped,
-	 * keyed on `P`). Per affected `P` key this runs the membership residual first and **deletes**
-	 * the `T.pk` backing key of **every** currently-referencing `T` row (regardless of scope —
-	 * the delete keys come from live `T` via the join, so they match existing backing keys and
-	 * touch nothing belonging to another `P`), then runs the in-scope residual and **upserts** the
-	 * survivors. A row leaving scope is deleted and not re-upserted (removed); a row entering
-	 * scope is deleted (a no-op if absent) and re-upserted (added); an unchanged in-scope row is
-	 * deleted then re-upserted (refreshed). The membership residual MUST ignore the WHERE — else a
-	 * row leaving scope would never be deleted.
+	 * keyed on `P`). Per affected `P` key this runs both residuals against the same live state and
+	 * applies the **keyed diff**: it **deletes** only the membership keys the in-scope recompute no
+	 * longer produces (rows that left scope — the delete keys come from live `T` via the join, so
+	 * they match existing backing keys and touch nothing belonging to another `P`; membership and
+	 * in-scope rows read the same live state, so their key bytes match exactly), and **upserts**
+	 * every in-scope row. A row leaving scope is deleted (removed); a row entering scope is
+	 * upserted (added); an unchanged in-scope row's upsert is suppressed by the host's
+	 * value-identical skip (vtab/backing-host.ts) — ZERO effective changes instead of the former
+	 * delete+insert refresh churn; a changed in-scope row reports one `update`. The membership
+	 * residual MUST ignore the WHERE — else a row leaving scope would never be deleted.
 	 *
 	 * A `T`-side membership change (insert/delete/FK-move) is the *forward* path's job and fires
 	 * its own maintenance. Returns the effective {@link BackingRowChange}(s) for the MV-over-MV
@@ -1896,18 +1935,25 @@ export class MaterializedViewManager {
 
 		const ops: MaintenanceOp[] = [];
 		for (const keyTuple of affected.values()) {
-			// Delete-capable (P-referencing WHERE): membership residual (WHERE stripped) →
-			// delete every currently-referencing T.pk backing key BEFORE re-upserting survivors,
-			// so a row that left the WHERE scope is removed. Ordering matters — deletes precede
-			// upserts so an unchanged in-scope row is refreshed, not dropped.
+			const recomputed = await this.runResidual(plan.lookupResidualScheduler, plan.lookupBindParamPrefix, keyTuple);
+			// Delete-capable (P-referencing WHERE): keyed diff of the membership residual
+			// (WHERE stripped) against the in-scope recompute — delete ONLY the membership
+			// keys the recompute no longer produces (rows that left the WHERE scope), not
+			// every member. Both residuals read the same live state, so a surviving row's
+			// key bytes match exactly (the byte-canonical set lookup is exact). Deletes
+			// precede upserts, preserving the prior arm's ordering discipline.
 			if (plan.lookupMembershipResidualScheduler) {
+				const produced = new Set(recomputed.map(row =>
+					canonKeyValues(plan.backingPkDefinition.map(d => row[d.index]))));
 				const members = await this.runResidual(plan.lookupMembershipResidualScheduler, plan.lookupBindParamPrefix, keyTuple);
 				for (const row of members) {
-					const key = buildPrimaryKeyFromValues(plan.backingPkDefinition.map(d => row[d.index]), plan.backingPkDefinition);
-					ops.push({ kind: 'delete-key', key });
+					const keyVals = plan.backingPkDefinition.map(d => row[d.index]);
+					if (produced.has(canonKeyValues(keyVals))) continue; // still in scope — upserted below
+					ops.push({ kind: 'delete-key', key: buildPrimaryKeyFromValues(keyVals, plan.backingPkDefinition) });
 				}
 			}
-			const recomputed = await this.runResidual(plan.lookupResidualScheduler, plan.lookupBindParamPrefix, keyTuple);
+			// Upsert every in-scope row; the host's value-identical skip suppresses the
+			// unchanged ones (an in-scope refresh that changed nothing reports nothing).
 			for (const row of recomputed) ops.push({ kind: 'upsert', row });
 		}
 		if (ops.length === 0) return [];
@@ -2025,7 +2071,8 @@ export class MaterializedViewManager {
 			// Soundness precondition for the binary prefix scan (the property
 			// `prefix-delete-noncase-collation-regression-test` locks in): the backing base-PK
 			// column MUST inherit the source PK column's collation. The btree orders this prefix
-			// by `d.collation`, but `delete-by-prefix` early-terminates the prefix scan on a
+			// by `d.collation`, but the keyed diff's existing-slice read (`scanEffective` with
+			// the base prefix, in `applyPrefixDelete`) early-terminates the prefix scan on a
 			// BINARY compare (scan-layer.ts) — sound ONLY because source-PK uniqueness under that
 			// collation collapses each collation class to a single binary value, so a base row's
 			// fan-out rows are binary-homogeneous and contiguous. A backing collation MORE
@@ -2107,16 +2154,32 @@ export class MaterializedViewManager {
 	/**
 	 * Compute a `'prefix-delete'` plan's per-row backing delta and apply it: derive the
 	 * affected base key(s) from the changed row (OLD ∪ NEW, deduped on the base key), and
-	 * for each — **delete the whole fan-out slice by base-PK prefix**, re-run the
-	 * base-PK-keyed residual against live source state, and **upsert** each recomputed
-	 * fan-out row. A base-PK-changing UPDATE recomputes both the OLD base key (slice
-	 * removed; residual returns nothing for the now-absent old PK) and the NEW base key
-	 * (new fan-out upserted); a DELETE removes the old slice with no recompute; an INSERT
-	 * recomputes-and-upserts (its prefix delete is a no-op). Returns the effective
+	 * for each — re-run the base-PK-keyed residual against live source state and apply the
+	 * **keyed diff against the existing effective fan-out slice** (read via the host's
+	 * `scanEffective` with the base prefix, pending over committed — the same contiguous
+	 * range the former wholesale `'delete-by-prefix'` removed): delete ONLY the existing
+	 * keys the recompute no longer produces, upsert every recomputed row (the host's
+	 * value-identical skip suppresses the unchanged ones). A base-PK-changing UPDATE
+	 * recomputes both the OLD base key (slice diffs to all-deletes; the residual returns
+	 * nothing for the now-absent old PK) and the NEW base key (new fan-out upserted); a
+	 * DELETE diffs the old slice to all-deletes; an INSERT diffs against an empty slice
+	 * (all upserts). An emptied/shrunk fan-out keeps the delete-without-upsert exactly —
+	 * a disappearance is never "skipped". Returns the effective
 	 * {@link BackingRowChange}(s) the backing layer realized, for the MV-over-MV cascade.
 	 *
+	 * Prefix-scan soundness is unchanged from the wholesale arm: the diff's slice read
+	 * uses the same binary `equalityPrefix` scan `'delete-by-prefix'` used, sound under
+	 * the build-time collation gate (the backing base-PK prefix inherits the source PK
+	 * collation, and source-PK uniqueness collapses each collation class to one binary
+	 * value). The stored slice's prefix bytes always equal the OLD image's (the slice was
+	 * projected from that very source row), and OLD ∪ NEW both iterate, so a case-only
+	 * base-PK rewrite still converges: the OLD-prefix pass pairs the slice with the
+	 * recomputed rows (key pairing is collation-aware — the btree's identity — so a
+	 * collation-equal key is REPLACED by its upsert, never also deleted) and the byte
+	 * change surfaces as `update`s that re-key the stored bytes.
+	 *
 	 * Structurally the same as {@link applyForwardResidual}, differing only in the
-	 * **prefix** delete (one base row owns N backing rows sharing the prefix) and the
+	 * **prefix-slice** diff (one base row owns N backing rows sharing the prefix) and the
 	 * **N-row** residual. Per-row recompute is correct without per-statement batching: the
 	 * residual reads live (reads-own-writes) state, so the last write to a base key produces
 	 * the authoritative slice. (Statement-level dedup of distinct base keys is the same
@@ -2128,9 +2191,9 @@ export class MaterializedViewManager {
 		cache?: BackingConnectionCache,
 	): Promise<BackingRowChange[]> {
 		// Distinct affected base keys (OLD ∪ NEW), deduped on the base-PK values. `keyTuple`
-		// binds the residual (`pk{i}`); `prefix` is the by-prefix delete key (the base-PK
-		// values in backing-PK order — identical here since the base PK leads the backing
-		// PK, but kept distinct for clarity).
+		// binds the residual (`pk{i}`); `prefix` is the slice's leading-PK equality key (the
+		// base-PK values in backing-PK order — identical here since the base PK leads the
+		// backing PK, but kept distinct for clarity).
 		const affected = new Map<string, { keyTuple: SqlValue[]; prefix: SqlValue[] }>();
 		const addFrom = (row: Row): void => {
 			const keyTuple = plan.bindColumns.map(c => row[c]);
@@ -2142,19 +2205,9 @@ export class MaterializedViewManager {
 		else if (change.op === 'delete') addFrom(change.oldRow);
 		else { addFrom(change.oldRow); addFrom(change.newRow); }
 
-		const ops: MaintenanceOp[] = [];
-		for (const { keyTuple, prefix } of affected.values()) {
-			ops.push({ kind: 'delete-by-prefix', keyPrefix: prefix });
-			const recomputed = await this.runResidual(plan.residualScheduler, plan.bindParamPrefix, keyTuple);
-			// Upsert each recomputed fan-out row. The residual for base key K filters T to K,
-			// so every row it returns shares K's base-PK prefix; the prefix-match guard is a
-			// defensive soundness net (mirrors the aggregate arm's `residualRowMatchesKey`).
-			for (const row of recomputed) {
-				if (this.residualRowMatchesBasePrefix(plan, row, prefix)) ops.push({ kind: 'upsert', row });
-			}
-		}
-		if (ops.length === 0) return [];
-
+		// Resolved up front (unlike the point-op arms): the keyed diff reads the existing
+		// effective slice before any op exists. The former wholesale arm always emitted ops,
+		// so this resolves no more connections than it did.
 		const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
 		if (!backing) {
 			throw new QuereusError(
@@ -2164,7 +2217,52 @@ export class MaterializedViewManager {
 		}
 		const host = this.backingHost(backing);
 		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+
+		const ops: MaintenanceOp[] = [];
+		for (const { keyTuple, prefix } of affected.values()) {
+			const recomputed = await this.runResidual(plan.residualScheduler, plan.bindParamPrefix, keyTuple);
+			// The residual for base key K filters T to K, so every row it returns shares K's
+			// base-PK prefix; the prefix-match guard is a defensive soundness net (mirrors
+			// the aggregate arm's `residualRowMatchesKey`).
+			const slice = recomputed.filter(row => this.residualRowMatchesBasePrefix(plan, row, prefix));
+			// Existing effective fan-out rows for this base prefix (pending over committed).
+			const existing: Row[] = [];
+			for await (const row of host.scanEffective(connection, { equalityPrefix: prefix })) {
+				existing.push(row);
+			}
+			// Keyed diff. Key pairing is collation-aware over the full backing PK (the btree's
+			// identity): a recomputed row whose key is collation-equal to an existing row
+			// REPLACES it via the upsert below, so it must not also be deleted. Deletes precede
+			// upserts (the wholesale arm's ordering discipline). The delete keys are built from
+			// the EXISTING rows' stored values, so the host's collation-aware point lookup
+			// always finds them.
+			for (const ex of existing) {
+				if (slice.some(row => this.backingPkEqual(plan.backingPkDefinition, row, ex))) continue;
+				ops.push({
+					kind: 'delete-key',
+					key: buildPrimaryKeyFromValues(plan.backingPkDefinition.map(d => ex[d.index]), plan.backingPkDefinition),
+				});
+			}
+			for (const row of slice) ops.push({ kind: 'upsert', row });
+		}
+		if (ops.length === 0) return [];
 		return host.applyMaintenance(connection, ops);
+	}
+
+	/**
+	 * True iff two backing rows agree on every backing-PK column under that column's
+	 * collation — the btree's key identity. Pairs an existing slice row with the
+	 * recomputed row that replaces it in {@link applyPrefixDelete}'s keyed diff.
+	 */
+	private backingPkEqual(
+		pkDef: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>,
+		a: Row,
+		b: Row,
+	): boolean {
+		for (const d of pkDef) {
+			if (compareSqlValues(a[d.index], b[d.index], d.collation) !== 0) return false;
+		}
+		return true;
 	}
 
 	/**

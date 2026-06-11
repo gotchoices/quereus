@@ -74,6 +74,7 @@ export {
 	// Core comparison functions (critical for module implementations)
 	compareSqlValues,
 	compareSqlValuesFast,
+	rowsValueIdentical,
 	compareRows,
 	compareTypedValues,
 	createTypedComparator,

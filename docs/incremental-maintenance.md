@@ -70,14 +70,16 @@ covering structure answers it.
 > `{ kind: 'group'; groupColumns }`, built directly from the aggregate's bare GROUP BY
 > — *not* via `extractBindings`, whose `'group'` classification additionally demands the
 > group key cover a *source* unique key and so reports `'global'` for the common
-> `group by <non-key>` body), deletes that group's old backing slice, runs the residual
-> bound to the affected key against **live mid-transaction source state**
-> (reads-own-writes, the same emit → `Scheduler` path the assertion evaluator uses), and
-> upserts the recomputed group row. A group-key-changing UPDATE recomputes both the OLD
-> and NEW groups; an emptied group's residual returns zero rows, so the delete-without-
-> upsert removes its backing row. Per-row recompute is correct without per-statement
-> batching — every change to a group recomputes it from live state, so the last write
-> wins.
+> `group by <non-key>` body), runs the residual bound to the affected key against **live
+> mid-transaction source state** (reads-own-writes, the same emit → `Scheduler` path the
+> assertion evaluator uses), and upserts the recomputed group row — the backing key IS
+> the group key, so the upsert replaces the old row wholesale (no delete-first), and a
+> value-identical recompute is suppressed by the host's skip-identical upsert
+> ([materialized-views.md § no-op suppression](materialized-views.md#value-identical-no-op-write-suppression)).
+> A group-key-changing UPDATE recomputes both the OLD and NEW groups; an emptied group's
+> residual returns zero rows, which maps to the point delete that removes its backing
+> row. Per-row recompute is correct without per-statement batching — every change to a
+> group recomputes it from live state, so the last write wins.
 >
 > **The `'join-residual'` arm — the same kernel with a `'row'`/`'pk'` binding, plus a
 > reverse residual for the lookup side.** A **1:1 row-preserving inner/cross join** body
@@ -88,9 +90,9 @@ covering structure answers it.
 > set to `T`'s PK (`'row'`/`'pk'`). The 1:1 join collapses the composite product key `keysOf`
 > advertises to `T`'s PK, so the backing is keyed on `T`'s PK and each changed `T` row maps to
 > one backing row. A write to `T` (the **driving** side) is therefore identical to a size-1
-> group: delete the old backing slice keyed on `T.pk`, run the `T`-keyed residual (`… where
-> T.pk = :pk0`, ≤1 joined row), upsert — driven by the *same* `applyForwardResidual` the
-> aggregate arm uses.
+> group: run the `T`-keyed residual (`… where T.pk = :pk0`, ≤1 joined row), upsert the
+> recomputed row (or delete the key when it returns nothing) — driven by the *same*
+> `applyForwardResidual` the aggregate arm uses.
 >
 > The join arm's distinct problem is the **lookup side (`P`)**: the MV's `sourceTables`
 > includes `P`, so a write to `P` fires maintenance too, but the forward residual is keyed on
@@ -117,11 +119,13 @@ covering structure answers it.
 > `P` write — adding or removing a backing row the upsert-only path could never delete — so the
 > reverse path becomes **delete-capable**: the plan carries a third residual, the body with the
 > `WHERE` **stripped** and `injectKeyFilter` on `P` (membership only). Per affected `P` key it runs
-> that membership residual to `delete` **every** currently-referencing `T.pk` backing key (the
-> delete keys come from live `T` via the join, so they match existing backing keys and never touch
-> another `P`'s rows), then runs the in-scope reverse residual (`WHERE` retained) to `upsert` the
-> survivors — a delete-then-upsert that converges the membership both ways. The membership residual
-> **must** ignore the `WHERE`, else a row leaving scope would never be deleted. Outer joins are
+> both residuals against the same live state and applies the keyed diff: `delete` only the
+> membership `T.pk` backing keys the in-scope recompute no longer produces (rows that left scope —
+> the delete keys come from live `T` via the join, so they match existing backing keys and never
+> touch another `P`'s rows), and `upsert` every in-scope row (`WHERE` retained; an unchanged row's
+> upsert is suppressed by the host's skip-identical contract) — converging the membership both ways
+> without churning the unchanged members. The membership residual **must** ignore the `WHERE`,
+> else a row leaving scope would never be deleted. Outer joins are
 > still declined (filtering `P` for the reverse residual would drop their null-extended rows), and a
 > **fanning** (non-1:1) keyed join is declined too — the builder returns `null` and the body falls
 > to the full-rebuild floor.
@@ -140,10 +144,13 @@ covering structure answers it.
 > `TableReferenceNode`, the per-statement batched accumulator, the cost gate, reads-own-
 > writes execution. The backing PK is the **composite product key** `(T.pk ∪ tvf-key)`
 > that `keysOf` advertises across the lateral join (`optimizer-keyed-cross-product-join-
-> keys`), with the base PK as its leading prefix (asserted at build). Per source change:
-> delete-by-prefix the OLD base PK's whole slice, re-run the residual for the NEW base PK,
-> upsert each fanned row (a base-PK-changing UPDATE processes both, OLD ∪ NEW deduped); the
-> body's WHERE is part of the residual, so an out-of-scope base row fans out to zero rows.
+> keys`), with the base PK as its leading prefix (asserted at build). Per source change
+> (OLD ∪ NEW base keys, deduped): re-run the residual for the affected base PK and apply
+> the keyed diff against the existing effective slice (read via the host's `scanEffective`
+> with the base prefix) — delete only the existing keys the recompute no longer produces,
+> upsert each fanned row (value-identical upserts suppressed by the host); the body's
+> WHERE is part of the residual, so an out-of-scope base row fans out to zero rows (an
+> all-deletes diff).
 > (The natural next consumer is a **fanning keyed join** — a non-1:1 inner/cross join — that
 > reuses this same by-prefix delete + product key, the join standing in for the TVF fan-out;
 > deferred to a follow-on ticket.)
@@ -157,7 +164,11 @@ covering structure answers it.
 > early-terminates on a prefix mismatch), then `recordDelete`s each matched row with the
 > **same** per-row bookkeeping (secondary indexes, change tracking) the point `delete-key`
 > arm uses. The op is therefore the prefix-keyed analogue of `delete-key` — one base row's
-> fan-out replaced as a unit.
+> fan-out replaced as a unit. (Since `mv-noop-upsert-suppression` converted the
+> prefix-delete arm to a keyed diff over the same prefix range, the engine no longer
+> *produces* this op; it remains part of the host contract — implemented by both hosts and
+> pinned by `test/vtab/maintenance-prefix-delete.spec.ts` — available to future consumers
+> such as the fanning-keyed-join arm.)
 >
 > **The `replace-all` `MaintenanceOp` — the whole-table primitive for the full-rebuild arm.**
 > Where `delete-key` replaces a point-keyed slice and `delete-by-prefix` a prefix-keyed slice,
