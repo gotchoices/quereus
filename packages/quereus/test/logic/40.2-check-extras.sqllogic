@@ -415,3 +415,11 @@ insert into t_riv_new values (1, 'x', 'x');
 select * from t_riv_new where a = 'x';
 → [{"id":1,"a":"x","b":"x"}]
 drop table t_riv_new;
+
+-- control: new.-qualified facts still fold contradictions end-to-end, same as
+-- the bare spelling.
+create table t_riv_newfold (id integer primary key, v integer, check (new.v > 0)) using memory;
+insert into t_riv_newfold values (1, 5);
+select * from t_riv_newfold where v <= 0;
+→ []
+drop table t_riv_newfold;
