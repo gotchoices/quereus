@@ -16,6 +16,16 @@ export function planAppliesToKey(
 		return keyComparator(key, plan.equalityKey) === 0;
 	}
 
+	// A NULL seek value admits no key: `v <op> NULL` and `v = NULL` are NULL,
+	// never true. Reachable when a parameter or correlated value binds NULL at
+	// runtime — plan-time literal NULLs never get here (constraint extraction
+	// declines range bounds; the access-path rule emits EmptyResult for seeks).
+	// Without this, compareSqlValues ranks every key above a NULL bound (key
+	// ordering), so `col > ?` bound to NULL would admit every row, and a NULL
+	// prefix component would equality-match stored NULL index entries.
+	if (plan.lowerBound?.value === null || plan.upperBound?.value === null) return false;
+	if (plan.equalityPrefix?.some(v => v === null)) return false;
+
 	// Prefix-range: check prefix equality + trailing column bounds. The prefix and
 	// bound compares honour the index columns' declared collations (threaded onto the
 	// plan) so a non-BINARY seek matches exactly the collation-correct window; an

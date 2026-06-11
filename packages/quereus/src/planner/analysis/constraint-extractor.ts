@@ -374,6 +374,13 @@ function extractBinaryConstraint(
     finalOp = baseOp ? flipOperator(baseOp) : null;
 	}
 
+  // `col op NULL` is never true (3VL). A pushed range bound would instead apply
+  // key ordering — where NULL sorts below everything, so `> NULL` matches every
+  // row — so decline and leave the conjunct as a residual filter. Equality stays
+  // extractable: the access-path literal-NULL seek check (rule-select-access-path)
+  // emits an EmptyResult for it.
+  if (constant === null && finalOp !== '=') return null;
+
   if (!columnRef || !finalOp) {
 		log('No column-constant pattern found in binary expression');
 		return null;
@@ -462,6 +469,9 @@ function extractBetweenConstraints(
 
   const lowVal = getLiteralValue(low);
   const upVal = getLiteralValue(up);
+  // A NULL bound makes BETWEEN never true (3VL); leave as residual rather than
+  // pushing a seek bound that key ordering would satisfy.
+  if (lowVal === null || upVal === null) return null;
   return [
     {
       columnIndex,
