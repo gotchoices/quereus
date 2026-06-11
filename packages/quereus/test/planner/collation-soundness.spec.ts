@@ -173,6 +173,22 @@ describe('Collation soundness of plan-time equality facts', () => {
 			}
 		});
 
+		it('USING over asymmetric declared collations mints no key claims (gate returns null → generic join)', async () => {
+			await db.exec('create table j7 (a integer primary key, k text collate nocase) using memory');
+			await db.exec('create table j8 (k text primary key, z integer) using memory');
+			await db.exec("insert into j7 values (1,'BOB')");
+			await db.exec("insert into j8 values ('Bob',1), ('bob',2)");
+			// extractEquiPairsFromUsing rejects the mismatched pair, so no physical
+			// equi-join (and no pair-derived key coverage) may fire; the generic
+			// nested-loop join compares under the left side's collation (NOCASE),
+			// matching BOTH right case-variants — duplicated `a` on the output.
+			const q = 'select j7.a as a, j8.z as z from j7 join j8 using (k)';
+			const root = rootOf(db, q);
+			const rows = await collect(db, q);
+			expect(rows.length).to.equal(2);
+			expect(keysOf(root).some(k => k.length === 1 && k[0] === 0), 'key {a} over-claimed with duplicated a').to.equal(false);
+		});
+
 		it('matched-collation (NOCASE=NOCASE) joins still match case-insensitively', async () => {
 			await db.exec('create table j5 (a integer primary key, k text collate nocase) using memory');
 			await db.exec('create table j6 (d text collate nocase primary key, z integer) using memory');

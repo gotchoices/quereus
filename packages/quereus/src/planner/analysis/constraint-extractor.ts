@@ -1023,6 +1023,11 @@ function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
 		const colSide = columnSideOf(src, c.attributeId);
 		return colSide !== undefined && operandCollation(colSide) === eff;
 	}
+	// Every `op: '='` constraint today is minted by `extractBinaryConstraint`
+	// with the BinaryOpNode itself as `sourceExpression` (OR collapse emits
+	// only 'IN'/'OR_RANGE'), so this permissive fallback is unreachable for
+	// equalities. If a new producer mints '=' constraints from another shape,
+	// it must either carry the comparison or be gated here explicitly.
 	return true;
 }
 
