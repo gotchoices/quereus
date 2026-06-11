@@ -51,6 +51,7 @@ export {
 	buildCatalogKey,
 	buildViewCatalogKey,
 	buildMaterializedViewCatalogKey,
+	parseMaterializedViewCatalogKey,
 	buildMetaCatalogKey,
 	CLEAN_SHUTDOWN_META_NAME,
 	classifyCatalogKey,

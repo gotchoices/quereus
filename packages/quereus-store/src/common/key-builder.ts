@@ -18,6 +18,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { encodeCompositeKey, type EncodeOptions } from './encoding.js';
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 /**
  * Store name suffixes for different data types.
@@ -171,6 +172,19 @@ export function buildMaterializedViewCatalogKey(schemaName: string, mvName: stri
 }
 
 /**
+ * Inverse of {@link buildMaterializedViewCatalogKey}: recover the qualified
+ * lowercased `schema.mv` name from a `\x00mview\x00…` catalog key by stripping the
+ * reserved prefix. Used by `rehydrateCatalog` to name each MV entry so the
+ * store can withhold the adopt fast path per-entry (the stale-at-close set in the
+ * clean-shutdown marker is keyed by this same `schema.mv` string). The caller has
+ * already classified the key as a materialized view ({@link classifyCatalogKey});
+ * the returned string is treated as opaque (never `.`-split).
+ */
+export function parseMaterializedViewCatalogKey(key: Uint8Array): string {
+	return decoder.decode(key.subarray(MVIEW_KEY_PREFIX_BYTES.length));
+}
+
+/**
  * Build a catalog key for a store-internal meta entry (not DDL). Format:
  * `\x00meta\x00{name}` — same reserved leading-`0x00` scheme as the view/MV
  * prefixes, so a meta key can never collide with a table entry, and the 'm'-vs
@@ -188,6 +202,12 @@ export function buildMetaCatalogKey(name: string): Uint8Array {
  * immediately deleted — single-use) by `rehydrateCatalog`. Its presence at open
  * attests no crash since the last close, which is the trust basis for the
  * materialized-view adopt-without-refill fast path.
+ *
+ * The marker **value** is a JSON array of the qualified lowercased `schema.mv`
+ * names that were stale-at-close (row-time maintenance detached, so the durable
+ * backing may be behind) — see {@link parseMaterializedViewCatalogKey}. `[]` is
+ * the common clean case (nothing stale). Any unparseable / wrong-shape payload
+ * (including a legacy bare `'1'`) degrades to refill-everything: the safe posture.
  */
 export const CLEAN_SHUTDOWN_META_NAME = 'clean_shutdown';
 

@@ -226,12 +226,20 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 
 		// Session 2: widen the source so the `select *` body produces three columns
 		// under the two-column declared list — the entry can never materialize.
-		// Clean close, so every gate up to the arity check passes on the next open.
 		const s2 = await reopen();
 		expect(s2.result.errors).to.have.lengthOf(0);
 		await s2.db.exec('alter table src add column w integer default 7');
 		await s2.mod.closeAll();
 		await plantSentinel('main._mv_mv', [99, 990]);
+
+		// The `alter table src` marked mv stale, so closeAll's marker names it —
+		// which would force the *refill* path (drop-then-rebuild, covered by the
+		// stale-at-close tests). Re-arm full trust here to isolate the *adopt* path's
+		// handling of a body that can never materialize: its arity check fires BEFORE
+		// any drop (`tryAdoptPreExistingBacking`), so the durable backing survives as a
+		// plain table for a later DDL fix instead of being destroyed for nothing.
+		const catalog = await provider.getCatalogStore();
+		await catalog.put(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME), new TextEncoder().encode('[]'));
 
 		const { db: db3, result } = await reopen();
 		expect(result.errors, 'one per-entry error').to.have.lengthOf(1);
@@ -385,6 +393,149 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		const afterRefill = await snapshot();
 
 		expect(afterAdopt, 'an adopted and a refilled MV leave identical catalog bytes').to.deep.equal(afterRefill);
+	});
+
+	describe('stale-at-close exclusion', () => {
+		/** Read the raw clean-shutdown marker value, or undefined when absent. */
+		async function markerValue(): Promise<string | undefined> {
+			const catalog = await provider.getCatalogStore();
+			const raw = await catalog.get(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME));
+			return raw ? new TextDecoder().decode(raw) : undefined;
+		}
+
+		it('a stale-at-close MV refills even under a clean shutdown (create index + post-stale DML)', async () => {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			await db.exec('create materialized view mv using store as select id, v from src');
+			// `create index` fires `table_modified` on src ⇒ mv goes stale and its
+			// row-time maintenance detaches. Pin the trigger.
+			await db.exec('create index i on src(v)');
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale, 'create index marked the MV stale')
+				.to.equal(true);
+			// NOT propagated to the backing (maintenance detached) — the divergence.
+			await db.exec('insert into src values (3, 30)');
+			await mod.closeAll();
+			expect(await markerValue(), 'marker names the stale MV').to.equal('["main.mv"]');
+			await plantSentinel('main._mv_mv', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors, 'rehydrate clean').to.have.lengthOf(0);
+			// Refilled: the post-stale row is present and both the sentinel and the
+			// behind-backing are scrubbed. A stale adopt would have served [1,2,99].
+			expect(await rows(db2, 'select id, v from mv order by id'), 'refilled to current source content')
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
+			expect(db2.schemaManager.getMaterializedView('main', 'mv')!.stale ?? false, 'refill cleared staleness')
+				.to.equal(false);
+		});
+
+		it('a stale-then-refreshed MV adopts (refresh clears the flag before close)', async () => {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			await db.exec('create materialized view mv using store as select id, v from src');
+			await db.exec('create index i on src(v)');
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale).to.equal(true);
+			// refresh re-materializes and re-arms maintenance, clearing `stale`.
+			await db.exec('refresh materialized view mv');
+			expect(db.schemaManager.getMaterializedView('main', 'mv')!.stale ?? false, 'refresh cleared staleness')
+				.to.equal(false);
+			// Post-refresh DML now propagates to the backing again.
+			await db.exec('insert into src values (3, 30)');
+			await mod.closeAll();
+			expect(await markerValue(), 'nothing stale at close').to.equal('[]');
+			await plantSentinel('main._mv_mv', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			// Adopted: the sentinel survives and serves (a refill would scrub it).
+			expect(await rows(db2, 'select id, v from mv order by id'), 'adopted (not stale at close)')
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }, { id: 99, v: 990 }]);
+		});
+
+		it('fine-grained: only the stale-at-close MV refills, the live one adopts', async () => {
+			const { db, mod } = open();
+			await db.exec('create table a (id integer primary key, v integer) using store');
+			await db.exec('create table b (id integer primary key, v integer) using store');
+			await db.exec('insert into a values (1, 10)');
+			await db.exec('insert into b values (1, 100)');
+			await db.exec('create materialized view amv using store as select id, v from a');
+			await db.exec('create materialized view bmv using store as select id, v from b');
+			// Only `a` is altered ⇒ only amv goes stale; bmv stays live.
+			await db.exec('create index ia on a(v)');
+			expect(db.schemaManager.getMaterializedView('main', 'amv')!.stale, 'amv stale').to.equal(true);
+			expect(db.schemaManager.getMaterializedView('main', 'bmv')!.stale ?? false, 'bmv live').to.equal(false);
+			await mod.closeAll();
+			expect(await markerValue(), 'marker names only the stale MV').to.equal('["main.amv"]');
+			await plantSentinel('main._mv_amv', [99, 990]);
+			await plantSentinel('main._mv_bmv', [98, 980]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db2, 'select id from amv where id = 99'), 'stale amv refilled — sentinel scrubbed')
+				.to.deep.equal([]);
+			expect(await rows(db2, 'select id from bmv where id = 98'), 'live bmv adopted — sentinel survives')
+				.to.deep.equal([{ id: 98 }]);
+		});
+
+		it('MV-over-MV: a stale upstream cascades, both refill', async () => {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			await db.exec('create materialized view mv1 using store as select id, v from src');
+			await db.exec('create materialized view mv2 using store as select id, v from mv1');
+			// Index on mv1's source marks mv1 stale; the backing-invalidation cascade
+			// (synthetic `table_modified` on `_mv_mv1`) marks mv2 stale too.
+			await db.exec('create index i on src(v)');
+			expect(db.schemaManager.getMaterializedView('main', 'mv1')!.stale, 'mv1 stale').to.equal(true);
+			expect(db.schemaManager.getMaterializedView('main', 'mv2')!.stale, 'mv2 stale (cascade)').to.equal(true);
+			await mod.closeAll();
+			expect(JSON.parse((await markerValue())!), 'both MVs in the stale set')
+				.to.have.members(['main.mv1', 'main.mv2']);
+			await plantSentinel('main._mv_mv1', [98, 980]);
+			await plantSentinel('main._mv_mv2', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			// Both refilled end-to-end: sentinels scrubbed, content correct.
+			expect(await rows(db2, 'select id, v from mv1 order by id'), 'upstream refilled')
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+			expect(await rows(db2, 'select id, v from mv2 order by id'), 'dependent refilled')
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		});
+
+		it('a close with no subscribed db writes an empty stale set (next session adopts)', async () => {
+			// Session 1: seed + clean close.
+			await seedSession();
+			await plantSentinel('main._mv_mv', [99, 990]);
+
+			// Session 2: a module that never rehydrates and never touches a store table.
+			// Its closeAll has no `subscribedDb` ⇒ writes an empty stale set, re-arming
+			// the fast path rather than skipping the marker or writing garbage.
+			const { mod: mod2 } = open();
+			await mod2.closeAll();
+			expect(await markerValue(), 'no-subscribed-db close writes an empty stale set').to.equal('[]');
+
+			// Session 3: adopts (empty stale set ⇒ full trust) — the sentinel survives.
+			const { db: db3, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db3, 'select id from mv where id = 99'), 'adopted under empty stale set')
+				.to.deep.equal([{ id: 99 }]);
+		});
+
+		it('a garbage (legacy bare-flag) marker payload degrades to refill', async () => {
+			await seedSession();
+			// Overwrite the JSON marker with the legacy bare '1' (pre-payload format):
+			// parses to a number, not a string array ⇒ conservative parse ⇒ refill all.
+			const catalog = await provider.getCatalogStore();
+			await catalog.put(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME), new TextEncoder().encode('1'));
+			await plantSentinel('main._mv_mv', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db2, 'select id from mv where id = 99'), 'garbage payload ⇒ refill (sentinel scrubbed)')
+				.to.deep.equal([]);
+		});
 	});
 
 	describe('engine importCatalog arm (no rehydrateCatalog)', () => {

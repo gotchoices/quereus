@@ -52,6 +52,7 @@ import {
 	buildStatsKey,
 	buildViewCatalogKey,
 	buildMaterializedViewCatalogKey,
+	parseMaterializedViewCatalogKey,
 	buildMetaCatalogKey,
 	CLEAN_SHUTDOWN_META_NAME,
 	classifyCatalogKey,
@@ -1896,15 +1897,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * **Clean-shutdown marker.** Before anything loads, the reserved
 	 * `\x00meta\x00clean_shutdown` catalog entry (written by {@link closeAll} after
-	 * every batch flushed) is consumed: read into `trustBackings`, then **deleted
-	 * immediately** — single-use, so a crash later in this session (or a second
-	 * rehydrate without an intervening clean close) is detected at the next open and
-	 * every adopt falls back to the always-correct drop+refill, self-healing any
-	 * crash-window divergence (coordinated commit is not 2PC across stores). Phase 3
-	 * threads `{ trustBackings, adoptedBackings }` into each per-entry `importCatalog`;
-	 * the one shared `adoptedBackings` set composes across fixpoint rounds (an upstream
-	 * MV adopted in round 1 enables its dependent in round 2, while a refilled upstream
-	 * forces dependents to refill).
+	 * every batch flushed) is consumed: parsed into `{ trusted, staleAtClose }`, then
+	 * **deleted immediately** — single-use, so a crash later in this session (or a
+	 * second rehydrate without an intervening clean close) is detected at the next open
+	 * and every adopt falls back to the always-correct drop+refill, self-healing any
+	 * crash-window divergence (coordinated commit is not 2PC across stores). The marker
+	 * payload is the JSON set of MVs that were **stale-at-close** (row-time maintenance
+	 * detached, so the durable backing may be behind); phase 3 withholds trust per-entry
+	 * for those — `trustBackings: trusted && !staleAtClose.has(name)` — so a
+	 * stale-at-close MV refills (recomputing content and re-arming maintenance) while
+	 * every live-at-close MV keeps the fast path. The one shared `adoptedBackings` set
+	 * composes across fixpoint rounds (an upstream MV adopted in round 1 enables its
+	 * dependent in round 2, while a refilled — or stale-at-close — upstream is never
+	 * added to it, forcing dependents to refill).
 	 *
 	 * **MV-over-MV ordering** is handled by a fixpoint retry rather than a static topo
 	 * sort: the source `sourceTables` an MV resolves to (`_mv_<x>`) is computed at create
@@ -1931,8 +1936,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		// Consume the clean-shutdown marker FIRST (before the catalog scan): its
 		// presence is the adopt trust basis for this rehydration only, and deleting
-		// it immediately makes it single-use.
-		const trustBackings = await this.consumeCleanShutdownMarker();
+		// it immediately makes it single-use. Its payload names the MVs that were
+		// stale-at-close — those are withheld from the fast path per-entry below.
+		const { trusted, staleAtClose } = await this.consumeCleanShutdownMarker();
 
 		const entries = await this.loadCatalogEntries();
 		const result: RehydrationResult = { tables: [], indexes: [], views: [], materializedViews: [], errors: [] };
@@ -1951,11 +1957,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// view/MV entry fed to the table-phase importCatalog would fail-loud or mis-handle.
 		const tableDDLs: string[] = [];
 		const viewDDLs: string[] = [];
-		const mvDDLs: string[] = [];
+		// MV entries retain their qualified `schema.mv` name (derived from the catalog
+		// key) so phase 3 can withhold the adopt fast path per-entry for any MV that
+		// was stale-at-close.
+		const mvEntries: Array<{ name: string; ddl: string }> = [];
 		for (const { key, ddl } of entries) {
 			switch (classifyCatalogKey(key)) {
 				case 'view': { viewDDLs.push(ddl); break; }
-				case 'materializedView': { mvDDLs.push(ddl); break; }
+				case 'materializedView': { mvEntries.push({ name: parseMaterializedViewCatalogKey(key), ddl }); break; }
 				// Meta entries are store-internal, never DDL. (The marker itself was
 				// already consumed above; this guards any future meta key.)
 				case 'meta': { break; }
@@ -1988,26 +1997,35 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// docstring). One shared adopt ledger across all rounds: adopted upstream
 		// backings unlock their dependents' adoption in later rounds.
 		const adoptedBackings = new Set<string>();
-		let pending = mvDDLs;
+		let pending = mvEntries;
 		while (pending.length > 0) {
-			const failed: Array<{ ddl: string; error: unknown }> = [];
+			const failed: Array<{ entry: { name: string; ddl: string }; error: unknown }> = [];
 			let progressed = false;
-			for (const ddl of pending) {
+			for (const entry of pending) {
 				try {
-					const imported = await db.schemaManager.importCatalog([ddl], { trustBackings, adoptedBackings });
+					// Trust this backing only under a clean shutdown AND when the MV was
+					// not stale-at-close — a stale-at-close MV's row-time maintenance was
+					// detached mid-session, so its durable backing may be behind. Refilling
+					// it recomputes content and re-arms maintenance (clearing `stale`); a
+					// refilled MV is also never added to `adoptedBackings`, so the ledger
+					// gate forces its MV-over-MV dependents to refill too.
+					const imported = await db.schemaManager.importCatalog([entry.ddl], {
+						trustBackings: trusted && !staleAtClose.has(entry.name),
+						adoptedBackings,
+					});
 					result.materializedViews.push(...imported.materializedViews);
 					progressed = true;
 				} catch (e) {
-					failed.push({ ddl, error: e });
+					failed.push({ entry, error: e });
 				}
 			}
 			if (!progressed) {
 				// No MV built this round → the remaining failures are genuine (missing
 				// source, ineligible body, unresolvable cycle). Record them and stop.
-				for (const f of failed) recordError(f.ddl, f.error);
+				for (const f of failed) recordError(f.entry.ddl, f.error);
 				break;
 			}
-			pending = failed.map(f => f.ddl);
+			pending = failed.map(f => f.entry);
 		}
 
 		// Refresh each connected StoreTable from the now-current registry. During
@@ -2027,17 +2045,43 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Consume the clean-shutdown marker: report whether it was present, deleting
-	 * it in the same breath (single-use). Absence — a fresh store, a crash, or a
-	 * prior rehydrate without an intervening {@link closeAll} — yields false, so
-	 * every materialized-view adopt this session falls back to refill.
+	 * Consume the clean-shutdown marker, deleting it in the same breath (single-use).
+	 *
+	 * Returns `{ trusted, staleAtClose }`:
+	 * - `trusted` — the marker was present AND its payload parsed as a string array.
+	 *   Absence (a fresh store, a crash, or a prior rehydrate without an intervening
+	 *   {@link closeAll}) yields `false`, so every adopt this session falls back to
+	 *   refill.
+	 * - `staleAtClose` — the qualified lowercased `schema.mv` names that were
+	 *   stale-at-close (written by {@link closeAll}); those MVs refill even under trust.
+	 *
+	 * Conservative parse: any unparseable / wrong-shape payload (including a legacy
+	 * bare `'1'`, which parses to a number, not an array) degrades to
+	 * `{ trusted: false, staleAtClose: ∅ }` — refill everything — rather than
+	 * trust-everything. The marker is deleted regardless of parse outcome.
 	 */
-	private async consumeCleanShutdownMarker(): Promise<boolean> {
+	private async consumeCleanShutdownMarker(): Promise<{ trusted: boolean; staleAtClose: ReadonlySet<string> }> {
 		const catalogStore = await this.provider.getCatalogStore();
 		const markerKey = buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME);
-		const present = (await catalogStore.get(markerKey)) !== undefined;
-		if (present) await catalogStore.delete(markerKey);
-		return present;
+		const raw = await catalogStore.get(markerKey);
+		if (raw === undefined) return { trusted: false, staleAtClose: new Set() };
+		await catalogStore.delete(markerKey); // single-use, regardless of parse outcome
+
+		try {
+			const parsed: unknown = JSON.parse(new TextDecoder().decode(raw));
+			if (!Array.isArray(parsed) || !parsed.every((s): s is string => typeof s === 'string')) {
+				console.warn('[StoreModule] clean-shutdown marker payload is not a string array; refilling all backings.');
+				return { trusted: false, staleAtClose: new Set() };
+			}
+			return { trusted: true, staleAtClose: new Set(parsed) };
+		} catch (e) {
+			console.warn(
+				`[StoreModule] clean-shutdown marker payload did not parse as JSON; refilling all backings: ${
+					e instanceof Error ? e.message : String(e)
+				}`,
+			);
+			return { trusted: false, staleAtClose: new Set() };
+		}
 	}
 
 	/**
@@ -2269,6 +2313,28 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * Close all stores.
 	 */
 	async closeAll(): Promise<void> {
+		// Capture the stale-at-close MV set BEFORE the unsubscribe block clears
+		// `subscribedDb`. Nothing between here and the marker write can change these
+		// flags (closeAll only drains the persist queue and disconnects tables).
+		// `stale` is in-memory-only runtime state — an MV whose row-time maintenance was
+		// detached mid-session (any `table_modified` on a source: an ALTER, even a
+		// `create index`) so subsequent source writes never reached its backing. Carrying
+		// the names lets the next open exclude exactly those from the adopt fast path.
+		//
+		// No subscribed db (this module was opened but never rehydrated and never had a
+		// store table created/connected) ⇒ the empty set: every path that can mark an MV
+		// stale requires a session in which this module observed the db — a store source
+		// create/connect (both call `ensureSchemaSubscription`) or `rehydrateCatalog`
+		// (subscribes up front) — so a session without `subscribedDb` never detached any
+		// persisted MV's maintenance. Memory-backed MVs that appear in the set are
+		// harmless: their catalog entries always refill (no phase-1 pre-existing backing),
+		// so withholding trust from them is a no-op.
+		const staleAtClose = this.subscribedDb
+			? this.subscribedDb.schemaManager.getAllMaterializedViews()
+				.filter(mv => mv.stale)
+				.map(mv => `${mv.schemaName}.${mv.name}`.toLowerCase())
+			: [];
+
 		// Stop listening first so no new persist work is enqueued mid-close, then drain
 		// the queued catalog writes (tag swaps) before the provider closes.
 		if (this.schemaListenerUnsub) {
@@ -2286,11 +2352,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		// Every batch has flushed (persist queue drained, tables disconnected):
 		// attest the clean shutdown so the next open may take the materialized-view
-		// adopt fast path. Consumed (single-use) by `rehydrateCatalog`. Written
-		// LAST, immediately before the provider closes — anything that dies before
-		// this line leaves no marker and the next open refills.
+		// adopt fast path. The marker VALUE is the JSON stale-at-close set (`[]` when
+		// nothing is stale) — `rehydrateCatalog` excludes those MVs from the fast path
+		// so they refill. Consumed (single-use) by `rehydrateCatalog`. Written LAST,
+		// immediately before the provider closes — anything that dies before this line
+		// leaves no marker and the next open refills everything.
 		const catalogStore = await this.provider.getCatalogStore();
-		await catalogStore.put(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME), new TextEncoder().encode('1'));
+		await catalogStore.put(
+			buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME),
+			new TextEncoder().encode(JSON.stringify(staleAtClose)),
+		);
 
 		await this.provider.closeAll();
 		this.stores.clear();
