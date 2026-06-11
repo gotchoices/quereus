@@ -265,15 +265,45 @@ export class TransactionCoordinator {
     });
   }
 
-  /** Release savepoints down to the target depth. */
+  /**
+   * Release savepoints down to the target depth.
+   *
+   * When the target depth exceeds the current stack size (e.g. after a store
+   * DDL-commit — `replaceContents`/`renameTable` — cleared the stack while the
+   * engine still broadcasts the savepoint), warns and returns without padding the
+   * array. Mirrors `vtab/memory/layer/connection.ts` `releaseSavepoint`.
+   */
   releaseSavepoint(targetDepth: number): void {
+    if (targetDepth > this.savepointStack.length) {
+      // Setting Array.length to a value larger than the current length pads with
+      // undefined slots, corrupting subsequent rollback-to / release lookups.
+      // The most likely cause is a DDL-commit (replaceContents / renameTable)
+      // that cleared the stack while the engine still holds open savepoints.
+      console.warn(
+        `[TransactionCoordinator] release savepoint depth ${targetDepth} out of range `
+          + `(stack size: ${this.savepointStack.length}); transaction was committed out from under it`,
+      );
+      return;
+    }
     this.savepointStack.length = targetDepth;
   }
 
-  /** Rollback to a savepoint at the target depth (preserves the savepoint). */
+  /**
+   * Rollback to a savepoint at the target depth (preserves the savepoint).
+   *
+   * When the target depth is out of range (e.g. after a store DDL-commit —
+   * `replaceContents`/`renameTable` — cleared the stack while the engine still
+   * broadcasts the savepoint), warns and returns rather than throwing.  Degrades
+   * to DDL-commits semantics: the committed DDL and everything before it stays
+   * committed.  Mirrors `vtab/memory/layer/connection.ts` `rollbackToSavepoint`.
+   */
   rollbackToSavepoint(targetDepth: number): void {
     if (targetDepth >= this.savepointStack.length) {
-      throw new QuereusError(`Savepoint depth ${targetDepth} not found`, StatusCode.NOTFOUND);
+      console.warn(
+        `[TransactionCoordinator] rollback-to savepoint depth ${targetDepth} out of range `
+          + `(stack size: ${this.savepointStack.length}); transaction was committed out from under it`,
+      );
+      return;
     }
 
     const snapshot = this.savepointStack[targetDepth];

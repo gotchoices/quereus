@@ -324,6 +324,40 @@ describe('materialized views `using store` (end-to-end)', () => {
 			expect(store, 'store and memory backings observe the same refresh-in-txn outcome').to.deep.equal(memory);
 		});
 
+		it('refresh inside a savepoint does not throw and matches memory arm (DDL-commits parity)', async () => {
+			// Mirror the refresh-in-txn parity test but with a savepoint wrapping the
+			// insert + refresh. The backing coordinator's stack is cleared by the
+			// DDL-commit in replaceContents; the subsequent rollback-to-s1 broadcast
+			// must warn-and-return rather than throw (regression guard).
+			const run = async (usingClause: string): Promise<{ mv: unknown; src: unknown }> => {
+				const arm = new Database();
+				const armProvider = createProvider();
+				arm.registerModule('store', createIsolatedStoreModule({ provider: armProvider }));
+				try {
+					await arm.exec('create table src (id integer primary key, v integer) using store');
+					await arm.exec('insert into src values (1, 10)');
+					await arm.exec(`create materialized view mv ${usingClause} as select id, v from src`);
+					await arm.exec('begin');
+					await arm.exec('savepoint s1');
+					await arm.exec('insert into src values (2, 20)');
+					await arm.exec('refresh materialized view mv'); // DDL-commits: clears backing stack
+					await arm.exec('rollback to s1');               // must not throw; degrades to DDL-commits
+					await arm.exec('commit');
+					return {
+						mv: await rows(arm, 'select id, v from mv order by id'),
+						src: await rows(arm, 'select id, v from src order by id'),
+					};
+				} finally {
+					await arm.close();
+					await armProvider.closeAll();
+				}
+			};
+
+			const storeResult = await run('using store');
+			const memoryResult = await run('');
+			expect(storeResult, 'store and memory backings observe the same refresh-in-savepoint outcome').to.deep.equal(memoryResult);
+		});
+
 		it('a shape rebuild after a source ALTER recreates the backing in the store module (no silent migration)', async () => {
 			await db.exec('create table src (id integer primary key, v integer) using store');
 			await db.exec('insert into src values (1, 10)');

@@ -185,9 +185,50 @@ describe('TransactionCoordinator', () => {
 			expect(await store.get(new Uint8Array([3]))).to.be.undefined;
 		});
 
-		it('rollbackToSavepoint with invalid depth throws', () => {
+		it('rollbackToSavepoint with invalid depth warns and returns (no throw)', () => {
 			coordinator.begin();
-			expect(() => coordinator.rollbackToSavepoint(5)).to.throw(/not found/i);
+			// Out-of-range depth within an active transaction: warn-and-return, matching memory.
+			expect(() => coordinator.rollbackToSavepoint(5)).to.not.throw();
+		});
+	});
+
+	describe('savepoint ops after a commit clear', () => {
+		it('rollbackToSavepoint after commit does not throw', async () => {
+			// Simulate a store DDL-commit clearing the stack: begin → createSavepoint → commit.
+			coordinator.begin();
+			coordinator.createSavepoint(0);
+			await coordinator.commit(); // clears savepointStack via clearTransaction()
+
+			// Engine still broadcasts rollback-to at depth 0 — must not throw.
+			expect(() => coordinator.rollbackToSavepoint(0)).to.not.throw();
+		});
+
+		it('releaseSavepoint after commit does not pad the stack', async () => {
+			coordinator.begin();
+			coordinator.createSavepoint(0);
+			await coordinator.commit(); // stack cleared
+
+			// releaseSavepoint(1) on an empty stack would pad with undefined → guard must fire.
+			expect(() => coordinator.releaseSavepoint(1)).to.not.throw();
+
+			// Follow-up savepoint round-trip on the same coordinator must still work correctly.
+			coordinator.begin();
+			coordinator.createSavepoint(0);
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.createSavepoint(1);
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]));
+			coordinator.rollbackToSavepoint(1);
+			await coordinator.commit();
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await store.get(new Uint8Array([2]))).to.be.undefined;
+		});
+
+		it('in-transaction out-of-range rollbackToSavepoint also warns and returns', () => {
+			// Depth uniformity: the guard fires regardless of whether the stack was
+			// cleared by a commit or simply never reached that depth.
+			coordinator.begin();
+			coordinator.createSavepoint(0);
+			expect(() => coordinator.rollbackToSavepoint(5)).to.not.throw();
 		});
 	});
 

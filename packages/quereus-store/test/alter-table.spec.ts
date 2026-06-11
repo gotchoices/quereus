@@ -417,6 +417,27 @@ describe('Store ALTER TABLE', () => {
 			expect(ddlStatements[0].toLowerCase()).to.include('t_after');
 			expect(ddlStatements[0].toLowerCase()).to.not.include('t_before');
 		});
+
+		it('rename inside a savepoint does not throw on rollback-to (DDL-commits posture)', async () => {
+			// renameTable commits the coordinator mid-transaction (DDL-commits posture),
+			// clearing the savepoint stack. The engine still broadcasts rollback-to-s1
+			// after the rename, which must warn-and-return rather than throw.
+			await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT) USING store`);
+			await db.exec(`INSERT INTO t VALUES (1, 'a'), (2, 'b')`);
+
+			await db.exec(`BEGIN`);
+			await db.exec(`SAVEPOINT s1`);
+			await db.exec(`INSERT INTO t VALUES (3, 'c')`);
+			await db.exec(`ALTER TABLE t RENAME TO t2`); // DDL-commits: commits insert + clears stack
+			await db.exec(`ROLLBACK TO s1`);             // must not throw; warn-and-return
+			await db.exec(`COMMIT`);
+
+			// The rename persisted (DDL-commits semantics); data is accessible under the new name.
+			const result = await asyncIterableToArray(db.eval('select id, val from t2 order by id'));
+			expect(result.length).to.be.at.least(2);
+			expect(result[0]).to.deep.equal({ id: 1, val: 'a' });
+			expect(result[1]).to.deep.equal({ id: 2, val: 'b' });
+		});
 	});
 
 	describe('sequential ALTER TABLE operations', () => {
