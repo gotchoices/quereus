@@ -540,6 +540,16 @@ describe('store-adapter seam integration', () => {
 				hlc: remoteHLC.tick(),
 				value: 'survives',
 			});
+			// Also seed a tombstone and a change-log entry for the completed table,
+			// plus a *non*-completed table (tableC) that the stream never re-emits.
+			// The resume-aware clear must preserve tableA's tb:/cl: state (the two
+			// branches of clearExistingMetadata that the cv assertions don't reach)
+			// while still dropping tableC's — proving the preserve filter is
+			// selective, not a blanket skip.
+			await syncManager.tombstones.setTombstone('main', 'tableA', ['a2'], remoteHLC.tick());
+			await syncManager.changeLog.recordColumnChange(remoteHLC.tick(), 'main', 'tableA', ['a1'], 'v');
+			await syncManager.tombstones.setTombstone('main', 'tableC', ['c1'], remoteHLC.tick());
+			await syncManager.changeLog.recordColumnChange(remoteHLC.tick(), 'main', 'tableC', ['c1'], 'v');
 			const checkpoint = {
 				snapshotId,
 				siteId: remoteSiteId,
@@ -585,6 +595,22 @@ describe('store-adapter seam integration', () => {
 			void expect(applied, 'resumed table column version applied').to.exist;
 			expect(applied!.value).to.equal('bval');
 			expect(await collect(db, 'select id, v from tableB')).to.deep.equal([{ id: 'b1', v: 'bval' }]);
+
+			// tableA's tombstone (tb:) and change-log entry (cl:) survived the clear...
+			void expect(
+				await syncManager.tombstones.getTombstone('main', 'tableA', ['a2']),
+				'completed-table tombstone preserved on resume',
+			).to.exist;
+			const clTables = new Set<string>();
+			for await (const e of syncManager.changeLog.getAllChanges()) clTables.add(e.table);
+			void expect(clTables.has('tableA'), 'completed-table change-log entry preserved on resume').to.be.true;
+
+			// ...while the non-completed tableC's tb:/cl: state was cleared.
+			void expect(
+				await syncManager.tombstones.getTombstone('main', 'tableC', ['c1']),
+				'non-completed tombstone cleared on resume',
+			).to.not.exist;
+			void expect(clTables.has('tableC'), 'non-completed change-log entry cleared on resume').to.be.false;
 
 			// Divergence angle: a full delta sync to a fresh peer still relays
 			// tableA's change, proving the metadata is not orphaned from its data.
