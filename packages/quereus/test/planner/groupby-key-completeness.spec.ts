@@ -54,6 +54,16 @@ describe('GROUP BY key completeness (collated / computed group keys)', () => {
 		expect(hasKey(root, [0])).to.equal(true);
 	});
 
+	it('a cast group key claims the key and reads it once (no double cast)', async () => {
+		const sql = 'select cast(a as text) as g, count(*) as n from t group by cast(a as text)';
+		const root = rootOf(db, sql);
+		expect(hasKey(root, [0]), 'cast group key lost at projection').to.equal(true);
+		// The aggregate column already holds cast(a) — the projection reads it as the
+		// group value rather than re-applying the cast to a representative source row.
+		const rows = await collect(db, sql + ' order by g');
+		expect(rows.map(r => r.g)).to.deep.equal(['5', '6', '7']);
+	});
+
 	it('a composite (col, collated) group key claims the composite key', () => {
 		const root = rootOf(db, 'select a, b collate nocase as bn, count(*) as n from t group by a, b collate nocase');
 		expect(hasKey(root, [0, 1])).to.equal(true);
