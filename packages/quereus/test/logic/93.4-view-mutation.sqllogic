@@ -848,6 +848,29 @@ create view uq8_v as
 update uq8_v set cval = pvc where cid = 1;
 -- error: cannot write through
 
+-- (uq-9) SCOPE GUARD: a bare column inside a NESTED value subquery binds to that
+-- subquery's OWN from-source, NOT the view sides — even when its name collides with a
+-- partner base column. The unqualified-resolution applies only at the TOP LEVEL of the SET
+-- value (where a bare column originates from the view body's projection); inside the
+-- subquery the scope-unaware descent leaves bare refs alone. Here `psecret` belongs to
+-- uq9_t (the subquery FROM), so cval must read 777 (uq9_t.psecret), NOT 888 (the joined
+-- parent uq9_p.psecret). `psecret` is deliberately NOT exposed by the view, so it can only
+-- be the inner-scope column. Regression for the cross-source-unqualified-body-projection
+-- review (mapQueryExprUniform is not scope-aware — a name-resolution decision must not ride
+-- it at depth).
+create table uq9_p (pid integer primary key, pv integer, psecret integer);
+create table uq9_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq9_p(pid));
+create table uq9_t (tid integer primary key, psecret integer);
+insert into uq9_p values (10, 100, 999), (20, 200, 888);
+insert into uq9_c values (1, 10, 1), (2, 20, 2);
+insert into uq9_t values (1, 777);
+create view uq9_v as
+    select c.cid as cid, cval, pv from uq9_c c join uq9_p p on p.pid = c.pref;
+update uq9_v set cval = (select psecret from uq9_t where tid = 1) where cid = 2;
+select cid, cval from uq9_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":777}]
+
 -- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
 -- order the base deletes FK-child before FK-parent. The canonical columnar split has each
 -- member's PK reference the anchor's (axd_b, axd_c -> axd_a); deleting the parent first

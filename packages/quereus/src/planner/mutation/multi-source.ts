@@ -2493,34 +2493,53 @@ function stripSideQualifier(
 		owningPk ??= requireKeyColumns(view, owning);
 		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk);
 	};
-	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
-		if (!col.table) {
-			// An UNQUALIFIED base-term leaf. Resolve its owning side by UNIQUE column
-			// ownership — the exact rule `resolveColumnSide` applies to join-condition
-			// operands. Owning-side OR unresolvable (a correlated outer ref, a name on no
-			// side) → leave bare: it resolves correctly in the lowered single-table UPDATE,
-			// or keeps its pre-existing pass-through. Partner-owned → qualify with that
-			// side's alias and route through the SAME capture path the qualified `b.y`
-			// branch uses (qualifying before `registerCrossSource` makes the projection
-			// byte-identical and the `srcN` dedup consistent with `a.av`).
-			//
-			// Preference 2 (a structured side-ambiguity diagnostic) is intentionally NOT
-			// added: `resolveColumnSide` returns `undefined` for a name owned by TWO+ sides,
-			// but such a body projection (`select av …` with `av` on both sides) is already
-			// rejected as ambiguous at body planning (analyzeBodyLineage → buildSelectStmt)
-			// before decomposition ever reaches this leaf — the branch would be unreachable
-			// dead code. The remaining `undefined` case (a name on NO side) is not a
-			// side-ambiguity and must keep its bare pass-through.
-			const side = resolveColumnSide(col, allSides);
-			if (side === undefined || side === owningSideIndex) return undefined;
-			return routePartnerRead({ ...col, table: allSides[side].alias });
-		}
+	// QUALIFIED-only substitution: an owning-alias ref strips to bare; a partner-alias ref
+	// routes through the capture; a BARE ref is left untouched. The decision is purely on
+	// the column's own qualifier (a syntactic property), so it is scope-independent and
+	// applies uniformly at EVERY nesting depth — this is the substitute threaded into the
+	// scope-unaware `mapQueryExprUniform` descent. A bare column reached there binds to the
+	// embedded subquery's OWN from-source, NOT the view sides, so it must NOT be resolved
+	// by name against the sides (doing so would mis-route an inner-scope column whose name
+	// merely collides with a partner base column — e.g. `(select psecret from t)` where the
+	// partner side also has a `psecret` — to the partner's captured value).
+	const substituteQualified = (col: AST.ColumnExpr): AST.Expression | undefined => {
+		if (!col.table) return undefined;
 		const t = col.table.toLowerCase();
 		if (owningQuals.has(t)) return { type: 'column', name: col.name };
 		if (otherQuals.has(t)) return routePartnerRead(col);
 		return undefined;
 	};
-	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
+	// TOP-LEVEL substitution: additionally resolves an UNQUALIFIED base-term leaf (a body
+	// projecting a partner column bare) by UNIQUE column ownership — the exact rule
+	// `resolveColumnSide` applies to join-condition operands. This resolution is sound ONLY
+	// at the top level of the SET value, where a bare column originates from the view body's
+	// own projection (injected here as the view column's base-term lineage by
+	// `substituteViewColumns`) and so legitimately resolves against the view sides. Inside a
+	// nested value subquery a bare column instead binds to that subquery's from-source, so
+	// the descent uses `substituteQualified` (no bare resolution) — see its note above.
+	//
+	// Owning-side OR unresolvable (a correlated outer ref, a name on no side) → leave bare:
+	// it resolves correctly in the lowered single-table UPDATE, or keeps its pre-existing
+	// pass-through. Partner-owned → qualify with that side's alias and route through the SAME
+	// capture path the qualified `b.y` branch uses (qualifying before `registerCrossSource`
+	// makes the projection byte-identical and the `srcN` dedup consistent with `a.av`).
+	//
+	// Preference 2 (a structured side-ambiguity diagnostic) is intentionally NOT added:
+	// `resolveColumnSide` returns `undefined` for a name owned by TWO+ sides, but such a
+	// body projection (`select av …` with `av` on both sides) is already rejected as
+	// ambiguous at body planning (analyzeBodyLineage → buildSelectStmt) before decomposition
+	// ever reaches this leaf — the branch would be unreachable dead code. The remaining
+	// `undefined` case (a name on NO side) is not a side-ambiguity and must keep its bare
+	// pass-through.
+	const substituteTop = (col: AST.ColumnExpr): AST.Expression | undefined => {
+		if (!col.table) {
+			const side = resolveColumnSide(col, allSides);
+			if (side === undefined || side === owningSideIndex) return undefined;
+			return routePartnerRead({ ...col, table: allSides[side].alias });
+		}
+		return substituteQualified(col);
+	};
+	return transformExpr(expr, substituteTop, (q) => mapQueryExprUniform(q, substituteQualified));
 }
 
 /**
