@@ -190,36 +190,23 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * for a `select` from the MV mid-transaction).
 	 */
 	getBackingHost(db: Database, schemaName: string, tableName: string): BackingHost | undefined {
-		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-		if (!this.tables.has(tableKey)) {
-			const registered = db.schemaManager.getTable(schemaName, tableName);
-			const wrapper = registered?.vtabModule as { underlying?: unknown } | undefined;
-			if (!registered || (registered.vtabModule !== this && wrapper?.underlying !== this)) {
-				return undefined;
-			}
-		}
-		const table = this.getOrReconnectTable(db, schemaName, tableName);
+		const table = this.resolveOwnedTable(db, schemaName, tableName);
 		if (!table) return undefined;
 		return new StoreBackingHost(table, table.attachCoordinator());
 	}
 
 	/**
-	 * Resolve the live {@link StoreTable} for an externally-applied write to a
-	 * SOURCE table (committed put/delete + secondary-index + stats maintenance via
-	 * {@link StoreTable.applyExternalRowChanges}). Returns undefined when the table
-	 * is not this module's.
-	 *
-	 * Resolution mirrors {@link getBackingHost}: an ownership pre-check (the table
-	 * is registered and its `vtabModule` is this StoreModule, or the IsolationModule
-	 * wrapper exposing it as `underlying`) gates the {@link getOrReconnectTable}
-	 * fallback so a rehydrated-but-untouched (or rename-evicted) table reconnects
-	 * without adopting a table owned by a different module. Unlike `getBackingHost`
-	 * it attaches no coordinator: external writes target committed storage, and the
-	 * before-image read (`readEffectiveRowByKey`) merges any already-attached
-	 * coordinator's pending state on its own (none when the table is freshly
-	 * reconnected).
+	 * Resolve a {@link StoreTable} this module owns, reconnecting a
+	 * rehydrated-but-untouched (or rename-evicted) table via
+	 * {@link getOrReconnectTable}. The ownership pre-check keeps the reconnect
+	 * fallback from adopting a registered table owned by a DIFFERENT module:
+	 * `vtabModule` must be this StoreModule, or a wrapper (IsolationModule)
+	 * exposing it as `underlying`. Returns undefined for an unknown/non-owned
+	 * table. Shared by {@link getBackingHost} and
+	 * {@link getTableForExternalWrite}; neither attaches a coordinator here —
+	 * each layers its own pending-state policy on top.
 	 */
-	getTableForExternalWrite(db: Database, schemaName: string, tableName: string): StoreTable | undefined {
+	private resolveOwnedTable(db: Database, schemaName: string, tableName: string): StoreTable | undefined {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		if (!this.tables.has(tableKey)) {
 			const registered = db.schemaManager.getTable(schemaName, tableName);
@@ -229,6 +216,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			}
 		}
 		return this.getOrReconnectTable(db, schemaName, tableName);
+	}
+
+	/**
+	 * Resolve the live {@link StoreTable} for an externally-applied write to a
+	 * SOURCE table (committed put/delete + secondary-index + stats maintenance via
+	 * {@link StoreTable.applyExternalRowChanges}). Returns undefined when the table
+	 * is not this module's.
+	 *
+	 * Resolution goes through {@link resolveOwnedTable} (the shared ownership
+	 * pre-check + reconnect fallback). Unlike `getBackingHost` it attaches no
+	 * coordinator: external writes target committed storage, and the before-image
+	 * read (`readEffectiveRowByKey`) merges any already-attached coordinator's
+	 * pending state on its own (none when the table is freshly reconnected).
+	 */
+	getTableForExternalWrite(db: Database, schemaName: string, tableName: string): StoreTable | undefined {
+		return this.resolveOwnedTable(db, schemaName, tableName);
 	}
 
 	/**

@@ -265,4 +265,56 @@ describe('store external row-write entry point', () => {
 		expect(await ext.readRowByPk(['Apple'])).to.deep.equal(['Apple', 'a']);
 		expect(await ext.readRowByPk(['apple'])).to.equal(null);
 	});
+
+	it('multi-column / DESC-direction PK keys and reads byte-identically to DML', async () => {
+		// Composite PK with a DESC second column exercises pkDirections beyond the
+		// single-column ASC path the byte-match scenarios above used.
+		await db.exec('create table dml (a text, b text, v text, primary key (a, b desc)) using store');
+		await db.exec('create table ext (a text, b text, v text, primary key (a, b desc)) using store');
+
+		await db.exec("insert into dml values ('x','1','p'),('x','2','q'),('y','1','r')");
+		await db.exec("update dml set v='Q2' where a='x' and b='2'");
+		await db.exec("delete from dml where a='y' and b='1'");
+
+		const ext = storeModule.getTableForExternalWrite(db, 'main', 'ext')!;
+		// extractPK derives [a, b] from the row in PK-definition order.
+		await ext.applyExternalRowChanges([
+			{ op: 'upsert', row: ['x', '1', 'p'] },
+			{ op: 'upsert', row: ['x', '2', 'q'] },
+			{ op: 'upsert', row: ['y', '1', 'r'] },
+		]);
+		await ext.applyExternalRowChanges([{ op: 'upsert', row: ['x', '2', 'Q2'] }]);
+		await ext.applyExternalRowChanges([{ op: 'delete', pk: ['y', '1'] }]);
+
+		expect(await dumpEntries(await provider.getStore('main', 'ext')))
+			.to.deep.equal(await dumpEntries(await provider.getStore('main', 'dml')));
+		// Point read keyed in PK-definition order resolves under the DESC encoding.
+		expect(await ext.readRowByPk(['x', '2'])).to.deep.equal(['x', '2', 'Q2']);
+	});
+
+	it('NULL indexed-column transitions maintain the secondary index like DML', async () => {
+		// A NULL value entering/leaving an indexed column must add/remove the index
+		// entry exactly as DML does (NULL is a distinct, indexable key, not absence).
+		await db.exec('create table dml (k text primary key, v text null) using store');
+		await db.exec('create index v_dml on dml(v)');
+		await db.exec('create table ext (k text primary key, v text null) using store');
+		await db.exec('create index v_ext on ext(v)');
+
+		await db.exec("insert into dml values ('k1',null),('k2','b')");
+		await db.exec("update dml set v='a' where k='k1'");  // NULL → non-NULL
+		await db.exec("update dml set v=null where k='k2'");  // non-NULL → NULL
+
+		const ext = storeModule.getTableForExternalWrite(db, 'main', 'ext')!;
+		await ext.applyExternalRowChanges([
+			{ op: 'upsert', row: ['k1', null] },
+			{ op: 'upsert', row: ['k2', 'b'] },
+		]);
+		await ext.applyExternalRowChanges([{ op: 'upsert', row: ['k1', 'a'] }]);
+		await ext.applyExternalRowChanges([{ op: 'upsert', row: ['k2', null] }]);
+
+		expect(await dumpEntries(await provider.getStore('main', 'ext')))
+			.to.deep.equal(await dumpEntries(await provider.getStore('main', 'dml')));
+		expect(await dumpEntries(await provider.getIndexStore('main', 'ext', 'v_ext')))
+			.to.deep.equal(await dumpEntries(await provider.getIndexStore('main', 'dml', 'v_dml')));
+	});
 });
