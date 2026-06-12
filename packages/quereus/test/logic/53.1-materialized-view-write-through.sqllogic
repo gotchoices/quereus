@@ -295,3 +295,35 @@ select w, n from wcount order by w;
 insert into words values (4, 'y');
 select w, n from wcount order by w;
 → [{"w":"x","n":2},{"w":"y","n":2}]
+
+-- ===================================
+-- 12. Subquery-in-FROM body. An MV whose body wraps its base in a derived-table
+--     subquery is creatable + maintained, but write-through rejects it at the
+--     single-base-source branch (the inner filters/projections live in the plan,
+--     not in the rewrite-driving selectAst). That branch — distinct from the
+--     aggregate (classifyViewBody) reject in § 11 — must ALSO name the target a
+--     *materialized view*, not a plain "view": every body-shape reject in
+--     analyzeView threads the target's kind, so a maintained table reaching this
+--     branch is not misnamed. Plan-time reject; MV contents untouched.
+-- ===================================
+
+create table nums (id integer primary key, v integer);
+insert into nums values (1, 10), (2, 20);
+create materialized view sqmv as select id, v from (select id, v from nums);
+select id, v from sqmv order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+
+-- write-through is rejected at the single-base-source branch, naming it a materialized view
+insert into sqmv (id, v) values (3, 30);
+-- error: cannot write through materialized view
+update sqmv set v = 99 where id = 1;
+-- error: cannot write through materialized view
+delete from sqmv where id = 2;
+-- error: cannot write through materialized view
+
+-- the rejected writes changed nothing; the source stays writable + maintained
+select id, v from sqmv order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20}]
+insert into nums values (3, 30);
+select id, v from sqmv order by id;
+→ [{"id":1,"v":10},{"id":2,"v":20},{"id":3,"v":30}]

@@ -394,7 +394,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
 			table: view.name,
-			message: `view '${view.name}' has a ${view.selectAst.type.toUpperCase()} body, which has no recoverable base operation`,
+			message: `${view.noun ?? 'view'} '${view.name}' has a ${view.selectAst.type.toUpperCase()} body, which has no recoverable base operation`,
 		});
 	}
 	const sel = view.selectAst;
@@ -406,7 +406,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		raiseMutationDiagnostic({
 			reason: 'no-base-lineage',
 			table: view.name,
-			message: `view '${view.name}' body did not produce a relation`,
+			message: `${view.noun ?? 'view'} '${view.name}' body did not produce a relation`,
 		});
 	}
 	const classification = classifyViewBody(bodyPlan as RelationalPlanNode);
@@ -414,9 +414,12 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		raiseMutationDiagnostic({
 			reason: classification.reason,
 			table: view.name,
-			// Name the target by its kind so an unsupported-body reject on a
-			// maintained table (e.g. an aggregate-bodied MV) reads "materialized
-			// view 'm'", not the misleading plain-view framing.
+			// Name the target by its kind (`view.noun`) so a body-shape reject on a
+			// maintained table reads "materialized view 'm'", not the misleading
+			// plain-view framing. A maintained table reaches this and the sibling
+			// body-shape branches below — e.g. an aggregate-bodied MV here, or a
+			// subquery-in-FROM MV at the single-base-source branch — so every
+			// body-shape diagnostic in this function honours the noun.
 			message: `cannot write through ${view.noun ?? 'view'} '${view.name}': ${classification.detail}`,
 		});
 	}
@@ -431,7 +434,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		raiseMutationDiagnostic({
 			reason: 'nested-view',
 			table: view.name,
-			message: `cannot write through view '${view.name}': only a single base-table source is supported in phase 1`,
+			message: `cannot write through ${view.noun ?? 'view'} '${view.name}': only a single base-table source is supported in phase 1`,
 		});
 	}
 	const fromTable = sel.from[0];
@@ -439,7 +442,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		raiseMutationDiagnostic({
 			reason: 'nested-view',
 			table: view.name,
-			message: `cannot write through view '${view.name}': its body references another view; nested-view mutation is not yet supported`,
+			message: `cannot write through ${view.noun ?? 'view'} '${view.name}': its body references another view; nested-view mutation is not yet supported`,
 		});
 	}
 	// MV-over-MV (or a plain view over an MV): the body's single source is itself a
