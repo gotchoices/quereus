@@ -246,7 +246,20 @@ apply schema main to version '1.0.0' options (
 
 **Safety:**
 - Seed data application is destructive (clears table before inserting).
-- Future enhancements will add `allow_destructive` gating for schema changes.
+- `allow_destructive` is **enforced for one case today**: a backing-module change on a maintained table (`materialized view … using <module>` or `create table … maintained as … using <module>`). Such a move physically relocates the table to a different store with no in-place primitive, so it is realized as a `DROP TABLE` + `create materialized view … using <newmodule>` that **mints a new incarnation** (changing row identity for a replicated/synced table). `apply schema` aborts — before any DDL runs — unless re-run with `options (allow_destructive = true)`:
+
+  ```sql
+  -- Re-declared with a moved backing module; refused without the ack:
+  apply schema main;
+  -- Error: backing-module change on maintained table(s) 'mv' is destructive
+  --        (drop + recreate, new incarnation). Re-run with options
+  --        (allow_destructive = true) to migrate the backing.
+
+  -- Acknowledged — drops + recreates, re-materializing the body into the new module:
+  apply schema main options (allow_destructive = true);
+  ```
+
+  `diff schema` surfaces the `DROP TABLE` / `create materialized view` DDL unconditionally (it is a read-only preview, never gated). Other drops are **not yet** gated — a general `allow_destructive` gate over all destructive schema changes remains future work.
 - Rename hints prevent accidental drops during renames — see "Rename detection" below.
 
 **Rename detection (`rename_policy`):**

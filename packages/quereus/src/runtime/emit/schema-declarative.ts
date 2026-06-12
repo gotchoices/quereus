@@ -194,6 +194,22 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 		// parity with direct DDL and a re-apply idempotent under a non-BINARY default.
 		const diff = computeSchemaDiff(declaredSchema, actualCatalog, applyStmt.options?.renamePolicy ?? 'allow', rctx.db.options.getStringOption('default_collation'));
 
+		// Acknowledgement gate: a backing-module change on a maintained table is a
+		// destructive incarnation-minting move (drop + recreate — fires
+		// materialized_view_removed then _added, so row identity changes for a
+		// replicated/synced table). Refuse to execute it unless the user opted in via
+		// `options (allow_destructive = true)`. The whole apply aborts here, BEFORE any
+		// DDL runs, so no partial migration occurs. (`diff schema` does NOT gate — it
+		// is a read-only preview and surfaces the DROP/recreate DDL unconditionally.)
+		if (diff.maintainedModuleMigrations.length > 0 && !applyStmt.options?.allowDestructive) {
+			const names = diff.maintainedModuleMigrations.map(m => `'${m.name}'`).join(', ');
+			throw new QuereusError(
+				`apply schema '${schemaName}': backing-module change on maintained table(s) ${names} is destructive ` +
+				`(drop + recreate, new incarnation). Re-run with options (allow_destructive = true) to migrate the backing.`,
+				StatusCode.ERROR,
+			);
+		}
+
 		// Generate migration DDL
 		const migrationStatements = generateMigrationDDL(diff, schemaName);
 

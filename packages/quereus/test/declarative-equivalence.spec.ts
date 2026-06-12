@@ -1444,13 +1444,12 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
-	it('a backing-module change on a maintained table is NOT auto-detected (documented gap)', async function () {
-		// Ticket 6.3: a maintained table is a TABLE now, and the differ tracks no
-		// module field for a table (CatalogTable carries none). An in-place module
-		// move is destructive (drop+create) and out of scope here, so a module-only
-		// re-declaration is a silent no-op — parity with a plain table. (Was a
-		// drop+recreate while MVs had their own diff bucket.) Pinned so a future
-		// implementer who closes the gap revisits this.
+	it('a backing-module change on a maintained table schedules a destructive drop+recreate', async function () {
+		// A maintained table is a TABLE now, but the catalog DOES carry its normalized
+		// backing module (CatalogTable.maintained.backingModuleName/Args). A both-
+		// maintained name-match whose declared module moves is an incarnation-minting
+		// relocation with no in-place primitive, so the differ schedules a destructive
+		// drop+recreate (gated at apply on allow_destructive) — NOT a body re-attach.
 		const db = new Database();
 		db.registerModule('mem2', new MemoryTableModule());
 		try {
@@ -1460,7 +1459,7 @@ describe('declarative-equivalence: materialized views', () => {
 			}`);
 			await db.exec('apply schema main');
 
-			// Same body, new backing module: undetected.
+			// Same body, new backing module: detected as a destructive move.
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
 				materialized view mv using mem2() as select id, x from t
@@ -1469,8 +1468,12 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'module change is not detected (gap)').to.be.undefined;
-			expect(diff.tablesToDrop, 'no drop on a module change').to.deep.equal([]);
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no alter — the recreate subsumes it').to.be.undefined;
+			expect(diff.tablesToDrop, 'mv dropped for the recreate').to.deep.equal(['mv']);
+			expect(diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
+			expect(diff.maintainedModuleMigrations, 'one module migration recorded').to.deep.equal([
+				{ name: 'mv', fromModule: 'memory', toModule: 'mem2' },
+			]);
 		} finally {
 			await db.close();
 		}
@@ -1502,9 +1505,10 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
-	it('a backing-module ARGS change on a maintained table is NOT auto-detected (documented gap)', async function () {
-		// Companion to the module-change gap: module args are not tracked for a table
-		// either, so an args-only re-declaration is a silent no-op (was a drop+recreate).
+	it('a backing-module ARGS change on a maintained table schedules a destructive drop+recreate', async function () {
+		// Companion to the module-name move: the args half drifts alone (name
+		// unchanged). canonicalBackingModuleArgs renders k='a' vs k='b' distinctly, so
+		// it is detected and migrated just like a name change.
 		const db = new Database();
 		db.registerModule('mem2', new MemoryTableModule());
 		try {
@@ -1514,7 +1518,7 @@ describe('declarative-equivalence: materialized views', () => {
 			}`);
 			await db.exec('apply schema main');
 
-			// Changed arg value ⇒ undetected (no re-attach, no drop).
+			// Changed arg value ⇒ destructive move (name unchanged, args drift).
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
 				materialized view mv using mem2 (k = 'b') as select id, x from t
@@ -1523,8 +1527,131 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'args change is not detected (gap)').to.be.undefined;
-			expect(diff.tablesToDrop).to.deep.equal([]);
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no alter — recreate subsumes it').to.be.undefined;
+			expect(diff.tablesToDrop, 'mv dropped for the recreate').to.deep.equal(['mv']);
+			expect(diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'mv recreated using mem2').to.be.true;
+			expect(diff.maintainedModuleMigrations, 'one args-only module migration recorded').to.deep.equal([
+				{ name: 'mv', fromModule: `mem2(k="a")`, toModule: `mem2(k="b")` },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('apply WITHOUT allow_destructive refuses a backing-module move and leaves the backing unchanged', async function () {
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			// Re-declare with a moved backing module, then apply without the ack.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv using mem2() as select id, x from t
+			}`);
+
+			let threw: Error | undefined;
+			try {
+				await db.exec('apply schema main');
+			} catch (e) {
+				threw = e as Error;
+			}
+			expect(threw, 'apply should throw without allow_destructive').to.not.be.undefined;
+			expect(threw!.message, 'sited error mentions allow_destructive').to.match(/allow_destructive/i);
+			expect(threw!.message, 'names the maintained table').to.match(/\bmv\b/);
+
+			// No partial migration: the live backing is still the memory default.
+			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv');
+			expect(live?.maintained, 'mv is still maintained').to.not.be.undefined;
+			expect(live!.maintained!.backingModuleName, 'still on the memory default backing').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('apply WITH allow_destructive migrates the backing (new incarnation, rows re-materialized, idempotent re-diff)', async function () {
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			// Capture the MV lifecycle events that prove a new incarnation.
+			const events: string[] = [];
+			const unsub = db.schemaManager.getChangeNotifier().addListener(ev => {
+				if (ev.type === 'materialized_view_removed' || ev.type === 'materialized_view_added') {
+					if (ev.objectName.toLowerCase() === 'mv') events.push(ev.type);
+				}
+			});
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv using mem2() as select id, x from t
+			}`);
+			await db.exec('apply schema main options (allow_destructive = true)');
+			unsub();
+
+			// New incarnation: removed then re-added, in that order.
+			expect(events, 'fires materialized_view_removed then _added').to.deep.equal([
+				'materialized_view_removed', 'materialized_view_added',
+			]);
+
+			// Live backing is now mem2.
+			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv');
+			expect(live!.maintained!.backingModuleName, 'mv now backed by mem2').to.equal('mem2');
+
+			// Rows re-materialized from current sources.
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, x from mv order by id')) rows.push(r);
+			expect(rows, 'rows re-derived into the new backing').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+
+			// Idempotent: re-diffing the same declaration now matches the live mem2 backing.
+			const diff2 = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff2.maintainedModuleMigrations, 'no second migration').to.deep.equal([]);
+			expect(diff2.tablesToDrop, 'no second drop').to.deep.equal([]);
+			expect(diff2.tablesToCreate, 'no second create').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a backing-module move AND a body change together take ONE drop+recreate (no separate re-attach)', async function () {
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+
+			// Both the backing module AND the body change in one re-declaration.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv using mem2() as select id, x + 1 from t
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			// The recreate (new module + new body) subsumes the body re-attach: exactly
+			// one migration, the drop+recreate, and NO `set maintained as` alter for mv.
+			expect(diff.maintainedModuleMigrations.length, 'one migration only').to.equal(1);
+			expect(diff.tablesToDrop, 'mv dropped once').to.deep.equal(['mv']);
+			expect(diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv\b/i.test(s) && /mem2/i.test(s)), 'recreate carries new module').to.be.true;
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'no separate re-attach alter for mv').to.be.undefined;
 		} finally {
 			await db.close();
 		}
