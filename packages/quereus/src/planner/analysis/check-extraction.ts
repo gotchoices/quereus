@@ -43,7 +43,12 @@ const cache = new WeakMap<TableSchema, CheckExtraction>();
 
 const allDeterministic = (): boolean => true;
 
-export function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
+/**
+ * Raw (capability-blind) CHECK extraction. **Module-internal**: every external
+ * consumer must go through {@link getTrustedCheckExtraction} so the
+ * `permitsGrandfatheredCheckViolators` gate cannot be forgotten. Not exported.
+ */
+function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
 	let cached = cache.get(tableSchema);
 	if (!cached) {
 		cached = extractCheckConstraints(
