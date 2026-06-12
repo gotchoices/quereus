@@ -158,36 +158,59 @@ drop materialized view smv2;
 drop table s2;
 
 -- ===================================
--- 9. refresh rebuilds the backing SCHEMA when a source ALTER shifts the body's
---    output shape. A `select *` join MV interleaves the new source column into its
---    output; refresh must rebuild the backing to match — not stuff the new rows into
---    the stale create-time schema (which surfaced values under the wrong labels: a
---    latent direct-read corruption). The colliding c.id surfaces as id:1.
+-- 9. refresh reconciles the backing SHAPE to the re-planned body IDENTITY-
+--    PRESERVINGLY when a source ALTER shifts it. A trailing source-column add
+--    reaching a single-source `select *` body is expressible in place (same table
+--    incarnation, via the module's alterTable + a data reconcile). An interleaving
+--    join `select *` — the new orders column lands BEFORE the customers columns —
+--    is inexpressible by append-only adds and is a sited error, leaving the table
+--    and its rows untouched (recoverable by detach→alter→attach or drop+recreate).
 -- ===================================
 
+-- (a) in-place reshape: single-source select*, trailing add
+create table rs_src (id integer primary key, a integer);
+insert into rs_src values (1, 10);
+create materialized view rsv as select * from rs_src;
+
+-- before the alter: 2 columns
+select * from rsv;
+→ [{"id":1,"a":10}]
+
+alter table rs_src add column b integer default 5;
+refresh materialized view rsv;
+
+-- after: the appended column reached the backing in place — value under the right label
+select * from rsv;
+→ [{"id":1,"a":10,"b":5}]
+
+-- row-time maintenance binds to the reshaped backing — a later source row carries the new column
+insert into rs_src values (2, 20, 7);
+select * from rsv where id = 2;
+→ [{"id":2,"a":20,"b":7}]
+
+drop materialized view rsv;
+drop table rs_src;
+
+-- (b) inexpressible interleave: a join select* whose new column lands mid-output → sited error
 create table rs_cust (id integer primary key, name text not null);
 create table rs_ord (id integer primary key, customer_id integer not null references rs_cust(id), amt integer not null);
-create materialized view rsv as select * from rs_ord o join rs_cust c on o.customer_id = c.id;
+create materialized view rsj as select * from rs_ord o join rs_cust c on o.customer_id = c.id;
 insert into rs_cust values (1, 'alice');
 insert into rs_ord values (10, 1, 100);
 
--- before the alter: 5 columns
-select * from rsv;
+-- before the alter: 5 columns (the colliding c.id surfaces as id:1)
+select * from rsj;
 → [{"id":10,"customer_id":1,"amt":100,"id:1":1,"name":"alice"}]
 
 alter table rs_ord add column extra text default 'x';
-refresh materialized view rsv;
+refresh materialized view rsj;
+-- error: changed incompatibly
 
--- after: the backing is rebuilt to the 6-column body — every value under the right label
-select * from rsv;
-→ [{"id":10,"customer_id":1,"amt":100,"extra":"x","id:1":1,"name":"alice"}]
+-- the table is untouched: the stored snapshot still reads at the old 5-column shape
+select * from rsj;
+→ [{"id":10,"customer_id":1,"amt":100,"id:1":1,"name":"alice"}]
 
--- row-time maintenance binds to the rebuilt backing — a later source row carries the new column
-insert into rs_ord values (20, 1, 200, 'custom');
-select * from rsv where id = 20;
-→ [{"id":20,"customer_id":1,"amt":200,"extra":"custom","id:1":1,"name":"alice"}]
-
-drop materialized view rsv;
+drop materialized view rsj;
 drop table rs_ord;
 drop table rs_cust;
 
@@ -208,50 +231,48 @@ drop table rs_t;
 -- ===================================
 -- 11. In-transaction source ALTER + REFRESH (mv-refresh-intxn-altered-source-stale-read).
 --     §9 is the autocommit analog; here the alter+refresh run inside one explicit
---     transaction. With an MV over the source, an autocommit-collapsed source
+--     transaction over a single-source `select *` MV (a trailing add → in-place
+--     reshape). With an MV over the source, an autocommit-collapsed source
 --     connection is detached from its manager's map but stays in the Database
 --     registry; `MemoryTable.ensureConnection` reuses it for the in-transaction read.
 --     ensureSchemaChangeSafety formerly re-pointed only connections still in the map,
---     so the detached one kept a stale pre-alter readLayer (3-column shape) — the
---     same-transaction source read missed `extra`, and refresh refilled the backing
---     with misaligned data (`extra` holding c.id, etc.). The fix re-points every
---     registered source connection at the new base, so both the direct source read
---     and the refresh observe the post-alter 4-column shape.
+--     so the detached one kept a stale pre-alter readLayer (2-column shape) — the
+--     same-transaction source read missed `extra`, and refresh reshaped+refilled the
+--     backing with misaligned data. The fix re-points every registered source
+--     connection at the new base, so both the direct source read and the refresh
+--     observe the post-alter 3-column shape.
 -- ===================================
 
-create table itx_cust (id integer primary key, name text not null);
-create table itx_ord (id integer primary key, customer_id integer not null references itx_cust(id), amt integer not null);
-create materialized view itxv as select * from itx_ord o join itx_cust c on o.customer_id = c.id;
-insert into itx_cust values (1, 'alice');
-insert into itx_ord values (10, 1, 100);
+create table itx_src (id integer primary key, a integer);
+create materialized view itxv as select * from itx_src;
+insert into itx_src values (10, 100);
 
 -- a direct autocommit source scan leaves a detached-but-registered source connection
-select * from itx_ord order by id;
-→ [{"id":10,"customer_id":1,"amt":100}]
+select * from itx_src order by id;
+→ [{"id":10,"a":100}]
 
 select * from itxv;
-→ [{"id":10,"customer_id":1,"amt":100,"id:1":1,"name":"alice"}]
+→ [{"id":10,"a":100}]
 
 begin;
-alter table itx_ord add column extra text default 'x';
+alter table itx_src add column extra text default 'x';
 -- (b) the same-transaction direct source read returns the new column + backfilled default
-select * from itx_ord order by id;
-→ [{"id":10,"customer_id":1,"amt":100,"extra":"x"}]
--- (a) refresh rebuilds the backing from the post-alter source — values under the right labels
+select * from itx_src order by id;
+→ [{"id":10,"a":100,"extra":"x"}]
+-- (a) refresh reshapes the backing in place from the post-alter source — values under right labels
 refresh materialized view itxv;
 commit;
 
 select * from itxv;
-→ [{"id":10,"customer_id":1,"amt":100,"extra":"x","id:1":1,"name":"alice"}]
+→ [{"id":10,"a":100,"extra":"x"}]
 
--- row-time maintenance still binds to the rebuilt backing post-commit
-insert into itx_ord values (20, 1, 200, 'custom');
+-- row-time maintenance still binds to the reshaped backing post-commit
+insert into itx_src values (20, 200, 'custom');
 select * from itxv where id = 20;
-→ [{"id":20,"customer_id":1,"amt":200,"extra":"custom","id:1":1,"name":"alice"}]
+→ [{"id":20,"a":200,"extra":"custom"}]
 
 drop materialized view itxv;
-drop table itx_ord;
-drop table itx_cust;
+drop table itx_src;
 
 -- ===================================
 -- 11. Unified maintained-table model: one catalog entry, one namespace,

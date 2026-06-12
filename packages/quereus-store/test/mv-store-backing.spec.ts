@@ -359,23 +359,24 @@ describe('materialized views `using store` (end-to-end)', () => {
 			expect(storeResult, 'store and memory backings observe the same refresh-in-savepoint outcome').to.deep.equal(memoryResult);
 		});
 
-		it('a shape rebuild after a source ALTER recreates the backing in the store module (no silent migration)', async () => {
+		it('an in-place reshape after a source ALTER keeps the backing in the store module (no silent migration)', async () => {
 			await db.exec('create table src (id integer primary key, v integer) using store');
 			await db.exec('insert into src values (1, 10)');
 			await db.exec('create materialized view mv using store as select * from src');
 
-			// A source ALTER shifts the `select *` body's shape → refresh takes the
-			// drop+recreate rebuild path, which must rebuild into the MV's OWN module.
+			// A trailing source-column add shifts the `select *` body's shape → refresh
+			// reshapes the maintained table IN PLACE (via the store module's alterTable),
+			// keeping the incarnation in the MV's OWN module.
 			await db.exec('alter table src add column w integer default 7');
 			await db.exec('refresh materialized view mv');
 
 			const backing = db.schemaManager.getTable('main', BACKING)!;
-			expect(backing.vtabModuleName, 'rebuilt backing module').to.equal('store');
-			expect(storeModule.getTable('main', BACKING), 'rebuilt backing in StoreModule map').to.not.be.undefined;
+			expect(backing.vtabModuleName, 'reshaped backing module').to.equal('store');
+			expect(storeModule.getTable('main', BACKING), 'reshaped backing in StoreModule map').to.not.be.undefined;
 			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.vtabModuleName).to.equal('store');
 			expect(await rows(db, 'select id, v, w from mv')).to.deep.equal([{ id: 1, v: 10, w: 7 }]);
 
-			// Maintenance is live against the rebuilt incarnation.
+			// Maintenance is live against the reshaped incarnation.
 			await db.exec('insert into src values (2, 20, 8)');
 			expect(await rows(db, 'select id, v, w from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10, w: 7 }, { id: 2, v: 20, w: 8 }]);

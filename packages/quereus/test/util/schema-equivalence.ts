@@ -23,7 +23,7 @@ import type { TableSchema, RowConstraintSchema, IndexSchema, ForeignKeyConstrain
 import type { ColumnSchema } from '../../src/schema/column.js';
 import type { ViewSchema } from '../../src/schema/view.js';
 import type { MaintainedTableSchema } from '../../src/schema/derivation.js';
-import { generateMaterializedViewDDL } from '../../src/schema/ddl-generator.js';
+import { generateMaintainedTableDDL } from '../../src/schema/ddl-generator.js';
 import type { IntegrityAssertionSchema } from '../../src/schema/assertion.js';
 import type * as AST from '../../src/parser/ast.js';
 import type { SqlValue } from '../../src/common/types.js';
@@ -255,7 +255,7 @@ export function assertMaterializedViewSchemaEqual(direct: MaintainedTableSchema,
 	const aCols = (applied.derivation.columns ?? []).map(c => c.toLowerCase());
 	eqArray(dCols, aCols, `${root}derivation.columns`);
 	eq(direct.derivation.bodyHash, applied.derivation.bodyHash, `${root}derivation.bodyHash`);
-	eq(generateMaterializedViewDDL(direct), generateMaterializedViewDDL(applied), `${root}generatedDDL`);
+	eq(generateMaintainedTableDDL(direct), generateMaintainedTableDDL(applied), `${root}generatedDDL`);
 	try {
 		assertAstEquivalent(direct.derivation.selectAst, applied.derivation.selectAst, `${root}derivation.selectAst`);
 		assertAstEquivalent(direct.derivation.insertDefaults ?? [], applied.derivation.insertDefaults ?? [], `${root}derivation.insertDefaults`);

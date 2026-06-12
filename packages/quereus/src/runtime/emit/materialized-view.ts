@@ -14,7 +14,7 @@ import {
 	materializeView,
 	deriveBackingShape,
 	rebuildBacking,
-	rebuildBackingTable,
+	reshapeBacking,
 	backingShapeMatches,
 	revalidateBody,
 	unlinkCoveredUniqueConstraints,
@@ -125,10 +125,12 @@ export function emitRefreshMaterializedView(plan: RefreshMaterializedViewNode, _
 			// FAST PATH: shape unchanged — data-only swap, table identity + caches preserved.
 			await rebuildBacking(db, mv);
 		} else {
-			// REBUILD: the shape shifted — drop+recreate the table under the SAME
-			// name (one catalog entry) to match the re-planned body; the helper
-			// re-attaches the (shape-updated) derivation and returns the new record.
-			live = await rebuildBackingTable(db, mv, shape);
+			// RESHAPE: the shape shifted — reconcile the live table to the re-planned
+			// body IN PLACE (module alterTable ops + data reconcile), preserving the
+			// table incarnation. An interleaving reorder or a physical-PK change is
+			// inexpressible in place and raises a sited error (table left untouched,
+			// MV stays stale). The helper returns the reshaped (shape-updated) record.
+			live = await reshapeBacking(db, mv, shape);
 		}
 
 		// Re-register row-time write-through maintenance. A source schema change that

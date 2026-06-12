@@ -11,12 +11,13 @@ import { deriveCoarsenedBackingKey, type CoarsenedBackingKey } from '../../plann
 import type { ColumnSchema } from '../../schema/column.js';
 import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule } from '../../schema/table.js';
 import type { CoarsenedKeyInfo } from '../../schema/view.js';
-import { computeBodyHash, normalizeBackingModule } from '../../schema/view.js';
+import { computeBodyHash } from '../../schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from '../../schema/derivation.js';
 import type { Schema } from '../../schema/schema.js';
 import { renameTableInAst, renameColumnInAst, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
 import type { BackingHost } from '../../vtab/backing-host.js';
+import type { SchemaChangeInfo } from '../../vtab/module.js';
 
 const log = createLogger('runtime:emit:materialized-view');
 const warnLog = log.extend('warn');
@@ -602,9 +603,38 @@ function backingShapeMatchesStructurally(current: TableSchema, shape: BackingSha
 	return describeBackingShapeMismatch(current, shape) === null;
 }
 
+/* ──────────────── shared backing-column comparison primitives ────────────────
+ * The per-column attribute comparisons below are the single shape-diff vocabulary
+ * shared by the positional {@link describeBackingShapeMismatch} (the rename
+ * propagation's "pure name shift?" assertion) and the alignment-based
+ * {@link classifyBackingReshape} (refresh's in-place reshape gate) — neither rolls
+ * its own column compare. All compare by NAME / normalized value, not identity:
+ * logical types resolve through the (name-interned) registry, but a module may
+ * rebuild its TableSchema with fresh instances after an ALTER (the store module
+ * does), so object identity is spuriously false. */
+
+/** The two columns carry the same logical type (by interned type name). */
+function backingTypeMatches(a: ColumnSchema, b: ColumnSchema): boolean {
+	return a.logicalType.name.toUpperCase() === b.logicalType.name.toUpperCase();
+}
+
+/** The two columns agree on NOT NULL. */
+function backingNotNullMatches(a: ColumnSchema, b: ColumnSchema): boolean {
+	return (a.notNull === true) === (b.notNull === true);
+}
+
+/** The two columns agree on declared collation (absent ⇒ BINARY). */
+function backingCollationMatches(a: ColumnSchema, b: ColumnSchema): boolean {
+	return (a.collation ?? 'BINARY') === (b.collation ?? 'BINARY');
+}
+
 /** Names the first structural difference between the live backing and the derived
  *  shape (null when structurally identical) — the diagnostic half of
- *  {@link backingShapeMatchesStructurally}. */
+ *  {@link backingShapeMatchesStructurally}. Deliberately **positional** (column i
+ *  vs column i): it answers "is this a pure positional name shift (or identical)?"
+ *  for the rename-propagation pass, which only ever carries names. The richer
+ *  alignment that tolerates appended / dropped / renamed columns is
+ *  {@link classifyBackingReshape}; both share the per-column predicates above. */
 function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape): string | null {
 	if (current.columns.length !== shape.columns.length) {
 		return `column count ${current.columns.length} → ${shape.columns.length}`;
@@ -612,16 +642,13 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
 	for (let i = 0; i < shape.columns.length; i++) {
 		const a = current.columns[i];
 		const b = shape.columns[i];
-		// By NAME, not identity: logical types resolve through the (name-interned)
-		// registry, but a module may rebuild its TableSchema with fresh instances
-		// after an ALTER (the store module does), so identity is spuriously false.
-		if (a.logicalType.name.toUpperCase() !== b.logicalType.name.toUpperCase()) {
+		if (!backingTypeMatches(a, b)) {
 			return `column ${i} type ${a.logicalType.name} → ${b.logicalType.name}`;
 		}
-		if ((a.notNull === true) !== (b.notNull === true)) {
+		if (!backingNotNullMatches(a, b)) {
 			return `column ${i} not-null ${a.notNull === true} → ${b.notNull === true}`;
 		}
-		if ((a.collation ?? 'BINARY') !== (b.collation ?? 'BINARY')) {
+		if (!backingCollationMatches(a, b)) {
 			return `column ${i} collation ${a.collation ?? 'BINARY'} → ${b.collation ?? 'BINARY'}`;
 		}
 	}
@@ -645,59 +672,323 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
 	return null;
 }
 
+/* ──────────────── identity-preserving refresh reshape ──────────────── */
+
 /**
- * Drop-and-recreate rebuild of a maintained table when a source schema change
- * has shifted the body's output shape (columns/types/PK/ordering), so the
- * table no longer corresponds column-for-column to the re-planned body.
- * Mirrors the create path (`emitCreateMaterializedView`) exactly —
- * `buildBackingTableSchema` → `createBackingTable` → fill via the backing host's
- * `replaceContents` — so there is one code path for "make the backing match the
- * body". The recreate registers under the SAME table name, one catalog entry,
- * and re-attaches the (shape-updated) derivation; the rebuilt maintained table
- * is returned for the caller to re-register maintenance on.
- *
- * The body rows are collected BEFORE the old table is dropped (the body reads
- * the sources with the rewrite suppressed, never the table it populates), so
- * the window in which no table exists is minimal. The drop fires `table_removed`
- * and the create fires `table_added` on the table's own name, which (a)
- * invalidate any cached prepared plan scanning it directly and (b) cascade
- * staleness to any consumer MV reading it. On a fill failure (e.g. the
- * reshaped body is duplicate-producing under the new PK) the half-built table
- * is dropped so the next read errors rather than serving an empty relation; the
- * caller leaves the MV `stale` (it clears the flag only on success).
+ * A single in-place reshape step expressed against the hosting module's
+ * `alterTable` surface. The classifier emits these in execution order; the
+ * executor lifts each onto a `SchemaChangeInfo` arm. Names are tracked
+ * post-rename (the rename phase runs first), and every op addresses its column
+ * by name, so the running index shift that add/drop induce never matters.
  */
-export async function rebuildBackingTable(
+type ReshapeColumnOp =
+	| { kind: 'rename'; oldName: string; oldCol: ColumnSchema; newName: string }
+	| { kind: 'add'; col: ColumnSchema }
+	| { kind: 'retype'; name: string; newTypeName: string }
+	| { kind: 'recollate'; name: string; collation: string }
+	| { kind: 'loosenNotNull'; name: string }
+	| { kind: 'drop'; name: string };
+
+/** An expressible in-place reshape: the ordered pre-reconcile module ops plus the
+ *  set of (final) column names whose NOT NULL must be (re-)asserted *after* the
+ *  data reconcile — see {@link reshapeBackingInPlace} for why tightening defers. */
+interface ReshapePlan {
+	ops: ReshapeColumnOp[];
+	tightenNotNull: string[];
+}
+
+type ReshapeClassification =
+	| { expressible: true; plan: ReshapePlan }
+	| { expressible: false; reason: string };
+
+/**
+ * Classifies the column-level delta old(`current`)→new(`shape`) for an
+ * identity-preserving refresh reshape. **Expressible in place** — returns the
+ * ordered module-op plan — iff the change is any combination of **trailing**
+ * appended columns, dropped columns, positionally renamed columns, and per-column
+ * attribute (type / collation / not-null) changes, with the surviving columns'
+ * relative order preserved and the physical primary key unchanged. Otherwise
+ * **inexpressible** (the caller raises a sited error and leaves the table
+ * untouched):
+ *
+ *  - an **interleaving** reorder — a new column landing mid-table (the canonical
+ *    `select *` body whose new source column lands before existing outputs):
+ *    append-only `addColumn` cannot place it, and renaming survivors to fake it
+ *    would silently re-map values;
+ *  - a **physical-PK definition change** (column set, order, direction, or
+ *    collation of the key) — a maintained table's PK is its replicated row
+ *    identity; silently re-keying it is the fatality drop+recreate was.
+ *
+ * Surviving columns are matched by **name** (case-insensitive — the only stable
+ * identity a derived backing carries); a name absent on both sides at an aligned
+ * position is a positional rename (the value-preserving trace
+ * {@link renameShiftedBackingColumns} already uses). Shares the per-column
+ * predicates with {@link describeBackingShapeMismatch} (the positional pure-name-
+ * shift check) rather than re-implementing the column compare.
+ */
+function classifyBackingReshape(current: TableSchema, shape: BackingShape): ReshapeClassification {
+	const cur = current.columns;
+	const sh = shape.columns;
+	const curNames = new Set(cur.map(c => c.name.toLowerCase()));
+	const shNames = new Set(sh.map(c => c.name.toLowerCase()));
+
+	const renames: ReshapeColumnOp[] = [];
+	const adds: ReshapeColumnOp[] = [];
+	const attrs: ReshapeColumnOp[] = [];   // survivor attribute shifts (retype / recollate / loosen)
+	const drops: ReshapeColumnOp[] = [];
+	const tightenNotNull: string[] = [];
+	// lower(oldName) → lower(newName), for the rename-aware PK comparison below.
+	const renameMap = new Map<string, string>();
+
+	// A survivor's attribute shift. A NOT NULL *tightening* defers to a
+	// post-reconcile pass (the live rows may still violate it; the reconciled body
+	// rows will not); a loosening and the type/collation shifts apply in place.
+	// `name` is the column's post-rename (new) name.
+	const recordAttrShift = (from: ColumnSchema, to: ColumnSchema, name: string): void => {
+		if (!backingTypeMatches(from, to)) attrs.push({ kind: 'retype', name, newTypeName: to.logicalType.name });
+		if (!backingCollationMatches(from, to)) attrs.push({ kind: 'recollate', name, collation: to.collation ?? 'BINARY' });
+		if (!backingNotNullMatches(from, to)) {
+			if (to.notNull === true) tightenNotNull.push(name);
+			else attrs.push({ kind: 'loosenNotNull', name });
+		}
+	};
+
+	let i = 0, j = 0;
+	while (i < cur.length && j < sh.length) {
+		const cc = cur[i], sc = sh[j];
+		const cn = cc.name.toLowerCase(), sn = sc.name.toLowerCase();
+		if (cn === sn) {
+			recordAttrShift(cc, sc, sc.name);
+			i++; j++;
+		} else if (!shNames.has(cn) && !curNames.has(sn)) {
+			// Aligned position, both names "extra" ⇒ positional rename cc → sc.
+			renames.push({ kind: 'rename', oldName: cc.name, oldCol: cc, newName: sc.name });
+			renameMap.set(cn, sn);
+			recordAttrShift(cc, sc, sc.name);   // attr ops reference the post-rename name
+			i++; j++;
+		} else if (!shNames.has(cn)) {
+			// cc's name is gone from the new shape ⇒ dropped; sc matches a later survivor.
+			drops.push({ kind: 'drop', name: cc.name });
+			i++;
+		} else if (!curNames.has(sn)) {
+			// A genuinely new column appearing before the current survivors are
+			// exhausted ⇒ a mid-table insert, not a trailing append.
+			return { expressible: false, reason: `new column '${sc.name}' lands mid-table (an interleaving reshape, not a trailing append)` };
+		} else {
+			// Both names exist on the opposite side but are not aligned here ⇒ a reorder/swap.
+			return { expressible: false, reason: `columns '${cc.name}' and '${sc.name}' are reordered` };
+		}
+	}
+	for (; i < cur.length; i++) {
+		const cc = cur[i];
+		if (!shNames.has(cc.name.toLowerCase())) drops.push({ kind: 'drop', name: cc.name });
+		else return { expressible: false, reason: `column '${cc.name}' is reordered` };
+	}
+	for (; j < sh.length; j++) {
+		const sc = sh[j];
+		if (!curNames.has(sc.name.toLowerCase())) {
+			adds.push({ kind: 'add', col: sc });
+			if (sc.notNull === true) tightenNotNull.push(sc.name);
+		} else {
+			return { expressible: false, reason: `column '${sc.name}' is reordered` };
+		}
+	}
+
+	const pkReason = describePhysicalPkChange(current, shape, renameMap);
+	if (pkReason) return { expressible: false, reason: pkReason };
+
+	// Data-lossless ops first (renames, adds) then lossy-capable (attribute shifts,
+	// drops), so a mid-sequence failure leaves a state a re-run refresh re-derives.
+	return { expressible: true, plan: { ops: [...renames, ...adds, ...attrs, ...drops], tightenNotNull } };
+}
+
+/**
+ * Compares the live backing's physical primary key to the re-derived shape's
+ * ({@link computeBackingPrimaryKey}) **by column name through the reshape's rename
+ * map** — not by index, which add/drop shift. Any change to the key's column set,
+ * order, direction, or collation makes the reshape inexpressible: a maintained
+ * table's PK is its replicated row identity. Returns a reason string, or null when
+ * the key is unchanged. (A renamed key column is *not* a key change — the rename
+ * map carries its new name; only a key-column type change is left to `alterColumn`,
+ * which is not a PK-definition change.)
+ */
+function describePhysicalPkChange(
+	current: TableSchema,
+	shape: BackingShape,
+	renameMap: ReadonlyMap<string, string>,
+): string | null {
+	const shapePk = computeBackingPrimaryKey(shape);
+	const currentPk = current.primaryKeyDefinition;
+	if (currentPk.length !== shapePk.length) {
+		return `primary-key column count ${currentPk.length} → ${shapePk.length}`;
+	}
+	for (let k = 0; k < shapePk.length; k++) {
+		const curCol = current.columns[currentPk[k].index];
+		const shCol = shape.columns[shapePk[k].index];
+		const curName = renameMap.get(curCol.name.toLowerCase()) ?? curCol.name.toLowerCase();
+		if (curName !== shCol.name.toLowerCase()) {
+			return `primary-key column ${k} '${curCol.name}' → '${shCol.name}'`;
+		}
+		if ((currentPk[k].desc === true) !== (shapePk[k].desc === true)) {
+			return `primary-key column ${k} direction`;
+		}
+		const curColl = currentPk[k].collation ?? curCol.collation ?? 'BINARY';
+		const shColl = shCol.collation ?? 'BINARY';
+		if (curColl !== shColl) {
+			return `primary-key column ${k} collation ${curColl} → ${shColl}`;
+		}
+	}
+	return null;
+}
+
+/** Lifts a {@link ReshapeColumnOp} onto the module's `SchemaChangeInfo` surface. */
+function reshapeOpToChange(op: ReshapeColumnOp): SchemaChangeInfo {
+	switch (op.kind) {
+		case 'rename':
+			// Preserve the OLD column's attributes (type / not-null / collation / PK)
+			// under the new name — attribute shifts ride separate alter ops.
+			return { type: 'renameColumn', oldName: op.oldName, newName: op.newName, newColumnDefAst: backingColumnDef(op.oldCol, op.newName) };
+		case 'add': {
+			// Add NULLABLE: real values arrive with the reconcile, and any NOT NULL is
+			// asserted post-reconcile so a non-empty backing never trips "ADD NOT NULL
+			// without a default". An added column is never a PK column (a PK change is
+			// inexpressible), so force non-PK in the lifted def.
+			const nullable: ColumnSchema = { ...op.col, notNull: false, primaryKey: false, pkOrder: 0, pkDirection: undefined };
+			return { type: 'addColumn', columnDef: backingColumnDef(nullable, op.col.name) };
+		}
+		case 'retype':
+			return { type: 'alterColumn', columnName: op.name, setDataType: op.newTypeName };
+		case 'recollate':
+			return { type: 'alterColumn', columnName: op.name, setCollation: op.collation };
+		case 'loosenNotNull':
+			return { type: 'alterColumn', columnName: op.name, setNotNull: false };
+		case 'drop':
+			return { type: 'dropColumn', columnName: op.name };
+	}
+}
+
+/**
+ * The sited error a refresh raises when the re-derived body shape cannot be
+ * reconciled onto the live maintained table in place — an interleaving column
+ * reorder or a physical-PK definition change (or a host module without
+ * `alterTable`). The table and its rows are left **untouched** and the derivation
+ * stays `stale`, recoverable exactly as the message says. Replaces the former
+ * silent drop+recreate: a maintained table's PK / positional identity is its
+ * replicated row identity, so an incompatible reshape is an actionable error, not
+ * a new incarnation.
+ */
+function inexpressibleReshapeError(schemaName: string, name: string, reason: string): QuereusError {
+	return new QuereusError(
+		`the derivation's output shape changed incompatibly with table '${schemaName}.${name}' (${reason}); `
+			+ `alter the table to the new shape and re-attach, or drop and recreate`,
+		StatusCode.ERROR,
+	);
+}
+
+/**
+ * Identity-preserving reshape of a maintained table whose re-derived body shape
+ * shifted — the refresh path's replacement for the former drop+recreate. Classify
+ * the column delta; an inexpressible delta (interleave / PK-definition change)
+ * raises the sited error with the table untouched, an expressible one reshapes in
+ * place. The shape-match fast path (`backingShapeMatches` ⇒ data-only
+ * `rebuildBacking`) is the caller's and is untouched.
+ */
+export async function reshapeBacking(
 	db: Database,
 	mv: MaintainedTableSchema,
 	shape: BackingShape,
 ): Promise<MaintainedTableSchema> {
-	const sm = db.schemaManager;
-	const rows: Row[] = await collectBodyRows(db, astToString(mv.derivation.selectAst));
-
-	// Rebuild into the table's OWN host module — falling back to memory here
-	// would silently migrate a non-default backing on the first shape rebuild.
-	const backing = normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs);
-	await sm.dropTable(mv.schemaName, mv.name, /*ifExists*/ true);
-	// Preserve the live table-level tags across the reshape (a refresh never
-	// changes metadata).
-	const backingSchema = buildBackingTableSchema(db, mv.schemaName, mv.name, shape, backing.moduleName, backing.storedModuleArgs, mv.tags);
-	const completeBacking = await sm.createBackingTable(backingSchema);
-	try {
-		const host = resolveBackingHost(db, completeBacking);
-		await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
-	} catch (e) {
-		try {
-			await sm.dropTable(mv.schemaName, mv.name, /*ifExists*/ true);
-		} catch { /* best-effort cleanup */ }
-		throw e;
+	const classification = classifyBackingReshape(mv, shape);
+	if (!classification.expressible) {
+		throw inexpressibleReshapeError(mv.schemaName, mv.name, classification.reason);
 	}
-	// Re-attach the derivation (updated to the new shape) onto the recreated
-	// table — one catalog entry, same name, derivation carried forward.
+	return reshapeBackingInPlace(db, mv, shape, classification.plan);
+}
+
+/**
+ * Executes an expressible in-place reshape: apply the ordered module `alterTable`
+ * ops (renames/adds/attribute-shifts/drops) → re-register the reshaped schema +
+ * (shape-updated) derivation → data-reconcile via the shared {@link rebuildBacking}
+ * (re-run the body, swap contents) → assert any deferred NOT NULL → fire one
+ * `table_modified`. The **same table incarnation throughout** — the backing-host
+ * instance stays owned, no `table_removed`/`table_added` — so a replicated basis
+ * table's row metadata survives; consumer maintained tables go stale via the
+ * single `table_modified` and recover by their own refresh, exactly as for any
+ * source alter. Returns the reshaped maintained table for the caller to re-register
+ * maintenance on.
+ *
+ * **NULL-default adds, deferred tightening.** A new column is added NULLABLE (its
+ * real values arrive with the reconcile) and any NOT NULL — added column or a
+ * survivor tightened from nullable — is asserted only after the reconcile, so a
+ * non-empty backing never trips "ADD NOT NULL without a default".
+ *
+ * **Recoverability.** A mid-sequence module failure (e.g. an `alterColumn`
+ * MISMATCH narrowing the live rows, or the reconcile tripping the set gate)
+ * throws; the caller leaves the MV `stale`, and a re-run refresh re-derives the
+ * (now smaller) residual delta against the partially-reshaped table and converges.
+ */
+async function reshapeBackingInPlace(
+	db: Database,
+	mv: MaintainedTableSchema,
+	shape: BackingShape,
+	plan: ReshapePlan,
+): Promise<MaintainedTableSchema> {
+	const sm = db.schemaManager;
+	const schema = sm.getSchemaOrFail(mv.schemaName);
+	const backing = schema.getTable(mv.name);
+	if (!backing) {
+		throw new QuereusError(
+			`Internal error: maintained table '${mv.name}' not found during reshape`,
+			StatusCode.INTERNAL,
+		);
+	}
+	const module = requireVtabModule(backing);
+	if (!module.alterTable) {
+		throw inexpressibleReshapeError(mv.schemaName, mv.name,
+			`its backing module '${backing.vtabModuleName}' does not support in-place ALTER`);
+	}
+
+	// Pre-reconcile structural ops. Each addresses its column by name, so the fresh
+	// schema each call returns need not be threaded by index; track only the latest.
+	let current: TableSchema = backing;
+	for (const op of plan.ops) {
+		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
+	}
+
+	// Re-register the reshaped schema with the (shape-updated) derivation BEFORE the
+	// reconcile, so `rebuildBacking` resolves the reshaped table from the catalog.
+	// alterTable returns a fresh derivation-less TableSchema; carry the derivation.
 	mv.derivation.logicalKey = shape.primaryKey;
 	mv.derivation.coarsenedKey = shape.coarsenedKey;
 	mv.derivation.ordering = shape.ordering;
 	mv.derivation.sourceTables = shape.sourceTables;
-	return sm.attachDerivation(mv.schemaName, mv.name, mv.derivation);
+	let live: MaintainedTableSchema = { ...current, derivation: mv.derivation };
+	schema.addTable(live);
+
+	// Data reconcile: re-run the body and swap contents (the identity-preserving
+	// data-only path — same host, same incarnation).
+	await rebuildBacking(db, live);
+
+	// Deferred NOT NULL: the reconciled rows satisfy it where the live rows might not.
+	for (const name of plan.tightenNotNull) {
+		current = await module.alterTable(db, mv.schemaName, mv.name, { type: 'alterColumn', columnName: name, setNotNull: true });
+	}
+	if (plan.tightenNotNull.length > 0) {
+		live = { ...current, derivation: mv.derivation };
+		schema.addTable(live);
+	}
+
+	// One engine-level event for the whole reshape: invalidate cached plans scanning
+	// the table directly and cascade staleness to consumer MVs — table_modified, NOT
+	// table_removed/added, since the incarnation is preserved.
+	sm.getChangeNotifier().notifyChange({
+		type: 'table_modified',
+		schemaName: mv.schemaName,
+		objectName: mv.name,
+		oldObject: backing,
+		newObject: live,
+	});
+	return live;
 }
 
 /**

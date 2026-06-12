@@ -9,7 +9,7 @@
  *      and the `IF [NOT] EXISTS` no-ops fire nothing. Internal `schema.addView`
  *      callers (lens bodies) are deliberately NOT covered — they never route
  *      through the emitter, so no event fires for them.
- *   2. `generateViewDDL` / `generateMaterializedViewDDL` emit fully-qualified,
+ *   2. `generateViewDDL` / `generateMaintainedTableDDL` emit fully-qualified,
  *      tag-carrying, re-parseable DDL (a parse→generate→parse fixed point) so a
  *      `view_modified` (SET TAGS, which leaves the stored `sql` stale) round-trips.
  *   3. `SchemaManager.importCatalog` silently registers a plain view from its DDL
@@ -22,7 +22,7 @@
 
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
-import { generateViewDDL, generateMaterializedViewDDL } from '../src/schema/ddl-generator.js';
+import { generateViewDDL, generateMaintainedTableDDL } from '../src/schema/ddl-generator.js';
 import { parse } from '../src/parser/index.js';
 import { computeBodyHash, normalizeBackingModule, type ViewSchema } from '../src/schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema } from '../src/schema/derivation.js';
@@ -386,7 +386,7 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName, 'clause honored on the rehydrated record').to.equal('mem2');
 			expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName).to.equal('mem2');
 			expect(mem2.tables.has('main.mv'), 'backing in mem2').to.equal(true);
-			expect(generateMaterializedViewDDL(mv), 'regenerated DDL keeps the clause').to.match(/using mem2/i);
+			expect(generateMaintainedTableDDL(mv), 'regenerated DDL keeps the clause').to.match(/using mem2/i);
 
 			await db.exec('insert into base values (2, 20)');
 			expect(await rows(db, 'select id, v from mv order by id'))
@@ -512,7 +512,7 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 			expect(result.materializedViews).to.deep.equal(['main.mv']);
 			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
 			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName, 'explicit default normalizes to absent').to.be.undefined;
-			expect(generateMaterializedViewDDL(mv), 'canonical DDL renders clause-free').to.not.match(/using/i);
+			expect(generateMaintainedTableDDL(mv), 'canonical DDL renders clause-free').to.not.match(/using/i);
 		} finally {
 			await db.close();
 		}
@@ -520,7 +520,7 @@ describe('view persistence: importCatalog honors the MV backing-module clause', 
 });
 
 // ============================================================================
-// generateViewDDL / generateMaterializedViewDDL parse→generate→parse fixed point.
+// generateViewDDL / generateMaintainedTableDDL parse→generate→parse fixed point.
 //
 // The generators read the LIVE schema (tags included) and emit fully-qualified,
 // re-parseable DDL. A `view_modified` / `materialized_view_modified` swaps the
@@ -619,8 +619,8 @@ describe('view persistence: generateViewDDL fixed point', () => {
 	});
 });
 
-describe('view persistence: generateMaterializedViewDDL fixed point', () => {
-	const gen = (ddl: string) => generateMaterializedViewDDL(mvSchemaFromDDL(ddl));
+describe('view persistence: generateMaintainedTableDDL fixed point', () => {
+	const gen = (ddl: string) => generateMaintainedTableDDL(mvSchemaFromDDL(ddl));
 
 	it('always emits a fully-qualified (schema.name) MV name; explicit-default USING normalizes away', () => {
 		const ddl = gen('create materialized view v using memory as select 1 as a');
@@ -692,7 +692,7 @@ describe('view persistence: generators over LIVE-created schemas', () => {
 		}
 	});
 
-	it('generateMaterializedViewDDL on a live CREATE MATERIALIZED VIEW rehydrates faithfully', async () => {
+	it('generateMaintainedTableDDL on a live CREATE MATERIALIZED VIEW rehydrates faithfully', async () => {
 		const src = new Database();
 		const dst = new Database();
 		try {
@@ -702,7 +702,7 @@ describe('view persistence: generators over LIVE-created schemas', () => {
 			await src.exec("create materialized view mv as select id, v from base with tags (purpose = 'live')");
 			const mv = src.schemaManager.getMaintainedTable('main', 'mv');
 			expect(mv, 'live MV registered').to.exist;
-			const ddl = generateMaterializedViewDDL(mv!);
+			const ddl = generateMaintainedTableDDL(mv!);
 			expect(parse(ddl).type, 'generated DDL re-parses to createMaterializedView').to.equal('createMaterializedView');
 			expect(ddl, 'USING omitted (backing rebuilds as memory)').to.not.match(/using/i);
 
@@ -869,7 +869,7 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
 			expect(modified[0].schemaName).to.equal('main');
-			const ddl = generateMaterializedViewDDL(asMaintained(modified[0].newObject));
+			const ddl = generateMaintainedTableDDL(asMaintained(modified[0].newObject));
 			expect(ddl, 'regenerated DDL references the new table name').to.match(/\bt2\b/);
 			expect(ddl, 'regenerated DDL no longer references a bare `from t`').to.not.match(/\bfrom\s+t\b/i);
 			expect(parse(ddl).type, 'regenerated DDL re-parses').to.equal('createMaterializedView');
@@ -887,7 +887,7 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
-			const ddl = generateMaterializedViewDDL(asMaintained(modified[0].newObject));
+			const ddl = generateMaintainedTableDDL(asMaintained(modified[0].newObject));
 			expect(ddl, 'regenerated DDL references the new column name').to.match(/\bw\b/);
 		} finally {
 			await db.close();
@@ -906,7 +906,7 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
 			const mv = asMaintained(modified[0].newObject);
-			const ddl = generateMaterializedViewDDL(mv);
+			const ddl = generateMaintainedTableDDL(mv);
 			expect(ddl, 'regenerated DDL names the new clause target').to.match(/insert defaults \(created_at = 55\)/);
 			expect(ddl, 'old clause target gone').to.not.match(/created\s*=/);
 			// The hash must be computed from the POST-rename clause — exactly what
@@ -929,7 +929,7 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 
 			const modified = mvModifiedFor(events, 'mv');
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
-			const ddl = generateMaterializedViewDDL(asMaintained(modified[0].newObject));
+			const ddl = generateMaintainedTableDDL(asMaintained(modified[0].newObject));
 			expect(ddl, 'regenerated DDL references the new table inside the expr subquery').to.match(/\baudit2\b/);
 			expect(ddl, 'old table name gone').to.not.match(/\baudit\b/);
 		} finally {

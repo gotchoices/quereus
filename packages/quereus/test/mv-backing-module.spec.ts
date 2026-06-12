@@ -21,7 +21,7 @@ import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import type { AnyVirtualTableModule } from '../src/vtab/module.js';
 import { computeBodyHash, normalizeBackingModule } from '../src/schema/view.js';
 import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
-import { generateMaterializedViewDDL } from '../src/schema/ddl-generator.js';
+import { generateMaintainedTableDDL } from '../src/schema/ddl-generator.js';
 
 // The maintained table IS the backing — one TableSchema under the MV's own name.
 const BACKING = 'mv';
@@ -102,7 +102,7 @@ describe('mv backing module: create gate diagnostics', () => {
 				const stored = normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs);
 				expect(stored.storedModuleName, `${name} records no module (memory default)`).to.be.undefined;
 				expect(stored.storedModuleArgs, `${name} records no args`).to.be.undefined;
-				expect(generateMaterializedViewDDL(mv), `${name} generated DDL is clause-free`).to.not.match(/using/i);
+				expect(generateMaintainedTableDDL(mv), `${name} generated DDL is clause-free`).to.not.match(/using/i);
 				expect(mem.tables.has(`main.${name}`.toLowerCase()),
 					`${name} backing lives in the default memory module`).to.equal(true);
 			}
@@ -123,7 +123,7 @@ describe('mv backing module: create gate diagnostics', () => {
 			const stored = normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs);
 			expect(stored.storedModuleName).to.equal('memory');
 			expect(stored.storedModuleArgs).to.deep.equal({ hint: 'x' });
-			expect(generateMaterializedViewDDL(mv)).to.match(/using memory \(hint = /i);
+			expect(generateMaintainedTableDDL(mv)).to.match(/using memory \(hint = /i);
 		} finally {
 			await db.close();
 		}
@@ -146,7 +146,7 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 
 			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
 			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName).to.equal('mem2');
-			expect(generateMaterializedViewDDL(mv), 'canonical DDL carries the clause').to.match(/using mem2/i);
+			expect(generateMaintainedTableDDL(mv), 'canonical DDL carries the clause').to.match(/using mem2/i);
 
 			expect(await rows(db, 'select id, v from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
@@ -211,16 +211,16 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 		}
 	});
 
-	it('refresh shape-rebuild preserves the module (no silent migration to memory)', async () => {
+	it('refresh in-place reshape preserves the module (no silent migration to memory)', async () => {
 		const { db, mem2, mem } = freshDb();
 		try {
 			await db.exec('create table base (id integer primary key, v integer)');
 			await db.exec('insert into base values (1, 10)');
 			await db.exec('create materialized view mv using mem2() as select * from base');
 
-			// A source ALTER shifts the `select *` body's shape → refresh takes the
-			// drop+recreate rebuild path (rebuildBackingTable), which must rebuild
-			// into the MV's OWN module.
+			// A trailing source-column add shifts the `select *` body's shape → refresh
+			// reshapes the maintained table IN PLACE (via the mem2 module's alterTable),
+			// preserving the incarnation in the MV's OWN module.
 			await db.exec('alter table base add column w integer default 7');
 			await db.exec('refresh materialized view mv');
 
@@ -247,7 +247,7 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
 			expect(mv.derivation.stale, 'MV stays live through the rename').to.not.equal(true);
 			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName, 'module identity untouched by the rewrite clone').to.equal('mem2');
-			expect(generateMaterializedViewDDL(mv)).to.match(/using mem2/i);
+			expect(generateMaintainedTableDDL(mv)).to.match(/using mem2/i);
 			expect(mem2.tables.has(BACKING_KEY)).to.equal(true);
 			expect(await rows(db, 'select id, w from mv')).to.deep.equal([{ id: 1, w: 10 }]);
 		} finally {

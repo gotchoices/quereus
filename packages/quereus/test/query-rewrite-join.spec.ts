@@ -303,16 +303,18 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 		}
 	});
 
-	it('a select* join MV ALTER+refresh rebuilds the MV table and RE-ENABLES the rewrite (no intervening query)', async () => {
-		// A source `alter` shifts a `select *` body's output order (the new source column
-		// interleaves) while the create-time MV table did not reorder — desynchronizing the
-		// position-keyed stored-column map. `refresh` now re-derives the stored shape and
-		// rebuilds the MV's table to match the re-planned body, restoring positional
-		// alignment — so `backingAlignsWithBody` passes and the join rewrite resumes (it no
-		// longer forgoes). Critically there is NO query while the MV is stale (the only path
-		// that used to drop the cached body root), so the post-refresh plan re-validates on
-		// its own (the source `alter` swapped the source `TableSchema` identity, forcing the
-		// cached body root to re-derive).
+	it('a select* join MV ALTER+refresh reshapes the MV table in place and RE-ENABLES the rewrite (no intervening query)', async () => {
+		// A source `alter` shifts a `select *` body's output shape while the create-time
+		// MV table does not — desynchronizing the position-keyed stored-column map. Here the
+		// column is added to the LAST join table, so it lands TRAILING in the `select *`
+		// output: an identity-preserving in-place reshape (the host module's alterTable + a
+		// data reconcile), restoring positional alignment — so `backingAlignsWithBody` passes
+		// and the join rewrite resumes (it no longer forgoes). (An add to a non-last table
+		// would interleave the new column mid-output, which is inexpressible in place and a
+		// sited error — covered in materialized-view-refresh-reshape.spec.ts.) Critically
+		// there is NO query while the MV is stale (the only path that used to drop the cached
+		// body root), so the post-refresh plan re-validates on its own (the source `alter`
+		// swapped the source `TableSchema` identity, forcing the cached body root to re-derive).
 		const db = await freshDb([
 			'create table customers (id integer primary key, name text null)',
 			'create table orders (id integer primary key, customer_id integer not null, '
@@ -328,19 +330,21 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 			expect(serializePlanTree(db.getPlan(q)), 'rewrites while fresh').to.contain('"name": "jstar"');
 			expect(await readRows(db, q)).to.equal(expected);
 
-			// Alter a non-last source column, then refresh — WITHOUT querying while stale.
-			await db.exec('alter table orders add column extra integer null');
+			// Add a TRAILING source column (to the last join table), then refresh — WITHOUT
+			// querying while stale. The new column appends to the select* output, so the
+			// reshape is expressible in place.
+			await db.exec('alter table customers add column extra integer null');
 			await db.exec('refresh materialized view jstar');
 			expect(db.schemaManager.getMaintainedTable('main', 'jstar')!.derivation.stale).to.not.equal(true);
 
-			// The rebuild realigned the MV table with the re-planned select* body, so the
-			// arm no longer forgoes — the rewrite fires again and rows stay correct.
-			expect(serializePlanTree(db.getPlan(q)), 'rewrite re-enabled after rebuild').to.contain('"name": "jstar"');
+			// The in-place reshape realigned the MV table with the re-planned select* body, so
+			// the arm no longer forgoes — the rewrite fires again and rows stay correct.
+			expect(serializePlanTree(db.getPlan(q)), 'rewrite re-enabled after reshape').to.contain('"name": "jstar"');
 			expect(await readRows(db, q)).to.equal(expected);
 
-			// Direct read of the reshaped MV exposes the new (interleaved) source column.
+			// Direct read of the reshaped MV exposes the new (trailing) source column.
 			expect(await readRows(db, 'select * from jstar'))
-				.to.equal('[101,1,null,1,"ann"]|[102,2,null,2,"bob"]');
+				.to.equal('[101,1,1,"ann",null]|[102,2,2,"bob",null]');
 		} finally {
 			await db.close();
 		}

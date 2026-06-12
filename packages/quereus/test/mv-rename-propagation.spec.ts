@@ -4,7 +4,7 @@
  * (53.2-materialized-view-rename-propagation.sqllogic) cannot see:
  *
  *   1. Derived-field re-keying: `derivation.sourceTables`, `derivation.bodyHash`,
- *      the on-demand DDL (`generateMaterializedViewDDL`), and the
+ *      the on-demand DDL (`generateMaintainedTableDDL`), and the
  *      `materialized_view_modified` event a store-backed catalog re-persists from.
  *   2. The staleness discipline: a pre-existing stale flag is never cleared by
  *      the rename (the backing may already be behind), but the body IS rewritten
@@ -21,7 +21,7 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { parse } from '../src/parser/index.js';
 import type { MaintainedTableSchema } from '../src/schema/derivation.js';
-import { generateMaterializedViewDDL } from '../src/schema/ddl-generator.js';
+import { generateMaintainedTableDDL } from '../src/schema/ddl-generator.js';
 import type { SchemaChangeEvent } from '../src/schema/change-events.js';
 
 async function rows(db: Database, sql: string): Promise<Record<string, unknown>[]> {
@@ -65,7 +65,7 @@ describe('MV rename propagation: derived fields and events', () => {
 			expect(mv.derivation.stale ?? false, 'MV stays live').to.equal(false);
 			expect(mv.derivation.sourceTables, 'source key re-keyed to the new base').to.deep.equal(['main.t2']);
 			expect(mv.derivation.bodyHash, 'body hash follows the rewritten body').to.not.equal(hashBefore);
-			const ddl = generateMaterializedViewDDL(mv);
+			const ddl = generateMaintainedTableDDL(mv);
 			expect(ddl.toLowerCase(), 'regenerated DDL names the new table').to.include('t2');
 			expect(parse(ddl).type, 'regenerated DDL re-parses').to.equal('createMaterializedView');
 
@@ -73,7 +73,7 @@ describe('MV rename propagation: derived fields and events', () => {
 			expect(modified, 'one materialized_view_modified (the store re-persist trigger)').to.have.length(1);
 			if (modified[0].type === 'materialized_view_modified') {
 				expect(modified[0].objectName).to.equal('mv');
-				expect(generateMaterializedViewDDL(modified[0].newObject as MaintainedTableSchema).toLowerCase()).to.include('t2');
+				expect(generateMaintainedTableDDL(modified[0].newObject as MaintainedTableSchema).toLowerCase()).to.include('t2');
 			}
 			expect(events.filter(e => e.type === 'materialized_view_added'), 'no re-create event').to.have.length(0);
 		} finally {
@@ -152,7 +152,7 @@ describe('MV rename propagation: staleness discipline', () => {
 			const mv = getMv(db, 'mv');
 			expect(mv.derivation.stale, 'rename must NOT clear a pre-existing stale flag').to.equal(true);
 			expect(mv.derivation.sourceTables, 'but the body IS rewritten for a later refresh').to.deep.equal(['main.t2']);
-			expect(generateMaterializedViewDDL(mv).toLowerCase()).to.include('t2');
+			expect(generateMaintainedTableDDL(mv).toLowerCase()).to.include('t2');
 			// Still behind: no re-registration happened.
 			await db.exec('insert into t2 values (3, 30, null)');
 			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
