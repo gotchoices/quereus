@@ -30,3 +30,9 @@ Expected behavior:
   two functions should tell one consistent story.
 - Document the chosen surface in docs/materialized-views.md (write-boundary
   section cross-reference).
+
+## Implement handoff (2026-06-12)
+
+Implemented. `deriveColumnInfo` (src/func/builtins/schema.ts) branches on `table.derivation` presence (structural, no name patterns) and routes through a new shared `deriveBodyColumnRows` helper — the same `updateLineage`/`baseSiteOf` walk the plain-view branch uses, so classification is reused not duplicated; registered column names are authoritative (positional override). Plan-failure degrades to conservative all-NO rows. `view_info` still excludes maintained tables (documented as deliberate). Note: an invertible expression column (`v + 1 as vp`) reports updatable=YES via its inverse — the ticket's `x + 1` read-only example predates inverse profiles; test uses a genuinely non-invertible `v * 2` for the NO case, with dynamic-agreement writes verifying each verdict. Tests in `test/logic/06.3.5-column-info.sqllogic`; docs updated (materialized-views.md write-boundary cross-ref; view-updateability.md stale claims fixed). Full suite 5909 passing.
+
+NOTE for reviewer: the implement diff for this ticket is NOT under its own commit — a concurrent runner commit (c04e512e, "ticket(implement): maintained-table-attach-detach-verbs") swept these changes in along with ticket 6.2's work. Review the files named above within that commit.

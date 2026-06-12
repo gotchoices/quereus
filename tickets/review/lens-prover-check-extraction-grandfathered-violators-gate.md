@@ -73,3 +73,5 @@ tsconfigs, and eslint on the four touched package files — all clean.
   schemas have no `using` clause); confirm that's an acceptable harness shape.
 - No shipped module declares the capability, so the fix stays latent in
   production paths — the spec's test double is the only activation.
+
+NOTE for reviewer: the implement diff for this ticket is NOT under its own commit — a concurrent runner commit (c04e512e, "ticket(implement): maintained-table-attach-detach-verbs") swept these changes in along with ticket 6.2's work. Review the files named above within that commit.

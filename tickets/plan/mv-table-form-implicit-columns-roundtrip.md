@@ -1,6 +1,7 @@
 ----
 description: The unified-model `create table … maintained as` persistence form cannot round-trip the implicit-vs-explicit output-column distinction, so an implicit `select *` materialized view whose source shape drifted between sessions arity-errors on reopen instead of reshaping.
 difficulty: hard
+prereq: maintained-table-attach-detach-verbs
 files:
   - packages/quereus/src/schema/manager.ts                            # maintainedImportFromTableStmt — columns reconstruction from the table form
   - packages/quereus/src/schema/ddl-generator.ts                      # generateMaintainedTableDDL — table-form render must be lossless re: explicit columns

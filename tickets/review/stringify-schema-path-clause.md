@@ -33,3 +33,9 @@ neighbor tests); pre-existing — unrelated to the inverse clause.
 - Statement-level compound interaction: on a compound select, `with schema`
   binds before the compound operator (`isCompoundSubquery` suppresses it on
   legs) — emission position must re-parse to the same binding.
+
+## Implement handoff (2026-06-12)
+
+Implemented. `schemaPathClauseToString` helper in `src/emit/ast-stringify.ts`; selectToString emits after HAVING / before compound chain (matches parseSchemaPath binding; compound legs carrying a schemaPath are parenthesized); DML emits among trailing WITH clauses after `with tags` (shields INSERT's bare-SELECT-source greediness). Tests: 13 deterministic round-trip cases in `test/emit-roundtrip.spec.ts` asserting first-parse survival; `schemaPathArb` wired into select/compound/insert/update/delete arbitraries in `test/emit-roundtrip-property.spec.ts`. Known corner (pre-existing parser ambiguity, unreachable from parse): INSERT-level schemaPath over a bare SELECT source with no intervening trailing clause cannot re-bind to the INSERT; nets stay inside parser-reachable shapes. Full suite 5909 passing.
+
+NOTE for reviewer: the implement diff for this ticket is NOT under its own commit — a concurrent runner commit (c04e512e, "ticket(implement): maintained-table-attach-detach-verbs") swept these changes in along with ticket 6.2's work. Review the files named above within that commit.

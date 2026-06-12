@@ -39,3 +39,9 @@ shape ("regression: a real same-key change still reports (delete + insert, as
 before)") — that pin flips to `['update']` as part of this change. The byte-exact
 equivalence oracle must stay green throughout (final backing state is unchanged by
 this; only the reported shape moves).
+
+## Implement handoff (2026-06-12)
+
+Implemented. `applyInverseProjection` UPDATE branch (src/core/database-materialized-views.ts): when both images in scope and projected backing keys equal under `backingPkEqual` (per-PK-component `compareSqlValues` with the column's collation — collation-equal byte-different keys count equal; the host upsert re-keys stored bytes), emit upsert only → host reports one `update`. Key-changing / scope-transition cases keep delete+upsert. Pin in `test/incremental/maintenance-equivalence.spec.ts` flipped to `['update']`; new NOCASE-backing-key suite asserts a case-only key rewrite takes the single-update path and stays byte-equivalence green. docs/materialized-views.md update-arm row updated. Full suite 5909 passing.
+
+NOTE for reviewer: the implement diff for this ticket is NOT under its own commit — a concurrent runner commit (c04e512e, "ticket(implement): maintained-table-attach-detach-verbs") swept these changes in along with ticket 6.2's work. Review the files named above within that commit.

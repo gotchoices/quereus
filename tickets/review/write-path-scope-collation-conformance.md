@@ -40,3 +40,9 @@ plan-time fact extraction, so there is no optimizer-soundness urgency. Pin
 with sqllogic cases mirroring the 40.2-check-extras collation section (a
 DEFAULT containing a `case when c = 'abc' ...` over a NOCASE-declared `c`; a
 RETURNING comparison) once behavior is decided.
+
+## Implement handoff (2026-06-12)
+
+Implemented via shared helper `columnSchemaToScalarType` in `src/planner/type-utils.ts` (always carries `collationName`); `columnSchemaToDef` / `relationTypeFromTableSchema` delegate to it. Threaded through: constraint-builder `buildNotNullDefaults`, insert/update/delete OLD/NEW attribute types, upsert existingAttributes, UPDATE RETURNING scope (four additional hand-built collation-blind types found there), `default-scope.ts` (`new.<col>` now resolves to the declared column type), and deduplicated local `columnScalarType` helpers in mutation/decomposition.ts + multi-source.ts. Tests: new `test/logic/06.4.3-write-path-collation.sqllogic` (DEFAULT with `new.c` NOCASE comparison, or-replace NOT NULL substitution, RETURNING on all three DML kinds, upsert DO UPDATE SET) — note bare-column refs in DEFAULTs are rejected at DDL time, so cases use `new.` spelling. Pre-existing gap left open: `MutationContextVar` has no collation field at all. Full suite 5909 passing.
+
+NOTE for reviewer: the implement diff for this ticket is NOT under its own commit — a concurrent runner commit (c04e512e, "ticket(implement): maintained-table-attach-detach-verbs") swept these changes in along with ticket 6.2's work. Review the files named above within that commit.

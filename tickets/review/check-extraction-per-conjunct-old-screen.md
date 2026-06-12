@@ -42,3 +42,9 @@ per-shape semantics then apply unchanged.
 
 Low priority: pure precision improvement; current behavior is conservative
 in the sound direction.
+
+## Implement handoff (2026-06-12)
+
+Implemented. The `old.`-ref screen moved from `isRowInvariantCheck` (which keeps the mask + not-deferred legs) into `walkConjunction`'s conjunct level: each non-AND conjunct is tested with `containsOldRowImageRef` and skipped if it references OLD; siblings extract normally. Whole-conjunct kill preserved for `old.` inside OR disjuncts / BETWEEN / IN / compound operands (the walker covers the full subtree), so non-AND shapes behave as before. Doc comment carries the ternary-logic soundness argument. Two new pins in `test/optimizer/check-derived-fds.spec.ts`: mixed transition+invariant check contributes exactly the invariant conjunct's enum domain; `old.` inside an implication-form OR kills that conjunct while the AND-sibling still extracts. All pre-existing kill tests unchanged. Full suite 5909 passing.
+
+NOTE for reviewer: the implement diff for this ticket is NOT under its own commit — a concurrent runner commit (c04e512e, "ticket(implement): maintained-table-attach-detach-verbs") swept these changes in along with ticket 6.2's work. Review the files named above within that commit.
