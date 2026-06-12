@@ -252,6 +252,39 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		expect(await provider.stores.get('main.mv')!.get(buildDataKey([99])), 'sentinel row preserved').to.not.be.undefined;
 	});
 
+	it('refill-path twin: a declared-column arity mismatch errors per-entry without dropping the backing', async () => {
+		// Guards assertDeclaredColumnArity's placement ABOVE the adopt/refill branch in
+		// importMaterializedView. Unlike the adopt-path twin above (which manually re-arms
+		// `[]` to force trust), this test does NOT re-arm the marker — the `alter table src`
+		// in session 2 marks mv stale-at-close, so closeAll writes a marker naming it and
+		// session 3 takes the REFILL path. The arity guard fires BEFORE the DROP, so the
+		// durable backing is preserved as a plain table instead of being destroyed for nothing.
+		const { db, mod } = open();
+		await db.exec('create table src (id integer primary key, v integer) using store');
+		await db.exec('insert into src values (1, 10)');
+		await db.exec('create materialized view mv (a, b) using store as select * from src');
+		await mod.closeAll();
+
+		// Session 2: widen the source so the `select *` body produces 3 columns under
+		// the 2-column declared list — the entry can never materialize. The alter marks
+		// mv stale-at-close; closeAll writes a marker naming it (no re-arm needed).
+		const s2 = await reopen();
+		expect(s2.result.errors).to.have.lengthOf(0);
+		await s2.db.exec('alter table src add column w integer default 7');
+		await s2.mod.closeAll();
+		// Do NOT re-arm `[]` — stale-at-close set already names mv, forcing the REFILL path.
+		await plantSentinel('main.mv', [99, 990]);
+
+		const { db: db3, result } = await reopen();
+		expect(result.errors, 'one per-entry error').to.have.lengthOf(1);
+		expect(result.errors[0].error.message).to.match(/2 declared columns but body produces 3/i);
+		expect(db3.schemaManager.getMaintainedTable('main', 'mv'), 'no MV record').to.be.undefined;
+		// The durable backing was NOT dropped before the error: assertDeclaredColumnArity fires
+		// above the drop in importMaterializedView, so rows survive for a later DDL fix.
+		expect(db3.schemaManager.getTable('main', 'mv'), 'backing still registered').to.not.be.undefined;
+		expect(await provider.stores.get('main.mv')!.get(buildDataKey([99])), 'sentinel row preserved').to.not.be.undefined;
+	});
+
 	it('a memory source fails the same-module gate: refill every reopen', async () => {
 		const { db, mod } = open();
 		// An anchor store table establishes persistence; the source is MEMORY.
