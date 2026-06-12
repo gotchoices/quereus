@@ -2,7 +2,7 @@ import type { Database } from '../../core/database.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import type * as AST from '../../parser/ast.js';
-import { astToString, viewDefinitionToCanonicalString } from '../../emit/ast-stringify.js';
+import { astToString, expressionToString, viewDefinitionToCanonicalString } from '../../emit/ast-stringify.js';
 import type { PlanNode, RelationalPlanNode } from '../../planner/nodes/plan-node.js';
 import { TableReferenceNode } from '../../planner/nodes/reference.js';
 import { keysOf } from '../../planner/util/fd-utils.js';
@@ -1363,6 +1363,155 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
 		}
 	}
 	return null;
+}
+
+/* ──────────────── body-irrelevant source change: recompile, never skip ────────────────
+ * A `table_modified` whose old/new differ only in fields a body cannot read —
+ * constraint metadata (CHECK exprs, FK targets, UNIQUE sets, index predicates),
+ * `statistics`/`estimatedRows` (ANALYZE), `tags`, column defaults — cannot change
+ * what a dependent MV's body *evaluates to*. But it CAN change what the body
+ * **compiles to**: CHECK constraints seed domain facts (`ruleFilterContradiction`
+ * may have folded a filter — or the whole body — away against a CHECK that no
+ * longer holds), and `proveOneToOneJoin`'s join-residual arm rests on NOT-NULL
+ * FK→PK referential integrity. So the MV manager's schema-change listener routes
+ * live dependents of a qualifying event through an in-place RECOMPILE
+ * ({@link tryRecompileMaterializedViewLive}) instead of marking them stale —
+ * recompile, never skip. Any failure falls back to the mark-stale path. */
+
+/** The per-column fields a body can observe: name, logical type, NOT NULL,
+ *  collation (absent ⇒ BINARY), and the generated expression. `defaultValue`
+ *  and per-column conflict metadata are deliberately IGNORED — a body reads
+ *  stored values, never source defaults; the recompile-not-skip discipline
+ *  covers any optimizer-level concern. */
+function bodyRelevantColumnMatches(a: ColumnSchema, b: ColumnSchema): boolean {
+	return a.name.toLowerCase() === b.name.toLowerCase()
+		&& backingTypeMatches(a, b)
+		&& backingNotNullMatches(a, b)
+		&& backingCollationMatches(a, b)
+		&& (a.generated === true) === (b.generated === true)
+		&& (!a.generated || sameGeneratedExpr(a, b));
+}
+
+function sameGeneratedExpr(a: ColumnSchema, b: ColumnSchema): boolean {
+	if ((a.generatedExpr === undefined) !== (b.generatedExpr === undefined)) return false;
+	if (!a.generatedExpr || !b.generatedExpr) return true;
+	return expressionToString(a.generatedExpr) === expressionToString(b.generatedExpr);
+}
+
+/** Pairwise physical-PK identity (`index`, `desc`, effective per-component
+ *  collation — explicit, else the keyed column's, else BINARY). */
+function samePrimaryKeyDefinition(a: TableSchema, b: TableSchema): boolean {
+	if (a.primaryKeyDefinition.length !== b.primaryKeyDefinition.length) return false;
+	return a.primaryKeyDefinition.every((pa, i) => {
+		const pb = b.primaryKeyDefinition[i];
+		const collA = pa.collation ?? a.columns[pa.index]?.collation ?? 'BINARY';
+		const collB = pb.collation ?? b.columns[pb.index]?.collation ?? 'BINARY';
+		return pa.index === pb.index
+			&& (pa.desc === true) === (pb.desc === true)
+			&& collA === collB;
+	});
+}
+
+/**
+ * True when a `table_modified` event's old→new transition is **body-irrelevant**:
+ * same table name and schema, columns pairwise identical in every body-relevant
+ * field ({@link bodyRelevantColumnMatches}), and an identical physical primary
+ * key. Everything else may differ — `checkConstraints`, `foreignKeys`,
+ * `uniqueConstraints`, `indexes`, `statistics`, `estimatedRows`, `tags`,
+ * `primaryKeyDefaultConflict`, defaults. A qualifying event cannot change what a
+ * dependent body evaluates to, only what it compiles to — see the section note
+ * above for why dependents are recompiled rather than skipped.
+ *
+ * **Reference-equality guard (load-bearing coupling).** The MV manager's
+ * `emitBackingInvalidation` fires a synthetic `table_modified` on an MV's own
+ * backing with the SAME object as `oldObject` and `newObject` — the event that
+ * cascades staleness down MV-over-MV chains. It must classify as body-RELEVANT,
+ * hence `oldObject === newObject` short-circuits to false here. Every genuine
+ * emitter passes distinct old/new objects. If either side changes, change both
+ * (see the matching comment in `emitBackingInvalidation`,
+ * core/database-materialized-views.ts).
+ */
+export function isBodyIrrelevantTableChange(oldObject: TableSchema, newObject: TableSchema): boolean {
+	if (oldObject === newObject) return false;
+	if (oldObject.name.toLowerCase() !== newObject.name.toLowerCase()) return false;
+	if (oldObject.schemaName.toLowerCase() !== newObject.schemaName.toLowerCase()) return false;
+	if (oldObject.columns.length !== newObject.columns.length) return false;
+	for (let i = 0; i < oldObject.columns.length; i++) {
+		if (!bodyRelevantColumnMatches(oldObject.columns[i], newObject.columns[i])) return false;
+	}
+	return samePrimaryKeyDefinition(oldObject, newObject);
+}
+
+/**
+ * Recompile a LIVE materialized view's row-time plan in place after a
+ * body-irrelevant source change ({@link isBodyIrrelevantTableChange}), gated by
+ * shape re-derivation — the same discipline as
+ * {@link restoreUnaffectedMaterializedViews}. Fully synchronous (the
+ * schema-change listener is sync; shape derivation, schema lookups, and
+ * registration all are). Never throws: logs and returns `false` on any failure,
+ * and the caller falls back to the mark-stale path. On success the MV stays
+ * live — `stale` untouched, row-time plan rebuilt against the new catalog, no
+ * backing invalidation (the backing stays maintained, so cached plans reading
+ * it remain correct).
+ *
+ * Gates, in order — each failure is a stale fallback:
+ *  1. `deriveBackingShape` throws when the body no longer plans against the
+ *     post-change catalog (e.g. a rename-cascade constraint rewrite observed
+ *     mid-statement, while a co-source's rename has landed but this MV's body
+ *     rewrite has not — the rename propagation's own MV loop restores it later).
+ *  2. `sameSourceTables`: the re-planned source set must equal the recorded one.
+ *     An FK drop can un-eliminate a previously FK/PK-eliminated join (growing
+ *     the set); a constraint change can let `ruleFilterContradiction` fold a
+ *     source out of the plan entirely (shrinking it). Either way the record is
+ *     out of sync with the body's plan — leave it to REFRESH, which re-derives.
+ *  3. `describeBackingShapeMismatch`: strict positional columns + exact
+ *     physical-PK equality against the live backing. This is what forces
+ *     staleness when a dropped UNIQUE backed the recorded backing PK — `keysOf`
+ *     no longer proves the recorded key, the derived PK shifts (lineage /
+ *     all-columns fallback) → mismatch. It also catches CHECK-driven output
+ *     nullability/type narrowing the optimizer may have inferred. Known
+ *     acceptable conservatism: an ADD CONSTRAINT UNIQUE that reorders `keysOf`'s
+ *     first proved key fails the strict equality → stale fallback (no worse
+ *     than today; a follow-up could relax to "recorded backing PK is a superkey
+ *     of some proved key").
+ *  4. `registerMaterializedView` re-runs arm selection / eligibility / cost
+ *     gating (`buildMaintenancePlan`) against the new catalog and throws on the
+ *     create-time gates (non-determinism, bag/no-key floor, full-rebuild
+ *     pathology against fresh ANALYZE stats — defensible: the alternative is
+ *     unbounded per-write rebuild cost). Registration is event-silent, so the
+ *     success path fires no nested schema-change notifications.
+ *
+ * Deliberately NOT {@link restoreMaterializedViewLive}: that path is async, may
+ * rename backing columns, and clears `stale` — the wrong discipline here, where
+ * the MV is live throughout and a pre-existing `stale` flag must stay untouched.
+ */
+export function tryRecompileMaterializedViewLive(db: Database, mv: MaintainedTableSchema): boolean {
+	try {
+		const d = mv.derivation;
+		const shape = deriveBackingShape(db, astToString(d.selectAst), d.columns);
+		if (!sameSourceTables(d.sourceTables, shape.sourceTables)) {
+			log('Marking materialized view %s.%s stale instead of recompiling: re-planned source tables (%s) disagree with the recorded set (%s) — REFRESH re-derives',
+				mv.schemaName, mv.name, shape.sourceTables.join(', '), d.sourceTables.join(', '));
+			return false;
+		}
+		const schema = db.schemaManager.getSchemaOrFail(mv.schemaName);
+		const live = schema.getTable(mv.name);
+		const backing = isMaintainedTable(live) ? live : mv;
+		const mismatch = describeBackingShapeMismatch(backing, shape);
+		if (mismatch) {
+			log('Marking materialized view %s.%s stale instead of recompiling: backing shape mismatch (%s) — REFRESH rebuilds it',
+				mv.schemaName, mv.name, mismatch);
+			return false;
+		}
+		db.registerMaterializedView(backing);
+		log('Recompiled materialized view %s.%s in place after a body-irrelevant source change',
+			mv.schemaName, mv.name);
+		return true;
+	} catch (e) {
+		log('Marking materialized view %s.%s stale instead of recompiling after a body-irrelevant source change: %s',
+			mv.schemaName, mv.name, e instanceof Error ? e.message : String(e));
+		return false;
+	}
 }
 
 /* ──────────────── identity-preserving refresh reshape ──────────────── */

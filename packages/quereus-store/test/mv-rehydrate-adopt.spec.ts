@@ -464,18 +464,20 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			return raw ? new TextDecoder().decode(raw) : undefined;
 		}
 
-		it('a stale-at-close MV refills even under a clean shutdown (create index + post-stale DML)', async () => {
+		it('a stale-at-close MV refills even under a clean shutdown (add column + post-stale DML)', async () => {
 			const { db, mod } = open();
 			await db.exec('create table src (id integer primary key, v integer) using store');
 			await db.exec('insert into src values (1, 10), (2, 20)');
 			await db.exec('create materialized view mv using store as select id, v from src');
-			// `create index` fires `table_modified` on src ⇒ mv goes stale and its
-			// row-time maintenance detaches. Pin the trigger.
-			await db.exec('create index i on src(v)');
-			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale, 'create index marked the MV stale')
+			// An unprojected ADD COLUMN fires a body-RELEVANT `table_modified` on src
+			// (the column set changed) ⇒ mv goes stale and its row-time maintenance
+			// detaches. Pin the trigger. (An index/constraint-only change no longer
+			// stales — it recompiles the MV in place; see 53.3 sqllogic.)
+			await db.exec('alter table src add column w integer null');
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale, 'add column marked the MV stale')
 				.to.equal(true);
 			// NOT propagated to the backing (maintenance detached) — the divergence.
-			await db.exec('insert into src values (3, 30)');
+			await db.exec('insert into src (id, v) values (3, 30)');
 			await mod.closeAll();
 			expect(await markerValue(), 'marker names the stale MV').to.equal('["main.mv"]');
 			await plantSentinel('main.mv', [99, 990]);
@@ -490,7 +492,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 				.to.equal(false);
 			// Re-armed, not merely flag-cleared: a post-reopen source write now reaches
 			// the refilled backing (the very maintenance that was detached at close).
-			await db2.exec('insert into src values (4, 40)');
+			await db2.exec('insert into src (id, v) values (4, 40)');
 			expect(await rows(db2, 'select id, v from mv order by id'), 'live maintenance re-armed after refill')
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }, { id: 4, v: 40 }]);
 		});
@@ -500,14 +502,14 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('create table src (id integer primary key, v integer) using store');
 			await db.exec('insert into src values (1, 10), (2, 20)');
 			await db.exec('create materialized view mv using store as select id, v from src');
-			await db.exec('create index i on src(v)');
+			await db.exec('alter table src add column w integer null');
 			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
 			// refresh re-materializes and re-arms maintenance, clearing `stale`.
 			await db.exec('refresh materialized view mv');
 			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale ?? false, 'refresh cleared staleness')
 				.to.equal(false);
 			// Post-refresh DML now propagates to the backing again.
-			await db.exec('insert into src values (3, 30)');
+			await db.exec('insert into src (id, v) values (3, 30)');
 			await mod.closeAll();
 			expect(await markerValue(), 'nothing stale at close').to.equal('[]');
 			await plantSentinel('main.mv', [99, 990]);
@@ -527,8 +529,9 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('insert into b values (1, 100)');
 			await db.exec('create materialized view amv using store as select id, v from a');
 			await db.exec('create materialized view bmv using store as select id, v from b');
-			// Only `a` is altered ⇒ only amv goes stale; bmv stays live.
-			await db.exec('create index ia on a(v)');
+			// Only `a` is altered (body-relevant: unprojected ADD COLUMN) ⇒ only amv
+			// goes stale; bmv stays live.
+			await db.exec('alter table a add column w integer null');
 			expect(db.schemaManager.getMaintainedTable('main', 'amv')!.derivation.stale, 'amv stale').to.equal(true);
 			expect(db.schemaManager.getMaintainedTable('main', 'bmv')!.derivation.stale ?? false, 'bmv live').to.equal(false);
 			await mod.closeAll();
@@ -550,9 +553,10 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('insert into src values (1, 10), (2, 20)');
 			await db.exec('create materialized view mv1 using store as select id, v from src');
 			await db.exec('create materialized view mv2 using store as select id, v from mv1');
-			// Index on mv1's source marks mv1 stale; the backing-invalidation cascade
-			// (synthetic `table_modified` on `mv1`) marks mv2 stale too.
-			await db.exec('create index i on src(v)');
+			// A body-relevant ALTER on mv1's source (unprojected ADD COLUMN) marks mv1
+			// stale; the backing-invalidation cascade (synthetic `table_modified` on
+			// `mv1`) marks mv2 stale too.
+			await db.exec('alter table src add column w integer null');
 			expect(db.schemaManager.getMaintainedTable('main', 'mv1')!.derivation.stale, 'mv1 stale').to.equal(true);
 			expect(db.schemaManager.getMaintainedTable('main', 'mv2')!.derivation.stale, 'mv2 stale (cascade)').to.equal(true);
 			await mod.closeAll();

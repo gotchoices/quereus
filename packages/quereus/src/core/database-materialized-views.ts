@@ -8,7 +8,13 @@
  *     an MV's body. This manager subscribes to schema-change events and marks any
  *     MV whose body reads a modified/removed source `stale`. The next reference
  *     re-validates the body (erroring with the staleness diagnostic on an
- *     incompatible change); the next successful refresh clears the flag. The SAME
+ *     incompatible change); the next successful refresh clears the flag. One
+ *     carve-out: a **body-irrelevant** `table_modified` (constraint/stats/tags-only —
+ *     columns and physical PK identical, see `isBodyIrrelevantTableChange`) instead
+ *     RECOMPILES each live dependent's row-time plan in place
+ *     (`tryRecompileMaterializedViewLive`, gated by shape re-derivation), falling
+ *     back to mark-stale on any failure — so DROP/ADD/RENAME CONSTRAINT and ANALYZE
+ *     no longer de-liven dependents whose backing shape is unaffected. The SAME
  *     subscription also rebuilds a maintained table's compiled **derived-row
  *     constraint validator** when a *constraint-only* dependency — an FK parent or a
  *     subquery-CHECK target, neither a derivation source — is renamed/dropped/re-created
@@ -69,7 +75,7 @@ import {
 	type MaintenanceSourceStats,
 	type MaintenanceStrategy,
 } from '../planner/cost/index.js';
-import { resolveBackingHost } from '../runtime/emit/materialized-view-helpers.js';
+import { resolveBackingHost, isBodyIrrelevantTableChange, tryRecompileMaterializedViewLive } from '../runtime/emit/materialized-view-helpers.js';
 import { buildDerivedRowValidator, makePoisonedDerivedRowValidator, validateDerivedRowImage, type DerivedRowConstraintValidator } from './derived-row-validator.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
@@ -449,28 +455,52 @@ export class MaterializedViewManager {
 		this.unsubscribeSchemaChanges = notifier.addListener((event: SchemaChangeEvent) => {
 			if (event.type === 'table_removed' || event.type === 'table_modified') {
 				const changed = `${event.schemaName}.${event.objectName}`.toLowerCase();
+				// A `table_modified` whose old/new differ only in fields a body cannot
+				// read — constraint metadata (DROP/RENAME/ADD CONSTRAINT, declarative FK
+				// retargets, rename propagation's constraint-AST rewrites on other
+				// tables), statistics (ANALYZE), tags, defaults — cannot change what a
+				// dependent body evaluates to, so live dependents are RECOMPILED in
+				// place (shape-gated) instead of marked stale. The classifier's
+				// reference-equality guard keeps emitBackingInvalidation's synthetic
+				// same-object event body-RELEVANT — that event drives the MV-over-MV
+				// staleness cascade and must keep staling consumers.
+				const bodyIrrelevant = event.type === 'table_modified'
+					&& isBodyIrrelevantTableChange(event.oldObject, event.newObject);
 				for (const mv of this.ctx.schemaManager.getAllMaintainedTables()) {
-					if (mv.derivation.sourceTables.includes(changed)) {
-						if (!mv.derivation.stale) {
-							mv.derivation.stale = true;
-							log('Marked materialized view %s.%s stale due to %s on %s', mv.schemaName, mv.name, event.type, changed);
-						}
-						// A source schema change invalidates the compiled row-time plan;
-						// detach it. The MV reads "stale" until refreshed or recreated,
-						// which re-registers it.
-						this.releaseRowTime(mvKey(mv.schemaName, mv.name));
-						// Invalidate any cached prepared-statement plan reading this MV's
-						// backing table so it recompiles and re-hits the build-time `stale`
-						// guard (see emitBackingInvalidation). This is load-bearing for a plan
-						// compiled while the MV was NOT stale: its only schema dependency is the
-						// backing table, which the source event never names. (A plan compiled
-						// while already stale instead carries a direct dependency on the source —
-						// the while-stale build-time re-validation resolves and records it — so
-						// the emit is defensive redundancy there, not a correctness requirement.)
-						// Emitting per qualifying event (rather than only on the false→true
-						// transition) also re-propagates the cascade down an MV-over-MV chain.
-						this.emitBackingInvalidation(mv);
+					if (!mv.derivation.sourceTables.includes(changed)) continue;
+					if (bodyIrrelevant) {
+						// An already-stale dependent skips entirely: there is no live
+						// plan to recompile, and only REFRESH may clear a pre-existing
+						// flag (the backing may be behind); re-releasing the (absent)
+						// plan and re-emitting invalidation would be pointless churn.
+						if (mv.derivation.stale) continue;
+						// On success the MV stays live: `stale` untouched, plan rebuilt
+						// against the new catalog, and NO emitBackingInvalidation — the
+						// backing stays maintained, so cached plans reading it remain
+						// correct (a plan reading the *source* invalidates via its own
+						// direct statement dependency on the source table). Any failure
+						// falls through to the stale path below, verbatim.
+						if (tryRecompileMaterializedViewLive(this.ctx as unknown as Database, mv)) continue;
 					}
+					if (!mv.derivation.stale) {
+						mv.derivation.stale = true;
+						log('Marked materialized view %s.%s stale due to %s on %s', mv.schemaName, mv.name, event.type, changed);
+					}
+					// A source schema change invalidates the compiled row-time plan;
+					// detach it. The MV reads "stale" until refreshed or recreated,
+					// which re-registers it.
+					this.releaseRowTime(mvKey(mv.schemaName, mv.name));
+					// Invalidate any cached prepared-statement plan reading this MV's
+					// backing table so it recompiles and re-hits the build-time `stale`
+					// guard (see emitBackingInvalidation). This is load-bearing for a plan
+					// compiled while the MV was NOT stale: its only schema dependency is the
+					// backing table, which the source event never names. (A plan compiled
+					// while already stale instead carries a direct dependency on the source —
+					// the while-stale build-time re-validation resolves and records it — so
+					// the emit is defensive redundancy there, not a correctness requirement.)
+					// Emitting per qualifying event (rather than only on the false→true
+					// transition) also re-propagates the cascade down an MV-over-MV chain.
+					this.emitBackingInvalidation(mv);
 				}
 				// Rebuild any derived-row validator that depends on the changed table as a
 				// CONSTRAINT-ONLY dependency (FK parent / subquery-CHECK target — never a
@@ -480,6 +510,10 @@ export class MaterializedViewManager {
 				// rename rewrites THIS maintained table's own FK/CHECK in place and fires
 				// `table_modified` on the maintained table itself (the original dependency
 				// name is gone from the catalog), so the dependency-set match alone misses it.
+				// Runs for body-irrelevant events too — this IS the constraint-only-
+				// dependency rebuild path; a just-recompiled dependent's validator was
+				// already rebuilt fresh inside registerMaterializedView, so the second
+				// rebuild here is idempotent.
 				this.rebuildConstraintValidatorsFor(changed, /*matchOwnName*/ true);
 			} else if (event.type === 'table_added') {
 				// A re-created dependency (previously dropped → poisoned or absent-parent
@@ -562,6 +596,14 @@ export class MaterializedViewManager {
 	 * stays green even with the emit removed for that case.) The `Statement` listener
 	 * maps `table_*` → `'table'` and matches on type + objectName (+ optional schemaName)
 	 * only, ignoring the payload, so the maintained `TableSchema` is passed as both old/new.
+	 *
+	 * **Same-object payload contract (load-bearing coupling).** Passing the SAME object
+	 * as `oldObject` and `newObject` is what keeps this synthetic event body-RELEVANT to
+	 * `isBodyIrrelevantTableChange` (its reference-equality guard) — so it cascades
+	 * staleness down an MV-over-MV chain instead of triggering the consumers'
+	 * recompile-in-place path. Every genuine `table_modified` emitter passes distinct
+	 * old/new objects. If this payload ever changes, change the classifier's guard with
+	 * it (see the matching comment in runtime/emit/materialized-view-helpers.ts).
 	 *
 	 * Safety: the event names the maintained table itself, which is never in its OWN
 	 * `sourceTables` (self-reference is rejected at create), so this manager's listener
