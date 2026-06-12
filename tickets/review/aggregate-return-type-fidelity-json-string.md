@@ -50,3 +50,21 @@ sweep.
   test) that pins the declared type — e.g. via a maintained/`create table as`
   column type, the way `51.7` pins `count(*) as n integer not null`.
 - `yarn workspace @quereus/quereus run lint` and `... run test` green.
+
+## Implement handoff (2026-06-12)
+
+Implemented: explicit `returnType` on all three (`json_group_array`/`json_group_object`
+→ JSON nullable in src/func/builtins/json.ts, with the JSON_TYPE import added;
+`string_concat` → TEXT nullable in src/func/builtins/string.ts), mirroring the
+parent ticket's group_concat shape. Pinned in test/logic/06.6-aggregate-extended.sqllogic
+via the maintained-table strict shape gate: declared `json null`/`text null` columns
+accept the aggregate body (a declared `real null` is now the "body derives type"
+error — the old implicit default), and a post-create source insert exercises
+maintenance + storage round-trip of the JSON values through the backing. Full
+quereus suite 5977 passing, 0 failing; golden plans unaffected; typecheck + lint
+clean. Reviewer notes: the end-to-end JSON-type concerns the ticket raises
+(serialize/validate hooks on projection vs storage) are exercised by the new
+maintained-table round-trip and the pre-existing json_group logic tests (06, 24,
+25, 27.3, 80 — all green), but no test asserts the JSON type's `validate` hook
+directly; `string_concat` returns `''` (not NULL) for an all-non-string group —
+pre-existing behavior, left untouched, nullable declaration is conservative.
