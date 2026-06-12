@@ -119,17 +119,20 @@ select v from mc_v where a = 'y' and b = '1';
 → [{"v":40}]
 
 -- ===================================
--- 6. Unchanged rejections: bodies with no lineage key keep the bag rejection
+-- 6. A key-dropping projection still keeps the bag rejection
 -- ===================================
 
 create materialized view still_bag as select email from contact_v1;
 -- error: no provable unique key
 
--- a collated GROUP BY key is conservatively NOT lineage-keyed (grouping collapses
--- rows, so a lineage-covered source key would be a false identity; the group-by
--- key completeness backlog ticket gives these bodies a real key instead)
+-- A collated GROUP BY key registers with a REAL (non-coarsened) key: the group
+-- columns genuinely key the aggregate output, published under exactly their
+-- grouping (NOCASE) collation (ticket collated-groupby-key-completeness — the
+-- non-coarsened complement to this file's coarsened-lineage shape). Here
+-- contact_v1 = {Bob, Carol, DAVE} with no NOCASE collisions, so three groups.
 create materialized view grp_bag as select handle collate nocase as h, count(*) as n from contact_v1 group by handle collate nocase;
--- error: no provable unique key
+select h, n from grp_bag order by h;
+→ [{"h":"Bob","n":1},{"h":"Carol","n":1},{"h":"DAVE","n":1}]
 
 -- ===================================
 -- 7. Refining direction (BINARY output over a NOCASE-keyed source) is a true

@@ -150,22 +150,37 @@ describe('coarsened backing key (collation-weakening migration shape)', () => {
 		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase()).to.equal('BINARY');
 	});
 
-	it('bodies with no lineage key keep the bag rejection', async () => {
+	it('a key-dropping projection keeps the bag rejection', async () => {
 		await db.exec('create table t (id integer primary key, v text)');
 		await db.exec("insert into t values (1, 'a')");
 		// A key-dropping projection has no lineage to the source key.
 		await expectExecError(db, 'create materialized view bag1 as select v from t', 'no provable unique key');
-		// A collated GROUP BY key is conservatively NOT lineage-keyed: the grouping
-		// collapses rows, so a lineage-covered source key would be a false identity.
-		// (The group-by key completeness backlog ticket gives these a real key.)
-		await expectExecError(db,
-			'create materialized view bag2 as select v collate nocase as v, count(*) as n from t group by v collate nocase',
-			'no provable unique key');
-		// Neither half-registered.
 		expect(db.schemaManager.getMaintainedTable('main', 'bag1')).to.equal(undefined);
-		expect(db.schemaManager.getMaintainedTable('main', 'bag2')).to.equal(undefined);
 		expect(db.schemaManager.getTable('main', 'bag1')).to.equal(undefined);
-		expect(db.schemaManager.getTable('main', 'bag2')).to.equal(undefined);
+	});
+
+	it('a collated GROUP BY key registers with a real, non-coarsened key', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec("insert into t values (1, 'a'), (2, 'A')");
+		// The group columns genuinely key the aggregate output, published under
+		// exactly their grouping (NOCASE) collation — a real unique key, NOT a
+		// coarsened lineage key. (ticket collated-groupby-key-completeness; the
+		// non-coarsened complement to mv-coarsened-backing-key-warning.)
+		await db.exec('create materialized view bag2 as select v collate nocase as v, count(*) as n from t group by v collate nocase');
+		const mv = db.schemaManager.getMaintainedTable('main', 'bag2')!;
+		expect(mv, 'MV registered').to.exist;
+		expect(mv.derivation.logicalKey).to.deep.equal([{ index: 0, desc: false }]);
+		expect(mv.derivation.coarsenedKey, 'genuine key, not coarsened').to.equal(undefined);
+
+		const backing = db.schemaManager.getTable('main', 'bag2')!;
+		expect(backing.primaryKeyDefinition.map(d => d.index)).to.deep.equal([0]);
+		expect((backing.primaryKeyDefinition[0].collation ?? 'BINARY').toUpperCase(), 'backing PK published NOCASE').to.equal('NOCASE');
+
+		// 'a' and 'A' collapse to one NOCASE group with n = 2.
+		const rows: unknown[] = [];
+		for await (const r of db.eval('select v, n from bag2')) rows.push(r);
+		expect(rows.length).to.equal(1);
+		expect((rows[0] as { n: number }).n).to.equal(2);
 	});
 
 	it('colliding seed data fails loudly at fill with nothing registered', async () => {

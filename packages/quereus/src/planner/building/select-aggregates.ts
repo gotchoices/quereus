@@ -1,5 +1,5 @@
 import type * as AST from '../../parser/ast.js';
-import { isRelationalNode, type PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
+import { isRelationalNode, type Attribute, type PlanNode, type RelationalPlanNode, type ScalarPlanNode } from '../nodes/plan-node.js';
 import type { PlanningContext } from '../planning-context.js';
 import { AggregateNode } from '../nodes/aggregate-node.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -608,8 +608,41 @@ export function buildFinalAggregateProjections(
 		};
 	});
 
+	// Fingerprint each GROUP BY expression to its output-column index on the
+	// AggregateNode. A non-bare SELECT-list item whose *whole* expression matches
+	// a GROUP BY expression is exactly that group key's value, so we reference the
+	// aggregate's own group output column instead of recomputing the expression
+	// over the representative source row. The recompute resolves the inner column
+	// to a *base-table* attribute id (the group symbol is registered under
+	// `group_N`, not the inner column name, for non-bare group exprs), which is
+	// absent from the aggregate output — so `deriveProjectionColumnMap` can't map
+	// it and the unique group-key FD is silently dropped at the projection
+	// (`keysOf(root) = []`). Referencing the aggregate group column keeps the key
+	// and republishes it under exactly its grouping collation (trivially sound).
+	const groupByFingerprints = new Map<string, number>();
+	groupByExpressions.forEach((expr, index) => {
+		const fp = expressionToString(expr.expression);
+		if (!groupByFingerprints.has(fp)) groupByFingerprints.set(fp, index);
+	});
+
 	for (const column of stmt.columns) {
 		if (column.type === 'column') {
+			// Bare columns (`type === 'column'`) already resolve against the aggregate
+			// group symbol (registered under the column name) in recompute, so their
+			// key survives; only non-bare group expressions need the direct reference.
+			const gbIdx = column.expr.type !== 'column'
+				? groupByFingerprints.get(expressionToString(column.expr))
+				: undefined;
+			if (gbIdx !== undefined) {
+				const colRef = buildGroupKeyColumnRef(aggregateOutputScope, aggregateAttributes[gbIdx], column.expr, gbIdx);
+				finalProjections.push({
+					node: colRef,
+					alias: column.alias,
+					attributeId: colRef.attributeId
+				});
+				continue;
+			}
+
 			// Re-build the expression in the context of the aggregate output
 			const finalContext: PlanningContext = {
 				...selectContext,
@@ -632,4 +665,25 @@ export function buildFinalAggregateProjections(
 	}
 
 	return finalProjections;
+}
+
+/**
+ * Synthesizes a bare {@link ColumnReferenceNode} to an AggregateNode group output
+ * column for a SELECT-list item that fingerprint-matches a GROUP BY expression.
+ *
+ * The reference publishes the aggregate column's `type` (the grouping collation,
+ * e.g. NOCASE) and `id` (which IS in the aggregate output, so the projection's
+ * group-key FD survives). The synthesized AST name is the whole grouped
+ * expression's string (e.g. `"b collate nocase"`) so an *unaliased* output column
+ * keeps the same name `ProjectNode.buildOutputType` would have produced for the
+ * recomputed expression.
+ */
+function buildGroupKeyColumnRef(
+	aggregateOutputScope: RegisteredScope,
+	groupAttr: Attribute,
+	selectExpr: AST.Expression,
+	columnIndex: number,
+): ColumnReferenceNode {
+	const colExpr: AST.ColumnExpr = { type: 'column', name: expressionToString(selectExpr) };
+	return new ColumnReferenceNode(aggregateOutputScope, colExpr, groupAttr.type, groupAttr.id, columnIndex);
 }

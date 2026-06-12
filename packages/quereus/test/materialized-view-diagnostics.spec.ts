@@ -149,8 +149,6 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		// no-provable-unique-key reject (the single create row was distinct, so it reached
 		// the gate rather than failing the set contract at fill).
 		['drops the source PK (bag)', 'select v from g', 'no provable unique key'],
-		// A computed group key carries no propagated key FD, so the aggregate output is a bag.
-		['computed GROUP BY key (bag)', 'select k + 1 as kk, count(*) as c from g group by k + 1', 'no provable unique key'],
 		// A recursive-CTE `union all` body is a bag (overlapping inputs, no provable key).
 		['recursive-CTE union-all (bag)', 'with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select n from r', 'no provable unique key'],
 		// A 2-leg `union all` does NOT dedup, so even over keyed legs it has no provable key —
@@ -178,6 +176,10 @@ describe('Materialized view gate diagnostic — per-reason tails', () => {
 		['DISTINCT', 'select distinct v from g'],
 		['scalar aggregate (no GROUP BY)', 'select count(*) as c, sum(v) as s from g'],
 		['order by aggregate (non-group-key backing PK)', 'select k, sum(v) as s from g group by k order by sum(v)'],
+		// A computed GROUP BY key now carries the propagated group-key FD (ticket
+		// collated-groupby-key-completeness), so the aggregate output is a real keyed
+		// set — no longer a bag reject.
+		['computed GROUP BY key (real key)', 'select k + 1 as kk, count(*) as c from g group by k + 1'],
 		['UNION over two tables', 'select id, v from g union select id, w from g2'],
 		['WHERE subquery over another table', 'select id, v from g where v in (select w from g2)'],
 		['LIMIT', 'select id, v from g limit 10'],
