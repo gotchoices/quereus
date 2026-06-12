@@ -8,7 +8,14 @@
  *     an MV's body. This manager subscribes to schema-change events and marks any
  *     MV whose body reads a modified/removed source `stale`. The next reference
  *     re-validates the body (erroring with the staleness diagnostic on an
- *     incompatible change); the next successful refresh clears the flag.
+ *     incompatible change); the next successful refresh clears the flag. The SAME
+ *     subscription also rebuilds a maintained table's compiled **derived-row
+ *     constraint validator** when a *constraint-only* dependency — an FK parent or a
+ *     subquery-CHECK target, neither a derivation source — is renamed/dropped/re-created
+ *     (see {@link MaterializedViewManager.rebuildConstraintValidatorsFor}); without
+ *     this the validator, compiled once at registration, would keep resolving against
+ *     the dead/renamed incarnation and fail maintenance writes with an internal
+ *     module-connect error.
  *
  *  2. **Row-time write-through** (`maintainRowTime`) — the backing table is kept
  *     consistent *synchronously* with each source row-write, driven from the
@@ -63,7 +70,7 @@ import {
 	type MaintenanceStrategy,
 } from '../planner/cost/index.js';
 import { resolveBackingHost } from '../runtime/emit/materialized-view-helpers.js';
-import { buildDerivedRowValidator, validateDerivedRowImage, type DerivedRowConstraintValidator } from './derived-row-validator.js';
+import { buildDerivedRowValidator, makePoisonedDerivedRowValidator, validateDerivedRowImage, type DerivedRowConstraintValidator } from './derived-row-validator.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import type { BackingHost, BackingRowChange, MaintenanceOp } from '../vtab/backing-host.js';
@@ -465,10 +472,77 @@ export class MaterializedViewManager {
 						this.emitBackingInvalidation(mv);
 					}
 				}
+				// Rebuild any derived-row validator that depends on the changed table as a
+				// CONSTRAINT-ONLY dependency (FK parent / subquery-CHECK target — never a
+				// derivation source, handled above). Runs AFTER the source loop so a plan
+				// the source path just released is naturally skipped (it is gone from
+				// `rowTime`). `matchOwnName` covers the rename: an FK-parent / CHECK-target
+				// rename rewrites THIS maintained table's own FK/CHECK in place and fires
+				// `table_modified` on the maintained table itself (the original dependency
+				// name is gone from the catalog), so the dependency-set match alone misses it.
+				this.rebuildConstraintValidatorsFor(changed, /*matchOwnName*/ true);
+			} else if (event.type === 'table_added') {
+				// A re-created dependency (previously dropped → poisoned or absent-parent
+				// fallback validator) self-heals: rebuild any validator that named it. No
+				// own-name match — a maintained table's own creation registers its validator
+				// directly. The table is already in the catalog when this fires.
+				const changed = `${event.schemaName}.${event.objectName}`.toLowerCase();
+				this.rebuildConstraintValidatorsFor(changed, /*matchOwnName*/ false);
 			} else if (event.type === 'materialized_view_removed') {
 				this.releaseRowTime(mvKey(event.schemaName, event.objectName));
 			}
 		});
+	}
+
+	/**
+	 * Rebuild the derived-row constraint validator of every registered plan whose
+	 * validator depends on `changed` (lowercased `schema.table`): it names `changed`
+	 * in {@link DerivedRowConstraintValidator.dependencyTables} (FK parent /
+	 * subquery-CHECK target), or — when `matchOwnName` — `changed` IS the maintained
+	 * table itself (the rename signal; see {@link subscribeToSchemaChanges}).
+	 *
+	 * The derivation is unaffected by a constraint-only dependency's DDL, so this
+	 * rebuilds the validator ONLY — no {@link releaseRowTime}, no staleness, no
+	 * maintenance interruption. The rebuild reads the CURRENT catalog record
+	 * (`getMaintainedTable`) so a rename re-resolves against the new name, and
+	 * replacing the validator also refreshes its `dependencyTables` (a rename re-keys
+	 * `{main.parent}` → `{main.parent2}`, so a later drop of `parent2` is caught too).
+	 *
+	 * Rebuild-failure handling: a rebuild THROWS when the subquery-CHECK target was
+	 * dropped (`buildConstraintChecks` → optimize raises a sited "table not found").
+	 * The throw is caught and a {@link makePoisonedDerivedRowValidator} installed, so
+	 * (a) this listener never propagates an exception — a schema-change event must not
+	 * fail the unrelated DDL that triggered it — and (b) the next derivation write
+	 * surfaces the clear sited planning error instead of the stale validator's internal
+	 * module-connect failure. The FK-parent-dropped case does NOT throw: the
+	 * absent-parent null-guards-only fallback (`buildChildSideFKChecks`) builds cleanly,
+	 * so the rebuilt validator is healthy (a non-NULL ref fails with the maintained-table
+	 * FK attribution; a NULL ref is admitted under MATCH SIMPLE).
+	 */
+	private rebuildConstraintValidatorsFor(changed: string, matchOwnName: boolean): void {
+		for (const plan of this.rowTime.values()) {
+			const validator = plan.derivedRowValidator;
+			if (!validator) continue;
+			const ownName = `${validator.schemaName}.${validator.tableName}`.toLowerCase();
+			if (!validator.dependencyTables.has(changed) && !(matchOwnName && changed === ownName)) continue;
+			const currentMv = this.ctx.schemaManager.getMaintainedTable(validator.schemaName, validator.tableName);
+			// MV gone (dropped) — `materialized_view_removed` releases the plan separately.
+			if (!currentMv) continue;
+			try {
+				plan.derivedRowValidator = buildDerivedRowValidator(this.ctx as unknown as Database, currentMv);
+				log('Rebuilt derived-row validator for %s after schema change on %s', ownName, changed);
+			} catch (err) {
+				const error = err instanceof QuereusError
+					? err
+					: new QuereusError(
+						`rebuilding derived-row validator for '${ownName}' failed: ${(err as Error).message}`,
+						StatusCode.ERROR,
+					);
+				log('Derived-row validator rebuild for %s failed after schema change on %s (%s); installing poisoned validator',
+					ownName, changed, error.message);
+				plan.derivedRowValidator = makePoisonedDerivedRowValidator(validator, error);
+			}
+		}
 	}
 
 	/**

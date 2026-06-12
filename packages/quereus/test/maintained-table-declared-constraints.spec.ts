@@ -172,4 +172,163 @@ describe('Maintained-table declared-constraint validation', () => {
 			expect(await readAll('select count(*) as n from mt1')).to.deep.equal([{ n: 0 }]);
 		});
 	});
+
+	// A maintained table's derived-row validator is compiled ONCE at registration and
+	// bakes in the live incarnations of its CONSTRAINT-ONLY dependencies (FK parent /
+	// subquery-CHECK target — neither a derivation source, so the source-change path
+	// never rebuilds them). A rename/drop/re-create of such a dependency must rebuild
+	// the validator (ticket maintained-table-validator-stale-on-dependency-ddl); before
+	// the fix a stale validator failed maintenance writes with an internal
+	// "Module 'memory' connect failed … not found" error.
+	describe('constraint-dependency DDL invalidation', () => {
+		describe('FK parent rename', () => {
+			beforeEach(async () => {
+				await db.exec(`
+					create table parent (pid integer primary key);
+					create table src (id integer primary key, ref integer null);
+					create table mt (id integer primary key, ref integer null references parent(pid))
+						maintained as select id, ref from src;
+					insert into parent values (10);
+					alter table parent rename to parent2;
+				`);
+			});
+
+			it('a valid source write referencing the renamed parent still maintains', async () => {
+				await db.exec(`insert into src values (1, 10)`);
+				expect(await readAll('select * from mt')).to.deep.equal([{ id: 1, ref: 10 }]);
+			});
+
+			it('an orphan write fails with the FK attribution against the RENAMED parent', async () => {
+				await expectError(`insert into src values (2, 99)`,
+					`row derived into maintained table 'main.mt' references a missing 'main.parent2'`);
+				expect(await readAll('select count(*) as n from mt')).to.deep.equal([{ n: 0 }]);
+			});
+		});
+
+		describe('FK parent drop', () => {
+			beforeEach(async () => {
+				// mt is empty at drop time (src empty), so the drop's referencing-children
+				// guard passes; the rebuild then emits the absent-parent null-guards fallback.
+				await db.exec(`
+					create table parent (pid integer primary key);
+					create table src (id integer primary key, ref integer null);
+					create table mt (id integer primary key, ref integer null references parent(pid))
+						maintained as select id, ref from src;
+					drop table parent;
+				`);
+			});
+
+			it('a non-NULL-ref write fails with the maintained-table FK CONSTRAINT error (not INTERNAL)', async () => {
+				let message = '';
+				try {
+					await db.exec(`insert into src values (1, 5)`);
+					expect.fail('expected the rebuilt absent-parent validator to reject the orphan');
+				} catch (e) {
+					message = (e as Error).message;
+				}
+				expect(message).to.contain(`row derived into maintained table 'main.mt' references a missing 'main.parent'`);
+				// NOT the stale-validator internal module-connect failure
+				expect(message).to.not.contain('connect failed');
+				expect(message).to.not.contain('Cannot connect');
+				expect(await readAll('select count(*) as n from mt')).to.deep.equal([{ n: 0 }]);
+			});
+
+			it('a NULL ref is admitted (MATCH SIMPLE)', async () => {
+				await db.exec(`insert into src values (2, null)`);
+				expect(await readAll('select * from mt')).to.deep.equal([{ id: 2, ref: null }]);
+			});
+		});
+
+		describe('subquery-CHECK target drop', () => {
+			beforeEach(async () => {
+				await db.exec(`
+					create table quota (k integer primary key, lim integer not null);
+					insert into quota values (1, 100);
+					create table qsrc (id integer primary key, n integer not null);
+					create table mq (id integer primary key, n integer not null
+						check (n <= (select lim from quota where k = 1)))
+						maintained as select id, n from qsrc;
+					drop table quota;
+				`);
+			});
+
+			it('a source write surfaces a clear table-not-found planning error, not a module connect failure', async () => {
+				let message = '';
+				try {
+					await db.exec(`insert into qsrc values (1, 5)`);
+					expect.fail('expected the poisoned validator to re-throw the sited planning error');
+				} catch (e) {
+					message = (e as Error).message;
+				}
+				expect(message).to.contain(`Table 'quota' not found`);
+				expect(message).to.not.contain('connect failed');
+				expect(message).to.not.contain('Cannot connect');
+				expect(await readAll('select count(*) as n from mq')).to.deep.equal([{ n: 0 }]);
+			});
+		});
+
+		describe('subquery-CHECK target rename', () => {
+			beforeEach(async () => {
+				await db.exec(`
+					create table quota (k integer primary key, lim integer not null);
+					insert into quota values (1, 100);
+					create table qsrc (id integer primary key, n integer not null);
+					create table mq (id integer primary key, n integer not null
+						check (n <= (select lim from quota where k = 1)))
+						maintained as select id, n from qsrc;
+					alter table quota rename to quota2;
+				`);
+			});
+
+			it('the CHECK still validates against the renamed target (conforming write flows)', async () => {
+				await db.exec(`insert into qsrc values (1, 5)`);
+				expect(await readAll('select * from mq')).to.deep.equal([{ id: 1, n: 5 }]);
+			});
+
+			it('a violating write fails the CHECK with maintained-table attribution', async () => {
+				await expectError(`insert into qsrc values (2, 500)`,
+					`row derived into maintained table 'main.mq'`);
+				expect(await readAll('select count(*) as n from mq')).to.deep.equal([{ n: 0 }]);
+			});
+		});
+
+		describe('self-heal on dependency re-create', () => {
+			it('re-creating a dropped subquery-CHECK target restores healthy validation', async () => {
+				await db.exec(`
+					create table quota (k integer primary key, lim integer not null);
+					insert into quota values (1, 100);
+					create table qsrc (id integer primary key, n integer not null);
+					create table mq (id integer primary key, n integer not null
+						check (n <= (select lim from quota where k = 1)))
+						maintained as select id, n from qsrc;
+					drop table quota;
+					create table quota (k integer primary key, lim integer not null);
+					insert into quota values (1, 100);
+				`);
+				// validator self-healed off the table_added: a conforming write flows…
+				await db.exec(`insert into qsrc values (1, 5)`);
+				expect(await readAll('select * from mq')).to.deep.equal([{ id: 1, n: 5 }]);
+				// …and a violating write fails the (re-resolved) CHECK
+				await expectError(`insert into qsrc values (2, 500)`, `row derived into maintained table 'main.mq'`);
+			});
+
+			it('re-creating a dropped FK parent restores existence validation', async () => {
+				await db.exec(`
+					create table parent (pid integer primary key);
+					create table src (id integer primary key, ref integer null);
+					create table mt (id integer primary key, ref integer null references parent(pid))
+						maintained as select id, ref from src;
+					drop table parent;
+					create table parent (pid integer primary key);
+					insert into parent values (7);
+				`);
+				// validator self-healed: a ref present in the re-created parent is admitted…
+				await db.exec(`insert into src values (1, 7)`);
+				expect(await readAll('select * from mt')).to.deep.equal([{ id: 1, ref: 7 }]);
+				// …and an orphan still fails against the re-created parent
+				await expectError(`insert into src values (2, 99)`,
+					`row derived into maintained table 'main.mt' references a missing 'main.parent'`);
+			});
+		});
+	});
 });

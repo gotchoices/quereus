@@ -14,6 +14,17 @@
  * maintenance manager evaluates each insert/update {@link BackingRowChange}'s
  * new row image against them before cascading.
  *
+ * The compiled checks bake in `TableReferenceNode`s resolved to the live
+ * incarnations of the tables a constraint references — the FK parent and any
+ * subquery-CHECK target. Those CONSTRAINT-ONLY dependencies (not derivation
+ * sources) are recorded on {@link DerivedRowConstraintValidator.dependencyTables}
+ * so the maintenance manager's schema-change subscription can REBUILD the validator
+ * when one is renamed/dropped/re-created (see `database-materialized-views.ts`'s
+ * `rebuildConstraintValidatorsFor`); otherwise the one-shot compile goes stale and a
+ * later maintenance write fails with an internal module-connect error.
+ * {@link makePoisonedDerivedRowValidator} handles the one rebuild that cannot
+ * recompile (the subquery-CHECK target was dropped).
+ *
  * Semantics (documented in `docs/materialized-views.md` § Derived-row
  * constraint validation):
  *  - **op-mask collapse** — a derived row image is neither a user INSERT nor
@@ -95,6 +106,18 @@ export interface DerivedRowConstraintValidator {
 	 *  (OLD = indices `0..n-1`, NEW = `n..2n-1`). */
 	readonly flatRowDescriptor: RowDescriptor;
 	readonly checks: ReadonlyArray<CompiledDerivedRowCheck>;
+	/**
+	 * Lowercased `schema.table` names of the **constraint-only** dependency tables
+	 * this validator's compiled checks resolve against — the FK parent(s) and any
+	 * table inside a subquery-bearing CHECK — EXCLUDING the derivation's own source
+	 * tables (handled by the source-change path) and the maintained table's own name.
+	 * The maintenance manager's schema-change subscription rebuilds the validator when
+	 * a `table_removed`/`table_modified`/`table_added` names one of these, so a
+	 * rename/drop/re-create of a constraint-only dependency no longer leaves the
+	 * compiled checks pointing at a dead/renamed incarnation. Empty for a validator
+	 * whose checks reference no external table (e.g. a plain-column CHECK).
+	 */
+	readonly dependencyTables: ReadonlySet<string>;
 }
 
 /**
@@ -250,6 +273,68 @@ export function buildDerivedRowValidator(db: Database, mv: MaintainedTableSchema
 		numColumns: mv.columns.length,
 		flatRowDescriptor,
 		checks,
+		dependencyTables: computeDependencyTables(ctx, mv, fks),
+	};
+}
+
+/**
+ * The constraint-only dependency set carried on the validator (see
+ * {@link DerivedRowConstraintValidator.dependencyTables}): the union of every
+ * `type:'table'` dependency the builders resolved through `ctx.schemaDependencies`
+ * (the FK-parent EXISTS subquery and any subquery-CHECK target) and each FK parent
+ * named explicitly (belt-and-suspenders — the absent-parent fallback resolves no
+ * parent through the tracker, so a dropped FK parent would otherwise be missing),
+ * MINUS the derivation's own sources (the source-change path already rebuilds those)
+ * and the maintained table's own qualified name. All lowercased.
+ */
+function computeDependencyTables(
+	ctx: PlanningContext,
+	mv: MaintainedTableSchema,
+	fks: ReadonlyArray<{ referencedSchema?: string; referencedTable: string }>,
+): ReadonlySet<string> {
+	const deps = new Set<string>();
+	for (const dep of ctx.schemaDependencies.getDependencies()) {
+		if (dep.type !== 'table') continue;
+		deps.add(`${(dep.schemaName ?? mv.schemaName).toLowerCase()}.${dep.objectName.toLowerCase()}`);
+	}
+	for (const fk of fks) {
+		deps.add(`${(fk.referencedSchema ?? mv.schemaName).toLowerCase()}.${fk.referencedTable.toLowerCase()}`);
+	}
+	deps.delete(`${mv.schemaName.toLowerCase()}.${mv.name.toLowerCase()}`);
+	for (const src of mv.derivation.sourceTables) deps.delete(src.toLowerCase());
+	return deps;
+}
+
+/**
+ * Build a "poisoned" validator that re-throws `error` on the next derivation
+ * write. The maintenance manager installs this when a dependency-DDL-triggered
+ * rebuild of a healthy validator THROWS — the subquery-CHECK target was dropped,
+ * so the CHECK can no longer compile (`buildConstraintChecks` → optimize raises a
+ * sited "table not found"). It retains the prior validator's identity and
+ * {@link DerivedRowConstraintValidator.dependencyTables} so a later re-create of
+ * the dropped dependency (or further DDL on it) re-triggers a healthy rebuild
+ * through the same channel. The single inline (non-deferred) check makes
+ * {@link validateDerivedRowImage} surface the captured sited planning error
+ * immediately on the next written image — matching ordinary-table re-prepare
+ * behavior — instead of the stale validator's internal module-connect failure.
+ * The interface stays uniform, so `validateDerivedRowImage` needs no special-casing.
+ */
+export function makePoisonedDerivedRowValidator(
+	prior: DerivedRowConstraintValidator,
+	error: QuereusError,
+): DerivedRowConstraintValidator {
+	return {
+		schemaName: prior.schemaName,
+		tableName: prior.tableName,
+		numColumns: prior.numColumns,
+		flatRowDescriptor: prior.flatRowDescriptor,
+		dependencyTables: prior.dependencyTables,
+		checks: [{
+			kind: 'check',
+			constraintName: '_rebuild_failed',
+			needsDeferred: false,
+			evaluator: (): Promise<SqlValue> => Promise.reject(error),
+		}],
 	};
 }
 

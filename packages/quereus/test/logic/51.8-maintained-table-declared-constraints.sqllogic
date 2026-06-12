@@ -270,3 +270,84 @@ create table mo3 (id integer primary key, v integer not null, check on delete (o
 insert into osrc values (1, 500);
 select count(*) as n from mo3;
 → [{"n":1}]
+
+-- ===================================
+-- 12. constraint-dependency DDL: rename/drop/re-create of a CONSTRAINT-ONLY
+-- dependency (FK parent / subquery-CHECK target — neither a derivation source)
+-- rebuilds the compiled derived-row validator. Before the fix the once-compiled
+-- validator went stale and maintenance writes failed with an internal
+-- "Module 'memory' connect failed … not found" error.
+-- ===================================
+
+-- FK parent RENAME: the maintained table's own FK is rewritten in place; the
+-- rebuilt validator resolves existence against the renamed parent
+create table rparent (pid integer primary key);
+create table rsrc (id integer primary key, ref integer null);
+create table rmt (id integer primary key, ref integer null references rparent(pid)) maintained as select id, ref from rsrc;
+insert into rparent values (10);
+alter table rparent rename to rparent2;
+insert into rsrc values (1, 10);
+select * from rmt order by id;
+→ [{"id":1,"ref":10}]
+-- an orphan fails with the FK attribution against the RENAMED parent (not internal)
+insert into rsrc values (2, 99);
+-- error: row derived into maintained table 'main.rmt' references a missing 'main.rparent2'
+select count(*) as n from rmt;
+→ [{"n":1}]
+
+-- FK parent DROP: the rebuild emits the absent-parent null-guards fallback — a
+-- non-NULL ref fails the maintained-table FK CONSTRAINT (NOT an internal connect
+-- error), a NULL ref is admitted under MATCH SIMPLE
+create table xparent (pid integer primary key);
+create table xsrc (id integer primary key, ref integer null);
+create table xmt (id integer primary key, ref integer null references xparent(pid)) maintained as select id, ref from xsrc;
+drop table xparent;
+insert into xsrc values (1, 5);
+-- error: row derived into maintained table 'main.xmt' references a missing 'main.xparent'
+insert into xsrc values (2, null);
+select * from xmt order by id;
+→ [{"id":2,"ref":null}]
+
+-- subquery-CHECK target DROP: the CHECK can no longer compile, so a poisoned
+-- validator surfaces the clear sited planning error on the next write
+create table fquota (k integer primary key, lim integer not null);
+insert into fquota values (1, 100);
+create table fqsrc (id integer primary key, n integer not null);
+create table fmq (id integer primary key, n integer not null check (n <= (select lim from fquota where k = 1))) maintained as select id, n from fqsrc;
+drop table fquota;
+insert into fqsrc values (1, 5);
+-- error: Table 'fquota' not found
+select count(*) as n from fmq;
+→ [{"n":0}]
+
+-- subquery-CHECK target RENAME: the CHECK AST is rewritten in place and the
+-- rebuilt validator re-resolves against the renamed target
+create table gquota (k integer primary key, lim integer not null);
+insert into gquota values (1, 100);
+create table gqsrc (id integer primary key, n integer not null);
+create table gmq (id integer primary key, n integer not null check (n <= (select lim from gquota where k = 1))) maintained as select id, n from gqsrc;
+alter table gquota rename to gquota2;
+insert into gqsrc values (1, 5);
+select * from gmq order by id;
+→ [{"id":1,"n":5}]
+insert into gqsrc values (2, 500);
+-- error: row derived into maintained table 'main.gmq'
+select count(*) as n from gmq;
+→ [{"n":1}]
+
+-- self-heal: re-creating a dropped subquery-CHECK target restores healthy
+-- validation via the table_added rebuild
+create table hquota (k integer primary key, lim integer not null);
+insert into hquota values (1, 100);
+create table hqsrc (id integer primary key, n integer not null);
+create table hmq (id integer primary key, n integer not null check (n <= (select lim from hquota where k = 1))) maintained as select id, n from hqsrc;
+drop table hquota;
+create table hquota (k integer primary key, lim integer not null);
+insert into hquota values (1, 100);
+insert into hqsrc values (1, 5);
+select * from hmq order by id;
+→ [{"id":1,"n":5}]
+insert into hqsrc values (2, 500);
+-- error: row derived into maintained table 'main.hmq'
+select count(*) as n from hmq;
+→ [{"n":1}]
