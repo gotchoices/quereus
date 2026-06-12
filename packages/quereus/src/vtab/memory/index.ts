@@ -32,11 +32,29 @@ export class MemoryIndex {
 	 *  `evaluate(row) === true` participate in the index. */
 	public readonly predicate: CompiledPredicate | undefined;
 	private readonly allTableColumnsSchema: ReadonlyArray<ColumnSchema>;
+	/**
+	 * The table's primary-key comparator (from `createPrimaryKeyFunctions(schema)`),
+	 * used to add/remove/contains members of each entry's sorted `primaryKeys` array
+	 * by value rather than JS identity. It is per-index — identical for every entry —
+	 * so it lives here, not duplicated per entry. Every layer of a table derives it
+	 * from the same PK definition, so an inherited (sorted) `primaryKeys` array stays
+	 * correctly ordered for this layer's binary search. A PK-collation change via
+	 * `ALTER COLUMN … SET COLLATE` forces a full base rebuild
+	 * (`rebuildAllSecondaryIndexes` / `rebuildPrimaryTreeStrict`), recreating entries
+	 * under the new comparator — so no stale sort order survives an ALTER.
+	 */
+	private readonly primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number;
 
-	constructor(spec: IndexSpec, allTableColumnsSchema: ReadonlyArray<ColumnSchema>, baseInheritreeTable?: BTree<BTreeKeyForIndex, MemoryIndexEntry>) {
+	constructor(
+		spec: IndexSpec,
+		allTableColumnsSchema: ReadonlyArray<ColumnSchema>,
+		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number,
+		baseInheritreeTable?: BTree<BTreeKeyForIndex, MemoryIndexEntry>,
+	) {
 		this.name = spec.name;
 		this.specColumns = Object.freeze(spec.columns.map(c => ({ ...c })));
 		this.allTableColumnsSchema = allTableColumnsSchema;
+		this.primaryKeyComparator = primaryKeyComparator;
 
 		this.validateColumnIndexes(allTableColumnsSchema);
 
@@ -153,16 +171,62 @@ export class MemoryIndex {
 	 * found through the tree but absent here was INHERITED from an ancestor
 	 * layer's tree (each TransactionLayer wraps a fresh MemoryIndex around the
 	 * parent's BTree as base): only the btree NODES are copy-on-write, the entry
-	 * objects (and their `primaryKeys` Sets) are shared, so mutating an inherited
-	 * entry's Set writes through to the ancestor — corrupting committed state
+	 * objects (and their `primaryKeys` arrays) are shared, so mutating an inherited
+	 * entry's array writes through to the ancestor — corrupting committed state
 	 * when this layer rolls back (a rolled-back insert leaves a phantom PK that
 	 * false-rejects later UNIQUE checks; a rolled-back delete strips a live PK
 	 * and silently un-enforces UNIQUE). Inherited entries are therefore
 	 * copy-on-written via {@link BTree.updateAt}, which lands the replacement in
-	 * THIS tree; owned entries keep the in-place fast path (bulk loads and
-	 * repeated same-key writes within one layer stay O(1) per entry).
+	 * THIS tree; the cloned container is a `slice()` of the sorted `primaryKeys`
+	 * array (was a `new Set(existing)`). Owned entries keep the in-place fast path
+	 * (bulk loads and repeated same-key writes within one layer stay O(1) per
+	 * entry, modulo the O(n) splice into the sorted array).
 	 */
 	private ownedEntries = new WeakSet<MemoryIndexEntry>();
+
+	/**
+	 * Binary-searches `primaryKeys` (kept sorted under {@link primaryKeyComparator})
+	 * for `pk`. Returns `found` and `index`: when found, `index` is the member's
+	 * position; otherwise `index` is the insertion point (lower bound) that keeps the
+	 * array sorted. PK-tree uniqueness guarantees the live PKs in one entry are
+	 * pairwise distinct under the comparator, so a value match is unambiguous.
+	 */
+	private findPrimaryKeyPosition(
+		primaryKeys: ReadonlyArray<BTreeKeyForPrimary>,
+		pk: BTreeKeyForPrimary,
+	): { found: boolean; index: number } {
+		let lo = 0;
+		let hi = primaryKeys.length; // exclusive
+		while (lo < hi) {
+			const mid = (lo + hi) >>> 1;
+			const cmp = this.primaryKeyComparator(primaryKeys[mid], pk);
+			if (cmp === 0) {
+				return { found: true, index: mid };
+			} else if (cmp < 0) {
+				lo = mid + 1;
+			} else {
+				hi = mid;
+			}
+		}
+		return { found: false, index: lo };
+	}
+
+	/** Inserts `pk` into the sorted array at its ordered position, deduping by value. */
+	private insertPrimaryKey(primaryKeys: BTreeKeyForPrimary[], pk: BTreeKeyForPrimary): void {
+		const { found, index } = this.findPrimaryKeyPosition(primaryKeys, pk);
+		if (!found) {
+			primaryKeys.splice(index, 0, pk);
+		}
+	}
+
+	/** Removes `pk` from the sorted array by value; returns true if it was present. */
+	private removePrimaryKey(primaryKeys: BTreeKeyForPrimary[], pk: BTreeKeyForPrimary): boolean {
+		const { found, index } = this.findPrimaryKeyPosition(primaryKeys, pk);
+		if (found) {
+			primaryKeys.splice(index, 1);
+		}
+		return found;
+	}
 
 	/** Adds a mapping from index key to primary key */
 	addEntry(indexKey: BTreeKeyForIndex, primaryKey: BTreeKeyForPrimary): void {
@@ -170,22 +234,25 @@ export class MemoryIndex {
 		if (path.on) {
 			const existingEntry = this.data.at(path)!;
 			if (this.ownedEntries.has(existingEntry)) {
-				existingEntry.primaryKeys.add(primaryKey);
+				this.insertPrimaryKey(existingEntry.primaryKeys, primaryKey);
 				return;
 			}
 			// Inherited: copy-on-write into this layer's tree (see ownedEntries).
-			// Keep the stored indexKey bytes (a collation-equal/byte-different new
-			// key must not re-key the entry — matching the prior in-place behavior).
+			// Clone the sorted array (slice) before mutating so the ancestor entry is
+			// untouched. Keep the stored indexKey bytes (a collation-equal/byte-different
+			// new key must not re-key the entry — matching the prior in-place behavior).
+			const primaryKeys = existingEntry.primaryKeys.slice();
+			this.insertPrimaryKey(primaryKeys, primaryKey);
 			const updated: MemoryIndexEntry = {
 				indexKey: existingEntry.indexKey,
-				primaryKeys: new Set(existingEntry.primaryKeys).add(primaryKey),
+				primaryKeys,
 			};
 			this.ownedEntries.add(updated);
 			this.data.updateAt(path, updated);
 		} else {
 			const newEntry: MemoryIndexEntry = {
 				indexKey,
-				primaryKeys: new Set([primaryKey])
+				primaryKeys: [primaryKey],
 			};
 			this.ownedEntries.add(newEntry);
 			this.data.insert(newEntry);
@@ -199,9 +266,9 @@ export class MemoryIndex {
 		const entry = this.data.at(path)!;
 
 		if (this.ownedEntries.has(entry)) {
-			entry.primaryKeys.delete(primaryKey);
+			this.removePrimaryKey(entry.primaryKeys, primaryKey);
 			// If no primary keys remain, remove the entire entry
-			if (entry.primaryKeys.size === 0) {
+			if (entry.primaryKeys.length === 0) {
 				this.data.deleteAt(path);
 			}
 			return;
@@ -209,9 +276,9 @@ export class MemoryIndex {
 
 		// Inherited: copy-on-write (see ownedEntries). A delete that empties the
 		// entry masks it in this layer's tree; the ancestor's entry is untouched.
-		const remaining = new Set(entry.primaryKeys);
-		remaining.delete(primaryKey);
-		if (remaining.size === 0) {
+		const remaining = entry.primaryKeys.slice();
+		this.removePrimaryKey(remaining, primaryKey);
+		if (remaining.length === 0) {
 			this.data.deleteAt(path);
 		} else {
 			const updated: MemoryIndexEntry = { indexKey: entry.indexKey, primaryKeys: remaining };
@@ -220,10 +287,10 @@ export class MemoryIndex {
 		}
 	}
 
-	/** Returns the primary keys for a given index key */
+	/** Returns the primary keys for a given index key (defensive copy of the sorted array) */
 	getPrimaryKeys(indexKey: BTreeKeyForIndex): BTreeKeyForPrimary[] {
 		const entry = this.data.get(indexKey);
-		return entry ? Array.from(entry.primaryKeys) : [];
+		return entry ? entry.primaryKeys.slice() : [];
 	}
 
 	/** Gets the count of unique index values */

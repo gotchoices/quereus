@@ -83,12 +83,18 @@ export class TransactionLayer implements Layer {
 		const schema = this.tableSchemaAtCreation;
 		if (!schema.indexes) return;
 
+		// All layers of a table derive the PK comparator from the same PK definition,
+		// so an inherited (sorted) primaryKeys array stays correctly ordered for this
+		// layer's value add/remove on each MemoryIndex entry.
+		const { primaryKeyComparator } = this.getPkExtractorsAndComparators(schema);
+
 		for (const indexSchema of schema.indexes) {
 			const parentSecondaryTree = this.parentLayer.getSecondaryIndexTree?.(indexSchema.name);
 			// Create MemoryIndex with inherited BTree
 			const memoryIndex = new MemoryIndex(
 				indexSchema,
 				schema.columns,
+				primaryKeyComparator,
 				parentSecondaryTree || undefined // Use parent's secondary index tree as base
 			);
 			this.secondaryIndexes.set(indexSchema.name, memoryIndex);

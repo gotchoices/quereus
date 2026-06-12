@@ -1045,12 +1045,16 @@ export class MemoryTableManager {
 
 			// Validate the candidate against the live effective row before acting —
 			// the same stale-candidate discipline as checkUniqueViaMaterializedView.
-			// An index entry can go stale against the effective row set (composite
-			// PKs live in the entry's Set by reference, so removeEntry cannot drop
-			// them by value — they accumulate until the entry empties), so a
+			// An index entry's PK can still lag the effective row set *within* a
+			// statement (a candidate row deleted/updated internally, or a prior
+			// REPLACE eviction whose index removal lands later in the batch), so a
 			// candidate whose row is gone, no longer carries the colliding values,
 			// or left a partial index's scope is skipped rather than raised as a
-			// false conflict (or, worse, REPLACE-evicting an innocent row).
+			// false conflict (or, worse, REPLACE-evicting an innocent row). The
+			// entry now tracks PKs by value (removeEntry drops composite PKs
+			// correctly, so it no longer accumulates stale-by-reference members);
+			// this live re-check remains as defense-in-depth for that genuine
+			// intra-statement lag.
 			// Compare under the INDEX's per-column collation (positionally aligned
 			// with uc.columns — findIndexForConstraint requires it): the index is
 			// the enforcing structure, and an explicit `create unique index …

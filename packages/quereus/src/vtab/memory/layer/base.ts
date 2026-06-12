@@ -80,7 +80,7 @@ export class BaseLayer implements Layer {
 
 		const newIndexes = new Map<string, MemoryIndex>();
 		for (const indexSchema of this.tableSchema.indexes!) {
-			const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns);
+			const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare);
 			this.populateNewIndex(memoryIndex, indexSchema); // throws CONSTRAINT on duplicate
 			newIndexes.set(indexSchema.name, memoryIndex);
 		}
@@ -152,7 +152,7 @@ export class BaseLayer implements Layer {
 
 		for (const indexSchema of this.tableSchema.indexes!) {
 			try {
-				const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns);
+				const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare);
 				newIndexes.set(indexSchema.name, memoryIndex);
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			} catch (e: any) {
@@ -318,7 +318,7 @@ export class BaseLayer implements Layer {
 			indexName: indexSchema.name
 		});
 
-		const newMemoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns);
+		const newMemoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare);
 		this.populateNewIndex(newMemoryIndex, indexSchema);
 		this.secondaryIndexes.set(indexSchema.name, newMemoryIndex);
 	}
