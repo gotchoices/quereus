@@ -2216,6 +2216,11 @@ describe('Materialized-view maintenance no-op write suppression', () => {
 		it('regression: a real producer change still cascades into the consumer', async () => {
 			await db.exec('update src set a = 11 where id = 1');
 			expect(records.some(r => r.mv === 'mv2' && r.changes.length > 0), 'consumer maintained').to.equal(true);
+			// Cascade cost (the ticket's headline motivation): a same-key producer change
+			// reports one `update`, so the consumer is dispatched for one update — not the
+			// twice-dispatched delete+insert pair the pre-unification arm produced.
+			expect(allOps(records.filter(r => r.mv === 'mv2')), 'consumer sees a single update, not delete+insert')
+				.to.deep.equal(['update']);
 			expect(await readMultiset(db, 'select * from mv2')).to.deep.equal([canonRow([1, 11])]);
 		});
 	});
