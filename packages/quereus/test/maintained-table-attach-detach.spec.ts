@@ -409,6 +409,213 @@ describe('Maintained-table attach/detach verbs', () => {
 			expect(maintained('t8').derivation.columns, 'presence is the contract, not need').to.deep.equal(['id', 'v']);
 		});
 	});
+
+	/**
+	 * Reshape-on-attach (ticket maintained-reattach-implicit-reshape): over the
+	 * IMPLICIT form — the verb call has no rename list AND the prior record is
+	 * implicit (a plain table or `derivation.columns === undefined`) — a body
+	 * whose derived shape differs from the live table reshapes the backing in
+	 * place to follow the body (classifyBackingReshape, the refresh reshape's
+	 * classifier) instead of erroring at the strict shape check. The reconcile
+	 * stays verify-by-diff: only the GENUINE per-row value changes dispatch — a
+	 * schema-only relabel reports nothing. Inexpressible deltas (interleave /
+	 * physical-PK change) keep the sited error with the table untouched, and an
+	 * explicit-recorded table never reshapes.
+	 */
+	describe('reshape-on-attach (implicit form)', () => {
+		beforeEach(async () => {
+			await db.exec(`
+				create table src (id integer primary key, x text not null, y text not null);
+				insert into src values (1, 'a', 'a'), (2, 'b', 'B'), (3, 'c', 'C');
+			`);
+		});
+
+		it('an output-column rename reshapes the backing and dispatches only the genuine value diffs', async () => {
+			await db.exec(`create materialized view m as select id, x from src`);
+			const dispatched = await captureDispatch(async () => {
+				await db.exec(`alter table m set maintained as select id, y from src`);
+			});
+			// The rename op relabels column 2 (x→y) carrying the OLD values; the
+			// replace-all diff then updates only the rows whose value actually
+			// changed — row 1 has x == y, so it must NOT report (no relabel churn).
+			expect(dispatched.map(c => [c.op, ...(c.newRow ?? [])])).to.deep.equal([
+				['update', 2, 'B'], ['update', 3, 'C'],
+			]);
+			const mv = maintained('m');
+			expect(mv.columns.map(c => c.name)).to.deep.equal(['id', 'y']);
+			expect(mv.derivation.columns, 'still recorded implicit').to.be.undefined;
+			expect(mv.derivation.stale).to.equal(false);
+			expect(await readAll('select id, y from m order by id')).to.deep.equal([
+				{ id: 1, y: 'a' }, { id: 2, y: 'B' }, { id: 3, y: 'C' },
+			]);
+			// Row-time maintenance re-bound to the reshaped backing.
+			await db.exec(`insert into src values (4, 'd', 'D')`);
+			expect(await readAll(`select y from m where id = 4`)).to.deep.equal([{ y: 'D' }]);
+		});
+
+		it('a pure relabel (same values under a new output name) reshapes the schema with ZERO dispatched changes', async () => {
+			await db.exec(`create materialized view m2 as select id, x from src`);
+			const dispatched = await captureDispatch(async () => {
+				await db.exec(`alter table m2 set maintained as select id, x as renamed from src`);
+			});
+			expect(dispatched, 'schema-only relabel ⇒ no row changes').to.deep.equal([]);
+			expect(maintained('m2').columns.map(c => c.name)).to.deep.equal(['id', 'renamed']);
+			expect(await readAll('select renamed from m2 order by id')).to.deep.equal([
+				{ renamed: 'a' }, { renamed: 'b' }, { renamed: 'c' },
+			]);
+		});
+
+		it('a trailing column add (NOT NULL) reshapes and asserts the constraint against the RECONCILED rows', async () => {
+			await db.exec(`create materialized view m3 as select id, x from src`);
+			const dispatched = await captureDispatch(async () => {
+				await db.exec(`alter table m3 set maintained as select id, x, y from src`);
+			});
+			// The column adds NULLABLE (committed rows hold NULL there until the
+			// reconcile commits), so the deferred NOT NULL tighten must validate the
+			// reconciled body rows — every row gains a y value, one update each.
+			expect(dispatched.map(c => c.op)).to.deep.equal(['update', 'update', 'update']);
+			const mv = maintained('m3');
+			expect(mv.columns.map(c => c.name)).to.deep.equal(['id', 'x', 'y']);
+			expect(mv.columns[2].notNull, 'NOT NULL tightened post-reconcile').to.equal(true);
+			expect(await readAll('select * from m3 order by id')).to.deep.equal([
+				{ id: 1, x: 'a', y: 'a' }, { id: 2, x: 'b', y: 'B' }, { id: 3, x: 'c', y: 'C' },
+			]);
+		});
+
+		it('a trailing column drop reshapes with ZERO dispatched changes when the surviving values are unchanged', async () => {
+			await db.exec(`create materialized view m4 as select id, x, y from src`);
+			const dispatched = await captureDispatch(async () => {
+				await db.exec(`alter table m4 set maintained as select id, x from src`);
+			});
+			expect(dispatched, 'drop is schema-only; survivors identical ⇒ no row changes').to.deep.equal([]);
+			expect(maintained('m4').columns.map(c => c.name)).to.deep.equal(['id', 'x']);
+			expect(await readAll('select * from m4 order by id')).to.deep.equal([
+				{ id: 1, x: 'a' }, { id: 2, x: 'b' }, { id: 3, x: 'c' },
+			]);
+		});
+
+		it('a NOT NULL tighten over divergent rows validates the reconciled body, not the stale backing', async () => {
+			// The backing holds a NULL the new body resolves; the tighten runs
+			// post-reconcile (and post-commit), so it sees the reconciled rows —
+			// validating the stale backing would spuriously throw CONSTRAINT.
+			await db.exec(`
+				create table nsrc (id integer primary key, x text null, y text not null);
+				insert into nsrc values (1, null, 'a'), (2, 'b', 'b');
+				create materialized view m5 as select id, x from nsrc;
+			`);
+			const dispatched = await captureDispatch(async () => {
+				await db.exec(`alter table m5 set maintained as select id, y as x from nsrc`);
+			});
+			// Row 2's value is unchanged ('b' → 'b'): only row 1's NULL→'a' reports.
+			expect(dispatched.map(c => [c.op, ...(c.newRow ?? [])])).to.deep.equal([['update', 1, 'a']]);
+			const mv = maintained('m5');
+			expect(mv.columns[1].notNull, 'tightened against the reconciled rows').to.equal(true);
+			expect(await readAll('select x from m5 order by id')).to.deep.equal([{ x: 'a' }, { x: 'b' }]);
+		});
+
+		it('an interleaving (mid-table) column is an inexpressible reshape — sited error, table untouched', async () => {
+			await db.exec(`create materialized view m6 as select id, x from src`);
+			const before = maintained('m6');
+			const beforeHash = before.derivation.bodyHash;
+			let message = '';
+			try {
+				await db.exec(`alter table m6 set maintained as select id, y, x from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/changed incompatibly/i);
+			expect(message).to.match(/lands mid-table/i);
+			const after = maintained('m6');
+			expect(after.columns.map(c => c.name), 'columns untouched').to.deep.equal(['id', 'x']);
+			expect(after.derivation.bodyHash, 'prior derivation restored').to.equal(beforeHash);
+			expect(after.derivation.stale).to.equal(false);
+			// Maintenance still live on the prior body.
+			await db.exec(`insert into src values (5, 'e', 'E')`);
+			expect(await readAll(`select x from m6 where id = 5`)).to.deep.equal([{ x: 'e' }]);
+		});
+
+		it('a physical-PK definition change is an inexpressible reshape — sited error, table untouched', async () => {
+			await db.exec(`create materialized view m7 as select id, x from src`);
+			const beforeHash = maintained('m7').derivation.bodyHash;
+			let message = '';
+			try {
+				// A body `order by` seeds the derived physical PK (ordering column
+				// leads), changing the key definition — refused, never silently re-keyed.
+				await db.exec(`alter table m7 set maintained as select id, x from src order by x`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/changed incompatibly/i);
+			expect(message).to.match(/primary-key/i);
+			expect(maintained('m7').derivation.bodyHash, 'prior derivation restored').to.equal(beforeHash);
+			expect(await readAll('select * from m7 order by id')).to.deep.equal([
+				{ id: 1, x: 'a' }, { id: 2, x: 'b' }, { id: 3, x: 'c' },
+			]);
+		});
+
+		it('a fresh attach over a PLAIN table whose columns differ reshapes to follow the body (rows discarded by the reconcile)', async () => {
+			await db.exec(`
+				create table pl (id integer primary key, a text);
+				insert into pl values (1, 'junk'), (9, 'stale');
+			`);
+			const events: string[] = [];
+			const unsubscribe = db.schemaManager.getChangeNotifier().addListener((e: SchemaChangeEvent) => {
+				events.push(`${e.type}:${'objectName' in e ? e.objectName : ''}`);
+			});
+			try {
+				await db.exec(`alter table pl set maintained as select id, x from src`);
+			} finally {
+				unsubscribe();
+			}
+			const mv = maintained('pl');
+			expect(mv.columns.map(c => c.name), 'backing follows the body (a → x)').to.deep.equal(['id', 'x']);
+			expect(await readAll('select * from pl order by id')).to.deep.equal([
+				{ id: 1, x: 'a' }, { id: 2, x: 'b' }, { id: 3, x: 'c' },
+			]);
+			// Fresh attach: one materialized_view_added; the shape change fires one
+			// table_modified (consumer invalidation) — never table_removed/added.
+			expect(events.filter(e => e.startsWith('materialized_view_'))).to.deep.equal(['materialized_view_added:pl']);
+			expect(events.filter(e => e === 'table_modified:pl').length).to.equal(1);
+			expect(events.some(e => e.startsWith('table_removed') || e.startsWith('table_added')), 'same incarnation').to.equal(false);
+		});
+
+		it('a consumer maintained table over the reshaped table goes stale and re-derives the renamed column on refresh', async () => {
+			await db.exec(`
+				create materialized view base9 as select id, x from src;
+				create materialized view consumer9 as select * from base9;
+			`);
+			const events: string[] = [];
+			const unsubscribe = db.schemaManager.getChangeNotifier().addListener((e: SchemaChangeEvent) => {
+				events.push(`${e.type}:${'objectName' in e ? e.objectName : ''}`);
+			});
+			try {
+				await db.exec(`alter table base9 set maintained as select id, y from src`);
+			} finally {
+				unsubscribe();
+			}
+			// The reshape fires ONE table_modified for the reshaped table (the
+			// modified-event channel has no maintenance listener, so this is what
+			// invalidates consumers) plus the ordinary materialized_view_modified.
+			expect(events.filter(e => e === 'table_modified:base9').length).to.equal(1);
+			expect(events.filter(e => e.startsWith('materialized_view_'))).to.deep.equal(['materialized_view_modified:base9']);
+			expect(maintained('consumer9').derivation.stale, 'consumer invalidated by the shape change').to.equal(true);
+			// The consumer's own refresh re-derives `select *` against the reshaped
+			// producer and reshapes ITS backing to the renamed column.
+			await db.exec(`refresh materialized view consumer9`);
+			expect(maintained('consumer9').columns.map(c => c.name)).to.deep.equal(['id', 'y']);
+			expect(await readAll('select id, y from consumer9 order by id')).to.deep.equal([
+				{ id: 1, y: 'a' }, { id: 2, y: 'B' }, { id: 3, y: 'C' },
+			]);
+		});
+
+		it('an EXPLICIT-recorded maintained table never reshapes — the strict shape error stands', async () => {
+			await db.exec(`create table ex (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			let message = '';
+			try {
+				await db.exec(`alter table ex set maintained as select id, y from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message, 'authored rename list is the arity-locked interface').to.match(/body output column 1 is named 'id' but the table declares 'a'/i);
+			const after = maintained('ex');
+			expect(after.columns.map(c => c.name), 'columns untouched').to.deep.equal(['a', 'b']);
+			expect(after.derivation.columns, 'still recorded explicit').to.deep.equal(['a', 'b']);
+		});
+	});
 });
 
 /** Read every row of `sql` against `target` into plain objects (multi-db helper). */

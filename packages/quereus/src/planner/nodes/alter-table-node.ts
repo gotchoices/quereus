@@ -112,10 +112,12 @@ export type AlterTableAction =
 	| {
 		/**
 		 * SET MAINTAINED AS <body> — attach a derivation to a plain table, or
-		 * atomically replace the derivation of an already-maintained table. The
-		 * body must derive the table's exact declared shape; the runtime helper
-		 * reconciles the table's current contents against the derived contents by
-		 * keyed diff (derived content wins). See
+		 * atomically replace the derivation of an already-maintained table. Over
+		 * the implicit form a body whose derived shape differs reshapes the
+		 * backing in place to follow the body (an explicit-recorded table keeps
+		 * the strict declared-shape error); the runtime helper then reconciles
+		 * the table's current contents against the derived contents by keyed
+		 * diff (derived content wins). See
 		 * `runtime/emit/materialized-view-helpers.ts` attachMaintainedDerivation.
 		 */
 		type: 'setMaintained';

@@ -1315,9 +1315,9 @@ describe('declarative-equivalence: materialized views', () => {
 			// Re-declare with a content-changing body that PRESERVES the output shape
 			// (column still named `x`, now fed by y). A shape-preserving body change is
 			// a single re-attach (`set maintained as`) — a content refresh, NOT a
-			// drop+recreate. (An output-column RENAME instead would change the shape;
-			// the plan-free differ can't detect that on a sugar MV, so it surfaces at
-			// apply's attach shape check — see the review handoff.)
+			// drop+recreate. (An output-column RENAME instead changes the shape; the
+			// plan-free differ can't detect that on a sugar MV, so the verb-side
+			// reshape-on-attach handles it — see the sibling test below.)
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL }
 				materialized view mv as select id, y as x from t
@@ -1409,9 +1409,13 @@ describe('declarative-equivalence: materialized views', () => {
 		// the body hash covers, so changing it (b → c) drifts the hash and the differ
 		// correctly emits a re-attach. But `alter table … set maintained as` has NO
 		// rename-list syntax, so the emitted body can't carry the new column names —
-		// the attach shape check rejects it at apply. A rename-list change on a sugar
-		// MV therefore needs the table form (or a manual drop+recreate) for now;
-		// tracked as a follow-up (re-attach cannot reshape a sugar MV's columns).
+		// and the verb's reshape-on-attach is gated to the IMPLICIT form (an
+		// explicit-recorded table's authored list is the arity-locked interface, so
+		// reshaping would abandon it for the body's natural names). The attach shape
+		// check therefore rejects it at apply. A rename-list change on an EXPLICIT MV
+		// needs the table form (or a manual drop+recreate) for now; tracked as
+		// maintained-reattach-explicit-rename-list-reshape. The IMPLICIT sibling — an
+		// output-column rename on a bare sugar MV — now applies (next test).
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -1440,6 +1444,69 @@ describe('declarative-equivalence: materialized views', () => {
 				message = e instanceof Error ? e.message : String(e);
 			}
 			expect(message, 'apply surfaces a sited attach shape mismatch').to.match(/attach derivation|declares/i);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an output-column RENAME on a sugar (implicit) MV applies via reshape-on-attach and converges', async function () {
+		// The implicit sibling of the explicit rename-list limitation above (ticket
+		// maintained-reattach-implicit-reshape): a sugar MV normalizes with
+		// `columns: []` (the body owns the shape), so the plan-free differ cannot
+		// see that the renamed output column needs a reshape — it compares only
+		// bodyHash and emits a plain `set maintained as`. The verb's
+		// reshape-on-attach now reshapes the backing to follow the body (rename
+		// x → renamed, values preserved) where it previously errored at the strict
+		// attach shape check.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			// Re-declare with the output column RENAMED. The differ sees a bodyHash
+			// drift and emits a single re-attach — no detach leg, no drop.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x as renamed from t
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			const mvAlter = diff.tablesToAlter.find(a => a.tableName === 'mv');
+			expect(mvAlter?.setMaintained, 'output-column rename ⇒ re-attach').to.not.be.undefined;
+			expect(mvAlter?.dropMaintained, 'no detach leg').to.be.undefined;
+			expect(diff.tablesToDrop, 'no drop of the maintained table').to.deep.equal([]);
+
+			// Applies cleanly (errored before reshape-on-attach landed).
+			await db.exec('apply schema main');
+
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.columns.map(c => c.name), 'backing reshaped to the renamed output').to.deep.equal(['id', 'renamed']);
+			expect(mv.derivation.columns, 'still recorded implicit').to.be.undefined;
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, renamed from mv order by id')) rows.push(r);
+			expect(rows, 'values preserved through the relabel').to.deep.equal([
+				{ id: 1, renamed: 10 }, { id: 2, renamed: 20 },
+			]);
+
+			// Maintenance is live on the reshaped backing.
+			await db.exec('insert into t values (3, 30)');
+			const after: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select renamed from mv where id = 3')) after.push(r);
+			expect(after).to.deep.equal([{ renamed: 30 }]);
+
+			// Converged: re-diffing the just-applied schema wants nothing further.
+			const converged = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(converged.tablesToAlter.find(a => a.tableName === 'mv'), 'converged ⇒ no further alter').to.be.undefined;
+			expect(converged.tablesToDrop).to.deep.equal([]);
 		} finally {
 			await db.close();
 		}

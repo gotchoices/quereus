@@ -313,9 +313,19 @@ alter table plain1 set maintained as insert into base values (99, 'x') returning
 select count(*) as n from base where id = 99;
 → [{"n":0}]
 
--- arity mismatch on attach
+-- a shape-differing attach over a PLAIN table (the implicit form) RESHAPES the
+-- backing to follow the body — here a trailing append; the plain rows are
+-- discarded by the reconcile (derived content wins)
 alter table plain1 set maintained as select id, v from base;
--- error: body produces 2 columns
+select count(*) as n from plain1;
+→ [{"n":7}]
+alter table plain1 drop maintained;
+
+-- an INEXPRESSIBLE reshape (a column reorder) is a sited error, table untouched
+alter table plain1 set maintained as select v, id from base;
+-- error: changed incompatibly
+select count(*) as n from plain1;
+→ [{"n":7}]
 
 -- a generated column is rejected on both authoring forms: the body supplies
 -- every column's value, so the generation expression would silently diverge

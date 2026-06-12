@@ -690,13 +690,22 @@ function assertNoDerivationCycle(db: Database, schemaName: string, tableName: st
  * The loud "must be a set" reject for attach, BEFORE any catalog or data
  * mutation: the keyed reconcile diff would otherwise last-write-win duplicate
  * derived keys silently. Collation-aware pairing — duplicates are detected
- * under the table's primary-key collations (the same key identity the
+ * under the backing primary-key collations (the same key identity the
  * 'replace-all' diff uses), so a coarsened-key collision present in the source
- * rejects here, naming the colliding key.
+ * rejects here, naming the colliding key. `pk` is the SHAPE-derived physical
+ * key ({@link computeBackingPrimaryKey} over the derived shape): the rows are
+ * indexed by the shape, and under a reshape-on-attach the table's own PK
+ * definition may carry pre-reshape column indices. Equivalent to the table's
+ * PK whenever the shapes match (the strict attach check verifies index, desc,
+ * and collation equality).
  */
-function assertDerivedRowsAreSet(rows: readonly Row[], table: TableSchema, schemaName: string, name: string): void {
+function assertDerivedRowsAreSet(
+	rows: readonly Row[],
+	pk: ReadonlyArray<{ index: number; collation?: string }>,
+	schemaName: string,
+	name: string,
+): void {
 	if (rows.length < 2) return;
-	const pk = table.primaryKeyDefinition;
 	const compareKeys = (ra: Row, rb: Row): number => {
 		for (const c of pk) {
 			const cmp = compareSqlValues(ra[c.index], rb[c.index], c.collation ?? 'BINARY');
@@ -839,6 +848,23 @@ async function validateDeclaredConstraintsOverContents(db: Database, mt: Maintai
  * hashes `recordedColumns` into `bodyHash`, so live exec and catalog import of the
  * same canonical DDL agree on both the record and the hash — making attach/create →
  * persist → reopen a fixed point.
+ *
+ * **Reshape-on-attach (`allowReshape`).** The verb path (`set maintained as` —
+ * manual AND differ-emitted) passes `allowReshape = true`: on a strict-shape
+ * mismatch over the IMPLICIT form, the backing reshapes in place to follow the
+ * body — the same "the body owns an implicit table's shape" contract the refresh
+ * reshape and the implicit table form's reopen already honor — instead of
+ * erroring. Gated to: the verb (`allowReshape`), an implicit call
+ * (`!positionalRename && !recordedColumns`), AND an implicit prior record (a
+ * plain table, or `derivation.columns === undefined`); an explicit-recorded
+ * table (`maintained (columns)`) keeps the strict error — its authored rename
+ * list is the arity-locked interface, and a verb-side reshape would abandon it
+ * for the body's natural names (tracked:
+ * maintained-reattach-explicit-rename-list-reshape). The delta classifies via
+ * {@link classifyBackingReshape}; an inexpressible delta (interleave /
+ * physical-PK change) raises {@link inexpressibleReshapeError} with the table
+ * untouched. An expressible plan splices around the verify-by-diff reconcile —
+ * see the sequencing notes inside.
  */
 export async function attachMaintainedDerivation(
 	db: Database,
@@ -847,6 +873,7 @@ export async function attachMaintainedDerivation(
 	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
 	recordedColumns: ReadonlyArray<string> | undefined,
 	positionalRename = false,
+	allowReshape = false,
 ): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
 	const schemaName = table.schemaName;
@@ -868,16 +895,36 @@ export async function attachMaintainedDerivation(
 	// the declared names — the attach verb / implicit-create posture).
 	const shape = deriveBackingShape(db, bodySql, positionalRename ? recordedColumns : undefined);
 	const mismatch = describeAttachShapeMismatch(table, shape, positionalRename);
+	let reshapePlan: ReshapePlan | undefined;
 	if (mismatch) {
-		throw new QuereusError(
-			`cannot attach derivation to '${schemaName}.${name}': ${mismatch}`,
-			StatusCode.ERROR,
-		);
+		// Reshape-on-attach gate (see the docstring): the verb over the implicit
+		// form — on the call AND on the prior record — may follow the body; every
+		// explicit form keeps the strict declared-shape error.
+		const priorImplicit = !isMaintainedTable(table) || table.derivation.columns === undefined;
+		if (!allowReshape || positionalRename || recordedColumns !== undefined || !priorImplicit) {
+			throw new QuereusError(
+				`cannot attach derivation to '${schemaName}.${name}': ${mismatch}`,
+				StatusCode.ERROR,
+			);
+		}
+		if (!module.alterTable) {
+			throw inexpressibleReshapeError(schemaName, name,
+				`its backing module '${table.vtabModuleName}' does not support in-place ALTER`);
+		}
+		const classification = classifyBackingReshape(table, shape);
+		if (!classification.expressible) {
+			throw inexpressibleReshapeError(schemaName, name, classification.reason);
+		}
+		reshapePlan = classification.plan;
 	}
 	assertNoDerivationCycle(db, schemaName, name, shape.sourceTables);
 
 	const rows: Row[] = await collectBodyRows(db, bodySql);
-	assertDerivedRowsAreSet(rows, table, schemaName, name);
+	// Shape-derived physical key (see assertDerivedRowsAreSet): under a reshape the
+	// table's own PK definition may carry pre-reshape indices; equivalent otherwise.
+	const shapePk = computeBackingPrimaryKey(shape)
+		.map(c => ({ index: c.index, collation: shape.columns[c.index]?.collation }));
+	assertDerivedRowsAreSet(rows, shapePk, schemaName, name);
 
 	const def: MaterializeViewDefinition = {
 		schemaName,
@@ -919,28 +966,121 @@ export async function attachMaintainedDerivation(
 	try {
 		// The create-time gates (determinism, keyed-or-coarsened body, relational
 		// output, full-rebuild size threshold) run here — identical to create.
+		// Under a reshape this registration is a GATE only: the catalog still
+		// holds the pre-reshape columns, so the plan it builds may classify into
+		// the full-rebuild floor where the final record fits a bounded-delta arm;
+		// the post-reshape re-registration below rebuilds the binding plan, and
+		// nothing exercises the interim plan inside this DDL statement.
 		db.registerMaterializedView(maintained);
 	} catch (e) {
 		restorePrior();
 		throw e;
 	}
 
+	// Failure restore once the module's live schema has (partially) reshaped:
+	// module column ops are NOT transactional, so restoring the PRIOR record would
+	// strand a catalog/module divergence. Keep the catalog tracking the module
+	// instead — fresh attach: the table reverts to a plain (derivation-less) table
+	// at the reshaped schema; re-attach: the prior derivation rides the reshaped
+	// backing marked STALE (its body no longer derives this shape — a later
+	// refresh reshapes it back). Coherent and re-runnable either way.
+	const restoreReshaped = (moduleSchema: TableSchema): void => {
+		if (priorMaintained) {
+			const restored: MaintainedTableSchema = { ...moduleSchema, derivation: priorMaintained.derivation };
+			schema.addTable(restored);
+			db.markMaterializedViewStale(restored);
+		} else {
+			const { derivation: _derivation, ...plain } = moduleSchema as Partial<MaintainedTableSchema> & TableSchema;
+			schema.addTable(plain);
+			db.unregisterMaterializedView(schemaName, name);
+		}
+	};
+
+	let live: MaintainedTableSchema = maintained;
 	let changes: BackingRowChange[];
+	let current: TableSchema = table;
+	let moduleMutated = false;
+	let reconcileCommitted = false;
 	try {
-		const host = resolveBackingHost(db, maintained);
+		if (reshapePlan) {
+			// Pre-reconcile structural ops (rename/add/loosen/drop — none throw on
+			// data), then re-register the reshaped schema with the new derivation so
+			// the reconcile resolves the reshaped backing. Mirrors
+			// reshapeBackingInPlace's pre batch; ops address columns by name.
+			for (const op of reshapePlan.preReconcileOps) {
+				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
+				moduleMutated = true;
+			}
+			live = { ...current, derivation: maintained.derivation };
+			schema.addTable(live);
+		}
+
+		// Verify-by-diff reconcile against the (possibly reshaped) backing: the
+		// re-resolved host keys the 'replace-all' diff by the module's CURRENT
+		// physical PK, so a reshape that shifted PK column indices stays aligned.
+		const host = resolveBackingHost(db, live);
 		const conn = await resolveAttachConnection(db, host, `${schemaName}.${name}`);
 		changes = await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
 		// Declared CHECK / child-side FK over the reconciled (derived) row set —
 		// inside this try so a violation restores the prior record; the pending
 		// reconcile writes roll back with the failing statement.
-		await validateDeclaredConstraintsOverContents(db, maintained);
+		await validateDeclaredConstraintsOverContents(db, live);
+
+		if (reshapePlan && reshapePlan.postReconcileOps.length > 0) {
+			// Data-validating attribute ops (retype / recollate / tighten NOT NULL)
+			// must validate the RECONCILED body rows, not the stale backing — but the
+			// module's alterTable scans COMMITTED contents (memory's alterColumn walks
+			// the base layer) while the reconcile above sits in the connection's
+			// PENDING layer. So commit the reconcile eagerly first (refresh-parity
+			// commit-first semantics — the structural ops above are already
+			// non-transactional, so the reshaping attach is DDL-grade atomicity
+			// regardless; the later coordinated commit no-ops). Then mirror
+			// reshapeBackingInPlace's post batch: re-register the catalog after EACH
+			// op so a mid-batch throw cannot strand catalog/module divergence.
+			await conn.commit();
+			reconcileCommitted = true;
+			for (const op of reshapePlan.postReconcileOps) {
+				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
+				live = { ...current, derivation: maintained.derivation };
+				schema.addTable(live);
+			}
+		}
+
+		if (reshapePlan) {
+			// Final binding: the early registration gated against the pre-reshape
+			// record; re-register (idempotent) so the row-time plan binds the
+			// RESHAPED backing's columns and physical PK.
+			db.registerMaterializedView(live);
+		}
 	} catch (e) {
-		restorePrior();
+		if (reconcileCommitted) {
+			// The reconciled rows are already committed and the catalog tracks the
+			// module per-op — leave the new record in place, stale (reads re-validate;
+			// a refresh applies the remaining attribute reshape).
+			db.markMaterializedViewStale(live);
+		} else if (moduleMutated) {
+			restoreReshaped(current);
+		} else {
+			restorePrior();
+		}
 		throw e;
 	}
 
 	if (priorMaintained) unlinkCoveredUniqueConstraints(db, priorMaintained);
-	linkCoveredUniqueConstraints(db, maintained, bodySql);
+	linkCoveredUniqueConstraints(db, live, bodySql);
+
+	if (reshapePlan) {
+		// The table's column SHAPE changed, and the modified-event channel has no
+		// maintenance listener — fire the same single table_modified the refresh
+		// reshape fires, BEFORE the row cascade below, so consumer maintained
+		// tables go stale (and their released plans never receive shape-shifted
+		// rows); cached plans scanning the table directly recompile.
+		sm.getChangeNotifier().notifyChange({
+			type: 'table_modified',
+			schemaName, objectName: name,
+			oldObject: prior, newObject: live,
+		});
+	}
 
 	// Cascade the GENUINE reconcile changes to consumer maintained tables: the
 	// reconcile wrote this table through the privileged surface, so the DML
@@ -960,18 +1100,18 @@ export async function attachMaintainedDerivation(
 		? {
 			type: 'materialized_view_modified',
 			schemaName, objectName: name,
-			oldObject: priorMaintained, newObject: maintained,
+			oldObject: priorMaintained, newObject: live,
 		}
 		: {
 			type: 'materialized_view_added',
 			schemaName, objectName: name,
-			newObject: maintained,
+			newObject: live,
 		});
 
-	if (maintained.derivation.coarsenedKey) {
-		warnKeyCoarsening(schemaName, name, maintained.derivation.coarsenedKey);
+	if (live.derivation.coarsenedKey) {
+		warnKeyCoarsening(schemaName, name, live.derivation.coarsenedKey);
 	}
-	return maintained;
+	return live;
 }
 
 /**

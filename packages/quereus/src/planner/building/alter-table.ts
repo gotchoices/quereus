@@ -170,22 +170,15 @@ export function buildAlterTableStmt(
     case 'setMaintained': {
       // SET MAINTAINED AS <body> — attach / re-attach a derivation. Reuse the
       // CREATE VIEW body gate so a DML body or non-relational body is rejected
-      // here with the same sited diagnostics as CREATE MATERIALIZED VIEW; the
-      // arity check against the table's declared shape also sites here. The
-      // full shape check (names/types/collations/PK) and the reconcile run in
-      // the emitter against the live catalog state.
+      // here with the same sited diagnostics as CREATE MATERIALIZED VIEW. The
+      // full shape check (arity/names/types/collations/PK) and the reconcile
+      // run in the emitter against the LIVE catalog state — deliberately not
+      // here: the build-time schema may be a cached statement's snapshot, and
+      // a shape mismatch over the implicit form is no longer an error but a
+      // reshape-on-attach (attachMaintainedDerivation), so a build-time arity
+      // gate would block legitimate reshapes.
       const tableSchema = tableReference.tableSchema;
-      const planned = planViewBody(ctx, tableSchema.name, stmt.action.select);
-      const bodyArity = planned.getAttributes().length;
-      if (bodyArity !== tableSchema.columns.length) {
-        throw new QuereusError(
-          `cannot attach derivation to '${tableSchema.name}': body produces ${bodyArity} columns but the table declares ${tableSchema.columns.length}`,
-          StatusCode.ERROR,
-          undefined,
-          stmt.table.loc?.start.line,
-          stmt.table.loc?.start.column,
-        );
-      }
+      planViewBody(ctx, tableSchema.name, stmt.action.select);
       // Mirror the create-form gate: a generated column would silently diverge
       // from its expression once the body supplies every column's value.
       const generated = tableSchema.columns.find(c => c.generated);

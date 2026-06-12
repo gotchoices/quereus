@@ -1334,13 +1334,18 @@ async function runSetMaintained(
 	if (!live) {
 		throw new QuereusError(`no such table: ${tableSchema.name}`, StatusCode.ERROR);
 	}
-	// The attach verb has no rename-list syntax, and its strict declared-shape check
-	// (no positional rename) guarantees the body's natural output names already equal
-	// the table's column names — a body whose names differ is rejected, not recorded.
-	// So record the IMPLICIT form (`undefined`): it is lossless here (body names ==
-	// table columns) and identical to what create-sugar records, keeping a sugar MV's
+	// The attach verb has no rename-list syntax, so record the IMPLICIT form
+	// (`undefined`) — identical to what create-sugar records, keeping a sugar MV's
 	// recorded `derivation.columns` from flipping implicit→explicit on re-attach.
-	await attachMaintainedDerivation(rctx.db, live, select, insertDefaults, undefined);
+	// `allowReshape`: over the implicit form (call and prior record) a body whose
+	// derived shape differs from the live table RESHAPES the backing in place to
+	// follow the body — the differ is plan-free, so a sugar MV's output-column
+	// rename arrives here as a plain re-attach and the reshape must happen
+	// verb-side; an explicit-recorded table keeps the strict declared-shape error.
+	await attachMaintainedDerivation(
+		rctx.db, live, select, insertDefaults, undefined,
+		/*positionalRename*/ false, /*allowReshape*/ true,
+	);
 	log('Attached derivation to table %s.%s', live.schemaName, live.name);
 	return null;
 }
