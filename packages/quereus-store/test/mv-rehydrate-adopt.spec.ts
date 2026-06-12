@@ -218,6 +218,32 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 		expect(await rows(db3, 'select count(*) as n from mv where id = 99')).to.deep.equal([{ n: 0 }]);
 	});
 
+	it('a table-form IMPLICIT MV reshapes on reopen after a source widening (live-create channel)', async () => {
+		const { db, mod } = open();
+		await db.exec('create table src (id integer primary key, v integer) using store');
+		await db.exec('insert into src values (1, 10)');
+		// The IMPLICIT `create table … maintained as` form (no rename-list clause):
+		// records derivation.columns = undefined, so its `select *` body reshapes its
+		// source on reopen — the table-form analogue of the sugar `select *` test above,
+		// authored through the LIVE-create channel this ticket fixed.
+		await db.exec('create table mv (id integer primary key, v integer) using store maintained as select * from src');
+		await mod.closeAll();
+
+		// Session 2: widen the source so the `select *` body re-plans wider than the
+		// persisted 2-column backing, then close cleanly (marker present).
+		const s2 = await reopen();
+		expect(s2.result.errors).to.have.lengthOf(0);
+		await s2.db.exec('alter table src add column w integer default 7');
+		await s2.mod.closeAll();
+		await plantSentinel('main.mv', [99, 990]);
+
+		const { db: db3, result } = await reopen();
+		expect(result.errors).to.have.lengthOf(0);
+		expect(await rows(db3, 'select id, v, w from mv order by id'), 'refilled to the re-planned 3-column shape')
+			.to.deep.equal([{ id: 1, v: 10, w: 7 }]);
+		expect(await rows(db3, 'select count(*) as n from mv where id = 99')).to.deep.equal([{ n: 0 }]);
+	});
+
 	it('a declared-column arity mismatch under trust errors per-entry without dropping the backing', async () => {
 		const { db, mod } = open();
 		await db.exec('create table src (id integer primary key, v integer) using store');

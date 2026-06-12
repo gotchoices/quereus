@@ -1325,7 +1325,10 @@ async function runSetMaintained(
 	if (!live) {
 		throw new QuereusError(`no such table: ${tableSchema.name}`, StatusCode.ERROR);
 	}
-	await attachMaintainedDerivation(rctx.db, live, select, insertDefaults);
+	// The attach verb has no rename-list syntax: record the declared column names
+	// (explicit / arity-locked) with the strict declared-shape check (no positional
+	// rename) — unchanged from before the table-form authored-columns threading.
+	await attachMaintainedDerivation(rctx.db, live, select, insertDefaults, live.columns.map(c => c.name));
 	log('Attached derivation to table %s.%s', live.schemaName, live.name);
 	return null;
 }

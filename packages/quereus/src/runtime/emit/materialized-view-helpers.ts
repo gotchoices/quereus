@@ -569,15 +569,22 @@ export async function adoptMaterializedView(
  * directions: tolerating a body-notNull/declared-nullable skew would make the
  * next refresh's reshape pass "tighten" the declared column, silently mutating
  * the frozen basis.
+ *
+ * `skipNames` drops the per-column NAME comparison for the `create table …
+ * maintained (columns) as` form: there the authored rename list is the
+ * authoritative output-name vector (body outputs are renamed positionally to it),
+ * so a body whose natural names differ from the declared columns is accepted as a
+ * positional rename. Everything else — column count, types, not-null (both ways),
+ * collations, and the physical primary key — stays strict.
  */
-function describeAttachShapeMismatch(table: TableSchema, shape: BackingShape): string | null {
+function describeAttachShapeMismatch(table: TableSchema, shape: BackingShape, skipNames = false): string | null {
 	if (table.columns.length !== shape.columns.length) {
 		return `body produces ${shape.columns.length} columns but the table declares ${table.columns.length}`;
 	}
 	for (let i = 0; i < shape.columns.length; i++) {
 		const declared = table.columns[i];
 		const derived = shape.columns[i];
-		if (declared.name.toLowerCase() !== derived.name.toLowerCase()) {
+		if (!skipNames && declared.name.toLowerCase() !== derived.name.toLowerCase()) {
 			return `body output column ${i + 1} is named '${derived.name}' but the table declares '${declared.name}' (alias the body output to match the declared shape)`;
 		}
 		if (!backingTypeMatches(declared, derived)) {
@@ -739,16 +746,28 @@ async function resolveAttachConnection(db: Database, host: BackingHost, qualifie
  *     (re-attach) so store catalogs re-persist the canonical table-form DDL,
  *     and surface the key-coarsening warning exactly as create does.
  *
- * The derivation's recorded `columns` list is the table's declared column
- * names — the same normalization the canonical table-form import applies
- * (`maintainedImportFromTableStmt`), so attach → persist → reopen is a fixed
- * point (same `bodyHash`, same record).
+ * `recordedColumns` is recorded verbatim as `derivation.columns` (the lossless
+ * implicit/explicit signal the persist + import paths already use): the declared
+ * column names for the explicit forms (the attach verb, and `create table …
+ * maintained (columns) as`), or `undefined` for the implicit `create table …
+ * maintained as` form (which reshapes its source on reopen). When
+ * `positionalRename` is set — the `maintained (columns)` create form — the body
+ * outputs are renamed positionally to `recordedColumns` and the per-column name
+ * check is skipped (the authored list is the authoritative output-name vector);
+ * otherwise the strict declared-shape check (names included) applies, so the
+ * body must already be aliased to the declared names (the attach verb's
+ * unchanged posture). `buildTableDerivation` hashes `recordedColumns` into
+ * `bodyHash`, so live exec and catalog import of the same canonical DDL agree on
+ * both the record and the hash — making attach/create → persist → reopen a fixed
+ * point.
  */
 export async function attachMaintainedDerivation(
 	db: Database,
 	table: TableSchema,
 	select: AST.QueryExpr,
 	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+	recordedColumns: ReadonlyArray<string> | undefined,
+	positionalRename = false,
 ): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
 	const schemaName = table.schemaName;
@@ -764,11 +783,12 @@ export async function attachMaintainedDerivation(
 	}
 
 	const bodySql = astToString(select);
-	// Natural output names — the declared-shape contract is strict, so the body
-	// must already be aliased to the declared names (no positional renaming here;
-	// the canonical-DDL import path is the lenient rename surface).
-	const shape = deriveBackingShape(db, bodySql, undefined);
-	const mismatch = describeAttachShapeMismatch(table, shape);
+	// With an authored rename list (`maintained (columns)` create form) the body is
+	// renamed positionally to it and the name check skipped; otherwise natural output
+	// names with the strict declared-shape check (the body must already be aliased to
+	// the declared names — the attach verb / implicit-create posture).
+	const shape = deriveBackingShape(db, bodySql, positionalRename ? recordedColumns : undefined);
+	const mismatch = describeAttachShapeMismatch(table, shape, positionalRename);
 	if (mismatch) {
 		throw new QuereusError(
 			`cannot attach derivation to '${schemaName}.${name}': ${mismatch}`,
@@ -785,7 +805,9 @@ export async function attachMaintainedDerivation(
 		viewName: name,
 		selectAst: select,
 		bodySql,
-		columns: table.columns.map(c => c.name),
+		// Recorded as authored: declared names for the explicit forms, undefined for
+		// the implicit create form — the lossless signal persist + import already use.
+		columns: recordedColumns,
 		insertDefaults,
 	};
 
@@ -946,10 +968,18 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 		);
 	}
 
+	// An authored `maintained (columns)` list is the explicit/arity-locked form: the
+	// body is renamed positionally to the declared names (name check skipped) and the
+	// declared names are recorded as `derivation.columns`. No list is the implicit
+	// form: the strict name check applies and `derivation.columns` is undefined, so
+	// the canonical DDL omits the clause and the table reshapes its source on reopen.
+	const list = stmt.maintained!.columns;
+	const explicit = list !== undefined && list.length > 0;
 	const declared = sm.buildDeclaredTableSchema(stmt);
+	const recordedColumns = explicit ? declared.columns.map(c => c.name) : undefined;
 	const bodySql = astToString(stmt.maintained!.select);
-	const shape = deriveBackingShape(db, bodySql, undefined);
-	const mismatch = describeAttachShapeMismatch(declared, shape);
+	const shape = deriveBackingShape(db, bodySql, explicit ? recordedColumns : undefined);
+	const mismatch = describeAttachShapeMismatch(declared, shape, explicit);
 	if (mismatch) {
 		throw new QuereusError(
 			`cannot create maintained table '${schemaName}.${name}': ${mismatch}`,
@@ -962,7 +992,10 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 
 	const table = await sm.createTable(stmt);
 	try {
-		return await attachMaintainedDerivation(db, table, stmt.maintained!.select, stmt.maintained!.insertDefaults);
+		return await attachMaintainedDerivation(
+			db, table, stmt.maintained!.select, stmt.maintained!.insertDefaults,
+			explicit ? table.columns.map(c => c.name) : undefined, explicit,
+		);
 	} catch (e) {
 		try {
 			await sm.dropTable(schemaName, name, /*ifExists*/ true);

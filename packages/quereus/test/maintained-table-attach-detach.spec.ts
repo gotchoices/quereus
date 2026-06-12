@@ -283,4 +283,135 @@ describe('Maintained-table attach/detach verbs', () => {
 			}
 		});
 	});
+
+	/**
+	 * Live-exec channel of `create table … maintained [(columns)] as` honors the
+	 * rename-list clause (ticket mv-table-form-implicit-columns-roundtrip): the
+	 * clause is the single source of truth for `derivation.columns` on every
+	 * consumption channel, so live exec and catalog import of the same canonical
+	 * DDL agree on the record AND the bodyHash.
+	 *   - no list ⇒ implicit (columns === undefined, clause-free DDL, reshapes on reopen);
+	 *   - list present ⇒ explicit (positional rename of the body, declared names recorded);
+	 *   - a wrong-arity / mismatched-name / empty list is a sited error (no silent drop).
+	 */
+	describe('live-exec table-form authored columns', () => {
+		beforeEach(async () => {
+			await db.exec(`
+				create table src (id integer primary key, v text);
+				insert into src values (1, 'a'), (2, 'b');
+			`);
+		});
+
+		/** Narrow a maintained table out of an arbitrary database. */
+		function maintainedIn(target: Database, name: string): MaintainedTableSchema {
+			const t = target.schemaManager.getTable('main', name);
+			if (!t || !isMaintainedTable(t)) throw new Error(`expected '${name}' to be a maintained table`);
+			return t;
+		}
+
+		it('implicit table form (no rename list) records columns === undefined and a clause-free body', async () => {
+			await db.exec(`create table t (id integer primary key, v text) maintained as select * from src`);
+			const mv = maintained('t');
+			expect(mv.derivation.columns, 'implicit ⇒ no recorded rename list').to.be.undefined;
+			const exported = generateMaintainedTableDDL(mv);
+			expect(exported, 'canonical DDL keeps the bare `maintained as`').to.match(/maintained as /i);
+			expect(exported, 'and emits no rename list').to.not.match(/maintained \(/i);
+		});
+
+		it('live exec and importCatalog of the same implicit DDL agree on derivation.columns AND bodyHash', async () => {
+			await db.exec(`create table t (id integer primary key, v text) maintained as select * from src`);
+			const liveHash = maintained('t').derivation.bodyHash;
+			const exported = generateMaintainedTableDDL(maintained('t'));
+
+			const db2 = new Database();
+			try {
+				await db2.exec(`
+					create table src (id integer primary key, v text);
+					insert into src values (1, 'a'), (2, 'b');
+				`);
+				await db2.schemaManager.importCatalog([exported]);
+				const t2 = maintainedIn(db2, 't');
+				expect(t2.derivation.columns, 'import records implicit too').to.be.undefined;
+				expect(t2.derivation.bodyHash, 'live exec and import agree on bodyHash').to.equal(liveHash);
+				expect(generateMaintainedTableDDL(t2), 'export after import is byte-identical').to.equal(exported);
+			} finally {
+				await db2.close();
+			}
+		});
+
+		it('canonical renamed-MV DDL replays live with byte-identical regeneration (gap 2)', async () => {
+			// Exactly the text generateMaintainedTableDDL emits for the MV sugar
+			// `create materialized view mv (key_id, val) as select id, v from src`.
+			await db.exec(`create materialized view mv (key_id, val) as select id, v from src`);
+			const canonical = generateMaintainedTableDDL(maintained('mv'));
+			expect(canonical, 'sugar exports the table form with the rename list')
+				.to.match(/maintained \(key_id, val\) as select id, v from src/i);
+
+			const db2 = new Database();
+			try {
+				await db2.exec(`
+					create table src (id integer primary key, v text);
+					insert into src values (1, 'a'), (2, 'b');
+				`);
+				// Replay the canonical table-form DDL through LIVE exec (a migration
+				// script) — the channel gap 2 reported as broken (pre-fix this errored
+				// "body output column 1 is named 'id' but the table declares 'key_id'").
+				await db2.exec(canonical);
+				const t2 = maintainedIn(db2, 'mv');
+				expect(t2.columns.map(c => c.name)).to.deep.equal(['key_id', 'val']);
+				expect(t2.derivation.columns, 'recorded explicit (declared casing)').to.deep.equal(['key_id', 'val']);
+				expect(generateMaintainedTableDDL(t2), 'regeneration is byte-identical').to.equal(canonical);
+				// Maintenance is live in the replaying session.
+				await db2.exec(`insert into src values (3, 'c')`);
+				expect(await readAllIn(db2, `select key_id, val from mv where key_id = 3`))
+					.to.deep.equal([{ key_id: 3, val: 'c' }]);
+			} finally {
+				await db2.close();
+			}
+		});
+
+		it('a mismatched rename list is a sited error — no silent drop (gap 3)', async () => {
+			let message = '';
+			try {
+				await db.exec(`create table t4 (id integer primary key, v text) maintained (x, y) as select id, v from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/maintained column 1 is named 'x' but the table declares 'id'/i);
+			expect(db.schemaManager.getTable('main', 't4'), 'nothing registered').to.be.undefined;
+		});
+
+		it('a wrong-arity rename list is a sited error', async () => {
+			let message = '';
+			try {
+				await db.exec(`create table t5 (id integer primary key, v text) maintained (id) as select id, v from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/maintained column list has 1 columns but the table declares 2/i);
+			expect(db.schemaManager.getTable('main', 't5')).to.be.undefined;
+		});
+
+		it('an empty rename list is rejected at parse time', async () => {
+			let message = '';
+			try {
+				await db.exec(`create table t6 (id integer primary key, v text) maintained () as select id, v from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/at least one column name in the maintained column list/i);
+			expect(db.schemaManager.getTable('main', 't6')).to.be.undefined;
+		});
+
+		it('a rename list in different casing is accepted, recorded in declared casing', async () => {
+			await db.exec(`create table t7 ("id" integer primary key, "v" text) maintained (ID, V) as select id, v from src`);
+			expect(maintained('t7').derivation.columns, 'recorded in declared casing').to.deep.equal(['id', 'v']);
+		});
+
+		it('a present list whose body names already equal the declared shape still arity-locks (recorded explicit)', async () => {
+			await db.exec(`create table t8 (id integer primary key, v text) maintained (id, v) as select id, v from src`);
+			expect(maintained('t8').derivation.columns, 'presence is the contract, not need').to.deep.equal(['id', 'v']);
+		});
+	});
 });
+
+/** Read every row of `sql` against `target` into plain objects (multi-db helper). */
+async function readAllIn(target: Database, sql: string): Promise<Record<string, unknown>[]> {
+	const rows: Record<string, unknown>[] = [];
+	for await (const row of target.eval(sql)) rows.push({ ...row });
+	return rows;
+}

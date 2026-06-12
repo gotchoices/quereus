@@ -2620,12 +2620,16 @@ export class Parser {
 		let columns: string[] | undefined;
 		if (this.check(TokenType.LPAREN)) {
 			this.consume(TokenType.LPAREN, "Expected '(' to start maintained column list.");
-			columns = [];
-			if (!this.check(TokenType.RPAREN)) {
-				do {
-					columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in maintained column list."));
-				} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
+			// An empty `maintained () as` list is rejected: `maintainedClauseToString`
+			// would drop it (so it could not round-trip) and import would arity-error.
+			// The clause's absence is the implicit signal; require at least one column.
+			if (this.check(TokenType.RPAREN)) {
+				throw this.error(this.peek(), "Expected at least one column name in the maintained column list.");
 			}
+			columns = [];
+			do {
+				columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in maintained column list."));
+			} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
 			this.consume(TokenType.RPAREN, "Expected ')' after maintained column list.");
 		}
 		this.consumeKeyword('AS', "Expected 'AS' after MAINTAINED.");

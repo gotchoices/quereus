@@ -715,6 +715,41 @@ describe('view persistence: generateMaintainedTableDDL fixed point', () => {
 });
 
 // ============================================================================
+// Table-form-AUTHORED rows: the canonical `create table … maintained [(columns)] as`
+// input directly (not via the MV sugar). `mvSchemaFromDDL` lifts the declared
+// columns/PK faithfully and reads `derivation.columns` from the `maintained
+// [(columns)]` clause — present ⇒ explicit (the clause round-trips), absent ⇒
+// implicit (the body reshapes its source on reopen, so the clause stays omitted).
+// This pins the parser → generator fixed point of both authored channels.
+// ============================================================================
+describe('view persistence: generateMaintainedTableDDL fixed point — table-form authored', () => {
+	const gen = (ddl: string) => generateMaintainedTableDDL(mvSchemaFromDDL(ddl));
+
+	const tableForm = [
+		{ name: 'implicit (no rename list)', ddl: 'create table v ("a" integer primary key) maintained as select 1 as a', list: false },
+		{ name: 'explicit rename list', ddl: 'create table v ("a" integer primary key) maintained (a) as select 1 as a', list: true },
+		{ name: 'explicit multi-column rename list', ddl: 'create table v ("key_id" integer primary key, "val" integer) maintained (key_id, val) as select id, v from src', list: true },
+	];
+
+	for (const { name, ddl, list } of tableForm) {
+		it(`re-parses, is a fixed point, and ${list ? 'keeps' : 'omits'} the clause: ${name}`, () => {
+			const once = gen(ddl);
+			const reparsed = parse(once);
+			expect(reparsed.type, 'generated DDL re-parses to the canonical table form').to.equal('createTable');
+			expect(reparsed.type === 'createTable' && reparsed.maintained, 'carries the maintained clause').to.exist;
+			expect(gen(once), 'generate is a fixed point over its own re-parse').to.equal(once);
+			// The clause presence is the lossless implicit/explicit signal.
+			if (list) {
+				expect(once, 'explicit ⇒ the rename list rides the clause').to.match(/maintained \(/i);
+			} else {
+				expect(once, 'implicit ⇒ no rename list').to.not.match(/maintained \(/i);
+				expect(once, 'implicit keeps the bare `maintained as`').to.match(/maintained as /i);
+			}
+		});
+	}
+});
+
+// ============================================================================
 // The matrix above feeds the generators parser-derived schemas. These two tests
 // instead exercise them against a LIVE-created schema — the schema a store would
 // actually regenerate. A live MV's `selectAst` is the raw parsed body (the create

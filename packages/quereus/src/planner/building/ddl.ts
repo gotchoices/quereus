@@ -49,6 +49,12 @@ function raiseCreateMaintainedDiagnostics(context: PlanningContext, stmt: AST.Cr
 			stmt.table.loc?.start.column,
 		);
 	}
+	// The optional `maintained (columns)` rename list is the authoritative output-name
+	// vector (presence ⇒ explicit / arity-locked). It must positionally match the
+	// declared columns — same length, same names case-insensitively — so the recorded
+	// `derivation.columns` (declared casing) regenerates byte-identical canonical DDL
+	// and a mismatched list can never be silently dropped at live exec.
+	raiseMaintainedColumnListDiagnostics(stmt, tableName);
 	const generated = stmt.columns.find(c => c.constraints?.some(con => con.type === 'generated'));
 	if (generated) {
 		throw new QuereusError(
@@ -81,6 +87,40 @@ function raiseCreateMaintainedDiagnostics(context: PlanningContext, stmt: AST.Cr
 			stmt.table.loc?.start.line,
 			stmt.table.loc?.start.column,
 		);
+	}
+}
+
+/**
+ * Validates the optional `maintained (columns)` rename list against the declared
+ * column layout: the list (when present) must have one entry per declared column
+ * and each entry must match the declared column name at the same position
+ * (case-insensitive). A length or name mismatch is a sited error — this is what
+ * kills the silent-drop hazard (a `maintained (x, y)` on a `(id, v)` table can no
+ * longer succeed live discarding the authored list). The empty list is already
+ * rejected at parse time, so `columns` here is either absent or non-empty.
+ */
+function raiseMaintainedColumnListDiagnostics(stmt: AST.CreateTableStmt, tableName: string): void {
+	const list = stmt.maintained!.columns;
+	if (!list) return;
+	if (list.length !== stmt.columns.length) {
+		throw new QuereusError(
+			`cannot create maintained table '${tableName}': the maintained column list has ${list.length} columns but the table declares ${stmt.columns.length}`,
+			StatusCode.ERROR,
+			undefined,
+			stmt.table.loc?.start.line,
+			stmt.table.loc?.start.column,
+		);
+	}
+	for (let i = 0; i < list.length; i++) {
+		if (list[i].toLowerCase() !== stmt.columns[i].name.toLowerCase()) {
+			throw new QuereusError(
+				`cannot create maintained table '${tableName}': maintained column ${i + 1} is named '${list[i]}' but the table declares '${stmt.columns[i].name}' (the maintained rename list must match the declared column names)`,
+				StatusCode.ERROR,
+				undefined,
+				stmt.table.loc?.start.line,
+				stmt.table.loc?.start.column,
+			);
+		}
 	}
 }
 
