@@ -236,3 +236,21 @@ select count(*) as n from mz;
 → [{"n":3}]
 select count(*) as n from vz;
 → [{"n":3}]
+
+-- ===================================
+-- 12. intra-statement value swap: bounded-delta maintenance applies per source
+-- row, so a swap across two source rows aborts mid-statement exactly like the
+-- equivalent multi-row UPDATE on an ordinary table (docs/materialized-views.md
+-- § Declared secondary UNIQUE); the statement rolls back whole
+-- ===================================
+
+create table wsrc (id integer primary key, tag text);
+insert into wsrc values (1, 'a'), (2, 'b');
+create table mw (id integer primary key, tag text unique) maintained as select id, tag from wsrc;
+
+update wsrc set tag = case id when 1 then 'b' else 'a' end;
+-- error: row derived into maintained table 'main.mw'
+select * from mw order by id;
+→ [{"id":1,"tag":"a"},{"id":2,"tag":"b"}]
+select * from wsrc order by id;
+→ [{"id":1,"tag":"a"},{"id":2,"tag":"b"}]

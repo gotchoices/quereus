@@ -355,9 +355,39 @@ SELECT id FROM atom_dp ORDER BY id;
 → [{"id":1},{"id":2},{"id":3}]
 
 -- ===================================
+-- Rolled-back statements must not corrupt UNIQUE enforcement state
+-- ===================================
+-- Regression (memory module): secondary-index entries are shared across
+-- inherited layer trees, so a rolled-back transaction's index mutations must
+-- be copy-on-written into the transaction's own tree, never applied in place
+-- to the shared committed entry (MemoryIndex.ownedEntries). A leaked delete
+-- silently un-enforced UNIQUE; a leaked insert left a phantom candidate.
+
+CREATE TABLE rbk (id INTEGER PRIMARY KEY, v TEXT UNIQUE);
+INSERT INTO rbk VALUES (1, 'x');
+
+-- a rolled-back DELETE must leave UNIQUE enforcement intact
+BEGIN;
+DELETE FROM rbk WHERE id = 1;
+ROLLBACK;
+
+INSERT INTO rbk VALUES (2, 'x');
+-- error: UNIQUE constraint failed
+
+-- a rolled-back INSERT must not leave a phantom that blocks the value
+BEGIN;
+INSERT INTO rbk VALUES (3, 'y');
+ROLLBACK;
+
+INSERT INTO rbk VALUES (4, 'y');
+SELECT id, v FROM rbk ORDER BY id;
+→ [{"id":1,"v":"x"},{"id":4,"v":"y"}]
+
+-- ===================================
 -- Cleanup
 -- ===================================
 
+DROP TABLE rbk;
 DROP TABLE txe;
 DROP TABLE atom_dc;
 DROP TABLE atom_dp;

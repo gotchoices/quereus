@@ -1051,9 +1051,18 @@ export class MemoryTableManager {
 			// candidate whose row is gone, no longer carries the colliding values,
 			// or left a partial index's scope is skipped rather than raised as a
 			// false conflict (or, worse, REPLACE-evicting an innocent row).
+			// Compare under the INDEX's per-column collation (positionally aligned
+			// with uc.columns — findIndexForConstraint requires it): the index is
+			// the enforcing structure, and an explicit `create unique index …
+			// (col collate nocase)` may declare a coarser collation than the
+			// column — re-checking under the column's collation would skip the
+			// case-variant candidates the index legitimately unifies.
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
-			if (!uc.columns.every(col => compareSqlValues(newRowData[col], conflictingRow[col], schema.columns[col].collation) === 0)) continue;
+			if (!uc.columns.every((col, i) => compareSqlValues(
+				newRowData[col], conflictingRow[col],
+				index.specColumns[i]?.collation ?? schema.columns[col].collation,
+			) === 0)) continue;
 			if (index.predicate && !index.rowMatchesPredicate(conflictingRow)) continue;
 
 			// Found a different live row with the same unique key values

@@ -44,6 +44,17 @@ What is NOT yet verified:
   finds the conflict first — today the index lookup misses case-variants under
   a finer index collation before the declared-collation check can see them).
 
+Update (maintained-table-derivation-secondary-unique review): memory's
+`checkUniqueViaIndex` now live-validates each index candidate against the
+effective row, comparing under the **index's per-column collation** (falling
+back to the column's), so memory enforcement = index collation by construction
+on both the lookup and the validation side (pinned by 05-vtab_memory.sqllogic
+§ explicit unique-index collation). The store's `findUniqueConflict` still
+compares under the **declared column collation** only — so a
+`create unique index … (col collate nocase)` over a BINARY column enforces
+case-insensitively under memory but case-sensitively under store. That
+divergence is the concrete store-side shape this audit should resolve.
+
 Use cases / expectations:
 
 - A claimed relation key must hold under each key column's output (declared)
