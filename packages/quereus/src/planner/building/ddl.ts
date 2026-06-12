@@ -4,6 +4,9 @@ import { CreateTableNode } from '../nodes/create-table-node.js';
 import { CreateIndexNode } from '../nodes/create-index-node.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
+import { planViewBody } from './create-view.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
 
 export function buildCreateTableStmt(
 	context: PlanningContext,
@@ -13,10 +16,72 @@ export function buildCreateTableStmt(
 	// direct CREATE path fails as loudly as ALTER ... SET TAGS and the declarative
 	// differ — a typo can't be silently stored on the most common authoring path.
 	raiseCreateTableTagDiagnostics(stmt);
+	if (stmt.maintained) {
+		raiseCreateMaintainedDiagnostics(context, stmt);
+	}
 	return new CreateTableNode(
 		context.scope,
 		stmt,
 	);
+}
+
+/**
+ * Build-time gates for the declared-shape maintained form, `create table …
+ * maintained as <body>`: the body must be relational and non-DML (the CREATE
+ * VIEW gate, same diagnostics as the MV sugar), its arity must match the
+ * declared column count, the hosting module must implement the backing-host
+ * capability, and the declared shape may not carry generated columns (the body
+ * supplies every column's value — a generated column would silently diverge
+ * from its expression). The full positional shape check (names / types /
+ * collations / physical PK) runs in the emitter against the derived shape,
+ * BEFORE any catalog registration.
+ */
+function raiseCreateMaintainedDiagnostics(context: PlanningContext, stmt: AST.CreateTableStmt): void {
+	const tableName = stmt.table.name;
+	const planned = planViewBody(context, tableName, stmt.maintained!.select);
+	const bodyArity = planned.getAttributes().length;
+	if (bodyArity !== stmt.columns.length) {
+		throw new QuereusError(
+			`cannot create maintained table '${tableName}': body produces ${bodyArity} columns but the table declares ${stmt.columns.length}`,
+			StatusCode.ERROR,
+			undefined,
+			stmt.table.loc?.start.line,
+			stmt.table.loc?.start.column,
+		);
+	}
+	const generated = stmt.columns.find(c => c.constraints?.some(con => con.type === 'generated'));
+	if (generated) {
+		throw new QuereusError(
+			`cannot create maintained table '${tableName}': column '${generated.name}' is generated — a maintained table's columns are all derived by the body`,
+			StatusCode.ERROR,
+			undefined,
+			stmt.table.loc?.start.line,
+			stmt.table.loc?.start.column,
+		);
+	}
+	// Resolve the hosting module exactly as CREATE TABLE will (the `using`
+	// clause, else the session default) and require the backing-host capability.
+	const sm = context.db.schemaManager;
+	const moduleName = stmt.moduleName ?? sm.getDefaultVTabModuleName();
+	const moduleInfo = sm.getModule(moduleName);
+	if (!moduleInfo?.module) {
+		throw new QuereusError(
+			`no virtual table module named '${moduleName}'`,
+			StatusCode.ERROR,
+			undefined,
+			stmt.table.loc?.start.line,
+			stmt.table.loc?.start.column,
+		);
+	}
+	if (!moduleInfo.module.getBackingHost) {
+		throw new QuereusError(
+			`cannot create maintained table '${tableName}': module '${moduleName}' cannot host a maintained table (it does not implement the backing-host capability)`,
+			StatusCode.UNSUPPORTED,
+			undefined,
+			stmt.table.loc?.start.line,
+			stmt.table.loc?.start.column,
+		);
+	}
 }
 
 export function buildCreateIndexStmt(

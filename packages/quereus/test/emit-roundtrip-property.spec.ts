@@ -79,6 +79,16 @@ const rowOpSubsetArb: fc.Arbitrary<RowOp[]> = fc.uniqueArray(rowOpArb, { minLeng
 const fkActionArb: fc.Arbitrary<AST.ForeignKeyAction> = fc.constantFrom('setNull', 'setDefault', 'cascade', 'restrict');
 
 /**
+ * Optional `with schema s1[, s2]` search path (`schemaPath` on SELECT and the
+ * three DML statements) — the stealth-drop net for the clause the stringifier
+ * once silently omitted (stringify-schema-path-clause).
+ */
+const schemaPathArb: fc.Arbitrary<string[] | undefined> = fc.option(
+	fc.uniqueArray(identArb, { minLength: 1, maxLength: 2 }),
+	{ nil: undefined },
+);
+
+/**
  * [NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE] — produced as `deferrable` /
  * `initiallyDeferred` on `ForeignKeyClause`. `initiallyDeferred` is only set
  * inside a DEFERRABLE/NOT DEFERRABLE branch (the parser cannot reach it
@@ -369,19 +379,23 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 // ------------------------------------------------------------------------
 
 /**
- * `select <col> [with inverse (…)] from <table>` — the result column sometimes
- * carries an authored-inverse clause, so every QueryExpr-accepting site fed by
- * this arbitrary (CTE body, view body, subquery source, compound leg, …) also
- * probes clause survival in nested positions.
+ * `select <col> [with inverse (…)] from <table> [with schema …]` — the result
+ * column sometimes carries an authored-inverse clause and the statement
+ * sometimes a schema path, so every QueryExpr-accepting site fed by this
+ * arbitrary (CTE body, view body, subquery source, compound leg, …) also
+ * probes clause survival in nested positions (a compound leg carrying a
+ * schema path must re-emit grouping parens — bare legs never parse one).
  */
 const simpleSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
 	identArb,
 	identArb,
 	fc.option(inverseClauseArb, { nil: undefined }),
-).map(([col, table, inverse]): AST.SelectStmt => ({
+	schemaPathArb,
+).map(([col, table, inverse, schemaPath]): AST.SelectStmt => ({
 	type: 'select',
 	columns: [{ type: 'column', expr: { type: 'column', name: col }, ...(inverse ? { inverse } : {}) }],
 	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
+	...(schemaPath ? { schemaPath } : {}),
 }));
 
 /**
@@ -512,11 +526,15 @@ const compoundSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
 	identArb, // left table name
 	compoundOpArb,
 	queryExprArb,
-).map(([col, table, op, rightLeg]): AST.SelectStmt => ({
+	// Statement-level schema path — binds BEFORE the compound operator, so the
+	// stringifier must emit it ahead of the op for re-parse to re-bind it here.
+	schemaPathArb,
+).map(([col, table, op, rightLeg, schemaPath]): AST.SelectStmt => ({
 	type: 'select',
 	columns: [{ type: 'column', expr: { type: 'column', name: col } }],
 	from: [{ type: 'table', table: { type: 'identifier', name: table } }],
 	compound: { op, select: rightLeg },
+	...(schemaPath ? { schemaPath } : {}),
 }));
 
 /**
@@ -894,12 +912,18 @@ const analyzeArb: fc.Arbitrary<AST.AnalyzeStmt> = fc.oneof(
 // DML smoke (kept tiny — string round-trip already covers most surface)
 // ------------------------------------------------------------------------
 
+// The INSERT source stays VALUES-shaped: a trailing schema path after a bare
+// SELECT source re-binds to the select on re-parse (the select's own
+// `parseSchemaPath` is greedy), so insert-level schemaPath ⨯ select-source is
+// only reachable with an intervening trailing clause — covered deterministically
+// in emit-roundtrip.spec.ts.
 const insertArb: fc.Arbitrary<AST.InsertStmt> = fc.tuple(
 	identArb,
 	uniqueIdents(2),
 	fc.array(literalArb, { minLength: 2, maxLength: 2 }),
 	conflictResArb,
-).map(([tbl, colNames, vals, onConflict]): AST.InsertStmt => {
+	schemaPathArb,
+).map(([tbl, colNames, vals, onConflict, schemaPath]): AST.InsertStmt => {
 	const stmt: AST.InsertStmt = {
 		type: 'insert',
 		table: { type: 'identifier', name: tbl },
@@ -910,6 +934,7 @@ const insertArb: fc.Arbitrary<AST.InsertStmt> = fc.tuple(
 		},
 	};
 	if (onConflict !== undefined) stmt.onConflict = onConflict;
+	if (schemaPath) stmt.schemaPath = schemaPath;
 	return stmt;
 });
 
@@ -918,25 +943,29 @@ const updateArb: fc.Arbitrary<AST.UpdateStmt> = fc.tuple(
 	identArb,
 	literalArb,
 	fc.option(checkExprArb, { nil: undefined }),
-).map(([tbl, col, val, wherePred]): AST.UpdateStmt => {
+	schemaPathArb,
+).map(([tbl, col, val, wherePred, schemaPath]): AST.UpdateStmt => {
 	const stmt: AST.UpdateStmt = {
 		type: 'update',
 		table: { type: 'identifier', name: tbl },
 		assignments: [{ column: col, value: val }],
 	};
 	if (wherePred) stmt.where = wherePred;
+	if (schemaPath) stmt.schemaPath = schemaPath;
 	return stmt;
 });
 
 const deleteArb: fc.Arbitrary<AST.DeleteStmt> = fc.tuple(
 	identArb,
 	fc.option(checkExprArb, { nil: undefined }),
-).map(([tbl, wherePred]): AST.DeleteStmt => {
+	schemaPathArb,
+).map(([tbl, wherePred, schemaPath]): AST.DeleteStmt => {
 	const stmt: AST.DeleteStmt = {
 		type: 'delete',
 		table: { type: 'identifier', name: tbl },
 	};
 	if (wherePred) stmt.where = wherePred;
+	if (schemaPath) stmt.schemaPath = schemaPath;
 	return stmt;
 });
 

@@ -1944,9 +1944,9 @@ describe('Materialized-view maintenance no-op write suppression', () => {
 			await assertEquivalent(db, body, 'after same-value rewrite');
 		});
 
-		it('regression: a real same-key change still reports (delete + insert, as before)', async () => {
+		it('a real same-key change reports a single update (upsert-only, no delete-first)', async () => {
 			await db.exec('update src set a = 11 where id = 1');
-			expect(allOps(records).sort()).to.deep.equal(['delete', 'insert']);
+			expect(allOps(records)).to.deep.equal(['update']);
 			await assertEquivalent(db, body, 'after real change');
 		});
 
@@ -1987,6 +1987,39 @@ describe('Materialized-view maintenance no-op write suppression', () => {
 			await db.exec('update src set a = 9 where id = 2');
 			expect(allOps(records)).to.deep.equal(['insert']);
 			await assertEquivalent(db, body, 'after scope entry');
+		});
+	});
+
+	describe('inverse-projection arm + NOCASE backing key', () => {
+		let db: Database;
+		let records: AppliedRecord[];
+		const body = 'select id, v from t';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table t (id text collate nocase primary key, v integer)');
+			await db.exec("insert into t (id, v) values ('apple', 1), ('Banana', 2)");
+			await db.exec(`create materialized view mv as ${body}`);
+			records = instrument(db);
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('a case-only key rewrite (collation-equal, byte-different) reports a single update and re-keys', async () => {
+			// White-box guard: this NOCASE projection really is the bounded-delta
+			// covering-index arm (not the floor), so the single-update path under test
+			// is the inverse-projection upsert-only branch.
+			expect(registeredPlanKind(db, 'mv'), 'NOCASE projection maintained by inverse-projection').to.equal('inverse-projection');
+			// 'apple' → 'APPLE' is the SAME backing key under NOCASE (collation-equal key
+			// identity) but a different stored byte value: one upsert, host reports one
+			// `update` — no delete-first pairing.
+			await db.exec("update t set id = 'APPLE' where id = 'apple'");
+			expect(allOps(records)).to.deep.equal(['update']);
+			// The upsert re-keyed the stored bytes at the unchanged key identity.
+			const ids = await readMultiset(db, 'select id from mv');
+			expect(ids.sort(), 'stored bytes re-keyed to the new casing').to.deep.equal(
+				[canonRow(['APPLE']), canonRow(['Banana'])].sort(),
+			);
+			await assertEquivalent(db, body, 'after case-only key rewrite');
 		});
 	});
 

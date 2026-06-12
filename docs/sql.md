@@ -422,7 +422,9 @@ Quereus supports flexible schema resolution through search paths. Unqualified ta
 1. **Qualified names** (`schema.table`) - Always used exactly as specified
 2. **WITH SCHEMA clause** - Per-query explicit search path
 3. **PRAGMA schema_path** - Session-level default search path
-4. **Default schema** - Typically `main`
+4. **Default search order** - `main`, then `temp`
+
+**DDL landing vs. read resolution (deliberate asymmetry):** unqualified DDL (`create table` / `create view` / `create index` / `drop …` / `alter … tags`) lands objects in the **current schema** (`SchemaManager.setCurrentSchema`, an embedder API — there is no SQL surface for it), while unqualified *reads* resolve only via the search path above, which does **not** consult the current schema. An embedder that sets a non-`main` current schema must also set `schema_path` (or qualify references); otherwise objects it creates are invisible to unqualified reads. Pure-SQL users are unaffected — the current schema is always `main` unless an embedder changes it.
 
 **WITH SCHEMA Syntax:**
 ```sql
@@ -1383,6 +1385,15 @@ Mutates the metadata tags on the table itself, one of its columns, or one of its
 
 The declarative schema differ detects tag drift at all three sites and emits the matching **whole-set** `SET TAGS` statements (it computes the full desired set) **after** the structural ALTER phases (rename/add/alter/pk/drop), so a tag set lands on the post-rename column / constraint name. `ADD TAGS` / `DROP TAGS` are an imperative-only convenience and are **not** emitted by the differ. The rename-hint keys `"quereus.id"` and `"quereus.previous_name"` are excluded from the tag-drift comparison (they drive rename detection, not data state, so a declaration carrying only a hint does not churn out a `SET TAGS` after the rename completes); all other reserved tags (`quereus.lens.*`, `quereus.expose_implicit_index`, …) *are* compared.
 
+#### SET MAINTAINED / DROP MAINTAINED — derivation lifecycle
+
+```sql
+ALTER TABLE table_name SET MAINTAINED AS query_expr [INSERT DEFAULTS (column = expr [, ...])];
+ALTER TABLE table_name DROP MAINTAINED;
+```
+
+`SET MAINTAINED AS` attaches a derivation to a plain table — making it a [maintained table](materialized-views.md) — or atomically replaces an already-maintained table's derivation. The body must derive the table's exact declared shape (names included; alias body outputs to match), and the table's current contents are reconciled against the derived contents by keyed diff (identical content writes nothing; divergence resolves derived-wins, reporting only genuine changes). There is no `using` clause — the module is the table's identity. A body closing a derivation cycle (including self-reference) and duplicate derived keys are rejected with the table untouched. `DROP MAINTAINED` detaches the derivation: catalog-only — the table keeps its rows and becomes an ordinary, user-writable table; maintenance stops. The declared-shape create form (`create table … maintained as <body>`) and the full attach/detach semantics are specified in [materialized-views.md § DDL statements](materialized-views.md#ddl-statements).
+
 #### SET / ADD / DROP TAGS on views, materialized views, and indexes
 
 The other tagged catalog objects — views, materialized views, and indexes — also carry their tags from `CREATE` time, and can be re-tagged in place with the same three verbs as `ALTER TABLE`:
@@ -1482,6 +1493,8 @@ create materialized view [if not exists] view_name [(column[, ...])]
 refresh materialized view view_name;
 drop materialized view [if exists] view_name;
 ```
+
+The `create materialized view` form is normalization sugar for the declared-shape **table form** — `create table name (columns...) [using module(...)] maintained as query_expr [insert defaults (...)] [with tags (...)]` — where the table layout is authored and the body must derive exactly that shape. The table form is also the canonical persistence/export rendering for every maintained table; `refresh materialized view` and `drop materialized view` work on any maintained table regardless of authoring form. See [materialized-views.md § DDL statements](materialized-views.md#ddl-statements) and the `SET MAINTAINED` / `DROP MAINTAINED` lifecycle verbs in [§2.7](#27-alter-table-statement).
 
 - The body is evaluated and stored at create; create is all-or-nothing.
 - `refresh` is **not required for currency** (row-time maintenance keeps it live); it is an explicit resync verb, useful after a source *schema* change marks the view `stale`.

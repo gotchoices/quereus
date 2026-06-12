@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { parse, parseAll } from '../src/parser/index.js';
 import { astToString, expressionToString, quoteIdentifier } from '../src/emit/index.js';
-import type { CreateViewStmt, ResultColumnExpr, SelectStmt } from '../src/parser/index.js';
+import type { CreateViewStmt, DeleteStmt, InsertStmt, ResultColumnExpr, SelectStmt, UpdateStmt } from '../src/parser/index.js';
 
 /** Round-trip a full statement: parse → stringify → parse → stringify, compare strings */
 function roundTripStmt(sql: string): string {
@@ -408,6 +408,94 @@ describe('Emit: statement round-trips', () => {
 	describe('VALUES', () => {
 		it('standalone VALUES clause', () => {
 			roundTripStmt('values (1, 2), (3, 4)');
+		});
+	});
+
+	describe('WITH SCHEMA (schema search path)', () => {
+		// roundTripStmt alone only proves idempotence — a silently dropped clause
+		// re-emits identically and still passes. Each case also asserts the
+		// schemaPath survives the first parse → stringify → parse.
+		function expectSchemaPathSurvives<T extends SelectStmt | InsertStmt | UpdateStmt | DeleteStmt>(
+			sql: string, expected: string[],
+		): T {
+			const stmt = parse(sql) as T;
+			expect(stmt.schemaPath, `parse of: ${sql}`).to.deep.equal(expected);
+			const reparsed = parse(roundTripStmt(sql)) as T;
+			expect(reparsed.schemaPath, sql).to.deep.equal(expected);
+			return reparsed;
+		}
+
+		it('SELECT with single-schema path', () => {
+			expectSchemaPathSurvives<SelectStmt>('select a from t with schema main', ['main']);
+		});
+
+		it('SELECT with multi-schema path', () => {
+			expectSchemaPathSurvives<SelectStmt>('select a from t with schema s1, s2', ['s1', 's2']);
+		});
+
+		it('SELECT: emitted after HAVING', () => {
+			expectSchemaPathSurvives<SelectStmt>(
+				'select a, count(*) from t group by a having count(*) > 1 with schema s1', ['s1']);
+		});
+
+		it('SELECT: emitted before ORDER BY / LIMIT', () => {
+			const out = roundTripStmt('select a from t with schema s1 order by a limit 10');
+			expect(out).to.equal('select a from t with schema s1 order by a limit 10');
+			expectSchemaPathSurvives<SelectStmt>('select a from t with schema s1 order by a limit 10', ['s1']);
+		});
+
+		it('compound SELECT: binds before the compound operator, stays on the outer statement', () => {
+			const reparsed = expectSchemaPathSurvives<SelectStmt>(
+				'select a from t1 with schema s1 union select b from t2', ['s1']);
+			expect(reparsed.compound?.op).to.equal('union');
+			expect(roundTripStmt('select a from t1 with schema s1 union select b from t2'))
+				.to.equal('select a from t1 with schema s1 union select b from t2');
+		});
+
+		it('compound SELECT with outer ORDER BY: schema before the operator, order by after the chain', () => {
+			expectSchemaPathSurvives<SelectStmt>(
+				'select a from t1 with schema s1 union select a from t2 order by a', ['s1']);
+		});
+
+		it('INSERT with trailing schema path', () => {
+			expectSchemaPathSurvives<InsertStmt>('insert into t (a) values (1) with schema s1', ['s1']);
+		});
+
+		it('INSERT with ON CONFLICT and schema path', () => {
+			expectSchemaPathSurvives<InsertStmt>(
+				'insert into t (a) values (1) on conflict do nothing with schema s1, s2', ['s1', 's2']);
+		});
+
+		it('INSERT with tags and schema path (tags shield a SELECT source)', () => {
+			const reparsed = expectSchemaPathSurvives<InsertStmt>(
+				"insert into t select a from s with tags (k = 'x') with schema s1", ['s1']);
+			expect(reparsed.tags).to.deep.equal({ k: 'x' });
+			if (reparsed.source.type !== 'select') throw new Error('Expected select source');
+			expect(reparsed.source.schemaPath).to.equal(undefined);
+		});
+
+		it('INSERT ... SELECT: schema on the source select stays on the select', () => {
+			const stmt = parse('insert into t select a from s with schema s1') as InsertStmt;
+			expect(stmt.schemaPath).to.equal(undefined);
+			if (stmt.source.type !== 'select') throw new Error('Expected select source');
+			expect(stmt.source.schemaPath).to.deep.equal(['s1']);
+			roundTripStmt('insert into t select a from s with schema s1');
+		});
+
+		it('UPDATE with trailing schema path', () => {
+			expectSchemaPathSurvives<UpdateStmt>('update t set a = 1 where b > 0 with schema s1, s2', ['s1', 's2']);
+		});
+
+		it('UPDATE with schema path and RETURNING', () => {
+			expectSchemaPathSurvives<UpdateStmt>('update t set a = 1 with schema s1 returning *', ['s1']);
+		});
+
+		it('DELETE with trailing schema path', () => {
+			expectSchemaPathSurvives<DeleteStmt>('delete from t where id = 1 with schema s1', ['s1']);
+		});
+
+		it('DELETE with schema path and RETURNING', () => {
+			expectSchemaPathSurvives<DeleteStmt>('delete from t with schema s1 returning *', ['s1']);
 		});
 	});
 

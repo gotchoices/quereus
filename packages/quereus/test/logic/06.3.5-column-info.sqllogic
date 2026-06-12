@@ -2,8 +2,9 @@
 -- The column-granular companion to view_info(): docs/view-updateability.md
 -- § Information Schema Surface (information_schema.columns.is_updatable).
 -- Columns: schema, name, cid, column_name, is_updatable ('YES'/'NO'),
--- base_table, base_column (both null for a read-only column). Resolves either a
--- base table or a plain view; throws not-found when neither matches.
+-- base_table, base_column (both null for a read-only column). Resolves a base
+-- table, a plain view, or a maintained table (materialized view — derivation-body
+-- lineage, not plain base columns); throws not-found when neither matches.
 
 -- ===================================================================
 -- Base table, all columns updatable: every non-generated base column is a
@@ -279,6 +280,49 @@ select cid, column_name, is_updatable, base_table, base_column from column_info(
 -- Surface agrees with propagate(): a write through the self-join view is accepted
 -- (empty base ⇒ clean no-op).
 update self_v set bv = 'z' where aid = 1;
+
+-- ===================================================================
+-- Maintained table (materialized view): per-column lineage comes from the SAME
+-- derivation-body walk a plain view gets — NOT the trivially-all-updatable base
+-- branch — because write-through inherits the view-updateability rules
+-- (docs/materialized-views.md § Write boundary). A passthrough column (id) and a
+-- renamed column (label = name) report their SOURCE base column with
+-- is_updatable='YES'; an INVERSE-profile expression (vp = v + 1) stays 'YES'
+-- tracing to its base column (same as a plain view — the write stores the
+-- inverted value); a non-invertible expression (dbl = v * 2) is read-only with
+-- null trace ('no-inverse' on write).
+-- ===================================================================
+
+create table mt (id integer primary key, v integer, name text);
+insert into mt values (1, 5, 'a');
+create materialized view mt_mv as select id, name as label, v + 1 as vp, v * 2 as dbl from mt;
+
+select cid, column_name, is_updatable, base_table, base_column from column_info('mt_mv');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":"mt","base_column":"id"},{"cid":1,"column_name":"label","is_updatable":"YES","base_table":"mt","base_column":"name"},{"cid":2,"column_name":"vp","is_updatable":"YES","base_table":"mt","base_column":"v"},{"cid":3,"column_name":"dbl","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- The object identity columns name the maintained table itself, in its schema.
+select distinct schema, name from column_info('mt_mv');
+→ [{"schema":"main","name":"mt_mv"}]
+
+-- Dynamic agreement with the write-through rewrite: the renamed column routes to
+-- its base column; the inverse column stores the inverted base value (vp = 9 ⇒
+-- v = 8); the non-invertible expression column rejects the write.
+update mt_mv set label = 'z' where id = 1;
+select id, v, name from mt;
+→ [{"id":1,"v":5,"name":"z"}]
+update mt_mv set vp = 9 where id = 1;
+select id, v, name from mt;
+→ [{"id":1,"v":8,"name":"z"}]
+select id, label, vp, dbl from mt_mv;
+→ [{"id":1,"label":"z","vp":9,"dbl":16}]
+
+update mt_mv set dbl = 99 where id = 1;
+-- error: read-only
+
+-- view_info keeps excluding maintained tables (its surface stays plain-view-only;
+-- the per-column lineage story for an MV lives in column_info above).
+select count(*) as c from view_info('mt_mv');
+→ [{"c":0}]
 
 -- ===================================================================
 -- Unknown name throws (mirrors table_info's required-target posture).

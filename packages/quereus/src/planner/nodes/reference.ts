@@ -2,7 +2,7 @@ import type { BaseType, ScalarType, RelationType } from '../../common/datatype.j
 import { PlanNode, type ZeroAryRelationalNode, type ZeroAryScalarNode, type Attribute, type InjectivityResult, type MonotonicityResult, type PhysicalProperties, type FunctionalDependency, type ConstantBinding, type DomainConstraint, type InclusionDependency, type UpdateSite, type AttributeDefault } from './plan-node.js';
 import { addFd, closeConstantBindingsOverEcs, mergeConstantBindings, mergeDomainConstraints, mergeEquivClasses } from '../util/fd-utils.js';
 import { seedTableForeignKeyInds } from '../util/ind-utils.js';
-import { getCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
+import { getTrustedCheckExtraction, type CheckExtraction } from '../analysis/check-extraction.js';
 import { getPartialUniqueGuardedFds } from '../analysis/partial-unique-extraction.js';
 import { getAssertionHoistedConstraints } from '../analysis/assertion-hoist-cache.js';
 import type { SchemaManager } from '../../schema/manager.js';
@@ -21,16 +21,6 @@ import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { getModuleConcurrencyMode } from '../../vtab/concurrency.js';
 import type { ColumnBindingProvider } from '../framework/characteristics.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
-
-/** Shared empty `CheckExtraction` instance used when a vtab module's
- *  `permitsGrandfatheredCheckViolators` capability suppresses the CHECK
- *  contribution lift in `TableReferenceNode.computePhysical`. */
-const EMPTY_CHECK_EXTRACTION: CheckExtraction = {
-	fds: [],
-	equivPairs: [],
-	constantBindings: [],
-	domainConstraints: [],
-};
 
 /** Represents a reference to a table in the global schema. */
 export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNode, TableAccessCapable, ColumnBindingProvider {
@@ -134,12 +124,10 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		// physical properties would let consumers (e.g. the filter-contradiction
 		// rule) fold WHERE predicates that would have matched the violators.
 		// Assertion-hoist and partial-UNIQUE contributions are independent
-		// paths and are NOT gated by this flag.
-		const permitsCheckViolators =
-			this.vtabModule.getCapabilities?.().permitsGrandfatheredCheckViolators === true;
-		const checkExt: CheckExtraction = permitsCheckViolators
-			? EMPTY_CHECK_EXTRACTION
-			: getCheckExtraction(this.tableSchema);
+		// paths and are NOT gated by this flag. The gate lives centrally in
+		// `getTrustedCheckExtraction`; the node's own module reference is passed
+		// explicitly (it is resolved at construction, independent of the schema).
+		const checkExt: CheckExtraction = getTrustedCheckExtraction(this.tableSchema, this.vtabModule);
 		// CHECK-derived FDs fold unconditionally. They are pure value claims
 		// (`kind: 'determination'`, or guarded), and the kind-aware readers
 		// (`isUniqueDeterminant`) never read a determination as a uniqueness

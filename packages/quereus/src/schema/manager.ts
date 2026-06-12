@@ -2354,6 +2354,22 @@ export class SchemaManager {
 	 * @returns A Promise that resolves to the created TableSchema.
 	 * @throws QuereusError on errors (e.g., module not found, create fails, table exists).
 	 */
+	/**
+	 * Builds the {@link TableSchema} a CREATE TABLE statement WOULD register,
+	 * without touching the module or the catalog. Resolution matches
+	 * {@link createTable} exactly (same module-info resolution, same live-session
+	 * default collation), so the result is byte-for-byte what registration would
+	 * produce. Used by the maintained-table create path
+	 * (`createMaintainedTable`) to verify the declared shape against the
+	 * derivation body BEFORE any catalog registration — the all-or-nothing
+	 * posture of `create table … maintained as`.
+	 */
+	buildDeclaredTableSchema(stmt: AST.CreateTableStmt): TableSchema {
+		const { moduleName, effectiveModuleArgs, moduleInfo } = this.resolveModuleInfo(stmt);
+		const defaultCollation = normalizeCollationName(this.db.options.getStringOption('default_collation'));
+		return this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo, defaultCollation);
+	}
+
 	async createTable(stmt: AST.CreateTableStmt): Promise<TableSchema> {
 		const targetSchemaName = stmt.table.schema || this.getCurrentSchemaName();
 		const tableName = stmt.table.name;

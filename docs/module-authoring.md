@@ -384,7 +384,7 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `concurrencyMode` | static field | engine-side fallback (`'serial'`) | `reentrant-reads` | `serial` (default) | computed: `weaker(underlying, overlay)`, capped at `reentrant-reads` | via store |
 | `expectedLatencyMs` | static field | engine-side fallback (`0`) | 0 | 0 | forwards underlying | via store |
 | `getCapabilities().delegatesNotNullBackfill` | flag (live) | engine-side gate (ADD COLUMN skips `validateNotNullBackfill`) | off | off | inherits underlying | off |
-| `getCapabilities().permitsGrandfatheredCheckViolators` | flag (live) | engine-side gate (`TableReferenceNode` skips the CHECK lift) | off | off | inherits underlying | off |
+| `getCapabilities().permitsGrandfatheredCheckViolators` | flag (live) | engine-side gate (`getTrustedCheckExtraction` returns the empty extraction, so `TableReferenceNode` skips the CHECK lift and the lens prover refuses the table's CHECK-derived enum domains) | off | off | inherits underlying | off |
 | `getCapabilities().{isolation,savepoints,persistent,secondaryIndexes,rangeScans}` | flag (informational) | **never consulted by engine** — asserted only in tests; isolation augments `isolation` / `savepoints` but nothing reads them | varies | varies | augments | varies |
 
 > **`shadowName` is unwired.** It is declared on `VirtualTableModule` but is never called anywhere in the engine. Treat it as deprecated / dead — do not implement a contract around it expecting the engine to consult it.

@@ -10,6 +10,7 @@ import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { analyzeBodyLineage } from './backward-body.js';
 import { buildExpression } from '../building/expression.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { JoinNode } from '../nodes/join-node.js';
 import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -493,7 +494,7 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		const sideIndex = out.sideIndex;
 		const baseCol = columnByName(sides[sideIndex].schema, out.baseColumn);
 		const isKey = out.baseColumn.toLowerCase() === keyColumns[sideIndex].toLowerCase();
-		return { name, sideIndex, baseColumn: out.baseColumn, type: columnScalarType(baseCol), isKey };
+		return { name, sideIndex, baseColumn: out.baseColumn, type: columnSchemaToScalarType(baseCol), isKey };
 	});
 
 	// A FULL outer join has no preserved anchor side to mint/thread the shared key from
@@ -904,10 +905,6 @@ function columnByName(schema: TableSchema, name: string): ColumnSchema {
 		raiseMutationDiagnostic({ reason: 'no-base-lineage', table: schema.name, column: name, message: `column '${name}' not found on base table '${schema.name}'` });
 	}
 	return col;
-}
-
-function columnScalarType(col: ColumnSchema): ScalarType {
-	return { typeClass: 'scalar', logicalType: col.logicalType, nullable: !col.notNull, isReadOnly: false };
 }
 
 // --- analysis -------------------------------------------------------------
@@ -2018,7 +2015,7 @@ export function buildMultiSourceKeyCapture(
 		const pkCols = requireKeyColumns(view, side);
 		pkCols.forEach((pk, j) => {
 			const name = keyColumnName(i, j);
-			keyColumns.push({ name, type: columnScalarType(columnByName(side.schema, pk)) });
+			keyColumns.push({ name, type: columnSchemaToScalarType(columnByName(side.schema, pk)) });
 			projections.push({
 				node: buildExpression({ ...ctx, scope: analysis.joinScope }, { type: 'column', name: pk, table: side.alias }),
 				alias: name,

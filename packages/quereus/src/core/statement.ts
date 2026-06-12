@@ -155,18 +155,27 @@ export class Statement {
 
 				// Add new listener for schema changes that affect our dependencies
 				this.schemaChangeUnsubscriber = this.db.schemaManager.getChangeNotifier().addListener(event => {
-					// Map event type to dependency type
-					let dependencyType: string;
-					if (event.type === 'view_modified' || event.type === 'materialized_view_modified') {
-						dependencyType = 'view';
+					// Map event type to the dependency type(s) it can affect
+					let dependencyTypes: string[];
+					if (event.type === 'view_modified') {
+						dependencyTypes = ['view'];
+					} else if (event.type === 'materialized_view_added'
+						|| event.type === 'materialized_view_removed'
+						|| event.type === 'materialized_view_modified') {
+						// Unified model: a maintained table IS a table, so plans that read
+						// or write it record 'table' dependencies — an attach/detach/
+						// re-attach must invalidate them (a cached direct-write plan must
+						// not survive an attach, nor a write-through plan a detach).
+						// Legacy 'view' dependencies are still honored.
+						dependencyTypes = ['table', 'view'];
 					} else if (event.type.startsWith('table_')) {
-						dependencyType = 'table';
+						dependencyTypes = ['table'];
 					} else if (event.type.startsWith('function_')) {
-						dependencyType = 'function';
+						dependencyTypes = ['function'];
 					} else if (event.type.startsWith('module_')) {
-						dependencyType = 'vtab_module';
+						dependencyTypes = ['vtab_module'];
 					} else if (event.type.startsWith('collation_')) {
-						dependencyType = 'collation';
+						dependencyTypes = ['collation'];
 					} else {
 						return; // Unknown event type
 					}
@@ -174,7 +183,7 @@ export class Statement {
 					// Check if this change affects any of our dependencies
 					const planDependencies = dependencies.getDependencies();
 					const affectedDependency = planDependencies.find((dep: SchemaDependency) =>
-						dep.type === dependencyType &&
+						dependencyTypes.includes(dep.type) &&
 						dep.objectName === event.objectName &&
 						(!dep.schemaName || dep.schemaName === event.schemaName)
 					);

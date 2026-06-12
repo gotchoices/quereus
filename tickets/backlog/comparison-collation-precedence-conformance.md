@@ -40,3 +40,29 @@ Decide:
 
 Either way, plan-time mirrors and runtime must change (or stay) together —
 they are deliberately drift-coupled.
+
+## Triage direction (2026-06-12, human sign-off)
+
+SQLite conformance is explicitly a non-goal; good semantics is the goal. The
+chosen direction follows the engine's existing philosophy (explicit conversions
+over implicit coercion — see docs/types.md on cross-category comparisons):
+
+- An explicit `COLLATE` anywhere in either operand expression wins
+  (leftmost/outermost on conflict, or consider erroring on conflicting
+  explicit COLLATEs too — settle in plan).
+- Both operands carrying **different explicitly-declared** column collations,
+  with no explicit `COLLATE` → **plan-time error** requiring the user to pick
+  via `collate` (the least-surprising option: silently choosing either side is
+  a coin flip the user cannot see).
+- Exactly one operand carries a declared collation → use it (literals and
+  collation-free expressions adopt the collated side, as today).
+- Neither → BINARY.
+
+`ColumnSchema.collationExplicit` already distinguishes a declared collation
+from a session-default one — a defaulted collation should count as
+"no preference" rather than triggering the conflict error. The plan pass must
+still distinguish a CollateNode-applied collation from a column-declared one
+(both currently flatten into `ScalarType.collationName`), and keep plan-time
+mirrors (`effectivePredicateCollation`) and runtime in lockstep. Erroring is a
+behavior change: sweep test/logic for now-erroring comparisons and add the
+`collate` annotations they need.

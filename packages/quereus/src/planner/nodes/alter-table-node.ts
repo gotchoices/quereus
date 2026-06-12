@@ -108,6 +108,27 @@ export type AlterTableAction =
 			| { kind: 'column'; columnName: string }
 			| { kind: 'constraint'; constraintName: string };
 		keys: string[];
+	}
+	| {
+		/**
+		 * SET MAINTAINED AS <body> — attach a derivation to a plain table, or
+		 * atomically replace the derivation of an already-maintained table. The
+		 * body must derive the table's exact declared shape; the runtime helper
+		 * reconciles the table's current contents against the derived contents by
+		 * keyed diff (derived content wins). See
+		 * `runtime/emit/materialized-view-helpers.ts` attachMaintainedDerivation.
+		 */
+		type: 'setMaintained';
+		select: AST.QueryExpr;
+		insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
+	}
+	| {
+		/**
+		 * DROP MAINTAINED — detach the table's derivation. Catalog-only: the table
+		 * keeps its rows, row-time maintenance stops, and the table becomes an
+		 * ordinary user-writable table.
+		 */
+		type: 'dropMaintained';
 	};
 
 /**
@@ -160,6 +181,10 @@ export class AlterTableNode extends VoidNode {
 				if (target.kind === 'constraint') return `ALTER TABLE ALTER CONSTRAINT ${target.constraintName} DROP TAGS`;
 				return `ALTER TABLE DROP TAGS`;
 			}
+			case 'setMaintained':
+				return `ALTER TABLE SET MAINTAINED`;
+			case 'dropMaintained':
+				return `ALTER TABLE DROP MAINTAINED`;
 		}
 	}
 

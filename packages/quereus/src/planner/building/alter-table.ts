@@ -15,6 +15,7 @@ import { inferType } from '../../types/registry.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
+import { planViewBody } from './create-view.js';
 
 export function buildAlterTableStmt(
   ctx: PlanningContext,
@@ -164,6 +165,48 @@ export function buildAlterTableStmt(
         keys: stmt.action.keys,
       });
     }
+
+    case 'setMaintained': {
+      // SET MAINTAINED AS <body> — attach / re-attach a derivation. Reuse the
+      // CREATE VIEW body gate so a DML body or non-relational body is rejected
+      // here with the same sited diagnostics as CREATE MATERIALIZED VIEW; the
+      // arity check against the table's declared shape also sites here. The
+      // full shape check (names/types/collations/PK) and the reconcile run in
+      // the emitter against the live catalog state.
+      const tableSchema = tableReference.tableSchema;
+      const planned = planViewBody(ctx, tableSchema.name, stmt.action.select);
+      const bodyArity = planned.getAttributes().length;
+      if (bodyArity !== tableSchema.columns.length) {
+        throw new QuereusError(
+          `cannot attach derivation to '${tableSchema.name}': body produces ${bodyArity} columns but the table declares ${tableSchema.columns.length}`,
+          StatusCode.ERROR,
+          undefined,
+          stmt.table.loc?.start.line,
+          stmt.table.loc?.start.column,
+        );
+      }
+      // The module is the table's identity (no `using` clause on attach); it
+      // must be able to host a maintained backing.
+      if (!tableSchema.vtabModule?.getBackingHost) {
+        throw new QuereusError(
+          `cannot attach derivation to '${tableSchema.name}': module '${tableSchema.vtabModuleName}' cannot host a maintained table (it does not implement the backing-host capability)`,
+          StatusCode.UNSUPPORTED,
+          undefined,
+          stmt.table.loc?.start.line,
+          stmt.table.loc?.start.column,
+        );
+      }
+      return new AlterTableNode(ctx.scope, tableReference, {
+        type: 'setMaintained',
+        select: stmt.action.select,
+        insertDefaults: stmt.action.insertDefaults,
+      });
+    }
+
+    case 'dropMaintained':
+      // Maintained-ness is checked in the emitter against the LIVE table (the
+      // build-time schema may be a cached statement's snapshot).
+      return new AlterTableNode(ctx.scope, tableReference, { type: 'dropMaintained' });
 
     default:
       throw new QuereusError(

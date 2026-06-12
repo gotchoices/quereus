@@ -24,10 +24,22 @@ A representation change runs through four phases. Only the first requires app co
 
 ### 1. Expand — publish the new table as a derivation of the old
 
-The upgraded app's deployment declares, in the **basis** schema, a new table for the new representation, *maintained from* the old one — today expressed as a materialized view over the old basis table, with the conversion in the body and the backing placed in the synced store module:
+The upgraded app's deployment declares, in the **basis** schema, a new table for the new representation, *maintained from* the old one — a maintained table over the old basis table, with the conversion in the body and the backing placed in the synced store module. The canonical expression is the declared-shape **table form** ([materialized-views.md § DDL statements](materialized-views.md#ddl-statements)): the new table's layout is authored (the frozen basis), and the body must derive exactly that shape:
 
 ```sql
--- Basis (shared). Contact_v1 is the existing table; handle was BINARY-keyed.
+-- Direct (imperative) form — the canonical table form:
+create table Contact_v2 (
+  handle text collate nocase primary key,
+  email text
+) using store()
+  maintained as select handle collate nocase as handle, email
+                from Contact_v1;
+```
+
+```sql
+-- Declarative form. The differ does not yet recognize the maintained clause on
+-- table items (ticket maintained-table-differ-transitions), so a declared
+-- schema still uses the materialized-view item — semantically the same record:
 declare schema Store {
   table Contact_v1 (handle text primary key, email text) using store();
 
@@ -55,7 +67,7 @@ What each peer sees during the window:
 
 - **An upgraded peer writing through the new logical table** — the lens resolves to the derived table; write-through rewrites the DML to target the *source* (`Contact_v1`); the source write fires row-time maintenance, which re-derives the affected `Contact_v2` rows in the same statement. Both tables change together, atomically, and both sync out.
 - **An old peer writing `Contact_v1` directly** (through its own v1 lens) — only `Contact_v1` changes locally. When the change syncs to any upgraded peer, the inbound application (via `Database.ingestExternalRowChanges` with `maintainMaterializedViews` on) fires the derivation there, and the derived rows sync onward — including back to old peers, which store `Contact_v2` as an opaque, unmapped basis table. Upgraded peers thus act as **derivation proxies** for the whole network.
-- **An old peer that later upgrades** — `Contact_v2` already exists locally with synced data; the deploy attaches the definition to the existing rows rather than re-deriving from scratch (the adopt path — see [Gaps](#current-gaps)), reconciling any lag by diff rather than refill.
+- **An old peer that later upgrades** — `Contact_v2` already exists locally with synced data; the deploy attaches the definition to the existing rows rather than re-deriving from scratch (`alter table Contact_v2 set maintained as …` — verify-by-diff), reconciling any lag by keyed diff rather than refill: identical content writes nothing, divergence resolves derived-wins with only the genuine changes reported.
 
 Convergence holds because the derivation is a **pure, replicable function** of the source rows ([requirements below](#determinism-requirements)): every peer that runs it computes identical bytes, so concurrent derivation writes at different peers carry different HLC stamps but the same values, and column-level LWW settles on one of them harmlessly. Value-identical maintenance writes are suppressed (no entry in the change log), so the derivation does not echo between peers.
 
@@ -68,14 +80,22 @@ The developer's question — "has everyone upgraded?" — decomposes into a stat
 
 ### 3. Flip — make the new table authoritative
 
-When old-schema writers have (or are believed to have) drained, reverse the derivation: redefine `Contact_v1` as maintained *from* `Contact_v2` with the inverse body, and drop the `Contact_v2` derivation. Nothing moves physically — both tables exist with the same rows; only the maintenance direction changes.
+When old-schema writers have (or are believed to have) drained, reverse the derivation: redefine `Contact_v1` as maintained *from* `Contact_v2` with the inverse body, and drop the `Contact_v2` derivation. Nothing moves physically — both tables exist with the same rows; only the maintenance direction changes:
+
+```sql
+alter table Contact_v2 drop maintained;          -- detach: rows intact, now authoritative
+alter table Contact_v1 set maintained as         -- reverse: derive the old from the new
+  select handle collate binary as handle, email from Contact_v2;
+```
+
+(Detach first — attaching `Contact_v1` from `Contact_v2` while `Contact_v2` still derives from `Contact_v1` is rejected as a derivation cycle. The attach reconciles by diff, so when the two tables already agree — the steady state of the window — the flip writes zero rows.)
 
 - The flip is available exactly when the conversion is **invertible over the data** — trivially true for value-preserving changes (collation, transparent type changes), true for lossy changes only where an [authored inverse](#writability-during-the-window) supplies the representative mapping.
 - After the flip, a straggler old peer is still served: its *reads* of `Contact_v1` see correctly derived data, and its inbound *writes* to `Contact_v1` can be applied at upgraded peers by **DML replay through the table name** (`insert or replace` / `delete` via the engine rather than the bulk ingest seam — see [materialized-views.md § DML replay vs. the ingestion seam](materialized-views.md#dml-replay-vs-the-ingestion-seam)), which rides write-through to land in `Contact_v2`. Retirement stops being urgent: the compatibility table can persist indefinitely at the cost of its storage.
 
 ### 4. Contract — retire the old table
 
-Drop the `Contact_v1` derivation and remove it from the basis schema. The engine's part ends there (the same boundary as [lens.md § GC of detached prior basis storage](lens.md#current-limitations)); reclaiming the physical storage is the storage module's / application's / sync layer's job, under a policy:
+Drop the `Contact_v1` derivation (`alter table Contact_v1 drop maintained`, then `drop table` when retired) and remove it from the basis schema. The engine's part ends there (the same boundary as [lens.md § GC of detached prior basis storage](lens.md#current-limitations)); reclaiming the physical storage is the storage module's / application's / sync layer's job, under a policy:
 
 - **Retention horizon.** A CRDT deployment already needs a tombstone-retention horizon ("changes older than T are not guaranteed deliverable"). Retirement inherits it: drop the legacy table no sooner than the horizon after the last directly-mapped write, and a peer offline longer than the horizon was already outside the delivery guarantee for ordinary reasons.
 - **Unknown-table disposition.** Once retired, a straggler's inbound changes reference a table outside the receiver's basis. The receiver detects this structurally (no version check — the table simply isn't there); the sync layer needs a configured disposition (ignore / quarantine / store-and-forward) **plus telemetry**, because the failure mode is otherwise silent write loss the straggler never learns about.
@@ -133,7 +153,7 @@ Not every logical change needs the pattern. A **collation change on a non-key, n
 The pattern above is the design target; these pieces are pending (tracked as tickets):
 
 - **Authored inverses** (`with inverse (col = expr, …)` on result columns) — parser/AST, write-path consumption, lens-prover integration ([view-updateability.md § Authored inverses](view-updateability.md#authored-inverses-with-inverse)).
-- **First-class derivation lifecycle** — stable backing identity, adopt-on-create (attach a derivation to an existing table's data), attach/detach verbs (the flip and the contract phases), and declarative-differ recognition of attach/detach as non-destructive ([materialized-views.md § Current limitations](materialized-views.md#current-limitations)).
+- **Declarative-differ derivation transitions** — the lifecycle verbs themselves are in place (`create table … maintained as`, `alter table … set maintained as` with verify-by-diff reconcile, `alter table … drop maintained` — [materialized-views.md § DDL statements](materialized-views.md#ddl-statements)), so the flip and contract phases are expressible imperatively; what remains is the **declarative differ** recognizing attach/detach/body-change as non-destructive `set/drop maintained` transitions instead of drop+recreate (ticket `maintained-table-differ-transitions`), plus the implicit-`select *` table-form round-trip gap (ticket `mv-table-form-implicit-columns-roundtrip`).
 - **Replicable determinism class** for UDFs + host-declared requirements on the backing-host capability.
 - **Key-coarsening collision telemetry** — the runtime operational complement to the (implemented) static create-time warning (ticket `mv-collation-collision-telemetry`).
 - **Sync-layer policies** — per-table change-logging opt-in for maintenance writes, unknown-table disposition + telemetry, retention-horizon-driven retirement, and mapped-since bookkeeping over `notifyLensDeployment`.

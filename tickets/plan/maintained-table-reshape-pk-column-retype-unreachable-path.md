@@ -1,5 +1,5 @@
 description: `describePhysicalPkChange` treats a PK-column *type* change as an expressible reshape (a retype routed to the post-reconcile batch), but no supported source ALTER can produce one — `alter column … set data type` is rejected outright on a PK column ("Cannot SET DATA TYPE on PRIMARY KEY column"). So the post-reconcile PK-column-retype path is currently dead code, and IF a future feature ever makes a PK-column type change reachable, its interaction with the reconcile (which keys body rows under the OLD PK comparator before the retype runs) is untested and may mis-key new-typed PK values.
-prereq:
+prereq: maintained-table-attach-detach-verbs
 files:
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # describePhysicalPkChange (permits PK-column type change); reshapeBackingInPlace (reconcile keys under current/old comparator, retype runs post-reconcile)
   - packages/quereus/src/runtime/emit/alter-table.ts                 # ~L702 runAlterColumn — rejects SET DATA TYPE on a PRIMARY KEY column
@@ -76,3 +76,13 @@ is no longer silently dead.
 - If supported: a multi-row PK-column retype with sort-order-diverging text→int
   values reshapes correctly (no mis-keyed/duplicate rows, `read(MV) ==
   eval(body)`).
+
+## Triage decision (2026-06-12)
+
+**Reject explicitly** is the chosen option: make `describePhysicalPkChange`
+treat a PK-column *type* change as a PK-definition change (inexpressible → the
+sited "alter and re-attach, or drop and recreate" error), matching the source's
+own refusal to retype a PK column in place. Add the PK-column-type-change case
+to the existing `inexpressible → sited error` suite. The "support it properly"
+branch is only revisited if a future feature makes PK-column retype a real
+source operation.

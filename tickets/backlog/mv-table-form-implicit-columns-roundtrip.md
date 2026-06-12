@@ -1,5 +1,5 @@
 ----
-description: The unified-model `create table … maintained as` persistence form cannot round-trip the implicit-vs-explicit output-column distinction, so an implicit `select *` materialized view whose source shape drifted between sessions arity-errors on reopen instead of reshaping; also the `generateMaintainedTableDDL` fixed-point test still expects the old sugar output.
+description: The unified-model `create table … maintained as` persistence form cannot round-trip the implicit-vs-explicit output-column distinction, so an implicit `select *` materialized view whose source shape drifted between sessions arity-errors on reopen instead of reshaping.
 difficulty: hard
 files:
   - packages/quereus/src/schema/manager.ts                            # maintainedImportFromTableStmt — columns reconstruction from the table form
@@ -8,7 +8,6 @@ files:
   - packages/quereus/src/parser/ast.ts                                # MaintainedClause shape (if a rename list is added)
   - packages/quereus/src/emit/ast-stringify.ts                        # maintainedClauseToString
   - packages/quereus-store/test/mv-rehydrate-adopt.spec.ts            # source-shape-change refill + adopt-ledger MV-over-MV residuals
-  - packages/quereus/test/view-mv-ddl-persistence.spec.ts             # generateMaintainedTableDDL fixed-point expectations (still assert sugar output)
 ----
 
 # Table-form maintained DDL: implicit-vs-explicit columns round-trip
@@ -71,20 +70,11 @@ was authored) so import can restore `derivation.columns` faithfully.
    ```
    (the `select *` upstream `zmv` arity-errors on widening; both entries fail.)
 
-`yarn workspace @quereus/quereus run test`:
-
-3. `view persistence: generateMaintainedTableDDL fixed point` ›
-   "always emits a fully-qualified (schema.name) MV name; explicit-default USING
-   normalizes away" (`view-mv-ddl-persistence.spec.ts:627`)
-
-   ```
-   expect(ddl).to.match(/^create materialized view main\.v /i)   // fails
-   ```
-   The test still asserts the OLD sugar (`create materialized view …`) output;
-   `generateMaintainedTableDDL` now emits `create table … maintained as`. The
-   whole `generateMaintainedTableDDL fixed point` matrix needs its expectations
-   migrated to the table form (re-parse to `createTable` carrying a `maintained`
-   clause, as `mv-rename-propagation.spec.ts` already does).
+(A third item once listed here — the `generateMaintainedTableDDL` fixed-point
+test in `view-mv-ddl-persistence.spec.ts` still asserting the old sugar output —
+was resolved by ticket `maintained-table-attach-detach-verbs`, which migrated
+the whole fixed-point matrix to the table form. Only the two store residuals
+above remain.)
 
 ## Ruled out / done in triage
 
@@ -95,7 +85,11 @@ was authored) so import can restore `derivation.columns` faithfully.
   `maintained` clause through `importMaterializedView` (re-materialize/adopt),
   keeping the `create materialized view` sugar path working. The store's
   `manualImport` test scaffold was updated to classify the table form as an MV.
-- This residual is NOT a regression: it is unfinished work of the in-progress
-  ticket `maintained-table-attach-detach-verbs` (its TODO lists "Import/rehydrate:
-  accept the table-form DDL" and "update view-mv-ddl-persistence expectations").
-  The bodyHash/columns-list concern is explicitly deferred there.
+- Ticket `maintained-table-attach-detach-verbs` has since landed: the lifecycle
+  verbs, the table-form build/exec path (the canonical DDL is now fully
+  re-consumable), and the fixed-point test migration are done. The two store
+  residuals above are exactly what remains — the lossless implicit-vs-explicit
+  column-list encoding this ticket owns. Note the attach verbs record
+  `derivation.columns = the table's declared column names` (matching
+  `maintainedImportFromTableStmt`) so attach → persist → reopen is a bodyHash
+  fixed point; whatever encoding this ticket chooses must preserve that.

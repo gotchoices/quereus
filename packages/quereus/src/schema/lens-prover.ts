@@ -9,7 +9,7 @@ import { addFd, superkeyToFd } from '../planner/util/fd-utils.js';
 import { proveEffectiveKeyUnique } from '../planner/analysis/coverage-prover.js';
 import { resolveBaseSite, type ResolvedBaseSite } from '../planner/analysis/update-lineage.js';
 import { viewComplement } from '../planner/analysis/view-complement.js';
-import { getCheckExtraction, containsNonDeterministicCall, type CheckExtraction } from '../planner/analysis/check-extraction.js';
+import { getTrustedCheckExtraction, containsNonDeterministicCall, type CheckExtraction } from '../planner/analysis/check-extraction.js';
 import { createRuntimeExpressionEvaluator } from '../planner/analysis/const-evaluator.js';
 import { classifyViewBody } from '../planner/mutation/propagate.js';
 import { substituteNewRefs, transformExpr } from '../planner/mutation/scope-transform.js';
@@ -1011,7 +1011,11 @@ function provePutGetByEnumeration(
 	forward: AST.Expression | undefined,
 ): PutGetEnumeration {
 	const li = ctx.logicalColIndex.get(column.toLowerCase());
-	const domain = li !== undefined ? enumerableDomain(getCheckExtraction(ctx.table), li) : undefined;
+	// Trusted accessor: a module declaring `permitsGrandfatheredCheckViolators`
+	// yields no enumerable domain (a logical table carries no module, so this is
+	// a no-op gate here today — but the accessor keeps every prover read of CHECK
+	// facts behind the capability gate).
+	const domain = li !== undefined ? enumerableDomain(getTrustedCheckExtraction(ctx.table), li) : undefined;
 	if (!domain) return { kind: 'indeterminate' };
 
 	const oi = ctx.outputIndex.get(column.toLowerCase());
@@ -1083,7 +1087,12 @@ function proveForwardInjective(
 	const put = authored.puts[0];
 	const bi = basis.columnIndexMap.get(put.baseColumn.toLowerCase());
 	if (bi === undefined || !basis.columns[bi]?.notNull) return false;
-	const basisDomain = enumerableDomain(getCheckExtraction(basis), bi);
+	// Trusted accessor: when the basis module declares
+	// `permitsGrandfatheredCheckViolators`, stored basis rows may violate the
+	// declared CHECK, so its enum domain cannot witness the bijection — the
+	// extraction is empty and the injectivity proof conservatively fails
+	// (matching the gate on `TableReferenceNode.computePhysical`).
+	const basisDomain = enumerableDomain(getTrustedCheckExtraction(basis), bi);
 	if (!basisDomain) return false;
 
 	for (const image of putImages) {

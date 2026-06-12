@@ -432,6 +432,8 @@ db.setSchemaPath(['main', 'extensions', 'plugins']);
 const path = db.getSchemaPath(); // ['main', 'extensions', 'plugins']
 ```
 
+Note the deliberate asymmetry with DDL: unqualified DDL lands objects in the **current schema** (`schemaManager.setCurrentSchema(name)`, API-only), but unqualified read resolution consults only the schema path (default `main`, then `temp`) — never the current schema. An embedder setting a non-`main` current schema should set the schema path to match, or qualify references; see [SQL Reference § Schema Search Path](sql.md) for the user-facing statement of this rule.
+
 See the [Usage Guide](usage.md) for the consumer-facing declarative schema workflow, schema path resolution order, and `PRAGMA schema_path` syntax.
 
 ## Database Options Affecting Schema

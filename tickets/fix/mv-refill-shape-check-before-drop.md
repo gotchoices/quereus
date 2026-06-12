@@ -1,4 +1,5 @@
 description: The MV rehydrate refill path drops a durable store backing before confirming the body can rebuild — an unmaterializable body (arity/shape mismatch) loses the durable rows. Assert the backing shape before the drop so an unrebuildable entry is preserved as a plain table instead.
+prereq: maintained-table-attach-detach-verbs
 files:
   - packages/quereus-store/src/common/store-module.ts          # rehydrateCatalog phase 3 (refill vs adopt path)
   - packages/quereus/src/schema/manager.ts                     # importCatalog / materializeView refill: drop-then-rebuild ordering

@@ -40,3 +40,26 @@ Benefits when present:
 
 Specify migration story for existing per-directory LevelDB layouts (or scope
 the capability to new providers only).
+
+## Folded in: clean-shutdown marker durability (was `mv-adopt-marker-sync-durability`)
+
+The adopt fast path's clean-shutdown marker is single-use (read + delete at
+open), but the consume-side delete and the session's data writes flush
+independently across separate KV stores without `sync: true` — a power loss
+can persist mid-session data writes while losing the marker delete, so the
+next open finds a resurrected marker and adopts across a genuine crash window
+(and it never self-heals: each clean close re-arms it). Process kills are
+safe; only power loss is exposed. The invariant: **the marker-consume delete
+must be durable before any of the session's data writes become durable.**
+
+- Subsumed by the atomic-commit capability when the marker and data share one
+  batch domain (the shared-root design).
+- If this lands as `batchAcross` without co-locating the catalog store, the
+  lesser fix still applies: an opt-in durability flag on the KVStore write
+  surface (`put/delete(key, { sync?: boolean })` or a `flush()` barrier —
+  classic-level supports `{ sync: true }`, IndexedDB is durable at
+  `oncomplete` with `durability: 'strict'`, memory no-ops), used by
+  `consumeCleanShutdownMarker` only. One synced write per open; the
+  close-side marker *write* can stay unsynced (losing it is conservative —
+  next open refills). Update the caveat in docs/materialized-views.md
+  § Cross-module atomicity when closed.

@@ -56,7 +56,7 @@ The corresponding output columns then form the **coarsened backing key K'**, whi
 - **Create-fill / REFRESH are loud.** The backing host's duplicate guard raises the "must be a set" diagnostic when the source rows collide under K' — at create this is the at-deploy rejection the migration pattern specifies, and a `refresh` during a collision window fails the same way (it is a re-fill).
 - **Row-time maintenance merges last-writer-wins.** A colliding source insert/update upserts into the shared backing key, replacing the sibling's image; each sibling edit re-asserts its own image (the deterministic oscillation migration.md describes), until the source rows are merged.
 - **The delete anomaly.** A source delete (or key-changing update) of one colliding sibling deletes the **shared** derived row even while the other sibling source row lives. The surviving sibling's next edit, or a `REFRESH` / full rebuild, re-asserts it — the full-rebuild paths are the correctness backstop.
-- **The key-coarsening warning.** When any K' column's output collation is strictly coarser than the source key column's enforcement collation (`BINARY` is the finest — refinement to it, or an equal collation, derives a genuine unique key and is accepted silently; any other difference is conservatively coarser), the create emits the warning — *"backing key (…) is coarser than the source primary key (…); colliding source rows will last-write-win until they are merged"* — on the structured logger's warn channel, and stamps `TableDerivation.coarsenedKey` (informational; recomputed wherever the shape is re-derived, never serialized). Warn, don't reject: merge-on-coarsen is often exactly what the migration intends. Runtime collision telemetry is the planned operational complement (backlog `mv-collation-collision-telemetry`).
+- **The key-coarsening warning.** When any K' column's output collation is strictly coarser than the source key column's enforcement collation (`BINARY` is the finest — refinement to it, or an equal collation, derives a genuine unique key and is accepted silently; any other difference is conservatively coarser), the create emits the warning — *"backing key (…) is coarser than the source primary key (…); colliding source rows will last-write-win until they are merged"* — on the structured logger's warn channel, and stamps `TableDerivation.coarsenedKey` (informational; recomputed wherever the shape is re-derived, never serialized). Warn, don't reject: merge-on-coarsen is often exactly what the migration intends. Runtime collision telemetry is the planned operational complement (backlog `mv-collation-collision-telemetry`). The stamp itself is programmatic-only today — no SQL/introspection-TVF or deploy-report surface exposes it; if/when the lens deploy-report pipeline grows an advisory surface, the coarsened-key fact is a natural candidate to carry there (it should read the live record, never persist — the stamp stays non-serialized).
 
 A **coarsening** K' is also the backing's *physical* key exactly — the ordering seed (see the physical-vs-logical note above) is suppressed for it. The loud fill and the LWW merge both rest on the backing btree equating colliding source keys; leading the physical key with the body's `order by` columns would widen uniqueness past K', letting colliding siblings coexist silently. The only cost is the clustering optimization; a non-coarsening lineage key is a true key and keeps the seed.
 
@@ -117,13 +117,53 @@ A body that cannot *plan* during a trusted import does not drop the backing (it 
 
 One known trust caveat:
 
-- **Marker durability under power loss.** The consume-side delete and the session's data writes land in separate KV stores with independent (unsynced) flushing; a power loss that persists data writes but loses the marker delete resurrects the marker, and the next open adopts across a genuine crash window. A process kill is safe (OS-buffered writes survive). Tracked as `mv-adopt-marker-sync-durability`.
+- **Marker durability under power loss.** The consume-side delete and the session's data writes land in separate KV stores with independent (unsynced) flushing; a power loss that persists data writes but loses the marker delete resurrects the marker, and the next open adopts across a genuine crash window. A process kill is safe (OS-buffered writes survive). Closing this requires either a per-provider durability flag on the marker-consume delete (one synced write per open) or — the subsuming fix — an atomic multi-store commit domain; tracked under backlog `store-atomic-multi-store-commit`.
 
 ## DDL statements
 
-Three statements manage materialized views. `MATERIALIZED` and `REFRESH` are contextual keywords — no new reserved words are introduced.
+A maintained table has two equivalent authoring surfaces — the declared-shape **table form** and the `create materialized view` **sugar** — plus the lifecycle verbs that attach and detach a derivation on an existing table (the [migration pattern's](migration.md) flip and contract phases stand on these). `MAINTAINED`, `MATERIALIZED`, and `REFRESH` are contextual keywords — no new reserved words are introduced.
 
-### `CREATE MATERIALIZED VIEW`
+### `CREATE TABLE … MAINTAINED AS` (declared-shape form)
+
+```sql
+create table X (
+  handle text collate nocase primary key,
+  email text
+) [using <module>(...)]
+  maintained as <body>
+  [insert defaults (col = expr, ...)]
+  [with tags (...)];
+```
+
+The declared column/PK layout is the **frozen basis** and the body must derive exactly that shape — column names (alias body outputs to match), logical types, nullability (exact, both directions), collations, and the physical primary key (column order, direction, per-component collation; note a body `order by` seeds the derived key) — or the create errors **before any catalog registration**, naming the first mismatching component. `if not exists` with an existing table skips entirely — never a half-attach. Clause order is fixed: `(columns) → using → maintained as … → insert defaults → with tags`. On success the create runs attach-to-empty through the same verify-by-diff core as [`SET MAINTAINED`](#alter-table--set-maintained-as-attach--re-attach) below (a diff against an empty table is the fill, applied to the connection's pending transaction state, so it commits in lockstep with the statement). Any later failure — duplicate derived keys, a maintenance gate — rolls the whole record back; the create is all-or-nothing.
+
+**Canonical DDL.** The table form is the one canonical persistence/export rendering for **every** maintained table regardless of authoring surface (`generateMaintainedTableDDL`): catalog persistence, `schema()` output, and schema export all emit `create table … maintained as`, and the import path consumes it (an MV-sugar entry still imports, normalizing identically). A sugar MV's explicit column list (renames) becomes the table's declared column names; the body keeps its original output names, and import recovers the rename list from the declared columns.
+
+### `ALTER TABLE … SET MAINTAINED AS` (attach / re-attach)
+
+```sql
+alter table X set maintained as <body> [insert defaults (col = expr, ...)];
+```
+
+Attaches a derivation to a plain table — or atomically replaces an already-maintained table's derivation (the body-change primitive). There is deliberately **no** `using` clause: the module is the table's identity and never changes via attach. Attach **verifies by diff** — it never trusts existing rows blindly and never refills wholesale:
+
+1. the body plans (rewrite-suppressed) and the create-time gates run — determinism, keyed-or-coarsened body, relational output, full-rebuild size threshold — identical to create;
+2. the derived shape must match the table's declared shape exactly (names included, like the declared-shape create), else a sited error with no catalog or data mutation;
+3. a body that would close a **derivation cycle** — `alter table A set maintained as select … from B` where B's derivation transitively reads A, including the degenerate self-reference — is rejected with the cycle path in the diagnostic (the maintenance cascade's depth guard stays as defense-in-depth);
+4. the body is evaluated once, and duplicate derived keys (a [coarsened-key](#coarsened-backing-keys) collision present in the source) reject loudly naming the key, with table and catalog untouched;
+5. the table's current effective contents are reconciled against the derived contents by **keyed diff** — the same collation-aware pairing and byte-faithful identical-row skip as the full-rebuild floor's `'replace-all'` op: identical derivable content ⇒ **zero row writes and zero reported changes**; divergence ⇒ **derived content wins** (changed rows upsert, extra rows delete), reporting only the genuine per-row changes — which cascade to consumer maintained tables exactly like source writes. The writes land in the connection's pending transaction state, committing/rolling back in lockstep with the statement.
+
+On success the derivation is stamped, row-time maintenance registers, covering links re-prove, and `materialized_view_added` (fresh attach) / `materialized_view_modified` (re-attach) fires so store catalogs persist the canonical form; the key-coarsening warning fires exactly as on create. Blind trust remains the *rehydrate* fast path's domain, where clean-shutdown attestation gates it — the verb has no such attestation, attach is a rare lifecycle event, and one body evaluation deterministically heals any lag while staying non-destructive to row identity (the property a future sync change-log opt-in depends on).
+
+### `ALTER TABLE … DROP MAINTAINED` (detach)
+
+```sql
+alter table X drop maintained;
+```
+
+Removes the derivation — catalog-only, nothing physical changes: the table keeps its rows (and name, module, indexes, tags), row-time maintenance stops, staleness state leaves with the derivation (detaching a *stale* maintained table is allowed), covering-structure links un-stamp (UNIQUE enforcement falls back to the auto-index), and the table becomes ordinary and user-writable. One `materialized_view_removed` fires — store catalogs delete the persisted maintained entry (a store-hosted table's plain bundle is already clause-free) and cached statement plans over the table invalidate (a cached write-through plan must not survive the flip). Deliberately **no** `table_modified`: the table's shape and rows are unchanged, so consumer maintained tables reading X stay live — subsequent user writes to X drive their maintenance exactly like any source writes.
+
+### `CREATE MATERIALIZED VIEW` (sugar)
 
 ```sql
 create materialized view mv [if not exists] [(col, ...)]
@@ -132,11 +172,14 @@ create materialized view mv [if not exists] [(col, ...)]
   [with tags (...)];
 ```
 
+Normalization sugar for the table form: the declared shape is *derived* from the body instead of authored (the explicit column list supplies renames). Semantically identical to a `create table … maintained as` whose declared columns are the derived shape.
+
 - `<body>` is any relation-producing `QueryExpr` with a provable unique key (see [Maintenance strategy](#maintenance-strategy)). An explicit column list renames the body's output columns (arity must match).
 - `using <module>(...)` places the maintained table in the named [backing-host](#backing-host-capability) module; omitted ⇒ the in-memory default (`mem` is an alias for `memory`). An unknown module or one without the capability is rejected at build time. An explicit `using memory()` with no args normalizes to the same schema record as an omitted clause.
 - There is **no** `with refresh = '...'` clause. Every materialized view is row-time maintained.
 - A body that references the view's **own name** is rejected at create and at catalog import ("body may not reference the view itself") — lexically expressible, since the table registers under the view's name before the fill, but with no defined semantics.
 - The body is evaluated immediately and the result stored. On any failure during the fill — or if the body is rejected (see [Maintenance strategy](#maintenance-strategy)) — the table is rolled back (from the named module) and the MV is **not** registered; a create is all-or-nothing.
+- `refresh materialized view` and `drop materialized view` work on **any** maintained table, however it was authored.
 
 ### `REFRESH MATERIALIZED VIEW`
 
@@ -304,6 +347,8 @@ Per-column writeability is inherited verbatim from [view updateability](view-upd
 - a **deterministic-expression** column (e.g. `x + 1 as y`) is **read-only** — a write to it raises the `no-inverse` diagnostic; reads are unaffected and the column is re-derived by maintenance on a passthrough write;
 - an omitted column pinned by an equality selection predicate (`… where color = 'green'`) is defaulted on the base via the constant-FD path; an insert that provably contradicts the predicate is rejected (`predicate-contradiction`); an update carrying a row out of the predicate scope succeeds in `T` and the maintenance update arm removes it from the MV.
 
+This per-column reality is **introspectable**: `column_info('mv')` derives each column's `is_updatable` / `base_table` / `base_column` from the **derivation body** through the same lineage classification the write-through rewrite applies (passthrough/rename → updatable, tracing to its source base column; invertible expression → updatable through the inverse; non-invertible expression → read-only with null trace) — not as plain writable base columns. `view_info` deliberately excludes maintained tables (they list as tables in `schema()`; its per-view surface stays plain-view-only). See [view updateability § Information Schema Surface](view-updateability.md).
+
 Two cases are **rejected** (also inherited):
 
 - **RETURNING through an MV** raises the `returning-through-view` diagnostic (RETURNING through views is not surfaced for the MV path yet).
@@ -323,9 +368,9 @@ The per-row backing delta is a **pure projection of the changed row** — no bod
 |---|---|
 | insert `r` | if `predicate(r)` → upsert `project(r)` |
 | delete `r` | if `predicate(r)` (was in scope) → delete the backing key of `project(r)` |
-| update `old→new` | both images in scope and **value-identical** → nothing (the equal-image short-circuit); else delete old image if in scope, upsert new image if in scope |
+| update `old→new` | both images in scope and **value-identical** → nothing (the equal-image short-circuit); both in scope with the **same backing key** (collation-aware) → upsert new image only (the host reports one `update`); else delete old image if in scope, upsert new image if in scope |
 
-The update arm covers predicate-scope transitions and key-changing updates. The equal-image short-circuit suppresses the dominant no-op echo — a source update touching only unprojected columns, or rewriting a projected column to its existing value — before any backing-connection work (see [no-op suppression](#value-identical-no-op-write-suppression)); the scope check reads the *source* row (the predicate may reference unprojected columns), so it only fires when both images are in scope. This bounded O(log n) per-row cost (a btree delete + insert) — identical to the secondary-index maintenance a UNIQUE auto-index already performs — is why row-time is affordable for this shape and not for general bodies.
+The update arm covers predicate-scope transitions and key-changing updates. The equal-image short-circuit suppresses the dominant no-op echo — a source update touching only unprojected columns, or rewriting a projected column to its existing value — before any backing-connection work (see [no-op suppression](#value-identical-no-op-write-suppression)); the scope check reads the *source* row (the predicate may reference unprojected columns), so it only fires when both images are in scope. A real same-key payload change emits the upsert alone — key identity is the backing PK comparator (a collation-equal / byte-different key is the *same* identity, and the upsert re-keys the stored bytes), so the host reports a single `update`, matching the residual arms: one cascade dispatch, one change-log entry, no secondary-index churn at an unchanged key. Only a key-changing or scope-transitioning update is genuinely two-sided (delete + upsert). This bounded O(log n) per-row cost — identical to the secondary-index maintenance a UNIQUE auto-index already performs — is why row-time is affordable for this shape and not for general bodies.
 
 ### `'residual-recompute'` (single-source aggregate shape)
 
@@ -517,7 +562,7 @@ The emit fires per qualifying source change rather than only on the `stale` fals
 
 `ALTER TABLE … RENAME TO` / `RENAME COLUMN` is the one source schema change that does **not** leave a dependent MV stale: the rename propagation (`propagate{Table,Column}RenameToMaterializedViews` in `runtime/emit/materialized-view-helpers.ts`, driven from the ALTER emitter alongside the plain-view loop) rewrites the MV's body **in place**, exactly as it rewrites a plain view's:
 
-- The body `selectAst` is mutated by the same `renameTableInAst` / `renameColumnInAst` walkers, and the `insert defaults` clause rides along (`renameTableInInsertDefaults` / `renameColumnInInsertDefaults` — the clause's target names a base column the body often projects away, so a clause-only change still processes the MV; see [view-updateability.md § View insert defaults](view-updateability.md#view-insert-defaults)); derived fields are recomputed on a shallow catalog clone — `sourceTables` re-keyed `schema.old` → `schema.new` (table rename only) and `bodyHash` over the post-rewrite definition including the clause (so the declarative differ sees no phantom "body changed"); the canonical DDL is not a stored field — it renders on demand via `generateMaterializedViewDDL`, so the `materialized_view_modified` event is what re-persists the rewritten form. A table rename also processes an MV whose `sourceTables` carries the old base even when its own AST never names the table (a body reading the renamed table *through a plain view*), so its row-time plan is re-keyed too.
+- The body `selectAst` is mutated by the same `renameTableInAst` / `renameColumnInAst` walkers, and the `insert defaults` clause rides along (`renameTableInInsertDefaults` / `renameColumnInInsertDefaults` — the clause's target names a base column the body often projects away, so a clause-only change still processes the MV; see [view-updateability.md § View insert defaults](view-updateability.md#view-insert-defaults)); derived fields are recomputed on a shallow catalog clone — `sourceTables` re-keyed `schema.old` → `schema.new` (table rename only) and `bodyHash` over the post-rewrite definition including the clause (so the declarative differ sees no phantom "body changed"); the canonical DDL is not a stored field — it renders on demand via `generateMaintainedTableDDL`, so the `materialized_view_modified` event is what re-persists the rewritten form. A table rename also processes an MV whose `sourceTables` carries the old base even when its own AST never names the table (a body reading the renamed table *through a plain view*), so its row-time plan is re-keyed too.
 - **Column rename only — materialized-column rename.** A bare passthrough projection of the renamed column shifts the MV's exposed output name (plain-view parity: `select id, v from t` exposes `w` after `rename column v to w`). The backing shape is re-derived from the rewritten body and any positionally name-shifted column of the maintained table is renamed in place (data-preserving, via the module's `renameColumn`); explicit-column MVs (`mv(a, b)`) and expression-aliased outputs are unaffected, and a clause-only change skips this pass entirely (it cannot shift the body's output names). The maintained table's `table_modified` event deliberately cascades: a chained MV whose body references the **old** output name is marked stale and surfaces the staleness diagnostic on its next read (parity with a broken plain-view chain — not a silently frozen snapshot). Transitive output-name rewriting through view/MV chains is deliberately not attempted (plain views don't either).
 - Row-time maintenance is **re-registered** against the renamed catalog (re-keying the source-base index, recomputing `sourceScope`), and `materialized_view_modified` fires — store-backed catalogs re-persist the rewritten DDL; cached write-through plans holding a `view` dependency invalidate.
 - **Staleness discipline.** `stale` means the backing may already be *behind* (writes during staleness are not maintained), so the rename never clears a flag that predates the statement: a previously-stale MV gets its body/hash/sources rewritten (so a later `REFRESH` resolves the new name — before this it could not) but is **not** re-registered and stays stale. Staleness set by the rename statement's own change events (the column-rename notify marks every dependent MV stale) *is* restored after a successful rewrite — no DML can interleave within the statement, so the backing cannot be behind. The pre-statement flags are snapshotted in the ALTER emitter before its first notify.
@@ -526,11 +571,12 @@ The emit fires per qualifying source change rather than only on the `stale` fals
 
 ### ALTER TABLE on the maintained table itself
 
-Because a materialized view *is* a table, `ALTER TABLE` accepts its name — but only for the one action that does not fight the derivation:
+Because a materialized view *is* a table, `ALTER TABLE` accepts its name — but only for the actions that do not fight the derivation:
 
 - **`RENAME TO`** is an ordinary table rename plus a maintenance re-key: the row-time plan is re-registered under the new name, and the persisted MV catalog entry moves with it (`materialized_view_removed` for the old name, `materialized_view_added` for the new).
-- **Tag actions** (`SET`/`ADD`/`DROP TAGS`) are rejected with a steer to `ALTER MATERIALIZED VIEW … TAGS`: the TABLE verb fires `table_modified` rather than `materialized_view_modified`, so a tag edit through it would never reach the persisted `create materialized view` catalog entry.
-- Every other **structural** action (add/drop/alter column, constraint changes, …) is rejected: *"cannot ALTER: it is a materialized view — its shape is defined by the view body (drop and recreate to change it)"*.
+- **`SET MAINTAINED AS`** atomically replaces the derivation (re-attach — see [the verb](#alter-table--set-maintained-as-attach--re-attach)), and **`DROP MAINTAINED`** detaches it.
+- **Tag actions** (`SET`/`ADD`/`DROP TAGS`) are rejected with a steer to `ALTER MATERIALIZED VIEW … TAGS`: the TABLE verb fires `table_modified` rather than `materialized_view_modified`, so a tag edit through it would never reach the persisted maintained-table catalog entry.
+- Every other **structural** action (add/drop/alter column, constraint changes, …) is rejected: *"cannot ALTER: it is a materialized view — its shape is defined by the view body (drop and recreate to change it)"*. To reshape deliberately: detach, alter the plain table, re-attach a body deriving the new shape.
 
 ## Change-scope projection
 
@@ -621,7 +667,7 @@ The following extensions build on this substrate but are not yet realized:
 - **Concurrent refresh** — overlapping refreshes and refresh-while-read beyond the current atomic base-layer swap.
 - **MV-over-MV write-through** — DML against an MV whose source is *itself* an MV (routing one level down to the inner MV's own write-through) is rejected today.
 - **Non-binary covering MV prefix scan** — thread per-column collation into `ScanPlan.equalityPrefix` matching (`plan-filter.ts` / `scan-layer.ts`) so non-binary covering MVs also use the prefix scan instead of the full-scan fallback.
-- **Derivation lifecycle verbs.** The unified record — one stably-named, sync-addressable table whose *derivation* is an attachment rather than its identity — is in place; what a migration target ([Migration](migration.md)) still needs is the lifecycle around it: **attach/detach verbs** (detach = drop the derivation and keep the table as a plain base table, nothing physical changes; attach = demote an existing base table to maintained), **adopt-on-create** (attach a derivation to an existing table's rows, reconciling by diff instead of refill — the engine-level analogue of the rehydrate adopt fast path), **identity-preserving reshape** (refresh's shape reshape now reconciles the live table *in place* — see [REFRESH](#refresh-materialized-view); the declarative differ's body-change path remains an incarnation-destroying drop+recreate), and declarative-differ recognition of attach/detach as non-destructive transitions rather than drop+create.
+- **Declarative-differ derivation transitions.** The lifecycle verbs are in place — [attach/detach](#alter-table--set-maintained-as-attach--re-attach) with verify-by-diff reconcile (adopt-by-diff: attach to an existing table's rows reconciles instead of refilling), the declared-shape [table form](#create-table--maintained-as-declared-shape-form), and refresh's [identity-preserving reshape](#refresh-materialized-view) — but the **declarative differ** does not yet recognize them: a declared body change still schedules an incarnation-destroying drop+recreate rather than a `set maintained` re-attach, and a maintained↔plain transition is not yet expressed as attach/detach (ticket `maintained-table-differ-transitions`). The table form also cannot yet round-trip the implicit-vs-explicit output-column distinction — an implicit `select *` body whose source shape drifted between sessions arity-errors on reopen instead of reshaping (ticket `mv-table-form-implicit-columns-roundtrip`).
 - **Replicable determinism class.** The create-time determinism gate means "pure within this database"; a derivation whose backing is replicated across peers must additionally be bit-identical across platforms and app versions. Built-ins qualify by construction (Quereus implements its own collation/case-folding); a UDF needs an explicit *replicable* declaration, and a backing host that replicates its tables declares the requirement through the backing-host capability so the engine validates it at create — keeping "synced" out of the core engine's vocabulary. See [Migration § Determinism requirements](migration.md#determinism-requirements).
 - **Precise change-scope projection** — a per-source row/group `Database.watch` scope mirroring the maintenance projection, rather than the current `full`-per-source union.
 - **Lens / layered schemas** — indexes and set-level constraint enforcement expressed as covering materialized views in the basis layer. See [Lenses and Layered Schemas](lens.md).

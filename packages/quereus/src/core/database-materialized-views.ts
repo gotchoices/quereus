@@ -820,10 +820,12 @@ export class MaterializedViewManager {
 		} else if (change.op === 'delete') {
 			if (inScope(change.oldRow)) ops.push({ kind: 'delete-key', key: keyOf(project(change.oldRow)) });
 		} else {
-			// UPDATE: delete the old image if it was in scope, upsert the new image if
-			// it is — covers predicate-scope transitions and key-changing updates. The
-			// scope check reads the SOURCE row (the predicate may reference unprojected
-			// columns), so both images must be in scope for the equal-image short-circuit.
+			// UPDATE: a both-in-scope, same-backing-key change is one upsert (the host
+			// reports a single `update`); otherwise delete the old image if it was in
+			// scope and upsert the new image if it is — predicate-scope transitions and
+			// key-changing updates are genuinely two-sided. The scope check reads the
+			// SOURCE row (the predicate may reference unprojected columns), so both
+			// images must be in scope for the equal-image short-circuit.
 			const oldIn = inScope(change.oldRow);
 			const newIn = inScope(change.newRow);
 			if (oldIn && newIn) {
@@ -833,8 +835,18 @@ export class MaterializedViewManager {
 				// collation-equal / byte-different image is NOT suppressed (it must re-key
 				// the stored bytes) — the same discipline as the host-level upsert skip.
 				if (rowsValueIdentical(oldImage, newImage)) return [];
-				ops.push({ kind: 'delete-key', key: keyOf(oldImage) });
-				ops.push({ kind: 'upsert', row: newImage });
+				if (this.backingPkEqual(plan.backingPkDefinition, oldImage, newImage)) {
+					// Same backing key (collation-aware — a collation-equal / byte-different
+					// key is the SAME btree identity, and the upsert re-keys the stored
+					// bytes): one upsert replaces the row wholesale, so the host reports
+					// a single `update` — matching the residual arms' post-suppression
+					// shape (one cascade dispatch, one change-log entry, no secondary-index
+					// churn from a delete+insert at an unchanged key).
+					ops.push({ kind: 'upsert', row: newImage });
+				} else {
+					ops.push({ kind: 'delete-key', key: keyOf(oldImage) });
+					ops.push({ kind: 'upsert', row: newImage });
+				}
 			} else {
 				if (oldIn) ops.push({ kind: 'delete-key', key: keyOf(project(change.oldRow)) });
 				if (newIn) ops.push({ kind: 'upsert', row: project(change.newRow) });

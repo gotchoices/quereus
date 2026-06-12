@@ -12,19 +12,7 @@ import { inferLogicalTypeFromValue } from '../common/type-inference.js';
  * This is used by PlanNodes that source data directly from a base table.
  */
 export function relationTypeFromTableSchema(tableSchema: TableSchema): RelationType {
-  const columnDefs: ColumnDef[] = tableSchema.columns.map((col: ColumnSchema) => {
-    return {
-      name: col.name,
-      type: {
-				typeClass: 'scalar',
-				logicalType: col.logicalType,
-				collationName: col.collation,
-				nullable: !col.notNull,
-				isReadOnly: false,
-			},
-      generated: col.generated,
-    };
-  });
+  const columnDefs: ColumnDef[] = tableSchema.columns.map((col: ColumnSchema) => columnSchemaToDef(col.name, col));
 
   // Populate keys from primaryKeyDefinition and unique constraints
   const keys: ColRef[][] = [];
@@ -135,16 +123,33 @@ export function checkRelationsAssignable(source: RelationType, target: RelationT
 	return checkColumnsAssignable(source.columns, target.columns, astNode);
 }
 
+/**
+ * Builds a ScalarType from a ColumnSchema, always threading the column's
+ * declared collation so expressions compiled over a table's row image
+ * (CHECK scopes, defaults, RETURNING, mutation OLD/NEW attributes, view
+ * write decomposition) resolve collations identically to a read-path query.
+ *
+ * `overrides.nullable` defaults to `!col.notNull`; pass `true` for row images
+ * where every column may be NULL (e.g. OLD on INSERT, NEW on DELETE).
+ * `overrides.isReadOnly` defaults to `false`.
+ */
+export function columnSchemaToScalarType(
+	col: ColumnSchema,
+	overrides?: { nullable?: boolean; isReadOnly?: boolean },
+): ScalarType {
+	return {
+		typeClass: 'scalar',
+		logicalType: col.logicalType,
+		collationName: col.collation,
+		nullable: overrides?.nullable ?? !col.notNull,
+		isReadOnly: overrides?.isReadOnly ?? false,
+	};
+}
+
 export function columnSchemaToDef(colName: string, colDef: ColumnSchema): ColumnDef {
 	return {
 		name: colName,
-		type: {
-			typeClass: 'scalar',
-			logicalType: colDef.logicalType,
-			collationName: colDef.collation,
-			nullable: !colDef.notNull,
-			isReadOnly: false,
-		},
+		type: columnSchemaToScalarType(colDef),
 		generated: colDef.generated,
 	};
 }

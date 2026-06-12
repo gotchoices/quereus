@@ -13,6 +13,7 @@
 import type { ConstantBinding, DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate } from '../nodes/plan-node.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
+import type { ModuleCapabilities } from '../../vtab/capabilities.js';
 import type * as AST from '../../parser/ast.js';
 import type { SqlValue } from '../../common/types.js';
 import { columnIndexFromExpr, literalValue, collectColumnNames, flattenDisjunction, flipComparison, walkAstNodes } from './predicate-shape.js';
@@ -56,6 +57,44 @@ export function getCheckExtraction(tableSchema: TableSchema): CheckExtraction {
 	return cached;
 }
 
+/** Shared empty {@link CheckExtraction} returned when the capability gate in
+ *  {@link getTrustedCheckExtraction} suppresses the CHECK contribution lift. */
+export const EMPTY_CHECK_EXTRACTION: CheckExtraction = {
+	fds: [],
+	equivPairs: [],
+	constantBindings: [],
+	domainConstraints: [],
+};
+
+/** The slice of a vtab module the capability gate consults (structural, so this
+ *  analysis module needn't depend on `vtab/module.ts`). */
+interface CapabilityProvider {
+	getCapabilities?(): ModuleCapabilities;
+}
+
+/**
+ * Capability-gated accessor over {@link getCheckExtraction}: returns
+ * {@link EMPTY_CHECK_EXTRACTION} when the table's owning vtab module declares
+ * `permitsGrandfatheredCheckViolators` (see `vtab/capabilities.ts`). Under that
+ * contract `ALTER TABLE … ADD CHECK` against non-conforming rows succeeds and
+ * grandfathers the violators, so a declared CHECK is not a universal invariant
+ * over the current row set — any consumer that treats the extraction as a
+ * row-set fact (physical-property lift, lens-prover domain enumeration) must
+ * go through this accessor rather than `getCheckExtraction` directly.
+ *
+ * `vtabModule` defaults to the schema's own module reference. Logical tables
+ * (lens-slot specs) carry no module and are never gated. Pass the module
+ * explicitly at sites that resolve it independently of the schema (e.g.
+ * `TableReferenceNode`, which is constructed with its module).
+ */
+export function getTrustedCheckExtraction(
+	tableSchema: TableSchema,
+	vtabModule: CapabilityProvider | undefined = tableSchema.vtabModule,
+): CheckExtraction {
+	const permitsViolators = vtabModule?.getCapabilities?.().permitsGrandfatheredCheckViolators === true;
+	return permitsViolators ? EMPTY_CHECK_EXTRACTION : getCheckExtraction(tableSchema);
+}
+
 /**
  * `columns` carries each column's declared collation + logical type (indexed
  * by column position; `ColumnSchema` is assignable) for the value-discrimination
@@ -88,7 +127,8 @@ export function extractCheckConstraints(
 /**
  * Row-invariant gate: a CHECK only contributes value facts when every stored
  * row image is guaranteed to satisfy it — i.e. it is enforced on every path a
- * row can enter the table. Three legs, all required:
+ * row can enter the table. Two check-level legs, both required (they describe
+ * when the whole check runs):
  *
  * 1. The operation mask covers both INSERT and UPDATE. Enforcement filters by
  *    `shouldCheckConstraint(constraint, operation)` (constraint-builder.ts),
@@ -104,19 +144,25 @@ export function extractCheckConstraints(
  *    CHECK constraints); this leg is defensive against hand-built or future
  *    schemas.
  *
- * 3. No `old.<col>` row-image reference. `old.a = b` is a transition
- *    constraint over the previous row image, not a predicate on stored rows —
- *    and OLD is registered nullable / NULL on the INSERT path, so even a
- *    default-mask `check (old.a = b)` admits rows violating the same-row
- *    reading. `new.<col>` stays allowed: NEW is the stored row image, so
- *    NEW-qualified references are same-row (see `columnIndexFromExpr`, whose
- *    bare-name resolution deliberately tolerates the qualifier).
+ * The third leg — no `old.<col>` row-image reference — is screened
+ * per-AND-conjunct inside {@link walkConjunction} rather than here:
+ * `old.a = b` is a transition constraint over the previous row image, not a
+ * predicate on stored rows — and OLD is registered nullable / NULL on the
+ * INSERT path, so even a default-mask `check (old.a = b)` admits rows
+ * violating the same-row reading. But under SQL ternary logic `C1 AND C2` is
+ * FALSE whenever C2 is FALSE regardless of C1, so each `old.`-free conjunct
+ * independently holds over stored rows and may extract normally even when a
+ * sibling conjunct references OLD. The per-conjunct argument does NOT extend
+ * through OR — an `old.` ref anywhere inside a non-AND conjunct (e.g. one
+ * disjunct of an implication form) kills that whole conjunct.
+ * `new.<col>` stays allowed: NEW is the stored row image, so NEW-qualified
+ * references are same-row (see `columnIndexFromExpr`, whose bare-name
+ * resolution deliberately tolerates the qualifier).
  */
 function isRowInvariantCheck(check: RowConstraintSchema): boolean {
 	const requiredOps = RowOpFlag.INSERT | RowOpFlag.UPDATE;
 	if ((check.operations & requiredOps) !== requiredOps) return false;
-	if (check.deferrable || check.initiallyDeferred) return false;
-	return !containsOldRowImageRef(check.expr);
+	return !(check.deferrable || check.initiallyDeferred);
 }
 
 /**
@@ -124,8 +170,10 @@ function isRowInvariantCheck(check: RowConstraintSchema): boolean {
  * the `old` row-image marker (`old.a` parses as
  * `ColumnExpr { name: 'a', table: 'old' }`). `walkAstNodes` discovers children
  * reflectively, so guard disjuncts, compound operands, between bounds, and
- * in-lists are all covered. Conservative edge: a table literally named `old`
- * using self-qualified `old.col` refs also matches — sound, since the
+ * in-lists are all covered — so an `old.` ref inside any non-AND structure
+ * (OR disjunct, BETWEEN bound, IN list, compound operand) screens out the
+ * entire conjunct it appears in. Conservative edge: a table literally named
+ * `old` using self-qualified `old.col` refs also matches — sound, since the
  * enforcement scope keys `old.<col>` to the OLD image there too.
  */
 function containsOldRowImageRef(expr: AST.Expression): boolean {
@@ -154,6 +202,10 @@ function walkConjunction(
 			stack.push(b.left, b.right);
 			continue;
 		}
+		// Per-conjunct `old.`-screen: a conjunct referencing the OLD row image is
+		// a transition constraint, not a stored-row invariant — skip it while
+		// letting sibling conjuncts extract (see isRowInvariantCheck doc).
+		if (containsOldRowImageRef(cur)) continue;
 		recognize(cur, columnIndexMap, columns, fds, equivPairs, constantBindings, domainConstraints);
 	}
 }

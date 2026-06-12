@@ -268,12 +268,16 @@ describe('extractCheckConstraints (unit)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Row-invariant gate — ticket check-extraction-rowop-mask-transition-checks.
+// Row-invariant gate — ticket check-extraction-rowop-mask-transition-checks,
+// refined per-conjunct by ticket check-extraction-per-conjunct-old-screen.
 // A CHECK contributes facts only when its operation mask covers INSERT and
 // UPDATE (enforcement filters by `shouldCheckConstraint`, so other masks
-// leave entry paths unenforced), it is not deferred, and it contains no
-// `old.` row-image reference (OLD is NULL on the INSERT path, so old.-form
-// checks are transition constraints, not row invariants).
+// leave entry paths unenforced) and it is not deferred. `old.` row-image
+// references (OLD is NULL on the INSERT path, so old.-form predicates are
+// transition constraints, not row invariants) are screened per AND-conjunct:
+// the conjunct containing the ref is skipped, sibling conjuncts extract
+// normally; an `old.` ref inside a non-AND shape (e.g. an OR disjunct) still
+// kills that entire conjunct.
 // ---------------------------------------------------------------------------
 
 describe('extractCheckConstraints row-invariant gate', () => {
@@ -364,6 +368,41 @@ describe('extractCheckConstraints row-invariant gate', () => {
 			checkWith(bin('=', col('x'), col('y')), { operations: RowOpFlag.INSERT }),
 			check(bin('>=', col('qty'), lit(0))),
 		], colMap, allDeterministic, colMeta);
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		expect(result.domainConstraints).to.have.length(1);
+		expect(result.domainConstraints[0].column).to.equal(6);
+	});
+
+	it("mixed check ((old.a is null or a = old.a) and status in ('a','i')) contributes exactly the status enum", () => {
+		const isNull = (e: AST.Expression): AST.UnaryExpr => ({ type: 'unary', operator: 'IS NULL', expr: e });
+		const result = extractCheckConstraints(
+			[check(and(
+				or(isNull(qcol('old', 'a')), bin('=', col('a'), qcol('old', 'a'))),
+				inExpr(col('status'), [lit('a'), lit('i')]),
+			))],
+			colMap, allDeterministic, colMeta);
+		// Nothing from the old-conjunct...
+		expect(result.fds).to.have.length(0);
+		expect(result.equivPairs).to.have.length(0);
+		expect(result.constantBindings).to.have.length(0);
+		// ...but the invariant sibling conjunct contributes its enum domain.
+		expect(result.domainConstraints).to.deep.equal([
+			{ kind: 'enum', column: 5, values: ['a', 'i'] },
+		]);
+	});
+
+	it('old. inside an OR disjunct kills that whole conjunct, not just the disjunct', () => {
+		// Implication-form OR with an old.-ref guard: the per-conjunct argument
+		// does not extend through OR, so the entire OR conjunct is skipped —
+		// while the AND-sibling range conjunct still extracts.
+		const result = extractCheckConstraints(
+			[check(and(
+				or(bin('<>', qcol('old', 'status'), lit('x')), bin('=', col('a'), col('b'))),
+				bin('>=', col('qty'), lit(0)),
+			))],
+			colMap, allDeterministic, colMeta);
 		expect(result.fds).to.have.length(0);
 		expect(result.equivPairs).to.have.length(0);
 		expect(result.constantBindings).to.have.length(0);

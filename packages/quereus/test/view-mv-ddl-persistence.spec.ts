@@ -26,7 +26,7 @@ import { generateViewDDL, generateMaintainedTableDDL } from '../src/schema/ddl-g
 import { parse } from '../src/parser/index.js';
 import { computeBodyHash, normalizeBackingModule, type ViewSchema } from '../src/schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema } from '../src/schema/derivation.js';
-import type { TableSchema } from '../src/schema/table.js';
+import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, type TableSchema } from '../src/schema/table.js';
 import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
 import type { SchemaChangeEvent } from '../src/schema/change-events.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
@@ -544,35 +544,70 @@ function viewSchemaFromDDL(ddl: string): ViewSchema {
 	};
 }
 
-/** Lift a `create materialized view` DDL into the minimal maintained-table
- *  record (`TableSchema` + `derivation`) the generator reads; the fields it
- *  never touches (table columns / pk / hash / sources) are stubbed. The
- *  backing module goes through the same `normalizeBackingModule` the create
- *  builder applies, so `using memory()` lifts to the clause-free record. */
+/** Lift a maintained-table DDL — EITHER authoring form: the `create
+ *  materialized view` sugar or the canonical `create table … maintained as`
+ *  table form the generator emits — into the minimal maintained-table record
+ *  (`TableSchema` + `derivation`) the generator reads. The sugar lift stubs
+ *  the declared table columns (the generator renders whatever the TableSchema
+ *  carries, so the empty stub round-trips as the singleton `PRIMARY KEY ()`
+ *  form); the table-form lift carries its declared columns/PK faithfully via
+ *  the shared schema helpers, so the generator's own output re-lifts to a
+ *  fixed point. The backing module goes through the same
+ *  `normalizeBackingModule` the create builder applies, so `using memory()`
+ *  lifts to the clause-free record. */
 function mvSchemaFromDDL(ddl: string): MaintainedTableSchema {
 	const stmt = parse(ddl);
-	if (stmt.type !== 'createMaterializedView') throw new Error(`not a create materialized view: ${stmt.type}`);
-	const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
-	return {
-		name: stmt.view.name,
-		schemaName: stmt.view.schema ?? 'main',
-		columns: [],
-		columnIndexMap: new Map(),
-		primaryKeyDefinition: [],
-		checkConstraints: [],
-		vtabModuleName: backing.moduleName,
-		vtabArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
-		isView: false,
-		tags: stmt.tags,
-		derivation: {
-			selectAst: stmt.select,
-			columns: stmt.columns ? [...stmt.columns] : undefined,
-			insertDefaults: stmt.insertDefaults,
-			bodyHash: '',
-			logicalKey: [],
-			sourceTables: [],
-		},
-	};
+	if (stmt.type === 'createMaterializedView') {
+		const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
+		return {
+			name: stmt.view.name,
+			schemaName: stmt.view.schema ?? 'main',
+			columns: [],
+			columnIndexMap: new Map(),
+			primaryKeyDefinition: [],
+			checkConstraints: [],
+			vtabModuleName: backing.moduleName,
+			vtabArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
+			isView: false,
+			tags: stmt.tags,
+			derivation: {
+				selectAst: stmt.select,
+				columns: stmt.columns ? [...stmt.columns] : undefined,
+				insertDefaults: stmt.insertDefaults,
+				bodyHash: '',
+				logicalKey: [],
+				sourceTables: [],
+			},
+		};
+	}
+	if (stmt.type === 'createTable' && stmt.maintained) {
+		const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
+		// Generated DDL always annotates nullability explicitly (no session
+		// default), so the defaultNotNull parameter is never consulted here.
+		const columns = stmt.columns.map(c => columnDefToSchema(c));
+		const { pkDef } = findPKDefinition(columns, stmt.constraints);
+		return {
+			name: stmt.table.name,
+			schemaName: stmt.table.schema ?? 'main',
+			columns,
+			columnIndexMap: buildColumnIndexMap(columns),
+			primaryKeyDefinition: [...pkDef],
+			checkConstraints: [],
+			vtabModuleName: backing.moduleName,
+			vtabArgs: backing.storedModuleArgs ? { ...backing.storedModuleArgs } : undefined,
+			isView: false,
+			tags: stmt.tags,
+			derivation: {
+				selectAst: stmt.maintained.select,
+				columns: stmt.columns.length > 0 ? stmt.columns.map(c => c.name) : undefined,
+				insertDefaults: stmt.maintained.insertDefaults,
+				bodyHash: '',
+				logicalKey: [],
+				sourceTables: [],
+			},
+		};
+	}
+	throw new Error(`not a maintained-table DDL: ${stmt.type}`);
 }
 
 /** The tag / column / body matrix, parameterized by the CREATE keyword. */
@@ -622,9 +657,12 @@ describe('view persistence: generateViewDDL fixed point', () => {
 describe('view persistence: generateMaintainedTableDDL fixed point', () => {
 	const gen = (ddl: string) => generateMaintainedTableDDL(mvSchemaFromDDL(ddl));
 
-	it('always emits a fully-qualified (schema.name) MV name; explicit-default USING normalizes away', () => {
+	it('emits the canonical fully-qualified TABLE form; explicit-default USING normalizes away', () => {
 		const ddl = gen('create materialized view v using memory as select 1 as a');
-		expect(ddl).to.match(/^create materialized view main\.v /i);
+		// The one canonical form for every maintained table is
+		// `create table … maintained as`, regardless of the authoring surface.
+		expect(ddl).to.match(/^create table "main"\."v" /i);
+		expect(ddl).to.match(/ maintained as select 1 as a$/i);
 		expect(ddl, '`using memory()` ≡ omitted — the default backing stays clause-free').to.not.match(/using/i);
 		expect(gen('create materialized view v using mem as select 1 as a'), '`mem` aliases to memory').to.not.match(/using/i);
 	});
@@ -632,7 +670,9 @@ describe('view persistence: generateMaintainedTableDDL fixed point', () => {
 	it('emits the USING clause for a non-default backing module and is a fixed point', () => {
 		const once = gen('create materialized view v using mem2 as select 1 as a');
 		expect(once, 'non-default module round-trips the clause').to.match(/using mem2/i);
-		expect(parse(once).type).to.equal('createMaterializedView');
+		const reparsed = parse(once);
+		expect(reparsed.type).to.equal('createTable');
+		expect(reparsed.type === 'createTable' && reparsed.maintained, 'carries the maintained clause').to.exist;
 		expect(gen(once), 'fixed point over its own re-parse').to.equal(once);
 	});
 
@@ -649,16 +689,23 @@ describe('view persistence: generateMaintainedTableDDL fixed point', () => {
 	for (const { name, ddl } of matrix('materialized view')) {
 		it(`re-parses and is a fixed point: ${name}`, () => {
 			const once = gen(ddl);
-			expect(parse(once).type, 'generated DDL re-parses to createMaterializedView').to.equal('createMaterializedView');
+			const reparsed = parse(once);
+			expect(reparsed.type, 'generated DDL re-parses to the canonical table form').to.equal('createTable');
+			expect(reparsed.type === 'createTable' && reparsed.maintained, 'carries the maintained clause').to.exist;
 			expect(gen(once), 'generate is a fixed point over its own re-parse').to.equal(once);
 		});
 	}
 
-	it('preserves tags, columns, and body shape through the round-trip', () => {
+	it('preserves tags and body shape through the round-trip', () => {
 		const tagged = parse(gen("create materialized view v as select 1 as a with tags (k1 = 'v1')"));
-		if (tagged.type === 'createMaterializedView') expect(tagged.tags).to.deep.equal({ k1: 'v1' });
-		const cols = parse(gen('create materialized view v (x, y) as select 1, 2'));
-		if (cols.type === 'createMaterializedView') expect(cols.columns).to.deep.equal(['x', 'y']);
+		if (tagged.type === 'createTable') expect(tagged.tags).to.deep.equal({ k1: 'v1' });
+		const vals = parse(gen('create materialized view v as values (1, 2), (3, 4)'));
+		if (vals.type === 'createTable') expect(vals.maintained?.select.type).to.equal('values');
+		// An explicit MV column list (renames) becomes the table's DECLARED column
+		// names in the canonical form; the synthetic lift here stubs the declared
+		// columns, so that leg is pinned against a LIVE schema instead — see
+		// maintained-table-attach-detach.spec.ts ('MV sugar with an explicit
+		// column list round-trips through the table form').
 	});
 });
 
@@ -703,7 +750,9 @@ describe('view persistence: generators over LIVE-created schemas', () => {
 			const mv = src.schemaManager.getMaintainedTable('main', 'mv');
 			expect(mv, 'live MV registered').to.exist;
 			const ddl = generateMaintainedTableDDL(mv!);
-			expect(parse(ddl).type, 'generated DDL re-parses to createMaterializedView').to.equal('createMaterializedView');
+			const reparsed = parse(ddl);
+			expect(reparsed.type, 'generated DDL re-parses to the canonical table form').to.equal('createTable');
+			expect(reparsed.type === 'createTable' && reparsed.maintained, 'carries the maintained clause').to.exist;
 			expect(ddl, 'USING omitted (backing rebuilds as memory)').to.not.match(/using/i);
 
 			// The body references `base`, so the destination needs it before the MV DDL.
@@ -872,7 +921,7 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 			const ddl = generateMaintainedTableDDL(asMaintained(modified[0].newObject));
 			expect(ddl, 'regenerated DDL references the new table name').to.match(/\bt2\b/);
 			expect(ddl, 'regenerated DDL no longer references a bare `from t`').to.not.match(/\bfrom\s+t\b/i);
-			expect(parse(ddl).type, 'regenerated DDL re-parses').to.equal('createMaterializedView');
+			expect(parse(ddl).type, 'regenerated DDL re-parses to the canonical table form').to.equal('createTable');
 		} finally {
 			await db.close();
 		}

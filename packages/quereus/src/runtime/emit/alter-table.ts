@@ -9,7 +9,7 @@ import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
 import { validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
-import type { ColumnDef } from '../../parser/ast.js';
+import type { ColumnDef, QueryExpr, ViewInsertDefault } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames } from '../../schema/rename-rewriter.js';
@@ -21,6 +21,8 @@ import {
 	propagateTableRenameToMaterializedViews,
 	propagateColumnRenameToMaterializedViews,
 	restoreUnaffectedMaterializedViews,
+	attachMaintainedDerivation,
+	detachMaintainedDerivation,
 } from './materialized-view-helpers.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 
@@ -62,12 +64,15 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 
 		// A maintained table's shape is DEFINED by its derivation body — structural
 		// ALTERs would desynchronize (and, mechanically, drop the derivation when the
-		// module returns a fresh schema). Only rename remains allowed (an ordinary
-		// table rename plus the maintenance re-key below). Tag actions must go
-		// through ALTER MATERIALIZED VIEW: the TABLE verb fires `table_modified`,
-		// not `materialized_view_modified`, so the tag edit would never reach the
-		// persisted `create materialized view` catalog entry.
-		if (isMaintainedTable(tableSchema) && action.type !== 'renameTable') {
+		// module returns a fresh schema). Only rename and the derivation lifecycle
+		// verbs (SET MAINTAINED = re-attach, DROP MAINTAINED = detach) remain
+		// allowed. Tag actions must go through ALTER MATERIALIZED VIEW: the TABLE
+		// verb fires `table_modified`, not `materialized_view_modified`, so the tag
+		// edit would never reach the persisted maintained-table catalog entry.
+		if (isMaintainedTable(tableSchema)
+			&& action.type !== 'renameTable'
+			&& action.type !== 'setMaintained'
+			&& action.type !== 'dropMaintained') {
 			throw new QuereusError(
 				action.type === 'setTags' || action.type === 'dropTags'
 					? `cannot ALTER TABLE '${tableSchema.name}': it is a materialized view — use ALTER MATERIALIZED VIEW for tags`
@@ -117,6 +122,10 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				if (target.kind === 'constraint') return runDropConstraintTags(rctx, tableSchema, target.constraintName, action.keys);
 				return runDropTableTags(rctx, tableSchema, action.keys);
 			}
+			case 'setMaintained':
+				return runSetMaintained(rctx, tableSchema, schema, action.select, action.insertDefaults);
+			case 'dropMaintained':
+				return runDropMaintained(rctx, tableSchema, schema);
 		}
 	}
 
@@ -144,6 +153,8 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 					: tableSchema.name;
 				return `dropTags(${where})`;
 			}
+			case 'setMaintained': return `setMaintained(${tableSchema.name})`;
+			case 'dropMaintained': return `dropMaintained(${tableSchema.name})`;
 		}
 	})();
 
@@ -1291,6 +1302,56 @@ export function buildShadowTableDdl(
 	}
 
 	return createDdl;
+}
+
+/**
+ * SET MAINTAINED AS <body> — attach a derivation to a plain table, or
+ * atomically replace an already-maintained table's derivation (the differ's
+ * body-change primitive). All gates, the verify-by-diff reconcile, the
+ * catalog/registration flip, the consumer cascade, and the lifecycle event
+ * (`materialized_view_added` on fresh attach, `materialized_view_modified` on
+ * re-attach) live in the shared {@link attachMaintainedDerivation} core.
+ * Resolved against the LIVE table (the build-time schema may be a cached
+ * statement's snapshot).
+ */
+async function runSetMaintained(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: import('../../schema/schema.js').Schema,
+	select: QueryExpr,
+	insertDefaults: ReadonlyArray<ViewInsertDefault> | undefined,
+): Promise<SqlValue> {
+	const live = schema.getTable(tableSchema.name);
+	if (!live) {
+		throw new QuereusError(`no such table: ${tableSchema.name}`, StatusCode.ERROR);
+	}
+	await attachMaintainedDerivation(rctx.db, live, select, insertDefaults);
+	log('Attached derivation to table %s.%s', live.schemaName, live.name);
+	return null;
+}
+
+/**
+ * DROP MAINTAINED — detach the table's derivation (see
+ * {@link detachMaintainedDerivation}: catalog-only, rows intact, maintenance
+ * stops, the table becomes ordinary and user-writable). Allowed on a STALE
+ * maintained table too — the flag leaves with the derivation. Resolved against
+ * the LIVE table.
+ */
+async function runDropMaintained(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	schema: import('../../schema/schema.js').Schema,
+): Promise<SqlValue> {
+	const live = schema.getTable(tableSchema.name);
+	if (!live || !isMaintainedTable(live)) {
+		throw new QuereusError(
+			`cannot drop maintained on '${tableSchema.name}': it is not a maintained table`,
+			StatusCode.ERROR,
+		);
+	}
+	detachMaintainedDerivation(rctx.db, live);
+	log('Detached derivation from table %s.%s', live.schemaName, live.name);
+	return null;
 }
 
 /**

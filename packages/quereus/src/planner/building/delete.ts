@@ -17,6 +17,7 @@ import { ReturningNode } from '../nodes/returning-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks } from './constraint-builder.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { buildParentSideFKChecks } from './foreign-key-builder.js';
 import { validateReturningQualifiers } from '../validation/returning-qualifier-validator.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
@@ -148,24 +149,15 @@ export function buildDeleteStmt(
   const oldAttributes = tableReference.tableSchema.columns.map((col) => ({
     id: PlanNode.nextAttrId(),
     name: col.name,
-    type: {
-      typeClass: 'scalar' as const,
-      logicalType: col.logicalType,
-      nullable: !col.notNull,
-      isReadOnly: false
-    },
+    type: columnSchemaToScalarType(col),
     sourceRelation: `OLD.${tableReference.tableSchema.name}`
   }));
 
   const newAttributes = tableReference.tableSchema.columns.map((col) => ({
     id: PlanNode.nextAttrId(),
     name: col.name,
-    type: {
-      typeClass: 'scalar' as const,
-      logicalType: col.logicalType,
-      nullable: true, // NEW values are always NULL for DELETE
-      isReadOnly: false
-    },
+    // NEW values are always NULL for DELETE
+    type: columnSchemaToScalarType(col, { nullable: true }),
     sourceRelation: `NEW.${tableReference.tableSchema.name}`
   }));
 

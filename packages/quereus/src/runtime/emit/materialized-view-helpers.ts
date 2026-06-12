@@ -16,8 +16,10 @@ import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } f
 import type { Schema } from '../../schema/schema.js';
 import { renameTableInAst, renameColumnInAst, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
-import type { BackingHost } from '../../vtab/backing-host.js';
+import type { BackingHost, BackingRowChange } from '../../vtab/backing-host.js';
+import type { VirtualTableConnection } from '../../vtab/connection.js';
 import type { SchemaChangeInfo } from '../../vtab/module.js';
+import { compareSqlValues } from '../../util/comparison.js';
 
 const log = createLogger('runtime:emit:materialized-view');
 const warnLog = log.extend('warn');
@@ -541,6 +543,428 @@ export async function adoptMaterializedView(
 	}
 
 	return maintained;
+}
+
+/* ──────────────── attach / detach lifecycle verbs ────────────────
+ * The maintained-table lifecycle verbs: `create table … maintained as <body>`
+ * (attach-to-empty), `alter table … set maintained as <body>` (attach /
+ * re-attach with verify-by-diff reconcile), and `alter table … drop maintained`
+ * (detach). The attach core never trusts existing rows blindly and never refills
+ * wholesale: it re-derives the body and reconciles by keyed diff (the
+ * 'replace-all' MaintenanceOp), so identical derivable content means ZERO row
+ * writes and zero reported changes, while divergence resolves derived-wins with
+ * only the genuine per-row changes reported (and cascaded to consumer maintained
+ * tables). Blind trust remains the rehydrate fast path's domain, where
+ * clean-shutdown attestation gates it (`SchemaManager.tryAdoptPreExistingBacking`). */
+
+/**
+ * Names the first difference between a table's declared/live shape and the
+ * derived body `shape` — the attach-time strict shape check (null when the body
+ * derives exactly the declared shape). Unlike {@link describeBackingShapeMismatch}
+ * (the structural, name-blind refresh check) this one is part of the
+ * declared-shape contract and therefore compares column NAMES too: the declared
+ * layout is the frozen basis, so the body must be aliased to produce it
+ * verbatim — names, types, not-null, collations, and the physical primary key
+ * (order, direction, per-component collation). Not-null is exact in BOTH
+ * directions: tolerating a body-notNull/declared-nullable skew would make the
+ * next refresh's reshape pass "tighten" the declared column, silently mutating
+ * the frozen basis.
+ */
+function describeAttachShapeMismatch(table: TableSchema, shape: BackingShape): string | null {
+	if (table.columns.length !== shape.columns.length) {
+		return `body produces ${shape.columns.length} columns but the table declares ${table.columns.length}`;
+	}
+	for (let i = 0; i < shape.columns.length; i++) {
+		const declared = table.columns[i];
+		const derived = shape.columns[i];
+		if (declared.name.toLowerCase() !== derived.name.toLowerCase()) {
+			return `body output column ${i + 1} is named '${derived.name}' but the table declares '${declared.name}' (alias the body output to match the declared shape)`;
+		}
+		if (!backingTypeMatches(declared, derived)) {
+			return `column '${declared.name}': body derives type ${derived.logicalType.name} but the table declares ${declared.logicalType.name}`;
+		}
+		if (!backingNotNullMatches(declared, derived)) {
+			return `column '${declared.name}': body derives ${derived.notNull ? 'not null' : 'nullable'} but the table declares ${declared.notNull ? 'not null' : 'nullable'}`;
+		}
+		if (!backingCollationMatches(declared, derived)) {
+			return `column '${declared.name}': body derives collation ${derived.collation ?? 'BINARY'} but the table declares ${declared.collation ?? 'BINARY'}`;
+		}
+	}
+	const derivedPk = computeBackingPrimaryKey(shape);
+	const declaredPk = table.primaryKeyDefinition;
+	if (declaredPk.length !== derivedPk.length) {
+		return `body derives a ${derivedPk.length}-column primary key but the table declares ${declaredPk.length} (a body \`order by\` seeds the derived key — see computeBackingPrimaryKey)`;
+	}
+	for (let k = 0; k < derivedPk.length; k++) {
+		const declaredCol = table.columns[declaredPk[k].index];
+		const derivedCol = shape.columns[derivedPk[k].index];
+		if (declaredPk[k].index !== derivedPk[k].index) {
+			return `primary-key component ${k + 1}: body derives '${derivedCol?.name}' but the table declares '${declaredCol?.name}'`;
+		}
+		if ((declaredPk[k].desc === true) !== (derivedPk[k].desc === true)) {
+			return `primary-key component ${k + 1} ('${declaredCol?.name}'): direction differs`;
+		}
+		const declaredColl = declaredPk[k].collation ?? declaredCol?.collation ?? 'BINARY';
+		const derivedColl = derivedCol?.collation ?? 'BINARY';
+		if (declaredColl !== derivedColl) {
+			return `primary-key component ${k + 1} ('${declaredCol?.name}'): body derives collation ${derivedColl} but the table declares ${declaredColl}`;
+		}
+	}
+	return null;
+}
+
+/**
+ * Rejects an attach whose body would close a derivation cycle. Create-MV can
+ * never form one (a consumer is created after its producer), but attach can:
+ * `alter table A set maintained as select … from B` where B's derivation
+ * (transitively) reads A — including the degenerate self-reference (`… from A`).
+ * Walks the sourceTables→derivation edges of the LIVE catalog from the new
+ * body's sources; reaching the attach target names the cycle path in the
+ * diagnostic. The maintenance cascade's depth guard
+ * (`assertCascadeDepth`) stays as defense-in-depth behind this.
+ */
+function assertNoDerivationCycle(db: Database, schemaName: string, tableName: string, sourceTables: readonly string[]): void {
+	const target = `${schemaName}.${tableName}`.toLowerCase();
+	const sm = db.schemaManager;
+	const visited = new Set<string>();
+	const walk = (qualified: string, path: readonly string[]): void => {
+		if (qualified === target) {
+			const cycle = [target, ...path].reverse().concat(target).join(' → ');
+			throw new QuereusError(
+				`cannot attach derivation to '${schemaName}.${tableName}': the body would create a derivation cycle (${cycle})`,
+				StatusCode.ERROR,
+			);
+		}
+		if (visited.has(qualified)) return;
+		visited.add(qualified);
+		const dot = qualified.indexOf('.');
+		const srcSchema = dot >= 0 ? qualified.slice(0, dot) : 'main';
+		const srcName = dot >= 0 ? qualified.slice(dot + 1) : qualified;
+		const source = sm.getTable(srcSchema, srcName);
+		if (source && isMaintainedTable(source)) {
+			for (const next of source.derivation.sourceTables) walk(next, [...path, qualified]);
+		}
+	};
+	for (const src of sourceTables) walk(src, []);
+}
+
+/** Renders one primary-key value for the duplicate-derived-key diagnostic. */
+function formatKeyValue(v: SqlValue): string {
+	if (v === null || v === undefined) return 'null';
+	if (typeof v === 'string') return `'${v}'`;
+	if (v instanceof Uint8Array) return `x'…'`;
+	return String(v);
+}
+
+/**
+ * The loud "must be a set" reject for attach, BEFORE any catalog or data
+ * mutation: the keyed reconcile diff would otherwise last-write-win duplicate
+ * derived keys silently. Collation-aware pairing — duplicates are detected
+ * under the table's primary-key collations (the same key identity the
+ * 'replace-all' diff uses), so a coarsened-key collision present in the source
+ * rejects here, naming the colliding key.
+ */
+function assertDerivedRowsAreSet(rows: readonly Row[], table: TableSchema, schemaName: string, name: string): void {
+	if (rows.length < 2) return;
+	const pk = table.primaryKeyDefinition;
+	const compareKeys = (ra: Row, rb: Row): number => {
+		for (const c of pk) {
+			const cmp = compareSqlValues(ra[c.index], rb[c.index], c.collation ?? 'BINARY');
+			if (cmp !== 0) return cmp;
+		}
+		return 0;
+	};
+	const order = rows.map((_r, i) => i).sort((a, b) => compareKeys(rows[a], rows[b]));
+	for (let i = 1; i < order.length; i++) {
+		if (compareKeys(rows[order[i - 1]], rows[order[i]]) === 0) {
+			const keyVals = pk.map(c => formatKeyValue(rows[order[i]][c.index])).join(', ');
+			throw new QuereusError(
+				`cannot attach derivation to '${schemaName}.${name}': the body produces duplicate rows for primary key (${keyVals}), but a maintained table must be a set — `
+					+ `project a unique key or merge the colliding source rows first`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+	}
+}
+
+/**
+ * Resolve (or lazily create + register) the table's backing connection for the
+ * current transaction — the same discipline as the maintenance manager's
+ * `getBackingConnection`, so the reconcile's pending writes ride the
+ * coordinated commit in lockstep with the statement, and a `select` from the
+ * table inside the same transaction observes them (reads-own-writes).
+ */
+async function resolveAttachConnection(db: Database, host: BackingHost, qualifiedName: string): Promise<VirtualTableConnection> {
+	for (const c of db.getConnectionsForTable(qualifiedName)) {
+		if (host.ownsConnection(c)) return c;
+	}
+	const conn = host.connect();
+	await db.registerConnection(conn);
+	return conn;
+}
+
+/**
+ * The attach core shared by `alter table … set maintained as` (fresh attach and
+ * re-attach) and `create table … maintained as` (attach-to-empty, via
+ * {@link createMaintainedTable}): verify-by-diff, never trust, never refill
+ * wholesale.
+ *
+ * Sequence — every gate runs BEFORE any catalog or data mutation:
+ *  1. backing-host capability (defense-in-depth; the builders gate with a sited
+ *     error);
+ *  2. derive the body's shape (rewrite-suppressed) and run the STRICT
+ *     declared-shape check ({@link describeAttachShapeMismatch} — names
+ *     included);
+ *  3. cycle / self-reference check over the live derivation graph;
+ *  4. evaluate the body once and reject duplicate derived keys (the loud
+ *     "must be a set" reject);
+ *  5. catalog flip (`attachDerivation`) + maintenance registration — the
+ *     create-time gates (determinism, keyed-or-coarsened body, full-rebuild
+ *     size threshold) run inside `registerMaterializedView`, before any row is
+ *     written; a throw restores the prior record (and the prior plan, on
+ *     re-attach);
+ *  6. reconcile-by-diff: one `'replace-all'` op against the table's effective
+ *     contents through the backing host — collation-aware pairing,
+ *     byte-faithful identical-row skip, so identical content writes nothing and
+ *     divergence resolves derived-wins with the minimal genuine
+ *     {@link BackingRowChange}s. The writes land in the connection's PENDING
+ *     state, committing/rolling back in lockstep with the statement;
+ *  7. covering links (clear the prior body's, stamp the new body's), cascade
+ *     the genuine changes to consumer maintained tables, fire
+ *     `materialized_view_added` (fresh) / `materialized_view_modified`
+ *     (re-attach) so store catalogs re-persist the canonical table-form DDL,
+ *     and surface the key-coarsening warning exactly as create does.
+ *
+ * The derivation's recorded `columns` list is the table's declared column
+ * names — the same normalization the canonical table-form import applies
+ * (`maintainedImportFromTableStmt`), so attach → persist → reopen is a fixed
+ * point (same `bodyHash`, same record).
+ */
+export async function attachMaintainedDerivation(
+	db: Database,
+	table: TableSchema,
+	select: AST.QueryExpr,
+	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+): Promise<MaintainedTableSchema> {
+	const sm = db.schemaManager;
+	const schemaName = table.schemaName;
+	const name = table.name;
+	const schema = sm.getSchemaOrFail(schemaName);
+
+	const module = requireVtabModule(table);
+	if (!module.getBackingHost) {
+		throw new QuereusError(
+			`cannot attach derivation to '${schemaName}.${name}': module '${table.vtabModuleName}' cannot host a maintained table (it does not implement the backing-host capability)`,
+			StatusCode.UNSUPPORTED,
+		);
+	}
+
+	const bodySql = astToString(select);
+	// Natural output names — the declared-shape contract is strict, so the body
+	// must already be aliased to the declared names (no positional renaming here;
+	// the canonical-DDL import path is the lenient rename surface).
+	const shape = deriveBackingShape(db, bodySql, undefined);
+	const mismatch = describeAttachShapeMismatch(table, shape);
+	if (mismatch) {
+		throw new QuereusError(
+			`cannot attach derivation to '${schemaName}.${name}': ${mismatch}`,
+			StatusCode.ERROR,
+		);
+	}
+	assertNoDerivationCycle(db, schemaName, name, shape.sourceTables);
+
+	const rows: Row[] = await collectBodyRows(db, bodySql);
+	assertDerivedRowsAreSet(rows, table, schemaName, name);
+
+	const def: MaterializeViewDefinition = {
+		schemaName,
+		viewName: name,
+		selectAst: select,
+		bodySql,
+		columns: table.columns.map(c => c.name),
+		insertDefaults,
+	};
+
+	const prior = schema.getTable(name) ?? table;
+	const priorMaintained = isMaintainedTable(prior) ? prior : undefined;
+
+	// Undo the catalog flip after a gate/reconcile failure: restore the prior
+	// record and, on re-attach, the prior row-time plan (registerMaterializedView
+	// released it when registering the new one).
+	const restorePrior = (): void => {
+		schema.addTable(prior);
+		if (priorMaintained) {
+			if (!priorMaintained.derivation.stale) {
+				try {
+					db.registerMaterializedView(priorMaintained);
+				} catch (e) {
+					// The prior plan registered before, so this should not throw; if it
+					// does, fail safe: stale (reads re-validate) beats silently live.
+					db.markMaterializedViewStale(priorMaintained);
+					log('Re-registering the prior derivation of %s.%s failed during attach rollback; marked stale: %s',
+						schemaName, name, e instanceof Error ? e.message : String(e));
+				}
+			}
+		} else {
+			db.unregisterMaterializedView(schemaName, name);
+		}
+	};
+
+	const maintained = sm.attachDerivation(schemaName, name, buildTableDerivation(def, shape));
+	try {
+		// The create-time gates (determinism, keyed-or-coarsened body, relational
+		// output, full-rebuild size threshold) run here — identical to create.
+		db.registerMaterializedView(maintained);
+	} catch (e) {
+		restorePrior();
+		throw e;
+	}
+
+	let changes: BackingRowChange[];
+	try {
+		const host = resolveBackingHost(db, maintained);
+		const conn = await resolveAttachConnection(db, host, `${schemaName}.${name}`);
+		changes = await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
+	} catch (e) {
+		restorePrior();
+		throw e;
+	}
+
+	if (priorMaintained) unlinkCoveredUniqueConstraints(db, priorMaintained);
+	linkCoveredUniqueConstraints(db, maintained, bodySql);
+
+	// Cascade the GENUINE reconcile changes to consumer maintained tables: the
+	// reconcile wrote this table through the privileged surface, so the DML
+	// boundary never saw the writes. Identical content produced zero changes and
+	// therefore zero dispatch. Full-rebuild consumers defer + drain once,
+	// mirroring the statement flush.
+	if (changes.length > 0) {
+		const base = `${schemaName}.${name}`;
+		const deferred = new Set<string>();
+		for (const change of changes) {
+			await db._maintainRowTimeCoveringStructures(base, change, undefined, deferred);
+		}
+		await db._flushDeferredRebuilds(deferred);
+	}
+
+	sm.getChangeNotifier().notifyChange(priorMaintained
+		? {
+			type: 'materialized_view_modified',
+			schemaName, objectName: name,
+			oldObject: priorMaintained, newObject: maintained,
+		}
+		: {
+			type: 'materialized_view_added',
+			schemaName, objectName: name,
+			newObject: maintained,
+		});
+
+	if (maintained.derivation.coarsenedKey) {
+		warnKeyCoarsening(schemaName, name, maintained.derivation.coarsenedKey);
+	}
+	return maintained;
+}
+
+/**
+ * Detach a maintained table's derivation — `alter table … drop maintained`.
+ * Catalog-only: nothing physical changes. The row-time plan is released, the
+ * covering-structure link un-stamped (UNIQUE enforcement falls back to the
+ * auto-index), and the registered record swapped for the same table minus the
+ * derivation — rows, indexes, module identity, and tags all stay; staleness
+ * state lives on the derivation and leaves with it. The table becomes ordinary
+ * and user-writable.
+ *
+ * Fires `materialized_view_removed` ONLY: the maintenance manager releases any
+ * remaining plan, store catalogs delete the persisted maintained entry (a
+ * store-hosted table's plain bundle is already clause-free), and cached
+ * statement plans over the table invalidate (a cached write-through plan
+ * compiled against the old derivation must not survive the flip). Deliberately
+ * NO `table_modified`: the table's shape and rows are unchanged, so consumer
+ * maintained tables reading it stay live — subsequent user writes drive their
+ * maintenance exactly like any source write.
+ */
+export function detachMaintainedDerivation(db: Database, mv: MaintainedTableSchema): TableSchema {
+	const sm = db.schemaManager;
+	const schema = sm.getSchemaOrFail(mv.schemaName);
+
+	db.unregisterMaterializedView(mv.schemaName, mv.name);
+	unlinkCoveredUniqueConstraints(db, mv);
+
+	const live = schema.getTable(mv.name);
+	const source = live && isMaintainedTable(live) ? live : mv;
+	const { derivation: _derivation, ...plain } = source;
+	schema.addTable(plain);
+
+	sm.getChangeNotifier().notifyChange({
+		type: 'materialized_view_removed',
+		schemaName: mv.schemaName,
+		objectName: mv.name,
+		oldObject: source,
+	});
+	return plain;
+}
+
+/**
+ * `create table … maintained as <body>` — the declared-shape authoring form,
+ * executed all-or-nothing:
+ *
+ *  - an existing table/view + `if not exists` skips ENTIRELY (never a
+ *    half-attach); without it, the standard already-exists error — both before
+ *    the body is planned;
+ *  - the declared shape is verified against the derived body shape BEFORE any
+ *    catalog registration ({@link SchemaManager.buildDeclaredTableSchema} builds
+ *    the schema the CREATE would register, without registering it);
+ *  - then the table registers through the ordinary `createTable` path (declared
+ *    constraints and defaults intact) and the shared {@link attachMaintainedDerivation}
+ *    core runs — attach-to-empty: the reconcile diff against an empty table IS
+ *    the fill, applied to the connection's pending state so it commits in
+ *    lockstep with the statement (no `replaceContents` commit-first caveat);
+ *  - any failure past registration (duplicate derived keys, a maintenance gate)
+ *    drops the just-created table — the schema is left exactly as before.
+ *
+ * The attach core re-derives the body AFTER the table registers, so a body that
+ * resolves differently once the new name exists (e.g. a same-name reference that
+ * becomes a self-reference) is caught by the cycle check and rolled back.
+ */
+export async function createMaintainedTable(db: Database, stmt: AST.CreateTableStmt): Promise<MaintainedTableSchema | undefined> {
+	const sm = db.schemaManager;
+	const schemaName = stmt.table.schema ? sm.canonicalSchemaName(stmt.table.schema) : sm.getCurrentSchemaName();
+	const name = stmt.table.name;
+
+	if (sm.getTable(schemaName, name) || sm.getView(schemaName, name)) {
+		if (stmt.ifNotExists) return undefined;
+		throw new QuereusError(
+			`Table ${schemaName}.${name} already exists`,
+			StatusCode.CONSTRAINT,
+			undefined,
+			stmt.table.loc?.start.line,
+			stmt.table.loc?.start.column,
+		);
+	}
+
+	const declared = sm.buildDeclaredTableSchema(stmt);
+	const bodySql = astToString(stmt.maintained!.select);
+	const shape = deriveBackingShape(db, bodySql, undefined);
+	const mismatch = describeAttachShapeMismatch(declared, shape);
+	if (mismatch) {
+		throw new QuereusError(
+			`cannot create maintained table '${schemaName}.${name}': ${mismatch}`,
+			StatusCode.ERROR,
+			undefined,
+			stmt.table.loc?.start.line,
+			stmt.table.loc?.start.column,
+		);
+	}
+
+	const table = await sm.createTable(stmt);
+	try {
+		return await attachMaintainedDerivation(db, table, stmt.maintained!.select, stmt.maintained!.insertDefaults);
+	} catch (e) {
+		try {
+			await sm.dropTable(schemaName, name, /*ifExists*/ true);
+		} catch { /* best-effort cleanup */ }
+		throw e;
+	}
 }
 
 /**

@@ -533,6 +533,11 @@ function resultColumnToString(col: AST.ResultColumn): string {
 	return colStr;
 }
 
+/** Renders the `with schema s1, s2` search-path clause (WITH SCHEMA). */
+function schemaPathClauseToString(schemaPath: readonly string[]): string {
+	return `with schema ${schemaPath.map(quoteIdentifier).join(', ')}`;
+}
+
 // Statement stringify functions
 export function selectToString(stmt: AST.SelectStmt): string {
 	const parts: string[] = [];
@@ -562,6 +567,14 @@ export function selectToString(stmt: AST.SelectStmt): string {
 
 	if (stmt.having) {
 		parts.push('having', expressionToString(stmt.having));
+	}
+
+	// WITH SCHEMA binds before the compound operator and before ORDER BY / LIMIT
+	// (see `parseSchemaPath` in `selectStatement`; compound legs parse with
+	// `isCompoundSubquery` and never consume it) — emit it here so re-parse
+	// re-binds it to this statement rather than a leg or the trailing position.
+	if (stmt.schemaPath && stmt.schemaPath.length > 0) {
+		parts.push(schemaPathClauseToString(stmt.schemaPath));
 	}
 
 	// Trailing ORDER BY / LIMIT / OFFSET. On a COMPOUND select these apply to the
@@ -609,15 +622,18 @@ export function selectToString(stmt: AST.SelectStmt): string {
 
 /**
  * Renders one compound set-operation leg. A SELECT leg that carries its OWN
- * trailing ORDER BY / LIMIT / OFFSET is wrapped in parentheses so those clauses
- * re-bind INSIDE the leg on re-parse; without the parens they would attach to the
- * enclosing compound and change the parse. Every other leg — a bare SELECT, a
- * VALUES leg, or a nested compound (whose right-leaning re-parse is identical) —
- * renders without parens, so existing round-trips are unchanged.
+ * trailing ORDER BY / LIMIT / OFFSET — or a WITH SCHEMA path, which bare legs
+ * never parse (`isCompoundSubquery` suppresses it) — is wrapped in parentheses
+ * so those clauses re-bind INSIDE the leg on re-parse; without the parens they
+ * would attach to the enclosing compound (or fail to parse) and change the
+ * parse. Every other leg — a bare SELECT, a VALUES leg, or a nested compound
+ * (whose right-leaning re-parse is identical) — renders without parens, so
+ * existing round-trips are unchanged.
  */
 function compoundLegToString(leg: AST.QueryExpr): string {
 	const s = astToString(leg);
-	if (leg.type === 'select' && ((leg.orderBy && leg.orderBy.length > 0) || leg.limit || leg.offset)) {
+	if (leg.type === 'select' && ((leg.orderBy && leg.orderBy.length > 0) || leg.limit || leg.offset
+		|| (leg.schemaPath && leg.schemaPath.length > 0))) {
 		return `(${s})`;
 	}
 	return s;
@@ -777,6 +793,14 @@ export function insertToString(stmt: AST.InsertStmt): string {
 		if (tagsClause) parts.push(tagsClause);
 	}
 
+	// Trailing WITH SCHEMA (parseTrailingWithClauses accepts context/schema/tags
+	// in any order). Emitted after WITH TAGS deliberately: an intervening trailing
+	// clause stops a bare SELECT source from greedily consuming the schema path
+	// onto itself on re-parse.
+	if (stmt.schemaPath && stmt.schemaPath.length > 0) {
+		parts.push(schemaPathClauseToString(stmt.schemaPath));
+	}
+
 	if (stmt.returning && stmt.returning.length > 0) {
 		parts.push('returning', stmt.returning.map(resultColumnToString).join(', '));
 	}
@@ -847,6 +871,11 @@ export function updateToString(stmt: AST.UpdateStmt): string {
 		if (tagsClause) parts.push(tagsClause);
 	}
 
+	// Trailing WITH SCHEMA (parseTrailingWithClauses accepts context/schema/tags in any order).
+	if (stmt.schemaPath && stmt.schemaPath.length > 0) {
+		parts.push(schemaPathClauseToString(stmt.schemaPath));
+	}
+
 	if (stmt.returning && stmt.returning.length > 0) {
 		parts.push('returning', stmt.returning.map(resultColumnToString).join(', '));
 	}
@@ -880,6 +909,11 @@ export function deleteToString(stmt: AST.DeleteStmt): string {
 	if (stmt.tags) {
 		const tagsClause = tagsClauseToString(stmt.tags).trimStart();
 		if (tagsClause) parts.push(tagsClause);
+	}
+
+	// Trailing WITH SCHEMA (parseTrailingWithClauses accepts context/schema/tags in any order).
+	if (stmt.schemaPath && stmt.schemaPath.length > 0) {
+		parts.push(schemaPathClauseToString(stmt.schemaPath));
 	}
 
 	if (stmt.returning && stmt.returning.length > 0) {

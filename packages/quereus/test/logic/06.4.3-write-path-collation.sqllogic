@@ -1,0 +1,71 @@
+-- Write-path scope/attribute collation conformance. Ticket
+-- write-path-scope-collation-conformance. Expressions compiled over a table's
+-- row image (DEFAULT expressions, OR REPLACE NOT NULL default substitution,
+-- RETURNING projections, upsert SET) resolve declared column collations
+-- exactly like a read-path query over the same schema. A literal contributes
+-- no collation, so a declared NOCASE drives the comparison from either side.
+-- Mirrors the CHECK collation section of 40.2-check-extras.
+
+-- ===================================
+-- 1. DEFAULT referencing a NOCASE sibling (row-expansion path): the
+--    comparison inside the default resolves the sibling's declared collation.
+-- ===================================
+
+create table def_coll (id integer primary key, c text collate nocase, flag text default (case when new.c = 'abc' then 'match' else 'nomatch' end));
+insert into def_coll (id, c) values (1, 'ABC');
+insert into def_coll (id, c) values (2, 'xyz');
+select id, flag from def_coll order by id;
+→ [{"id":1,"flag":"match"},{"id":2,"flag":"nomatch"}]
+-- read path agrees: the same comparison matches the case-variant row.
+select count(*) as cnt from def_coll where c = 'abc';
+→ [{"cnt":1}]
+drop table def_coll;
+
+-- ===================================
+-- 2. OR REPLACE NOT NULL default substitution: the pre-built default plan
+--    (buildNotNullDefaults) resolves the sibling's declared collation too.
+-- ===================================
+
+create table def_nn (id integer primary key, c text collate nocase, flag text not null default (case when new.c = 'abc' then 'match' else 'nomatch' end));
+insert or replace into def_nn values (1, 'ABC', null);
+select flag from def_nn where id = 1;
+→ [{"flag":"match"}]
+insert or replace into def_nn values (2, 'xyz', null);
+select flag from def_nn where id = 2;
+→ [{"flag":"nomatch"}]
+drop table def_nn;
+
+-- ===================================
+-- 3. RETURNING comparisons against a NOCASE column (NEW on INSERT/UPDATE,
+--    OLD on DELETE) match the read-path resolution of the same expression.
+-- ===================================
+
+create table ret_coll (id integer primary key, c text collate nocase);
+insert into ret_coll values (1, 'ABC') returning c = 'abc' as eq;
+→ [{"eq":true}]
+-- read path agrees.
+select c = 'abc' as eq from ret_coll where id = 1;
+→ [{"eq":true}]
+
+-- UPDATE RETURNING: both row images carry the declared collation, so a
+-- case-variant rewrite still compares equal under NOCASE.
+update ret_coll set c = 'abc' where id = 1 returning old.c = new.c as same;
+→ [{"same":true}]
+
+-- DELETE RETURNING resolves OLD with the declared collation.
+delete from ret_coll where id = 1 returning c = 'aBc' as eq;
+→ [{"eq":true}]
+drop table ret_coll;
+
+-- ===================================
+-- 4. Upsert DO UPDATE: the conflicting (existing) row's columns resolve the
+--    declared collation inside SET expressions.
+-- ===================================
+
+create table ups_coll (id integer primary key, c text collate nocase, note text null);
+insert into ups_coll values (1, 'ABC', null);
+insert into ups_coll values (1, 'zzz', null)
+	on conflict (id) do update set note = case when c = 'abc' then 'was-match' else 'was-nomatch' end;
+select note from ups_coll where id = 1;
+→ [{"note":"was-match"}]
+drop table ups_coll;

@@ -13,6 +13,7 @@ import { PlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode } from '../nodes/reference.js';
 import * as AST from '../../parser/ast.js';
 import { validateDeterministicConstraint } from '../validation/determinism-validator.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { stripSelfQualifierInCheckExpression, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { cloneExpr } from '../mutation/scope-transform.js';
 
@@ -97,16 +98,10 @@ export function buildConstraintChecks(
       // Register NEW.col and unqualified col (defaults to NEW for INSERT/UPDATE, OLD for DELETE)
       const newAttrId = newAttrIdByCol[colNameLower];
       if (newAttrId !== undefined) {
-        const newColumnType = {
-          typeClass: 'scalar' as const,
-          logicalType: tableColumn.logicalType,
-          nullable: !tableColumn.notNull,
-          isReadOnly: false,
-          // Write-time CHECK comparisons must resolve the column's declared
-          // collation, matching read-path queries, ALTER backfill validation,
-          // and assertion enforcement (all compile plain SQL over the schema).
-          collationName: tableColumn.collation
-        };
+        // Write-time CHECK comparisons must resolve the column's declared
+        // collation, matching read-path queries, ALTER backfill validation,
+        // and assertion enforcement (all compile plain SQL over the schema).
+        const newColumnType = columnSchemaToScalarType(tableColumn);
 
         // NEW.column
         constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
@@ -122,13 +117,8 @@ export function buildConstraintChecks(
       // Register OLD.col
       const oldAttrId = oldAttrIdByCol[colNameLower];
       if (oldAttrId !== undefined) {
-        const oldColumnType = {
-          typeClass: 'scalar' as const,
-          logicalType: tableColumn.logicalType,
-          nullable: true, // OLD values can be NULL (especially for INSERT)
-          isReadOnly: false,
-          collationName: tableColumn.collation
-        };
+        // OLD values can be NULL (especially for INSERT)
+        const oldColumnType = columnSchemaToScalarType(tableColumn, { nullable: true });
 
         // OLD.column
         constraintScope.registerSymbol(`old.${colNameLower}`, (exp, s) =>
@@ -276,12 +266,7 @@ export function buildNotNullDefaults(
     tableSchema.columns.forEach((col, idx) => {
       const attr = newAttributes[idx];
       if (!attr) return;
-      const colType = {
-        typeClass: 'scalar' as const,
-        logicalType: col.logicalType,
-        nullable: !col.notNull,
-        isReadOnly: false,
-      };
+      const colType = columnSchemaToScalarType(col);
       const colKey = col.name.toLowerCase();
       if (!reservedKeys.has(colKey)) {
         scope.registerSymbol(colKey, (exp, s) =>

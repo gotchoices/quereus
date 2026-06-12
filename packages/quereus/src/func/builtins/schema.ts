@@ -658,6 +658,10 @@ export const functionInfoFunc = createIntegratedTableValuedFunction(
 // § Information Schema Surface's `information_schema.views`: a read-only TVF
 // (consistent with the `*_info` introspection family) projecting the four
 // view-level updateability columns over plain (non-materialized) views.
+// Maintained tables (materialized views) are deliberately excluded — they list
+// as tables in `schema()`; their per-column write-through lineage surfaces
+// through `column_info`, which walks the derivation body with the same
+// classification (one consistent story across the two functions).
 //
 // Every value is derived **statically** from the planned view body's backward
 // `updateLineage` / `attributeDefaults` (threaded onto `PhysicalProperties` by
@@ -1023,8 +1027,8 @@ export const viewInfoFunc = createIntegratedTableValuedFunction(
 // The column-granular companion to `view_info()` — the engine-idiomatic
 // realization of `docs/view-updateability.md` § Information Schema Surface's
 // `information_schema.columns.is_updatable`, covering every column of every base
-// table and plain (non-materialized) view. `view_info : schema()` ::
-// `column_info : table_info`.
+// table, plain view, and maintained table (materialized view).
+// `view_info : schema()` :: `column_info : table_info`.
 //
 // A dedicated TVF (not a `table_info` extension): `table_info` resolves base
 // tables only (`_findTable`), whereas views live in a separate catalog map and
@@ -1033,7 +1037,8 @@ export const viewInfoFunc = createIntegratedTableValuedFunction(
 // updateability facts, uniformly.
 //
 // Every value is derived **statically**: a base column's `is_updatable` is just
-// `!generated`; a view column's is read from the planned body's backward
+// `!generated`; a view column's — and a maintained table's, through the same
+// shared derivation-body walk — is read from the planned body's backward
 // `updateLineage` (the same substrate `view_info()` reads) — no dry-run
 // mutation, no new planner pass.
 // ---------------------------------------------------------------------------
@@ -1050,7 +1055,8 @@ interface ColumnInfoRow {
 }
 
 /**
- * Derive the per-column updateability rows for a base table or plain view.
+ * Derive the per-column updateability rows for a base table, plain view, or
+ * maintained table (materialized view).
  *
  * **Base table** (`_findTable` hit) — every non-generated column is trivially a
  * `base` write target; generated columns are computed/read-only. The `schema`
@@ -1069,14 +1075,49 @@ interface ColumnInfoRow {
  * `view_info`'s optional filter). A view body that fails to plan or yields no
  * relational output produces *no rows* (logged) — the conservative, never-throw
  * posture `view_info` takes, but at row granularity there is no all-`NO` row to
- * emit. A materialized view (a maintained table) resolves through the base-table
- * branch and reports its registered columns — `view_info` continues to exclude
- * MVs (its per-view lineage surface is plain-view-only).
+ * emit.
+ *
+ * **Maintained table** (a `TableSchema` carrying a `TableDerivation` — what
+ * `create materialized view` produces; detected via `isMaintainedTable`, never a
+ * name pattern) — write-through inherits the view-updateability rules
+ * (`maintainedTableViewLike` routes DML through the same view-mutation rewrite a
+ * plain view uses), so the per-column rows come from the SAME derivation-body
+ * lineage walk a plain view gets, not the trivially-all-updatable base branch:
+ * passthrough/rename columns report their source base column and
+ * `is_updatable = 'YES'`; non-invertible expression columns report `'NO'` with
+ * null trace. The table's own registered columns are the authoritative output
+ * names (the derivation's rename list is already folded into them), so they
+ * override the body attribute names positionally. A derivation body that fails
+ * to plan (e.g. stale source) degrades to conservative read-only rows over the
+ * registered columns — unlike the view path's no-rows fallback, the columns ARE
+ * known here. `view_info` continues to exclude maintained tables (its per-view
+ * surface stays plain-view-only); the two functions tell one consistent
+ * lineage story through this shared walk.
  */
 function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 	// Base table first (mirrors table_info's `_findTable`-only resolution).
 	const table = db._findTable(name);
 	if (table) {
+		if (isMaintainedTable(table)) {
+			const columnNames = table.columns.map(c => c.name);
+			try {
+				return deriveBodyColumnRows(db, table.schemaName, table.name, table.derivation.selectAst, columnNames);
+			} catch (error) {
+				// Conservative fallback: the registered columns are known even when the
+				// derivation body fails to plan — report each read-only with null trace.
+				log('column_info: conservative rows for maintained table %s.%s: %s', table.schemaName, table.name,
+					error instanceof Error ? error.message : String(error));
+				return columnNames.map((columnName, i): ColumnInfoRow => ({
+					schema: table.schemaName,
+					objectName: table.name,
+					cid: i,
+					columnName,
+					isUpdatable: false,
+					baseTable: null,
+					baseColumn: null,
+				}));
+			}
+		}
 		return table.columns.map((col, i): ColumnInfoRow => {
 			const updatable = !col.generated;
 			return {
@@ -1104,115 +1145,7 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 	}
 
 	try {
-		const { plan } = db._buildPlan([view.selectAst as AST.Statement]);
-		const root = plan.getRelations()[0];
-		if (!root) return [];
-
-		const nodes = collectBodyNodes(root);
-
-		// Set-operation membership body: every column is writable through an *effect*, not a
-		// base mapping — a membership flag flips its branch's presence (insert/delete), a data
-		// column fans out to its member branches (`set-op-membership-write`). So each reports
-		// `is_updatable = 'YES'` with `base_table` / `base_column` = null (no single base
-		// column), the same writable-through-effect shape a join-side existence flag reports.
-		//
-		// Gated on the branch-writability shape probe (parity with `deriveViewInfo`): a body
-		// the dynamic write rejects (outer LIMIT/OFFSET, non-SELECT right, `select *` leg,
-		// computed leg, mismatched leg arity) falls THROUGH to the per-column walk below
-		// instead of the all-`YES` short-circuit. That walk reports every column non-updatable
-		// with null base — a `SetOperationNode` root threads `updateLineage` ONLY for its
-		// membership flags (a read-only `set-op-branch` existence site) and NONE for its data
-		// columns, so `baseSiteOf` resolves no base for either, matching the dynamic reject.
-		// Nested (subtree) operands (`nestable-flagged-set-ops`): data columns + own flags stay
-		// writable-through-effect (`YES`); a SURFACED INNER flag (`inB`/`inC`) is read-only (`NO`) —
-		// writing it addresses a branch inside a subtree (product-coordinate `set-op-membership-nested`).
-		// Empty surfaced-inner set (the binary case) => all-`YES`, unchanged.
-		if (isSetOpMembershipBody(view.selectAst) && isSetOpBranchWritable(view.selectAst)) {
-			const innerFlags = new Set(surfacedInnerFlagNames(view.selectAst).map(n => n.toLowerCase()));
-			return root.getAttributes().map((attr, i): ColumnInfoRow => ({
-				schema: schemaName,
-				objectName: view.name,
-				cid: i,
-				columnName: attr.name,
-				isUpdatable: !innerFlags.has(attr.name.toLowerCase()),
-				baseTable: null,
-				baseColumn: null,
-			}));
-		}
-
-		// Non-decomposable join shape gate: cross / comma / subquery-source join bodies
-		// are not write-through-able. `propagate()` decomposes an n-way (≥2) equi-join —
-		// `inner`/`left`/`right`/`full` (RIGHT now admitted, the LEFT mirror; FULL self-conservatizes), composite-PK
-	// sides and self-joins included
-		// (`isDecomposableJoinBody`, the boolean shadow of `collectJoinSources`) — and
-		// rejects every other join shape, so without this gate `baseSiteOf` would resolve
-		// their bases and over-report `is_updatable = 'YES'`. Outer joins ARE decomposable
-		// now; their non-preserved columns are reported updatable per-column below when a
-		// preserved anchor exists (matching the dynamic matched-update / null-extended-insert
-		// materialization), rather than short-circuiting the whole view to all-`NO`.
-		const unsupportedJoinShape = isJoinBody(view.selectAst) && !isDecomposableJoinBody(view.selectAst);
-
-		const tableRefsById = buildTableRefsById(nodes);
-		const rootLineage = root.physical?.updateLineage;
-
-		const attrs = root.getAttributes();
-		// Whether the body exposes a PRESERVED base column — a preserved anchor that pins
-		// each view row's identity. A LEFT join has one (the preserved side); a FULL outer
-		// join (every column null-extended) does not, so a non-preserved update there stays
-		// deferred. A non-preserved (`null-extended`) column is now updatable WHEN such an
-		// anchor exists: the matched-update / null-extended-insert materialization keys off
-		// it (`view-write-optional-member-transitions`), matching the dynamic accept.
-		const hasPreservedBase = !unsupportedJoinShape && attrs.some(a => {
-			const s = baseSiteOf(rootLineage?.get(a.id));
-			return s !== undefined && !s.nullExtended;
-		});
-
-		const rows: ColumnInfoRow[] = [];
-		for (let i = 0; i < attrs.length; i++) {
-			const attr = attrs[i];
-			const site = unsupportedJoinShape ? undefined : rootLineage?.get(attr.id);
-			const bs = baseSiteOf(site);
-			const ref = bs ? tableRefsById.get(bs.table) : undefined;
-			// A join-side `exists … as` existence flag has NO base column but is writable
-			// through an *effect* — its flip inserts/deletes the non-preserved side — when a
-			// preserved anchor pins each row's identity (`outer-join-existence-column`).
-			// Report it `is_updatable = 'YES'` with `base_table` / `base_column` = null (it
-			// maps to no base column), matching the dynamic `propagate()` accept. Gated on a
-			// preserved anchor like the non-preserved column: a FULL outer (none) stays
-			// deferred. A `set-op-branch` existence flag is READ-ONLY in this read half
-			// (`set-op-membership-read`) — it reports `is_updatable = 'NO'` with null base
-			// (a set-op view has no preserved base anchor anyway); the write half flips it on.
-			const isExistence = site?.kind === 'existence' && site.component.kind === 'join-side' && hasPreservedBase;
-			// An authored (`with inverse`) column is writable (and insertable) through its
-			// put expressions — report it updatable, with the base trace populated only
-			// for a single-put inverse (a multi-target inverse maps to no single base
-			// column, the same null-base shape an existence flag reports). Agrees with
-			// the dynamic spines, which route authored sites on UPDATE and INSERT alike.
-			const authored = site?.kind === 'authored' ? site : undefined;
-			const authoredPutRef = authored && authored.puts.length === 1
-				? tableRefsById.get(authored.puts[0].table)
-				: undefined;
-			// Updatable iff a base site resolves to a producing TableReferenceNode. A
-			// PRESERVED base column is always updatable; a non-preserved (`null-extended`)
-			// column is updatable when the body has a preserved anchor (the matched-update /
-			// null-extended-insert materialization pins identity off it), and read-only only
-			// when no anchor exists (a FULL outer — write-through stays deferred there). A
-			// base id without a resolved ref should not happen; fail conservative if it does.
-			const updatable = isExistence || authored !== undefined || !!(bs && ref && (!bs.nullExtended || hasPreservedBase));
-			// Base trace is reported only for an actual base column write (an existence flag
-			// is updatable but has no base mapping).
-			const hasBaseTrace = updatable && bs !== undefined && ref !== undefined;
-			rows.push({
-				schema: schemaName,
-				objectName: view.name,
-				cid: i,
-				columnName: attr.name,
-				isUpdatable: updatable,
-				baseTable: hasBaseTrace ? ref!.tableSchema.name : authoredPutRef ? authoredPutRef.tableSchema.name : null,
-				baseColumn: hasBaseTrace ? bs!.baseColumn : authoredPutRef ? authored!.puts[0].baseColumn : null,
-			});
-		}
-		return rows;
+		return deriveBodyColumnRows(db, schemaName, view.name, view.selectAst);
 	} catch (error) {
 		// A body that fails to plan (stale source, unsupported shape) yields no
 		// rows rather than throwing the whole TVF — logged so a genuinely
@@ -1221,6 +1154,137 @@ function deriveColumnInfo(db: Database, name: string): ColumnInfoRow[] {
 			error instanceof Error ? error.message : String(error));
 		return [];
 	}
+}
+
+/**
+ * The shared body-lineage walk behind `column_info`'s view AND maintained-table
+ * branches: plan `selectAst` **logically** (via `_buildPlan`, not `getPlan`, for
+ * the same lineage-preservation reason as `deriveViewInfo`) and read each output
+ * attribute's backward `updateLineage` site — the same classification the
+ * write-through rewrite applies, so the static surface agrees with the dynamic
+ * `propagate()` truth for both surfaces. Throws on plan failure; each caller
+ * supplies its own conservative fallback. `columnNames`, when given (the
+ * maintained-table caller), positionally overrides the body attribute names —
+ * the owning table's registered columns are the authoritative output names.
+ * Lineage classification (set-op flag membership) still keys off the body
+ * attribute names the AST probes report.
+ */
+function deriveBodyColumnRows(
+	db: Database,
+	schemaName: string,
+	objectName: string,
+	selectAst: AST.QueryExpr,
+	columnNames?: ReadonlyArray<string>,
+): ColumnInfoRow[] {
+	const { plan } = db._buildPlan([selectAst as AST.Statement]);
+	const root = plan.getRelations()[0];
+	if (!root) return [];
+
+	const nodes = collectBodyNodes(root);
+
+	// Set-operation membership body: every column is writable through an *effect*, not a
+	// base mapping — a membership flag flips its branch's presence (insert/delete), a data
+	// column fans out to its member branches (`set-op-membership-write`). So each reports
+	// `is_updatable = 'YES'` with `base_table` / `base_column` = null (no single base
+	// column), the same writable-through-effect shape a join-side existence flag reports.
+	//
+	// Gated on the branch-writability shape probe (parity with `deriveViewInfo`): a body
+	// the dynamic write rejects (outer LIMIT/OFFSET, non-SELECT right, `select *` leg,
+	// computed leg, mismatched leg arity) falls THROUGH to the per-column walk below
+	// instead of the all-`YES` short-circuit. That walk reports every column non-updatable
+	// with null base — a `SetOperationNode` root threads `updateLineage` ONLY for its
+	// membership flags (a read-only `set-op-branch` existence site) and NONE for its data
+	// columns, so `baseSiteOf` resolves no base for either, matching the dynamic reject.
+	// Nested (subtree) operands (`nestable-flagged-set-ops`): data columns + own flags stay
+	// writable-through-effect (`YES`); a SURFACED INNER flag (`inB`/`inC`) is read-only (`NO`) —
+	// writing it addresses a branch inside a subtree (product-coordinate `set-op-membership-nested`).
+	// Empty surfaced-inner set (the binary case) => all-`YES`, unchanged.
+	if (isSetOpMembershipBody(selectAst) && isSetOpBranchWritable(selectAst)) {
+		const innerFlags = new Set(surfacedInnerFlagNames(selectAst).map(n => n.toLowerCase()));
+		return root.getAttributes().map((attr, i): ColumnInfoRow => ({
+			schema: schemaName,
+			objectName,
+			cid: i,
+			columnName: columnNames?.[i] ?? attr.name,
+			isUpdatable: !innerFlags.has(attr.name.toLowerCase()),
+			baseTable: null,
+			baseColumn: null,
+		}));
+	}
+
+	// Non-decomposable join shape gate: cross / comma / subquery-source join bodies
+	// are not write-through-able. `propagate()` decomposes an n-way (≥2) equi-join —
+	// `inner`/`left`/`right`/`full` (RIGHT now admitted, the LEFT mirror; FULL self-conservatizes), composite-PK
+	// sides and self-joins included
+	// (`isDecomposableJoinBody`, the boolean shadow of `collectJoinSources`) — and
+	// rejects every other join shape, so without this gate `baseSiteOf` would resolve
+	// their bases and over-report `is_updatable = 'YES'`. Outer joins ARE decomposable
+	// now; their non-preserved columns are reported updatable per-column below when a
+	// preserved anchor exists (matching the dynamic matched-update / null-extended-insert
+	// materialization), rather than short-circuiting the whole view to all-`NO`.
+	const unsupportedJoinShape = isJoinBody(selectAst) && !isDecomposableJoinBody(selectAst);
+
+	const tableRefsById = buildTableRefsById(nodes);
+	const rootLineage = root.physical?.updateLineage;
+
+	const attrs = root.getAttributes();
+	// Whether the body exposes a PRESERVED base column — a preserved anchor that pins
+	// each view row's identity. A LEFT join has one (the preserved side); a FULL outer
+	// join (every column null-extended) does not, so a non-preserved update there stays
+	// deferred. A non-preserved (`null-extended`) column is now updatable WHEN such an
+	// anchor exists: the matched-update / null-extended-insert materialization keys off
+	// it (`view-write-optional-member-transitions`), matching the dynamic accept.
+	const hasPreservedBase = !unsupportedJoinShape && attrs.some(a => {
+		const s = baseSiteOf(rootLineage?.get(a.id));
+		return s !== undefined && !s.nullExtended;
+	});
+
+	const rows: ColumnInfoRow[] = [];
+	for (let i = 0; i < attrs.length; i++) {
+		const attr = attrs[i];
+		const site = unsupportedJoinShape ? undefined : rootLineage?.get(attr.id);
+		const bs = baseSiteOf(site);
+		const ref = bs ? tableRefsById.get(bs.table) : undefined;
+		// A join-side `exists … as` existence flag has NO base column but is writable
+		// through an *effect* — its flip inserts/deletes the non-preserved side — when a
+		// preserved anchor pins each row's identity (`outer-join-existence-column`).
+		// Report it `is_updatable = 'YES'` with `base_table` / `base_column` = null (it
+		// maps to no base column), matching the dynamic `propagate()` accept. Gated on a
+		// preserved anchor like the non-preserved column: a FULL outer (none) stays
+		// deferred. A `set-op-branch` existence flag is READ-ONLY in this read half
+		// (`set-op-membership-read`) — it reports `is_updatable = 'NO'` with null base
+		// (a set-op view has no preserved base anchor anyway); the write half flips it on.
+		const isExistence = site?.kind === 'existence' && site.component.kind === 'join-side' && hasPreservedBase;
+		// An authored (`with inverse`) column is writable (and insertable) through its
+		// put expressions — report it updatable, with the base trace populated only
+		// for a single-put inverse (a multi-target inverse maps to no single base
+		// column, the same null-base shape an existence flag reports). Agrees with
+		// the dynamic spines, which route authored sites on UPDATE and INSERT alike.
+		const authored = site?.kind === 'authored' ? site : undefined;
+		const authoredPutRef = authored && authored.puts.length === 1
+			? tableRefsById.get(authored.puts[0].table)
+			: undefined;
+		// Updatable iff a base site resolves to a producing TableReferenceNode. A
+		// PRESERVED base column is always updatable; a non-preserved (`null-extended`)
+		// column is updatable when the body has a preserved anchor (the matched-update /
+		// null-extended-insert materialization pins identity off it), and read-only only
+		// when no anchor exists (a FULL outer — write-through stays deferred there). A
+		// base id without a resolved ref should not happen; fail conservative if it does.
+		const updatable = isExistence || authored !== undefined || !!(bs && ref && (!bs.nullExtended || hasPreservedBase));
+		// Base trace is reported only for an actual base column write (an existence flag
+		// is updatable but has no base mapping).
+		const hasBaseTrace = updatable && bs !== undefined && ref !== undefined;
+		rows.push({
+			schema: schemaName,
+			objectName,
+			cid: i,
+			columnName: columnNames?.[i] ?? attr.name,
+			isUpdatable: updatable,
+			baseTable: hasBaseTrace ? ref!.tableSchema.name : authoredPutRef ? authoredPutRef.tableSchema.name : null,
+			baseColumn: hasBaseTrace ? bs!.baseColumn : authoredPutRef ? authored!.puts[0].baseColumn : null,
+		});
+	}
+	return rows;
 }
 
 // Per-column updateability function (table-valued function)

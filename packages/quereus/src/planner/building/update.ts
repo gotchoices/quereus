@@ -17,6 +17,7 @@ import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ReturningNode } from '../nodes/returning-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks } from './foreign-key-builder.js';
 import { isCommittedSchemaRef } from './schema-resolution.js';
 import { validateDeterministicGenerated } from '../validation/determinism-validator.js';
@@ -200,24 +201,14 @@ export function buildUpdateStmt(
   const oldAttributes = tableReference.tableSchema.columns.map((col) => ({
     id: PlanNode.nextAttrId(),
     name: col.name,
-    type: {
-      typeClass: 'scalar' as const,
-      logicalType: col.logicalType,
-      nullable: !col.notNull,
-      isReadOnly: false
-    },
+    type: columnSchemaToScalarType(col),
     sourceRelation: `OLD.${tableReference.tableSchema.name}`
   }));
 
   const newAttributes = tableReference.tableSchema.columns.map((col) => ({
     id: PlanNode.nextAttrId(),
     name: col.name,
-    type: {
-      typeClass: 'scalar' as const,
-      logicalType: col.logicalType,
-      nullable: !col.notNull,
-      isReadOnly: false
-    },
+    type: columnSchemaToScalarType(col),
     sourceRelation: `NEW.${tableReference.tableSchema.name}`
   }));
 
@@ -276,71 +267,26 @@ export function buildUpdateStmt(
     tableReference.tableSchema.columns.forEach((tableColumn, columnIndex) => {
       const newAttributeId = newAttributes[columnIndex].id;
       const oldAttributeId = oldAttributes[columnIndex].id;
+      // RETURNING comparisons resolve the column's declared collation, exactly
+      // like a read-path query over the same schema.
+      const columnType = columnSchemaToScalarType(tableColumn);
 
       // Register the unqualified column name in the RETURNING scope (defaults to NEW values)
-      returningScope.registerSymbol(tableColumn.name.toLowerCase(), (exp, s) => {
-        return new ColumnReferenceNode(
-          s,
-          exp as AST.ColumnExpr,
-          {
-            typeClass: 'scalar',
-            logicalType: tableColumn.logicalType,
-            nullable: !tableColumn.notNull,
-            isReadOnly: false
-          },
-          newAttributeId,
-          columnIndex
-        );
-      });
+      returningScope.registerSymbol(tableColumn.name.toLowerCase(), (exp, s) =>
+        new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, newAttributeId, columnIndex));
 
       // Also register the table-qualified form (table.column) - defaults to NEW values
       const tblQualified = `${tableReference.tableSchema.name.toLowerCase()}.${tableColumn.name.toLowerCase()}`;
       returningScope.registerSymbol(tblQualified, (exp, s) =>
-        new ColumnReferenceNode(
-          s,
-          exp as AST.ColumnExpr,
-          {
-            typeClass: 'scalar',
-            logicalType: tableColumn.logicalType,
-            nullable: !tableColumn.notNull,
-            isReadOnly: false
-          },
-          newAttributeId,
-          columnIndex
-        )
-      );
+        new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, newAttributeId, columnIndex));
 
       // Register NEW.column for UPDATE RETURNING (updated values)
       returningScope.registerSymbol(`new.${tableColumn.name.toLowerCase()}`, (exp, s) =>
-        new ColumnReferenceNode(
-          s,
-          exp as AST.ColumnExpr,
-          {
-            typeClass: 'scalar',
-            logicalType: tableColumn.logicalType,
-            nullable: !tableColumn.notNull,
-            isReadOnly: false
-          },
-          newAttributeId,
-          columnIndex
-        )
-      );
+        new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, newAttributeId, columnIndex));
 
       // Register OLD.column for UPDATE RETURNING (original values)
       returningScope.registerSymbol(`old.${tableColumn.name.toLowerCase()}`, (exp, s) =>
-        new ColumnReferenceNode(
-          s,
-          exp as AST.ColumnExpr,
-          {
-            typeClass: 'scalar',
-            logicalType: tableColumn.logicalType,
-            nullable: !tableColumn.notNull,
-            isReadOnly: false
-          },
-          oldAttributeId,
-          columnIndex
-        )
-      );
+        new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, oldAttributeId, columnIndex));
     });
 
     const returningProjections = stmt.returning.map(rc => {

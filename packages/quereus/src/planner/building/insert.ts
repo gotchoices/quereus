@@ -10,7 +10,7 @@ import { buildDeleteStmt } from './delete.js';
 import { buildWithClause } from './with.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type RowDescriptor } from '../nodes/plan-node.js';
 import { buildExpression } from './expression.js';
-import { checkColumnsAssignable, columnSchemaToDef } from '../type-utils.js';
+import { checkColumnsAssignable, columnSchemaToDef, columnSchemaToScalarType } from '../type-utils.js';
 import type { ColumnDef } from '../../common/datatype.js';
 import type { CTEScopeNode } from '../nodes/cte-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -298,12 +298,7 @@ function buildUpsertClausePlans(
 		const existingAttributes = tableSchema.columns.map((col) => ({
 			id: PlanNode.nextAttrId(),
 			name: col.name,
-			type: {
-				typeClass: 'scalar' as const,
-				logicalType: col.logicalType,
-				nullable: !col.notNull,
-				isReadOnly: true
-			},
+			type: columnSchemaToScalarType(col, { isReadOnly: true }),
 			sourceRelation: `existing.${tableSchema.name}`
 		}));
 
@@ -660,24 +655,15 @@ export function buildInsertStmt(
 	const oldAttributes = tableReference.tableSchema.columns.map((col) => ({
 		id: PlanNode.nextAttrId(),
 		name: col.name,
-		type: {
-			typeClass: 'scalar' as const,
-			logicalType: col.logicalType,
-			nullable: true, // OLD values are always NULL for INSERT
-			isReadOnly: false
-		},
+		// OLD values are always NULL for INSERT
+		type: columnSchemaToScalarType(col, { nullable: true }),
 		sourceRelation: `OLD.${tableReference.tableSchema.name}`
 	}));
 
 	const newAttributes = tableReference.tableSchema.columns.map((col) => ({
 		id: PlanNode.nextAttrId(),
 		name: col.name,
-		type: {
-			typeClass: 'scalar' as const,
-			logicalType: col.logicalType,
-			nullable: !col.notNull,
-			isReadOnly: false
-		},
+		type: columnSchemaToScalarType(col),
 		sourceRelation: `NEW.${tableReference.tableSchema.name}`
 	}));
 

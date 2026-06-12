@@ -15,6 +15,7 @@ import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { combineAnd } from './single-source.js';
 import { transformExpr, cloneExpr } from './scope-transform.js';
 import { buildExpression } from '../building/expression.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { createRuntimeExpressionEvaluator } from '../analysis/const-evaluator.js';
 import { containsNonDeterministicCall } from '../analysis/check-extraction.js';
 import { FunctionFlags } from '../../common/constants.js';
@@ -455,12 +456,12 @@ function routeInsertColumn(
 		case 'member': {
 			const ref = memberRefs.get(route.member.relationId)!;
 			const col = columnByName(view, ref.tableSchema, route.baseColumn);
-			return { name, envelopeIndex: idx, type: columnScalarType(col), columnar: { relationId: route.member.relationId, basisColumn: route.baseColumn } };
+			return { name, envelopeIndex: idx, type: columnSchemaToScalarType(col), columnar: { relationId: route.member.relationId, basisColumn: route.baseColumn } };
 		}
 		case 'eav': {
 			const ref = memberRefs.get(route.member.relationId)!;
 			const valCol = columnByName(view, ref.tableSchema, route.member.attributePivot!.valueColumn);
-			return { name, envelopeIndex: idx, type: columnScalarType(valCol), eav: route.member, eavAttribute: declaredNames.get(name) ?? rawName };
+			return { name, envelopeIndex: idx, type: columnSchemaToScalarType(valCol), eav: route.member, eavAttribute: declaredNames.get(name) ?? rawName };
 		}
 		case 'computed-mapping':
 			return raiseMutationDiagnostic({
@@ -653,10 +654,6 @@ function columnByName(view: MutableViewLike, schema: TableSchema, name: string):
 		});
 	}
 	return col;
-}
-
-function columnScalarType(col: ColumnSchema): ScalarType {
-	return { typeClass: 'scalar', logicalType: col.logicalType, nullable: !col.notNull, isReadOnly: false };
 }
 
 /**
