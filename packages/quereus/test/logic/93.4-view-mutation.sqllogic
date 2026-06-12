@@ -716,6 +716,138 @@ update ax_three set pv = bv where cid = 2;
 select pid, pv from ax_parent order by pid;
 → [{"pid":10,"pv":100},{"pid":20,"pv":200}]
 
+-- ========================================================================
+-- Cross-source SET / authored read of a partner column projected UNQUALIFIED.
+-- A join-view body may project a partner-side column BARE when the name is
+-- unambiguous across the sides. The leftover unqualified base-term ref is resolved
+-- to its owning side by UNIQUE column ownership (the exact rule join-condition
+-- operands use), and a partner-owned ref rides the IDENTICAL `__vmupd_keys` capture
+-- machinery as a qualified `b.y` read — it no longer mis-routes into the owning
+-- side's base UPDATE with a generic `Column not found`. The qualified analogues
+-- above (ax_jv_x, ax_xscpk_v, xs1n_v, xs1u_v, mj_v) all still hold.
+-- See docs/view-updateability.md § Inner Join, cross-source `set`.
+-- ========================================================================
+
+-- (uq-1) headline: partner column `pv` projected UNQUALIFIED, read cross-source into the
+-- child's `cval` (the unqualified analogue of ax_jv_x). For cid=2 (joined parent pid=20,
+-- pv=200) cval becomes 200; cid=1 untouched; the parent base is unchanged.
+create table uq_p (pid integer primary key, pv integer);
+create table uq_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq_p(pid));
+insert into uq_p values (10, 100), (20, 200);
+insert into uq_c values (1, 10, 1), (2, 20, 2);
+create view uq_jv as
+    select c.cid as cid, cval, pv from uq_c c join uq_p p on p.pid = c.pref;
+update uq_jv set cval = pv where cid = 2;
+select cid, cval from uq_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":200}]
+select pid, pv from uq_p order by pid;
+→ [{"pid":10,"pv":100},{"pid":20,"pv":200}]
+
+-- (uq-2) owning-side UNQUALIFIED read: both the assigned and the read column live on the
+-- SAME (owning) side, the read projected bare → resolves to the owning side → PLAIN
+-- qualifier strip, value lands locally with NO `srcN` capture minted (byte-identical to a
+-- qualified same-side read). `cval2 = cval` copies within the child.
+create table uq2_p (pid integer primary key, pv integer);
+create table uq2_c (cid integer primary key, pref integer, cval integer, cval2 integer,
+    foreign key (pref) references uq2_p(pid));
+insert into uq2_p values (10, 100);
+insert into uq2_c values (1, 10, 7, 0);
+create view uq2_jv as
+    select c.cid as cid, cval, cval2, pv from uq2_c c join uq2_p p on p.pid = c.pref;
+update uq2_jv set cval2 = cval where cid = 1;
+select cid, cval, cval2 from uq2_c order by cid;
+→ [{"cid":1,"cval":7,"cval2":7}]
+
+-- (uq-3) COMPOSITE-PK owning side, partner `pv` projected UNQUALIFIED: the correlated
+-- read-back still conjoins one equality per owning PK column (k.k0_0 = k1 and k.k0_1 = k2),
+-- so only the identified row (k1=1, k2=2 — joined parent pp=20, pv=200) takes the value.
+create table uq3_k (k1 integer, k2 integer, v integer, ref integer, primary key (k1, k2));
+create table uq3_p (pp integer primary key, pv integer);
+insert into uq3_p values (10, 100), (20, 200);
+insert into uq3_k values (1, 1, 0, 10), (1, 2, 0, 20);
+create view uq3_v as
+    select k.k1 as k1, k.k2 as k2, v, pv from uq3_k k join uq3_p p on p.pp = k.ref;
+update uq3_v set v = pv where k1 = 1 and k2 = 2;
+select k1, k2, v from uq3_k order by k1, k2;
+→ [{"k1":1,"k2":1,"v":0},{"k1":1,"k2":2,"v":200}]
+
+-- (uq-4) partner's join column is UNIQUE but NOT the PK, partner `pv` projected UNQUALIFIED
+-- → accepted via the unique-constraint branch of the cardinality proof. For cid=1 (joined
+-- parent pcode=500, pv=100) cv becomes 100; cid=2 (pcode=600, pv=200) untouched.
+create table uq4_p (pid integer primary key, pcode integer unique, pv integer);
+create table uq4_c (cid integer primary key, cref integer, cv integer);
+insert into uq4_p values (10, 500, 100), (20, 600, 200);
+insert into uq4_c values (1, 500, 1), (2, 600, 2);
+create view uq4_v as
+    select c.cid as cid, cv, pv from uq4_c c join uq4_p p on p.pcode = c.cref;
+update uq4_v set cv = pv where cid = 1;
+select cid, cv from uq4_c order by cid;
+→ [{"cid":1,"cv":100},{"cid":2,"cv":2}]
+
+-- (uq-5) `srcN` dedup: one statement reads the SAME partner column both QUALIFIED
+-- (`pvq` ← p.pv) and UNQUALIFIED (`pvu` ← bare pv). Qualifying the bare ref with the
+-- partner alias BEFORE registering the capture maps both to the dedup key `p.pv`, so a
+-- single `srcN` projection backs both reads. (The result is value-equivalent whether one
+-- or two srcN are minted — the assertion proves both routes resolve consistently in one
+-- statement; the count itself is an internal invariant, not separately asserted.) For
+-- cid=1 (joined parent pid=20, pv=200) both cv and cw read 200.
+create table uq5_p (pid integer primary key, pv integer);
+create table uq5_c (cid integer primary key, pref integer, cv integer, cw integer,
+    foreign key (pref) references uq5_p(pid));
+insert into uq5_p values (10, 100), (20, 200);
+insert into uq5_c values (1, 20, 0, 0);
+create view uq5_v as
+    select c.cid as cid, c.cv as cv, c.cw as cw, p.pv as pvq, pv as pvu
+    from uq5_c c join uq5_p p on p.pid = c.pref;
+update uq5_v set cv = pvq, cw = pvu where cid = 1;
+select cid, cv, cw from uq5_c order by cid;
+→ [{"cid":1,"cv":200,"cw":200}]
+
+-- (uq-6) authored-inverse put reading `new.<UNQUALIFIED partner column>`: the put on side
+-- `b` (writing bv) reads `new.av` where `av` is projected BARE off side `a`. The forward
+-- read of the non-assigned partner column rides the same capture as a cross-source SET
+-- value (the unqualified analogue of mj_v). `bv2 = 'y'` ⇒ bv = 'y' || '+' || (captured av).
+create table uq6_a (pid integer primary key, av text);
+create table uq6_b (bid integer primary key, pid integer not null references uq6_a(pid), bv text);
+insert into uq6_a values (1, 'a');
+insert into uq6_b values (10, 1, 'b');
+create view uq6_v as select uq6_a.pid as pid, uq6_b.bid as bid, av,
+        bv || '' as bv2 with inverse (bv = new.bv2 || '+' || new.av)
+    from uq6_a join uq6_b on uq6_a.pid = uq6_b.pid;
+update uq6_v set bv2 = 'y' where pid = 1;
+select bv from uq6_b;
+→ [{"bv":"y+a"}]
+
+-- (uq-7) 1:MANY direction with an UNQUALIFIED partner read → still rejected at PLAN TIME
+-- (the cardinality gate resolves the bare ref via resolveColumnSide). Owning side `p` joins
+-- TWO children, so the partner read `cv` is multi-valued and the proof fails.
+create table uq7_p (pid integer primary key, pv integer);
+create table uq7_c (cid integer primary key, pref integer, cv integer,
+    foreign key (pref) references uq7_p(pid));
+insert into uq7_p values (10, 100);
+insert into uq7_c values (1, 10, 11), (2, 10, 22);
+create view uq7_v as
+    select p.pid as pid, pv, cv from uq7_p p join uq7_c c on c.pref = p.pid;
+update uq7_v set pv = cv where pid = 10;
+-- error: assigned side joins more than one
+-- ...plan-time reject: uq7_p is unchanged.
+select pid, pv from uq7_p order by pid;
+→ [{"pid":10,"pv":100}]
+
+-- (uq-8) COMPUTED (non-base) partner column read UNQUALIFIED → still rejected `no-inverse`
+-- (gateCrossSourceReads walks the pre-substitution view term, so it sees the computed view
+-- column regardless of qualification). The capture cannot carry a non-base value.
+create table uq8_p (pid integer primary key, pv integer);
+create table uq8_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq8_p(pid));
+insert into uq8_p values (10, 100);
+insert into uq8_c values (1, 10, 1);
+create view uq8_v as
+    select c.cid as cid, cval, (pv * 2) as pvc from uq8_c c join uq8_p p on p.pid = c.pref;
+update uq8_v set cval = pvc where cid = 1;
+-- error: cannot write through
+
 -- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
 -- order the base deletes FK-child before FK-parent. The canonical columnar split has each
 -- member's PK reference the anchor's (axd_b, axd_c -> axd_a); deleting the parent first

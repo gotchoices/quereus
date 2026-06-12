@@ -1531,7 +1531,6 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// only when a capture carrier is threaded — the legacy path rejects wholesale.
 			if (registerCrossSource) gateCrossSourceReads(valueViewTerms, owningSideIndex, analysis, view);
 			const side = analysis.sides[owningSideIndex];
-			const others = analysis.sides.filter((_, i) => i !== owningSideIndex);
 			// Cross-source cardinality gate (§ Inner Join, cross-source `set`): a cross-source
 			// value `set owner.x = partner.y` is well-defined only when the owning side joins AT
 			// MOST ONE partner row — else the capture's correlated read-back is multi-valued and
@@ -1567,7 +1566,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// value (`registerCrossSource`); absent the carrier it is rejected.
 			return stripSideQualifier(
 				substituteViewColumns(ctx, valueViewTerms, analysis.viewColToBaseRef, view),
-				view, side, owningSideIndex, others, registerCrossSource, gateCrossSourceCardinality,
+				view, side, owningSideIndex, analysis.sides, registerCrossSource, gateCrossSourceCardinality,
 			);
 		};
 		// An authored (`with inverse`) column lowers to one base assignment per put,
@@ -2430,6 +2429,14 @@ function substituteViewColumns(
  * side shares the owning side's table name) still strips an owning-alias reference; only
  * a reference qualified by a *different alias* is the cross-source case.
  *
+ * An **unqualified** base-term leaf (a body projecting a column bare — legal when the name
+ * is unambiguous across the sides) is resolved to its owning side by **unique column
+ * ownership**, the exact rule `resolveColumnSide` applies to join-condition operands: an
+ * owning-side (or unresolvable) name stays bare and resolves in the lowered single-table
+ * UPDATE; a **partner**-owned name is qualified with that partner's alias and routed
+ * through the identical cross-source capture path a qualified `b.y` rides — so a partner
+ * column projected unqualified no longer mis-routes into the owning side's base UPDATE.
+ *
  * A cross-source read is rewritten to `(select <srcN> from __vmupd_keys k where
  * k.k<owningSide>_0 = <pk0> [and …])`: `registerCrossSource` projects the partner column
  * into the capture under `srcN` and returns the alias; the unqualified `<pk_j>` bind to
@@ -2449,39 +2456,68 @@ function stripSideQualifier(
 	view: MutableViewLike,
 	owning: JoinSide,
 	owningSideIndex: number,
-	others: readonly JoinSide[],
+	allSides: readonly JoinSide[],
 	registerCrossSource: ((col: AST.ColumnExpr) => string) | undefined,
 	gateCrossSourceCardinality?: (partnerCol: AST.ColumnExpr) => void,
 ): AST.Expression {
 	const owningQuals = new Set([owning.alias, owning.schema.name.toLowerCase()]);
 	const otherQuals = new Set<string>();
-	for (const o of others) {
-		otherQuals.add(o.alias);
-		otherQuals.add(o.schema.name.toLowerCase());
-	}
+	allSides.forEach((s, i) => {
+		if (i === owningSideIndex) return;
+		otherQuals.add(s.alias);
+		otherQuals.add(s.schema.name.toLowerCase());
+	});
 	// The owning side's PK — the correlation a captured cross-source read binds on.
 	// Resolved lazily (only a cross-source rewrite needs it).
 	let owningPk: readonly string[] | undefined;
+	// Route a partner-side base-column read through the up-front capture: project it into
+	// `__vmupd_keys` under a stable `srcN` alias and rewrite the reference to a correlated
+	// scalar read of it, keyed by the owning side's PK. Shared by the qualified-other branch
+	// and the unqualified-partner branch (both lower identically; the `srcN` dedup key is
+	// `<table>.<col>`, so a body mixing `a.av` and a partner-resolved bare `av` — qualified
+	// here with the same alias — mints ONE capture column). Absent a capture carrier (the
+	// legacy non-build path) reject `cross-source-assignment`.
+	const routePartnerRead = (col: AST.ColumnExpr): AST.Expression => {
+		if (!registerCrossSource) {
+			raiseMutationDiagnostic({
+				reason: 'cross-source-assignment',
+				column: col.name,
+				table: view.name,
+				message: `cannot write through view '${view.name}': an update value references column '${col.name}' on a different base table than the column it assigns; cross-source assignment is not supported`,
+			});
+		}
+		// Reject the 1:many direction at plan time before lowering to a (multi-valued)
+		// correlated read of the capture (§ Inner Join, cross-source `set`).
+		gateCrossSourceCardinality?.(col);
+		const srcAlias = registerCrossSource(col);
+		owningPk ??= requireKeyColumns(view, owning);
+		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk);
+	};
 	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
-		if (!col.table) return undefined;
+		if (!col.table) {
+			// An UNQUALIFIED base-term leaf. Resolve its owning side by UNIQUE column
+			// ownership — the exact rule `resolveColumnSide` applies to join-condition
+			// operands. Owning-side OR unresolvable (a correlated outer ref, a name on no
+			// side) → leave bare: it resolves correctly in the lowered single-table UPDATE,
+			// or keeps its pre-existing pass-through. Partner-owned → qualify with that
+			// side's alias and route through the SAME capture path the qualified `b.y`
+			// branch uses (qualifying before `registerCrossSource` makes the projection
+			// byte-identical and the `srcN` dedup consistent with `a.av`).
+			//
+			// Preference 2 (a structured side-ambiguity diagnostic) is intentionally NOT
+			// added: `resolveColumnSide` returns `undefined` for a name owned by TWO+ sides,
+			// but such a body projection (`select av …` with `av` on both sides) is already
+			// rejected as ambiguous at body planning (analyzeBodyLineage → buildSelectStmt)
+			// before decomposition ever reaches this leaf — the branch would be unreachable
+			// dead code. The remaining `undefined` case (a name on NO side) is not a
+			// side-ambiguity and must keep its bare pass-through.
+			const side = resolveColumnSide(col, allSides);
+			if (side === undefined || side === owningSideIndex) return undefined;
+			return routePartnerRead({ ...col, table: allSides[side].alias });
+		}
 		const t = col.table.toLowerCase();
 		if (owningQuals.has(t)) return { type: 'column', name: col.name };
-		if (otherQuals.has(t)) {
-			if (!registerCrossSource) {
-				raiseMutationDiagnostic({
-					reason: 'cross-source-assignment',
-					column: col.name,
-					table: view.name,
-					message: `cannot write through view '${view.name}': an update value references column '${col.name}' on a different base table than the column it assigns; cross-source assignment is not supported`,
-				});
-			}
-			// Reject the 1:many direction at plan time before lowering to a (multi-valued)
-			// correlated read of the capture (§ Inner Join, cross-source `set`).
-			gateCrossSourceCardinality?.(col);
-			const srcAlias = registerCrossSource(col);
-			owningPk ??= requireKeyColumns(view, owning);
-			return capturedValueSubquery(srcAlias, owningSideIndex, owningPk);
-		}
+		if (otherQuals.has(t)) return routePartnerRead(col);
 		return undefined;
 	};
 	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
