@@ -330,5 +330,61 @@ describe('Maintained-table declared-constraint validation', () => {
 					`row derived into maintained table 'main.mt' references a missing 'main.parent'`);
 			});
 		});
+
+		describe('shared dependency across plans', () => {
+			// The rebuild scans every registered plan; the other cases only ever have a
+			// single matching plan. Two maintained tables sharing one FK parent exercise
+			// the multi-plan path — a single rename must rebuild BOTH validators.
+			it('renaming an FK parent shared by two maintained tables rebuilds both validators', async () => {
+				await db.exec(`
+					create table parent (pid integer primary key);
+					create table sa (id integer primary key, ref integer null);
+					create table sb (id integer primary key, ref integer null);
+					create table ma (id integer primary key, ref integer null references parent(pid))
+						maintained as select id, ref from sa;
+					create table mb (id integer primary key, ref integer null references parent(pid))
+						maintained as select id, ref from sb;
+					insert into parent values (10);
+					alter table parent rename to parent2;
+				`);
+				// Both maintained tables re-resolve against the renamed parent: a valid
+				// ref flows…
+				await db.exec(`insert into sa values (1, 10)`);
+				await db.exec(`insert into sb values (1, 10)`);
+				expect(await readAll('select * from ma')).to.deep.equal([{ id: 1, ref: 10 }]);
+				expect(await readAll('select * from mb')).to.deep.equal([{ id: 1, ref: 10 }]);
+				// …and each rejects an orphan with attribution against the RENAMED parent.
+				await expectError(`insert into sa values (2, 99)`,
+					`row derived into maintained table 'main.ma' references a missing 'main.parent2'`);
+				await expectError(`insert into sb values (2, 99)`,
+					`row derived into maintained table 'main.mb' references a missing 'main.parent2'`);
+			});
+		});
+
+		describe('rebuild preserves existing maintained rows', () => {
+			// The rebuild swaps only the validator; the backing rows must be untouched.
+			it('an FK-parent rename leaves pre-existing maintained rows intact and validates new writes', async () => {
+				await db.exec(`
+					create table parent (pid integer primary key);
+					create table src (id integer primary key, ref integer null);
+					create table mt (id integer primary key, ref integer null references parent(pid))
+						maintained as select id, ref from src;
+					insert into parent values (10);
+					insert into src values (1, 10);
+				`);
+				// A row validated against the pre-rename parent is already in the backing.
+				expect(await readAll('select * from mt order by id')).to.deep.equal([{ id: 1, ref: 10 }]);
+				await db.exec(`alter table parent rename to parent2`);
+				// The pre-existing row survives the rename untouched…
+				expect(await readAll('select * from mt order by id')).to.deep.equal([{ id: 1, ref: 10 }]);
+				// …a new conforming write still maintains against the renamed parent…
+				await db.exec(`insert into src values (2, 10)`);
+				expect(await readAll('select * from mt order by id'))
+					.to.deep.equal([{ id: 1, ref: 10 }, { id: 2, ref: 10 }]);
+				// …and an orphan is rejected against the renamed parent.
+				await expectError(`insert into src values (3, 99)`,
+					`row derived into maintained table 'main.mt' references a missing 'main.parent2'`);
+			});
+		});
 	});
 });
