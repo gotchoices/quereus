@@ -59,3 +59,21 @@ Related (does not cover this): `maintained-table-dml-executor-backstop`
 (implement/) handles rejecting direct writes against maintained tables (user
 DML routes through write-through); this ticket is about
 what the *derivation's own writes* owe the declared constraints.
+
+## Triage decision (2026-06-12, human sign-off)
+
+**Option 2 — validate derived rows.** Declared constraints on a maintained
+table are real claims over the derivation: the fill, the attach reconcile, and
+steady-state row-time maintenance must evaluate declared CHECKs (and FK
+existence, gated on the `foreign_keys` pragma) against the rows they write,
+failing the writing statement on violation with a diagnostic that names the
+maintained table and the constraint (the writing statement targets a different
+table, so attribution is load-bearing). This matches the engine's
+constraints-are-logical-claims philosophy (assertions, lens constraint
+attachment). Plan-stage questions: reuse of the existing row-local constraint
+check machinery vs. a maintenance-path evaluator; whether subquery-bearing
+CHECKs and FKs defer to commit like ordinary tables (they should, riding the
+same DeltaExecutor kernel where possible); cost gating (skip evaluation
+entirely for tables declaring no constraints — the common case must stay
+zero-overhead); attach-reconcile validates pre-existing rows so detach can
+never strand violating rows.

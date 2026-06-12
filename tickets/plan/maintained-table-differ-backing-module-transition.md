@@ -74,3 +74,15 @@ materialized-views.md gap note must be updated to match the chosen behavior.
   `using memory()` against a default-backed table) produces an empty diff.
 - Docs and the pinning tests reflect the chosen semantics; full declarative suite
   green.
+
+## Triage decision (2026-06-12, human sign-off)
+
+**Surface + migrate, behind the destructive-change acknowledgement.** Thread
+`backingModuleName`/`backingModuleArgs` (normalized as the pre-6.3 MV loop
+did: absent ⇒ memory, `mem` aliased, stable-key-order args) into the table
+comparison; on drift emit the drop-maintained → drop → recreate-using-new-module
+sequence through the existing declarative destructive-ack mechanism — an
+incarnation-minting migration the user must acknowledge, clearly distinct from
+a non-destructive body re-attach. Idempotence acceptance (explicit
+`using memory()` vs default-backed ⇒ empty diff) and updating the two pinning
+tests + the materialized-views.md gap note are in the ticket body above.
