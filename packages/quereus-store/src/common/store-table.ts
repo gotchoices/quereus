@@ -848,25 +848,45 @@ export class StoreTable extends VirtualTable {
 				// Check for existing row (for conflict handling).
 				// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
 				const pkEffective = args.onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
-				const existing = await store.get(key);
+
+				// Trusted-flush safety analysis — why this arm diverges from the others.
+				// The insert arm's probe stays committed-only on the trusted-flush path,
+				// while the update/delete arms below read the effective
+				// (pending-over-committed) image UNCONDITIONALLY. That divergence is
+				// safe: `flushOverlayToUnderlying` (isolation, isolated-table.ts) wraps
+				// the flush in its own coordinator mini-transaction, the overlay holds
+				// at most ONE entry per PK, and tombstone deletes are ordered before
+				// inserts/updates — so when any flush write probes its own key, no
+				// pending op exists at that key yet in the mini-transaction and the
+				// effective read equals the committed read on every trusted probe. The
+				// committed-only read kept here is therefore NOT a read-correctness
+				// requirement but a pinned INTERNAL invariant: the flush routes existing
+				// PKs to update, so a row present here is an isolation-layer violation we
+				// must surface loudly (store-backing-host-substrate analysis).
+				let existingRow: Row | null;
+				if (args.trustedWrite) {
+					const committed = await store.get(key);
+					existingRow = committed ? deserializeRow(committed) : null;
+				} else {
+					existingRow = await this.readEffectiveRowByKey(key);
+				}
 				if (args.trustedWrite) {
 					// Trusted flush insert: the overlay flush routes existing PKs to
 					// update (via rowExistsInUnderlying), so a row already present here
 					// is an isolation-layer invariant violation. Fail loudly rather than
 					// silently overwrite — the flush try/catch rolls back and rethrows
 					// (isolation-merged-unique-stale-underlying-false-positive).
-					if (existing) {
+					if (existingRow) {
 						throw new QuereusError(
 							`Trusted flush insert on '${this.tableName}' hit an existing PK; the overlay flush should route existing PKs to update. This indicates an isolation-layer invariant violation.`,
 							StatusCode.INTERNAL,
 						);
 					}
-				} else if (existing) {
+				} else if (existingRow) {
 					if (pkEffective === ConflictResolution.IGNORE) {
 						return { status: 'ok', row: undefined };
 					}
 					if (pkEffective !== ConflictResolution.REPLACE) {
-						const existingRow = deserializeRow(existing);
 						return {
 							status: 'constraint',
 							constraint: 'unique',
@@ -894,7 +914,7 @@ export class StoreTable extends VirtualTable {
 					if (ucResult) return ucResult;
 				}
 
-				const oldRow = existing ? deserializeRow(existing) : null;
+				const oldRow = existingRow;
 				const serializedRow = serializeRow(coerced);
 				if (inTransaction) {
 					coordinator.put(key, serializedRow);
@@ -902,11 +922,13 @@ export class StoreTable extends VirtualTable {
 					await store.put(key, serializedRow);
 				}
 
-				// Update secondary indexes
+				// Update secondary indexes. An effective `oldRow` (a pending row at the
+				// same PK, evicted under REPLACE) cancels the earlier pending index-put;
+				// a commit-batch delete of a never-committed index key is a harmless no-op.
 				await this.updateSecondaryIndexes(inTransaction, oldRow, coerced, pk);
 
 				// Track statistics (only count as new if not replacing)
-				if (!existing) {
+				if (!existingRow) {
 					this.trackMutation(+1, inTransaction);
 				}
 
@@ -952,9 +974,14 @@ export class StoreTable extends VirtualTable {
 				const oldKey = buildDataKey(oldPk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 				const newKey = buildDataKey(newPk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 
-				// Get old row for index updates
-				const oldRowData = await store.get(oldKey);
-				const oldRow = oldRowData ? deserializeRow(oldRowData) : null;
+				// Get old row for index updates. Read the effective
+				// (pending-over-committed) image UNCONDITIONALLY — including the trusted
+				// flush path — so an old image written earlier in the same transaction is
+				// visible. This fixes index cleanup, the `uniqueColumnsChanged` gate, and
+				// the event's `oldRow`. Trusted is safe here (see the insert-arm comment):
+				// deletes-first ordering + one-entry-per-PK ⇒ effective ≡ committed on a
+				// flush write probing its own key.
+				const oldRow = await this.readEffectiveRowByKey(oldKey);
 
 				// A PK "change" only relocates the row when the ENCODED key differs.
 				// Under a non-binary PK collation (e.g. NOCASE) a case-only rewrite
@@ -971,15 +998,16 @@ export class StoreTable extends VirtualTable {
 				// PK-change UPDATE collides like an INSERT at the new key.
 				// Capture the evicted row so it can be reported via `replacedRow`
 				// (consumed by the executor for ON DELETE cascade/SET NULL of the
-				// row at the new PK). Read through the coordinator so an evictee
-				// written earlier in the same transaction is visible.
+				// row at the new PK). Read the effective (pending-over-committed) image
+				// so an evictee written earlier in the same transaction conflicts/evicts
+				// rather than being silently overwritten.
 				// Skipped for trusted flush writes — the overlay flush never changes a
 				// row's PK (oldKeyValues and the row's PK columns are the same overlay
 				// entry), so pkChanged is false there; the guard makes the intent explicit.
 				let replacedAtNewPk: Row | null = null;
 				if (pkChanged && !args.trustedWrite) {
-					const existingAtNew = await store.get(newKey);
-					if (existingAtNew) {
+					const existingAtNewRow = await this.readEffectiveRowByKey(newKey);
+					if (existingAtNewRow) {
 						if (pkEffective === ConflictResolution.IGNORE) {
 							return { status: 'ok', row: undefined };
 						}
@@ -988,10 +1016,10 @@ export class StoreTable extends VirtualTable {
 								status: 'constraint',
 								constraint: 'unique',
 								message: `UNIQUE constraint failed: ${this.tableName} PK.`,
-								existingRow: deserializeRow(existingAtNew),
+								existingRow: existingAtNewRow,
 							};
 						}
-						replacedAtNewPk = deserializeRow(existingAtNew);
+						replacedAtNewPk = existingAtNewRow;
 					}
 				}
 
@@ -1074,9 +1102,15 @@ export class StoreTable extends VirtualTable {
 				const pk = this.extractPK(oldKeyValues);
 				const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 
-				// Get old row for index cleanup
-				const oldRowData = await store.get(key);
-				const oldRow = oldRowData ? deserializeRow(oldRowData) : null;
+				// Get old row for index cleanup. Read the effective
+				// (pending-over-committed) image so a row inserted earlier in the same
+				// transaction is seen: this fixes index cleanup, the `-1` stats delta
+				// (netting an insert+delete to zero), and the event's `oldRow`.
+				// `coordinator.delete(key)` cancels a pending put; a commit-batch delete
+				// of a never-committed key is a harmless no-op. The trusted flush delete
+				// arm does NOT pass `trustedWrite`, but deletes-first ordering +
+				// one-entry-per-PK keep effective ≡ committed there too (see insert arm).
+				const oldRow = await this.readEffectiveRowByKey(key);
 
 				if (inTransaction) {
 					coordinator.delete(key);

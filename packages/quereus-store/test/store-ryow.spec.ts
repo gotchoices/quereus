@@ -15,12 +15,14 @@ import {
 	StoreModule,
 	StoreTable,
 	InMemoryKVStore,
+	StoreEventEmitter,
 	buildDataKey,
 	serializeRow,
 	type KVStoreProvider,
 	type KVStore,
 	type IterateOptions,
 	type KVEntry,
+	type DataChangeEvent,
 } from '../src/index.js';
 
 async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
@@ -250,5 +252,165 @@ describe('StoreTable read-your-own-writes (bare StoreModule)', () => {
 			}
 			expect(out).to.deep.equal([buildDataKey([1]), buildDataKey([2])]);
 		});
+	});
+});
+
+/**
+ * DML internal reads (the insert PK-conflict probe, the update/delete old-image
+ * reads, and the update PK-change conflict probe) must read through the same
+ * pending-over-committed merge as `query()`. Otherwise a row written earlier in
+ * the same transaction lives only in the coordinator's pending bucket, so the
+ * committed-only probes report "absent": no PK conflict, no secondary-index
+ * cleanup, wrong stats deltas, and events with a missing `oldRow`.
+ */
+describe('StoreTable DML internal reads are pending-aware (bare StoreModule)', () => {
+	let db: Database;
+	let provider: KVStoreProvider & { stores: Map<string, InMemoryKVStore> };
+	let module: StoreModule;
+	let events: DataChangeEvent[];
+
+	/** In-memory provider that exposes its store map so index entries are countable. */
+	function createExposedProvider(): KVStoreProvider & { stores: Map<string, InMemoryKVStore> } {
+		const stores = new Map<string, InMemoryKVStore>();
+		const get = (key: string) => {
+			if (!stores.has(key)) stores.set(key, new InMemoryKVStore());
+			return stores.get(key)!;
+		};
+		return {
+			stores,
+			async getStore(s, t) { return get(`${s}.${t}`); },
+			async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
+			async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
+			async getCatalogStore() { return get('__catalog__'); },
+			async closeStore() {},
+			async closeIndexStore() {},
+			async closeAll() {
+				for (const store of stores.values()) await store.close();
+				stores.clear();
+			},
+		};
+	}
+
+	beforeEach(() => {
+		db = new Database();
+		provider = createExposedProvider();
+		const emitter = new StoreEventEmitter();
+		events = [];
+		emitter.onDataChange(e => events.push(e));
+		module = new StoreModule(provider, emitter);
+		db.registerModule('store', module);
+	});
+
+	afterEach(async () => {
+		await provider.closeAll();
+	});
+
+	/** Committed estimated row count of `main.t` from the live table. */
+	const rowCount = () => module.getTable('main', 't')!.getEstimatedRowCount();
+	/** Entry count of the backing KV store for index `ix` on `main.t`. */
+	const indexSize = (ix: string) => provider.stores.get(`main.t_idx_${ix}`)?.size ?? 0;
+
+	it('insert over a pending PK raises UNIQUE (ABORT)', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1, 'a')`);
+		let failed = false;
+		try {
+			await db.exec(`insert into t values (1, 'b')`);
+		} catch {
+			failed = true;
+		}
+		expect(failed).to.equal(true, 'duplicate PK over a pending row must be rejected');
+		// The pending row is untouched.
+		expect(await collect(db, `select id, v from t`)).to.deep.equal([{ id: 1, v: 'a' }]);
+		await db.exec(`rollback`);
+	});
+
+	it('insert or ignore over a pending PK keeps the original row', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1, 'a')`);
+		await db.exec(`insert or ignore into t values (1, 'b')`);
+		expect(await collect(db, `select id, v from t`)).to.deep.equal([{ id: 1, v: 'a' }]);
+		await db.exec(`commit`);
+		expect(await collect(db, `select id, v from t`)).to.deep.equal([{ id: 1, v: 'a' }]);
+		expect(await rowCount()).to.equal(1);
+	});
+
+	it('insert or replace over a pending PK overwrites it: one row, stats 1, update event with the pending oldRow', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1, 'a')`);
+		await db.exec(`insert or replace into t values (1, 'b')`);
+		await db.exec(`commit`);
+		expect(await collect(db, `select id, v from t`)).to.deep.equal([{ id: 1, v: 'b' }]);
+		expect(await rowCount()).to.equal(1);
+		const updates = events.filter(e => e.type === 'update');
+		expect(updates).to.have.lengthOf(1);
+		expect(updates[0].oldRow).to.deep.equal([1, 'a']);
+		expect(updates[0].newRow).to.deep.equal([1, 'b']);
+	});
+
+	it('updating an indexed column on a pending row leaves exactly one index entry', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`create index ix_v on t (v)`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1, 'old')`);
+		await db.exec(`update t set v = 'new' where id = 1`);
+		await db.exec(`commit`);
+		expect(await collect(db, `select id, v from t`)).to.deep.equal([{ id: 1, v: 'new' }]);
+		// The stale 'old' index entry must be removed, not leaked beside 'new'.
+		expect(indexSize('ix_v')).to.equal(1);
+		// The update arm read the pending old image, so its event carries it.
+		const updates = events.filter(e => e.type === 'update');
+		expect(updates).to.have.lengthOf(1);
+		expect(updates[0].oldRow).to.deep.equal([1, 'old']);
+		expect(updates[0].newRow).to.deep.equal([1, 'new']);
+	});
+
+	it('insert then delete within a transaction nets to empty: no rows, stats 0, zero index entries', async () => {
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+		await db.exec(`create index ix_v on t (v)`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1, 'x')`);
+		await db.exec(`delete from t where id = 1`);
+		await db.exec(`commit`);
+		expect(await collect(db, `select id, v from t`)).to.deep.equal([]);
+		expect(await rowCount()).to.equal(0);
+		expect(indexSize('ix_v')).to.equal(0);
+		// The delete saw the pending row, so it emitted a delete carrying its oldRow.
+		const deletes = events.filter(e => e.type === 'delete');
+		expect(deletes).to.have.lengthOf(1);
+		expect(deletes[0].oldRow).to.deep.equal([1, 'x']);
+	});
+
+	it('PK-change UPDATE onto a pending row raises UNIQUE (ABORT)', async () => {
+		await db.exec(`create table t (id integer primary key) using store`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1), (2)`);
+		let failed = false;
+		try {
+			await db.exec(`update t set id = 2 where id = 1`);
+		} catch {
+			failed = true;
+		}
+		expect(failed).to.equal(true, 'a PK change onto a pending row must conflict');
+		await db.exec(`rollback`);
+	});
+
+	// `UPDATE OR <action>` is intentionally unsupported by the parser (logic/47.2
+	// §5), so the only SQL-level way to drive the PK-change REPLACE path is a
+	// schema-level `PRIMARY KEY ON CONFLICT REPLACE` default.
+	it('PK-change UPDATE evicts a pending row at the new PK under PRIMARY KEY ON CONFLICT REPLACE', async () => {
+		await db.exec(`create table t (id integer primary key on conflict replace, v text) using store`);
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (1, 'one'), (2, 'two')`);
+		// No statement-level OR; the column-level REPLACE applies. The colliding
+		// row at PK 2 is pending — committed-only probes would miss it (the bug).
+		await db.exec(`update t set id = 2 where id = 1`);
+		await db.exec(`commit`);
+		// Row 1 relocated to PK 2 with its own value; the pending row 2 was evicted.
+		expect(await collect(db, `select id, v from t order by id`)).to.deep.equal([{ id: 2, v: 'one' }]);
+		expect(await rowCount()).to.equal(1);
 	});
 });
