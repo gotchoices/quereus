@@ -106,9 +106,10 @@ drop table t_dd;
 -- 5. The error fires wherever the comparison compiles. CHECK predicates
 --    compile when the enforcing DML plans (constraint-builder), so the
 --    conflict surfaces at the first write against the table; WHERE-clause
---    conflicts surface at that statement's prepare. (CREATE-time detection of
---    a conflicted CHECK is parked with the FK variant — backlog
---    fk-collation-conflict-create-time-validation.)
+--    conflicts surface at that statement's prepare. (The FK variant now also
+--    validates at CREATE/ALTER — see § 10 and 41.1-fk-collation-conflict —
+--    but CREATE-time detection of a conflicted CHECK is still unimplemented,
+--    so a conflicted CHECK remains caught at the first write below.)
 -- =============================================================================
 
 create table t_chk_conflict (id integer primary key, a text collate nocase, b text collate rtrim, check (a = b));
@@ -260,18 +261,17 @@ drop table t_dn;
 
 -- =============================================================================
 -- 10. FK with parent and child declaring DIFFERENT explicit collations: the
---     synthesized parent-existence comparison errors at DML plan time
---     (CREATE-time detection is parked in backlog
---     fk-collation-conflict-create-time-validation).
+--     conflict is now rejected at CREATE TABLE (declaration time) through the
+--     same lattice the synthesized parent-existence comparison uses — no longer
+--     deferred to the first DML. Ticket fk-collation-conflict-create-time-
+--     validation. (The DML-time error remains the residual for a forward-
+--     declared parent; that path is covered in 41.1-fk-collation-conflict.)
 -- =============================================================================
 
 pragma foreign_keys = true;
 create table fkp_conf (k text collate rtrim primary key);
 create table fkc_conf (id integer primary key, ref text collate nocase references fkp_conf(k));
-insert into fkp_conf values ('a');
-insert into fkc_conf values (1, 'a');
--- error: ambiguous collation
-drop table fkc_conf;
+-- error: conflicting collations
 drop table fkp_conf;
 pragma foreign_keys = false;
 

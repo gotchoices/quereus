@@ -419,6 +419,22 @@ Errors surface at the point the comparison compiles: statement prepare for
 queries, DML prepare for write-path scopes (CHECK enforcement, FK
 parent-existence checks, upsert SET, RETURNING).
 
+**FOREIGN KEY collations are validated at declaration time.** A FK's enforced
+comparison is `parent.k = child.fk`; the same lattice that resolves it at DML
+prepare also runs at **declaration time** (CREATE TABLE / ALTER … ADD CONSTRAINT
+/ ALTER … ADD COLUMN / declarative apply) over the two columns' `ScalarType`s, so
+a same-rank conflicting pair is rejected the moment the `REFERENCES` clause is
+declared rather than at the first write against the child
+(`schema/constraint-builder.ts` `validateForeignKeyCollations`, mirroring the
+FK-builder's comparison exactly — never a re-derived name- or textuality-based
+rule). It is **unconditional** (not gated on `pragma foreign_keys`): a
+contradictory declaration is malformed regardless of whether enforcement is
+enabled. The one residual is a **forward-declared parent** (the parent table
+does not exist yet when the child is declared): the parent column types are not
+yet knowable, so the conflict stays caught at first DML — unchanged. Reload /
+`importTable` deliberately does **not** re-validate, so a legacy persisted
+conflicting FK reloads without error and still surfaces at DML.
+
 **Provenance is a function of the current catalog column, not its history.**
 A column reaches rank 2 (`declared`) two ways, with identical standing: a
 CREATE-time explicit `COLLATE` clause, OR `ALTER COLUMN ... SET COLLATE`

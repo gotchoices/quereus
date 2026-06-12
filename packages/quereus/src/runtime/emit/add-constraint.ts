@@ -6,6 +6,7 @@ import { SqlValue, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import { opsToMask, requireVtabModule } from '../../schema/table.js';
+import { validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 
 const log = createLogger('runtime:emit:add-constraint');
 
@@ -97,6 +98,19 @@ async function runAddConstraintViaModule(
 		tableSchema.name,
 		{ type: 'addConstraint', constraint },
 	);
+
+	// Reject a newly-added FK whose child/parent column collations declare a same-rank
+	// conflict — before swapping the schema into the catalog, so a rejected ALTER leaves
+	// the table untouched. Newly-added FKs are the entries in the updated schema not present
+	// by reference in the original (the module appends; it never rewrites existing entries).
+	// The module-side `validateForeignKeyOverExistingRows` stays where it is — it needs a row
+	// scan, this is a pure schema check. (The `foreign_keys` pragma does NOT gate this:
+	// a conflicting-collation declaration is malformed regardless of enforcement.)
+	const priorFks = new Set(tableSchema.foreignKeys ?? []);
+	for (const fk of updatedTableSchema.foreignKeys ?? []) {
+		if (priorFks.has(fk)) continue;
+		validateForeignKeyCollations(rctx.db, updatedTableSchema, fk);
+	}
 
 	schema.addTable(updatedTableSchema);
 

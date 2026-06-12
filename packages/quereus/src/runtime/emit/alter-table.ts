@@ -8,7 +8,7 @@ import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
-import { validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
+import { validateForeignKeyOverExistingRows, validateForeignKeyCollations, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
 import type { ColumnDef, QueryExpr, ViewInsertDefault } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
@@ -549,6 +549,15 @@ async function runAddColumn(
 	const runCheckScan = !backfill && newCheckConstraints.length > 0;
 	if (runCheckScan || hasNewForeignKeys) {
 		try {
+			// Reject any new FK whose child/parent column collations declare a same-rank
+			// conflict (the conflict enforcement would raise at first DML). Pure schema
+			// check — no row scan, pragma-independent — but kept inside this try/revert
+			// region so a conflict drops the just-materialized column and restores the
+			// original catalog, leaving the table untouched. `enhancedTableSchema` carries
+			// the new column so the child FK column resolves.
+			for (const fk of resolvedForeignKeys) {
+				validateForeignKeyCollations(rctx.db, enhancedTableSchema, fk);
+			}
 			if (runCheckScan) {
 				await validateBackfillAgainstChecks(rctx, validationSchema, newCheckConstraints);
 			}

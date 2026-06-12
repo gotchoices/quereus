@@ -23,6 +23,8 @@ import { StatusCode } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
 import { quoteIdentifier } from '../emit/ast-stringify.js';
 import { createLogger } from '../common/logger.js';
+import { columnSchemaToScalarType } from '../planner/type-utils.js';
+import { resolveComparisonCollation } from '../planner/analysis/comparison-collation.js';
 
 const log = createLogger('schema:constraint-builder');
 
@@ -277,5 +279,85 @@ export async function validateForeignKeyOverExistingRows(
 		}
 	} finally {
 		await stmt.finalize();
+	}
+}
+
+/**
+ * Rejects a FOREIGN KEY whose child column and parent key column declare
+ * conflicting explicit/declared collations — the same conflict the synthesized
+ * `parent.ref = child.fk` enforcement comparison raises at plan time, surfaced
+ * here at declaration time (CREATE TABLE / ALTER ADD CONSTRAINT / ADD COLUMN /
+ * declarative apply). Pure schema check (no row scan).
+ *
+ * Stays in lockstep with enforcement by construction: it maps each column to a
+ * `ScalarType` through {@link columnSchemaToScalarType} (the same map the FK
+ * builder's comparison uses — `collationExplicit` → provenance `'declared'`,
+ * else `'default'`) and resolves the pair through the same
+ * {@link resolveComparisonCollation} lattice. So it fires on exactly the
+ * conflicts the first DML against the child would, only sooner — never a
+ * re-derived textuality- or name-based rule.
+ *
+ * Resolution rules (consequences of staying in lockstep, intended):
+ *  - matching declared collations (nocase/nocase) resolve, no conflict;
+ *  - one-sided declaration (declared nocase vs defaulted BINARY) resolves to
+ *    NOCASE — a defaulted BINARY is the engine floor, it contributes nothing;
+ *  - a *declared* `COLLATE BINARY` (rank 2) vs a declared NOCASE conflicts;
+ *  - a divergent explicit COLLATE on non-text columns still conflicts — we
+ *    mirror enforcement exactly rather than gating on textuality.
+ *
+ * The parent is resolved against the live catalog; a not-yet-created
+ * (forward-declared) parent is skipped — its column types are unknown, so the
+ * conflict cannot be seen yet and remains caught at first DML (the one
+ * unavoidable residual). A self-referencing FK resolves against `childSchema`
+ * directly so it validates at CREATE, before the table is registered.
+ *
+ * Unconditional — NOT gated on `pragma foreign_keys`. A conflicting-collation
+ * declaration is a malformed declaration (same class as the child/parent
+ * column-count mismatch the builders reject unconditionally), not an
+ * enforcement concern, so a contradictory schema is rejected whether or not
+ * enforcement is currently enabled.
+ */
+export function validateForeignKeyCollations(
+	db: Database,
+	childSchema: TableSchema,
+	fk: ForeignKeyConstraintSchema,
+): void {
+	// Resolve the parent. A self-referencing FK names `childSchema` itself; resolve
+	// it directly so the check fires at CREATE (the table is not yet registered).
+	const parentSchemaName = fk.referencedSchema ?? childSchema.schemaName;
+	const selfRef = fk.referencedTable.toLowerCase() === childSchema.name.toLowerCase()
+		&& parentSchemaName.toLowerCase() === childSchema.schemaName.toLowerCase();
+	const parent = selfRef
+		? childSchema
+		: db.schemaManager.findTable(fk.referencedTable, parentSchemaName);
+	// Forward-declared parent: column types unknown — conflict stays caught at first DML.
+	if (!parent) return;
+
+	let parentColIndices: number[];
+	try {
+		parentColIndices = resolveReferencedColumns(fk, parent);
+	} catch {
+		// A missing referenced column is reported by the enforcement path; don't double-report.
+		return;
+	}
+	// A child/parent column-count mismatch is already raised by the builders.
+	if (parentColIndices.length !== fk.columns.length) return;
+
+	for (let i = 0; i < fk.columns.length; i++) {
+		const childCol = childSchema.columns[fk.columns[i]];
+		const parentCol = parent.columns[parentColIndices[i]];
+		const res = resolveComparisonCollation(
+			columnSchemaToScalarType(childCol),
+			columnSchemaToScalarType(parentCol),
+		);
+		if (res.kind === 'conflict') {
+			throw new QuereusError(
+				`FOREIGN KEY '${fk.name ?? `_fk_${childSchema.name}`}' on '${childSchema.name}': `
+				+ `child column '${childSchema.name}.${childCol.name}' (collation ${childCol.collation}) `
+				+ `and parent column '${parent.name}.${parentCol.name}' (collation ${parentCol.collation}) `
+				+ `declare conflicting collations; declare a matching COLLATE on both sides.`,
+				StatusCode.ERROR,
+			);
+		}
 	}
 }

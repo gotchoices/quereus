@@ -10,7 +10,7 @@ import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js'
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, opsToMask, mutationContextVarToSchema, extractGeneratedColumnDependencies, topoSortGeneratedColumns, requireVtabModule, resolveNamedConstraintClass, appendIndexToTableSchema } from './table.js';
-import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema } from './constraint-builder.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from './constraint-builder.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
@@ -2428,6 +2428,19 @@ export class SchemaManager {
 		const completeTableSchema = this.finalizeCreatedTableSchema(
 			tableInstance, tableName, targetSchemaName, moduleName, effectiveModuleArgs, moduleInfo
 		);
+
+		// Reject a FK whose child/parent column collations declare a same-rank conflict
+		// — the same conflict FK enforcement raises at first DML, surfaced here at CREATE.
+		// `completeTableSchema` is post-reconcile (the store's `reconcilePkCollations` ran
+		// inside `module.create`), so an implicit-default text PK reconciled to the store's
+		// NOCASE keeps `collationExplicit` unset → contributes the engine floor, never a
+		// false conflict. Done BEFORE `addTable` so a conflicting FK leaves the catalog
+		// clean (a self-ref FK resolves against `completeTableSchema` itself). Deliberately
+		// only here — never in `buildTableSchemaFromAST` or the import/rehydrate path, so a
+		// legacy persisted conflicting FK reloads fine and still surfaces at DML.
+		for (const fk of completeTableSchema.foreignKeys ?? []) {
+			validateForeignKeyCollations(this.db, completeTableSchema, fk);
+		}
 
 		schema.addTable(completeTableSchema);
 		log(`Successfully created table %s.%s using module %s`, targetSchemaName, tableName, moduleName);

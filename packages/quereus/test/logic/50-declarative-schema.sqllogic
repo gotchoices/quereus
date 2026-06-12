@@ -366,6 +366,28 @@ apply schema main;
 select * from user_summary order by user_id;
 → [{"user_id": 1, "full_name": "Alice", "contact": "alice@example.com"}, {"user_id": 2, "full_name": "Bob", "contact": "bob@example.com"}]
 
+-- Step 34: Declarative apply rejects a conflicting-collation FK. The differ emits
+-- CREATE TABLE in dependency order (parent before child), so the child's CREATE
+-- re-executes through the same declaration-time collation validation as a direct
+-- CREATE TABLE and the apply fails. Isolated in schema Test3 so `main` is
+-- untouched. Ticket fk-collation-conflict-create-time-validation.
+declare schema Test3 {
+	table cfk_parent {
+		k TEXT COLLATE RTRIM PRIMARY KEY
+	}
+
+	table cfk_child {
+		id INTEGER PRIMARY KEY,
+		ref TEXT COLLATE NOCASE,
+		constraint fk_bad foreign key (ref) references cfk_parent(k)
+	}
+}
+
+-- run
+
+apply schema Test3;
+-- error: conflicting collations
+
 -- Step 34: Test view removal
 declare schema main {
 	table users {
