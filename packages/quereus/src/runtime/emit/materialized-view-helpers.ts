@@ -1163,9 +1163,10 @@ type ReshapeClassification =
  *    `select *` body whose new source column lands before existing outputs):
  *    append-only `addColumn` cannot place it, and renaming survivors to fake it
  *    would silently re-map values;
- *  - a **physical-PK definition change** (column set, order, direction, or
- *    collation of the key) — a maintained table's PK is its replicated row
- *    identity; silently re-keying it is the fatality drop+recreate was.
+ *  - a **physical-PK definition change** (column set, order, direction,
+ *    collation, or a key column's type) — a maintained table's PK is its
+ *    replicated row identity; silently re-keying it is the fatality drop+recreate
+ *    was.
  *
  * Surviving columns are matched by **name** (case-insensitive — the only stable
  * identity a derived backing carries); a name absent on both sides at an aligned
@@ -1271,11 +1272,13 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
  * Compares the live backing's physical primary key to the re-derived shape's
  * ({@link computeBackingPrimaryKey}) **by column name through the reshape's rename
  * map** — not by index, which add/drop shift. Any change to the key's column set,
- * order, direction, or collation makes the reshape inexpressible: a maintained
- * table's PK is its replicated row identity. Returns a reason string, or null when
- * the key is unchanged. (A renamed key column is *not* a key change — the rename
- * map carries its new name; only a key-column type change is left to `alterColumn`,
- * which is not a PK-definition change.)
+ * order, direction, collation, or a key column's **type** makes the reshape
+ * inexpressible: a maintained table's PK is its replicated row identity, and
+ * re-keying replicated row identity in place is refused. Returns a reason string,
+ * or null when the key is unchanged. (A renamed key column is *not* a key change —
+ * the rename map carries its new name; but a renamed-*and*-retyped key column still
+ * trips the type check, because the comparison is on the underlying column schemas,
+ * whose type identity a rename does not change.)
  */
 function describePhysicalPkChange(
 	current: TableSchema,
@@ -1293,6 +1296,9 @@ function describePhysicalPkChange(
 		const curName = renameMap.get(curCol.name.toLowerCase()) ?? curCol.name.toLowerCase();
 		if (curName !== shCol.name.toLowerCase()) {
 			return `primary-key column ${k} '${curCol.name}' → '${shCol.name}'`;
+		}
+		if (!backingTypeMatches(curCol, shCol)) {
+			return `primary-key column ${k} '${curCol.name}' type ${curCol.logicalType.name} → ${shCol.logicalType.name}`;
 		}
 		if ((currentPk[k].desc === true) !== (shapePk[k].desc === true)) {
 			return `primary-key column ${k} direction`;

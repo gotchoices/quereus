@@ -305,6 +305,59 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 			}
 		});
 
+		it('a physical-PK column type change errors at refresh (re-keying row identity in place is refused)', async () => {
+			const db = new Database();
+			try {
+				// `order by v` seeds the backing's physical PK with the NON-PK source column
+				// `v` (text), leading; the logical key `k` is appended as a tiebreaker. So the
+				// physical PK is [v(text), k(integer)] — a key over a column whose source type
+				// IS retypeable (`alter column <non-pk> set data type` is permitted; only a
+				// *source PK* column's retype is blocked). This makes the PK-column-type-change
+				// reshape genuinely reachable as black-box SQL.
+				await db.exec('create table t (k integer primary key, v text)');
+				// Sort-order-diverging values: as text '10' < '9'; as integer 10 > 9. A
+				// regression that *applied* the reshape (re-keying under the stale text
+				// comparator) would visibly mis-order the rows.
+				await db.exec("insert into t values (1, '10'), (2, '9')");
+				await db.exec('create materialized view mv as select v, k from t order by v');
+
+				// Precondition (empirical): the physical PK leads with `v`, and `v` is text.
+				// If the optimizer ever stops carrying the body `order by` into the backing
+				// shape, this assertion catches it — the scenario would no longer be reachable.
+				const mvBefore = db.schemaManager.getTable('main', 'mv')!;
+				const pkLead = mvBefore.columns[mvBefore.primaryKeyDefinition[0].index];
+				expect(pkLead.name, 'physical PK leads with the order-by column v').to.equal('v');
+				expect(pkLead.logicalType.name.toUpperCase(), 'PK lead column v is text').to.equal('TEXT');
+				expect(mvBefore.primaryKeyDefinition.length, 'multi-component PK: [v, k]').to.equal(2);
+
+				// Retyping the NON-PK source column `v` text→integer is permitted at the source
+				// and re-derives a body whose PK column `v` is integer — a PK-column type change
+				// against the live backing's text-keyed identity.
+				await db.exec('alter table t alter column v set data type integer');
+				expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
+
+				let err: Error | undefined;
+				const events = await captureEventsFor(db, 'mv', async () => {
+					try { await db.exec('refresh materialized view mv'); } catch (e) { err = e as Error; }
+				});
+				expect(err, 'refresh errors on the PK-column type change').to.not.be.undefined;
+				expect(err!.message).to.match(/changed incompatibly|primary-key/);
+				// The reason must name the seed column `v` (PK component 0), not the tiebreaker `k`.
+				expect(err!.message).to.match(/'v'|column 0/);
+
+				// The table is left coherent: no incarnation/modify events, column count
+				// unchanged, derivation still stale, and the stored snapshot still reads under
+				// the original text key (un-reshaped, so the text sort order is preserved).
+				expect(events).to.not.include.members(['table_removed', 'table_added', 'table_modified']);
+				expect(db.schemaManager.getTable('main', 'mv')!.columns.length, 'shape untouched').to.equal(2);
+				expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
+				expect(await readObjectsSorted(db, 'select * from mv'))
+					.to.deep.equal(['{"v":"10","k":1}', '{"v":"9","k":2}']);
+			} finally {
+				await db.close();
+			}
+		});
+
 		it('an explicit-column MV whose body output count shifts errors at refresh (declared interface)', async () => {
 			const db = new Database();
 			try {
