@@ -1828,11 +1828,17 @@ export function createTableToString(stmt: AST.CreateTableStmt): string {
 	return parts.join(' ');
 }
 
-/** `maintained as <body> [insert defaults (…)]` clause of a CREATE TABLE, or '' when absent.
- *  Clause order matches the parser grammar: using → maintained as … → insert defaults → with tags. */
+/** `maintained [(columns)] as <body> [insert defaults (…)]` clause of a CREATE TABLE, or '' when absent.
+ *  Clause order matches the parser grammar: using → maintained [(columns)] as … → insert defaults → with tags.
+ *  The `(columns)` rename list is emitted only when present (an explicit MV-sugar rename); its absence is
+ *  the lossless signal that the body is implicit and may reshape to follow its source on reopen. */
 export function maintainedClauseToString(maintained: AST.MaintainedClause | undefined): string {
 	if (!maintained) return '';
-	const parts = ['maintained as', astToString(maintained.select)];
+	const parts = ['maintained'];
+	if (maintained.columns && maintained.columns.length > 0) {
+		parts.push(`(${maintained.columns.map(quoteIdentifier).join(', ')})`);
+	}
+	parts.push('as', astToString(maintained.select));
 	const defaultsStr = insertDefaultsClauseToString(maintained.insertDefaults);
 	if (defaultsStr) parts.push(defaultsStr);
 	return parts.join(' ');

@@ -207,7 +207,9 @@ describe('Maintained-table attach/detach verbs', () => {
 				alter table tgt set maintained as select id, v from src;
 			`);
 			const exported = generateMaintainedTableDDL(maintained('tgt'));
-			expect(exported, 'canonical form is the table form').to.match(/create table .* maintained as/i);
+			// Attach records the declared names as the (explicit) rename list, so the
+			// canonical table form carries them on the `maintained (…)` clause.
+			expect(exported, 'canonical form is the table form').to.match(/create table .* maintained \(id, v\) as/i);
 			const originalHash = maintained('tgt').derivation.bodyHash;
 
 			const db2 = new Database();
@@ -241,10 +243,12 @@ describe('Maintained-table attach/detach verbs', () => {
 			`);
 			const exported = generateMaintainedTableDDL(maintained('mv'));
 			// Renamed columns became the table's declared column names; the body
-			// keeps its original output names.
+			// keeps its original output names. The explicit rename also rides the
+			// `maintained (…)` clause — the lossless signal that re-import must
+			// arity-lock (vs an implicit body, which omits the clause and reshapes).
 			expect(exported).to.match(/"key_id"/);
 			expect(exported).to.match(/"val"/);
-			expect(exported).to.match(/maintained as select id, v from src/i);
+			expect(exported).to.match(/maintained \(key_id, val\) as select id, v from src/i);
 
 			const db2 = new Database();
 			try {

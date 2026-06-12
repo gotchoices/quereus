@@ -104,10 +104,9 @@ interface MaintainedTableImportSpec {
 	/** Derivation body — any relation-producing QueryExpr. */
 	select: AST.QueryExpr;
 	/**
-	 * Output-column names: the MV-sugar rename list (`mv(a, b)`), or — for the
-	 * table form, whose declared columns ARE the backing shape — the declared
-	 * column names. Per the unified model, a sugar MV's renamed columns become
-	 * the table's declared column names, so both round-trip to the same shape.
+	 * Explicit output-column rename list (`mv(a, b)` sugar, or the table form's
+	 * `maintained (a, b)` clause). Present ⇒ arity-locked (a source widening is a
+	 * sited error); absent ⇒ implicit, the body reshapes to follow its source.
 	 */
 	columns: ReadonlyArray<string> | undefined;
 	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
@@ -133,12 +132,12 @@ function maintainedImportFromMvStmt(stmt: AST.CreateMaterializedViewStmt): Maint
 
 /**
  * Build the import spec from the canonical `create table … maintained as …` form
- * (the unified-model persistence / export form). The declared columns are the
- * backing shape, so their names become the derivation's output-column list — the
- * inverse of the sugar's rename-into-declared normalization. (Known gap: the table
- * form cannot distinguish an implicit `select *` body from an explicit rename list,
- * so an implicit MV whose source shape drifted between sessions arity-errors on
- * reopen instead of reshaping — see ticket `mv-table-form-implicit-columns-roundtrip`.)
+ * (the unified-model persistence / export form). The rename list is read from the
+ * `maintained [(columns)]` clause, NOT the declared column list: its presence is
+ * the lossless flag that distinguishes an explicit MV-sugar rename (arity-locks —
+ * a widened source is a sited error) from an implicit `select *` body (reshapes to
+ * follow its source on reopen). `generateMaintainedTableDDL` emits the clause iff
+ * the derivation carries a rename, so this restores `derivation.columns` faithfully.
  */
 function maintainedImportFromTableStmt(stmt: AST.CreateTableStmt): MaintainedTableImportSpec {
 	const maintained = stmt.maintained!;
@@ -146,7 +145,7 @@ function maintainedImportFromTableStmt(stmt: AST.CreateTableStmt): MaintainedTab
 		schemaName: stmt.table.schema,
 		name: stmt.table.name,
 		select: maintained.select,
-		columns: stmt.columns.map(c => c.name),
+		columns: maintained.columns,
 		insertDefaults: maintained.insertDefaults,
 		moduleName: stmt.moduleName,
 		moduleArgs: stmt.moduleArgs,

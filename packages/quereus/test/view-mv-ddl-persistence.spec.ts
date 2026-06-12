@@ -599,7 +599,12 @@ function mvSchemaFromDDL(ddl: string): MaintainedTableSchema {
 			tags: stmt.tags,
 			derivation: {
 				selectAst: stmt.maintained.select,
-				columns: stmt.columns.length > 0 ? stmt.columns.map(c => c.name) : undefined,
+				// The rename list rides the `maintained [(columns)]` clause (lossless),
+				// not the declared column list — its presence/absence distinguishes an
+				// explicit rename from an implicit body across the round-trip.
+				columns: stmt.maintained.columns && stmt.maintained.columns.length > 0
+					? [...stmt.maintained.columns]
+					: undefined,
 				insertDefaults: stmt.maintained.insertDefaults,
 				bodyHash: '',
 				logicalKey: [],

@@ -2613,12 +2613,27 @@ export class Parser {
 	 */
 	private parseMaintainedClause(): AST.MaintainedClause | undefined {
 		if (!this.matchKeyword('MAINTAINED')) return undefined;
+		// Optional explicit output-column rename list before AS — the lossless
+		// table-form encoding of the MV-sugar `(a, b)` renames. Absent ⇒ implicit
+		// (the body follows its source shape on reopen). The required AS that
+		// follows keeps this unambiguous against a parenthesized body.
+		let columns: string[] | undefined;
+		if (this.check(TokenType.LPAREN)) {
+			this.consume(TokenType.LPAREN, "Expected '(' to start maintained column list.");
+			columns = [];
+			if (!this.check(TokenType.RPAREN)) {
+				do {
+					columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in maintained column list."));
+				} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
+			}
+			this.consume(TokenType.RPAREN, "Expected ')' after maintained column list.");
+		}
 		this.consumeKeyword('AS', "Expected 'AS' after MAINTAINED.");
 		// Body is any QueryExpr — bare SELECT / VALUES / WITH … SELECT all qualify.
 		// DML bodies parse here but the planner rejects them.
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 		const insertDefaults = this.parseInsertDefaultsClause();
-		return { select, insertDefaults };
+		return { columns, select, insertDefaults };
 	}
 
 	/**

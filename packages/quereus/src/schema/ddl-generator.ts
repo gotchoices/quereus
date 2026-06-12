@@ -83,6 +83,10 @@ export function generateMaintainedTableDDL(table: MaintainedTableSchema): string
 		if (Object.keys(args).length > 0) usingClause += ` (${formatVtabArgs(args)})`;
 	}
 	const maintained = maintainedClauseToString({
+		// Emit the rename list only when the derivation carries one (an explicit
+		// MV-sugar rename / an attached backing). Its absence is the lossless signal
+		// that the body is implicit and must reshape to follow its source on reopen.
+		columns: table.derivation.columns,
 		select: table.derivation.selectAst,
 		insertDefaults: table.derivation.insertDefaults,
 	});

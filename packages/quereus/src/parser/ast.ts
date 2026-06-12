@@ -297,14 +297,23 @@ export type QueryExpr =
 	| DeleteStmt;
 
 /**
- * The `maintained as <body> [insert defaults (col = expr, …)]` clause of a
- * CREATE TABLE — declares the table as a **maintained table** (the canonical
- * table form of a materialized view): the declared column/PK shape is the
- * frozen basis and the body must derive exactly that shape. Clause order:
- * `(columns) → using → maintained as … → insert defaults → with tags`.
+ * The `maintained [(columns)] as <body> [insert defaults (col = expr, …)]`
+ * clause of a CREATE TABLE — declares the table as a **maintained table** (the
+ * canonical table form of a materialized view): the declared column/PK shape is
+ * the frozen basis and the body must derive exactly that shape. The optional
+ * `(columns)` is the explicit output-column rename list (see `columns` below).
+ * Clause order:
+ * `(columns) → using → maintained [(columns)] as … → insert defaults → with tags`.
  * `maintained` is contextual (no new reserved word).
  */
 export interface MaintainedClause {
+	/**
+	 * Explicit output-column rename list (`maintained (a, b) as …`) — the lossless
+	 * table-form encoding of the MV-sugar rename list. Absent ⇒ implicit: the body
+	 * follows its source shape, so a widened `select *` reshapes on reopen instead
+	 * of arity-erroring against a stale declared list.
+	 */
+	columns?: ReadonlyArray<string>;
 	/** Derivation body — any relation-producing QueryExpr. */
 	select: QueryExpr;
 	/** Trailing `insert defaults (col = expr, …)` — omitted-insert defaults for write-through. */
