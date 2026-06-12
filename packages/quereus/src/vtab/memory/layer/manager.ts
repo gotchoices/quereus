@@ -12,7 +12,7 @@ import { Latches } from '../../../util/latches.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
-import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows } from '../../../schema/constraint-builder.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
 import { compareSqlValues, rowsValueIdentical } from '../../../util/comparison.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -943,13 +943,14 @@ export class MemoryTableManager {
 		newRowData: Row,
 		newPrimaryKey: BTreeKeyForPrimary,
 		onConflict: ConflictResolution | undefined,
-		evicted: Row[]
+		evicted: Row[],
+		allowMvCovering = true
 	): Promise<UpdateResult | null> {
 		// SQL semantics: UNIQUE allows multiple NULLs — skip if any constrained column is NULL
 		if (uc.columns.some(colIdx => newRowData[colIdx] === null)) return null;
 
 		// Find the covering structure enforcing this constraint.
-		const covering = this.findIndexForConstraint(targetLayer, uc);
+		const covering = this.findIndexForConstraint(targetLayer, uc, allowMvCovering);
 
 		// Partial UNIQUE: a row whose predicate is not unambiguously TRUE is outside
 		// the structure's scope and contributes nothing to uniqueness. The source-side
@@ -995,13 +996,23 @@ export class MemoryTableManager {
 	 * `memory-index`. The row-time resolution is a synchronous map lookup with an
 	 * O(1) negative fast path, so a non-covered table stays on the index path at
 	 * effectively no cost.
+	 *
+	 * `allowMvCovering = false` skips the MV preference: the maintenance-write
+	 * enforcement path ({@link enforceSecondaryUniqueOnMaintenance}) checks rows
+	 * THIS table's batch just wrote, and a covering MV over this table is
+	 * cascade-maintained only after the batch returns — it lags the batch and
+	 * would miss a same-batch colliding pair. The synchronously-maintained
+	 * auto-index is exact.
 	 */
 	private findIndexForConstraint(
 		targetLayer: Layer,
-		uc: UniqueConstraintSchema
+		uc: UniqueConstraintSchema,
+		allowMvCovering = true
 	): CoveringStructure | undefined {
-		const mv = this.db._findRowTimeCoveringStructure(this.schemaName, this._tableName, uc);
-		if (mv) return { kind: 'materialized-view', view: mv };
+		if (allowMvCovering) {
+			const mv = this.db._findRowTimeCoveringStructure(this.schemaName, this._tableName, uc);
+			if (mv) return { kind: 'materialized-view', view: mv };
+		}
 
 		const schema = targetLayer.getSchema();
 		if (!schema.indexes) return undefined;
@@ -1032,26 +1043,35 @@ export class MemoryTableManager {
 		for (const existingPK of existingPKs) {
 			if (this.comparePrimaryKeys(newPrimaryKey, existingPK) === 0) continue;
 
-			// Found a different row with the same unique key values
+			// Validate the candidate against the live effective row before acting —
+			// the same stale-candidate discipline as checkUniqueViaMaterializedView.
+			// An index entry can go stale against the effective row set (composite
+			// PKs live in the entry's Set by reference, so removeEntry cannot drop
+			// them by value — they accumulate until the entry empties), so a
+			// candidate whose row is gone, no longer carries the colliding values,
+			// or left a partial index's scope is skipped rather than raised as a
+			// false conflict (or, worse, REPLACE-evicting an innocent row).
+			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
+			if (!conflictingRow) continue;
+			if (!uc.columns.every(col => compareSqlValues(newRowData[col], conflictingRow[col], schema.columns[col].collation) === 0)) continue;
+			if (index.predicate && !index.rowMatchesPredicate(conflictingRow)) continue;
+
+			// Found a different live row with the same unique key values
 			if (onConflict === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };
 			}
 			if (onConflict === ConflictResolution.REPLACE) {
-				const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
-				if (conflictingRow) {
-					targetLayer.recordDelete(existingPK, conflictingRow);
-					// Report the eviction so the executor runs its delete pipeline.
-					evicted.push(conflictingRow);
-				}
-				return null; // Conflict resolved, continue with insert
+				targetLayer.recordDelete(existingPK, conflictingRow);
+				// Report the eviction so the executor runs its delete pipeline.
+				evicted.push(conflictingRow);
+				continue; // conflict resolved, keep scanning for further duplicates
 			}
 			const colNames = uc.columns.map(i => schema.columns[i].name).join(', ');
-			const existingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			return {
 				status: 'constraint',
 				constraint: 'unique',
 				message: `UNIQUE constraint failed: ${this._tableName} (${colNames})`,
-				existingRow: existingRow ?? undefined
+				existingRow: conflictingRow
 			};
 		}
 
@@ -1294,6 +1314,11 @@ export class MemoryTableManager {
 	 * synchronous — so a multi-row statement's later rows observe earlier rows'
 	 * pending writes with no interleaving.
 	 *
+	 * Declared secondary UNIQUE constraints ARE enforced — post-batch, against the
+	 * final effective contents, throwing the maintained-table-attributed
+	 * CONSTRAINT error ({@link enforceSecondaryUniqueOnMaintenance}). CHECK / FK
+	 * stay engine-validated (see `vtab/backing-host.ts` § Constraint validation).
+	 *
 	 * Returns the **effective** changes it applied (one {@link BackingRowChange} per
 	 * backing row it mutated): a `delete-key` that found a row → `delete`; an `upsert` →
 	 * `update` when it replaced an existing row, else `insert`; a `delete-by-prefix` →
@@ -1430,7 +1455,71 @@ export class MemoryTableManager {
 				}
 			}
 		}
+		await this.enforceSecondaryUniqueOnMaintenance(layer, changes);
 		return changes;
+	}
+
+	/**
+	 * Declared secondary-UNIQUE enforcement for maintenance writes — the
+	 * collision-shaped half of the derived-row constraint contract (CHECK / FK
+	 * are per-row properties and validate engine-side; see
+	 * docs/materialized-views.md § Derived-row constraint validation). The
+	 * privileged surface bypasses the DML constraint pipeline, so without this
+	 * the batch above would store two derived rows colliding on a declared
+	 * UNIQUE silently.
+	 *
+	 * Runs POST-batch over the effective changes, never per-op: a `replace-all`
+	 * diff applies its upserts before its deletes, so an in-flight per-op check
+	 * would false-positive against a row the same batch is about to delete
+	 * (e.g. the derived set moved a unique value from one primary key to
+	 * another). After the batch the layer holds exactly the final contents, so
+	 * checking each WRITTEN image against it is exact — and complete: every
+	 * pre-existing row entered through DML / ADD CONSTRAINT / earlier validated
+	 * maintenance, so any colliding pair includes at least one written image.
+	 * A value-identical upsert the batch skipped emitted no change and cannot
+	 * introduce a collision (the table's contents did not change at that key).
+	 *
+	 * Reuses {@link checkSingleUniqueConstraint} (same-PK exclusion, NULL-pass,
+	 * partial-predicate scope, per-column collation, auto-index fast path) with
+	 * two maintenance-specific postures: the conflict action is forced to ABORT
+	 * (a derivation write carries no user OR clause, and a declared
+	 * `on conflict replace`/`ignore` default must not silently evict or drop
+	 * derived rows — the eviction would diverge the table from its derivation),
+	 * and the covering-MV route is bypassed (see
+	 * {@link findIndexForConstraint}'s `allowMvCovering`).
+	 *
+	 * Zero overhead when the table declares no secondary UNIQUE (every MV-sugar
+	 * backing, and most maintained tables): one empty-array check.
+	 */
+	private async enforceSecondaryUniqueOnMaintenance(
+		layer: TransactionLayer,
+		changes: readonly BackingRowChange[],
+	): Promise<void> {
+		const schema = layer.getSchema();
+		const ucs = schema.uniqueConstraints;
+		if (!ucs || ucs.length === 0 || changes.length === 0) return;
+
+		// ABORT means the IGNORE/REPLACE arms never fire, so nothing ever lands here.
+		const noEvict: Row[] = [];
+		for (const change of changes) {
+			if (change.op === 'delete') continue;
+			const newPrimaryKey = this.primaryKeyFromRow(change.newRow);
+			for (const uc of ucs) {
+				const result = await this.checkSingleUniqueConstraint(
+					layer, schema, uc, change.newRow, newPrimaryKey,
+					ConflictResolution.ABORT, noEvict, /*allowMvCovering*/ false,
+				);
+				if (result) {
+					const colNames = uc.columns.map(i => schema.columns[i]?.name ?? String(i));
+					throw maintainedTableUniqueViolationError(
+						this.schemaName, this._tableName,
+						uc.name ?? `_uc_${colNames.join('_')}`,
+						colNames,
+						uc.columns.map(i => change.newRow[i]),
+					);
+				}
+			}
+		}
 	}
 
 	// --- Schema Operations (simplified with inherited BTrees) ---

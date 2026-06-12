@@ -138,7 +138,7 @@ export { SchemaManager } from './schema/manager.js';
 export type { ImportCatalogOptions } from './schema/manager.js';
 export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
 export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema } from './schema/table.js';
-export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys } from './schema/constraint-builder.js';
+export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, maintainedTableUniqueViolationError } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, NamedConstraintClass } from './schema/table.js';
 export type { ColumnSchema } from './schema/column.js';
 export type { ViewSchema } from './schema/view.js';

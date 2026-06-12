@@ -52,18 +52,36 @@
  * programmatic `update()` calls on the backing by an embedder are the same trust
  * level as holding this privileged surface and are out of engine scope.
  *
- * ## Constraint validation — engine-owned
+ * ## Constraint validation — split by shape
  *
- * The privileged surface re-validates nothing structural: `applyMaintenance` /
- * `replaceContents` write rows as given (PK identity aside) with no UNIQUE /
- * CHECK / FK evaluation. Declared CHECK and child-side FK constraints on a
- * maintained table are validated by the **engine** at the maintenance
+ * Declared CHECK and child-side FK constraints on a maintained table are
+ * per-ROW properties and are validated by the **engine** at the maintenance
  * boundary: the attach core's bulk scan over the reconciled contents
  * (create-fill / attach — `validateDeclaredConstraintsOverContents` in
  * `runtime/emit/materialized-view-helpers.ts`) and the per-row derived-row
  * validator over each maintenance delta (`core/derived-row-validator.ts`,
  * applied by the maintenance manager before the cascade). A host module
- * implements none of this itself.
+ * implements none of that itself.
+ *
+ * Declared secondary (non-PK) UNIQUE constraints are COLLISION-shaped — a
+ * property of a pair of rows under the host's own key/collation machinery —
+ * and are enforced by the **host**, exactly where its DML UNIQUE enforcement
+ * already lives: after applying an `applyMaintenance` batch, the host checks
+ * each written (insert/update) image against the batch's final effective
+ * contents for a different-PK row matching the constraint (NULLs distinct,
+ * partial predicates honored, per-column collations, conflict action forced to
+ * ABORT — a derivation write carries no user OR clause and must never evict),
+ * throwing the maintained-table-attributed CONSTRAINT error
+ * (`maintainedTableUniqueViolationError`). Post-batch is load-bearing: a
+ * `replace-all` diff applies upserts before deletes, so a per-op check would
+ * false-positive when the derived set moves a unique value between primary
+ * keys. Checking only written images is complete because pre-existing contents
+ * already satisfied the constraint (DML / ADD CONSTRAINT enforced it), so any
+ * colliding pair includes a written image. See the memory host's
+ * `enforceSecondaryUniqueOnMaintenance` (reference) and the store host's
+ * `StoreTable.enforceSecondaryUniqueForMaintenance`. `replaceContents` remains
+ * validation-free (PK identity aside) — its callers carry MV-sugar backings,
+ * which declare no constraints.
  *
  * ## Concurrency
  *
@@ -184,7 +202,10 @@ export interface BackingHost {
 	 *  `upsert` writes nothing and reports nothing, see {@link MaintenanceOp};
 	 *  `replace-all` yields the minimal keyed diff). Later reads on `conn`
 	 *  (scanEffective, point lookups) must observe the applied ops
-	 *  (reads-own-writes). */
+	 *  (reads-own-writes). Declared secondary UNIQUE constraints are enforced
+	 *  post-batch against the final effective contents, throwing the
+	 *  maintained-table-attributed CONSTRAINT error on a collision (see
+	 *  § Constraint validation above). */
 	applyMaintenance(conn: VirtualTableConnection, ops: readonly MaintenanceOp[]): Promise<BackingRowChange[]>;
 	/** Atomically replace the COMMITTED contents with `rows` (create-fill /
 	 *  refresh). Throws `onDuplicateKey()` (or a generic CONSTRAINT) on a

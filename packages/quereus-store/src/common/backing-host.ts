@@ -34,9 +34,15 @@
  * Privileged writes deliberately queue NO store `DataChangeEvent`s: the
  * MV-over-MV cascade consumes the returned {@link BackingRowChange}s directly,
  * and the sync layer must not replicate derived rows (the sources replicate;
- * each replica derives). Backing tables also carry no secondary indexes,
- * UNIQUE constraints, or FKs (`buildBackingTableSchema` builds none), so the
- * host writes the data store only — asserted, not maintained.
+ * each replica derives). MV-sugar backings carry no secondary indexes, UNIQUE
+ * constraints, or FKs (`buildBackingTableSchema` builds none), so the host
+ * writes the data store only. A `create table … maintained as` backing DOES
+ * carry its declared constraints: CHECK / FK are validated engine-side, and
+ * declared secondary UNIQUEs are enforced here, post-batch, via
+ * {@link StoreTable.enforceSecondaryUniqueForMaintenance} (the store keeps no
+ * index store for UNIQUE anyway — enforcement is the same effective scan its
+ * DML path uses). See the engine's `vtab/backing-host.ts` § Constraint
+ * validation.
  */
 
 import {
@@ -174,6 +180,10 @@ export class StoreBackingHost implements BackingHost {
 				}
 			}
 		}
+		// Declared secondary-UNIQUE enforcement, post-batch against the final
+		// effective contents (engine contract — vtab/backing-host.ts § Constraint
+		// validation). Zero overhead for constraint-less backings.
+		await this.table.enforceSecondaryUniqueForMaintenance(changes);
 		return changes;
 	}
 

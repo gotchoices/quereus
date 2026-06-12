@@ -15,6 +15,7 @@ import {
 	validateForeignKeyOverExistingRows,
 	maintainedTableCheckViolationError,
 	maintainedTableFkViolationError,
+	formatKeyValue,
 } from '../../schema/constraint-builder.js';
 import type { CoarsenedKeyInfo } from '../../schema/view.js';
 import { computeBodyHash } from '../../schema/view.js';
@@ -683,14 +684,6 @@ function assertNoDerivationCycle(db: Database, schemaName: string, tableName: st
 		}
 	};
 	for (const src of sourceTables) walk(src, []);
-}
-
-/** Renders one primary-key value for the duplicate-derived-key diagnostic. */
-function formatKeyValue(v: SqlValue): string {
-	if (v === null || v === undefined) return 'null';
-	if (typeof v === 'string') return `'${v}'`;
-	if (v instanceof Uint8Array) return `x'…'`;
-	return String(v);
 }
 
 /**

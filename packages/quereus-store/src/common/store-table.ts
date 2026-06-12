@@ -20,6 +20,7 @@ import {
 	rowsValueIdentical,
 	validateAndParse,
 	compilePredicate,
+	maintainedTableUniqueViolationError,
 	type Database,
 	type DatabaseInternal,
 	type ColumnSchema,
@@ -1517,6 +1518,60 @@ export class StoreTable extends VirtualTable {
 	/** Buffer a privileged row-count delta, applied at coordinator commit (host writes). */
 	trackPrivilegedMutation(delta: number): void {
 		this.trackMutation(delta, true);
+	}
+
+	/**
+	 * Declared secondary-UNIQUE enforcement for maintenance writes — the store
+	 * mirror of the memory manager's `enforceSecondaryUniqueOnMaintenance` (see
+	 * `vtab/backing-host.ts` § Constraint validation for the contract and
+	 * docs/materialized-views.md § Derived-row constraint validation for the
+	 * semantics). Called by `StoreBackingHost.applyMaintenance` AFTER the op
+	 * batch lands in the coordinator's pending state: post-batch is load-bearing
+	 * (a `replace-all` diff applies puts before deletes, so a per-op check would
+	 * false-positive when the derived set moves a unique value between primary
+	 * keys), and checking only the WRITTEN images is complete (pre-existing
+	 * contents already satisfied the constraint).
+	 *
+	 * Reuses {@link findUniqueConflict} — pending-overlay reads, per-column
+	 * collations, NULL-pass, partial-predicate scope, self-PK exclusion — with
+	 * the covering-MV route deliberately bypassed: a covering MV over THIS table
+	 * is cascade-maintained only after the batch returns, so it lags the batch
+	 * and would miss a same-batch colliding pair. The conflict action is a hard
+	 * abort (a derivation write carries no user OR clause, and a declared
+	 * `on conflict replace`/`ignore` default must not evict or drop derived
+	 * rows). Per-image cost is one effective scan — the same full-scan posture
+	 * the store's DML UNIQUE enforcement already takes.
+	 *
+	 * Zero overhead when the table declares no secondary UNIQUE (every MV-sugar
+	 * backing, and most maintained tables): one empty-array check.
+	 */
+	async enforceSecondaryUniqueForMaintenance(changes: readonly BackingRowChange[]): Promise<void> {
+		const schema = this.tableSchema;
+		const ucs = schema?.uniqueConstraints;
+		if (!schema || !ucs || ucs.length === 0 || changes.length === 0) return;
+
+		for (const change of changes) {
+			if (change.op === 'delete') continue;
+			const newRow = change.newRow;
+			const selfPks = [this.extractPK(newRow)];
+			for (const uc of ucs) {
+				// SQL semantics: UNIQUE allows multiple NULLs.
+				if (uc.columns.some(idx => newRow[idx] === null)) continue;
+				// Partial UNIQUE: an out-of-scope image contributes nothing.
+				const predicate = this.compileFor(uc);
+				if (predicate && predicate.evaluate(newRow) !== true) continue;
+				const conflict = await this.findUniqueConflict(uc, predicate, newRow, selfPks);
+				if (conflict) {
+					const colNames = uc.columns.map(i => schema.columns[i]?.name ?? String(i));
+					throw maintainedTableUniqueViolationError(
+						schema.schemaName, schema.name,
+						uc.name ?? `_uc_${colNames.join('_')}`,
+						colNames,
+						uc.columns.map(i => newRow[i]),
+					);
+				}
+			}
+		}
 	}
 
 	/**

@@ -19,7 +19,7 @@ import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
 import { resolveReferencedColumns, opsToMask } from './table.js';
 import { QuereusError } from '../common/errors.js';
-import { StatusCode } from '../common/types.js';
+import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
 import { quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import { createLogger } from '../common/logger.js';
@@ -242,6 +242,37 @@ export function maintainedTableFkViolationError(
 	return new QuereusError(
 		`FOREIGN KEY constraint failed: ${constraintName} — row derived into maintained table `
 			+ `'${schemaName}.${tableName}' references a missing '${parentSchemaName}.${parentTableName}'`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
+/** Renders one constrained-column value for a key-collision diagnostic. */
+export function formatKeyValue(v: SqlValue): string {
+	if (v === null || v === undefined) return 'null';
+	if (typeof v === 'string') return `'${v}'`;
+	if (v instanceof Uint8Array) return `x'…'`;
+	return String(v);
+}
+
+/**
+ * Attributed secondary-UNIQUE diagnostic for rows the derivation wrote into a
+ * maintained table. Unlike CHECK / FK (per-row properties), a UNIQUE collision
+ * is a property of a PAIR of rows at distinct primary keys, so the diagnostic
+ * names the colliding key values. Thrown by the backing hosts' post-batch
+ * maintenance enforcement (memory `enforceSecondaryUniqueOnMaintenance`, store
+ * `enforceSecondaryUniqueForMaintenance`) — see `vtab/backing-host.ts`
+ * § Constraint validation.
+ */
+export function maintainedTableUniqueViolationError(
+	schemaName: string,
+	tableName: string,
+	constraintName: string,
+	columnNames: readonly string[],
+	keyValues: readonly SqlValue[],
+): QuereusError {
+	return new QuereusError(
+		`UNIQUE constraint failed: ${constraintName} (${columnNames.join(', ')}) — row derived into maintained table `
+			+ `'${schemaName}.${tableName}' collides on its declared UNIQUE constraint (key: ${keyValues.map(formatKeyValue).join(', ')})`,
 		StatusCode.CONSTRAINT,
 	);
 }

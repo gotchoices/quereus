@@ -148,19 +148,46 @@ export class MemoryIndex {
 		);
 	}
 
+	/**
+	 * Entries created by THIS index instance — safe to mutate in place. An entry
+	 * found through the tree but absent here was INHERITED from an ancestor
+	 * layer's tree (each TransactionLayer wraps a fresh MemoryIndex around the
+	 * parent's BTree as base): only the btree NODES are copy-on-write, the entry
+	 * objects (and their `primaryKeys` Sets) are shared, so mutating an inherited
+	 * entry's Set writes through to the ancestor — corrupting committed state
+	 * when this layer rolls back (a rolled-back insert leaves a phantom PK that
+	 * false-rejects later UNIQUE checks; a rolled-back delete strips a live PK
+	 * and silently un-enforces UNIQUE). Inherited entries are therefore
+	 * copy-on-written via {@link BTree.updateAt}, which lands the replacement in
+	 * THIS tree; owned entries keep the in-place fast path (bulk loads and
+	 * repeated same-key writes within one layer stay O(1) per entry).
+	 */
+	private ownedEntries = new WeakSet<MemoryIndexEntry>();
+
 	/** Adds a mapping from index key to primary key */
 	addEntry(indexKey: BTreeKeyForIndex, primaryKey: BTreeKeyForPrimary): void {
 		const path = this.data.find(indexKey);
 		if (path.on) {
-			// Entry exists, add to the existing set of primary keys
 			const existingEntry = this.data.at(path)!;
-			existingEntry.primaryKeys.add(primaryKey);
+			if (this.ownedEntries.has(existingEntry)) {
+				existingEntry.primaryKeys.add(primaryKey);
+				return;
+			}
+			// Inherited: copy-on-write into this layer's tree (see ownedEntries).
+			// Keep the stored indexKey bytes (a collation-equal/byte-different new
+			// key must not re-key the entry — matching the prior in-place behavior).
+			const updated: MemoryIndexEntry = {
+				indexKey: existingEntry.indexKey,
+				primaryKeys: new Set(existingEntry.primaryKeys).add(primaryKey),
+			};
+			this.ownedEntries.add(updated);
+			this.data.updateAt(path, updated);
 		} else {
-			// Create new entry with a Set containing the primary key
 			const newEntry: MemoryIndexEntry = {
 				indexKey,
 				primaryKeys: new Set([primaryKey])
 			};
+			this.ownedEntries.add(newEntry);
 			this.data.insert(newEntry);
 		}
 	}
@@ -168,14 +195,28 @@ export class MemoryIndex {
 	/** Removes a mapping from index key to primary key */
 	removeEntry(indexKey: BTreeKeyForIndex, primaryKey: BTreeKeyForPrimary): void {
 		const path = this.data.find(indexKey);
-		if (path.on) {
-			const entry = this.data.at(path)!;
-			entry.primaryKeys.delete(primaryKey);
+		if (!path.on) return;
+		const entry = this.data.at(path)!;
 
+		if (this.ownedEntries.has(entry)) {
+			entry.primaryKeys.delete(primaryKey);
 			// If no primary keys remain, remove the entire entry
 			if (entry.primaryKeys.size === 0) {
 				this.data.deleteAt(path);
 			}
+			return;
+		}
+
+		// Inherited: copy-on-write (see ownedEntries). A delete that empties the
+		// entry masks it in this layer's tree; the ancestor's entry is untouched.
+		const remaining = new Set(entry.primaryKeys);
+		remaining.delete(primaryKey);
+		if (remaining.size === 0) {
+			this.data.deleteAt(path);
+		} else {
+			const updated: MemoryIndexEntry = { indexKey: entry.indexKey, primaryKeys: remaining };
+			this.ownedEntries.add(updated);
+			this.data.updateAt(path, updated);
 		}
 	}
 
