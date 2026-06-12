@@ -152,6 +152,23 @@ describe('Maintained-table attach/detach verbs', () => {
 		});
 	});
 
+	describe('cycle diagnostic', () => {
+		it('names the cycle path in data-flow order, closed on the target', async () => {
+			await db.exec(`
+				create table a1 (id integer primary key, v text not null);
+				insert into a1 values (1, 'a');
+				create table b1 (id integer primary key, v text not null);
+				alter table b1 set maintained as select id, v from a1;
+			`);
+			try {
+				await db.exec(`alter table a1 set maintained as select id, v from b1`);
+				expect.fail('expected a derivation-cycle error');
+			} catch (e) {
+				expect((e as Error).message).to.contain('main.a1 → main.b1 → main.a1');
+			}
+		});
+	});
+
 	describe('cached statement plans flip with the catalog', () => {
 		beforeEach(async () => {
 			await db.exec(`

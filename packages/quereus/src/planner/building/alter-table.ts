@@ -185,6 +185,18 @@ export function buildAlterTableStmt(
           stmt.table.loc?.start.column,
         );
       }
+      // Mirror the create-form gate: a generated column would silently diverge
+      // from its expression once the body supplies every column's value.
+      const generated = tableSchema.columns.find(c => c.generated);
+      if (generated) {
+        throw new QuereusError(
+          `cannot attach derivation to '${tableSchema.name}': column '${generated.name}' is generated — a maintained table's columns are all derived by the body`,
+          StatusCode.ERROR,
+          undefined,
+          stmt.table.loc?.start.line,
+          stmt.table.loc?.start.column,
+        );
+      }
       // The module is the table's identity (no `using` clause on attach); it
       // must be able to host a maintained backing.
       if (!tableSchema.vtabModule?.getBackingHost) {

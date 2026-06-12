@@ -629,7 +629,11 @@ function assertNoDerivationCycle(db: Database, schemaName: string, tableName: st
 	const visited = new Set<string>();
 	const walk = (qualified: string, path: readonly string[]): void => {
 		if (qualified === target) {
-			const cycle = [target, ...path].reverse().concat(target).join(' → ');
+			// Render in data-flow order, closing the loop on the target. `path` is the
+			// derived-from chain outward from the new body (path[0] = a body source,
+			// path[last] = the table derived from the target), so data flows
+			// target → path[last] → … → path[0] → target.
+			const cycle = [target, ...[...path].reverse(), target].join(' → ');
 			throw new QuereusError(
 				`cannot attach derivation to '${schemaName}.${tableName}': the body would create a derivation cycle (${cycle})`,
 				StatusCode.ERROR,

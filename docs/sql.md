@@ -1498,7 +1498,7 @@ The `create materialized view` form is normalization sugar for the declared-shap
 
 - The body is evaluated and stored at create; create is all-or-nothing.
 - `refresh` is **not required for currency** (row-time maintenance keeps it live); it is an explicit resync verb, useful after a source *schema* change marks the view `stale`.
-- `using module(...)` is parsed for forward compatibility but v1 always backs the view with the in-memory table module.
+- `using module(...)` places the maintained table in the named [backing-host](materialized-views.md#backing-host-capability) module; omitted ⇒ the in-memory default. An unknown module or one without the capability is rejected at build time.
 - `insert defaults (col = expr, ...)` carries the same omitted-insert-default semantics as on a plain view ([§2.8](#28-create-view-statement)) — the default is supplied on the rewritten *source* insert and is transparent to row-time backing maintenance.
 - `drop table` / `drop view` reject a materialized-view name and redirect to `drop materialized view` (and vice-versa).
 

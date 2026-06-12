@@ -192,6 +192,27 @@ alter table tgt drop maintained;
 drop table tgt;
 drop table base2;
 
+-- an aggregate body attaches too: the strict shape check holds over the
+-- derived aggregate types/key, and incremental maintenance runs post-attach.
+-- (count(*) derives REAL nullable — the declared shape must say what the body
+-- derives, quirks included.)
+create table words (id integer primary key, w text not null);
+insert into words values (1, 'x'), (2, 'y'), (3, 'x');
+-- the PK column pins `collate binary` so the declared collation matches the
+-- body-derived one under both suites (the store's key collation defaults to NOCASE)
+create table counts (w text not null collate binary primary key, n real null);
+alter table counts set maintained as select w, count(*) as n from words group by w;
+select * from counts order by w;
+→ [{"w":"x","n":2},{"w":"y","n":1}]
+insert into words values (4, 'x');
+select n from counts where w = 'x';
+→ [{"n":3}]
+delete from words where id = 2;
+select count(*) as remaining from counts;
+→ [{"remaining":1}]
+drop materialized view counts;
+drop table words;
+
 -- ===================================
 -- 6. duplicate derived keys ⇒ loud reject, table and catalog untouched
 --    (the coarsened-key collision — the parallel-migration shape)
@@ -286,6 +307,15 @@ select count(*) as n from base where id = 99;
 alter table plain1 set maintained as select id, v from base;
 -- error: body produces 2 columns
 
+-- a generated column is rejected on both authoring forms: the body supplies
+-- every column's value, so the generation expression would silently diverge
+create table gen1 (id integer primary key, v text not null generated always as ('x'));
+alter table gen1 set maintained as select id, v from base;
+-- error: generated
+drop table gen1;
+create table gen1 (id integer primary key, v text not null generated always as ('x')) maintained as select id, v from base;
+-- error: generated
+
 drop table plain1;
 drop table base;
 
@@ -330,6 +360,18 @@ select * from mt4;
 → [{"id":1,"v":"a","created":42}]
 
 drop materialized view mt4;
+
+-- the clause also rides the attach verb
+create table mt5 (id integer primary key, v text not null, created integer not null);
+alter table mt5 set maintained as select id, v, created from src4
+  insert defaults (created = 99);
+insert into mt5 (id, v) values (2, 'b');
+select * from src4 order by id;
+→ [{"id":1,"v":"a","created":42},{"id":2,"v":"b","created":99}]
+select created from mt5 where id = 2;
+→ [{"created":99}]
+
+drop materialized view mt5;
 drop table src4;
 
 -- ===================================
