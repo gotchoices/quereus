@@ -105,6 +105,7 @@ export {
   resolvePkKeyCollations,
   type StoreTableConfig,
   type StoreTableModule,
+  type ExternalRowOp,
 } from './store-table.js';
 export { StoreConnection } from './store-connection.js';
 

@@ -17,6 +17,7 @@ import {
 	QuereusError,
 	StatusCode,
 	compareSqlValues,
+	rowsValueIdentical,
 	validateAndParse,
 	compilePredicate,
 	type Database,
@@ -34,6 +35,7 @@ import {
 	type UpdateArgs,
 	type VirtualTableModule,
 	type UpdateResult,
+	type BackingRowChange,
 } from '@quereus/quereus';
 
 import type { IterateOptions, KVEntry, KVStore } from './kv-store.js';
@@ -150,6 +152,17 @@ export interface StoreTableModule {
 	/** Save table DDL to persistent storage. */
 	saveTableDDL(tableSchema: TableSchema): Promise<void>;
 }
+
+/**
+ * One externally-applied row op against a SOURCE table's committed storage,
+ * the input vocabulary of {@link StoreTable.applyExternalRowChanges}. An
+ * `upsert` carries the full table row in schema column order (its PK — and thus
+ * its data key — is derived from the row, so an upsert can never relocate a
+ * row); a `delete` carries the PK values in PK-definition order.
+ */
+export type ExternalRowOp =
+	| { op: 'upsert'; row: Row }
+	| { op: 'delete'; pk: SqlValue[] };
 
 /**
  * Generic KVStore-backed virtual table.
@@ -1490,6 +1503,103 @@ export class StoreTable extends VirtualTable {
 	 */
 	openDataStore(): Promise<KVStore> {
 		return this.ensureStore();
+	}
+
+	// ── External row-write surface ────────────────────────────────────────
+	// Module-side entry point for externally-applied writes to a SOURCE table
+	// (the index-maintaining sibling of `StoreBackingHost`, which is for MV
+	// BACKING tables and deliberately keeps no indexes). Resolved per call via
+	// `StoreModule.getTableForExternalWrite`; addresses the table's CURRENT
+	// schema/encoding state so keys and index entries match its own DML paths.
+
+	/**
+	 * Effective (pending-over-committed) point read by PK values — the public
+	 * read an external writer issues before an upsert to learn the row's current
+	 * image. Thin wrapper over the same private point-lookup that backs
+	 * {@link query}'s point arm, so an external read merges pending-over-committed
+	 * exactly like an engine read does.
+	 */
+	readRowByPk(pk: SqlValue[]): Promise<Row | null> {
+		return this.readLiveRowByPk(pk);
+	}
+
+	/**
+	 * Apply externally-originated row ops directly to this source table's
+	 * COMMITTED storage: table-owned data-key put/delete, secondary-index
+	 * maintenance, and stats tracking. The index-maintaining counterpart of
+	 * `StoreBackingHost.applyMaintenance` (which targets index-less MV backings),
+	 * built for trusted replication-style writes.
+	 *
+	 * Deliberately:
+	 *   - emits NO module {@link DataChangeEvent}s — the external writer owns
+	 *     emission and the `remote` flag;
+	 *   - opens NO coordinator transaction — writes land in committed state
+	 *     immediately (`store.put`/`store.delete`, never the coordinator);
+	 *   - runs NO constraint validation (PK/UNIQUE/CHECK/FK) — the origin is
+	 *     trusted, mirroring the backing-host posture.
+	 *
+	 * Returns the EFFECTIVE per-op {@link BackingRowChange}s with accurate
+	 * before-images (the shape `Database.ingestExternalRowChanges` consumes),
+	 * suppressing no-ops to match the normative upsert-suppression contract in
+	 * `vtab/backing-host.ts`: a delete of an absent key, and a value-identical
+	 * upsert (`rowsValueIdentical` — byte-faithful, collation-UNAWARE, against the
+	 * effective existing row) write nothing and report nothing. A collation-equal /
+	 * byte-different upsert (e.g. a case-only rewrite under a NOCASE PK) keeps the
+	 * SAME data key (key identity is collation-aware) but IS a real update that
+	 * replaces the stored bytes and reports `update`.
+	 *
+	 * Last-writer-wins against any concurrently pending local transaction on this
+	 * table: the external write commits to storage at once, and that transaction's
+	 * pending batch may overwrite these keys when it commits. This is the same
+	 * posture the prior raw-KV sync adapter took — not a regression, now stated.
+	 */
+	async applyExternalRowChanges(ops: readonly ExternalRowOp[]): Promise<BackingRowChange[]> {
+		const changes: BackingRowChange[] = [];
+		if (ops.length === 0) return changes;
+
+		// Route through the lazy store-open path so the first external write to a
+		// freshly created table persists its DDL exactly like a first vtab write.
+		const store = await this.ensureStore();
+
+		for (const op of ops) {
+			switch (op.op) {
+				case 'delete': {
+					const key = this.encodeDataKey(op.pk);
+					const existing = await this.readEffectiveRowByKey(key);
+					if (!existing) break; // absent key → no storage/index/stats op, nothing reported
+					await store.delete(key);
+					await this.updateSecondaryIndexes(false, existing, null, op.pk);
+					this.trackMutation(-1, false);
+					changes.push({ op: 'delete', oldRow: existing });
+					break;
+				}
+				case 'upsert': {
+					const pk = this.extractPK(op.row);
+					const key = this.encodeDataKey(pk);
+					const existing = await this.readEffectiveRowByKey(key);
+					if (existing && rowsValueIdentical(existing, op.row)) {
+						// Byte-identical to the effective row → a true no-op: no write, no
+						// index touch, no stats delta, nothing reported (echo-prevention seam).
+						break;
+					}
+					await store.put(key, serializeRow(op.row));
+					// PK derives from the row, so the key never relocates: oldPk == newPk.
+					await this.updateSecondaryIndexes(false, existing, op.row, pk);
+					if (!existing) this.trackMutation(+1, false);
+					changes.push(existing
+						? { op: 'update', oldRow: existing, newRow: op.row }
+						: { op: 'insert', newRow: op.row });
+					break;
+				}
+				default: {
+					// A new ExternalRowOp variant must extend this switch; never-assignment
+					// makes that a compile error rather than a silent no-op.
+					const exhaustiveCheck: never = op;
+					throw new QuereusError(`Unknown external row op: ${JSON.stringify(exhaustiveCheck)}`, StatusCode.INTERNAL);
+				}
+			}
+		}
+		return changes;
 	}
 
 	/**

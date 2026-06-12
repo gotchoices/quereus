@@ -204,6 +204,34 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Resolve the live {@link StoreTable} for an externally-applied write to a
+	 * SOURCE table (committed put/delete + secondary-index + stats maintenance via
+	 * {@link StoreTable.applyExternalRowChanges}). Returns undefined when the table
+	 * is not this module's.
+	 *
+	 * Resolution mirrors {@link getBackingHost}: an ownership pre-check (the table
+	 * is registered and its `vtabModule` is this StoreModule, or the IsolationModule
+	 * wrapper exposing it as `underlying`) gates the {@link getOrReconnectTable}
+	 * fallback so a rehydrated-but-untouched (or rename-evicted) table reconnects
+	 * without adopting a table owned by a different module. Unlike `getBackingHost`
+	 * it attaches no coordinator: external writes target committed storage, and the
+	 * before-image read (`readEffectiveRowByKey`) merges any already-attached
+	 * coordinator's pending state on its own (none when the table is freshly
+	 * reconnected).
+	 */
+	getTableForExternalWrite(db: Database, schemaName: string, tableName: string): StoreTable | undefined {
+		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+		if (!this.tables.has(tableKey)) {
+			const registered = db.schemaManager.getTable(schemaName, tableName);
+			const wrapper = registered?.vtabModule as { underlying?: unknown } | undefined;
+			if (!registered || (registered.vtabModule !== this && wrapper?.underlying !== this)) {
+				return undefined;
+			}
+		}
+		return this.getOrReconnectTable(db, schemaName, tableName);
+	}
+
+	/**
 	 * Get the event emitter for this module.
 	 */
 	getEventEmitter(): StoreEventEmitter | undefined {

@@ -213,6 +213,37 @@ primary-key columns are keyed under the store's `collation` arg (default
 isolation wrapper forwards the capability automatically. See
 [`docs/materialized-views.md` § The store host](../../docs/materialized-views.md#the-store-host-using-store).
 
+## External Row-Write Entry Point
+
+`StoreTable.applyExternalRowChanges(ops)` applies trusted, externally-originated
+row writes (e.g. inbound replication) directly to a **source** table's committed
+storage — table-owned data-key put/delete, **secondary-index maintenance**, and
+stats tracking — and returns the effective `BackingRowChange[]` (the shape
+`Database.ingestExternalRowChanges` consumes). It is the index-maintaining
+sibling of the backing host (whose MV backing tables carry no indexes): a caller
+writing the data `KVStore` directly would silently skip index and stats upkeep.
+
+Resolve the table with `StoreModule.getTableForExternalWrite(db, schema, table)`
+(same ownership/wrapper resolution as `getBackingHost`), read a row's current
+image with `StoreTable.readRowByPk(pk)`, then apply one `ExternalRowOp` per row:
+
+```typescript
+const table = storeModule.getTableForExternalWrite(db, 'main', 'users');
+if (table) {
+  const changes = await table.applyExternalRowChanges([
+    { op: 'upsert', row: [1, 'alice'] },   // full row, schema column order
+    { op: 'delete', pk: [2] },             // PK values, PK-definition order
+  ]);
+}
+```
+
+Deliberately emits **no** module data events (the caller owns emission and the
+`remote` flag), opens **no** coordinator transaction (writes commit at once,
+last-writer-wins against any pending local transaction), and runs **no**
+constraint validation (the origin is trusted). No-ops are suppressed: a delete
+of an absent key and a value-identical upsert (byte-faithful) write nothing and
+report nothing.
+
 ## Transaction Isolation
 
 To add full ACID transaction semantics with snapshot isolation, wrap the store module with the `IsolationModule`:
@@ -277,7 +308,8 @@ console.log(hasIsolation(isolatedModule)); // true
 | `WriteBatch` | Batch write interface (type) |
 | `IterateOptions` | Iteration options (type) |
 | `StoreModule` | Generic VirtualTableModule |
-| `StoreTable` | Virtual table implementation |
+| `StoreTable` | Virtual table implementation (incl. `applyExternalRowChanges` / `readRowByPk` for externally-applied source writes) |
+| `ExternalRowOp` | One externally-applied row op (`upsert`/`delete`) for `StoreTable.applyExternalRowChanges` (type) |
 | `resolvePkKeyCollations` | Per-PK-column key collations (pass to `buildDataKey`/`buildIndexKey` to match `StoreTable`'s key bytes) |
 | `StoreConnection` | Transaction connection |
 | `TransactionCoordinator` | Transaction management |
