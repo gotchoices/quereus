@@ -1656,6 +1656,53 @@ describe('declarative-equivalence: materialized views', () => {
 			await db.close();
 		}
 	});
+
+	it('a backing-module move on a DECLARED-SHAPE maintained table migrates (recreate via create table … maintained as)', async function () {
+		// The MV-sugar form is covered above; this exercises the other maintained
+		// surface — `table … using <mod> (columns) maintained as <body>` (the declare-
+		// schema grammar puts `using` before the column list) — which sets the same
+		// module signal before the MV-sugar branch split and routes through
+		// `createTableToString` (not the `materialized view` sugar) for its recreate.
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				table mvt (id INTEGER PRIMARY KEY, x INTEGER NOT NULL) maintained as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			// Same shape + body, moved backing module.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				table mvt using mem2() (id INTEGER PRIMARY KEY, x INTEGER NOT NULL) maintained as select id, x from t
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.maintainedModuleMigrations, 'one migration recorded for the declared-shape table').to.deep.equal([
+				{ name: 'mvt', fromModule: 'memory', toModule: 'mem2' },
+			]);
+			expect(diff.tablesToDrop, 'mvt dropped for the recreate').to.deep.equal(['mvt']);
+			// Recreate renders the declared-shape `create table … maintained as` form
+			// (NOT the MV-sugar) and carries the moved module.
+			expect(diff.tablesToCreate.some(s => /create\s+table\s+(?:"mvt"|mvt)\b/i.test(s) && /maintained\s+as/i.test(s) && /mem2/i.test(s)),
+				'recreate is a create-table-maintained-as carrying mem2').to.be.true;
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mvt'), 'no orphaned alter for mvt').to.be.undefined;
+
+			// End-to-end gate-on apply migrates and re-materializes the rows.
+			await db.exec('apply schema main options (allow_destructive = true)');
+			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mvt');
+			expect(live!.maintained!.backingModuleName, 'mvt now backed by mem2').to.equal('mem2');
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, x from mvt order by id')) rows.push(r);
+			expect(rows, 'rows re-derived into the new backing').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================
