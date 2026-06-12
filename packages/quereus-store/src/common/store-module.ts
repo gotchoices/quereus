@@ -1370,11 +1370,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// (Option A). Query-layer ORDER BY / `=` / `table_info().collation` pick the
 					// new collation up from the column schema once this updated schema re-registers.
 					const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
-					if (normalized === (oldCol.collation || 'BINARY')) {
-						return oldSchema; // already in desired state — no scan, no re-key, no re-persist
+					const nameMatches = normalized === (oldCol.collation || 'BINARY');
+					if (nameMatches && oldCol.collationExplicit) {
+						return oldSchema; // already explicit in the desired collation — no scan, no re-key, no re-persist
 					}
-					newCol = { ...oldCol, collation: normalized };
-					collationChanged = true;
+					// SET COLLATE is a user declaration with the same standing as a
+					// CREATE-time COLLATE clause, so mark the collation explicit (rank 2
+					// in the comparison lattice) regardless of the column's creation
+					// history — including SET COLLATE binary. When only the name matches
+					// but the column was not yet explicit (a defaulted collation, or one
+					// inherited from session default_collation), flip the flag as a
+					// METADATA-ONLY change: the collation bytes are unchanged, so keep
+					// collationChanged false to skip rekeyRows / validateUniqueOverExistingRows
+					// below while still re-registering the schema and re-persisting DDL.
+					// A different name takes the full physical re-key path AND sets the flag.
+					newCol = { ...oldCol, collation: normalized, collationExplicit: true };
+					collationChanged = !nameMatches;
 				} else {
 					throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
 				}

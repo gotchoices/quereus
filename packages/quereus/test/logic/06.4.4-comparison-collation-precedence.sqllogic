@@ -274,3 +274,69 @@ insert into fkc_conf values (1, 'a');
 drop table fkc_conf;
 drop table fkp_conf;
 pragma foreign_keys = false;
+
+-- =============================================================================
+-- 11. SET COLLATE provenance (ticket collation-provenance-stability-set-collate-
+--     and-reload). `ALTER COLUMN ... SET COLLATE` is a user declaration with the
+--     same standing as a CREATE-time COLLATE clause: it marks the collation
+--     explicit (rank 2 'declared') regardless of the column's creation history,
+--     so the rank is a function of the current catalog column, not its past.
+--     Runs under BOTH memory and store (SET COLLATE re-registers the schema on
+--     each — see the 41.7 header). The same statement that previously diverged
+--     (rank 1 vs rank 2 depending on whether the column happened to be created
+--     with a COLLATE clause) now resolves identically.
+-- =============================================================================
+
+-- 11a. The reproduced bug, now fixed: SET COLLATE NOCASE on a column created
+--      WITHOUT a COLLATE clause vs a declared RTRIM column ⇒ rank-2 vs rank-2,
+--      ambiguous-collation error (was silently RTRIM — rank-1 lost to rank-2).
+create table sc_r1 (id integer primary key, v text, r text collate rtrim);
+insert into sc_r1 values (1, 'xx', 'xx');
+alter table sc_r1 alter column v set collate nocase;
+select id from sc_r1 where v = r;
+-- error: ambiguous collation
+drop table sc_r1;
+
+-- 11b. History independence: the SAME SET COLLATE NOCASE statement on a column
+--      created WITH `collate binary` yields the identical rank-2 result — the
+--      same ambiguous-collation error against a declared RTRIM column. The rank
+--      follows the current column, not whether it was once created with COLLATE.
+create table sc_r1b (id integer primary key, v text collate binary, r text collate rtrim);
+insert into sc_r1b values (1, 'xx', 'xx');
+alter table sc_r1b alter column v set collate nocase;
+select id from sc_r1b where v = r;
+-- error: ambiguous collation
+drop table sc_r1b;
+
+-- 11c. SET COLLATE NOCASE on a plain column vs a declared BINARY column: a real
+--      rank-2 vs rank-2 conflict (declared `collate binary` contributes at rank
+--      2), ambiguous-collation error.
+create table sc_db (id integer primary key, v text, b text collate binary);
+insert into sc_db values (1, 'xx', 'xx');
+alter table sc_db alter column v set collate nocase;
+select id from sc_db where v = b;
+-- error: ambiguous collation
+drop table sc_db;
+
+-- 11d. SET COLLATE NOCASE on a plain column vs another plain (defaulted-BINARY)
+--      column: rank-2 NOCASE wins over the rank-1 BINARY that contributes
+--      nothing, so the comparison resolves NOCASE and the case-folded row matches.
+create table sc_p (id integer primary key, v text, p text);
+insert into sc_p values (1, 'AB', 'ab'), (2, 'xy', 'zz');
+alter table sc_p alter column v set collate nocase;
+select id from sc_p where v = p;
+→ [{"id":1}]
+drop table sc_p;
+
+-- 11e. SET COLLATE binary is rank 2 too (a real BINARY demand, not the absence of
+--      one): on a defaulted-BINARY column it flips the column explicit, so a
+--      conflict against a declared NOCASE column is an ambiguous-collation error
+--      in-session (was silently NOCASE — rank-1 defaulted BINARY lost to rank-2).
+--      This pins the "consistency argues yes" decision; no reopen assertion (the
+--      flag does not survive a store reload, by design — BINARY DDL is elided).
+create table sc_bin (id integer primary key, v text, n text collate nocase);
+insert into sc_bin values (1, 'xx', 'xx');
+alter table sc_bin alter column v set collate binary;
+select id from sc_bin where v = n;
+-- error: ambiguous collation
+drop table sc_bin;

@@ -1707,11 +1707,21 @@ export class MemoryTableManager {
 
 			if (change.setCollation !== undefined) {
 				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
-				if (normalized === (oldCol.collation || 'BINARY')) {
-					return; // already in desired state — no re-sort needed
+				const nameMatches = normalized === (oldCol.collation || 'BINARY');
+				if (nameMatches && oldCol.collationExplicit) {
+					return; // already explicit in the desired collation — nothing to do
 				}
-				newCol = { ...oldCol, collation: normalized };
-				collationChanged = true;
+				// SET COLLATE is a user declaration with the same standing as a
+				// CREATE-time COLLATE clause, so mark the collation explicit (rank 2 in
+				// the comparison lattice) regardless of the column's creation history —
+				// including SET COLLATE binary. When only the name matches but the column
+				// was not yet explicit (a defaulted collation, or one inherited from
+				// session default_collation), flip the flag as a METADATA-ONLY change:
+				// the collation bytes are unchanged, so keep collationChanged false and
+				// skip the physical re-sort / re-key / UNIQUE re-validation below. A
+				// different name takes the full path AND sets the flag.
+				newCol = { ...oldCol, collation: normalized, collationExplicit: true };
+				collationChanged = !nameMatches;
 			} else if (change.setNotNull !== undefined) {
 				if (change.setNotNull === true && !oldCol.notNull) {
 					// Tightening: scan for NULLs. If DEFAULT present, backfill first.

@@ -419,6 +419,29 @@ Errors surface at the point the comparison compiles: statement prepare for
 queries, DML prepare for write-path scopes (CHECK enforcement, FK
 parent-existence checks, upsert SET, RETURNING).
 
+**Provenance is a function of the current catalog column, not its history.**
+A column reaches rank 2 (`declared`) two ways, with identical standing: a
+CREATE-time explicit `COLLATE` clause, OR `ALTER COLUMN ... SET COLLATE`
+(including `SET COLLATE binary` — a real BINARY demand, not the absence of
+one). So the same `SET COLLATE NOCASE` resolves identically whether the column
+was originally created with or without a `COLLATE` clause; the rank follows the
+live column schema (`ColumnSchema.collationExplicit`), never how the column was
+first declared.
+
+**Rank-1 `default` provenance is session-transient.** It is not persisted as a
+distinct bit: the catalog and persisted DDL are fully explicit (an explicit
+`COLLATE` for every non-`BINARY` collation, `BINARY` elided — see docs/sql.md
+§ 9.2.4). So a column that got `NOCASE` from session `default_collation`, or a
+store-module reconcile default, carries rank 1 in-session but reloads through
+the CREATE path as rank 2 (`declared`), because the re-parsed `COLLATE NOCASE`
+sets `collationExplicit`. This reload upgrade is **fail-louder only**: a
+comparison that previously resolved silently (to BINARY, or to the declared
+side) can only become a prepare-time ambiguous-collation error — never silently
+different results — so the upgrade needs no catalog/DDL representation change.
+A defaulted *BINARY* (and an explicit `SET COLLATE binary`) reloads as rank 1
+because `BINARY` is elided from DDL — consistent with a CREATE-time
+`c text collate binary` column, which already round-trips to rank 1.
+
 Related forms:
 
 - **IN** — `cond IN (e1, …, en)` / `cond IN (subquery)` merges the RHS

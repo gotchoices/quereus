@@ -3487,6 +3487,17 @@ text column with no explicit `COLLATE` resolves to the session default (non-text
 deliberately does **not** consult the default — it preserves the renamed column's existing
 collation rather than re-resolving it to the current session setting.
 
+Because "the catalog always stores the concrete, resolved collation" is enforced by emitting an
+explicit `COLLATE` for every non-`BINARY` collation, a column whose collation came from the
+session default is *defaulted* in-session (rank 1, `default`) but reloads as *declared* (rank 2)
+after a reopen or DDL re-execution — the re-parsed `COLLATE` clause is indistinguishable from a
+hand-written one. This is intended: the comparison-collation rank may rise from rank 1 to rank 2
+across the persistence boundary, and the only observable effect is *stricter* (fail-louder)
+conflict detection — a comparison that previously resolved silently can become a prepare-time
+ambiguous-collation error, never silently different results (see docs/types.md § Comparison
+collation resolution). `ALTER COLUMN ... SET COLLATE` likewise marks the collation explicit
+(rank 2) in-session, with the same standing as a CREATE-time `COLLATE`.
+
 #### 9.2.5 nondeterministic_schema
 
 Allows non-deterministic expressions (`random()`, `datetime('now')`, user-defined functions

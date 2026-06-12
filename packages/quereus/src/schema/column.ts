@@ -23,11 +23,19 @@ export interface ColumnSchema {
 	/** Declared collation sequence name (e.g., "BINARY", "NOCASE", "RTRIM") */
 	collation: string;
 	/**
-	 * Whether `collation` came from an explicit `COLLATE` clause (true) rather than
-	 * the implicit default (undefined). Lets a module distinguish a user-declared
+	 * Whether `collation` is user-declared (true) rather than an implicit default
+	 * (undefined). Set by a CREATE-time explicit `COLLATE` clause AND by
+	 * `ALTER COLUMN ... SET COLLATE` (which carries the same standing as a declared
+	 * clause, incl. `SET COLLATE binary`) — so the flag reflects the current catalog
+	 * column, not its creation history. Lets a module distinguish a user-declared
 	 * collation from the default — e.g. the store module keys an *explicit* per-column
 	 * PK collation natively but applies its own table-level default collation to an
-	 * *implicit*-default text PK column. Purely informational; absent ⇒ implicit.
+	 * *implicit*-default text PK column; the comparison lattice ranks an explicit
+	 * collation (rank 2 'declared') above a defaulted one (rank 1 'default'). Purely
+	 * informational; absent ⇒ implicit. NOT persisted as a distinct bit: persisted DDL
+	 * is fully explicit (an explicit `COLLATE` for any non-BINARY collation, BINARY
+	 * elided), so a defaulted non-BINARY collation reloads as `collationExplicit: true`
+	 * and a defaulted/explicit BINARY both reload as implicit — see docs/types.md.
 	 */
 	collationExplicit?: boolean;
 	/** Whether the column is generated (GENERATED ALWAYS AS) */
