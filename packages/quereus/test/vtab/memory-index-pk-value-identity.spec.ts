@@ -44,6 +44,19 @@ function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefini
 	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pkCompare);
 }
 
+/**
+ * A child index whose BTree inherits from `base`'s tree (the same wiring a
+ * TransactionLayer uses: `new MemoryIndex(..., parentSecondaryTree)`). Entries
+ * reachable only through `base.data` are INHERITED for the child — the child's
+ * per-instance `ownedEntries` WeakSet does not contain them — so add/remove must
+ * copy-on-write (clone the sorted array via `slice()`) rather than mutate the
+ * shared entry in place.
+ */
+function makeChildIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[], base: MemoryIndex): MemoryIndex {
+	const pkCompare = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition)).compare;
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pkCompare, base.data);
+}
+
 describe('MemoryIndex primaryKeys value-identity', () => {
 	it('composite-PK removeEntry drops the member by value (count -> 0, entry deleted)', () => {
 		const columns = makeColumns(3);
@@ -106,5 +119,53 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 		index.addEntry(1, 5n);
 		index.addEntry(1, 5); // value-equal under the integer comparator
 		expect(index.getPrimaryKeys(1)).to.have.length(1);
+	});
+
+	// The copy-on-write discipline that keeps a layer's writes from corrupting the
+	// committed base it inherits from. The container changed from `new Set(existing)`
+	// to `existing.slice()`, so these guard the new sorted-array clone path.
+	describe('inherited copy-on-write (array container) isolates the base', () => {
+		it('inherited addEntry of a distinct composite PK does not mutate the base entry', () => {
+			const columns = makeColumns(3);
+			const pk = [{ index: 1 }, { index: 2 }];
+			const base = makeIndex(columns, pk);
+			base.addEntry(1, [10, 20]);
+
+			const child = makeChildIndex(columns, pk, base);
+			// Inherited entry (owned by `base`, not `child`): must clone before insert.
+			child.addEntry(1, [10, 21]);
+
+			// Child sees both PKs; base is untouched (no write-through to committed state).
+			expect(child.getPrimaryKeys(1)).to.have.length(2);
+			expect(base.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
+		});
+
+		it('inherited removeEntry that empties the entry leaves the base entry intact', () => {
+			const columns = makeColumns(3);
+			const pk = [{ index: 1 }, { index: 2 }];
+			const base = makeIndex(columns, pk);
+			base.addEntry(1, [10, 20]);
+
+			const child = makeChildIndex(columns, pk, base);
+			// Fresh equal-by-value array removes by value through the inherited COW path.
+			child.removeEntry(1, [10, 20]);
+
+			// Masked in the child (a rolled-back delete must not strip the live base PK).
+			expect(child.getPrimaryKeys(1)).to.have.length(0);
+			expect(base.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
+		});
+
+		it('inherited addEntry of an already-present PK does not duplicate or mutate the base', () => {
+			const columns = makeColumns(3);
+			const pk = [{ index: 1 }, { index: 2 }];
+			const base = makeIndex(columns, pk);
+			base.addEntry(1, [10, 20]);
+
+			const child = makeChildIndex(columns, pk, base);
+			child.addEntry(1, [10, 20]); // value-equal: COW no-op, still must not dup
+
+			expect(child.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
+			expect(base.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
+		});
 	});
 });
