@@ -511,4 +511,88 @@ describe('store-adapter seam integration', () => {
 			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
 		});
 	});
+
+	describe('resumed snapshot stream preserves completed-table metadata', () => {
+		// A resumed transfer's sender skips already-completed tables and never
+		// re-emits their metadata. The receiver's up-front clear must consult the
+		// persisted checkpoint and preserve those tables — otherwise their CRDT
+		// state is wiped and never rewritten (metadata/data divergence).
+		it('omitted completed table survives the clear; re-streamed table applies', async () => {
+			// tableB is re-streamed → its rows flush to the store at table-end, so
+			// the store must be able to resolve it. tableA is skipped entirely.
+			await db.exec('create table tableB (id text primary key, v text) using store');
+
+			const kv = new InMemoryKVStore();
+			const syncEvents = new SyncEventEmitterImpl();
+			const syncManager = await SyncManagerImpl.create(
+				kv, events, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
+			);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			const snapshotId = 'snap-resume-1';
+
+			// Seed tableA's column version (the "already completed" table) and a
+			// checkpoint that lists it completed — mirroring saveSnapshotCheckpoint's
+			// serialization (hlc.wallTime as string, siteId arrays).
+			await syncManager.columnVersions.setColumnVersion('main', 'tableA', ['a1'], 'v', {
+				hlc: remoteHLC.tick(),
+				value: 'survives',
+			});
+			const checkpoint = {
+				snapshotId,
+				siteId: remoteSiteId,
+				hlc: remoteHLC.tick(),
+				lastTableIndex: 1,
+				lastEntryIndex: 1,
+				completedTables: ['main.tableA'],
+				entriesProcessed: 1,
+				createdAt: 0,
+			};
+			const ckptJson = JSON.stringify({
+				...checkpoint,
+				hlc: {
+					wallTime: checkpoint.hlc.wallTime.toString(),
+					counter: checkpoint.hlc.counter,
+					siteId: Array.from(checkpoint.hlc.siteId),
+				},
+				siteId: Array.from(checkpoint.siteId),
+			});
+			await kv.put(new TextEncoder().encode(`sc:${snapshotId}`), new TextEncoder().encode(ckptJson));
+
+			// Resumed stream: header (full table count) + tableB only + footer.
+			const chunks: SnapshotChunk[] = [
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 2, migrationCount: 0, snapshotId },
+				{ type: 'table-start', schema: 'main', table: 'tableB', estimatedEntries: 0 },
+				{ type: 'column-versions', schema: 'main', table: 'tableB', entries: [['["b1"]:v', remoteHLC.tick(), 'bval']] },
+				{ type: 'table-end', schema: 'main', table: 'tableB', entriesWritten: 1 },
+				{ type: 'footer', snapshotId, totalTables: 2, totalEntries: 1, totalMigrations: 0 },
+			];
+			async function* stream(): AsyncIterable<SnapshotChunk> {
+				for (const c of chunks) yield c;
+			}
+
+			await syncManager.applySnapshotStream(stream());
+
+			// tableA's metadata survived the resume-aware clear...
+			const survived = await syncManager.columnVersions.getColumnVersion('main', 'tableA', ['a1'], 'v');
+			void expect(survived, 'completed-table column version preserved on resume').to.exist;
+			expect(survived!.value).to.equal('survives');
+
+			// ...and tableB was applied (metadata + store row).
+			const applied = await syncManager.columnVersions.getColumnVersion('main', 'tableB', ['b1'], 'v');
+			void expect(applied, 'resumed table column version applied').to.exist;
+			expect(applied!.value).to.equal('bval');
+			expect(await collect(db, 'select id, v from tableB')).to.deep.equal([{ id: 'b1', v: 'bval' }]);
+
+			// Divergence angle: a full delta sync to a fresh peer still relays
+			// tableA's change, proving the metadata is not orphaned from its data.
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			const tableAChange = relayed
+				.flatMap(cs => cs.changes)
+				.find(c => c.type === 'column' && c.table === 'tableA' && c.column === 'v');
+			void expect(tableAChange, 'tableA change relayed after resume').to.exist;
+		});
+	});
 });

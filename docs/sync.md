@@ -351,6 +351,14 @@ interface SyncManager {
   /**
    * Apply a streamed snapshot with progress tracking.
    * Supports resumption via checkpoint tracking.
+   *
+   * A fresh apply replaces all local CRDT metadata: the up-front clear wipes
+   * column versions, tombstones, and the change log before the chunks rewrite
+   * them. On a *resumed* apply the sender skips already-completed tables and
+   * never re-emits their metadata, so the receiver consults the persisted
+   * checkpoint (saved under `sc:{snapshotId}`) and preserves those completed
+   * tables through the clear — otherwise their CRDT state would be wiped and
+   * never rewritten, diverging from the row data still in the store.
    */
   applySnapshotStream(
     chunks: AsyncIterable<SnapshotChunk>,

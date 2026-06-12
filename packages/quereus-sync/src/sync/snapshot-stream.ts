@@ -18,6 +18,8 @@ import {
 	buildTableColumnVersionScanBounds,
 	parseColumnVersionKey,
 	parseSchemaMigrationKey,
+	parseTombstoneKey,
+	parseChangeLogKey,
 	encodePK,
 } from '../metadata/keys.js';
 import type { SnapshotCheckpoint } from './manager.js';
@@ -231,6 +233,41 @@ export async function* resumeSnapshotStream(
 // ============================================================================
 
 /**
+ * Clear existing CRDT metadata (column versions, tombstones, change log) ahead
+ * of applying a snapshot.
+ *
+ * `preserveTables` names `schema.table` keys whose metadata must survive — on a
+ * resumed transfer the sender skips already-completed tables and never re-emits
+ * their metadata, so blanket-clearing would wipe state that is never rewritten.
+ * With an empty `preserveTables` this deletes everything, identical to a fresh
+ * full apply.
+ */
+async function clearExistingMetadata(
+	ctx: SyncContext,
+	preserveTables: ReadonlySet<string>,
+): Promise<void> {
+	const clearBatch = ctx.kv.batch();
+
+	for await (const entry of ctx.kv.iterate(buildAllColumnVersionsScanBounds())) {
+		const parsed = parseColumnVersionKey(entry.key);
+		if (parsed && preserveTables.has(`${parsed.schema}.${parsed.table}`)) continue;
+		clearBatch.delete(entry.key);
+	}
+	for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
+		const parsed = parseTombstoneKey(entry.key);
+		if (parsed && preserveTables.has(`${parsed.schema}.${parsed.table}`)) continue;
+		clearBatch.delete(entry.key);
+	}
+	for await (const entry of ctx.kv.iterate(buildAllChangeLogScanBounds())) {
+		const parsed = parseChangeLogKey(entry.key);
+		if (parsed && preserveTables.has(`${parsed.schema}.${parsed.table}`)) continue;
+		clearBatch.delete(entry.key);
+	}
+
+	await clearBatch.write();
+}
+
+/**
  * Apply a streamed snapshot, processing chunks as they arrive.
  */
 export async function applySnapshotStream(
@@ -264,19 +301,6 @@ export async function applySnapshotStream(
 		}
 	};
 
-	// Clear existing metadata before applying
-	const clearBatch = ctx.kv.batch();
-	for await (const entry of ctx.kv.iterate(buildAllColumnVersionsScanBounds())) {
-		clearBatch.delete(entry.key);
-	}
-	for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
-		clearBatch.delete(entry.key);
-	}
-	for await (const entry of ctx.kv.iterate(buildAllChangeLogScanBounds())) {
-		clearBatch.delete(entry.key);
-	}
-	await clearBatch.write();
-
 	// Process chunks
 	let batch = ctx.kv.batch();
 	let batchSize = 0;
@@ -288,11 +312,27 @@ export async function applySnapshotStream(
 
 	for await (const chunk of chunks) {
 		switch (chunk.type) {
-			case 'header':
+			case 'header': {
 				snapshotId = chunk.snapshotId;
 				snapshotHLC = chunk.hlc;
 				totalTables = chunk.tableCount;
+
+				// On a resumed transfer the sender skips tables it already streamed and
+				// never re-emits their metadata. Look up the persisted checkpoint (saved
+				// under this snapshotId during the prior pass) and preserve those completed
+				// tables through the up-front clear; otherwise their column-version /
+				// change-log state would be wiped and never rewritten. Seed the local
+				// counters from the checkpoint so mid-stream checkpoint saves stay
+				// monotonic and progress reporting reflects the full transfer.
+				const checkpoint = snapshotId ? await getSnapshotCheckpoint(ctx, snapshotId) : undefined;
+				if (checkpoint) {
+					completedTables.push(...checkpoint.completedTables);
+					tablesProcessed = checkpoint.completedTables.length;
+					entriesProcessed = checkpoint.entriesProcessed;
+				}
+				await clearExistingMetadata(ctx, new Set(completedTables));
 				break;
+			}
 
 			case 'table-start':
 				currentTable = `${chunk.schema}.${chunk.table}`;
