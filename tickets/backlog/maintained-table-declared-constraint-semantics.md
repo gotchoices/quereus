@@ -55,6 +55,7 @@ user DML — rows previously stored in violation then exist in a table whose
 constraints claim they cannot. Whatever is decided must say what detach means
 for pre-existing violating rows.
 
-Related (does not cover this): `backing-tables-readonly-enforcement` (plan/)
-handles rejecting user DML against maintained tables; this ticket is about
+Related (does not cover this): `maintained-table-dml-executor-backstop`
+(implement/) handles rejecting direct writes against maintained tables (user
+DML routes through write-through); this ticket is about
 what the *derivation's own writes* owe the declared constraints.
