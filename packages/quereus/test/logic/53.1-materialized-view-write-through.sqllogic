@@ -260,3 +260,38 @@ delete from pv where id = 1;
 -- the rejected writes changed nothing
 select id, x from pv order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================
+-- 11. Aggregate (non-updatable) body. An aggregate-bodied MV is creatable and
+--     maintained (the residual-recompute arm), but its body is NOT row-decomposable
+--     for write-through, so user DML against the MV name is rejected at PLAN time.
+--     The diagnostic names the target as a *materialized view* (not a plain "view") —
+--     the body-shape reject threads the target's kind. The reject is plan-time, so
+--     the MV contents are untouched and the source stays directly writable + maintained.
+--     (Runs in both memory and store suites; the 'x'/'y' group keys carry no
+--     case-variant collision, so the store's NOCASE backing-key default is moot.)
+-- ===================================
+
+create table words (id integer primary key, w text);
+insert into words values (1, 'x'), (2, 'y'), (3, 'x');
+create materialized view wcount as select w, count(*) as n from words group by w;
+select w, n from wcount order by w;
+→ [{"w":"x","n":2},{"w":"y","n":1}]
+
+-- insert / update / delete against the aggregate MV are all rejected at plan time,
+-- naming it a materialized view
+insert into wcount (w, n) values ('z', 1);
+-- error: cannot write through materialized view
+update wcount set n = 99 where w = 'x';
+-- error: cannot write through materialized view
+delete from wcount where w = 'y';
+-- error: cannot write through materialized view
+
+-- the rejected writes changed nothing
+select w, n from wcount order by w;
+→ [{"w":"x","n":2},{"w":"y","n":1}]
+
+-- the source remains directly writable and the MV maintains incrementally
+insert into words values (4, 'y');
+select w, n from wcount order by w;
+→ [{"w":"x","n":2},{"w":"y","n":2}]

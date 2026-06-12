@@ -102,6 +102,7 @@ export function maintainedTableViewLike(table: MaintainedTableSchema): {
 	readonly columns?: ReadonlyArray<string>;
 	readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	readonly tags?: TableSchema['tags'];
+	readonly noun?: string;
 } {
 	return {
 		name: table.name,
@@ -110,5 +111,9 @@ export function maintainedTableViewLike(table: MaintainedTableSchema): {
 		columns: table.derivation.columns,
 		insertDefaults: table.derivation.insertDefaults,
 		tags: table.tags,
+		// Body-shape rejection diagnostics name the target by its kind (see
+		// MutableViewLike.noun) so an unsupported-body MV reject reads
+		// "materialized view 'm'", not "view 'm'".
+		noun: 'materialized view',
 	};
 }

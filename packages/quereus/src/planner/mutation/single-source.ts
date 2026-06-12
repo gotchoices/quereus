@@ -63,6 +63,16 @@ export interface MutableViewLike {
 	readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** View-level metadata tags — validated at the `view-ddl` site on mutation. */
 	readonly tags?: Readonly<Record<string, SqlValue>>;
+	/**
+	 * What to call this target in body-shape rejection diagnostics — `'view'`
+	 * (the default for a plain {@link import('../../schema/view.js').ViewSchema})
+	 * or `'materialized view'` (set by `maintainedTableViewLike`). Write-through
+	 * presents a maintained table through this same adapter, so without it an
+	 * unsupported-body reject (e.g. an aggregate-bodied MV) would misname the MV
+	 * a "view". Only the `analyzeView` body-shape rejects consult it; the
+	 * per-column rewrite diagnostics keep the generic "view" framing.
+	 */
+	readonly noun?: string;
 }
 
 /**
@@ -404,7 +414,10 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		raiseMutationDiagnostic({
 			reason: classification.reason,
 			table: view.name,
-			message: `cannot write through view '${view.name}': ${classification.detail}`,
+			// Name the target by its kind so an unsupported-body reject on a
+			// maintained table (e.g. an aggregate-bodied MV) reads "materialized
+			// view 'm'", not the misleading plain-view framing.
+			message: `cannot write through ${view.noun ?? 'view'} '${view.name}': ${classification.detail}`,
 		});
 	}
 	const baseTable = classification.baseTable.tableSchema;

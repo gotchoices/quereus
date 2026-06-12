@@ -150,9 +150,21 @@ insert into base values (6, 'f');
 select count(*) as n from tgt where id = 6;
 → [{"n":0}]
 
--- ordinary and user-writable: a direct write stays local (no write-through)
+-- ordinary and user-writable: a direct write stays local (no write-through).
+-- After detach the table carries no derivation, so the engine's READONLY backstop
+-- (runtime DML executor) sheds with it — a direct INSERT/UPDATE/DELETE succeeds and
+-- writes the table's own rows rather than routing to a source.
 insert into tgt values (7, 'local');
 select count(*) as n from base where id = 7;
+→ [{"n":0}]
+-- the local row is readable directly in the detached (now ordinary) table
+select v from tgt where id = 7;
+→ [{"v":"local"}]
+update tgt set v = 'LOCAL' where id = 7;
+select v from tgt where id = 7;
+→ [{"v":"LOCAL"}]
+delete from tgt where id = 7;
+select count(*) as n from tgt where id = 7;
 → [{"n":0}]
 
 -- structural ALTER allowed again

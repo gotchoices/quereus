@@ -10,6 +10,7 @@ import { extractOldRowFromFlat, extractNewRowFromFlat } from '../../util/row-des
 import { buildInsertStatement, buildUpdateStatement, buildDeleteStatement } from '../../util/mutation-statement.js';
 import type { UpdateArgs, VirtualTable } from '../../vtab/table.js';
 import type { TableSchema } from '../../schema/table.js';
+import { isMaintainedTable } from '../../schema/derivation.js';
 import { hasNativeEventSupport } from '../../util/event-support.js';
 import { sqlValuesEqual } from '../../util/comparison.js';
 import { withAsyncRowContext } from '../context-helpers.js';
@@ -117,8 +118,49 @@ async function evaluateContextRow(
 	return contextRow as Row;
 }
 
+/**
+ * Engine-level READONLY backstop for maintained tables — the defense-in-depth
+ * second net behind plan-time write-through dispatch.
+ *
+ * A maintained table's rows are *derived* (it carries a {@link TableDerivation};
+ * `schema/derivation.ts`). The only engine surfaces permitted to write them are
+ * the privileged backing-host paths (`applyMaintenance` / `replaceContents`, the
+ * attach/refresh reconcile, the store rehydrate-refill, the isolation flush
+ * `trustedWrite`) — none of which route through the DML executor. User DML naming
+ * a maintained table is rewritten to **write-through** against the body's base
+ * source at plan time (the three DML builders' view-mutation dispatch + the
+ * resolved-schema backstop), so a `DmlExecutorNode` whose target still carries a
+ * derivation can only be a plan-time mis-dispatch — a direct-write plan that
+ * would silently diverge the derived contents from the source. This converts that
+ * whole bug class into a loud READONLY error at emit time.
+ *
+ * Keyed structurally on `derivation` presence ({@link isMaintainedTable}) — never
+ * on the table name. Emit-time (a single prepare-time check), not per-row: zero
+ * runtime cost, and re-checked on every re-plan because `set / drop maintained`
+ * invalidate the `'table'` statement-cache dependency. Exported so a spec test can
+ * exercise it directly with a derivation-bearing schema: the backstop is
+ * deliberately unreachable from SQL (plan-time dispatch routes every reachable
+ * spelling away from it), so the exported guard plus the one wiring call site is
+ * the honest pin.
+ */
+export function assertNotMaintainedTableTarget(tableSchema: TableSchema): void {
+	if (isMaintainedTable(tableSchema)) {
+		throw new QuereusError(
+			`table '${tableSchema.schemaName}.${tableSchema.name}' is a maintained table — its contents are derived `
+			+ `and may not be written directly (user DML routes through write-through; this plan bypassed the dispatch — engine bug)`,
+			StatusCode.READONLY,
+		);
+	}
+}
+
 export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): Instruction {
 	const tableSchema = plan.table.tableSchema;
+
+	// READONLY backstop: a DmlExecutorNode targeting a maintained table is a
+	// plan-time mis-dispatch (user DML should have been rewritten to write-through
+	// against the base source). Reject loudly rather than letting a direct write
+	// silently diverge the derived contents — see assertNotMaintainedTableTarget.
+	assertNotMaintainedTableTarget(tableSchema);
 
 	// Pre-calculate primary key column indices from schema (needed for update/delete)
 	const pkColumnIndicesInSchema = tableSchema.primaryKeyDefinition.map(pkColDef => pkColDef.index);

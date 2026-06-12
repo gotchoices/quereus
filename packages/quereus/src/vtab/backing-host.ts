@@ -35,11 +35,22 @@
  * delta commits/rolls-back in lockstep with the source write under the
  * Database's coordinated commit.
  *
- * ## Read-only to user DML
+ * ## Read-only to user DML — engine-owned
  *
- * A backing table must reject user DML (READONLY) while admitting
- * `applyMaintenance` / `replaceContents` — the privileged surface deliberately
- * bypasses the user-write permission check.
+ * A maintained table's rows are derived; nothing but the privileged surface may
+ * write them. This is enforced by the **engine**, not owed by the host module:
+ * the planner rewrites user DML naming a maintained table to **write-through**
+ * against the body's base source (the three DML builders' view-mutation dispatch
+ * + the resolved-schema backstop), and the runtime DML executor carries a
+ * READONLY backstop that rejects any mutation plan whose target still carries a
+ * derivation (`runtime/emit/dml-executor.ts` `assertNotMaintainedTableTarget`) —
+ * the second net catching a plan-time mis-dispatch before it can silently
+ * diverge the derived contents. The privileged surface (`applyMaintenance` /
+ * `replaceContents` and the reconcile / rehydrate-refill paths) bypasses both by
+ * construction: it never routes through the DML executor. A host module
+ * therefore implements no user-DML permission check of its own; direct
+ * programmatic `update()` calls on the backing by an embedder are the same trust
+ * level as holding this privileged surface and are out of engine scope.
  *
  * ## Concurrency
  *
