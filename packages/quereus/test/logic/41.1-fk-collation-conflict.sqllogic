@@ -123,12 +123,15 @@ drop table mp_parent;
 
 -- =============================================================================
 -- 8. ALTER TABLE ADD CONSTRAINT: a conflicting FK added after the fact is
---    rejected at ALTER time. Run with foreign_keys OFF so the module's
---    existing-row validator early-returns and THIS declaration-time check is
---    the rejecting mechanism — proving the ALTER-time check is unconditional.
---    (With foreign_keys ON the memory module prepares the FK existence query
---    first, whose plan-time comparison raises the equivalent `ambiguous
---    collation` error — also a rejection, just from the enforcement seam.)
+--    rejected at ALTER time. The collation check now runs as a PRE-validation,
+--    BEFORE module.alterTable, so it is the single, authoritative rejection
+--    point — before any module persistence side effect (on the store backend
+--    alterTable's addConstraint arm saveTableDDL's the FK before returning, so a
+--    post-call throw would leave the rejected FK on disk; see the store-reopen
+--    spec fk-collation-conflict-reopen.spec.ts). The `foreign_keys` pragma is no
+--    longer load-bearing for THIS rejection — it fires whether enforcement is on
+--    or off — but we keep OFF here so the assertion isolates the pure
+--    declaration-time check from the module's enforcement-time existing-row scan.
 -- =============================================================================
 
 pragma foreign_keys = false;

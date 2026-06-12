@@ -130,7 +130,12 @@ comparison-collation lattice (`schema/constraint-builder.ts`
 `validateForeignKeyCollations`; see docs/types.md § Comparison collation
 resolution). The same check runs on the universal `ALTER … ADD CONSTRAINT` and
 `ALTER … ADD COLUMN` emit paths (so memory and store are covered with one
-validator) and, transitively, on declarative apply. It is **unconditional** —
+validator) and, transitively, on declarative apply. On every path the check runs
+**before any persistence side effect**: `createTable` validates before `addTable`,
+`ADD COLUMN` inside its validate-before-swap revert region, and `ADD CONSTRAINT`
+**before** `module.alterTable` (the store backend's addConstraint arm
+`saveTableDDL`'s the FK before returning, so a post-call throw would leave a
+rejected FK on disk to rehydrate on the next reopen). It is **unconditional** —
 unlike the FK existing-row scan it is *not* gated on `pragma foreign_keys`, since
 a contradictory collation pairing is a malformed declaration (same class as a
 child/parent column-count mismatch), not an enforcement concern. Two residuals
