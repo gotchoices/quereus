@@ -381,6 +381,40 @@ describe('materialized views `using store` (end-to-end)', () => {
 			expect(await rows(db, 'select id, v, w from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10, w: 7 }, { id: 2, v: 20, w: 8 }]);
 		});
+
+		it('a narrowing retype reshapes the durable store backing against the reconciled body, not the stale rows (no MISMATCH)', async () => {
+			// Store analogue of the memory `narrowing retype validates the reconciled
+			// body` regression (`maintained-table-reshape-narrowing-attr-on-stale-data`).
+			// Pins `store-module.ts`'s `alterColumn` setDataType arm under a narrowing:
+			// the backing goes stale on an unrelated source add, so a source data-fix is
+			// NOT maintained in (the durable backing keeps the un-convertible 'abc'). The
+			// deferred post-reconcile retype must validate the clean re-derived body.
+			await db.exec('create table src (id integer primary key, v text) using store');
+			await db.exec("insert into src values (1, 'abc')");
+			await db.exec('create materialized view mv using store as select * from src');
+
+			await db.exec('alter table src add column w integer default 0'); // mv stale
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
+			await db.exec("update src set v = '5' where id = 1");             // unmaintained
+			await db.exec('alter table src alter column v set data type integer'); // source narrows; backing keeps 'abc'
+
+			// OLD code retyped v over the durable 'abc' before the reconcile → MISMATCH.
+			// The fix defers it past the reconcile so it validates the clean body.
+			await db.exec('refresh materialized view mv');
+
+			const backing = db.schemaManager.getTable('main', BACKING)!;
+			expect(backing.vtabModuleName, 'reshaped backing still in the store module').to.equal('store');
+			expect(backing.columns.map(c => c.name)).to.deep.equal(['id', 'v', 'w']);
+			expect(backing.columns[1].logicalType.name.toUpperCase(), 'v retyped to INTEGER').to.equal('INTEGER');
+			// read(MV) == evaluate(body): reconciled the fresh body, never the stale 'abc'.
+			expect(await rows(db, 'select id, v, w from mv order by id'))
+				.to.deep.equal(await rows(db, 'select id, v, w from src order by id'));
+
+			// Maintenance is live against the reshaped incarnation.
+			await db.exec("insert into src values (2, '7', 9)");
+			expect(await rows(db, 'select id, w from mv order by id'))
+				.to.deep.equal([{ id: 1, w: 0 }, { id: 2, w: 9 }]);
+		});
 	});
 
 	it('drop materialized view destroys the store backing and removes both catalog entries', async () => {

@@ -167,6 +167,66 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 			}
 		});
 
+		it('a narrowing retype validates the reconciled body, not the discarded stale backing (no spurious MISMATCH; no col_2 divergence)', async () => {
+			// Regression for `maintained-table-reshape-narrowing-attr-on-stale-data`.
+			// The backing goes STALE on an unrelated source add, so a subsequent source
+			// data-fix is NOT maintained in — the backing keeps the pre-narrowing value
+			// while the re-derived body is clean. The narrowing retype must validate the
+			// reconciled body (clean), not the discarded backing (dirty).
+			const db = new Database();
+			try {
+				await db.exec('create table t (id integer primary key, v text)');
+				await db.exec("insert into t values (1, 'abc')");
+				await db.exec('create materialized view mv as select * from t');
+				expect(await readObjectsSorted(db, 'select * from mv')).to.deep.equal(['{"id":1,"v":"abc"}']);
+
+				// (1) An unrelated source add marks the MV stale → its row-time plan detaches,
+				// so the data-fix below is NOT maintained into the backing (it keeps 'abc').
+				await db.exec('alter table t add column w integer default 0');
+				expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
+
+				// (2) Clean the source so v narrows; the write is unmaintained (MV stale).
+				await db.exec("update t set v = '5' where id = 1");
+				// (3) Narrow t.v to integer — the source is clean ('5'→5), so the source
+				// alter succeeds; the stale backing still holds the un-convertible 'abc'.
+				await db.exec('alter table t alter column v set data type integer');
+
+				// The OLD code retyped v BEFORE the reconcile, validating the discarded
+				// 'abc' → spurious MISMATCH, and on a partial throw left the catalog (2-col)
+				// diverged from the module (3-col), surfacing a phantom `col_2`. The fix
+				// defers the retype past the reconcile.
+				const events = await captureEventsFor(db, 'mv', async () => {
+					await db.exec('refresh materialized view mv');
+				});
+				expect(events).to.not.include.members(['table_removed', 'table_added']);
+				expect(events).to.include('table_modified');
+
+				const reshaped = db.schemaManager.getTable('main', 'mv')!;
+				// Exactly [id, v, w] — no phantom `col_2` from a catalog/module divergence
+				// (the divergence the OLD mid-loop throw left behind).
+				expect(reshaped.columns.map(c => c.name)).to.deep.equal(['id', 'v', 'w']);
+				// The deferred retype applied to the schema (v narrowed to INTEGER). NOTE:
+				// `set data type` is a metadata-only logical-type change in this engine — it
+				// validates convertibility but does not rewrite the stored representation, so
+				// the value rides as the body produced it (the source `t.v` is likewise the
+				// text '5' under its INTEGER logical type). The point is it reconciled the
+				// FRESH body, not the discarded 'abc'.
+				expect(reshaped.columns[1].logicalType.name.toUpperCase(), 'v retyped to INTEGER').to.equal('INTEGER');
+				// read(MV) == evaluate(body): the maintained snapshot matches a fresh body
+				// eval (so the value is the re-derived '5', never the stale 'abc').
+				expect(await readObjectsSorted(db, 'select * from mv'))
+					.to.deep.equal(await readObjectsSorted(db, 'select * from t'));
+
+				// Convergence: with the snapshot now coherent, a second refresh (no further
+				// source change) takes the data-only fast path — same TableSchema identity.
+				const before = db.schemaManager.getTable('main', 'mv');
+				await db.exec('refresh materialized view mv');
+				expect(db.schemaManager.getTable('main', 'mv'), 'converged: no re-reshape loop').to.equal(before);
+			} finally {
+				await db.close();
+			}
+		});
+
 		it('row-time maintenance after an in-place reshape maintains the reshaped backing', async () => {
 			const db = new Database();
 			try {

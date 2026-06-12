@@ -680,6 +680,14 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
  * executor lifts each onto a `SchemaChangeInfo` arm. Names are tracked
  * post-rename (the rename phase runs first), and every op addresses its column
  * by name, so the running index shift that add/drop induce never matters.
+ *
+ * `retype`, `recollate`, and `tightenNotNull` are the **data-validating** ops —
+ * each can throw on the rows it touches (a non-convertible value → MISMATCH, a
+ * unique collision under the new collation → CONSTRAINT, a NULL under the new
+ * NOT NULL → CONSTRAINT). The classifier routes them into the plan's
+ * post-reconcile batch so they validate the **reconciled body rows**, not the
+ * about-to-be-discarded backing (see {@link ReshapePlan}). `rename`, `add`,
+ * `loosenNotNull`, and `drop` never throw on data and stay pre-reconcile.
  */
 type ReshapeColumnOp =
 	| { kind: 'rename'; oldName: string; oldCol: ColumnSchema; newName: string }
@@ -687,14 +695,26 @@ type ReshapeColumnOp =
 	| { kind: 'retype'; name: string; newTypeName: string }
 	| { kind: 'recollate'; name: string; collation: string }
 	| { kind: 'loosenNotNull'; name: string }
+	| { kind: 'tightenNotNull'; name: string }
 	| { kind: 'drop'; name: string };
 
-/** An expressible in-place reshape: the ordered pre-reconcile module ops plus the
- *  set of (final) column names whose NOT NULL must be (re-)asserted *after* the
- *  data reconcile — see {@link reshapeBackingInPlace} for why tightening defers. */
+/**
+ * An expressible in-place reshape, split into two batches by whether an op can
+ * throw on the data it touches:
+ *
+ *  - `preReconcileOps` — the structural, data-lossless ops (`rename`, `add`,
+ *    `loosenNotNull`, `drop`). These run BEFORE the data reconcile and only morph
+ *    the schema; the pre-reconcile rows are about to be discarded by the rebuild.
+ *  - `postReconcileOps` — the data-validating ops (`retype`, `recollate`,
+ *    `tightenNotNull`). These run AFTER the reconcile so they validate the freshly
+ *    re-derived body rows (which satisfy the new attribute) rather than the stale
+ *    backing (which may not). Deferring them is what fixes the spurious
+ *    MISMATCH/CONSTRAINT a narrowing reshape over stale data used to throw — see
+ *    {@link reshapeBackingInPlace}.
+ */
 interface ReshapePlan {
-	ops: ReshapeColumnOp[];
-	tightenNotNull: string[];
+	preReconcileOps: ReshapeColumnOp[];
+	postReconcileOps: ReshapeColumnOp[];
 }
 
 type ReshapeClassification =
@@ -725,6 +745,12 @@ type ReshapeClassification =
  * {@link renameShiftedBackingColumns} already uses). Shares the per-column
  * predicates with {@link describeBackingShapeMismatch} (the positional pure-name-
  * shift check) rather than re-implementing the column compare.
+ *
+ * The resulting plan is two-phase (see {@link ReshapePlan}): the structural,
+ * data-lossless ops (`rename`/`add`/`loosenNotNull`/`drop`) go pre-reconcile; the
+ * data-validating attribute shifts (`retype`/`recollate`) and every deferred
+ * NOT NULL `tightenNotNull` go post-reconcile, so they validate the reconciled
+ * body rows rather than the discarded backing.
  */
 function classifyBackingReshape(current: TableSchema, shape: BackingShape): ReshapeClassification {
 	const cur = current.columns;
@@ -734,22 +760,23 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
 
 	const renames: ReshapeColumnOp[] = [];
 	const adds: ReshapeColumnOp[] = [];
-	const attrs: ReshapeColumnOp[] = [];   // survivor attribute shifts (retype / recollate / loosen)
+	const loosens: ReshapeColumnOp[] = [];        // pre-reconcile: NOT NULL loosen never throws on data
 	const drops: ReshapeColumnOp[] = [];
-	const tightenNotNull: string[] = [];
+	const postReconcileOps: ReshapeColumnOp[] = []; // retype / recollate / tightenNotNull — validate the reconciled body
 	// lower(oldName) → lower(newName), for the rename-aware PK comparison below.
 	const renameMap = new Map<string, string>();
 
-	// A survivor's attribute shift. A NOT NULL *tightening* defers to a
-	// post-reconcile pass (the live rows may still violate it; the reconciled body
-	// rows will not); a loosening and the type/collation shifts apply in place.
-	// `name` is the column's post-rename (new) name.
+	// A survivor's attribute shift. The data-validating shifts (type/collation
+	// retype, NOT NULL *tightening*) defer to the post-reconcile batch — the live
+	// rows may still violate them, but the re-derived body rows will not. A NOT NULL
+	// *loosening* never throws on data, so it stays pre-reconcile. `name` is the
+	// column's post-rename (new) name.
 	const recordAttrShift = (from: ColumnSchema, to: ColumnSchema, name: string): void => {
-		if (!backingTypeMatches(from, to)) attrs.push({ kind: 'retype', name, newTypeName: to.logicalType.name });
-		if (!backingCollationMatches(from, to)) attrs.push({ kind: 'recollate', name, collation: to.collation ?? 'BINARY' });
+		if (!backingTypeMatches(from, to)) postReconcileOps.push({ kind: 'retype', name, newTypeName: to.logicalType.name });
+		if (!backingCollationMatches(from, to)) postReconcileOps.push({ kind: 'recollate', name, collation: to.collation ?? 'BINARY' });
 		if (!backingNotNullMatches(from, to)) {
-			if (to.notNull === true) tightenNotNull.push(name);
-			else attrs.push({ kind: 'loosenNotNull', name });
+			if (to.notNull === true) postReconcileOps.push({ kind: 'tightenNotNull', name });
+			else loosens.push({ kind: 'loosenNotNull', name });
 		}
 	};
 
@@ -787,8 +814,10 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
 	for (; j < sh.length; j++) {
 		const sc = sh[j];
 		if (!curNames.has(sc.name.toLowerCase())) {
+			// Added NULLABLE pre-reconcile (the reconcile fills it); any NOT NULL is
+			// asserted post-reconcile against the filled rows, joining the tighten batch.
 			adds.push({ kind: 'add', col: sc });
-			if (sc.notNull === true) tightenNotNull.push(sc.name);
+			if (sc.notNull === true) postReconcileOps.push({ kind: 'tightenNotNull', name: sc.name });
 		} else {
 			return { expressible: false, reason: `column '${sc.name}' is reordered` };
 		}
@@ -797,9 +826,17 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
 	const pkReason = describePhysicalPkChange(current, shape, renameMap);
 	if (pkReason) return { expressible: false, reason: pkReason };
 
-	// Data-lossless ops first (renames, adds) then lossy-capable (attribute shifts,
-	// drops), so a mid-sequence failure leaves a state a re-run refresh re-derives.
-	return { expressible: true, plan: { ops: [...renames, ...adds, ...attrs, ...drops], tightenNotNull } };
+	// Pre-reconcile: the structural, data-lossless ops only (renames + adds before
+	// drops, so a mid-sequence failure leaves a re-derivable state). The
+	// data-validating attribute shifts + NOT NULL tightenings run post-reconcile
+	// against the reconciled body, never the discarded backing.
+	return {
+		expressible: true,
+		plan: {
+			preReconcileOps: [...renames, ...adds, ...loosens, ...drops],
+			postReconcileOps,
+		},
+	};
 }
 
 /**
@@ -862,6 +899,8 @@ function reshapeOpToChange(op: ReshapeColumnOp): SchemaChangeInfo {
 			return { type: 'alterColumn', columnName: op.name, setCollation: op.collation };
 		case 'loosenNotNull':
 			return { type: 'alterColumn', columnName: op.name, setNotNull: false };
+		case 'tightenNotNull':
+			return { type: 'alterColumn', columnName: op.name, setNotNull: true };
 		case 'drop':
 			return { type: 'dropColumn', columnName: op.name };
 	}
@@ -906,26 +945,45 @@ export async function reshapeBacking(
 }
 
 /**
- * Executes an expressible in-place reshape: apply the ordered module `alterTable`
- * ops (renames/adds/attribute-shifts/drops) → re-register the reshaped schema +
- * (shape-updated) derivation → data-reconcile via the shared {@link rebuildBacking}
- * (re-run the body, swap contents) → assert any deferred NOT NULL → fire one
- * `table_modified`. The **same table incarnation throughout** — the backing-host
- * instance stays owned, no `table_removed`/`table_added` — so a replicated basis
- * table's row metadata survives; consumer maintained tables go stale via the
- * single `table_modified` and recover by their own refresh, exactly as for any
- * source alter. Returns the reshaped maintained table for the caller to re-register
+ * Executes an expressible in-place reshape in two phases around the data reconcile:
+ *
+ *   1. apply the **pre-reconcile** structural ops (renames/adds/loosens/drops) →
+ *   2. re-register the reshaped (structural) schema + (shape-updated) derivation →
+ *   3. data-reconcile via the shared {@link rebuildBacking} (re-run the body, swap
+ *      contents) → 4. apply the **post-reconcile** data-validating ops
+ *      (retype/recollate/tighten-NOT-NULL) → 5. re-register the final schema →
+ *   6. fire one `table_modified`.
+ *
+ * The **same table incarnation throughout** — the backing-host instance stays
+ * owned, no `table_removed`/`table_added` — so a replicated basis table's row
+ * metadata survives; consumer maintained tables go stale via the single
+ * `table_modified` and recover by their own refresh, exactly as for any source
+ * alter. Returns the reshaped maintained table for the caller to re-register
  * maintenance on.
  *
- * **NULL-default adds, deferred tightening.** A new column is added NULLABLE (its
- * real values arrive with the reconcile) and any NOT NULL — added column or a
- * survivor tightened from nullable — is asserted only after the reconcile, so a
- * non-empty backing never trips "ADD NOT NULL without a default".
+ * **Why the data-validating ops defer.** A retype (physical convert), a recollate
+ * (re-key + unique re-validate), and a NOT NULL tighten each scan the rows and
+ * throw on a violation — but the pre-reconcile rows are about to be discarded by
+ * step 3. Running them pre-reconcile would validate the stale backing (which may
+ * still hold pre-narrowing values, e.g. an MV gone stale on an unrelated source
+ * change whose data-fix was never maintained in) and spuriously throw a
+ * MISMATCH/CONSTRAINT on a reshape the fresh body satisfies. Deferring them past
+ * the reconcile validates the re-derived body rows instead. This is sound because
+ * the reconcile's insert paths do NOT validate values against the column schema
+ * (`MemoryTable.replaceBaseLayer` PK-extracts + inserts raw; the store backing-host
+ * `replaceContents` puts serialized rows by keyed diff), so a body value conforming
+ * to the NEW attribute enters the still-OLD-typed column unvalidated, and the
+ * post-reconcile op then converts/re-keys/asserts the clean body data successfully.
+ * The added-NULLABLE / deferred-tighten behavior for new NOT NULL columns is the
+ * same mechanism (a non-empty backing never trips "ADD NOT NULL without a default").
  *
- * **Recoverability.** A mid-sequence module failure (e.g. an `alterColumn`
- * MISMATCH narrowing the live rows, or the reconcile tripping the set gate)
- * throws; the caller leaves the MV `stale`, and a re-run refresh re-derives the
- * (now smaller) residual delta against the partially-reshaped table and converges.
+ * **Recoverability.** Only the data-lossless structural ops run before step 2's
+ * `schema.addTable`, so the window in which the catalog schema and the module's
+ * live schema could diverge on a partial failure no longer arises in practice. A
+ * genuine post-reconcile throw (a body the new attribute still cannot satisfy)
+ * happens AFTER the catalog is consistently re-registered with the reconciled body,
+ * so the caller leaves the MV `stale` over a coherent, re-runnable table that
+ * converges once the underlying data is fixed.
  */
 async function reshapeBackingInPlace(
 	db: Database,
@@ -948,10 +1006,11 @@ async function reshapeBackingInPlace(
 			`its backing module '${backing.vtabModuleName}' does not support in-place ALTER`);
 	}
 
-	// Pre-reconcile structural ops. Each addresses its column by name, so the fresh
-	// schema each call returns need not be threaded by index; track only the latest.
+	// Pre-reconcile structural ops (renames/adds/loosens/drops — none throw on data).
+	// Each addresses its column by name, so the fresh schema each call returns need
+	// not be threaded by index; track only the latest.
 	let current: TableSchema = backing;
-	for (const op of plan.ops) {
+	for (const op of plan.preReconcileOps) {
 		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
 	}
 
@@ -969,11 +1028,13 @@ async function reshapeBackingInPlace(
 	// data-only path — same host, same incarnation).
 	await rebuildBacking(db, live);
 
-	// Deferred NOT NULL: the reconciled rows satisfy it where the live rows might not.
-	for (const name of plan.tightenNotNull) {
-		current = await module.alterTable(db, mv.schemaName, mv.name, { type: 'alterColumn', columnName: name, setNotNull: true });
+	// Post-reconcile data-validating ops (retype / recollate / tighten NOT NULL): the
+	// reconciled body rows satisfy the new attribute where the discarded backing
+	// might not, so each validates the fresh data, not the stale rows.
+	for (const op of plan.postReconcileOps) {
+		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
 	}
-	if (plan.tightenNotNull.length > 0) {
+	if (plan.postReconcileOps.length > 0) {
 		live = { ...current, derivation: mv.derivation };
 		schema.addTable(live);
 	}
