@@ -1627,6 +1627,71 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
+	it('a maintained-table RENAME + backing-module move in one apply cooperate (rename retargets, recreate-in-place under new name)', async function () {
+		// Regression: a maintained table that is BOTH renamed (via a
+		// `quereus.previous_name` hint) AND has its backing module moved in the same
+		// apply previously emitted conflicting DDL — the table RENAME landed first, so
+		// the module-move's `DROP mv` no-op'd and `CREATE mv2` collided ("already
+		// exists"). The fix keeps the RENAME op (dependents retarget) but drops the NEW
+		// declared name `mv2` so the recreate lands in-place. A dependent plain view `v`
+		// over the renamed+moved table pins the retargeting.
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+				view v as select id, x from mv
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			// Same body, renamed (mv→mv2 via previous_name hint) AND moved backing module,
+			// with the dependent view retargeted to the new name.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv2 using mem2() as select id, x from t
+					with tags ("quereus.previous_name" = 'mv')
+				view v as select id, x from mv2
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			// The table RENAME op survives (dependents retarget via ALTER … RENAME).
+			expect(
+				diff.renames.some(r => r.kind === 'table' && r.oldName.toLowerCase() === 'mv' && r.newName.toLowerCase() === 'mv2'),
+				'mv→mv2 table rename preserved',
+			).to.be.true;
+			// The drop targets the NEW name (the just-renamed live incarnation), not the old.
+			expect(diff.tablesToDrop, 'drop targets the new declared name mv2').to.deep.equal(['mv2']);
+			expect(
+				diff.tablesToCreate.some(s => /create\s+materialized\s+view\s+mv2\b/i.test(s) && /mem2/i.test(s)),
+				'mv2 recreated using mem2',
+			).to.be.true;
+			expect(diff.maintainedModuleMigrations, 'one module migration recorded under the new name').to.deep.equal([
+				{ name: 'mv2', fromModule: 'memory', toModule: 'mem2' },
+			]);
+
+			// End-to-end: the destructive apply renames-then-recreates-in-place, the rows
+			// re-materialize under mv2, and the dependent view stays intact (retargeted).
+			await db.exec('apply schema main options (allow_destructive = true)');
+
+			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv2');
+			expect(live!.maintained!.backingModuleName, 'mv2 now backed by mem2').to.equal('mem2');
+
+			const mvRows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, x from mv2 order by id')) mvRows.push(r);
+			expect(mvRows, 'mv2 rows re-derived into the new backing').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+
+			const vRows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, x from v order by id')) vRows.push(r);
+			expect(vRows, 'dependent view v retargeted to mv2 and still correct').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('a backing-module move AND a body change together take ONE drop+recreate (no separate re-attach)', async function () {
 		const db = new Database();
 		db.registerModule('mem2', new MemoryTableModule());

@@ -473,13 +473,25 @@ export function computeSchemaDiff(
 			// FK-referenced-parent-column against the actual (pre-rename) catalog body.
 			const alterDiff = computeTableAlterDiff(declaredTable, matchedActual, policy, tableRenames.renames, targetSchemaName, columnRenamesByTable, resolveDeclaredColumn, defaultCollation);
 			if (alterDiff.maintainedModuleMigration) {
-				// Destructive backing-module move: drop the live incarnation (actual
-				// name, via the shared drop ordering) and recreate into the newly
-				// declared module (re-materializing the body). The recreate subsumes any
-				// concurrent body / tag / shape op, so the alter diff is SUPPRESSED — no
-				// `tablesToAlter` entry for this table. Gated at apply (allow_destructive);
-				// surfaced unconditionally by `diff schema`.
-				dropSet.add(matchedActual.name.toLowerCase());
+				// Destructive backing-module move: drop the live incarnation (via the
+				// shared drop ordering) and recreate into the newly declared module
+				// (re-materializing the body). The recreate subsumes any concurrent body /
+				// tag / shape op, so the alter diff is SUPPRESSED — no `tablesToAlter`
+				// entry for this table. Gated at apply (allow_destructive); surfaced
+				// unconditionally by `diff schema`.
+				//
+				// Rename-coincident case: when the same apply BOTH renames this
+				// maintained table (hinted match, `matchedActual.name !== name`) AND moves
+				// its backing module, the table RENAME op is preserved in `diff.renames`
+				// (dependents over the old name retarget via the ALTER … RENAME primitive —
+				// see reconciledDeclaredViewDefinition). At apply that rename runs FIRST,
+				// moving the live incarnation to the NEW declared name, so the drop must
+				// target the NEW name `name` — dropping the old `matchedActual.name` would
+				// no-op (it was just renamed away) and the recreate, which renders under
+				// `name`, would then collide ("already exists"). For a plain name match the
+				// two names are identical.
+				const dropName = matchedActual.name.toLowerCase() !== name ? name : matchedActual.name.toLowerCase();
+				dropSet.add(dropName);
 				diff.tablesToCreate.push(renderFreshTableCreate(name, tableStmt, declaredMaterializedViews, targetSchemaName, defaultVtabModule, defaultVtabArgs));
 				diff.maintainedModuleMigrations.push({
 					name: tableStmt.table.name,
