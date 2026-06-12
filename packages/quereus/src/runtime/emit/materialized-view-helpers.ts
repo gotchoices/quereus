@@ -824,18 +824,21 @@ async function validateDeclaredConstraintsOverContents(db: Database, mt: Maintai
  *
  * `recordedColumns` is recorded verbatim as `derivation.columns` (the lossless
  * implicit/explicit signal the persist + import paths already use): the declared
- * column names for the explicit forms (the attach verb, and `create table …
- * maintained (columns) as`), or `undefined` for the implicit `create table …
- * maintained as` form (which reshapes its source on reopen). When
- * `positionalRename` is set — the `maintained (columns)` create form — the body
- * outputs are renamed positionally to `recordedColumns` and the per-column name
- * check is skipped (the authored list is the authoritative output-name vector);
- * otherwise the strict declared-shape check (names included) applies, so the
- * body must already be aliased to the declared names (the attach verb's
- * unchanged posture). `buildTableDerivation` hashes `recordedColumns` into
- * `bodyHash`, so live exec and catalog import of the same canonical DDL agree on
- * both the record and the hash — making attach/create → persist → reopen a fixed
- * point.
+ * column names for the explicit `create table … maintained (columns) as` form, or
+ * `undefined` for the implicit forms — `create table … maintained as` (which
+ * reshapes its source on reopen) AND the re-attach verb (`set maintained as`).
+ * The verb has no rename-list syntax and its strict declared-shape check
+ * guarantees the body's natural names already equal the table columns, so the
+ * implicit form is lossless there and identical to what create-sugar records (no
+ * implicit→explicit flip on re-attach). When `positionalRename` is set — the
+ * `maintained (columns)` create form — the body outputs are renamed positionally
+ * to `recordedColumns` and the per-column name check is skipped (the authored list
+ * is the authoritative output-name vector); otherwise the strict declared-shape
+ * check (names included) applies, so the body must already be aliased to the
+ * declared names (the implicit-create / attach-verb posture). `buildTableDerivation`
+ * hashes `recordedColumns` into `bodyHash`, so live exec and catalog import of the
+ * same canonical DDL agree on both the record and the hash — making attach/create →
+ * persist → reopen a fixed point.
  */
 export async function attachMaintainedDerivation(
 	db: Database,

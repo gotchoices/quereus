@@ -224,9 +224,11 @@ describe('Maintained-table attach/detach verbs', () => {
 				alter table tgt set maintained as select id, v from src;
 			`);
 			const exported = generateMaintainedTableDDL(maintained('tgt'));
-			// Attach records the declared names as the (explicit) rename list, so the
-			// canonical table form carries them on the `maintained (…)` clause.
-			expect(exported, 'canonical form is the table form').to.match(/create table .* maintained \(id, v\) as/i);
+			// Attach now records the IMPLICIT form (the verb's strict name check guarantees
+			// the body's natural names already equal the table columns), so the canonical
+			// table form omits the rename list — the bare `maintained as`, matching create-sugar.
+			expect(exported, 'canonical form is the implicit table form').to.match(/create table .* maintained as /i);
+			expect(exported, 'no explicit rename list on the implicit form').to.not.match(/maintained \(/i);
 			const originalHash = maintained('tgt').derivation.bodyHash;
 
 			const db2 = new Database();

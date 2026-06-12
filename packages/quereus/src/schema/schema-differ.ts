@@ -1715,7 +1715,7 @@ function computeTableAlterDiff(
 		if (tagsDrifted(declaredTable.tableStmt.tags, actualTable.tags)) {
 			diff.tableTagsChange = desiredTagSet(declaredTable.tableStmt.tags);
 		}
-		applyMaintainedTransition(diff, declaredMaintained, liveMaintained, actualTable.columns.map(c => c.name), tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
+		applyMaintainedTransition(diff, declaredMaintained, liveMaintained, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
 		markMaintainedTagRoute(diff, liveMaintained);
 		return diff;
 	}
@@ -1913,7 +1913,7 @@ function computeTableAlterDiff(
 
 	// Derivation transition LAST, so a re-attach with a concurrent shape change can
 	// observe the column / PK / constraint ops recorded above (→ detach-reshape-attach).
-	applyMaintainedTransition(diff, declaredMaintained, liveMaintained, actualTable.columns.map(c => c.name), tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
+	applyMaintainedTransition(diff, declaredMaintained, liveMaintained, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
 	markMaintainedTagRoute(diff, liveMaintained);
 
 	return diff;
@@ -1991,8 +1991,6 @@ function applyMaintainedTransition(
 	diff: TableAlterDiff,
 	declaredMaintained: AST.MaintainedClause | undefined,
 	liveMaintained: CatalogTable['maintained'],
-	/** Live table column names — the explicit rename-list form a re-attach records. */
-	liveColumnNames: ReadonlyArray<string>,
 	tableRenames: ReadonlyArray<RenameOp>,
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
@@ -2011,7 +2009,7 @@ function applyMaintainedTransition(
 	}
 	// Both maintained — compare the canonical body hash (reconciling in-diff renames
 	// so a pure source rename converges via the rename propagation, not a re-attach).
-	if (maintainedBodyMatches(declaredMaintained!, liveMaintained!.bodyHash, liveColumnNames, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) {
+	if (maintainedBodyMatches(declaredMaintained!, liveMaintained!.bodyHash, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) {
 		return; // no derivation change → no churn
 	}
 	// Body drift → re-attach. A concurrent shape change (column / PK / constraint
@@ -2025,35 +2023,31 @@ function applyMaintainedTransition(
  * True when the declared maintained body canonicalizes to the live
  * `derivation.bodyHash` — i.e. an unchanged derivation (no re-attach).
  *
- * The rename list inside the hash is the wrinkle: a maintained table's live
- * bodyHash is computed with the IMPLICIT form (no rename list — `columns:
- * undefined`) right after a fresh create, but with the EXPLICIT form (the table's
- * own column names) after a `set maintained as` re-attach (the attach verb records
- * `table.columns`). To stay idempotent across that representational difference, we
- * accept EITHER form — the as-authored `maintained.columns` AND the live column
- * names — each also re-compared under in-diff rename reconciliation so a pure
- * source rename converges via the rename propagation rather than churning a
- * re-attach. A genuine body / clause edit fails BOTH (the canonical body text
- * differs), so it is not masked. (The underlying create-vs-attach `columns`
- * inconsistency is tracked for a verb-side cleanup — see the review handoff.)
+ * The recorded form is the as-authored `maintained.columns`: `undefined` for an
+ * implicit body (MV sugar / `create table … maintained as` / the re-attach verb,
+ * which now records implicit) and the names array for an explicit rename list
+ * (`mv (a, b)` / `maintained (a, b) as`). Both the create path AND the re-attach
+ * verb record the same implicit form for a body whose natural names already equal
+ * the table columns, so a single as-authored variant suffices — there is no
+ * create-vs-attach representation gap to absorb. The variant is also re-compared
+ * under in-diff rename reconciliation so a pure source rename converges via the
+ * rename propagation rather than churning a re-attach. A genuine body / clause edit
+ * (including an explicit rename-list change b → c) fails the compare, so it is not
+ * masked.
  */
 function maintainedBodyMatches(
 	declared: AST.MaintainedClause,
 	liveBodyHash: string,
-	liveColumnNames: ReadonlyArray<string>,
 	tableRenames: ReadonlyArray<RenameOp>,
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
 	resolveDeclaredColumn: ResolveColumnInSource,
 ): boolean {
 	const hasRenames = tableRenames.length > 0 || columnRenamesByTable.size > 0;
-	// As-authored rename list, plus — ONLY for the implicit (sugar / no-rename-list)
-	// form — the live column names a re-attach records. An EXPLICIT declared rename
-	// list (`mv (a, b)`) is compared as-authored only, so a genuine rename-list
-	// change (b → c) is NOT masked by the live names; the live-names fallback exists
-	// solely to absorb the create-vs-attach `columns` representation gap for an
-	// implicit body.
-	const variants = declared.columns === undefined ? [undefined, liveColumnNames] : [declared.columns];
+	// The single as-authored form: implicit (`undefined`) for a sugar / verb-attached
+	// body, or the explicit declared rename list. Both create and re-attach record the
+	// implicit form for a same-name body, so there is no live-names fallback to add.
+	const variants = [declared.columns];
 	for (const columns of variants) {
 		if (computeBodyHash(viewDefinitionToCanonicalString(columns, declared.select, declared.insertDefaults)) === liveBodyHash) return true;
 		if (hasRenames

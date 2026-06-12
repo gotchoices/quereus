@@ -1257,6 +1257,44 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
+	it('a sugar MV re-attached via the verb (same body) records the IMPLICIT form, so the unchanged declaration does not churn', async function () {
+		// Regression (ticket maintained-reattach-columns-parity): the re-attach verb
+		// used to record the EXPLICIT table column names, flipping a sugar MV's recorded
+		// `derivation.columns` from implicit→explicit and diverging its bodyHash from the
+		// (implicit) declared form. The differ papered over that with a dual-hash
+		// tolerance (`maintainedBodyMatches` also tried the live column names); both are
+		// now gone — the verb records the implicit form, matching create-sugar, so a
+		// single as-authored hash stays idempotent.
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			const createHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
+
+			// Force a re-attach through the verb with the SAME body. The verb now records
+			// the implicit form (no rename list), so the recorded bodyHash is unchanged —
+			// before the fix it recorded the explicit (id, x) names and the hash diverged.
+			await db.exec('alter table mv set maintained as select id, x from t');
+			const reattachHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
+			expect(reattachHash, 'verb re-attach records implicit ⇒ bodyHash unchanged').to.equal(createHash);
+
+			// Diffing the UNCHANGED sugar-MV declaration against the re-attached catalog
+			// must yield no re-attach and no drop — proving the differ no longer churns
+			// now that the verb's record matches the declared implicit form.
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv')?.setMaintained, 'unchanged declaration ⇒ no re-attach after a verb re-attach').to.be.undefined;
+			expect(diff.tablesToDrop, 'unchanged declaration ⇒ no drop').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('changing the MV body triggers a re-attach refresh on re-apply (not a recreate)', async function () {
 		const db = new Database();
 		try {

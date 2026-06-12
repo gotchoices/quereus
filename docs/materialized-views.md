@@ -162,6 +162,8 @@ Attaches a derivation to a plain table — or atomically replaces an already-mai
 
 On success the derivation is stamped, row-time maintenance registers, covering links re-prove, and `materialized_view_added` (fresh attach) / `materialized_view_modified` (re-attach) fires so store catalogs persist the canonical form; the key-coarsening warning fires exactly as on create. Blind trust remains the *rehydrate* fast path's domain, where clean-shutdown attestation gates it — the verb has no such attestation, attach is a rare lifecycle event, and one body evaluation deterministically heals any lag while staying non-destructive to row identity (the property a future sync change-log opt-in depends on).
 
+The verb has no `maintained (columns)` rename-list syntax, so it records `derivation.columns` as the **implicit** form (`undefined`): its strict name check (step 2) already guarantees the body's natural output names equal the table's columns, so the implicit form is lossless here and identical to what an MV-sugar/`maintained as` create records. A sugar MV re-attached by the verb therefore keeps its clause-free canonical DDL and its `bodyHash` — so the next [declarative diff](#declarative-schema-integration) of the unchanged declaration computes the same implicit hash and does not churn a phantom re-attach.
+
 ### `ALTER TABLE … DROP MAINTAINED` (detach)
 
 ```sql
