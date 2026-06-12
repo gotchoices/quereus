@@ -1,8 +1,8 @@
 import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
-import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, indexedColumnBareName, viewDefinitionToCanonicalString } from '../emit/ast-stringify.js';
-import { computeBodyHash, normalizeBackingModuleName, canonicalBackingModuleArgs } from './view.js';
+import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, indexedColumnBareName, viewDefinitionToCanonicalString, astToString } from '../emit/ast-stringify.js';
+import { computeBodyHash } from './view.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
@@ -45,24 +45,18 @@ export interface SchemaDiff {
 	tablesToAlter: TableAlterDiff[];
 	viewsToCreate: string[];
 	viewsToDrop: string[];
-	/** Materialized views to (re)create — full `create materialized view …` DDL. */
-	materializedViewsToCreate: string[];
-	/** Materialized-view names to drop (a rebuild emits both a drop and a create). */
-	materializedViewsToDrop: string[];
 	indexesToCreate: string[];
 	indexesToDrop: string[];
 	assertionsToCreate: string[];
 	assertionsToDrop: string[];
 	/**
-	 * In-place metadata-tag changes on name-matched views / materialized views /
-	 * indexes (whole-set replacement; `tags: {}` clears). These take the new
-	 * `ALTER … SET TAGS` primitive rather than a drop+recreate — crucially, a
-	 * materialized-view tag change avoids a needless re-materialization. A MV whose
-	 * *body* changed drops+recreates instead (the recreate carries the declared
-	 * tags), so the two are mutually exclusive per object.
+	 * In-place metadata-tag changes on name-matched views / indexes (whole-set
+	 * replacement; `tags: {}` clears). These take the new `ALTER … SET TAGS`
+	 * primitive rather than a drop+recreate. A maintained table is a TABLE now, so
+	 * its tag-only change rides `TableAlterDiff.tableTagsChange` (`ALTER TABLE …
+	 * SET TAGS`) — there is no separate materialized-view tag bucket.
 	 */
 	viewTagsChanges: Array<{ name: string; tags: Record<string, SqlValue> }>;
-	materializedViewTagsChanges: Array<{ name: string; tags: Record<string, SqlValue> }>;
 	indexTagsChanges: Array<{ name: string; tags: Record<string, SqlValue> }>;
 	/** Renames detected via `quereus.id` / `quereus.previous_name` hints. */
 	renames: RenameOp[];
@@ -151,6 +145,36 @@ export interface TableAlterDiff {
 	 * Whole-set replacement; `tags: {}` clears. Name-matched constraints only.
 	 */
 	constraintTagsChanges?: Array<{ constraintName: string; tags: Record<string, SqlValue> }>;
+	/**
+	 * Maintained-table (derivation) transition. Attach or re-attach a derivation:
+	 * `alter table … set maintained as <body> [insert defaults (…)]`. Emitted LATE
+	 * (after table creates/alters), where the target's final shape and the body's
+	 * sources must already exist. Set on: a fresh attach (declared maintained, live
+	 * plain) and a re-attach (both maintained, body drift). On a same-shape
+	 * re-attach this is the only op (content reconcile / refresh — no recreate).
+	 */
+	setMaintained?: { select: AST.QueryExpr; insertDefaults?: ReadonlyArray<AST.ViewInsertDefault> };
+	/**
+	 * Detach a derivation: `alter table … drop maintained` (the table keeps its
+	 * rows and becomes writable). Emitted EARLY (before table alters/drops) — a
+	 * detach must precede column ops on the table and may precede a drop of its
+	 * former source. Set on: a detach (declared plain, live maintained) and the
+	 * reshape leg of a re-attach with a concurrent shape change (detach → column
+	 * ops → {@link setMaintained}).
+	 */
+	dropMaintained?: boolean;
+	/**
+	 * When {@link tableTagsChange} is set on a table that is STILL maintained at the
+	 * point the alter block's SET TAGS runs (live-maintained and NOT detached early
+	 * in this same diff), the tag edit must go through `ALTER MATERIALIZED VIEW …
+	 * SET TAGS` rather than `ALTER TABLE … SET TAGS`: the TABLE verb fires
+	 * `table_modified`, not `materialized_view_modified`, so a store-backed catalog
+	 * would never re-persist the maintained-table entry — and the runtime ALTER
+	 * TABLE handler rejects a tag action on a maintained table outright. A detach
+	 * (or re-attach reshape leg) runs its `drop maintained` EARLY, so by tag time
+	 * the table is plain and the ordinary ALTER TABLE path applies (flag absent).
+	 */
+	maintainedTags?: boolean;
 }
 
 /**
@@ -175,14 +199,11 @@ export function computeSchemaDiff(
 		tablesToAlter: [],
 		viewsToCreate: [],
 		viewsToDrop: [],
-		materializedViewsToCreate: [],
-		materializedViewsToDrop: [],
 		indexesToCreate: [],
 		indexesToDrop: [],
 		assertionsToCreate: [],
 		assertionsToDrop: [],
 		viewTagsChanges: [],
-		materializedViewTagsChanges: [],
 		indexTagsChanges: [],
 		renames: [],
 		lensToAttach: [],
@@ -285,10 +306,28 @@ export function computeSchemaDiff(
 		log: (d) => warnLog('reserved tag advisory (%s) on %s: %s', d.reason, d.site, d.message),
 	});
 
+	// Normalize every declared `materialized view` into the TABLE category: a
+	// declared table whose `maintained` clause carries the body (no declared
+	// columns — the body owns the shape). This is what dissolves the standalone MV
+	// comparison: a maintained table is now compared per name against a declared
+	// table or maintained clause in ONE category, so a table↔maintained transition
+	// becomes an attach/detach alter, never a cross-category drop+create. The
+	// original `declaredMaterializedViews` map is retained for the CREATE branch
+	// (a fresh maintained table renders the `create materialized view` sugar, since
+	// a column-less `create table … maintained as` has no parseable DDL).
+	for (const [name, declaredMv] of declaredMaterializedViews) {
+		if (declaredTables.has(name)) {
+			throw new QuereusError(
+				`'${name}' is declared as both a table and a materialized view`,
+				StatusCode.ERROR,
+			);
+		}
+		declaredTables.set(name, materializedViewToDeclaredTable(declaredMv));
+	}
+
 	// Build maps of actual items
 	const actualTables = new Map(actualCatalog.tables.map(t => [t.name.toLowerCase(), t]));
 	const actualViews = new Map(actualCatalog.views.map(v => [v.name.toLowerCase(), v]));
-	const actualMaterializedViews = new Map(actualCatalog.materializedViews.map(mv => [mv.name.toLowerCase(), mv]));
 	// Exclude *exposed implicit covering indexes* (`CatalogIndex.implicit` — the
 	// secondary BTree backing a UNIQUE constraint tagged
 	// `quereus.expose_implicit_index`). The catalog surfaces them for introspection
@@ -414,12 +453,23 @@ export function computeSchemaDiff(
 				|| alterDiff.primaryKeyChange
 				|| alterDiff.tableTagsChange !== undefined
 				|| (alterDiff.constraintTagsChanges?.length ?? 0) > 0
+				|| alterDiff.setMaintained !== undefined
+				|| alterDiff.dropMaintained === true
 			) {
 				diff.tablesToAlter.push(alterDiff);
 			}
 		} else {
-			const effectiveStmt = applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
-			diff.tablesToCreate.push(createTableToString(effectiveStmt));
+			// Fresh create. A maintained table declared via the `materialized view`
+			// sugar renders that sugar (its column-less normalized table form has no
+			// parseable DDL); a declared-shape maintained table and a plain table
+			// render the `create table …` form (carrying any `maintained as` clause).
+			const declaredMv = declaredMaterializedViews.get(name);
+			if (declaredMv) {
+				diff.tablesToCreate.push(createMaterializedViewToString(declaredMv.viewStmt));
+			} else {
+				const effectiveStmt = applyTableDefaults(tableStmt, targetSchemaName, defaultVtabModule, defaultVtabArgs);
+				diff.tablesToCreate.push(createTableToString(effectiveStmt));
+			}
 		}
 	}
 
@@ -494,53 +544,14 @@ export function computeSchemaDiff(
 		if (!declaredViews.has(name)) diff.viewsToDrop.push(name);
 	}
 
-	// Materialized views: create / drop / rebuild. No rename support (names are
-	// part of the contract, like assertions). A definition change is detected by
-	// recomputing the declared MV's canonical definition hash (explicit column
-	// list + body + `insert defaults` clause — the same
-	// `viewDefinitionToCanonicalString` plain views compare, hashed because the
-	// live side persists only the hash) and comparing it against the live MV's
-	// `bodyHash`; a mismatch schedules a drop + recreate (the recreate
-	// re-materializes the body in apply order — same drop+recreate path views
-	// use, since MVs have no in-place ALTER primitive). On a raw mismatch the
-	// rename-reconciled render re-compares first, so an in-diff source
-	// table/column rename does not churn a spurious rebuild — the rename ops
-	// themselves trigger the live MV rename propagation at apply, which rewrites
-	// the body and re-stamps `bodyHash` to converge.
-	//
-	// Backing-module identity (`using <module>(...)`) is compared as a SEPARATE
-	// field, not folded into the hash (changing the hash formula would spuriously
-	// rebuild every already-persisted MV): both sides normalize (absent ⇒ memory,
-	// `mem` aliased) and args compare under a stable-key-order render, so
-	// `using memory()` vs absent never churns while a real module change takes
-	// the same drop+recreate path a body drift does.
-	for (const [name, declaredMv] of declaredMaterializedViews) {
-		const actual = actualMaterializedViews.get(name);
-		if (!actual) {
-			diff.materializedViewsToCreate.push(createMaterializedViewToString(declaredMv.viewStmt));
-		} else {
-			const stmt = declaredMv.viewStmt;
-			let bodyDrifted = computeBodyHash(viewDefinitionToCanonicalString(stmt.columns, stmt.select, stmt.insertDefaults)) !== actual.bodyHash;
-			if (bodyDrifted && (tableRenames.renames.length > 0 || columnRenamesByTable.size > 0)) {
-				bodyDrifted = computeBodyHash(reconciledDeclaredViewDefinition(stmt.columns, stmt.select, stmt.insertDefaults, tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn)) !== actual.bodyHash;
-			}
-			const moduleDrifted =
-				normalizeBackingModuleName(stmt.moduleName) !== normalizeBackingModuleName(actual.backingModuleName)
-				|| canonicalBackingModuleArgs(stmt.moduleArgs) !== canonicalBackingModuleArgs(actual.backingModuleArgs);
-			if (bodyDrifted || moduleDrifted) {
-				// Definition changed → drop+recreate (the recreate re-materializes AND
-				// carries the declared tags); never also emit a SET TAGS for this MV.
-				diff.materializedViewsToDrop.push(name);
-				diff.materializedViewsToCreate.push(createMaterializedViewToString(stmt));
-			} else if (tagsDrifted(stmt.tags, actual.tags)) {
-				// Definition unchanged but tags drifted → in-place SET TAGS, no rebuild.
-				diff.materializedViewTagsChanges.push({ name: stmt.view.name, tags: desiredTagSet(stmt.tags) });
-			}
-		}
-	}
-	for (const [name] of actualMaterializedViews) {
-		if (!declaredMaterializedViews.has(name)) diff.materializedViewsToDrop.push(name);
-	}
+	// (Maintained tables are no longer compared here. They are normalized into the
+	// table category above, so the unified table loop recognizes a body change as a
+	// re-attach (`set maintained as`), a table↔maintained transition as an
+	// attach/detach, and an undeclared live maintained table as a `drop table` —
+	// see `computeTableAlterDiff` / `applyMaintainedTransition`. A backing-module
+	// change on a maintained table follows today's table posture: undetected
+	// (CatalogTable carries no module field), a documented gap — an in-place module
+	// move is destructive (drop+create) and out of scope here.)
 
 	// Indexes: creates / drops / body-change recreates / hinted-rename recreates /
 	// in-place tag changes.
@@ -1597,6 +1608,24 @@ function computeTableAlterDiff(
 		columnsToRename: [],
 	};
 
+	const declaredMaintained = declaredTable.tableStmt.maintained;
+	const liveMaintained = actualTable.maintained;
+
+	// MV-sugar / implicit maintained form: the body owns the shape, so the differ
+	// stays PLAN-FREE — it never derives or compares this table's columns /
+	// constraints / PK. A genuine shape mismatch surfaces at apply's attach shape
+	// check (the sited, authoritative check), not here. Only table tags and the
+	// derivation transition matter. (The declared-shape table form carries columns
+	// and falls through to the full comparison below.)
+	if (declaredMaintained && declaredTable.tableStmt.columns.length === 0) {
+		if (tagsDrifted(declaredTable.tableStmt.tags, actualTable.tags)) {
+			diff.tableTagsChange = desiredTagSet(declaredTable.tableStmt.tags);
+		}
+		applyMaintainedTransition(diff, declaredMaintained, liveMaintained, actualTable.columns.map(c => c.name), tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
+		markMaintainedTagRoute(diff, liveMaintained);
+		return diff;
+	}
+
 	// Detect column renames first so subsequent add/drop/alter operate on the
 	// post-rename column set.
 	const colRenames = resolveColumnRenames(declaredTable, actualTable, policy);
@@ -1788,7 +1817,158 @@ function computeTableAlterDiff(
 		};
 	}
 
+	// Derivation transition LAST, so a re-attach with a concurrent shape change can
+	// observe the column / PK / constraint ops recorded above (→ detach-reshape-attach).
+	applyMaintainedTransition(diff, declaredMaintained, liveMaintained, actualTable.columns.map(c => c.name), tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
+	markMaintainedTagRoute(diff, liveMaintained);
+
 	return diff;
+}
+
+/**
+ * Route a maintained table's tag change through `ALTER MATERIALIZED VIEW` (see
+ * {@link TableAlterDiff.maintainedTags}): set the flag when a tag change exists on
+ * a table that is live-maintained and NOT detached early in this same diff (so it
+ * is still maintained at the moment the alter block's SET TAGS runs).
+ */
+function markMaintainedTagRoute(diff: TableAlterDiff, liveMaintained: CatalogTable['maintained']): void {
+	if (diff.tableTagsChange !== undefined && liveMaintained && !diff.dropMaintained) {
+		diff.maintainedTags = true;
+	}
+}
+
+/**
+ * Recognize the maintained-table (derivation) transition for a name-matched table
+ * and record the attach / detach / re-attach op on `diff`. PLAN-FREE: it compares
+ * only the canonical body hash (declared `maintained` clause vs the live
+ * `derivation.bodyHash`), never the body's derived shape.
+ *
+ *   declared maintained, live plain      → attach    (set maintained as)
+ *   declared plain,      live maintained → detach    (drop maintained)
+ *   both maintained, body hash equal     → no-op (idempotent — no phantom re-attach)
+ *   both maintained, body hash drift     → re-attach: a single `set maintained as`
+ *       when the table shape is unchanged (content reconcile / refresh — NOT a
+ *       recreate, so the table incarnation and unrelated rows survive); a
+ *       detach → column ops → attach when the declared shape ALSO drifted (the new
+ *       column's values arrive via the attach reconcile).
+ *
+ * A pure in-diff source rename is inverse-applied before the hash compare so a
+ * rename never churns a spurious re-attach (mirrors the view/MV body reconcile).
+ * A backing-module change is deliberately NOT compared here — see the note where
+ * the standalone MV loop used to live (module move is destructive, out of scope).
+ */
+function applyMaintainedTransition(
+	diff: TableAlterDiff,
+	declaredMaintained: AST.MaintainedClause | undefined,
+	liveMaintained: CatalogTable['maintained'],
+	/** Live table column names — the explicit rename-list form a re-attach records. */
+	liveColumnNames: ReadonlyArray<string>,
+	tableRenames: ReadonlyArray<RenameOp>,
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	schemaName: string,
+	resolveDeclaredColumn: ResolveColumnInSource,
+): void {
+	if (!declaredMaintained && !liveMaintained) return;
+	if (declaredMaintained && !liveMaintained) {
+		// Attach: derived content reconciles the live (plain) table's rows.
+		diff.setMaintained = { select: declaredMaintained.select, insertDefaults: declaredMaintained.insertDefaults };
+		return;
+	}
+	if (!declaredMaintained && liveMaintained) {
+		// Detach: rows stay, maintenance stops, the table becomes writable.
+		diff.dropMaintained = true;
+		return;
+	}
+	// Both maintained — compare the canonical body hash (reconciling in-diff renames
+	// so a pure source rename converges via the rename propagation, not a re-attach).
+	if (maintainedBodyMatches(declaredMaintained!, liveMaintained!.bodyHash, liveColumnNames, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) {
+		return; // no derivation change → no churn
+	}
+	// Body drift → re-attach. A concurrent shape change (column / PK / constraint
+	// ops already on `diff`) means detach → reshape → re-attach; an unchanged shape
+	// re-attaches in place (content reconcile / refresh).
+	if (alterDiffHasShapeOps(diff)) diff.dropMaintained = true;
+	diff.setMaintained = { select: declaredMaintained!.select, insertDefaults: declaredMaintained!.insertDefaults };
+}
+
+/**
+ * True when the declared maintained body canonicalizes to the live
+ * `derivation.bodyHash` — i.e. an unchanged derivation (no re-attach).
+ *
+ * The rename list inside the hash is the wrinkle: a maintained table's live
+ * bodyHash is computed with the IMPLICIT form (no rename list — `columns:
+ * undefined`) right after a fresh create, but with the EXPLICIT form (the table's
+ * own column names) after a `set maintained as` re-attach (the attach verb records
+ * `table.columns`). To stay idempotent across that representational difference, we
+ * accept EITHER form — the as-authored `maintained.columns` AND the live column
+ * names — each also re-compared under in-diff rename reconciliation so a pure
+ * source rename converges via the rename propagation rather than churning a
+ * re-attach. A genuine body / clause edit fails BOTH (the canonical body text
+ * differs), so it is not masked. (The underlying create-vs-attach `columns`
+ * inconsistency is tracked for a verb-side cleanup — see the review handoff.)
+ */
+function maintainedBodyMatches(
+	declared: AST.MaintainedClause,
+	liveBodyHash: string,
+	liveColumnNames: ReadonlyArray<string>,
+	tableRenames: ReadonlyArray<RenameOp>,
+	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
+	schemaName: string,
+	resolveDeclaredColumn: ResolveColumnInSource,
+): boolean {
+	const hasRenames = tableRenames.length > 0 || columnRenamesByTable.size > 0;
+	// As-authored rename list, plus — ONLY for the implicit (sugar / no-rename-list)
+	// form — the live column names a re-attach records. An EXPLICIT declared rename
+	// list (`mv (a, b)`) is compared as-authored only, so a genuine rename-list
+	// change (b → c) is NOT masked by the live names; the live-names fallback exists
+	// solely to absorb the create-vs-attach `columns` representation gap for an
+	// implicit body.
+	const variants = declared.columns === undefined ? [undefined, liveColumnNames] : [declared.columns];
+	for (const columns of variants) {
+		if (computeBodyHash(viewDefinitionToCanonicalString(columns, declared.select, declared.insertDefaults)) === liveBodyHash) return true;
+		if (hasRenames
+			&& computeBodyHash(reconciledDeclaredViewDefinition(columns, declared.select, declared.insertDefaults, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) === liveBodyHash) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** True when a table-alter diff carries any structural (column / PK / constraint) op. */
+function alterDiffHasShapeOps(diff: TableAlterDiff): boolean {
+	return diff.columnsToAdd.length > 0
+		|| diff.columnsToDrop.length > 0
+		|| diff.columnsToAlter.length > 0
+		|| diff.columnsToRename.length > 0
+		|| !!diff.primaryKeyChange
+		|| (diff.constraintsToAdd?.length ?? 0) > 0
+		|| (diff.constraintsToDrop?.length ?? 0) > 0
+		|| (diff.constraintsToRename?.length ?? 0) > 0;
+}
+
+/**
+ * Normalize a declared `materialized view` item into the table category: a
+ * declared table whose `maintained` clause carries the body and whose declared
+ * column list is empty (the body owns the shape). This is what lets the differ
+ * compare a maintained declaration per name in ONE category — a table↔maintained
+ * transition becomes an attach/detach alter, never a cross-category drop+create.
+ */
+function materializedViewToDeclaredTable(declaredMv: AST.DeclaredMaterializedView): AST.DeclaredTable {
+	const mv = declaredMv.viewStmt;
+	return {
+		type: 'declaredTable',
+		tableStmt: {
+			type: 'createTable',
+			table: mv.view,
+			ifNotExists: false,
+			columns: [],
+			constraints: [],
+			moduleName: mv.moduleName,
+			moduleArgs: mv.moduleArgs,
+			tags: mv.tags,
+			maintained: { columns: mv.columns, select: mv.select, insertDefaults: mv.insertDefaults },
+		},
+	};
 }
 
 /**
@@ -2071,11 +2251,15 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		statements.push(`DROP ASSERTION IF EXISTS ${schemaPrefix}${quoteIdentifier(name)}`);
 	}
 
-	// Drop materialized views before their source tables. MV storage is
-	// independent (its own backing table), but dropping early keeps a body-change
-	// rebuild's drop ahead of any source-table alter/drop in the same migration.
-	for (const mvName of diff.materializedViewsToDrop) {
-		statements.push(`DROP MATERIALIZED VIEW IF EXISTS ${schemaPrefix}${quoteIdentifier(mvName)}`);
+	// Detach maintained tables (`drop maintained`) EARLY — where MV drops ran
+	// before — so a detach precedes any column op on that table AND any drop of its
+	// former source in the same migration. This is the reshape leg of a re-attach
+	// (detach → column ops → re-attach) and the standalone detach transition; the
+	// flip's cross-table detach-v2 / attach-v1 pair falls out of this ordering.
+	for (const alter of diff.tablesToAlter) {
+		if (alter.dropMaintained) {
+			statements.push(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`);
+		}
 	}
 
 	// Drop items (reverse order)
@@ -2091,11 +2275,11 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		statements.push(`DROP INDEX IF EXISTS ${schemaPrefix}${quoteIdentifier(indexName)}`);
 	}
 
-	// Create new items. Materialized views come after tables and views (their
-	// body reads those) and re-materialize as part of the create.
+	// Create new items. A fresh maintained table rides `tablesToCreate` (rendered
+	// as the `create materialized view` sugar) and re-materializes as part of its
+	// create.
 	statements.push(...diff.tablesToCreate);
 	statements.push(...diff.viewsToCreate);
-	statements.push(...diff.materializedViewsToCreate);
 	statements.push(...diff.indexesToCreate);
 	statements.push(...diff.assertionsToCreate);
 
@@ -2173,7 +2357,12 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		// constraint set (a tag set emitted alongside a RENAME COLUMN targets the
 		// post-rename name). Whole-set replacement; an empty set clears.
 		if (alter.tableTagsChange !== undefined) {
-			statements.push(`ALTER TABLE ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`);
+			// A maintained table's tag edit must use ALTER MATERIALIZED VIEW (fires
+			// materialized_view_modified so a store catalog re-persists; the ALTER
+			// TABLE handler rejects a tag action on a maintained table). See
+			// `TableAlterDiff.maintainedTags`.
+			const tagVerb = alter.maintainedTags ? 'ALTER MATERIALIZED VIEW' : 'ALTER TABLE';
+			statements.push(`${tagVerb} ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`);
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			if (colAlter.tags === undefined) continue;
@@ -2184,16 +2373,36 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 		}
 	}
 
-	// In-place tag changes on views / materialized views / indexes. These are leaf
-	// metadata writes (no dependency ordering vs the table-alter block), and an MV
-	// tag change here is mutually exclusive with a body-rebuild drop+recreate. The
-	// `?? []` keeps generateMigrationDDL robust against hand-built diffs (some tests
-	// construct partial SchemaDiff literals), mirroring `constraintTagsChanges`.
+	// Attach / re-attach maintained tables (`set maintained as`) LATE — where MV
+	// creates ran — after every table create/alter, so the target's final shape and
+	// the body's sources already exist (and any reshape leg's `drop maintained` +
+	// column ops have run). A same-shape re-attach reconciles content in place (a
+	// refresh, not a recreate). Rendered via `astToString` over a synthetic
+	// `set maintained as` action so the body QueryExpr round-trips exactly.
+	for (const alter of diff.tablesToAlter) {
+		if (!alter.setMaintained) continue;
+		const stmt: AST.AlterTableStmt = {
+			type: 'alterTable',
+			table: schemaName && schemaName !== 'main'
+				? { type: 'identifier', name: alter.tableName, schema: schemaName }
+				: { type: 'identifier', name: alter.tableName },
+			action: {
+				type: 'setMaintained',
+				select: alter.setMaintained.select,
+				insertDefaults: alter.setMaintained.insertDefaults,
+			},
+		};
+		statements.push(astToString(stmt));
+	}
+
+	// In-place tag changes on views / indexes. These are leaf metadata writes (no
+	// dependency ordering vs the table-alter block). The `?? []` keeps
+	// generateMigrationDDL robust against hand-built diffs (some tests construct
+	// partial SchemaDiff literals), mirroring `constraintTagsChanges`. A maintained
+	// table's tag-only change rides the table-alter block above (`SET TAGS`), not a
+	// separate bucket.
 	for (const vtc of diff.viewTagsChanges ?? []) {
 		statements.push(`ALTER VIEW ${schemaPrefix}${quoteIdentifier(vtc.name)} SET TAGS ${tagsBodyToString(vtc.tags)}`);
-	}
-	for (const mvtc of diff.materializedViewTagsChanges ?? []) {
-		statements.push(`ALTER MATERIALIZED VIEW ${schemaPrefix}${quoteIdentifier(mvtc.name)} SET TAGS ${tagsBodyToString(mvtc.tags)}`);
 	}
 	for (const itc of diff.indexTagsChanges ?? []) {
 		statements.push(`ALTER INDEX ${schemaPrefix}${quoteIdentifier(itc.name)} SET TAGS ${tagsBodyToString(itc.tags)}`);

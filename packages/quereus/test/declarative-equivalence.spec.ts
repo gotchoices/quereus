@@ -30,7 +30,6 @@ import { StatusCode } from '../src/common/types.js';
 import { computeSchemaHash } from '../src/schema/schema-hasher.js';
 import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
-import { normalizeBackingModule } from '../src/schema/view.js';
 import { MemoryTableModule } from '../src/vtab/memory/module.js';
 import {
 	assertTableSchemaEqual,
@@ -1248,15 +1247,17 @@ describe('declarative-equivalence: materialized views', () => {
 				tagged.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(tagged, 'main'),
 			);
-			expect(diff.materializedViewsToCreate, 'tagged unchanged MV should not recreate').to.deep.equal([]);
-			expect(diff.materializedViewsToDrop, 'tagged unchanged MV should not drop').to.deep.equal([]);
+			// A maintained table is a table now: an unchanged tagged MV produces no
+			// re-attach (`set maintained as`) and no drop.
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv')?.setMaintained, 'tagged unchanged MV should not re-attach').to.be.undefined;
+			expect(diff.tablesToDrop, 'tagged unchanged MV should not drop').to.deep.equal([]);
 		} finally {
 			await tagged.close();
 			await untagged.close();
 		}
 	});
 
-	it('changing the MV body triggers a drop+recreate rebuild on re-apply', async function () {
+	it('changing the MV body triggers a re-attach refresh on re-apply (not a recreate)', async function () {
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -1273,35 +1274,47 @@ describe('declarative-equivalence: materialized views', () => {
 			expect(beforeRows).to.deep.equal([{ id: 1, x: 10 }]);
 			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
-			// Re-declare with a changed body (select y instead of x) and re-apply.
+			// Re-declare with a content-changing body that PRESERVES the output shape
+			// (column still named `x`, now fed by y). A shape-preserving body change is
+			// a single re-attach (`set maintained as`) — a content refresh, NOT a
+			// drop+recreate. (An output-column RENAME instead would change the shape;
+			// the plan-free differ can't detect that on a sugar MV, so it surfaces at
+			// apply's attach shape check — see the review handoff.)
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL }
-				materialized view mv as select id, y from t
+				materialized view mv as select id, y as x from t
 			}`);
+			const reattachDiff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			const mvAlter = reattachDiff.tablesToAlter.find(a => a.tableName === 'mv');
+			expect(mvAlter?.setMaintained, 'body change ⇒ re-attach').to.not.be.undefined;
+			expect(mvAlter?.dropMaintained, 'shape preserved ⇒ no detach leg').to.be.undefined;
+			expect(reattachDiff.tablesToDrop, 'no drop of the maintained table').to.deep.equal([]);
 			await db.exec('apply schema main');
 
-			// Rebuild happened: the new body re-materialized from current t.
+			// Refresh happened: column `x` now carries y's value (content re-derived
+			// from current t); the table incarnation survived.
 			const afterRows: Array<Record<string, unknown>> = [];
-			for await (const r of db.eval('select id, y from mv')) afterRows.push(r);
-			expect(afterRows).to.deep.equal([{ id: 1, y: 100 }]);
+			for await (const r of db.eval('select id, x from mv')) afterRows.push(r);
+			expect(afterRows).to.deep.equal([{ id: 1, x: 100 }]);
 
 			const afterHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 			expect(afterHash, 'bodyHash should change when the body changes').to.not.equal(beforeHash);
 
-			// The old column is gone after the rebuild.
-			let threw = false;
-			try {
-				for await (const _ of db.eval('select x from mv')) { /* drain */ }
-			} catch {
-				threw = true;
-			}
-			expect(threw, 'expected `select x from mv` to fail after the rebuild').to.be.true;
+			// Idempotent: re-diffing the just-applied schema wants no further re-attach.
+			const converged = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(converged.tablesToAlter.find(a => a.tableName === 'mv'), 'converged ⇒ no re-attach').to.be.undefined;
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('changing only the MV insert-defaults clause triggers a drop+recreate on re-apply', async function () {
+	it('changing only the MV insert-defaults clause triggers a re-attach on re-apply', async function () {
 		// Regression (ticket view-insert-defaults-declarative-drift-undetected):
 		// the body hash used to cover `astToString(select)` only, so a clause-only
 		// change diffed empty and write-through kept supplying the OLD default.
@@ -1318,7 +1331,7 @@ describe('declarative-equivalence: materialized views', () => {
 			expect(before).to.deep.equal([{ created: 111 }]);
 			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
-			// Same body, clause 111 → 222: must surface as a drop+recreate.
+			// Same body, clause 111 → 222: must surface as a re-attach (`set maintained as`).
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, created INTEGER NOT NULL }
 				materialized view mv as select id, x from t insert defaults (created = 222)
@@ -1327,8 +1340,10 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff.materializedViewsToDrop, 'clause-only change must drop').to.deep.equal(['mv']);
-			expect(diff.materializedViewsToCreate, 'clause-only change must recreate').to.have.length(1);
+			const mvAlter = diff.tablesToAlter.find(a => a.tableName === 'mv');
+			expect(mvAlter?.setMaintained, 'clause-only change ⇒ re-attach').to.not.be.undefined;
+			expect(mvAlter?.dropMaintained, 'same shape ⇒ no detach leg').to.be.undefined;
+			expect(diff.tablesToDrop, 'no drop of the maintained table').to.deep.equal([]);
 
 			await db.exec('apply schema main');
 			await db.exec('insert into mv values (2, 20)');
@@ -1344,16 +1359,21 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff2.materializedViewsToCreate).to.deep.equal([]);
-			expect(diff2.materializedViewsToDrop).to.deep.equal([]);
+			expect(diff2.tablesToAlter.find(a => a.tableName === 'mv'), 'converged ⇒ no re-attach').to.be.undefined;
+			expect(diff2.tablesToDrop).to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('changing only the MV explicit column list triggers a drop+recreate on re-apply', async function () {
-		// The explicit list renames the backing-table columns, so it is
-		// definitional — part of the canonical definition the body hash covers.
+	it('a column-list (rename) change on a sugar MV emits a re-attach the verb cannot apply (known limitation)', async function () {
+		// The explicit rename list (`mv (a, b)`) is part of the canonical definition
+		// the body hash covers, so changing it (b → c) drifts the hash and the differ
+		// correctly emits a re-attach. But `alter table … set maintained as` has NO
+		// rename-list syntax, so the emitted body can't carry the new column names —
+		// the attach shape check rejects it at apply. A rename-list change on a sugar
+		// MV therefore needs the table form (or a manual drop+recreate) for now;
+		// tracked as a follow-up (re-attach cannot reshape a sugar MV's columns).
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -1361,7 +1381,6 @@ describe('declarative-equivalence: materialized views', () => {
 				materialized view mv (a, b) as select id, x from t
 			}`);
 			await db.exec('apply schema main');
-			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
@@ -1371,15 +1390,18 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff.materializedViewsToDrop, 'column-list-only change must drop').to.deep.equal(['mv']);
-			expect(diff.materializedViewsToCreate, 'column-list-only change must recreate').to.have.length(1);
+			// The differ DOES recognize the rename-list change as a re-attach…
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv')?.setMaintained, 'rename-list change ⇒ re-attach').to.not.be.undefined;
+			expect(diff.tablesToDrop, 'no drop of the maintained table').to.deep.equal([]);
 
-			await db.exec('apply schema main');
-			await db.exec('insert into t values (1, 10)');
-			const rows: Array<Record<string, unknown>> = [];
-			for await (const r of db.eval('select a, c from mv')) rows.push(r);
-			expect(rows).to.deep.equal([{ a: 1, c: 10 }]);
-			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash).to.not.equal(beforeHash);
+			// …but applying it throws: the re-attach body can't carry the new names.
+			let message = '';
+			try {
+				await db.exec('apply schema main');
+			} catch (e) {
+				message = e instanceof Error ? e.message : String(e);
+			}
+			expect(message, 'apply surfaces a sited attach shape mismatch').to.match(/attach derivation|declares/i);
 		} finally {
 			await db.close();
 		}
@@ -1402,8 +1424,8 @@ describe('declarative-equivalence: materialized views', () => {
 			// unchanged MV body yields no create and no drop.
 			const catalog = collectSchemaCatalog(db, 'main');
 			const diff = computeSchemaDiff(declared, catalog);
-			expect(diff.materializedViewsToCreate, 'unchanged MV should not be recreated').to.deep.equal([]);
-			expect(diff.materializedViewsToDrop, 'unchanged MV should not be dropped').to.deep.equal([]);
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'unchanged MV should not re-attach').to.be.undefined;
+			expect(diff.tablesToDrop, 'unchanged MV should not be dropped').to.deep.equal([]);
 
 			// Re-declaring the identical schema yields an identical hash.
 			await db.exec(declSql);
@@ -1422,20 +1444,23 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
-	it('changing only the MV backing module triggers a drop+recreate; bodyHash is unperturbed', async function () {
+	it('a backing-module change on a maintained table is NOT auto-detected (documented gap)', async function () {
+		// Ticket 6.3: a maintained table is a TABLE now, and the differ tracks no
+		// module field for a table (CatalogTable carries none). An in-place module
+		// move is destructive (drop+create) and out of scope here, so a module-only
+		// re-declaration is a silent no-op — parity with a plain table. (Was a
+		// drop+recreate while MVs had their own diff bucket.) Pinned so a future
+		// implementer who closes the gap revisits this.
 		const db = new Database();
-		const mem2 = new MemoryTableModule();
-		db.registerModule('mem2', mem2);
+		db.registerModule('mem2', new MemoryTableModule());
 		try {
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
 				materialized view mv as select id, x from t
 			}`);
 			await db.exec('apply schema main');
-			await db.exec('insert into t values (1, 10)');
-			const beforeHash = db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.bodyHash;
 
-			// Same body, new backing module: only the module comparison fires.
+			// Same body, new backing module: undetected.
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
 				materialized view mv using mem2() as select id, x from t
@@ -1444,42 +1469,8 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff.materializedViewsToDrop, 'module-only change must drop').to.deep.equal(['mv']);
-			expect(diff.materializedViewsToCreate, 'module-only change must recreate').to.have.length(1);
-			expect(diff.materializedViewsToCreate[0]).to.match(/using mem2/i);
-
-			await db.exec('apply schema main');
-			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
-			expect(normalizeBackingModule(mv.vtabModuleName, mv.vtabArgs).storedModuleName).to.equal('mem2');
-			expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName).to.equal('mem2');
-			expect(mem2.tables.has('main.mv'), 'backing migrated into mem2').to.equal(true);
-			expect(mv.derivation.bodyHash, 'module identity is NOT folded into the hash').to.equal(beforeHash);
-			const r: Array<Record<string, unknown>> = [];
-			for await (const row of db.eval('select id, x from mv')) r.push(row);
-			expect(r, 'rows survive the re-materialization').to.deep.equal([{ id: 1, x: 10 }]);
-
-			// Converged: re-diff is empty.
-			const diff2 = computeSchemaDiff(
-				db.declaredSchemaManager.getDeclaredSchema('main')!,
-				collectSchemaCatalog(db, 'main'),
-			);
-			expect(diff2.materializedViewsToCreate).to.deep.equal([]);
-			expect(diff2.materializedViewsToDrop).to.deep.equal([]);
-
-			// Reverse direction: dropping the clause migrates back to memory.
-			await db.exec(`declare schema main {
-				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
-				materialized view mv as select id, x from t
-			}`);
-			const diff3 = computeSchemaDiff(
-				db.declaredSchemaManager.getDeclaredSchema('main')!,
-				collectSchemaCatalog(db, 'main'),
-			);
-			expect(diff3.materializedViewsToDrop, 'reverse module change must drop').to.deep.equal(['mv']);
-			await db.exec('apply schema main');
-			const mvBack = db.schemaManager.getMaintainedTable('main', 'mv')!;
-			expect(normalizeBackingModule(mvBack.vtabModuleName, mvBack.vtabArgs).storedModuleName).to.be.undefined;
-			expect(mem2.tables.has('main.mv'), 'old mem2 backing destroyed').to.equal(false);
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'module change is not detected (gap)').to.be.undefined;
+			expect(diff.tablesToDrop, 'no drop on a module change').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
@@ -1503,15 +1494,17 @@ describe('declarative-equivalence: materialized views', () => {
 					db.declaredSchemaManager.getDeclaredSchema('main')!,
 					collectSchemaCatalog(db, 'main'),
 				);
-				expect(diff.materializedViewsToCreate, `'${spelling}' must not recreate`).to.deep.equal([]);
-				expect(diff.materializedViewsToDrop, `'${spelling}' must not drop`).to.deep.equal([]);
+				expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), `'${spelling}' must not re-attach`).to.be.undefined;
+				expect(diff.tablesToDrop, `'${spelling}' must not drop`).to.deep.equal([]);
 			}
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('changing only the backing-module ARGS triggers a drop+recreate (stable-key-order comparison)', async function () {
+	it('a backing-module ARGS change on a maintained table is NOT auto-detected (documented gap)', async function () {
+		// Companion to the module-change gap: module args are not tracked for a table
+		// either, so an args-only re-declaration is a silent no-op (was a drop+recreate).
 		const db = new Database();
 		db.registerModule('mem2', new MemoryTableModule());
 		try {
@@ -1521,15 +1514,7 @@ describe('declarative-equivalence: materialized views', () => {
 			}`);
 			await db.exec('apply schema main');
 
-			// Identical args ⇒ no drift.
-			const diff0 = computeSchemaDiff(
-				db.declaredSchemaManager.getDeclaredSchema('main')!,
-				collectSchemaCatalog(db, 'main'),
-			);
-			expect(diff0.materializedViewsToCreate).to.deep.equal([]);
-			expect(diff0.materializedViewsToDrop).to.deep.equal([]);
-
-			// Changed arg value ⇒ drop+recreate.
+			// Changed arg value ⇒ undetected (no re-attach, no drop).
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
 				materialized view mv using mem2 (k = 'b') as select id, x from t
@@ -1538,8 +1523,8 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff.materializedViewsToDrop, 'args-only change must drop').to.deep.equal(['mv']);
-			expect(diff.materializedViewsToCreate, 'args-only change must recreate').to.have.length(1);
+			expect(diff.tablesToAlter.find(a => a.tableName === 'mv'), 'args change is not detected (gap)').to.be.undefined;
+			expect(diff.tablesToDrop).to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
@@ -1646,10 +1631,13 @@ describe('declarative-equivalence: in-place view / MV / index tag drift', () => 
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			// Body unchanged → no rebuild; only the in-place tag change appears.
-			expect(diff.materializedViewsToCreate, 'tag-only MV drift must not recreate').to.deep.equal([]);
-			expect(diff.materializedViewsToDrop, 'tag-only MV drift must not drop').to.deep.equal([]);
-			expect(diff.materializedViewTagsChanges).to.deep.equal([{ name: 'mv', tags: { owner: 'platform', tier: 'gold' } }]);
+			// Body unchanged → no re-attach; a maintained table's tag-only change is an
+			// `alter table … set tags` (it rides the table-alter channel now, not a
+			// separate MV tag bucket).
+			const mvAlter = diff.tablesToAlter.find(a => a.tableName === 'mv');
+			expect(mvAlter?.setMaintained, 'tag-only MV drift must not re-attach').to.be.undefined;
+			expect(mvAlter?.tableTagsChange).to.deep.equal({ owner: 'platform', tier: 'gold' });
+			expect(diff.tablesToDrop, 'tag-only MV drift must not drop').to.deep.equal([]);
 
 			await db.exec('apply schema main');
 			const mvAfter = db.schemaManager.getMaintainedTable('main', 'mv')!;
@@ -1664,13 +1652,13 @@ describe('declarative-equivalence: in-place view / MV / index tag drift', () => 
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(diff2.materializedViewTagsChanges, 'idempotent re-apply produces no MV tag change').to.deep.equal([]);
+			expect(diff2.tablesToAlter.find(a => a.tableName === 'mv'), 'idempotent re-apply produces no MV tag change').to.be.undefined;
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('an MV whose body AND tags both changed rebuilds (drop+create) and emits no SET TAGS', async function () {
+	it('an MV whose body AND tags both changed re-attaches and sets tags (same alter, no recreate)', async function () {
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -1679,23 +1667,27 @@ describe('declarative-equivalence: in-place view / MV / index tag drift', () => 
 			}`);
 			await db.exec('apply schema main');
 
-			// Change both the body (x → y) and the tags in the same re-declaration.
+			// Change both the body (shape-preserving: column still `x`, now fed by y)
+			// and the tags in the same re-declaration.
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL }
-				materialized view mv as select id, y from t with tags (owner = 'platform')
+				materialized view mv as select id, y as x from t with tags (owner = 'platform')
 			}`);
 			const diff = computeSchemaDiff(
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			// Body change wins: rebuild carries the declared tags; the two are mutually
-			// exclusive, so no separate SET TAGS is emitted for this MV.
-			expect(diff.materializedViewsToDrop).to.deep.equal(['mv']);
-			expect(diff.materializedViewsToCreate.length, 'rebuild recreate present').to.equal(1);
-			expect(diff.materializedViewTagsChanges, 'no in-place SET TAGS when the body rebuilds').to.deep.equal([]);
+			// New model: a body change is a re-attach (`set maintained as`) and the tag
+			// change rides the table-alter channel as ALTER MATERIALIZED VIEW SET TAGS —
+			// both ops on the SAME table alter (no recreate; the incarnation survives).
+			const mvAlter = diff.tablesToAlter.find(a => a.tableName === 'mv');
+			expect(mvAlter?.setMaintained, 'body change ⇒ re-attach').to.not.be.undefined;
+			expect(mvAlter?.tableTagsChange, 'tag change ⇒ set tags').to.deep.equal({ owner: 'platform' });
+			expect(mvAlter?.maintainedTags, 'maintained tag edit routes via ALTER MATERIALIZED VIEW').to.equal(true);
+			expect(diff.tablesToDrop, 'no drop of the maintained table').to.deep.equal([]);
 
 			await db.exec('apply schema main');
-			// The recreate carried the new tags through the create path.
+			// The re-attach refreshed content and the SET TAGS carried the new tags.
 			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.tags).to.deep.equal({ owner: 'platform' });
 		} finally {
 			await db.close();

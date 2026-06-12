@@ -7,7 +7,7 @@ import { expect } from 'chai';
 import { generateMigrationDDL, computeSchemaDiff } from '../src/schema/schema-differ.js';
 import type { SchemaDiff } from '../src/schema/schema-differ.js';
 import type * as AST from '../src/parser/ast.js';
-import type { SchemaCatalog, CatalogTable, CatalogView, CatalogMaterializedView } from '../src/schema/catalog.js';
+import type { SchemaCatalog, CatalogTable, CatalogView } from '../src/schema/catalog.js';
 import { QuereusError } from '../src/common/errors.js';
 import { Parser } from '../src/parser/parser.js';
 import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
@@ -19,8 +19,8 @@ function parseDeclaredSchema(sql: string): AST.DeclareSchemaStmt {
 	return stmt;
 }
 
-function makeCatalog(tables: CatalogTable[] = [], views: CatalogView[] = [], materializedViews: CatalogMaterializedView[] = []): SchemaCatalog {
-	return { schemaName: 'main', tables, views, materializedViews, indexes: [], assertions: [] };
+function makeCatalog(tables: CatalogTable[] = [], views: CatalogView[] = []): SchemaCatalog {
+	return { schemaName: 'main', tables, views, indexes: [], assertions: [] };
 }
 
 function catalogTable(name: string, pkColumn: string): CatalogTable {
@@ -67,18 +67,30 @@ function catalogView(sql: string): CatalogView {
 	};
 }
 
-/** Builds a CatalogMaterializedView from CREATE MATERIALIZED VIEW DDL the way
- *  `materializedViewSchemaToCatalog` does (same hash over the same canonical
- *  renderer applied to the parsed statement's definitional fields). */
-function catalogMaterializedView(sql: string): CatalogMaterializedView {
+/** Builds a maintained table's CatalogTable from CREATE MATERIALIZED VIEW DDL the
+ *  way `tableSchemaToCatalog` does for a maintained table — a TABLE entry carrying
+ *  a `maintained` descriptor (the canonical body hash over the same renderer the
+ *  live `derivation.bodyHash` uses). Columns default to a single `id` PK; pass an
+ *  explicit list for detach / column-drift cases. */
+function catalogMaintainedTable(sql: string, columns: Array<{ name: string; primaryKey?: boolean }> = [{ name: 'id', primaryKey: true }]): CatalogTable {
 	const stmt = new Parser().parse(sql);
 	if (stmt.type !== 'createMaterializedView') throw new Error(`Expected createMaterializedView, got ${stmt.type}`);
 	const mv = stmt as AST.CreateMaterializedViewStmt;
 	return {
 		name: mv.view.name,
 		ddl: sql,
-		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select, mv.insertDefaults)),
-		tags: mv.tags,
+		columns: columns.map(c => ({
+			name: c.name,
+			type: 'integer',
+			notNull: !!c.primaryKey,
+			primaryKey: !!c.primaryKey,
+			defaultValue: null,
+			collation: 'BINARY',
+		})),
+		primaryKey: columns.filter(c => c.primaryKey).map(c => ({ columnName: c.name, desc: false })),
+		referencedTables: [],
+		namedConstraints: [],
+		maintained: { bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select, mv.insertDefaults)) },
 	};
 }
 
@@ -91,8 +103,6 @@ describe('Schema Differ', () => {
 				tablesToAlter: [],
 				viewsToCreate: [],
 				viewsToDrop: [],
-				materializedViewsToCreate: [],
-				materializedViewsToDrop: [],
 				indexesToCreate: [],
 				indexesToDrop: [],
 				assertionsToCreate: [],
@@ -113,8 +123,6 @@ describe('Schema Differ', () => {
 				tablesToAlter: [],
 				viewsToCreate: [],
 				viewsToDrop: ['select'],
-				materializedViewsToCreate: [],
-				materializedViewsToDrop: [],
 				indexesToCreate: [],
 				indexesToDrop: [],
 				assertionsToCreate: [],
@@ -134,8 +142,6 @@ describe('Schema Differ', () => {
 				tablesToAlter: [],
 				viewsToCreate: [],
 				viewsToDrop: [],
-				materializedViewsToCreate: [],
-				materializedViewsToDrop: [],
 				indexesToCreate: [],
 				indexesToDrop: ['index'],
 				assertionsToCreate: [],
@@ -161,8 +167,6 @@ describe('Schema Differ', () => {
 				}],
 				viewsToCreate: [],
 				viewsToDrop: [],
-				materializedViewsToCreate: [],
-				materializedViewsToDrop: [],
 				indexesToCreate: [],
 				indexesToDrop: [],
 				assertionsToCreate: [],
@@ -183,8 +187,6 @@ describe('Schema Differ', () => {
 				tablesToAlter: [],
 				viewsToCreate: [],
 				viewsToDrop: [],
-				materializedViewsToCreate: [],
-				materializedViewsToDrop: [],
 				indexesToCreate: [],
 				indexesToDrop: [],
 				assertionsToCreate: [],
@@ -204,8 +206,6 @@ describe('Schema Differ', () => {
 				tablesToAlter: [],
 				viewsToCreate: [],
 				viewsToDrop: [],
-				materializedViewsToCreate: [],
-				materializedViewsToDrop: [],
 				indexesToCreate: [],
 				indexesToDrop: [],
 				assertionsToCreate: [],
@@ -225,8 +225,6 @@ describe('Schema Differ', () => {
 				tablesToAlter: [],
 				viewsToCreate: [],
 				viewsToDrop: [],
-				materializedViewsToCreate: [],
-				materializedViewsToDrop: [],
 				indexesToCreate: [],
 				indexesToDrop: [],
 				assertionsToCreate: [],
@@ -265,7 +263,6 @@ describe('Schema Differ', () => {
 				schemaName: 'test',
 				tables: [],
 				views: [],
-				materializedViews: [],
 				indexes: [],
 				assertions: [],
 			};
@@ -593,13 +590,15 @@ describe('Schema Differ', () => {
 				[
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
 					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
+					catalogMaintainedTable('create materialized view mv as select id from t insert defaults (ts = (select max(c) from audit))'),
 				],
-				[],
-				[catalogMaterializedView('create materialized view mv as select id from t insert defaults (ts = (select max(c) from audit))')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
-			expect(diff.materializedViewsToDrop).to.deep.equal([]);
-			expect(diff.materializedViewsToCreate).to.deep.equal([]);
+			// Reconciled body hash matches → no re-attach (a spurious `set maintained as`
+			// would be a needless content refresh of an unchanged derivation).
+			const mvAlter = diff.tablesToAlter.find(t => t.tableName === 'mv');
+			expect(mvAlter?.setMaintained, 'no spurious re-attach').to.be.undefined;
+			expect(mvAlter?.dropMaintained, 'no spurious detach').to.be.undefined;
 		});
 
 		it('combined table+column rename on a non-FROM table in a clause-expr subquery reconciles (OLD-name seed mapping)', () => {
@@ -679,5 +678,63 @@ describe('Schema Differ', () => {
 			expect(diff.viewsToDrop).to.deep.equal(['v']);
 			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id, newc from t where id > 0']);
 		});
+	});
+});
+
+// ============================================================================
+// Maintained-table transition matrix (ticket 6.3): a maintained table is a TABLE
+// now, so table↔maintained transitions are non-destructive alter ops, never a
+// cross-category drop+recreate. Diff-level assertions (apply behavior is covered
+// by the declarative-equivalence + migration-capstone specs).
+// ============================================================================
+describe('Schema Differ — maintained-table transitions', () => {
+	const mvAlterOf = (sql: string, catalog: SchemaCatalog) =>
+		computeSchemaDiff(parseDeclaredSchema(sql), catalog).tablesToAlter.find(a => a.tableName === 'm');
+
+	it('attach: declared maintained over a live PLAIN table → set maintained (no drop)', () => {
+		const diff = computeSchemaDiff(
+			parseDeclaredSchema('declare schema main { materialized view m as select id from src }'),
+			makeCatalog([catalogTable('m', 'id')]),
+		);
+		const alter = diff.tablesToAlter.find(a => a.tableName === 'm');
+		expect(alter?.setMaintained, 'attach emits set maintained').to.not.be.undefined;
+		expect(alter?.dropMaintained, 'attach has no detach leg').to.be.undefined;
+		expect(diff.tablesToDrop, 'attach never drops the table').to.deep.equal([]);
+	});
+
+	it('detach: declared PLAIN table over a live maintained table → drop maintained (no set)', () => {
+		const diff = computeSchemaDiff(
+			parseDeclaredSchema('declare schema main { table m { id integer primary key } }'),
+			makeCatalog([catalogMaintainedTable('create materialized view m as select id from src')]),
+		);
+		const alter = diff.tablesToAlter.find(a => a.tableName === 'm');
+		expect(alter?.dropMaintained, 'detach emits drop maintained').to.equal(true);
+		expect(alter?.setMaintained, 'detach has no re-attach leg').to.be.undefined;
+		expect(diff.tablesToDrop, 'detach never drops the table').to.deep.equal([]);
+	});
+
+	it('orphan: a live maintained table absent from the declaration → drop table (parity)', () => {
+		const diff = computeSchemaDiff(
+			parseDeclaredSchema('declare schema main { table keep { id integer primary key } }'),
+			makeCatalog([catalogTable('keep', 'id'), catalogMaintainedTable('create materialized view m as select id from src')]),
+		);
+		expect(diff.tablesToDrop, 'undeclared maintained table drops as a table').to.include('m');
+	});
+
+	it('idempotent: declared maintained equals the live maintained table → no alter', () => {
+		const alter = mvAlterOf(
+			'declare schema main { materialized view m as select id from src }',
+			makeCatalog([catalogMaintainedTable('create materialized view m as select id from src')]),
+		);
+		expect(alter, 'unchanged maintained table produces no alter').to.be.undefined;
+	});
+
+	it('tags-only on a maintained table → set tags (no re-attach)', () => {
+		const alter = mvAlterOf(
+			`declare schema main { materialized view m as select id from src with tags (owner = 'x') }`,
+			makeCatalog([catalogMaintainedTable('create materialized view m as select id from src')]),
+		);
+		expect(alter?.tableTagsChange, 'tag drift rides the table-alter channel').to.deep.equal({ owner: 'x' });
+		expect(alter?.setMaintained, 'a tag-only change must not re-attach').to.be.undefined;
 	});
 });

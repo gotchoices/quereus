@@ -16,7 +16,6 @@ export interface SchemaCatalog {
 	schemaName: string;
 	tables: CatalogTable[];
 	views: CatalogView[];
-	materializedViews: CatalogMaterializedView[];
 	indexes: CatalogIndex[];
 	assertions: CatalogAssertion[];
 }
@@ -48,6 +47,24 @@ export interface CatalogTable {
 	 * CONSTRAINT … SET TAGS`, not a needless drop+recreate.
 	 */
 	namedConstraints: Array<{ name: string; tags?: Readonly<Record<string, SqlValue>>; definition: string }>;
+	/**
+	 * Present iff this is a **maintained table** (carries a `derivation` — what
+	 * `create materialized view` / `create table … maintained as` produces). A
+	 * maintained table round-trips in the table category like any other table; this
+	 * descriptor carries the extra derivation dimension the differ compares to
+	 * recognize attach / detach / re-attach transitions (table↔maintained) as
+	 * non-destructive alter ops instead of a drop+recreate. `bodyHash` is the
+	 * canonical DEFINITION hash (`computeBodyHash` over `viewDefinitionToCanonicalString`
+	 * — explicit rename list + body + `insert defaults`; name / schema / tags
+	 * excluded), matching the live `derivation.bodyHash`. Absent ⇒ a plain table.
+	 */
+	maintained?: {
+		bodyHash: string;
+		/** Normalized backing-host module when non-default (absent ⇒ memory). */
+		backingModuleName?: string;
+		/** Backing-module args; recorded only when non-empty. */
+		backingModuleArgs?: Readonly<Record<string, SqlValue>>;
+	};
 }
 
 export interface CatalogView {
@@ -64,25 +81,6 @@ export interface CatalogView {
 	 * drop+recreate.
 	 */
 	definition: string;
-	tags?: Readonly<Record<string, SqlValue>>;
-}
-
-export interface CatalogMaterializedView {
-	name: string;
-	ddl: string;
-	/** Canonical definition hash (`computeBodyHash` over
-	 *  `viewDefinitionToCanonicalString` — explicit column list + body +
-	 *  `insert defaults` clause; name / schema / tags excluded). The differ
-	 *  compares this against a declared MV's recomputed definition hash to
-	 *  detect "definition changed → rebuild". */
-	bodyHash: string;
-	/** Normalized backing-host module when non-default (absent ⇒ memory). The
-	 *  differ compares backing-module identity SEPARATELY from `bodyHash` (the
-	 *  module is deliberately not folded into the hash formula); a mismatch
-	 *  takes the same drop+recreate path a body drift does. */
-	backingModuleName?: string;
-	/** Backing-module args; recorded only when non-empty. */
-	backingModuleArgs?: Readonly<Record<string, SqlValue>>;
 	tags?: Readonly<Record<string, SqlValue>>;
 }
 
@@ -147,7 +145,6 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 			schemaName,
 			tables: [],
 			views: [],
-			materializedViews: [],
 			indexes: [],
 			assertions: []
 		};
@@ -155,58 +152,58 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 
 	const tables: CatalogTable[] = [];
 	const views: CatalogView[] = [];
-	const materializedViews: CatalogMaterializedView[] = [];
 	const indexes: CatalogIndex[] = [];
 	const assertions: CatalogAssertion[] = [];
 
-	// Collect tables. A maintained table (one carrying a `derivation`) is a
-	// materialized view: it round-trips as a `CatalogMaterializedView` below —
-	// one catalog entry per maintained table, never also listed as a plain table.
+	// Collect tables. A maintained table (one carrying a `derivation` — what
+	// `create materialized view` / `create table … maintained as` produces)
+	// round-trips in the TABLE category like any other table, carrying a
+	// `maintained` descriptor (body hash + backing module) so the declarative
+	// differ compares it per name in one category and recognizes attach / detach /
+	// re-attach transitions as non-destructive alter ops. Its internal covering
+	// indexes stay OUT of the catalog `indexes` set — they are a maintenance
+	// backing detail, not differ-managed objects. (Check maintained BEFORE isView:
+	// a maintained table may legacy-carry isView.)
 	for (const tableSchema of schema.getAllTables()) {
-		if (isMaintainedTable(tableSchema)) continue;
-		if (!tableSchema.isView) {
+		if (isMaintainedTable(tableSchema)) {
 			tables.push(tableSchemaToCatalog(tableSchema, db));
+			continue;
+		}
+		if (tableSchema.isView) continue;
+		tables.push(tableSchemaToCatalog(tableSchema, db));
 
-			// Collect indexes for this table. Implicit covering structures (the
-			// auto-built secondary BTree a declared UNIQUE constraint synthesizes for
-			// enforcement) are a backing detail and are omitted by default, surfaced
-			// only when the originating constraint opts in via
-			// `quereus.expose_implicit_index` — preserving the user-visible shape.
-			if (tableSchema.indexes && tableSchema.indexes.length > 0) {
-				const implicit = implicitCoveringIndexExposure(tableSchema);
-				for (const indexSchema of tableSchema.indexes) {
-					const exposed = implicit.get(indexSchema.name);
-					if (exposed === false) continue; // hidden implicit covering structure
-					// Mark only the *exposed* implicit covering structure (exposed === true);
-					// an ordinary index (absent from the exposure map ⇒ undefined) stays
-					// unmarked so the differ manages it normally.
-					indexes.push(indexSchemaToCatalog(indexSchema, tableSchema, db, exposed === true));
-				}
+		// Collect indexes for this table. Implicit covering structures (the
+		// auto-built secondary BTree a declared UNIQUE constraint synthesizes for
+		// enforcement) are a backing detail and are omitted by default, surfaced
+		// only when the originating constraint opts in via
+		// `quereus.expose_implicit_index` — preserving the user-visible shape.
+		if (tableSchema.indexes && tableSchema.indexes.length > 0) {
+			const implicit = implicitCoveringIndexExposure(tableSchema);
+			for (const indexSchema of tableSchema.indexes) {
+				const exposed = implicit.get(indexSchema.name);
+				if (exposed === false) continue; // hidden implicit covering structure
+				// Mark only the *exposed* implicit covering structure (exposed === true);
+				// an ordinary index (absent from the exposure map ⇒ undefined) stays
+				// unmarked so the differ manages it normally.
+				indexes.push(indexSchemaToCatalog(indexSchema, tableSchema, db, exposed === true));
 			}
+		}
 
-			// Surface exposed implicit covering indexes the backend did NOT
-			// materialize as `IndexSchema` entries (store mode). In memory mode this
-			// returns [] (the name is already in `tableSchema.indexes` above), so the
-			// catalog shape matches across backends with no double-listing. Tags ride
-			// on the descriptor (from `uc.exposedIndexTags`), kept out of the canonical
-			// `definition` so a tag-only change stays `ALTER INDEX … SET TAGS`.
-			for (const desc of exposedImplicitIndexes(tableSchema)) {
-				// Every synthetic descriptor is exposed-implicit by construction → mark it.
-				indexes.push(indexSchemaToCatalog(desc, tableSchema, db, true));
-			}
+		// Surface exposed implicit covering indexes the backend did NOT
+		// materialize as `IndexSchema` entries (store mode). In memory mode this
+		// returns [] (the name is already in `tableSchema.indexes` above), so the
+		// catalog shape matches across backends with no double-listing. Tags ride
+		// on the descriptor (from `uc.exposedIndexTags`), kept out of the canonical
+		// `definition` so a tag-only change stays `ALTER INDEX … SET TAGS`.
+		for (const desc of exposedImplicitIndexes(tableSchema)) {
+			// Every synthetic descriptor is exposed-implicit by construction → mark it.
+			indexes.push(indexSchemaToCatalog(desc, tableSchema, db, true));
 		}
 	}
 
 	// Collect views
 	for (const viewSchema of schema.getAllViews()) {
 		views.push(viewSchemaToCatalog(viewSchema));
-	}
-
-	// Collect materialized views (maintained tables)
-	for (const tableSchema of schema.getAllTables()) {
-		if (isMaintainedTable(tableSchema)) {
-			materializedViews.push(materializedViewSchemaToCatalog(tableSchema));
-		}
 	}
 
 	// Collect assertions
@@ -218,15 +215,16 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 		schemaName,
 		tables,
 		views,
-		materializedViews,
 		indexes,
 		assertions
 	};
 }
 
 function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTable {
-	// Generate canonical DDL from TableSchema
-	const ddl = generateTableDDL(tableSchema, db);
+	// Canonical DDL: a maintained table renders the `create table … maintained as`
+	// form (carrying its derivation body), a plain table the ordinary form.
+	const maintainedTable = isMaintainedTable(tableSchema) ? tableSchema : undefined;
+	const ddl = maintainedTable ? generateMaintainedTableDDL(maintainedTable) : generateTableDDL(tableSchema, db);
 
 	const columns = tableSchema.columns.map(col => ({
 		name: col.name,
@@ -294,6 +292,23 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		referencedTables,
 		tags: tableSchema.tags,
 		namedConstraints,
+		...(maintainedTable ? { maintained: maintainedDescriptor(maintainedTable) } : {}),
+	};
+}
+
+/**
+ * The derivation dimension surfaced on a maintained table's catalog entry — the
+ * canonical body hash plus the normalized backing module (compared separately
+ * from the hash, the module is deliberately not folded into the hash formula).
+ * The differ uses this to recognize a body change (re-attach) vs an unchanged
+ * maintained table (no-op), and table↔maintained transitions (attach / detach).
+ */
+function maintainedDescriptor(table: MaintainedTableSchema): NonNullable<CatalogTable['maintained']> {
+	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
+	return {
+		bodyHash: table.derivation.bodyHash,
+		backingModuleName: backing.storedModuleName,
+		backingModuleArgs: backing.storedModuleArgs,
 	};
 }
 
@@ -303,21 +318,6 @@ function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 		ddl: viewSchema.sql,
 		definition: viewDefinitionToCanonicalString(viewSchema.columns, viewSchema.selectAst, viewSchema.insertDefaults),
 		tags: viewSchema.tags,
-	};
-}
-
-function materializedViewSchemaToCatalog(table: MaintainedTableSchema): CatalogMaterializedView {
-	// Backing-module identity re-derives from the table's own module/args (the
-	// `normalizeBackingModule` rule keeps the memory default absent, preserving
-	// the differ's comparison keying).
-	const backing = normalizeBackingModule(table.vtabModuleName, table.vtabArgs);
-	return {
-		name: table.name,
-		ddl: generateMaintainedTableDDL(table),
-		bodyHash: table.derivation.bodyHash,
-		backingModuleName: backing.storedModuleName,
-		backingModuleArgs: backing.storedModuleArgs,
-		tags: table.tags,
 	};
 }
 

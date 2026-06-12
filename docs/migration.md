@@ -22,6 +22,8 @@ This is the load-bearing rule, and everything else in this document is a consequ
 
 A representation change runs through four phases. Only the first requires app code; the rest are observation and housekeeping.
 
+> **Covered end-to-end by an engine-level capstone test.** The expand → flip → contract walk below — driven entirely through `declare schema` + `apply schema` over a single database — is exercised as a regression test at `packages/quereus/test/maintained-table-migration-capstone.spec.ts`. It asserts data equivalence at every quiescent point and that the new table's incarnation and rows survive all three applies untouched (no `table_removed`/`table_added` fires after expand), pinning the differ's attach/re-attach/detach transitions to this document's worked example.
+
 ### 1. Expand — publish the new table as a derivation of the old
 
 The upgraded app's deployment declares, in the **basis** schema, a new table for the new representation, *maintained from* the old one — a maintained table over the old basis table, with the conversion in the body and the backing placed in the synced store module. The canonical expression is the declared-shape **table form** ([materialized-views.md § DDL statements](materialized-views.md#ddl-statements)): the new table's layout is authored (the frozen basis), and the body must derive exactly that shape:
@@ -37,9 +39,9 @@ create table Contact_v2 (
 ```
 
 ```sql
--- Declarative form. The differ does not yet recognize the maintained clause on
--- table items (ticket maintained-table-differ-transitions), so a declared
--- schema still uses the materialized-view item — semantically the same record:
+-- Declarative form. The differ recognizes the maintained clause on table items
+-- and the `materialized view` item identically — both normalize to one declared
+-- record, so either form applies as a non-destructive attach/re-attach:
 declare schema Store {
   table Contact_v1 (handle text primary key, email text) using store();
 
@@ -153,7 +155,6 @@ Not every logical change needs the pattern. A **collation change on a non-key, n
 The pattern above is the design target; these pieces are pending (tracked as tickets):
 
 - **Authored inverses** (`with inverse (col = expr, …)` on result columns) — parser/AST, write-path consumption, lens-prover integration ([view-updateability.md § Authored inverses](view-updateability.md#authored-inverses-with-inverse)).
-- **Declarative-differ derivation transitions** — the lifecycle verbs themselves are in place (`create table … maintained as`, `alter table … set maintained as` with verify-by-diff reconcile, `alter table … drop maintained` — [materialized-views.md § DDL statements](materialized-views.md#ddl-statements)), so the flip and contract phases are expressible imperatively; what remains is the **declarative differ** recognizing attach/detach/body-change as non-destructive `set/drop maintained` transitions instead of drop+recreate (ticket `maintained-table-differ-transitions`).
 - **Replicable determinism class** for UDFs + host-declared requirements on the backing-host capability.
 - **Key-coarsening collision telemetry** — the runtime operational complement to the (implemented) static create-time warning (ticket `mv-collation-collision-telemetry`).
 - **Sync-layer policies** — per-table change-logging opt-in for maintenance writes, unknown-table disposition + telemetry, retention-horizon-driven retirement, and mapped-since bookkeeping over `notifyLensDeployment`.

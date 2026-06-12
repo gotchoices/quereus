@@ -34,7 +34,7 @@ function parseLiteralDefault(sql: string): AST.Expression {
 }
 
 function makeCatalog(tables: CatalogTable[]): SchemaCatalog {
-	return { schemaName: 'main', tables, views: [], materializedViews: [], indexes: [], assertions: [] };
+	return { schemaName: 'main', tables, views: [], indexes: [], assertions: [] };
 }
 
 function catalogTable(
