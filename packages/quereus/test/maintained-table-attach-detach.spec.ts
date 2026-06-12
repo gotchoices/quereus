@@ -615,6 +615,46 @@ describe('Maintained-table attach/detach verbs', () => {
 			expect(after.columns.map(c => c.name), 'columns untouched').to.deep.equal(['a', 'b']);
 			expect(after.derivation.columns, 'still recorded explicit').to.deep.equal(['a', 'b']);
 		});
+
+		it('a reconcile failure AFTER the structural reshape leaves the reshaped backing carrying the prior derivation STALE, and re-runs to converge', async () => {
+			// The post-mutation failure-restore path (restoreReshaped): a declared
+			// CHECK violated by the reconciled body throws AFTER a pre-reconcile
+			// structural op already mutated the module (here the trailing `z` add) but
+			// BEFORE any commit. Module column ops are non-transactional, so the prior
+			// shape cannot be restored; the catalog instead tracks the reshaped module
+			// with the PRIOR derivation marked stale — coherent and re-runnable.
+			await db.exec(`
+				create table csrc (id integer primary key, x text not null, y text not null, z text);
+				insert into csrc values (1, 'a', 'a', 'p'), (2, 'b', 'bad', 'q');
+				create table cm (id integer primary key, x text not null check (x <> 'bad')) maintained as select id, x from csrc;
+			`);
+			let message = '';
+			try {
+				// Trailing add (z) ⇒ a reshape; the body also feeds y into x, so row 2's
+				// reconciled x is 'bad' ⇒ the declared CHECK throws pre-commit.
+				await db.exec(`alter table cm set maintained as select id, y as x, z from csrc`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message, 'the reconciled body violates the declared CHECK').to.match(/check/i);
+			const stalled = maintained('cm');
+			expect(stalled.columns.map(c => c.name), 'backing physically reshaped (z added) — module ops are not transactional').to.deep.equal(['id', 'x', 'z']);
+			expect(stalled.derivation.stale, 'prior derivation rides the reshaped backing, stale').to.equal(true);
+			expect(stalled.derivation.columns, 'still recorded implicit').to.be.undefined;
+			// Reads serve the coherent prior backing (the rolled-back reconcile left the
+			// original x values; the added z is NULL), not the failed derivation.
+			expect(await readAll('select * from cm order by id')).to.deep.equal([
+				{ id: 1, x: 'a', z: null }, { id: 2, x: 'b', z: null },
+			]);
+			// Re-runnable: fix the offending source row and re-run the SAME verb — the
+			// backing already carries the reshaped columns, so it now reconciles cleanly
+			// and converges (live, derived content wins).
+			await db.exec(`update csrc set y = 'c' where id = 2`);
+			await db.exec(`alter table cm set maintained as select id, y as x, z from csrc`);
+			const healed = maintained('cm');
+			expect(healed.derivation.stale, 'converged').to.equal(false);
+			expect(await readAll('select * from cm order by id')).to.deep.equal([
+				{ id: 1, x: 'a', z: 'p' }, { id: 2, x: 'c', z: 'q' },
+			]);
+		});
 	});
 });
 
