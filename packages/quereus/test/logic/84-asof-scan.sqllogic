@@ -216,6 +216,12 @@ CREATE TABLE asof_quotes_mix (ts INTEGER PRIMARY KEY, symbol TEXT COLLATE NOCASE
 INSERT INTO asof_trades_mix VALUES (1, 'A', 100), (2, 'a', 200), (3, 'B', 150);
 INSERT INTO asof_quotes_mix VALUES (50, 'a', 1.0), (180, 'b', 2.0);
 
+-- This must remain an ASOFSCAN — the partition-collation resolution under review
+-- only runs in the asof emitter; if the plan ever degraded to a generic correlated
+-- subquery the result assertion below would pass vacuously without exercising it.
+SELECT op FROM query_plan('select t.id, q.bid from (select id, symbol, ts from asof_trades_mix order by ts) t left join lateral (select bid from asof_quotes_mix q where q.symbol = t.symbol and q.ts <= t.ts order by q.ts desc limit 1) q on true') WHERE op = 'ASOFSCAN';
+→ [{"op":"ASOFSCAN"}]
+
 -- t.id=1 (A,100): A/a quotes ≤ 100 → ts=50 → 1.0
 -- t.id=2 (a,200): A/a quotes ≤ 200 → ts=50 → 1.0
 -- t.id=3 (B,150): B/b quotes ≤ 150 → none (only ts=180) → null
