@@ -6,6 +6,7 @@ import type { ConstraintCheck } from '../nodes/constraint-check-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { buildExpression } from './expression.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { basisFksOverriddenByDivergentLensFk } from '../../schema/lens-fk-discovery.js';
 import * as AST from '../../parser/ast.js';
 import { createLogger } from '../../common/logger.js';
@@ -256,12 +257,10 @@ export function buildChildSideFKChecks(
 
 			const newAttr = newAttributes[tableColIndex];
 			if (newAttr) {
-				const newColumnType = {
-					typeClass: 'scalar' as const,
-					logicalType: tableColumn.logicalType,
-					nullable: !tableColumn.notNull,
-					isReadOnly: false,
-				};
+				// Carry the column's declared collation so a FK comparison over a
+				// collated child column resolves the same collation a read-path
+				// query would (mirrors the CHECK constraint scope).
+				const newColumnType = columnSchemaToScalarType(tableColumn);
 
 				constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
 					new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
@@ -274,12 +273,7 @@ export function buildChildSideFKChecks(
 
 			const oldAttr = oldAttributes[tableColIndex];
 			if (oldAttr) {
-				const oldColumnType = {
-					typeClass: 'scalar' as const,
-					logicalType: tableColumn.logicalType,
-					nullable: true,
-					isReadOnly: false,
-				};
+				const oldColumnType = columnSchemaToScalarType(tableColumn, { nullable: true });
 
 				constraintScope.registerSymbol(`old.${colNameLower}`, (exp, s) =>
 					new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
@@ -396,12 +390,7 @@ export function buildParentSideFKChecks(
 
 					const oldAttr = oldAttributes[tableColIndex];
 					if (oldAttr) {
-						const oldColumnType = {
-							typeClass: 'scalar' as const,
-							logicalType: tableColumn.logicalType,
-							nullable: !tableColumn.notNull,
-							isReadOnly: false,
-						};
+						const oldColumnType = columnSchemaToScalarType(tableColumn);
 
 						constraintScope.registerSymbol(`old.${colNameLower}`, (exp, s) =>
 							new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
@@ -415,12 +404,7 @@ export function buildParentSideFKChecks(
 
 					const newAttr = newAttributes[tableColIndex];
 					if (newAttr) {
-						const newColumnType = {
-							typeClass: 'scalar' as const,
-							logicalType: tableColumn.logicalType,
-							nullable: true,
-							isReadOnly: false,
-						};
+						const newColumnType = columnSchemaToScalarType(tableColumn, { nullable: true });
 
 						constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
 							new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));

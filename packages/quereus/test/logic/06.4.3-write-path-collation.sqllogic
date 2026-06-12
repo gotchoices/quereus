@@ -69,3 +69,30 @@ insert into ups_coll values (1, 'zzz', null)
 select note from ups_coll where id = 1;
 → [{"note":"was-match"}]
 drop table ups_coll;
+
+-- ===================================
+-- 5. Foreign-key check scope: the synthesized parent-existence comparison
+--    `parent.k = NEW.ref` resolves the child FK column's declared collation
+--    (the right operand wins, mirroring read-path comparison precedence). A
+--    NOCASE child column therefore matches a case-variant parent key, exactly
+--    as a read-path join over the two columns would.
+-- ===================================
+
+pragma foreign_keys = true;
+create table fk_parent (k text primary key);
+create table fk_child (id integer primary key, ref text collate nocase references fk_parent(k));
+insert into fk_parent values ('ABC');
+-- Case-variant FK satisfied: NOCASE on the child column drives the parent lookup.
+insert into fk_child values (1, 'abc');
+select count(*) as cnt from fk_child where id = 1;
+→ [{"cnt":1}]
+-- read path agrees: the same comparison (parent.k = child.ref, right operand
+-- NOCASE) matches across the case variance.
+select count(*) as cnt from fk_parent as p join fk_child as c on p.k = c.ref;
+→ [{"cnt":1}]
+-- A value with no case-folded parent match is still rejected (FK is enforced).
+insert into fk_child values (2, 'nope');
+-- error:
+drop table fk_child;
+drop table fk_parent;
+pragma foreign_keys = false;
