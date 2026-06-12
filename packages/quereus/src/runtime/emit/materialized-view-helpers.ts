@@ -1030,11 +1030,15 @@ async function reshapeBackingInPlace(
 
 	// Post-reconcile data-validating ops (retype / recollate / tighten NOT NULL): the
 	// reconciled body rows satisfy the new attribute where the discarded backing
-	// might not, so each validates the fresh data, not the stale rows.
+	// might not, so each validates the fresh data, not the stale rows. Re-register
+	// the catalog after EACH op (not once after the loop): a data-validating op can
+	// throw, and unlike the pre-reconcile batch the module schema mutates per op, so
+	// a single post-loop register would leave the catalog behind the module — the
+	// very catalog/module divergence this two-phase split exists to avoid — on a
+	// partial throw. Per-op registration keeps the catalog tracking the module so a
+	// mid-batch failure leaves a coherent, re-runnable table.
 	for (const op of plan.postReconcileOps) {
 		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
-	}
-	if (plan.postReconcileOps.length > 0) {
 		live = { ...current, derivation: mv.derivation };
 		schema.addTable(live);
 	}
