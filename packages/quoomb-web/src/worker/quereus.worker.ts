@@ -628,26 +628,19 @@ class QuereusWorker implements QuereusWorkerAPI {
     }
 
     // Create store adapter for applying remote changes
-    // This executes DDL/DML on the local database when remote changes arrive
+    // This executes DDL on the local database and applies row changes through
+    // the store module's external-write entry point (table-owned keying,
+    // secondary-index maintenance) + the engine's ingestion seam (MV
+    // maintenance, Database.watch capture).
     const db = this.db;
-    const storeModule = this.storeModule;
     const getTableSchema = (schemaName: string, tableName: string) => {
       return db.schemaManager.getTable(schemaName, tableName);
     };
 
-    // Get the correct KV store for each table
-    const getKVStore = async (schemaName: string, tableName: string) => {
-      const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-      const config = { collation: 'NOCASE' as const };
-      return storeModule.getStore(tableKey, config);
-    };
-
     const applyToStore = createStoreAdapter({
       db: this.db,
-      getKVStore,
+      storeModule: this.storeModule,
       events: this.storeEvents,
-      getTableSchema,
-      collation: 'NOCASE',
     });
 
     // Create sync module with the store adapter and schema lookup

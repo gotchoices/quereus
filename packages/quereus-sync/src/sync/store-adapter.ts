@@ -1,14 +1,53 @@
 /**
  * Store adapter for applying remote sync changes.
  *
- * This module provides adapters that implement the ApplyToStoreCallback
- * interface for LevelDB and IndexedDB stores, enabling the SyncManager
- * to apply remote changes to the actual data store.
+ * Implements the ApplyToStoreCallback interface over the store module's
+ * external row-write entry point (`StoreTable.applyExternalRowChanges` —
+ * table-owned key encoding, secondary-index and stats maintenance) plus the
+ * engine's batch ingestion seam (`Database.ingestExternalRowChanges` — change
+ * capture for `Database.watch` + global assertions, materialized-view
+ * maintenance, opt-in parent-side FK actions).
+ *
+ * Per `applyToStore(dataChanges, schemaChanges, options)` invocation:
+ *   1. Schema changes execute first via `db.exec` (DDL before DML), with the
+ *      resulting module schema events pre-marked remote.
+ *   2. Data changes are grouped per table, then per row; each row group
+ *      collapses to ONE `ExternalRowOp` (a delete in the group wins over
+ *      column updates; column updates merge onto the pre-read existing row,
+ *      or onto a PK+nulls partial row when absent — UPSERT semantics).
+ *   3. `StoreTable.applyExternalRowChanges(ops)` applies the table's ops to
+ *      committed storage and returns the EFFECTIVE changes (no-ops — absent
+ *      delete, value-identical upsert — are suppressed: no storage write, no
+ *      module event, no seam report).
+ *   4. Module data events are emitted from the effective changes with
+ *      `remote: true` (so the SyncManager never re-records inbound changes),
+ *      carrying accurate `oldRow` before-images and derived `changedColumns`.
+ *   5. After all tables' storage writes, ONE seam call reports the
+ *      accumulated effective changes: `db.ingestExternalRowChanges(batch,
+ *      { applyForeignKeyActions })` — capture + MV facets default on.
+ *      Changes recorded in `result.errors` are excluded from the batch.
+ *
+ * A seam throw (e.g. a commit-time global-assertion failure over the inbound
+ * batch) PROPAGATES out of the callback: the seam's batch savepoint has
+ * unwound the derived effects (MV backing deltas, capture entries), the
+ * storage rows stay applied, and the sync layer leaves CRDT metadata
+ * uncommitted — the same changes re-resolve on the next sync attempt.
+ * Re-application is idempotent (value-identical upserts suppress), then the
+ * seam retries. A batch that keeps failing an assertion retries forever
+ * (poison batch); detection/recovery policy is the host's.
+ *
+ * Constraints (see docs/materialized-views.md § External row-change
+ * ingestion): the callback is host-driven — never invoke it from within
+ * statement execution or vtab callbacks (exec-mutex deadlock), and hosts
+ * should not drive it while holding an open explicit transaction on `db`
+ * (the seam would join that transaction, so a later rollback diverges
+ * MV/capture state from the already-committed storage rows; recoverable via
+ * MV refresh).
  */
 
-import type { Database, SqlValue, Row, TableSchema } from '@quereus/quereus';
-import type { KVStore, StoreEventEmitter } from '@quereus/store';
-import { buildDataKey, resolvePkKeyCollations, serializeRow, deserializeRow } from '@quereus/store';
+import type { BackingRowChange, Database, ExternalRowChange, Row, SqlValue, TableSchema } from '@quereus/quereus';
+import { compareSqlValues } from '@quereus/quereus';
+import type { ExternalRowOp, StoreEventEmitter, StoreModule, StoreTable } from '@quereus/store';
 import type {
   ApplyToStoreCallback,
   ApplyToStoreOptions,
@@ -22,25 +61,27 @@ import { toError } from './sync-context.js';
  * Options for creating a SyncStoreAdapter.
  */
 export interface SyncStoreAdapterOptions {
-  /** The Quereus database for executing DDL statements. */
+  /** The Quereus database: DDL execution + `ingestExternalRowChanges` reporting. */
   db: Database;
   /**
-   * Function to get the KV store for a specific table.
-   * Each table may have its own IndexedDB database, so we need to look up
-   * the correct store for each table when applying remote changes.
+   * The store module owning the synced tables. Each table is resolved per
+   * apply via `getTableForExternalWrite`, which owns key encoding (incl.
+   * per-PK-column collations), secondary-index maintenance, and per-table
+   * store resolution (e.g. IndexedDB's one-database-per-table layout).
    */
-  getKVStore: (schemaName: string, tableName: string) => Promise<KVStore>;
-  /** The event emitter for data change events. */
+  storeModule: StoreModule;
+  /** The event emitter for data change events (the adapter emits `remote: true`). */
   events: StoreEventEmitter;
-  /** Function to get table schema by name. */
-  getTableSchema: (schemaName: string, tableName: string) => TableSchema | undefined;
   /**
-   * Table-level key collation K — must match the store module's configured
-   * collation (default 'NOCASE'). A text PK column's own declared collation
-   * overrides K for that column (via `resolvePkKeyCollations`), mirroring how
-   * `StoreTable` keys its rows.
+   * Parent-side FK actions on inbound update/delete (seam facet). Default
+   * false — a replication stream usually carries the origin's cascade
+   * effects; opt in only when the deployment's stream does not. When on, an
+   * inbound parent delete cascades to local children through the full DML
+   * pipeline; those cascaded child writes emit module events WITHOUT
+   * `remote`, so they are recorded as local changes and propagate outward —
+   * correct for the opt-in posture.
    */
-  collation?: 'BINARY' | 'NOCASE';
+  applyForeignKeyActions?: boolean;
 }
 
 /**
@@ -50,12 +91,14 @@ export interface SyncStoreAdapterOptions {
  * - UPSERT semantics for column changes (insert if row doesn't exist, update if it does)
  * - Row deletions by primary key
  * - DDL execution for schema changes
+ * - Post-apply reporting through the engine's ingestion seam (MV maintenance,
+ *   `Database.watch` capture, opt-in FK actions)
  *
  * All data change events are emitted with `remote: true` to prevent
  * the SyncManager from re-recording CRDT metadata.
  */
 export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToStoreCallback {
-  const { db, getKVStore, events, getTableSchema, collation = 'NOCASE' } = options;
+  const { db, storeModule, events, applyForeignKeyActions = false } = options;
 
   return async (
     dataChanges: DataChangeToApply[],
@@ -81,25 +124,38 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
       }
     }
 
-    // Group data changes by table for efficient batch operations
-    // Each table may have its own KV store (especially in IndexedDB)
-    const changesByTable = groupChangesByTable(dataChanges);
+    // Effective changes accumulated across all tables, in apply order,
+    // for the single end-of-invocation seam call.
+    const seamBatch: ExternalRowChange[] = [];
 
-    // Apply data changes per table
+    // Apply data changes per table; the resolved StoreTable owns key
+    // encoding, store resolution, and secondary-index maintenance.
+    const changesByTable = groupChangesByTable(dataChanges);
     for (const [tableKey, tableChanges] of changesByTable) {
       const [schemaName, tableName] = tableKey.split('.');
       try {
-        // Get the correct KV store for this table
-        const kv = await getKVStore(schemaName, tableName);
-
-        // Group by row within the table
-        const changesByRow = groupChangesByRow(tableChanges);
-
-        for (const [rowKey, rowChanges] of changesByRow) {
-          await applyRowChanges(kv, events, getTableSchema, collation, rowKey, rowChanges, applyOptions);
-          result.dataChangesApplied += rowChanges.length;
+        const table = storeModule.getTableForExternalWrite(db, schemaName, tableName);
+        if (!table) {
+          throw new Error(`Table not found for external write: ${schemaName}.${tableName}`);
         }
+
+        // One ExternalRowOp per row group: multiple same-row changes collapse
+        // to a single effective op, so the seam's same-row before-image
+        // chaining rule is satisfied trivially (oldRow = true pre-batch image).
+        const ops: ExternalRowOp[] = [];
+        for (const rowChanges of groupChangesByRow(tableChanges).values()) {
+          ops.push(await buildRowOp(table, rowChanges));
+        }
+
+        const effective = await table.applyExternalRowChanges(ops);
+        emitEffectiveChanges(events, table.getSchema(), effective);
+        for (const change of effective) {
+          seamBatch.push({ schemaName, tableName, change });
+        }
+        result.dataChangesApplied += tableChanges.length;
       } catch (error) {
+        // Errored changes are excluded from the seam batch; earlier tables'
+        // applied changes still report below.
         for (const change of tableChanges) {
           result.errors.push({
             change,
@@ -107,6 +163,14 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
           });
         }
       }
+    }
+
+    // One seam call per invocation, after all storage writes. A throw
+    // propagates: derived effects are unwound by the seam's batch savepoint,
+    // storage rows stay applied, the sync layer leaves CRDT metadata
+    // uncommitted and the same changes re-resolve on the next attempt.
+    if (seamBatch.length > 0) {
+      await db.ingestExternalRowChanges(seamBatch, { applyForeignKeyActions });
     }
 
     return result;
@@ -169,8 +233,8 @@ async function applySchemaChange(
   const objectType = change.type.includes('table') ? 'table' : 'index';
 
   // Register this as an expected remote event BEFORE executing DDL.
-  // When IndexedDBModule.create() emits the event, it will be automatically
-  // marked as remote, so SyncManager won't re-record it.
+  // When the module emits the event, it will be automatically marked as
+  // remote, so SyncManager won't re-record it.
   // This approach avoids race conditions with concurrent local DDL.
   events.expectRemoteSchemaEvent({
     type: eventType,
@@ -198,139 +262,109 @@ async function applySchemaChange(
 }
 
 /**
- * Apply data changes for a single row.
+ * Collapse one row group's changes into a single ExternalRowOp.
+ * A delete in the group wins over column updates.
  */
-async function applyRowChanges(
-  kv: KVStore,
-  events: StoreEventEmitter,
-  getTableSchema: (schemaName: string, tableName: string) => TableSchema | undefined,
-  collation: 'BINARY' | 'NOCASE',
-  _rowKey: string,
-  changes: DataChangeToApply[],
-  _options: ApplyToStoreOptions
-): Promise<void> {
-  // All changes in the group should be for the same row
-  const firstChange = changes[0];
-  const { schema, table, pk } = firstChange;
+async function buildRowOp(
+  table: StoreTable,
+  changes: DataChangeToApply[]
+): Promise<ExternalRowOp> {
+  const { pk } = changes[0];
 
-  const tableSchema = getTableSchema(schema, table);
-  if (!tableSchema) {
-    throw new Error(`Table schema not found: ${schema}.${table}`);
+  if (changes.some(c => c.type === 'delete')) {
+    return { op: 'delete', pk };
   }
 
-  const encodeOptions = { collation };
-  const pkDirections = tableSchema.primaryKeyDefinition.map(p => !!p.desc);
-  const pkCollations = resolvePkKeyCollations(tableSchema.primaryKeyDefinition, tableSchema.columns, collation);
-  const dataKey = buildDataKey(pk, encodeOptions, pkDirections, pkCollations);
-
-  // Check for delete operations first
-  const deleteChange = changes.find(c => c.type === 'delete');
-  if (deleteChange) {
-    await applyDelete(kv, events, tableSchema, dataKey, pk);
-    return;
-  }
-
-  // Apply column updates (UPSERT semantics)
-  await applyColumnUpdates(kv, events, tableSchema, dataKey, pk, changes, { serializeRow, deserializeRow });
+  return { op: 'upsert', row: await mergeColumnUpdates(table, pk, changes) };
 }
 
 /**
- * Apply a delete operation for a row.
+ * Merge column updates onto the row's current image (UPSERT semantics):
+ * pre-read the existing row by PK, or build a PK+nulls partial row when
+ * absent (column changes may arrive before the rest of the row).
  */
-async function applyDelete(
-  kv: KVStore,
-  events: StoreEventEmitter,
-  tableSchema: TableSchema,
-  dataKey: Uint8Array,
-  pk: SqlValue[]
-): Promise<void> {
-  await kv.delete(dataKey);
-
-  // Emit data change event with remote flag
-  events.emitDataChange({
-    type: 'delete',
-    schemaName: tableSchema.schemaName,
-    tableName: tableSchema.name,
-    key: pk,
-    remote: true,
-  });
-}
-
-/**
- * Apply column updates with UPSERT semantics.
- */
-async function applyColumnUpdates(
-  kv: KVStore,
-  events: StoreEventEmitter,
-  tableSchema: TableSchema,
-  dataKey: Uint8Array,
+async function mergeColumnUpdates(
+  table: StoreTable,
   pk: SqlValue[],
-  changes: DataChangeToApply[],
-  serialization: {
-    serializeRow: (row: Row) => Uint8Array;
-    deserializeRow: (data: Uint8Array) => Row;
-  }
-): Promise<void> {
-  const { serializeRow, deserializeRow } = serialization;
+  changes: DataChangeToApply[]
+): Promise<Row> {
+  const tableSchema = table.getSchema();
+  const existing = await table.readRowByPk(pk);
 
-  // Read existing row if any
-  const existingData = await kv.get(dataKey);
   let row: Row;
-  let isInsert = false;
-
-  if (existingData) {
-    row = deserializeRow(existingData);
+  if (existing) {
+    row = [...existing];
   } else {
-    // Create new row with nulls
-    row = new Array(tableSchema.columns.length).fill(null);
-    // Set PK values
+    row = new Array<SqlValue>(tableSchema.columns.length).fill(null);
     for (let i = 0; i < tableSchema.primaryKeyDefinition.length; i++) {
-      const pkDef = tableSchema.primaryKeyDefinition[i];
-      row[pkDef.index] = pk[i];
+      row[tableSchema.primaryKeyDefinition[i].index] = pk[i];
     }
-    isInsert = true;
   }
 
-  // Apply column changes from all changes
-  const changedColumns: string[] = [];
+  let columnsApplied = 0;
   for (const change of changes) {
-    if (change.columns) {
-      for (const [colName, value] of Object.entries(change.columns)) {
-        const colIndex = tableSchema.columnIndexMap.get(colName.toLowerCase());
-        if (colIndex !== undefined) {
-          row[colIndex] = value;
-          changedColumns.push(colName);
-        } else {
-          // Column name not found in schema - this could be a sync bug
-          console.warn(
-            `[Sync] Column '${colName}' not found in ${tableSchema.schemaName}.${tableSchema.name}. ` +
-            `Available columns: ${[...tableSchema.columnIndexMap.keys()].join(', ')}`
-          );
-        }
+    if (!change.columns) continue;
+    for (const [colName, value] of Object.entries(change.columns)) {
+      const colIndex = tableSchema.columnIndexMap.get(colName.toLowerCase());
+      if (colIndex !== undefined) {
+        row[colIndex] = value;
+        columnsApplied++;
+      } else {
+        // Column name not found in schema - this could be a sync bug
+        console.warn(
+          `[Sync] Column '${colName}' not found in ${tableSchema.schemaName}.${tableSchema.name}. ` +
+          `Available columns: ${[...tableSchema.columnIndexMap.keys()].join(', ')}`
+        );
       }
     }
   }
 
-  // Check if any columns were actually applied
-  if (changedColumns.length === 0 && !isInsert) {
+  if (columnsApplied === 0 && existing) {
     console.warn(
       `[Sync] No columns were applied for ${tableSchema.schemaName}.${tableSchema.name} pk=${JSON.stringify(pk)}. ` +
       `This may indicate a column name mismatch between source and destination.`
     );
   }
 
-  // Write updated row
-  await kv.put(dataKey, serializeRow(row));
-
-  // Emit data change event with remote flag
-  events.emitDataChange({
-    type: isInsert ? 'insert' : 'update',
-    schemaName: tableSchema.schemaName,
-    tableName: tableSchema.name,
-    key: pk,
-    newRow: row,
-    changedColumns: isInsert ? undefined : changedColumns,
-    remote: true,
-  });
+  return row;
 }
 
+/**
+ * Emit module data change events for the effective changes, with
+ * `remote: true` so the SyncManager never re-records them. Suppressed no-ops
+ * (absent delete, value-identical upsert) were never reported by the store,
+ * so they emit nothing — deliberate.
+ */
+function emitEffectiveChanges(
+  events: StoreEventEmitter,
+  tableSchema: TableSchema,
+  effective: readonly BackingRowChange[]
+): void {
+  for (const change of effective) {
+    const row = change.newRow ?? change.oldRow;
+    const pk = tableSchema.primaryKeyDefinition.map(p => row[p.index]);
+    events.emitDataChange({
+      type: change.op,
+      schemaName: tableSchema.schemaName,
+      tableName: tableSchema.name,
+      key: pk,
+      oldRow: change.oldRow,
+      newRow: change.newRow,
+      changedColumns: change.op === 'update'
+        ? diffChangedColumns(tableSchema, change.oldRow, change.newRow)
+        : undefined,
+      remote: true,
+    });
+  }
+}
+
+/** Column names whose values differ between the effective before/after images. */
+function diffChangedColumns(tableSchema: TableSchema, oldRow: Row, newRow: Row): string[] {
+  const changed: string[] = [];
+  for (let i = 0; i < tableSchema.columns.length; i++) {
+    if (compareSqlValues(oldRow[i], newRow[i]) !== 0) {
+      changed.push(tableSchema.columns[i].name);
+    }
+  }
+  return changed;
+}

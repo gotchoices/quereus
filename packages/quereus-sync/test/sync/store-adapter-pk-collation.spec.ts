@@ -1,10 +1,13 @@
 /**
- * Repro/regression tests: the sync store-adapter must key rows IDENTICALLY to
- * StoreTable — including per-column PK key collations. A text PK column with a
- * collation that diverges from the table-level key collation K (e.g.
- * `collate binary` PK on a default-NOCASE store) is encoded under its own
- * collation by the store; the adapter must match those bytes or remote
- * inserts land at phantom keys and remote deletes miss.
+ * Regression tests: inbound sync rows must be keyed IDENTICALLY to StoreTable
+ * — including per-column PK key collations. A text PK column with a collation
+ * that diverges from the table-level key collation K (e.g. `collate binary`
+ * PK on a default-NOCASE store) is encoded under its own collation by the
+ * store; a mismatched key would land remote inserts at phantom keys and make
+ * remote deletes miss. The adapter now resolves each table via
+ * `StoreModule.getTableForExternalWrite` and applies through
+ * `StoreTable.applyExternalRowChanges`, so these scenarios pin the
+ * TABLE-OWNED keying (no adapter-side key encoding remains to diverge).
  */
 
 import { expect } from 'chai';
@@ -54,17 +57,13 @@ describe('store-adapter PK key collation', () => {
 		db = new Database();
 		provider = createInMemoryProvider();
 		events = new StoreEventEmitter();
-		db.registerModule('store', new StoreModule(provider, events));
-		applyToStore = createStoreAdapter({
-			db,
-			getKVStore: (schemaName, tableName) => provider.getStore(schemaName, tableName),
-			events,
-			getTableSchema: (schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
-			collation: 'NOCASE',
-		});
+		const storeModule = new StoreModule(provider, events);
+		db.registerModule('store', storeModule);
+		applyToStore = createStoreAdapter({ db, storeModule, events });
 	});
 
 	afterEach(async () => {
+		await db.close();
 		await provider.closeAll();
 	});
 

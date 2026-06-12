@@ -27,10 +27,14 @@ import { createSyncModule, createStoreAdapter } from '@quereus/sync';
 const storeEvents = new StoreEventEmitter();
 const kv = await LevelDBStore.open({ path: './sync-metadata' });
 
-// Create sync module (tracks CRDT metadata, emits sync events)
+// Create sync module (tracks CRDT metadata, emits sync events).
+// `db` is the Quereus Database; `storeModule` is the StoreModule the synced
+// tables use — the adapter resolves each table through it, so inbound writes
+// get table-owned key encoding, secondary-index maintenance, and post-apply
+// reporting through the engine (materialized views, Database.watch).
 const { syncManager, syncEvents } = await createSyncModule(kv, storeEvents, {
-  applyToStore: createStoreAdapter({ db, getKVStore, events: storeEvents, getTableSchema }),
-  getTableSchema: (schema, table) => db.getTableSchema(schema, table),
+  applyToStore: createStoreAdapter({ db, storeModule, events: storeEvents }),
+  getTableSchema: (schema, table) => db.schemaManager.getTable(schema, table),
 });
 
 // Subscribe to sync events for UI
@@ -155,7 +159,7 @@ This means concurrent updates to *different* columns of the same row both apply,
 ### Core Exports
 
 - `createSyncModule(kv, storeEvents, options?)` - Factory to create sync manager and event emitter
-- `createStoreAdapter(options)` - Creates an `ApplyToStoreCallback` for applying remote changes
+- `createStoreAdapter({ db, storeModule, events, applyForeignKeyActions? })` - Creates an `ApplyToStoreCallback` for applying remote changes. Applies rows through `StoreTable.applyExternalRowChanges` (table-owned keying, secondary-index maintenance) and reports each invocation as one `Database.ingestExternalRowChanges` batch (materialized-view maintenance, `Database.watch` capture, commit-time assertions). `applyForeignKeyActions` (default `false`) opts inbound update/delete into parent-side FK actions — only enable when the replication stream does not already carry the origin's cascade effects; cascaded child writes are recorded as *local* changes and propagate outward. The callback is host-driven: never invoke it from within statement execution, and don't drive it while holding an open explicit transaction on `db`. A seam throw (e.g. an assertion failure over an inbound batch) propagates out of `applyToStore` with the storage rows applied and CRDT metadata uncommitted; the next sync attempt re-resolves and converges (value-identical re-application is suppressed)
 - `SyncManager` - Main sync coordination interface
 - `SyncEventEmitter` / `SyncEventEmitterImpl` - Event subscription interface and implementation
 

@@ -165,10 +165,12 @@ Quereus Sync provides **fully opaque CRDT replication** — your application wri
 ```typescript
 import { createSyncModule, createStoreAdapter } from '@quereus/sync';
 
-// Sync plugs into your existing Quereus database
+// Sync plugs into your existing Quereus database and store module —
+// inbound changes maintain secondary indexes, materialized views, and
+// Database.watch subscriptions just like local writes
 const { syncManager, syncEvents } = await createSyncModule(kv, storeEvents, {
-  applyToStore: createStoreAdapter({ db, getKVStore, events: storeEvents, getTableSchema }),
-  getTableSchema: (schema, table) => db.getTableSchema(schema, table),
+  applyToStore: createStoreAdapter({ db, storeModule, events: storeEvents }),
+  getTableSchema: (schema, table) => db.schemaManager.getTable(schema, table),
 });
 
 // Delta sync between replicas

@@ -16,11 +16,11 @@ import {
   type ApplyToStoreCallback,
   type SnapshotChunk,
 } from '../../src/sync/protocol.js';
-import { StoreEventEmitter, InMemoryKVStore } from '@quereus/store';
+import { StoreEventEmitter, InMemoryKVStore, StoreModule, type KVStoreProvider } from '@quereus/store';
 import { generateSiteId } from '../../src/clock/site.js';
 import { compareHLC } from '../../src/clock/hlc.js';
 import type { SyncManager } from '../../src/sync/manager.js';
-import type { SqlValue, TableSchema } from '@quereus/quereus';
+import { Database, type SqlValue, type TableSchema } from '@quereus/quereus';
 
 // ============================================================================
 // Test Infrastructure
@@ -91,10 +91,11 @@ class MockDataStore {
 
 /**
  * Minimal TableSchema stand-in for `main.test (id INTEGER PRIMARY KEY, value TEXT)`.
- * Carries only the fields the sync paths actually read: identity, columns with
- * `logicalType.isTextual` (consumed by the store adapter's
- * `resolvePkKeyCollations`), `primaryKeyDefinition`, and `columnIndexMap`.
- * If the adapter starts reading more schema fields, extend this one factory.
+ * Carries only the fields the sync manager's column-mapping paths actually
+ * read: identity, columns, `primaryKeyDefinition`, and `columnIndexMap`.
+ * (The store adapter itself no longer takes a schema lookup — it resolves
+ * tables through the StoreModule.) If a sync path starts reading more schema
+ * fields, extend this one factory.
  */
 function makeTestTableSchema(): TableSchema {
   return {
@@ -1095,38 +1096,51 @@ describe('Sync Protocol E2E', () => {
      * - The sync manager uses `quoomb_sync_meta` IndexedDB database for CRDT metadata
      * - Each table uses its own IndexedDB database like `quereus_main_test` for data
      *
-     * The fix: createStoreAdapter now takes a getKVStore function that returns
-     * the correct store for each table.
+     * The adapter resolves each table via `StoreModule.getTableForExternalWrite`,
+     * whose `StoreTable.ensureStore` opens the table's OWN data store through the
+     * module's provider — the per-table routing the deleted `getKVStore` option
+     * used to do by hand.
      */
     it('should write to the correct KV store for each table', async function() {
       this.timeout(5000);
 
       // This simulates the browser scenario where we have TWO different stores:
       // 1. syncMetaStore - where sync metadata lives (quoomb_sync_meta)
-      // 2. tableDataStore - where actual table data lives (quereus_main_test)
+      // 2. the per-table data stores the StoreModule resolves via its provider
       const syncMetaStore = new InMemoryKVStore();
-      const tableDataStore = new InMemoryKVStore();
 
-      const tableSchema = makeTestTableSchema();
+      const dataStores = new Map<string, InMemoryKVStore>();
+      const getDataStore = (key: string): InMemoryKVStore => {
+        let store = dataStores.get(key);
+        if (!store) {
+          store = new InMemoryKVStore();
+          dataStores.set(key, store);
+        }
+        return store;
+      };
+      const provider: KVStoreProvider = {
+        async getStore(s, t) { return getDataStore(`${s}.${t}`); },
+        async getIndexStore(s, t, i) { return getDataStore(`${s}.${t}_idx_${i}`); },
+        async getStatsStore(s, t) { return getDataStore(`${s}.${t}.__stats__`); },
+        async getCatalogStore() { return getDataStore('__catalog__'); },
+        async closeStore() {},
+        async closeIndexStore() {},
+        async closeAll() {
+          for (const store of dataStores.values()) await store.close();
+          dataStores.clear();
+        },
+      };
 
       const events = new StoreEventEmitter();
       const syncEvents = new SyncEventEmitterImpl();
 
-      // Create a store adapter with getKVStore that returns the TABLE's store
+      const db = new Database();
+      const storeModule = new StoreModule(provider, events);
+      db.registerModule('store', storeModule);
+      await db.exec('create table test (id integer primary key, value text) using store');
+
       const { createStoreAdapter } = await import('../../src/sync/store-adapter.js');
-      const applyToStore = createStoreAdapter({
-        db: null as unknown as import('@quereus/quereus').Database, // Not needed for this test
-        getKVStore: async (schemaName: string, tableName: string) => {
-          // Return the table's store (not the sync metadata store)
-          if (schemaName === 'main' && tableName === 'test') {
-            return tableDataStore;
-          }
-          throw new Error(`Unknown table: ${schemaName}.${tableName}`);
-        },
-        events,
-        getTableSchema: () => tableSchema,
-        collation: 'NOCASE',
-      });
+      const applyToStore = createStoreAdapter({ db, storeModule, events });
 
       const syncManager = await SyncManagerImpl.create(
         syncMetaStore,  // Sync metadata goes here
@@ -1134,7 +1148,7 @@ describe('Sync Protocol E2E', () => {
         config,
         syncEvents,
         applyToStore,
-        () => tableSchema
+        (schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName)
       );
 
       // Simulate receiving remote changes
@@ -1180,21 +1194,26 @@ describe('Sync Protocol E2E', () => {
       }
 
       const tableDataKeys: string[] = [];
-      for await (const entry of tableDataStore.iterate()) {
+      for await (const entry of getDataStore('main.test').iterate()) {
         tableDataKeys.push(new TextDecoder().decode(entry.key));
       }
 
-      // FIXED: Data should now be in tableDataStore, NOT syncMetaStore
-      // Sync metadata keys start with specific prefixes (e.g., 'crdt:', 'hlc:', etc.)
-      // Table data keys are just encoded PKs (no prefix)
-      // We verify by checking that tableDataStore has entries and syncMetaStore has none of those
-      expect(tableDataKeys.length).to.be.greaterThan(0, 'Data should be in tableDataStore');
+      // Data lands in the TABLE's data store, NOT syncMetaStore.
+      expect(tableDataKeys.length).to.be.greaterThan(0, 'Data should be in the table data store');
       // Sync meta store should only have sync-related keys, not table data
-      // (The actual sync metadata format uses different prefixes)
       const tableDataInSyncMeta = syncMetaKeys.some(k =>
         tableDataKeys.includes(k)
       );
       expect(tableDataInSyncMeta).to.equal(false, 'Table data keys should not be in syncMetaStore');
+
+      // The applied row reads back through the engine (both column changes
+      // merged into one upsert against the table's own store).
+      const rows: Record<string, SqlValue>[] = [];
+      for await (const row of db.eval('select id, value from test')) rows.push(row);
+      expect(rows.map(r => ({ id: Number(r.id), value: r.value })))
+        .to.deep.equal([{ id: 1, value: 'hello' }]);
+
+      await db.close();
     });
   });
 
