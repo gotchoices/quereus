@@ -325,6 +325,21 @@ select count(*) as c from view_info('mt_mv');
 → [{"c":0}]
 
 -- ===================================================================
+-- MV-sugar column-rename form: the registered output names (mv(pk, dv)) DIFFER
+-- from the body's attribute names (id, v). The maintained-table branch reports
+-- the table's REGISTERED columns as the authoritative output names (positional
+-- override) while the lineage trace still resolves to the SOURCE base column —
+-- exercising the columnNames override that the alias-only MV above cannot.
+-- ===================================================================
+
+create table mt2 (id integer primary key, v integer);
+insert into mt2 values (1, 5);
+create materialized view mt2_mv (pk, dv) as select id, v from mt2;
+
+select cid, column_name, is_updatable, base_table, base_column from column_info('mt2_mv');
+→ [{"cid":0,"column_name":"pk","is_updatable":"YES","base_table":"mt2","base_column":"id"},{"cid":1,"column_name":"dv","is_updatable":"YES","base_table":"mt2","base_column":"v"}]
+
+-- ===================================================================
 -- Unknown name throws (mirrors table_info's required-target posture).
 -- ===================================================================
 
