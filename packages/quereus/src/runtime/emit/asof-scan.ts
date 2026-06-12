@@ -6,9 +6,10 @@ import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
+import { compareSqlValuesFast } from '../../util/comparison.js';
 import type { CollationFunction } from '../../util/comparison.js';
 import { resolveKeyNormalizer, serializeRowKey } from '../../util/key-serializer.js';
+import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:asof-scan');
@@ -51,8 +52,16 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 	if (leftMatchIdx === -1 || rightMatchIdx === -1) {
 		throw new Error(`AsofScan: could not resolve match-attr ids ${plan.matchAttr.leftAttrId}/${plan.matchAttr.rightAttrId}`);
 	}
-	const matchCollationName = leftAttrs[leftMatchIdx].type.collationName ?? rightAttrs[rightMatchIdx].type.collationName;
-	const matchCollation: CollationFunction = matchCollationName ? ctx.resolveCollation(matchCollationName) : BINARY_COLLATION;
+	// Resolve the match column's comparison collation through the shared provenance
+	// lattice (explicit > declared > default > BINARY), so a declared NOCASE on
+	// either side governs the asof match regardless of which side spells it. Throws
+	// on an explicit/declared conflict — a loud backstop. LOCKSTEP (merge strategy):
+	// the asof co-stream needs both inputs ordered under THIS collation;
+	// `rule-asof-strategy-select` validates the (collation-blind) physical ordering,
+	// sound only while both match attrs share their declared sort collation — the
+	// same alignment `equi-pair-extractor` enforces for merge join.
+	const matchCollationName = effectiveCollationOfTypes(leftAttrs[leftMatchIdx].type, rightAttrs[rightMatchIdx].type);
+	const matchCollation: CollationFunction = ctx.resolveCollation(matchCollationName);
 
 	const leftPartitionIndices: number[] = [];
 	const rightPartitionIndices: number[] = [];
@@ -66,8 +75,12 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 		}
 		leftPartitionIndices.push(leftIdx);
 		rightPartitionIndices.push(rightIdx);
-		const collationName = leftAttrs[leftIdx].type.collationName ?? rightAttrs[rightIdx].type.collationName;
-		partitionCollations.push(collationName ? ctx.resolveCollation(collationName) : BINARY_COLLATION);
+		// Same provenance-lattice resolution as the match column: a partition column
+		// declared NOCASE on either side groups case-variant keys together regardless
+		// of which side declares it; the comparator and the hash-bucket normalizer
+		// both key off the one resolved name so they cannot disagree.
+		const collationName = effectiveCollationOfTypes(leftAttrs[leftIdx].type, rightAttrs[rightIdx].type);
+		partitionCollations.push(ctx.resolveCollation(collationName));
 		keyNormalizers.push(resolveKeyNormalizer(collationName));
 	}
 

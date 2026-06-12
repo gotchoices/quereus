@@ -7,6 +7,7 @@ import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 import { resolveKeyNormalizer, serializeRowKey } from '../../util/key-serializer.js';
+import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:bloom-join');
@@ -39,8 +40,13 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		}
 		leftIndices.push(li);
 		rightIndices.push(ri);
-		// Use the left attribute's collation (consistent with nested-loop join behavior)
-		const collationName = leftAttributes[li].type.collationName || rightAttributes[ri].type.collationName;
+		// Resolve the pair's comparison collation through the shared provenance
+		// lattice so the probe- and build-side key normalization agree and match
+		// every other join algorithm and the nested-loop fallback. Throws on an
+		// explicit/declared conflict — a loud backstop; `equi-pair-extractor`'s
+		// matched-collation gate keeps such pairs out of this path (see the lockstep
+		// note there).
+		const collationName = effectiveCollationOfTypes(leftAttributes[li].type, rightAttributes[ri].type);
 		keyNormalizers.push(resolveKeyNormalizer(collationName));
 	}
 

@@ -162,3 +162,37 @@ create materialized view ord_v as select handle collate nocase as handle, email 
 insert into ord_src values ('BOB', 'b3@x.test');
 select handle, email from ord_v;
 → [{"handle":"BOB","email":"b3@x.test"}]
+
+-- ===================================
+-- 9. Explicit-collation backing key survives the store reconcile
+--    (ticket join-key-collation-resolution-alignment): an MV column published with
+--    an EXPLICIT collation now stamps `ColumnSchema.collationExplicit`, so the store
+--    module keys the backing PK under the PUBLISHED collation instead of re-keying
+--    every implicit text PK under its table-level default (NOCASE). A body whose key
+--    column is explicit `collate binary` must therefore keep case-variant rows that
+--    are DISTINCT under BINARY but would collide under the store default — proving
+--    the published collation, not the store default, governs the backing key. (Under
+--    the memory module the backing already keys on the column's collation field; this
+--    case earns its keep under `yarn test:store`.)
+-- ===================================
+
+create table bin_src (handle text collate binary primary key, v integer);
+insert into bin_src values ('Bob', 1), ('bob', 2);
+create materialized view bin_v as select handle collate binary as handle, v from bin_src;
+
+-- Both case-variants survive: 'Bob' and 'bob' are distinct under the published
+-- BINARY key. A NOCASE re-key (the historic implicit-default reconcile) would have
+-- collapsed them to one row (or rejected the fill as "not a set").
+select count(*) as n from bin_v;
+→ [{"n":2}]
+select handle, v from bin_v order by v;
+→ [{"handle":"Bob","v":1},{"handle":"bob","v":2}]
+
+-- A genuinely-implicit (default-collation) MV column keeps the historic behavior:
+-- no explicit stamp, so the store applies its table-level default. Pin the
+-- value-level result (collation-agnostic) so the case runs identically cross-module.
+create table plain_src (id integer primary key, label text);
+insert into plain_src values (1, 'Xyz'), (2, 'abc');
+create materialized view plain_v as select id, label from plain_src;
+select id, label from plain_v order by id;
+→ [{"id":1,"label":"Xyz"},{"id":2,"label":"abc"}]

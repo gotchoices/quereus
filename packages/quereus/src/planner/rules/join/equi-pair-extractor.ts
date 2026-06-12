@@ -131,20 +131,29 @@ export function combineResidual(
  * Returns null if no equi-pairs are found.
  *
  * **Collation gate.** A `l = r` column pair is recognized only when both
- * columns contribute the same collation. The physical join algorithms this
- * extraction feeds (hash / merge / bloom) resolve the pair's comparison
- * collation themselves (left-operand precedence in their emitters), while the
- * canonical scalar comparison (`emitComparisonOp`, used by the nested-loop
- * fallback) resolves right-first — for an asymmetric pair (NOCASE column vs
- * BINARY column) the two would *disagree on the result rows*, and the join's
- * key-coverage claims (left keys survive when pairs cover a right key) would
- * be computed against whichever collation the algorithm happened to use. A
- * matched-collation pair is immune to resolution order, and its coverage
- * claims are sound (comparison collation = covered column's declared
- * collation = its key's enforcement collation). Mismatched pairs demote to
- * the residual, where the canonical scalar comparison evaluates them; if no
- * matched pair remains, the rule doesn't fire and the generic join evaluates
- * the whole condition. (Ticket `collation-blind-equality-fact-extraction`.)
+ * columns contribute the same collation. Every physical join algorithm this
+ * extraction feeds (hash / merge / bloom) now resolves the pair's comparison
+ * collation through the SAME provenance lattice as the canonical scalar
+ * comparison (`resolveComparisonCollation` — symmetric, so the result no longer
+ * depends on which side the algorithm reads first; ticket
+ * `join-key-collation-resolution-alignment`). So the historical
+ * resolution-order disagreement is gone — but the gate is **deliberately kept
+ * conservative** for a second, independent reason: a *merge* join also requires
+ * both inputs physically ordered under the key's comparison collation, and the
+ * physical ordering property (`PhysicalProperties.ordering`) is collation-blind
+ * (`{column, desc}` only) — a column's advertised ordering is implicitly under
+ * its OWN declared collation. Admitting an asymmetric pair (declared NOCASE vs
+ * defaulted BINARY → resolves NOCASE) would compare under NOCASE a side sorted
+ * under BINARY, silently breaking the merge. Requiring matched collations keeps
+ * the resolved key collation equal to each input's declared sort collation, so
+ * the merge stays sound without the ordering property having to carry collation.
+ * Loosening this gate is therefore an optimization gated on teaching the planner
+ * ordering to track collation end-to-end — out of scope here. Mismatched pairs
+ * demote to the residual, where the canonical scalar comparison (right-first but
+ * via the same lattice) evaluates them; if no matched pair remains, the rule
+ * doesn't fire and the generic join evaluates the whole condition. (Tickets
+ * `collation-blind-equality-fact-extraction`,
+ * `join-key-collation-resolution-alignment`.)
  */
 export function extractEquiPairs(
 	condition: ScalarPlanNode | undefined,

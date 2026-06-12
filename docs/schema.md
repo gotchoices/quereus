@@ -315,7 +315,13 @@ points:
   undecorated text PK keeps the store's historical NOCASE-keyed behavior; an *explicit*
   `COLLATE` clause — even one diverging from K — is left exactly as declared and keyed
   under it. (The explicit-vs-implicit distinction rides on `ColumnSchema.collationExplicit`,
-  set by `columnDefToSchema` only for a `COLLATE` clause.) Non-text PK columns (e.g.
+  set by `columnDefToSchema` for a `COLLATE` clause, and — for a **materialized-view backing
+  column** — by `deriveBackingShape` (`materialized-view-helpers.ts`) when the body output
+  column's collation provenance is `explicit` or `declared`. So an MV whose key column
+  publishes a deliberate collation — an explicit `collate …` projection or a passthrough of
+  a declared-collation source column — is keyed under that published collation across the
+  reconcile, while a genuinely-implicit MV column keeps the store-default reconcile, exactly
+  like an undecorated base-table PK.) Non-text PK columns (e.g.
   `integer primary key`) keep their declared collation — collation governs key bytes only
   for text.
 - **Load path (`connect` / rehydrate).** The load path does **not** reconcile — the

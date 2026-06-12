@@ -6,8 +6,9 @@ import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
+import { compareSqlValuesFast } from '../../util/comparison.js';
 import type { CollationFunction } from '../../util/comparison.js';
+import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:merge-join');
@@ -64,8 +65,19 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 		}
 		leftIndices.push(li);
 		rightIndices.push(ri);
-		const collationName = leftAttributes[li].type.collationName || rightAttributes[ri].type.collationName;
-		collations.push(collationName ? ctx.resolveCollation(collationName) : BINARY_COLLATION);
+		// Resolve the pair's comparison collation through the shared provenance
+		// lattice (explicit > declared > default > BINARY) so a merge key compares
+		// identically to the same `l.k = r.k` under any other join algorithm and the
+		// nested-loop fallback. Throws on an explicit/declared conflict — a loud
+		// backstop: `equi-pair-extractor`'s matched-collation gate keeps
+		// conflicting/asymmetric pairs out of the merge path (LOCKSTEP: the merge
+		// algorithm also needs both inputs sorted under THIS collation, and the
+		// physical ordering property is collation-blind — the gate is what makes the
+		// resolved key collation equal each input's declared sort collation; see the
+		// gate's docstring in equi-pair-extractor.ts), so this is unreachable for
+		// legitimately-admitted pairs.
+		const collationName = effectiveCollationOfTypes(leftAttributes[li].type, rightAttributes[ri].type);
+		collations.push(ctx.resolveCollation(collationName));
 	}
 
 	const rightColCount = rightAttributes.length;

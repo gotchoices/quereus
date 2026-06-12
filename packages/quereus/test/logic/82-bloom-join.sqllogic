@@ -100,6 +100,24 @@ SELECT l.id, r.id FROM bj_nocase_l l JOIN bj_nocase_r r ON l.name = r.name ORDER
 SELECT l.id, l.name, r.id AS rid FROM bj_nocase_l l LEFT JOIN bj_nocase_r r ON l.name = r.name ORDER BY l.id;
 → [{"id":1,"name":"Alice","rid":10},{"id":2,"name":"Bob","rid":20},{"id":3,"name":"Charlie","rid":null}]
 
+-- Asymmetric collation (ticket join-key-collation-resolution-alignment): left
+-- defaults to BINARY, right declares NOCASE. The matched-collation gate demotes the
+-- asymmetric pair out of the bloom path (kept conservative — the physical ordering
+-- property is collation-blind), so this runs as a nested loop, but the comparison
+-- still resolves to NOCASE via the shared lattice — IDENTICAL result to the
+-- symmetric bloom join above. Mirror spelling: the old left-first key normalizer
+-- would have built/probed under BINARY and missed the case-variant matches.
+CREATE TABLE bj_mix_l (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE bj_mix_r (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+INSERT INTO bj_mix_l VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+INSERT INTO bj_mix_r VALUES (10, 'alice'), (20, 'BOB'), (30, 'Dave');
+
+SELECT l.id, r.id FROM bj_mix_l l JOIN bj_mix_r r ON l.name = r.name ORDER BY l.id;
+→ [{"id":1,"id:1":10},{"id":2,"id:1":20}]
+
+DROP TABLE bj_mix_l;
+DROP TABLE bj_mix_r;
+
 -- Cleanup
 DROP TABLE bj_left;
 DROP TABLE bj_right;

@@ -82,3 +82,62 @@ select cn_a.id as aid, cn_a.name as aname, cn_b.id as bid from cn_a join cn_b us
 
 drop table cn_a;
 drop table cn_b;
+-- run
+
+-- ===== USING collation precedence (both spellings) + conflict =====
+-- (ticket join-key-collation-resolution-alignment) A USING pair resolves its
+-- comparison collation through the shared provenance lattice
+-- (explicit > declared > default > BINARY), SYMMETRICALLY: a declared NOCASE on
+-- EITHER side governs the join regardless of which side spells it, matching the
+-- equivalent `l.name = r.name`. Fixtures are chosen so BINARY yields 0 matches
+-- and NOCASE yields 3 — the row count alone pins which collation is in effect.
+
+-- Left declares NOCASE, right defaults to BINARY → NOCASE wins (folds case).
+create table up_l (id integer primary key, name text collate nocase);
+create table up_r (id integer primary key, name text);
+insert into up_l values (1, 'Alice'), (2, 'BOB'), (3, 'carol');
+insert into up_r values (10, 'alice'), (20, 'bob'), (30, 'CAROL');
+select up_l.id as lid, up_r.id as rid from up_l join up_r using (name) order by up_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":20},{"lid":3,"rid":30}]
+
+-- Mirror spelling: left defaults to BINARY, right declares NOCASE → still NOCASE.
+-- The pre-alignment left-only rule (`leftType ?? BINARY`) would have compared
+-- under BINARY here and matched nothing; the symmetric lattice folds case.
+create table um_l (id integer primary key, name text);
+create table um_r (id integer primary key, name text collate nocase);
+insert into um_l values (1, 'Alice'), (2, 'BOB'), (3, 'carol');
+insert into um_r values (10, 'alice'), (20, 'bob'), (30, 'CAROL');
+select um_l.id as lid, um_r.id as rid from um_l join um_r using (name) order by um_l.id;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":20},{"lid":3,"rid":30}]
+
+drop table up_l;
+drop table up_r;
+drop table um_l;
+drop table um_r;
+-- run
+
+-- Conflicting DECLARED collations on a USING pair → plan-time ambiguous-collation
+-- error, raised at build (USING pairs never become BinaryOpNodes, so the new
+-- join-build validation must catch them). The spelled-out ON form must error
+-- IDENTICALLY (uniformity between USING and ON).
+create table cf_a (id integer primary key, name text collate nocase);
+create table cf_b (id integer primary key, name text collate rtrim);
+insert into cf_a values (1, 'bob');
+insert into cf_b values (10, 'BOB');
+-- run
+
+select cf_a.id from cf_a join cf_b using (name);
+-- error: ambiguous collation
+
+select cf_a.id from cf_a join cf_b on cf_a.name = cf_b.name;
+-- error: ambiguous collation
+
+-- An explicit COLLATE on the comparison resolves the ambiguity (rank-3 explicit
+-- outranks both declared collations), so the same join builds and runs. USING has
+-- no per-column COLLATE syntax, so pin the resolution via the ON form: under the
+-- explicit NOCASE, 'bob' matches 'BOB'.
+select cf_a.id as aid, cf_b.id as bid from cf_a join cf_b on cf_a.name = cf_b.name collate nocase order by cf_a.id;
+→ [{"aid":1,"bid":10}]
+
+drop table cf_a;
+drop table cf_b;

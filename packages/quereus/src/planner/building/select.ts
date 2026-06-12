@@ -19,6 +19,7 @@ import { CTEReferenceNode } from '../nodes/cte-reference-node.js';
 import { InternalRecursiveCTERefNode as _InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import type { CTEScopeNode, CTEPlanNode } from '../nodes/cte-node.js';
 import { JoinNode, type ExistenceColumnSpec } from '../nodes/join-node.js';
+import { resolveComparisonCollation, collationConflictError } from '../analysis/comparison-collation.js';
 import { EXISTENCE_FLAG_TYPE } from '../nodes/join-utils.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { TEXT_TYPE } from '../../types/builtin-types.js';
@@ -663,6 +664,7 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 		// Convert USING to ON condition: table1.col1 = table2.col1 AND table1.col2 = table2.col2 ...
 		// For now, store the column names and let the emitter handle the condition
 		// TODO: This could be improved by synthesizing the equality conditions here
+		validateUsingCollations(usingColumns, leftNode, rightNode);
 	}
 
 	// Existence (`exists … as`) flags: mint a stable attribute id per clause (once,
@@ -701,4 +703,35 @@ function buildJoin(joinClause: AST.JoinClause, parentContext: PlanningContext, c
 	parentContext.outputScopes.set(joinNode, columnScope);
 
 	return joinNode;
+}
+
+/**
+ * Plan-time USING (and, when supported, NATURAL) collation-conflict check. USING
+ * column pairs never materialize as a `BinaryOpNode`, so `BinaryOpNode.generateType`'s
+ * lattice validation — which covers spelled-out ON-clause equi-joins — never sees
+ * them, yet every USING comparator (the nested-loop join's, and the merge/bloom
+ * key collations once `equi-pair-extractor` admits the pair) resolves each pair
+ * through the SAME provenance lattice. Run the resolver here so a `using (c)` over
+ * columns with conflicting explicit/declared collations raises the identical
+ * ambiguous-collation error as the equivalent `l.c = r.c`, at plan time rather
+ * than only as the emitter's loud backstop. A NATURAL join (not yet parsed)
+ * desugars to USING pairs and inherits this check for free.
+ */
+function validateUsingCollations(
+	usingColumns: readonly string[],
+	leftNode: RelationalPlanNode,
+	rightNode: RelationalPlanNode,
+): void {
+	const leftAttrs = leftNode.getAttributes();
+	const rightAttrs = rightNode.getAttributes();
+	for (const colName of usingColumns) {
+		const lower = colName.toLowerCase();
+		const leftAttr = leftAttrs.find(a => a.name.toLowerCase() === lower);
+		const rightAttr = rightAttrs.find(a => a.name.toLowerCase() === lower);
+		// A USING column missing from a side is a name-resolution error surfaced
+		// elsewhere (the join's column scope); skip rather than mask it here.
+		if (!leftAttr || !rightAttr) continue;
+		const resolution = resolveComparisonCollation(leftAttr.type, rightAttr.type);
+		if (resolution.kind === 'conflict') throw collationConflictError(resolution);
+	}
 }

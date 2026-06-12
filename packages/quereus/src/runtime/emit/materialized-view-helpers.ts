@@ -105,16 +105,30 @@ function deriveBackingShapeUnguarded(
 		? explicitColumns
 		: bodyColumns.map((c, i) => c.name || `col${i}`);
 
-	const columns: ColumnSchema[] = bodyColumns.map((c, i) => ({
-		name: names[i] ?? `col${i}`,
-		logicalType: c.type.logicalType,
-		notNull: c.type.nullable === false,
-		primaryKey: false,
-		pkOrder: 0,
-		defaultValue: null,
-		collation: c.type.collationName ?? 'BINARY',
-		generated: false,
-	}));
+	const columns: ColumnSchema[] = bodyColumns.map((c, i) => {
+		const col: ColumnSchema = {
+			name: names[i] ?? `col${i}`,
+			logicalType: c.type.logicalType,
+			notNull: c.type.nullable === false,
+			primaryKey: false,
+			pkOrder: 0,
+			defaultValue: null,
+			collation: c.type.collationName ?? 'BINARY',
+			generated: false,
+		};
+		// Thread the output collation's PROVENANCE into backing-column explicitness:
+		// a deliberately-collated output column (an explicit `COLLATE`, or a column
+		// whose declared collation flows through unchanged) publishes an EXPLICIT
+		// backing collation, so the store module's PK-collation reconcile keeps the
+		// backing text PK under the published collation instead of re-keying it under
+		// the store default (NOCASE). A 'default'/absent source stays implicit (field
+		// left unset — matching ColumnSchema's "absent ⇒ implicit" contract), so a
+		// genuinely-implicit MV column preserves the historical store-default keying.
+		if (c.type.collationSource === 'explicit' || c.type.collationSource === 'declared') {
+			col.collationExplicit = true;
+		}
+		return col;
+	});
 
 	// First usable key from the unified surface. A keyless body is then offered the
 	// coarsened lineage key (the parallel-migration shape — see coarsened-key.ts):

@@ -1166,7 +1166,7 @@ The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from A
 - **Complexity**: O(n + m) vs O(n × m) for nested loop
 - **Supports**: INNER, LEFT, SEMI, and ANTI joins with equi-predicates
 - **Null handling**: Null keys are never inserted into the hash map (SQL null != null semantics)
-- **Collation awareness**: Key serialization normalizes string values according to column collation (e.g., NOCASE → toLowerCase, RTRIM → trimEnd)
+- **Collation awareness**: Each equi-pair's key normalizer is resolved through the shared comparison-collation lattice (`resolveComparisonCollation` — explicit > declared > default > BINARY, **symmetric**), so build- and probe-side keys normalize identically and agree with the merge/nested-loop comparators (e.g., NOCASE → toLowerCase, RTRIM → trimEnd). The `equi-pair-extractor` matched-collation gate keeps asymmetric/conflicting pairs out of the hash path (they demote to the residual); a same-rank explicit/declared conflict reaching the emitter throws as a loud backstop.
 - **Residual conditions**: Non-equi parts of the ON clause are evaluated as a residual filter after hash lookup
 - **Side selection**: For INNER JOINs, the smaller input is the build side; for LEFT/SEMI/ANTI JOINs, the left side is always the probe side to preserve semantics
 - **Semi join**: Emits left row on first match, producing at most one output per left row (used for EXISTS decorrelation)
@@ -1183,7 +1183,7 @@ Selected when both inputs are already sorted on the equi-join columns (or when s
 - **Sort insertion**: The optimizer detects existing ascending ordering via `PlanNodeCharacteristics.getOrdering()` and inserts `SortNode`s only when inputs aren't already sorted on the equi-pair columns
 - **Duplicate key runs**: Correctly produces cross-product of matching runs when both sides have duplicate key values
 - **Null handling**: NULL keys never match (consistent with SQL null != null semantics)
-- **Collation awareness**: Uses per-column collation functions for key comparisons
+- **Collation awareness**: Each equi-pair's key comparator is resolved through the same shared lattice as bloom/nested-loop. Because the physical ordering property (`PhysicalProperties.ordering`) is collation-blind, merge correctness depends on both inputs being sorted under the resolved collation — the `equi-pair-extractor` matched-collation gate (both operands' collation names must agree) is the lockstep that guarantees the resolved key collation equals each input's declared sort collation, so the gate is deliberately kept conservative even though the resolver could resolve some asymmetric pairs cleanly.
 
 **Cost model** (from `src/planner/cost/index.ts`):
 - Merge join: `(leftRows + rightRows) × 0.3` + sort costs if needed
