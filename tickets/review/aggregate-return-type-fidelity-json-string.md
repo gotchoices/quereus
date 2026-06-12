@@ -68,3 +68,8 @@ maintained-table round-trip and the pre-existing json_group logic tests (06, 24,
 25, 27.3, 80 — all green), but no test asserts the JSON type's `validate` hook
 directly; `string_concat` returns `''` (not NULL) for an all-non-string group —
 pre-existing behavior, left untouched, nullable declaration is conservative.
+
+NOTE for reviewer: the code diff (json.ts, string.ts, 06.6-aggregate-extended.sqllogic)
+was swept into commit 8ceaf398 ("ticket(plan): cross-source-unqualified-nested-subquery-scope")
+by a concurrent runner commit; the commit named "ticket(implement): aggregate-return-type-fidelity-json-string"
+(6531e773) carries only this ticket file.
