@@ -167,6 +167,61 @@ insert into acc_ok values (2, 'nope');
 drop table acc_ok;
 drop table acp_ok;
 
+-- =============================================================================
+-- 8.2. ALTER TABLE ADD CONSTRAINT with foreign_keys ON: the conflict is caught
+--      by the declaration-time PRE-validation (which runs BEFORE the module's
+--      existing-row scan), so it surfaces as `conflicting collations` regardless
+--      of the pragma state — NOT the enforcement-seam `ambiguous collation`
+--      error the FK-ON existing-row query plan would otherwise raise. Locks the
+--      cross-pragma message consistency the prevalidation reorder introduced
+--      (§ 8 already pins the FK-OFF message). Empty child, so the existing-row
+--      scan finds no orphan — the collation pre-check is the rejecting mechanism.
+-- =============================================================================
+
+pragma foreign_keys = true;
+
+create table acp_on (k text collate rtrim primary key);
+create table acc_on (id integer primary key, ref text collate nocase);
+alter table acc_on add constraint fk_on foreign key (ref) references acp_on(k);
+-- error: conflicting collations
+drop table acc_on;
+drop table acp_on;
+
+-- =============================================================================
+-- 8.3. Self-referencing ADD CONSTRAINT FK: a conflict against the SAME table's
+--      PK column is rejected at ALTER time (the validator resolves the parent
+--      against the already-registered table). Mirrors § 6 on the ADD CONSTRAINT
+--      path, where the table — unlike at CREATE — is already in the catalog.
+-- =============================================================================
+
+create table self_ac (
+    code text collate nocase primary key,
+    parent_code text collate rtrim
+);
+alter table self_ac add constraint fk_self foreign key (parent_code) references self_ac(code);
+-- error: conflicting collations
+drop table self_ac;
+
+-- =============================================================================
+-- 8.4. Multi-column ADD CONSTRAINT FK: a conflict on ANY one pair rejects, even
+--      when the other pairs agree. Mirrors § 7 on the ADD CONSTRAINT path.
+-- =============================================================================
+
+create table mpa_parent (
+    a text collate nocase,
+    b text collate nocase,
+    primary key (a, b)
+);
+create table mpa_child (
+    id integer primary key,
+    fa text collate nocase,
+    fb text collate rtrim
+);
+alter table mpa_child add constraint fk_multi foreign key (fa, fb) references mpa_parent(a, b);
+-- error: conflicting collations
+drop table mpa_child;
+drop table mpa_parent;
+
 pragma foreign_keys = false;
 
 -- =============================================================================
