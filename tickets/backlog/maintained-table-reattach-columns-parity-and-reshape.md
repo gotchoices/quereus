@@ -10,6 +10,18 @@ files:
 
 # Re-attach: implicit-shape columns parity + reshape limitation
 
+> **Update (post `mv-table-form-implicit-columns-roundtrip`):** the canonical
+> table form now carries a lossless `maintained [(columns)]` rename-list clause
+> (presence ⇒ explicit/arity-locked, absence ⇒ implicit/reshape-on-reopen);
+> persist and import round-trip `derivation.columns` faithfully through it, and
+> the attach verb's explicit recording is pinned by
+> `maintained-table-attach-detach.spec.ts` (attach → persist → reopen is an
+> explicit fixed point — no longer "permanently diverging"). §1 below is
+> therefore no longer a round-trip bug, only the create-vs-attach
+> representation inconsistency that keeps the differ's dual-hash tolerance
+> alive; any §1 fix must either keep the verb explicit or update those pins
+> deliberately.
+
 Surfaced while landing ticket 6.3 (maintained-table differ transitions). The
 declarative differ now treats every maintained-table body change as a re-attach
 (`alter table … set maintained as <body>`). Two properties of the re-attach
