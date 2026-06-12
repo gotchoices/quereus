@@ -67,7 +67,11 @@ describe('MV rename propagation: derived fields and events', () => {
 			expect(mv.derivation.bodyHash, 'body hash follows the rewritten body').to.not.equal(hashBefore);
 			const ddl = generateMaintainedTableDDL(mv);
 			expect(ddl.toLowerCase(), 'regenerated DDL names the new table').to.include('t2');
-			expect(parse(ddl).type, 'regenerated DDL re-parses').to.equal('createMaterializedView');
+			// The unified model's canonical form is `create table … maintained as`, which
+			// re-parses as a createTable carrying a maintained clause (not the MV sugar).
+			const reparsed = parse(ddl);
+			expect(reparsed.type, 'regenerated DDL re-parses').to.equal('createTable');
+			expect((reparsed as { maintained?: unknown }).maintained, 'as a maintained table').to.not.equal(undefined);
 
 			const modified = events.filter(e => e.type === 'materialized_view_modified');
 			expect(modified, 'one materialized_view_modified (the store re-persist trigger)').to.have.length(1);
