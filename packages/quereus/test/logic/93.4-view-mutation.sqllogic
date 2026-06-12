@@ -990,6 +990,28 @@ update uq15_v set note = 'HIT' where exists (select 1 from uq15_allow where k = 
 select cid, note from uq15_c order by cid;
 → [{"cid":1,"note":"HIT"},{"cid":2,"note":"b"},{"cid":3,"note":"HIT"}]
 
+-- (uq-16) LOUD-OVER-SILENT on an unresolvable lineage scope: a SAME-side computed view
+-- column (`pc`, reading only `cval`) whose base-term lineage contains a correlated
+-- subquery over a `select *` source — its columns are not statically resolvable, so the
+-- injection-time side-qualify (makeSideQualifyScope, unresolvableScope: 'reject') cannot
+-- prove the lineage's correlation refs are not shadowed by that source and REJECTS rather
+-- than substitute unqualified (a potential silent mis-bind, the prior behaviour). Mirrors
+-- the single-source makeBaseQualifyScope reject policy. Same-side keeps the cross-source
+-- computed-read gate from firing first, isolating the substitution-time reject.
+create table uq16_p (pid integer primary key, pv integer);
+create table uq16_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq16_p(pid));
+create table uq16_aux (a integer);
+insert into uq16_p values (10, 100);
+insert into uq16_c values (1, 10, 1);
+insert into uq16_aux values (1);
+create view uq16_v as
+    select c.cid as cid, cval,
+           (select a from (select * from uq16_aux) s where s.a = cval) as pc
+    from uq16_c c join uq16_p p on p.pid = c.pref;
+update uq16_v set cval = pc where cid = 1;
+-- error: source columns are not statically resolvable
+
 -- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
 -- order the base deletes FK-child before FK-parent. The canonical columnar split has each
 -- member's PK reference the anchor's (axd_b, axd_c -> axd_a); deleting the parent first
