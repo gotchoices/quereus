@@ -206,13 +206,11 @@ drop table base2;
 
 -- an aggregate body attaches too: the strict shape check holds over the
 -- derived aggregate types/key, and incremental maintenance runs post-attach.
--- (count(*) derives REAL nullable — the declared shape must say what the body
--- derives, quirks included.)
 create table words (id integer primary key, w text not null);
 insert into words values (1, 'x'), (2, 'y'), (3, 'x');
 -- the PK column pins `collate binary` so the declared collation matches the
 -- body-derived one under both suites (the store's key collation defaults to NOCASE)
-create table counts (w text not null collate binary primary key, n real null);
+create table counts (w text not null collate binary primary key, n integer not null);
 alter table counts set maintained as select w, count(*) as n from words group by w;
 select * from counts order by w;
 → [{"w":"x","n":2},{"w":"y","n":1}]

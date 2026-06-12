@@ -705,7 +705,7 @@
                 "arguments": [],
                 "function": "COUNT",
                 "isDistinct": false,
-                "resultType": "REAL"
+                "resultType": "INTEGER"
               },
               "nodeType": "ScalarFunctionCall",
               "op": "SCALARFUNCTIONCALL",
@@ -802,7 +802,7 @@
           "logical": {
             "attributeId": 8,
             "column": "employee_count",
-            "resultType": "REAL"
+            "resultType": "INTEGER"
           },
           "nodeType": "ColumnReference",
           "op": "COLUMNREFERENCE",
