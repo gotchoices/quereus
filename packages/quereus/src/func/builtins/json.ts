@@ -10,6 +10,7 @@ import { createLogger } from '../../common/logger.js';
 import type { SqlValue, JSONValue } from '../../common/types.js';
 import { createScalarFunction, createAggregateFunction } from '../registration.js';
 import { coerceToJsonValue, resolveJsonPathForModify, prepareJsonValue, deepCopyJson, getJsonType } from './json-helpers.js';
+import { JSON_TYPE } from '../../types/json-type.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
 import type { Instruction, InstructionRun, RuntimeContext } from '../../runtime/types.js';
@@ -434,7 +435,7 @@ export const jsonRemoveFunc = createScalarFunction(
 
 // json_group_array(value) — returns native array
 export const jsonGroupArrayFunc = createAggregateFunction(
-	{ name: 'json_group_array', numArgs: 1, initialValue: [] },
+	{ name: 'json_group_array', numArgs: 1, initialValue: [], returnType: { typeClass: 'scalar', logicalType: JSON_TYPE, nullable: true, isReadOnly: true } },
 	(acc: JSONValue[], value: SqlValue): JSONValue[] => {
 		acc.push(prepareJsonValue(value));
 		return acc;
@@ -446,7 +447,7 @@ export const jsonGroupArrayFunc = createAggregateFunction(
 
 // json_group_object(name, value) — returns native object
 export const jsonGroupObjectFunc = createAggregateFunction(
-	{ name: 'json_group_object', numArgs: 2, initialValue: {} },
+	{ name: 'json_group_object', numArgs: 2, initialValue: {}, returnType: { typeClass: 'scalar', logicalType: JSON_TYPE, nullable: true, isReadOnly: true } },
 	(acc: Record<string, JSONValue>, name: SqlValue, value: SqlValue): Record<string, JSONValue> => {
 		if (name === null || name === undefined) {
 			return acc;

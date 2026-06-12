@@ -256,7 +256,7 @@ export const splitStringFunc = createTableValuedFunction(
 
 // String concatenation aggregate (like GROUP_CONCAT but simpler)
 export const stringConcatFunc = createAggregateFunction(
-	{ name: 'string_concat', numArgs: 1, initialValue: [] },
+	{ name: 'string_concat', numArgs: 1, initialValue: [], returnType: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true } },
 	(acc: string[], value: SqlValue) => {
 		if (typeof value === 'string') {
 			acc.push(value);
