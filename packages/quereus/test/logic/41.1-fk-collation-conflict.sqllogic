@@ -141,6 +141,32 @@ drop table acc;
 drop table acp;
 
 -- =============================================================================
+-- 8.1. ALTER TABLE ADD CONSTRAINT, matching collations: a text FK whose child
+--      and parent declare the SAME collation is NOT falsely rejected — the
+--      validator only fires on a same-rank conflict. Proves the ALTER-time
+--      check leaves valid declarations alone (regression guard for the
+--      reference-based new-FK selection) and the added FK is live/enforced.
+-- =============================================================================
+
+pragma foreign_keys = true;
+
+create table acp_ok (k text collate nocase primary key);
+create table acc_ok (id integer primary key, ref text collate nocase);
+alter table acc_ok add constraint fk_ok foreign key (ref) references acp_ok(k);
+insert into acp_ok values ('ABC');
+-- case-variant child satisfied under the shared NOCASE collation (FK enforced).
+insert into acc_ok values (1, 'abc');
+select count(*) as cnt from acc_ok;
+→ [{"cnt":1}]
+-- a value with no case-folded parent is still rejected.
+insert into acc_ok values (2, 'nope');
+-- error:
+drop table acc_ok;
+drop table acp_ok;
+
+pragma foreign_keys = false;
+
+-- =============================================================================
 -- 9. ALTER TABLE ADD COLUMN (column-level FK): a conflicting FK on the added
 --    column is rejected, and the column is NOT added — the validate-before-swap
 --    revert drops it, leaving the table untouched.
@@ -156,6 +182,22 @@ select * from alc;
 → [{"id":1}]
 drop table alc;
 drop table alp;
+
+-- =============================================================================
+-- 9.1. ALTER TABLE ADD COLUMN, matching collations: a column-level FK whose
+--      added column matches the parent collation is NOT rejected — the column
+--      IS added (the validate-before-swap region only reverts on a conflict).
+-- =============================================================================
+
+create table alp_ok (k text collate nocase primary key);
+create table alc_ok (id integer primary key);
+alter table alc_ok add column ref text collate nocase null references alp_ok(k);
+-- The column was added: both `id` and `ref` are present.
+insert into alc_ok (id, ref) values (1, null);
+select * from alc_ok;
+→ [{"id":1,"ref":null}]
+drop table alc_ok;
+drop table alp_ok;
 
 -- =============================================================================
 -- 10. Forward-declared parent residual: when the parent does not yet exist at
