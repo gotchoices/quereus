@@ -238,3 +238,35 @@ select count(*) as n from mz;
 → [{"n":2}]
 select count(*) as n from vz;
 → [{"n":2}]
+
+-- ===================================
+-- 11. a CHECK referencing OLD/NEW row images is rejected at registration:
+-- a derived row has no OLD image (a transition CHECK would be vacuous) and
+-- NEW is the row itself (expressible unqualified)
+-- ===================================
+
+create table osrc (id integer primary key, v integer not null);
+create table mo (id integer primary key, v integer not null, check on update (new.v > old.v)) maintained as select id, v from osrc;
+-- error: references OLD/NEW row images
+
+-- the failed create left the name free
+create table mo (id integer primary key);
+drop table mo;
+
+-- the attach form rejects too, restoring the plain table (still writable,
+-- and its qualified CHECK still enforces on user DML)
+create table mo2 (id integer primary key, v integer not null, check (new.v > 0));
+alter table mo2 set maintained as select id, v from osrc;
+-- error: references OLD/NEW row images
+insert into mo2 values (1, 5);
+insert into mo2 values (2, -1);
+-- error: CHECK constraint failed
+select count(*) as n from mo2;
+→ [{"n":1}]
+
+-- a delete-only CHECK with image qualifiers is exempt (never fires on
+-- derivation writes)
+create table mo3 (id integer primary key, v integer not null, check on delete (old.v < 100)) maintained as select id, v from osrc;
+insert into osrc values (1, 500);
+select count(*) as n from mo3;
+→ [{"n":1}]

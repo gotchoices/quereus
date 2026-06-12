@@ -756,7 +756,10 @@ async function resolveAttachConnection(db: Database, host: BackingHost, qualifie
  * The scan is a plain table read of the backing (a maintained table resolves
  * through the ORDINARY table path in `building/select.ts` — never a
  * re-derivation), observing the pending reconcile writes through the registered
- * attach connection (reads-own-writes).
+ * attach connection (reads-own-writes). An `old.`/`new.`-qualified CHECK —
+ * which this SQL scan could not resolve — was already rejected at registration
+ * (`buildDerivedRowValidator`), which runs before this validation on every
+ * create/attach path.
  *
  * Declared-constraint folding: the optimizer trusts a declared CHECK / FK as a
  * proven invariant (`ruleFilterContradiction` / `ruleAntiJoinFkEmpty`), and —

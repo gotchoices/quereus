@@ -64,8 +64,8 @@ import { Scheduler } from '../runtime/scheduler.js';
 import { createRowSlot } from '../runtime/context-helpers.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import type { RuntimeContext } from '../runtime/types.js';
-import type { Row, SqlValue } from '../common/types.js';
-import type { QuereusError } from '../common/errors.js';
+import { StatusCode, type Row, type SqlValue } from '../common/types.js';
+import { QuereusError } from '../common/errors.js';
 import { expressionToString } from '../emit/ast-stringify.js';
 
 /** One compiled declared constraint over a single derived row image. */
@@ -95,6 +95,24 @@ export interface DerivedRowConstraintValidator {
 	 *  (OLD = indices `0..n-1`, NEW = `n..2n-1`). */
 	readonly flatRowDescriptor: RowDescriptor;
 	readonly checks: ReadonlyArray<CompiledDerivedRowCheck>;
+}
+
+/**
+ * True when the expression tree contains a column reference qualified `old.` /
+ * `new.` (case-insensitive). A structural walk over the plain-data AST graph so
+ * no node kind is missed; deliberately conservative — a subquery source the
+ * user aliased `old`/`new` also matches, which is acceptable for a gate whose
+ * only job is a clear diagnostic on an unsupported constraint shape.
+ */
+function referencesRowImageQualifier(node: unknown): boolean {
+	if (Array.isArray(node)) return node.some(referencesRowImageQualifier);
+	if (node === null || typeof node !== 'object') return false;
+	const rec = node as Record<string, unknown>;
+	if (rec.type === 'column' && rec.schema === undefined && typeof rec.table === 'string') {
+		const qualifier = (rec.table as string).toLowerCase();
+		if (qualifier === 'old' || qualifier === 'new') return true;
+	}
+	return Object.values(rec).some(referencesRowImageQualifier);
 }
 
 /** Fresh single-purpose planning context for compiling constraint expressions
@@ -155,6 +173,20 @@ export function buildDerivedRowValidator(db: Database, mv: MaintainedTableSchema
 	const declaredChecks: Array<{ constraint: RowConstraintSchema; origIndex: number }> = [];
 	mv.checkConstraints.forEach((constraint, origIndex) => {
 		if ((constraint.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) !== 0) {
+			// A derived row image has no OLD section (it is always all-NULL) and its
+			// NEW section is just the row — an `old.`/`new.`-qualified CHECK is
+			// either vacuous or expressible unqualified, and the bulk SQL-scan
+			// validation cannot resolve the qualifiers at all. Reject at
+			// registration so create/attach fails with a clear, sited diagnostic
+			// (instead of a binding error from the bulk scan).
+			if (referencesRowImageQualifier(constraint.expr)) {
+				throw new QuereusError(
+					`CHECK constraint '${constraint.name ?? `_check_${origIndex}`}' on maintained table `
+						+ `'${mv.schemaName}.${mv.name}' references OLD/NEW row images — a derived row has no `
+						+ `OLD image and NEW is the row itself; rewrite the constraint over plain column names`,
+					StatusCode.ERROR,
+				);
+			}
 			declaredChecks.push({ constraint, origIndex });
 		}
 	});
