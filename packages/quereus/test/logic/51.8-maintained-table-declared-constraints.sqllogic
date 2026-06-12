@@ -1,0 +1,240 @@
+-- 51.8-maintained-table-declared-constraints.sqllogic — declared CHECK and
+-- child-side FK constraints on a `create table … maintained as` table are
+-- validated against the rows the DERIVATION writes: the create-fill, the
+-- attach/re-attach reconcile, and steady-state row-time maintenance. The
+-- writing statement fails with a diagnostic attributed to the maintained
+-- table (the statement itself targeted a different table). A `delete` delta
+-- writes no row image and is never CHECK-validated.
+
+-- ===================================
+-- 1. create-fill validates declared CHECK (bulk scan), rolls back cleanly
+-- ===================================
+
+create table src (id integer primary key, v text not null);
+insert into src values (1, 'bad');
+
+create table mt (id integer primary key, v text not null check (v <> 'bad')) maintained as select id, v from src;
+-- error: row derived into maintained table 'main.mt'
+
+-- the failed create left nothing behind: the name is free for a plain create
+create table mt (id integer primary key);
+drop table mt;
+
+-- ===================================
+-- 2. steady-state maintenance validates the delta (insert and update images)
+-- ===================================
+
+update src set v = 'ok' where id = 1;
+create table mt (id integer primary key, v text not null check (v <> 'bad')) maintained as select id, v from src;
+
+insert into src values (2, 'bad');
+-- error: row derived into maintained table 'main.mt'
+
+-- the violating source statement rolled back whole
+select count(*) as n from src;
+→ [{"n":1}]
+select * from mt order by id;
+→ [{"id":1,"v":"ok"}]
+
+-- a derived UPDATE image is validated too
+insert into src values (2, 'fine');
+update src set v = 'bad' where id = 2;
+-- error: row derived into maintained table 'main.mt'
+select v from mt where id = 2;
+→ [{"v":"fine"}]
+
+-- deletes write no row image: removing a source row never CHECK-validates
+delete from src where id = 2;
+select count(*) as n from mt;
+→ [{"n":1}]
+
+-- conforming maintenance still flows
+insert into src values (3, 'good');
+select count(*) as n from mt;
+→ [{"n":2}]
+
+-- ===================================
+-- 3. child-side FK existence: create-fill, steady state, MATCH SIMPLE, pragma
+-- ===================================
+
+create table parent (pid integer primary key);
+insert into parent values (1);
+create table csrc (id integer primary key, ref integer null);
+insert into csrc values (10, 2);
+
+-- create-fill: a derived row referencing a missing parent fails the create
+create table mfk (id integer primary key, ref integer null references parent(pid)) maintained as select id, ref from csrc;
+-- error: row derived into maintained table 'main.mfk' references a missing 'main.parent'
+
+update csrc set ref = 1 where id = 10;
+create table mfk (id integer primary key, ref integer null references parent(pid)) maintained as select id, ref from csrc;
+
+-- MATCH SIMPLE: a NULL FK column is admitted regardless of parent presence
+insert into csrc values (11, null);
+select count(*) as n from mfk;
+→ [{"n":2}]
+
+-- steady state: an orphan-producing source write fails (deferred to the
+-- statement's autocommit, exactly as on an ordinary table)
+insert into csrc values (12, 99);
+-- error: row derived into maintained table 'main.mfk' references a missing 'main.parent'
+select count(*) as n from csrc;
+→ [{"n":2}]
+
+-- pragma off: the orphan is admitted (FK evaluation is gated at eval time)
+pragma foreign_keys = false;
+insert into csrc values (13, 77);
+select count(*) as n from mfk;
+→ [{"n":3}]
+
+-- pragma back on: the NEW delta validates; the pre-existing orphan (13) is
+-- NOT retro-validated (matches ordinary tables — no retro-check on pragma flip)
+pragma foreign_keys = true;
+insert into csrc values (14, 88);
+-- error: row derived into maintained table 'main.mfk' references a missing 'main.parent'
+delete from csrc where id = 13;
+
+-- ===================================
+-- 4. subquery-bearing CHECK defers to commit with maintained-table attribution
+-- ===================================
+
+create table quota (k integer primary key, lim integer not null);
+insert into quota values (1, 1);
+create table qsrc (id integer primary key, n integer not null);
+insert into qsrc values (1, 1);
+
+create table mq (id integer primary key, n integer not null check (n <= (select lim from quota where k = 1))) maintained as select id, n from qsrc;
+
+insert into qsrc values (2, 5);
+-- error: row derived into maintained table 'main.mq'
+select count(*) as n from qsrc;
+→ [{"n":1}]
+
+-- ===================================
+-- 5. CHECK op-mask collapse: a derived row image is neither a user INSERT nor
+-- UPDATE, so any CHECK touching insert|update applies to every written image
+-- ===================================
+
+create table usrc (id integer primary key, v text not null);
+create table mu (id integer primary key, v text not null check on update (v <> 'nope')) maintained as select id, v from usrc;
+-- an `on update` CHECK fires on a derived INSERT image
+insert into usrc values (1, 'nope');
+-- error: row derived into maintained table 'main.mu'
+
+create table isrc (id integer primary key, v text not null);
+insert into isrc values (1, 'fine');
+create table mi (id integer primary key, v text not null check on insert (v <> 'nope')) maintained as select id, v from isrc;
+-- an `on insert` CHECK fires on a derived UPDATE image
+update isrc set v = 'nope' where id = 1;
+-- error: row derived into maintained table 'main.mi'
+
+-- a delete-only CHECK never applies to derivation writes
+create table dsrc (id integer primary key, v text not null);
+create table md (id integer primary key, v text not null check on delete (v <> 'x')) maintained as select id, v from dsrc;
+insert into dsrc values (1, 'x');
+select count(*) as n from md;
+→ [{"n":1}]
+
+-- ===================================
+-- 6. attach / re-attach reconcile validation
+-- ===================================
+
+-- a violating PRE-EXISTING row the derivation does not reproduce is simply
+-- deleted by the derived-wins reconcile and never validated. (It slipped in
+-- via an op-masked `check on update`, which user INSERT does not evaluate.)
+create table b1 (id integer primary key, v text not null);
+insert into b1 values (1, 'ok');
+create table tgt (id integer primary key, v text not null check on update (v <> 'stale-bad'));
+insert into tgt values (1, 'ok'), (9, 'stale-bad');
+alter table tgt set maintained as select id, v from b1;
+select * from tgt order by id;
+→ [{"id":1,"v":"ok"}]
+
+-- a derivation that REPRODUCES a violator fails the attach (the op-mask
+-- collapse validates the derived image against the on-update CHECK too)
+alter table tgt drop maintained;
+create table b2 (id integer primary key, v text not null);
+insert into b2 values (9, 'stale-bad');
+alter table tgt set maintained as select id, v from b2;
+-- error: row derived into maintained table 'main.tgt'
+
+-- the failed attach left the table plain and intact
+insert into tgt values (2, 'still writable');
+select count(*) as n from tgt;
+→ [{"n":2}]
+
+-- re-attach failure restores the PRIOR derivation (and its row-time plan)
+create table a1 (id integer primary key, v text not null);
+insert into a1 values (1, 'good');
+create table a2 (id integer primary key, v text not null);
+insert into a2 values (1, 'evil');
+create table mr (id integer primary key, v text not null check (v <> 'evil')) maintained as select id, v from a1;
+alter table mr set maintained as select id, v from a2;
+-- error: row derived into maintained table 'main.mr'
+select * from mr;
+→ [{"id":1,"v":"good"}]
+-- the prior derivation is still live: an a1 write maintains mr
+insert into a1 values (2, 'more');
+select count(*) as n from mr;
+→ [{"n":2}]
+
+-- ===================================
+-- 7. MV-over-MV cascade: each level validates with its OWN evaluator
+-- ===================================
+
+create table base (id integer primary key, v text not null);
+insert into base values (1, 'ok');
+create table mt1 (id integer primary key, v text not null) maintained as select id, v from base;
+create table mt2 (id integer primary key, v text not null check (v <> 'poison')) maintained as select id, v from mt1;
+
+insert into base values (2, 'poison');
+-- error: row derived into maintained table 'main.mt2'
+select count(*) as n from base;
+→ [{"n":1}]
+select count(*) as n from mt2;
+→ [{"n":1}]
+
+-- ===================================
+-- 8. full-rebuild floor: the rebuild diff validates once at the statement flush
+-- ===================================
+
+-- (integer PK: a text PK would collate NOCASE under the store backend and fail
+-- the attach shape check before validation is ever reached)
+create table fsrc (id integer primary key, n integer not null);
+insert into fsrc values (1, 10);
+-- DISTINCT falls to the full-rebuild arm
+create table mfr (n integer not null primary key check (n < 100)) maintained as select distinct n from fsrc;
+
+insert into fsrc values (2, 500), (3, 20);
+-- error: row derived into maintained table 'main.mfr'
+select count(*) as n from fsrc;
+→ [{"n":1}]
+select * from mfr order by n;
+→ [{"n":10}]
+
+-- ===================================
+-- 9. detach: every committed row already satisfies the constraints, which
+-- become user-enforced — no stranded violators
+-- ===================================
+
+alter table mt drop maintained;
+update mt set v = 'bad' where id = 1;
+-- error: CHECK constraint failed
+update mt set v = 'still ok' where id = 1;
+select v from mt where id = 1;
+→ [{"v":"still ok"}]
+
+-- ===================================
+-- 10. zero-overhead regression: constraint-less maintained tables and the
+-- MV sugar behave exactly as before
+-- ===================================
+
+create table z (id integer primary key, v text not null);
+insert into z values (1, 'zz');
+create table mz (id integer primary key, v text not null) maintained as select id, v from z;
+create materialized view vz as select id, v from z;
+insert into z values (2, 'yy');
+select count(*) as n from mz;
+→ [{"n":2}]
+select count(*) as n from vz;
+→ [{"n":2}]

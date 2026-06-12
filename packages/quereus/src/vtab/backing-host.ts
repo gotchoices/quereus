@@ -52,6 +52,19 @@
  * programmatic `update()` calls on the backing by an embedder are the same trust
  * level as holding this privileged surface and are out of engine scope.
  *
+ * ## Constraint validation — engine-owned
+ *
+ * The privileged surface re-validates nothing structural: `applyMaintenance` /
+ * `replaceContents` write rows as given (PK identity aside) with no UNIQUE /
+ * CHECK / FK evaluation. Declared CHECK and child-side FK constraints on a
+ * maintained table are validated by the **engine** at the maintenance
+ * boundary: the attach core's bulk scan over the reconciled contents
+ * (create-fill / attach — `validateDeclaredConstraintsOverContents` in
+ * `runtime/emit/materialized-view-helpers.ts`) and the per-row derived-row
+ * validator over each maintenance delta (`core/derived-row-validator.ts`,
+ * applied by the maintenance manager before the cascade). A host module
+ * implements none of this itself.
+ *
  * ## Concurrency
  *
  * The engine adds no latching around the privileged surface: each host owns

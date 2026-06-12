@@ -21,7 +21,7 @@ import { resolveReferencedColumns, opsToMask } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
-import { quoteIdentifier } from '../emit/ast-stringify.js';
+import { quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import { createLogger } from '../common/logger.js';
 import { columnSchemaToScalarType } from '../planner/type-utils.js';
 import { resolveComparisonCollation } from '../planner/analysis/comparison-collation.js';
@@ -205,6 +205,90 @@ function qualifyRelation(schemaName: string, tableName: string): string {
 	return `${prefix}${quoteIdentifier(tableName)}`;
 }
 
+/* ──────────────── maintained-table derived-row attribution ────────────────
+ * A maintained table's rows are written by its derivation, so a declared
+ * CHECK / FK violation surfaces on a statement that targeted a DIFFERENT table
+ * (a source write, or the create/attach statement). These two helpers produce
+ * the table-attributed diagnostic both validation mechanisms share — the bulk
+ * SQL-scan validators (create-fill / attach reconcile) and the per-row
+ * maintenance evaluator (`core/derived-row-validator.ts`). The leading
+ * `CHECK constraint failed:` / `FOREIGN KEY constraint failed:` prefixes are
+ * load-bearing: existing assertions and downstream consumers key off them
+ * (see `runtime/emit/constraint-check.ts`). */
+
+/** Attributed CHECK diagnostic for a row the derivation wrote into a maintained table. */
+export function maintainedTableCheckViolationError(
+	schemaName: string,
+	tableName: string,
+	constraintName: string,
+	exprHint?: string,
+): QuereusError {
+	const hint = exprHint && exprHint.length <= 60 ? ` (${exprHint})` : '';
+	return new QuereusError(
+		`CHECK constraint failed: ${constraintName}${hint} — row derived into maintained table `
+			+ `'${schemaName}.${tableName}' violates its declared constraint`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
+/** Attributed child-side FK diagnostic for a row the derivation wrote into a maintained table. */
+export function maintainedTableFkViolationError(
+	schemaName: string,
+	tableName: string,
+	constraintName: string,
+	parentSchemaName: string,
+	parentTableName: string,
+): QuereusError {
+	return new QuereusError(
+		`FOREIGN KEY constraint failed: ${constraintName} — row derived into maintained table `
+			+ `'${schemaName}.${tableName}' references a missing '${parentSchemaName}.${parentTableName}'`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
+/**
+ * Validates a table's EXISTING (effective, pending-over-committed) rows against
+ * each CHECK in `checks`, throwing on the first violating row. The table-wide
+ * sibling of the ADD-COLUMN backfill scan (`validateBackfillAgainstChecks` in
+ * `runtime/emit/alter-table.ts`): one `select 1 from <t> where not (<expr>)
+ * limit 1` scan per CHECK, so the NULL-pass rule falls out of SQL semantics
+ * (`not NULL` is NULL — the row is not a violation). A subquery-bearing CHECK
+ * is just SQL here; the scan reads final pending state.
+ *
+ * CAUTION — declared-constraint folding: the optimizer trusts a DECLARED CHECK
+ * as a proven domain invariant, so if the LIVE catalog entry for `tableSchema`
+ * still declares the CHECK being validated, `ruleFilterContradiction` folds the
+ * `where not (<expr>)` scan to EmptyRelation and the validation vacuously
+ * passes. Callers must scan against a live record that does NOT declare the
+ * constraints under validation (see the stripped-schema swap in
+ * `runtime/emit/materialized-view-helpers.ts`, mirroring the ADD COLUMN
+ * intermediate-schema discipline).
+ */
+export async function validateChecksOverExistingRows(
+	db: Database,
+	tableSchema: TableSchema,
+	checks: ReadonlyArray<RowConstraintSchema>,
+	onViolation?: (check: RowConstraintSchema, exprSql: string) => QuereusError,
+): Promise<void> {
+	const tableRef = qualifyRelation(tableSchema.schemaName, tableSchema.name);
+	for (const check of checks) {
+		const exprSql = expressionToString(check.expr);
+		const sql = `select 1 from ${tableRef} where not (${exprSql}) limit 1`;
+		log('CHECK existing-row validation for %s.%s: %s', tableSchema.schemaName, tableSchema.name, sql);
+		const stmt = db.prepare(sql);
+		try {
+			for await (const _row of stmt._iterateRowsRaw()) {
+				throw onViolation?.(check, exprSql) ?? new QuereusError(
+					`CHECK constraint failed: ${check.name ?? exprSql} — existing rows in '${tableSchema.name}' violate the constraint`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		} finally {
+			await stmt.finalize();
+		}
+	}
+}
+
 /**
  * Validates every existing CHILD row against a newly-added FOREIGN KEY,
  * throwing `StatusCode.CONSTRAINT` if any row references a non-existent parent.
@@ -219,11 +303,20 @@ function qualifyRelation(schemaName: string, tableName: string): string {
  * parent table is absent, no fully-non-NULL child row can be satisfied, so any
  * such row is an orphan (mirrors the child-side builder's null-guards-only
  * fallback in `planner/building/foreign-key-builder.ts`).
+ *
+ * `onViolation` overrides the default diagnostic — the maintained-table
+ * derivation validator threads its table-attributed message through here.
+ * Note the declared-constraint folding caveat on
+ * {@link validateChecksOverExistingRows}: if the live child record already
+ * declares this FK (it does NOT on the ADD COLUMN / ADD CONSTRAINT paths, but
+ * DOES on the maintained-table path), the caller must scan against a
+ * constraint-stripped record or `ruleAntiJoinFkEmpty` folds the anti-join away.
  */
 export async function validateForeignKeyOverExistingRows(
 	db: Database,
 	childSchema: TableSchema,
 	fk: ForeignKeyConstraintSchema,
+	onViolation?: () => QuereusError,
 ): Promise<void> {
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
@@ -271,6 +364,7 @@ export async function validateForeignKeyOverExistingRows(
 	const stmt = db.prepare(sql);
 	try {
 		for await (const _row of stmt._iterateRowsRaw()) {
+			if (onViolation) throw onViolation();
 			const colNames = fk.columns.map(idx => childSchema.columns[idx].name).join(', ');
 			throw new QuereusError(
 				`FOREIGN KEY constraint failed: ${childSchema.name} (${colNames}) has rows referencing a missing '${fk.referencedTable}'`,

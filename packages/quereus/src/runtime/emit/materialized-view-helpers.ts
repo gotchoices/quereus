@@ -9,7 +9,13 @@ import { keysOf } from '../../planner/util/fd-utils.js';
 import { proveCoverage } from '../../planner/analysis/coverage-prover.js';
 import { deriveCoarsenedBackingKey, type CoarsenedBackingKey } from '../../planner/analysis/coarsened-key.js';
 import type { ColumnSchema } from '../../schema/column.js';
-import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule } from '../../schema/table.js';
+import { type TableSchema, type PrimaryKeyColumnDefinition, buildColumnIndexMap, requireVtabModule, RowOpFlag } from '../../schema/table.js';
+import {
+	validateChecksOverExistingRows,
+	validateForeignKeyOverExistingRows,
+	maintainedTableCheckViolationError,
+	maintainedTableFkViolationError,
+} from '../../schema/constraint-builder.js';
 import type { CoarsenedKeyInfo } from '../../schema/view.js';
 import { computeBodyHash } from '../../schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from '../../schema/derivation.js';
@@ -461,6 +467,12 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 	try {
 		const rows: Row[] = await collectBodyRows(db, def.bodySql);
 		const host = resolveBackingHost(db, completeBacking);
+		// `replaceContents` runs NO derived-row constraint validation: this caller's
+		// backing is the MV-sugar shape (`buildBackingTableSchema` hard-codes empty
+		// checkConstraints and carries no foreignKeys), so there is nothing to
+		// validate. A future maintained-table path adopting `replaceContents` must
+		// add the declared-constraint validation the attach core runs
+		// (`validateDeclaredConstraintsOverContents`).
 		await host.replaceContents(rows, () => materializedViewNotASetError(def.schemaName, def.viewName));
 	} catch (e) {
 		// Roll back: drop the table, do not attach a derivation.
@@ -729,6 +741,60 @@ async function resolveAttachConnection(db: Database, host: BackingHost, qualifie
 }
 
 /**
+ * Bulk derived-row constraint validation for the attach paths (create-fill and
+ * attach/re-attach reconcile): after the `'replace-all'` reconcile lands the
+ * derived row set in the connection's pending layer, scan the table's EFFECTIVE
+ * (pending-over-committed) contents against every declared CHECK whose op-mask
+ * intersects INSERT | UPDATE (the derived-row op-mask collapse — a derived row's
+ * presence is neither a user INSERT nor UPDATE, see docs/materialized-views.md)
+ * and every declared child-side FK (pragma-gated inside the FK validator,
+ * MATCH SIMPLE). Post-reconcile contents are exactly the derived set, so this
+ * validates every row the table will hold — which is also why detach can never
+ * strand a violator. Zero overhead when nothing is declared (every MV-sugar
+ * backing: `buildBackingTableSchema` hard-codes empty constraints).
+ *
+ * The scan is a plain table read of the backing (a maintained table resolves
+ * through the ORDINARY table path in `building/select.ts` — never a
+ * re-derivation), observing the pending reconcile writes through the registered
+ * attach connection (reads-own-writes).
+ *
+ * Declared-constraint folding: the optimizer trusts a declared CHECK / FK as a
+ * proven invariant (`ruleFilterContradiction` / `ruleAntiJoinFkEmpty`), and —
+ * unlike the ALTER ADD paths — the constraints under validation are already on
+ * the LIVE record here. So the live record is swapped for a constraint-stripped
+ * clone for the duration of the scans (the ADD COLUMN intermediate-schema
+ * discipline, see `runtime/emit/alter-table.ts`), then restored.
+ */
+async function validateDeclaredConstraintsOverContents(db: Database, mt: MaintainedTableSchema): Promise<void> {
+	const applicableChecks = mt.checkConstraints.filter(
+		c => (c.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) !== 0);
+	const fks = mt.foreignKeys ?? [];
+	if (applicableChecks.length === 0 && fks.length === 0) return;
+
+	const schema = db.schemaManager.getSchemaOrFail(mt.schemaName);
+	const stripped: MaintainedTableSchema = { ...mt, checkConstraints: Object.freeze([]), foreignKeys: undefined };
+	schema.addTable(stripped);
+	try {
+		await validateChecksOverExistingRows(db, mt, applicableChecks, (check, exprSql) =>
+			maintainedTableCheckViolationError(
+				mt.schemaName, mt.name,
+				check.name ?? `_check_${mt.checkConstraints.indexOf(check)}`,
+				exprSql,
+			));
+		for (const fk of fks) {
+			await validateForeignKeyOverExistingRows(db, mt, fk, () =>
+				maintainedTableFkViolationError(
+					mt.schemaName, mt.name,
+					fk.name ?? `_fk_${mt.name}`,
+					fk.referencedSchema ?? mt.schemaName, fk.referencedTable,
+				));
+		}
+	} finally {
+		schema.addTable(mt);
+	}
+}
+
+/**
  * The attach core shared by `alter table … set maintained as` (fresh attach and
  * re-attach) and `create table … maintained as` (attach-to-empty, via
  * {@link createMaintainedTable}): verify-by-diff, never trust, never refill
@@ -865,6 +931,10 @@ export async function attachMaintainedDerivation(
 		const host = resolveBackingHost(db, maintained);
 		const conn = await resolveAttachConnection(db, host, `${schemaName}.${name}`);
 		changes = await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
+		// Declared CHECK / child-side FK over the reconciled (derived) row set —
+		// inside this try so a violation restores the prior record; the pending
+		// reconcile writes roll back with the failing statement.
+		await validateDeclaredConstraintsOverContents(db, maintained);
 	} catch (e) {
 		restorePrior();
 		throw e;
@@ -1040,6 +1110,15 @@ export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): P
 		);
 	}
 	const host = resolveBackingHost(db, backing);
+	// `replaceContents` swaps COMMITTED contents and runs NO derived-row constraint
+	// validation. For the MV-sugar shape there is nothing declared to validate; a
+	// table-form maintained table CAN carry declared CHECK/FK here (manual
+	// `refresh materialized view`), but every row the refresh recomputes was
+	// validated when it entered via the maintenance boundary, so a refresh of a
+	// continuously-maintained table re-derives an already-validated set. The one
+	// residual gap is a STALE table whose plan was released (source writes landed
+	// unvalidated while detached from maintenance) — re-validation of that refresh
+	// is tracked as `maintained-table-refresh-revalidation` (backlog).
 	await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
 }
 

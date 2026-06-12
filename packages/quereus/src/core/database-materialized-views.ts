@@ -63,6 +63,7 @@ import {
 	type MaintenanceStrategy,
 } from '../planner/cost/index.js';
 import { resolveBackingHost } from '../runtime/emit/materialized-view-helpers.js';
+import { buildDerivedRowValidator, validateDerivedRowImage, type DerivedRowConstraintValidator } from './derived-row-validator.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import type { BackingHost, BackingRowChange, MaintenanceOp } from '../vtab/backing-host.js';
@@ -180,6 +181,13 @@ interface MaintenancePlanCommon {
 	/** Create-time cost inputs (StatsProvider + forward optimizer), retained so the DML
 	 *  boundary can re-cost residual vs. rebuild against the actual changeCardinality. */
 	sourceStats: MaintenanceSourceStats;
+	/** Compiled declared-CHECK/FK validator over derived row images — present ONLY
+	 *  when the maintained table declares ≥1 applicable CHECK or ≥1 FK (the
+	 *  zero-overhead gate: MV-sugar backings and constraint-less maintained tables
+	 *  carry `undefined` and pay nothing per write). Built once at registration
+	 *  ({@link MaterializedViewManager.registerMaterializedView}); applied to each
+	 *  insert/update {@link BackingRowChange} before the cascade. */
+	derivedRowValidator?: DerivedRowConstraintValidator;
 }
 
 export interface InverseProjectionPlan extends MaintenancePlanCommon {
@@ -521,6 +529,12 @@ export class MaterializedViewManager {
 		mv.derivation.sourceScope = buildSourceUnionScope(mv.derivation.sourceTables);
 		this.releaseRowTime(key);
 		const plan = this.buildMaintenancePlan(mv); // throws on ineligible shape
+		// Compile the declared-CHECK/FK derived-row validator (undefined when the
+		// table declares nothing — the zero-overhead gate). Built here, inside the
+		// registration the create/attach paths roll back on throw, so a constraint
+		// that cannot compile (e.g. a non-deterministic CHECK without the pragma)
+		// errors cleanly at create time.
+		plan.derivedRowValidator = buildDerivedRowValidator(this.ctx as unknown as Database, mv);
 		this.rowTime.set(key, plan);
 		// Index the plan under every source base it reads. Single-source arms index
 		// under `sourceBase` only; the 1:1-join arm also indexes under the lookup base
@@ -649,6 +663,14 @@ export class MaterializedViewManager {
 			}
 			const backingChanges = await this.applyMaintenancePlan(plan, change, changedBase, cache);
 			if (backingChanges.length === 0) continue;
+			// Declared CHECK / child-side FK over the rows this delta wrote — BEFORE
+			// cascading, so a consumer never consumes an invalid producer row. Every
+			// row already in the backing was validated when it entered (the bulk
+			// validation at create/attach seeds the induction), so only the delta is
+			// validated. No-op (`undefined`) for a constraint-less table.
+			if (plan.derivedRowValidator) {
+				await this.validateDerivedChanges(plan, plan.derivedRowValidator, backingChanges, cache);
+			}
 			const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 			if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
 			this.assertCascadeDepth(depth + 1, backingBase);
@@ -702,6 +724,13 @@ export class MaterializedViewManager {
 				if (!plan || plan.kind !== 'full-rebuild') continue;
 				const backingChanges = await this.applyFullRebuild(plan, cache);
 				if (backingChanges.length === 0) continue;
+				// Validate the rebuild diff's written images at the flush boundary —
+				// the full-rebuild analogue of the per-row validation in
+				// {@link maintainRowTime} (deferred-rebuild semantics preserved: a bulk
+				// source write fails once at end-of-statement, not per source row).
+				if (plan.derivedRowValidator) {
+					await this.validateDerivedChanges(plan, plan.derivedRowValidator, backingChanges, cache);
+				}
 				const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 				if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
 				for (const bc of backingChanges) {
@@ -864,6 +893,39 @@ export class MaterializedViewManager {
 		const host = this.backingHost(backing);
 		const connection = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
 		return host.applyMaintenance(connection, ops);
+	}
+
+	/**
+	 * Validate the row images a maintenance apply WROTE (insert/update
+	 * {@link BackingRowChange}s — a delete writes no image) against the plan's
+	 * compiled {@link DerivedRowConstraintValidator}. Inline checks abort the
+	 * writing statement with the maintained-table-attributed CONSTRAINT error;
+	 * auto-deferred checks (subquery CHECK, every child-side FK) queue to the
+	 * deferred-constraint queue and validate at commit. Deferred entries are
+	 * pinned to the backing connection the maintenance write used (resolved from
+	 * the per-statement cache, or re-resolved deterministically — the same
+	 * connection either way) so commit-time evaluation reads the same pending
+	 * state, mirroring the DML pipeline's active-connection capture.
+	 */
+	private async validateDerivedChanges(
+		plan: MaintenancePlan,
+		validator: DerivedRowConstraintValidator,
+		changes: readonly BackingRowChange[],
+		cache?: BackingConnectionCache,
+	): Promise<void> {
+		let connectionId: string | undefined;
+		if (validator.checks.some(c => c.needsDeferred)) {
+			const backing = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
+			if (backing) {
+				const host = this.backingHost(backing);
+				const conn = await this.getBackingConnection(host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+				connectionId = conn.connectionId;
+			}
+		}
+		for (const change of changes) {
+			if (change.op === 'delete') continue;
+			await validateDerivedRowImage(this.ctx as unknown as Database, validator, change.newRow, connectionId);
+		}
 	}
 
 	/**
