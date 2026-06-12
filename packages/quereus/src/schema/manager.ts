@@ -91,6 +91,70 @@ export interface ImportCatalogOptions {
 }
 
 /**
+ * The normalized input to {@link SchemaManager.importMaterializedView}, built from
+ * EITHER the `create materialized view …` sugar OR the canonical
+ * `create table … maintained as …` table form (the unified-model persistence /
+ * export form). Both authoring surfaces re-materialize through the one import core.
+ */
+interface MaintainedTableImportSpec {
+	/** Raw schema from the identifier (canonicalized inside the importer). */
+	schemaName: string | undefined;
+	/** The maintained table's (and MV's) name. */
+	name: string;
+	/** Derivation body — any relation-producing QueryExpr. */
+	select: AST.QueryExpr;
+	/**
+	 * Output-column names: the MV-sugar rename list (`mv(a, b)`), or — for the
+	 * table form, whose declared columns ARE the backing shape — the declared
+	 * column names. Per the unified model, a sugar MV's renamed columns become
+	 * the table's declared column names, so both round-trip to the same shape.
+	 */
+	columns: ReadonlyArray<string> | undefined;
+	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
+	/** Backing-host module from a `using <module>(...)` clause; absent ⇒ memory default. */
+	moduleName?: string;
+	moduleArgs?: Record<string, SqlValue>;
+	tags?: Record<string, SqlValue>;
+}
+
+/** Build the import spec from the `create materialized view` sugar form. */
+function maintainedImportFromMvStmt(stmt: AST.CreateMaterializedViewStmt): MaintainedTableImportSpec {
+	return {
+		schemaName: stmt.view.schema,
+		name: stmt.view.name,
+		select: stmt.select,
+		columns: stmt.columns,
+		insertDefaults: stmt.insertDefaults,
+		moduleName: stmt.moduleName,
+		moduleArgs: stmt.moduleArgs,
+		tags: stmt.tags,
+	};
+}
+
+/**
+ * Build the import spec from the canonical `create table … maintained as …` form
+ * (the unified-model persistence / export form). The declared columns are the
+ * backing shape, so their names become the derivation's output-column list — the
+ * inverse of the sugar's rename-into-declared normalization. (Known gap: the table
+ * form cannot distinguish an implicit `select *` body from an explicit rename list,
+ * so an implicit MV whose source shape drifted between sessions arity-errors on
+ * reopen instead of reshaping — see ticket `mv-table-form-implicit-columns-roundtrip`.)
+ */
+function maintainedImportFromTableStmt(stmt: AST.CreateTableStmt): MaintainedTableImportSpec {
+	const maintained = stmt.maintained!;
+	return {
+		schemaName: stmt.table.schema,
+		name: stmt.table.name,
+		select: maintained.select,
+		columns: stmt.columns.map(c => c.name),
+		insertDefaults: maintained.insertDefaults,
+		moduleName: stmt.moduleName,
+		moduleArgs: stmt.moduleArgs,
+		tags: stmt.tags,
+	};
+}
+
+/**
  * A per-key tag mutation descriptor consumed by {@link SchemaManager.mutateTagRecord}:
  * `merge` overlays keys onto the current set, `drop` removes listed keys (atomically).
  */
@@ -2509,7 +2573,18 @@ export class SchemaManager {
 		const results: Array<{ type: 'table' | 'index' | 'view' | 'materializedView'; name: string }> = [];
 		for (const stmt of statements) {
 			if (stmt.type === 'createTable') {
-				results.push(await this.importTable(stmt as AST.CreateTableStmt));
+				const createTable = stmt as AST.CreateTableStmt;
+				// Unified model: a maintained table persists/exports as the canonical
+				// `create table … maintained as <body>` form (see generateMaintainedTableDDL).
+				// That re-parses as a createTable carrying a `maintained` clause, so route
+				// it through the same re-materialize/adopt path as the MV sugar — the plain
+				// `importTable` connect path would try (and fail) to reconnect an ephemeral
+				// backing that was never persisted.
+				if (createTable.maintained) {
+					results.push(await this.importMaterializedView(maintainedImportFromTableStmt(createTable), options));
+				} else {
+					results.push(await this.importTable(createTable));
+				}
 			} else if (stmt.type === 'createIndex') {
 				results.push(await this.importIndex(stmt as AST.CreateIndexStmt));
 			} else if (stmt.type === 'createView') {
@@ -2520,7 +2595,7 @@ export class SchemaManager {
 				// data, row-time maintenance re-registered) — silent like the other arms.
 				// Under `options.trustBackings` a pre-existing durable backing that
 				// passes every adopt gate is adopted without the refill.
-				results.push(await this.importMaterializedView(stmt as AST.CreateMaterializedViewStmt, options));
+				results.push(await this.importMaterializedView(maintainedImportFromMvStmt(stmt as AST.CreateMaterializedViewStmt), options));
 			} else if (stmt.type === 'alterIndex') {
 				// Tag re-application on an already-imported object — no result entry.
 				this.applyImportedIndexTags(stmt as AST.AlterIndexStmt);
@@ -2627,19 +2702,19 @@ export class SchemaManager {
 	 * MV refills through {@link materializeView}. Only import ever adopts —
 	 * create and refresh are unchanged.
 	 */
-	private async importMaterializedView(stmt: AST.CreateMaterializedViewStmt, options?: ImportCatalogOptions): Promise<{ type: 'materializedView'; name: string }> {
+	private async importMaterializedView(spec: MaintainedTableImportSpec, options?: ImportCatalogOptions): Promise<{ type: 'materializedView'; name: string }> {
 		// Canonical stored schemaName (see canonicalSchemaName) — the schema itself
 		// is created below, after the DML-body gate.
-		const targetSchemaName = this.canonicalSchemaName(stmt.view.schema || this.getCurrentSchemaName());
-		const viewName = stmt.view.name;
+		const targetSchemaName = this.canonicalSchemaName(spec.schemaName || this.getCurrentSchemaName());
+		const viewName = spec.name;
 
 		// A DML body (insert/update/delete … returning) parses but is un-creatable —
 		// `planViewBody` rejects it at build time. Reject it here too, BEFORE
 		// materializing: a corrupt or hand-edited catalog entry would otherwise
 		// EXECUTE the mutation against live source tables during rehydrate.
-		if (stmt.select.type === 'insert' || stmt.select.type === 'update' || stmt.select.type === 'delete') {
+		if (spec.select.type === 'insert' || spec.select.type === 'update' || spec.select.type === 'delete') {
 			throw new QuereusError(
-				`${stmt.select.type.toUpperCase()} cannot be used as a materialized view body`,
+				`${spec.select.type.toUpperCase()} cannot be used as a materialized view body`,
 				StatusCode.ERROR,
 			);
 		}
@@ -2652,16 +2727,16 @@ export class SchemaManager {
 		// only when non-default). An unknown or capability-less module throws from
 		// buildBackingTableSchema inside materializeView — the caller records it
 		// as a per-entry rehydration error.
-		const backing = normalizeBackingModule(stmt.moduleName, stmt.moduleArgs);
+		const backing = normalizeBackingModule(spec.moduleName, spec.moduleArgs);
 
 		const def: MaterializeViewDefinition = {
 			schemaName: targetSchemaName,
 			viewName,
-			selectAst: stmt.select,
-			bodySql: astToString(stmt.select),
-			columns: stmt.columns,
-			insertDefaults: stmt.insertDefaults,
-			tags: stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
+			selectAst: spec.select,
+			bodySql: astToString(spec.select),
+			columns: spec.columns,
+			insertDefaults: spec.insertDefaults,
+			tags: spec.tags ? Object.freeze({ ...spec.tags }) : undefined,
 			backingModuleName: backing.storedModuleName,
 			backingModuleArgs: backing.storedModuleArgs,
 		};

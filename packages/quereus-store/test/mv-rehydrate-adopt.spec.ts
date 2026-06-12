@@ -553,7 +553,11 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			const ddls = await mod.loadAllDDL();
 			// The meta marker is filtered out of loadAllDDL — only DDL remains.
 			expect(ddls.every(d => /^create/i.test(d)), 'loadAllDDL returns only DDL').to.equal(true);
-			const isMv = (d: string): boolean => /^create materialized view/i.test(d);
+			// A maintained table persists as the canonical `create table … maintained as`
+			// form (the unified model), so the MV arm matches that clause as well as the
+			// `create materialized view` sugar; the real rehydrateCatalog classifies by
+			// catalog key prefix (loadAllDDL discards the keys this hand-replay lacks).
+			const isMv = (d: string): boolean => /^create materialized view/i.test(d) || /\bmaintained\s+as\b/i.test(d);
 			const isView = (d: string): boolean => /^create view/i.test(d);
 			await db.schemaManager.importCatalog(ddls.filter(d => !isMv(d) && !isView(d)));
 			await db.schemaManager.importCatalog(ddls.filter(isView));
