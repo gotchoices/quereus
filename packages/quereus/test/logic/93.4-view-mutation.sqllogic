@@ -719,12 +719,17 @@ select pid, pv from ax_parent order by pid;
 -- ========================================================================
 -- Cross-source SET / authored read of a partner column projected UNQUALIFIED.
 -- A join-view body may project a partner-side column BARE when the name is
--- unambiguous across the sides. The leftover unqualified base-term ref is resolved
--- to its owning side by UNIQUE column ownership (the exact rule join-condition
--- operands use), and a partner-owned ref rides the IDENTICAL `__vmupd_keys` capture
--- machinery as a qualified `b.y` read — it no longer mis-routes into the owning
--- side's base UPDATE with a generic `Column not found`. The qualified analogues
--- above (ax_jv_x, ax_xscpk_v, xs1n_v, xs1u_v, mj_v) all still hold.
+-- unambiguous across the sides. The bare base-term lineage leaf is resolved to its
+-- owning side by UNIQUE column ownership (the exact rule join-condition operands
+-- use) and SIDE-ALIAS-QUALIFIED when the view-column substitution injects it
+-- (makeSideQualifyScope — the multi-source analog of the single-source
+-- correlation-qualification of substituted terms), so a partner-owned read rides
+-- the IDENTICAL `__vmupd_keys` capture machinery as a qualified `b.y` read — at ANY
+-- nesting depth — instead of mis-routing into the owning side's base UPDATE with a
+-- generic `Column not found`. The qualifier strip itself stays purely syntactic
+-- (qualifier-driven); a bare leaf reaching it is only ever a user-authored
+-- local/unknown name. The qualified analogues above (ax_jv_x, ax_xscpk_v, xs1n_v,
+-- xs1u_v, mj_v) all still hold.
 -- See docs/view-updateability.md § Inner Join, cross-source `set`.
 -- ========================================================================
 
@@ -848,16 +853,16 @@ create view uq8_v as
 update uq8_v set cval = pvc where cid = 1;
 -- error: cannot write through
 
--- (uq-9) SCOPE GUARD: a bare column inside a NESTED value subquery binds to that
--- subquery's OWN from-source, NOT the view sides — even when its name collides with a
--- partner base column. The unqualified-resolution applies only at the TOP LEVEL of the SET
--- value (where a bare column originates from the view body's projection); inside the
--- subquery the scope-unaware descent leaves bare refs alone. Here `psecret` belongs to
--- uq9_t (the subquery FROM), so cval must read 777 (uq9_t.psecret), NOT 888 (the joined
--- parent uq9_p.psecret). `psecret` is deliberately NOT exposed by the view, so it can only
--- be the inner-scope column. Regression for the cross-source-unqualified-body-projection
--- review (mapQueryExprUniform is not scope-aware — a name-resolution decision must not ride
--- it at depth).
+-- (uq-9) SCOPE GUARD: a USER-AUTHORED bare column inside a NESTED value subquery binds to
+-- that subquery's OWN from-source, NOT the view sides — even when its name collides with a
+-- partner base column. `psecret` is deliberately NOT exposed by the view, so the scope-aware
+-- view-column substitution never touches it; and the qualifier strip is purely syntactic —
+-- it strips/routes only ALIAS-QUALIFIED refs (every base-term lineage leaf arrives
+-- side-alias-qualified from the substitution) and never resolves a bare name against the
+-- sides. Here `psecret` belongs to uq9_t (the subquery FROM), so cval must read 777
+-- (uq9_t.psecret), NOT 888 (the joined parent uq9_p.psecret). Regression for the
+-- cross-source-unqualified-body-projection review (a name-resolution decision must not ride
+-- the scope-unaware descent at depth).
 create table uq9_p (pid integer primary key, pv integer, psecret integer);
 create table uq9_c (cid integer primary key, pref integer, cval integer,
     foreign key (pref) references uq9_p(pid));
@@ -870,6 +875,120 @@ create view uq9_v as
 update uq9_v set cval = (select psecret from uq9_t where tid = 1) where cid = 2;
 select cid, cval from uq9_c order by cid;
 → [{"cid":1,"cval":1},{"cid":2,"cval":777}]
+
+-- (uq-10) NESTED cross-source read of a BARE-projected partner column: the view column
+-- `pv` (lineage: bare `pv`, owned by the partner side p) is referenced inside a value
+-- SUBQUERY. The substitution injects the lineage side-alias-qualified (`p.pv`), so the
+-- strip's qualified routing carries it through the `__vmupd_keys` capture at depth —
+-- exactly like a top-level read (uq-1). For cid=2 (joined parent pv=200):
+-- sum(tv) where tv <= 200 → 100 + 150 = 250. Other rows and the partner base unchanged.
+create table uq10_p (pid integer primary key, pv integer);
+create table uq10_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq10_p(pid));
+create table uq10_t (tid integer primary key, tv integer);
+insert into uq10_p values (10, 100), (20, 200);
+insert into uq10_c values (1, 10, 1), (2, 20, 2);
+insert into uq10_t values (1, 100), (2, 150), (3, 300);
+create view uq10_v as
+    select c.cid as cid, cval, pv from uq10_c c join uq10_p p on p.pid = c.pref;
+update uq10_v set cval = (select sum(tv) from uq10_t where tv <= pv) where cid = 2;
+select cid, cval from uq10_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":250}]
+select pid, pv from uq10_p order by pid;
+→ [{"pid":10,"pv":100},{"pid":20,"pv":200}]
+
+-- (uq-11) COMPUTED-lineage collision — the silent-wrong injection-qualification fixes:
+-- the view computes `pc = pv * 2` with `pv` written BARE in the body, and the value
+-- subquery's FROM (uq11_t) ALSO has a `pv` column. The reference `pc` is substituted
+-- (uq11_t has no `pc`, so it is not shadowed), and the injected lineage leaf `pv` must
+-- evaluate against the JOINED PARTNER row (qualified `p.pv`), not re-bind to uq11_t.pv
+-- by innermost-scope rules. For cid=2: pv=200 → pc=400 → max(tv) where tv < 400 = 350.
+-- (A re-bind to uq11_t.pv=5 would compute pc=10 → max(tv) where tv < 10 = null.)
+create table uq11_p (pid integer primary key, pv integer);
+create table uq11_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq11_p(pid));
+create table uq11_t (tid integer primary key, tv integer, pv integer);
+insert into uq11_p values (10, 100), (20, 200);
+insert into uq11_c values (1, 10, 1), (2, 20, 2);
+insert into uq11_t values (1, 50, 5), (2, 350, 5), (3, 500, 5);
+create view uq11_v as
+    select c.cid as cid, cval, (pv * 2) as pc from uq11_c c join uq11_p p on p.pid = c.pref;
+update uq11_v set cval = (select max(tv) from uq11_t where tv < pc) where cid = 2;
+select cid, cval from uq11_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":350}]
+
+-- (uq-12) TAINTED scope: a nested bare reference to a BARE-projected partner view column
+-- under a `select *` subquery source cannot be proven correlated (the source's columns are
+-- not statically resolvable, so shadowing is unprovable) → structured reject, the
+-- multi-source analog of single-source case (f). Previously this shape fell out as a
+-- confusing generic resolution error; the scope-aware substitution now owns the decision.
+create table uq12_p (pid integer primary key, pv integer);
+create table uq12_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq12_p(pid));
+create table uq12_aux (x integer);
+insert into uq12_p values (10, 100);
+insert into uq12_c values (1, 10, 1);
+insert into uq12_aux values (100);
+create view uq12_v as
+    select c.cid as cid, cval, pv from uq12_c c join uq12_p p on p.pid = c.pref;
+update uq12_v set cval = (select s.x from (select * from uq12_aux) as s where s.x = pv) where cid = 1;
+-- error: cannot be proven correlated
+
+-- (uq-13) NESTED 1:many cardinality: the uq-7 shape (owning side p joins TWO children)
+-- with the bare partner read `cv` moved INSIDE a value subquery → still rejected at PLAN
+-- time. The injected lineage arrives qualified (`c.cv`), so the strip's rewrite site —
+-- where the cardinality gate fires — covers the nested read identically to a top-level one.
+create table uq13_p (pid integer primary key, pv integer);
+create table uq13_c (cid integer primary key, pref integer, cv integer,
+    foreign key (pref) references uq13_p(pid));
+create table uq13_t (tid integer primary key, tv integer);
+insert into uq13_p values (10, 100);
+insert into uq13_c values (1, 10, 11), (2, 10, 22);
+insert into uq13_t values (1, 5);
+create view uq13_v as
+    select p.pid as pid, pv, cv from uq13_p p join uq13_c c on c.pref = p.pid;
+update uq13_v set pv = (select tv from uq13_t where tv < cv) where pid = 10;
+-- error: assigned side joins more than one
+-- ...plan-time reject: uq13_p is unchanged.
+select pid, pv from uq13_p order by pid;
+→ [{"pid":10,"pv":100}]
+
+-- (uq-14) ENCAPSULATION GUARD at depth: a nested bare reference to a partner base column
+-- the view does NOT project (`psecret`), absent from the inner FROM too, must FAIL loudly
+-- at build — never silently resolve against the view sides and route through the capture
+-- (that would read a concealed base column through the view). The substitution skips it
+-- (not a view column) and the qualifier-only strip leaves it bare → unresolvable.
+create table uq14_p (pid integer primary key, pv integer, psecret integer);
+create table uq14_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq14_p(pid));
+create table uq14_t (tid integer primary key, tv integer);
+insert into uq14_p values (10, 100, 999);
+insert into uq14_c values (1, 10, 1);
+insert into uq14_t values (1, 5);
+create view uq14_v as
+    select c.cid as cid, cval, pv from uq14_c c join uq14_p p on p.pid = c.pref;
+update uq14_v set cval = (select tv from uq14_t where tv = psecret) where cid = 1;
+-- error: Column not found
+
+-- (uq-15) WHERE-path free fix (the bare-projection analog of single-source case (g)):
+-- the view RENAMES a BARE-projected partner column (`plabel` → `label`), and the user
+-- WHERE references the view column inside an EXISTS whose FROM (uq15_allow) ALSO has a
+-- `plabel` column. The reference `label` is substituted (not shadowed — uq15_allow has no
+-- `label`), and the injected lineage leaf must correlate to the join body (`p.plabel`),
+-- not re-bind to uq15_allow.plabel (which would make the predicate the uncorrelated
+-- 'P10' = 'ZZZ' → no rows updated). Rows joined to parent P10 (cid 1, 3) take the write.
+create table uq15_p (pid integer primary key, plabel text);
+create table uq15_c (cid integer primary key, pref integer, note text,
+    foreign key (pref) references uq15_p(pid));
+create table uq15_allow (k text, plabel text);
+insert into uq15_p values (10, 'P10'), (20, 'P20');
+insert into uq15_c values (1, 10, 'a'), (2, 20, 'b'), (3, 10, 'c');
+insert into uq15_allow values ('P10', 'ZZZ');
+create view uq15_v as
+    select c.cid as cid, note, plabel as label from uq15_c c join uq15_p p on p.pid = c.pref;
+update uq15_v set note = 'HIT' where exists (select 1 from uq15_allow where k = label);
+select cid, note from uq15_c order by cid;
+→ [{"cid":1,"note":"HIT"},{"cid":2,"note":"b"},{"cid":3,"note":"HIT"}]
 
 -- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
 -- order the base deletes FK-child before FK-parent. The canonical columnar split has each

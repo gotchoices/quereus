@@ -204,8 +204,8 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
  * regardless of what the subquery FROM defines. For UPDATE/DELETE the caller passes
  * the lowered target's synthesised collision-proof alias ({@link SELF_ALIAS}), so the
  * qualified term binds the outer row even when the subquery FROM names the view's own
- * base table; INSERT (and the multi-source spine) leaves it at the base table name
- * (no target-row scan to collide with). Default is the bare base table name.
+ * base table; INSERT leaves it at the base table name (no target-row scan to collide
+ * with). Default is the bare base table name.
  *
  * The qualification is **scope-aware and DEEP** (it rides the shared
  * {@link transformScopedExpr} descent over {@link makeBaseQualifyScope}): it
@@ -214,7 +214,8 @@ function normalizeBaseRefs(expr: AST.Expression, aliases: ReadonlySet<string>): 
  * `(select x from oth where fk = id)`), qualifying only the lineage's own
  * correlation refs — a base column not shadowed by the lineage subquery's own FROM
  * — and leaving the lineage's genuinely-local columns alone. The multi-source
- * spine passes no qualifier (its terms are already alias-qualified — `p.label`).
+ * spine has its own analog (`makeSideQualifyScope` in multi-source.ts), which
+ * qualifies a bare lineage leaf with its owning side's alias.
  *
  * Returns a fresh tree (does not mutate the shared `columnMap` entry).
  */
@@ -303,9 +304,10 @@ function makeBaseQualifyScope(baseTable: TableSchema, qualifierName: string = ba
  * correlation-qualifies its base terms (scope-aware and deep — see
  * {@link makeBaseQualifier}) so they bind to the outer (UPDATE/DELETE target) row
  * rather than re-binding to a same-named local source. The single-source rewriters
- * pass it; the multi-source spine passes `undefined` (its base terms are already
- * alias-qualified — `p.label`). `resolve` returns a fresh tree, never the shared
- * `columnMap` entry.
+ * pass it; the multi-source spine passes its side-alias qualifier
+ * (`makeSideQualifyScope`), which qualifies a bare lineage leaf with its owning
+ * side's alias. `resolve` returns a fresh tree, never the shared `columnMap`
+ * entry.
  */
 function makeViewScope(
 	columnMap: ReadonlyMap<string, AST.Expression>,
@@ -355,8 +357,8 @@ function makeViewScope(
  *
  * `baseQualify` is the single-source lowered statement's correlation qualifier
  * (built by {@link makeBaseQualifier} from the base table); the multi-source spine
- * passes `undefined` (its base terms are already alias-qualified — `p.label`). See
- * {@link makeViewScope}.
+ * passes its side-alias qualifier (`makeSideQualifyScope`), which qualifies a bare
+ * lineage leaf with its owning side's alias. See {@link makeViewScope}.
  */
 export function makeViewColumnDescend(
 	ctx: PlanningContext,

@@ -18,7 +18,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
-import { transformExpr, cloneExpr, mapQueryExprUniform, substituteNewRefs } from './scope-transform.js';
+import { transformExpr, cloneExpr, mapQueryExprUniform, substituteNewRefs, transformScopedExpr, type ScopeContext } from './scope-transform.js';
 import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 
 /**
@@ -1501,7 +1501,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// and captured pre-mutation, so a same- or cross-side read resolves uniformly.
 			guardTopLevelScope(asg.value, analysis, view);
 			const npSide = analysis.sides[out.sideIndex];
-			const baseValue = substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view);
+			const baseValue = substituteViewColumns(ctx, asg.value, analysis.viewColToBaseRef, view, analysis.sides);
 			const valAlias = registerCapturedExpr(`neval:${out.sideIndex}:${out.baseColumn.toLowerCase()}`, baseValue);
 			// Matched rows: a per-side UPDATE reading the captured value back, correlated by
 			// the non-preserved side's PK (`buildCapturedKeyPredicate` already filters to
@@ -1565,7 +1565,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// partner side is rewritten to a correlated read of its captured pre-mutation
 			// value (`registerCrossSource`); absent the carrier it is rejected.
 			return stripSideQualifier(
-				substituteViewColumns(ctx, valueViewTerms, analysis.viewColToBaseRef, view),
+				substituteViewColumns(ctx, valueViewTerms, analysis.viewColToBaseRef, view, analysis.sides),
 				view, side, owningSideIndex, analysis.sides, registerCrossSource, gateCrossSourceCardinality,
 			);
 		};
@@ -2193,7 +2193,7 @@ function buildReturningProjection(
 			// re-bind against a base table in the re-query's join body (the same leak
 			// the where/set guard closes). Parity with the single-source RETURNING guard.
 			guardTopLevelScope(rc.expr, analysis, view);
-			const substituted = substituteViewColumns(ctx, rc.expr, analysis.viewColToBaseRef, view);
+			const substituted = substituteViewColumns(ctx, rc.expr, analysis.viewColToBaseRef, view, analysis.sides);
 			// Preserve the user's view spelling as the output name: an explicit alias
 			// wins; a bare column ref keeps its own name; otherwise leave it unnamed.
 			const alias = rc.alias ?? (rc.expr.type === 'column' ? rc.expr.name : undefined);
@@ -2382,7 +2382,7 @@ function buildIdentifyingPredicate(
 	userWhere: AST.Expression | undefined,
 	view: MutableViewLike,
 ): AST.Expression | undefined {
-	const userBase = userWhere ? substituteViewColumns(ctx, userWhere, analysis.viewColToBaseRef, view) : undefined;
+	const userBase = userWhere ? substituteViewColumns(ctx, userWhere, analysis.viewColToBaseRef, view, analysis.sides) : undefined;
 	const bodyWhere = analysis.sel.where ? cloneExpr(analysis.sel.where) : undefined;
 	return combineAnd(userBase, bodyWhere);
 }
@@ -2392,26 +2392,82 @@ function buildIdentifyingPredicate(
  * own name) with their base-term replacement expression. References already
  * qualified by a base alias are left untouched. A view-column reference nested
  * inside a `subquery` / `exists` / `in`-subquery operand is rewritten too, via
- * the scope-aware {@link makeViewColumnDescend} descent — the base-term
- * replacements are alias-qualified (`p.label`), so they correlate correctly to
- * the join body that becomes the FROM of the generated identifying subquery.
- * Hence no `baseQualify` is threaded into the descent (that single-source-only
- * re-qualification would be redundant here, and there is no single base-table
- * correlation name to use against a two-source join body).
+ * the scope-aware {@link makeViewColumnDescend} descent.
+ *
+ * Every injected replacement is **side-alias-qualified** ({@link
+ * makeSideQualifyScope}, threaded both into the top-level substitution and as the
+ * descent's `baseQualify`). A body may legally project a partner column BARE
+ * (`select c.cid as cid, cval, pv from c join p …` — `pv` unambiguous across the
+ * sides), so its lineage leaf arrives unqualified, and an unqualified leaf emitted
+ * inside a subquery operand would re-bind, by innermost-scope SQL rules, to a
+ * same-named column of that subquery's own FROM instead of the join body — the
+ * multi-source analog of the single-source correlation-qualification of
+ * substituted terms (`makeBaseQualifier`). Qualifying at injection keeps every
+ * scope decision in this walk: downstream, the qualifier strip
+ * ({@link stripSideQualifier}) stays purely syntactic, and a bare leaf reaching it
+ * is only ever a user-authored local/unknown name.
  */
 function substituteViewColumns(
 	ctx: PlanningContext,
 	expr: AST.Expression,
 	viewColToBaseRef: ReadonlyMap<string, AST.Expression>,
 	view: MutableViewLike,
+	sides: readonly JoinSide[],
 ): AST.Expression {
 	const viewName = view.name.toLowerCase();
-	const descend = makeViewColumnDescend(ctx, viewColToBaseRef, view.name, view);
+	const sideQualifyScope = makeSideQualifyScope(sides, view);
+	const sideQualify = (repl: AST.Expression): AST.Expression => transformScopedExpr(ctx, sideQualifyScope, repl);
+	const descend = makeViewColumnDescend(ctx, viewColToBaseRef, view.name, view, sideQualify);
 	return transformExpr(expr, (col) => {
 		if (col.table && col.table.toLowerCase() !== viewName) return undefined;
 		const repl = viewColToBaseRef.get(col.name.toLowerCase());
-		return repl ? cloneExpr(repl) : undefined;
+		return repl ? sideQualify(repl) : undefined;
 	}, descend);
+}
+
+/**
+ * The {@link ScopeContext} that side-alias-qualifies a substituted base-term
+ * lineage expression at injection time — the multi-source analog of the
+ * single-source `makeBaseQualifyScope` (docs/view-updateability.md § Inner Join,
+ * cross-source `set`). A bare, non-shadowed leaf is resolved by **unique column
+ * ownership** across the join sides ({@link resolveColumnSide}, the exact rule
+ * join-condition operands use) and qualified with the owning side's **alias** —
+ * never the table name, so a self-join's distinct aliases stay distinct. A name
+ * on NO side is a lineage-internal correlated/local name and stays bare; a name
+ * on 2+ sides resolves to `undefined`, but such a bare body projection
+ * (`select av …` with `av` on both sides) is already rejected as ambiguous at
+ * body planning (analyzeBodyLineage → buildSelectStmt), so for genuine lineage
+ * leaves that branch is unreachable — the bare pass-through serves only the
+ * no-side case. Shadowing within the lineage's own nested subqueries is handled
+ * by the shared scoped descent (a lineage term `(select x from oth where fk =
+ * cid)` qualifies only its correlation ref `cid`; `x`/`fk`, shadowed by `oth`,
+ * stay local).
+ *
+ * An unresolvable nested scope is **rejected** rather than tainted (matching
+ * `makeBaseQualifyScope`): shadowing cannot be proven, so the term could over- or
+ * under-qualify into a silent wrong write.
+ */
+function makeSideQualifyScope(sides: readonly JoinSide[], view: MutableViewLike): ScopeContext {
+	return {
+		makeSubstitute: (shadowed) => (col) => {
+			if (col.table) return undefined;
+			if (shadowed.has(col.name.toLowerCase())) return undefined;
+			const side = resolveColumnSide(col, sides);
+			if (side === undefined) return undefined;
+			return { ...col, table: sides[side].alias };
+		},
+		unresolvableScope: 'reject',
+		rejectUnresolvableScope: () => raiseMutationDiagnostic({
+			reason: 'unsupported-subquery-correlation',
+			table: view.name,
+			message: `cannot write through view '${view.name}': a view column's base-term lineage contains a correlated subquery whose source columns are not statically resolvable (a 'select *' / table-valued function / unresolved source), so its correlation cannot be proven; restructure the view body`,
+		}),
+		rejectDmlSubquery: () => raiseMutationDiagnostic({
+			reason: 'unsupported-subquery-correlation',
+			table: view.name,
+			message: `cannot write through view '${view.name}': a data-modifying subquery (INSERT/UPDATE/DELETE) within a view column's base-term lineage cannot be analysed`,
+		}),
+	};
 }
 
 /**
@@ -2419,23 +2475,25 @@ function substituteViewColumns(
  * targets the single-table UPDATE directly). A reference to **any other side** cannot
  * be expressed as a single-table SET, so it is either captured-and-rewritten (when a
  * `registerCrossSource` carrier is supplied — § Inner Join, cross-source `set`) or
- * rejected (`cross-source-assignment`, the legacy path). The strip is threaded into any
- * subquery embedded in the value (the qualifier rule is purely about a column's own
- * table qualifier, so it applies uniformly at every nesting depth); a nested owning-side
- * reference is correlated to the target row of the lowered UPDATE just like a top-level
- * one.
+ * rejected (`cross-source-assignment`, the legacy path). The strip is purely
+ * **syntactic** — the decision reads only a column's own table qualifier — so a single
+ * substitute is threaded uniformly at every nesting depth (the scope-unaware
+ * `mapQueryExprUniform` descent); a nested owning-side reference is correlated to the
+ * target row of the lowered UPDATE just like a top-level one.
  *
  * The owning-side qualifier set is checked **first**, so a self-join (where an `other`
  * side shares the owning side's table name) still strips an owning-alias reference; only
  * a reference qualified by a *different alias* is the cross-source case.
  *
- * An **unqualified** base-term leaf (a body projecting a column bare — legal when the name
- * is unambiguous across the sides) is resolved to its owning side by **unique column
- * ownership**, the exact rule `resolveColumnSide` applies to join-condition operands: an
- * owning-side (or unresolvable) name stays bare and resolves in the lowered single-table
- * UPDATE; a **partner**-owned name is qualified with that partner's alias and routed
- * through the identical cross-source capture path a qualified `b.y` rides — so a partner
- * column projected unqualified no longer mis-routes into the owning side's base UPDATE.
+ * A **bare** leaf is left untouched — binding locally (a nested subquery's own FROM, or
+ * the lowered single-table UPDATE's target) or failing loudly at build. The strip never
+ * resolves a bare name against the view sides: every base-term lineage leaf was
+ * side-alias-qualified when `substituteViewColumns` injected it
+ * ({@link makeSideQualifyScope} — including a partner column the body projected bare, so
+ * that read rides the qualified routing below at ANY nesting depth), and resolving a
+ * bare name here would mis-route an inner-scope column whose name merely collides with a
+ * partner base column (e.g. `(select psecret from t)` where the partner side also has a
+ * `psecret`) to the partner's captured value.
  *
  * A cross-source read is rewritten to `(select <srcN> from __vmupd_keys k where
  * k.k<owningSide>_0 = <pk0> [and …])`: `registerCrossSource` projects the partner column
@@ -2494,52 +2552,19 @@ function stripSideQualifier(
 		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk);
 	};
 	// QUALIFIED-only substitution: an owning-alias ref strips to bare; a partner-alias ref
-	// routes through the capture; a BARE ref is left untouched. The decision is purely on
-	// the column's own qualifier (a syntactic property), so it is scope-independent and
-	// applies uniformly at EVERY nesting depth — this is the substitute threaded into the
-	// scope-unaware `mapQueryExprUniform` descent. A bare column reached there binds to the
-	// embedded subquery's OWN from-source, NOT the view sides, so it must NOT be resolved
-	// by name against the sides (doing so would mis-route an inner-scope column whose name
-	// merely collides with a partner base column — e.g. `(select psecret from t)` where the
-	// partner side also has a `psecret` — to the partner's captured value).
-	const substituteQualified = (col: AST.ColumnExpr): AST.Expression | undefined => {
+	// routes through the capture; a BARE ref is left untouched (only ever a user-authored
+	// local/unknown name — every lineage leaf arrives side-alias-qualified; see the
+	// docstring). Purely a qualifier decision (a syntactic property), so it is
+	// scope-independent and the same substitute is threaded uniformly at every nesting
+	// depth through the scope-unaware `mapQueryExprUniform` descent.
+	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
 		if (!col.table) return undefined;
 		const t = col.table.toLowerCase();
 		if (owningQuals.has(t)) return { type: 'column', name: col.name };
 		if (otherQuals.has(t)) return routePartnerRead(col);
 		return undefined;
 	};
-	// TOP-LEVEL substitution: additionally resolves an UNQUALIFIED base-term leaf (a body
-	// projecting a partner column bare) by UNIQUE column ownership — the exact rule
-	// `resolveColumnSide` applies to join-condition operands. This resolution is sound ONLY
-	// at the top level of the SET value, where a bare column originates from the view body's
-	// own projection (injected here as the view column's base-term lineage by
-	// `substituteViewColumns`) and so legitimately resolves against the view sides. Inside a
-	// nested value subquery a bare column instead binds to that subquery's from-source, so
-	// the descent uses `substituteQualified` (no bare resolution) — see its note above.
-	//
-	// Owning-side OR unresolvable (a correlated outer ref, a name on no side) → leave bare:
-	// it resolves correctly in the lowered single-table UPDATE, or keeps its pre-existing
-	// pass-through. Partner-owned → qualify with that side's alias and route through the SAME
-	// capture path the qualified `b.y` branch uses (qualifying before `registerCrossSource`
-	// makes the projection byte-identical and the `srcN` dedup consistent with `a.av`).
-	//
-	// Preference 2 (a structured side-ambiguity diagnostic) is intentionally NOT added:
-	// `resolveColumnSide` returns `undefined` for a name owned by TWO+ sides, but such a
-	// body projection (`select av …` with `av` on both sides) is already rejected as
-	// ambiguous at body planning (analyzeBodyLineage → buildSelectStmt) before decomposition
-	// ever reaches this leaf — the branch would be unreachable dead code. The remaining
-	// `undefined` case (a name on NO side) is not a side-ambiguity and must keep its bare
-	// pass-through.
-	const substituteTop = (col: AST.ColumnExpr): AST.Expression | undefined => {
-		if (!col.table) {
-			const side = resolveColumnSide(col, allSides);
-			if (side === undefined || side === owningSideIndex) return undefined;
-			return routePartnerRead({ ...col, table: allSides[side].alias });
-		}
-		return substituteQualified(col);
-	};
-	return transformExpr(expr, substituteTop, (q) => mapQueryExprUniform(q, substituteQualified));
+	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
 }
 
 /**
