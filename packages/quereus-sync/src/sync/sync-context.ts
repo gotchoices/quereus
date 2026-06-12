@@ -12,7 +12,7 @@ import type { ColumnVersionStore } from '../metadata/column-version.js';
 import type { TombstoneStore } from '../metadata/tombstones.js';
 import type { ChangeLogStore } from '../metadata/change-log.js';
 import type { SchemaMigrationStore } from '../metadata/schema-migration.js';
-import type { SyncConfig, ApplyToStoreCallback } from './protocol.js';
+import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
 import { SYNC_KEY_PREFIX } from '../metadata/keys.js';
 
@@ -54,6 +54,37 @@ export async function persistHLCState(ctx: SyncContext): Promise<void> {
  */
 export function toError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * Abort the apply if the store reported any per-change errors.
+ *
+ * The store adapter continues applying other tables when one fails, collecting
+ * each failure in `result.errors` rather than throwing — so the maximal set of
+ * resolvable rows reaches committed storage. The *consumer* must still treat
+ * any non-empty `errors` exactly like the whole-batch throw path: emit an error
+ * sync-state event and throw BEFORE committing any CRDT metadata, so the whole
+ * batch re-resolves and re-applies idempotently on the next sync attempt.
+ *
+ * This upholds the write-ordering invariant (docs/sync.md § Transactional
+ * Integrity): CRDT metadata must not be committed when the corresponding data
+ * write did not land — for per-change failures, not just whole-batch throws.
+ *
+ * No-op when `result.errors` is empty.
+ */
+export function throwIfApplyErrors(ctx: SyncContext, result: ApplyToStoreResult): void {
+	if (result.errors.length === 0) return;
+
+	const detail = result.errors
+		.map(({ change, error }) => `${change.schema}.${change.table} (${change.type}): ${error.message}`)
+		.join('; ');
+	const error = new Error(
+		`apply-to-store failed for ${result.errors.length} change(s): ${detail}`,
+		{ cause: result.errors[0].error },
+	);
+
+	ctx.syncEvents.emitSyncStateChange({ status: 'error', error });
+	throw error;
 }
 
 /**

@@ -26,7 +26,7 @@ import type {
 	SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState } from './sync-context.js';
+import { persistHLCState, throwIfApplyErrors } from './sync-context.js';
 
 /**
  * Get a full snapshot of all data and schema state.
@@ -159,7 +159,11 @@ export async function applySnapshot(
 
 	// PHASE 2: Apply data to store
 	if (ctx.applyToStore && (dataChangesToApply.length > 0 || schemaChangesToApply.length > 0)) {
-		await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true });
+		const result = await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true });
+		// A per-change storage failure aborts before clearing/rewriting metadata,
+		// leaving prior CRDT state intact; the snapshot retries wholesale
+		// (idempotent on the store side).
+		throwIfApplyErrors(ctx, result);
 	}
 
 	// PHASE 3: Clear existing CRDT metadata and apply new

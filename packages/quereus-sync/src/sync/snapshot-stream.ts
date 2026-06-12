@@ -34,7 +34,7 @@ import type {
 	SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState } from './sync-context.js';
+import { persistHLCState, throwIfApplyErrors } from './sync-context.js';
 
 /** Default chunk size for streaming snapshots. */
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
@@ -254,7 +254,11 @@ export async function applySnapshotStream(
 
 	const flushDataToStore = async (): Promise<void> => {
 		if (ctx.applyToStore && (pendingDataChanges.length > 0 || pendingSchemaChanges.length > 0)) {
-			await ctx.applyToStore(pendingDataChanges, pendingSchemaChanges, { remote: true });
+			const result = await ctx.applyToStore(pendingDataChanges, pendingSchemaChanges, { remote: true });
+			// A per-change storage failure aborts the stream mid-flight, before the
+			// footer emits `status: 'synced'` / clears the checkpoint — so the
+			// checkpoint stays in place and the transfer resumes/retries.
+			throwIfApplyErrors(ctx, result);
 			pendingDataChanges = [];
 			pendingSchemaChanges = [];
 		}

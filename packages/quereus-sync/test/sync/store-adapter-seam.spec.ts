@@ -21,9 +21,9 @@ import {
 	type KVStoreProvider,
 } from '@quereus/store';
 import { createStoreAdapter, type SyncStoreAdapterOptions } from '../../src/sync/store-adapter.js';
-import type { ApplyToStoreCallback, DataChangeToApply } from '../../src/sync/protocol.js';
+import type { ApplyToStoreCallback, DataChangeToApply, Snapshot, SnapshotChunk } from '../../src/sync/protocol.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl } from '../../src/sync/events.js';
+import { SyncEventEmitterImpl, type SyncState } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager } from '../../src/clock/hlc.js';
@@ -377,6 +377,133 @@ describe('store-adapter seam integration', () => {
 			// left would be an echo recorded under OUR site id. There must be none.
 			const echoed = await syncManager.getChangesSince(remoteSiteId);
 			expect(echoed.flatMap(cs => cs.changes)).to.have.length(0);
+		});
+	});
+
+	describe('per-change apply errors abort with no metadata committed', () => {
+		// The adapter collects per-change failures in `result.errors` rather than
+		// throwing (it keeps applying other tables). The consumer must still treat
+		// any non-empty `errors` like a whole-batch throw: emit error + throw, with
+		// NO CRDT metadata committed, so the whole batch re-resolves next sync.
+		const makeSyncManager = (syncEvents: SyncEventEmitterImpl) =>
+			SyncManagerImpl.create(
+				new InMemoryKVStore(), events, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
+			);
+
+		it('applyChanges: a per-change storage failure throws and commits no metadata; retry converges', async () => {
+			await db.exec('create table t (id text primary key, v text) using store');
+
+			const syncEvents = new SyncEventEmitterImpl();
+			const syncManager = await makeSyncManager(syncEvents);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			// One change set spanning a resolvable table `t` and an unresolvable
+			// `no_such_table`. Built once and reused so the HLCs are stable across
+			// both attempts.
+			const changeSets = [{
+				siteId: remoteSiteId,
+				transactionId: 'tx1',
+				hlc: remoteHLC.tick(),
+				changes: [
+					{ type: 'column' as const, schema: 'main', table: 't', pk: ['x'], column: 'v', value: 'a', hlc: remoteHLC.tick() },
+					{ type: 'column' as const, schema: 'main', table: 'no_such_table', pk: ['k'], column: 'v', value: 'b', hlc: remoteHLC.tick() },
+				],
+				schemaMigrations: [],
+			}];
+
+			// First attempt: `t` applies to storage, `no_such_table` fails → the
+			// adapter records the error, applyChanges aggregates it into a throw
+			// (carrying the failed change), and NO CRDT metadata is committed.
+			let thrown: unknown;
+			try {
+				await syncManager.applyChanges(changeSets);
+			} catch (e) {
+				thrown = e;
+			}
+			expect(String(thrown)).to.contain('no_such_table');
+
+			// Whole batch uncommitted: nothing to relay (neither `t` nor `no_such_table`).
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
+
+			// Create the missing table and re-apply the SAME change set: both apply,
+			// metadata commits, both changes relay (convergence on idempotent retry).
+			await db.exec('create table no_such_table (id text primary key, v text) using store');
+			const retry = await syncManager.applyChanges(changeSets);
+			expect(retry.applied).to.equal(2);
+			const relayedAfter = await syncManager.getChangesSince(generateSiteId());
+			expect(relayedAfter.flatMap(cs => cs.changes)).to.have.length(2);
+		});
+
+		it('applySnapshot: an unresolvable table throws before clearing/rewriting metadata', async () => {
+			const syncEvents = new SyncEventEmitterImpl();
+			const syncManager = await makeSyncManager(syncEvents);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			const snapshot: Snapshot = {
+				siteId: remoteSiteId,
+				hlc: remoteHLC.tick(),
+				tables: [{
+					schema: 'main',
+					table: 'no_such_table',
+					rows: [],
+					// versionKey = `${encodePK(pk)}:${column}` — encodePK is JSON.stringify.
+					columnVersions: new Map([['["k"]:v', { hlc: remoteHLC.tick(), value: 'b' }]]),
+				}],
+				schemaMigrations: [],
+			};
+
+			let thrown: unknown;
+			try {
+				await syncManager.applySnapshot(snapshot);
+			} catch (e) {
+				thrown = e;
+			}
+			expect(String(thrown)).to.contain('no_such_table');
+
+			// Throw fired before the clear/rewrite phase → no column-version metadata committed.
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
+		});
+
+		it('applySnapshotStream: an unresolvable table throws and never emits status synced', async () => {
+			const syncEvents = new SyncEventEmitterImpl();
+			const states: SyncState[] = [];
+			syncEvents.onSyncStateChange(s => states.push(s));
+			const syncManager = await makeSyncManager(syncEvents);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			const snapshotId = 'snap-err-1';
+			const chunks: SnapshotChunk[] = [
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+				{ type: 'table-start', schema: 'main', table: 'no_such_table', estimatedEntries: 0 },
+				{ type: 'column-versions', schema: 'main', table: 'no_such_table', entries: [['["k"]:v', remoteHLC.tick(), 'b']] },
+				{ type: 'table-end', schema: 'main', table: 'no_such_table', entriesWritten: 1 },
+				{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
+			];
+			async function* stream(): AsyncIterable<SnapshotChunk> {
+				for (const c of chunks) yield c;
+			}
+
+			let thrown: unknown;
+			try {
+				await syncManager.applySnapshotStream(stream());
+			} catch (e) {
+				thrown = e;
+			}
+			expect(String(thrown)).to.contain('no_such_table');
+
+			// The footer's data flush throws before `status: 'synced'` is emitted.
+			expect(states.map(s => s.status)).to.include('error');
+			expect(states.map(s => s.status)).to.not.include('synced');
+
+			// Metadata batch is flushed only after the data flush → none committed.
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
 		});
 	});
 });

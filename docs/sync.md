@@ -152,7 +152,15 @@ This order is safe because:
 
 The reverse order (metadata first) would be dangerous: if we crash after writing metadata but before data, the CRDT state believes the change is applied but data is missing—and re-sync won't retry.
 
-**Current Status**: ⚠️ The current implementation writes metadata first, then data. This should be reversed.
+**Invariant — metadata follows a landed data write**: CRDT metadata must **not** be committed for any change whose data write did not land. This covers two failure shapes, handled identically:
+- **Whole-batch throw**: the `applyToStore` callback throws (e.g. a commit-time global-assertion failure over the inbound batch). The exception propagates; no metadata is committed.
+- **Per-change failure**: the store adapter does *not* throw on a single change's failure — it keeps applying the other tables (maximizing idempotent storage progress) and records each failure in `ApplyToStoreResult.errors`. The **consumer** (`change-applicator`, `snapshot`, `snapshot-stream` via the shared `throwIfApplyErrors` helper) treats any non-empty `errors` exactly like a whole-batch throw: it emits `status: 'error'` and throws **before** committing any metadata.
+
+In both cases no metadata is committed, so the caller does not advance its per-peer `lastSyncHLC` watermark and the **whole batch re-resolves and re-applies on the next sync**. Re-application is idempotent: value-identical upserts are suppressed by the adapter, so converged rows do no redundant work and only the previously-failed change is genuinely retried. (A change that *always* fails blocks its whole batch forever — an accepted "poison batch" property of the throw path; detection/recovery is the host's.)
+
+Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done: a batch spans multiple HLCs but peer re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent.
+
+**Current Status**: ✓ The implementation writes data first (`applyToStore`), then metadata, and aborts with no metadata on any whole-batch throw or per-change `ApplyToStoreResult.errors`.
 
 **Per-Table Batching**: Within each table, changes should be applied using `WriteBatch` for atomicity. The `TransactionCoordinator` in the Store module provides this capability.
 

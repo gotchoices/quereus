@@ -14,12 +14,13 @@ import type {
 	ChangeSet,
 	Change,
 	ApplyResult,
+	ApplyToStoreResult,
 	DataChangeToApply,
 	SchemaChangeToApply,
 	SchemaMigration,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState, toError } from './sync-context.js';
+import { persistHLCState, toError, throwIfApplyErrors } from './sync-context.js';
 
 /**
  * Result of resolving a single change (without writing metadata).
@@ -110,8 +111,9 @@ export async function applyChanges(
 
 	// PHASE 2: Apply data and schema changes to the store via callback
 	if (ctx.applyToStore && (dataChangesToApply.length > 0 || schemaChangesToApply.length > 0)) {
+		let result: ApplyToStoreResult;
 		try {
-			await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true });
+			result = await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true });
 		} catch (error) {
 			// Emit error state so UI can react. CRDT metadata is NOT committed,
 			// allowing the same changes to be re-resolved on the next sync attempt.
@@ -121,6 +123,12 @@ export async function applyChanges(
 			});
 			throw error;
 		}
+
+		// Per-change storage failures (the adapter collects rather than throws)
+		// abort the apply identically to a whole-batch throw: no metadata is
+		// committed, so the whole batch re-resolves and re-applies idempotently
+		// on the next sync. See throwIfApplyErrors / docs/sync.md write-ordering.
+		throwIfApplyErrors(ctx, result);
 	}
 
 	// PHASE 3: Commit CRDT metadata
