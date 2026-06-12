@@ -109,6 +109,8 @@ export interface ScalarType {
   logicalType: LogicalType;
   nullable: boolean;
   collationName?: string;
+  /** Provenance of collationName: 'explicit' | 'declared' | 'default' (absent = 'default'). */
+  collationSource?: CollationSource;
   isReadOnly?: boolean;
 }
 ```
@@ -378,6 +380,66 @@ if (column.collation && column.logicalType.supportedCollations) {
   }
 }
 ```
+
+### Comparison collation resolution
+
+A comparison (`=`, `!=`, `<`, `<=`, `>`, `>=`, plus IN and each BETWEEN bound)
+resolves ONE effective collation from its operands' types via a
+**provenance-ranked lattice** (implemented once in
+`planner/analysis/comparison-collation.ts`, shared by every plan-time
+analysis and runtime emitter so the two cannot drift):
+
+| rank | source (`ScalarType.collationSource`)                  | does BINARY contribute? |
+|------|--------------------------------------------------------|-------------------------|
+| 3    | `explicit` — a `COLLATE` expression                    | yes (`collate binary` is a real demand) |
+| 2    | `declared` — column declared with an explicit `COLLATE`| yes (`c text collate binary` is a real preference) |
+| 1    | `default` — defaulted column collation (session `default_collation`, store-module reconcile, engine BINARY default) | **no** — a defaulted BINARY contributes nothing |
+| —    | no `collationName` (literals, most expressions)        | n/a |
+
+Resolution of `left <op> right`:
+
+1. The highest rank present among the two contributions wins.
+2. If both operands contribute at that rank with **different** names:
+   - rank 3 → plan-time error: `conflicting COLLATE clauses in comparison: X vs Y`
+   - rank 2 → plan-time error: `ambiguous collation for comparison: column collations X vs Y differ; apply an explicit COLLATE`
+   - rank 1 → **BINARY**, silently (defaults are preferences, not declarations)
+3. Otherwise the winning contribution's name; no contributions at all → BINARY.
+
+Resolution is **symmetric**: `a = b` and `b = a` always resolve identically
+(and error identically). This deliberately diverges from SQLite's
+left-operand precedence, in keeping with the engine's explicit-over-implicit
+philosophy: a declared `NOCASE` column compared against a plain column is
+NOCASE from either side, and genuinely ambiguous declared/explicit pairs are
+errors rather than coin flips. Conflicts error even when the operands are
+statically non-textual (consistent strictness; only `COLLATE`-wrapped
+expressions can reach this case, since non-text columns reject collation
+declarations).
+
+Errors surface at the point the comparison compiles: statement prepare for
+queries, DML prepare for write-path scopes (CHECK enforcement, FK
+parent-existence checks, upsert SET, RETURNING).
+
+Related forms:
+
+- **IN** — `cond IN (e1, …, en)` / `cond IN (subquery)` merges the RHS
+  contributions first (a rank-3/2 name conflict among elements is the same
+  plan-time error; rank-1 conflicts merge to no contribution; a subquery
+  contributes its output column's contribution), then resolves
+  condition-vs-RHS through the lattice. The whole membership test runs under
+  that ONE collation. Literal-only lists contribute nothing, so the dominant
+  case stays condition-driven.
+- **BETWEEN** — desugars to two independent comparisons (`expr >= lo`,
+  `expr <= hi`); each bound resolves against the tested expression
+  separately. Two differently-collated bounds are NOT a conflict with each
+  other.
+- **USING joins** — each same-named column pair resolves through the lattice,
+  so `using (k)` agrees with the spelled-out `l.k = r.k`.
+- **Propagation through non-comparison combiners** (`||` concat, CASE branch
+  merge) — the highest-ranked contribution wins and keeps its provenance;
+  equal-rank contributions with different names propagate **no** collation
+  (the conflict is not an error there — those nodes don't compare — but it
+  must not silently coin-flip; a later comparison over the result falls back
+  to BINARY).
 
 ### Custom Collations for Custom Types
 

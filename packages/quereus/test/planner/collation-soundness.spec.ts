@@ -158,8 +158,9 @@ describe('Collation soundness of plan-time equality facts', () => {
 			const root = rootOf(db, q);
 			const joinRows = await collect(db, q);
 			// The same comparison spelled as a WHERE filter is the canonical
-			// semantics (emitComparisonOp, right-operand collation precedence);
-			// the join must agree with it regardless of physical algorithm.
+			// semantics (emitComparisonOp, symmetric provenance-lattice
+			// resolution); the join must agree with it regardless of physical
+			// algorithm.
 			const filterRows = await collect(db, 'select j1.a as a, j2.z as z from j1 cross join j2 where j1.k = j2.d');
 			expect(joinRows.length).to.equal(filterRows.length);
 			// And no preserved-key over-claim either way.
@@ -180,7 +181,8 @@ describe('Collation soundness of plan-time equality facts', () => {
 			await db.exec("insert into j8 values ('Bob',1), ('bob',2)");
 			// extractEquiPairsFromUsing rejects the mismatched pair, so no physical
 			// equi-join (and no pair-derived key coverage) may fire; the generic
-			// nested-loop join compares under the left side's collation (NOCASE),
+			// join resolves the USING comparison through the provenance lattice
+			// (declared NOCASE beats the right side's defaulted BINARY),
 			// matching BOTH right case-variants — duplicated `a` on the output.
 			const q = 'select j7.a as a, j8.z as z from j7 join j8 using (k)';
 			const root = rootOf(db, q);
@@ -293,9 +295,9 @@ describe('Collation soundness of plan-time equality facts', () => {
 
 		it('control: NOCASE-declared columns in the CHECK suppress the ≤1-row claim', async () => {
 			await db.exec('create table sc2 (id integer primary key, b text unique, c text collate nocase, check (b = c)) using memory');
-			// Post-enforcement-fix the CHECK comparison is NOCASE (right operand
-			// declared NOCASE): 'x'/'X' pairs satisfy it while b stays
-			// BINARY-distinct, so no value FD may be minted.
+			// Post-enforcement-fix the CHECK comparison is NOCASE (c's declared
+			// NOCASE outranks b's defaulted BINARY): 'x'/'X' pairs satisfy it
+			// while b stays BINARY-distinct, so no value FD may be minted.
 			await db.exec("insert into sc2 values (1,'x','X'), (2,'X','X')");
 			const q = "select * from sc2 where b = c";
 			const rows = await collect(db, q);

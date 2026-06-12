@@ -6,6 +6,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
+import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 
 import { createRowSlot } from '../context-helpers.js';
 import { joinOutputRow } from './join-output.js';
@@ -32,13 +33,19 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 	const rightAttributes = plan.right.getAttributes();
 	const rightRowDescriptor = buildRowDescriptor(rightAttributes);
 
-	// Pre-resolve USING column indices and collation-based comparators at emit time
+	// Pre-resolve USING column indices and collation-based comparators at emit time.
+	// USING compares the two sides' same-named columns, so each pair resolves
+	// through the shared provenance lattice — `using (k)` agrees with the
+	// spelled-out `l.k = r.k` regardless of side order.
 	const usingResolved = plan.usingColumns?.map(columnName => {
 		const lowerName = columnName.toLowerCase();
 		const leftIndex = leftAttributes.findIndex(attr => attr.name.toLowerCase() === lowerName);
 		const rightIndex = rightAttributes.findIndex(attr => attr.name.toLowerCase() === lowerName);
 		const leftType = leftAttributes[leftIndex]?.type;
-		const collationFunc = leftType?.collationName ? ctx.resolveCollation(leftType.collationName) : BINARY_COLLATION;
+		const rightType = rightAttributes[rightIndex]?.type;
+		const collationFunc = leftType && rightType
+			? ctx.resolveCollation(effectiveCollationOfTypes(leftType, rightType))
+			: BINARY_COLLATION;
 		return { leftIndex, rightIndex, collationFunc };
 	});
 

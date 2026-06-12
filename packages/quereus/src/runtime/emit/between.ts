@@ -4,16 +4,16 @@ import type { BetweenNode } from "../../planner/nodes/scalar.js";
 import { emitPlanNode } from "../emitters.js";
 import { compareSqlValuesFast } from "../../util/comparison.js";
 import type { EmissionContext } from "../emission-context.js";
+import { effectiveBetweenBoundCollation } from "../../planner/analysis/comparison-collation.js";
 
 export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instruction {
-	// BETWEEN desugars to `expr >= lower AND expr <= upper`, where each comparison
-	// resolves its collation independently with right(bound)-operand precedence,
-	// mirroring emitComparisonOp. A plain column's collationName is the implicit
-	// default 'BINARY' — always present and truthy — so an explicit COLLATE on a
-	// bound must win over it: bound.collationName ?? expr.collationName ?? 'BINARY'.
-	const exprColl = plan.expr.getType().collationName;
-	const lowerCollationName = plan.lower.getType().collationName ?? exprColl ?? 'BINARY';
-	const upperCollationName = plan.upper.getType().collationName ?? exprColl ?? 'BINARY';
+	// BETWEEN desugars to `expr >= lower AND expr <= upper`; each comparison
+	// resolves its collation independently through the shared provenance lattice
+	// (explicit COLLATE > declared column collation > defaults — see
+	// analysis/comparison-collation.ts), so an explicit COLLATE on a bound wins
+	// over the tested column's defaulted collation and vice versa.
+	const lowerCollationName = effectiveBetweenBoundCollation(plan.expr, plan.lower);
+	const upperCollationName = effectiveBetweenBoundCollation(plan.expr, plan.upper);
 
 	// Pre-resolve a collation function per comparison for optimal performance
 	const lowerCollationFunc = ctx.resolveCollation(lowerCollationName);

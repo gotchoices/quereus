@@ -1345,11 +1345,11 @@ function buildPredicateFacts(
 			if (!n.values || n.values.length === 0) continue;
 			const cIdx = columnIndexOf(n.condition);
 			if (cIdx === undefined) continue;
-			// emitIn compares under the condition operand's collation; for the
-			// bare-column condition recognized here that IS the declared collation,
-			// so this gate is currently always satisfied — kept explicit so a
-			// future condition-unwrapping change can't open a hole.
-			if (!equalityCollationOk(cIdx, effectiveInCollation(n.condition))) continue;
+			// emitIn resolves ONE collation through the provenance lattice over the
+			// condition AND the listed values — a collate-wrapped element (folded
+			// to a literal whose type carries rank-3 NOCASE) can outrank the bare
+			// column recognized here, so this gate is load-bearing.
+			if (!equalityCollationOk(cIdx, effectiveInCollation(n))) continue;
 			const set = new Set<SqlValue>();
 			let allLiterals = true;
 			for (const v of n.values) {

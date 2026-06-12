@@ -10,7 +10,7 @@ import { PlanNodeType } from './plan-node-type.js';
 import type { TableSchema } from '../../schema/table.js';
 import type { Scope } from '../scopes/scope.js';
 import type * as AST from '../../parser/ast.js';
-import { relationTypeFromTableSchema } from '../type-utils.js';
+import { columnSchemaToScalarType, relationTypeFromTableSchema } from '../type-utils.js';
 import { Cached } from '../../util/cached.js';
 import type { FunctionSchema } from '../../schema/function.js';
 import { isTableValuedFunctionSchema } from '../../schema/function.js';
@@ -54,13 +54,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 			return this.tableSchema.columns.map((column) => ({
 				id: PlanNode.nextAttrId(),
 				name: column.name,
-				type: {
-					typeClass: 'scalar' as const,
-					logicalType: column.logicalType,
-					nullable: !column.notNull,
-					isReadOnly: false,
-					collationName: column.collation
-				},
+				type: columnSchemaToScalarType(column),
 				sourceRelation: `${this.tableSchema.schemaName}.${this.tableSchema.name}`,
 				relationName: this.tableSchema.name
 			}));

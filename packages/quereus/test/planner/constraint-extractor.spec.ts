@@ -38,26 +38,30 @@ function lit(value: unknown): LiteralNode {
 	return new LiteralNode(scope, expr);
 }
 
-/** TEXT-typed column reference, optionally carrying a declared collation (the existing colRef helper is INTEGER-typed). */
+/** TEXT-typed column reference, optionally carrying an explicitly-declared collation (the existing colRef helper is INTEGER-typed). */
 function textColRef(attrId: number, name: string, index: number, collation?: string): ColumnReferenceNode {
 	const expr: AST.ColumnExpr = { type: 'column', schema: undefined as unknown as string, table: undefined as unknown as string, name } as unknown as AST.ColumnExpr;
 	const columnType = {
 		typeClass: 'scalar' as const,
 		logicalType: TEXT_TYPE,
 		collationName: collation,
+		collationSource: collation !== undefined ? 'declared' as const : undefined,
 		nullable: false,
 		isReadOnly: false,
 	};
 	return new ColumnReferenceNode(scope, expr, columnType, attrId, index);
 }
 
-/** The folded-`COLLATE` shape: a literal whose *type* carries the collation (constant folding preserves type metadata). */
+/** The folded-`COLLATE` shape: a literal whose *type* carries the collation with
+ *  `'explicit'` provenance (constant folding preserves the whole type, including
+ *  the CollateNode's rank-3 source). */
 function collatedLit(value: string, collation: string): LiteralNode {
 	const expr: AST.LiteralExpr = { type: 'literal', value } as unknown as AST.LiteralExpr;
 	return new LiteralNode(scope, expr, {
 		typeClass: 'scalar',
 		logicalType: TEXT_TYPE,
 		collationName: collation,
+		collationSource: 'explicit',
 		nullable: false,
 		isReadOnly: true,
 	});
@@ -1539,17 +1543,19 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].op).to.equal('OR_RANGE');
 		});
 
-		it('written order is load-bearing: NOCASE-folded literal on the LEFT of a BINARY-declared column resolves to the column (right) collation → collapse allowed', () => {
-			// `'bob' COLLATE NOCASE = b` compares under b's collation
-			// (emitComparisonOp right-operand precedence), so the IN rewrite is
-			// sound when b is explicitly BINARY.
+		it('written order is immaterial: a NOCASE-folded literal on EITHER side of a BINARY-declared column makes the comparison NOCASE → collapse declined', () => {
+			// `'bob' COLLATE NOCASE = b` compares NOCASE regardless of spelling
+			// order (explicit rank 3 outranks the declared BINARY in the
+			// symmetric provenance lattice), so collapsing into an IN that the
+			// column's BINARY collation would drive is unsound — the gate must
+			// keep the OR residual.
 			const expr = orNode(
 				binOp('=', collatedLit('bob', 'NOCASE'), textColRef(102, 'b', 2, 'BINARY')),
 				binOp('=', textColRef(102, 'b', 2, 'BINARY'), lit('x'))
 			);
 			const result = extractConstraints(expr, [TABLE_A]);
-			expect(result.allConstraints).to.have.length(1);
-			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
 		});
 	});
 

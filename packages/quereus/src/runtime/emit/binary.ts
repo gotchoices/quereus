@@ -10,6 +10,7 @@ import { coerceToNumberForArithmetic } from "../../util/coercion.js";
 import { simpleLike } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
+import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
 
 export function emitBinaryOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
 	// Normalize operator to uppercase for case-insensitive matching of keywords
@@ -207,17 +208,13 @@ export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 }
 
 export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
-	// Determine collation to use for comparison
 	const leftType = plan.left.getType();
 	const rightType = plan.right.getType();
-	let collationName = 'BINARY';
 
-	// Use collation from either operand (right side takes precedence for COLLATE expressions)
-	if (rightType.collationName) {
-		collationName = rightType.collationName;
-	} else if (leftType.collationName) {
-		collationName = leftType.collationName;
-	}
+	// One shared, symmetric resolution for plan-time facts and runtime behavior
+	// (analysis/comparison-collation.ts). The throw inside is an unreachable
+	// backstop — BinaryOpNode.generateType already rejected conflicts at plan time.
+	const collationName = effectiveComparisonCollation(plan.left, plan.right);
 
 	// Pre-resolve collation function for optimal performance
 	const collationFunc = ctx.resolveCollation(collationName);

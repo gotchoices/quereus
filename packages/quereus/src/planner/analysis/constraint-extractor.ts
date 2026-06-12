@@ -620,12 +620,11 @@ function flattenOrDisjuncts(expr: ScalarPlanNode): ScalarPlanNode[] {
  * `or-equality-collapse-collation-blind`).
  *
  * Both collapsed forms compare under the *column operand's own* collation —
- * `emitIn` resolves the condition (column) operand's collation for IN, and an
- * OR_RANGE spec's bounds are interpreted in the index's declared-collation
+ * an OR_RANGE spec's bounds are interpreted in the index's declared-collation
  * ordering — while each written disjunct compares under its own effective
- * collation (`emitComparisonOp`: right ?? left ?? BINARY, in *written* operand
- * order; constant folding keeps `'bob' COLLATE NOCASE` as a literal whose
- * *type* carries NOCASE, so shape checks never see the wrapper). A collapse is
+ * collation (the shared provenance lattice in `comparison-collation.ts`;
+ * constant folding keeps `'bob' COLLATE NOCASE` as a literal whose *type*
+ * carries NOCASE, so shape checks never see the wrapper). A collapse is
  * sound only when those two collations are **equal** for the branch; both
  * directions fail otherwise (under-match: a NOCASE disjunct over a BINARY
  * column matches fewer rows after collapse; over-match: a BINARY disjunct over
@@ -643,11 +642,10 @@ function orBranchConstraintCollationOk(c: PredicateConstraint): boolean {
 	}
 	if (src instanceof InNode) {
 		// Minted only by `extractInConstraint`, whose condition is a bare
-		// ColumnReferenceNode — `effectiveInCollation(condition)` IS the
-		// column's collation, so this is vacuously true today. Kept explicit so
-		// a future producer minting IN constraints from a non-bare condition
-		// stays gated.
-		return effectiveInCollation(src.condition) === operandCollation(src.condition);
+		// ColumnReferenceNode. The lattice lets a collate-wrapped list element
+		// outrank the column's contribution, so the equality below is genuinely
+		// load-bearing (not just future-proofing).
+		return effectiveInCollation(src) === operandCollation(src.condition);
 	}
 	if (src instanceof BetweenNode) {
 		// A BETWEEN branch contributes two constraints sharing this source;
@@ -1084,9 +1082,10 @@ function columnSideOf(src: BinaryOpNode, attributeId: number): ScalarPlanNode | 
  * the *column* side never folds and is already structurally rejected by
  * `unwrapCast` being Cast-only.
  *
- * IN constraints need no gate: `emitIn` compares under the condition (column)
- * operand's own collation — the declared collation itself — and listed values'
- * collations are inert.
+ * IN constraints are gated by {@link inConstraintCollationOk}: under the
+ * provenance lattice a collate-wrapped list element (folded to a literal whose
+ * type carries rank-3 NOCASE) can outrank the column condition, so listed
+ * values' collations are no longer inert.
  */
 function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
 	const src = c.sourceExpression;
@@ -1101,6 +1100,28 @@ function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
 	// only 'IN'/'OR_RANGE'), so this permissive fallback is unreachable for
 	// equalities. If a new producer mints '=' constraints from another shape,
 	// it must either carry the comparison or be gated here explicitly.
+	return true;
+}
+
+/**
+ * Collation gate for a (singleton) IN constraint feeding covered-key
+ * detection — the IN analogue of {@link equalityConstraintCollationOk}. The
+ * runtime membership test (`emitIn`) compares under the lattice-resolved
+ * collation over the condition AND every listed value, so a wrapped element
+ * like `b IN ('bob' collate nocase)` compares NOCASE over a BINARY-enforced
+ * key and must not count as covering. Sound cases mirror the equality gate:
+ * effective BINARY (finest), or equal to the column operand's own (declared)
+ * collation. OR-collapse-minted IN constraints carry the OR BinaryOpNode as
+ * `sourceExpression` and were already vetted per-branch by
+ * {@link orBranchConstraintCollationOk}.
+ */
+function inConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof InNode) {
+		const eff = effectiveInCollation(src);
+		if (eff === 'BINARY') return true;
+		return operandCollation(src.condition) === eff;
+	}
 	return true;
 }
 
@@ -1145,7 +1166,7 @@ export function computeCoveredKeysForConstraints(
             if (equalityConstraintCollationOk(c)) eqCols.add(c.columnIndex);
         }
         if (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1) {
-            eqCols.add(c.columnIndex);
+            if (inConstraintCollationOk(c)) eqCols.add(c.columnIndex);
         }
     }
 

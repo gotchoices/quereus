@@ -276,14 +276,15 @@ drop table t_selfq_r;
 -- ===================================
 -- CHECK comparisons resolve declared column collations, exactly like read-path
 -- queries (and ALTER backfill validation / assertion enforcement, which compile
--- plain SQL). Ticket check-extraction-collation-blind-fds. Collation precedence
--- is the engine's right-operand-first rule (`emitComparisonOp`) — see backlog
--- comparison-collation-precedence-conformance for the SQLite left-first
--- divergence — so `b = c` resolves c's NOCASE while `c = b` resolves b's
--- (implicit) BINARY, matching `select ... where` of the same spelling.
+-- plain SQL). Ticket check-extraction-collation-blind-fds. Collation resolution
+-- is the symmetric provenance lattice (explicit COLLATE > explicitly-declared
+-- column collation > defaulted collation > BINARY; ticket
+-- comparison-collation-provenance-and-precedence) — so `b = c` and `c = b`
+-- resolve identically: the declared NOCASE outranks b's defaulted BINARY from
+-- either side, matching `select ... where` of the same spelling.
 -- ===================================
 
--- bare col = col, NOCASE on the RIGHT operand: comparison is NOCASE.
+-- bare col = col, NOCASE declared on one operand: comparison is NOCASE.
 create table chk_coll (id integer primary key, b text, c text collate nocase, check (b = c));
 insert into chk_coll values (1, 'X', 'x');
 insert into chk_coll values (2, 'abc', 'ABC');
@@ -296,14 +297,16 @@ insert into chk_coll values (3, 'X', 'y');
 -- error: CHECK
 drop table chk_coll;
 
--- flipped spelling, BINARY-declared plain column on the RIGHT: comparison is
--- BINARY — the case-variant pair is rejected, again matching the read path.
+-- flipped spelling resolves the SAME collation: the declared NOCASE wins over
+-- the plain column's defaulted BINARY regardless of operand order, so the
+-- case-variant pair is accepted, again matching the read path.
 create table chk_coll_flip (id integer primary key, b text, c text collate nocase, check (c = b));
 insert into chk_coll_flip values (1, 'x', 'x');
 insert into chk_coll_flip values (2, 'X', 'x');
--- error: CHECK
 select count(*) as cnt from chk_coll_flip where c = b;
-→ [{"cnt":1}]
+→ [{"cnt":2}]
+insert into chk_coll_flip values (3, 'X', 'y');
+-- error: CHECK
 drop table chk_coll_flip;
 
 -- col = literal: a literal contributes no collation, so the declared NOCASE

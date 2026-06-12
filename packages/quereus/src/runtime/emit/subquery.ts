@@ -9,6 +9,7 @@ import { BTree } from 'inheritree';
 import { compareSqlValuesFast } from '../../util/comparison.js';
 import { ConstantNode } from '../../planner/nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
+import { effectiveInCollation } from '../../planner/analysis/comparison-collation.js';
 
 export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContext): Instruction {
 	const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.subquery);
@@ -80,9 +81,11 @@ export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContex
 }
 
 export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
-	// Extract collation from the condition expression
-	const conditionType = plan.condition.getType();
-	const collationName = conditionType.collationName || 'BINARY';
+	// ONE collation for the whole membership test (condition vs every RHS
+	// value), resolved through the shared provenance lattice — the BTree build
+	// below keys under it. Throws only as a backstop; InNode.generateType
+	// already rejected conflicts at plan time.
+	const collationName = effectiveInCollation(plan);
 	const collation = ctx.resolveCollation(collationName);
 
 	if (plan.source) {

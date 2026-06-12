@@ -141,6 +141,10 @@ export function columnSchemaToScalarType(
 		typeClass: 'scalar',
 		logicalType: col.logicalType,
 		collationName: col.collation,
+		// Provenance drives comparison-collation resolution: an explicit
+		// `COLLATE` clause outranks a defaulted collation (session default,
+		// store-module reconcile, engine BINARY).
+		collationSource: col.collationExplicit ? 'declared' : 'default',
 		nullable: overrides?.nullable ?? !col.notNull,
 		isReadOnly: overrides?.isReadOnly ?? false,
 	};

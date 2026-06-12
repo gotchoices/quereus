@@ -155,7 +155,13 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
       if (COMPARISON_OPS.has(expr.operator)) {
         [left, right] = insertCrossTypeCoercion(ctx.scope, left, right);
       }
-      return new BinaryOpNode(ctx.scope, expr, left, right);
+      const binaryNode = new BinaryOpNode(ctx.scope, expr, left, right);
+      // Comparisons validate their collation lattice in generateType, which is
+      // lazily cached — force it so a conflict errors at prepare time.
+      if (COMPARISON_OPS.has(expr.operator)) {
+        binaryNode.getType();
+      }
+      return binaryNode;
 		}
 
     case 'case': {
@@ -250,13 +256,18 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
          if (subqueryType.typeClass === 'relation' && (subqueryType as RelationType).columns.length !== 1) {
            throw new QuereusError('IN subquery must return exactly one column', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
          }
-                   return new InNode(ctx.scope, expr, leftExpr, inSubqueryPlan);
+                   const inSubqueryNode = new InNode(ctx.scope, expr, leftExpr, inSubqueryPlan);
+                   // Force the lazily-cached generateType so a collation-lattice
+                   // conflict errors at prepare time, not first emit.
+                   inSubqueryNode.getType();
+                   return inSubqueryNode;
                } else if (expr.values) {
           // IN value list: expr IN (value1, value2, ...)
           const valueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
-          // Create a special IN node for value lists
-          // Import the InNode from subquery module
-          return new InNode(ctx.scope, expr, leftExpr, undefined, valueExprs);
+          const inListNode = new InNode(ctx.scope, expr, leftExpr, undefined, valueExprs);
+          // Same eager collation-lattice validation as the subquery form.
+          inListNode.getType();
+          return inListNode;
        } else {
          throw new QuereusError('IN expression must have either values or subquery', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
        }
@@ -280,7 +291,11 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
        // Insert explicit casts for cross-category operands (same logic as comparisons)
        [exprNode, lowerNode] = insertCrossTypeCoercion(ctx.scope, exprNode, lowerNode);
        [exprNode, upperNode] = insertCrossTypeCoercion(ctx.scope, exprNode, upperNode);
-       return new BetweenNode(ctx.scope, expr, exprNode, lowerNode, upperNode);
+       const betweenNode = new BetweenNode(ctx.scope, expr, exprNode, lowerNode, upperNode);
+       // Force the lazily-cached generateType so a per-bound collation-lattice
+       // conflict errors at prepare time.
+       betweenNode.getType();
+       return betweenNode;
 		}
 
 		default:

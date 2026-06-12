@@ -1205,12 +1205,12 @@ interface CollationCoverDecision {
 
 /**
  * Resolve a predicate constraint's effective comparison collation at plan time
- * via the shared runtime-mirroring helpers in `analysis/comparison-collation.ts`
- * (one resolution for plan-time facts and runtime behavior — they cannot drift):
- * a comparison takes the right operand's collation, else the left's, else BINARY
- * (`emitComparisonOp`); an IN takes the condition (LHS) operand's collation
- * (`emitIn`); a BETWEEN bound takes that bound's collation, else the tested
- * expression's (`emitBetween`). The result is normalized.
+ * via the shared helpers in `analysis/comparison-collation.ts` (one resolution
+ * for plan-time facts and runtime behavior — they cannot drift): the symmetric
+ * provenance lattice (explicit COLLATE > declared column collation > defaults
+ * > BINARY). An IN merges the condition with every listed value / the subquery
+ * column (`emitIn`); a BETWEEN bound resolves against the tested expression
+ * per bound (`emitBetween`). The result is normalized.
  */
 function effectivePredicateCollation(constraint: PlannerPredicateConstraint): string {
 	const src = constraint.sourceExpression;
@@ -1218,11 +1218,11 @@ function effectivePredicateCollation(constraint: PlannerPredicateConstraint): st
 		return effectiveComparisonCollation(src.left, src.right);
 	}
 	if (src instanceof InNode) {
-		return effectiveInCollation(src.condition);
+		return effectiveInCollation(src);
 	}
 	if (src instanceof BetweenNode) {
-		// BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves
-		// its collation independently with bound (right-operand) precedence.
+		// BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison
+		// resolves its collation independently through the lattice.
 		// extractBetweenConstraints emits two constraints sharing this BetweenNode
 		// source — `op: '>='`/`'>'` for the lower bound, `'<='`/`'<'` for the
 		// upper — so the constraint's op selects which bound's collation applies. A

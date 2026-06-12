@@ -213,9 +213,10 @@ drop table coll_case;
 -- COLLATE on a BETWEEN *bound* (scan form)
 -- =============================================================================
 -- BETWEEN desugars to `expr >= lo AND expr <= hi`; each comparison resolves its
--- collation independently with bound (right-operand) precedence, so a COLLATE on a
--- bound governs that bound's comparison. The tested column's implicit BINARY default
--- must NOT shadow an explicit bound COLLATE. Regression for `collate-on-between-bound`.
+-- collation independently through the provenance lattice (explicit COLLATE >
+-- declared column collation > defaults), so a COLLATE on a bound governs that
+-- bound's comparison. The tested column's implicit BINARY default must NOT
+-- shadow an explicit bound COLLATE. Regression for `collate-on-between-bound`.
 
 create table btw (id integer primary key, name text);
 insert into btw values (1, 'Alice'), (2, 'BOB'), (3, 'charlie'), (4, 'Bob');

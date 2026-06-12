@@ -1,64 +1,259 @@
 /**
- * Plan-time resolution of a comparison's *effective collation*, mirroring the
- * runtime resolution exactly so plan-time facts and runtime behavior cannot
- * drift:
+ * THE shared resolution of a comparison's *effective collation*. Both the
+ * plan-time mirrors (access-path collation-cover analysis, FD/EC gates in
+ * `fd-utils.ts`, the predicate normalizer's eq↔IN gate, the constraint
+ * extractor's collation gates) and the runtime emitters (`emitComparisonOp`,
+ * `emitIn`, `emitBetween`, the USING-join comparator) call through this module,
+ * so plan-time facts and runtime behavior cannot drift.
  *
- *   - `emitComparisonOp` (runtime/emit/binary.ts): the right operand's
- *     collation, else the left's, else BINARY.
- *   - `emitIn` (runtime/emit/subquery.ts): the condition (LHS) operand's
- *     collation, else BINARY.
- *   - `emitBetween` (runtime/emit/between.ts): per-bound — the bound's
- *     collation, else the tested expression's, else BINARY.
+ * ## The resolution lattice
  *
- * Consumers: the access-path rule (`rule-select-access-path.ts` collation-cover
- * analysis) and the equality-fact extractors (`fd-utils.ts`), which must only
- * mint VALUE-level facts from comparisons whose effective collation is
- * value-discriminating (see {@link isValueDiscriminatingEquality}).
+ * Each operand contributes at most one `(collation, rank)`, derived from the
+ * provenance of its `ScalarType.collationName` ({@link CollationSource}):
+ *
+ * | rank | source                                            | BINARY contributes? |
+ * |------|---------------------------------------------------|---------------------|
+ * | 3    | `explicit` — a COLLATE expression                 | yes (`collate binary` is a real demand) |
+ * | 2    | `declared` — column with an explicit COLLATE      | yes (`c text collate binary` is a real preference) |
+ * | 1    | `default` — defaulted column collation            | **no** — a defaulted BINARY is the engine floor |
+ * | —    | no `collationName` (literals, most expressions)   | n/a |
+ *
+ * Resolution of `left <op> right` is **symmetric** (`a = b` ≡ `b = a`):
+ * 1. The highest rank present among the two contributions wins.
+ * 2. If both operands contribute at that rank with *different* normalized
+ *    names: rank 3 or 2 → plan-time error ({@link collationConflictError});
+ *    rank 1 → BINARY, silently (defaults are preferences, not declarations).
+ * 3. Otherwise the winning (single, or name-identical) contribution's name;
+ *    no contributions at all → BINARY.
+ *
+ * This deliberately diverges from SQLite's left-operand precedence: the engine
+ * follows explicit-over-implicit semantics and keeps comparisons commutative.
+ * See `docs/types.md` § Comparison collation resolution.
  */
 
 import type { ScalarPlanNode } from '../nodes/plan-node.js';
+import type { InNode } from '../nodes/subquery.js';
 import type * as AST from '../../parser/ast.js';
+import type { ScalarType, CollationSource } from '../../common/datatype.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { normalizeCollationName } from '../../util/comparison.js';
 import { PhysicalType } from '../../types/logical-type.js';
 import { collectCollateNames, collectColumnNames, columnIndexFromExpr } from './predicate-shape.js';
+import { QuereusError } from '../../common/errors.js';
+import { StatusCode } from '../../common/types.js';
+
+export type { CollationSource } from '../../common/datatype.js';
+
+/** The `(normalized name, rank)` one operand contributes to a comparison. */
+export interface CollationContribution {
+	readonly name: string;
+	readonly rank: 3 | 2 | 1;
+}
+
+const RANK_BY_SOURCE: Record<CollationSource, 3 | 2 | 1> = { explicit: 3, declared: 2, default: 1 };
+const SOURCE_BY_RANK: Record<3 | 2 | 1, CollationSource> = { 3: 'explicit', 2: 'declared', 1: 'default' };
+
+/**
+ * The contribution one operand's type makes to a comparison, or `undefined`
+ * when it makes none (no `collationName`, or a defaulted BINARY — the engine
+ * floor is not a preference). An absent `collationSource` with a present
+ * `collationName` is treated as `'default'` (the safe floor for any
+ * construction site the provenance sweep missed).
+ */
+export function collationContribution(t: ScalarType): CollationContribution | undefined {
+	if (t.collationName === undefined) return undefined;
+	const rank = RANK_BY_SOURCE[t.collationSource ?? 'default'];
+	const name = normalizeCollationName(t.collationName);
+	if (rank === 1 && name === 'BINARY') return undefined;
+	return { name, rank };
+}
+
+/** Outcome of resolving two contributions: a single collation, or a same-rank conflict. */
+export type CollationResolution =
+	| { kind: 'resolved'; name: string }
+	| { kind: 'conflict'; level: 'explicit' | 'declared'; left: string; right: string };
+
+const RESOLVED_BINARY: CollationResolution = { kind: 'resolved', name: 'BINARY' };
+
+function resolveContributions(
+	l: CollationContribution | undefined,
+	r: CollationContribution | undefined,
+): CollationResolution {
+	if (!l && !r) return RESOLVED_BINARY;
+	if (!l) return { kind: 'resolved', name: r!.name };
+	if (!r) return { kind: 'resolved', name: l.name };
+	if (l.rank !== r.rank) return { kind: 'resolved', name: (l.rank > r.rank ? l : r).name };
+	if (l.name === r.name) return { kind: 'resolved', name: l.name };
+	// Same-rank, different names. Defaults resolve to the floor silently;
+	// explicit/declared conflicts are user errors.
+	if (l.rank === 1) return RESOLVED_BINARY;
+	return { kind: 'conflict', level: l.rank === 3 ? 'explicit' : 'declared', left: l.name, right: r.name };
+}
+
+/**
+ * Effective collation of a binary comparison `left <op> right` under the
+ * lattice. Pure — never throws; conflicts are returned for the caller to
+ * surface (plan-time validation) or gate on (the predicate normalizer).
+ */
+export function resolveComparisonCollation(left: ScalarType, right: ScalarType): CollationResolution {
+	return resolveContributions(collationContribution(left), collationContribution(right));
+}
+
+/** Build the plan-time error for a same-rank explicit/declared conflict. */
+export function collationConflictError(
+	conflict: Extract<CollationResolution, { kind: 'conflict' }>,
+	expr?: AST.Expression,
+): QuereusError {
+	const message = conflict.level === 'explicit'
+		? `conflicting COLLATE clauses in comparison: ${conflict.left} vs ${conflict.right}`
+		: `ambiguous collation for comparison: column collations ${conflict.left} vs ${conflict.right} differ; apply an explicit COLLATE`;
+	return new QuereusError(message, StatusCode.ERROR, undefined, expr?.loc?.start.line, expr?.loc?.start.column);
+}
+
+function resolvedOrThrow(res: CollationResolution, expr?: AST.Expression): string {
+	if (res.kind === 'conflict') throw collationConflictError(res, expr);
+	return res.name;
+}
+
+/**
+ * Throwing form of {@link resolveComparisonCollation} over bare types, for
+ * sites that hold types rather than plan nodes (the USING-join emitter). The
+ * throw is a backstop — plan-time validation rejects user-written conflicts.
+ */
+export function effectiveCollationOfTypes(left: ScalarType, right: ScalarType, expr?: AST.Expression): string {
+	return resolvedOrThrow(resolveComparisonCollation(left, right), expr);
+}
+
+/**
+ * Effective collation of a binary comparison `left <op> right`. Symmetric —
+ * operand order never changes the result. Throws `QuereusError` on a
+ * same-rank explicit/declared conflict (normally unreachable past plan-time
+ * validation in `BinaryOpNode.generateType`).
+ */
+export function effectiveComparisonCollation(left: ScalarPlanNode, right: ScalarPlanNode): string {
+	return effectiveCollationOfTypes(left.getType(), right.getType());
+}
+
+/**
+ * Effective collation of one BETWEEN bound comparison. BETWEEN desugars to
+ * `expr >= lower AND expr <= upper`; each bound resolves independently through
+ * the same lattice (two independent comparisons — differing bound collations
+ * are NOT a conflict with each other, only with the tested expression).
+ */
+export function effectiveBetweenBoundCollation(expr: ScalarPlanNode, bound: ScalarPlanNode): string {
+	return effectiveCollationOfTypes(expr.getType(), bound.getType());
+}
+
+/**
+ * Order-independent merge of many contributions (IN right-hand sides, CASE
+ * branches, concat operands): the highest rank present wins; distinct names at
+ * that rank are a conflict (resolved per-call-site: error for IN at rank ≥ 2,
+ * no-contribution otherwise).
+ */
+type ContributionMerge =
+	| { kind: 'contribution'; contribution: CollationContribution | undefined }
+	| { kind: 'conflict'; level: 'explicit' | 'declared'; left: string; right: string };
+
+function mergeContributions(contribs: ReadonlyArray<CollationContribution | undefined>): ContributionMerge {
+	let best: CollationContribution | undefined;
+	let conflictingName: string | undefined;
+	for (const c of contribs) {
+		if (!c) continue;
+		if (!best || c.rank > best.rank) {
+			best = c;
+			conflictingName = undefined;
+			continue;
+		}
+		if (c.rank === best.rank && c.name !== best.name && conflictingName === undefined) {
+			conflictingName = c.name;
+		}
+	}
+	if (best && conflictingName !== undefined) {
+		if (best.rank === 1) return { kind: 'contribution', contribution: undefined };
+		return { kind: 'conflict', level: best.rank === 3 ? 'explicit' : 'declared', left: best.name, right: conflictingName };
+	}
+	return { kind: 'contribution', contribution: best };
+}
+
+/**
+ * Pure IN resolution: merge the right-hand-side contributions first (list
+ * elements under the lattice — a rank-3/2 name conflict among elements is the
+ * same plan-time error; rank-1 conflicts merge to no-contribution; a subquery
+ * RHS contributes its single output column's contribution), then resolve
+ * condition-vs-RHS. Literal-only lists contribute nothing, preserving
+ * condition-driven behavior for the dominant case.
+ */
+export function resolveInCollation(condition: ScalarType, rhs: ReadonlyArray<ScalarType>): CollationResolution {
+	const merged = mergeContributions(rhs.map(collationContribution));
+	if (merged.kind === 'conflict') {
+		return { kind: 'conflict', level: merged.level, left: merged.left, right: merged.right };
+	}
+	return resolveContributions(collationContribution(condition), merged.contribution);
+}
+
+/** RHS contribution sources of an InNode: list element types, or the subquery's single output column. */
+function inRhsTypes(node: InNode): ReadonlyArray<ScalarType> {
+	if (node.values) return node.values.map(v => v.getType());
+	if (node.source) {
+		const rel = node.source.getType();
+		const col = rel.columns[0];
+		return col ? [col.type] : [];
+	}
+	return [];
+}
+
+/** Pure form of {@link effectiveInCollation} — conflicts returned, not thrown. */
+export function resolveInCollationForNode(node: InNode): CollationResolution {
+	return resolveInCollation(node.condition.getType(), inRhsTypes(node));
+}
+
+/**
+ * Effective collation of `condition IN (...)`. `emitIn` pre-resolves this ONE
+ * collation for the whole membership test (the BTree build keys under it).
+ * Throws on conflict (backstop past `InNode.generateType` validation).
+ */
+export function effectiveInCollation(node: InNode): string {
+	return resolvedOrThrow(resolveInCollationForNode(node), node.expression);
+}
+
+/**
+ * Collation propagated through a non-comparison combiner (`||` concat, CASE
+ * branch merge): the highest-ranked contribution wins; equal-rank
+ * contributions with the same name keep it; equal-rank contributions with
+ * different names propagate **no** collation — the conflict is not an error
+ * here (these nodes do not compare), but it must not silently coin-flip; a
+ * later comparison over the result then falls back to BINARY. Set-based over
+ * the winning rank, so operand/branch order cannot change the result.
+ */
+export function mergePropagatedCollation(
+	types: ReadonlyArray<ScalarType>,
+): { collationName?: string; collationSource?: CollationSource } {
+	const merged = mergeContributions(types.map(collationContribution));
+	if (merged.kind === 'conflict' || merged.contribution === undefined) return {};
+	return { collationName: merged.contribution.name, collationSource: SOURCE_BY_RANK[merged.contribution.rank] };
+}
+
+/**
+ * Binary operators that compare their operands under a collation, and so must
+ * validate the lattice in `generateType`. The parser currently produces only
+ * unary `IS [NOT] NULL/TRUE/FALSE` forms — binary `IS`/`IS NOT` are listed so
+ * validation comes for free if it ever grows them.
+ */
+const COMPARISON_OPERATORS = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=', 'IS', 'IS NOT']);
+
+export function isComparisonOperator(op: string): boolean {
+	return COMPARISON_OPERATORS.has(op.toUpperCase());
+}
 
 /**
  * The collation a single operand contributes to a comparison, normalized.
- * `'BINARY'` when the operand's type carries none.
+ * `'BINARY'` when the operand's type carries none. Provenance-blind by design:
+ * gates that compare an operand's own collation against an effective collation
+ * (covered-key detection, equi-pair extraction) care about the *name* the
+ * operand resolves under, not its rank.
  */
 export function operandCollation(node: ScalarPlanNode): string {
 	return normalizeCollationName(node.getType().collationName ?? 'BINARY');
-}
-
-/**
- * Effective collation of a binary comparison `left <op> right`, in *written*
- * operand order. Mirrors `emitComparisonOp`: right precedence, then left,
- * then BINARY.
- */
-export function effectiveComparisonCollation(left: ScalarPlanNode, right: ScalarPlanNode): string {
-	return normalizeCollationName(
-		right.getType().collationName ?? left.getType().collationName ?? 'BINARY',
-	);
-}
-
-/**
- * Effective collation of `condition IN (...)`. Mirrors `emitIn`: the
- * condition (LHS) operand's collation, else BINARY — the listed values'
- * collations never participate.
- */
-export function effectiveInCollation(condition: ScalarPlanNode): string {
-	return normalizeCollationName(condition.getType().collationName ?? 'BINARY');
-}
-
-/**
- * Effective collation of one BETWEEN bound comparison. Mirrors `emitBetween`:
- * the bound's collation wins over the tested expression's, else BINARY.
- */
-export function effectiveBetweenBoundCollation(expr: ScalarPlanNode, bound: ScalarPlanNode): string {
-	return normalizeCollationName(
-		bound.getType().collationName ?? expr.getType().collationName ?? 'BINARY',
-	);
 }
 
 /**
@@ -96,11 +291,12 @@ function isStaticallyNonTextual(node: ScalarPlanNode): boolean {
  *     passes value-DIFFERENT rows ('Bob' = 'bob' NOCASE), so any value-level
  *     fact minted from it over-claims.
  *
- * Both sides are checked (not just the right-precedence winner of
- * `effectiveComparisonCollation`) so the gate stays robust to per-algorithm
- * resolution-order differences among runtime comparison sites
- * (`emitComparisonOp` resolves right-first; the merge/bloom join emitters
- * resolve left-first).
+ * Both sides are checked (not just `effectiveComparisonCollation`'s lattice
+ * winner) so the gate stays robust to per-algorithm resolution-order
+ * differences among runtime comparison sites (the merge/bloom join emitters
+ * resolve per-key from one side's attribute type). Note this deliberately
+ * blocks on a *defaulted* non-BINARY contribution too (session
+ * `default_collation`), which the lattice would also resolve to.
  */
 export function isValueDiscriminatingEquality(left: ScalarPlanNode, right: ScalarPlanNode): boolean {
 	if (operandCollation(left) === 'BINARY' && operandCollation(right) === 'BINARY') return true;

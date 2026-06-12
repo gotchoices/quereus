@@ -12,6 +12,7 @@ import { buildRowDefaultScope } from './default-scope.js';
 import { validateDeterministicDefault } from '../validation/determinism-validator.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { inferType } from '../../types/registry.js';
+import { columnSchemaToScalarType } from '../type-utils.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { validateReservedTags, type TagSite } from '../../schema/reserved-tags.js';
 import { columnTagDiagnostics, raiseStmtTagDiagnostics } from './tag-diagnostics.js';
@@ -256,13 +257,7 @@ function buildAddColumnBackfill(
   const rowAttrs: Attribute[] = tableSchema.columns.map(column => ({
     id: PlanNode.nextAttrId(),
     name: column.name,
-    type: {
-      typeClass: 'scalar' as const,
-      logicalType: column.logicalType,
-      nullable: !column.notNull,
-      isReadOnly: false,
-      collationName: column.collation,
-    },
+    type: columnSchemaToScalarType(column),
     sourceRelation: 'add-column-backfill',
   }));
   const rowScope = buildRowDefaultScope(ctx.scope, tableSchema.columns, rowAttrs);
@@ -301,13 +296,7 @@ function buildAddColumnChecks(
   const existingAttrs: Attribute[] = tableSchema.columns.map(column => ({
     id: PlanNode.nextAttrId(),
     name: column.name,
-    type: {
-      typeClass: 'scalar' as const,
-      logicalType: column.logicalType,
-      nullable: !column.notNull,
-      isReadOnly: false,
-      collationName: column.collation,
-    },
+    type: columnSchemaToScalarType(column),
     sourceRelation: 'add-column-check',
   }));
   const newColNotNull = (columnDef.constraints ?? []).some(c => c.type === 'notNull');
@@ -324,6 +313,8 @@ function buildAddColumnChecks(
       nullable: !newColNotNull,
       isReadOnly: false,
       collationName: newColCollation,
+      // From an explicit COLLATE constraint on the new column — 'declared' by definition.
+      collationSource: newColCollation !== undefined ? 'declared' as const : undefined,
     },
     sourceRelation: 'add-column-check',
   };

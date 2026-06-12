@@ -15,7 +15,7 @@
  * same shape.
  */
 import type { SqlValue, SqlParameters } from '../../common/types.js';
-import type { ScalarType } from '../../common/datatype.js';
+import type { CollationSource, ScalarType } from '../../common/datatype.js';
 import { isRelationalNode } from '../nodes/plan-node.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
 import { TableReferenceNode, ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
@@ -56,6 +56,8 @@ export interface PortableScalarType {
 	readonly typeName: string;
 	readonly nullable: boolean;
 	readonly collationName?: string;
+	/** Provenance of `collationName` — see {@link ScalarType.collationSource}. */
+	readonly collationSource?: CollationSource;
 	readonly isReadOnly?: boolean;
 }
 
@@ -82,6 +84,7 @@ function portableFromScalarType(t: ScalarType): PortableScalarType {
 		typeName: t.logicalType.name,
 		nullable: t.nullable,
 		...(t.collationName !== undefined ? { collationName: t.collationName } : {}),
+		...(t.collationSource !== undefined ? { collationSource: t.collationSource } : {}),
 		...(t.isReadOnly !== undefined ? { isReadOnly: t.isReadOnly } : {}),
 	};
 	return result;
@@ -100,6 +103,7 @@ export function scalarTypeFromPortable(p: PortableScalarType): ScalarType {
 		logicalType: logical,
 		nullable: p.nullable,
 		...(p.collationName !== undefined ? { collationName: p.collationName } : {}),
+		...(p.collationSource !== undefined ? { collationSource: p.collationSource } : {}),
 		...(p.isReadOnly !== undefined ? { isReadOnly: p.isReadOnly } : {}),
 	};
 }

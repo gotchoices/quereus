@@ -10,6 +10,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { NULL_TYPE, INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, BOOLEAN_TYPE } from "../../types/builtin-types.js";
 import { typeRegistry } from "../../types/registry.js";
+import { collationConflictError, isComparisonOperator, mergePropagatedCollation, resolveComparisonCollation } from "../analysis/comparison-collation.js";
 
 export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 	readonly nodeType = PlanNodeType.UnaryOp;
@@ -60,6 +61,7 @@ export class UnaryOpNode extends PlanNode implements UnaryScalarNode {
 			nullable,
 			isReadOnly: operandType.isReadOnly,
 			collationName: operandType.collationName,
+			collationSource: operandType.collationSource,
 		};
 	}
 
@@ -220,15 +222,30 @@ export class BinaryOpNode extends PlanNode implements BinaryScalarNode {
 				break;
 		};
 
-		// TODO: Handle collation conflict
-		const collationName = leftType.collationName || rightType.collationName;
+		// Comparisons resolve ONE collation across both operands (symmetric
+		// provenance lattice); a same-rank explicit/declared conflict is a user
+		// error surfaced at plan time (builders force this lazily-cached type
+		// eagerly — see building/expression.ts).
+		if (isComparisonOperator(this.expression.operator)) {
+			const resolution = resolveComparisonCollation(leftType, rightType);
+			if (resolution.kind === 'conflict') {
+				throw collationConflictError(resolution, this.expression);
+			}
+		}
+
+		// Result collation propagates by provenance rank (higher-ranked
+		// contribution wins; equal-rank different names propagate none), so a
+		// plain operand's defaulted BINARY can no longer shadow a declared
+		// collation on the other side of a concat.
+		const collation = mergePropagatedCollation([leftType, rightType]);
 
 		return {
 			typeClass: 'scalar',
 			logicalType,
 			nullable,
 			isReadOnly: leftType.isReadOnly || rightType.isReadOnly,
-			collationName,
+			collationName: collation.collationName,
+			collationSource: collation.collationSource,
 		};
 	}
 
@@ -505,7 +522,6 @@ export class CaseExprNode extends PlanNode implements NaryScalarNode {
 		let logicalType = firstType.logicalType;
 		let nullable = firstType.nullable;
 		let isReadOnly = firstType.isReadOnly;
-		let collationName = firstType.collationName;
 
 		// Check all other result expressions for type compatibility
 		for (let i = 1; i < resultExpressions.length; i++) {
@@ -521,17 +537,17 @@ export class CaseExprNode extends PlanNode implements NaryScalarNode {
 				isReadOnly = true;
 			}
 
-			// Handle collation conflicts - for now, use the first non-null collation
-			if (!collationName && exprType.collationName) {
-				collationName = exprType.collationName;
-			}
-
 			// TODO: Implement proper type coercion rules for SQL
 			// For now, if types differ, default to TEXT
 			if (exprType.logicalType !== logicalType) {
 				logicalType = TEXT_TYPE;
 			}
 		}
+
+		// Branch collations merge by provenance rank (order-independent);
+		// equal-rank disagreement propagates no collation rather than letting
+		// branch order pick a winner.
+		const collation = mergePropagatedCollation(resultExpressions.map(e => e.getType()));
 
 		// If there's no ELSE clause, the result can be NULL
 		if (!this.elseExpr) {
@@ -543,7 +559,8 @@ export class CaseExprNode extends PlanNode implements NaryScalarNode {
 			logicalType,
 			nullable,
 			isReadOnly,
-			collationName,
+			collationName: collation.collationName,
+			collationSource: collation.collationSource,
 		};
 	}
 
@@ -684,6 +701,7 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 			nullable: operandType.nullable, // CAST preserves nullability
 			isReadOnly: operandType.isReadOnly,
 			collationName: logicalType.isTextual ? operandType.collationName : undefined,
+			collationSource: logicalType.isTextual ? operandType.collationSource : undefined,
 		};
 	}
 
@@ -786,7 +804,10 @@ export class CollateNode extends PlanNode implements UnaryScalarNode {
 
 		return {
 			...operandType,
-			collationName: this.expression.collation.toUpperCase()
+			collationName: this.expression.collation.toUpperCase(),
+			// A COLLATE wrapper is the strongest provenance — rank 3 in the
+			// comparison-resolution lattice (even `collate binary` is a demand).
+			collationSource: 'explicit',
 		};
 	}
 
@@ -838,6 +859,7 @@ export class CollateNode extends PlanNode implements UnaryScalarNode {
 
 export class BetweenNode extends PlanNode implements TernaryScalarNode {
 	readonly nodeType = PlanNodeType.Between;
+	private cachedType: Cached<ScalarType>;
 
 	constructor(
 		public readonly scope: Scope,
@@ -847,17 +869,32 @@ export class BetweenNode extends PlanNode implements TernaryScalarNode {
 		public readonly upper: ScalarPlanNode,
 	) {
 		super(scope, 0.03); // Cost for three comparisons
+		this.cachedType = new Cached(this.generateType);
 	}
 
-	getType(): ScalarType {
-		// BETWEEN is equivalent to expr >= lower AND expr <= upper
+	generateType = (): ScalarType => {
+		// BETWEEN desugars to `expr >= lower AND expr <= upper`: each bound is
+		// an independent comparison, validated per-bound against the tested
+		// expression (two differently-collated bounds are NOT a conflict with
+		// each other). Eagerly forced at build time — see building/expression.ts.
+		const exprType = this.expr.getType();
+		for (const bound of [this.lower, this.upper]) {
+			const resolution = resolveComparisonCollation(exprType, bound.getType());
+			if (resolution.kind === 'conflict') {
+				throw collationConflictError(resolution, this.expression);
+			}
+		}
 		// If any operand is nullable, the result can be NULL
 		return {
 			typeClass: 'scalar',
 			logicalType: BOOLEAN_TYPE,
-			nullable: this.expr.getType().nullable || this.lower.getType().nullable || this.upper.getType().nullable,
+			nullable: exprType.nullable || this.lower.getType().nullable || this.upper.getType().nullable,
 			isReadOnly: true,
 		};
+	}
+
+	getType(): ScalarType {
+		return this.cachedType.value;
 	}
 
 	getChildren(): readonly [ScalarPlanNode, ScalarPlanNode, ScalarPlanNode] {
