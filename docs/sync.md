@@ -714,14 +714,15 @@ When the SyncManager applies remote changes, it must execute SQL in a way that t
 ```typescript
 // SyncManager applies a remote changeset
 async applyRemoteChangeset(changeset: ChangeSet): Promise<void> {
-  // 1. Update CRDT metadata first (before SQL execution)
+  // 1. Apply to store with remote flag (the data write must land first)
+  await this.applyToStore(changeset.changes, { remote: true });
+  // Store emits events with remote=true, SyncManager ignores them
+
+  // 2. Commit CRDT metadata only after the data write succeeded — see the
+  //    write-ordering invariant under Transactional Integrity During Sync.
   for (const change of changeset.changes) {
     await this.updateMetadataForRemote(change);
   }
-
-  // 2. Apply to store with remote flag
-  await this.applyToStore(changeset.changes, { remote: true });
-  // Store emits events with remote=true, SyncManager ignores them
 }
 ```
 
@@ -1127,7 +1128,7 @@ const syncManager = new SyncManagerImpl(metadataKvStore, storeEvents, applyToSto
 ### Remaining Work
 
 #### Transactional Integrity (Short-term)
-- [ ] Fix write order in `applyChanges`: write data first, then CRDT metadata (see [Transactional Integrity During Sync](#transactional-integrity-during-sync))
+- [x] Fix write order in `applyChanges`: write data first, then CRDT metadata; abort with no metadata on any whole-batch throw or per-change `ApplyToStoreResult.errors` (see [Transactional Integrity During Sync](#transactional-integrity-during-sync))
 - [ ] Use `WriteBatch` for per-table atomicity when applying remote changes
 - [ ] Consider using `TransactionCoordinator` in store adapter for batched writes
 

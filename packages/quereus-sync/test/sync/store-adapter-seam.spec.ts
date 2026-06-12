@@ -423,6 +423,11 @@ describe('store-adapter seam integration', () => {
 				thrown = e;
 			}
 			expect(String(thrown)).to.contain('no_such_table');
+			// throwIfApplyErrors aggregates the failed change(s) into one Error and
+			// chains the underlying store error as `cause`.
+			expect(thrown).to.be.instanceOf(Error);
+			expect((thrown as Error).message).to.contain('apply-to-store failed for');
+			expect((thrown as Error).cause).to.be.instanceOf(Error);
 
 			// Whole batch uncommitted: nothing to relay (neither `t` nor `no_such_table`).
 			const relayed = await syncManager.getChangesSince(generateSiteId());
