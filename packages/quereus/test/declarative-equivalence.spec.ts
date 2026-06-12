@@ -1768,6 +1768,89 @@ describe('declarative-equivalence: materialized views', () => {
 			await db.close();
 		}
 	});
+
+	it('a DECLARED-SHAPE maintained-table RENAME + backing-module move in one apply cooperate', async function () {
+		// Shape-agnostic counterpart to the MV-sugar cooperate test: the rename-
+		// coincident drop-the-new-name fix only touches the dropped NAME, not the
+		// recreate render, so the declared-shape surface (`create table … maintained
+		// as`) must behave identically when renamed + moved together.
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				table mvt (id INTEGER PRIMARY KEY, x INTEGER NOT NULL) maintained as select id, x from t
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				table mvt2 using mem2() (id INTEGER PRIMARY KEY, x INTEGER NOT NULL) maintained as select id, x from t
+					with tags ("quereus.previous_name" = 'mvt')
+			}`);
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(
+				diff.renames.some(r => r.kind === 'table' && r.oldName.toLowerCase() === 'mvt' && r.newName.toLowerCase() === 'mvt2'),
+				'mvt→mvt2 table rename preserved',
+			).to.be.true;
+			expect(diff.tablesToDrop, 'drop targets the new declared name mvt2').to.deep.equal(['mvt2']);
+			expect(
+				diff.tablesToCreate.some(s => /create\s+table\s+(?:"mvt2"|mvt2)\b/i.test(s) && /maintained\s+as/i.test(s) && /mem2/i.test(s)),
+				'recreate is a create-table-maintained-as carrying mem2 under the new name',
+			).to.be.true;
+			expect(diff.maintainedModuleMigrations, 'one module migration recorded under the new name').to.deep.equal([
+				{ name: 'mvt2', fromModule: 'memory', toModule: 'mem2' },
+			]);
+
+			await db.exec('apply schema main options (allow_destructive = true)');
+			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mvt2');
+			expect(live!.maintained!.backingModuleName, 'mvt2 now backed by mem2').to.equal('mem2');
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, x from mvt2 order by id')) rows.push(r);
+			expect(rows, 'rows re-derived into the new backing under the new name').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a dependent MATERIALIZED VIEW over a renamed+moved maintained table retargets and stays correct', async function () {
+		// The MV-sugar cooperate test pins a dependent PLAIN view; this pins a dependent
+		// MATERIALIZED view (mvdep over mv) across the same rename+module-move so the
+		// retarget machinery is exercised for a maintained dependent, not just a data-less
+		// plain view.
+		const db = new Database();
+		db.registerModule('mem2', new MemoryTableModule());
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv as select id, x from t
+				materialized view mvdep as select id, x from mv
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
+
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
+				materialized view mv2 using mem2() as select id, x from t
+					with tags ("quereus.previous_name" = 'mv')
+				materialized view mvdep as select id, x from mv2
+			}`);
+			await db.exec('apply schema main options (allow_destructive = true)');
+
+			const live = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'mv2');
+			expect(live!.maintained!.backingModuleName, 'mv2 now backed by mem2').to.equal('mem2');
+
+			const depRows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, x from mvdep order by id')) depRows.push(r);
+			expect(depRows, 'dependent MV retargeted to mv2 and still correct').to.deep.equal([{ id: 1, x: 10 }, { id: 2, x: 20 }]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 // ============================================================================
