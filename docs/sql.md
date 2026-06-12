@@ -1040,7 +1040,7 @@ Generated columns are computed from an expression over other columns in the same
 **CHECK Constraints:**
 
 - `check (expr)` is enforced on INSERT and UPDATE by default; `check on {insert | update | delete}[,...]` restricts the operations. Unqualified columns name the NEW row (the OLD row for DELETE-only checks); `old.<col>` / `new.<col>` reference either row image explicitly.
-- Comparisons inside a CHECK resolve **declared column collations** (and explicit `COLLATE` wrappers), exactly like the same expression in a query — `check (c = 'abc')` over a `text collate nocase` column accepts any case-variant. Operand precedence follows the engine's comparison rule (the right operand's collation wins, then the left's, then BINARY).
+- Comparisons inside a CHECK resolve **declared column collations** (and explicit `COLLATE` wrappers), exactly like the same expression in a query — `check (c = 'abc')` over a `text collate nocase` column accepts any case-variant. Resolution follows the engine's symmetric provenance lattice (explicit `COLLATE` > declared column collation > defaulted collation > BINARY; see `docs/types.md` § Comparison collation resolution), so `check (b = c)` and `check (c = b)` behave identically.
 - A CHECK containing a subquery is automatically deferred to transaction commit; the deferred evaluation runs the same compiled predicate, so collation semantics are identical to the immediate path.
 
 **Default Values:**
@@ -2412,8 +2412,12 @@ where total > (
 expr collate collation_name
 ```
 
-In a comparison, the collation is taken from the right operand if it carries an explicit
-`COLLATE`, else the left operand, else the operands' declared/default collation (`BINARY`).
+In a comparison, the effective collation is resolved **symmetrically** from both operands by
+provenance rank: an explicit `COLLATE` wrapper outranks a column's declared `COLLATE` clause,
+which outranks a defaulted collation; with no contribution from either side the comparison is
+`BINARY`. Two operands contributing *different* collations at the same explicit/declared rank
+are a prepare-time error (apply an explicit `COLLATE` to disambiguate); conflicting defaults
+resolve to `BINARY` silently. See `docs/types.md` § Comparison collation resolution.
 `BETWEEN` is evaluated as two independent comparisons (`expr >= lower AND expr <= upper`), so a
 `COLLATE` on a **bound** governs only *that bound's* comparison — it does not propagate to the
 whole expression. For example `x BETWEEN 'a' COLLATE NOCASE AND 'z'` compares `x >= 'a'` under
