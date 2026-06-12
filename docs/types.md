@@ -440,7 +440,14 @@ side) can only become a prepare-time ambiguous-collation error — never silentl
 different results — so the upgrade needs no catalog/DDL representation change.
 A defaulted *BINARY* (and an explicit `SET COLLATE binary`) reloads as rank 1
 because `BINARY` is elided from DDL — consistent with a CREATE-time
-`c text collate binary` column, which already round-trips to rank 1.
+`c text collate binary` column, which already round-trips to rank 1. This is the
+one direction where reopen relaxes rather than tightens: an in-session rank-2
+`collate binary` operand can make a comparison an ambiguous-collation error that,
+after reopen, resolves silently (the elided BINARY contributes nothing at rank
+1). The "fail-louder only" guarantee above covers the rank-1→rank-2 *upgrade* of
+a non-BINARY default; the BINARY-elision *downgrade* of an explicit/declared
+BINARY is the documented exception, and matches CREATE-time `collate binary`
+either way.
 
 Related forms:
 

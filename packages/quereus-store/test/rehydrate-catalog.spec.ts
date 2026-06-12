@@ -557,6 +557,52 @@ describe('StoreModule.rehydrateCatalog()', () => {
 		expect(t.columns.find(c => c.name === 'name')!.collation, 'name keeps NOCASE after reopen').to.equal('NOCASE');
 	});
 
+	// Option (a) reload provenance-upgrade (ticket collation-provenance-stability-
+	// set-collate-and-reload): a column whose collation came from session
+	// `default_collation` is rank 1 (`default`) IN-SESSION — it loses silently to a
+	// declared collation on the other operand — but the persisted DDL is fully
+	// explicit (an explicit `COLLATE` for any non-BINARY collation), so on reopen the
+	// re-parsed clause sets `collationExplicit` and the column reloads as rank 2
+	// (`declared`). The documented effect is fail-louder-only: a comparison that
+	// resolved silently in-session becomes a prepare-time ambiguous-collation error
+	// after reopen — never silently different results. This locks that boundary
+	// upgrade, which was otherwise covered by prose alone.
+	it('default_collation-derived collation upgrades rank 1 → declared across reopen (fail-louder)', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		// `v` inherits NOCASE from the session default (rank 1, collationExplicit
+		// false); `r` is a declared RTRIM (rank 2). 'xx ' = 'xx' matches under RTRIM
+		// but not under NOCASE, so a returned row proves the in-session comparison
+		// resolved to the rank-2 RTRIM winner with no conflict.
+		await db1.exec(`PRAGMA default_collation = 'nocase'`);
+		await db1.exec(`CREATE TABLE prov (id INTEGER PRIMARY KEY, v TEXT, r TEXT COLLATE RTRIM) USING store`);
+		await db1.exec(`INSERT INTO prov VALUES (1, 'xx ', 'xx')`);
+		const inSession = await asyncIterableToArray(db1.eval('select id from prov where v = r'));
+		expect(inSession, 'in-session: rank-1 default v loses silently to declared RTRIM r').to.deep.equal([{ id: 1 }]);
+
+		// Reopen into a fresh Database (default_collation back at BINARY — irrelevant,
+		// since the persisted DDL carries an explicit COLLATE NOCASE).
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed default-derived collation DDL parses cleanly').to.have.lengthOf(0);
+		// The rehydrated column carries NOCASE...
+		const t = db2.schemaManager.findTable('prov')!;
+		expect(t.columns.find(c => c.name === 'v')!.collation, 'v keeps NOCASE after reopen').to.equal('NOCASE');
+		// ...and now contributes at rank 2, so v = r is a same-rank declared conflict.
+		let rejected = false;
+		try {
+			await asyncIterableToArray(db2.eval('select id from prov where v = r'));
+		} catch (e) {
+			rejected = true;
+			expect(String(e), 'after reopen: rank-2 NOCASE vs rank-2 RTRIM is an ambiguous-collation error')
+				.to.match(/ambiguous collation/i);
+		}
+		expect(rejected, 'the silently-resolved in-session comparison fails louder after reopen').to.be.true;
+	});
+
 	// A single ADD COLUMN declaring BOTH a CHECK and an FK exercises the store's two
 	// independent merge arms (checkConstraints AND foreignKeys both extended on
 	// `persistedSchema`). Both must persist and enforce after reopen.
