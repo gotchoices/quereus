@@ -1088,8 +1088,11 @@ export class MaterializedViewManager {
 	 * engine also early-returns, but skipping the `getTable` + loop avoids all per-change work).
 	 * NOT gated on `plan.derivedRowValidator` — that gate is child-side (constraints *on* `M`);
 	 * an inbound FK lives on `C` and leaves `M`'s plan untouched. Beyond the gate it fires
-	 * unconditionally per delete/update change: the engine's `O(catalog)` referencing-FK scan
-	 * is the same cost an ordinary `delete from M` pays, so this is parity, not a new tax.
+	 * unconditionally per delete/update change, but the engine no longer pays an `O(catalog)`
+	 * scan: both calls route through `SchemaManager.getReferencingForeignKeys`, the precomputed
+	 * reverse-FK index, so an `M` that nothing references resolves to the shared empty bucket and
+	 * each call early-returns in O(1) — a maintained table with no inbound FK (the common case)
+	 * pays only the pragma check plus one map lookup per delete/key-update change.
 	 */
 	private async enforceParentSideReferentialActions(
 		plan: MaintenancePlan,
