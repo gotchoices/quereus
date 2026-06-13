@@ -31,11 +31,19 @@
  * defers MV maintenance and watch capture for the whole transfer and converges
  * once at the end.
  *   - `bootstrap` flush: steps 1–4 run unchanged (storage rows applied, remote
- *     module events emitted) but step 5 — the seam call — is SKIPPED. With MV
- *     maintenance + capture both deferred and FK actions off for a wholesale
- *     load, the seam would be a pure no-op that still opens a
- *     transaction/savepoint per flush; skipping it removes that overhead and
- *     the per-flush full-rebuild.
+ *     module events emitted) but step 5 — the seam call — is SKIPPED. MV
+ *     maintenance + capture are deferred to the finalize and FK actions are off
+ *     for a wholesale load, so the only seam facet skipping the call drops
+ *     outright is commit-time GLOBAL ASSERTION evaluation over the bootstrapped
+ *     rows — deliberate under the seam's trust-the-origin contract: a complete
+ *     snapshot already satisfied the origin's assertions, and per-flush
+ *     evaluation over partial data could spuriously fail a valid snapshot
+ *     (a cross-table assertion seeing children before parents). The remaining
+ *     seam work for a wholesale load is otherwise deferred, so skipping the call
+ *     also removes the per-flush transaction/savepoint and the per-flush
+ *     full-rebuild. (Whether the finalize should re-validate assertions over the
+ *     converged state is an open design question — see the backlog ticket
+ *     `sync-bootstrap-assertion-enforcement`.)
  *   - `bootstrapFinalize` call (empty data/schema): converges every MV in
  *     dependency order via `db.refreshAllMaterializedViews()`, then fires a
  *     coarse `db.notifyExternalChange` per bootstrapped base table and per
