@@ -431,8 +431,8 @@ describe('materialized views `using store` (end-to-end)', () => {
 		// attach), not the host machinery.
 		//
 		// Flow mirrors the memory spec: (1) seed a clean row (row-time maintained into mt);
-		// (2) a body-relevant source add (`alter table src add column pad`) marks mt stale
-		// and detaches its row-time plan, so step (3) is NOT maintained in; (3) drift a
+		// (2) a body-relevant shape-shifting ALTER on a projected column (drop not null /
+		// retype) marks mt stale and detaches its row-time plan, so step (3) is NOT maintained in; (3) drift a
 		// violator into the now-unmaintained source; (4) `refresh` and assert the
 		// maintained-table-attributed diagnostic + intact COMMITTED store contents + stays
 		// stale (a clean drift instead commits + clears stale).
@@ -445,8 +445,8 @@ describe('materialized views `using store` (end-to-end)', () => {
 				await db.exec(`create table mt (id integer primary key, v text not null, check (v <> 'poison'))
 					using store maintained as select id, v from src`);
 				await db.exec(`insert into src values (1, 'clean')`);
-				await db.exec('alter table src add column pad integer null'); // stale + plan detached
-				expect(isStale('mt'), 'add column marked mt stale').to.equal(true);
+				await db.exec('alter table src alter column v drop not null'); // stale + plan detached
+				expect(isStale('mt'), 'shape-shifting alter marked mt stale').to.equal(true);
 			});
 
 			it('a CHECK-violating drift throws the attribution and leaves the committed store contents intact + stale', async () => {
@@ -484,8 +484,8 @@ describe('materialized views `using store` (end-to-end)', () => {
 				await db.exec('insert into parent values (1)');
 				await db.exec('insert into src values (1, 1)');
 				expect(await rows(db, 'select id, ref from mt')).to.deep.equal([{ id: 1, ref: 1 }]);
-				await db.exec('alter table src add column pad integer null'); // stale + plan detached
-				expect(isStale('mt'), 'add column marked mt stale').to.equal(true);
+				await db.exec('alter table src alter column ref set data type real'); // stale + plan detached
+				expect(isStale('mt'), 'shape-shifting alter marked mt stale').to.equal(true);
 			});
 
 			it('an FK-orphan drift throws the FK attribution and leaves the committed store contents intact + stale', async () => {

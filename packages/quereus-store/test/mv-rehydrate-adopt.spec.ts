@@ -464,17 +464,18 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			return raw ? new TextDecoder().decode(raw) : undefined;
 		}
 
-		it('a stale-at-close MV refills even under a clean shutdown (add column + post-stale DML)', async () => {
+		it('a stale-at-close MV refills even under a clean shutdown (structural alter + post-stale DML)', async () => {
 			const { db, mod } = open();
 			await db.exec('create table src (id integer primary key, v integer) using store');
 			await db.exec('insert into src values (1, 10), (2, 20)');
 			await db.exec('create materialized view mv using store as select id, v from src');
-			// An unprojected ADD COLUMN fires a body-RELEVANT `table_modified` on src
-			// (the column set changed) ⇒ mv goes stale and its row-time maintenance
-			// detaches. Pin the trigger. (An index/constraint-only change no longer
-			// stales — it recompiles the MV in place; see 53.3 sqllogic.)
-			await db.exec('alter table src add column w integer null');
-			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale, 'add column marked the MV stale')
+			// A shape-shifting structural ALTER on the PROJECTED column v (drop not null
+			// shifts the body's output nullability) fires a body-RELEVANT `table_modified`
+			// on src ⇒ mv goes stale and its row-time maintenance detaches. Pin the trigger.
+			// (A value-disjoint structural ALTER — e.g. a bare unprojected ADD COLUMN — no
+			// longer stales: it recompiles the MV in place; see 53.4 sqllogic.)
+			await db.exec('alter table src alter column v drop not null');
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale, 'shape-shifting alter marked the MV stale')
 				.to.equal(true);
 			// NOT propagated to the backing (maintenance detached) — the divergence.
 			await db.exec('insert into src (id, v) values (3, 30)');
@@ -502,7 +503,7 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('create table src (id integer primary key, v integer) using store');
 			await db.exec('insert into src values (1, 10), (2, 20)');
 			await db.exec('create materialized view mv using store as select id, v from src');
-			await db.exec('alter table src add column w integer null');
+			await db.exec('alter table src alter column v drop not null');
 			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
 			// refresh re-materializes and re-arms maintenance, clearing `stale`.
 			await db.exec('refresh materialized view mv');
@@ -529,9 +530,9 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('insert into b values (1, 100)');
 			await db.exec('create materialized view amv using store as select id, v from a');
 			await db.exec('create materialized view bmv using store as select id, v from b');
-			// Only `a` is altered (body-relevant: unprojected ADD COLUMN) ⇒ only amv
-			// goes stale; bmv stays live.
-			await db.exec('alter table a add column w integer null');
+			// Only `a` is altered (a shape-shifting drop not null on the projected column
+			// v) ⇒ only amv goes stale; bmv stays live.
+			await db.exec('alter table a alter column v drop not null');
 			expect(db.schemaManager.getMaintainedTable('main', 'amv')!.derivation.stale, 'amv stale').to.equal(true);
 			expect(db.schemaManager.getMaintainedTable('main', 'bmv')!.derivation.stale ?? false, 'bmv live').to.equal(false);
 			await mod.closeAll();
@@ -553,10 +554,10 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			await db.exec('insert into src values (1, 10), (2, 20)');
 			await db.exec('create materialized view mv1 using store as select id, v from src');
 			await db.exec('create materialized view mv2 using store as select id, v from mv1');
-			// A body-relevant ALTER on mv1's source (unprojected ADD COLUMN) marks mv1
-			// stale; the backing-invalidation cascade (synthetic `table_modified` on
-			// `mv1`) marks mv2 stale too.
-			await db.exec('alter table src add column w integer null');
+			// A body-relevant ALTER on mv1's source (a shape-shifting drop not null on
+			// the projected column v) marks mv1 stale; the backing-invalidation cascade
+			// (synthetic `table_modified` on `mv1`) marks mv2 stale too.
+			await db.exec('alter table src alter column v drop not null');
 			expect(db.schemaManager.getMaintainedTable('main', 'mv1')!.derivation.stale, 'mv1 stale').to.equal(true);
 			expect(db.schemaManager.getMaintainedTable('main', 'mv2')!.derivation.stale, 'mv2 stale (cascade)').to.equal(true);
 			await mod.closeAll();
