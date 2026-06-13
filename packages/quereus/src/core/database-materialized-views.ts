@@ -752,6 +752,92 @@ export class MaterializedViewManager {
 		}
 	}
 
+	/* ──────────────────── convergence ordering ──────────────────── */
+
+	/**
+	 * The source bases (lowercased `schema.table`) an MV's body reads — the
+	 * dependency edges {@link Database.refreshAllMaterializedViews} orders the
+	 * convergence sweep on. A registered (live) MV reports its compiled plan's
+	 * bases ({@link planSourceBases} — the same set `rowTimeBySource` indexes it
+	 * under). A **stale** MV has no live plan (a body-relevant source change
+	 * released it), so its bases come from the recorded
+	 * {@link import('../schema/derivation.js').TableDerivation.sourceTables} — the
+	 * body's source-table set captured at (re)registration and kept current
+	 * through every reshape. That recorded set is identical to what re-planning
+	 * the body would derive (the create/refresh path fills it from the same
+	 * analysis), but never re-plans a stale body that may no longer plan — so the
+	 * ordering pass cannot throw a planning error before the per-MV refresh
+	 * surfaces the real staleness diagnostic.
+	 */
+	sourceBasesFor(mv: MaintainedTableSchema): readonly string[] {
+		const plan = this.rowTime.get(mvKey(mv.schemaName, mv.name));
+		return plan ? planSourceBases(plan) : mv.derivation.sourceTables;
+	}
+
+	/**
+	 * All maintained tables in **source-dependency order**: a base MV precedes
+	 * every MV whose body reads it (MV-over-MV — in the unified model a base MV's
+	 * backing is a table under its own name, so a dependent's
+	 * {@link sourceBasesFor} contains that qualified name). A sequential refresh
+	 * sweep over this order is correct because refresh is commit-first per MV: a
+	 * base MV's backing commits before a dependent's body re-reads it
+	 * ({@link Database.refreshAllMaterializedViews}).
+	 *
+	 * Edges are `sourceBasesFor(mv)` intersected with the MV-key set (a non-MV
+	 * source is no ordering constraint); Kahn's algorithm produces the order.
+	 * Throws {@link StatusCode.INTERNAL} on a cycle — the create-time gates
+	 * (`assertNoSelfReference` / `assertNoDerivationCycle`) reject recursive MVs,
+	 * so a cycle here is an impossible-state backstop, never a silently dropped MV.
+	 */
+	materializedViewRefreshOrder(): MaintainedTableSchema[] {
+		const mvs = this.ctx.schemaManager.getAllMaintainedTables();
+		const byKey = new Map<string, MaintainedTableSchema>();
+		for (const mv of mvs) byKey.set(mvKey(mv.schemaName, mv.name), mv);
+
+		// Prerequisite count (in-degree) + reverse adjacency (base → consumers).
+		const indegree = new Map<string, number>();
+		const consumers = new Map<string, string[]>();
+		for (const key of byKey.keys()) { indegree.set(key, 0); consumers.set(key, []); }
+
+		for (const mv of mvs) {
+			const key = mvKey(mv.schemaName, mv.name);
+			const prereqs = new Set<string>();
+			for (const base of this.sourceBasesFor(mv)) {
+				const baseKey = base.toLowerCase();
+				// A non-MV source is no ordering constraint; a self-edge is impossible
+				// (create-time gate) — skip both, and dedup so a body reading a base
+				// twice adds one edge.
+				if (baseKey === key || !byKey.has(baseKey) || prereqs.has(baseKey)) continue;
+				prereqs.add(baseKey);
+				consumers.get(baseKey)!.push(key);
+				indegree.set(key, indegree.get(key)! + 1);
+			}
+		}
+
+		// Kahn: drain zero-in-degree keys in catalog-enumeration order (stable).
+		const order: MaintainedTableSchema[] = [];
+		const ready: string[] = [];
+		for (const key of byKey.keys()) if (indegree.get(key) === 0) ready.push(key);
+		while (ready.length > 0) {
+			const key = ready.shift()!;
+			order.push(byKey.get(key)!);
+			for (const dep of consumers.get(key)!) {
+				const next = indegree.get(dep)! - 1;
+				indegree.set(dep, next);
+				if (next === 0) ready.push(dep);
+			}
+		}
+
+		if (order.length !== mvs.length) {
+			throw new QuereusError(
+				`materialized-view convergence ordering found a dependency cycle among maintained tables `
+					+ `(ordered ${order.length} of ${mvs.length}) — recursive materialized views are rejected at create time`,
+				StatusCode.INTERNAL,
+			);
+		}
+		return order;
+	}
+
 	/* ──────────────────── coarsening collision telemetry ──────────────────── */
 
 	/**

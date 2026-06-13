@@ -19,6 +19,7 @@ import { Parser } from '../parser/parser.js';
 import * as AST from '../parser/ast.js';
 import { buildBlock } from '../planner/building/block.js';
 import { emitPlanNode } from '../runtime/emitters.js';
+import { refreshMaintainedTable } from '../runtime/emit/materialized-view.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
@@ -1884,6 +1885,64 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  (ALTER … RENAME propagation failure path). */
 	public markMaterializedViewStale(mv: MaintainedTableSchema): void {
 		this.materializedViewManager.markMaterializedViewStale(mv);
+	}
+
+	/**
+	 * Refresh every maintained table (materialized view) in source-dependency
+	 * order, bringing each backing current with its sources. The convergence
+	 * point after a wholesale external load (e.g. a sync snapshot bootstrap) that
+	 * deferred row-time maintenance. Each MV is refreshed through the same
+	 * full-rebuild path as `refresh materialized view` (stale revalidation, shape
+	 * re-derivation/reshape, row-time re-registration, `stale` clear), so a
+	 * bounded-delta MV is full-rebuilt here too — convergence does not depend on
+	 * delta replay, and the full rebuild re-reads the complete source through the
+	 * vtab regardless of how its rows arrived (out-of-band direct-storage writes
+	 * included). MV-over-MV chains converge base-first: refresh is commit-first per
+	 * MV, so a base MV's backing is committed before a dependent's body re-reads it.
+	 *
+	 * NOT atomic across the sweep — the whole sweep is deliberately NOT wrapped in
+	 * one explicit transaction (refresh is commit-first per MV, so an enclosing
+	 * transaction would not make it atomic anyway). Each MV ensures/commits its own
+	 * implicit transaction exactly as the single-MV `refresh` does, so a failure
+	 * partway leaves earlier MVs converged; the caller (snapshot bootstrap) retries
+	 * the whole load idempotently.
+	 *
+	 * Serialized via the exec mutex like any statement — do NOT call from within
+	 * statement execution or a vtab callback (deadlock; same constraint as
+	 * `refresh materialized view` itself). Returns the refreshed MV identifiers
+	 * (for coarse watch notification); `[]` (no mutex, no transaction) when there
+	 * are no maintained tables. See `docs/materialized-views.md` § Converging all
+	 * materialized views.
+	 */
+	public async refreshAllMaterializedViews(): Promise<Array<{ schemaName: string; name: string }>> {
+		this.checkOpen();
+		// Build the order BEFORE the mutex: it only reads catalog/plan state, and an
+		// empty catalog must take no mutex and start no transaction.
+		const order = this.materializedViewManager.materializedViewRefreshOrder();
+		if (order.length === 0) return [];
+
+		const refreshed: Array<{ schemaName: string; name: string }> = [];
+		await this._withMutex(async () => {
+			// Per-MV implicit-transaction scope mirrors `exec`'s per-statement boundary:
+			// each refresh commits independently (commit-first), so a mid-sweep failure
+			// leaves the already-refreshed MVs converged rather than rolling them back.
+			for (const mv of order) {
+				try {
+					await this._ensureTransaction();
+					const live = await refreshMaintainedTable(this, mv);
+					if (this._isImplicitTransaction()) {
+						await this._commitTransaction();
+					}
+					refreshed.push({ schemaName: live.schemaName, name: live.name });
+				} catch (err) {
+					if (this._isImplicitTransaction()) {
+						await this._rollbackTransaction();
+					}
+					throw err;
+				}
+			}
+		});
+		return refreshed;
 	}
 
 	/** @internal Cheap synchronous guard for the per-row DML maintenance hook: true
