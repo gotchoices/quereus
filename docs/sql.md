@@ -3939,7 +3939,11 @@ common_table_expr  = cte_name [ "(" column_name { "," column_name } ")" ]
 cte_name           = identifier ;
 
 /* SELECT statement */
-select_stmt        = simple_select [ compound_operator simple_select ]* [ order_by_clause ] [ limit_clause ] ;
+select_stmt        = simple_select [ compound_operator simple_select ]* [ order_by_clause ] [ limit_clause ] [ with_defaults_clause ] ;
+
+with_defaults_clause = "with" "defaults" "(" column_name "=" expr { "," column_name "=" expr } ")" ;
+                     (* per-column omitted-insert defaults for view write-through; binds to the whole
+                        compound, after limit/offset and before the DDL-level tags_clause — see view-updateability.md *)
 
 simple_select      = "select" [ distinct_clause ] result_column { "," result_column }
                      [ from_clause ]
@@ -4091,16 +4095,16 @@ indexed_column     = column_name [ "collate" collation_name ] [ "asc" | "desc" ]
 /* CREATE VIEW statement */
 create_view_stmt   = "create" "view" [ "if" "not" "exists" ]
                      view_name [ "(" column_name { "," column_name } ")" ] "as" select_stmt
-                     [ insert_defaults_clause ] [ tags_clause ] ;
-
-insert_defaults_clause = "insert" "defaults" "(" column_name "=" expr { "," column_name "=" expr } ")" ;
+                     [ tags_clause ] ;
+                     (* omitted-insert defaults ride inside select_stmt's trailing with_defaults_clause *)
 
 /* CREATE / REFRESH MATERIALIZED VIEW statements.
-   The body is any query expression — a select_stmt, values_stmt, or with_clause select_stmt. */
+   The body is any query expression — a select_stmt, values_stmt, or with_clause select_stmt.
+   Its omitted-insert defaults ride inside select_stmt's trailing with_defaults_clause. */
 create_materialized_view_stmt = "create" "materialized" "view"
                      [ "if" "not" "exists" ] view_name [ "(" column_name { "," column_name } ")" ]
                      [ "using" module_name [ "(" module_arg { "," module_arg } ")" ] ] "as" select_stmt
-                     [ insert_defaults_clause ] [ tags_clause ] ;
+                     [ tags_clause ] ;
 
 refresh_materialized_view_stmt = "refresh" "materialized" "view" view_name ;
 

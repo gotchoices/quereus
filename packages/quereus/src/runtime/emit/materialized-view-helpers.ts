@@ -383,8 +383,10 @@ export function assertDeclaredColumnArity(def: MaterializeViewDefinition, shape:
  * string carries any trailing `with defaults (…)` clause), NOT the executable
  * bodySql — the declarative differ recomputes the same form from a declared MV,
  * so a defaults-only or explicit-columns-only change is detected as drift.
- * `def.bodySql` stays select-only: it feeds execution (collectBodyRows /
- * deriveBackingShape / linkCoveredUniqueConstraints).
+ * `def.bodySql` is the full body render (it carries the inert trailing
+ * `with defaults (…)` clause, which the read planner ignores — defaults are
+ * realized only in the view write-through rewrite): it feeds execution
+ * (collectBodyRows / deriveBackingShape / linkCoveredUniqueConstraints).
  */
 function buildTableDerivation(def: MaterializeViewDefinition, shape: BackingShape): TableDerivation {
 	return {

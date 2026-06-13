@@ -1649,6 +1649,10 @@ insert into df3_v values (1, 'x');
 select * from df3 order by id;
 → [{"id":1,"created":111,"label":"x"}]
 
+-- --- a duplicate target WITHIN one `with defaults` clause is a parse error ---
+create view df3_dup_v as select id from df3 with defaults (created = 1, created = 2);
+-- error: Duplicate column 'created' in WITH DEFAULTS
+
 -- --- the retired view-DDL default_for tag is unknown at mutation ---
 -- View-DDL tag validation is lazy (the create succeeds; the rename hints are the
 -- only reserved keys still legal there, inert on a direct create) — the

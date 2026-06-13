@@ -980,55 +980,6 @@ function isResultColumnExposure(
 	return bodyFrame.aliasMap.get(qualLower) === state.tableName;
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// `insert defaults` clause (views / materialized views)
-// ──────────────────────────────────────────────────────────────────────
-
-/**
- * Lowercased table names referenced by the top-level FROM of a view body
- * (recursing into joins and compound tails, NOT into subqueries). These are the
- * tables an `insert defaults` clause's columns can belong to — the clause's
- * `column` names a BASE-TABLE column of the view's FROM table (often projected
- * away, so the select-body rewrite cannot catch it) and its `expr` evaluates in
- * that base table's inserted-row context. Only sources in `defaultSchemaName`
- * (explicitly qualified or unqualified) are collected — a cross-schema FROM
- * entry that merely shares the renamed table's name must not scope the clause
- * rewrite to it. A column rename never changes table names, so the forward
- * rename propagation can collect before or after its body rewrite; the
- * differ's inverse path collects from the ORIGINAL declared body
- * (declared/new names — the key its rename map uses) BEFORE its inverse table
- * pass rewrites the references to their old forms.
- *
- * Limitation: a CTE shadowing a same-named real table is still collected (no
- * WITH-scope tracking here). A view whose FROM is a CTE is not insertable, so
- * its clause is dormant either way; the differ shares the same blind spot, so
- * forward propagation and inverse reconciliation stay in agreement.
- */
-export function collectFromTableNames(query: AST.QueryExpr, defaultSchemaName: string): Set<string> {
-	const names = new Set<string>();
-	const visitFrom = (item: AST.FromClause): void => {
-		if (item.type === 'table') {
-			const table = (item as AST.TableSource).table;
-			if (schemaMatches(table.schema, defaultSchemaName)) {
-				names.add(table.name.toLowerCase());
-			}
-		} else if (item.type === 'join') {
-			const join = item as AST.JoinClause;
-			visitFrom(join.left);
-			visitFrom(join.right);
-		}
-	};
-	const visitQuery = (q: AST.QueryExpr | undefined): void => {
-		if (!q || q.type !== 'select') return;
-		const stmt = q as AST.SelectStmt;
-		(stmt.from ?? []).forEach(visitFrom);
-		visitQuery(stmt.union);
-		if (stmt.compound) visitQuery(stmt.compound.select);
-	};
-	visitQuery(query);
-	return names;
-}
-
 /**
  * Rename `new.<old>` → `new.<new>` references inside a `with inverse` assignment
  * expression, for output columns whose name shifted under a column rename (an

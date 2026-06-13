@@ -852,8 +852,9 @@ drop table t_vd4;
 --     the clause (FROM-table scoping is schema-aware)
 -- ===================================
 -- The view's FROM table is temp.t_vd5; renaming main.t_vd5's column must leave
--- the clause alone — `collectFromTableNames` excludes cross-schema sources, so
--- a bare-name collision cannot false-rewrite the target and break inserts.
+-- the clause alone — the scope-aware walk binds the clause to temp.t_vd5 (a
+-- schema-qualified FROM source), so a bare-name collision in another schema
+-- cannot false-rewrite the target and break inserts.
 
 create table temp.t_vd5 (id integer primary key, name text, created integer not null);
 create table t_vd5 (id integer primary key, created integer not null);
@@ -870,3 +871,34 @@ select id, name, created from temp.t_vd5;
 drop view v_vd5;
 drop table t_vd5;
 drop table temp.t_vd5;
+
+-- ===================================
+-- 23. RENAME COLUMN must NOT false-capture a like-named column inside a
+--     `with defaults` expr subquery (forward scope-aware resolver)
+-- ===================================
+-- The renamed column (t_vd6.cap) shares its name with lim_vd6.cap, which the
+-- clause's subquery references. The forward walk descends `select.defaults`: the
+-- body projection `cap` rewrites to `cap_new`, but an enclosing FROM seed would
+-- ALSO false-capture the inner `cap` → `cap_new` and the write-through subquery
+-- `select max(cap_new) from lim_vd6` would then error ("no such column"). The
+-- threaded `resolveColumnInSource` keeps the inner ref bound to lim_vd6
+-- (declared-side / differ parity, see schema-differ.spec.ts).
+
+create table lim_vd6 (id integer primary key, cap integer);
+insert into lim_vd6 values (1, 50);
+
+create table t_vd6 (id integer primary key, cap integer, ts integer not null);
+create view v_vd6 as select id, cap from t_vd6 with defaults (ts = (select max(cap) from lim_vd6));
+
+alter table t_vd6 rename column cap to cap_new;
+
+-- the projected body column followed the rename (id, cap_new); the inner subquery
+-- still targets lim_vd6.cap — a false-capture would break the default evaluation.
+insert into v_vd6 (id, cap_new) values (9, 7);
+
+select id, cap_new, ts from t_vd6;
+→ [{"id":9,"cap_new":7,"ts":50}]
+
+drop view v_vd6;
+drop table t_vd6;
+drop table lim_vd6;
