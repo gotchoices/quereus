@@ -432,17 +432,17 @@ describe('Parent-side referential enforcement for maintained-table maintenance w
 			expect(await count('m')).to.equal(N);
 			expect(await readAll('select id, v from m where id = 1')).to.deep.equal([{ id: 1, v: 1001 }]);
 
-			// Bulk delete => many backing delete deltas. (A front-anchored `id <= K` predicate;
-			// a tail/gap predicate like `id > 100` trips an UNRELATED memory-vtab range-delete bug
-			// — see tickets/fix/delete-range-predicate-under-deletes — that this ticket does not touch.)
-			await db.exec('delete from src where id <= 100');
+			// Bulk delete => many backing delete deltas, via a non-front-anchored tail predicate
+			// (`id > 100`) so the range delete exercises the inheritree COW sibling borrow/merge
+			// path fixed in delete-range-predicate-under-deletes.
+			await db.exec('delete from src where id > 100');
 			expect(await count('m')).to.equal(100);
 
 			// Parity invariant: the maintained image is exactly the projection of the live source
 			// after the whole delta lifecycle — the gate short-circuit changed cost, not results.
 			expect(await readAll('select id, v from m order by id'))
 				.to.deep.equal(await readAll('select id, v from src order by id'));
-			expect(await readAll('select min(id) as mn, max(id) as mx from m')).to.deep.equal([{ mn: 101, mx: 200 }]);
+			expect(await readAll('select min(id) as mn, max(id) as mx from m')).to.deep.equal([{ mn: 1, mx: 100 }]);
 
 			// Gate unchanged after the DML lifecycle (DDL-free statements never rebuild it).
 			expect(db.schemaManager.getReferencingForeignKeys('main', 'm')).to.deep.equal([]);

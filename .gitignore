@@ -3,7 +3,8 @@ dist
 doc
 **/*.tsbuildinfo
 packages/sync-coordinator/.data
-.yarn
+.yarn/*
+!.yarn/patches
 .quereus
 .yarnrc.yml
 

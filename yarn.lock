@@ -2301,7 +2301,7 @@ __metadata:
     eslint-plugin-import: "npm:^2.32.0"
     fast-check: "npm:^4.5.3"
     fast-json-patch: "npm:^3.1.1"
-    inheritree: "npm:^0.3.4"
+    inheritree: "patch:inheritree@npm%3A0.3.4#~/.yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch"
     moat-maker: "npm:^2.2.0"
     mocha: "npm:^11.7.5"
     rimraf: "npm:^6.1.2"
@@ -6594,10 +6594,17 @@ __metadata:
   languageName: node
   linkType: hard
 
-"inheritree@npm:^0.3.4":
+"inheritree@npm:0.3.4":
   version: 0.3.4
   resolution: "inheritree@npm:0.3.4"
   checksum: 10c0/31c3791c5d140a04c952ccd9ca8db05bc5a5cfbc89cd6b966f483e5548819f084a9d1776a4f8e2d31c5da5f627c383a8ef62a5ae228ee3625fb3889811c97c27
+  languageName: node
+  linkType: hard
+
+"inheritree@patch:inheritree@npm%3A0.3.4#~/.yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch":
+  version: 0.3.4
+  resolution: "inheritree@patch:inheritree@npm%3A0.3.4#~/.yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch::version=0.3.4&hash=4a59ee"
+  checksum: 10c0/b91c87ea27bde963878932e67a6ef8a7f523a9e74b4a42b2cad55ce2708dea7a3d1662fce1b9ef55816d3e15609c46bd83bf30575b1f8447d83f4242fa349d9e
   languageName: node
   linkType: hard
 
