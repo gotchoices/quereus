@@ -394,4 +394,80 @@ describe('Parent-side referential enforcement for maintained-table maintenance w
 			expect(await count('c')).to.equal(1);
 		});
 	});
+
+	/* ──────────────────── reverse-FK index gate (unreferenced maintained table) ──────────────────── */
+
+	describe('reverse-FK index gate: an unreferenced maintained table short-circuits enforcement', () => {
+		// After routing the parent-side engine through SchemaManager.getReferencingForeignKeys,
+		// a maintained table that NOTHING references resolves to the shared empty bucket. So the
+		// per-backing-delta cost is one map lookup, and the two engine calls the maintenance hook
+		// makes (assertTransitiveRestrictsForParentMutation + executeForeignKeyActionsAndLens)
+		// early-return without walking the catalog. We assert behavioral parity across a bulk of
+		// backing deltas plus the white-box gate value (getReferencingForeignKeys('main','m') === []).
+
+		it('an unreferenced maintained table maintains correctly across a bulk of deltas; its reverse-FK bucket is the empty gate', async () => {
+			await db.exec(`
+				create table src (id integer primary key, v integer);
+				create table m (id integer primary key, v integer) maintained as select id, v from src;
+				-- An unrelated FK pair so the reverse-FK index is non-empty overall, yet m's bucket stays empty.
+				create table other_p (pid integer primary key);
+				create table other_c (cid integer primary key, p integer, foreign key (p) references other_p(pid));
+			`);
+
+			// White-box: nothing references m, so the lookup is the shared empty array (the O(1) gate).
+			expect(db.schemaManager.getReferencingForeignKeys('main', 'm')).to.deep.equal([]);
+			// The index IS populated (other_p is referenced) -- the empty m bucket is a real miss,
+			// not an un-built index masquerading as empty.
+			expect(db.schemaManager.getReferencingForeignKeys('main', 'other_p')).to.have.length(1);
+
+			// Bulk source write => many backing inserts (each a parent-side-enforcement opportunity
+			// that the gate now skips in O(1)).
+			const N = 200;
+			const insertValues = Array.from({ length: N }, (_, i) => `(${i + 1}, ${i + 1})`).join(', ');
+			await db.exec(`insert into src values ${insertValues}`);
+			expect(await count('m')).to.equal(N);
+
+			// Bulk key-update => many backing update deltas (the per-delta FK gate is consulted).
+			await db.exec('update src set v = v + 1000 where id <= 100');
+			expect(await count('m')).to.equal(N);
+			expect(await readAll('select id, v from m where id = 1')).to.deep.equal([{ id: 1, v: 1001 }]);
+
+			// Bulk delete => many backing delete deltas. (A front-anchored `id <= K` predicate;
+			// a tail/gap predicate like `id > 100` trips an UNRELATED memory-vtab range-delete bug
+			// — see tickets/fix/delete-range-predicate-under-deletes — that this ticket does not touch.)
+			await db.exec('delete from src where id <= 100');
+			expect(await count('m')).to.equal(100);
+
+			// Parity invariant: the maintained image is exactly the projection of the live source
+			// after the whole delta lifecycle — the gate short-circuit changed cost, not results.
+			expect(await readAll('select id, v from m order by id'))
+				.to.deep.equal(await readAll('select id, v from src order by id'));
+			expect(await readAll('select min(id) as mn, max(id) as mx from m')).to.deep.equal([{ mn: 101, mx: 200 }]);
+
+			// Gate unchanged after the DML lifecycle (DDL-free statements never rebuild it).
+			expect(db.schemaManager.getReferencingForeignKeys('main', 'm')).to.deep.equal([]);
+		});
+
+		it('a referenced maintained table still enforces CASCADE across a bulk of deltas (pair to the gate case)', async () => {
+			await db.exec(`
+				create table src (id integer primary key, v integer);
+				create table m (id integer primary key, v integer) maintained as select id, v from src;
+				create table c (cid integer primary key, m_id integer,
+					foreign key (m_id) references m(id) on delete cascade);
+			`);
+			// m IS referenced => a non-empty bucket; the gate does NOT short-circuit.
+			expect(db.schemaManager.getReferencingForeignKeys('main', 'm')).to.have.length(1);
+
+			const N = 50;
+			const srcValues = Array.from({ length: N }, (_, i) => `(${i + 1}, ${i + 1})`).join(', ');
+			await db.exec(`insert into src values ${srcValues}`);
+			const cValues = Array.from({ length: N }, (_, i) => `(${i + 1}, ${i + 1})`).join(', ');
+			await db.exec(`insert into c values ${cValues}`);
+
+			// A bulk maintenance delete cascades through every matching child.
+			await db.exec('delete from src where id <= 30');
+			expect(await count('m')).to.equal(20);
+			expect(await count('c'), 'cascade fired for each deleted parent across the bulk').to.equal(20);
+		});
+	});
 });

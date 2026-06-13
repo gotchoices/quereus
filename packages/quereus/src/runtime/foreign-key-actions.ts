@@ -66,42 +66,35 @@ export async function executeForeignKeyActions(
 		: new Set<ForeignKeyConstraintSchema>();
 
 	try {
-		// Find all child tables with FKs referencing this parent
-		for (const schema of db.schemaManager._getAllSchemas()) {
-			for (const childTable of schema.getAllTables()) {
-				if (!childTable.foreignKeys) continue;
+		// Find all child tables with FKs referencing this parent. The reverse FK index is keyed
+		// on the referenced schema.table, so the two discovery filters (referencedTable /
+		// targetSchema match) are satisfied by the lookup and drop out; the per-FK body is
+		// unchanged. The index returns the shared empty array (the O(1) gate) when nothing
+		// references this parent — the common case short-circuits with no allocation.
+		for (const { childTable, fk } of db.schemaManager.getReferencingForeignKeys(parentTable.schemaName, parentTable.name)) {
+			const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
 
-				for (const fk of childTable.foreignKeys) {
-					if (fk.referencedTable.toLowerCase() !== parentTable.name.toLowerCase()) continue;
+			// RESTRICT is handled by parent-side constraint checks, not actions
+			if (action === 'restrict') continue;
 
-					const targetSchema = fk.referencedSchema ?? childTable.schemaName;
-					if (targetSchema.toLowerCase() !== parentTable.schemaName.toLowerCase()) continue;
+			// Suppressed: a divergent non-RESTRICT logical FK over the same columns
+			// replaces this basis action (the lens walker fires the logical action).
+			if (suppressed.has(fk)) continue;
 
-					const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
+			const parentColIndices = resolveReferencedColumns(fk, parentTable);
+			if (parentColIndices.length !== fk.columns.length) continue;
 
-					// RESTRICT is handled by parent-side constraint checks, not actions
-					if (action === 'restrict') continue;
+			// Get old parent values for the referenced columns
+			const oldParentValues = parentColIndices.map(idx => oldRow[idx]);
 
-					// Suppressed: a divergent non-RESTRICT logical FK over the same columns
-					// replaces this basis action (the lens walker fires the logical action).
-					if (suppressed.has(fk)) continue;
+			// Skip if any old value is NULL (NULLs don't participate in FK matching)
+			if (oldParentValues.some(v => v === null || v === undefined)) continue;
 
-					const parentColIndices = resolveReferencedColumns(fk, parentTable);
-					if (parentColIndices.length !== fk.columns.length) continue;
-
-					// Get old parent values for the referenced columns
-					const oldParentValues = parentColIndices.map(idx => oldRow[idx]);
-
-					// Skip if any old value is NULL (NULLs don't participate in FK matching)
-					if (oldParentValues.some(v => v === null || v === undefined)) continue;
-
-					await executeSingleFKAction(
-						db, childTable, fk, action, parentTable, parentColIndices,
-						oldParentValues, operation === 'update' ? newRow : undefined,
-						visited
-					);
-				}
-			}
+			await executeSingleFKAction(
+				db, childTable, fk, action, parentTable, parentColIndices,
+				oldParentValues, operation === 'update' ? newRow : undefined,
+				visited
+			);
 		}
 	} finally {
 		visited.delete(parentKey);
@@ -211,8 +204,6 @@ export async function assertTransitiveRestrictsForParentMutation(
 		// delete child rows, scan the matching children NOW (pre-mutation, so
 		// the parent's OLD values still resolve), compute the projected child
 		// row, and recurse with that child as the new "parent".
-		const parentSchemaLower = parentTable.schemaName.toLowerCase();
-		const parentTableLower = parentTable.name.toLowerCase();
 
 		// Basis cascading FKs a divergent non-RESTRICT logical FK overrides — skip them in
 		// the recursion: the physical cascade they walk will not run (the logical action
@@ -223,110 +214,103 @@ export async function assertTransitiveRestrictsForParentMutation(
 			? basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager)
 			: new Set<ForeignKeyConstraintSchema>();
 
-		for (const schema of db.schemaManager._getAllSchemas()) {
-			for (const childTable of schema.getAllTables()) {
-				if (!childTable.foreignKeys) continue;
+		// The reverse FK index is keyed on the referenced schema.table, so the two discovery
+		// filters (referencedTable / targetSchema match) are satisfied by the lookup and drop
+		// out; the per-FK body below is unchanged.
+		for (const { childTable, fk } of db.schemaManager.getReferencingForeignKeys(parentTable.schemaName, parentTable.name)) {
+			const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
+			if (action !== 'cascade' && action !== 'setNull' && action !== 'setDefault') continue;
 
-				for (const fk of childTable.foreignKeys) {
-					if (fk.referencedTable.toLowerCase() !== parentTableLower) continue;
-					const targetSchema = fk.referencedSchema ?? childTable.schemaName;
-					if (targetSchema.toLowerCase() !== parentSchemaLower) continue;
+			// Suppressed: the logical action replaces this basis cascade, so the
+			// physical cascade it would walk never runs — do not recurse through it.
+			if (suppressed.has(fk)) continue;
 
-					const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
-					if (action !== 'cascade' && action !== 'setNull' && action !== 'setDefault') continue;
+			const parentColIndices = resolveReferencedColumns(fk, parentTable);
+			if (parentColIndices.length !== fk.columns.length) continue;
 
-					// Suppressed: the logical action replaces this basis cascade, so the
-					// physical cascade it would walk never runs — do not recurse through it.
-					if (suppressed.has(fk)) continue;
+			// MATCH SIMPLE: NULL parent values cannot be referenced.
+			const oldParentValues = parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
+			if (oldParentValues.some(v => v === null || v === undefined)) continue;
 
-					const parentColIndices = resolveReferencedColumns(fk, parentTable);
-					if (parentColIndices.length !== fk.columns.length) continue;
-
-					// MATCH SIMPLE: NULL parent values cannot be referenced.
-					const oldParentValues = parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
-					if (oldParentValues.some(v => v === null || v === undefined)) continue;
-
-					// UPDATE-only short-circuit: skip if no referenced parent column changed.
-					let newParentValues: SqlValue[] | undefined;
-					if (operation === 'update' && newRow !== undefined) {
-						let anyChanged = false;
-						for (const idx of parentColIndices) {
-							if (!sqlValuesEqual(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
-								anyChanged = true;
-								break;
-							}
-						}
-						if (!anyChanged) continue;
-						newParentValues = parentColIndices.map(idx => newRow[idx]) as SqlValue[];
-					}
-
-					// Scan child rows that match the OLD parent values.
-					const childColQuoted = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
-					const whereClause = childColQuoted.map(c => `${c} = ?`).join(' AND ');
-					const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
-						? `${quoteIdentifier(childTable.schemaName)}.`
-						: '';
-					const sql = `select * from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause}`;
-
-					log('TRANSITIVE pre-walk: %s with params %o', sql, oldParentValues);
-
-					const stmt = db.prepare(sql);
-					try {
-						stmt.bindAll(oldParentValues);
-						for await (const childOldRow of stmt._iterateRowsRaw()) {
-							let childNewRow: Row | undefined;
-							let childOp: 'delete' | 'update';
-
-							if (action === 'cascade' && operation === 'delete') {
-								childOp = 'delete';
-								childNewRow = undefined;
-							} else if (action === 'cascade' && operation === 'update' && newParentValues) {
-								childOp = 'update';
-								const next = [...(childOldRow as Row)] as SqlValue[];
-								for (let i = 0; i < fk.columns.length; i++) {
-									next[fk.columns[i]] = newParentValues[i];
-								}
-								childNewRow = next as Row;
-							} else if (action === 'setNull') {
-								childOp = 'update';
-								const next = [...(childOldRow as Row)] as SqlValue[];
-								for (let i = 0; i < fk.columns.length; i++) {
-									next[fk.columns[i]] = null;
-								}
-								childNewRow = next as Row;
-							} else if (action === 'setDefault') {
-								// SET DEFAULT recursion: pass the child OLD row as both
-								// old and new. The recursion's column-change short-circuit
-								// will treat this as "no FK column moved" and the per-target
-								// cascade SQL (executeSingleFKAction) still fires its own
-								// RESTRICT enforcement for non-rowid-chained backends. This
-								// matches the coverage gap SET DEFAULT already has in
-								// rowid-chained backends — no regression beyond status quo.
-								childOp = 'update';
-								childNewRow = childOldRow as Row;
-							} else {
-								continue;
-							}
-
-							// Recurse carrying the SAME `lensRouted`: the nested levels are the
-							// transitive closure of *this* write, so when the top-level write is
-							// lens-routed every level inherits the logical FK semantics. This is
-							// load-bearing for a logical RESTRICT sitting below an *agreeing*
-							// basis cascade (basis + logical both cascade): at runtime that basis
-							// cascade executes as a basis-direct write — which does NOT fire the
-							// deeper lens RESTRICT — and the agreeing lens cascade is elided, so it
-							// never re-enters through the child view either. The ONLY place that
-							// deeper RESTRICT is caught is this pre-walk recursing with the lens flag
-							// still set. For a basis-direct top-level write `lensRouted` is already
-							// false, so the recursion correctly stays basis-only throughout.
-							await assertTransitiveRestrictsForParentMutation(
-								db, childTable, childOp, childOldRow as Row, childNewRow, lensRouted, visitedSet,
-							);
-						}
-					} finally {
-						await stmt.finalize();
+			// UPDATE-only short-circuit: skip if no referenced parent column changed.
+			let newParentValues: SqlValue[] | undefined;
+			if (operation === 'update' && newRow !== undefined) {
+				let anyChanged = false;
+				for (const idx of parentColIndices) {
+					if (!sqlValuesEqual(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
+						anyChanged = true;
+						break;
 					}
 				}
+				if (!anyChanged) continue;
+				newParentValues = parentColIndices.map(idx => newRow[idx]) as SqlValue[];
+			}
+
+			// Scan child rows that match the OLD parent values.
+			const childColQuoted = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
+			const whereClause = childColQuoted.map(c => `${c} = ?`).join(' AND ');
+			const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
+				? `${quoteIdentifier(childTable.schemaName)}.`
+				: '';
+			const sql = `select * from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause}`;
+
+			log('TRANSITIVE pre-walk: %s with params %o', sql, oldParentValues);
+
+			const stmt = db.prepare(sql);
+			try {
+				stmt.bindAll(oldParentValues);
+				for await (const childOldRow of stmt._iterateRowsRaw()) {
+					let childNewRow: Row | undefined;
+					let childOp: 'delete' | 'update';
+
+					if (action === 'cascade' && operation === 'delete') {
+						childOp = 'delete';
+						childNewRow = undefined;
+					} else if (action === 'cascade' && operation === 'update' && newParentValues) {
+						childOp = 'update';
+						const next = [...(childOldRow as Row)] as SqlValue[];
+						for (let i = 0; i < fk.columns.length; i++) {
+							next[fk.columns[i]] = newParentValues[i];
+						}
+						childNewRow = next as Row;
+					} else if (action === 'setNull') {
+						childOp = 'update';
+						const next = [...(childOldRow as Row)] as SqlValue[];
+						for (let i = 0; i < fk.columns.length; i++) {
+							next[fk.columns[i]] = null;
+						}
+						childNewRow = next as Row;
+					} else if (action === 'setDefault') {
+						// SET DEFAULT recursion: pass the child OLD row as both
+						// old and new. The recursion's column-change short-circuit
+						// will treat this as "no FK column moved" and the per-target
+						// cascade SQL (executeSingleFKAction) still fires its own
+						// RESTRICT enforcement for non-rowid-chained backends. This
+						// matches the coverage gap SET DEFAULT already has in
+						// rowid-chained backends — no regression beyond status quo.
+						childOp = 'update';
+						childNewRow = childOldRow as Row;
+					} else {
+						continue;
+					}
+
+					// Recurse carrying the SAME `lensRouted`: the nested levels are the
+					// transitive closure of *this* write, so when the top-level write is
+					// lens-routed every level inherits the logical FK semantics. This is
+					// load-bearing for a logical RESTRICT sitting below an *agreeing*
+					// basis cascade (basis + logical both cascade): at runtime that basis
+					// cascade executes as a basis-direct write — which does NOT fire the
+					// deeper lens RESTRICT — and the agreeing lens cascade is elided, so it
+					// never re-enters through the child view either. The ONLY place that
+					// deeper RESTRICT is caught is this pre-walk recursing with the lens flag
+					// still set. For a basis-direct top-level write `lensRouted` is already
+					// false, so the recursion correctly stays basis-only throughout.
+					await assertTransitiveRestrictsForParentMutation(
+						db, childTable, childOp, childOldRow as Row, childNewRow, lensRouted, visitedSet,
+					);
+				}
+			} finally {
+				await stmt.finalize();
 			}
 		}
 	} finally {
@@ -363,9 +347,6 @@ export async function assertNoRestrictedChildrenForParentMutation(
 ): Promise<void> {
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
-	const parentSchemaLower = parentTable.schemaName.toLowerCase();
-	const parentTableLower = parentTable.name.toLowerCase();
-
 	// Basis RESTRICT FKs a divergent non-RESTRICT logical FK overrides — their RESTRICT
 	// pre-check is suppressed so the parent mutation a logical cascade must complete is
 	// not aborted. ONLY for a lens-routed write: a basis-direct write bears no logical FK
@@ -374,69 +355,62 @@ export async function assertNoRestrictedChildrenForParentMutation(
 		? basisFksOverriddenByDivergentLensFk(parentTable, operation, db.schemaManager)
 		: new Set<ForeignKeyConstraintSchema>();
 
-	for (const schema of db.schemaManager._getAllSchemas()) {
-		for (const childTable of schema.getAllTables()) {
-			if (!childTable.foreignKeys) continue;
+	// The reverse FK index is keyed on the referenced schema.table, so the two discovery
+	// filters (referencedTable / targetSchema match) are satisfied by the lookup and drop
+	// out; the per-FK body below is unchanged.
+	for (const { childTable, fk } of db.schemaManager.getReferencingForeignKeys(parentTable.schemaName, parentTable.name)) {
+		const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
+		if (action !== 'restrict') continue;
 
-			for (const fk of childTable.foreignKeys) {
-				if (fk.referencedTable.toLowerCase() !== parentTableLower) continue;
-				const targetSchema = fk.referencedSchema ?? childTable.schemaName;
-				if (targetSchema.toLowerCase() !== parentSchemaLower) continue;
+		// Suppressed: a divergent non-RESTRICT logical FK over the same columns
+		// replaces this basis RESTRICT (the logical cascade must run, not abort).
+		if (suppressed.has(fk)) continue;
 
-				const action = operation === 'delete' ? fk.onDelete : fk.onUpdate;
-				if (action !== 'restrict') continue;
+		const parentColIndices = resolveReferencedColumns(fk, parentTable);
+		if (parentColIndices.length !== fk.columns.length) continue;
 
-				// Suppressed: a divergent non-RESTRICT logical FK over the same columns
-				// replaces this basis RESTRICT (the logical cascade must run, not abort).
-				if (suppressed.has(fk)) continue;
-
-				const parentColIndices = resolveReferencedColumns(fk, parentTable);
-				if (parentColIndices.length !== fk.columns.length) continue;
-
-				// UPDATE: only enforce when at least one referenced parent column changed.
-				if (operation === 'update' && newRow !== undefined) {
-					let anyChanged = false;
-					for (const idx of parentColIndices) {
-						if (!sqlValuesEqual(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
-							anyChanged = true;
-							break;
-						}
-					}
-					if (!anyChanged) continue;
-				}
-
-				// MATCH SIMPLE: NULL parent values cannot be referenced.
-				const oldParentValues = parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
-				if (oldParentValues.some(v => v === null || v === undefined)) continue;
-
-				const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
-				const whereClause = childColNames.map(c => `${c} = ?`).join(' AND ');
-				const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
-					? `${quoteIdentifier(childTable.schemaName)}.`
-					: '';
-				const sql = `select 1 from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause} limit 1`;
-
-				log('RESTRICT check (%s): %s with params %o', operation, sql, oldParentValues);
-
-				const stmt = db.prepare(sql);
-				try {
-					stmt.bindAll(oldParentValues);
-					let referenced = false;
-					for await (const _row of stmt._iterateRowsRaw()) {
-						referenced = true;
-						break;
-					}
-					if (referenced) {
-						const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
-						throw new QuereusError(
-							`FOREIGN KEY constraint failed: ${opName} on '${parentTable.name}' violates RESTRICT from '${childTable.name}'`,
-							StatusCode.CONSTRAINT,
-						);
-					}
-				} finally {
-					await stmt.finalize();
+		// UPDATE: only enforce when at least one referenced parent column changed.
+		if (operation === 'update' && newRow !== undefined) {
+			let anyChanged = false;
+			for (const idx of parentColIndices) {
+				if (!sqlValuesEqual(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
+					anyChanged = true;
+					break;
 				}
 			}
+			if (!anyChanged) continue;
+		}
+
+		// MATCH SIMPLE: NULL parent values cannot be referenced.
+		const oldParentValues = parentColIndices.map(idx => oldRow[idx]) as SqlValue[];
+		if (oldParentValues.some(v => v === null || v === undefined)) continue;
+
+		const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
+		const whereClause = childColNames.map(c => `${c} = ?`).join(' AND ');
+		const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
+			? `${quoteIdentifier(childTable.schemaName)}.`
+			: '';
+		const sql = `select 1 from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause} limit 1`;
+
+		log('RESTRICT check (%s): %s with params %o', operation, sql, oldParentValues);
+
+		const stmt = db.prepare(sql);
+		try {
+			stmt.bindAll(oldParentValues);
+			let referenced = false;
+			for await (const _row of stmt._iterateRowsRaw()) {
+				referenced = true;
+				break;
+			}
+			if (referenced) {
+				const opName = operation === 'delete' ? 'DELETE' : 'UPDATE';
+				throw new QuereusError(
+					`FOREIGN KEY constraint failed: ${opName} on '${parentTable.name}' violates RESTRICT from '${childTable.name}'`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		} finally {
+			await stmt.finalize();
 		}
 	}
 }

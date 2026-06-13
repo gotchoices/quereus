@@ -332,113 +332,104 @@ export function buildParentSideFKChecks(
 		ctx.schemaManager,
 	);
 
-	// Find all tables that have FKs referencing this table
-	for (const schema of ctx.schemaManager._getAllSchemas()) {
-		for (const childTable of schema.getAllTables()) {
-			if (!childTable.foreignKeys) continue;
+	// The reverse FK index is keyed on the referenced schema.table, so the two discovery
+	// filters (referencedTable / targetSchema match) are satisfied by the lookup and drop
+	// out; only RESTRICT FKs generate a parent-side check (the per-FK body is unchanged).
+	for (const { childTable, fk } of ctx.schemaManager.getReferencingForeignKeys(tableSchema.schemaName, tableSchema.name)) {
+		const action = operation === RowOpFlag.DELETE ? fk.onDelete : fk.onUpdate;
 
-			for (const fk of childTable.foreignKeys) {
-				if (fk.referencedTable.toLowerCase() !== tableSchema.name.toLowerCase()) continue;
+		// Only RESTRICT generates parent-side checks. CASCADE, SET NULL,
+		// and SET DEFAULT are handled by cascading actions in
+		// runtime/foreign-key-actions.
+		if (action !== 'restrict') continue;
 
-				const targetSchema = fk.referencedSchema ?? childTable.schemaName;
-				if (targetSchema.toLowerCase() !== tableSchema.schemaName.toLowerCase()) continue;
+		// Suppressed: a divergent non-RESTRICT logical FK over the same columns
+		// replaces this basis RESTRICT (the logical cascade must complete, not be
+		// rejected by the immediate plan-time NOT EXISTS).
+		if (suppressed.has(fk)) continue;
 
-				const action = operation === RowOpFlag.DELETE ? fk.onDelete : fk.onUpdate;
+		const parentColIndices = resolveReferencedColumns(fk, tableSchema);
+		if (parentColIndices.length !== fk.columns.length) continue;
 
-				// Only RESTRICT generates parent-side checks. CASCADE, SET NULL,
-				// and SET DEFAULT are handled by cascading actions in
-				// runtime/foreign-key-actions.
-				if (action !== 'restrict') continue;
+		// For UPDATE, the runtime skips this check when none of `parentColIndices`
+		// changed (see emit/constraint-check.ts).
 
-				// Suppressed: a divergent non-RESTRICT logical FK over the same columns
-				// replaces this basis RESTRICT (the logical cascade must complete, not be
-				// rejected by the immediate plan-time NOT EXISTS).
-				if (suppressed.has(fk)) continue;
+		// Synthesize NOT EXISTS(SELECT 1 FROM child WHERE child.fk = OLD.pk)
+		const notExistsExpr = synthesizeNotExistsCheck(fk, childTable, tableSchema, parentColIndices);
 
-				const parentColIndices = resolveReferencedColumns(fk, tableSchema);
-				if (parentColIndices.length !== fk.columns.length) continue;
+		const isRestrict = action === 'restrict';
+		const syntheticConstraint: RowConstraintSchema = {
+			name: fk.name ?? `_fk_parent_${childTable.name}_${tableSchema.name}`,
+			expr: notExistsExpr,
+			operations: (RowOpFlag.DELETE | RowOpFlag.UPDATE) as RowOpMask,
+			deferrable: !isRestrict, // RESTRICT is immediate
+			initiallyDeferred: !isRestrict,
+		};
 
-				// For UPDATE, the runtime skips this check when none of `parentColIndices`
-				// changed (see emit/constraint-check.ts).
+		// Build scope with OLD/NEW column access
+		const constraintScope = new RegisteredScope(ctx.scope);
 
-				// Synthesize NOT EXISTS(SELECT 1 FROM child WHERE child.fk = OLD.pk)
-				const notExistsExpr = synthesizeNotExistsCheck(fk, childTable, tableSchema, parentColIndices);
+		contextAttributes.forEach((attr, contextVarIndex) => {
+			if (contextVarIndex < (tableSchema.mutationContext?.length || 0)) {
+				const contextVar = tableSchema.mutationContext![contextVarIndex];
+				constraintScope.registerSymbol(contextVar.name.toLowerCase(), (exp, s) =>
+					new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
+				);
+			}
+		});
 
-				const isRestrict = action === 'restrict';
-				const syntheticConstraint: RowConstraintSchema = {
-					name: fk.name ?? `_fk_parent_${childTable.name}_${tableSchema.name}`,
-					expr: notExistsExpr,
-					operations: (RowOpFlag.DELETE | RowOpFlag.UPDATE) as RowOpMask,
-					deferrable: !isRestrict, // RESTRICT is immediate
-					initiallyDeferred: !isRestrict,
-				};
+		tableSchema.columns.forEach((tableColumn, tableColIndex) => {
+			const colNameLower = tableColumn.name.toLowerCase();
 
-				// Build scope with OLD/NEW column access
-				const constraintScope = new RegisteredScope(ctx.scope);
+			const oldAttr = oldAttributes[tableColIndex];
+			if (oldAttr) {
+				const oldColumnType = columnSchemaToScalarType(tableColumn);
 
-				contextAttributes.forEach((attr, contextVarIndex) => {
-					if (contextVarIndex < (tableSchema.mutationContext?.length || 0)) {
-						const contextVar = tableSchema.mutationContext![contextVarIndex];
-						constraintScope.registerSymbol(contextVar.name.toLowerCase(), (exp, s) =>
-							new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, contextVarIndex)
-						);
-					}
-				});
+				constraintScope.registerSymbol(`old.${colNameLower}`, (exp, s) =>
+					new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
 
-				tableSchema.columns.forEach((tableColumn, tableColIndex) => {
-					const colNameLower = tableColumn.name.toLowerCase();
-
-					const oldAttr = oldAttributes[tableColIndex];
-					if (oldAttr) {
-						const oldColumnType = columnSchemaToScalarType(tableColumn);
-
-						constraintScope.registerSymbol(`old.${colNameLower}`, (exp, s) =>
-							new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
-
-						// For DELETE, unqualified defaults to OLD
-						if (operation === RowOpFlag.DELETE) {
-							constraintScope.registerSymbol(colNameLower, (exp, s) =>
-								new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
-						}
-					}
-
-					const newAttr = newAttributes[tableColIndex];
-					if (newAttr) {
-						const newColumnType = columnSchemaToScalarType(tableColumn, { nullable: true });
-
-						constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
-							new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
-
-						if (operation === RowOpFlag.UPDATE) {
-							constraintScope.registerSymbol(colNameLower, (exp, s) =>
-								new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
-						}
-					}
-				});
-
-				const originalCurrentSchema = ctx.schemaManager.getCurrentSchemaName();
-				const needsSchemaSwitch = tableSchema.schemaName !== originalCurrentSchema;
-				if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(tableSchema.schemaName);
-
-				try {
-					const constraintSchemaPath = [tableSchema.schemaName];
-					const constraintCtx = { ...ctx, scope: constraintScope, schemaPath: constraintSchemaPath };
-
-					const expression = buildExpression(constraintCtx, notExistsExpr) as ScalarPlanNode;
-
-					checks.push({
-						constraint: syntheticConstraint,
-						expression,
-						deferrable: !isRestrict,
-						initiallyDeferred: !isRestrict,
-						needsDeferred: !isRestrict, // RESTRICT must be immediate, not deferred
-						kind: 'fk-parent',
-						referencedColumnIndices: parentColIndices,
-					});
-				} finally {
-					if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(originalCurrentSchema);
+				// For DELETE, unqualified defaults to OLD
+				if (operation === RowOpFlag.DELETE) {
+					constraintScope.registerSymbol(colNameLower, (exp, s) =>
+						new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldColumnType, oldAttr.id, tableColIndex));
 				}
 			}
+
+			const newAttr = newAttributes[tableColIndex];
+			if (newAttr) {
+				const newColumnType = columnSchemaToScalarType(tableColumn, { nullable: true });
+
+				constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
+					new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
+
+				if (operation === RowOpFlag.UPDATE) {
+					constraintScope.registerSymbol(colNameLower, (exp, s) =>
+						new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttr.id, tableColIndex));
+				}
+			}
+		});
+
+		const originalCurrentSchema = ctx.schemaManager.getCurrentSchemaName();
+		const needsSchemaSwitch = tableSchema.schemaName !== originalCurrentSchema;
+		if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(tableSchema.schemaName);
+
+		try {
+			const constraintSchemaPath = [tableSchema.schemaName];
+			const constraintCtx = { ...ctx, scope: constraintScope, schemaPath: constraintSchemaPath };
+
+			const expression = buildExpression(constraintCtx, notExistsExpr) as ScalarPlanNode;
+
+			checks.push({
+				constraint: syntheticConstraint,
+				expression,
+				deferrable: !isRestrict,
+				initiallyDeferred: !isRestrict,
+				needsDeferred: !isRestrict, // RESTRICT must be immediate, not deferred
+				kind: 'fk-parent',
+				referencedColumnIndices: parentColIndices,
+			});
+		} finally {
+			if (needsSchemaSwitch) ctx.schemaManager.setCurrentSchema(originalCurrentSchema);
 		}
 	}
 
