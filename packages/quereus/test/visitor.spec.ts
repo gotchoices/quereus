@@ -202,6 +202,22 @@ describe('traverseAst', () => {
 			expect(selects.length).to.be.greaterThanOrEqual(1);
 		});
 
+		it('traverses an inline-subquery UPDATE target body', () => {
+			// The real body hangs off `targetSource`, not `table` (a synthetic alias
+			// placeholder), so the traversal must descend into it to reach the inner select.
+			const types = collectTypes("update (select id, color from base) as v set color = 'x' where v.id = 1");
+			expect(types).to.include('update');
+			expect(types).to.include('subquerySource');
+			expect(types).to.include('select'); // the inline body
+		});
+
+		it('traverses an inline-subquery DELETE target body', () => {
+			const types = collectTypes('delete from (select id from base) as v where v.id = 1');
+			expect(types).to.include('delete');
+			expect(types).to.include('subquerySource');
+			expect(types).to.include('select');
+		});
+
 		it('traverses DELETE with WHERE', () => {
 			const types = collectTypes('delete from t where x = 1');
 			expect(types).to.include('delete');

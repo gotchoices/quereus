@@ -3347,6 +3347,16 @@ update (select id, color from isq_hw) as v set color='x' where v.id in (select i
 select * from isq_hw order by id;
 → [{"id":1,"color":"x"},{"id":2,"color":"x"}]
 
+-- Key-mutating self-reference — the predicate column (`id`) is itself rewritten by the SET.
+-- Eager-capture must hold: the affected set {1,2} is captured from the ORIGINAL table BEFORE
+-- any write, so both rows mutate deterministically (1→11, 2→12) rather than the rewrite
+-- feeding back into the predicate (which would skip or re-match rows — the Halloween bug).
+create table isq_hwk (id integer primary key, color text);
+insert into isq_hwk values (1,'a'),(2,'b');
+update (select id, color from isq_hwk) as v set id = id + 10 where v.id in (select id from isq_hwk);
+select * from isq_hwk order by id;
+→ [{"id":11,"color":"a"},{"id":12,"color":"b"}]
+
 -- Reject — a subquery write target with NO explicit alias errors clearly at parse; the
 -- alias is user-meaningful (the where/set reference it), never a generated default. Both
 -- UPDATE and DELETE forms reject.
@@ -3370,6 +3380,11 @@ update (select distinct color from isq_base) as v set color='z';
 -- Reject — a DML-bodied inline target (a RETURNING DML body is admitted in a FROM position
 -- but is not a meaningful write target): rejected up front with a structured diagnostic.
 update (insert into isq_base values (9,'q') returning id, color) as v set color='z' where v.id=9;
+-- error: has no recoverable base operation
+
+-- Reject — a VALUES-bodied inline target has no base lineage; it rejects downstream in the
+-- view-shape analysis (not at the up-front DML-body guard) with the same no-base-lineage class.
+update (values (1,'a')) as v(id, color) set color='z' where v.id=1;
 -- error: has no recoverable base operation
 
 -- Reject — inline-subquery INSERT is deliberately NOT admitted in v1; `insert into (` falls

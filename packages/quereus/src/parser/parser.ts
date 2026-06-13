@@ -988,21 +988,8 @@ export class Parser {
 		// immediately after `(`; all relation-producing forms (SELECT, VALUES,
 		// WITH …, INSERT|UPDATE|DELETE w/ RETURNING) flow through the same
 		// subquerySource path.
-		if (this.check(TokenType.LPAREN)) {
-			const lookahead = this.current + 1;
-			if (lookahead < this.tokens.length) {
-				const nextTokenType = this.tokens[lookahead].type;
-				if (
-					nextTokenType === TokenType.SELECT
-					|| nextTokenType === TokenType.VALUES
-					|| nextTokenType === TokenType.WITH
-					|| nextTokenType === TokenType.INSERT
-					|| nextTokenType === TokenType.UPDATE
-					|| nextTokenType === TokenType.DELETE
-				) {
-					return this.subquerySource(startToken, withClause);
-				}
-			}
+		if (this.startsParenSubquery()) {
+			return this.subquerySource(startToken, withClause);
 		}
 
 		// Check for function call syntax: IDENTIFIER (
@@ -1093,21 +1080,30 @@ export class Parser {
 	 * (rejected as a write target downstream) and parses the `as v` / `v(a,b)` alias.
 	 */
 	private subqueryDmlTarget(withClause?: AST.WithClause): AST.SubquerySource | undefined {
-		if (!this.check(TokenType.LPAREN)) return undefined;
-		const lookahead = this.current + 1;
-		if (lookahead >= this.tokens.length) return undefined;
-		const nextTokenType = this.tokens[lookahead].type;
-		if (
-			nextTokenType !== TokenType.SELECT
-			&& nextTokenType !== TokenType.VALUES
-			&& nextTokenType !== TokenType.WITH
-			&& nextTokenType !== TokenType.INSERT
-			&& nextTokenType !== TokenType.UPDATE
-			&& nextTokenType !== TokenType.DELETE
-		) {
-			return undefined;
-		}
+		if (!this.startsParenSubquery()) return undefined;
 		return this.subquerySource(this.peek(), withClause, /*requireAlias*/ true);
+	}
+
+	/**
+	 * True when the cursor is at `(` followed by a relation-producing keyword
+	 * (`SELECT` / `VALUES` / `WITH` / a DML keyword) — i.e. the start of a
+	 * parenthesized subquery source. Shared by the FROM-clause {@link tableSource}
+	 * and the inline-subquery DML target {@link subqueryDmlTarget} so the lookahead
+	 * set stays defined once.
+	 */
+	private startsParenSubquery(): boolean {
+		if (!this.check(TokenType.LPAREN)) return false;
+		const lookahead = this.current + 1;
+		if (lookahead >= this.tokens.length) return false;
+		const nextTokenType = this.tokens[lookahead].type;
+		return (
+			nextTokenType === TokenType.SELECT
+			|| nextTokenType === TokenType.VALUES
+			|| nextTokenType === TokenType.WITH
+			|| nextTokenType === TokenType.INSERT
+			|| nextTokenType === TokenType.UPDATE
+			|| nextTokenType === TokenType.DELETE
+		);
 	}
 
 	/** Parses a standard table source (schema.table or table) */

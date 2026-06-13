@@ -35,6 +35,15 @@ records no `view` schema dependency — but this is reasoned, not pinned by a te
    re-route the cached CTE-target plan — and that the CTE-target plan DOES depend on the real
    base table it writes (so an `alter`/`drop` of the base table invalidates it correctly).
 
+3. **Inline-subquery target parity (same substrate).** The `inline-subquery-dml-write-target`
+   work (shipped, state-verified in the `93.4-view-mutation.sqllogic` Inline-subquery block)
+   routes `update (select …) as v set …` / `delete from (select …) as v where …` through the
+   **same** ephemeral view-like substrate as the CTE-name target, so it inherits the identical
+   state-only-parity gap. While adding (1), also assert the inline-subquery single-source form
+   lowers to a base-op plan tree byte-identical to both the equivalent named-view and CTE-name
+   forms (and, like the CTE target, records no `view` schema dependency for (2)). One extra
+   comparison arm — no separate substrate to exercise.
+
 ## Why backlog
 
 These are test-rigor additions for an already-shipped, state-verified feature, not a bug fix.

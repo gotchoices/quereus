@@ -90,6 +90,9 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			const stmt = node as AST.UpdateStmt;
 			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
 			traverseAst(stmt.table, callbacks);
+			// Inline subquery write target (`update (select …) as v …`): the real body
+			// hangs off `targetSource`; `table` is only a synthetic alias placeholder.
+			traverseAst(stmt.targetSource, callbacks);
 			stmt.assignments.forEach(a => traverseAst(a.value, callbacks));
 			traverseAst(stmt.where, callbacks);
 			break;
@@ -98,6 +101,8 @@ export function traverseAst(node: AST.AstNode | undefined, callbacks: AstVisitor
 			const stmt = node as AST.DeleteStmt;
 			stmt.withClause?.ctes.forEach(cte => traverseAst(cte.query, callbacks));
 			traverseAst(stmt.table, callbacks);
+			// See `update` above — the inline subquery write target's body is on `targetSource`.
+			traverseAst(stmt.targetSource, callbacks);
 			traverseAst(stmt.where, callbacks);
 			break;
 		}
