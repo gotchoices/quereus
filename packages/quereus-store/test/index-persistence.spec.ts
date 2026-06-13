@@ -513,4 +513,50 @@ describe('StoreModule secondary-index persistence', () => {
 		const { db: db2 } = await reopen();
 		expect((await indexInfo(db2, 't')).map(r => r.index_name)).to.include('ix_b');
 	});
+
+	// ── Module-facing stored-name canonicalization (module-facing-schema-name-
+	// canonicalization). The engine now hands every module hook the STORED names
+	// of the object it acts on — never the raw spelling of the triggering DDL. This
+	// in-memory provider keys its stores by the EXACT casing it is handed (a real
+	// disk provider lowercases via buildDataStoreName/buildIndexStoreName, masking
+	// the drift), so it directly exposes whether dropIndex / destroy address the
+	// store created under the stored name. Physical keys are unchanged either way —
+	// lowercase(canonical) === lowercase(raw) — so these are display/registry fixes,
+	// asserted here as "no orphan store under the raw drop spelling".
+
+	it('DROP INDEX with a case-divergent spelling releases the backing store under the stored name', async () => {
+		const { db } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index MyIdx on t (b)`); // stored display casing: MyIdx
+		await db.exec(`insert into t values (1, 10)`);
+		expect(indexStoreSize('t', 'MyIdx'), 'backing store created under the stored casing').to.equal(1);
+
+		// Drop with a divergent spelling. module.dropIndex receives the stored `MyIdx`
+		// (via SchemaManager), so StoreTable.indexStores + provider.deleteIndexStore
+		// address the right store — the raw `MYIDX` would orphan it.
+		await db.exec(`drop index MYIDX`);
+		expect(indexStoreSize('t', 'MyIdx'), 'backing store for the stored name is torn down').to.equal(0);
+		expect(provider.stores.has('main.t_idx_MYIDX'), 'no orphan store under the raw DROP spelling').to.equal(false);
+	});
+
+	it('DROP TABLE with a case-divergent spelling tears down the stored-name stores; reopen does not resurrect', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`insert into t values (1, 10)`);
+		expect(provider.stores.has('main.t'), 'data store present').to.equal(true);
+		expect(indexStoreSize('t', 'ix_b')).to.equal(1);
+
+		// module.destroy receives the stored `t` (not the raw `T`), so deleteTableStores
+		// addresses the data + index stores created under the stored name.
+		await db.exec(`drop table T`);
+		expect(provider.stores.has('main.t'), 'data store torn down under the stored name').to.equal(false);
+		expect(indexStoreSize('t', 'ix_b'), 'index store torn down under the stored name').to.equal(0);
+		expect(provider.stores.has('main.T'), 'no orphan data store under the raw DROP spelling').to.equal(false);
+		expect(await catalogEntry('t'), 'catalog entry removed').to.be.undefined;
+		await mod.closeAll();
+
+		const { db: db2 } = await reopen();
+		expect(db2.schemaManager.findTable('t'), 'table does not resurrect').to.be.undefined;
+	});
 });

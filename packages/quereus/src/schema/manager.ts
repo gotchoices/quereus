@@ -1471,12 +1471,17 @@ export class SchemaManager {
 			const moduleRegistration = this.getModule(tableSchema.vtabModuleName);
 			if (moduleRegistration && moduleRegistration.module && moduleRegistration.module.destroy) {
 				log(`Calling destroy for VTab %s.%s via module %s`, schemaName, tableName, tableSchema.vtabModuleName);
+				// Module-facing stored-name contract (see canonicalSchemaName): hand the
+				// resolved table's canonical schemaName and stored display casing, never
+				// the raw `drop table T` spelling — so a module keying by the arg finds the
+				// create-time key, and the store's own `drop` schema-change event (which
+				// emits objectName: tableName) fires the stored name.
 				await moduleRegistration.module.destroy(
 					this.db,
 					moduleRegistration.auxData,
 					tableSchema.vtabModuleName,
-					schemaName,
-					tableName
+					tableSchema.schemaName,
+					tableSchema.name
 				);
 				log(`destroy completed for VTab %s.%s`, schemaName, tableName);
 			} else {
@@ -2330,7 +2335,12 @@ export class SchemaManager {
 		const indexSchema = this.buildIndexSchema(stmt, tableSchema, tableName, indexName);
 
 		try {
-			await vtabModule.createIndex(this.db, targetSchemaName, tableName, indexSchema);
+			// Module-facing stored-name contract (see canonicalSchemaName): hand the
+			// module the resolved table's canonical schemaName and stored display
+			// casing, never the raw `create index … on T` spelling — a module may key
+			// storage/registries by these args verbatim. `indexSchema.name` is the
+			// *new* index's own name (the future stored name), left as-spelled.
+			await vtabModule.createIndex(this.db, tableSchema.schemaName, tableSchema.name, indexSchema);
 		} catch (e: unknown) {
 			const message = e instanceof Error ? e.message : String(e);
 			const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;
@@ -2435,11 +2445,21 @@ export class SchemaManager {
 			throw new QuereusError(`no such index: ${indexName}`, StatusCode.ERROR);
 		}
 
+		// Stored display casing of the dropped index — the raw `indexName` arg may
+		// differ in case. Computed *before* the module call so module.dropIndex
+		// receives the stored name (the module-facing stored-name contract; see
+		// canonicalSchemaName), keeping a case-divergent `DROP INDEX iDx` from
+		// missing a module handle/registry keyed by the stored `idx` (e.g. the
+		// store's StoreTable.indexStores cache). Also reused by the events below.
+		const storedIndexName = ownerTable.indexes!.find(
+			idx => idx.name.toLowerCase() === lowerIndexName
+		)!.name;
+
 		// Call module.dropIndex if the module supports it
 		const moduleReg = ownerTable.vtabModuleName ? this.getModule(ownerTable.vtabModuleName) : undefined;
 		if (moduleReg?.module?.dropIndex) {
 			try {
-				await moduleReg.module.dropIndex(this.db, schemaName, ownerTable.name, indexName);
+				await moduleReg.module.dropIndex(this.db, ownerTable.schemaName, ownerTable.name, storedIndexName);
 			} catch (e: unknown) {
 				const message = e instanceof Error ? e.message : String(e);
 				const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;
@@ -2449,12 +2469,6 @@ export class SchemaManager {
 				);
 			}
 		}
-
-		// Stored display casing of the dropped index, for the events below (the
-		// raw `indexName` arg may differ in case).
-		const storedIndexName = ownerTable.indexes!.find(
-			idx => idx.name.toLowerCase() === lowerIndexName
-		)!.name;
 
 		// Remove the index from the table schema, along with any uniqueConstraint
 		// that was synthesized from this index (see appendIndexToTableSchema).
@@ -3061,12 +3075,16 @@ export class SchemaManager {
 		const tableSchema = this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo, 'BINARY');
 
 		try {
+			// Module-facing stored-name contract (see canonicalSchemaName): the
+			// rehydrated connect receives `tableSchema`'s canonical schemaName and
+			// stored display casing, never the raw persisted-DDL spelling — a module
+			// keying storage by the args addresses the same physical store it created.
 			await moduleInfo.module.connect(
 				this.db,
 				moduleInfo.auxData,
 				moduleName,
-				targetSchemaName,
-				tableName,
+				tableSchema.schemaName,
+				tableSchema.name,
 				effectiveModuleArgs,
 				tableSchema
 			);
@@ -3075,7 +3093,7 @@ export class SchemaManager {
 			throw new QuereusError(`Module '${moduleName}' connect failed during import for table '${tableName}': ${message}`, StatusCode.ERROR);
 		}
 
-		const schema = this.getOrCreateSchema(targetSchemaName);
+		const schema = this.getOrCreateSchema(tableSchema.schemaName);
 
 		schema.addTable(tableSchema);
 		// Catalog rehydration registers FK-bearing tables silently (no `table_added`
@@ -3091,7 +3109,7 @@ export class SchemaManager {
 		this.invalidateLensFkGate();
 		log(`Imported table %s.%s using module %s`, targetSchemaName, tableName, moduleName);
 
-		return { type: 'table', name: `${targetSchemaName}.${tableName}` };
+		return { type: 'table', name: `${tableSchema.schemaName}.${tableSchema.name}` };
 	}
 
 	/**

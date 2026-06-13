@@ -574,6 +574,19 @@ private async ensureConnection(): Promise<MyConnection> {
 
 **Note:** The `DatabaseInternal` interface is marked `@internal` and may change between versions. It's intended for tight integration scenarios like storage backends and isolation layers.
 
+## Identifier casing in module-facing calls
+
+Every SchemaManager → module hook receives **canonical stored names**, never the raw spelling of the triggering statement:
+
+- `schemaName` is **canonical** — lowercase, folded through `SchemaManager.canonicalSchemaName`. A `MAIN.t` qualifier, or an unqualified statement under a non-`main` current schema, reaches the module as `main` / `aux` / … exactly as `getCurrentSchemaName()` would resolve it.
+- An existing object's **own name** (table name to `connect` / `createIndex` / `dropIndex` / `destroy`, the index name to `dropIndex`) is its **stored display casing** — the casing captured when the object was created — not the casing used in the `create index … on T` / `drop index iDx` / `drop table T` that triggered the call.
+
+This holds for the whole hook surface: `create`, `connect`, `createIndex`, `dropIndex`, `destroy`, `alterTable`, `renameTable`, `getBackingHost`, and the auto-emitted schema-change events. Because the names are stored and stable, a module **may** key its storage, physical stores, and internal registries by the call arguments verbatim — a table created under one casing and later dropped/queried under another will address the same key. (`create` is handed the full canonical `TableSchema`, so its `tableSchema.schemaName` / `tableSchema.name` follow the same rule.)
+
+**The one as-spelled exception** is a *new* object's own name — the index name in `createIndex` (`indexSchema.name`) and `newName` in `renameTable`. These are not yet stored; they *become* the stored name, carrying the casing as written in the DDL (the same way `CREATE TABLE Foo` stores `Foo`). A module that persists the new object should adopt that casing as its stored display name.
+
+This is the module-call analogue of the schema-change event naming contract; see [schema § Schema Change Events](schema.md#event-types).
+
 ## Schema Changes (`SchemaChangeInfo`)
 
 When `ALTER TABLE` performs a data-affecting change, the engine calls
