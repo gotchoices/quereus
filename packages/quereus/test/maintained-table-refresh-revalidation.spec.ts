@@ -292,4 +292,75 @@ describe('Maintained-table refresh re-validation', () => {
 			await expectError('refresh materialized view mt', DUP_MESSAGE);
 		});
 	});
+
+	describe('CHECK and FK both declared (each validator runs independently)', () => {
+		// The constraint-bearing branch runs both validators in sequence
+		// (`validateDeclaredConstraintsOverContents` scans every applicable CHECK,
+		// then every FK). Pin that a violation of EITHER is caught even when the
+		// other passes — a CHECK-only or FK-only test could not distinguish a branch
+		// that silently ran just one validator.
+		beforeEach(async () => {
+			await db.exec(`
+				create table parent (pid integer primary key);
+				create table src (id integer primary key, v text not null, ref integer null);
+				create table mt (id integer primary key, v text not null,
+					ref integer null references parent(pid), check (v <> 'poison'))
+					maintained as select id, v, ref from src;
+				insert into parent values (1);
+				insert into src values (1, 'clean', 1);
+			`);
+			await db.exec(`alter table src add column pad integer null`); // stale
+		});
+
+		it('a CHECK-clean but FK-orphan drift is caught by the FK validator', async () => {
+			await db.exec(`insert into src (id, v, ref) values (2, 'clean', 99)`); // parent 99 absent
+			await expectError('refresh materialized view mt', `references a missing 'main.parent'`);
+			expect(await readAll('select id from mt order by id')).to.deep.equal([{ id: 1 }]);
+			expect(isStale('mt')).to.equal(true);
+		});
+
+		it('an FK-clean but CHECK-violating drift is caught by the CHECK validator', async () => {
+			await db.exec(`insert into src (id, v, ref) values (2, 'poison', 1)`); // ref ok, v bad
+			await expectError('refresh materialized view mt', `row derived into maintained table 'main.mt'`);
+			expect(await readAll('select id from mt order by id')).to.deep.equal([{ id: 1 }]);
+			expect(isStale('mt')).to.equal(true);
+		});
+
+		it('a drift clean on both constraints passes and clears stale', async () => {
+			await db.exec(`insert into parent values (2)`);
+			await db.exec(`insert into src (id, v, ref) values (2, 'clean', 2)`);
+			await db.exec('refresh materialized view mt');
+			expect(await readAll('select id, v, ref from mt order by id'))
+				.to.deep.equal([{ id: 1, v: 'clean', ref: 1 }, { id: 2, v: 'clean', ref: 2 }]);
+			expect(isStale('mt')).to.equal(false);
+		});
+	});
+
+	describe('commit-first parity (an enclosing rollback does not undo a refresh)', () => {
+		// `replaceContents` swaps COMMITTED state, so a refresh is durable past an
+		// enclosing `rollback` today. The constraint-bearing branch's explicit
+		// `conn.commit()` must preserve that EXACT behavior rather than tying the swap
+		// to the outer transaction — otherwise the two refresh branches would diverge
+		// on transactional semantics. (Verified to match the constraint-less path.)
+		it('a successful constraint-bearing refresh survives an enclosing rollback', async () => {
+			await db.exec(`
+				create table src (id integer primary key, v text not null);
+				create table mt (id integer primary key, v text not null, check (v <> 'poison'))
+					maintained as select id, v from src;
+				insert into src values (1, 'a');
+			`);
+			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`insert into src (id, v) values (2, 'b')`);
+
+			await db.exec('begin');
+			await db.exec('refresh materialized view mt');
+			await db.exec('rollback');
+
+			// The backing swap committed independently of the outer transaction.
+			expect(await readAll('select id, v from mt order by id'))
+				.to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'b' }]);
+			expect(isStale('mt'), 'a successful refresh clears stale even under an enclosing rollback')
+				.to.equal(false);
+		});
+	});
 });
