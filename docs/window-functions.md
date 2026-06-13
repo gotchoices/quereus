@@ -270,16 +270,28 @@ Window functions are comprehensively tested through SQL Logic Tests (`test/logic
 
 ## Extensibility
 
-New window functions can be added through the function registry system:
+New window functions can be added through the function registry system. A
+registration is a single schema object (`WindowFunctionSchema`):
 
 ```typescript
-registerWindowFunction('NEW_FUNC', {
-    kind: 'ranking', // or 'aggregate'
-    init: () => ({ /* initial state */ }),
+registerWindowFunction({
+    name: 'NEW_FUNC',
+    argCount: 1,              // or 'variadic'
+    returnType: { /* ScalarType */ },  // fallback type
+    requiresOrderBy: false,
+    kind: 'aggregate',       // 'ranking' | 'aggregate' | 'value' | 'navigation'
     step: (state, value) => { /* update state */ },
     final: (state, rowCount) => { /* return result */ }
 });
 ```
+
+**Return-type inference.** Pass-through functions whose result is the argument
+value verbatim (`MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `LAG`, `LEAD`) supply
+an optional `inferReturnType(argTypes) => ScalarType` that derives the result
+type from `argTypes[0]` (the value expression) rather than the fixed
+`returnType`. For `LAG`/`LEAD` the offset and default arguments do not widen the
+result. When no argument types are available the planner falls back to the
+declared `returnType`.
 
 ## Future Enhancements
 

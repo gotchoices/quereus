@@ -169,6 +169,20 @@ describe('Planner: window function types', () => {
 		expect(types.some(t => t.fn.toLowerCase() === 'last_value' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
 	});
 
+	it('returns the argument value (not a float coercion) for FIRST_VALUE/LAST_VALUE over TEXT (runtime)', async () => {
+		// End-to-end symmetry with the LAG smoke: the REAL→argument-type
+		// tightening must not float-coerce the emitted value. The default frame
+		// (ORDER BY, no explicit frame) is UNBOUNDED PRECEDING .. CURRENT ROW, so
+		// last_value tracks the current row while first_value pins the partition's
+		// first row.
+		const rows: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select first_value(v) over (order by id) as fv, last_value(v) over (order by id) as lv from t')) {
+			rows.push(r);
+		}
+		expect(rows.map(r => r.fv)).to.deep.equal(['a', 'a', 'a']); // TEXT preserved
+		expect(rows.map(r => r.lv)).to.deep.equal(['a', 'b', 'c']);
+	});
+
 	it('derives FIRST_VALUE return type from an expression argument', async () => {
 		// `id || ''` is a concat expression typed TEXT — proves the built expression's
 		// logical type flows through, not just a bare column ref.

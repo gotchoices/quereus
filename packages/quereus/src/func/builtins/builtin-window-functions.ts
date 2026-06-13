@@ -1,6 +1,24 @@
 import { registerWindowFunction } from '../../schema/window-function.js';
 import { AggValue } from '../registration.js';
 import { INTEGER_TYPE, REAL_TYPE } from '../../types/builtin-types.js';
+import type { ScalarType } from '../../common/datatype.js';
+import type { DeepReadonly } from '../../common/types.js';
+import type { LogicalType } from '../../types/logical-type.js';
+
+/**
+ * Shared `inferReturnType` for pass-through window functions (MIN, MAX,
+ * FIRST_VALUE, LAST_VALUE, LAG, LEAD): the result follows arg[0]'s logical
+ * type because the value is emitted unchanged at runtime. Only arg[0] (the
+ * value expression) participates — LAG/LEAD's offset and default arguments do
+ * not widen the result. Each registration's fixed `returnType` is the
+ * no-arg-types fallback.
+ */
+const passThroughArgType = (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>): ScalarType => ({
+	typeClass: 'scalar',
+	logicalType: argTypes[0],
+	nullable: true,
+	isReadOnly: true
+});
 
 // Built-in window function schemas
 export function registerBuiltinWindowFunctions(): void {
@@ -69,12 +87,7 @@ export function registerBuiltinWindowFunctions(): void {
 		},
 		// LAG passes arg[0] (the value expression) through unchanged; arg[1] is the
 		// offset and arg[2] is an optional default — their types do not widen the result.
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true,
-			isReadOnly: true
-		}),
+		inferReturnType: passThroughArgType,
 		requiresOrderBy: true,
 		kind: 'navigation'
 	});
@@ -90,12 +103,7 @@ export function registerBuiltinWindowFunctions(): void {
 		},
 		// LEAD passes arg[0] (the value expression) through unchanged; arg[1] is the
 		// offset and arg[2] is an optional default — their types do not widen the result.
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true,
-			isReadOnly: true
-		}),
+		inferReturnType: passThroughArgType,
 		requiresOrderBy: true,
 		kind: 'navigation'
 	});
@@ -112,12 +120,7 @@ export function registerBuiltinWindowFunctions(): void {
 		},
 		// FIRST_VALUE passes its argument value through unchanged, so the result
 		// follows the argument's logical type (mirrors the MIN/MAX pattern).
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true,
-			isReadOnly: true
-		}),
+		inferReturnType: passThroughArgType,
 		requiresOrderBy: false,
 		kind: 'value'
 	});
@@ -133,12 +136,7 @@ export function registerBuiltinWindowFunctions(): void {
 		},
 		// LAST_VALUE passes its argument value through unchanged, so the result
 		// follows the argument's logical type (mirrors the MIN/MAX pattern).
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true,
-			isReadOnly: true
-		}),
+		inferReturnType: passThroughArgType,
 		requiresOrderBy: false,
 		kind: 'value'
 	});
@@ -245,14 +243,8 @@ export function registerBuiltinWindowFunctions(): void {
 			isReadOnly: true
 		},
 		// MIN passes the argument value through unchanged, so the result follows
-		// the argument's logical type (mirrors the aggregate minFunc). The fixed
-		// REAL returnType above is the no-arg-types fallback.
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true,
-			isReadOnly: true
-		}),
+		// the argument's logical type (mirrors the aggregate minFunc).
+		inferReturnType: passThroughArgType,
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		step: (state: AggValue, value: AggValue) => {
@@ -275,14 +267,8 @@ export function registerBuiltinWindowFunctions(): void {
 			isReadOnly: true
 		},
 		// MAX passes the argument value through unchanged, so the result follows
-		// the argument's logical type (mirrors the aggregate maxFunc). The fixed
-		// REAL returnType above is the no-arg-types fallback.
-		inferReturnType: (argTypes) => ({
-			typeClass: 'scalar',
-			logicalType: argTypes[0],
-			nullable: true,
-			isReadOnly: true
-		}),
+		// the argument's logical type (mirrors the aggregate maxFunc).
+		inferReturnType: passThroughArgType,
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		step: (state: AggValue, value: AggValue) => {
