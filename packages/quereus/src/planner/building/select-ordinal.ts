@@ -2,6 +2,8 @@ import type * as AST from '../../parser/ast.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { RelationalPlanNode } from '../nodes/plan-node.js';
+import type { Scope } from '../scopes/scope.js';
+import { ColumnReferenceNode } from '../nodes/reference.js';
 
 /**
  * Builds the source-order list of AST expressions for a SELECT list, with
@@ -57,6 +59,45 @@ export function resolveOrdinalReference(
 		);
 	}
 	return selectListAsts[value - 1];
+}
+
+/**
+ * Resolves a 1-based positional ORDER BY ordinal against a *compound* (set
+ * operation) result. A compound has no single SELECT-list AST to map the
+ * ordinal onto (each arm has its own), so `resolveOrdinalReference` does not
+ * apply — instead the ordinal maps directly to the Nth OUTPUT column of the set
+ * node, returning a `ColumnReferenceNode` over that column's attribute/type
+ * (index `n-1`). The reference therefore inherits the column's RESOLVED type —
+ * including its cross-input `collationName`/`collationSource` — so an ordinal
+ * ORDER BY stays in lockstep with dedup, exactly like the column-name form.
+ *
+ * Returns null for any non-ordinal expression shape (mirrors
+ * `extractOrdinalValue`) so the caller falls through to normal expression
+ * building. Out-of-range / zero / negative ordinals raise the same prepare-time
+ * error as `resolveOrdinalReference`.
+ */
+export function resolveCompoundOrdinalColumn(
+	expr: AST.Expression,
+	setNode: RelationalPlanNode,
+	scope: Scope,
+): ColumnReferenceNode | null {
+	const value = extractOrdinalValue(expr);
+	if (value === null) return null;
+	const columns = setNode.getType().columns;
+	if (value < 1 || value > columns.length) {
+		throw new QuereusError(
+			`ORDER BY position ${value} is not in the SELECT list (1..${columns.length})`,
+			StatusCode.ERROR,
+			undefined,
+			expr.loc?.start.line,
+			expr.loc?.start.column,
+		);
+	}
+	const index = value - 1;
+	const column = columns[index];
+	const attr = setNode.getAttributes()[index];
+	const colExpr: AST.ColumnExpr = { type: 'column', name: column.name || attr.name };
+	return new ColumnReferenceNode(scope, colExpr, column.type, attr.id, index);
 }
 
 function extractOrdinalValue(expr: AST.Expression): number | null {

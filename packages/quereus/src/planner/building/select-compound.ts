@@ -11,6 +11,7 @@ import { LiteralNode } from '../nodes/scalar.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
+import { resolveCompoundOrdinalColumn } from './select-ordinal.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 import { buildValuesStmt } from './select.js';
 import { buildInsertStmt } from './insert.js';
@@ -158,11 +159,17 @@ function applyOuterOrderBy(
 	selectContext: PlanningContext
 ): RelationalPlanNode {
 	if (outerOrderBy && outerOrderBy.length > 0) {
-		const sortKeys: SortKey[] = outerOrderBy.map((ob) => ({
-			expression: buildExpression(selectContext, ob.expr),
-			direction: ob.direction,
-			nulls: ob.nulls,
-		}));
+		const sortKeys: SortKey[] = outerOrderBy.map((ob) => {
+			// A bare positional ordinal (`order by 1`) maps to the compound's Nth
+			// OUTPUT column, inheriting its resolved type/collation; any other
+			// expression shape builds normally against the set-op output scope.
+			const ordinalRef = resolveCompoundOrdinalColumn(ob.expr, input, selectContext.scope);
+			return {
+				expression: ordinalRef ?? buildExpression(selectContext, ob.expr),
+				direction: ob.direction,
+				nulls: ob.nulls,
+			};
+		});
 		return new SortNode(selectContext.scope, input, sortKeys);
 	}
 	return input;

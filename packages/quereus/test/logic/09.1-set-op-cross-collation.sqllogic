@@ -166,10 +166,13 @@ create table o2 (id integer primary key, p text);
 insert into o1 values (1, 'banana');
 insert into o2 values (1, 'Cherry'), (2, 'apple');
 
--- (ORDER BY column NAME; ordinal `order by 1` in a compound is a separate
--- pre-existing matter — compound applyOuterOrderBy does not resolve ordinals —
--- so it is not asserted here.)
 select n from o1 union select p from o2 order by n;
+→ [{"n":"apple"},{"n":"banana"},{"n":"Cherry"}]
+
+-- Ordinal form keys off the SAME resolved NOCASE output column (ticket
+-- compound-order-by-ordinal-reference): `order by 1` resolves to output column 1
+-- and inherits its resolved collation, so it sorts identically to the name form.
+select n from o1 union select p from o2 order by 1;
 → [{"n":"apple"},{"n":"banana"},{"n":"Cherry"}]
 
 drop table o1;
