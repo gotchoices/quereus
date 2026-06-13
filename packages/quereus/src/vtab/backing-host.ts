@@ -80,8 +80,13 @@
  * colliding pair includes a written image. See the memory host's
  * `enforceSecondaryUniqueOnMaintenance` (reference) and the store host's
  * `StoreTable.enforceSecondaryUniqueForMaintenance`. `replaceContents` remains
- * validation-free (PK identity aside) — its callers carry MV-sugar backings,
- * which declare no constraints.
+ * validation-free (PK identity aside): create/import (`materializeView`) carries
+ * MV-sugar backings, which declare no constraints, and the refresh path
+ * (`rebuildBacking`) only calls `replaceContents` when the maintained table
+ * declares no applicable CHECK/FK — a constraint-bearing refresh instead routes
+ * through `applyMaintenance('replace-all')` + the engine's bulk
+ * `validateDeclaredConstraintsOverContents` scan (the stale-refresh
+ * re-validation path), so `replaceContents` never has constraints to validate.
  *
  * ## Concurrency
  *

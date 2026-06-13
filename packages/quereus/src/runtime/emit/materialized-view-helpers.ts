@@ -471,9 +471,10 @@ export async function materializeView(db: Database, def: MaterializeViewDefiniti
 		// `replaceContents` runs NO derived-row constraint validation: this caller's
 		// backing is the MV-sugar shape (`buildBackingTableSchema` hard-codes empty
 		// checkConstraints and carries no foreignKeys), so there is nothing to
-		// validate. A future maintained-table path adopting `replaceContents` must
-		// add the declared-constraint validation the attach core runs
-		// (`validateDeclaredConstraintsOverContents`).
+		// validate. The constraint-bearing refresh path that DOES need validation
+		// over a `replaceContents`-style whole-set swap runs it in `rebuildBacking`
+		// (pending-layer `replace-all` + `validateDeclaredConstraintsOverContents`),
+		// not here.
 		await host.replaceContents(rows, () => materializedViewNotASetError(def.schemaName, def.viewName));
 	} catch (e) {
 		// Roll back: drop the table, do not attach a derivation.
@@ -698,12 +699,19 @@ function assertNoDerivationCycle(db: Database, schemaName: string, tableName: st
  * definition may carry pre-reshape column indices. Equivalent to the table's
  * PK whenever the shapes match (the strict attach check verifies index, desc,
  * and collation equality).
+ *
+ * `onDuplicate` overrides the default attach-time diagnostic with a caller-built
+ * one (receiving the rendered colliding key values) — the refresh path threads
+ * {@link materializedViewNotASetError} through {@link assertRefreshRowsAreSet} so
+ * its constraint-bearing branch rejects duplicates identically to the
+ * `replaceContents` fast path, single-sourcing the collation-aware dup detection.
  */
 function assertDerivedRowsAreSet(
 	rows: readonly Row[],
 	pk: ReadonlyArray<{ index: number; collation?: string }>,
 	schemaName: string,
 	name: string,
+	onDuplicate?: (keyVals: string) => QuereusError,
 ): void {
 	if (rows.length < 2) return;
 	const compareKeys = (ra: Row, rb: Row): number => {
@@ -717,13 +725,32 @@ function assertDerivedRowsAreSet(
 	for (let i = 1; i < order.length; i++) {
 		if (compareKeys(rows[order[i - 1]], rows[order[i]]) === 0) {
 			const keyVals = pk.map(c => formatKeyValue(rows[order[i]][c.index])).join(', ');
-			throw new QuereusError(
+			throw onDuplicate?.(keyVals) ?? new QuereusError(
 				`cannot attach derivation to '${schemaName}.${name}': the body produces duplicate rows for primary key (${keyVals}), but a maintained table must be a set — `
 					+ `project a unique key or merge the colliding source rows first`,
 				StatusCode.CONSTRAINT,
 			);
 		}
 	}
+}
+
+/**
+ * Refresh's duplicate-derived-key reject — the constraint-bearing
+ * {@link rebuildBacking} branch's parity with the `replaceContents` fast path,
+ * which rejects duplicate backing PKs via {@link materializedViewNotASetError}.
+ * `applyMaintenance('replace-all')` would otherwise silently LWW-merge colliding
+ * keys, so this raises the IDENTICAL diagnostic BEFORE the pending-layer reconcile,
+ * keeping the two refresh branches indistinguishable on duplicate handling.
+ * Delegates to {@link assertDerivedRowsAreSet} so the collation-aware detection
+ * stays single-sourced.
+ */
+function assertRefreshRowsAreSet(
+	rows: readonly Row[],
+	pk: ReadonlyArray<{ index: number; collation?: string }>,
+	schemaName: string,
+	name: string,
+): void {
+	assertDerivedRowsAreSet(rows, pk, schemaName, name, () => materializedViewNotASetError(schemaName, name));
 }
 
 /**
@@ -740,6 +767,27 @@ async function resolveAttachConnection(db: Database, host: BackingHost, qualifie
 	const conn = host.connect();
 	await db.registerConnection(conn);
 	return conn;
+}
+
+/**
+ * Whether `mt` declares ≥1 constraint the {@link rebuildBacking} refresh path must
+ * validate over the recomputed row set — the same predicate
+ * {@link validateDeclaredConstraintsOverContents} gates on: any CHECK whose op-mask
+ * intersects INSERT | UPDATE (the derived-row op-mask collapse — a derived row's
+ * presence is neither a user INSERT nor UPDATE), or any child-side FK.
+ *
+ * The FK term is additionally gated on `pragma foreign_keys`: with enforcement off
+ * the bulk FK scan no-ops, so an FK-only maintained table keeps the zero-overhead
+ * `replaceContents` fast path rather than spinning up a connection for a no-op scan.
+ * A table also declaring an applicable CHECK always takes the validating branch
+ * regardless of the pragma.
+ */
+function hasApplicableConstraints(db: Database, mt: TableSchema): boolean {
+	const hasCheck = mt.checkConstraints.some(
+		c => (c.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) !== 0);
+	if (hasCheck) return true;
+	const fks = mt.foreignKeys ?? [];
+	return fks.length > 0 && db.options.getBooleanOption('foreign_keys');
 }
 
 /**
@@ -1229,12 +1277,47 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 
 /**
  * Full-rebuild of a maintained table's contents: re-run the body to completion
- * and atomically swap the table's base layer. This is the always-correct path
- * shared by manual `refresh materialized view` and the incremental manager's
- * global / cost-fallback branch (`globalRelations`).
+ * and swap the table to the recomputed set. The always-correct path the two
+ * `refresh materialized view` arms funnel through — the fast (data-only) path
+ * (`backingShapeMatches` ⇒ direct `rebuildBacking`) and the reshape arm
+ * (`reshapeBackingInPlace`, between its pre- and post-reconcile structural ops).
+ * It is used by NOTHING else: create/import (`materializeView`) calls
+ * `replaceContents` directly, and the incremental manager's full-rebuild arm
+ * (`applyFullRebuild` in `core/database-materialized-views.ts`) does its own
+ * `applyMaintenance` + per-delta validation (`validateDerivedChanges`).
  *
- * The caller is responsible for staleness re-validation when relevant; this
- * helper assumes the derivation body plans. Throws if the table is missing
+ * **Constraint-bearing branch.** When the maintained table declares ≥1 applicable
+ * CHECK or (FK-enforcement-on) child-side FK ({@link hasApplicableConstraints}),
+ * the swap mirrors the attach core instead of calling `replaceContents`: reject
+ * duplicate derived keys ({@link assertRefreshRowsAreSet} — parity with
+ * `replaceContents`'s set gate), land the recomputed set in the connection's
+ * PENDING layer via `applyMaintenance('replace-all')`, run the eager bulk
+ * anti-join / `not (<check>)` scan ({@link validateDeclaredConstraintsOverContents})
+ * which throws the maintained-table-attributed CONSTRAINT diagnostic on the first
+ * violator BEFORE the swap is committed (the failing statement unwinds and the
+ * pending reconcile is discarded by statement-level rollback — the pre-refresh
+ * COMMITTED contents stay intact), then `conn.commit()`.
+ *
+ * The commit is **commit-first parity** and load-bearing two ways: (1)
+ * `replaceContents` already swaps committed state (a `begin; refresh; rollback`
+ * does NOT undo a refresh today), so committing here preserves that exact
+ * observable behavior; (2) on the reshape arm, `reshapeBackingInPlace`'s
+ * post-reconcile data-validating ops (retype/recollate/tighten-NOT-NULL) scan
+ * COMMITTED contents after this returns, so they must see the rebuilt rows —
+ * `replaceContents` gives that implicitly, the pending-layer branch matches it by
+ * committing (as the attach reshape path does before its own post-reconcile ops).
+ *
+ * The real-world trigger is a STALE table: a body-relevant source change released
+ * the MV's row-time plan, subsequent source writes drifted unvalidated, and a
+ * refresh recomputes that drifted set — so this scan is where a declared CHECK/FK
+ * is enforced over rows that never crossed the maintenance boundary. A
+ * continuously-maintained table re-derives an already-validated set, so the scan
+ * is redundant-but-cheap there.
+ *
+ * Constraint-less maintained tables and every MV-sugar backing take the untouched
+ * `replaceContents` fast path — no connection, no scan, byte-for-byte the prior
+ * behavior. The caller is responsible for staleness re-validation when relevant;
+ * this helper assumes the derivation body plans. Throws if the table is missing
  * from the catalog.
  */
 export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): Promise<void> {
@@ -1249,16 +1332,36 @@ export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): P
 		);
 	}
 	const host = resolveBackingHost(db, backing);
-	// `replaceContents` swaps COMMITTED contents and runs NO derived-row constraint
-	// validation. For the MV-sugar shape there is nothing declared to validate; a
-	// table-form maintained table CAN carry declared CHECK/FK here (manual
-	// `refresh materialized view`), but every row the refresh recomputes was
-	// validated when it entered via the maintenance boundary, so a refresh of a
-	// continuously-maintained table re-derives an already-validated set. The one
-	// residual gap is a STALE table whose plan was released (source writes landed
-	// unvalidated while detached from maintenance) — re-validation of that refresh
-	// is tracked as `maintained-table-refresh-revalidation` (backlog).
-	await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
+
+	if (!isMaintainedTable(backing) || !hasApplicableConstraints(db, backing)) {
+		// Fast path: nothing declared to validate (every MV-sugar backing, and a
+		// constraint-less table-form maintained table). `replaceContents` swaps
+		// COMMITTED contents and runs no derived-row validation — byte-for-byte the
+		// historical path. (A pragma-off FK-only table also lands here: its bulk FK
+		// scan would no-op anyway — see hasApplicableConstraints.)
+		await host.replaceContents(rows, () => materializedViewNotASetError(mv.schemaName, mv.name));
+		return;
+	}
+
+	// Constraint-bearing branch: pending-layer replace-all + eager bulk scan, then a
+	// commit-first commit (see the docstring). `shapePk` is the live backing's
+	// physical key — re-derived shape matches it on the fast path, and on the reshape
+	// arm the catalog was already re-registered with the post-reshape PK before this
+	// runs, so the live `primaryKeyDefinition` is the correct keying either way.
+	const shapePk = backing.primaryKeyDefinition.map(c => ({
+		index: c.index,
+		collation: c.collation ?? backing.columns[c.index]?.collation,
+	}));
+	assertRefreshRowsAreSet(rows, shapePk, mv.schemaName, mv.name);
+
+	const conn = await resolveAttachConnection(db, host, `${mv.schemaName}.${mv.name}`);
+	await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
+	// Throws the maintained-table-attributed diagnostic BEFORE the commit; on a
+	// violation the failing statement unwinds and discards the pending reconcile,
+	// leaving the pre-refresh committed contents intact (the MV stays stale, so the
+	// next read re-validates rather than serving the rejected set).
+	await validateDeclaredConstraintsOverContents(db, backing);
+	await conn.commit();
 }
 
 /**
