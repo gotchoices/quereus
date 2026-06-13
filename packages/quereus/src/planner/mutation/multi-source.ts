@@ -2482,8 +2482,10 @@ function makeSideQualifyScope(sides: readonly JoinSide[], view: MutableViewLike)
 }
 
 /**
- * Strip the owning side's alias qualifier from a base-term assignment value (so it
- * targets the single-table UPDATE directly). A reference to **any other side** cannot
+ * Rewrite the owning side's alias qualifier on a base-term assignment value to the lowered
+ * UPDATE's `__vm_self` correlation alias ({@link SELF_ALIAS}), so it binds the single-table
+ * UPDATE's target row directly even when nested in a user value subquery whose own FROM
+ * carries a same-named column. A reference to **any other side** cannot
  * be expressed as a single-table SET, so it is either captured-and-rewritten (when a
  * `registerCrossSource` carrier is supplied — § Inner Join, cross-source `set`) or
  * rejected (`cross-source-assignment`, the legacy path). The strip is qualifier-driven
@@ -2518,9 +2520,10 @@ function makeSideQualifyScope(sides: readonly JoinSide[], view: MutableViewLike)
  * `psecret`) to the partner's captured value.
  *
  * A cross-source read is rewritten to `(select <srcN> from __vmupd_keys k where
- * k.k<owningSide>_0 = <pk0> [and …])`: `registerCrossSource` projects the partner column
- * into the capture under `srcN` and returns the alias; the unqualified `<pk_j>` bind to
- * the lowered UPDATE's own target row, so each row reads the captured pre-mutation
+ * k.k<owningSide>_0 = __vm_self.<pk0> [and …])`: `registerCrossSource` projects the partner
+ * column into the capture under `srcN` and returns the alias; the `<pk_j>` (qualified with
+ * the lowered UPDATE's `__vm_self` correlation alias — {@link SELF_ALIAS}) bind to its own
+ * target row, so each row reads the captured pre-mutation
  * partner value of its joined row. The cross-source gate (`gateCrossSourceReads`) has
  * already proved every reached partner column has `base` lineage.
  *
@@ -2576,7 +2579,8 @@ function stripSideQualifier(
 		// user value subquery whose FROM has a same-named column (the bug-1 site).
 		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk, undefined, SELF_ALIAS);
 	};
-	// QUALIFIED-only substitution: an owning-alias ref strips to bare; a partner-alias ref
+	// QUALIFIED-only substitution: an owning-alias ref is re-qualified to the lowered
+	// target's `__vm_self` correlation alias; a partner-alias ref
 	// routes through the capture; a BARE ref is left untouched (only ever a user-authored
 	// local/unknown name — every lineage leaf arrives side-alias-qualified; see the
 	// docstring). The route/strip decision is qualifier-driven but ALIAS-SCOPE-AWARE: a

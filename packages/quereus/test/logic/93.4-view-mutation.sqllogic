@@ -1153,7 +1153,8 @@ select cid, cval from uq22_c order by cid;
 -- `pv` (off side `p`) lowers to a correlated read of the `__vmupd_keys` capture, NESTED inside
 -- that user subquery; its owning-PK operand must correlate `cid` to the lowered per-side UPDATE
 -- target (uq23_c, cid=2) via the synthesised `__vm_self` alias — not re-bind to `uq23_t.cid`
--- (=99, matching no capture row → NULL read-back → wrong/NULL result). For cid=2 (joined pv=200):
+-- (=99, matching no capture row → mis-keyed read-back; unfixed, this surfaces as a loud
+-- `NOT NULL constraint failed: uq23_c.cval`, not a silent wrong value). For cid=2 (joined pv=200):
 -- max(x) where x < 200 = max(50,150) = 150; cid=1 untouched.
 create table uq23_p (pid integer primary key, pv integer);
 create table uq23_c (cid integer primary key, pref integer, cval integer,
