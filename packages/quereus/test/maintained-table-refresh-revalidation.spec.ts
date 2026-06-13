@@ -21,9 +21,13 @@ import { Database } from '../src/index.js';
  *   (1) seed a clean row → (2) a body-relevant source ALTER (stale + plan
  *   released) → (3) drift a violator into the unmaintained source →
  *   (4) `refresh` and assert.
- * `alter table src add column …` changes the source column COUNT, which is
- * body-RELEVANT (not recompilable in place), so it reliably marks the dependent
- * stale and detaches its plan.
+ * The stale trigger is `alter column g set collate nocase` on column `g`, which every
+ * body reads only in its `where g <> 'skip'` predicate: a value-semantics (collation)
+ * change to a READ column is content-relevant, so the in-place recompile declines and the
+ * dependent is marked stale with its plan detached — while the body's projected output
+ * shape is unchanged, so `refresh` recomputes through the ordinary (non-reshape) path.
+ * (A structural ALTER the body provably does NOT read now keeps the dependent LIVE —
+ * see 53.4-materialized-view-structural-alter-restore.sqllogic.)
  */
 describe('Maintained-table refresh re-validation', () => {
 	let db: Database;
@@ -53,15 +57,16 @@ describe('Maintained-table refresh re-validation', () => {
 	describe('stale fast-path CHECK violation', () => {
 		beforeEach(async () => {
 			await db.exec(`
-				create table src (id integer primary key, v text not null);
+				create table src (id integer primary key, v text not null, g text not null default 'keep');
 				create table mt (id integer primary key, v text not null, check (v <> 'poison'))
-					maintained as select id, v from src;
-				insert into src values (1, 'clean');
+					maintained as select id, v from src where g <> 'skip';
+				insert into src (id, v) values (1, 'clean');
 			`);
-			// Body-relevant source change: column count shifts ⇒ mt goes stale and its
-			// row-time plan detaches, so the drift below is NOT maintained in.
-			await db.exec(`alter table src add column pad integer null`);
-			expect(isStale('mt'), 'add column marked mt stale').to.equal(true);
+			// Content-relevant source change: a collation change on `g` (read in the body's
+			// WHERE) stales mt and detaches its row-time plan, so the drift below is NOT
+			// maintained in. (Pre-feature this used `add column`, which now keeps the MV live.)
+			await db.exec(`alter table src alter column g set collate nocase`);
+			expect(isStale('mt'), 'source ALTER marked mt stale').to.equal(true);
 		});
 
 		it('a refresh that recomputes a CHECK-violating row throws the attribution and leaves the pre-refresh rows intact', async () => {
@@ -92,15 +97,15 @@ describe('Maintained-table refresh re-validation', () => {
 		beforeEach(async () => {
 			await db.exec(`
 				create table parent (pid integer primary key);
-				create table src (id integer primary key, ref integer null);
+				create table src (id integer primary key, ref integer null, g text not null default 'keep');
 				create table mt (id integer primary key, ref integer null references parent(pid))
-					maintained as select id, ref from src;
+					maintained as select id, ref from src where g <> 'skip';
 				insert into parent values (1);
-				insert into src values (1, 1);
+				insert into src (id, ref) values (1, 1);
 			`);
 			expect(await readAll('select id, ref from mt')).to.deep.equal([{ id: 1, ref: 1 }]);
-			await db.exec(`alter table src add column pad integer null`);
-			expect(isStale('mt'), 'add column marked mt stale').to.equal(true);
+			await db.exec(`alter table src alter column g set collate nocase`);
+			expect(isStale('mt'), 'source ALTER marked mt stale').to.equal(true);
 		});
 
 		it('a refresh that recomputes an orphan throws the FK attribution and leaves the pre-refresh rows intact', async () => {
@@ -158,11 +163,11 @@ describe('Maintained-table refresh re-validation', () => {
 
 		it('a constraint-less table-form maintained table refresh runs no validation scan', async () => {
 			await db.exec(`
-				create table src (id integer primary key, v text not null);
-				create table mt (id integer primary key, v text not null) maintained as select id, v from src;
-				insert into src values (1, 'a');
+				create table src (id integer primary key, v text not null, g text not null default 'keep');
+				create table mt (id integer primary key, v text not null) maintained as select id, v from src where g <> 'skip';
+				insert into src (id, v) values (1, 'a');
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (id, v) values (2, 'b')`);
 
 			const prepares = await capturePrepares(async () => {
@@ -175,11 +180,11 @@ describe('Maintained-table refresh re-validation', () => {
 
 		it('an MV-sugar refresh runs no validation scan', async () => {
 			await db.exec(`
-				create table src (id integer primary key, v text not null);
-				create materialized view mv as select id, v from src;
-				insert into src values (1, 'a');
+				create table src (id integer primary key, v text not null, g text not null default 'keep');
+				create materialized view mv as select id, v from src where g <> 'skip';
+				insert into src (id, v) values (1, 'a');
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (id, v) values (2, 'b')`);
 
 			const prepares = await capturePrepares(async () => {
@@ -192,12 +197,12 @@ describe('Maintained-table refresh re-validation', () => {
 
 		it('positive control: a constraint-bearing refresh DOES run a validation scan', async () => {
 			await db.exec(`
-				create table src (id integer primary key, v text not null);
+				create table src (id integer primary key, v text not null, g text not null default 'keep');
 				create table mt (id integer primary key, v text not null, check (v <> 'poison'))
-					maintained as select id, v from src;
-				insert into src values (1, 'a');
+					maintained as select id, v from src where g <> 'skip';
+				insert into src (id, v) values (1, 'a');
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (id, v) values (2, 'b')`);
 
 			const prepares = await capturePrepares(async () => {
@@ -212,13 +217,13 @@ describe('Maintained-table refresh re-validation', () => {
 			await db.exec(`pragma foreign_keys = off`);
 			await db.exec(`
 				create table parent (pid integer primary key);
-				create table src (id integer primary key, ref integer null);
+				create table src (id integer primary key, ref integer null, g text not null default 'keep');
 				create table mt (id integer primary key, ref integer null references parent(pid))
-					maintained as select id, ref from src;
+					maintained as select id, ref from src where g <> 'skip';
 				insert into parent values (1);
-				insert into src values (1, 1);
+				insert into src (id, ref) values (1, 1);
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (id, ref) values (2, 99)`); // orphan, unmaintained
 
 			// FK enforcement off ⇒ the FK scan would no-op, so the table keeps the
@@ -242,7 +247,7 @@ describe('Maintained-table refresh re-validation', () => {
 			// A trailing source add shifts the select* body's shape ⇒ refresh takes the
 			// reshape arm; mt goes stale and its plan detaches.
 			await db.exec(`alter table src add column w integer default 0`);
-			expect(isStale('mt'), 'add column marked mt stale').to.equal(true);
+			expect(isStale('mt'), 'source ALTER marked mt stale').to.equal(true);
 			await db.exec(`insert into src (id, v, w) values (2, 'poison', 0)`); // drift, unmaintained
 
 			await expectError('refresh materialized view mt',
@@ -516,11 +521,11 @@ describe('Maintained-table refresh re-validation', () => {
 
 		it('a constraint-less refresh rejects duplicate derived keys (replaceContents fast path)', async () => {
 			await db.exec(`
-				create table src (k text primary key, v text);
-				create materialized view mv as select k collate nocase as k, v from src;
-				insert into src values ('a', 'x');
+				create table src (k text primary key, v text, g text not null default 'keep');
+				create materialized view mv as select k collate nocase as k, v from src where g <> 'skip';
+				insert into src (k, v) values ('a', 'x');
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (k, v) values ('A', 'y')`); // collides under NOCASE
 
 			await expectError('refresh materialized view mv', DUP_MESSAGE);
@@ -528,12 +533,12 @@ describe('Maintained-table refresh re-validation', () => {
 
 		it('a constraint-bearing refresh rejects duplicate derived keys with the SAME diagnostic', async () => {
 			await db.exec(`
-				create table src (k text primary key, v text);
+				create table src (k text primary key, v text, g text not null default 'keep');
 				create table mt (k text collate nocase primary key, v text, check (v <> 'zzz'))
-					maintained as select k collate nocase as k, v from src;
-				insert into src values ('a', 'x');
+					maintained as select k collate nocase as k, v from src where g <> 'skip';
+				insert into src (k, v) values ('a', 'x');
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (k, v) values ('A', 'y')`); // collides under NOCASE
 
 			await expectError('refresh materialized view mt', DUP_MESSAGE);
@@ -549,14 +554,14 @@ describe('Maintained-table refresh re-validation', () => {
 		beforeEach(async () => {
 			await db.exec(`
 				create table parent (pid integer primary key);
-				create table src (id integer primary key, v text not null, ref integer null);
+				create table src (id integer primary key, v text not null, ref integer null, g text not null default 'keep');
 				create table mt (id integer primary key, v text not null,
 					ref integer null references parent(pid), check (v <> 'poison'))
-					maintained as select id, v, ref from src;
+					maintained as select id, v, ref from src where g <> 'skip';
 				insert into parent values (1);
-				insert into src values (1, 'clean', 1);
+				insert into src (id, v, ref) values (1, 'clean', 1);
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 		});
 
 		it('a CHECK-clean but FK-orphan drift is caught by the FK validator', async () => {
@@ -591,12 +596,12 @@ describe('Maintained-table refresh re-validation', () => {
 		// on transactional semantics. (Verified to match the constraint-less path.)
 		it('a successful constraint-bearing refresh survives an enclosing rollback', async () => {
 			await db.exec(`
-				create table src (id integer primary key, v text not null);
+				create table src (id integer primary key, v text not null, g text not null default 'keep');
 				create table mt (id integer primary key, v text not null, check (v <> 'poison'))
-					maintained as select id, v from src;
-				insert into src values (1, 'a');
+					maintained as select id, v from src where g <> 'skip';
+				insert into src (id, v) values (1, 'a');
 			`);
-			await db.exec(`alter table src add column pad integer null`); // stale
+			await db.exec(`alter table src alter column g set collate nocase`); // stale
 			await db.exec(`insert into src (id, v) values (2, 'b')`);
 
 			await db.exec('begin');

@@ -201,8 +201,8 @@ describe('query-rewrite matcher — gates (no-candidate)', () => {
 	it('a stale MV is never matched', async () => {
 		const db = await freshDb([...SALES, 'create materialized view recent as select id, customer_id, amt from sales where amt > 0']);
 		try {
-			// A compatible alter marks the MV stale but it still plans.
-			await db.exec('alter table sales add column note text null');
+			// A body-relevant alter (retyping the projected `amt`) marks the MV stale but it still plans.
+			await db.exec('alter table sales alter column amt set data type real');
 			expect(db.schemaManager.getMaintainedTable('main', 'recent')!.derivation.stale).to.equal(true);
 			const res = match(db, 'select customer_id, amt from sales where amt > 0', 'recent');
 			expect(res.match).to.be.undefined;

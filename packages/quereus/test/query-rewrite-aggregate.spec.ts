@@ -302,7 +302,7 @@ describe('aggregate-rollup matcher — per-reason negatives', () => {
 	it('no-candidate: a stale MV is never matched', async () => {
 		const db = await freshDb(SALES);
 		try {
-			await db.exec('alter table sales add column note text null');
+			await db.exec('alter table sales alter column amt set data type real');
 			expect(db.schemaManager.getMaintainedTable('main', 'byregion')!.derivation.stale).to.equal(true);
 			const res = matchAgg(db, 'select d, sum(amt) from sales group by d', 'byregion');
 			expect(res.match).to.be.undefined;

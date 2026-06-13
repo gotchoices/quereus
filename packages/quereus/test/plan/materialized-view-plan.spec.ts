@@ -39,7 +39,7 @@ describe('Materialized view plan shape', () => {
 			create table t (x integer primary key, y text);
 			insert into t values (1, 'a');
 			create materialized view mv as select x, y from t;
-			alter table t add column z integer null;
+			alter table t alter column y drop not null;
 		`);
 
 		// Compatible alter marks the MV stale but the body still plans; the
@@ -128,7 +128,7 @@ describe('Materialized view stale invalidation of cached plans', () => {
 		`);
 
 		// Compatible alter: marks mv2 stale but the body still plans.
-		await db.exec('alter table t2 add column z integer null;');
+		await db.exec('alter table t2 alter column y drop not null;');
 		const mv2 = db.schemaManager.getMaintainedTable('main', 'mv2');
 		expect(mv2?.derivation.stale, 'compatible alter marks the MV stale').to.equal(true);
 

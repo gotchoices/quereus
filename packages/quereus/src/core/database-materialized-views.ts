@@ -493,33 +493,44 @@ export class MaterializedViewManager {
 		this.unsubscribeSchemaChanges = notifier.addListener((event: SchemaChangeEvent) => {
 			if (event.type === 'table_removed' || event.type === 'table_modified') {
 				const changed = `${event.schemaName}.${event.objectName}`.toLowerCase();
-				// A `table_modified` whose old/new differ only in fields a body cannot
-				// read — constraint metadata (DROP/RENAME/ADD CONSTRAINT, declarative FK
-				// retargets, rename propagation's constraint-AST rewrites on other
-				// tables), statistics (ANALYZE), tags, defaults — cannot change what a
-				// dependent body evaluates to, so live dependents are RECOMPILED in
-				// place (shape-gated) instead of marked stale. The classifier's
-				// reference-equality guard keeps emitBackingInvalidation's synthetic
-				// same-object event body-RELEVANT — that event drives the MV-over-MV
-				// staleness cascade and must keep staling consumers.
-				const bodyIrrelevant = event.type === 'table_modified'
-					&& isBodyIrrelevantTableChange(event.oldObject, event.newObject);
+				// A **genuine** source `table_modified` (distinct old/new objects). Live
+				// dependents are routed through an in-place RECOMPILE that keeps them live
+				// when provably unaffected, instead of marked stale — covering BOTH a
+				// body-irrelevant change (constraint/stats/tags/default-only — columns + PK
+				// identical: DROP/RENAME/ADD CONSTRAINT, declarative FK retargets, ANALYZE,
+				// rename propagation's constraint-AST rewrites) AND a structural ALTER
+				// (ADD/DROP/ALTER COLUMN) the body provably never reads. The recompile is
+				// shape-gated, and for a structural value-semantics ALTER (type/collation)
+				// additionally content-stability-gated (see tryRecompileMaterializedViewLive).
+				// The synthetic backing-invalidation event emitBackingInvalidation fires with
+				// the SAME object as old/new is deliberately NOT genuine (the
+				// `oldObject !== newObject` guard) — it must cascade staleness down MV-over-MV
+				// chains, never trigger a keep-live recompile.
+				const modified = event.type === 'table_modified' && event.oldObject !== event.newObject
+					? event
+					: undefined;
+				// Body-irrelevant is retained ONLY to decide the already-stale skip below,
+				// whose semantics differ between the constraint-only and structural cases.
+				const bodyIrrelevant = modified !== undefined
+					&& isBodyIrrelevantTableChange(modified.oldObject, modified.newObject);
 				for (const mv of this.ctx.schemaManager.getAllMaintainedTables()) {
 					if (!mv.derivation.sourceTables.includes(changed)) continue;
-					if (bodyIrrelevant) {
-						// An already-stale dependent skips entirely: there is no live
-						// plan to recompile, and only REFRESH may clear a pre-existing
-						// flag (the backing may be behind); re-releasing the (absent)
-						// plan and re-emitting invalidation would be pointless churn.
-						if (mv.derivation.stale) continue;
-						// On success the MV stays live: `stale` untouched, plan rebuilt
-						// against the new catalog, and NO emitBackingInvalidation — the
-						// backing stays maintained, so cached plans reading it remain
-						// correct (a plan reading the *source* invalidates via its own
-						// direct statement dependency on the source table). Any failure
-						// falls through to the stale path below, verbatim.
-						if (tryRecompileMaterializedViewLive(this.ctx as unknown as Database, mv)) continue;
-					}
+					// CONSTRAINT-ONLY change on an already-stale dependent: skip entirely.
+					// There is no live plan to recompile, only REFRESH may clear a pre-existing
+					// flag (the backing may be behind), and re-releasing the (absent) plan /
+					// re-emitting invalidation would be pointless churn. A STRUCTURAL change on
+					// an already-stale dependent instead FALLS THROUGH to re-emit below — the
+					// backing shape may now differ, so cached plans must recompile.
+					if (bodyIrrelevant && mv.derivation.stale) continue;
+					// Genuine source change on a LIVE dependent: try to keep it live. On success
+					// `stale` is untouched, the plan is rebuilt against the new catalog, and NO
+					// emitBackingInvalidation fires — the backing stays maintained, so cached plans
+					// reading it remain correct (a plan reading the *source* invalidates via its own
+					// direct statement dependency on the source table). Any failure (shape mismatch,
+					// content not provably stable, ineligible re-plan) falls through to the stale
+					// path below, verbatim.
+					if (modified !== undefined && !mv.derivation.stale
+						&& tryRecompileMaterializedViewLive(this.ctx as unknown as Database, mv, modified.oldObject, modified.newObject)) continue;
 					if (!mv.derivation.stale) {
 						mv.derivation.stale = true;
 						log('Marked materialized view %s.%s stale due to %s on %s', mv.schemaName, mv.name, event.type, changed);

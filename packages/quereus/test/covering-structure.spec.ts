@@ -1193,26 +1193,28 @@ describe('row-time covering enforcement', () => {
 		expect(await selectAll('select * from t order by id')).to.deep.equal([{ id: 1, x: 5, y: 5 }]);
 	});
 
-	it('covering enforcement resumes after a refresh following a compatible source ALTER', async () => {
-		// A compatible `alter table … add column` marks the covering MV stale and
-		// DETACHES its row-time plan, so while stale `findRowTimeCoveringStructure`
-		// returns undefined and enforcement falls back to the auto-index. `refresh`
-		// must re-register the row-time plan (the fix in
-		// materialized-view-refresh-reregister-rowtime), restoring the MV as the
-		// enforcement-ready covering structure — the `coveringStructureName` forward
-		// pointer survives the alter (the spread in runAddColumn keeps it).
+	it('covering enforcement stays live across a compatible, unreferenced source ALTER', async () => {
+		// A compatible `alter table … add column` of a column the MV body never reads
+		// now KEEPS the covering MV live (mv-restore-unaffected-structural-alters):
+		// its row-time plan is recompiled in place rather than detached, so
+		// `findRowTimeCoveringStructure` keeps resolving to it with no REFRESH gap.
+		// The `coveringStructureName` forward pointer survives the alter (the spread in
+		// runAddColumn keeps it). (Refresh re-registering a DETACHED plan after a
+		// body-relevant stale is covered by mv-structural-alter-restore.spec.ts.)
 		await freshCovered(['insert into t values (1, 5, 5)']);
 		const uc = () => db.schemaManager.getTable('main', 't')!.uniqueConstraints![0];
 		expect(db._findRowTimeCoveringStructure('main', 't', uc())?.name, 'covering before alter').to.equal('ix');
 
 		await db.exec('alter table t add column note text null');
 		expect(uc().coveringStructureName, 'forward pointer survives compatible alter').to.equal('ix');
-		expect(db._findRowTimeCoveringStructure('main', 't', uc()), 'stale MV is not enforcement-ready').to.be.undefined;
+		// The MV never reads `note`, so it stays live and enforcement-ready — no stale gap.
+		expect(db._findRowTimeCoveringStructure('main', 't', uc())?.name, 'live MV stays enforcement-ready').to.equal('ix');
 
+		// REFRESH is an idempotent no-op re-attach here and keeps it ready.
 		await db.exec('refresh materialized view ix');
-		expect(db._findRowTimeCoveringStructure('main', 't', uc())?.name, 'refresh restores the covering MV').to.equal('ix');
+		expect(db._findRowTimeCoveringStructure('main', 't', uc())?.name, 'refresh keeps the covering MV').to.equal('ix');
 
-		// Enforcement is answered through the re-registered covering MV's backing table.
+		// Enforcement is answered through the (still-registered) covering MV's backing table.
 		await expectThrows(() => db.exec('insert into t (id, x, y) values (2, 5, 5)'), 'UNIQUE constraint failed: t (x, y)');
 		expect(await selectAll('select count(*) as n from t')).to.deep.equal([{ n: 1 }]);
 	});

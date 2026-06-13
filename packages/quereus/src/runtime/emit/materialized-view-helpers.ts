@@ -4,7 +4,8 @@ import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import type * as AST from '../../parser/ast.js';
 import { astToString, expressionToString, viewDefinitionToCanonicalString } from '../../emit/ast-stringify.js';
 import type { PlanNode, RelationalPlanNode } from '../../planner/nodes/plan-node.js';
-import { TableReferenceNode } from '../../planner/nodes/reference.js';
+import { TableReferenceNode, ColumnReferenceNode } from '../../planner/nodes/reference.js';
+import { Parser } from '../../parser/parser.js';
 import { keysOf } from '../../planner/util/fd-utils.js';
 import { proveCoverage } from '../../planner/analysis/coverage-prover.js';
 import { deriveCoarsenedBackingKey, type CoarsenedBackingKey } from '../../planner/analysis/coarsened-key.js';
@@ -1633,23 +1634,163 @@ function isBackingPkASuperkeyInShape(current: TableSchema, shape: BackingShape):
 	return shape.allProvedKeys.some(k => k.every(idx => backingPkCols.has(idx)));
 }
 
+/* ──────────────── content-stability proof (structural-ALTER keep-live) ────────────────
+ * For a CONSTRAINT-only `table_modified`, re-derived backing-shape identity implies
+ * content identity (a constraint cannot change what stored rows the body evaluates
+ * to, only what the body compiles to), so a recompile against the new catalog is
+ * sufficient — that is the constraint-only path. For a STRUCTURAL ALTER (ADD / DROP /
+ * ALTER COLUMN) the same argument does NOT carry: shape identity ⇏ content identity.
+ * The classic hazard is `alter column v set collate nocase` (or `set data type`) on a
+ * column the body uses only in a WHERE / join / group / order position — the output
+ * shape is unchanged (v is unprojected), yet the row set the predicate admits, hence
+ * the backing content, changes. So a structural keep-live additionally proves the
+ * value-semantics of the change is DISJOINT from everything the body reads. The two
+ * helpers below compute the two sides of that proof; the gate lives in
+ * {@link tryRecompileMaterializedViewLive}. */
+
 /**
- * Recompile a LIVE materialized view's row-time plan in place after a
- * body-irrelevant source change ({@link isBodyIrrelevantTableChange}), gated by
- * shape re-derivation — the same discipline as
- * {@link restoreUnaffectedMaterializedViews}. Fully synchronous (the
- * schema-change listener is sync; shape derivation, schema lookups, and
- * registration all are). Never throws: logs and returns `false` on any failure,
- * and the caller falls back to the mark-stale path. On success the MV stays
- * live — `stale` untouched, row-time plan rebuilt against the new catalog, no
- * backing invalidation (the backing stays maintained, so cached plans reading
- * it remain correct).
+ * The columns whose **value semantics** the `oldObject → newObject` transition
+ * changed: present **by name in both** schemas and differing in logical type or
+ * collation. Returns lowercased column names (the column-index map key). NOT NULL,
+ * default, generated-expr-unchanged, and add/drop are deliberately excluded —
+ * NOT NULL / default are content-irrelevant (a body reads stored values, never
+ * constraints or defaults), and an add/drop that the body reads is already caught
+ * upstream (a `select *` reshapes ⇒ shape mismatch; a referenced dropped column
+ * fails re-derivation; a referenced added column cannot exist in the authored body).
+ * So the set is EMPTY for every change except ALTER COLUMN SET DATA TYPE / SET
+ * COLLATE — making the disjointness proof a no-op (today's behavior) elsewhere.
+ */
+function valueSemanticsChangedColumns(oldObject: TableSchema, newObject: TableSchema): Set<string> {
+	const out = new Set<string>();
+	for (const newCol of newObject.columns) {
+		const oldCol = oldObject.columns.find(c => c.name.toLowerCase() === newCol.name.toLowerCase());
+		if (!oldCol) continue; // added column — no value-semantics change to an existing column
+		if (!backingTypeMatches(oldCol, newCol) || !backingCollationMatches(oldCol, newCol)) {
+			out.add(newCol.name.toLowerCase());
+		}
+	}
+	return out;
+}
+
+/**
+ * The set of source-column indices (in `qualifiedSource`'s POST-ALTER schema) that a
+ * materialized-view body **reads** — directly, through a predicate / join / group /
+ * order position, or transitively through a generated column. The disjointness half
+ * of the structural-ALTER content-stability gate (see the section note and
+ * {@link tryRecompileMaterializedViewLive}): a value-semantics change (type /
+ * collation) to a column NOT in this set cannot alter what the body evaluates to.
+ *
+ * **Why the un-optimized built plan, not `db.getPlan`.** The optimizer can absorb a
+ * `where v = 'x'` predicate into an access-method seek key, dropping the explicit
+ * {@link ColumnReferenceNode} from the tree — walking the optimized plan would MISS
+ * that reference and falsely conclude disjoint (UNSOUND). The un-optimized built plan
+ * (`db._buildPlan`) carries every reference explicitly in its projection / filter /
+ * join / group / order nodes. Over-approximation is the safe direction: an extra
+ * column in the read set only ever causes MORE staleness, never an unsound keep-live.
+ *
+ * Mechanics: walk the built tree (children AND relations, like {@link collectSourceTables},
+ * so nested subqueries / EXISTS / correlated refs are reached) collecting every
+ * `ColumnReferenceNode.attributeId`; for every `TableReferenceNode` whose qualified
+ * name equals `qualifiedSource` (several for a self-join) map the collected attribute
+ * ids back to its column indices via `getAttributes()`; union over occurrences. Then
+ * expand the set DOWNWARD through `generatedColumnDependencies` to a fixed point —
+ * reading a generated column reads its dependency columns even when the body never
+ * names them (safe whether or not the planner inlines generated columns: if it does,
+ * the dep already appears as a direct reference and the closure is a no-op; if it
+ * does not, the closure is load-bearing).
+ *
+ * The rewrite is suppressed for the same reason {@link deriveBackingShape} suppresses
+ * it. Any exception propagates to {@link tryRecompileMaterializedViewLive}'s try/catch,
+ * which treats a failed analysis as "could not prove disjoint" ⇒ stale (the safe
+ * default) — it must never be swallowed into a false "disjoint" conclusion.
+ */
+export function referencedSourceColumns(db: Database, bodySql: string, qualifiedSource: string): Set<number> {
+	const targetName = qualifiedSource.toLowerCase();
+	return db.schemaManager.withSuppressedMaterializedViewRewrite(() => {
+		const ast = new Parser().parse(bodySql);
+		const { plan } = db._buildPlan([ast as AST.Statement]);
+
+		const referencedAttrIds = new Set<number>();
+		const sourceRefs: TableReferenceNode[] = [];
+		const visited = new Set<PlanNode>();
+		const walk = (node: PlanNode): void => {
+			if (visited.has(node)) return;
+			visited.add(node);
+			if (node instanceof ColumnReferenceNode) {
+				referencedAttrIds.add(node.attributeId);
+			} else if (node instanceof TableReferenceNode
+				&& `${node.tableSchema.schemaName}.${node.tableSchema.name}`.toLowerCase() === targetName) {
+				sourceRefs.push(node);
+			}
+			for (const c of node.getChildren()) walk(c as unknown as PlanNode);
+			for (const r of node.getRelations()) walk(r as unknown as PlanNode);
+		};
+		walk(plan);
+
+		const cols = new Set<number>();
+		let deps: ReadonlyMap<number, ReadonlyArray<number>> | undefined;
+		for (const ref of sourceRefs) {
+			const attrs = ref.getAttributes();
+			for (let i = 0; i < attrs.length; i++) {
+				if (referencedAttrIds.has(attrs[i].id)) cols.add(i);
+			}
+			// The TableReferenceNode is built from the live (post-ALTER) catalog, so its
+			// schema IS `newObject`; all S occurrences share it.
+			deps ??= ref.tableSchema.generatedColumnDependencies;
+		}
+		if (deps) expandGeneratedDependencyClosure(cols, deps);
+		return cols;
+	});
+}
+
+/** Expand `cols` downward through `deps` (generated-column index → dependency column
+ *  indices) to a fixed point: a read of a generated column is a read of its dependency
+ *  columns, which may themselves be generated. */
+function expandGeneratedDependencyClosure(cols: Set<number>, deps: ReadonlyMap<number, ReadonlyArray<number>>): void {
+	const queue = [...cols];
+	while (queue.length > 0) {
+		const idx = queue.pop()!;
+		const depIndices = deps.get(idx);
+		if (!depIndices) continue;
+		for (const d of depIndices) {
+			if (!cols.has(d)) { cols.add(d); queue.push(d); }
+		}
+	}
+}
+
+/**
+ * Recompile a LIVE materialized view's row-time plan in place after a **genuine**
+ * source `table_modified` (`oldObject !== newObject` — constraint/stats/tags-only OR
+ * structural ADD/DROP/ALTER COLUMN), gated by shape re-derivation and — for a
+ * structural value-semantics change — a content-stability proof. The same discipline
+ * as {@link restoreUnaffectedMaterializedViews}. Fully synchronous (the schema-change
+ * listener is sync; shape derivation, schema lookups, the disjointness analysis, and
+ * registration all are). Never throws: logs and returns `false` on any failure, and
+ * the caller falls back to the mark-stale path. On success the MV stays live —
+ * `stale` untouched, row-time plan rebuilt against the new catalog, no backing
+ * invalidation (the backing stays maintained, so cached plans reading it remain
+ * correct).
+ *
+ * **Structural-ALTER soundness (why a recompile is not enough on its own).** For a
+ * constraint-only change, re-derived backing-shape identity IMPLIES content identity —
+ * a constraint cannot change what stored rows the body evaluates to, only what the
+ * body compiles to. For a structural ALTER that argument does NOT carry: shape
+ * identity ⇏ content identity. `alter column v set collate nocase` / `set data type`
+ * on a column the body reads only in a WHERE / join / group / order position leaves
+ * the output shape identical while changing the admitted row set — the backing content
+ * diverges from a fresh body evaluation. So the structural keep-live adds a final
+ * **content-stability gate** proving the change's value-semantics-changed columns are
+ * disjoint from everything the body reads (the {@link valueSemanticsChangedColumns} ∩
+ * {@link referencedSourceColumns} proof). That changed set is EMPTY for constraint-only,
+ * ADD, DROP, NOT NULL, and DEFAULT changes, so the proof is a no-op there and preserves
+ * today's behavior exactly; it does real work only for ALTER COLUMN type/collation.
  *
  * Gates, in order — each failure is a stale fallback:
  *  1. `deriveBackingShape` throws when the body no longer plans against the
  *     post-change catalog (e.g. a rename-cascade constraint rewrite observed
  *     mid-statement, while a co-source's rename has landed but this MV's body
  *     rewrite has not — the rename propagation's own MV loop restores it later).
+ *     A DROP COLUMN the body references directly throws here too.
  *  2. `sameSourceTables`: the re-planned source set must equal the recorded one.
  *     An FK drop can un-eliminate a previously FK/PK-eliminated join (growing
  *     the set); a constraint change can let `ruleFilterContradiction` fold a
@@ -1662,23 +1803,40 @@ function isBackingPkASuperkeyInShape(current: TableSchema, shape: BackingShape):
  *     staleness when a dropped UNIQUE un-proves the recorded backing key (`keysOf`
  *     falls back to a smaller key or all-columns → no proved key ⊆ old PK). An
  *     ADD CONSTRAINT UNIQUE that subsumes the compound key passes: the new minimal
- *     key is a subset of the old compound backing PK. Re-registers with the
- *     EXISTING backing (PK unchanged) — the better key is adopted only by REFRESH.
- *  4. `registerMaterializedView` re-runs arm selection / eligibility / cost
+ *     key is a subset of the old compound backing PK. A `select *` body over an
+ *     ADD/DROP COLUMN reshapes its output here ⇒ shape mismatch ⇒ stale. A PROJECTED
+ *     column whose type/collation changed shifts the output column ⇒ shape mismatch
+ *     ⇒ stale. Re-registers with the EXISTING backing (PK unchanged) on a pass.
+ *  4. Content-stability gate (structural value-semantics ALTER only — see above):
+ *     if any value-semantics-changed column (type/collation) is read by the body
+ *     (transitively through generated columns), the backing content is unstable ⇒
+ *     stale. Empty changed set ⇒ no-op. A failure to build the disjointness analysis
+ *     propagates to the outer try/catch ⇒ stale (could not prove disjoint).
+ *  5. `registerMaterializedView` re-runs arm selection / eligibility / cost
  *     gating (`buildMaintenancePlan`) against the new catalog and throws on the
  *     create-time gates (non-determinism, bag/no-key floor, full-rebuild
  *     pathology against fresh ANALYZE stats — defensible: the alternative is
  *     unbounded per-write rebuild cost). Registration is event-silent, so the
  *     success path fires no nested schema-change notifications.
  *
+ * `oldObject`/`newObject` are the genuine event's distinct schemas. The synthetic
+ * backing-invalidation event (same object as old/new) is excluded by the caller's
+ * `oldObject !== newObject` guard — it must cascade staleness, never recompile.
+ *
  * Deliberately NOT {@link restoreMaterializedViewLive}: that path is async, may
  * rename backing columns, and clears `stale` — the wrong discipline here, where
  * the MV is live throughout and a pre-existing `stale` flag must stay untouched.
  */
-export function tryRecompileMaterializedViewLive(db: Database, mv: MaintainedTableSchema): boolean {
+export function tryRecompileMaterializedViewLive(
+	db: Database,
+	mv: MaintainedTableSchema,
+	oldObject: TableSchema,
+	newObject: TableSchema,
+): boolean {
 	try {
 		const d = mv.derivation;
-		const shape = deriveBackingShape(db, astToString(d.selectAst), d.columns);
+		const bodySql = astToString(d.selectAst);
+		const shape = deriveBackingShape(db, bodySql, d.columns);
 		if (!sameSourceTables(d.sourceTables, shape.sourceTables)) {
 			log('Marking materialized view %s.%s stale instead of recompiling: re-planned source tables (%s) disagree with the recorded set (%s) — REFRESH re-derives',
 				mv.schemaName, mv.name, shape.sourceTables.join(', '), d.sourceTables.join(', '));
@@ -1703,12 +1861,46 @@ export function tryRecompileMaterializedViewLive(db: Database, mv: MaintainedTab
 			log('Recompiling materialized view %s.%s with existing backing PK (superkey check passed): %s',
 				mv.schemaName, mv.name, mismatch);
 		}
+		// Name-stability gate. The recompile re-registers against the EXISTING backing, so
+		// it is sound only when the re-derived body's output column NAMES still match the
+		// backing's. `describeBackingShapeMismatch` is deliberately name-blind (it serves the
+		// rename propagation's pure-positional-name-shift detection), so a column RENAME under
+		// a `select *`-style body re-derives a name-blind-identical shape — keeping it live
+		// here would leave the backing column under its OLD name. Decline so the
+		// rename-propagation pass owns the backing rename (restoreUnaffectedMaterializedViews);
+		// an explicit-column body naming the renamed column already declined upstream
+		// (deriveBackingShape threw).
+		if (shape.columns.some((c, i) => c.name.toLowerCase() !== (backing.columns[i]?.name ?? '').toLowerCase())) {
+			log('Marking materialized view %s.%s stale instead of recompiling: re-derived output names shifted (a column rename) — the rename-propagation pass owns the backing rename',
+				mv.schemaName, mv.name);
+			return false;
+		}
+		// Content-stability gate. EMPTY for constraint-only / ADD / DROP / NOT NULL /
+		// DEFAULT (no-op — exactly today's behavior); for an ALTER COLUMN type/collation
+		// it proves the change is disjoint from every column the body reads (directly or
+		// transitively through generated columns), else the backing content is unstable.
+		const valueChanged = valueSemanticsChangedColumns(oldObject, newObject);
+		if (valueChanged.size > 0) {
+			const source = `${newObject.schemaName}.${newObject.name}`.toLowerCase();
+			const read = referencedSourceColumns(db, bodySql, source);
+			const collidingName = [...valueChanged].find(name => {
+				const idx = newObject.columnIndexMap.get(name);
+				return idx !== undefined && read.has(idx);
+			});
+			if (collidingName !== undefined) {
+				log("Marking materialized view %s.%s stale instead of recompiling: a value-semantics ALTER (type/collation) on '%s' — a column the body reads — changes backing content; REFRESH re-derives",
+					mv.schemaName, mv.name, collidingName);
+				return false;
+			}
+			log('Recompiling materialized view %s.%s after a value-semantics ALTER (type/collation) on column(s) the body does not read (%s)',
+				mv.schemaName, mv.name, [...valueChanged].join(', '));
+		}
 		db.registerMaterializedView(backing);
-		log('Recompiled materialized view %s.%s in place after a body-irrelevant source change',
+		log('Recompiled materialized view %s.%s in place after a genuine source change',
 			mv.schemaName, mv.name);
 		return true;
 	} catch (e) {
-		log('Marking materialized view %s.%s stale instead of recompiling after a body-irrelevant source change: %s',
+		log('Marking materialized view %s.%s stale instead of recompiling after a genuine source change: %s',
 			mv.schemaName, mv.name, e instanceof Error ? e.message : String(e));
 		return false;
 	}

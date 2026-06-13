@@ -583,14 +583,16 @@ select x, id, payload from sk_ix order by x, id;
 → [{"x":8,"id":1,"payload":"a2"},{"x":8,"id":2,"payload":"b"}]
 
 -- ===================================
--- 16. Source schema change + refresh / recreate re-registration. A COMPATIBLE source
---     ALTER (add an unprojected nullable column) fires a `table_modified` event that
---     marks the MV stale and DETACHES the row-time plan: the MV keeps reading its last
---     snapshot, and a post-alter source write is NOT maintained (stale until refresh
---     or recreate). BOTH `refresh materialized view` and drop+recreate restore the
---     MV — they (a) rebuild the snapshot to include the missed row(s) AND (b) re-register
---     a fresh row-time plan so subsequent source writes resume propagating. Dropping the
---     source instead makes the MV read a clean stale error.
+-- 16. Source schema change + refresh / recreate re-registration. A SHAPE-SHIFTING
+--     structural ALTER (here: DROP NOT NULL on a PROJECTED column, which shifts the body's
+--     output nullability) fires a `table_modified` event that marks the MV stale and
+--     DETACHES the row-time plan: the MV keeps reading its last snapshot, and a post-alter
+--     source write is NOT maintained (stale until refresh or recreate). BOTH `refresh
+--     materialized view` and drop+recreate restore the MV — they (a) rebuild the snapshot
+--     to include the missed row(s) AND (b) re-register a fresh row-time plan so subsequent
+--     source writes resume propagating. Dropping the source instead makes the MV read a
+--     clean stale error. (A structural ALTER the body provably does NOT read now keeps the
+--     MV LIVE instead — see 53.4-materialized-view-structural-alter-restore.sqllogic.)
 -- ===================================
 
 -- 16a. `refresh materialized view` re-registers the row-time plan (the bug this file's
@@ -600,8 +602,8 @@ create table al (id integer primary key, x integer);
 insert into al values (1, 10);
 create materialized view al_ix as select id, x from al;
 
--- compatible ALTER marks the MV stale and detaches the row-time plan
-alter table al add column extra text null;
+-- a shape-shifting ALTER (drop not null on the projected column x) marks the MV stale and detaches the row-time plan
+alter table al alter column x drop not null;
 -- the post-alter source write is NOT maintained (plan detached); the MV serves the
 -- pre-alter snapshot rather than crashing
 insert into al (id, x) values (2, 20);
@@ -623,7 +625,7 @@ create table al2 (id integer primary key, x integer);
 insert into al2 values (1, 10);
 create materialized view al2_ix as select id, x from al2;
 
-alter table al2 add column extra text null;
+alter table al2 alter column x drop not null;
 insert into al2 (id, x) values (2, 20);
 select id, x from al2_ix order by id;
 → [{"id":1,"x":10}]
@@ -656,7 +658,7 @@ select id, x from nr_ix order by id;
 create table cpr (a integer, b integer, v integer, primary key (a, b));
 insert into cpr values (1, 1, 100);
 create materialized view cpr_ix as select a, b, v from cpr;
-alter table cpr add column note text null;
+alter table cpr alter column v drop not null;
 insert into cpr (a, b, v) values (1, 2, 200);
 select a, b, v from cpr_ix order by a, b;
 → [{"a":1,"b":1,"v":100}]
@@ -672,7 +674,7 @@ select a, b, v from cpr_ix order by a, b;
 create table par (id integer primary key, x integer);
 insert into par values (1, 5);
 create materialized view par_ix as select id, x from par where x > 0;
-alter table par add column note text null;
+alter table par alter column x drop not null;
 -- one in-scope and one out-of-scope write while stale (both unmaintained)
 insert into par (id, x) values (2, 8);
 insert into par (id, x) values (3, -1);

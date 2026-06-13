@@ -137,14 +137,15 @@ describe('Database.refreshAllMaterializedViews — engine convergence', () => {
 
 	it('converges a stale MV (no live plan), clears stale, and re-registers row-time maintenance', async () => {
 		await db.exec(`
-			create table src (id integer primary key, v text not null);
-			create materialized view mv as select id, v from src;
-			insert into src values (1, 'a');
+			create table src (id integer primary key, v text not null, g text not null default 'keep');
+			create materialized view mv as select id, v from src where g <> 'skip';
+			insert into src (id, v) values (1, 'a');
 		`);
-		// A body-relevant source change (column count shifts) marks mv stale and
-		// detaches its row-time plan, so the drift below is NOT maintained in.
-		await db.exec('alter table src add column pad integer null');
-		expect(isStale('mv'), 'add column marked mv stale').to.equal(true);
+		// A content-relevant source change (a collation change on `g`, read in the body's
+		// WHERE) marks mv stale and detaches its row-time plan, so the drift below is NOT
+		// maintained in. (Pre-feature this used `add column`, which now keeps the MV live.)
+		await db.exec('alter table src alter column g set collate nocase');
+		expect(isStale('mv'), 'source ALTER marked mv stale').to.equal(true);
 		await db.exec(`insert into src (id, v) values (2, 'b')`); // unmaintained while stale
 
 		const refreshed = await db.refreshAllMaterializedViews();

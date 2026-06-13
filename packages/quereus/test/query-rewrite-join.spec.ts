@@ -219,7 +219,7 @@ describe('join-subsumption matcher — per-reason negatives', () => {
 	it('no-candidate: a stale MV is never matched', async () => {
 		const db = await freshDb(SCHEMA);
 		try {
-			await db.exec('alter table orders add column note text null');
+			await db.exec('alter table orders alter column amt set data type real');
 			expect(db.schemaManager.getMaintainedTable('main', 'enriched')!.derivation.stale).to.equal(true);
 			const res = matchJoin(db, 'select o.id, o.amt, c.name from orders o join customers c on o.customer_id = c.id', 'enriched');
 			expect(res.match).to.be.undefined;
@@ -288,7 +288,7 @@ describe('join-subsumption — end-to-end rows + plan shape', () => {
 			expect(await readRows(db, q)).to.equal(expected);
 
 			// A source ALTER marks the join MV stale → no rewrite, base recompute stays correct.
-			await db.exec('alter table orders add column note text null');
+			await db.exec('alter table orders alter column amt set data type real');
 			expect(db.schemaManager.getMaintainedTable('main', 'enriched')!.derivation.stale).to.equal(true);
 			expect(serializePlanTree(db.getPlan(q)), 'no rewrite while stale').to.not.contain('"name": "enriched"');
 			expect(await readRows(db, q)).to.equal(expected);

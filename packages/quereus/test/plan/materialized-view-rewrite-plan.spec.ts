@@ -40,7 +40,7 @@ describe('Materialized-view query rewrite — golden plans', () => {
 	});
 
 	it('a stale MV is not used (base recompute)', async () => {
-		await db.exec('alter table sales add column note text null');
+		await db.exec('alter table sales alter column amt set data type real');
 		expect(db.schemaManager.getMaintainedTable('main', 'recent')!.derivation.stale).to.equal(true);
 		const plan = serializePlanTree(db.getPlan('select customer_id, amt from sales where amt > 0'));
 		expect(plan).to.not.contain('"name": "recent"');

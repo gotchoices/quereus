@@ -144,11 +144,12 @@ describe('MV rename propagation: staleness discipline', () => {
 			await db.exec('insert into t values (1, 10)');
 			await db.exec('create materialized view mv as select id, v from t');
 
-			// Any source schema change marks the MV stale and releases its plan.
-			await db.exec('alter table t add column extra integer null');
+			// A body-relevant source change (retyping the projected column v) marks the MV stale
+			// and releases its plan.
+			await db.exec('alter table t alter column v set data type real');
 			expect(getMv(db, 'mv').derivation.stale, 'stale from the un-refreshed source change').to.equal(true);
 			// Writes during staleness are NOT maintained — the stored rows are now behind.
-			await db.exec('insert into t values (2, 20, null)');
+			await db.exec('insert into t values (2, 20)');
 			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
 
 			await db.exec('alter table t rename to t2');
@@ -158,7 +159,7 @@ describe('MV rename propagation: staleness discipline', () => {
 			expect(mv.derivation.sourceTables, 'but the body IS rewritten for a later refresh').to.deep.equal(['main.t2']);
 			expect(generateMaintainedTableDDL(mv).toLowerCase()).to.include('t2');
 			// Still behind: no re-registration happened.
-			await db.exec('insert into t2 values (3, 30, null)');
+			await db.exec('insert into t2 values (3, 30)');
 			expect(await rows(db, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
 
 			// REFRESH resolves the rewritten body (errored "Table 't' not found" before the fix),
@@ -167,7 +168,7 @@ describe('MV rename propagation: staleness discipline', () => {
 			expect(getMv(db, 'mv').derivation.stale).to.equal(false);
 			expect(await rows(db, 'select id, v from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
-			await db.exec('insert into t2 values (4, 40, null)');
+			await db.exec('insert into t2 values (4, 40)');
 			expect(await rows(db, 'select id, v from mv order by id'))
 				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }, { id: 4, v: 40 }]);
 		} finally {
