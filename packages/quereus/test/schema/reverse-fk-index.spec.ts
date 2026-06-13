@@ -150,6 +150,27 @@ describe('SchemaManager reverse FK index', () => {
 		expect(refs('main', 'P')[0].fk).to.equal(cTable.foreignKeys![0]);
 	});
 
+	it('invalidates when a silent catalog import adds an FK to an existing schema', async () => {
+		// `importTable` (catalog rehydration) registers tables WITHOUT firing a
+		// `table_added` event and through `getOrCreateSchema`, which resets the index
+		// only when it CREATES a schema. Importing an FK-bearing child into an already
+		// -existing schema therefore bypasses both the event- and schema-reset paths;
+		// `importTable` must reset the index directly or it under-reports (the fatal
+		// direction). Memory `connect` needs the storage to pre-exist, so C is created
+		// FK-less first (establishing both its backing and an already-built, empty
+		// index), then re-imported WITH the FK — the silent path under test.
+		await db.exec('create table P (id integer primary key)');
+		await db.exec('create table C (id integer primary key, pid integer)');
+		expect(refs('main', 'P'), 'index built, no referencer yet').to.have.length(0);
+
+		await db.schemaManager.importCatalog([
+			'create table C (id integer primary key, pid integer references P(id))',
+		]);
+		expect(db.schemaManager.getTable('main', 'C')!.foreignKeys, 'import carried the FK').to.have.length(1);
+		expect(refs('main', 'P'), 'silent import invalidated the stale index').to.have.length(1);
+		expect(refs('main', 'P')[0].childTable.name).to.equal('C');
+	});
+
 	describe('behavioral regression: assertNoReferencingChildrenForDrop routes through the index', () => {
 		it('still blocks DROP of a parent with a referencing child row (RESTRICT)', async () => {
 			await db.exec('pragma foreign_keys = true');

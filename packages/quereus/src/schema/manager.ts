@@ -3015,6 +3015,14 @@ export class SchemaManager {
 		const schema = this.getOrCreateSchema(targetSchemaName);
 
 		schema.addTable(tableSchema);
+		// Catalog rehydration registers FK-bearing tables silently (no `table_added`
+		// fires) and via `getOrCreateSchema`, which only resets when it *creates* a
+		// schema — so importing a child into an existing schema (e.g. `main`) would
+		// otherwise leave a stale reverse FK index. Cold reopen masks this (the index
+		// is built lazily only after rehydration completes), but a re-import onto a
+		// live, already-built index would under-report — the fatal direction. Reset
+		// directly so the silent-import path upholds the same invariant as the events.
+		this.invalidateReverseFkIndex();
 		log(`Imported table %s.%s using module %s`, targetSchemaName, tableName, moduleName);
 
 		return { type: 'table', name: `${targetSchemaName}.${tableName}` };
