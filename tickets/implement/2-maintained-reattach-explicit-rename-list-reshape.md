@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-13T21:22:01.173Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\2-maintained-reattach-explicit-rename-list-reshape.implement.2026-06-13T21-22-01-173Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Make a declarative rename-list change on an EXPLICIT maintained table apply via `apply schema`. The differ already emits a re-attach (the bodyHash drifts); the only gap is that the emitted `set maintained as` does not carry the new rename list. With the verb's `set maintained (cols) as` grammar now landed (prereq complete), the differ threads the declared `maintained.columns` into the re-attach so the backing column is renamed and the derivation re-recorded, instead of erroring at the strict attach shape check.
 prereq: maintained-set-maintained-rename-list-verb
 files:

@@ -1404,19 +1404,17 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
-	it('a column-list (rename) change on a sugar MV: the bare re-attach goes implicit; the explicit verb converges', async function () {
+	it('an explicit rename-list change on a sugar MV applies via the carried (cols) re-attach and converges', async function () {
 		// The explicit rename list (`mv (a, b)`) is part of the canonical definition
 		// the body hash covers, so changing it (b → c) drifts the hash and the differ
-		// emits a re-attach. The differ does not YET carry the rename list on the
-		// emitted `set maintained as` (tracked: the sibling differ ticket
-		// maintained-reattach-explicit-rename-list-reshape), so the verb sees an
-		// IMPLICIT re-attach. With the gate relaxation (this ticket,
-		// maintained-set-maintained-rename-list-verb) that no longer ERRORS as it used
-		// to — it reshapes the backing to the body's natural names and records
-		// implicit. The declaration stays explicit, so a single apply no longer
-		// CONVERGES; the `set maintained (cols) as` verb this ticket adds closes the
-		// gap and is exercised directly here and in
-		// maintained-table-attach-detach.spec.ts.
+		// emits a re-attach. The differ now carries the DECLARED rename list onto the
+		// emitted `set maintained` op (ticket
+		// maintained-reattach-explicit-rename-list-reshape), so `generateMigrationDDL`
+		// renders `set maintained (a, c) as …`. The verb (prereq
+		// maintained-set-maintained-rename-list-verb) positionally relabels the body to
+		// (a, c) and renames the backing `b → c` IN PLACE — so a single `apply schema`
+		// CONVERGES (no drop+recreate, no detach leg) where it previously could only
+		// reshape to the body's natural names (going implicit) and never converge.
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -1424,6 +1422,7 @@ describe('declarative-equivalence: materialized views', () => {
 				materialized view mv (a, b) as select id, x from t
 			}`);
 			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 10), (2, 20)');
 
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL }
@@ -1433,36 +1432,40 @@ describe('declarative-equivalence: materialized views', () => {
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			// The differ DOES recognize the rename-list change as a re-attach…
-			expect(diff.tablesToAlter.find(a => a.tableName === 'mv')?.setMaintained, 'rename-list change ⇒ re-attach').to.not.be.undefined;
+			// The differ recognizes the rename-list change as an in-place re-attach that
+			// CARRIES the declared list — no detach leg, no drop+recreate.
+			const mvAlter = diff.tablesToAlter.find(a => a.tableName === 'mv');
+			expect(mvAlter?.setMaintained?.columns, 'carries the declared rename list').to.deep.equal(['a', 'c']);
+			expect(mvAlter?.dropMaintained, 'in-place reshape ⇒ no detach leg').to.be.undefined;
 			expect(diff.tablesToDrop, 'no drop of the maintained table').to.deep.equal([]);
+			expect(diff.tablesToCreate, 'no recreate of the maintained table').to.deep.equal([]);
 
-			// …and applying it no longer throws: the bare (implicit) re-attach reshapes
-			// the backing to the body's natural names and records implicit.
+			// One apply relabels the backing `b → c` in place and re-records the list.
 			await db.exec('apply schema main');
 			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
-			expect(mv.columns.map(c => c.name), 'reshaped to the body names (went implicit)').to.deep.equal(['id', 'x']);
-			expect(mv.derivation.columns, 'recorded implicit').to.be.undefined;
+			expect(mv.columns.map(c => c.name), 'backing relabeled to (a, c)').to.deep.equal(['a', 'c']);
+			expect(mv.derivation.columns, 'records the authored list (a, c)').to.deep.equal(['a', 'c']);
 
-			// But it did not converge to the EXPLICIT declaration: a re-diff still wants
-			// a re-attach until the differ carries the rename list (sibling ticket).
-			const reDiff = computeSchemaDiff(
+			// Rows survive the relabel with their values intact (a rename, not a rebuild).
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select a, c from mv order by a')) rows.push(r);
+			expect(rows, 'rows preserved through the relabel').to.deep.equal([
+				{ a: 1, c: 10 }, { a: 2, c: 20 },
+			]);
+
+			// Maintenance is live on the relabeled backing.
+			await db.exec('insert into t values (3, 30)');
+			const after: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select c from mv where a = 3')) after.push(r);
+			expect(after).to.deep.equal([{ c: 30 }]);
+
+			// Converged: re-diffing the just-applied schema wants no further re-attach.
+			const converged = computeSchemaDiff(
 				db.declaredSchemaManager.getDeclaredSchema('main')!,
 				collectSchemaCatalog(db, 'main'),
 			);
-			expect(reDiff.tablesToAlter.find(a => a.tableName === 'mv')?.setMaintained, 'not yet converged (differ ticket pending)').to.not.be.undefined;
-
-			// The explicit verb closes the gap: it relabels the backing to (a, c) and
-			// records the authored list, so the schema converges.
-			await db.exec('alter table mv set maintained (a, c) as select id, x from t');
-			const converged = db.schemaManager.getMaintainedTable('main', 'mv')!;
-			expect(converged.columns.map(c => c.name), 'explicit verb relabels to (a, c)').to.deep.equal(['a', 'c']);
-			expect(converged.derivation.columns, 'records the authored list').to.deep.equal(['a', 'c']);
-			const convergedDiff = computeSchemaDiff(
-				db.declaredSchemaManager.getDeclaredSchema('main')!,
-				collectSchemaCatalog(db, 'main'),
-			);
-			expect(convergedDiff.tablesToAlter.find(a => a.tableName === 'mv'), 'converged ⇒ no further re-attach').to.be.undefined;
+			expect(converged.tablesToAlter.find(a => a.tableName === 'mv'), 'converged ⇒ no further re-attach').to.be.undefined;
+			expect(converged.tablesToDrop).to.deep.equal([]);
 		} finally {
 			await db.close();
 		}

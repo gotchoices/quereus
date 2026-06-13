@@ -159,14 +159,22 @@ export interface TableAlterDiff {
 	constraintTagsChanges?: Array<{ constraintName: string; tags: Record<string, SqlValue> }>;
 	/**
 	 * Maintained-table (derivation) transition. Attach or re-attach a derivation:
-	 * `alter table … set maintained as <body>` (any `with defaults (…)` rides inside
-	 * the body). Emitted LATE (after table creates/alters), where the target's final
-	 * shape and the body's sources must already exist. Set on: a fresh attach
+	 * `alter table … set maintained [(cols)] as <body>` (any `with defaults (…)` rides
+	 * inside the body). Emitted LATE (after table creates/alters), where the target's
+	 * final shape and the body's sources must already exist. Set on: a fresh attach
 	 * (declared maintained, live plain) and a re-attach (both maintained, body
 	 * drift). On a same-shape re-attach this is the only op (content reconcile /
 	 * refresh — no recreate).
+	 *
+	 * `columns` carries the DECLARED rename list verbatim: the names array for an
+	 * explicit maintained form (`mv (a, c)` / `maintained (a, c) as`) — rendered as the
+	 * `(cols)` form so the verb positionally renames the body and reshapes the backing
+	 * — or `undefined` for an implicit/sugar-without-list MV, where the verb stays
+	 * implicit (the body's natural names follow). The differ never synthesizes or
+	 * compares renames; it hands the verb the authored list and the verb does the
+	 * reshape (and re-records `derivation.columns`).
 	 */
-	setMaintained?: { select: AST.QueryExpr };
+	setMaintained?: { columns?: ReadonlyArray<string>; select: AST.QueryExpr };
 	/**
 	 * Detach a derivation: `alter table … drop maintained` (the table keeps its
 	 * rows and becomes writable). Emitted EARLY (before table alters/drops) — a
@@ -1950,8 +1958,9 @@ function applyMaintainedTransition(
 	if (!declaredMaintained && !liveMaintained) return;
 	if (declaredMaintained && !liveMaintained) {
 		// Attach: derived content reconciles the live (plain) table's rows. Any
-		// `with defaults (…)` rides inside the body select.
-		diff.setMaintained = { select: declaredMaintained.select };
+		// `with defaults (…)` rides inside the body select. Carry the DECLARED rename
+		// list (the verb renames + records explicit; `undefined` ⇒ stays implicit).
+		diff.setMaintained = { columns: declaredMaintained.columns, select: declaredMaintained.select };
 		return;
 	}
 	if (!declaredMaintained && liveMaintained) {
@@ -1966,9 +1975,12 @@ function applyMaintainedTransition(
 	}
 	// Body drift → re-attach. A concurrent shape change (column / PK / constraint
 	// ops already on `diff`) means detach → reshape → re-attach; an unchanged shape
-	// re-attaches in place (content reconcile / refresh).
+	// re-attaches in place (content reconcile / refresh). Carry the DECLARED rename
+	// list so an explicit rename-list change (`(a, b)` → `(a, c)`) reshapes the
+	// backing in place via the verb instead of erroring at the strict attach shape
+	// check; `undefined` ⇒ the verb follows the body (implicit reshape).
 	if (alterDiffHasShapeOps(diff)) diff.dropMaintained = true;
-	diff.setMaintained = { select: declaredMaintained!.select };
+	diff.setMaintained = { columns: declaredMaintained!.columns, select: declaredMaintained!.select };
 }
 
 /**
@@ -2467,8 +2479,11 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 				? { type: 'identifier', name: alter.tableName, schema: schemaName }
 				: { type: 'identifier', name: alter.tableName },
 			action: {
-				// Any `with defaults (…)` rides inside the body select.
+				// Any `with defaults (…)` rides inside the body select. The `(cols)`
+				// rename list rides too when the DECLARED form is explicit (`astToString`
+				// renders it; `undefined` ⇒ the bare `set maintained as` implicit form).
 				type: 'setMaintained',
+				columns: alter.setMaintained.columns,
 				select: alter.setMaintained.select,
 			},
 		};

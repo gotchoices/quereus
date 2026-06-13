@@ -114,4 +114,179 @@ describe('Maintained-table differ — review coverage', () => {
 		expect(isMaintainedTable(m!), 'm is no longer maintained').to.be.false;
 		expect(await rows('select id, v from m')).to.deep.equal([{ id: 1, v: 10 }]);
 	});
+
+	/**
+	 * The differ carries the DECLARED rename list (`maintained.columns`) onto every
+	 * `setMaintained` re-attach op (ticket maintained-reattach-explicit-rename-list-reshape),
+	 * so `generateMigrationDDL` renders `set maintained (cols) as …` and the verb
+	 * relabels the backing IN PLACE. These cover the variants the headline
+	 * declarative-equivalence test (the sugar `(a, b)` → `(a, c)` rename) does not:
+	 * body-only, the explicit⇄implicit transitions, the arity contract, the declared-
+	 * shape table form, and re-diff idempotency after each apply.
+	 *
+	 * NOTE (deliberately uncovered here): a declared-SHAPE table form whose authored
+	 * NAME list changes (`table mv (a, b) maintained (a, b) as …` → `… (a, c) …`) also
+	 * drifts the table's OWN declared column set (b → c), which the differ resolves as
+	 * an independent column drop+add — the pre-existing detach→reshape→re-attach path,
+	 * orthogonal to this ticket's carried-columns surface. The literal column-less
+	 * table form (`create table mv maintained (a, b) as …`) is not a thing the grammar
+	 * accepts (a `table` item requires a column block), so the canonical explicit
+	 * surface is the MV sugar; the table-form coverage below therefore exercises a
+	 * body-only re-attach (rename list stable), which routes cleanly through the
+	 * declared-shape branch carrying the explicit list.
+	 */
+	describe('explicit rename-list carried through the re-attach', () => {
+		async function declareApply(decl: string): Promise<void> {
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				${decl}
+			}`);
+			await db.exec('apply schema main');
+		}
+		function diffMv() {
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			return { diff, mv: diff.tablesToAlter.find(a => a.tableName === 'mv') };
+		}
+
+		it('a body-only change on an EXPLICIT sugar MV carries the list and converges', async () => {
+			await declareApply('materialized view mv (a, b) as select id, x from t');
+			await db.exec('insert into t values (1, 10)');
+			// Same rename list, body gains a predicate (type-preserving) → body-hash drift.
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				materialized view mv (a, b) as select id, x from t where id > 0
+			}`);
+			const before = diffMv();
+			expect(before.mv?.setMaintained?.columns, 'carries the unchanged list (a, b)').to.deep.equal(['a', 'b']);
+			expect(before.mv?.dropMaintained, 'no detach leg').to.be.undefined;
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.derivation.columns, 'still explicit (a, b)').to.deep.equal(['a', 'b']);
+			expect(await rows('select a, b from mv')).to.deep.equal([{ a: 1, b: 10 }]);
+			expect(diffMv().mv, 'converged').to.be.undefined;
+		});
+
+		it('an EXPLICIT → IMPLICIT re-attach drops the list and converges to an implicit record', async () => {
+			await declareApply('materialized view mv (a, b) as select id, x from t');
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				materialized view mv as select id, x from t
+			}`);
+			const before = diffMv();
+			expect(before.mv?.setMaintained, 'a re-attach is scheduled').to.not.be.undefined;
+			expect(before.mv?.setMaintained?.columns, 'no declared list ⇒ implicit re-attach').to.be.undefined;
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.columns.map(c => c.name), 'backing follows the body names').to.deep.equal(['id', 'x']);
+			expect(mv.derivation.columns, 'recorded implicit').to.be.undefined;
+			expect(diffMv().mv, 'converged').to.be.undefined;
+		});
+
+		it('an IMPLICIT → EXPLICIT re-attach records the declared list and converges', async () => {
+			await declareApply('materialized view mv as select id, x from t');
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				materialized view mv (a, b) as select id, x from t
+			}`);
+			const before = diffMv();
+			expect(before.mv?.setMaintained?.columns, 'carries the now-declared list (a, b)').to.deep.equal(['a', 'b']);
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.columns.map(c => c.name), 'backing relabeled to (a, b)').to.deep.equal(['a', 'b']);
+			expect(mv.derivation.columns, 'recorded explicit (a, b)').to.deep.equal(['a', 'b']);
+			expect(diffMv().mv, 'converged').to.be.undefined;
+		});
+
+		it('an arity change on an EXPLICIT MV is a sited error, not a silent widen', async () => {
+			await declareApply('materialized view mv (a, b) as select id, x from t');
+			// List widens to 3 and the body widens to 3 outputs: the differ carries the
+			// 3-name list verbatim; the verb's strict count check rejects it at apply.
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				materialized view mv (a, b, d) as select id, x, x from t
+			}`);
+			const before = diffMv();
+			expect(before.mv?.setMaintained?.columns, 'carries the widened list verbatim').to.deep.equal(['a', 'b', 'd']);
+			let message = '';
+			try { await db.exec('apply schema main'); } catch (e) { message = (e as Error).message; }
+			expect(message, 'arity is a sited error').to.match(/body produces 3 columns but the table declares 2/i);
+			// The live MV is unchanged — no silent widen/narrow.
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.columns.map(c => c.name), 'live shape unchanged').to.deep.equal(['a', 'b']);
+			expect(mv.derivation.columns, 'live record unchanged').to.deep.equal(['a', 'b']);
+		});
+
+		it('a concurrent tag change + rename-list change coexist on one diff and the rename lands', async () => {
+			await declareApply(`materialized view mv (a, b) as select id, x from t with tags ("team.owner" = 'old')`);
+			await db.exec('insert into t values (1, 10)');
+			// Both the rename list (b → c) AND the table tags drift in the same diff.
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				materialized view mv (a, c) as select id, x from t with tags ("team.owner" = 'new')
+			}`);
+			const before = diffMv();
+			// In scope here: the carried columns and the maintained-tag routing
+			// (markMaintainedTagRoute) coexist on the same alter diff — the carry does not
+			// disturb the SET TAGS routing.
+			expect(before.mv?.setMaintained?.columns, 'carries the list (a, c)').to.deep.equal(['a', 'c']);
+			expect(before.mv?.tableTagsChange, 'tag drift recorded').to.deep.equal({ 'team.owner': 'new' });
+			expect(before.mv?.maintainedTags, 'tag edit routed through ALTER MATERIALIZED VIEW').to.equal(true);
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.derivation.columns, 'rename-list landed (a, c)').to.deep.equal(['a', 'c']);
+			expect(await rows('select a, c from mv')).to.deep.equal([{ a: 1, c: 10 }]);
+			// KNOWN GAP (orthogonal to this ticket — tracked by fix ticket
+			// maintained-reshape-reattach-drops-concurrent-tags): a *reshaping* re-attach
+			// rebuilds `live` from the backing module's post-ALTER schema, which does not
+			// carry the catalog's table tags, so the concurrent SET TAGS is dropped. A
+			// non-reshaping (body-only) re-attach preserves tags (covered above); the
+			// pre-existing IMPLICIT reshape had the same gap. We deliberately do NOT assert
+			// the tag value here so this stays green until that fix lands; the rename-list
+			// reshape — this ticket's surface — converges regardless.
+			const tagDiff = diffMv();
+			expect(tagDiff.mv?.setMaintained, 'rename-list converged ⇒ no further re-attach').to.be.undefined;
+		});
+
+		it('a rename-list change under require-hint is an alter, not an unhinted create+drop', async () => {
+			await declareApply('materialized view mv (a, b) as select id, x from t');
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				materialized view mv (a, c) as select id, x from t
+			}`);
+			// A re-attach is an ALTER (set maintained), not a create+drop pair, so it does
+			// not trip the unhinted-rename guard — diffing under require-hint must not throw.
+			const diff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+				'require-hint',
+			);
+			const mv = diff.tablesToAlter.find(a => a.tableName === 'mv');
+			expect(mv?.setMaintained?.columns, 'carries the list under require-hint').to.deep.equal(['a', 'c']);
+			expect(diff.tablesToCreate, 'no create').to.deep.equal([]);
+			expect(diff.tablesToDrop, 'no drop').to.deep.equal([]);
+		});
+
+		it('the declared-shape table form carries the explicit list on a body-only re-attach', async () => {
+			await declareApply('table mv (a integer primary key, b integer) maintained (a, b) as select id, x from t');
+			await db.exec('insert into t values (1, 10)');
+			// Rename list AND declared columns unchanged; only the body drifts (WHERE).
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				table mv (a integer primary key, b integer) maintained (a, b) as select id, x from t where id > 0
+			}`);
+			const before = diffMv();
+			expect(before.mv?.setMaintained?.columns, 'declared-shape branch carries (a, b)').to.deep.equal(['a', 'b']);
+			expect(before.mv?.dropMaintained, 'body-only ⇒ no detach leg').to.be.undefined;
+			expect(before.mv?.columnsToAdd, 'no column drift').to.deep.equal([]);
+			expect(before.mv?.columnsToDrop, 'no column drift').to.deep.equal([]);
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.derivation.columns, 'still explicit (a, b)').to.deep.equal(['a', 'b']);
+			expect(await rows('select a, b from mv')).to.deep.equal([{ a: 1, b: 10 }]);
+			expect(diffMv().mv, 'converged').to.be.undefined;
+		});
+	});
 });
