@@ -152,11 +152,15 @@ function synthesizeExistsCheck(
 ): AST.Expression {
 	const parentColumns = parentColIndices.map(i => parentTable.columns[i].name);
 	const childColumns = fk.columns.map(childColIdx => childTable.columns[childColIdx].name);
+	// Thread the parent's own schema so the synthesized `from <parent>` resolves to
+	// the correct table even when the parent lives in a different schema than the
+	// child (a no-op for the same-schema case — the search path already resolves it).
 	return synthesizeFKExistsExpr(
 		parentTable.name,
 		parentColumns,
 		childColumns,
 		qualifier.toUpperCase() as 'NEW' | 'OLD',
+		parentTable.schemaName,
 	);
 }
 
@@ -174,8 +178,10 @@ function synthesizeNotExistsCheck(
 ): AST.UnaryExpr {
 	const childColumns = fk.columns.map(childColIdx => childTable.columns[childColIdx].name);
 	const parentColumns = parentColIndices.map(idx => parentTable.columns[idx].name);
-	// Physical path: child/parent names off the `TableSchema`s, no `fromSchema`.
-	return synthesizeFKNotExistsExpr(childTable.name, childColumns, parentColumns, 'OLD');
+	// Physical path: child/parent names off the `TableSchema`s. Thread the child's
+	// own schema as `fromSchema` so the synthesized `from <child>` resolves correctly
+	// when the child lives in a different schema than the parent (a no-op same-schema).
+	return synthesizeFKNotExistsExpr(childTable.name, childColumns, parentColumns, 'OLD', childTable.schemaName);
 }
 
 /**

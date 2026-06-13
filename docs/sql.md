@@ -3163,13 +3163,20 @@ When no `ON DELETE` or `ON UPDATE` clause is specified, the default action is `R
 
 **Syntax - Column Constraint:**
 ```sql
-column_name data_type references foreign_table [(column)] [ref_actions]
+column_name data_type references [schema.]foreign_table [(column)] [ref_actions]
 ```
 
 **Syntax - Table Constraint:**
 ```sql
-foreign key (column[, ...]) references foreign_table [(column[, ...])] [ref_actions]
+foreign key (column[, ...]) references [schema.]foreign_table [(column[, ...])] [ref_actions]
 ```
+
+The parent table may be **schema-qualified** (`references other_schema.parent(id)`),
+so a child in one schema can reference a parent in another. An unqualified parent
+defaults to the child's own schema and persists with no qualifier (byte-identical
+to a same-schema FK). All reference actions (RESTRICT / CASCADE / SET NULL /
+SET DEFAULT) and `foreign_key_info()`'s `referenced_schema` column work the same
+across schemas.
 
 **Reference Actions:**
 ```sql

@@ -93,7 +93,7 @@ export function buildForeignKeyConstraintSchema(
 		name: fkName,
 		columns: Object.freeze(childColIndices),
 		referencedTable: fk.table,
-		referencedSchema: childSchemaName,
+		referencedSchema: fk.schema ?? childSchemaName,
 		referencedColumns: Object.freeze([]), // resolved at enforcement time
 		referencedColumnNames: fk.columns, // deferred resolution via resolveReferencedColumns
 		onDelete: fk.onDelete ?? 'restrict',
@@ -182,7 +182,7 @@ export function extractColumnLevelForeignKeys(
 			name: con.name ?? `_fk_${columnDef.name}`,
 			columns: Object.freeze([]),
 			referencedTable: fk.table,
-			referencedSchema: defaultSchemaName,
+			referencedSchema: fk.schema ?? defaultSchemaName,
 			referencedColumns: Object.freeze([]),
 			referencedColumnNames: fk.columns,
 			onDelete: fk.onDelete ?? 'restrict',

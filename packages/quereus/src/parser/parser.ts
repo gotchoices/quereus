@@ -4531,7 +4531,18 @@ export class Parser {
 		if (this.check(TokenType.REFERENCES)) {
 			this.advance();
 		}
-		const table = this.consumeIdentifier("Expected foreign table name.");
+		// Optional `schema.` qualifier on the parent table (cross-schema FK),
+		// mirroring tableIdentifier() so a schema named `temp` parses.
+		const contextualKeywords = [...CONTEXTUAL_KEYWORDS, 'temp', 'temporary'];
+		let schema: string | undefined;
+		let table: string;
+		if (this.checkIdentifierLike(contextualKeywords) && this.checkNext(1, TokenType.DOT)) {
+			schema = this.consumeIdentifier(contextualKeywords, "Expected schema name.");
+			this.advance(); // Consume DOT
+			table = this.consumeIdentifier(contextualKeywords, "Expected foreign table name after schema.");
+		} else {
+			table = this.consumeIdentifier(contextualKeywords, "Expected foreign table name.");
+		}
 		let columns: string[] | undefined;
 		if (this.match(TokenType.LPAREN)) {
 			columns = this.identifierList();
@@ -4580,7 +4591,7 @@ export class Parser {
 			}
 		}
 
-		return { table, columns, onDelete, onUpdate, deferrable, initiallyDeferred };
+		return { table, schema, columns, onDelete, onUpdate, deferrable, initiallyDeferred };
 	}
 
 	/** @internal Parses the ON CONFLICT clause */

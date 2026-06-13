@@ -342,17 +342,21 @@ function schemaConstraintToTableConstraint(
 			// form distinguishable here is `deferrable initially deferred`; all
 			// non-deferred forms reconstruct as no clause (re-parses to deferred=false).
 			//
-			// Cross-schema FK limitation: AST.ForeignKeyClause.table is unqualified and
-			// cannot encode `c.referencedSchema`, so a FK referencing a parent in a
-			// different schema loses that qualification on persistence round-trip. This
-			// is a pre-existing fidelity gap (cross-schema FKs are already excluded from
-			// catalog drop-ordering in catalog.ts); same-schema FKs round-trip exactly.
+			// Cross-schema FK: emit the `schema.` qualifier ONLY when the parent schema
+			// differs from the child's, so a cross-schema parent survives the DDL
+			// round-trip while same-schema FK DDL stays byte-identical (no qualifier).
+			const crossSchema =
+				c.referencedSchema &&
+				c.referencedSchema.toLowerCase() !== tableSchema.schemaName.toLowerCase()
+					? c.referencedSchema
+					: undefined;
 			return {
 				type: 'foreignKey',
 				name: c.name,
 				columns: c.columns.map(i => ({ name: colName(i) })),
 				foreignKey: {
 					table: c.referencedTable,
+					schema: crossSchema,
 					columns: c.referencedColumnNames ? [...c.referencedColumnNames] : undefined,
 					onDelete: c.onDelete,
 					onUpdate: c.onUpdate,

@@ -632,6 +632,7 @@ export interface TableConstraint extends AstNode {
 // Foreign key clause
 export interface ForeignKeyClause {
 	table: string;
+	schema?: string;           // Optional parent schema qualifier (cross-schema FK)
 	columns?: string[];
 	onDelete?: ForeignKeyAction;
 	onUpdate?: ForeignKeyAction;

@@ -1616,6 +1616,11 @@ function canonicalCheckOperations(ops: RowOp[] | undefined): RowOp[] | undefined
 function canonicalForeignKeyClause(fk: AST.ForeignKeyClause): AST.ForeignKeyClause {
 	return {
 		table: fk.table.toLowerCase(),
+		// Carry the parent-schema qualifier (case-folded) so a cross-schema FK and a
+		// same-schema FK to a like-named parent don't collapse to one canonical key.
+		// Full declared-vs-actual symmetry (eliding an explicit own-schema qualifier)
+		// is the follow-on `cross-schema-fk-declarative-diff` ticket's job.
+		schema: fk.schema ? fk.schema.toLowerCase() : undefined,
 		columns: fk.columns && fk.columns.length > 0 ? fk.columns : undefined,
 		onDelete: fk.onDelete && fk.onDelete !== 'restrict' ? fk.onDelete : undefined,
 		onUpdate: fk.onUpdate && fk.onUpdate !== 'restrict' ? fk.onUpdate : undefined,
@@ -1711,9 +1716,10 @@ function foreignKeyActionToString(action: AST.ForeignKeyAction): string {
 	}
 }
 
-/** Emits `references TBL(cols) [on delete …] [on update …] [[not] deferrable [initially …]]`. */
+/** Emits `references [SCHEMA.]TBL(cols) [on delete …] [on update …] [[not] deferrable [initially …]]`. */
 function foreignKeyClauseTail(fk: AST.ForeignKeyClause): string {
-	let s = `references ${quoteIdentifier(fk.table)}`;
+	const qualified = fk.schema ? `${quoteIdentifier(fk.schema)}.${quoteIdentifier(fk.table)}` : quoteIdentifier(fk.table);
+	let s = `references ${qualified}`;
 	if (fk.columns && fk.columns.length > 0) {
 		s += `(${fk.columns.map(quoteIdentifier).join(', ')})`;
 	}

@@ -178,6 +178,61 @@ describe('Emit: ast-stringify AST round-trip', () => {
 		}
 	});
 
+	describe('Cross-schema FOREIGN KEY parent qualifier', () => {
+		// The parent table may be schema-qualified (`references <schema>.<table>`);
+		// the optional qualifier must survive parse → stringify → parse on both the
+		// column-level and table-level FK forms, and a reserved/contextual-word
+		// schema name must re-quote correctly.
+
+		it('preserves a column-level cross-schema parent qualifier', () => {
+			const sql = 'create table Child (Id int references Other.Parent (Id), primary key (Id))';
+			const original = parse(sql) as CreateTableStmt;
+			const emitted = createTableToString(original);
+			expect(emitted, `emitted should qualify the parent\n  ${emitted}`).to.match(/references\s+Other\s*\.\s*Parent/i);
+
+			const reparsed = parse(emitted) as CreateTableStmt;
+			const colFk = reparsed.columns[0].constraints.find(c => c.type === 'foreignKey');
+			if (!colFk || !colFk.foreignKey) throw new Error('Expected column-level FK to survive re-parse');
+			expect(colFk.foreignKey.schema?.toLowerCase()).to.equal('other');
+			expect(colFk.foreignKey.table.toLowerCase()).to.equal('parent');
+		});
+
+		it('preserves a table-level cross-schema parent qualifier', () => {
+			const sql = 'create table Child (Id int, primary key (Id), foreign key (Id) references Other.Parent (Id))';
+			const original = parse(sql) as CreateTableStmt;
+			const emitted = createTableToString(original);
+			expect(emitted).to.match(/references\s+Other\s*\.\s*Parent/i);
+
+			const reparsed = parse(emitted) as CreateTableStmt;
+			const tblFk = reparsed.constraints.find(c => c.type === 'foreignKey');
+			if (!tblFk || !tblFk.foreignKey) throw new Error('Expected table-level FK to survive re-parse');
+			expect(tblFk.foreignKey.schema?.toLowerCase()).to.equal('other');
+			expect(tblFk.foreignKey.table.toLowerCase()).to.equal('parent');
+		});
+
+		it('omits the qualifier when the parent is unqualified', () => {
+			const sql = 'create table Child (Id int references Parent (Id), primary key (Id))';
+			const emitted = createTableToString(parse(sql) as CreateTableStmt);
+			expect(emitted, `no qualifier expected\n  ${emitted}`).to.not.match(/references\s+\w+\s*\.\s*\w+/i);
+			const reparsed = parse(emitted) as CreateTableStmt;
+			const colFk = reparsed.columns[0].constraints.find(c => c.type === 'foreignKey');
+			expect(colFk?.foreignKey?.schema).to.equal(undefined);
+		});
+
+		it('quotes and round-trips a reserved-word schema name', () => {
+			// `"order"` is a reserved word as a bare identifier; the qualifier must be
+			// quoted on emit and re-parse back to the same schema.
+			const sql = 'create table Child (Id int references "order".Parent (Id), primary key (Id))';
+			const original = parse(sql) as CreateTableStmt;
+			const emitted = createTableToString(original);
+			expect(emitted, `reserved-word schema must re-quote\n  ${emitted}`).to.include('"order".');
+
+			const reparsed = parse(emitted) as CreateTableStmt;
+			const colFk = reparsed.columns[0].constraints.find(c => c.type === 'foreignKey');
+			expect(colFk?.foreignKey?.schema?.toLowerCase()).to.equal('order');
+		});
+	});
+
 	describe('TEMP/TEMPORARY is rejected (not a Quereus concept)', () => {
 		it('rejects `create temp table` / `create temporary table`', () => {
 			expect(() => parse('create temp table T (Id int, primary key (Id))')).to.throw(/TEMP\/TEMPORARY is not supported/);

@@ -360,6 +360,64 @@ describe('Generator: table-column COLLATE default elision + round-trip', () => {
 	});
 });
 
+describe('Generator: cross-schema FOREIGN KEY qualifier round-trip', () => {
+	// `generateTableDDL` must emit the `schema.` qualifier on a FK whose parent
+	// lives in a different schema than the child — so a store-backed catalog keeps
+	// the parent schema across reload — and must NOT emit it for a same-schema FK,
+	// keeping existing FK DDL byte-identical. See `schemaConstraintToTableConstraint`
+	// in ddl-generator.ts.
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('emits and re-parses the parent-schema qualifier for a cross-schema FK', async () => {
+		db.schemaManager.addSchema('s2');
+		await db.exec('create table s2.par (id integer primary key)');
+		await db.exec('create table childtbl (id integer primary key, p integer null, foreign key (p) references s2.par(id))');
+
+		const child = db.schemaManager.findTable('childtbl', 'main')!;
+		const ddl = generateTableDDL(child, db);
+		expect(ddl, `qualifier emitted\n  ddl: ${ddl}`).to.include('references s2.par');
+
+		const stmt = parse(ddl);
+		expect(stmt.type, `ddl re-parses\n  ddl: ${ddl}`).to.equal('createTable');
+		if (stmt.type === 'createTable') {
+			const fk = stmt.constraints.find(c => c.type === 'foreignKey');
+			expect(fk, 'FK constraint present').to.exist;
+			if (fk && fk.type === 'foreignKey') {
+				expect(fk.foreignKey?.schema?.toLowerCase(), 'parent schema survives round-trip').to.equal('s2');
+			}
+		}
+	});
+
+	it('omits the qualifier for a same-schema FK (byte-identical to today)', async () => {
+		await db.exec('create table par2 (id integer primary key)');
+		await db.exec('create table child2 (id integer primary key, p integer null, foreign key (p) references par2(id))');
+
+		const child = db.schemaManager.findTable('child2', 'main')!;
+		const ddl = generateTableDDL(child, db);
+		expect(ddl, `bare parent\n  ddl: ${ddl}`).to.include('references par2');
+		expect(ddl, `no qualifier on same-schema FK\n  ddl: ${ddl}`).to.not.include('main.par2');
+		expect(ddl, `no qualifier on same-schema FK\n  ddl: ${ddl}`).to.not.include('"main"');
+
+		const stmt = parse(ddl);
+		expect(stmt.type).to.equal('createTable');
+		if (stmt.type === 'createTable') {
+			const fk = stmt.constraints.find(c => c.type === 'foreignKey');
+			expect(fk, 'FK constraint present').to.exist;
+			if (fk && fk.type === 'foreignKey') {
+				expect(fk.foreignKey?.schema, 'no parent-schema qualifier for same-schema FK').to.equal(undefined);
+			}
+		}
+	});
+});
+
 describe('Generator: CREATE ASSERTION name (collectSchemaCatalog)', () => {
 	// The assertion DDL is emitted inside the private `assertionSchemaToCatalog`;
 	// `collectSchemaCatalog` is the public driver that reaches it. We create a
