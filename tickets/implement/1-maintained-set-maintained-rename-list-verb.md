@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-13T02:02:24.290Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\1-maintained-set-maintained-rename-list-verb.implement.2026-06-13T02-02-24-290Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Extend the `alter table … set maintained` verb with an explicit rename-list syntax (`set maintained (a, c) as <body>`), and teach the attach core to apply that list as a positional rename AND reshape the backing (rename only) when an explicit-recorded table's column names drift. This is the verb foundation the differ ticket (maintained-reattach-explicit-rename-list-reshape) drives; it is independently testable via manual SQL.
 prereq:
 files:
