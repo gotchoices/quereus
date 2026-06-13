@@ -10,9 +10,11 @@ import type {
 	DeclaredSeed,
 	DeclaredTable,
 	DeclaredView,
+	DeleteStmt,
 	InsertStmt,
 	SelectStmt,
 	TableConstraint,
+	UpdateStmt,
 } from '../../src/parser/ast.js';
 import { ConflictResolution } from '../../src/common/constants.js';
 
@@ -391,6 +393,65 @@ describe('Emit: ast-stringify AST round-trip', () => {
 			expect(emitted).to.match(/^insert\s+into\b/i);
 			expect(emitted).to.not.match(/\binsert\s+or\b/i);
 			expect(emitted).to.not.match(/\bon\s+conflict\b/i);
+		});
+	});
+
+	describe('Inline subquery DML write target', () => {
+		// `update (select …) as v set …` / `delete from (select …) as v where …` carry the
+		// subquery body on `targetSource`, the alias on `alias`, and a synthetic placeholder
+		// `table` (= the alias). The stringifier renders `(body) as alias[(cols)]` in place of
+		// a named target and must NOT double-emit the standalone `as alias`.
+
+		it('round-trips a subquery UPDATE target', () => {
+			const sql = "update (select id, color from base) as v set color = 'x' where v.id = 1";
+			const original = parse(sql) as UpdateStmt;
+			expect(original.targetSource, 'targetSource should be set').to.exist;
+			expect(original.targetSource!.alias).to.equal('v');
+			expect(original.targetSource!.subquery.type).to.equal('select');
+			expect(original.alias).to.equal('v');
+			expect(original.table.name).to.equal('v'); // synthetic placeholder = alias
+
+			const emitted = astToString(original);
+			// The alias appears exactly once (folded into the targetSource render).
+			expect((emitted.match(/\bas\s+(?:"v"|v)\b/gi) ?? []).length, `alias emitted once in: ${emitted}`).to.equal(1);
+			expect(emitted).to.match(/^update\s+\(\s*select\b/i);
+
+			const reparsed = parse(emitted) as UpdateStmt;
+			expect(reparsed.targetSource, 'targetSource survives round-trip').to.exist;
+			expect(reparsed.targetSource!.alias).to.equal('v');
+			expect(reparsed.targetSource!.columns).to.be.undefined;
+			expect(reparsed.alias).to.equal('v');
+			expect(astToString(reparsed)).to.equal(emitted); // string-stable
+		});
+
+		it('round-trips a subquery DELETE target', () => {
+			const sql = 'delete from (select id, color from base) as v where v.id = 2';
+			const original = parse(sql) as DeleteStmt;
+			expect(original.targetSource, 'targetSource should be set').to.exist;
+			expect(original.targetSource!.alias).to.equal('v');
+			expect(original.alias).to.equal('v');
+
+			const emitted = astToString(original);
+			expect((emitted.match(/\bas\s+(?:"v"|v)\b/gi) ?? []).length, `alias emitted once in: ${emitted}`).to.equal(1);
+			expect(emitted).to.match(/^delete\s+from\s+\(\s*select\b/i);
+
+			const reparsed = parse(emitted) as DeleteStmt;
+			expect(reparsed.targetSource, 'targetSource survives round-trip').to.exist;
+			expect(reparsed.targetSource!.alias).to.equal('v');
+			expect(astToString(reparsed)).to.equal(emitted);
+		});
+
+		it('round-trips a subquery UPDATE target with an `as v(cols)` rename list', () => {
+			const sql = "update (select id, color from base) as v (k, c) set c = 'z' where k = 1";
+			const original = parse(sql) as UpdateStmt;
+			expect(original.targetSource!.columns).to.deep.equal(['k', 'c']);
+
+			const emitted = astToString(original);
+			expect(emitted).to.match(/\(\s*"?k"?\s*,\s*"?c"?\s*\)/i); // rename list survives
+
+			const reparsed = parse(emitted) as UpdateStmt;
+			expect(reparsed.targetSource!.columns).to.deep.equal(['k', 'c']);
+			expect(astToString(reparsed)).to.equal(emitted);
 		});
 	});
 });

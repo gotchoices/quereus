@@ -26,7 +26,7 @@ import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivat
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { buildWithContext } from './select-context.js';
-import { resolveCteTarget, contextForCteTarget } from './dml-target.js';
+import { resolveCteTarget, contextForCteTarget, resolveSubqueryTarget } from './dml-target.js';
 
 export function buildDeleteStmt(
   ctx: PlanningContext,
@@ -68,6 +68,17 @@ export function buildDeleteStmt(
   // not resolve; building it here closes that read gap AND makes a CTE-name DML target
   // resolvable. A WITH-less delete with no parent CTEs gets the context back unchanged.
   const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
+
+  // Inline subquery target: `delete from (select …) as v where …` routes the subquery
+  // body through the same ephemeral view-like substrate (the dual of the CTE-name
+  // target). Resolved BEFORE the CTE / schema dispatch — the synthetic `table.name` (=
+  // the user alias) must not be re-resolved as a same-named CTE / schema object. The
+  // statement's CTEs stay in scope (no own-name to shadow out). See
+  // docs/view-updateability.md § CTEs and Subqueries.
+  const subqueryTarget = resolveSubqueryTarget(contextWithCTEs, stmt);
+  if (subqueryTarget) {
+    return buildViewMutation(contextWithCTEs, subqueryTarget, { op: 'delete', stmt });
+  }
 
   // CTE-name target: `with t as (…) delete from t …` writes through the CTE body via
   // the ephemeral view-like substrate, SHADOWING any same-named schema table/view/MV

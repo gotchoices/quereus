@@ -245,11 +245,23 @@ export interface UpdateStmt extends AstNode {
 	withClause?: WithClause;
 	table: IdentifierExpr;
 	/**
-	 * Internal correlation name for the target. Synthesised by the view-mutation
-	 * single-source lowering to give the lowered UPDATE target a collision-proof
-	 * alias, so a substituted subquery-descent base term qualified with it binds the
-	 * outer target row even when the user subquery FROM names the same base table.
-	 * The parser never produces it (there is no `UPDATE t AS x` user syntax in scope).
+	 * Inline parenthesized subquery target: `update (select …) as v set …`. Mutually
+	 * exclusive with a named/CTE `table`. Routes the subquery body through the same
+	 * view-mutation substrate a named view / CTE target uses (an ephemeral view-like).
+	 * Its `alias` is the mandatory correlation name (the `where`/`set` reference its
+	 * columns via `v.col`), and `columns` carries an optional `as v(a,b)` rename list.
+	 * When set, the parser also fills {@link table} with a synthetic placeholder
+	 * identifier equal to the alias (so generic `stmt.table.name` reads stay total) and
+	 * {@link alias} with the same correlation name.
+	 */
+	targetSource?: SubquerySource;
+	/**
+	 * Correlation name for the target. Synthesised by the view-mutation single-source
+	 * lowering to give the lowered UPDATE target a collision-proof alias, so a
+	 * substituted subquery-descent base term qualified with it binds the outer target
+	 * row even when the user subquery FROM names the same base table. Also carries the
+	 * user-written alias of an inline subquery target ({@link targetSource}) — the one
+	 * place `UPDATE … AS x` reaches the AST.
 	 */
 	alias?: string;
 	assignments: { column: string; value: Expression }[];
@@ -266,11 +278,22 @@ export interface DeleteStmt extends AstNode {
 	withClause?: WithClause;
 	table: IdentifierExpr;
 	/**
-	 * Internal correlation name for the target. Synthesised by the view-mutation
-	 * single-source lowering to give the lowered DELETE target a collision-proof
-	 * alias, so a substituted subquery-descent base term qualified with it binds the
-	 * outer target row even when the user subquery FROM names the same base table.
-	 * The parser never produces it (there is no `DELETE FROM t AS x` user syntax in scope).
+	 * Inline parenthesized subquery target: `delete from (select …) as v where …`.
+	 * Mutually exclusive with a named/CTE `table`. Routes the subquery body through the
+	 * same view-mutation substrate a named view / CTE target uses (an ephemeral
+	 * view-like). Its `alias` is the mandatory correlation name (the `where` references
+	 * its columns via `v.col`), and `columns` carries an optional `as v(a,b)` rename
+	 * list. When set, the parser also fills {@link table} with a synthetic placeholder
+	 * identifier equal to the alias and {@link alias} with the same correlation name.
+	 */
+	targetSource?: SubquerySource;
+	/**
+	 * Correlation name for the target. Synthesised by the view-mutation single-source
+	 * lowering to give the lowered DELETE target a collision-proof alias, so a
+	 * substituted subquery-descent base term qualified with it binds the outer target
+	 * row even when the user subquery FROM names the same base table. Also carries the
+	 * user-written alias of an inline subquery target ({@link targetSource}) — the one
+	 * place `DELETE FROM … AS x` reaches the AST.
 	 */
 	alias?: string;
 	where?: Expression;

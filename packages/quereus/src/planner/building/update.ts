@@ -26,7 +26,7 @@ import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivat
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
 import { buildWithContext } from './select-context.js';
-import { resolveCteTarget, contextForCteTarget } from './dml-target.js';
+import { resolveCteTarget, contextForCteTarget, resolveSubqueryTarget } from './dml-target.js';
 
 export function buildUpdateStmt(
   ctx: PlanningContext,
@@ -68,6 +68,17 @@ export function buildUpdateStmt(
   // target resolvable. A WITH-less update with no parent CTEs gets the context back
   // unchanged (no overhead).
   const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
+
+  // Inline subquery target: `update (select …) as v set …` routes the subquery body
+  // through the same ephemeral view-like substrate (the dual of the CTE-name target).
+  // Resolved BEFORE the CTE / schema dispatch — the synthetic `table.name` (= the user
+  // alias) must not be re-resolved as a same-named CTE / schema object. The statement's
+  // CTEs stay in scope (no own-name to shadow out), so a sibling-CTE read in the body
+  // resolves. See docs/view-updateability.md § CTEs and Subqueries.
+  const subqueryTarget = resolveSubqueryTarget(contextWithCTEs, stmt);
+  if (subqueryTarget) {
+    return buildViewMutation(contextWithCTEs, subqueryTarget, { op: 'update', stmt });
+  }
 
   // CTE-name target: `with t as (…) update t …` writes through the CTE body via the
   // ephemeral view-like substrate, SHADOWING any same-named schema table/view/MV

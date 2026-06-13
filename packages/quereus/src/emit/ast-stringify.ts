@@ -850,6 +850,20 @@ function upsertClauseToString(upsert: AST.UpsertClause): string {
 	return parts.join(' ');
 }
 
+/**
+ * Render an inline subquery DML write target: `(<body>) as <alias>[(cols)]`. Reuses the
+ * FROM-subquery body+alias rendering so a nested DML/RETURNING body round-trips. The
+ * alias is folded in here, so the caller must NOT also emit the standalone `as <alias>`
+ * push (it would double-emit). Mirrors the `subquerySource` case of {@link fromClauseToString}.
+ */
+function subqueryTargetToString(target: AST.SubquerySource): string {
+	let aliasStr = `as ${quoteIdentifier(target.alias)}`;
+	if (target.columns && target.columns.length > 0) {
+		aliasStr += ` (${target.columns.map(quoteIdentifier).join(', ')})`;
+	}
+	return `(${astToString(target.subquery)}) ${aliasStr}`;
+}
+
 export function updateToString(stmt: AST.UpdateStmt): string {
 	const parts: string[] = [];
 
@@ -857,10 +871,17 @@ export function updateToString(stmt: AST.UpdateStmt): string {
 		parts.push(withClauseToString(stmt.withClause));
 	}
 
-	parts.push('update', expressionToString(stmt.table));
-	// Synthesised internal correlation name (view-mutation single-source lowering) —
-	// render it for plan/debug round-trip fidelity.
-	if (stmt.alias) parts.push('as', quoteIdentifier(stmt.alias));
+	if (stmt.targetSource) {
+		// Inline subquery target: render `(body) as alias[(cols)]` in place of the named
+		// target. The alias rides the targetSource rendering, so the standalone `as alias`
+		// push below is skipped to avoid double-emitting it.
+		parts.push('update', subqueryTargetToString(stmt.targetSource));
+	} else {
+		parts.push('update', expressionToString(stmt.table));
+		// Synthesised internal correlation name (view-mutation single-source lowering) —
+		// render it for plan/debug round-trip fidelity.
+		if (stmt.alias) parts.push('as', quoteIdentifier(stmt.alias));
+	}
 
 	if (stmt.contextValues && stmt.contextValues.length > 0) {
 		const contextAssignments = stmt.contextValues.map(assign =>
@@ -904,10 +925,17 @@ export function deleteToString(stmt: AST.DeleteStmt): string {
 		parts.push(withClauseToString(stmt.withClause));
 	}
 
-	parts.push('delete from', expressionToString(stmt.table));
-	// Synthesised internal correlation name (view-mutation single-source lowering) —
-	// render it for plan/debug round-trip fidelity.
-	if (stmt.alias) parts.push('as', quoteIdentifier(stmt.alias));
+	if (stmt.targetSource) {
+		// Inline subquery target: render `(body) as alias[(cols)]` in place of the named
+		// target. The alias rides the targetSource rendering, so the standalone `as alias`
+		// push below is skipped to avoid double-emitting it.
+		parts.push('delete from', subqueryTargetToString(stmt.targetSource));
+	} else {
+		parts.push('delete from', expressionToString(stmt.table));
+		// Synthesised internal correlation name (view-mutation single-source lowering) —
+		// render it for plan/debug round-trip fidelity.
+		if (stmt.alias) parts.push('as', quoteIdentifier(stmt.alias));
+	}
 
 	if (stmt.contextValues && stmt.contextValues.length > 0) {
 		const contextAssignments = stmt.contextValues.map(assign =>

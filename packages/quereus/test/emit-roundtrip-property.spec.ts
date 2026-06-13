@@ -981,6 +981,59 @@ const deleteArb: fc.Arbitrary<AST.DeleteStmt> = fc.tuple(
 	return stmt;
 });
 
+/**
+ * A minimal single-column-from-table SELECT body for an inline-subquery DML target
+ * (`(select <col> from <tbl>)`), shaped to match exactly what the parser yields for the
+ * same SQL so the round-trip compares equal.
+ */
+const subqueryBodyArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(identArb, identArb).map(
+	([col, tbl]): AST.SelectStmt => ({
+		type: 'select',
+		columns: [{ type: 'column', expr: { type: 'column', name: col } }],
+		from: [{ type: 'table', table: { type: 'identifier', name: tbl } }],
+	}),
+);
+
+/**
+ * Inline-subquery UPDATE target (`update (select …) as v [(cols)] set …`). Built to
+ * mirror parser output: `table` is the alias-named placeholder, `alias` carries the
+ * correlation name, and `targetSource` holds the body + optional rename list. Guards the
+ * stringifier against silently dropping `targetSource`.
+ */
+const subqueryTargetUpdateArb: fc.Arbitrary<AST.UpdateStmt> = fc.tuple(
+	subqueryBodyArb,
+	identArb,
+	identArb,
+	literalArb,
+	fc.option(fc.array(identArb, { minLength: 1, maxLength: 3 }), { nil: undefined }),
+).map(([subquery, alias, setCol, val, columns]): AST.UpdateStmt => {
+	const targetSource: AST.SubquerySource = { type: 'subquerySource', subquery, alias };
+	if (columns) targetSource.columns = columns;
+	return {
+		type: 'update',
+		table: { type: 'identifier', name: alias },
+		alias,
+		targetSource,
+		assignments: [{ column: setCol, value: val }],
+	};
+});
+
+/** Inline-subquery DELETE target (`delete from (select …) as v [(cols)] [where …]`). */
+const subqueryTargetDeleteArb: fc.Arbitrary<AST.DeleteStmt> = fc.tuple(
+	subqueryBodyArb,
+	identArb,
+	fc.option(fc.array(identArb, { minLength: 1, maxLength: 3 }), { nil: undefined }),
+).map(([subquery, alias, columns]): AST.DeleteStmt => {
+	const targetSource: AST.SubquerySource = { type: 'subquerySource', subquery, alias };
+	if (columns) targetSource.columns = columns;
+	return {
+		type: 'delete',
+		table: { type: 'identifier', name: alias },
+		alias,
+		targetSource,
+	};
+});
+
 // ------------------------------------------------------------------------
 // Round-trip driver
 // ------------------------------------------------------------------------
@@ -1199,5 +1252,13 @@ describe('AST round-trip property: DML smoke', () => {
 
 	it('DELETE round-trips structurally', () => {
 		fc.assert(fc.property(deleteArb, checkRoundTrip), { numRuns: 50 });
+	});
+
+	it('UPDATE with an inline-subquery target round-trips structurally', () => {
+		fc.assert(fc.property(subqueryTargetUpdateArb, checkRoundTrip), { numRuns: 50 });
+	});
+
+	it('DELETE with an inline-subquery target round-trips structurally', () => {
+		fc.assert(fc.property(subqueryTargetDeleteArb, checkRoundTrip), { numRuns: 50 });
 	});
 });

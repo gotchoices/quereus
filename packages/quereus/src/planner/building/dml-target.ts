@@ -67,6 +67,62 @@ export function resolveCteTarget(
 }
 
 /**
+ * Build an ephemeral {@link MutableViewLike} from an inline parenthesized subquery DML
+ * target (`update (select …) as v set …` / `delete from (select …) as v where …`), or
+ * `undefined` when the statement carries no `targetSource` (an ordinary named / CTE
+ * target — unchanged dispatch). This is the inline-subquery dual of
+ * {@link resolveCteTarget}: per docs/view-updateability.md, a subquery in `from` is
+ * structurally an inlined CTE, so the body routes through the SAME view-mutation
+ * substrate via the same ephemeral adapter.
+ *
+ *  - `name` is the user's alias `v` — the substrate resolves the user `where`/`set`
+ *    column refs (`v.col` and the bare form) against it, exactly as for a named view's
+ *    own name.
+ *  - `selectAst` is the parenthesized body, re-planned against its own base table(s).
+ *  - `columns` carries the optional `as v(a,b)` rename list (the renamed names are what
+ *    `where`/`set` reference; the body's own projection names are hidden).
+ *
+ * A **DML-bodied** inline target (`update (insert … returning …) as v …`) is rejected
+ * up front: {@link import('../../parser/parser.js')}'s `subquerySource` admits a
+ * RETURNING DML body in a FROM position, but it is not a meaningful *write* target — the
+ * body must be a SELECT/VALUES-shaped relation with recoverable base lineage. (A
+ * VALUES/`select`-with-no-base body still rejects downstream in `analyzeView`; this
+ * guard adds a target-named fast-fail for the DML case.)
+ *
+ * The caller threads the statement's CTEs into the planning context so a sibling-CTE
+ * read in the body / user `where` / `set` resolves. Unlike the CTE-name target, an
+ * inline subquery has no own-name to shadow out of its body, so no `cteNodes` deletion
+ * is needed.
+ */
+export function resolveSubqueryTarget(
+	ctx: PlanningContext,
+	stmt: AST.UpdateStmt | AST.DeleteStmt,
+): MutableViewLike | undefined {
+	const source = stmt.targetSource;
+	if (!source) return undefined;
+
+	const body = source.subquery;
+	if (body.type === 'insert' || body.type === 'update' || body.type === 'delete') {
+		raiseMutationDiagnostic({
+			reason: 'no-base-lineage',
+			table: source.alias,
+			message: `cannot write through inline subquery target '${source.alias}': a ${body.type.toUpperCase()} body has no recoverable base operation — the write target must be a SELECT-shaped relation`,
+		});
+	}
+
+	return {
+		name: source.alias,
+		// Cosmetic for an ephemeral target (see resolveCteTarget): only lens / dependency
+		// lookups read it, and both are suppressed (ephemeral) or return undefined.
+		schemaName: ctx.schemaManager.getCurrentSchemaName(),
+		selectAst: body,
+		columns: source.columns,
+		ephemeral: true,
+		noun: 'derived table',
+	};
+}
+
+/**
  * The planning context the view-mutation substrate uses for a CTE-name target: the
  * statement's CTE-threaded context with the TARGET CTE's OWN name removed from
  * `cteNodes`.

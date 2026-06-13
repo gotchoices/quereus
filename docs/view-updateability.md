@@ -78,7 +78,7 @@ When propagation reaches an n-ary operator, it evaluates each branch's accumulat
 
 ## Per-Operator Semantics
 
-The rules below apply identically to view bodies and to a **CTE-name DML target** (a leading `with t as (…)` written as `update t` / `insert into t` / `delete from t`), which routes the CTE body through the same predicate-driven substrate via an ephemeral view-like adapter (see [§ Common Table Expressions and the CTE-name DML target](#common-table-expressions-and-the-cte-name-dml-target)). An inline `from`-subquery target (`update (select …) as v set …`) reuses the same routing and is the next phase.
+The rules below apply identically to view bodies, to a **CTE-name DML target** (a leading `with t as (…)` written as `update t` / `insert into t` / `delete from t`), and to an **inline subquery DML target** (`update (select …) as v set …` / `delete from (select …) as v where …`) — all route the body through the same predicate-driven substrate via an ephemeral view-like adapter (see [§ Common Table Expressions and the CTE-name DML target](#common-table-expressions-and-the-cte-name-dml-target) and [§ Inline subquery DML target](#inline-subquery-dml-target)).
 
 ### Projection
 
@@ -687,7 +687,23 @@ The equivalence to a named view is the acceptance bar: a CTE body that is struct
 
 **Plan-cache invalidation.** An ephemeral target records *no* schema dependency (and skips the view reserved-tag validation): there is no schema object to depend on, and the CTE body is part of the statement, re-planned from its own AST every run. So a CTE-target DML is never wrongly cached against a later `create view t`.
 
-A subquery in `from` is structurally an inlined CTE; the **inline target** `update (select … from t join s on …) as v set v.col = …` reuses this same ephemeral routing and is the next phase (`inline-subquery-dml-write-target`).
+### Inline subquery DML target
+
+A parenthesized subquery is a real **inline DML write target** for UPDATE and DELETE: `update (select …) as v set …` and `delete from (select …) as v where …` route the subquery body through the *same* view-mutation substrate a named view / CTE target uses, via the same **ephemeral view-like adapter** (`MutableViewLike.ephemeral`). A subquery in `from` is structurally an inlined CTE (§ above), so the routing is identical; this target kind adds only the grammar + AST + stringify to reach it (`resolveSubqueryTarget`, `planner/building/dml-target.ts`). The three substrate guarantees carry over unchanged: a single-source projection-and-filter body produces a **byte-identical base-op plan** to the equivalent named view / CTE; a join body composes through the same multi-source substrate; and non-decomposable bodies raise the **same** body-shape diagnostics, reached through the new target kind.
+
+**Grammar.** The target is detected by a leading `(` followed by a relation-producing keyword (`select` / `values` / `with` / a DML keyword) — the same lookahead a FROM subquery uses — and parsed by the shared `subquerySource` production. For DELETE the `(` check runs *after* the optional leading `FROM`, so `delete from (select …) as v` and `delete (select …) as v` both parse.
+
+**The alias is mandatory.** Unlike a FROM subquery (which synthesizes a default alias when none is written), a write-target alias is user-meaningful — the `where` references the body's columns through it (`v.col`) — so the bare form `update (select …) set …` is a clear parse error (`requires an alias`), never a silently-generated alias. An optional `as v(a,b)` rename list renames the body's output columns; the renamed names are what `where` reference (the body's own projection names are hidden). SET targets, as everywhere, are bare column names (`set color = …`, not `set v.color = …` — qualified SET targets are not SQL).
+
+**AST encoding.** `UpdateStmt` / `DeleteStmt` keep `table: IdentifierExpr` for the ordinary named/CTE case; an inline target rides a parallel `targetSource?: SubquerySource`, with `table` filled by a synthetic placeholder identifier equal to the alias (so the generic `stmt.table.name` reads — diagnostics, the committed-schema guard — stay total) and `alias` carrying the same correlation name. The inline-target resolution runs *before* the CTE / schema dispatch, so the synthetic `table.name` is never re-resolved as a same-named CTE or schema object.
+
+**Halloween / self-reference is a write, not a reject.** `update (select id, color from base) as v set color = 'x' where v.id in (select id from base)` writes through: the inner `from base` reads the **real** base table (an inline subquery has no own-name to shadow out of its body), so the predicate resolves and the captured affected-row set is mutated under the substrate's eager-capture discipline. This is *more* capable than the CTE-name target, whose own name is shadowed out of its body — there the equivalent self-read does not resolve and rejects. Sibling CTEs likewise stay in scope, so `with cv as (…) update (select … ) as v set x = (select … from cv) …` resolves `cv`.
+
+**v1 boundaries** (documented, deferred):
+
+- **INSERT is not admitted.** `insert into (select …)` is deliberately left unchanged: an INSERT target needs a column-list mapping, not an aliased relation, and SQLite has no such form. `insert into (` falls through to the existing `Expected table name` parse error. The CTE-name INSERT (`insert into t …`) already covers "insert through a derived relation". (A future need files a backlog ticket.)
+- **DML-bodied target.** `update (insert … returning …) as v …` parses (`subquerySource` admits a RETURNING DML body in a FROM position) but is rejected up front (`no-base-lineage`): a write target must be a SELECT-shaped relation with recoverable base lineage.
+- **Inline body that reads a CTE.** `with t as (…) update (select … from t) as v …` reaches a CTE node rather than a base table on the lineage walk and rejects structurally (`is not updateable in phase 1`) — the same multi-level boundary a CTE body that reads another CTE draws.
 
 ### Window Functions
 

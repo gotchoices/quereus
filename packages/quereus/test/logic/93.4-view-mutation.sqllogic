@@ -3234,3 +3234,155 @@ create table ectx (id integer primary key, created integer default now_ms) using
 with t as (select id from ectx) insert into t with context now_ms = 999 values (1);
 select * from ectx order by id;
 → [{"id":1,"created":999}]
+
+-- ===================================
+-- Inline subquery as a DML write target. `update (select …) as v set …` and
+-- `delete from (select …) as v where …` make a parenthesized subquery a real write
+-- target: the subquery body routes through the SAME view-mutation substrate a named
+-- view / CTE target uses (an ephemeral view-like adapter). Per docs/view-updateability.md
+-- a subquery in `from` is structurally an inlined CTE, so a single-source
+-- projection-and-filter body produces a byte-identical base-op plan to the equivalent
+-- named view. The user `where`/`set` reference the body's columns via the mandatory
+-- alias (`v.col`) or the bare form. inline-subquery INSERT is deliberately rejected.
+-- See docs/view-updateability.md § Inline subquery DML target.
+-- ===================================
+
+create table isq_base (id integer primary key, color text);
+insert into isq_base values (1,'red'),(2,'green'),(3,'blue');
+
+-- Round-Trip Law — UPDATE through the inline subquery target lands on the base table.
+-- The `where` filters on the alias-qualified `v.id`; the `set` assigns the bare column.
+update (select id, color from isq_base) as v set color = 'x' where v.id = 1;
+select * from isq_base order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"green"},{"id":3,"color":"blue"}]
+
+-- DELETE through the inline subquery target (with the optional leading FROM).
+delete from (select id, color from isq_base) as v where v.id = 2;
+select * from isq_base order by id;
+→ [{"id":1,"color":"x"},{"id":3,"color":"blue"}]
+
+-- `delete (select …) as v` — no leading FROM — parses the same way (optional-FROM parity).
+delete (select id, color from isq_base) as v where v.id = 3;
+select * from isq_base order by id;
+→ [{"id":1,"color":"x"}]
+
+-- Alias-qualified `v.col` in the WHERE (an expression position): `v.id` binds to the
+-- body's `id` column through the substrate's alias-qualified view-column descend. (SET
+-- targets are bare column names — qualified `set v.col` is not SQL, here or in SQLite —
+-- so the SET assigns the bare `color`.)
+insert into isq_base values (2,'green'),(3,'blue');
+update (select id, color from isq_base) as v set color = 'q' where v.id = 2;
+select * from isq_base order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"q"},{"id":3,"color":"blue"}]
+
+-- `as v(a,b)` column rename list — the renamed names are what `set`/`where` reference;
+-- they map through to the right base column (`c` → base `color`, `k` → base `id`).
+update (select id, color from isq_base) as v(k, c) set c = 'renamed' where k = 3;
+select * from isq_base order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"q"},{"id":3,"color":"renamed"}]
+
+-- Parity: the equivalent named view, from the same starting rows and the same DML
+-- sequence, leaves byte-identical base-table state.
+create table isq_view_base (id integer primary key, color text);
+insert into isq_view_base values (1,'red'),(2,'green'),(3,'blue');
+create view isq_tv as select id, color from isq_view_base;
+update isq_tv set color = 'x' where id = 1;
+delete from isq_tv where id = 2;
+select * from isq_view_base order by id;
+→ [{"id":1,"color":"x"},{"id":3,"color":"blue"}]
+-- And the inline subquery against a fresh copy lands identically.
+create table isq_inline_base (id integer primary key, color text);
+insert into isq_inline_base values (1,'red'),(2,'green'),(3,'blue');
+update (select id, color from isq_inline_base) as v set color = 'x' where v.id = 1;
+delete from (select id, color from isq_inline_base) as v where v.id = 2;
+select * from isq_inline_base order by id;
+→ [{"id":1,"color":"x"},{"id":3,"color":"blue"}]
+
+-- RETURNING through the inline subquery target (the OLD/NEW machinery the base op embeds).
+create table isq_ret (id integer primary key, color text);
+insert into isq_ret values (1,'red');
+update (select id, color from isq_ret) as v set color='ret' where v.id=1 returning id, color;
+→ [{"id":1,"color":"ret"}]
+
+-- Composite-PK body: the multi-column key identifies the base row through the ephemeral
+-- substrate exactly as for a composite-PK base table / view.
+create table isq_cpk (a integer, b integer, note text, primary key (a,b));
+insert into isq_cpk values (1,2,'x'),(3,4,'y');
+update (select a, b, note from isq_cpk) as v set note='z' where v.a=1 and v.b=2;
+select * from isq_cpk order by a, b;
+→ [{"a":1,"b":2,"note":"z"},{"a":3,"b":4,"note":"y"}]
+
+-- Join-bodied inline target (key-preserving inner join): composes through the same
+-- multi-source substrate as a join view — "works without special-casing" (L670).
+create table isq_jp (pid integer primary key, label text);
+create table isq_jc (cid integer primary key, pref integer, note text,
+    foreign key (pref) references isq_jp(pid));
+insert into isq_jp values (10,'P10');
+insert into isq_jc values (1,10,'a');
+update (select c.cid as cid, c.note as note, p.label as label
+    from isq_jc c join isq_jp p on p.pid = c.pref) as v set note='B' where v.cid=1;
+select cid, note from isq_jc order by cid;
+→ [{"cid":1,"note":"B"}]
+
+-- Sibling CTE read in the SET value resolves: the statement's CTEs thread into scope, and
+-- an inline subquery has NO own-name to shadow out of its body, so `cv` resolves.
+create table isq_sib_b (id integer primary key, color text);
+insert into isq_sib_b values (1,'red');
+create table isq_sib_vals (vv text);
+insert into isq_sib_vals values ('fromcte');
+with cv as (select vv from isq_sib_vals)
+    update (select id, color from isq_sib_b) as v set color = (select vv from cv) where v.id = 1;
+select * from isq_sib_b order by id;
+→ [{"id":1,"color":"fromcte"}]
+
+-- Halloween / self-reference — the inline body's `from base` and the user predicate's
+-- `from base` both read the REAL table; the substrate's eager-capture discipline holds, so
+-- this is a deterministic positive write (not a reject): every row whose id is in the
+-- captured set {1,2} updates. (Unlike the CTE-name target, whose own name is shadowed out
+-- of its body, so the equivalent CTE self-read rejects — here the predicate names the real
+-- table, which resolves.)
+create table isq_hw (id integer primary key, color text);
+insert into isq_hw values (1,'red'),(2,'green');
+update (select id, color from isq_hw) as v set color='x' where v.id in (select id from isq_hw);
+select * from isq_hw order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"x"}]
+
+-- Reject — a subquery write target with NO explicit alias errors clearly at parse; the
+-- alias is user-meaningful (the where/set reference it), never a generated default. Both
+-- UPDATE and DELETE forms reject.
+update (select id, color from isq_base) set color='q';
+-- error: requires an alias
+delete from (select id, color from isq_base) where id=1;
+-- error: requires an alias
+
+-- Reject parity — a non-updatable body (aggregate / DISTINCT) reached through the inline
+-- subquery target raises the SAME body-shape diagnostic the equivalent view body raises.
+create table isq_agg (id integer primary key, g integer, v integer);
+insert into isq_agg values (1,1,10),(2,1,20);
+update (select g, sum(v) as s from isq_agg group by g) as v set s=0 where v.g=1;
+-- error: is not updateable in phase 1
+create view isq_vagg as select g, sum(v) as s from isq_agg group by g;
+update isq_vagg set s=0 where g=1;
+-- error: is not updateable in phase 1
+update (select distinct color from isq_base) as v set color='z';
+-- error: is not updateable in phase 1
+
+-- Reject — a DML-bodied inline target (a RETURNING DML body is admitted in a FROM position
+-- but is not a meaningful write target): rejected up front with a structured diagnostic.
+update (insert into isq_base values (9,'q') returning id, color) as v set color='z' where v.id=9;
+-- error: has no recoverable base operation
+
+-- Reject — inline-subquery INSERT is deliberately NOT admitted in v1; `insert into (` falls
+-- through to the unchanged "Expected table name" parse error (an INSERT target needs a
+-- column-list mapping, not an aliased relation — the CTE-name INSERT covers the use case).
+insert into (select id from isq_base) values (9);
+-- error: Expected table name
+
+-- v1 boundary — an inline body that reads a CTE reaches a CTEReference node (not a base
+-- table) on the lineage walk, so it rejects structurally rather than multi-level inlining
+-- (the same boundary as a CTE body that reads another CTE).
+create table isq_ml (id integer primary key, color text);
+insert into isq_ml values (1,'red');
+with t as (select id, color from isq_ml)
+    update (select id, color from t) as v set color='z' where v.id=1;
+-- error: is not updateable in phase 1

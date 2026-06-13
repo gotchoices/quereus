@@ -1022,8 +1022,13 @@ export class Parser {
 	 * INSERT/UPDATE/DELETE with RETURNING). The DML branch is enforced to
 	 * carry RETURNING because the outer FROM-clause position consumes a
 	 * relation, not a side-effect.
+	 *
+	 * `requireAlias` mandates an explicit user-written alias rather than synthesizing
+	 * a default — set for an inline-subquery DML *write target* (`update (select …) as
+	 * v set …`), whose `alias` is user-meaningful (the `where`/`set` reference it). A
+	 * FROM-clause subquery leaves it false and keeps the generated-alias fallback.
 	 */
-	private subquerySource(startToken: Token, withClause?: AST.WithClause): AST.SubquerySource {
+	private subquerySource(startToken: Token, withClause?: AST.WithClause, requireAlias = false): AST.SubquerySource {
 		this.consume(TokenType.LPAREN, "Expected '(' before subquery.");
 
 		const subquery = this.parseQueryExpr(withClause, /*requireReturning*/ true);
@@ -1045,6 +1050,10 @@ export class Parser {
 			!this.isJoinToken() &&
 			!this.isEndOfClause()) {
 			alias = this.getIdentifierValue(this.advance());
+		} else if (requireAlias) {
+			// A subquery write target's alias is mandatory and user-meaningful — never a
+			// generated default (the `where`/`set` reference it). Reject the bare form.
+			throw this.error(this.peek(), "a subquery UPDATE/DELETE write target requires an alias, e.g. (select …) as v");
 		} else {
 			// Generate a default alias if none provided. Keep separate prefixes
 			// for read-only vs mutating bodies so generated aliases stay
@@ -1073,6 +1082,32 @@ export class Parser {
 			columns,
 			loc: _createLoc(startToken, endToken),
 		};
+	}
+
+	/**
+	 * Detect and parse a leading inline-subquery DML write target — `(<query>) as v` —
+	 * for `update`/`delete`, or `undefined` when the next tokens are not a `(` followed
+	 * by a relation-producing keyword (the SAME lookahead {@link tableSource} uses for a
+	 * FROM subquery). The alias is mandatory (`requireAlias`); the body re-uses the
+	 * shared {@link subquerySource} production, so it requires RETURNING on a DML body
+	 * (rejected as a write target downstream) and parses the `as v` / `v(a,b)` alias.
+	 */
+	private subqueryDmlTarget(withClause?: AST.WithClause): AST.SubquerySource | undefined {
+		if (!this.check(TokenType.LPAREN)) return undefined;
+		const lookahead = this.current + 1;
+		if (lookahead >= this.tokens.length) return undefined;
+		const nextTokenType = this.tokens[lookahead].type;
+		if (
+			nextTokenType !== TokenType.SELECT
+			&& nextTokenType !== TokenType.VALUES
+			&& nextTokenType !== TokenType.WITH
+			&& nextTokenType !== TokenType.INSERT
+			&& nextTokenType !== TokenType.UPDATE
+			&& nextTokenType !== TokenType.DELETE
+		) {
+			return undefined;
+		}
+		return this.subquerySource(this.peek(), withClause, /*requireAlias*/ true);
 	}
 
 	/** Parses a standard table source (schema.table or table) */
@@ -2292,8 +2327,15 @@ export class Parser {
 	// --- Statement Parsing Stubs ---
 
 	/** @internal */
-	private updateStatement(startToken: Token, _withClause?: AST.WithClause): AST.UpdateStmt {
-		const table = this.tableIdentifier();
+	private updateStatement(startToken: Token, withClause?: AST.WithClause): AST.UpdateStmt {
+		// Inline subquery target: `update (select …) as v set …`. When present, the
+		// alias is the target's correlation name; mirror it into a synthetic placeholder
+		// `table` (= the alias) so generic `stmt.table.name` reads stay total, and carry
+		// it on `alias`. Otherwise fall through to the ordinary named/CTE target.
+		const targetSource = this.subqueryDmlTarget(withClause);
+		const table: AST.IdentifierExpr = targetSource
+			? { type: 'identifier', name: targetSource.alias, loc: targetSource.loc }
+			: this.tableIdentifier();
 
 		// Parse mutation context assignments and/or tags if present (either may also
 		// appear trailing, after WHERE, via parseTrailingWithClauses).
@@ -2347,13 +2389,19 @@ export class Parser {
 		}
 
 		const endToken = this.previous();
-		return { type: 'update', table, assignments, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
+		return { type: 'update', table, targetSource, alias: targetSource?.alias, assignments, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
 	}
 
 	/** @internal */
-	private deleteStatement(startToken: Token, _withClause?: AST.WithClause): AST.DeleteStmt {
+	private deleteStatement(startToken: Token, withClause?: AST.WithClause): AST.DeleteStmt {
+		// `delete` consumes an optional leading `FROM`; the inline-subquery target check
+		// runs AFTER it so `delete from (select …) as v` works (and `delete (select …) as
+		// v` too, matching the optional-FROM behavior). See updateStatement.
 		this.matchKeyword('FROM');
-		const table = this.tableIdentifier();
+		const targetSource = this.subqueryDmlTarget(withClause);
+		const table: AST.IdentifierExpr = targetSource
+			? { type: 'identifier', name: targetSource.alias, loc: targetSource.loc }
+			: this.tableIdentifier();
 
 		// Parse mutation context assignments and/or tags if present (either may also
 		// appear trailing, after WHERE, via parseTrailingWithClauses).
@@ -2399,7 +2447,7 @@ export class Parser {
 		}
 
 		const endToken = this.previous();
-		return { type: 'delete', table, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
+		return { type: 'delete', table, targetSource, alias: targetSource?.alias, where, returning, contextValues, schemaPath, tags, loc: _createLoc(startToken, endToken) };
 	}
 
 	/** @internal */
