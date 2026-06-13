@@ -25,6 +25,8 @@ import { buildViewMutation } from './view-mutation-builder.js';
 import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
+import { buildWithContext } from './select-context.js';
+import { resolveCteTarget, contextForCteTarget } from './dml-target.js';
 
 export function buildUpdateStmt(
   ctx: PlanningContext,
@@ -60,6 +62,23 @@ export function buildUpdateStmt(
     ? { ...ctx, schemaPath: stmt.schemaPath }
     : ctx;
 
+  // Thread the statement's own leading WITH clause into scope. UPDATE previously
+  // ignored `stmt.withClause` entirely, so even a CTE *read* in a WHERE/SET subquery
+  // did not resolve; building it here closes that read gap AND makes a CTE-name DML
+  // target resolvable. A WITH-less update with no parent CTEs gets the context back
+  // unchanged (no overhead).
+  const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
+
+  // CTE-name target: `with t as (…) update t …` writes through the CTE body via the
+  // ephemeral view-like substrate, SHADOWING any same-named schema table/view/MV
+  // (matching read-side FROM shadowing). Resolved ahead of the schema dispatch; a
+  // recursive target is rejected here with the structured `recursive-cte` reason.
+  // See docs/view-updateability.md § CTEs and Subqueries.
+  const cteTarget = resolveCteTarget(contextWithCTEs, stmt.table, stmt.withClause);
+  if (cteTarget) {
+    return buildViewMutation(contextForCteTarget(contextWithCTEs, cteTarget.name), cteTarget, { op: 'update', stmt });
+  }
+
   // View- or materialized-view-mediated update: rewrite to target the underlying
   // base table and re-plan. An MV is a single-source projection-and-filter, so the
   // same rewrite routes write-through to its source `T`; the row-time maintenance
@@ -71,10 +90,10 @@ export function buildUpdateStmt(
     ?? (updateMaintained ? maintainedTableViewLike(updateMaintained) : undefined);
   if (updateView) {
     // Route through the view-mutation substrate (single-source = one base op).
-    return buildViewMutation(contextWithSchemaPath, updateView, { op: 'update', stmt });
+    return buildViewMutation(contextWithCTEs, updateView, { op: 'update', stmt });
   }
 
-  const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
+  const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithCTEs);
 	const tableReference = tableRetrieve.tableRef; // Extract the actual TableReferenceNode
 
   // Backstop on the RESOLVED table: the dispatch above defaults an unqualified
@@ -84,7 +103,7 @@ export function buildUpdateStmt(
   // view-mutation rewrite.
   const updateResolved = tableReference.tableSchema;
   if (isMaintainedTable(updateResolved)) {
-    return buildViewMutation(contextWithSchemaPath, maintainedTableViewLike(updateResolved), { op: 'update', stmt });
+    return buildViewMutation(contextWithCTEs, maintainedTableViewLike(updateResolved), { op: 'update', stmt });
   }
 
   // Process mutation context assignments if present
@@ -109,18 +128,19 @@ export function buildUpdateStmt(
 
     // Build context value expressions (evaluated in the base scope, before table scope)
     stmt.contextValues.forEach((assignment) => {
-      const valueExpr = buildExpression(contextWithSchemaPath, assignment.value) as ScalarPlanNode;
+      const valueExpr = buildExpression(contextWithCTEs, assignment.value) as ScalarPlanNode;
       mutationContextValues.set(assignment.name, valueExpr);
     });
   }
 
   // Plan the source of rows to update. This is typically the table itself, potentially filtered.
-  let sourceNode: RelationalPlanNode = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
+  let sourceNode: RelationalPlanNode = buildTableReference({ type: 'table', table: stmt.table }, contextWithCTEs);
 
   // Create a new scope with the table columns registered for column resolution.
   // Wrap with AliasedScope so correlated subqueries inside SET / WHERE / RETURNING
-  // can reference the outer DML target via qualified `table.column` form.
-  const tableColumnScope = new RegisteredScope(ctx.scope);
+  // can reference the outer DML target via qualified `table.column` form. Parent on
+  // the CTE-aware scope so a CTE-qualified column reference correlates too.
+  const tableColumnScope = new RegisteredScope(contextWithCTEs.scope);
   const sourceAttributes = sourceNode.getAttributes();
   sourceNode.getType().columns.forEach((c, i) => {
     const attr = sourceAttributes[i];
@@ -136,8 +156,10 @@ export function buildUpdateStmt(
   const correlationName = stmt.alias?.toLowerCase() ?? tableName;
   const tableScope = new AliasedScope(tableColumnScope, tableName, correlationName);
 
-  // Create a new planning context with the updated scope for WHERE clause resolution
-  const updateCtx = { ...contextWithSchemaPath, scope: tableScope };
+  // Create a new planning context with the updated scope for WHERE clause resolution.
+  // Built off the CTE-aware context so `stmt.cteNodes` thread into the SET / WHERE
+  // subquery builds — a CTE read in either now resolves (closes the prior read gap).
+  const updateCtx = { ...contextWithCTEs, scope: tableScope };
 
   // IMPORTANT: Build assignments FIRST to ensure parameter indices match SQL text order.
   // SQL: UPDATE t SET col = ?1 WHERE id = ?2

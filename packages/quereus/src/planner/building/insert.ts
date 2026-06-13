@@ -8,6 +8,8 @@ import { buildSelectStmt, buildValuesStmt } from './select.js';
 import { buildUpdateStmt } from './update.js';
 import { buildDeleteStmt } from './delete.js';
 import { buildWithClause } from './with.js';
+import { buildWithContext } from './select-context.js';
+import { resolveCteTarget, contextForCteTarget } from './dml-target.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type Attribute, type RowDescriptor } from '../nodes/plan-node.js';
 import { buildExpression } from './expression.js';
 import { checkColumnsAssignable, columnSchemaToDef, columnSchemaToScalarType } from '../type-utils.js';
@@ -460,6 +462,20 @@ export function buildInsertStmt(
 	// Block DML on committed pseudo-schema
 	if (isCommittedSchemaRef(stmt.table.schema)) {
 		throw new QuereusError(`Cannot modify committed-state table 'committed.${stmt.table.name}'`, StatusCode.ERROR);
+	}
+
+	// CTE-name target: a leading `with t as (…) insert into t …` writes through the
+	// CTE body via the ephemeral view-like substrate — the same predicate-driven
+	// updateability framework a named view uses — and SHADOWS any same-named schema
+	// table / view / MV (matching read-side FROM shadowing). Resolve it ahead of the
+	// schema dispatch below; a recursive target is rejected here with the structured
+	// `recursive-cte` reason. The statement's CTEs are threaded into the planning
+	// context so a sibling-CTE read in the source resolves. See docs/view-updateability.md
+	// § CTEs and Subqueries.
+	const cteTarget = resolveCteTarget(contextWithSchemaPath, stmt.table, stmt.withClause);
+	if (cteTarget) {
+		const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
+		return buildViewMutation(contextForCteTarget(contextWithCTEs, cteTarget.name), cteTarget, { op: 'insert', stmt });
 	}
 
 	// View- or materialized-view-mediated insert: if the target names an (updateable)

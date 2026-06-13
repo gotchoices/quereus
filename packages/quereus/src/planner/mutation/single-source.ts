@@ -75,6 +75,19 @@ export interface MutableViewLike {
 	 * per-column rewrite diagnostics keep the generic "view" framing.
 	 */
 	readonly noun?: string;
+	/**
+	 * True when this view-like is a CTE body or inline FROM-subquery target, NOT a
+	 * schema-registered view / MV. It carries no backing schema object, so
+	 * {@link import('../building/view-mutation-builder.js').buildViewMutation} skips
+	 * the two schema-object-coupled steps for it — the `view` schema-dependency
+	 * recording (there is nothing to depend on, and the CTE body is re-planned from
+	 * the statement AST every run) and the reserved-tag validation (an ephemeral
+	 * target carries no {@link tags}). Every other substrate step already degrades
+	 * correctly: each lens-slot / decomposition / set-op lookup keys on a schema
+	 * object the CTE name has none of, so the single-source spine is taken for a
+	 * plain projection-filter body. Diagnostics name the target by {@link noun}.
+	 */
+	readonly ephemeral?: boolean;
 }
 
 /**
@@ -488,14 +501,14 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 		raiseMutationDiagnostic({
 			reason: 'unsupported-limit',
 			table: view.name,
-			message: `cannot write through view '${view.name}': a LIMIT/OFFSET body is not decomposable in phase 1 (a mutation would escape the limited window)`,
+			message: `cannot write through ${view.noun ?? 'view'} '${view.name}': a LIMIT/OFFSET body is not decomposable in phase 1 (a mutation would escape the limited window)`,
 		});
 	}
 	if (sel.distinct) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-distinct',
 			table: view.name,
-			message: `cannot write through view '${view.name}': a DISTINCT body has no 1:1 base-row lineage and is not updateable in phase 1`,
+			message: `cannot write through ${view.noun ?? 'view'} '${view.name}': a DISTINCT body has no 1:1 base-row lineage and is not updateable in phase 1`,
 		});
 	}
 

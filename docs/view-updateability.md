@@ -78,7 +78,7 @@ When propagation reaches an n-ary operator, it evaluates each branch's accumulat
 
 ## Per-Operator Semantics
 
-The rules below apply identically to view bodies, CTE bodies, subqueries in `from`, and the inline target of `update (select ...) set ...`.
+The rules below apply identically to view bodies and to a **CTE-name DML target** (a leading `with t as (…)` written as `update t` / `insert into t` / `delete from t`), which routes the CTE body through the same predicate-driven substrate via an ephemeral view-like adapter (see [§ Common Table Expressions and the CTE-name DML target](#common-table-expressions-and-the-cte-name-dml-target)). An inline `from`-subquery target (`update (select …) as v set …`) reuses the same routing and is the next phase.
 
 ### Projection
 
@@ -665,9 +665,29 @@ Lineage passthrough. Mutations apply to all base rows that collapse to the affec
 
 Pure passthrough. `order by` and `limit` do not affect propagation unless the mutation itself carries `order by` / `limit`, in which case they participate in row-identifying-predicate construction.
 
-### Common Table Expressions and Subqueries in `from`
+### Common Table Expressions and the CTE-name DML target
 
-CTE references are inlined; propagation runs on the unfolded plan. Non-recursive CTEs are therefore transparently mutable. Recursive CTEs are read-only and rejected with a `recursive-cte` diagnostic. A subquery in `from` is structurally identical to an inlined CTE; the propagation pass treats them as the same. `update (select ... from t join s on ...) as v set v.col = ...` works without special-casing.
+A leading `with t as (…)` makes the **CTE name a real DML write target**: `update t …`, `insert into t …`, and `delete from t …` route the CTE body through the *same* view-mutation substrate a named view uses, via an **ephemeral view-like adapter** (`MutableViewLike.ephemeral`). There is no grammar change — a CTE name already parses as a bare identifier; the gap was purely resolution. The three DML builders intercept the target against the statement's own `withClause` (`resolveCteTarget`, `planner/building/dml-target.ts`) *ahead* of the `getView` / `getMaintainedTable` / `buildTableReference` schema dispatch, and a match short-circuits to `buildViewMutation` with the ephemeral adapter.
+
+The equivalence to a named view is the acceptance bar: a CTE body that is structurally a single-source projection-and-filter produces a **byte-identical base-op plan** to `create view t as (…)` followed by the same DML against `t`. Multi-source (join) CTE bodies compose through the same join substrate as a join view.
+
+**Resolution order — a CTE name *shadows* a same-named schema table / view / MV** as a write target, matching read semantics (a CTE shadows a base table in `from`). The `resolveCteTarget` check therefore runs first; the shadow is silent (no warning), consistent with read-side shadowing. A **schema-qualified** target (`update main.t`) is never a bare CTE reference, so it dispatches to the schema object even when a same-named CTE is in scope.
+
+**The target CTE's own name is shadowed out of its own body.** A non-recursive CTE cannot reference itself, so within its body a same-named `from` source is the *outer* object — the real base table (exactly SQL's CTE scoping). This makes the load-bearing shadow case `with base as (select id, color from base) update base set color = 'x'` write through to the **real** `base` table (the lowered base op resolves via the schema manager, never CTEs). Sibling CTEs stay in scope, so a sibling read in the body or in the user `where` / `set` / source resolves.
+
+**Recursive CTE targets are rejected** with a structured `recursive-cte` diagnostic (never a generic table-not-found miss). The reject gates on the *actual* recursive shape (`with recursive` keyword **and** a compound self-referential body — `isRecursiveCte`), not merely the keyword: a `with recursive` clause whose *target* member is a plain non-self-referential body is still writable.
+
+**Non-decomposable CTE bodies** (aggregate / `distinct` / `limit` / `group by` / window) raise the **same** structured diagnostic the equivalent view body raises (`unsupported-aggregate` / `unsupported-distinct` / `unsupported-limit` / …), reached through the new target kind — the reject is body-shape-driven, identical across the view and CTE target kinds.
+
+**v1 boundaries** (documented, deferred):
+
+- **Multi-level CTE body** — a CTE body that reads *another* CTE (`with a as (…), t as (select * from a) insert into t …`) reaches a CTE node rather than a base table on the lineage walk and rejects structurally (`no-base-lineage` — "not updateable in phase 1"). Transparent multi-level inlining is deferred.
+- **Self-reference in the user predicate (Halloween)** — because the target name is shadowed out of scope, a user-predicate self-read of the CTE name (`… where id in (select id from t)`) does not resolve the CTE; it is rejected cleanly (the base table is unchanged), never silently producing a Halloween-unsafe plan. Routing a CTE-sourced self-read through the substrate's eager-capture discipline is deferred.
+- **Set-op-bodied / compound CTE target** — reaches the existing set-op reject off `selectAst` (structured, no crash).
+
+**Plan-cache invalidation.** An ephemeral target records *no* schema dependency (and skips the view reserved-tag validation): there is no schema object to depend on, and the CTE body is part of the statement, re-planned from its own AST every run. So a CTE-target DML is never wrongly cached against a later `create view t`.
+
+A subquery in `from` is structurally an inlined CTE; the **inline target** `update (select … from t join s on …) as v set v.col = …` reuses this same ephemeral routing and is the next phase (`inline-subquery-dml-write-target`).
 
 ### Window Functions
 

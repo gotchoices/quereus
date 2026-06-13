@@ -6,11 +6,17 @@ import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildWithClause } from './with.js';
 
 /**
- * Builds context with CTEs if present
+ * Builds context with CTEs if present.
+ *
+ * `stmt` is narrowed to just the `withClause`-bearing shape this reads, so UPDATE /
+ * DELETE (which also carry a leading WITH) can thread their CTEs into scope through
+ * the same path SELECT uses — closing the read gap where a CTE referenced in an
+ * UPDATE/DELETE `where` / `set` subquery previously failed to resolve, and giving a
+ * CTE-name DML target its sibling CTEs.
  */
 export function buildWithContext(
 	ctx: PlanningContext,
-	stmt: AST.SelectStmt,
+	stmt: { readonly withClause?: AST.WithClause },
 	parentCTEs: Map<string, CTEScopeNode> = new Map()
 ): {
 	contextWithCTEs: PlanningContext;

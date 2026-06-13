@@ -48,6 +48,20 @@ export function buildWithClause(
 }
 
 /**
+ * True when `cte` is the recursive (self-referential) member of a WITH clause —
+ * the `recursive` keyword AND a compound (UNION / UNION ALL) SELECT body, which is
+ * the exact shape {@link buildCommonTableExpr} routes to {@link buildRecursiveCTE}.
+ * A `with recursive` clause whose member is a plain non-compound body is NOT itself
+ * recursive (a *sibling* member may carry the self-reference), so it stays on the
+ * ordinary CTE path — and remains a valid DML write target. The CTE-name DML target
+ * resolver reuses this to reject only a genuinely-recursive target with the
+ * structured `recursive-cte` diagnostic, never merely on the `recursive` keyword.
+ */
+export function isRecursiveCte(recursive: boolean, cte: AST.CommonTableExpr): boolean {
+	return recursive && cte.query.type === 'select' && !!cte.query.compound;
+}
+
+/**
  * Builds a plan node for a single Common Table Expression.
  */
 export function buildCommonTableExpr(
@@ -79,7 +93,7 @@ export function buildCommonTableExpr(
 	// require a SELECT body with a compound (UNION / UNION ALL) leg — VALUES
 	// or DML bodies cannot be recursive and fall through to the normal path
 	// (which will report the right error for non-SELECT recursive bodies).
-	if (isRecursive && cte.query.type === 'select' && cte.query.compound) {
+	if (isRecursiveCte(isRecursive, cte)) {
 		return buildRecursiveCTE(cteContext, cte, existingCTEs, options);
 	}
 

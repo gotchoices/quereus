@@ -25,6 +25,8 @@ import { buildViewMutation } from './view-mutation-builder.js';
 import { isMaintainedTable, maintainedTableViewLike } from '../../schema/derivation.js';
 import { validateReservedTags } from '../../schema/reserved-tags.js';
 import { raiseStmtTagDiagnostics } from './tag-diagnostics.js';
+import { buildWithContext } from './select-context.js';
+import { resolveCteTarget, contextForCteTarget } from './dml-target.js';
 
 export function buildDeleteStmt(
   ctx: PlanningContext,
@@ -61,6 +63,22 @@ export function buildDeleteStmt(
     ? { ...ctx, schemaPath: stmt.schemaPath }
     : ctx;
 
+  // Thread the statement's own leading WITH clause into scope. DELETE previously
+  // ignored `stmt.withClause` entirely, so even a CTE *read* in a WHERE subquery did
+  // not resolve; building it here closes that read gap AND makes a CTE-name DML target
+  // resolvable. A WITH-less delete with no parent CTEs gets the context back unchanged.
+  const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
+
+  // CTE-name target: `with t as (…) delete from t …` writes through the CTE body via
+  // the ephemeral view-like substrate, SHADOWING any same-named schema table/view/MV
+  // (matching read-side FROM shadowing). Resolved ahead of the schema dispatch; a
+  // recursive target is rejected here with the structured `recursive-cte` reason.
+  // See docs/view-updateability.md § CTEs and Subqueries.
+  const cteTarget = resolveCteTarget(contextWithCTEs, stmt.table, stmt.withClause);
+  if (cteTarget) {
+    return buildViewMutation(contextForCteTarget(contextWithCTEs, cteTarget.name), cteTarget, { op: 'delete', stmt });
+  }
+
   // View- or materialized-view-mediated delete: rewrite to target the underlying
   // base table and re-plan. An MV is a single-source projection-and-filter, so the
   // same rewrite routes write-through to its source `T`; the row-time maintenance
@@ -72,10 +90,10 @@ export function buildDeleteStmt(
     ?? (deleteMaintained ? maintainedTableViewLike(deleteMaintained) : undefined);
   if (deleteView) {
     // Route through the view-mutation substrate (single-source = one base op).
-    return buildViewMutation(contextWithSchemaPath, deleteView, { op: 'delete', stmt });
+    return buildViewMutation(contextWithCTEs, deleteView, { op: 'delete', stmt });
   }
 
-  const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithSchemaPath);
+  const tableRetrieve = buildTableReference({ type: 'table', table: stmt.table }, contextWithCTEs);
   const tableReference = tableRetrieve.tableRef; // Extract the actual TableReferenceNode
 
   // Backstop on the RESOLVED table: the dispatch above defaults an unqualified
@@ -85,7 +103,7 @@ export function buildDeleteStmt(
   // view-mutation rewrite.
   const deleteResolved = tableReference.tableSchema;
   if (isMaintainedTable(deleteResolved)) {
-    return buildViewMutation(contextWithSchemaPath, maintainedTableViewLike(deleteResolved), { op: 'delete', stmt });
+    return buildViewMutation(contextWithCTEs, maintainedTableViewLike(deleteResolved), { op: 'delete', stmt });
   }
 
   // Process mutation context assignments if present
@@ -110,7 +128,7 @@ export function buildDeleteStmt(
 
     // Build context value expressions (evaluated in the base scope, before table scope)
     stmt.contextValues.forEach((assignment) => {
-      const valueExpr = buildExpression(contextWithSchemaPath, assignment.value) as ScalarPlanNode;
+      const valueExpr = buildExpression(contextWithCTEs, assignment.value) as ScalarPlanNode;
       mutationContextValues.set(assignment.name, valueExpr);
     });
   }
@@ -120,8 +138,9 @@ export function buildDeleteStmt(
 
   // Create a new scope with the table columns registered for column resolution.
   // Wrap with AliasedScope so correlated subqueries inside WHERE / RETURNING
-  // can reference the outer DML target via qualified `table.column` form.
-  const tableColumnScope = new RegisteredScope(ctx.scope);
+  // can reference the outer DML target via qualified `table.column` form. Parent on
+  // the CTE-aware scope so a CTE-qualified column reference correlates too.
+  const tableColumnScope = new RegisteredScope(contextWithCTEs.scope);
   const sourceAttributes = sourceNode.getAttributes();
   sourceNode.getType().columns.forEach((c, i) => {
     const attr = sourceAttributes[i];
@@ -137,8 +156,10 @@ export function buildDeleteStmt(
   const correlationName = stmt.alias?.toLowerCase() ?? tableName;
   const tableScope = new AliasedScope(tableColumnScope, tableName, correlationName);
 
-  // Create a new planning context with the updated scope for WHERE clause resolution
-  const deleteCtx = { ...contextWithSchemaPath, scope: tableScope };
+  // Create a new planning context with the updated scope for WHERE clause resolution.
+  // Built off the CTE-aware context so `stmt.cteNodes` thread into the WHERE subquery
+  // builds — a CTE read there now resolves (closes the prior read gap).
+  const deleteCtx = { ...contextWithCTEs, scope: tableScope };
 
   if (stmt.where) {
     const filterExpression = buildExpression(deleteCtx, stmt.where);

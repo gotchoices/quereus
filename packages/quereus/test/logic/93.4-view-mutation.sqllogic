@@ -3055,3 +3055,150 @@ select lx, rid, rx from rsjv order by rid;
 update rsjv set rx = 'r2b' where rid = 2;
 select lx, rid, rx from rsjv order by rid;
 → [{"lx":null,"rid":1,"rx":"r1"},{"lx":"r1","rid":2,"rx":"r2b"}]
+
+-- ===================================
+-- CTE name as a DML write target. A leading `with t as (…)` makes the CTE name a real
+-- DML target: update / insert / delete route the CTE body through the SAME view-mutation
+-- substrate a named view uses (an ephemeral view-like adapter). A single-source
+-- projection-and-filter CTE body produces a byte-identical base-op plan to the equivalent
+-- named view, so the observable base-table state matches. No grammar change — a CTE name
+-- already parses as a bare identifier; this is pure resolution + routing.
+-- See docs/view-updateability.md § Common Table Expressions and the CTE-name DML target.
+-- ===================================
+
+create table cte_base (id integer primary key, color text);
+insert into cte_base values (1,'red'),(2,'green'),(3,'blue');
+
+-- CTE Round-Trip Law — UPDATE through the CTE target lands on the base table.
+with t as (select id, color from cte_base) update t set color = 'x' where id = 1;
+select * from cte_base order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"green"},{"id":3,"color":"blue"}]
+
+-- INSERT through the CTE target.
+with t as (select id, color from cte_base) insert into t (id, color) values (4, 'k');
+select * from cte_base order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"green"},{"id":3,"color":"blue"},{"id":4,"color":"k"}]
+
+-- DELETE through the CTE target.
+with t as (select id, color from cte_base) delete from t where id = 2;
+select * from cte_base order by id;
+→ [{"id":1,"color":"x"},{"id":3,"color":"blue"},{"id":4,"color":"k"}]
+
+-- Parity: the equivalent named view, from the same starting rows and the same DML
+-- sequence, leaves byte-identical base-table state.
+create table cte_view_base (id integer primary key, color text);
+insert into cte_view_base values (1,'red'),(2,'green'),(3,'blue');
+create view cte_tv as select id, color from cte_view_base;
+update cte_tv set color = 'x' where id = 1;
+insert into cte_tv (id, color) values (4, 'k');
+delete from cte_tv where id = 2;
+select * from cte_view_base order by id;
+→ [{"id":1,"color":"x"},{"id":3,"color":"blue"},{"id":4,"color":"k"}]
+
+-- RETURNING through the CTE target (the OLD/NEW machinery the base op embeds).
+create table cte_ret (id integer primary key, color text);
+insert into cte_ret values (1,'red');
+with t as (select id, color from cte_ret) update t set color='ret' where id=1 returning id, color;
+→ [{"id":1,"color":"ret"}]
+
+-- Shadow: a CTE named the same as a real table SHADOWS it as the write TARGET, but the
+-- CTE body's own `from sbase` reads the REAL table (a non-recursive CTE cannot reference
+-- itself), so the lowered base op writes the real `sbase`. This is the load-bearing
+-- self-reference case.
+create table sbase (id integer primary key, color text);
+insert into sbase values (1,'red'),(2,'green');
+with sbase as (select id, color from sbase) update sbase set color='x' where id=1;
+select * from sbase order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"green"}]
+
+-- Schema-qualified target never resolves to a CTE (a CTE is never schema-qualified):
+-- `main.sbase` writes the REAL table even with a same-named leading CTE in scope.
+with sbase as (select id, color from sbase) update main.sbase set color='q' where id=2;
+select * from sbase order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"q"}]
+
+-- Sibling CTE read in the SET value resolves: the statement's CTEs are threaded into
+-- scope; only the TARGET's own name is shadowed out of its body.
+create table sib_b (id integer primary key, color text);
+insert into sib_b values (1,'red');
+create table sib_vals (v text);
+insert into sib_vals values ('fromcte');
+with vv as (select v from sib_vals), t as (select id, color from sib_b)
+    update t set color = (select v from vv) where id = 1;
+select * from sib_b order by id;
+→ [{"id":1,"color":"fromcte"}]
+
+-- Read-gap closure: an ORDINARY base-table UPDATE may now read a CTE in its WHERE
+-- (update/delete previously ignored the leading WITH entirely).
+create table rg (id integer primary key, n integer);
+insert into rg values (1,10),(2,20);
+with keep as (select 1 as id) update rg set n=99 where id in (select id from keep);
+select * from rg order by id;
+→ [{"id":1,"n":99},{"id":2,"n":20}]
+
+-- Multi-source (join) CTE body: composes through the same join substrate as a join view.
+create table cj_p (pid integer primary key, label text);
+create table cj_c (cid integer primary key, pref integer, note text,
+    foreign key (pref) references cj_p(pid));
+insert into cj_p values (10,'P10');
+insert into cj_c values (1,10,'a');
+with j as (select c.cid as cid, c.note as note, p.label as label
+    from cj_c c join cj_p p on p.pid = c.pref)
+    update j set note='B' where cid=1;
+select cid, note from cj_c order by cid;
+→ [{"cid":1,"note":"B"}]
+
+-- A `with recursive` clause whose TARGET member is a plain non-self-referential body is
+-- still writable: the reject gates on actual self-reference, not the `recursive` keyword.
+create table nr (id integer primary key, color text);
+insert into nr values (1,'red'),(2,'green');
+with recursive r as (select 1 as n union all select n+1 from r where n<3),
+    t as (select id, color from nr) update t set color='ok' where id=2;
+select * from nr order by id;
+→ [{"id":1,"color":"red"},{"id":2,"color":"ok"}]
+
+-- Reject parity — a recursive CTE target raises the structured `recursive-cte` reason,
+-- never a generic table-not-found miss.
+with recursive r as (select 1 as n union all select n+1 from r where n<3) update r set n=0;
+-- error: recursive cte has no recoverable base operation
+
+-- Reject parity — an aggregate-bodied CTE target and the equivalent aggregate view both
+-- reject with the SAME body-shape diagnostic ("not updateable in phase 1").
+create table agg_t (id integer primary key, g integer, v integer);
+insert into agg_t values (1,1,10),(2,1,20);
+with cagg as (select g, sum(v) as s from agg_t group by g) update cagg set s=0 where g=1;
+-- error: is not updateable in phase 1
+create view vagg as select g, sum(v) as s from agg_t group by g;
+update vagg set s=0 where g=1;
+-- error: is not updateable in phase 1
+
+-- Reject parity — a DISTINCT-bodied CTE target and the equivalent DISTINCT view both reject.
+with cdist as (select distinct color from cte_base) update cdist set color='z';
+-- error: is not updateable in phase 1
+create view vdist as select distinct color from cte_base;
+update vdist set color='z';
+-- error: is not updateable in phase 1
+
+-- v1 boundary — a CTE body that reads ANOTHER CTE reaches a CTE node (not a base table)
+-- on the lineage walk, so it rejects structurally rather than multi-level inlining.
+create table ml (id integer primary key, color text);
+insert into ml values (1,'red');
+with a as (select id, color from ml), t as (select * from a) update t set color='z' where id=1;
+-- error: is not updateable in phase 1
+
+-- v1 boundary — a plain set-op-bodied CTE target reaches the existing set-op reject
+-- (structured, no crash).
+create table so (id integer primary key);
+insert into so values (1),(2);
+with s as (select id from so union select id from so) delete from s where id=1;
+-- error: is not updateable in phase 1
+
+-- v1 boundary (Halloween / self-reference) — the target name is shadowed out of its own
+-- body's scope, so a user-predicate self-read of the CTE name does NOT resolve the CTE.
+-- It is rejected cleanly (the base table is unchanged), never a Halloween-unsafe plan.
+create table hw (id integer primary key, color text);
+insert into hw values (1,'red'),(2,'green');
+with t as (select id, color from hw) update t set color='x' where id in (select id from t);
+-- error: cannot be proven correlated
+select * from hw order by id;
+→ [{"id":1,"color":"red"},{"id":2,"color":"green"}]
