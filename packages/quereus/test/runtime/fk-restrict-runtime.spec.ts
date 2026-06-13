@@ -154,6 +154,33 @@ describe('runtime FK RESTRICT pre-check', () => {
 		);
 	});
 
+	// Order determinism: when two children both RESTRICT-reference the parent and
+	// both hold a referencing row, the throw must name the FIRST-declared child.
+	// The reverse-FK index preserves schema → table → FK-declaration order, so the
+	// runtime pre-check still walks c1 before c2 — this pins that contract at the
+	// behavioral (message) level, not just via the index unit tests.
+	it('names the first-declared referencing child on a multi-child RESTRICT throw', async () => {
+		await db.exec(`
+			create table p (id integer primary key);
+			create table c1 (id integer primary key, p_id integer,
+				foreign key (p_id) references p(id) on delete restrict);
+			create table c2 (id integer primary key, p_id integer,
+				foreign key (p_id) references p(id) on delete restrict);
+			insert into p values (1);
+			insert into c1 values (10, 1);
+			insert into c2 values (20, 1);
+		`);
+		const parentSchema = db.schemaManager.getTable('main', 'p');
+		void expect(parentSchema, 'p schema').to.exist;
+
+		// Both c1 and c2 reference parent id=1; the first-declared child (c1) is named.
+		const err = await expectThrows(
+			() => assertNoRestrictedChildrenForParentMutation(db, parentSchema!, 'delete', [1]),
+			"violates RESTRICT from 'c1'",
+		);
+		void expect(err.message, 'must not name the second-declared child').to.not.include("from 'c2'");
+	});
+
 	it('directly returns cleanly when no child references the parent values', async () => {
 		await db.exec(`
 			create table p_uq (id integer primary key, code text not null unique);
