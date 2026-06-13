@@ -162,6 +162,14 @@ Drops a table:
 
 Returns `true` if the table was removed. With `ifExists`, returns `false` silently when not found.
 
+When `pragma foreign_keys` is on, the drop is first gated by a referencing-child scan (a non-NULL FK row in any *other* table forbids the drop; self-FK rows go away with the table). That scan routes through the **reverse foreign-key index** rather than walking the whole catalog — see below.
+
+#### Reverse foreign-key index
+
+`getReferencingForeignKeys(parentSchemaName, parentTableName)` returns the FKs that reference a given parent `schema.table`, the shared primitive every parent-side referential scan uses to short-circuit. It is a lazily-built, event-invalidated derived cache on `SchemaManager`: a `Map` from the **referenced** `schema.table` (lowercased, resolved exactly as the scans compute their target: `fk.referencedSchema ?? childTable.schemaName` — so a declared FK keys under its child's schema, FK parent resolution being schema-local) to the `{ childTable, fk }` entries that reference it. A table nothing references yields a shared frozen empty array — the O(1) gate that replaces an `O(tables × FKs)` catalog walk; the returned `fk` is the same object held in `childTable.foreignKeys` (identity preserved). Entries stay in schema-insertion → table → FK-declaration order so a first-surviving-child RESTRICT pre-check names the same child it did under the nested-loop scan.
+
+The cache is `null`ed (rebuilt from the live catalog on next access) on every mutation that can add/drop/retarget an FK or add/remove a schema: a self-subscription to the `SchemaChangeNotifier` resets it on any `table_added` / `table_modified` / `table_removed` (the only events through which an FK enters/leaves/retargets — create-with-references, ALTER ADD/DROP CONSTRAINT, a parent/column-rename FK rewrite, and DROP TABLE), and `addSchema` / `getOrCreateSchema` / `removeSchema` reset it directly since ATTACH/DETACH fire no event. Under-reporting would silently drop enforcement, so invalidation is deliberately broad (over-reporting a since-dropped FK is harmless — each consumer re-checks `referencedTable` / target schema / arity in its per-FK body); the lazy first-access rebuild after a (rare) DDL amortizes across the many DML writes between DDLs.
+
 #### `dropView(schemaName, viewName): boolean`
 
 Removes a view definition from the schema.

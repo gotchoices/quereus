@@ -38,6 +38,23 @@ const warnLog = log.extend('warn');
 const errorLog = log.extend('error');
 
 /**
+ * One FK that references some parent table, paired with its declaring child
+ * table. Entries in the reverse FK index ({@link SchemaManager.getReferencingForeignKeys});
+ * `fk` is the same object reference held in `childTable.foreignKeys` (identity
+ * preserved).
+ */
+export interface ReferencingForeignKey {
+	readonly childTable: TableSchema;
+	readonly fk: ForeignKeyConstraintSchema;
+}
+
+/**
+ * Shared frozen empty result for the reverse-FK lookup miss (the O(1)
+ * unreferenced-table gate), so the hot path allocates nothing per call.
+ */
+const EMPTY_REFERENCING_FKS: readonly ReferencingForeignKey[] = Object.freeze([]);
+
+/**
  * Generic options passed to VTab modules during CREATE TABLE.
  * Modules are responsible for interpreting these.
  */
@@ -200,6 +217,15 @@ export class SchemaManager {
 	private mvRewriteSuppressed: number = 0;
 
 	/**
+	 * Catalog-level reverse foreign-key index: referenced `schema.table`
+	 * (lowercased) → the FKs that reference it. `null` ⇒ needs a (re)build from
+	 * the live catalog on next access — a pure derived cache, nulled on every
+	 * mutation that can add/drop/retarget an FK or add/remove a schema (see
+	 * {@link invalidateReverseFkIndex}). See `getReferencingForeignKeys`.
+	 */
+	private reverseFkIndex: Map<string, ReferencingForeignKey[]> | null = null;
+
+	/**
 	 * Creates a new schema manager
 	 *
 	 * @param db Reference to the parent Database instance
@@ -209,6 +235,21 @@ export class SchemaManager {
 		// Ensure 'main' and 'temp' schemas always exist
 		this.schemas.set('main', new Schema('main'));
 		this.schemas.set('temp', new Schema('temp'));
+		// Self-subscribe so any table FK-lifecycle event invalidates the reverse FK
+		// index. An FK is declared on a table, and a table enters/leaves/changes the
+		// catalog ONLY through one of these events: `create table … references`
+		// (table_added), `alter table add/drop constraint` and FK retargets from a
+		// parent/column rename (table_modified), and `drop table` (table_removed) —
+		// so this is exhaustive. The body just nulls the cache (rebuild happens on
+		// next access, never inside the listener), so subscribing to our own notifier
+		// is order-independent and safe. Schema ATTACH/DETACH fire no event, so those
+		// invalidate directly in addSchema/getOrCreateSchema/removeSchema. The
+		// listener lifetime is the SchemaManager's (no disposal path to unsubscribe).
+		this.changeNotifier.addListener(event => {
+			if (event.type === 'table_added' || event.type === 'table_modified' || event.type === 'table_removed') {
+				this.invalidateReverseFkIndex();
+			}
+		});
 	}
 
 	/**
@@ -514,6 +555,9 @@ export class SchemaManager {
 		}
 		const schema = new Schema(lowerName, kind);
 		this.schemas.set(lowerName, schema);
+		// ATTACH can bring (or, via later import, an attached schema can hold) a
+		// cross-schema FK target; this method fires no change event, so reset directly.
+		this.invalidateReverseFkIndex();
 		log(`Added schema '%s' (kind=%s)`, lowerName, kind);
 		return schema;
 	}
@@ -531,6 +575,8 @@ export class SchemaManager {
 		if (!schema) {
 			schema = new Schema(lowerName);
 			this.schemas.set(lowerName, schema);
+			// Fires no change event; a cross-schema FK can land in/under this schema.
+			this.invalidateReverseFkIndex();
 		}
 		return schema;
 	}
@@ -555,6 +601,9 @@ export class SchemaManager {
 			schema.clearAssertions();
 			schema.clearLensSlots();
 			this.schemas.delete(lowerName);
+			// DETACH fires no change event, yet a cross-schema FK may have keyed
+			// under (or referenced from) this schema; reset directly.
+			this.invalidateReverseFkIndex();
 			log(`Removed schema '%s'`, name);
 			return true;
 		}
@@ -1218,6 +1267,62 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Nulls the reverse FK index so it rebuilds from the live catalog on next
+	 * access. Pure derived-cache reset — order-independent, called both from the
+	 * self-subscribed change listener and from the schema attach/detach methods.
+	 */
+	private invalidateReverseFkIndex(): void {
+		this.reverseFkIndex = null;
+	}
+
+	/**
+	 * Builds the reverse FK index from the live catalog, bucketing every FK under
+	 * its resolved referenced `schema.table` key (cross-schema FKs key under their
+	 * `referencedSchema`). Preserves schema-insertion → table → FK-declaration
+	 * order within each bucket so the first-surviving-child RESTRICT pre-check and
+	 * any error-message golden tests keep naming the same child.
+	 */
+	private buildReverseFkIndex(): Map<string, ReferencingForeignKey[]> {
+		const index = new Map<string, ReferencingForeignKey[]>();
+		for (const schema of this._getAllSchemas()) {
+			for (const childTable of schema.getAllTables()) {
+				if (!childTable.foreignKeys) continue;
+				for (const fk of childTable.foreignKeys) {
+					const refSchema = (fk.referencedSchema ?? childTable.schemaName).toLowerCase();
+					const key = `${refSchema}.${fk.referencedTable.toLowerCase()}`;
+					let bucket = index.get(key);
+					if (!bucket) {
+						bucket = [];
+						index.set(key, bucket);
+					}
+					bucket.push({ childTable, fk });
+				}
+			}
+		}
+		return index;
+	}
+
+	/**
+	 * Returns the FKs that reference `parentSchemaName.parentTableName`
+	 * (case-insensitive), the shared primitive every parent-side referential scan
+	 * uses to short-circuit. Returns a shared frozen empty array — the O(1) gate —
+	 * when nothing references the table; otherwise exactly its referencing FKs.
+	 * Lazily (re)builds the whole index from the live catalog on the first access
+	 * after any schema mutation; a pure derived cache (over-reporting a since-dropped
+	 * FK is harmless — each consumer re-checks arity/target in its per-FK body).
+	 *
+	 * The returned `fk` objects are the same references held in
+	 * `childTable.foreignKeys` (identity preserved).
+	 */
+	getReferencingForeignKeys(parentSchemaName: string, parentTableName: string): readonly ReferencingForeignKey[] {
+		if (this.reverseFkIndex === null) {
+			this.reverseFkIndex = this.buildReverseFkIndex();
+		}
+		const key = `${parentSchemaName.toLowerCase()}.${parentTableName.toLowerCase()}`;
+		return this.reverseFkIndex.get(key) ?? EMPTY_REFERENCING_FKS;
+	}
+
+	/**
 	 * Asserts that no other table has FK rows referencing the table being dropped.
 	 * Self-referential FKs are skipped — those rows go away with the table.
 	 * No-op when foreign_keys is off.
@@ -1228,43 +1333,37 @@ export class SchemaManager {
 		const parentSchemaLower = parentSchemaName.toLowerCase();
 		const parentTableLower = parentTableName.toLowerCase();
 
-		for (const schema of this._getAllSchemas()) {
-			for (const childTable of schema.getAllTables()) {
-				if (!childTable.foreignKeys) continue;
-				// Skip the table being dropped itself — self-FK rows are going away with it.
-				if (childTable.schemaName.toLowerCase() === parentSchemaLower &&
-					childTable.name.toLowerCase() === parentTableLower) continue;
+		// The reverse FK index already keyed on the referenced schema.table, so the
+		// two discovery filters (referencedTable / targetSchema match) are satisfied
+		// by the lookup and drop out; every other line below is unchanged.
+		for (const { childTable, fk } of this.getReferencingForeignKeys(parentSchemaName, parentTableName)) {
+			// Skip the table being dropped itself — self-FK rows are going away with it.
+			if (childTable.schemaName.toLowerCase() === parentSchemaLower &&
+				childTable.name.toLowerCase() === parentTableLower) continue;
 
-				for (const fk of childTable.foreignKeys) {
-					if (fk.referencedTable.toLowerCase() !== parentTableLower) continue;
-					const targetSchema = fk.referencedSchema ?? childTable.schemaName;
-					if (targetSchema.toLowerCase() !== parentSchemaLower) continue;
+			// MATCH SIMPLE: row is referencing iff every FK column is non-NULL.
+			const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
+			const whereClause = childColNames.map(c => `${c} IS NOT NULL`).join(' AND ');
+			const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
+				? `${quoteIdentifier(childTable.schemaName)}.`
+				: '';
+			const sql = `select 1 from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause} limit 1`;
 
-					// MATCH SIMPLE: row is referencing iff every FK column is non-NULL.
-					const childColNames = fk.columns.map(idx => quoteIdentifier(childTable.columns[idx].name));
-					const whereClause = childColNames.map(c => `${c} IS NOT NULL`).join(' AND ');
-					const schemaPrefix = childTable.schemaName.toLowerCase() !== 'main'
-						? `${quoteIdentifier(childTable.schemaName)}.`
-						: '';
-					const sql = `select 1 from ${schemaPrefix}${quoteIdentifier(childTable.name)} where ${whereClause} limit 1`;
-
-					const stmt = this.db.prepare(sql);
-					try {
-						let referenced = false;
-						for await (const _row of stmt._iterateRowsRaw()) {
-							referenced = true;
-							break;
-						}
-						if (referenced) {
-							throw new QuereusError(
-								`FOREIGN KEY constraint failed: cannot drop table '${parentTableName}' because table '${childTable.name}' still has rows referencing it`,
-								StatusCode.CONSTRAINT,
-							);
-						}
-					} finally {
-						await stmt.finalize();
-					}
+			const stmt = this.db.prepare(sql);
+			try {
+				let referenced = false;
+				for await (const _row of stmt._iterateRowsRaw()) {
+					referenced = true;
+					break;
 				}
+				if (referenced) {
+					throw new QuereusError(
+						`FOREIGN KEY constraint failed: cannot drop table '${parentTableName}' because table '${childTable.name}' still has rows referencing it`,
+						StatusCode.CONSTRAINT,
+					);
+				}
+			} finally {
+				await stmt.finalize();
 			}
 		}
 	}
