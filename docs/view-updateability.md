@@ -402,7 +402,10 @@ unwrapped; a projecting or filtering derived table (`select x from (A∪B) v`) s
 relation. This is the **sum** surface (distinct flag names → distinct columns). Two siblings that
 **reuse** the same flag names (the **product** model — reused names merging into shared coordinate
 columns) are out of scope and currently rejected at create (the duplicate names collide in the set-op
-output scope); that merge is the deferred `set-op-product-coordinate-model`. Writes through the left
+output scope); that merge is the **shelved** `set-op-product-coordinate-model` (backlog) — a projected
+attribute records a row's *origin* (the sum model), not `tuple ∈ <union of like-named leaves>` (a probe
+semantic a stored value cannot express), so the sum model is the honest scope and the merge is built only
+if a use case needs writable membership over a non-literal σ-guard. Writes through the left
 wrapper landed as `set-op-leftwrap-write` (see § Set-operation membership writes → Parenthesized LEFT
 subtree operand): the write path unwraps the same pure wrapper, so the LEFT subtree fans out for the
 unambiguous operations exactly as the right subtree does.
@@ -552,7 +555,12 @@ inserts into the LEFT subtree (`set <subtreeFlag> = true`, a surfaced left-subtr
 insert-through routing into the left subtree side) stay deferred to `set-op-membership-nested`, and the
 static surfaces walk **both** operands so `is_insertable_into` reports `NO` and the surfaced left-inner
 flags report `is_updatable = NO`. The orthogonal **product** model (two siblings *reusing* flag names,
-merging into shared coordinate columns) remains the blocked `set-op-product-coordinate-model`.
+merging into shared coordinate columns) is the **shelved** `set-op-product-coordinate-model` (backlog):
+projected attributes express the **sum** model (origin tags), not the **merge** (`tuple ∈ <union of
+like-named leaves>`), so the merge ships only on a use case needing writable membership over a non-literal
+σ-guard. The reuse-aligned alternative — a flag-less `union all` of literal-discriminator legs made writable
+by predicate-honest branch dispatch — is `set-op-flagless-predicate-honest-writes` (backlog; needs an
+appetite check, as it partially re-opens the "membership columns replace routing-tag dispatch" decision).
 
 **v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
 view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of
