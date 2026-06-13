@@ -2615,6 +2615,15 @@ export function capturedValueSubquery(srcAlias: string, owningSideIndex: number,
  * column is admitted and captured. Walks only the value's top-level column references
  * (the scope `guardTopLevelScope` already proved are view columns); a reference nested in
  * a value subquery is left to the qualifier strip's per-leaf handling.
+ *
+ * Known asymmetry (deliberate, conservative): because this walks top level only, a
+ * computed partner read nested in a value subquery is *admitted* via the per-leaf
+ * capture — which is value-correct (leaves captured pre-mutation, scalar applied on
+ * read) — while the same read at the top level is rejected here. `no-inverse` is only
+ * a hard requirement for a computed column as an assignment *target*; admitting the
+ * top-level read through the same capture is the intended unification, pending an
+ * audit of mixed owning/partner leaves under an owning-site inverse. See
+ * docs/view-updateability.md § cross-source `set` values.
  */
 function gateCrossSourceReads(value: AST.Expression, owningSideIndex: number, analysis: JoinViewAnalysis, view: MutableViewLike): void {
 	forEachTopLevelColumnRef(value, (col) => {

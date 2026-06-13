@@ -48,3 +48,13 @@ Option 1 matches the engine-wide convention but has store-keying blast
 radius (existing persisted keys may carry old casing); audit
 `quereus-store`'s key derivation before changing call args. Whatever the
 choice, document it in docs/module-authoring.md.
+
+## Triage decision (2026-06-12, human sign-off)
+
+**Option 1 — canonicalize at every module-call frontier.** Modules always
+receive canonical stored names and may key storage/registries by the arguments
+verbatim. Plan pass must audit `quereus-store`'s key derivation first
+(persisted keys may carry old casing — decide whether a one-time key migration
+or a read-side case-fold fallback covers existing stores), then canonicalize
+the `createIndex` / `dropIndex` / `importTable`→`connect` frontiers in
+SchemaManager, and document the contract in docs/module-authoring.md.

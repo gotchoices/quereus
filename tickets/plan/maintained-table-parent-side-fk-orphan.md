@@ -44,3 +44,22 @@ This is a real gap but distinct from the in-scope work:
 
 Promote to `plan/` when the child-side ticket has landed and there is appetite to
 close the parent-side gap.
+
+## Triage decision (2026-06-12, human sign-off)
+
+**Full referential actions** — with the explicit condition that the
+infrastructure built for it must improve the general architecture, not be a
+maintained-table special case. Concretely: a maintenance delete/key-update of a
+referenced parent row enforces RESTRICT (failing the source-write statement,
+attributed to the maintained table) and executes declared CASCADE / SET NULL
+against child tables. The plan pass should design this as a generalization of
+the existing parent-side enforcement machinery (`buildParentSideFKChecks`,
+`foreign-key-actions.ts`) so the same kernel serves ordinary-table writes,
+view-routed writes (the lens cascade walker), and maintenance writes — one
+referential-action engine with multiple entry points, rather than a third
+copy. Key design questions for the plan pass: transactional shape of a
+maintenance write triggering child-table writes mid-flush (interaction with
+deferred-rebuild and MV-over-MV cascade ordering); whether the cascaded child
+write re-enters the full write path (it should — constraints, watches, and
+nested cascades fire for free, matching the lens walker's issue-against-the-view
+precedent); and recursion termination.
