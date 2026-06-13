@@ -2203,6 +2203,30 @@ describe('lens enforcement: parent-side FK CASCADE / SET NULL / SET DEFAULT acti
 			}
 		});
 
+		it('gate hit — action-agnostic: a RESTRICT-only logical FK is a hit and the RESTRICT pre-check still aborts', async () => {
+			const db = new Database();
+			try {
+				// The gate is keyed on *any* referencing logical FK, regardless of action — so a
+				// slot referenced only by a RESTRICT logical FK is a hit for all three paths
+				// (the cascade walker then no-ops after its own action filter; the RESTRICT
+				// pre-check fires). Pins the "action-agnostic over-report is correct, not a miss"
+				// claim for the RESTRICT path, which the cascade-hit test above does not exercise.
+				await deployCascadeLens(db, { fkTail: 'on delete restrict' });
+				expect(db.schemaManager.basisTableBacksLogicalParentFk('y', 'parent'), 'RESTRICT logical FK ⇒ gate hit (action-agnostic)').to.be.true;
+				await db.exec(`insert into x.parent (id, name) values (1, 'a'), (2, 'b')`);
+				await db.exec('insert into x.child (id, pid) values (10, 1)');
+				// Deleting the referenced parent must abort (the logical RESTRICT pre-check runs
+				// on the gate hit) — behavior unchanged from the non-gated path.
+				await expectThrows(() => db.exec('delete from x.parent where id = 1'), /constraint|foreign|fk/i);
+				expect(await rows(db, 'select count(*) as n from x.parent where id = 1'), 'referenced parent survives the RESTRICT').to.deep.equal([{ n: 1 }]);
+				// An unreferenced parent still deletes.
+				await db.exec('delete from x.parent where id = 2');
+				expect(await rows(db, 'select count(*) as n from x.parent where id = 2'), 'unreferenced parent deletes').to.deep.equal([{ n: 0 }]);
+			} finally {
+				await db.close();
+			}
+		});
+
 		it('under-report regression — a gate built before the logical FK is deployed is invalidated on deploy', async () => {
 			const db = new Database();
 			try {
