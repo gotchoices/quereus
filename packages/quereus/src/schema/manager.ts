@@ -15,6 +15,7 @@ import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from './derivation.js';
 import { isHiddenImplicitIndex, findExposedImplicitConstraintIndex } from './catalog.js';
+import { buildLensBasisFkGate } from './lens-fk-discovery.js';
 import { createLogger } from '../common/logger.js';
 import type * as AST from '../parser/ast.js';
 import { Parser } from '../parser/parser.js';
@@ -226,6 +227,27 @@ export class SchemaManager {
 	private reverseFkIndex: Map<string, ReferencingForeignKey[]> | null = null;
 
 	/**
+	 * Lens basis-FK gate: the set of basis `schema.table` keys (lowercased) that
+	 * back ≥1 logical parent slot referenced by ≥1 logical FK — the logical-FK
+	 * analogue of {@link reverseFkIndex}. `null` ⇒ rebuild from the live catalog on
+	 * next access. A pure derived cache (built by {@link buildLensBasisFkGate}),
+	 * nulled on every event that can change the underlying slot scan: lens deploy
+	 * (no `SchemaChangeEvent` fires — `lens-compiler` calls
+	 * {@link invalidateLensFkGate} directly), any `table_added`/`_modified`/`_removed`
+	 * (basis-table catalog change, via the constructor listener), and schema
+	 * attach/detach/reset (no event — invalidated directly).
+	 *
+	 * Soundness invariant (load-bearing): a stale gate that **under-reports** would
+	 * silently drop logical FK enforcement (cascade not propagated / RESTRICT not
+	 * enforced / divergent basis action not suppressed) — the fatal direction — so
+	 * invalidation must be exhaustive. Built from, and reset alongside, the same
+	 * catalog state the three lens FK paths scan, it never under-reports for the
+	 * current catalog; over-reporting (a stray key ⇒ an on-hit scan that finds
+	 * nothing) is harmless. See {@link basisTableBacksLogicalParentFk}.
+	 */
+	private lensFkGate: Set<string> | null = null;
+
+	/**
 	 * Creates a new schema manager
 	 *
 	 * @param db Reference to the parent Database instance
@@ -245,9 +267,15 @@ export class SchemaManager {
 		// is order-independent and safe. Schema ATTACH/DETACH fire no event, so those
 		// invalidate directly in addSchema/getOrCreateSchema/removeSchema. The
 		// listener lifetime is the SchemaManager's (no disposal path to unsubscribe).
+		// The same table events also change basis-table resolution for the lens
+		// basis-FK gate (a basis table created after the gate was built is the
+		// under-report vector; a drop / column-rename can change which slot resolves
+		// to which basis), so reset it on the same events. Lens-slot lifecycle fires
+		// no event — `lens-compiler.deployLogicalSchema` invalidates the gate directly.
 		this.changeNotifier.addListener(event => {
 			if (event.type === 'table_added' || event.type === 'table_modified' || event.type === 'table_removed') {
 				this.invalidateReverseFkIndex();
+				this.invalidateLensFkGate();
 			}
 		});
 	}
@@ -557,7 +585,9 @@ export class SchemaManager {
 		this.schemas.set(lowerName, schema);
 		// ATTACH can bring (or, via later import, an attached schema can hold) a
 		// cross-schema FK target; this method fires no change event, so reset directly.
+		// A logical-schema ATTACH likewise brings lens slots, so reset the lens gate too.
 		this.invalidateReverseFkIndex();
+		this.invalidateLensFkGate();
 		log(`Added schema '%s' (kind=%s)`, lowerName, kind);
 		return schema;
 	}
@@ -575,8 +605,10 @@ export class SchemaManager {
 		if (!schema) {
 			schema = new Schema(lowerName);
 			this.schemas.set(lowerName, schema);
-			// Fires no change event; a cross-schema FK can land in/under this schema.
+			// Fires no change event; a cross-schema FK can land in/under this schema, and
+			// a lens slot can later resolve a basis under it — reset both derived caches.
 			this.invalidateReverseFkIndex();
+			this.invalidateLensFkGate();
 		}
 		return schema;
 	}
@@ -602,8 +634,11 @@ export class SchemaManager {
 			schema.clearLensSlots();
 			this.schemas.delete(lowerName);
 			// DETACH fires no change event, yet a cross-schema FK may have keyed
-			// under (or referenced from) this schema; reset directly.
+			// under (or referenced from) this schema; reset directly. The schema's lens
+			// slots (cleared above) also leave the gate stale — a basis re-attach after a
+			// stale-but-non-null gate could under-report — so reset it too.
 			this.invalidateReverseFkIndex();
+			this.invalidateLensFkGate();
 			log(`Removed schema '%s'`, name);
 			return true;
 		}
@@ -1323,6 +1358,33 @@ export class SchemaManager {
 	}
 
 	/**
+	 * Nulls the lens basis-FK gate so it rebuilds from the live catalog on next
+	 * access. Pure derived-cache reset — order-independent (rebuild happens on next
+	 * access, never inside a listener). Public because `lens-compiler` calls it after
+	 * a lens (re)deploy, which mutates the slot set without firing a `SchemaChangeEvent`.
+	 */
+	invalidateLensFkGate(): void {
+		this.lensFkGate = null;
+	}
+
+	/**
+	 * O(1) gate for the three basis-keyed lens FK paths: does `schemaName.tableName`
+	 * (case-insensitive) back ≥1 logical parent slot referenced by ≥1 logical FK?
+	 * When `false`, `executeLensForeignKeyActions`,
+	 * `assertLensRestrictsForParentMutation`, and `basisFksOverriddenByDivergentLensFk`
+	 * early-return — the reverse-map slot scan they would run finds nothing. Lazily
+	 * (re)builds {@link lensFkGate} on the first access after any invalidation, then
+	 * does a single `Set.has`. See {@link buildLensBasisFkGate} for the build, and the
+	 * {@link lensFkGate} doc-comment for the never-under-report soundness invariant.
+	 */
+	basisTableBacksLogicalParentFk(schemaName: string, tableName: string): boolean {
+		if (this.lensFkGate === null) {
+			this.lensFkGate = buildLensBasisFkGate(this);
+		}
+		return this.lensFkGate.has(`${schemaName.toLowerCase()}.${tableName.toLowerCase()}`);
+	}
+
+	/**
 	 * Asserts that no other table has FK rows referencing the table being dropped.
 	 * Self-referential FKs are skipped — those rows go away with the table.
 	 * No-op when foreign_keys is off.
@@ -1489,6 +1551,10 @@ export class SchemaManager {
 			schema.clearAssertions();
 			schema.clearLensSlots();
 		});
+		// Wiping every table + lens slot leaves both derived FK caches stale (this
+		// path fires no change event); reset so the next access rebuilds them empty.
+		this.invalidateReverseFkIndex();
+		this.invalidateLensFkGate();
 		log("Cleared all schemas.");
 	}
 
@@ -3022,7 +3088,10 @@ export class SchemaManager {
 		// is built lazily only after rehydration completes), but a re-import onto a
 		// live, already-built index would under-report — the fatal direction. Reset
 		// directly so the silent-import path upholds the same invariant as the events.
+		// The lens basis-FK gate shares this vector: a basis table imported silently
+		// after the gate was built would otherwise leave it under-reporting too.
 		this.invalidateReverseFkIndex();
+		this.invalidateLensFkGate();
 		log(`Imported table %s.%s using module %s`, targetSchemaName, tableName, moduleName);
 
 		return { type: 'table', name: `${targetSchemaName}.${tableName}` };

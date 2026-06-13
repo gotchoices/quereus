@@ -503,11 +503,13 @@ async function executeSingleFKAction(
  * of a *logical* FK through the lens when a lens-backed logical parent is deleted or
  * updated. The logical dual of {@link executeForeignKeyActions}.
  *
- * No-op (early return) when `foreign_keys` is off, or when no lens slot resolves to
- * `basisParentTable` as its single basis spine — so non-lens DML pays only one cheap
- * scan over the lens slots (most databases have none). The single-source-spine
- * boundary is identical to the RESTRICT collector's: a parent slot with no single
- * basis spine never matches.
+ * No-op (early return) when `foreign_keys` is off, or when the O(1)
+ * `SchemaManager.basisTableBacksLogicalParentFk` gate says `basisParentTable` backs no
+ * logical-FK-referenced parent slot — so non-lens DML pays one `Set.has`, not a scan
+ * over the lens slots. On a gate hit the reverse-map slot scan below is the
+ * confirmation: it walks every lens slot whose single basis spine is `basisParentTable`
+ * (a multi-source / decomposition parent resolves to no single spine and never matches,
+ * consistent with the gate's omission).
  */
 export async function executeLensForeignKeyActions(
 	db: Database,
@@ -519,6 +521,10 @@ export async function executeLensForeignKeyActions(
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
 	const sm = db.schemaManager;
+	// O(1) gate: nothing below can match when this basis table backs no logical-FK
+	// parent slot — skip the slot scan entirely (the common non-lens / no-logical-FK case).
+	if (!sm.basisTableBacksLogicalParentFk(basisParentTable.schemaName, basisParentTable.name)) return;
+
 	const basisNameLower = basisParentTable.name.toLowerCase();
 	const basisSchemaLower = basisParentTable.schemaName.toLowerCase();
 
@@ -736,9 +742,11 @@ async function issueLensFkAction(
  * UPDATE hits the vtab, so it observes the pre-cascade child state — the timing a deferred
  * `NOT EXISTS` cannot achieve against a same-statement basis cascade.
  *
- * No-op (early return) when `foreign_keys` is off, or when no lens slot resolves to
- * `basisParentTable` as its single basis spine — so non-lens DML pays only one cheap scan
- * over the lens slots. The single-source-spine boundary is identical to the cascade walker's
+ * No-op (early return) when `foreign_keys` is off, or when the O(1)
+ * `SchemaManager.basisTableBacksLogicalParentFk` gate says `basisParentTable` backs no
+ * logical-FK-referenced parent slot — so non-lens DML pays one `Set.has`, not a scan over
+ * the lens slots. On a gate hit the reverse-map slot scan below confirms; the
+ * single-source-spine boundary is identical to the cascade walker's
  * ({@link executeLensForeignKeyActions}).
  */
 export async function assertLensRestrictsForParentMutation(
@@ -751,6 +759,10 @@ export async function assertLensRestrictsForParentMutation(
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
 	const sm = db.schemaManager;
+	// O(1) gate: nothing below can match when this basis table backs no logical-FK
+	// parent slot — skip the slot scan entirely (the common non-lens / no-logical-FK case).
+	if (!sm.basisTableBacksLogicalParentFk(basisParentTable.schemaName, basisParentTable.name)) return;
+
 	const basisNameLower = basisParentTable.name.toLowerCase();
 	const basisSchemaLower = basisParentTable.schemaName.toLowerCase();
 

@@ -252,6 +252,12 @@ export function deployLogicalSchema(
 		log('Deployed lens for %s.%s over %s', logicalSchemaName, slot.logicalTable.name, slot.defaultBasis.schemaName);
 	}
 
+	// The lens-slot set just changed (the only slot-mutating site that fires no
+	// `SchemaChangeEvent`), so the lens basis-FK gate is stale — reset it directly,
+	// sibling to the snapshot rotation. The next basis write rebuilds it and reflects
+	// any added / removed logical FK in this deploy.
+	schemaManager.invalidateLensFkGate();
+
 	// Capture + rotate the deployed-basis snapshot AFTER a successful catalog
 	// mutation, so an aborted re-apply leaves the prior snapshot untouched. The
 	// snapshot is the source of truth the `quereus_basis_backfill` differ reads

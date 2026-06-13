@@ -2140,6 +2140,110 @@ describe('lens enforcement: parent-side FK CASCADE / SET NULL / SET DEFAULT acti
 			await db.close();
 		}
 	});
+
+	// --- Basis-FK gate short-circuit (ticket: reverse-fk-index-lens-coverage) ---
+	// The O(1) `SchemaManager.basisTableBacksLogicalParentFk` gate decides whether the
+	// three basis-keyed lens FK paths (executeLensForeignKeyActions /
+	// assertLensRestrictsForParentMutation / basisFksOverriddenByDivergentLensFk) run
+	// their reverse-map slot scan at all. These pin: a gate MISS short-circuits, a gate
+	// HIT preserves existing enforcement, and the gate is invalidated (never stale → the
+	// fatal under-report) on lens deploy/redeploy.
+	describe('lens enforcement: basis-FK gate short-circuit', () => {
+		it('gate miss — a basis table backing no logical-FK parent slot short-circuits the three paths', async () => {
+			const db = new Database();
+			try {
+				// Cascade shape: only `y.parent` is referenced by a logical FK, so only it
+				// backs a logical-FK parent slot. `y.child` (referenced by nothing) and an
+				// unknown table are gate misses.
+				await deployCascadeLens(db, { fkTail: 'on delete cascade' });
+				const sm = db.schemaManager;
+				expect(sm.basisTableBacksLogicalParentFk('y', 'parent'), 'parent backs a logical-FK slot ⇒ hit').to.be.true;
+				expect(sm.basisTableBacksLogicalParentFk('y', 'child'), 'child backs no logical-FK slot ⇒ miss').to.be.false;
+				expect(sm.basisTableBacksLogicalParentFk('main', 'unrelated'), 'unknown table ⇒ miss').to.be.false;
+				// Case-insensitive, mirroring the reverse-FK index.
+				expect(sm.basisTableBacksLogicalParentFk('Y', 'PARENT'), 'gate is case-insensitive').to.be.true;
+				// The divergent-suppression set short-circuits to empty on a gate miss, without
+				// scanning the slots (mirrors the `maintained-parent-fk` throughput-gate style).
+				const childBasis = sm.getTable('y', 'child')!;
+				expect(basisFksOverriddenByDivergentLensFk(childBasis, 'delete', sm).size, 'gate miss ⇒ empty set').to.equal(0);
+				expect(basisFksOverriddenByDivergentLensFk(childBasis, 'update', sm).size, 'gate miss ⇒ empty set').to.equal(0);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('gate miss — a lens with no logical FK at all leaves every basis table a miss', async () => {
+			const db = new Database();
+			try {
+				// A lens-bearing DB whose logical schema declares NO FK: the parent slot is
+				// backed by `y.parent` but referenced by nothing, so the gate is empty.
+				await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+				await db.exec('apply schema y');
+				await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+				await db.exec('apply schema x');
+				const sm = db.schemaManager;
+				expect(sm.basisTableBacksLogicalParentFk('y', 'parent'), 'no logical FK ⇒ parent is a miss').to.be.false;
+				expect(sm.basisTableBacksLogicalParentFk('y', 'child'), 'no logical FK ⇒ child is a miss').to.be.false;
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('gate hit — a basis-backed logical cascade still fires (behavior unchanged)', async () => {
+			const db = new Database();
+			try {
+				await deployCascadeLens(db, { fkTail: 'on delete cascade' });
+				expect(db.schemaManager.basisTableBacksLogicalParentFk('y', 'parent'), 'gate hit').to.be.true;
+				await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+				await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+				await db.exec('delete from x.parent where id = 1');
+				expect(await rows(db, 'select count(*) as n from x.child'), 'children cascade-deleted on a gate hit').to.deep.equal([{ n: 0 }]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('under-report regression — a gate built before the logical FK is deployed is invalidated on deploy', async () => {
+			const db = new Database();
+			try {
+				// Basis only — no lens slots yet.
+				await db.exec('declare schema y { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+				await db.exec('apply schema y');
+				const sm = db.schemaManager;
+				// Force-build the gate NOW, while no logical FK exists ⇒ it caches as empty.
+				expect(sm.basisTableBacksLogicalParentFk('y', 'parent'), 'no logical FK yet ⇒ miss (builds an empty gate)').to.be.false;
+				// Deploy the logical cascade FK. deployLogicalSchema MUST invalidate the gate;
+				// otherwise the stale empty gate would under-report and the cascade below would
+				// silently NOT fire (the fatal direction this guards — the assertion would fail
+				// on `n: 2` if the invalidateLensFkGate() call in deployLogicalSchema were removed).
+				await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null, constraint fk_pid foreign key (pid) references parent(id) on delete cascade) }');
+				await db.exec('apply schema x');
+				expect(sm.basisTableBacksLogicalParentFk('y', 'parent'), 'gate rebuilt after deploy ⇒ hit').to.be.true;
+				await db.exec(`insert into x.parent (id, name) values (1, 'a')`);
+				await db.exec('insert into x.child (id, pid) values (10, 1), (11, 1)');
+				await db.exec('delete from x.parent where id = 1');
+				expect(await rows(db, 'select count(*) as n from x.child'), 'cascade fires despite the pre-deploy gate build').to.deep.equal([{ n: 0 }]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('invalidation on redeploy — dropping the logical FK flips the gate to a miss', async () => {
+			const db = new Database();
+			try {
+				await deployCascadeLens(db, { fkTail: 'on delete cascade' });
+				const sm = db.schemaManager;
+				expect(sm.basisTableBacksLogicalParentFk('y', 'parent'), 'initially a hit').to.be.true;
+				// Re-declare X without the FK (clear-and-rebuild redeploy) ⇒ parent backs no
+				// logical-FK slot now. The redeploy invalidates, and the rebuild reflects it.
+				await db.exec('declare logical schema x { table parent (id integer primary key, name text); table child (id integer primary key, pid integer null) }');
+				await db.exec('apply schema x');
+				expect(sm.basisTableBacksLogicalParentFk('y', 'parent'), 'gate reflects the dropped FK ⇒ miss').to.be.false;
+			} finally {
+				await db.close();
+			}
+		});
+	});
 });
 
 describe('lens enforcement: parent-side FK cascade — mixed logical/basis cycle', () => {

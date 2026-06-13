@@ -266,6 +266,42 @@ export function findLogicalParentFkRefs(
 }
 
 /**
+ * Builds the **lens basis-FK gate**: the set of basis `schema.table` keys
+ * (lowercased) that back ≥1 logical parent slot referenced by ≥1 logical FK —
+ * the logical-FK analogue of the physical reverse-FK index. This is exactly the
+ * reverse-map scan the three basis-keyed lens FK paths
+ * ({@link basisFksOverriddenByDivergentLensFk}, plus the runtime
+ * `executeLensForeignKeyActions` / `assertLensRestrictsForParentMutation`)
+ * perform per write, run once and cached on {@link SchemaManager}.
+ *
+ * Keyed by the **basis parent** `schema.table` — the value each basis write
+ * carries. A parent slot with no single basis spine resolves to `undefined`
+ * (multi-source / decomposition) and contributes no key; at runtime that same
+ * slot is skipped (`if (!basis) continue`), so the gate's omission is
+ * **consistent** with the full scan — no under-report. A slot whose referencing
+ * logical FK set is empty (`findLogicalParentFkRefs(...).length === 0`) also
+ * contributes no key — there is nothing for the three paths to find.
+ *
+ * Conservatism is automatic: building from the live catalog, the gate can only
+ * **over-report** (a stray key ⇒ an unnecessary scan that finds nothing ⇒ same
+ * result, slower); it never under-reports for the current catalog state. The
+ * caller ({@link SchemaManager.basisTableBacksLogicalParentFk}) is responsible
+ * for rebuilding it on every event that can change this scan's result.
+ */
+export function buildLensBasisFkGate(schemaManager: SchemaManager): Set<string> {
+	const gate = new Set<string>();
+	for (const schema of schemaManager._getAllSchemas()) {
+		for (const parentSlot of schema.getAllLensSlots()) {
+			const basis = resolveSlotBasisSource(parentSlot, schemaManager);   // undefined ⇒ multi-source/absent ⇒ skip
+			if (!basis) continue;
+			if (findLogicalParentFkRefs(parentSlot, schemaManager).length === 0) continue;
+			gate.add(`${basis.schemaName.toLowerCase()}.${basis.name.toLowerCase()}`);
+		}
+	}
+	return gate;
+}
+
+/**
  * The basis FKs (declared on the logical child's basis table) structurally equivalent
  * to `ref`'s logical FK over the same mapped `(basisChildCol → basisParentCol)`
  * index-pair set referencing `basisParent`. The lens walker's per-ref match list — the
@@ -294,7 +330,10 @@ export function matchingBasisFksForLensRef(
  *
  * The returned FK objects are the same references the enforcement sites iterate over
  * (`TableSchema.foreignKeys`), so `overridden.has(fk)` is a direct identity lookup.
- * Empty (cheap) when no parent slot is backed by `basisParent` — the common non-lens case.
+ * Empty (cheap) when no parent slot is backed by `basisParent` — the common non-lens
+ * case — which the O(1) {@link SchemaManager.basisTableBacksLogicalParentFk} gate
+ * decides at entry, with the full reverse-map scan below as the on-hit confirmation.
+ * (This set is not itself `foreign_keys`-gated; its callers are.)
  *
  * **Complement invariant** (the load-bearing correctness argument): for one equivalent
  * basis FK `m` with logical op-action `L` (non-RESTRICT) and basis op-action `B`:
@@ -318,6 +357,10 @@ export function basisFksOverriddenByDivergentLensFk(
 	operation: 'delete' | 'update',
 	schemaManager: SchemaManager,
 ): Set<ForeignKeyConstraintSchema> {
+	// O(1) gate: when no lens slot backed by basisParent carries a referencing logical
+	// FK, the reverse-map scan below finds nothing — return the empty set without scanning.
+	if (!schemaManager.basisTableBacksLogicalParentFk(basisParent.schemaName, basisParent.name)) return new Set();
+
 	const overridden = new Set<ForeignKeyConstraintSchema>();
 	const basisNameLower = basisParent.name.toLowerCase();
 	const basisSchemaLower = basisParent.schemaName.toLowerCase();
