@@ -107,6 +107,34 @@ describe('Database.refreshAllMaterializedViews — engine convergence', () => {
 			.to.deep.equal(expected);
 	});
 
+	it('converges a diamond DAG (one base feeding two consumers that re-converge) in one sweep', async () => {
+		// t ─┬→ a ─┐
+		//    └→ b ─┴→ c   (c reads BOTH a and b — the diamond's join point)
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec('create materialized view a as select id, v from t where id <= 2');
+		await db.exec('create materialized view b as select id, v from t where id >= 2');
+		await db.exec('create materialized view c as select id, v from a union select id, v from b');
+
+		await directWrite('t', 'insert', [1, 'x']);
+		await directWrite('t', 'insert', [2, 'y']);
+		await directWrite('t', 'insert', [3, 'z']);
+
+		const refreshed = await db.refreshAllMaterializedViews();
+		// Both consumers must precede the join point: a and b appear before c. If c
+		// refreshed before either was committed it would union empty/partial backings,
+		// so the full id set in c is the real proof; the order assert pins Kahn drains
+		// the in-degree-0 bases first.
+		const names = refreshed.map(r => r.name);
+		expect(names).to.have.members(['a', 'b', 'c']);
+		expect(names.indexOf('c'), 'join point c refreshes after both bases').to.equal(2);
+		expect(names.indexOf('a')).to.be.lessThan(names.indexOf('c'));
+		expect(names.indexOf('b')).to.be.lessThan(names.indexOf('c'));
+
+		// c = (id<=2) ∪ (id>=2) = all three, deduped.
+		expect((await readAll('select id, v from c order by id')).map(r => ({ id: Number(r.id), v: r.v })))
+			.to.deep.equal([{ id: 1, v: 'x' }, { id: 2, v: 'y' }, { id: 3, v: 'z' }]);
+	});
+
 	it('converges a stale MV (no live plan), clears stale, and re-registers row-time maintenance', async () => {
 		await db.exec(`
 			create table src (id integer primary key, v text not null);
