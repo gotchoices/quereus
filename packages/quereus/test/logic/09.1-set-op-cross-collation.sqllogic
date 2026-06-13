@@ -201,5 +201,27 @@ select n from cl diff select r from cr;
 select count(*) as c from (select n from cl diff select p from cr);
 → [{"c":2}]
 
+-- =============================================================================
+-- 12. Materialized view over a cross-collation UNION. The union's resolved
+--     output-column collation flows through `deriveBackingShape` into the
+--     backing column (its provenance — declared here — publishes an explicit
+--     backing collation), so the materialized result dedups under the SAME
+--     resolved NOCASE the plain view would (3, not 4), in BOTH branch orders.
+--     Locks in the implement handoff's highest-value gap (gap #3): an MV body's
+--     union persists the symmetric resolved collation, not the left input's.
+-- =============================================================================
+
+create materialized view mv_xc as select n from cl union select p from cr;
+select count(*) as c from mv_xc;
+→ [{"c":3}]
+
+-- reversed branch order persists the same NOCASE backing (was BINARY → 4).
+create materialized view mv_xc2 as select p from cr union select n from cl;
+select count(*) as c from mv_xc2;
+→ [{"c":3}]
+
+drop materialized view mv_xc;
+drop materialized view mv_xc2;
+
 drop table cl;
 drop table cr;
