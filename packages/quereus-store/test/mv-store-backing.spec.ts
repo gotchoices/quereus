@@ -506,6 +506,36 @@ describe('materialized views `using store` (end-to-end)', () => {
 			});
 		});
 
+		describe('commit-first parity on the store backing (an enclosing rollback does not undo a refresh)', () => {
+			// The constraint-bearing branch ends in an explicit `conn.commit()` on the
+			// resolved attach connection — a DIFFERENT commit mechanism than the MV-sugar
+			// store path's `replaceContents` (pinned above in the `refresh` block) and than
+			// the memory constraint-bearing branch (pinned engine-wide in the memory spec's
+			// `commit-first parity` case). Neither covers a STORE constraint-bearing refresh
+			// committing through the coordinator under an enclosing transaction, so pin that
+			// the swap is durable past the outer `rollback` here — exact parity with both.
+			beforeEach(async () => {
+				await db.exec('create table src (id integer primary key, v text not null) using store');
+				await db.exec(`create table mt (id integer primary key, v text not null, check (v <> 'poison'))
+					using store maintained as select id, v from src`);
+				await db.exec(`insert into src values (1, 'a')`);
+				await db.exec('alter table src add column pad integer null'); // stale + plan detached
+				await db.exec(`insert into src (id, v) values (2, 'b')`);      // conforming drift, unmaintained
+			});
+
+			it('a successful constraint-bearing refresh survives an enclosing rollback', async () => {
+				await db.exec('begin');
+				await db.exec('refresh materialized view mt');
+				await db.exec('rollback');
+
+				// `conn.commit()` swapped the store backing independently of the outer txn.
+				expect(await rows(db, 'select id, v from mt order by id'))
+					.to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'b' }]);
+				expect(isStale('mt'), 'a successful refresh clears stale even under an enclosing rollback')
+					.to.equal(false);
+			});
+		});
+
 		// Duplicate-derived-key reject is deliberately NOT re-pinned here: the set gate
 		// (`assertRefreshRowsAreSet`) runs at the ENGINE level BEFORE `host.applyMaintenance`,
 		// so it exercises nothing store-host-specific (no pending `replace-all` write
