@@ -395,6 +395,127 @@ describe('Parent-side referential enforcement for maintained-table maintenance w
 		});
 	});
 
+	/* ──────────────────── join-residual arm ──────────────────── */
+
+	describe('join-residual arm (1:1 inner join) as an FK parent', () => {
+		// A provably-1:1 inner join (T.fk NOT NULL → P.id PK) routes to the
+		// 'join-residual' arm. Deleting a T row fires applyForwardResidual, which
+		// recomputes the T-keyed slice → empty → delete-key for the backing row →
+		// enforceParentSideReferentialActions fires.
+		async function seedJoin(childFk: string): Promise<void> {
+			await db.exec(`
+				create table p (id integer primary key, name text);
+				create table t (id integer primary key, fk integer not null references p(id));
+				create table m (id integer primary key, t_fk integer, p_name text)
+					maintained as select t.id, t.fk as t_fk, p.name as p_name
+					             from t join p on t.fk = p.id;
+				create table c (cid integer primary key, m_id integer, ${childFk});
+				insert into p values (1, 'alpha'), (2, 'beta');
+				insert into t values (10, 1), (20, 2);
+				insert into c values (100, 10);
+			`);
+			expect(registeredPlanKind(db, 'main.m'), 'body must route to join-residual arm').to.equal('join-residual');
+		}
+
+		it('CASCADE removes the child when a T-side delete drops the backing row', async () => {
+			await seedJoin('foreign key (m_id) references m(id) on delete cascade');
+			await db.exec('delete from t where id = 10');
+			// m(20) survives; c was cascade-deleted along with m(10).
+			expect(await count('m')).to.equal(1);
+			expect(await count('c'), 'child cascade-deleted').to.equal(0);
+		});
+
+		it('RESTRICT blocks the T-side delete and rolls back the source write', async () => {
+			await seedJoin('foreign key (m_id) references m(id) on delete restrict');
+			await expectError(
+				() => db.exec('delete from t where id = 10'),
+				`DELETE on 'm' violates RESTRICT from 'c'`,
+			);
+			// Atomic rollback: t, m, and c all intact.
+			expect(await count('t')).to.equal(2);
+			expect(await count('m')).to.equal(2);
+			expect(await count('c')).to.equal(1);
+		});
+	});
+
+	/* ──────────────────── prefix-delete arm ──────────────────── */
+
+	describe('prefix-delete arm (lateral TVF fan-out) as an FK parent', () => {
+		// A single-source lateral TVF fan-out routes to 'prefix-delete'. Deleting
+		// src(1) (n=3) produces delete-key ops for backing rows (1,1),(1,2),(1,3).
+		// enforceParentSideReferentialActions fires per backing-row change; the one
+		// that hits a child reference triggers the declared FK action.
+		async function seedFanOut(childFk: string): Promise<void> {
+			await db.exec(`
+				create table src (id integer primary key, n integer);
+				create table m (sid integer, v integer, primary key (sid, v))
+					maintained as select src.id as sid, f.value as v
+					             from src cross join lateral generate_series(1, src.n) f;
+				create table c (cid integer primary key, sid integer, v integer, ${childFk});
+				insert into src values (1, 3), (2, 2);
+				insert into c values (100, 1, 2);
+			`);
+			expect(registeredPlanKind(db, 'main.m'), 'body must route to prefix-delete arm').to.equal('prefix-delete');
+		}
+
+		it('CASCADE removes the child when the source delete empties its fan-out slice', async () => {
+			await seedFanOut('foreign key (sid, v) references m(sid, v) on delete cascade');
+			await db.exec('delete from src where id = 1');
+			// Only src(2)'s fan-out remains: (2,1) and (2,2).
+			expect(await readAll('select sid, v from m order by sid, v')).to.deep.equal([
+				{ sid: 2, v: 1 }, { sid: 2, v: 2 },
+			]);
+			expect(await count('c'), 'child cascade-deleted').to.equal(0);
+		});
+
+		it('RESTRICT blocks the source delete when a fan-out backing row is referenced', async () => {
+			await seedFanOut('foreign key (sid, v) references m(sid, v) on delete restrict');
+			await expectError(
+				() => db.exec('delete from src where id = 1'),
+				`DELETE on 'm' violates RESTRICT from 'c'`,
+			);
+			// Atomic rollback: src(1) and its full fan-out (1,1),(1,2),(1,3) intact; c(100) intact.
+			expect(await count('src')).to.equal(2);
+			expect(await readAll('select sid, v from m where sid = 1 order by v')).to.deep.equal([
+				{ sid: 1, v: 1 }, { sid: 1, v: 2 }, { sid: 1, v: 3 },
+			]);
+			expect(await count('c')).to.equal(1);
+		});
+	});
+
+	/* ──────────────────── cross-schema (MV in s2) ──────────────────── */
+
+	describe('cross-schema: maintained table and FK child both in s2, derivation source in main', () => {
+		// The maintained table lives in s2 (its derivation reads main.src); the FK
+		// child also lives in s2. The reverse-FK index keys the FK under 's2.m', so
+		// getReferencingForeignKeys('s2','m') finds it and enforcement fires.
+		it('RESTRICT from s2.c blocks a maintenance delete of s2.m; unreferenced row still maintains cleanly', async () => {
+			db.schemaManager.addSchema('s2');
+			await db.exec(`
+				create table src (id integer primary key);
+				create table s2.m (id integer primary key) maintained as select id from src;
+				create table s2.c (cid integer primary key, m_id integer,
+					foreign key (m_id) references m(id) on delete restrict);
+				insert into src values (1), (2);
+				insert into s2.c values (100, 1);
+			`);
+			expect(registeredPlanKind(db, 's2.m'), 'body routes to inverse-projection arm').to.equal('inverse-projection');
+
+			await expectError(
+				() => db.exec('delete from src where id = 1'),
+				`DELETE on 'm' violates RESTRICT from 'c'`,
+			);
+			// Rollback: src, s2.m, and s2.c all intact.
+			expect(await count('src')).to.equal(2);
+			expect(await readAll('select id from s2.m order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+			expect(await count('s2.c')).to.equal(1);
+
+			// Unreferenced src(2) deletes cleanly — s2.m(2) is removed with no FK action.
+			await db.exec('delete from src where id = 2');
+			expect(await readAll('select id from s2.m')).to.deep.equal([{ id: 1 }]);
+		});
+	});
+
 	/* ──────────────────── reverse-FK index gate (unreferenced maintained table) ──────────────────── */
 
 	describe('reverse-FK index gate: an unreferenced maintained table short-circuits enforcement', () => {
