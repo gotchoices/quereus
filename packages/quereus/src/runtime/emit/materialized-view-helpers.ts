@@ -1367,6 +1367,19 @@ export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): P
 	// violation the failing statement unwinds and discards the pending reconcile,
 	// leaving the pre-refresh committed contents intact (the MV stays stale, so the
 	// next read re-validates rather than serving the rejected set).
+	//
+	// Documented limitation (collation-sensitive CHECK on the reshape arm): on the
+	// reshape path this scan validates the rows in their PRE-recollate physical form
+	// — the catalog column still carries the OLD collation here, and any
+	// `recollate` op runs post-reconcile in reshapeBackingInPlace, AFTER this commit.
+	// So a CHECK whose truth flips under a recollate-during-reshape (e.g. `v <> 'abc'`
+	// with v recollated BINARY → NOCASE over a row 'ABC') passes here and is then
+	// recollated into a violating state. Not closed: this commit is load-bearing
+	// (commit-first parity + the post-reconcile ops scan committed contents), and the
+	// attach reshape path uses the identical ordering. See docs/materialized-views.md
+	// § REFRESH MATERIALIZED VIEW "Known limitation — collation-sensitive CHECK" and
+	// maintained-table-refresh-revalidation.spec.ts § "reshape arm: collation-
+	// sensitive CHECK".
 	await validateDeclaredConstraintsOverContents(db, backing);
 	await conn.commit();
 }
@@ -2024,6 +2037,11 @@ async function reshapeBackingInPlace(
 	// Post-reconcile data-validating ops (retype / recollate / tighten NOT NULL): the
 	// reconciled body rows satisfy the new attribute where the discarded backing
 	// might not, so each validates the fresh data, not the stale rows. Re-register
+	// NOTE: a `recollate` here applies AFTER step 3's rebuildBacking has already
+	// validated + committed the rows under the OLD collation — so a collation-
+	// sensitive declared CHECK whose truth flips under this recollate is not caught
+	// by that scan (documented limitation; see the note in rebuildBacking's
+	// constraint-bearing branch and docs/materialized-views.md).
 	// the catalog after EACH op (not once after the loop): a data-validating op can
 	// throw, and unlike the pre-reconcile batch the module schema mutates per op, so
 	// a single post-loop register would leave the catalog behind the module — the
