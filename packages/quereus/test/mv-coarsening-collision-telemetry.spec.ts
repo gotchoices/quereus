@@ -207,4 +207,41 @@ describe('coarsened-key materialized-view collision telemetry', () => {
 		unsubBad();
 		unsubGood();
 	});
+
+	it('multiple collisions in one transaction each fire and accumulate the counter', async () => {
+		await db.exec('create table contact_v1 (handle text primary key, email text)');
+		await db.exec("insert into contact_v1 values ('Bob', 'b@x')");
+		await db.exec('create materialized view contact_v2 as select handle collate nocase as handle, email from contact_v1');
+
+		await db.exec('begin');
+		await db.exec("insert into contact_v1 values ('bob', 'b2@x')"); // collision 1 (vs 'Bob')
+		await db.exec("insert into contact_v1 values ('BOB', 'b3@x')"); // collision 2 (vs 'bob' winner)
+		expect(collisions.length, 'nothing delivered mid-transaction').to.equal(0);
+		await db.exec('commit');
+
+		expect(collisions.length, 'both merges fire on commit').to.equal(2);
+		expect(collisions.map(e => e.newRow), 'each merge carries its own image').to.deep.equal([
+			['bob', 'b2@x'],
+			['BOB', 'b3@x'],
+		]);
+		expect(stat('main.contact_v2'), 'counter accumulates both').to.equal(2);
+	});
+
+	it('a savepoint rolled back to drops its collisions while the base collision still commits', async () => {
+		await db.exec('create table contact_v1 (handle text primary key, email text)');
+		await db.exec("insert into contact_v1 values ('Bob', 'b@x')");
+		await db.exec('create materialized view contact_v2 as select handle collate nocase as handle, email from contact_v1');
+
+		await db.exec('begin');
+		await db.exec("insert into contact_v1 values ('bob', 'b2@x')"); // collision in the base layer
+		await db.exec('savepoint sp1');
+		await db.exec("insert into contact_v1 values ('BOB', 'b3@x')"); // collision captured in the sp1 layer
+		await db.exec('rollback to sp1'); // sp1 layer discarded — its collision dropped
+		await db.exec('commit');
+
+		// Only the base-layer merge survives; the savepoint-scoped one is gone.
+		expect(collisions.length, 'savepoint collision dropped, base collision kept').to.equal(1);
+		expect(collisions[0].newRow).to.deep.equal(['bob', 'b2@x']);
+		expect(stat('main.contact_v2'), 'counter reflects only the committed merge').to.equal(1);
+	});
 });
