@@ -2617,27 +2617,35 @@ export class Parser {
 		// table-form encoding of the MV-sugar `(a, b)` renames. Absent ⇒ implicit
 		// (the body follows its source shape on reopen). The required AS that
 		// follows keeps this unambiguous against a parenthesized body.
-		let columns: string[] | undefined;
-		if (this.check(TokenType.LPAREN)) {
-			this.consume(TokenType.LPAREN, "Expected '(' to start maintained column list.");
-			// An empty `maintained () as` list is rejected: `maintainedClauseToString`
-			// would drop it (so it could not round-trip) and import would arity-error.
-			// The clause's absence is the implicit signal; require at least one column.
-			if (this.check(TokenType.RPAREN)) {
-				throw this.error(this.peek(), "Expected at least one column name in the maintained column list.");
-			}
-			columns = [];
-			do {
-				columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in maintained column list."));
-			} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
-			this.consume(TokenType.RPAREN, "Expected ')' after maintained column list.");
-		}
+		const columns = this.parseMaintainedColumnList();
 		this.consumeKeyword('AS', "Expected 'AS' after MAINTAINED.");
 		// Body is any QueryExpr — bare SELECT / VALUES / WITH … SELECT all qualify.
 		// DML bodies parse here but the planner rejects them.
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 		const insertDefaults = this.parseInsertDefaultsClause();
 		return { columns, select, insertDefaults };
+	}
+
+	/**
+	 * Parse the optional parenthesized output-column rename list that may precede the
+	 * `AS` of a maintained-table form — shared by `create table … maintained (cols) as`
+	 * and `alter table … set maintained (cols) as`. Returns undefined when absent
+	 * (the implicit form). An empty `()` is rejected: it could not round-trip
+	 * (`maintainedClauseToString` drops an empty list) and the clause's absence is
+	 * already the implicit signal, so require at least one column.
+	 */
+	private parseMaintainedColumnList(): string[] | undefined {
+		if (!this.check(TokenType.LPAREN)) return undefined;
+		this.consume(TokenType.LPAREN, "Expected '(' to start maintained column list.");
+		if (this.check(TokenType.RPAREN)) {
+			throw this.error(this.peek(), "Expected at least one column name in the maintained column list.");
+		}
+		const columns: string[] = [];
+		do {
+			columns.push(this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in maintained column list."));
+		} while (this.match(TokenType.COMMA) && !this.check(TokenType.RPAREN));
+		this.consume(TokenType.RPAREN, "Expected ')' after maintained column list.");
+		return columns;
 	}
 
 	/**
@@ -3167,12 +3175,17 @@ export class Parser {
 		} else if (this.peekKeyword('SET')) {
 			this.consumeKeyword('SET', "Expected SET.");
 			if (this.matchKeyword('MAINTAINED')) {
-				// SET MAINTAINED AS <body> [INSERT DEFAULTS (...)] — attach / re-attach a
-				// derivation. No `using` clause: the module is the table's identity.
+				// SET MAINTAINED [(cols)] AS <body> [INSERT DEFAULTS (...)] — attach /
+				// re-attach a derivation. No `using` clause: the module is the table's
+				// identity. The optional `(cols)` is the explicit output-column rename
+				// list (the differ's lossless encoding of an MV-sugar `(a, c)` rename):
+				// present ⇒ positional rename + recorded explicit; absent ⇒ implicit
+				// (the body's natural names). The required AS keeps it unambiguous.
+				const columns = this.parseMaintainedColumnList();
 				this.consumeKeyword('AS', "Expected 'AS' after SET MAINTAINED.");
 				const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 				const insertDefaults = this.parseInsertDefaultsClause();
-				action = { type: 'setMaintained', select, insertDefaults };
+				action = { type: 'setMaintained', columns, select, insertDefaults };
 			} else {
 				// Table-level `SET TAGS (...)` — whole-set tag replacement on the table.
 				this.consumeKeyword('TAGS', "Expected 'TAGS' or 'MAINTAINED' after SET.");

@@ -714,14 +714,20 @@ export type AlterTableAction =
 	}
 	| {
 		/**
-		 * ALTER TABLE … SET MAINTAINED AS <body> [INSERT DEFAULTS (…)] — attach
-		 * (or, on an already-maintained table, atomically replace) a derivation.
-		 * The body must derive the table's exact shape; attach reconciles the
-		 * table's current contents against the derived contents by keyed diff
-		 * (derived content wins). There is deliberately no `using` clause — the
-		 * module is the table's identity and never changes via attach.
+		 * ALTER TABLE … SET MAINTAINED [(cols)] AS <body> [INSERT DEFAULTS (…)] —
+		 * attach (or, on an already-maintained table, atomically replace) a
+		 * derivation. The optional `(cols)` is the explicit output-column rename
+		 * list (the differ's lossless encoding of an MV-sugar `(a, c)` rename):
+		 * present ⇒ the body outputs are renamed positionally to it, the list is
+		 * recorded as `derivation.columns`, and a same-arity name drift reshapes
+		 * (renames) the backing in place; absent ⇒ the implicit form (the body's
+		 * natural names, may reshape the backing to follow the body). Attach
+		 * reconciles the table's current contents against the derived contents by
+		 * keyed diff (derived content wins). There is deliberately no `using`
+		 * clause — the module is the table's identity and never changes via attach.
 		 */
 		type: 'setMaintained',
+		columns?: ReadonlyArray<string>,
 		select: QueryExpr,
 		insertDefaults?: ReadonlyArray<ViewInsertDefault>
 	}

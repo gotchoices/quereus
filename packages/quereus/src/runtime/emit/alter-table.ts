@@ -123,7 +123,7 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				return runDropTableTags(rctx, tableSchema, action.keys);
 			}
 			case 'setMaintained':
-				return runSetMaintained(rctx, tableSchema, schema, action.select, action.insertDefaults);
+				return runSetMaintained(rctx, tableSchema, schema, action.columns, action.select, action.insertDefaults);
 			case 'dropMaintained':
 				return runDropMaintained(rctx, tableSchema, schema);
 		}
@@ -1314,7 +1314,7 @@ export function buildShadowTableDdl(
 }
 
 /**
- * SET MAINTAINED AS <body> — attach a derivation to a plain table, or
+ * SET MAINTAINED [(cols)] AS <body> — attach a derivation to a plain table, or
  * atomically replace an already-maintained table's derivation (the differ's
  * body-change primitive). All gates, the verify-by-diff reconcile, the
  * catalog/registration flip, the consumer cascade, and the lifecycle event
@@ -1322,11 +1322,23 @@ export function buildShadowTableDdl(
  * re-attach) live in the shared {@link attachMaintainedDerivation} core.
  * Resolved against the LIVE table (the build-time schema may be a cached
  * statement's snapshot).
+ *
+ * The optional `columns` rename list selects the attach mode:
+ *  - present ⇒ EXPLICIT: the body outputs are renamed positionally to it, the
+ *    list is recorded as `derivation.columns`, and a same-arity name drift
+ *    reshapes (renames) the backing in place to the listed names — the differ's
+ *    lossless re-attach of an MV-sugar `(a, c)` rename;
+ *  - absent ⇒ IMPLICIT: the body's natural names are recorded (undefined), and a
+ *    differing derived shape reshapes the backing to follow the body — now also
+ *    over a prior-explicit record (the deliberate "go implicit" re-attach).
+ * Both pass `allowReshape` (the verb is the reshape-permitting path; create stays
+ * strict).
  */
 async function runSetMaintained(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,
+	columns: ReadonlyArray<string> | undefined,
 	select: QueryExpr,
 	insertDefaults: ReadonlyArray<ViewInsertDefault> | undefined,
 ): Promise<SqlValue> {
@@ -1334,17 +1346,11 @@ async function runSetMaintained(
 	if (!live) {
 		throw new QuereusError(`no such table: ${tableSchema.name}`, StatusCode.ERROR);
 	}
-	// The attach verb has no rename-list syntax, so record the IMPLICIT form
-	// (`undefined`) — identical to what create-sugar records, keeping a sugar MV's
-	// recorded `derivation.columns` from flipping implicit→explicit on re-attach.
-	// `allowReshape`: over the implicit form (call and prior record) a body whose
-	// derived shape differs from the live table RESHAPES the backing in place to
-	// follow the body — the differ is plan-free, so a sugar MV's output-column
-	// rename arrives here as a plain re-attach and the reshape must happen
-	// verb-side; an explicit-recorded table keeps the strict declared-shape error.
+	const explicit = columns !== undefined && columns.length > 0;
 	await attachMaintainedDerivation(
-		rctx.db, live, select, insertDefaults, undefined,
-		/*positionalRename*/ false, /*allowReshape*/ true,
+		rctx.db, live, select, insertDefaults,
+		/*recordedColumns*/ explicit ? columns : undefined,
+		/*positionalRename*/ explicit, /*allowReshape*/ true,
 	);
 	log('Attached derivation to table %s.%s', live.schemaName, live.name);
 	return null;

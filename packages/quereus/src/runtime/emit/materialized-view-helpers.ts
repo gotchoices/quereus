@@ -887,37 +887,47 @@ async function validateDeclaredConstraintsOverContents(db: Database, mt: Maintai
  *     and surface the key-coarsening warning exactly as create does.
  *
  * `recordedColumns` is recorded verbatim as `derivation.columns` (the lossless
- * implicit/explicit signal the persist + import paths already use): the declared
- * column names for the explicit `create table … maintained (columns) as` form, or
- * `undefined` for the implicit forms — `create table … maintained as` (which
- * reshapes its source on reopen) AND the re-attach verb (`set maintained as`).
- * The verb has no rename-list syntax and its strict declared-shape check
- * guarantees the body's natural names already equal the table columns, so the
- * implicit form is lossless there and identical to what create-sugar records (no
- * implicit→explicit flip on re-attach). When `positionalRename` is set — the
- * `maintained (columns)` create form — the body outputs are renamed positionally
- * to `recordedColumns` and the per-column name check is skipped (the authored list
- * is the authoritative output-name vector); otherwise the strict declared-shape
- * check (names included) applies, so the body must already be aliased to the
- * declared names (the implicit-create / attach-verb posture). `buildTableDerivation`
- * hashes `recordedColumns` into `bodyHash`, so live exec and catalog import of the
- * same canonical DDL agree on both the record and the hash — making attach/create →
- * persist → reopen a fixed point.
+ * implicit/explicit signal the persist + import paths already use): the authored
+ * column names for the explicit forms — `create table … maintained (columns) as`
+ * AND the re-attach verb `set maintained (columns) as` — or `undefined` for the
+ * implicit forms — `create table … maintained as` (which reshapes its source on
+ * reopen) AND the implicit re-attach verb `set maintained as` (which reshapes to
+ * follow the body's natural names). When `positionalRename` is set — every
+ * explicit form — the body outputs are renamed positionally to `recordedColumns`
+ * and the per-column name check is skipped (the authored list is the authoritative
+ * output-name vector); otherwise the strict declared-shape check (names included)
+ * applies. `buildTableDerivation` hashes `recordedColumns` into `bodyHash`, so
+ * live exec and catalog import of the same canonical DDL agree on both the record
+ * and the hash — making attach/create → persist → reopen a fixed point.
  *
- * **Reshape-on-attach (`allowReshape`).** The verb path (`set maintained as` —
- * manual AND differ-emitted) passes `allowReshape = true`: on a strict-shape
- * mismatch over the IMPLICIT form, the backing reshapes in place to follow the
- * body — the same "the body owns an implicit table's shape" contract the refresh
- * reshape and the implicit table form's reopen already honor — instead of
- * erroring. Gated to: the verb (`allowReshape`), an implicit call
- * (`!positionalRename && !recordedColumns`), AND an implicit prior record (a
- * plain table, or `derivation.columns === undefined`); an explicit-recorded
- * table (`maintained (columns)`) keeps the strict error — its authored rename
- * list is the arity-locked interface, and a verb-side reshape would abandon it
- * for the body's natural names (tracked:
- * maintained-reattach-explicit-rename-list-reshape). The delta classifies via
- * {@link classifyBackingReshape}; an inexpressible delta (interleave /
- * physical-PK change) raises {@link inexpressibleReshapeError} with the table
+ * An explicit list whose arity disagrees with the body raises a sited error (the
+ * list-vs-body arity guard) before anything is recorded — `deriveBackingShape`
+ * sizes the shape to the body, so a surplus/short list would otherwise persist a
+ * miscounted `derivation.columns`.
+ *
+ * **Reshape-on-attach (`allowReshape`).** The verb path (`set maintained [(cols)]
+ * as` — manual AND differ-emitted) passes `allowReshape = true`; create and any
+ * non-verb caller pass `false` and keep the strict declared-shape error. Two
+ * reshape triggers, both reusing the two-phase splice + restore handlers below:
+ *
+ *  - **Implicit call** (no rename list): on a strict-shape mismatch the backing
+ *    reshapes in place to follow the body's natural names — the same "the body
+ *    owns an implicit table's shape" contract the refresh reshape and the implicit
+ *    table form's reopen honor. Now permitted over a prior-EXPLICIT record too:
+ *    `set maintained as <body>` over an `(a, b)` table abandons the authored list
+ *    and relabels the backing to the body's names, recording an implicit
+ *    derivation (the deliberate "go implicit" re-attach).
+ *  - **Explicit call** (`positionalRename`): a same-arity output-NAME drift
+ *    `(a, b) → (a, c)` produces no strict mismatch (names are skipped), yet the
+ *    backing must be relabeled to the recorded names — classified as a reshape.
+ *    The derived shape carries the TARGET names, so {@link classifyBackingReshape}
+ *    emits a pure positional RENAME (`b → c`); a renamed PK output column is
+ *    matched through the rename map (not a key change). A count/type/PK delta is
+ *    still the strict error, and a reorder/swap (`(a, b) → (b, a)`) classifies as
+ *    inexpressible.
+ *
+ * An inexpressible delta (interleave / physical-PK change, or a host module
+ * without `alterTable`) raises {@link inexpressibleReshapeError} with the table
  * untouched. An expressible plan splices around the verify-by-diff reconcile —
  * see the sequencing notes inside.
  */
@@ -949,19 +959,47 @@ export async function attachMaintainedDerivation(
 	// names with the strict declared-shape check (the body must already be aliased to
 	// the declared names — the attach verb / implicit-create posture).
 	const shape = deriveBackingShape(db, bodySql, positionalRename ? recordedColumns : undefined);
+
+	// Explicit rename-list arity guard. `deriveBackingShape` sizes the shape to the
+	// BODY's arity (a surplus rename name is dropped, a missing one padded), so a
+	// list whose length disagrees with the body would otherwise record an
+	// over/under-counted `derivation.columns` over the backing. The CREATE path
+	// catches this via its table-vs-body count check before reaching here (the
+	// freshly-created table mirrors the list); on re-attach the existing table can
+	// match the body while the list does not, so guard the list-vs-body arity
+	// directly. The implicit form (`recordedColumns === undefined`) is exempt.
+	if (recordedColumns !== undefined && recordedColumns.length !== shape.columns.length) {
+		throw new QuereusError(
+			`cannot attach derivation to '${schemaName}.${name}': the rename list declares ${recordedColumns.length} columns but the body produces ${shape.columns.length}`,
+			StatusCode.ERROR,
+		);
+	}
+
 	const mismatch = describeAttachShapeMismatch(table, shape, positionalRename);
+	// Reshape-on-attach (see the docstring). The verb (`allowReshape`) reshapes the
+	// backing in place instead of erroring on a shape change; create and any
+	// non-verb caller keep the strict error. Two reshape triggers:
+	//   - IMPLICIT call (no rename list): a strict mismatch follows the body's
+	//     natural names — now also over a prior-explicit record (the deliberate
+	//     "go implicit" re-attach); the explicit forms keep the strict count/type/PK
+	//     error instead.
+	//   - EXPLICIT call (`positionalRename`): a same-arity NAME drift `(a,b)→(a,c)`
+	//     produces NO mismatch under `skipNames`, yet the backing must be relabeled
+	//     to the recorded names — classify that as a reshape too. The shape carries
+	//     the TARGET names, so `classifyBackingReshape` emits a pure positional
+	//     RENAME; a reorder/swap classifies inexpressible (table untouched) and a
+	//     renamed PK column is matched through the rename map (not a key change).
+	const strictMismatchReshape = mismatch !== null && allowReshape && !positionalRename && recordedColumns === undefined;
+	const explicitNameDriftReshape = mismatch === null && positionalRename && allowReshape
+		&& table.columns.some((c, i) => c.name.toLowerCase() !== shape.columns[i].name.toLowerCase());
 	let reshapePlan: ReshapePlan | undefined;
-	if (mismatch) {
-		// Reshape-on-attach gate (see the docstring): the verb over the implicit
-		// form — on the call AND on the prior record — may follow the body; every
-		// explicit form keeps the strict declared-shape error.
-		const priorImplicit = !isMaintainedTable(table) || table.derivation.columns === undefined;
-		if (!allowReshape || positionalRename || recordedColumns !== undefined || !priorImplicit) {
-			throw new QuereusError(
-				`cannot attach derivation to '${schemaName}.${name}': ${mismatch}`,
-				StatusCode.ERROR,
-			);
-		}
+	if (mismatch && !strictMismatchReshape) {
+		throw new QuereusError(
+			`cannot attach derivation to '${schemaName}.${name}': ${mismatch}`,
+			StatusCode.ERROR,
+		);
+	}
+	if (strictMismatchReshape || explicitNameDriftReshape) {
 		if (!module.alterTable) {
 			throw inexpressibleReshapeError(schemaName, name,
 				`its backing module '${table.vtabModuleName}' does not support in-place ALTER`);

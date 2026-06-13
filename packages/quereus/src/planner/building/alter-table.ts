@@ -204,6 +204,7 @@ export function buildAlterTableStmt(
       }
       return new AlterTableNode(ctx.scope, tableReference, {
         type: 'setMaintained',
+        columns: stmt.action.columns,
         select: stmt.action.select,
         insertDefaults: stmt.action.insertDefaults,
       });

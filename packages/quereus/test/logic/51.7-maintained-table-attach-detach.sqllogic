@@ -406,3 +406,63 @@ select maintained from maintained;
 alter table maintained drop maintained;
 -- error: not a maintained table
 drop table maintained;
+
+-- ===================================
+-- 12. set maintained (cols) as — explicit rename-list re-attach + backing reshape
+-- ===================================
+
+create table rsrc (id integer primary key, x text not null, y text not null);
+insert into rsrc values (1, 'a', 'A'), (2, 'b', 'B');
+
+-- explicit attach with an authored rename list (a, b) over the body's (id, x)
+create table rmv (a integer primary key, b text not null) maintained (a, b) as select id, x from rsrc;
+select a, b from rmv order by a;
+→ [{"a":1,"b":"a"},{"a":2,"b":"b"}]
+
+-- rename-list change b → c (same body): the backing column is RENAMED in place,
+-- rows relabeled (not rebuilt); the derivation re-records (a, c)
+alter table rmv set maintained (a, c) as select id, x from rsrc;
+select a, c from rmv order by a;
+→ [{"a":1,"c":"a"},{"a":2,"c":"b"}]
+
+-- idempotent: re-running the same verb changes nothing
+alter table rmv set maintained (a, c) as select id, x from rsrc;
+select a, c from rmv order by a;
+→ [{"a":1,"c":"a"},{"a":2,"c":"b"}]
+
+-- maintenance is live on the renamed backing
+insert into rsrc values (3, 'c', 'C');
+select c from rmv where a = 3;
+→ [{"c":"c"}]
+
+-- body-only change with the list unchanged applies (a plain reconcile, no reshape)
+alter table rmv set maintained (a, c) as select id, y from rsrc;
+select a, c from rmv order by a;
+→ [{"a":1,"c":"A"},{"a":2,"c":"B"},{"a":3,"c":"C"}]
+
+-- a rename-list swap (a, c) → (c, a) is an inexpressible reorder, table untouched
+alter table rmv set maintained (c, a) as select id, y from rsrc;
+-- error: changed incompatibly
+select a, c from rmv order by a;
+→ [{"a":1,"c":"A"},{"a":2,"c":"B"},{"a":3,"c":"C"}]
+
+-- a list/body arity mismatch is a sited error before anything is recorded
+alter table rmv set maintained (a, c, d) as select id, y from rsrc;
+-- error: rename list declares 3 columns but the body produces 2
+
+-- a count drift (3-col list + body over the 2-col table) is the strict shape error
+alter table rmv set maintained (a, c, d) as select id, y, x from rsrc;
+-- error: body produces 3 columns but the table declares 2
+
+-- still intact after the rejected re-attaches
+select a, c from rmv order by a;
+→ [{"a":1,"c":"A"},{"a":2,"c":"B"},{"a":3,"c":"C"}]
+
+-- the bare verb over the explicit table goes implicit: the backing relabels to the
+-- body's natural names and the recorded list is abandoned (derivation.columns clears)
+alter table rmv set maintained as select id, x from rsrc;
+select id, x from rmv order by id;
+→ [{"id":1,"x":"a"},{"id":2,"x":"b"},{"id":3,"x":"c"}]
+
+drop materialized view rmv;
+drop table rsrc;

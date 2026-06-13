@@ -1404,18 +1404,19 @@ describe('declarative-equivalence: materialized views', () => {
 		}
 	});
 
-	it('a column-list (rename) change on a sugar MV emits a re-attach the verb cannot apply (known limitation)', async function () {
+	it('a column-list (rename) change on a sugar MV: the bare re-attach goes implicit; the explicit verb converges', async function () {
 		// The explicit rename list (`mv (a, b)`) is part of the canonical definition
 		// the body hash covers, so changing it (b → c) drifts the hash and the differ
-		// correctly emits a re-attach. But `alter table … set maintained as` has NO
-		// rename-list syntax, so the emitted body can't carry the new column names —
-		// and the verb's reshape-on-attach is gated to the IMPLICIT form (an
-		// explicit-recorded table's authored list is the arity-locked interface, so
-		// reshaping would abandon it for the body's natural names). The attach shape
-		// check therefore rejects it at apply. A rename-list change on an EXPLICIT MV
-		// needs the table form (or a manual drop+recreate) for now; tracked as
-		// maintained-reattach-explicit-rename-list-reshape. The IMPLICIT sibling — an
-		// output-column rename on a bare sugar MV — now applies (next test).
+		// emits a re-attach. The differ does not YET carry the rename list on the
+		// emitted `set maintained as` (tracked: the sibling differ ticket
+		// maintained-reattach-explicit-rename-list-reshape), so the verb sees an
+		// IMPLICIT re-attach. With the gate relaxation (this ticket,
+		// maintained-set-maintained-rename-list-verb) that no longer ERRORS as it used
+		// to — it reshapes the backing to the body's natural names and records
+		// implicit. The declaration stays explicit, so a single apply no longer
+		// CONVERGES; the `set maintained (cols) as` verb this ticket adds closes the
+		// gap and is exercised directly here and in
+		// maintained-table-attach-detach.spec.ts.
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -1436,14 +1437,32 @@ describe('declarative-equivalence: materialized views', () => {
 			expect(diff.tablesToAlter.find(a => a.tableName === 'mv')?.setMaintained, 'rename-list change ⇒ re-attach').to.not.be.undefined;
 			expect(diff.tablesToDrop, 'no drop of the maintained table').to.deep.equal([]);
 
-			// …but applying it throws: the re-attach body can't carry the new names.
-			let message = '';
-			try {
-				await db.exec('apply schema main');
-			} catch (e) {
-				message = e instanceof Error ? e.message : String(e);
-			}
-			expect(message, 'apply surfaces a sited attach shape mismatch').to.match(/attach derivation|declares/i);
+			// …and applying it no longer throws: the bare (implicit) re-attach reshapes
+			// the backing to the body's natural names and records implicit.
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.columns.map(c => c.name), 'reshaped to the body names (went implicit)').to.deep.equal(['id', 'x']);
+			expect(mv.derivation.columns, 'recorded implicit').to.be.undefined;
+
+			// But it did not converge to the EXPLICIT declaration: a re-diff still wants
+			// a re-attach until the differ carries the rename list (sibling ticket).
+			const reDiff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(reDiff.tablesToAlter.find(a => a.tableName === 'mv')?.setMaintained, 'not yet converged (differ ticket pending)').to.not.be.undefined;
+
+			// The explicit verb closes the gap: it relabels the backing to (a, c) and
+			// records the authored list, so the schema converges.
+			await db.exec('alter table mv set maintained (a, c) as select id, x from t');
+			const converged = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(converged.columns.map(c => c.name), 'explicit verb relabels to (a, c)').to.deep.equal(['a', 'c']);
+			expect(converged.derivation.columns, 'records the authored list').to.deep.equal(['a', 'c']);
+			const convergedDiff = computeSchemaDiff(
+				db.declaredSchemaManager.getDeclaredSchema('main')!,
+				collectSchemaCatalog(db, 'main'),
+			);
+			expect(convergedDiff.tablesToAlter.find(a => a.tableName === 'mv'), 'converged ⇒ no further re-attach').to.be.undefined;
 		} finally {
 			await db.close();
 		}

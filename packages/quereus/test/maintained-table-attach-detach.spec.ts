@@ -604,16 +604,23 @@ describe('Maintained-table attach/detach verbs', () => {
 			]);
 		});
 
-		it('an EXPLICIT-recorded maintained table never reshapes — the strict shape error stands', async () => {
+		it('the BARE verb over an EXPLICIT-recorded table goes implicit — reshapes to the body names, abandons the authored list', async () => {
+			// Gate relaxation (this ticket): a bare `set maintained as <body>` over a
+			// prior-EXPLICIT record no longer keeps the strict shape error — it
+			// reshapes the backing to follow the body's natural names and records an
+			// IMPLICIT derivation (the deliberate "go implicit" re-attach). The
+			// explicit-target reshape (preserving the authored list) needs the
+			// `set maintained (cols) as` form (covered below).
 			await db.exec(`create table ex (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
-			let message = '';
-			try {
-				await db.exec(`alter table ex set maintained as select id, y from src`);
-			} catch (e) { message = (e as Error).message; }
-			expect(message, 'authored rename list is the arity-locked interface').to.match(/body output column 1 is named 'id' but the table declares 'a'/i);
+			expect(maintained('ex').derivation.columns, 'starts explicit').to.deep.equal(['a', 'b']);
+			await db.exec(`alter table ex set maintained as select id, y from src`);
 			const after = maintained('ex');
-			expect(after.columns.map(c => c.name), 'columns untouched').to.deep.equal(['a', 'b']);
-			expect(after.derivation.columns, 'still recorded explicit').to.deep.equal(['a', 'b']);
+			expect(after.columns.map(c => c.name), 'backing relabeled to the body names').to.deep.equal(['id', 'y']);
+			expect(after.derivation.columns, 'now recorded implicit').to.be.undefined;
+			expect(after.derivation.stale).to.equal(false);
+			expect(await readAll('select id, y from ex order by id')).to.deep.equal([
+				{ id: 1, y: 'a' }, { id: 2, y: 'B' }, { id: 3, y: 'C' },
+			]);
 		});
 
 		it('a reconcile failure AFTER the structural reshape leaves the reshaped backing carrying the prior derivation STALE, and re-runs to converge', async () => {
@@ -654,6 +661,126 @@ describe('Maintained-table attach/detach verbs', () => {
 			expect(await readAll('select * from cm order by id')).to.deep.equal([
 				{ id: 1, x: 'a', z: 'p' }, { id: 2, x: 'c', z: 'q' },
 			]);
+		});
+	});
+
+	/**
+	 * Explicit rename-list re-attach (ticket maintained-set-maintained-rename-list-verb):
+	 * `alter table … set maintained (cols) as <body>` carries the authored output-column
+	 * list as first-class grammar, so the differ's round-trip through SQL converges
+	 * (the list is recorded SEPARATELY from the body). The verb:
+	 *   - renames the body outputs positionally to the list and records it explicitly;
+	 *   - on a same-arity NAME drift `(a, b) → (a, c)` RESHAPES (renames) the backing in
+	 *     place — rows relabeled, not rebuilt — and is idempotent on re-run;
+	 *   - allows a PK output-column rename (matched through the rename map);
+	 *   - refuses a reorder/swap as inexpressible (table untouched);
+	 *   - keeps the strict count/type/PK error on a real shape change; and
+	 *   - guards a list/body arity mismatch with a sited error before recording.
+	 */
+	describe('explicit rename-list re-attach (set maintained (cols) as)', () => {
+		beforeEach(async () => {
+			await db.exec(`
+				create table src (id integer primary key, x text not null, y text not null);
+				insert into src values (1, 'a', 'A'), (2, 'b', 'B'), (3, 'c', 'C');
+			`);
+		});
+
+		it('a rename-list change renames the backing in place, preserves rows, records the new list, and is idempotent', async () => {
+			await db.exec(`create table mv (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			expect(maintained('mv').derivation.columns, 'starts explicit (a, b)').to.deep.equal(['a', 'b']);
+
+			// Same body, list b → c: the backing column is RENAMED (rows relabeled, not
+			// rebuilt), so the verify-by-diff reconcile reports nothing.
+			const dispatched = await captureDispatch(async () => {
+				await db.exec(`alter table mv set maintained (a, c) as select id, x from src`);
+			});
+			expect(dispatched, 'pure relabel ⇒ zero row changes').to.deep.equal([]);
+			const after = maintained('mv');
+			expect(after.columns.map(c => c.name), 'backing renamed b → c').to.deep.equal(['a', 'c']);
+			expect(after.derivation.columns, 'recorded explicit (a, c)').to.deep.equal(['a', 'c']);
+			expect(after.derivation.stale).to.equal(false);
+			expect(await readAll('select a, c from mv order by a')).to.deep.equal([
+				{ a: 1, c: 'a' }, { a: 2, c: 'b' }, { a: 3, c: 'c' },
+			]);
+
+			// Idempotent: re-running the identical verb reshapes nothing and reports nothing.
+			const again = await captureDispatch(async () => {
+				await db.exec(`alter table mv set maintained (a, c) as select id, x from src`);
+			});
+			expect(again, 'idempotent re-attach ⇒ no changes').to.deep.equal([]);
+			expect(maintained('mv').columns.map(c => c.name)).to.deep.equal(['a', 'c']);
+			expect(maintained('mv').derivation.columns).to.deep.equal(['a', 'c']);
+
+			// Row-time maintenance re-bound to the renamed backing.
+			await db.exec(`insert into src values (4, 'd', 'D')`);
+			expect(await readAll(`select c from mv where a = 4`)).to.deep.equal([{ c: 'd' }]);
+		});
+
+		it('a body-only change with the list unchanged applies (the case that errors today)', async () => {
+			await db.exec(`create table mv2 (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			// Body x → y, list (a, b) unchanged: shape matches the backing (no reshape),
+			// a plain verify-by-diff reconcile updates the drifted values.
+			await db.exec(`alter table mv2 set maintained (a, b) as select id, y from src`);
+			const after = maintained('mv2');
+			expect(after.columns.map(c => c.name), 'shape unchanged').to.deep.equal(['a', 'b']);
+			expect(after.derivation.columns, 'still explicit (a, b)').to.deep.equal(['a', 'b']);
+			expect(await readAll('select a, b from mv2 order by a')).to.deep.equal([
+				{ a: 1, b: 'A' }, { a: 2, b: 'B' }, { a: 3, b: 'C' },
+			]);
+		});
+
+		it('a PK output-column rename is allowed — matched through the rename map', async () => {
+			await db.exec(`create table mv3 (id integer primary key, x text not null) maintained (id, x) as select id, x from src`);
+			await db.exec(`alter table mv3 set maintained (keyid, x) as select id, x from src`);
+			const after = maintained('mv3');
+			expect(after.columns.map(c => c.name), 'PK column id → keyid').to.deep.equal(['keyid', 'x']);
+			expect(after.derivation.columns).to.deep.equal(['keyid', 'x']);
+			expect(after.primaryKeyDefinition.map(p => after.columns[p.index].name), 'PK follows the rename').to.deep.equal(['keyid']);
+			expect(await readAll('select keyid, x from mv3 order by keyid')).to.deep.equal([
+				{ keyid: 1, x: 'a' }, { keyid: 2, x: 'b' }, { keyid: 3, x: 'c' },
+			]);
+		});
+
+		it('a rename-list swap (a, b) → (b, a) is an inexpressible reshape — sited error, table untouched', async () => {
+			await db.exec(`create table mv4 (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			const beforeHash = maintained('mv4').derivation.bodyHash;
+			let message = '';
+			try {
+				await db.exec(`alter table mv4 set maintained (b, a) as select id, x from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/changed incompatibly/i);
+			expect(message).to.match(/reorder/i);
+			const after = maintained('mv4');
+			expect(after.columns.map(c => c.name), 'table untouched').to.deep.equal(['a', 'b']);
+			expect(after.derivation.columns, 'still (a, b)').to.deep.equal(['a', 'b']);
+			expect(after.derivation.bodyHash, 'prior derivation restored').to.equal(beforeHash);
+		});
+
+		it('a count drift (3-col list+body over a 2-col table) is the strict shape error', async () => {
+			await db.exec(`create table mv5 (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			let message = '';
+			try {
+				await db.exec(`alter table mv5 set maintained (a, b, c) as select id, x, y from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/body produces 3 columns but the table declares 2/i);
+			expect(maintained('mv5').columns.map(c => c.name), 'untouched').to.deep.equal(['a', 'b']);
+			expect(maintained('mv5').derivation.columns).to.deep.equal(['a', 'b']);
+		});
+
+		it('a list/body arity mismatch is a sited error before anything is recorded', async () => {
+			await db.exec(`create table mv6 (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			let message = '';
+			try {
+				await db.exec(`alter table mv6 set maintained (a, b, c) as select id, x from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/rename list declares 3 columns but the body produces 2/i);
+			expect(maintained('mv6').derivation.columns, 'untouched').to.deep.equal(['a', 'b']);
+		});
+
+		it('the explicit verb round-trips: ast-stringify emits the (cols) clause', async () => {
+			await db.exec(`create table mv7 (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			await db.exec(`alter table mv7 set maintained (a, c) as select id, x from src`);
+			expect(maintained('mv7').derivation.columns).to.deep.equal(['a', 'c']);
 		});
 	});
 });

@@ -111,16 +111,19 @@ export type AlterTableAction =
 	}
 	| {
 		/**
-		 * SET MAINTAINED AS <body> — attach a derivation to a plain table, or
-		 * atomically replace the derivation of an already-maintained table. Over
-		 * the implicit form a body whose derived shape differs reshapes the
-		 * backing in place to follow the body (an explicit-recorded table keeps
-		 * the strict declared-shape error); the runtime helper then reconciles
-		 * the table's current contents against the derived contents by keyed
-		 * diff (derived content wins). See
+		 * SET MAINTAINED [(cols)] AS <body> — attach a derivation to a plain table,
+		 * or atomically replace the derivation of an already-maintained table. The
+		 * optional `columns` rename list (present ⇒ explicit/positional) renames the
+		 * body outputs positionally and reshapes (renames) the backing in place on a
+		 * same-arity name drift; absent ⇒ the implicit form, where a body whose
+		 * derived shape differs reshapes the backing to follow the body's natural
+		 * names — now also over a prior-explicit record. The runtime helper then
+		 * reconciles the table's current contents against the derived contents by
+		 * keyed diff (derived content wins). See
 		 * `runtime/emit/materialized-view-helpers.ts` attachMaintainedDerivation.
 		 */
 		type: 'setMaintained';
+		columns?: ReadonlyArray<string>;
 		select: AST.QueryExpr;
 		insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	}
@@ -184,7 +187,9 @@ export class AlterTableNode extends VoidNode {
 				return `ALTER TABLE DROP TAGS`;
 			}
 			case 'setMaintained':
-				return `ALTER TABLE SET MAINTAINED`;
+				return this.action.columns?.length
+					? `ALTER TABLE SET MAINTAINED (${this.action.columns.join(', ')})`
+					: `ALTER TABLE SET MAINTAINED`;
 			case 'dropMaintained':
 				return `ALTER TABLE DROP MAINTAINED`;
 		}

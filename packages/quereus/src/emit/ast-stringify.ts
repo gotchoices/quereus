@@ -1261,7 +1261,13 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 			return `alter table ${table} drop tags ${body}`;
 		}
 		case 'setMaintained': {
-			const parts = [`alter table ${table} set maintained as`, astToString(stmt.action.select)];
+			// `(cols)` rename list is emitted only when present (an explicit MV-sugar
+			// rename — the differ's lossless encoding); its absence is the implicit
+			// signal. Byte-identical to the bare `set maintained as` form otherwise.
+			const cols = stmt.action.columns?.length
+				? ` (${stmt.action.columns.map(quoteIdentifier).join(', ')})`
+				: '';
+			const parts = [`alter table ${table} set maintained${cols} as`, astToString(stmt.action.select)];
 			const defaultsStr = insertDefaultsClauseToString(stmt.action.insertDefaults);
 			if (defaultsStr) parts.push(defaultsStr);
 			return parts.join(' ');
