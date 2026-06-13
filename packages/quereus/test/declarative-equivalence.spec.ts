@@ -4670,6 +4670,52 @@ describe('declarative-equivalence: cross-schema foreign keys', () => {
 			await db.close();
 		}
 	});
+
+	it('changing one cross-schema parent to ANOTHER cross-schema parent is a body change', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			// Like-named parent `m` in TWO non-child schemas (s2 and main); child lives in s3.
+			// Both qualifiers genuinely differ from the child schema (s3), so neither elides —
+			// this isolates the qualifier as a compared *value* (s2 vs main), not present/absent.
+			await db.exec(`declare schema main {
+				table m { id INTEGER PRIMARY KEY }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema s2 {
+				table m { id INTEGER PRIMARY KEY }
+			}`);
+			await db.exec('apply schema s2');
+			await db.exec(`declare schema s3 {
+				table child {
+					id INTEGER PRIMARY KEY,
+					m_id INTEGER,
+					constraint fk_m foreign key (m_id) references s2.m(id)
+				}
+			}`);
+			await db.exec('apply schema s3');
+			expect(diffOf(db, 's3').tablesToAlter, 'unchanged cross→cross FK → no churn').to.deep.equal([]);
+
+			// Re-declare: SAME parent table name `m`, SAME present-ness of qualifier, but a
+			// DIFFERENT cross-schema parent (s2 → main). Two surviving-but-distinct qualifiers
+			// must compare unequal → drop+recreate.
+			await db.exec(`declare schema s3 {
+				table child {
+					id INTEGER PRIMARY KEY,
+					m_id INTEGER,
+					constraint fk_m foreign key (m_id) references main.m(id)
+				}
+			}`);
+			const diff = diffOf(db, 's3');
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter, 'child alter present for the cross→cross parent-schema change').to.not.be.undefined;
+			expect(childAlter!.constraintsToDrop ?? [], 'old FK dropped').to.deep.equal(['fk_m']);
+			expect((childAlter!.constraintsToAdd ?? []).length, 'new FK added (drop+recreate)').to.equal(1);
+			expect(((childAlter!.constraintsToAdd ?? [])[0] ?? '').toLowerCase(), 'recreated FK carries the NEW cross-schema qualifier').to.include('main.m');
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('declarative-equivalence: default_collation', () => {
