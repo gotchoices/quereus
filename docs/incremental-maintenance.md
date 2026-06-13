@@ -59,6 +59,19 @@ covering structure answers it.
 > All are gated by the maintenance-equivalence property harness
 > `test/incremental/maintenance-equivalence.spec.ts`.)
 >
+> **Parent-side referential enforcement.** For each backing change a maintenance pass
+> *removes or re-keys*, the manager also fires the shared parent-side FK engine
+> (`enforceParentSideReferentialActions` → `assertTransitiveRestrictsForParentMutation` then
+> `executeForeignKeyActionsAndLens`), so an FK declared on an *ordinary* table that references
+> the maintained table sees its declared RESTRICT / CASCADE / SET NULL / SET DEFAULT instead of
+> being silently orphaned. The per-change order mirrors the DML executor's
+> (capture → MV maintenance → FK actions) and the external-change seam: child-side derived-row
+> validation first, then parent-side actions, then the MV-over-MV cascade — at both the
+> bounded-delta site (`maintainRowTime`) and the full-rebuild flush (`flushDeferredRebuilds`,
+> inside the statement-atomicity savepoint). A surviving RESTRICT throws (attributed to the
+> maintained table) and rolls the **source** write back. See `docs/materialized-views.md`
+> § Parent-side referential enforcement.
+>
 > **The `'residual-recompute'` arm — the synchronous analogue of the assertion
 > residual path.** A single-source aggregate body (`select g1,…, agg(…) from T [where
 > P] group by g1,…` over **bare** group columns) is maintained by re-running a

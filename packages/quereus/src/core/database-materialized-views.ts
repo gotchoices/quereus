@@ -76,6 +76,7 @@ import {
 	type MaintenanceStrategy,
 } from '../planner/cost/index.js';
 import { resolveBackingHost, isBodyIrrelevantTableChange, tryRecompileMaterializedViewLive } from '../runtime/emit/materialized-view-helpers.js';
+import { assertTransitiveRestrictsForParentMutation, executeForeignKeyActionsAndLens } from '../runtime/foreign-key-actions.js';
 import { buildDerivedRowValidator, makePoisonedDerivedRowValidator, validateDerivedRowImage, type DerivedRowConstraintValidator } from './derived-row-validator.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
@@ -787,6 +788,12 @@ export class MaterializedViewManager {
 			if (plan.derivedRowValidator) {
 				await this.validateDerivedChanges(plan, plan.derivedRowValidator, backingChanges, cache);
 			}
+			// Parent-side referential enforcement: this maintenance delete/key-update of an
+			// `M` row may orphan rows in an ordinary table `C` whose FK references `M`. Fire
+			// the shared engine over the backing delta — RESTRICT-walk then declared actions —
+			// after `M`'s own image is validated, before the MV-over-MV cascade. Runs whether
+			// or not `M` has MV consumers (placed before the leaf fast-path).
+			await this.enforceParentSideReferentialActions(plan, backingChanges);
 			const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 			if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
 			this.assertCascadeDepth(depth + 1, backingBase);
@@ -847,6 +854,10 @@ export class MaterializedViewManager {
 				if (plan.derivedRowValidator) {
 					await this.validateDerivedChanges(plan, plan.derivedRowValidator, backingChanges, cache);
 				}
+				// Parent-side referential enforcement for the rebuild diff's deletes/key-updates,
+				// fired inside the statement-atomicity savepoint (the flush runs before its
+				// release) so a RESTRICT failure or cascade error unwinds the whole statement.
+				await this.enforceParentSideReferentialActions(plan, backingChanges);
 				const backingBase = `${plan.backingSchema}.${plan.backingTableName}`.toLowerCase();
 				if (!this.rowTimeBySource.has(backingBase)) continue; // leaf — no dependents
 				for (const bc of backingChanges) {
@@ -1041,6 +1052,59 @@ export class MaterializedViewManager {
 		for (const change of changes) {
 			if (change.op === 'delete') continue;
 			await validateDerivedRowImage(this.ctx as unknown as Database, validator, change.newRow, connectionId);
+		}
+	}
+
+	/**
+	 * Fire **parent-side** referential enforcement over the backing rows a maintenance
+	 * apply REMOVED or re-keyed (delete / key-update {@link BackingRowChange}s — an insert
+	 * has no parent-side action). When the maintained table `M` is the PARENT (FK target)
+	 * of an FK declared on an ordinary table `C` (`create table C (… references M(col) …)`),
+	 * a maintenance-driven delete/key-update of the referenced `M` row would silently orphan
+	 * `C`'s rows, bypassing the declared RESTRICT / referential action. This is the
+	 * **dual** of {@link validateDerivedChanges} (constraints declared *on* `M`); the FK here
+	 * lives on `C` and references `M`, so it is invisible to `M`'s own plan/validator.
+	 *
+	 * It reuses the SAME shared referential-action engine the DML executor and the
+	 * external-change ingestion seam use — no third copy — applying its two functions over
+	 * each backing change exactly as `database-external-changes.ts` does:
+	 *  - {@link assertTransitiveRestrictsForParentMutation} — pre-walk the transitive cascade
+	 *    closure and throw a CONSTRAINT error naming `M` on any surviving RESTRICT child;
+	 *  - {@link executeForeignKeyActionsAndLens} — run declared CASCADE / SET NULL / SET DEFAULT,
+	 *    re-entering the DML executor (the already-holding-the-mutex variant) for each cascaded
+	 *    child write, so `C`'s own constraints, watches, nested cascades, and (if `C` is itself
+	 *    an MV source) its own maintenance all fire.
+	 *
+	 * Ordering: called AFTER the backing delta has landed in the pending layer (the RESTRICT
+	 * walk runs POST-application — the child rows it keys off still exist because the cascade
+	 * has not run yet) and AFTER `M`'s own image is validated, matching the DML executor's
+	 * per-change order (capture → MV maintenance → FK actions) and the external-changes seam.
+	 * `lensRouted = false`: a maintenance backing write is a physical basis write (maintained
+	 * tables are not lens basis spines). A surviving RESTRICT throws up through
+	 * {@link maintainRowTime} → the DML executor → the statement, rolling back the source write
+	 * attributed to `M`.
+	 *
+	 * Gate: a cheap `foreign_keys`-pragma early-return keeps the pragma-off path free (the
+	 * engine also early-returns, but skipping the `getTable` + loop avoids all per-change work).
+	 * NOT gated on `plan.derivedRowValidator` — that gate is child-side (constraints *on* `M`);
+	 * an inbound FK lives on `C` and leaves `M`'s plan untouched. Beyond the gate it fires
+	 * unconditionally per delete/update change: the engine's `O(catalog)` referencing-FK scan
+	 * is the same cost an ordinary `delete from M` pays, so this is parity, not a new tax.
+	 */
+	private async enforceParentSideReferentialActions(
+		plan: MaintenancePlan,
+		changes: readonly BackingRowChange[],
+	): Promise<void> {
+		const db = this.ctx as unknown as Database;
+		if (!db.options.getBooleanOption('foreign_keys')) return; // cheap gate; engine early-returns too
+		// The backing `TableSchema` — same object validateDerivedChanges resolves; its `.name`
+		// equals `M`'s, so an FK on `C` (`references M`) matches the engine's referencing scan.
+		const parent = this.ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
+		if (!parent) return; // backing gone ⇒ MV already broken
+		for (const change of changes) {
+			if (change.op === 'insert') continue; // inserts have no parent-side actions
+			await assertTransitiveRestrictsForParentMutation(db, parent, change.op, change.oldRow, change.newRow);
+			await executeForeignKeyActionsAndLens(db, parent, change.op, change.oldRow, change.newRow);
 		}
 	}
 
