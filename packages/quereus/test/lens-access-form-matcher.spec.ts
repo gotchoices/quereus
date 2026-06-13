@@ -48,6 +48,7 @@ function fnCall(name: string, operands: ScalarPlanNode[]): ScalarFunctionCallNod
 	const schema: ScalarFunctionSchema = {
 		name, numArgs: operands.length, flags: FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC,
 		returnType: intType,
+		implementation: () => null,
 	};
 	const ast = { type: 'function', name, args: operands.map(o => (o as { expression: AST.Expression }).expression) } as AST.FunctionExpr;
 	return new ScalarFunctionCallNode(scope, ast, schema, operands);

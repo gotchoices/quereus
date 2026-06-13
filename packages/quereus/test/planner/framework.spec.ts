@@ -3,6 +3,7 @@ import { expect } from 'chai';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { PlanNode, type PhysicalProperties, type Attribute } from '../../src/planner/nodes/plan-node.js';
 import type { BaseType, ScalarType } from '../../src/common/datatype.js';
+import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
 import type { Scope } from '../../src/planner/scopes/scope.js';
 import type { OptContext } from '../../src/planner/framework/context.js';
 import { DEFAULT_TUNING, type OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
@@ -110,7 +111,7 @@ function scalarNode(opts: {
 } = {}): MockPlanNode {
 	return new MockPlanNode({
 		...opts,
-		type: { typeClass: 'scalar', logicalType: 'integer', nullable: false, isReadOnly: false } as ScalarType,
+		type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: false } as ScalarType,
 	});
 }
 
@@ -127,7 +128,6 @@ function makeContext(overrides: Partial<OptimizerTuning> = {}): OptContext {
 		stats: {} as any,
 		tuning,
 		phase: 'rewrite',
-		depth: 0,
 		context: new Map(),
 		diagnostics: {},
 		db: {} as any,

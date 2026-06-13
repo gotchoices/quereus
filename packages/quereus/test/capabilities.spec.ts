@@ -39,7 +39,6 @@ describe('Module Capabilities', () => {
 			columns: Object.freeze(columns),
 			columnIndexMap,
 			primaryKeyDefinition: Object.freeze(primaryKeyDefinition),
-			primaryKey: Object.freeze(primaryKey),
 			indexes: Object.freeze([]),
 			checkConstraints: Object.freeze([]),
 			vtabModule: module,

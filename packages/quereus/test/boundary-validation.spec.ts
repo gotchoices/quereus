@@ -134,14 +134,17 @@ describe('Boundary Validation', () => {
 		});
 
 		it('should reject invalid physicalType', () => {
+			// @ts-expect-error invalid PhysicalType (boundary test)
 			expect(() => db.registerType('TEST', { name: 'TEST', physicalType: 99 })).to.throw(MisuseError, /physicalType must be a valid/);
 		});
 
 		it('should reject non-integer physicalType', () => {
+			// @ts-expect-error invalid PhysicalType (boundary test)
 			expect(() => db.registerType('TEST', { name: 'TEST', physicalType: 1.5 })).to.throw(MisuseError, /physicalType must be a valid/);
 		});
 
 		it('should reject negative physicalType', () => {
+			// @ts-expect-error invalid PhysicalType (boundary test)
 			expect(() => db.registerType('TEST', { name: 'TEST', physicalType: -1 })).to.throw(MisuseError, /physicalType must be a valid/);
 		});
 	});

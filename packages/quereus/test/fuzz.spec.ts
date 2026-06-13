@@ -200,9 +200,9 @@ function buildSqlArbitraries(schema: SchemaInfo) {
 		).map(([l, op, r]) => `(${l} ${op} ${r})`),
 
 		unaryExpr: fc.oneof(
-			tie('expr').map((e: string) => `(- ${e})`),
-			tie('expr').map((e: string) => `(not ${e})`),
-			tie('expr').map((e: string) => `(+ ${e})`),
+			(tie('expr') as fc.Arbitrary<string>).map((e: string) => `(- ${e})`),
+			(tie('expr') as fc.Arbitrary<string>).map((e: string) => `(not ${e})`),
+			(tie('expr') as fc.Arbitrary<string>).map((e: string) => `(+ ${e})`),
 		),
 
 		funcCall: fc.oneof(
@@ -243,9 +243,9 @@ function buildSqlArbitraries(schema: SchemaInfo) {
 			tie('expr'), tie('expr'), tie('expr'),
 		).map(([e, lo, hi]) => `${e} between ${lo} and ${hi}`),
 
-		existsExpr: tie('subSelect').map((s: string) => `exists (${s})`),
+		existsExpr: (tie('subSelect') as fc.Arbitrary<string>).map((s: string) => `exists (${s})`),
 
-		subquery: tie('subSelect').map((s: string) => `(${s})`),
+		subquery: (tie('subSelect') as fc.Arbitrary<string>).map((s: string) => `(${s})`),
 
 		correlatedSubquery: tableNames.length >= 2
 			? fc.tuple(
@@ -299,7 +299,7 @@ function buildSqlArbitraries(schema: SchemaInfo) {
 
 		whereClause: fc.oneof(
 			fc.constant(''),
-			tie('expr').map((e: string) => `where ${e}`),
+			(tie('expr') as fc.Arbitrary<string>).map((e: string) => `where ${e}`),
 		),
 
 		orderByClause: fc.oneof(
@@ -328,7 +328,7 @@ function buildSqlArbitraries(schema: SchemaInfo) {
 
 		havingClause: fc.oneof(
 			fc.constant(''),
-			tie('expr').map((e: string) => `having ${e}`),
+			(tie('expr') as fc.Arbitrary<string>).map((e: string) => `having ${e}`),
 		),
 
 		fromClause: fc.oneof(
@@ -796,7 +796,8 @@ describe('Grammar-Based SQL Fuzzing', function () {
 											const prev = rows[i - 1].v;
 											const curr = rows[i].v;
 											if (typeof prev === typeof curr) {
-												if (prev > curr) {
+												// Same runtime typeof guaranteed by the guard; cast is type-only.
+												if ((prev as number) > (curr as number)) {
 													throw new Error(
 														`ORDER BY ASC violation: ${JSON.stringify(prev)} > ${JSON.stringify(curr)} in ${table.name}.${col.name}`
 													);

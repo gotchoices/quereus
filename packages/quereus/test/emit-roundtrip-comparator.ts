@@ -38,7 +38,6 @@
 import { expect } from 'chai';
 import { safeJsonStringify } from '../src/util/serialization.js';
 import { ConflictResolution } from '../src/common/constants.js';
-import type { AstNode } from '../src/parser/ast.js';
 
 /**
  * Defaults the parser sometimes fills in but the stringifier may omit.
@@ -382,7 +381,9 @@ export function astEquivalent(
  * Wraps `astEquivalent` so callers don't have to thread the empty path / parent
  * tags. Use this from spec files.
  */
-export function assertAstEquivalent(a: AstNode, b: AstNode, label?: string): void {
+// Accepts `unknown` (not just `AstNode`): the internal comparator walks any
+// structural value — including AST-bearing arrays like `ViewInsertDefault[]`.
+export function assertAstEquivalent(a: unknown, b: unknown, label?: string): void {
 	try {
 		astEquivalent(a, b, []);
 	} catch (e) {

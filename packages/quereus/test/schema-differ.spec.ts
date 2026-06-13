@@ -27,7 +27,7 @@ function catalogTable(name: string, pkColumn: string): CatalogTable {
 	return {
 		name,
 		ddl: '',
-		columns: [{ name: pkColumn, type: 'integer', notNull: true, primaryKey: true, defaultValue: null }],
+		columns: [{ name: pkColumn, type: 'integer', notNull: true, primaryKey: true, defaultValue: null, collation: 'BINARY' }],
 		primaryKey: [{ columnName: pkColumn, desc: false }],
 		referencedTables: [],
 		namedConstraints: [],
@@ -94,20 +94,34 @@ function catalogMaintainedTable(sql: string, columns: Array<{ name: string; prim
 	};
 }
 
+/** An all-empty {@link SchemaDiff}; spread it and override only the fields a
+ *  case exercises, so future required fields land in one place. */
+function makeEmptySchemaDiff(): SchemaDiff {
+	return {
+		tablesToCreate: [],
+		tablesToDrop: [],
+		tablesToAlter: [],
+		maintainedModuleMigrations: [],
+		viewsToCreate: [],
+		viewsToDrop: [],
+		indexesToCreate: [],
+		indexesToDrop: [],
+		assertionsToCreate: [],
+		assertionsToDrop: [],
+		viewTagsChanges: [],
+		indexTagsChanges: [],
+		renames: [],
+		lensToAttach: [],
+		lensToDetach: [],
+	};
+}
+
 describe('Schema Differ', () => {
 	describe('generateMigrationDDL identifier quoting', () => {
 		it('should quote reserved-word table names in DROP statements', () => {
 			const diff: SchemaDiff = {
-				tablesToCreate: [],
+				...makeEmptySchemaDiff(),
 				tablesToDrop: ['order', 'group'],
-				tablesToAlter: [],
-				viewsToCreate: [],
-				viewsToDrop: [],
-				indexesToCreate: [],
-				indexesToDrop: [],
-				assertionsToCreate: [],
-				assertionsToDrop: [],
-				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -118,16 +132,8 @@ describe('Schema Differ', () => {
 
 		it('should quote reserved-word view names in DROP statements', () => {
 			const diff: SchemaDiff = {
-				tablesToCreate: [],
-				tablesToDrop: [],
-				tablesToAlter: [],
-				viewsToCreate: [],
+				...makeEmptySchemaDiff(),
 				viewsToDrop: ['select'],
-				indexesToCreate: [],
-				indexesToDrop: [],
-				assertionsToCreate: [],
-				assertionsToDrop: [],
-				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -137,16 +143,8 @@ describe('Schema Differ', () => {
 
 		it('should quote reserved-word index names in DROP statements', () => {
 			const diff: SchemaDiff = {
-				tablesToCreate: [],
-				tablesToDrop: [],
-				tablesToAlter: [],
-				viewsToCreate: [],
-				viewsToDrop: [],
-				indexesToCreate: [],
+				...makeEmptySchemaDiff(),
 				indexesToDrop: ['index'],
-				assertionsToCreate: [],
-				assertionsToDrop: [],
-				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -156,8 +154,7 @@ describe('Schema Differ', () => {
 
 		it('should quote reserved-word table names in ALTER statements', () => {
 			const diff: SchemaDiff = {
-				tablesToCreate: [],
-				tablesToDrop: [],
+				...makeEmptySchemaDiff(),
 				tablesToAlter: [{
 					tableName: 'table',
 					columnsToAdd: ['col1 TEXT'],
@@ -165,13 +162,6 @@ describe('Schema Differ', () => {
 					columnsToAlter: [],
 					columnsToRename: [],
 				}],
-				viewsToCreate: [],
-				viewsToDrop: [],
-				indexesToCreate: [],
-				indexesToDrop: [],
-				assertionsToCreate: [],
-				assertionsToDrop: [],
-				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -182,16 +172,8 @@ describe('Schema Differ', () => {
 
 		it('should quote schema prefix when provided', () => {
 			const diff: SchemaDiff = {
-				tablesToCreate: [],
+				...makeEmptySchemaDiff(),
 				tablesToDrop: ['users'],
-				tablesToAlter: [],
-				viewsToCreate: [],
-				viewsToDrop: [],
-				indexesToCreate: [],
-				indexesToDrop: [],
-				assertionsToCreate: [],
-				assertionsToDrop: [],
-				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff, 'my schema');
 			expect(ddl).to.deep.equal([
@@ -201,16 +183,8 @@ describe('Schema Differ', () => {
 
 		it('should not quote valid non-keyword identifiers', () => {
 			const diff: SchemaDiff = {
-				tablesToCreate: [],
+				...makeEmptySchemaDiff(),
 				tablesToDrop: ['users'],
-				tablesToAlter: [],
-				viewsToCreate: [],
-				viewsToDrop: [],
-				indexesToCreate: [],
-				indexesToDrop: [],
-				assertionsToCreate: [],
-				assertionsToDrop: [],
-				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -220,16 +194,8 @@ describe('Schema Differ', () => {
 
 		it('should quote names with special characters', () => {
 			const diff: SchemaDiff = {
-				tablesToCreate: [],
+				...makeEmptySchemaDiff(),
 				tablesToDrop: ['my-table', 'has space'],
-				tablesToAlter: [],
-				viewsToCreate: [],
-				viewsToDrop: [],
-				indexesToCreate: [],
-				indexesToDrop: [],
-				assertionsToCreate: [],
-				assertionsToDrop: [],
-				renames: [],
 			};
 			const ddl = generateMigrationDDL(diff);
 			expect(ddl).to.deep.equal([
@@ -252,7 +218,7 @@ describe('Schema Differ', () => {
 					type: 'declaredTable',
 					tableStmt: {
 						type: 'createTable',
-						table: { name: 'items' },
+						table: { type: 'identifier', name: 'items' },
 						columns: [{ name: 'id', constraints: [] }],
 						constraints: [],
 						ifNotExists: false,

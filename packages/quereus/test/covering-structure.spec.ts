@@ -1474,7 +1474,7 @@ describe('internal-eviction reporting (secondary-UNIQUE REPLACE)', () => {
 		const dataEvents: DatabaseDataChangeEvent[] = [];
 		const unsub = db.onDataChange(e => dataEvents.push(e));
 		const watchEvents: WatchEvent[] = [];
-		const sub = db.watch(rowsWatch('p', 1), e => watchEvents.push(e));
+		const sub = db.watch(rowsWatch('p', 1), e => { watchEvents.push(e); });
 
 		await db.exec("insert or replace into p values (2, 'a@x')");
 		sub.unsubscribe();

@@ -16,7 +16,7 @@ export async function planRows(db: Database, sql: string): Promise<PlanRow[]> {
 	for await (const r of db.eval(
 		"SELECT id, parent_id, op, node_type, detail, object_name FROM query_plan(?)", [sql]
 	)) {
-		rows.push(r as PlanRow);
+		rows.push(r as unknown as PlanRow);
 	}
 	return rows;
 }

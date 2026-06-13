@@ -51,8 +51,11 @@ function catalogTable(
 			notNull: c.notNull ?? false,
 			primaryKey: c.primaryKey ?? false,
 			defaultValue: c.defaultValue ?? null,
+			collation: 'BINARY',
 		})),
 		primaryKey: primaryKey.map(pk => ({ columnName: pk.columnName, desc: pk.desc ?? false })),
+		referencedTables: [],
+		namedConstraints: [],
 	};
 }
 

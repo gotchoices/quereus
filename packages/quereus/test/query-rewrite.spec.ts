@@ -223,7 +223,7 @@ describe('query-rewrite matcher — gates (no-candidate)', () => {
 			const mv = db.schemaManager.getMaintainedTable('main', 'recent')!;
 			const stubAst = { ...(mv.derivation.selectAst as object), where: undefined, columns: [
 				{ type: 'column', expr: { type: 'function', name: 'random', args: [] } },
-			] } as typeof mv.derivation.selectAst;
+			] } as unknown as typeof mv.derivation.selectAst;
 			const stub = { ...mv, derivation: { ...mv.derivation, selectAst: stubAst } };
 			const frag = analyzeQueryFragment(pristineFragment(db, 'select customer_id, amt from sales where amt > 0'));
 			expect(frag.ok).to.be.true;

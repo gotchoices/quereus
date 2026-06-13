@@ -531,7 +531,7 @@ describe('Schema Catalog', () => {
 						select: {
 							type: 'select',
 							columns: [{ type: 'all' }],
-							from: { type: 'table', table: { type: 'identifier', name: 'users' } },
+							from: [{ type: 'table', table: { type: 'identifier', name: 'users' } }],
 						},
 					},
 				}],
@@ -765,7 +765,7 @@ describe('Schema Hasher', () => {
 					select: {
 						type: 'select',
 						columns: [{ type: 'all' }],
-						from: { type: 'table', table: { type: 'identifier', name: 't1' } },
+						from: [{ type: 'table', table: { type: 'identifier', name: 't1' } }],
 					},
 				},
 			}],
@@ -783,7 +783,7 @@ describe('Schema Hasher', () => {
 					select: {
 						type: 'select',
 						columns: [{ type: 'all' }],
-						from: { type: 'table', table: { type: 'identifier', name: 't1' } },
+						from: [{ type: 'table', table: { type: 'identifier', name: 't1' } }],
 					},
 					tags: { api: 'v2' },
 				},

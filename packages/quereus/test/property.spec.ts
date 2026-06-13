@@ -1459,7 +1459,7 @@ describe('Property-Based Tests', () => {
 					const checksArb: fc.Arbitrary<Array<{ name: string; sql: string }>> =
 						checkableCol
 							? fc.option(
-								checkExprArb(checkableCol.name, checkableCol.type).map((sql, idx) => [{ name: `chk_${idx}`, sql }]),
+								checkExprArb(checkableCol.name, checkableCol.type).map((sql: string) => [{ name: 'chk_0', sql }]),
 								{ nil: [] as Array<{ name: string; sql: string }> },
 							)
 							: fc.constant([] as Array<{ name: string; sql: string }>);

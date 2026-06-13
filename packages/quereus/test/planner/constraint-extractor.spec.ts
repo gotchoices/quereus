@@ -953,7 +953,7 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 		// and singleton-IN-correlated bindings are skipped uniformly.
 		it('correlated singleton IN (correlated: true) does NOT cover', () => {
 			const c = makeConstraint('IN', 0);
-			c.value = [undefined];
+			c.value = [null];
 			c.bindingKind = 'mixed';
 			c.correlated = true;
 			const result = computeCoveredKeysForConstraints([c], [[0]]);

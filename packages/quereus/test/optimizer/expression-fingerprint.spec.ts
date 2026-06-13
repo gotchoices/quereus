@@ -42,7 +42,7 @@ function makeFunctionSchema(name: string, deterministic: boolean): ScalarFunctio
 	return {
 		name,
 		numArgs: -1,
-		flags: deterministic ? FunctionFlags.DETERMINISTIC : 0,
+		flags: FunctionFlags.UTF8 | (deterministic ? FunctionFlags.DETERMINISTIC : 0),
 		returnType: textType,
 		implementation: () => null,
 	};
