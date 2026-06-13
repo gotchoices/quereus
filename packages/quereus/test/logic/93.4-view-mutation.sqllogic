@@ -1148,6 +1148,63 @@ update uq22_v set cval = (
 select cid, cval from uq22_c order by cid;
 → [{"cid":1,"cval":1},{"cid":2,"cval":70}]
 
+-- (uq-23) CAPTURE READ-BACK owning-PK collision (cross-source `set`): the value subquery's
+-- FROM (`uq23_t`) has a `cid` column colliding with the owning side's PK. The partner read of
+-- `pv` (off side `p`) lowers to a correlated read of the `__vmupd_keys` capture, NESTED inside
+-- that user subquery; its owning-PK operand must correlate `cid` to the lowered per-side UPDATE
+-- target (uq23_c, cid=2) via the synthesised `__vm_self` alias — not re-bind to `uq23_t.cid`
+-- (=99, matching no capture row → NULL read-back → wrong/NULL result). For cid=2 (joined pv=200):
+-- max(x) where x < 200 = max(50,150) = 150; cid=1 untouched.
+create table uq23_p (pid integer primary key, pv integer);
+create table uq23_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq23_p(pid));
+create table uq23_t (tid integer primary key, x integer, cid integer);  -- `cid` collides
+insert into uq23_p values (10, 100), (20, 200);
+insert into uq23_c values (1, 10, 1), (2, 20, 2);
+insert into uq23_t values (1, 50, 99), (2, 150, 99), (3, 250, 99);      -- cid=99 ≠ any target cid
+create view uq23_v as
+    select c.cid as cid, cval, pv from uq23_c c join uq23_p p on p.pid = c.pref;
+update uq23_v set cval = (select max(x) from uq23_t where x < pv) where cid = 2;
+select cid, cval from uq23_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":150}]
+
+-- (uq-24) OWNING STRIP-TO-BARE collision: a RENAMED owning column (`c.realval as cval`) read
+-- inside a same-side value subquery whose FROM (`uq24_t`) has the BASE column name `realval`.
+-- The view name `cval` is not a `uq24_t` column, so the descent substitutes it to owning
+-- `c.realval`; the qualifier strip must yield `__vm_self.realval` (correlating to the target
+-- row uq24_c, realval=7) — not bare `realval`, which would re-bind to `uq24_t.realval` (=999).
+-- For cid=2: max(x) where x < 7 = max(3,6) = 6; cid=1 untouched.
+create table uq24_p (pid integer primary key, pv integer);
+create table uq24_c (cid integer primary key, pref integer, realval integer,
+    foreign key (pref) references uq24_p(pid));
+create table uq24_t (tid integer primary key, x integer, realval integer);  -- base name `realval` collides
+insert into uq24_p values (10, 100), (20, 200);
+insert into uq24_c values (1, 10, 5), (2, 20, 7);
+insert into uq24_t values (1, 3, 999), (2, 6, 999), (3, 9, 999);
+create view uq24_v as
+    select c.cid as cid, c.realval as cval, pv from uq24_c c join uq24_p p on p.pid = c.pref;
+update uq24_v set cval = (select max(x) from uq24_t where x < cval) where cid = 2;
+select cid, realval from uq24_c order by cid;
+→ [{"cid":1,"realval":5},{"cid":2,"realval":6}]
+
+-- (uq-25) COMPOSITE owning-PK variant of uq-23: a two-column owning PK (c1, c2), so the capture
+-- read-back conjoins TWO equalities — each right operand must carry `__vm_self` (else c1/c2
+-- re-bind to the colliding uq25_t.c1/c2 = 99). For (c1=2,c2=2) (joined pv=200): max(x) where
+-- x < 200 = max(50,150) = 150; (c1=1,c2=1) untouched.
+create table uq25_p (pid integer primary key, pv integer);
+create table uq25_c (c1 integer, c2 integer, pref integer, cval integer,
+    primary key (c1, c2),
+    foreign key (pref) references uq25_p(pid));
+create table uq25_t (tid integer primary key, x integer, c1 integer, c2 integer);  -- c1,c2 collide
+insert into uq25_p values (10, 100), (20, 200);
+insert into uq25_c values (1, 1, 10, 1), (2, 2, 20, 2);
+insert into uq25_t values (1, 50, 99, 99), (2, 150, 99, 99), (3, 250, 99, 99);
+create view uq25_v as
+    select c.c1 as c1, c.c2 as c2, cval, pv from uq25_c c join uq25_p p on p.pid = c.pref;
+update uq25_v set cval = (select max(x) from uq25_t where x < pv) where c1 = 2 and c2 = 2;
+select c1, c2, cval from uq25_c order by c1;
+→ [{"c1":1,"c2":1,"cval":1},{"c1":2,"c2":2,"cval":150}]
+
 -- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
 -- order the base deletes FK-child before FK-parent. The canonical columnar split has each
 -- member's PK reference the anchor's (axd_b, axd_c -> axd_a); deleting the parent first

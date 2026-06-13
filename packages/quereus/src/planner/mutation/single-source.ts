@@ -85,8 +85,18 @@ export interface MutableViewLike {
  * (view-over-view / MV-over-MV / view-over-MV are all rejected by `analyzeView`, and a
  * user subquery is a plain SELECT that never re-lowers), so a single module-level
  * constant suffices: two `__vm_self`-aliased targets can never be in scope at once.
+ *
+ * The **multi-source** per-side lowered UPDATE (`multi-source.ts`) reuses this same
+ * constant: each per-side op is a flat single-table base UPDATE, planned independently
+ * through this same base builder and never co-scoped or nested with another lowered
+ * target, so the same "at most one `__vm_self` in scope" invariant holds. The per-side
+ * UPDATE carries `alias: SELF_ALIAS`, and its capture read-back owning-PK operands and
+ * owning-side strip-to-bare refs are qualified with it, so a correlation reference
+ * emitted inside a user value subquery binds the target row rather than re-binding to a
+ * same-named column in the subquery's own FROM (the multi-source analog of the
+ * single-source qualification below).
  */
-const SELF_ALIAS = '__vm_self';
+export const SELF_ALIAS = '__vm_self';
 
 /** A base column pinned to a constant by the view's selection predicate. */
 interface FilterConstant {

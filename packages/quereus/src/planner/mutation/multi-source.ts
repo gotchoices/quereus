@@ -17,7 +17,7 @@ import { FilterNode } from '../nodes/filter.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
+import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn, SELF_ALIAS } from './single-source.js';
 import { transformExpr, cloneExpr, mapQueryExprUniform, substituteNewRefs, transformScopedExpr, transformAliasScopedExpr, type ScopeContext } from './scope-transform.js';
 import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 
@@ -1510,7 +1510,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// existing partner, that partner's PK matches all N capture rows, so a bare scalar
 			// read would error `Scalar subquery returned more than one row` — `min` collapses
 			// the shared-partner group to one value (a no-op for a constant / np-only SET).
-			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min') });
+			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min', SELF_ALIAS) });
 			// Null-extended rows: accumulate the (column, captured value) for this side's
 			// single materialization insert, built after the loop.
 			let list = nullExtendedBySide.get(out.sideIndex);
@@ -1665,6 +1665,12 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		const statement: AST.UpdateStmt = {
 			type: 'update',
 			table: tableIdentifier(side.schema),
+			// Synthesised collision-proof correlation name on the lowered per-side target
+			// (mirrors the single-source spine): the base builder registers it as the
+			// target's AliasedScope alias, so a `__vm_self.col` operand emitted by the
+			// capture read-back / owning-strip qualifications above binds the outer target
+			// row regardless of a user value subquery's own FROM.
+			alias: SELF_ALIAS,
 			assignments,
 			where,
 			contextValues: stmt.contextValues,
@@ -2565,7 +2571,10 @@ function stripSideQualifier(
 		gateCrossSourceCardinality?.(col);
 		const srcAlias = registerCrossSource(col);
 		owningPk ??= requireKeyColumns(view, owning);
-		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk);
+		// Qualify the owning-PK operands with the per-side UPDATE's collision-proof alias so
+		// the read-back correlates to the target row even when this subquery nests inside a
+		// user value subquery whose FROM has a same-named column (the bug-1 site).
+		return capturedValueSubquery(srcAlias, owningSideIndex, owningPk, undefined, SELF_ALIAS);
 	};
 	// QUALIFIED-only substitution: an owning-alias ref strips to bare; a partner-alias ref
 	// routes through the capture; a BARE ref is left untouched (only ever a user-authored
@@ -2584,7 +2593,10 @@ function stripSideQualifier(
 		if (!col.table) return undefined;
 		const t = col.table.toLowerCase();
 		if (aliasShadow.has(t)) return undefined;
-		if (owningQuals.has(t)) return { type: 'column', name: col.name };
+		// Qualify the stripped owning ref with the per-side UPDATE's collision-proof alias
+		// rather than emitting a bare column: a bare base-name ref nested in a user value
+		// subquery whose FROM carries that base name would re-bind locally (the bug-2 site).
+		if (owningQuals.has(t)) return { type: 'column', name: col.name, table: SELF_ALIAS };
 		if (otherQuals.has(t)) return routePartnerRead(col);
 		return undefined;
 	};
@@ -2607,13 +2619,22 @@ function stripSideQualifier(
  * value that genuinely differs per preserved row it resolves the ambiguity deterministically
  * rather than erroring at runtime. The cross-source `set` callers leave it off (their gate
  * already proves at-most-one partner), keeping the bare-column form byte-identical.
+ *
+ * `correlationAlias` qualifies each owning-PK right operand (`<pk_j>` → `<alias>.<pk_j>`).
+ * When this read-back nests inside a user value subquery whose own FROM introduces a
+ * column named like the owning PK, a **bare** `<pk_j>` would re-bind to that inner column
+ * by innermost-scope SQL rules (keying the read-back on the wrong value); qualifying it with
+ * the lowered per-side UPDATE's collision-proof alias ({@link SELF_ALIAS}) binds the outer
+ * target row instead. The multi-source per-side callers pass `SELF_ALIAS`; `decomposition.ts`
+ * and any caller that omits it keep the bare form (byte-identical — composite keys still
+ * qualify every conjunct only when supplied).
  */
-export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[], dedupAggregate?: string): AST.Expression {
+export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[], dedupAggregate?: string, correlationAlias?: string): AST.Expression {
 	const conds = owningPk.map((pk, j): AST.Expression => ({
 		type: 'binary',
 		operator: '=',
 		left: { type: 'column', name: keyColumnName(owningSideIndex, j), table: 'k' },
-		right: { type: 'column', name: pk },
+		right: correlationAlias ? { type: 'column', name: pk, table: correlationAlias } : { type: 'column', name: pk },
 	}));
 	const colRef: AST.ColumnExpr = { type: 'column', name: srcAlias, table: 'k' };
 	const projection: AST.Expression = dedupAggregate
