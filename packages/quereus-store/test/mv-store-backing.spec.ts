@@ -417,6 +417,106 @@ describe('materialized views `using store` (end-to-end)', () => {
 		});
 	});
 
+	describe('constraint-bearing refresh re-validation', () => {
+		// Store analogue of `quereus/test/maintained-table-refresh-revalidation.spec.ts`'s
+		// `stale fast-path` blocks, pinning `rebuildBacking`'s CONSTRAINT-BEARING branch
+		// (`applyMaintenance('replace-all')` → `validateDeclaredConstraintsOverContents`
+		// → `conn.commit()`) on the STORE backing host specifically. The memory spec only
+		// reaches that branch on memory backings, and the MV-sugar store cases above never
+		// declare a constraint (so they take the validation-free `replaceContents` fast
+		// path). Here `src` and the TABLE-FORM maintained table `mt` are both `using store`,
+		// so the bulk validation scan must read the store connection's PENDING `replace-all`
+		// writes (reads-own-writes) to catch a drifted violator BEFORE the commit — the
+		// untested variable vs. the store-tested attach core is the trigger (refresh vs.
+		// attach), not the host machinery.
+		//
+		// Flow mirrors the memory spec: (1) seed a clean row (row-time maintained into mt);
+		// (2) a body-relevant source add (`alter table src add column pad`) marks mt stale
+		// and detaches its row-time plan, so step (3) is NOT maintained in; (3) drift a
+		// violator into the now-unmaintained source; (4) `refresh` and assert the
+		// maintained-table-attributed diagnostic + intact COMMITTED store contents + stays
+		// stale (a clean drift instead commits + clears stale).
+		const isStale = (name: string): boolean =>
+			db.schemaManager.getMaintainedTable('main', name)!.derivation.stale === true;
+
+		describe('CHECK violator on the store backing', () => {
+			beforeEach(async () => {
+				await db.exec('create table src (id integer primary key, v text not null) using store');
+				await db.exec(`create table mt (id integer primary key, v text not null, check (v <> 'poison'))
+					using store maintained as select id, v from src`);
+				await db.exec(`insert into src values (1, 'clean')`);
+				await db.exec('alter table src add column pad integer null'); // stale + plan detached
+				expect(isStale('mt'), 'add column marked mt stale').to.equal(true);
+			});
+
+			it('a CHECK-violating drift throws the attribution and leaves the committed store contents intact + stale', async () => {
+				await db.exec(`insert into src (id, v) values (2, 'poison')`); // drift, unmaintained
+				expect(await rows(db, 'select id, v from mt order by id'), 'drift not maintained in')
+					.to.deep.equal([{ id: 1, v: 'clean' }]);
+
+				await expectThrows(() => db.exec('refresh materialized view mt'),
+					/row derived into maintained table 'main\.mt'/);
+
+				// The rejected pending `replace-all` was discarded by statement-level rollback,
+				// NOT committed to the store: re-reading mt returns the COMMITTED seed row, and
+				// mt stays stale so the next read re-validates rather than serving the rejected set.
+				expect(await rows(db, 'select id, v from mt order by id')).to.deep.equal([{ id: 1, v: 'clean' }]);
+				expect(isStale('mt'), 'mt stays stale after a rejected refresh').to.equal(true);
+			});
+
+			it('a clean drift commits to the store backing and clears stale', async () => {
+				await db.exec(`insert into src (id, v) values (2, 'fresh')`);
+				await db.exec('refresh materialized view mt');
+				expect(await rows(db, 'select id, v from mt order by id'))
+					.to.deep.equal([{ id: 1, v: 'clean' }, { id: 2, v: 'fresh' }]);
+				expect(isStale('mt'), 'a conforming refresh clears stale').to.equal(false);
+			});
+		});
+
+		describe('child-side FK orphan on the store backing (FK enforcement on)', () => {
+			beforeEach(async () => {
+				// parent is store-backed too (the FK anti-join is a plain SQL query, so the
+				// backing under test stays the store backing regardless).
+				await db.exec('create table parent (pid integer primary key) using store');
+				await db.exec('create table src (id integer primary key, ref integer null) using store');
+				await db.exec(`create table mt (id integer primary key, ref integer null references parent(pid))
+					using store maintained as select id, ref from src`);
+				await db.exec('insert into parent values (1)');
+				await db.exec('insert into src values (1, 1)');
+				expect(await rows(db, 'select id, ref from mt')).to.deep.equal([{ id: 1, ref: 1 }]);
+				await db.exec('alter table src add column pad integer null'); // stale + plan detached
+				expect(isStale('mt'), 'add column marked mt stale').to.equal(true);
+			});
+
+			it('an FK-orphan drift throws the FK attribution and leaves the committed store contents intact + stale', async () => {
+				await db.exec('insert into src (id, ref) values (2, 99)'); // parent 99 absent, unmaintained
+				await expectThrows(() => db.exec('refresh materialized view mt'),
+					/references a missing 'main\.parent'/);
+				expect(await rows(db, 'select id, ref from mt order by id')).to.deep.equal([{ id: 1, ref: 1 }]);
+				expect(isStale('mt'), 'mt stays stale after a rejected refresh').to.equal(true);
+			});
+
+			it('an orphan-drift with a matching parent commits and clears stale', async () => {
+				await db.exec('insert into parent values (2)');
+				await db.exec('insert into src (id, ref) values (2, 2)');
+				await db.exec('refresh materialized view mt');
+				expect(await rows(db, 'select id, ref from mt order by id'))
+					.to.deep.equal([{ id: 1, ref: 1 }, { id: 2, ref: 2 }]);
+				expect(isStale('mt'), 'a conforming refresh clears stale').to.equal(false);
+			});
+		});
+
+		// Duplicate-derived-key reject is deliberately NOT re-pinned here: the set gate
+		// (`assertRefreshRowsAreSet`) runs at the ENGINE level BEFORE `host.applyMaintenance`,
+		// so it exercises nothing store-host-specific (no pending `replace-all` write
+		// reached yet). It is already owned by the memory spec's `duplicate-key reject
+		// parity` block engine-wide, and the store create-fill collision is pinned at
+		// `using store(...) args: PK key collation` above (the NOCASE-PK set-gate case).
+		// A fully-store source also collapses the case-variant keys on `src`'s OWN store PK
+		// (store-default NOCASE keying), so the collision would throw at the source insert,
+		// not the refresh — further proof the case is not about the store backing branch.
+	});
+
 	it('drop materialized view destroys the store backing and removes both catalog entries', async () => {
 		await db.exec('create table src (id integer primary key, v integer) using store');
 		await db.exec('insert into src values (1, 10)');
