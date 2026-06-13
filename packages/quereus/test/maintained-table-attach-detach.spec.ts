@@ -5,6 +5,8 @@ import { isMaintainedTable } from '../src/schema/derivation.js';
 import type { MaintainedTableSchema } from '../src/schema/derivation.js';
 import { generateMaintainedTableDDL } from '../src/schema/ddl-generator.js';
 import type { SchemaChangeEvent } from '../src/schema/change-events.js';
+import { parse } from '../src/parser/index.js';
+import { astToString } from '../src/emit/ast-stringify.js';
 
 /**
  * Attach/detach verb pins that sqllogic cannot express — the diff-fidelity and
@@ -781,6 +783,52 @@ describe('Maintained-table attach/detach verbs', () => {
 			await db.exec(`create table mv7 (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
 			await db.exec(`alter table mv7 set maintained (a, c) as select id, x from src`);
 			expect(maintained('mv7').derivation.columns).to.deep.equal(['a', 'c']);
+
+			// Directly exercise the ast-stringify `(cols)` branch (alterTableToString):
+			// the differ does not yet emit the list, so no apply-path test covers it.
+			// Render the explicit verb and confirm it round-trips through reparse;
+			// the bare form stays byte-identical (no parenthesized list).
+			const explicit = astToString(parse('alter table mv7 set maintained (a, c) as select id, x from src'));
+			expect(explicit, 'renders the (cols) rename list').to.match(/set maintained \(\s*"?a"?\s*,\s*"?c"?\s*\) as/i);
+			expect(astToString(parse(explicit)), 're-stringify is stable').to.equal(explicit);
+
+			const bare = astToString(parse('alter table mv7 set maintained as select id, x from src'));
+			expect(bare, 'bare form carries no column list').to.not.match(/set maintained \(/i);
+		});
+
+		it('an explicit rename whose body ALSO changes a column type keeps the strict shape error', async () => {
+			// The explicit path only reshapes a pure NAME drift; an attribute (type)
+			// delta produces a real shape mismatch that `positionalRename` routes to the
+			// strict throw — the backing is NOT silently retyped under the rename.
+			await db.exec(`create table mv8 (a integer primary key, b text not null) maintained (a, b) as select id, x from src`);
+			let message = '';
+			try {
+				// `(a, c)` renames b→c, but the body's second output is now INTEGER (id),
+				// while the table column is TEXT.
+				await db.exec(`alter table mv8 set maintained (a, c) as select id, id from src`);
+			} catch (e) { message = (e as Error).message; }
+			expect(message, 'type delta on the explicit path is the strict error').to.match(/derives type|integer|text/i);
+			const after = maintained('mv8');
+			expect(after.columns.map(c => c.name), 'untouched').to.deep.equal(['a', 'b']);
+			expect(after.derivation.columns, 'still (a, b)').to.deep.equal(['a', 'b']);
+		});
+
+		it('an explicit rename-list attach to a PLAIN table renames its columns to the list', async () => {
+			// The explicit-name-drift reshape also covers a fresh attach over a plain
+			// table whose columns differ from the list: c→a, d→b, then the plain rows
+			// reconcile against the derived content (derived wins).
+			await db.exec(`
+				create table plain8 (c integer primary key, d text not null);
+				insert into plain8 values (9, 'stale'), (1, 'wrong');
+			`);
+			await db.exec(`alter table plain8 set maintained (a, b) as select id, x from src`);
+			const after = maintained('plain8');
+			expect(after.columns.map(c => c.name), 'plain columns renamed to the list').to.deep.equal(['a', 'b']);
+			expect(after.derivation.columns, 'recorded explicit (a, b)').to.deep.equal(['a', 'b']);
+			expect(after.derivation.stale).to.equal(false);
+			expect(await readAll('select a, b from plain8 order by a'), 'reconciled to the derived content').to.deep.equal([
+				{ a: 1, b: 'a' }, { a: 2, b: 'b' }, { a: 3, b: 'c' },
+			]);
 		});
 	});
 });
