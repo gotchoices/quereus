@@ -87,6 +87,7 @@ import { compareSqlValues, rowsValueIdentical } from '../util/comparison.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import type { Database } from './database.js';
+import type { DatabaseEventEmitter, MaintenanceCollisionEvent } from './database-events.js';
 import type * as AST from '../parser/ast.js';
 
 const log = createLogger('core:materialized-views');
@@ -103,6 +104,12 @@ const DEFAULT_SOURCE_ROWS = 1000;
 export interface MaterializedViewManagerContext {
 	readonly schemaManager: SchemaManager;
 	readonly optimizer: Database['optimizer'];
+
+	/** Database event emitter — the row-time collision telemetry channel
+	 *  ({@link MaterializedViewManager.detectAndReportCoarseningCollisions}) queues
+	 *  {@link MaintenanceCollisionEvent}s here. Already exposed for the transaction
+	 *  manager; reused narrowly. */
+	getEventEmitter(): DatabaseEventEmitter;
 
 	_buildPlan(statements: AST.Statement[]): import('./database.js').BuildPlanResult;
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
@@ -177,6 +184,27 @@ export type BackingProjector =
 	| { readonly kind: 'expr'; readonly eval: (sourceRow: Row) => SqlValue };
 
 /**
+ * One **weakened** column of a coarsened backing key K′, precomputed once at
+ * registration for the row-time collision telemetry
+ * ({@link MaterializedViewManager.detectAndReportCoarseningCollisions}). Carries the
+ * backing column index to read from each {@link BackingRowChange} image, the
+ * **source** (pre-coarsening, stricter) collation the divergence test compares
+ * under, the **output** (coarsened) collation the backing key enforces, and the
+ * column name for the {@link MaintenanceCollisionEvent} payload. Derived from
+ * `mv.derivation.coarsenedKey.weakened` (column names) via `mv.columnIndexMap`.
+ */
+interface CoarseningWatchColumn {
+	/** Backing column index (= body output column index) the weakened K′ column lands at. */
+	readonly index: number;
+	/** Source key enforcement collation (pre-coarsening); the divergence test compares under it. */
+	readonly sourceCollation: string;
+	/** Output (coarsened) collation the backing key enforces. */
+	readonly outputCollation: string;
+	/** Backing/output column name (for the event payload's `weakenedColumns`). */
+	readonly column: string;
+}
+
+/**
  * Common identity + cost-gate fields shared by every {@link MaintenancePlan} arm.
  * `chosenStrategy` / `sourceStats` are set once by the create-time cost gate
  * ({@link MaterializedViewManager.buildMaintenancePlan}, via `selectMaintenanceStrategy`)
@@ -202,6 +230,15 @@ interface MaintenancePlanCommon {
 	 *  ({@link MaterializedViewManager.registerMaterializedView}); applied to each
 	 *  insert/update {@link BackingRowChange} before the cascade. */
 	derivedRowValidator?: DerivedRowConstraintValidator;
+	/** Precomputed weakened-K′-column watch list for row-time collision telemetry —
+	 *  present ONLY when `mv.derivation.coarsenedKey` is stamped (the zero-overhead
+	 *  gate: a provable-key / refining-lineage-key MV carries `undefined` and pays
+	 *  nothing per write — detection short-circuits on this field). Built once at
+	 *  registration ({@link MaterializedViewManager.registerMaterializedView} →
+	 *  {@link MaterializedViewManager.buildCoarseningWatch}); read by
+	 *  {@link MaterializedViewManager.detectAndReportCoarseningCollisions} from both
+	 *  the bounded-delta and full-rebuild maintenance arms. */
+	coarseningWatch?: ReadonlyArray<CoarseningWatchColumn>;
 }
 
 export interface InverseProjectionPlan extends MaintenancePlanCommon {
@@ -652,6 +689,11 @@ export class MaterializedViewManager {
 		// that cannot compile (e.g. a non-deterministic CHECK without the pragma)
 		// errors cleanly at create time.
 		plan.derivedRowValidator = buildDerivedRowValidator(this.ctx as unknown as Database, mv);
+		// Precompute the weakened-K′-column watch for row-time collision telemetry.
+		// `undefined` unless this MV carries a coarsened backing key — the zero-overhead
+		// gate that keeps a non-coarsened MV's maintenance path untouched (see
+		// {@link detectAndReportCoarseningCollisions}).
+		plan.coarseningWatch = this.buildCoarseningWatch(mv);
 		this.rowTime.set(key, plan);
 		// Index the plan under every source base it reads. Single-source arms index
 		// under `sourceBase` only; the 1:1-join arm also indexes under the lookup base
@@ -707,6 +749,98 @@ export class MaterializedViewManager {
 				set.delete(key);
 				if (set.size === 0) this.rowTimeBySource.delete(base);
 			}
+		}
+	}
+
+	/* ──────────────────── coarsening collision telemetry ──────────────────── */
+
+	/**
+	 * Precompute the weakened-K′-column watch list for row-time collision telemetry —
+	 * one entry per coarsening column of the MV's coarsened backing key. Returns
+	 * `undefined` (the zero-overhead gate) unless `mv.derivation.coarsenedKey` is
+	 * stamped with ≥1 weakened column: a provable-key or refining-lineage-key MV builds
+	 * no watch, so {@link detectAndReportCoarseningCollisions} short-circuits and the
+	 * maintenance path is untouched. Each weakened column name resolves to its backing
+	 * column index via `mv.columnIndexMap` (the maintained table IS the backing table),
+	 * carrying the source → output collations the divergence test needs.
+	 */
+	private buildCoarseningWatch(mv: MaintainedTableSchema): ReadonlyArray<CoarseningWatchColumn> | undefined {
+		const coarsened = mv.derivation.coarsenedKey;
+		if (!coarsened || coarsened.weakened.length === 0) return undefined;
+		const watch: CoarseningWatchColumn[] = [];
+		for (const w of coarsened.weakened) {
+			const index = mv.columnIndexMap.get(w.column.toLowerCase());
+			// Defensive: a weakened name that does not resolve to a backing column would
+			// be a derivation/stamp inconsistency — skip it rather than mis-key the read.
+			if (index === undefined) {
+				log("Coarsening watch: weakened column '%s' not found on backing %s.%s; skipping",
+					w.column, mv.schemaName, mv.name);
+				continue;
+			}
+			watch.push({
+				index,
+				sourceCollation: w.sourceCollation,
+				outputCollation: w.outputCollation,
+				column: w.column,
+			});
+		}
+		return watch.length > 0 ? watch : undefined;
+	}
+
+	/**
+	 * Observe-only row-time collision telemetry: scan the **realized**
+	 * {@link BackingRowChange}s a maintenance apply produced and queue a
+	 * {@link MaintenanceCollisionEvent} for each one that is a key-coarsening collision —
+	 * an `update` whose replaced backing row came from a **distinct source identity**
+	 * than the incoming row's, merged under the coarsened backing key K′ (last-writer-win).
+	 *
+	 * **Zero-overhead gate.** Returns immediately unless `plan.coarseningWatch` is present
+	 * (only a coarsened-key MV builds one). A non-coarsened MV never scans `backingChanges`.
+	 *
+	 * **Criterion.** For each `'update'` change, a weakened K′ column is *diverged* when its
+	 * old/new backing values differ under the **source** (pre-coarsening, stricter) collation.
+	 * An `update` here means the incoming row landed on an existing backing row sharing K′
+	 * under the **output** collation (that is what made the upsert replacing, not inserting);
+	 * if those rows are equal under the source collation it is the same source row's value
+	 * being updated (e.g. an `email` change — not reported), and if they differ under the
+	 * source collation two distinct source identities (`'Bob'`/`'bob'`) collapsed onto one
+	 * backing key (reported). `insert`/`delete` changes are never collisions (new key / removal).
+	 *
+	 * Runs **independently** of the cascade — it neither consumes nor reorders the
+	 * `backingChanges` routed onward (observe-only), so an MV-over-MV chain is unperturbed.
+	 * The queued event rides the emitter's transaction batching, so a collision inside a
+	 * rolled-back transaction reports nothing and does not increment the counter.
+	 */
+	private detectAndReportCoarseningCollisions(
+		plan: MaintenancePlan,
+		backingChanges: readonly BackingRowChange[],
+	): void {
+		const watch = plan.coarseningWatch;
+		if (!watch) return;
+		const coarsened = plan.mv.derivation.coarsenedKey;
+		if (!coarsened) return; // defensive — a watch implies a stamped coarsenedKey
+		// K′ key column indices (ALL key columns, in key order) for the event payload's `key`.
+		// Resolved once for the whole batch; collisions are rare so this is off the hot path.
+		const keyIndices = coarsened.columns.map(name => plan.mv.columnIndexMap.get(name.toLowerCase()) ?? -1);
+		const emitter = this.ctx.getEventEmitter();
+		for (const change of backingChanges) {
+			if (change.op !== 'update') continue;
+			const weakenedColumns: string[] = [];
+			for (const w of watch) {
+				if (compareSqlValues(change.oldRow[w.index], change.newRow[w.index], w.sourceCollation) !== 0) {
+					weakenedColumns.push(w.column);
+				}
+			}
+			if (weakenedColumns.length === 0) continue;
+			const event: MaintenanceCollisionEvent = {
+				schemaName: plan.backingSchema,
+				tableName: plan.backingTableName,
+				key: keyIndices.map(i => change.newRow[i]),
+				weakenedColumns,
+				oldRow: change.oldRow,
+				newRow: change.newRow,
+			};
+			emitter.queueCollision(event);
 		}
 	}
 
@@ -780,6 +914,11 @@ export class MaterializedViewManager {
 			}
 			const backingChanges = await this.applyMaintenancePlan(plan, change, changedBase, cache);
 			if (backingChanges.length === 0) continue;
+			// Row-time coarsening collision telemetry: observe-only over the realized
+			// delta (gated on `coarseningWatch` — a no-op for a non-coarsened MV). Runs
+			// independently of the cascade below; it neither consumes nor reorders the
+			// backing changes routed onward.
+			this.detectAndReportCoarseningCollisions(plan, backingChanges);
 			// Declared CHECK / child-side FK over the rows this delta wrote — BEFORE
 			// cascading, so a consumer never consumes an invalid producer row. Every
 			// row already in the backing was validated when it entered (the bulk
@@ -847,6 +986,10 @@ export class MaterializedViewManager {
 				if (!plan || plan.kind !== 'full-rebuild') continue;
 				const backingChanges = await this.applyFullRebuild(plan, cache);
 				if (backingChanges.length === 0) continue;
+				// Coarsening collision telemetry over the rebuild diff — the full-rebuild
+				// floor's collation-keyed `replace-all` realizes the same LWW merge as the
+				// bounded-delta arms (observe-only; gated on `coarseningWatch`).
+				this.detectAndReportCoarseningCollisions(plan, backingChanges);
 				// Validate the rebuild diff's written images at the flush boundary —
 				// the full-rebuild analogue of the per-row validation in
 				// {@link maintainRowTime} (deferred-rebuild semantics preserved: a bulk

@@ -45,6 +45,7 @@ export { DefaultVTableEventEmitter } from './vtab/events.js';
 export type {
 	DatabaseDataChangeEvent,
 	DatabaseSchemaChangeEvent,
+	MaintenanceCollisionEvent,
 	DataChangeSubscriptionOptions,
 	SchemaChangeSubscriptionOptions,
 } from './core/database-events.js';

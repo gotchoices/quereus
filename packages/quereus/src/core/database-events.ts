@@ -68,8 +68,43 @@ export interface DatabaseSchemaChangeEvent {
 	remote: boolean;
 }
 
+/**
+ * Materialized-view key-coarsening **collision** event emitted at the database
+ * level — the operational complement to the create-time key-coarsening warning
+ * (`docs/materialized-views.md` § Coarsened backing keys). Fired from row-time
+ * maintenance whenever an upsert under the coarsened backing key K′ replaces a
+ * backing row whose **source identity differs** from the incoming row's — i.e.
+ * two distinct source-key tuples (`'Bob'` / `'bob'`) merged into one derived row
+ * under K′'s coarsened (output) collation, last-writer-win (`docs/migration.md`
+ * § Convergence hazards). One event per realized colliding merge, delivered on
+ * the commit that realized it (it rides the same transaction batching the
+ * data/schema channels use, so a collision inside a rolled-back transaction
+ * reports nothing).
+ */
+export interface MaintenanceCollisionEvent {
+	/** Schema name of the maintained (backing) table. */
+	schemaName: string;
+	/** Maintained (backing) table name. */
+	tableName: string;
+	/** The coarsened backing key K′ values (from the incoming/new row), in key order. */
+	key: SqlValue[];
+	/** Names of the weakened K′ column(s) whose values diverged under the source
+	 *  (pre-coarsening, stricter) collation — the columns whose coarsening realized
+	 *  the merge. */
+	weakenedColumns: string[];
+	/** The replaced backing row (the losing source identity's prior image). */
+	oldRow: Row;
+	/** The incoming backing row that won the merge (the new image). */
+	newRow: Row;
+	/** Reserved: true when the colliding write arrived via the external-change
+	 *  ingest seam (peer) rather than local DML. Not threaded through maintenance
+	 *  in v1 (see the ticket's Out of scope) — left unset. */
+	remote?: boolean;
+}
+
 export type DatabaseDataChangeListener = (event: DatabaseDataChangeEvent) => void;
 export type DatabaseSchemaChangeListener = (event: DatabaseSchemaChangeEvent) => void;
+export type MaintenanceCollisionListener = (event: MaintenanceCollisionEvent) => void;
 
 /**
  * Options for subscribing to data change events.
@@ -132,15 +167,28 @@ const DEFAULT_MAX_LISTENERS = 100;
 export class DatabaseEventEmitter {
 	private dataListeners = new Set<DatabaseDataChangeListener>();
 	private schemaListeners = new Set<DatabaseSchemaChangeListener>();
+	private collisionListeners = new Set<MaintenanceCollisionListener>();
 	private maxListeners = DEFAULT_MAX_LISTENERS;
 
 	/** Batched events waiting for commit (base transaction level) */
 	private batchedDataEvents: PendingDataEvent[] = [];
 	private batchedSchemaEvents: PendingSchemaEvent[] = [];
+	private batchedCollisionEvents: MaintenanceCollisionEvent[] = [];
 
 	/** Savepoint layers for event batching - each layer captures events since that savepoint */
 	private dataEventLayers: PendingDataEvent[][] = [];
 	private schemaEventLayers: PendingSchemaEvent[][] = [];
+	private collisionEventLayers: MaintenanceCollisionEvent[][] = [];
+
+	/**
+	 * Cumulative count of COMMITTED key-coarsening collisions, keyed by lowercased
+	 * qualified `schema.table` of the maintained table. Incremented in
+	 * {@link flushBatch} as each batched collision is emitted (or immediately on the
+	 * non-batching path) — so the count reflects only collisions that actually
+	 * committed, consistent with event delivery, and survives a host that never
+	 * subscribed an `onMaintenanceCollision` listener.
+	 */
+	private collisionCounts = new Map<string, number>();
 
 	/** Whether we're currently in a transaction (batching mode) */
 	private isBatching = false;
@@ -214,6 +262,40 @@ export class DatabaseEventEmitter {
 	 */
 	hasSchemaListeners(): boolean {
 		return this.schemaListeners.size > 0;
+	}
+
+	/**
+	 * Subscribe to materialized-view key-coarsening collision events
+	 * ({@link MaintenanceCollisionEvent}). Events share the data/schema channels'
+	 * transaction-batching discipline — delivered after the commit that realized
+	 * the merge, dropped on rollback.
+	 * @param listener Callback invoked for each committed collision
+	 * @returns Unsubscribe function
+	 */
+	onMaintenanceCollision(listener: MaintenanceCollisionListener): () => void {
+		this.collisionListeners.add(listener);
+		this.checkListenerCount('collision', this.collisionListeners.size);
+		log('Added maintenance-collision listener, total: %d', this.collisionListeners.size);
+		return () => {
+			this.collisionListeners.delete(listener);
+			log('Removed maintenance-collision listener, total: %d', this.collisionListeners.size);
+		};
+	}
+
+	/**
+	 * Check if there are any maintenance-collision listeners registered.
+	 */
+	hasCollisionListeners(): boolean {
+		return this.collisionListeners.size > 0;
+	}
+
+	/**
+	 * Read-only snapshot of the cumulative committed-collision counter, keyed by
+	 * lowercased qualified `schema.table`. A fresh copy each call, so the caller
+	 * cannot mutate the live counter.
+	 */
+	getMaterializedViewCollisionStats(): ReadonlyMap<string, number> {
+		return new Map(this.collisionCounts);
 	}
 
 	/**
@@ -297,6 +379,15 @@ export class DatabaseEventEmitter {
 	}
 
 	/**
+	 * Get the active collision event store (top savepoint layer or base).
+	 */
+	private getActiveCollisionStore(): MaintenanceCollisionEvent[] {
+		return this.collisionEventLayers.length > 0
+			? this.collisionEventLayers[this.collisionEventLayers.length - 1]
+			: this.batchedCollisionEvents;
+	}
+
+	/**
 	 * Handle a data change event from a module.
 	 * If batching, queue the event; otherwise emit immediately.
 	 */
@@ -351,6 +442,47 @@ export class DatabaseEventEmitter {
 			this.getActiveSchemaStore().push({ moduleName, event });
 		} else {
 			this.emitSchemaEvent(moduleName, event);
+		}
+	}
+
+	/**
+	 * Queue a materialized-view key-coarsening collision for delivery. If batching
+	 * (inside a transaction/savepoint), the event is captured in the active store
+	 * and emitted only on commit (dropped on rollback); otherwise it is emitted —
+	 * and counted — immediately. Mirrors {@link emitAutoDataEvent}.
+	 */
+	queueCollision(event: MaintenanceCollisionEvent): void {
+		if (this.isBatching) {
+			this.getActiveCollisionStore().push(event);
+			log('Batched maintenance-collision event on %s.%s', event.schemaName, event.tableName);
+		} else {
+			this.emitCollisionEvent(event);
+		}
+	}
+
+	/**
+	 * Count and emit one collision event. The cumulative committed-collision
+	 * counter is incremented FIRST (always — even with no listeners, so the count
+	 * survives a host that never subscribed), then the event is delivered to each
+	 * listener. A throwing listener is isolated so it cannot break emission to the
+	 * others or the commit (mirrors {@link emitDataEvent}).
+	 */
+	private emitCollisionEvent(event: MaintenanceCollisionEvent): void {
+		const counterKey = `${event.schemaName}.${event.tableName}`.toLowerCase();
+		this.collisionCounts.set(counterKey, (this.collisionCounts.get(counterKey) ?? 0) + 1);
+
+		if (this.collisionListeners.size === 0) return;
+
+		log('Emitting maintenance-collision event on %s.%s (weakened: %s)',
+			event.schemaName, event.tableName, event.weakenedColumns.join(', '));
+
+		for (const listener of this.collisionListeners) {
+			try {
+				listener(event);
+			} catch (e) {
+				errorLog('Maintenance-collision listener error on %s.%s: %O',
+					event.schemaName, event.tableName, e);
+			}
 		}
 	}
 
@@ -423,8 +555,10 @@ export class DatabaseEventEmitter {
 		this.isBatching = true;
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
+		this.collisionEventLayers = [];
 		log('Started event batching');
 	}
 
@@ -446,13 +580,21 @@ export class DatabaseEventEmitter {
 			allSchemaEvents.push(...layer);
 		}
 
+		const allCollisionEvents: MaintenanceCollisionEvent[] = [...this.batchedCollisionEvents];
+		for (const layer of this.collisionEventLayers) {
+			allCollisionEvents.push(...layer);
+		}
+
 		// Clear all
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
+		this.collisionEventLayers = [];
 
-		log('Flushing %d data events and %d schema events', allDataEvents.length, allSchemaEvents.length);
+		log('Flushing %d data events, %d schema events, and %d collision events',
+			allDataEvents.length, allSchemaEvents.length, allCollisionEvents.length);
 
 		// Emit schema events first (table creation before data insertion makes logical sense)
 		for (const { moduleName, event } of allSchemaEvents) {
@@ -463,6 +605,12 @@ export class DatabaseEventEmitter {
 		for (const { moduleName, event } of allDataEvents) {
 			this.emitDataEvent(moduleName, event);
 		}
+
+		// Then count + emit collision events (each increments the cumulative counter,
+		// so the count reflects only committed collisions).
+		for (const event of allCollisionEvents) {
+			this.emitCollisionEvent(event);
+		}
 	}
 
 	/**
@@ -472,11 +620,15 @@ export class DatabaseEventEmitter {
 		this.isBatching = false;
 		const discardedData = this.batchedDataEvents.length + this.dataEventLayers.reduce((sum, layer) => sum + layer.length, 0);
 		const discardedSchema = this.batchedSchemaEvents.length + this.schemaEventLayers.reduce((sum, layer) => sum + layer.length, 0);
+		const discardedCollision = this.batchedCollisionEvents.length + this.collisionEventLayers.reduce((sum, layer) => sum + layer.length, 0);
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
-		log('Discarded %d data events and %d schema events', discardedData, discardedSchema);
+		this.collisionEventLayers = [];
+		log('Discarded %d data events, %d schema events, and %d collision events',
+			discardedData, discardedSchema, discardedCollision);
 	}
 
 	/**
@@ -486,6 +638,7 @@ export class DatabaseEventEmitter {
 	beginSavepointLayer(): void {
 		this.dataEventLayers.push([]);
 		this.schemaEventLayers.push([]);
+		this.collisionEventLayers.push([]);
 		log('Started savepoint event layer (depth: %d)', this.dataEventLayers.length);
 	}
 
@@ -496,8 +649,9 @@ export class DatabaseEventEmitter {
 	rollbackSavepointLayer(): void {
 		const discardedData = this.dataEventLayers.pop();
 		const discardedSchema = this.schemaEventLayers.pop();
-		log('Rolled back savepoint event layer, discarded %d data and %d schema events',
-			discardedData?.length ?? 0, discardedSchema?.length ?? 0);
+		const discardedCollision = this.collisionEventLayers.pop();
+		log('Rolled back savepoint event layer, discarded %d data, %d schema, and %d collision events',
+			discardedData?.length ?? 0, discardedSchema?.length ?? 0, discardedCollision?.length ?? 0);
 	}
 
 	/**
@@ -523,8 +677,16 @@ export class DatabaseEventEmitter {
 			targetSchema.push(...topSchema);
 		}
 
-		log('Released savepoint event layer, merged %d data and %d schema events',
-			topData?.length ?? 0, topSchema?.length ?? 0);
+		const topCollision = this.collisionEventLayers.pop();
+		if (topCollision && topCollision.length > 0) {
+			const targetCollision = this.collisionEventLayers.length > 0
+				? this.collisionEventLayers[this.collisionEventLayers.length - 1]
+				: this.batchedCollisionEvents;
+			targetCollision.push(...topCollision);
+		}
+
+		log('Released savepoint event layer, merged %d data, %d schema, and %d collision events',
+			topData?.length ?? 0, topSchema?.length ?? 0, topCollision?.length ?? 0);
 	}
 
 	/**
@@ -535,20 +697,25 @@ export class DatabaseEventEmitter {
 	removeAllListeners(): void {
 		const dataCount = this.dataListeners.size;
 		const schemaCount = this.schemaListeners.size;
+		const collisionCount = this.collisionListeners.size;
 
-		if (dataCount > 0 || schemaCount > 0) {
+		if (dataCount > 0 || schemaCount > 0 || collisionCount > 0) {
 			warnLog(
-				'removeAllListeners() called with %d data and %d schema listeners still registered — possible listener leak',
-				dataCount, schemaCount
+				'removeAllListeners() called with %d data, %d schema, and %d collision listeners still registered — possible listener leak',
+				dataCount, schemaCount, collisionCount
 			);
 		}
 
 		this.dataListeners.clear();
 		this.schemaListeners.clear();
+		this.collisionListeners.clear();
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
+		this.batchedCollisionEvents = [];
 		this.dataEventLayers = [];
 		this.schemaEventLayers = [];
+		this.collisionEventLayers = [];
+		this.collisionCounts.clear();
 		this.isBatching = false;
 
 		// Unhook all module emitters

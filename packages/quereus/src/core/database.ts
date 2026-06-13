@@ -50,6 +50,7 @@ import {
 	DatabaseEventEmitter,
 	type DatabaseDataChangeEvent,
 	type DatabaseSchemaChangeEvent,
+	type MaintenanceCollisionEvent,
 	type DataChangeSubscriptionOptions,
 	type SchemaChangeSubscriptionOptions,
 } from './database-events.js';
@@ -785,6 +786,42 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 */
 	hasSchemaListeners(): boolean {
 		return this.eventEmitter.hasSchemaListeners();
+	}
+
+	/**
+	 * Subscribe to materialized-view key-coarsening **collision** events — the
+	 * operational complement to the create-time key-coarsening warning. A
+	 * {@link MaintenanceCollisionEvent} fires whenever row-time maintenance
+	 * LWW-merges two distinct source-key tuples under one coarsened backing key K′
+	 * (`docs/materialized-views.md` § Coarsened backing keys). Events share the
+	 * transaction-batching discipline of the data/schema channels — delivered after
+	 * the commit that realized the merge, dropped on rollback.
+	 *
+	 * @param listener Callback invoked for each committed collision
+	 * @returns Unsubscribe function
+	 *
+	 * @example
+	 * ```typescript
+	 * const off = db.onMaintenanceCollision((e) => {
+	 *   console.warn(`coarsening collision on ${e.schemaName}.${e.tableName} ` +
+	 *     `at key ${JSON.stringify(e.key)} (columns: ${e.weakenedColumns.join(', ')})`);
+	 * });
+	 * ```
+	 */
+	onMaintenanceCollision(listener: (event: MaintenanceCollisionEvent) => void): () => void {
+		this.checkOpen();
+		return this.eventEmitter.onMaintenanceCollision(listener);
+	}
+
+	/**
+	 * Read-only snapshot of the cumulative committed key-coarsening collision
+	 * counter, keyed by lowercased qualified `schema.table` of the maintained
+	 * table. Reflects only collisions that committed (consistent with event
+	 * delivery) and is maintained whether or not a listener was ever subscribed.
+	 */
+	getMaterializedViewCollisionStats(): ReadonlyMap<string, number> {
+		this.checkOpen();
+		return this.eventEmitter.getMaterializedViewCollisionStats();
 	}
 
 	/**
