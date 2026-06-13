@@ -405,3 +405,32 @@ select id from mv18b order by id;
 drop materialized view mv18b;
 drop materialized view mv18a;
 drop table b18;
+
+-- ===================================
+-- 18. Content gate reaches a NESTED relation: the altered column is read ONLY
+--     inside a correlated subquery (neither projected nor in a top-level WHERE).
+--     The read-set walk must recurse through `getRelations` into the subquery to
+--     see the correlated reference — otherwise the MV would be wrongly kept live
+--     (unsound: serving the pre-ALTER row set). Mirror of case 14 for nesting
+--     rather than a self-join.
+-- ===================================
+
+create table t19 (id integer primary key, u integer not null, v integer not null);
+create table keys19 (k integer primary key);
+insert into t19 values (1, 10, 5), (2, 20, 6);
+insert into keys19 values (5);
+create materialized view mv19 as select id, u from t19 where exists (select 1 from keys19 where keys19.k = t19.v);
+select * from mv19 order by id;
+→ [{"id":1,"u":10}]
+
+alter table t19 alter column v set data type real;
+
+-- frozen: t19.v is read only via the correlated reference inside the EXISTS subquery,
+-- reached through the read-set walk's recursion into nested relations ⇒ disjointness fails
+insert into t19 (id, u, v) values (3, 30, 5);
+select * from mv19 order by id;
+→ [{"id":1,"u":10}]
+
+drop materialized view mv19;
+drop table keys19;
+drop table t19;
