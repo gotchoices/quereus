@@ -378,3 +378,26 @@ refresh materialized view mvn;
 
 drop materialized view mvn;
 drop table n;
+
+-- ===================================
+-- 14. ADD UNIQUE that subsumes the existing compound backing key:
+--     keysOf's first key shrinks (compound {a,b} → single {a}) but the old
+--     backing PK {a,b} is still a superkey → MV stays live.
+-- ===================================
+
+create table t14 (id integer primary key, a text not null, b text not null,
+                  constraint uq_ab unique (a, b));
+-- id is not projected; only compound key {a,b} is the backing PK
+insert into t14 values (1, 'x', 'p');
+create materialized view mv14 as select a, b from t14;
+
+alter table t14 add constraint uq_a unique (a);
+-- keysOf now returns {0} (a alone) as the first key — {a,b} is subsumed
+-- superkey check: {0} ⊆ {0,1} → backing PK still valid → stay live
+
+insert into t14 values (2, 'y', 'q');
+select * from mv14 order by a;
+→ [{"a":"x","b":"p"},{"a":"y","b":"q"}]
+
+drop materialized view mv14;
+drop table t14;

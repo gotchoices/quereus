@@ -71,6 +71,12 @@ export interface BackingShape {
 	 *  lineage key does not coarsen, or when no key was derivable at all (the
 	 *  all-columns fallback; such a body is rejected at registration). */
 	coarsenedKey?: CoarsenedKeyInfo;
+	/** All minimal candidate keys proved by `keysOf` for the body root, as sorted
+	 *  column-index arrays. Present only when `keysOf` returned at least one key
+	 *  (i.e., not the coarsened-lineage or all-columns path). Used by
+	 *  `tryRecompileMaterializedViewLive` to check if the existing backing PK is
+	 *  still a superkey after a body-irrelevant constraint change. */
+	allProvedKeys?: ReadonlyArray<ReadonlyArray<number>>;
 }
 
 /**
@@ -180,6 +186,7 @@ function deriveBackingShapeUnguarded(
 		ordering: ordering && ordering.length > 0 ? ordering : undefined,
 		sourceTables: collectSourceTables(plan),
 		coarsenedKey,
+		allProvedKeys: keys.length > 0 ? keys.map(k => Array.from(k)) : undefined,
 	};
 }
 
@@ -1545,6 +1552,32 @@ export function isBodyIrrelevantTableChange(oldObject: TableSchema, newObject: T
 	return samePrimaryKeyDefinition(oldObject, newObject);
 }
 
+/** Structural (name-blind) column-only check: count + per-column type/not-null/collation,
+ *  WITHOUT comparing the physical PK. Used by the superkey relaxation in
+ *  `tryRecompileMaterializedViewLive` to gate the PK-changing case where column
+ *  attributes are otherwise identical. */
+function backingColumnsStructurallyMatch(current: TableSchema, shape: BackingShape): boolean {
+	if (current.columns.length !== shape.columns.length) return false;
+	for (let i = 0; i < shape.columns.length; i++) {
+		const a = current.columns[i];
+		const b = shape.columns[i];
+		if (!backingTypeMatches(a, b)) return false;
+		if (!backingNotNullMatches(a, b)) return false;
+		if (!backingCollationMatches(a, b)) return false;
+	}
+	return true;
+}
+
+/** Returns true when the live backing's physical PK column set is a superkey of the
+ *  re-planned body — i.e., some proved minimal key from `shape.allProvedKeys` is
+ *  entirely contained in the backing PK's column set.  Returns false when
+ *  `allProvedKeys` is absent (coarsened-lineage or all-columns path). */
+function isBackingPkASuperkeyInShape(current: TableSchema, shape: BackingShape): boolean {
+	if (!shape.allProvedKeys) return false;
+	const backingPkCols = new Set(current.primaryKeyDefinition.map(pk => pk.index));
+	return shape.allProvedKeys.some(k => k.every(idx => backingPkCols.has(idx)));
+}
+
 /**
  * Recompile a LIVE materialized view's row-time plan in place after a
  * body-irrelevant source change ({@link isBodyIrrelevantTableChange}), gated by
@@ -1567,16 +1600,15 @@ export function isBodyIrrelevantTableChange(oldObject: TableSchema, newObject: T
  *     the set); a constraint change can let `ruleFilterContradiction` fold a
  *     source out of the plan entirely (shrinking it). Either way the record is
  *     out of sync with the body's plan — leave it to REFRESH, which re-derives.
- *  3. `describeBackingShapeMismatch`: strict positional columns + exact
- *     physical-PK equality against the live backing. This is what forces
- *     staleness when a dropped UNIQUE backed the recorded backing PK — `keysOf`
- *     no longer proves the recorded key, the derived PK shifts (lineage /
- *     all-columns fallback) → mismatch. It also catches CHECK-driven output
- *     nullability/type narrowing the optimizer may have inferred. Known
- *     acceptable conservatism: an ADD CONSTRAINT UNIQUE that reorders `keysOf`'s
- *     first proved key fails the strict equality → stale fallback (no worse
- *     than today; a follow-up could relax to "recorded backing PK is a superkey
- *     of some proved key").
+ *  3. `backingColumnsStructurallyMatch` + `isBackingPkASuperkeyInShape`: the column
+ *     structural attributes (type / not-null / collation) must match positionally,
+ *     AND the live backing's physical PK column set must be a superkey of the
+ *     re-planned body (some proved minimal key ⊆ backing PK columns). This forces
+ *     staleness when a dropped UNIQUE un-proves the recorded backing key (`keysOf`
+ *     falls back to a smaller key or all-columns → no proved key ⊆ old PK). An
+ *     ADD CONSTRAINT UNIQUE that subsumes the compound key passes: the new minimal
+ *     key is a subset of the old compound backing PK. Re-registers with the
+ *     EXISTING backing (PK unchanged) — the better key is adopted only by REFRESH.
  *  4. `registerMaterializedView` re-runs arm selection / eligibility / cost
  *     gating (`buildMaintenancePlan`) against the new catalog and throws on the
  *     create-time gates (non-determinism, bag/no-key floor, full-rebuild
@@ -1602,9 +1634,19 @@ export function tryRecompileMaterializedViewLive(db: Database, mv: MaintainedTab
 		const backing = isMaintainedTable(live) ? live : mv;
 		const mismatch = describeBackingShapeMismatch(backing, shape);
 		if (mismatch) {
-			log('Marking materialized view %s.%s stale instead of recompiling: backing shape mismatch (%s) — REFRESH rebuilds it',
+			// Relaxed superkey gate: columns match structurally AND the existing backing
+			// PK column set is still a superkey of the re-planned body (some proved
+			// minimal key is ⊆ the backing PK's column set). Covers ADD CONSTRAINT UNIQUE
+			// that subsumes the compound key — keysOf now returns a smaller key first,
+			// changing the physical PK shape, but the old backing PK is still uniquely
+			// identifying. Re-register with the EXISTING backing (unchanged PK).
+			if (!backingColumnsStructurallyMatch(backing, shape) || !isBackingPkASuperkeyInShape(backing, shape)) {
+				log('Marking materialized view %s.%s stale instead of recompiling: backing shape mismatch (%s) — REFRESH rebuilds it',
+					mv.schemaName, mv.name, mismatch);
+				return false;
+			}
+			log('Recompiling materialized view %s.%s with existing backing PK (superkey check passed): %s',
 				mv.schemaName, mv.name, mismatch);
-			return false;
 		}
 		db.registerMaterializedView(backing);
 		log('Recompiled materialized view %s.%s in place after a body-irrelevant source change',
