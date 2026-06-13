@@ -1374,12 +1374,16 @@ export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): P
 	// `recollate` op runs post-reconcile in reshapeBackingInPlace, AFTER this commit.
 	// So a CHECK whose truth flips under a recollate-during-reshape (e.g. `v <> 'abc'`
 	// with v recollated BINARY → NOCASE over a row 'ABC') passes here and is then
-	// recollated into a violating state. Not closed: this commit is load-bearing
-	// (commit-first parity + the post-reconcile ops scan committed contents), and the
-	// attach reshape path uses the identical ordering. See docs/materialized-views.md
-	// § REFRESH MATERIALIZED VIEW "Known limitation — collation-sensitive CHECK" and
+	// recollated into a violating state. The same class of corner applies to a
+	// `retype` op (it shares this `postReconcileOps` batch): a CHECK whose truth flips
+	// under the column's NEW affinity (e.g. `v < '9'` retyped TEXT → INTEGER over a
+	// row '10' — lexicographic-true then numeric-false) passes here and is retyped into
+	// violation. Not closed: this commit is load-bearing (commit-first parity + the
+	// post-reconcile ops scan committed contents), and the attach reshape path uses the
+	// identical ordering. See docs/materialized-views.md § REFRESH MATERIALIZED VIEW
+	// "Known limitation — collation-sensitive CHECK" / "… type-sensitive CHECK" and
 	// maintained-table-refresh-revalidation.spec.ts § "reshape arm: collation-
-	// sensitive CHECK".
+	// sensitive CHECK" / "reshape arm: type-sensitive CHECK".
 	await validateDeclaredConstraintsOverContents(db, backing);
 	await conn.commit();
 }
@@ -2047,8 +2051,11 @@ async function reshapeBackingInPlace(
 	// NOTE: a `recollate` here applies AFTER step 3's rebuildBacking has already
 	// validated + committed the rows under the OLD collation — so a collation-
 	// sensitive declared CHECK whose truth flips under this recollate is not caught
-	// by that scan (documented limitation; see the note in rebuildBacking's
-	// constraint-bearing branch and docs/materialized-views.md).
+	// by that scan. A `retype` in this same batch is the affinity analog: a CHECK
+	// whose truth flips under the column's NEW logical type (e.g. `v < '9'` retyped
+	// TEXT → INTEGER) is likewise validated under the OLD type and missed (documented
+	// limitation; see the note in rebuildBacking's constraint-bearing branch and
+	// docs/materialized-views.md).
 	for (const op of plan.postReconcileOps) {
 		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
 		live = { ...current, derivation: mv.derivation };

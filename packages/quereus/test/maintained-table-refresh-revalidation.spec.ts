@@ -374,6 +374,137 @@ describe('Maintained-table refresh re-validation', () => {
 		});
 	});
 
+	describe('reshape arm: type-sensitive CHECK (documented limitation)', () => {
+		// Sibling of the collation corner above — the type-affinity-sensitive analog.
+		// `reshapeBackingInPlace` sequences:
+		//   3. rebuildBacking → validateDeclaredConstraintsOverContents (validates + COMMITS)
+		//   4. post-reconcile RETYPE (`set data type`, a `postReconcileOps` op — same batch
+		//      the recollate above rides in)
+		// The step-3 declared-CHECK scan resolves comparison **affinity** from the column's
+		// declared logical type, and runs while the catalog column still carries the OLD type
+		// (the `retype` op applies AFTER this commit). So a CHECK whose truth FLIPS under the
+		// affinity change passes validation, commits, and is then retyped into a violating
+		// state. This engine's `set data type` is **metadata-only** — it validates
+		// convertibility but does NOT rewrite the stored value — so the flip is driven by the
+		// column's affinity, not by any value rewrite (a physical convert would scrub the value
+		// at scan time and close the corner). Commit-first ordering and attach-path parity
+		// block a clean fix, exactly as for the recollate sibling. See docs/materialized-views.md
+		// § REFRESH MATERIALIZED VIEW "Known limitation — type-sensitive CHECK on the reshape arm".
+
+		/** The live backing logical type of column `v` — TEXT before the reshape's
+		 *  post-reconcile retype runs, INTEGER after. The flip is the observable proof the
+		 *  refresh took the RESHAPE arm with a `retype` op (the fast path would leave the
+		 *  type untouched). Paralleling `vCollation` in the recollate block above. */
+		function vType(name: string): string {
+			const col = db.schemaManager.getMaintainedTable('main', name)!.columns.find(c => c.name === 'v');
+			return col!.logicalType.name.toUpperCase();
+		}
+
+		it('the core corner: a retype-during-reshape commits a row that violates its CHECK under the FINAL type', async () => {
+			await db.exec(`
+				create table src (id integer primary key, v text);
+				create table mt (id integer primary key, v text, check (v < '9'))
+					maintained as select * from src;
+				insert into src values (1, '10');
+			`);
+			// Clean under TEXT: lexicographic '10' < '9' is true ('1' < '9'), so create-fill admits it.
+			expect(vType('mt'), 'v starts TEXT').to.equal('TEXT');
+
+			// A source `set data type` is body-relevant (the `select *` output type shifts) ⇒ mt
+			// goes stale and its row-time plan detaches, so the row is not re-validated until refresh.
+			await db.exec(`alter table src alter column v set data type integer`);
+			expect(isStale('mt'), 'set data type marked mt stale').to.equal(true);
+			// The catalog still carries the OLD logical type until the reshape's post-reconcile retype.
+			expect(vType('mt'), 'catalog v still TEXT pre-refresh').to.equal('TEXT');
+
+			// LIMITATION. Refresh takes the reshape arm: step-3 rebuildBacking validates `v < '9'`
+			// under the PRE-retype TEXT affinity, where lexicographic '10' < '9' is true → the scan
+			// PASSES and COMMITS; step-4 then retypes v to INTEGER. Under INTEGER affinity the
+			// comparison is numeric 10 < 9 = false, so the committed row now violates its own CHECK
+			// — but the pre-retype scan never resolved the comparison under INTEGER. The refresh
+			// SUCCEEDS and the violating row survives. (This is the corner being pinned; it is NOT
+			// the behavior we would want if the limitation were closed.)
+			await db.exec('refresh materialized view mt');
+			expect(vType('mt'), 'v retyped to INTEGER ⇒ reshape arm + retype ran').to.equal('INTEGER');
+			// Metadata-only retype: the stored value is NOT rewritten (typeof stays 'text'). This is
+			// the crux that makes the flip affinity-driven rather than value-driven — a physical
+			// convert would scrub '10' at scan time and the scan would catch it (the corner would
+			// close itself). Pinned so that regression is visible here.
+			expect(await readAll(`select v, typeof(v) as t from mt`),
+				'value rides as the body produced it; only the column logical type flipped')
+				.to.deep.equal([{ v: '10', t: 'text' }]);
+			expect(await readAll('select id, v from mt order by id'),
+				'limitation: the row that violates the CHECK under the FINAL INTEGER affinity survives')
+				.to.deep.equal([{ id: 1, v: '10' }]);
+			// Re-evaluated under the final INTEGER column, the committed row violates its own CHECK.
+			expect(await readAll(`select (v < '9') as lt from mt`),
+				'limitation: v < 9 is now numeric-false on the committed row')
+				.to.deep.equal([{ lt: false }]);
+			expect(isStale('mt'), 'the (limitation) successful reshape clears stale').to.equal(false);
+		});
+
+		it('control: a type-INSENSITIVE CHECK over the same retype reshape still rejects a genuine violator', async () => {
+			// Same reshape (retype v TEXT → INTEGER), but the CHECK is a value-domain `id > 0` —
+			// its truth does NOT depend on any column's affinity. The step-3 scan enforces it
+			// correctly, so a drifted -1 row IS rejected. This scopes the limitation strictly to
+			// affinity-SENSITIVE comparisons (the validation path itself is sound), exactly
+			// parallel to the collation-insensitive control above.
+			await db.exec(`
+				create table src (id integer primary key, v text);
+				create table mt (id integer primary key, v text, check (id > 0))
+					maintained as select * from src;
+				insert into src values (1, '5');
+			`);
+			await db.exec(`alter table src alter column v set data type integer`); // retype reshape ⇒ stale
+			expect(isStale('mt'), 'set data type marked mt stale').to.equal(true);
+			await db.exec(`insert into src values (-1, '5')`); // drift: violates id > 0, unmaintained
+
+			await expectError('refresh materialized view mt',
+				`row derived into maintained table 'main.mt'`);
+			// Pre-refresh contents survive (the scan threw before commit); mt stays stale.
+			expect(await readAll('select id from mt order by id')).to.deep.equal([{ id: 1 }]);
+			expect(isStale('mt'), 'a rejected reshape refresh leaves mt stale').to.equal(true);
+		});
+
+		it('next maintenance re-validates under the NEW type: a genuine re-derivation is rejected, but the already-committed row is frozen', async () => {
+			// Reach the limitation state: the offending row is committed under INTEGER.
+			await db.exec(`
+				create table src (id integer primary key, v text);
+				create table mt (id integer primary key, v text, check (v < '9'))
+					maintained as select * from src;
+				insert into src values (1, '10');
+			`);
+			await db.exec(`alter table src alter column v set data type integer`);
+			await db.exec('refresh materialized view mt');
+			expect(await readAll('select id, v from mt order by id'), 'limitation row committed')
+				.to.deep.equal([{ id: 1, v: '10' }]);
+
+			// A value-identical source touch produces NO derived-row delta, so the maintenance
+			// manager suppresses the backing op and runs no row-time validation — the frozen
+			// violator is left exactly as-is (not corrected, not re-rejected).
+			await db.exec(`update src set v = v where id = 1`);
+			expect(await readAll('select id, v from mt order by id'), 'no-delta touch leaves it frozen')
+				.to.deep.equal([{ id: 1, v: '10' }]);
+
+			// A GENUINE delta that re-derives an offending value (distinct from 10 so a real
+			// derived-row change is produced, but 11 < '9' is still false under INTEGER) runs
+			// buildDerivedRowValidator under the NEW type ⇒ the write is REJECTED. So the
+			// violation cannot silently spread via ordinary writes…
+			await expectError(`update src set v = 11 where id = 1`,
+				`row derived into maintained table 'main.mt'`);
+			// …and the rejected write rolls back, leaving the already-committed row unchanged.
+			expect(await readAll('select id, v from mt order by id'), 'rejected update rolls back; row frozen')
+				.to.deep.equal([{ id: 1, v: '10' }]);
+
+			// A brand-new source row deriving an offending value is likewise rejected under
+			// INTEGER (the row-time validator, not the pre-retype bulk scan, sees it).
+			await expectError(`insert into src values (2, 20)`,
+				`row derived into maintained table 'main.mt'`);
+			expect(await readAll('select id, v from mt order by id'), 'fresh offending row rejected; original frozen')
+				.to.deep.equal([{ id: 1, v: '10' }]);
+		});
+	});
+
 	describe('duplicate-key reject parity', () => {
 		// A backing whose physical PK keys a TEXT column under NOCASE while the source
 		// keys it under BINARY: 'a' and 'A' are distinct source rows but collide on the
