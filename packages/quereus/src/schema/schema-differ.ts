@@ -1420,15 +1420,22 @@ function columnConstraintToTableConstraint(columnName: string, cc: AST.ColumnCon
  * `primaryKeyChange`); engine-synthesized `_`-prefixed names are excluded to stay
  * symmetric with the catalog's `namedConstraints`. On a name collision the first
  * wins (a duplicate user constraint name is a separate validation concern).
+ *
+ * `schemaName` is the schema this table is being diffed under (the differ runs
+ * per schema — it is the CHILD schema for any FK declared here). It is threaded
+ * into the canonical-body render so an FK's explicit own-schema qualifier folds
+ * out symmetrically with the actual-catalog side (see
+ * {@link constraintBodyToCanonicalString}); a genuine cross-schema parent stays a
+ * body-change channel.
  */
-function collectDeclaredNamedConstraints(declaredTable: AST.DeclaredTable): Map<string, DeclaredNamedConstraint> {
+function collectDeclaredNamedConstraints(declaredTable: AST.DeclaredTable, schemaName: string): Map<string, DeclaredNamedConstraint> {
 	const out = new Map<string, DeclaredNamedConstraint>();
 	const add = (name: string | undefined, tags: Readonly<Record<string, SqlValue>> | undefined, tc: AST.TableConstraint): void => {
 		if (!name) return;
 		const lower = name.toLowerCase();
 		if (lower.startsWith('_')) return;
 		if (out.has(lower)) return;
-		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]), definition: constraintBodyToCanonicalString(tc), bodyAst: tc });
+		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]), definition: constraintBodyToCanonicalString(tc, schemaName), bodyAst: tc });
 	};
 	for (const c of declaredTable.tableStmt.constraints ?? []) {
 		if (c.type === 'primaryKey') continue;
@@ -1614,10 +1621,13 @@ function reconciledDeclaredBody(
 				const parentColRenames = columnRenamesByTable.get(parentLower);
 				if (parentColRenames) inverseRenameStringColumns(clone.foreignKey.columns, parentColRenames);
 				// Parent table reference → inverse table rename (newTable → oldTable).
+				// The parent SCHEMA is NOT a rename channel (renames are within-schema),
+				// so `foreignKey.schema` rides the clone untouched; the canonical render
+				// folds an own-schema qualifier out against `schemaName` (the child schema).
 				const tr = tableRenames.find(r => r.newName.toLowerCase() === parentLower);
 				if (tr) clone.foreignKey = { ...clone.foreignKey, table: tr.oldName };
 			}
-			return constraintBodyToCanonicalString(clone);
+			return constraintBodyToCanonicalString(clone, schemaName);
 		}
 		default:
 			return d.definition;
@@ -1772,7 +1782,7 @@ function computeTableAlterDiff(
 	// (PK changes flow through `primaryKeyChange`); auto-prefixed (`_`) names are
 	// excluded to stay symmetric with the catalog (see catalog.ts) so an unnamed
 	// declared constraint never churns add/drop against its synthesized actual name.
-	const declaredNamedConstraints = collectDeclaredNamedConstraints(declaredTable);
+	const declaredNamedConstraints = collectDeclaredNamedConstraints(declaredTable, schemaName);
 	const actualNamedConstraints = new Map<string, CatalogTable['namedConstraints'][number]>();
 	for (const c of actualTable.namedConstraints ?? []) {
 		actualNamedConstraints.set(c.name.toLowerCase(), c);

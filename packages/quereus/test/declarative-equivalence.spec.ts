@@ -4511,6 +4511,167 @@ describe('declarative-equivalence: rename without constraint churn', () => {
 	});
 });
 
+describe('declarative-equivalence: cross-schema foreign keys', () => {
+	// The declarative differ canonicalizes the FK parent-schema qualifier symmetrically
+	// on both sides: an explicit qualifier equal to the CHILD schema elides, a genuine
+	// cross-schema parent survives (see canonicalForeignKeyClause). So an unchanged
+	// cross-schema FK — and an explicit own-schema qualifier — must NOT churn a spurious
+	// drop+recreate, while a real parent-schema change MUST surface as a body change.
+	function diffOf(db: Database, schemaName: string) {
+		return computeSchemaDiff(
+			db.declaredSchemaManager.getDeclaredSchema(schemaName)!,
+			collectSchemaCatalog(db, schemaName),
+		);
+	}
+
+	it('re-declaring an unchanged cross-schema FK produces no diff op', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			// Parent m in main; child in s2 referencing main.m (genuine cross-schema).
+			await db.exec(`declare schema main {
+				table m { id INTEGER PRIMARY KEY, label TEXT }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec(`declare schema s2 {
+				table child {
+					id INTEGER PRIMARY KEY,
+					m_id INTEGER,
+					constraint fk_m foreign key (m_id) references main.m(id) on delete restrict
+				}
+			}`);
+			await db.exec('apply schema s2');
+
+			// Re-declare s2 byte-identically — the cross-schema qualifier 'main' survives on
+			// BOTH the declared and actual sides, so the canonical bodies match: no churn.
+			await db.exec(`declare schema s2 {
+				table child {
+					id INTEGER PRIMARY KEY,
+					m_id INTEGER,
+					constraint fk_m foreign key (m_id) references main.m(id) on delete restrict
+				}
+			}`);
+			expect(diffOf(db, 's2').tablesToAlter, 'no spurious churn on unchanged cross-schema FK').to.deep.equal([]);
+
+			// Apply is a no-op and the cross-schema FK still enforces end to end.
+			await db.exec('apply schema s2');
+			await db.exec("insert into main.m values (1, 'one')");
+			await db.exec('insert into s2.child values (1, 1)');
+			let rejected = false;
+			try { await db.exec('insert into s2.child values (2, 99)'); } catch { rejected = true; }
+			expect(rejected, 'cross-schema FK still enforces after idempotent re-apply').to.be.true;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('an explicit own-schema qualifier is equivalent to the unqualified form (no churn)', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			// Live catalog built from the UNQUALIFIED form (`references t`), child in main.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					t_id INTEGER,
+					constraint fk_t foreign key (t_id) references t(id)
+				}
+			}`);
+			await db.exec('apply schema main');
+
+			// Re-declare the SAME FK with an EXPLICIT own-schema qualifier `main.t`. The
+			// qualifier equals the child schema (main), so it elides to the same canonical
+			// body as the unqualified actual → no drop+recreate.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					t_id INTEGER,
+					constraint fk_t foreign key (t_id) references main.t(id)
+				}
+			}`);
+			const diff = diffOf(db, 'main');
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter?.constraintsToDrop ?? [], 'no FK drop for an own-schema qualifier').to.deep.equal([]);
+			expect(childAlter?.constraintsToAdd ?? [], 'no FK add for an own-schema qualifier').to.deep.equal([]);
+			expect(diff.tablesToAlter, 'no alter at all for the own-schema-qualifier equivalence').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('changing the declared parent schema is detected as a body change (drop+recreate)', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			// A like-named parent `m` exists in BOTH main and s2.
+			await db.exec(`declare schema main {
+				table m { id INTEGER PRIMARY KEY }
+			}`);
+			await db.exec('apply schema main');
+			// Child in s2 initially references s2.m (own schema → qualifier elides canonically).
+			await db.exec(`declare schema s2 {
+				table m { id INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					m_id INTEGER,
+					constraint fk_m foreign key (m_id) references s2.m(id)
+				}
+			}`);
+			await db.exec('apply schema s2');
+
+			// Re-declare: SAME parent table name `m`, DIFFERENT parent schema (main). The
+			// qualifier now differs from the child schema (s2) → it survives canonicalization
+			// → the bodies diverge → drop+recreate (the "must differ" half of the symmetry).
+			await db.exec(`declare schema s2 {
+				table m { id INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					m_id INTEGER,
+					constraint fk_m foreign key (m_id) references main.m(id)
+				}
+			}`);
+			const diff = diffOf(db, 's2');
+			const childAlter = diff.tablesToAlter.find(a => a.tableName.toLowerCase() === 'child');
+			expect(childAlter, 'child alter present for the parent-schema change').to.not.be.undefined;
+			expect(childAlter!.constraintsToDrop ?? [], 'old FK dropped').to.deep.equal(['fk_m']);
+			expect((childAlter!.constraintsToAdd ?? []).length, 'new FK added (drop+recreate)').to.equal(1);
+			expect(((childAlter!.constraintsToAdd ?? [])[0] ?? '').toLowerCase(), 'recreated FK carries the cross-schema qualifier').to.include('main.m');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('REGRESSION: an unchanged same-schema FK still produces no diff op', async function () {
+		const db = new Database();
+		try {
+			await db.exec('pragma foreign_keys = true');
+			await db.exec(`declare schema main {
+				table parent { id INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					parent_id INTEGER,
+					constraint fk_p foreign key (parent_id) references parent(id) on delete cascade
+				}
+			}`);
+			await db.exec('apply schema main');
+			// Re-declare identically — the common same-schema case stays churn-free.
+			await db.exec(`declare schema main {
+				table parent { id INTEGER PRIMARY KEY }
+				table child {
+					id INTEGER PRIMARY KEY,
+					parent_id INTEGER,
+					constraint fk_p foreign key (parent_id) references parent(id) on delete cascade
+				}
+			}`);
+			expect(diffOf(db, 'main').tablesToAlter, 'same-schema FK unchanged → no churn').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('declarative-equivalence: default_collation', () => {
 	// Diff threading the live session default_collation, mirroring the runtime emitters.
 	function diffOf(db: Database) {

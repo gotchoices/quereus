@@ -297,14 +297,17 @@ export function indexToCanonicalDDL(indexSchema: IndexSchema, tableSchema: Table
  * into the equivalent {@link AST.TableConstraint} (column indices → names,
  * operation mask → `RowOp[]`, `defaultConflict` → `onConflict`, FK actions and
  * deferred resolution mapped over), so both sides share one rendering path and
- * stay byte-comparable.
+ * stay byte-comparable. The child schema (`tableSchema.schemaName`) is threaded so
+ * the FK parent-schema qualifier folds symmetrically with the declared side — an
+ * own-schema qualifier elides, a genuine cross-schema parent survives (the lift
+ * already elides a parent == child qualifier, so this pass is idempotent here).
  */
 export function constraintToCanonicalDDL(
 	kind: NamedConstraintClass,
 	constraint: RowConstraintSchema | UniqueConstraintSchema | ForeignKeyConstraintSchema,
 	tableSchema: TableSchema,
 ): string {
-	return constraintBodyToCanonicalString(schemaConstraintToTableConstraint(kind, constraint, tableSchema));
+	return constraintBodyToCanonicalString(schemaConstraintToTableConstraint(kind, constraint, tableSchema), tableSchema.schemaName);
 }
 
 /**

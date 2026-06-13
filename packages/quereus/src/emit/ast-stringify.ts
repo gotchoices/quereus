@@ -1613,14 +1613,20 @@ function canonicalCheckOperations(ops: RowOp[] | undefined): RowOp[] | undefined
  * sides. (The referenced COLUMN list is folded upstream by
  * {@link lowercaseTableConstraintColumnNames}.)
  */
-function canonicalForeignKeyClause(fk: AST.ForeignKeyClause): AST.ForeignKeyClause {
+function canonicalForeignKeyClause(fk: AST.ForeignKeyClause, childSchemaName?: string): AST.ForeignKeyClause {
 	return {
 		table: fk.table.toLowerCase(),
-		// Carry the parent-schema qualifier (case-folded) so a cross-schema FK and a
-		// same-schema FK to a like-named parent don't collapse to one canonical key.
-		// Full declared-vs-actual symmetry (eliding an explicit own-schema qualifier)
-		// is the follow-on `cross-schema-fk-declarative-diff` ticket's job.
-		schema: fk.schema ? fk.schema.toLowerCase() : undefined,
+		// The parent-schema qualifier is canonical iff it differs (case-insensitively)
+		// from the CHILD table's schema: a genuine cross-schema FK keeps its qualifier,
+		// but an explicit own-schema qualifier elides to `undefined` so `references main.t`
+		// declared on a child IN `main` canonicalizes equal to the bare `references t`
+		// (and to the actual-catalog side, which already elides a parent == child schema).
+		// `childSchemaName` is absent for non-FK contexts / callers without a child schema;
+		// then any present qualifier is kept (case-folded) — a cross-schema FK and a
+		// same-schema FK to a like-named parent still don't collapse to one canonical key.
+		schema: fk.schema && fk.schema.toLowerCase() !== childSchemaName?.toLowerCase()
+			? fk.schema.toLowerCase()
+			: undefined,
 		columns: fk.columns && fk.columns.length > 0 ? fk.columns : undefined,
 		onDelete: fk.onDelete && fk.onDelete !== 'restrict' ? fk.onDelete : undefined,
 		onUpdate: fk.onUpdate && fk.onUpdate !== 'restrict' ? fk.onUpdate : undefined,
@@ -1695,14 +1701,22 @@ function lowercaseTableConstraintColumnNames(tc: AST.TableConstraint): AST.Table
  * the declared-AST side (`schema-differ`) and the actual-catalog side
  * (`ddl-generator`'s `constraintToCanonicalDDL`) funnel through here so their
  * fragments are byte-comparable.
+ *
+ * `childSchemaName` (the schema of the table OWNING this constraint) makes the FK
+ * parent-schema qualifier symmetric between the two sides: an explicit qualifier
+ * equal to the child schema elides to nothing (see {@link canonicalForeignKeyClause}),
+ * so a declared `references main.t` on a child in `main` and the actual catalog's
+ * elided form canonicalize identically (no spurious churn), while a genuine
+ * cross-schema parent survives as a body-change channel. It is optional so non-FK
+ * callers (CHECK / UNIQUE — no schema channel) are unaffected.
  */
-export function constraintBodyToCanonicalString(tc: AST.TableConstraint): string {
+export function constraintBodyToCanonicalString(tc: AST.TableConstraint, childSchemaName?: string): string {
 	const normalized: AST.TableConstraint = lowercaseTableConstraintColumnNames({ ...tc, name: undefined, tags: undefined });
 	if (normalized.type === 'check') {
 		normalized.operations = canonicalCheckOperations(normalized.operations);
 	}
 	if (normalized.type === 'foreignKey' && normalized.foreignKey) {
-		normalized.foreignKey = canonicalForeignKeyClause(normalized.foreignKey);
+		normalized.foreignKey = canonicalForeignKeyClause(normalized.foreignKey, childSchemaName);
 	}
 	return tableConstraintsToString([normalized]);
 }
