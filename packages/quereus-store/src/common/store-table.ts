@@ -58,7 +58,7 @@ import {
 	deserializeStats,
 	type TableStats,
 } from './serialization.js';
-import type { EncodeOptions } from './encoding.js';
+import { getCollationEncoder, type EncodeOptions } from './encoding.js';
 
 /** Number of mutations before persisting statistics. */
 const STATS_FLUSH_INTERVAL = 100;
@@ -753,20 +753,88 @@ export class StoreTable extends VirtualTable {
 		return { type: 'scan' };
 	}
 
-	/** Scan a range of PK values. */
+	/**
+	 * Convert a leading-PK-column range access into one seek + early-terminate
+	 * iterate window.
+	 *
+	 * Each LT/LE/GT/GE constraint's bound value is encoded under the SAME
+	 * per-column DESC direction and key collation as the data keys (via
+	 * {@link encodePkPrefixBounds}), giving the byte region `[lo, hi)` whose
+	 * leading column equals that value (`lo = encode([x])`,
+	 * `hi = incrementLastByte(lo)`). The op maps that region's endpoints onto a
+	 * `gte`/`lt` window; because a DESC column bit-inverts its bytes (larger value
+	 * ⇒ smaller bytes), the lower/upper assignment swaps with direction:
+	 *
+	 *   | op | ASC      | DESC     |
+	 *   |----|----------|----------|
+	 *   | GE | gte = lo | lt  = hi |
+	 *   | GT | gte = hi | lt  = lo |
+	 *   | LE | lt  = hi | gte = lo |
+	 *   | LT | lt  = lo | gte = hi |
+	 *
+	 * Across constraints (BETWEEN ⇒ one lower + one upper; a redundant same-side
+	 * pair ⇒ the tighter wins) we keep the MAX lower candidate for `gte` and the
+	 * MIN upper candidate for `lt`. A candidate that resolves to `undefined` (an
+	 * `hi` whose increment overflowed all-0xff) leaves that side unbounded — a safe
+	 * SUPERSET, since {@link matchesFilters} stays the authoritative collation-aware
+	 * row filter. A NULL/missing bound value is likewise skipped (the planner never
+	 * pushes `= NULL`, and a range op against NULL rejects every row in matchesFilters).
+	 *
+	 * Falls back to a full scan when the leading text PK column declares a
+	 * comparator-only collation with no registered byte encoder: `encodeText` would
+	 * silently key it under NOCASE bytes that do not track the column's logical
+	 * order, so a derived window could UNDER-fetch. A non-text leading column has
+	 * `pkKeyCollations[0] === undefined` and encodes type-natively — always safe.
+	 */
+	protected buildPKRangeBounds(access: PKAccessPattern): IterateOptions {
+		const full = buildFullScanBounds();
+		const constraints = access.constraints;
+		if (!constraints || constraints.length === 0) return full;
+
+		const dir = this.pkDirections[0];
+		const coll = this.pkKeyCollations[0];
+		// A comparator-only collation (declared on the column, but with no registered
+		// byte encoder) is not seekable: its key bytes fall back to NOCASE and do not
+		// track the column's logical order. Stay full-scan; matchesFilters is authoritative.
+		if (coll !== undefined && getCollationEncoder(coll) === undefined) return full;
+
+		let gte: Uint8Array = full.gte;
+		let lt: Uint8Array | undefined;
+
+		for (const c of constraints) {
+			if (c.value === undefined || c.value === null) continue;
+			const { gte: lo, lt: hi } = this.encodePkPrefixBounds([c.value]);
+			const lower = !dir
+				? (c.op === IndexConstraintOp.GE ? lo : c.op === IndexConstraintOp.GT ? hi : undefined)
+				: (c.op === IndexConstraintOp.LE ? lo : c.op === IndexConstraintOp.LT ? hi : undefined);
+			const upper = !dir
+				? (c.op === IndexConstraintOp.LE ? hi : c.op === IndexConstraintOp.LT ? lo : undefined)
+				: (c.op === IndexConstraintOp.GE ? hi : c.op === IndexConstraintOp.GT ? lo : undefined);
+			if (lower && compareBytes(lower, gte) > 0) gte = lower;
+			if (upper && (lt === undefined || compareBytes(upper, lt) < 0)) lt = upper;
+		}
+
+		return lt === undefined ? { gte } : { gte, lt };
+	}
+
+	/**
+	 * Scan a leading-PK-column range, seeking to the window start and
+	 * early-terminating at its end.
+	 *
+	 * {@link buildPKRangeBounds} converts the LT/LE/GT/GE constraints into one
+	 * encoded-byte `gte`/`lt` window under the same per-column DESC directions and
+	 * key collations the data keys use, so the iterate visits a SUPERSET of the
+	 * qualifying rows (a collation widening or the bound-byte increment can
+	 * over-fetch, never under-fetch). {@link matchesFilters} stays the authoritative
+	 * collation-aware row filter. {@link iterateEffective} restricts the pending
+	 * merge to the same `bounds`, so read-your-own-writes holds on the narrowed window.
+	 */
 	protected async *scanPKRange(
 		store: KVStore,
-		_access: PKAccessPattern,
+		access: PKAccessPattern,
 		filterInfo: FilterInfo
 	): AsyncIterable<Row> {
-		const bounds = buildFullScanBounds();
-
-		// TODO: Refine bounds based on range constraints. When implemented, the
-		// bound keys must be encoded under the same per-PK-column collations the
-		// data keys use (pkKeyCollations) so the iterated window is a superset of
-		// the collation-aware filter below — matchesFilters stays the authoritative
-		// row filter either way. Today the full key space is visited, so there is
-		// no seek-start/early-termination carrying a BINARY assumption.
+		const bounds = this.buildPKRangeBounds(access);
 		for await (const entry of this.iterateEffective(store, bounds)) {
 			const row = deserializeRow(entry.value);
 			if (this.matchesFilters(row, filterInfo)) {

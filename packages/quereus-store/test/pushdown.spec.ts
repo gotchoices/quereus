@@ -11,12 +11,70 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray } from '@quereus/quereus';
+import { Database, asyncIterableToArray, IndexConstraintOp, type SqlValue } from '@quereus/quereus';
 import {
 	StoreModule,
+	StoreTable,
 	InMemoryKVStore,
 	type KVStoreProvider,
+	type IterateOptions,
+	type KVEntry,
 } from '../src/index.js';
+
+/**
+ * In-memory data store that tallies how many entries its `iterate` actually
+ * yields. Lets a test prove a selective PK range SEEKS a narrow window rather
+ * than full-scanning and post-filtering (both return identical rows, so only the
+ * visit count distinguishes them).
+ */
+class CountingKVStore extends InMemoryKVStore {
+	public iterateEntryCount = 0;
+	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
+		for await (const entry of super.iterate(options)) {
+			this.iterateEntryCount++;
+			yield entry;
+		}
+	}
+}
+
+/**
+ * Provider whose DATA stores are {@link CountingKVStore}s (recorded in the
+ * supplied `dataStores` map, keyed `schema.table`); index/stats/catalog stores
+ * stay plain so only data-row iteration is counted.
+ */
+function createCountingProvider(dataStores: Map<string, CountingKVStore>): KVStoreProvider {
+	const auxStores = new Map<string, InMemoryKVStore>();
+	const aux = (key: string): InMemoryKVStore => {
+		let s = auxStores.get(key);
+		if (!s) { s = new InMemoryKVStore(); auxStores.set(key, s); }
+		return s;
+	};
+	return {
+		async getStore(schemaName: string, tableName: string) {
+			const key = `${schemaName}.${tableName}`;
+			let s = dataStores.get(key);
+			if (!s) { s = new CountingKVStore(); dataStores.set(key, s); }
+			return s;
+		},
+		async getIndexStore(schemaName: string, tableName: string, indexName: string) {
+			return aux(`${schemaName}.${tableName}_idx_${indexName}`);
+		},
+		async getStatsStore(schemaName: string, tableName: string) {
+			return aux(`${schemaName}.${tableName}.__stats__`);
+		},
+		async getCatalogStore() {
+			return aux('__catalog__');
+		},
+		async closeStore() {},
+		async closeIndexStore() {},
+		async closeAll() {
+			for (const s of dataStores.values()) await s.close();
+			for (const s of auxStores.values()) await s.close();
+			dataStores.clear();
+			auxStores.clear();
+		},
+	};
+}
 
 function createInMemoryProvider(): KVStoreProvider {
 	const stores = new Map<string, InMemoryKVStore>();
@@ -64,11 +122,12 @@ function createInMemoryProvider(): KVStoreProvider {
 describe('StoreModule predicate pushdown', () => {
 	let db: Database;
 	let provider: KVStoreProvider;
+	let storeModule: StoreModule;
 
 	beforeEach(() => {
 		db = new Database();
 		provider = createInMemoryProvider();
-		const storeModule = new StoreModule(provider);
+		storeModule = new StoreModule(provider);
 		db.registerModule('store', storeModule);
 	});
 
@@ -240,6 +299,142 @@ describe('StoreModule predicate pushdown', () => {
 				// BINARY: uppercase sorts before lowercase, so 'apple' and 'date' qualify.
 				expect(await values(q)).to.deep.equal([2, 4]);
 			});
+		});
+	});
+
+	// DESC leading PK: buildPKRangeBounds' lower/upper byte-bound assignment SWAPS
+	// (a `>` seeks the smaller-bytes window). A wrong swap that under-fetches would
+	// show up as missing rows here.
+	describe('DESC leading primary key', () => {
+		beforeEach(async () => {
+			await db.exec(`create table d (id integer primary key desc, n integer) using store`);
+			await db.exec(`insert into d values (1, 10), (2, 20), (3, 30), (4, 40)`);
+		});
+
+		it('> k seeks and returns the correct rows', async () => {
+			const rows = await asyncIterableToArray(db.eval(`select n from d where id > 2 order by id`));
+			expect(rows.map(r => r.n)).to.deep.equal([30, 40]);
+		});
+
+		it('between a and b seeks and returns the correct rows', async () => {
+			const rows = await asyncIterableToArray(db.eval(`select n from d where id between 2 and 3 order by id`));
+			expect(rows.map(r => r.n)).to.deep.equal([20, 30]);
+		});
+	});
+
+	// A leading PK key collation with NO registered byte encoder must NOT produce a
+	// narrowed window — `encodeText` silently falls back to NOCASE bytes that do not
+	// track the column's logical order, so a derived window could under-fetch.
+	// `matchesFilters` (collation-aware) stays authoritative on the full scan.
+	//
+	// The engine restricts TEXT column collations to BINARY/NOCASE/RTRIM (all of
+	// which DO have a byte encoder), so this branch is defensive and unreachable via
+	// DDL today; we exercise it white-box by setting the key collation directly.
+	describe('comparator-only collation falls back to full scan (buildPKRangeBounds)', () => {
+		// Structural view of the protected surface under test.
+		interface RangeBoundsProbe {
+			pkKeyCollations: (string | undefined)[];
+			buildPKRangeBounds(access: {
+				type: 'range';
+				columnIndex: number;
+				constraints: Array<{ columnIndex: number; op: IndexConstraintOp; value?: SqlValue }>;
+			}): IterateOptions;
+		}
+
+		const gtBananaBounds = (table: StoreTable): IterateOptions =>
+			(table as unknown as RangeBoundsProbe).buildPKRangeBounds({
+				type: 'range',
+				columnIndex: 0,
+				constraints: [{ columnIndex: 0, op: IndexConstraintOp.GT, value: 'banana' }],
+			});
+
+		it('returns full-scan bounds when the leading PK collation has no byte encoder', async () => {
+			await db.exec(`create table sorted (name text collate NOCASE primary key, n integer) using store`);
+			const table = storeModule.getTable('main', 'sorted');
+			expect(table, 'store table should be registered after create').to.exist;
+
+			// Force a comparator-only key collation (no registered byte encoder).
+			(table as unknown as RangeBoundsProbe).pkKeyCollations = ['CUSTOMSORT'];
+
+			const bounds = gtBananaBounds(table!);
+			// Full-scan bounds: empty gte, no lt — NOT a narrowed window.
+			expect(bounds.lt, 'comparator-only PK must not narrow the upper bound').to.be.undefined;
+			expect(bounds.gte, 'comparator-only PK must keep an unbounded lower bound').to.have.lengthOf(0);
+		});
+
+		it('a registered-encoder (NOCASE) PK DOES narrow (positive control)', async () => {
+			await db.exec(`create table plain (name text collate NOCASE primary key, n integer) using store`);
+			const table = storeModule.getTable('main', 'plain');
+			expect(table).to.exist;
+
+			const bounds = gtBananaBounds(table!);
+			expect(bounds.gte, 'NOCASE PK should seek to a lower bound').to.exist;
+			expect(bounds.gte!.length, 'NOCASE PK should seek to a non-empty lower bound').to.be.greaterThan(0);
+		});
+	});
+
+	// Distinguish a real seek from full-scan + filter: only the latter visits every
+	// row. Uses a CountingKVStore data store and asserts the visit count.
+	describe('window narrowing (real seek, not full-scan + filter)', () => {
+		let cdb: Database;
+		let cprovider: KVStoreProvider;
+		let dataStores: Map<string, CountingKVStore>;
+
+		async function seed(table: string, pkClause: string): Promise<CountingKVStore> {
+			await cdb.exec(`create table ${table} (id integer primary key ${pkClause}, n integer) using store`);
+			const vals = Array.from({ length: 100 }, (_, i) => `(${i}, ${i})`).join(', ');
+			await cdb.exec(`insert into ${table} values ${vals}`);
+			const store = dataStores.get(`main.${table}`);
+			expect(store, `data store for ${table} should exist`).to.exist;
+			store!.iterateEntryCount = 0;
+			return store!;
+		}
+
+		beforeEach(() => {
+			dataStores = new Map();
+			cprovider = createCountingProvider(dataStores);
+			cdb = new Database();
+			cdb.registerModule('store', new StoreModule(cprovider));
+		});
+
+		afterEach(async () => {
+			await cprovider.closeAll();
+		});
+
+		it('a selective ASC range visits far fewer entries than the full row count', async () => {
+			const store = await seed('nums', '');
+			const rows = await asyncIterableToArray(cdb.eval(`select n from nums where id > 95 order by id`));
+			expect(rows.map(r => r.n)).to.deep.equal([96, 97, 98, 99]);
+			// Seek lands just past id=95 and early-terminates: ~4 entries visited, not
+			// 100. A full-scan + post-filter implementation would visit all 100.
+			expect(store.iterateEntryCount, 'seek should visit only the in-window slice').to.be.lessThanOrEqual(5);
+		});
+
+		it('a selective DESC range narrows (proves the swap over-fetches nothing)', async () => {
+			const store = await seed('dnums', 'desc');
+			const rows = await asyncIterableToArray(cdb.eval(`select n from dnums where id > 95 order by id`));
+			expect(rows.map(r => r.n)).to.deep.equal([96, 97, 98, 99]);
+			// DESC `> 95` seeks the lt = lo(95) window (smaller bytes ⇒ larger values).
+			expect(store.iterateEntryCount, 'DESC seek should visit only the in-window slice').to.be.lessThanOrEqual(5);
+		});
+
+		it('an empty / contradictory window yields no rows without error', async () => {
+			const store = await seed('nums', '');
+			const rows = await asyncIterableToArray(cdb.eval(`select n from nums where id > 10 and id < 5`));
+			expect(rows).to.deep.equal([]);
+			// gte > lt ⇒ the KVStore iterate yields nothing; no throw, no visits.
+			expect(store.iterateEntryCount).to.equal(0);
+		});
+
+		it('reads-own-writes: an uncommitted row inside the window surfaces', async () => {
+			await seed('nums', '');
+			await cdb.exec('begin');
+			await cdb.exec(`insert into nums values (200, 200)`);
+			await cdb.exec(`update nums set n = 970 where id = 97`);
+			const rows = await asyncIterableToArray(cdb.eval(`select n from nums where id > 95 order by id`));
+			await cdb.exec('commit');
+			// 96, 97(updated→970), 98, 99, 200(pending insert) — all within id>95.
+			expect(rows.map(r => r.n)).to.deep.equal([96, 970, 98, 99, 200]);
 		});
 	});
 });

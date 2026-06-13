@@ -1588,9 +1588,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * collation, so the access path's collation-cover analysis may keep a
 	 * collation-matched non-BINARY (NOCASE/RTRIM) PK range/BETWEEN seek instead of
 	 * declining to a SeqScan + residual (see `classifyConstraintCover` in
-	 * rule-select-access-path.ts). There is no seek-start/early-termination to thread
-	 * the collation into — the range scan visits the full key space and post-filters
-	 * (see `StoreTable.scanPKRange`). Mirrors the memory module's advertisement.
+	 * rule-select-access-path.ts). The seek really does narrow: `StoreTable.scanPKRange`
+	 * (via `StoreTable.buildPKRangeBounds`) encodes the LT/LE/GT/GE bounds under the
+	 * same per-column key collations the data keys use and iterates that
+	 * seek-start/early-termination window. The window is a SUPERSET, so the post-fetch
+	 * row filter still reproduces the exact collation semantics — and a comparator-only
+	 * collation with no byte encoder safely falls back to a full scan. Mirrors the
+	 * memory module's advertisement.
 	 */
 	getBestAccessPlan(
 		_db: Database,
@@ -1644,9 +1648,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		if (rangeFilters.length > 0) {
 			// Range scan on first PK column. Iteration is by PK key order (see
 			// StoreTable.scanPKRange), so we can advertise monotonic emission on
-			// the leading PK column. The scan still visits the entire data store
-			// today (TODO in scanPKRange to refine bounds), but the order
-			// guarantee already holds.
+			// the leading PK column. The scan seeks to the window start and
+			// early-terminates (StoreTable.buildPKRangeBounds derives the encoded
+			// bounds), and the leading-PK order guarantee holds throughout.
 			const handledFilters = request.filters.map(f =>
 				rangeFilters.some(rf => rf.columnIndex === f.columnIndex && rf.op === f.op)
 			);
