@@ -1126,6 +1126,28 @@ select cid, cval from uq21_c order by cid;
 select pid, pv from uq21_p order by pid;
 → [{"pid":10,"pv":100},{"pid":20,"pv":200}]
 
+-- (uq-22) DEPTH-2 shadow accumulation: a partner-alias collision (`p`) shadowed by an inner
+-- FROM *two* levels down — a derived-table double nesting `(... from (select … from points p) q)`.
+-- The shadow set must accumulate across BOTH nestings: `p` is bound only by the innermost
+-- subquery's FROM, while the genuine correlated `cid` (bare, owning target) stays untouched at
+-- every depth. The qualifier-only strip would route `p.score` (depth 2) through the `parent`
+-- capture (no `score` → build error); the alias-shadow descent threads `{q}` then `{q,p}` down
+-- the `subquerySource` body so `p.score` binds local. For cid=2: max(50,70)=70; cid=1 untouched.
+create table uq22_p (pid integer primary key, pv integer);
+create table uq22_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq22_p(pid));
+create table uq22_points (k integer, score integer);
+insert into uq22_p values (10, 100), (20, 200);
+insert into uq22_c values (1, 10, 1), (2, 20, 2);
+insert into uq22_points values (2, 50), (2, 70), (1, 999);
+create view uq22_v as
+    select c.cid as cid, cval, pv from uq22_c c join uq22_p p on p.pid = c.pref;
+update uq22_v set cval = (
+        select s from (select max(p.score) as s from uq22_points p where p.k = cid) q
+    ) where cid = 2;
+select cid, cval from uq22_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":70}]
+
 -- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
 -- order the base deletes FK-child before FK-parent. The canonical columnar split has each
 -- member's PK reference the anchor's (axd_b, axd_c -> axd_a); deleting the parent first
