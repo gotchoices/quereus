@@ -288,6 +288,28 @@ describe('StoreModule predicate pushdown', () => {
 			});
 		});
 
+		// DESC + non-BINARY collation on the SAME leading PK column: buildPKRangeBounds
+		// must apply BOTH the lower/upper byte-bound SWAP (DESC) and the NOCASE encoder
+		// to each bound. A bug in either dimension under-fetches (missing rows).
+		describe('DESC NOCASE primary key', () => {
+			beforeEach(async () => {
+				await db.exec(`create table dfruits (name text collate NOCASE primary key desc, n integer) using store`);
+				await db.exec(`insert into dfruits values ('apple', 1), ('Banana', 2), ('CHERRY', 3), ('date', 4)`);
+			});
+
+			it('range seeks under both DESC and NOCASE and returns the correct rows', async () => {
+				const q = `select n from dfruits where name > 'banana' order by n`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await values(q)).to.deep.equal([3, 4]);
+			});
+
+			it('BETWEEN seeks under both DESC and NOCASE and honours both bounds', async () => {
+				const q = `select n from dfruits where name between 'banana' and 'cherry' order by n`;
+				expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+				expect(await values(q)).to.deep.equal([2, 3]);
+			});
+		});
+
 		describe('explicit BINARY primary key (negative control)', () => {
 			it('range seeks and keeps plain BINARY semantics', async () => {
 				// Explicit BINARY so the store does not reconcile the PK column to its
