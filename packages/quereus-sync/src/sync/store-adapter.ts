@@ -27,6 +27,22 @@
  *      { applyForeignKeyActions })` — capture + MV facets default on.
  *      Changes recorded in `result.errors` are excluded from the batch.
  *
+ * Snapshot bootstrap (per-call, not sticky): a known-complete wholesale load
+ * defers MV maintenance and watch capture for the whole transfer and converges
+ * once at the end.
+ *   - `bootstrap` flush: steps 1–4 run unchanged (storage rows applied, remote
+ *     module events emitted) but step 5 — the seam call — is SKIPPED. With MV
+ *     maintenance + capture both deferred and FK actions off for a wholesale
+ *     load, the seam would be a pure no-op that still opens a
+ *     transaction/savepoint per flush; skipping it removes that overhead and
+ *     the per-flush full-rebuild.
+ *   - `bootstrapFinalize` call (empty data/schema): converges every MV in
+ *     dependency order via `db.refreshAllMaterializedViews()`, then fires a
+ *     coarse `db.notifyExternalChange` per bootstrapped base table and per
+ *     refreshed MV — one whole-table watch invalidation instead of per-row
+ *     capture. The caller issues it before clearing the snapshot checkpoint, so
+ *     a finalize throw leaves the checkpoint in place and the transfer retries.
+ *
  * A seam throw (e.g. a commit-time global-assertion failure over the inbound
  * batch) PROPAGATES out of the callback: the seam's batch savepoint has
  * unwound the derived effects (MV backing deltas, capture entries), the
@@ -105,6 +121,12 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
     schemaChanges: SchemaChangeToApply[],
     applyOptions: ApplyToStoreOptions
   ): Promise<ApplyToStoreResult> => {
+    // Bootstrap finalize carries no data/schema changes: converge the MVs whose
+    // per-flush maintenance was deferred, then coarse-notify the watchers.
+    if (applyOptions.bootstrapFinalize) {
+      return finalizeBootstrap(db, applyOptions);
+    }
+
     const result: ApplyToStoreResult = {
       dataChangesApplied: 0,
       schemaChangesApplied: 0,
@@ -149,8 +171,12 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
 
         const effective = await table.applyExternalRowChanges(ops);
         emitEffectiveChanges(events, table.getSchema(), effective);
-        for (const change of effective) {
-          seamBatch.push({ schemaName, tableName, change });
+        // On a bootstrap flush the seam is skipped (deferred to finalize), so
+        // there is no batch to accumulate — don't build one.
+        if (!applyOptions.bootstrap) {
+          for (const change of effective) {
+            seamBatch.push({ schemaName, tableName, change });
+          }
         }
         result.dataChangesApplied += tableChanges.length;
       } catch (error) {
@@ -168,13 +194,46 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
     // One seam call per invocation, after all storage writes. A throw
     // propagates: derived effects are unwound by the seam's batch savepoint,
     // storage rows stay applied, the sync layer leaves CRDT metadata
-    // uncommitted and the same changes re-resolve on the next attempt.
+    // uncommitted and the same changes re-resolve on the next attempt. Empty on
+    // a bootstrap flush (the batch was never built — maintenance is deferred to
+    // the end-of-snapshot `bootstrapFinalize` convergence).
     if (seamBatch.length > 0) {
       await db.ingestExternalRowChanges(seamBatch, { applyForeignKeyActions });
     }
 
     return result;
   };
+}
+
+/**
+ * Finalize a snapshot bootstrap: the per-flush MV maintenance and watch capture
+ * were deferred (each bootstrap flush skipped the seam), so converge every MV
+ * in dependency order and fire a coarse whole-table watch invalidation for each
+ * bootstrapped base table and each refreshed MV — base-table and MV watchers
+ * re-read once instead of seeing per-row capture.
+ *
+ * A throw from `refreshAllMaterializedViews` propagates to the caller, which
+ * runs the finalize before clearing the snapshot checkpoint — so the checkpoint
+ * survives and the transfer retries (the storage rows are already correct, so
+ * the retry's finalize rebuilds cleanly).
+ */
+async function finalizeBootstrap(
+  db: Database,
+  options: ApplyToStoreOptions,
+): Promise<ApplyToStoreResult> {
+  const refreshed = await db.refreshAllMaterializedViews();
+
+  // Coarse base-table invalidation per bootstrapped table (note the
+  // table-then-schema argument order of `notifyExternalChange`)...
+  for (const { schema, table } of options.bootstrapTables ?? []) {
+    await db.notifyExternalChange(table, schema);
+  }
+  // ...and per refreshed MV, so MV watchers re-read.
+  for (const { schemaName, name } of refreshed) {
+    await db.notifyExternalChange(name, schemaName);
+  }
+
+  return { dataChangesApplied: 0, schemaChangesApplied: 0, errors: [] };
 }
 
 /**

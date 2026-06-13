@@ -233,6 +233,21 @@ export async function* resumeSnapshotStream(
 // ============================================================================
 
 /**
+ * Parse the accumulated `schema.table` completed-table keys into the
+ * `{ schema, table }` records the `bootstrapFinalize` coarse watch notification
+ * consumes. Mirrors the `tableKey.split('.')` convention used throughout this
+ * module.
+ */
+function parseBootstrapTables(
+	completedTables: ReadonlyArray<string>,
+): Array<{ schema: string; table: string }> {
+	return completedTables.map((key) => {
+		const [schema, table] = key.split('.');
+		return { schema, table };
+	});
+}
+
+/**
  * Clear existing CRDT metadata (column versions, tombstones, change log) ahead
  * of applying a snapshot.
  *
@@ -291,7 +306,11 @@ export async function applySnapshotStream(
 
 	const flushDataToStore = async (): Promise<void> => {
 		if (ctx.applyToStore && (pendingDataChanges.length > 0 || pendingSchemaChanges.length > 0)) {
-			const result = await ctx.applyToStore(pendingDataChanges, pendingSchemaChanges, { remote: true });
+			// A streamed snapshot is a known-complete wholesale load: each flush is a
+			// bootstrap flush (the adapter skips the engine seam — no per-flush MV
+			// maintenance, no per-row watch capture), converged once by the footer's
+			// `bootstrapFinalize` below.
+			const result = await ctx.applyToStore(pendingDataChanges, pendingSchemaChanges, { remote: true, bootstrap: true });
 			// A per-change storage failure aborts the stream mid-flight, before the
 			// footer emits `status: 'synced'` / clears the checkpoint — so the
 			// checkpoint stays in place and the transfer resumes/retries.
@@ -471,6 +490,21 @@ export async function applySnapshotStream(
 				if (snapshotHLC) {
 					ctx.hlcManager.receive(snapshotHLC);
 					await persistHLCState(ctx);
+				}
+
+				// Converge the bootstrap: the flushes deferred MV maintenance and watch
+				// capture, so converge every MV once and coarse-notify each bootstrapped
+				// table's watchers. Issued BEFORE clearing the checkpoint — a finalize
+				// failure leaves the checkpoint in place so the transfer retries (storage
+				// rows are already applied, so the retry's finalize rebuilds cleanly).
+				// `completedTables` is the full set even on a resumed transfer (seeded
+				// from the checkpoint in the `header` case).
+				if (ctx.applyToStore) {
+					await ctx.applyToStore([], [], {
+						remote: true,
+						bootstrapFinalize: true,
+						bootstrapTables: parseBootstrapTables(completedTables),
+					});
 				}
 
 				// Clear checkpoint

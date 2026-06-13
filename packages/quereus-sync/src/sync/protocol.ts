@@ -265,6 +265,21 @@ export interface ApplyToStoreOptions {
    * preventing the SyncManager from re-recording CRDT metadata.
    */
   readonly remote: boolean;
+  /**
+   * Bootstrap flush: one chunk of a known-complete wholesale snapshot load.
+   * The adapter skips the engine seam (no per-flush MV maintenance, no
+   * per-row watch capture) — storage rows are applied and remote module
+   * events still emitted. A `bootstrapFinalize` call converges afterwards.
+   */
+  readonly bootstrap?: boolean;
+  /**
+   * Finalize a bootstrap: no data/schema changes carried. The adapter
+   * converges every MV (`refreshAllMaterializedViews`) and fires a coarse
+   * `notifyExternalChange` per bootstrapped table.
+   */
+  readonly bootstrapFinalize?: boolean;
+  /** Bootstrapped base tables (for the finalize coarse watch notification). */
+  readonly bootstrapTables?: ReadonlyArray<{ schema: string; table: string }>;
 }
 
 /**

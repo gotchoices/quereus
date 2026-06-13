@@ -159,7 +159,10 @@ export async function applySnapshot(
 
 	// PHASE 2: Apply data to store
 	if (ctx.applyToStore && (dataChangesToApply.length > 0 || schemaChangesToApply.length > 0)) {
-		const result = await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true });
+		// A full snapshot is a known-complete wholesale load: apply as a bootstrap
+		// (the adapter skips the engine seam — no per-row MV maintenance/watch
+		// capture), converged once by the finalize below.
+		const result = await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true, bootstrap: true });
 		// A per-change storage failure aborts before clearing/rewriting metadata,
 		// leaving prior CRDT state intact; the snapshot retries wholesale
 		// (idempotent on the store side).
@@ -230,6 +233,19 @@ export async function applySnapshot(
 	// Update HLC
 	ctx.hlcManager.receive(snapshot.hlc);
 	await persistHLCState(ctx);
+
+	// Converge the bootstrap: PHASE 2 deferred MV maintenance and watch capture
+	// (seam skipped), so converge every MV once and coarse-notify each
+	// bootstrapped table's watchers. Issued before `status: 'synced'` so a
+	// finalize failure aborts the apply (the storage rows are already correct, so
+	// a retry's finalize rebuilds cleanly).
+	if (ctx.applyToStore) {
+		await ctx.applyToStore([], [], {
+			remote: true,
+			bootstrapFinalize: true,
+			bootstrapTables: snapshot.tables.map(t => ({ schema: t.schema, table: t.table })),
+		});
+	}
 
 	// Emit sync state change
 	ctx.syncEvents.emitSyncStateChange({ status: 'synced', lastSyncHLC: snapshot.hlc });
