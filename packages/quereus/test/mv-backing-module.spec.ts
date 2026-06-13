@@ -185,7 +185,7 @@ describe('mv backing module: full semantics with a mem2 backing', () => {
 			// memory-backed MVs must not see a formula drift from this ticket.
 			expect(a.derivation.bodyHash).to.equal(b.derivation.bodyHash);
 			expect(a.derivation.bodyHash).to.equal(
-				computeBodyHash(viewDefinitionToCanonicalString(a.derivation.columns, a.derivation.selectAst, a.derivation.insertDefaults)));
+				computeBodyHash(viewDefinitionToCanonicalString(a.derivation.columns, a.derivation.selectAst)));
 		} finally {
 			await db.close();
 		}

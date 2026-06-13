@@ -509,7 +509,7 @@ CREATE TABLE RsvInlineMissite (
 -- error: not allowed
 
 -- The retired quereus.update.default_for.<col> key (replaced by the view-level
--- `insert defaults (…)` clause) is unknown — still rejected, different reason.
+-- `with defaults (…)` clause) is unknown — still rejected, different reason.
 CREATE TABLE RsvInlineRetired (
     id INTEGER PRIMARY KEY,
     qty INTEGER CONSTRAINT chk_qty3 CHECK (qty > 0) WITH TAGS ("quereus.update.default_for.qty" = '0')
@@ -597,7 +597,7 @@ ALTER TABLE AddCon ADD CONSTRAINT c_chk2 CHECK (id > 0) WITH TAGS ("quereus.lens
 -- error: not allowed
 
 -- The retired quereus.update.default_for.<col> key (replaced by the view-level
--- `insert defaults (…)` clause) is unknown — still rejected, different reason.
+-- `with defaults (…)` clause) is unknown — still rejected, different reason.
 ALTER TABLE AddCon ADD CONSTRAINT c_chk3 CHECK (id > 0) WITH TAGS ("quereus.update.default_for.id" = '0');
 -- error: unknown reserved tag
 

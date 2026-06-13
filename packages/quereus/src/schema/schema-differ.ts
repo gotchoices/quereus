@@ -8,7 +8,7 @@ import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
-import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, collectFromTableNames } from './rename-rewriter.js';
+import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst } from './rename-rewriter.js';
 import type { ResolveColumnInSource } from './rename-rewriter.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
@@ -159,13 +159,14 @@ export interface TableAlterDiff {
 	constraintTagsChanges?: Array<{ constraintName: string; tags: Record<string, SqlValue> }>;
 	/**
 	 * Maintained-table (derivation) transition. Attach or re-attach a derivation:
-	 * `alter table … set maintained as <body> [insert defaults (…)]`. Emitted LATE
-	 * (after table creates/alters), where the target's final shape and the body's
-	 * sources must already exist. Set on: a fresh attach (declared maintained, live
-	 * plain) and a re-attach (both maintained, body drift). On a same-shape
-	 * re-attach this is the only op (content reconcile / refresh — no recreate).
+	 * `alter table … set maintained as <body>` (any `with defaults (…)` rides inside
+	 * the body). Emitted LATE (after table creates/alters), where the target's final
+	 * shape and the body's sources must already exist. Set on: a fresh attach
+	 * (declared maintained, live plain) and a re-attach (both maintained, body
+	 * drift). On a same-shape re-attach this is the only op (content reconcile /
+	 * refresh — no recreate).
 	 */
-	setMaintained?: { select: AST.QueryExpr; insertDefaults?: ReadonlyArray<AST.ViewInsertDefault> };
+	setMaintained?: { select: AST.QueryExpr };
 	/**
 	 * Detach a derivation: `alter table … drop maintained` (the table keeps its
 	 * rows and becomes writable). Emitted EARLY (before table alters/drops) — a
@@ -570,9 +571,11 @@ export function computeSchemaDiff(
 			continue;
 		}
 		const stmt = declaredView.viewStmt;
-		let definitionDrifted = viewDefinitionToCanonicalString(stmt.columns, stmt.select, stmt.insertDefaults) !== matchedActual.definition;
+		// The body string carries any trailing `with defaults (…)` clause, so the
+		// canonical definition (and its rename-reconciled form) covers defaults drift.
+		let definitionDrifted = viewDefinitionToCanonicalString(stmt.columns, stmt.select) !== matchedActual.definition;
 		if (definitionDrifted && (tableRenames.renames.length > 0 || columnRenamesByTable.size > 0)) {
-			definitionDrifted = reconciledDeclaredViewDefinition(stmt.columns, stmt.select, stmt.insertDefaults, tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn) !== matchedActual.definition;
+			definitionDrifted = reconciledDeclaredViewDefinition(stmt.columns, stmt.select, tableRenames.renames, columnRenamesByTable, targetSchemaName, resolveDeclaredColumn) !== matchedActual.definition;
 		}
 		if (definitionDrifted) {
 			diff.viewsToDrop.push(matchedActual.name);
@@ -1151,22 +1154,21 @@ function declaredIndexCanonicalBody(
  *
  * The explicit column list names the VIEW's own output columns — stable
  * identity untouched by source renames — so it passes through unchanged; the
- * body and `insert defaults` clause reconcile via
+ * body (including its trailing `with defaults (…)` clause) reconciles via
  * {@link inverseRenamedViewParts} with ALL in-diff table renames threaded.
  */
 function reconciledDeclaredViewDefinition(
 	columns: ReadonlyArray<string> | undefined,
 	select: AST.QueryExpr,
-	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
 	tableRenames: ReadonlyArray<RenameOp>,
 	/** Declared (new) table name (lowercased) → that table's column renames. */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
-	/** Declared-side column-existence resolver for the seeded `insert defaults` expr rewrites (see `computeSchemaDiff`). */
+	/** Declared-side column-existence resolver for the seeded defaults-expr rewrites (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
 ): string {
-	const parts = inverseRenamedViewParts(select, insertDefaults, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
-	return viewDefinitionToCanonicalString(columns, parts.select, parts.insertDefaults);
+	const reconciledSelect = inverseRenamedViewParts(select, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn);
+	return viewDefinitionToCanonicalString(columns, reconciledSelect);
 }
 
 /**
@@ -1177,51 +1179,35 @@ function reconciledDeclaredViewDefinition(
  * the declared stmt backs the declared-schema store / recreate DDL) and
  * rewrites the in-diff renames NEW→OLD.
  *
- * Reconciled parts:
- *   - body:    inverse table renames over the select clone for ALL threaded
- *              renames FIRST — so both a direct FROM reference and a
- *              cross-table reference in a subquery normalize to OLD names —
- *              THEN each renamed table's column renames NEW→OLD, seeded with
- *              that table's OLD name (qualifiers are pre-normalized to OLD by
- *              the table pass; with no own-table rename — in particular with
- *              no table pass at all — the seed is the DECLARED name the
- *              qualifiers still carry). Sequential inverse application is
- *              order-independent: `resolveRenames` makes chains/swaps
- *              unrepresentable, so no inverse output (oldName) can match
- *              another inverse input (newName).
- *   - clause:  each `insert defaults` entry's `column` names a base-table
- *              column of the view's FROM table — inverse-renamed via that
- *              table's column renames ({@link collectFromTableNames} scopes the
- *              lookup to FROM tables so an unrelated table's rename cannot
- *              false-rewrite); its `expr` gets the same inverse rewriters as
- *              the body, with column renames applied in two passes mirroring
- *              the forward `renameColumnInInsertDefaults` branch split: FROM
- *              tables' renames via the CHECK-expression entry point (the expr
- *              has no FROM of its own — the base table seeds the scope,
- *              exactly like the constraint/index predicates), threaded with
- *              the declared-side scope resolver so an inner subquery ref
- *              binding to a like-named column on its own FROM is not falsely
- *              captured by the seed; THEN non-FROM tables' renames (reachable
- *              only through a subquery in the expr) via the plain scope-aware
- *              walk — no seed frame, no resolver, exactly the body pass's
- *              iteration with the FROM tables skipped. FROM-seeded first,
- *              cross-table second — the same load-bearing ordering as the
- *              constraint CHECK reconcile's owning-first split.
+ * Reconciled body: inverse table renames over the select clone for ALL threaded
+ * renames FIRST — so both a direct FROM reference and a cross-table reference in
+ * a subquery normalize to OLD names — THEN each renamed table's column renames
+ * NEW→OLD, seeded with that table's OLD name (qualifiers are pre-normalized to
+ * OLD by the table pass; with no own-table rename — in particular with no table
+ * pass at all — the seed is the DECLARED name the qualifiers still carry).
+ * Sequential inverse application is order-independent: `resolveRenames` makes
+ * chains/swaps unrepresentable, so no inverse output (oldName) can match another
+ * inverse input (newName).
+ *
+ * The trailing `with defaults (…)` clause now rides inside `select`
+ * ({@link AST.SelectStmt.defaults}), so the scope-aware body walks descend it
+ * directly: each entry's `expr` inverse-renames in the select's FROM scope frame
+ * and each entry's `column` target rides the same synthetic-probe rewrite as a
+ * `with inverse` target, so the body reconciliation here covers the defaults for
+ * free. The `resolveDeclaredColumn` resolver is threaded into that body walk so
+ * an unqualified ref inside a defaults-expr subquery that binds a like-named
+ * column on its own FROM is NOT false-captured by the enclosing FROM seed
+ * (declared-side parity with the forward live-lookup walk; see `computeSchemaDiff`).
  */
 function inverseRenamedViewParts(
 	select: AST.QueryExpr,
-	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
 	tableRenames: ReadonlyArray<RenameOp>,
 	/** Declared (new) table name (lowercased) → that table's column renames. */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
-	/** Declared-side column-existence resolver for the seeded `insert defaults` expr rewrites (see `computeSchemaDiff`). */
+	/** Declared-side column-existence resolver for the scope-aware body walk (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
-): { select: AST.QueryExpr; insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined } {
-	// FROM tables under their DECLARED (new) names — collected before the inverse
-	// table pass below rewrites the clone's references to OLD names.
-	const fromTables = collectFromTableNames(select, schemaName);
-
+): AST.QueryExpr {
 	const selectClone = cloneQueryExpr(select);
 	for (const r of tableRenames) {
 		renameTableInAst(selectClone, r.newName, r.oldName, schemaName);
@@ -1230,57 +1216,10 @@ function inverseRenamedViewParts(
 		const ownRename = tableRenames.find(r => r.newName.toLowerCase() === declaredTableName);
 		const seedTableName = ownRename?.oldName ?? declaredTableName;
 		for (const r of colRenames) {
-			renameColumnInAst(selectClone, seedTableName, r.newName, r.oldName, schemaName);
+			renameColumnInAst(selectClone, seedTableName, r.newName, r.oldName, schemaName, resolveDeclaredColumn);
 		}
 	}
-
-	let reconciledDefaults = insertDefaults;
-	if (insertDefaults && insertDefaults.length > 0) {
-		reconciledDefaults = insertDefaults.map(d => {
-			let column = d.column;
-			for (const ft of fromTables) {
-				const r = columnRenamesByTable.get(ft)?.find(cr => cr.newName.toLowerCase() === column.toLowerCase());
-				if (r) {
-					column = r.oldName;
-					break;
-				}
-			}
-			const exprClone = cloneExpr(d.expr);
-			for (const r of tableRenames) {
-				renameTableInAst(exprClone, r.newName, r.oldName, schemaName);
-			}
-			for (const ft of fromTables) {
-				const colRenames = columnRenamesByTable.get(ft);
-				if (!colRenames) continue;
-				const ownRename = tableRenames.find(r => r.newName.toLowerCase() === ft);
-				const seedTableName = ownRename?.oldName ?? ft;
-				for (const r of colRenames) {
-					renameColumnInCheckExpression(exprClone, seedTableName, r.newName, r.oldName, schemaName, resolveDeclaredColumn);
-				}
-			}
-			// Cross-table pass: renames on tables NOT in the view's FROM, reachable
-			// only through a clause-expr subquery — the body pass's iteration with
-			// the FROM tables skipped (just handled seeded above; FROM-first ordering
-			// is load-bearing, see the constraint CHECK reconcile). Plain scope-aware
-			// walk, no seed frame / resolver — forward parity with
-			// `renameColumnInInsertDefaults`'s non-FROM branch. Via the shared
-			// `columnReconciledViewStmt` path (no table renames) a hinted view-rename
-			// recreate now spells the OLD name for such a ref; the post-create
-			// forward RENAME COLUMN propagation rewrites it forward again, so both
-			// spellings converge (clause exprs plan lazily at write-through time).
-			for (const [declaredTableName, colRenames] of columnRenamesByTable) {
-				if (fromTables.has(declaredTableName)) continue;
-				const ownRename = tableRenames.find(r => r.newName.toLowerCase() === declaredTableName);
-				const seedTableName = ownRename?.oldName ?? declaredTableName;
-				for (const r of colRenames) {
-					renameColumnInAst(exprClone, seedTableName, r.newName, r.oldName, schemaName);
-				}
-			}
-			return { column, expr: exprClone };
-		});
-	}
-
-	return { select: selectClone, insertDefaults: reconciledDefaults };
+	return selectClone;
 }
 
 /**
@@ -1303,12 +1242,13 @@ function columnReconciledViewStmt(
 	/** Declared (new) table name (lowercased) → that table's column renames. */
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
-	/** Declared-side column-existence resolver for the seeded `insert defaults` expr rewrites (see `computeSchemaDiff`). */
+	/** Declared-side column-existence resolver for the seeded defaults-expr rewrites (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
 ): AST.CreateViewStmt {
 	if (columnRenamesByTable.size === 0) return stmt;
-	const parts = inverseRenamedViewParts(stmt.select, stmt.insertDefaults, [], columnRenamesByTable, schemaName, resolveDeclaredColumn);
-	return { ...stmt, select: parts.select, insertDefaults: parts.insertDefaults };
+	// The reconciled body carries any trailing `with defaults (…)` clause inline.
+	const reconciledSelect = inverseRenamedViewParts(stmt.select, [], columnRenamesByTable, schemaName, resolveDeclaredColumn);
+	return { ...stmt, select: reconciledSelect };
 }
 
 /**
@@ -2004,12 +1944,14 @@ function applyMaintainedTransition(
 	tableRenames: ReadonlyArray<RenameOp>,
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
+	/** Declared-side column-existence resolver for the seeded defaults-expr rewrites (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
 ): void {
 	if (!declaredMaintained && !liveMaintained) return;
 	if (declaredMaintained && !liveMaintained) {
-		// Attach: derived content reconciles the live (plain) table's rows.
-		diff.setMaintained = { select: declaredMaintained.select, insertDefaults: declaredMaintained.insertDefaults };
+		// Attach: derived content reconciles the live (plain) table's rows. Any
+		// `with defaults (…)` rides inside the body select.
+		diff.setMaintained = { select: declaredMaintained.select };
 		return;
 	}
 	if (!declaredMaintained && liveMaintained) {
@@ -2026,7 +1968,7 @@ function applyMaintainedTransition(
 	// ops already on `diff`) means detach → reshape → re-attach; an unchanged shape
 	// re-attaches in place (content reconcile / refresh).
 	if (alterDiffHasShapeOps(diff)) diff.dropMaintained = true;
-	diff.setMaintained = { select: declaredMaintained!.select, insertDefaults: declaredMaintained!.insertDefaults };
+	diff.setMaintained = { select: declaredMaintained!.select };
 }
 
 /**
@@ -2051,17 +1993,20 @@ function maintainedBodyMatches(
 	tableRenames: ReadonlyArray<RenameOp>,
 	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
 	schemaName: string,
+	/** Declared-side column-existence resolver for the seeded defaults-expr rewrites (see `computeSchemaDiff`). */
 	resolveDeclaredColumn: ResolveColumnInSource,
 ): boolean {
 	const hasRenames = tableRenames.length > 0 || columnRenamesByTable.size > 0;
 	// The single as-authored form: implicit (`undefined`) for a sugar / verb-attached
 	// body, or the explicit declared rename list. Both create and re-attach record the
 	// implicit form for a same-name body, so there is no live-names fallback to add.
+	// The body string carries any trailing `with defaults (…)` clause, so a
+	// defaults-only edit fails the compare and a pure source rename converges.
 	const variants = [declared.columns];
 	for (const columns of variants) {
-		if (computeBodyHash(viewDefinitionToCanonicalString(columns, declared.select, declared.insertDefaults)) === liveBodyHash) return true;
+		if (computeBodyHash(viewDefinitionToCanonicalString(columns, declared.select)) === liveBodyHash) return true;
 		if (hasRenames
-			&& computeBodyHash(reconciledDeclaredViewDefinition(columns, declared.select, declared.insertDefaults, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) === liveBodyHash) {
+			&& computeBodyHash(reconciledDeclaredViewDefinition(columns, declared.select, tableRenames, columnRenamesByTable, schemaName, resolveDeclaredColumn)) === liveBodyHash) {
 			return true;
 		}
 	}
@@ -2100,7 +2045,8 @@ function materializedViewToDeclaredTable(declaredMv: AST.DeclaredMaterializedVie
 			moduleName: mv.moduleName,
 			moduleArgs: mv.moduleArgs,
 			tags: mv.tags,
-			maintained: { columns: mv.columns, select: mv.select, insertDefaults: mv.insertDefaults },
+			// Any `with defaults (…)` rides inside mv.select.
+			maintained: { columns: mv.columns, select: mv.select },
 		},
 	};
 }
@@ -2521,9 +2467,9 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
 				? { type: 'identifier', name: alter.tableName, schema: schemaName }
 				: { type: 'identifier', name: alter.tableName },
 			action: {
+				// Any `with defaults (…)` rides inside the body select.
 				type: 'setMaintained',
 				select: alter.setMaintained.select,
-				insertDefaults: alter.setMaintained.insertDefaults,
 			},
 		};
 		statements.push(astToString(stmt));

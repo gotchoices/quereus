@@ -15,8 +15,8 @@ import type { SqlValue } from '../common/types.js';
  *
  * No reserved tag carries *behavior* — view-mutation semantics moved to
  * first-class constructs (write routing to per-row presence/membership columns;
- * omitted-insert defaults to the `insert defaults (col = expr, …)` view clause,
- * which retired the last `quereus.update.*` key, `default_for.<column>`).
+ * omitted-insert defaults to the body select's `with defaults (col = expr, …)`
+ * clause, which retired the last `quereus.update.*` key, `default_for.<column>`).
  *
  * This module is the single shape/site validation entry point those keys flow
  * through. It is **additive and behavior-neutral**: it reads no reserved tag's
@@ -175,7 +175,7 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	// --- quereus.lens.* : lens advisory acknowledgments / access hints ---
 	// (The former quereus.update.* family is gone: routing became per-row
 	// presence/membership columns; default_for.<column> became the first-class
-	// `insert defaults (col = expr, …)` view clause.)
+	// `with defaults (col = expr, …)` body-select clause.)
 	{
 		// docs/lens.md:176, 190 — code is <code>[:<target>]; remainder captured whole.
 		key: { template: 'quereus.lens.ack.<code>' },

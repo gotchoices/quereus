@@ -124,8 +124,9 @@ export type AlterTableAction =
 		 */
 		type: 'setMaintained';
 		columns?: ReadonlyArray<string>;
+		/** Derivation body — any relation-producing QueryExpr; carries its own
+		 *  trailing `with defaults (…)` clause ({@link AST.SelectStmt.defaults}). */
 		select: AST.QueryExpr;
-		insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	}
 	| {
 		/**

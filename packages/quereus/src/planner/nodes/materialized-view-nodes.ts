@@ -25,7 +25,6 @@ export class CreateMaterializedViewNode extends VoidNode {
 		public readonly selectStmt: AST.QueryExpr,
 		/** Canonical SQL of the body alone (re-planned at runtime to fill the backing table). */
 		public readonly bodySql: string,
-		public readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>,
 		public readonly tags?: Readonly<Record<string, SqlValue>>,
 		/** Normalized backing-host module from `using <module>(...)`; undefined = memory default. */
 		public readonly backingModuleName?: string,

@@ -75,7 +75,6 @@ export function buildCreateMaterializedViewStmt(ctx: PlanningContext, stmt: AST.
 		stmt.columns,
 		stmt.select,
 		bodySql,
-		stmt.insertDefaults,
 		stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined,
 		backing.storedModuleName,
 		backing.storedModuleArgs,

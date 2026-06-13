@@ -595,14 +595,24 @@ const cteSelectArb: fc.Arbitrary<AST.SelectStmt> = fc.tuple(
 	};
 });
 
-/** `insert defaults (col = expr, …)` entries — distinct columns, literal exprs. */
-const insertDefaultsArb: fc.Arbitrary<AST.ViewInsertDefault[] | undefined> = fc.option(
+/** `with defaults (col = expr, …)` entries — distinct columns, literal exprs.
+ *  The clause now rides inside the SELECT body (`SelectStmt.defaults`); attach
+ *  via {@link withDefaults} which is a no-op on a non-select body. */
+const defaultsArb: fc.Arbitrary<AST.ViewInsertDefault[] | undefined> = fc.option(
 	fc.uniqueArray(
 		fc.tuple(identArb, literalArb).map(([column, expr]): AST.ViewInsertDefault => ({ column, expr })),
 		{ minLength: 1, maxLength: 3, selector: d => d.column },
 	),
 	{ nil: undefined },
 );
+
+/** Attach a `with defaults (…)` clause to a body — only a SELECT body can carry it
+ *  ({@link AST.SelectStmt.defaults}); a VALUES body passes through unchanged (its
+ *  defaults would wrap to `SELECT * FROM (VALUES…)` and break AST round-trip). */
+function withDefaults(body: AST.QueryExpr, defaults: AST.ViewInsertDefault[] | undefined): AST.QueryExpr {
+	if (!defaults || body.type !== 'select') return body;
+	return { ...body, defaults };
+}
 
 /**
  * CREATE VIEW with either a SELECT or VALUES body. When the body is VALUES
@@ -615,14 +625,13 @@ const createViewArb: fc.Arbitrary<AST.CreateViewStmt> = fc.tuple(
 	fc.boolean(),
 	fc.option(uniqueIdents(1), { nil: undefined }),
 	queryExprArb,
-	insertDefaultsArb,
-).map(([name, ifNotExists, columns, body, insertDefaults]): AST.CreateViewStmt => ({
+	defaultsArb,
+).map(([name, ifNotExists, columns, body, defaults]): AST.CreateViewStmt => ({
 	type: 'createView',
 	view: { type: 'identifier', name },
 	ifNotExists,
 	columns: body.type === 'values' ? undefined : columns,
-	select: body,
-	insertDefaults,
+	select: withDefaults(body, defaults),
 }));
 
 // ------------------------------------------------------------------------
@@ -722,16 +731,15 @@ const declaredViewItemArb: fc.Arbitrary<AST.DeclaredView> = fc.record({
 	name: identArb,
 	cols: fc.option(uniqueIdents(1), { nil: undefined }),
 	select: simpleSelectArb,
-	insertDefaults: insertDefaultsArb,
-}).map(({ name, cols, select, insertDefaults }): AST.DeclaredView => ({
+	defaults: defaultsArb,
+}).map(({ name, cols, select, defaults }): AST.DeclaredView => ({
 	type: 'declaredView',
 	viewStmt: {
 		type: 'createView',
 		view: { type: 'identifier', name },
 		ifNotExists: false,
 		columns: cols,
-		select,
-		insertDefaults,
+		select: { ...select, defaults },
 	},
 }));
 

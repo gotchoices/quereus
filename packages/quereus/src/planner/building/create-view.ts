@@ -81,7 +81,6 @@ export function buildCreateViewStmt(ctx: PlanningContext, stmt: AST.CreateViewSt
 		stmt.columns,
 		stmt.select,
 		sql,
-		stmt.insertDefaults,
 		stmt.tags ? Object.freeze({ ...stmt.tags }) : undefined
 	);
 }

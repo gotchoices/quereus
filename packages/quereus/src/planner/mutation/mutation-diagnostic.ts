@@ -14,7 +14,7 @@ export type MutationDiagnosticReason =
 	| 'no-default'                 // insert missing a NOT NULL column after the recovery chain
 	| 'predicate-contradiction'    // insert violates the view's selection at plan time (Filter)
 	| 'recursive-cte'              // recursive CTE as mutation target
-	| 'default-target-not-found'   // an `insert defaults (col = expr, …)` clause entry names a column that is neither a view nor a base column
+	| 'default-target-not-found'   // a `with defaults (col = expr, …)` clause entry names a column that is neither a view nor a base column
 	| 'mutual-fk-restrict-delete'  // a two-side join DELETE fan-out spans a mutual FK whose ON DELETE actions cannot be satisfied in ANY side order under immediate enforcement (deleting either side trips the other's RESTRICT, directly or transitively through a cascade); break the cycle by clearing the referencing column(s) first (deferring the constraint does not help — RESTRICT is always immediate)
 	// --- "not yet shipped" body-shape rejections (Phase 2+) ---
 	| 'unsupported-join'           // join body — Phase 2 / 4

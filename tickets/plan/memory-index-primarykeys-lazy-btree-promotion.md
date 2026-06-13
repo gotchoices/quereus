@@ -313,3 +313,22 @@ spec, adapted to the chosen structure.)
 > [DONE this run: cliff CONFIRMED for out-of-order arrival (250k descending =
 > 4369 ms), but build/consolidation are already O(N) append. The redesign is
 > blocked not by the gate but by the structuredClone infeasibility above.]
+
+---
+
+## Triage decision (2026-06-13, human sign-off): Alternative C — Map + lossless PK encoding
+
+Take **Alternative C**: replace the per-entry sorted array with a `Map` keyed by
+a type-aware **lossless** PK encoder (survives `structuredClone` as a Map, so it
+is COW-safe in inheritree's node-clone path). Owned add/remove/dedup become O(1);
+scans sort-on-read O(M log M) per bucket (or cache a sorted snapshot invalidated
+on mutation). The plan pass owns the open questions the ticket lists: the lossless
+encoder design (normalize `5n`/`5`, recurse composite arrays, encode blobs — NOT a
+collation transform, so it never false-merges collation-distinct PKs; the
+PK-uniqueness invariant makes it value-correct as the ticket argues), the per-scan
+sort vs cached-snapshot cost, and confirming nothing depends on PK-sorted scan
+order beyond current tests. Required: the multi-entry-leaf COW test the ticket
+specifies (the existing single-entry-leaf suite masks the corruption class), and
+the container-level descending-order sentinel (drop-in snippet provided). The
+build/consolidation paths are already O(N) — C only needs to fix the out-of-order
+owned-DML path without regressing them.

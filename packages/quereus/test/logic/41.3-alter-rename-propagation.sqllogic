@@ -752,16 +752,16 @@ drop table t_corr_u;
 -- propagation path.)
 
 -- ===================================
--- 18. RENAME COLUMN rewrites a view's `insert defaults` target
+-- 18. RENAME COLUMN rewrites a view's `with defaults` target
 -- ===================================
 -- The dominant clause use case: the defaulted NOT NULL column is projected
 -- away, so the body rewrite alone never touches the view — the clause rewrite
 -- must both fire (clause-only change still propagates) and rewrite
 -- `created` → `created_at`, or the write-through errors with
--- "'insert defaults (created = …)' names column 'created'".
+-- "'with defaults (created = …)' names column 'created'".
 
 create table t_vd (id integer primary key, name text, created integer not null);
-create view v_vd as select id, name from t_vd insert defaults (created = 99);
+create view v_vd as select id, name from t_vd with defaults (created = 99);
 
 alter table t_vd rename column created to created_at;
 
@@ -778,7 +778,7 @@ drop view v_vd;
 drop table t_vd;
 
 -- ===================================
--- 19. RENAME TO of a table referenced inside an `insert defaults` expr subquery
+-- 19. RENAME TO of a table referenced inside an `with defaults` expr subquery
 -- ===================================
 -- The clause expr is appended to VALUES rows, so it cannot reference base
 -- columns at top level — but a subquery inside it can reference any table.
@@ -788,7 +788,7 @@ create table aud_t (c integer primary key);
 insert into aud_t values (5);
 
 create table t_vd2 (id integer primary key, ts integer not null);
-create view v_vd2 as select id from t_vd2 insert defaults (ts = (select max(c) from aud_t));
+create view v_vd2 as select id from t_vd2 with defaults (ts = (select max(c) from aud_t));
 
 alter table aud_t rename to aud_t2;
 
@@ -802,7 +802,7 @@ drop table t_vd2;
 drop table aud_t2;
 
 -- ===================================
--- 20. RENAME COLUMN inside an `insert defaults` expr subquery
+-- 20. RENAME COLUMN inside an `with defaults` expr subquery
 -- ===================================
 -- The renamed table is NOT a FROM table of the view, so the clause's expr gets
 -- the plain scope-aware walk — the subquery's `c` must still rewrite to `c2`.
@@ -811,7 +811,7 @@ create table aud_c (c integer primary key);
 insert into aud_c values (7);
 
 create table t_vd3 (id integer primary key, ts integer not null);
-create view v_vd3 as select id from t_vd3 insert defaults (ts = (select max(c) from aud_c));
+create view v_vd3 as select id from t_vd3 with defaults (ts = (select max(c) from aud_c));
 
 alter table aud_c rename column c to c2;
 
@@ -825,14 +825,14 @@ drop table t_vd3;
 drop table aud_c;
 
 -- ===================================
--- 21. RENAME COLUMN hitting both a view's body and its `insert defaults` target
+-- 21. RENAME COLUMN hitting both a view's body and its `with defaults` target
 -- ===================================
 -- The defaulted column is also projected, so one rename rewrites the body
 -- projection AND the clause target; inserting with a column list omits it and
 -- the default lands under the new name.
 
 create table t_vd4 (id integer primary key, v integer not null);
-create view v_vd4 as select id, v from t_vd4 insert defaults (v = 42);
+create view v_vd4 as select id, v from t_vd4 with defaults (v = 42);
 
 alter table t_vd4 rename column v to w;
 
@@ -857,7 +857,7 @@ drop table t_vd4;
 
 create table temp.t_vd5 (id integer primary key, name text, created integer not null);
 create table t_vd5 (id integer primary key, created integer not null);
-create view v_vd5 as select id, name from temp.t_vd5 insert defaults (created = 99);
+create view v_vd5 as select id, name from temp.t_vd5 with defaults (created = 99);
 
 alter table t_vd5 rename column created to created_at;
 

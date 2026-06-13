@@ -23,15 +23,21 @@ export interface ViewSchema {
 	selectAst: AST.QueryExpr;
 	/** Columns explicitly defined in CREATE VIEW (e.g., CREATE VIEW v(a,b) AS...) */
 	columns?: ReadonlyArray<string>; // Optional list of explicitly named columns
-	/**
-	 * Per-column omitted-insert defaults from the `insert defaults (col = expr, …)`
-	 * clause. Consumed by the insert write-through rewrite (step 5 of the
-	 * insert-defaulting precedence chain — docs/view-updateability.md § View insert
-	 * defaults) and by `view_info`'s insertability derivation.
-	 */
-	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */
 	tags?: Readonly<Record<string, SqlValue>>;
+}
+
+/**
+ * Read the trailing `with defaults (col = expr, …)` clause off a view /
+ * derivation body — per-column omitted-insert defaults for write-through, now
+ * stored inside the body select AST ({@link AST.SelectStmt.defaults}). Only a
+ * SELECT body carries it; a VALUES (or other) body has none. Consumed by the
+ * insert write-through rewrite (step 5 of the insert-defaulting precedence chain
+ * — docs/view-updateability.md § View defaults) and by `view_info`'s
+ * insertability derivation.
+ */
+export function bodyDefaults(body: AST.QueryExpr): ReadonlyArray<AST.ViewInsertDefault> | undefined {
+	return body.type === 'select' ? body.defaults : undefined;
 }
 
 /**
@@ -119,11 +125,11 @@ function renderBackingArgValue(v: SqlValue): string {
 /**
  * Canonical definition hash for a materialized view:
  * `toBase64Url(fnv1aHash(...))` over the canonical DEFINITION string supplied
- * by the caller — `viewDefinitionToCanonicalString(columns, selectAst,
- * insertDefaults)`, i.e. the explicit column list + the body's canonical SQL +
- * the `insert defaults` clause (NOT a plan-structure serialization, which
- * embeds unstable node ids). Stable per definition; changes when any
- * definitional part changes.
+ * by the caller — `viewDefinitionToCanonicalString(columns, selectAst)`, i.e.
+ * the explicit column list + the body's canonical SQL (which itself carries any
+ * trailing `with defaults (…)` clause — NOT a plan-structure serialization,
+ * which embeds unstable node ids). Stable per definition; changes when any
+ * definitional part changes, including a defaults-only edit.
  *
  * Single source of truth shared by MV creation / the rename-propagation
  * rewrite (which stamp `TableDerivation.bodyHash`) and the declarative-schema

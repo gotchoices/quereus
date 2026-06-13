@@ -203,10 +203,10 @@ export function buildAlterTableStmt(
         );
       }
       return new AlterTableNode(ctx.scope, tableReference, {
+        // Any `with defaults (…)` rides inside stmt.action.select.
         type: 'setMaintained',
         columns: stmt.action.columns,
         select: stmt.action.select,
-        insertDefaults: stmt.action.insertDefaults,
       });
     }
 

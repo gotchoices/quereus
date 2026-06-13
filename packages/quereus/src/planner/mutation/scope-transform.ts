@@ -213,6 +213,11 @@ function rebuildSelect(
 		orderBy: sel.orderBy ? sel.orderBy.map(ob => ({ ...ob, expr: onExpr(ob.expr) })) : undefined,
 		limit: sel.limit ? onExpr(sel.limit) : undefined,
 		offset: sel.offset ? onExpr(sel.offset) : undefined,
+		// A `with defaults` clause is write-through metadata, not a live scalar of the
+		// read query — pure-clone it (severs sharing for the in-place rename
+		// rewriters that descend `select.defaults`) without threading the substitution,
+		// exactly like the sibling `with inverse` clause above.
+		defaults: cloneDefaultsClause(sel.defaults),
 		compound: sel.compound ? { ...sel.compound, select: onLeg(sel.compound.select) } : undefined,
 		union: sel.union ? onLeg(sel.union) as AST.SelectStmt : undefined,
 	};
@@ -282,6 +287,14 @@ function cloneInverseClause(
 	inverse: ReadonlyArray<AST.ResultColumnInverse> | undefined,
 ): AST.ResultColumnInverse[] | undefined {
 	return inverse?.map(a => ({ ...a, expr: cloneExpr(a.expr) }));
+}
+
+/** Structural clone of a select's `with defaults` assignment list (mirrors
+ *  {@link cloneInverseClause}). */
+function cloneDefaultsClause(
+	defaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
+): AST.ViewInsertDefault[] | undefined {
+	return defaults?.map(d => ({ ...d, expr: cloneExpr(d.expr) }));
 }
 
 /** Structural clone of mutation-context assignments. */

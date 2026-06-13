@@ -9,10 +9,10 @@ import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
 import { validateForeignKeyOverExistingRows, validateForeignKeyCollations, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
-import type { ColumnDef, QueryExpr, ViewInsertDefault } from '../../parser/ast.js';
+import type { ColumnDef, QueryExpr } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
-import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames } from '../../schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
@@ -123,7 +123,7 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				return runDropTableTags(rctx, tableSchema, action.keys);
 			}
 			case 'setMaintained':
-				return runSetMaintained(rctx, tableSchema, schema, action.columns, action.select, action.insertDefaults);
+				return runSetMaintained(rctx, tableSchema, schema, action.columns, action.select);
 			case 'dropMaintained':
 				return runDropMaintained(rctx, tableSchema, schema);
 		}
@@ -1340,15 +1340,15 @@ async function runSetMaintained(
 	schema: import('../../schema/schema.js').Schema,
 	columns: ReadonlyArray<string> | undefined,
 	select: QueryExpr,
-	insertDefaults: ReadonlyArray<ViewInsertDefault> | undefined,
 ): Promise<SqlValue> {
 	const live = schema.getTable(tableSchema.name);
 	if (!live) {
 		throw new QuereusError(`no such table: ${tableSchema.name}`, StatusCode.ERROR);
 	}
 	const explicit = columns !== undefined && columns.length > 0;
+	// Any omitted-insert defaults ride inside `select` (→ derivation.selectAst).
 	await attachMaintainedDerivation(
-		rctx.db, live, select, insertDefaults,
+		rctx.db, live, select,
 		/*recordedColumns*/ explicit ? columns : undefined,
 		/*positionalRename*/ explicit, /*allowReshape*/ true,
 	);
@@ -1474,18 +1474,18 @@ async function propagateTableRenameInSchema(
 
 	if (schema.name.toLowerCase() === renamedSchemaLower) {
 		for (const view of Array.from(schema.getAllViews())) {
+			// The body walk also descends the trailing `with defaults (…)` clause
+			// (now stored on `selectAst.defaults`), so a clause-only rewrite — a
+			// defaults-expr subquery referencing the renamed table even when the body
+			// never names it — flips `bodyChanged` and fires the (single) view_modified.
 			const bodyChanged = renameTableInAst(view.selectAst, oldName, newName, renamedSchemaName);
-			// An `insert defaults` expr subquery can reference the renamed table even
-			// when the body never names it, so a clause-only rewrite must still fire
-			// the (single) view_modified below.
-			const clause = renameTableInInsertDefaults(view.insertDefaults, oldName, newName, renamedSchemaName);
-			if (bodyChanged || clause?.changed) {
+			if (bodyChanged) {
 				const updatedView = { ...view, sql: astToString(view.selectAst) };
 				schema.addView(updatedView);
-				// The rewriters mutated `view.selectAst` / the clause exprs in place, so
-				// `oldObject` shares the rewritten ASTs (only `newObject.sql` differs).
-				// No consumer reads `oldObject.selectAst`; mirrors the table loop above
-				// (no clone).
+				// The rewriter mutated `view.selectAst` (including its defaults clause) in
+				// place, so `oldObject` shares the rewritten AST (only `newObject.sql`
+				// differs). No consumer reads `oldObject.selectAst`; mirrors the table
+				// loop above (no clone).
 				notifier.notifyChange({
 					type: 'view_modified',
 					schemaName: schema.name,
@@ -1602,23 +1602,22 @@ async function propagateColumnRenameInSchema(
 
 	if (schema.name.toLowerCase() === renamedSchemaLower) {
 		for (const view of Array.from(schema.getAllViews())) {
-			const bodyChanged = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, renamedSchemaName);
-			// `insert defaults` targets a base column of the view's FROM table —
-			// usually projected away, so the body rewrite alone never sees it. The
-			// FROM-table set scopes the clause rewrite; collecting it after the body
-			// rewrite is safe (a column rename never changes table names).
-			const clause = view.insertDefaults?.length
-				? renameColumnInInsertDefaults(view.insertDefaults, collectFromTableNames(view.selectAst, renamedSchemaName), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
-				: null;
-			if (bodyChanged || clause?.changed) {
-				const updatedView = clause?.changed
-					? { ...view, insertDefaults: clause.defaults, sql: astToString(view.selectAst) }
-					: { ...view, sql: astToString(view.selectAst) };
+			// The body walk also descends the trailing `with defaults (…)` clause (now
+			// on `selectAst.defaults`): the entry `column` (a base column of the view's
+			// FROM table, usually projected away) rewrites via the same scope-aware
+			// synthetic probe as a `with inverse` target, and the entry exprs rewrite in
+			// the FROM frame — so a clause-only change flips `bodyChanged`. The live
+			// `resolveColumnInSource` keeps the walk scope-aware so an unqualified ref
+			// inside a defaults-expr subquery that binds a like-named column on its own
+			// FROM is not false-captured (the differ's inverse reconcile passes the
+			// declared-side resolver for parity).
+			const bodyChanged = renameColumnInAst(view.selectAst, tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource);
+			if (bodyChanged) {
+				const updatedView = { ...view, sql: astToString(view.selectAst) };
 				schema.addView(updatedView);
-				// The rewriters mutated `view.selectAst` / the clause exprs in place, so
-				// `oldObject` shares the rewritten ASTs (only `sql` — and the clause
-				// array when a `column` entry changed — differ). No consumer reads
-				// `oldObject.selectAst`; mirrors the table loop above (no clone).
+				// The rewriter mutated `view.selectAst` (including its defaults clause) in
+				// place, so `oldObject` shares the rewritten AST (only `sql` differs). No
+				// consumer reads `oldObject.selectAst`; mirrors the table loop above (no clone).
 				notifier.notifyChange({
 					type: 'view_modified',
 					schemaName: schema.name,

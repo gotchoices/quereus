@@ -226,10 +226,9 @@ export function assertViewSchemaEqual(direct: ViewSchema, applied: ViewSchema, l
 	eqArray(dCols, aCols, `${root}columns`);
 	// View body — structural compare via assertAstEquivalent.
 	try {
+		// The body AST compare covers the trailing `with defaults (col = expr, …)`
+		// clause too — it now rides inside `selectAst` (SelectStmt.defaults).
 		assertAstEquivalent(direct.selectAst, applied.selectAst, `${root}selectAst`);
-		// `insert defaults (col = expr, …)` — entries carry AST expressions, so the
-		// same structural comparator applies (missing ≡ empty array).
-		assertAstEquivalent(direct.insertDefaults ?? [], applied.insertDefaults ?? [], `${root}insertDefaults`);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		expect.fail(msg);
@@ -257,8 +256,8 @@ export function assertMaterializedViewSchemaEqual(direct: MaintainedTableSchema,
 	eq(direct.derivation.bodyHash, applied.derivation.bodyHash, `${root}derivation.bodyHash`);
 	eq(generateMaintainedTableDDL(direct), generateMaintainedTableDDL(applied), `${root}generatedDDL`);
 	try {
+		// The body AST compare covers the trailing `with defaults (…)` clause too.
 		assertAstEquivalent(direct.derivation.selectAst, applied.derivation.selectAst, `${root}derivation.selectAst`);
-		assertAstEquivalent(direct.derivation.insertDefaults ?? [], applied.derivation.insertDefaults ?? [], `${root}derivation.insertDefaults`);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		expect.fail(msg);

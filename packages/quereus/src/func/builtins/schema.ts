@@ -23,7 +23,7 @@ import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-no
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
 import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, surfacedInnerFlagNames } from "../../planner/mutation/set-op.js";
-import type { ViewSchema } from "../../schema/view.js";
+import { type ViewSchema, bodyDefaults } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
 
@@ -883,14 +883,14 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// View-level insert defaults (Divergence 1): the `view-insert-default`
 	// provenance is never threaded onto `PhysicalProperties` (it is consumed only
 	// in the rewrite), so this body is planned without the view's defaults and the
-	// walk above misses them. Fold each `insert defaults (col = expr, …)` clause
-	// column into `defaultable` directly, mirroring `resolveDefaultForColumn` — a
-	// base column of a reachable target (the common projected-away case) or a
-	// visible view-output column with base lineage. Unlike the rewrite, an
-	// unresolvable name is silently skipped: a read-only introspection surface
-	// stays on its never-throw posture (the per-view try/catch would otherwise
-	// collapse the row to all-`NO`).
-	const defaultedColumns = new Set<string>((view.insertDefaults ?? []).map(d => d.column.toLowerCase()));
+	// walk above misses them. Fold each `with defaults (col = expr, …)` clause
+	// column (now stored on the body select AST) into `defaultable` directly,
+	// mirroring `resolveDefaultForColumn` — a base column of a reachable target
+	// (the common projected-away case) or a visible view-output column with base
+	// lineage. Unlike the rewrite, an unresolvable name is silently skipped: a
+	// read-only introspection surface stays on its never-throw posture (the
+	// per-view try/catch would otherwise collapse the row to all-`NO`).
+	const defaultedColumns = new Set<string>((bodyDefaults(view.selectAst) ?? []).map(d => d.column.toLowerCase()));
 	for (const colName of defaultedColumns) {
 		let resolved = false;
 		for (const id of targetIds) {

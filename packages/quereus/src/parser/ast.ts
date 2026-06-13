@@ -184,6 +184,17 @@ export interface SelectStmt extends AstNode {
 	unionAll?: boolean;
 	compound?: { op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'; select: QueryExpr; existence?: ReadonlyArray<SetOpMembershipColumn> };
 	schemaPath?: string[]; // Optional schema search path from WITH SCHEMA clause
+	/**
+	 * Optional trailing `with defaults (col = expr, …)` clause — per-column
+	 * omitted-insert defaults for view write-through. Binds to the WHOLE compound
+	 * (like trailing `order by`), so it is parsed only in non-compound-leg
+	 * position and never lands on a leg. Inert metadata wherever no write path
+	 * consumes it (a bare top-level select, a VALUES view body); the view INSERT
+	 * write-through rewrite and `view_info`'s insertability derivation pull it
+	 * from the stored body AST. See {@link ViewInsertDefault} and
+	 * docs/view-updateability.md § View defaults.
+	 */
+	defaults?: ReadonlyArray<ViewInsertDefault>;
 }
 
 /**
@@ -297,13 +308,14 @@ export type QueryExpr =
 	| DeleteStmt;
 
 /**
- * The `maintained [(columns)] as <body> [insert defaults (col = expr, …)]`
- * clause of a CREATE TABLE — declares the table as a **maintained table** (the
- * canonical table form of a materialized view): the declared column/PK shape is
- * the frozen basis and the body must derive exactly that shape. The optional
- * `(columns)` is the explicit output-column rename list (see `columns` below).
- * Clause order:
- * `(columns) → using → maintained [(columns)] as … → insert defaults → with tags`.
+ * The `maintained [(columns)] as <body>` clause of a CREATE TABLE — declares the
+ * table as a **maintained table** (the canonical table form of a materialized
+ * view): the declared column/PK shape is the frozen basis and the body must
+ * derive exactly that shape. The optional `(columns)` is the explicit
+ * output-column rename list (see `columns` below). Any omitted-insert defaults
+ * ride inside the body select's trailing `with defaults (…)` clause
+ * ({@link SelectStmt.defaults}). Clause order:
+ * `(columns) → using → maintained [(columns)] as <body … with defaults> → with tags`.
  * `maintained` is contextual (no new reserved word).
  */
 export interface MaintainedClause {
@@ -314,10 +326,9 @@ export interface MaintainedClause {
 	 * of arity-erroring against a stale declared list.
 	 */
 	columns?: ReadonlyArray<string>;
-	/** Derivation body — any relation-producing QueryExpr. */
+	/** Derivation body — any relation-producing QueryExpr. Carries its own
+	 *  `with defaults (…)` clause when present ({@link SelectStmt.defaults}). */
 	select: QueryExpr;
-	/** Trailing `insert defaults (col = expr, …)` — omitted-insert defaults for write-through. */
-	insertDefaults?: ReadonlyArray<ViewInsertDefault>;
 }
 
 // CREATE TABLE statement
@@ -355,9 +366,10 @@ export interface CreateAssertionStmt extends AstNode {
 }
 
 /**
- * One entry of a view's `insert defaults (col = expr, …)` clause: a per-column
- * default supplied when an insert through the view omits the column. The column
- * may name a base column the view projects away or a base-lineage view column.
+ * One entry of a select body's `with defaults (col = expr, …)` clause: a
+ * per-column default supplied when an insert through the view omits the column.
+ * The column may name a base column the view projects away or a base-lineage
+ * view column. Stored on {@link SelectStmt.defaults}.
  */
 export interface ViewInsertDefault {
 	column: string;
@@ -370,10 +382,10 @@ export interface CreateViewStmt extends AstNode {
 	view: IdentifierExpr;
 	ifNotExists: boolean;
 	columns?: string[];
-	/** View body — any relation-producing form. Bare `VALUES (...)` is permitted. */
+	/** View body — any relation-producing form. Bare `VALUES (...)` is permitted.
+	 *  Carries its own trailing `with defaults (…)` clause when present
+	 *  ({@link SelectStmt.defaults}). */
 	select: QueryExpr;
-	/** Trailing `insert defaults (col = expr, …)` clause — omitted-insert defaults for write-through. */
-	insertDefaults?: ReadonlyArray<ViewInsertDefault>;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 
@@ -389,8 +401,6 @@ export interface CreateMaterializedViewStmt extends AstNode {
 	moduleName?: string;
 	/** Optional backing-module arguments (forward-compatible; ignored in v1). */
 	moduleArgs?: Record<string, SqlValue>;
-	/** Trailing `insert defaults (col = expr, …)` clause — omitted-insert defaults for write-through. */
-	insertDefaults?: ReadonlyArray<ViewInsertDefault>;
 	tags?: Record<string, SqlValue>; // Optional metadata tags from WITH TAGS clause
 }
 
@@ -714,10 +724,12 @@ export type AlterTableAction =
 	}
 	| {
 		/**
-		 * ALTER TABLE … SET MAINTAINED [(cols)] AS <body> [INSERT DEFAULTS (…)] —
-		 * attach (or, on an already-maintained table, atomically replace) a
-		 * derivation. The optional `(cols)` is the explicit output-column rename
-		 * list (the differ's lossless encoding of an MV-sugar `(a, c)` rename):
+		 * ALTER TABLE … SET MAINTAINED [(cols)] AS <body> — attach (or, on an
+		 * already-maintained table, atomically replace) a derivation. Any
+		 * omitted-insert defaults ride inside the body select's trailing
+		 * `with defaults (…)` clause ({@link SelectStmt.defaults}). The optional
+		 * `(cols)` is the explicit output-column rename list (the differ's lossless
+		 * encoding of an MV-sugar `(a, c)` rename):
 		 * present ⇒ the body outputs are renamed positionally to it, the list is
 		 * recorded as `derivation.columns`, and a same-arity name drift reshapes
 		 * (renames) the backing in place; absent ⇒ the implicit form (the body's
@@ -728,8 +740,7 @@ export type AlterTableAction =
 		 */
 		type: 'setMaintained',
 		columns?: ReadonlyArray<string>,
-		select: QueryExpr,
-		insertDefaults?: ReadonlyArray<ViewInsertDefault>
+		select: QueryExpr
 	}
 	| {
 		/**

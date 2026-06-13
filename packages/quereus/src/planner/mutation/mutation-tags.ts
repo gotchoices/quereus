@@ -12,7 +12,7 @@ const log = createLogger('mutation:tags');
  * site only. No reserved tag carries view-mutation behavior anymore — write
  * *routing* is per-row writable presence/membership columns (the outer-join
  * existence column and the set-op membership columns), and omitted-insert
- * *defaults* are the first-class `insert defaults (col = expr, …)` view clause
+ * *defaults* are the first-class `with defaults (col = expr, …)` body-select clause
  * (which retired the last `quereus.update.*` key, `default_for.<column>`). What
  * remains here is the guard: a typo'd or mis-sited `quereus.*` key declared on
  * the mutated view/MV must still fail loudly at mutation time — view-DDL tag

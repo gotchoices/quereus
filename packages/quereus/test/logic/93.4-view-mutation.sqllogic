@@ -1611,15 +1611,15 @@ select bid, aref from m_b order by bid;
 → [{"bid":10,"aref":1},{"bid":20,"aref":null}]
 
 -- ===================================
--- Phase 3.4: view insert defaults + per-row routing. A view's omitted-insert
--- defaults are declared first-class — `create view v as <body> insert defaults
+-- Phase 3.4: view with defaults + per-row routing. A view's omitted-insert
+-- defaults are declared first-class — `create view v as <body> with defaults
 -- (col = expr, …)` — the construct that replaced the removed
 -- `quereus.update.default_for.<column>` tag (view-DDL and statement-level alike;
 -- a per-statement default is expressible as an explicit insert value). Write
 -- *routing* is no longer a tag either — predicates rule, and a per-row writable
 -- presence/existence column states a non-default side explicitly. Every retired
 -- `quereus.update.*` key is now an `unknown-reserved-tag` error. See
--- docs/view-updateability.md § View insert defaults.
+-- docs/view-updateability.md § View with defaults.
 -- ===================================
 
 -- --- the retired statement-level default_for tag is unknown at the dml-stmt site ---
@@ -1632,9 +1632,9 @@ insert into df_v with tags ("quereus.update.default_for.created" = '777') values
 select * from df_t order by id;
 → []
 
--- --- insert defaults: the view-declared omitted-insert default ---
+-- --- with defaults: the view-declared omitted-insert default ---
 create table df2 (id integer primary key, created integer);
-create view df2_v as select id from df2 insert defaults (created = 111);
+create view df2_v as select id from df2 with defaults (created = 111);
 
 -- the clause supplies the omitted projected-away column (the expression is a
 -- first-class AST value, not re-parsed tag text).
@@ -1642,9 +1642,9 @@ insert into df2_v values (1);
 select * from df2 order by id;
 → [{"id":1,"created":111}]
 
--- --- insert defaults: non-literal expression, alongside a renamed column list ---
+-- --- with defaults: non-literal expression, alongside a renamed column list ---
 create table df3 (id integer primary key, created integer, label text);
-create view df3_v (ident, tag) as select id, label from df3 insert defaults (created = 100 + 11);
+create view df3_v (ident, tag) as select id, label from df3 with defaults (created = 100 + 11);
 insert into df3_v values (1, 'x');
 select * from df3 order by id;
 → [{"id":1,"created":111,"label":"x"}]
@@ -1660,17 +1660,17 @@ insert into df5_v values (1);
 select * from df5 order by id;
 → []
 
--- --- insert defaults naming an unknown column: hard sited error at write ---
+-- --- with defaults naming an unknown column: hard sited error at write ---
 create table df6 (id integer primary key, created integer);
-create view df6_v as select id from df6 insert defaults (nope = 1);
+create view df6_v as select id from df6 with defaults (nope = 1);
 insert into df6_v values (1);
 -- error: not a column
 
--- --- materialized view: insert defaults write through to the source and are
+-- --- materialized view: with defaults write through to the source and are
 -- transparent to row-time backing maintenance (maintenance projects the
 -- resulting source row, defaulted column included-then-projected-away).
 create table mvd_t (id integer primary key, name text, created integer not null);
-create materialized view mvd_v as select id, name from mvd_t insert defaults (created = 777);
+create materialized view mvd_v as select id, name from mvd_t with defaults (created = 777);
 insert into mvd_v values (1, 'a');
 -- the source row carries the defaulted not-null column...
 select * from mvd_t order by id;
@@ -1759,7 +1759,7 @@ insert into bvu_v values (1);
 -- The view projects `created`, so a statement that supplies it explicitly must
 -- override the view's declared insert default; an omitted insert still takes it.
 create table dfp (id integer primary key, created integer);
-create view dfp_v as select id, created from dfp insert defaults (created = 111);
+create view dfp_v as select id, created from dfp with defaults (created = 111);
 insert into dfp_v (id, created) values (1, 999);
 insert into dfp_v (id) values (2);
 select * from dfp order by id;

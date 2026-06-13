@@ -127,7 +127,6 @@ interface MaintainedTableImportSpec {
 	 * sited error); absent ⇒ implicit, the body reshapes to follow its source.
 	 */
 	columns: ReadonlyArray<string> | undefined;
-	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** Backing-host module from a `using <module>(...)` clause; absent ⇒ memory default. */
 	moduleName?: string;
 	moduleArgs?: Record<string, SqlValue>;
@@ -141,7 +140,6 @@ function maintainedImportFromMvStmt(stmt: AST.CreateMaterializedViewStmt): Maint
 		name: stmt.view.name,
 		select: stmt.select,
 		columns: stmt.columns,
-		insertDefaults: stmt.insertDefaults,
 		moduleName: stmt.moduleName,
 		moduleArgs: stmt.moduleArgs,
 		tags: stmt.tags,
@@ -164,7 +162,6 @@ function maintainedImportFromTableStmt(stmt: AST.CreateTableStmt): MaintainedTab
 		name: stmt.table.name,
 		select: maintained.select,
 		columns: maintained.columns,
-		insertDefaults: maintained.insertDefaults,
 		moduleName: stmt.moduleName,
 		moduleArgs: stmt.moduleArgs,
 		tags: stmt.tags,
@@ -2857,9 +2854,9 @@ export class SchemaManager {
 			name: viewName,
 			schemaName: targetSchemaName,
 			sql: createViewToString(stmt),
+			// Any `with defaults (…)` rides inside stmt.select (→ selectAst).
 			selectAst: stmt.select,
 			columns: stmt.columns ? Object.freeze([...stmt.columns]) : undefined,
-			insertDefaults: stmt.insertDefaults,
 			tags: stmt.tags && Object.keys(stmt.tags).length > 0 ? Object.freeze({ ...stmt.tags }) : undefined,
 		};
 
@@ -2925,10 +2922,10 @@ export class SchemaManager {
 		const def: MaterializeViewDefinition = {
 			schemaName: targetSchemaName,
 			viewName,
+			// Any `with defaults (…)` rides inside spec.select (→ selectAst).
 			selectAst: spec.select,
 			bodySql: astToString(spec.select),
 			columns: spec.columns,
-			insertDefaults: spec.insertDefaults,
 			tags: spec.tags ? Object.freeze({ ...spec.tags }) : undefined,
 			backingModuleName: backing.storedModuleName,
 			backingModuleArgs: backing.storedModuleArgs,

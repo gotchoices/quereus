@@ -344,7 +344,7 @@ drop table widget;
 -- time, so an unreconciled recreate naming the NEW column would fail at apply.
 
 create table emp (emp_id integer primary key, fullname text not null, created integer not null);
-create view emp_v as select emp_id, fullname from emp insert defaults (created = 7);
+create view emp_v as select emp_id, fullname from emp with defaults (created = 7);
 insert into emp values (1, 'Carol', 0);
 
 declare schema main {
@@ -354,7 +354,7 @@ declare schema main {
 		created integer not null
 	}
 
-	view emp_v as select emp_id, full_name from emp insert defaults (created = 7)
+	view emp_v as select emp_id, full_name from emp with defaults (created = 7)
 }
 
 -- run
@@ -815,15 +815,15 @@ drop index tri_new;
 drop table src_new;
 
 -- ===================================
--- 23. Hinted VIEW rename + insert defaults + in-diff COLUMN rename
+-- 23. Hinted VIEW rename + with defaults + in-diff COLUMN rename
 -- ===================================
 
--- The recreate's `insert defaults` clause must also name the OLD column (its
+-- The recreate's `with defaults` clause must also name the OLD column (its
 -- column names a base-table column, often projected away — the body rewrite
 -- cannot catch it); after the create, RENAME COLUMN propagation rewrites it.
 
 create table emp2 (emp_id integer primary key, fullname text not null, created integer not null);
-create view ev_old as select emp_id, fullname from emp2 insert defaults (created = 7);
+create view ev_old as select emp_id, fullname from emp2 with defaults (created = 7);
 insert into emp2 values (1, 'Carol', 0);
 
 declare schema main {
@@ -833,13 +833,13 @@ declare schema main {
 		created_at integer not null with tags ("quereus.previous_name" = 'created')
 	}
 
-	view ev_new as select emp_id, fullname from emp2 insert defaults (created_at = 7) with tags ("quereus.previous_name" = 'ev_old')
+	view ev_new as select emp_id, fullname from emp2 with defaults (created_at = 7) with tags ("quereus.previous_name" = 'ev_old')
 }
 
 -- run
 
 diff schema main;
-→ [{"ddl": "DROP VIEW IF EXISTS ev_old"}, {"ddl": "create view ev_new as select emp_id, fullname from emp2 insert defaults (created = 7) with tags (\"quereus.previous_name\" = 'ev_old')"}, {"ddl": "ALTER TABLE emp2 RENAME COLUMN created TO created_at"}]
+→ [{"ddl": "DROP VIEW IF EXISTS ev_old"}, {"ddl": "create view ev_new as select emp_id, fullname from emp2 with defaults (created = 7) with tags (\"quereus.previous_name\" = 'ev_old')"}, {"ddl": "ALTER TABLE emp2 RENAME COLUMN created TO created_at"}]
 
 apply schema main;
 

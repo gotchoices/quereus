@@ -50,10 +50,10 @@ export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ct
 		const mv = await materializeView(db, {
 			schemaName: plan.schemaName,
 			viewName: plan.viewName,
+			// Any `with defaults (…)` rides inside plan.selectStmt (→ selectAst).
 			selectAst: plan.selectStmt,
 			bodySql: plan.bodySql,
 			columns: plan.columns,
-			insertDefaults: plan.insertDefaults,
 			tags: plan.tags,
 			backingModuleName: plan.backingModuleName,
 			backingModuleArgs: plan.backingModuleArgs,

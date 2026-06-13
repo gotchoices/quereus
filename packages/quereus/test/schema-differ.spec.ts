@@ -62,7 +62,7 @@ function catalogView(sql: string): CatalogView {
 	return {
 		name: view.view.name,
 		ddl: sql,
-		definition: viewDefinitionToCanonicalString(view.columns, view.select, view.insertDefaults),
+		definition: viewDefinitionToCanonicalString(view.columns, view.select),
 		tags: view.tags,
 	};
 }
@@ -90,7 +90,7 @@ function catalogMaintainedTable(sql: string, columns: Array<{ name: string; prim
 		primaryKey: columns.filter(c => c.primaryKey).map(c => ({ columnName: c.name, desc: false })),
 		referencedTables: [],
 		namedConstraints: [],
-		maintained: { bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select, mv.insertDefaults)) },
+		maintained: { bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select)) },
 	};
 }
 
@@ -288,7 +288,7 @@ describe('Schema Differ', () => {
 
 		it('throws on the removed quereus.update.default_for tag on a declared view', () => {
 			// default_for was the last quereus.update.* key; the first-class
-			// `insert defaults (col = expr, …)` clause replaced it, so it is unknown
+			// `with defaults (col = expr, …)` clause replaced it, so it is unknown
 			// at any site — including its former view-ddl home.
 			const declared = parseDeclaredSchema(
 				`declare schema main { table t { id integer primary key, x integer } view v as select id from t with tags ("quereus.update.default_for.x" = '0') }`
@@ -336,15 +336,15 @@ describe('Schema Differ', () => {
 	describe('view definition drift (canonical compare + rename reconciliation)', () => {
 		it('clause-only drift on a name-matched view → drop+recreate, no SET TAGS', () => {
 			const declared = parseDeclaredSchema(
-				`declare schema main { table t { id integer primary key } view v as select id from t insert defaults (created = 222) }`
+				`declare schema main { table t { id integer primary key } view v as select id from t with defaults (created = 222) }`
 			);
 			const catalog = makeCatalog(
 				[catalogTable('t', 'id')],
-				[catalogView('create view v as select id from t insert defaults (created = 111)')],
+				[catalogView('create view v as select id from t with defaults (created = 111)')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal(['v']);
-			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id from t insert defaults (created = 222)']);
+			expect(diff.viewsToCreate).to.deep.equal(['create view v as select id from t with defaults (created = 222)']);
 			expect(diff.viewTagsChanges, 'a recreate carries the declared tags — no separate SET TAGS').to.deep.equal([]);
 		});
 
@@ -387,12 +387,12 @@ describe('Schema Differ', () => {
 						newc integer with tags ("quereus.previous_name" = 'oldc'),
 						extra integer
 					}
-					view v as select id, newc from t insert defaults (extra = newc + 1)
+					view v as select id, newc from t with defaults (extra = newc + 1)
 				}`
 			);
 			const catalog = makeCatalog(
 				[catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'oldc' }, { name: 'extra' }])],
-				[catalogView('create view v as select id, oldc from t insert defaults (extra = oldc + 1)')],
+				[catalogView('create view v as select id, oldc from t with defaults (extra = oldc + 1)')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
@@ -410,12 +410,12 @@ describe('Schema Differ', () => {
 						id integer primary key,
 						newc integer with tags ("quereus.previous_name" = 'oldc')
 					}
-					view v as select id from t insert defaults (newc = 1)
+					view v as select id from t with defaults (newc = 1)
 				}`
 			);
 			const catalog = makeCatalog(
 				[catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'oldc' }])],
-				[catalogView('create view v as select id from t insert defaults (oldc = 1)')],
+				[catalogView('create view v as select id from t with defaults (oldc = 1)')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
@@ -433,7 +433,7 @@ describe('Schema Differ', () => {
 						id integer primary key,
 						marker integer with tags ("quereus.previous_name" = 'old_marker')
 					}
-					view v as select id from t insert defaults (marker = 1)
+					view v as select id from t with defaults (marker = 1)
 				}`
 			);
 			const catalog = makeCatalog(
@@ -441,7 +441,7 @@ describe('Schema Differ', () => {
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'marker' }]),
 					catalogTableWithColumns('other', [{ name: 'id', primaryKey: true }, { name: 'old_marker' }]),
 				],
-				[catalogView('create view v as select id from t insert defaults (marker = 1)')],
+				[catalogView('create view v as select id from t with defaults (marker = 1)')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
@@ -449,7 +449,7 @@ describe('Schema Differ', () => {
 		});
 
 		it('an in-diff rename whose NEW name collides with a clause-subquery FROM table\'s column reconciles scope-aware (declared-side resolver)', () => {
-			// Gap-B cousin for the `insert defaults` expr: t.qty → cap while lim — the
+			// Gap-B cousin for the `with defaults` expr: t.qty → cap while lim — the
 			// clause expr's subquery FROM — also has a `cap`. The seeded inverse walk
 			// must leave the inner ref bound to lim (the declared-side resolver answers
 			// from the declared column sets) and rewrite only the outer ref; a false
@@ -462,7 +462,7 @@ describe('Schema Differ', () => {
 						cap integer with tags ("quereus.previous_name" = 'qty'),
 						extra integer
 					}
-					view v as select id from t insert defaults (extra = cap + (select max(cap) from lim))
+					view v as select id from t with defaults (extra = cap + (select max(cap) from lim))
 				}`
 			);
 			const catalog = makeCatalog(
@@ -470,7 +470,7 @@ describe('Schema Differ', () => {
 					catalogTableWithColumns('lim', [{ name: 'id', primaryKey: true }, { name: 'cap' }]),
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'qty' }, { name: 'extra' }]),
 				],
-				[catalogView('create view v as select id from t insert defaults (extra = qty + (select max(cap) from lim))')],
+				[catalogView('create view v as select id from t with defaults (extra = qty + (select max(cap) from lim))')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'inner subquery ref not falsely inverse-captured — no recreate').to.deep.equal([]);
@@ -491,7 +491,7 @@ describe('Schema Differ', () => {
 						cap integer with tags ("quereus.previous_name" = 'qty'),
 						extra integer
 					}
-					view v2 as select id from t insert defaults (extra = cap + (select max(cap) from lim)) with tags ("quereus.previous_name" = 'v')
+					view v2 as select id from t with defaults (extra = cap + (select max(cap) from lim)) with tags ("quereus.previous_name" = 'v')
 				}`
 			);
 			const catalog = makeCatalog(
@@ -499,7 +499,7 @@ describe('Schema Differ', () => {
 					catalogTableWithColumns('lim', [{ name: 'id', primaryKey: true }, { name: 'cap' }]),
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'qty' }, { name: 'extra' }]),
 				],
-				[catalogView('create view v as select id from t insert defaults (extra = qty + (select max(cap) from lim))')],
+				[catalogView('create view v as select id from t with defaults (extra = qty + (select max(cap) from lim))')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);
@@ -521,7 +521,7 @@ describe('Schema Differ', () => {
 						id integer primary key,
 						c2 integer with tags ("quereus.previous_name" = 'c')
 					}
-					view v as select id from t insert defaults (ts = (select max(c2) from audit))
+					view v as select id from t with defaults (ts = (select max(c2) from audit))
 				}`
 			);
 			const catalog = makeCatalog(
@@ -529,7 +529,7 @@ describe('Schema Differ', () => {
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
 					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
 				],
-				[catalogView('create view v as select id from t insert defaults (ts = (select max(c) from audit))')],
+				[catalogView('create view v as select id from t with defaults (ts = (select max(c) from audit))')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
@@ -549,14 +549,14 @@ describe('Schema Differ', () => {
 						id integer primary key,
 						c2 integer with tags ("quereus.previous_name" = 'c')
 					}
-					materialized view mv as select id from t insert defaults (ts = (select max(c2) from audit))
+					materialized view mv as select id from t with defaults (ts = (select max(c2) from audit))
 				}`
 			);
 			const catalog = makeCatalog(
 				[
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
 					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
-					catalogMaintainedTable('create materialized view mv as select id from t insert defaults (ts = (select max(c) from audit))'),
+					catalogMaintainedTable('create materialized view mv as select id from t with defaults (ts = (select max(c) from audit))'),
 				],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
@@ -580,7 +580,7 @@ describe('Schema Differ', () => {
 						id integer primary key,
 						c2 integer with tags ("quereus.previous_name" = 'c')
 					} with tags ("quereus.previous_name" = 'audit')
-					view v as select id from t insert defaults (ts = (select max(c2) from audit2))
+					view v as select id from t with defaults (ts = (select max(c2) from audit2))
 				}`
 			);
 			const catalog = makeCatalog(
@@ -588,7 +588,7 @@ describe('Schema Differ', () => {
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
 					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
 				],
-				[catalogView('create view v as select id from t insert defaults (ts = (select max(c) from audit))')],
+				[catalogView('create view v as select id from t with defaults (ts = (select max(c) from audit))')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop).to.deep.equal([]);
@@ -610,7 +610,7 @@ describe('Schema Differ', () => {
 						id integer primary key,
 						c2 integer with tags ("quereus.previous_name" = 'c')
 					}
-					view v2 as select id from t insert defaults (ts = (select max(c2) from audit)) with tags ("quereus.previous_name" = 'v')
+					view v2 as select id from t with defaults (ts = (select max(c2) from audit)) with tags ("quereus.previous_name" = 'v')
 				}`
 			);
 			const catalog = makeCatalog(
@@ -618,7 +618,7 @@ describe('Schema Differ', () => {
 					catalogTableWithColumns('t', [{ name: 'id', primaryKey: true }, { name: 'ts' }]),
 					catalogTableWithColumns('audit', [{ name: 'id', primaryKey: true }, { name: 'c' }]),
 				],
-				[catalogView('create view v as select id from t insert defaults (ts = (select max(c) from audit))')],
+				[catalogView('create view v as select id from t with defaults (ts = (select max(c) from audit))')],
 			);
 			const diff = computeSchemaDiff(declared, catalog);
 			expect(diff.viewsToDrop, 'hinted rename drops the old name').to.deep.equal(['v']);

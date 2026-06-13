@@ -1,11 +1,28 @@
 ----
-description: Prove the `with defaults` clause on CTE / subquery-in-FROM write targets — BLOCKED, the premise that these are write targets is false in the current engine
-prereq: with-defaults-clause-rehome
+description: Prove the `with defaults` clause on CTE / subquery-in-FROM write targets, once those targets exist. Chains behind `cte-subquery-dml-write-target-dispatch` (the feature build) and `with-defaults-clause-rehome` (the clause must parse on a core select first).
+prereq: with-defaults-clause-rehome, cte-subquery-dml-write-target-dispatch
 files: packages/quereus/test/logic/93.4-view-mutation.sqllogic, packages/quereus/test/logic/ (new coverage), docs/view-updateability.md, packages/quereus/src/parser/ast.ts, packages/quereus/src/parser/parser.ts, packages/quereus/src/planner/building/{insert,update,delete}.ts
 difficulty: medium
 ----
 
-**BLOCKED — category (b) premise mismatch (with a category (a) design question riding on it).**
+## Unblocked (2026-06-13, human sign-off): build the write targets
+
+The premise this ticket was blocked on — that CTE / subquery-in-FROM DML write
+targets exist — is now being **built**: the dev chose to build the capability
+(plan ticket `cte-subquery-dml-write-target-dispatch`) rather than walk the docs
+back. So this reverts to an ordinary prereq-deferred test ticket: once the
+feature lands it runs as originally written below (supplied-wins / omitted-fires
+through a CTE/subquery write target, the inert read-only case, routing parity /
+`default-target-not-found` on a typo'd target, compound-CTE write-through, the
+non-updatable-subquery case). The doc-correction part (L81 / L662) is subsumed by
+the feature ticket making those claims true. The original analysis below is kept
+for context — its "why blocked" reasoning is now historical (the block is lifted),
+but its empirical probe and code-evidence remain the accurate starting map for
+the feature implementer.
+
+---
+
+**Original analysis (now historical — block lifted; retained as the feature map).**
 Unblocks when the dev decides scope: **(i)** build CTE / subquery-in-FROM *write-target* dispatch
 (a new feature — not present today and not a tess ticket), after which this test ticket can run as
 written; **OR (ii)** re-scope this ticket to drop the write-target coverage (cover only the inert

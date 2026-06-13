@@ -668,6 +668,14 @@ export class Parser {
 		// for a compound subquery (they bind to the outer compound).
 		this.parseTrailingOrderLimit(result, isCompoundSubquery);
 
+		// Trailing `with defaults (col = expr, …)` — binds to the whole compound,
+		// after limit/offset and before any DDL-level `with tags`. Suppressed on a
+		// compound leg (it belongs to the outer compound, like trailing ORDER BY).
+		if (!isCompoundSubquery) {
+			const defaults = this.parseDefaultsClause();
+			if (defaults) result.defaults = defaults;
+		}
+
 		result.loc = _createLoc(start, this.previous());
 		return result;
 	}
@@ -2164,6 +2172,23 @@ export class Parser {
 		return this.tokens[this.current + n].type === type;
 	}
 
+	/**
+	 * Non-consuming lookahead for a trailing `with defaults` clause — `WITH`
+	 * followed by the contextual `DEFAULTS` keyword (an IDENTIFIER lexeme, since
+	 * DEFAULTS is not reserved). Used by the VALUES trailing-clause path to decide
+	 * whether to wrap `VALUES …` as `SELECT * FROM (VALUES …)` so the select spine's
+	 * {@link parseDefaultsClause} can consume the clause — exactly how a trailing
+	 * ORDER BY / LIMIT on VALUES already wraps. A trailing `WITH TAGS` (DDL-level)
+	 * never matches, so it stays with the outer DDL parser.
+	 */
+	private checkWithDefaults(): boolean {
+		if (!this.check(TokenType.WITH)) return false;
+		const next = this.tokens[this.current + 1];
+		return next !== undefined
+			&& next.type === TokenType.IDENTIFIER
+			&& next.lexeme.toUpperCase() === 'DEFAULTS';
+	}
+
 	private advance(): Token {
 		if (!this.isAtEnd()) this.current++;
 		const tok = this.previous();
@@ -2420,7 +2445,10 @@ export class Parser {
 	private valuesStatementWithOptionalCompound(startToken: Token, withClause?: AST.WithClause, isCompoundSubquery: boolean = false): AST.QueryExpr {
 		const values = this.valuesStatement(startToken);
 		const hasCompound = this.checkCompoundOperator();
-		const hasTrailing = !isCompoundSubquery && (this.check(TokenType.ORDER) || this.check(TokenType.LIMIT));
+		// A trailing `with defaults (…)` wraps just like ORDER BY / LIMIT so the
+		// select spine consumes it — a VALUES-bodied view's defaults are inert
+		// (the view is non-updateable), but the clause must still parse + store.
+		const hasTrailing = !isCompoundSubquery && (this.check(TokenType.ORDER) || this.check(TokenType.LIMIT) || this.checkWithDefaults());
 		if (!hasCompound && !hasTrailing) {
 			return values;
 		}
@@ -2449,6 +2477,11 @@ export class Parser {
 		// Compound chain (left-associative tail) binds before ORDER BY / LIMIT.
 		const result = this.parseCompoundTail(sel, withClause, startToken);
 		this.parseTrailingOrderLimit(result, isCompoundSubquery);
+		// Trailing `with defaults (…)` binds to the whole compound (see selectStatement).
+		if (!isCompoundSubquery) {
+			const defaults = this.parseDefaultsClause();
+			if (defaults) result.defaults = defaults;
+		}
 		return result;
 	}
 
@@ -2564,7 +2597,7 @@ export class Parser {
             }
 		}
 
-		// Optional `maintained as <body> [insert defaults (…)]` clause — the declared-shape
+		// Optional `maintained as <body … with defaults (…)>` clause — the declared-shape
 		// maintained-table form. `maintained` is contextual (an IDENTIFIER lexeme match), and
 		// this position (after the column list / USING clause, before the WITH clauses) is
 		// unambiguous, so no look-ahead guard is needed.
@@ -2607,9 +2640,10 @@ export class Parser {
 	}
 
 	/**
-	 * Parse the optional `maintained as <query-expr> [insert defaults (col = expr, …)]`
-	 * clause of a CREATE TABLE (or a `declare schema` table item) — the declared-shape
-	 * maintained-table form. Returns undefined when the clause is absent.
+	 * Parse the optional `maintained as <query-expr>` clause of a CREATE TABLE (or
+	 * a `declare schema` table item) — the declared-shape maintained-table form.
+	 * Any omitted-insert defaults ride inside the body select's trailing
+	 * `with defaults (…)` clause. Returns undefined when the clause is absent.
 	 */
 	private parseMaintainedClause(): AST.MaintainedClause | undefined {
 		if (!this.matchKeyword('MAINTAINED')) return undefined;
@@ -2620,10 +2654,10 @@ export class Parser {
 		const columns = this.parseMaintainedColumnList();
 		this.consumeKeyword('AS', "Expected 'AS' after MAINTAINED.");
 		// Body is any QueryExpr — bare SELECT / VALUES / WITH … SELECT all qualify.
-		// DML bodies parse here but the planner rejects them.
+		// DML bodies parse here but the planner rejects them. A trailing
+		// `with defaults (…)` is consumed by the select spine into `select.defaults`.
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
-		const insertDefaults = this.parseInsertDefaultsClause();
-		return { columns, select, insertDefaults };
+		return { columns, select };
 	}
 
 	/**
@@ -2737,8 +2771,8 @@ export class Parser {
 		// them (mutating views are out of scope for this milestone).
 		const select = this.parseQueryExpr(withClause, /*requireReturning*/ true);
 
-		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
-		const insertDefaults = this.parseInsertDefaultsClause();
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
 
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
@@ -2756,45 +2790,46 @@ export class Parser {
 			ifNotExists,
 			columns,
 			select,
-			insertDefaults,
 			tags,
 			loc: _createLoc(startToken, this.previous()),
 		};
 	}
 
 	/**
-	 * Parse the optional trailing `insert defaults ( col = expr , … )` clause of a
-	 * view / materialized-view definition — per-column omitted-insert defaults for
-	 * write-through. Returns undefined when the clause is absent. Commits only once
-	 * DEFAULTS follows INSERT, so a stray `insert` after a complete view body still
-	 * surfaces as the same downstream syntax error it did before this clause existed.
+	 * Parse the optional trailing `with defaults ( col = expr , … )` clause of a
+	 * core select — per-column omitted-insert defaults for view write-through.
+	 * Modeled byte-for-byte on {@link parseInverseClause}: commits only once
+	 * DEFAULTS follows WITH, so a statement-trailing `with tags` / `with schema` /
+	 * `with context` stays with the outer parser (the rewound token is WITH, which
+	 * never touches the parenStack — so the bare cursor rewind is safe). Returns
+	 * undefined when the clause is absent. An empty assignment list is a parse error.
 	 */
-	private parseInsertDefaultsClause(): AST.ViewInsertDefault[] | undefined {
-		if (!this.check(TokenType.INSERT)) return undefined;
+	private parseDefaultsClause(): AST.ViewInsertDefault[] | undefined {
+		if (!this.check(TokenType.WITH)) return undefined;
 		this.advance();
 		if (!this.peekKeyword('DEFAULTS')) {
-			// Not our clause — back up the INSERT and stop. Bare cursor rewind is safe
-			// only because the rewound token is INSERT: advance() has one non-cursor
-			// side effect (LPAREN/RPAREN parenStack maintenance), which INSERT never hits.
+			// Not our clause — back up the WITH and stop. Bare cursor rewind is safe
+			// only because the rewound token is WITH: advance() has one non-cursor
+			// side effect (LPAREN/RPAREN parenStack maintenance), which WITH never hits.
 			this.current--;
 			return undefined;
 		}
 		this.advance();
-		this.consume(TokenType.LPAREN, "Expected '(' after INSERT DEFAULTS.");
+		this.consume(TokenType.LPAREN, "Expected '(' after WITH DEFAULTS.");
 		const defaults: AST.ViewInsertDefault[] = [];
 		const seen = new Set<string>();
 		do {
 			const columnToken = this.peek();
-			const column = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in INSERT DEFAULTS.");
+			const column = this.consumeIdentifier(CONTEXTUAL_KEYWORDS, "Expected column name in WITH DEFAULTS.");
 			if (seen.has(column.toLowerCase())) {
-				throw this.error(columnToken, `Duplicate column '${column}' in INSERT DEFAULTS.`);
+				throw this.error(columnToken, `Duplicate column '${column}' in WITH DEFAULTS.`);
 			}
 			seen.add(column.toLowerCase());
-			this.consume(TokenType.EQUAL, `Expected '=' after INSERT DEFAULTS column '${column}'.`);
+			this.consume(TokenType.EQUAL, `Expected '=' after WITH DEFAULTS column '${column}'.`);
 			const expr = this.expression();
 			defaults.push({ column, expr });
 		} while (this.match(TokenType.COMMA));
-		this.consume(TokenType.RPAREN, "Expected ')' after INSERT DEFAULTS list.");
+		this.consume(TokenType.RPAREN, "Expected ')' after WITH DEFAULTS list.");
 		return defaults;
 	}
 
@@ -2911,8 +2946,8 @@ export class Parser {
 		// DML bodies parse here but the planner rejects them.
 		const select = this.parseQueryExpr(withClause, /*requireReturning*/ true);
 
-		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
-		const insertDefaults = this.parseInsertDefaultsClause();
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
 
 		// Parse the trailing `with tags (...)` metadata clause.
 		let tags: Record<string, SqlValue> | undefined;
@@ -2933,7 +2968,6 @@ export class Parser {
 			select,
 			moduleName,
 			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
-			insertDefaults,
 			tags,
 			loc: _createLoc(startToken, this.previous()),
 		};
@@ -3175,17 +3209,17 @@ export class Parser {
 		} else if (this.peekKeyword('SET')) {
 			this.consumeKeyword('SET', "Expected SET.");
 			if (this.matchKeyword('MAINTAINED')) {
-				// SET MAINTAINED [(cols)] AS <body> [INSERT DEFAULTS (...)] — attach /
-				// re-attach a derivation. No `using` clause: the module is the table's
-				// identity. The optional `(cols)` is the explicit output-column rename
-				// list (the differ's lossless encoding of an MV-sugar `(a, c)` rename):
-				// present ⇒ positional rename + recorded explicit; absent ⇒ implicit
-				// (the body's natural names). The required AS keeps it unambiguous.
+				// SET MAINTAINED [(cols)] AS <body> — attach / re-attach a derivation.
+				// No `using` clause: the module is the table's identity. The optional
+				// `(cols)` is the explicit output-column rename list (the differ's
+				// lossless encoding of an MV-sugar `(a, c)` rename): present ⇒ positional
+				// rename + recorded explicit; absent ⇒ implicit (the body's natural
+				// names). The required AS keeps it unambiguous. A trailing
+				// `with defaults (…)` rides inside the body (`select.defaults`).
 				const columns = this.parseMaintainedColumnList();
 				this.consumeKeyword('AS', "Expected 'AS' after SET MAINTAINED.");
 				const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
-				const insertDefaults = this.parseInsertDefaultsClause();
-				action = { type: 'setMaintained', columns, select, insertDefaults };
+				action = { type: 'setMaintained', columns, select };
 			} else {
 				// Table-level `SET TAGS (...)` — whole-set tag replacement on the table.
 				this.consumeKeyword('TAGS', "Expected 'TAGS' or 'MAINTAINED' after SET.");
@@ -3628,7 +3662,7 @@ export class Parser {
 			this.consume(TokenType.RPAREN, "Expected ')' after table definition.");
 		}
 
-		// Optional `maintained as <body> [insert defaults (…)]` — the declared-shape
+		// Optional `maintained as <body … with defaults (…)>` — the declared-shape
 		// maintained-table form, carried through the CreateTableStmt reuse. (Differ
 		// transition handling is a follow-up; the clause parses and round-trips.)
 		const maintained = this.parseMaintainedClause();
@@ -3718,8 +3752,8 @@ export class Parser {
 		this.consumeKeyword('AS', "Expected AS before view body in view declaration.");
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 
-		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
-		const insertDefaults = this.parseInsertDefaultsClause();
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
 
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
@@ -3737,7 +3771,6 @@ export class Parser {
 			ifNotExists: false,
 			columns,
 			select,
-			insertDefaults,
 			tags
 		};
 
@@ -3782,8 +3815,8 @@ export class Parser {
 		this.consumeKeyword('AS', "Expected AS before view body in materialized view declaration.");
 		const select = this.parseQueryExpr(undefined, /*requireReturning*/ true);
 
-		// Optional trailing `insert defaults (col = expr, …)`, before WITH TAGS.
-		const insertDefaults = this.parseInsertDefaultsClause();
+		// A trailing `with defaults (…)` rides inside the select body
+		// (`select.defaults`); only the DDL-level WITH TAGS is parsed here.
 
 		// Parse optional WITH TAGS
 		let tags: Record<string, SqlValue> | undefined;
@@ -3803,7 +3836,6 @@ export class Parser {
 			select,
 			moduleName,
 			moduleArgs: moduleName && Object.keys(moduleArgs).length > 0 ? moduleArgs : undefined,
-			insertDefaults,
 			tags
 		};
 

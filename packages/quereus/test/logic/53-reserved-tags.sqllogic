@@ -60,7 +60,7 @@ apply schema bad_site;
 
 -- ===================================
 -- 2b. The retired `quereus.update.default_for.<col>` key → unknown at apply
---     (the first-class `insert defaults (…)` view clause replaced it; a stray
+--     (the first-class `with defaults (…)` view clause replaced it; a stray
 --     occurrence is an unknown key now, no longer a mis-site)
 -- ===================================
 

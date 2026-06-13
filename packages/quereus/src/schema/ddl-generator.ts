@@ -60,7 +60,7 @@ export function generateTableDDL(tableSchema: TableSchema, db?: Database): strin
  * {@link import('./derivation.js').TableDerivation}) — the table form:
  *
  *   `create table <schema>.<name> (<declared shape>) [using <module>(args)]
- *    maintained as <body> [insert defaults (…)] [with tags (…)]`
+ *    maintained as <body … [with defaults (…)]> [with tags (…)]`
  *
  * This is the one canonical comparison/persistence surface for every maintained
  * table regardless of authoring form (`create table … maintained as` or the
@@ -86,9 +86,9 @@ export function generateMaintainedTableDDL(table: MaintainedTableSchema): string
 		// Emit the rename list only when the derivation carries one (an explicit
 		// MV-sugar rename / an attached backing). Its absence is the lossless signal
 		// that the body is implicit and must reshape to follow its source on reopen.
+		// Any `with defaults (…)` rides inside the body string (selectAst).
 		columns: table.derivation.columns,
 		select: table.derivation.selectAst,
-		insertDefaults: table.derivation.insertDefaults,
 	});
 	return generateTableDDLInternal(table, ctx, usingClause, maintained);
 }
@@ -219,8 +219,8 @@ export function generateViewDDL(view: ViewSchema): string {
 		view: { type: 'identifier', name: view.name, schema: view.schemaName },
 		ifNotExists: false,
 		columns: view.columns ? [...view.columns] : undefined,
+		// Any `with defaults (…)` rides inside the body string (selectAst).
 		select: view.selectAst,
-		insertDefaults: view.insertDefaults,
 		tags: view.tags ? { ...view.tags } : undefined,
 	};
 	return createViewToString(stmt);

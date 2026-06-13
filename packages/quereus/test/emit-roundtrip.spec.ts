@@ -311,11 +311,11 @@ describe('Emit: statement round-trips', () => {
 			expect(firstExprColumn(body).inverse).to.equal(undefined);
 		});
 
-		it("view body's trailing INSERT DEFAULTS stays with the view", () => {
-			const stmt = parse('create view v as select a from t insert defaults (b = 1)') as CreateViewStmt;
-			expect(stmt.insertDefaults).to.have.length(1);
+		it("view body's trailing WITH DEFAULTS stays with the view", () => {
+			const stmt = parse('create view v as select a from t with defaults (b = 1)') as CreateViewStmt;
 			const body = stmt.select;
 			if (body.type !== 'select') throw new Error('Expected select body');
+			expect(body.defaults).to.have.length(1);
 			expect(firstExprColumn(body).inverse).to.equal(undefined);
 		});
 
@@ -329,9 +329,9 @@ describe('Emit: statement round-trips', () => {
 			roundTripStmt('select b from (select a + 1 as b with inverse (a = new.b - 1) from t) as s');
 		});
 
-		it('view body, alone and with trailing insert defaults + tags', () => {
+		it('view body, alone and with trailing with defaults + tags', () => {
 			roundTripStmt('create view v as select a + 1 as b with inverse (a = new.b - 1) from t');
-			roundTripStmt("create view v as select a + 1 as b with inverse (a = new.b - 1) from t insert defaults (c = 1) with tags (k = 'x')");
+			roundTripStmt("create view v as select a + 1 as b with inverse (a = new.b - 1) from t with defaults (c = 1) with tags (k = 'x')");
 		});
 
 		it('compound legs', () => {

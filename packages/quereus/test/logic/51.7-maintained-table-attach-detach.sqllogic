@@ -364,14 +364,14 @@ drop table mt3;
 drop table src3;
 
 -- ===================================
--- 10. insert defaults clause on the table form (write-through supplies the
+-- 10. with defaults clause on the table form (write-through supplies the
 --     omitted column)
 -- ===================================
 
 create table src4 (id integer primary key, v text not null, created integer not null);
 create table mt4 (id integer primary key, v text not null, created integer not null)
   maintained as select id, v, created from src4
-  insert defaults (created = 42);
+  with defaults (created = 42);
 
 insert into mt4 (id, v) values (1, 'a');
 select * from src4;
@@ -384,7 +384,7 @@ drop materialized view mt4;
 -- the clause also rides the attach verb
 create table mt5 (id integer primary key, v text not null, created integer not null);
 alter table mt5 set maintained as select id, v, created from src4
-  insert defaults (created = 99);
+  with defaults (created = 99);
 insert into mt5 (id, v) values (2, 'b');
 select * from src4 order by id;
 → [{"id":1,"v":"a","created":42},{"id":2,"v":"b","created":99}]

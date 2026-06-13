@@ -1071,7 +1071,7 @@ insert into decl_expo_idx.ExpoTbl values (2, 'VIN001');
 drop table decl_expo_idx.ExpoTbl;
 
 -- ===================================================================
--- View `insert defaults (col = expr, …)` survives the declare/diff/apply
+-- View `with defaults (col = expr, …)` survives the declare/diff/apply
 -- round-trip: the diff renders the clause in the create DDL, the apply
 -- re-parses that DDL, and an insert through the applied view supplies the
 -- defaulted column. Declared in `main` since declarative views in
@@ -1088,14 +1088,14 @@ declare schema main {
 		created INTEGER NOT NULL
 	)
 
-	view decl_dfl_v as select id, name from decl_dfl insert defaults (created = 424242)
+	view decl_dfl_v as select id, name from decl_dfl with defaults (created = 424242)
 }
 
 -- run
 
 -- The rendered create DDL carries the clause in canonical form.
 diff schema main;
-→ [{"ddl": "create table decl_dfl (id INTEGER primary key, name TEXT, created INTEGER not null)"}, {"ddl": "create view decl_dfl_v as select id, name from decl_dfl insert defaults (created = 424242)"}]
+→ [{"ddl": "create table decl_dfl (id INTEGER primary key, name TEXT, created INTEGER not null)"}, {"ddl": "create view decl_dfl_v as select id, name from decl_dfl with defaults (created = 424242)"}]
 
 apply schema main;
 
@@ -1117,7 +1117,7 @@ drop table decl_dfl;
 -- ===================================================================
 -- View definition drift on a NAME-MATCHED view (ticket
 -- view-insert-defaults-declarative-drift-undetected): a changed /
--- removed / added `insert defaults` clause and a changed body each
+-- removed / added `with defaults` clause and a changed body each
 -- diff as DROP VIEW + CREATE VIEW. Previously all four diffed EMPTY —
 -- a stale default survived apply silently. Tag-only drift still takes
 -- the in-place SET TAGS path (declarative-equivalence unit tests).
@@ -1125,7 +1125,7 @@ drop table decl_dfl;
 -- ===================================================================
 
 create table vd_t (id integer primary key, name text, created integer not null);
-create view vd_v as select id, name from vd_t insert defaults (created = 111);
+create view vd_v as select id, name from vd_t with defaults (created = 111);
 
 -- run
 
@@ -1142,13 +1142,13 @@ declare schema main {
 		created integer not null
 	)
 
-	view vd_v as select id, name from vd_t insert defaults (created = 222)
+	view vd_v as select id, name from vd_t with defaults (created = 222)
 }
 
 -- run
 
 diff schema main;
-→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t insert defaults (created = 222)"}]
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t with defaults (created = 222)"}]
 
 apply schema main;
 
@@ -1199,13 +1199,13 @@ declare schema main {
 		created integer not null
 	)
 
-	view vd_v as select id, name from vd_t insert defaults (created = 333)
+	view vd_v as select id, name from vd_t with defaults (created = 333)
 }
 
 -- run
 
 diff schema main;
-→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t insert defaults (created = 333)"}]
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t with defaults (created = 333)"}]
 
 apply schema main;
 
@@ -1223,13 +1223,13 @@ declare schema main {
 		created integer not null
 	)
 
-	view vd_v as select id, name from vd_t where id > 2 insert defaults (created = 333)
+	view vd_v as select id, name from vd_t where id > 2 with defaults (created = 333)
 }
 
 -- run
 
 diff schema main;
-→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t where id > 2 insert defaults (created = 333)"}]
+→ [{"ddl": "DROP VIEW IF EXISTS vd_v"}, {"ddl": "create view vd_v as select id, name from vd_t where id > 2 with defaults (created = 333)"}]
 
 apply schema main;
 

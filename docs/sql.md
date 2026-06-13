@@ -1284,7 +1284,7 @@ Modifies an existing table's structure or name.
 ALTER TABLE old_name RENAME TO new_name;
 ```
 
-Renames a table. The old name becomes invalid immediately. Fails if the new name already exists. References to the old name in dependent objects are rewritten in place: CHECK expressions on every table in the schema, FOREIGN KEY `referencedTable` entries (across all schemas), partial-index `WHERE` predicates (a table-qualified self-reference like `where t.active = 1` follows the rename, including in the derived UNIQUE constraint of a unique partial index, which shares the predicate AST), view bodies (`selectAst` and the cached `sql` text), view/MV `insert defaults` clauses (an expr subquery referencing the renamed table — a clause-only rewrite still fires the modified event), and materialized-view bodies (which additionally re-key their derived fields and re-register row-time maintenance, staying live — see [materialized-views.md § Rename propagation](materialized-views.md#rename-propagation-mv--faster-view)). The rewrite is best-effort AST replacement — a CTE that intentionally shadowed the old name is not preserved.
+Renames a table. The old name becomes invalid immediately. Fails if the new name already exists. References to the old name in dependent objects are rewritten in place: CHECK expressions on every table in the schema, FOREIGN KEY `referencedTable` entries (across all schemas), partial-index `WHERE` predicates (a table-qualified self-reference like `where t.active = 1` follows the rename, including in the derived UNIQUE constraint of a unique partial index, which shares the predicate AST), view bodies (`selectAst` and the cached `sql` text), view/MV `with defaults` clauses (now stored inside the body select, so an expr subquery referencing the renamed table is rewritten by the body walk — a clause-only rewrite still fires the modified event), and materialized-view bodies (which additionally re-key their derived fields and re-register row-time maintenance, staying live — see [materialized-views.md § Rename propagation](materialized-views.md#rename-propagation-mv--faster-view)). The rewrite is best-effort AST replacement — a CTE that intentionally shadowed the old name is not preserved.
 
 **RENAME COLUMN**
 
@@ -1292,7 +1292,7 @@ Renames a table. The old name becomes invalid immediately. Fails if the new name
 ALTER TABLE table_name RENAME COLUMN old_col TO new_col;
 ```
 
-Renames a column. Data is preserved. Fails if the new name conflicts with an existing column or the old name doesn't exist. As with `RENAME TABLE`, references in CHECK expressions, FOREIGN KEY `referencedColumnNames`, partial-index `WHERE` predicates (unqualified and table-qualified refs on the renamed table, resolved against the indexed table the same way an implicit CHECK seed is; the derived UNIQUE constraint of a unique partial index shares the rewritten AST), view bodies, view/MV `insert defaults` clauses (the clause's target names a base column of the view's FROM table — usually projected away, so a clause-only rewrite still fires the modified event; expr subqueries rewrite scope-aware — see [view-updateability.md § View insert defaults](view-updateability.md#view-insert-defaults)), and materialized-view bodies (a bare passthrough projection's exposed output name follows the rename, carried onto the backing table in place — see [materialized-views.md § Rename propagation](materialized-views.md#rename-propagation-mv--faster-view)) are propagated. Inside dependent SELECTs the rewrite follows scope: unqualified column references resolve when the renamed table (or a CTE that re-exposes the renamed column under the same name) is in the unaliased FROM scope; qualified references resolve via the alias map. A CTE re-exposes the renamed column when it has no explicit column list (`with c as ...` not `with c(x) as ...`) and at least one result column is a passthrough of the renamed column (an unaliased `select k`, `t.k`, or `select *` from the renamed table).
+Renames a column. Data is preserved. Fails if the new name conflicts with an existing column or the old name doesn't exist. As with `RENAME TABLE`, references in CHECK expressions, FOREIGN KEY `referencedColumnNames`, partial-index `WHERE` predicates (unqualified and table-qualified refs on the renamed table, resolved against the indexed table the same way an implicit CHECK seed is; the derived UNIQUE constraint of a unique partial index shares the rewritten AST), view bodies, view/MV `with defaults` clauses (stored inside the body select; the clause's target names a base column of the view's FROM table — usually projected away — and rewrites via the same scope-aware synthetic-probe path a `with inverse` target uses, so a clause-only rewrite still fires the modified event; expr subqueries rewrite scope-aware — see [view-updateability.md § View defaults](view-updateability.md#view-defaults)), and materialized-view bodies (a bare passthrough projection's exposed output name follows the rename, carried onto the backing table in place — see [materialized-views.md § Rename propagation](materialized-views.md#rename-propagation-mv--faster-view)) are propagated. Inside dependent SELECTs the rewrite follows scope: unqualified column references resolve when the renamed table (or a CTE that re-exposes the renamed column under the same name) is in the unaliased FROM scope; qualified references resolve via the alias map. A CTE re-exposes the renamed column when it has no explicit column list (`with c as ...` not `with c(x) as ...`) and at least one result column is a passthrough of the renamed column (an unaliased `select k`, `t.k`, or `select *` from the renamed table).
 
 **ADD COLUMN**
 
@@ -1401,7 +1401,7 @@ The declarative schema differ detects tag drift at all three sites and emits the
 #### SET MAINTAINED / DROP MAINTAINED — derivation lifecycle
 
 ```sql
-ALTER TABLE table_name SET MAINTAINED AS query_expr [INSERT DEFAULTS (column = expr [, ...])];
+ALTER TABLE table_name SET MAINTAINED AS query_expr [WITH DEFAULTS (column = expr [, ...])];
 ALTER TABLE table_name DROP MAINTAINED;
 ```
 
@@ -1428,7 +1428,7 @@ The three verbs carry **exactly the `ALTER TABLE … {SET|ADD|DROP} TAGS` semant
 
 - **Reserved-tag validation site (SET / ADD only; DROP does not validate).** A `quereus.*` key on `ALTER VIEW` / `ALTER MATERIALIZED VIEW … SET TAGS` / `ADD TAGS` is validated at the `view-ddl` site, and on `ALTER INDEX … SET TAGS` / `ADD TAGS` at the `physical-index` site — the same registry and sites `CREATE` / `declare schema` use, so a typo (e.g. `"quereus.bogus"`) fails loudly at plan-build. `DROP TAGS` removes by key with no value validation, so dropping a reserved key (e.g. `DROP TAGS ("quereus.id")`) is legitimate and succeeds.
 - **Materialized views never re-materialize.** Any MV tag change — `SET`, `ADD`, or `DROP` — is a pure metadata write; it does **not** touch the backing table or re-run the body. The declarative differ enforces this: a tag-only MV change takes the in-place `SET TAGS` path, while a **body** change still drops+recreates (carrying the declared tags through the recreate) — the two are mutually exclusive per MV in one migration.
-- **View tag changes reach prepared statements.** No reserved tag drives write-through behavior (routing is per-row presence/membership columns; omitted-insert defaults are the `insert defaults (…)` clause — see [§2.9](#29-updatable-views)), but reserved-tag *validation* re-runs whenever a write-through plan is built — and the change applies to both newly planned statements *and* already-prepared ones: an `ALTER VIEW … {SET|ADD|DROP} TAGS` fires `view_modified` (and the `ALTER MATERIALIZED VIEW` forms fire `materialized_view_modified`), and every view-/MV-mediated write records a `view` plan dependency, so a cached prepared statement that writes through the view is invalidated and re-planned on its next execution — exactly as a table tag change invalidates via `table_modified` — surfacing, e.g., a newly-added invalid reserved key. (Read-only `select … from v` is intentionally *not* invalidated: view tags do not affect read results.)
+- **View tag changes reach prepared statements.** No reserved tag drives write-through behavior (routing is per-row presence/membership columns; omitted-insert defaults are the body select's `with defaults (…)` clause — see [§2.9](#29-updatable-views)), but reserved-tag *validation* re-runs whenever a write-through plan is built — and the change applies to both newly planned statements *and* already-prepared ones: an `ALTER VIEW … {SET|ADD|DROP} TAGS` fires `view_modified` (and the `ALTER MATERIALIZED VIEW` forms fire `materialized_view_modified`), and every view-/MV-mediated write records a `view` plan dependency, so a cached prepared statement that writes through the view is invalidated and re-planned on its next execution — exactly as a table tag change invalidates via `table_modified` — surfacing, e.g., a newly-added invalid reserved key. (Read-only `select … from v` is intentionally *not* invalidated: view tags do not affect read results.)
 - **Index resolution and implicit covering structures.** `ALTER INDEX` resolves the owning table from the index name (index names are unique per schema). The auto-built covering structure backing a UNIQUE constraint is **not** a user-addressable index — `ALTER INDEX … {SET|ADD|DROP} TAGS` on its name raises `NOTFOUND`; its tags live on the originating constraint (`ALTER TABLE … ALTER CONSTRAINT … {SET|ADD|DROP} TAGS`), unless the constraint opted the structure into visibility via `quereus.expose_implicit_index`.
 - **Tags are the only `ALTER` verb for these objects.** There is no structural `ALTER VIEW` / `ALTER MATERIALIZED VIEW` / `ALTER INDEX` (rename, recolumn, …) yet; structural changes still go through drop+recreate (which the declarative pipeline drives automatically).
 
@@ -1441,8 +1441,7 @@ A view is a named query. Selecting from it re-evaluates the body on every refere
 **Syntax:**
 ```sql
 create view [if not exists] view_name [(column[, ...])]
-  as query_expr
-[insert defaults (column = expr [, ...])]
+  as query_expr [with defaults (column = expr [, ...])]
 [with tags (key = value [, ...])]
 
 drop view [if exists] view_name;
@@ -1450,7 +1449,7 @@ drop view [if exists] view_name;
 
 - `query_expr` is any relation-producing expression — a `select`, a `values (...)`, or a `with … select`. A **DML body** (`insert`/`update`/`delete … returning`) is **rejected at create time**: a view re-evaluates per reference, so a write-per-read body is incoherent.
 - An optional column list renames the body's output columns (arity must match).
-- `insert defaults (col = expr, ...)` declares per-column **omitted-insert defaults** for write-through — typically for a base column the view projects away (see [§2.9](#29-updatable-views)). Column names must be distinct; each `expr` must be self-contained (it cannot reference the inserted row's columns); the target is resolved (and a typo rejected) at write time, not at create.
+- `with defaults (col = expr, ...)` is a trailing clause of the **core select** (it binds to the whole query expression after `limit`/`offset`, before `with tags`): it declares per-column **omitted-insert defaults** for write-through — typically for a base column the view projects away (see [§2.9](#29-updatable-views)). Column names must be distinct; each `expr` must be self-contained (it cannot reference the inserted row's columns); the target is resolved (and a typo rejected) at write time, not at create — the base-column lineage it resolves against is only assembled when the view is an actual write target.
 - `with tags (...)` attaches metadata (informational only — reserved `quereus.*` keys are validated, but none carries view behavior; see [§2.9](#29-updatable-views)).
 
 **Examples:**
@@ -1458,7 +1457,7 @@ drop view [if exists] view_name;
 create view ActiveUsers as select * from Users where active = 1;
 create view UserNames(uid, label) as select id, name from Users;
 create view NewUsers(uid, label) as select id, name from Users
-  insert defaults (created = epoch_ms('now'));
+  with defaults (created = epoch_ms('now'));
 drop view if exists ActiveUsers;
 ```
 
@@ -1473,7 +1472,7 @@ Reads and writes through a view report the *base* table(s) to `getChangeScope()`
 - A **passthrough or renamed** column (`c`, `c as alias`) routes the value straight to its base column — writable on both `insert` and `update`.
 - An **invertible-expression** column (`v + 1 as w`) is writable on `update` (the assignment is lowered through the inverse: `set w = 9` ⇒ `set v = 8`). It is **not** insertable.
 - A **computed / non-invertible** column (`lower(name)`, a window or aggregate output) is **read-only**; writing it raises the `no-inverse` diagnostic — *unless* the result column carries an **authored inverse**: `expr as col with inverse (base_col = expr-over-NEW, ...)` upgrades the column to writable on both `update` and `insert` (each assignment computes a base column from the written view row, referenced via the mandatory `new.` qualifier). Targets must be base columns of the FROM sources; `new.*` references must be output columns of the select — both validated at build time wherever the clause appears. See [View Updateability § Authored inverses](view-updateability.md#authored-inverses-with-inverse).
-- A column **omitted** from an `insert` but pinned by an equality predicate is supplied automatically: `create view GreenMen as select * from Men where color = 'green'` lets `insert into GreenMen (name) values ('Bob')` default `color` to `'green'`. A view-declared `insert defaults (col = expr, ...)` entry fills a still-omitted column next (ahead of the base column's declared `default` — the dominant use is a base column the view projects away); base-column `default`s fill the rest; a `not null` column with no available value is rejected.
+- A column **omitted** from an `insert` but pinned by an equality predicate is supplied automatically: `create view GreenMen as select * from Men where color = 'green'` lets `insert into GreenMen (name) values ('Bob')` default `color` to `'green'`. A view-declared `with defaults (col = expr, ...)` entry fills a still-omitted column next (ahead of the base column's declared `default` — the dominant use is a base column the view projects away); base-column `default`s fill the rest; a `not null` column with no available value is rejected.
 - A top-level reference in `where` / `set` / `returning` must name a **view** column — a base column the view projects away does not silently resolve (`unknown-view-column`).
 
 ```sql
@@ -1487,9 +1486,9 @@ delete from GreenMen where id = 7;                    -- routes to Men
 
 **`returning`** through a view projects rows through the *view's* column list, evaluated against post-mutation state (single-source all ops; multi-source `update` / `delete`).
 
-**Insert defaults — and no override tags.** A view declares omitted-insert defaults first-class via the trailing `insert defaults (col = expr, ...)` clause ([§2.8](#28-create-view-statement)); the expression is evaluated per omitted-insert row, ahead of the base column's declared `default`. Write *routing* is not a tag — it is expressed by predicates and per-row writable **presence/membership columns** (the outer-join existence column, the set-op membership columns). To realize a non-default deletion side (e.g. delete the FK-parent), expose the side as an outer-join existence column and write it: `update v set hasP = false where ...`.
+**Insert defaults — and no override tags.** A view declares omitted-insert defaults first-class via the body select's trailing `with defaults (col = expr, ...)` clause ([§2.8](#28-create-view-statement)); the expression is evaluated per omitted-insert row, ahead of the base column's declared `default`. Write *routing* is not a tag — it is expressed by predicates and per-row writable **presence/membership columns** (the outer-join existence column, the set-op membership columns). To realize a non-default deletion side (e.g. delete the FK-parent), expose the side as an outer-join existence column and write it: `update v set hasP = false where ...`.
 
-The entire `quereus.update.*` tag namespace is retired: the routing keys (`target` / `exclude` / `delete_via` / `policy`) and the `default_for.<col>` insert-default override (both its view-DDL and statement-level sites; superseded by the `insert defaults` clause — a per-statement default is expressed as an explicit insert value) are now an `unknown-reserved-tag` error at any site. See [View Updateability](view-updateability.md) for the full per-operator semantics and the complete diagnostic catalog.
+The entire `quereus.update.*` tag namespace is retired: the routing keys (`target` / `exclude` / `delete_via` / `policy`) and the `default_for.<col>` insert-default override (both its view-DDL and statement-level sites; superseded by the `with defaults` clause — a per-statement default is expressed as an explicit insert value) are now an `unknown-reserved-tag` error at any site. See [View Updateability](view-updateability.md) for the full per-operator semantics and the complete diagnostic catalog.
 
 ### 2.10 CREATE MATERIALIZED VIEW Statement
 
@@ -1499,20 +1498,19 @@ A materialized view stores its body in a keyed backing relation kept consistent 
 ```sql
 create materialized view [if not exists] view_name [(column[, ...])]
   [using module_name [(module_args...)]]
-  as query_expr
-[insert defaults (column = expr [, ...])]
+  as query_expr [with defaults (column = expr [, ...])]
 [with tags (key = value [, ...])]
 
 refresh materialized view view_name;
 drop materialized view [if exists] view_name;
 ```
 
-The `create materialized view` form is normalization sugar for the declared-shape **table form** — `create table name (columns...) [using module(...)] maintained [(columns)] as query_expr [insert defaults (...)] [with tags (...)]` — where the table layout is authored and the body must derive exactly that shape (the optional `maintained (columns)` rename list is the lossless persistence encoding of a sugar MV's explicit renames; its absence marks an implicit body that reshapes to follow its source). The table form is also the canonical persistence/export rendering for every maintained table; `refresh materialized view` and `drop materialized view` work on any maintained table regardless of authoring form. See [materialized-views.md § DDL statements](materialized-views.md#ddl-statements) and the `SET MAINTAINED` / `DROP MAINTAINED` lifecycle verbs in [§2.7](#27-alter-table-statement).
+The `create materialized view` form is normalization sugar for the declared-shape **table form** — `create table name (columns...) [using module(...)] maintained [(columns)] as query_expr [with defaults (...)] [with tags (...)]` — where the table layout is authored and the body must derive exactly that shape (the optional `maintained (columns)` rename list is the lossless persistence encoding of a sugar MV's explicit renames; its absence marks an implicit body that reshapes to follow its source). The `with defaults (...)` clause rides the body `query_expr` (the core select), not the DDL statement. The table form is also the canonical persistence/export rendering for every maintained table; `refresh materialized view` and `drop materialized view` work on any maintained table regardless of authoring form. See [materialized-views.md § DDL statements](materialized-views.md#ddl-statements) and the `SET MAINTAINED` / `DROP MAINTAINED` lifecycle verbs in [§2.7](#27-alter-table-statement).
 
 - The body is evaluated and stored at create; create is all-or-nothing.
 - `refresh` is **not required for currency** (row-time maintenance keeps it live); it is an explicit resync verb, useful after a source *schema* change marks the view `stale`.
 - `using module(...)` places the maintained table in the named [backing-host](materialized-views.md#backing-host-capability) module; omitted ⇒ the in-memory default. An unknown module or one without the capability is rejected at build time.
-- `insert defaults (col = expr, ...)` carries the same omitted-insert-default semantics as on a plain view ([§2.8](#28-create-view-statement)) — the default is supplied on the rewritten *source* insert and is transparent to row-time backing maintenance.
+- the body select's trailing `with defaults (col = expr, ...)` clause carries the same omitted-insert-default semantics as on a plain view ([§2.8](#28-create-view-statement)) — the default is supplied on the rewritten *source* insert and is transparent to row-time backing maintenance.
 - `drop table` / `drop view` reject a materialized-view name and redirect to `drop materialized view` (and vice-versa).
 
 **Eligibility (enforced at create).** Row-time maintenance is only affordable for bodies whose per-write delta is bounded, so the accepted shape is narrow. Eligible bodies:
@@ -1528,7 +1526,7 @@ Any other body (general joins, set-operations, recursion, `distinct`, `limit`/`o
 
 **Covering structures.** A materialized view that projects a UNIQUE constraint's columns (plus the source PK), ordered by those columns, can *cover* that constraint — its backing table then answers `insert or replace` / `or ignore` / conflict detection at O(log n), row-time. This is the substrate the [lens](#211-logical-schemas-and-lenses) layer's set-level enforcement builds on.
 
-**Declarative schema.** A `materialized view` item is accepted inside `declare schema { … }`; a definition change — body, explicit column list, or `insert defaults` clause, detected by `bodyHash` over the canonical definition — schedules a drop-and-recreate.
+**Declarative schema.** A `materialized view` item is accepted inside `declare schema { … }`; a definition change — body, explicit column list, or `with defaults` clause (the body string carries it, so `bodyHash` over the canonical definition detects it) — schedules a drop-and-recreate.
 
 ```sql
 create materialized view mv as select id, x from t order by x;

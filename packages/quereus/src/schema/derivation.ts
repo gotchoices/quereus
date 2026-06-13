@@ -28,16 +28,10 @@ export interface TableDerivation {
 	 */
 	columns?: ReadonlyArray<string>;
 	/**
-	 * Per-column omitted-insert defaults from the `insert defaults (col = expr, …)`
-	 * clause — consumed by the write-through rewrite identically to
-	 * {@link import('./view.js').ViewSchema.insertDefaults}.
-	 */
-	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
-	/**
-	 * `computeBodyHash(viewDefinitionToCanonicalString(columns, selectAst,
-	 * insertDefaults))` — the canonical DEFINITION hash the declarative differ
-	 * compares to detect "definition changed → rebuild". Same formula as before
-	 * the unification; differ keying unchanged.
+	 * `computeBodyHash(viewDefinitionToCanonicalString(columns, selectAst))` — the
+	 * canonical DEFINITION hash the declarative differ compares to detect
+	 * "definition changed → rebuild". The body string carries any trailing
+	 * `with defaults (…)` clause, so a defaults-only edit drifts the hash.
 	 */
 	bodyHash: string;
 	/**
@@ -93,14 +87,13 @@ export function isMaintainedTable(table: TableSchema | undefined): table is Main
  * structural shape for a maintained table, so DML naming it routes through the
  * same view-mutation rewrite a plain view uses (write-through to the body's
  * source). The rewrite reads only name / schemaName / selectAst / columns /
- * insertDefaults / tags.
+ * tags — any omitted-insert defaults ride inside `selectAst.defaults`.
  */
 export function maintainedTableViewLike(table: MaintainedTableSchema): {
 	readonly name: string;
 	readonly schemaName: string;
 	readonly selectAst: AST.QueryExpr;
 	readonly columns?: ReadonlyArray<string>;
-	readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	readonly tags?: TableSchema['tags'];
 	readonly noun?: string;
 } {
@@ -109,7 +102,6 @@ export function maintainedTableViewLike(table: MaintainedTableSchema): {
 		schemaName: table.schemaName,
 		selectAst: table.derivation.selectAst,
 		columns: table.derivation.columns,
-		insertDefaults: table.derivation.insertDefaults,
 		tags: table.tags,
 		// Body-shape rejection diagnostics name the target by its kind (see
 		// MutableViewLike.noun) so an unsupported-body MV reject reads

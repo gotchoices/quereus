@@ -316,7 +316,7 @@ function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 	return {
 		name: viewSchema.name,
 		ddl: viewSchema.sql,
-		definition: viewDefinitionToCanonicalString(viewSchema.columns, viewSchema.selectAst, viewSchema.insertDefaults),
+		definition: viewDefinitionToCanonicalString(viewSchema.columns, viewSchema.selectAst),
 		tags: viewSchema.tags,
 	};
 }

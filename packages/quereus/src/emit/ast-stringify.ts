@@ -598,6 +598,12 @@ export function selectToString(stmt: AST.SelectStmt): string {
 	if (stmt.offset) {
 		trailing.push('offset', expressionToString(stmt.offset));
 	}
+	// `with defaults (col = expr, …)` binds to the whole compound, after
+	// limit/offset (mirrors trailing ORDER BY) — appended last in both the
+	// compound and non-compound cases below so re-parse re-binds it to the whole
+	// result, not the left leg.
+	const defaultsStr = defaultsClauseToString(stmt.defaults);
+	if (defaultsStr) trailing.push(defaultsStr);
 
 	let result = parts.join(' ');
 
@@ -633,10 +639,18 @@ export function selectToString(stmt: AST.SelectStmt): string {
 function compoundLegToString(leg: AST.QueryExpr): string {
 	const s = astToString(leg);
 	if (leg.type === 'select' && ((leg.orderBy && leg.orderBy.length > 0) || leg.limit || leg.offset
-		|| (leg.schemaPath && leg.schemaPath.length > 0))) {
+		|| (leg.schemaPath && leg.schemaPath.length > 0)
+		|| (leg.defaults && leg.defaults.length > 0))) {
 		return `(${s})`;
 	}
 	return s;
+}
+
+/** `with defaults (col = expr, …)` clause of a select body, or '' when absent. */
+function defaultsClauseToString(defaults: ReadonlyArray<AST.ViewInsertDefault> | undefined): string {
+	if (!defaults || defaults.length === 0) return '';
+	const entries = defaults.map(d => `${quoteIdentifier(d.column)} = ${expressionToString(d.expr)}`);
+	return `with defaults (${entries.join(', ')})`;
 }
 
 function compoundOpToKeyword(op: 'union' | 'unionAll' | 'intersect' | 'except' | 'diff'): string {
@@ -1077,22 +1091,16 @@ export function createIndexBodyToCanonicalString(stmt: AST.CreateIndexStmt): str
 	return parts.join(' ');
 }
 
-/** `insert defaults (col = expr, …)` clause of a view definition, or '' when absent. */
-function insertDefaultsClauseToString(insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined): string {
-	if (!insertDefaults || insertDefaults.length === 0) return '';
-	const entries = insertDefaults.map(d => `${quoteIdentifier(d.column)} = ${expressionToString(d.expr)}`);
-	return `insert defaults (${entries.join(', ')})`;
-}
-
 /**
  * Renders the **canonical definition** of a view or materialized view — the
  * comparison key the declarative differ uses to detect a name-matched view whose
- * definition changed. Covers the three definitional parts: the explicit column
- * list (`v(a, b)` — for an MV it also names the backing-table columns), the body
- * (`astToString` of the QueryExpr), and the `insert defaults (col = expr, …)`
- * clause (write-through behavior). Excludes the view name / schema / `if not
- * exists` / tags — tags are a separate diff channel (`ALTER VIEW … SET TAGS`),
- * mirroring `CatalogIndex.definition`.
+ * definition changed. Covers the two definitional parts: the explicit column
+ * list (`v(a, b)` — for an MV it also names the backing-table columns) and the
+ * body (`astToString` of the QueryExpr). The body string already carries any
+ * trailing `with defaults (col = expr, …)` clause (write-through behavior) via
+ * `selectToString`, so a defaults-only edit drifts this string automatically.
+ * Excludes the view name / schema / `if not exists` / tags — tags are a separate
+ * diff channel (`ALTER VIEW … SET TAGS`), mirroring `CatalogIndex.definition`.
  *
  * Both diff sides funnel through here (the actual side from the live
  * `ViewSchema` / `TableDerivation` fields, the declared side from the
@@ -1108,15 +1116,12 @@ function insertDefaultsClauseToString(insertDefaults: ReadonlyArray<AST.ViewInse
 export function viewDefinitionToCanonicalString(
 	columns: ReadonlyArray<string> | undefined,
 	select: AST.QueryExpr,
-	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
 ): string {
 	const parts: string[] = [];
 	if (columns && columns.length > 0) {
 		parts.push(`(${columns.map(quoteIdentifier).join(', ')})`);
 	}
 	parts.push(astToString(select));
-	const defaultsStr = insertDefaultsClauseToString(insertDefaults);
-	if (defaultsStr) parts.push(defaultsStr);
 	return parts.join(' ');
 }
 
@@ -1132,10 +1137,8 @@ export function createViewToString(stmt: AST.CreateViewStmt): string {
 	}
 
 	// View body is a QueryExpr — astToString dispatches on the discriminator.
+	// A trailing `with defaults (…)` rides inside the body string (selectToString).
 	parts.push('as', astToString(stmt.select));
-
-	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
-	if (defaultsStr) parts.push(defaultsStr);
 
 	const viewTagStr = tagsClauseToString(stmt.tags);
 	if (viewTagStr) parts.push(viewTagStr.trimStart());
@@ -1157,10 +1160,8 @@ export function createMaterializedViewToString(stmt: AST.CreateMaterializedViewS
 	const usingClause = mvModuleClauseToString(stmt);
 	if (usingClause) parts.push(usingClause);
 
+	// A trailing `with defaults (…)` rides inside the body string (selectToString).
 	parts.push('as', astToString(stmt.select));
-
-	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
-	if (defaultsStr) parts.push(defaultsStr);
 
 	const viewTagStr = tagsClauseToString(stmt.tags);
 	if (viewTagStr) parts.push(viewTagStr.trimStart());
@@ -1267,10 +1268,8 @@ function alterTableToString(stmt: AST.AlterTableStmt): string {
 			const cols = stmt.action.columns?.length
 				? ` (${stmt.action.columns.map(quoteIdentifier).join(', ')})`
 				: '';
-			const parts = [`alter table ${table} set maintained${cols} as`, astToString(stmt.action.select)];
-			const defaultsStr = insertDefaultsClauseToString(stmt.action.insertDefaults);
-			if (defaultsStr) parts.push(defaultsStr);
-			return parts.join(' ');
+			// A trailing `with defaults (…)` rides inside the body string (selectToString).
+			return `alter table ${table} set maintained${cols} as ${astToString(stmt.action.select)}`;
 		}
 		case 'dropMaintained':
 			return `alter table ${table} drop maintained`;
@@ -1428,10 +1427,8 @@ function declaredViewToString(it: AST.DeclaredView): string {
 		parts.push(`(${stmt.columns.map(quoteIdentifier).join(', ')})`);
 	}
 	// View body is a QueryExpr — astToString dispatches on the discriminator.
+	// A trailing `with defaults (…)` rides inside the body string (selectToString).
 	parts.push('as', astToString(stmt.select));
-
-	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
-	if (defaultsStr) parts.push(defaultsStr);
 
 	const tagStr = tagsClauseToString(stmt.tags);
 	if (tagStr) parts.push(tagStr.trimStart());
@@ -1449,10 +1446,8 @@ function declaredMaterializedViewToString(it: AST.DeclaredMaterializedView): str
 	const usingClause = mvModuleClauseToString(stmt);
 	if (usingClause) parts.push(usingClause);
 
+	// A trailing `with defaults (…)` rides inside the body string (selectToString).
 	parts.push('as', astToString(stmt.select));
-
-	const defaultsStr = insertDefaultsClauseToString(stmt.insertDefaults);
-	if (defaultsStr) parts.push(defaultsStr);
 
 	const tagStr = tagsClauseToString(stmt.tags);
 	if (tagStr) parts.push(tagStr.trimStart());
@@ -1854,8 +1849,9 @@ export function createTableToString(stmt: AST.CreateTableStmt): string {
 	return parts.join(' ');
 }
 
-/** `maintained [(columns)] as <body> [insert defaults (…)]` clause of a CREATE TABLE, or '' when absent.
- *  Clause order matches the parser grammar: using → maintained [(columns)] as … → insert defaults → with tags.
+/** `maintained [(columns)] as <body>` clause of a CREATE TABLE, or '' when absent.
+ *  Clause order matches the parser grammar: using → maintained [(columns)] as <body … with defaults> → with tags.
+ *  Any omitted-insert defaults ride inside the body string (selectToString's `with defaults (…)`).
  *  The `(columns)` rename list is emitted only when present (an explicit MV-sugar rename); its absence is
  *  the lossless signal that the body is implicit and may reshape to follow its source on reopen. */
 export function maintainedClauseToString(maintained: AST.MaintainedClause | undefined): string {
@@ -1865,7 +1861,5 @@ export function maintainedClauseToString(maintained: AST.MaintainedClause | unde
 		parts.push(`(${maintained.columns.map(quoteIdentifier).join(', ')})`);
 	}
 	parts.push('as', astToString(maintained.select));
-	const defaultsStr = insertDefaultsClauseToString(maintained.insertDefaults);
-	if (defaultsStr) parts.push(defaultsStr);
 	return parts.join(' ');
 }

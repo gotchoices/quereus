@@ -7,8 +7,8 @@ import type { SqlValue } from '../../src/common/types.js';
  * TAGS` and prepared write-through statements.
  *
  * No reserved tag carries view-mutation *behavior* anymore (routing is per-row
- * presence/membership columns; omitted-insert defaults are the first-class
- * `insert defaults (…)` clause), so the old observable this spec pinned — a
+ * presence/membership columns; omitted-with defaults are the first-class
+ * `with defaults (…)` clause), so the old observable this spec pinned — a
  * cached write-through plan re-ROUTING after a tag change — no longer exists.
  * (`buildViewMutation` still records the `view` plan dependency, and the tag
  * setters still fire `view_modified` / `materialized_view_modified`; that

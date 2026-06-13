@@ -97,10 +97,14 @@ function visitTableRename(
 					visitTableRename(c.expr, oldName, newName, defaultSchemaName, ctx);
 					// A `with inverse` assignment expr can embed a subquery naming any
 					// table; the assignment's target names a base COLUMN, untouched by a
-					// table rename (mirrors renameTableInInsertDefaults).
+					// table rename (same as the `with defaults` clause below).
 					(c.inverse ?? []).forEach(a => visitTableRename(a.expr, oldName, newName, defaultSchemaName, ctx));
 				}
 			});
+			// `with defaults` clause: each entry's `expr` (an inserted-row default) can
+			// embed a subquery naming any table; the entry's `column` names a base
+			// COLUMN, untouched by a table rename.
+			(stmt.defaults ?? []).forEach(d => visitTableRename(d.expr, oldName, newName, defaultSchemaName, ctx));
 			(stmt.from ?? []).forEach(f => visitTableRename(f, oldName, newName, defaultSchemaName, ctx));
 			visitTableRename(stmt.where, oldName, newName, defaultSchemaName, ctx);
 			(stmt.groupBy ?? []).forEach(g => visitTableRename(g, oldName, newName, defaultSchemaName, ctx));
@@ -272,12 +276,29 @@ function rewriteIdentifierIfTable(
 // Column rename
 // ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Rewrite column references inside a full statement/expression AST, resolving
+ * unqualified refs against the FROM scopes the walk descends (no implicit seed,
+ * unlike {@link renameColumnInCheckExpression}). The walk descends a select
+ * body's trailing `with defaults (…)` clause ({@link AST.SelectStmt.defaults}),
+ * whose entry exprs evaluate in the body's FROM scope.
+ *
+ * When `resolveColumnInSource` is supplied, the scope walk consults it at each
+ * inner FROM frame so an unqualified ref that legitimately binds to a like-named
+ * column on a subquery's own FROM source is NOT false-captured by an enclosing
+ * binding (e.g. a `with defaults` expr `cap + (select max(cap) from lim)` under
+ * a `t.cap` rename must leave the inner `lim.cap` untouched). The same callback
+ * infrastructure backs {@link renameColumnInCheckExpression}; both the forward
+ * propagation (live schema lookup) and the differ's inverse reconcile
+ * (declared-side resolver) pass it so the two stay in parity.
+ */
 export function renameColumnInAst(
 	node: AST.AstNode | undefined,
 	tableName: string,
 	oldColName: string,
 	newColName: string,
 	defaultSchemaName: string,
+	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
 	if (!node) return false;
 	const state: ColumnRewriteState = {
@@ -287,6 +308,7 @@ export function renameColumnInAst(
 		defaultSchema: defaultSchemaName.toLowerCase(),
 		scopeStack: [],
 		changed: false,
+		resolveColumnInSource,
 	};
 	visitColumnRename(node, state);
 	return state.changed;
@@ -310,9 +332,8 @@ export function renameColumnInAst(
  *
  * Limitation: aliased subquery / function-source / CTE-projection inner
  * sources are not asked (the rewriter would need recursive column-set
- * inference on their bodies). Same latent issue exists in
- * `renameColumnInAst` for non-CHECK paths — file a follow-up if it
- * surfaces; the callback infrastructure is already in place.
+ * inference on their bodies). `renameColumnInAst` shares the same callback
+ * (passed by the view-body callers) and the same limitation.
  */
 export function renameColumnInCheckExpression(
 	expr: AST.AstNode | undefined,
@@ -534,7 +555,7 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 					// `with inverse` clauses: the assignment target is a bare base-column
 					// name resolving against this select's FROM — exactly an unqualified
 					// body ref, so it rides the same scope-aware walk via a synthetic
-					// probe (mirrors renameColumnInInsertDefaults' target rewrite); the
+					// probe (the `with defaults` clause below uses the same pattern); the
 					// assignment expr rewrites like any body expression.
 					(stmt.columns ?? []).forEach(c => {
 						if (c.type !== 'column' || !c.inverse?.length) return;
@@ -547,6 +568,22 @@ function visitColumnRename(node: AST.AstNode | undefined, state: ColumnRewriteSt
 							}
 							visitColumnRename(a.expr, state);
 						});
+					});
+					// `with defaults` clause: each entry's `column` is a bare base-column
+					// name of this select's FROM (a projected-away base column), so it
+					// rides the same scope-aware synthetic probe as a `with inverse`
+					// target; the entry's `expr` evaluates in the inserted-row context of
+					// the FROM table — exactly the FROM frame already on the scope stack —
+					// so it rewrites like any body expression (an inner subquery in the
+					// expr pushes its own frame and disambiguates a like-named column).
+					(stmt.defaults ?? []).forEach(d => {
+						const probe: AST.ColumnExpr = { type: 'column', name: d.column };
+						visitColumnRename(probe, state);
+						if (probe.name !== d.column) {
+							(d as { column: string }).column = probe.name;
+							state.changed = true;
+						}
+						visitColumnRename(d.expr, state);
 					});
 					const outputRenames = new Map<string, string>();
 					(stmt.columns ?? []).forEach((c, i) => {
@@ -1027,71 +1064,14 @@ function renameNewQualifiedRefs(expr: AST.Expression, renames: ReadonlyMap<strin
 	return changed;
 }
 
-/**
- * Table rename over a view's `insert defaults` clause: descend into each
- * entry's `expr` (a subquery inside it may reference any table); the entry's
- * `column` names a base COLUMN, untouched by a table rename. Exprs are
- * mutated in place (consistent with the body `selectAst` handling); the input
- * array is returned as-is. Returns null when the clause is empty/undefined.
- */
-export function renameTableInInsertDefaults(
-	defaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
-	oldName: string,
-	newName: string,
-	defaultSchemaName: string,
-): { defaults: ReadonlyArray<AST.ViewInsertDefault>; changed: boolean } | null {
-	if (!defaults || defaults.length === 0) return null;
-	let changed = false;
-	for (const d of defaults) {
-		if (renameTableInAst(d.expr, oldName, newName, defaultSchemaName)) changed = true;
-	}
-	return { defaults, changed };
-}
-
-/**
- * Column rename over a view's `insert defaults` clause — the forward mirror of
- * the differ's inverse reconciliation (`reconciledDeclaredViewDefinition`):
- *
- * - `column` names a base column of the view's FROM table, so it rewrites when
- *   the renamed table is among `fromTables` and the name matches `oldColName`
- *   case-insensitively.
- * - `expr` evaluates in the FROM table's inserted-row context — exactly a
- *   CHECK expression's scope — so when the renamed table is a FROM table it
- *   gets the seeded {@link renameColumnInCheckExpression} walk; otherwise the
- *   plain scope-aware {@link renameColumnInAst} still catches subquery
- *   references to an unrelated renamed table.
- *
- * The same-schema gate is the caller's responsibility. Exprs are mutated in
- * place; the returned array is fresh only so a changed `column` string can be
- * swapped without mutating the (frozen) input entries. Returns null when the
- * clause is empty/undefined.
- */
-export function renameColumnInInsertDefaults(
-	defaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
-	fromTables: ReadonlySet<string>,
-	tableName: string,
-	oldColName: string,
-	newColName: string,
-	defaultSchemaName: string,
-	resolveColumnInSource?: ResolveColumnInSource,
-): { defaults: ReadonlyArray<AST.ViewInsertDefault>; changed: boolean } | null {
-	if (!defaults || defaults.length === 0) return null;
-	const isFromTable = fromTables.has(tableName.toLowerCase());
-	const oldColLower = oldColName.toLowerCase();
-	let changed = false;
-	const rewritten = defaults.map(d => {
-		const exprChanged = isFromTable
-			? renameColumnInCheckExpression(d.expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource)
-			: renameColumnInAst(d.expr, tableName, oldColName, newColName, defaultSchemaName);
-		if (exprChanged) changed = true;
-		if (isFromTable && d.column.toLowerCase() === oldColLower) {
-			changed = true;
-			return { ...d, column: newColName };
-		}
-		return d;
-	});
-	return { defaults: rewritten, changed };
-}
+// The former `renameTableInInsertDefaults` / `renameColumnInInsertDefaults`
+// standalone clause rewriters are gone: `with defaults (…)` now rides inside the
+// select body (`SelectStmt.defaults`), so the body walks above
+// (`visitTableRename` / `visitColumnRename` select cases) descend it directly —
+// the entry `expr` rewrites in the select's FROM scope frame and the entry
+// `column` target rides the same scope-aware synthetic probe as a `with inverse`
+// target. No seeded CHECK-expr scope / declared resolver is needed: the real
+// FROM frame is on the scope stack, exactly as for any body reference.
 
 // ──────────────────────────────────────────────────────────────────────
 // Self-qualifier strip (CHECK expressions)

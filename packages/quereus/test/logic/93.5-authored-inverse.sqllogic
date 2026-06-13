@@ -215,7 +215,7 @@ select val from nn_t where id = 1;
 → [{"val":"a"}]
 
 -- ===================================
--- Interaction with `insert defaults`: an authored-inverse target column takes
+-- Interaction with `with defaults`: an authored-inverse target column takes
 -- the inverse-computed value ahead of the clause entry for that base column
 -- (it is a supplied value, not an omission); an unrelated entry still fills.
 -- ===================================
@@ -224,7 +224,7 @@ create table di_t (id integer primary key, code20 text not null, tag text);
 create view di_v as select id, case code20 when 'A1' then 'A' else 'C' end as code
 	with inverse (code20 = case new.code when 'A' then 'A1' else 'C1' end)
 	from di_t
-	insert defaults (code20 = 'X9', tag = 'defaulted');
+	with defaults (code20 = 'X9', tag = 'defaulted');
 
 insert into di_v (id, code) values (1, 'A');
 select * from di_t where id = 1;

@@ -24,7 +24,7 @@ import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { generateViewDDL, generateMaintainedTableDDL } from '../src/schema/ddl-generator.js';
 import { parse } from '../src/parser/index.js';
-import { computeBodyHash, normalizeBackingModule, type ViewSchema } from '../src/schema/view.js';
+import { bodyDefaults, computeBodyHash, normalizeBackingModule, type ViewSchema } from '../src/schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema } from '../src/schema/derivation.js';
 import { buildColumnIndexMap, columnDefToSchema, findPKDefinition, type TableSchema } from '../src/schema/table.js';
 import { viewDefinitionToCanonicalString } from '../src/emit/ast-stringify.js';
@@ -153,17 +153,18 @@ describe('view persistence: importCatalog silent view registration', () => {
 		}
 	});
 
-	it('rehydrates the insert defaults clause — write-through supplies the defaulted column', async () => {
+	it('rehydrates the with defaults clause — write-through supplies the defaulted column', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table t (id integer primary key, name text, created integer not null)');
 			const result = await db.schemaManager.importCatalog([
-				'create view v as select id, name from t insert defaults (created = 999)',
+				'create view v as select id, name from t with defaults (created = 999)',
 			]);
 			expect(result.views).to.deep.equal(['main.v']);
 			const schema = db.schemaManager.getView('main', 'v');
-			expect(schema?.insertDefaults, 'clause survives rehydration').to.have.length(1);
-			expect(schema?.insertDefaults?.[0].column).to.equal('created');
+			const defaults = schema ? bodyDefaults(schema.selectAst) : undefined;
+			expect(defaults, 'clause survives rehydration').to.have.length(1);
+			expect(defaults?.[0].column).to.equal('created');
 			// The rehydrated clause drives write-through: the omitted not-null column fills.
 			await db.exec("insert into v values (1, 'x')");
 			expect(await rows(db, 'select id, name, created from t'))
@@ -226,17 +227,18 @@ describe('view persistence: importCatalog materialized-view re-materialization',
 		}
 	});
 
-	it('rehydrates the insert defaults clause — MV write-through supplies the defaulted source column', async () => {
+	it('rehydrates the with defaults clause — MV write-through supplies the defaulted source column', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table t (id integer primary key, name text, created integer not null)');
 			const result = await db.schemaManager.importCatalog([
-				'create materialized view mv as select id, name from t insert defaults (created = 777)',
+				'create materialized view mv as select id, name from t with defaults (created = 777)',
 			]);
 			expect(result.materializedViews).to.deep.equal(['main.mv']);
 			const schema = db.schemaManager.getMaintainedTable('main', 'mv');
-			expect(schema?.derivation.insertDefaults, 'clause survives re-materialization').to.have.length(1);
-			expect(schema?.derivation.insertDefaults?.[0].column).to.equal('created');
+			const defaults = schema ? bodyDefaults(schema.derivation.selectAst) : undefined;
+			expect(defaults, 'clause survives re-materialization').to.have.length(1);
+			expect(defaults?.[0].column).to.equal('created');
 			await db.exec("insert into mv values (1, 'a')");
 			expect(await rows(db, 'select id, name, created from t'))
 				.to.deep.equal([{ id: 1, name: 'a', created: 777 }]);
@@ -537,9 +539,9 @@ function viewSchemaFromDDL(ddl: string): ViewSchema {
 		name: stmt.view.name,
 		schemaName: stmt.view.schema ?? 'main',
 		sql: ddl,
+		// Any `with defaults (…)` rides inside stmt.select (→ selectAst).
 		selectAst: stmt.select,
 		columns: stmt.columns ? [...stmt.columns] : undefined,
-		insertDefaults: stmt.insertDefaults,
 		tags: stmt.tags,
 	};
 }
@@ -571,9 +573,9 @@ function mvSchemaFromDDL(ddl: string): MaintainedTableSchema {
 			isView: false,
 			tags: stmt.tags,
 			derivation: {
+				// Any `with defaults (…)` rides inside stmt.select (→ selectAst).
 				selectAst: stmt.select,
 				columns: stmt.columns ? [...stmt.columns] : undefined,
-				insertDefaults: stmt.insertDefaults,
 				bodyHash: '',
 				logicalKey: [],
 				sourceTables: [],
@@ -605,7 +607,6 @@ function mvSchemaFromDDL(ddl: string): MaintainedTableSchema {
 				columns: stmt.maintained.columns && stmt.maintained.columns.length > 0
 					? [...stmt.maintained.columns]
 					: undefined,
-				insertDefaults: stmt.maintained.insertDefaults,
 				bodyHash: '',
 				logicalKey: [],
 				sourceTables: [],
@@ -626,8 +627,8 @@ function matrix(kind: 'view' | 'materialized view'): { name: string; ddl: string
 		{ name: 'explicit column list', ddl: `${k} (x, y) as select 1, 2` },
 		{ name: 'compound-SELECT body', ddl: `${k} as select 1 as a union all select 2 as a` },
 		{ name: 'VALUES body', ddl: `${k} as values (1, 2), (3, 4)` },
-		{ name: 'insert defaults clause', ddl: `${k} as select 1 as a insert defaults (created = 42 + 1)` },
-		{ name: 'insert defaults clause + tags', ddl: `${k} as select 1 as a insert defaults (c1 = 7, c2 = epoch_ms('now')) with tags (k = 'v')` },
+		{ name: 'with defaults clause', ddl: `${k} as select 1 as a with defaults (created = 42 + 1)` },
+		{ name: 'with defaults clause + tags', ddl: `${k} as select 1 as a with defaults (c1 = 7, c2 = epoch_ms('now')) with tags (k = 'v')` },
 	];
 }
 
@@ -875,11 +876,11 @@ describe('view persistence: RENAME rewrites a view body and fires view_modified'
 		}
 	});
 
-	it('clause-only column rename (defaulted column projected away) fires one view_modified with rewritten insert defaults', async () => {
+	it('clause-only column rename (defaulted column projected away) fires one view_modified with rewritten with defaults', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table t (id integer primary key, name text, created integer not null)');
-			await db.exec('create view v as select id, name from t insert defaults (created = 99)');
+			await db.exec('create view v as select id, name from t with defaults (created = 99)');
 			const events = await captureEvents(db, () => db.exec('alter table t rename column created to created_at'));
 
 			// The body never names `created`, so this is a pure clause rewrite — it
@@ -887,19 +888,19 @@ describe('view persistence: RENAME rewrites a view body and fires view_modified'
 			const modified = viewModifiedFor(events, 'v');
 			expect(modified, 'exactly one view_modified for v').to.have.length(1);
 			const ddl = generateViewDDL(modified[0].newObject);
-			expect(ddl, 'rewritten DDL names the new clause target').to.match(/insert defaults \(created_at = 99\)/);
+			expect(ddl, 'rewritten DDL names the new clause target').to.match(/with defaults \(created_at = 99\)/);
 			expect(ddl, 'old clause target gone').to.not.match(/created\s*=/);
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('table rename inside an insert defaults expr subquery fires one view_modified with rewritten DDL', async () => {
+	it('table rename inside an with defaults expr subquery fires one view_modified with rewritten DDL', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table audit (c integer primary key)');
 			await db.exec('create table t (id integer primary key, ts integer not null)');
-			await db.exec('create view v as select id from t insert defaults (ts = (select max(c) from audit))');
+			await db.exec('create view v as select id from t with defaults (ts = (select max(c) from audit))');
 			const events = await captureEvents(db, () => db.exec('alter table audit rename to audit2'));
 
 			const modified = viewModifiedFor(events, 'v');
@@ -987,7 +988,7 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 		const db = new Database();
 		try {
 			await db.exec('create table t (id integer primary key, name text, created integer not null)');
-			await db.exec('create materialized view mv as select id, name from t insert defaults (created = 55)');
+			await db.exec('create materialized view mv as select id, name from t with defaults (created = 55)');
 			const events = await captureEvents(db, () => db.exec('alter table t rename column created to created_at'));
 
 			// The body never names `created` — pre-fix the propagation `continue`d
@@ -996,24 +997,24 @@ describe('view persistence: RENAME rewrites an MV body and fires materialized_vi
 			expect(modified, 'exactly one materialized_view_modified for mv').to.have.length(1);
 			const mv = asMaintained(modified[0].newObject);
 			const ddl = generateMaintainedTableDDL(mv);
-			expect(ddl, 'regenerated DDL names the new clause target').to.match(/insert defaults \(created_at = 55\)/);
+			expect(ddl, 'regenerated DDL names the new clause target').to.match(/with defaults \(created_at = 55\)/);
 			expect(ddl, 'old clause target gone').to.not.match(/created\s*=/);
 			// The hash must be computed from the POST-rename clause — exactly what
 			// the differ recomputes from the post-rename declared form.
 			expect(mv.derivation.bodyHash, 'bodyHash hashes the rewritten clause').to.equal(
-				computeBodyHash(viewDefinitionToCanonicalString(mv.derivation.columns, mv.derivation.selectAst, mv.derivation.insertDefaults)));
+				computeBodyHash(viewDefinitionToCanonicalString(mv.derivation.columns, mv.derivation.selectAst)));
 			expect(mv.derivation.stale, 'MV stays live after a clause-only rewrite').to.not.be.true;
 		} finally {
 			await db.close();
 		}
 	});
 
-	it('table rename inside an MV insert defaults expr subquery fires one event with rewritten DDL', async () => {
+	it('table rename inside an MV with defaults expr subquery fires one event with rewritten DDL', async () => {
 		const db = new Database();
 		try {
 			await db.exec('create table audit (c integer primary key)');
 			await db.exec('create table t (id integer primary key, ts integer not null)');
-			await db.exec('create materialized view mv as select id from t insert defaults (ts = (select max(c) from audit))');
+			await db.exec('create materialized view mv as select id from t with defaults (ts = (select max(c) from audit))');
 			const events = await captureEvents(db, () => db.exec('alter table audit rename to audit2'));
 
 			const modified = mvModifiedFor(events, 'mv');

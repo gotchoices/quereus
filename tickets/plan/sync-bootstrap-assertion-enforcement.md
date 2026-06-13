@@ -229,3 +229,21 @@ re-validation contract and remove the open-question note.
   enforce assertions; update any doc that currently states bootstrap does not.
 
 ## End
+
+---
+
+## Triage decision (2026-06-13, human sign-off): Option 1 — trust the origin
+
+Take **Option 1**. Bootstrap installs one origin's already-converged state
+wholesale (replace, not merge), so the merge-introduced-violation class the
+incremental path guards against cannot arise; re-checking is redundant for an
+honest origin and consistent with the seam not re-validating CHECK/NOT NULL/
+UNIQUE/FK on any inbound row. The plan pass emits the small **Appendix A**
+implement ticket (`sync-bootstrap-assertion-trust-origin`, easy): settle the
+store-adapter contract comment with the merge-vs-replace rationale, add the
+docs/materialized-views.md § External row-change ingestion subsection, and pin
+the contract with a test that a bootstrap snapshot whose converged state violates
+an active assertion **succeeds** (no throw, checkpoint cleared, `synced` emitted).
+The two paths agree on intent (trust-the-origin everywhere) and differ in
+mechanism because they do different things (merge vs replace) — documented so the
+asymmetry is not re-filed as a bug. Appendix B (Option 2) is not taken.

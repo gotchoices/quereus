@@ -750,17 +750,17 @@ describe('declarative-equivalence: views', () => {
 		});
 	});
 
-	it('view with insert defaults clause — schema field and write-through agree on both paths', async function () {
+	it('view with with defaults clause — schema field and write-through agree on both paths', async function () {
 		await runCase({
 			name: 'view-insert-defaults',
 			directDDL: [
 				'create table dfl (id integer primary key, name text, created integer not null)',
-				'create view dfl_v as select id, name from dfl insert defaults (created = 424242)',
+				'create view dfl_v as select id, name from dfl with defaults (created = 424242)',
 			],
 			declarativeBody: `table dfl { id INTEGER PRIMARY KEY, name TEXT, created INTEGER NOT NULL }
 
 			view dfl_v as
-				select id, name from dfl insert defaults (created = 424242)`,
+				select id, name from dfl with defaults (created = 424242)`,
 			expectTables: ['dfl'],
 			expectViews: ['dfl_v'],
 			// Write THROUGH the view on both paths — the clause must supply the
@@ -1360,7 +1360,7 @@ describe('declarative-equivalence: materialized views', () => {
 		try {
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, created INTEGER NOT NULL }
-				materialized view mv as select id, x from t insert defaults (created = 111)
+				materialized view mv as select id, x from t with defaults (created = 111)
 			}`);
 			await db.exec('apply schema main');
 			await db.exec('insert into mv values (1, 10)');
@@ -1372,7 +1372,7 @@ describe('declarative-equivalence: materialized views', () => {
 			// Same body, clause 111 → 222: must surface as a re-attach (`set maintained as`).
 			await db.exec(`declare schema main {
 				table t { id INTEGER PRIMARY KEY, x INTEGER NOT NULL, created INTEGER NOT NULL }
-				materialized view mv as select id, x from t insert defaults (created = 222)
+				materialized view mv as select id, x from t with defaults (created = 222)
 			}`);
 			const diff = computeSchemaDiff(
 				db.declaredSchemaManager.getDeclaredSchema('main')!,

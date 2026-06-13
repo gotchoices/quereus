@@ -25,14 +25,14 @@ export function emitCreateView(plan: CreateViewNode, _ctx: EmissionContext): Ins
 			return null;
 		}
 
-		// Create the view schema
+		// Create the view schema. Any `with defaults (…)` rides inside
+		// plan.selectStmt (→ selectAst), so there is no separate field to thread.
 		const viewSchema: ViewSchema = {
 			name: plan.viewName,
 			schemaName: plan.schemaName,
 			sql: plan.sql,
 			selectAst: plan.selectStmt,
 			columns: plan.columns,
-			insertDefaults: plan.insertDefaults,
 			tags: plan.tags,
 		};
 

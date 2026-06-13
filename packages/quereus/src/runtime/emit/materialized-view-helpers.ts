@@ -22,7 +22,8 @@ import type { CoarsenedKeyInfo } from '../../schema/view.js';
 import { computeBodyHash } from '../../schema/view.js';
 import { isMaintainedTable, type MaintainedTableSchema, type TableDerivation } from '../../schema/derivation.js';
 import type { Schema } from '../../schema/schema.js';
-import { renameTableInAst, renameColumnInAst, renameTableInInsertDefaults, renameColumnInInsertDefaults, collectFromTableNames, type ResolveColumnInSource } from '../../schema/rename-rewriter.js';
+import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewriter.js';
+import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
 import type { BackingHost, BackingRowChange } from '../../vtab/backing-host.js';
 import type { VirtualTableConnection } from '../../vtab/connection.js';
@@ -343,8 +344,6 @@ export interface MaterializeViewDefinition {
 	bodySql: string;
 	/** Explicit column list from `create materialized view mv(a, b) ...`, when present. */
 	columns?: ReadonlyArray<string>;
-	/** Per-column omitted-insert defaults from `insert defaults (col = expr, …)`. */
-	insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	tags?: Readonly<Record<string, SqlValue>>;
 	/** Normalized backing-host module (absent ⇒ memory default — see
 	 *  `normalizeBackingModule` in schema/view.ts). */
@@ -380,21 +379,20 @@ export function assertDeclaredColumnArity(def: MaterializeViewDefinition, shape:
  * adopted and a refilled maintained table are indistinguishable (fixed point:
  * export DDL after adopt == after refill).
  *
- * `bodyHash` hashes the canonical DEFINITION (explicit columns + body +
- * insert-defaults clause), NOT the executable bodySql — the declarative differ
- * recomputes the same form from a declared MV, so a clause-only or
- * explicit-columns-only change is detected as drift. `def.bodySql` stays
- * select-only: it feeds execution (collectBodyRows / deriveBackingShape /
- * linkCoveredUniqueConstraints).
+ * `bodyHash` hashes the canonical DEFINITION (explicit columns + body — the body
+ * string carries any trailing `with defaults (…)` clause), NOT the executable
+ * bodySql — the declarative differ recomputes the same form from a declared MV,
+ * so a defaults-only or explicit-columns-only change is detected as drift.
+ * `def.bodySql` stays select-only: it feeds execution (collectBodyRows /
+ * deriveBackingShape / linkCoveredUniqueConstraints).
  */
 function buildTableDerivation(def: MaterializeViewDefinition, shape: BackingShape): TableDerivation {
 	return {
 		selectAst: def.selectAst,
 		columns: def.columns,
-		insertDefaults: def.insertDefaults,
 		logicalKey: shape.primaryKey,
 		coarsenedKey: shape.coarsenedKey,
-		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst, def.insertDefaults)),
+		bodyHash: computeBodyHash(viewDefinitionToCanonicalString(def.columns, def.selectAst)),
 		ordering: shape.ordering,
 		sourceTables: shape.sourceTables,
 		stale: false,
@@ -936,7 +934,6 @@ export async function attachMaintainedDerivation(
 	db: Database,
 	table: TableSchema,
 	select: AST.QueryExpr,
-	insertDefaults: ReadonlyArray<AST.ViewInsertDefault> | undefined,
 	recordedColumns: ReadonlyArray<string> | undefined,
 	positionalRename = false,
 	allowReshape = false,
@@ -1027,8 +1024,8 @@ export async function attachMaintainedDerivation(
 		bodySql,
 		// Recorded as authored: declared names for the explicit forms, undefined for
 		// the implicit create form — the lossless signal persist + import already use.
+		// Any `with defaults (…)` rides inside `select` (→ derivation.selectAst).
 		columns: recordedColumns,
-		insertDefaults,
 	};
 
 	const prior = schema.getTable(name) ?? table;
@@ -1310,7 +1307,7 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 	const table = await sm.createTable(stmt);
 	try {
 		return await attachMaintainedDerivation(
-			db, table, stmt.maintained!.select, stmt.maintained!.insertDefaults,
+			db, table, stmt.maintained!.select,
 			explicit ? table.columns.map(c => c.name) : undefined, explicit,
 		);
 	} catch (e) {
@@ -2473,9 +2470,11 @@ export async function propagateTableRenameToMaterializedViews(
 	for (const mv of maintainedTablesOf(schema)) {
 		try {
 			const d = mv.derivation;
+			// The body walk also descends the trailing `with defaults (…)` clause
+			// (now on `selectAst.defaults`), so a defaults-expr subquery naming the
+			// renamed table flips `bodyChanged` even when the body never names it.
 			const bodyChanged = renameTableInAst(d.selectAst, oldName, newName, renamedSchemaName);
-			const clause = renameTableInInsertDefaults(d.insertDefaults, oldName, newName, renamedSchemaName);
-			if (!bodyChanged && !clause?.changed && !d.sourceTables.includes(oldBase)) continue;
+			if (!bodyChanged && !d.sourceTables.includes(oldBase)) continue;
 			const covers = d.covers
 				&& d.covers.schemaName.toLowerCase() === schemaLower
 				&& d.covers.tableName.toLowerCase() === oldName.toLowerCase()
@@ -2494,20 +2493,17 @@ export async function propagateTableRenameToMaterializedViews(
 /**
  * Rewrites every dependent materialized view in `schema` after a source COLUMN
  * RENAME — the MV mirror of the plain-view loop in `propagateColumnRenameInSchema`
- * (same same-schema gate at the caller, same in-place `renameColumnInAst` walk,
- * same `renameColumnInInsertDefaults` clause rewrite). An MV is processed when
- * its body AST OR its `insert defaults` clause changed — the clause's target is
- * typically a projected-away NOT NULL column the body never mentions, so a
- * clause-only change must still re-hash, regenerate DDL, and fire the event. An
- * MV neither rewrite touches that the schema-change listener marked stale (an
- * unreferenced-column rename, a `select *` body) is restored by the
+ * (same same-schema gate at the caller, same in-place `renameColumnInAst` walk).
+ * The body walk also descends the trailing `with defaults (…)` clause (now on
+ * `selectAst.defaults`): the clause target is typically a projected-away NOT NULL
+ * column the body never mentions, so its rewrite still flips `bodyChanged` and
+ * forces the re-hash / regenerate-DDL / fire-event path. An MV the walk does not
+ * touch that the schema-change listener marked stale (an unreferenced-column
+ * rename, a `select *` body) is restored by the
  * {@link restoreUnaffectedMaterializedViews} pass the ALTER emitter runs after
- * all per-schema loops. A changed BODY
- * can shift the MV's *exposed output names* (a bare passthrough projection of
- * the renamed column — plain-view parity), which
- * {@link applyMaterializedViewRewrite} carries onto the live backing table; a
- * clause-only change cannot, so the backing-rename pass is gated on the body
- * flag.
+ * all per-schema loops. A changed BODY can shift the MV's *exposed output names*
+ * (a bare passthrough projection of the renamed column — plain-view parity),
+ * which {@link applyMaterializedViewRewrite} carries onto the live backing table.
  */
 export async function propagateColumnRenameToMaterializedViews(
 	db: Database,
@@ -2522,16 +2518,12 @@ export async function propagateColumnRenameToMaterializedViews(
 	for (const mv of maintainedTablesOf(schema)) {
 		try {
 			const d = mv.derivation;
-			const bodyChanged = renameColumnInAst(d.selectAst, tableName, oldCol, newCol, renamedSchemaName);
-			const clause = d.insertDefaults?.length
-				? renameColumnInInsertDefaults(d.insertDefaults, collectFromTableNames(d.selectAst, renamedSchemaName), tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource)
-				: null;
-			if (!bodyChanged && !clause?.changed) continue;
-			await applyMaterializedViewRewrite(
-				db, schema, mv,
-				clause?.changed ? { insertDefaults: clause.defaults } : {},
-				preStale, /*renamedColumns*/ bodyChanged,
-			);
+			// `resolveColumnInSource` keeps the body walk scope-aware for a defaults-expr
+			// subquery referencing a like-named column on its own FROM — plain-view /
+			// differ-reconcile parity (see `renameColumnInAst`).
+			const bodyChanged = renameColumnInAst(d.selectAst, tableName, oldCol, newCol, renamedSchemaName, resolveColumnInSource);
+			if (!bodyChanged) continue;
+			await applyMaterializedViewRewrite(db, schema, mv, {}, preStale, /*renamedColumns*/ true);
 		} catch (e) {
 			failMaterializedViewRenamePropagation(db, schema, mv, e);
 		}
@@ -2539,17 +2531,16 @@ export async function propagateColumnRenameToMaterializedViews(
 }
 
 /**
- * The per-MV core both rename propagations share. `mv.selectAst` (and any
- * `insert defaults` exprs) have already been rewritten in place; `overrides`
- * carries the recomputed catalog fields — `sourceTables` / `covers` (table
- * rename) and `insertDefaults` (column rename, where a clause entry's `column`
- * string swap needs a fresh array). The remaining derived fields are recomputed
- * on a shallow clone (mirroring the tag setters — `oldObject` in the event
- * shares the rewritten AST, only the derived fields differ) and swapped into
- * the catalog. The `bodyHash` and regenerated `sql` both read the POST-override
- * clause, so they agree with each other and with what the differ recomputes
- * from the post-rename declared form; the `materialized_view_modified` → store
- * re-persist path round-trips the new name.
+ * The per-MV core both rename propagations share. `mv.selectAst` — including its
+ * trailing `with defaults (…)` clause — has already been rewritten in place;
+ * `overrides` carries the recomputed catalog fields — `sourceTables` / `covers`
+ * (table rename). The remaining derived fields are recomputed on a shallow clone
+ * (mirroring the tag setters — `oldObject` in the event shares the rewritten AST,
+ * only the derived fields differ) and swapped into the catalog. The `bodyHash`
+ * and regenerated `sql` both read the rewritten body (defaults included), so they
+ * agree with each other and with what the differ recomputes from the post-rename
+ * declared form; the `materialized_view_modified` → store re-persist path
+ * round-trips the new name.
  *
  * Staleness discipline: `stale` means the row-time plan was released and the
  * backing may already be BEHIND, so a flag that predates this statement is never
@@ -2567,7 +2558,7 @@ async function applyMaterializedViewRewrite(
 	db: Database,
 	schema: Schema,
 	mv: MaintainedTableSchema,
-	overrides: Partial<Pick<TableDerivation, 'sourceTables' | 'covers' | 'insertDefaults'>>,
+	overrides: Partial<Pick<TableDerivation, 'sourceTables' | 'covers'>>,
 	preStale: ReadonlySet<string>,
 	renamedColumns: boolean,
 ): Promise<void> {
@@ -2576,13 +2567,12 @@ async function applyMaterializedViewRewrite(
 	const bodySql = astToString(d.selectAst);
 	if (overrides.sourceTables) d.sourceTables = overrides.sourceTables;
 	if ('covers' in overrides) d.covers = overrides.covers;
-	if (overrides.insertDefaults) d.insertDefaults = overrides.insertDefaults;
-	// Canonical-definition hash (columns + body + POST-override insert-defaults
-	// clause) — must match the formula stamped at create / recomputed by the
-	// differ, or every post-rename diff would churn a spurious rebuild. `bodySql`
-	// (select-only) still feeds renameShiftedBackingColumns below. The DDL itself
-	// is rendered on demand from the unified record, so no stored `sql` to swap.
-	d.bodyHash = computeBodyHash(viewDefinitionToCanonicalString(d.columns, d.selectAst, d.insertDefaults));
+	// Canonical-definition hash (columns + body — the body string carries the
+	// rewritten `with defaults (…)` clause) — must match the formula stamped at
+	// create / recomputed by the differ, or every post-rename diff would churn a
+	// spurious rebuild. `bodySql` also feeds renameShiftedBackingColumns below. The
+	// DDL itself is rendered on demand from the unified record, so no stored `sql`.
+	d.bodyHash = computeBodyHash(viewDefinitionToCanonicalString(d.columns, d.selectAst));
 
 	if (!wasPreStale) {
 		// Only a changed BODY can shift output names; a table rename / clause-only

@@ -173,15 +173,15 @@ drop materialized view n1;
 drop table c;
 
 -- ===================================
--- 7. RENAME COLUMN rewrites an MV's `insert defaults` clause (clause-only:
+-- 7. RENAME COLUMN rewrites an MV's `with defaults` clause (clause-only:
 --    the body does not project the defaulted column)
 -- ===================================
 -- Pre-fix the propagation `continue`d when the body AST didn't change, so the
 -- clause kept the old name and write-through errored
--- "'insert defaults (created = …)' names column 'created'".
+-- "'with defaults (created = …)' names column 'created'".
 
 create table g (id integer primary key, name text, created integer not null);
-create materialized view mv7 as select id, name from g insert defaults (created = 55);
+create materialized view mv7 as select id, name from g with defaults (created = 55);
 
 alter table g rename column created to created_at;
 
@@ -199,13 +199,13 @@ drop materialized view mv7;
 drop table g;
 
 -- ===================================
--- 8. RENAME COLUMN hitting both an MV's body and its `insert defaults` clause
+-- 8. RENAME COLUMN hitting both an MV's body and its `with defaults` clause
 -- ===================================
 -- The defaulted column is also a bare passthrough projection: the rename
 -- shifts the backing output name (body change) AND rewrites the clause target.
 
 create table h (id integer primary key, v integer not null);
-create materialized view mv8 as select id, v from h insert defaults (v = 9);
+create materialized view mv8 as select id, v from h with defaults (v = 9);
 
 alter table h rename column v to w;
 
@@ -221,7 +221,7 @@ drop materialized view mv8;
 drop table h;
 
 -- ===================================
--- 9. RENAME TO of a table referenced inside an MV's `insert defaults` expr
+-- 9. RENAME TO of a table referenced inside an MV's `with defaults` expr
 --    subquery (clause-only: the body reads a different table)
 -- ===================================
 
@@ -229,7 +229,7 @@ create table aud (c integer primary key);
 insert into aud values (3);
 
 create table k (id integer primary key, ts integer not null);
-create materialized view mv9 as select id from k insert defaults (ts = (select max(c) from aud));
+create materialized view mv9 as select id from k with defaults (ts = (select max(c) from aud));
 
 alter table aud rename to aud2;
 

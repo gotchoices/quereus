@@ -12,6 +12,7 @@ import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
+import { bodyDefaults } from '../../schema/view.js';
 
 /**
  * Single-source view-mediated DML rewriting (the single-source spine of the
@@ -57,10 +58,11 @@ import { isMaintainedTable } from '../../schema/derivation.js';
 export interface MutableViewLike {
 	readonly name: string;
 	readonly schemaName: string;
+	/** View body — any relation-producing QueryExpr. A SELECT body carries its own
+	 *  trailing `with defaults (…)` clause ({@link AST.SelectStmt.defaults}), read
+	 *  via {@link bodyDefaults}. */
 	readonly selectAst: AST.QueryExpr;
 	readonly columns?: ReadonlyArray<string>;
-	/** Per-column omitted-insert defaults from `insert defaults (col = expr, …)`. */
-	readonly insertDefaults?: ReadonlyArray<AST.ViewInsertDefault>;
 	/** View-level metadata tags — validated at the `view-ddl` site on mutation. */
 	readonly tags?: Readonly<Record<string, SqlValue>>;
 	/**
@@ -721,7 +723,7 @@ function requireBaseColumn(vc: ViewColumn): string {
 }
 
 /**
- * Resolve an insert-default column name (from the `insert defaults (col = expr, …)`
+ * Resolve an insert-default column name (from the body's `with defaults (col = expr, …)`
  * clause) to its base column. The name may be a base column (the documented
  * projected-away case) or a view column with `base` lineage. An unknown name is
  * a structured `default-target-not-found` — a typo must fail loudly, not silently
@@ -833,9 +835,9 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 
 /**
  * Collect the appended omitted-insert defaults shared by both INSERT lowerings:
- * constant-FD selection pins first, then the view's `insert defaults` clause
+ * constant-FD selection pins first, then the body's `with defaults (…)` clause
  * entries — each only for a base column the insert left unsupplied
- * (docs/view-updateability.md § Projection step 5, § View insert defaults).
+ * (docs/view-updateability.md § Projection step 5, § View defaults).
  * `suppliedBaseColumns` are the base columns the insert targets directly
  * (verbatim targets AND authored put targets — an authored target takes the
  * inverse-computed value ahead of any default for that column: it is a supplied
@@ -865,13 +867,14 @@ function collectAppendedDefaults(
 		}
 	}
 
-	// Omitted-insert defaults, applied ahead of the base column's declared default:
-	// the clause fills only a column the insert and the constant-FD chain left
-	// omitted — an explicit user value or a stronger predicate pin always wins. The
-	// clause value is already an AST expression — no text re-lowering. Pushing the
-	// schema-held node is safe: the VALUES rewrite clones per row.
-	for (const d of view.insertDefaults ?? []) {
-		const baseCol = resolveDefaultForColumn(analysis, d.column.toLowerCase(), view, `'insert defaults (${d.column} = …)'`);
+	// Omitted-insert defaults (the body's trailing `with defaults (…)` clause),
+	// applied ahead of the base column's declared default: the clause fills only a
+	// column the insert and the constant-FD chain left omitted — an explicit user
+	// value or a stronger predicate pin always wins. The clause value is already an
+	// AST expression — no text re-lowering. Pushing the schema-held node is safe:
+	// the VALUES rewrite clones per row.
+	for (const d of bodyDefaults(view.selectAst) ?? []) {
+		const baseCol = resolveDefaultForColumn(analysis, d.column.toLowerCase(), view, `'with defaults (${d.column} = …)'`);
 		if (isSupplied(baseCol)) continue;
 		appendColumns.push(baseCol);
 		appendExprs.push(d.expr);
@@ -944,7 +947,7 @@ function rewriteAuthoredViewInsert(
 	});
 
 	// Appended defaults over the FULL supplied base set (verbatim + authored puts):
-	// an authored put target is a supplied value, so it shadows any `insert defaults`
+	// an authored put target is a supplied value, so it shadows any `with defaults`
 	// entry / constant-FD pin for that base column. The literal-contradiction check
 	// applies only to verbatim targets (an authored cell is computed, not a literal).
 	const suppliedBase = [...verbatim.map(v => v.baseColumn), ...authored.flatMap(a => a.site.puts.map(p => p.baseColumn))];

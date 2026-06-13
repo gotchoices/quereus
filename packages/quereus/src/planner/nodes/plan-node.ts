@@ -386,7 +386,7 @@ export interface AuthoredInverseMeta {
  * Per-attribute insert-default provenance — the value used when an `insert`
  * through the relation omits the column. Sourced from constant-FD selection
  * predicates (`constant-fd`), declared base-column defaults (`base-default`),
- * or a view's `insert defaults (col = expr, …)` clause (`view-insert-default` —
+ * or a view's `with defaults (col = expr, …)` clause (`view-insert-default` —
  * declared but not yet threaded: view defaults are realized in the write-through
  * rewrite, and `view_info`'s derivation folds clause columns directly; see
  * `deriveViewInfo`'s Divergence-1 note). The value is symbolic (literal,
