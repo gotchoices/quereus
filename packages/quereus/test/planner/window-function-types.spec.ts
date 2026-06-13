@@ -3,6 +3,7 @@ import { Database } from '../../src/core/database.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { WindowNode } from '../../src/planner/nodes/window-node.js';
+import type { RelationType } from '../../src/common/datatype.js';
 
 describe('Planner: window function types', () => {
 	let db: Database;
@@ -16,6 +17,31 @@ describe('Planner: window function types', () => {
 	afterEach(async () => {
 		await db.close();
 	});
+
+	/** Logical type names of the topmost relation's output columns in the plan. */
+	function getProjectionColumnTypes(sql: string): Array<{ name: string; type: string }> {
+		const plan = db.getPlan(sql) as PlanNode;
+		const stack: PlanNode[] = [plan];
+		while (stack.length > 0) {
+			const node = stack.pop();
+			if (!node || typeof node !== 'object') continue;
+
+			const t = node.getType?.();
+			if (t && t.typeClass === 'relation') {
+				const rel = t as RelationType;
+				if (rel.columns.length > 0) {
+					return rel.columns.map(c => ({ name: c.name, type: String(c.type.logicalType.name) }));
+				}
+			}
+
+			if (typeof node.getChildren === 'function') {
+				for (const child of node.getChildren()) {
+					stack.push(child);
+				}
+			}
+		}
+		return [];
+	}
 
 	function getWindowFunctionTypesFromPlan(sql: string): Array<{ fn: string; resultType: string }> {
 		const plan = db.getPlan(sql) as PlanNode;
@@ -86,6 +112,32 @@ describe('Planner: window function types', () => {
 		const types = getWindowFunctionTypesFromPlan(sql);
 
 		expect(types.some(t => t.fn.toLowerCase() === 'min' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('flows MIN window TEXT type through a surrounding expression', async () => {
+		// `min(v) over () || '!'` — the outer concat must type as TEXT, which only
+		// holds if the WindowFunctionCallNode built on the projection/expression
+		// side (expression.ts) also derives its argument type. Pins the gap the
+		// implementer flagged: the expression-tree path, not just the WindowNode.
+		const cols = getProjectionColumnTypes("select min(v) over () || '!' as c from t");
+		expect(cols.some(c => c.name === 'c' && c.type === 'TEXT'), JSON.stringify(cols)).to.equal(true);
+	});
+
+	it('returns the argument value (not a float coercion) for MIN/MAX over TEXT/INTEGER at runtime', async () => {
+		// End-to-end: the REAL→argument-type tightening must not float-coerce the
+		// emitted window value. step/final pass the value through unchanged.
+		async function one(sql: string): Promise<Record<string, unknown>> {
+			for await (const r of db.eval(sql)) return r;
+			throw new Error('no row');
+		}
+
+		const text = await one("select min(v) over () as mn, max(v) over () as mx from t");
+		expect(text.mn).to.equal('a'); // TEXT preserved, not coerced toward a number
+		expect(text.mx).to.equal('c');
+
+		const int = await one('select min(id) over () as mn, max(id) over () as mx from t');
+		expect(Number(int.mn)).to.equal(1);
+		expect(Number(int.mx)).to.equal(3);
 	});
 
 	it('leaves non-polymorphic window functions at their declared returnType', async () => {
