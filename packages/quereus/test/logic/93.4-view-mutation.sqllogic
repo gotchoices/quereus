@@ -3202,3 +3202,35 @@ with t as (select id, color from hw) update t set color='x' where id in (select 
 -- error: cannot be proven correlated
 select * from hw order by id;
 → [{"id":1,"color":"red"},{"id":2,"color":"green"}]
+
+-- ===================================
+-- Review-added interaction probes (cte-name-dml-write-target review pass): the source
+-- sibling-read, composite-PK, and statement-level WITH CONTEXT cases the implement pass
+-- left to the reviewer. All route the CTE body through the ephemeral substrate.
+-- ===================================
+
+-- INSERT into a CTE target whose SELECT source reads a SIBLING CTE: the statement's CTEs
+-- thread into the source build, so `from s` (a sibling) resolves while `t` (the target)
+-- is shadowed out of its own body's scope.
+create table p_src (id integer primary key, color text);
+create table p_dst (id integer primary key, color text);
+insert into p_src values (1,'a'),(2,'b');
+with s as (select id, color from p_src), t as (select id, color from p_dst)
+    insert into t (id, color) select id, color from s;
+select * from p_dst order by id;
+→ [{"id":1,"color":"a"},{"id":2,"color":"b"}]
+
+-- Composite-PK CTE body: the multi-column key identifies the base row through the
+-- ephemeral substrate exactly as for a composite-PK base table / view.
+create table cpk (a integer, b integer, note text, primary key (a,b));
+insert into cpk values (1,2,'x'),(3,4,'y');
+with t as (select a, b, note from cpk) update t set note='z' where a=1 and b=2;
+select * from cpk order by a, b;
+→ [{"a":1,"b":2,"note":"z"},{"a":3,"b":4,"note":"y"}]
+
+-- Statement-level WITH CONTEXT on a CTE-targeted INSERT threads to the lowered base op:
+-- the base column default `now_ms` reads the supplied context value through the substrate.
+create table ectx (id integer primary key, created integer default now_ms) using memory with context (now_ms integer);
+with t as (select id from ectx) insert into t with context now_ms = 999 values (1);
+select * from ectx order by id;
+→ [{"id":1,"created":999}]
