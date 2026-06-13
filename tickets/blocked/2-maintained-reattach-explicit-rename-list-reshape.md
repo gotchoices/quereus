@@ -1,4 +1,4 @@
-description: Make a declarative rename-list change on an EXPLICIT maintained table apply via `apply schema`. The differ already emits a re-attach (the bodyHash drifts); the only gap is that the emitted `set maintained as` does not carry the new rename list. With the verb's `set maintained (cols) as` grammar in place (prereq), the differ now threads the declared `maintained.columns` into the re-attach so the backing column is renamed and the derivation re-recorded, instead of erroring at the strict attach shape check.
+description: BLOCKED on missing-prereq-code — the prereq `maintained-set-maintained-rename-list-verb` (the `set maintained (cols) as` verb foundation) has not landed; it errored at runner startup on a model-availability glitch (`claude-fable-5` unavailable), so NONE of its grammar / AST / stringify / runtime work is in the tree. This differ ticket is unbuildable AND untestable without it (see "Why this is blocked"). Original spec preserved below verbatim — resume it unchanged once the prereq lands. Make a declarative rename-list change on an EXPLICIT maintained table apply via `apply schema`. The differ already emits a re-attach (the bodyHash drifts); the only gap is that the emitted `set maintained as` does not carry the new rename list. With the verb's `set maintained (cols) as` grammar in place (prereq), the differ now threads the declared `maintained.columns` into the re-attach so the backing column is renamed and the derivation re-recorded, instead of erroring at the strict attach shape check.
 prereq: maintained-set-maintained-rename-list-verb
 files:
   - packages/quereus/src/schema/schema-differ.ts                     # applyMaintainedTransition (~1990) — carry maintained.columns; TableAlterDiff.setMaintained (~168) +columns; generateMigrationDDL (~2506) — render columns
@@ -8,6 +8,78 @@ files:
   - docs/materialized-views.md                                       # Declarative-schema integration — explicit rename-list re-attach now applies
 difficulty: medium
 ----
+
+## Why this is blocked (missing-prereq-code)
+
+This ticket is the thin differ half of a two-ticket chain. Its entire premise —
+restated in its own description and "What lands here" — is *"With the verb's
+`set maintained (cols) as` grammar in place (prereq), the differ now threads the
+declared `maintained.columns` into the re-attach."* That prereq
+(`maintained-set-maintained-rename-list-verb`, the `hard` verb foundation) is
+**not in the tree**.
+
+**Verified state (2026-06-12):**
+
+- `packages/quereus/src/parser/parser.ts` (~3169) parses only
+  `SET MAINTAINED AS <body>` — there is **no** optional `(cols)` list between
+  `MAINTAINED` and `AS`.
+- `packages/quereus/src/parser/ast.ts` (~723) — the `setMaintained`
+  `AlterTableAction` has **no** `columns?` field (only `select`, `insertDefaults`).
+- No `ast-stringify` rendering of `set maintained (cols) as`, and no runtime
+  positional-rename / backing-reshape path in `attachMaintainedDerivation`.
+
+**Why the prereq is absent:** it did not fail on a design/implementation
+problem. The prior runner run on ticket 1 errored at **startup** — the run
+selected model `claude-fable-5`, which was unavailable ("It may not exist or you
+may not have access to it"), and the agent exited code 1 before doing any work.
+The log
+(`tickets/.logs/1-maintained-set-maintained-rename-list-verb.implement.2026-06-13T02-02-24-290Z.log`)
+shows a 0.6s error with `cost $0.0000`. So zero code landed; the ticket still
+sits in `tickets/implement/1-maintained-set-maintained-rename-list-verb.md` with
+a resume-note, awaiting a re-run under a valid model.
+
+**Why this differ ticket cannot proceed as specified:**
+
+1. **Not type-safe.** The specified `generateMigrationDDL` change builds the
+   synthetic action as `{ type: 'setMaintained', select, insertDefaults, columns }`.
+   The AST action has no `columns` field (prereq deliverable), so this is a
+   compile error. The minimal fixes (add `columns?` to the AST action; render it
+   in `ast-stringify`) are **ticket 1's owned files** (`ast.ts`,
+   `ast-stringify.ts` are in ticket 1's `files:`, not this ticket's) — doing them
+   here steals scope and steps on the prereq agent.
+2. **Untestable acceptance.** Every acceptance criterion is end-to-end
+   apply-schema behavior: the rename-list change *applies* and *converges*, the
+   backing column is renamed `b → c`, `derivation.columns` becomes `(a, c)`, the
+   incarnation survives, re-diff is idempotent. All of that requires the
+   **runtime verb** to parse and apply `set maintained (a, c) as` — which does not
+   exist. The `declarative-equivalence.spec.ts` rewrite, the
+   `50-declarative-schema.sqllogic` convergence section, and the differ-coverage
+   apply cases would all fail.
+3. The implement-stage contract requires build + tests to pass. With the prereq
+   absent, neither can — and a differ-only edit (carrying `columns` on a
+   `TableAlterDiff` the renderer would silently drop) would land dead code masked
+   as "done." That is the dishonest-handoff the rules forbid.
+
+This is the sanctioned **`missing-prereq-code` (implement only)** block — the
+concrete prereq code this implementation requires to build *and* test is missing,
+and it is missing for an environmental reason, not a design one.
+
+**Unblock condition:** ticket 1 (`maintained-set-maintained-rename-list-verb`)
+lands its grammar + AST `columns?` + `ast-stringify` rendering + runtime
+positional-rename/backing-reshape + arity guard (re-run it under an available
+model — `claude-opus-4-8`/`claude-sonnet-4-6`, not `claude-fable-5`). Once that
+is in the tree, move this file back to `tickets/implement/` and resume the
+**unchanged** spec below — the differ surface is genuinely small (a `columns?`
+field, two carry-throughs in `applyMaintainedTransition`, one render in
+`generateMigrationDDL`) and the prereq does the heavy lifting.
+
+**Note for the runner/human:** ticket 1 and this ticket are both in `implement/`
+(seq 1 and 2). The intended order is 1 → (its code in tree) → 2. Because ticket 1
+errored (rather than blocking) on the model glitch, the runner picked ticket 2
+this pass before the prereq code existed. Re-running ticket 1 first restores the
+intended chain.
+
+---
 
 # Differ carries the rename list through the re-attach
 
