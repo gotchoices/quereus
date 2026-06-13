@@ -49,7 +49,8 @@ type Expectation =
  *
  * `stubUnsupported` marks arms that surface the engine's sited `UNSUPPORTED`
  * when `module.alterTable` is absent — i.e. arms with NO engine-side fallback.
- * Exempt (false): ADD CHECK is engine-side; ALTER PRIMARY KEY has a rebuild
+ * Exempt (false): ADD CHECK routes through the module when present but keeps an
+ * engine-side fallback for modules without `alterTable`; ALTER PRIMARY KEY has a rebuild
  * fallback; RENAME COLUMN degrades to a documented engine-side schema-only
  * rename. The memory leg runs every arm regardless; this flag only gates the
  * no-`alterTable` stub leg.
@@ -222,10 +223,12 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		// ADD CHECK stays in the engine emitter (runtime/emit/add-constraint.ts) and
-		// never routes through module.alterTable — so it is honored for EVERY module,
-		// memory and store alike. Hence `stubUnsupported: false` (exempt from the stub case).
-		label: 'addConstraint CHECK (engine-side)',
+		// ADD CHECK routes through module.alterTable when the module supports it (so the
+		// module-cached schema stays in lock-step with the catalog for later DROP/RENAME),
+		// and falls back to the engine emitter (runtime/emit/add-constraint.ts) for modules
+		// that omit alterTable — so it is honored for EVERY module, memory and store alike.
+		// Hence `stubUnsupported: false` (the engine-side fallback covers the stub case).
+		label: 'addConstraint CHECK',
 		seed: u => [`create table t (id integer primary key, v integer)${u}`, `insert into t values (1, 5), (2, 9)`],
 		alter: `alter table t add constraint pos check (v > 0)`,
 		memory: { kind: 'honored' },

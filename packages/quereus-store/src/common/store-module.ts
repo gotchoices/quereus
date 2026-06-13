@@ -34,7 +34,7 @@ import type {
 	MaintainedTableSchema,
 	BackingHost,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
 import type { KVStore, KVStoreProvider } from './kv-store.js';
@@ -1200,6 +1200,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					};
 					// Pragma-gated existing-row validation; throws before persistence on an orphan.
 					await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
+				} else if (constraint.type === 'check') {
+					// Schema-only: a CHECK has no physical structure and (matching the
+					// engine's prior in-emitter behavior) no existing-row scan. Routing it
+					// here — rather than catalog-only — keeps the persisted DDL and the
+					// connected-table schema in lock-step so DROP/RENAME CONSTRAINT resolve it.
+					const check = buildCheckConstraintSchema(constraint, oldSchema.checkConstraints.length);
+					updatedSchema = {
+						...oldSchema,
+						checkConstraints: Object.freeze([...oldSchema.checkConstraints, check]),
+					};
 				} else {
 					throw new QuereusError(
 						`Store table ADD CONSTRAINT does not support constraint type '${constraint.type}'`,

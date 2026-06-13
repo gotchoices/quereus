@@ -20,14 +20,15 @@
  * Store backing: the in-memory KV provider from `alter-table.spec.ts`, so this
  * stays in the fast `yarn test` lane (no LevelDB).
  *
- * NOTE on the ADD CHECK cell: the audit matrix marked the store cell as a clean
- * `UNSUPPORTED` reject. That is NOT how the engine behaves today — `ALTER TABLE
- * ADD CONSTRAINT … CHECK` is handled entirely engine-side (runtime/emit/
- * add-constraint.ts `runAddCheck`) and never reaches `module.alterTable`, so it is
- * honored in-session for the store exactly as for memory. The store's own
- * `addConstraint` UNSUPPORTED branch is reachable only by a constraint type that
- * routes to the module and that it does not handle (today: none beyond UNIQUE/FK).
- * Asserted as honored below; the discrepancy is flagged in the review handoff.
+ * NOTE on the ADD CHECK cell: `ALTER TABLE ADD CONSTRAINT … CHECK` now routes
+ * through the store's `addConstraint` (a schema-only append + DDL persist), the
+ * same path UNIQUE / FK take — so the module-cached schema stays in lock-step with
+ * the catalog and a later DROP/RENAME CONSTRAINT resolves it. (An engine-side
+ * fallback in runtime/emit/add-constraint.ts covers only modules that omit
+ * `alterTable`; the store implements it.) Honored in-session for the store exactly
+ * as for memory. The store's own `addConstraint` UNSUPPORTED branch is reachable
+ * only by a constraint type the module does not handle (today: none beyond
+ * CHECK/UNIQUE/FK).
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -217,9 +218,9 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		// Engine-side (runAddCheck); honored for store in-session exactly as for memory.
-		// See the file header note re: the audit-matrix discrepancy.
-		label: 'addConstraint CHECK (engine-side)',
+		// Routes through the store's addConstraint (schema-only append + DDL persist);
+		// honored for store in-session exactly as for memory. See the file header note.
+		label: 'addConstraint CHECK',
 		seed: [`create table t (id integer primary key, v integer) using store`, `insert into t values (1, 5), (2, 9)`],
 		alter: `alter table t add constraint pos check (v > 0)`,
 		expect: { kind: 'honored' },

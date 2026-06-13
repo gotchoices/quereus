@@ -135,7 +135,7 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		label: 'addConstraint CHECK (engine-side)',
+		label: 'addConstraint CHECK',
 		seed: [`create table t (id integer primary key, v integer) using isolated`, `insert into t values (1, 5), (2, 9)`],
 		alter: `alter table t add constraint pos check (v > 0)`,
 		expect: { kind: 'honored' },

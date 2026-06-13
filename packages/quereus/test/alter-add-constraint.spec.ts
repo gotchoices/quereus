@@ -1,13 +1,15 @@
 /**
  * Tests for `ALTER TABLE ADD CONSTRAINT` routing + enforcement.
  *
- * CHECK constraints stay in Quereus's emitter (`runtime/emit/add-constraint.ts`)
- * and mutate the schema's `checkConstraints` array directly. Non-CHECK
- * constraints (UNIQUE / FOREIGN KEY) route through the vtab module's
- * `alterTable({ type: 'addConstraint', constraint })`. The built-in
- * `MemoryTableModule` implements both: it re-validates the existing rows and
- * fails atomically with `CONSTRAINT` (no schema mutation) when the current data
- * violates the new constraint, otherwise installs forward enforcement.
+ * All three constraint classes (CHECK / UNIQUE / FOREIGN KEY) route through the
+ * vtab module's `alterTable({ type: 'addConstraint', constraint })` when the module
+ * supports it, so the module-cached schema stays in lock-step with the catalog
+ * (a later DROP/RENAME CONSTRAINT resolves the class against it). CHECK keeps an
+ * engine-side fallback (`runtime/emit/add-constraint.ts`) only for modules that
+ * omit `alterTable`. The built-in `MemoryTableModule` implements all three: UNIQUE /
+ * FOREIGN KEY re-validate the existing rows and fail atomically with `CONSTRAINT`
+ * (no schema mutation) when the current data violates the new constraint; CHECK is
+ * a schema-only append, enforced going forward at write time.
  */
 
 import { expect } from 'chai';
@@ -37,11 +39,43 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 		await db.close();
 	});
 
-	it('CHECK constraint succeeds (in-emitter metadata mutation)', async () => {
+	it('CHECK constraint succeeds (schema-only append, enforced forward)', async () => {
 		await db.exec('create table t (id integer primary key, v integer)');
 		await db.exec('alter table t add constraint pos_v check (v > 0)');
 		// Forward enforcement still works.
 		const err = await expectThrows(() => db.exec('insert into t (id, v) values (1, -1)'));
+		expect(err.code).to.equal(StatusCode.CONSTRAINT);
+	});
+
+	// Regression: an ALTER-added CHECK must land in the *module-cached* schema, not
+	// just the catalog — otherwise DROP/RENAME CONSTRAINT (which resolve the class
+	// through the module) reported it missing, and a later module-routed ALTER
+	// silently dropped it from the catalog.
+	it('an ALTER-added CHECK can be dropped by name', async () => {
+		await db.exec('create table t (id integer primary key, v integer)');
+		await db.exec('alter table t add constraint chk check (v > 10)');
+		await db.exec('alter table t drop constraint chk');
+		expect(db.schemaManager.getTable('main', 't')!.checkConstraints.map(c => c.name)).to.deep.equal([]);
+		// Enforcement is gone: a previously-violating row now inserts.
+		await db.exec('insert into t (id, v) values (1, 5)');
+	});
+
+	it('an ALTER-added CHECK can be renamed by name and keeps enforcing', async () => {
+		await db.exec('create table t (id integer primary key, v integer)');
+		await db.exec('alter table t add constraint chk check (v > 10)');
+		await db.exec('alter table t rename constraint chk to chk2');
+		expect(db.schemaManager.getTable('main', 't')!.checkConstraints.map(c => c.name)).to.deep.equal(['chk2']);
+		const err = await expectThrows(() => db.exec('insert into t (id, v) values (1, 5)'));
+		expect(err.code).to.equal(StatusCode.CONSTRAINT);
+	});
+
+	it('an ALTER-added CHECK survives a later module-routed ALTER (ADD UNIQUE)', async () => {
+		await db.exec('create table t (id integer primary key, v integer, email text null)');
+		await db.exec('alter table t add constraint chk check (v > 10)');
+		await db.exec('alter table t add constraint uq unique (email)');
+		// The CHECK is still present in the catalog and still enforces alongside UNIQUE.
+		expect(db.schemaManager.getTable('main', 't')!.checkConstraints.map(c => c.name)).to.deep.equal(['chk']);
+		const err = await expectThrows(() => db.exec('insert into t values (1, 5, null)'));
 		expect(err.code).to.equal(StatusCode.CONSTRAINT);
 	});
 

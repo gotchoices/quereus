@@ -104,6 +104,33 @@ export function buildForeignKeyConstraintSchema(
 }
 
 /**
+ * Builds a {@link RowConstraintSchema} from a table-level CHECK
+ * `AST.TableConstraint` (the `ALTER TABLE … ADD CONSTRAINT … CHECK` form). The
+ * single source of truth for that mapping, called by the built-in modules
+ * (memory + store) so a CHECK added via ALTER lands in the *module-cached*
+ * schema, in lock-step with the catalog — the same place inline-CREATE CHECKs
+ * live and where `DROP/RENAME CONSTRAINT` later resolve the constraint class. An
+ * unnamed CHECK is auto-named `check_<existingCount>`, preserving the engine's
+ * prior in-emitter naming (`existingCount` = the number of CHECKs already on the
+ * table). Determinism is intentionally NOT validated here — a CHECK may reference
+ * `new.*`/`old.*`, which is checked at INSERT/UPDATE plan time.
+ */
+export function buildCheckConstraintSchema(
+	con: AST.TableConstraint,
+	existingCount: number,
+): RowConstraintSchema {
+	if (con.type !== 'check' || !con.expr) {
+		throw new QuereusError('CHECK constraint requires an expression', StatusCode.ERROR);
+	}
+	return {
+		name: con.name || `check_${existingCount}`,
+		expr: con.expr,
+		operations: opsToMask(con.operations),
+		tags: con.tags && Object.keys(con.tags).length > 0 ? Object.freeze({ ...con.tags }) : undefined,
+	};
+}
+
+/**
  * Extracts the column-level CHECK constraints declared on a single `ALTER TABLE
  * ADD COLUMN` ColumnDef into {@link RowConstraintSchema}s. Used by both the
  * engine's emit layer (to merge into the live in-memory schema) and the store

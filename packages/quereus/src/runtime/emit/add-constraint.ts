@@ -21,8 +21,17 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 		const schemaManager = rctx.db.schemaManager;
 		const schema = schemaManager.getSchemaOrFail(tableSchema.schemaName);
 
-		if (constraint.type === 'check') {
-			return runAddCheck(rctx, tableSchema, schema, constraint);
+		// A CHECK on a module without an `alterTable` hook stays engine-side (catalog
+		// only — DROP/RENAME CONSTRAINT are unsupported on such a module anyway, so
+		// there is no second copy to keep in sync). Every other case — including CHECK
+		// on a module that DOES support `alterTable` — routes through the module so its
+		// cached schema stays in lock-step with the catalog. Routing CHECK engine-side
+		// while DROP/RENAME route through the module is exactly what stranded an
+		// ALTER-added CHECK: the module never learned of it, so `resolveNamedConstraintClass`
+		// against the module's stale schema reported it missing (and a later module-routed
+		// ALTER returned a schema that silently dropped it from the catalog).
+		if (constraint.type === 'check' && !tableSchema.vtabModule?.alterTable) {
+			return runAddCheckEngineSide(rctx, tableSchema, schema, constraint);
 		}
 
 		return runAddConstraintViaModule(rctx, tableSchema, schema, constraint);
@@ -35,7 +44,14 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 	};
 }
 
-async function runAddCheck(
+/**
+ * Engine-side CHECK append for modules that do not implement `alterTable` (so the
+ * CHECK can't route through the module). Mutates only the catalog's
+ * `checkConstraints`. Modules that DO support `alterTable` take the module-routed
+ * path instead (see {@link runAddConstraintViaModule}), keeping the module-cached
+ * schema and the catalog consistent.
+ */
+async function runAddCheckEngineSide(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
 	schema: import('../../schema/schema.js').Schema,

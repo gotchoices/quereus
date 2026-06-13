@@ -12,7 +12,7 @@ import { Latches } from '../../../util/latches.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
-import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
+import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
 import { compareSqlValues, rowsValueIdentical } from '../../../util/comparison.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -2256,9 +2256,12 @@ export class MemoryTableManager {
 	 *   predicate + per-column collation honored, NULLs distinct).
 	 * - FOREIGN KEY appends the constraint and runs the pragma-gated existing-row
 	 *   validation (engine-side enforcement needs no physical structure).
-	 *
-	 * CHECK is handled engine-side (`runtime/emit/add-constraint.ts`) and never
-	 * routes here.
+	 * - CHECK appends the constraint (no physical structure, no existing-row scan —
+	 *   matching the engine's prior in-emitter behavior); it routes here, rather than
+	 *   being applied catalog-only, so the module-cached schema stays in lock-step
+	 *   with the catalog and a later `DROP/RENAME CONSTRAINT` resolves it. (The engine
+	 *   keeps an engine-side fallback in `runtime/emit/add-constraint.ts` only for
+	 *   modules that omit `alterTable` — which cannot DROP/RENAME a constraint anyway.)
 	 */
 	async addConstraint(constraint: ASTTableConstraint): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
@@ -2272,6 +2275,8 @@ export class MemoryTableManager {
 				await this.addUniqueConstraint(constraint);
 			} else if (constraint.type === 'foreignKey') {
 				await this.addForeignKeyConstraint(constraint);
+			} else if (constraint.type === 'check') {
+				this.addCheckConstraint(constraint);
 			} else {
 				throw new QuereusError(
 					`MemoryTable ADD CONSTRAINT does not support constraint type '${constraint.type}'`,
@@ -2299,6 +2304,23 @@ export class MemoryTableManager {
 		} finally {
 			release();
 		}
+	}
+
+	/**
+	 * CHECK arm of {@link addConstraint}. Schema-only: a CHECK has no covering
+	 * structure and (matching the engine's prior in-emitter behavior) no existing-row
+	 * validation, so this just appends the constraint to the cached schema. Enforcement
+	 * is engine-side at INSERT/UPDATE plan time. Runs under the same latch / rollback
+	 * scaffolding as the other arms (via {@link addConstraint}).
+	 */
+	private addCheckConstraint(constraint: ASTTableConstraint): void {
+		const check = buildCheckConstraintSchema(constraint, this.tableSchema.checkConstraints.length);
+		const newSchema: TableSchema = Object.freeze({
+			...this.tableSchema,
+			checkConstraints: Object.freeze([...this.tableSchema.checkConstraints, check]),
+		});
+		this.baseLayer.updateSchema(newSchema);
+		this.tableSchema = newSchema;
 	}
 
 	/**
