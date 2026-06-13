@@ -1,6 +1,6 @@
 import { isRelationalNode, PlanNode } from './plan-node.js';
 import type { RelationalPlanNode, Attribute, BinaryRelationalNode, PhysicalProperties, FunctionalDependency, DomainConstraint, ConstantBinding, UpdateSite } from './plan-node.js';
-import type { RelationType, ColumnDef } from '../../common/datatype.js';
+import type { RelationType, ColumnDef, CollationSource, ScalarType } from '../../common/datatype.js';
 import type { Expression } from '../../parser/ast.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
@@ -9,6 +9,13 @@ import { quereusError, QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { EXISTENCE_FLAG_TYPE } from './join-utils.js';
 import { superkeyToFd } from '../util/fd-utils.js';
+import { resolveSetOpColumnCollation, collationConflictError } from '../analysis/comparison-collation.js';
+
+/** A data column's cross-input-resolved collation (override over the left base type). */
+interface ResolvedDataCollation {
+  readonly collationName?: string;
+  readonly collationSource?: CollationSource;
+}
 
 /**
  * One `<setop> exists <branch> as <name>` membership-flag column the
@@ -47,6 +54,14 @@ function flagCount(node: RelationalPlanNode): number {
 export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
   readonly nodeType = PlanNodeType.SetOperation;
   private attributesCache: Cached<readonly Attribute[]>;
+  /**
+   * Per-data-column collation resolved across BOTH inputs through the shared
+   * comparison lattice (`set-operation-cross-input-collation-merge`). Cached so
+   * `buildAttributes` and `getType` read ONE result and cannot drift — the dedup
+   * comparator (which keys off the output attribute collation) and an enclosing
+   * ORDER BY (which keys off the output column collation) thus stay in lockstep.
+   */
+  private dataCollationsCache: Cached<readonly ResolvedDataCollation[]>;
 
   constructor(
     scope: Scope,
@@ -73,6 +88,54 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     }
     // TODO: optionally check type compatibility (affinity)
     this.attributesCache = new Cached(() => this.buildAttributes());
+    this.dataCollationsCache = new Cached(() => this.resolveDataCollations());
+  }
+
+  /**
+   * Resolve each DATA column's dedup/compare collation across both inputs through
+   * the shared comparison lattice (`resolveSetOpColumnCollation`). The conflict
+   * policy is keyed on set-ness:
+   *  - DISTINCT operators (`union`/`intersect`/`except`, `op !== 'unionAll'`) DO
+   *    dedup, so a same-rank explicit/declared name conflict is a plan-time error
+   *    — the same one a spelled-out `l.c = r.c` would throw. Forced at build time
+   *    by `createSetOperationScope` (and, for DIFF, by the outer union forcing the
+   *    nested except nodes transitively).
+   *  - `union all` does NO dedup, so a conflict must NOT throw — it propagates no
+   *    collation forward (BINARY-equivalent), exactly as `mergePropagatedCollation`
+   *    swallows conflicts for `||` / CASE. Rows pass through unchanged (bag).
+   * Only the first `dataColumnCount()` columns are resolved; flag columns (appended
+   * after, `EXISTENCE_FLAG_TYPE`, no collation) are never touched.
+   */
+  private resolveDataCollations(): readonly ResolvedDataCollation[] {
+    const isSet = this.op !== 'unionAll';
+    const leftColumns = this.left.getType().columns;
+    const rightColumns = this.right.getType().columns;
+    const dataCount = this.dataColumnCount();
+    const resolved: ResolvedDataCollation[] = [];
+    for (let i = 0; i < dataCount; i++) {
+      const res = resolveSetOpColumnCollation(leftColumns[i].type, rightColumns[i].type);
+      if (res.kind === 'conflict') {
+        if (isSet) throw collationConflictError(res);
+        resolved.push({}); // union all: no comparison, carry no collation forward
+      } else {
+        resolved.push({ collationName: res.collationName, collationSource: res.collationSource });
+      }
+    }
+    return resolved;
+  }
+
+  /**
+   * Data column `i`'s `ScalarType` rebased onto the cross-input-resolved collation:
+   * the left operand's type stays the base (logicalType, nullable, affinity —
+   * cross-branch type merge stays out of scope) and ONLY `collationName`/
+   * `collationSource` are overridden (both possibly `undefined` for the BINARY
+   * floor). Callers map this over the first `dataColumnCount()` attrs/columns,
+   * preserving attribute ids (only the type's collation changes) so ORDER BY / an
+   * enclosing view still resolve and a `withChildren` rebuild yields the same ids.
+   */
+  private resolvedDataType(baseType: ScalarType, i: number): ScalarType {
+    const c = this.dataCollationsCache.value[i];
+    return { ...baseType, collationName: c.collationName, collationSource: c.collationSource };
   }
 
   /** True when this set operation exposes its OWN membership flags. */
@@ -129,16 +192,19 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
    */
   private buildAttributes(): readonly Attribute[] {
     const leftAttrs = this.left.getAttributes();
-    // No flag anywhere → the result IS the left child's data attributes; preserve them
-    // directly (ids unchanged) so ORDER BY expressions resolve to the same ids.
-    if (!this.hasSurfacedFlags) return leftAttrs;
-    // `leftAttrs` is already `[data] ++ [L flags]` (the left operand's data attrs, which
-    // are this node's data attrs, then any surfaced left flags). Append the right
-    // operand's surfaced flags (beyond the shared data arity) and this node's own flags.
     const dataCount = this.dataColumnCount();
+    // Data attrs carry the cross-input-resolved collation (ids preserved); the dedup
+    // comparator and any enclosing ORDER BY both read collation from here.
+    const dataAttrs: Attribute[] = leftAttrs.slice(0, dataCount).map((attr, i) => ({ ...attr, type: this.resolvedDataType(attr.type, i) }));
+    // No flag anywhere → the result IS the (collation-resolved) data attributes;
+    // ids unchanged so ORDER BY expressions resolve to the same ids.
+    if (!this.hasSurfacedFlags) return dataAttrs;
+    // `leftAttrs` is `[data] ++ [L flags]`: keep the L-flag slice verbatim. Append the
+    // right operand's surfaced flags (beyond the shared data arity) and own flags.
     const ownFlagAttrs: Attribute[] = (this.membership ?? []).map(spec => ({ id: spec.attrId, name: spec.name, type: EXISTENCE_FLAG_TYPE }));
     return [
-      ...leftAttrs,
+      ...dataAttrs,
+      ...leftAttrs.slice(dataCount),
       ...this.right.getAttributes().slice(dataCount),
       ...ownFlagAttrs,
     ];
@@ -164,16 +230,20 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
     //    ColRefs (which index data columns) stay valid and a flag is NEVER part of a key
     //    at any depth (Key-Soundness Inv. 1–2).
     const keys = (this.op === 'intersect' || this.op === 'except') ? leftType.keys : [];
+    // Data ColumnDefs carry the cross-input-resolved collation (same cached array the
+    // output attrs use, so type.collationName and attr.type.collationName cannot drift).
+    const dataCount = this.dataColumnCount();
+    const dataColumns = leftType.columns.slice(0, dataCount).map((col, i) => ({ ...col, type: this.resolvedDataType(col.type, i) }));
     if (!this.hasSurfacedFlags) {
-      return { ...leftType, isSet, keys } as RelationType;
+      return { ...leftType, isSet, keys, columns: dataColumns } as RelationType;
     }
     // Mirror buildAttributes' `[data] ++ [L flags] ++ [R flags] ++ [own flags]` layout.
-    // `leftType.columns` is already `[data] ++ [L flags]`; append the right operand's
-    // surfaced flag ColumnDefs (beyond the shared data arity) and this node's own flags.
-    const dataCount = this.dataColumnCount();
+    // `leftType.columns` is `[data] ++ [L flags]`: keep the L-flag slice verbatim; append
+    // the right operand's surfaced flag ColumnDefs (beyond the shared data arity) and own flags.
     const ownFlagColumns: ColumnDef[] = (this.membership ?? []).map(spec => ({ name: spec.name, type: EXISTENCE_FLAG_TYPE }));
     const columns = [
-      ...leftType.columns,
+      ...dataColumns,
+      ...leftType.columns.slice(dataCount),
       ...this.right.getType().columns.slice(dataCount),
       ...ownFlagColumns,
     ];

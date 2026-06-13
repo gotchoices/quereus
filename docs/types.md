@@ -479,7 +479,31 @@ Related forms:
   separately. Two differently-collated bounds are NOT a conflict with each
   other.
 - **USING joins** — each same-named column pair resolves through the lattice,
-  so `using (k)` agrees with the spelled-out `l.k = r.k`.
+  so `using (k)` agrees with the spelled-out `l.k = r.k`. The four pairwise
+  join-key surfaces (USING comparator, merge / bloom / asof) all resolve their
+  key collation through the same lattice — the sibling of set operations below.
+- **Set operations** (`UNION` / `INTERSECT` / `EXCEPT` / `DIFF`, and `UNION
+  ALL`) — each OUTPUT column resolves its dedup/compare collation **symmetrically
+  across BOTH inputs'** corresponding column types through the same lattice
+  (`resolveSetOpColumnCollation`), rather than inheriting the left input's
+  collation alone. The resolved collation is written into the
+  `SetOperationNode`'s output column/attribute types, so it governs the dedup /
+  membership comparator **and** the output column's `collationName` — i.e. what an
+  enclosing `ORDER BY` over the set operation sorts under — in lockstep (one
+  resolution site, both readers). The winning *rank* propagates as
+  `collationSource`, so a nested set operation re-resolves against the inner
+  node's output column **at the correct rank**, and divergence surfaces at every
+  level. Conflict handling splits on whether the operator dedups:
+    - **DISTINCT operators** (`UNION` / `INTERSECT` / `EXCEPT`; `DIFF` desugars to
+      nested `EXCEPT`/`UNION`) DO compare, so a same-rank explicit/declared name
+      conflict in any output column is the same prepare-time error a spelled-out
+      comparison throws (surfaced when the compound's output scope is built).
+    - **`UNION ALL`** does NO dedup, so a conflict is **not** an error — it
+      propagates no collation forward (BINARY-equivalent), exactly as `||` / CASE
+      swallow conflicts. Rows pass through unchanged.
+  Non-textual columns carry no collation, so resolution is a harmless no-op.
+  (No sort-merge set-op strategy exists today; if one is ever added it MUST
+  derive its key collation from this same resolved output-column collation.)
 - **Propagation through non-comparison combiners** (`||` concat, CASE branch
   merge) — the highest-ranked contribution wins and keeps its provenance;
   equal-rank contributions with different names propagate **no** collation

@@ -11,11 +11,13 @@ import {
 	collationContribution,
 	resolveComparisonCollation,
 	resolveInCollation,
+	resolveSetOpColumnCollation,
 	mergePropagatedCollation,
 	effectiveComparisonCollation,
 	isComparisonOperator,
 	type CollationSource,
 	type CollationResolution,
+	type SetOpColumnCollation,
 } from '../../src/planner/analysis/comparison-collation.js';
 import type { ScalarType } from '../../src/common/datatype.js';
 import { TEXT_TYPE } from '../../src/types/builtin-types.js';
@@ -154,6 +156,107 @@ describe('comparison-collation provenance lattice', () => {
 		it('condition vs merged RHS resolves through the same lattice (conflict included)', () => {
 			expect(resolveInCollation(t('NOCASE', 'declared'), [t('RTRIM', 'declared')]).kind).to.equal('conflict');
 			expectResolved(resolveInCollation(t('NOCASE', 'declared'), [t('BINARY', 'explicit')]), 'BINARY');
+		});
+	});
+
+	describe('resolveSetOpColumnCollation (set-op cross-input column merge)', () => {
+		// The resolved form keeps the winning RANK (as collationSource) that the bare
+		// `resolveComparisonCollation` name-only form discards — needed so a nested
+		// set-op re-resolves at the correct rank. Otherwise the rank table is identical.
+
+		it('both absent / defaulted BINARY → resolved with no collation (BINARY floor)', () => {
+			expect(resolveSetOpColumnCollation(t(), t())).to.deep.equal({ kind: 'resolved' });
+			expect(resolveSetOpColumnCollation(t('BINARY', 'default'), t())).to.deep.equal({ kind: 'resolved' });
+			expect(resolveSetOpColumnCollation(t('BINARY', 'default'), t('BINARY', 'default'))).to.deep.equal({ kind: 'resolved' });
+		});
+
+		it('one-sided contribution drives, carrying its source', () => {
+			expect(resolveSetOpColumnCollation(t('NOCASE', 'declared'), t()))
+				.to.deep.equal({ kind: 'resolved', collationName: 'NOCASE', collationSource: 'declared' });
+			expect(resolveSetOpColumnCollation(t(), t('nocase', 'explicit')))
+				.to.deep.equal({ kind: 'resolved', collationName: 'NOCASE', collationSource: 'explicit' });
+		});
+
+		it('declared beats defaulted BINARY (rank 2 over rank-1 no-contribution), both orders', () => {
+			const want = { kind: 'resolved', collationName: 'NOCASE', collationSource: 'declared' };
+			expect(resolveSetOpColumnCollation(t('NOCASE', 'declared'), t('BINARY', 'default'))).to.deep.equal(want);
+			expect(resolveSetOpColumnCollation(t('BINARY', 'default'), t('NOCASE', 'declared'))).to.deep.equal(want);
+		});
+
+		it('explicit outranks declared, preserving rank 3 as the source', () => {
+			expect(resolveSetOpColumnCollation(t('BINARY', 'explicit'), t('NOCASE', 'declared')))
+				.to.deep.equal({ kind: 'resolved', collationName: 'BINARY', collationSource: 'explicit' });
+		});
+
+		it('same rank, same name → that name at that rank (explicit and declared)', () => {
+			expect(resolveSetOpColumnCollation(t('NOCASE', 'explicit'), t('NOCASE', 'explicit')))
+				.to.deep.equal({ kind: 'resolved', collationName: 'NOCASE', collationSource: 'explicit' });
+			expect(resolveSetOpColumnCollation(t('NOCASE', 'declared'), t('nocase', 'declared')))
+				.to.deep.equal({ kind: 'resolved', collationName: 'NOCASE', collationSource: 'declared' });
+		});
+
+		it('default/default different names → no collation (silent BINARY floor, never a conflict)', () => {
+			expect(resolveSetOpColumnCollation(t('NOCASE', 'default'), t('RTRIM', 'default')))
+				.to.deep.equal({ kind: 'resolved' });
+		});
+
+		it('declared/declared different names → declared conflict', () => {
+			expect(resolveSetOpColumnCollation(t('NOCASE', 'declared'), t('RTRIM', 'declared')))
+				.to.deep.equal({ kind: 'conflict', level: 'declared', left: 'NOCASE', right: 'RTRIM' });
+			// declared BINARY is a real rank-2 preference, so it conflicts with declared NOCASE.
+			expect(resolveSetOpColumnCollation(t('BINARY', 'declared'), t('NOCASE', 'declared')).kind).to.equal('conflict');
+		});
+
+		it('explicit/explicit different names → explicit conflict', () => {
+			expect(resolveSetOpColumnCollation(t('NOCASE', 'explicit'), t('RTRIM', 'explicit')))
+				.to.deep.equal({ kind: 'conflict', level: 'explicit', left: 'NOCASE', right: 'RTRIM' });
+		});
+
+		it('symmetric: swapping operands yields the same outcome across the matrix', () => {
+			const cells = [
+				t(), t('BINARY', 'default'), t('NOCASE', 'default'), t('RTRIM', 'default'),
+				t('BINARY', 'declared'), t('NOCASE', 'declared'), t('RTRIM', 'declared'),
+				t('BINARY', 'explicit'), t('NOCASE', 'explicit'), t('RTRIM', 'explicit'),
+				t('NOCASE'),
+			];
+			const pair = (r: SetOpColumnCollation): [string, string] =>
+				r.kind === 'conflict' ? [r.left, r.right].sort() as [string, string] : ['', ''];
+			for (const a of cells) {
+				for (const b of cells) {
+					const ab = resolveSetOpColumnCollation(a, b);
+					const ba = resolveSetOpColumnCollation(b, a);
+					const label = `${a.collationName}/${a.collationSource} vs ${b.collationName}/${b.collationSource}`;
+					expect(ba.kind, `kind asymmetry for ${label}`).to.equal(ab.kind);
+					if (ab.kind === 'resolved' && ba.kind === 'resolved') {
+						expect(ba.collationName, `name asymmetry for ${label}`).to.equal(ab.collationName);
+						expect(ba.collationSource, `source asymmetry for ${label}`).to.equal(ab.collationSource);
+					} else if (ab.kind === 'conflict' && ba.kind === 'conflict') {
+						expect(ba.level, `level asymmetry for ${label}`).to.equal(ab.level);
+						expect(pair(ba), `conflict-pair asymmetry for ${label}`).to.deep.equal(pair(ab));
+					}
+				}
+			}
+		});
+
+		it('resolved name agrees with resolveComparisonCollation (the equivalence the rank-keeping form extends)', () => {
+			const cases: Array<[ScalarType, ScalarType]> = [
+				[t('NOCASE', 'declared'), t('BINARY', 'default')],
+				[t('BINARY', 'explicit'), t('NOCASE', 'declared')],
+				[t('NOCASE', 'default'), t('RTRIM', 'default')],
+				[t(), t()],
+				[t(), t('NOCASE', 'explicit')],
+			];
+			for (const [a, b] of cases) {
+				const setOp = resolveSetOpColumnCollation(a, b);
+				const cmp = resolveComparisonCollation(a, b);
+				expect(setOp.kind).to.equal('resolved');
+				expect(cmp.kind).to.equal('resolved');
+				if (setOp.kind === 'resolved' && cmp.kind === 'resolved') {
+					// The comparison form floors absent contributions to BINARY; the set-op form
+					// reports them as no-collation. They agree once BINARY ≡ no-collation.
+					expect(setOp.collationName ?? 'BINARY').to.equal(cmp.name);
+				}
+			}
 		});
 	});
 

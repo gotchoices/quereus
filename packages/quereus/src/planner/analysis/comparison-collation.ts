@@ -234,6 +234,37 @@ export function mergePropagatedCollation(
 }
 
 /**
+ * Per-output-column collation of a set operation (UNION/INTERSECT/EXCEPT/DIFF),
+ * merged symmetrically from the two inputs' corresponding column types through
+ * the comparison lattice. Mirrors a comparison: a same-rank explicit/declared
+ * name conflict is returned for the caller to surface as a plan-time error
+ * (DISTINCT operators) or swallow (UNION ALL does no dedup, like `||` / CASE);
+ * rank-1 default conflicts resolve to the BINARY floor (no contribution). The
+ * winning rank propagates as `collationSource` so the output column carries
+ * forward correctly into nested set-ops / outer comparisons.
+ */
+export type SetOpColumnCollation =
+	| { kind: 'resolved'; collationName?: string; collationSource?: CollationSource }
+	| { kind: 'conflict'; level: 'explicit' | 'declared'; left: string; right: string };
+
+/**
+ * Resolve one set-operation output column's dedup/compare collation across both
+ * inputs. Pure — never throws; a conflict is returned for the caller to handle
+ * per operator (throw for `union`/`intersect`/`except`; treat as no-collation
+ * for `union all`). Semantically `resolveContributions(left, right)` except it
+ * keeps the winning contribution's *rank* (as `collationSource`) instead of
+ * collapsing to a bare name, so a nested set-op re-resolves at the correct rank.
+ */
+export function resolveSetOpColumnCollation(left: ScalarType, right: ScalarType): SetOpColumnCollation {
+	const merged = mergeContributions([collationContribution(left), collationContribution(right)]);
+	if (merged.kind === 'conflict') return { kind: 'conflict', level: merged.level, left: merged.left, right: merged.right };
+	const c = merged.contribution;
+	return c
+		? { kind: 'resolved', collationName: c.name, collationSource: SOURCE_BY_RANK[c.rank] }
+		: { kind: 'resolved' };  // BINARY floor — no collationName/collationSource
+}
+
+/**
  * Binary operators that compare their operands under a collation, and so must
  * validate the lattice in `generateType`. The parser currently produces only
  * unary `IS [NOT] NULL/TRUE/FALSE` forms — binary `IS`/`IS NOT` are listed so

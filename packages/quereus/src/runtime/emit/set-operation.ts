@@ -14,6 +14,13 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
   // operations). The comparator runs over the DATA columns only — membership flags
   // are appended after, but dedup / probe identity is on data columns alone, so set
   // identity is never perturbed by the flags.
+  //
+  // Each data column's collation is the CROSS-INPUT resolved collation: `SetOperationNode`
+  // merges both operands' column types through the shared comparison lattice and writes
+  // the result into the output attribute/column types (`set-operation-cross-input-collation-merge`).
+  // This emitter reads `attr.type.collationName` verbatim, so dedup/membership and an
+  // enclosing ORDER BY (which keys off the same output-column collation) stay in lockstep —
+  // the node is the single resolution site; do NOT re-resolve here.
   const attributes = plan.getAttributes();
   // DATA arity is recursive (`plan.dataColumnCount()`), NOT `plan.left.getType().columns.length`
   // — a flagged inner set-op operand on the left would over-count by its surfaced flags.
