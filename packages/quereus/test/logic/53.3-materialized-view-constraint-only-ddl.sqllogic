@@ -399,5 +399,11 @@ insert into t14 values (2, 'y', 'q');
 select * from mv14 order by a;
 → [{"a":"x","b":"p"},{"a":"y","b":"q"}]
 
+-- live maintenance keeps working under the unchanged (wider) backing PK {a,b}:
+-- a delete propagates too, not just inserts
+delete from t14 where a = 'x';
+select * from mv14 order by a;
+→ [{"a":"y","b":"q"}]
+
 drop materialized view mv14;
 drop table t14;
