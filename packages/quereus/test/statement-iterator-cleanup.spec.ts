@@ -268,7 +268,7 @@ describe('Statement Iterator Cleanup', () => {
 			expect(first.done).to.be.false;
 
 			// Call return() explicitly
-			const returnResult = await iterator.return();
+			const returnResult = await iterator.return!();
 			expect(returnResult.done).to.be.true;
 
 			// Transaction should be committed
@@ -286,7 +286,7 @@ describe('Statement Iterator Cleanup', () => {
 
 			// Call throw() explicitly
 			try {
-				await iterator.throw(new Error('Direct throw'));
+				await iterator.throw!(new Error('Direct throw'));
 				expect.fail('Should have thrown');
 			} catch (err) {
 				expect((err as Error).message).to.equal('Direct throw');

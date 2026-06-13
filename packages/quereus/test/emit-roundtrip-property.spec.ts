@@ -177,7 +177,7 @@ const checkExprArb: fc.Arbitrary<AST.BinaryExpr> = fc.tuple(
 const columnConstraintArb: fc.Arbitrary<AST.ColumnConstraint> = fc.oneof(
 	// PRIMARY KEY [ASC|DESC] [ON CONFLICT ...]
 	fc.record({
-		direction: fc.oneof<('asc' | 'desc' | undefined)[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
+		direction: fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
 		onConflict: conflictResArb,
 	}).map(({ direction, onConflict }): AST.ColumnConstraint => {
 		const c: AST.ColumnConstraint = { type: 'primaryKey' };
@@ -290,7 +290,7 @@ function makeTableConstraintArb(columnNames: string[]): fc.Arbitrary<AST.TableCo
 		// PRIMARY KEY (col [ASC|DESC], ...) [ON CONFLICT ...]
 		fc.record({
 			cols: multiCol(3),
-			directions: fc.array(fc.oneof<('asc' | 'desc' | undefined)[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')), { minLength: 0, maxLength: 3 }),
+			directions: fc.array(fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')), { minLength: 0, maxLength: 3 }),
 			onConflict: conflictResArb,
 		}).map(({ cols, directions, onConflict }): AST.TableConstraint => {
 			const c: AST.TableConstraint = {
@@ -361,9 +361,11 @@ const createTableArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	uniqueIdents(3),                            // column names (3 fixed so table constraints have something to reference)
 	fc.boolean(),                               // ifNotExists
 ).chain(([tableName, colNames, ifNotExists]) => {
-	const columnDefs = colNames.map(name => makeColumnDefArb(name));
+	// Destructure into a fixed 3-tuple (colNames has exactly 3 entries) so fc.tuple
+	// infers positional element types instead of `ColumnDef | TableConstraint[]`.
+	const [col0, col1, col2] = colNames.map(name => makeColumnDefArb(name));
 	return fc.tuple(
-		...columnDefs,
+		col0, col1, col2,
 		fc.array(makeTableConstraintArb(colNames), { minLength: 0, maxLength: 2 }),
 	).map(([c0, c1, c2, constraints]): AST.CreateTableStmt => ({
 		type: 'createTable',
@@ -629,7 +631,7 @@ const createViewArb: fc.Arbitrary<AST.CreateViewStmt> = fc.tuple(
 
 const indexedColumnArb: fc.Arbitrary<AST.IndexedColumn> = fc.record({
 	name: identArb,
-	direction: fc.oneof<('asc' | 'desc' | undefined)[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
+	direction: fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(fc.constant(undefined), fc.constant('asc'), fc.constant('desc')),
 }).map(({ name, direction }) => {
 	const c: AST.IndexedColumn = { name };
 	if (direction !== undefined) c.direction = direction;
@@ -679,9 +681,11 @@ const declaredTableInnerArb: fc.Arbitrary<AST.CreateTableStmt> = fc.tuple(
 	identArb,
 	uniqueIdents(3),
 ).chain(([tableName, colNames]) => {
-	const columnDefs = colNames.map(name => makeColumnDefArb(name));
+	// Destructure into a fixed 3-tuple (colNames has exactly 3 entries) so fc.tuple
+	// infers positional element types instead of `ColumnDef | TableConstraint[]`.
+	const [col0, col1, col2] = colNames.map(name => makeColumnDefArb(name));
 	return fc.tuple(
-		...columnDefs,
+		col0, col1, col2,
 		fc.array(makeTableConstraintArb(colNames), { minLength: 0, maxLength: 2 }),
 	).map(([c0, c1, c2, constraints]): AST.CreateTableStmt => ({
 		type: 'createTable',
@@ -780,7 +784,7 @@ const declareSchemaArb: fc.Arbitrary<AST.DeclareSchemaStmt> = fc.array(declareIt
 
 const alterTableArb: fc.Arbitrary<AST.AlterTableStmt> = fc.tuple(
 	identArb, // table name
-	fc.oneof<AST.AlterTableAction[]>(
+	fc.oneof<fc.Arbitrary<AST.AlterTableAction>[]>(
 		// RENAME TO
 		identArb.map(newName => ({ type: 'renameTable', newName })),
 		// RENAME COLUMN
@@ -814,7 +818,7 @@ const alterTableArb: fc.Arbitrary<AST.AlterTableStmt> = fc.tuple(
 			})),
 		),
 		// ALTER PRIMARY KEY (cols)
-		uniqueIdents(2).chain(cols => fc.array(fc.oneof<('asc' | 'desc' | undefined)[]>(
+		uniqueIdents(2).chain(cols => fc.array(fc.oneof<fc.Arbitrary<'asc' | 'desc' | undefined>[]>(
 			fc.constant(undefined),
 			fc.constant('asc'),
 			fc.constant('desc'),

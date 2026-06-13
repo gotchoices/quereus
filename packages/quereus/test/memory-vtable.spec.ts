@@ -11,6 +11,12 @@ import type { FilterInfo } from "../src/vtab/filter-info.js";
 import { ConflictResolution } from "../src/common/constants.js";
 import type * as AST from "../src/parser/ast.js";
 import { INTEGER_TYPE, TEXT_TYPE, REAL_TYPE, BLOB_TYPE } from "../src/types/index.js";
+import type { UpdateResult } from "../src/common/types.js";
+
+/** Assert an UpdateResult succeeded and narrow it to the `'ok'` branch so `.row` is accessible. */
+function expectOk(result: UpdateResult): asserts result is Extract<UpdateResult, { status: 'ok' }> {
+	expect(result.status).to.equal('ok');
+}
 
 describe("Memory VTable Module", () => {
 	let db: Database;
@@ -127,7 +133,7 @@ describe("Memory VTable Module", () => {
 			const newRow = [1, 'Laptop', 999.99, 'Electronics'];
 			const result = await table.update({ operation: 'insert', values: newRow });
 
-			expect(result.status).to.equal('ok');
+			expectOk(result);
 			expect(result.row).to.deep.equal(newRow);
 		});
 
@@ -156,7 +162,7 @@ describe("Memory VTable Module", () => {
 			const oldKeyValues = [1]; // Primary key values
 			const result = await table.update({ operation: 'update', values: updatedRow, oldKeyValues });
 
-			expect(result.status).to.equal('ok');
+			expectOk(result);
 			expect(result.row).to.deep.equal(updatedRow);
 
 			// Verify the update
@@ -178,7 +184,7 @@ describe("Memory VTable Module", () => {
 			const oldKeyValues = [1];
 			const result = await table.update({ operation: 'delete', values: undefined, oldKeyValues });
 
-			expect(result.status).to.equal('ok');
+			expectOk(result);
 			expect(result.row).to.deep.equal([1, 'Laptop', 999.99, 'Electronics']);
 
 			// Verify deletion
@@ -199,7 +205,7 @@ describe("Memory VTable Module", () => {
 			const oldKeyValues = [1];
 			const result = await table.update({ operation: 'update', values: updatedRow, oldKeyValues });
 
-			expect(result.status).to.equal('ok');
+			expectOk(result);
 			expect(result.row).to.deep.equal(updatedRow);
 
 			// Verify old key is gone and new key exists
@@ -244,7 +250,7 @@ describe("Memory VTable Module", () => {
 			const rowWithConflictRes = [1, 'other@example.com'];
 			const result = await table.update({ operation: 'insert', values: rowWithConflictRes, onConflict: ConflictResolution.IGNORE });
 			// IGNORE should return ok with undefined row
-			expect(result.status).to.equal('ok');
+			expectOk(result);
 			expect(result.row).to.be.undefined;
 
 			// Verify original data unchanged
@@ -302,7 +308,7 @@ describe("Memory VTable Module", () => {
 			const oldKeyValues = [1, 'sess_123'];
 			const result = await table.update({ operation: 'update', values: updatedRow, oldKeyValues });
 
-			expect(result.status).to.equal('ok');
+			expectOk(result);
 			expect(result.row).to.deep.equal(updatedRow);
 		});
 
@@ -313,7 +319,7 @@ describe("Memory VTable Module", () => {
 			const oldKeyValues = [1, 'sess_123'];
 			const result = await table.update({ operation: 'delete', values: undefined, oldKeyValues });
 
-			expect(result.status).to.equal('ok');
+			expectOk(result);
 			expect(result.row).to.deep.equal([1, 'sess_123', '2024-01-01']);
 
 			const rows = [];

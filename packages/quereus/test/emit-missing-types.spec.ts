@@ -107,7 +107,7 @@ describe('Emit: missing statement types', () => {
 			const node: AlterViewStmt = {
 				type: 'alterView',
 				name: ident('v'),
-				action: { type: 'setTags', tags: { cacheable: true } },
+				action: { type: 'setTags', mode: 'replace', tags: { cacheable: true } },
 			};
 			const result = astToString(node);
 			expect(result).to.equal(`alter view v set tags (cacheable = true)`);
@@ -117,7 +117,7 @@ describe('Emit: missing statement types', () => {
 			const node: AlterMaterializedViewStmt = {
 				type: 'alterMaterializedView',
 				name: ident('mv'),
-				action: { type: 'setTags', tags: { owner: 'analytics' } },
+				action: { type: 'setTags', mode: 'replace', tags: { owner: 'analytics' } },
 			};
 			const result = astToString(node);
 			expect(result).to.equal(`alter materialized view mv set tags (owner = 'analytics')`);
@@ -127,7 +127,7 @@ describe('Emit: missing statement types', () => {
 			const node: AlterIndexStmt = {
 				type: 'alterIndex',
 				name: ident('idx'),
-				action: { type: 'setTags', tags: {} },
+				action: { type: 'setTags', mode: 'replace', tags: {} },
 			};
 			const result = astToString(node);
 			expect(result).to.equal(`alter index idx set tags ()`);
