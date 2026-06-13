@@ -67,6 +67,14 @@ select * from mvc order by id;
 insert into c values (3, -1);
 -- error: check
 
+-- add→drop roundtrip: dropping the just-added CHECK is another
+-- body-irrelevant event — still live, and the previously-rejected
+-- write now propagates
+alter table c drop constraint chk;
+insert into c values (3, -1);
+select * from mvc order by id;
+→ [{"id":1,"v":5},{"id":2,"v":6},{"id":3,"v":-1}]
+
 drop materialized view mvc;
 drop table c;
 
@@ -169,6 +177,33 @@ select * from mvg order by id;
 
 drop materialized view mvg;
 drop table g;
+
+-- ===================================
+-- 7b. CREATE/DROP INDEX and a tag-only ALTER are equally body-irrelevant:
+--     each fires table_modified on the source, none stales the MV
+-- ===================================
+
+create table g2 (id integer primary key, v integer not null);
+insert into g2 values (1, 1);
+create materialized view mvg2 as select id, v from g2;
+
+create index ig2 on g2 (v);
+insert into g2 values (2, 2);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2}]
+
+drop index ig2;
+insert into g2 values (3, 3);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2},{"id":3,"v":3}]
+
+alter table g2 set tags (note = 'x');
+insert into g2 values (4, 4);
+select * from mvg2 order by id;
+→ [{"id":1,"v":1},{"id":2,"v":2},{"id":3,"v":3},{"id":4,"v":4}]
+
+drop materialized view mvg2;
+drop table g2;
 
 -- ===================================
 -- 8. Pre-existing staleness is never cleared by a constraint-only DDL:
