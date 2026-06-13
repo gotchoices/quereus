@@ -537,9 +537,12 @@ describe('SQL Logic Tests' + (USE_STORE_MODULE ? ' (Store Mode)' : ''), () => {
 			});
 
 			it('should execute statements and match results or expected errors', async function() {
-				if (USE_STORE_MODULE) {
-					this.timeout(30000); // Store tests may be slower
-				}
+				// Each .sqllogic file runs as a single test that executes the whole file
+				// (potentially thousands of statements), so mocha's 2000ms default is
+				// structurally too tight — the larger files sit right at the boundary and
+				// flake under full-suite GC/load. Give memory mode a generous explicit
+				// timeout; store mode is slower still.
+				this.timeout(USE_STORE_MODULE ? 30000 : 15000);
 
 				const lines = content.split(/\r?\n/);
 				let currentSql = '';
