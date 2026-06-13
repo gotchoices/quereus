@@ -245,6 +245,15 @@ SELECT v FROM (VALUES (2)) AS b(v)
 ORDER BY 1;
 → [{"v":1},{"v":3}]
 
+-- Ordinal over DIFF (symmetric difference: (A EXCEPT B) UNION (B EXCEPT A)).
+-- The ordinal resolves over the outer UNION's output column, so positional
+-- ordering works across the structural expansion.
+SELECT v FROM (VALUES (1), (2), (3)) AS a(v)
+DIFF
+SELECT v FROM (VALUES (2), (3), (4)) AS b(v)
+ORDER BY 1 DESC;
+→ [{"v":4},{"v":1}]
+
 -- Mixed ordinal + column-name keys in one ORDER BY
 SELECT a, b FROM (VALUES (2, 'x'), (1, 'y'), (1, 'a')) AS t(a, b)
 UNION
