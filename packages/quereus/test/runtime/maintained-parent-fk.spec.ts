@@ -344,4 +344,54 @@ describe('Parent-side referential enforcement for maintained-table maintenance w
 			expect(await count('c'), 'parent-side cascade removed the child').to.equal(0);
 		});
 	});
+
+	/* ──────────────────── residual-recompute (aggregate) arm ──────────────────── */
+
+	describe('residual-recompute (aggregate) arm as an FK parent', () => {
+		// A bare-group-column aggregate routes to the residual arm (white-box-asserted). An
+		// emptied group is realized as a backing `delete-key` (count → 0), structurally
+		// distinct from the inverse-projection arm's delta — so this exercises a second,
+		// genuinely different apply path under the arm-agnostic enforcement hook.
+		async function seedAgg(childFk: string): Promise<void> {
+			await db.exec(`
+				create table src (id integer primary key, g integer);
+				create table m (g integer primary key, n integer)
+					maintained as select g, count(*) as n from src group by g;
+				create table c (cid integer primary key, m_g integer, ${childFk});
+				insert into src values (1, 10), (2, 10), (3, 20);
+				insert into c values (100, 10);
+			`);
+			expect(registeredPlanKind(db, 'main.m'), 'body must route to the aggregate residual arm').to.equal('residual-recompute');
+		}
+
+		it('CASCADE removes children when a maintenance delete empties the referenced group', async () => {
+			await seedAgg('foreign key (m_g) references m(g) on delete cascade');
+			// Delete both rows of group 10 ⇒ m(10) backing row removed (count → 0) ⇒ cascade c.
+			await db.exec('delete from src where g = 10');
+			expect(await readAll('select g from m order by g')).to.deep.equal([{ g: 20 }]);
+			expect(await count('c'), 'child cascade-deleted when its group emptied').to.equal(0);
+		});
+
+		it('RESTRICT blocks the maintenance delete that would empty a referenced group', async () => {
+			await seedAgg('foreign key (m_g) references m(g) on delete restrict');
+			await expectError(
+				() => db.exec('delete from src where g = 10'),
+				`DELETE on 'm' violates RESTRICT from 'c'`,
+			);
+			// Source + aggregate + child all intact.
+			expect(await count('src')).to.equal(3);
+			expect(await readAll('select g, n from m order by g')).to.deep.equal([{ g: 10, n: 2 }, { g: 20, n: 1 }]);
+			expect(await count('c')).to.equal(1);
+		});
+
+		it('a non-emptying group decrement (upsert at the same key, not delete) fires no parent-side action', async () => {
+			await seedAgg('foreign key (m_g) references m(g) on delete restrict on update restrict');
+			// Remove ONE of group 10's two rows ⇒ m(10) updates n 2→1 at the same backing key
+			// (an upsert/REPLACE, not a delete; the referenced column `g` is unchanged) ⇒ the
+			// UPDATE referenced-column short-circuit means no enforcement; the child stands.
+			await db.exec('delete from src where id = 1');
+			expect(await readAll('select g, n from m order by g')).to.deep.equal([{ g: 10, n: 1 }, { g: 20, n: 1 }]);
+			expect(await count('c')).to.equal(1);
+		});
+	});
 });
