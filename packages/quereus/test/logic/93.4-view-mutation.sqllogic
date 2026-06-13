@@ -1012,6 +1012,120 @@ create view uq16_v as
 update uq16_v set cval = pc where cid = 1;
 -- error: source columns are not statically resolvable
 
+-- ========================================================================
+-- ALIAS-SCOPE-AWARE cross-source SET strip: a USER-AUTHORED *alias-qualified* ref whose
+-- qualifier collides with a join side's alias/table name but is SHADOWED by an inner
+-- value-subquery's own FROM alias binds locally (innermost-scope SQL rules), NOT routed by
+-- the qualifier strip. The converse of uq-9 (a BARE user name colliding with a partner base
+-- column — handled by the injection-pass column-name shadowing): here the collision is on an
+-- alias QUALIFIER, handled by the strip's alias-shadow descent (transformAliasScopedExpr).
+-- See docs/view-updateability.md § Inner Join, cross-source `set`.
+-- ========================================================================
+
+-- (uq-17) PARTNER-alias collision (headline): the view exposes `pv` off side `p`; an
+-- unrelated `uq17_points p` is the inner value-subquery FROM. The user ref `p.score` denotes
+-- uq17_points.score by innermost-scope rules, NOT the join side `p` (uq17_p has no `score`).
+-- The qualifier-only strip would route `p.score` through the `parent` capture → the partner
+-- base has no `score` → build error; the alias-shadow descent leaves it local. For cid=2:
+-- max(score) where k=2 → max(50,70) = 70; cid=1 untouched.
+create table uq17_p (pid integer primary key, pv integer);
+create table uq17_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq17_p(pid));
+create table uq17_points (k integer, score integer);
+insert into uq17_p values (10, 100), (20, 200);
+insert into uq17_c values (1, 10, 1), (2, 20, 2);
+insert into uq17_points values (2, 50), (2, 70), (1, 999);
+create view uq17_v as
+    select c.cid as cid, cval, pv from uq17_c c join uq17_p p on p.pid = c.pref;
+update uq17_v set cval = (select max(p.score) from uq17_points p where p.k = cid) where cid = 2;
+select cid, cval from uq17_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":70}]
+
+-- (uq-18) OWNING-alias collision: the owning side (child, assigns `cval`) is aliased `c`; the
+-- inner value-subquery FROM aliases `uq18_things` as `c`. The user ref `c.v` denotes
+-- uq18_things.v by innermost-scope rules. The qualifier-only strip would match `c` ∈ owning
+-- and strip `c.v` to BARE `v` — ambiguous across the inner cross-join's two sources (a
+-- plan-time error), and even resolved leftmost it would read uq18_first.v=99, not 42. The
+-- alias-shadow check fires BEFORE the owning set, so `c.v` stays local → uq18_things.v = 42.
+create table uq18_p (pid integer primary key, pv integer);
+create table uq18_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq18_p(pid));
+create table uq18_first (fid integer primary key, v integer);
+create table uq18_things (tid integer primary key, v integer);
+insert into uq18_p values (10, 100);
+insert into uq18_c values (1, 10, 0);
+insert into uq18_first values (1, 99);
+insert into uq18_things values (1, 42);
+create view uq18_v as
+    select c.cid as cid, cval, pv from uq18_c c join uq18_p p on p.pid = c.pref;
+update uq18_v set cval = (select c.v from uq18_first f cross join uq18_things c) where cid = 1;
+select cid, cval from uq18_c order by cid;
+→ [{"cid":1,"cval":42}]
+
+-- (uq-19) TABLE-NAME collision: the partner side is `uq19_parent p`, so the strip's other-side
+-- qualifier set carries the table NAME `uq19_parent` as well as the alias `p`. The inner
+-- value-subquery aliases `uq19_aux` AS `uq19_parent`, so the user ref `uq19_parent.av` denotes
+-- uq19_aux.av. The qualifier-only strip would match the table-name qualifier and route `av`
+-- through the parent capture (the parent base has no `av` → build error); the alias-shadow
+-- descent records the INNER alias and leaves it local. For cid=2: aux.aid=2 → av=666.
+create table uq19_parent (pid integer primary key, pv integer);
+create table uq19_child (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq19_parent(pid));
+create table uq19_aux (aid integer primary key, av integer);
+insert into uq19_parent values (10, 100), (20, 200);
+insert into uq19_child values (1, 10, 1), (2, 20, 2);
+insert into uq19_aux values (1, 555), (2, 666);
+create view uq19_v as
+    select c.cid as cid, cval, pv from uq19_child c join uq19_parent p on p.pid = c.pref;
+update uq19_v set cval = (select av from uq19_aux uq19_parent where uq19_parent.aid = cid) where cid = 2;
+select cid, cval from uq19_child order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":666}]
+
+-- (uq-20) COMPOUND-LEG negative scoping: a `union` value subquery whose FIRST leg's FROM binds
+-- alias `p` (colliding with the partner side `p`) must NOT shadow the GENUINE partner read in
+-- the SIBLING leg — the legs correlate to the same enclosing scope, not to each other's FROM
+-- (mirror transformScopedQuery's onLeg: a leg keeps the incoming alias set, not the first
+-- leg's `inner`). Leg A (`uq20_aux p`, filtered to no rows) must not leak its `p` into leg B,
+-- whose `pv` (view column → side-qualified `p.pv`) still routes through the capture. For cid=2
+-- (joined parent pv=200): leg A empty ∪ leg B {200} → 200; cid=1 untouched.
+create table uq20_parent (pid integer primary key, pv integer);
+create table uq20_child (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq20_parent(pid));
+create table uq20_aux (k integer, av integer);
+create table uq20_one (dummy integer);
+insert into uq20_parent values (10, 100), (20, 200);
+insert into uq20_child values (1, 10, 1), (2, 20, 2);
+insert into uq20_aux values (1, 7);
+insert into uq20_one values (0);
+create view uq20_v as
+    select c.cid as cid, cval, pv from uq20_child c join uq20_parent p on p.pid = c.pref;
+update uq20_v set cval = (
+        select av from uq20_aux p where p.k = 999
+        union
+        select pv from uq20_one) where cid = 2;
+select cid, cval from uq20_child order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":200}]
+
+-- (uq-21) NON-COLLIDING regression: a genuine partner read (`pv` → side-qualified `p.pv`)
+-- nested in a value subquery whose inner FROM uses a *different* alias (`q`) still routes
+-- through the `__vmupd_keys` capture — proving the alias-shadow fix NARROWS routing to true
+-- collisions, never removes it. For cid=2 (joined parent pv=200): sum(tv) where tv <= 200 =
+-- 100 + 150 = 250; cid=1 untouched; the partner base unchanged.
+create table uq21_p (pid integer primary key, pv integer);
+create table uq21_c (cid integer primary key, pref integer, cval integer,
+    foreign key (pref) references uq21_p(pid));
+create table uq21_t (tid integer primary key, tv integer);
+insert into uq21_p values (10, 100), (20, 200);
+insert into uq21_c values (1, 10, 1), (2, 20, 2);
+insert into uq21_t values (1, 100), (2, 150), (3, 300);
+create view uq21_v as
+    select c.cid as cid, cval, pv from uq21_c c join uq21_p p on p.pid = c.pref;
+update uq21_v set cval = (select sum(tv) from uq21_t q where q.tv <= pv) where cid = 2;
+select cid, cval from uq21_c order by cid;
+→ [{"cid":1,"cval":1},{"cid":2,"cval":250}]
+select pid, pv from uq21_p order by pid;
+→ [{"pid":10,"pv":100},{"pid":20,"pv":200}]
+
 -- n-way DELETE under FK enforcement (foreign_keys defaults ON here) -> the fan-out must
 -- order the base deletes FK-child before FK-parent. The canonical columnar split has each
 -- member's PK reference the anchor's (axd_b, axd_c -> axd_a); deleting the parent first

@@ -18,7 +18,7 @@ import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
 import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn } from './single-source.js';
-import { transformExpr, cloneExpr, mapQueryExprUniform, substituteNewRefs, transformScopedExpr, type ScopeContext } from './scope-transform.js';
+import { transformExpr, cloneExpr, mapQueryExprUniform, substituteNewRefs, transformScopedExpr, transformAliasScopedExpr, type ScopeContext } from './scope-transform.js';
 import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 
 /**
@@ -2404,8 +2404,13 @@ function buildIdentifyingPredicate(
  * multi-source analog of the single-source correlation-qualification of
  * substituted terms (`makeBaseQualifier`). Qualifying at injection keeps every
  * scope decision in this walk: downstream, the qualifier strip
- * ({@link stripSideQualifier}) stays purely syntactic, and a bare leaf reaching it
- * is only ever a user-authored local/unknown name.
+ * ({@link stripSideQualifier}) is qualifier-driven, and a bare leaf reaching it is
+ * only ever a user-authored local/unknown name. The strip is **alias-scope-aware**
+ * for the converse case this pass does not cover — a *user-authored*
+ * alias-qualified ref whose qualifier collides with a side alias/table name but is
+ * shadowed by an inner value-subquery's own FROM alias is left subquery-local there
+ * (these injected lineage leaves carry side aliases a user subquery would not reuse,
+ * so they are never the shadowed ones).
  */
 function substituteViewColumns(
 	ctx: PlanningContext,
@@ -2475,23 +2480,34 @@ function makeSideQualifyScope(sides: readonly JoinSide[], view: MutableViewLike)
  * targets the single-table UPDATE directly). A reference to **any other side** cannot
  * be expressed as a single-table SET, so it is either captured-and-rewritten (when a
  * `registerCrossSource` carrier is supplied — § Inner Join, cross-source `set`) or
- * rejected (`cross-source-assignment`, the legacy path). The strip is purely
- * **syntactic** — the decision reads only a column's own table qualifier — so a single
- * substitute is threaded uniformly at every nesting depth (the scope-unaware
- * `mapQueryExprUniform` descent); a nested owning-side reference is correlated to the
+ * rejected (`cross-source-assignment`, the legacy path). The strip is qualifier-driven
+ * but **alias-scope-aware**: the route/strip decision reads a column's own table
+ * qualifier, yet a qualifier shadowed by an inner value-subquery's FROM **alias** binds
+ * to that inner source (innermost-scope SQL rules), so it is left local. The alias-shadow
+ * set accumulates per nesting depth through the {@link transformAliasScopedExpr} descent
+ * (the alias-only analog of the view-column descent's column-name shadowing); a nested
+ * *owning*-side reference whose qualifier is NOT shadowed is still correlated to the
  * target row of the lowered UPDATE just like a top-level one.
  *
- * The owning-side qualifier set is checked **first**, so a self-join (where an `other`
- * side shares the owning side's table name) still strips an owning-alias reference; only
- * a reference qualified by a *different alias* is the cross-source case.
+ * The **alias-shadow check fires first** (before the owning/other qualifier sets), so a
+ * user-authored alias-qualified ref colliding with a side alias OR a side's table name
+ * (`from things c` shadowing owning alias `c`; `from aux parent` shadowing a side's table
+ * name `parent`) is left subquery-local — never stripped to bare, never mis-routed
+ * through the capture. Injected base-term lineage leaves carry side aliases a user
+ * subquery would not intentionally reuse, so they are never shadowed; the narrowing
+ * affects only genuine user collisions.
+ *
+ * The owning-side qualifier set is checked **before** the other-side set, so a self-join
+ * (where an `other` side shares the owning side's table name) still strips an owning-alias
+ * reference; only a reference qualified by a *different alias* is the cross-source case.
  *
  * A **bare** leaf is left untouched — binding locally (a nested subquery's own FROM, or
  * the lowered single-table UPDATE's target) or failing loudly at build. The strip never
  * resolves a bare name against the view sides: every base-term lineage leaf was
  * side-alias-qualified when `substituteViewColumns` injected it
  * ({@link makeSideQualifyScope} — including a partner column the body projected bare, so
- * that read rides the qualified routing below at ANY nesting depth), and resolving a
- * bare name here would mis-route an inner-scope column whose name merely collides with a
+ * that read rides the qualified routing below at ANY non-shadowed nesting depth), and
+ * resolving a bare name here would mis-route an inner-scope column whose name merely collides with a
  * partner base column (e.g. `(select psecret from t)` where the partner side also has a
  * `psecret`) to the partner's captured value.
  *
@@ -2554,17 +2570,25 @@ function stripSideQualifier(
 	// QUALIFIED-only substitution: an owning-alias ref strips to bare; a partner-alias ref
 	// routes through the capture; a BARE ref is left untouched (only ever a user-authored
 	// local/unknown name — every lineage leaf arrives side-alias-qualified; see the
-	// docstring). Purely a qualifier decision (a syntactic property), so it is
-	// scope-independent and the same substitute is threaded uniformly at every nesting
-	// depth through the scope-unaware `mapQueryExprUniform` descent.
-	const substitute = (col: AST.ColumnExpr): AST.Expression | undefined => {
+	// docstring). The route/strip decision is qualifier-driven but ALIAS-SCOPE-AWARE: a
+	// qualifier shadowed by an inner value-subquery FROM alias (`aliasShadow`) binds to that
+	// inner source by innermost-scope SQL rules, so it is left local — checked BEFORE the
+	// side-qualifier sets, so an owning-/partner-/table-name collision with an inner alias
+	// never strips or routes. Injected lineage leaves carry side aliases a user subquery
+	// would not reuse, so they are never shadowed; only a user-authored alias-qualified ref
+	// colliding with a side alias/table name is affected. The alias set accumulates per
+	// nesting depth via `transformAliasScopedExpr` (mirrors the view-column descent's
+	// column-name shadowing); at the top level it is empty, so behaviour is byte-identical
+	// for every non-colliding statement.
+	const substitute = (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>): AST.Expression | undefined => {
 		if (!col.table) return undefined;
 		const t = col.table.toLowerCase();
+		if (aliasShadow.has(t)) return undefined;
 		if (owningQuals.has(t)) return { type: 'column', name: col.name };
 		if (otherQuals.has(t)) return routePartnerRead(col);
 		return undefined;
 	};
-	return transformExpr(expr, substitute, (q) => mapQueryExprUniform(q, substitute));
+	return transformAliasScopedExpr(expr, substitute);
 }
 
 /**

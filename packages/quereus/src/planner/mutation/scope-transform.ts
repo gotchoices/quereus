@@ -540,3 +540,108 @@ export function transformScopedQuery(
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, onNested);
 	return rebuildSelect(sel, onExpr, onNested, onLeg);
 }
+
+// --- alias-shadow-aware substitution (cross-source SET-value strip) --------
+
+/**
+ * The lowercased set of FROM aliases a subquery's FROM sources bind into scope.
+ * Unlike {@link collectFromColumnNames} this NEVER returns `null` and needs no
+ * `PlanningContext`: a FROM alias is always statically known from the FROM clause
+ * itself, even when the source's *columns* are unresolvable (a `select *` / TVF /
+ * CTE still binds its own alias), so alias shadowing needs no taint signal.
+ *
+ *   table          -> alias ?? table.name
+ *   subquerySource -> alias              (always present)
+ *   functionSource -> alias ?? name.name
+ *   join           -> union(left, right)
+ */
+export function collectFromAliases(from: readonly AST.FromClause[] | undefined): Set<string> {
+	const acc = new Set<string>();
+	if (!from) return acc;
+	for (const fc of from) collectFromSourceAliases(fc, acc);
+	return acc;
+}
+
+/** Accumulate the lowercased alias(es) a single FROM source binds into `acc`. */
+function collectFromSourceAliases(fc: AST.FromClause, acc: Set<string>): void {
+	switch (fc.type) {
+		case 'table':
+			acc.add((fc.alias ?? fc.table.name).toLowerCase());
+			return;
+		case 'subquerySource':
+			acc.add(fc.alias.toLowerCase());
+			return;
+		case 'functionSource':
+			acc.add((fc.alias ?? fc.name.name).toLowerCase());
+			return;
+		case 'join':
+			collectFromSourceAliases(fc.left, acc);
+			collectFromSourceAliases(fc.right, acc);
+			return;
+	}
+}
+
+const NO_ALIAS_SHADOW: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Alias-shadow-aware structural substitution over an expression, entered at the
+ * outermost scope (no inner FROM aliases shadow yet). `substitute` receives each
+ * column AND the set of FROM aliases shadowing at the column's depth, so a
+ * qualifier shadowed by an inner value-subquery FROM alias can be left local
+ * (per innermost-scope SQL rules) instead of routed by the cross-source strip.
+ *
+ * Mirrors {@link transformScopedQuery}'s scope rules — a select's own FROM
+ * aliases join the shadow set for its clauses and any subquery nested in them; a
+ * compound / union leg keeps the incoming set (it correlates to the same outer
+ * scope); VALUES has no FROM — but threads ONLY an alias set: no column-name
+ * shadow set, no taint, no reject. An embedded INSERT/UPDATE/DELETE … RETURNING
+ * subquery is cloned through structurally (no substitution), exactly matching the
+ * cross-source strip's prior {@link mapQueryExprUniform} behaviour.
+ */
+export function transformAliasScopedExpr(
+	expr: AST.Expression,
+	substitute: (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>) => AST.Expression | undefined,
+): AST.Expression {
+	const sub = (col: AST.ColumnExpr): AST.Expression | undefined => substitute(col, NO_ALIAS_SHADOW);
+	const descend = (q: AST.QueryExpr): AST.QueryExpr => transformAliasScopedQuery(q, substitute, NO_ALIAS_SHADOW);
+	return transformExpr(expr, sub, descend);
+}
+
+/**
+ * Alias-shadow-aware transform of an inner `QueryExpr`, threading the FROM-alias
+ * shadow set exactly as {@link transformScopedQuery} threads its column-name
+ * `shadowed` set: a `select`'s own FROM aliases join the set for its clauses and
+ * nested subqueries; a sibling compound / union leg keeps the incoming set; a
+ * VALUES body (no FROM) keeps it too; a DML … RETURNING subquery clones through.
+ */
+function transformAliasScopedQuery(
+	query: AST.QueryExpr,
+	substitute: (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>) => AST.Expression | undefined,
+	aliasShadow: ReadonlySet<string>,
+): AST.QueryExpr {
+	if (query.type === 'values') {
+		// No FROM — the value rows correlate to the enclosing scope unchanged.
+		const sub = (col: AST.ColumnExpr): AST.Expression | undefined => substitute(col, aliasShadow);
+		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformAliasScopedQuery(q, substitute, aliasShadow);
+		const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, sub, descend);
+		return { ...query, values: query.values.map(row => row.map(onExpr)) };
+	}
+	if (query.type !== 'select') {
+		// An embedded INSERT/UPDATE/DELETE … RETURNING subquery — clone through
+		// structurally (no substitution, no reject), matching mapQueryExprUniform.
+		return cloneDmlStmt(query);
+	}
+
+	const sel = query;
+	// References in THIS select's clauses see this select's FROM aliases in addition
+	// to any enclosing scope, so its aliases join the shadow set.
+	const inner: ReadonlySet<string> = new Set<string>([...aliasShadow, ...collectFromAliases(sel.from)]);
+	const sub = (col: AST.ColumnExpr): AST.Expression | undefined => substitute(col, inner);
+	// A subquery nested inside this select's clauses / FROM sees this select's FROM.
+	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformAliasScopedQuery(q, substitute, inner);
+	// A compound / union leg is a SIBLING select correlating to the SAME outer scope
+	// as this one — it does NOT see this select's FROM, so it keeps the incoming set.
+	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformAliasScopedQuery(q, substitute, aliasShadow);
+	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, sub, onNested);
+	return rebuildSelect(sel, onExpr, onNested, onLeg);
+}
