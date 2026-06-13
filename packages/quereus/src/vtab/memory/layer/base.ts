@@ -80,7 +80,7 @@ export class BaseLayer implements Layer {
 
 		const newIndexes = new Map<string, MemoryIndex>();
 		for (const indexSchema of this.tableSchema.indexes!) {
-			const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare);
+			const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare, this.primaryKeyFunctions.encode);
 			this.populateNewIndex(memoryIndex, indexSchema); // throws CONSTRAINT on duplicate
 			newIndexes.set(indexSchema.name, memoryIndex);
 		}
@@ -152,7 +152,7 @@ export class BaseLayer implements Layer {
 
 		for (const indexSchema of this.tableSchema.indexes!) {
 			try {
-				const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare);
+				const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare, this.primaryKeyFunctions.encode);
 				newIndexes.set(indexSchema.name, memoryIndex);
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			} catch (e: any) {
@@ -318,7 +318,7 @@ export class BaseLayer implements Layer {
 			indexName: indexSchema.name
 		});
 
-		const newMemoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare);
+		const newMemoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare, this.primaryKeyFunctions.encode);
 		this.populateNewIndex(newMemoryIndex, indexSchema);
 		this.secondaryIndexes.set(indexSchema.name, newMemoryIndex);
 	}
@@ -346,7 +346,9 @@ export class BaseLayer implements Layer {
 				// (its BTree keys by compareKeys), so a value set unique under BINARY but
 				// colliding under e.g. NOCASE surfaces here — a raw value signature would
 				// miss it. A non-empty key means a prior in-scope row already inserted it.
-				if (!hasNull && newIndex.getPrimaryKeys(indexKey).length > 0) {
+				// hasAnyPrimaryKey is O(1) (Map size) so the ascending build stays O(N) —
+				// getPrimaryKeys would sort the bucket on every row.
+				if (!hasNull && newIndex.hasAnyPrimaryKey(indexKey)) {
 					const colNames = newIndex.specColumns
 						.map(c => this.tableSchema.columns[c.index]?.name ?? String(c.index))
 						.join(', ');

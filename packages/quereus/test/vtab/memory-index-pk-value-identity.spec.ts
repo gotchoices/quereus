@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { MemoryIndex } from '../../src/vtab/memory/index.js';
 import { createPrimaryKeyFunctions } from '../../src/vtab/memory/utils/primary-key.js';
+import { encodeScalar, encodePrimaryKey } from '../../src/vtab/memory/utils/primary-key-encode.js';
 import { createDefaultColumnSchema } from '../../src/schema/column.js';
 import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
 import type { ColumnSchema } from '../../src/schema/column.js';
@@ -13,7 +14,12 @@ import type { TableSchema, PrimaryKeyColumnDefinition } from '../../src/schema/t
  *   - composite (array) PKs: a fresh equal-by-value array never matched on
  *     removeEntry and stored a duplicate on addEntry; and
  *   - scalar integer PKs across representations (`5n` vs `5`).
- * The fix keys members by the table's PK comparator via a sorted array.
+ * The container is now a `Map<string, BTreeKeyForPrimary>` keyed by a lossless,
+ * type-aware PK encoding (see `utils/primary-key-encode.ts`): membership/dedup is
+ * by *value* (O(1) Map set/delete/has) while PK-sorted scan output is reconstructed
+ * by sort-on-read. The Map is pure structured-cloneable data, so the secondary-index
+ * inheritree's node copy-on-write (which deep-clones stored entries via
+ * `structuredClone`) is safe.
  */
 
 /** N INTEGER columns named c0..c(n-1). */
@@ -38,10 +44,10 @@ function makeSchema(columns: ColumnSchema[], primaryKeyDefinition: PrimaryKeyCol
 	};
 }
 
-/** A single-column secondary index (on column 0) whose entries hold PKs compared by `pkCompare`. */
+/** A single-column secondary index (on column 0) whose entries hold PKs compared/encoded for `pkDefinition`. */
 function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[]): MemoryIndex {
-	const pkCompare = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition)).compare;
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pkCompare);
+	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition));
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pk.compare, pk.encode);
 }
 
 /**
@@ -49,12 +55,12 @@ function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefini
  * TransactionLayer uses: `new MemoryIndex(..., parentSecondaryTree)`). Entries
  * reachable only through `base.data` are INHERITED for the child — the child's
  * per-instance `ownedEntries` WeakSet does not contain them — so add/remove must
- * copy-on-write (clone the sorted array via `slice()`) rather than mutate the
+ * copy-on-write (clone the Map via `new Map(existing)`) rather than mutate the
  * shared entry in place.
  */
 function makeChildIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[], base: MemoryIndex): MemoryIndex {
-	const pkCompare = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition)).compare;
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pkCompare, base.data);
+	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition));
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pk.compare, pk.encode, base.data);
 }
 
 describe('MemoryIndex primaryKeys value-identity', () => {
@@ -122,9 +128,9 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 	});
 
 	// The copy-on-write discipline that keeps a layer's writes from corrupting the
-	// committed base it inherits from. The container changed from `new Set(existing)`
-	// to `existing.slice()`, so these guard the new sorted-array clone path.
-	describe('inherited copy-on-write (array container) isolates the base', () => {
+	// committed base it inherits from. The container is now a Map cloned via
+	// `new Map(existing)`, so these guard the Map clone path.
+	describe('inherited copy-on-write (Map container) isolates the base', () => {
 		it('inherited addEntry of a distinct composite PK does not mutate the base entry', () => {
 			const columns = makeColumns(3);
 			const pk = [{ index: 1 }, { index: 2 }];
@@ -166,6 +172,153 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 
 			expect(child.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
 			expect(base.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
+		});
+	});
+
+	// The corruption class the single-entry COW tests above cannot catch: when an
+	// inheritree LEAF holds ≥2 entries and one is copy-on-written, the node clone
+	// (structuredClone of the leaf's entries) must preserve the SIBLING entries
+	// intact and leave the base's view untouched. A class/BTree container would not
+	// survive structuredClone here — this is the regression guard against
+	// re-introducing one.
+	describe('multi-entry-leaf copy-on-write', () => {
+		it('a sibling entry is still served on the child AND base after COW of another entry', () => {
+			const columns = makeColumns(3);
+			const pk = [{ index: 1 }, { index: 2 }];
+			const base = makeIndex(columns, pk);
+			// Two distinct index keys → they share one inheritree leaf.
+			base.addEntry(1, [10, 20]);
+			base.addEntry(2, [30, 40]);
+
+			const child = makeChildIndex(columns, pk, base);
+			// COW the entry for index key 1 on the child (inherited → new Map + updateAt).
+			child.addEntry(1, [11, 21]);
+
+			// The sibling entry (index key 2) is served correctly through the child...
+			expect(child.getPrimaryKeys(2)).to.deep.equal([[30, 40]]);
+			// ...and through the base (the leaf clone must not have corrupted it).
+			expect(base.getPrimaryKeys(2)).to.deep.equal([[30, 40]]);
+
+			// And the COW'd entry: child sees both PKs, base only the original.
+			expect(child.getPrimaryKeys(1)).to.have.length(2);
+			expect(base.getPrimaryKeys(1)).to.deep.equal([[10, 20]]);
+		});
+	});
+
+	// Numeric-storage-class normalization: the encoder collapses comparator-equal
+	// numerics (NUMERIC class) to one Map key, but only element-wise — a single
+	// JSON-array *value* is encoded whole, so structurally-distinct arrays stay
+	// distinct.
+	describe('numeric normalization & arity', () => {
+		it('single-column PK: true / 1 / 1n collapse to one bucket member', () => {
+			const columns = makeColumns(2);
+			const index = makeIndex(columns, [{ index: 1 }]);
+
+			index.addEntry(1, true);
+			index.addEntry(1, 1);
+			index.addEntry(1, 1n);
+			expect(index.getPrimaryKeys(1)).to.have.length(1);
+		});
+
+		it('composite PK: [5n, 7] and [5, 7] collapse to one bucket member', () => {
+			const columns = makeColumns(3);
+			const index = makeIndex(columns, [{ index: 1 }, { index: 2 }]);
+
+			index.addEntry(1, [5n, 7]);
+			index.addEntry(1, [5, 7]); // value-equal element-wise under numeric normalization
+			expect(index.getPrimaryKeys(1)).to.have.length(1);
+		});
+	});
+
+	// An owned (in-place) mutation must invalidate the memoized sorted view so the
+	// next scan reflects the new PK in its sorted position rather than a stale array.
+	describe('sortedCache invalidation', () => {
+		it('an in-place add after a sorted read re-sorts on the next read', () => {
+			const columns = makeColumns(2);
+			const index = makeIndex(columns, [{ index: 1 }]);
+
+			index.addEntry(1, 30);
+			index.addEntry(1, 10);
+			// Prime the cache with a sorted read.
+			expect(index.getPrimaryKeys(1)).to.deep.equal([10, 30]);
+
+			// In-place add of a PK that sorts between the two — must invalidate the cache.
+			index.addEntry(1, 20);
+			expect(index.getPrimaryKeys(1)).to.deep.equal([10, 20, 30]);
+		});
+	});
+});
+
+/**
+ * Direct unit tests for the lossless PK encoder. It must (1) never collide two
+ * comparator-distinct PKs within a PK domain, and (2) collapse the NUMERIC
+ * storage-class representation variants the comparator treats as equal. It is NOT a
+ * collation transform.
+ */
+describe('primary-key-encode', () => {
+	describe('encodeScalar', () => {
+		it('collapses NUMERIC representation variants', () => {
+			// 5, 5.0, 5n, and (for 1) true all normalize to the same key.
+			expect(encodeScalar(5)).to.equal(encodeScalar(5n));
+			expect(encodeScalar(5)).to.equal(encodeScalar(5.0));
+			expect(encodeScalar(1)).to.equal(encodeScalar(1n));
+			expect(encodeScalar(1)).to.equal(encodeScalar(true));
+			expect(encodeScalar(0)).to.equal(encodeScalar(false));
+			// -0 collapses to 0.
+			expect(encodeScalar(-0)).to.equal(encodeScalar(0));
+		});
+
+		it('keeps a non-integer real distinct from any integer but under the NUMERIC tag', () => {
+			expect(encodeScalar(5.5)).to.not.equal(encodeScalar(5));
+			expect(encodeScalar(5.5)).to.not.equal(encodeScalar(6));
+			// Same real always encodes the same.
+			expect(encodeScalar(5.5)).to.equal(encodeScalar(5.5));
+		});
+
+		it('does not collide across storage classes (number / string / blob / json / null)', () => {
+			const keys = [
+				encodeScalar(5),
+				encodeScalar('5'),
+				encodeScalar(new Uint8Array([5])),
+				encodeScalar({ a: 5 }),
+				encodeScalar([5]),
+				encodeScalar(null),
+			];
+			expect(new Set(keys).size).to.equal(keys.length);
+		});
+
+		it('encodes BLOBs losslessly: equal bytes collide, distinct bytes do not', () => {
+			expect(encodeScalar(new Uint8Array([1, 2, 3]))).to.equal(encodeScalar(new Uint8Array([1, 2, 3])));
+			expect(encodeScalar(new Uint8Array([1, 2, 3]))).to.not.equal(encodeScalar(new Uint8Array([1, 2, 4])));
+			// Hex is zero-padded so [10] (0x0a) ≠ [1, 0] etc.
+			expect(encodeScalar(new Uint8Array([10]))).to.not.equal(encodeScalar(new Uint8Array([1, 0])));
+		});
+
+		it('encodes JSON values by JSON.stringify', () => {
+			expect(encodeScalar({ a: 1, b: 2 })).to.equal(encodeScalar({ a: 1, b: 2 }));
+			expect(encodeScalar([1, 2])).to.not.equal(encodeScalar([1, 3]));
+		});
+	});
+
+	describe('encodePrimaryKey', () => {
+		it('arity 0 (singleton) is the constant key', () => {
+			expect(encodePrimaryKey([], 0)).to.equal('S');
+		});
+
+		it('arity 1 collapses numeric variants but treats a JSON-array value as whole', () => {
+			expect(encodePrimaryKey(5, 1)).to.equal(encodePrimaryKey(5n, 1));
+			// [true] vs [1] as a SINGLE-column JSON value do NOT collide (encoded whole,
+			// not element-wise) — distinct under JSON.stringify.
+			expect(encodePrimaryKey([true], 1)).to.not.equal(encodePrimaryKey([1], 1));
+		});
+
+		it('arity N is injective via length-prefixed components', () => {
+			// Numeric normalization still applies element-wise.
+			expect(encodePrimaryKey([5n, 'a'], 2)).to.equal(encodePrimaryKey([5, 'a'], 2));
+			// Length-prefixing prevents component-boundary aliasing.
+			expect(encodePrimaryKey([1, 23], 2)).to.not.equal(encodePrimaryKey([12, 3], 2));
+			// Distinct tuples encode distinctly.
+			expect(encodePrimaryKey([5, 7], 2)).to.not.equal(encodePrimaryKey([5, 8], 2));
 		});
 	});
 });

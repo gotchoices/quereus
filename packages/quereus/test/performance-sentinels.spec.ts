@@ -12,6 +12,11 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
 import { Parser } from '../src/parser/parser.js';
+import { MemoryIndex } from '../src/vtab/memory/index.js';
+import { createPrimaryKeyFunctions } from '../src/vtab/memory/utils/primary-key.js';
+import { createDefaultColumnSchema } from '../src/schema/column.js';
+import { INTEGER_TYPE } from '../src/types/builtin-types.js';
+import type { TableSchema } from '../src/schema/table.js';
 
 /** Collect an async iterable into an array. */
 async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
@@ -326,6 +331,46 @@ describe('Performance sentinels', function () {
 				}
 			});
 			expect(elapsed).to.be.below(500, `50 prepare+execute cycles took ${elapsed.toFixed(1)} ms`);
+		});
+	});
+
+	// ----------------------------- Secondary index per-entry PK container (O(1) owned add)
+	// Container-level descending-add: every PK lands in ONE low-cardinality bucket in
+	// reverse order. The old sorted-array container splices at the front each time
+	// (O(M²) to build, ~4.4 s at 250k); the Map's set is O(1) so the build is O(N).
+	describe('Secondary index per-entry PK container', function () {
+		this.timeout(120_000);
+
+		it('builds a single-key bucket of 250k out-of-order PKs under 2 s', () => {
+			const columns = [
+				{ ...createDefaultColumnSchema('status'), logicalType: INTEGER_TYPE },
+				{ ...createDefaultColumnSchema('id'), logicalType: INTEGER_TYPE },
+			];
+			const schema: TableSchema = {
+				name: 'orders',
+				schemaName: 'main',
+				columns,
+				columnIndexMap: new Map(columns.map((c, i) => [c.name.toLowerCase(), i])),
+				primaryKeyDefinition: [{ index: 1 }],
+				checkConstraints: [],
+				vtabModuleName: 'memory',
+				isView: false,
+			};
+			const pk = createPrimaryKeyFunctions(schema);
+			const index = new MemoryIndex(
+				{ name: 'ix_status', columns: [{ index: 0 }] },
+				columns,
+				pk.compare,
+				pk.encode,
+			);
+
+			const N = 250_000;
+			const start = performance.now();
+			for (let i = N; i >= 1; i--) index.addEntry(0, i); // descending => array-front splice worst case
+			const elapsed = performance.now() - start;
+
+			expect(index.getPrimaryKeys(0)).to.have.length(N);
+			expect(elapsed).to.be.below(2000, `250k out-of-order PK adds took ${elapsed.toFixed(1)} ms`);
 		});
 	});
 });

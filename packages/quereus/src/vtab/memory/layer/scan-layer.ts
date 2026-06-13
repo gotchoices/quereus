@@ -1,7 +1,7 @@
 import { BTree } from 'inheritree';
 import type { ScanPlan } from './scan-plan.js';
 import type { Layer } from './interface.js';
-import type { BTreeKey, BTreeKeyForPrimary, BTreeKeyForIndex } from '../types.js';
+import type { BTreeKey, BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
 import { compareSqlValues } from '../../../util/comparison.js';
 import { StatusCode, type Row } from '../../../common/types.js';
@@ -172,13 +172,25 @@ export async function* scanLayer(
 
 		const primaryTree = layer.getModificationTree('primary');
 
+		// PK-within-index-key order is observable and depended upon: `quereus-isolation`
+		// merges the overlay scan with this scan using sort key `[indexKeyParts…, pkParts…]`
+		// and assumes both streams share that order. The entry's `primaryKeys` Map is in
+		// insertion order, so fetch the PK-comparator-sorted view from the MemoryIndex
+		// (memoized there). The inline sort is a defensive fallback for a layer that does
+		// not expose `getSecondaryIndex` (`primaryKeyComparator` is already in scope).
+		const secondaryIndex = layer.getSecondaryIndex?.(plan.indexName);
+		const sortedPrimaryKeys = (indexEntry: MemoryIndexEntry): readonly BTreeKeyForPrimary[] =>
+			secondaryIndex
+				? secondaryIndex.getSortedPrimaryKeys(indexEntry)
+				: [...indexEntry.primaryKeys.values()].sort(primaryKeyComparator);
+
 		if (plan.equalityKey !== undefined) {
 			// NULL equality is UNKNOWN ⇒ no rows (see the primary branch above). Only
 			// `undefined` falls through to the ordered walk.
 			if (seekKeyHasNull(plan.equalityKey)) return;
 			const indexEntry = indexTree.get(plan.equalityKey as BTreeKeyForIndex);
 			if (indexEntry && primaryTree) {
-				for (const pk of indexEntry.primaryKeys) {
+				for (const pk of sortedPrimaryKeys(indexEntry)) {
 					const value = primaryTree.get(pk);
 					if (value) {
 						yield value as Row;
@@ -249,7 +261,7 @@ export async function* scanLayer(
 				continue;
 			}
 			if (!primaryTree) continue;
-			for (const pk of indexEntry.primaryKeys) {
+			for (const pk of sortedPrimaryKeys(indexEntry)) {
 				const value = primaryTree.get(pk);
 				if (value) {
 					yield value as Row;

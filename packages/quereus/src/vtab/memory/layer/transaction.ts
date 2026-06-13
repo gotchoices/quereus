@@ -83,10 +83,10 @@ export class TransactionLayer implements Layer {
 		const schema = this.tableSchemaAtCreation;
 		if (!schema.indexes) return;
 
-		// All layers of a table derive the PK comparator from the same PK definition,
-		// so an inherited (sorted) primaryKeys array stays correctly ordered for this
+		// All layers of a table derive the PK comparator and encoder from the same PK
+		// definition, so an inherited entry's `primaryKeys` Map keys stay valid for this
 		// layer's value add/remove on each MemoryIndex entry.
-		const { primaryKeyComparator } = this.getPkExtractorsAndComparators(schema);
+		const pkFunctions = createPrimaryKeyFunctions(schema);
 
 		for (const indexSchema of schema.indexes) {
 			const parentSecondaryTree = this.parentLayer.getSecondaryIndexTree?.(indexSchema.name);
@@ -94,7 +94,8 @@ export class TransactionLayer implements Layer {
 			const memoryIndex = new MemoryIndex(
 				indexSchema,
 				schema.columns,
-				primaryKeyComparator,
+				pkFunctions.compare,
+				pkFunctions.encode,
 				parentSecondaryTree || undefined // Use parent's secondary index tree as base
 			);
 			this.secondaryIndexes.set(indexSchema.name, memoryIndex);

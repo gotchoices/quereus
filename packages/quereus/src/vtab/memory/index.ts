@@ -34,27 +34,36 @@ export class MemoryIndex {
 	private readonly allTableColumnsSchema: ReadonlyArray<ColumnSchema>;
 	/**
 	 * The table's primary-key comparator (from `createPrimaryKeyFunctions(schema)`),
-	 * used to add/remove/contains members of each entry's sorted `primaryKeys` array
-	 * by value rather than JS identity. It is per-index — identical for every entry —
-	 * so it lives here, not duplicated per entry. Every layer of a table derives it
-	 * from the same PK definition, so an inherited (sorted) `primaryKeys` array stays
-	 * correctly ordered for this layer's binary search. A PK-collation change via
-	 * `ALTER COLUMN … SET COLLATE` forces a full base rebuild
-	 * (`rebuildAllSecondaryIndexes` / `rebuildPrimaryTreeStrict`), recreating entries
-	 * under the new comparator — so no stale sort order survives an ALTER.
+	 * used to sort each entry's `primaryKeys` on read (see {@link getSortedPrimaryKeys}).
+	 * It is per-index — identical for every entry — so it lives here, not duplicated
+	 * per entry. A PK-collation change via `ALTER COLUMN … SET COLLATE` forces a full
+	 * base rebuild (`rebuildAllSecondaryIndexes` / `rebuildPrimaryTreeStrict`),
+	 * recreating entries under the new comparator/encoder — so no stale order or
+	 * encoding survives an ALTER.
 	 */
 	private readonly primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number;
+
+	/**
+	 * The table's lossless PK encoder (from `createPrimaryKeyFunctions(schema)`),
+	 * bound to the PK arity. Produces the `Map` key for value-identity dedup of each
+	 * entry's `primaryKeys`. Per-index — every layer derives it from the same PK
+	 * definition, so an inherited entry's Map keys stay valid for this layer's
+	 * add/remove. See `utils/primary-key-encode.ts`.
+	 */
+	private readonly encode: (pk: BTreeKeyForPrimary) => string;
 
 	constructor(
 		spec: IndexSpec,
 		allTableColumnsSchema: ReadonlyArray<ColumnSchema>,
 		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number,
+		encode: (pk: BTreeKeyForPrimary) => string,
 		baseInheritreeTable?: BTree<BTreeKeyForIndex, MemoryIndexEntry>,
 	) {
 		this.name = spec.name;
 		this.specColumns = Object.freeze(spec.columns.map(c => ({ ...c })));
 		this.allTableColumnsSchema = allTableColumnsSchema;
 		this.primaryKeyComparator = primaryKeyComparator;
+		this.encode = encode;
 
 		this.validateColumnIndexes(allTableColumnsSchema);
 
@@ -171,78 +180,48 @@ export class MemoryIndex {
 	 * found through the tree but absent here was INHERITED from an ancestor
 	 * layer's tree (each TransactionLayer wraps a fresh MemoryIndex around the
 	 * parent's BTree as base): only the btree NODES are copy-on-write, the entry
-	 * objects (and their `primaryKeys` arrays) are shared, so mutating an inherited
-	 * entry's array writes through to the ancestor — corrupting committed state
+	 * objects (and their `primaryKeys` Maps) are shared, so mutating an inherited
+	 * entry's Map writes through to the ancestor — corrupting committed state
 	 * when this layer rolls back (a rolled-back insert leaves a phantom PK that
 	 * false-rejects later UNIQUE checks; a rolled-back delete strips a live PK
 	 * and silently un-enforces UNIQUE). Inherited entries are therefore
 	 * copy-on-written via {@link BTree.updateAt}, which lands the replacement in
-	 * THIS tree; the cloned container is a `slice()` of the sorted `primaryKeys`
-	 * array (was a `new Set(existing)`). Owned entries keep the in-place fast path
-	 * (bulk loads and repeated same-key writes within one layer stay O(1) per
-	 * entry, modulo the O(n) splice into the sorted array).
+	 * THIS tree; the cloned container is a `new Map(existing.primaryKeys)` (was a
+	 * `slice()` of the sorted array). Owned entries keep the in-place fast path —
+	 * a Map set/delete is O(1), so bulk loads and repeated same-key writes within
+	 * one layer stay O(1) per entry (the previous sorted-array splice was O(n) on
+	 * an out-of-order arrival).
 	 */
 	private ownedEntries = new WeakSet<MemoryIndexEntry>();
 
 	/**
-	 * Binary-searches `primaryKeys` (kept sorted under {@link primaryKeyComparator})
-	 * for `pk`. Returns `found` and `index`: when found, `index` is the member's
-	 * position; otherwise `index` is the insertion point (lower bound) that keeps the
-	 * array sorted. PK-tree uniqueness guarantees the live PKs in one entry are
-	 * pairwise distinct under the comparator, so a value match is unambiguous.
+	 * Per-entry memoized PK-sorted view, rebuilt lazily by {@link getSortedPrimaryKeys}.
+	 * Keyed by entry identity (a WeakMap, so it never pins an entry alive and is never
+	 * serialized — entries stay pure structured-cloneable data). An owned in-place
+	 * mutation invalidates by `delete(entry)` (entry identity is preserved); a
+	 * copy-on-write produces a fresh entry object whose cache slot is naturally absent.
+	 * The cache is per-MemoryIndex (per layer) and discarded with the layer.
 	 */
-	private findPrimaryKeyPosition(
-		primaryKeys: ReadonlyArray<BTreeKeyForPrimary>,
-		pk: BTreeKeyForPrimary,
-	): { found: boolean; index: number } {
-		let lo = 0;
-		let hi = primaryKeys.length; // exclusive
-		while (lo < hi) {
-			const mid = (lo + hi) >>> 1;
-			const cmp = this.primaryKeyComparator(primaryKeys[mid], pk);
-			if (cmp === 0) {
-				return { found: true, index: mid };
-			} else if (cmp < 0) {
-				lo = mid + 1;
-			} else {
-				hi = mid;
-			}
-		}
-		return { found: false, index: lo };
-	}
+	private sortedCache = new WeakMap<MemoryIndexEntry, BTreeKeyForPrimary[]>();
 
-	/** Inserts `pk` into the sorted array at its ordered position, deduping by value. */
-	private insertPrimaryKey(primaryKeys: BTreeKeyForPrimary[], pk: BTreeKeyForPrimary): void {
-		const { found, index } = this.findPrimaryKeyPosition(primaryKeys, pk);
-		if (!found) {
-			primaryKeys.splice(index, 0, pk);
-		}
-	}
-
-	/** Removes `pk` from the sorted array by value; returns true if it was present. */
-	private removePrimaryKey(primaryKeys: BTreeKeyForPrimary[], pk: BTreeKeyForPrimary): boolean {
-		const { found, index } = this.findPrimaryKeyPosition(primaryKeys, pk);
-		if (found) {
-			primaryKeys.splice(index, 1);
-		}
-		return found;
-	}
-
-	/** Adds a mapping from index key to primary key */
+	/** Adds a mapping from index key to primary key (O(1) Map set, deduped by encoding) */
 	addEntry(indexKey: BTreeKeyForIndex, primaryKey: BTreeKeyForPrimary): void {
+		const enc = this.encode(primaryKey);
 		const path = this.data.find(indexKey);
 		if (path.on) {
 			const existingEntry = this.data.at(path)!;
 			if (this.ownedEntries.has(existingEntry)) {
-				this.insertPrimaryKey(existingEntry.primaryKeys, primaryKey);
+				existingEntry.primaryKeys.set(enc, primaryKey);
+				this.sortedCache.delete(existingEntry);
 				return;
 			}
 			// Inherited: copy-on-write into this layer's tree (see ownedEntries).
-			// Clone the sorted array (slice) before mutating so the ancestor entry is
-			// untouched. Keep the stored indexKey bytes (a collation-equal/byte-different
-			// new key must not re-key the entry — matching the prior in-place behavior).
-			const primaryKeys = existingEntry.primaryKeys.slice();
-			this.insertPrimaryKey(primaryKeys, primaryKey);
+			// Clone the Map before mutating so the ancestor entry is untouched. Keep the
+			// stored indexKey bytes (a collation-equal/byte-different new key must not
+			// re-key the entry — matching the prior in-place behavior). The fresh entry
+			// object has no sortedCache slot, so no stale sorted view survives.
+			const primaryKeys = new Map(existingEntry.primaryKeys);
+			primaryKeys.set(enc, primaryKey);
 			const updated: MemoryIndexEntry = {
 				indexKey: existingEntry.indexKey,
 				primaryKeys,
@@ -252,33 +231,36 @@ export class MemoryIndex {
 		} else {
 			const newEntry: MemoryIndexEntry = {
 				indexKey,
-				primaryKeys: [primaryKey],
+				primaryKeys: new Map([[enc, primaryKey]]),
 			};
 			this.ownedEntries.add(newEntry);
 			this.data.insert(newEntry);
 		}
 	}
 
-	/** Removes a mapping from index key to primary key */
+	/** Removes a mapping from index key to primary key (O(1) Map delete by encoding) */
 	removeEntry(indexKey: BTreeKeyForIndex, primaryKey: BTreeKeyForPrimary): void {
 		const path = this.data.find(indexKey);
 		if (!path.on) return;
 		const entry = this.data.at(path)!;
+		const enc = this.encode(primaryKey);
 
 		if (this.ownedEntries.has(entry)) {
-			this.removePrimaryKey(entry.primaryKeys, primaryKey);
+			entry.primaryKeys.delete(enc);
 			// If no primary keys remain, remove the entire entry
-			if (entry.primaryKeys.length === 0) {
+			if (entry.primaryKeys.size === 0) {
 				this.data.deleteAt(path);
+			} else {
+				this.sortedCache.delete(entry);
 			}
 			return;
 		}
 
 		// Inherited: copy-on-write (see ownedEntries). A delete that empties the
 		// entry masks it in this layer's tree; the ancestor's entry is untouched.
-		const remaining = entry.primaryKeys.slice();
-		this.removePrimaryKey(remaining, primaryKey);
-		if (remaining.length === 0) {
+		const remaining = new Map(entry.primaryKeys);
+		remaining.delete(enc);
+		if (remaining.size === 0) {
 			this.data.deleteAt(path);
 		} else {
 			const updated: MemoryIndexEntry = { indexKey: entry.indexKey, primaryKeys: remaining };
@@ -287,10 +269,36 @@ export class MemoryIndex {
 		}
 	}
 
-	/** Returns the primary keys for a given index key (defensive copy of the sorted array) */
+	/**
+	 * Returns the entry's PKs sorted under the PK comparator, memoized per entry.
+	 * Scan output must be PK-sorted within each index key (the optimizer never claims
+	 * the order, but `quereus-isolation` merges overlay and underlying secondary scans
+	 * assuming `(indexKey, PK)` order — an insertion-order Map would break the merge).
+	 * The Map stores PKs in insertion order, so this sorts on read; the cache keeps
+	 * repeated scans at the original amortized cost.
+	 */
+	getSortedPrimaryKeys(entry: MemoryIndexEntry): readonly BTreeKeyForPrimary[] {
+		let sorted = this.sortedCache.get(entry);
+		if (!sorted) {
+			sorted = [...entry.primaryKeys.values()].sort(this.primaryKeyComparator);
+			this.sortedCache.set(entry, sorted);
+		}
+		return sorted;
+	}
+
+	/** Returns the primary keys for a given index key (defensive copy of the sorted view) */
 	getPrimaryKeys(indexKey: BTreeKeyForIndex): BTreeKeyForPrimary[] {
 		const entry = this.data.get(indexKey);
-		return entry ? entry.primaryKeys.slice() : [];
+		return entry ? this.getSortedPrimaryKeys(entry).slice() : [];
+	}
+
+	/**
+	 * True when at least one PK is mapped under `indexKey`. O(1) (Map size), so the
+	 * build-time UNIQUE check (BaseLayer `populateNewIndex`) can probe per row without
+	 * sorting the bucket.
+	 */
+	hasAnyPrimaryKey(indexKey: BTreeKeyForIndex): boolean {
+		return (this.data.get(indexKey)?.primaryKeys.size ?? 0) > 0;
 	}
 
 	/** Gets the count of unique index values */
