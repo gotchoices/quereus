@@ -67,6 +67,14 @@ export function registerBuiltinWindowFunctions(): void {
 			nullable: true,
 			isReadOnly: true
 		},
+		// LAG passes arg[0] (the value expression) through unchanged; arg[1] is the
+		// offset and arg[2] is an optional default — their types do not widen the result.
+		inferReturnType: (argTypes) => ({
+			typeClass: 'scalar',
+			logicalType: argTypes[0],
+			nullable: true,
+			isReadOnly: true
+		}),
 		requiresOrderBy: true,
 		kind: 'navigation'
 	});
@@ -80,6 +88,14 @@ export function registerBuiltinWindowFunctions(): void {
 			nullable: true,
 			isReadOnly: true
 		},
+		// LEAD passes arg[0] (the value expression) through unchanged; arg[1] is the
+		// offset and arg[2] is an optional default — their types do not widen the result.
+		inferReturnType: (argTypes) => ({
+			typeClass: 'scalar',
+			logicalType: argTypes[0],
+			nullable: true,
+			isReadOnly: true
+		}),
 		requiresOrderBy: true,
 		kind: 'navigation'
 	});
@@ -94,6 +110,14 @@ export function registerBuiltinWindowFunctions(): void {
 			nullable: true,
 			isReadOnly: true
 		},
+		// FIRST_VALUE passes its argument value through unchanged, so the result
+		// follows the argument's logical type (mirrors the MIN/MAX pattern).
+		inferReturnType: (argTypes) => ({
+			typeClass: 'scalar',
+			logicalType: argTypes[0],
+			nullable: true,
+			isReadOnly: true
+		}),
 		requiresOrderBy: false,
 		kind: 'value'
 	});
@@ -107,6 +131,14 @@ export function registerBuiltinWindowFunctions(): void {
 			nullable: true,
 			isReadOnly: true
 		},
+		// LAST_VALUE passes its argument value through unchanged, so the result
+		// follows the argument's logical type (mirrors the MIN/MAX pattern).
+		inferReturnType: (argTypes) => ({
+			typeClass: 'scalar',
+			logicalType: argTypes[0],
+			nullable: true,
+			isReadOnly: true
+		}),
 		requiresOrderBy: false,
 		kind: 'value'
 	});

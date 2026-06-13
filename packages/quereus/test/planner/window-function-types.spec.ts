@@ -150,5 +150,85 @@ describe('Planner: window function types', () => {
 		expect(types.some(t => t.fn.toLowerCase() === 'count' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
 		expect(types.some(t => t.fn.toLowerCase() === 'row_number' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
 	});
+
+	// ── FIRST_VALUE / LAST_VALUE ──────────────────────────────────────────────
+
+	it('derives FIRST_VALUE/LAST_VALUE return type from a TEXT argument', async () => {
+		const sql = 'select first_value(v) over (order by id) as fv, last_value(v) over (order by id) as lv from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'first_value' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'last_value' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('derives FIRST_VALUE/LAST_VALUE return type from an INTEGER argument', async () => {
+		const sql = 'select first_value(id) over (order by id) as fv, last_value(id) over (order by id) as lv from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'first_value' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'last_value' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('derives FIRST_VALUE return type from an expression argument', async () => {
+		// `id || ''` is a concat expression typed TEXT — proves the built expression's
+		// logical type flows through, not just a bare column ref.
+		const sql = "select first_value(id || '') over (order by id) as fv from t";
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'first_value' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+	});
+
+	// ── LAG / LEAD ────────────────────────────────────────────────────────────
+
+	it('derives LAG/LEAD return type from a TEXT argument', async () => {
+		const sql = 'select lag(v) over (order by id) as lg, lead(v) over (order by id) as ld from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'lag' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'lead' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('derives LAG/LEAD return type from an INTEGER argument', async () => {
+		const sql = 'select lag(id) over (order by id) as lg, lead(id) over (order by id) as ld from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'lag' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'lead' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('LAG offset argument does not leak into return type', async () => {
+		// lag(v, 1) — arg[1] is the INTEGER offset; result must still be TEXT.
+		const sql = 'select lag(v, 1) over (order by id) as lg from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'lag' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('LAG/LEAD with a differing-type default types as the value argument (runtime smoke)', async () => {
+		// lag(v, 1, 'X') over (order by id):
+		//   row 1 (id=1) — out-of-range → default 'X'
+		//   row 2 (id=2) — in-range → prior v = 'a'
+		//   row 3 (id=3) — in-range → prior v = 'b'
+		// Also confirms a differing-type default (integer 0) types as TEXT and
+		// returns the integer as the boundary value.
+		const rows: Record<string, unknown>[] = [];
+		for await (const r of db.eval("select lag(v, 1, 'X') over (order by id) as lg from t")) {
+			rows.push(r);
+		}
+		expect(rows[0].lg).to.equal('X');
+		expect(rows[1].lg).to.equal('a');
+		expect(rows[2].lg).to.equal('b');
+
+		// Mismatched-type default: lag(v, 1, 0) — plan types TEXT, boundary yields 0
+		const planTypes = getWindowFunctionTypesFromPlan('select lag(v, 1, 0) over (order by id) as lg from t');
+		expect(planTypes.some(t => t.fn.toLowerCase() === 'lag' && t.resultType === 'TEXT'), JSON.stringify(planTypes)).to.equal(true);
+
+		const rows2: Record<string, unknown>[] = [];
+		for await (const r of db.eval('select lag(v, 1, 0) over (order by id) as lg from t')) {
+			rows2.push(r);
+		}
+		expect(rows2[0].lg).to.equal(0);  // integer default at boundary
+		expect(rows2[1].lg).to.equal('a');
+	});
 });
 
