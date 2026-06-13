@@ -1,5 +1,6 @@
 import type { ScalarType } from '../common/datatype.js';
-import type { SqlValue } from '../common/types.js';
+import type { DeepReadonly, SqlValue } from '../common/types.js';
+import type { LogicalType } from '../types/logical-type.js';
 
 export interface WindowFunctionSchema {
 	name: string;                    // 'ROW_NUMBER', 'RANK', 'SUM', etc.
@@ -7,6 +8,14 @@ export interface WindowFunctionSchema {
 	returnType: ScalarType;          // Return type
 	requiresOrderBy: boolean;        // Whether ORDER BY is required
 	kind: 'ranking' | 'aggregate' | 'value' | 'navigation';
+
+	/**
+	 * Optional type inference for polymorphic window functions. Mirrors
+	 * AggregateFunctionSchema.inferReturnType — called at planning time with the
+	 * argument logical types to derive the return type (e.g. window MIN/MAX
+	 * return their argument's type rather than the fixed `returnType`).
+	 */
+	inferReturnType?: (argTypes: ReadonlyArray<DeepReadonly<LogicalType>>) => ScalarType;
 
 	// Optional custom step/final hooks for aggregate-style windows
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -7,8 +7,9 @@ import { Cached } from '../../util/cached.js';
 import { formatScalarType } from '../../util/plan-formatter.js';
 import { resolveWindowFunction } from '../../schema/window-function.js';
 import { REAL_TYPE } from '../../types/builtin-types.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { quereusError } from '../../common/errors.js';
-import { StatusCode } from '../../common/types.js';
+import { StatusCode, type DeepReadonly } from '../../common/types.js';
 
 /**
  * Represents a window function call in the query plan.
@@ -25,6 +26,13 @@ export class WindowFunctionCallNode extends PlanNode implements ZeroAryScalarNod
 		public readonly functionName: string,
 		public readonly isDistinct: boolean = false,
 		public readonly alias?: string,
+		/**
+		 * Logical types of the built argument expressions, supplied by the
+		 * builders so `getType()` can consult `schema.inferReturnType` (e.g.
+		 * window MIN/MAX deriving their argument's type). Zero-ary node carries
+		 * no argument children, so the types must be threaded in explicitly.
+		 */
+		public readonly argTypes?: ReadonlyArray<DeepReadonly<LogicalType>>,
 		estimatedCostOverride?: number
 	) {
 		super(scope, estimatedCostOverride);
@@ -32,6 +40,11 @@ export class WindowFunctionCallNode extends PlanNode implements ZeroAryScalarNod
 		this.outputTypeCache = new Cached(() => {
 			const schema = resolveWindowFunction(this.functionName);
 			if (schema) {
+				// Polymorphic windows (MIN/MAX) derive their type from the argument
+				// type when one is available; otherwise fall back to the fixed type.
+				if (schema.inferReturnType && this.argTypes && this.argTypes.length > 0) {
+					return schema.inferReturnType(this.argTypes);
+				}
 				return schema.returnType;
 			}
 

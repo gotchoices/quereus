@@ -61,5 +61,42 @@ describe('Planner: window function types', () => {
 		expect(types.some(t => t.fn.toLowerCase() === 'sum' && t.resultType === 'REAL')).to.equal(true);
 		expect(types.some(t => t.fn.toLowerCase() === 'count' && t.resultType === 'INTEGER')).to.equal(true);
 	});
+
+	it('derives MIN/MAX window return type from a TEXT argument', async () => {
+		const sql = 'select min(v) over () as mn, max(v) over () as mx from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'min' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'max' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('derives MIN/MAX window return type from an INTEGER argument', async () => {
+		const sql = 'select min(id) over () as mn, max(id) over () as mx from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'min' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'max' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('derives MIN window return type from an expression argument', async () => {
+		// `id || ''` is a concat expression typed TEXT, distinct from both the
+		// INTEGER column type and the REAL fallback — so a TEXT result proves the
+		// built expression's logical type flows through, not just a bare column ref.
+		const sql = "select min(id || '') over () as mn from t";
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'min' && t.resultType === 'TEXT'), JSON.stringify(types)).to.equal(true);
+	});
+
+	it('leaves non-polymorphic window functions at their declared returnType', async () => {
+		// Regression: only MIN/MAX gained inferReturnType; SUM stays REAL, COUNT
+		// stays INTEGER, ROW_NUMBER stays INTEGER even though argTypes now flow in.
+		const sql = 'select sum(id) over () as s, count(id) over () as c, row_number() over (order by id) as rn from t';
+		const types = getWindowFunctionTypesFromPlan(sql);
+
+		expect(types.some(t => t.fn.toLowerCase() === 'sum' && t.resultType === 'REAL'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'count' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+		expect(types.some(t => t.fn.toLowerCase() === 'row_number' && t.resultType === 'INTEGER'), JSON.stringify(types)).to.equal(true);
+	});
 });
 

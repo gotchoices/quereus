@@ -232,11 +232,22 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
          throw new QuereusError(`Window function ${expr.function.name} requires ORDER BY clause`, StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
        }
 
+       // Build the argument expressions to derive their logical types. The
+       // authoritative argument plan nodes are (re)built in select-window.ts for
+       // the WindowNode; these exist only so this node's getType() can consult
+       // inferReturnType (e.g. min(text_col) over (...) must type as TEXT so a
+       // surrounding `|| 'x'` types correctly).
+       const windowArgTypes = expr.function.args.map(arg =>
+         buildExpression(ctx, arg, false).getType().logicalType
+       );
+
        return new WindowFunctionCallNode(
          ctx.scope,
          expr,
          expr.function.name,
-         expr.function.distinct ?? false
+         expr.function.distinct ?? false,
+         undefined,
+         windowArgTypes
        );
 		}
 

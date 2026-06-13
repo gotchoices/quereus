@@ -56,18 +56,25 @@ export function buildWindowPhase(
 			buildExpression(selectContext, orderClause.expr, false)
 		);
 
-		// Create new WindowFunctionCallNode instances with alias information
-		const windowFuncsWithAlias = functions.map(({ func, alias }) =>
+		// Build the function argument expressions FIRST (off the original nodes)
+		// so each re-created WindowFunctionCallNode can be handed its argument
+		// logical types for faithful return-type inference (window MIN/MAX).
+		const functionArguments = buildWindowFunctionArguments(
+			functions.map(({ func }) => func),
+			selectContext
+		);
+
+		// Create new WindowFunctionCallNode instances with alias + argument-type info
+		const windowFuncsWithAlias = functions.map(({ func, alias }, i) =>
 			new WindowFunctionCallNode(
 				func.scope,
 				func.expression,
 				func.functionName,
 				func.isDistinct,
-				alias
+				alias,
+				functionArguments[i].map(a => a.getType().logicalType)
 			)
 		);
-
-		const functionArguments = buildWindowFunctionArguments(windowFuncsWithAlias, selectContext);
 
 		// Now create the WindowNode with pre-compiled expressions
 		currentInput = new WindowNode(
@@ -133,10 +140,10 @@ function shouldUseSequencingNode(
  * Returns a 2D array: one array of ScalarPlanNodes per function.
  */
 function buildWindowFunctionArguments(
-	windowFuncsWithAlias: WindowFunctionCallNode[],
+	windowFuncs: WindowFunctionCallNode[],
 	selectContext: PlanningContext
 ): ScalarPlanNode[][] {
-	return windowFuncsWithAlias.map(func => {
+	return windowFuncs.map(func => {
 		const args = func.expression.function.args;
 		if (args && args.length > 0) {
 			// Build all arguments (supports multi-arg functions like LAG/LEAD)

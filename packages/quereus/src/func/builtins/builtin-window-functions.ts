@@ -212,6 +212,15 @@ export function registerBuiltinWindowFunctions(): void {
 			nullable: true,
 			isReadOnly: true
 		},
+		// MIN passes the argument value through unchanged, so the result follows
+		// the argument's logical type (mirrors the aggregate minFunc). The fixed
+		// REAL returnType above is the no-arg-types fallback.
+		inferReturnType: (argTypes) => ({
+			typeClass: 'scalar',
+			logicalType: argTypes[0],
+			nullable: true,
+			isReadOnly: true
+		}),
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		step: (state: AggValue, value: AggValue) => {
@@ -233,6 +242,15 @@ export function registerBuiltinWindowFunctions(): void {
 			nullable: true,
 			isReadOnly: true
 		},
+		// MAX passes the argument value through unchanged, so the result follows
+		// the argument's logical type (mirrors the aggregate maxFunc). The fixed
+		// REAL returnType above is the no-arg-types fallback.
+		inferReturnType: (argTypes) => ({
+			typeClass: 'scalar',
+			logicalType: argTypes[0],
+			nullable: true,
+			isReadOnly: true
+		}),
 		requiresOrderBy: false,
 		kind: 'aggregate',
 		step: (state: AggValue, value: AggValue) => {
