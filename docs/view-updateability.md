@@ -598,8 +598,11 @@ by a non-literal σ (`where f(color)`) routes by include-on-unknown but cannot r
 columns on insert; a deep / mixed `intersect`/`except` chain is not flattened (it stays on the existing
 reject); an INSERT that **omits a discriminator** is consistent with every leg that discriminator would have
 excluded, so it routes to all of them — when two such legs share a base table this surfaces as a clean PK
-conflict (a leg discriminating by a non-`=` range σ on a *projected* column is likewise invisible to the
-oracle, so an INSERT can over-insert a phantom base row — `set-op-flagless-range-sigma-oracle`, backlog);
+conflict (a leg discriminating by a non-`=` range σ on a *projected* column is now **honored by the
+oracle** — its σ conjuncts (`where x < 5`, `between`, …) are fed to `checkSatisfiability` alongside the
+mutation predicate, so an INSERT whose supplied value provably violates the range makes that leg `unsat`
+⇒ skipped, with no phantom base row, `set-op-flagless-range-sigma-oracle`; a σ on a **non-projected**
+column (`where f(color)`) still resolves to no in-scope accumulator and routes include-on-unknown);
 a leg whose body is a **multi-source (join) body** is now explicitly **rejected** (`isWritableLeafLeg`
 gates on `isJoinBody`), so the static surfaces report all-`NO` and the dynamic write falls out of the
 flag-less route into the single-source spine's clean `cannot write through view` reject — no longer the

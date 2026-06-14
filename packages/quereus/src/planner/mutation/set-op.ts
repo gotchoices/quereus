@@ -1431,6 +1431,15 @@ interface FlaglessLeg {
 	readonly bindings: readonly ConstantBinding[];
 	/** The leg's planned physical domain constraints. */
 	readonly domains: readonly DomainConstraint[];
+	/**
+	 * Every σ (`FilterNode.predicate`) conjunct in the leg body, fed to the oracle alongside
+	 * the mutation predicate. A range σ (`where x < 5`) on a *projected* column does not forward
+	 * as a `ConstantBinding`/`DomainConstraint` (filter passes domains through unchanged), so an
+	 * out-of-range INSERT would otherwise route into the leg and land a phantom base row. These
+	 * conjuncts close that gap: `x = 7 ∧ x < 5 ⇒ unsat ⇒ skip the leg`. Conjuncts on a
+	 * non-projected column resolve to `attrIndex → undefined` and contribute nothing.
+	 */
+	readonly sigmaConjuncts: readonly ScalarPlanNode[];
 	/** Maps a predicate `ColumnReferenceNode.attributeId` to this leg's output column index. */
 	readonly attrIndex: (attrId: number) => number | undefined;
 	/** The declared collation of this leg's output column `col`, for the checker. */
@@ -1558,12 +1567,31 @@ function buildFlaglessLeg(
 	const physical = legRoot.physical;
 	const bindings: ConstantBinding[] = [...(physical.constantBindings ?? []), ...discriminatorBindings];
 	const domains = physical.domainConstraints ?? [];
+	const sigmaConjuncts = collectFilterConjuncts(legRoot);
 
 	return {
-		branch, plainPositions, discriminatorPositions, scope, bindings, domains,
+		branch, plainPositions, discriminatorPositions, scope, bindings, domains, sigmaConjuncts,
 		attrIndex: (attrId) => attrIdToIndex.get(attrId),
 		getCollation: (col) => legAttrs[col]?.type.collationName,
 	};
+}
+
+/**
+ * Collect every leg-body σ predicate as a flat conjunct list: each `FilterNode.predicate` in
+ * the leg's relational subtree (walked via `getRelations()`) split into its AND-conjuncts. Every
+ * collected conjunct is a fact that must hold for a row resident in this leg, so feeding them all
+ * to the oracle can only ever push the verdict toward `unsat` on a real contradiction (the checker
+ * never emits a false `unsat`). A conjunct referencing a column this leg does not project resolves
+ * to `attrIndex → undefined` and contributes nothing.
+ */
+function collectFilterConjuncts(root: RelationalPlanNode): ScalarPlanNode[] {
+	const out: ScalarPlanNode[] = [];
+	const visit = (node: RelationalPlanNode): void => {
+		if (node instanceof FilterNode) out.push(...splitConjuncts(node.predicate));
+		for (const child of node.getRelations()) visit(child);
+	};
+	visit(root);
+	return out;
 }
 
 /**
@@ -1580,7 +1608,11 @@ function legConsistency(ctx: PlanningContext, leg: FlaglessLeg, predicate: AST.E
 		const node = buildExpression({ ...ctx, scope: leg.scope }, cloneExpr(predicate));
 		conjuncts = splitConjuncts(node);
 	}
-	return checkSatisfiability(conjuncts, leg.domains, leg.bindings, leg.attrIndex, leg.getCollation);
+	// Fold the leg's own σ conjuncts in alongside the mutation predicate: a range σ on a
+	// projected column (`where x < 5`) is invisible to the bindings/domains the leg forwards,
+	// so a supplied value that provably violates it (`x = 7`) only contradicts here ⇒ `unsat`
+	// ⇒ skip the leg (no phantom base row). Non-projected-column conjuncts are inert.
+	return checkSatisfiability([...conjuncts, ...leg.sigmaConjuncts], leg.domains, leg.bindings, leg.attrIndex, leg.getCollation);
 }
 
 // --- flag-less INSERT (route to the consistent legs) ----------------------

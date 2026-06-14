@@ -322,3 +322,109 @@ insert into DV (id, x, src) values (5, 50, 'a');
 -- error: cannot write through view
 select id, x from jv1 order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================================================
+-- Range-σ write-branch oracle (`set-op-flagless-range-sigma-oracle`): a RANGE σ
+-- (`where x < 5`) on a *projected* column is now fed to the oracle as a conjunct, so a
+-- supplied value that provably violates it makes the leg `unsat` ⇒ skipped (no phantom base
+-- row). A literal discriminator (`bucket`) keeps the body writable; INSERTs OMIT it so the
+-- range σ — not the discriminator — drives the routing decision. See
+-- docs/view-updateability.md § Set Operations.
+-- ===================================================================
+create table rlo (id integer primary key, x integer);
+create table rhi (id integer primary key, x integer);
+insert into rlo values (1,1),(2,3);
+insert into rhi values (3,7),(4,9);
+create view RV as
+  select id, x, 'lo' as bucket from rlo where x < 5
+  union all
+  select id, x, 'hi' as bucket from rhi where x >= 5;
+
+select * from RV order by id;
+→ [{"id":1,"x":1,"bucket":"lo"},{"id":2,"x":3,"bucket":"lo"},{"id":3,"x":7,"bucket":"hi"},{"id":4,"x":9,"bucket":"hi"}]
+
+-- Out-of-range INSERT (the fix): x=100 provably violates the `lo` leg's `x < 5` → that leg
+-- is skipped (rlo gets NO phantom row); it is consistent with the `hi` leg's `x >= 5` → routes
+-- to rhi only. (Without the fix the range σ was invisible to the oracle and rlo got a phantom.)
+insert into RV (id, x) values (10, 100);
+select id, x from rlo order by id;
+→ [{"id":1,"x":1},{"id":2,"x":3}]
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":4,"x":9},{"id":10,"x":100}]
+select * from RV where id = 10;
+→ [{"id":10,"x":100,"bucket":"hi"}]
+
+-- Complementary in-range INSERT: x=2 violates `x >= 5` (hi skipped) and satisfies `x < 5`
+-- (lo included) → routes to rlo only.
+insert into RV (id, x) values (11, 2);
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":4,"x":9},{"id":10,"x":100}]
+select id, x from rlo order by id;
+→ [{"id":1,"x":1},{"id":2,"x":3},{"id":11,"x":2}]
+select * from RV where id = 11;
+→ [{"id":11,"x":2,"bucket":"lo"}]
+
+-- DELETE through a range σ: the WHERE `x < 3` is consistent with the `lo` leg but provably
+-- `unsat` with the `hi` leg (`x < 3 ∧ x >= 5`) → the fan NARROWS to rlo only, and the
+-- member-exists capture restricts the delete to the resident matching rows (rlo id 1 & 11).
+-- rhi is untouched; the observable result is exactly the resident rows.
+delete from RV where x < 3;
+select id, x from rlo order by id;
+→ [{"id":2,"x":3}]
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":4,"x":9},{"id":10,"x":100}]
+
+-- ===================================================================
+-- Gap-value INSERT: legs with a GAP (`x < 5` / `x >= 10`) reject a value that falls in the
+-- gap — both legs are provably `unsat`, so `baseOps` is empty and the honest
+-- `consistent with no writable leg` diagnostic fires (NOT a silent no-op). Base tables untouched.
+-- ===================================================================
+create table glo (id integer primary key, x integer);
+create table ghi (id integer primary key, x integer);
+insert into glo values (1,1);
+insert into ghi values (2,20);
+create view GV as
+  select id, x, 'lo' as bucket from glo where x < 5
+  union all
+  select id, x, 'hi' as bucket from ghi where x >= 10;
+
+select * from GV order by id;
+→ [{"id":1,"x":1,"bucket":"lo"},{"id":2,"x":20,"bucket":"hi"}]
+
+insert into GV (id, x) values (9, 7);
+-- error: consistent with no writable leg
+select id, x from glo order by id;
+→ [{"id":1,"x":1}]
+select id, x from ghi order by id;
+→ [{"id":2,"x":20}]
+
+-- ===================================================================
+-- BETWEEN-σ leg: `checkSatisfiability`'s positive-BETWEEN handling absorbs `x between 0 and 4`,
+-- so an out-of-band supplied value (`x = 50`) makes that leg `unsat` ⇒ skipped; an in-band
+-- value (`x = 3`) routes into it.
+-- ===================================================================
+create table btw (id integer primary key, x integer);
+create table oth (id integer primary key, x integer);
+insert into btw values (1,2);
+insert into oth values (2,50);
+create view BV as
+  select id, x, 'in' as bucket from btw where x between 0 and 4
+  union all
+  select id, x, 'out' as bucket from oth where x > 10;
+
+select * from BV order by id;
+→ [{"id":1,"x":2,"bucket":"in"},{"id":2,"x":50,"bucket":"out"}]
+
+-- x=50 is out of `[0,4]` → `in` leg skipped; consistent with `x > 10` → routes to oth.
+insert into BV (id, x) values (9, 50);
+select id, x from btw order by id;
+→ [{"id":1,"x":2}]
+select id, x from oth order by id;
+→ [{"id":2,"x":50},{"id":9,"x":50}]
+
+-- x=3 is within `[0,4]` → routes to btw; provably violates `x > 10` → oth skipped.
+insert into BV (id, x) values (8, 3);
+select id, x from btw order by id;
+→ [{"id":1,"x":2},{"id":8,"x":3}]
+select id, x from oth order by id;
+→ [{"id":2,"x":50},{"id":9,"x":50}]
