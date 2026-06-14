@@ -150,7 +150,8 @@ function ctesBefore(withClause: AST.WithClause, cte: AST.CommonTableExpr): AST.C
 
 /**
  * The planning context the view-mutation substrate uses for a CTE-name target: the
- * statement's CTE-threaded context with the TARGET CTE's OWN name removed from
+ * statement's CTE-threaded context narrowed to the target's **prior-sibling prefix** —
+ * the target's OWN name **and every sibling defined at or after it** are removed from
  * `cteNodes`.
  *
  * `buildFrom` resolves a FROM name against `cteNodes` *before* the schema, so leaving
@@ -158,21 +159,43 @@ function ctesBefore(withClause: AST.WithClause, cte: AST.CommonTableExpr): AST.C
  * self-resolve to the CTE instead of the real object — silently wrong for the
  * load-bearing shadow case `with base as (select … from base) update base …`, whose
  * body must reach the REAL `base` table. A non-recursive CTE cannot reference itself,
- * so SQL scopes its own name OUT of its body anyway (exactly what
- * {@link import('./with.js').buildCommonTableExpr} does when it builds a body against
- * the PRIOR siblings only) — this mirrors that for the re-planned ephemeral body.
+ * so SQL scopes its own name OUT of its body anyway.
  *
- * SIBLING CTEs stay in scope, so a sibling read in the body or the user predicate /
- * value still resolves. A consequence: a user-predicate self-read of the target name
- * (`… where id in (select id from t)`) does NOT resolve the CTE in v1 — it errors as
- * table-not-found rather than silently producing a Halloween-unsafe plan. See
- * docs/view-updateability.md § CTEs and Subqueries.
+ * The same definition-order rule applies to **later** siblings: a non-recursive CTE is
+ * visible only to siblings defined after it, so the target's body sees only its PRIOR
+ * siblings — a later sibling is out of scope and a same-named FROM in the body binds the
+ * real object instead (`with x as (select … from fwd), fwd as (…) update x …` writes
+ * through to the real `fwd`). This mirrors {@link import('./with.js').buildCommonTableExpr},
+ * which builds each body against the prior siblings only.
+ *
+ * PRIOR sibling CTEs stay in scope, so a prior-sibling read in the body still resolves.
+ *
+ * Two consequences for the shared user-clause context (body and user `where`/`set`/
+ * `returning` share this one context in v1 — see
+ * {@link import('./view-mutation-builder.js')}):
+ *  - A user-clause read of a LATER-defined sibling resolves to a real same-named table
+ *    (or errors table-not-found), not the later CTE — never silently wrong.
+ *  - A user-clause self-read of the target name (`… where id in (select id from t)`)
+ *    does NOT resolve the CTE here — the self-capture path (`ctxSelfRead`) re-adds the
+ *    target name for that, leaving this context Halloween-safe.
+ * See docs/view-updateability.md § CTEs and Subqueries.
  */
-export function contextForCteTarget(ctx: PlanningContext, cteName: string): PlanningContext {
-	const key = cteName.toLowerCase();
-	if (!ctx.cteNodes?.has(key)) return ctx;
+export function contextForCteTarget(
+	ctx: PlanningContext,
+	withClause: AST.WithClause,
+	targetName: string,
+): PlanningContext {
+	if (!ctx.cteNodes?.size) return ctx;
+	const target = targetName.toLowerCase();
+	// The target itself + every sibling defined at-or-after it are out of scope inside the
+	// target's body (a non-recursive CTE sees only PRIOR siblings). `resolveCteTarget`
+	// already matched targetName, so idx is normally >= 0; guard the not-found case to a
+	// no-op slice rather than slicing from the end.
+	const idx = withClause.ctes.findIndex(c => c.name.toLowerCase() === target);
+	if (idx < 0) return ctx;
+	const shadowed = new Set(withClause.ctes.slice(idx).map(c => c.name.toLowerCase()));
 	const cteNodes = new Map(ctx.cteNodes);
-	cteNodes.delete(key);
+	for (const name of shadowed) cteNodes.delete(name);
 	return { ...ctx, cteNodes };
 }
 

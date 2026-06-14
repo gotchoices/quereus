@@ -87,7 +87,7 @@ export function buildDeleteStmt(
   // See docs/view-updateability.md § CTEs and Subqueries.
   const cteTarget = resolveCteTarget(contextWithCTEs, stmt.table, stmt.withClause);
   if (cteTarget) {
-    return buildViewMutation(contextForCteTarget(contextWithCTEs, cteTarget.name), cteTarget, { op: 'delete', stmt });
+    return buildViewMutation(contextForCteTarget(contextWithCTEs, stmt.withClause!, cteTarget.name), cteTarget, { op: 'delete', stmt });
   }
 
   // View- or materialized-view-mediated delete: rewrite to target the underlying

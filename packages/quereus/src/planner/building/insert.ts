@@ -475,7 +475,7 @@ export function buildInsertStmt(
 	const cteTarget = resolveCteTarget(contextWithSchemaPath, stmt.table, stmt.withClause);
 	if (cteTarget) {
 		const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);
-		return buildViewMutation(contextForCteTarget(contextWithCTEs, cteTarget.name), cteTarget, { op: 'insert', stmt });
+		return buildViewMutation(contextForCteTarget(contextWithCTEs, stmt.withClause!, cteTarget.name), cteTarget, { op: 'insert', stmt });
 	}
 
 	// View- or materialized-view-mediated insert: if the target names an (updateable)

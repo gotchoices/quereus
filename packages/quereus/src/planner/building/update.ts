@@ -87,7 +87,7 @@ export function buildUpdateStmt(
   // See docs/view-updateability.md § CTEs and Subqueries.
   const cteTarget = resolveCteTarget(contextWithCTEs, stmt.table, stmt.withClause);
   if (cteTarget) {
-    return buildViewMutation(contextForCteTarget(contextWithCTEs, cteTarget.name), cteTarget, { op: 'update', stmt });
+    return buildViewMutation(contextForCteTarget(contextWithCTEs, stmt.withClause!, cteTarget.name), cteTarget, { op: 'update', stmt });
   }
 
   // View- or materialized-view-mediated update: rewrite to target the underlying

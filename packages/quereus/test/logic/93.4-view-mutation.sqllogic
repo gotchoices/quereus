@@ -3276,17 +3276,27 @@ with a as (select id, color from base2), base2 as (select * from a)
 select * from base2 order by id;
 → [{"id":1,"color":"z"},{"id":2,"color":"green"}]
 
--- v1 boundary — a FORWARD reference (the target body reads a sibling CTE defined LATER, whose
--- name also shadows a real table) rejects cleanly rather than writing through. Per SQL scoping
--- `x`'s `from fwd` should bind the REAL `fwd` table (a CTE is visible only to LATER siblings),
--- but the CTE-target re-plan threads ALL siblings into scope (`contextForCteTarget`), so `fwd`
--- resolves to the later CTE → CTEReference → reject. The flattener correctly treats it as
--- terminal (only PRIOR siblings inline); the reject originates in the re-plan context, not the
--- flattener. See backlog ticket cte-dml-forward-reference-visibility.
+-- Forward reference write-through — the target `x` is the FIRST CTE and its body reads a sibling
+-- CTE `fwd` defined LATER whose name also shadows a real table. Per SQL definition-order scoping a
+-- non-recursive CTE is visible only to LATER siblings, so inside `x`'s body the later `fwd` CTE is
+-- out of scope and `from fwd` binds the REAL `fwd` table → write through. `contextForCteTarget`
+-- strips the target + every at-or-after sibling from the re-plan context (prior-sibling prefix),
+-- mirroring `buildCommonTableExpr`. The later `fwd` CTE is never the write target and is unused.
 create table fwd (id integer primary key, color text);
-insert into fwd values (1,'red');
-with x as (select id, color from fwd), fwd as (select id, color from fwd) update x set color='z' where id=1;
--- error: is not updateable in phase 1
+insert into fwd values (1,'red'),(2,'green');
+with x as (select id, color from fwd), fwd as (select id, color from fwd)
+    update x set color='z' where id=1;
+select * from fwd order by id;
+→ [{"id":1,"color":"z"},{"id":2,"color":"green"}]
+
+-- Forward reference with NO real backing — the body reads a later sibling `later` whose name is
+-- NOT a real table. The later CTE is out of scope (prior-sibling-only visibility) and there is no
+-- real object to fall back to, so resolution is a clean table-not-found, never silently wrong.
+create table fwdr (id integer primary key, color text);
+insert into fwdr values (1,'red');
+with x as (select id, color from later), later as (select * from fwdr)
+    update x set color='z' where id=1;
+-- error: Table 'later' not found
 
 -- Reject parity — a non-updateable INTERMEDIATE rejects with its own body-shape reason
 -- ("not updateable in phase 1"), the SAME diagnostic class a single-level CTE of that shape
@@ -3364,6 +3374,18 @@ create table base (id integer primary key, color text);
 insert into base values (1,'red'),(2,'green');
 with base as (select id, color from base) update base set color='x' where id in (select id from base);
 select * from base order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"x"}]
+
+-- Self-read × later-sibling combo — the target `t` is the FIRST CTE; its body reads `hwls`,
+-- which is ALSO a later sibling that shadows the real table. `contextForCteTarget` strips the
+-- target + later sibling, so BOTH the body and the eager capture are planned over the REAL
+-- `hwls`; the user-clause self-read `from t` resolves to the capture. The self-capture path is
+-- untouched by later-sibling stripping (it re-adds only the target name) → Halloween-safe write.
+create table hwls (id integer primary key, color text);
+insert into hwls values (1,'red'),(2,'green');
+with t as (select id, color from hwls), hwls as (select id, color from hwls)
+    update t set color='x' where id in (select id from t);
+select * from hwls order by id;
 → [{"id":1,"color":"x"},{"id":2,"color":"x"}]
 
 -- DELETE variant — a self-read with a subquery WHERE (`id<>2`) deletes only the rows whose
