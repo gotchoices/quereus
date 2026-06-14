@@ -591,7 +591,13 @@ SELECT/DML source's per-row routing is deferred); RETURNING is rejected; a `unio
 overlapping data tuples fans a delete/data-update to all copies (bag identity); a leg discriminating purely
 by a non-literal σ (`where f(color)`) routes by include-on-unknown but cannot recover its omitted base
 columns on insert; a deep / mixed `intersect`/`except` chain is not flattened (it stays on the existing
-reject).
+reject); an INSERT that **omits a discriminator** is consistent with every leg that discriminator would have
+excluded, so it routes to all of them — when two such legs share a base table this surfaces as a clean PK
+conflict (a leg discriminating by a non-`=` range σ on a *projected* column is likewise invisible to the
+oracle, so an INSERT can over-insert a phantom base row — `set-op-flagless-range-sigma-oracle`, backlog);
+a leg whose body is a **multi-source (join) body** is admitted by the recognizer's column-shape check but
+the shared fan substrate cannot compose its nested capture, so the write fails with an internal error — the
+same pre-existing limitation the `exists`-membership path has (`set-op-write-multisource-leg-capture`, fix).
 
 **v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
 view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of

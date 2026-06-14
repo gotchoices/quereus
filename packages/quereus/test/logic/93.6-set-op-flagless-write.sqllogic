@@ -201,3 +201,58 @@ select id from ea order by id;
 → [{"id":2},{"id":3}]
 select id from eb order by id;
 → [{"id":2}]
+
+-- ===================================================================
+-- Rejected boundaries: the static surfaces must AGREE with the dynamic reject (no
+-- over-claim). A body the flag-less recognizer rejects falls through to the conservative
+-- all-`NO` row AND the dynamic write rejects.
+-- ===================================================================
+create table rp (id integer primary key, x integer);
+create table rq (id integer primary key, x integer);
+create table rr (id integer primary key, x integer);
+
+-- A discriminator-less `union all` is NOT writable (no literal discriminator to route an
+-- insert honestly — the phase-1 reject is preserved): all-`NO` static + dynamic reject.
+create view DLU as select id, x from rp union all select id, x from rq;
+select is_insertable_into, is_updatable, is_deletable from view_info('DLU');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+select cid, column_name, is_updatable from column_info('DLU');
+→ [{"cid":0,"column_name":"id","is_updatable":"NO"},{"cid":1,"column_name":"x","is_updatable":"NO"}]
+insert into DLU (id, x) values (1, 10);
+-- error:
+
+-- A deep / mixed `intersect` chain is not flattened (binary only) → conservative all-`NO`.
+create view DI as select id, x from rp intersect select id, x from rq intersect select id, x from rr;
+select is_insertable_into, is_updatable, is_deletable from view_info('DI');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+
+-- ===================================================================
+-- `union` (DISTINCT) of literal-discriminator legs is writable too (the recognizer admits
+-- both `union` and `union all`).
+-- ===================================================================
+create table da (id integer primary key, x integer, color text null);
+create table db (id integer primary key, x integer, color text null);
+insert into da values (1,10,'red'),(2,20,'blue');
+insert into db values (3,30,'red'),(4,40,'blue');
+create view DU as
+  select id, x, 'a' as src from da where color = 'red'
+  union
+  select id, x, 'b' as src from db where color = 'red';
+select is_insertable_into, is_updatable, is_deletable from view_info('DU');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+insert into DU (id, x, src) values (5, 50, 'a');
+select id, color from da order by id;
+→ [{"id":1,"color":"red"},{"id":2,"color":"blue"},{"id":5,"color":"red"}]
+
+-- ===================================================================
+-- Partial-discriminator insert ambiguity (the routing-ambiguity caveat): omitting a
+-- discriminator that distinguishes two legs of the SAME base table routes the row to BOTH,
+-- which surfaces as a clean PK conflict (not silent corruption).
+-- ===================================================================
+create table oa (id integer primary key, x integer, color text null, size text null);
+create view OU as
+  select id, x, 'red' as kind from oa where color = 'red'
+  union all
+  select id, x, 'large' as kind from oa where size = 'large';
+insert into OU (id, x) values (7, 70);
+-- error:
