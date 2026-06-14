@@ -95,7 +95,7 @@
  * module declares (the memory host's pending layer is private to the
  * connection and mutated synchronously, so it needs none).
  *
- * ## Replicable-determination requirement
+ * ## Replicable-determinism requirement
  *
  * {@link BackingHost.requiresReplicableDerivations} is an **opt-in capability
  * declaration** consumed by the engine **only at create**: a host whose backing
