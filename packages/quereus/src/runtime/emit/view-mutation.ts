@@ -6,7 +6,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { isAsyncIterable } from '../utils.js';
 import { createRowSlot } from '../context-helpers.js';
-import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
+import type { RowDescriptor, TableDescriptor } from '../../planner/nodes/plan-node.js';
 
 type Callback = (ctx: RuntimeContext) => OutputValue;
 
@@ -64,6 +64,13 @@ type Callback = (ctx: RuntimeContext) => OutputValue;
  * delete without RETURNING still needs it) and removed in a `finally`. Mutually
  * exclusive with the insert envelope.
  *
+ * **Chained nested captures (set-op multi-source leg compose).** `plan.nestedCaptures`
+ * adds further captures materialized AFTER the primary, in list order, before the base
+ * ops. A nested capture's source may scan a strictly-earlier capture's rows (e.g. an
+ * inner base-PK capture whose `memberExists` probe reads the outer set-op capture's
+ * `__vmupd_keys`), so they are materialized primary → nested[0] → nested[1] → … and torn
+ * down in REVERSE in a `finally` (so a throw mid-statement leaks no context entry).
+ *
  * Without a `returning` clause every base op is a side-effect statement that
  * yields nothing and this node yields nothing; the block emitter treats it like a
  * Sink for result selection.
@@ -93,16 +100,30 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	const capture = plan.identityCapture;
 	const captureDescriptor = capture?.descriptor;
 
+	// Nested identity captures (set-op multi-source leg compose): materialized AFTER the
+	// primary capture, in list order, BEFORE the base ops. Each nested source may scan a
+	// strictly-earlier capture's materialized rows (the primary, or an earlier nested
+	// entry), so the materialization order is load-bearing.
+	const nestedCaptures = plan.nestedCaptures ?? [];
+
 	// Params follow the same order `ViewMutationNode.getChildren` threads them in:
 	// base-op callbacks, then the optional RETURNING re-query, then the optional
-	// identity-capture source, then the envelope source + optional surrogate seed —
-	// so the scheduler resolves every sub-program before `run`.
+	// identity-capture source, then the nested-capture sources (in list order), then the
+	// envelope source + optional surrogate seed — so the scheduler resolves every
+	// sub-program before `run`.
 	const params: Instruction[] = [...baseOpInstructions];
 	let cursor = baseOpCount;
 	let returningIdx = -1;
 	if (plan.returning) { returningIdx = cursor++; params.push(emitCallFromPlan(plan.returning, ctx)); }
 	let captureIdx = -1;
 	if (capture) { captureIdx = cursor++; params.push(emitCallFromPlan(capture.source, ctx)); }
+	// One param slot per nested capture source, in list order, immediately after the
+	// primary capture and before the envelope source — matching `getChildren`.
+	const nestedCaptureIdxs: number[] = [];
+	for (const nested of nestedCaptures) {
+		nestedCaptureIdxs.push(cursor++);
+		params.push(emitCallFromPlan(nested.source, ctx));
+	}
 	let envSourceIdx = -1;
 	if (envelope) { envSourceIdx = cursor++; params.push(emitCallFromPlan(envelope.source, ctx)); }
 	let keyDefaultIdx = -1;
@@ -178,23 +199,50 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	async function run(rctx: RuntimeContext, ...args: RuntimeValue[]): Promise<OutputValue> {
 		const baseCbs = args.slice(0, baseOpCount);
 
-		// Identity capture (multi-source UPDATE / multi-side DELETE fan-out): materialize
-		// the affected view rows' base-PK identities into context BEFORE any base op
-		// runs, then run the body. This wraps ALL branches — the multi-side base ops
-		// (which read `__vmupd_keys` by descriptor) and the post-mutation RETURNING
-		// re-query both read the captured set, and a multi-side mutation WITHOUT
-		// RETURNING still needs it for the base ops. The context entry is removed in
-		// `finally` so it never leaks past the statement.
+		// Identity captures (multi-source UPDATE / multi-side DELETE fan-out, and the
+		// set-op leg compose's chained captures): materialize each affected-row capture's
+		// rows into context BEFORE any base op runs, then run the body. This wraps ALL
+		// branches — the multi-side base ops (which read `__vmupd_keys` by descriptor) and
+		// the post-mutation RETURNING re-query both read the captured set, and a multi-side
+		// mutation WITHOUT RETURNING still needs it for the base ops.
+		//
+		// The captures are materialized in a load-bearing order: the primary
+		// `identityCapture` first, then each nested capture in list order. A nested
+		// capture's source may scan a STRICTLY-earlier capture's rows (read back by
+		// descriptor), so the earlier `tableContexts` entry must already be set when the
+		// nested source runs. Each entry set is removed in `finally`, in REVERSE order, so
+		// a partially-run statement (a base op — or a later nested capture's
+		// materialization — throwing) never leaks a context entry into a sibling statement.
+		//
+		// Ordered off whatever captures are present (primary-then-nested), so a statement
+		// with nested captures but no primary is handled cleanly too.
+		const orderedCaptureIdxs: { descriptor: TableDescriptor; idx: number }[] = [];
 		if (captureIdx >= 0 && captureDescriptor) {
-			const captureRows = await collectRows((args[captureIdx] as Callback)(rctx));
-			rctx.tableContexts.set(captureDescriptor, () => arrayIterable(captureRows));
-			try {
-				return await runBody(rctx, args, baseCbs);
-			} finally {
-				rctx.tableContexts.delete(captureDescriptor);
+			orderedCaptureIdxs.push({ descriptor: captureDescriptor, idx: captureIdx });
+		}
+		for (let i = 0; i < nestedCaptureIdxs.length; i++) {
+			orderedCaptureIdxs.push({ descriptor: nestedCaptures[i].descriptor, idx: nestedCaptureIdxs[i] });
+		}
+
+		if (orderedCaptureIdxs.length === 0) {
+			return runBody(rctx, args, baseCbs);
+		}
+
+		// Teardown stack: only the descriptors actually set are removed (in reverse), so a
+		// throw mid-materialization tears down exactly what was installed.
+		const setDescriptors: TableDescriptor[] = [];
+		try {
+			for (const { descriptor: capDescriptor, idx } of orderedCaptureIdxs) {
+				const captureRows = await collectRows((args[idx] as Callback)(rctx));
+				rctx.tableContexts.set(capDescriptor, () => arrayIterable(captureRows));
+				setDescriptors.push(capDescriptor);
+			}
+			return await runBody(rctx, args, baseCbs);
+		} finally {
+			for (let i = setDescriptors.length - 1; i >= 0; i--) {
+				rctx.tableContexts.delete(setDescriptors[i]);
 			}
 		}
-		return runBody(rctx, args, baseCbs);
 	}
 
 	async function runBody(rctx: RuntimeContext, args: RuntimeValue[], baseCbs: RuntimeValue[]): Promise<OutputValue> {
@@ -249,10 +297,11 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	}
 
 	const retNote = plan.returning ? ` +returning(${returningTiming}${capture ? '+capture' : ''})` : relationalBaseIdx >= 0 ? ' +returning' : '';
+	const nestedNote = nestedCaptures.length > 0 ? ` +nested(${nestedCaptures.length})` : '';
 	return {
 		params,
 		run: run as InstructionRun,
-		note: `viewMutation(${baseOpCount} base op${baseOpCount === 1 ? '' : 's'}${envelope ? ' +envelope' : ''}${retNote})`,
+		note: `viewMutation(${baseOpCount} base op${baseOpCount === 1 ? '' : 's'}${envelope ? ' +envelope' : ''}${retNote}${nestedNote})`,
 	};
 }
 

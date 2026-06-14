@@ -162,6 +162,28 @@ export class ViewMutationNode extends PlanNode {
 		 * (whose RETURNING re-queries the view `pre`), and the void/insert paths.
 		 */
 		public readonly identityCapture?: IdentityCapture,
+		/**
+		 * Additional identity captures materialized **after** {@link identityCapture}, in
+		 * array order, **before** the base ops. Each entry's `source` may scan a
+		 * STRICTLY-earlier capture's materialized rows (the primary {@link identityCapture}
+		 * or an earlier `nestedCaptures` entry, read back through an
+		 * `InternalRecursiveCTERefNode` carrying that capture's descriptor) — so they
+		 * materialize in list order (primary → nested[0] → nested[1] → …) and tear down in
+		 * reverse. A nested source may depend only on a strictly-earlier capture, never a
+		 * later one or itself.
+		 *
+		 * Load-bearing for the set-op multi-source leg compose, where a join branch's inner
+		 * base-PK capture chains off the outer set-op capture (its `memberExists` predicate
+		 * scans the outer capture's `__vmupd_keys`). Empty / undefined for every other
+		 * producer — a single-capture (or capture-free) statement lowers and runs
+		 * byte-identically to the pre-list substrate.
+		 *
+		 * The list is independent of {@link identityCapture}: although the set-op use always
+		 * has the outer capture as the primary, the emitter orders materialization off
+		 * whatever captures are present (primary-then-nested), so a `nestedCaptures` with no
+		 * primary is handled cleanly too.
+		 */
+		public readonly nestedCaptures?: readonly IdentityCapture[],
 	) {
 		super(scope, baseOps.reduce((cost, op) => cost + op.getTotalCost(), 0.1));
 		if (baseOps.length === 0) {
@@ -211,12 +233,14 @@ export class ViewMutationNode extends PlanNode {
 
 	getChildren(): readonly PlanNode[] {
 		// Order: base ops, then the optional RETURNING re-query, then the optional
-		// identity-capture source, then the envelope children. `withChildren` slices
-		// back in this same order.
+		// primary identity-capture source, then the nested-capture sources (in list
+		// order), then the envelope children. `withChildren` slices back in this same
+		// order, and the emitter threads its params identically.
 		return [
 			...this.baseOps,
 			...(this.returning ? [this.returning] : []),
 			...(this.identityCapture ? [this.identityCapture.source] : []),
+			...(this.nestedCaptures ?? []).map(c => c.source),
 			...this.envelopeChildren(),
 		];
 	}
@@ -231,8 +255,10 @@ export class ViewMutationNode extends PlanNode {
 		// The identity-capture source (like the envelope source) is a side input
 		// materialized into context, not part of this node's forwarded output, so it
 		// is excluded — only reachable via getChildren for optimization/withChildren.
-		// (Holds for the both-sides void update too: its base ops are Sink-topped, so
-		// the node stays void and the capture source is never a forwarded relation.)
+		// The nested-capture sources are excluded for the same reason: each is a side
+		// input materialized into context (after the primary capture), never a forwarded
+		// relation. (Holds for the both-sides void update too: its base ops are
+		// Sink-topped, so the node stays void and no capture source is forwarded.)
 		const rels = this.baseOps.filter(isRelationalNode);
 		if (this.returning) rels.push(this.returning);
 		return rels;
@@ -255,6 +281,18 @@ export class ViewMutationNode extends PlanNode {
 			newCapture = { source: newCaptureSource, descriptor: this.identityCapture.descriptor };
 		}
 
+		// Slice the nested-capture sources back in the same order getChildren laid them
+		// out, rebuilding each IdentityCapture with its PRESERVED descriptor (the readers
+		// bind to the descriptor by identity — minting a fresh `{}` would orphan them).
+		let newNestedCaptures = this.nestedCaptures;
+		if (this.nestedCaptures && this.nestedCaptures.length > 0) {
+			newNestedCaptures = this.nestedCaptures.map(c => {
+				const source = newChildren[cursor] as RelationalPlanNode;
+				cursor += 1;
+				return { source, descriptor: c.descriptor };
+			});
+		}
+
 		let newEnvelope = this.envelope;
 		if (this.envelope) {
 			const newSource = newChildren[cursor] as RelationalPlanNode;
@@ -272,12 +310,13 @@ export class ViewMutationNode extends PlanNode {
 			&& newBaseOps.every((child, i) => child === this.baseOps[i])
 			&& newReturning === this.returning
 			&& (!this.identityCapture || newCapture!.source === this.identityCapture.source)
+			&& (!this.nestedCaptures || this.nestedCaptures.every((c, i) => newNestedCaptures![i].source === c.source))
 			&& (!this.envelope || (newEnvelope!.source === this.envelope.source
 				&& newEnvelope!.keyDefault === this.envelope.keyDefault));
 		if (unchanged) {
 			return this;
 		}
-		return new ViewMutationNode(this.scope, newBaseOps, newReturning, newEnvelope, this.returningTiming, newCapture);
+		return new ViewMutationNode(this.scope, newBaseOps, newReturning, newEnvelope, this.returningTiming, newCapture, newNestedCaptures);
 	}
 
 	get estimatedRows(): number | undefined {
@@ -294,7 +333,12 @@ export class ViewMutationNode extends PlanNode {
 
 	override toString(): string {
 		const env = this.envelope ? ` +envelope${this.envelope.keyDefault ? '(default)' : ''}` : '';
-		const cap = this.identityCapture ? ' +capture' : '';
+		// Show a `+capture(<primary>+<nested>)` breakdown when nested captures chain off
+		// the primary; keep the bare `+capture` for the common single-capture case.
+		const nestedCount = this.nestedCaptures?.length ?? 0;
+		const cap = nestedCount > 0
+			? ` +capture(${this.identityCapture ? 1 : 0}+${nestedCount})`
+			: this.identityCapture ? ' +capture' : '';
 		const ret = this.resultRelation() ? ` returning${this.returning ? `(${this.returningTiming})` : ''}` : '';
 		return `VIEW MUTATION (${this.baseOps.length} base op${this.baseOps.length === 1 ? '' : 's'}${env}${cap}${ret})`;
 	}
@@ -304,6 +348,7 @@ export class ViewMutationNode extends PlanNode {
 			baseOps: this.baseOps.length,
 			envelope: this.envelope ? (this.envelope.keyDefault ? 'default' : 'shared') : undefined,
 			identityCapture: this.identityCapture ? 'identity' : undefined,
+			nestedCaptures: this.nestedCaptures && this.nestedCaptures.length > 0 ? this.nestedCaptures.length : undefined,
 			returning: this.resultRelation() ? (this.returning ? `requery(${this.returningTiming})` : 'base-op') : undefined,
 		};
 	}
