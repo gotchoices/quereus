@@ -301,5 +301,20 @@ describe('Materialized view replicable-determinism gate', () => {
 			const err = await captureError('create materialized view m_coll_pragma using repl as select id, c from t order by c collate MYLOCALE;');
 			expectReplicableCollationReject(err, 'MYLOCALE', 'm_coll_pragma');
 		});
+
+		it('rejects a non-replicable custom collation in a DISTINCT key', async () => {
+			// DISTINCT dedup folds under the projected scalar's collation; the CollateNode
+			// rides the projection so the body walk reaches it.
+			const err = await captureError('create materialized view m_dist using repl as select distinct c collate MYLOCALE as ck from t;');
+			expectReplicableCollationReject(err, 'MYLOCALE', 'm_dist');
+		});
+
+		it('rejects a non-replicable custom collation buried in a subquery leg', async () => {
+			// The collation appears ONLY inside a correlated/uncorrelated subquery — confirms
+			// the `getChildren()` walk recurses through relational subtrees, not just the
+			// top-level projection/WHERE (gap #4 in the handoff: previously unpinned).
+			const err = await captureError("create materialized view m_subq using repl as select id from t where id in (select id from t t2 where t2.c collate MYLOCALE = 'alpha');");
+			expectReplicableCollationReject(err, 'MYLOCALE', 'm_subq');
+		});
 	});
 });
