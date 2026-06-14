@@ -17,7 +17,7 @@ import { FilterNode } from '../nodes/filter.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import type { BaseOp, MutableViewLike, MutationRequest } from './propagate.js';
-import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn, SELF_ALIAS } from './single-source.js';
+import { combineAnd, flattenAnd, makeViewColumnDescend, assertTopLevelViewColumns, raiseUnknownViewColumn, SELF_ALIAS, assertReturningStarQualifier } from './single-source.js';
 import { transformExpr, cloneExpr, mapQueryExprUniform, substituteNewRefs, transformScopedExpr, transformAliasScopedExpr, type ScopeContext } from './scope-transform.js';
 import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 
@@ -2192,10 +2192,7 @@ function buildReturningProjection(
 	const out: AST.ResultColumn[] = [];
 	for (const rc of returningCols) {
 		if (rc.type === 'all') {
-			// TODO: an `rc.table` qualifier (`bogus.*`) is NOT validated here — any
-			// qualifier expands all view columns rather than erroring on a wrong name.
-			// The base-table path (building/returning-star.ts) DOES validate; tightening
-			// the view path needs the view name/alias threaded in.
+			assertReturningStarQualifier(rc.table, view.name);
 			for (const col of analysis.outColumns) {
 				const baseExpr = analysis.viewColToBaseRef.get(col.name);
 				if (!baseExpr) {

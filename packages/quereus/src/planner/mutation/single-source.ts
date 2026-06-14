@@ -2,7 +2,8 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema } from '../../schema/table.js';
 import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js';
-import { type SqlValue } from '../../common/types.js';
+import { type SqlValue, StatusCode } from '../../common/types.js';
+import { QuereusError } from '../../common/errors.js';
 import { sqlValuesEqual } from '../../util/comparison.js';
 import { buildSelectStmt } from '../building/select.js';
 import { classifyViewBody } from './propagate.js';
@@ -1290,6 +1291,17 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
  * correlate to the target row the same way a WHERE subquery can). UPDATE/DELETE pass
  * the synthesised {@link SELF_ALIAS}; INSERT leaves it at the base table name (default).
  */
+
+/** Shared guard for `RETURNING <q>.*` through a view — validates the qualifier against the view name. */
+export function assertReturningStarQualifier(rcTable: string | undefined, viewName: string): void {
+	if (rcTable && rcTable.toLowerCase() !== viewName.toLowerCase()) {
+		throw new QuereusError(
+			`Table '${rcTable}' not found in FROM clause for qualified RETURNING *`,
+			StatusCode.ERROR,
+		);
+	}
+}
+
 export function rewriteViewReturning(
 	ctx: PlanningContext,
 	returning: AST.ResultColumn[] | undefined,
@@ -1310,10 +1322,7 @@ export function rewriteViewReturning(
 		if (rc.type === 'all') {
 			// RETURNING * (or `view.*`) → every view column, projected through its
 			// base-term lineage and named by the view column.
-			// TODO: an `rc.table` qualifier (`bogus.*`) is NOT validated here — any
-			// qualifier expands all view columns rather than erroring on a wrong
-			// name. The base-table path (building/returning-star.ts) DOES validate;
-			// tightening the view path needs the view name/alias threaded in.
+			assertReturningStarQualifier(rc.table, view.name);
 			for (const vc of analysis.viewColumns) {
 				const baseExpr = analysis.columnMap.get(vc.name.toLowerCase());
 				if (baseExpr) out.push({ type: 'column', expr: cloneExpr(baseExpr), alias: vc.name });

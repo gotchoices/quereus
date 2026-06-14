@@ -3995,3 +3995,64 @@ select id, x from mj1 order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
 select id from mj2 order by id;
 → [{"id":1},{"id":2}]
+
+-- ===================================
+-- RETURNING <q>.* qualifier validation through updatable views.
+-- A wrong qualifier (bogus.*) must error with the same diagnostic as the base-table
+-- path ("Table '<q>' not found in FROM clause for qualified RETURNING *").
+-- A correct <view>.* qualifier must still expand normally.
+-- ===================================
+
+-- single-source filter view fixtures
+create table qv_men (name text primary key, color text);
+create view qv_green as select name, color from qv_men where color = 'green';
+insert into qv_men values ('Alice', 'green'), ('Bob', 'blue');
+-- run
+
+-- single-source INSERT: wrong qualifier errors
+insert into qv_green (name) values ('Carl') returning bogus.*;
+-- error: not found in FROM clause for qualified RETURNING *
+
+-- single-source UPDATE: wrong qualifier errors
+update qv_green set color = 'green' where name = 'Alice' returning bogus.*;
+-- error: not found in FROM clause for qualified RETURNING *
+
+-- single-source DELETE: wrong qualifier errors
+delete from qv_green where name = 'Alice' returning bogus.*;
+-- error: not found in FROM clause for qualified RETURNING *
+
+-- regression: correct view-name qualifier still expands (must not break)
+insert into qv_green (name) values ('Dave') returning qv_green.*;
+→ [{"name":"Dave","color":"green"}]
+
+update qv_green set color = 'green' where name = 'Dave' returning qv_green.*;
+→ [{"name":"Dave","color":"green"}]
+
+delete from qv_green where name = 'Dave' returning qv_green.*;
+→ [{"name":"Dave","color":"green"}]
+
+-- multi-source join view fixtures
+create table qv_p (pid integer primary key, label text);
+create table qv_c (cid integer primary key, pref integer, note text,
+    foreign key (pref) references qv_p(pid));
+insert into qv_p values (1, 'L1'), (2, 'L2');
+insert into qv_c values (10, 1, 'x'), (20, 2, 'y');
+create view qv_join as
+    select c.cid as cid, c.note as note, p.label as label
+    from qv_c c join qv_p p on p.pid = c.pref;
+-- run
+
+-- multi-source UPDATE: wrong qualifier errors
+update qv_join set note = 'X' where cid = 10 returning bogus.*;
+-- error: not found in FROM clause for qualified RETURNING *
+
+-- multi-source DELETE: wrong qualifier errors
+delete from qv_join where cid = 20 returning bogus.*;
+-- error: not found in FROM clause for qualified RETURNING *
+
+-- regression: correct view-name qualifier still expands through the join view
+update qv_join set note = 'X2' where cid = 10 returning qv_join.*;
+→ [{"cid":10,"note":"X2","label":"L1"}]
+
+delete from qv_join where cid = 10 returning qv_join.*;
+→ [{"cid":10,"note":"X2","label":"L1"}]
