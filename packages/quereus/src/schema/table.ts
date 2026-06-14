@@ -824,6 +824,42 @@ export function columnsFormDeclaredKey(table: TableSchema, indices: readonly num
 	return findDeclaredKey(table, indices) !== undefined;
 }
 
+/**
+ * Every declared whole-table key on `table` whose column set is a **subset** of
+ * `indices` — the PRIMARY KEY and each non-partial UNIQUE constraint that `indices`
+ * subsumes. The subset (`⊆`) sibling of {@link findDeclaredKey}'s exact (`=`) match,
+ * returning *all* matches rather than the one exact key.
+ *
+ * Where exact-match answers "is this key `proved` **via transport**" — an authored
+ * bijection onto an *exact* basis key (a strict superset does not *prove* the smaller
+ * key's uniqueness, so exact-match is correct there) — subset answers a different
+ * question: "which declared basis keys **govern** a write-through duplicate of this
+ * key?" A logical key whose mapped basis columns ⊇ a basis key K is, for any two rows
+ * equal on the full logical key, also equal on K — so K fires on *every* logical-key
+ * duplicate. Governance therefore needs subset, not equality: a logical key that is a
+ * strict superkey of a smaller basis key is governed by that smaller basis key even
+ * though no basis key set-equals the logical key's columns.
+ *
+ * Consumed by the prover's proved-key conflict-action check
+ * (`lens-prover.ts rejectBasisGovernedConflictActionForProvedKey`): the basis key whose
+ * `defaultConflict` a duplicate actually resolves to must be identified by subset, so a
+ * superkey of a smaller basis key (which exact-match misses) is still covered. Partial
+ * UNIQUE constraints are skipped for the same reason as in {@link findDeclaredKey} — they
+ * only guarantee uniqueness within their scope, so they do not unconditionally govern.
+ */
+export function findGoverningBasisKeys(table: TableSchema, indices: readonly number[]): DeclaredKeyMatch[] {
+	const want = new Set(indices);
+	const subset = (cols: readonly number[]): boolean => cols.length > 0 && cols.every(c => want.has(c));
+	const matches: DeclaredKeyMatch[] = [];
+	const pk = table.primaryKeyDefinition.map(p => p.index);
+	if (subset(pk)) matches.push({ kind: 'primaryKey' });
+	for (const uc of table.uniqueConstraints ?? []) {
+		if (uc.predicate !== undefined) continue; // partial UNIQUE only governs within its scope
+		if (subset(uc.columns)) matches.push({ kind: 'unique', constraint: uc });
+	}
+	return matches;
+}
+
 function findConstraintPKDefinition(
 	columns: readonly ColumnSchema[],
 	constraints: readonly TableConstraint[] | undefined

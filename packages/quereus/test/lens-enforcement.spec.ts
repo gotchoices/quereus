@@ -1018,16 +1018,21 @@ describe('lens enforcement: logical UNIQUE over a bijective authored inverse', (
 });
 
 describe('lens enforcement: conflict action on a transport-proved key', () => {
-	// A transport-proved key is enforced by the *basis* key the bijection maps onto,
-	// whose own conflict action governs a write-through duplicate — the logical key's
-	// is never consulted. So a logical `on conflict replace`/`ignore` the basis key
-	// does not itself carry is silently dropped, and the prover rejects it at deploy
-	// with `lens.unenforceable-conflict-action` (ticket
-	// `lens-proved-transport-key-conflict-action-drop`). The check fires whether the
-	// key is classified `proved` by the body (a faithful projection of a basis key —
-	// a basis NOT-NULL UNIQUE is itself a relation key) or by bijection transport (an
-	// authored bijection the body cannot prove). A *matching* basis-key action deploys
-	// clean (the basis key honors it for free — the documented remediation).
+	// A `proved` key is enforced for free by whatever declared basis key stands behind
+	// the proof — never the logical key — so a logical `on conflict replace`/`ignore`
+	// that governing key does not itself carry is silently dropped, and the prover
+	// rejects it at deploy with `lens.unenforceable-conflict-action` (tickets
+	// `lens-proved-transport-key-conflict-action-drop` +
+	// `lens-proved-superkey-basis-key-conflict-action-drop`). The governing basis key is
+	// identified by a SUBSET search over the mapped basis columns, so the check is
+	// decoupled from the transport proof's exact-match/single-source gate: it fires
+	// whether the key is proved by the body (a faithful projection of a basis key, or a
+	// strict superkey of a smaller basis key) or by bijection transport (an authored
+	// bijection the body cannot prove). A *matching* basis-key action deploys clean (the
+	// basis key honors it for free — the documented remediation); a genuinely
+	// basis-keyless proof (a GROUP BY aggregate with no basis UC over the key) governs
+	// no basis key, so its `on conflict` is vacuous and deploys clean. A multi-source
+	// body cannot pin the governing key, so it rejects conservatively.
 	const BIJECTIVE_LENS = 'declare lens for x over y { view t as select id, code + 10 as grp with inverse (code = new.grp - 10) from y.t }';
 	const BARE_RENAME_LENS = 'declare lens for x over y { view t as select id, code as grp from y.t }';
 
@@ -1088,6 +1093,123 @@ describe('lens enforcement: conflict action on a transport-proved key', () => {
 				'matching action ⇒ still classified proved',
 			).to.be.true;
 			expect(collectLensSetLevelConstraints(slot(db, 't')), 'proved ⇒ no set-level obligation').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	// ── Superkey governance: the body proves a strict superkey of a smaller basis key.
+	// The smaller basis key (a subset of the logical key's mapped basis columns) governs
+	// every write-through duplicate, yet transport's exact-match `findDeclaredKey` misses
+	// it. The subset governance search (`findGoverningBasisKeys`) catches it.
+	// (ticket `lens-proved-superkey-basis-key-conflict-action-drop`).
+	const SUPERKEY_BARE_LENS = 'declare lens for x over y { view t as select id, a, b from y.t }';
+
+	it('superkey UNIQUE (basis NOT-NULL unique(a) ⊊ logical unique(a,b)) with MISMATCHED REPLACE blocks (the confirmed repro)', async () => {
+		// The body proves `unique(a,b)` because basis NOT-NULL `unique(a)` → relation key
+		// `{a}` ⊆ `{a,b}`. The basis `unique(a)` (ABORT) governs any write-through `(a,b)`
+		// duplicate (it is also a duplicate `a`), so the logical REPLACE is never consulted.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique check (a in (1, 2, 3)), b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer not null check (a in (1, 2, 3)), b integer not null, unique (a, b) on conflict replace) }');
+			await db.exec(SUPERKEY_BARE_LENS);
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('superkey UNIQUE with MISMATCHED IGNORE blocks (IGNORE arm of the basis-governed rejecter)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique check (a in (1, 2, 3)), b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer not null check (a in (1, 2, 3)), b integer not null, unique (a, b) on conflict ignore) }');
+			await db.exec(SUPERKEY_BARE_LENS);
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('superkey PK (logical primary key (a,b) ⊋ basis unique(a)) with MISMATCHED REPLACE blocks (PK action via resolvePkDefaultConflict)', async () => {
+		// The logical PK `(a,b)` is a strict superkey of the basis NOT-NULL `unique(a)`.
+		// The PK's REPLACE is resolved through `resolvePkDefaultConflict`; the basis
+		// `unique(a)` (ABORT) governs the duplicate, so it must red.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique check (a in (1, 2, 3)), b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer not null, a integer not null check (a in (1, 2, 3)), b integer not null, primary key (a, b) on conflict replace) }');
+			await db.exec(SUPERKEY_BARE_LENS);
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('superkey UNIQUE whose governing basis key carries the MATCHING action deploys clean (honored for free)', async () => {
+		// Basis `unique(a) on conflict replace` ⊆ logical `unique(a,b) on conflict replace`:
+		// the governing key already resolves the declared action, so nothing to reject.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique on conflict replace check (a in (1, 2, 3)), b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer not null check (a in (1, 2, 3)), b integer not null, unique (a, b) on conflict replace) }');
+			await db.exec(SUPERKEY_BARE_LENS);
+			await db.exec('apply schema x'); // no throw — the basis unique(a) honors REPLACE for free
+
+			expect(
+				(slot(db, 't').obligations ?? []).some(o => o.kind === 'proved' && o.constraint.kind === 'unique'),
+				'matching governing action ⇒ still classified proved',
+			).to.be.true;
+			expect(collectLensSetLevelConstraints(slot(db, 't')), 'proved ⇒ no set-level obligation').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('multi-source proved key with a MISMATCHED REPLACE blocks conservatively (governing key not pinnable)', async () => {
+		// A 1:1 join body is multi-source — `ctx.basisSource` is undefined, so the 1:1
+		// logical→basis column mapping the subset search needs does not exist and the
+		// superkey soundness argument does not transfer across the decomposition.
+		// Governance cannot be pinned, so the declared REPLACE rejects conservatively.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table Core { id integer primary key, name text } table Contact { id integer primary key, email text } }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table Person { id integer primary key on conflict replace, name text, email text } }');
+			await db.exec('declare lens for x over y { view Person as select c.id, c.name, k.email from y.Core c join y.Contact k using (id) }');
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('genuinely basis-keyless proof (DISTINCT, no basis UC over the key) with `on conflict replace` deploys clean (no false positive)', async () => {
+		// `select distinct a, b from y.t` proves `primary key (a, b)` (DISTINCT makes the
+		// full output a key) yet stays writable, but no declared basis key is a subset of
+		// `{a, b}` (the basis PK is `{id}`), so the proof is genuinely basis-keyless. The
+		// governance subset search finds no governing basis key ⇒ the `on conflict replace`
+		// is vacuous ⇒ deploy clean. This exercises the "no governing key → clean" branch.
+		// (A `group by a, b` body — no aggregate — would instead classify enforced-set-level
+		// commit-time here and be rejected by the pre-existing commit-time block, so DISTINCT
+		// is the shape that actually reaches `proved`.)
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null, b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table v (a integer not null, b integer not null, primary key (a, b) on conflict replace) }');
+			await db.exec('declare lens for x over y { view v as select distinct a, b from y.t }');
+			await db.exec('apply schema x'); // no throw — no governing basis key, so the action is vacuous
+
+			expect(
+				(slot(db, 'v').obligations ?? []).some(o => o.kind === 'proved' && o.constraint.kind === 'primaryKey'),
+				'distinct proves the key',
+			).to.be.true;
+			expect(collectLensSetLevelConstraints(slot(db, 'v')), 'proved ⇒ no set-level obligation').to.deep.equal([]);
 		} finally {
 			await db.close();
 		}
