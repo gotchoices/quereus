@@ -1018,6 +1018,22 @@ export class MemoryTableManager {
 		const schema = targetLayer.getSchema();
 		if (!schema.indexes) return undefined;
 
+		// An index-derived UNIQUE (`CREATE UNIQUE INDEX`) must enforce under ITS OWN
+		// index's collation. Resolve BY NAME via `uc.derivedFromIndex` — not the
+		// column-set scan below, which returns the FIRST same-column-set index and
+		// would enforce a coarser-declared UC under a finer first-listed index's
+		// collation (and generate candidates from that index's wrongly-keyed BTree).
+		// This matches the by-name resolution store/isolation use via
+		// `uniqueEnforcementCollations`. Falls through to the column-set scan only
+		// when the name does not resolve (defensive) or the UC is non-derived.
+		if (uc.derivedFromIndex) {
+			const index = targetLayer.getSecondaryIndex?.(uc.derivedFromIndex);
+			if (index) return { kind: 'memory-index', index };
+		}
+
+		// Non-derived UNIQUE (table-level / column): match the auto-built `_uc_*`
+		// covering index by column-set — it carries the declared collation, so any
+		// same-column-set match is collation-equivalent and correct.
 		for (const idx of schema.indexes) {
 			if (idx.columns.length === uc.columns.length &&
 				idx.columns.every((col, i) => col.index === uc.columns[i])) {
@@ -1066,16 +1082,16 @@ export class MemoryTableManager {
 			// enforcement collation. The shared `uniqueEnforcementCollations(schema,
 			// uc)` helper (which store/isolation import, and checkUniqueViaMaterializedView
 			// uses) resolves the SAME per-column value, but BY NAME via
-			// `uc.derivedFromIndex` instead of from this live handle that
-			// findIndexForConstraint resolves BY COLUMN-SET. That `(schema, uc)`
-			// signature has no MemoryIndex handle, so this site keeps the live-handle
-			// read; the agreement between the two index-resolution paths is pinned by
-			// test/unique-enforcement-collation.spec.ts (a real divergence is a finding,
-			// not a reason to widen the helper). KNOWN gap: when two UNIQUE indexes
-			// cover the SAME column-set with different collations, the by-column-set
-			// match above returns the FIRST such index for BOTH UCs, so a coarser-
-			// declared UNIQUE can be under-enforced here — a pre-existing memory bug
-			// tracked by fix ticket memory-multi-index-unique-collation-resolution.
+			// `uc.derivedFromIndex`. `findIndexForConstraint` now ALSO resolves an
+			// index-derived UC by that name (the column-set scan is only the
+			// non-derived fallback), so the live `index` handle here IS the UC's own
+			// index and `index.specColumns[i]?.collation` is the correct per-column
+			// collation even when several same-column-set indexes exist with
+			// differing collations. The `(schema, uc)` helper signature still has no
+			// MemoryIndex handle, so this site keeps the live-handle read — but the
+			// two resolutions now agree on the multi-index shape too. The agreement is
+			// pinned by test/unique-enforcement-collation.spec.ts (a real divergence
+			// is a finding, not a reason to widen the helper).
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
 			if (!uc.columns.every((col, i) => compareSqlValues(

@@ -8,19 +8,18 @@
  * NAME via `uc.derivedFromIndex`. store/isolation import that helper directly, so
  * their copies cannot drift. Memory's `checkUniqueViaIndex` cannot share the
  * import: it reads the collation from the *live* `MemoryIndex` handle that
- * `findIndexForConstraint` resolves BY COLUMN-SET —
- * `index.specColumns[i]?.collation ?? schema.columns[col].collation`. The two
- * resolution paths agree per column for every NORMAL shape — at most one UNIQUE
- * index per column-set — and a drift on those would re-open the covering-MV
- * subset-miss (or over-reject). They do NOT agree when two UNIQUE indexes cover
- * the SAME column-set with different collations: by-name resolves each UC's own
- * index, by-column-set resolves the first index in `schema.indexes`, so memory
- * can under-enforce a coarser-declared UNIQUE (a pre-existing memory-enforcement
- * bug independent of this unification — see fix ticket
- * `memory-multi-index-unique-collation-resolution`). The shapes below stay within
- * the single-index-per-column-set regime where agreement is the contract.
+ * `findIndexForConstraint` returns —
+ * `index.specColumns[i]?.collation ?? schema.columns[col].collation`. That
+ * resolver now mirrors the helper: an index-derived UC resolves BY NAME via
+ * `uc.derivedFromIndex`, with the column-set scan kept only as the non-derived
+ * fallback. The two paths therefore agree per column even when two UNIQUE indexes
+ * cover the SAME column-set with different collations — each UC resolves to its
+ * OWN index, so neither under-enforces a coarser-declared UNIQUE
+ * (`memory-multi-index-unique-collation-resolution`). A drift would re-open the
+ * covering-MV subset-miss (or over-reject).
  *
- * This suite drives those shapes through BOTH paths and asserts equal per-column
+ * This suite drives the shapes — single-index AND multi-index-same-column-set,
+ * in BOTH index creation orders — through BOTH paths and asserts equal per-column
  * output. A drift here is a genuine finding (the two index-resolution paths
  * disagree on a shape that should agree), NOT a reason to widen the helper's
  * signature.
@@ -51,16 +50,21 @@ function getBackingManager(schema: TableSchema): MemoryTableManager {
 
 /**
  * The live `MemoryIndex` enforcing `uc`, resolved EXACTLY as
- * `MemoryTableManager.findIndexForConstraint` does for the non-MV path: the first
- * secondary index whose column SET matches `uc.columns` positionally, fetched
- * from the committed layer. This is the source `checkUniqueViaIndex` reads — note
- * it matches by column-set, not by `uc.derivedFromIndex` name.
+ * `MemoryTableManager.findIndexForConstraint` does for the non-MV path: an
+ * index-derived UC resolves BY NAME via `uc.derivedFromIndex`; a non-derived UC
+ * (or a name that no longer resolves) falls back to the first secondary index
+ * whose column SET matches `uc.columns` positionally. Fetched from the committed
+ * layer — the source `checkUniqueViaIndex` reads.
  */
 function resolveLiveIndex(
 	manager: MemoryTableManager,
 	schema: TableSchema,
 	uc: UniqueConstraintSchema,
 ): MemoryIndex | undefined {
+	if (uc.derivedFromIndex) {
+		const byName = manager.currentCommittedLayer.getSecondaryIndex?.(uc.derivedFromIndex);
+		if (byName) return byName;
+	}
 	const idx = schema.indexes?.find(ix =>
 		ix.columns.length === uc.columns.length &&
 		ix.columns.every((col, i) => col.index === uc.columns[i]),
@@ -90,9 +94,16 @@ interface Shape {
 	ddl: string[];
 	/** The base table whose UNIQUE constraint is under test. */
 	table: string;
-	/** Expected normalized per-column enforcement collation (sanity floor that the
-	 *  shapes actually exercise the distinctions they claim to). */
-	expected: string[];
+	/** Expected normalized per-column enforcement collation for `uniqueConstraints[0]`
+	 *  (single-UC shapes — sanity floor that the shapes actually exercise the
+	 *  distinctions they claim to). */
+	expected?: string[];
+	/** For multi-UC shapes — two UNIQUE indexes over the SAME column-set, where
+	 *  `uniqueConstraints[0]` no longer uniquely identifies the constraint under
+	 *  test. Each entry picks a UC BY its `derivedFromIndex` name and asserts that
+	 *  UC's OWN per-column collation, proving each resolves to its own index (and
+	 *  not the first-listed one) regardless of creation order. */
+	byIndex?: { index: string; expected: string[] }[];
 }
 
 const SHAPES: Shape[] = [
@@ -166,6 +177,38 @@ const SHAPES: Shape[] = [
 		table: 't',
 		expected: ['BINARY', 'NOCASE'],
 	},
+	{
+		// Multi-index, SAME column-set, BINARY created FIRST. Two UNIQUE indexes over
+		// `b` with differing collations: each derived UC must resolve to its OWN
+		// index (by name), so the by-column-set first-match no longer steals the
+		// coarser UC's collation. This is the shape the fix closes.
+		name: 'multi-index same column-set (BINARY first)',
+		ddl: [
+			'create table t (id integer primary key, b text collate nocase)',
+			'create unique index ix_binary on t (b collate binary)',
+			'create unique index ix_nocase on t (b collate nocase)',
+		],
+		table: 't',
+		byIndex: [
+			{ index: 'ix_binary', expected: ['BINARY'] },
+			{ index: 'ix_nocase', expected: ['NOCASE'] },
+		],
+	},
+	{
+		// Same shape, NOCASE created FIRST — proves order-independence (on `main` the
+		// by-column-set scan made the answer depend on `schema.indexes` order).
+		name: 'multi-index same column-set (NOCASE first)',
+		ddl: [
+			'create table t (id integer primary key, b text collate nocase)',
+			'create unique index ix_nocase on t (b collate nocase)',
+			'create unique index ix_binary on t (b collate binary)',
+		],
+		table: 't',
+		byIndex: [
+			{ index: 'ix_binary', expected: ['BINARY'] },
+			{ index: 'ix_nocase', expected: ['NOCASE'] },
+		],
+	},
 ];
 
 describe('uniqueEnforcementCollations ⇔ memory checkUniqueViaIndex (#4 conformance lock)', () => {
@@ -177,29 +220,42 @@ describe('uniqueEnforcementCollations ⇔ memory checkUniqueViaIndex (#4 conform
 
 				const schema = db.schemaManager.getTable('main', shape.table)!;
 				expect(schema, `table '${shape.table}'`).to.not.be.undefined;
-				const uc = schema.uniqueConstraints![0];
-				expect(uc, 'UNIQUE constraint under test').to.not.be.undefined;
-
-				// The shared helper — resolves the index BY NAME (uc.derivedFromIndex).
-				const helper = uniqueEnforcementCollations(schema, uc);
-
-				// The memory #4 path — the live index resolved BY COLUMN-SET.
 				const manager = getBackingManager(schema);
-				const index = resolveLiveIndex(manager, schema, uc);
-				expect(index, 'live enforcing MemoryIndex for the constraint').to.not.be.undefined;
-				const viaIndex = viaLiveIndexCollations(index!, schema, uc);
 
-				expect(helper.length, 'one collation per constrained column').to.equal(uc.columns.length);
-				expect(viaIndex.length, 'live path matches arity').to.equal(uc.columns.length);
+				// A single-UC shape checks `uniqueConstraints[0]`; a multi-UC shape
+				// (two UNIQUE indexes over one column-set) picks each UC BY name so the
+				// assertion is independent of the `uniqueConstraints` order.
+				const checks = shape.byIndex
+					? shape.byIndex.map(b => ({
+						uc: schema.uniqueConstraints!.find(u => u.derivedFromIndex === b.index)!,
+						expected: b.expected,
+						label: b.index,
+					}))
+					: [{ uc: schema.uniqueConstraints![0], expected: shape.expected!, label: 'uc[0]' }];
 
-				const helperNorm = helper.map(norm);
-				const viaIndexNorm = viaIndex.map(norm);
-				// The lock: the name-resolved helper and the column-set-resolved live
-				// index produce the same per-column enforcement collation.
-				expect(helperNorm, 'helper (by-name) vs live index (by-column-set) must agree')
-					.to.deep.equal(viaIndexNorm);
-				// Sanity floor: and they match the shape's intended distinction.
-				expect(helperNorm, 'shape exercises the intended collation').to.deep.equal(shape.expected);
+				for (const { uc, expected, label } of checks) {
+					expect(uc, `UNIQUE constraint under test (${label})`).to.not.be.undefined;
+
+					// The shared helper — resolves the index BY NAME (uc.derivedFromIndex).
+					const helper = uniqueEnforcementCollations(schema, uc);
+
+					// The memory #4 path — the live index findIndexForConstraint resolves.
+					const index = resolveLiveIndex(manager, schema, uc);
+					expect(index, `live enforcing MemoryIndex for the constraint (${label})`).to.not.be.undefined;
+					const viaIndex = viaLiveIndexCollations(index!, schema, uc);
+
+					expect(helper.length, `one collation per constrained column (${label})`).to.equal(uc.columns.length);
+					expect(viaIndex.length, `live path matches arity (${label})`).to.equal(uc.columns.length);
+
+					const helperNorm = helper.map(norm);
+					const viaIndexNorm = viaIndex.map(norm);
+					// The lock: the name-resolved helper and the live index findIndexForConstraint
+					// resolves produce the same per-column enforcement collation.
+					expect(helperNorm, `helper (by-name) vs live index must agree (${label})`)
+						.to.deep.equal(viaIndexNorm);
+					// Sanity floor: and they match the shape's intended distinction.
+					expect(helperNorm, `shape exercises the intended collation (${label})`).to.deep.equal(expected);
+				}
 			} finally {
 				await db.close();
 			}

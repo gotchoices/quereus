@@ -13,7 +13,10 @@
 -- covering MV; §10 exercises the index-derived shapes (finer/coarser/plain index)
 -- through a row-time covering MV, where the collation eligibility gate
 -- (`covering-mv-index-derived-unique-collation`) keeps an MV only when the index
--- collation is coarser-or-equal to the declared column collation per column.
+-- collation is coarser-or-equal to the declared column collation per column. §11
+-- covers two UNIQUE indexes over the SAME column-set with differing collations: each
+-- derived constraint enforces under ITS OWN index's collation in BOTH creation orders
+-- (`memory-multi-index-unique-collation-resolution`).
 
 -- ===================================
 -- 1. Table-level `unique (x)` over a NOCASE column — auto-index enforcement.
@@ -290,3 +293,52 @@ select count(*) as n from pgm;
 insert into pgm values (3, 'abd');
 select id, b from pgm order by id;
 → [{"id":1,"b":"Bob"},{"id":3,"b":"abd"}]
+
+-- ===================================
+-- 11. TWO UNIQUE indexes over the SAME column-set with DIFFERING collations. Each
+--     index-derived UNIQUE must enforce under ITS OWN index's collation, regardless
+--     of the order the indexes were created in. memory's findIndexForConstraint now
+--     resolves the enforcing index BY NAME (uc.derivedFromIndex), not the FIRST
+--     same-column-set index, so the coarser (NOCASE) UNIQUE rejects a case-variant
+--     duplicate in BOTH creation orders while the finer (BINARY) UNIQUE keeps
+--     genuine byte-distinct values apart. On main the BINARY-first order silently
+--     ADMITTED the NOCASE duplicate (the order-sensitive under-enforcement bug,
+--     memory-multi-index-unique-collation-resolution); store already rejected both.
+-- ===================================
+
+-- 11a. BINARY index created FIRST, then NOCASE. The NOCASE UNIQUE still catches a
+--      case-variant duplicate — index order no longer decides the enforcing collation.
+create table mbf (id integer primary key, b text collate NOCASE);
+create unique index mbf_binary on mbf (b collate BINARY);
+create unique index mbf_nocase on mbf (b collate NOCASE);
+insert into mbf values (1, 'Bob');
+
+-- 'bob' is BINARY-distinct from 'Bob' but NOCASE-equal → the NOCASE UNIQUE rejects it
+insert into mbf values (2, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from mbf;
+→ [{"n":1}]
+
+-- a genuinely distinct value (neither NOCASE- nor BINARY-equal) still inserts — the
+-- finer BINARY index keys byte-distinct values apart without raising a false conflict
+insert into mbf values (3, 'Carol');
+select id, b from mbf order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
+
+-- 11b. Reverse creation order: NOCASE FIRST, then BINARY. Same enforcement — the
+--      NOCASE UNIQUE rejects the case-variant regardless of index order.
+create table mnf (id integer primary key, b text collate NOCASE);
+create unique index mnf_nocase on mnf (b collate NOCASE);
+create unique index mnf_binary on mnf (b collate BINARY);
+insert into mnf values (1, 'Bob');
+
+insert into mnf values (2, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from mnf;
+→ [{"n":1}]
+
+insert into mnf values (3, 'Carol');
+select id, b from mnf order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
