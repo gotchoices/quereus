@@ -193,6 +193,15 @@ with d as (delete from star_t where id = 5 returning *)
 select id, name, value from d;
 → [{"id":5,"name":"e","value":50}]
 
+-- interaction: a multi-row INSERT ... RETURNING * emits one expanded row per
+-- inserted row (the star is the projection list; the executor supplies the rows).
+insert into star_t (id, name, value) values (10, 'j', 1), (11, 'k', 2) returning *;
+→ [{"id":10,"name":"j","value":1},{"id":11,"name":"k","value":2}]
+
+-- ...and a multi-row UPDATE ... RETURNING * emits one NEW image per updated row.
+update star_t set value = value + 100 where id in (10, 11) returning *;
+→ [{"id":10,"name":"j","value":101},{"id":11,"name":"k","value":102}]
+
 drop table star_t;
 
 -- ===================================
