@@ -3298,6 +3298,21 @@ with x as (select id, color from later), later as (select * from fwdr)
     update x set color='z' where id=1;
 -- error: Table 'later' not found
 
+-- v1 boundary (documented) — a USER-clause read of a LATER-defined sibling. The body re-plan and
+-- the user `set` subquery share ONE re-plan context (`contextForCteTarget`), which strips later
+-- siblings, so the `set` subquery's `from ysib` binds the REAL table `ysib` (v=42), NOT the later
+-- CTE `ysib` (which would give 999). Per strict SQL the user clause is main-query scope and SHOULD
+-- see the later CTE; v1 instead resolves a real same-named table (deterministic, never silently
+-- the wrong relation). This pins the v1 behavior — if the faithful split-context fix lands, flip it.
+create table ysib (id integer primary key, v integer);
+insert into ysib values (1,42);
+create table ucbase (id integer primary key, c integer);
+insert into ucbase values (1,0);
+with x as (select id, c from ucbase), ysib as (select id, 999 as v from ucbase)
+    update x set c = (select v from ysib where id=1) where id=1;
+select c from ucbase order by id;
+→ [{"c":42}]
+
 -- Reject parity — a non-updateable INTERMEDIATE rejects with its own body-shape reason
 -- ("not updateable in phase 1"), the SAME diagnostic class a single-level CTE of that shape
 -- raises. Aggregate intermediate:

@@ -99,9 +99,10 @@ export interface MutableViewLike {
 	 * `where`/`set`/`returning` and self-read the target, resolving against an eager
 	 * snapshot of the body; an inline subquery's alias does not (its predicate names the
 	 * real base table directly and already round-trips). The capture path also requires
-	 * the incoming planning context be target-EXCLUDED (`contextForCteTarget`), which only
-	 * the CTE-name dispatch applies — so the flag both selects the case and asserts that
-	 * precondition.
+	 * the incoming planning context be target-EXCLUDED — in fact narrowed to the target's
+	 * prior-sibling prefix (`contextForCteTarget`, a superset of target-exclusion), which
+	 * only the CTE-name dispatch applies — so the flag both selects the case and asserts
+	 * that precondition.
 	 */
 	readonly cteTarget?: boolean;
 }
