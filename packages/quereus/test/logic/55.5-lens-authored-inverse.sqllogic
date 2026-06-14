@@ -1185,3 +1185,68 @@ declare lens for buca_x over buca_b {
 
 apply schema buca_x;
 -- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 24. Multi-column commit-time UNIQUE mixing a bare-reconstructible column and a
+--     bijective authored column. unique(tag, grp): `tag` is a plain rename (bare,
+--     NEW.tag) and `grp` is the +10 affine bijection (authored, NEW.code + 10). No
+--     basis key over the put targets ⇒ commit-time. Exercises the per-column NEW-side
+--     synthesis: the count predicate must read `_u.tag = NEW.tag and _u.grp =
+--     NEW.code + 10` so a logical-domain tuple is compared to a logical-domain tuple.
+--     Distinct tuples land; a duplicate logical tuple ABORTs.
+-- ===================================
+
+declare schema bumix_b {
+	table Item (
+		id integer primary key,
+		tag text not null,
+		code integer not null check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema bumix_b;
+
+-- run
+
+declare logical schema bumix_x {
+	table Item (
+		id integer primary key,
+		tag text not null,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (tag, grp)
+	)
+}
+
+-- run
+
+declare lens for bumix_x over bumix_b {
+	view Item as select id, tag, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from bumix_b.Item
+}
+
+-- run
+
+apply schema bumix_x;
+
+-- run
+
+-- Commit-time (mixed bare + authored key): one no-backing-index, no unrealizable.
+select code, "constraint", status from quereus_lens_advisories('bumix_x') where code = 'lens.no-backing-index';
+→ [{"code": "lens.no-backing-index", "constraint": "unique", "status": "active"}]
+
+-- run
+
+-- Distinct logical tuples all land: (a,11), (a,12) differ in grp; (b,11) differs in tag.
+insert into bumix_x.Item values (1, 'a', 11), (2, 'a', 12), (3, 'b', 11);
+select id, tag, code from bumix_b.Item order by id;
+→ [{"id": 1, "tag": "a", "code": 1}, {"id": 2, "tag": "a", "code": 2}, {"id": 3, "tag": "b", "code": 1}]
+
+-- run
+
+-- A duplicate logical tuple (a, 11) → (tag a, code 1) ABORTs via the commit-time scan
+-- over the mixed NEW side (NEW.tag and NEW.code + 10).
+insert into bumix_x.Item values (4, 'a', 11);
+-- error: constraint
