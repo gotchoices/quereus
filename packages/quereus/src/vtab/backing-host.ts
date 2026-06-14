@@ -100,14 +100,19 @@
  * {@link BackingHost.requiresReplicableDerivations} is an **opt-in capability
  * declaration** consumed by the engine **only at create**: a host whose backing
  * replicates across peers (the future sync-store) sets it so the create-time MV
- * gate rejects any non-REPLICABLE function in the derivation body — a function
- * not asserted bit-identical across platforms/app-versions (see
- * {@link import('../schema/function.js').BaseFunctionSchema.replicable}). The
- * reference hosts (memory, store) leave it `undefined` ⇒ no requirement ⇒ zero
- * behavior change, so this class is inert by default. It is **not** escapable by
- * `pragma nondeterministic_schema` — that lifts the separate, weaker per-database
- * determinism gate; a replicating host's bit-identity requirement cannot be
- * locally waived without breaking convergence.
+ * gate rejects any non-REPLICABLE **function** OR **collation** in the derivation
+ * body — a function not asserted bit-identical across platforms/app-versions (see
+ * {@link import('../schema/function.js').BaseFunctionSchema.replicable}), or a
+ * custom collation whose sort/fold governs derived bytes (comparison / ORDER BY /
+ * GROUP BY / DISTINCT / backing key) without being declared `replicable: true`.
+ * Both surfaces can diverge derived bytes across peers' platforms, exactly the
+ * hazard this class prevents; built-in functions AND built-in collations
+ * (`BINARY`/`NOCASE`/`RTRIM`) auto-qualify. The reference hosts (memory, store)
+ * leave it `undefined` ⇒ no requirement ⇒ zero behavior change, so this class is
+ * inert by default. It is **not** escapable by `pragma nondeterministic_schema` —
+ * that lifts the separate, weaker per-database determinism gate; a replicating
+ * host's bit-identity requirement cannot be locally waived without breaking
+ * convergence.
  */
 
 import type { Row, SqlValue } from '../common/types.js';
@@ -235,14 +240,17 @@ export interface BackingHost {
 	 *  state layered over committed), in PK order, honoring `equalityPrefix`
 	 *  as a seek + early-terminate prefix range. */
 	scanEffective(conn: VirtualTableConnection, req: BackingScanRequest): AsyncIterable<Row>;
-	/** When true, the engine validates at create that every function in a
-	 *  materialized-view / derivation body hosted here is REPLICABLE (declared
-	 *  bit-identical across peers/platforms/app-versions — builtins auto-qualify).
-	 *  A host whose backing replicates (the sync-store) demands it so a
-	 *  platform-dependent UDF cannot diverge peers. Absent/false ⇒ no requirement
-	 *  (memory, store) ⇒ zero behavior change. NOT escapable by
-	 *  `pragma nondeterministic_schema` — that lifts the per-database determinism
-	 *  gate, a separate and weaker concern; a replicating host's bit-identity
-	 *  requirement cannot be locally waived without breaking convergence. */
+	/** When true, the engine validates at create that every function AND every
+	 *  collation in a materialized-view / derivation body hosted here is REPLICABLE
+	 *  (declared bit-identical across peers/platforms/app-versions — builtin
+	 *  functions and builtin collations `BINARY`/`NOCASE`/`RTRIM` auto-qualify). A
+	 *  host whose backing replicates (the sync-store) demands it so a
+	 *  platform-dependent UDF or custom collation cannot diverge peers. The collation
+	 *  check covers both the body's fold/order/key sites and the backing key's
+	 *  declared collations. Absent/false ⇒ no requirement (memory, store) ⇒ zero
+	 *  behavior change. NOT escapable by `pragma nondeterministic_schema` — that
+	 *  lifts the per-database determinism gate, a separate and weaker concern; a
+	 *  replicating host's bit-identity requirement cannot be locally waived without
+	 *  breaking convergence. */
 	readonly requiresReplicableDerivations?: boolean;
 }

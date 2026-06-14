@@ -113,10 +113,14 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private readonly watcherManager: WatcherManager;
 	/** Materialized-view schema-change staleness tracking */
 	private readonly materializedViewManager: MaterializedViewManager;
-	/** Per-database collation registry — comparator + optional key normalizer.
-	 *  The normalizer is required for index participation; comparator-only
-	 *  collations may still be used in ORDER BY but cannot back a compound index. */
-	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string }>();
+	/** Per-database collation registry — comparator + optional key normalizer +
+	 *  optional REPLICABLE assertion. The normalizer is required for index
+	 *  participation; comparator-only collations may still be used in ORDER BY but
+	 *  cannot back a compound index. `replicable` (stamped `true` on the built-ins,
+	 *  opt-in for a custom collation) is consulted only by the materialized-view
+	 *  replicable-collation gate when the backing host demands it
+	 *  (see {@link _isCollationReplicable}). */
+	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string; replicable?: boolean }>();
 
 	constructor() {
 		this.schemaManager = new SchemaManager(this);
@@ -354,10 +358,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal Registers default collation sequences */
 	private registerDefaultCollations(): void {
 		// Register the built-in collations into per-instance registry, paired
-		// with their key normalizers so they can back compound indexes.
-		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY });
-		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE });
-		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM  });
+		// with their key normalizers so they can back compound indexes. Stamped
+		// `replicable: true` — the built-ins are pure JS string operations (`<`/`>`,
+		// locale-independent `toLowerCase()`, ASCII-space trim), so they are
+		// bit-identical across peers' JS engines, exactly parallel to why built-in
+		// functions auto-qualify (see registerBuiltinFunctions). This is the single
+		// seam that *knows* a collation is a builtin.
+		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY, replicable: true });
+		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE, replicable: true });
+		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM,  replicable: true });
 		log("Default collations registered (BINARY, NOCASE, RTRIM)");
 	}
 
@@ -1159,10 +1168,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Registers a user-defined collation sequence.
 	 * @param name The name of the collation sequence (case-insensitive).
 	 * @param func The comparison function (a, b) => number (-1, 0, 1).
-	 * @param normalizer Optional key normalizer — a function whose output equality
-	 *   partitions strings into the same equivalence classes as `func` (modulo
-	 *   total ordering). Required to make this collation usable as the key for a
-	 *   compound index; ORDER BY / standalone comparisons work without it.
+	 * @param optionsOrNormalizer Either a bare key normalizer (the legacy positional
+	 *   form) or an options object `{ normalizer?, replicable? }`:
+	 *   - `normalizer` — a function whose output equality partitions strings into the
+	 *     same equivalence classes as `func` (modulo total ordering). Required to make
+	 *     this collation usable as the key for a compound index; ORDER BY / standalone
+	 *     comparisons work without it.
+	 *   - `replicable` — assert this collation is **bit-identical across peers,
+	 *     platforms, and app versions** (not merely deterministic). Consulted only by
+	 *     the materialized-view replicable-collation gate when a backing host declares
+	 *     `requiresReplicableDerivations`. Defaults to `false` — the conservative
+	 *     default for a custom collation (built-ins auto-qualify).
 	 * @example
 	 * // Example: Create a custom collation for phone numbers
 	 * db.registerCollation('PHONENUMBER', (a, b) => {
@@ -1172,17 +1188,37 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *   return numA < numB ? -1 : numA > numB ? 1 : 0;
 	 * }, (s) => s.replace(/\D/g, ''));
 	 *
+	 * // A locale-independent custom collation a replicating backing can host:
+	 * db.registerCollation('CODEPOINT', cmp, { replicable: true });
+	 *
 	 * // Then use it in SQL:
 	 * // SELECT * FROM contacts ORDER BY phone COLLATE PHONENUMBER;
 	 * // CREATE INDEX phone_idx ON contacts(phone COLLATE PHONENUMBER);
 	 */
-	registerCollation(name: string, func: CollationFunction, normalizer?: (s: string) => string): void {
+	registerCollation(
+		name: string,
+		func: CollationFunction,
+		optionsOrNormalizer?: ((s: string) => string) | { normalizer?: (s: string) => string; replicable?: boolean },
+	): void {
 		this.checkOpen();
 		if (typeof name !== 'string' || !name) {
 			throw new MisuseError('registerCollation: name must be a non-empty string');
 		}
 		if (typeof func !== 'function') {
 			throw new MisuseError('registerCollation: func must be a function');
+		}
+		// A function-typed third arg is the legacy normalizer-only path (existing call
+		// sites unchanged, `replicable` defaults to false); an object reads its fields;
+		// any other non-undefined third arg is a misused legacy normalizer.
+		let normalizer: ((s: string) => string) | undefined;
+		let replicable = false;
+		if (typeof optionsOrNormalizer === 'function') {
+			normalizer = optionsOrNormalizer;
+		} else if (typeof optionsOrNormalizer === 'object' && optionsOrNormalizer !== null) {
+			normalizer = optionsOrNormalizer.normalizer;
+			replicable = optionsOrNormalizer.replicable === true;
+		} else if (optionsOrNormalizer !== undefined) {
+			throw new MisuseError('registerCollation: normalizer must be a function when supplied');
 		}
 		if (normalizer !== undefined && typeof normalizer !== 'function') {
 			throw new MisuseError('registerCollation: normalizer must be a function when supplied');
@@ -1191,10 +1227,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (this.collations.has(upperName)) {
 			log('Overwriting existing collation: %s', upperName);
 		}
-		this.collations.set(upperName, normalizer !== undefined
-			? { comparator: func, normalizer }
-			: { comparator: func });
-		log('Registered collation: %s%s', upperName, normalizer !== undefined ? ' (with normalizer)' : '');
+		const entry: { comparator: CollationFunction; normalizer?: (s: string) => string; replicable?: boolean } = { comparator: func };
+		if (normalizer !== undefined) entry.normalizer = normalizer;
+		if (replicable) entry.replicable = true;
+		this.collations.set(upperName, entry);
+		log('Registered collation: %s%s%s', upperName,
+			normalizer !== undefined ? ' (with normalizer)' : '',
+			replicable ? ' (replicable)' : '');
 	}
 
 	/**
@@ -1283,6 +1322,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// happen for built-ins, but defends against external mutation) still
 		// resolves to the canonical built-in normalizer.
 		return BUILTIN_NORMALIZERS[upper];
+	}
+
+	/** @internal True iff the named collation is asserted REPLICABLE — bit-identical
+	 *  across peers/platforms/app-versions. Built-ins are stamped `replicable` at
+	 *  registration; a custom collation opts in with `replicable: true`. An unknown
+	 *  collation returns `false` defensively (an unknown collation in a derivation
+	 *  body errors earlier at create). Consumed only by the materialized-view
+	 *  replicable-collation gate when the backing host declares
+	 *  `requiresReplicableDerivations`. */
+	_isCollationReplicable(name: string): boolean {
+		return this.collations.get(name.toUpperCase())?.replicable === true;
 	}
 
 	public _queueDeferredConstraintRow(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, connectionId?: string, contextRow?: Row, contextDescriptor?: RowDescriptor): void {

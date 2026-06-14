@@ -83,11 +83,11 @@ import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import type { BackingHost, BackingRowChange, MaintenanceOp } from '../vtab/backing-host.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
-import { compareSqlValues, rowsValueIdentical } from '../util/comparison.js';
+import { compareSqlValues, rowsValueIdentical, normalizeCollationName } from '../util/comparison.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { FunctionSchema } from '../schema/function.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
-import { coveringMvHonorsIndexCollation } from '../schema/unique-enforcement.js';
+import { coveringMvHonorsIndexCollation, uniqueEnforcementCollations } from '../schema/unique-enforcement.js';
 import type { Database } from './database.js';
 import type { DatabaseEventEmitter, MaintenanceCollisionEvent } from './database-events.js';
 import type * as AST from '../parser/ast.js';
@@ -1442,19 +1442,24 @@ export class MaterializedViewManager {
 
 		// Replicable-determinism gate — host-conditional, inert by default. A backing host
 		// whose backing replicates across peers (the sync-store) sets
-		// `requiresReplicableDerivations` so a platform-dependent UDF cannot diverge peers.
-		// Checked here — after `analyzed`, before arm selection — so it applies regardless of
-		// which maintenance arm wins, over the SAME analyzed plan the determinism gate walks
-		// (nested calls, WHERE / GROUP BY / aggregate-arg / TVF-arg positions all reached). It
-		// sits NEXT TO, not in place of, the determinism gate: the two are orthogonal, so this
-		// is NOT lifted by `pragma nondeterministic_schema`. A memory/store host leaves the flag
-		// undefined ⇒ this block is skipped ⇒ zero behavior change. Idempotent (same body ⇒
-		// same verdict), so it is also desirable on re-register / catalog import: a tampered
-		// catalog cannot smuggle a non-replicable body past a demanding host.
+		// `requiresReplicableDerivations` so a platform-dependent UDF or collation cannot
+		// diverge peers. Checked here — after `analyzed`, before arm selection — so it applies
+		// regardless of which maintenance arm wins, over the SAME analyzed plan the determinism
+		// gate walks (nested calls, WHERE / GROUP BY / aggregate-arg / TVF-arg positions all
+		// reached). It sits NEXT TO, not in place of, the determinism gate: the two are
+		// orthogonal, so this is NOT lifted by `pragma nondeterministic_schema`. A memory/store
+		// host leaves the flag undefined ⇒ this block is skipped ⇒ zero behavior change.
+		// Idempotent (same body ⇒ same verdict), so it is also desirable on re-register /
+		// catalog import: a tampered catalog cannot smuggle a non-replicable body past a
+		// demanding host. Two gates of the same shape: a non-replicable FUNCTION (which the
+		// body walk's function-bearing nodes carry) and a non-replicable COLLATION (which rides
+		// each scalar node's resolved type plus the backing key's declared collations).
 		const host = this.backingHost(mv);
 		if (host.requiresReplicableDerivations) {
-			const offending = findNonReplicableFunction(analyzed);
-			if (offending) throw nonReplicableDerivationError(mv.name, offending);
+			const offendingFn = findNonReplicableFunction(analyzed);
+			if (offendingFn) throw nonReplicableDerivationError(mv.name, offendingFn);
+			const offendingCollation = findNonReplicableCollation(analyzed, mv, db);
+			if (offendingCollation) throw nonReplicableCollationDerivationError(mv.name, offendingCollation);
 		}
 
 		// Try a bounded-delta arm; a shape that fits none falls through to the floor.
@@ -3213,6 +3218,82 @@ function findNonReplicableFunction(node: PlanNode): string | undefined {
 	return undefined;
 }
 
+/** The built-in collation names. These are pure JS string operations (`<`/`>`,
+ *  locale-independent `toLowerCase()`, ASCII-space trim), so they are bit-identical
+ *  across peers' JS engines and auto-qualify as REPLICABLE — exactly parallel to why
+ *  built-in functions do. A custom collation must opt in with `replicable: true` at
+ *  registration. Short-circuiting on name (regardless of `collationSource`) keeps the
+ *  walk free of rank reasoning: a `default` BINARY and an `explicit` NOCASE both pass;
+ *  only a custom name is ever subjected to `_isCollationReplicable`. */
+const BUILTIN_COLLATION_NAMES: ReadonlySet<string> = new Set(['BINARY', 'NOCASE', 'RTRIM']);
+
+/** True when `collation` is a non-builtin name the database does not assert REPLICABLE.
+ *  `undefined`/builtin/replicable ⇒ not offending. */
+function collationIsOffending(collation: string | undefined, db: Database): boolean {
+	if (collation === undefined) return false;
+	const norm = normalizeCollationName(collation);
+	if (BUILTIN_COLLATION_NAMES.has(norm)) return false;
+	return !db._isCollationReplicable(norm);
+}
+
+/**
+ * The collation analogue of {@link findNonReplicableFunction}: return the NAME of the
+ * first collation that governs derived bytes and is neither built-in nor declared
+ * REPLICABLE, or `undefined` when every collation qualifies. Two sources, soundness-first
+ * (any non-builtin non-replicable collation anywhere rejects — see the soundness note in
+ * `replicable-collation-class`):
+ *
+ *  1. **Body scalars** — every fold/order/key site (explicit `COLLATE`, a declared/default
+ *     column collation, a comparison's effective collation, ORDER BY / GROUP BY / DISTINCT
+ *     keys) resolves through some scalar node whose `getType().collationName` carries the
+ *     name. One `getChildren()` walk reading that field uniformly reaches them all, including
+ *     nested COLLATE, subquery/CTE/set-op legs, and MV-over-MV bodies (whose source columns
+ *     carry the producing backing's published collation).
+ *  2. **Backing key** — a custom collation can govern the backing key MERGE without appearing
+ *     on any body scalar type (a maintained table declared with an explicit
+ *     `UNIQUE (… COLLATE custom)` or PK collation the SELECT body never names). The body walk
+ *     alone would miss it, so the maintained table's own PK column collations + declared
+ *     secondary UNIQUE per-column enforcement collations (resolving an index-derived override
+ *     via {@link uniqueEnforcementCollations}) are checked directly — the robust closure.
+ *
+ * Consumed only when the backing host declares `requiresReplicableDerivations`.
+ */
+function findNonReplicableCollation(node: PlanNode, mv: MaintainedTableSchema, db: Database): string | undefined {
+	const bodyOffender = findNonReplicableBodyCollation(node, db);
+	if (bodyOffender !== undefined) return bodyOffender;
+	return findNonReplicableKeyCollation(mv, db);
+}
+
+/** Source 1: walk the plan; first scalar node whose resolved `collationName` is a
+ *  non-builtin non-replicable collation. Mirrors {@link findNonReplicableFunction}'s
+ *  recursion so every body position is reached. */
+function findNonReplicableBodyCollation(node: PlanNode, db: Database): string | undefined {
+	if (isScalarNode(node)) {
+		const collation = (node as ScalarPlanNode).getType().collationName;
+		if (collationIsOffending(collation, db)) return normalizeCollationName(collation!);
+	}
+	for (const child of node.getChildren()) {
+		const found = findNonReplicableBodyCollation(child as unknown as PlanNode, db);
+		if (found !== undefined) return found;
+	}
+	return undefined;
+}
+
+/** Source 2: the maintained table's backing-key collations — PK column collations and
+ *  declared secondary UNIQUE per-column enforcement collations. First non-builtin
+ *  non-replicable name returns. */
+function findNonReplicableKeyCollation(mv: MaintainedTableSchema, db: Database): string | undefined {
+	for (const pk of mv.primaryKeyDefinition) {
+		if (collationIsOffending(pk.collation, db)) return normalizeCollationName(pk.collation!);
+	}
+	for (const uc of mv.uniqueConstraints ?? []) {
+		for (const collation of uniqueEnforcementCollations(mv, uc)) {
+			if (collationIsOffending(collation, db)) return normalizeCollationName(collation!);
+		}
+	}
+	return undefined;
+}
+
 /** Canonical, order-stable, bigint-safe string for a key tuple — used to dedup the
  *  distinct affected backing keys of a single change in the residual-recompute arm. */
 function canonKeyValues(values: readonly SqlValue[]): string {
@@ -3478,6 +3559,25 @@ function nonReplicableDerivationError(mvName: string, fnName: string): QuereusEr
 			+ `function '${fnName}'. This host requires every function in the body to be bit-identical across `
 			+ `peers/platforms; declare the function \`replicable: true\` at registration (built-in functions `
 			+ `qualify automatically)`,
+		StatusCode.UNSUPPORTED,
+	);
+}
+
+/**
+ * The diagnostic for the create-time **replicable-collation** reject — the collation
+ * analogue of {@link nonReplicableDerivationError}. The body is fine; it just folds or
+ * orders (comparison / ORDER BY / GROUP BY / DISTINCT / backing key) under a collation the
+ * backing host requires be bit-identical across peers — so this does NOT steer to a plain
+ * view. It names the collation and steers to declaring it `replicable: true` at registration
+ * (built-in collations qualify automatically). Fires only when the resolved backing host
+ * declares `requiresReplicableDerivations`. `StatusCode.UNSUPPORTED`.
+ */
+function nonReplicableCollationDerivationError(mvName: string, collationName: string): QuereusError {
+	return new QuereusError(
+		`materialized view '${mvName}' cannot be materialized on this backing host: it folds or orders under `
+			+ `non-replicable collation '${collationName}'. This host requires every collation in the body to be `
+			+ `bit-identical across peers/platforms; declare the collation \`replicable: true\` at registration `
+			+ `(built-in collations qualify automatically)`,
 		StatusCode.UNSUPPORTED,
 	);
 }

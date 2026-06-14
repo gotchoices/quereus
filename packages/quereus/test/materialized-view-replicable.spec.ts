@@ -51,9 +51,13 @@ describe('Materialized view replicable-determinism gate', () => {
 		// A non-replicable but DETERMINISTIC scalar UDF — deterministic so the determinism
 		// gate passes and the *replicable* gate is the one that bites (the two are orthogonal).
 		db.createScalarFunction('nonrepl', { numArgs: 1, deterministic: true }, (x) => Number(x) + 1);
+		// A non-replicable custom collation (opt-in defaults to false), for the collation gate.
+		// A comparator-only collation suffices — the replicable flag is independent of the
+		// (absent) normalizer, and the gate flags it whenever it governs the body.
+		db.registerCollation('MYLOCALE', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
 		await db.exec(`
-			create table t (id integer primary key, k integer, v integer);
-			insert into t values (1, 10, 100), (2, 20, 200);
+			create table t (id integer primary key, k integer, v integer, c text);
+			insert into t values (1, 10, 100, 'alpha'), (2, 20, 200, 'beta');
 		`);
 	});
 	afterEach(async () => { await db.close(); });
@@ -72,6 +76,16 @@ describe('Materialized view replicable-determinism gate', () => {
 		expect(err.message).to.contain('cannot be materialized');
 		expect(err.message).to.contain(mvName);
 		expect(err.message).to.contain(fnName);
+		expect(err.message).to.contain('replicable');
+		expect(db.schemaManager.getMaintainedTable('main', mvName), `${mvName} must not register`).to.be.undefined;
+	}
+
+	/** Assert the create rejected for the replicable-COLLATION reason, naming the collation. */
+	function expectReplicableCollationReject(err: Error, collationName: string, mvName: string): void {
+		expect(err.message).to.contain('cannot be materialized');
+		expect(err.message).to.contain(mvName);
+		expect(err.message).to.contain(collationName);
+		expect(err.message).to.contain('collation');
 		expect(err.message).to.contain('replicable');
 		expect(db.schemaManager.getMaintainedTable('main', mvName), `${mvName} must not register`).to.be.undefined;
 	}
@@ -195,5 +209,97 @@ describe('Materialized view replicable-determinism gate', () => {
 		));
 		await db.exec('create materialized view m_direct using repl as select id, direct_repl(v) as nv from t;');
 		expect(db.schemaManager.getMaintainedTable('main', 'm_direct'), 'direct-schema replicable body registers').to.not.be.undefined;
+	});
+
+	/**
+	 * The REPLICABLE collation class (ticket `replicable-collation-class`). A second gate of
+	 * the same shape under the SAME host capability: a custom collation whose sort/fold governs
+	 * derived bytes (comparison / ORDER BY / GROUP BY / DISTINCT / backing key) can diverge
+	 * derived bytes across peers' platforms, so on a demanding host every collation in the body
+	 * must be built-in or declared `replicable: true`. The collation name rides each scalar
+	 * node's resolved type (source 1, the body walk) plus the maintained table's declared
+	 * backing-key collations (source 2, the closure). Built-ins (`BINARY`/`NOCASE`/`RTRIM`)
+	 * auto-qualify; orthogonal to the determinism gate.
+	 */
+	describe('replicable-collation gate', () => {
+		it('rejects a non-replicable custom collation in ORDER BY', async () => {
+			const err = await captureError('create materialized view m_ord using repl as select id, c from t order by c collate MYLOCALE;');
+			expectReplicableCollationReject(err, 'MYLOCALE', 'm_ord');
+		});
+
+		it('rejects a non-replicable custom collation in a WHERE comparison', async () => {
+			const err = await captureError("create materialized view m_where using repl as select id, c from t where c collate MYLOCALE = 'alpha';");
+			expectReplicableCollationReject(err, 'MYLOCALE', 'm_where');
+		});
+
+		it('rejects a non-replicable custom collation on a column projected into the body', async () => {
+			// A bare COLLATE projection (the deliberately conservative over-reject — the value
+			// is byte-copied, but the gate biases hard toward soundness: any non-builtin
+			// collation name on any body scalar rejects).
+			const err = await captureError('create materialized view m_proj using repl as select id, c collate MYLOCALE as ck from t;');
+			expectReplicableCollationReject(err, 'MYLOCALE', 'm_proj');
+		});
+
+		it('rejects a non-replicable custom collation in a GROUP BY key', async () => {
+			const err = await captureError('create materialized view m_grp using repl as select c collate MYLOCALE as g, count(*) as n from t group by c collate MYLOCALE;');
+			expectReplicableCollationReject(err, 'MYLOCALE', 'm_grp');
+		});
+
+		it('accepts the same body once the collation is declared replicable', async () => {
+			// Re-register MYLOCALE replicable: true (overwrites the beforeEach non-replicable
+			// entry) — the demanding host then accepts the body the ORDER BY case rejected.
+			db.registerCollation('MYLOCALE', (a, b) => (a < b ? -1 : a > b ? 1 : 0), { replicable: true });
+			await db.exec('create materialized view m_ord_ok using repl as select id, c from t order by c collate MYLOCALE;');
+			expect(db.schemaManager.getMaintainedTable('main', 'm_ord_ok'), 'replicable-collation body registers').to.not.be.undefined;
+		});
+
+		it('accepts a built-in collation (NOCASE auto-qualifies)', async () => {
+			await db.exec("create materialized view m_nocase using repl as select id, c from t where c collate NOCASE = 'alpha';");
+			expect(db.schemaManager.getMaintainedTable('main', 'm_nocase'), 'builtin-collation body registers').to.not.be.undefined;
+		});
+
+		it('is inert on a non-demanding host: a custom-collation body creates `using memory`', async () => {
+			// The load-bearing zero-behavior-change property for collations: memory declares no
+			// requirement, so a custom collation in the body is untouched.
+			await db.exec('create materialized view m_mem_coll using memory as select id, c from t order by c collate MYLOCALE;');
+			expect(db.schemaManager.getMaintainedTable('main', 'm_mem_coll'), 'inert host accepts a custom-collation body').to.not.be.undefined;
+		});
+
+		it('rejects a backing-key collation the SELECT body never names (the second source)', async () => {
+			// A maintained table whose backing key folds under a custom collation declared on a
+			// secondary UNIQUE index — the body `select id, code from src` carries no MYLOCALE,
+			// so ONLY the backing-key source can catch this (the body walk alone would miss it).
+			await db.exec(`
+				create table src (id integer primary key, code text);
+				insert into src values (1, 'alpha');
+				create table mt_key (id integer primary key, code text) using repl;
+				create unique index mt_key_ix on mt_key (code collate MYLOCALE);
+			`);
+			const err = await captureError('alter table mt_key set maintained as select id, code from src;');
+			expect(err.message).to.contain('MYLOCALE');
+			expect(err.message).to.contain('collation');
+			expect(err.message).to.contain('replicable');
+			expect(db.schemaManager.getMaintainedTable('main', 'mt_key'), 'mt_key must not attach as maintained').to.be.undefined;
+		});
+
+		it('accepts a built-in backing-key collation (second-source NOCASE auto-qualifies)', async () => {
+			// The negative control for the second source: a NOCASE secondary UNIQUE index
+			// attaches fine, proving the reject above is the custom collation, not the index.
+			await db.exec(`
+				create table src2 (id integer primary key, code text);
+				insert into src2 values (1, 'alpha');
+				create table mt_key2 (id integer primary key, code text) using repl;
+				create unique index mt_key2_ix on mt_key2 (code collate NOCASE);
+				alter table mt_key2 set maintained as select id, code from src2;
+			`);
+			expect(db.schemaManager.getMaintainedTable('main', 'mt_key2'), 'builtin backing-key collation attaches').to.not.be.undefined;
+		});
+
+		it('does NOT lift the collation gate via `pragma nondeterministic_schema`', async () => {
+			// The collation class is orthogonal to (and not waivable by) the determinism gate.
+			await db.exec('pragma nondeterministic_schema = true;');
+			const err = await captureError('create materialized view m_coll_pragma using repl as select id, c from t order by c collate MYLOCALE;');
+			expectReplicableCollationReject(err, 'MYLOCALE', 'm_coll_pragma');
+		});
 	});
 });
