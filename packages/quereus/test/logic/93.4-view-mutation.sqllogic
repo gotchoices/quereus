@@ -3849,3 +3849,104 @@ insert into isq_agg2 values (1,1,10),(2,1,20);
 with a as (select g, sum(v) as s from isq_agg2 group by g)
     update (select g, s from a) as v set s=0 where v.g=1;
 -- error: is not updateable in phase 1
+
+-- ===================================
+-- `with defaults (…)` × CTE-name / inline-subquery DML write targets. The omitted-insert
+-- defaults clause lives on the body select (`SelectStmt.defaults`), so it rides for free
+-- onto a derived write target — no engine code beyond the clause-rehome + the write-target
+-- dispatch. Reachability matrix: it is ACTIVE on a CTE-name INSERT target (omitted columns
+-- fill through the ephemeral substrate, exactly as for a named view) and INERT on an inline
+-- subquery target (the only inline writes are UPDATE/DELETE, which never consult defaults;
+-- inline-subquery INSERT is rejected — so the CTE name is the only derived target that fires
+-- defaults). A body-shape reject (aggregate / set-op / SELECT-source-needing-append) fires
+-- regardless of the clause — `with defaults` never rescues a non-updateable body.
+-- See docs/view-updateability.md § View defaults.
+-- ===================================
+
+-- (1) CTE-name INSERT: an omitted column is filled by the body's `with defaults` through the
+-- ephemeral substrate — the headline omitted-fires case (parity with the view df2_v case).
+create table p1 (id integer primary key, color text, created integer);
+with t as (select id, color from p1 with defaults (created = 111))
+    insert into t (id, color) values (1, 'red');
+select * from p1 order by id;
+→ [{"id":1,"color":"red","created":111}]
+
+-- (2) CTE-name INSERT: a supplied value wins over the default (no contradiction).
+create table p2 (id integer primary key, created integer);
+with t as (select id, created from p2 with defaults (created = 111))
+    insert into t (id, created) values (1, 999);
+select * from p2 order by id;
+→ [{"id":1,"created":999}]
+
+-- (3) CTE-name INSERT: the defaulted column is PROJECTED AWAY by the CTE body (it has no slot
+-- in the body's output) — the default still fills the base column (parity with df2_v / df3_v).
+create table p3 (id integer primary key, created integer);
+with t as (select id from p3 with defaults (created = 222))
+    insert into t (id) values (1);
+select * from p3 order by id;
+→ [{"id":1,"created":222}]
+
+-- (4) Typo in a `with defaults` column name → sited write error. This is the proof the clause
+-- is ACTUALLY consumed through the ephemeral path (not silently dropped): a typo must fail loud.
+create table p4 (id integer primary key, created integer);
+with t as (select id from p4 with defaults (nope = 1))
+    insert into t (id) values (1);
+-- error: not a column
+
+-- (5) Inline-subquery UPDATE carrying `with defaults` on its body → clause INERT. UPDATE never
+-- consults defaults, so the row's untouched `created` keeps its value (5), only `color` changes.
+create table p5 (id integer primary key, color text, created integer);
+insert into p5 values (1,'red',5);
+update (select id, color from p5 with defaults (created = 999)) as v set color='x' where v.id=1;
+select * from p5 order by id;
+→ [{"id":1,"color":"x","created":5}]
+
+-- (6) Multi-level CTE chain: the inner CTE's defaults and the consumer's defaults MERGE through
+-- the flattener (`mergeDefaults`, cte-flatten.ts), CONSUMER WINNING on a column collision —
+-- `a` survives from the inner clause but is overridden to 10 by the consumer; `b` rides from inner.
+create table p6 (id integer primary key, a integer, b integer);
+with inner1 as (select id from p6 with defaults (a = 1, b = 2)),
+     t as (select id from inner1 with defaults (a = 10))
+    insert into t (id) values (1);
+select * from p6 order by id;
+→ [{"id":1,"a":10,"b":2}]
+
+-- (7) Aggregate CTE body carrying defaults → still a body-shape reject. The clause is appended
+-- AFTER the body is proven decomposable, so an unupdatable body rejects with the same diagnostic
+-- it raises without the clause — reject parity, not a defaults bypass.
+create table p7 (id integer primary key, g integer, v integer);
+insert into p7 values (1,1,10);
+with t as (select g, sum(v) as s from p7 group by g with defaults (g = 9))
+    insert into t (g) values (2);
+-- error: is not updateable in phase 1
+
+-- (8) Inline-subquery INSERT is still rejected even with a `with defaults` body — `insert into (`
+-- falls through to the unchanged "Expected table name" parse error (no inline-INSERT path exists).
+create table p8 (id integer primary key, created integer);
+insert into (select id from p8 with defaults (created = 1)) values (1);
+-- error: Expected table name
+
+-- (A) Compound (set-op) CTE body carrying defaults → set-op body-shape reject (clause inert here).
+create table q1 (id integer primary key, created integer);
+insert into q1 values (1,5);
+with t as (select id from q1 union select id from q1 with defaults (created = 9))
+    insert into t (id) values (2);
+-- error: phase 1
+
+-- (B) CTE INSERT with a SELECT source while a default MUST be appended → VALUES-source reject.
+-- The appended-defaults rewrite is VALUES-only (single-source.ts), parity with the view.
+create table q2 (id integer primary key, created integer);
+create table q2src (id integer primary key);
+insert into q2src values (7);
+with t as (select id from q2 with defaults (created = 111))
+    insert into t (id) select id from q2src;
+-- error: VALUES source
+
+-- (C) CTE INSERT, SELECT source, but EVERY column supplied (no default needs appending) → works.
+create table q3 (id integer primary key, created integer);
+create table q3src (id integer primary key, c integer);
+insert into q3src values (7, 70);
+with t as (select id, created from q3 with defaults (created = 111))
+    insert into t (id, created) select id, c from q3src;
+select * from q3 order by id;
+→ [{"id":7,"created":70}]
