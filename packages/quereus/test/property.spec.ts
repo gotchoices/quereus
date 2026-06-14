@@ -5043,7 +5043,8 @@ describe('Property-Based Tests', () => {
 		});
 
 		// ----- Computed deploy-time round-trip predicate (the lens prover's seam) -----
-		// The lens prover's `proveRoundTrip` (schema/lens-prover.ts) computes the
+		// The lens prover's round-trip seam (`analyzeRoundTrip` / `emitRoundTrip` in
+		// schema/lens-prover.ts) computes the
 		// GetPut/PutGet verdict per column off `viewComplement`. The PRIMARY correctness
 		// gate is that its per-column verdict AGREES with the operational law: a column
 		// the operational law accepts a write to is writable-and-faithful under the

@@ -23,7 +23,7 @@ import type * as AST from '../../parser/ast.js';
  * computed (GetPut ⇔ `put` leaves the complement fixed; PutGet ⇔ `get ∘ put`
  * reproduces the written image) rather than an enumerated checklist. The prover
  * (`schema/lens-prover.ts`) is the intended consumer; it rides its
- * `proveRoundTrip` seam onto this accessor.
+ * `analyzeRoundTrip` / `emitRoundTrip` seam onto this accessor.
  */
 export interface ViewComplement {
 	readonly hiddenColumns: ReadonlyArray<{ readonly table: number; readonly column: string }>;

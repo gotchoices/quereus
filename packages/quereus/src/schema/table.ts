@@ -788,9 +788,9 @@ export function resolvePkDefaultConflict(schema: TableSchema): ConflictResolutio
  *
  * The single in-package source for "do these columns form a declared whole-table
  * key": the lens decomposition compiler's 1:1-stitch guard
- * (`lens-compiler.ts indicesFormDeclaredUnique`) and the prover's
- * bijection-transport key proof (`lens-prover.ts`) both consume it, so the two
- * agree on what counts as a basis key.
+ * (`lens-compiler.ts validatePrimaryAdvertisement`) and the prover's
+ * bijection-transport key proof (`lens-prover.ts proveKeyByBijectionTransport`)
+ * both consume it, so the two agree on what counts as a basis key.
  */
 export function columnsFormDeclaredKey(table: TableSchema, indices: readonly number[]): boolean {
 	const want = new Set(indices);

@@ -2186,7 +2186,7 @@ describe('lens decomposition put: stitch-key uniqueness guard', () => {
 	it('reject: a partial UNIQUE on the stitch column does not satisfy the guard', async () => {
 		// `id` carries only a *partial* unique (`create unique index … where`), whose
 		// `predicate !== undefined` — it guarantees uniqueness only within its scope and
-		// cannot back an unqualified `on conflict (id)`. `indicesFormDeclaredUnique` skips
+		// cannot back an unqualified `on conflict (id)`. `columnsFormDeclaredKey` skips
 		// it, so the stitch key still resolves to no whole-table key → rejected. (Reuses
 		// the columnar shape: stitch `id` on U_c, whose PK is the unrelated `rid`.)
 		const db = new Database();

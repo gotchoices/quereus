@@ -638,6 +638,34 @@ describe('lens prover: bijective authored PK (key-reconstructible by proven bije
 			await db.close();
 		}
 	});
+
+	it('COMPOSITE PK — a bare column + a bijective-authored column over a declared basis composite key is proved by transport', async () => {
+		const db = new Database();
+		try {
+			// Composite logical PK (region, grp): `region` is a bare passthrough, `grp` is a
+			// proven-bijective authored inverse (upper/lower over {a,b}). Each key column maps
+			// injectively to its basis column (region→region, grp→code), and {region, code} is
+			// exactly the declared basis composite PK — so the product map is injective and the
+			// logical key transports onto the basis key ⇒ proved. Exercises the product-of-
+			// injections path and `columnsFormDeclaredKey` over a multi-column set (the single-
+			// column scenarios above never do).
+			await db.exec("declare schema y { table Item (region text not null check (region in ('n','s')), code text not null check (code in ('a','b')), note text, primary key (region, code)) }");
+			await db.exec('apply schema y');
+			await db.exec("declare logical schema x { table Item (region text not null check (region in ('n','s')), grp text not null check (grp in ('A','B')), note text, primary key (region, grp)) }");
+			await db.exec('declare lens for x over y { view Item as select region, upper(code) as grp with inverse (code = lower(new.grp)), note from y.Item }');
+			await db.exec('apply schema x');
+
+			const s = slot(db, 'Item');
+			expect(s.readOnly ?? false, 'composite bijective-transport PK ⇒ writable').to.equal(false);
+			const pk = findObligation(s, 'primaryKey');
+			expect(pk.kind, 'composite PK proved by bijection transport onto the basis composite key').to.equal('proved');
+			expect(warningCodes(db), 'reconstructible').to.not.include('lens.pk-not-reconstructible');
+			expect(warningCodes(db), 'proved ⇒ no commit-time advisory').to.not.include('lens.no-backing-index');
+			expect(warningCodes(db), 'bijection suppresses lossy').to.not.include('lens.getput-lossy');
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens prover: advisories', () => {
