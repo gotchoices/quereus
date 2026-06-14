@@ -349,15 +349,19 @@ function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnaly
 }
 
 /**
- * A planning context whose `cteNodes` resolves `__vmupd_keys` to a freshly-minted
+ * A planning context whose `cteNodes` resolves the capture's relation name (the
+ * shared `__vmupd_keys` default, or a nested capture's fresh name) to a freshly-minted
  * context-backed key relation (over the shared capture descriptor), so a multi-side
- * base op's `select k<side> from __vmupd_keys` identifying subquery reads the
- * materialized capture rows. A fresh ref per call keeps each base op's subtree from
- * sharing a node instance.
+ * base op's `select k<side> from <relationName>` identifying subquery reads the
+ * materialized capture rows. The injected ref's own name is pinned to the SAME
+ * `relationName` so the map key and the ref agree (a nested capture injects under its
+ * fresh name while shadowing nothing under the default). A fresh ref per call keeps each
+ * base op's subtree from sharing a node instance.
  */
 function withKeyCapture(ctx: PlanningContext, capture: MultiSourceKeyCapture): PlanningContext {
 	const cteNodes = new Map(ctx.cteNodes ?? []);
-	cteNodes.set(MS_UPDATE_KEYS_CTE, makeMultiSourceKeyRef(ctx.scope, capture));
+	const relationName = capture.relationName ?? MS_UPDATE_KEYS_CTE;
+	cteNodes.set(relationName, makeMultiSourceKeyRef(ctx.scope, capture, relationName));
 	return { ...ctx, cteNodes };
 }
 

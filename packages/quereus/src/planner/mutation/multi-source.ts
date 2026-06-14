@@ -1341,7 +1341,7 @@ export interface CrossSourceValue {
 	readonly expr: AST.Expression;
 }
 
-export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, sourceValues?: CrossSourceValue[]): BaseOp[] {
+export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.UpdateStmt, sourceValues?: CrossSourceValue[], captureRelationName: string = MS_UPDATE_KEYS_CTE): BaseOp[] {
 	// RETURNING through a multi-source update is supported, but the rows are not
 	// recoverable from the per-side base ops (the view row spans both tables), so
 	// the builder (`view-mutation-builder.ts`) supplies them via a re-query of the
@@ -1520,7 +1520,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 			// existing partner, that partner's PK matches all N capture rows, so a bare scalar
 			// read would error `Scalar subquery returned more than one row` — `min` collapses
 			// the shared-partner group to one value (a no-op for a constant / np-only SET).
-			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min', SELF_ALIAS) });
+			perSide[out.sideIndex].push({ column: out.baseColumn, value: capturedValueSubquery(valAlias, out.sideIndex, requireKeyColumns(view, npSide), 'min', SELF_ALIAS, captureRelationName) });
 			// Null-extended rows: accumulate the (column, captured value) for this side's
 			// single materialization insert, built after the loop.
 			let list = nullExtendedBySide.get(out.sideIndex);
@@ -1671,7 +1671,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		const assignments = perSide[sideIndex];
 		if (assignments.length === 0) continue;
 		const side = analysis.sides[sideIndex];
-		const where = buildCapturedKeyPredicate(view, side, sideIndex);
+		const where = buildCapturedKeyPredicate(view, side, sideIndex, captureRelationName);
 		const statement: AST.UpdateStmt = {
 			type: 'update',
 			table: tableIdentifier(side.schema),
@@ -1695,7 +1695,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// matched UPDATE for the same side was already emitted by the per-side loop above (its
 	// tag-allowance enforced there), so this only adds the create branch. § Outer Joins.
 	for (const [sideIndex, cols] of nullExtendedBySide) {
-		ops.push(buildNullExtendedInsert(ctx, view, analysis, sideIndex, cols, registerCapturedExpr!, stmt));
+		ops.push(buildNullExtendedInsert(ctx, view, analysis, sideIndex, cols, registerCapturedExpr!, stmt, captureRelationName));
 	}
 
 	// Existence-flip deletes (§ Existence columns): `set hasB = false` removes the matched
@@ -1704,7 +1704,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 	// untouched, so a deleted row reads back null-extended (`hasB` now false).
 	for (const sideIndex of existenceDeleteSides) {
 		const side = analysis.sides[sideIndex];
-		const where = buildCapturedKeyPredicate(view, side, sideIndex);
+		const where = buildCapturedKeyPredicate(view, side, sideIndex, captureRelationName);
 		const statement: AST.DeleteStmt = {
 			type: 'delete',
 			table: tableIdentifier(side.schema),
@@ -1754,6 +1754,7 @@ function buildNullExtendedInsert(
 	cols: ReadonlyArray<{ baseColumn: string; valAlias: string }>,
 	registerCapturedExpr: (key: string, expr: AST.Expression) => string,
 	stmt: AST.UpdateStmt,
+	captureRelationName: string = MS_UPDATE_KEYS_CTE,
 ): BaseOp {
 	const npSide = analysis.sides[npSideIndex];
 	const { npJoinColumn, preservedExpr } = outerJoinInsertKey(view, analysis, npSideIndex);
@@ -1792,7 +1793,7 @@ function buildNullExtendedInsert(
 	const select: AST.SelectStmt = {
 		type: 'select',
 		columns: projections,
-		from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
+		from: [{ type: 'table', table: { type: 'identifier', name: captureRelationName }, alias: 'k' }],
 		where,
 		groupBy: [{ type: 'column', name: jkAlias, table: 'k' }],
 	};
@@ -1913,7 +1914,7 @@ function preservedSideIndices(sides: readonly JoinSide[]): number[] {
  * the join body. (EXISTS — not a row-value `IN` — to reuse the UPDATE RETURNING
  * re-query's correlation shape; one pattern.)
  */
-function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIndex: number): AST.Expression {
+function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIndex: number, captureRelationName: string = MS_UPDATE_KEYS_CTE): AST.Expression {
 	const keyCols = requireKeyColumns(view, side);
 	const conds = keyCols.map((pkCol, j): AST.Expression => ({
 		type: 'binary',
@@ -1926,7 +1927,7 @@ function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIn
 		subquery: {
 			type: 'select',
 			columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
-			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
+			from: [{ type: 'table', table: { type: 'identifier', name: captureRelationName }, alias: 'k' }],
 			where: conds.reduce((acc, c) => combineAnd(acc, c)!),
 		},
 	};
@@ -1947,11 +1948,19 @@ function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIn
  *    and every {@link InternalRecursiveCTERefNode} that reads them back.
  *  - `keyColumns`: the flattened `k<side>_<j>` column shape (one entry per requested
  *    side per PK column) each reader mints a key ref over.
+ *  - `relationName`: the AST relation name this capture is injected under in `cteNodes`
+ *    (and that every base-op predicate reads back via `from <relationName> k`). Absent ⇒
+ *    {@link MS_UPDATE_KEYS_CTE} — the standalone multi-source / decomposition / set-op /
+ *    CTE-self-read paths all use the shared default. A **nested** capture mints a fresh
+ *    name so two captures can coexist by name in one lowered statement
+ *    (`set-op-write-multisource-leg-compose`): the inner per-branch capture's readers and
+ *    its injected ref agree on the fresh name while shadowing nothing under the default.
  */
 export interface MultiSourceKeyCapture {
 	readonly source: RelationalPlanNode;
 	readonly descriptor: TableDescriptor;
 	readonly keyColumns: readonly { readonly name: string; readonly type: ScalarType }[];
+	readonly relationName?: string;
 }
 
 /**
@@ -1960,13 +1969,24 @@ export interface MultiSourceKeyCapture {
  * the RETURNING re-query's EXISTS scans `__vmupd_keys` through. Fresh attribute ids
  * per call (each ref lives in its own subtree); the **descriptor** identity is what
  * ties it to the rows the emitter materializes.
+ *
+ * `captureRelationName` is used for BOTH the node's display CTE name and every
+ * attribute's `sourceRelation`, so a half-updated node can never keep the constant as
+ * `sourceRelation` while the caller injects under a fresh name. It defaults to the
+ * capture's own {@link MultiSourceKeyCapture.relationName} (falling back to
+ * {@link MS_UPDATE_KEYS_CTE}), so a ref minted from a fresh-named capture is
+ * self-consistent without the caller re-passing the name.
  */
-export function makeMultiSourceKeyRef(scope: Scope, capture: MultiSourceKeyCapture): InternalRecursiveCTERefNode {
+export function makeMultiSourceKeyRef(
+	scope: Scope,
+	capture: MultiSourceKeyCapture,
+	captureRelationName: string = capture.relationName ?? MS_UPDATE_KEYS_CTE,
+): InternalRecursiveCTERefNode {
 	const keyAttrs: Attribute[] = capture.keyColumns.map(c => ({
 		id: PlanNode.nextAttrId(),
 		name: c.name,
 		type: c.type,
-		sourceRelation: MS_UPDATE_KEYS_CTE,
+		sourceRelation: captureRelationName,
 	}));
 	const keyRelType: RelationType = {
 		typeClass: 'relation',
@@ -1976,7 +1996,7 @@ export function makeMultiSourceKeyRef(scope: Scope, capture: MultiSourceKeyCaptu
 		keys: [],
 		rowConstraints: [],
 	};
-	return new InternalRecursiveCTERefNode(scope, MS_UPDATE_KEYS_CTE, keyAttrs, keyRelType, capture.descriptor);
+	return new InternalRecursiveCTERefNode(scope, captureRelationName, keyAttrs, keyRelType, capture.descriptor);
 }
 
 /**
@@ -1999,6 +2019,13 @@ export function makeMultiSourceKeyRef(scope: Scope, capture: MultiSourceKeyCaptu
  *
  * Op-agnostic: takes the user `where` directly (an UPDATE's or a DELETE's) — the
  * identifying predicate is the same either way.
+ *
+ * `captureRelationName` is the AST relation name the resulting capture is injected
+ * under (and that the base-op predicates `decomposeUpdate`/`decomposeDelete` emit read
+ * back); it is stamped onto the returned {@link MultiSourceKeyCapture.relationName} so
+ * downstream injection/RETURNING read it from the capture object rather than
+ * re-deriving the literal. Defaults to {@link MS_UPDATE_KEYS_CTE} — the standalone
+ * multi-source path is byte-identical; a nested capture passes a fresh name.
  */
 export function buildMultiSourceKeyCapture(
 	ctx: PlanningContext,
@@ -2007,6 +2034,7 @@ export function buildMultiSourceKeyCapture(
 	analysis: JoinViewAnalysis,
 	sideIndices: readonly number[],
 	sourceValues?: readonly CrossSourceValue[],
+	captureRelationName: string = MS_UPDATE_KEYS_CTE,
 ): MultiSourceKeyCapture {
 	// The identifying predicate (user WHERE → base terms ∧ the body's own WHERE), built
 	// as a ScalarPlanNode over the planned join body's own scope — the exact scope
@@ -2051,7 +2079,7 @@ export function buildMultiSourceKeyCapture(
 
 	const source = new ProjectNode(analysis.joinScope, filtered, projections, undefined, undefined, false);
 
-	return { source, descriptor: {}, keyColumns };
+	return { source, descriptor: {}, keyColumns, relationName: captureRelationName };
 }
 
 /**
@@ -2129,18 +2157,22 @@ export function buildMultiSourceUpdateReturning(
 			.reduce((acc, c) => combineAnd(acc, c)!);
 		return { type: 'binary', operator: 'OR', left: exact, right: allNull } as AST.BinaryExpr;
 	});
-	const keyRef = makeMultiSourceKeyRef(ctx.scope, capture);
+	// Read the capture's own relation name so a fresh-named capture's RETURNING re-query
+	// reads back from (and injects under) the same relation its base ops do — the constant
+	// is only the default the standalone path stamps.
+	const captureRelationName = capture.relationName ?? MS_UPDATE_KEYS_CTE;
+	const keyRef = makeMultiSourceKeyRef(ctx.scope, capture, captureRelationName);
 	const existsPredicateAst: AST.Expression = {
 		type: 'exists',
 		subquery: {
 			type: 'select',
 			columns: [{ type: 'column', expr: { type: 'literal', value: 1 } }],
-			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
+			from: [{ type: 'table', table: { type: 'identifier', name: captureRelationName }, alias: 'k' }],
 			where: sideConds.reduce((acc, c) => combineAnd(acc, c)!),
 		},
 	};
 	const cteNodes = new Map(ctx.cteNodes ?? []);
-	cteNodes.set(MS_UPDATE_KEYS_CTE, keyRef);
+	cteNodes.set(captureRelationName, keyRef);
 	const existsNode = buildExpression({ ...ctx, scope: analysis.joinScope, cteNodes }, existsPredicateAst);
 	const filtered = new FilterNode(analysis.joinScope, analysis.joinNode, existsNode);
 
@@ -2253,7 +2285,7 @@ export function buildMultiSourceDeleteReturning(
 	return buildMultiSourceReturningProjection(ctx, view, analysis, filtered, stmt.returning!);
 }
 
-export function decomposeDelete(_ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt): BaseOp[] {
+export function decomposeDelete(_ctx: PlanningContext, view: MutableViewLike, analysis: JoinViewAnalysis, stmt: AST.DeleteStmt, captureRelationName: string = MS_UPDATE_KEYS_CTE): BaseOp[] {
 	// RETURNING through a multi-source delete is supported via a re-query of the
 	// planned view body captured *before* the base delete fires (the builder); the
 	// base op itself carries no RETURNING.
@@ -2325,7 +2357,7 @@ export function decomposeDelete(_ctx: PlanningContext, view: MutableViewLike, an
 	const ops: BaseOp[] = [];
 	for (const sideIndex of order) {
 		const side = analysis.sides[sideIndex];
-		const where = buildCapturedKeyPredicate(view, side, sideIndex);
+		const where = buildCapturedKeyPredicate(view, side, sideIndex, captureRelationName);
 		const statement: AST.DeleteStmt = {
 			type: 'delete',
 			table: tableIdentifier(side.schema),
@@ -2643,8 +2675,12 @@ function stripSideQualifier(
  * target row instead. The multi-source per-side callers pass `SELF_ALIAS`; `decomposition.ts`
  * and any caller that omits it keep the bare form (byte-identical — composite keys still
  * qualify every conjunct only when supplied).
+ *
+ * `captureRelationName` is the relation the correlated read scans (`from <name> k`); it
+ * defaults to {@link MS_UPDATE_KEYS_CTE} so the standalone multi-source and decomposition
+ * callers are byte-identical, while a nested multi-source capture threads its fresh name.
  */
-export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[], dedupAggregate?: string, correlationAlias?: string): AST.Expression {
+export function capturedValueSubquery(srcAlias: string, owningSideIndex: number, owningPk: readonly string[], dedupAggregate?: string, correlationAlias?: string, captureRelationName: string = MS_UPDATE_KEYS_CTE): AST.Expression {
 	const conds = owningPk.map((pk, j): AST.Expression => ({
 		type: 'binary',
 		operator: '=',
@@ -2660,7 +2696,7 @@ export function capturedValueSubquery(srcAlias: string, owningSideIndex: number,
 		query: {
 			type: 'select',
 			columns: [{ type: 'column', expr: projection }],
-			from: [{ type: 'table', table: { type: 'identifier', name: MS_UPDATE_KEYS_CTE }, alias: 'k' }],
+			from: [{ type: 'table', table: { type: 'identifier', name: captureRelationName }, alias: 'k' }],
 			where: conds.reduce((acc, c) => combineAnd(acc, c)!),
 		},
 	};
