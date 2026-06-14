@@ -351,7 +351,7 @@ function composeColumns(
 			else for (const ic of innerColumns) out.push({ type: 'column', expr: cloneExpr(ic.expr), alias: ic.name });
 			continue;
 		}
-		out.push({ type: 'column', expr: sub(rc.expr), alias: rc.alias ?? inferredName(rc.expr), inverse: rc.inverse });
+		out.push({ type: 'column', expr: sub(rc.expr), alias: rc.alias ?? inferredName(rc.expr), inverse: cloneInverse(rc.inverse) });
 	}
 	return out;
 }
@@ -395,9 +395,18 @@ function cloneTableFrom(from: AST.FromClause[] | undefined): AST.FromClause[] {
 	return (from ?? []).map(fc => fc.type === 'table' ? { ...fc, table: { ...fc.table } } : { ...fc });
 }
 
-/** Structural clone of one projection column (used for the passthrough star case). */
+/** Structural clone of one projection column (used for the passthrough star case). The
+ *  `with inverse` clause is deep-cloned too, severing all sharing with the source AST — the
+ *  invariant the scope-transform clones uphold (in-place rewriters mutate the produced tree). */
 function cloneResultColumn(rc: AST.ResultColumn): AST.ResultColumn {
-	return rc.type === 'all' ? { ...rc } : { ...rc, expr: cloneExpr(rc.expr) };
+	return rc.type === 'all' ? { ...rc } : { ...rc, expr: cloneExpr(rc.expr), inverse: cloneInverse(rc.inverse) };
+}
+
+/** Deep-clone a result column's `with inverse (col = expr, …)` list, severing expr sharing. */
+function cloneInverse(
+	inverse: ReadonlyArray<AST.ResultColumnInverse> | undefined,
+): AST.ResultColumnInverse[] | undefined {
+	return inverse?.map(a => ({ ...a, expr: cloneExpr(a.expr) }));
 }
 
 /** The base table's column names for a flattened body whose FROM is one base table, or null. */

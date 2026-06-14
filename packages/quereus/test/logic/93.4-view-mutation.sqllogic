@@ -3257,6 +3257,15 @@ with a(p,q) as (select id, color from mlren), t as (select p as id, q as color f
 select * from mlren order by id;
 → [{"id":1,"color":"z"}]
 
+-- Column rename over a `select *` inner — `a(p,q)` renames the star body's columns; the
+-- flattener resolves the base table's column list (the one schemaManager touch) to pair the
+-- renamed names with positions, so `set q=…` lowers to the base `color` column.
+create table mlrens (id integer primary key, color text);
+insert into mlrens values (1,'red');
+with a(p,q) as (select * from mlrens), t as (select * from a) update t set q='z' where p=1;
+select * from mlrens order by id;
+→ [{"id":1,"color":"z"}]
+
 -- Combined shadow + inline — `a` (defined before the `base2` CTE) inlines, while the target's
 -- own self-name `base2` does NOT (its same-named source stays the real `base2` table). The
 -- flattened body is `select id, color from base2`, re-planned target-excluded onto real base2.
@@ -3266,6 +3275,18 @@ with a as (select id, color from base2), base2 as (select * from a)
     update base2 set color='z' where id=1;
 select * from base2 order by id;
 → [{"id":1,"color":"z"},{"id":2,"color":"green"}]
+
+-- v1 boundary — a FORWARD reference (the target body reads a sibling CTE defined LATER, whose
+-- name also shadows a real table) rejects cleanly rather than writing through. Per SQL scoping
+-- `x`'s `from fwd` should bind the REAL `fwd` table (a CTE is visible only to LATER siblings),
+-- but the CTE-target re-plan threads ALL siblings into scope (`contextForCteTarget`), so `fwd`
+-- resolves to the later CTE → CTEReference → reject. The flattener correctly treats it as
+-- terminal (only PRIOR siblings inline); the reject originates in the re-plan context, not the
+-- flattener. See backlog ticket cte-dml-forward-reference-visibility.
+create table fwd (id integer primary key, color text);
+insert into fwd values (1,'red');
+with x as (select id, color from fwd), fwd as (select id, color from fwd) update x set color='z' where id=1;
+-- error: is not updateable in phase 1
 
 -- Reject parity — a non-updateable INTERMEDIATE rejects with its own body-shape reason
 -- ("not updateable in phase 1"), the SAME diagnostic class a single-level CTE of that shape
