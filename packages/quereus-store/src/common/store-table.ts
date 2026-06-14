@@ -21,6 +21,7 @@ import {
 	validateAndParse,
 	compilePredicate,
 	maintainedTableUniqueViolationError,
+	uniqueEnforcementCollations,
 	type Database,
 	type DatabaseInternal,
 	type ColumnSchema,
@@ -1426,32 +1427,6 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
-	 * Per-`uc.column` comparison collation for UNIQUE enforcement, one entry per
-	 * constrained column (positionally aligned with `uc.columns`).
-	 *
-	 * For an index-derived constraint (`CREATE UNIQUE INDEX … (col COLLATE x)`)
-	 * the enforcing collation is the index's per-column COLLATE — mirroring
-	 * memory's `checkUniqueViaIndex` and the store's own `buildIndexEntries`
-	 * dedup — so the store admits/rejects exactly the data memory and SQLite do.
-	 * Positional alignment of `uc.columns[i]` ↔ `index.columns[i]` is guaranteed
-	 * by `appendIndexToTableSchema` (`columns = indexSchema.columns.map(c => c.index)`).
-	 *
-	 * Falls back to the declared column collation when (a) the constraint is not
-	 * index-derived (table-level / column UNIQUE — declared IS the enforcement
-	 * collation), (b) the index metadata did not survive (mirrors the gate's
-	 * `if (!index) return true` tolerance — must not throw), or (c) a column
-	 * position carries no explicit index COLLATE (the common `CREATE UNIQUE INDEX
-	 * ix ON t(b)` case → byte-for-byte unchanged behaviour).
-	 */
-	private uniqueEnforcementCollations(uc: UniqueConstraintSchema): (string | undefined)[] {
-		const schema = this.tableSchema!;
-		const index = uc.derivedFromIndex
-			? schema.indexes?.find(ix => ix.name === uc.derivedFromIndex)
-			: undefined;
-		return uc.columns.map((col, i) => index?.columns[i]?.collation ?? schema.columns[col].collation);
-	}
-
-	/**
 	 * Scan committed + pending data rows for a row matching `newRow` on
 	 * `uc.columns` whose PK is not in `selfPks`. For partial UNIQUE, candidates
 	 * whose row does not satisfy the predicate are skipped. Returns the first
@@ -1473,7 +1448,7 @@ export class StoreTable extends VirtualTable {
 		const constrainedCols = uc.columns;
 		// One comparison collation per constrained column — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
-		const collations = this.uniqueEnforcementCollations(uc);
+		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
 
 		const matches = (candidate: Row): { pk: SqlValue[]; row: Row } | null => {
 			const pk = this.extractPK(candidate);
@@ -1528,7 +1503,7 @@ export class StoreTable extends VirtualTable {
 		selfPks: SqlValue[][],
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
 		const newSourcePk = this.extractPK(newRow);
-		const collations = this.uniqueEnforcementCollations(uc);
+		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
 		const candidates = await (this.db as DatabaseInternal)._lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
 		for (const cand of candidates) {
 			const liveRow = await this.readLiveRowByPk(cand.pk);

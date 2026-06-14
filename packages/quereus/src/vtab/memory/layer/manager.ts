@@ -1062,6 +1062,16 @@ export class MemoryTableManager {
 			// (col collate nocase)` may declare a coarser collation than the
 			// column — re-checking under the column's collation would skip the
 			// case-variant candidates the index legitimately unifies.
+			// This is the authoritative LIVE-index source for the per-column
+			// enforcement collation. The shared `uniqueEnforcementCollations(schema,
+			// uc)` helper (which store/isolation import, and checkUniqueViaMaterializedView
+			// uses) resolves the SAME per-column value, but BY NAME via
+			// `uc.derivedFromIndex` instead of from this live handle that
+			// findIndexForConstraint resolves BY COLUMN-SET. That `(schema, uc)`
+			// signature has no MemoryIndex handle, so this site keeps the live-handle
+			// read; the agreement between the two index-resolution paths is pinned by
+			// test/unique-enforcement-collation.spec.ts (a real divergence is a finding,
+			// not a reason to widen the helper).
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
 			if (!uc.columns.every((col, i) => compareSqlValues(

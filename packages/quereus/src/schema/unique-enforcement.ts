@@ -1,5 +1,10 @@
 /**
- * Shared UNIQUE-enforcement collation helpers, scoped to the quereus package.
+ * Shared UNIQUE-enforcement collation helpers. {@link uniqueEnforcementCollations}
+ * is the single source of truth across packages — it is re-exported from the
+ * package index (`@quereus/quereus`) and imported directly by the store and
+ * isolation re-validators (`quereus-store/store-table.ts`,
+ * `quereus-isolation/isolated-table.ts`), so cross-package drift is eliminated by
+ * construction rather than by a test.
  *
  * Two facts about a UNIQUE constraint that both the row-time covering-MV
  * eligibility gate and memory's covering-MV re-validation need:
@@ -7,11 +12,17 @@
  *  - {@link uniqueEnforcementCollations} — the comparison collation per
  *    constrained column. For an index-derived constraint
  *    (`CREATE UNIQUE INDEX … (col COLLATE x)`) it is the index's per-column
- *    COLLATE; otherwise the declared column collation. This mirrors the copies
- *    in `quereus-store/store-table.ts` and `quereus-isolation/isolated-table.ts`
- *    (deliberately NOT yet unified across packages — see the ticket's "out of
- *    scope"). Positional alignment `uc.columns[i]` ↔ `index.columns[i]` is
- *    guaranteed by `appendIndexToTableSchema`.
+ *    COLLATE (resolved BY NAME via `uc.derivedFromIndex`); otherwise the declared
+ *    column collation. Positional alignment `uc.columns[i]` ↔ `index.columns[i]`
+ *    is guaranteed by `appendIndexToTableSchema`.
+ *
+ *    Memory's `checkUniqueViaIndex` (manager.ts) is the one resolver that does NOT
+ *    import this helper: it reads the collation from the *live* `MemoryIndex`
+ *    handle that `findIndexForConstraint` resolves BY COLUMN-SET, a source this
+ *    `(schema, uc)` signature has no handle to. For every constraint shape that
+ *    arises the two index-resolution paths land on the same index and the same
+ *    per-column collations, so it is conformance-locked against this helper by
+ *    `test/unique-enforcement-collation.spec.ts` rather than sharing the import.
  *
  *  - {@link coveringMvHonorsIndexCollation} — whether a row-time covering MV may
  *    soundly answer this constraint. A covering MV generates its candidate set by
