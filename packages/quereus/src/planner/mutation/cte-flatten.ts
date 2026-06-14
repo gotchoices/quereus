@@ -1,6 +1,6 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
-import { transformExpr, cloneExpr, mapQueryExprUniform } from './scope-transform.js';
+import { transformExpr, cloneExpr, transformAliasScopedQuery } from './scope-transform.js';
 import { combineAnd } from './single-source.js';
 import { raiseMutationDiagnostic, type MutationDiagnosticReason } from './mutation-diagnostic.js';
 
@@ -213,7 +213,10 @@ function composeBody(
 	// schema touch — substitution merely drops the `sourceName.` qualifier.
 	const innerColumns = resolveInnerColumns(ctx, innerFlat, inner);
 	const { topSubst, nestedSubst } = makeSubstitutions(lcSource, innerColumns);
-	const descend = (q: AST.QueryExpr): AST.QueryExpr => mapQueryExprUniform(q, nestedSubst);
+	// Alias-shadow-aware descent: a subquery nested in the consumer that re-binds `sourceName`
+	// as a LOCAL FROM alias shadows it, so a `sourceName.`-qualified ref there is local to the
+	// nested scope and is NOT rewritten to the inner CTE's defining term (silent-wrong otherwise).
+	const descend = (q: AST.QueryExpr): AST.QueryExpr => transformAliasScopedQuery(q, nestedSubst);
 	const sub = (e: AST.Expression): AST.Expression => transformExpr(e, topSubst, descend);
 
 	const columns = composeColumns(consumer.columns, innerFlat.columns, innerColumns, sub);
@@ -302,18 +305,25 @@ function resolveInnerColumns(
  *  - `topSubst` rewrites a TOP-LEVEL reference to the inner source — bare (the body's single
  *    FROM source) or `sourceName`-qualified — to its inner defining expression.
  *  - `nestedSubst` (used inside subquery operands, where a bare name binds to the subquery's
- *    own scope) rewrites ONLY a `sourceName`-qualified correlation.
- * The identity-strip path returns the same closure for both: drop the `sourceName.` qualifier,
- * leave bare names (they already resolve to the base table after the FROM re-point).
+ *    own scope) rewrites ONLY a `sourceName`-qualified correlation — and ONLY while `sourceName`
+ *    is not shadowed by a nested FROM alias. A subquery that re-binds `sourceName` as a LOCAL
+ *    FROM alias makes a `sourceName.`-qualified ref local to that scope (innermost-scope SQL
+ *    rules), so it must NOT be rewritten to the inner CTE's defining term. The descent
+ *    ({@link transformAliasScopedQuery}) threads the FROM-alias shadow set into `nestedSubst`.
+ * The identity-strip path mirrors the same split: `topSubst` drops the `sourceName.` qualifier;
+ * `nestedSubst` does too but only when `sourceName` is unshadowed. Bare names are left untouched
+ * (they already resolve to the base table after the FROM re-point).
  */
 function makeSubstitutions(
 	lcSource: string,
 	innerColumns: InnerColumn[] | null,
-): { topSubst: (col: AST.ColumnExpr) => AST.Expression | undefined; nestedSubst: (col: AST.ColumnExpr) => AST.Expression | undefined } {
+): { topSubst: (col: AST.ColumnExpr) => AST.Expression | undefined; nestedSubst: (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>) => AST.Expression | undefined } {
 	if (innerColumns === null) {
-		const strip = (col: AST.ColumnExpr): AST.Expression | undefined =>
+		const stripTop = (col: AST.ColumnExpr): AST.Expression | undefined =>
 			col.table && col.table.toLowerCase() === lcSource ? { type: 'column', name: col.name } : undefined;
-		return { topSubst: strip, nestedSubst: strip };
+		const stripNested = (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>): AST.Expression | undefined =>
+			col.table && col.table.toLowerCase() === lcSource && !aliasShadow.has(lcSource) ? { type: 'column', name: col.name } : undefined;
+		return { topSubst: stripTop, nestedSubst: stripNested };
 	}
 	const map = new Map<string, AST.Expression>();
 	for (const ic of innerColumns) map.set(ic.name.toLowerCase(), ic.expr);
@@ -323,8 +333,8 @@ function makeSubstitutions(
 		if (col.table) return col.table.toLowerCase() === lcSource ? lookup(col.name) : undefined;
 		return lookup(col.name);
 	};
-	const nestedSubst = (col: AST.ColumnExpr): AST.Expression | undefined =>
-		col.table && col.table.toLowerCase() === lcSource ? lookup(col.name) : undefined;
+	const nestedSubst = (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>): AST.Expression | undefined =>
+		col.table && col.table.toLowerCase() === lcSource && !aliasShadow.has(lcSource) ? lookup(col.name) : undefined;
 	return { topSubst, nestedSubst };
 }
 

@@ -3276,6 +3276,66 @@ with a as (select id, color from base2), base2 as (select * from a)
 select * from base2 order by id;
 → [{"id":1,"color":"z"},{"id":2,"color":"green"}]
 
+-- Nested-subquery alias shadow of the inner CTE source name — a subquery in the consumer's WHERE
+-- re-binds the inner source `x` as a LOCAL FROM alias (`from nother x`), so the `x.note` there is
+-- that nested alias's column, NOT the inner CTE's renamed base term. The consumer-rewrite is now
+-- alias-shadow-aware, so it leaves the nested `x.note` alone → EXISTS sees nother.note='red' (true)
+-- → the write fires. (Blind substitution rewrote `x.note` → base `color`, binding nother.color
+-- ='blue' → EXISTS false → no write — the silent-wrong bug this fixes.)
+create table nbase (id integer primary key, color text);
+insert into nbase values (1,'red');
+create table nother (oid integer primary key, note text, color text);
+insert into nother values (1,'red','blue');
+with x as (select id, color as note from nbase),
+     t as (select id, note from x where exists (select 1 from nother x where x.note = 'red'))
+     update t set note='z';
+select * from nbase order by id;
+→ [{"id":1,"color":"z"}]
+
+-- Over-suppression guard — a GENUINE correlation: the nested subquery does NOT re-bind `x`, so
+-- `x.note` is a real outer correlation and MUST still be substituted to the inner base term.
+-- cother has a matching row → EXISTS true → the write fires (the fix must not over-suppress).
+create table cbase (id integer primary key, color text);
+insert into cbase values (1,'red');
+create table cother (oid integer primary key, color text);
+insert into cother values (1,'red');
+with x as (select id, color as note from cbase),
+     t as (select id, note from x where exists (select 1 from cother where cother.color = x.note))
+     update t set note='z';
+select * from cbase order by id;
+→ [{"id":1,"color":"z"}]
+
+-- Identity-strip path (benign) — a `select *` inner with no rename: the consumer-rewrite only
+-- drops the `sourceName.` qualifier, and a nested re-bind of the source name resolves the bare
+-- result to the same local column either way. Shadow-awareness changes nothing here; pin no-change.
+create table idbase (id integer primary key, color text);
+insert into idbase values (1,'red');
+create table idother (oid integer primary key, color text);
+insert into idother values (1,'red');
+with x as (select * from idbase),
+     t as (select id, color from x where exists (select 1 from idother x where x.color = 'red'))
+     update t set color='z';
+select * from idbase order by id;
+→ [{"id":1,"color":"z"}]
+
+-- Deeper nesting — the re-bind of the inner source name `x` sits TWO subquery levels down; the
+-- alias-shadow set must accumulate downward (the outer EXISTS adds nd_mid, the inner adds x), so
+-- the depth-2 `x.note` is local to `nd_inner` and stays unsubstituted → it binds nd_inner.note='red'
+-- → the EXISTS chain is true → write fires. (Blind substitution would bind nd_inner.color='blue'.)
+create table nd_base (id integer primary key, color text);
+insert into nd_base values (1,'red');
+create table nd_mid (mid integer primary key);
+insert into nd_mid values (1);
+create table nd_inner (iid integer primary key, note text, color text);
+insert into nd_inner values (1,'red','blue');
+with x as (select id, color as note from nd_base),
+     t as (select id, note from x where exists (
+        select 1 from nd_mid where exists (
+           select 1 from nd_inner x where x.note = 'red')))
+     update t set note='z';
+select * from nd_base order by id;
+→ [{"id":1,"color":"z"}]
+
 -- Forward reference write-through — the target `x` is the FIRST CTE and its body reads a sibling
 -- CTE `fwd` defined LATER whose name also shadows a real table. Per SQL definition-order scoping a
 -- non-recursive CTE is visible only to LATER siblings, so inside `x`'s body the later `fwd` CTE is

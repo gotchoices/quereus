@@ -657,10 +657,10 @@ export function transformAliasScopedExpr(
  * nested subqueries; a sibling compound / union leg keeps the incoming set; a
  * VALUES body (no FROM) keeps it too; a DML … RETURNING subquery clones through.
  */
-function transformAliasScopedQuery(
+export function transformAliasScopedQuery(
 	query: AST.QueryExpr,
 	substitute: (col: AST.ColumnExpr, aliasShadow: ReadonlySet<string>) => AST.Expression | undefined,
-	aliasShadow: ReadonlySet<string>,
+	aliasShadow: ReadonlySet<string> = NO_ALIAS_SHADOW,
 ): AST.QueryExpr {
 	if (query.type === 'values') {
 		// No FROM — the value rows correlate to the enclosing scope unchanged.
