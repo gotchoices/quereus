@@ -3334,6 +3334,28 @@ with t(k,c) as (select id, color from hwren) update t set c='r' where k in (sele
 select * from hwren order by id;
 → [{"id":1,"color":"r"},{"id":2,"color":"r"}]
 
+-- Multiple self-reads in ONE statement — `from t` appears in BOTH the WHERE and the RETURNING.
+-- Both resolve through the single context-backed capture ref minted under the CTE name; the
+-- shared ref reads the same frozen snapshot from each position. Both rows update; the RETURNING
+-- count reads the pre-mutation snapshot (2). Exercises the shared-instance ref path that the
+-- single-position tests above do not.
+create table hwmr (id integer primary key, color text);
+insert into hwmr values (1,'red'),(2,'green');
+with t as (select id, color from hwmr) update t set color='x' where id in (select id from t) returning (select count(*) from t) as cnt;
+→ [{"cnt":2},{"cnt":2}]
+select * from hwmr order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"x"}]
+
+-- Two self-reads in ONE WHERE — `id in (select id from t where id<2)` ∪ `color in (select color
+-- from t where id>2)`. Both `from t` bind to the same frozen capture; row 1 (id<2) and row 3
+-- (color in {captured blue}) update, row 2 is left. Confirms two same-name refs co-resolve.
+create table hwmr2 (id integer primary key, color text);
+insert into hwmr2 values (1,'red'),(2,'green'),(3,'blue');
+with t as (select id, color from hwmr2)
+    update t set color='y' where id in (select id from t where id<2) or color in (select color from t where id>2);
+select * from hwmr2 order by id;
+→ [{"id":1,"color":"y"},{"id":2,"color":"green"},{"id":3,"color":"y"}]
+
 -- No-self-read CTE-target — a CTE-target UPDATE whose predicate does NOT self-read pays
 -- nothing (no capture built, byte-identical plan); a plain positive write lands.
 create table hwns (id integer primary key, color text);
