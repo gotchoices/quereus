@@ -38,6 +38,7 @@ const USE_STORE_MODULE = process.env.QUEREUS_TEST_STORE === 'true' || process.en
 // Files that are explicitly memory-module-specific and should be skipped in store mode
 const MEMORY_ONLY_FILES = new Set([
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
+  '10.2.2-default-collation-memory.sqllogic',  // Asserts the memory-side BINARY default for an undecorated text PK; the store applies NOCASE (see docs/schema.md §"Per-column PK key collation")
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
   // '41-foreign-keys.sqllogic' was excluded here; now fixed by IsolatedTable surfacing replacedRow for OR REPLACE store-side displacements
   // '41.7.1-alter-column-collate-unique.sqllogic' is now cross-module: the store keys the PK per-column (store-pk-collate-physical-rekey), so an explicit `collate binary` PK holds the 'a'/'A' pair and re-keys it under SET COLLATE just like memory
