@@ -18,6 +18,9 @@ interface ScalarFuncOptions {
 	flags?: FunctionFlags;
 	/** Whether the function is deterministic (affects caching) */
 	deterministic?: boolean;
+	/** Whether the function is REPLICABLE — bit-identical across peers/platforms/app
+	 *  versions (stronger than deterministic). See {@link import('../schema/function.js').BaseFunctionSchema.replicable}. */
+	replicable?: boolean;
 	/** Return type information */
 	returnType?: ScalarType;
 	/**
@@ -56,6 +59,9 @@ interface TableValuedFuncOptions {
 	flags?: FunctionFlags;
 	/** Whether the function is deterministic (affects caching) */
 	deterministic?: boolean;
+	/** Whether the function is REPLICABLE — bit-identical across peers/platforms/app
+	 *  versions (stronger than deterministic). See {@link import('../schema/function.js').BaseFunctionSchema.replicable}. */
+	replicable?: boolean;
 	/** Return type (relation) information */
 	returnType?: RelationType;
 	/** Optional relational / physical property advertisement */
@@ -78,6 +84,9 @@ interface AggregateFuncOptions {
 	flags?: FunctionFlags;
 	/** Whether the function is deterministic (affects caching) */
 	deterministic?: boolean;
+	/** Whether the function is REPLICABLE — bit-identical across peers/platforms/app
+	 *  versions (stronger than deterministic). See {@link import('../schema/function.js').BaseFunctionSchema.replicable}. */
+	replicable?: boolean;
 	/** Initial accumulator value */
 	initialValue?: AggValue;
 	/** Return type information */
@@ -118,6 +127,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
 		returnType,
 		implementation: jsFunc,
+		replicable: options.replicable,
 		inferReturnType: options.inferReturnType,
 		validateArgTypes: options.validateArgTypes,
 		injectiveOnArgs: options.injectiveOnArgs,
@@ -150,6 +160,7 @@ export function createTableValuedFunction(options: TableValuedFuncOptions, jsFun
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
 		returnType,
 		implementation: jsFunc,
+		replicable: options.replicable,
 		relationalAdvertisement: options.relationalAdvertisement
 	};
 }
@@ -178,6 +189,7 @@ export function createIntegratedTableValuedFunction(options: TableValuedFuncOpti
 		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
 		returnType,
 		implementation: jsFunc,
+		replicable: options.replicable,
 		isIntegrated: true,
 		relationalAdvertisement: options.relationalAdvertisement
 	};
@@ -212,6 +224,7 @@ export function createAggregateFunction(
 		stepFunction: stepFunc,
 		finalizeFunction: finalizeFunc,
 		initialValue: options.initialValue,
+		replicable: options.replicable,
 		inferReturnType: options.inferReturnType,
 		validateArgTypes: options.validateArgTypes
 	};

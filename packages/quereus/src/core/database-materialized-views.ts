@@ -85,6 +85,7 @@ import type { VirtualTableConnection } from '../vtab/connection.js';
 import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/predicate.js';
 import { compareSqlValues, rowsValueIdentical } from '../util/comparison.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
+import type { FunctionSchema } from '../schema/function.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import { coveringMvHonorsIndexCollation } from '../schema/unique-enforcement.js';
 import type { Database } from './database.js';
@@ -1438,6 +1439,23 @@ export class MaterializedViewManager {
 			const { plan } = this.ctx._buildPlan([mv.derivation.selectAst as AST.Statement]);
 			return this.ctx.optimizer.optimizeForAnalysis(plan, db) as BlockNode;
 		});
+
+		// Replicable-determinism gate — host-conditional, inert by default. A backing host
+		// whose backing replicates across peers (the sync-store) sets
+		// `requiresReplicableDerivations` so a platform-dependent UDF cannot diverge peers.
+		// Checked here — after `analyzed`, before arm selection — so it applies regardless of
+		// which maintenance arm wins, over the SAME analyzed plan the determinism gate walks
+		// (nested calls, WHERE / GROUP BY / aggregate-arg / TVF-arg positions all reached). It
+		// sits NEXT TO, not in place of, the determinism gate: the two are orthogonal, so this
+		// is NOT lifted by `pragma nondeterministic_schema`. A memory/store host leaves the flag
+		// undefined ⇒ this block is skipped ⇒ zero behavior change. Idempotent (same body ⇒
+		// same verdict), so it is also desirable on re-register / catalog import: a tampered
+		// catalog cannot smuggle a non-replicable body past a demanding host.
+		const host = this.backingHost(mv);
+		if (host.requiresReplicableDerivations) {
+			const offending = findNonReplicableFunction(analyzed);
+			if (offending) throw nonReplicableDerivationError(mv.name, offending);
+		}
 
 		// Try a bounded-delta arm; a shape that fits none falls through to the floor.
 		const boundedDelta = this.tryBuildBoundedDeltaArm(mv, analyzed);
@@ -3171,6 +3189,30 @@ function findNonDeterministic(node: PlanNode): string | undefined {
 	return undefined;
 }
 
+/** Walk the whole plan; return the NAME of the first function whose schema is not declared
+ *  REPLICABLE (bit-identical across peers/platforms/app-versions — built-ins auto-qualify),
+ *  or `undefined` when every function in the body qualifies. Mirrors {@link findNonDeterministic}'s
+ *  `getChildren()` recursion so nested calls (a UDF inside a builtin inside a UDF) and the
+ *  WHERE / GROUP BY / aggregate-arg / TVF-arg positions are all reached. The structural
+ *  `'functionSchema' in node` test covers all four function-bearing node kinds uniformly —
+ *  scalar (`function.ts`), aggregate (`aggregate-function.ts`), TVF call
+ *  (`table-function-call.ts`), and TVF reference (`reference.ts`) — without per-type imports.
+ *  Window functions live in a separate builtin-only registry with no UDF registration path and
+ *  carry no scalar/aggregate/TVF `functionSchema` on these nodes, so they are inherently
+ *  replicable and are never flagged. Consumed only when the backing host declares
+ *  `requiresReplicableDerivations` (see {@link MaterializedViewManager.buildMaintenancePlan}). */
+function findNonReplicableFunction(node: PlanNode): string | undefined {
+	if ('functionSchema' in node) {
+		const schema = (node as unknown as { functionSchema: FunctionSchema }).functionSchema;
+		if (schema.replicable !== true) return schema.name;
+	}
+	for (const child of node.getChildren()) {
+		const found = findNonReplicableFunction(child as unknown as PlanNode);
+		if (found) return found;
+	}
+	return undefined;
+}
+
 /** Canonical, order-stable, bigint-safe string for a key tuple — used to dedup the
  *  distinct affected backing keys of a single change in the residual-recompute arm. */
 function canonKeyValues(values: readonly SqlValue[]): string {
@@ -3418,6 +3460,24 @@ function cannotMaterialize(mvName: string, detail: string): QuereusError {
 	return new QuereusError(
 		`materialized view '${mvName}' cannot be materialized: ${detail}. For this body, use a `
 			+ `plain 'create view' (live re-evaluation) or 'create table ... as <body>' (a one-off snapshot)`,
+		StatusCode.UNSUPPORTED,
+	);
+}
+
+/**
+ * The diagnostic for the create-time **replicable-determinism** reject — distinct from
+ * {@link cannotMaterialize} because the fix here is not "use a plain view": the body is
+ * fine, it just calls a function the backing host requires be REPLICABLE. So this names the
+ * function and steers to declaring it `replicable: true` at registration (built-ins qualify
+ * automatically). Fires only when the resolved backing host declares
+ * `requiresReplicableDerivations`. `StatusCode.UNSUPPORTED`.
+ */
+function nonReplicableDerivationError(mvName: string, fnName: string): QuereusError {
+	return new QuereusError(
+		`materialized view '${mvName}' cannot be materialized on this backing host: it calls non-replicable `
+			+ `function '${fnName}'. This host requires every function in the body to be bit-identical across `
+			+ `peers/platforms; declare the function \`replicable: true\` at registration (built-in functions `
+			+ `qualify automatically)`,
 		StatusCode.UNSUPPORTED,
 	);
 }

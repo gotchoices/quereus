@@ -68,6 +68,19 @@ interface BaseFunctionSchema {
 	numArgs: number;
 	/** Combination of FunctionFlags */
 	flags: FunctionFlags;
+	/**
+	 * Stronger-than-deterministic class: when `true`, this function is asserted to
+	 * be **bit-identical across peers, platforms, and app versions** — not merely
+	 * deterministic within one database. This matters only for a function that is
+	 * already deterministic (the determinism gate handles non-determinism
+	 * independently), and is consulted at create when a backing host declares
+	 * {@link import('../vtab/backing-host.js').BackingHost.requiresReplicableDerivations}.
+	 * Built-in functions qualify automatically (Quereus implements its own
+	 * collation / case-folding / numeric formatting, so a deterministic builtin
+	 * cannot drift between peers' JS engines); a UDF opts in explicitly. Absent /
+	 * `false` ⇒ not asserted (the conservative default for a UDF).
+	 */
+	replicable?: boolean;
 	/** User data pointer passed during registration */
 	userData?: unknown;
 	/** Return type information */

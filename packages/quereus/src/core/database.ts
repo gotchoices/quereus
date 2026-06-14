@@ -333,9 +333,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal Registers default built-in SQL functions */
 	private registerBuiltinFunctions(): void {
 		const mainSchema = this.schemaManager.getMainSchema();
+		// Built-ins auto-qualify as REPLICABLE: Quereus implements its own collation,
+		// case-folding, and numeric formatting, so a deterministic builtin is
+		// bit-identical across peers' JS engines (see BaseFunctionSchema.replicable).
+		// This is the single seam that *knows* a schema is a builtin, so stamping here
+		// auto-qualifies all of them without editing ~100 definitions and without
+		// defaulting UDFs to replicable. Non-deterministic builtins (random, now, …) are
+		// stamped too — harmless, since the determinism gate rejects them first. Spread a
+		// COPY so the shared exported BUILTIN_FUNCTIONS constants are never mutated.
 		BUILTIN_FUNCTIONS.forEach(funcDef => {
 			try {
-				mainSchema.addFunction(funcDef);
+				mainSchema.addFunction({ ...funcDef, replicable: true });
 			} catch (e) {
 				errorLog(`Failed to register built-in function ${funcDef.name}/${funcDef.numArgs}: %O`, e);
 			}
@@ -970,6 +978,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		options: {
 			numArgs: number;
 			deterministic?: boolean;
+			replicable?: boolean;
 			flags?: number;
 		},
 		func: (...args: SqlValue[]) => SqlValue
@@ -980,7 +989,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const flags = options.flags ?? baseFlags;
 
 		const schema = createScalarFunction(
-			{ name, numArgs: options.numArgs, flags },
+			{ name, numArgs: options.numArgs, flags, replicable: options.replicable },
 			func
 		);
 
@@ -1002,6 +1011,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		options: {
 			numArgs: number;
 			flags?: number;
+			replicable?: boolean;
 			initialState?: unknown;
 		},
 		stepFunc: (acc: unknown, ...args: SqlValue[]) => unknown,
@@ -1012,7 +1022,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const flags = options.flags ?? FunctionFlags.UTF8;
 
 		const schema = createAggregateFunction(
-			{ name, numArgs: options.numArgs, flags, initialValue: options.initialState },
+			{ name, numArgs: options.numArgs, flags, replicable: options.replicable, initialValue: options.initialState },
 			stepFunc,
 			finalFunc
 		);
