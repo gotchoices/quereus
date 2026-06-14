@@ -374,6 +374,17 @@ select id, x from rlo order by id;
 select id, x from rhi order by id;
 → [{"id":3,"x":7},{"id":4,"x":9},{"id":10,"x":100}]
 
+-- UPDATE through a range σ (the delete-companion the ticket asked for): WHERE `x >= 9` is
+-- provably `unsat` with the `lo` leg (`x >= 9 ∧ x < 5`) → the fan NARROWS to rhi, and the
+-- member-exists capture restricts to the resident matching rows (rhi id 4 & 10). The SET
+-- target (`id`) does NOT touch the range column, so no Halloween reclassification. rlo is
+-- untouched (never even consulted — its leg is skipped at routing time).
+update RV set id = id + 100 where x >= 9;
+select id, x from rlo order by id;
+→ [{"id":2,"x":3}]
+select id, x from rhi order by id;
+→ [{"id":3,"x":7},{"id":104,"x":9},{"id":110,"x":100}]
+
 -- ===================================================================
 -- Gap-value INSERT: legs with a GAP (`x < 5` / `x >= 10`) reject a value that falls in the
 -- gap — both legs are provably `unsat`, so `baseOps` is empty and the honest
