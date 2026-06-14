@@ -1250,3 +1250,219 @@ select id, tag, code from bumix_b.Item order by id;
 -- over the mixed NEW side (NEW.tag and NEW.code + 10).
 insert into bumix_x.Item values (4, 'a', 11);
 -- error: constraint
+
+-- ===================================
+-- 25. Conflict-action rejection on a PROVED-by-TRANSPORT key — the headline repro.
+--     A bare-reconstructible rename (`code as grp`) whose put-target basis column
+--     carries a declared basis UNIQUE classifies `proved` (a basis NOT-NULL UNIQUE is
+--     itself a relation key, so the body proves the logical key directly). But the
+--     basis UNIQUE — not the logical key — governs a write-through: a duplicate `grp`
+--     maps to a duplicate `code`, which the basis UNIQUE resolves by its OWN action
+--     (here ABORT). So a logical `unique (grp) on conflict replace` the basis UNIQUE
+--     does not carry would be silently dropped — it reds lens.unenforceable-conflict-
+--     action. (Before the fix this deployed clean, dropping the declared REPLACE.)
+-- ===================================
+
+declare schema tca25_b {
+	table t (
+		id integer primary key,
+		code integer not null unique check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca25_b;
+
+-- run
+
+declare logical schema tca25_x {
+	table t (
+		id integer primary key,
+		grp integer not null check (grp in (1, 2, 3)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for tca25_x over tca25_b {
+	view t as select id, code as grp from tca25_b.t
+}
+
+-- run
+
+apply schema tca25_x;
+-- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 26. The same rejection over an AUTHORED-bijective transport key (+10 affine), to
+--     pin the authored arm of the transport proof too (the body cannot prove a `code
+--     + 10` key, so this reaches the transport classification, not the body-proved
+--     one). Basis UNIQUE on the put target (ABORT), logical `unique (grp) on conflict
+--     replace` ⇒ red.
+-- ===================================
+
+declare schema tca26_b {
+	table t (
+		id integer primary key,
+		code integer not null unique check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca26_b;
+
+-- run
+
+declare logical schema tca26_x {
+	table t (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for tca26_x over tca26_b {
+	view t as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from tca26_b.t
+}
+
+-- run
+
+apply schema tca26_x;
+-- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 27. A MATCHING basis-UNIQUE action deploys clean and the write-through honors
+--     REPLACE for free — the positive case the rejecter must NOT block. Basis UNIQUE
+--     `on conflict replace`, logical `unique (grp) on conflict replace`: the actions
+--     agree, so the key stays `proved` with zero advisories, and a duplicate `code`
+--     REPLACES via the basis UNIQUE (not ABORT). This is the documented remediation.
+-- ===================================
+
+declare schema tca27_b {
+	table t (
+		id integer primary key,
+		code integer not null unique on conflict replace check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca27_b;
+
+-- run
+
+declare logical schema tca27_x {
+	table t (
+		id integer primary key,
+		grp integer not null check (grp in (1, 2, 3)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for tca27_x over tca27_b {
+	view t as select id, code as grp from tca27_b.t
+}
+
+-- run
+
+apply schema tca27_x;
+
+-- run
+
+-- Clean deploy: matching actions ⇒ proved transport, no advisories.
+select count(*) as n from quereus_lens_advisories('tca27_x');
+→ [{"n": 0}]
+
+-- run
+
+-- The write honors REPLACE through the basis UNIQUE: (2, 1) replaces (1, 1) on the
+-- duplicate code, leaving one basis row (the later id) rather than ABORTing.
+insert into tca27_x.t (id, grp) values (1, 1);
+insert into tca27_x.t (id, grp) values (2, 1);
+select id, code from tca27_b.t order by id;
+→ [{"id": 2, "code": 1}]
+
+-- ===================================
+-- 28. PK transport variant. A logical PK over an authored-bijective column mapping to
+--     the basis PK is `proved` by transport — the basis PK governs a write-through.
+--     28a: a logical PK `on conflict replace` over a plain-ABORT basis PK reds.
+-- ===================================
+
+declare schema tca28a_b {
+	table t (
+		k integer primary key check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca28a_b;
+
+-- run
+
+declare logical schema tca28a_x {
+	table t (
+		n integer primary key on conflict replace check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for tca28a_x over tca28a_b {
+	view t as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from tca28a_b.t
+}
+
+-- run
+
+apply schema tca28a_x;
+-- error: lens.unenforceable-conflict-action
+
+-- ===================================
+-- 28b. A matching basis PK action deploys clean — confirms the PK arm's positive case.
+-- ===================================
+
+declare schema tca28b_b {
+	table t (
+		k integer primary key on conflict replace check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema tca28b_b;
+
+-- run
+
+declare logical schema tca28b_x {
+	table t (
+		n integer primary key on conflict replace check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for tca28b_x over tca28b_b {
+	view t as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from tca28b_b.t
+}
+
+-- run
+
+apply schema tca28b_x;
+
+-- run
+
+select count(*) as n from quereus_lens_advisories('tca28b_x');
+→ [{"n": 0}]

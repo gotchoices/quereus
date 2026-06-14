@@ -1017,6 +1017,83 @@ describe('lens enforcement: logical UNIQUE over a bijective authored inverse', (
 	});
 });
 
+describe('lens enforcement: conflict action on a transport-proved key', () => {
+	// A transport-proved key is enforced by the *basis* key the bijection maps onto,
+	// whose own conflict action governs a write-through duplicate — the logical key's
+	// is never consulted. So a logical `on conflict replace`/`ignore` the basis key
+	// does not itself carry is silently dropped, and the prover rejects it at deploy
+	// with `lens.unenforceable-conflict-action` (ticket
+	// `lens-proved-transport-key-conflict-action-drop`). The check fires whether the
+	// key is classified `proved` by the body (a faithful projection of a basis key —
+	// a basis NOT-NULL UNIQUE is itself a relation key) or by bijection transport (an
+	// authored bijection the body cannot prove). A *matching* basis-key action deploys
+	// clean (the basis key honors it for free — the documented remediation).
+	const BIJECTIVE_LENS = 'declare lens for x over y { view t as select id, code + 10 as grp with inverse (code = new.grp - 10) from y.t }';
+	const BARE_RENAME_LENS = 'declare lens for x over y { view t as select id, code as grp from y.t }';
+
+	it('authored-bijective UNIQUE with a MISMATCHED `on conflict replace` (basis ABORT) blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, code integer not null unique check (code in (1, 2, 3))) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, grp integer not null check (grp in (11, 12, 13)), unique (grp) on conflict replace) }');
+			await db.exec(BIJECTIVE_LENS);
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('bare-rename UNIQUE proved by the BODY (basis NOT-NULL UNIQUE is a relation key) with a MISMATCHED action also blocks', async () => {
+		// The headline repro: `code as grp` is a faithful projection, so the body proves
+		// the key via the basis NOT-NULL UNIQUE → relation key, never reaching the
+		// transport classification. The basis UNIQUE still governs the write, so the
+		// dropped REPLACE must red on the body-proved path too (not only on transport).
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, code integer not null unique check (code in (1, 2, 3))) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, grp integer not null check (grp in (1, 2, 3)), unique (grp) on conflict replace) }');
+			await db.exec(BARE_RENAME_LENS);
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a transport-proved PK with a MISMATCHED action (basis PK ABORT) blocks the deploy', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (k integer primary key check (k in (1, 2, 3))) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (n integer primary key on conflict replace check (n in (11, 12, 13))) }');
+			await db.exec('declare lens for x over y { view t as select k + 10 as n with inverse (k = new.n - 10) from y.t }');
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a MATCHING basis-UNIQUE action keeps the key `proved` and deploys clean', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, code integer not null unique on conflict replace check (code in (1, 2, 3))) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, grp integer not null check (grp in (11, 12, 13)), unique (grp) on conflict replace) }');
+			await db.exec(BIJECTIVE_LENS);
+			await db.exec('apply schema x'); // no throw — the basis UNIQUE honors REPLACE for free
+
+			expect(
+				(slot(db, 't').obligations ?? []).some(o => o.kind === 'proved' && o.constraint.kind === 'unique'),
+				'matching action ⇒ still classified proved',
+			).to.be.true;
+			expect(collectLensSetLevelConstraints(slot(db, 't')), 'proved ⇒ no set-level obligation').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens enforcement: set-level (unique / PK) row-time at the write boundary', () => {
 	/**
 	 * Deploys a row-time set-level lens: a basis `unique(email)` plus an explicit

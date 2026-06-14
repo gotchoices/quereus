@@ -779,29 +779,49 @@ export function resolvePkDefaultConflict(schema: TableSchema): ConflictResolutio
 }
 
 /**
- * True when `indices` (as a set) exactly equals the column set of a declared
- * PRIMARY KEY or a non-partial UNIQUE constraint on `table`. Exact set-equality
- * mirrors how `on conflict (cols)` resolves a constraint by its column set; a
- * partial UNIQUE (`predicate !== undefined`, synthesized from `CREATE UNIQUE INDEX
- * … WHERE …`) only guarantees uniqueness within its scope and cannot back an
- * unqualified conflict target, so it is skipped.
+ * Which declared whole-table key a column set matched — the PRIMARY KEY or a
+ * specific non-partial UNIQUE constraint. Surfaced (over the boolean
+ * {@link columnsFormDeclaredKey}) so a caller can read the matched key's governing
+ * conflict action: the basis key whose `defaultConflict` a duplicate actually
+ * resolves to (the prover's bijection-transport conflict-action check needs it,
+ * mirroring the row-time path's `BasisCovering.uc`).
+ */
+export type DeclaredKeyMatch =
+	| { kind: 'primaryKey' }
+	| { kind: 'unique'; constraint: UniqueConstraintSchema };
+
+/**
+ * The declared whole-table key whose column set (as a set) exactly equals
+ * `indices` — the PRIMARY KEY or a non-partial UNIQUE constraint on `table` — or
+ * `undefined`. Exact set-equality mirrors how `on conflict (cols)` resolves a
+ * constraint by its column set; a partial UNIQUE (`predicate !== undefined`,
+ * synthesized from `CREATE UNIQUE INDEX … WHERE …`) only guarantees uniqueness
+ * within its scope and cannot back an unqualified conflict target, so it is
+ * skipped.
  *
  * The single in-package source for "do these columns form a declared whole-table
  * key": the lens decomposition compiler's 1:1-stitch guard
- * (`lens-compiler.ts validatePrimaryAdvertisement`) and the prover's
- * bijection-transport key proof (`lens-prover.ts proveKeyByBijectionTransport`)
+ * (`lens-compiler.ts validatePrimaryAdvertisement`, via {@link columnsFormDeclaredKey})
+ * and the prover's bijection-transport key proof
+ * (`lens-prover.ts proveKeyByBijectionTransport`, which reads the matched key)
  * both consume it, so the two agree on what counts as a basis key.
  */
-export function columnsFormDeclaredKey(table: TableSchema, indices: readonly number[]): boolean {
+export function findDeclaredKey(table: TableSchema, indices: readonly number[]): DeclaredKeyMatch | undefined {
 	const want = new Set(indices);
 	const eq = (cols: readonly number[]): boolean => cols.length === want.size && cols.every(c => want.has(c));
 	const pk = table.primaryKeyDefinition.map(p => p.index);
-	if (pk.length > 0 && eq(pk)) return true;
+	if (pk.length > 0 && eq(pk)) return { kind: 'primaryKey' };
 	for (const uc of table.uniqueConstraints ?? []) {
 		if (uc.predicate !== undefined) continue; // partial UNIQUE is not a whole-table key
-		if (eq(uc.columns)) return true;
+		if (eq(uc.columns)) return { kind: 'unique', constraint: uc };
 	}
-	return false;
+	return undefined;
+}
+
+/** True when `indices` exactly forms a declared whole-table key — the boolean-only
+ *  wrapper over {@link findDeclaredKey} (the caller does not need which key matched). */
+export function columnsFormDeclaredKey(table: TableSchema, indices: readonly number[]): boolean {
+	return findDeclaredKey(table, indices) !== undefined;
 }
 
 function findConstraintPKDefinition(

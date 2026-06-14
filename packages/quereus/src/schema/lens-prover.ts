@@ -1,7 +1,7 @@
 import type { Database } from '../core/database.js';
 import type { SchemaManager } from './manager.js';
-import type { TableSchema, UniqueConstraintSchema } from './table.js';
-import { resolvePkDefaultConflict, columnsFormDeclaredKey } from './table.js';
+import type { TableSchema, UniqueConstraintSchema, DeclaredKeyMatch } from './table.js';
+import { resolvePkDefaultConflict, findDeclaredKey } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
 import type * as AST from '../parser/ast.js';
 import type { DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate, PlanNode, RelationalPlanNode } from '../planner/nodes/plan-node.js';
@@ -1448,13 +1448,23 @@ function conflictActionName(action: ConflictResolution | undefined): string {
  *    `lens.pk-not-reconstructible` warning) — NOT a blocking error, because the
  *    table still deploys for reads.
  *
- * Otherwise: proved by the body's effective key (`proveEffectiveKeyUnique`) ⇒
- * `proved`; else proved by **bijection transport** ({@link proveKeyByBijectionTransport}
- * — every key column bare-reconstructible or authored-bijective, mapping to a
- * declared basis key over the put targets) ⇒ `proved`; else `enforced-set-level`,
- * row-time when a basis covering structure answers it, commit-time (+
- * `lens.no-backing-index` warning) when none does. The warning is suppressed for a
- * read-only table — its set-level enforcement is moot.
+ * Otherwise: proved by the body's effective key (`proveEffectiveKeyUnique`) **or**
+ * by **bijection transport** ({@link proveKeyByBijectionTransport} — every key column
+ * bare-reconstructible or authored-bijective, mapping to a declared basis key over
+ * the put targets) ⇒ `proved`; else `enforced-set-level`, row-time when a basis
+ * covering structure answers it, commit-time (+ `lens.no-backing-index` warning) when
+ * none does. The warning is suppressed for a read-only table — its set-level
+ * enforcement is moot.
+ *
+ * When a basis key backs the proof — which a successful transport proof identifies,
+ * including for a body-proved faithful projection of a basis key (a basis NOT-NULL
+ * UNIQUE is itself a relation key, so `proveEffectiveKeyUnique` proves it directly) —
+ * that basis key's conflict action governs a write-through duplicate, not the logical
+ * key's. A logical `on conflict replace`/`ignore` the basis key does not itself carry
+ * would be silently dropped, so it reds `lens.unenforceable-conflict-action`
+ * ({@link rejectTransportConflictAction}), mirroring the row-time and commit-time
+ * arms. A genuinely basis-keyless body proof (a GROUP BY aggregate, etc.) has no
+ * transport proof, so its vacuous `on conflict` deploys clean.
  */
 function classifyKeyConstraint(
 	ctx: ProveContext,
@@ -1500,19 +1510,36 @@ function classifyKeyConstraint(
 		if (oi !== undefined) outCols.push(oi);
 	}
 
-	// Body proves it? (e.g. unique(x,y) over `group by x,y`, or a faithful
-	// projection of a basis key.) Only when every column resolved to the output.
-	if (ctx.root && outCols.length === logicalColumns.length && proveEffectiveKeyUnique(ctx.root, outCols).proved) {
-		return { constraint, kind: 'proved' };
-	}
+	// A bijection-transport proof, when one exists, names the *basis key* behind the
+	// proof — the basis PK / UNIQUE the key columns map onto, whose own conflict
+	// action governs a write-through duplicate (the logical key's is never consulted).
+	// Computed up front, independent of which arm classifies the key `proved` below,
+	// because the basis key governs the write whether the key is proved by the body
+	// (a faithful projection of a basis key — a basis NOT-NULL UNIQUE is itself a
+	// relation key, so `proveEffectiveKeyUnique` proves it directly) or by transport
+	// (an authored bijection the body cannot prove). So a logical `on conflict
+	// replace`/`ignore` the basis key does not itself carry would be silently dropped
+	// on either arm — reject the mismatch (a populated `errors` blocks the deploy
+	// regardless of the obligation kind, exactly as the row-time arm does).
+	const transport = proveKeyByBijectionTransport(ctx, logicalColumns, bijectiveAuthored);
 
-	// Proved by BIJECTION TRANSPORT: every key column is bare-reconstructible or
-	// authored-bijective and maps to a declared basis key over its put target. A
-	// bijection is injective, so two distinct logical keys map to two distinct basis
-	// keys, which the basis key forbids colliding — the logical key is intrinsically
-	// unique, zero runtime enforcement. Subsumes both the basis-PK and basis-UNIQUE
-	// cases, so the authored key never needs the row-time/covering path.
-	if (proveKeyByBijectionTransport(ctx, logicalColumns, bijectiveAuthored)) {
+	// Body proves it? (e.g. unique(x,y) over `group by x,y`, or a faithful projection
+	// of a basis key.) Only when every column resolved to the output.
+	const bodyProvesKey = ctx.root != null
+		&& outCols.length === logicalColumns.length
+		&& proveEffectiveKeyUnique(ctx.root, outCols).proved;
+
+	// Proved by BODY or by BIJECTION TRANSPORT (every key column bare-reconstructible
+	// or authored-bijective, mapping to a declared basis key). Both are `proved` —
+	// zero runtime enforcement, the basis key forbids the colliding tuple. Transport
+	// subsumes both the basis-PK and basis-UNIQUE cases, so an authored key never
+	// needs the row-time/covering path. A genuinely basis-keyless body proof (a
+	// GROUP BY aggregate, etc.) has `transport === undefined`, so its vacuous
+	// `on conflict` is left untouched.
+	if (bodyProvesKey || transport) {
+		if (transport) {
+			rejectTransportConflictAction(ctx, constraint, transport, label, columnNames, readOnly, errors);
+		}
 		return { constraint, kind: 'proved' };
 	}
 
@@ -1570,6 +1597,45 @@ function classifyKeyConstraint(
 }
 
 /**
+ * Shared core for the two basis-governed set-level conflict-action rejecters
+ * (row-time covering UC, proved-transport basis key). A basis-governed key is
+ * enforced by the **basis** key, whose conflict action resolves a duplicate as
+ * `statement-OR ?? basis-key.defaultConflict ?? ABORT` — the *logical* key's own
+ * `defaultConflict` is never consulted. So a logical `on conflict replace`/`ignore`
+ * the basis key does NOT itself carry is silently dropped to ABORT at write time
+ * (with no statement-level OR), violating the declared action. Reject it at deploy.
+ *
+ * Fires only when the logical effective action is REPLACE / IGNORE *and* differs
+ * from the basis key's own action: when they match, the basis key already resolves
+ * the declared action for free (the documented remediation), so there is nothing to
+ * reject. ABORT / FAIL / ROLLBACK (and no declared action) never reject. Gated on
+ * `!readOnly`: a read-only table never writes, so the action is moot. The two
+ * callers differ only in `basis` — where the governing action and its label come
+ * from — so both funnel into this one diagnostic.
+ */
+function rejectBasisGovernedConflictAction(
+	ctx: ProveContext,
+	constraint: LogicalConstraint,
+	label: string,
+	columnNames: readonly string[],
+	readOnly: boolean,
+	errors: LensDiagnostic[],
+	basis: { conflict: ConflictResolution | undefined; label: string },
+): void {
+	if (readOnly) return;
+	const eff = effectiveKeyDefaultConflict(ctx, constraint);
+	if (eff !== ConflictResolution.REPLACE && eff !== ConflictResolution.IGNORE) return;
+	if (eff === basis.conflict) return; // basis key honors it for free — the documented remediation
+
+	errors.push({
+		code: 'lens.unenforceable-conflict-action',
+		severity: 'error',
+		site: { table: ctx.table.name, constraint: label },
+		message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) declares 'on conflict ${conflictActionName(eff)}', but its backing ${basis.label} resolves a duplicate to '${conflictActionName(basis.conflict)}' — the write path honors the basis key's action, not the logical key's, so the declared action would be silently dropped. Declare the matching 'on conflict ${conflictActionName(eff)}' on the basis key, or drop the logical conflict action.`,
+	});
+}
+
+/**
  * Row-time sibling of the commit-time `lens.unenforceable-conflict-action` block.
  * A row-time key is enforced by re-planning the lens write against the basis UC,
  * whose conflict action resolves as `statement-OR ?? basis-uc.defaultConflict ??
@@ -1577,14 +1643,8 @@ function classifyKeyConstraint(
  * key's own `defaultConflict` is never consulted in that re-plan. So a logical
  * `on conflict replace`/`ignore` the backing basis UC does NOT itself carry is
  * silently dropped to ABORT at write time (with no statement-level OR), violating
- * the declared action. Reject it at deploy, mirroring the commit-time channel.
- *
- * Fires only when the logical effective action is REPLACE / IGNORE *and* differs
- * from the basis UC's own `defaultConflict`: when they match, the basis UC already
- * resolves the declared action for free (the documented remediation), so there is
- * nothing to reject. ABORT / FAIL / ROLLBACK (and no declared action) never reject
- * — consistent with the commit-time block, which only rejects REPLACE / IGNORE.
- * Gated on `!readOnly`: a read-only table never writes, so the action is moot.
+ * the declared action. Delegates to {@link rejectBasisGovernedConflictAction} with
+ * the covering structure's basis UC as the governing key.
  */
 function rejectRowTimeConflictAction(
 	ctx: ProveContext,
@@ -1595,16 +1655,32 @@ function rejectRowTimeConflictAction(
 	readOnly: boolean,
 	errors: LensDiagnostic[],
 ): void {
-	if (readOnly) return;
-	const effectiveConflict = effectiveKeyDefaultConflict(ctx, constraint);
-	if (effectiveConflict !== ConflictResolution.REPLACE && effectiveConflict !== ConflictResolution.IGNORE) return;
-	if (effectiveConflict === covering.uc.defaultConflict) return; // basis UC honors it for free
+	rejectBasisGovernedConflictAction(ctx, constraint, label, columnNames, readOnly, errors, {
+		conflict: covering.uc.defaultConflict,
+		label: `covering structure '${covering.ref.name}'`,
+	});
+}
 
-	errors.push({
-		code: 'lens.unenforceable-conflict-action',
-		severity: 'error',
-		site: { table: ctx.table.name, constraint: label },
-		message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) declares 'on conflict ${conflictActionName(effectiveConflict)}', but its backing basis UNIQUE/PK (covering structure '${covering.ref.name}') resolves a duplicate to '${conflictActionName(covering.uc.defaultConflict)}' — the row-time write path honors the basis UC's action, not the logical key's, so the declared action would be silently dropped. Declare the matching 'on conflict ${conflictActionName(effectiveConflict)}' on the basis UNIQUE/PK, or drop the logical conflict action.`,
+/**
+ * Transport sibling of the row-time/commit-time `lens.unenforceable-conflict-action`
+ * blocks. A transport-proved key is enforced by the **basis** key the bijection maps
+ * onto (never the logical key), whose own action governs a duplicate — so a logical
+ * `on conflict replace`/`ignore` the basis key does not carry is silently dropped.
+ * Delegates to {@link rejectBasisGovernedConflictAction} with the matched basis key
+ * ({@link basisKeyDefaultConflict} / {@link basisKeyLabel}) as the governing key.
+ */
+function rejectTransportConflictAction(
+	ctx: ProveContext,
+	constraint: LogicalConstraint,
+	transport: TransportProof,
+	label: string,
+	columnNames: readonly string[],
+	readOnly: boolean,
+	errors: LensDiagnostic[],
+): void {
+	rejectBasisGovernedConflictAction(ctx, constraint, label, columnNames, readOnly, errors, {
+		conflict: basisKeyDefaultConflict(transport),
+		label: basisKeyLabel(transport),
 	});
 }
 
@@ -1712,21 +1788,34 @@ function mappedBasisColumn(ctx: ProveContext, logicalColumn: string, basis: Tabl
 // ---------------------------------------------------------------------------
 
 /**
+ * The matched basis key behind a transport-proved logical key — the basis table
+ * plus *which* declared key (PK or a specific UNIQUE) the transported columns form.
+ * Returned by {@link proveKeyByBijectionTransport} so the caller can derive the
+ * basis key's governing conflict action ({@link basisKeyDefaultConflict}), the way
+ * the row-time path reads `BasisCovering.uc`.
+ */
+interface TransportProof {
+	readonly basis: TableSchema;
+	readonly match: DeclaredKeyMatch;
+}
+
+/**
  * Proves a logical key `proved` by **transporting** it onto a declared basis key
  * through a bijection. Every key column must be either bare-reconstructible (maps
  * to its basis column via {@link mappedBasisColumn}) or authored-bijective (in
  * `bijectiveAuthored`, maps to its single put-target basis column via
  * {@link authoredPutTargetBasisColumn}); the resulting basis columns must exactly
- * form a declared basis key ({@link columnsFormDeclaredKey} — the basis PK or a
- * non-partial basis UNIQUE).
+ * form a declared basis key ({@link findDeclaredKey} — the basis PK or a non-partial
+ * basis UNIQUE). Returns the matched basis key ({@link TransportProof}) on success,
+ * or `undefined`.
  *
  * Soundness: a bijection is injective, so distinct logical keys map to distinct
  * basis keys; the basis key forbids two rows sharing that tuple, so the logical key
  * is intrinsically unique with zero runtime enforcement. This subsumes both the
  * basis-PK and basis-UNIQUE cases (a basis UNIQUE alone entails it via the
  * bijection — no covering MV required). Absent a declared basis key over the put
- * targets it returns false and the caller falls to the commit-time fallback (the
- * honest O(n) scan over the forward image), never an unsound `proved`.
+ * targets it returns `undefined` and the caller falls to the commit-time fallback
+ * (the honest O(n) scan over the forward image), never an unsound `proved`.
  *
  * Every key column must additionally be declared **NOT NULL**: a basis key is
  * NULL-skipping (SQL UNIQUE permits multiple all-NULL rows), so a nullable key is
@@ -1740,19 +1829,19 @@ function mappedBasisColumn(ctx: ProveContext, logicalColumn: string, basis: Tabl
  * Conservative: a multi-source body (no `basisSource`), a key column that is
  * neither bare nor authored-bijective, a nullable key column, an authored column
  * with more than one put target / a put target that is not a single bare basis
- * column, or any unmapped column all yield false.
+ * column, or any unmapped column all yield `undefined`.
  */
-function proveKeyByBijectionTransport(ctx: ProveContext, logicalColumns: readonly number[], bijectiveAuthored: ReadonlySet<string>): boolean {
+function proveKeyByBijectionTransport(ctx: ProveContext, logicalColumns: readonly number[], bijectiveAuthored: ReadonlySet<string>): TransportProof | undefined {
 	const basis = ctx.basisSource;
-	if (!basis) return false;
+	if (!basis) return undefined;
 
 	const basisCols: number[] = [];
 	for (const li of logicalColumns) {
 		const col = ctx.table.columns[li];
-		if (!col) return false;
+		if (!col) return undefined;
 		// A nullable key is only conditionally unique over a NULL-skipping basis key;
 		// the unconditional `proved` FD would be unsound. Defer to row-time/commit-time.
-		if (!col.notNull) return false;
+		if (!col.notNull) return undefined;
 		const name = col.name;
 		let bc: number | undefined;
 		if (isReconstructibleColumn(ctx, name)) {
@@ -1760,12 +1849,40 @@ function proveKeyByBijectionTransport(ctx: ProveContext, logicalColumns: readonl
 		} else if (bijectiveAuthored.has(name.toLowerCase())) {
 			bc = authoredPutTargetBasisColumn(ctx, name, basis);
 		} else {
-			return false; // neither bare-reconstructible nor authored-bijective
+			return undefined; // neither bare-reconstructible nor authored-bijective
 		}
-		if (bc === undefined) return false;
+		if (bc === undefined) return undefined;
 		basisCols.push(bc);
 	}
-	return columnsFormDeclaredKey(basis, basisCols);
+	const match = findDeclaredKey(basis, basisCols);
+	return match ? { basis, match } : undefined;
+}
+
+/**
+ * The governing conflict action of the basis key a transport proof matched — the
+ * action a duplicate actually resolves to. Mirrors {@link effectiveKeyDefaultConflict}'s
+ * two arms exactly: a PK uses {@link resolvePkDefaultConflict} (which also folds in
+ * any column-level `defaultConflict`); a UNIQUE uses its own `defaultConflict`.
+ */
+function basisKeyDefaultConflict(p: TransportProof): ConflictResolution | undefined {
+	return p.match.kind === 'primaryKey'
+		? resolvePkDefaultConflict(p.basis)
+		: p.match.constraint.defaultConflict;
+}
+
+/**
+ * A human-readable label for the backing basis key, for the conflict-action
+ * diagnostic. There is no MV here (the proof needs none), so name the basis key
+ * itself — the PK / UNIQUE on the basis table, falling back to the column list when
+ * a UNIQUE is unnamed (e.g. `basis unique (code)`).
+ */
+function basisKeyLabel(p: TransportProof): string {
+	if (p.match.kind === 'primaryKey') return `basis primary key on '${p.basis.name}'`;
+	const uc = p.match.constraint;
+	const ucName = uc.name !== undefined
+		? `'${uc.name}'`
+		: `(${uc.columns.map(c => p.basis.columns[c]?.name ?? `#${c}`).join(', ')})`;
+	return `basis unique ${ucName}`;
 }
 
 /**
