@@ -927,3 +927,261 @@ select code, "constraint", "column" from quereus_lens_advisories('nbk_x') where 
 -- Bijection still proved ⇒ no getput-lossy.
 select count(*) as cnt from quereus_lens_advisories('nbk_x') where code = 'lens.getput-lossy';
 → [{"cnt": 0}]
+
+-- ===================================
+-- 20. A logical UNIQUE over a PROVEN-BIJECTIVE authored inverse is REALIZABLE.
+--     The authored column is not the PK (the table is keyed and writable via the
+--     real PK `id`), so the UNIQUE classifies on its own. The forward/inverse pair
+--     is proved a bijection, AND the put-target basis column `code` carries a
+--     declared basis UNIQUE — so the logical UNIQUE is `proved` by bijection
+--     transport: zero runtime enforcement, no lens.unrealizable-constraint, no
+--     lens.no-backing-index, no lens.getput-lossy. A duplicate is forbidden by the
+--     basis UNIQUE through the write-through (the proved key relies on it, exactly
+--     as the design intends). Integer +10 affine bijection (backend-agnostic, like
+--     scenario 18). The logical UNIQUE column is NOT NULL: the bijection-transport
+--     proof requires it (a nullable key would be conditionally unique and defers to
+--     commit-time per the prereq's transport guard).
+-- ===================================
+
+declare schema buprv_b {
+	table Item (
+		id integer primary key,
+		code integer not null unique check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema buprv_b;
+
+-- run
+
+insert into buprv_b.Item values (1, 1);
+
+-- run
+
+declare logical schema buprv_x {
+	table Item (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp)
+	)
+}
+
+-- run
+
+declare lens for buprv_x over buprv_b {
+	view Item as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from buprv_b.Item
+}
+
+-- run
+
+apply schema buprv_x;
+
+-- run
+
+-- Clean deploy: proved by transport (no unrealizable, no no-backing-index, no
+-- getput-lossy), reconstructible PK (no pk-not-reconstructible).
+select count(*) as n from quereus_lens_advisories('buprv_x');
+→ [{"n": 0}]
+
+-- run
+
+-- Read transports the basis key through the forward.
+select * from buprv_x.Item order by id;
+→ [{"id": 1, "grp": 11}]
+
+-- run
+
+-- A second row whose grp maps to an existing code (grp 11 → code 1) is forbidden by
+-- the basis UNIQUE through the write-through — distinct id, so the basis PK does not
+-- catch it. The proved logical UNIQUE adds no runtime scan; the basis UNIQUE is the
+-- enforcer.
+insert into buprv_x.Item values (2, 11);
+-- error: unique
+
+-- run
+
+-- A distinct grp lands.
+insert into buprv_x.Item values (3, 12);
+select code from buprv_b.Item order by code;
+→ [{"code": 1}, {"code": 2}]
+
+-- ===================================
+-- 21. Commit-time fallback: the same bijective authored UNIQUE, but the put-target
+--     basis column has a CHECK + NOT NULL yet NO basis UNIQUE/PK over it — so the
+--     bijection-transport proof fails (no declared basis key) and findBasisCovering
+--     finds nothing (the authored projection has no bare basis column to map). The
+--     UNIQUE is still REALIZABLE: it enforces commit-time over the logical forward
+--     image, deploying with lens.no-backing-index (NOT lens.unrealizable-constraint).
+--     A logical-key duplicate ABORTs via the O(n) count scan.
+-- ===================================
+
+declare schema buct_b {
+	table Item (
+		id integer primary key,
+		code integer not null check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema buct_b;
+
+-- run
+
+insert into buct_b.Item values (1, 1);
+
+-- run
+
+declare logical schema buct_x {
+	table Item (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp)
+	)
+}
+
+-- run
+
+declare lens for buct_x over buct_b {
+	view Item as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from buct_b.Item
+}
+
+-- run
+
+apply schema buct_x;
+
+-- run
+
+-- Realizable, not proved: exactly one active no-backing-index advisory, sited at the
+-- unique constraint (the put target is not a basis key).
+select code, "constraint", status from quereus_lens_advisories('buct_x') where code = 'lens.no-backing-index';
+→ [{"code": "lens.no-backing-index", "constraint": "unique", "status": "active"}]
+
+-- run
+
+-- Neither unrealizable nor lossy: the bijection still proves the round-trip.
+select count(*) as n from quereus_lens_advisories('buct_x') where code in ('lens.unrealizable-constraint', 'lens.getput-lossy');
+→ [{"n": 0}]
+
+-- run
+
+-- Read transports the basis key.
+select * from buct_x.Item order by id;
+→ [{"id": 1, "grp": 11}]
+
+-- run
+
+-- A logical-key duplicate (grp 11 → code 1, distinct id) ABORTs via the commit-time
+-- count scan — the basis has no UNIQUE on code, so only the logical scan catches it.
+insert into buct_x.Item values (2, 11);
+-- error: constraint
+
+-- run
+
+-- A distinct grp lands (grp 12 → code 2).
+insert into buct_x.Item values (3, 12);
+select code from buct_b.Item order by code;
+→ [{"code": 1}, {"code": 2}]
+
+-- run
+
+-- A key-changing UPDATE that creates a duplicate (grp 12 → 11, colliding with id 1)
+-- also ABORTs via the commit-time scan (the constraint fires on INSERT|UPDATE; the
+-- NEW side is the authored forward image NEW.code + 10). The row is unchanged.
+update buct_x.Item set grp = 11 where grp = 12;
+-- error: constraint
+
+-- run
+
+select grp from buct_x.Item order by grp;
+→ [{"grp": 11}, {"grp": 12}]
+
+-- ===================================
+-- 22. A NON-INJECTIVE (lossy) authored UNIQUE still reds lens.unrealizable-constraint
+--     — the motivating safety case. substr(code,1,1) collapses A1/A2 → A, so the
+--     forward is not injective and the authored column is NOT in the bijective set;
+--     uniqueness over a value with no proven write path is neither provable nor
+--     enforceable, so the gate stays closed for it.
+-- ===================================
+
+declare schema bunj_b {
+	table Item (
+		id integer primary key,
+		code text not null check (code in ('A1', 'A2', 'B1'))
+	)
+}
+
+-- run
+
+apply schema bunj_b;
+
+-- run
+
+declare logical schema bunj_x {
+	table Item (
+		id integer primary key,
+		grp text null check (grp in ('A', 'B')),
+		unique (grp)
+	)
+}
+
+-- run
+
+declare lens for bunj_x over bunj_b {
+	view Item as select id, substr(code, 1, 1) as grp
+		with inverse (code = new.grp || '1')
+	from bunj_b.Item
+}
+
+-- run
+
+apply schema bunj_x;
+-- error: lens.unrealizable-constraint
+
+-- ===================================
+-- 23. Conflict-action rejection: a bijective authored UNIQUE that classifies
+--     commit-time (no basis key over the put target) with `on conflict replace`
+--     still reds lens.unenforceable-conflict-action — the commit-time count scan can
+--     only ABORT, never REPLACE. The realizability gate is lifted, but the
+--     conflict-action gate downstream still fires.
+-- ===================================
+
+declare schema buca_b {
+	table Item (
+		id integer primary key,
+		code integer not null check (code in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema buca_b;
+
+-- run
+
+declare logical schema buca_x {
+	table Item (
+		id integer primary key,
+		grp integer not null check (grp in (11, 12, 13)),
+		unique (grp) on conflict replace
+	)
+}
+
+-- run
+
+declare lens for buca_x over buca_b {
+	view Item as select id, code + 10 as grp
+		with inverse (code = new.grp - 10)
+	from buca_b.Item
+}
+
+-- run
+
+apply schema buca_x;
+-- error: lens.unenforceable-conflict-action

@@ -1437,7 +1437,12 @@ function conflictActionName(action: ConflictResolution | undefined): string {
  * A column with no write path (computed lineage) is handled by class:
  *  - a **unique** over such a column is `lens.unrealizable-constraint` (you
  *    declared uniqueness on a value with no write path — it can be neither proved
- *    nor enforced);
+ *    nor enforced), *unless* the column is authored-**bijective**
+ *    (`bijectiveAuthored`): the proven bijection transports uniqueness to/from its
+ *    put target, so it has a sound write path and is admitted to the key (proved
+ *    via transport when the put target is a basis key, else the commit-time scan
+ *    over the forward image enforces it) — the same realizability a bijective PK
+ *    column enjoys;
  *  - a **primary key** over such a column makes the whole table *read-only*
  *    (owned by {@link checkKeyReconstructibility}, surfaced as the
  *    `lens.pk-not-reconstructible` warning) — NOT a blocking error, because the
@@ -1472,7 +1477,15 @@ function classifyKeyConstraint(
 		const name = ctx.table.columns[li]?.name;
 		const oi = name !== undefined ? ctx.outputIndex.get(name.toLowerCase()) : undefined;
 		const reachable = oi !== undefined && isReconstructibleColumn(ctx, name!);
-		if (!reachable && !isPrimaryKey) {
+		// An authored-bijective column is not bare-reconstructible, but the proven
+		// bijection transports uniqueness to/from its put target — so it has a sound
+		// write path and is admitted to the key just like a bijective PK column (the
+		// bijection-transport proof below maps it to its basis column, and absent a
+		// basis key the commit-time scan over the forward image enforces it). A
+		// non-bijective authored column (or a computed/opaque column) still has no
+		// proven write path: uniqueness over it is neither provable nor enforceable.
+		const authoredBijective = name !== undefined && bijectiveAuthored.has(name.toLowerCase());
+		if (!reachable && !isPrimaryKey && !authoredBijective) {
 			errors.push({
 				code: 'lens.unrealizable-constraint',
 				severity: 'error',
@@ -1481,8 +1494,9 @@ function classifyKeyConstraint(
 			});
 			return { constraint, kind: 'enforced-set-level', mode: 'commit-time' };
 		}
-		// A PK over an unreachable column: the table is read-only (warned elsewhere);
-		// fall through to classify the obligation without a blocking error.
+		// A PK over an unreachable column (read-only, warned elsewhere) or an
+		// authored-bijective key column: fall through to classify the obligation
+		// without a blocking error.
 		if (oi !== undefined) outCols.push(oi);
 	}
 

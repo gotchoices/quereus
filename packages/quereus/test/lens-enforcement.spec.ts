@@ -957,6 +957,66 @@ describe('lens enforcement: set-level (unique / PK) commit-time at the write bou
 	});
 });
 
+describe('lens enforcement: logical UNIQUE over a bijective authored inverse', () => {
+	// A logical UNIQUE over a proven-bijective `with inverse` column is realizable
+	// (ticket `authored-bijection-unique-realizable`): the bijection transports
+	// uniqueness to/from the put target. Pin the two backing shapes — `proved` when
+	// the put target is a declared basis key, `commit-time` otherwise — mirroring the
+	// PK transport pins. Integer +10 affine bijection (backend-agnostic). The logical
+	// UNIQUE column is NOT NULL because the bijection-transport proof requires it (a
+	// nullable key defers to commit-time per the prereq's transport guard).
+	const BIJECTIVE_LENS = 'declare lens for x over y { view t as select id, code + 10 as grp with inverse (code = new.grp - 10) from y.t }';
+
+	it('proved via a basis UNIQUE over the put target ⇒ no set-level obligation, collector []', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, code integer not null unique check (code in (1, 2, 3))) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, grp integer not null check (grp in (11, 12, 13)), unique (grp)) }');
+			await db.exec(BIJECTIVE_LENS);
+			await db.exec('apply schema x');
+
+			// The basis UNIQUE over the put target makes the logical UNIQUE intrinsically
+			// unique under the bijection ⇒ `proved`, never `enforced-set-level`.
+			expect(setLevelModes(slot(db, 't')), 'proved bijective UNIQUE ⇒ no set-level obligation').to.deep.equal([]);
+			expect(
+				(slot(db, 't').obligations ?? []).some(o => o.kind === 'proved' && o.constraint.kind === 'unique'),
+				'the UNIQUE is classified proved',
+			).to.be.true;
+			expect(collectLensSetLevelConstraints(slot(db, 't')), 'proved UNIQUE ⇒ []').to.deep.equal([]);
+			expect(hasCommitTimeSetLevelObligation(slot(db, 't')), 'no commit-time obligation').to.be.false;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('no basis key over the put target ⇒ commit-time obligation + count-scan collector', async () => {
+		const db = new Database();
+		try {
+			// Same bijective authored UNIQUE, but `code` carries only CHECK + NOT NULL (no
+			// basis UNIQUE/PK), so the transport proof fails and the authored projection
+			// has no bare basis column for a covering structure ⇒ commit-time scan.
+			await db.exec('declare schema y { table t (id integer primary key, code integer not null check (code in (1, 2, 3))) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, grp integer not null check (grp in (11, 12, 13)), unique (grp)) }');
+			await db.exec(BIJECTIVE_LENS);
+			await db.exec('apply schema x');
+
+			expect(setLevelModes(slot(db, 't')), 'bijective UNIQUE with no basis key ⇒ commit-time').to.deep.equal(['commit-time']);
+			expect(hasCommitTimeSetLevelObligation(slot(db, 't')), 'commit-time obligation present').to.be.true;
+			expect(collectLensSetLevelConstraints(slot(db, 't')).length, 'one count-scan set-level constraint').to.equal(1);
+
+			// And it enforces: a logical-key duplicate (grp 11 → code 1) ABORTs via the
+			// commit-time count scan over the forward image (the basis has no UNIQUE).
+			await db.exec('insert into x.t (id, grp) values (1, 11)');
+			await expectThrows(() => db.exec('insert into x.t (id, grp) values (2, 11)'), /unique|constraint/i);
+			expect(await rows(db, 'select code from y.t order by code')).to.deep.equal([{ code: 1 }]);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens enforcement: set-level (unique / PK) row-time at the write boundary', () => {
 	/**
 	 * Deploys a row-time set-level lens: a basis `unique(email)` plus an explicit

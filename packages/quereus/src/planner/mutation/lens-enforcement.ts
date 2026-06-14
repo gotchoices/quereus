@@ -676,26 +676,31 @@ function setLevelConstraintName(c: Extract<LogicalConstraint, { kind: 'primaryKe
  *      where _u.lk1 = NEW.bk1 and … and _u.lkn = NEW.bkn) <= 1
  *
  * The subquery FROM is the **logical view** (schema-qualified + aliased `_u`), so
- * `_u.<logicalCol>` resolves against the registered logical relation while
- * `NEW.<basisCol>` is the basis write row (a correlated reference resolved from the
- * surrounding constraint scope, exactly as the FK `EXISTS` resolves `NEW.*`). The
- * `count(*)` is a `count` with empty args — `astToString` renders it `count(*)` and
- * the planner treats it as the row-count aggregate. The contained scalar subquery
- * makes the constraint pipeline auto-defer the check to commit. NULL key columns
- * fall out for free: `_u.lk = NEW.bk` is `NULL` (never true) when either side is
- * NULL, so a NULL-key row is never counted — SQL UNIQUE's NULL-distinct rule.
+ * `_u.<logicalCol>` resolves against the registered logical relation while each key
+ * column's `newSide` expression (a correlated reference resolved from the
+ * surrounding constraint scope, exactly as the FK `EXISTS` resolves `NEW.*`)
+ * reconstructs that column's **logical key value** from the basis write row: a bare
+ * `NEW.<basisCol>` for a reconstructible (rename / passthrough) column, and the
+ * authored column's NEW-qualified **forward `get`** image (e.g. `NEW.code + 10`) for
+ * a proven-bijective `with inverse` column — so a logical-domain value is compared
+ * to a logical-domain value, not a basis-domain one. The `count(*)` is a `count`
+ * with empty args — `astToString` renders it `count(*)` and the planner treats it as
+ * the row-count aggregate. The contained scalar subquery makes the constraint
+ * pipeline auto-defer the check to commit. NULL key columns fall out for free:
+ * `_u.lk = <newSide>` is `NULL` (never true) when either side is NULL, so a NULL-key
+ * row is never counted — SQL UNIQUE's NULL-distinct rule.
  */
 function synthesizeUniqueCountExpr(
 	logicalSchema: string,
 	logicalTable: string,
-	keyColumns: ReadonlyArray<{ logicalColumn: string; basisColumn: string }>,
+	keyColumns: ReadonlyArray<{ logicalColumn: string; newSide: AST.Expression }>,
 ): AST.Expression {
 	const alias = '_u';
-	const conditions: AST.Expression[] = keyColumns.map(({ logicalColumn, basisColumn }) => ({
+	const conditions: AST.Expression[] = keyColumns.map(({ logicalColumn, newSide }) => ({
 		type: 'binary',
 		operator: '=',
 		left: { type: 'column', name: logicalColumn, table: alias } as AST.ColumnExpr,
-		right: { type: 'column', name: basisColumn, table: 'NEW' } as AST.ColumnExpr,
+		right: newSide,
 	} as AST.BinaryExpr));
 
 	const whereExpr = conditions.reduce((acc, cond) => ({
@@ -748,6 +753,7 @@ function synthesizeUniqueCountExpr(
 export function collectLensSetLevelConstraints(slot: LensSlot): RowConstraintSchema[] {
 	if (!slot.obligations || slot.obligations.length === 0) return [];
 	const map = logicalToBasisColumnMap(slot);
+	const forwards = authoredForwardMap(slot);
 	const logicalSchemaName = slot.logicalTable.schemaName;
 	const logicalTableName = slot.logicalTable.name;
 	const constraints: RowConstraintSchema[] = [];
@@ -759,13 +765,25 @@ export function collectLensSetLevelConstraints(slot: LensSlot): RowConstraintSch
 		// The empty (singleton) key classifies `vacuous`, never commit-time set-level;
 		// guard defensively so an empty WHERE is never synthesized.
 		if (logicalColumns.length === 0) continue;
-		// Each logical key column → its basis column for the NEW.* side. A column the
-		// prover proved reconstructible maps; otherwise it falls back to the logical
-		// name (a non-reconstructible key would have made the table read-only — no
-		// write reaches here — but the fallback keeps the synthesis total).
+		// Each logical key column → the NEW.* expression reconstructing its logical key
+		// value from the basis write row: a bare `NEW.<basis>` for a reconstructible
+		// (rename / passthrough) column, or the authored column's NEW-qualified forward
+		// `get` image for a proven-bijective `with inverse` column (so the count compares
+		// logical value to logical value). A non-reconstructible, non-authored key would
+		// have made the table read-only — no write reaches here — but the bare-name
+		// fallback keeps the synthesis total.
 		const keyColumns = logicalColumns.map(li => {
 			const logicalColumn = slot.logicalTable.columns[li]?.name ?? `#${li}`;
-			return { logicalColumn, basisColumn: map.get(logicalColumn.toLowerCase()) ?? logicalColumn };
+			const lc = logicalColumn.toLowerCase();
+			const basisColumn = map.get(lc);
+			if (basisColumn !== undefined) {
+				return { logicalColumn, newSide: { type: 'column', name: basisColumn, table: 'NEW' } as AST.ColumnExpr };
+			}
+			const forward = forwards.get(lc);
+			if (forward !== undefined) {
+				return { logicalColumn, newSide: transformExpr(forward, col => ({ type: 'column', name: col.name, table: 'NEW' })) };
+			}
+			return { logicalColumn, newSide: { type: 'column', name: logicalColumn, table: 'NEW' } as AST.ColumnExpr };
 		});
 		constraints.push({
 			name: setLevelConstraintName(c),
