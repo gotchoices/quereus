@@ -15,7 +15,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { propagate, type BaseOp, type MutableViewLike, type MutationRequest } from './propagate.js';
-import { MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture } from './multi-source.js';
+import { MS_UPDATE_KEYS_CTE, isJoinBody, type MultiSourceKeyCapture } from './multi-source.js';
 import { cloneExpr, transformExpr } from './scope-transform.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
@@ -47,11 +47,17 @@ import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
  *
  * **A branch is itself a view body — routed per-branch via recursive `propagate`.**
  * Each operand of the set operation is a relational sub-plan (`select … from B`),
- * exactly a single-source (or, in principle, join) view body. Inserting/deleting a row
+ * exactly a **single-source** view body. A **multi-source** leg/branch — one whose FROM is a
+ * join or comma-join ({@link isJoinBody}) — is explicitly **rejected** (a clean
+ * `unsupported-set-op` diagnostic, both static and dynamic) pending
+ * `set-op-write-multisource-leg-compose`: the recursive `propagate` would route it to
+ * `propagateMultiSource`, whose own {@link MS_UPDATE_KEYS_CTE} capture (`k<side>_<j>` columns)
+ * collides with the outer set-op capture (whose columns are the view output columns) — the
+ * un-diagnosed internal `k.k0_0 isn't a column` error. Inserting/deleting a row
  * *into a branch* is a recursive view-mutation on that branch's sub-plan, so each
  * per-branch op is lowered to an AST `BaseOp` against a **synthetic branch view-like**
- * and run back through {@link propagate} — reusing the single-source / multi-source
- * spines verbatim (the branch's own σ predicate, renames, and base routing are honored
+ * and run back through {@link propagate} — reusing the single-source spine verbatim
+ * (the branch's own σ predicate, renames, and base routing are honored
  * by its spine). A branch that bottoms out in a base table emits one base op; a branch
  * that is itself a `SetOperationNode` (a **subtree operand**, `nestable-flagged-set-ops`)
  * recurses *here* for the unambiguous fan-out — a data-column UPDATE, a DELETE, and a
@@ -182,7 +188,11 @@ function isOperandWritable(operand: AST.QueryExpr, hasGatingFlag: boolean): bool
 		if (!isUnionLikeSubtree(effective.compound.op) && !hasGatingFlag) return false;
 		return isSetOpBodyWritable(effective);
 	}
-	return tryBranchColumnNames(effective) !== null;
+	// A leaf operand must be **single-source**: a multi-source (join / comma) leg is rejected
+	// pending `set-op-write-multisource-leg-compose` (the dynamic `buildBranch` rejects it too —
+	// its recursive `propagate` would collide the nested capture with the outer set-op capture).
+	// This recurses to leaves at every depth, so a nested join leaf reports non-writable too.
+	return tryBranchColumnNames(effective) !== null && !isJoinBody(effective);
 }
 
 /**
@@ -542,6 +552,22 @@ function buildBranch(
 	// `isNested`, and recursion all derive from the inner) — `set-op-leftwrap-write`. A no-op on a
 	// direct operand.
 	const effectiveSelect = unwrapBranchSelect(branchSelect);
+	// A subtree operand carries its own (non-diff) compound; its fan-out recurses to leaves.
+	const isNested = !!effectiveSelect.compound && effectiveSelect.compound.op !== 'diff';
+	// A non-nested leaf branch must be **single-source**: a multi-source (join / comma) leg is
+	// rejected pending `set-op-write-multisource-leg-compose`. Its recursive `propagate` would
+	// route to `propagateMultiSource`, whose own `__vmupd_keys` capture (`k<side>_<j>`) collides
+	// with the outer set-op capture (view-output columns) — the un-diagnosed internal
+	// `k.k0_0 isn't a column` error. A nested (subtree) operand is NOT rejected here: its join
+	// leaves are reached as non-nested branches via `analyzeSetOpBranches` → `buildBranch` and
+	// caught at that depth, so this gate covers every leaf at every nesting level.
+	if (!isNested && isJoinBody(effectiveSelect)) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op',
+			table: view.name,
+			message: `cannot write through view '${view.name}': the ${side} branch is a multi-source (join) leg, which is not yet writable — a join leg's identity capture is not yet composed (see set-op-write-multisource-leg-compose)`,
+		});
+	}
 	const dataColNames = branchColumnNames(view, side, effectiveSelect);
 	if (dataColNames.length !== dataColCount) {
 		raiseMutationDiagnostic({
@@ -556,8 +582,6 @@ function buildBranch(
 		selectAst: effectiveSelect,
 	};
 	const flag = flags.find(f => f.side === side);
-	// A subtree operand carries its own (non-diff) compound; its fan-out recurses to leaves.
-	const isNested = !!effectiveSelect.compound && effectiveSelect.compound.op !== 'diff';
 	return { side, view: branchView, dataColNames, isNested, ...(flag ? { flag } : {}) };
 }
 
@@ -1301,9 +1325,15 @@ function hasLiteralDiscriminator(leaf: AST.SelectStmt): boolean {
 	return leaf.columns.some(rc => legColumnKind(rc)?.kind === 'literal');
 }
 
-/** True iff a leaf SELECT is a writable flag-less leg: no compound, ≥1 plain/literal column, all admitted. */
+/** True iff a leaf SELECT is a writable flag-less leg: single-source, no compound, ≥1 plain/literal column, all admitted. */
 function isWritableLeafLeg(leaf: AST.SelectStmt): boolean {
 	if (leaf.compound) return false;
+	// A multi-source (join / comma) leg is rejected pending `set-op-write-multisource-leg-compose`:
+	// its recursive `propagate` routes to `propagateMultiSource`, whose own `__vmupd_keys` capture
+	// collides with the outer set-op capture (the internal `k.k0_0 isn't a column` error). Falling
+	// to `false` here makes the static surface report all-`NO` AND drops the dynamic write out of
+	// the flag-less route into the single-source spine's clean `unsupported-set-op` reject.
+	if (isJoinBody(leaf)) return false;
 	if (!leaf.columns || leaf.columns.length === 0) return false;
 	return leaf.columns.every(rc => legColumnKind(rc) !== null);
 }

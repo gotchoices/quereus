@@ -256,3 +256,45 @@ create view OU as
   select id, x, 'large' as kind from oa where size = 'large';
 insert into OU (id, x) values (7, 70);
 -- error:
+
+-- ===================================================================
+-- Multi-source (JOIN) leg rejection (`set-op-write-multisource-leg-reject`): a flag-less
+-- set-op body one of whose legs is a JOIN is NOT yet writable. The leg recognizer
+-- (`isWritableLeafLeg`) rejects a join leg (`isJoinBody`), so the static surfaces report the
+-- conservative all-`NO` row AND the dynamic write falls out of the flag-less route into the
+-- single-source spine's clean `cannot write through view` reject — NEVER the internal
+-- `k.k0_0 isn't a column` error a recursive multi-source capture would have collided into.
+-- The join-leg write-through unlock is filed as `set-op-write-multisource-leg-compose`.
+-- ===================================================================
+create table jv1 (id integer primary key, x integer, color text null);
+create table jv2 (id integer primary key, y integer);
+insert into jv1 values (1,10,'red'),(2,20,'blue');
+insert into jv2 values (1,100),(2,200);
+create view JV as
+  select jv1.id as id, jv1.x as x, 'a' as src from jv1 join jv2 on jv1.id = jv2.id where jv1.color = 'red'
+  union all
+  select id, x, 'b' as src from jv1 where color = 'blue';
+
+-- read still works (the body is a valid set-op read; only WRITE-through is rejected).
+select * from JV order by id;
+→ [{"id":1,"x":10,"src":"a"},{"id":2,"x":20,"src":"b"}]
+
+-- static surfaces: all-`NO` (the join leg drops the flag-less recognizer to non-writable).
+select is_insertable_into, is_updatable, is_deletable from view_info('JV');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+select cid, column_name, is_updatable, base_table, base_column from column_info('JV');
+→ [{"cid":0,"column_name":"id","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- dynamic write: a clean structured reject (NOT the internal `k.k0_0` error), insert/update/delete.
+delete from JV where src = 'a';
+-- error: cannot write through view
+update JV set x = x + 1 where src = 'a';
+-- error: cannot write through view
+insert into JV (id, x, src) values (5, 50, 'a');
+-- error: cannot write through view
+
+-- the base tables are untouched (every write rejected before any base op fired).
+select id, x from jv1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select id from jv2 order by id;
+→ [{"id":1},{"id":2}]

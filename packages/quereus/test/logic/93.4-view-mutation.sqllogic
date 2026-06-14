@@ -3950,3 +3950,48 @@ with t as (select id, created from q3 with defaults (created = 111))
     insert into t (id, created) select id, c from q3src;
 select * from q3 order by id;
 → [{"id":7,"created":70}]
+
+-- ===================================================================
+-- Set-op MEMBERSHIP body with a multi-source (JOIN) branch (`set-op-write-multisource-leg-reject`):
+-- a `union exists … as <flag>` body one of whose branches is a JOIN is NOT yet writable. Both
+-- the static branch-writability probe (`isOperandWritable`) and the dynamic branch builder
+-- (`buildBranch`) reject a join branch (`isJoinBody`), so `view_info` / `column_info` report the
+-- conservative all-`NO` row (no over-claim from the membership flag's presence) and a write
+-- rejects with a clean `cannot write through view … multi-source (join) leg` diagnostic — NEVER
+-- the internal `k.k0_0 isn't a column` error a recursive multi-source capture would have hit.
+-- The join-branch write-through unlock is filed as `set-op-write-multisource-leg-compose`.
+-- ===================================================================
+create table mj1 (id integer primary key, x integer, color text null);
+create table mj2 (id integer primary key, y integer);
+insert into mj1 values (1,10,'red'),(2,20,'blue');
+insert into mj2 values (1,100),(2,200);
+create view MV as
+  select mj1.id as id, mj1.x as x from mj1 join mj2 on mj1.id = mj2.id where mj1.color = 'red'
+  union exists left as inL, exists right as inR
+  select id, x from mj1 where color = 'blue';
+
+-- read (data columns) still works — only WRITE-through is rejected.
+select id, x from MV order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- static surfaces: all-`NO` (the join branch drops the branch-writability probe to non-writable).
+select is_insertable_into, is_updatable, is_deletable from view_info('MV');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+-- (column_name dropped: the membership-flag column case is not load-bearing here; every column,
+-- data and flag alike, must report is_updatable = NO with a null base.)
+select cid, is_updatable, base_table, base_column from column_info('MV');
+→ [{"cid":0,"is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- dynamic write: a clean structured reject (NOT the internal `k.k0_0` error), delete/update/insert.
+delete from MV where inL = true;
+-- error: multi-source (join) leg
+update MV set x = x + 1 where inL = true;
+-- error: multi-source (join) leg
+insert into MV (id, x, inL, inR) values (5, 50, true, false);
+-- error: multi-source (join) leg
+
+-- the base tables are untouched (every write rejected before any base op fired).
+select id, x from mj1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select id from mj2 order by id;
+→ [{"id":1},{"id":2}]

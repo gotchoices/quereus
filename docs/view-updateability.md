@@ -440,11 +440,16 @@ so a branch insert/delete can never perturb the affected set out from under a si
 Halloween-unsafe). The capture rides the existing `ViewMutationNode.identityCapture` side
 input + void/drain runtime path — no new runtime substrate.
 
-**A branch is itself a view body.** Each operand (`select … from B`) is a single-source
-(or, in principle, join) view body, so each per-branch op is lowered to an AST `BaseOp`
+**A branch is itself a view body.** Each operand (`select … from B`) is a **single-source**
+view body, so each per-branch op is lowered to an AST `BaseOp`
 against a **synthetic branch view-like** and run back through `propagate` — reusing the
 spines verbatim (the branch's own σ predicate, column renames, and base routing are honored
 by its own spine; `no-default` / computed-column rejections fall out of the recursion). A
+**multi-source** branch/leg — one whose FROM is a join or comma-join (`isJoinBody`) — is
+explicitly **rejected** (a clean `unsupported-set-op` reject, both static and dynamic) pending
+the `set-op-write-multisource-leg-compose` unlock: routing it back through `propagate` would
+reach the multi-source spine, whose own `__vmupd_keys` identity capture collides with the
+outer set-op capture (the internal `k.k0_0 isn't a column` error). A
 branch that bottoms out in a base table emits one base op; a branch that is itself a
 `SetOperationNode` (a **subtree operand**) **recurses here** for the
 unambiguous fan-out — a data-column UPDATE, a DELETE, and a `set <subtreeFlag> = false` drop
@@ -595,9 +600,11 @@ reject); an INSERT that **omits a discriminator** is consistent with every leg t
 excluded, so it routes to all of them — when two such legs share a base table this surfaces as a clean PK
 conflict (a leg discriminating by a non-`=` range σ on a *projected* column is likewise invisible to the
 oracle, so an INSERT can over-insert a phantom base row — `set-op-flagless-range-sigma-oracle`, backlog);
-a leg whose body is a **multi-source (join) body** is admitted by the recognizer's column-shape check but
-the shared fan substrate cannot compose its nested capture, so the write fails with an internal error — the
-same pre-existing limitation the `exists`-membership path has (`set-op-write-multisource-leg-capture`, fix).
+a leg whose body is a **multi-source (join) body** is now explicitly **rejected** (`isWritableLeafLeg`
+gates on `isJoinBody`), so the static surfaces report all-`NO` and the dynamic write falls out of the
+flag-less route into the single-source spine's clean `cannot write through view` reject — no longer the
+internal `k.k0_0 isn't a column` error the un-composed nested capture used to hit (`set-op-write-multisource-leg-reject`).
+Composing the nested capture to actually *support* a join leg is the separate `set-op-write-multisource-leg-compose` unlock.
 
 **v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
 view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of

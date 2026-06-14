@@ -253,9 +253,19 @@ export interface JoinViewAnalysis {
 /**
  * True when the view body is a join (and so routes to this multi-source path
  * rather than the single-source spine). Cheap AST peek — no plan built.
+ *
+ * A **compound (set-op) body** returns `false` even when its left-most leg's FROM is a
+ * join (`select … from a join b … union …`): a set-op body routes to the set-op write path
+ * (`set-op.ts`), never this multi-source join spine, whose capture/lineage walk reads only
+ * the leg's `JoinNode` and silently ignores the surrounding compound — mishandling it
+ * (`set-op-write-multisource-leg-reject`). Excluding it here lets such a body fall through to
+ * the single-source spine's clean `classifyViewBody` reject (the intent
+ * `propagate.ts` already documents). The set-op path itself detects a multi-source LEG by
+ * calling this same predicate on the **leg** SELECT (which carries no `compound`).
  */
 export function isJoinBody(selectAst: AST.QueryExpr): boolean {
 	if (selectAst.type !== 'select' || !selectAst.from) return false;
+	if (selectAst.compound) return false;
 	return selectAst.from.length > 1 || selectAst.from.some(f => f.type === 'join');
 }
 
