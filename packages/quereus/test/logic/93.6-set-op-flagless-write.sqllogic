@@ -298,3 +298,27 @@ select id, x from jv1 order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
 select id from jv2 order by id;
 → [{"id":1},{"id":2}]
+
+-- NOTE on comma-join legs (`from a, b`): the engine rejects multiple FROM sources at build
+-- time ("SELECT with multiple FROM sources (joins) not supported"), so such a body cannot even
+-- be created/read — the `from.length > 1` arm of `isJoinBody` is unreachable for any readable
+-- view and needs no write-path test. The explicit-`join` form above is the live path.
+
+-- Join leg at chain depth > 1: a flag-less union-all chain whose THIRD leg is a JOIN. The
+-- flag-less recognizer walks every leg (`flaglessShape`'s loop), so a join at any depth drops
+-- the whole body to non-writable — the every-depth coverage claim, exercised here (the
+-- implementer's tests used only depth-1 join legs).
+create view DV as
+  select id, x, 'a' as src from jv1 where color = 'red'
+  union all
+  select id, x, 'b' as src from jv1 where color = 'blue'
+  union all
+  select jv1.id as id, jv1.x as x, 'c' as src from jv1 join jv2 on jv1.id = jv2.id where jv1.color = 'red';
+select is_insertable_into, is_updatable, is_deletable from view_info('DV');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+delete from DV where src = 'a';
+-- error: cannot write through view
+insert into DV (id, x, src) values (5, 50, 'a');
+-- error: cannot write through view
+select id, x from jv1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
