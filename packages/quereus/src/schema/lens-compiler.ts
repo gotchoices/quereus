@@ -1,7 +1,7 @@
 import type { Database } from '../core/database.js';
 import type { Schema } from './schema.js';
 import type { SchemaManager } from './manager.js';
-import type { TableSchema } from './table.js';
+import { columnsFormDeclaredKey, type TableSchema } from './table.js';
 import type { ViewSchema } from './view.js';
 import type * as AST from '../parser/ast.js';
 import { QuereusError } from '../common/errors.js';
@@ -1681,7 +1681,7 @@ function validatePrimaryAdvertisement(
 			// (`entity` alone, which is deliberately one-to-many across attributes).
 			const target = [member.attributePivot.entityColumn, member.attributePivot.attributeColumn];
 			const idx = resolveColumnIndices(table, target);
-			if (idx && !indicesFormDeclaredUnique(table, idx)) {
+			if (idx && !columnsFormDeclaredKey(table, idx)) {
 				errors.push(`EAV pivot member '${member.relationId}' conflict target (${target.join(', ')}) is not a declared PRIMARY KEY or UNIQUE constraint on '${table.name}'; the get-side correlated subquery requires (entity, attribute) single-valued and the per-attribute materialize INSERT cedes matched triples via \`on conflict (${target.join(', ')}) do nothing\` — declare a PRIMARY KEY / UNIQUE on those columns`);
 			}
 			continue;
@@ -1689,7 +1689,7 @@ function validatePrimaryAdvertisement(
 		const keyCols = sharedKey.keyColumnsByRelation.get(member.relationId) ?? [];
 		if (keyCols.length === 0) continue; // singleton (`primary key ()`) — no stitch, no materialize path
 		const idx = resolveColumnIndices(table, keyCols);
-		if (idx && !indicesFormDeclaredUnique(table, idx)) {
+		if (idx && !columnsFormDeclaredKey(table, idx)) {
 			errors.push(`member '${member.relationId}' stitch key (${keyCols.join(', ')}) is not a declared PRIMARY KEY or UNIQUE constraint on basis relation '${table.name}'; the decomposition equi-join requires a 1:1 stitch and the optional-member materialize INSERT's \`on conflict (${keyCols.join(', ')}) do nothing\` only cedes matched rows against a declared unique — declare a PRIMARY KEY / UNIQUE on those columns`);
 		}
 	}
@@ -1768,26 +1768,6 @@ function resolveColumnIndices(table: TableSchema, names: readonly string[]): num
 		out.push(i);
 	}
 	return out;
-}
-
-/**
- * True when `indices` (as a set) exactly equals the column set of a declared
- * PRIMARY KEY or a non-partial UNIQUE constraint on `table`. Exact set-equality
- * mirrors how `on conflict (cols)` resolves a constraint by its column set; a
- * partial UNIQUE (`predicate !== undefined`, synthesized from `CREATE UNIQUE INDEX
- * … WHERE …`) only guarantees uniqueness within its scope and cannot back an
- * unqualified conflict target, so it is skipped.
- */
-function indicesFormDeclaredUnique(table: TableSchema, indices: readonly number[]): boolean {
-	const want = new Set(indices);
-	const eq = (cols: readonly number[]) => cols.length === want.size && cols.every(c => want.has(c));
-	const pk = table.primaryKeyDefinition.map(p => p.index);
-	if (pk.length > 0 && eq(pk)) return true;
-	for (const uc of table.uniqueConstraints ?? []) {
-		if (uc.predicate !== undefined) continue; // partial UNIQUE is not a whole-table key
-		if (eq(uc.columns)) return true;
-	}
-	return false;
 }
 
 /** Resolves a member's {@link BasisRelationRef} to a concrete basis table. */

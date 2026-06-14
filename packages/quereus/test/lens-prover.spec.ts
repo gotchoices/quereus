@@ -568,6 +568,78 @@ describe('lens prover: read-only (key reconstructibility)', () => {
 	});
 });
 
+describe('lens prover: bijective authored PK (key-reconstructible by proven bijection)', () => {
+	it('proved by bijection transport — a PK over a proven-bijective authored inverse deploys WRITABLE', async () => {
+		const db = new Database();
+		try {
+			await db.exec("declare schema y { table Item (code text primary key check (code in ('a','b','c'))) }");
+			await db.exec('apply schema y');
+			await db.exec("declare logical schema x { table Item (grp text primary key check (grp in ('A','B','C'))) }");
+			await db.exec('declare lens for x over y { view Item as select upper(code) as grp with inverse (code = lower(new.grp)) from y.Item }');
+			await db.exec('apply schema x');
+
+			const s = slot(db, 'Item');
+			expect(s.readOnly ?? false, 'bijective authored PK ⇒ reconstructible ⇒ writable').to.equal(false);
+
+			// The logical PK is `proved` by bijection transport onto the basis PK over
+			// the put target — zero runtime enforcement, like any proved key. A
+			// regression to commit-time would re-introduce the spurious no-backing-index.
+			const pk = findObligation(s, 'primaryKey');
+			expect(pk.kind, 'PK proved by bijection transport').to.equal('proved');
+
+			// No advisories: reconstructible (no pk-not-reconstructible), proved (no
+			// no-backing-index), bijective (no getput-lossy).
+			expect(warningCodes(db), 'no read-only advisory').to.not.include('lens.pk-not-reconstructible');
+			expect(warningCodes(db), 'no commit-time advisory').to.not.include('lens.no-backing-index');
+			expect(warningCodes(db), 'bijection suppresses the lossy advisory').to.not.include('lens.getput-lossy');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('non-injective authored PK stays read-only (the gate is the bijection verdict, not the bare-column test)', async () => {
+		const db = new Database();
+		try {
+			// substr(code,1,1) collapses A1/A2 — not injective, so the authored PK is
+			// neither bare-reconstructible nor bijective-authored ⇒ read-only.
+			await db.exec("declare schema y { table Item (code text primary key check (code in ('A1','A2','B1'))) }");
+			await db.exec('apply schema y');
+			await db.exec("declare logical schema x { table Item (grp text primary key check (grp in ('A','B'))) }");
+			await db.exec("declare lens for x over y { view Item as select substr(code,1,1) as grp with inverse (code = new.grp || '1') from y.Item }");
+			await db.exec('apply schema x');
+
+			const s = slot(db, 'Item');
+			expect(s.readOnly, 'non-injective authored PK ⇒ read-only').to.equal(true);
+			expect(warningCodes(db)).to.include('lens.pk-not-reconstructible');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('bijective authored PK whose put-target is NOT a basis key is writable but enforces commit-time (not proved)', async () => {
+		const db = new Database();
+		try {
+			// `code` is NOT NULL + CHECK (so the bijection proves ⇒ reconstructible ⇒
+			// writable), but the basis PK is the unrelated `id`, so `code` is not a basis
+			// key — the logical key is not intrinsically unique ⇒ commit-time, not proved.
+			await db.exec("declare schema y { table Item (id integer primary key, code text not null check (code in ('a','b','c'))) }");
+			await db.exec('apply schema y');
+			await db.exec("declare logical schema x { table Item (grp text primary key check (grp in ('A','B','C'))) }");
+			await db.exec('declare lens for x over y { view Item as select upper(code) as grp with inverse (code = lower(new.grp)) from y.Item }');
+			await db.exec('apply schema x');
+
+			const s = slot(db, 'Item');
+			expect(s.readOnly ?? false, 'bijective ⇒ reconstructible ⇒ writable').to.equal(false);
+			const pk = findObligation(s, 'primaryKey');
+			expect(pk.kind === 'enforced-set-level' && pk.mode, 'commit-time (no basis key over the put target)').to.equal('commit-time');
+			expect(warningCodes(db), 'writable').to.not.include('lens.pk-not-reconstructible');
+			expect(warningCodes(db), 'commit-time key warns no-backing-index').to.include('lens.no-backing-index');
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens prover: advisories', () => {
 	it('partial-override — lists override-authored vs default gap-filled columns', async () => {
 		const db = new Database();

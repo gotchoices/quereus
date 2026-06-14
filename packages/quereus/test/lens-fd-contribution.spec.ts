@@ -155,6 +155,47 @@ describe('lens FD contribution: the soundness gate (computeLensAssertedKeyFds)',
 		}
 	});
 
+	it('bijective authored PK — a proven-bijection key over a basis key contributes the UNCONDITIONAL key FD', async () => {
+		const db = new Database();
+		try {
+			// `grp` is a computed authored column the round-trip proves a bijection onto the
+			// basis PK `code`; the logical key is intrinsically unique, so it classifies
+			// `proved` and contributes an unconditional `grp → note` (no guard).
+			await db.exec("declare schema y { table Item (code text primary key check (code in ('a','b','c')), note text) }");
+			await db.exec('apply schema y');
+			await db.exec("declare logical schema x { table Item (grp text primary key check (grp in ('A','B','C')), note text) }");
+			await db.exec('declare lens for x over y { view Item as select upper(code) as grp with inverse (code = lower(new.grp)), note from y.Item }');
+			await db.exec('apply schema x');
+
+			const list = fds(db, 'Item');
+			const fd = fdByDeterminants(list, [0]);
+			expect(fd, 'an FD determined by grp (col 0)').to.not.be.undefined;
+			expect(fd!.dependents, 'determines note (col 1)').to.deep.equal([1]);
+			expect(fd!.guard, 'bijection-transport-proved key is unconditional (no guard)').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('bijective authored PK but NO basis key — commit-time, contributes NO key FD (soundness floor)', async () => {
+		const db = new Database();
+		try {
+			// `code` is NOT NULL + CHECK (so the bijection proves) but the basis PK is the
+			// unrelated `id`, so the logical key is not intrinsically unique ⇒ commit-time ⇒
+			// excluded. A stray unconditional FD here could make DISTINCT/join-elim drop rows.
+			await db.exec("declare schema y { table Item (id integer primary key, code text not null check (code in ('a','b','c')), note text) }");
+			await db.exec('apply schema y');
+			await db.exec("declare logical schema x { table Item (grp text primary key check (grp in ('A','B','C')), note text) }");
+			await db.exec('declare lens for x over y { view Item as select upper(code) as grp with inverse (code = lower(new.grp)), note from y.Item }');
+			await db.exec('apply schema x');
+
+			const list = fds(db, 'Item');
+			expect(fdByDeterminants(list, [0]), 'no FD for the commit-time bijective key').to.be.undefined;
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('plain (non-lens) view contributes no node — computeLensAssertedKeyFds only sees lens slots', async () => {
 		const db = new Database();
 		try {

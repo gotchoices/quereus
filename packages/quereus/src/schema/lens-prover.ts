@@ -1,7 +1,7 @@
 import type { Database } from '../core/database.js';
 import type { SchemaManager } from './manager.js';
 import type { TableSchema, UniqueConstraintSchema } from './table.js';
-import { resolvePkDefaultConflict } from './table.js';
+import { resolvePkDefaultConflict, columnsFormDeclaredKey } from './table.js';
 import type { LensSlot, LogicalConstraint } from './lens.js';
 import type * as AST from '../parser/ast.js';
 import type { DomainConstraint, FunctionalDependency, GuardClause, GuardPredicate, PlanNode, RelationalPlanNode } from '../planner/nodes/plan-node.js';
@@ -236,10 +236,22 @@ export function proveLens(slot: LensSlot, db: Database): LensProveResult {
 
 	checkColumnCoverage(ctx, errors);
 	checkTypeAndNullability(ctx, errors);
-	const readOnly = checkKeyReconstructibility(ctx, warnings);
-	proveRoundTrip(ctx, readOnly, errors, warnings);
 
-	const obligations = classifyObligations(ctx, readOnly, errors, warnings);
+	// Run the round-trip enumeration ONCE, up front: it produces both the
+	// proven-bijection verdict per authored column (the same `{proved, injective}`
+	// that suppresses `lens.getput-lossy`) and the cached enumeration the
+	// round-trip diagnostics consume. Hoisting it ahead of key reconstructibility
+	// is what lets a bijective authored PK column count as reconstructible
+	// (writable) instead of read-only — a bijection maps a written logical key to
+	// exactly one basis key and back. {@link emitRoundTrip} consumes the cache; it
+	// never re-runs the enumeration.
+	const rt = analyzeRoundTrip(ctx);
+	const bijectiveAuthored = bijectiveAuthoredColumns(rt);
+
+	const readOnly = checkKeyReconstructibility(ctx, bijectiveAuthored, warnings);
+	emitRoundTrip(ctx, rt, readOnly, errors, warnings);
+
+	const obligations = classifyObligations(ctx, readOnly, bijectiveAuthored, errors, warnings);
 
 	checkAnsweringStructures(ctx, warnings);
 	checkPartialOverride(ctx, warnings);
@@ -451,23 +463,28 @@ function checkTypeAndNullability(ctx: ProveContext, errors: LensDiagnostic[]): v
 
 /**
  * For a writable logical table the logical PK must be reconstructible at the lens
- * boundary — each PK column maps to a plain (invertible) basis column projection.
- * When it is not (a computed / aggregated PK column), the table is
- * **read-only**: reads still work, but any mutation errors at the lens
- * (`planner/mutation/single-source.ts` `analyzeView` raises). This is not a deploy-blocking error — the table
- * deploys read-only — so it surfaces as a warning, and `readOnly` is set on the
- * slot. The empty (singleton) PK is vacuously reconstructible.
+ * boundary — each PK column either maps to a plain (invertible) basis column
+ * projection ({@link isReconstructibleColumn}) **or** is an authored
+ * (`with inverse`) column whose forward/inverse pair the round-trip enumeration
+ * proved a **bijection** (`bijectiveAuthored`). A bijective key is fully
+ * reconstructible: a written logical key maps to exactly one basis key and back.
+ * When a PK column is neither (a computed / aggregated / non-injective authored
+ * column), the table is **read-only**: reads still work, but any mutation errors
+ * at the lens (`planner/mutation/single-source.ts` `analyzeView` raises). This is
+ * not a deploy-blocking error — the table deploys read-only — so it surfaces as a
+ * warning, and `readOnly` is set on the slot. The empty (singleton) PK is
+ * vacuously reconstructible.
  *
  * @returns whether the table is read-only.
  */
-function checkKeyReconstructibility(ctx: ProveContext, warnings: LensDiagnostic[]): boolean {
+function checkKeyReconstructibility(ctx: ProveContext, bijectiveAuthored: ReadonlySet<string>, warnings: LensDiagnostic[]): boolean {
 	const pk = ctx.table.primaryKeyDefinition;
 	if (pk.length === 0) return false; // singleton — 0-or-1 row, vacuously reconstructible
 
 	const unreconstructible: string[] = [];
 	for (const pkCol of pk) {
 		const name = ctx.table.columns[pkCol.index]?.name;
-		if (name === undefined || !isReconstructibleColumn(ctx, name)) {
+		if (name === undefined || !(isReconstructibleColumn(ctx, name) || bijectiveAuthored.has(name.toLowerCase()))) {
 			unreconstructible.push(name ?? `#${pkCol.index}`);
 		}
 	}
@@ -483,9 +500,11 @@ function checkKeyReconstructibility(ctx: ProveContext, warnings: LensDiagnostic[
 }
 
 /**
- * A logical column is reconstructible iff its body-output projection term is a
- * plain column reference (so a written value maps straight back to a basis
- * column). A computed (non-column) projection has no write path.
+ * A logical column is **bare-reconstructible** iff its body-output projection term
+ * is a plain column reference (so a written value maps straight back to a basis
+ * column). A computed (non-column) projection has no bare write path — but an
+ * authored (`with inverse`) computed column may still be key-reconstructible by a
+ * proven bijection; that case is handled by the `bijectiveAuthored` set, not here.
  */
 function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean {
 	const oi = ctx.outputIndex.get(columnName.toLowerCase());
@@ -497,6 +516,21 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
 // ---------------------------------------------------------------------------
 // Error: round-trip / lens laws (lens.non-invertible) — computed deploy-time form
 // ---------------------------------------------------------------------------
+
+/**
+ * The hoisted round-trip analysis: the per-column verdicts plus, for each authored
+ * column, its cached PutGet enumeration. Produced ONCE by {@link analyzeRoundTrip}
+ * and consumed by both {@link bijectiveAuthoredColumns} (the proven-bijection set
+ * that gates key reconstructibility) and {@link emitRoundTrip} (the diagnostics).
+ * `verdicts` is undefined when the body degrades to safe (out of fragment / failed
+ * to plan); `authoredEnum` is then empty.
+ */
+interface RoundTripAnalysis {
+	/** Per-output-column round-trip verdicts, in attribute order; undefined ⇒ degrade-to-safe. */
+	readonly verdicts?: readonly ColumnRoundTrip[];
+	/** Authored logical column (lowercased) → its cached PutGet enumeration. */
+	readonly authoredEnum: ReadonlyMap<string, PutGetEnumeration>;
+}
 
 /**
  * Round-trip (GetPut / PutGet) over the writable fragment, **computed at deploy**
@@ -514,7 +548,61 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
  *    restriction the column's inverse carries is **entailed** by the residual
  *    predicate.
  *
- * The firing rule has three branches:
+ * This is the *analysis* half, split from the diagnostic emission
+ * ({@link emitRoundTrip}) so the per-authored-column enumeration runs **exactly
+ * once**: each authored verdict's {@link provePutGetByEnumeration} result is cached
+ * keyed by the logical column (lowercased), and both the bijection-set consumer and
+ * the emitter read the cache. The split is a pure refactor — the cached enumeration
+ * is byte-identical to what the formerly-inline authored-inverse check computed.
+ *
+ * Degrade-to-safe: yields no verdicts (and an empty enum map) whenever the
+ * complement cannot characterize the body (out of the single-source projection-and-
+ * filter fragment, lineage not threaded, or a non-negation-free residual) — today's
+ * behaviour, the mutation-time and key-reconstructibility nets still govern. The
+ * body is planned **logically** ({@link planLogicalBody}, not `ctx.root`) so the
+ * Project/Filter/TableReference operator tree threading `updateLineage` survives.
+ * See `docs/lens.md` § Round-trip and `docs/view-updateability.md`
+ * § The predicate-honest complement.
+ */
+function analyzeRoundTrip(ctx: ProveContext): RoundTripAnalysis {
+	const authoredEnum = new Map<string, PutGetEnumeration>();
+	const root = planLogicalBody(ctx);
+	if (!root) return { authoredEnum }; // body failed to plan logically → safe verdict
+	const verdicts = computeRoundTrip(root);
+	if (!verdicts) return { authoredEnum }; // out of fragment / indeterminate complement → safe verdict
+
+	verdicts.forEach((v, i) => {
+		if (!v.authored) return;
+		// Site at the *logical* column (the contract spelling), positionally aligned
+		// with the body output — the same space {@link emitRoundTrip} re-derives it in.
+		const column = ctx.outputColumns[i] ?? v.name;
+		authoredEnum.set(column.toLowerCase(), provePutGetByEnumeration(ctx, column, v.authored, v.forward));
+	});
+	return { verdicts, authoredEnum };
+}
+
+/**
+ * The authored logical columns (lowercased) the round-trip enumeration proved a
+ * **bijection** (`{kind:'proved', injective:true}`) — the same verdict that
+ * suppresses `lens.getput-lossy`. A bijective authored column is key-reconstructible
+ * (a written logical key maps to exactly one basis key and back) and its logical key
+ * is intrinsically unique, so this set gates both {@link checkKeyReconstructibility}
+ * and the bijection-transport `proved` classification in {@link classifyKeyConstraint}.
+ * A column outside the set (non-injective, indeterminate, or a violation) confers no
+ * reconstructibility.
+ */
+function bijectiveAuthoredColumns(rt: RoundTripAnalysis): ReadonlySet<string> {
+	const set = new Set<string>();
+	for (const [column, enumResult] of rt.authoredEnum) {
+		if (enumResult.kind === 'proved' && enumResult.injective) set.add(column);
+	}
+	return set;
+}
+
+/**
+ * Emits the round-trip diagnostics from the cached {@link RoundTripAnalysis} — the
+ * *diagnostic* half, split from {@link analyzeRoundTrip} (which already ran the
+ * enumeration). The firing rule has three branches:
  *  1. a column the lens presents as writable (a `base` {@link ResolvedBaseSite})
  *     whose round-trip the analysis cannot prove faithful (`v.writable &&
  *     !v.faithful`) — the original rule, unchanged.
@@ -522,17 +610,14 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
  *     writable via the `quereus.lens.writable = true` intent tag
  *     ({@link intentWritable}): the round-trip law's stronger reading makes this
  *     an authoring error, not a derived column.
- *  3. an **authored** (`with inverse`) column ({@link checkAuthoredInverse}):
+ *  3. an **authored** (`with inverse`) column ({@link emitAuthoredInverseDiagnostics}):
  *     writable by construction (it satisfies the writable intent exactly as an
  *     inferred inverse does — branch 2 never fires for it). PutGet is checked by
- *     *composition*: when the logical column carries an enumerable CHECK
- *     `in (...)` domain, `forward(inverse(v))` is const-evaluated per domain
- *     value — a value that fails to reproduce is the hard `lens.putget-violation`
- *     error; no enumerable domain degrades to the safe admit. GetPut is
- *     surrendered by design for a non-injective forward (a write-through
- *     normalizes the base value) and surfaces as the acknowledgeable
- *     `lens.getput-lossy` advisory — suppressed only when the enumeration also
- *     proves the forward bijective over the basis domain.
+ *     *composition* (the cached enumeration): a value that fails to reproduce is the
+ *     hard `lens.putget-violation` error; GetPut is surrendered by design for a
+ *     non-injective forward and surfaces as the acknowledgeable `lens.getput-lossy`
+ *     advisory — suppressed only when the enumeration also proves the forward
+ *     bijective over the basis domain.
  *
  * An opaque column carrying no intent tag (or `= false`) is *not* a deploy error
  * — it is an intentional read-only/derived column (its write reds `no-inverse` at
@@ -545,34 +630,25 @@ function isReconstructibleColumn(ctx: ProveContext, columnName: string): boolean
  * `(speed + 1) - 2`), NOT `isReconstructibleColumn` (the bare-column test, which
  * would false-fire on such a chain).
  *
- * Degrade-to-safe: returns `[]` (today's behaviour — the mutation-time and
- * key-reconstructibility nets still govern) whenever the complement cannot
- * characterize the body (out of the single-source projection-and-filter fragment,
- * lineage not threaded, or a non-negation-free residual). In that case there are
- * no per-column verdicts and the writable-intent branch does **not** fire — so an
- * out-of-fragment opaque column tagged writable does not deploy-block; it still
- * reds `no-inverse` at mutation time. This completeness gap is intentional. The
- * body is planned **logically** ({@link planLogicalBody}, not `ctx.root`) so the
- * Project/Filter/TableReference operator tree threading `updateLineage` survives.
- * See `docs/lens.md` § Round-trip and `docs/view-updateability.md`
- * § The predicate-honest complement.
+ * Degrade-to-safe: emits nothing when {@link analyzeRoundTrip} produced no verdicts —
+ * so an out-of-fragment opaque column tagged writable does not deploy-block; it still
+ * reds `no-inverse` at mutation time. This completeness gap is intentional.
  */
-function proveRoundTrip(ctx: ProveContext, readOnly: boolean, errors: LensDiagnostic[], warnings: LensDiagnostic[]): void {
-	const root = planLogicalBody(ctx);
-	if (!root) return; // body failed to plan logically → safe verdict
-	const verdicts = computeRoundTrip(root);
-	if (!verdicts) return; // out of fragment / indeterminate complement → safe verdict
+function emitRoundTrip(ctx: ProveContext, rt: RoundTripAnalysis, readOnly: boolean, errors: LensDiagnostic[], warnings: LensDiagnostic[]): void {
+	if (!rt.verdicts) return; // degrade-to-safe: no per-column verdicts to emit
 
-	verdicts.forEach((v, i) => {
+	rt.verdicts.forEach((v, i) => {
 		// Site at the *logical* column (the contract spelling), positionally aligned
-		// with the body output — the same space `column_info` derives writability in.
+		// with the body output — the same space {@link analyzeRoundTrip} cached it in.
 		const column = ctx.outputColumns[i] ?? v.name;
 
 		// (3) An authored (`with inverse`) column: writable by construction (the
 		// intent branch below never fires), PutGet checked by composition, GetPut
-		// surrendered into the `lens.getput-lossy` advisory.
+		// surrendered into the `lens.getput-lossy` advisory. Consumes the cached
+		// enumeration (always present for an authored verdict — same iteration).
 		if (v.authored) {
-			checkAuthoredInverse(ctx, column, v.authored, v.forward, readOnly, errors, warnings);
+			const enumResult = rt.authoredEnum.get(column.toLowerCase());
+			if (enumResult) emitAuthoredInverseDiagnostics(ctx, column, enumResult, readOnly, errors, warnings);
 			return;
 		}
 
@@ -647,7 +723,7 @@ export interface ColumnRoundTrip {
 	/**
 	 * The authored (`with inverse`) put payload, when the column's write path is
 	 * authored. Such a column is writable+faithful *structurally*; its law
-	 * treatment is the prover's authored branch ({@link checkAuthoredInverse}) —
+	 * treatment is the prover's authored branch ({@link emitAuthoredInverseDiagnostics}) —
 	 * PutGet by enumeration, GetPut surrendered into the lossy advisory.
 	 */
 	readonly authored?: AuthoredSite;
@@ -657,9 +733,9 @@ export interface ColumnRoundTrip {
 
 /**
  * The computed per-column GetPut/PutGet verdict over a planned **logical** body —
- * the deploy-time predicate `proveRoundTrip` consumes, exported so the operational
- * round-trip harness (`test/property.spec.ts` § View Round-Trip Laws) can assert
- * it agrees with the operational law per column.
+ * the deploy-time predicate {@link analyzeRoundTrip} / {@link emitRoundTrip} consume,
+ * exported so the operational round-trip harness (`test/property.spec.ts` § View
+ * Round-Trip Laws) can assert it agrees with the operational law per column.
  *
  * Returns `undefined` (the degrade-to-safe signal) for any body the complement
  * does not characterize: not single-source projection-and-filter (multi-source /
@@ -932,9 +1008,11 @@ type PutGetEnumeration =
 	| { readonly kind: 'indeterminate'; readonly domain?: readonly SqlValue[] };
 
 /**
- * The law treatment for one authored-inverse column (firing-rule branch 3):
+ * Emits the law-treatment diagnostics for one authored-inverse column (firing-rule
+ * branch 3) from its **cached** {@link PutGetEnumeration} (computed once in
+ * {@link analyzeRoundTrip}, never re-run here):
  *
- *  - **PutGet** (`forward(inverse(v)) ≡ v`) — checked by composition over the
+ *  - **PutGet** (`forward(inverse(v)) ≡ v`) — proved by composition over the
  *    logical column's enumerable CHECK `in (...)` domain
  *    ({@link provePutGetByEnumeration}). A value that fails to reproduce is the
  *    hard `lens.putget-violation` error (a put that loses the written value is
@@ -954,16 +1032,14 @@ type PutGetEnumeration =
  * The advisory's fingerprint carries the rendered domain values, so a CHECK
  * list change (the domain gains a value) re-surfaces an acknowledgment.
  */
-function checkAuthoredInverse(
+function emitAuthoredInverseDiagnostics(
 	ctx: ProveContext,
 	column: string,
-	authored: AuthoredSite,
-	forward: AST.Expression | undefined,
+	result: PutGetEnumeration,
 	readOnly: boolean,
 	errors: LensDiagnostic[],
 	warnings: LensDiagnostic[],
 ): void {
-	const result = provePutGetByEnumeration(ctx, column, authored, forward);
 	if (result.kind === 'violation') {
 		errors.push({
 			code: 'lens.putget-violation',
@@ -1281,10 +1357,10 @@ function renderSqlValue(v: SqlValue): string {
  * write path (computed lineage) is neither provable nor attachable.
  * Set-level constraints with no covering structure emit `lens.no-backing-index`.
  */
-function classifyObligations(ctx: ProveContext, readOnly: boolean, errors: LensDiagnostic[], warnings: LensDiagnostic[]): ConstraintObligation[] {
+function classifyObligations(ctx: ProveContext, readOnly: boolean, bijectiveAuthored: ReadonlySet<string>, errors: LensDiagnostic[], warnings: LensDiagnostic[]): ConstraintObligation[] {
 	const obligations: ConstraintObligation[] = [];
 	for (const c of ctx.slot.attachedConstraints) {
-		obligations.push(classifyConstraint(ctx, c, readOnly, errors, warnings));
+		obligations.push(classifyConstraint(ctx, c, readOnly, bijectiveAuthored, errors, warnings));
 	}
 	return obligations;
 }
@@ -1293,14 +1369,15 @@ function classifyConstraint(
 	ctx: ProveContext,
 	constraint: LogicalConstraint,
 	readOnly: boolean,
+	bijectiveAuthored: ReadonlySet<string>,
 	errors: LensDiagnostic[],
 	warnings: LensDiagnostic[],
 ): ConstraintObligation {
 	switch (constraint.kind) {
 		case 'primaryKey':
-			return classifyKeyConstraint(ctx, constraint, constraint.columns.map(c => c.index), 'primary key', true, readOnly, errors, warnings);
+			return classifyKeyConstraint(ctx, constraint, constraint.columns.map(c => c.index), 'primary key', true, readOnly, bijectiveAuthored, errors, warnings);
 		case 'unique':
-			return classifyKeyConstraint(ctx, constraint, constraint.constraint.columns, constraintLabel(constraint), false, readOnly, errors, warnings);
+			return classifyKeyConstraint(ctx, constraint, constraint.constraint.columns, constraintLabel(constraint), false, readOnly, bijectiveAuthored, errors, warnings);
 		case 'check':
 			return classifyCheckConstraint(ctx, constraint, errors);
 		case 'foreignKey':
@@ -1367,9 +1444,12 @@ function conflictActionName(action: ConflictResolution | undefined): string {
  *    table still deploys for reads.
  *
  * Otherwise: proved by the body's effective key (`proveEffectiveKeyUnique`) ⇒
- * `proved`; else `enforced-set-level`, row-time when a basis covering structure
- * answers it, commit-time (+ `lens.no-backing-index` warning) when none does. The
- * warning is suppressed for a read-only table — its set-level enforcement is moot.
+ * `proved`; else proved by **bijection transport** ({@link proveKeyByBijectionTransport}
+ * — every key column bare-reconstructible or authored-bijective, mapping to a
+ * declared basis key over the put targets) ⇒ `proved`; else `enforced-set-level`,
+ * row-time when a basis covering structure answers it, commit-time (+
+ * `lens.no-backing-index` warning) when none does. The warning is suppressed for a
+ * read-only table — its set-level enforcement is moot.
  */
 function classifyKeyConstraint(
 	ctx: ProveContext,
@@ -1378,6 +1458,7 @@ function classifyKeyConstraint(
 	label: string,
 	isPrimaryKey: boolean,
 	readOnly: boolean,
+	bijectiveAuthored: ReadonlySet<string>,
 	errors: LensDiagnostic[],
 	warnings: LensDiagnostic[],
 ): ConstraintObligation {
@@ -1408,6 +1489,16 @@ function classifyKeyConstraint(
 	// Body proves it? (e.g. unique(x,y) over `group by x,y`, or a faithful
 	// projection of a basis key.) Only when every column resolved to the output.
 	if (ctx.root && outCols.length === logicalColumns.length && proveEffectiveKeyUnique(ctx.root, outCols).proved) {
+		return { constraint, kind: 'proved' };
+	}
+
+	// Proved by BIJECTION TRANSPORT: every key column is bare-reconstructible or
+	// authored-bijective and maps to a declared basis key over its put target. A
+	// bijection is injective, so two distinct logical keys map to two distinct basis
+	// keys, which the basis key forbids colliding — the logical key is intrinsically
+	// unique, zero runtime enforcement. Subsumes both the basis-PK and basis-UNIQUE
+	// cases, so the authored key never needs the row-time/covering path.
+	if (proveKeyByBijectionTransport(ctx, logicalColumns, bijectiveAuthored)) {
 		return { constraint, kind: 'proved' };
 	}
 
@@ -1600,6 +1691,84 @@ function mappedBasisColumn(ctx: ProveContext, logicalColumn: string, basis: Tabl
 	const rc = ctx.slot.compiledBody.columns[oi];
 	if (rc?.type !== 'column' || rc.expr.type !== 'column') return undefined;
 	return basis.columnIndexMap.get((rc.expr as AST.ColumnExpr).name.toLowerCase());
+}
+
+// ---------------------------------------------------------------------------
+// Bijection-transport key proof (authored-bijective key → proved)
+// ---------------------------------------------------------------------------
+
+/**
+ * Proves a logical key `proved` by **transporting** it onto a declared basis key
+ * through a bijection. Every key column must be either bare-reconstructible (maps
+ * to its basis column via {@link mappedBasisColumn}) or authored-bijective (in
+ * `bijectiveAuthored`, maps to its single put-target basis column via
+ * {@link authoredPutTargetBasisColumn}); the resulting basis columns must exactly
+ * form a declared basis key ({@link columnsFormDeclaredKey} — the basis PK or a
+ * non-partial basis UNIQUE).
+ *
+ * Soundness: a bijection is injective, so distinct logical keys map to distinct
+ * basis keys; the basis key forbids two rows sharing that tuple, so the logical key
+ * is intrinsically unique with zero runtime enforcement. This subsumes both the
+ * basis-PK and basis-UNIQUE cases (a basis UNIQUE alone entails it via the
+ * bijection — no covering MV required). Absent a declared basis key over the put
+ * targets it returns false and the caller falls to the commit-time fallback (the
+ * honest O(n) scan over the forward image), never an unsound `proved`.
+ *
+ * Every key column must additionally be declared **NOT NULL**: a basis key is
+ * NULL-skipping (SQL UNIQUE permits multiple all-NULL rows), so a nullable key is
+ * only *conditionally* unique — the existing row-time path classifies that with a
+ * guarded FD (`key → others [guard: key IS NOT NULL]`), which the unconditional
+ * `proved` FD would unsoundly override. A PK column is always NOT NULL; an
+ * authored-bijective column whose logical column is NOT NULL has a non-null,
+ * unconditionally-unique key. A nullable key column therefore defers to
+ * row-time/commit-time rather than taking the transport shortcut.
+ *
+ * Conservative: a multi-source body (no `basisSource`), a key column that is
+ * neither bare nor authored-bijective, a nullable key column, an authored column
+ * with more than one put target / a put target that is not a single bare basis
+ * column, or any unmapped column all yield false.
+ */
+function proveKeyByBijectionTransport(ctx: ProveContext, logicalColumns: readonly number[], bijectiveAuthored: ReadonlySet<string>): boolean {
+	const basis = ctx.basisSource;
+	if (!basis) return false;
+
+	const basisCols: number[] = [];
+	for (const li of logicalColumns) {
+		const col = ctx.table.columns[li];
+		if (!col) return false;
+		// A nullable key is only conditionally unique over a NULL-skipping basis key;
+		// the unconditional `proved` FD would be unsound. Defer to row-time/commit-time.
+		if (!col.notNull) return false;
+		const name = col.name;
+		let bc: number | undefined;
+		if (isReconstructibleColumn(ctx, name)) {
+			bc = mappedBasisColumn(ctx, name, basis);
+		} else if (bijectiveAuthored.has(name.toLowerCase())) {
+			bc = authoredPutTargetBasisColumn(ctx, name, basis);
+		} else {
+			return false; // neither bare-reconstructible nor authored-bijective
+		}
+		if (bc === undefined) return false;
+		basisCols.push(bc);
+	}
+	return columnsFormDeclaredKey(basis, basisCols);
+}
+
+/**
+ * The basis column an authored (`with inverse`) logical column writes to, when its
+ * put is a **single** assignment to one bare basis column — the put-target the
+ * bijection transports onto a basis key. Reads the compiled body's authored
+ * `inverse` clause directly (the same `ResultColumnInverse[]` the lineage threads).
+ * Returns undefined for an authored put with more than one target (a multi-column
+ * fan-out cannot land on a single basis key column) or a target name that does not
+ * resolve to a basis column.
+ */
+function authoredPutTargetBasisColumn(ctx: ProveContext, logicalColumn: string, basis: TableSchema): number | undefined {
+	const oi = ctx.outputIndex.get(logicalColumn.toLowerCase());
+	if (oi === undefined) return undefined;
+	const rc = ctx.slot.compiledBody.columns[oi];
+	if (rc?.type !== 'column' || !rc.inverse || rc.inverse.length !== 1) return undefined;
+	return basis.columnIndexMap.get(rc.inverse[0].column.toLowerCase());
 }
 
 // ---------------------------------------------------------------------------

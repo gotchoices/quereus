@@ -582,9 +582,14 @@ apply schema ai12x;
 -- error: lens.unrealizable-constraint
 
 -- ===================================
--- 13. Read-only gate: a lossy authored inverse on a read-only table (the PK is
---     the authored column — not reconstructible) deploys WITHOUT the advisory
---     (the put never runs), while the table is verifiably read-only.
+-- 13. Read-only gate: a NON-injective authored inverse as the logical PK keeps
+--     the table read-only. The reconstructibility verdict is now the bijection
+--     check, not the bare-column test: substr(code,1,1) collapses A1/A2 so the
+--     forward is not injective — the authored PK column is neither bare-
+--     reconstructible nor bijective-authored, so the PK is not reconstructible and
+--     the table deploys read-only (contrast scenario 18, where a *proven*
+--     bijection makes the authored PK reconstructible ⇒ writable). The lossy
+--     advisory is suppressed because the put never runs on a read-only table.
 -- ===================================
 
 declare schema ai13b {
@@ -774,3 +779,151 @@ select k from ai17b.Item where id = 1;
 -- Both declared CHECKs enforce over the written image (NEW.k + 1).
 update ai17x.Item set n = 3 where id = 1;
 -- error: check
+
+-- ===================================
+-- 18. PK over a PROVEN-BIJECTIVE authored inverse → WRITABLE. The logical PK is
+--     the authored column itself; the forward/inverse pair is proved a bijection
+--     between the basis and logical CHECK domains, AND the put-target basis column
+--     is a declared basis key, so the key is `proved` by bijection transport. The
+--     table deploys writable (no lens.pk-not-reconstructible), with zero runtime
+--     key enforcement (no lens.no-backing-index) and no lens.getput-lossy. Full
+--     keyed CRUD goes through the authored put: the forward in WHERE locates the
+--     row, the inverse in SET/VALUES writes the basis cell.
+--
+--     Integer keys (not text) so the behaviour is identical under the memory and
+--     LevelDB-store backends: the store assigns a single-column TEXT primary key
+--     NOCASE collation, under which a text CHECK in-list is not value-discriminating
+--     and so cannot witness a bijection — the integer-keyed shape proves cleanly on
+--     both. (The text upper/lower bijection is covered by scenario 6 and the unit
+--     specs.)
+-- ===================================
+
+declare schema bpk_b {
+	table Item (
+		k integer primary key check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema bpk_b;
+
+-- run
+
+insert into bpk_b.Item values (2);
+
+-- run
+
+declare logical schema bpk_x {
+	table Item (
+		n integer primary key check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for bpk_x over bpk_b {
+	view Item as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from bpk_b.Item
+}
+
+-- run
+
+apply schema bpk_x;
+
+-- run
+
+-- No advisories at all: bijective (no getput-lossy), reconstructible (no
+-- pk-not-reconstructible), proved by transport (no no-backing-index).
+select count(*) as n from quereus_lens_advisories('bpk_x');
+→ [{"n": 0}]
+
+-- Read transports the basis key through the forward.
+select * from bpk_x.Item;
+→ [{"n": 12}]
+
+-- run
+
+-- INSERT through the authored put: 11 stores k = 1.
+insert into bpk_x.Item values (11);
+select k from bpk_b.Item order by k;
+→ [{"k": 1}, {"k": 2}]
+
+-- run
+
+-- UPDATE by the authored key: forward in WHERE (k + 10 = 12), put in SET (k = 13 - 10).
+update bpk_x.Item set n = 13 where n = 12;
+select k from bpk_b.Item where k = 3;
+→ [{"k": 3}]
+
+-- run
+
+-- DELETE by the authored key.
+delete from bpk_x.Item where n = 11;
+select count(*) as cnt from bpk_b.Item where k = 1;
+→ [{"cnt": 0}]
+
+-- run
+
+-- GetPut still byte-stable (bijection): writing the read value back leaves the
+-- basis unchanged.
+update bpk_x.Item set n = n where n = 13;
+select k from bpk_b.Item where k = 3;
+→ [{"k": 3}]
+
+-- ===================================
+-- 19. A bijective authored inverse whose put-target basis column is NOT a basis
+--     key keeps the table writable (the bijection still proves, so the PK column
+--     is reconstructible — no lens.pk-not-reconstructible) but does NOT classify
+--     `proved`: two basis rows could share the value (`k` is NOT NULL + CHECK, but
+--     the basis PK is the unrelated `id`), so the logical key is not intrinsically
+--     unique. It enforces commit-time and emits lens.no-backing-index. The
+--     columnsFormDeclaredKey gate over the put target is load-bearing here.
+-- ===================================
+
+declare schema nbk_b {
+	table Item (
+		id integer primary key,
+		k integer not null check (k in (1, 2, 3))
+	)
+}
+
+-- run
+
+apply schema nbk_b;
+
+-- run
+
+declare logical schema nbk_x {
+	table Item (
+		n integer primary key check (n in (11, 12, 13))
+	)
+}
+
+-- run
+
+declare lens for nbk_x over nbk_b {
+	view Item as select k + 10 as n
+		with inverse (k = new.n - 10)
+	from nbk_b.Item
+}
+
+-- run
+
+apply schema nbk_x;
+
+-- run
+
+-- Writable (bijective ⇒ reconstructible): no read-only advisory.
+select count(*) as cnt from quereus_lens_advisories('nbk_x') where code = 'lens.pk-not-reconstructible';
+→ [{"cnt": 0}]
+
+-- Not proved (put-target is not a basis key): commit-time enforcement, so the
+-- no-backing-index advisory fires, sited at the primary key.
+select code, "constraint", "column" from quereus_lens_advisories('nbk_x') where code = 'lens.no-backing-index';
+→ [{"code": "lens.no-backing-index", "constraint": "primary key", "column": null}]
+
+-- Bijection still proved ⇒ no getput-lossy.
+select count(*) as cnt from quereus_lens_advisories('nbk_x') where code = 'lens.getput-lossy';
+→ [{"cnt": 0}]
