@@ -403,7 +403,13 @@ admits case-variants the column would unify, and a *coarser* index (`COLLATE NOC
 COLLATE` on a column under such an index propagates the new collation into the index
 column (metadata-only — the store's index *key* bytes use the table-level collation K, so
 no entry re-encode is required), mirroring the memory module; a non-derived (table-level /
-column) UNIQUE always enforces under the declared column collation.
+column) UNIQUE always enforces under the declared column collation. When a row-time covering
+materialized view is *also* linked to such a constraint, a finer/incomparable index collation
+disqualifies the MV from answering it — see the [covering-MV collation eligibility
+gate](materialized-views.md#enforcement-through-a-covering-mv) — so enforcement falls back to
+this per-scan / auto-index path (still under the index collation). The gate reads the same
+`index.columns[i].collation` this resolver does, so the two stay consistent across an `ALTER
+COLUMN … SET COLLATE`.
 
 ### View and materialized-view persistence
 
