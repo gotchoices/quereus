@@ -258,13 +258,14 @@ insert into OU (id, x) values (7, 70);
 -- error:
 
 -- ===================================================================
--- Multi-source (JOIN) leg rejection (`set-op-write-multisource-leg-reject`): a flag-less
--- set-op body one of whose legs is a JOIN is NOT yet writable. The leg recognizer
--- (`isWritableLeafLeg`) rejects a join leg (`isJoinBody`), so the static surfaces report the
--- conservative all-`NO` row AND the dynamic write falls out of the flag-less route into the
--- single-source spine's clean `cannot write through view` reject — NEVER the internal
--- `k.k0_0 isn't a column` error a recursive multi-source capture would have collided into.
--- The join-leg write-through unlock is filed as `set-op-write-multisource-leg-compose`.
+-- Multi-source (INNER JOIN) leg compose (`set-op-write-multisource-leg-compose`): a flag-less
+-- set-op body one of whose legs is an INNER join is now writable for UPDATE / DELETE. The
+-- leg recognizer (`isWritableLeafLeg`) admits an inner-join leg, so the static surfaces report
+-- is_updatable / is_deletable = YES (and is_insertable_into = NO — join-leg insert is deferred to
+-- `set-op-write-multisource-leg-insert`). The fan composes the join leg via an inner per-leg
+-- base-PK capture (`__vmupd_keys$N`) chained off the outer set-op capture, so the join leg
+-- decomposes through the multi-source machinery without colliding with the outer capture (the
+-- internal `k.k0_0` error is gone). Both surfaces match the dynamic write exactly.
 -- ===================================================================
 create table jv1 (id integer primary key, x integer, color text null);
 create table jv2 (id integer primary key, y integer);
@@ -275,52 +276,157 @@ create view JV as
   union all
   select id, x, 'b' as src from jv1 where color = 'blue';
 
--- read still works (the body is a valid set-op read; only WRITE-through is rejected).
 select * from JV order by id;
 → [{"id":1,"x":10,"src":"a"},{"id":2,"x":20,"src":"b"}]
 
--- static surfaces: all-`NO` (the join leg drops the flag-less recognizer to non-writable).
+-- static surfaces: update/delete YES (the join leg composes), insert NO (deferred). The plain data
+-- columns report is_updatable = YES; the literal discriminator `src` is read-only (NO).
 select is_insertable_into, is_updatable, is_deletable from view_info('JV');
-→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
 select cid, column_name, is_updatable, base_table, base_column from column_info('JV');
-→ [{"cid":0,"column_name":"id","is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
 
--- dynamic write: a clean structured reject (NOT the internal `k.k0_0` error), insert/update/delete.
-delete from JV where src = 'a';
--- error: cannot write through view
+-- data UPDATE through the join leg ('a' leg): `x` maps to jv1.x, so only jv1 is updated; the
+-- discriminator σ routes the fan to the join leg ('b' leg is unsat with src='a' ⇒ skipped).
 update JV set x = x + 1 where src = 'a';
--- error: cannot write through view
-insert into JV (id, x, src) values (5, 50, 'a');
--- error: cannot write through view
-
--- the base tables are untouched (every write rejected before any base op fired).
 select id, x from jv1 order by id;
-→ [{"id":1,"x":10},{"id":2,"x":20}]
-select id from jv2 order by id;
-→ [{"id":1},{"id":2}]
+→ [{"id":1,"x":11},{"id":2,"x":20}]
+select id, y from jv2 order by id;
+→ [{"id":1,"y":100},{"id":2,"y":200}]
+
+-- DELETE through the join leg fans to both candidate sides of the inner join (ambiguous-delete
+-- default), so the joined row id=1 leaves both jv1 and jv2.
+delete from JV where src = 'a';
+select id, x from jv1 order by id;
+→ [{"id":2,"x":20}]
+select id, y from jv2 order by id;
+→ [{"id":2,"y":200}]
+
+-- INSERT through the join leg stays deferred — a clean reject (never the internal capture error).
+insert into JV (id, x, src) values (5, 50, 'a');
+-- error: set-op-write-multisource-leg-insert
 
 -- NOTE on comma-join legs (`from a, b`): the engine rejects multiple FROM sources at build
 -- time ("SELECT with multiple FROM sources (joins) not supported"), so such a body cannot even
 -- be created/read — the `from.length > 1` arm of `isJoinBody` is unreachable for any readable
--- view and needs no write-path test. The explicit-`join` form above is the live path.
+-- view. The explicit-`join` form above is the live path.
 
--- Join leg at chain depth > 1: a flag-less union-all chain whose THIRD leg is a JOIN. The
--- flag-less recognizer walks every leg (`flaglessShape`'s loop), so a join at any depth drops
--- the whole body to non-writable — the every-depth coverage claim, exercised here (the
--- implementer's tests used only depth-1 join legs).
+-- ===================================================================
+-- Join leg at chain depth > 1 (`set-op-write-multisource-leg-compose`, every-depth coverage):
+-- a flag-less union-all chain whose THIRD leg is a JOIN. The fan walks every flat leg, so a join
+-- at any depth composes its own inner capture and decomposes correctly.
+-- ===================================================================
+create table dv1 (id integer primary key, x integer, color text null);
+create table dv2 (id integer primary key, y integer);
+insert into dv1 values (1,10,'red'),(2,20,'blue'),(3,30,'red');
+insert into dv2 values (1,100),(3,300);
 create view DV as
-  select id, x, 'a' as src from jv1 where color = 'red'
+  select id, x, 'a' as src from dv1 where color = 'red'
   union all
-  select id, x, 'b' as src from jv1 where color = 'blue'
+  select id, x, 'b' as src from dv1 where color = 'blue'
   union all
-  select jv1.id as id, jv1.x as x, 'c' as src from jv1 join jv2 on jv1.id = jv2.id where jv1.color = 'red';
+  select dv1.id as id, dv1.x as x, 'c' as src from dv1 join dv2 on dv1.id = dv2.id where dv1.color = 'red';
 select is_insertable_into, is_updatable, is_deletable from view_info('DV');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+select id, x, src from DV order by src, id;
+→ [{"id":1,"x":10,"src":"a"},{"id":3,"x":30,"src":"a"},{"id":2,"x":20,"src":"b"},{"id":1,"x":10,"src":"c"},{"id":3,"x":30,"src":"c"}]
+
+-- DELETE through the depth-3 join leg ('c'): the σ-router fans only to that leg (the 'a'/'b' legs
+-- are unsat with src='c'), and it deletes the joined rows (id 1,3) from both dv1 and dv2.
+delete from DV where src = 'c';
+select id, x from dv1 order by id;
+→ [{"id":2,"x":20}]
+select id, y from dv2 order by id;
+→ []
+
+-- INSERT through the deep join leg stays deferred.
+insert into DV (id, x, src) values (9, 90, 'c');
+-- error: set-op-write-multisource-leg-insert
+
+-- ===================================================================
+-- Composite-PK join leg (`set-op-write-multisource-leg-compose`): the inner per-leg capture
+-- projects one column per PK column per side (`k<side>_0, k<side>_1`), so a composite-key join
+-- leg decomposes through the multi-source machinery unchanged.
+-- ===================================================================
+create table cp1 (a integer, b integer, v integer, primary key (a, b));
+create table cp2 (a integer, b integer, w integer, primary key (a, b));
+insert into cp1 values (1,1,10),(1,2,20);
+insert into cp2 values (1,1,100),(1,2,200);
+create view CV as
+  select cp1.a as a, cp1.b as b, cp1.v as v, 'j' as src from cp1 join cp2 on cp1.a = cp2.a and cp1.b = cp2.b
+  union all
+  select a, b, v, 's' as src from cp1 where a = 9;
+select cid, column_name, is_updatable from column_info('CV');
+→ [{"cid":0,"column_name":"a","is_updatable":"YES"},{"cid":1,"column_name":"b","is_updatable":"YES"},{"cid":2,"column_name":"v","is_updatable":"YES"},{"cid":3,"column_name":"src","is_updatable":"NO"}]
+
+-- data UPDATE through the composite-PK join leg: `v` maps to cp1.v (identified by the composite key).
+update CV set v = v + 1 where a = 1 and b = 1 and src = 'j';
+select a, b, v from cp1 order by a, b;
+→ [{"a":1,"b":1,"v":11},{"a":1,"b":2,"v":20}]
+
+-- DELETE through the composite-PK join leg fans to both sides (composite identities captured per side).
+delete from CV where a = 1 and b = 2 and src = 'j';
+select a, b, v from cp1 order by a, b;
+→ [{"a":1,"b":1,"v":11}]
+select a, b, w from cp2 order by a, b;
+→ [{"a":1,"b":1,"w":100}]
+
+-- ===================================================================
+-- Self-join leg (`set-op-write-multisource-leg-compose`): one base table under two aliases. The
+-- inner capture routes by alias, so a data UPDATE through the self-join leg lands on the aliased
+-- owning side (`name` ⇒ `e.name`), not the manager alias.
+-- ===================================================================
+create table emp (id integer primary key, name text, mgr integer);
+insert into emp values (1,'a',1),(2,'b',1),(3,'c',2);
+create view SJ as
+  select e.id as id, e.name as name, m.name as mgrname, 'pair' as src from emp e join emp m on e.mgr = m.id
+  union all
+  select id, name, name as mgrname, 'solo' as src from emp where id = 99;
+select is_insertable_into, is_updatable, is_deletable from view_info('SJ');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+update SJ set name = 'X' where id = 2 and src = 'pair';
+select id, name from emp order by id;
+→ [{"id":1,"name":"a"},{"id":2,"name":"X"},{"id":3,"name":"c"}]
+
+-- ===================================================================
+-- Halloween safety through a join leg (`set-op-write-multisource-leg-compose`): the inner capture
+-- is materialized BEFORE the leg's base ops, so an UPDATE that rewrites a column its own member
+-- filter ranged on still matches every captured row by identity (no row escapes mid-update).
+-- ===================================================================
+create table hk1 (id integer primary key, grp integer, x integer);
+create table hk2 (id integer primary key, y integer);
+insert into hk1 values (1,5,10),(2,5,20);
+insert into hk2 values (1,100),(2,200);
+create view HV as
+  select hk1.id as id, hk1.grp as grp, hk1.x as x, 'j' as src from hk1 join hk2 on hk1.id = hk2.id
+  union all
+  select id, grp, x, 's' as src from hk1 where grp = 9;
+update HV set grp = grp + 1 where grp = 5 and src = 'j';
+select id, grp, x from hk1 order by id;
+→ [{"id":1,"grp":6,"x":10},{"id":2,"grp":6,"x":20}]
+
+-- ===================================================================
+-- OUTER (left/right/full) join leg deferral (`set-op-write-multisource-leg-compose` ships INNER
+-- legs only): an outer-join leg drops the whole body out of the flag-less route (its
+-- `isWritableLeafLeg` is false), so the static surfaces report all-`NO` and the dynamic write
+-- falls to the single-source spine's clean reject — never the internal `k.k0_0` capture error.
+-- ===================================================================
+create table oj1 (id integer primary key, x integer, color text);
+create table oj2 (id integer primary key, y integer);
+insert into oj1 values (1,10,'red'),(2,20,'blue');
+insert into oj2 values (1,100);
+create view OJV as
+  select oj1.id as id, oj1.x as x, 'a' as src from oj1 left join oj2 on oj1.id = oj2.id where oj1.color = 'red'
+  union all
+  select id, x, 'b' as src from oj1 where color = 'blue';
+select is_insertable_into, is_updatable, is_deletable from view_info('OJV');
 → [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
-delete from DV where src = 'a';
+update OJV set x = x + 1 where src = 'a';
 -- error: cannot write through view
-insert into DV (id, x, src) values (5, 50, 'a');
+delete from OJV where src = 'a';
 -- error: cannot write through view
-select id, x from jv1 order by id;
+-- base tables untouched.
+select id, x from oj1 order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
 
 -- ===================================================================

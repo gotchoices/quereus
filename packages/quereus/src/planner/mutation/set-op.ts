@@ -15,7 +15,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { propagate, type BaseOp, type MutableViewLike, type MutationRequest } from './propagate.js';
-import { MS_UPDATE_KEYS_CTE, isJoinBody, type MultiSourceKeyCapture } from './multi-source.js';
+import { MS_UPDATE_KEYS_CTE, isJoinBody, isInnerJoinBody, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, withKeyCapture, type MultiSourceKeyCapture, type JoinViewAnalysis } from './multi-source.js';
 import { cloneExpr, transformExpr } from './scope-transform.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
@@ -46,19 +46,26 @@ import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
  * runtime substrate (see `runtime/emit/view-mutation.ts`).
  *
  * **A branch is itself a view body — routed per-branch via recursive `propagate`.**
- * Each operand of the set operation is a relational sub-plan (`select … from B`),
- * exactly a **single-source** view body. A **multi-source** leg/branch — one whose FROM is a
- * join or comma-join ({@link isJoinBody}) — is explicitly **rejected** (a clean
- * `unsupported-set-op` diagnostic, both static and dynamic) pending
- * `set-op-write-multisource-leg-compose`: the recursive `propagate` would route it to
- * `propagateMultiSource`, whose own {@link MS_UPDATE_KEYS_CTE} capture (`k<side>_<j>` columns)
- * collides with the outer set-op capture (whose columns are the view output columns) — the
- * un-diagnosed internal `k.k0_0 isn't a column` error. Inserting/deleting a row
- * *into a branch* is a recursive view-mutation on that branch's sub-plan, so each
- * per-branch op is lowered to an AST `BaseOp` against a **synthetic branch view-like**
- * and run back through {@link propagate} — reusing the single-source spine verbatim
- * (the branch's own σ predicate, renames, and base routing are honored
- * by its spine). A branch that bottoms out in a base table emits one base op; a branch
+ * Each operand of the set operation is a relational sub-plan (`select … from B`). A
+ * **single-source** branch's per-branch op is lowered to an AST `BaseOp` against a
+ * **synthetic branch view-like** and run back through {@link propagate} — reusing the
+ * single-source spine verbatim (the branch's own σ predicate, renames, and base routing are
+ * honored by its spine).
+ *
+ * A **multi-source (INNER join) branch/leg** ({@link isInnerJoinBody}) is **composed** rather
+ * than routed through plain {@link propagate} (`set-op-write-multisource-leg-compose`): plain
+ * `propagate` builds NO capture, so its emitted multi-source predicates (`k<side>_<j>`) would
+ * bind to the outer set-op capture (view-output columns) — the internal `k.k0_0 isn't a column`
+ * error. Instead the fan builds the join branch itself (mirroring `buildViewMutation`'s
+ * orchestration): {@link analyzeJoinView} + {@link decomposeUpdate}/{@link decomposeDelete} +
+ * {@link buildMultiSourceKeyCapture} build an **inner per-branch base-PK capture** under a fresh
+ * `__vmupd_keys$N` name (minted monotonically — two join branches never collide), filtered by the
+ * SAME {@link buildMemberExists} predicate (so it scans the OUTER set-op capture), and bubble it
+ * up on {@link SetOpWritePlan.nestedCaptures} (materialized outer-first then inner, via
+ * `ViewMutationNode.nestedCaptures`). INSERT into a join branch is deferred to
+ * `set-op-write-multisource-leg-insert` (needs the plan-level shared-surrogate envelope) — a clean
+ * reject + `is_insertable_into = NO`; an OUTER (left/right/full) / cross / non-equi join leg is
+ * likewise deferred (a clean classification reject). A branch that bottoms out in a base table emits one base op; a branch
  * that is itself a `SetOperationNode` (a **subtree operand**, `nestable-flagged-set-ops`)
  * recurses *here* for the unambiguous fan-out — a data-column UPDATE, a DELETE, and a
  * `set <subtreeFlag> = false` drop fan out to every member leaf, sharing the ONE up-front
@@ -188,11 +195,15 @@ function isOperandWritable(operand: AST.QueryExpr, hasGatingFlag: boolean): bool
 		if (!isUnionLikeSubtree(effective.compound.op) && !hasGatingFlag) return false;
 		return isSetOpBodyWritable(effective);
 	}
-	// A leaf operand must be **single-source**: a multi-source (join / comma) leg is rejected
-	// pending `set-op-write-multisource-leg-compose` (the dynamic `buildBranch` rejects it too —
-	// its recursive `propagate` would collide the nested capture with the outer set-op capture).
-	// This recurses to leaves at every depth, so a nested join leaf reports non-writable too.
-	return tryBranchColumnNames(effective) !== null && !isJoinBody(effective);
+	// A leaf operand's data columns must be plain (optionally renamed) base columns; on top of
+	// that it is writable when it is single-source OR a **multi-source INNER join leg** (the
+	// join-leg compose — `set-op-write-multisource-leg-compose`, which builds an inner per-branch
+	// capture chained off the outer set-op capture). An OUTER (left/right/full) / cross / non-equi
+	// join leg is deferred, so it reports non-writable here — matching the dynamic `buildBranch`
+	// reject exactly. This recurses to leaves at every depth, so a nested join leaf is classified
+	// too. Insertability through a join leg is deferred separately (gated in `schema.ts`).
+	if (tryBranchColumnNames(effective) === null) return false;
+	return !isJoinBody(effective) || isInnerJoinBody(effective);
 }
 
 /**
@@ -226,6 +237,30 @@ export function setOpHasSubtreeOperand(selectAst: AST.QueryExpr): boolean {
 /** True iff an operand SELECT is itself a (non-diff) set-op subtree. */
 function isSubtreeOperand(operand: AST.QueryExpr): boolean {
 	return operand.type === 'select' && !!operand.compound && operand.compound.op !== 'diff';
+}
+
+/**
+ * True iff ANY leaf leg of the set-op body (at any depth, either operand) is a multi-source
+ * (join) body. Insert-through a join leg needs the plan-level shared-surrogate envelope, which
+ * the capture-driven set-op fan does not produce, so join-leg INSERT is deferred to
+ * `set-op-write-multisource-leg-insert`. The `is_insertable_into` static surfaces gate to `NO`
+ * when this holds (matching the dynamic insert reject), while UPDATE / DELETE stay writable
+ * (`is_updatable` / `is_deletable` = YES). Detects ALL join shapes (inner OR outer): every join
+ * leg's insert is deferred, not just the outer ones the update/delete recognizers gate out.
+ */
+export function setOpHasMultiSourceLeg(selectAst: AST.QueryExpr): boolean {
+	if (selectAst.type !== 'select' || !selectAst.compound) return false;
+	return operandHasJoinLeg(leftBranchSelect(selectAst)) || operandHasJoinLeg(selectAst.compound.select);
+}
+
+/** Recursive helper for {@link setOpHasMultiSourceLeg}: descend a subtree operand to its leaves. */
+function operandHasJoinLeg(operand: AST.QueryExpr): boolean {
+	if (operand.type !== 'select') return false;
+	const effective = unwrapBranchSelect(operand);
+	if (effective.compound && effective.compound.op !== 'diff') {
+		return operandHasJoinLeg(leftBranchSelect(effective)) || operandHasJoinLeg(effective.compound.select);
+	}
+	return isJoinBody(effective);
 }
 
 /**
@@ -301,6 +336,18 @@ interface SetOpBranch {
 	 * deterministic target leaf — `set-op-membership-nested`).
 	 */
 	readonly isNested: boolean;
+	/**
+	 * True iff this branch is a non-nested **multi-source (INNER join) leg**
+	 * (`set-op-write-multisource-leg-compose`). Its data/delete fan does NOT route through plain
+	 * {@link propagate} (which builds no capture and would collide the inner multi-source capture
+	 * with the outer set-op capture); instead it builds its own inner per-branch base-PK capture
+	 * under a fresh `__vmupd_keys$N` name, chained off the outer set-op capture (the inner's
+	 * `memberExists` filter scans the outer `__vmupd_keys`). Mutually exclusive with
+	 * {@link isNested}. An OUTER (left/right/full) / cross / non-equi join leg is rejected at
+	 * classification (deferred); its `= true` flip / insert-through is rejected
+	 * (`set-op-write-multisource-leg-insert`).
+	 */
+	readonly isMultiSource: boolean;
 }
 
 interface SetOpAnalysis {
@@ -337,6 +384,17 @@ interface SetOpAnalysis {
 export interface SetOpWritePlan {
 	readonly baseOps: BaseOp[];
 	readonly capture?: MultiSourceKeyCapture;
+	/**
+	 * The inner per-branch base-PK captures one per **multi-source (join) branch** the fan
+	 * reached (`set-op-write-multisource-leg-compose`), accumulated in fan order. Each is built
+	 * over its branch's planned join body, filtered by the SAME `buildMemberExists` predicate
+	 * (which scans the outer {@link capture} via `__vmupd_keys`), under a fresh
+	 * `__vmupd_keys$N` name so two join branches never collide. `buildSetOpMutation` injects each
+	 * under its own name for the branch base ops and rides them on `ViewMutationNode.nestedCaptures`
+	 * (materialized AFTER the outer capture). Absent / empty for a join-leg-free set-op write —
+	 * which then lowers byte-identically to the pre-list substrate.
+	 */
+	readonly nestedCaptures?: MultiSourceKeyCapture[];
 }
 
 /** Decompose a set-op membership-column view mutation. Throws a structured diagnostic for unsupported shapes. */
@@ -554,18 +612,21 @@ function buildBranch(
 	const effectiveSelect = unwrapBranchSelect(branchSelect);
 	// A subtree operand carries its own (non-diff) compound; its fan-out recurses to leaves.
 	const isNested = !!effectiveSelect.compound && effectiveSelect.compound.op !== 'diff';
-	// A non-nested leaf branch must be **single-source**: a multi-source (join / comma) leg is
-	// rejected pending `set-op-write-multisource-leg-compose`. Its recursive `propagate` would
-	// route to `propagateMultiSource`, whose own `__vmupd_keys` capture (`k<side>_<j>`) collides
-	// with the outer set-op capture (view-output columns) — the un-diagnosed internal
-	// `k.k0_0 isn't a column` error. A nested (subtree) operand is NOT rejected here: its join
-	// leaves are reached as non-nested branches via `analyzeSetOpBranches` → `buildBranch` and
-	// caught at that depth, so this gate covers every leaf at every nesting level.
-	if (!isNested && isJoinBody(effectiveSelect)) {
+	// A non-nested **multi-source (INNER join) leg** is now writable for UPDATE / DELETE
+	// (`set-op-write-multisource-leg-compose`): its data/delete fan builds an inner per-branch
+	// base-PK capture chained off the outer set-op capture (a fresh `__vmupd_keys$N` name), so
+	// the join branch decomposes through the multi-source machinery without colliding with the
+	// outer capture. An OUTER (left/right/full) / cross / non-equi join leg is deferred — reject
+	// it cleanly here (never routing it to `propagate`, which would mishandle the un-composed
+	// capture). A nested (subtree) operand is NOT classified here: its join leaves are reached as
+	// non-nested branches via `analyzeSetOpBranches` → `buildBranch` and classified at that
+	// depth, so this covers every leaf at every nesting level.
+	const isMultiSource = !isNested && isInnerJoinBody(effectiveSelect);
+	if (!isNested && !isMultiSource && isJoinBody(effectiveSelect)) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-set-op',
 			table: view.name,
-			message: `cannot write through view '${view.name}': the ${side} branch is a multi-source (join) leg, which is not yet writable — a join leg's identity capture is not yet composed (see set-op-write-multisource-leg-compose)`,
+			message: `cannot write through view '${view.name}': the ${side} branch is a multi-source join leg that is not a plain INNER equi-join (an OUTER/CROSS/non-equi join leg) — its set-op write composition is deferred (set-op-write-multisource-leg-compose ships inner-join legs)`,
 		});
 	}
 	const dataColNames = branchColumnNames(view, side, effectiveSelect);
@@ -582,7 +643,7 @@ function buildBranch(
 		selectAst: effectiveSelect,
 	};
 	const flag = flags.find(f => f.side === side);
-	return { side, view: branchView, dataColNames, isNested, ...(flag ? { flag } : {}) };
+	return { side, view: branchView, dataColNames, isNested, isMultiSource, ...(flag ? { flag } : {}) };
 }
 
 /**
@@ -670,6 +731,81 @@ function buildSetOpCapture(ctx: PlanningContext, analysis: SetOpAnalysis, where:
 	return { source, descriptor: {}, keyColumns };
 }
 
+// --- multi-source (join) branch composition -------------------------------
+
+/**
+ * The fan-wide state a multi-source (INNER join) branch threads through the data/delete fan
+ * (`set-op-write-multisource-leg-compose`). It carries the OUTER set-op capture (each inner
+ * per-branch capture's `memberExists` filter scans it via `__vmupd_keys`), accumulates the inner
+ * captures in fan order (`captures`), and mints a fresh `__vmupd_keys$N` name per join branch via
+ * a monotonic counter that **must not reset between branches** — two branches sharing a name
+ * re-introduce the very collision this ticket resolves.
+ */
+interface JoinLegFan {
+	readonly outerCapture: MultiSourceKeyCapture;
+	readonly captures: MultiSourceKeyCapture[];
+	/** Mint the next fresh inner capture name (`__vmupd_keys$1`, `$2`, …). */
+	mintName(): string;
+}
+
+/** Build a fresh {@link JoinLegFan} over the up-front outer set-op capture. */
+function makeJoinLegFan(outerCapture: MultiSourceKeyCapture): JoinLegFan {
+	const captures: MultiSourceKeyCapture[] = [];
+	let counter = 0;
+	return { outerCapture, captures, mintName: () => `${MS_UPDATE_KEYS_CTE}$${++counter}` };
+}
+
+/**
+ * The distinct join-side indices the emitted base ops target (each base op carries its planned
+ * side's `TableReferenceNode`), ascending — the sides whose PKs the inner capture must project so
+ * each op's `exists (… from __vmupd_keys$N k where k.k<side>_<j> = <side>.<pk>)` resolves. A
+ * local copy of the multi-source builder's same helper (importing it from
+ * `view-mutation-builder.ts` would cycle — that module imports this one).
+ */
+function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnalysis): number[] {
+	const set = new Set<number>();
+	for (const op of baseOps) {
+		const i = analysis.sides.findIndex(s => s.table.id === op.table.id);
+		if (i >= 0) set.add(i);
+	}
+	return [...set].sort((a, b) => a - b);
+}
+
+/**
+ * Compose one multi-source (INNER join) branch's data UPDATE / DELETE: build the branch base ops
+ * via the multi-source decomposer (referencing a fresh inner `__vmupd_keys$N` capture) PLUS the
+ * inner per-branch base-PK capture itself, filtered by the branch's `memberExists` predicate (the
+ * SAME data-tuple match against the OUTER set-op capture the single-source fan builds), and record
+ * the inner capture into the fan accumulator. The inner capture is built under a context with the
+ * OUTER capture injected (so its `memberExists` filter's `from __vmupd_keys` resolves), and over
+ * the branch's planned join body (`analyzeJoinView`) — so the join leg decomposes through the
+ * multi-source machinery without colliding with the outer capture.
+ *
+ * `decompose` selects UPDATE vs DELETE — both build `BaseOp[]` against the base tables whose
+ * predicates read back the fresh inner capture; the inner capture's identity is the branch's
+ * affected (captured-and-member-matched) rows. `branchStmt.where` IS the `memberExists` predicate,
+ * reused verbatim as the inner capture's filter.
+ */
+function fanMultiSourceBranch(
+	ctx: PlanningContext,
+	branch: SetOpBranch,
+	branchStmt: AST.UpdateStmt | AST.DeleteStmt,
+	fan: JoinLegFan,
+	decompose: (joinAnalysis: JoinViewAnalysis, name: string) => BaseOp[],
+): BaseOp[] {
+	const joinAnalysis = analyzeJoinView(ctx, branch.view);
+	const name = fan.mintName();
+	const baseOps = decompose(joinAnalysis, name);
+	const sides = capturedSideIndices(baseOps, joinAnalysis);
+	// Inject the OUTER set-op capture so the inner capture's `memberExists` filter (`exists (…
+	// from __vmupd_keys k …)`) resolves against it; the inner capture is built over the branch's
+	// planned join body under its own fresh name.
+	const ctxWithOuter = withKeyCapture(ctx, fan.outerCapture);
+	const capture = buildMultiSourceKeyCapture(ctxWithOuter, branch.view, branchStmt.where, joinAnalysis, sides, undefined, name);
+	fan.captures.push(capture);
+	return baseOps;
+}
+
 // --- UPDATE (membership flip + data fan-out) ------------------------------
 
 interface DataAssignment {
@@ -747,6 +883,9 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 	}
 
 	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
+	// A multi-source (INNER join) branch the fan reaches builds its own inner per-branch capture
+	// chained off this outer capture; the fan accumulates them (`set-op-write-multisource-leg-compose`).
+	const fan = makeJoinLegFan(capture);
 	const baseOps: BaseOp[] = [];
 
 	// Data fan-out: update the row in every member leaf, recursing through a subtree operand
@@ -755,7 +894,7 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 	// membership is honored without an explicit flag gate.
 	if (dataAssignments.length > 0) {
 		for (const branch of analysis.branches) {
-			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, branch, dataAssignments, stmt));
+			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, branch, dataAssignments, stmt, fan));
 		}
 	}
 
@@ -768,7 +907,7 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 		if (flip) {
 			baseOps.push(...buildBranchMembershipInsert(ctx, view, analysis, branch, dataAssignments, stmt));
 		} else {
-			baseOps.push(...fanBranchDelete(ctx, view, analysis, branch, stmt));
+			baseOps.push(...fanBranchDelete(ctx, view, analysis, branch, stmt, fan));
 		}
 	}
 
@@ -781,7 +920,7 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 			message: `cannot write through view '${view.name}': the update names no writable set-operation column`,
 		});
 	}
-	return { baseOps, capture };
+	return { baseOps, capture, nestedCaptures: fan.captures.length > 0 ? fan.captures : undefined };
 }
 
 /**
@@ -844,13 +983,14 @@ function fanBranchDataUpdate(
 	branch: SetOpBranch,
 	dataAssignments: readonly DataAssignment[],
 	stmt: AST.UpdateStmt,
+	fan: JoinLegFan,
 	gateFlags: readonly string[] = [],
 ): BaseOp[] {
 	if (branch.isNested) {
 		const innerGate = accumulateInnerGate(view, branch, gateFlags);
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
-			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, inner, dataAssignments, stmt, innerGate));
+			baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, inner, dataAssignments, stmt, fan, innerGate));
 		}
 		return baseOps;
 	}
@@ -867,6 +1007,13 @@ function fanBranchDataUpdate(
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
+	// A multi-source (INNER join) branch routes through the join decomposer + an inner per-branch
+	// capture (chained off the outer set-op capture) rather than plain `propagate` (which builds
+	// no capture and would collide the inner capture with the outer). § set-op-write-multisource-leg-compose.
+	if (branch.isMultiSource) {
+		return fanMultiSourceBranch(ctx, branch, updateStmt, fan,
+			(joinAnalysis, name) => decomposeUpdate(ctx, branch.view, joinAnalysis, updateStmt, undefined, name));
+	}
 	return propagate(ctx, branch.view, { op: 'update', stmt: updateStmt });
 }
 
@@ -893,6 +1040,18 @@ function buildBranchMembershipInsert(
 			column: branch.flag?.name,
 			table: view.name,
 			message: `cannot write through view '${view.name}': 'set ${branch.flag?.name ?? '<flag>'} = true' inserts into a multi-leaf subtree operand, which has no single deterministic target leaf (product-coordinate addressing) — deferred to set-op-membership-nested`,
+		});
+	}
+	if (branch.isMultiSource) {
+		// `set <flag> = true` inserts into a multi-source (join) branch — that insert needs the
+		// plan-level shared-surrogate envelope (`buildMultiSourceInsert`), which the capture-driven
+		// set-op fan does not produce. Deferred to `set-op-write-multisource-leg-insert` (the
+		// composed UPDATE / DELETE legs ship here). Clean reject, never the internal capture error.
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op',
+			column: branch.flag?.name,
+			table: view.name,
+			message: `cannot write through view '${view.name}': 'set ${branch.flag?.name ?? '<flag>'} = true' inserts into a multi-source (join) branch, whose insert needs the plan-level shared-surrogate envelope — deferred to set-op-write-multisource-leg-insert (UPDATE / DELETE through a join branch are supported)`,
 		});
 	}
 	if (!branch.flag) {
@@ -948,13 +1107,14 @@ function fanBranchDelete(
 	analysis: SetOpAnalysis,
 	branch: SetOpBranch,
 	stmt: AST.UpdateStmt | AST.DeleteStmt,
+	fan: JoinLegFan,
 	gateFlags: readonly string[] = [],
 ): BaseOp[] {
 	if (branch.isNested) {
 		const innerGate = accumulateInnerGate(view, branch, gateFlags);
 		const baseOps: BaseOp[] = [];
 		for (const inner of analyzeSetOpBranches(view, branch.view, analysis.dataColCount)) {
-			baseOps.push(...fanBranchDelete(ctx, view, analysis, inner, stmt, innerGate));
+			baseOps.push(...fanBranchDelete(ctx, view, analysis, inner, stmt, fan, innerGate));
 		}
 		return baseOps;
 	}
@@ -966,6 +1126,12 @@ function fanBranchDelete(
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
+	// A multi-source (INNER join) branch routes through the join decomposer + an inner per-branch
+	// capture (chained off the outer set-op capture); a single-source branch lowers via `propagate`.
+	if (branch.isMultiSource) {
+		return fanMultiSourceBranch(ctx, branch, deleteStmt, fan,
+			(joinAnalysis, name) => decomposeDelete(ctx, branch.view, joinAnalysis, deleteStmt, name));
+	}
 	return propagate(ctx, branch.view, { op: 'delete', stmt: deleteStmt });
 }
 
@@ -974,20 +1140,35 @@ function fanBranchDelete(
 function buildDelete(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, stmt: AST.DeleteStmt): SetOpWritePlan {
 	rejectReturning(view, stmt.returning);
 	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
+	const fan = makeJoinLegFan(capture);
 	const baseOps: BaseOp[] = [];
 	// Delete from every member leaf at every depth — the fan recurses through a subtree
 	// operand to its leaves (the full-tuple `exists` correlation restricts each leaf delete to
-	// its resident rows, so a non-member leaf matches none).
+	// its resident rows, so a non-member leaf matches none). A multi-source (INNER join) branch
+	// builds its own inner per-branch capture chained off this outer capture.
 	for (const branch of analysis.branches) {
-		baseOps.push(...fanBranchDelete(ctx, view, analysis, branch, stmt));
+		baseOps.push(...fanBranchDelete(ctx, view, analysis, branch, stmt, fan));
 	}
-	return { baseOps, capture };
+	return { baseOps, capture, nestedCaptures: fan.captures.length > 0 ? fan.captures : undefined };
 }
 
 // --- INSERT (insert-through, flag-routed) ---------------------------------
 
 function buildInsertThrough(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, stmt: AST.InsertStmt): SetOpWritePlan {
 	rejectReturning(view, stmt.returning);
+	// A multi-source (join) branch's insert needs the plan-level shared-surrogate envelope
+	// (`buildMultiSourceInsert`), which the capture-driven set-op fan does not produce — deferred
+	// to `set-op-write-multisource-leg-insert`. Reject the WHOLE insert when ANY branch is a join
+	// (the static `is_insertable_into` surface reports `NO` for such a body), so the static and
+	// dynamic answers match exactly; UPDATE / DELETE through the same body's join branches are
+	// supported. Clean reject — never the internal capture error.
+	if (analysis.branches.some(b => b.isMultiSource)) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op',
+			table: view.name,
+			message: `cannot insert through view '${view.name}': a branch is a multi-source (join) leg, whose insert needs the plan-level shared-surrogate envelope — deferred to set-op-write-multisource-leg-insert (UPDATE / DELETE through a join branch are supported)`,
+		});
+	}
 	if (stmt.source.type !== 'values') {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-source',
@@ -1328,12 +1509,14 @@ function hasLiteralDiscriminator(leaf: AST.SelectStmt): boolean {
 /** True iff a leaf SELECT is a writable flag-less leg: single-source, no compound, ≥1 plain/literal column, all admitted. */
 function isWritableLeafLeg(leaf: AST.SelectStmt): boolean {
 	if (leaf.compound) return false;
-	// A multi-source (join / comma) leg is rejected pending `set-op-write-multisource-leg-compose`:
-	// its recursive `propagate` routes to `propagateMultiSource`, whose own `__vmupd_keys` capture
-	// collides with the outer set-op capture (the internal `k.k0_0 isn't a column` error). Falling
-	// to `false` here makes the static surface report all-`NO` AND drops the dynamic write out of
-	// the flag-less route into the single-source spine's clean `unsupported-set-op` reject.
-	if (isJoinBody(leaf)) return false;
+	// A multi-source (join) leg is writable for UPDATE / DELETE when it is a plain INNER equi-join
+	// (`set-op-write-multisource-leg-compose`, which builds an inner per-branch capture chained
+	// off the outer set-op capture). An OUTER (left/right/full) / cross / non-equi join leg is
+	// deferred: falling to `false` here drops the WHOLE body out of the flag-less route (via
+	// `flaglessShape`'s per-leg walk) → conservative all-`NO` static surface + the single-source
+	// spine's clean `unsupported-set-op` reject. (Comma joins are unreachable — the reader rejects
+	// multiple FROM sources at build time.)
+	if (isJoinBody(leaf) && !isInnerJoinBody(leaf)) return false;
 	if (!leaf.columns || leaf.columns.length === 0) return false;
 	return leaf.columns.every(rc => legColumnKind(rc) !== null);
 }
@@ -1535,7 +1718,10 @@ function buildFlaglessLeg(
 	}));
 	const effectiveSelect: AST.SelectStmt = { ...legSel, columns: aliasedColumns };
 	const branchView: MutableViewLike = { name: `__setop_leg${index}`, schemaName: view.schemaName, selectAst: effectiveSelect };
-	const branch: SetOpBranch = { side: index === 0 ? 'left' : 'right', view: branchView, dataColNames: [...dataColNames], isNested: false };
+	// A flag-less join leg is always an INNER join here: `isWritableLeafLeg` (the recognizer
+	// `flaglessShape` gated on) admits only single-source or INNER-join legs, so an outer / cross
+	// leg never reaches this builder (the body falls out of the flag-less route).
+	const branch: SetOpBranch = { side: index === 0 ? 'left' : 'right', view: branchView, dataColNames: [...dataColNames], isNested: false, isMultiSource: isJoinBody(legSel) };
 
 	const plainPositions = kinds.flatMap((k, i) => k!.kind === 'column' ? [i] : []);
 	const discriminatorPositions = kinds.flatMap((k, i) => k!.kind === 'literal' ? [i] : []);
@@ -1666,6 +1852,17 @@ function buildFlaglessInsert(ctx: PlanningContext, view: MutableViewLike, analys
 			message: `cannot insert through view '${view.name}': a flag-less set-operation insert routes by the supplied discriminator values, so it requires a VALUES source (a SELECT/DML source's per-row routing is deferred)`,
 		});
 	}
+	// A multi-source (join) leg's insert needs the plan-level shared-surrogate envelope
+	// (`buildMultiSourceInsert`), which the capture-driven set-op fan does not produce — deferred
+	// to `set-op-write-multisource-leg-insert`. Reject the WHOLE insert when ANY leg is a join (the
+	// static `is_insertable_into` surface reports `NO` for such a body), so the static and dynamic
+	// answers match exactly; UPDATE / DELETE through the same body's join legs are supported.
+	if (legs.some(l => l.branch.isMultiSource)) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op', table: view.name,
+			message: `cannot insert through view '${view.name}': a multi-source (join) leg's insert needs the plan-level shared-surrogate envelope — deferred to set-op-write-multisource-leg-insert (UPDATE / DELETE through a join leg are supported)`,
+		});
+	}
 	const values = stmt.source.values;
 	const layout = resolveFlaglessInsertLayout(view, analysis, stmt);
 	const baseOps: BaseOp[] = [];
@@ -1715,11 +1912,12 @@ function fanLegsForFanOut(ctx: PlanningContext, op: SetOpAnalysis['op'], legs: r
 function buildFlaglessDelete(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, legs: readonly FlaglessLeg[], stmt: AST.DeleteStmt): SetOpWritePlan {
 	rejectReturning(view, stmt.returning);
 	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
+	const fan = makeJoinLegFan(capture);
 	const baseOps: BaseOp[] = [];
 	for (const leg of fanLegsForFanOut(ctx, analysis.op, legs, stmt.where)) {
-		baseOps.push(...fanBranchDelete(ctx, view, analysis, leg.branch, stmt));
+		baseOps.push(...fanBranchDelete(ctx, view, analysis, leg.branch, stmt, fan));
 	}
-	return { baseOps, capture };
+	return { baseOps, capture, nestedCaptures: fan.captures.length > 0 ? fan.captures : undefined };
 }
 
 function buildFlaglessUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, legs: readonly FlaglessLeg[], stmt: AST.UpdateStmt): SetOpWritePlan {
@@ -1747,9 +1945,10 @@ function buildFlaglessUpdate(ctx: PlanningContext, view: MutableViewLike, analys
 		dataAssignments.push({ position, value: asg.value });
 	}
 	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
+	const fan = makeJoinLegFan(capture);
 	const baseOps: BaseOp[] = [];
 	for (const leg of fanLegsForFanOut(ctx, analysis.op, legs, stmt.where)) {
-		baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, leg.branch, dataAssignments, stmt));
+		baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, leg.branch, dataAssignments, stmt, fan));
 	}
-	return { baseOps, capture };
+	return { baseOps, capture, nestedCaptures: fan.captures.length > 0 ? fan.captures : undefined };
 }

@@ -326,6 +326,24 @@ export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 }
 
 /**
+ * True iff `selectAst` is a decomposable join body ({@link isDecomposableJoinBody}) whose
+ * joins are **all INNER**. The set-op join-leg compose
+ * (`set-op-write-multisource-leg-compose`) ships INNER equi-join legs; an OUTER
+ * (left/right/full) join leg's set-op write composition is a follow-up. The set-op
+ * recognizers gate on this so a body with an outer-join leg reports the conservative
+ * all-`NO` static surface AND rejects the dynamic write cleanly (never an internal error),
+ * matching exactly. A cross / no-ON join (not decomposable) likewise fails this and is
+ * deferred — agreeing with `analyzeJoinView`'s downstream reject.
+ */
+export function isInnerJoinBody(selectAst: AST.QueryExpr): boolean {
+	if (!isDecomposableJoinBody(selectAst)) return false;
+	const from = (selectAst as AST.SelectStmt).from!;
+	const allInner = (fc: AST.FromClause): boolean =>
+		fc.type !== 'join' || (fc.joinType === 'inner' && allInner(fc.left) && allInner(fc.right));
+	return allInner(from[0]);
+}
+
+/**
  * Decompose a multi-source (n-way `inner`/`left`/`full` join) view mutation into
  * an ordered `BaseOp[]`. Throws a structured diagnostic for any unsupported shape.
  */
@@ -1997,6 +2015,26 @@ export function makeMultiSourceKeyRef(
 		rowConstraints: [],
 	};
 	return new InternalRecursiveCTERefNode(scope, captureRelationName, keyAttrs, keyRelType, capture.descriptor);
+}
+
+/**
+ * A planning context with `capture` injected into `cteNodes` under its relation name (the
+ * capture's {@link MultiSourceKeyCapture.relationName}, defaulting to {@link MS_UPDATE_KEYS_CTE}),
+ * so a base op's / inner capture's `from <relationName> k` reference resolves to the capture's
+ * context-backed key relation (over the shared capture descriptor). The injected ref's own
+ * name is pinned to the SAME `relationName` so the map key and the ref agree — a nested capture
+ * injects under its fresh `__vmupd_keys$N` name while shadowing nothing under the default. A
+ * fresh ref per call keeps each consumer's subtree from sharing a node instance.
+ *
+ * Shared by the multi-source UPDATE/DELETE builder (`view-mutation-builder.ts`) and the set-op
+ * join-leg compose (`set-op.ts`, which injects the OUTER set-op capture so an inner per-branch
+ * capture's `memberExists` filter resolves against it).
+ */
+export function withKeyCapture(ctx: PlanningContext, capture: MultiSourceKeyCapture): PlanningContext {
+	const cteNodes = new Map(ctx.cteNodes ?? []);
+	const relationName = capture.relationName ?? MS_UPDATE_KEYS_CTE;
+	cteNodes.set(relationName, makeMultiSourceKeyRef(ctx.scope, capture, relationName));
+	return { ...ctx, cteNodes };
 }
 
 /**

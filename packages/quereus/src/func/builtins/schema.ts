@@ -22,7 +22,7 @@ import type * as AST from "../../parser/ast.js";
 import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
-import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, surfacedInnerFlagNames, isSetOpFlaglessWritableBody, flaglessDiscriminatorColumnNames } from "../../planner/mutation/set-op.js";
+import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, setOpHasMultiSourceLeg, surfacedInnerFlagNames, isSetOpFlaglessWritableBody, flaglessDiscriminatorColumnNames } from "../../planner/mutation/set-op.js";
 import { type ViewSchema, bodyDefaults } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -781,12 +781,15 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		if (!isSetOpBranchWritable(view.selectAst)) return CONSERVATIVE_VIEW_INFO;
 		const targets = [...new Set([...buildTableRefsById(nodes).values()].map(r => r.tableSchema.name))].sort();
 		// Update / delete fan-out recurses through a subtree operand to its member leaves
-		// (`nestable-flagged-set-ops`), so updatable / deletable stay YES at any depth. But
-		// inserting into a multi-leaf subtree has no single deterministic target leaf
-		// (product-coordinate addressing — `set-op-membership-nested`), so gate insertability
-		// to NO when ANY operand is a subtree — a conservative, honest under-claim agreeing
+		// (`nestable-flagged-set-ops`) AND composes a multi-source (INNER join) branch
+		// (`set-op-write-multisource-leg-compose`), so updatable / deletable stay YES at any depth.
+		// But insert is deferred for two shapes: inserting into a multi-leaf subtree has no single
+		// deterministic target leaf (product-coordinate addressing — `set-op-membership-nested`),
+		// and inserting into a multi-source (join) branch needs the plan-level shared-surrogate
+		// envelope the capture-driven fan does not produce (`set-op-write-multisource-leg-insert`).
+		// Gate insertability to NO when EITHER holds — a conservative, honest under-claim agreeing
 		// with the dynamic insert-through reject.
-		const isInsertableInto = !setOpHasSubtreeOperand(view.selectAst);
+		const isInsertableInto = !setOpHasSubtreeOperand(view.selectAst) && !setOpHasMultiSourceLeg(view.selectAst);
 		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 
@@ -800,7 +803,11 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// `targetIds.size === 0` conservative row below.
 	if (isSetOpFlaglessWritableBody(view.selectAst)) {
 		const targets = [...new Set([...buildTableRefsById(nodes).values()].map(r => r.tableSchema.name))].sort();
-		return { isInsertableInto: true, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
+		// Insert through a multi-source (join) leg is deferred (`set-op-write-multisource-leg-insert`),
+		// so gate `is_insertable_into` to NO when ANY leg is a join — matching the dynamic
+		// `buildFlaglessInsert` reject; UPDATE / DELETE through the join leg stay YES.
+		const isInsertableInto = !setOpHasMultiSourceLeg(view.selectAst);
+		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 
 	// Non-decomposable join shape gate: cross / comma (implicit) / subquery- or

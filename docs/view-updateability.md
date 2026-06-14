@@ -440,16 +440,44 @@ so a branch insert/delete can never perturb the affected set out from under a si
 Halloween-unsafe). The capture rides the existing `ViewMutationNode.identityCapture` side
 input + void/drain runtime path — no new runtime substrate.
 
-**A branch is itself a view body.** Each operand (`select … from B`) is a **single-source**
-view body, so each per-branch op is lowered to an AST `BaseOp`
+**A branch is itself a view body.** Each **single-source** operand (`select … from B`) has its
+per-branch op lowered to an AST `BaseOp`
 against a **synthetic branch view-like** and run back through `propagate` — reusing the
 spines verbatim (the branch's own σ predicate, column renames, and base routing are honored
-by its own spine; `no-default` / computed-column rejections fall out of the recursion). A
-**multi-source** branch/leg — one whose FROM is a join or comma-join (`isJoinBody`) — is
-explicitly **rejected** (a clean `unsupported-set-op` reject, both static and dynamic) pending
-the `set-op-write-multisource-leg-compose` unlock: routing it back through `propagate` would
-reach the multi-source spine, whose own `__vmupd_keys` identity capture collides with the
-outer set-op capture (the internal `k.k0_0 isn't a column` error). A
+by its own spine; `no-default` / computed-column rejections fall out of the recursion).
+
+**A multi-source (INNER join) branch/leg composes via a chained inner capture**
+(`set-op-write-multisource-leg-compose`). A branch whose FROM is an inner equi-join
+(`isInnerJoinBody`) does NOT route through plain `propagate` (which builds no capture and would
+collide the multi-source spine's own `__vmupd_keys` identity capture with the outer set-op
+capture — the internal `k.k0_0 isn't a column` error). Instead the fan builds the join branch
+itself, mirroring `buildViewMutation`'s mini-orchestration: it analyses the branch join body
+(`analyzeJoinView`), decomposes the base ops (`decomposeUpdate` / `decomposeDelete`) against a
+**fresh per-branch capture name** `__vmupd_keys$N` (minted monotonically, so two join branches in
+one statement never collide), and builds that **inner per-branch base-PK capture**
+(`buildMultiSourceKeyCapture`) over the branch join body, filtered by the **same `buildMemberExists`
+predicate** the single-source fan uses (the NULL-safe data-tuple match against the OUTER set-op
+capture, plus any `except` / `intersect` gate flags). The inner capture is built under a context
+with the outer `__vmupd_keys` injected, so its `memberExists` filter scans the outer capture; it is
+bubbled up on `SetOpWritePlan.nestedCaptures` and rides `ViewMutationNode.nestedCaptures` —
+materialized **outer-first, then each inner**, before the branch base ops, so the inner capture
+freezes the branch's affected rows before any base op mutates (Halloween-safe and order-independent
+across the branch's own base ops, including a both-sides write). The chain is:
+
+```
+outer set-op capture  __vmupd_keys      = π_{view cols + flags}( σ_{userWhere}( setOpRoot ) )        [primary capture]
+inner branch capture  __vmupd_keys$N    = π_{k<side>_<j>}( σ_{memberExists}( branchJoinNode ) )      [nested, scans the outer]
+branch base ops       update/delete t_side … where exists(select 1 from __vmupd_keys$N k where k.k<side>_<j> = t_side.<pk_j>)
+```
+
+A composite-PK / self-join branch flows through unchanged (the inner capture projects one column
+per PK column per side; self-joins route by alias). **INSERT** into a join branch — a membership
+`set <flag> = true`, a flag-less consistent-leg insert, or VALUES insert-through — needs the
+plan-level shared-surrogate envelope the AST `BaseOp[]` fan does not produce, so it is deferred to
+`set-op-write-multisource-leg-insert`: the dynamic insert rejects cleanly and the static
+`is_insertable_into` surface reports `NO` for any body with a join leg (while `is_updatable` /
+`is_deletable` report `YES`), matching exactly. An **OUTER (left/right/full) / cross / non-equi**
+join leg is likewise deferred — rejected cleanly at branch classification (a follow-up). A
 branch that bottoms out in a base table emits one base op; a branch that is itself a
 `SetOperationNode` (a **subtree operand**) **recurses here** for the
 unambiguous fan-out — a data-column UPDATE, a DELETE, and a `set <subtreeFlag> = false` drop
@@ -603,11 +631,14 @@ oracle** — its σ conjuncts (`where x < 5`, `between`, …) are fed to `checkS
 mutation predicate, so an INSERT whose supplied value provably violates the range makes that leg `unsat`
 ⇒ skipped, with no phantom base row, `set-op-flagless-range-sigma-oracle`; a σ on a **non-projected**
 column (`where f(color)`) still resolves to no in-scope accumulator and routes include-on-unknown);
-a leg whose body is a **multi-source (join) body** is now explicitly **rejected** (`isWritableLeafLeg`
-gates on `isJoinBody`), so the static surfaces report all-`NO` and the dynamic write falls out of the
-flag-less route into the single-source spine's clean `cannot write through view` reject — no longer the
-internal `k.k0_0 isn't a column` error the un-composed nested capture used to hit (`set-op-write-multisource-leg-reject`).
-Composing the nested capture to actually *support* a join leg is the separate `set-op-write-multisource-leg-compose` unlock.
+a leg whose body is a **multi-source (INNER join) body** is now **composed** through the chained inner
+per-leg capture (`isWritableLeafLeg` admits an inner-join leg; the fan builds an `__vmupd_keys$N`
+capture off the outer set-op capture — see § Set Operations above), so UPDATE / data-UPDATE and DELETE
+fan to it and the static surfaces report `is_updatable` / `is_deletable` = YES. INSERT through a join leg
+is deferred (`set-op-write-multisource-leg-insert`): a clean reject, with `is_insertable_into` = NO for
+any body with a join leg. An OUTER / cross / non-equi join leg stays deferred (a clean reject, the static
+surface all-`NO`), so neither path hits the internal `k.k0_0 isn't a column` error the un-composed nested
+capture used to (`set-op-write-multisource-leg-compose`).
 
 **v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
 view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of

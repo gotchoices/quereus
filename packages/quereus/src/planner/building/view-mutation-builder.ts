@@ -5,7 +5,7 @@ import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, withKeyCapture, isJoinBody, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as decomposeDecompositionUpdate, buildDecompositionKeyCapture, type DecompInsertOp, type DecompShape, type CapturedDecompValue } from '../mutation/decomposition.js';
 import { isSetOpMembershipBody, isSetOpFlaglessWritableBody, buildSetOpWrite, buildFlaglessSetOpWrite, type SetOpWritePlan } from '../mutation/set-op.js';
 import { buildCteSelfCapture } from '../mutation/single-source.js';
@@ -349,23 +349,6 @@ function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnaly
 }
 
 /**
- * A planning context whose `cteNodes` resolves the capture's relation name (the
- * shared `__vmupd_keys` default, or a nested capture's fresh name) to a freshly-minted
- * context-backed key relation (over the shared capture descriptor), so a multi-side
- * base op's `select k<side> from <relationName>` identifying subquery reads the
- * materialized capture rows. The injected ref's own name is pinned to the SAME
- * `relationName` so the map key and the ref agree (a nested capture injects under its
- * fresh name while shadowing nothing under the default). A fresh ref per call keeps each
- * base op's subtree from sharing a node instance.
- */
-function withKeyCapture(ctx: PlanningContext, capture: MultiSourceKeyCapture): PlanningContext {
-	const cteNodes = new Map(ctx.cteNodes ?? []);
-	const relationName = capture.relationName ?? MS_UPDATE_KEYS_CTE;
-	cteNodes.set(relationName, makeMultiSourceKeyRef(ctx.scope, capture, relationName));
-	return { ...ctx, cteNodes };
-}
-
-/**
  * The `ctxSelfRead` for a CTE-name DML target whose user clauses self-read the target
  * name (docs/view-updateability.md § Common Table Expressions — self-reference): the
  * target-EXCLUDED body context (`ctx`) with the target name **re-added** to `cteNodes`,
@@ -545,14 +528,24 @@ function buildSetOpMutation(
 	req: MutationRequest,
 	writeFn: (ctx: PlanningContext, view: MutableViewLike, req: MutationRequest) => SetOpWritePlan,
 ): PlanNode {
-	const { baseOps, capture } = writeFn(ctx, view, req);
+	const { baseOps, capture, nestedCaptures } = writeFn(ctx, view, req);
 	// Each probe-driven branch op reads the capture back through `__vmupd_keys`; inject a
 	// fresh context-backed key ref (sharing the one capture descriptor) per op, exactly as
 	// the multi-source update/delete path does. Insert-through has no capture ⇒ no injection.
-	const opCtx = capture ? withKeyCapture(ctx, capture) : ctx;
+	// A **multi-source (join) branch** additionally builds its own inner per-branch capture
+	// under a fresh `__vmupd_keys$N` name (chained off the outer set-op capture): inject the
+	// outer AND every inner so a base op of branch N — referencing `__vmupd_keys$N` — resolves
+	// (distinct names, so injecting all is harmless; a base op names only its own branch's).
+	let opCtx = capture ? withKeyCapture(ctx, capture) : ctx;
+	for (const inner of nestedCaptures ?? []) opCtx = withKeyCapture(opCtx, inner);
 	const children = baseOps.map(op => buildBaseOp(opCtx, op, [], false));
 	const identityCapture = capture ? { source: capture.source, descriptor: capture.descriptor } : undefined;
-	return new ViewMutationNode(ctx.scope, children, undefined, undefined, undefined, identityCapture);
+	// The inner per-branch captures ride the ORDERED `nestedCaptures` side input: materialized
+	// AFTER the primary outer capture, in fan order, so each inner's `memberExists` filter scans
+	// the already-materialized outer `__vmupd_keys` (and torn down in reverse). Empty ⇒ undefined,
+	// so a join-leg-free set-op write lowers byte-identically to the pre-list substrate.
+	const nested = (nestedCaptures ?? []).map(c => ({ source: c.source, descriptor: c.descriptor }));
+	return new ViewMutationNode(ctx.scope, children, undefined, undefined, undefined, identityCapture, nested.length > 0 ? nested : undefined);
 }
 
 /**

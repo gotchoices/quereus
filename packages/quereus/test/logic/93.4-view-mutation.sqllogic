@@ -3969,14 +3969,14 @@ select * from q3 order by id;
 → [{"id":7,"created":70}]
 
 -- ===================================================================
--- Set-op MEMBERSHIP body with a multi-source (JOIN) branch (`set-op-write-multisource-leg-reject`):
--- a `union exists … as <flag>` body one of whose branches is a JOIN is NOT yet writable. Both
--- the static branch-writability probe (`isOperandWritable`) and the dynamic branch builder
--- (`buildBranch`) reject a join branch (`isJoinBody`), so `view_info` / `column_info` report the
--- conservative all-`NO` row (no over-claim from the membership flag's presence) and a write
--- rejects with a clean `cannot write through view … multi-source (join) leg` diagnostic — NEVER
--- the internal `k.k0_0 isn't a column` error a recursive multi-source capture would have hit.
--- The join-branch write-through unlock is filed as `set-op-write-multisource-leg-compose`.
+-- Set-op MEMBERSHIP body with a multi-source (INNER JOIN) branch
+-- (`set-op-write-multisource-leg-compose`): a `union exists … as <flag>` body one of whose
+-- branches is an INNER join is now writable for UPDATE / DELETE. The data/delete fan composes the
+-- join branch via an inner per-branch base-PK capture (`__vmupd_keys$N`) chained off the outer
+-- set-op capture, so the join branch decomposes through the multi-source machinery without
+-- colliding with the outer capture (the internal `k.k0_0` error is gone). INSERT into a join
+-- branch is deferred (`set-op-write-multisource-leg-insert`), so `is_insertable_into` reports NO
+-- while is_updatable / is_deletable report YES — both surfaces matching the dynamic write.
 -- ===================================================================
 create table mj1 (id integer primary key, x integer, color text null);
 create table mj2 (id integer primary key, y integer);
@@ -3987,31 +3987,75 @@ create view MV as
   union exists left as inL, exists right as inR
   select id, x from mj1 where color = 'blue';
 
--- read (data columns) still works — only WRITE-through is rejected.
-select id, x from MV order by id;
-→ [{"id":1,"x":10},{"id":2,"x":20}]
+-- read (data columns + membership probes).
+select id, x, inL, inR from MV order by id;
+→ [{"id":1,"x":10,"inL":true,"inR":false},{"id":2,"x":20,"inL":false,"inR":true}]
 
--- static surfaces: all-`NO` (the join branch drops the branch-writability probe to non-writable).
+-- static surfaces: is_updatable / is_deletable = YES (the join branch composes); is_insertable_into
+-- = NO (join-branch insert deferred). Matches the dynamic write exactly.
 select is_insertable_into, is_updatable, is_deletable from view_info('MV');
-→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
--- (column_name dropped: the membership-flag column case is not load-bearing here; every column,
--- data and flag alike, must report is_updatable = NO with a null base.)
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+-- every column (data + flag) is writable-through-effect with a null base (the membership-write
+-- shape — a data fan-out / flag flip, not a single base column).
 select cid, is_updatable, base_table, base_column from column_info('MV');
-→ [{"cid":0,"is_updatable":"NO","base_table":null,"base_column":null},{"cid":1,"is_updatable":"NO","base_table":null,"base_column":null},{"cid":2,"is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"is_updatable":"NO","base_table":null,"base_column":null}]
+→ [{"cid":0,"is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"is_updatable":"YES","base_table":null,"base_column":null},{"cid":3,"is_updatable":"YES","base_table":null,"base_column":null}]
 
--- dynamic write: a clean structured reject (NOT the internal `k.k0_0` error), delete/update/insert.
-delete from MV where inL = true;
--- error: multi-source (join) leg
+-- data UPDATE through the join branch: `x` maps to mj1.x, so the fan updates mj1 only (mj2 untouched).
 update MV set x = x + 1 where inL = true;
--- error: multi-source (join) leg
-insert into MV (id, x, inL, inR) values (5, 50, true, false);
--- error: multi-source (join) leg
-
--- the base tables are untouched (every write rejected before any base op fired).
 select id, x from mj1 order by id;
-→ [{"id":1,"x":10},{"id":2,"x":20}]
-select id from mj2 order by id;
-→ [{"id":1},{"id":2}]
+→ [{"id":1,"x":11},{"id":2,"x":20}]
+select id, y from mj2 order by id;
+→ [{"id":1,"y":100},{"id":2,"y":200}]
+
+-- DELETE through the join branch fans to both candidate sides of the inner join (the lenient
+-- ambiguous-delete default), so the joined row id=1 leaves both mj1 and mj2; the plain branch's
+-- row id=2 is untouched (it is not a member of the join branch's captured set).
+delete from MV where inL = true;
+select id, x from mj1 order by id;
+→ [{"id":2,"x":20}]
+select id, y from mj2 order by id;
+→ [{"id":2,"y":200}]
+
+-- INSERT into a join branch stays deferred — a clean reject (never the internal capture error).
+insert into MV (id, x, inL, inR) values (5, 50, true, false);
+-- error: set-op-write-multisource-leg-insert
+
+-- ===================================================================
+-- TWO join branches in ONE body (`set-op-write-multisource-leg-compose`, the distinct-inner-name
+-- requirement): both branches are INNER joins, so the fan builds an inner per-branch capture for
+-- EACH under a DISTINCT fresh name (`__vmupd_keys$1`, `__vmupd_keys$2`). A single UPDATE touching
+-- both branches exercises both captures at once — two branches sharing a name would re-introduce
+-- the original collision, so a correct both-branch update proves the monotonic counter never resets.
+-- ===================================================================
+create table tba (id integer primary key, x integer);
+create table tbb (id integer primary key, x integer);
+create table tbc (id integer primary key);
+create table tbd (id integer primary key);
+insert into tba values (1,10),(2,20);
+insert into tbb values (1,11),(2,22);
+insert into tbc values (1),(2);
+insert into tbd values (1),(2);
+create view TWO as
+  select tba.id as id, tba.x as x from tba join tbc on tba.id = tbc.id
+  union exists left as inL, exists right as inR
+  select tbb.id as id, tbb.x as x from tbb join tbd on tbb.id = tbd.id;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('TWO');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+
+-- The left join branch's rows (from tba) and the right's (from tbb) carry different x values, so
+-- each view row is a member of exactly one branch.
+select id, x, inL, inR from TWO order by id, x;
+→ [{"id":1,"x":10,"inL":true,"inR":false},{"id":1,"x":11,"inL":false,"inR":true},{"id":2,"x":20,"inL":true,"inR":false},{"id":2,"x":22,"inL":false,"inR":true}]
+
+-- UPDATE both branches at once (where id=1 captures one row per branch): the left fan updates
+-- tba.x (via `__vmupd_keys$1`), the right fan updates tbb.x (via `__vmupd_keys$2`) — distinct
+-- inner captures, no collision.
+update TWO set x = x + 100 where id = 1;
+select id, x from tba order by id;
+→ [{"id":1,"x":110},{"id":2,"x":20}]
+select id, x from tbb order by id;
+→ [{"id":1,"x":111},{"id":2,"x":22}]
 
 -- ===================================
 -- RETURNING <q>.* qualifier validation through updatable views.
