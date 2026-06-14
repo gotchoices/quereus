@@ -1214,6 +1214,26 @@ describe('lens enforcement: conflict action on a transport-proved key', () => {
 			await db.close();
 		}
 	});
+
+	it('a smaller disagreeing subset basis key supersedes an exact transport match and blocks', async () => {
+		// The basis has BOTH an exact `unique(a, b) on conflict replace` (which transport's
+		// `findDeclaredKey` matches) AND a smaller `unique(a)` defaulting to ABORT. The
+		// logical `unique(a, b) on conflict replace` matches the exact basis key — under the
+		// OLD transport-coupled rejecter it deployed clean. But `unique(a)` ⊆ `{a, b}` also
+		// governs every `(a, b)` duplicate, and if it fires first the REPLACE is dropped, so
+		// the decoupled subset governance correctly reds, naming the smaller key. This pins
+		// the soundness gain of decoupling governance from the exact transport match.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null, b integer not null, unique (a, b) on conflict replace, unique (a)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer not null, b integer not null, unique (a, b) on conflict replace) }');
+			await db.exec(SUPERKEY_BARE_LENS);
+			await expectThrows(() => db.exec('apply schema x'), /unenforceable-conflict-action[\s\S]*basis unique \(a\)/);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens enforcement: set-level (unique / PK) row-time at the write boundary', () => {
