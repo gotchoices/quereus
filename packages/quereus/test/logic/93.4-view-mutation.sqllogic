@@ -3336,6 +3336,26 @@ with x as (select id, color as note from nd_base),
 select * from nd_base order by id;
 → [{"id":1,"color":"z"}]
 
+-- Compound (union) leg re-binds the inner source name — the shadowing re-bind sits in a UNION leg
+-- of a nested EXISTS subquery, exercising the `onLeg` descent (a leg's OWN FROM aliases shadow
+-- WITHIN that leg). `from lother2 x` re-binds `x`, so the leg's `x.note` is that local alias's
+-- column → binds lother2.note='red' → leg returns a row → EXISTS true → write fires. (Blind
+-- substitution rewrote `x.note` → bare base `color`, which then binds lother2.color='blue' inside
+-- the leg → both legs empty → EXISTS false → no write.)
+create table lbase (id integer primary key, color text);
+insert into lbase values (1,'red');
+create table lother (k integer primary key);
+create table lother2 (oid integer primary key, note text, color text);
+insert into lother2 values (1,'red','blue');
+with x as (select id, color as note from lbase),
+     t as (select id, note from x where exists (
+        select 1 from lother
+        union
+        select 1 from lother2 x where x.note = 'red'))
+     update t set note='z';
+select * from lbase order by id;
+→ [{"id":1,"color":"z"}]
+
 -- Forward reference write-through — the target `x` is the FIRST CTE and its body reads a sibling
 -- CTE `fwd` defined LATER whose name also shadows a real table. Per SQL definition-order scoping a
 -- non-recursive CTE is visible only to LATER siblings, so inside `x`'s body the later `fwd` CTE is
