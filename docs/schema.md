@@ -391,6 +391,20 @@ full SET COLLATE contract, including the non-PK UNIQUE re-validation and the
 custom-comparator dedup residual (a comparator-only collation with no registered byte
 encoder still keys/dedups under NOCASE bytes).
 
+**Index-derived UNIQUE enforcement collation.** A `CREATE UNIQUE INDEX … (col COLLATE x)`
+synthesizes a `derivedFromIndex` UNIQUE constraint whose DML enforcement resolves each
+column's comparison collation from the **index's** per-column `COLLATE` clause (falling
+back to the declared column collation when the index column carries none) —
+`StoreTable.uniqueEnforcementCollations`, matching memory's `checkUniqueViaIndex`, the
+store's own `buildIndexEntries` build-time dedup, and SQLite (a unique index enforces
+under the index's collation). So a *finer* index (`COLLATE BINARY` over a `NOCASE` column)
+admits case-variants the column would unify, and a *coarser* index (`COLLATE NOCASE` over a
+`BINARY` column) unifies case-variants the column would keep distinct. `ALTER COLUMN … SET
+COLLATE` on a column under such an index propagates the new collation into the index
+column (metadata-only — the store's index *key* bytes use the table-level collation K, so
+no entry re-encode is required), mirroring the memory module; a non-derived (table-level /
+column) UNIQUE always enforces under the declared column collation.
+
 ### View and materialized-view persistence
 
 Views and materialized views are engine-level catalog objects that never pass

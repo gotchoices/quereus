@@ -365,4 +365,124 @@ describe('StoreTable UNIQUE constraints', () => {
 			expect(await collect(db, `SELECT count(*) AS n FROM rt`)).to.deep.equal([{ n: 1 }]);
 		});
 	});
+
+	// A UNIQUE *index* carrying an explicit per-column COLLATE clause must be enforced
+	// under the INDEX's collation, not the column's declared collation — matching the
+	// memory module (checkUniqueViaIndex), the store's own buildIndexEntries dedup, and
+	// SQLite (store-index-derived-unique-honors-index-collation). The DML write path now
+	// resolves each constrained column's collation via StoreTable.uniqueEnforcementCollations
+	// (index per-column COLLATE → declared fallback).
+	describe('index-derived UNIQUE honors the index per-column collation', () => {
+		async function rejects(sql: string): Promise<Error> {
+			let err: Error | null = null;
+			try { await db.exec(sql); } catch (e) { err = e as Error; }
+			expect(err, `expected "${sql}" to be rejected`).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+			return err!;
+		}
+
+		it('FINER index (BINARY) over a NOCASE column admits both case-variants (plain scan path)', async () => {
+			// Case A: the NOCASE column would unify 'Bob'/'bob', but the BINARY index
+			// keeps them distinct — both must insert (was rejected under declared NOCASE).
+			await db.exec(`CREATE TABLE fa (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX fa_b ON fa (b COLLATE BINARY)`);
+			await db.exec(`INSERT INTO fa VALUES (1, 'Bob')`);
+			await db.exec(`INSERT INTO fa VALUES (2, 'bob')`); // BINARY-distinct ⇒ admitted
+			expect(await collect(db, `SELECT id, b FROM fa ORDER BY id`)).to.deep.equal([
+				{ id: 1, b: 'Bob' }, { id: 2, b: 'bob' },
+			]);
+			// A genuine BINARY duplicate is still rejected (guard against under-matching).
+			await rejects(`INSERT INTO fa VALUES (3, 'bob')`);
+		});
+
+		it('FINER index (BINARY) over a NOCASE column admits both case-variants through the covering MV path', async () => {
+			// Same as above but with a row-time covering MV linked to the derived UNIQUE,
+			// so enforcement routes through findUniqueConflictViaCoveringMv: the candidate
+			// generation narrows under the declared NOCASE (a SUPERSET of the BINARY
+			// matches) and the re-validation filters under the index BINARY. NOTE: this is
+			// a store-only assertion — memory's checkUniqueViaMaterializedView re-validates
+			// under the declared collation, so the MV-backed path is one place store and
+			// memory still differ for a finer-index derived UNIQUE (see review handoff).
+			await db.exec(`CREATE TABLE fam (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX fam_b ON fam (b COLLATE BINARY)`);
+			await db.exec(`CREATE MATERIALIZED VIEW fam_mv AS SELECT b, id FROM fam ORDER BY b`);
+			await db.exec(`INSERT INTO fam VALUES (1, 'Bob')`);
+			await db.exec(`INSERT INTO fam VALUES (2, 'bob')`); // BINARY-distinct ⇒ admitted via MV path
+			expect(await collect(db, `SELECT id, b FROM fam ORDER BY id`)).to.deep.equal([
+				{ id: 1, b: 'Bob' }, { id: 2, b: 'bob' },
+			]);
+		});
+
+		it('COARSER index (NOCASE) over a BINARY column unifies case-variants (plain scan path)', async () => {
+			// Case B: the BINARY column would keep 'Bob'/'BOB' distinct, but the NOCASE
+			// index unifies them — the second must be rejected (was admitted under declared
+			// BINARY).
+			await db.exec(`CREATE TABLE cb (id INTEGER PRIMARY KEY, b TEXT) USING store`); // b is BINARY
+			await db.exec(`CREATE UNIQUE INDEX cb_b ON cb (b COLLATE NOCASE)`);
+			await db.exec(`INSERT INTO cb VALUES (1, 'Bob')`);
+			await rejects(`INSERT INTO cb VALUES (2, 'BOB')`); // NOCASE-equal ⇒ rejected
+			expect(await collect(db, `SELECT count(*) AS n FROM cb`)).to.deep.equal([{ n: 1 }]);
+			// A genuinely different value still inserts.
+			await db.exec(`INSERT INTO cb VALUES (3, 'Carol')`);
+			expect(await collect(db, `SELECT id, b FROM cb ORDER BY id`)).to.deep.equal([
+				{ id: 1, b: 'Bob' }, { id: 3, b: 'Carol' },
+			]);
+		});
+
+		it('build-time dedup and DML enforcement agree on the index collation (internal consistency)', async () => {
+			// The headline internal inconsistency: buildIndexEntries (CREATE UNIQUE INDEX
+			// over existing rows) already dedups under the index collation, but DML used to
+			// compare under the declared collation. Pre-load BINARY-distinct case-variants
+			// into a NOCASE column, then build a BINARY index over them — the build must
+			// admit both — and a later DML insert of a third BINARY-distinct variant must
+			// also be admitted, proving build and DML now agree.
+			await db.exec(`CREATE TABLE ic (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
+			await db.exec(`INSERT INTO ic VALUES (1, 'Bob'), (2, 'bob')`); // no constraint yet
+			await db.exec(`CREATE UNIQUE INDEX ic_b ON ic (b COLLATE BINARY)`); // build dedup under BINARY ⇒ ok
+			await db.exec(`INSERT INTO ic VALUES (3, 'BOB')`); // DML under BINARY ⇒ admitted
+			expect(await collect(db, `SELECT id, b FROM ic ORDER BY id`)).to.deep.equal([
+				{ id: 1, b: 'Bob' }, { id: 2, b: 'bob' }, { id: 3, b: 'BOB' },
+			]);
+		});
+
+		it('a plain CREATE UNIQUE INDEX (no explicit COLLATE) still enforces the column collation', async () => {
+			// Regression guard for the common path: with no per-column COLLATE on the index,
+			// the helper falls back to the declared column collation, so a NOCASE column's
+			// index still folds case (byte-for-byte unchanged behaviour).
+			await db.exec(`CREATE TABLE pg (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX pg_b ON pg (b)`);
+			await db.exec(`INSERT INTO pg VALUES (1, 'Bob')`);
+			await rejects(`INSERT INTO pg VALUES (2, 'bob')`); // still NOCASE ⇒ rejected
+			expect(await collect(db, `SELECT count(*) AS n FROM pg`)).to.deep.equal([{ n: 1 }]);
+		});
+
+		it('composite index resolves each column position independently (mixed collations)', async () => {
+			// (a COLLATE BINARY, b COLLATE NOCASE): each position uses its own index
+			// collation — the helper returns per-column collations, not one table-wide one.
+			await db.exec(`CREATE TABLE comp (id INTEGER PRIMARY KEY, a TEXT, b TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX comp_ab ON comp (a COLLATE BINARY, b COLLATE NOCASE)`);
+			await db.exec(`INSERT INTO comp VALUES (1, 'x', 'Y')`);
+			// a matches under BINARY ('x'='x'), b matches under NOCASE ('Y'≈'y') ⇒ conflict.
+			await rejects(`INSERT INTO comp VALUES (2, 'x', 'y')`);
+			// a differs under BINARY ('X'≠'x') ⇒ distinct composite key ⇒ admitted.
+			await db.exec(`INSERT INTO comp VALUES (3, 'X', 'y')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM comp`)).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('conflict resolution (OR IGNORE / OR REPLACE) acts on the index-collation conflict', async () => {
+			// A NOCASE index over a BINARY column: a case-variant collides, and the OR arms
+			// must resolve that index-collation conflict (REPLACE evicts the prior row).
+			await db.exec(`CREATE TABLE cr (id INTEGER PRIMARY KEY, b TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX cr_b ON cr (b COLLATE NOCASE)`);
+			await db.exec(`INSERT INTO cr VALUES (1, 'Bob')`);
+
+			// OR IGNORE: the NOCASE-equal duplicate is silently dropped.
+			await db.exec(`INSERT OR IGNORE INTO cr VALUES (2, 'BOB')`);
+			expect(await collect(db, `SELECT id, b FROM cr ORDER BY id`)).to.deep.equal([{ id: 1, b: 'Bob' }]);
+
+			// OR REPLACE: the NOCASE-equal duplicate (id=1) is evicted, the new row lands.
+			await db.exec(`INSERT OR REPLACE INTO cr VALUES (3, 'BOB')`);
+			expect(await collect(db, `SELECT id, b FROM cr ORDER BY id`)).to.deep.equal([{ id: 3, b: 'BOB' }]);
+		});
+	});
 });

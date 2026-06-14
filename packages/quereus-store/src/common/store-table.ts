@@ -1426,6 +1426,32 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
+	 * Per-`uc.column` comparison collation for UNIQUE enforcement, one entry per
+	 * constrained column (positionally aligned with `uc.columns`).
+	 *
+	 * For an index-derived constraint (`CREATE UNIQUE INDEX … (col COLLATE x)`)
+	 * the enforcing collation is the index's per-column COLLATE — mirroring
+	 * memory's `checkUniqueViaIndex` and the store's own `buildIndexEntries`
+	 * dedup — so the store admits/rejects exactly the data memory and SQLite do.
+	 * Positional alignment of `uc.columns[i]` ↔ `index.columns[i]` is guaranteed
+	 * by `appendIndexToTableSchema` (`columns = indexSchema.columns.map(c => c.index)`).
+	 *
+	 * Falls back to the declared column collation when (a) the constraint is not
+	 * index-derived (table-level / column UNIQUE — declared IS the enforcement
+	 * collation), (b) the index metadata did not survive (mirrors the gate's
+	 * `if (!index) return true` tolerance — must not throw), or (c) a column
+	 * position carries no explicit index COLLATE (the common `CREATE UNIQUE INDEX
+	 * ix ON t(b)` case → byte-for-byte unchanged behaviour).
+	 */
+	private uniqueEnforcementCollations(uc: UniqueConstraintSchema): (string | undefined)[] {
+		const schema = this.tableSchema!;
+		const index = uc.derivedFromIndex
+			? schema.indexes?.find(ix => ix.name === uc.derivedFromIndex)
+			: undefined;
+		return uc.columns.map((col, i) => index?.columns[i]?.collation ?? schema.columns[col].collation);
+	}
+
+	/**
 	 * Scan committed + pending data rows for a row matching `newRow` on
 	 * `uc.columns` whose PK is not in `selfPks`. For partial UNIQUE, candidates
 	 * whose row does not satisfy the predicate are skipped. Returns the first
@@ -1445,16 +1471,18 @@ export class StoreTable extends VirtualTable {
 			? this.coordinator.getPendingOpsForStore()
 			: null;
 		const constrainedCols = uc.columns;
-		const schema = this.tableSchema!;
+		// One comparison collation per constrained column — the index's per-column
+		// COLLATE for an index-derived UNIQUE, else the declared column collation.
+		const collations = this.uniqueEnforcementCollations(uc);
 
 		const matches = (candidate: Row): { pk: SqlValue[]; row: Row } | null => {
 			const pk = this.extractPK(candidate);
 			for (const skip of selfPks) {
 				if (this.keysEqual(pk, skip)) return null;
 			}
-			for (const idx of constrainedCols) {
-				// Compare under the column's declared collation (e.g. NOCASE), not BINARY.
-				if (compareSqlValues(newRow[idx], candidate[idx], schema.columns[idx].collation) !== 0) return null;
+			for (let i = 0; i < constrainedCols.length; i++) {
+				const idx = constrainedCols[i];
+				if (compareSqlValues(newRow[idx], candidate[idx], collations[i]) !== 0) return null;
 			}
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
 			if (predicate && predicate.evaluate(candidate) !== true) return null;
@@ -1500,13 +1528,20 @@ export class StoreTable extends VirtualTable {
 		selfPks: SqlValue[][],
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
 		const newSourcePk = this.extractPK(newRow);
+		const collations = this.uniqueEnforcementCollations(uc);
 		const candidates = await (this.db as DatabaseInternal)._lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
 		for (const cand of candidates) {
 			const liveRow = await this.readLiveRowByPk(cand.pk);
 			if (!liveRow) continue; // stale backing candidate (source row gone)
 			if (selfPks.some(pk => this.keysEqual(pk, cand.pk))) continue;
-			// Re-validate under each column's declared collation (e.g. NOCASE), not BINARY.
-			if (uc.columns.some(c => compareSqlValues(newRow[c], liveRow[c], this.tableSchema!.columns[c].collation) !== 0)) continue;
+			// Re-validate under each column's enforcement collation (the index's
+			// per-column COLLATE for an index-derived UNIQUE, else declared) — see
+			// uniqueEnforcementCollations. NOTE: the candidate generation
+			// (_lookupCoveringConflicts) narrows under the SOURCE column's declared
+			// collation, so for a FINER index it returns a superset this filters down
+			// correctly; a COARSER-index covering MV is out of scope (see the review
+			// handoff) — its narrowed candidate set can be a subset.
+			if (uc.columns.some((c, i) => compareSqlValues(newRow[c], liveRow[c], collations[i]) !== 0)) continue;
 			if (predicate && predicate.evaluate(liveRow) !== true) continue;
 			return { pk: cand.pk, row: liveRow };
 		}

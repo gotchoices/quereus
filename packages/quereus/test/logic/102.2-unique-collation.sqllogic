@@ -172,3 +172,56 @@ select count(*) as n from tl;
 insert into tl values (3, 'abd');
 select id, x from tl order by id;
 → [{"id":1,"x":"abc"},{"id":3,"x":"abd"}]
+
+-- ===================================
+-- 9. Index-derived UNIQUE enforces under the INDEX's per-column collation, not
+--    the column's declared collation. A `create unique index … (col collate x)`
+--    carries its own comparator; both modules enforce through it (memory's
+--    checkUniqueViaIndex / the store's findUniqueConflict, both now resolving the
+--    index per-column collation). Run through the plain per-scan / auto-index
+--    path (no covering MV), where memory and store provably agree.
+--    (store-index-derived-unique-honors-index-collation.)
+-- ===================================
+
+-- 9a. FINER index (BINARY) over a NOCASE column ADMITS both case-variants — the
+--     NOCASE column would unify 'Bob'/'bob' but the BINARY index keeps them apart.
+create table fai (id integer primary key, b text collate NOCASE);
+create unique index fai_b on fai (b collate BINARY);
+insert into fai values (1, 'Bob');
+insert into fai values (2, 'bob');
+select id, b from fai order by id;
+→ [{"id":1,"b":"Bob"},{"id":2,"b":"bob"}]
+
+-- a genuine BINARY duplicate is still rejected (guard against under-matching)
+insert into fai values (3, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from fai;
+→ [{"n":2}]
+
+-- 9b. COARSER index (NOCASE) over a BINARY column UNIFIES case-variants — the
+--     BINARY column would keep 'Bob'/'BOB' distinct but the NOCASE index folds them.
+create table cbi (id integer primary key, b text);
+create unique index cbi_b on cbi (b collate NOCASE);
+insert into cbi values (1, 'Bob');
+insert into cbi values (2, 'BOB');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from cbi;
+→ [{"n":1}]
+
+-- a genuinely different value still inserts
+insert into cbi values (3, 'Carol');
+select id, b from cbi order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
+
+-- 9c. A plain `create unique index` (no per-column COLLATE) falls back to the
+--     column's declared collation — a NOCASE column's index still folds case.
+create table pgi (id integer primary key, b text collate NOCASE);
+create unique index pgi_b on pgi (b);
+insert into pgi values (1, 'Bob');
+insert into pgi values (2, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from pgi;
+→ [{"n":1}]

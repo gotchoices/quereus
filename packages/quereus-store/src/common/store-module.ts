@@ -1401,10 +1401,30 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				}
 
 				const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newCol : c);
+				// Mirror the memory module (MemoryTableManager.alterColumn): a per-column
+				// collation change propagates into every index column ordering by this
+				// column, so a `derivedFromIndex` UNIQUE re-keys its enforcement under the
+				// new collation. StoreTable.uniqueEnforcementCollations reads the index's
+				// per-column collation, so without this the index entry would stay stale
+				// and the derived UNIQUE would keep enforcing the OLD collation after the
+				// ALTER. Metadata-only: the store's index KEY bytes use the table-level key
+				// collation K (see buildIndexEntries / updateSecondaryIndexes), so no index
+				// entry re-encode is required for a non-PK column. An index column with an
+				// explicit COLLATE is re-collated too — matching memory, which clobbers it
+				// the same way (no surface preserves a differing index COLLATE across an
+				// ALTER COLUMN SET COLLATE on its column).
+				const updatedIndexes = (collationChanged && oldSchema.indexes)
+					? oldSchema.indexes.map(idx => ({
+						...idx,
+						columns: idx.columns.map(ic =>
+							ic.index === colIndex ? { ...ic, collation: newCol.collation } : ic),
+					}))
+					: oldSchema.indexes;
 				const updatedSchema: TableSchema = {
 					...oldSchema,
 					columns: Object.freeze(updatedColumns),
 					columnIndexMap: buildColumnIndexMap(updatedColumns),
+					indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
 				};
 
 				// SET COLLATE existing-row re-validation (Option A, non-PK UNIQUE): a new

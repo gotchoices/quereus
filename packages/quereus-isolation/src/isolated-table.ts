@@ -1056,6 +1056,24 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		return compiled;
 	}
 
+	/**
+	 * Per-`uc.column` comparison collation for the merge-view UNIQUE check, one
+	 * entry per constrained column (positionally aligned with `uc.columns`). For an
+	 * index-derived constraint (`CREATE UNIQUE INDEX … (col COLLATE x)`) the
+	 * enforcing collation is the index's per-column COLLATE — keeping the isolation
+	 * overlay in lockstep with the wrapped store/memory module's own scanners
+	 * (StoreTable.uniqueEnforcementCollations / memory's checkUniqueViaIndex).
+	 * Falls back to the declared column collation for a non-derived constraint,
+	 * absent index metadata, or a column position with no explicit index COLLATE.
+	 */
+	private uniqueEnforcementCollations(uc: UniqueConstraintSchema): (string | undefined)[] {
+		const schema = this.tableSchema!;
+		const index = uc.derivedFromIndex
+			? schema.indexes?.find(ix => ix.name === uc.derivedFromIndex)
+			: undefined;
+		return uc.columns.map((col, i) => index?.columns[i]?.collation ?? schema.columns[col].collation);
+	}
+
 	private keysEqual(a: SqlValue[], b: SqlValue[]): boolean {
 		if (a.length !== b.length) return false;
 		// Compare under each PK column's declared collation, not BINARY. The underlying
@@ -1188,6 +1206,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		if (!this.underlyingTable.query) return null;
 		const pkIndices = this.getPrimaryKeyIndices();
 		const constrainedCols = uc.columns;
+		// One comparison collation per constrained column — the index's per-column
+		// COLLATE for an index-derived UNIQUE, else the declared column collation.
+		const collations = this.uniqueEnforcementCollations(uc);
 
 		for await (const underlyingRow of this.underlyingTable.query(this.createFullScanFilterInfo())) {
 			const pk = pkIndices.map(i => underlyingRow[i]);
@@ -1205,12 +1226,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			// row carries the appended tombstone column; strip it back to schema shape.
 			const mergedRow: Row = overlayRow ? (overlayRow.slice(0, tombstoneIndex) as Row) : underlyingRow;
 
-			const matches = constrainedCols.every(idx => {
+			const matches = constrainedCols.every((idx, i) => {
 				if (newRow[idx] === null || mergedRow[idx] === null) return false;
-				// Compare under the column's declared collation (e.g. NOCASE), not BINARY,
-				// so a UNIQUE over a collated column is enforced against committed rows
-				// through the isolation merge path (unique-constraint-honors-column-collation).
-				return compareSqlValues(newRow[idx], mergedRow[idx], this.tableSchema!.columns[idx].collation) === 0;
+				// Compare under each column's enforcement collation (the index's
+				// per-column COLLATE for an index-derived UNIQUE, else the declared
+				// column collation), so a UNIQUE over a collated column is enforced
+				// against committed rows through the isolation merge path
+				// (unique-constraint-honors-column-collation / store-index-derived-unique).
+				return compareSqlValues(newRow[idx], mergedRow[idx], collations[i]) === 0;
 			});
 			if (!matches) continue;
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
