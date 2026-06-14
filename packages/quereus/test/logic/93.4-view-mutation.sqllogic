@@ -3179,11 +3179,124 @@ create view vdist as select distinct color from cte_base;
 update vdist set color='z';
 -- error: is not updateable in phase 1
 
--- v1 boundary — a CTE body that reads ANOTHER CTE reaches a CTE node (not a base table)
--- on the lineage walk, so it rejects structurally rather than multi-level inlining.
+-- ===================================
+-- CTE-name DML target: transparent multi-level (CTE-over-CTE) body.
+-- A single-source projection-and-filter chain whose body reads ANOTHER (prior) sibling CTE
+-- is AST-flattened down to its terminal base table, so it writes through byte-identically to
+-- collapsing the chain into one CTE body. The flattener does pure syntactic substitution +
+-- filter conjunction; all lineage/inverse reasoning stays in the planner that re-plans the
+-- flat body. A non-updateable INTERMEDIATE rejects with that intermediate's body-shape reason.
+-- See docs/view-updateability.md § Common Table Expressions — multi-level CTE body.
+-- ===================================
+
+-- 2-level positive UPDATE write-through — `t` reads `a` reads base `ml`; the write lands on ml.
 create table ml (id integer primary key, color text);
-insert into ml values (1,'red');
+insert into ml values (1,'red'),(2,'green');
 with a as (select id, color from ml), t as (select * from a) update t set color='z' where id=1;
+select * from ml order by id;
+→ [{"id":1,"color":"z"},{"id":2,"color":"green"}]
+
+-- 3-level positive (ml3 ← a ← b ← t) — the recursion composes all three levels.
+create table ml3 (id integer primary key, color text);
+insert into ml3 values (1,'red'),(2,'green');
+with a as (select id, color from ml3), b as (select * from a), t as (select * from b)
+    update t set color='z' where id=2;
+select * from ml3 order by id;
+→ [{"id":1,"color":"red"},{"id":2,"color":"z"}]
+
+-- INSERT through a 2-level chain — the row lands on the terminal base table.
+create table mli (id integer primary key, color text);
+with a as (select id, color from mli), t as (select * from a) insert into t values (5,'blue');
+select * from mli order by id;
+→ [{"id":5,"color":"blue"}]
+
+-- DELETE through a 2-level chain.
+create table mld (id integer primary key, color text);
+insert into mld values (1,'red'),(2,'green'),(3,'blue');
+with a as (select id, color from mld), t as (select * from a) delete from t where id=2;
+select * from mld order by id;
+→ [{"id":1,"color":"red"},{"id":3,"color":"blue"}]
+
+-- RETURNING through a 2-level chain — returns the view-projected post-mutation row.
+create table mlr (id integer primary key, color text);
+insert into mlr values (1,'red');
+with a as (select id, color from mlr), t as (select * from a)
+    update t set color='z' where id=1 returning id, color;
+→ [{"id":1,"color":"z"}]
+
+-- Filter conjunction — the intermediate's WHERE survives into the flat body, so only red rows
+-- update; row 2 (green) is untouched even though the user predicate alone would match it.
+create table mlf (id integer primary key, color text);
+insert into mlf values (1,'red'),(2,'green');
+with a as (select id, color from mlf where color='red'), t as (select * from a)
+    update t set color='z';
+select * from mlf order by id;
+→ [{"id":1,"color":"z"},{"id":2,"color":"green"}]
+
+-- Projection narrowing — `t` exposes only `id`, so `set color=…` is unknown-view-column,
+-- exactly as for the collapsed single CTE `select id from mln`.
+create table mln (id integer primary key, color text);
+insert into mln values (1,'red');
+with a as (select id, color from mln), t as (select id from a) update t set color='z';
+-- error: is not a column of the view
+
+-- Computed / inverse across levels — `vp = v + 1` is inlined two levels; the planner recovers
+-- the inverse from the FLAT body (the flattener only substitutes syntactically), so vp=9 ⇒ v=8.
+create table ml2 (id integer primary key, v integer);
+insert into ml2 values (1,7);
+with a as (select id, v + 1 as vp from ml2), t as (select * from a) update t set vp=9 where id=1;
+select id, v from ml2 order by id;
+→ [{"id":1,"v":8}]
+
+-- Column rename — the inner CTE renames its outputs over a renamed prior CTE `a(p,q)`;
+-- substitution maps the renamed names back to the base columns.
+create table mlren (id integer primary key, color text);
+insert into mlren values (1,'red');
+with a(p,q) as (select id, color from mlren), t as (select p as id, q as color from a)
+    update t set color='z' where id=1;
+select * from mlren order by id;
+→ [{"id":1,"color":"z"}]
+
+-- Combined shadow + inline — `a` (defined before the `base2` CTE) inlines, while the target's
+-- own self-name `base2` does NOT (its same-named source stays the real `base2` table). The
+-- flattened body is `select id, color from base2`, re-planned target-excluded onto real base2.
+create table base2 (id integer primary key, color text);
+insert into base2 values (1,'red'),(2,'green');
+with a as (select id, color from base2), base2 as (select * from a)
+    update base2 set color='z' where id=1;
+select * from base2 order by id;
+→ [{"id":1,"color":"z"},{"id":2,"color":"green"}]
+
+-- Reject parity — a non-updateable INTERMEDIATE rejects with its own body-shape reason
+-- ("not updateable in phase 1"), the SAME diagnostic class a single-level CTE of that shape
+-- raises. Aggregate intermediate:
+create table mlagg (id integer primary key, g integer, v integer);
+insert into mlagg values (1,1,10),(2,1,20);
+with a as (select g, sum(v) as s from mlagg group by g), t as (select * from a)
+    update t set s=0 where g=1;
+-- error: is not updateable in phase 1
+
+-- Distinct intermediate:
+create table mldist (id integer primary key, color text);
+insert into mldist values (1,'red');
+with a as (select distinct color from mldist), t as (select * from a) update t set color='z';
+-- error: is not updateable in phase 1
+
+-- Set-op intermediate:
+create table mlsop (id integer primary key);
+insert into mlsop values (1),(2);
+with a as (select id from mlsop union select id from mlsop), t as (select * from a)
+    delete from t where id=1;
+-- error: is not updateable in phase 1
+
+-- Join intermediate:
+create table mljp (pid integer primary key, label text);
+create table mljc (cid integer primary key, pref integer, note text);
+insert into mljp values (10,'P10');
+insert into mljc values (1,10,'a');
+with a as (select c.cid as cid, c.note as note, p.label as label
+    from mljc c join mljp p on p.pid = c.pref), t as (select * from a)
+    update t set note='B' where cid=1;
 -- error: is not updateable in phase 1
 
 -- v1 boundary — a plain set-op-bodied CTE target reaches the existing set-op reject
@@ -3573,11 +3686,28 @@ update (values (1,'a')) as v(id, color) set color='z' where v.id=1;
 insert into (select id from isq_base) values (9);
 -- error: Expected table name
 
--- v1 boundary — an inline body that reads a CTE reaches a CTEReference node (not a base
--- table) on the lineage walk, so it rejects structurally rather than multi-level inlining
--- (the same boundary as a CTE body that reads another CTE).
+-- Inline-subquery target over a CTE — `update (select … from t) as v` where `t` is a CTE now
+-- writes through: the inline body's single-source chain is flattened to the terminal base
+-- table (the inline-subquery dual of the CTE-over-CTE multi-level inlining above).
 create table isq_ml (id integer primary key, color text);
-insert into isq_ml values (1,'red');
+insert into isq_ml values (1,'red'),(2,'green');
 with t as (select id, color from isq_ml)
     update (select id, color from t) as v set color='z' where v.id=1;
+select * from isq_ml order by id;
+→ [{"id":1,"color":"z"},{"id":2,"color":"green"}]
+
+-- DELETE inline-subquery over a CTE.
+create table isq_mld (id integer primary key, color text);
+insert into isq_mld values (1,'red'),(2,'green');
+with t as (select id, color from isq_mld)
+    delete from (select id, color from t) as v where v.id=2;
+select * from isq_mld order by id;
+→ [{"id":1,"color":"red"}]
+
+-- Reject parity — an inline body whose CTE chain has a non-updateable (aggregate) intermediate
+-- rejects with that intermediate's body-shape reason, same as the CTE-name target chain.
+create table isq_agg2 (id integer primary key, g integer, v integer);
+insert into isq_agg2 values (1,1,10),(2,1,20);
+with a as (select g, sum(v) as s from isq_agg2 group by g)
+    update (select g, s from a) as v set s=0 where v.g=1;
 -- error: is not updateable in phase 1

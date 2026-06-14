@@ -2,6 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { MutableViewLike } from '../mutation/single-source.js';
 import { raiseMutationDiagnostic } from '../mutation/mutation-diagnostic.js';
+import { flattenCteBody } from '../mutation/cte-flatten.js';
 import { isRecursiveCte } from './with.js';
 
 /**
@@ -29,6 +30,14 @@ import { isRecursiveCte } from './with.js';
  * The CTE body itself is re-planned by the substrate against its own base table(s);
  * the caller threads the statement's CTEs into the planning context so any
  * sibling-CTE read in the user `where` / `set` / source resolves.
+ *
+ * **Multi-level body.** When the body is a single-source projection-and-filter that reads
+ * ANOTHER (prior) sibling CTE, {@link flattenCteBody} collapses the linear chain down to a
+ * flat body over the terminal base table, so the substrate sees a genuine single base-table
+ * body (byte-equivalent to collapsing the chain into one CTE). The target's OWN name is passed
+ * as the shadow-out name so the load-bearing `with base as (… from base) …` case stays
+ * terminal; a non-updateable intermediate in the chain rejects with its own body-shape reason.
+ * When nothing inlines, `flattenCteBody` returns `cte.query`'s identity unchanged.
  */
 export function resolveCteTarget(
 	ctx: PlanningContext,
@@ -59,7 +68,10 @@ export function resolveCteTarget(
 		// and both are suppressed (ephemeral) or return undefined (no schema object).
 		// The current schema name keeps any leaked diagnostic readable.
 		schemaName: ctx.schemaManager.getCurrentSchemaName(),
-		selectAst: cte.query,
+		// Flatten a single-source multi-level chain (`with a …, t as (select * from a) …`) down
+		// to a flat body over the terminal base table; the target's own name shadows out so its
+		// own same-named FROM source stays the real table. A non-chain body is returned unchanged.
+		selectAst: flattenCteBody(ctx, cte.query, ctesBefore(withClause, cte), cte.name),
 		columns: cte.columns,
 		ephemeral: true,
 		// Marks this as a CTE-name target (vs an inline subquery), gating the
@@ -118,11 +130,22 @@ export function resolveSubqueryTarget(
 		// Cosmetic for an ephemeral target (see resolveCteTarget): only lens / dependency
 		// lookups read it, and both are suppressed (ephemeral) or return undefined.
 		schemaName: ctx.schemaManager.getCurrentSchemaName(),
-		selectAst: body,
+		// Flatten a single-source multi-level chain (`with t as (…) update (select … from t) …`)
+		// down to the terminal base table. An inline subquery sees ALL the statement's CTEs (it
+		// sits after the WITH clause) and has no own-name to shadow out. Non-chain bodies are
+		// returned unchanged.
+		selectAst: flattenCteBody(ctx, body, stmt.withClause?.ctes ?? [], undefined),
 		columns: source.columns,
 		ephemeral: true,
 		noun: 'derived table',
 	};
+}
+
+/** The CTEs of `withClause` defined strictly before `cte` — its in-scope prior siblings (the
+ *  visibility prefix a CTE-name target's body may inline against). */
+function ctesBefore(withClause: AST.WithClause, cte: AST.CommonTableExpr): AST.CommonTableExpr[] {
+	const idx = withClause.ctes.indexOf(cte);
+	return idx <= 0 ? [] : withClause.ctes.slice(0, idx);
 }
 
 /**
