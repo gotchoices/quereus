@@ -14,7 +14,7 @@ import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
 import { uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
-import { compareSqlValues, rowsValueIdentical } from '../../../util/comparison.js';
+import { compareSqlValues, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
 import { scanLayer as scanLayerImpl } from './scan-layer.js';
@@ -160,9 +160,15 @@ export class MemoryTableManager {
 		let added = false;
 
 		for (const uc of uniqueConstraints) {
+			// Reuse an existing same-column-set index ONLY when its per-column
+			// collations are equivalent to the declared column collations — otherwise
+			// it would enforce this non-derived UC under the index's collation rather
+			// than the declared one. A collation-mismatched index falls through to a
+			// distinct `_uc_*` covering index and coexists as its own constraint.
 			const matchingIndex = existingIndexes.find(idx =>
 				idx.columns.length === uc.columns.length &&
-				idx.columns.every((col, i) => col.index === uc.columns[i])
+				idx.columns.every((col, i) => col.index === uc.columns[i]) &&
+				this.indexCollationsMatchDeclared(idx, uc)
 			);
 
 			let indexName: string;
@@ -214,6 +220,33 @@ export class MemoryTableManager {
 	private implicitIndexNameFor(uc: UniqueConstraintSchema): string {
 		const colNames = uc.columns.map(i => this.tableSchema.columns[i]?.name ?? String(i));
 		return `_uc_${colNames.join('_')}`;
+	}
+
+	/**
+	 * True when a same-column-set index's per-column collations are
+	 * collation-equivalent to the constraint's DECLARED column collations.
+	 *
+	 * Gates REUSE of an existing same-column-set index as a non-derived UNIQUE's
+	 * realizing structure. A non-derived (table-level / column) UNIQUE enforces
+	 * under the declared column collation, so reusing a finer/coarser-collated
+	 * same-column-set index (e.g. a BINARY `create unique index` over a NOCASE
+	 * column) would silently enforce under the index's collation instead. When
+	 * this returns false the caller builds the distinct `_uc_*` covering index and
+	 * lets the user index coexist as an independent constraint (matches SQLite,
+	 * where both indexes enforce).
+	 *
+	 * Positions align because the column SET already matched
+	 * (`idx.columns[i]` ↔ `uc.columns[i]`). A plain index column with no explicit
+	 * COLLATE has `collation === undefined` and falls back to the declared
+	 * collation, so the common case stays reuse-safe.
+	 */
+	private indexCollationsMatchDeclared(idx: IndexSchema, uc: UniqueConstraintSchema): boolean {
+		const columns = this.tableSchema.columns;
+		return uc.columns.every((colIdx, i) => {
+			const declared = normalizeCollationName(columns[colIdx]?.collation ?? 'BINARY');
+			const indexColl = normalizeCollationName(idx.columns[i]?.collation ?? columns[colIdx]?.collation ?? 'BINARY');
+			return indexColl === declared;
+		});
 	}
 
 	/**
@@ -1018,22 +1051,35 @@ export class MemoryTableManager {
 		const schema = targetLayer.getSchema();
 		if (!schema.indexes) return undefined;
 
-		// An index-derived UNIQUE (`CREATE UNIQUE INDEX`) must enforce under ITS OWN
-		// index's collation. Resolve BY NAME via `uc.derivedFromIndex` — not the
+		// Resolve the constraint's OWN realizing structure BY NAME — never the
 		// column-set scan below, which returns the FIRST same-column-set index and
-		// would enforce a coarser-declared UC under a finer first-listed index's
-		// collation (and generate candidates from that index's wrongly-keyed BTree).
-		// This matches the by-name resolution store/isolation use via
-		// `uniqueEnforcementCollations`. Falls through to the column-set scan only
-		// when the name does not resolve (defensive) or the UC is non-derived.
+		// (when several differently-collated indexes cover one column-set) would
+		// enforce a UC under the wrong index's collation, generating candidates from
+		// that index's wrongly-keyed BTree:
+		//  - index-derived UNIQUE (`CREATE UNIQUE INDEX`) → its own index name via
+		//    `uc.derivedFromIndex` (matches store/isolation's by-name resolution
+		//    through `uniqueEnforcementCollations`).
+		//  - non-derived UNIQUE (table-level / column) → its own `_uc_*` covering
+		//    index via `implicitCoveringStructures`. The realization guard only
+		//    reuses a collation-equivalent same-column-set index, so a pre-existing
+		//    finer index (e.g. BINARY over a NOCASE column) no longer collapses onto
+		//    the constraint; resolving by name is robust to `schema.indexes` order
+		//    (the finer index may be listed earlier, having been created first).
+		// Both fall through to the column-set scan only when the name does not
+		// resolve (defensive).
 		if (uc.derivedFromIndex) {
 			const index = targetLayer.getSecondaryIndex?.(uc.derivedFromIndex);
 			if (index) return { kind: 'memory-index', index };
+		} else {
+			const own = this.getImplicitCoveringStructure(uc);
+			if (own) {
+				const index = targetLayer.getSecondaryIndex?.(own.indexName);
+				if (index) return { kind: 'memory-index', index };
+			}
 		}
 
-		// Non-derived UNIQUE (table-level / column): match the auto-built `_uc_*`
-		// covering index by column-set — it carries the declared collation, so any
-		// same-column-set match is collation-equivalent and correct.
+		// Defensive fallback: match the auto-built `_uc_*` covering index by
+		// column-set when the by-name resolution above did not land.
 		for (const idx of schema.indexes) {
 			if (idx.columns.length === uc.columns.length &&
 				idx.columns.every((col, i) => col.index === uc.columns[i])) {
@@ -2381,11 +2427,18 @@ export class MemoryTableManager {
 
 		// Reuse: an existing UNIQUE index over the exact columns already guarantees
 		// uniqueness, so skip the rebuild. A non-unique index gives no such guarantee
-		// — fall through to build-and-validate.
+		// — fall through to build-and-validate. The reused index must ALSO be
+		// collation-equivalent to the declared column collations: a finer/coarser
+		// same-column-set index (e.g. a BINARY `create unique index` over a NOCASE
+		// column) enforces under ITS collation, not the declared one, so reusing it
+		// would under-enforce this non-derived UNIQUE. A collation mismatch falls
+		// through to build the distinct `_uc_*` covering index; the user index keeps
+		// enforcing its own (stricter) uniqueness independently (matches SQLite).
 		const matchingUniqueIndex = existingIndexes.find(idx =>
 			idx.unique &&
 			idx.columns.length === uc.columns.length &&
-			idx.columns.every((col, i) => col.index === uc.columns[i]),
+			idx.columns.every((col, i) => col.index === uc.columns[i]) &&
+			this.indexCollationsMatchDeclared(idx, uc),
 		);
 
 		if (matchingUniqueIndex) {

@@ -50,11 +50,13 @@ function getBackingManager(schema: TableSchema): MemoryTableManager {
 
 /**
  * The live `MemoryIndex` enforcing `uc`, resolved EXACTLY as
- * `MemoryTableManager.findIndexForConstraint` does for the non-MV path: an
- * index-derived UC resolves BY NAME via `uc.derivedFromIndex`; a non-derived UC
- * (or a name that no longer resolves) falls back to the first secondary index
- * whose column SET matches `uc.columns` positionally. Fetched from the committed
- * layer — the source `checkUniqueViaIndex` reads.
+ * `MemoryTableManager.findIndexForConstraint` does for the non-MV path. The
+ * constraint's OWN realizing structure is resolved BY NAME:
+ *   - index-derived UC → `uc.derivedFromIndex`;
+ *   - non-derived UC → its `_uc_*` covering index via `getImplicitCoveringStructure`.
+ * Either falls back to the first secondary index whose column SET matches
+ * `uc.columns` positionally only when the name does not resolve (defensive).
+ * Fetched from the committed layer — the source `checkUniqueViaIndex` reads.
  */
 function resolveLiveIndex(
 	manager: MemoryTableManager,
@@ -64,6 +66,12 @@ function resolveLiveIndex(
 	if (uc.derivedFromIndex) {
 		const byName = manager.currentCommittedLayer.getSecondaryIndex?.(uc.derivedFromIndex);
 		if (byName) return byName;
+	} else {
+		const own = manager.getImplicitCoveringStructure(uc);
+		if (own) {
+			const byName = manager.currentCommittedLayer.getSecondaryIndex?.(own.indexName);
+			if (byName) return byName;
+		}
 	}
 	const idx = schema.indexes?.find(ix =>
 		ix.columns.length === uc.columns.length &&
@@ -98,12 +106,13 @@ interface Shape {
 	 *  (single-UC shapes — sanity floor that the shapes actually exercise the
 	 *  distinctions they claim to). */
 	expected?: string[];
-	/** For multi-UC shapes — two UNIQUE indexes over the SAME column-set, where
+	/** For multi-UC shapes — several UNIQUE structures over the SAME column-set, where
 	 *  `uniqueConstraints[0]` no longer uniquely identifies the constraint under
-	 *  test. Each entry picks a UC BY its `derivedFromIndex` name and asserts that
-	 *  UC's OWN per-column collation, proving each resolves to its own index (and
-	 *  not the first-listed one) regardless of creation order. */
-	byIndex?: { index: string; expected: string[] }[];
+	 *  test. Each entry picks a UC and asserts that UC's OWN per-column collation,
+	 *  proving each resolves to its own index (not the first-listed one) regardless
+	 *  of creation order. `index` is the derived UC's `derivedFromIndex` name, or
+	 *  `null` to select the single NON-derived UC (table-level / column UNIQUE). */
+	byIndex?: { index: string | null; expected: string[] }[];
 }
 
 const SHAPES: Shape[] = [
@@ -209,6 +218,42 @@ const SHAPES: Shape[] = [
 			{ index: 'ix_nocase', expected: ['NOCASE'] },
 		],
 	},
+	{
+		// NON-derived UNIQUE coexisting with a FINER same-column-set index, INDEX
+		// created FIRST (the order-sensitive under-enforcement repro). The realization
+		// guard refuses to reuse the BINARY `ix_binary` for the NOCASE-declared
+		// `unique (b)` — it builds a distinct NOCASE `_uc_*`, and findIndexForConstraint
+		// resolves the non-derived UC to THAT structure by name (not the earlier-listed
+		// finer index). The derived UC from `ix_binary` still enforces BINARY. On main
+		// this shape under-enforced: the non-derived UC reused/resolved to ix_binary.
+		name: 'non-derived + finer index, same column-set (index first)',
+		ddl: [
+			'create table t (id integer primary key, b text collate nocase)',
+			'create unique index ix_binary on t (b collate binary)',
+			'alter table t add constraint uq unique (b)',
+		],
+		table: 't',
+		byIndex: [
+			{ index: 'ix_binary', expected: ['BINARY'] },
+			{ index: null, expected: ['NOCASE'] },
+		],
+	},
+	{
+		// Same coexistence, CONSTRAINT created FIRST (table-level UNIQUE), THEN the finer
+		// index — order-independence. The non-derived UC's `_uc_*` is built at table
+		// construction; the later finer index is independent. Both UCs still resolve to
+		// their own structures.
+		name: 'non-derived + finer index, same column-set (constraint first)',
+		ddl: [
+			'create table t (id integer primary key, b text collate nocase, constraint uq unique (b))',
+			'create unique index ix_binary on t (b collate binary)',
+		],
+		table: 't',
+		byIndex: [
+			{ index: 'ix_binary', expected: ['BINARY'] },
+			{ index: null, expected: ['NOCASE'] },
+		],
+	},
 ];
 
 describe('uniqueEnforcementCollations ⇔ memory checkUniqueViaIndex (#4 conformance lock)', () => {
@@ -227,9 +272,11 @@ describe('uniqueEnforcementCollations ⇔ memory checkUniqueViaIndex (#4 conform
 				// assertion is independent of the `uniqueConstraints` order.
 				const checks = shape.byIndex
 					? shape.byIndex.map(b => ({
-						uc: schema.uniqueConstraints!.find(u => u.derivedFromIndex === b.index)!,
+						uc: b.index === null
+							? schema.uniqueConstraints!.find(u => u.derivedFromIndex === undefined)!
+							: schema.uniqueConstraints!.find(u => u.derivedFromIndex === b.index)!,
 						expected: b.expected,
-						label: b.index,
+						label: b.index ?? 'non-derived',
 					}))
 					: [{ uc: schema.uniqueConstraints![0], expected: shape.expected!, label: 'uc[0]' }];
 

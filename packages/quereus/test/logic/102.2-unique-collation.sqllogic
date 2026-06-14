@@ -16,7 +16,12 @@
 -- collation is coarser-or-equal to the declared column collation per column. §11
 -- covers two UNIQUE indexes over the SAME column-set with differing collations: each
 -- derived constraint enforces under ITS OWN index's collation in BOTH creation orders
--- (`memory-multi-index-unique-collation-resolution`).
+-- (`memory-multi-index-unique-collation-resolution`). §12 covers a NON-derived
+-- (table-level / column) UNIQUE coexisting with a FINER same-column-set
+-- `create unique index`: the non-derived UNIQUE enforces under its DECLARED collation
+-- in BOTH creation orders, the user's finer index keeps enforcing its own uniqueness,
+-- and dropping the non-derived constraint leaves the user index intact
+-- (`memory-nonderived-unique-reused-finer-index-under-enforcement`).
 
 -- ===================================
 -- 1. Table-level `unique (x)` over a NOCASE column — auto-index enforcement.
@@ -342,3 +347,69 @@ select count(*) as n from mnf;
 insert into mnf values (3, 'Carol');
 select id, b from mnf order by id;
 → [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
+
+-- ===================================
+-- 12. A NON-derived (table-level / column) UNIQUE coexisting with a FINER
+--     same-column-set `create unique index`. The non-derived UNIQUE enforces under
+--     its DECLARED column collation (NOCASE) regardless of DDL order — the memory
+--     module no longer reuses or resolves onto the finer (BINARY) user index, which
+--     would silently ADMIT a NOCASE duplicate. The user's BINARY index keeps
+--     enforcing its OWN (byte-exact) uniqueness, and dropping the non-derived
+--     constraint leaves that index intact. On main the index-first order under-enforced
+--     (count went to 2); store already rejected both orders.
+--     (memory-nonderived-unique-reused-finer-index-under-enforcement.)
+-- ===================================
+
+-- 12a. INDEX created FIRST, then `alter table … add constraint uq unique (b)` over a
+--      NOCASE column. The NOCASE UNIQUE rejects a case-variant duplicate that the
+--      finer BINARY index alone would have admitted — the bug this fix closes.
+create table mif (id integer primary key, b text collate NOCASE);
+create unique index mif_binary on mif (b collate BINARY);
+alter table mif add constraint uq unique (b);
+insert into mif values (1, 'Bob');
+
+-- 'bob' is BINARY-distinct from 'Bob' but NOCASE-equal → the non-derived NOCASE UNIQUE rejects it
+insert into mif values (2, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from mif;
+→ [{"n":1}]
+
+-- a genuinely distinct value (neither NOCASE- nor BINARY-equal) still inserts (guard against over-matching)
+insert into mif values (3, 'Carol');
+select id, b from mif order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
+
+-- 12b. CONSTRAINT created FIRST (table-level `unique (b)`), THEN the finer index —
+--      order-independence. Same NOCASE enforcement.
+create table mcf (id integer primary key, b text collate NOCASE, unique (b));
+create unique index mcf_binary on mcf (b collate BINARY);
+insert into mcf values (1, 'Bob');
+
+insert into mcf values (2, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from mcf;
+→ [{"n":1}]
+
+insert into mcf values (3, 'Carol');
+select id, b from mcf order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
+
+-- 12c. Lifecycle: dropping the non-derived NOCASE UNIQUE leaves the user's BINARY
+--      index (`mif_binary`) enforcing its own uniqueness. A NOCASE-variant is now
+--      ADMITTED (only BINARY enforces, keeping case-variants apart) while a genuine
+--      byte-exact duplicate is still rejected — proof the user index survived the drop.
+alter table mif drop constraint uq;
+
+-- NOCASE folding gone: 'BOB' is BINARY-distinct from existing 'Bob'/'Carol' → admitted
+insert into mif values (4, 'BOB');
+select id, b from mif order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"},{"id":4,"b":"BOB"}]
+
+-- but a byte-exact duplicate of 'Bob' is still rejected by the surviving BINARY index
+insert into mif values (5, 'Bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from mif;
+→ [{"n":3}]
