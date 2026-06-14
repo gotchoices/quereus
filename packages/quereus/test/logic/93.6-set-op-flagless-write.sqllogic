@@ -430,6 +430,30 @@ select id, x from oj1 order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
 
 -- ===================================================================
+-- Non-equi (theta) INNER join leg deferral (`set-op-write-multisource-leg-compose` ships INNER
+-- EQUI-join legs): a join leg whose ON is a non-equi predicate (`ne1.x > ne2.lo and ne1.x <
+-- ne2.hi`) is deferred — the body is conservatively non-writable, so the static surfaces report
+-- all-`NO` and the dynamic write rejects cleanly (never the internal `k.k0_0` capture error).
+-- ===================================================================
+create table ne1 (id integer primary key, x integer);
+create table ne2 (id integer primary key, lo integer, hi integer);
+insert into ne1 values (1,10),(2,20);
+insert into ne2 values (1,5,15),(2,5,15);
+create view NEV as
+  select ne1.id as id, ne1.x as x from ne1 join ne2 on ne1.x > ne2.lo and ne1.x < ne2.hi
+  union all
+  select id, x from ne1 where id = 99;
+select is_insertable_into, is_updatable, is_deletable from view_info('NEV');
+→ [{"is_insertable_into":"NO","is_updatable":"NO","is_deletable":"NO"}]
+update NEV set x = x + 1 where id = 1;
+-- error: cannot write through view
+delete from NEV where id = 1;
+-- error: cannot write through view
+-- base tables untouched.
+select id, x from ne1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================================================
 -- Range-σ write-branch oracle (`set-op-flagless-range-sigma-oracle`): a RANGE σ
 -- (`where x < 5`) on a *projected* column is now fed to the oracle as a conjunct, so a
 -- supplied value that provably violates it makes the leg `unsat` ⇒ skipped (no phantom base

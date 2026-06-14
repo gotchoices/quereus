@@ -476,9 +476,14 @@ per PK column per side; self-joins route by alias). **INSERT** into a join branc
 plan-level shared-surrogate envelope the AST `BaseOp[]` fan does not produce, so it is deferred to
 `set-op-write-multisource-leg-insert`: the dynamic insert rejects cleanly and the static
 `is_insertable_into` surface reports `NO` for any body with a join leg (while `is_updatable` /
-`is_deletable` report `YES`), matching exactly. An **OUTER (left/right/full) / cross / non-equi**
-join leg is likewise deferred — rejected cleanly at branch classification (a follow-up). A
-branch that bottoms out in a base table emits one base op; a branch that is itself a
+`is_deletable` report `YES`), matching exactly. An **OUTER (left/right/full) / cross** join leg is
+likewise deferred — rejected cleanly at branch classification (`isInnerJoinBody` is false). A
+**non-equi (theta) inner** join leg, by contrast, is admitted by `isInnerJoinBody` (which keys only
+on `joinType`) and composes here **exactly as the standalone join-view path admits it** — so a
+membership body's non-equi inner-join branch is writable, not deferred. (The flag-less route, by
+contrast, is stricter: its recognizer conservatively defers a non-equi leg to all-`NO`. Aligning
+non-equi handling across the two set-op paths is a follow-up — `set-op-write-multisource-leg-nonequi`.)
+A branch that bottoms out in a base table emits one base op; a branch that is itself a
 `SetOperationNode` (a **subtree operand**) **recurses here** for the
 unambiguous fan-out — a data-column UPDATE, a DELETE, and a `set <subtreeFlag> = false` drop
 fan out to every member leaf, sharing the ONE up-front capture (the recursion rebuilds the same

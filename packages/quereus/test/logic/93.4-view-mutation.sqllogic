@@ -4057,6 +4057,20 @@ select id, x from tba order by id;
 select id, x from tbb order by id;
 → [{"id":1,"x":111},{"id":2,"x":22}]
 
+-- DELETE both branches at once (where id=2 captures one row per branch): each branch builds its
+-- own inner capture (`__vmupd_keys$1` / `__vmupd_keys$2`) and the lenient inner-join delete fans
+-- to BOTH sides, so the joined row id=2 leaves all four base tables. Proves both inner captures
+-- materialize and tear down for a DELETE (the ordered-capture substrate, not just UPDATE).
+delete from TWO where id = 2;
+select id, x from tba order by id;
+→ [{"id":1,"x":110}]
+select id from tbc order by id;
+→ [{"id":1}]
+select id, x from tbb order by id;
+→ [{"id":1,"x":111}]
+select id from tbd order by id;
+→ [{"id":1}]
+
 -- ===================================
 -- RETURNING <q>.* qualifier validation through updatable views.
 -- A wrong qualifier (bogus.*) must error with the same diagnostic as the base-table

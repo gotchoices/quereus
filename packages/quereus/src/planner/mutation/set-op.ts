@@ -15,7 +15,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { propagate, type BaseOp, type MutableViewLike, type MutationRequest } from './propagate.js';
-import { MS_UPDATE_KEYS_CTE, isJoinBody, isInnerJoinBody, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, withKeyCapture, type MultiSourceKeyCapture, type JoinViewAnalysis } from './multi-source.js';
+import { MS_UPDATE_KEYS_CTE, isJoinBody, isInnerJoinBody, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, capturedSideIndices, withKeyCapture, type MultiSourceKeyCapture, type JoinViewAnalysis } from './multi-source.js';
 import { cloneExpr, transformExpr } from './scope-transform.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
@@ -198,10 +198,13 @@ function isOperandWritable(operand: AST.QueryExpr, hasGatingFlag: boolean): bool
 	// A leaf operand's data columns must be plain (optionally renamed) base columns; on top of
 	// that it is writable when it is single-source OR a **multi-source INNER join leg** (the
 	// join-leg compose — `set-op-write-multisource-leg-compose`, which builds an inner per-branch
-	// capture chained off the outer set-op capture). An OUTER (left/right/full) / cross / non-equi
-	// join leg is deferred, so it reports non-writable here — matching the dynamic `buildBranch`
-	// reject exactly. This recurses to leaves at every depth, so a nested join leaf is classified
-	// too. Insertability through a join leg is deferred separately (gated in `schema.ts`).
+	// capture chained off the outer set-op capture). An OUTER (left/right/full) / cross join leg is
+	// deferred, so it reports non-writable here — matching the dynamic `buildBranch` reject exactly.
+	// (`isInnerJoinBody` keys only on `joinType`, so a NON-EQUI inner join is admitted and composes,
+	// exactly as the standalone join-view path admits it — the flag-less route is stricter; see
+	// docs/view-updateability.md § Set Operations.) This recurses to leaves at every depth, so a
+	// nested join leaf is classified too. Insertability through a join leg is deferred separately
+	// (gated in `schema.ts`).
 	if (tryBranchColumnNames(effective) === null) return false;
 	return !isJoinBody(effective) || isInnerJoinBody(effective);
 }
@@ -616,17 +619,19 @@ function buildBranch(
 	// (`set-op-write-multisource-leg-compose`): its data/delete fan builds an inner per-branch
 	// base-PK capture chained off the outer set-op capture (a fresh `__vmupd_keys$N` name), so
 	// the join branch decomposes through the multi-source machinery without colliding with the
-	// outer capture. An OUTER (left/right/full) / cross / non-equi join leg is deferred — reject
-	// it cleanly here (never routing it to `propagate`, which would mishandle the un-composed
-	// capture). A nested (subtree) operand is NOT classified here: its join leaves are reached as
-	// non-nested branches via `analyzeSetOpBranches` → `buildBranch` and classified at that
-	// depth, so this covers every leaf at every nesting level.
+	// outer capture. An OUTER (left/right/full) / cross join leg is deferred — reject it cleanly
+	// here (never routing it to `propagate`, which would mishandle the un-composed capture).
+	// (`isInnerJoinBody` keys only on `joinType`, so a NON-EQUI inner join is admitted and
+	// composes here, exactly as the standalone join-view path admits it — not rejected.) A nested
+	// (subtree) operand is NOT classified here: its join leaves are reached as non-nested branches
+	// via `analyzeSetOpBranches` → `buildBranch` and classified at that depth, so this covers every
+	// leaf at every nesting level.
 	const isMultiSource = !isNested && isInnerJoinBody(effectiveSelect);
 	if (!isNested && !isMultiSource && isJoinBody(effectiveSelect)) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-set-op',
 			table: view.name,
-			message: `cannot write through view '${view.name}': the ${side} branch is a multi-source join leg that is not a plain INNER equi-join (an OUTER/CROSS/non-equi join leg) — its set-op write composition is deferred (set-op-write-multisource-leg-compose ships inner-join legs)`,
+			message: `cannot write through view '${view.name}': the ${side} branch is an OUTER (left/right/full) or cross join leg, which is not a plain INNER join — its set-op write composition is deferred (set-op-write-multisource-leg-compose ships inner-join legs)`,
 		});
 	}
 	const dataColNames = branchColumnNames(view, side, effectiveSelect);
@@ -753,22 +758,6 @@ function makeJoinLegFan(outerCapture: MultiSourceKeyCapture): JoinLegFan {
 	const captures: MultiSourceKeyCapture[] = [];
 	let counter = 0;
 	return { outerCapture, captures, mintName: () => `${MS_UPDATE_KEYS_CTE}$${++counter}` };
-}
-
-/**
- * The distinct join-side indices the emitted base ops target (each base op carries its planned
- * side's `TableReferenceNode`), ascending — the sides whose PKs the inner capture must project so
- * each op's `exists (… from __vmupd_keys$N k where k.k<side>_<j> = <side>.<pk>)` resolves. A
- * local copy of the multi-source builder's same helper (importing it from
- * `view-mutation-builder.ts` would cycle — that module imports this one).
- */
-function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnalysis): number[] {
-	const set = new Set<number>();
-	for (const op of baseOps) {
-		const i = analysis.sides.findIndex(s => s.table.id === op.table.id);
-		if (i >= 0) set.add(i);
-	}
-	return [...set].sort((a, b) => a - b);
 }
 
 /**

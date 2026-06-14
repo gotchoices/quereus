@@ -5,7 +5,7 @@ import type { RelationType, ScalarType } from '../../common/datatype.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
 import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
-import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, withKeyCapture, isJoinBody, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
+import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, withKeyCapture, capturedSideIndices, isJoinBody, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as decomposeDecompositionUpdate, buildDecompositionKeyCapture, type DecompInsertOp, type DecompShape, type CapturedDecompValue } from '../mutation/decomposition.js';
 import { isSetOpMembershipBody, isSetOpFlaglessWritableBody, buildSetOpWrite, buildFlaglessSetOpWrite, type SetOpWritePlan } from '../mutation/set-op.js';
 import { buildCteSelfCapture } from '../mutation/single-source.js';
@@ -332,20 +332,6 @@ function buildIdentityCapture(
 		default:
 			return undefined;
 	}
-}
-
-/**
- * The distinct join-side indices the emitted base ops target (each base op carries the
- * planned side's `TableReferenceNode`), sorted ascending — the sides whose PKs the
- * capture must project so each op's `select k<side> from __vmupd_keys` resolves.
- */
-function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnalysis): number[] {
-	const set = new Set<number>();
-	for (const op of baseOps) {
-		const i = analysis.sides.findIndex(s => s.table.id === op.table.id);
-		if (i >= 0) set.add(i);
-	}
-	return [...set].sort((a, b) => a - b);
 }
 
 /**

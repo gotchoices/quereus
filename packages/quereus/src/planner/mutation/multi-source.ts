@@ -2038,6 +2038,23 @@ export function withKeyCapture(ctx: PlanningContext, capture: MultiSourceKeyCapt
 }
 
 /**
+ * The distinct join-side indices the emitted base ops target (each base op carries the
+ * planned side's `TableReferenceNode`), sorted ascending — the sides whose PKs the capture
+ * must project so each op's `select k<side> from <relationName>` resolves. Shared by the
+ * standalone multi-source UPDATE/DELETE builder (`view-mutation-builder.ts`) and the set-op
+ * join-leg compose (`set-op.ts`), which each pass it straight to
+ * {@link buildMultiSourceKeyCapture}.
+ */
+export function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnalysis): number[] {
+	const set = new Set<number>();
+	for (const op of baseOps) {
+		const i = analysis.sides.findIndex(s => s.table.id === op.table.id);
+		if (i >= 0) set.add(i);
+	}
+	return [...set].sort((a, b) => a - b);
+}
+
+/**
  * Build the up-front identity capture: each affected view row's base-PK identities,
  * by the same identifying predicate the base ops route on (user WHERE → base ∧ body
  * WHERE). Built as **plan nodes directly over the ALREADY-planned join body**
