@@ -906,7 +906,9 @@ column follows the unqualified-default image rule above: the NEW image for
 INSERT/UPDATE, the OLD image for DELETE. Output column names are the bare column
 names regardless of any qualifier. A `table.*` qualifier must name the target
 table; any other name is an error. Through a view, `*` expands to the *view's*
-output columns (in view order), not the base table's.
+output columns (in view order), not the base table's, and a `view.*` qualifier
+must name the view (or, for an inline-subquery / CTE target, its correlation
+name) — any other qualifier is the same error.
 
 #### 2.5.3 Advanced RETURNING Examples
 

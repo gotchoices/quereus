@@ -3101,6 +3101,14 @@ insert into cte_ret values (1,'red');
 with t as (select id, color from cte_ret) update t set color='ret' where id=1 returning id, color;
 → [{"id":1,"color":"ret"}]
 
+-- RETURNING <q>.* qualifier validation against a CTE-name target: the only valid
+-- qualifier is the CTE name (`resolveCteTarget` sets `view.name = cte.name`).
+with t as (select id, color from cte_ret) update t set color='x2' where id=1 returning bogus.*;
+-- error: not found in FROM clause for qualified RETURNING *
+
+with t as (select id, color from cte_ret) update t set color='cret' where id=1 returning t.*;
+→ [{"id":1,"color":"cret"}]
+
 -- Shadow: a CTE named the same as a real table SHADOWS it as the write TARGET, but the
 -- CTE body's own `from sbase` reads the REAL table (a non-recursive CTE cannot reference
 -- itself), so the lowered base op writes the real `sbase`. This is the load-bearing
@@ -3734,6 +3742,15 @@ create table isq_ret (id integer primary key, color text);
 insert into isq_ret values (1,'red');
 update (select id, color from isq_ret) as v set color='ret' where v.id=1 returning id, color;
 → [{"id":1,"color":"ret"}]
+
+-- RETURNING <q>.* qualifier validation against an inline-subquery target: the only
+-- valid qualifier is the mandatory alias (`resolveSubqueryTarget` sets `view.name =
+-- source.alias`), so `v.*` expands and any other qualifier errors.
+update (select id, color from isq_ret) as v set color='x2' where v.id=1 returning bogus.*;
+-- error: not found in FROM clause for qualified RETURNING *
+
+update (select id, color from isq_ret) as v set color='vret' where v.id=1 returning v.*;
+→ [{"id":1,"color":"vret"}]
 
 -- Composite-PK body: the multi-column key identifies the base row through the ephemeral
 -- substrate exactly as for a composite-PK base table / view.
