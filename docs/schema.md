@@ -407,7 +407,13 @@ back to the declared column collation when the index column carries none) —
 store's own `buildIndexEntries` build-time dedup, and SQLite (a unique index enforces
 under the index's collation). So a *finer* index (`COLLATE BINARY` over a `NOCASE` column)
 admits case-variants the column would unify, and a *coarser* index (`COLLATE NOCASE` over a
-`BINARY` column) unifies case-variants the column would keep distinct. `ALTER COLUMN … SET
+`BINARY` column) unifies case-variants the column would keep distinct. When **two** UNIQUE
+indexes cover the same column-set with differing collations, each derived constraint enforces
+under **its own** index's collation regardless of index creation order: memory's
+`findIndexForConstraint` resolves the enforcing index BY NAME (`uc.derivedFromIndex`), matching
+the store's by-name `uniqueEnforcementCollations` — a by-column-set resolution would collapse
+both constraints onto the first-listed index and under-enforce the coarser one
+(`memory-multi-index-unique-collation-resolution`). `ALTER COLUMN … SET
 COLLATE` on a column under such an index propagates the new collation into the index
 column (metadata-only — the store's index *key* bytes use the table-level collation K, so
 no entry re-encode is required), mirroring the memory module; a non-derived (table-level /
