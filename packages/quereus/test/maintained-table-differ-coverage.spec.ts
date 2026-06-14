@@ -288,5 +288,30 @@ describe('Maintained-table differ — review coverage', () => {
 			expect(await rows('select a, b from mv')).to.deep.equal([{ a: 1, b: 10 }]);
 			expect(diffMv().mv, 'converged').to.be.undefined;
 		});
+
+		it('a FRESH attach over a plain table carries the declared list (records explicit)', async () => {
+			// The carry rides the fresh-attach branch too (declared maintained, live
+			// plain) — not only the re-attach. `mv` pre-exists as a plain table; declaring
+			// it as an explicit MV attaches and must record derivation.columns from the
+			// carried list, not infer it from the body's natural names.
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('create table mv (a integer primary key, b integer not null)');
+			await db.exec('insert into t values (1, 10)');
+			await db.exec(`declare schema main {
+				table t { id integer primary key, x integer not null }
+				materialized view mv (a, b) as select id, x from t
+			}`);
+			const before = diffMv();
+			expect(before.mv?.setMaintained?.columns, 'fresh-attach carries the declared list (a, b)').to.deep.equal(['a', 'b']);
+			expect(before.mv?.dropMaintained, 'attach ⇒ no detach leg').to.be.undefined;
+			await db.exec('apply schema main');
+			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
+			expect(mv.derivation.columns, 'recorded explicit (a, b) from the carry').to.deep.equal(['a', 'b']);
+			expect(await rows('select a, b from mv')).to.deep.equal([{ a: 1, b: 10 }]);
+			expect(diffMv().mv, 'converged').to.be.undefined;
+		});
 	});
 });

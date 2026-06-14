@@ -784,10 +784,11 @@ describe('Maintained-table attach/detach verbs', () => {
 			await db.exec(`alter table mv7 set maintained (a, c) as select id, x from src`);
 			expect(maintained('mv7').derivation.columns).to.deep.equal(['a', 'c']);
 
-			// Directly exercise the ast-stringify `(cols)` branch (alterTableToString):
-			// the differ does not yet emit the list, so no apply-path test covers it.
-			// Render the explicit verb and confirm it round-trips through reparse;
-			// the bare form stays byte-identical (no parenthesized list).
+			// Directly exercise the ast-stringify `(cols)` branch (alterTableToString)
+			// in isolation; the differ-driven apply path is covered separately in
+			// maintained-table-differ-coverage.spec.ts. Render the explicit verb and
+			// confirm it round-trips through reparse; the bare form stays byte-identical
+			// (no parenthesized list).
 			const explicit = astToString(parse('alter table mv7 set maintained (a, c) as select id, x from src'));
 			expect(explicit, 'renders the (cols) rename list').to.match(/set maintained \(\s*"?a"?\s*,\s*"?c"?\s*\) as/i);
 			expect(astToString(parse(explicit)), 're-stringify is stable').to.equal(explicit);
