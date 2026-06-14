@@ -112,6 +112,29 @@ describe('MV rename propagation: derived fields and events', () => {
 		}
 	});
 
+	it('COLUMN rename preserves the MV table tags while shifting the backing column', async () => {
+		// The source-rename relabel rebuilds the backing record from the module's
+		// post-ALTER schema, which carries no catalog tags — the rebuild must graft
+		// them back (renameShiftedBackingColumns / graftReshapedRecord).
+		const db = new Database();
+		try {
+			await db.exec('create table s (id integer primary key, v integer not null)');
+			await db.exec('insert into s values (1, 10)');
+			await db.exec(`create materialized view mv as select id, v from s with tags ("team.owner" = 'sre')`);
+			expect(db.schemaManager.getTable('main', 'mv')!.tags?.['team.owner'], 'tag set at create')
+				.to.equal('sre');
+
+			await db.exec('alter table s rename column v to w');
+
+			const stored = db.schemaManager.getTable('main', 'mv')!;
+			expect(stored.columns.map(c => c.name), 'backing column followed the rename')
+				.to.deep.equal(['id', 'w']);
+			expect(stored.tags?.['team.owner'], 'tags survive the source-rename relabel').to.equal('sre');
+		} finally {
+			await db.close();
+		}
+	});
+
 	it('TABLE rename reaches an MV reading the renamed table THROUGH a plain view', async () => {
 		const db = new Database();
 		try {
