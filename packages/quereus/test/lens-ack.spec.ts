@@ -360,11 +360,12 @@ describe('lens ack: escalation policy', () => {
 });
 
 describe('lens ack: advisory vocabulary (drift guard)', () => {
-	it('ACKNOWLEDGEABLE_ADVISORY_CODES is exactly the five governable warning codes', () => {
+	it('ACKNOWLEDGEABLE_ADVISORY_CODES is exactly the six governable warning codes', () => {
 		expect([...ACKNOWLEDGEABLE_ADVISORY_CODES].sort()).to.deep.equal([
 			'lens.getput-lossy',
 			'lens.no-answering-structure',
 			'lens.no-backing-index',
+			'lens.over-restrictive-basis-key',
 			'lens.partial-override',
 			'lens.pk-not-reconstructible',
 		]);
@@ -396,6 +397,39 @@ describe('lens ack: fingerprint domain sensitivity (lens.getput-lossy)', () => {
 		// Absent domain ⇒ the key is omitted entirely, so pre-existing advisory
 		// fingerprints (every code without a domain) are unchanged by the new field.
 		const without = computeAdvisoryFingerprint('lens.getput-lossy', site, { constraintColumns: ['grp'] });
+		expect(without).to.not.equal(a);
+	});
+});
+
+describe('lens ack: fingerprint basis-key sensitivity (lens.over-restrictive-basis-key)', () => {
+	const site = { table: 't', constraint: 'unique' };
+
+	it('a governing basis-key change moves the fingerprint (the ack re-surfaces)', () => {
+		// Widening the basis key (a) → (a, b) changes the advisory's truth, so its
+		// fingerprint must move and re-surface a prior acknowledgment.
+		const a = computeAdvisoryFingerprint('lens.over-restrictive-basis-key', site, {
+			constraintColumns: ['a', 'b'], basisRelation: 'y.t', basisKeyColumns: ['a'],
+		});
+		const b = computeAdvisoryFingerprint('lens.over-restrictive-basis-key', site, {
+			constraintColumns: ['a', 'b'], basisRelation: 'y.t', basisKeyColumns: ['a', 'b'],
+		});
+		expect(a).to.not.equal(b);
+	});
+
+	it('the basis key is order/case-insensitive (canonicalized) and only serialized when present', () => {
+		const a = computeAdvisoryFingerprint('lens.over-restrictive-basis-key', site, {
+			constraintColumns: ['a', 'b'], basisRelation: 'y.t', basisKeyColumns: ['B', 'A'],
+		});
+		const b = computeAdvisoryFingerprint('lens.over-restrictive-basis-key', site, {
+			constraintColumns: ['a', 'b'], basisRelation: 'y.t', basisKeyColumns: ['a', 'b'],
+		});
+		expect(a, 'order + case canonicalized').to.equal(b);
+
+		// Absent basisKeyColumns ⇒ the key is omitted entirely, so pre-existing advisory
+		// fingerprints (every code without a basis key) are unchanged by the new field.
+		const without = computeAdvisoryFingerprint('lens.over-restrictive-basis-key', site, {
+			constraintColumns: ['a', 'b'], basisRelation: 'y.t',
+		});
 		expect(without).to.not.equal(a);
 	});
 });

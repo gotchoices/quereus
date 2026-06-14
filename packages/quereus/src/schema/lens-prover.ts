@@ -97,6 +97,7 @@ const ADVISORY_CODE_LIST = [
 	'lens.no-answering-structure',
 	'lens.partial-override',
 	'lens.getput-lossy',
+	'lens.over-restrictive-basis-key',
 ] as const;
 
 /** An advisory (warning-severity) code — see {@link ADVISORY_CODE_LIST}. */
@@ -141,6 +142,15 @@ export interface FingerprintInputs {
 	 * domain keep their existing hashes.
 	 */
 	readonly domainValues?: readonly string[];
+	/**
+	 * The governing basis key's basis-column names behind an over-restriction
+	 * advisory (`lens.over-restrictive-basis-key`), rendered + sorted — if the basis
+	 * key changes (tightened to match the logical key, or loosened) the advisory's
+	 * truth changes, so a prior acknowledgment should re-surface. Serialized into the
+	 * fingerprint only when present (mirroring {@link domainValues}), so advisories
+	 * without a basis key keep their existing hashes.
+	 */
+	readonly basisKeyColumns?: readonly string[];
 }
 
 /** A sited, coded diagnostic. Errors block the deploy; warnings flow to the report. */
@@ -1469,10 +1479,19 @@ function conflictActionName(action: ConflictResolution | undefined): string {
  * not transfer). A genuinely basis-keyless body proof (a GROUP BY aggregate over plain
  * columns with no basis UC over the key, an FD-closure key, etc.) subsumes no declared
  * basis key, so its `on conflict` is vacuous and deploys clean. Mirrors the row-time and
- * commit-time arms. (The strictly-more-restrictive-basis superkey *realizability*
- * concern — basis `unique(a)`, logical `unique(a,b)` advertising write-capacity the basis
- * cannot hold — is a separate, over-enforcement matter tracked under
- * `lens-superkey-over-restrictive-basis-realizability`, not this conflict-action check.)
+ * commit-time arms.
+ *
+ * A strict superkey of a NOT-NULL basis key is *over*-enforced — distinct from the
+ * conflict-action mismatch above. The logical `unique(a, b)` permits two rows differing
+ * only in `b`, but the basis NOT-NULL `unique(a)` that body-proved it rejects them: the
+ * basis enforces uniqueness on a *subset* of the logical key's columns, so it is stricter
+ * than the logical declaration advertises. That is sound (every logical invariant still
+ * holds) but surprising, so it surfaces as the acknowledgeable warning
+ * `lens.over-restrictive-basis-key` ({@link warnOverRestrictiveBasisKey}), emitted from this
+ * `proved` branch beside the conflict-action check (the only branch a `proved` logical key
+ * can sit over a strict-subset NOT-NULL basis key — a nullable basis sub-key yields only a
+ * guarded FD and never classifies `proved`). It is a warning, not an error: the schema is
+ * sound, just enforced more tightly than declared.
  */
 function classifyKeyConstraint(
 	ctx: ProveContext,
@@ -1545,6 +1564,10 @@ function classifyKeyConstraint(
 		// row-time arm does). A genuinely basis-keyless proof governs no basis key, so its
 		// `on conflict` is vacuous and left untouched.
 		rejectBasisGovernedConflictActionForProvedKey(ctx, constraint, logicalColumns, bijectiveAuthored, label, columnNames, readOnly, errors);
+		// Diagnostic-only: a logical key proved over a strict-subset NOT-NULL basis key is
+		// sound but over-enforced (the basis rejects writes the logical schema permits).
+		// Surface the surprise as a warning; this does not alter the proved classification.
+		warnOverRestrictiveBasisKey(ctx, logicalColumns, bijectiveAuthored, label, columnNames, readOnly, warnings);
 		return { constraint, kind: 'proved' };
 	}
 
@@ -1740,6 +1763,80 @@ function rejectBasisGovernedConflictActionForProvedKey(
 		conflict: basisKeyDefaultConflict(basis, mismatched),
 		label: basisKeyLabel(basis, mismatched),
 	});
+}
+
+/**
+ * Warns when a `proved` logical key is a strict **superkey** of a NOT-NULL basis key —
+ * the over-enforcement sibling of {@link rejectBasisGovernedConflictActionForProvedKey},
+ * emitted from the same `proved` branch. A logical `unique(a, b)` whose body proof rests on
+ * a basis NOT-NULL `unique(a)` (or basis PK `(a)`) is intrinsically unique — but the basis
+ * enforces uniqueness on a *subset* of the logical key's columns, so it rejects two rows
+ * differing only in `b` that the logical schema advertises as valid. The schema is sound
+ * (every logical invariant still holds), just stricter than declared — so this is the
+ * acknowledgeable warning `lens.over-restrictive-basis-key`, never an error.
+ *
+ * Fires when, after mapping the logical key 1:1 to basis columns
+ * ({@link mapLogicalKeyToBasisColumns}), a governing basis key
+ * ({@link findGoverningBasisKeys}) is a **strict** subset of the mapped columns
+ * (`governingKey.length < mappedBasisCols.length`). The strict filter excludes an
+ * exact-match basis key, which enforces exactly the logical key and is fully realizable —
+ * it must not warn. One warning per logical key; when several strict-subset basis keys
+ * exist, the first (smallest enumerated) names the message.
+ *
+ * Scoped to single-source `proved` keys:
+ *  - `readOnly` ⇒ early return (a read-only table never writes, so the over-enforcement
+ *    never materializes — the same gate as `lens.no-backing-index`);
+ *  - multi-source / unmappable ⇒ {@link mapLogicalKeyToBasisColumns} is undefined ⇒ no
+ *    advisory (the 1:1 logical→basis mapping the subset search needs does not exist, and
+ *    the superkey argument does not transfer across a decomposition — a documented gap);
+ *  - a nullable basis sub-key contributes only a guarded FD, so the logical key never
+ *    classifies `proved` and this check never sees it (a documented gap).
+ *
+ * Diagnostic-only: it does not alter the proved classification or the returned obligation.
+ */
+function warnOverRestrictiveBasisKey(
+	ctx: ProveContext,
+	logicalColumns: readonly number[],
+	bijectiveAuthored: ReadonlySet<string>,
+	label: string,
+	columnNames: readonly string[],
+	readOnly: boolean,
+	warnings: LensDiagnostic[],
+): void {
+	if (readOnly) return;
+	const basis = ctx.basisSource;
+	const basisCols = basis ? mapLogicalKeyToBasisColumns(ctx, logicalColumns, bijectiveAuthored) : undefined;
+	if (!basis || basisCols === undefined) return; // multi-source / unmappable: no sound subset relation to report
+
+	// Strict-subset governing keys only — an exact-match basis key enforces exactly the
+	// logical key (fully realizable) and must not warn.
+	const strictSubset = findGoverningBasisKeys(basis, basisCols)
+		.filter(m => basisKeyColumnIndices(basis, m).length < basisCols.length);
+	if (strictSubset.length === 0) return;
+
+	const governing = strictSubset[0];
+	const basisKeyColumns = basisKeyColumnIndices(basis, governing)
+		.map(c => basis.columns[c]?.name ?? `#${c}`)
+		.sort((a, b) => a.localeCompare(b));
+
+	warnings.push({
+		code: 'lens.over-restrictive-basis-key',
+		severity: 'warning',
+		site: { table: ctx.table.name, constraint: label },
+		message: `lens: ${label} on '${ctx.table.name}' (${columnNames.map(c => `'${c}'`).join(', ')}) is a strict superkey of ${basisKeyLabel(basis, governing)} — the basis enforces uniqueness on a subset of the logical key's columns, so it will reject writes the logical schema permits (two rows differing only outside the basis key's columns cannot coexist). This is sound but stricter than the logical declaration advertises; widen the basis key to match, or narrow the logical key, to make the logical contract faithful.`,
+		fingerprintInputs: {
+			constraintColumns: [...columnNames],
+			basisRelation: `${basis.schemaName.toLowerCase()}.${basis.name.toLowerCase()}`,
+			basisKeyColumns,
+		},
+	});
+}
+
+/** The basis-column indices a matched basis key covers — the PK definition or the UNIQUE's columns. */
+function basisKeyColumnIndices(basis: TableSchema, match: DeclaredKeyMatch): readonly number[] {
+	return match.kind === 'primaryKey'
+		? basis.primaryKeyDefinition.map(p => p.index)
+		: match.constraint.columns;
 }
 
 /**

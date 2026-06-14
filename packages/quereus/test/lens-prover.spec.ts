@@ -537,6 +537,188 @@ describe('lens prover: unenforceable conflict action (row-time set-level)', () =
 	});
 });
 
+describe('lens prover: over-restrictive basis key (advisory)', () => {
+	/**
+	 * A `proved` logical key that is a strict superkey of a NOT-NULL basis key is
+	 * sound but over-enforced: the basis enforces uniqueness on a subset of the
+	 * logical key's columns, so it rejects writes the logical schema advertises as
+	 * valid. The acknowledgeable `lens.over-restrictive-basis-key` warning surfaces
+	 * the surprise without downgrading the proved classification. It fires only for a
+	 * STRICT subset (an exact-match basis key is fully realizable) and only on the
+	 * single-source `proved` path (a nullable basis sub-key never reaches `proved`).
+	 */
+	function overRestrictive(db: Database) {
+		return report(db).warnings.filter(w => w.code === 'lens.over-restrictive-basis-key');
+	}
+
+	it('warns when a logical unique is a strict superkey of a NOT-NULL basis unique (still proved)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique, b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			expect(findObligation(slot(db, 't'), 'unique').kind, 'body-proved superkey stays proved').to.equal('proved');
+			const w = overRestrictive(db);
+			expect(w.length, 'one over-restrictive-basis-key advisory').to.equal(1);
+			expect(w[0].fingerprintInputs?.constraintColumns).to.deep.equal(['a', 'b']);
+			expect(w[0].fingerprintInputs?.basisKeyColumns).to.deep.equal(['a']);
+			expect(w[0].message).to.match(/strict superkey of basis unique/);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('warns for a logical PK that is a strict superkey of a NOT-NULL basis unique', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique, b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (a integer, b integer, id integer, primary key (a, b)) }');
+			await db.exec('apply schema x');
+
+			expect(findObligation(slot(db, 't'), 'primaryKey').kind, 'PK superkey proved').to.equal('proved');
+			const w = overRestrictive(db);
+			expect(w.length, 'one advisory for the PK superkey').to.equal(1);
+			expect(w[0].fingerprintInputs?.constraintColumns).to.deep.equal(['a', 'b']);
+			expect(w[0].fingerprintInputs?.basisKeyColumns).to.deep.equal(['a']);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('warns when the strict-subset governing key is the basis PRIMARY KEY', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (a integer primary key, b integer not null, id integer not null unique) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			expect(findObligation(slot(db, 't'), 'unique').kind).to.equal('proved');
+			const w = overRestrictive(db);
+			expect(w.length).to.equal(1);
+			expect(w[0].message, 'the basis PK governs').to.match(/strict superkey of basis primary key/);
+			expect(w[0].fingerprintInputs?.basisKeyColumns).to.deep.equal(['a']);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('warns when BOTH a strict-subset and an exact-match basis key exist (the subset still over-restricts)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique, b integer not null, unique (a, b)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			const w = overRestrictive(db);
+			expect(w.length, 'the strict-subset basis unique(a) still warns despite the exact match').to.equal(1);
+			expect(w[0].fingerprintInputs?.basisKeyColumns).to.deep.equal(['a']);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT warn when an exact basis key matches the logical key (fully realizable)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null, b integer not null, unique (a, b)) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			expect(findObligation(slot(db, 't'), 'unique').kind, 'proved by the matching basis unique').to.equal('proved');
+			expect(warningCodes(db)).to.not.include('lens.over-restrictive-basis-key');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT warn for a nullable basis sub-key (the logical key never classifies proved)', async () => {
+		const db = new Database();
+		try {
+			// Basis `a` is a NULLABLE unique ⇒ NULL-skipping ⇒ only a guarded FD, so the
+			// logical key is not unconditionally unique and classifies set-level, never
+			// reaching the `proved` branch this advisory fires from. (Logical `a` is declared
+			// nullable to match the nullable basis column — else the deploy reds a
+			// nullability-mismatch before this check runs.)
+			await db.exec('declare schema y { table t (id integer primary key, a integer null unique, b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer null, b integer, unique (a, b)) }');
+			await db.exec('apply schema x');
+
+			expect(findObligation(slot(db, 't'), 'unique').kind, 'nullable basis sub-key ⇒ not proved').to.equal('enforced-set-level');
+			expect(warningCodes(db)).to.not.include('lens.over-restrictive-basis-key');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT warn for a body-established key that rests on no governing basis key (group by)', async () => {
+		const db = new Database();
+		try {
+			// No basis UNIQUE/PK is a subset of {a, b}, so there is no governing basis key
+			// to over-restrict the logical key — the body alone establishes it. (Through the
+			// lens this group-by body classifies set-level rather than `proved`, but either
+			// way the advisory must stay silent: it fires only off a strict-subset basis key.)
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null, b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (a integer, b integer, primary key (a, b)) }');
+			await db.exec('declare lens for x over y { view t as select a, b from y.t group by a, b }');
+			await db.exec('apply schema x');
+
+			expect(warningCodes(db), 'no governing basis key ⇒ no over-restriction').to.not.include('lens.over-restrictive-basis-key');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('does NOT warn on a read-only table (the over-enforcement never materializes)', async () => {
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique, b integer not null) }');
+			await db.exec('apply schema y');
+			// The PK `k` maps to a computed expression (id + 1) ⇒ not reconstructible ⇒ read-only.
+			await db.exec('declare logical schema x { table t (k integer primary key, a integer, b integer, unique (a, b)) }');
+			await db.exec('declare lens for x over y { view t as select id + 1 as k, a, b from y.t }');
+			await db.exec('apply schema x');
+
+			expect(slot(db, 't').readOnly, 'computed PK ⇒ read-only').to.equal(true);
+			expect(warningCodes(db)).to.include('lens.pk-not-reconstructible');
+			expect(warningCodes(db), 'read-only never writes ⇒ no over-restriction advisory').to.not.include('lens.over-restrictive-basis-key');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('co-occurs with lens.unenforceable-conflict-action: the clean variant warns, the `replace` variant errors', async () => {
+		// A `replace`-declaring superkey fires BOTH diagnostics (the conflict-action error
+		// and the over-restriction warning) from the same `proved` branch — but the error
+		// throws atomically, so they cannot share one report. The clean variant flows the
+		// warning to the report; the `replace` variant blocks the deploy with the error.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique, b integer not null) }');
+			await db.exec('apply schema y');
+
+			// Clean variant: the over-restriction warning surfaces, deploy succeeds.
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, unique (a, b)) }');
+			await db.exec('apply schema x');
+			expect(overRestrictive(db).length, 'clean variant warns').to.equal(1);
+
+			// `replace` variant: the governing basis unique(a) carries no action (ABORT), so
+			// the declared REPLACE is dropped ⇒ conflict-action error blocks the deploy.
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, unique (a, b) on conflict replace) }');
+			await expectThrows(() => db.exec('apply schema x'), /lens\.unenforceable-conflict-action/);
+		} finally {
+			await db.close();
+		}
+	});
+});
+
 describe('lens prover: read-only (key reconstructibility)', () => {
 	it('a non-reconstructible PK deploys read-only and rejects mutation at the lens boundary', async () => {
 		const db = new Database();

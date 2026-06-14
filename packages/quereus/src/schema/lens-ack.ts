@@ -178,6 +178,11 @@ export function computeAdvisoryFingerprint(
 		// CHECK `in (...)` list change moves a round-trip advisory's fingerprint
 		// and re-surfaces its acknowledgment.
 		...(inputs?.domainValues ? { domain: [...inputs.domainValues].sort() } : {}),
+		// Conditionally serialized (same as `domain`): only `lens.over-restrictive-basis-key`
+		// carries a governing basis key, so every other advisory keeps its existing hash. A
+		// basis-key change (tightened to match the logical key, or loosened) moves the hash
+		// and re-surfaces the acknowledgment.
+		...(inputs?.basisKeyColumns ? { basisKey: [...inputs.basisKeyColumns].map(c => c.toLowerCase()).sort() } : {}),
 	});
 	return toBase64Url(fnv1aHash(canonical)).slice(0, 12);
 }
