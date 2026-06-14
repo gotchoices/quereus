@@ -1071,7 +1071,11 @@ export class MemoryTableManager {
 			// signature has no MemoryIndex handle, so this site keeps the live-handle
 			// read; the agreement between the two index-resolution paths is pinned by
 			// test/unique-enforcement-collation.spec.ts (a real divergence is a finding,
-			// not a reason to widen the helper).
+			// not a reason to widen the helper). KNOWN gap: when two UNIQUE indexes
+			// cover the SAME column-set with different collations, the by-column-set
+			// match above returns the FIRST such index for BOTH UCs, so a coarser-
+			// declared UNIQUE can be under-enforced here — a pre-existing memory bug
+			// tracked by fix ticket memory-multi-index-unique-collation-resolution.
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
 			if (!uc.columns.every((col, i) => compareSqlValues(

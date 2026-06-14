@@ -19,10 +19,15 @@
  *    Memory's `checkUniqueViaIndex` (manager.ts) is the one resolver that does NOT
  *    import this helper: it reads the collation from the *live* `MemoryIndex`
  *    handle that `findIndexForConstraint` resolves BY COLUMN-SET, a source this
- *    `(schema, uc)` signature has no handle to. For every constraint shape that
- *    arises the two index-resolution paths land on the same index and the same
- *    per-column collations, so it is conformance-locked against this helper by
- *    `test/unique-enforcement-collation.spec.ts` rather than sharing the import.
+ *    `(schema, uc)` signature has no handle to. For the normal shape — at most one
+ *    UNIQUE index per column-set — the two index-resolution paths land on the same
+ *    index and the same per-column collations, so it is conformance-locked against
+ *    this helper by `test/unique-enforcement-collation.spec.ts` rather than sharing
+ *    the import. (They DIVERGE when two UNIQUE indexes cover the same column-set
+ *    with different collations — memory then enforces the first index's collation
+ *    for both UCs and can under-enforce a coarser-declared one; a pre-existing
+ *    memory-enforcement bug tracked by fix ticket
+ *    `memory-multi-index-unique-collation-resolution`, NOT introduced here.)
  *
  *  - {@link coveringMvHonorsIndexCollation} — whether a row-time covering MV may
  *    soundly answer this constraint. A covering MV generates its candidate set by

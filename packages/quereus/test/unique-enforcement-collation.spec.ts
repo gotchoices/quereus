@@ -10,12 +10,20 @@
  * import: it reads the collation from the *live* `MemoryIndex` handle that
  * `findIndexForConstraint` resolves BY COLUMN-SET —
  * `index.specColumns[i]?.collation ?? schema.columns[col].collation`. The two
- * resolution paths must agree per column for every constraint shape that arises;
- * a drift would re-open the covering-MV subset-miss (or over-reject).
+ * resolution paths agree per column for every NORMAL shape — at most one UNIQUE
+ * index per column-set — and a drift on those would re-open the covering-MV
+ * subset-miss (or over-reject). They do NOT agree when two UNIQUE indexes cover
+ * the SAME column-set with different collations: by-name resolves each UC's own
+ * index, by-column-set resolves the first index in `schema.indexes`, so memory
+ * can under-enforce a coarser-declared UNIQUE (a pre-existing memory-enforcement
+ * bug independent of this unification — see fix ticket
+ * `memory-multi-index-unique-collation-resolution`). The shapes below stay within
+ * the single-index-per-column-set regime where agreement is the contract.
  *
- * This suite drives the relevant shapes through BOTH paths and asserts equal
- * per-column output. A real divergence here is a genuine finding (the two
- * index-resolution paths disagree), NOT a reason to widen the helper's signature.
+ * This suite drives those shapes through BOTH paths and asserts equal per-column
+ * output. A drift here is a genuine finding (the two index-resolution paths
+ * disagree on a shape that should agree), NOT a reason to widen the helper's
+ * signature.
  */
 
 import { expect } from 'chai';
