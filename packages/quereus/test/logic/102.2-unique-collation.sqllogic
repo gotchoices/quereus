@@ -21,7 +21,10 @@
 -- `create unique index`: the non-derived UNIQUE enforces under its DECLARED collation
 -- in BOTH creation orders, the user's finer index keeps enforcing its own uniqueness,
 -- and dropping the non-derived constraint leaves the user index intact
--- (`memory-nonderived-unique-reused-finer-index-under-enforcement`).
+-- (`memory-nonderived-unique-reused-finer-index-under-enforcement`). §13 covers
+-- conflict resolution (OR REPLACE / OR IGNORE) over those two coexisting structures:
+-- a conflict on one is not a false conflict on the other, and OR REPLACE evicts
+-- exactly the row the conflicting structure identifies.
 
 -- ===================================
 -- 1. Table-level `unique (x)` over a NOCASE column — auto-index enforcement.
@@ -413,3 +416,47 @@ insert into mif values (5, 'Bob');
 
 select count(*) as n from mif;
 → [{"n":3}]
+
+-- ===================================
+-- 13. Conflict resolution (OR REPLACE / OR IGNORE) with the TWO coexisting unique
+--     structures the §12 fix produces: a NOCASE non-derived UNIQUE (`uq`) and a
+--     FINER BINARY user index (`ixb`). The two enforce DIFFERENT equivalences, so a
+--     conflict on one must not be a false conflict on the other, and OR REPLACE must
+--     evict exactly the row the conflicting structure identifies. Runs under memory
+--     AND store (cross-module conformance with SQLite).
+--     (memory-nonderived-unique-reused-finer-index-under-enforcement, review.)
+-- ===================================
+
+create table p (id integer primary key, b text collate nocase);
+create unique index ixb on p (b collate binary);
+alter table p add constraint uq unique (b);
+insert into p values (1, 'Bob');
+
+-- OR REPLACE on 'bob': NOCASE-dup of 'Bob' but BINARY-distinct → the NOCASE UNIQUE
+-- drives the conflict and evicts id=1; the BINARY index raises no false conflict.
+insert or replace into p values (2, 'bob');
+select id, b from p order by id;
+→ [{"id":2,"b":"bob"}]
+
+-- OR IGNORE on 'BOB': NOCASE-dup of the surviving 'bob' → ignored, table unchanged.
+insert or ignore into p values (3, 'BOB');
+select id, b from p order by id;
+→ [{"id":2,"b":"bob"}]
+
+-- OR REPLACE byte-exact dup of 'bob' → BOTH structures conflict on the SAME row id=2;
+-- it is evicted once and the new row inserted (no double-evict error).
+insert or replace into p values (4, 'bob');
+select id, b from p order by id;
+→ [{"id":4,"b":"bob"}]
+
+-- OR REPLACE where the NOCASE structure conflicts on one row while a DIFFERENT row
+-- stays clear of both: 'Cat' NOCASE-matches 'cat' (id=1); 'DOG' is BINARY- and
+-- NOCASE-distinct → only id=1 is evicted, id=2 survives.
+create table q (id integer primary key, b text collate nocase);
+create unique index qixb on q (b collate binary);
+alter table q add constraint uq2 unique (b);
+insert into q values (1, 'cat');
+insert into q values (2, 'DOG');
+insert or replace into q values (3, 'Cat');
+select id, b from q order by id;
+→ [{"id":2,"b":"DOG"},{"id":3,"b":"Cat"}]

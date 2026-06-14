@@ -417,7 +417,13 @@ both constraints onto the first-listed index and under-enforce the coarser one
 COLLATE` on a column under such an index propagates the new collation into the index
 column (metadata-only — the store's index *key* bytes use the table-level collation K, so
 no entry re-encode is required), mirroring the memory module; a non-derived (table-level /
-column) UNIQUE always enforces under the declared column collation. When a row-time covering
+column) UNIQUE always enforces under the declared column collation — even when a *finer*
+same-column-set `CREATE UNIQUE INDEX` already exists (either DDL order). Memory does **not**
+reuse such a finer index as the constraint's realizing structure: it builds the constraint's
+own declared-collation covering index and `findIndexForConstraint` resolves the non-derived UC
+to that structure BY NAME (via `getImplicitCoveringStructure`), so the two indexes coexist and
+each enforces its own equivalence (matches SQLite and the store, which never reused the user
+index) (`memory-nonderived-unique-reused-finer-index-under-enforcement`). When a row-time covering
 materialized view is *also* linked to such a constraint, a finer/incomparable index collation
 disqualifies the MV from answering it — see the [covering-MV collation eligibility
 gate](materialized-views.md#enforcement-through-a-covering-mv) — so enforcement falls back to
