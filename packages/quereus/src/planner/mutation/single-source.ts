@@ -1310,6 +1310,10 @@ export function rewriteViewReturning(
 		if (rc.type === 'all') {
 			// RETURNING * (or `view.*`) → every view column, projected through its
 			// base-term lineage and named by the view column.
+			// TODO: an `rc.table` qualifier (`bogus.*`) is NOT validated here — any
+			// qualifier expands all view columns rather than erroring on a wrong
+			// name. The base-table path (building/returning-star.ts) DOES validate;
+			// tightening the view path needs the view name/alias threaded in.
 			for (const vc of analysis.viewColumns) {
 				const baseExpr = analysis.columnMap.get(vc.name.toLowerCase());
 				if (baseExpr) out.push({ type: 'column', expr: cloneExpr(baseExpr), alias: vc.name });

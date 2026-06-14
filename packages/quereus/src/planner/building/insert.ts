@@ -22,7 +22,8 @@ import { ColumnReferenceNode, TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
 import { RowOpFlag, type TableSchema, type RowConstraintSchema } from '../../schema/table.js';
-import { ReturningNode } from '../nodes/returning-node.js';
+import { ReturningNode, type ReturningProjection } from '../nodes/returning-node.js';
+import { expandReturningStar } from './returning-star.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode, type UpsertClausePlan } from '../nodes/dml-executor-node.js';
@@ -807,10 +808,16 @@ export function buildInsertStmt(
 			);
 		});
 
-		// Build RETURNING projections in the OLD/NEW context
-		const returningProjections = stmt.returning.map(rc => {
-			// TODO: Support RETURNING *
-			if (rc.type === 'all') throw new QuereusError('RETURNING * not yet supported', StatusCode.UNSUPPORTED);
+		// Build RETURNING projections in the OLD/NEW context. A `*` / `t.*` expands
+		// in place (so `returning id, *` keeps surrounding columns in position).
+		const returningProjections: ReturningProjection[] = [];
+		for (const rc of stmt.returning) {
+			if (rc.type === 'all') {
+				// INSERT has no alias (only inline-subquery targets do, and those route
+				// through the view path); the star inherits NEW via the returning scope.
+				returningProjections.push(...expandReturningStar(ctx, rc, returningScope, tableReference.tableSchema, undefined));
+				continue;
+			}
 
 			// Infer alias from column name if not explicitly provided.
 			// Preserve the spelling the user wrote so quoted identifiers like
@@ -826,11 +833,11 @@ export function buildInsertStmt(
 			// OLD-in-INSERT guard fires before any "column not found" error.
 			validateReturningQualifiers(rc.expr, 'INSERT');
 
-			return {
+			returningProjections.push({
 				node: buildExpression({ ...ctx, scope: returningScope }, rc.expr) as ScalarPlanNode,
 				alias: alias
-			};
-		});
+			});
+		}
 
 		return new ReturningNode(ctx.scope, dmlExecutorNode, returningProjections);
 	}

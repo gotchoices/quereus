@@ -14,7 +14,8 @@ import { ColumnReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
-import { ReturningNode } from '../nodes/returning-node.js';
+import { ReturningNode, type ReturningProjection } from '../nodes/returning-node.js';
+import { expandReturningStar } from './returning-star.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
@@ -322,9 +323,15 @@ export function buildUpdateStmt(
         new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, oldAttributeId, columnIndex));
     });
 
-    const returningProjections = stmt.returning.map(rc => {
-      // TODO: Support RETURNING *
-      if (rc.type === 'all') throw new QuereusError('RETURNING * not yet supported', StatusCode.UNSUPPORTED);
+    const returningProjections: ReturningProjection[] = [];
+    for (const rc of stmt.returning) {
+      if (rc.type === 'all') {
+        // `*` / `t.*` expands in place to every column (NEW image via the returning
+        // scope), each carrying its NEW attribute id like the named path below.
+        returningProjections.push(...expandReturningStar(
+          updateCtx, rc, returningScope, tableReference.tableSchema, stmt.alias, newColumnAttributeIds));
+        continue;
+      }
 
       // Infer alias from column name if not explicitly provided.
       // Preserve the spelling the user wrote so quoted identifiers like
@@ -339,12 +346,12 @@ export function buildUpdateStmt(
       const columnIndex = tableReference.tableSchema.columns.findIndex(col => col.name.toLowerCase() === (rc.expr.type === 'column' ? rc.expr.name.toLowerCase() : ''));
       const projAttributeId = rc.expr.type === 'column' && columnIndex !== -1 ? newColumnAttributeIds[columnIndex] : undefined;
 
-      return {
+      returningProjections.push({
         node: buildExpression({ ...updateCtx, scope: returningScope }, rc.expr) as ScalarPlanNode,
         alias: alias,
         attributeId: projAttributeId
-      };
-    });
+      });
+    }
 
     // Create UpdateNode with both row descriptors for RETURNING coordination
     const updateNodeWithDescriptor = new UpdateNode(

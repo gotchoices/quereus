@@ -2182,6 +2182,10 @@ function buildReturningProjection(
 	const out: AST.ResultColumn[] = [];
 	for (const rc of returningCols) {
 		if (rc.type === 'all') {
+			// TODO: an `rc.table` qualifier (`bogus.*`) is NOT validated here — any
+			// qualifier expands all view columns rather than erroring on a wrong name.
+			// The base-table path (building/returning-star.ts) DOES validate; tightening
+			// the view path needs the view name/alias threaded in.
 			for (const col of analysis.outColumns) {
 				const baseExpr = analysis.viewColToBaseRef.get(col.name);
 				if (!baseExpr) {

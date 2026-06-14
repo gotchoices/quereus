@@ -532,7 +532,7 @@ The insert statement adds new rows to a table. The target may also be an updatab
   { values (expr [, expr...]) [, (expr [, expr...])]... | select_statement }
   [ with context (variable = expr [, ...]) ]
   [ with schema schema_name [, schema_name...] ]
-  [ returning [qualifier.]expr [, [qualifier.]expr...] ]
+  [ returning { * | table.* | [qualifier.]expr [ [as] alias ] } [, ...] ]
 
 conflict_resolution:
   rollback | abort | fail | ignore | replace
@@ -555,7 +555,7 @@ assignment:
 - `upsert_clause`: Specifies how to handle conflicts with fine-grained control (see UPSERT below)
 - `with context`: Provides table-level parameters for defaults and constraints (see section 2.6.2)
 - `with schema`: Specifies schema search path for resolving table names (see section 2.1.1)
-- `returning`: Returns specified expressions from the inserted rows (supports NEW qualifier)
+- `returning`: Returns specified expressions from the inserted rows. `*` (or `table.*`) expands to every table column in declaration order, projecting the NEW (inserted) image; named expressions support the NEW qualifier
 
 **Conflict Resolution (OR clause):**
 
@@ -729,7 +729,7 @@ The update statement modifies existing rows in a table. The target may also be a
     [ where condition ]
     [ with context (variable = expr [, ...]) ]
     [ with schema schema_name [, schema_name...] ]
-    [ returning [qualifier.]expr [, [qualifier.]expr...] ]
+    [ returning { * | table.* | [qualifier.]expr [ [as] alias ] } [, ...] ]
 ```
 
 **Options:**
@@ -739,7 +739,7 @@ The update statement modifies existing rows in a table. The target may also be a
 - `where`: Optional condition to specify which rows to update
 - `with context`: Provides table-level parameters for defaults and constraints (see section 2.6.2)
 - `with schema`: Specifies schema search path for resolving table names (see section 2.1.1)
-- `returning`: Returns specified expressions from the updated rows (supports OLD and NEW qualifiers)
+- `returning`: Returns specified expressions from the updated rows. `*` (or `table.*`) expands to every table column in declaration order, projecting the NEW (updated) image by default; named expressions support the OLD and NEW qualifiers
 
 **Examples:**
 ```sql
@@ -810,7 +810,7 @@ delete from table_name
 [ where condition ]
 [ with context (variable = expr [, ...]) ]
 [ with schema schema_name [, schema_name...] ]
-[ returning [qualifier.]expr [, [qualifier.]expr...] ]
+[ returning { * | table.* | [qualifier.]expr [ [as] alias ] } [, ...] ]
 ```
 
 **Options:**
@@ -819,7 +819,7 @@ delete from table_name
 - `where`: Optional condition to specify which rows to delete
 - `with context`: Provides table-level parameters for defaults and constraints (see section 2.6.2)
 - `with schema`: Specifies schema search path for resolving table names (see section 2.1.1)
-- `returning`: Returns specified expressions from the deleted rows (supports OLD qualifier)
+- `returning`: Returns specified expressions from the deleted rows. `*` (or `table.*`) expands to every table column in declaration order, projecting the OLD (deleted) image; named expressions support the OLD qualifier
 
 **Examples:**
 ```sql
@@ -888,6 +888,15 @@ qualifier:
 - `OLD`: References the deleted values ✅
 - `NEW`: Not allowed (will cause error) ❌
 - Unqualified columns: Default to OLD values
+
+**`*` / `table.*` expansion:** A `*` (or table-qualified `table.*`) expands, in
+place, to every column of the target in declaration order — so `returning id, *`
+and `returning *, expr` keep the surrounding items in position. Each expanded
+column follows the unqualified-default image rule above: the NEW image for
+INSERT/UPDATE, the OLD image for DELETE. Output column names are the bare column
+names regardless of any qualifier. A `table.*` qualifier must name the target
+table; any other name is an error. Through a view, `*` expands to the *view's*
+output columns (in view order), not the base table's.
 
 #### 2.5.3 Advanced RETURNING Examples
 

@@ -13,7 +13,8 @@ import { ColumnReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
-import { ReturningNode } from '../nodes/returning-node.js';
+import { ReturningNode, type ReturningProjection } from '../nodes/returning-node.js';
+import { expandReturningStar } from './returning-star.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
 import { buildConstraintChecks } from './constraint-builder.js';
@@ -303,10 +304,16 @@ export function buildDeleteStmt(
       );
     });
 
-    // Build RETURNING projections in the OLD/NEW context
-    const returningProjections = stmt.returning.map(rc => {
-      // TODO: Support RETURNING *
-      if (rc.type === 'all') throw new QuereusError('RETURNING * not yet supported', StatusCode.UNSUPPORTED);
+    // Build RETURNING projections in the OLD/NEW context. A `*` / `t.*` expands
+    // in place; the unqualified symbols bind OLD for DELETE, so the star yields
+    // the pre-deletion image.
+    const returningProjections: ReturningProjection[] = [];
+    for (const rc of stmt.returning) {
+      if (rc.type === 'all') {
+        returningProjections.push(...expandReturningStar(
+          deleteCtx, rc, returningScope, tableReference.tableSchema, stmt.alias));
+        continue;
+      }
 
       // Validate qualifier usage on the AST before column resolution so the
       // NEW-in-DELETE guard fires before any "column not found" error.
@@ -322,11 +329,11 @@ export function buildDeleteStmt(
           : rc.expr.name;
       }
 
-      return {
+      returningProjections.push({
         node: buildExpression({ ...deleteCtx, scope: returningScope }, rc.expr) as ScalarPlanNode,
         alias: alias
-      };
-    });
+      });
+    }
 
     return new ReturningNode(deleteCtx.scope, dmlExecutorNode, returningProjections);
   }
