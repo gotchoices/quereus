@@ -1536,11 +1536,14 @@ export class StoreTable extends VirtualTable {
 			if (selfPks.some(pk => this.keysEqual(pk, cand.pk))) continue;
 			// Re-validate under each column's enforcement collation (the index's
 			// per-column COLLATE for an index-derived UNIQUE, else declared) — see
-			// uniqueEnforcementCollations. NOTE: the candidate generation
+			// uniqueEnforcementCollations. The candidate generation
 			// (_lookupCoveringConflicts) narrows under the SOURCE column's declared
-			// collation, so for a FINER index it returns a superset this filters down
-			// correctly; a COARSER-index covering MV is out of scope (see the review
-			// handoff) — its narrowed candidate set can be a subset.
+			// collation, so for a FINER index (BINARY over a NOCASE column) it returns a
+			// superset this filters down correctly. A finer/incomparable index-derived
+			// UNIQUE whose declared candidate set could be a SUBSET (e.g. a coarser NOCASE
+			// index over a BINARY column) is declined upstream by the collation gate in
+			// findRowTimeCoveringStructure, so only BINARY-floor or equal-collation MVs
+			// reach here — the superset this re-validation can soundly filter.
 			if (uc.columns.some((c, i) => compareSqlValues(newRow[c], liveRow[c], collations[i]) !== 0)) continue;
 			if (predicate && predicate.evaluate(liveRow) !== true) continue;
 			return { pk: cand.pk, row: liveRow };

@@ -86,6 +86,7 @@ import { compilePredicate, type CompiledPredicate } from '../vtab/memory/utils/p
 import { compareSqlValues, rowsValueIdentical } from '../util/comparison.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
+import { coveringMvHonorsIndexCollation } from '../schema/unique-enforcement.js';
 import type { Database } from './database.js';
 import type { DatabaseEventEmitter, MaintenanceCollisionEvent } from './database-events.js';
 import type * as AST from '../parser/ast.js';
@@ -2864,6 +2865,25 @@ export class MaterializedViewManager {
 	 * eligibility flip from opening a stale-read enforcement path. O(1) negative fast
 	 * path off {@link rowTimeBySource} so a source table with no row-time covering MV
 	 * pays a single map lookup and stays on the synchronous index/scan path.
+	 *
+	 * **Collation eligibility gate.** A covering MV generates its conflict candidates
+	 * by re-comparing each backing row under the SOURCE column's DECLARED collation
+	 * ({@link lookupCoveringConflicts} / {@link tryBuildCoveringPrefix}), while the
+	 * re-validators (store `findUniqueConflictViaCoveringMv`, memory
+	 * `checkUniqueViaMaterializedView`) filter under the index per-column collation. The
+	 * candidate set is a sound *superset* of the index-collation matches — safe to filter
+	 * down — only when the index collation is coarser-or-equal to the declared collation
+	 * per constrained column (see {@link coveringMvHonorsIndexCollation}). For a
+	 * finer/incomparable index-derived UNIQUE (e.g. a coarser NOCASE index over a BINARY
+	 * column) the candidate set may be a *subset* that silently misses conflicts, so the
+	 * MV is declined here and enforcement falls back to the per-scan / auto-index path
+	 * (already correct under the index collation). All three callers (store, memory,
+	 * lens-prover) consult this resolver, so they decline the same MV in lockstep and
+	 * candidate generation never runs for a declined MV. This gate is load-bearing, not
+	 * mere defense-in-depth: the covering-link prover's own collation gate compares the
+	 * OUTPUT column collation against the DECLARED base-column collation (not the index
+	 * collation), so it DOES link a coarser-index covering MV — confirmed by the
+	 * premise-check test in `covering-structure.spec.ts`.
 	 */
 	findRowTimeCoveringStructure(
 		schemaName: string,
@@ -2884,6 +2904,13 @@ export class MaterializedViewManager {
 			// the end-of-statement flush), so it cannot answer a synchronous probe.
 			if (plan.chosenStrategy === 'full-rebuild') return undefined;
 			if (mv.derivation.stale) return undefined; // not row-time consistent
+			// Decline the MV when its declared-collation candidate set is not a sound
+			// superset of the index-collation matches (finer/incomparable index-derived
+			// UNIQUE). Resolve the source schema for the declared/index collations; if it
+			// cannot be resolved, fall through to the existing behavior rather than throw
+			// (mirrors the `if (!index) …` tolerance elsewhere).
+			const sourceSchema = this.ctx._findTable(tableName, schemaName);
+			if (sourceSchema && !coveringMvHonorsIndexCollation(sourceSchema, uc)) return undefined;
 			return mv;
 		}
 		return undefined;

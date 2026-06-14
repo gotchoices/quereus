@@ -9,7 +9,11 @@
 --
 -- Runs under BOTH the memory module (`yarn test`) and the store module
 -- (`yarn test:store`); the covering-MV sections additionally exercise the MV-backed
--- enforcement path on each module.
+-- enforcement path on each module. §4 uses a non-derived NOCASE column through the
+-- covering MV; §10 exercises the index-derived shapes (finer/coarser/plain index)
+-- through a row-time covering MV, where the collation eligibility gate
+-- (`covering-mv-index-derived-unique-collation`) keeps an MV only when the index
+-- collation is coarser-or-equal to the declared column collation per column.
 
 -- ===================================
 -- 1. Table-level `unique (x)` over a NOCASE column — auto-index enforcement.
@@ -225,3 +229,64 @@ insert into pgi values (2, 'bob');
 
 select count(*) as n from pgi;
 → [{"n":1}]
+
+-- ===================================
+-- 10. Index-derived UNIQUE through a row-time COVERING MV. Parallels §9's per-scan
+--     shapes but with a covering MV linked, so the collation eligibility gate decides
+--     whether enforcement routes through the MV (BINARY-floor / equal collation) or
+--     falls back to the per-scan / auto-index path (finer/incomparable index). Both
+--     paths honor the INDEX per-column collation, so memory and store agree on each
+--     module (covering-mv-index-derived-unique-collation).
+-- ===================================
+
+-- 10a. FINER index (BINARY) over a NOCASE column + covering MV → eligible (I=BINARY
+--      floor). The candidate set is a superset; re-validation under BINARY admits both
+--      case-variants 'Bob'/'bob'. A genuine BINARY duplicate is still rejected.
+create table fam (id integer primary key, b text collate NOCASE);
+create unique index fam_b on fam (b collate BINARY);
+create materialized view fam_mv as select b, id from fam order by b;
+insert into fam values (1, 'Bob');
+insert into fam values (2, 'bob');
+select id, b from fam order by id;
+→ [{"id":1,"b":"Bob"},{"id":2,"b":"bob"}]
+
+insert into fam values (3, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from fam;
+→ [{"n":2}]
+
+-- 10b. COARSER index (NOCASE) over a BINARY column + covering MV → declined (I=NOCASE,
+--      D=BINARY). Enforcement falls back to the per-scan / auto-index path under the
+--      index NOCASE, so 'BOB' after 'Bob' is rejected (the silent miss the gate closes).
+create table cbm (id integer primary key, b text);
+create unique index cbm_b on cbm (b collate NOCASE);
+create materialized view cbm_mv as select b, id from cbm order by b;
+insert into cbm values (1, 'Bob');
+insert into cbm values (2, 'BOB');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from cbm;
+→ [{"n":1}]
+
+-- a genuinely different value still inserts through the per-scan path
+insert into cbm values (3, 'Carol');
+select id, b from cbm order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"Carol"}]
+
+-- 10c. PLAIN index (no per-column COLLATE) over a NOCASE column + covering MV →
+--      eligible (I falls back to D=NOCASE ⇒ equal). Unchanged NOCASE folding (mirrors §4).
+create table pgm (id integer primary key, b text collate NOCASE);
+create unique index pgm_b on pgm (b);
+create materialized view pgm_mv as select b, id from pgm order by b;
+insert into pgm values (1, 'Bob');
+insert into pgm values (2, 'bob');
+-- error: UNIQUE constraint failed
+
+select count(*) as n from pgm;
+→ [{"n":1}]
+
+-- a non-NOCASE-equal value still inserts through the covering path
+insert into pgm values (3, 'abd');
+select id, b from pgm order by id;
+→ [{"id":1,"b":"Bob"},{"id":3,"b":"abd"}]

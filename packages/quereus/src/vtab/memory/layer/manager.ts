@@ -13,6 +13,7 @@ import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
+import { uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
 import { compareSqlValues, rowsValueIdentical } from '../../../util/comparison.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -1122,6 +1123,17 @@ export class MemoryTableManager {
 	): Promise<UpdateResult | null> {
 		const newSourcePk = Array.isArray(newPrimaryKey) ? newPrimaryKey as SqlValue[] : [newPrimaryKey as SqlValue];
 		const conflicts = await this.db._lookupCoveringConflicts(mv, uc, newRowData, newSourcePk);
+		// Re-validate under each column's enforcement collation — the index's per-column
+		// COLLATE for an index-derived UNIQUE, else the declared column collation
+		// (uniqueEnforcementCollations) — mirroring checkUniqueViaIndex, the store's
+		// findUniqueConflictViaCoveringMv, and the isolation overlay, so all modules agree.
+		// The candidate generation (_lookupCoveringConflicts) narrows under the SOURCE
+		// column's DECLARED collation, so for a FINER index (e.g. BINARY over a NOCASE
+		// column) it returns a superset this filters down correctly; a finer/incomparable
+		// index-derived UNIQUE whose declared candidate set could be a subset is declined
+		// upstream by findRowTimeCoveringStructure's collation gate, so only BINARY-floor
+		// or equal-collation MVs ever reach here.
+		const collations = uniqueEnforcementCollations(schema, uc);
 
 		for (const conflict of conflicts) {
 			const existingPK = buildPrimaryKeyFromValues(conflict.pk, schema.primaryKeyDefinition);
@@ -1130,7 +1142,7 @@ export class MemoryTableManager {
 			// Validate against the live source row: skip stale backing candidates.
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
-			if (!uc.columns.every(col => compareSqlValues(newRowData[col], conflictingRow[col], schema.columns[col].collation) === 0)) continue;
+			if (!uc.columns.every((col, i) => compareSqlValues(newRowData[col], conflictingRow[col], collations[i]) === 0)) continue;
 
 			if (onConflict === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };

@@ -399,10 +399,10 @@ describe('StoreTable UNIQUE constraints', () => {
 			// Same as above but with a row-time covering MV linked to the derived UNIQUE,
 			// so enforcement routes through findUniqueConflictViaCoveringMv: the candidate
 			// generation narrows under the declared NOCASE (a SUPERSET of the BINARY
-			// matches) and the re-validation filters under the index BINARY. NOTE: this is
-			// a store-only assertion — memory's checkUniqueViaMaterializedView re-validates
-			// under the declared collation, so the MV-backed path is one place store and
-			// memory still differ for a finer-index derived UNIQUE (see review handoff).
+			// matches) and the re-validation filters under the index BINARY. Store and
+			// memory now AGREE here: the finer index is BINARY-floor eligible so the
+			// covering MV is kept, and memory's checkUniqueViaMaterializedView re-validates
+			// under the index BINARY too (covering-mv-index-derived-unique-collation).
 			await db.exec(`CREATE TABLE fam (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
 			await db.exec(`CREATE UNIQUE INDEX fam_b ON fam (b COLLATE BINARY)`);
 			await db.exec(`CREATE MATERIALIZED VIEW fam_mv AS SELECT b, id FROM fam ORDER BY b`);
@@ -410,6 +410,26 @@ describe('StoreTable UNIQUE constraints', () => {
 			await db.exec(`INSERT INTO fam VALUES (2, 'bob')`); // BINARY-distinct ⇒ admitted via MV path
 			expect(await collect(db, `SELECT id, b FROM fam ORDER BY id`)).to.deep.equal([
 				{ id: 1, b: 'Bob' }, { id: 2, b: 'bob' },
+			]);
+		});
+
+		it('COARSER index (NOCASE) over a BINARY column rejects the NOCASE-equal dup through the covering MV path', async () => {
+			// A coarser index over a covering MV: the MV's candidate generation narrows
+			// under the declared BINARY, so 'BOB' (NOCASE-equal but BINARY-different to
+			// 'Bob') would be a SUBSET miss. The collation eligibility gate
+			// (findRowTimeCoveringStructure) DECLINES the MV, so enforcement falls back to
+			// the per-scan findUniqueConflict under the index NOCASE — closing the silent
+			// miss on the store too (covering-mv-index-derived-unique-collation).
+			await db.exec(`CREATE TABLE cbm (id INTEGER PRIMARY KEY, b TEXT) USING store`); // b is BINARY
+			await db.exec(`CREATE UNIQUE INDEX cbm_b ON cbm (b COLLATE NOCASE)`);
+			await db.exec(`CREATE MATERIALIZED VIEW cbm_mv AS SELECT b, id FROM cbm ORDER BY b`);
+			await db.exec(`INSERT INTO cbm VALUES (1, 'Bob')`);
+			await rejects(`INSERT INTO cbm VALUES (2, 'BOB')`); // NOCASE-equal ⇒ rejected via declined-MV per-scan
+			expect(await collect(db, `SELECT count(*) AS n FROM cbm`)).to.deep.equal([{ n: 1 }]);
+			// A genuinely different value still inserts.
+			await db.exec(`INSERT INTO cbm VALUES (3, 'Carol')`);
+			expect(await collect(db, `SELECT id, b FROM cbm ORDER BY id`)).to.deep.equal([
+				{ id: 1, b: 'Bob' }, { id: 3, b: 'Carol' },
 			]);
 		});
 

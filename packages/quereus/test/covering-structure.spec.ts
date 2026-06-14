@@ -1414,6 +1414,150 @@ describe('row-time covering enforcement', () => {
 });
 
 /**
+ * Collation eligibility gate for an index-derived UNIQUE answered by a covering MV
+ * (`covering-mv-index-derived-unique-collation`). A covering MV generates its
+ * conflict candidates under the SOURCE column's DECLARED collation but the
+ * re-validators filter under the INDEX per-column collation, so the candidate set is
+ * a sound superset only when the index collation is coarser-or-equal to the declared
+ * collation per constrained column (BINARY-floor OR name-equal). The gate in
+ * `findRowTimeCoveringStructure` declines a finer/incomparable MV so enforcement
+ * falls back to the per-scan / auto-index path (already index-collation-correct).
+ */
+describe('row-time covering enforcement — index-derived collation gate', () => {
+	let db: Database;
+	afterEach(async () => { if (db) await db.close(); });
+
+	async function selectAll(sql: string): Promise<Record<string, unknown>[]> {
+		const rows: Record<string, unknown>[] = [];
+		for await (const row of db.eval(sql)) rows.push(row);
+		return rows;
+	}
+
+	async function expectThrows(fn: () => Promise<unknown>, substr: string): Promise<void> {
+		let err: unknown;
+		try { await fn(); } catch (e) { err = e; }
+		expect(err, `expected an error containing "${substr}"`).to.not.be.undefined;
+		expect(String((err as Error).message)).to.contain(substr);
+	}
+
+	/** Resolve the (first) UNIQUE constraint on `table` and the covering-structure verdict. */
+	function coveringFor(table: string): MaintainedTableSchema | undefined {
+		const uc = db.schemaManager.getTable('main', table)!.uniqueConstraints![0];
+		return db._findRowTimeCoveringStructure('main', table, uc);
+	}
+
+	// ── Premise check (the gate is load-bearing, not mere defense-in-depth) ──
+	// The covering-link prover's collation gate compares the OUTPUT column collation
+	// against the DECLARED base-column collation, NOT the index collation, so it DOES
+	// link a coarser-index covering MV. Without the eligibility gate that link would be
+	// resolved and the declared-collation candidate set would silently miss conflicts.
+	it('premise: a coarser-index covering MV IS linked (so the gate is load-bearing)', async () => {
+		db = new Database();
+		await db.exec('create table cbi (id integer primary key, b text)'); // b BINARY
+		await db.exec('create unique index cbi_b on cbi (b collate NOCASE)'); // coarser index
+		await db.exec('create materialized view cbi_mv as select b, id from cbi order by b');
+		const uc = db.schemaManager.getTable('main', 'cbi')!.uniqueConstraints![0];
+		expect(uc.derivedFromIndex, 'the UNIQUE is index-derived').to.equal('cbi_b');
+		expect(uc.coveringStructureName, 'the prover links the coarser MV (premise of the silent miss)').to.equal('cbi_mv');
+		// …but the gate declines it, so it is NOT enforcement-ready.
+		expect(coveringFor('cbi'), 'the gate declines the coarser-index MV').to.be.undefined;
+	});
+
+	// ── Gate unit tests on _findRowTimeCoveringStructure ──
+
+	it('eligible: FINER index (BINARY) over a NOCASE column → MV used', async () => {
+		db = new Database();
+		await db.exec('create table fai (id integer primary key, b text collate NOCASE)');
+		await db.exec('create unique index fai_b on fai (b collate BINARY)'); // finer index
+		await db.exec('create materialized view fai_mv as select b, id from fai order by b');
+		expect(coveringFor('fai')?.name, 'I=BINARY floor ⇒ eligible').to.equal('fai_mv');
+	});
+
+	it('eligible: EQUAL index collation (NOCASE) over a NOCASE column → MV used', async () => {
+		db = new Database();
+		await db.exec('create table eqi (id integer primary key, b text collate NOCASE)');
+		await db.exec('create unique index eqi_b on eqi (b collate NOCASE)'); // equal
+		await db.exec('create materialized view eqi_mv as select b, id from eqi order by b');
+		expect(coveringFor('eqi')?.name, 'I==D ⇒ eligible').to.equal('eqi_mv');
+	});
+
+	it('eligible: NON-derived UNIQUE over a NOCASE column → MV used', async () => {
+		db = new Database();
+		await db.exec('create table ndu (id integer primary key, b text collate NOCASE, unique (b))');
+		await db.exec('create materialized view ndu_mv as select b, id from ndu order by b');
+		const uc = db.schemaManager.getTable('main', 'ndu')!.uniqueConstraints![0];
+		expect(uc.derivedFromIndex, 'non-derived UNIQUE').to.be.undefined;
+		expect(coveringFor('ndu')?.name, 'non-derived ⇒ I==D ⇒ eligible').to.equal('ndu_mv');
+	});
+
+	it('declined: COARSER index (NOCASE) over a BINARY column → MV not used', async () => {
+		db = new Database();
+		await db.exec('create table cbi (id integer primary key, b text)'); // b BINARY
+		await db.exec('create unique index cbi_b on cbi (b collate NOCASE)'); // coarser index
+		await db.exec('create materialized view cbi_mv as select b, id from cbi order by b');
+		expect(coveringFor('cbi'), 'I=NOCASE, D=BINARY, I≠BINARY & I≠D ⇒ declined').to.be.undefined;
+	});
+
+	it('declined: RTRIM index over a BINARY column → MV not used', async () => {
+		db = new Database();
+		await db.exec('create table rtb (id integer primary key, b text)'); // b BINARY
+		await db.exec('create unique index rtb_b on rtb (b collate RTRIM)'); // coarser index
+		await db.exec('create materialized view rtb_mv as select b, id from rtb order by b');
+		expect(coveringFor('rtb'), 'I=RTRIM, D=BINARY ⇒ declined').to.be.undefined;
+	});
+
+	it('declined: composite UC whose one member is coarser → whole MV not used', async () => {
+		db = new Database();
+		// a: BINARY index over a NOCASE column (eligible); b: NOCASE index over a BINARY
+		// column (ineligible). The AND-over-columns gate poisons the whole MV.
+		await db.exec('create table comp (id integer primary key, a text collate NOCASE, b text)');
+		await db.exec('create unique index comp_ab on comp (a collate BINARY, b collate NOCASE)');
+		await db.exec('create materialized view comp_mv as select a, b, id from comp order by a, b');
+		const uc = db.schemaManager.getTable('main', 'comp')!.uniqueConstraints![0];
+		expect(uc.coveringStructureName, 'composite covering MV linked').to.equal('comp_mv');
+		expect(coveringFor('comp'), 'one coarser member poisons the whole MV').to.be.undefined;
+	});
+
+	// ── End-to-end memory enforcement through the (declined or kept) covering path ──
+
+	it('finer-index covering MV admits both case-variants (memory re-validates under BINARY)', async () => {
+		// The memory-alignment assertion: pre-Phase-2 checkUniqueViaMaterializedView
+		// re-validated under the declared NOCASE and over-rejected 'bob' after 'Bob'.
+		// After alignment it re-validates under the index BINARY and admits both.
+		db = new Database();
+		await db.exec('create table fai (id integer primary key, b text collate NOCASE)');
+		await db.exec('create unique index fai_b on fai (b collate BINARY)');
+		await db.exec('create materialized view fai_mv as select b, id from fai order by b');
+		expect(coveringFor('fai')?.name, 'finer-index MV stays eligible').to.equal('fai_mv');
+		await db.exec("insert into fai values (1, 'Bob')");
+		await db.exec("insert into fai values (2, 'bob')"); // BINARY-distinct ⇒ admitted via MV path
+		expect(await selectAll('select id, b from fai order by id')).to.deep.equal([
+			{ id: 1, b: 'Bob' }, { id: 2, b: 'bob' },
+		]);
+		// A genuine BINARY duplicate is still rejected (guard against under-matching).
+		await expectThrows(() => db.exec("insert into fai values (3, 'bob')"), 'UNIQUE constraint failed');
+		expect(await selectAll('select count(*) as n from fai')).to.deep.equal([{ n: 2 }]);
+	});
+
+	it('coarser-index covering MV rejects the NOCASE-equal dup via the declined-MV per-scan path', async () => {
+		// The MV is declined (coarser), so enforcement routes to the auto-index
+		// (checkUniqueViaIndex) under the index NOCASE: 'BOB' after 'Bob' collides.
+		db = new Database();
+		await db.exec('create table cbi (id integer primary key, b text)'); // b BINARY
+		await db.exec('create unique index cbi_b on cbi (b collate NOCASE)');
+		await db.exec('create materialized view cbi_mv as select b, id from cbi order by b');
+		await db.exec("insert into cbi values (1, 'Bob')");
+		await expectThrows(() => db.exec("insert into cbi values (2, 'BOB')"), 'UNIQUE constraint failed');
+		expect(await selectAll('select count(*) as n from cbi')).to.deep.equal([{ n: 1 }]);
+		// A genuinely different value still inserts.
+		await db.exec("insert into cbi values (3, 'Carol')");
+		expect(await selectAll('select id, b from cbi order by id')).to.deep.equal([
+			{ id: 1, b: 'Bob' }, { id: 3, b: 'Carol' },
+		]);
+	});
+});
+
+/**
  * Internal-eviction reporting (`internal-eviction-reporting`) — a secondary-UNIQUE
  * REPLACE eviction (a new row collides on a NON-PK UNIQUE with an existing row at a
  * DIFFERENT primary key) is surfaced via `UpdateResult.evictedRows`, so the DML
