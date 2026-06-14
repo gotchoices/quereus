@@ -22,7 +22,7 @@ import type * as AST from "../../parser/ast.js";
 import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
-import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, surfacedInnerFlagNames } from "../../planner/mutation/set-op.js";
+import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, surfacedInnerFlagNames, isSetOpFlaglessWritableBody, flaglessDiscriminatorColumnNames } from "../../planner/mutation/set-op.js";
 import { type ViewSchema, bodyDefaults } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -790,6 +790,19 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 
+	// Flag-less predicate-honest set-op body (`set-op-flagless-predicate-honest-writes`): a
+	// flag-less body of literal-discriminator legs is insertable (routed to the consistent
+	// legs), updatable (data-column fan-out; the literal discriminators are read-only), and
+	// deletable (fan-out) — agreeing with the dynamic `buildFlaglessSetOpWrite` truth. The
+	// recognizer is the static shadow of the dynamic write's shape acceptance (it admits
+	// literal projections, unlike the membership probe), so a body it rejects (outer
+	// LIMIT/OFFSET, `select *` / computed leg, deep intersect/except) falls through to the
+	// `targetIds.size === 0` conservative row below.
+	if (isSetOpFlaglessWritableBody(view.selectAst)) {
+		const targets = [...new Set([...buildTableRefsById(nodes).values()].map(r => r.tableSchema.name))].sort();
+		return { isInsertableInto: true, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
+	}
+
 	// Non-decomposable join shape gate: cross / comma (implicit) / subquery- or
 	// function-source join bodies are not write-through-able, so they must report the
 	// conservative all-`NO` row. `propagate()` decomposes an n-way (≥2) equi-join —
@@ -1207,6 +1220,26 @@ function deriveBodyColumnRows(
 			cid: i,
 			columnName: columnNames?.[i] ?? attr.name,
 			isUpdatable: !innerFlags.has(attr.name.toLowerCase()),
+			baseTable: null,
+			baseColumn: null,
+		}));
+	}
+
+	// Flag-less predicate-honest set-op body (`set-op-flagless-predicate-honest-writes`):
+	// a plain (writable) data column reports `is_updatable = YES` (its data-column fan-out
+	// writes the base column through every consistent leg); a literal **discriminator**
+	// column reports `NO` (read-only — it routes rows and has no base inverse, surfacing
+	// `no-inverse` on the dynamic write). Both with null base (no single base column). Gated
+	// on the same shape recognizer as `deriveViewInfo`, so the static and dynamic answers
+	// cannot drift.
+	if (isSetOpFlaglessWritableBody(selectAst)) {
+		const discriminators = new Set(flaglessDiscriminatorColumnNames(selectAst).map(n => n.toLowerCase()));
+		return root.getAttributes().map((attr, i): ColumnInfoRow => ({
+			schema: schemaName,
+			objectName,
+			cid: i,
+			columnName: columnNames?.[i] ?? attr.name,
+			isUpdatable: !discriminators.has(attr.name.toLowerCase()),
 			baseTable: null,
 			baseColumn: null,
 		}));

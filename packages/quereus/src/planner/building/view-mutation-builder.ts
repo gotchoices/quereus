@@ -7,7 +7,7 @@ import { ViewMutationNode } from '../nodes/view-mutation-node.js';
 import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, type MutationRequest } from '../mutation/propagate.js';
 import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as decomposeDecompositionUpdate, buildDecompositionKeyCapture, type DecompInsertOp, type DecompShape, type CapturedDecompValue } from '../mutation/decomposition.js';
-import { isSetOpMembershipBody, buildSetOpWrite } from '../mutation/set-op.js';
+import { isSetOpMembershipBody, isSetOpFlaglessWritableBody, buildSetOpWrite, buildFlaglessSetOpWrite, type SetOpWritePlan } from '../mutation/set-op.js';
 import { buildCteSelfCapture } from '../mutation/single-source.js';
 import { needsSelfCapture } from './dml-target.js';
 import { FilterNode } from '../nodes/filter.js';
@@ -94,10 +94,22 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// on the runtime membership probe needs a plan-level capture (the affected rows +
 	// their probe flags, materialized once before any branch op fires — Halloween-safe),
 	// which the AST `BaseOp[]` model cannot express. Build it directly (the dual of the
-	// multi-source insert), for insert / update / delete alike. A plain (flag-less)
-	// set-op body is NOT this case — it keeps rejecting `unsupported-set-op` downstream.
+	// multi-source insert), for insert / update / delete alike.
 	if (isSetOpMembershipBody(view.selectAst)) {
-		return buildSetOpMutation(ctx, view, req);
+		return buildSetOpMutation(ctx, view, req, buildSetOpWrite);
+	}
+
+	// Flag-less predicate-honest set-op write (`set-op-flagless-predicate-honest-writes`): the
+	// *preferred* surface over the `exists`-membership path above — a flag-less body of
+	// literal-discriminator legs (`'red' as kind`) routed by a plan-time σ + discriminator
+	// oracle. It rides the SAME capture + per-branch `propagate` + fan substrate (shared via
+	// `buildSetOpMutation`), differing only in the per-leg write builder. A non-writable
+	// flag-less shape is NOT this case — it keeps rejecting `unsupported-set-op` downstream.
+	// Gated to a real view/MV (`!view.ephemeral`): an ephemeral CTE-body / inline-subquery
+	// target with a flag-less set-op body keeps its established phase-1 reject this pass
+	// (a CTE-target flag-less write — self-reference / Halloween interplay — is out of scope).
+	if (!view.ephemeral && isSetOpFlaglessWritableBody(view.selectAst)) {
+		return buildSetOpMutation(ctx, view, req, buildFlaglessSetOpWrite);
 	}
 
 	// Lens set-level conflict-resolution gate: a commit-time set-level key (no basis
@@ -509,20 +521,27 @@ function rejectLensSetLevelConflictResolution(ctx: PlanningContext, view: Mutabl
 }
 
 /**
- * Build the set-operation membership-write substrate (docs/view-updateability.md
- * § Set Operations) — the first set-op view writability in the engine.
+ * Build the set-operation write substrate (docs/view-updateability.md § Set Operations) —
+ * the shared core for BOTH set-op view writabilities, parameterized by `writeFn`: the
+ * `exists`-membership decomposition ({@link buildSetOpWrite}) or the flag-less
+ * predicate-honest one ({@link buildFlaglessSetOpWrite}).
  *
- * `buildSetOpWrite` (planner/mutation/set-op.ts) decomposes the write into the ordered
- * per-branch base ops (each lowered through `propagate` against a synthetic branch
- * view-like, so the branch's own spine handles its base routing) plus the up-front
- * affected-row capture they read. We wire the capture through the SAME `identityCapture`
- * side input + context-backed `__vmupd_keys` relation the multi-source path uses (so the
- * branch ops' `exists (… from __vmupd_keys …)` resolves), and sequence the base ops in a
- * void `ViewMutationNode` (no RETURNING through a set-op write in v1). Insert-through
- * carries no capture (its values are self-contained), so no key ref is injected there.
+ * `writeFn` decomposes the write into the ordered per-branch base ops (each lowered through
+ * `propagate` against a synthetic branch view-like, so the branch's own spine handles its
+ * base routing) plus the up-front affected-row capture they read. We wire the capture
+ * through the SAME `identityCapture` side input + context-backed `__vmupd_keys` relation the
+ * multi-source path uses (so the branch ops' `exists (… from __vmupd_keys …)` resolves), and
+ * sequence the base ops in a void `ViewMutationNode` (no RETURNING through a set-op write in
+ * v1). Insert-through carries no capture (its values are self-contained), so no key ref is
+ * injected there.
  */
-function buildSetOpMutation(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): PlanNode {
-	const { baseOps, capture } = buildSetOpWrite(ctx, view, req);
+function buildSetOpMutation(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	req: MutationRequest,
+	writeFn: (ctx: PlanningContext, view: MutableViewLike, req: MutationRequest) => SetOpWritePlan,
+): PlanNode {
+	const { baseOps, capture } = writeFn(ctx, view, req);
 	// Each probe-driven branch op reads the capture back through `__vmupd_keys`; inject a
 	// fresh context-backed key ref (sharing the one capture descriptor) per op, exactly as
 	// the multi-source update/delete path does. Insert-through has no capture ⇒ no injection.

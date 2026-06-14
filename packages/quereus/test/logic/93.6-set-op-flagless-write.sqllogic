@@ -1,0 +1,203 @@
+-- 93.6-set-op-flagless-write.sqllogic
+-- Flag-less predicate-honest set-op writes (`set-op-flagless-predicate-honest-writes`):
+-- a flag-less `union all` of literal-discriminator legs (`'red' as kind`) is writable via a
+-- plan-time σ + literal-discriminator branch oracle (`checkSatisfiability`). The literal
+-- discriminators are READ-ONLY; the plain base columns round-trip through the branch spine.
+-- See docs/view-updateability.md § Set Operations and docs/sql.md.
+
+-- ===================================================================
+-- Schema: a 4-leg flag-less union all. `kind` (red/large) and `src` (A/B) are literal
+-- discriminators; `id` / `x` are plain (writable) base columns.
+-- ===================================================================
+-- (`color` / `size` are nullable so a leg's omitted base column defaults to null when its
+-- sibling σ does not pin it — this engine defaults columns to NOT NULL.)
+create table items_a (id integer primary key, x integer, color text null, size text null);
+create table items_b (id integer primary key, x integer, color text null, size text null);
+insert into items_a values (1,10,'red','small'),(2,20,'blue','large');
+insert into items_b values (3,30,'red','small'),(4,40,'blue','large');
+
+create view U as
+  select id, x, 'red' as kind, 'A' as src from items_a where color = 'red'
+  union all
+  select id, x, 'red' as kind, 'B' as src from items_b where color = 'red'
+  union all
+  select id, x, 'large' as kind, 'A' as src from items_a where size = 'large'
+  union all
+  select id, x, 'large' as kind, 'B' as src from items_b where size = 'large';
+
+select * from U order by id;
+→ [{"id":1,"x":10,"kind":"red","src":"A"},{"id":2,"x":20,"kind":"large","src":"A"},{"id":3,"x":30,"kind":"red","src":"B"},{"id":4,"x":40,"kind":"large","src":"B"}]
+
+-- --- static surfaces: writable shape, discriminators read-only ---
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('U');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"items_a\",\"items_b\"]"}]
+
+select cid, column_name, is_updatable, base_table, base_column from column_info('U');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"column_name":"kind","is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- ===================================================================
+-- INSERT routing: the literal discriminators select exactly one leg; the other three are
+-- provably inconsistent (`unsat`) and skipped. Omitted base columns recover via the leg σ.
+-- ===================================================================
+-- (5,50,'red','B') → only the `items_b where color='red'` leg.
+insert into U (id, x, kind, src) values (5, 50, 'red', 'B');
+select id, x, color, size from items_b order by id;
+→ [{"id":3,"x":30,"color":"red","size":"small"},{"id":4,"x":40,"color":"blue","size":"large"},{"id":5,"x":50,"color":"red","size":null}]
+-- items_a untouched (the two `src='A'` / `kind='large'` legs were skipped).
+select id from items_a order by id;
+→ [{"id":1},{"id":2}]
+select * from U where id = 5;
+→ [{"id":5,"x":50,"kind":"red","src":"B"}]
+
+-- (6,60,'large','A') → only the `items_a where size='large'` leg; σ recovers `size='large'`.
+insert into U (id, x, kind, src) values (6, 60, 'large', 'A');
+select id, color, size from items_a where id = 6;
+→ [{"id":6,"color":null,"size":"large"}]
+select * from U where id = 6;
+→ [{"id":6,"x":60,"kind":"large","src":"A"}]
+
+-- ===================================================================
+-- DELETE fan-out: `kind='large'` fans to BOTH `size='large'` legs (items_a + items_b); the
+-- two `kind='red'` legs are provably inconsistent and skipped.
+-- ===================================================================
+delete from U where kind = 'large';
+select id from items_a order by id;
+→ [{"id":1}]
+select id from items_b order by id;
+→ [{"id":3},{"id":5}]
+
+-- ===================================================================
+-- data-UPDATE fan-out + discriminator read-only rejection (fresh tables).
+-- ===================================================================
+create table ua (id integer primary key, x integer, color text null, size text null);
+create table ub (id integer primary key, x integer, color text null, size text null);
+insert into ua values (1,10,'red','small'),(2,20,'blue','large');
+insert into ub values (3,30,'red','small'),(4,40,'blue','large');
+create view U4 as
+  select id, x, 'red' as kind, 'A' as src from ua where color = 'red'
+  union all
+  select id, x, 'red' as kind, 'B' as src from ub where color = 'red'
+  union all
+  select id, x, 'large' as kind, 'A' as src from ua where size = 'large'
+  union all
+  select id, x, 'large' as kind, 'B' as src from ub where size = 'large';
+
+-- `src='A'` fans to the two items_a-based legs (red + large) only.
+update U4 set x = x + 1 where src = 'A';
+select id, x from ua order by id;
+→ [{"id":1,"x":11},{"id":2,"x":21}]
+select id, x from ub order by id;
+→ [{"id":3,"x":30},{"id":4,"x":40}]
+
+-- A literal discriminator is read-only (no base inverse) — NOT silently routed.
+update U4 set kind = 'large' where id = 1;
+-- error: read-only
+
+update U4 set src = 'B' where id = 1;
+-- error: read-only
+
+-- An unknown column is a clean reject.
+update U4 set bogus = 1 where id = 1;
+-- error: not a column
+
+-- ===================================================================
+-- Rejected boundaries: SELECT-source insert (v1 VALUES only) + RETURNING.
+-- ===================================================================
+insert into U4 (id, x, kind, src) select id, x, 'red', 'A' from ua;
+-- error: VALUES source
+
+delete from U4 where id = 1 returning id;
+-- error: RETURNING
+
+-- ===================================================================
+-- σ-consistency oracle: a provably-inconsistent leg is skipped; the checker never emits a
+-- false `unsat`, so a real target leg is never dropped.
+-- ===================================================================
+create table sa (id integer primary key, x integer, color text null);
+create table sb (id integer primary key, x integer, color text null);
+insert into sa values (1,10,'red'),(2,20,'red');
+insert into sb values (3,30,'green'),(4,40,'green');
+create view U6 as
+  select id, x, 'lit' as tag from sa where color = 'red'
+  union all
+  select id, x, 'fn' as tag from sb where length(color) > 2;
+
+select * from U6 order by id;
+→ [{"id":1,"x":10,"tag":"lit"},{"id":2,"x":20,"tag":"lit"},{"id":3,"x":30,"tag":"fn"},{"id":4,"x":40,"tag":"fn"}]
+
+-- `tag='lit'` is provably inconsistent with the `'fn'` leg → that leg is skipped (sb intact),
+-- even though its σ (`length(color) > 2`) is undecidable to the checker.
+delete from U6 where tag = 'lit';
+select id from sa order by id;
+→ []
+select id from sb order by id;
+→ [{"id":3},{"id":4}]
+
+-- Honest fan-out: an UNDECIDABLE predicate (`tag like 'f%'`) is included on BOTH legs (no
+-- false `unsat`), and the member-exists correlation self-restricts the no-op leg — the `fn`
+-- leg's rows go, the `lit` leg's stay (its discriminator never matches the captured `fn` rows).
+create table la (id integer primary key, x integer, color text null);
+create table lb (id integer primary key, x integer, color text null);
+insert into la values (1,10,'red'),(2,20,'red');
+insert into lb values (3,30,'green'),(4,40,'green');
+create view U7 as
+  select id, x, 'lit' as tag from la where color = 'red'
+  union all
+  select id, x, 'fn' as tag from lb where length(color) > 2;
+delete from U7 where tag like 'f%';
+select id from la order by id;
+→ [{"id":1},{"id":2}]
+select id from lb order by id;
+→ []
+
+-- ===================================================================
+-- `intersect` semantics: insert fans to EVERY leg (a row must be in all to be visible);
+-- delete fans to every leg by default.
+-- ===================================================================
+create table ia (id integer primary key, v integer);
+create table ib (id integer primary key, v integer);
+insert into ia values (1,10),(2,20);
+insert into ib values (2,20),(3,30);
+create view IV as select id, v from ia intersect select id, v from ib;
+select * from IV order by id;
+→ [{"id":2,"v":20}]
+
+insert into IV (id, v) values (5, 50);
+select id from ia order by id;
+→ [{"id":1},{"id":2},{"id":5}]
+select id from ib order by id;
+→ [{"id":2},{"id":3},{"id":5}]
+select * from IV order by id;
+→ [{"id":2,"v":20},{"id":5,"v":50}]
+
+delete from IV where id = 2;
+select id from ia order by id;
+→ [{"id":1},{"id":5}]
+select id from ib order by id;
+→ [{"id":3},{"id":5}]
+
+-- ===================================================================
+-- `except` (A except B) semantics: insert into the LEFT operand only; delete from the LEFT
+-- operand only (so the row leaves the difference).
+-- ===================================================================
+create table ea (id integer primary key, v integer);
+create table eb (id integer primary key, v integer);
+insert into ea values (1,10),(2,20);
+insert into eb values (2,20);
+create view EV as select id, v from ea except select id, v from eb;
+select * from EV order by id;
+→ [{"id":1,"v":10}]
+
+insert into EV (id, v) values (3, 30);
+select id from ea order by id;
+→ [{"id":1},{"id":2},{"id":3}]
+select id from eb order by id;
+→ [{"id":2}]
+select * from EV order by id;
+→ [{"id":1,"v":10},{"id":3,"v":30}]
+
+delete from EV where id = 1;
+select id from ea order by id;
+→ [{"id":2},{"id":3}]
+select id from eb order by id;
+→ [{"id":2}]

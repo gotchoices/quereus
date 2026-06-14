@@ -2,7 +2,10 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import type { Scope } from '../scopes/scope.js';
 import type { ScalarType } from '../../common/datatype.js';
-import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js';
+import type { SqlValue } from '../../common/types.js';
+import { isRelationalNode, type RelationalPlanNode, type ScalarPlanNode, type ConstantBinding, type DomainConstraint } from '../nodes/plan-node.js';
+import { checkSatisfiability, type SatResult } from '../analysis/sat-checker.js';
+import { splitConjuncts } from '../analysis/predicate-conjuncts.js';
 import { SetOperationNode } from '../nodes/set-operation-node.js';
 import { buildSelectStmt } from '../building/select.js';
 import { buildExpression } from '../building/expression.js';
@@ -1218,4 +1221,473 @@ function rejectReturning(view: MutableViewLike, returning: AST.ResultColumn[] | 
 			message: `cannot write through view '${view.name}': RETURNING is not yet supported on a set-operation membership write (the per-branch fan-out yields no single recoverable view row)`,
 		});
 	}
+}
+
+// ===========================================================================
+// Flag-less predicate-honest set-op writes (`set-op-flagless-predicate-honest-writes`)
+// ===========================================================================
+//
+// The **preferred** write surface over the `exists`-membership path above: a flag-less
+// set-op body whose legs carry *regular projected columns* — plain base columns plus
+// literal **discriminators** (`'red' as kind`) — is writable for INSERT (routed to the
+// consistent legs), DELETE / data-UPDATE (fanned to the consistent legs), with the
+// literal discriminators **read-only** (a `set kind = …` surfaces `no-inverse`).
+//
+// It reuses the membership substrate verbatim — the up-front Halloween-safe capture
+// ({@link buildSetOpCapture}), the per-branch recursive {@link propagate} lowering, the
+// member-exists correlation ({@link buildMemberExists}), and the fan helpers
+// ({@link fanBranchDelete} / {@link fanBranchDataUpdate}). The ONE difference is the
+// per-leg branch oracle: instead of a runtime membership-probe flag, a leg's eligibility
+// is decided at PLAN time by {@link checkSatisfiability} over (the leg's σ-derived facts
+// ∧ its literal-discriminator bindings ∧ the mutation's predicate) — `unsat ⇒ skip the
+// leg`, `sat / unknown ⇒ include it` (honest fan-out over silent suppression; the checker
+// never emits a false `unsat`).
+//
+// **Option B (localized FD-gap closure).** A projected literal does NOT emit a constant
+// FD today (`ProjectNode.computePhysical` only *forwards* the child's bindings through the
+// source→output map, and a pure literal has no source attribute), so the routing
+// discriminator does not fall out of the FD framework for free. Rather than enhance the
+// hot physical path (Option A), the per-leg oracle reads the leg AST's literal projections
+// directly and synthesizes the discriminator `ConstantBinding`s itself, feeding them to the
+// checker alongside the leg's *planned* physical bindings (which DO carry the σ-on-projected
+// constant, e.g. `where color='red'` forwarded to a `color`-projecting output column — the
+// pre-existing half) and the mutation predicate. No physical-path change.
+
+/**
+ * The write classification of one leg result column: a writable plain (optionally
+ * renamed) base-column projection, a read-only literal **discriminator** (a literal —
+ * peeling Cast/Collate, the regular-projected-column routing idiom), or `null` when the
+ * column is a `select *` / computed projection that makes the leg non-writable.
+ */
+type LegColumnKind =
+	| { readonly kind: 'column'; readonly name: string }
+	| { readonly kind: 'literal'; readonly value: SqlValue }
+	| null;
+
+/** Peel Cast/Collate wrappers to expose an underlying AST literal value, else `undefined`. */
+function peelToLiteral(expr: AST.Expression): SqlValue | undefined {
+	let e = expr;
+	while (e.type === 'cast' || e.type === 'collate') e = e.expr;
+	if (e.type !== 'literal') return undefined;
+	const v = e.value;
+	if (v instanceof Promise) return undefined;
+	return v;
+}
+
+/** Classify one leg result column (the shadow of {@link tryBranchColumnNames}, admitting literals). */
+function legColumnKind(rc: AST.ResultColumn): LegColumnKind {
+	if (rc.type === 'all') return null;
+	if (rc.expr.type === 'column') return { kind: 'column', name: rc.alias ?? rc.expr.name };
+	const lit = peelToLiteral(rc.expr);
+	if (lit !== undefined) return { kind: 'literal', value: lit };
+	return null; // a computed (non-literal) projection — not a writable / discriminator shape
+}
+
+/** The supported flag-less writable shape: a uniform union-like chain, or a binary intersect/except. */
+interface FlaglessShape {
+	readonly op: 'union' | 'unionAll' | 'intersect' | 'except';
+	/** Each leg as a leaf SELECT (no compound), in plan-layout order (left-most first). */
+	readonly legSelects: readonly AST.SelectStmt[];
+}
+
+/** Strip a leg's own ORDER BY / LIMIT / OFFSET (those belong to the outer compound), keeping `compound`. */
+function stripLegModifiers(sel: AST.SelectStmt): AST.SelectStmt {
+	const { orderBy: _o, limit: _l, offset: _f, ...core } = sel;
+	return core as AST.SelectStmt;
+}
+
+/** True iff a leg projects ≥1 literal discriminator (a routing constant). */
+function hasLiteralDiscriminator(leaf: AST.SelectStmt): boolean {
+	return leaf.columns.some(rc => legColumnKind(rc)?.kind === 'literal');
+}
+
+/** True iff a leaf SELECT is a writable flag-less leg: no compound, ≥1 plain/literal column, all admitted. */
+function isWritableLeafLeg(leaf: AST.SelectStmt): boolean {
+	if (leaf.compound) return false;
+	if (!leaf.columns || leaf.columns.length === 0) return false;
+	return leaf.columns.every(rc => legColumnKind(rc) !== null);
+}
+
+/**
+ * The flag-less writable shape of a set-op body, or `null` when it is not one. A pure AST
+ * peek (no plan built), the write-side shadow of {@link isSetOpBranchWritable} that ADMITS
+ * literal discriminators (which `tryBranchColumnNames` rejects). Returns `null` for any
+ * existence flag anywhere (mutual exclusion with {@link isSetOpMembershipBody}), a `diff`
+ * body, a non-SELECT operand, a `select *` / computed leg, or a shape v1 does not flatten:
+ *  - a **union-like** (`union` / `unionAll`) chain of any depth → N flat legs;
+ *  - a **binary** `intersect` / `except` (a single depth-1 compound) → 2 legs;
+ *  - anything else (a deep / mixed intersect/except chain) → `null` (kept on the existing reject).
+ */
+function flaglessShape(sel: AST.SelectStmt): FlaglessShape | null {
+	if (!sel.compound || sel.compound.op === 'diff') return null;
+	if (sel.compound.existence && sel.compound.existence.length > 0) return null;
+	const topOp = sel.compound.op;
+	const legs: AST.SelectStmt[] = [];
+	let cur: AST.SelectStmt = sel;
+	for (;;) {
+		const leftLeg = unwrapBranchSelect(leftBranchSelect(cur));
+		if (!isWritableLeafLeg(leftLeg)) return null;
+		legs.push(leftLeg);
+		const right = cur.compound!.select;
+		if (right.type !== 'select') return null;
+		const rightEff = unwrapBranchSelect(stripLegModifiers(right));
+		if (!rightEff.compound) {
+			if (!isWritableLeafLeg(rightEff)) return null;
+			legs.push(rightEff);
+			// A union / union all needs ≥1 literal discriminator to route an insert honestly —
+			// without one every leg is consistent with every row, so the routing is ambiguous
+			// (the flag-less analog of the membership path's "a flag-less multi-branch insert is
+			// ambiguous"). Such a body stays on the existing phase-1 reject. `intersect` / `except`
+			// route by the OPERATOR (every leg / the left operand), so they need no discriminator.
+			if (isUnionLikeSubtree(topOp) && !legs.some(hasLiteralDiscriminator)) return null;
+			return { op: topOp, legSelects: legs };
+		}
+		// The chain continues: only a uniform union-like chain may descend past depth 1; an
+		// intersect / except is supported only as a single binary compound (its associativity
+		// matters and is deferred for chains).
+		if (rightEff.compound.op !== topOp || !isUnionLikeSubtree(topOp)) return null;
+		if (rightEff.compound.existence && rightEff.compound.existence.length > 0) return null;
+		cur = rightEff;
+	}
+}
+
+/**
+ * True iff `selectAst` is a flag-less set-op body writable through predicate-honest branch
+ * dispatch (`set-op-flagless-predicate-honest-writes`). Mutually exclusive with
+ * {@link isSetOpMembershipBody} (any `exists … as <flag>` takes the membership path); a
+ * non-decomposable shape (outer LIMIT/OFFSET, `select *` / computed leg, deep intersect/except)
+ * returns `false` and keeps rejecting `unsupported-set-op` through the single-source spine.
+ */
+export function isSetOpFlaglessWritableBody(selectAst: AST.QueryExpr): boolean {
+	if (selectAst.type !== 'select' || !selectAst.compound) return false;
+	if (selectAst.limit || selectAst.offset) return false;
+	return flaglessShape(selectAst) !== null;
+}
+
+/**
+ * The flag-less view's **discriminator** column names — every data column projected as a
+ * literal in ANY leg (read-only, `no-inverse` on UPDATE). The view's column names come from
+ * the left-most leg (a set op takes its left child's names); a position is a discriminator
+ * iff some leg pins it with a literal projection. Used by the `column_info` static surface
+ * to report the discriminator `is_updatable = NO` (data / plain columns report YES).
+ */
+export function flaglessDiscriminatorColumnNames(selectAst: AST.QueryExpr): string[] {
+	if (selectAst.type !== 'select') return [];
+	const shape = flaglessShape(selectAst);
+	if (!shape) return [];
+	const first = shape.legSelects[0];
+	const out: string[] = [];
+	for (let i = 0; i < first.columns.length; i++) {
+		const anyLiteral = shape.legSelects.some(leg => legColumnKind(leg.columns[i])?.kind === 'literal');
+		if (!anyLiteral) continue;
+		const rc = first.columns[i];
+		const name = rc.type === 'column' ? (rc.alias ?? (rc.expr.type === 'column' ? rc.expr.name : undefined)) : undefined;
+		if (name) out.push(name);
+	}
+	return out;
+}
+
+/** One leg of a flag-less writable set-op body, with its plan-time routing oracle inputs. */
+interface FlaglessLeg {
+	/** The branch view-like + data-column names, reused with the membership fan helpers. */
+	readonly branch: SetOpBranch;
+	/** Data-column positions projecting a plain (writable) base column. */
+	readonly plainPositions: readonly number[];
+	/** Data-column positions projecting a literal discriminator (read-only). */
+	readonly discriminatorPositions: readonly number[];
+	/** A scope resolving each view data-column name to this leg's planned output attribute. */
+	readonly scope: Scope;
+	/** The leg's σ-forwarded physical bindings ++ the synthesized literal-discriminator bindings. */
+	readonly bindings: readonly ConstantBinding[];
+	/** The leg's planned physical domain constraints. */
+	readonly domains: readonly DomainConstraint[];
+	/** Maps a predicate `ColumnReferenceNode.attributeId` to this leg's output column index. */
+	readonly attrIndex: (attrId: number) => number | undefined;
+	/** The declared collation of this leg's output column `col`, for the checker. */
+	readonly getCollation: (col: number) => string | undefined;
+}
+
+/** Decompose a flag-less set-op view mutation. Throws a structured diagnostic for unsupported shapes. */
+export function buildFlaglessSetOpWrite(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): SetOpWritePlan {
+	const { analysis, legs } = analyzeFlaglessSetOpView(ctx, view);
+	switch (req.op) {
+		case 'insert': return buildFlaglessInsert(ctx, view, analysis, legs, req.stmt);
+		case 'update': return buildFlaglessUpdate(ctx, view, analysis, legs, req.stmt);
+		case 'delete': return buildFlaglessDelete(ctx, view, analysis, legs, req.stmt);
+	}
+}
+
+function analyzeFlaglessSetOpView(ctx: PlanningContext, view: MutableViewLike): { analysis: SetOpAnalysis; legs: FlaglessLeg[] } {
+	if (view.selectAst.type !== 'select' || !view.selectAst.compound) {
+		raiseMutationDiagnostic({ reason: 'unsupported-set-op', table: view.name, message: `cannot write through view '${view.name}': not a set-operation body` });
+	}
+	const sel = view.selectAst;
+	const shape = flaglessShape(sel);
+	if (!shape) {
+		raiseMutationDiagnostic({ reason: 'unsupported-set-op', table: view.name, message: `cannot write through view '${view.name}': not a flag-less predicate-honest writable set-operation body` });
+	}
+
+	// Plan the body ONCE: a flag-less body has no flag columns, so the root attributes ARE
+	// the view's data columns (positionally aligned to every leg's projection).
+	const root = buildSelectStmt(ctx, sel);
+	if (!isRelationalNode(root)) {
+		raiseMutationDiagnostic({ reason: 'no-base-lineage', table: view.name, message: `cannot write through view '${view.name}': the set-operation body did not produce a relation` });
+	}
+	const relRoot = root as RelationalPlanNode;
+	const setOpNode = findSetOpNode(relRoot);
+	if (!setOpNode) {
+		raiseMutationDiagnostic({ reason: 'no-base-lineage', table: view.name, message: `cannot write through view '${view.name}': the set-operation body produced no SetOperationNode` });
+	}
+	const dataColCount = setOpNode.dataColumnCount();
+	const attrs = relRoot.getAttributes();
+	const dataColNames = attrs.map(a => a.name);
+	const dataColTypes = attrs.map(a => a.type);
+
+	// A scope resolving each view data-column name to its producing attribute over the planned
+	// root — reused by `buildSetOpCapture` for the user-predicate / capture projections.
+	const viewColScope = new RegisteredScope(ctx.scope);
+	attrs.forEach((attr, i) => {
+		viewColScope.registerSymbol(attr.name.toLowerCase(), (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
+	});
+
+	const legs = shape.legSelects.map((legSel, i) => buildFlaglessLeg(ctx, view, legSel, i, dataColNames));
+	// A `SetOpAnalysis`-shaped carrier so the membership fan helpers / capture builder are
+	// reused verbatim. `branches` is a 2-tuple by type; the flag-less fan iterates `legs`
+	// (which may be > 2) and never reads `branches`, so the first two legs satisfy the type.
+	const branches: [SetOpBranch, SetOpBranch] = [legs[0].branch, legs[1].branch];
+	const analysis: SetOpAnalysis = {
+		op: shape.op, root: relRoot, viewColScope,
+		viewColNames: dataColNames, viewColTypes: dataColTypes,
+		dataColCount, dataColNames, surfacedInnerFlagNames: [], flags: [], branches,
+	};
+	return { analysis, legs };
+}
+
+/**
+ * Build one flag-less leg: a synthetic branch view-like (its columns re-aliased to the view
+ * data-column names so the member-exists correlation and the base ops align positionally),
+ * plus the plan-time routing oracle inputs (the leg's planned σ-forwarded bindings + the
+ * synthesized literal-discriminator bindings).
+ */
+function buildFlaglessLeg(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	legSel: AST.SelectStmt,
+	index: number,
+	dataColNames: readonly string[],
+): FlaglessLeg {
+	const dataColCount = dataColNames.length;
+	const kinds = legSel.columns.map(legColumnKind);
+	if (kinds.length !== dataColCount || kinds.some(k => k === null)) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op', table: view.name,
+			message: `cannot write through view '${view.name}': a leg projects ${kinds.length} columns (expected ${dataColCount}) or a non-writable (\`select *\` / computed) column`,
+		});
+	}
+
+	// Re-alias every leg column to the view data-column name at its position, so the synthetic
+	// branch view exposes exactly the view's data columns (a plain base column round-trips
+	// through `propagate`; a literal discriminator resolves to its constant). This makes the
+	// member-exists `b.<col>` references and the base ops align regardless of the leg's own
+	// aliases / base-column names.
+	const aliasedColumns: AST.ResultColumn[] = legSel.columns.map((rc, i) => ({
+		type: 'column', expr: (rc as AST.ResultColumnExpr).expr, alias: dataColNames[i],
+	}));
+	const effectiveSelect: AST.SelectStmt = { ...legSel, columns: aliasedColumns };
+	const branchView: MutableViewLike = { name: `__setop_leg${index}`, schemaName: view.schemaName, selectAst: effectiveSelect };
+	const branch: SetOpBranch = { side: index === 0 ? 'left' : 'right', view: branchView, dataColNames: [...dataColNames], isNested: false };
+
+	const plainPositions = kinds.flatMap((k, i) => k!.kind === 'column' ? [i] : []);
+	const discriminatorPositions = kinds.flatMap((k, i) => k!.kind === 'literal' ? [i] : []);
+
+	// Plan the leg body for the oracle: its output attributes carry the σ-forwarded constant
+	// bindings / domains (the pre-existing half — a `where color='red'` over a `color`-projecting
+	// leg forwards `∅ → color='red'` to the output column). The synthesized discriminator
+	// bindings (Option B) close the projected-literal gap.
+	const planned = buildSelectStmt(ctx, effectiveSelect);
+	if (!isRelationalNode(planned)) {
+		raiseMutationDiagnostic({ reason: 'no-base-lineage', table: view.name, message: `cannot write through view '${view.name}': a leg did not produce a relation` });
+	}
+	const legRoot = planned as RelationalPlanNode;
+	const legAttrs = legRoot.getAttributes();
+	const attrIdToIndex = new Map<number, number>();
+	legAttrs.forEach((a, i) => attrIdToIndex.set(a.id, i));
+	const scope = new RegisteredScope(ctx.scope);
+	legAttrs.forEach((attr, i) => {
+		scope.registerSymbol(dataColNames[i].toLowerCase(), (exp, s) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, attr.type, attr.id, i));
+	});
+
+	const discriminatorBindings: ConstantBinding[] = [];
+	kinds.forEach((k, i) => {
+		if (k!.kind === 'literal' && k!.value !== null) {
+			discriminatorBindings.push({ attrs: [i], value: { kind: 'literal', value: k!.value } });
+		}
+	});
+	const physical = legRoot.physical;
+	const bindings: ConstantBinding[] = [...(physical.constantBindings ?? []), ...discriminatorBindings];
+	const domains = physical.domainConstraints ?? [];
+
+	return {
+		branch, plainPositions, discriminatorPositions, scope, bindings, domains,
+		attrIndex: (attrId) => attrIdToIndex.get(attrId),
+		getCollation: (col) => legAttrs[col]?.type.collationName,
+	};
+}
+
+/**
+ * The per-leg branch oracle (`set-op-flagless-predicate-honest-writes`): is a row satisfying
+ * `predicate` possible in this leg? Feeds the mutation predicate (in view data-column terms,
+ * resolved against the leg's planned attributes) as conjuncts, alongside the leg's σ-forwarded
+ * + literal-discriminator bindings, into {@link checkSatisfiability}. `unsat` ⇒ skip the leg;
+ * `sat` / `unknown` ⇒ include it (the checker never emits a false `unsat`). A `predicate` of
+ * `undefined` (no WHERE / no supplied values) is unconstrained ⇒ `sat`.
+ */
+function legConsistency(ctx: PlanningContext, leg: FlaglessLeg, predicate: AST.Expression | undefined): SatResult {
+	let conjuncts: ScalarPlanNode[] = [];
+	if (predicate) {
+		const node = buildExpression({ ...ctx, scope: leg.scope }, cloneExpr(predicate));
+		conjuncts = splitConjuncts(node);
+	}
+	return checkSatisfiability(conjuncts, leg.domains, leg.bindings, leg.attrIndex, leg.getCollation);
+}
+
+// --- flag-less INSERT (route to the consistent legs) ----------------------
+
+interface FlaglessInsertLayout {
+	/** View data-column position → its index in each VALUES row. Omitted columns are absent. */
+	readonly valueIndexByDataPos: ReadonlyMap<number, number>;
+}
+
+function resolveFlaglessInsertLayout(view: MutableViewLike, analysis: SetOpAnalysis, stmt: AST.InsertStmt): FlaglessInsertLayout {
+	const cols = stmt.columns && stmt.columns.length > 0 ? stmt.columns : analysis.dataColNames;
+	const map = new Map<number, number>();
+	cols.forEach((rawName, vi) => {
+		const pos = analysis.dataColNames.findIndex(n => n.toLowerCase() === rawName.toLowerCase());
+		if (pos < 0) {
+			raiseMutationDiagnostic({
+				reason: 'unknown-view-column', column: rawName, table: view.name,
+				message: `cannot insert through view '${view.name}': '${rawName}' is not a column of the set operation`,
+				suggestion: `view '${view.name}' exposes: ${analysis.dataColNames.join(', ')}.`,
+			});
+		}
+		map.set(pos, vi);
+	});
+	return { valueIndexByDataPos: map };
+}
+
+/** The existence predicate of one VALUES row: `∧ <dataCol> = <suppliedValue>` over the supplied columns. */
+function rowExistencePredicate(analysis: SetOpAnalysis, layout: FlaglessInsertLayout, row: readonly AST.Expression[]): AST.Expression | undefined {
+	let pred: AST.Expression | undefined;
+	for (const [pos, vi] of layout.valueIndexByDataPos) {
+		const eq: AST.Expression = {
+			type: 'binary', operator: '=',
+			left: { type: 'column', name: analysis.dataColNames[pos] } as AST.ColumnExpr,
+			right: row[vi],
+		};
+		pred = pred ? { type: 'binary', operator: 'AND', left: pred, right: eq } : eq;
+	}
+	return pred;
+}
+
+/** The legs a flag-less INSERT routes into by operator: `except` inserts the left operand only. */
+function fanLegsForInsert(op: SetOpAnalysis['op'], legs: readonly FlaglessLeg[]): readonly FlaglessLeg[] {
+	return op === 'except' ? [legs[0]] : legs;
+}
+
+function buildFlaglessInsert(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, legs: readonly FlaglessLeg[], stmt: AST.InsertStmt): SetOpWritePlan {
+	rejectReturning(view, stmt.returning);
+	if (stmt.source.type !== 'values') {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-source', table: view.name,
+			message: `cannot insert through view '${view.name}': a flag-less set-operation insert routes by the supplied discriminator values, so it requires a VALUES source (a SELECT/DML source's per-row routing is deferred)`,
+		});
+	}
+	const values = stmt.source.values;
+	const layout = resolveFlaglessInsertLayout(view, analysis, stmt);
+	const baseOps: BaseOp[] = [];
+	for (const leg of fanLegsForInsert(analysis.op, legs)) {
+		// Per-row routing: a row inserts into this leg unless provably inconsistent with it.
+		const rows = values.filter(row => legConsistency(ctx, leg, rowExistencePredicate(analysis, layout, row)) !== 'unsat');
+		if (rows.length === 0) continue;
+		// Only the leg's PLAIN (writable) columns that are supplied flow into the base insert;
+		// the literal discriminators are determined by the leg projection / σ (omitted base
+		// columns are recovered by the leg's `where`-constant FD insert-defaulting).
+		const supplied = leg.plainPositions.filter(pos => layout.valueIndexByDataPos.has(pos));
+		if (supplied.length === 0) continue; // an all-literal / unsupplied leg has no base row to write
+		const colNames = supplied.map(pos => analysis.dataColNames[pos]);
+		const valueRows = rows.map(row => supplied.map(pos => cloneExpr(row[layout.valueIndexByDataPos.get(pos)!])));
+		const source: AST.SelectStmt | AST.ValuesStmt = { type: 'values', values: valueRows };
+		const insertStmt: AST.InsertStmt = {
+			type: 'insert',
+			table: { type: 'identifier', name: leg.branch.view.name },
+			columns: colNames,
+			source,
+			onConflict: stmt.onConflict,
+			contextValues: stmt.contextValues,
+			schemaPath: stmt.schemaPath,
+			loc: stmt.loc,
+		};
+		baseOps.push(...propagate(ctx, leg.branch.view, { op: 'insert', stmt: insertStmt }));
+	}
+	if (baseOps.length === 0) {
+		raiseMutationDiagnostic({
+			reason: 'unsupported-set-op', table: view.name,
+			message: `cannot insert through view '${view.name}': the supplied values are consistent with no writable leg (the row would belong to no branch)`,
+		});
+	}
+	// Insert-through reads no existing row, so it needs no capture (self-contained values).
+	return { baseOps };
+}
+
+// --- flag-less DELETE / data-UPDATE (fan to the consistent legs) ----------
+
+/** The legs a flag-less DELETE / data-UPDATE fans to: every consistent leg (`except` fans the left only). */
+function fanLegsForFanOut(ctx: PlanningContext, op: SetOpAnalysis['op'], legs: readonly FlaglessLeg[], where: AST.Expression | undefined): FlaglessLeg[] {
+	const consistent = legs.filter(l => legConsistency(ctx, l, where) !== 'unsat');
+	if (op === 'except') return consistent.includes(legs[0]) ? [legs[0]] : [];
+	return consistent;
+}
+
+function buildFlaglessDelete(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, legs: readonly FlaglessLeg[], stmt: AST.DeleteStmt): SetOpWritePlan {
+	rejectReturning(view, stmt.returning);
+	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
+	const baseOps: BaseOp[] = [];
+	for (const leg of fanLegsForFanOut(ctx, analysis.op, legs, stmt.where)) {
+		baseOps.push(...fanBranchDelete(ctx, view, analysis, leg.branch, stmt));
+	}
+	return { baseOps, capture };
+}
+
+function buildFlaglessUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, legs: readonly FlaglessLeg[], stmt: AST.UpdateStmt): SetOpWritePlan {
+	rejectReturning(view, stmt.returning);
+	// A literal discriminator is read-only (it has no base inverse). Reject a write to one
+	// up front with `no-inverse` (Finding 5) — NOT silently routed.
+	const discriminators = new Set<number>();
+	for (const leg of legs) for (const p of leg.discriminatorPositions) discriminators.add(p);
+	const dataAssignments: DataAssignment[] = [];
+	for (const asg of stmt.assignments) {
+		const position = analysis.dataColNames.findIndex(n => n.toLowerCase() === asg.column.toLowerCase());
+		if (position < 0) {
+			raiseMutationDiagnostic({
+				reason: 'unknown-view-column', column: asg.column, table: view.name,
+				message: `cannot write through view '${view.name}': '${asg.column}' is not a column of the set operation`,
+				suggestion: `view '${view.name}' exposes: ${analysis.dataColNames.join(', ')}.`,
+			});
+		}
+		if (discriminators.has(position)) {
+			raiseMutationDiagnostic({
+				reason: 'no-inverse', column: asg.column, table: view.name,
+				message: `cannot write through view '${view.name}': '${asg.column}' is a literal discriminator column (it routes rows to a branch and has no base-column inverse) — it is read-only`,
+			});
+		}
+		dataAssignments.push({ position, value: asg.value });
+	}
+	const capture = buildSetOpCapture(ctx, analysis, stmt.where);
+	const baseOps: BaseOp[] = [];
+	for (const leg of fanLegsForFanOut(ctx, analysis.op, legs, stmt.where)) {
+		baseOps.push(...fanBranchDataUpdate(ctx, view, analysis, leg.branch, dataAssignments, stmt));
+	}
+	return { baseOps, capture };
 }

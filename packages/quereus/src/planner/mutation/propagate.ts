@@ -249,10 +249,13 @@ export function propagate(
 	// `propagate` call on such a body (e.g. a nested set-op branch — `set-op-membership-nested`);
 	// guard it explicitly rather than mis-routing it into the single-source rewrite (which
 	// would reject `unsupported-set-op` with a misleading message). A plain (flag-less)
-	// set-op body is NOT intercepted — it falls through to the single-source spine below
-	// and rejects `unsupported-set-op` as before (no membership column to address a branch).
-	// The AST peek is inlined (not imported from `set-op.ts`) to keep the dependency
-	// one-directional — `set-op.ts` imports `propagate`, never the reverse.
+	// set-op body is NOT intercepted here — a directly-reached *flag-less writable* body is
+	// handled in `view-mutation-builder.ts` (`set-op-flagless-predicate-honest-writes`, gated
+	// to real views); any other flag-less compound (a non-writable shape, or an ephemeral
+	// CTE / inline target) falls through to the single-source spine below and rejects
+	// `unsupported-set-op` via `classifyViewBody`'s established "not updateable in phase 1"
+	// diagnostic, unchanged. The AST peek is inlined (not imported from `set-op.ts`) to keep
+	// the dependency one-directional — `set-op.ts` imports `propagate`, never the reverse.
 	const so = view.selectAst;
 	if (so.type === 'select' && so.compound && so.compound.op !== 'diff'
 		&& so.compound.existence && so.compound.existence.length > 0) {

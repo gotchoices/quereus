@@ -558,9 +558,40 @@ flags report `is_updatable = NO`. The orthogonal **product** model (two siblings
 merging into shared coordinate columns) is the **shelved** `set-op-product-coordinate-model` (backlog):
 projected attributes express the **sum** model (origin tags), not the **merge** (`tuple ∈ <union of
 like-named leaves>`), so the merge ships only on a use case needing writable membership over a non-literal
-σ-guard. The reuse-aligned alternative — a flag-less `union all` of literal-discriminator legs made writable
-by predicate-honest branch dispatch — is `set-op-flagless-predicate-honest-writes` (backlog; needs an
-appetite check, as it partially re-opens the "membership columns replace routing-tag dispatch" decision).
+σ-guard.
+
+**Flag-less predicate-honest writes (the preferred surface, `set-op-flagless-predicate-honest-writes`).**
+A flag-less set-op body whose legs carry *regular projected columns* — plain base columns plus literal
+**discriminators** (`'red' as kind`, `'A' as src`) — is writable WITHOUT any `exists … as <flag>` membership
+column. It is the **preferred** write surface over the `exists`-membership path above (the two coexist; no
+unification this pass), reusing the SAME substrate verbatim: the up-front Halloween-safe capture, the
+per-branch recursive `propagate` lowering, the member-exists correlation, and the data/delete fan helpers
+(shared through `buildSetOpMutation`, parameterized by the per-shape write builder). The ONE difference is
+the **per-leg branch oracle**: instead of a runtime membership-probe flag, a leg's eligibility is decided at
+PLAN time by `checkSatisfiability` (`analysis/sat-checker.ts`) over the leg's σ-derived constant facts ∧ its
+literal-discriminator bindings ∧ the mutation's predicate — `unsat ⇒ skip the leg`, `sat`/`unknown ⇒ include
+it` (honest fan-out over silent suppression; the checker never emits a false `unsat`, so a real target leg is
+never dropped). INSERT routes a VALUES row to every consistent leg (a literal-discriminator design routes to
+exactly one); DELETE / data-UPDATE fan to every consistent leg; `intersect` fans inserts/deletes to every leg
+and `except` writes the left operand only. The literal discriminators are **read-only** — a `set kind = …`
+surfaces `no-inverse` (a projected literal has no base inverse).
+
+The discriminator routing does **not** "fall out of the FD framework for free": a pure-literal projection
+(`'red' as kind`) emits **no constant FD** today — `ProjectNode.computePhysical` only *forwards* the child's
+existing bindings through the source→output column map, and a literal has no source attribute to forward. So
+the oracle closes the gap with the localized **Option B**: it reads each leg's literal projections directly
+from the leg AST (peeling Cast/Collate) and synthesizes the discriminator `ConstantBinding`s itself, feeding
+them to the checker alongside the leg's *planned* physical bindings — which DO carry the σ-on-projected
+constant (`where color='red'` forwarded to a `color`-projecting output column). That σ-derived half — and the
+omitted-base-column insert recovery it drives — IS pre-existing (the same single-source `where`-constant
+insert-defaulting the GreenMen view uses); only the routing discriminator needed the localized synthesis. No
+hot-path (`ProjectNode.computePhysical`) change was made; the optimizer-wide projected-literal-constant-FD
+enhancement (Option A) is a separate deferred concern. **v1 limitations:** VALUES-source inserts only (a
+SELECT/DML source's per-row routing is deferred); RETURNING is rejected; a `union all` view with duplicate /
+overlapping data tuples fans a delete/data-update to all copies (bag identity); a leg discriminating purely
+by a non-literal σ (`where f(color)`) routes by include-on-unknown but cannot recover its omitted base
+columns on insert; a deep / mixed `intersect`/`except` chain is not flattened (it stays on the existing
+reject).
 
 **v1 limitations (documented).** Identification is by the full data tuple, so a `union all`
 view with **duplicate data tuples** in a branch fans a delete/data-write to *all* copies of

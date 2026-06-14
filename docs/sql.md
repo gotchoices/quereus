@@ -380,6 +380,16 @@ from a union exists left as inA, exists right as inB select id, x from b;
   the supplied flags (a true flag inserts into that branch). `column_info` reports each
   column `is_updatable = 'YES'` with null base (writable through an *effect*, not a base
   mapping). Nested / n-way set-op writes and non-literal membership values are deferred.
+- **Flag-less predicate-honest writes (the preferred surface).** A flag-less set-op body
+  whose legs carry *regular projected columns* — plain base columns plus literal
+  **discriminators** (`'red' as kind`) — is writable WITHOUT any `exists … as <flag>`
+  column: a flat `union all` of literal-discriminator legs (and a binary `intersect` /
+  `except`) routes INSERT to, and fans DELETE / data-UPDATE across, the legs each row is
+  consistent with — decided at plan time by the leg's σ-facts + literal discriminators
+  (`checkSatisfiability`). The literal discriminators are **read-only** (a `set kind = …`
+  is `no-inverse`); plain data columns are writable. This coexists with — and is preferred
+  over — the `exists`-membership path above. See
+  [docs/view-updateability.md](view-updateability.md) § Set Operations.
 
 **Examples:**
 ```sql
