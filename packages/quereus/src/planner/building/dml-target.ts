@@ -62,6 +62,9 @@ export function resolveCteTarget(
 		selectAst: cte.query,
 		columns: cte.columns,
 		ephemeral: true,
+		// Marks this as a CTE-name target (vs an inline subquery), gating the
+		// user-predicate self-read eager-capture path in the view-mutation builder.
+		cteTarget: true,
 		noun: 'common table expression',
 	};
 }
@@ -148,4 +151,100 @@ export function contextForCteTarget(ctx: PlanningContext, cteName: string): Plan
 	const cteNodes = new Map(ctx.cteNodes);
 	cteNodes.delete(key);
 	return { ...ctx, cteNodes };
+}
+
+/**
+ * True iff the user clauses of an UPDATE/DELETE **self-read** the CTE-name target
+ * `targetName` — a FROM source named `targetName` (unqualified) appears in any subquery
+ * reachable from the `where`, an assignment value, or a RETURNING expression. This is
+ * the gate the view-mutation builder uses to build the eager self-read capture + split
+ * planning context (docs/view-updateability.md § Common Table Expressions —
+ * self-reference): the body is planned target-EXCLUDED (so a same-named base FROM reaches
+ * the real table), while the user clause's self-read resolves `t` against a materialized
+ * snapshot of the body — a Halloween-safe positive write. Absent a self-read this returns
+ * false and the lowering is byte-identical to today (no extra materialization).
+ *
+ * A CTE name is never schema-qualified, so only an unqualified FROM-source name matches.
+ * The scan descends nested subqueries / their FROM (incl. join legs, TVF args, subquery
+ * sources) and compound / union legs; a DML…RETURNING subquery is not descended (the
+ * capture path never lowers one).
+ */
+export function needsSelfCapture(stmt: AST.UpdateStmt | AST.DeleteStmt, targetName: string): boolean {
+	const target = targetName.toLowerCase();
+	const exprs: AST.Expression[] = [];
+	if (stmt.where) exprs.push(stmt.where);
+	if (stmt.type === 'update') for (const a of stmt.assignments) exprs.push(a.value);
+	if (stmt.returning) for (const rc of stmt.returning) if (rc.type !== 'all') exprs.push(rc.expr);
+	return exprs.some(e => exprReadsTarget(e, target));
+}
+
+/** True iff any subquery operand of `expr` reads a FROM source named `target`. */
+function exprReadsTarget(expr: AST.Expression, target: string): boolean {
+	switch (expr.type) {
+		case 'binary':
+			return exprReadsTarget(expr.left, target) || exprReadsTarget(expr.right, target);
+		case 'unary':
+		case 'cast':
+		case 'collate':
+			return exprReadsTarget(expr.expr, target);
+		case 'function':
+			return expr.args.some(a => exprReadsTarget(a, target));
+		case 'between':
+			return exprReadsTarget(expr.expr, target) || exprReadsTarget(expr.lower, target) || exprReadsTarget(expr.upper, target);
+		case 'case':
+			return (!!expr.baseExpr && exprReadsTarget(expr.baseExpr, target))
+				|| expr.whenThenClauses.some(w => exprReadsTarget(w.when, target) || exprReadsTarget(w.then, target))
+				|| (!!expr.elseExpr && exprReadsTarget(expr.elseExpr, target));
+		case 'in':
+			return exprReadsTarget(expr.expr, target)
+				|| (!!expr.values && expr.values.some(v => exprReadsTarget(v, target)))
+				|| (!!expr.subquery && queryReadsTarget(expr.subquery, target));
+		case 'subquery':
+			return queryReadsTarget(expr.query, target);
+		case 'exists':
+			return queryReadsTarget(expr.subquery, target);
+		case 'windowFunction':
+			return expr.function.args.some(a => exprReadsTarget(a, target))
+				|| (!!expr.window?.partitionBy && expr.window.partitionBy.some(e => exprReadsTarget(e, target)))
+				|| (!!expr.window?.orderBy && expr.window.orderBy.some(ob => exprReadsTarget(ob.expr, target)));
+		default:
+			// literal / identifier / parameter / functionSource — no subquery operand.
+			return false;
+	}
+}
+
+/** True iff a relation-producing subquery reads (anywhere) a FROM source named `target`. */
+function queryReadsTarget(query: AST.QueryExpr, target: string): boolean {
+	if (query.type === 'select') {
+		return (!!query.from && query.from.some(fc => fromReadsTarget(fc, target)))
+			|| query.columns.some(rc => rc.type !== 'all' && exprReadsTarget(rc.expr, target))
+			|| (!!query.where && exprReadsTarget(query.where, target))
+			|| (!!query.groupBy && query.groupBy.some(e => exprReadsTarget(e, target)))
+			|| (!!query.having && exprReadsTarget(query.having, target))
+			|| (!!query.orderBy && query.orderBy.some(ob => exprReadsTarget(ob.expr, target)))
+			|| (!!query.limit && exprReadsTarget(query.limit, target))
+			|| (!!query.offset && exprReadsTarget(query.offset, target))
+			|| (!!query.compound && queryReadsTarget(query.compound.select, target))
+			|| (!!query.union && queryReadsTarget(query.union, target));
+	}
+	if (query.type === 'values') {
+		return query.values.some(row => row.some(e => exprReadsTarget(e, target)));
+	}
+	// A DML … RETURNING subquery — not descended (the capture path never lowers one).
+	return false;
+}
+
+/** True iff a FROM clause names (or nests a subquery that reads) a source named `target`. */
+function fromReadsTarget(fc: AST.FromClause, target: string): boolean {
+	switch (fc.type) {
+		case 'table':
+			return !fc.table.schema && fc.table.name.toLowerCase() === target;
+		case 'join':
+			return fromReadsTarget(fc.left, target) || fromReadsTarget(fc.right, target)
+				|| (!!fc.condition && exprReadsTarget(fc.condition, target));
+		case 'functionSource':
+			return fc.args.some(a => exprReadsTarget(a, target));
+		case 'subquerySource':
+			return queryReadsTarget(fc.subquery, target);
+	}
 }

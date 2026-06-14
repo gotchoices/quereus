@@ -3193,15 +3193,173 @@ insert into so values (1),(2);
 with s as (select id from so union select id from so) delete from s where id=1;
 -- error: is not updateable in phase 1
 
--- v1 boundary (Halloween / self-reference) — the target name is shadowed out of its own
--- body's scope, so a user-predicate self-read of the CTE name does NOT resolve the CTE.
--- It is rejected cleanly (the base table is unchanged), never a Halloween-unsafe plan.
+-- ===================================
+-- CTE-name DML target: self-reference in the user predicate (Halloween).
+-- A user-clause self-read of the target CTE name (`with t as (…) update t … where id in
+-- (select id from t)`) resolves the self-read against an EAGER up-front capture of the
+-- whole CTE body, producing a Halloween-safe positive write (split context + eager
+-- capture via `ViewMutationNode.identityCapture`). The body is still planned
+-- target-EXCLUDED (so a same-named base FROM reaches the real table — the load-bearing
+-- shadow case), while the user `where`/`set`/`returning` self-read resolves `t` to the
+-- frozen snapshot. Mirrors the inline-subquery Halloween behavior (isq_hw / isq_hwk).
+-- See docs/view-updateability.md § Common Table Expressions — self-reference.
+-- ===================================
+
+-- Bare self-read — `from t` resolves to the captured snapshot; every captured row
+-- matches, so both rows update (a positive write, NOT the old clean reject).
 create table hw (id integer primary key, color text);
 insert into hw values (1,'red'),(2,'green');
 with t as (select id, color from hw) update t set color='x' where id in (select id from t);
--- error: cannot be proven correlated
 select * from hw order by id;
-→ [{"id":1,"color":"red"},{"id":2,"color":"green"}]
+→ [{"id":1,"color":"x"},{"id":2,"color":"x"}]
+
+-- Key-mutating self-read (Halloween core) — the predicate column (`id`) is itself rewritten
+-- by the SET. The capture is materialized BEFORE the base op, so the frozen {1,2} drives the
+-- predicate and both rows mutate deterministically (1→11, 2→12) — never the feedback bug.
+create table hwk (id integer primary key, color text);
+insert into hwk values (1,'a'),(2,'b');
+with t as (select id, color from hwk) update t set id = id + 10 where id in (select id from t);
+select * from hwk order by id;
+→ [{"id":11,"color":"a"},{"id":12,"color":"b"}]
+
+-- Shadow case × self-read combo — the body FROM, the self-read FROM, and the target all
+-- name `base`. Body planned target-excluded reads the REAL base; capture snapshots real base;
+-- the lowered target is schema-qualified `main.base` → real base; the predicate `from base`
+-- → capture. All three resolve correctly and the write lands on real `base`.
+create table base (id integer primary key, color text);
+insert into base values (1,'red'),(2,'green');
+with base as (select id, color from base) update base set color='x' where id in (select id from base);
+select * from base order by id;
+→ [{"id":1,"color":"x"},{"id":2,"color":"x"}]
+
+-- DELETE variant — a self-read with a subquery WHERE (`id<>2`) deletes only the rows whose
+-- id is in the captured-and-filtered set {1,3}; row 2 survives.
+create table hwd (id integer primary key, color text);
+insert into hwd values (1,'red'),(2,'green'),(3,'blue');
+with t as (select id, color from hwd) delete from t where id in (select id from t where id<>2);
+select * from hwd order by id;
+→ [{"id":2,"color":"green"}]
+
+-- RETURNING self-read — `(select count(*) from t)` reads the frozen snapshot (2 rows)
+-- materialized before the base op, so the RETURNING re-projection returns the pre-mutation
+-- count even though the same statement writes a row.
+create table hwret (id integer primary key, color text);
+insert into hwret values (1,'red'),(2,'green');
+with t as (select id, color from hwret) update t set color='r' where id=1 returning (select count(*) from t) as cnt;
+→ [{"cnt":2}]
+select * from hwret order by id;
+→ [{"id":1,"color":"r"},{"id":2,"color":"green"}]
+
+-- View-name-qualified self-read (`select t.id from t`) — `t.id` is the CAPTURE's column
+-- (alias-shadow), NOT a de-correlated `__vm_self`-qualified base term. The discriminating
+-- probe is an aggregate: `sum(t.id)` over the frozen {1,2,3} is 6 (a silent de-correlation
+-- would correlate `t.id` to the single outer row and sum 1+1+1 = 3).
+create table hwq (id integer primary key, color text);
+insert into hwq values (1,'a'),(2,'b'),(3,'c');
+with t as (select id, color from hwq) update t set color = cast((select sum(t.id) from t) as text) where id = 1;
+select * from hwq order by id;
+→ [{"id":1,"color":"6"},{"id":2,"color":"b"},{"id":3,"color":"c"}]
+
+-- The same alias-shadow probe in a RETURNING subquery — `sum(t.id)` over the frozen capture
+-- is 6, not the de-correlated 3.
+create table hwq2 (id integer primary key, color text);
+insert into hwq2 values (1,'a'),(2,'b'),(3,'c');
+with t as (select id, color from hwq2) update t set color='r' where id=1 returning (select sum(t.id) from t) as s;
+→ [{"s":6}]
+
+-- Scalar-subquery self-read in the SET value — row 2 takes row 1's captured color.
+create table hwsc (id integer primary key, color text);
+insert into hwsc values (1,'red'),(2,'green');
+with t as (select id, color from hwsc) update t set color = (select color from t where id = 1) where id = 2;
+select * from hwsc order by id;
+→ [{"id":1,"color":"red"},{"id":2,"color":"red"}]
+
+-- exists-form self-read — `exists (select 1 from t where color='red')` over the capture is
+-- true (a red row exists), so every row updates. The capture + descend hold for the `exists`
+-- operand form, not just `in`.
+create table hwe (id integer primary key, color text);
+insert into hwe values (1,'red'),(2,'green');
+with t as (select id, color from hwe) update t set color='E' where exists (select 1 from t where color='red');
+select * from hwe order by id;
+→ [{"id":1,"color":"E"},{"id":2,"color":"E"}]
+
+-- Mixed self-read + genuine outer correlation in one statement — the WHERE `from t` is the
+-- self-read (→ capture), while the SET value `(select c from oth where oth.k = id)` is a
+-- genuine outer view-column correlation (the bare `id`, not shadowed by `oth`, binds to the
+-- target row). The descend keeps them distinct (shadow vs. not-shadowed).
+create table hwmix (id integer primary key, color text);
+insert into hwmix values (1,'red'),(2,'green');
+create table oth (k integer, c text);
+insert into oth values (1,'M1'),(2,'M2');
+with t as (select id, color from hwmix) update t set color = (select c from oth where oth.k = id) where id in (select id from t);
+select * from hwmix order by id;
+→ [{"id":1,"color":"M1"},{"id":2,"color":"M2"}]
+
+-- Sibling CTE read in the predicate alongside the self-read — `t` is the self-read (capture),
+-- `sv` is a sibling CTE (stays in `cteNodes` in BOTH contexts); only id in capture AND in
+-- `sv` {1} matches, so row 1 updates and row 2 is left.
+create table hwsib (id integer primary key, color text);
+insert into hwsib values (1,'red'),(2,'green');
+create table sibvals (filt integer);
+insert into sibvals values (1);
+with sv as (select filt from sibvals), t as (select id, color from hwsib)
+    update t set color='s' where id in (select id from t) and id in (select filt from sv);
+select * from hwsib order by id;
+→ [{"id":1,"color":"s"},{"id":2,"color":"green"}]
+
+-- Sibling CTE read in the SET value alongside the self-read in the WHERE — `cv` resolves
+-- (sibling), `t` resolves to the capture.
+create table hwss (id integer primary key, color text);
+insert into hwss values (1,'red'),(2,'green');
+create table cvtab (vv text);
+insert into cvtab values ('CV');
+with cv as (select vv from cvtab), t as (select id, color from hwss)
+    update t set color = (select vv from cv) where id in (select id from t);
+select * from hwss order by id;
+→ [{"id":1,"color":"CV"},{"id":2,"color":"CV"}]
+
+-- Composite-PK body self-read — the capture exposes all view columns; a self-read predicate
+-- over `note` (`note in (select note from t where a=1)`) resolves through the composite-PK body.
+create table hwcpk (a integer, b integer, note text, primary key (a,b));
+insert into hwcpk values (1,2,'x'),(3,4,'y');
+with t as (select a, b, note from hwcpk) update t set note='z' where note in (select note from t where a=1);
+select * from hwcpk order by a, b;
+→ [{"a":1,"b":2,"note":"z"},{"a":3,"b":4,"note":"y"}]
+
+-- `t(a,b)` column-rename CTE self-read — the capture honors the rename, so `from t` exposes
+-- the renamed names (`k`, `c`).
+create table hwren (id integer primary key, color text);
+insert into hwren values (1,'red'),(2,'green');
+with t(k,c) as (select id, color from hwren) update t set c='r' where k in (select k from t);
+select * from hwren order by id;
+→ [{"id":1,"color":"r"},{"id":2,"color":"r"}]
+
+-- No-self-read CTE-target — a CTE-target UPDATE whose predicate does NOT self-read pays
+-- nothing (no capture built, byte-identical plan); a plain positive write lands.
+create table hwns (id integer primary key, color text);
+insert into hwns values (1,'red'),(2,'green');
+with t as (select id, color from hwns) update t set color='n' where id=1;
+select * from hwns order by id;
+→ [{"id":1,"color":"n"},{"id":2,"color":"green"}]
+
+-- Out of scope — INSERT-source self-read keeps current behavior (the target name is shadowed
+-- out of the INSERT source's scope, so `from t` is table-not-found). Not silently wrong; the
+-- new single-source capture path is INSERT-gated out. (Follow-up: cte-dml-insert-source-self-read.)
+create table hwins (id integer primary key, color text);
+insert into hwins values (1,'red');
+with t as (select id, color from hwins) insert into t (id, color) select id+10, color from t;
+-- error: Table 't' not found
+
+-- Out of scope — join-bodied (multi-source) CTE self-read keeps current behavior: the new
+-- single-source capture path is gated to single-source bodies, so the multi-source descend
+-- still rejects the self-read as unprovable-correlation (no silent-wrong plan).
+create table hwjp (pid integer primary key, label text);
+create table hwjc (cid integer primary key, pref integer, note text, foreign key (pref) references hwjp(pid));
+insert into hwjp values (10,'P10');
+insert into hwjc values (1,10,'a');
+with t as (select c.cid as cid, c.note as note, p.label as label
+    from hwjc c join hwjp p on p.pid = c.pref) update t set note='B' where cid in (select cid from t);
+-- error: cannot be proven correlated
 
 -- ===================================
 -- Review-added interaction probes (cte-name-dml-write-target review pass): the source

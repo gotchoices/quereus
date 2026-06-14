@@ -8,6 +8,8 @@ import { propagate, decompositionStorage, type BaseOp, type MutableViewLike, typ
 import { analyzeMultiSourceInsert, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, buildMultiSourceUpdateReturning, buildMultiSourceDeleteReturning, makeMultiSourceKeyRef, isJoinBody, MS_UPDATE_KEYS_CTE, type MultiSourceKeyCapture, type JoinViewAnalysis, type CrossSourceValue } from '../mutation/multi-source.js';
 import { analyzeDecompositionInsert, analyzeDecomposition, decomposeUpdate as decomposeDecompositionUpdate, buildDecompositionKeyCapture, type DecompInsertOp, type DecompShape, type CapturedDecompValue } from '../mutation/decomposition.js';
 import { isSetOpMembershipBody, buildSetOpWrite } from '../mutation/set-op.js';
+import { buildCteSelfCapture } from '../mutation/single-source.js';
+import { needsSelfCapture } from './dml-target.js';
 import { FilterNode } from '../nodes/filter.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { validateMutationTags } from '../mutation/mutation-tags.js';
@@ -137,6 +139,26 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// Arbitrary optional-columnar values a decomposition UPDATE lowers to a captured read-back
 	// accumulate here, then thread into the decomposition key capture (the dual of `sourceValues`).
 	const capturedValues: CapturedDecompValue[] = [];
+	// CTE-name DML target self-read (docs/view-updateability.md § Common Table Expressions
+	// — self-reference). When the user `where` / `set` / `returning` self-reads the target
+	// CTE name (`with t as (…) update t … where id in (select id from t)`), build a SPLIT
+	// planning context: the body is planned target-EXCLUDED under `ctx` (so a same-named
+	// base FROM reaches the real table — the load-bearing shadow case), while the
+	// user-clause descend AND the lowered base op's re-plan resolve `t` against an EAGER
+	// capture of the full body relation (`ctxSelfRead`). The capture rides `identityCapture`,
+	// materialized once before any base op runs — so the base op's `select id from t` reads
+	// the pre-mutation snapshot, Halloween-safe by construction. Gated to an ephemeral
+	// CTE-name target (an inline subquery already round-trips via the real base table) + a
+	// single-source UPDATE/DELETE; a join-bodied (multi-source) or INSERT-source self-read
+	// is out of scope and keeps current behavior (it does not take this path). `ctx` here is
+	// already target-excluded by the CTE-name dispatch's `contextForCteTarget`.
+	const selfCapture = !!view.ephemeral && !!view.cteTarget
+		&& (req.op === 'update' || req.op === 'delete')
+		&& !isJoinBody(view.selectAst)
+		&& needsSelfCapture(req.stmt, view.name)
+		? buildCteSelfCapture(ctx, view)
+		: undefined;
+	const ctxSelfRead = selfCapture ? withCteCapture(ctx, view.name, selfCapture) : undefined;
 	let baseOps: BaseOp[];
 	if (msAnalysis && req.op === 'update') {
 		baseOps = decomposeUpdate(ctx, view, msAnalysis, req.stmt, sourceValues);
@@ -145,7 +167,10 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	} else if (decompShape && req.op === 'update') {
 		baseOps = decomposeDecompositionUpdate(ctx, view, decompShape, req.stmt, capturedValues);
 	} else {
-		baseOps = propagate(ctx, view, req);
+		// `ctxSelfRead` (when a self-read is present) threads into the single-source
+		// UPDATE/DELETE rewrite so the user-clause descend resolves `from t` to the capture;
+		// undefined elsewhere is the byte-identical no-self-read path.
+		baseOps = propagate(ctx, view, req, ctxSelfRead);
 	}
 	// Lens row-local enforcement: when the target is a lens-backed logical table,
 	// its prover-classified `enforced-row-local` CHECK obligations (rewritten to
@@ -219,7 +244,11 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// exactly one base op carrying all basis columns, so this is a no-op there.
 	const riddenConstraints = new Set<RowConstraintSchema>();
 	const children = baseOps.map(op => {
-		const opCtx = injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx;
+		// A CTE self-read base op re-plans under `ctxSelfRead`, so its `from t` predicate /
+		// RETURNING subquery binds to the eager capture (keyed under the CTE name). Mutually
+		// exclusive with the `__vmupd_keys` key-ref injection (single-source vs multi-source /
+		// decomposition / set-op); prefer it when present.
+		const opCtx = ctxSelfRead ?? (injectKeyRef ? withKeyCapture(ctx, keyCapture!) : ctx);
 		const opConstraints = constraintsForOp(op, extraConstraints, riddenConstraints);
 		return buildBaseOp(opCtx, op, opConstraints, isLensWrite);
 	});
@@ -241,7 +270,13 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// an update re-queries the join body *after* restricted to the captured identities
 	// (robust against an update that rewrites its own predicate column).
 	const { returning, returningTiming } = buildMultiSourceReturning(ctx, view, req, keyCapture, msAnalysis);
-	const identityCapture = keyCapture ? { source: keyCapture.source, descriptor: keyCapture.descriptor } : undefined;
+	// The side input the emitter materializes ONCE before any base op runs: the CTE
+	// self-read capture (single-source) or the multi-source / decomposition / set-op key
+	// capture (mutually exclusive). For a self-read, single-source RETURNING is embedded on
+	// the base op (re-planned under `ctxSelfRead`) and reads the same frozen snapshot.
+	const identityCapture = selfCapture
+		? { source: selfCapture.source, descriptor: selfCapture.descriptor }
+		: keyCapture ? { source: keyCapture.source, descriptor: keyCapture.descriptor } : undefined;
 	return new ViewMutationNode(ctx.scope, children, returning, undefined, returningTiming, identityCapture);
 }
 
@@ -311,6 +346,23 @@ function capturedSideIndices(baseOps: readonly BaseOp[], analysis: JoinViewAnaly
 function withKeyCapture(ctx: PlanningContext, capture: MultiSourceKeyCapture): PlanningContext {
 	const cteNodes = new Map(ctx.cteNodes ?? []);
 	cteNodes.set(MS_UPDATE_KEYS_CTE, makeMultiSourceKeyRef(ctx.scope, capture));
+	return { ...ctx, cteNodes };
+}
+
+/**
+ * The `ctxSelfRead` for a CTE-name DML target whose user clauses self-read the target
+ * name (docs/view-updateability.md § Common Table Expressions — self-reference): the
+ * target-EXCLUDED body context (`ctx`) with the target name **re-added** to `cteNodes`,
+ * resolving to a context-backed key relation over the eager self-read capture. The
+ * {@link withKeyCapture} analog, keyed under the CTE name (`cteName`) rather than
+ * {@link MS_UPDATE_KEYS_CTE} — so a user-clause `from t` (and the lowered base op's
+ * re-plan of it) binds to the materialized snapshot instead of the real base table. A
+ * fresh ref per call keeps the descend's and the base op's subtrees from sharing a node
+ * instance.
+ */
+function withCteCapture(ctx: PlanningContext, cteName: string, capture: MultiSourceKeyCapture): PlanningContext {
+	const cteNodes = new Map(ctx.cteNodes ?? []);
+	cteNodes.set(cteName.toLowerCase(), makeMultiSourceKeyRef(ctx.scope, capture));
 	return { ...ctx, cteNodes };
 }
 

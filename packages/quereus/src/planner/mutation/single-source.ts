@@ -8,6 +8,9 @@ import { buildSelectStmt } from '../building/select.js';
 import { classifyViewBody } from './propagate.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { deriveViewColumns, resolveBaseSite, type ViewColumn } from '../analysis/update-lineage.js';
+import { ProjectNode, type Projection } from '../nodes/project-node.js';
+import { ColumnReferenceNode } from '../nodes/reference.js';
+import type { MultiSourceKeyCapture } from './multi-source.js';
 import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { transformExpr, cloneExpr, substituteNewRefs, transformScopedExpr, transformScopedQuery, type ScopeContext } from './scope-transform.js';
@@ -88,6 +91,19 @@ export interface MutableViewLike {
 	 * plain projection-filter body. Diagnostics name the target by {@link noun}.
 	 */
 	readonly ephemeral?: boolean;
+	/**
+	 * True for an ephemeral **CTE-name** target (resolved by `resolveCteTarget`); an
+	 * inline FROM-subquery target (`resolveSubqueryTarget`) leaves it undefined. Gates the
+	 * user-predicate self-read eager-capture path (docs/view-updateability.md § Common
+	 * Table Expressions — self-reference): a CTE name can appear unqualified in the user
+	 * `where`/`set`/`returning` and self-read the target, resolving against an eager
+	 * snapshot of the body; an inline subquery's alias does not (its predicate names the
+	 * real base table directly and already round-trips). The capture path also requires
+	 * the incoming planning context be target-EXCLUDED (`contextForCteTarget`), which only
+	 * the CTE-name dispatch applies — so the flag both selects the case and asserts that
+	 * precondition.
+	 */
+	readonly cteTarget?: boolean;
 }
 
 /**
@@ -347,10 +363,21 @@ function makeViewScope(
 		return baseQualify(repl);
 	};
 	return {
-		makeSubstitute: (shadowed, tainted) => (col) => {
+		makeSubstitute: (shadowed, tainted, aliasShadowed) => (col) => {
 			const name = col.name.toLowerCase();
 			if (col.table) {
-				return col.table.toLowerCase() === lcView ? resolve(name) : undefined;
+				const lcQual = col.table.toLowerCase();
+				// A view-name-qualified ref (`t.id`) is normally an unambiguous outer
+				// view-output correlation, rewritten to its base-term lineage. BUT when the
+				// SAME name is a locally-shadowed FROM alias — the user-predicate self-read
+				// `select t.id from t` over the eager capture — `t.id` is the capture's own
+				// column, not an outer correlation; leave it local (innermost-scope SQL
+				// rules) so it binds to the captured snapshot rather than a de-correlated
+				// `__vm_self`-qualified base term (docs/view-updateability.md § Common Table
+				// Expressions — self-reference). Other ScopeContext implementers never reach
+				// this branch with an aliased self-read (no own-name to shadow).
+				if (aliasShadowed.has(lcQual)) return undefined;
+				return lcQual === lcView ? resolve(name) : undefined;
 			}
 			if (shadowed.has(name)) return undefined;
 			if (!columnMap.has(name)) return undefined;
@@ -589,6 +616,52 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 	});
 
 	return { baseTable, viewColumns, filterPredicate, filterConstants, columnMap, writableSites };
+}
+
+/**
+ * Build the eager **CTE self-read capture** for a CTE-name DML target whose user
+ * clauses self-read the target name (docs/view-updateability.md § Common Table
+ * Expressions — self-reference). The capture is the FULL body relation — every view
+ * column, **unfiltered** (the self-read `from t` is the whole relation, exactly a
+ * materialized CTE) — projected over the body planned under `ctx` (the **target-
+ * excluded** body context, so the body's own `from base` reaches the REAL base table,
+ * the load-bearing shadow case). It rides {@link import('../nodes/view-mutation-node.js').ViewMutationNode}'s
+ * `identityCapture`, which the emitter materializes ONCE before any base op runs — so
+ * the lowered base op's `from t` reads the pre-mutation snapshot, Halloween-safe by
+ * construction.
+ *
+ * Mirrors `set-op.ts`'s `buildSetOpCapture`, minus the user-WHERE filter (the whole
+ * relation, not just the affected rows — a self-read names the entire CTE). Returns a
+ * {@link MultiSourceKeyCapture} so the readers reuse `makeMultiSourceKeyRef` /
+ * `withCteCapture` and the existing `identityCapture` side-input substrate verbatim.
+ *
+ * Deliberately plans the body a SECOND time (alongside `analyzeView`'s own body plan,
+ * threaded through `rewriteViewUpdate`/`Delete`): a localization tradeoff the ticket
+ * accepts — the body is a cheap single-source projection-and-filter, and the capture's
+ * projection over a freshly-planned root keeps the descriptor self-contained.
+ */
+export function buildCteSelfCapture(ctx: PlanningContext, view: MutableViewLike): MultiSourceKeyCapture {
+	// Gate + derive the view-column model (names honour a `t(a,b)` rename via
+	// `deriveViewColumns`; an unsupported body shape rejects here just as the lowering's
+	// own `analyzeView` would).
+	const analysis = analyzeView(ctx, view);
+	const sel = view.selectAst as AST.SelectStmt; // analyzeView already proved a SELECT body
+	const bodyPlan = buildSelectStmt(ctx, sel) as RelationalPlanNode;
+	const attrs = bodyPlan.getAttributes();
+
+	// One capture column per view column, positionally aligned to the body plan's
+	// attributes (the `viewColumns[i] ↔ attrs[i]` parity `analyzeView` relies on). The
+	// renamed name is the capture column name, so a self-read `from t` exposes the
+	// renamed columns; the type/id come from the planned attribute.
+	const projections: Projection[] = analysis.viewColumns.map((vc, i) => {
+		const attr = attrs[i];
+		const node = new ColumnReferenceNode(ctx.scope, { type: 'column', name: vc.name }, attr.type, attr.id, i);
+		return { node, alias: vc.name };
+	});
+	// preserveInputColumns=false → the materialized rows are exactly the view columns.
+	const source = new ProjectNode(ctx.scope, bodyPlan, projections, undefined, undefined, false);
+	const keyColumns = analysis.viewColumns.map((vc, i) => ({ name: vc.name, type: attrs[i].type }));
+	return { source, descriptor: {}, keyColumns };
 }
 
 /** Extract `baseColumn = literal` bindings from the view's selection predicate. */
@@ -1046,14 +1119,22 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 
 // --- UPDATE ---------------------------------------------------------------
 
-export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike): AST.UpdateStmt {
+export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, view: MutableViewLike, descendCtx?: PlanningContext): AST.UpdateStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
 	// Qualify substituted subquery-descent base terms with the lowered target's
 	// synthesised alias (SELF_ALIAS) so they correlate to the outer target row even
 	// when the user subquery FROM names the view's own base table (the same-base-table
 	// self-reference corner). The lowered statement carries `alias: SELF_ALIAS` below.
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, SELF_ALIAS));
+	//
+	// `descendCtx` (a CTE-name DML target's `ctxSelfRead` — the body context with the
+	// target name re-added to `cteNodes`, resolving to the eager capture) drives ONLY
+	// the user-clause subquery descent, so a self-read `from t` resolves `t`'s columns
+	// against the capture (a clean shadowing local source). `analyzeView` keeps planning
+	// the BODY under the target-EXCLUDED `ctx` (so the body's own `from base` reaches the
+	// real table — the load-bearing shadow case). Absent it, `descendCtx ?? ctx` is the
+	// byte-identical no-self-read path.
+	const descend = makeViewColumnDescend(descendCtx ?? ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, SELF_ALIAS));
 
 	// Scope guard: `set` targets, assigned values, and the top-level `where`
 	// references must name view columns (a base-only name must not leak through to
@@ -1150,7 +1231,7 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		assignments,
 		where,
 		contextValues: stmt.contextValues,
-		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view, SELF_ALIAS),
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view, SELF_ALIAS, descendCtx),
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
@@ -1158,14 +1239,16 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 
 // --- DELETE ---------------------------------------------------------------
 
-export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike): AST.DeleteStmt {
+export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, view: MutableViewLike, descendCtx?: PlanningContext): AST.DeleteStmt {
 	const analysis = analyzeView(ctx, view);
 	const substitute = remapper(analysis);
 	// Qualify substituted subquery-descent base terms with the lowered target's
 	// synthesised alias (SELF_ALIAS) so they correlate to the outer target row even
 	// when the user subquery FROM names the view's own base table (the same-base-table
 	// self-reference corner). The lowered statement carries `alias: SELF_ALIAS` below.
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, SELF_ALIAS));
+	// `descendCtx` (a CTE self-read `ctxSelfRead`) drives the user-WHERE subquery descent
+	// so a self-read `from t` resolves to the eager capture; see {@link rewriteViewUpdate}.
+	const descend = makeViewColumnDescend(descendCtx ?? ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, SELF_ALIAS));
 
 	// Scope guard: top-level `where` references must name view columns.
 	if (stmt.where) guardTopLevelScope(stmt.where, analysis, view);
@@ -1180,7 +1263,7 @@ export function rewriteViewDelete(ctx: PlanningContext, stmt: AST.DeleteStmt, vi
 		alias: SELF_ALIAS,
 		where,
 		contextValues: stmt.contextValues,
-		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view, SELF_ALIAS),
+		returning: rewriteViewReturning(ctx, stmt.returning, analysis, view, SELF_ALIAS, descendCtx),
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
@@ -1212,10 +1295,15 @@ export function rewriteViewReturning(
 	analysis: ViewAnalysis,
 	view: MutableViewLike,
 	correlationName: string = analysis.baseTable.name,
+	/** A CTE self-read `ctxSelfRead` driving the RETURNING-subquery descent so a
+	 *  self-read `from t` resolves to the eager capture (the capture is materialized
+	 *  before the base op, so the RETURNING re-projection reads the frozen snapshot).
+	 *  Absent it, `descendCtx ?? ctx` is the byte-identical no-self-read path. */
+	descendCtx?: PlanningContext,
 ): AST.ResultColumn[] | undefined {
 	if (!returning || returning.length === 0) return undefined;
 	const substitute = remapper(analysis);
-	const descend = makeViewColumnDescend(ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, correlationName));
+	const descend = makeViewColumnDescend(descendCtx ?? ctx, analysis.columnMap, view.name, view, makeBaseQualifier(ctx, analysis.baseTable, correlationName));
 	const out: AST.ResultColumn[] = [];
 	for (const rc of returning) {
 		if (rc.type === 'all') {

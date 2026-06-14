@@ -215,7 +215,22 @@ function resolveBaseTable(
  * Broader shapes (outer joins, set-ops, aggregates, > 2 tables) stay
  * diagnosed-and-rejected with a structured reason.
  */
-export function propagate(ctx: PlanningContext, view: MutableViewLike, req: MutationRequest): BaseOp[] {
+export function propagate(
+	ctx: PlanningContext,
+	view: MutableViewLike,
+	req: MutationRequest,
+	/**
+	 * A CTE-name DML target's `ctxSelfRead` (the body context with the target name
+	 * re-added to `cteNodes`, resolving to the eager self-read capture), threaded into
+	 * the single-source UPDATE/DELETE rewrite so a user-clause self-read `from t`
+	 * resolves to the frozen capture (docs/view-updateability.md § Common Table
+	 * Expressions — self-reference). Ignored for insert and for the join / decomposition
+	 * / set-op paths (none of which take the single-source self-read capture path). The
+	 * BODY is still analysed under `ctx` (target-excluded), so its own `from base`
+	 * reaches the real table.
+	 */
+	descendCtx?: PlanningContext,
+): BaseOp[] {
 	// A logical table backed by a decomposition advertisement is registered as a
 	// view whose body is the synthesized `anchor ⋈ members` join. Routing it
 	// through the generic two-table join path below would be unsound (that path
@@ -261,11 +276,11 @@ export function propagate(ctx: PlanningContext, view: MutableViewLike, req: Muta
 			return [{ table: resolveBaseTable(ctx, statement), op: 'insert', statement }];
 		}
 		case 'update': {
-			const statement = rewriteViewUpdate(ctx, req.stmt, view);
+			const statement = rewriteViewUpdate(ctx, req.stmt, view, descendCtx);
 			return [{ table: resolveBaseTable(ctx, statement), op: 'update', statement }];
 		}
 		case 'delete': {
-			const statement = rewriteViewDelete(ctx, req.stmt, view);
+			const statement = rewriteViewDelete(ctx, req.stmt, view, descendCtx);
 			return [{ table: resolveBaseTable(ctx, statement), op: 'delete', statement }];
 		}
 	}

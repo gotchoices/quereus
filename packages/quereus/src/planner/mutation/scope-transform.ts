@@ -416,7 +416,21 @@ function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource): Set
 			? new Set(view.columns.map(c => c.toLowerCase()))
 			: projectionOutputNames(view.selectAst);
 	}
-	// Unknown name (a CTE reference, or a not-yet-resolvable source).
+	// A CTE / context-backed source (a sibling CTE, or an injected eager-capture relation
+	// keyed under the CTE name) — never schema-qualified, so only an unqualified name can
+	// match. Resolve its columns from the planning context's `cteNodes` so the source
+	// SHADOWS (a clean local source) rather than tainting the scope. This is what lets a
+	// CTE-name DML target's user-predicate self-read (`from t`) over its eager capture
+	// resolve `t`'s bare columns as local instead of rejecting them as
+	// unprovable-correlation (docs/view-updateability.md § Common Table Expressions). A
+	// schema object of the same name was already resolved above, so this only fires for a
+	// genuine context-backed name. `buildFrom` resolves such a name the same way (its own
+	// `cteNodes` lookup), so the static shadow set matches the plan-time binding.
+	if (!schemaName && ctx.cteNodes) {
+		const cteNode = ctx.cteNodes.get(src.table.name.toLowerCase());
+		if (cteNode) return new Set(cteNode.getType().columns.map(c => c.name.toLowerCase()));
+	}
+	// Unknown name (a not-yet-resolvable source).
 	return null;
 }
 
@@ -449,13 +463,23 @@ function projectionOutputNames(query: AST.QueryExpr): Set<string> | null {
 interface ScopeContextBase {
 	/**
 	 * Build the per-column substitution closure for ONE scope, given the set of
-	 * column names shadowed by this (and enclosing) scopes and whether the scope is
-	 * tainted (an enclosing scope's columns proved unresolvable). Returns the
-	 * replacement expression for a column, or `undefined` to leave it untouched.
-	 * May throw a structured diagnostic (e.g. a tainted scope rejecting an
-	 * unqualified, correlation-ambiguous reference).
+	 * column names shadowed by this (and enclosing) scopes, whether the scope is
+	 * tainted (an enclosing scope's columns proved unresolvable), and the set of FROM
+	 * **aliases** bound by this (and enclosing) scopes. Returns the replacement
+	 * expression for a column, or `undefined` to leave it untouched. May throw a
+	 * structured diagnostic (e.g. a tainted scope rejecting an unqualified,
+	 * correlation-ambiguous reference).
+	 *
+	 * `aliasShadowed` is the alias-only analog of `shadowed` (built from
+	 * {@link collectFromAliases}, never tainted — a FROM alias is always statically
+	 * known). It lets a context distinguish a genuine outer-correlation qualifier from
+	 * a qualifier that names a locally-shadowed FROM source: a view-name-qualified ref
+	 * (`t.id`) is an outer view-column correlation UNLESS `t` is also a local FROM
+	 * alias (the self-read `select t.id from t` over the eager capture), in which case
+	 * it is the capture's own column and stays local. Implementers that do not care
+	 * about alias shadowing simply ignore the parameter.
 	 */
-	makeSubstitute(shadowed: ReadonlySet<string>, tainted: boolean): (col: AST.ColumnExpr) => AST.Expression | undefined;
+	makeSubstitute(shadowed: ReadonlySet<string>, tainted: boolean, aliasShadowed: ReadonlySet<string>): (col: AST.ColumnExpr) => AST.Expression | undefined;
 	/** Raise the structured diagnostic for an embedded data-modifying (INSERT/UPDATE/DELETE) subquery. */
 	rejectDmlSubquery(): never;
 }
@@ -487,8 +511,8 @@ const NO_SHADOW: ReadonlySet<string> = new Set<string>();
  * correlation refs must be (re-)bound (the single-source base-term qualifier).
  */
 export function transformScopedExpr(ctx: PlanningContext, scope: ScopeContext, expr: AST.Expression): AST.Expression {
-	const substitute = scope.makeSubstitute(NO_SHADOW, false);
-	const descend = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, NO_SHADOW, false);
+	const substitute = scope.makeSubstitute(NO_SHADOW, false, NO_ALIAS_SHADOW);
+	const descend = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, NO_SHADOW, false, NO_ALIAS_SHADOW);
 	return transformExpr(expr, substitute, descend);
 }
 
@@ -511,11 +535,12 @@ export function transformScopedQuery(
 	query: AST.QueryExpr,
 	shadowed: ReadonlySet<string>,
 	tainted: boolean,
+	aliasShadowed: ReadonlySet<string> = NO_ALIAS_SHADOW,
 ): AST.QueryExpr {
 	if (query.type === 'values') {
 		// No FROM — the value rows correlate to the enclosing scope unchanged.
-		const substitute = scope.makeSubstitute(shadowed, tainted);
-		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, shadowed, tainted);
+		const substitute = scope.makeSubstitute(shadowed, tainted, aliasShadowed);
+		const descend = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, shadowed, tainted, aliasShadowed);
 		const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, descend);
 		return { ...query, values: query.values.map(row => row.map(onExpr)) };
 	}
@@ -541,15 +566,20 @@ export function transformScopedQuery(
 		innerShadow = new Set<string>([...shadowed, ...local]);
 		scopeTainted = tainted;
 	}
+	// FROM **aliases** of this select join the alias-shadow set for its clauses and any
+	// subquery nested in them — the alias-only analog of `innerShadow`. Always known (a
+	// FROM alias is statically resolvable even when its columns are not), so this never
+	// taints; a tainted scope still accumulates aliases.
+	const innerAliasShadow: ReadonlySet<string> = new Set<string>([...aliasShadowed, ...collectFromAliases(sel.from)]);
 
-	const substitute = scope.makeSubstitute(innerShadow, scopeTainted);
+	const substitute = scope.makeSubstitute(innerShadow, scopeTainted, innerAliasShadow);
 	// A subquery nested inside this select's clauses / FROM sees this select's FROM,
-	// so it inherits `innerShadow` / `scopeTainted`.
-	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, innerShadow, scopeTainted);
+	// so it inherits `innerShadow` / `scopeTainted` / `innerAliasShadow`.
+	const onNested = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, innerShadow, scopeTainted, innerAliasShadow);
 	// A compound / union leg is a SIBLING select correlating to the SAME outer scope
 	// as this one — it does NOT see this select's FROM, so it keeps the incoming
-	// `shadowed` / `tainted`.
-	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, shadowed, tainted);
+	// `shadowed` / `tainted` / `aliasShadowed`.
+	const onLeg = (q: AST.QueryExpr): AST.QueryExpr => transformScopedQuery(ctx, scope, q, shadowed, tainted, aliasShadowed);
 	const onExpr = (e: AST.Expression): AST.Expression => transformExpr(e, substitute, onNested);
 	return rebuildSelect(sel, onExpr, onNested, onLeg);
 }
