@@ -98,6 +98,48 @@ describe('View plan dependencies and invalidation', () => {
 				'the base table dep is still recorded',
 			).to.equal(true);
 		});
+
+		// CTE-name / inline-subquery DML targets funnel through the SAME
+		// `buildViewMutation`, but enter with `view.ephemeral === true`, so the
+		// `!view.ephemeral` guard (view-mutation-builder.ts ~L58) skips the `view`
+		// dependency record: there is nothing to depend *on* (the body is part of the
+		// statement, re-planned every run). The lowered base op still records the
+		// ordinary `table` dep on the real base it writes. The invalidation half of
+		// this property is pinned in the suite below.
+
+		it('a CTE-name UPDATE records no view dependency but does record the base-table dependency', async () => {
+			await db.exec('create table cte_base (id integer primary key, color text)');
+			const all = planDeps("with t as (select id, color from cte_base) update t set color = 'x' where id = 1");
+			expect(all.filter(d => d.type === 'view'), 'an ephemeral CTE target records no view dep').to.deep.equal([]);
+			expect(
+				all.some(d => d.type === 'table' && d.objectName === 'cte_base'),
+				'the real base table dep is still recorded',
+			).to.equal(true);
+		});
+
+		it('an inline-subquery UPDATE records no view dependency but does record the base-table dependency', async () => {
+			await db.exec('create table cte_base (id integer primary key, color text)');
+			const all = planDeps("update (select id, color from cte_base) as v set color = 'x' where v.id = 1");
+			expect(all.filter(d => d.type === 'view'), 'an ephemeral inline target records no view dep').to.deep.equal([]);
+			expect(
+				all.some(d => d.type === 'table' && d.objectName === 'cte_base'),
+				'the real base table dep is still recorded',
+			).to.equal(true);
+		});
+
+		it('the equivalent named-view UPDATE records exactly one view dependency (contrast control)', async () => {
+			// Makes the two empty results above meaningful: the same single-source body
+			// behind a *named* view DOES record a view dep, so the ephemeral skip is the
+			// difference, not a helper artifact.
+			await db.exec(`
+				create table cte_base (id integer primary key, color text);
+				create view t as select id, color from cte_base;
+			`);
+			const deps = viewDeps("update t set color = 'x' where id = 1");
+			expect(deps.length, 'exactly one view dep for the named single-source view').to.equal(1);
+			expect(deps[0].objectName).to.equal('t');
+			expect(deps[0].schemaName).to.equal('main');
+		});
 	});
 
 	describe('plan invalidation (prepared-statement compile identity)', () => {
@@ -264,6 +306,62 @@ describe('View plan dependencies and invalidation', () => {
 
 			await db.exec(`alter materialized view MAIN.mv add tags (display_name = 'x')`);
 			expect(stmt.compile(), 'case-differing schema qualifier must still invalidate the MV write plan').to.not.equal(p1);
+			await stmt.finalize();
+		});
+
+		// --- Ephemeral (CTE-name / inline-subquery) DML targets ---
+		// These record no `view` dep but DO record a `table` dep on the real base (the
+		// recording half is pinned above). So a `view_modified` of the same name must NOT
+		// invalidate them, while a `table_*` of the base MUST. The existing tests already
+		// prove `view_modified` *can* invalidate a real view-dep plan and `table_*` paths
+		// wire through, so the `===` controls below are non-vacuous.
+
+		it('ALTER VIEW of the same name does NOT invalidate a CTE-target plan (no view dep)', async () => {
+			await db.exec('create table cte_base (id integer primary key, color text)');
+			await db.exec("insert into cte_base values (1, 'red')");
+			const stmt = db.prepare("with t as (select id, color from cte_base) update t set color = 'x' where id = 1");
+			const p1 = stmt.compile();
+			expect(stmt.compile(), 'compile() caches the plan (control)').to.equal(p1);
+
+			// Create a real view named `t` (the CTE shadows it as the write target) and
+			// fire the watched `view_modified` event for `t`.
+			await db.exec('create view t as select id, color from cte_base');
+			await db.exec(`alter view t set tags (display_name = 'x')`);
+			expect(stmt.compile(), 'the CTE target recorded no view dep on t, so view_modified must not invalidate').to.equal(p1);
+
+			// Re-execution still routes to the base table (the CTE shadows the view), so the
+			// write lands on cte_base — proof the un-invalidated cached plan targets the base.
+			await stmt.run();
+			const out: unknown[] = [];
+			for await (const row of db.eval('select color from cte_base where id = 1')) out.push(row);
+			expect(out, 'the CTE-target write updated the real base table').to.deep.equal([{ color: 'x' }]);
+			await stmt.finalize();
+		});
+
+		it('an additive ALTER TABLE of the base MUST invalidate a CTE-target plan', async () => {
+			await db.exec('create table cte_base (id integer primary key, color text)');
+			const stmt = db.prepare("with t as (select id, color from cte_base) update t set color = 'x' where id = 1");
+			const p1 = stmt.compile();
+			expect(stmt.compile(), 'compile() caches the plan (control)').to.equal(p1);
+
+			// Additive alter (so the recompiled statement still plans + runs) fires the
+			// watched `table_*` event for cte_base — the base-table dep the ephemeral
+			// target recorded.
+			await db.exec('alter table cte_base add column extra text');
+			expect(stmt.compile(), 'the base-table dep must invalidate on a table_* event').to.not.equal(p1);
+			await stmt.finalize();
+		});
+
+		it('an additive ALTER TABLE of the base MUST invalidate an inline-subquery-target plan', async () => {
+			// The inline form has no name to collide with, so it gets only the base-table
+			// invalidation half.
+			await db.exec('create table cte_base (id integer primary key, color text)');
+			const stmt = db.prepare("update (select id, color from cte_base) as v set color = 'x' where v.id = 1");
+			const p1 = stmt.compile();
+			expect(stmt.compile(), 'compile() caches the plan (control)').to.equal(p1);
+
+			await db.exec('alter table cte_base add column extra text');
+			expect(stmt.compile(), 'the base-table dep must invalidate on a table_* event').to.not.equal(p1);
 			await stmt.finalize();
 		});
 	});
