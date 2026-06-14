@@ -469,6 +469,42 @@ describe('StoreTable UNIQUE constraints', () => {
 			expect(await collect(db, `SELECT count(*) AS n FROM comp`)).to.deep.equal([{ n: 2 }]);
 		});
 
+		it('UPDATE into a collision is enforced under the index collation (shares findUniqueConflict)', async () => {
+			// UPDATE routes through the same checkUniqueConstraints → findUniqueConflict
+			// path as INSERT (selfPks excludes the row being updated), so the index
+			// collation governs equally. Two cases pinned in one table:
+			//   - COARSER index (NOCASE over BINARY): two BINARY-distinct rows coexist,
+			//     then UPDATE one to a NOCASE-equal value collides → rejected.
+			//   - the same UPDATE that moves to a genuinely distinct value succeeds.
+			await db.exec(`CREATE TABLE up (id INTEGER PRIMARY KEY, b TEXT) USING store`); // b is BINARY
+			await db.exec(`CREATE UNIQUE INDEX up_b ON up (b COLLATE NOCASE)`);
+			await db.exec(`INSERT INTO up VALUES (1, 'alpha'), (2, 'beta')`);
+			// UPDATE id=2 to a NOCASE-equal of id=1's value → conflict under the index.
+			await rejects(`UPDATE up SET b = 'ALPHA' WHERE id = 2`);
+			// The self-row may always be "updated" to its own NOCASE-equal value (selfPks
+			// excludes it) — no false conflict.
+			await db.exec(`UPDATE up SET b = 'ALPHA' WHERE id = 1`);
+			// And a move to a genuinely distinct value succeeds.
+			await db.exec(`UPDATE up SET b = 'gamma' WHERE id = 2`);
+			expect(await collect(db, `SELECT id, b FROM up ORDER BY id`)).to.deep.equal([
+				{ id: 1, b: 'ALPHA' }, { id: 2, b: 'gamma' },
+			]);
+		});
+
+		it('UPDATE under a FINER index keeps BINARY-distinct case-variants updatable', async () => {
+			// FINER index (BINARY over NOCASE column): 'Bob'/'bob' coexist; UPDATE one to
+			// another BINARY-distinct case-variant stays admitted, but UPDATE onto the
+			// other's exact bytes collides under BINARY.
+			await db.exec(`CREATE TABLE uf (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX uf_b ON uf (b COLLATE BINARY)`);
+			await db.exec(`INSERT INTO uf VALUES (1, 'Bob'), (2, 'bob')`); // BINARY-distinct ⇒ both admitted
+			await db.exec(`UPDATE uf SET b = 'BOB' WHERE id = 2`); // still BINARY-distinct from 'Bob'
+			expect(await collect(db, `SELECT id, b FROM uf ORDER BY id`)).to.deep.equal([
+				{ id: 1, b: 'Bob' }, { id: 2, b: 'BOB' },
+			]);
+			await rejects(`UPDATE uf SET b = 'Bob' WHERE id = 2`); // exact BINARY dup of id=1 ⇒ rejected
+		});
+
 		it('conflict resolution (OR IGNORE / OR REPLACE) acts on the index-collation conflict', async () => {
 			// A NOCASE index over a BINARY column: a case-variant collides, and the OR arms
 			// must resolve that index-collation conflict (REPLACE evicts the prior row).
