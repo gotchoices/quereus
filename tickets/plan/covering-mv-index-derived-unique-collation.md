@@ -87,3 +87,47 @@ concern rather than active work.
 - The relation-key promotion gate (`enforcementCollationCoversDeclared`) — audited sound and
   unchanged by the landed ticket; it under-promotes (never over-claims) regardless of the
   covering-MV enforcement collation.
+
+---
+
+## Triage decision (2026-06-13, human sign-off): gate covering-MV eligibility on collation — don't widen candidate generation
+
+The dev's reframe: *"Shouldn't we just not consider it covered if it doesn't have
+the same collation?"* — adopted. This **supersedes the "Desired end state" above**
+and collapses the hard three-site candidate-generation widening into a simple
+eligibility gate, aligned with the engine's covering-structure-is-optional
+philosophy (correctness comes from the per-scan fallback, which the landed
+`store-index-derived-unique-honors-index-collation` ticket already made correct).
+
+**The rule:** at the point a covering MV is classified as answering an
+index-derived UNIQUE (the row-time covering-structure selection), compare the
+MV backing key's enforcement collation against the **index's per-column
+collation**. If the MV key collation is **finer** than the index collation
+(BINARY MV key under a NOCASE index → its candidate set is an unsound *subset*,
+the silent-miss case), the MV does **not** cover that UNIQUE — decline it and let
+the constraint enforce via the per-scan path (already correct). The minimal sound
+gate is "decline when MV key is finer than index enforcement"; the simplest is
+"decline on any non-equal collation."
+
+- **Coarser-or-equal MV key** (NOCASE MV under a BINARY index → superset) is
+  sound *iff* re-validation runs under the index collation. Two choices for the
+  plan pass: (a) keep it eligible and align **memory's**
+  `checkUniqueViaMaterializedView` to the index collation (the store's
+  `findUniqueConflictViaCoveringMv` already does this — closes the finer-index
+  store/memory divergence in §2), or (b) for maximum simplicity, decline it too
+  (exact-collation-match-or-per-scan) and accept the minor perf loss in this
+  exotic case. Recommend (a): it's a one-line alignment that also fixes the
+  existing intra-memory inconsistency, and it keeps the optimization where it's
+  sound.
+- **No candidate-generation widening.** `lookupCoveringConflicts` /
+  `tryBuildCoveringPrefix` stay as-is; the subset-candidate problem disappears
+  because a finer MV key is never *selected* as covering in the first place.
+- **Eligibility locus** (the new gate) is wherever the row-time covering-MV is
+  matched to the UC — find it via the prover's row-time classification
+  (docs/lens.md § "enforced-set-level row-time"; `database-materialized-views.ts`
+  covering-conflict entry). The plan pass pins the exact site.
+
+**Acceptance:** a finer-collation MV is declined as covering and the UNIQUE
+enforces correctly via per-scan (no silent miss), cross-module; a coarser/equal
+MV stays eligible and memory + store agree (per choice (a)). The exotic shape
+gets a cross-module parity case under both `yarn test` and `yarn test:store`.
