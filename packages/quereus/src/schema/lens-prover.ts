@@ -1781,7 +1781,8 @@ function rejectBasisGovernedConflictActionForProvedKey(
  * (`governingKey.length < mappedBasisCols.length`). The strict filter excludes an
  * exact-match basis key, which enforces exactly the logical key and is fully realizable —
  * it must not warn. One warning per logical key; when several strict-subset basis keys
- * exist, the first (smallest enumerated) names the message.
+ * exist, the first in {@link findGoverningBasisKeys} enumeration order (the basis PK if it
+ * governs, else the first declared UNIQUE) names the message — not the smallest by arity.
  *
  * Scoped to single-source `proved` keys:
  *  - `readOnly` ⇒ early return (a read-only table never writes, so the over-enforcement

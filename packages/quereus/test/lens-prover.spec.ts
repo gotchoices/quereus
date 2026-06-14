@@ -717,6 +717,28 @@ describe('lens prover: over-restrictive basis key (advisory)', () => {
 			await db.close();
 		}
 	});
+
+	it('the over-restriction is real: the basis rejects two write-through rows the logical key permits', async () => {
+		// The advisory's central claim, end-to-end. Logical unique(a, b) advertises that two
+		// rows differing only in `b` may coexist; the governing basis unique(a) rejects the
+		// second on the write-through. Demonstrates the over-enforcement the warning describes
+		// is observable runtime behavior, not merely a deploy-time classification.
+		const db = new Database();
+		try {
+			await db.exec('declare schema y { table t (id integer primary key, a integer not null unique, b integer not null) }');
+			await db.exec('apply schema y');
+			await db.exec('declare logical schema x { table t (id integer primary key, a integer, b integer, unique (a, b)) }');
+			await db.exec('apply schema x');
+			expect(overRestrictive(db).length, 'the deploy warned about exactly this').to.equal(1);
+
+			// First write lands; the second — distinct on the logical key (a, b), colliding only
+			// on the basis sub-key (a) — is rejected by the basis unique(a).
+			await db.exec('insert into x.t (id, a, b) values (1, 1, 2)');
+			await expectThrows(() => db.exec('insert into x.t (id, a, b) values (2, 1, 3)'), /UNIQUE constraint failed/i);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('lens prover: read-only (key reconstructibility)', () => {
