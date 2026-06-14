@@ -238,16 +238,15 @@ describe('Maintained-table differ — review coverage', () => {
 			const mv = db.schemaManager.getMaintainedTable('main', 'mv')!;
 			expect(mv.derivation.columns, 'rename-list landed (a, c)').to.deep.equal(['a', 'c']);
 			expect(await rows('select a, c from mv')).to.deep.equal([{ a: 1, c: 10 }]);
-			// KNOWN GAP (orthogonal to this ticket — tracked by fix ticket
-			// maintained-reshape-reattach-drops-concurrent-tags): a *reshaping* re-attach
-			// rebuilds `live` from the backing module's post-ALTER schema, which does not
-			// carry the catalog's table tags, so the concurrent SET TAGS is dropped. A
-			// non-reshaping (body-only) re-attach preserves tags (covered above); the
-			// pre-existing IMPLICIT reshape had the same gap. We deliberately do NOT assert
-			// the tag value here so this stays green until that fix lands; the rename-list
-			// reshape — this ticket's surface — converges regardless.
+			// A *reshaping* re-attach rebuilds `live` from the backing module's post-ALTER
+			// schema (derivation-less AND tag-less); the rebuild now grafts the catalog's
+			// table tags back, so the concurrent SET TAGS riding the same diff lands too
+			// (fix ticket maintained-reshape-reattach-drops-concurrent-tags).
+			expect(mv.tags?.['team.owner'], 'concurrent SET TAGS landed through the reshape').to.equal('new');
+			// Both legs converged: the rename-list reshape AND the tag change.
 			const tagDiff = diffMv();
 			expect(tagDiff.mv?.setMaintained, 'rename-list converged ⇒ no further re-attach').to.be.undefined;
+			expect(tagDiff.mv?.tableTagsChange, 'tag change converged ⇒ no further SET TAGS').to.be.undefined;
 		});
 
 		it('a rename-list change under require-hint is an alter, not an unhinted create+drop', async () => {

@@ -98,6 +98,29 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 			}
 		});
 
+		it('an in-place reshape preserves the MV table tags (module schema is tag-less)', async () => {
+			const db = new Database();
+			try {
+				await db.exec('create table t (id integer primary key, a integer)');
+				await db.exec('insert into t values (1, 10)');
+				await db.exec(`create materialized view mv as select * from t with tags ("team.owner" = 'sre')`);
+				expect(db.schemaManager.getTable('main', 'mv')!.tags?.['team.owner'], 'tag set at create')
+					.to.equal('sre');
+
+				// A trailing source-column add drives an in-place reshape. The reshape
+				// rebuilds the catalog record from the module's post-ALTER schema, which
+				// carries no catalog tags — the rebuild must graft them back.
+				await db.exec('alter table t add column b integer default 5');
+				await db.exec('refresh materialized view mv');
+
+				const reshaped = db.schemaManager.getTable('main', 'mv')!;
+				expect(reshaped.columns.map(c => c.name), 'reshaped in place').to.deep.equal(['id', 'a', 'b']);
+				expect(reshaped.tags?.['team.owner'], 'tags survive the reshape').to.equal('sre');
+			} finally {
+				await db.close();
+			}
+		});
+
 		it('a NOT NULL trailing add reshapes in place (added nullable, tightened after the reconcile)', async () => {
 			const db = new Database();
 			try {

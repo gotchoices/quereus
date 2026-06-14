@@ -1079,7 +1079,7 @@ export async function attachMaintainedDerivation(
 	// refresh reshapes it back). Coherent and re-runnable either way.
 	const restoreReshaped = (moduleSchema: TableSchema): void => {
 		if (priorMaintained) {
-			const restored: MaintainedTableSchema = { ...moduleSchema, derivation: priorMaintained.derivation };
+			const restored = graftReshapedRecord(moduleSchema, priorMaintained);
 			schema.addTable(restored);
 			db.markMaterializedViewStale(restored);
 		} else {
@@ -1104,7 +1104,7 @@ export async function attachMaintainedDerivation(
 				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
 				moduleMutated = true;
 			}
-			live = { ...current, derivation: maintained.derivation };
+			live = graftReshapedRecord(current, maintained);
 			schema.addTable(live);
 		}
 
@@ -1134,7 +1134,7 @@ export async function attachMaintainedDerivation(
 			reconcileCommitted = true;
 			for (const op of reshapePlan.postReconcileOps) {
 				current = await module.alterTable!(db, schemaName, name, reshapeOpToChange(op));
-				live = { ...current, derivation: maintained.derivation };
+				live = graftReshapedRecord(current, maintained);
 				schema.addTable(live);
 			}
 		}
@@ -2146,6 +2146,20 @@ function reshapeOpToChange(op: ReshapeColumnOp): SchemaChangeInfo {
 }
 
 /**
+ * Rebuild a maintained-table catalog record from the backing module's post-reshape
+ * `TableSchema`. `module.alterTable` returns ONLY the physical column shape — it
+ * tracks neither the catalog-only `derivation` nor the catalog-only `tags`, so a
+ * bare `{ ...moduleSchema, derivation }` graft silently drops the table's tags.
+ * Graft both from the authoritative catalog record so a reshaping re-attach
+ * preserves any tags a concurrent SET TAGS routed through ALTER MATERIALIZED VIEW
+ * (and a refresh-driven reshape never wipes existing tags). A non-reshaping
+ * re-attach keeps the whole record, tags included — this restores parity.
+ */
+function graftReshapedRecord(moduleSchema: TableSchema, source: MaintainedTableSchema): MaintainedTableSchema {
+	return { ...moduleSchema, derivation: source.derivation, tags: source.tags };
+}
+
+/**
  * The sited error a refresh raises when the re-derived body shape cannot be
  * reconciled onto the live maintained table in place — an interleaving column
  * reorder or a physical-PK definition change (or a host module without
@@ -2260,7 +2274,7 @@ async function reshapeBackingInPlace(
 	mv.derivation.coarsenedKey = shape.coarsenedKey;
 	mv.derivation.ordering = shape.ordering;
 	mv.derivation.sourceTables = shape.sourceTables;
-	let live: MaintainedTableSchema = { ...current, derivation: mv.derivation };
+	let live: MaintainedTableSchema = graftReshapedRecord(current, mv);
 	schema.addTable(live);
 
 	// Data reconcile: re-run the body and swap contents (the identity-preserving
@@ -2287,7 +2301,7 @@ async function reshapeBackingInPlace(
 	// docs/materialized-views.md).
 	for (const op of plan.postReconcileOps) {
 		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
-		live = { ...current, derivation: mv.derivation };
+		live = graftReshapedRecord(current, mv);
 		schema.addTable(live);
 	}
 
@@ -2775,8 +2789,9 @@ async function renameShiftedBackingColumns(
 	}
 	if (current !== backing) {
 		// The module's alterTable returns a fresh TableSchema that does NOT carry
-		// the derivation — re-attach it so the registered record stays maintained.
-		const renamed: TableSchema = { ...current, derivation: mv.derivation };
+		// the derivation or the catalog-only tags — re-graft both so the registered
+		// record stays maintained and keeps its tags.
+		const renamed: TableSchema = graftReshapedRecord(current, mv);
 		schema.addTable(renamed);
 		db.schemaManager.getChangeNotifier().notifyChange({
 			type: 'table_modified',
