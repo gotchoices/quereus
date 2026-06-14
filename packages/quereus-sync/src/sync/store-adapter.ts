@@ -35,15 +35,29 @@
  *     maintenance + capture are deferred to the finalize and FK actions are off
  *     for a wholesale load, so the only seam facet skipping the call drops
  *     outright is commit-time GLOBAL ASSERTION evaluation over the bootstrapped
- *     rows — deliberate under the seam's trust-the-origin contract: a complete
- *     snapshot already satisfied the origin's assertions, and per-flush
- *     evaluation over partial data could spuriously fail a valid snapshot
- *     (a cross-table assertion seeing children before parents). The remaining
- *     seam work for a wholesale load is otherwise deferred, so skipping the call
- *     also removes the per-flush transaction/savepoint and the per-flush
- *     full-rebuild. (Whether the finalize should re-validate assertions over the
- *     converged state is an open design question — see the backlog ticket
- *     `sync-bootstrap-assertion-enforcement`.)
+ *     rows — deliberate under the seam's trust-the-origin contract. The
+ *     incremental path enforces global assertions because it **merges** deltas
+ *     from possibly many origins into the receiver's existing state, and a
+ *     cross-origin merge can produce a global-invariant violation no single
+ *     origin ever saw. Bootstrap does something different: it installs **one**
+ *     origin's already-converged state **wholesale (replace, not merge)** — no
+ *     merge means no merge-introduced violation, so a complete snapshot already
+ *     satisfied the origin's assertions and re-checking is redundant. The
+ *     `bootstrapFinalize` therefore does NOT evaluate any global assertion —
+ *     not even a no-dependency one. This uniform skip is consistent with the
+ *     seam's general trust-the-origin posture for every other constraint type
+ *     (see `docs/materialized-views.md` § Trust boundary). MV-backed assertions
+ *     would see the MV only after `refreshAllMaterializedViews()`; under
+ *     trust-the-origin they are not evaluated at finalize at all, so MV-refresh
+ *     ordering is moot for assertions. Residual risk (a corrupt/hostile snapshot
+ *     installs invariant-violating data) is already unguarded for every other
+ *     constraint type; a one-off assertion sweep would be inconsistent
+ *     defense-in-depth — a separate integrity layer is the right fix if origins
+ *     are ever distrusted. Per-flush evaluation also could not serve bootstrap
+ *     correctly: it could spuriously fail a valid snapshot whose cross-table
+ *     assertion sees children before parents. The remaining seam work for a
+ *     wholesale load is otherwise deferred, so skipping the call also removes
+ *     the per-flush transaction/savepoint and the per-flush full-rebuild.
  *   - `bootstrapFinalize` call (empty data/schema): converges every MV in
  *     dependency order via `db.refreshAllMaterializedViews()`, then fires a
  *     coarse `db.notifyExternalChange` per bootstrapped base table and per

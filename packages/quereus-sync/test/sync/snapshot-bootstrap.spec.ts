@@ -358,6 +358,46 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		expect(await collect(db, 'select v from mv order by v')).to.deep.equal([{ v: 'val0' }, { v: 'val1' }]);
 	});
 
+	it('assertion-violating bootstrap succeeds — trust-the-origin (deliberate inverse of store-adapter-seam.spec.ts "assertion failure propagates")', async () => {
+		// Bootstrap replaces (one origin's converged state, wholesale), whereas
+		// incremental merges and must enforce. No assertion is evaluated at finalize.
+		await db.exec('create table t (id text primary key, v integer) using store');
+		await db.exec('create assertion non_negative check (not exists (select 1 from t where v < 0))');
+
+		const spies = installSpies(db);
+		const kv = new InMemoryKVStore();
+		const syncEvents = new SyncEventEmitterImpl();
+		const states: SyncState[] = [];
+		syncEvents.onSyncStateChange(s => states.push(s));
+		const syncManager = await makeSyncManager(kv, syncEvents);
+
+		const remoteSiteId = generateSiteId();
+		const remoteHLC = new HLCManager(remoteSiteId);
+		const snapshotId = 'snap-assertion-trust-1';
+		const chunks: SnapshotChunk[] = [
+			{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+			{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 1 },
+			{ type: 'column-versions', schema: 'main', table: 't', entries: [cvEntry(['r1'], 'v', remoteHLC.tick(), -5)] },
+			{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 1 },
+			{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
+		];
+
+		// Must not throw despite violating the assertion — bootstrap trusts the origin.
+		await syncManager.applySnapshotStream(toStream(chunks));
+
+		// Converged row is present with the violating value.
+		expect(await collect(db, 'select v from t')).to.deep.equal([{ v: -5 }]);
+		// Seam was never called — no assertion evaluation during bootstrap.
+		expect(spies.seamCalls, 'seam skipped: no assertion evaluated during bootstrap').to.equal(0);
+		// Finalize converged exactly once.
+		expect(spies.refreshCalls, 'finalized exactly once').to.equal(1);
+		// Snapshot checkpoint was cleared — success path.
+		expect(await kv.get(new TextEncoder().encode(`sc:${snapshotId}`)), 'checkpoint cleared').to.be.undefined;
+		// Sync state reached synced, never error.
+		expect(states.map(s => s.status), 'reached synced').to.include('synced');
+		expect(states.map(s => s.status), 'no error state').to.not.include('error');
+	});
+
 	it('post-bootstrap incremental write maintains the MV (seam runs; no stale row-time plan)', async () => {
 		await db.exec('create table t (id text primary key, v text) using store');
 		await db.exec('create materialized view mv as select distinct v from t');
