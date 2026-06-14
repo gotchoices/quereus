@@ -8,11 +8,12 @@ import { ParameterScope } from '../../src/planner/scopes/param.js';
 import { buildInsertStmt } from '../../src/planner/building/insert.js';
 import { buildUpdateStmt } from '../../src/planner/building/update.js';
 import { buildDeleteStmt } from '../../src/planner/building/delete.js';
+import { buildSelectStmt } from '../../src/planner/building/select.js';
 import { ViewMutationError } from '../../src/planner/mutation/mutation-diagnostic.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
-import { ViewMutationNode } from '../../src/planner/nodes/view-mutation-node.js';
+import { ViewMutationNode, type IdentityCapture } from '../../src/planner/nodes/view-mutation-node.js';
 import type { DmlExecutorNode } from '../../src/planner/nodes/dml-executor-node.js';
-import { isRelationalNode, type PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type RelationalPlanNode, type TableDescriptor } from '../../src/planner/nodes/plan-node.js';
 import type * as AST from '../../src/parser/ast.js';
 
 /**
@@ -211,5 +212,126 @@ describe('View Mutation Substrate (with defaults unknown column)', () => {
 		const err = caught as ViewMutationError;
 		expect(err.mutationDiagnostic.reason).to.equal('default-target-not-found');
 		expect(err.message).to.contain(`names column 'nope'`);
+	});
+});
+
+/**
+ * Structural gate for the ordered multi-capture substrate
+ * (ticket `view-mutation-ordered-multi-capture`). `ViewMutationNode` carries an
+ * optional `nestedCaptures` list materialized AFTER the primary `identityCapture`,
+ * in list order, before the base ops. No producer fills the list yet (the set-op
+ * leg compose does), so the load-bearing cursor arithmetic — `getChildren` order,
+ * the `withChildren` round-trip, descriptor preservation, and the unchanged
+ * short-circuit — is otherwise unexercised. These tests construct the node
+ * directly (the only `nestedCaptures`-bearing shape available pre-compose).
+ */
+describe('View Mutation Substrate (ordered multi-capture)', () => {
+	async function ctx(): Promise<PlanningContext> {
+		const db = new Database();
+		await db.exec(`create table mc (id integer primary key, v integer)`);
+		const parameterScope = new ParameterScope(new GlobalScope(db.schemaManager));
+		return {
+			db,
+			schemaManager: db.schemaManager,
+			parameters: {},
+			scope: parameterScope,
+			cteNodes: new Map(),
+			schemaDependencies: new BuildTimeDependencyTracker(),
+			schemaCache: new Map(),
+			cteReferenceCache: new Map(),
+			outputScopes: new Map(),
+		};
+	}
+
+	/** A fresh relational plan node to stand in as a capture/base-op source. */
+	function relSource(pc: PlanningContext, sql: string): RelationalPlanNode {
+		const ast = new Parser().parseAll(sql)[0] as AST.SelectStmt;
+		return buildSelectStmt(pc, ast) as RelationalPlanNode;
+	}
+
+	function cap(source: RelationalPlanNode): IdentityCapture {
+		return { source, descriptor: {} as TableDescriptor };
+	}
+
+	it('threads getChildren in order base ops -> primary capture -> nested captures', async () => {
+		const pc = await ctx();
+		const baseOp = relSource(pc, `select id from mc where id = 1`);
+		const primary = cap(relSource(pc, `select id from mc where id = 2`));
+		const nested0 = cap(relSource(pc, `select id from mc where id = 3`));
+		const nested1 = cap(relSource(pc, `select id from mc where id = 4`));
+		const vm = new ViewMutationNode(pc.scope, [baseOp], undefined, undefined, undefined, primary, [nested0, nested1]);
+
+		// Order is the contract the emitter's param cursor mirrors exactly.
+		expect(vm.getChildren()).to.deep.equal([baseOp, primary.source, nested0.source, nested1.source]);
+		// Side inputs (captures) are materialized into context, never forwarded.
+		expect(vm.getRelations()).to.not.include(primary.source);
+		expect(vm.getRelations()).to.not.include(nested0.source);
+		expect(vm.getRelations()).to.not.include(nested1.source);
+		// Diagnostics reflect the breakdown.
+		expect(vm.toString()).to.contain('+capture(1+2)');
+		expect(vm.getLogicalAttributes().nestedCaptures).to.equal(2);
+		expect(vm.getLogicalAttributes().identityCapture).to.equal('identity');
+	});
+
+	it('withChildren returns this when every source is reference-identical', async () => {
+		const pc = await ctx();
+		const baseOp = relSource(pc, `select id from mc where id = 1`);
+		const primary = cap(relSource(pc, `select id from mc where id = 2`));
+		const nested0 = cap(relSource(pc, `select id from mc where id = 3`));
+		const vm = new ViewMutationNode(pc.scope, [baseOp], undefined, undefined, undefined, primary, [nested0]);
+		expect(vm.withChildren(vm.getChildren())).to.equal(vm);
+	});
+
+	it('withChildren rebuilds a replaced nested source while preserving every descriptor identity', async () => {
+		const pc = await ctx();
+		const baseOp = relSource(pc, `select id from mc where id = 1`);
+		const primary = cap(relSource(pc, `select id from mc where id = 2`));
+		const nested0 = cap(relSource(pc, `select id from mc where id = 3`));
+		const nested1 = cap(relSource(pc, `select id from mc where id = 4`));
+		const vm = new ViewMutationNode(pc.scope, [baseOp], undefined, undefined, undefined, primary, [nested0, nested1]);
+
+		// Replace only nested[1]'s source (the last child) — everything else identical.
+		const replacement = relSource(pc, `select id from mc where id = 99`);
+		const newChildren = [...vm.getChildren()];
+		newChildren[newChildren.length - 1] = replacement;
+		const rebuilt = vm.withChildren(newChildren) as ViewMutationNode;
+
+		expect(rebuilt).to.not.equal(vm);
+		expect(rebuilt.nestedCaptures!.length).to.equal(2);
+		// Descriptors are bound to by identity — a rebuild must reuse the SAME object.
+		expect(rebuilt.identityCapture!.descriptor).to.equal(primary.descriptor);
+		expect(rebuilt.nestedCaptures![0].descriptor).to.equal(nested0.descriptor);
+		expect(rebuilt.nestedCaptures![1].descriptor).to.equal(nested1.descriptor);
+		// Unchanged sources kept; replaced source picked up.
+		expect(rebuilt.nestedCaptures![0].source).to.equal(nested0.source);
+		expect(rebuilt.nestedCaptures![1].source).to.equal(replacement);
+	});
+
+	it('handles nested captures with no primary (defensive shape: base ops -> nested)', async () => {
+		const pc = await ctx();
+		const baseOp = relSource(pc, `select id from mc where id = 1`);
+		const nested0 = cap(relSource(pc, `select id from mc where id = 3`));
+		const vm = new ViewMutationNode(pc.scope, [baseOp], undefined, undefined, undefined, undefined, [nested0]);
+
+		expect(vm.getChildren()).to.deep.equal([baseOp, nested0.source]);
+		expect(vm.toString()).to.contain('+capture(0+1)');
+		expect(vm.getLogicalAttributes().identityCapture).to.equal(undefined);
+		expect(vm.getLogicalAttributes().nestedCaptures).to.equal(1);
+		// Round-trips.
+		expect(vm.withChildren(vm.getChildren())).to.equal(vm);
+	});
+
+	it('an empty/absent nested list lowers byte-identically to the pre-list substrate', async () => {
+		const pc = await ctx();
+		const baseOp = relSource(pc, `select id from mc where id = 1`);
+		const primary = cap(relSource(pc, `select id from mc where id = 2`));
+		const vm = new ViewMutationNode(pc.scope, [baseOp], undefined, undefined, undefined, primary);
+
+		expect(vm.getChildren()).to.deep.equal([baseOp, primary.source]);
+		// Bare `+capture` (no breakdown) for the common single-capture case.
+		expect(vm.toString()).to.contain('+capture');
+		expect(vm.toString()).to.not.contain('+capture(');
+		expect(vm.getLogicalAttributes().nestedCaptures).to.equal(undefined);
+		expect(vm.withChildren(vm.getChildren())).to.equal(vm);
 	});
 });
