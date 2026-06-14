@@ -33,3 +33,16 @@ Expected shape (the design stays out of the core-engine "synced" vocabulary):
 Use case: the sync-store module declares the requirement, so a migration
 target (`docs/migration.md` § 1 Expand) cannot deploy with a
 platform-dependent conversion function.
+
+---
+
+## Promotion note (2026-06-14): runner-ready, self-contained, inert-by-default
+
+Promoted backlog → plan. This is the self-contained determinism-class piece, NOT
+the broader sync layer: a `replicable: true` UDF declaration (builtins auto-qualify),
+a backing-host capability field (`requiresReplicableDerivations`), and create-time
+validation that every function in a materialized-view / derivation body is replicable
+when the resolved host demands it. The design is fully specified in
+docs/migration.md § Determinism requirements — no open human decision. Hosts that
+don't demand it (memory) see zero behavior change, so it ships inert until a
+sync-store host opts in; safe to build ahead of the rest of the sync roadmap.

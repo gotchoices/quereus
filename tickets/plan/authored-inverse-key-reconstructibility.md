@@ -47,3 +47,16 @@ and must stay: a collapsed image cannot be a key.
 - Mutation-time key routing (DELETE/UPDATE-by-key through the inverse) must
   evaluate the put to locate the basis row — verify the write path supports
   keyed access through an authored put before flipping the verdict.
+
+---
+
+## Promotion note (2026-06-14): runner-ready, no sign-off needed
+
+Promoted backlog → plan. This is a self-contained, decision-free technical task:
+the design is settled (thread the round-trip pass's proven-bijection verdict into
+`checkKeyReconstructibility` so a PK/UNIQUE over an authored-inverse column whose
+forward/inverse pair was proved bijective counts as reconstructible; the
+non-injective case stays read-only, unchanged). The open items in the spec sketch
+(verdict threading order — `proveRoundTrip` runs after the read-only verdict today;
+keyed write-path access through an authored put) are implementation-ordering
+questions the plan/implement pass resolves, not human decisions.
