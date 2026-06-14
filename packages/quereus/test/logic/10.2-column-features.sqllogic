@@ -160,6 +160,21 @@ select name from t_collate_order order by name collate nocase;
 
 drop table t_collate_order;
 
+-- 2e. Undecorated text PRIMARY KEY resolves to BINARY under the memory module.
+--     (The store module deliberately applies NOCASE as its default K instead —
+--      see docs/schema.md §"Per-column PK key collation" for the cross-backend contrast.)
+create table t_text_pk (x text primary key);
+select name, collation from table_info('t_text_pk');
+→ [{"name":"x","collation":"BINARY"}]
+
+-- BINARY PK: 'a' and 'A' are distinct rows (would collide under NOCASE).
+insert into t_text_pk values ('a');
+insert into t_text_pk values ('A');
+select count(*) as n from t_text_pk;
+→ [{"n":2}]
+
+drop table t_text_pk;
+
 -- ===================================
 -- 3. NOT NULL / NULL Behavior
 -- ===================================

@@ -359,7 +359,15 @@ points:
   column (e.g. the engine's BINARY column default becomes NOCASE under K = NOCASE), so an
   undecorated text PK keeps the store's historical NOCASE-keyed behavior; an *explicit*
   `COLLATE` clause — even one diverging from K — is left exactly as declared and keyed
-  under it. (The explicit-vs-implicit distinction rides on `ColumnSchema.collationExplicit`,
+  under it. This means the same DDL `create table t (x text primary key)` yields **BINARY
+  under the memory module** (`'a'` and `'A'` are distinct rows) and **NOCASE under the
+  store** (`'a'` and `'A'` collide). This is intentional — the memory side honors the
+  session `default_collation` (BINARY out of box, via `resolveDefaultCollation` in
+  `quereus/src/schema/table.ts`), while the store side preserves its on-disk NOCASE
+  semantics for undecorated text PKs. An authored lens (bijection inverse) for a text PK
+  will therefore be read-only under the store default but writable under memory, because
+  the value-discriminating check requires BINARY-level distinct 'a'/'A' to prove
+  injectivity. (The explicit-vs-implicit distinction rides on `ColumnSchema.collationExplicit`,
   set by `columnDefToSchema` for a `COLLATE` clause, and — for a **materialized-view backing
   column** — by `deriveBackingShape` (`materialized-view-helpers.ts`) when the body output
   column's collation provenance is `explicit` or `declared`. So an MV whose key column

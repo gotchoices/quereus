@@ -226,6 +226,14 @@ export function validateCollationForType(
  *
  * Only the *implicit* default is gated this way; an *explicit* `COLLATE` clause
  * keeps its existing (looser) {@link validateCollationForType} handling.
+ *
+ * **Cross-backend divergence (intentional).** This function resolves the
+ * *engine/memory* default only. The store module deliberately overrides an
+ * implicit-default text PK column to its table-level key collation K (NOCASE by
+ * default) via `reconcilePkCollations` (`quereus-store/store-module.ts`). So the
+ * same DDL `create table t (x text primary key)` yields BINARY under the memory
+ * module and NOCASE under the store. This is a deliberate backward-compatibility
+ * choice, not a bug — see `docs/schema.md` §"Per-column PK key collation".
  */
 export function resolveDefaultCollation(logicalType: LogicalType, defaultCollation: string): string {
 	const normalized = normalizeCollationName(defaultCollation);
