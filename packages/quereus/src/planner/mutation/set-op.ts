@@ -15,7 +15,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
 import { propagate, type BaseOp, type MutableViewLike, type MutationRequest } from './propagate.js';
-import { MS_UPDATE_KEYS_CTE, isJoinBody, isInnerJoinBody, analyzeJoinView, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, capturedSideIndices, withKeyCapture, type MultiSourceKeyCapture, type JoinViewAnalysis } from './multi-source.js';
+import { MS_UPDATE_KEYS_CTE, isJoinBody, isInnerJoinBody, analyzeJoinView, analyzeMultiSourceInsert, decomposeUpdate, decomposeDelete, buildMultiSourceKeyCapture, capturedSideIndices, withKeyCapture, type MultiSourceKeyCapture, type JoinViewAnalysis } from './multi-source.js';
 import { cloneExpr, transformExpr } from './scope-transform.js';
 import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
@@ -243,27 +243,48 @@ function isSubtreeOperand(operand: AST.QueryExpr): boolean {
 }
 
 /**
- * True iff ANY leaf leg of the set-op body (at any depth, either operand) is a multi-source
- * (join) body. Insert-through a join leg needs the plan-level shared-surrogate envelope, which
- * the capture-driven set-op fan does not produce, so join-leg INSERT is deferred to
- * `set-op-write-multisource-leg-insert`. The `is_insertable_into` static surfaces gate to `NO`
- * when this holds (matching the dynamic insert reject), while UPDATE / DELETE stay writable
- * (`is_updatable` / `is_deletable` = YES). Detects ALL join shapes (inner OR outer): every join
- * leg's insert is deferred, not just the outer ones the update/delete recognizers gate out.
+ * True iff EVERY multi-source (INNER join) leg/branch of this set-op body would accept an
+ * implicit INSERT through the plan-level shared-surrogate envelope
+ * (`set-op-write-multisource-leg-insert`). A body with NO join leg returns `true` (its
+ * single-source legs are the existing insert-through path); a body with ≥1 join leg returns
+ * `true` only when every such leg's `analyzeMultiSourceInsert` probe succeeds.
+ *
+ * A purely structural inner-vs-outer predicate is INSUFFICIENT: an inner equi-join leg can still
+ * reject dynamically with `unsupported-decomposition-key` (a composite shared key — the CV shape),
+ * `unsupported-join` (a non-equi ON), or `no-default` (the shared key is neither supplied nor
+ * defaulted — e.g. the SJ self-join, whose anchor key `emp.mgr` has no default). So this re-derives
+ * the branches the same way the dynamic write does (membership via {@link analyzeSetOpView}, else
+ * {@link analyzeFlaglessSetOpView}) and probes each `isMultiSource` leg with
+ * {@link analyzeMultiSourceInsert} under a synthetic implicit (empty-column) `InsertStmt`, in
+ * try/catch — a leg that throws (composite key, non-equi, no-default, uncovered NOT NULL, …) ⇒
+ * `false`. The empty `columns` makes `analyzeMultiSourceInsert` use the implicit supply set, and an
+ * inner join leg has no existence columns, so the empty `values` is never read.
+ *
+ * This is only ever reached after {@link isSetOpBranchWritable} / {@link isSetOpFlaglessWritableBody}
+ * already passed (an outer-join branch / non-flagless body short-circuits to the conservative
+ * all-`NO` row upstream, never reaching here), so the branch re-derivation will not throw on the
+ * body shape; only the per-leg `analyzeMultiSourceInsert` probe may. It must not leak a structured
+ * diagnostic out of the read TVF, so every probe is caught.
  */
-export function setOpHasMultiSourceLeg(selectAst: AST.QueryExpr): boolean {
-	if (selectAst.type !== 'select' || !selectAst.compound) return false;
-	return operandHasJoinLeg(leftBranchSelect(selectAst)) || operandHasJoinLeg(selectAst.compound.select);
-}
-
-/** Recursive helper for {@link setOpHasMultiSourceLeg}: descend a subtree operand to its leaves. */
-function operandHasJoinLeg(operand: AST.QueryExpr): boolean {
-	if (operand.type !== 'select') return false;
-	const effective = unwrapBranchSelect(operand);
-	if (effective.compound && effective.compound.op !== 'diff') {
-		return operandHasJoinLeg(leftBranchSelect(effective)) || operandHasJoinLeg(effective.compound.select);
+export function setOpJoinLegsInsertable(ctx: PlanningContext, view: MutableViewLike): boolean {
+	const branches = isSetOpMembershipBody(view.selectAst)
+		? analyzeSetOpView(ctx, view).branches
+		: analyzeFlaglessSetOpView(ctx, view).legs.map(l => l.branch);
+	for (const branch of branches) {
+		if (!branch.isMultiSource) continue;
+		const probeStmt: AST.InsertStmt = {
+			type: 'insert',
+			table: { type: 'identifier', name: branch.view.name },
+			columns: [],
+			source: { type: 'values', values: [] },
+		};
+		try {
+			analyzeMultiSourceInsert(ctx, branch.view, probeStmt);
+		} catch {
+			return false; // a leg whose insert envelope rejects (composite / non-equi / no-default key)
+		}
 	}
-	return isJoinBody(effective);
+	return true;
 }
 
 /**
@@ -379,6 +400,26 @@ interface SetOpAnalysis {
 }
 
 /**
+ * One active multi-source (INNER join) leg/branch INSERT to build via the plan-level
+ * shared-surrogate envelope (`buildMultiSourceInsert`) and splice as a nested
+ * `ViewMutationNode` child of the outer set-op write node (`set-op-write-multisource-leg-insert`).
+ *
+ * The set-op insert builders cannot call `buildMultiSourceInsert` (it lives in the building
+ * layer, and `buildMultiSourceInsert` produces a whole `PlanNode`, not an AST `BaseOp`), so they
+ * record this per-leg descriptor instead of routing to {@link propagate}; `buildSetOpMutation`
+ * (beside `buildMultiSourceInsert`) turns each into a nested envelope-backed `ViewMutationNode`.
+ * The `stmt`'s source is self-contained for an insert-through / flag-less VALUES insert, or a
+ * SELECT over `__vmupd_keys` for a membership `set <flag> = true` flip (which reads the OUTER
+ * set-op capture — `buildSetOpMutation` passes the capture-injected context so it resolves).
+ */
+export interface JoinLegInsert {
+	/** The synthetic `__setop_*` / `__setop_legN` join-leg view-like the insert targets. */
+	readonly view: MutableViewLike;
+	/** The per-leg insert (VALUES self-contained, or a SELECT over `__vmupd_keys`). */
+	readonly stmt: AST.InsertStmt;
+}
+
+/**
  * The decomposition of a set-op membership write: the ordered per-branch base ops plus
  * the up-front capture they read. `capture` is absent for insert-through (whose values
  * are self-contained — no affected-row read), present for every probe-driven write
@@ -398,6 +439,17 @@ export interface SetOpWritePlan {
 	 * which then lowers byte-identically to the pre-list substrate.
 	 */
 	readonly nestedCaptures?: MultiSourceKeyCapture[];
+	/**
+	 * The active multi-source (INNER join) leg/branch INSERTs to build via the plan-level
+	 * shared-surrogate envelope and splice as nested `ViewMutationNode` children of the outer
+	 * set-op write node (`set-op-write-multisource-leg-insert`). Populated by the three insert
+	 * routes — membership `set <flag> = true` ({@link buildBranchMembershipInsert}), flag-less
+	 * consistent-leg INSERT ({@link buildFlaglessInsert}), and VALUES insert-through
+	 * ({@link buildInsertThrough}) — in place of the join-leg `propagate` (which would raise the
+	 * internal `unsupported-multisource-insert`). `buildSetOpMutation` builds each via
+	 * `buildMultiSourceInsert`. Absent / empty for a join-leg-free insert.
+	 */
+	readonly joinLegInserts?: JoinLegInsert[];
 }
 
 /** Decompose a set-op membership-column view mutation. Throws a structured diagnostic for unsupported shapes. */
@@ -876,6 +928,13 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 	// chained off this outer capture; the fan accumulates them (`set-op-write-multisource-leg-compose`).
 	const fan = makeJoinLegFan(capture);
 	const baseOps: BaseOp[] = [];
+	// A `set <joinFlag> = true` membership flip into a multi-source (INNER join) branch is built via
+	// the plan-level shared-surrogate envelope and spliced as a nested `ViewMutationNode` child; the
+	// accumulator threads into `buildBranchMembershipInsert` (mirror of the `fan` threading) and
+	// rides the plan (`set-op-write-multisource-leg-insert`). The nested envelope source reads the
+	// OUTER `__vmupd_keys` capture (built above for every UPDATE), so `buildSetOpMutation`'s
+	// capture-injected `opCtx` resolves its `from __vmupd_keys`.
+	const joinLegInserts: JoinLegInsert[] = [];
 
 	// Data fan-out: update the row in every member leaf, recursing through a subtree operand
 	// to its leaves. The full-data-tuple `exists` correlation restricts each leaf update to
@@ -894,22 +953,29 @@ function buildUpdate(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 		const flip = flips.get(branch.side);
 		if (flip === undefined) continue;
 		if (flip) {
-			baseOps.push(...buildBranchMembershipInsert(ctx, view, analysis, branch, dataAssignments, stmt));
+			baseOps.push(...buildBranchMembershipInsert(ctx, view, analysis, branch, dataAssignments, stmt, joinLegInserts));
 		} else {
 			baseOps.push(...fanBranchDelete(ctx, view, analysis, branch, stmt, fan));
 		}
 	}
 
-	if (baseOps.length === 0) {
+	if (baseOps.length === 0 && joinLegInserts.length === 0) {
 		// Unreachable: the parser requires ≥1 assignment, and every assignment routes to a
-		// flip or a data fan-out above. Guard defensively.
+		// flip or a data fan-out above. Guard defensively. (A lone join-branch `= true` flip
+		// produces no base op of its own — it splices a nested envelope child — so it is
+		// admitted via the `joinLegInserts` arm.)
 		raiseMutationDiagnostic({
 			reason: 'unsupported-set-op',
 			table: view.name,
 			message: `cannot write through view '${view.name}': the update names no writable set-operation column`,
 		});
 	}
-	return { baseOps, capture, nestedCaptures: fan.captures.length > 0 ? fan.captures : undefined };
+	return {
+		baseOps,
+		capture,
+		nestedCaptures: fan.captures.length > 0 ? fan.captures : undefined,
+		joinLegInserts: joinLegInserts.length > 0 ? joinLegInserts : undefined,
+	};
 }
 
 /**
@@ -1018,6 +1084,7 @@ function buildBranchMembershipInsert(
 	branch: SetOpBranch,
 	dataAssignments: readonly DataAssignment[],
 	stmt: AST.UpdateStmt,
+	joinLegInserts: JoinLegInsert[],
 ): BaseOp[] {
 	if (branch.isNested) {
 		// `set <subtreeFlag> = true` would insert the row into a multi-leaf subtree (B∪C) —
@@ -1029,18 +1096,6 @@ function buildBranchMembershipInsert(
 			column: branch.flag?.name,
 			table: view.name,
 			message: `cannot write through view '${view.name}': 'set ${branch.flag?.name ?? '<flag>'} = true' inserts into a multi-leaf subtree operand, which has no single deterministic target leaf (product-coordinate addressing) — deferred to set-op-membership-nested`,
-		});
-	}
-	if (branch.isMultiSource) {
-		// `set <flag> = true` inserts into a multi-source (join) branch — that insert needs the
-		// plan-level shared-surrogate envelope (`buildMultiSourceInsert`), which the capture-driven
-		// set-op fan does not produce. Deferred to `set-op-write-multisource-leg-insert` (the
-		// composed UPDATE / DELETE legs ship here). Clean reject, never the internal capture error.
-		raiseMutationDiagnostic({
-			reason: 'unsupported-set-op',
-			column: branch.flag?.name,
-			table: view.name,
-			message: `cannot write through view '${view.name}': 'set ${branch.flag?.name ?? '<flag>'} = true' inserts into a multi-source (join) branch, whose insert needs the plan-level shared-surrogate envelope — deferred to set-op-write-multisource-leg-insert (UPDATE / DELETE through a join branch are supported)`,
 		});
 	}
 	if (!branch.flag) {
@@ -1079,6 +1134,17 @@ function buildBranchMembershipInsert(
 		schemaPath: stmt.schemaPath,
 		loc: stmt.loc,
 	};
+	// A `set <flag> = true` flip into a multi-source (INNER join) branch is built via the
+	// plan-level shared-surrogate envelope (`buildMultiSourceInsert`) and spliced as a nested
+	// `ViewMutationNode` child — record the descriptor and produce NO base op of our own
+	// (`set-op-write-multisource-leg-insert`). The `source` SELECT reads the OUTER `__vmupd_keys`
+	// capture (`where not k.<flag>`), so the envelope reuses it verbatim; `buildSetOpMutation`
+	// passes the capture-injected context so its `from __vmupd_keys` resolves. A single-source
+	// branch lowers through `propagate`.
+	if (branch.isMultiSource) {
+		joinLegInserts.push({ view: branch.view, stmt: insertStmt });
+		return [];
+	}
 	return propagate(ctx, branch.view, { op: 'insert', stmt: insertStmt });
 }
 
@@ -1145,19 +1211,6 @@ function buildDelete(ctx: PlanningContext, view: MutableViewLike, analysis: SetO
 
 function buildInsertThrough(ctx: PlanningContext, view: MutableViewLike, analysis: SetOpAnalysis, stmt: AST.InsertStmt): SetOpWritePlan {
 	rejectReturning(view, stmt.returning);
-	// A multi-source (join) branch's insert needs the plan-level shared-surrogate envelope
-	// (`buildMultiSourceInsert`), which the capture-driven set-op fan does not produce — deferred
-	// to `set-op-write-multisource-leg-insert`. Reject the WHOLE insert when ANY branch is a join
-	// (the static `is_insertable_into` surface reports `NO` for such a body), so the static and
-	// dynamic answers match exactly; UPDATE / DELETE through the same body's join branches are
-	// supported. Clean reject — never the internal capture error.
-	if (analysis.branches.some(b => b.isMultiSource)) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-set-op',
-			table: view.name,
-			message: `cannot insert through view '${view.name}': a branch is a multi-source (join) leg, whose insert needs the plan-level shared-surrogate envelope — deferred to set-op-write-multisource-leg-insert (UPDATE / DELETE through a join branch are supported)`,
-		});
-	}
 	if (stmt.source.type !== 'values') {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-source',
@@ -1196,6 +1249,11 @@ function buildInsertThrough(ctx: PlanningContext, view: MutableViewLike, analysi
 	}
 
 	const baseOps: BaseOp[] = [];
+	// A multi-source (INNER join) branch's VALUES insert is built via the plan-level
+	// shared-surrogate envelope (`buildMultiSourceInsert`) and spliced as a nested
+	// `ViewMutationNode` child rather than routed through `propagate` (which would raise the
+	// internal `unsupported-multisource-insert`) — `set-op-write-multisource-leg-insert`.
+	const joinLegInserts: JoinLegInsert[] = [];
 	for (const branch of analysis.branches) {
 		if (!activeSides.has(branch.side)) continue;
 		if (branch.isNested) {
@@ -1220,10 +1278,16 @@ function buildInsertThrough(ctx: PlanningContext, view: MutableViewLike, analysi
 			schemaPath: stmt.schemaPath,
 			loc: stmt.loc,
 		};
-		baseOps.push(...propagate(ctx, branch.view, { op: 'insert', stmt: insertStmt }));
+		// The VALUES source is self-contained (no outer capture); the nested envelope sources
+		// its values straight from it. A single-source branch lowers through `propagate`.
+		if (branch.isMultiSource) {
+			joinLegInserts.push({ view: branch.view, stmt: insertStmt });
+		} else {
+			baseOps.push(...propagate(ctx, branch.view, { op: 'insert', stmt: insertStmt }));
+		}
 	}
 	// Insert-through reads no existing row, so it needs no capture (self-contained values).
-	return { baseOps };
+	return { baseOps, joinLegInserts: joinLegInserts.length > 0 ? joinLegInserts : undefined };
 }
 
 interface InsertLayout {
@@ -1841,20 +1905,14 @@ function buildFlaglessInsert(ctx: PlanningContext, view: MutableViewLike, analys
 			message: `cannot insert through view '${view.name}': a flag-less set-operation insert routes by the supplied discriminator values, so it requires a VALUES source (a SELECT/DML source's per-row routing is deferred)`,
 		});
 	}
-	// A multi-source (join) leg's insert needs the plan-level shared-surrogate envelope
-	// (`buildMultiSourceInsert`), which the capture-driven set-op fan does not produce — deferred
-	// to `set-op-write-multisource-leg-insert`. Reject the WHOLE insert when ANY leg is a join (the
-	// static `is_insertable_into` surface reports `NO` for such a body), so the static and dynamic
-	// answers match exactly; UPDATE / DELETE through the same body's join legs are supported.
-	if (legs.some(l => l.branch.isMultiSource)) {
-		raiseMutationDiagnostic({
-			reason: 'unsupported-set-op', table: view.name,
-			message: `cannot insert through view '${view.name}': a multi-source (join) leg's insert needs the plan-level shared-surrogate envelope — deferred to set-op-write-multisource-leg-insert (UPDATE / DELETE through a join leg are supported)`,
-		});
-	}
 	const values = stmt.source.values;
 	const layout = resolveFlaglessInsertLayout(view, analysis, stmt);
 	const baseOps: BaseOp[] = [];
+	// A multi-source (INNER join) leg's INSERT is built via the plan-level shared-surrogate
+	// envelope (`buildMultiSourceInsert`) and spliced as a nested `ViewMutationNode` child rather
+	// than routed through `propagate` (which would raise the internal `unsupported-multisource-insert`)
+	// — `set-op-write-multisource-leg-insert`. The VALUES source is self-contained.
+	const joinLegInserts: JoinLegInsert[] = [];
 	for (const leg of fanLegsForInsert(analysis.op, legs)) {
 		// Per-row routing: a row inserts into this leg unless provably inconsistent with it.
 		const rows = values.filter(row => legConsistency(ctx, leg, rowExistencePredicate(analysis, layout, row)) !== 'unsat');
@@ -1877,16 +1935,20 @@ function buildFlaglessInsert(ctx: PlanningContext, view: MutableViewLike, analys
 			schemaPath: stmt.schemaPath,
 			loc: stmt.loc,
 		};
-		baseOps.push(...propagate(ctx, leg.branch.view, { op: 'insert', stmt: insertStmt }));
+		if (leg.branch.isMultiSource) {
+			joinLegInserts.push({ view: leg.branch.view, stmt: insertStmt });
+		} else {
+			baseOps.push(...propagate(ctx, leg.branch.view, { op: 'insert', stmt: insertStmt }));
+		}
 	}
-	if (baseOps.length === 0) {
+	if (baseOps.length === 0 && joinLegInserts.length === 0) {
 		raiseMutationDiagnostic({
 			reason: 'unsupported-set-op', table: view.name,
 			message: `cannot insert through view '${view.name}': the supplied values are consistent with no writable leg (the row would belong to no branch)`,
 		});
 	}
 	// Insert-through reads no existing row, so it needs no capture (self-contained values).
-	return { baseOps };
+	return { baseOps, joinLegInserts: joinLegInserts.length > 0 ? joinLegInserts : undefined };
 }
 
 // --- flag-less DELETE / data-UPDATE (fan to the consistent legs) ----------

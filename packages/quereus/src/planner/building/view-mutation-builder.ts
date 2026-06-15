@@ -514,7 +514,7 @@ function buildSetOpMutation(
 	req: MutationRequest,
 	writeFn: (ctx: PlanningContext, view: MutableViewLike, req: MutationRequest) => SetOpWritePlan,
 ): PlanNode {
-	const { baseOps, capture, nestedCaptures } = writeFn(ctx, view, req);
+	const { baseOps, capture, nestedCaptures, joinLegInserts } = writeFn(ctx, view, req);
 	// Each probe-driven branch op reads the capture back through `__vmupd_keys`; inject a
 	// fresh context-backed key ref (sharing the one capture descriptor) per op, exactly as
 	// the multi-source update/delete path does. Insert-through has no capture ⇒ no injection.
@@ -525,6 +525,17 @@ function buildSetOpMutation(
 	let opCtx = capture ? withKeyCapture(ctx, capture) : ctx;
 	for (const inner of nestedCaptures ?? []) opCtx = withKeyCapture(opCtx, inner);
 	const children = baseOps.map(op => buildBaseOp(opCtx, op, [], false));
+	// Splice each active multi-source (INNER join) leg/branch INSERT as a nested envelope-backed
+	// `ViewMutationNode` child (`set-op-write-multisource-leg-insert`): the set-op insert builders
+	// cannot call `buildMultiSourceInsert` (a building-layer function producing a whole `PlanNode`,
+	// not an AST `BaseOp`), so they recorded per-leg descriptors and we build them here. Each nested
+	// node carries its OWN envelope under a fresh identity descriptor — two join legs never collide
+	// — and runs its own self-contained sub-program (the emitter drains each base op via
+	// `emitCallFromPlan`). Pass the capture-injected `opCtx` so a membership-flip leg's
+	// `from __vmupd_keys` source resolves against the outer set-op capture (which the outer node
+	// materializes first). `buildMultiSourceInsert` records no view dependency (that happens once in
+	// `buildViewMutation` above), so building it on a synthetic branch view is safe.
+	for (const jli of joinLegInserts ?? []) children.push(buildMultiSourceInsert(opCtx, jli.view, jli.stmt));
 	const identityCapture = capture ? { source: capture.source, descriptor: capture.descriptor } : undefined;
 	// The inner per-branch captures ride the ORDERED `nestedCaptures` side input: materialized
 	// AFTER the primary outer capture, in fan order, so each inner's `memberExists` filter scans

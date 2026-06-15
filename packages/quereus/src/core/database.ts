@@ -1664,8 +1664,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this.schemaManager.findFunction(funcName, nArg);
 	}
 
-	/** @internal */
-	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>): BuildPlanResult {
+	/**
+	 * @internal Build a fresh top-level {@link PlanningContext} (global → parameter scope,
+	 * default schema path, an empty dependency tracker). The shared seam {@link _buildPlan}
+	 * builds its planning context from, and a throwaway context the static updateability
+	 * surfaces (`func/builtins/schema.ts`) use to plan a view body / run an insertability
+	 * probe — whose `schemaDependencies` are discarded (the read TVF already discards the body
+	 * plan's), so a fresh tracker per call is correct.
+	 */
+	_buildProbeContext(paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>): PlanningContext {
 		const globalScope = new GlobalScope(this.schemaManager);
 
 		// If we received parameter values, infer their types
@@ -1680,22 +1687,25 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// Get default schema path from options
 		const schemaPath = parseSchemaPath(this.options.getStringOption('schema_path'));
 
-		const schemaDependencies = new BuildTimeDependencyTracker();
-		const ctx: PlanningContext = {
+		return {
 			db: this,
 			schemaManager: this.schemaManager,
 			parameters: paramsOrTypes instanceof Map ? {} : (paramsOrTypes ?? {}),
 			scope: parameterScope,
 			cteNodes: new Map(),
-			schemaDependencies,
+			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
 			outputScopes: new Map(),
 			schemaPath
 		};
+	}
 
+	/** @internal */
+	_buildPlan(statements: AST.Statement[], paramsOrTypes?: SqlParameters | SqlValue[] | Map<string | number, ScalarType>): BuildPlanResult {
+		const ctx = this._buildProbeContext(paramsOrTypes);
 		const plan = buildBlock(ctx, statements);
-		return { plan, schemaDependencies };
+		return { plan, schemaDependencies: ctx.schemaDependencies };
 	}
 
 	/**

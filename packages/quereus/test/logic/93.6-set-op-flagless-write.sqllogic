@@ -268,7 +268,7 @@ insert into OU (id, x) values (7, 70);
 -- internal `k.k0_0` error is gone). Both surfaces match the dynamic write exactly.
 -- ===================================================================
 create table jv1 (id integer primary key, x integer, color text null);
-create table jv2 (id integer primary key, y integer);
+create table jv2 (id integer primary key, y integer null);
 insert into jv1 values (1,10,'red'),(2,20,'blue');
 insert into jv2 values (1,100),(2,200);
 create view JV as
@@ -279,10 +279,11 @@ create view JV as
 select * from JV order by id;
 → [{"id":1,"x":10,"src":"a"},{"id":2,"x":20,"src":"b"}]
 
--- static surfaces: update/delete YES (the join leg composes), insert NO (deferred). The plain data
--- columns report is_updatable = YES; the literal discriminator `src` is read-only (NO).
+-- static surfaces: update/delete YES (the join leg composes), insert YES (the join leg's shared key
+-- `id` is supplied, so its shared-surrogate envelope accepts the insert). The plain data columns
+-- report is_updatable = YES; the literal discriminator `src` is read-only (NO).
 select is_insertable_into, is_updatable, is_deletable from view_info('JV');
-→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
 select cid, column_name, is_updatable, base_table, base_column from column_info('JV');
 → [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
 
@@ -302,9 +303,16 @@ select id, x from jv1 order by id;
 select id, y from jv2 order by id;
 → [{"id":2,"y":200}]
 
--- INSERT through the join leg stays deferred — a clean reject (never the internal capture error).
+-- INSERT through the join leg is now SHIPPED via the nested shared-surrogate envelope splice
+-- (`set-op-write-multisource-leg-insert`): the discriminator `src='a'` routes to the join leg, whose
+-- shared key `id` is supplied (jv1.id = jv2.id), so jv1 gets (5,50,null) and jv2 gets (5,null). The
+-- 'b' plain leg is unsat with src='a' ⇒ untouched. (The join leg's `where color='red'` is NOT
+-- consulted on insert — the base row is written regardless of the view predicate.)
 insert into JV (id, x, src) values (5, 50, 'a');
--- error: set-op-write-multisource-leg-insert
+select id, x, color from jv1 order by id;
+→ [{"id":2,"x":20,"color":"blue"},{"id":5,"x":50,"color":null}]
+select id, y from jv2 order by id;
+→ [{"id":2,"y":200},{"id":5,"y":null}]
 
 -- NOTE on comma-join legs (`from a, b`): the engine rejects multiple FROM sources at build
 -- time ("SELECT with multiple FROM sources (joins) not supported"), so such a body cannot even
@@ -317,7 +325,7 @@ insert into JV (id, x, src) values (5, 50, 'a');
 -- at any depth composes its own inner capture and decomposes correctly.
 -- ===================================================================
 create table dv1 (id integer primary key, x integer, color text null);
-create table dv2 (id integer primary key, y integer);
+create table dv2 (id integer primary key, y integer null);
 insert into dv1 values (1,10,'red'),(2,20,'blue'),(3,30,'red');
 insert into dv2 values (1,100),(3,300);
 create view DV as
@@ -327,7 +335,7 @@ create view DV as
   union all
   select dv1.id as id, dv1.x as x, 'c' as src from dv1 join dv2 on dv1.id = dv2.id where dv1.color = 'red';
 select is_insertable_into, is_updatable, is_deletable from view_info('DV');
-→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
 select id, x, src from DV order by src, id;
 → [{"id":1,"x":10,"src":"a"},{"id":3,"x":30,"src":"a"},{"id":2,"x":20,"src":"b"},{"id":1,"x":10,"src":"c"},{"id":3,"x":30,"src":"c"}]
 
@@ -339,9 +347,13 @@ select id, x from dv1 order by id;
 select id, y from dv2 order by id;
 → []
 
--- INSERT through the deep join leg stays deferred.
+-- INSERT through the deep (depth-3) join leg is now SHIPPED via the nested envelope splice: `src='c'`
+-- routes to the join leg, shared key `id` supplied, so dv1 gets (9,90,null) and dv2 gets (9,null).
 insert into DV (id, x, src) values (9, 90, 'c');
--- error: set-op-write-multisource-leg-insert
+select id, x from dv1 order by id;
+→ [{"id":2,"x":20},{"id":9,"x":90}]
+select id, y from dv2 order by id;
+→ [{"id":9,"y":null}]
 
 -- ===================================================================
 -- Composite-PK join leg (`set-op-write-multisource-leg-compose`): the inner per-leg capture
@@ -358,6 +370,14 @@ create view CV as
   select a, b, v, 's' as src from cp1 where a = 9;
 select cid, column_name, is_updatable from column_info('CV');
 → [{"cid":0,"column_name":"a","is_updatable":"YES"},{"cid":1,"column_name":"b","is_updatable":"YES"},{"cid":2,"column_name":"v","is_updatable":"YES"},{"cid":3,"column_name":"src","is_updatable":"NO"}]
+
+-- INSERT through the composite-PK join leg stays deferred (the shared-surrogate envelope threads a
+-- SINGLE shared key column): `is_insertable_into` reports NO (the probe sees the composite key), and
+-- the dynamic insert rejects cleanly with `unsupported-decomposition-key`. UPDATE / DELETE compose.
+select is_insertable_into, is_updatable, is_deletable from view_info('CV');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+insert into CV (a, b, v, src) values (9, 9, 90, 'j');
+-- error: composite shared key
 
 -- data UPDATE through the composite-PK join leg: `v` maps to cp1.v (identified by the composite key).
 update CV set v = v + 1 where a = 1 and b = 1 and src = 'j';
@@ -384,9 +404,49 @@ create view SJ as
   select id, name, name as mgrname, 'solo' as src from emp where id = 99;
 select is_insertable_into, is_updatable, is_deletable from view_info('SJ');
 → [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+
+-- INSERT through the self-join leg stays deferred: the shared key `e.mgr` is neither supplied nor
+-- declares a DEFAULT, so the shared-surrogate envelope cannot mint it. The probe reports NO (above)
+-- and the dynamic insert rejects cleanly with `no-default`. UPDATE / DELETE compose.
+insert into SJ (id, name, mgrname, src) values (4, 'd', 'e', 'pair');
+-- error: neither supplied nor declares a default
+
 update SJ set name = 'X' where id = 2 and src = 'pair';
 select id, name from emp order by id;
 → [{"id":1,"name":"a"},{"id":2,"name":"X"},{"id":3,"name":"c"}]
+
+-- ===================================================================
+-- Mixed body — one JOIN leg + one PLAIN leg both active on an INSERT (`set-op-write-multisource-leg-insert`):
+-- a union-all of a join leg ('j') and a plain leg ('p'). An INSERT that OMITS the discriminator is
+-- consistent with BOTH legs, so it routes to each: the join leg via a nested shared-surrogate envelope
+-- (mxj1+mxj2), the plain leg via the single-source spine (mxp). Both land in fan order.
+-- ===================================================================
+create table mxj1 (id integer primary key, x integer);
+create table mxj2 (id integer primary key);
+create table mxp (id integer primary key, x integer);
+insert into mxj1 values (1,10);
+insert into mxj2 values (1);
+insert into mxp values (1,10);
+create view MXV as
+  select mxj1.id as id, mxj1.x as x, 'j' as src from mxj1 join mxj2 on mxj1.id = mxj2.id
+  union all
+  select id, x, 'p' as src from mxp;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('MXV');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+
+select id, x, src from MXV order by src, id;
+→ [{"id":1,"x":10,"src":"j"},{"id":1,"x":10,"src":"p"}]
+
+-- Omit `src`: the row (5,50) is consistent with BOTH legs, so it lands in the join leg's base tables
+-- (mxj1+mxj2 via one nested envelope) AND the plain leg's base table (mxp).
+insert into MXV (id, x) values (5, 50);
+select id, x from mxj1 order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
+select id from mxj2 order by id;
+→ [{"id":1},{"id":5}]
+select id, x from mxp order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
 
 -- ===================================================================
 -- Halloween safety through a join leg (`set-op-write-multisource-leg-compose`): the inner capture

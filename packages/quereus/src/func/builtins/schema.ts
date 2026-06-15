@@ -22,7 +22,7 @@ import type * as AST from "../../parser/ast.js";
 import type { RelationalPlanNode, UpdateSite } from "../../planner/nodes/plan-node.js";
 import { TableReferenceNode } from "../../planner/nodes/reference.js";
 import { isJoinBody, isDecomposableJoinBody } from "../../planner/mutation/multi-source.js";
-import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, setOpHasMultiSourceLeg, surfacedInnerFlagNames, isSetOpFlaglessWritableBody, flaglessDiscriminatorColumnNames } from "../../planner/mutation/set-op.js";
+import { isSetOpMembershipBody, isSetOpBranchWritable, setOpHasSubtreeOperand, setOpJoinLegsInsertable, surfacedInnerFlagNames, isSetOpFlaglessWritableBody, flaglessDiscriminatorColumnNames } from "../../planner/mutation/set-op.js";
 import { type ViewSchema, bodyDefaults } from "../../schema/view.js";
 
 const log = createLogger('func:view_info');
@@ -764,6 +764,10 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 
 	const nodes = collectBodyNodes(root);
 
+	// The minimal `MutableViewLike` the set-op insertability probe re-derives the branches from
+	// (the same `{ name, schemaName, selectAst }` shape the write path / `deriveBackingShape` use).
+	const viewAsMutable = { name: view.name, schemaName: view.schemaName, selectAst: view.selectAst };
+
 	// Set-operation membership body: the per-branch fan-out makes the view
 	// insertable-into (flag-routed insert-through), updatable (membership flip + data
 	// fan-out), and deletable (delete fan-out), agreeing with the dynamic `propagate()`
@@ -783,13 +787,14 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 		// Update / delete fan-out recurses through a subtree operand to its member leaves
 		// (`nestable-flagged-set-ops`) AND composes a multi-source (INNER join) branch
 		// (`set-op-write-multisource-leg-compose`), so updatable / deletable stay YES at any depth.
-		// But insert is deferred for two shapes: inserting into a multi-leaf subtree has no single
-		// deterministic target leaf (product-coordinate addressing — `set-op-membership-nested`),
-		// and inserting into a multi-source (join) branch needs the plan-level shared-surrogate
-		// envelope the capture-driven fan does not produce (`set-op-write-multisource-leg-insert`).
-		// Gate insertability to NO when EITHER holds — a conservative, honest under-claim agreeing
-		// with the dynamic insert-through reject.
-		const isInsertableInto = !setOpHasSubtreeOperand(view.selectAst) && !setOpHasMultiSourceLeg(view.selectAst);
+		// Insert through a join branch is now SHIPPED via the nested shared-surrogate envelope splice
+		// (`set-op-write-multisource-leg-insert`), so `is_insertable_into` is YES for a body whose
+		// join branches are ALL insertable — re-derived dynamically by `setOpJoinLegsInsertable`
+		// (NO for a composite-key / no-default / non-equi join branch). It stays NO when EITHER
+		// operand is a subtree: inserting into a multi-leaf subtree has no single deterministic
+		// target leaf (product-coordinate addressing — `set-op-membership-nested`).
+		const isInsertableInto = !setOpHasSubtreeOperand(view.selectAst)
+			&& setOpJoinLegsInsertable(db._buildProbeContext(), viewAsMutable);
 		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 
@@ -803,10 +808,12 @@ function deriveViewInfo(db: Database, view: ViewSchema): ViewInfoRow {
 	// `targetIds.size === 0` conservative row below.
 	if (isSetOpFlaglessWritableBody(view.selectAst)) {
 		const targets = [...new Set([...buildTableRefsById(nodes).values()].map(r => r.tableSchema.name))].sort();
-		// Insert through a multi-source (join) leg is deferred (`set-op-write-multisource-leg-insert`),
-		// so gate `is_insertable_into` to NO when ANY leg is a join — matching the dynamic
-		// `buildFlaglessInsert` reject; UPDATE / DELETE through the join leg stay YES.
-		const isInsertableInto = !setOpHasMultiSourceLeg(view.selectAst);
+		// Insert through a multi-source (join) leg is now SHIPPED via the nested shared-surrogate
+		// envelope splice (`set-op-write-multisource-leg-insert`), so `is_insertable_into` is YES for
+		// a body whose join legs are ALL insertable — re-derived dynamically by
+		// `setOpJoinLegsInsertable` (NO for a composite-key / no-default / non-equi join leg) —
+		// matching the dynamic `buildFlaglessInsert`; UPDATE / DELETE through the join leg stay YES.
+		const isInsertableInto = setOpJoinLegsInsertable(db._buildProbeContext(), viewAsMutable);
 		return { isInsertableInto, isUpdatable: true, isDeletable: true, effectiveTargets: targets };
 	}
 

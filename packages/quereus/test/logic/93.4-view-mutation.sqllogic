@@ -3979,7 +3979,7 @@ select * from q3 order by id;
 -- while is_updatable / is_deletable report YES — both surfaces matching the dynamic write.
 -- ===================================================================
 create table mj1 (id integer primary key, x integer, color text null);
-create table mj2 (id integer primary key, y integer);
+create table mj2 (id integer primary key, y integer null);
 insert into mj1 values (1,10,'red'),(2,20,'blue');
 insert into mj2 values (1,100),(2,200);
 create view MV as
@@ -3992,9 +3992,10 @@ select id, x, inL, inR from MV order by id;
 → [{"id":1,"x":10,"inL":true,"inR":false},{"id":2,"x":20,"inL":false,"inR":true}]
 
 -- static surfaces: is_updatable / is_deletable = YES (the join branch composes); is_insertable_into
--- = NO (join-branch insert deferred). Matches the dynamic write exactly.
+-- = YES (the join branch's shared key `id` is supplied, so its shared-surrogate envelope accepts the
+-- insert — `set-op-write-multisource-leg-insert`). Matches the dynamic write exactly.
 select is_insertable_into, is_updatable, is_deletable from view_info('MV');
-→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
 -- every column (data + flag) is writable-through-effect with a null base (the membership-write
 -- shape — a data fan-out / flag flip, not a single base column).
 select cid, is_updatable, base_table, base_column from column_info('MV');
@@ -4016,9 +4017,15 @@ select id, x from mj1 order by id;
 select id, y from mj2 order by id;
 → [{"id":2,"y":200}]
 
--- INSERT into a join branch stays deferred — a clean reject (never the internal capture error).
+-- INSERT into a join branch is now SHIPPED via the nested shared-surrogate envelope splice
+-- (`set-op-write-multisource-leg-insert`): inL=true routes the VALUES row into the join branch's base
+-- tables (mj1 gets (5,50,null), mj2 gets (5,null) — shared key `id` supplied); inR=false omits the
+-- plain branch.
 insert into MV (id, x, inL, inR) values (5, 50, true, false);
--- error: set-op-write-multisource-leg-insert
+select id, x from mj1 order by id;
+→ [{"id":2,"x":20},{"id":5,"x":50}]
+select id, y from mj2 order by id;
+→ [{"id":2,"y":200},{"id":5,"y":null}]
 
 -- ===================================================================
 -- TWO join branches in ONE body (`set-op-write-multisource-leg-compose`, the distinct-inner-name
@@ -4041,7 +4048,7 @@ create view TWO as
   select tbb.id as id, tbb.x as x from tbb join tbd on tbb.id = tbd.id;
 
 select is_insertable_into, is_updatable, is_deletable from view_info('TWO');
-→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
 
 -- The left join branch's rows (from tba) and the right's (from tbb) carry different x values, so
 -- each view row is a member of exactly one branch.
@@ -4070,6 +4077,60 @@ select id, x from tbb order by id;
 → [{"id":1,"x":111}]
 select id from tbd order by id;
 → [{"id":1}]
+
+-- INSERT into BOTH join branches at once (inL=true, inR=true): each branch builds its OWN nested
+-- shared-surrogate envelope under a DISTINCT identity descriptor — the left lands tba+tbc, the right
+-- lands tbb+tbd — proving two nested envelope children never collide (`set-op-write-multisource-leg-insert`).
+insert into TWO (id, x, inL, inR) values (7, 70, true, true);
+select id, x from tba order by id;
+→ [{"id":1,"x":110},{"id":7,"x":70}]
+select id from tbc order by id;
+→ [{"id":1},{"id":7}]
+select id, x from tbb order by id;
+→ [{"id":1,"x":111},{"id":7,"x":70}]
+select id from tbd order by id;
+→ [{"id":1},{"id":7}]
+
+-- ===================================================================
+-- Membership `set <joinFlag> = true` FLIP into a join branch (`set-op-write-multisource-leg-insert`):
+-- the nested envelope source reads the OUTER `__vmupd_keys` capture (`where not k.<flag>`), so a
+-- captured row ABSENT from the join branch inserts into its base tables, while a row already present
+-- is a clean no-op. The outer capture is materialized before the nested insert (Halloween-safe).
+-- A dedicated fixture (the join branch and plain branch source DISTINCT base tables) so the flip's
+-- insert does not collide with the plain branch's own base row.
+-- ===================================================================
+create table mf_p (id integer primary key, x integer);
+create table mfj1 (id integer primary key, x integer);
+create table mfj2 (id integer primary key);
+insert into mf_p values (1,10),(2,20);
+insert into mfj1 values (1,10);
+insert into mfj2 values (1);
+create view MF as
+  select mfj1.id as id, mfj1.x as x from mfj1 join mfj2 on mfj1.id = mfj2.id
+  union exists left as inJ, exists right as inP
+  select id, x from mf_p;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('MF');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+
+-- id=1 is a member of BOTH branches; id=2 is only in the plain branch (mfj1/mfj2 have no id=2).
+select id, x, inJ, inP from MF order by id;
+→ [{"id":1,"x":10,"inJ":true,"inP":true},{"id":2,"x":20,"inJ":false,"inP":true}]
+
+-- Flip inJ=true on the captured-ABSENT row (id=2): it inserts into the join branch's base tables.
+update MF set inJ = true where id = 2;
+select id, x from mfj1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select id from mfj2 order by id;
+→ [{"id":1},{"id":2}]
+
+-- Flip inJ=true on a row already present in the join branch (id=1): a clean no-op (`where not k.inJ`),
+-- so mfj1/mfj2 are untouched.
+update MF set inJ = true where id = 1;
+select id, x from mfj1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":20}]
+select id from mfj2 order by id;
+→ [{"id":1},{"id":2}]
 
 -- ===================================
 -- RETURNING <q>.* qualifier validation through updatable views.
