@@ -12,6 +12,10 @@ import type { SqlValue } from '../common/types.js';
  *   § Acknowledging advisories).
  * - `quereus.id` / `quereus.previous_name`
  *   — declarative-differ rename hints (docs/schema.md § Rename Detection).
+ * - `quereus.sync.replicate`
+ *   — per-table opt-in that records a maintained table / materialized view's
+ *   maintenance writes in the sync change log (`docs/migration.md` § Synced vs.
+ *   local derived tables). Engine-global spec, behaviorally store-only.
  *
  * No reserved tag carries *behavior* — view-mutation semantics moved to
  * first-class constructs (write routing to per-row presence/membership columns;
@@ -75,6 +79,18 @@ export const DECOMP_KEYKIND_VALUES = ['surrogate', 'logical-tuple'] as const;
  * admit-as-read-only behaviour.
  */
 export const LENS_WRITABLE_INTENT_TAG = 'quereus.lens.writable';
+
+/**
+ * The per-table sync-replication opt-in (docs/migration.md § Synced vs. local
+ * derived tables). `= true` records this maintained table / materialized view's
+ * maintenance writes in the sync change log — the store backing host queues a
+ * module `DataChangeEvent` per realized `BackingRowChange`, so the sync layer
+ * records column versions / HLC stamps / tombstones exactly as for an ordinary
+ * table write. Default off (a privileged maintenance write emits no module data
+ * events otherwise). Exported so the store host keys off this single constant
+ * rather than re-spelling the literal; the host reads `=== true`.
+ */
+export const SYNC_REPLICATE_TAG = 'quereus.sync.replicate';
 
 /**
  * The shape a reserved tag's value must satisfy. Validation here is purely
@@ -171,6 +187,25 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		sites: siteSet('physical-constraint'),
 		valueSchema: 'boolean',
 		description: 'Surface a UNIQUE constraint\'s implicit covering structure in the catalog / export_schema (boolean; default hidden).',
+	},
+	// --- quereus.sync.replicate : per-table maintenance-write change-log opt-in ---
+	// docs/migration.md § Synced vs. local derived tables. `= true` records a
+	// maintained table / materialized view's maintenance writes in the sync change
+	// log (the store backing host queues a DataChangeEvent per realized
+	// BackingRowChange — column versions / HLC stamps / tombstones, like an ordinary
+	// table write). Boolean (the host reads `=== true`), default off. Sited at
+	// view-ddl (the `create materialized view … with tags (…)` authoring form) and
+	// physical-table (the canonical `create table … using store() maintained as …`
+	// form) — the two authoring forms of a migration target. NOT a logical-* site:
+	// the tag governs a physical backing, not a lens column. Engine-global spec,
+	// behaviorally store-only (the memory host stays event-free — see
+	// quereus-store/src/common/backing-host.ts).
+	{
+		key: SYNC_REPLICATE_TAG,
+		sites: siteSet('view-ddl', 'physical-table'),
+		valueSchema: 'boolean',
+		description: 'Opt this maintained table / materialized view\'s maintenance writes into the sync change log '
+			+ '(the backing host records column versions / tombstones for each derivation write). Default off.',
 	},
 	// --- quereus.lens.* : lens advisory acknowledgments / access hints ---
 	// (The former quereus.update.* family is gone: routing became per-row
@@ -528,7 +563,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.sync.replicate, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 

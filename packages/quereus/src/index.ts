@@ -152,6 +152,9 @@ export { isMaintainedTable } from './schema/derivation.js';
 export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
 export { isHiddenImplicitIndex, exposedImplicitIndexes } from './schema/catalog.js';
 export type { SyntheticExposedIndex } from './schema/catalog.js';
+// Reserved-tag namespace surface — `@quereus/quereus-store` keys its sync-replication
+// opt-in off SYNC_REPLICATE_TAG (DRY: one literal) and reads it via getReservedTag.
+export { SYNC_REPLICATE_TAG, getReservedTag } from './schema/reserved-tags.js';
 
 // Partial-index predicate compilation (used by store modules to honor partial UNIQUE)
 export { compilePredicate } from './vtab/memory/utils/predicate.js';

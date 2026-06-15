@@ -249,6 +249,40 @@ describe('Reserved tag registry', () => {
 		});
 	});
 
+	describe('quereus.sync.replicate (boolean, view-ddl + physical-table)', () => {
+		it('accepts a boolean value at the view-ddl and physical-table sites', () => {
+			// The two authoring forms of a migration target: the materialized-view
+			// form (view-ddl) and the canonical `create table … maintained as` form
+			// (physical-table). Both true/false are well-shaped.
+			for (const site of ['view-ddl', 'physical-table'] as const) {
+				expect(check({ 'quereus.sync.replicate': true }, site), `replicate true @ ${site}`).to.have.length(0);
+				expect(check({ 'quereus.sync.replicate': false }, site), `replicate false @ ${site}`).to.have.length(0);
+			}
+		});
+
+		it('rejects a non-boolean value (error)', () => {
+			// The store host reads it via a strict `=== true`, so only a real boolean is meaningful.
+			const diags = check({ 'quereus.sync.replicate': 'true' }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+			expect(diags[0].severity).to.equal('error');
+		});
+
+		it('is not allowed on a logical-column / logical-table site (governs a physical backing)', () => {
+			for (const site of ['logical-column', 'logical-table'] as const) {
+				const diags = check({ 'quereus.sync.replicate': true }, site);
+				expect(diags, `replicate @ ${site}`).to.have.length(1);
+				expect(diags[0].reason).to.equal('tag-not-allowed-here');
+			}
+		});
+
+		it('flags a typo as unknown-reserved-tag', () => {
+			const diags = check({ 'quereus.sync.replicat': true }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+		});
+	});
+
 	describe('getReservedTag (typed, exact key)', () => {
 		it('reads a string value verbatim', () => {
 			const tags = { 'quereus.lens.policy.error-on': 'lens.no-backing-index' };
@@ -373,15 +407,16 @@ describe('Reserved tag registry', () => {
 			}
 		});
 
-		it('seeds all documented keys (rename hints + expose_implicit_index + lens advisory + writable intent + escalation policy + lens decomposition families)', () => {
+		it('seeds all documented keys (rename hints + expose_implicit_index + sync replicate + lens advisory + writable intent + escalation policy + lens decomposition families)', () => {
 			// 2 rename hints (quereus.id / quereus.previous_name) + 1 quereus.expose_implicit_index
-			// + 2 quereus.lens.{ack,access} + 1 quereus.lens.writable
-			// + 2 quereus.lens.policy.* + 9 quereus.lens.decomp.* = 17.
-			expect(RESERVED_TAGS).to.have.length(17);
+			// + 1 quereus.sync.replicate + 2 quereus.lens.{ack,access} + 1 quereus.lens.writable
+			// + 2 quereus.lens.policy.* + 9 quereus.lens.decomp.* = 18.
+			expect(RESERVED_TAGS).to.have.length(18);
 			const keys = RESERVED_TAGS.map(s => (typeof s.key === 'string' ? s.key : s.key.template));
 			expect(keys).to.include('quereus.id');
 			expect(keys).to.include('quereus.previous_name');
 			expect(keys).to.include('quereus.expose_implicit_index');
+			expect(keys).to.include('quereus.sync.replicate');
 			expect(keys).to.include('quereus.lens.writable');
 			expect(keys).to.include('quereus.lens.policy.error-on');
 			expect(keys).to.include('quereus.lens.policy.require-ack');

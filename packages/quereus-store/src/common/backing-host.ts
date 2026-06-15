@@ -29,12 +29,27 @@
  * instances and `ownsConnection`'s coordinator-identity comparison rejects the
  * old incarnation's connections — memory-parity pinning.
  *
- * ## No events, no secondary structures
+ * ## Events: off by default, opt-in per table
  *
- * Privileged writes deliberately queue NO store `DataChangeEvent`s: the
+ * Privileged writes queue NO store `DataChangeEvent`s **by default**: the
  * MV-over-MV cascade consumes the returned {@link BackingRowChange}s directly,
- * and the sync layer must not replicate derived rows (the sources replicate;
- * each replica derives). MV-sugar backings carry no secondary indexes, UNIQUE
+ * and a local derived table (covering index, perf cache) must not replicate its
+ * rows (the sources replicate; each replica derives). The exception is a
+ * **migration target**, whose derived rows must reach old / never-upgrading
+ * peers that store the new table opaquely: a backing carrying the reserved tag
+ * `quereus.sync.replicate = true` (engine `SYNC_REPLICATE_TAG`) opts its
+ * maintenance writes into change recording — the host queues one local (non-
+ * `remote`) `DataChangeEvent` per realized {@link BackingRowChange}, so the sync
+ * layer records column versions / HLC stamps / tombstones exactly as for an
+ * ordinary table write. The value-identical-upsert suppression contract means a
+ * re-derivation that changes nothing emits no change and hence no event, so the
+ * echo loop closes itself (docs/migration.md § Synced vs. local derived tables).
+ * Create-fill / refresh (`replaceContents`) stays event-free regardless — it has
+ * no suppression, so publishing it would storm the change log.
+ *
+ * ## No secondary structures
+ *
+ * MV-sugar backings carry no secondary indexes, UNIQUE
  * constraints, or FKs (`buildBackingTableSchema` builds none), so the host
  * writes the data store only. A `create table … maintained as` backing DOES
  * carry its declared constraints: CHECK / FK are validated engine-side, and
@@ -49,8 +64,10 @@ import {
 	QuereusError,
 	StatusCode,
 	rowsValueIdentical,
+	SYNC_REPLICATE_TAG,
 	type Row,
 	type SqlValue,
+	type TableSchema,
 	type BackingHost,
 	type BackingScanRequest,
 	type BackingRowChange,
@@ -60,6 +77,7 @@ import {
 
 import type { StoreTable } from './store-table.js';
 import type { TransactionCoordinator } from './transaction.js';
+import type { DataChangeEvent } from './events.js';
 import { StoreConnection } from './store-connection.js';
 import { bytesToHex } from './bytes.js';
 import { buildFullScanBounds } from './key-builder.js';
@@ -184,7 +202,47 @@ export class StoreBackingHost implements BackingHost {
 		// effective contents (engine contract — vtab/backing-host.ts § Constraint
 		// validation). Zero overhead for constraint-less backings.
 		await this.table.enforceSecondaryUniqueForMaintenance(changes);
+
+		// Sync-replication opt-in: when the backing carries
+		// `quereus.sync.replicate = true`, publish one local DataChangeEvent per
+		// realized change so the sync layer records column versions / tombstones for
+		// the derivation write (migration target). Queued AFTER UNIQUE enforcement so
+		// a thrown constraint error leaves nothing queued; the coordinator buffers
+		// these into pendingEvents (fires on commit / discards on rollback). Default
+		// off — a non-replicated backing returns here having queued zero events, so
+		// existing MV maintenance is byte-for-byte unchanged.
+		if (this.replicates) {
+			const schema = this.table.getSchema();
+			for (const change of changes) {
+				this.coordinator.queueEvent(this.toDataChangeEvent(schema, change));
+			}
+		}
 		return changes;
+	}
+
+	/** True when this backing opts its maintenance writes into the sync change log. */
+	private get replicates(): boolean {
+		return this.table.getSchema().tags?.[SYNC_REPLICATE_TAG] === true;
+	}
+
+	/**
+	 * Map a realized {@link BackingRowChange} to the store {@link DataChangeEvent}
+	 * shape, mirroring the ordinary StoreTable DML events (`store-table.ts` insert
+	 * / update / delete). `remote` is left unset (these are local derivations — an
+	 * inbound sync write is a different path); `changedColumns` is omitted because
+	 * the sync layer recomputes the per-column diff from `oldRow`/`newRow` itself,
+	 * parity with the store's own update event.
+	 */
+	private toDataChangeEvent(schema: TableSchema, change: BackingRowChange): DataChangeEvent {
+		const base = { schemaName: schema.schemaName, tableName: schema.name };
+		switch (change.op) {
+			case 'insert':
+				return { ...base, type: 'insert', key: this.extractPk(change.newRow), newRow: change.newRow };
+			case 'update':
+				return { ...base, type: 'update', key: this.extractPk(change.newRow), oldRow: change.oldRow, newRow: change.newRow };
+			case 'delete':
+				return { ...base, type: 'delete', key: this.extractPk(change.oldRow), oldRow: change.oldRow };
+		}
 	}
 
 	/**

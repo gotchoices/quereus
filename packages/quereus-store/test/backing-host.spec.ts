@@ -27,8 +27,10 @@ import type { IsolationModule } from '@quereus/isolation';
 import {
 	StoreModule,
 	InMemoryKVStore,
+	StoreEventEmitter,
 	createIsolatedStoreModule,
 	type KVStoreProvider,
+	type DataChangeEvent,
 } from '../src/index.js';
 
 /** Module under test: either the registered isolation wrapper or the bare store module. */
@@ -383,3 +385,189 @@ describe('backing-host capability (store): DESC / NOCASE leading PK', () => {
 		conn.rollback();
 	});
 });
+
+/**
+ * `quereus.sync.replicate` opt-in: an opted-in backing's maintenance writes are
+ * published as local store `DataChangeEvent`s on coordinator commit, so the sync
+ * layer records the derivation (migration target). Default off; value-identical
+ * re-derivation suppresses (the echo seam); rollback discards. Run against both
+ * registration shapes (each wires the same coordinator/emitter pair).
+ *
+ * The coordinator carries the module's `StoreEventEmitter`, so subscribing to
+ * `emitter.onDataChange` captures exactly what the sync layer would see.
+ */
+const EMIT_FLAVORS: ReadonlyArray<{
+	label: string;
+	make: (provider: KVStoreProvider, emitter: StoreEventEmitter) => BackingHostModule;
+}> = [
+	{ label: 'isolated store (IsolationModule(StoreModule))', make: (p, e) => createIsolatedStoreModule({ provider: p, eventEmitter: e }) },
+	{ label: 'bare StoreModule', make: (p, e) => new StoreModule(p, e) },
+];
+
+for (const flavor of EMIT_FLAVORS) {
+	describe(`backing-host quereus.sync.replicate change-log opt-in (${flavor.label})`, () => {
+		let db: Database;
+		let provider: KVStoreProvider;
+		let emitter: StoreEventEmitter;
+		let storeModule: BackingHostModule;
+		let events: DataChangeEvent[];
+
+		/** Project a captured event to the fields the sync layer keys off. */
+		const shape = (e: DataChangeEvent) => ({ type: e.type, key: e.key, oldRow: e.oldRow, newRow: e.newRow });
+
+		beforeEach(() => {
+			db = new Database();
+			provider = createProvider();
+			emitter = new StoreEventEmitter();
+			storeModule = flavor.make(provider, emitter);
+			db.registerModule('store', storeModule);
+			events = [];
+			emitter.onDataChange(e => events.push(e));
+		});
+		afterEach(async () => {
+			await db.close();
+			await provider.closeAll();
+		});
+
+		/**
+		 * Create the `repl` backing (composite PK so `key` is an array) and seed it.
+		 * `tagOn` carries the `quereus.sync.replicate = true` opt-in. Setup data
+		 * events are discarded so each test asserts only its own maintenance.
+		 */
+		async function setup(tagOn: boolean): Promise<void> {
+			const tagClause = tagOn ? ' with tags ("quereus.sync.replicate" = true)' : '';
+			await db.exec(`create table repl (a integer, b integer, v text, primary key (a, b)) using store${tagClause}`);
+			await db.exec("insert into repl values (1,1,'a'),(1,2,'b'),(2,1,'c')");
+			events.length = 0;
+		}
+
+		function resolveHost(): BackingHost {
+			const host = storeModule.getBackingHost!(db, 'main', 'repl');
+			expect(host, "backing host for 'repl'").to.not.be.undefined;
+			return host!;
+		}
+
+		it('publishes a local insert / update / delete event per realized change on commit', async () => {
+			await setup(true);
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [
+				{ kind: 'upsert', row: [3, 1, 'z'] },   // new key → insert
+				{ kind: 'upsert', row: [1, 2, 'B'] },   // existing key, changed → update
+				{ kind: 'delete-key', key: [2, 1] },    // existing → delete
+			]);
+			// Events ride the coordinator: nothing is delivered until commit.
+			expect(events, 'buffered until commit').to.have.length(0);
+
+			await conn.commit();
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'insert', key: [3, 1], oldRow: undefined, newRow: [3, 1, 'z'] },
+				{ type: 'update', key: [1, 2], oldRow: [1, 2, 'b'], newRow: [1, 2, 'B'] },
+				{ type: 'delete', key: [2, 1], oldRow: [2, 1, 'c'], newRow: undefined },
+			]);
+			// All are local derivations — never marked remote (that's the inbound-sync path).
+			expect(events.every(e => !e.remote)).to.equal(true);
+		});
+
+		it('suppresses a value-identical upsert (the echo seam): no change, no event', async () => {
+			await setup(true);
+			const host = resolveHost();
+			const conn = host.connect();
+			const changes = await host.applyMaintenance(conn, [
+				{ kind: 'upsert', row: [1, 1, 'a'] },   // byte-identical to committed → suppressed
+			]);
+			expect(changes).to.deep.equal([]);
+			await conn.commit();
+			expect(events).to.have.length(0);
+		});
+
+		it('replace-all publishes only the genuine diffs; identical paired rows publish nothing', async () => {
+			await setup(true);
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{
+				kind: 'replace-all',
+				rows: [[1, 1, 'a'], [1, 2, 'B2'], [3, 3, 'n']],
+			}]);
+			await conn.commit();
+			// (1,1) identical → skipped (no event); (1,2) changed → update; (3,3) new →
+			// insert; (2,1) absent → delete. Order matches the returned changes[].
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'update', key: [1, 2], oldRow: [1, 2, 'b'], newRow: [1, 2, 'B2'] },
+				{ type: 'insert', key: [3, 3], oldRow: undefined, newRow: [3, 3, 'n'] },
+				{ type: 'delete', key: [2, 1], oldRow: [2, 1, 'c'], newRow: undefined },
+			]);
+		});
+
+		it('a replace-all of the exact committed contents publishes nothing (steady-state attach)', async () => {
+			await setup(true);
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{
+				kind: 'replace-all',
+				rows: [[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']],
+			}]);
+			await conn.commit();
+			expect(events).to.have.length(0);
+		});
+
+		it('without the tag, maintenance emits no events (default off, no regression)', async () => {
+			await setup(false);
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [
+				{ kind: 'upsert', row: [3, 1, 'z'] },
+				{ kind: 'delete-key', key: [1, 2] },
+			]);
+			await conn.commit();
+			expect(events).to.have.length(0);
+		});
+
+		it('a rolled-back maintenance batch publishes nothing', async () => {
+			await setup(true);
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [9, 9, 'rb'] }]);
+			conn.rollback();
+			expect(events).to.have.length(0);
+		});
+
+		it('ALTER add-tags turns replication on for subsequent maintenance (live propagation)', async () => {
+			await setup(false);
+			// table_modified propagates to the live StoreTable.updateSchema — no reopen.
+			await db.exec('alter table repl add tags ("quereus.sync.replicate" = true)');
+			events.length = 0;
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [4, 4, 'on'] }]);
+			await conn.commit();
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'insert', key: [4, 4], oldRow: undefined, newRow: [4, 4, 'on'] },
+			]);
+		});
+
+		it('ALTER drop-tags turns replication off for subsequent maintenance (live propagation)', async () => {
+			await setup(true);
+			await db.exec('alter table repl drop tags ("quereus.sync.replicate")');
+			events.length = 0;
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [4, 4, 'off'] }]);
+			await conn.commit();
+			expect(events).to.have.length(0);
+		});
+	});
+}
+
+/**
+ * Echo-loop quiescence — the spec's explicit cross-peer test (docs/migration.md
+ * § Synced vs. local derived tables). Peer A's source write derives + logs the
+ * derived row; B ingests source + derived; B's own re-derivation of the ingested
+ * source change is value-identical, so suppression drops it → B logs zero
+ * B-origin derived entries (no ping-pong). This is heavier than a store-host unit
+ * test — it needs a store+`@quereus/sync` two-peer harness (HLC, change log,
+ * ingest) — so it is tracked as a follow-up rather than stubbed here; the
+ * single-host echo seam (value-identical upsert → no event) is pinned by the
+ * suppression test above. See review handoff `sync-derivation-changelog-optin`.
+ */
+it('echo-loop quiescence across two synced peers (integration; tracked follow-up)');
