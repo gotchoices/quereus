@@ -532,6 +532,25 @@ for (const flavor of EMIT_FLAVORS) {
 			expect(events).to.have.length(0);
 		});
 
+		it('rolling back to a savepoint discards only that span\'s queued maintenance events', async () => {
+			// The coordinator snapshots `pendingEvents.length` per savepoint and
+			// truncates back to it on rollback-to (transaction.ts createSavepoint /
+			// rollbackToSavepoint), so maintenance events ride the same eventIndex
+			// truncation as data ops: the pre-savepoint batch survives, the batch
+			// inside the released span is dropped, and commit fires only the survivor.
+			await setup(true);
+			const host = resolveHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [5, 5, 'keep'] }]);
+			conn.createSavepoint(0);
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [6, 6, 'drop'] }]);
+			conn.rollbackToSavepoint(0);
+			await conn.commit();
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'insert', key: [5, 5], oldRow: undefined, newRow: [5, 5, 'keep'] },
+			]);
+		});
+
 		it('ALTER add-tags turns replication on for subsequent maintenance (live propagation)', async () => {
 			await setup(false);
 			// table_modified propagates to the live StoreTable.updateSchema — no reopen.
