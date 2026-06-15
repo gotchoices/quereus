@@ -2322,32 +2322,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				return;
 			}
 			case 'materialized_view_added':
-			case 'materialized_view_modified': {
-				// Unified model: the payload is the maintained table itself. Narrow
-				// defensively — a derivation-less payload would be an engine bug.
-				// Mirror `table_modified`: refresh the connected StoreTable's cached schema
-				// synchronously so a replicates-tag change takes effect immediately.
-				const mv = event.newObject;
-				if (isMaintainedTable(mv)) {
-					const key = `${event.schemaName}.${event.objectName}`.toLowerCase();
-					const connected = this.tables.get(key);
-					if (connected) connected.updateSchema(mv);
-					this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
-				}
+			case 'materialized_view_modified':
+				// Unified model: the payload is the maintained table itself.
+				this.refreshConnectedMaterializedView(event.schemaName, event.objectName, event.newObject);
 				return;
-			}
-			case 'materialized_view_refreshed': {
-				// DDL is usually unchanged by a REFRESH (body/tags identical) → compare-skip.
-				// Refresh the cache in case tags were somehow updated alongside the refresh.
-				const mv = event.object;
-				if (isMaintainedTable(mv)) {
-					const key = `${event.schemaName}.${event.objectName}`.toLowerCase();
-					const connected = this.tables.get(key);
-					if (connected) connected.updateSchema(mv);
-					this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
-				}
+			case 'materialized_view_refreshed':
+				// DDL is usually unchanged by a REFRESH (body/tags identical) → compare-skip,
+				// but re-read tags in case they were updated alongside the refresh.
+				this.refreshConnectedMaterializedView(event.schemaName, event.objectName, event.object);
 				return;
-			}
 			case 'materialized_view_removed': {
 				const { schemaName, objectName } = event;
 				this.enqueuePersist(() => this.removeMaterializedViewDDL(schemaName, objectName));
@@ -2357,6 +2340,21 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				return;
 		}
 	};
+
+	/**
+	 * Shared MV add/modify/refresh handling. Narrow defensively — a derivation-less
+	 * payload would be an engine bug, so skip. Otherwise, mirror `table_modified`:
+	 * synchronously refresh a connected `StoreTable`'s cached schema (so a tag change
+	 * such as `quereus.sync.replicate` takes effect immediately without reopen) before
+	 * enqueuing the catalog DDL persist.
+	 */
+	private refreshConnectedMaterializedView(schemaName: string, objectName: string, payload: TableSchema): void {
+		if (!isMaintainedTable(payload)) return;
+		const key = `${schemaName}.${objectName}`.toLowerCase();
+		const connected = this.tables.get(key);
+		if (connected) connected.updateSchema(payload);
+		this.enqueuePersist(() => this.saveMaterializedViewDDL(payload));
+	}
 
 	/**
 	 * Append a catalog-persistence task to the serialized `persistQueue`, so successive
