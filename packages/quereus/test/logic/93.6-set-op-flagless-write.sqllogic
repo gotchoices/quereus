@@ -448,6 +448,38 @@ select id from mxj2 order by id;
 select id, x from mxp order by id;
 → [{"id":1,"x":10},{"id":5,"x":50}]
 
+-- `insert or ignore` through the join leg threads `onConflict` into the per-leg envelope insert:
+-- a row colliding on the existing join-leg PK (mxj1 id=5) is ignored (no error, no change), while a
+-- fresh non-colliding row still lands (`set-op-write-multisource-leg-insert`).
+insert or ignore into MXV (id, x, src) values (5, 999, 'j');
+select id, x from mxj1 order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
+insert or ignore into MXV (id, x, src) values (6, 60, 'j');
+select id, x from mxj1 order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50},{"id":6,"x":60}]
+select id from mxj2 order by id;
+→ [{"id":1},{"id":5},{"id":6}]
+
+-- ===================================================================
+-- Uncovered NOT NULL non-key column on a join leg ⇒ NOT insertable (the probe-reject reason the
+-- `jv2.y integer null` fixture above sidesteps). `nn2.y` is a bare `integer` (NOT NULL, no default)
+-- not exposed as a view column, so the shared-surrogate envelope cannot supply it: `is_insertable_into`
+-- reports NO and the dynamic insert rejects cleanly. UPDATE / DELETE through the join leg stay YES.
+-- ===================================================================
+create table nn1 (id integer primary key, x integer, color text null);
+create table nn2 (id integer primary key, y integer);
+insert into nn1 values (1,10,'red');
+insert into nn2 values (1,100);
+create view NNV as
+  select nn1.id as id, nn1.x as x, 'a' as src from nn1 join nn2 on nn1.id = nn2.id
+  union all
+  select id, x, 'b' as src from nn1 where 0;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('NNV');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+insert into NNV (id, x, src) values (5, 50, 'a');
+-- error: is NOT NULL with no default
+
 -- ===================================================================
 -- Halloween safety through a join leg (`set-op-write-multisource-leg-compose`): the inner capture
 -- is materialized BEFORE the leg's base ops, so an UPDATE that rewrites a column its own member

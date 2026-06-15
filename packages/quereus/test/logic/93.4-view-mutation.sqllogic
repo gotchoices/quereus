@@ -4132,6 +4132,38 @@ select id, x from mfj1 order by id;
 select id from mfj2 order by id;
 → [{"id":1},{"id":2}]
 
+-- ===================================================================
+-- Combined data-fan + join-flip in ONE update (`set x = …, inJ = true`)
+-- (`set-op-write-multisource-leg-insert`): the data assignment and the membership
+-- flip coexist on one plan — the data fan rewrites the present (plain-leg) row while
+-- the flip's nested envelope inserts the join branch's base tables with the SAME
+-- assigned value folded into its projection (via `qualifyDataRefsWithCapture`).
+-- ===================================================================
+create table cf_p (id integer primary key, x integer);
+create table cfj1 (id integer primary key, x integer);
+create table cfj2 (id integer primary key);
+insert into cf_p values (1,10),(2,20);
+insert into cfj1 values (1,10);
+insert into cfj2 values (1);
+create view CF as
+  select cfj1.id as id, cfj1.x as x from cfj1 join cfj2 on cfj1.id = cfj2.id
+  union exists left as inJ, exists right as inP
+  select id, x from cf_p;
+
+select id, x, inJ, inP from CF order by id;
+→ [{"id":1,"x":10,"inJ":true,"inP":true},{"id":2,"x":20,"inJ":false,"inP":true}]
+
+-- On the captured-absent row id=2: set x=99 AND flip inJ=true. The flip's join-leg
+-- insert carries the assigned x=99 (NOT the captured x=20), and the plain leg's own
+-- row is data-updated to x=99 too.
+update CF set x = 99, inJ = true where id = 2;
+select id, x from cfj1 order by id;
+→ [{"id":1,"x":10},{"id":2,"x":99}]
+select id from cfj2 order by id;
+→ [{"id":1},{"id":2}]
+select id, x from cf_p order by id;
+→ [{"id":1,"x":10},{"id":2,"x":99}]
+
 -- ===================================
 -- RETURNING <q>.* qualifier validation through updatable views.
 -- A wrong qualifier (bogus.*) must error with the same diagnostic as the base-table
