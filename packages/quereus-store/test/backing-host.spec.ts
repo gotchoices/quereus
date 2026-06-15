@@ -578,6 +578,97 @@ for (const flavor of EMIT_FLAVORS) {
 	});
 }
 
+for (const flavor of EMIT_FLAVORS) {
+	describe(`backing-host quereus.sync.replicate on store-hosted materialized view (${flavor.label})`, () => {
+		let db: Database;
+		let provider: KVStoreProvider;
+		let emitter: StoreEventEmitter;
+		let storeModule: BackingHostModule;
+		let events: DataChangeEvent[];
+
+		const shape = (e: DataChangeEvent) => ({ type: e.type, key: e.key, oldRow: e.oldRow, newRow: e.newRow });
+
+		beforeEach(async () => {
+			db = new Database();
+			provider = createProvider();
+			emitter = new StoreEventEmitter();
+			storeModule = flavor.make(provider, emitter);
+			db.registerModule('store', storeModule);
+			events = [];
+			emitter.onDataChange(e => events.push(e));
+
+			// Source table + store-hosted materialized view (no replicate tag by default).
+			await db.exec(`create table src (k integer primary key, v text) using store`);
+			await db.exec(`create materialized view mv using store as select k, v from src`);
+			events.length = 0;
+		});
+
+		afterEach(async () => {
+			await db.close();
+			await provider.closeAll();
+		});
+
+		function resolveMvHost(): BackingHost {
+			const host = storeModule.getBackingHost!(db, 'main', 'mv');
+			expect(host, "backing host for 'mv'").to.not.be.undefined;
+			return host!;
+		}
+
+		it('create-time quereus.sync.replicate = true emits on maintenance', async () => {
+			// Drop and re-create the MV with the tag at create time.
+			await db.exec(`drop materialized view mv`);
+			await db.exec(`create materialized view mv using store as select k, v from src with tags ("quereus.sync.replicate" = true)`);
+			events.length = 0;
+
+			const host = resolveMvHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [1, 'hello'] }]);
+			await conn.commit();
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'insert', key: [1], oldRow: undefined, newRow: [1, 'hello'] },
+			]);
+		});
+
+		it('without tag, maintenance emits nothing (default off)', async () => {
+			const host = resolveMvHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [1, 'hello'] }]);
+			await conn.commit();
+			expect(events).to.have.length(0);
+		});
+
+		it('ALTER add-tags turns MV replication on immediately (live propagation, no reopen)', async () => {
+			// materialized_view_modified must refresh the connected StoreTable cache.
+			await db.exec(`alter materialized view mv add tags ("quereus.sync.replicate" = true)`);
+			events.length = 0;
+
+			const host = resolveMvHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [2, 'on'] }]);
+			await conn.commit();
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'insert', key: [2], oldRow: undefined, newRow: [2, 'on'] },
+			]);
+		});
+
+		it('ALTER drop-tags turns MV replication off immediately (live propagation, no reopen)', async () => {
+			// Start with tag on, then drop it.
+			await db.exec(`drop materialized view mv`);
+			await db.exec(`create materialized view mv using store as select k, v from src with tags ("quereus.sync.replicate" = true)`);
+			events.length = 0;
+
+			await db.exec(`alter materialized view mv drop tags ("quereus.sync.replicate")`);
+			events.length = 0;
+
+			const host = resolveMvHost();
+			const conn = host.connect();
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [3, 'off'] }]);
+			await conn.commit();
+			expect(events).to.have.length(0);
+		});
+	});
+}
+
 /**
  * Echo-loop quiescence — the spec's explicit cross-peer test (docs/migration.md
  * § Synced vs. local derived tables). Peer A's source write derives + logs the

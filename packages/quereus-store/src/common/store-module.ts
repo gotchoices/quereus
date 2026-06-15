@@ -2280,6 +2280,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * - `view_added` / `view_modified` / `view_removed` — plain `CREATE`/`ALTER … SET TAGS`/
 	 *   `DROP VIEW` (the engine fires these from the runtime emitters).
 	 * - `materialized_view_added` / `_modified` / `_refreshed` / `_removed` — MV lifecycle.
+	 *   Like `table_modified`, the `_added`/`_modified`/`_refreshed` arms also synchronously
+	 *   refresh the connected `StoreTable`'s cached schema so a tag change (e.g.
+	 *   `quereus.sync.replicate`) takes effect immediately without reopen.
 	 *
 	 * Unlike the table path there is **no** catalog-absent self-filter for view/MV
 	 * add/remove: one `StoreModule` instance serves one `Database`, so that database's
@@ -2322,14 +2325,27 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			case 'materialized_view_modified': {
 				// Unified model: the payload is the maintained table itself. Narrow
 				// defensively — a derivation-less payload would be an engine bug.
+				// Mirror `table_modified`: refresh the connected StoreTable's cached schema
+				// synchronously so a replicates-tag change takes effect immediately.
 				const mv = event.newObject;
-				if (isMaintainedTable(mv)) this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				if (isMaintainedTable(mv)) {
+					const key = `${event.schemaName}.${event.objectName}`.toLowerCase();
+					const connected = this.tables.get(key);
+					if (connected) connected.updateSchema(mv);
+					this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				}
 				return;
 			}
 			case 'materialized_view_refreshed': {
 				// DDL is usually unchanged by a REFRESH (body/tags identical) → compare-skip.
+				// Refresh the cache in case tags were somehow updated alongside the refresh.
 				const mv = event.object;
-				if (isMaintainedTable(mv)) this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				if (isMaintainedTable(mv)) {
+					const key = `${event.schemaName}.${event.objectName}`.toLowerCase();
+					const connected = this.tables.get(key);
+					if (connected) connected.updateSchema(mv);
+					this.enqueuePersist(() => this.saveMaterializedViewDDL(mv));
+				}
 				return;
 			}
 			case 'materialized_view_removed': {
