@@ -193,7 +193,9 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 	// maintained table / materialized view's maintenance writes in the sync change
 	// log (the store backing host queues a DataChangeEvent per realized
 	// BackingRowChange — column versions / HLC stamps / tombstones, like an ordinary
-	// table write). Boolean (the host reads `=== true`), default off. Sited at
+	// table write — on the row-time maintenance path AND the create-fill / refresh
+	// path, the latter as the minimal keyed diff so a value-identical re-fill
+	// suppresses). Boolean (the host reads `=== true`), default off. Sited at
 	// view-ddl (the `create materialized view … with tags (…)` authoring form) and
 	// physical-table (the canonical `create table … using store() maintained as …`
 	// form) — the two authoring forms of a migration target. NOT a logical-* site:

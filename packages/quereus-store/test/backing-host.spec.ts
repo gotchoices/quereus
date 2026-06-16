@@ -599,6 +599,28 @@ for (const flavor of EMIT_FLAVORS) {
 				[[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
 		});
 
+		it('replaceContents commits a pending maintenance txn first: its events fire separately, and its row is in the diff before-image', async () => {
+			await setup(true);
+			const host = resolveHost();
+			const conn = host.connect();
+			// Queue a maintenance insert WITHOUT committing — it buffers on the coordinator.
+			await host.applyMaintenance(conn, [{ kind: 'upsert', row: [3, 1, 'z'] }]);
+			expect(events, 'buffered until the top-of-method commit').to.have.length(0);
+
+			// The fill OMITS (3,1) and re-states the original three byte-identically. The
+			// top-of-method coordinator commit must fire the pending insert; the committed
+			// before-image the diff snapshots must then INCLUDE (3,1), so the fill emits one
+			// delete for it (and nothing for the three byte-identical rows) — no double-count.
+			await host.replaceContents([[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'insert', key: [3, 1], oldRow: undefined, newRow: [3, 1, 'z'] },
+				{ type: 'delete', key: [3, 1], oldRow: [3, 1, 'z'], newRow: undefined },
+			]);
+			conn.rollback(); // nothing left open — the commit-first drained the txn
+			expect(await collect(host.scanEffective(host.connect(), {}))).to.deep.equal(
+				[[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
+		});
+
 		it('without the tag, maintenance emits no events (default off, no regression)', async () => {
 			await setup(false);
 			const host = resolveHost();
