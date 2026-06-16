@@ -10,6 +10,7 @@
 import { compareHLC, maxHLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
+import type { Tombstone } from '../metadata/tombstones.js';
 import type {
 	ChangeSet,
 	Change,
@@ -31,6 +32,8 @@ export interface ResolvedChange {
 	dataChange?: DataChangeToApply;
 	/** For column changes: the old version to clean up in the change log. */
 	oldColumnVersion?: ColumnVersion;
+	/** For delete changes: the prior tombstone whose stale delete entry to clean up in the change log. */
+	oldTombstone?: Tombstone;
 }
 
 /**
@@ -197,6 +200,7 @@ export async function resolveChange(
 		return {
 			outcome: 'applied',
 			change,
+			oldTombstone: existingTombstone ?? undefined,
 			dataChange: {
 				type: 'delete',
 				schema: change.schema,
@@ -301,6 +305,19 @@ export async function commitChangeMetadata(
 		const change = resolved.change;
 
 		if (change.type === 'delete') {
+			// Dedupe: a newer tombstone overwrites the prior one, leaving its delete
+			// change-log entry stale — remove it so at most one survives per pk (mirrors
+			// the column dedup below and the write path in recordDataEvent).
+			if (resolved.oldTombstone) {
+				ctx.changeLog.deleteEntryBatch(
+					batch,
+					resolved.oldTombstone.hlc,
+					'delete',
+					change.schema,
+					change.table,
+					change.pk,
+				);
+			}
 			ctx.tombstones.setTombstoneBatch(batch, change.schema, change.table, change.pk, change.hlc);
 			ctx.changeLog.recordDeletionBatch(batch, change.hlc, change.schema, change.table, change.pk);
 		} else {

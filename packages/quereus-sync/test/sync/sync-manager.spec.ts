@@ -259,12 +259,12 @@ describe('SyncManager', () => {
 
     // Regression for the scan-time bound mis-counting when a stale delete change-log
     // entry re-attributes to a later tombstone HLC. A delete→reinsert→delete key reuse
-    // leaves the first delete's entry behind (delete entries are never deduped), and it
-    // resolves to the SECOND delete's tombstone — so boundary detection (keyed on the
-    // log HLC) and grouping (keyed on the resolved HLC) disagree, splitting the later
-    // multi-fact transaction across two getChangesSince rounds. Un-skip when
-    // `sync-stale-delete-entry-reattribution` lands.
-    it.skip('does not split a transaction when a stale delete entry re-attributes', async () => {
+    // used to leave the first delete's entry behind, and it resolved to the SECOND
+    // delete's tombstone — so boundary detection (keyed on the log HLC) and grouping
+    // (keyed on the resolved HLC) disagreed, splitting the later multi-fact transaction
+    // across two getChangesSince rounds. `sync-stale-delete-entry-reattribution` now
+    // dedupes the delete entry on overwrite, so at most one survives per pk.
+    it('does not split a transaction when a stale delete entry re-attributes', async () => {
       config.batchSize = 1;
       const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const peer = generateSiteId();
@@ -293,6 +293,70 @@ describe('SyncManager', () => {
         withDelete!.changes.some(c => c.type === 'column' && JSON.stringify(c.pk) === '[2]'),
         'transaction split: pk[2] insert missing from the delete transaction',
       ).to.be.true;
+    });
+
+    it('walks a multi-round delta over a delete→reinsert→delete key reuse with no repeats, gaps, or split', async () => {
+      // Same re-attribution hazard as above, but driven across watermark-advancing
+      // rounds: batchSize=1 forces one whole transaction per round, so the stale
+      // delete entry (txn3's tombstone) — if not deduped — would re-attribute to the
+      // later multi-fact transaction and split it across rounds. Surviving txns:
+      //   txn1 column pk[10], txn5 column pk[20], txn6 { delete pk[1], insert pk[2] }.
+      config.batchSize = 1;
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [10], newRow: ['a1'] });
+      await flush();
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a'] });
+      await flush();
+      source.commitData({ type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['a'] });
+      await flush();
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['b'] });
+      await flush();
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [20], newRow: ['c'] });
+      await flush();
+      // One transaction that deletes pk[1] AND inserts pk[2] — must never be split.
+      source.commit({ data: [
+        { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['b'] },
+        { type: 'insert', schemaName: 'main', tableName: 'users', key: [2], newRow: ['z'] },
+      ] });
+      await flush();
+
+      const collected: ChangeSet[] = [];
+      let sinceHLC: HLC | undefined = { wallTime: 0n, counter: 0, siteId: new Uint8Array(16), opSeq: 0 };
+      for (let i = 0; i < 10; i++) {
+        const sets: ChangeSet[] = await manager.getChangesSince(peer, sinceHLC);
+        if (sets.length === 0) break;
+        collected.push(...sets);
+        sinceHLC = sets[sets.length - 1].hlc;
+      }
+
+      // No repeats: each transaction id appears exactly once.
+      const txnIds = collected.map(cs => cs.transactionId);
+      expect(new Set(txnIds).size, 'a transaction was repeated across rounds').to.equal(txnIds.length);
+
+      // No gaps / strictly ascending watermark across the whole walk.
+      for (let i = 1; i < collected.length; i++) {
+        expect(compareHLC(collected[i - 1].hlc, collected[i].hlc)).to.be.lessThan(0);
+      }
+
+      // The multi-fact transaction is never split: the ChangeSet carrying the pk[1]
+      // delete also carries the pk[2] insert, and nothing else carries either fact.
+      const deleteSets = collected.filter(s => s.changes.some(c => c.type === 'delete'));
+      expect(deleteSets, 'the delete must surface in exactly one ChangeSet').to.have.lengthOf(1);
+      const deleteSet = deleteSets[0];
+      expect(
+        deleteSet.changes.some(c => c.type === 'column' && JSON.stringify(c.pk) === '[2]'),
+        'transaction split: pk[2] insert missing from the delete transaction',
+      ).to.be.true;
+
+      // Exactly the surviving facts, once each: pk[10], pk[20], delete pk[1], pk[2].
+      const allChanges = collected.flatMap(cs => cs.changes);
+      const deletes = allChanges.filter(c => c.type === 'delete');
+      const columns = allChanges.filter(c => c.type === 'column');
+      expect(deletes.map(c => JSON.stringify(c.pk))).to.deep.equal(['[1]']);
+      expect(new Set(columns.map(c => JSON.stringify(c.pk)))).to.deep.equal(new Set(['[10]', '[20]', '[2]']));
+      expect(columns).to.have.lengthOf(3);
     });
   });
 

@@ -345,6 +345,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		}
 
 		if (type === 'delete') {
+			// Dedupe the change-log delete entry the same way columns are deduped: if a
+			// prior tombstone exists for this pk (a delete→reinsert→delete key reuse),
+			// its stale delete entry must go, so at most one delete entry survives per pk
+			// with HLC equal to the current tombstone. This keeps collectChangesSince's
+			// boundary detection (keyed on the log HLC) in lockstep with grouping (keyed
+			// on the resolved tombstone HLC) — see its LOAD-BEARING INVARIANT.
+			const existing = await this.tombstones.getTombstone(schemaName, tableName, pk);
+			if (existing) {
+				this.changeLog.deleteEntryBatch(batch, existing.hlc, 'delete', schemaName, tableName, pk);
+			}
+
 			const hlc = nextHlc();
 			this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, hlc);
 			this.changeLog.recordDeletionBatch(batch, hlc, schemaName, tableName, pk);
@@ -474,14 +485,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * LOAD-BEARING INVARIANT: boundary detection keys off `logEntry.hlc`, but the
 	 * grouper keys off the *resolved* version's HLC ({@link resolveLogEntry} returns
 	 * `cv.hlc` / `tombstone.hlc`). These agree only when each non-null-resolving log
-	 * entry's HLC equals its resolved version's HLC. For COLUMN entries that holds:
-	 * an overwrite deletes the prior change-log entry (see {@link recordColumnVersions}
-	 * and `commitChangeMetadata`), so at most one entry per `(pk, column)` survives and
-	 * its HLC is the current `cv.hlc`. DELETE entries are NOT deduped this way
-	 * (`deleteEntryBatch` is never called with `'delete'`), so a delete→reinsert→delete
-	 * key-reuse sequence leaves a stale delete entry that re-attributes to a later
-	 * tombstone HLC — there the scan-time bound can mis-count and split a transaction.
-	 * Tracked by `sync-stale-delete-entry-reattribution`.
+	 * entry's HLC equals its resolved version's HLC, which holds for BOTH entry types
+	 * because each is deduped on overwrite — at most one entry survives per key, and
+	 * its HLC equals the current version's:
+	 *   - COLUMN: an overwrite deletes the prior `(pk, column)` entry (see
+	 *     {@link recordColumnVersions} and `commitChangeMetadata`), so the survivor's
+	 *     HLC is the current `cv.hlc`.
+	 *   - DELETE: a newer tombstone deletes the prior `pk` delete entry (see
+	 *     {@link recordDataEvent} and `commitChangeMetadata`), so a
+	 *     delete→reinsert→delete key reuse no longer leaves a stale entry that
+	 *     re-attributes to a later tombstone HLC; the survivor's HLC is the current
+	 *     `tombstone.hlc`.
 	 *
 	 * (Schema migrations are still fully scanned by {@link collectSchemaMigrations};
 	 * the `sm:` range is not HLC-ordered, but migrations are few and the grouping
