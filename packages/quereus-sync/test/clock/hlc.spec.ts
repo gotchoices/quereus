@@ -267,11 +267,19 @@ describe('HLC (Hybrid Logical Clock)', () => {
         const siteA = generateSiteId();
         const siteB = generateSiteId();
 
-        const mgr1 = new HLCManager(siteA, { wallTime: 1000n, counter: 0 });
-        const mgr2 = new HLCManager(siteA, { wallTime: 1000n, counter: 0 });
+        // Seed wallTime ahead of the real wall clock (within MAX_DRIFT) so receive()
+        // merges from the stored/remote clock rather than Date.now(). Otherwise both
+        // managers' (and the remote's) wallTimes sit far below the real clock, maxWall
+        // resolves to Date.now() in both calls, and a 1ms boundary between the two
+        // Date.now() reads makes the two results diverge — a flaky failure.
+        const base = BigInt(Date.now()) + 10_000n;
+        const mgr1 = new HLCManager(siteA, { wallTime: base, counter: 0 });
+        const mgr2 = new HLCManager(siteA, { wallTime: base, counter: 0 });
 
-        const r1 = mgr1.receive(createHLC(2000n, 5, siteB, 0));
-        const r2 = mgr2.receive(createHLC(2000n, 5, siteB, 4_000_000_000));
+        // remote.wallTime > local.wallTime, so the "remote wins" branch applies
+        // deterministically: wallTime/counter derive from the remote clock, never Date.now().
+        const r1 = mgr1.receive(createHLC(base + 1000n, 5, siteB, 0));
+        const r2 = mgr2.receive(createHLC(base + 1000n, 5, siteB, 4_000_000_000));
 
         expect(r2.wallTime).to.equal(r1.wallTime);
         expect(r2.counter).to.equal(r1.counter);
