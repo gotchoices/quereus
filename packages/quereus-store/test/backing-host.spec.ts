@@ -668,16 +668,3 @@ for (const flavor of EMIT_FLAVORS) {
 		});
 	});
 }
-
-/**
- * Echo-loop quiescence — the spec's explicit cross-peer test (docs/migration.md
- * § Synced vs. local derived tables). Peer A's source write derives + logs the
- * derived row; B ingests source + derived; B's own re-derivation of the ingested
- * source change is value-identical, so suppression drops it → B logs zero
- * B-origin derived entries (no ping-pong). This is heavier than a store-host unit
- * test — it needs a store+`@quereus/sync` two-peer harness (HLC, change log,
- * ingest) — so it is tracked as a follow-up rather than stubbed here; the
- * single-host echo seam (value-identical upsert → no event) is pinned by the
- * suppression test above. See review handoff `sync-derivation-changelog-optin`.
- */
-it('echo-loop quiescence across two synced peers (integration; tracked follow-up)');
