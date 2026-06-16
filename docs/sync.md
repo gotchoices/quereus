@@ -305,7 +305,14 @@ overwrite**, so at most one change-log entry survives per key with HLC equal to 
 current version. Column entries are deduped when a newer value overwrites the prior one;
 delete entries are deduped when a newer tombstone overwrites the prior one — so a
 `delete → reinsert → delete` key reuse no longer leaves a stale delete entry that could
-re-attribute to the later tombstone's HLC and split that transaction across rounds.
+re-attribute to the later tombstone's HLC and split that transaction across rounds. The
+overwrite dedup covers entries written across *separate* writes/applies. The apply path
+(`commitChangeMetadata`) additionally **collapses in-batch repeats**: when two versions
+of one key arrive in a single `applyChanges` call they resolve against the same
+pre-batch prior version, so neither sees the other — only the max-HLC winner per key is
+written, keeping a single surviving entry whose HLC equals the current version's no
+matter how many versions of a key were batched (e.g. concurrent deletes of the same pk
+relayed together).
 
 **Oversized transaction.** A single transaction whose fact count exceeds `batchSize`
 is returned **whole** as one ChangeSet and telemetered (a `console.warn`), never

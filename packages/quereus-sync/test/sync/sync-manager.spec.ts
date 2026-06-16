@@ -704,6 +704,135 @@ describe('SyncManager', () => {
       expect(compareHLC(deletes[0].hlc, { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId, opSeq: 0 }))
         .to.equal(0);
     });
+
+    it('dedupes same-pk deletes batched into ONE applyChanges call (in-batch repeat)', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const siteA = generateSiteId();
+      const siteB = generateSiteId();
+      const now = Date.now();
+
+      const deleteFrom = (site: Uint8Array, wall: number, counter: number, tx: string): ChangeSet => {
+        const hlc: HLC = { wallTime: BigInt(wall), counter, siteId: site, opSeq: 0 };
+        return { siteId: site, transactionId: tx, hlc, changes: [{ type: 'delete', schema: 'main', table: 'users', pk: [1], hlc }], schemaMigrations: [] };
+      };
+
+      // Both deletes resolve against the SAME pre-batch state (no tombstone yet),
+      // so neither sees the other — both delete entries are recorded today.
+      const result = await manager.applyChanges([
+        deleteFrom(siteA, now, 1, 'tx-a'),
+        deleteFrom(siteB, now + 1000, 1, 'tx-b'),
+      ]);
+      expect(result.applied).to.equal(2);
+
+      const peer = generateSiteId();
+      const sinceHLC: HLC = { wallTime: 0n, counter: 0, siteId: new Uint8Array(16), opSeq: 0 };
+      const sets = await manager.getChangesSince(peer, sinceHLC);
+      const deletes = sets.flatMap(s => s.changes).filter(c => c.type === 'delete' && JSON.stringify(c.pk) === '[1]');
+      expect(deletes, 'in-batch stale delete entry not deduped').to.have.lengthOf(1);
+      // Survivor's HLC must equal the current tombstone's (the max-HLC delete).
+      expect(compareHLC(deletes[0].hlc, { wallTime: BigInt(now + 1000), counter: 1, siteId: siteB, opSeq: 0 })).to.equal(0);
+    });
+
+    it('dedupes same-(pk,column) writes batched into ONE applyChanges call (in-batch repeat)', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const siteA = generateSiteId();
+      const siteB = generateSiteId();
+      const now = Date.now();
+
+      const writeFrom = (site: Uint8Array, wall: number, value: string, tx: string): ChangeSet => {
+        const hlc: HLC = { wallTime: BigInt(wall), counter: 1, siteId: site, opSeq: 0 };
+        return { siteId: site, transactionId: tx, hlc, changes: [{ type: 'column', schema: 'main', table: 'users', pk: [1], column: 'name', value, hlc }], schemaMigrations: [] };
+      };
+
+      const result = await manager.applyChanges([
+        writeFrom(siteA, now, 'Alice', 'tx-a'),
+        writeFrom(siteB, now + 1000, 'Bob', 'tx-b'),
+      ]);
+      expect(result.applied).to.equal(2);
+
+      const peer = generateSiteId();
+      const sinceHLC: HLC = { wallTime: 0n, counter: 0, siteId: new Uint8Array(16), opSeq: 0 };
+      const sets = await manager.getChangesSince(peer, sinceHLC);
+      const cols = sets.flatMap(s => s.changes).filter(c => c.type === 'column' && JSON.stringify(c.pk) === '[1]');
+      expect(cols, 'in-batch stale column entry not deduped').to.have.lengthOf(1);
+      expect(compareHLC(cols[0].hlc, { wallTime: BigInt(now + 1000), counter: 1, siteId: siteB, opSeq: 0 })).to.equal(0);
+    });
+
+    it('does not split a separate transaction when same-pk deletes are collapsed in one batch (multi-round walk)', async () => {
+      // batchSize=1 forces one whole transaction per round. Two same-pk deletes batched
+      // into ONE applyChanges call collapse to the max-HLC winner; if the stale older
+      // entry survived it would re-attribute to the later HLC and split the separate
+      // multi-fact transaction across rounds (the apply-path mirror of the ~line-298 walk).
+      config.batchSize = 1;
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const siteA = generateSiteId();
+      const siteB = generateSiteId();
+      const siteC = generateSiteId();
+      const now = Date.now();
+
+      const deleteFrom = (site: Uint8Array, wall: number, pk: number, tx: string): ChangeSet => {
+        const hlc: HLC = { wallTime: BigInt(wall), counter: 1, siteId: site, opSeq: 0 };
+        return { siteId: site, transactionId: tx, hlc, changes: [{ type: 'delete', schema: 'main', table: 'users', pk: [pk], hlc }], schemaMigrations: [] };
+      };
+
+      // A multi-fact transaction (one commit): delete pk[5] AND write pk[6].name — same
+      // base HLC, distinct opSeq, so it groups as one ChangeSet that must never split.
+      const base = { wallTime: BigInt(now + 2000), counter: 1, siteId: siteC };
+      const multiFact: ChangeSet = {
+        siteId: siteC,
+        transactionId: 'tx-multi',
+        hlc: { ...base, opSeq: 1 },
+        changes: [
+          { type: 'delete', schema: 'main', table: 'users', pk: [5], hlc: { ...base, opSeq: 0 } },
+          { type: 'column', schema: 'main', table: 'users', pk: [6], column: 'name', value: 'x', hlc: { ...base, opSeq: 1 } },
+        ],
+        schemaMigrations: [],
+      };
+
+      // hlcA < hlcB; both pk[1] deletes resolve against the same pre-batch state.
+      const result = await manager.applyChanges([
+        deleteFrom(siteA, now, 1, 'tx-a'),
+        deleteFrom(siteB, now + 1000, 1, 'tx-b'),
+        multiFact,
+      ]);
+      expect(result.applied).to.equal(4);
+
+      const peer = generateSiteId();
+      const collected: ChangeSet[] = [];
+      let sinceHLC: HLC | undefined = { wallTime: 0n, counter: 0, siteId: new Uint8Array(16), opSeq: 0 };
+      for (let i = 0; i < 10; i++) {
+        const sets: ChangeSet[] = await manager.getChangesSince(peer, sinceHLC);
+        if (sets.length === 0) break;
+        collected.push(...sets);
+        sinceHLC = sets[sets.length - 1].hlc;
+      }
+
+      // No repeats: each transaction id appears exactly once.
+      const txnIds = collected.map(cs => cs.transactionId);
+      expect(new Set(txnIds).size, 'a transaction was repeated across rounds').to.equal(txnIds.length);
+
+      // Strictly-ascending watermark across the whole walk.
+      for (let i = 1; i < collected.length; i++) {
+        expect(compareHLC(collected[i - 1].hlc, collected[i].hlc)).to.be.lessThan(0);
+      }
+
+      // The multi-fact transaction surfaces whole in exactly one ChangeSet: the set
+      // carrying the pk[5] delete also carries the pk[6] write, and nothing else does.
+      const withPk5 = collected.filter(s => s.changes.some(c => c.type === 'delete' && JSON.stringify(c.pk) === '[5]'));
+      expect(withPk5, 'pk[5] delete must surface in exactly one ChangeSet').to.have.lengthOf(1);
+      expect(
+        withPk5[0].changes.some(c => c.type === 'column' && JSON.stringify(c.pk) === '[6]'),
+        'transaction split: pk[6] write missing from the multi-fact transaction',
+      ).to.be.true;
+      const withPk6 = collected.filter(s => s.changes.some(c => c.type === 'column' && JSON.stringify(c.pk) === '[6]'));
+      expect(withPk6, 'pk[6] write must surface in exactly one ChangeSet').to.have.lengthOf(1);
+      expect(withPk6[0].transactionId).to.equal(withPk5[0].transactionId);
+
+      // The collapsed pk[1] delete surfaces exactly once, attributed to the max-HLC winner.
+      const pk1Deletes = collected.flatMap(s => s.changes).filter(c => c.type === 'delete' && JSON.stringify(c.pk) === '[1]');
+      expect(pk1Deletes, 'collapsed pk[1] delete must surface exactly once').to.have.lengthOf(1);
+      expect(compareHLC(pk1Deletes[0].hlc, { wallTime: BigInt(now + 1000), counter: 1, siteId: siteB, opSeq: 0 })).to.equal(0);
+    });
   });
 
   describe('pruneTombstones', () => {

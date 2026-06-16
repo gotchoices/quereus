@@ -497,6 +497,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 *     re-attributes to a later tombstone HLC; the survivor's HLC is the current
 	 *     `tombstone.hlc`.
 	 *
+	 * The overwrite dedup above covers entries written across SEPARATE writes/applies
+	 * (each later one sees the prior committed version). The apply path additionally
+	 * collapses in-batch repeats: two versions of one key inside a single
+	 * `applyChanges` call resolve against the SAME pre-batch prior version, so neither
+	 * sees the other — `commitChangeMetadata` keeps only the max-HLC winner per key and
+	 * writes a single entry, preserving the invariant regardless of how many versions
+	 * of a key were batched.
+	 *
 	 * (Schema migrations are still fully scanned by {@link collectSchemaMigrations};
 	 * the `sm:` range is not HLC-ordered, but migrations are few and the grouping
 	 * step drops any that sort past the bounded fact watermark.)

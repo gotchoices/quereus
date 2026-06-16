@@ -7,6 +7,7 @@
  *   3. commitChangeMetadata — persist CRDT metadata
  */
 
+import type { WriteBatch } from '@quereus/store';
 import { compareHLC, maxHLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
@@ -14,6 +15,8 @@ import type { Tombstone } from '../metadata/tombstones.js';
 import type {
 	ChangeSet,
 	Change,
+	ColumnChange,
+	RowDeletion,
 	ApplyResult,
 	DataChangeToApply,
 	SchemaChangeToApply,
@@ -291,6 +294,18 @@ export async function resolveChange(
  * Commit CRDT metadata for resolved changes.
  *
  * Phase 3 of the 3-phase apply pattern: called AFTER data is written to store.
+ *
+ * In-batch repeats of one key are collapsed to the max-HLC winner before any write.
+ * Two versions of the same key can land in a single `applyChanges` batch (e.g.
+ * concurrent deletes of the same pk relayed together), and Phase 1 resolved BOTH
+ * against the same pre-batch prior version — neither saw the other. Writing both would
+ * leave two change-log entries for one key, re-attributing the older entry to the later
+ * HLC and breaking {@link SyncManagerImpl}'s `collectChangesSince` LOAD-BEARING
+ * INVARIANT (survivor's log HLC == its current version's HLC). So only the winner's
+ * metadata + change-log entry are written; losers are never written and the single
+ * pre-batch prior entry is deleted once. Mirrors the local write-path dedup in
+ * `recordDataEvent` / `recordColumnVersions`, keeping the delete and column paths
+ * symmetric.
  */
 export async function commitChangeMetadata(
 	ctx: SyncContext,
@@ -298,73 +313,100 @@ export async function commitChangeMetadata(
 ): Promise<void> {
 	if (resolvedChanges.length === 0) return;
 
-	const batch = ctx.kv.batch();
-
+	// Collapse in-batch repeats per key, keeping the max-HLC change. Deletes key by
+	// (schema, table, pk); columns by (schema, table, pk, column) — distinct change-log
+	// entry types that never collide.
+	const deleteWinners = new Map<string, ResolvedChange>();
+	const columnWinners = new Map<string, ResolvedChange>();
 	for (const resolved of resolvedChanges) {
 		if (resolved.outcome !== 'applied') continue;
 		const change = resolved.change;
-
 		if (change.type === 'delete') {
-			// Dedupe: a newer tombstone overwrites the prior one, leaving its delete
-			// change-log entry stale — remove it so at most one survives per pk (mirrors
-			// the column dedup below and the write path in recordDataEvent).
-			if (resolved.oldTombstone) {
-				ctx.changeLog.deleteEntryBatch(
-					batch,
-					resolved.oldTombstone.hlc,
-					'delete',
-					change.schema,
-					change.table,
-					change.pk,
-				);
-			}
-			ctx.tombstones.setTombstoneBatch(batch, change.schema, change.table, change.pk, change.hlc);
-			ctx.changeLog.recordDeletionBatch(batch, change.hlc, change.schema, change.table, change.pk);
+			keepMaxHLC(deleteWinners, deleteKey(change), resolved);
 		} else {
-			// Delete old change log entry if exists
-			if (resolved.oldColumnVersion) {
-				ctx.changeLog.deleteEntryBatch(
-					batch,
-					resolved.oldColumnVersion.hlc,
-					'column',
-					change.schema,
-					change.table,
-					change.pk,
-					change.column,
-				);
-			}
-
-			ctx.columnVersions.setColumnVersionBatch(
-				batch,
-				change.schema,
-				change.table,
-				change.pk,
-				change.column,
-				{ hlc: change.hlc, value: change.value },
-			);
-
-			ctx.changeLog.recordColumnChangeBatch(
-				batch,
-				change.hlc,
-				change.schema,
-				change.table,
-				change.pk,
-				change.column,
-			);
+			keepMaxHLC(columnWinners, columnKey(change), resolved);
 		}
 	}
 
+	const batch = ctx.kv.batch();
+	for (const resolved of deleteWinners.values()) {
+		const change = resolved.change;
+		if (change.type !== 'delete') continue; // homogeneous map; narrows the union
+		commitDeleteMetadata(ctx, batch, change, resolved.oldTombstone);
+	}
+	for (const resolved of columnWinners.values()) {
+		const change = resolved.change;
+		if (change.type !== 'column') continue; // homogeneous map; narrows the union
+		commitColumnMetadata(ctx, batch, change, resolved.oldColumnVersion);
+	}
 	await batch.write();
 
-	// Handle column version deletions for delete operations (requires async iteration)
-	for (const resolved of resolvedChanges) {
-		if (resolved.outcome !== 'applied') continue;
-		if (resolved.change.type === 'delete') {
-			await ctx.columnVersions.deleteRowVersions(
-				resolved.change.schema,
-				resolved.change.table,
-				resolved.change.pk,
-			);
-		}
+	// Column-version cleanup for deletes requires async iteration — once per winning
+	// delete (losers were never written, so there is nothing of theirs to clean).
+	for (const resolved of deleteWinners.values()) {
+		const change = resolved.change;
+		if (change.type !== 'delete') continue;
+		await ctx.columnVersions.deleteRowVersions(change.schema, change.table, change.pk);
 	}
+}
+
+/** Stable per-pk key for collapsing repeated delete entries within one batch. */
+function deleteKey(change: RowDeletion): string {
+	return JSON.stringify([change.schema, change.table, change.pk]);
+}
+
+/** Stable per-(pk, column) key for collapsing repeated column entries within one batch. */
+function columnKey(change: ColumnChange): string {
+	return JSON.stringify([change.schema, change.table, change.pk, change.column]);
+}
+
+/** Keep the max-HLC resolved change per key, collapsing in-batch repeats to one winner. */
+function keepMaxHLC(
+	winners: Map<string, ResolvedChange>,
+	key: string,
+	resolved: ResolvedChange,
+): void {
+	const prev = winners.get(key);
+	if (!prev || compareHLC(resolved.change.hlc, prev.change.hlc) > 0) {
+		winners.set(key, resolved);
+	}
+}
+
+/** Write a winning delete's tombstone + change-log entry, deleting any prior delete entry. */
+function commitDeleteMetadata(
+	ctx: SyncContext,
+	batch: WriteBatch,
+	change: RowDeletion,
+	oldTombstone: Tombstone | undefined,
+): void {
+	// Dedupe: a newer tombstone overwrites the prior one, leaving its delete change-log
+	// entry stale — remove it so at most one survives per pk (mirrors the column dedup
+	// and the write path in recordDataEvent).
+	if (oldTombstone) {
+		ctx.changeLog.deleteEntryBatch(batch, oldTombstone.hlc, 'delete', change.schema, change.table, change.pk);
+	}
+	ctx.tombstones.setTombstoneBatch(batch, change.schema, change.table, change.pk, change.hlc);
+	ctx.changeLog.recordDeletionBatch(batch, change.hlc, change.schema, change.table, change.pk);
+}
+
+/** Write a winning column's version + change-log entry, deleting any prior column entry. */
+function commitColumnMetadata(
+	ctx: SyncContext,
+	batch: WriteBatch,
+	change: ColumnChange,
+	oldColumnVersion: ColumnVersion | undefined,
+): void {
+	// Delete the prior (pk, column) change-log entry if one exists.
+	if (oldColumnVersion) {
+		ctx.changeLog.deleteEntryBatch(batch, oldColumnVersion.hlc, 'column', change.schema, change.table, change.pk, change.column);
+	}
+	ctx.columnVersions.setColumnVersionBatch(
+		batch,
+		change.schema,
+		change.table,
+		change.pk,
+		change.column,
+		{ hlc: change.hlc, value: change.value },
+	);
+	ctx.changeLog.recordColumnChangeBatch(batch, change.hlc, change.schema, change.table, change.pk, change.column);
 }
