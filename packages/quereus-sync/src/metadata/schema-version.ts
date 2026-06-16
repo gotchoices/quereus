@@ -5,7 +5,7 @@
  * "most destructive wins" conflict resolution for schema changes.
  *
  * Key format: sv:{schema}.{table}:{column}
- * Value: HLC (26 bytes) + 1 byte type + type-specific data
+ * Value: HLC (30 bytes) + 1 byte type + type-specific data
  *
  * Column types:
  * - 0x01: Regular column (type affinity, nullable, default)

@@ -156,5 +156,28 @@ describe('change-log key encoding', () => {
       const earlierKey = buildChangeLogKey(earlier, 'delete', 'main', 't', [7]);
       expect(compareBytes(earlierKey, gte)).to.be.lessThan(0);
     });
+
+    it('should carry from opSeq into siteId when opSeq is at max (0xFFFFFFFF)', () => {
+      // The generic last-byte increment must roll all four opSeq bytes to 0 and
+      // carry into the low byte of siteId — there is no opSeq beyond max, so the
+      // next possible key is (wallTime, counter, siteId+1, opSeq 0).
+      const since = createHLC(1000n, 1, siteA, 0xFFFFFFFF);
+      const { gte } = buildChangeLogScanBoundsAfter(since);
+
+      // Decode the HLC component of gte (skip the 3-byte 'cl:' prefix).
+      const carried = deserializeHLCFromKey(gte.slice(3, 33));
+      expect(carried.wallTime).to.equal(1000n);
+      expect(carried.counter).to.equal(1);
+      expect(carried.opSeq).to.equal(0); // rolled over
+
+      // siteA is [1, 0, …, 0]; the carry lands in the last siteId byte.
+      const expectedSite = new Uint8Array(siteA);
+      expectedSite[15] = 1;
+      expect(Array.from(carried.siteId)).to.deep.equal(Array.from(expectedSite));
+
+      // The boundary fact (max opSeq) is therefore excluded by the scan.
+      const boundaryKey = buildChangeLogKey(since, 'column', 'main', 't', [1], 'c');
+      expect(compareBytes(boundaryKey, gte)).to.be.lessThan(0);
+    });
   });
 });
