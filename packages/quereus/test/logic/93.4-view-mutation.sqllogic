@@ -3015,6 +3015,25 @@ select cc, cv, pv from sdojv where cc = 4;
 → []
 select cc, cv from sdoc where cc = 4;
 → [{"cc":4,"cv":44}]
+
+-- --- (σ5) MULTIPLE σ columns on ONE side, both projected away (`color`, `region` — both NOT
+--          NULL with no default). The per-side σ-default loop appends BOTH constant projections
+--          (and both base columns to the side insert's column list), so both are defaulted and
+--          legitimately cover their NOT-NULL-without-default columns; the row is visible. ---
+create table sdm1 (id integer primary key, x integer, color text not null, region text not null);
+create table sdm2 (id integer primary key, y integer null);
+insert into sdm1 values (1,10,'red','west');
+insert into sdm2 values (1,100);
+create view sdmv as select sdm1.id as id, sdm1.x as x from sdm1 join sdm2 on sdm1.id = sdm2.id
+    where sdm1.color = 'red' and sdm1.region = 'west';
+
+insert into sdmv (id, x) values (5, 50);
+-- BOTH σ columns defaulted on sdm1 (the multi-default-per-side path); neither raises no-default.
+select id, x, color, region from sdm1 order by id;
+→ [{"id":1,"x":10,"color":"red","region":"west"},{"id":5,"x":50,"color":"red","region":"west"}]
+-- the inserted row is VISIBLE through the view (it satisfies both σ conjuncts).
+select id, x from sdmv order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
 pragma foreign_keys = false;
 
 -- ===================================
