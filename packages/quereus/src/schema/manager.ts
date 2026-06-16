@@ -2674,11 +2674,13 @@ export class SchemaManager {
 
 		let tableInstance: VirtualTable;
 		try {
-			tableInstance = await moduleInfo.module.create(this.db, tableSchema);
+			const create = moduleInfo.module.createBacking?.bind(moduleInfo.module)
+				?? moduleInfo.module.create.bind(moduleInfo.module);
+			tableInstance = await create(this.db, tableSchema);
 		} catch (e: unknown) {
 			const message = e instanceof Error ? e.message : String(e);
 			const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;
-			throw new QuereusError(`Module '${moduleName}' create failed for backing table '${tableName}': ${message}`, code, e instanceof Error ? e : undefined);
+			throw new QuereusError(`Module '${moduleName}' backing create failed for '${tableName}': ${message}`, code, e instanceof Error ? e : undefined);
 		}
 
 		const completeTableSchema = this.finalizeCreatedTableSchema(

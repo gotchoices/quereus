@@ -113,6 +113,21 @@ export interface VirtualTableModule<
 	): Promise<TTable>;
 
 	/**
+	 * Optional. Creates a materialized-view BACKING table, preferred by
+	 * {@link SchemaManager.createBackingTable} over {@link create} when present
+	 * (`createBacking?.() ?? create()`). Presence is the capability (mirrors
+	 * {@link getBackingHost?}): a durable-backing module routes the backing into
+	 * its durable store here instead of building an ordinary relational table, so
+	 * the subsequent {@link getBackingHost} resolves a real host. Same
+	 * signature/contract as {@link create}; omit ⇒ backings go through
+	 * {@link create} (today's behavior).
+	 */
+	createBacking?(
+		db: Database,
+		tableSchema: TableSchema,
+	): Promise<TTable>;
+
+	/**
 	 * Connects to an existing virtual table definition.
 	 * Called when the schema is loaded or a connection needs to interact with the table.
 	 *
