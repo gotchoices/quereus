@@ -62,3 +62,13 @@ rows the user believes they inserted "into the view".
 Not a regression introduced by `set-op-write-multisource-leg-insert` — that ticket faithfully reuses
 the existing envelope. This is a pre-existing limitation of the multi-source insert path surfaced
 during its review.
+
+---
+
+## Feed note (2026-06-15): decision-free bug fix
+
+Promoted backlog→plan to keep the runner fed. This is a **correctness bug**, not a design choice:
+the multi-source insert path should honor σ equality constants as insert-defaults exactly as the
+single-source path already does (docs/view-updateability.md § Selection). The target behavior is
+fully pinned (lift the join body's σ equality predicate into the defaulted column set so the
+inserted row satisfies the view predicate and is visible). No question for the dev.

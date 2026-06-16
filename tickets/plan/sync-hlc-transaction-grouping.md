@@ -139,3 +139,15 @@ interface HLC {
   later leaks into a committed transaction's ordering.
 - **HLCManager.receive** on inbound facts must carry/merge opSeq without
   breaking monotonicity.
+
+---
+
+## Feed note (2026-06-15): decision-free — fulfills a documented contract
+
+Promoted backlog→plan to keep the runner fed. This makes the code uphold the transaction-atomic
+sync property `docs/sync.md` **already promises** ("changes within a transaction are sent as a
+unit… applying is atomic per transaction") but does not enforce. The approach is pinned in the body
+(tick HLC once per commit, add per-transaction `opSeq` for a total order, group `getChangesSince`
+by transaction, advance `lastSyncHLC` only at commit boundaries). The plan pass should decompose it;
+if any sub-choice turns out to need a real semantic decision (not just mechanics), block/ that part
+for the dev rather than pick unilaterally.

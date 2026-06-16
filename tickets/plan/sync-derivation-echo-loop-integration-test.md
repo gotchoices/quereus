@@ -46,3 +46,14 @@ follow-up)')`) as an in-code breadcrumb pointing here.
   stub from `backing-host.spec.ts` once the real test lands.
 - Consider a second round-trip (B→A) to assert the loop is fully quiescent in
   both directions, not just A→B.
+
+---
+
+## Feed note (2026-06-15): decision-free verification work
+
+Promoted backlog→plan to keep the runner fed. Pure test-building for the just-shipped
+`quereus.sync.replicate` opt-in — the invariant (value-identical re-derivation → no
+BackingRowChange → no event → no echo) is fully specified and already unit-pinned single-host;
+this builds the two-peer harness to assert cross-peer quiescence. No design decision; if the
+cross-package harness proves infeasible in the store test tree, the runner should block/ it with
+the specific blocker rather than guess.
