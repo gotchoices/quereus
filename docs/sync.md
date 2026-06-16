@@ -288,6 +288,17 @@ on the next `getChangesSince` call (the consumer advances its watermark to the l
 returned `ChangeSet.hlc` and re-fetches). A transaction is **never** split to hit the
 bound.
 
+The bound applies at **scan time**, not just response time. On the delta path
+(`sinceHLC` given), the change-log scan is HLC-ordered, so `collectChangesSince`
+detects each transaction boundary and stops scanning the moment enough whole
+transactions accumulate — `batchSize` caps the scan footprint, not only the returned
+array. Two scans are *not* bounded this way: the from-zero full scan
+(`collectAllChanges`, used when `sinceHLC` is absent) reads `cv:`/`tb:` keyed by
+table/pk rather than HLC, so it cannot early-exit (a large initial range is served by
+a snapshot instead); and the `sm:` schema-migration scan is not HLC-ordered, so it is
+drained in full (migrations are few, and grouping drops any that sort past the bounded
+fact watermark — over-scan costs work, never correctness).
+
 **Oversized transaction.** A single transaction whose fact count exceeds `batchSize`
 is returned **whole** as one ChangeSet and telemetered (a `console.warn`), never
 silently chunked — splitting it would violate the one-ChangeSet-per-transaction

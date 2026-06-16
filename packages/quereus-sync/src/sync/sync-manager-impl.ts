@@ -28,7 +28,7 @@ import { ColumnVersionStore, type ColumnVersion, deserializeColumnVersion } from
 import { TombstoneStore, deserializeTombstone } from '../metadata/tombstones.js';
 import { PeerStateStore } from '../metadata/peer-state.js';
 import { SchemaMigrationStore, deserializeMigration } from '../metadata/schema-migration.js';
-import { ChangeLogStore } from '../metadata/change-log.js';
+import { ChangeLogStore, type ChangeLogEntry } from '../metadata/change-log.js';
 import {
 	SYNC_KEY_PREFIX,
 	buildAllColumnVersionsScanBounds,
@@ -436,7 +436,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 */
 	async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
 		const changes: Change[] = sinceHLC
-			? await this.collectChangesSince(peerSiteId, sinceHLC)
+			? await this.collectChangesSince(peerSiteId, sinceHLC, this.config.batchSize)
 			: await this.collectAllChanges(peerSiteId);
 
 		const schemaMigrations = await this.collectSchemaMigrations(peerSiteId, sinceHLC);
@@ -455,58 +455,124 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		);
 	}
 
-	/** Delta extraction: facts after `sinceHLC`, in change-log (4-tuple) order. */
-	private async collectChangesSince(peerSiteId: SiteId, sinceHLC: HLC): Promise<Change[]> {
+	/**
+	 * Delta extraction: facts after `sinceHLC`, in change-log (HLC) order, bounded
+	 * at **scan time** to whole transactions whose cumulative data-change count
+	 * reaches `batchSize`.
+	 *
+	 * The change-log scan is keyed by `(wallTime, counter, siteId, opSeq)`, so a
+	 * transaction's facts arrive contiguously and transactions arrive in commit
+	 * order. That lets us stop scanning as soon as enough WHOLE transactions have
+	 * accumulated, instead of draining the entire iterator into memory and letting
+	 * {@link buildTransactionChangeSets} truncate afterward (the pre-
+	 * `sync-getchangessince-bounded-extraction` behavior, where `batchSize` capped
+	 * the response but not the scan). The bound here mirrors that grouping step
+	 * exactly — whole transactions accumulate until the cumulative data-change count
+	 * reaches `batchSize`, never splitting a transaction — so the grouped response
+	 * is byte-identical; only the scan footprint shrinks.
+	 *
+	 * (Schema migrations are still fully scanned by {@link collectSchemaMigrations};
+	 * the `sm:` range is not HLC-ordered, but migrations are few and the grouping
+	 * step drops any that sort past the bounded fact watermark.)
+	 */
+	private async collectChangesSince(
+		peerSiteId: SiteId,
+		sinceHLC: HLC,
+		batchSize: number,
+	): Promise<Change[]> {
 		const changes: Change[] = [];
+		// Data-change count over fully-scanned (whole) transactions. The in-flight
+		// transaction's own count is held separately until its boundary is crossed,
+		// so it is only folded in once the transaction is known to be complete.
+		let completedChangeCount = 0;
+		let currentTxnId: string | null = null;
+		let currentTxnChangeCount = 0;
+
 		for await (const logEntry of this.changeLog.getChangesSince(sinceHLC)) {
 			// A transaction is wholly one site's, so skipping the peer's own facts
 			// filters whole transactions cleanly (no half-empty ChangeSet).
 			if (siteIdEquals(logEntry.hlc.siteId, peerSiteId)) continue;
 
-			if (logEntry.entryType === 'column') {
-				const cv = await this.columnVersions.getColumnVersion(
-					logEntry.schema,
-					logEntry.table,
-					logEntry.pk,
-					logEntry.column!
-				);
-				if (!cv) continue;
-
-				const columnChange: ColumnChange = {
-					type: 'column',
-					schema: logEntry.schema,
-					table: logEntry.table,
-					pk: logEntry.pk,
-					column: logEntry.column!,
-					value: cv.value,
-					hlc: cv.hlc,
-				};
-				changes.push(columnChange);
-			} else {
-				const tombstone = await this.tombstones.getTombstone(
-					logEntry.schema,
-					logEntry.table,
-					logEntry.pk
-				);
-				if (!tombstone) continue;
-
-				const deletion: RowDeletion = {
-					type: 'delete',
-					schema: logEntry.schema,
-					table: logEntry.table,
-					pk: logEntry.pk,
-					hlc: tombstone.hlc,
-				};
-				changes.push(deletion);
+			// deterministicTxnId excludes opSeq, so it is exactly the transaction
+			// identity. Facts of one transaction are contiguous in the HLC-ordered
+			// scan, so a change of id means the prior transaction is complete and can
+			// be folded into the bound.
+			const txnId = deterministicTxnId(logEntry.hlc);
+			if (currentTxnId !== null && txnId !== currentTxnId) {
+				completedChangeCount += currentTxnChangeCount;
+				// Enough whole transactions accumulated — stop before touching the next
+				// one. buildTransactionChangeSets re-applies the same bound, so feeding
+				// it this prefix yields the same ChangeSets the full scan would have.
+				if (completedChangeCount >= batchSize) break;
+				currentTxnChangeCount = 0;
 			}
+			currentTxnId = txnId;
+
+			const change = await this.resolveLogEntry(logEntry);
+			if (!change) continue;
+			changes.push(change);
+			currentTxnChangeCount++;
 		}
 		return changes;
+	}
+
+	/**
+	 * Resolve a change-log entry to the live {@link Change} it references, or
+	 * `null` when the underlying column version / tombstone is gone — a stale log
+	 * entry (e.g. a column overwritten, or a row deleted after the entry was
+	 * written). The authoritative HLC and value come from the current version, not
+	 * the log key.
+	 */
+	private async resolveLogEntry(logEntry: ChangeLogEntry): Promise<Change | null> {
+		if (logEntry.entryType === 'column') {
+			const cv = await this.columnVersions.getColumnVersion(
+				logEntry.schema,
+				logEntry.table,
+				logEntry.pk,
+				logEntry.column!,
+			);
+			if (!cv) return null;
+
+			const columnChange: ColumnChange = {
+				type: 'column',
+				schema: logEntry.schema,
+				table: logEntry.table,
+				pk: logEntry.pk,
+				column: logEntry.column!,
+				value: cv.value,
+				hlc: cv.hlc,
+			};
+			return columnChange;
+		}
+
+		const tombstone = await this.tombstones.getTombstone(
+			logEntry.schema,
+			logEntry.table,
+			logEntry.pk,
+		);
+		if (!tombstone) return null;
+
+		const deletion: RowDeletion = {
+			type: 'delete',
+			schema: logEntry.schema,
+			table: logEntry.table,
+			pk: logEntry.pk,
+			hlc: tombstone.hlc,
+		};
+		return deletion;
 	}
 
 	/**
 	 * Full extraction (initial sync / delta-from-zero): every column version and
 	 * tombstone not originating from the peer. Ordering is owned by
 	 * {@link buildTransactionChangeSets}, so no pre-sort is needed here.
+	 *
+	 * Unlike {@link collectChangesSince}, this path cannot early-exit at scan time:
+	 * the `cv:`/`tb:` scans are keyed by table/pk, NOT by HLC, so transactions are
+	 * interleaved arbitrarily and no transaction boundary is reachable without a
+	 * full scan + sort. It is left unbounded because it is the from-zero path: a
+	 * large initial range is expected to be served by a snapshot rather than this
+	 * delta path (docs/sync.md).
 	 */
 	private async collectAllChanges(peerSiteId: SiteId): Promise<Change[]> {
 		const changes: Change[] = [];
@@ -556,6 +622,15 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Collect schema migrations after `sinceHLC` not originating from the peer.
 	 * Each migration shares its transaction's base HLC, so the grouping step
 	 * rejoins it with that transaction's data facts (or forms a DDL-only ChangeSet).
+	 *
+	 * The `sm:` range is keyed by `{schema}.{table}:{version}`, not by HLC, so this
+	 * scan cannot early-exit the way {@link collectChangesSince} does — it is drained
+	 * in full even when the fact side stops early. That is acceptable because
+	 * migrations are few, and {@link buildTransactionChangeSets} drops any migration
+	 * that sorts past the bounded fact watermark (its DDL-only group falls beyond the
+	 * `batchSize` cut), so over-scanning here costs work but never correctness. A
+	 * peer with a pathological volume of un-synced DDL is the one case this leaves
+	 * unbounded; see the bounded-extraction ticket's handoff.
 	 */
 	private async collectSchemaMigrations(
 		peerSiteId: SiteId,

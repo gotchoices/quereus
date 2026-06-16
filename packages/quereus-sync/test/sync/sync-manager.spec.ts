@@ -13,7 +13,7 @@ import {
   type SnapshotFooterChunk,
   type ChangeSet,
 } from '../../src/sync/protocol.js';
-import { InMemoryKVStore } from '@quereus/store';
+import { InMemoryKVStore, type IterateOptions, type KVEntry } from '@quereus/store';
 import { generateSiteId, siteIdEquals } from '../../src/clock/site.js';
 import { type HLC, compareHLC } from '../../src/clock/hlc.js';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
@@ -210,6 +210,51 @@ describe('SyncManager', () => {
       for (let i = 1; i < collected.length; i++) {
         expect(compareHLC(collected[i - 1].hlc, collected[i].hlc)).to.be.lessThan(0);
       }
+    });
+
+    it('bounds the change-log scan at scan time (does not drain the whole log)', async () => {
+      // The delta path must STOP scanning once enough whole transactions are
+      // accumulated — `batchSize` caps the scan footprint, not just the response.
+      config.batchSize = 2;
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      // Five single-fact transactions => five change-log entries, five transactions.
+      for (const id of [1, 2, 3, 4, 5]) {
+        source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [id], newRow: [`v${id}`] });
+        await flush();
+      }
+
+      // Count change-log (`cl:`) entries pulled from the store during extraction.
+      // getColumnVersion/getTombstone use kv.get, so only the change-log range scan
+      // shows up here — an honest measure of the scan footprint.
+      let changeLogEntriesScanned = 0;
+      const origIterate = kv.iterate.bind(kv);
+      kv.iterate = (options?: IterateOptions): AsyncIterable<KVEntry> => {
+        const inner = origIterate(options);
+        return (async function* () {
+          for await (const entry of inner) {
+            // Change-log keys begin with the ASCII bytes 'c','l',':'.
+            if (entry.key[0] === 0x63 && entry.key[1] === 0x6c && entry.key[2] === 0x3a) {
+              changeLogEntriesScanned++;
+            }
+            yield entry;
+          }
+        })();
+      };
+
+      // A delta from the start of time exercises the HLC-ordered delta path.
+      const sinceHLC: HLC = { wallTime: 0n, counter: 0, siteId: new Uint8Array(16), opSeq: 0 };
+      const sets = await manager.getChangesSince(peer, sinceHLC);
+
+      // Response is unchanged: the first two whole transactions only.
+      expect(sets).to.have.lengthOf(2);
+      expect(sets.flatMap(s => s.changes)).to.have.lengthOf(2);
+
+      // Scan stopped after detecting the 3rd transaction's boundary (3 entries),
+      // never reaching the 4th/5th — the whole point of the bound.
+      expect(changeLogEntriesScanned).to.be.at.most(3);
+      expect(changeLogEntriesScanned).to.be.lessThan(5);
     });
   });
 
