@@ -27,6 +27,7 @@ export {
   HLCManager,
   compareHLC,
   hlcEquals,
+  maxHLC,
   createHLC,
   deterministicTxnId,
   MAX_OPSEQ,

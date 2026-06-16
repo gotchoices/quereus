@@ -96,6 +96,17 @@ export function hlcEquals(a: HLC, b: HLC): boolean {
 }
 
 /**
+ * Return the maximum HLC from an iterable, or undefined when empty.
+ */
+export function maxHLC(hlcs: Iterable<HLC>): HLC | undefined {
+  let max: HLC | undefined;
+  for (const hlc of hlcs) {
+    if (!max || compareHLC(hlc, max) > 0) max = hlc;
+  }
+  return max;
+}
+
+/**
  * Create a new HLC with the given values.
  *
  * `opSeq` defaults to 0 to keep the many call sites that produce the first (or

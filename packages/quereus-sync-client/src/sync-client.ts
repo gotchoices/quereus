@@ -12,10 +12,9 @@
 import {
   siteIdToBase64,
   siteIdFromBase64,
-  compareHLC,
+  maxHLC,
   type SyncManager,
   type SyncEventEmitter,
-  type ChangeSet,
   type HLC,
   type SiteId,
 } from '@quereus/sync';
@@ -40,17 +39,6 @@ import {
 const DEFAULT_RECONNECT_DELAY_MS = 1000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 60_000;
 const DEFAULT_LOCAL_CHANGE_DEBOUNCE_MS = 50;
-
-/** Find the maximum HLC in a list of change sets. */
-function maxHLCFromChangeSets(changeSets: ChangeSet[]): HLC | undefined {
-  let max: HLC | undefined;
-  for (const cs of changeSets) {
-    if (!max || compareHLC(cs.hlc, max) > 0) {
-      max = cs.hlc;
-    }
-  }
-  return max;
-}
 
 /**
  * WebSocket sync client for Quereus.
@@ -329,9 +317,9 @@ export class SyncClient {
 
     // Update peer sync state with the max HLC from received changes
     if (changeSets.length > 0 && this.serverSiteId) {
-      const maxHLC = maxHLCFromChangeSets(changeSets);
-      if (maxHLC) {
-        await this.syncManager.updatePeerSyncState(this.serverSiteId, maxHLC);
+      const maxHlc = maxHLC(changeSets.map(cs => cs.hlc));
+      if (maxHlc) {
+        await this.syncManager.updatePeerSyncState(this.serverSiteId, maxHlc);
       }
     }
 
@@ -456,7 +444,7 @@ export class SyncClient {
     if (changes.length === 0) return;
 
     // Track the max HLC we're sending for delta sync
-    this.pendingSentHLC = maxHLCFromChangeSets(changes) ?? null;
+    this.pendingSentHLC = maxHLC(changes.map(cs => cs.hlc)) ?? null;
 
     // Serialize and send
     const serialized = changes.map(cs => serializeChangeSet(cs));

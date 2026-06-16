@@ -7,7 +7,7 @@
  *   3. commitChangeMetadata — persist CRDT metadata
  */
 
-import { compareHLC, type HLC } from '../clock/hlc.js';
+import { compareHLC, maxHLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type {
@@ -20,17 +20,6 @@ import type {
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { admitGroup } from './admission.js';
-
-/** Maximum HLC across a batch of change sets (their commit boundaries), or undefined when empty. */
-function maxHLCFromChangeSets(changeSets: ChangeSet[]): HLC | undefined {
-	let max: HLC | undefined;
-	for (const changeSet of changeSets) {
-		if (!max || compareHLC(changeSet.hlc, max) > 0) {
-			max = changeSet.hlc;
-		}
-	}
-	return max;
-}
 
 /**
  * Result of resolving a single change (without writing metadata).
@@ -144,7 +133,7 @@ export async function applyChanges(
 		// Merging the batch max once is equivalent to receiving each changeset's
 		// HLC (receive is a monotonic max-merge); on a mid-batch abort the clock
 		// does not advance and the batch re-resolves next sync.
-		watermarkHLC: maxHLCFromChangeSets(changes),
+		watermarkHLC: maxHLC(changes.map(cs => cs.hlc)),
 	});
 
 	// Emit remote change events
