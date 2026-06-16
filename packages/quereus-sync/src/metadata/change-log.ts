@@ -7,7 +7,7 @@
 
 import type { KVStore, WriteBatch } from '@quereus/store';
 import type { SqlValue } from '@quereus/quereus';
-import type { HLC } from '../clock/hlc.js';
+import { type HLC, compareHLC } from '../clock/hlc.js';
 import {
   buildChangeLogKey,
   buildChangeLogScanBoundsAfter,
@@ -135,11 +135,11 @@ export class ChangeLogStore {
       const parsed = parseChangeLogKey(entry.key);
       if (!parsed) continue;
 
-      // Compare HLCs - stop when we reach entries >= beforeHLC
-      if (parsed.hlc.wallTime > beforeHLC.wallTime) break;
-      if (parsed.hlc.wallTime === beforeHLC.wallTime) {
-        if (parsed.hlc.counter >= beforeHLC.counter) break;
-      }
+      // Prune entries strictly before the boundary HLC. Iteration is in HLC key
+      // order (lexicographic == compareHLC), so the first entry at-or-after the
+      // boundary means every remaining entry is too — stop. Comparing via
+      // compareHLC keeps opSeq (and siteId) participating consistently.
+      if (compareHLC(parsed.hlc, beforeHLC) >= 0) break;
 
       batch.delete(entry.key);
       count++;

@@ -20,15 +20,15 @@ export interface Tombstone {
 
 /**
  * Serialize a tombstone for storage.
- * Format: 26 bytes HLC + 8 bytes createdAt
+ * Format: 30 bytes HLC + 8 bytes createdAt
  */
 export function serializeTombstone(tombstone: Tombstone): Uint8Array {
-  const result = new Uint8Array(34);
+  const result = new Uint8Array(38);
   const hlcBytes = serializeHLC(tombstone.hlc);
   result.set(hlcBytes, 0);
 
   const view = new DataView(result.buffer);
-  view.setBigUint64(26, BigInt(tombstone.createdAt), false);
+  view.setBigUint64(30, BigInt(tombstone.createdAt), false);
 
   return result;
 }
@@ -37,9 +37,9 @@ export function serializeTombstone(tombstone: Tombstone): Uint8Array {
  * Deserialize a tombstone from storage.
  */
 export function deserializeTombstone(buffer: Uint8Array): Tombstone {
-  const hlc = deserializeHLC(buffer.slice(0, 26));
+  const hlc = deserializeHLC(buffer.slice(0, 30));
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  const createdAt = Number(view.getBigUint64(26, false));
+  const createdAt = Number(view.getBigUint64(30, false));
   return { hlc, createdAt };
 }
 

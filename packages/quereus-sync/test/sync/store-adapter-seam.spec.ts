@@ -566,6 +566,7 @@ describe('store-adapter seam integration', () => {
 					wallTime: checkpoint.hlc.wallTime.toString(),
 					counter: checkpoint.hlc.counter,
 					siteId: Array.from(checkpoint.hlc.siteId),
+					opSeq: checkpoint.hlc.opSeq,
 				},
 				siteId: Array.from(checkpoint.siteId),
 			});

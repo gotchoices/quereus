@@ -42,6 +42,36 @@ describe('HLC (Hybrid Logical Clock)', () => {
       const b = createHLC(1000n, 1, siteA);
       expect(compareHLC(a, b)).to.equal(0);
     });
+
+    it('should order by opSeq when wallTime, counter, and siteId are equal', () => {
+      const a = createHLC(1000n, 1, siteA, 0);
+      const b = createHLC(1000n, 1, siteA, 7);
+      expect(compareHLC(a, b)).to.be.lessThan(0);
+      expect(compareHLC(b, a)).to.be.greaterThan(0);
+    });
+
+    it('should treat siteId as a stronger tiebreak than opSeq', () => {
+      // siteA < siteB by siteId, but siteA carries a much larger opSeq.
+      // siteId is compared before opSeq, so siteA must still order first.
+      const a = createHLC(1000n, 1, siteA, 9999);
+      const b = createHLC(1000n, 1, siteB, 0);
+      expect(compareHLC(a, b)).to.be.lessThan(0);
+      expect(compareHLC(b, a)).to.be.greaterThan(0);
+    });
+
+    it('should give a total order across all four components', () => {
+      // Ascending in each successive component; every neighbour is strictly ordered.
+      const ordered = [
+        createHLC(1000n, 1, siteA, 0),
+        createHLC(1000n, 1, siteA, 1),
+        createHLC(1000n, 1, siteB, 0),   // siteId beats opSeq
+        createHLC(1000n, 2, siteA, 0),   // counter beats siteId/opSeq
+        createHLC(2000n, 0, siteA, 0),   // wallTime beats everything
+      ];
+      for (let i = 0; i + 1 < ordered.length; i++) {
+        expect(compareHLC(ordered[i], ordered[i + 1])).to.be.lessThan(0);
+      }
+    });
   });
 
   describe('hlcEquals', () => {
@@ -61,21 +91,33 @@ describe('HLC (Hybrid Logical Clock)', () => {
   });
 
   describe('serialization', () => {
-    it('should round-trip serialize/deserialize', () => {
+    it('should round-trip serialize/deserialize (including opSeq)', () => {
       const siteId = generateSiteId();
-      const original = createHLC(1234567890123n, 42, siteId);
+      const original = createHLC(1234567890123n, 42, siteId, 0xDEADBEEF);
 
       const serialized = serializeHLC(original);
-      expect(serialized.length).to.equal(26);
+      expect(serialized.length).to.equal(30);
 
       const deserialized = deserializeHLC(serialized);
       expect(deserialized.wallTime).to.equal(original.wallTime);
       expect(deserialized.counter).to.equal(original.counter);
+      expect(deserialized.opSeq).to.equal(0xDEADBEEF);
       expect(hlcEquals(deserialized, original)).to.be.true;
+    });
+
+    it('should default opSeq to 0 when omitted from createHLC', () => {
+      const siteId = generateSiteId();
+      const hlc = createHLC(1000n, 1, siteId);
+      expect(hlc.opSeq).to.equal(0);
+      expect(deserializeHLC(serializeHLC(hlc)).opSeq).to.equal(0);
     });
 
     it('should throw on invalid buffer length', () => {
       expect(() => deserializeHLC(new Uint8Array(10))).to.throw('Invalid HLC buffer length');
+    });
+
+    it('should reject a legacy 26-byte (no-opSeq) buffer', () => {
+      expect(() => deserializeHLC(new Uint8Array(26))).to.throw('Invalid HLC buffer length');
     });
   });
 
@@ -129,6 +171,18 @@ describe('HLC (Hybrid Logical Clock)', () => {
 
       const restored = hlcFromJson(json);
       expect(restored.wallTime).to.equal(9007199254740993n);
+    });
+
+    it('should round-trip opSeq through JSON', () => {
+      const siteId = generateSiteId();
+      const hlc = createHLC(1234567890123n, 42, siteId, 123456);
+
+      const json = hlcToJson(hlc);
+      expect(json.opSeq).to.equal(123456);
+
+      const restored = hlcFromJson(JSON.parse(JSON.stringify(json)));
+      expect(restored.opSeq).to.equal(123456);
+      expect(hlcEquals(restored, hlc)).to.be.true;
     });
   });
 
@@ -205,6 +259,31 @@ describe('HLC (Hybrid Logical Clock)', () => {
         expect(compareHLC(received, remoteHLC)).to.be.greaterThan(0);
         // localAfter should be > received
         expect(compareHLC(localAfter, received)).to.be.greaterThan(0);
+      });
+
+      it('should ignore remote opSeq when merging the clock', () => {
+        // opSeq is transaction-local, NOT a clock-monotonicity component:
+        // receive() must advance wallTime/counter identically regardless of it.
+        const siteA = generateSiteId();
+        const siteB = generateSiteId();
+
+        const mgr1 = new HLCManager(siteA, { wallTime: 1000n, counter: 0 });
+        const mgr2 = new HLCManager(siteA, { wallTime: 1000n, counter: 0 });
+
+        const r1 = mgr1.receive(createHLC(2000n, 5, siteB, 0));
+        const r2 = mgr2.receive(createHLC(2000n, 5, siteB, 4_000_000_000));
+
+        expect(r2.wallTime).to.equal(r1.wallTime);
+        expect(r2.counter).to.equal(r1.counter);
+        // The local receive event always starts a fresh transaction at opSeq 0.
+        expect(r1.opSeq).to.equal(0);
+        expect(r2.opSeq).to.equal(0);
+      });
+
+      it('should produce opSeq 0 from tick/now', () => {
+        const manager = new HLCManager(generateSiteId(), { wallTime: 1000n, counter: 0 });
+        expect(manager.tick().opSeq).to.equal(0);
+        expect(manager.now().opSeq).to.equal(0);
       });
     });
 

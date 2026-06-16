@@ -84,7 +84,7 @@ describe('SyncManager', () => {
     it('should return false for unknown peer', async () => {
       const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
       const peerSiteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId, opSeq: 0 };
       const canDelta = await manager.canDeltaSync(peerSiteId, hlc);
       expect(canDelta).to.be.false;
     });
@@ -92,7 +92,7 @@ describe('SyncManager', () => {
     it('should return true for known peer within TTL', async () => {
       const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
       const peerSiteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId, opSeq: 0 };
 
       // Register the peer
       await manager.updatePeerSyncState(peerSiteId, hlc);
@@ -106,7 +106,7 @@ describe('SyncManager', () => {
     it('should store and retrieve peer sync state', async () => {
       const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
       const peerSiteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 5, siteId: peerSiteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 5, siteId: peerSiteId, opSeq: 0 };
 
       await manager.updatePeerSyncState(peerSiteId, hlc);
       const retrieved = await manager.getPeerSyncState(peerSiteId);
@@ -289,7 +289,7 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -298,7 +298,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Alice',
-            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -317,14 +317,14 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'delete',
             schema: 'main',
             table: 'users',
             pk: [1],
-            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -345,7 +345,7 @@ describe('SyncManager', () => {
       const newerChangeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-2',
-        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -354,7 +354,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Bob',
-            hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -366,7 +366,7 @@ describe('SyncManager', () => {
       const olderChangeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -375,7 +375,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Alice',
-            hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -422,7 +422,7 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -431,7 +431,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Alice',
-            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -464,14 +464,14 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'delete',
             schema: 'main',
             table: 'users',
             pk: [1],
-            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -494,7 +494,7 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -503,7 +503,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Alice',
-            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -529,7 +529,7 @@ describe('SyncManager', () => {
       const newerChangeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-2',
-        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -538,7 +538,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Bob',
-            hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -551,7 +551,7 @@ describe('SyncManager', () => {
       const olderChangeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -560,7 +560,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Alice',
-            hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -587,7 +587,7 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [
           {
             type: 'column',
@@ -596,7 +596,7 @@ describe('SyncManager', () => {
             pk: [1],
             column: 'name',
             value: 'Alice',
-            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
           },
         ],
         schemaMigrations: [],
@@ -662,8 +662,8 @@ describe('SyncManager', () => {
       const remoteSite2 = generateSiteId();
 
       // Create concurrent changes with different timestamps
-      const earlierHLC: HLC = { wallTime: BigInt(1000), counter: 1, siteId: remoteSite1 };
-      const laterHLC: HLC = { wallTime: BigInt(2000), counter: 1, siteId: remoteSite2 };
+      const earlierHLC: HLC = { wallTime: BigInt(1000), counter: 1, siteId: remoteSite1, opSeq: 0 };
+      const laterHLC: HLC = { wallTime: BigInt(2000), counter: 1, siteId: remoteSite2, opSeq: 0 };
 
       const changeSet1: ChangeSet = {
         siteId: remoteSite1,
@@ -720,7 +720,7 @@ describe('SyncManager', () => {
       const remoteSite = generateSiteId();
 
       // First, apply an update
-      const updateHLC: HLC = { wallTime: BigInt(1000), counter: 1, siteId: remoteSite };
+      const updateHLC: HLC = { wallTime: BigInt(1000), counter: 1, siteId: remoteSite, opSeq: 0 };
       const updateChangeSet: ChangeSet = {
         siteId: remoteSite,
         transactionId: 'tx-1',
@@ -741,7 +741,7 @@ describe('SyncManager', () => {
       await manager1.applyChanges([updateChangeSet]);
 
       // Then apply a delete with later timestamp
-      const deleteHLC: HLC = { wallTime: BigInt(2000), counter: 1, siteId: remoteSite };
+      const deleteHLC: HLC = { wallTime: BigInt(2000), counter: 1, siteId: remoteSite, opSeq: 0 };
       const deleteChangeSet: ChangeSet = {
         siteId: remoteSite,
         transactionId: 'tx-2',
@@ -864,7 +864,7 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [],
         schemaMigrations: [
           {
@@ -872,7 +872,7 @@ describe('SyncManager', () => {
             schema: 'main',
             table: 'users',
             ddl: 'CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "name" TEXT) USING indexeddb',
-            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+            hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
             schemaVersion: 1,
           },
         ],
@@ -1270,7 +1270,7 @@ describe('SyncManager', () => {
       const changeSet: ChangeSet = {
         siteId: remoteSiteId,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         changes: [{
           type: 'column',
           schema: 'main',
@@ -1278,7 +1278,7 @@ describe('SyncManager', () => {
           pk: [1],
           column: 'name',
           value: 'Alice',
-          hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId },
+          hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: remoteSiteId, opSeq: 0 },
         }],
         schemaMigrations: [],
       };
@@ -1308,7 +1308,7 @@ describe('SyncManager', () => {
       const earlierChangeSet: ChangeSet = {
         siteId: remoteSite1,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite1 },
+        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite1, opSeq: 0 },
         changes: [{
           type: 'column',
           schema: 'main',
@@ -1316,7 +1316,7 @@ describe('SyncManager', () => {
           pk: [1],
           column: 'name',
           value: 'Alice',
-          hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite1 },
+          hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite1, opSeq: 0 },
         }],
         schemaMigrations: [],
       };
@@ -1324,11 +1324,11 @@ describe('SyncManager', () => {
       await manager.applyChanges([earlierChangeSet]);
       conflicts.length = 0; // Clear any initial events
 
-      // Apply newer change — remote wins over existing
+      // Apply newer change â€” remote wins over existing
       const newerChangeSet: ChangeSet = {
         siteId: remoteSite2,
         transactionId: 'tx-2',
-        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite2 },
+        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite2, opSeq: 0 },
         changes: [{
           type: 'column',
           schema: 'main',
@@ -1336,7 +1336,7 @@ describe('SyncManager', () => {
           pk: [1],
           column: 'name',
           value: 'Bob',
-          hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite2 },
+          hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite2, opSeq: 0 },
         }],
         schemaMigrations: [],
       };
@@ -1365,7 +1365,7 @@ describe('SyncManager', () => {
       const newerChangeSet: ChangeSet = {
         siteId: remoteSite1,
         transactionId: 'tx-1',
-        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite1 },
+        hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite1, opSeq: 0 },
         changes: [{
           type: 'column',
           schema: 'main',
@@ -1373,7 +1373,7 @@ describe('SyncManager', () => {
           pk: [1],
           column: 'name',
           value: 'Bob',
-          hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite1 },
+          hlc: { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSite1, opSeq: 0 },
         }],
         schemaMigrations: [],
       };
@@ -1381,11 +1381,11 @@ describe('SyncManager', () => {
       await manager.applyChanges([newerChangeSet]);
       conflicts.length = 0;
 
-      // Apply older change — local wins
+      // Apply older change â€” local wins
       const olderChangeSet: ChangeSet = {
         siteId: remoteSite2,
         transactionId: 'tx-2',
-        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite2 },
+        hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite2, opSeq: 0 },
         changes: [{
           type: 'column',
           schema: 'main',
@@ -1393,7 +1393,7 @@ describe('SyncManager', () => {
           pk: [1],
           column: 'name',
           value: 'Alice',
-          hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite2 },
+          hlc: { wallTime: BigInt(now), counter: 1, siteId: remoteSite2, opSeq: 0 },
         }],
         schemaMigrations: [],
       };

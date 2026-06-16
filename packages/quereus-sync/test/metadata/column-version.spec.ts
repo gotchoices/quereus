@@ -13,7 +13,7 @@ describe('ColumnVersion', () => {
     it('should round-trip serialize/deserialize', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
-        hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId, opSeq: 0 },
         value: 'test value',
       };
 
@@ -28,7 +28,7 @@ describe('ColumnVersion', () => {
     it('should handle null values', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
-        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId },
+        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
         value: null,
       };
 
@@ -41,7 +41,7 @@ describe('ColumnVersion', () => {
     it('should handle numeric values', () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
-        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId },
+        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
         value: 42.5,
       };
 
@@ -55,7 +55,7 @@ describe('ColumnVersion', () => {
       const siteId = generateSiteId();
       const blob = new Uint8Array([0, 1, 127, 255, 65, 66, 67]);
       const version: ColumnVersion = {
-        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId },
+        hlc: { wallTime: BigInt(1234567890), counter: 0, siteId, opSeq: 0 },
         value: blob,
       };
 
@@ -69,7 +69,7 @@ describe('ColumnVersion', () => {
     });
 
     it('should recover legacy corrupted Uint8Array format', () => {
-      // Simulate old corrupted format: JSON.stringify(Uint8Array) → {"0":65,"1":66,"2":67}
+      // Simulate old corrupted format: JSON.stringify(Uint8Array) â†’ {"0":65,"1":66,"2":67}
       const corrupted = { '0': 65, '1': 66, '2': 67 };
       const recovered = decodeSqlValue(corrupted);
 
@@ -103,7 +103,7 @@ describe('ColumnVersion', () => {
     it('should store and retrieve column versions', async () => {
       const siteId = generateSiteId();
       const version: ColumnVersion = {
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 },
         value: 'hello',
       };
 
@@ -123,8 +123,8 @@ describe('ColumnVersion', () => {
       const siteId1 = generateSiteId();
       const siteId2 = generateSiteId();
 
-      const olderHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId: siteId1 };
-      const newerHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId: siteId2 };
+      const olderHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId: siteId1, opSeq: 0 };
+      const newerHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId: siteId2, opSeq: 0 };
 
       // Store older version
       await store.setColumnVersion('main', 'users', [1], 'name', { hlc: olderHLC, value: 'old' });

@@ -13,7 +13,7 @@ describe('Tombstone', () => {
     it('should round-trip serialize/deserialize', () => {
       const siteId = generateSiteId();
       const tombstone: Tombstone = {
-        hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId },
+        hlc: { wallTime: BigInt(Date.now()), counter: 42, siteId, opSeq: 0 },
         createdAt: Date.now(),
       };
 
@@ -38,7 +38,7 @@ describe('Tombstone', () => {
 
     it('should store and retrieve tombstones', async () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 };
 
       await store.setTombstone('main', 'users', [1], hlc);
       const retrieved = await store.getTombstone('main', 'users', [1]);
@@ -54,8 +54,8 @@ describe('Tombstone', () => {
 
     it('should block writes when tombstone exists and resurrection not allowed', async () => {
       const siteId = generateSiteId();
-      const deleteHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId };
-      const writeHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId };
+      const deleteHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 };
+      const writeHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
 
       await store.setTombstone('main', 'users', [1], deleteHLC);
 
@@ -66,8 +66,8 @@ describe('Tombstone', () => {
 
     it('should allow resurrection when enabled', async () => {
       const siteId = generateSiteId();
-      const deleteHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId };
-      const writeHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId };
+      const deleteHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
+      const writeHLC: HLC = { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 };
 
       await store.setTombstone('main', 'users', [1], deleteHLC);
 
@@ -78,7 +78,7 @@ describe('Tombstone', () => {
 
     it('should not block when no tombstone exists', async () => {
       const siteId = generateSiteId();
-      const writeHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId };
+      const writeHLC: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
 
       const isBlocked = await store.isDeletedAndBlocking('main', 'users', [1], writeHLC, false);
       expect(isBlocked).to.be.false;

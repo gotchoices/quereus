@@ -20,7 +20,7 @@ export interface ColumnVersion {
 
 /**
  * Serialize a column version for storage.
- * Format: 26 bytes HLC + JSON value
+ * Format: 30 bytes HLC + JSON value
  *
  * Uint8Array values are encoded as `{"__bin":"<base64>"}` so they survive
  * the JSON round-trip (plain JSON.stringify turns Uint8Array into an object
@@ -41,8 +41,8 @@ export function serializeColumnVersion(cv: ColumnVersion): Uint8Array {
  * Deserialize a column version from storage.
  */
 export function deserializeColumnVersion(buffer: Uint8Array): ColumnVersion {
-  const hlc = deserializeHLC(buffer.slice(0, 26));
-  const valueJson = new TextDecoder().decode(buffer.slice(26));
+  const hlc = deserializeHLC(buffer.slice(0, 30));
+  const valueJson = new TextDecoder().decode(buffer.slice(30));
   const value = decodeSqlValue(JSON.parse(valueJson));
   return { hlc, value };
 }

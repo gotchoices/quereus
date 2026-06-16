@@ -14,7 +14,7 @@ describe('Serialization', () => {
       const hlc: HLC = {
         wallTime: BigInt(Date.now()),
         counter: 42,
-        siteId,
+        siteId, opSeq: 0
       };
 
       const serialized = serializeHLCForTransport(hlc);
@@ -33,7 +33,7 @@ describe('Serialization', () => {
       const hlc: HLC = {
         wallTime: BigInt(Date.now()),
         counter: 1,
-        siteId,
+        siteId, opSeq: 0
       };
 
       const changeSet: ChangeSet = {
@@ -79,7 +79,7 @@ describe('Serialization', () => {
       const hlc: HLC = {
         wallTime: BigInt(Date.now()),
         counter: 2,
-        siteId,
+        siteId, opSeq: 0
       };
 
       const changeSet: ChangeSet = {
@@ -110,7 +110,7 @@ describe('Serialization', () => {
       const hlc: HLC = {
         wallTime: BigInt(Date.now()),
         counter: 3,
-        siteId,
+        siteId, opSeq: 0
       };
 
       const changeSet: ChangeSet = {
@@ -143,7 +143,7 @@ describe('Serialization', () => {
   describe('HLC edge cases', () => {
     it('should round-trip an HLC with counter 0', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(1000), counter: 0, siteId };
+      const hlc: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
       const result = deserializeHLCFromTransport(serializeHLCForTransport(hlc));
       expect(result.wallTime).to.equal(hlc.wallTime);
       expect(result.counter).to.equal(0);
@@ -151,21 +151,21 @@ describe('Serialization', () => {
 
     it('should round-trip an HLC with max counter (65535)', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 65535, siteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 65535, siteId, opSeq: 0 };
       const result = deserializeHLCFromTransport(serializeHLCForTransport(hlc));
       expect(result.counter).to.equal(65535);
     });
 
     it('should round-trip an HLC with wallTime 0', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(0), counter: 0, siteId };
+      const hlc: HLC = { wallTime: BigInt(0), counter: 0, siteId, opSeq: 0 };
       const result = deserializeHLCFromTransport(serializeHLCForTransport(hlc));
       expect(result.wallTime).to.equal(BigInt(0));
     });
 
     it('should round-trip an HLC with large wallTime', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt('9999999999999'), counter: 1, siteId };
+      const hlc: HLC = { wallTime: BigInt('9999999999999'), counter: 1, siteId, opSeq: 0 };
       const result = deserializeHLCFromTransport(serializeHLCForTransport(hlc));
       expect(result.wallTime).to.equal(BigInt('9999999999999'));
     });
@@ -174,7 +174,7 @@ describe('Serialization', () => {
   describe('ChangeSet edge cases', () => {
     it('should round-trip an empty ChangeSet (no changes, no migrations)', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId, opSeq: 0 };
       const cs: ChangeSet = {
         siteId,
         transactionId: 'tx-empty',
@@ -190,7 +190,7 @@ describe('Serialization', () => {
 
     it('should round-trip a ChangeSet with multiple changes', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId, opSeq: 0 };
       const cs: ChangeSet = {
         siteId,
         transactionId: 'tx-multi',
@@ -210,7 +210,7 @@ describe('Serialization', () => {
 
     it('should preserve null values in column changes', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId, opSeq: 0 };
       const cs: ChangeSet = {
         siteId,
         transactionId: 'tx-null',
@@ -229,7 +229,7 @@ describe('Serialization', () => {
 
     it('should preserve composite primary keys', () => {
       const siteId = generateSiteId();
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId, opSeq: 0 };
       const cs: ChangeSet = {
         siteId,
         transactionId: 'tx-cpk',

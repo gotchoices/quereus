@@ -545,6 +545,7 @@ export async function getSnapshotCheckpoint(
 			wallTime: BigInt(obj.hlc.wallTime),
 			counter: obj.hlc.counter,
 			siteId: new Uint8Array(obj.hlc.siteId),
+			opSeq: obj.hlc.opSeq ?? 0,
 		},
 		siteId: new Uint8Array(obj.siteId),
 	};
@@ -564,6 +565,7 @@ async function saveSnapshotCheckpoint(
 			wallTime: checkpoint.hlc.wallTime.toString(),
 			counter: checkpoint.hlc.counter,
 			siteId: Array.from(checkpoint.hlc.siteId),
+			opSeq: checkpoint.hlc.opSeq,
 		},
 		siteId: Array.from(checkpoint.siteId),
 	});

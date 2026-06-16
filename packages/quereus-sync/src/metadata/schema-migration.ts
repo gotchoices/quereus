@@ -22,7 +22,7 @@ export interface StoredMigration {
 
 /**
  * Serialize a migration for storage.
- * Format: 26 bytes HLC + 4 bytes version + 1 byte type length + type + ddl
+ * Format: 30 bytes HLC + 4 bytes version + 1 byte type length + type + ddl
  */
 export function serializeMigration(migration: StoredMigration): Uint8Array {
   const encoder = new TextEncoder();
@@ -30,12 +30,12 @@ export function serializeMigration(migration: StoredMigration): Uint8Array {
   const ddlBytes = encoder.encode(migration.ddl);
   const hlcBytes = serializeHLC(migration.hlc);
 
-  const buffer = new Uint8Array(26 + 4 + 1 + typeBytes.length + ddlBytes.length);
+  const buffer = new Uint8Array(30 + 4 + 1 + typeBytes.length + ddlBytes.length);
   let offset = 0;
 
-  // HLC (26 bytes)
+  // HLC (30 bytes)
   buffer.set(hlcBytes, offset);
-  offset += 26;
+  offset += 30;
 
   // Schema version (4 bytes, big-endian)
   const view = new DataView(buffer.buffer);
@@ -61,9 +61,9 @@ export function deserializeMigration(buffer: Uint8Array): StoredMigration {
   const decoder = new TextDecoder();
   let offset = 0;
 
-  // HLC (26 bytes)
-  const hlc = deserializeHLC(buffer.slice(0, 26));
-  offset += 26;
+  // HLC (30 bytes)
+  const hlc = deserializeHLC(buffer.slice(0, 30));
+  offset += 30;
 
   // Schema version (4 bytes)
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);

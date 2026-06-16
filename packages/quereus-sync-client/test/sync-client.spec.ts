@@ -122,7 +122,7 @@ class MockSyncManager implements SyncManager {
   }
 
   getCurrentHLC(): HLC {
-    return { wallTime: BigInt(Date.now()), counter: 0, siteId: this.siteId };
+    return { wallTime: BigInt(Date.now()), counter: 0, siteId: this.siteId, opSeq: 0 };
   }
 
   async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
@@ -222,7 +222,7 @@ async function connectAndHandshake(
   const ws = MockWebSocket.lastInstance!;
   ws.simulateOpen();
 
-  // Simulate handshake ack BEFORE awaiting — connect() waits for handshake_ack
+  // Simulate handshake ack BEFORE awaiting Ã¢â‚¬â€ connect() waits for handshake_ack
   const sId = serverSiteId ?? generateSiteId();
   ws.simulateMessage({
     type: 'handshake_ack',
@@ -450,7 +450,7 @@ describe('SyncClient', () => {
       const ws = await connectAndHandshake(client);
 
       // Create a serialized change set
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: generateSiteId() };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: generateSiteId(), opSeq: 0 };
       const cs: ChangeSet = {
         siteId: generateSiteId(),
         transactionId: 'tx-1',
@@ -472,7 +472,7 @@ describe('SyncClient', () => {
       const { client } = createClient({ syncManager });
       const ws = await connectAndHandshake(client);
 
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: generateSiteId() };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: generateSiteId(), opSeq: 0 };
       const cs: ChangeSet = {
         siteId: generateSiteId(),
         transactionId: 'tx-push',
@@ -559,7 +559,7 @@ describe('SyncClient', () => {
       await connectAndHandshake(client);
 
       // Trigger a local change
-      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId() };
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId(), opSeq: 0 };
       syncManager.getChangesSinceResult = [{
         siteId: syncManager.getSiteId(),
         transactionId: 'tx-local',
@@ -592,7 +592,7 @@ describe('SyncClient', () => {
       syncManager.getChangesSinceResult = [{
         siteId: syncManager.getSiteId(),
         transactionId: 'tx-offline',
-        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId() },
+        hlc: { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId(), opSeq: 0 },
         changes: [],
         schemaMigrations: [],
       }];

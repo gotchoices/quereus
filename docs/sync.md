@@ -57,19 +57,36 @@ The sync module uses a Hybrid Logical Clock to establish causal ordering of even
 - **Physical Time**: Wall clock time in milliseconds for rough ordering
 - **Logical Counter**: Disambiguates events within the same millisecond
 - **Site ID**: 16-byte UUID identifying each replica
+- **opSeq**: Per-transaction sub-order disambiguating facts of the *same* transaction
 
 ```typescript
 interface HLC {
   wallTime: bigint;      // Physical time (ms since epoch)
   counter: number;       // Logical counter (0-65535)
   siteId: Uint8Array;    // 16-byte replica UUID
+  opSeq: number;         // Per-transaction sub-order (0-based uint32)
 }
 ```
 
-HLC ordering: `(wallTime, counter, siteId)` compared lexicographically. This ensures:
+HLC ordering: `(wallTime, counter, siteId, opSeq)` compared lexicographically. This ensures:
 - Events with higher wall time are considered newer
 - Events at the same wall time are ordered by counter
 - Ties are broken deterministically by site ID
+- Facts of the *same* transaction (same `wallTime`, `counter`, `siteId`) are ordered
+  by `opSeq`
+
+`opSeq` is the data-model layer for "HLC = transaction" grouping: it is a
+contiguous, 0-based sub-order assigned per transaction. Because `siteId` is
+compared **before** `opSeq`, two different sites never reach the `opSeq` tiebreak,
+so `opSeq` only ever discriminates facts produced by one site at one
+`(wallTime, counter)` — i.e. within a single transaction. It is **transaction-local**:
+it resets every transaction and is **not** persisted in the `hc:` clock state.
+
+Encoding widths: the comparison key serializes as 30 bytes —
+8 (`wallTime`) + 2 (`counter`) + 16 (`siteId`) + 4 (`opSeq`, big-endian uint32) —
+both for storage (`serializeHLC`) and as the sortable change-log key component
+(`serializeHLCForKey`), where the `opSeq` bytes sit after `siteId` so lexicographic
+key order matches `compareHLC`.
 
 ### Conflict Resolution: Column-Level Last-Write-Wins (LWW)
 

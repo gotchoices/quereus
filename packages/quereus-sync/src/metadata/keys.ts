@@ -332,11 +332,12 @@ export function parseSchemaMigrationKey(key: Uint8Array): {
 export type ChangeLogEntryType = 'column' | 'delete';
 
 /**
- * Serialize an HLC to a sortable key component (26 bytes, big-endian).
- * This format ensures lexicographic ordering matches HLC ordering.
+ * Serialize an HLC to a sortable key component (30 bytes, big-endian).
+ * This format ensures lexicographic ordering matches HLC ordering — the opSeq
+ * bytes sit after siteId (the last tiebreak), matching compareHLC.
  */
 export function serializeHLCForKey(hlc: HLC): Uint8Array {
-  const buffer = new Uint8Array(26);
+  const buffer = new Uint8Array(30);
   const view = new DataView(buffer.buffer);
   // Wall time as big-endian 64-bit
   view.setBigUint64(0, hlc.wallTime, false);
@@ -344,6 +345,8 @@ export function serializeHLCForKey(hlc: HLC): Uint8Array {
   view.setUint16(8, hlc.counter, false);
   // Site ID (16 bytes)
   buffer.set(hlc.siteId, 10);
+  // Per-transaction sub-order as big-endian 32-bit
+  view.setUint32(26, hlc.opSeq, false);
   return buffer;
 }
 
@@ -355,7 +358,8 @@ export function deserializeHLCFromKey(buffer: Uint8Array): HLC {
   const wallTime = view.getBigUint64(0, false);
   const counter = view.getUint16(8, false);
   const siteId = new Uint8Array(buffer.slice(10, 26));
-  return { wallTime, counter, siteId };
+  const opSeq = view.getUint32(26, false);
+  return { wallTime, counter, siteId, opSeq };
 }
 
 /**
@@ -380,12 +384,12 @@ export function buildChangeLogKey(
     : `${schemaName}.${tableName}${SEPARATOR}${encodePK(pk)}`;
   const suffixBytes = encoder.encode(suffix);
 
-  // cl: (3) + hlc (26) + type (1) + suffix
-  const key = new Uint8Array(3 + 26 + 1 + suffixBytes.length);
+  // cl: (3) + hlc (30) + type (1) + suffix
+  const key = new Uint8Array(3 + 30 + 1 + suffixBytes.length);
   key.set(SYNC_KEY_PREFIX.CHANGE_LOG, 0);
   key.set(hlcBytes, 3);
-  key[29] = typeByte;
-  key.set(suffixBytes, 30);
+  key[33] = typeByte;
+  key.set(suffixBytes, 34);
 
   return key;
 }
@@ -397,7 +401,7 @@ export function buildChangeLogKey(
 export function buildChangeLogScanBoundsAfter(sinceHLC: HLC): { gte: Uint8Array; lt: Uint8Array } {
   const hlcBytes = serializeHLCForKey(sinceHLC);
   // Start just after sinceHLC
-  const gte = new Uint8Array(3 + 26);
+  const gte = new Uint8Array(3 + 30);
   gte.set(SYNC_KEY_PREFIX.CHANGE_LOG, 0);
   gte.set(incrementHLCBytes(hlcBytes), 3);
 
@@ -444,19 +448,19 @@ export function parseChangeLogKey(key: Uint8Array): {
   pk: SqlValue[];
   column?: string;
 } | null {
-  // Minimum: cl: (3) + hlc (26) + type (1) + some suffix
-  if (key.length < 31) return null;
+  // Minimum: cl: (3) + hlc (30) + type (1) + some suffix
+  if (key.length < 35) return null;
 
   const prefixStr = new TextDecoder().decode(key.slice(0, 3));
   if (prefixStr !== 'cl:') return null;
 
-  const hlcBytes = key.slice(3, 29);
+  const hlcBytes = key.slice(3, 33);
   const hlc = deserializeHLCFromKey(hlcBytes);
 
-  const typeByte = key[29];
+  const typeByte = key[33];
   const entryType: ChangeLogEntryType = typeByte === 0x01 ? 'column' : 'delete';
 
-  const suffixStr = new TextDecoder().decode(key.slice(30));
+  const suffixStr = new TextDecoder().decode(key.slice(34));
 
   // Parse suffix: {schema}.{table}:{pk_json}:{column?}
   const firstDot = suffixStr.indexOf('.');

@@ -6,7 +6,7 @@
  * - Causality tracking across distributed nodes
  * - Bounded clock drift tolerance
  *
- * Ordering: (wallTime, counter, siteId) compared lexicographically
+ * Ordering: (wallTime, counter, siteId, opSeq) compared lexicographically
  */
 
 import type { SiteId } from './site.js';
@@ -21,6 +21,15 @@ export interface HLC {
   readonly counter: number;
   /** 16-byte UUID identifying the replica */
   readonly siteId: SiteId;
+  /**
+   * Per-transaction sub-order, 0-based (uint32, 0–4294967295).
+   *
+   * Discriminates facts produced by the *same* site at the same
+   * `(wallTime, counter)` — i.e. the same transaction. It is the *last*
+   * tiebreak in the comparison key and is NOT a clock-monotonicity component:
+   * it resets every transaction and is never persisted in the `hc:` clock state.
+   */
+  readonly opSeq: number;
 }
 
 /**
@@ -48,7 +57,13 @@ export function compareHLC(a: HLC, b: HLC): number {
   if (a.counter > b.counter) return 1;
 
   // Same counter: compare site ID lexicographically
-  return compareSiteIds(a.siteId, b.siteId);
+  const siteCmp = compareSiteIds(a.siteId, b.siteId);
+  if (siteCmp !== 0) return siteCmp;
+
+  // Same site (i.e. same transaction): compare per-transaction sub-order
+  if (a.opSeq < b.opSeq) return -1;
+  if (a.opSeq > b.opSeq) return 1;
+  return 0;
 }
 
 /**
@@ -72,17 +87,22 @@ export function hlcEquals(a: HLC, b: HLC): boolean {
 
 /**
  * Create a new HLC with the given values.
+ *
+ * `opSeq` defaults to 0 to keep the many call sites that produce the first (or
+ * only) fact of a transaction terse — the field remains required on the
+ * interface.
  */
-export function createHLC(wallTime: bigint, counter: number, siteId: SiteId): HLC {
-  return Object.freeze({ wallTime, counter, siteId });
+export function createHLC(wallTime: bigint, counter: number, siteId: SiteId, opSeq = 0): HLC {
+  return Object.freeze({ wallTime, counter, siteId, opSeq });
 }
 
 /**
  * Serialize HLC to a Uint8Array for storage.
- * Format: 8 bytes wallTime (BE) + 2 bytes counter (BE) + 16 bytes siteId = 26 bytes
+ * Format: 8 bytes wallTime (BE) + 2 bytes counter (BE) + 16 bytes siteId
+ *   + 4 bytes opSeq (BE) = 30 bytes
  */
 export function serializeHLC(hlc: HLC): Uint8Array {
-  const buffer = new Uint8Array(26);
+  const buffer = new Uint8Array(30);
   const view = new DataView(buffer.buffer);
 
   // Wall time as big-endian 64-bit
@@ -94,6 +114,9 @@ export function serializeHLC(hlc: HLC): Uint8Array {
   // Site ID (16 bytes)
   buffer.set(hlc.siteId, 10);
 
+  // Per-transaction sub-order as big-endian 32-bit
+  view.setUint32(26, hlc.opSeq, false);
+
   return buffer;
 }
 
@@ -101,8 +124,8 @@ export function serializeHLC(hlc: HLC): Uint8Array {
  * Deserialize HLC from a Uint8Array.
  */
 export function deserializeHLC(buffer: Uint8Array): HLC {
-  if (buffer.length !== 26) {
-    throw new Error(`Invalid HLC buffer length: ${buffer.length}, expected 26`);
+  if (buffer.length !== 30) {
+    throw new Error(`Invalid HLC buffer length: ${buffer.length}, expected 30`);
   }
 
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
@@ -110,8 +133,9 @@ export function deserializeHLC(buffer: Uint8Array): HLC {
   const wallTime = view.getBigUint64(0, false);
   const counter = view.getUint16(8, false);
   const siteId = new Uint8Array(buffer.slice(10, 26));
+  const opSeq = view.getUint32(26, false);
 
-  return createHLC(wallTime, counter, siteId);
+  return createHLC(wallTime, counter, siteId, opSeq);
 }
 
 // ============================================================================
@@ -129,6 +153,8 @@ export interface SerializedHLC {
   counter: number;
   /** Site ID as 22-character base64url string */
   siteId: string;
+  /** Per-transaction sub-order (0-based uint32) */
+  opSeq: number;
 }
 
 /**
@@ -140,6 +166,7 @@ export function hlcToJson(hlc: HLC): SerializedHLC {
     wallTime: hlc.wallTime.toString(),
     counter: hlc.counter,
     siteId: siteIdToBase64Local(hlc.siteId),
+    opSeq: hlc.opSeq,
   };
 }
 
@@ -150,7 +177,8 @@ export function hlcFromJson(json: SerializedHLC): HLC {
   return createHLC(
     BigInt(json.wallTime),
     json.counter,
-    siteIdFromBase64Local(json.siteId)
+    siteIdFromBase64Local(json.siteId),
+    json.opSeq ?? 0
   );
 }
 
