@@ -12,6 +12,7 @@ import { compareHLC, maxHLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
+import { encodePK } from '../metadata/keys.js';
 import type {
 	ChangeSet,
 	Change,
@@ -350,14 +351,18 @@ export async function commitChangeMetadata(
 	}
 }
 
+// Collapse keys reuse encodePK so in-batch grouping matches the canonical pk encoding of
+// the actual KV keys (buildTombstoneKey / buildColumnVersionKey) — two pks collapse here
+// iff they would collide on disk.
+
 /** Stable per-pk key for collapsing repeated delete entries within one batch. */
 function deleteKey(change: RowDeletion): string {
-	return JSON.stringify([change.schema, change.table, change.pk]);
+	return `delete:${change.schema}.${change.table}:${encodePK(change.pk)}`;
 }
 
 /** Stable per-(pk, column) key for collapsing repeated column entries within one batch. */
 function columnKey(change: ColumnChange): string {
-	return JSON.stringify([change.schema, change.table, change.pk, change.column]);
+	return `column:${change.schema}.${change.table}:${encodePK(change.pk)}:${change.column}`;
 }
 
 /** Keep the max-HLC resolved change per key, collapsing in-batch repeats to one winner. */

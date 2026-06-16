@@ -777,7 +777,12 @@ describe('SyncManager', () => {
 
       // A multi-fact transaction (one commit): delete pk[5] AND write pk[6].name — same
       // base HLC, distinct opSeq, so it groups as one ChangeSet that must never split.
-      const base = { wallTime: BigInt(now + 2000), counter: 1, siteId: siteC };
+      // Its HLC sits BETWEEN the two colliding pk[1] deletes (now < now+1000 < now+2000):
+      // without the in-batch collapse, the older pk[1] entry re-attributes forward to the
+      // winner's HLC (now+2000), advancing the watermark PAST this transaction in round 1
+      // so it would be silently skipped — i.e. this ordering makes the test a genuine
+      // regression guard, not one masked by the watermark walk.
+      const base = { wallTime: BigInt(now + 1000), counter: 1, siteId: siteC };
       const multiFact: ChangeSet = {
         siteId: siteC,
         transactionId: 'tx-multi',
@@ -792,7 +797,7 @@ describe('SyncManager', () => {
       // hlcA < hlcB; both pk[1] deletes resolve against the same pre-batch state.
       const result = await manager.applyChanges([
         deleteFrom(siteA, now, 1, 'tx-a'),
-        deleteFrom(siteB, now + 1000, 1, 'tx-b'),
+        deleteFrom(siteB, now + 2000, 1, 'tx-b'),
         multiFact,
       ]);
       expect(result.applied).to.equal(4);
@@ -831,7 +836,7 @@ describe('SyncManager', () => {
       // The collapsed pk[1] delete surfaces exactly once, attributed to the max-HLC winner.
       const pk1Deletes = collected.flatMap(s => s.changes).filter(c => c.type === 'delete' && JSON.stringify(c.pk) === '[1]');
       expect(pk1Deletes, 'collapsed pk[1] delete must surface exactly once').to.have.lengthOf(1);
-      expect(compareHLC(pk1Deletes[0].hlc, { wallTime: BigInt(now + 1000), counter: 1, siteId: siteB, opSeq: 0 })).to.equal(0);
+      expect(compareHLC(pk1Deletes[0].hlc, { wallTime: BigInt(now + 2000), counter: 1, siteId: siteB, opSeq: 0 })).to.equal(0);
     });
   });
 
