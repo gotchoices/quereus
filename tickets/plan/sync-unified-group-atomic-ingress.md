@@ -1,5 +1,5 @@
 description: Collapse the three sync ingress paths (wire applyChanges, snapshot/snapshot-stream bootstrap, and the planned schema-seed-as-peer) onto one group-atomic admission core — "apply a transaction group atomically, advance the watermark idempotently" — mirroring Lamina's single `acceptLocalFacts` admission seam that synthesizes one transaction group per `(hlc, siteId)` run. Shrinks the surface where the data-first/metadata-second + idempotent-replay invariant must be re-proven.
-prereq: sync-hlc-transaction-grouping
+prereq: sync-getchangessince-transaction-grouping
 files:
   - packages/quereus-sync/src/sync/sync-manager-impl.ts     # applyChanges / applySnapshot / applySnapshotStream
   - packages/quereus-sync/src/sync/change-applicator.ts      # per-group apply + throwIfApplyErrors
@@ -30,7 +30,9 @@ no metadata on any throw or per-change error; idempotent re-apply on retry):
 ## Expected shape
 
 A single internal admission function that takes a **transaction group** (the
-unit defined by `sync-hlc-transaction-grouping`) and:
+unit established by the now-complete hlc transaction-grouping chain —
+`sync-per-transaction-hlc-tick` + `sync-getchangessince-transaction-grouping`)
+and:
 
 1. applies the group's data via the store adapter (data write lands first),
 2. commits CRDT metadata only after the data write succeeds,
@@ -44,8 +46,10 @@ adapters that feed groups into this one core.
 
 ## Notes
 
-- Depends on `sync-hlc-transaction-grouping` for the transaction-group unit; do
-  not invent a second grouping primitive here.
+- Depends on the transaction-group unit from the now-complete hlc chain
+  (`sync-per-transaction-hlc-tick` + `sync-getchangessince-transaction-grouping`,
+  which superseded the original `sync-hlc-transaction-grouping` parent); do not
+  invent a second grouping primitive here.
 - Must preserve the all-or-nothing-per-group semantics already documented (no
   selective/partial commit — the single-watermark constraint in
   `docs/sync.md` makes "all but the failed change" inexpressible).
@@ -53,3 +57,14 @@ adapters that feed groups into this one core.
   `bootstrapFinalize` in `protocol.ts`) that skips the engine seam; the unified
   core must keep that escape hatch rather than forcing every snapshot chunk
   through full per-row maintenance.
+
+## Feed note (2026-06-15)
+
+Promoted backlog → plan once the hlc transaction-grouping prereq landed. The
+original `sync-hlc-transaction-grouping` parent was decomposed during its plan
+pass into `engine-transaction-commit-signal`, `sync-hlc-opseq-foundation`,
+`sync-per-transaction-hlc-tick`, and `sync-getchangessince-transaction-grouping`
+— all now complete. `prereq:` repointed to the grouping sub-ticket so the
+topological sort resolves. No new design decision: this is a consolidation of
+three existing, tested ingress paths behind one admission core that preserves
+the already-documented data-first / idempotent-replay invariants.
