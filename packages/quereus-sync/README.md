@@ -32,7 +32,12 @@ const kv = await LevelDBStore.open({ path: './sync-metadata' });
 // tables use — the adapter resolves each table through it, so inbound writes
 // get table-owned key encoding, secondary-index maintenance, and post-apply
 // reporting through the engine (materialized views, Database.watch).
-const { syncManager, syncEvents } = await createSyncModule(kv, storeEvents, {
+//
+// `transactionSource: db` wires local-change capture to the engine's
+// transaction-commit boundary: the HLC ticks once per committed transaction and
+// every fact of that transaction shares its base HLC (differing only by opSeq).
+const { syncManager, syncEvents } = await createSyncModule(kv, {
+  transactionSource: db,
   applyToStore: createStoreAdapter({ db, storeModule, events: storeEvents }),
   getTableSchema: (schema, table) => db.schemaManager.getTable(schema, table),
 });
@@ -158,7 +163,7 @@ This means concurrent updates to *different* columns of the same row both apply,
 
 ### Core Exports
 
-- `createSyncModule(kv, storeEvents, options?)` - Factory to create sync manager and event emitter
+- `createSyncModule(kv, options?)` - Factory to create sync manager and event emitter. Pass `transactionSource` (the engine `Database`) to capture local changes at the transaction boundary; omit it for a relay-only deployment (e.g. a coordinator)
 - `createStoreAdapter({ db, storeModule, events, applyForeignKeyActions? })` - Creates an `ApplyToStoreCallback` for applying remote changes. Applies rows through `StoreTable.applyExternalRowChanges` (table-owned keying, secondary-index maintenance) and reports each invocation as one `Database.ingestExternalRowChanges` batch (materialized-view maintenance, `Database.watch` capture, commit-time assertions). `applyForeignKeyActions` (default `false`) opts inbound update/delete into parent-side FK actions — only enable when the replication stream does not already carry the origin's cascade effects; cascaded child writes are recorded as *local* changes and propagate outward. The callback is host-driven: never invoke it from within statement execution, and don't drive it while holding an open explicit transaction on `db`. A seam throw (e.g. an assertion failure over an inbound batch) propagates out of `applyToStore` with the storage rows applied and CRDT metadata uncommitted; the next sync attempt re-resolves and converges (value-identical re-application is suppressed)
 - `SyncManager` - Main sync coordination interface
 - `SyncEventEmitter` / `SyncEventEmitterImpl` - Event subscription interface and implementation

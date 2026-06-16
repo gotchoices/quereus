@@ -337,7 +337,10 @@ export class StoreManager {
     });
 
     const storeEvents = new StoreEventEmitter();
-    const { syncManager } = await createSyncModule(store, storeEvents, this.config.syncConfig);
+    // Relay-only: the coordinator has no local engine and produces no local DML,
+    // so no transactionSource is wired — it only applies remote changes and serves
+    // getChangesSince. (storeEvents is retained for the StoreEntry/adapter wiring.)
+    const { syncManager } = await createSyncModule(store, this.config.syncConfig);
 
     return {
       databaseId,

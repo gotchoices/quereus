@@ -190,6 +190,61 @@ global DML-interleave order (store coordinators buffer per-table and fire at the
 own commit). This is deterministic and replayable, which is what downstream
 `opSeq` assignment needs.
 
+#### Write side: one tick per commit, `opSeq` per fact
+
+The sync layer's local-change capture (`SyncManagerImpl.handleTransactionCommit`)
+consumes exactly this grouped batch and records the whole transaction under **one**
+base HLC:
+
+```
+onTransactionCommit(batch):
+  localSchema = batch.schemaEvents where !remote
+  localData   = batch.dataEvents   where !remote
+  if both empty: return                 // all-remote echo, or empty/idle commit
+  base  = hlcManager.tick()             // ONE tick per transaction; opSeq 0
+  txnId = deterministicTxnId(base)      // stable over (wallTime, counter, siteId)
+  opSeq = 0; kvBatch = kv.batch()
+  for each local schema event (DDL before DML):
+     record migration with hlc = {...base, opSeq: opSeq++}
+  for each local data event, for each fact (per changed column, or the deletion):
+     record column-version / tombstone + change-log entry, hlc = {...base, opSeq: opSeq++}
+  persist HLC clock state (wallTime/counter only) into kvBatch
+  kvBatch.write()                       // all metadata for the transaction, atomically
+  emit ONE local-change event { transactionId: txnId, changes, pendingSync: true }
+```
+
+Why one tick is correct: `tick()` advances `wallTime`/`counter` once, so the base
+`(wallTime, counter, siteId)` is unique among this site's transactions. Every fact
+of the transaction shares that triple and differs only in `opSeq` — exactly the
+identity the read side groups on. DDL events take the lowest `opSeq`s so they sort
+below the same transaction's DML (§ DDL Application Order).
+
+`opSeq` ordering semantics: **intra-table** order is true write order (a coordinator
+buffers its table's events in DML order); **cross-table** order is the deterministic
+per-coordinator commit order, not the global DML interleave. This is sufficient for
+intra-transaction atomicity, intra-table parent-before-child, and full determinism
+(same facts ⇒ same `opSeq` on every peer). True cross-table dependency ordering on
+*apply* is a separate concern.
+
+Edge cases:
+- **Rollback / discard** — the engine fires no group, so `tick()` is never called
+  and no HLC/`opSeq` is consumed; a later committed transaction's ordering is never
+  polluted by a discarded one.
+- **All-remote group (echo)** — a pure sync-apply transaction (every event
+  `remote: true`) is skipped entirely; its metadata was already recorded on apply.
+- **Mixed group** — local + remote in one transaction records only the local facts,
+  assigning `opSeq` only to recorded facts so they stay contiguous.
+- **`opSeq` exhaustion** — `opSeq` is a uint32; a transaction whose fact count would
+  exceed `MAX_OPSEQ` throws a `QuereusError` (telemetered as an error sync-state)
+  rather than wrapping. Practically unreachable.
+
+#### Deterministic transaction id
+
+`transactionId` is derived from the base HLC —
+`deterministicTxnId(base) = "${wallTime}:${counter}:${base64(siteId)}"` — rather than
+a random UUID. Same transaction ⇒ same id on every peer (the read side reproduces it
+from the change-log facts' shared base), so no separate `tx:` record is persisted.
+
 ### Transactional Integrity During Sync
 
 When applying remote changes, the sync system must write to two separate stores:
@@ -703,25 +758,30 @@ type SyncState =
 
 ### Integration with Store Events
 
-The sync module subscribes to the store's `StoreEventEmitter` to capture mutations. A key design goal is that reactive events fire **exactly once** for each change, whether the change is local or remote.
+Local-change capture is sourced from the **engine** transaction boundary, not the
+per-table store emitter. `createSyncModule(kv, { transactionSource: db, ... })`
+subscribes the SyncManager to `db.onTransactionCommit`; each committed transaction
+delivers one grouped batch that the write side records under one HLC (see
+§ Transaction-Based Change Grouping → *Write side*). A key design goal is that
+reactive events fire **exactly once** for each change, whether local or remote.
 
-> **Transaction grouping is anchored at the engine, not here.** The per-table
-> `StoreEventEmitter` / `TransactionCoordinator` is the right seam for *capturing
-> individual mutations* (and the `remote` flag that decides whether to record
-> CRDT metadata), but it is **not** the transaction-grouping boundary: each table
-> has its own coordinator, so a cross-table commit fires several separate bursts.
-> The single boundary that sees one logical transaction whole — across every
-> table — is the engine's `DatabaseEventEmitter.onTransactionCommit` (see
-> § Transaction-Based Change Grouping). Group by transaction there; capture and
-> `remote`-filter per mutation here. The grouped batch preserves each event's
-> `remote` flag, so the consumer still filters remote-origin events out of the
-> group.
+> **Why the engine emitter, not the per-table store emitter.** The per-table
+> `StoreEventEmitter` / `TransactionCoordinator` sits **below** the transaction
+> boundary: each table has its own coordinator, so a cross-table commit fires
+> several separate bursts and cannot be grouped into one transaction. The single
+> boundary that sees one logical transaction whole — across every table — is the
+> engine's `DatabaseEventEmitter.onTransactionCommit`. The grouped batch preserves
+> each event's `remote` flag, so the write side still filters remote-origin events
+> out of the group (an all-remote group is a pure sync-apply echo and is skipped).
+> A relay-only deployment (e.g. a coordinator) that produces no local DML simply
+> omits `transactionSource` and captures nothing.
 
 #### Event Flow
 
 **Local Changes:**
 ```
-User SQL → Store executes → Store emits event (remote=false) → SyncManager records metadata → UI receives event
+User SQL → engine commits txn → db.onTransactionCommit (grouped, remote=false)
+        → SyncManager records metadata under one HLC → UI receives per-event store events
 ```
 
 **Remote Changes:**
@@ -758,29 +818,28 @@ interface SchemaChangeEvent {
 
 #### Sync Module Event Handling
 
+The SyncManager subscribes once to the engine transaction boundary and records the
+whole committed transaction under one HLC, emitting a single local-change event:
+
 ```typescript
-// Sync module listens to store events
-storeEventEmitter.onDataChange((event) => {
-  // Skip events from remote sync - metadata already recorded
-  if (event.remote) return;
+// Sync module subscribes to the engine transaction-commit boundary.
+db.onTransactionCommit((batch) => {
+  const localSchema = batch.schemaEvents.filter((e) => !e.remote);
+  const localData = batch.dataEvents.filter((e) => !e.remote);
+  if (localSchema.length === 0 && localData.length === 0) return; // all-remote echo
 
-  // Record CRDT metadata for local changes only
-  syncModule.recordChange(event);
+  const base = hlcManager.tick();                 // ONE HLC per transaction
+  const transactionId = deterministicTxnId(base); // stable across peers
+  let opSeq = 0;
+  const kvBatch = kv.batch();
 
-  // Emit for UI reactivity (local change pending sync)
-  syncEventEmitter.emitLocalChange({
-    transactionId: currentTxId,
-    changes: [eventToChange(event)],
-    pendingSync: true,
-  });
-});
+  for (const e of localSchema) recordMigration(kvBatch, e, base, opSeq++);   // DDL first
+  for (const e of localData)   recordFacts(kvBatch, e, base, () => opSeq++);  // then DML
+  persistHlcState(kvBatch);
+  await kvBatch.write();
 
-storeEventEmitter.onSchemaChange((event) => {
-  // Skip events from remote sync - metadata already recorded
-  if (event.remote) return;
-
-  // Record schema CRDT metadata for local changes
-  syncModule.recordSchemaChange(event);
+  // One local-change event per committed transaction, for UI reactivity.
+  syncEventEmitter.emitLocalChange({ transactionId, changes, pendingSync: true });
 });
 ```
 

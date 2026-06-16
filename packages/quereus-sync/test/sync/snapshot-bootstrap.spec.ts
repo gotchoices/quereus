@@ -144,7 +144,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 
 	const makeSyncManager = (kv: InMemoryKVStore, syncEvents: SyncEventEmitterImpl) =>
 		SyncManagerImpl.create(
-			kv, events, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+			kv, undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
 			(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
 		);
 

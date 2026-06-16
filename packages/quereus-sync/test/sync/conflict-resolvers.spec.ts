@@ -18,9 +18,10 @@ import {
 	type ConflictResolver,
 } from '../../src/sync/protocol.js';
 import { localWinsResolver, remoteWinsResolver, lwwResolver } from '../../src/sync/conflict-resolvers.js';
-import { StoreEventEmitter, InMemoryKVStore } from '@quereus/store';
+import { InMemoryKVStore } from '@quereus/store';
 import type { SyncManager } from '../../src/sync/manager.js';
 import type { SqlValue } from '@quereus/quereus';
+import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
 // ============================================================================
 // Test Infrastructure
@@ -78,7 +79,7 @@ class MockDataStore {
 interface Replica {
 	kv: InMemoryKVStore;
 	dataStore: MockDataStore;
-	storeEvents: StoreEventEmitter;
+	source: FakeTransactionSource;
 	syncEvents: SyncEventEmitterImpl;
 	manager: SyncManager;
 }
@@ -86,13 +87,13 @@ interface Replica {
 async function createReplica(config: SyncConfig): Promise<Replica> {
 	const kv = new InMemoryKVStore();
 	const dataStore = new MockDataStore();
-	const storeEvents = new StoreEventEmitter();
+	const source = new FakeTransactionSource();
 	const syncEvents = new SyncEventEmitterImpl();
 	const applyToStore = dataStore.createApplyToStoreCallback();
 
-	const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+	const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
 
-	return { kv, dataStore, storeEvents, syncEvents, manager };
+	return { kv, dataStore, source, syncEvents, manager };
 }
 
 async function syncOneway(sender: Replica, receiver: Replica): Promise<{ applied: number; conflicts: number }> {
@@ -112,7 +113,7 @@ async function syncBidirectional(a: Replica, b: Replica): Promise<void> {
 }
 
 function emitInsert(replica: Replica, schema: string, table: string, pk: SqlValue[], row: SqlValue[]): void {
-	// Update local data store (emitDataChange only records CRDT metadata, not data)
+	// Update local data store (commitData only records CRDT metadata, not data)
 	const tableKey = `${schema}.${table}`;
 	const pkKey = JSON.stringify(pk);
 	if (!replica.dataStore.tables.has(tableKey)) {
@@ -125,7 +126,7 @@ function emitInsert(replica: Replica, schema: string, table: string, pk: SqlValu
 	}
 	tbl.set(pkKey, cols);
 
-	replica.storeEvents.emitDataChange({ type: 'insert', schemaName: schema, tableName: table, key: pk, newRow: row });
+	replica.source.commitData({ type: 'insert', schemaName: schema, tableName: table, key: pk, newRow: row });
 }
 
 function emitUpdate(replica: Replica, schema: string, table: string, pk: SqlValue[], oldRow: SqlValue[], newRow: SqlValue[]): void {
@@ -143,14 +144,14 @@ function emitUpdate(replica: Replica, schema: string, table: string, pk: SqlValu
 		cols.set(`col_${i}`, newRow[i]);
 	}
 
-	replica.storeEvents.emitDataChange({ type: 'update', schemaName: schema, tableName: table, key: pk, oldRow, newRow });
+	replica.source.commitData({ type: 'update', schemaName: schema, tableName: table, key: pk, oldRow, newRow });
 }
 
 function emitDelete(replica: Replica, schema: string, table: string, pk: SqlValue[], oldRow: SqlValue[]): void {
 	const tableKey = `${schema}.${table}`;
 	replica.dataStore.tables.get(tableKey)?.delete(JSON.stringify(pk));
 
-	replica.storeEvents.emitDataChange({ type: 'delete', schemaName: schema, tableName: table, key: pk, oldRow });
+	replica.source.commitData({ type: 'delete', schemaName: schema, tableName: table, key: pk, oldRow });
 }
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));

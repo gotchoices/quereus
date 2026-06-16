@@ -324,7 +324,7 @@ describe('store-adapter seam integration', () => {
 
 			const syncEvents = new SyncEventEmitterImpl();
 			const syncManager = await SyncManagerImpl.create(
-				new InMemoryKVStore(), events, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
 				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
 			);
 
@@ -363,7 +363,7 @@ describe('store-adapter seam integration', () => {
 
 			const syncEvents = new SyncEventEmitterImpl();
 			const syncManager = await SyncManagerImpl.create(
-				new InMemoryKVStore(), events, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
 				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
 			);
 
@@ -387,7 +387,7 @@ describe('store-adapter seam integration', () => {
 		// NO CRDT metadata committed, so the whole batch re-resolves next sync.
 		const makeSyncManager = (syncEvents: SyncEventEmitterImpl) =>
 			SyncManagerImpl.create(
-				new InMemoryKVStore(), events, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
 				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
 			);
 
@@ -525,7 +525,7 @@ describe('store-adapter seam integration', () => {
 			const kv = new InMemoryKVStore();
 			const syncEvents = new SyncEventEmitterImpl();
 			const syncManager = await SyncManagerImpl.create(
-				kv, events, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				kv, undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
 				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
 			);
 

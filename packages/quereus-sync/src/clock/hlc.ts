@@ -38,6 +38,16 @@ export interface HLC {
 const MAX_COUNTER = 0xFFFF;
 
 /**
+ * Maximum `opSeq` value — a transaction may produce at most 2^32 facts.
+ *
+ * `opSeq` is serialized as a big-endian uint32 (see {@link serializeHLC}), so a
+ * fact count exceeding this would silently wrap. The write side asserts against
+ * this bound and throws rather than wrapping; the limit is practically
+ * unreachable (4 billion facts in one transaction).
+ */
+export const MAX_OPSEQ = 0xFFFFFFFF;
+
+/**
  * Maximum allowed clock drift in milliseconds (1 minute).
  * Rejects remote timestamps that are too far in the future.
  */
@@ -94,6 +104,20 @@ export function hlcEquals(a: HLC, b: HLC): boolean {
  */
 export function createHLC(wallTime: bigint, counter: number, siteId: SiteId, opSeq = 0): HLC {
   return Object.freeze({ wallTime, counter, siteId, opSeq });
+}
+
+/**
+ * Derive a deterministic transaction id from a transaction's base HLC.
+ *
+ * The base HLC `(wallTime, counter, siteId)` is unique among a site's
+ * transactions (consecutive {@link HLCManager.tick}s always differ in counter or
+ * wallTime), so this id is stable and reproducible: every peer that replays the
+ * same transaction's facts derives the *same* id from their shared base, without
+ * persisting a separate transaction record. `opSeq` is intentionally excluded —
+ * all facts of one transaction share a single id.
+ */
+export function deterministicTxnId(base: HLC): string {
+  return `${base.wallTime.toString()}:${base.counter}:${siteIdToBase64Local(base.siteId)}`;
 }
 
 /**

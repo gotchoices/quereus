@@ -12,11 +12,12 @@
  *
  * Usage:
  *   import { createSyncModule } from '@quereus/sync';
- *   import { LevelDBModule, StoreEventEmitter } from '@quereus/store';
+ *   import { LevelDBStore } from '@quereus/store';
  *
- *   const storeEvents = new StoreEventEmitter();
  *   const kv = await LevelDBStore.open({ path: './sync-metadata' });
- *   const { syncManager, syncEvents } = await createSyncModule(kv, storeEvents);
+ *   // `db` is the engine Database; it captures local changes at the
+ *   // transaction boundary. Omit transactionSource for a relay-only deployment.
+ *   const { syncManager, syncEvents } = await createSyncModule(kv, { transactionSource: db });
  */
 
 // Clock module
@@ -27,6 +28,8 @@ export {
   compareHLC,
   hlcEquals,
   createHLC,
+  deterministicTxnId,
+  MAX_OPSEQ,
   serializeHLC,
   deserializeHLC,
   // HLC JSON serialization (for schema seeds and transport)
@@ -111,6 +114,7 @@ export {
   type CreateSyncModuleResult,
   type CreateSyncModuleOptions,
   type GetTableSchemaCallback,
+  type TransactionCommitSource,
 } from './create-sync-module.js';
 
 // Reactive events

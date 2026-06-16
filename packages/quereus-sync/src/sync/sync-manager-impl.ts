@@ -5,10 +5,17 @@
  * Delegates to focused sub-modules for snapshot, streaming, and change application.
  */
 
-import type { KVStore, StoreEventEmitter, DataChangeEvent, SchemaChangeEvent } from '@quereus/store';
-import type { SqlValue, Row } from '@quereus/quereus';
-import type { GetTableSchemaCallback } from '../create-sync-module.js';
-import { HLCManager, type HLC, compareHLC } from '../clock/hlc.js';
+import type { KVStore, WriteBatch } from '@quereus/store';
+import type {
+	SqlValue,
+	Row,
+	TransactionCommitBatch,
+	DatabaseDataChangeEvent,
+	DatabaseSchemaChangeEvent,
+} from '@quereus/quereus';
+import { QuereusError, StatusCode } from '@quereus/quereus';
+import type { GetTableSchemaCallback, TransactionCommitSource } from '../create-sync-module.js';
+import { HLCManager, type HLC, compareHLC, createHLC, deterministicTxnId, MAX_OPSEQ } from '../clock/hlc.js';
 import {
 	generateSiteId,
 	type SiteId,
@@ -48,7 +55,7 @@ import type {
 } from './protocol.js';
 import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState, persistHLCStateBatch, toError } from './sync-context.js';
+import { persistHLCStateBatch, toError } from './sync-context.js';
 import { applyChanges as applyChangesImpl } from './change-applicator.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
 import {
@@ -57,6 +64,48 @@ import {
 	getSnapshotCheckpoint as getSnapshotCheckpointImpl,
 	resumeSnapshotStream as resumeSnapshotStreamImpl,
 } from './snapshot-stream.js';
+
+/**
+ * Guard a transaction's running `opSeq` against the uint32 bound. `opSeq` is
+ * serialized as a big-endian uint32 in the HLC comparison key, so a fact count
+ * exceeding {@link MAX_OPSEQ} would silently wrap and corrupt ordering — throw
+ * instead. Practically unreachable (4 billion facts in one transaction); the
+ * write side telemeters the throw via an error sync-state event.
+ */
+export function assertOpSeqInRange(opSeq: number): void {
+	if (opSeq > MAX_OPSEQ) {
+		throw new QuereusError(
+			`Transaction exceeds ${MAX_OPSEQ + 1} facts; opSeq exhausted`,
+			StatusCode.ERROR,
+		);
+	}
+}
+
+/**
+ * Map an engine schema-change event `(objectType, type)` to the sync
+ * {@link SchemaMigrationType} it records, or `undefined` when the combination is
+ * not tracked for replication (e.g. column-level or view/trigger objects, or an
+ * `alter` on an index). A `'table' alter` is recorded as `alter_column` — the
+ * coarse "table definition changed" migration the schema-sync layer replays.
+ */
+function mapSchemaMigrationType(
+	objectType: DatabaseSchemaChangeEvent['objectType'],
+	type: DatabaseSchemaChangeEvent['type'],
+): SchemaMigrationType | undefined {
+	if (objectType === 'table') {
+		switch (type) {
+			case 'create': return 'create_table';
+			case 'drop': return 'drop_table';
+			case 'alter': return 'alter_column';
+		}
+	} else if (objectType === 'index') {
+		switch (type) {
+			case 'create': return 'add_index';
+			case 'drop': return 'drop_index';
+		}
+	}
+	return undefined;
+}
 
 /**
  * Implementation of SyncManager.
@@ -76,10 +125,6 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 	private readonly getTableSchema?: GetTableSchemaCallback;
-
-	// Pending changes for the current transaction
-	private pendingChanges: Change[] = [];
-	private currentTransactionId: string | null = null;
 
 	private constructor(
 		kv: KVStore,
@@ -106,7 +151,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * Create a new SyncManager, initializing or loading site identity.
 	 *
 	 * @param kv - KV store for sync metadata
-	 * @param storeEvents - Store event emitter to subscribe to local changes
+	 * @param transactionSource - Engine transaction-commit source for local change
+	 *   capture (a `Database`, or any `onTransactionCommit` emitter). When provided,
+	 *   sync subscribes to `onTransactionCommit` and records CRDT metadata for each
+	 *   committed local transaction — one HLC per transaction. Pass `undefined` for a
+	 *   relay-only deployment (e.g. a coordinator) that captures no local DML.
 	 * @param config - Sync configuration
 	 * @param syncEvents - Sync event emitter for UI integration
 	 * @param applyToStore - Optional callback for applying remote changes to the store
@@ -114,7 +163,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 */
 	static async create(
 		kv: KVStore,
-		storeEvents: StoreEventEmitter,
+		transactionSource: TransactionCommitSource | undefined,
 		config: SyncConfig,
 		syncEvents: SyncEventEmitterImpl,
 		applyToStore?: ApplyToStoreCallback,
@@ -151,9 +200,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		const hlcManager = new HLCManager(siteId, hlcState);
 		const manager = new SyncManagerImpl(kv, config, hlcManager, syncEvents, applyToStore, getTableSchema);
 
-		// Subscribe to store events
-		storeEvents.onDataChange((event) => manager.handleDataChange(event));
-		storeEvents.onSchemaChange((event) => manager.handleSchemaChange(event));
+		// Capture local changes at the engine transaction boundary: one grouped
+		// `onTransactionCommit` batch ⇒ one transaction ⇒ one HLC. The store's
+		// per-table emitter is below the transaction boundary and cannot group a
+		// multi-table transaction (docs/sync.md § Transaction-Based Change Grouping),
+		// so we subscribe here, not there. Omitted for relay-only deployments.
+		transactionSource?.onTransactionCommit((batch) => {
+			void manager.handleTransactionCommit(batch);
+		});
 
 		return manager;
 	}
@@ -171,61 +225,68 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	// ============================================================================
-	// Event Handlers (local store changes)
+	// Local change capture (engine transaction boundary)
 	// ============================================================================
 
 	/**
-	 * Handle a data change event from the store.
-	 * Records CRDT metadata for the change.
+	 * Record CRDT metadata for one committed local transaction.
+	 *
+	 * Driven by the engine's `onTransactionCommit` group — the authoritative
+	 * "one transaction = one HLC" boundary. The clock is ticked exactly **once**;
+	 * every fact of the transaction shares that base `(wallTime, counter, siteId)`
+	 * and differs only in `opSeq` (a contiguous, 0-based sub-order). DDL is recorded
+	 * before DML so migrations sort below the same transaction's data facts
+	 * (docs/sync.md § DDL Application Order). All metadata for the transaction —
+	 * schema migrations, column versions, tombstones, change-log entries, and the
+	 * HLC clock state — lands in a single KV batch.
 	 */
-	private async handleDataChange(event: DataChangeEvent): Promise<void> {
+	private async handleTransactionCommit(batch: TransactionCommitBatch): Promise<void> {
 		try {
-			if (event.remote) return;
+			// Capture only LOCAL facts. An all-remote group is a pure sync-apply echo:
+			// its metadata was already recorded by the apply path. A mixed group
+			// (local + remote in one transaction — unusual) records only its local
+			// facts; opSeq is assigned only to recorded facts so they stay contiguous.
+			const localSchema = batch.schemaEvents.filter(e => !e.remote);
+			const localData = batch.dataEvents.filter(e => !e.remote);
+			if (localSchema.length === 0 && localData.length === 0) return;
 
-			const hlc = this.hlcManager.tick();
-			const { schemaName, tableName, type, oldRow, newRow } = event;
-			const pk = event.key ?? event.pk;
-			if (!pk) {
-				console.warn(`[Sync] Missing primary key for ${schemaName}.${tableName} ${type} event — change not tracked`);
-				return;
+			// ONE tick per committed transaction. tick() returns opSeq 0; the closure
+			// below stamps each successive fact with the next opSeq off the same base.
+			const base = this.hlcManager.tick();
+			const transactionId = deterministicTxnId(base);
+
+			let opSeq = 0;
+			const nextHlc = (): HLC => {
+				// Throw (telemetered via the catch below) rather than wrap the uint32.
+				assertOpSeqInRange(opSeq);
+				return createHLC(base.wallTime, base.counter, base.siteId, opSeq++);
+			};
+
+			const kvBatch = this.kv.batch();
+			const changes: Change[] = [];
+
+			// DDL before DML: migrations take the lowest opSeqs.
+			const versionCounters = new Map<string, number>();
+			for (const event of localSchema) {
+				await this.recordSchemaMigration(kvBatch, event, nextHlc, versionCounters);
 			}
 
-			const batch = this.kv.batch();
-
-			if (type === 'delete') {
-				this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, hlc);
-				this.changeLog.recordDeletionBatch(batch, hlc, schemaName, tableName, pk);
-				await this.columnVersions.deleteRowVersions(schemaName, tableName, pk);
-
-				const change: RowDeletion = {
-					type: 'delete',
-					schema: schemaName,
-					table: tableName,
-					pk,
-					hlc,
-				};
-				this.pendingChanges.push(change);
-			} else {
-				if (newRow) {
-					await this.recordColumnVersions(batch, schemaName, tableName, pk, oldRow, newRow, hlc);
-				}
+			for (const event of localData) {
+				await this.recordDataEvent(kvBatch, event, nextHlc, changes);
 			}
 
-			// Persist HLC state in batch (DRY: uses shared helper)
-			persistHLCStateBatch(this, batch);
+			// Persist HLC clock state (wallTime/counter only — opSeq is never persisted).
+			persistHLCStateBatch(this, kvBatch);
 
-			await batch.write();
-
-			const changesToEmit = [...this.pendingChanges];
-			this.pendingChanges = [];
+			await kvBatch.write();
 
 			this.syncEvents.emitLocalChange({
-				transactionId: this.currentTransactionId || crypto.randomUUID(),
-				changes: changesToEmit,
+				transactionId,
+				changes,
 				pendingSync: true,
 			});
 		} catch (error) {
-			console.error('[Sync] Error handling data change:', error);
+			console.error('[Sync] Error handling transaction commit:', error);
 			this.syncEvents.emitSyncStateChange({
 				status: 'error',
 				error: toError(error),
@@ -234,69 +295,82 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Handle a schema change event from the store.
-	 * Records schema migrations for sync.
+	 * Record one local schema-change event as a migration. Allocates an `opSeq`
+	 * (via `nextHlc`) only when the event maps to a tracked migration, so
+	 * unsupported object types consume no sub-order. `versionCounters` carries the
+	 * running per-table schema version across this transaction's migrations.
 	 */
-	private async handleSchemaChange(event: SchemaChangeEvent): Promise<void> {
-		try {
-			if (event.remote) return;
+	private async recordSchemaMigration(
+		batch: WriteBatch,
+		event: DatabaseSchemaChangeEvent,
+		nextHlc: () => HLC,
+		versionCounters: Map<string, number>,
+	): Promise<void> {
+		const migrationType = mapSchemaMigrationType(event.objectType, event.type);
+		if (!migrationType) return;
 
-			const hlc = this.hlcManager.tick();
-			const { type, objectType, schemaName, objectName, ddl } = event;
+		const { schemaName, objectName, ddl } = event;
+		const counterKey = `${schemaName}.${objectName}`;
+		let version = versionCounters.get(counterKey);
+		if (version === undefined) {
+			version = await this.schemaMigrations.getCurrentVersion(schemaName, objectName);
+		}
+		version += 1;
+		versionCounters.set(counterKey, version);
 
-			let migrationType: SchemaMigrationType;
-			if (objectType === 'table') {
-				switch (type) {
-					case 'create': migrationType = 'create_table'; break;
-					case 'drop': migrationType = 'drop_table'; break;
-					case 'alter': migrationType = 'alter_column'; break;
-					default: return;
-				}
-			} else if (objectType === 'index') {
-				switch (type) {
-					case 'create': migrationType = 'add_index'; break;
-					case 'drop': migrationType = 'drop_index'; break;
-					default: return;
-				}
-			} else {
-				return;
-			}
+		this.schemaMigrations.recordMigrationBatch(batch, schemaName, objectName, {
+			type: migrationType,
+			ddl: ddl || '',
+			hlc: nextHlc(),
+			schemaVersion: version,
+		});
+	}
 
-			const currentVersion = await this.schemaMigrations.getCurrentVersion(schemaName, objectName);
-			const newVersion = currentVersion + 1;
+	/**
+	 * Record one local data-change event: a tombstone (delete) or the changed
+	 * column versions (insert/update). Each recorded fact consumes one `opSeq`.
+	 */
+	private async recordDataEvent(
+		batch: WriteBatch,
+		event: DatabaseDataChangeEvent,
+		nextHlc: () => HLC,
+		changes: Change[],
+	): Promise<void> {
+		const { schemaName, tableName, type, oldRow, newRow } = event;
+		const pk = event.key;
+		if (!pk) {
+			console.warn(`[Sync] Missing primary key for ${schemaName}.${tableName} ${type} event — change not tracked`);
+			return;
+		}
 
-			await this.schemaMigrations.recordMigration(schemaName, objectName, {
-				type: migrationType,
-				ddl: ddl || '',
+		if (type === 'delete') {
+			const hlc = nextHlc();
+			this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, hlc);
+			this.changeLog.recordDeletionBatch(batch, hlc, schemaName, tableName, pk);
+			await this.columnVersions.deleteRowVersions(schemaName, tableName, pk);
+
+			const change: RowDeletion = {
+				type: 'delete',
+				schema: schemaName,
+				table: tableName,
+				pk,
 				hlc,
-				schemaVersion: newVersion,
-			});
-
-			// Persist HLC state (DRY: uses shared helper)
-			await persistHLCState(this);
-
-			this.syncEvents.emitLocalChange({
-				transactionId: crypto.randomUUID(),
-				changes: [],
-				pendingSync: true,
-			});
-		} catch (error) {
-			console.error('[Sync] Error handling schema change:', error);
-			this.syncEvents.emitSyncStateChange({
-				status: 'error',
-				error: toError(error),
-			});
+			};
+			changes.push(change);
+		} else if (newRow) {
+			await this.recordColumnVersions(batch, schemaName, tableName, pk, oldRow, newRow, nextHlc, changes);
 		}
 	}
 
 	private async recordColumnVersions(
-		batch: import('@quereus/store').WriteBatch,
+		batch: WriteBatch,
 		schemaName: string,
 		tableName: string,
 		pk: SqlValue[],
 		oldRow: Row | undefined,
 		newRow: Row,
-		hlc: HLC
+		nextHlc: () => HLC,
+		changes: Change[],
 	): Promise<void> {
 		const tableSchema = this.getTableSchema?.(schemaName, tableName);
 		const columnNames = tableSchema?.columns?.map(c => c.name);
@@ -328,6 +402,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 					);
 				}
 
+				const hlc = nextHlc();
 				const version: ColumnVersion = { hlc, value: newValue };
 				this.columnVersions.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
 				this.changeLog.recordColumnChangeBatch(batch, hlc, schemaName, tableName, pk, column);
@@ -341,7 +416,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 					value: newValue,
 					hlc,
 				};
-				this.pendingChanges.push(change);
+				changes.push(change);
 			}
 		}
 	}

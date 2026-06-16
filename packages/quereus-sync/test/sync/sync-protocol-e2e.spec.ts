@@ -21,6 +21,7 @@ import { generateSiteId } from '../../src/clock/site.js';
 import { compareHLC } from '../../src/clock/hlc.js';
 import type { SyncManager } from '../../src/sync/manager.js';
 import { Database, type SqlValue, type TableSchema } from '@quereus/quereus';
+import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
 // ============================================================================
 // Test Infrastructure
@@ -118,7 +119,7 @@ interface Replica {
   name: string;
   kv: InMemoryKVStore;
   dataStore: MockDataStore;
-  storeEvents: StoreEventEmitter;
+  storeEvents: FakeTransactionSource;
   syncEvents: SyncEventEmitterImpl;
   manager: SyncManager;
 }
@@ -127,7 +128,7 @@ interface Replica {
 async function createReplica(name: string, config: SyncConfig): Promise<Replica> {
   const kv = new InMemoryKVStore();
   const dataStore = new MockDataStore();
-  const storeEvents = new StoreEventEmitter();
+  const storeEvents = new FakeTransactionSource();
   const syncEvents = new SyncEventEmitterImpl();
   const applyToStore = dataStore.createApplyToStoreCallback();
 
@@ -180,7 +181,7 @@ function emitLocalInsert(
   pk: SqlValue[],
   row: SqlValue[]
 ): void {
-  replica.storeEvents.emitDataChange({
+  replica.storeEvents.commitData({
     type: 'insert',
     schemaName: schema,
     tableName: table,
@@ -198,7 +199,7 @@ function emitLocalUpdate(
   oldRow: SqlValue[],
   newRow: SqlValue[]
 ): void {
-  replica.storeEvents.emitDataChange({
+  replica.storeEvents.commitData({
     type: 'update',
     schemaName: schema,
     tableName: table,
@@ -216,7 +217,7 @@ function emitLocalDelete(
   pk: SqlValue[],
   oldRow: SqlValue[]
 ): void {
-  replica.storeEvents.emitDataChange({
+  replica.storeEvents.commitData({
     type: 'delete',
     schemaName: schema,
     tableName: table,
@@ -589,7 +590,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Host creates a table
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -613,7 +614,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Host creates table and inserts data
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -642,7 +643,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Emit schema change with remote=true (simulating received remote change)
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -738,7 +739,7 @@ describe('Sync Protocol E2E', () => {
 
       const store = new InMemoryKVStore();
       const dataStore = new MockDataStore();
-      const storeEvents = new StoreEventEmitter();
+      const storeEvents = new FakeTransactionSource();
       const syncEvents = new SyncEventEmitterImpl();
 
       // Create manager with getTableSchema callback
@@ -752,7 +753,7 @@ describe('Sync Protocol E2E', () => {
       );
 
       // Emit a local insert
-      storeEvents.emitDataChange({
+      storeEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'users',
@@ -804,7 +805,7 @@ describe('Sync Protocol E2E', () => {
 
       // Source replica with schema
       const sourceStore = new InMemoryKVStore();
-      const sourceEvents = new StoreEventEmitter();
+      const sourceEvents = new FakeTransactionSource();
       const sourceSyncEvents = new SyncEventEmitterImpl();
       const sourceDataStore = new MockDataStore();
 
@@ -819,7 +820,7 @@ describe('Sync Protocol E2E', () => {
 
       // Destination replica with same schema
       const destStore = new InMemoryKVStore();
-      const destEvents = new StoreEventEmitter();
+      const destEvents = new FakeTransactionSource();
       const destSyncEvents = new SyncEventEmitterImpl();
       const destDataStore = new MockDataStore();
 
@@ -833,7 +834,7 @@ describe('Sync Protocol E2E', () => {
       );
 
       // Source makes a local insert
-      sourceEvents.emitDataChange({
+      sourceEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'users',
@@ -895,7 +896,7 @@ describe('Sync Protocol E2E', () => {
 
       // Browser A (source)
       const browserAStore = new InMemoryKVStore();
-      const browserAEvents = new StoreEventEmitter();
+      const browserAEvents = new FakeTransactionSource();
       const browserASyncEvents = new SyncEventEmitterImpl();
       const browserADataStore = new MockDataStore();
       const browserA = await SyncManagerImpl.create(
@@ -909,7 +910,7 @@ describe('Sync Protocol E2E', () => {
 
       // Coordinator (no schema, no applyToStore - just CRDT metadata)
       const coordStore = new InMemoryKVStore();
-      const coordEvents = new StoreEventEmitter();
+      const coordEvents = new FakeTransactionSource();
       const coordSyncEvents = new SyncEventEmitterImpl();
       const coordinator = await SyncManagerImpl.create(
         coordStore,
@@ -921,7 +922,7 @@ describe('Sync Protocol E2E', () => {
 
       // Browser B (destination)
       const browserBStore = new InMemoryKVStore();
-      const browserBEvents = new StoreEventEmitter();
+      const browserBEvents = new FakeTransactionSource();
       const browserBSyncEvents = new SyncEventEmitterImpl();
       const browserBDataStore = new MockDataStore();
       const browserB = await SyncManagerImpl.create(
@@ -934,7 +935,7 @@ describe('Sync Protocol E2E', () => {
       );
 
       // Step 1: Browser A creates table and inserts row
-      browserAEvents.emitSchemaChange({
+      browserAEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -943,7 +944,7 @@ describe('Sync Protocol E2E', () => {
       });
       await new Promise(r => setTimeout(r, 10));
 
-      browserAEvents.emitDataChange({
+      browserAEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'test',
@@ -998,7 +999,7 @@ describe('Sync Protocol E2E', () => {
 
       // Browser A (source)
       const browserAStore = new InMemoryKVStore();
-      const browserAEvents = new StoreEventEmitter();
+      const browserAEvents = new FakeTransactionSource();
       const browserASyncEvents = new SyncEventEmitterImpl();
       const browserADataStore = new MockDataStore();
       const browserA = await SyncManagerImpl.create(
@@ -1012,7 +1013,7 @@ describe('Sync Protocol E2E', () => {
 
       // Coordinator (no schema, no applyToStore - just CRDT metadata)
       const coordStore = new InMemoryKVStore();
-      const coordEvents = new StoreEventEmitter();
+      const coordEvents = new FakeTransactionSource();
       const coordSyncEvents = new SyncEventEmitterImpl();
       const coordinator = await SyncManagerImpl.create(
         coordStore,
@@ -1023,7 +1024,7 @@ describe('Sync Protocol E2E', () => {
       );
 
       // Step 1: Browser A creates table and inserts row
-      browserAEvents.emitSchemaChange({
+      browserAEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -1032,7 +1033,7 @@ describe('Sync Protocol E2E', () => {
       });
       await new Promise(r => setTimeout(r, 10));
 
-      browserAEvents.emitDataChange({
+      browserAEvents.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'test',
@@ -1050,7 +1051,7 @@ describe('Sync Protocol E2E', () => {
 
       // Step 4: Browser B connects LATER and requests changes
       const browserBStore = new InMemoryKVStore();
-      const browserBEvents = new StoreEventEmitter();
+      const browserBEvents = new FakeTransactionSource();
       const browserBSyncEvents = new SyncEventEmitterImpl();
       const browserBDataStore = new MockDataStore();
       const browserB = await SyncManagerImpl.create(
@@ -1142,9 +1143,11 @@ describe('Sync Protocol E2E', () => {
       const { createStoreAdapter } = await import('../../src/sync/store-adapter.js');
       const applyToStore = createStoreAdapter({ db, storeModule, events });
 
+      // Local capture is sourced from the engine transaction boundary (the real
+      // Database); this test only applies remote changes, so nothing is captured.
       const syncManager = await SyncManagerImpl.create(
         syncMetaStore,  // Sync metadata goes here
-        events,
+        db,
         config,
         syncEvents,
         applyToStore,
@@ -1359,7 +1362,7 @@ describe('Sync Protocol E2E', () => {
       const guest = await createReplica('guest', config);
 
       // Host creates a table (schema change)
-      host.storeEvents.emitSchemaChange({
+      host.storeEvents.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',

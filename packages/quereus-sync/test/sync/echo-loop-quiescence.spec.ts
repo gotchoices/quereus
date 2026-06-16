@@ -9,8 +9,8 @@
  *   Peer A                                  Peer B
  *   ──────                                  ──────
  *   insert into src (local DML)
- *     ├─ src DML       → DataChangeEvent ─┐  (ordinary store DML auto-emits;
- *     │                                   │   handleDataChange records it LOCAL)
+ *     ├─ src DML       → DataChangeEvent ─┐  (one commit group at the engine
+ *     │                                   │   boundary; recorded LOCAL under one HLC)
  *     └─ mv maintenance (tag on)          │
  *           → derived DataChangeEvent ────┤  A.changeLog = { src change, mv change }
  *                                         │
@@ -22,7 +22,7 @@
  *                                         │          src change → MV maintenance re-derives mv row
  *                                         │          → reads mv's COMMITTED state (already has A's row)
  *                                         │          → value-identical → SUPPRESSED → no BackingRowChange
- *                                         │          → no DataChangeEvent → handleDataChange records NOTHING
+ *                                         │          → no DataChangeEvent → empty commit group → records NOTHING
  *                                         ▼
  *                                 B.changeLog has ZERO B-origin entries  ← quiescence
  *                                 B's `select * from mv` == A's          ← convergence
@@ -89,6 +89,17 @@ async function collect(db: Database, sql: string): Promise<Record<string, SqlVal
 	return out;
 }
 
+/**
+ * Local-change capture is anchored to the engine transaction boundary and runs
+ * fire-and-forget *after* the commit (the `onTransactionCommit` listener cannot
+ * await the async metadata write). In production the sync loop is driven by the
+ * post-capture `onLocalChange` event, so there is no race; this manual-relay
+ * harness reads the change log directly, so it must let the capture settle
+ * before reading. (A generous in-memory delay; the handler completes in
+ * microtasks.)
+ */
+const settle = () => new Promise<void>(resolve => setTimeout(resolve, 25));
+
 /** A self-contained sync peer: real Database + StoreModule + adapter + SyncManager. */
 interface Peer {
 	readonly name: string;
@@ -115,9 +126,12 @@ async function makePeer(name: string): Promise<Peer> {
 	const storeModule = new StoreModule(provider, events);
 	db.registerModule('store', storeModule);
 	const applyToStore = createStoreAdapter({ db, storeModule, events });
+	// Local-change capture is sourced from the engine transaction boundary: each
+	// committed local transaction (the src DML and its tagged-MV derivation) is
+	// grouped and recorded under one HLC.
 	const manager = await SyncManagerImpl.create(
 		new InMemoryKVStore(),
-		events,
+		db,
 		{ ...DEFAULT_SYNC_CONFIG },
 		new SyncEventEmitterImpl(),
 		applyToStore,
@@ -139,6 +153,15 @@ async function closePeer(peer: Peer): Promise<void> {
 }
 
 /**
+ * Apply one local SQL write and let its transaction-boundary capture settle, so
+ * the peer's change log reflects the write before any subsequent relay/read.
+ */
+async function localWrite(peer: Peer, sql: string): Promise<void> {
+	await peer.db.exec(sql);
+	await settle();
+}
+
+/**
  * One-directional full DATA relay (real-db analogue of `performBidirectionalSync`):
  * `from`'s data changes excluding `to`-origin → `to`. Uses full sync (no
  * `sinceHLC`), so `getChangesSince(to.siteId)` returns every change `from` holds
@@ -153,15 +176,18 @@ async function closePeer(peer: Peer): Promise<void> {
  * agree on schema.
  */
 async function relay(from: Peer, to: Peer): Promise<ApplyResult> {
+	await settle(); // flush `from`'s pending local capture before reading its log
 	const sets = await from.manager.getChangesSince(to.manager.getSiteId());
 	const dataOnly = sets.map(cs => ({ ...cs, schemaMigrations: [] }));
 	const res = await to.manager.applyChanges(dataOnly);
+	await settle(); // flush `to`'s re-derivation capture from the apply
 	await to.manager.updatePeerSyncState(from.manager.getSiteId(), from.manager.getCurrentHLC());
 	return res;
 }
 
 /** Flatten a peer's relayable change log for a given peer-id exclusion. */
 async function changesFor(peer: Peer, excludeSiteId: Uint8Array): Promise<readonly unknown[]> {
+	await settle(); // flush any pending local capture before reading the log
 	const sets = await peer.manager.getChangesSince(excludeSiteId);
 	return sets.flatMap(cs => cs.changes);
 }
@@ -187,7 +213,7 @@ describe('echo-loop quiescence across two synced peers', () => {
 
 		// (1) Incremental source write on A. The src DML emits a local event AND the
 		// tagged MV's row-time maintenance emits a local derived event → A logs both.
-		await A.db.exec("insert into src values (1, 'x')");
+		await localWrite(A, "insert into src values (1, 'x')");
 
 		// Sanity: A's change log carries BOTH a src and an mv change. A fresh/neutral
 		// peer id excludes nothing, so this is A's complete relayable log.
@@ -238,7 +264,7 @@ describe('echo-loop quiescence across two synced peers', () => {
 		const bEvents: DataChangeEvent[] = [];
 		B.events.onDataChange(e => bEvents.push(e));
 
-		await A.db.exec("insert into src values (1, 'x')");
+		await localWrite(A, "insert into src values (1, 'x')");
 
 		const sets = await A.manager.getChangesSince(B.manager.getSiteId());
 		const srcOnly = sets.map(cs => ({
@@ -262,7 +288,7 @@ describe('echo-loop quiescence across two synced peers', () => {
 	});
 
 	it('B→A round-trip: the reverse relay carries nothing and adds no spurious change on A', async () => {
-		await A.db.exec("insert into src values (1, 'x')");
+		await localWrite(A, "insert into src values (1, 'x')");
 		await relay(A, B); // B converged + quiescent (asserted above).
 
 		// A's complete change log before the reverse relay (neutral id excludes nothing).
@@ -287,14 +313,14 @@ describe('echo-loop quiescence across two synced peers', () => {
 	});
 
 	it('a follow-up UPDATE on the source stays quiescent across the loop (steady state)', async () => {
-		await A.db.exec("insert into src values (1, 'x')");
+		await localWrite(A, "insert into src values (1, 'x')");
 		await relay(A, B);
 
 		const bEvents: DataChangeEvent[] = [];
 		B.events.onDataChange(e => bEvents.push(e));
 
 		// Incremental UPDATE: re-derives the mv row on A (local) and logs it.
-		await A.db.exec("update src set v = 'y' where id = 1");
+		await localWrite(A, "update src set v = 'y' where id = 1");
 		await relay(A, B);
 
 		// Convergence at the new value.
@@ -311,14 +337,14 @@ describe('echo-loop quiescence across two synced peers', () => {
 	});
 
 	it('a DELETE on the source derives an MV tombstone and stays quiescent (tombstone path)', async () => {
-		await A.db.exec("insert into src values (1, 'x')");
+		await localWrite(A, "insert into src values (1, 'x')");
 		await relay(A, B);
 
 		const bEvents: DataChangeEvent[] = [];
 		B.events.onDataChange(e => bEvents.push(e));
 
 		// Incremental DELETE: drops the mv row on A (local) and logs the tombstone.
-		await A.db.exec('delete from src where id = 1');
+		await localWrite(A, 'delete from src where id = 1');
 		await relay(A, B);
 
 		// Convergence: both src and mv are empty on B.

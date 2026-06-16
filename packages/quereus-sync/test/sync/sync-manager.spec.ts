@@ -13,31 +13,32 @@ import {
   type SnapshotFooterChunk,
   type ChangeSet,
 } from '../../src/sync/protocol.js';
-import { StoreEventEmitter, InMemoryKVStore } from '@quereus/store';
+import { InMemoryKVStore } from '@quereus/store';
 import { generateSiteId, siteIdEquals } from '../../src/clock/site.js';
 import { type HLC, compareHLC } from '../../src/clock/hlc.js';
+import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
 describe('SyncManager', () => {
   let kv: InMemoryKVStore;
-  let storeEvents: StoreEventEmitter;
+  let source: FakeTransactionSource;
   let syncEvents: SyncEventEmitterImpl;
   let config: SyncConfig;
 
   beforeEach(() => {
     kv = new InMemoryKVStore();
-    storeEvents = new StoreEventEmitter();
+    source = new FakeTransactionSource();
     syncEvents = new SyncEventEmitterImpl();
     config = { ...DEFAULT_SYNC_CONFIG };
   });
 
   describe('creation', () => {
     it('should create a new SyncManager', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       expect(manager).to.be.instanceOf(SyncManagerImpl);
     });
 
     it('should generate a site ID if not provided', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const siteId = manager.getSiteId();
       expect(siteId).to.have.lengthOf(16);
     });
@@ -45,16 +46,16 @@ describe('SyncManager', () => {
     it('should use provided site ID', async () => {
       const providedSiteId = generateSiteId();
       config.siteId = providedSiteId;
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       expect(siteIdEquals(manager.getSiteId(), providedSiteId)).to.be.true;
     });
 
     it('should persist and reload site ID', async () => {
-      const manager1 = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager1 = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const siteId1 = manager1.getSiteId();
 
       // Create a new manager with the same KV store
-      const manager2 = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager2 = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const siteId2 = manager2.getSiteId();
 
       expect(siteIdEquals(siteId1, siteId2)).to.be.true;
@@ -63,7 +64,7 @@ describe('SyncManager', () => {
 
   describe('HLC', () => {
     it('should provide current HLC', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const hlc = manager.getCurrentHLC();
       expect(hlc.wallTime).to.be.a('bigint');
       expect(hlc.counter).to.be.a('number');
@@ -73,7 +74,7 @@ describe('SyncManager', () => {
 
   describe('getChangesSince', () => {
     it('should return empty array when no changes', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const peerSiteId = generateSiteId();
       const changes = await manager.getChangesSince(peerSiteId);
       expect(changes).to.deep.equal([]);
@@ -82,7 +83,7 @@ describe('SyncManager', () => {
 
   describe('canDeltaSync', () => {
     it('should return false for unknown peer', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const peerSiteId = generateSiteId();
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId, opSeq: 0 };
       const canDelta = await manager.canDeltaSync(peerSiteId, hlc);
@@ -90,7 +91,7 @@ describe('SyncManager', () => {
     });
 
     it('should return true for known peer within TTL', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const peerSiteId = generateSiteId();
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 0, siteId: peerSiteId, opSeq: 0 };
 
@@ -104,7 +105,7 @@ describe('SyncManager', () => {
 
   describe('peerSyncState', () => {
     it('should store and retrieve peer sync state', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const peerSiteId = generateSiteId();
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 5, siteId: peerSiteId, opSeq: 0 };
 
@@ -117,7 +118,7 @@ describe('SyncManager', () => {
     });
 
     it('should return undefined for unknown peer', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const peerSiteId = generateSiteId();
       const retrieved = await manager.getPeerSyncState(peerSiteId);
       expect(retrieved).to.be.undefined;
@@ -126,7 +127,7 @@ describe('SyncManager', () => {
 
   describe('getSnapshot', () => {
     it('should return snapshot with site ID and HLC', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const snapshot = await manager.getSnapshot();
 
       expect(snapshot.siteId).to.have.lengthOf(16);
@@ -136,7 +137,7 @@ describe('SyncManager', () => {
     });
 
     it('should return empty tables when no data', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const snapshot = await manager.getSnapshot();
       expect(snapshot.tables).to.have.lengthOf(0);
     });
@@ -144,8 +145,8 @@ describe('SyncManager', () => {
 
   describe('applySnapshot', () => {
     it('should apply snapshot and update HLC', async () => {
-      const manager1 = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
-      const manager2 = await SyncManagerImpl.create(new InMemoryKVStore(), storeEvents, config, syncEvents);
+      const manager1 = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const manager2 = await SyncManagerImpl.create(new InMemoryKVStore(), source, config, syncEvents);
 
       // Get snapshot from manager1
       const snapshot = await manager1.getSnapshot();
@@ -162,7 +163,7 @@ describe('SyncManager', () => {
 
   describe('streaming snapshots', () => {
     it('should stream snapshot with header and footer', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const chunks: SnapshotChunk[] = [];
 
       for await (const chunk of manager.getSnapshotStream()) {
@@ -175,7 +176,7 @@ describe('SyncManager', () => {
     });
 
     it('should include snapshot ID in header and footer', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const chunks: SnapshotChunk[] = [];
 
       for await (const chunk of manager.getSnapshotStream()) {
@@ -190,8 +191,8 @@ describe('SyncManager', () => {
     });
 
     it('should apply streamed snapshot', async () => {
-      const manager1 = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
-      const manager2 = await SyncManagerImpl.create(new InMemoryKVStore(), storeEvents, config, syncEvents);
+      const manager1 = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const manager2 = await SyncManagerImpl.create(new InMemoryKVStore(), source, config, syncEvents);
 
       // Stream snapshot from manager1
       const chunks: SnapshotChunk[] = [];
@@ -215,7 +216,7 @@ describe('SyncManager', () => {
     });
 
     it('should respect chunk size', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const chunks: SnapshotChunk[] = [];
 
       // Use a small chunk size
@@ -231,13 +232,13 @@ describe('SyncManager', () => {
 
   describe('checkpoint/resume', () => {
     it('should return undefined for non-existent checkpoint', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const checkpoint = await manager.getSnapshotCheckpoint('non-existent');
       expect(checkpoint).to.be.undefined;
     });
 
     it('should resume snapshot stream', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
 
       // Get snapshot ID from initial stream
       let snapshotId = '';
@@ -273,7 +274,7 @@ describe('SyncManager', () => {
 
   describe('applyChanges', () => {
     it('should apply empty changeset', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const result = await manager.applyChanges([]);
 
       expect(result.applied).to.equal(0);
@@ -283,7 +284,7 @@ describe('SyncManager', () => {
     });
 
     it('should apply column changes', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -311,7 +312,7 @@ describe('SyncManager', () => {
     });
 
     it('should apply row deletions', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -337,7 +338,7 @@ describe('SyncManager', () => {
     });
 
     it('should skip older changes (LWW)', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSiteId = generateSiteId();
       const now = Date.now();
 
@@ -391,7 +392,7 @@ describe('SyncManager', () => {
 
   describe('pruneTombstones', () => {
     it('should return 0 when no tombstones', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const pruned = await manager.pruneTombstones();
       expect(pruned).to.equal(0);
     });
@@ -416,7 +417,7 @@ describe('SyncManager', () => {
         return { dataChangesApplied: dataChanges.length, schemaChangesApplied: schemaChanges.length, errors: [] };
       };
 
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -458,7 +459,7 @@ describe('SyncManager', () => {
         return { dataChangesApplied: dataChanges.length, schemaChangesApplied: schemaChanges.length, errors: [] };
       };
 
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -488,7 +489,7 @@ describe('SyncManager', () => {
 
     it('should not call applyToStore when no callback provided', async () => {
       // Create manager without callback
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -521,7 +522,7 @@ describe('SyncManager', () => {
         return { dataChangesApplied: 0, schemaChangesApplied: 0, errors: [] };
       };
 
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
       const remoteSiteId = generateSiteId();
       const now = Date.now();
 
@@ -581,7 +582,7 @@ describe('SyncManager', () => {
       });
 
       const applyToStore = async () => ({ dataChangesApplied: 1, schemaChangesApplied: 0, errors: [] });
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -613,13 +614,13 @@ describe('SyncManager', () => {
       // Create two replicas with separate stores
       const kv1 = new InMemoryKVStore();
       const kv2 = new InMemoryKVStore();
-      const events1 = new StoreEventEmitter();
-      const events2 = new StoreEventEmitter();
+      const source1 = new FakeTransactionSource();
+      const source2 = new FakeTransactionSource();
       const syncEvents1 = new SyncEventEmitterImpl();
       const syncEvents2 = new SyncEventEmitterImpl();
 
-      const manager1 = await SyncManagerImpl.create(kv1, events1, config, syncEvents1);
-      const manager2 = await SyncManagerImpl.create(kv2, events2, config, syncEvents2);
+      const manager1 = await SyncManagerImpl.create(kv1, source1, config, syncEvents1);
+      const manager2 = await SyncManagerImpl.create(kv2, source2, config, syncEvents2);
 
       // Simulate local change on replica 1
       const site1 = manager1.getSiteId();
@@ -651,10 +652,10 @@ describe('SyncManager', () => {
 
     it('should resolve concurrent updates with LWW', async () => {
       const kv1 = new InMemoryKVStore();
-      const events1 = new StoreEventEmitter();
+      const source1 = new FakeTransactionSource();
       const syncEvents1 = new SyncEventEmitterImpl();
 
-      const manager1 = await SyncManagerImpl.create(kv1, events1, config, syncEvents1);
+      const manager1 = await SyncManagerImpl.create(kv1, source1, config, syncEvents1);
 
       // Use separate site IDs for the remote changes (not manager1's own siteId)
       // This simulates receiving changes from two different remote peers
@@ -712,10 +713,10 @@ describe('SyncManager', () => {
 
     it('should handle delete-update conflicts', async () => {
       const kv1 = new InMemoryKVStore();
-      const events1 = new StoreEventEmitter();
+      const source1 = new FakeTransactionSource();
       const syncEvents1 = new SyncEventEmitterImpl();
 
-      const manager1 = await SyncManagerImpl.create(kv1, events1, config, syncEvents1);
+      const manager1 = await SyncManagerImpl.create(kv1, source1, config, syncEvents1);
 
       const remoteSite = generateSiteId();
 
@@ -765,13 +766,13 @@ describe('SyncManager', () => {
     it('should sync full snapshot between replicas', async () => {
       const kv1 = new InMemoryKVStore();
       const kv2 = new InMemoryKVStore();
-      const events1 = new StoreEventEmitter();
-      const events2 = new StoreEventEmitter();
+      const source1 = new FakeTransactionSource();
+      const source2 = new FakeTransactionSource();
       const syncEvents1 = new SyncEventEmitterImpl();
       const syncEvents2 = new SyncEventEmitterImpl();
 
-      const manager1 = await SyncManagerImpl.create(kv1, events1, config, syncEvents1);
-      const manager2 = await SyncManagerImpl.create(kv2, events2, config, syncEvents2);
+      const manager1 = await SyncManagerImpl.create(kv1, source1, config, syncEvents1);
+      const manager2 = await SyncManagerImpl.create(kv2, source2, config, syncEvents2);
 
       // Add some data to replica 1
       const site1 = manager1.getSiteId();
@@ -824,12 +825,12 @@ describe('SyncManager', () => {
   });
 
   describe('schema migration sync', () => {
-    it('should record schema migration when store emits schema change event', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+    it('should record schema migration when a transaction commits a schema change', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSiteId = generateSiteId();
 
       // Emit a schema change event (simulating CREATE TABLE)
-      storeEvents.emitSchemaChange({
+      source.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -858,7 +859,7 @@ describe('SyncManager', () => {
         return { dataChangesApplied: 0, schemaChangesApplied: schemaChanges.length, errors: [] };
       };
 
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -889,8 +890,8 @@ describe('SyncManager', () => {
     it('should sync schema migrations between two replicas', async () => {
       const kv1 = new InMemoryKVStore();
       const kv2 = new InMemoryKVStore();
-      const events1 = new StoreEventEmitter();
-      const events2 = new StoreEventEmitter();
+      const source1 = new FakeTransactionSource();
+      const source2 = new FakeTransactionSource();
       const syncEvents1 = new SyncEventEmitterImpl();
       const syncEvents2 = new SyncEventEmitterImpl();
 
@@ -903,11 +904,11 @@ describe('SyncManager', () => {
         return { dataChangesApplied: 0, schemaChangesApplied: schemaChanges.length, errors: [] };
       };
 
-      const manager1 = await SyncManagerImpl.create(kv1, events1, config, syncEvents1);
-      const manager2 = await SyncManagerImpl.create(kv2, events2, config, syncEvents2, applyToStore2);
+      const manager1 = await SyncManagerImpl.create(kv1, source1, config, syncEvents1);
+      const manager2 = await SyncManagerImpl.create(kv2, source2, config, syncEvents2, applyToStore2);
 
       // Simulate CREATE TABLE on replica 1
-      events1.emitSchemaChange({
+      source1.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -933,11 +934,11 @@ describe('SyncManager', () => {
     });
 
     it('should not re-record schema migration from remote events', async () => {
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSiteId = generateSiteId();
 
       // Emit a schema change event with remote=true (simulating applied remote change)
-      storeEvents.emitSchemaChange({
+      source.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -967,8 +968,8 @@ describe('SyncManager', () => {
 
       const kvA = new InMemoryKVStore();
       const kvB = new InMemoryKVStore();
-      const eventsA = new StoreEventEmitter();
-      const eventsB = new StoreEventEmitter();
+      const sourceA = new FakeTransactionSource();
+      const sourceB = new FakeTransactionSource();
       const syncEventsA = new SyncEventEmitterImpl();
       const syncEventsB = new SyncEventEmitterImpl();
 
@@ -978,8 +979,8 @@ describe('SyncManager', () => {
         conflictsOnA.push(event);
       });
 
-      const managerA = await SyncManagerImpl.create(kvA, eventsA, config, syncEventsA);
-      const managerB = await SyncManagerImpl.create(kvB, eventsB, config, syncEventsB);
+      const managerA = await SyncManagerImpl.create(kvA, sourceA, config, syncEventsA);
+      const managerB = await SyncManagerImpl.create(kvB, sourceB, config, syncEventsB);
 
       const siteA = managerA.getSiteId();
       const hlcA = managerA.getCurrentHLC();
@@ -1052,13 +1053,13 @@ describe('SyncManager', () => {
     it('should skip own deletions when receiving via relay', async () => {
       const kvA = new InMemoryKVStore();
       const kvB = new InMemoryKVStore();
-      const eventsA = new StoreEventEmitter();
-      const eventsB = new StoreEventEmitter();
+      const sourceA = new FakeTransactionSource();
+      const sourceB = new FakeTransactionSource();
       const syncEventsA = new SyncEventEmitterImpl();
       const syncEventsB = new SyncEventEmitterImpl();
 
-      const managerA = await SyncManagerImpl.create(kvA, eventsA, config, syncEventsA);
-      const managerB = await SyncManagerImpl.create(kvB, eventsB, config, syncEventsB);
+      const managerA = await SyncManagerImpl.create(kvA, sourceA, config, syncEventsA);
+      const managerB = await SyncManagerImpl.create(kvB, sourceB, config, syncEventsB);
 
       const siteA = managerA.getSiteId();
       const hlcA = managerA.getCurrentHLC();
@@ -1104,13 +1105,13 @@ describe('SyncManager', () => {
 
       const kvA = new InMemoryKVStore();
       const kvB = new InMemoryKVStore();
-      const eventsA = new StoreEventEmitter();
-      const eventsB = new StoreEventEmitter();
+      const sourceA = new FakeTransactionSource();
+      const sourceB = new FakeTransactionSource();
       const syncEventsA = new SyncEventEmitterImpl();
       const syncEventsB = new SyncEventEmitterImpl();
 
-      const managerA = await SyncManagerImpl.create(kvA, eventsA, config, syncEventsA);
-      const managerB = await SyncManagerImpl.create(kvB, eventsB, config, syncEventsB);
+      const managerA = await SyncManagerImpl.create(kvA, sourceA, config, syncEventsA);
+      const managerB = await SyncManagerImpl.create(kvB, sourceB, config, syncEventsB);
 
       const siteA = managerA.getSiteId();
       const hlcA = managerA.getCurrentHLC();
@@ -1143,7 +1144,7 @@ describe('SyncManager', () => {
       // B makes its own LOCAL change via store events (not applyChanges)
       // This simulates B doing an INSERT/UPDATE locally
       // Note: Each column in the row becomes a separate column change
-      eventsB.emitDataChange({
+      sourceB.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'test1',
@@ -1180,10 +1181,10 @@ describe('SyncManager', () => {
       const origWarn = console.warn;
       console.warn = (msg: string) => warnings.push(msg);
       try {
-        const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+        const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
 
         // Emit data change without key or pk
-        storeEvents.emitDataChange({
+        source.commitData({
           type: 'insert',
           schemaName: 'main',
           tableName: 'test',
@@ -1199,7 +1200,7 @@ describe('SyncManager', () => {
       }
     });
 
-    it('should catch errors in handleDataChange and emit error state', async () => {
+    it('should catch errors while recording a committed data change and emit error state', async () => {
       const states: SyncState[] = [];
       syncEvents.onSyncStateChange(state => states.push(state));
 
@@ -1212,9 +1213,9 @@ describe('SyncManager', () => {
         return batch;
       };
 
-      const manager = await SyncManagerImpl.create(failingKv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(failingKv, source, config, syncEvents);
 
-      storeEvents.emitDataChange({
+      source.commitData({
         type: 'insert',
         schemaName: 'main',
         tableName: 'test',
@@ -1229,13 +1230,13 @@ describe('SyncManager', () => {
       expect(errorState.error.message).to.equal('batch write failed');
     });
 
-    it('should catch errors in handleSchemaChange and emit error state', async () => {
+    it('should catch errors while recording a committed schema change and emit error state', async () => {
       const states: SyncState[] = [];
       syncEvents.onSyncStateChange(state => states.push(state));
 
       // Create a manager with a KV store that will fail
       const failingKv = new InMemoryKVStore();
-      const manager = await SyncManagerImpl.create(failingKv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(failingKv, source, config, syncEvents);
 
       // Sabotage the KV store after creation so schemaMigrations.getCurrentVersion fails
       const origIterate = failingKv.iterate.bind(failingKv);
@@ -1243,7 +1244,7 @@ describe('SyncManager', () => {
         throw new Error('iterate failed');
       };
 
-      storeEvents.emitSchemaChange({
+      source.commitSchema({
         type: 'create',
         objectType: 'table',
         schemaName: 'main',
@@ -1264,7 +1265,7 @@ describe('SyncManager', () => {
         throw new Error('store apply failed');
       };
 
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, applyToStore);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore);
       const remoteSiteId = generateSiteId();
 
       const changeSet: ChangeSet = {
@@ -1299,7 +1300,7 @@ describe('SyncManager', () => {
       const conflicts: ConflictEvent[] = [];
       syncEvents.onConflictResolved(event => conflicts.push(event));
 
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSite1 = generateSiteId();
       const remoteSite2 = generateSiteId();
       const now = Date.now();
@@ -1356,7 +1357,7 @@ describe('SyncManager', () => {
       const conflicts: ConflictEvent[] = [];
       syncEvents.onConflictResolved(event => conflicts.push(event));
 
-      const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
       const remoteSite1 = generateSiteId();
       const remoteSite2 = generateSiteId();
       const now = Date.now();
@@ -1413,9 +1414,9 @@ describe('SyncManager', () => {
       console.warn = (msg: string) => warnings.push(msg);
       try {
         // Create manager WITHOUT getTableSchema callback
-        const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents);
+        const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
 
-        storeEvents.emitDataChange({
+        source.commitData({
           type: 'insert',
           schemaName: 'main',
           tableName: 'test',
@@ -1439,9 +1440,9 @@ describe('SyncManager', () => {
       try {
         // Create manager WITH getTableSchema that returns undefined
         const getTableSchema = () => undefined;
-        const manager = await SyncManagerImpl.create(kv, storeEvents, config, syncEvents, undefined, getTableSchema);
+        const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, undefined, getTableSchema);
 
-        storeEvents.emitDataChange({
+        source.commitData({
           type: 'insert',
           schemaName: 'main',
           tableName: 'test',

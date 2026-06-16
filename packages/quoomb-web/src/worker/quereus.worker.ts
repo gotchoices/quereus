@@ -643,12 +643,13 @@ class QuereusWorker implements QuereusWorkerAPI {
       events: this.storeEvents,
     });
 
-    // Create sync module with the store adapter and schema lookup
-    // getTableSchema is needed for proper column name mapping in sync
+    // Create sync module with the store adapter and schema lookup.
+    // getTableSchema maps column indices to names; transactionSource (the engine
+    // Database) drives local-change capture at the transaction boundary — one HLC
+    // per committed transaction.
     const { syncManager, syncEvents } = await createSyncModule(
       this.kvStore,
-      this.storeEvents,
-      { applyToStore, getTableSchema }
+      { applyToStore, getTableSchema, transactionSource: db }
     );
 
     this.syncManager = syncManager;
