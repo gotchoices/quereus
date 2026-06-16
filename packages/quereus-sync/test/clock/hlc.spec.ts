@@ -3,6 +3,7 @@ import {
   HLCManager,
   compareHLC,
   hlcEquals,
+  maxHLC,
   createHLC,
   serializeHLC,
   deserializeHLC,
@@ -87,6 +88,54 @@ describe('HLC (Hybrid Logical Clock)', () => {
       const a = createHLC(1000n, 1, siteA);
       const b = createHLC(1000n, 2, siteA);
       expect(hlcEquals(a, b)).to.be.false;
+    });
+  });
+
+  describe('maxHLC', () => {
+    const siteA = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const siteB = new Uint8Array([2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    it('should return undefined for an empty iterable', () => {
+      expect(maxHLC([])).to.be.undefined;
+    });
+
+    it('should return the sole element for a single-element iterable', () => {
+      const only = createHLC(1000n, 1, siteA);
+      expect(hlcEquals(maxHLC([only])!, only)).to.be.true;
+    });
+
+    it('should return the maximum regardless of position', () => {
+      const low = createHLC(1000n, 0, siteA);
+      const mid = createHLC(2000n, 0, siteA);
+      const high = createHLC(3000n, 0, siteA);
+      // Max in the middle, at the end, and at the start.
+      expect(hlcEquals(maxHLC([low, high, mid])!, high)).to.be.true;
+      expect(hlcEquals(maxHLC([low, mid, high])!, high)).to.be.true;
+      expect(hlcEquals(maxHLC([high, mid, low])!, high)).to.be.true;
+    });
+
+    it('should use the full HLC total order, not just wallTime', () => {
+      // Equal wallTime/counter — siteB outranks siteA by the siteId tiebreak.
+      const a = createHLC(1000n, 1, siteA);
+      const b = createHLC(1000n, 1, siteB);
+      expect(hlcEquals(maxHLC([a, b])!, b)).to.be.true;
+      expect(hlcEquals(maxHLC([b, a])!, b)).to.be.true;
+    });
+
+    it('should keep the first of equal maxima', () => {
+      // compareHLC uses strict greater-than, so ties retain the earlier element.
+      const first = createHLC(1000n, 1, siteA);
+      const second = createHLC(1000n, 1, siteA);
+      expect(maxHLC([first, second])).to.equal(first);
+    });
+
+    it('should consume a lazy generator (Iterable contract)', () => {
+      function* gen(): Generator<ReturnType<typeof createHLC>> {
+        yield createHLC(1000n, 0, siteA);
+        yield createHLC(3000n, 0, siteA);
+        yield createHLC(2000n, 0, siteA);
+      }
+      expect(maxHLC(gen())!.wallTime).to.equal(3000n);
     });
   });
 

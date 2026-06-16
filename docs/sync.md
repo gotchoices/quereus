@@ -712,7 +712,7 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 
 To minimize data transfer, clients track sync progress with the server. Every
 watermark is a **`ChangeSet.hlc`** — a transaction commit boundary (the max over
-`changeSets[].hlc`, computed by `maxHLCFromChangeSets`), never a per-change max or a
+`changeSets[].hlc`, computed by the shared `maxHLC` clock helper), never a per-change max or a
 batch-slice boundary — so advancing it can only ever land *between* whole
 transactions (§ Transaction-Based Change Grouping → Read side):
 
