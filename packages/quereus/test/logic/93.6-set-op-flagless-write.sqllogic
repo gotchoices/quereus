@@ -305,14 +305,20 @@ select id, y from jv2 order by id;
 
 -- INSERT through the join leg is now SHIPPED via the nested shared-surrogate envelope splice
 -- (`set-op-write-multisource-leg-insert`): the discriminator `src='a'` routes to the join leg, whose
--- shared key `id` is supplied (jv1.id = jv2.id), so jv1 gets (5,50,null) and jv2 gets (5,null). The
--- 'b' plain leg is unsat with src='a' ⇒ untouched. (The join leg's `where color='red'` is NOT
--- consulted on insert — the base row is written regardless of the view predicate.)
+-- shared key `id` is supplied (jv1.id = jv2.id), so jv1 gets (5,50,'red') and jv2 gets (5,null). The
+-- 'b' plain leg is unsat with src='a' ⇒ untouched. The join leg's `where jv1.color='red'` IS now
+-- consulted on insert (multisource-insert-sigma-fd-defaulting): the σ equality constant is lifted as
+-- a per-side insert default, so the omitted, projected-away `color` is supplied 'red' on jv1 and the
+-- inserted row is VISIBLE through JV (matching the single-source σ-defaulting rule).
 insert into JV (id, x, src) values (5, 50, 'a');
 select id, x, color from jv1 order by id;
-→ [{"id":2,"x":20,"color":"blue"},{"id":5,"x":50,"color":null}]
+→ [{"id":2,"x":20,"color":"blue"},{"id":5,"x":50,"color":"red"}]
 select id, y from jv2 order by id;
 → [{"id":2,"y":200},{"id":5,"y":null}]
+-- the inserted (5,50,'a') row now appears THROUGH the view (jv1.color defaulted to 'red', so the
+-- 'a' join leg's `where color='red'` admits it).
+select * from JV order by id;
+→ [{"id":2,"x":20,"src":"b"},{"id":5,"x":50,"src":"a"}]
 
 -- NOTE on comma-join legs (`from a, b`): the engine rejects multiple FROM sources at build
 -- time ("SELECT with multiple FROM sources (joins) not supported"), so such a body cannot even

@@ -2901,6 +2901,123 @@ insert into mpv (c, cv, pv, qv) values (4, 400, 30, 40);
 -- error: single shared key
 
 -- ===================================
+-- σ (where-clause) constant-FD insert defaulting (multisource-insert-sigma-fd-defaulting):
+-- the join body's `where col = literal` equality constants are lifted as per-side insert
+-- defaults — the multi-source analog of the single-source § Selection rule (line ~118).
+-- An omitted σ-constrained column is supplied its σ constant, so the inserted row satisfies
+-- the view predicate and is visible THROUGH the view (matching the single-source path); an
+-- explicit value that contradicts the σ constant rejects at plan time (predicate-contradiction).
+-- ===================================
+pragma foreign_keys = false;
+
+-- --- (σ1) the repro: σ on a PROJECTED-AWAY column (`color` is not an SV output column), key
+--          supplied. The omitted `color` is defaulted to 'red' on sdj1, so the row is visible
+--          through SV — without the lift it would land NULL and be invisible. ---
+create table sdj1 (id integer primary key, x integer, color text null);
+create table sdj2 (id integer primary key, y integer null);
+insert into sdj1 values (1,10,'red');
+insert into sdj2 values (1,100);
+create view sdjv as select sdj1.id as id, sdj1.x as x from sdj1 join sdj2 on sdj1.id = sdj2.id where sdj1.color = 'red';
+
+insert into sdjv (id, x) values (5, 50);
+-- color DEFAULTED to the σ constant on sdj1 (the projected-away column).
+select id, x, color from sdj1 order by id;
+→ [{"id":1,"x":10,"color":"red"},{"id":5,"x":50,"color":"red"}]
+select id, y from sdj2 order by id;
+→ [{"id":1,"y":100},{"id":5,"y":null}]
+-- the inserted row is VISIBLE through the view (it satisfies `where color='red'`).
+select id, x from sdjv order by id;
+→ [{"id":1,"x":10},{"id":5,"x":50}]
+
+-- σ-defaulting also applies to a SELECT source — a strict capability gain over the single-
+-- source path (which defers σ-defaulting for SELECT sources). The σ constant rides the side
+-- projection, not the VALUES rows, so a SELECT-sourced insert defaults `color` too.
+insert into sdjv (id, x) select 11, 110;
+select id, x, color from sdj1 where id = 11;
+→ [{"id":11,"x":110,"color":"red"}]
+
+-- --- (σ2) σ on a PROJECTED column, supplied. The matching value succeeds (idempotent — no
+--          default, no reject); a contradicting value rejects at plan time. ---
+create table sdc1 (id integer primary key, x integer null, color text null);
+create table sdc2 (id integer primary key, y integer null);
+insert into sdc1 values (1,10,'red');
+insert into sdc2 values (1,100);
+create view sdjp as select sdc1.id as id, sdc1.x as x, sdc1.color as color from sdc1 join sdc2 on sdc1.id = sdc2.id where sdc1.color = 'red';
+
+insert into sdjp (id, x, color) values (6, 60, 'red');
+select id, x, color from sdc1 order by id;
+→ [{"id":1,"x":10,"color":"red"},{"id":6,"x":60,"color":"red"}]
+
+-- a supplied value CONTRADICTING the σ constant rejects at plan time.
+insert into sdjp (id, x, color) values (7, 70, 'blue');
+-- error: contradicts its selection predicate
+-- ...the statement never executed: sdc1 unchanged.
+select id, x, color from sdc1 order by id;
+→ [{"id":1,"x":10,"color":"red"},{"id":6,"x":60,"color":"red"}]
+
+-- a multi-row insert: the contradiction scan walks EVERY row and rejects if ANY cell
+-- contradicts the σ constant (here the second row's color='blue').
+insert into sdjp (id, x, color) values (10, 100, 'red'), (11, 110, 'blue');
+-- error: contradicts its selection predicate
+select count(*) as n from sdc1 where id in (10, 11);
+→ [{"n":0}]
+
+-- --- (σ2b) a RENAMED σ column (`color as hue`): the contradiction match is on the resolved
+--           BASE column, not the view spelling, so supplying `hue` contradicting the σ rejects;
+--           the matching value succeeds. ---
+create view sdjr as select sdc1.id as id, sdc1.color as hue from sdc1 join sdc2 on sdc1.id = sdc2.id where sdc1.color = 'red';
+insert into sdjr (id, hue) values (8, 'blue');
+-- error: contradicts its selection predicate
+insert into sdjr (id, hue) values (9, 'red');
+select id, color from sdc1 where id = 9;
+→ [{"id":9,"color":"red"}]
+
+-- --- (σ3) σ over a MINTED shared key: a σ-constrained non-key, non-projected column (`tier`,
+--          NOT NULL with no default) on the anchor side is defaulted while the key `rid` is
+--          still minted once per row from the anchor's high-water default. The σ default also
+--          legitimately covers the NOT-NULL-without-default column (no spurious `no-default`). ---
+create table sdmk_core (rid integer primary key default (coalesce((select max(rid) from sdmk_core), 0) + mutation_ordinal()), name text, tier text not null);
+create table sdmk_contact (rid integer primary key, email text);
+create view sdmkv as select c.name as name, k.email as email
+    from sdmk_core c join sdmk_contact k on k.rid = c.rid where c.tier = 'gold';
+
+insert into sdmkv (name, email) values ('Ada', 'ada@x.io');
+-- rid minted once (=1) and shared; tier defaulted to 'gold' on the anchor (sdmk_core).
+select rid, name, tier from sdmk_core order by rid;
+→ [{"rid":1,"name":"Ada","tier":"gold"}]
+select rid, email from sdmk_contact order by rid;
+→ [{"rid":1,"email":"ada@x.io"}]
+select name, email from sdmkv order by name;
+→ [{"name":"Ada","email":"ada@x.io"}]
+
+-- --- (σ4) OUTER join with σ on the NON-preserved side. A both-side insert makes that side
+--          active, so the σ default applies and the row is visible; a preserved-only insert
+--          leaves the side inactive (no base row to default into), so the row reads back null-
+--          extended/invisible — a documented structural residual — but the insert SUCCEEDS. ---
+create table sdop (pp integer primary key default (coalesce((select max(pp) from sdop), 0) + mutation_ordinal()), pv integer null, kind text not null);
+create table sdoc (cc integer primary key, pr integer null references sdop(pp), cv integer null);
+create view sdojv as select c.cc as cc, c.cv as cv, p.pv as pv
+    from sdoc c left join sdop p on p.pp = c.pr where p.kind = 'gold';
+
+-- both-side insert: the non-preserved side (sdop) is active, so its σ column `kind` defaults to
+-- 'gold' and the materialized parent satisfies `where p.kind='gold'` ⇒ the row is VISIBLE.
+insert into sdojv (cc, cv, pv) values (3, 33, 333);
+select cc, cv, pv from sdojv where cc = 3;
+→ [{"cc":3,"cv":33,"pv":333}]
+select pv, kind from sdop order by pv;
+→ [{"pv":333,"kind":"gold"}]
+
+-- preserved-only insert: sdop is INACTIVE (no base row), so no σ default — the row reads back
+-- null-extended and is INVISIBLE through the σ-constrained view, yet the insert SUCCEEDS (sdoc
+-- is written). This is the documented structural residual.
+insert into sdojv (cc, cv) values (4, 44);
+select cc, cv, pv from sdojv where cc = 4;
+→ []
+select cc, cv from sdoc where cc = 4;
+→ [{"cc":4,"cv":44}]
+pragma foreign_keys = false;
+
+-- ===================================
 -- SUPPLIED shared key (the join key is a writable view column, not minted): the per-row
 -- key gate must NOT fire. The user's explicit key may reference a PRE-EXISTING parent the
 -- insert never touches (pv left null because the parent already exists); nulling it would

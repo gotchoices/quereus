@@ -605,6 +605,16 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 			);
 			return { node: ref, alias: baseColumn };
 		});
+		// σ-default projections (the constant-FD insert defaulting lifted from the join
+		// body's `where` — § Inner Join — Inserts, the multi-source analog of single-source
+		// § Selection). Each is a per-row **constant** — not an envelope column — so it rides
+		// the side's `ProjectNode` as a compiled literal (`buildExpression`); the base-table
+		// builder then coerces it to the column type and runs every constraint exactly as for
+		// a single-source appended-VALUES cell. Because the constant rides the projection (not
+		// the VALUES rows), this also covers a SELECT-source insert.
+		for (const sd of side.sigmaDefaults ?? []) {
+			projections.push({ node: buildExpression(ctx, sd.valueExpr) as ScalarPlanNode, alias: sd.baseColumn });
+		}
 		// preserveInputColumns=false → output is exactly the picked columns, fresh
 		// attribute ids, positionally aligned to the base op's target columns.
 		const source = new ProjectNode(ctx.scope, gated, projections, undefined, undefined, false);
@@ -612,7 +622,7 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 		const sideInsert: AST.InsertStmt = {
 			type: 'insert',
 			table: { type: 'identifier', name: side.schema.name, schema: side.schema.schemaName },
-			columns: [...side.targetColumns],
+			columns: [...side.targetColumns, ...(side.sigmaDefaults ?? []).map(sd => sd.baseColumn)],
 			source: { type: 'values', values: [] }, // placeholder — ignored when preBuiltSource is set
 			onConflict: stmt.onConflict,
 			contextValues: stmt.contextValues,

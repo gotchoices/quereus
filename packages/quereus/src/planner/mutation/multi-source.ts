@@ -6,6 +6,8 @@ import { resolveReferencedColumns } from '../../schema/table.js';
 import type { ColumnSchema } from '../../schema/column.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor, type RelationalComponentRef } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
+import type { SqlValue } from '../../common/types.js';
+import { sqlValuesEqual } from '../../util/comparison.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { analyzeBodyLineage } from './backward-body.js';
@@ -402,6 +404,20 @@ export interface MsInsertSide {
 	 * parent/anchor side, or a key shared only among always-active sides).
 	 */
 	readonly keyGate?: { readonly keyTargetIndex: number; readonly groups: readonly (readonly number[])[] };
+	/**
+	 * Per-side constant-FD insert-defaults lifted from the join body's σ (where-clause)
+	 * equality constants (§ Inner Join — Inserts; the multi-source analog of the single-
+	 * source § Selection rule). Each entry supplies an omitted σ-constrained base column its
+	 * σ value, so the inserted row satisfies the view predicate and is visible through the
+	 * view. Unlike the minted shared key these are NOT envelope-sourced — they are per-row
+	 * **constants**, so they carry their literal node directly and ride the side's
+	 * `ProjectNode` as a compiled constant (`buildExpression`), needing no envelope column.
+	 * Because the projection rides the side (not the VALUES rows), this also supports a
+	 * **SELECT-source** insert (a strict capability gain over the single-source path, which
+	 * defers σ-defaulting for SELECT sources). Empty/absent ⇒ no σ-constrained columns this
+	 * side. A σ over the side's shared join key is skipped (the EC thread owns that value).
+	 */
+	readonly sigmaDefaults?: readonly { readonly baseColumn: string; readonly valueExpr: AST.Expression }[];
 }
 
 /**
@@ -448,6 +464,14 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	const analysis = analyzeJoinView(ctx, view);
 	const { sides, outColumns } = analysis;
 	const keyColumns = extractJoinKeyColumns(view, analysis.sel, sides);
+
+	// Constant-FD insert-defaults from the join body's σ (where-clause): each `column =
+	// literal` conjunct, resolved to its owning join side, is lifted as a per-side
+	// insert-default (the side-aware analog of single-source `extractFilterConstants`). An
+	// omitted σ-constrained column is then supplied its σ constant so the inserted row
+	// satisfies the view predicate and is visible through the view; an explicit value that
+	// contradicts the constant rejects at plan time below (§ Inner Join — Inserts).
+	const filterConstants = extractJoinFilterConstants(analysis.sel.where, sides);
 
 	// Supplied view columns: the explicit list, or every base-routed (identity, rename,
 	// or outer-join null-extended) view output column. An `inverse`-profile column
@@ -631,6 +655,19 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	// preserved row reads back cleanly null-extended with no dangling FK. The *statically*
 	// absent case (a non-preserved side with NO supplied columns) needs no gate — it is
 	// inactive ⇒ no key is threaded at all.
+	// σ-constant contradiction reject (the supplied-and-contradicting case): when an
+	// explicit insert value lands on a σ-constrained base column AND contradicts its
+	// constant, reject `predicate-contradiction` at plan time — parity with single-source
+	// `checkContradiction`. Match a supplied entry by its resolved (sideIndex, baseColumn)
+	// so a *renamed* view column is covered (the supplied entry carries the base column,
+	// not the view spelling). Only literal VALUES cells are provable; a non-literal cell, a
+	// parameter, or a SELECT source is unprovable ⇒ skipped (proceed), exactly as single-
+	// source. The user supplies the value, so no σ-default is appended for it.
+	for (const fc of filterConstants) {
+		const idx = supplied.findIndex(s => s.sideIndex === fc.sideIndex && s.baseColumn !== undefined && s.baseColumn.toLowerCase() === fc.baseColumn.toLowerCase());
+		if (idx >= 0) checkJoinFilterContradiction(stmt.source, idx, fc, view);
+	}
+
 	const specByIndex = new Map<number, MsInsertSide>();
 	for (const sideIndex of activeIndices) {
 		const side = sides[sideIndex];
@@ -650,8 +687,28 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 			envelopeIndices.push(idx);
 			if (!side.preserved) presenceGateIndices.push(idx);
 		});
-		assertNoMissingNotNull(view, side.schema, targetColumns);
-		specByIndex.set(sideIndex, { table: side.table, schema: side.schema, targetColumns, envelopeIndices, presenceGateIndices });
+		// σ-default routing (the not-supplied, owning-side-active case): a σ-constrained base
+		// column this side owns that the insert did NOT supply is defaulted to its σ constant
+		// — appended as a constant projection on the side (the builder compiles `valueExpr`),
+		// NOT an envelope column. The shared join key is skipped (`keyColumns[sideIndex]` — the
+		// EC/key thread owns that value; a σ on a join key is degenerate); a supplied column is
+		// skipped (the user's value wins, contradiction-checked above). The σ default is a
+		// per-row constant, never added to `presenceGateIndices`, so it never makes an
+		// otherwise-absent optional side "present". An inactive side reaches neither this loop
+		// nor a default (no base row to default into — the documented structural residual).
+		const sigmaDefaults: { baseColumn: string; valueExpr: AST.Expression }[] = [];
+		for (const fc of filterConstants) {
+			if (fc.sideIndex !== sideIndex) continue;
+			if (fc.baseColumn.toLowerCase() === keyColumns[sideIndex].toLowerCase()) continue;
+			if (supplied.some(s => s.sideIndex === sideIndex && s.baseColumn !== undefined && s.baseColumn.toLowerCase() === fc.baseColumn.toLowerCase())) continue;
+			if (sigmaDefaults.some(d => d.baseColumn.toLowerCase() === fc.baseColumn.toLowerCase())) continue;
+			sigmaDefaults.push({ baseColumn: fc.baseColumn, valueExpr: fc.valueExpr });
+		}
+		// A σ default legitimately covers a NOT-NULL-without-default base column (e.g. `where
+		// color='red'` covering a NOT NULL `color`), so fold the σ-default columns into the
+		// covered set BEFORE the NOT-NULL assertion.
+		assertNoMissingNotNull(view, side.schema, [...targetColumns, ...sigmaDefaults.map(d => d.baseColumn)]);
+		specByIndex.set(sideIndex, { table: side.table, schema: side.schema, targetColumns, envelopeIndices, presenceGateIndices, ...(sigmaDefaults.length > 0 ? { sigmaDefaults } : {}) });
 	}
 
 	// Per-row conditional key thread (the FK-dangling-key fix). With the key MINTED and
@@ -890,6 +947,76 @@ function extractJoinKeyColumns(view: MutableViewLike, sel: AST.SelectStmt, sides
 		}
 	}
 	return keyCols;
+}
+
+/**
+ * One base column pinned to a constant by the join body's σ (where-clause), resolved to
+ * its owning join side — the multi-source, side-aware analog of single-source
+ * `FilterConstant`.
+ */
+interface JoinFilterConstant {
+	readonly sideIndex: number;
+	/** The side's base column name in canonical (schema) case. */
+	readonly baseColumn: string;
+	/** The literal RHS node — cloned into the side projection at the build. */
+	readonly valueExpr: AST.Expression;
+	/** The folded literal value for the contradiction check; `undefined` ⇒ unprovable. */
+	readonly value: SqlValue | undefined;
+}
+
+/**
+ * Lift the join body's σ (`where`) `column = literal` equality conjuncts as per-side
+ * constant-FD insert-defaults — the side-aware analog of single-source
+ * `extractFilterConstants`. Each conjunct's column operand is resolved to its owning join
+ * side via {@link resolveColumnSide} (which handles alias-qualified `sv1.color` AND
+ * unqualified columns, returning `undefined` for ambiguous/unresolved — skipped
+ * conservatively, parity with {@link joinCorrelatesMutualFk}); the side's canonical base-
+ * column name is resolved via {@link columnByName}. Only a **literal** RHS is lifted (parity
+ * with single-source — a `where color = :p` parameter, or a `col = col` / non-equality
+ * conjunct, is not a constant-FD producer and is skipped). The σ-constrained column is
+ * frequently projected away (`color` is not a view output column), so re-scanning the AST
+ * — rather than reading the planned body's output attributes — is the established write-path
+ * pattern.
+ */
+function extractJoinFilterConstants(where: AST.Expression | undefined, sides: readonly JoinSide[]): JoinFilterConstant[] {
+	const out: JoinFilterConstant[] = [];
+	if (!where) return out;
+	for (const conj of flattenAnd(where)) {
+		if (conj.type !== 'binary' || conj.operator !== '=') continue;
+		const colSide = conj.left.type === 'column' ? conj.left : conj.right.type === 'column' ? conj.right : undefined;
+		const litSide = conj.left.type === 'literal' ? conj.left : conj.right.type === 'literal' ? conj.right : undefined;
+		if (!colSide || !litSide) continue;
+		const sideIndex = resolveColumnSide(colSide, sides);
+		if (sideIndex === undefined) continue; // ambiguous / unresolved — skip conservatively
+		const baseCol = columnByName(sides[sideIndex].schema, colSide.name);
+		const value = litSide.value instanceof Promise ? undefined : litSide.value;
+		out.push({ sideIndex, baseColumn: baseCol.name, valueExpr: litSide, value });
+	}
+	return out;
+}
+
+/**
+ * Reject an insert literal cell that contradicts a join-σ constant — the multi-source
+ * analog of single-source `checkContradiction`. Walks every VALUES row's `columnIndex`
+ * cell (the supplied entry's position in the envelope/VALUES tuple) and rejects
+ * `predicate-contradiction` when a literal cell ≠ the σ constant. A non-literal cell, a
+ * parameter, an unprovable constant (`fc.value === undefined`), or a non-VALUES (SELECT)
+ * source is skipped (unprovable ⇒ proceed).
+ */
+function checkJoinFilterContradiction(source: AST.QueryExpr, columnIndex: number, fc: JoinFilterConstant, view: MutableViewLike): void {
+	if (source.type !== 'values' || fc.value === undefined) return;
+	for (const row of source.values) {
+		const cell = row[columnIndex];
+		if (!cell || cell.type !== 'literal' || cell.value instanceof Promise) continue;
+		if (!sqlValuesEqual(cell.value, fc.value)) {
+			raiseMutationDiagnostic({
+				reason: 'predicate-contradiction',
+				column: fc.baseColumn,
+				table: view.name,
+				message: `insert into view '${view.name}' contradicts its selection predicate on column '${fc.baseColumn}'`,
+			});
+		}
+	}
 }
 
 /** Reject a not-null base column with no declared default that no envelope value covers. */
