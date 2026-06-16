@@ -45,6 +45,20 @@ interface RuntimeUpsertClause {
 }
 
 /**
+ * Returns true when the table's owning *module* natively emits data events.
+ * The gate must consult the MODULE, not the vtab instance: StoreModule exposes
+ * getEventEmitter only at the module level — its table instances do not — so an
+ * instance check spuriously reports "no native support" and the engine double-emits
+ * alongside the module's native emitter. Mirrors the schema-event gate in
+ * schema/manager.ts (emitAutoSchemaEventIfNeeded).
+ */
+function moduleHasNativeDataEvents(ctx: RuntimeContext, tableSchema: TableSchema): boolean {
+	const moduleName = tableSchema.vtabModuleName;
+	const moduleReg = moduleName ? ctx.db._getVtabModule(moduleName) : undefined;
+	return hasNativeEventSupport(moduleReg?.module);
+}
+
+/**
  * Emit an automatic data change event for modules without native event support.
  */
 function emitAutoDataEvent(
@@ -494,7 +508,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db._needsDataEvents() && !hasNativeEventSupport(vtab);
+		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
 		// Per-statement backing-connection cache: resolve each covering MV's backing
@@ -723,7 +737,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db._needsDataEvents() && !hasNativeEventSupport(vtab);
+		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
 		// Per-statement backing-connection cache + deferred full-rebuild set (see runInsert).
@@ -871,7 +885,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db._needsDataEvents() && !hasNativeEventSupport(vtab);
+		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
 		// Per-statement backing-connection cache + deferred full-rebuild set (see runInsert).
