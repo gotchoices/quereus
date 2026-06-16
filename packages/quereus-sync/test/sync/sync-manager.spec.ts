@@ -100,9 +100,31 @@ describe('SyncManager', () => {
       // ChangeSet.hlc is the transaction's max fact HLC.
       const maxOpSeq = Math.max(...sets[0].changes.map(c => c.hlc.opSeq));
       expect(sets[0].hlc.opSeq).to.equal(maxOpSeq);
+      // ChangeSet.siteId is the originating site (this manager), not a relay/random id.
+      expect(siteIdEquals(sets[0].siteId, manager.getSiteId())).to.be.true;
       // Stable across repeated extraction.
       const again = await manager.getChangesSince(peer);
       expect(again[0].transactionId).to.equal(sets[0].transactionId);
+    });
+
+    it('groups a single transaction spanning multiple tables into one ChangeSet', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      // One commit touching two different tables => one transaction, one base HLC.
+      source.commit({
+        data: [
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a'] },
+          { type: 'insert', schemaName: 'main', tableName: 'orders', key: [1], newRow: ['b'] },
+        ],
+      });
+      await flush();
+
+      const sets = await manager.getChangesSince(peer);
+      // Cross-table facts share the base HLC, so they group into ONE ChangeSet.
+      expect(sets).to.have.lengthOf(1);
+      expect(sets[0].changes).to.have.lengthOf(2);
+      expect(new Set(sets[0].changes.map(c => c.table))).to.deep.equal(new Set(['users', 'orders']));
     });
 
     it('never merges two separate transactions', async () => {
