@@ -1789,6 +1789,52 @@ describe('IsolationModule', () => {
 			expect(caps.isolation).to.be.true; // isolation guarantee layered on
 			expect(caps.savepoints).to.be.true;
 		});
+
+		it('mirrors createBacking presence — defined iff the underlying declares it', () => {
+			// `SchemaManager.createBackingTable` does `createBacking?() ?? create()`,
+			// so PRESENCE is the capability. The forward must be present iff the
+			// underlying declares it — exactly like getBackingHost, with which it must
+			// travel (one routes the MV backing into the durable store, the other
+			// resolves its host).
+			const withHook = new IsolationModule({ underlying: new (class extends MemoryTableModule {
+				async createBacking(callDb: any, tableSchema: any) { return super.create(callDb, tableSchema); }
+			})() });
+			expect(withHook.createBacking, 'present when underlying declares it').to.be.a('function');
+
+			const withoutHook = new IsolationModule({ underlying: { ...new MemoryTableModule(), createBacking: undefined } as any });
+			expect(withoutHook.createBacking, 'absent when underlying omits it').to.be.undefined;
+		});
+
+		it('routes MV backing creation through the underlying createBacking under isolation', async () => {
+			// End-to-end floor: register the wrapper as a real module and run an actual
+			// CREATE MATERIALIZED VIEW. createBackingTable must prefer the (forwarded)
+			// createBacking over create, and the (forwarded) getBackingHost must then
+			// resolve a real host so the fill (replaceContents) succeeds. A missing
+			// createBacking forward would silently fall back to the wrapper's generic
+			// create — an ordinary table the forwarded getBackingHost can't back.
+			const calls: string[] = [];
+			class BackingModule extends MemoryTableModule {
+				async createBacking(callDb: any, tableSchema: any) {
+					calls.push('createBacking');
+					return super.create(callDb, tableSchema);
+				}
+				override async create(callDb: any, tableSchema: any) {
+					calls.push('create');
+					return super.create(callDb, tableSchema);
+				}
+			}
+			const isolatedModule = new IsolationModule({ underlying: new BackingModule() });
+			db.registerModule('isolated', isolatedModule);
+
+			await db.exec('create table src (id integer primary key, v text) using isolated');
+			await db.exec("insert into src values (1, 'a')");
+			calls.length = 0; // clear setup creates
+
+			await db.exec('create materialized view mv using isolated as select id, v from src');
+
+			expect(calls).to.include('createBacking');
+			expect(calls).to.not.include('create');
+		});
 	});
 });
 

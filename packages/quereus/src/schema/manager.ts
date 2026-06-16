@@ -2648,10 +2648,14 @@ export class SchemaManager {
 	 * full {@link import('../common/datatype.js').ScalarType} fidelity that a
 	 * round-trip through SQL type strings would lose).
 	 *
-	 * Reuses the same internal sequence as {@link createTable} — `module.create`
-	 * → `finalizeCreatedTableSchema` → `addTable` → `table_added` notify — so the
-	 * backing table behaves like any other table. The supplied schema must carry
-	 * `vtabModule`/`vtabModuleName` (typically `memory`).
+	 * Reuses the same internal sequence as {@link createTable} —
+	 * `finalizeCreatedTableSchema` → `addTable` → `table_added` notify — so the
+	 * backing table behaves like any other table, except the instance is built via
+	 * the module's optional `createBacking` when present (`createBacking?() ??
+	 * create()`): a durable-backing module routes the backing into its durable
+	 * store there; modules without it fall through to `create` (today's behavior).
+	 * The supplied schema must carry `vtabModule`/`vtabModuleName` (typically
+	 * `memory`).
 	 */
 	async createBackingTable(tableSchema: TableSchema): Promise<TableSchema> {
 		const targetSchemaName = tableSchema.schemaName;

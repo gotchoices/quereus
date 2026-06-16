@@ -174,6 +174,24 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	getBackingHost?: (db: Database, schemaName: string, tableName: string) => BackingHost | undefined;
 
+	/**
+	 * Materialized-view backing-create capability forward
+	 * (`SchemaManager.createBackingTable` prefers `createBacking?() ?? create()`)
+	 * — assigned in the constructor ONLY when the underlying module implements it,
+	 * so method PRESENCE mirrors the underlying, exactly like {@link getBackingHost}.
+	 * The two MUST be forwarded together: this forward routes the MV backing into
+	 * the underlying's durable store via its `createBacking`, so the subsequent
+	 * (forwarded) {@link getBackingHost} resolves a real host. Without it, the
+	 * wrapper would have no `createBacking`, `createBackingTable` would fall back to
+	 * the wrapper's generic {@link create} (an ordinary underlying table), and the
+	 * forwarded `getBackingHost` would find no durable host for it. The body mirrors
+	 * {@link create} — wrap the underlying table in an `IsolatedTable` and record
+	 * underlying state — but builds the underlying via `createBacking`. Backing
+	 * writes are privileged and bypass the per-connection overlay (see
+	 * {@link getBackingHost}), so the empty-overlay wrapper is correct here too.
+	 */
+	createBacking?: (db: Database, tableSchema: TableSchema) => Promise<IsolatedTable>;
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
@@ -183,6 +201,16 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		if (underlyingGetBackingHost) {
 			this.getBackingHost = (db, schemaName, tableName) =>
 				underlyingGetBackingHost.call(this.underlying, db, schemaName, tableName);
+		}
+
+		const underlyingCreateBacking = this.underlying.createBacking;
+		if (underlyingCreateBacking) {
+			this.createBacking = async (db, tableSchema) => {
+				const underlyingTable = await underlyingCreateBacking.call(this.underlying, db, tableSchema);
+				const state: UnderlyingTableState = { underlyingTable };
+				this.setUnderlyingState(tableSchema.schemaName, tableSchema.name, state);
+				return new IsolatedTable(db, this, underlyingTable);
+			};
 		}
 	}
 
