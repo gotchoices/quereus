@@ -301,13 +301,17 @@ select [distinct | all] select_expr [, select_expr ...]
 +| [ except select_statement ]
 +| [ diff select_statement ]
 [ with schema schema_name [, schema_name...] ]
+[ with defaults (column = expr [, ...]) ]
+
+select_expr:
+  { * | table.* | expr [ [as] alias ] [ with inverse (column = expr [, ...]) ] }
 ```
 
 **Options:**
 - `with clause`: Common Table Expressions (CTEs) for temporary named result sets
 - `distinct`: Removes duplicate rows from the result set
 - `all`: Includes all rows (default behavior)
-- `select_expr`: Column expressions to be returned; `*` for all columns. A result column may carry an optional trailing `with inverse (column = expr, ...)` clause supplying authored write-back expressions for updatable-view write-through (see [§2.9](#29-updatable-views))
+- `select_expr`: Column expressions to be returned; `*` for all columns. A result column may carry a trailing `with inverse (...)` clause — a core-`select` extension supplying authored write-back expressions for updatable-view write-through (see [Result-column inverses](#result-column-inverses-with-inverse) below)
 - `from`: Tables, views, or subqueries to retrieve data from
 - `where`: Filters rows based on a condition
 - `group by`: Groups rows that have the same values
@@ -316,6 +320,7 @@ select [distinct | all] select_expr [, select_expr ...]
 - `limit/offset`: Restricts the number of rows returned
 - `union`/`intersect`/`except`/`diff`: Set operations combining two result sets
 - `with schema`: Specifies an ordered search path for resolving unqualified table names (see section 2.1.1)
+- `with defaults`: Trailing clause binding the whole query expression; declares per-column omitted-insert defaults for updatable-view write-through (see [Insert defaults](#insert-defaults-with-defaults) below)
 
 **Set operations:**
 - `union all`: Concatenation (bag semantics)
@@ -436,6 +441,68 @@ select not exists(
 select * from users, orders
 with schema sales, main;
 ```
+
+#### Result-column inverses (WITH INVERSE)
+
+A result column may carry a trailing `with inverse (column = expr, ...)` clause — a
+**core `select` extension**, not a view-only feature — that supplies authored write-back
+expressions for [updatable-view](#29-updatable-views) write-through. Each assignment names
+a base column of the FROM sources and gives the expression that computes it from the
+written view row, referenced through the mandatory `new.` qualifier:
+
+```sql
+-- target names the BASE column (code5); new.* names the OUTPUT column (code)
+select
+  case code5 when 'A1' then 'A' when 'A2' then 'A' end as code
+    with inverse (code5 = case new.code when 'A' then 'A1' end),
+  first || ' ' || last as full_name
+    with inverse (first = substr(new.full_name, 1, instr(new.full_name, ' ') - 1),
+                  last  = substr(new.full_name, instr(new.full_name, ' ') + 1))
+from people;
+```
+
+- Upgrades an otherwise **read-only computed column** to writable on both `update` and
+  `insert` (a registry-invertible column such as `v + 1` is writable on `update` only; the
+  authored inverse is the hook that also makes the column insertable).
+- Targets must be base columns of the FROM sources; every `new.*` reference must be an
+  output column of the select. Both are **validated at build time wherever the clause
+  appears**, so a typo fails loudly even when the relation is never written through.
+- Because the clause lives on the core `select`, it parses at every relation site — view
+  bodies, CTE bodies, subqueries-in-`from`, and lens bodies — and is **inert metadata
+  until the relation is an actual write target**.
+
+See [View Updateability § Authored inverses](view-updateability.md#authored-inverses-with-inverse)
+for the law treatment (PutGet / GetPut) and the per-shape consumption.
+
+#### Insert defaults (WITH DEFAULTS)
+
+A query expression may carry a trailing `with defaults (column = expr, ...)` clause — bound
+to the **whole compound**, after `order by` / `limit` and before any DDL-level `with tags`
+— declaring per-column **omitted-insert defaults** for [updatable-view](#29-updatable-views)
+write-through. Like `with inverse`, it is a clause of the **core select**, not a view-only
+construct:
+
+```sql
+create view NewUsers(uid, label) as
+  select id, name from Users
+  with defaults (created = epoch_ms('now'));
+
+insert into NewUsers (uid, label) values (7, 'Bob');   -- created defaults to epoch_ms('now')
+```
+
+- Each entry names a base column the view projects away (the dominant case) or a
+  `base`-lineage view column, and supplies a **self-contained** expression (literals,
+  function calls, subqueries — it cannot reference the inserted row's columns). At
+  write-through it fills a still-omitted column *after* the user value / equality-predicate
+  constant / EC sources and *ahead of* the base column's declared `default`.
+- Column names must be distinct (a duplicate is a parse error); the target is resolved —
+  and a typo rejected — at **write time**, not create time.
+- It parses wherever a select parses and is **inert where no write path consumes it** — a
+  bare top-level `select … with defaults (…)` runs and ignores the clause; only a view or
+  CTE-name INSERT target fires it. It is the **only** insert-default surface (the former
+  `insert defaults (…)` spelling and the `quereus.update.default_for.*` tag are both removed).
+
+See [View Updateability § View defaults](view-updateability.md#view-defaults).
 
 #### 2.1.1 Schema Search Path (WITH SCHEMA)
 

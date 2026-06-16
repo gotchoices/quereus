@@ -511,6 +511,94 @@ for (const flavor of EMIT_FLAVORS) {
 			expect(events).to.have.length(0);
 		});
 
+		// ── replaceContents (create-fill / refresh) deltas ──────────────────────
+		// The fill path now diffs `rows` against the COMMITTED before-image and
+		// publishes one DataChangeEvent per genuine insert/update/delete, suppressing
+		// byte-identical keys — so cold/static derived rows reach never-upgrading old
+		// peers at deploy, while a value-identical re-fill stays event-free. The host
+		// is called directly (no engine txn wraps it), so the coordinator is not in a
+		// transaction and each queueEvent emits immediately into the captured `events`.
+
+		it('replaceContents fresh-fill on an empty backing publishes one insert per row (cold rows reach old peers)', async () => {
+			// A distinct, UNSEEDED replicate backing: every fill row is an insert, the
+			// headline migration case (a derived row filled at deploy, never edited again).
+			await db.exec('create table cold (a integer, b integer, v text, primary key (a, b)) using store with tags ("quereus.sync.replicate" = true)');
+			events.length = 0;
+			const host = storeModule.getBackingHost!(db, 'main', 'cold')!;
+
+			await host.replaceContents([[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'insert', key: [1, 1], oldRow: undefined, newRow: [1, 1, 'a'] },
+				{ type: 'insert', key: [1, 2], oldRow: undefined, newRow: [1, 2, 'b'] },
+				{ type: 'insert', key: [2, 1], oldRow: undefined, newRow: [2, 1, 'c'] },
+			]);
+			expect(events.every(e => !e.remote)).to.equal(true);
+		});
+
+		it('replaceContents identical re-fill publishes nothing (storm-suppression contract)', async () => {
+			await setup(true);
+			const host = resolveHost();
+			// Re-fill with the EXACT committed contents — what an independently-upgraded
+			// peer re-deriving the same fill computes. Diffs to zero deltas, emits nothing.
+			await host.replaceContents([[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
+			expect(events).to.have.length(0);
+		});
+
+		it('replaceContents publishes only the genuine partial diff; identical paired rows publish nothing', async () => {
+			await setup(true);
+			const host = resolveHost();
+			await host.replaceContents([[1, 1, 'a'], [1, 2, 'B'], [3, 3, 'n']]);
+			// (1,1) identical → skipped; (1,2) changed → update; (3,3) new → insert;
+			// (2,1) absent from the fill → delete (deletes after upserts, in old-key order).
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'update', key: [1, 2], oldRow: [1, 2, 'b'], newRow: [1, 2, 'B'] },
+				{ type: 'insert', key: [3, 3], oldRow: undefined, newRow: [3, 3, 'n'] },
+				{ type: 'delete', key: [2, 1], oldRow: [2, 1, 'c'], newRow: undefined },
+			]);
+		});
+
+		it('replaceContents refresh to empty publishes a delete per old row (the inverse cold path)', async () => {
+			await setup(true);
+			const host = resolveHost();
+			await host.replaceContents([]);
+			// Every old row tombstones, in ascending PK order.
+			expect(events.map(shape)).to.deep.equal([
+				{ type: 'delete', key: [1, 1], oldRow: [1, 1, 'a'], newRow: undefined },
+				{ type: 'delete', key: [1, 2], oldRow: [1, 2, 'b'], newRow: undefined },
+				{ type: 'delete', key: [2, 1], oldRow: [2, 1, 'c'], newRow: undefined },
+			]);
+			expect(await collect(host.scanEffective(host.connect(), {}))).to.deep.equal([]);
+		});
+
+		it('replaceContents on a non-replicating backing publishes nothing (default-path regression guard)', async () => {
+			await setup(false);
+			const host = resolveHost();
+			await host.replaceContents([[5, 1, 'x'], [6, 1, 'y']]);
+			expect(events).to.have.length(0);
+			// …and the storage swap still happened (the streaming direct-batch path).
+			expect(await collect(host.scanEffective(host.connect(), {}))).to.deep.equal(
+				[[5, 1, 'x'], [6, 1, 'y']]);
+		});
+
+		it('replaceContents duplicate PK throws before any event, leaving committed contents untorn', async () => {
+			await setup(true);
+			const host = resolveHost();
+			try {
+				await host.replaceContents(
+					[[7, 1, 'x'], [7, 1, 'y']],
+					() => new QuereusError('not a set', StatusCode.CONSTRAINT),
+				);
+				expect.fail('expected the onDuplicateKey error');
+			} catch (e) {
+				expect(e).to.be.instanceOf(QuereusError);
+				expect((e as QuereusError).message).to.contain('not a set');
+			}
+			// No write, no event — and the committed contents are intact.
+			expect(events).to.have.length(0);
+			expect(await collect(host.scanEffective(host.connect(), {}))).to.deep.equal(
+				[[1, 1, 'a'], [1, 2, 'b'], [2, 1, 'c']]);
+		});
+
 		it('without the tag, maintenance emits no events (default off, no regression)', async () => {
 			await setup(false);
 			const host = resolveHost();
@@ -668,3 +756,63 @@ for (const flavor of EMIT_FLAVORS) {
 		});
 	});
 }
+
+/**
+ * `replaceContents` (create-fill / refresh) delta publication under a DESC / NOCASE
+ * leading PK on a replicate-opted-in backing. Keys compare by ENCODED data-key bytes
+ * (folding per-column key collation), so a case-only key match with byte-different
+ * value resolves to an `update` that re-keys the stored bytes — never an insert+delete
+ * — exactly like the `replace-all` maintenance arm; a byte-identical paired row skips.
+ */
+describe('backing-host quereus.sync.replicate replaceContents: DESC / NOCASE leading PK', () => {
+	let db: Database;
+	let provider: KVStoreProvider;
+	let emitter: StoreEventEmitter;
+	let storeModule: BackingHostModule;
+	let events: DataChangeEvent[];
+
+	const shape = (e: DataChangeEvent) => ({ type: e.type, key: e.key, oldRow: e.oldRow, newRow: e.newRow });
+
+	beforeEach(async () => {
+		db = new Database();
+		provider = createProvider();
+		emitter = new StoreEventEmitter();
+		storeModule = createIsolatedStoreModule({ provider, eventEmitter: emitter });
+		db.registerModule('store', storeModule);
+		events = [];
+		emitter.onDataChange(e => events.push(e));
+		await db.exec('create table p (name text, k integer, v text, primary key (name desc, k)) using store with tags ("quereus.sync.replicate" = true)');
+		await db.exec("insert into p values ('a', 1, 'a1'), ('a', 2, 'a2'), ('b', 1, 'b1')");
+		events.length = 0;
+	});
+	afterEach(async () => {
+		await db.close();
+		await provider.closeAll();
+	});
+
+	function resolveHost(): BackingHost {
+		const host = storeModule.getBackingHost!(db, 'main', 'p');
+		expect(host).to.not.be.undefined;
+		return host!;
+	}
+
+	it('a collation-equal / byte-different fill row re-keys (update, not insert+delete); byte-identical rows skip', async () => {
+		const host = resolveHost();
+		// 'A' NOCASE-matches the stored key 'a' (same encoded data key) but the value
+		// compare is byte-faithful, so ('a',1) re-keys to ['A',1,'a1'] as an update.
+		// ('a',2) and ('b',1) are byte-identical → skipped (no event).
+		await host.replaceContents([['A', 1, 'a1'], ['a', 2, 'a2'], ['b', 1, 'b1']]);
+		expect(events.map(shape)).to.deep.equal([
+			{ type: 'update', key: ['A', 1], oldRow: ['a', 1, 'a1'], newRow: ['A', 1, 'a1'] },
+		]);
+		// The re-keyed bytes show; full scan follows physical key order (name DESC, k ASC).
+		expect(await collect(host.scanEffective(host.connect(), {}))).to.deep.equal(
+			[['b', 1, 'b1'], ['A', 1, 'a1'], ['a', 2, 'a2']]);
+	});
+
+	it('a re-fill of the exact committed bytes publishes nothing (byte-faithful suppression)', async () => {
+		const host = resolveHost();
+		await host.replaceContents([['a', 1, 'a1'], ['a', 2, 'a2'], ['b', 1, 'b1']]);
+		expect(events).to.have.length(0);
+	});
+});

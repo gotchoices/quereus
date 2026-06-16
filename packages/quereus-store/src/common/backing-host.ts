@@ -44,8 +44,13 @@
  * ordinary table write. The value-identical-upsert suppression contract means a
  * re-derivation that changes nothing emits no change and hence no event, so the
  * echo loop closes itself (docs/migration.md § Synced vs. local derived tables).
- * Create-fill / refresh (`replaceContents`) stays event-free regardless — it has
- * no suppression, so publishing it would storm the change log.
+ * Create-fill / refresh (`replaceContents`) on a replicate-opted-in backing
+ * publishes the **minimal keyed diff against the committed contents** — so a
+ * value-identical re-fill emits nothing (the same suppression the point-op and
+ * `replace-all` arms have): N upgraded peers that each re-derive the same fill
+ * diff to zero deltas, only the first author of a cold row publishes it. A
+ * non-replicating backing stays event-free and byte-identical (its streaming
+ * direct-batch path is untouched).
  *
  * ## No secondary structures
  *
@@ -305,19 +310,43 @@ export class StoreBackingHost implements BackingHost {
 	 *
 	 * Duplicate encoded data keys among `rows` are detected BEFORE any write, so a
 	 * thrown `onDuplicateKey()` (the MV "must be a set" gate) leaves the committed
-	 * contents untorn. The clear + rewrite then rides ONE provider batch (deletes
-	 * of displaced old keys, then puts), so a provider with atomic batches gives
-	 * concurrent readers pre- or post-swap state, never partial. Routed through
-	 * the table's `openDataStore()` so the lazy first-access `saveTableDDL` fires
-	 * — the catalog write a freshly created `using store` backing relies on to
-	 * survive reopen. Stats reset to the exact new count.
+	 * contents untorn — and, on a replicating backing, queues no events. The clear
+	 * + rewrite then rides ONE provider batch (deletes of displaced old keys, then
+	 * puts), so a provider with atomic batches gives concurrent readers pre- or
+	 * post-swap state, never partial. Routed through the table's `openDataStore()`
+	 * so the lazy first-access `saveTableDDL` fires — the catalog write a freshly
+	 * created `using store` backing relies on to survive reopen. Stats reset to the
+	 * exact new count.
+	 *
+	 * Replication seam (opt-in only): when this backing carries
+	 * `quereus.sync.replicate = true`, the bulk path additionally diffs `rows`
+	 * against the COMMITTED before-image and queues ONE `DataChangeEvent` per
+	 * genuine insert / update / delete — and NOTHING for a byte-faithful-identical
+	 * key, exactly like {@link applyReplaceAll}. That restores suppression to the
+	 * fill path: a value-identical re-derivation (the same fill computed by another
+	 * upgraded peer) diffs to zero deltas and emits nothing, so only the first
+	 * author of a cold row publishes it (so it reaches never-upgrading old peers
+	 * that store this backing opaquely). The coordinator is NOT in a transaction at
+	 * the emit (committed at the top, or never began), so `queueEvent` emits
+	 * immediately into the store emitter; when the engine drives this mid-
+	 * transaction (create-fill / refresh under `db._ensureTransaction()`) the
+	 * emitter is batching, so the deltas flush as one grouped change-set at the
+	 * engine commit — the same place `applyMaintenance`'s events land.
+	 *
+	 * A non-replicating backing keeps the original streaming direct-batch path
+	 * verbatim (no old-value deserialization, no delta list) — byte-for-byte the
+	 * prior behavior, zero added cost for the common local-derivation case.
 	 */
 	async replaceContents(rows: readonly Row[], onDuplicateKey?: () => QuereusError): Promise<void> {
 		if (this.coordinator.isInTransaction()) {
 			await this.coordinator.commit();
 		}
 
-		const entries = new Map<string, { key: Uint8Array; value: Uint8Array }>();
+		// Build the duplicate-checked entry set FIRST, before any write or event, so a
+		// thrown onDuplicateKey leaves the committed contents untorn AND (replicating
+		// path) queues nothing. Carry the deserialized `row` so the event `newRow` is
+		// available without a re-deserialize on the emit pass.
+		const entries = new Map<string, { key: Uint8Array; value: Uint8Array; row: Row }>();
 		for (const row of rows) {
 			const key = this.table.encodeDataKey(this.extractPk(row));
 			const hex = bytesToHex(key);
@@ -329,23 +358,71 @@ export class StoreBackingHost implements BackingHost {
 						StatusCode.CONSTRAINT,
 					);
 			}
-			entries.set(hex, { key, value: serializeRow(row) });
+			entries.set(hex, { key, value: serializeRow(row), row });
 		}
 
 		const store = await this.table.openDataStore();
-		const batch = store.batch();
-		for await (const entry of store.iterate(buildFullScanBounds())) {
-			// Keys being rewritten are skipped (the put below covers them), so the
-			// batch carries no delete/put order dependence on the same key.
-			if (!entries.has(bytesToHex(entry.key))) {
-				batch.delete(entry.key);
+
+		if (!this.replicates) {
+			// Default (local-derivation) path: stream the committed contents, delete every
+			// key not in `entries`, put all entries. Byte-for-byte the prior behavior.
+			const batch = store.batch();
+			for await (const entry of store.iterate(buildFullScanBounds())) {
+				// Keys being rewritten are skipped (the put below covers them), so the
+				// batch carries no delete/put order dependence on the same key.
+				if (!entries.has(bytesToHex(entry.key))) {
+					batch.delete(entry.key);
+				}
 			}
+			for (const { key, value } of entries.values()) {
+				batch.put(key, value);
+			}
+			await batch.write();
+			await this.table.resetStats(rows.length);
+			return;
 		}
-		for (const { key, value } of entries.values()) {
-			batch.put(key, value);
+
+		// Replicating path: snapshot the committed before-image and diff. The
+		// coordinator was committed above (or never began), so `store.iterate` yields
+		// exactly the committed contents (no pending state to merge) — the right
+		// before-image for the diff. Map insertion order = scan order = ascending key
+		// order, so the delete pass below emits in old-key order, mirroring applyReplaceAll.
+		const oldByKey = new Map<string, { key: Uint8Array; row: Row }>();
+		for await (const entry of store.iterate(buildFullScanBounds())) {
+			oldByKey.set(bytesToHex(entry.key), { key: entry.key, row: deserializeRow(entry.value) });
+		}
+
+		const batch = store.batch();
+		const deltas: BackingRowChange[] = [];
+		for (const { key, value, row } of entries.values()) {            // rows order
+			const existing = oldByKey.get(bytesToHex(key));
+			if (!existing) {
+				batch.put(key, value);
+				deltas.push({ op: 'insert', newRow: row });
+			} else if (!rowsValueIdentical(existing.row, row)) {
+				batch.put(key, value);
+				deltas.push({ op: 'update', oldRow: existing.row, newRow: row });
+			}
+			// else: byte-identical at this key — a true no-op. The put is skipped (the
+			// stored bytes are already identical — a non-observable write reduction) and
+			// no delta is emitted (the suppression contract). Byte-faithful like the
+			// point-op / replace-all arms: a collation-equal / byte-different paired row
+			// is an `update` that re-keys the stored bytes, never a skip.
+		}
+		for (const { key, row } of oldByKey.values()) {                  // old-key order
+			if (entries.has(bytesToHex(key))) continue;
+			batch.delete(key);
+			deltas.push({ op: 'delete', oldRow: row });
 		}
 		await batch.write();
 
+		// Durable-then-publish: queue events only after the batch is durable. Not in a
+		// transaction → each queueEvent emits immediately (batched into the engine's
+		// change-set when one is open, flushed at engine commit).
+		const schema = this.table.getSchema();
+		for (const delta of deltas) {
+			this.coordinator.queueEvent(this.toDataChangeEvent(schema, delta));
+		}
 		await this.table.resetStats(rows.length);
 	}
 
