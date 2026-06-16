@@ -667,6 +667,43 @@ describe('SyncManager', () => {
       expect(result.conflicts).to.equal(1);
       expect(result.applied).to.equal(0);
     });
+
+    it('dedupes the stale delete change-log entry when a newer tombstone is applied', async () => {
+      // Apply-path mirror of the write-path dedup: two increasing-HLC deletes for the
+      // same pk, applied in SEPARATE applyChanges calls (so the first tombstone is
+      // committed before the second resolves and sees it as `oldTombstone`). The older
+      // delete's change-log entry must be removed so at most one survives per pk with
+      // HLC equal to the current tombstone — otherwise the stale entry resolves to the
+      // later tombstone and re-attributes, the same scan-time hazard the write path fixes.
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const remoteSiteId = generateSiteId();
+      const now = Date.now();
+
+      const deleteAt = (wall: number, counter: number): ChangeSet => {
+        const hlc: HLC = { wallTime: BigInt(wall), counter, siteId: remoteSiteId, opSeq: 0 };
+        return {
+          siteId: remoteSiteId,
+          transactionId: `tx-${wall}`,
+          hlc,
+          changes: [{ type: 'delete', schema: 'main', table: 'users', pk: [1], hlc }],
+          schemaMigrations: [],
+        };
+      };
+
+      await manager.applyChanges([deleteAt(now, 1)]);
+      const result = await manager.applyChanges([deleteAt(now + 1000, 1)]);
+      expect(result.applied, 'the newer delete must be applied over the older tombstone').to.equal(1);
+
+      // A peer other than the originating site sees the deletes. If the stale d1 entry
+      // survived it would resolve to the d2 tombstone too, surfacing the pk[1] delete
+      // twice; exactly one proves the older entry was deduped.
+      const peer = generateSiteId();
+      const sets = await manager.getChangesSince(peer);
+      const deletes = sets.flatMap(s => s.changes).filter(c => c.type === 'delete' && JSON.stringify(c.pk) === '[1]');
+      expect(deletes, 'stale delete entry not deduped on the apply path').to.have.lengthOf(1);
+      expect(compareHLC(deletes[0].hlc, { wallTime: BigInt(now + 1000), counter: 1, siteId: remoteSiteId, opSeq: 0 }))
+        .to.equal(0);
+    });
   });
 
   describe('pruneTombstones', () => {
