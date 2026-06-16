@@ -1516,7 +1516,7 @@ export class SchemaManager {
 
 			// Emit auto schema event for modules without native event support
 			const moduleReg = tableSchema.vtabModuleName ? this.getModule(tableSchema.vtabModuleName) : undefined;
-			if (this.db.hasSchemaListeners() && !hasNativeEventSupport(moduleReg?.module)) {
+			if (this.db._needsSchemaEvents() && !hasNativeEventSupport(moduleReg?.module)) {
 				this.db._getEventEmitter().emitAutoSchemaEvent(tableSchema.vtabModuleName ?? 'memory', {
 					type: 'drop',
 					objectType: 'table',
@@ -2509,14 +2509,15 @@ export class SchemaManager {
 
 	/**
 	 * Emits an auto schema event for modules that don't have native event support,
-	 * if any schema listeners are registered.
+	 * if the engine needs schema events — i.e. any `onSchemaChange` or
+	 * `onTransactionCommit` listener is registered (see `Database._needsSchemaEvents`).
 	 */
 	private emitAutoSchemaEventIfNeeded(
 		moduleName: string | undefined,
 		event: VTableSchemaChangeEvent
 	): void {
 		const moduleReg = moduleName ? this.getModule(moduleName) : undefined;
-		if (this.db.hasSchemaListeners() && !hasNativeEventSupport(moduleReg?.module)) {
+		if (this.db._needsSchemaEvents() && !hasNativeEventSupport(moduleReg?.module)) {
 			this.db._getEventEmitter().emitAutoSchemaEvent(moduleName ?? 'memory', event);
 		}
 	}

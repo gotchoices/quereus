@@ -52,6 +52,7 @@ import {
 	type DatabaseDataChangeEvent,
 	type DatabaseSchemaChangeEvent,
 	type MaintenanceCollisionEvent,
+	type TransactionCommitBatch,
 	type DataChangeSubscriptionOptions,
 	type SchemaChangeSubscriptionOptions,
 } from './database-events.js';
@@ -807,6 +808,27 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
+	 * @internal Whether the engine must generate/collect data-change events for
+	 * this statement — true when any `onDataChange` OR `onTransactionCommit`
+	 * listener is registered. The DML executor's auto-event gate consults this so a
+	 * consumer subscribed only to the grouped transaction-commit channel still gets
+	 * data events collected.
+	 */
+	_needsDataEvents(): boolean {
+		return this.eventEmitter.needsDataEvents();
+	}
+
+	/**
+	 * @internal Whether the engine must generate/collect schema-change events —
+	 * true when any `onSchemaChange` OR `onTransactionCommit` listener is
+	 * registered. Companion to {@link _needsDataEvents}; consulted by the schema
+	 * manager's auto-event gate.
+	 */
+	_needsSchemaEvents(): boolean {
+		return this.eventEmitter.needsSchemaEvents();
+	}
+
+	/**
 	 * Subscribe to materialized-view key-coarsening **collision** events — the
 	 * operational complement to the create-time key-coarsening warning. A
 	 * {@link MaintenanceCollisionEvent} fires whenever row-time maintenance
@@ -840,6 +862,36 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	getMaterializedViewCollisionStats(): ReadonlyMap<string, number> {
 		this.checkOpen();
 		return this.eventEmitter.getMaterializedViewCollisionStats();
+	}
+
+	/**
+	 * Subscribe to grouped per-transaction commit batches — the authoritative
+	 * "one logical transaction = one group" boundary. A
+	 * {@link TransactionCommitBatch} fires **once** per committed transaction,
+	 * carrying every data and schema event of that transaction across **all**
+	 * tables, in flush order. Unlike the per-event {@link onDataChange} /
+	 * {@link onSchemaChange} channels (which this does not replace — it is purely
+	 * additive), a single subscription receives the whole transaction as one unit,
+	 * which is what a consumer grouping changes by transaction (e.g. assigning one
+	 * HLC per transaction) needs. Dropped on rollback; never fires for a
+	 * transaction that produced no data/schema events.
+	 *
+	 * @param listener Callback invoked once per committed transaction
+	 * @returns Unsubscribe function
+	 *
+	 * @example
+	 * ```typescript
+	 * const off = db.onTransactionCommit((batch) => {
+	 *   // All changes of one transaction, across all tables, in order.
+	 *   const local = batch.dataEvents.filter((e) => !e.remote);
+	 *   console.log(`committed ${local.length} local row changes, ` +
+	 *     `${batch.schemaEvents.length} schema changes`);
+	 * });
+	 * ```
+	 */
+	onTransactionCommit(listener: (batch: TransactionCommitBatch) => void): () => void {
+		this.checkOpen();
+		return this.eventEmitter.onTransactionCommit(listener);
 	}
 
 	/**

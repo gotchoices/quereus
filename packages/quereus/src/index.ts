@@ -46,6 +46,8 @@ export type {
 	DatabaseDataChangeEvent,
 	DatabaseSchemaChangeEvent,
 	MaintenanceCollisionEvent,
+	TransactionCommitBatch,
+	TransactionCommitListener,
 	DataChangeSubscriptionOptions,
 	SchemaChangeSubscriptionOptions,
 } from './core/database-events.js';

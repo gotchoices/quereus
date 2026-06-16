@@ -133,6 +133,46 @@ Changes are grouped by transaction. When syncing:
 - Applying changes is atomic per transaction
 - This preserves referential integrity across related writes
 
+**The grouping boundary is the engine, not the store.** The authoritative
+"one logical transaction = one group" anchor is the Quereus engine's
+`DatabaseEventEmitter` (`packages/quereus/src/core/database-events.ts`). It hooks
+every module's event emitter and **batches all data and schema events of the
+whole logical transaction** — `startBatch()` at `beginTransaction`,
+`flushBatch()` at `commitTransaction`, `discardBatch()` at `rollbackTransaction`
+(`database-transaction.ts`), with savepoint layers discarded on
+`ROLLBACK TO SAVEPOINT`. At the commit flush point the complete, ordered,
+multi-table fact set of exactly one transaction is known, so the engine exposes
+it as a single grouped delivery:
+
+```typescript
+interface TransactionCommitBatch {
+  readonly dataEvents: ReadonlyArray<DatabaseDataChangeEvent>;   // flush order
+  readonly schemaEvents: ReadonlyArray<DatabaseSchemaChangeEvent>;
+}
+
+// Fires once per committed transaction (across all tables); dropped on rollback;
+// never fires for a transaction that produced no data/schema events.
+const off = db.onTransactionCommit((batch) => { /* assign one HLC to the group */ });
+```
+
+This is the boundary the sync layer anchors an HLC to: one `onTransactionCommit`
+batch ⇒ one transaction ⇒ one HLC. It is purely additive — the per-event
+`onDataChange` / `onSchemaChange` channels are untouched.
+
+**Why not the per-table store coordinator.** The store has one
+`TransactionCoordinator` *per table* (`store-module.ts` `getCoordinator(tableKey)`),
+each with its own `StoreConnection` firing its own event burst. A cross-table
+transaction therefore commits several coordinators separately — so a
+per-coordinator (per-table) commit would split one logical transaction into
+multiple groups and assign it multiple HLCs, breaking the referential-integrity
+property above. Only the engine emitter sees the whole transaction at once.
+
+Ordering within a batch is the engine flush order: base batch then each savepoint
+layer in push order — i.e. per-module/per-table arrival order at commit, not
+global DML-interleave order (store coordinators buffer per-table and fire at their
+own commit). This is deterministic and replayable, which is what downstream
+`opSeq` assignment needs.
+
 ### Transactional Integrity During Sync
 
 When applying remote changes, the sync system must write to two separate stores:
@@ -647,6 +687,18 @@ type SyncState =
 ### Integration with Store Events
 
 The sync module subscribes to the store's `StoreEventEmitter` to capture mutations. A key design goal is that reactive events fire **exactly once** for each change, whether the change is local or remote.
+
+> **Transaction grouping is anchored at the engine, not here.** The per-table
+> `StoreEventEmitter` / `TransactionCoordinator` is the right seam for *capturing
+> individual mutations* (and the `remote` flag that decides whether to record
+> CRDT metadata), but it is **not** the transaction-grouping boundary: each table
+> has its own coordinator, so a cross-table commit fires several separate bursts.
+> The single boundary that sees one logical transaction whole — across every
+> table — is the engine's `DatabaseEventEmitter.onTransactionCommit` (see
+> § Transaction-Based Change Grouping). Group by transaction there; capture and
+> `remote`-filter per mutation here. The grouped batch preserves each event's
+> `remote` flag, so the consumer still filters remote-origin events out of the
+> group.
 
 #### Event Flow
 

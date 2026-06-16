@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
-import { Database, type DatabaseDataChangeEvent, type DatabaseSchemaChangeEvent } from '../src/index.js';
+import {
+	Database,
+	DatabaseEventEmitter,
+	type DatabaseDataChangeEvent,
+	type DatabaseSchemaChangeEvent,
+	type TransactionCommitBatch,
+} from '../src/index.js';
 
 describe('Database-Level Event System', () => {
 	let db: Database;
@@ -386,5 +392,178 @@ describe('Database-Level Event System', () => {
 			await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
 			await db.exec("INSERT INTO users VALUES (1, 'Alice')");
 		});
+	});
+});
+
+/**
+ * Grouped per-transaction commit delivery (`onTransactionCommit`) — the
+ * authoritative "one logical transaction = one group" boundary. Every committed
+ * transaction yields a single {@link TransactionCommitBatch} carrying all of its
+ * data + schema events across all tables, in flush order; rolled-back work and
+ * idle commits yield nothing. See `database-events.ts` and `docs/sync.md`
+ * § Transaction-Based Change Grouping.
+ *
+ * These tests subscribe ONLY to `onTransactionCommit` (no per-event listener) to
+ * prove the channel is standalone — the engine collects events whenever a
+ * transaction-commit listener is present, not only when an `onDataChange` /
+ * `onSchemaChange` listener is.
+ */
+describe('Transaction-Commit Grouping', () => {
+	let db: Database;
+	let batches: TransactionCommitBatch[];
+	let unsub: () => void;
+
+	beforeEach(() => {
+		db = new Database();
+		batches = [];
+		unsub = db.onTransactionCommit((batch) => batches.push(batch));
+	});
+
+	afterEach(async () => {
+		unsub?.();
+		await db.close();
+	});
+
+	it('groups a single-table multi-row autocommit INSERT into one batch', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		batches = []; // discard the create-table batch
+
+		await db.exec("insert into t values (1, 'a'), (2, 'b'), (3, 'c')");
+
+		assert.equal(batches.length, 1);
+		assert.equal(batches[0].dataEvents.length, 3);
+		assert.equal(batches[0].schemaEvents.length, 0);
+		assert.deepEqual(batches[0].dataEvents.map((e) => e.key), [[1], [2], [3]]);
+		assert.ok(batches[0].dataEvents.every((e) => e.type === 'insert' && e.tableName === 't'));
+	});
+
+	it('groups a multi-table explicit transaction into one batch in commit order', async () => {
+		await db.exec('create table t1 (id integer primary key, v text)');
+		await db.exec('create table t2 (id integer primary key, v text)');
+		batches = [];
+
+		await db.exec('begin');
+		await db.exec("insert into t1 values (1, 'a')");
+		await db.exec("insert into t2 values (2, 'b')");
+		assert.equal(batches.length, 0); // nothing until commit
+		await db.exec('commit');
+
+		assert.equal(batches.length, 1);
+		const { dataEvents, schemaEvents } = batches[0];
+		assert.equal(schemaEvents.length, 0);
+		assert.equal(dataEvents.length, 2);
+		assert.equal(dataEvents[0].tableName, 't1');
+		assert.equal(dataEvents[1].tableName, 't2');
+	});
+
+	it('carries both schema and data events of one DDL+DML transaction in the same batch', async () => {
+		await db.exec('begin');
+		await db.exec('create table c (id integer primary key, v text)');
+		await db.exec("insert into c values (1, 'x')");
+		await db.exec('commit');
+
+		assert.equal(batches.length, 1);
+		const { dataEvents, schemaEvents } = batches[0];
+		assert.equal(schemaEvents.length, 1);
+		assert.equal(schemaEvents[0].type, 'create');
+		assert.equal(schemaEvents[0].objectType, 'table');
+		assert.equal(schemaEvents[0].objectName, 'c');
+		assert.equal(dataEvents.length, 1);
+		assert.equal(dataEvents[0].type, 'insert');
+		assert.deepEqual(dataEvents[0].key, [1]);
+	});
+
+	it('fires no batch on rollback', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		batches = [];
+
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec('rollback');
+
+		assert.equal(batches.length, 0);
+	});
+
+	it('excludes a rolled-back savepoint layer from the committed batch', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		batches = [];
+
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec('savepoint sp1');
+		await db.exec("insert into t values (2, 'b')");
+		await db.exec('rollback to sp1');
+		await db.exec("insert into t values (3, 'c')");
+		await db.exec('commit');
+
+		assert.equal(batches.length, 1);
+		// Only the surviving writes (1 and 3); the rolled-back write (2) is excluded.
+		assert.deepEqual(batches[0].dataEvents.map((e) => e.key), [[1], [3]]);
+	});
+
+	it('fires no batch for an empty/idle commit', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		batches = [];
+
+		await db.exec('begin');
+		await db.exec('commit');
+
+		assert.equal(batches.length, 0);
+	});
+
+	it('still delivers per-event onDataChange alongside onTransactionCommit (additive)', async () => {
+		const perEvent: DatabaseDataChangeEvent[] = [];
+		const offData = db.onDataChange((e) => perEvent.push(e));
+		await db.exec('create table t (id integer primary key, v text)');
+		batches = [];
+
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec("insert into t values (2, 'b')");
+		await db.exec('commit');
+
+		// Per-event channel: one callback per row. Grouped channel: one batch.
+		assert.equal(perEvent.length, 2);
+		assert.equal(batches.length, 1);
+		assert.equal(batches[0].dataEvents.length, 2);
+		offData();
+	});
+
+	// The remote flag is set by the store/sync apply path, not by the in-memory
+	// engine, so this asserts the projection directly on the emitter: a batch must
+	// carry through each event's `remote` flag so a sync consumer can filter.
+	it('preserves the remote flag through the grouped projection', () => {
+		const emitter = new DatabaseEventEmitter();
+		const captured: TransactionCommitBatch[] = [];
+		emitter.onTransactionCommit((batch) => captured.push(batch));
+
+		emitter.startBatch();
+		emitter.emitAutoDataEvent('memory', {
+			type: 'insert', schemaName: 'main', tableName: 'users',
+			key: [1], newRow: [1, 'Alice'], remote: true,
+		});
+		emitter.emitAutoDataEvent('memory', {
+			type: 'insert', schemaName: 'main', tableName: 'users',
+			key: [2], newRow: [2, 'Bob'], remote: false,
+		});
+		emitter.flushBatch();
+
+		assert.equal(captured.length, 1);
+		assert.equal(captured[0].dataEvents.length, 2);
+		assert.equal(captured[0].dataEvents[0].remote, true);
+		assert.equal(captured[0].dataEvents[1].remote, false);
+	});
+
+	it('isolates a throwing transaction-commit listener from the others', async () => {
+		let goodCalled = false;
+		const offBad = db.onTransactionCommit(() => { throw new Error('boom'); });
+		const offGood = db.onTransactionCommit(() => { goodCalled = true; });
+
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec("insert into t values (1, 'a')");
+
+		assert.equal(goodCalled, true);
+		offBad();
+		offGood();
 	});
 });

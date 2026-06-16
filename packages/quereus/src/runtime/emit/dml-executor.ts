@@ -494,7 +494,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
+		const needsAutoEvents = ctx.db._needsDataEvents() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
 		// Per-statement backing-connection cache: resolve each covering MV's backing
@@ -723,7 +723,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
+		const needsAutoEvents = ctx.db._needsDataEvents() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
 		// Per-statement backing-connection cache + deferred full-rebuild set (see runInsert).
@@ -871,7 +871,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		await ctx.db._ensureTransaction();
 
 		const vtab = await getVTable(ctx, tableSchema);
-		const needsAutoEvents = ctx.db.hasDataListeners() && !hasNativeEventSupport(vtab);
+		const needsAutoEvents = ctx.db._needsDataEvents() && !hasNativeEventSupport(vtab);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
 
 		// Per-statement backing-connection cache + deferred full-rebuild set (see runInsert).

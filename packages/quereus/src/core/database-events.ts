@@ -102,9 +102,36 @@ export interface MaintenanceCollisionEvent {
 	remote?: boolean;
 }
 
+/**
+ * The complete, ordered fact set of one committed logical transaction, delivered
+ * as a single group on the {@link DatabaseEventEmitter.onTransactionCommit}
+ * channel. This is the authoritative "one transaction = one group" boundary the
+ * sync layer anchors an HLC to: it spans **all** tables touched by the
+ * transaction (every module's emitter feeds the same engine-level batch), so a
+ * cross-table commit is never split — unlike a per-table store coordinator, which
+ * commits each table separately. See `docs/sync.md` § Transaction-Based Change
+ * Grouping.
+ *
+ * Delivered once from `flushBatch()` (i.e. after a successful commit), never on
+ * rollback. The `dataEvents`/`schemaEvents` carry the same
+ * {@link DatabaseDataChangeEvent}/{@link DatabaseSchemaChangeEvent} shapes the
+ * per-event `onDataChange`/`onSchemaChange` channels deliver — `onTransactionCommit`
+ * is purely additive and does not replace them.
+ */
+export interface TransactionCommitBatch {
+	/** All data events of the committed transaction, in flush order (base batch
+	 *  then each savepoint layer, in push order — the same order `flushBatch`
+	 *  emits per-event). Per-module/per-table arrival order at commit, not global
+	 *  DML-interleave order; deterministic and replayable. */
+	readonly dataEvents: ReadonlyArray<DatabaseDataChangeEvent>;
+	/** All schema events of the committed transaction, in flush order. */
+	readonly schemaEvents: ReadonlyArray<DatabaseSchemaChangeEvent>;
+}
+
 export type DatabaseDataChangeListener = (event: DatabaseDataChangeEvent) => void;
 export type DatabaseSchemaChangeListener = (event: DatabaseSchemaChangeEvent) => void;
 export type MaintenanceCollisionListener = (event: MaintenanceCollisionEvent) => void;
+export type TransactionCommitListener = (batch: TransactionCommitBatch) => void;
 
 /**
  * Options for subscribing to data change events.
@@ -168,6 +195,7 @@ export class DatabaseEventEmitter {
 	private dataListeners = new Set<DatabaseDataChangeListener>();
 	private schemaListeners = new Set<DatabaseSchemaChangeListener>();
 	private collisionListeners = new Set<MaintenanceCollisionListener>();
+	private transactionCommitListeners = new Set<TransactionCommitListener>();
 	private maxListeners = DEFAULT_MAX_LISTENERS;
 
 	/** Batched events waiting for commit (base transaction level) */
@@ -287,6 +315,57 @@ export class DatabaseEventEmitter {
 	 */
 	hasCollisionListeners(): boolean {
 		return this.collisionListeners.size > 0;
+	}
+
+	/**
+	 * Subscribe to grouped per-transaction commit batches
+	 * ({@link TransactionCommitBatch}). Fired **once** per committed logical
+	 * transaction, after the per-event {@link onDataChange}/{@link onSchemaChange}
+	 * delivery, carrying every data and schema event of that transaction (across
+	 * all tables) in flush order — the authoritative grouping boundary for
+	 * "one transaction = one group". Never fires on rollback, and never fires for a
+	 * transaction that produced no data or schema events (an empty/idle commit).
+	 * This is additive: the per-event channels are untouched.
+	 * @param listener Callback invoked once per committed transaction
+	 * @returns Unsubscribe function
+	 */
+	onTransactionCommit(listener: TransactionCommitListener): () => void {
+		this.transactionCommitListeners.add(listener);
+		this.checkListenerCount('transaction-commit', this.transactionCommitListeners.size);
+		log('Added transaction-commit listener, total: %d', this.transactionCommitListeners.size);
+		return () => {
+			this.transactionCommitListeners.delete(listener);
+			log('Removed transaction-commit listener, total: %d', this.transactionCommitListeners.size);
+		};
+	}
+
+	/**
+	 * Check if there are any transaction-commit listeners registered.
+	 */
+	hasTransactionCommitListeners(): boolean {
+		return this.transactionCommitListeners.size > 0;
+	}
+
+	/**
+	 * Whether the engine must collect data-change events for delivery — true when
+	 * any per-event {@link onDataChange} listener OR any {@link onTransactionCommit}
+	 * listener is registered. A transaction-commit listener needs the grouped data
+	 * events, so the auto-event generation gate must open for it too even when no
+	 * per-event data listener is subscribed. Consulted by the DML executor's
+	 * auto-event gate (see `dml-executor.ts`).
+	 */
+	needsDataEvents(): boolean {
+		return this.dataListeners.size > 0 || this.transactionCommitListeners.size > 0;
+	}
+
+	/**
+	 * Whether the engine must collect schema-change events for delivery — true when
+	 * any per-event {@link onSchemaChange} listener OR any {@link onTransactionCommit}
+	 * listener is registered. Companion to {@link needsDataEvents}; consulted by the
+	 * schema manager's auto-event gate (see `schema/manager.ts`).
+	 */
+	needsSchemaEvents(): boolean {
+		return this.schemaListeners.size > 0 || this.transactionCommitListeners.size > 0;
 	}
 
 	/**
@@ -487,12 +566,14 @@ export class DatabaseEventEmitter {
 	}
 
 	/**
-	 * Emit a data event to all listeners.
+	 * Project a pending data event into the database-level {@link DatabaseDataChangeEvent}
+	 * shape delivered to listeners. The single source of truth for the projection,
+	 * reused by both the per-event {@link emitDataEvent} path and the grouped
+	 * {@link flushBatch} transaction-commit batch so listeners on either channel see
+	 * identical shapes.
 	 */
-	private emitDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
-		if (this.dataListeners.size === 0) return;
-
-		const dbEvent: DatabaseDataChangeEvent = {
+	private toDataChangeEvent(moduleName: string, event: VTableDataChangeEvent): DatabaseDataChangeEvent {
+		return {
 			type: event.type,
 			moduleName,
 			schemaName: event.schemaName,
@@ -503,6 +584,33 @@ export class DatabaseEventEmitter {
 			changedColumns: event.changedColumns,
 			remote: event.remote ?? false,
 		};
+	}
+
+	/**
+	 * Project a pending schema event into the database-level {@link DatabaseSchemaChangeEvent}
+	 * shape. Companion to {@link toDataChangeEvent}; same dual-use rationale.
+	 */
+	private toSchemaChangeEvent(moduleName: string, event: VTableSchemaChangeEvent): DatabaseSchemaChangeEvent {
+		return {
+			type: event.type,
+			objectType: event.objectType,
+			moduleName,
+			schemaName: event.schemaName,
+			objectName: event.objectName,
+			columnName: event.columnName,
+			oldColumnName: event.oldColumnName,
+			ddl: event.ddl,
+			remote: event.remote ?? false,
+		};
+	}
+
+	/**
+	 * Emit a data event to all listeners.
+	 */
+	private emitDataEvent(moduleName: string, event: VTableDataChangeEvent): void {
+		if (this.dataListeners.size === 0) return;
+
+		const dbEvent = this.toDataChangeEvent(moduleName, event);
 
 		log('Emitting data event: %s on %s.%s (module: %s, remote: %s)',
 			dbEvent.type, dbEvent.schemaName, dbEvent.tableName, moduleName, dbEvent.remote);
@@ -523,17 +631,7 @@ export class DatabaseEventEmitter {
 	private emitSchemaEvent(moduleName: string, event: VTableSchemaChangeEvent): void {
 		if (this.schemaListeners.size === 0) return;
 
-		const dbEvent: DatabaseSchemaChangeEvent = {
-			type: event.type,
-			objectType: event.objectType,
-			moduleName,
-			schemaName: event.schemaName,
-			objectName: event.objectName,
-			columnName: event.columnName,
-			oldColumnName: event.oldColumnName,
-			ddl: event.ddl,
-			remote: event.remote ?? false,
-		};
+		const dbEvent = this.toSchemaChangeEvent(moduleName, event);
 
 		log('Emitting schema event: %s %s %s (module: %s, remote: %s)',
 			dbEvent.type, dbEvent.objectType, dbEvent.objectName, moduleName, dbEvent.remote);
@@ -610,6 +708,38 @@ export class DatabaseEventEmitter {
 		// so the count reflects only committed collisions).
 		for (const event of allCollisionEvents) {
 			this.emitCollisionEvent(event);
+		}
+
+		// Finally, deliver the whole committed transaction as a single grouped
+		// batch on the additive onTransactionCommit channel. Built from the same
+		// allDataEvents/allSchemaEvents projections the per-event path used, so the
+		// shapes match. Skipped entirely when no listener is subscribed (avoid the
+		// per-commit allocation in the common no-subscriber case) or when the
+		// transaction produced no data/schema facts (an empty/idle commit, or one
+		// that produced only collisions — collisions keep their own channel).
+		if (this.transactionCommitListeners.size > 0 && (allDataEvents.length + allSchemaEvents.length) > 0) {
+			this.emitTransactionCommit({
+				dataEvents: allDataEvents.map(({ moduleName, event }) => this.toDataChangeEvent(moduleName, event)),
+				schemaEvents: allSchemaEvents.map(({ moduleName, event }) => this.toSchemaChangeEvent(moduleName, event)),
+			});
+		}
+	}
+
+	/**
+	 * Deliver one grouped {@link TransactionCommitBatch} to each transaction-commit
+	 * listener. A throwing listener is isolated so it cannot break delivery to the
+	 * others or the commit (mirrors {@link emitDataEvent}).
+	 */
+	private emitTransactionCommit(batch: TransactionCommitBatch): void {
+		log('Emitting transaction-commit batch: %d data events, %d schema events',
+			batch.dataEvents.length, batch.schemaEvents.length);
+
+		for (const listener of this.transactionCommitListeners) {
+			try {
+				listener(batch);
+			} catch (e) {
+				errorLog('Transaction-commit listener error: %O', e);
+			}
 		}
 	}
 
@@ -698,17 +828,19 @@ export class DatabaseEventEmitter {
 		const dataCount = this.dataListeners.size;
 		const schemaCount = this.schemaListeners.size;
 		const collisionCount = this.collisionListeners.size;
+		const txCommitCount = this.transactionCommitListeners.size;
 
-		if (dataCount > 0 || schemaCount > 0 || collisionCount > 0) {
+		if (dataCount > 0 || schemaCount > 0 || collisionCount > 0 || txCommitCount > 0) {
 			warnLog(
-				'removeAllListeners() called with %d data, %d schema, and %d collision listeners still registered — possible listener leak',
-				dataCount, schemaCount, collisionCount
+				'removeAllListeners() called with %d data, %d schema, %d collision, and %d transaction-commit listeners still registered — possible listener leak',
+				dataCount, schemaCount, collisionCount, txCommitCount
 			);
 		}
 
 		this.dataListeners.clear();
 		this.schemaListeners.clear();
 		this.collisionListeners.clear();
+		this.transactionCommitListeners.clear();
 		this.batchedDataEvents = [];
 		this.batchedSchemaEvents = [];
 		this.batchedCollisionEvents = [];
