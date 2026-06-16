@@ -434,4 +434,97 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 		expect(spies.seamCalls, 'incremental write ran the seam').to.equal(1);
 		expect(await collect(db, 'select v from mv order by v')).to.deep.equal([{ v: 'a' }, { v: 'b' }, { v: 'c' }]);
 	});
+
+	// A whole-batch throw (e.g. a commit-time global-assertion failure over the
+	// inbound batch) is distinct from the per-change `errors` shape: the adapter
+	// throws outright rather than collecting failures. Before the unified admission
+	// core, the snapshot/stream paths called `applyToStore` BARE, so such a throw
+	// propagated WITHOUT the `status:'error'` emit the wire path produces. The
+	// shared `applyDataToStore` seam now emits it exactly once on both paths.
+	describe('whole-batch throw surfaces status:error (unified admission core)', () => {
+		// applyToStore that throws outright on the data flush — independent of `db`.
+		const throwingApply: ApplyToStoreCallback = async (data, _schema, options) => {
+			// The bootstrapFinalize call carries no data — let it pass so the test
+			// only exercises the data-apply seam, never reaching finalize anyway.
+			if (options.bootstrapFinalize) return { dataChangesApplied: 0, schemaChangesApplied: 0, errors: [] };
+			if (data.length === 0) return { dataChangesApplied: 0, schemaChangesApplied: 0, errors: [] };
+			throw new Error('whole-batch boom');
+		};
+
+		const makeThrowingSyncManager = (kv: InMemoryKVStore, syncEvents: SyncEventEmitterImpl) =>
+			SyncManagerImpl.create(
+				kv, undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, throwingApply,
+				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
+			);
+
+		it('non-streamed applySnapshot whole-batch throw emits exactly one status:error, commits no metadata', async () => {
+			const kv = new InMemoryKVStore();
+			const syncEvents = new SyncEventEmitterImpl();
+			const states: SyncState[] = [];
+			syncEvents.onSyncStateChange(s => states.push(s));
+			const syncManager = await makeThrowingSyncManager(kv, syncEvents);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			const columnVersions = new Map<string, { hlc: HLC; value: SqlValue }>();
+			columnVersions.set('["r1"]:v', { hlc: remoteHLC.tick(), value: 'x' });
+			const snapshot: Snapshot = {
+				siteId: remoteSiteId,
+				hlc: remoteHLC.tick(),
+				tables: [{ schema: 'main', table: 't', rows: [], columnVersions }],
+				schemaMigrations: [],
+			};
+
+			let thrown: unknown;
+			try {
+				await syncManager.applySnapshot(snapshot);
+			} catch (e) {
+				thrown = e;
+			}
+			expect(String(thrown), 'whole-batch throw propagates').to.contain('whole-batch boom');
+
+			// Exactly one status:error, never synced (the wire-path invariant, now shared).
+			expect(states.filter(s => s.status === 'error'), 'exactly one error event').to.have.length(1);
+			expect(states.map(s => s.status), 'never reached synced').to.not.include('synced');
+
+			// Throw fired before the clear/rewrite phase → no column-version metadata committed.
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes), 'no CRDT metadata committed').to.have.length(0);
+		});
+
+		it('streamed applySnapshotStream whole-batch flush throw emits exactly one status:error, leaves checkpoint', async () => {
+			const kv = new InMemoryKVStore();
+			const syncEvents = new SyncEventEmitterImpl();
+			const states: SyncState[] = [];
+			syncEvents.onSyncStateChange(s => states.push(s));
+			const syncManager = await makeThrowingSyncManager(kv, syncEvents);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			const snapshotId = 'snap-wholebatch-throw-1';
+			const chunks: SnapshotChunk[] = [
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+				{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 1 },
+				{ type: 'column-versions', schema: 'main', table: 't', entries: [cvEntry(['r1'], 'v', remoteHLC.tick(), 'x')] },
+				{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 1 },
+				{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
+			];
+
+			let thrown: unknown;
+			try {
+				await syncManager.applySnapshotStream(toStream(chunks));
+			} catch (e) {
+				thrown = e;
+			}
+			expect(String(thrown), 'whole-batch flush throw propagates').to.contain('whole-batch boom');
+
+			expect(states.filter(s => s.status === 'error'), 'exactly one error event').to.have.length(1);
+			expect(states.map(s => s.status), 'never reached synced').to.not.include('synced');
+
+			// The footer flush throws before `batch.write()` → the accumulated
+			// column-version metadata is never committed (nothing to relay).
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes), 'no CRDT metadata committed').to.have.length(0);
+		});
+	});
 });

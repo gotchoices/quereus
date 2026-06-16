@@ -26,7 +26,7 @@ import type {
 	SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState, throwIfApplyErrors } from './sync-context.js';
+import { admitGroup } from './admission.js';
 
 /**
  * Get a full snapshot of all data and schema state.
@@ -157,82 +157,80 @@ export async function applySnapshot(
 		}
 	}
 
-	// PHASE 2: Apply data to store
-	if (ctx.applyToStore && (dataChangesToApply.length > 0 || schemaChangesToApply.length > 0)) {
-		// A full snapshot is a known-complete wholesale load: apply as a bootstrap
-		// (the adapter skips the engine seam — no per-row MV maintenance/watch
-		// capture), converged once by the finalize below.
-		const result = await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true, bootstrap: true });
-		// A per-change storage failure aborts before clearing/rewriting metadata,
-		// leaving prior CRDT state intact; the snapshot retries wholesale
-		// (idempotent on the store side).
-		throwIfApplyErrors(ctx, result);
-	}
+	// Admit the snapshot as one wholesale all-or-nothing unit: data first (PHASE 2,
+	// a bootstrap apply — the adapter skips the engine seam, converged once by the
+	// finalize below), then the wholesale metadata replace (PHASE 3), then the
+	// clock watermark. A data-apply failure aborts before clearing/rewriting
+	// metadata, leaving prior CRDT state intact; the snapshot retries wholesale
+	// (idempotent on the store side) and now also emits status:'error'.
+	await admitGroup(ctx, {
+		dataChanges: dataChangesToApply,
+		schemaChanges: schemaChangesToApply,
+		applyOptions: { remote: true, bootstrap: true },
+		commitMetadata: async () => {
+			// Clear existing CRDT metadata and apply new
+			const clearBatch = ctx.kv.batch();
 
-	// PHASE 3: Clear existing CRDT metadata and apply new
-	const clearBatch = ctx.kv.batch();
+			for await (const entry of ctx.kv.iterate(buildAllColumnVersionsScanBounds())) {
+				clearBatch.delete(entry.key);
+			}
+			for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
+				clearBatch.delete(entry.key);
+			}
+			for await (const entry of ctx.kv.iterate(buildAllChangeLogScanBounds())) {
+				clearBatch.delete(entry.key);
+			}
 
-	for await (const entry of ctx.kv.iterate(buildAllColumnVersionsScanBounds())) {
-		clearBatch.delete(entry.key);
-	}
-	for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
-		clearBatch.delete(entry.key);
-	}
-	for await (const entry of ctx.kv.iterate(buildAllChangeLogScanBounds())) {
-		clearBatch.delete(entry.key);
-	}
+			await clearBatch.write();
 
-	await clearBatch.write();
+			// Apply snapshot's column versions and rebuild change log
+			const applyBatch = ctx.kv.batch();
 
-	// Apply snapshot's column versions and rebuild change log
-	const applyBatch = ctx.kv.batch();
+			for (const tableSnapshot of snapshot.tables) {
+				for (const [versionKey, cvEntry] of tableSnapshot.columnVersions) {
+					const lastColon = versionKey.lastIndexOf(':');
+					if (lastColon === -1) continue;
 
-	for (const tableSnapshot of snapshot.tables) {
-		for (const [versionKey, cvEntry] of tableSnapshot.columnVersions) {
-			const lastColon = versionKey.lastIndexOf(':');
-			if (lastColon === -1) continue;
+					const rowKey = versionKey.slice(0, lastColon);
+					const column = versionKey.slice(lastColon + 1);
+					const pk = JSON.parse(rowKey) as SqlValue[];
 
-			const rowKey = versionKey.slice(0, lastColon);
-			const column = versionKey.slice(lastColon + 1);
-			const pk = JSON.parse(rowKey) as SqlValue[];
+					ctx.columnVersions.setColumnVersionBatch(
+						applyBatch,
+						tableSnapshot.schema,
+						tableSnapshot.table,
+						pk,
+						column,
+						{ hlc: cvEntry.hlc, value: cvEntry.value },
+					);
 
-			ctx.columnVersions.setColumnVersionBatch(
-				applyBatch,
-				tableSnapshot.schema,
-				tableSnapshot.table,
-				pk,
-				column,
-				{ hlc: cvEntry.hlc, value: cvEntry.value },
-			);
+					ctx.changeLog.recordColumnChangeBatch(
+						applyBatch,
+						cvEntry.hlc,
+						tableSnapshot.schema,
+						tableSnapshot.table,
+						pk,
+						column,
+					);
+				}
+			}
 
-			ctx.changeLog.recordColumnChangeBatch(
-				applyBatch,
-				cvEntry.hlc,
-				tableSnapshot.schema,
-				tableSnapshot.table,
-				pk,
-				column,
-			);
-		}
-	}
+			// Record schema migrations
+			for (const migration of snapshot.schemaMigrations) {
+				const schemaVersion = migration.schemaVersion ??
+					(await ctx.schemaMigrations.getCurrentVersion(migration.schema, migration.table)) + 1;
+				await ctx.schemaMigrations.recordMigration(migration.schema, migration.table, {
+					type: migration.type,
+					ddl: migration.ddl,
+					hlc: migration.hlc,
+					schemaVersion,
+				});
+			}
 
-	// Record schema migrations
-	for (const migration of snapshot.schemaMigrations) {
-		const schemaVersion = migration.schemaVersion ??
-			(await ctx.schemaMigrations.getCurrentVersion(migration.schema, migration.table)) + 1;
-		await ctx.schemaMigrations.recordMigration(migration.schema, migration.table, {
-			type: migration.type,
-			ddl: migration.ddl,
-			hlc: migration.hlc,
-			schemaVersion,
-		});
-	}
-
-	await applyBatch.write();
-
-	// Update HLC
-	ctx.hlcManager.receive(snapshot.hlc);
-	await persistHLCState(ctx);
+			await applyBatch.write();
+		},
+		watermarkHLC: snapshot.hlc,
+	});
 
 	// Converge the bootstrap: PHASE 2 deferred MV maintenance and watch capture
 	// (seam skipped), so converge every MV once and coarse-notify each

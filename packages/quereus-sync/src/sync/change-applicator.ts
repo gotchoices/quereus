@@ -7,20 +7,30 @@
  *   3. commitChangeMetadata — persist CRDT metadata
  */
 
-import { compareHLC } from '../clock/hlc.js';
+import { compareHLC, type HLC } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type {
 	ChangeSet,
 	Change,
 	ApplyResult,
-	ApplyToStoreResult,
 	DataChangeToApply,
 	SchemaChangeToApply,
 	SchemaMigration,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState, toError, throwIfApplyErrors } from './sync-context.js';
+import { admitGroup } from './admission.js';
+
+/** Maximum HLC across a batch of change sets (their commit boundaries), or undefined when empty. */
+function maxHLCFromChangeSets(changeSets: ChangeSet[]): HLC | undefined {
+	let max: HLC | undefined;
+	for (const changeSet of changeSets) {
+		if (!max || compareHLC(changeSet.hlc, max) > 0) {
+			max = changeSet.hlc;
+		}
+	}
+	return max;
+}
 
 /**
  * Result of resolving a single change (without writing metadata).
@@ -59,10 +69,10 @@ export async function applyChanges(
 		schemaVersion: number;
 	}> = [];
 
-	// PHASE 1: Resolve all changes (no writes yet)
+	// PHASE 1: Resolve all changes (no writes yet). The clock watermark is merged
+	// once after a successful admission (see admitGroup below), not per changeset —
+	// resolution reads stored versions via compareHLC, never the live clock.
 	for (const changeSet of changes) {
-		ctx.hlcManager.receive(changeSet.hlc);
-
 		// Process schema migrations first (DDL before DML)
 		for (const migration of changeSet.schemaMigrations) {
 			const schemaVersion = migration.schemaVersion ??
@@ -109,40 +119,33 @@ export async function applyChanges(
 		}
 	}
 
-	// PHASE 2: Apply data and schema changes to the store via callback
-	if (ctx.applyToStore && (dataChangesToApply.length > 0 || schemaChangesToApply.length > 0)) {
-		let result: ApplyToStoreResult;
-		try {
-			result = await ctx.applyToStore(dataChangesToApply, schemaChangesToApply, { remote: true });
-		} catch (error) {
-			// Emit error state so UI can react. CRDT metadata is NOT committed,
-			// allowing the same changes to be re-resolved on the next sync attempt.
-			ctx.syncEvents.emitSyncStateChange({
-				status: 'error',
-				error: toError(error),
-			});
-			throw error;
-		}
+	// Admit the whole resolved batch as one all-or-nothing unit: data first (PHASE
+	// 2), then CRDT metadata (PHASE 3), then the merged clock watermark — aborting
+	// with no metadata committed on any data-apply failure. The batch is admitted
+	// once (not per ChangeSet): the single per-peer lastSyncHLC watermark cannot
+	// express a partial commit, so selective commit is intentionally not done.
+	await admitGroup(ctx, {
+		dataChanges: dataChangesToApply,
+		schemaChanges: schemaChangesToApply,
+		applyOptions: { remote: true },
+		commitMetadata: async () => {
+			await commitChangeMetadata(ctx, resolvedDataChanges);
 
-		// Per-change storage failures (the adapter collects rather than throws)
-		// abort the apply identically to a whole-batch throw: no metadata is
-		// committed, so the whole batch re-resolves and re-applies idempotently
-		// on the next sync. See throwIfApplyErrors / docs/sync.md write-ordering.
-		throwIfApplyErrors(ctx, result);
-	}
-
-	// PHASE 3: Commit CRDT metadata
-	await commitChangeMetadata(ctx, resolvedDataChanges);
-
-	// Commit schema migration metadata
-	for (const { migration, schemaVersion } of pendingSchemaMigrations) {
-		await ctx.schemaMigrations.recordMigration(migration.schema, migration.table, {
-			type: migration.type,
-			ddl: migration.ddl,
-			hlc: migration.hlc,
-			schemaVersion,
-		});
-	}
+			// Commit schema migration metadata
+			for (const { migration, schemaVersion } of pendingSchemaMigrations) {
+				await ctx.schemaMigrations.recordMigration(migration.schema, migration.table, {
+					type: migration.type,
+					ddl: migration.ddl,
+					hlc: migration.hlc,
+					schemaVersion,
+				});
+			}
+		},
+		// Merging the batch max once is equivalent to receiving each changeset's
+		// HLC (receive is a monotonic max-merge); on a mid-batch abort the clock
+		// does not advance and the batch re-resolves next sync.
+		watermarkHLC: maxHLCFromChangeSets(changes),
+	});
 
 	// Emit remote change events
 	if (appliedChanges.length > 0) {
@@ -168,8 +171,6 @@ export async function applyChanges(
 			});
 		}
 	}
-
-	await persistHLCState(ctx);
 
 	return {
 		applied,

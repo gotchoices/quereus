@@ -324,13 +324,15 @@ The reverse order (metadata first) would be dangerous: if we crash after writing
 
 **Invariant — metadata follows a landed data write**: CRDT metadata must **not** be committed for any change whose data write did not land. This covers two failure shapes, handled identically:
 - **Whole-batch throw**: the `applyToStore` callback throws (e.g. a commit-time global-assertion failure over the inbound batch). The exception propagates; no metadata is committed.
-- **Per-change failure**: the store adapter does *not* throw on a single change's failure — it keeps applying the other tables (maximizing idempotent storage progress) and records each failure in `ApplyToStoreResult.errors`. The **consumer** (`change-applicator`, `snapshot`, `snapshot-stream` via the shared `throwIfApplyErrors` helper) treats any non-empty `errors` exactly like a whole-batch throw: it emits `status: 'error'` and throws **before** committing any metadata.
+- **Per-change failure**: the store adapter does *not* throw on a single change's failure — it keeps applying the other tables (maximizing idempotent storage progress) and records each failure in `ApplyToStoreResult.errors`. The **consumer** treats any non-empty `errors` exactly like a whole-batch throw: it emits `status: 'error'` and throws **before** committing any metadata.
 
-In both cases no metadata is committed, so the caller does not advance its per-peer `lastSyncHLC` watermark and the **whole batch re-resolves and re-applies on the next sync**. Re-application is idempotent: value-identical upserts are suppressed by the adapter, so converged rows do no redundant work and only the previously-failed change is genuinely retried. (A change that *always* fails blocks its whole batch forever — an accepted "poison batch" property of the throw path; detection/recovery is the host's.)
+**Unified admission core** (`admission.ts`): both failure shapes — and the data-first/metadata-second/abort-with-no-metadata ordering — are centralized in one seam so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a full group-atomic unit — data first, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The streaming snapshot (`snapshot-stream`) keeps its own checkpoint-based model (interleaved metadata/data flushes, resume on a saved checkpoint) but reuses `applyDataToStore` for each flush, so a whole-batch flush throw now emits the same `status: 'error'` event the other paths do.
 
-Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done: a batch spans multiple HLCs but peer re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent.
+In all cases no metadata is committed, so the caller does not advance its per-peer `lastSyncHLC` watermark and the **whole batch re-resolves and re-applies on the next sync**. Re-application is idempotent: value-identical upserts are suppressed by the adapter, so converged rows do no redundant work and only the previously-failed change is genuinely retried. (A change that *always* fails blocks its whole batch forever — an accepted "poison batch" property of the throw path; detection/recovery is the host's.)
 
-**Current Status**: ✓ The implementation writes data first (`applyToStore`), then metadata, and aborts with no metadata on any whole-batch throw or per-change `ApplyToStoreResult.errors`.
+Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done: a batch spans multiple HLCs but peer re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent. The wire batch is therefore admitted as **one** all-or-nothing `admitGroup` unit, not once per `ChangeSet`.
+
+**Current Status**: ✓ Data is written first (`applyToStore`), then metadata, aborting with no metadata on any whole-batch throw or per-change `ApplyToStoreResult.errors`. The unified admission core (`admitGroup` + `applyDataToStore`, `admission.ts`) centralizes this for the wire and non-streaming snapshot paths; the streaming path reuses the `applyDataToStore` seam for consistent error emission while keeping its checkpoint-based model.
 
 **Per-Table Batching**: Within each table, changes should be applied using `WriteBatch` for atomicity. The `TransactionCoordinator` in the Store module provides this capability.
 
@@ -1422,6 +1424,8 @@ This approach:
 - Handles user customizations naturally via CRDT semantics
 - Enables efficient delta sync on app updates (only new schema since last sync)
 - Works offline (seed is bundled with the app)
+
+Because the seed is applied through `applyChanges()`, it rides the wire path's group-atomic admission core (`admitGroup`, see [Transactional Integrity During Sync](#transactional-integrity-during-sync)) and inherits the same data-first/metadata-second/abort-with-no-metadata write-ordering guarantees with no seed-specific code.
 
 ### Architecture
 

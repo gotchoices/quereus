@@ -36,7 +36,8 @@ import type {
 	SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState, throwIfApplyErrors } from './sync-context.js';
+import { persistHLCState } from './sync-context.js';
+import { applyDataToStore } from './admission.js';
 
 /** Default chunk size for streaming snapshots. */
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
@@ -305,19 +306,17 @@ export async function applySnapshotStream(
 	const DATA_FLUSH_SIZE = 100;
 
 	const flushDataToStore = async (): Promise<void> => {
-		if (ctx.applyToStore && (pendingDataChanges.length > 0 || pendingSchemaChanges.length > 0)) {
-			// A streamed snapshot is a known-complete wholesale load: each flush is a
-			// bootstrap flush (the adapter skips the engine seam — no per-flush MV
-			// maintenance, no per-row watch capture), converged once by the footer's
-			// `bootstrapFinalize` below.
-			const result = await ctx.applyToStore(pendingDataChanges, pendingSchemaChanges, { remote: true, bootstrap: true });
-			// A per-change storage failure aborts the stream mid-flight, before the
-			// footer emits `status: 'synced'` / clears the checkpoint — so the
-			// checkpoint stays in place and the transfer resumes/retries.
-			throwIfApplyErrors(ctx, result);
-			pendingDataChanges = [];
-			pendingSchemaChanges = [];
-		}
+		// A streamed snapshot is a known-complete wholesale load: each flush is a
+		// bootstrap flush (the adapter skips the engine seam — no per-flush MV
+		// maintenance, no per-row watch capture), converged once by the footer's
+		// `bootstrapFinalize` below. Streaming keeps its checkpoint-based model but
+		// reuses the shared data-apply seam: a whole-batch throw OR a per-change
+		// storage failure emits `status:'error'` and aborts the stream mid-flight,
+		// before the footer emits `status:'synced'` / clears the checkpoint — so the
+		// checkpoint stays in place and the transfer resumes/retries.
+		await applyDataToStore(ctx, pendingDataChanges, pendingSchemaChanges, { remote: true, bootstrap: true });
+		pendingDataChanges = [];
+		pendingSchemaChanges = [];
 	};
 
 	// Process chunks
