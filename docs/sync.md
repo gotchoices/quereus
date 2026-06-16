@@ -326,7 +326,7 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 |--------|---------|--------|
 | `cv:{schema}.{table}:{pk}:{col}` | Column version | `{hlc, value}` |
 | `tb:{schema}.{table}:{pk}` | Tombstone | `{hlc}` |
-| `tx:{txId}` | Transaction record | `{changes[], hlc, committed}` |
+| `tx:{txId}` | *Reserved — not persisted.* The transaction id is **derived** from the base HLC (see *Deterministic transaction id*), so no transaction record is written. The `tx:` prefix and `buildTransactionKey` remain reserved for a future durable txn log. | — |
 | `ps:{siteId}` | Peer sync state | `{lastSyncHlc}` |
 | `sm:{schema}.{table}:{version}` | Schema migration | `{ddl, hlc}` |
 | `si:` | Site identity | `{siteId, createdAt}` |
