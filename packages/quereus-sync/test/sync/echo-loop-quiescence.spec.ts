@@ -225,6 +225,42 @@ describe('echo-loop quiescence across two synced peers', () => {
 		expect(localMvEvents, 'no local mv event during ingest (suppressed re-derivation)').to.have.length(0);
 	});
 
+	it('negative control: relaying ONLY the source change makes B re-derive locally (proves suppression is real, not absence of maintenance)', async () => {
+		// The quiescence assertions above prove a NEGATIVE — no local mv event. That
+		// proof is only meaningful if B's seam re-derivation actually FIRES (and is
+		// then suppressed). Were store-backed MV maintenance ever to stop running on
+		// external ingest, every quiescence test would still pass green while silently
+		// becoming vacuous. This control pins the machinery live: relay ONLY A's src
+		// change (drop the relayed mv row), so B has nothing pre-committed to match —
+		// its re-derivation MUST write the mv row and emit a LOCAL event, recording a
+		// B-origin echo. That echo is exactly the ping-pong the full-relay tests prove
+		// is suppressed.
+		const bEvents: DataChangeEvent[] = [];
+		B.events.onDataChange(e => bEvents.push(e));
+
+		await A.db.exec("insert into src values (1, 'x')");
+
+		const sets = await A.manager.getChangesSince(B.manager.getSiteId());
+		const srcOnly = sets.map(cs => ({
+			...cs,
+			schemaMigrations: [],
+			changes: cs.changes.filter(c => (c as { table: string }).table === 'src'),
+		}));
+		await B.manager.applyChanges(srcOnly);
+
+		// B re-derived the mv row from src alone → it converges...
+		expect(await collect(B.db, 'select id, v from mv')).to.deep.equal([{ id: 1, v: 'x' }]);
+		// ...and the un-suppressed re-derivation fired a LOCAL (non-remote) mv event,
+		// which the sync layer logged as a B-origin echo.
+		const localMvEvents = bEvents.filter(e => e.tableName === 'mv' && !e.remote);
+		expect(localMvEvents.length, 'B re-derived mv locally from src alone').to.be.greaterThan(0);
+		const bEcho = await changesFor(B, A.manager.getSiteId());
+		expect(
+			bEcho.some(c => (c as { table: string }).table === 'mv'),
+			'B logged a B-origin mv echo (the ping-pong the quiescence tests prove is suppressed)',
+		).to.equal(true);
+	});
+
 	it('B→A round-trip: the reverse relay carries nothing and adds no spurious change on A', async () => {
 		await A.db.exec("insert into src values (1, 'x')");
 		await relay(A, B); // B converged + quiescent (asserted above).
