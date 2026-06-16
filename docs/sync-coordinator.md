@@ -298,6 +298,8 @@ interface CoordinatorConfig {
 | `SYNC_CORS_ORIGIN` | CORS origin(s), comma-separated |
 | `SYNC_AUTH_MODE` | Authentication mode |
 | `SYNC_AUTH_TOKENS` | Comma-separated token whitelist |
+| `SYNC_RETENTION_HORIZON_MS` | Retention horizon in ms (changes older than this are not guaranteed deliverable; default 30 days) |
+| `SYNC_BATCH_SIZE` | Maximum changes per sync batch |
 | `DEBUG` | Debug logging namespaces |
 
 ### CLI Usage
