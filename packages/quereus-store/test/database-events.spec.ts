@@ -132,6 +132,18 @@ describe('Database-level events: store-backed DML single-emit', () => {
 		}
 	});
 
+	it('multi-row insert emits exactly N onDataChange events (no per-row doubling)', async () => {
+		const events: DatabaseDataChangeEvent[] = [];
+		const unsub = db.onDataChange(e => events.push(e));
+		try {
+			await db.exec("insert into t values (1, 'a'), (2, 'b'), (3, 'c')");
+			assert.equal(events.length, 3, `expected 3 data events for 3 rows, got ${events.length}`);
+			assert.deepEqual(events.map(e => e.type), ['insert', 'insert', 'insert']);
+		} finally {
+			unsub();
+		}
+	});
+
 	it('memory table in the same DB still gets its auto-emitted event (single)', async () => {
 		await db.exec('create table m (id integer primary key, v text)');
 		const events: DatabaseDataChangeEvent[] = [];
