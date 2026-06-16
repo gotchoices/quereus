@@ -29,6 +29,7 @@ import { TombstoneStore, deserializeTombstone } from '../metadata/tombstones.js'
 import { PeerStateStore } from '../metadata/peer-state.js';
 import { SchemaMigrationStore, deserializeMigration } from '../metadata/schema-migration.js';
 import { ChangeLogStore, type ChangeLogEntry } from '../metadata/change-log.js';
+import { QuarantineStore } from '../metadata/quarantine.js';
 import {
 	SYNC_KEY_PREFIX,
 	buildAllColumnVersionsScanBounds,
@@ -52,6 +53,7 @@ import type {
 	SnapshotChunk,
 	SnapshotProgress,
 	ApplyToStoreCallback,
+	UnknownTableDisposition,
 } from './protocol.js';
 import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
@@ -123,9 +125,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	private readonly peerStates: PeerStateStore;
 	readonly changeLog: ChangeLogStore;
 	readonly schemaMigrations: SchemaMigrationStore;
+	readonly quarantine: QuarantineStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 	private readonly getTableSchema?: GetTableSchemaCallback;
+
+	// Cumulative unknown-table disposition counters (in-memory, observe-only —
+	// mirrors the engine's materialized-view collision stats).
+	private unknownTableIgnored = 0;
+	private unknownTableQuarantined = 0;
+	private readonly unknownTableByTable = new Map<string, number>();
 
 	private constructor(
 		kv: KVStore,
@@ -146,6 +155,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.peerStates = new PeerStateStore(kv);
 		this.changeLog = new ChangeLogStore(kv);
 		this.schemaMigrations = new SchemaMigrationStore(kv);
+		this.quarantine = new QuarantineStore(kv);
 	}
 
 	/**
@@ -223,6 +233,43 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	getCurrentHLC(): HLC {
 		return this.hlcManager.now();
+	}
+
+	/**
+	 * Basis-membership oracle for unknown-table detection. `getTableSchema(s,t)
+	 * === undefined` ⇒ the table is outside the local basis. When no oracle was
+	 * provided (e.g. a relay-only coordinator), detection is inert: every table
+	 * reports in-basis and the store adapter's defensive throw governs.
+	 */
+	isTableInBasis(schema: string, table: string): boolean {
+		return this.getTableSchema ? this.getTableSchema(schema, table) !== undefined : true;
+	}
+
+	/**
+	 * Accumulate unknown-table disposition stats (called by the apply path after a
+	 * diverted group is successfully admitted).
+	 */
+	recordUnknownTable(
+		disposition: UnknownTableDisposition,
+		schema: string,
+		table: string,
+		changeCount: number,
+	): void {
+		if (disposition === 'quarantine') {
+			this.unknownTableQuarantined += changeCount;
+		} else {
+			this.unknownTableIgnored += changeCount;
+		}
+		const key = `${schema}.${table}`;
+		this.unknownTableByTable.set(key, (this.unknownTableByTable.get(key) ?? 0) + changeCount);
+	}
+
+	getUnknownTableStats(): { ignored: number; quarantined: number; byTable: Map<string, number> } {
+		return {
+			ignored: this.unknownTableIgnored,
+			quarantined: this.unknownTableQuarantined,
+			byTable: new Map(this.unknownTableByTable),
+		};
 	}
 
 	// ============================================================================
@@ -759,6 +806,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		await batch.write();
 		return count;
+	}
+
+	/**
+	 * GC quarantined out-of-basis straggler changes past the retention horizon —
+	 * the quarantine sibling of {@link pruneTombstones}, keyed off the same
+	 * `retentionHorizonMs`. A held change older than the horizon was already
+	 * outside the delivery guarantee.
+	 */
+	async pruneQuarantine(): Promise<number> {
+		const cutoff = Date.now() - this.config.retentionHorizonMs;
+		return this.quarantine.pruneOlderThan(cutoff);
 	}
 
 	getEventEmitter(): SyncEventEmitterImpl {

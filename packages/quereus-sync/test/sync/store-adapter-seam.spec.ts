@@ -11,7 +11,7 @@
  */
 
 import { expect } from 'chai';
-import { Database, type ChangeScope, type SqlValue, type WatchEvent } from '@quereus/quereus';
+import { Database, type ChangeScope, type SqlValue, type TableSchema, type WatchEvent } from '@quereus/quereus';
 import {
 	StoreModule,
 	StoreEventEmitter,

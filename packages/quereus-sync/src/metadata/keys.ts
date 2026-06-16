@@ -10,6 +10,7 @@
  *   si: - Site identity
  *   hc: - HLC clock state
  *   cl: - Change log (HLC-indexed for efficient delta queries)
+ *   qt: - Quarantine (held out-of-basis straggler changes)
  */
 
 import type { SqlValue } from '@quereus/quereus';
@@ -28,6 +29,7 @@ export const SYNC_KEY_PREFIX = {
   SITE_IDENTITY: encoder.encode('si:'),
   HLC_STATE: encoder.encode('hc:'),
   CHANGE_LOG: encoder.encode('cl:'),
+  QUARANTINE: encoder.encode('qt:'),
 } as const;
 
 /** Separator between key components. */
@@ -494,4 +496,67 @@ export function parseChangeLogKey(key: Uint8Array): {
       return null;
     }
   }
+}
+
+/**
+ * Build a quarantine key for a held out-of-basis straggler change.
+ * Format: qt:{schema}.{table}: + hlc_bytes(30) + type_byte(1) + :{pk_json}[:{column}]
+ *
+ * Unlike the change log (`cl:`), the table prefix comes BEFORE the HLC so the
+ * range scans by `(schema, table)` for operator inspection. The HLC + type + pk
+ * (+ column) suffix make the key idempotent: re-applying the same straggler
+ * change (same HLC) overwrites its own entry rather than accumulating. Reuses
+ * {@link serializeHLCForKey} / {@link encodePK} for parity with the change-log
+ * encoding.
+ *
+ * The value (not the key) carries the serialized change verbatim, so quarantine
+ * keys are written and pruned but never parsed back.
+ */
+export function buildQuarantineKey(
+  schemaName: string,
+  tableName: string,
+  hlc: HLC,
+  entryType: ChangeLogEntryType,
+  pk: SqlValue[],
+  column?: string
+): Uint8Array {
+  const prefixBytes = encoder.encode(`qt:${schemaName}.${tableName}${SEPARATOR}`);
+  const hlcBytes = serializeHLCForKey(hlc);
+  const typeByte = entryType === 'column' ? 0x01 : 0x02;
+  const suffix = column
+    ? `${SEPARATOR}${encodePK(pk)}${SEPARATOR}${column}`
+    : `${SEPARATOR}${encodePK(pk)}`;
+  const suffixBytes = encoder.encode(suffix);
+
+  const key = new Uint8Array(prefixBytes.length + 30 + 1 + suffixBytes.length);
+  let offset = 0;
+  key.set(prefixBytes, offset); offset += prefixBytes.length;
+  key.set(hlcBytes, offset); offset += 30;
+  key[offset] = typeByte; offset += 1;
+  key.set(suffixBytes, offset);
+  return key;
+}
+
+/**
+ * Build scan bounds over quarantine entries.
+ * - both `schemaName` and `tableName`: a single table's held changes.
+ * - `schemaName` only: all held changes in that schema.
+ * - neither: every quarantine entry (the GC sweep).
+ */
+export function buildQuarantineScanBounds(
+  schemaName?: string,
+  tableName?: string
+): { gte: Uint8Array; lt: Uint8Array } {
+  if (schemaName !== undefined && tableName !== undefined) {
+    const prefix = encoder.encode(`qt:${schemaName}.${tableName}${SEPARATOR}`);
+    return { gte: prefix, lt: incrementLastByte(prefix) };
+  }
+  if (schemaName !== undefined) {
+    const prefix = encoder.encode(`qt:${schemaName}.`);
+    return { gte: prefix, lt: incrementLastByte(prefix) };
+  }
+  return {
+    gte: SYNC_KEY_PREFIX.QUARANTINE,
+    lt: incrementLastByte(SYNC_KEY_PREFIX.QUARANTINE),
+  };
 }

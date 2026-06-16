@@ -103,6 +103,27 @@ export interface SyncManager {
    */
   pruneTombstones(): Promise<number>;
 
+  /**
+   * Prune quarantined out-of-basis straggler changes older than the retention
+   * horizon. A held change past the horizon was already outside the delivery
+   * guarantee. Call from the same periodic maintenance path as
+   * {@link pruneTombstones}. Returns the number of entries pruned.
+   */
+  pruneQuarantine(): Promise<number>;
+
+  /**
+   * Cumulative unknown-table disposition stats since process start.
+   *
+   * `ignored` / `quarantined` count diverted changes by disposition; `byTable`
+   * counts diverted changes per `schema.table`. Mirrors the engine's
+   * `getMaterializedViewCollisionStats()` pattern (observe-only, in-memory).
+   */
+  getUnknownTableStats(): {
+    ignored: number;
+    quarantined: number;
+    byTable: Map<string, number>;
+  };
+
   // ============================================================================
   // Streaming Snapshot API
   // ============================================================================

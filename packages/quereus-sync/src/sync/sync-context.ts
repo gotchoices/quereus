@@ -12,7 +12,8 @@ import type { ColumnVersionStore } from '../metadata/column-version.js';
 import type { TombstoneStore } from '../metadata/tombstones.js';
 import type { ChangeLogStore } from '../metadata/change-log.js';
 import type { SchemaMigrationStore } from '../metadata/schema-migration.js';
-import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult } from './protocol.js';
+import type { QuarantineStore } from '../metadata/quarantine.js';
+import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
 import { SYNC_KEY_PREFIX } from '../metadata/keys.js';
 
@@ -30,11 +31,32 @@ export interface SyncContext {
 	readonly tombstones: TombstoneStore;
 	readonly changeLog: ChangeLogStore;
 	readonly schemaMigrations: SchemaMigrationStore;
+	readonly quarantine: QuarantineStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 
 	getSiteId(): SiteId;
 	getCurrentHLC(): HLC;
+
+	/**
+	 * Whether `(schema, table)` is in the local basis. Backed by the
+	 * `getTableSchema` oracle; when no oracle was provided detection is inert and
+	 * this returns `true` for every table (the store adapter's defensive throw
+	 * remains the fallback for genuinely-retired tables).
+	 */
+	isTableInBasis(schema: string, table: string): boolean;
+
+	/**
+	 * Record cumulative unknown-table disposition stats (surfaced via
+	 * `SyncManager.getUnknownTableStats`). Telemetry-only; called once per
+	 * diverted `(schema, table)` group after successful admission.
+	 */
+	recordUnknownTable(
+		disposition: UnknownTableDisposition,
+		schema: string,
+		table: string,
+		changeCount: number,
+	): void;
 }
 
 /**

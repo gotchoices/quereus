@@ -131,6 +131,14 @@ export interface ApplyResult {
   transactions: number;
   /** Changes rejected by server-side validation hooks */
   rejected?: ApplyRejection[];
+  /**
+   * Changes diverted because they referenced a table outside the local basis
+   * (an out-of-basis straggler delta). Omitted when none were diverted. The
+   * disposition (`ignore` / `quarantine`) is governed by
+   * {@link SyncConfig.unknownTableDisposition}; see also the `onUnknownTable`
+   * event and `getUnknownTableStats()`.
+   */
+  unknownTable?: number;
 }
 
 /**
@@ -392,6 +400,28 @@ export type ConflictResolution = 'local' | 'remote';
 export type ConflictResolver = (ctx: ConflictContext) => ConflictResolution;
 
 // ============================================================================
+// Unknown-table disposition
+// ============================================================================
+
+/**
+ * What the apply path does with inbound changes for a table outside the local
+ * basis (a straggler delta referencing a table this receiver no longer has —
+ * see `docs/migration.md` § 4 Contract).
+ *
+ * - `ignore` — drop the diverted changes (telemetry still fires). The deliberate
+ *   opt-out for deployments that do not want to retain post-retirement straggler
+ *   traffic; the write loss is intentional and observable, not silent.
+ * - `quarantine` (default) — durably hold the diverted changes for manual / late
+ *   processing. No write loss, operator-inspectable, and bounded: quarantine
+ *   entries GC at the retention horizon like tombstones.
+ *
+ * The `store-and-forward` (relay) disposition is parked in the backlog ticket
+ * `sync-unknown-table-store-and-forward`; it needs outbound `getChangesSince`
+ * integration and is not required for write-loss protection.
+ */
+export type UnknownTableDisposition = 'ignore' | 'quarantine';
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
@@ -433,6 +463,18 @@ export interface SyncConfig {
    * passed to this function for every conflicting column write.
    */
   conflictResolver?: ConflictResolver;
+
+  /**
+   * What to do with inbound changes that reference a table outside the local
+   * basis (an out-of-basis straggler delta — see {@link UnknownTableDisposition}
+   * and `docs/migration.md` § 4 Contract). Default: `quarantine` (durably hold
+   * to prevent silent write loss). Telemetry (`onUnknownTable` + the cumulative
+   * counter) fires regardless of disposition.
+   *
+   * Detection requires a basis oracle (`getTableSchema`); when absent, detection
+   * is inert and the store adapter's defensive throw remains the fallback.
+   */
+  unknownTableDisposition: UnknownTableDisposition;
 }
 
 /**
@@ -442,5 +484,6 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,  // 30 days
   allowResurrection: false,
   batchSize: 1000,
+  unknownTableDisposition: 'quarantine',
 };
 

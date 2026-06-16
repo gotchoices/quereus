@@ -8,7 +8,7 @@
 import type { SqlValue } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
-import type { Change } from './protocol.js';
+import type { Change, UnknownTableDisposition } from './protocol.js';
 
 // ============================================================================
 // Event Types
@@ -63,6 +63,26 @@ export interface ConflictEvent {
 }
 
 /**
+ * Fired when inbound changes reference a table outside the local basis (an
+ * out-of-basis straggler delta). Always emitted, regardless of disposition, so
+ * an operator sees straggler traffic even when it is being dropped.
+ */
+export interface UnknownTableEvent {
+  /** Schema of the unknown table. */
+  readonly schema: string;
+  /** Name of the unknown table. */
+  readonly table: string;
+  /** Configured disposition applied to the diverted changes. */
+  readonly disposition: UnknownTableDisposition;
+  /** Number of changes diverted for this table in this apply. */
+  readonly changeCount: number;
+  /** Straggler origin (the changeset's site id). */
+  readonly siteId: SiteId;
+  /** Max HLC among the diverted changes for this table. */
+  readonly latestHLC: HLC;
+}
+
+/**
  * Sync connection state.
  */
 export type SyncState =
@@ -108,6 +128,13 @@ export interface SyncEventEmitter {
    * Fired when a conflict is resolved (via LWW or a custom resolver).
    */
   onConflictResolved(listener: (event: ConflictEvent) => void): Unsubscribe;
+
+  /**
+   * Subscribe to unknown-table events.
+   * Fired when inbound changes reference a table outside the local basis,
+   * regardless of the configured disposition.
+   */
+  onUnknownTable(listener: (event: UnknownTableEvent) => void): Unsubscribe;
 }
 
 // ============================================================================
@@ -122,6 +149,7 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   private localChangeListeners = new Set<(event: LocalChangeEvent) => void>();
   private syncStateListeners = new Set<(state: SyncState) => void>();
   private conflictListeners = new Set<(event: ConflictEvent) => void>();
+  private unknownTableListeners = new Set<(event: UnknownTableEvent) => void>();
 
   onRemoteChange(listener: (event: RemoteChangeEvent) => void): Unsubscribe {
     this.remoteChangeListeners.add(listener);
@@ -141,6 +169,11 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   onConflictResolved(listener: (event: ConflictEvent) => void): Unsubscribe {
     this.conflictListeners.add(listener);
     return () => this.conflictListeners.delete(listener);
+  }
+
+  onUnknownTable(listener: (event: UnknownTableEvent) => void): Unsubscribe {
+    this.unknownTableListeners.add(listener);
+    return () => this.unknownTableListeners.delete(listener);
   }
 
   // Internal emit methods
@@ -165,6 +198,12 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
 
   emitConflictResolved(event: ConflictEvent): void {
     for (const listener of this.conflictListeners) {
+      listener(event);
+    }
+  }
+
+  emitUnknownTable(event: UnknownTableEvent): void {
+    for (const listener of this.unknownTableListeners) {
       listener(event);
     }
   }

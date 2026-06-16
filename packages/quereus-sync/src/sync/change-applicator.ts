@@ -41,12 +41,59 @@ export interface ResolvedChange {
 }
 
 /**
+ * Diverted out-of-basis straggler changes for one `(schema, table)`, accumulated
+ * across the batch before disposition (quarantine / ignore) and telemetry.
+ */
+interface UnknownTableGroup {
+	schema: string;
+	table: string;
+	/** Straggler origin: the changeset siteId that first referenced this table. */
+	siteId: SiteId;
+	changes: Change[];
+}
+
+/** Stable `schema.table` map key for batch deltas and diversion groups. */
+function tableKey(schema: string, table: string): string {
+	return `${schema}.${table}`;
+}
+
+/**
+ * In-batch table delta from the batch's schema migrations: `create_table` adds a
+ * table, `drop_table` removes one. Detection runs at Phase 1 (before any DDL
+ * executes in Phase 2), so a referenced table is "known" if it is in the current
+ * basis OR created by this batch, AND not dropped by this batch. Computed over the
+ * WHOLE batch because admission applies all schema changes before all data.
+ */
+function computeBatchTableDelta(changes: ChangeSet[]): { created: Set<string>; dropped: Set<string> } {
+	const created = new Set<string>();
+	const dropped = new Set<string>();
+	for (const changeSet of changes) {
+		for (const migration of changeSet.schemaMigrations) {
+			const key = tableKey(migration.schema, migration.table);
+			if (migration.type === 'create_table') {
+				created.add(key);
+			} else if (migration.type === 'drop_table') {
+				dropped.add(key);
+			}
+		}
+	}
+	return { created, dropped };
+}
+
+/**
  * Apply change sets from a remote peer.
  *
  * Three-phase process:
- *   1. Resolve all changes (no writes)
+ *   1. Resolve all changes (no writes); divert out-of-basis straggler changes
  *   2. Apply data to store via callback
- *   3. Commit CRDT metadata
+ *   3. Commit CRDT metadata (+ durable quarantine of diverted changes)
+ *
+ * Unknown-table disposition: a change referencing a table outside the local basis
+ * (a retired-table straggler delta — see `docs/migration.md` § 4 Contract) is
+ * **diverted** during resolution — never resolved, applied, or recorded as CRDT
+ * metadata, so the change log stays clean (no survivor-HLC pollution). Diverted
+ * changes are quarantined (durably, idempotently) or ignored per
+ * {@link SyncConfig.unknownTableDisposition}, and telemetered either way.
  */
 export async function applyChanges(
 	ctx: SyncContext,
@@ -64,6 +111,11 @@ export async function applyChanges(
 		migration: SchemaMigration;
 		schemaVersion: number;
 	}> = [];
+	// Out-of-basis straggler changes diverted out of the resolve/apply/metadata
+	// path, grouped per table for disposition + telemetry.
+	const unknownByTable = new Map<string, UnknownTableGroup>();
+
+	const { created: batchCreated, dropped: batchDropped } = computeBatchTableDelta(changes);
 
 	// PHASE 1: Resolve all changes (no writes yet). The clock watermark is merged
 	// once after a successful admission (see admitGroup below), not per changeset —
@@ -99,6 +151,31 @@ export async function applyChanges(
 
 		// Resolve data changes
 		for (const change of changeSet.changes) {
+			// Self-origin echo skip BEFORE unknown-table detection, so a self-change
+			// to a retired table is skipped (counted), never quarantined. resolveChange
+			// re-checks this defensively for any other caller.
+			if (siteIdEquals(change.hlc.siteId, ctx.getSiteId())) {
+				skipped++;
+				continue;
+			}
+
+			// Structural unknown-table detection: in the current basis OR created by
+			// this batch, AND not dropped by this batch. Diverted changes never reach
+			// resolveChange / dataChangesToApply / commitChangeMetadata, so no CRDT
+			// metadata is written for a table the receiver does not have.
+			const key = tableKey(change.schema, change.table);
+			const known = (ctx.isTableInBasis(change.schema, change.table) || batchCreated.has(key))
+				&& !batchDropped.has(key);
+			if (!known) {
+				let group = unknownByTable.get(key);
+				if (!group) {
+					group = { schema: change.schema, table: change.table, siteId: changeSet.siteId, changes: [] };
+					unknownByTable.set(key, group);
+				}
+				group.changes.push(change);
+				continue;
+			}
+
 			const resolved = await resolveChange(ctx, change);
 			if (resolved.outcome === 'applied') {
 				applied++;
@@ -114,6 +191,10 @@ export async function applyChanges(
 			}
 		}
 	}
+
+	const disposition = ctx.config.unknownTableDisposition;
+	// Single receive timestamp for every quarantine entry this apply (GC horizon).
+	const receivedAt = Date.now();
 
 	// Admit the whole resolved batch as one all-or-nothing unit: data first (PHASE
 	// 2), then CRDT metadata (PHASE 3), then the merged clock watermark — aborting
@@ -135,6 +216,20 @@ export async function applyChanges(
 					hlc: migration.hlc,
 					schemaVersion,
 				});
+			}
+
+			// Quarantine diverted changes as part of the admission unit — durable
+			// BEFORE the watermark advances below, so a crash never strands a
+			// straggler's change with no re-delivery (the batch re-resolves and
+			// re-quarantines idempotently, HLC-keyed). `ignore` writes nothing.
+			if (disposition === 'quarantine' && unknownByTable.size > 0) {
+				const qBatch = ctx.kv.batch();
+				for (const group of unknownByTable.values()) {
+					for (const change of group.changes) {
+						ctx.quarantine.put(qBatch, change, receivedAt);
+					}
+				}
+				await qBatch.write();
 			}
 		},
 		// Merging the batch max once is equivalent to receiving each changeset's
@@ -168,11 +263,29 @@ export async function applyChanges(
 		}
 	}
 
+	// Unknown-table telemetry AFTER successful admission, regardless of disposition
+	// (the operator must see straggler traffic even when it is being dropped).
+	let unknownTableCount = 0;
+	for (const group of unknownByTable.values()) {
+		unknownTableCount += group.changes.length;
+		ctx.recordUnknownTable(disposition, group.schema, group.table, group.changes.length);
+		ctx.syncEvents.emitUnknownTable({
+			schema: group.schema,
+			table: group.table,
+			disposition,
+			changeCount: group.changes.length,
+			siteId: group.siteId,
+			// Group is non-empty by construction, so maxHLC is defined.
+			latestHLC: maxHLC(group.changes.map(c => c.hlc))!,
+		});
+	}
+
 	return {
 		applied,
 		skipped,
 		conflicts,
 		transactions: changes.length,
+		...(unknownTableCount > 0 ? { unknownTable: unknownTableCount } : {}),
 	};
 }
 

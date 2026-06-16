@@ -168,6 +168,14 @@ class MockSyncManager implements SyncManager {
     return 0;
   }
 
+  async pruneQuarantine(): Promise<number> {
+    return 0;
+  }
+
+  getUnknownTableStats(): { ignored: number; quarantined: number; byTable: Map<string, number> } {
+    return { ignored: 0, quarantined: 0, byTable: new Map() };
+  }
+
   async *resumeSnapshotStream(_checkpoint: SnapshotCheckpoint): AsyncIterable<SnapshotChunk> {}
 }
 

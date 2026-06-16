@@ -90,6 +90,8 @@ export {
   type ConflictContext,
   type ConflictResolution,
   type ConflictResolver,
+  // Unknown-table disposition
+  type UnknownTableDisposition,
   // Configuration
   type SyncConfig,
   DEFAULT_SYNC_CONFIG,
@@ -123,6 +125,7 @@ export {
   type RemoteChangeEvent,
   type LocalChangeEvent,
   type ConflictEvent,
+  type UnknownTableEvent,
   type SyncState,
   type Unsubscribe,
   type SyncEventEmitter,
@@ -157,6 +160,13 @@ export {
   TombstoneStore,
   serializeTombstone,
   deserializeTombstone,
+  // Quarantine (held out-of-basis straggler changes)
+  type QuarantineEntry,
+  QuarantineStore,
+  serializeQuarantineEntry,
+  deserializeQuarantineEntry,
+  buildQuarantineKey,
+  buildQuarantineScanBounds,
   // Peer state
   type PeerState,
   PeerStateStore,
