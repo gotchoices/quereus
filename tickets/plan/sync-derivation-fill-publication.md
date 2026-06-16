@@ -40,6 +40,9 @@ cold/static rows it does not.
   contents (like `applyMaintenance('replace-all')` does against pending) and
   publish only genuine deltas — so a re-fill that matches already-synced rows
   publishes nothing. This restores suppression for the bulk path.
+
+  ** User update: ** This is the approach we want to take.  In general we should only fire sync changes on actual deltas.
+
 - Or: leave `replaceContents` event-free and rely on the reconcile/attach path
   (`applyMaintenance('replace-all')`, which the prereq already change-logs) to
   carry cold rows when a peer attaches over existing data — accepting that a

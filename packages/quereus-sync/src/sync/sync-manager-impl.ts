@@ -471,6 +471,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * reaches `batchSize`, never splitting a transaction — so the grouped response
 	 * is byte-identical; only the scan footprint shrinks.
 	 *
+	 * LOAD-BEARING INVARIANT: boundary detection keys off `logEntry.hlc`, but the
+	 * grouper keys off the *resolved* version's HLC ({@link resolveLogEntry} returns
+	 * `cv.hlc` / `tombstone.hlc`). These agree only when each non-null-resolving log
+	 * entry's HLC equals its resolved version's HLC. For COLUMN entries that holds:
+	 * an overwrite deletes the prior change-log entry (see {@link recordColumnVersions}
+	 * and `commitChangeMetadata`), so at most one entry per `(pk, column)` survives and
+	 * its HLC is the current `cv.hlc`. DELETE entries are NOT deduped this way
+	 * (`deleteEntryBatch` is never called with `'delete'`), so a delete→reinsert→delete
+	 * key-reuse sequence leaves a stale delete entry that re-attributes to a later
+	 * tombstone HLC — there the scan-time bound can mis-count and split a transaction.
+	 * Tracked by `sync-stale-delete-entry-reattribution`.
+	 *
 	 * (Schema migrations are still fully scanned by {@link collectSchemaMigrations};
 	 * the `sm:` range is not HLC-ordered, but migrations are few and the grouping
 	 * step drops any that sort past the bounded fact watermark.)

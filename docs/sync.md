@@ -299,6 +299,15 @@ a snapshot instead); and the `sm:` schema-migration scan is not HLC-ordered, so 
 drained in full (migrations are few, and grouping drops any that sort past the bounded
 fact watermark — over-scan costs work, never correctness).
 
+> **Known edge case (delete key-reuse).** Scan-time boundary detection keys off the
+> *log entry's* HLC, while grouping keys off the *resolved version's* HLC. These match
+> for column entries (an overwrite deletes the prior change-log entry) but not for
+> delete entries, which are never individually deleted. A `delete → reinsert → delete`
+> sequence on the same primary key leaves a stale delete entry that re-attributes to the
+> later tombstone's HLC; the scan-time bound can then mis-count and **split** the later
+> transaction across two `getChangesSince` rounds (the rest arrives next round). Tracked
+> by `sync-stale-delete-entry-reattribution`.
+
 **Oversized transaction.** A single transaction whose fact count exceeds `batchSize`
 is returned **whole** as one ChangeSet and telemetered (a `console.warn`), never
 silently chunked — splitting it would violate the one-ChangeSet-per-transaction

@@ -256,6 +256,44 @@ describe('SyncManager', () => {
       expect(changeLogEntriesScanned).to.be.at.most(3);
       expect(changeLogEntriesScanned).to.be.lessThan(5);
     });
+
+    // Regression for the scan-time bound mis-counting when a stale delete change-log
+    // entry re-attributes to a later tombstone HLC. A delete→reinsert→delete key reuse
+    // leaves the first delete's entry behind (delete entries are never deduped), and it
+    // resolves to the SECOND delete's tombstone — so boundary detection (keyed on the
+    // log HLC) and grouping (keyed on the resolved HLC) disagree, splitting the later
+    // multi-fact transaction across two getChangesSince rounds. Un-skip when
+    // `sync-stale-delete-entry-reattribution` lands.
+    it.skip('does not split a transaction when a stale delete entry re-attributes', async () => {
+      config.batchSize = 1;
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a'] });
+      await flush();
+      source.commitData({ type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['a'] });
+      await flush();
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['b'] });
+      await flush();
+      // One transaction that deletes pk[1] AND inserts pk[2].
+      source.commit({ data: [
+        { type: 'delete', schemaName: 'main', tableName: 'users', key: [1], oldRow: ['b'] },
+        { type: 'insert', schemaName: 'main', tableName: 'users', key: [2], newRow: ['z'] },
+      ] });
+      await flush();
+
+      const sinceHLC: HLC = { wallTime: 0n, counter: 0, siteId: new Uint8Array(16), opSeq: 0 };
+      const sets = await manager.getChangesSince(peer, sinceHLC);
+
+      // Whichever ChangeSet carries the pk[1] delete must also carry the pk[2] insert —
+      // they are one transaction and must never be split by the bound.
+      const withDelete = sets.find(s => s.changes.some(c => c.type === 'delete'));
+      expect(withDelete, 'expected a ChangeSet containing the delete').to.not.be.undefined;
+      expect(
+        withDelete!.changes.some(c => c.type === 'column' && JSON.stringify(c.pk) === '[2]'),
+        'transaction split: pk[2] insert missing from the delete transaction',
+      ).to.be.true;
+    });
   });
 
   describe('canDeltaSync', () => {
