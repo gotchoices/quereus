@@ -49,7 +49,7 @@ export function deserializeTombstone(buffer: Uint8Array): Tombstone {
 export class TombstoneStore {
   constructor(
     private readonly kv: KVStore,
-    private readonly tombstoneTTL: number
+    private readonly retentionHorizonMs: number
   ) {}
 
   /**
@@ -142,7 +142,7 @@ export class TombstoneStore {
 
     for await (const entry of this.kv.iterate(bounds)) {
       const tombstone = deserializeTombstone(entry.value);
-      if (now - tombstone.createdAt > this.tombstoneTTL) {
+      if (now - tombstone.createdAt > this.retentionHorizonMs) {
         batch.delete(entry.key);
         count++;
       }

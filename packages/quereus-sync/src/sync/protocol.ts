@@ -400,11 +400,13 @@ export type ConflictResolver = (ctx: ConflictContext) => ConflictResolution;
  */
 export interface SyncConfig {
   /**
-   * Tombstone retention period in milliseconds.
-   * After this period, delta sync may not be possible.
+   * Retention horizon in milliseconds: changes older than this are not
+   * guaranteed deliverable. Bounds tombstone GC AND delta-sync eligibility,
+   * and is the bound retirement guidance keys off (drop a legacy basis table
+   * no sooner than the horizon after its last directly-mapped write).
    * Default: 30 days (30 * 24 * 60 * 60 * 1000)
    */
-  tombstoneTTL: number;
+  retentionHorizonMs: number;
 
   /**
    * Whether deleted rows can be resurrected by later writes.
@@ -437,7 +439,7 @@ export interface SyncConfig {
  * Default sync configuration.
  */
 export const DEFAULT_SYNC_CONFIG: SyncConfig = {
-  tombstoneTTL: 30 * 24 * 60 * 60 * 1000,  // 30 days
+  retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,  // 30 days
   allowResurrection: false,
   batchSize: 1000,
 };

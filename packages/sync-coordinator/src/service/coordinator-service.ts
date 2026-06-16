@@ -103,7 +103,7 @@ export class CoordinatorService {
       idleTimeoutMs: 5 * 60 * 1000,
       cleanupIntervalMs: 30 * 1000,
       syncConfig: {
-        tombstoneTTL: this.config.sync.tombstoneTTL,
+        retentionHorizonMs: this.config.sync.retentionHorizonMs,
         batchSize: this.config.sync.batchSize,
       },
       hooks: options.storeHooks,

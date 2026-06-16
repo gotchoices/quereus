@@ -276,7 +276,7 @@ interface CoordinatorConfig {
 
   // Sync settings (passed to SyncManager)
   sync: {
-    tombstoneTTL: number;          // Default: 30 days (ms)
+    retentionHorizonMs: number;    // Default: 30 days (ms)
     batchSize: number;             // Default: 1000
   };
 

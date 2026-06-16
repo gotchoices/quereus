@@ -142,7 +142,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.applyToStore = applyToStore;
 		this.getTableSchema = getTableSchema;
 		this.columnVersions = new ColumnVersionStore(kv);
-		this.tombstones = new TombstoneStore(kv, config.tombstoneTTL);
+		this.tombstones = new TombstoneStore(kv, config.retentionHorizonMs);
 		this.peerStates = new PeerStateStore(kv);
 		this.changeLog = new ChangeLogStore(kv);
 		this.schemaMigrations = new SchemaMigrationStore(kv);
@@ -707,10 +707,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			return false;
 		}
 
-		// Check if tombstone TTL covers the requested time range
+		// Check if retention horizon covers the requested time range
 		const now = Date.now();
 		const sinceTime = Number(sinceHLC.wallTime);
-		if (now - sinceTime > this.config.tombstoneTTL) {
+		if (now - sinceTime > this.config.retentionHorizonMs) {
 			return false;
 		}
 
@@ -751,7 +751,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		for await (const entry of this.kv.iterate(tbBounds)) {
 			const tombstone = deserializeTombstone(entry.value);
 
-			if (now - tombstone.createdAt > this.config.tombstoneTTL) {
+			if (now - tombstone.createdAt > this.config.retentionHorizonMs) {
 				batch.delete(entry.key);
 				count++;
 			}

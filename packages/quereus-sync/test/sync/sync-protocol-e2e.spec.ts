@@ -1489,9 +1489,13 @@ describe('Sync Protocol E2E', () => {
   });
 
   describe('Tombstone Pruning', () => {
+    it('DEFAULT_SYNC_CONFIG.retentionHorizonMs should be 30 days', () => {
+      expect(DEFAULT_SYNC_CONFIG.retentionHorizonMs).to.equal(30 * 24 * 60 * 60 * 1000);
+    });
+
     it('should prune expired tombstones', async () => {
-      // Use very short TTL for testing
-      const shortTTLConfig = { ...config, tombstoneTTL: 1 }; // 1ms TTL
+      // Use very short retention horizon for testing
+      const shortTTLConfig = { ...config, retentionHorizonMs: 1 }; // 1ms
       const replica = await createReplica('replica', shortTTLConfig);
 
       // Insert and delete a row (creates a tombstone)
@@ -1513,8 +1517,8 @@ describe('Sync Protocol E2E', () => {
     });
 
     it('should not prune non-expired tombstones', async () => {
-      // Use long TTL
-      const longTTLConfig = { ...config, tombstoneTTL: 60_000 };
+      // Use long retention horizon
+      const longTTLConfig = { ...config, retentionHorizonMs: 60_000 };
       const replica = await createReplica('replica', longTTLConfig);
 
       emitLocalInsert(replica, 'main', 'users', [1], [1, 'Alice']);

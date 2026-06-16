@@ -1109,8 +1109,12 @@ private shouldApplySchemaChange(remote: SchemaChange, local: SchemaVersion): boo
 
 ```typescript
 interface SyncConfig {
-  /** Tombstone retention period in milliseconds (default: 30 days) */
-  tombstoneTTL: number;
+  /**
+   * Retention horizon in milliseconds: changes older than this are not
+   * guaranteed deliverable. Bounds tombstone GC, delta-sync eligibility,
+   * and retirement timing guidance. Default: 30 days.
+   */
+  retentionHorizonMs: number;
 
   /** Whether deleted rows can be resurrected by later writes (default: false) */
   allowResurrection: boolean;
@@ -1124,7 +1128,7 @@ interface SyncConfig {
 
 // Usage
 const sync = createSyncModule(storeModule, storeEventEmitter, {
-  tombstoneTTL: 30 * 24 * 60 * 60 * 1000,  // 30 days
+  retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,  // 30 days
   allowResurrection: false,
   batchSize: 1000,
 });
@@ -1146,7 +1150,7 @@ const kvStore = await LevelDBStore.open({ path: './sync-meta' });
 
 // 3. Create sync module
 const { syncManager, syncEvents } = await createSyncModule(kvStore, storeEvents, {
-  tombstoneTTL: 30 * 24 * 60 * 60 * 1000,
+  retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,
 });
 
 // 4. Register store module with database
@@ -1248,7 +1252,7 @@ const applyToStore = createStoreAdapter(kvStore, storeEvents);
 
 // Use with SyncManager - remote changes are applied via the adapter
 const syncManager = new SyncManagerImpl(metadataKvStore, storeEvents, applyToStore, {
-  tombstoneTTL: 30 * 24 * 60 * 60 * 1000,
+  retentionHorizonMs: 30 * 24 * 60 * 60 * 1000,
 });
 
 // When remote changes arrive, the adapter:

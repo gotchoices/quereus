@@ -78,7 +78,7 @@ export interface StoreManagerConfig {
   cleanupIntervalMs: number;
   /** Sync config passed to createSyncModule */
   syncConfig?: {
-    tombstoneTTL?: number;
+    retentionHorizonMs?: number;
     batchSize?: number;
   };
   /** Hooks for customizing behavior */

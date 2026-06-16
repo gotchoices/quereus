@@ -182,7 +182,7 @@ This means concurrent updates to *different* columns of the same row both apply,
 - `SchemaMigration` - Schema change (CREATE/ALTER/DROP TABLE)
 - `SnapshotChunk` - Streaming snapshot data (header, table-start, column-versions, table-end, schema-migration, footer)
 - `ApplyResult` - Result of applying changes (applied, skipped, conflicts, transactions)
-- `SyncConfig` / `DEFAULT_SYNC_CONFIG` - Configuration (tombstoneTTL, allowResurrection, etc.)
+- `SyncConfig` / `DEFAULT_SYNC_CONFIG` - Configuration (retentionHorizonMs, allowResurrection, etc.)
 
 ## Related Packages
 
