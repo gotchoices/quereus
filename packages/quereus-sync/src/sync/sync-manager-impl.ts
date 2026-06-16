@@ -57,6 +57,7 @@ import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCStateBatch, toError } from './sync-context.js';
 import { applyChanges as applyChangesImpl } from './change-applicator.js';
+import { buildTransactionChangeSets } from './change-grouping.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
 import {
 	getSnapshotStream as getSnapshotStreamImpl,
@@ -425,114 +426,91 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// Delta Sync API
 	// ============================================================================
 
+	/**
+	 * Extract changes for a peer as **one {@link ChangeSet} per source
+	 * transaction** (grouped by HLC identity `(wallTime, counter, siteId)`),
+	 * bounded at transaction granularity by `config.batchSize`. A transaction is
+	 * never split across ChangeSets and two transactions are never merged, so a
+	 * consumer that advances `lastSyncHLC = ChangeSet.hlc` always lands on a real
+	 * commit boundary (docs/sync.md § Transaction-Based Change Grouping → Read side).
+	 */
 	async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
-		const changes: Change[] = [];
+		const changes: Change[] = sinceHLC
+			? await this.collectChangesSince(peerSiteId, sinceHLC)
+			: await this.collectAllChanges(peerSiteId);
 
-		if (sinceHLC) {
-			for await (const logEntry of this.changeLog.getChangesSince(sinceHLC)) {
-				if (siteIdEquals(logEntry.hlc.siteId, peerSiteId)) continue;
+		const schemaMigrations = await this.collectSchemaMigrations(peerSiteId, sinceHLC);
 
-				if (logEntry.entryType === 'column') {
-					const cv = await this.columnVersions.getColumnVersion(
-						logEntry.schema,
-						logEntry.table,
-						logEntry.pk,
-						logEntry.column!
-					);
-					if (!cv) continue;
-
-					const columnChange: ColumnChange = {
-						type: 'column',
-						schema: logEntry.schema,
-						table: logEntry.table,
-						pk: logEntry.pk,
-						column: logEntry.column!,
-						value: cv.value,
-						hlc: cv.hlc,
-					};
-					changes.push(columnChange);
-				} else {
-					const tombstone = await this.tombstones.getTombstone(
-						logEntry.schema,
-						logEntry.table,
-						logEntry.pk
-					);
-					if (!tombstone) continue;
-
-					const deletion: RowDeletion = {
-						type: 'delete',
-						schema: logEntry.schema,
-						table: logEntry.table,
-						pk: logEntry.pk,
-						hlc: tombstone.hlc,
-					};
-					changes.push(deletion);
-				}
-			}
-		} else {
-			await this.collectAllChanges(peerSiteId, changes);
-		}
-
-		// Collect schema migrations
-		const schemaMigrations: SchemaMigration[] = [];
-		const smBounds = buildAllSchemaMigrationsScanBounds();
-		for await (const entry of this.kv.iterate(smBounds)) {
-			const parsed = parseSchemaMigrationKey(entry.key);
-			if (!parsed) continue;
-
-			const migration = deserializeMigration(entry.value);
-
-			if (sinceHLC && compareHLC(migration.hlc, sinceHLC) <= 0) continue;
-			if (siteIdEquals(migration.hlc.siteId, peerSiteId)) continue;
-
-			schemaMigrations.push({
-				type: migration.type,
-				schema: parsed.schema,
-				table: parsed.table,
-				ddl: migration.ddl,
-				hlc: migration.hlc,
-				schemaVersion: migration.schemaVersion,
-			});
-		}
-
-		if (changes.length === 0 && schemaMigrations.length === 0) {
-			return [];
-		}
-
-		schemaMigrations.sort((a, b) => compareHLC(a.hlc, b.hlc));
-
-		const result: ChangeSet[] = [];
-		for (let i = 0; i < changes.length; i += this.config.batchSize) {
-			const batch = changes.slice(i, i + this.config.batchSize);
-			const maxHLC = batch.reduce((max, c) => compareHLC(c.hlc, max) > 0 ? c.hlc : max, batch[0].hlc);
-
-			result.push({
-				siteId: this.getSiteId(),
-				transactionId: crypto.randomUUID(),
-				hlc: maxHLC,
-				changes: batch,
-				schemaMigrations: i === 0 ? schemaMigrations : [],
-			});
-		}
-
-		if (result.length === 0 && schemaMigrations.length > 0) {
-			const maxHLC = schemaMigrations.reduce(
-				(max, m) => compareHLC(m.hlc, max) > 0 ? m.hlc : max,
-				schemaMigrations[0].hlc
-			);
-			result.push({
-				siteId: this.getSiteId(),
-				transactionId: crypto.randomUUID(),
-				hlc: maxHLC,
-				changes: [],
-				schemaMigrations,
-			});
-		}
-
-		return result;
+		return buildTransactionChangeSets(
+			changes,
+			schemaMigrations,
+			this.config.batchSize,
+			(transactionId, changeCount) => {
+				// Oversized transactions are returned whole (never split); telemeter
+				// rather than silently chunk so the bound breach is observable.
+				console.warn(
+					`[Sync] Oversized transaction ${transactionId}: ${changeCount} changes exceed batchSize ${this.config.batchSize}; returned as one ChangeSet`,
+				);
+			},
+		);
 	}
 
-	private async collectAllChanges(peerSiteId: SiteId, changes: Change[]): Promise<void> {
+	/** Delta extraction: facts after `sinceHLC`, in change-log (4-tuple) order. */
+	private async collectChangesSince(peerSiteId: SiteId, sinceHLC: HLC): Promise<Change[]> {
+		const changes: Change[] = [];
+		for await (const logEntry of this.changeLog.getChangesSince(sinceHLC)) {
+			// A transaction is wholly one site's, so skipping the peer's own facts
+			// filters whole transactions cleanly (no half-empty ChangeSet).
+			if (siteIdEquals(logEntry.hlc.siteId, peerSiteId)) continue;
+
+			if (logEntry.entryType === 'column') {
+				const cv = await this.columnVersions.getColumnVersion(
+					logEntry.schema,
+					logEntry.table,
+					logEntry.pk,
+					logEntry.column!
+				);
+				if (!cv) continue;
+
+				const columnChange: ColumnChange = {
+					type: 'column',
+					schema: logEntry.schema,
+					table: logEntry.table,
+					pk: logEntry.pk,
+					column: logEntry.column!,
+					value: cv.value,
+					hlc: cv.hlc,
+				};
+				changes.push(columnChange);
+			} else {
+				const tombstone = await this.tombstones.getTombstone(
+					logEntry.schema,
+					logEntry.table,
+					logEntry.pk
+				);
+				if (!tombstone) continue;
+
+				const deletion: RowDeletion = {
+					type: 'delete',
+					schema: logEntry.schema,
+					table: logEntry.table,
+					pk: logEntry.pk,
+					hlc: tombstone.hlc,
+				};
+				changes.push(deletion);
+			}
+		}
+		return changes;
+	}
+
+	/**
+	 * Full extraction (initial sync / delta-from-zero): every column version and
+	 * tombstone not originating from the peer. Ordering is owned by
+	 * {@link buildTransactionChangeSets}, so no pre-sort is needed here.
+	 */
+	private async collectAllChanges(peerSiteId: SiteId): Promise<Change[]> {
+		const changes: Change[] = [];
+
 		const cvBounds = buildAllColumnVersionsScanBounds();
 		for await (const entry of this.kv.iterate(cvBounds)) {
 			const parsed = parseColumnVersionKey(entry.key);
@@ -571,7 +549,39 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			changes.push(deletion);
 		}
 
-		changes.sort((a, b) => compareHLC(a.hlc, b.hlc));
+		return changes;
+	}
+
+	/**
+	 * Collect schema migrations after `sinceHLC` not originating from the peer.
+	 * Each migration shares its transaction's base HLC, so the grouping step
+	 * rejoins it with that transaction's data facts (or forms a DDL-only ChangeSet).
+	 */
+	private async collectSchemaMigrations(
+		peerSiteId: SiteId,
+		sinceHLC?: HLC,
+	): Promise<SchemaMigration[]> {
+		const schemaMigrations: SchemaMigration[] = [];
+		const smBounds = buildAllSchemaMigrationsScanBounds();
+		for await (const entry of this.kv.iterate(smBounds)) {
+			const parsed = parseSchemaMigrationKey(entry.key);
+			if (!parsed) continue;
+
+			const migration = deserializeMigration(entry.value);
+
+			if (sinceHLC && compareHLC(migration.hlc, sinceHLC) <= 0) continue;
+			if (siteIdEquals(migration.hlc.siteId, peerSiteId)) continue;
+
+			schemaMigrations.push({
+				type: migration.type,
+				schema: parsed.schema,
+				table: parsed.table,
+				ddl: migration.ddl,
+				hlc: migration.hlc,
+				schemaVersion: migration.schemaVersion,
+			});
+		}
+		return schemaMigrations;
 	}
 
 	// ============================================================================

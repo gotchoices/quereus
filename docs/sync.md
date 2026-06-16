@@ -245,6 +245,64 @@ Edge cases:
 a random UUID. Same transaction ⇒ same id on every peer (the read side reproduces it
 from the change-log facts' shared base), so no separate `tx:` record is persisted.
 
+#### Read side: one ChangeSet per transaction
+
+`getChangesSince(peerSiteId, sinceHLC?)` returns **one `ChangeSet` per source
+transaction** — never splitting a commit across ChangeSets, never merging two
+commits into one (`change-grouping.ts` `buildTransactionChangeSets`):
+
+```
+getChangesSince(peerSiteId, sinceHLC):
+  facts      = sinceHLC ? changeLog.scan(after sinceHLC) : (all column-versions + tombstones)
+               skipping any fact whose hlc.siteId == peerSiteId   // echo filter (whole tx)
+  migrations = sm: scan, after sinceHLC, not from peerSiteId
+  group facts+migrations by transaction identity (wallTime, counter, siteId):
+    each group ⇒ one ChangeSet:
+      changes:          group's facts in opSeq order (parent-before-child apply)
+      schemaMigrations: group's migrations in opSeq order (DDL below the tx's DML)
+      hlc:              group's MAX fact HLC (last opSeq) — the commit boundary
+      transactionId:    deterministicTxnId(base)          — same derivation as write side
+      siteId:           the group's origin site
+  order ChangeSets by base HLC ascending
+  bound by batchSize at TRANSACTION granularity (below)
+```
+
+The HLC scan is already ordered by `(wallTime, counter, siteId, opSeq)` (the
+change-log key, from `sync-hlc-opseq-foundation`), so a transaction's facts are
+contiguous and in `opSeq` order. Because a transaction is wholly one site's,
+filtering the peer's own facts (echo prevention) drops *whole* transactions — never
+a half-empty ChangeSet.
+
+- **Echo filter** — facts/migrations whose `hlc.siteId == peerSiteId` are excluded;
+  a transaction wholly from `peerSiteId` yields no ChangeSet.
+- **DDL-only transaction** — a `create table` with no DML forms its own ChangeSet
+  (`changes: []`, one migration), `hlc` = the migration HLC.
+- **DDL + DML in one transaction** — migration and data share the base, so they land
+  in one ChangeSet; the migration's lower `opSeq` keeps DDL ahead of DML (the
+  applicator processes `schemaMigrations` first regardless).
+
+**Transaction-granularity bounding.** `batchSize` caps the response by accumulating
+**whole** transactions: once a completed transaction pushes the cumulative `changes`
+count `>= batchSize`, extraction stops and returns — the remaining transactions come
+on the next `getChangesSince` call (the consumer advances its watermark to the last
+returned `ChangeSet.hlc` and re-fetches). A transaction is **never** split to hit the
+bound.
+
+**Oversized transaction.** A single transaction whose fact count exceeds `batchSize`
+is returned **whole** as one ChangeSet and telemetered (a `console.warn`), never
+silently chunked — splitting it would violate the one-ChangeSet-per-transaction
+contract.
+
+**Watermark halts at transaction boundaries.** Because every returned ChangeSet is a
+whole transaction whose `hlc` is the commit's max fact HLC, a consumer that sets
+`lastSyncHLC = max(applied ChangeSet.hlc)` always lands on a real commit boundary —
+`buildChangeLogScanBoundsAfter` then excludes everything `<=` it, so re-fetch resumes
+strictly *after* the last whole transaction (no repeats, no gaps, no mid-transaction
+resume). A partially applied transaction never advances the watermark: `applyChanges`
+applies a ChangeSet atomically and commits metadata only on success (§ Transactional
+Integrity During Sync), so a failed ChangeSet leaves the watermark at the prior
+boundary.
+
 ### Transactional Integrity During Sync
 
 When applying remote changes, the sync system must write to two separate stores:
@@ -650,12 +708,16 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 
 #### Delta Sync Optimization
 
-To minimize data transfer, clients track sync progress with the server:
+To minimize data transfer, clients track sync progress with the server. Every
+watermark is a **`ChangeSet.hlc`** — a transaction commit boundary (the max over
+`changeSets[].hlc`, computed by `maxHLCFromChangeSets`), never a per-change max or a
+batch-slice boundary — so advancing it can only ever land *between* whole
+transactions (§ Transaction-Based Change Grouping → Read side):
 
-1. **Receiving changes**: After applying server changes, client updates `peerSyncState[serverSiteId]` with the max HLC received
-2. **Sending changes**: Client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack)
+1. **Receiving changes**: After applying server changes, client updates `peerSyncState[serverSiteId]` with the max `ChangeSet.hlc` received
+2. **Sending changes**: Client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values
 3. **Reconnection**: On reconnect, client sends `get_changes` with `sinceHLC` from peer sync state
-4. **Server tracking**: Server uses client's `sinceHLC` to return only new changes
+4. **Server tracking**: Server uses client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -673,14 +735,14 @@ To minimize data transfer, clients track sync progress with the server:
 │                                                                             │
 │  On reconnect:                                                              │
 │  1. Client: get_changes { sinceHLC: peerSyncState[serverSiteId] }           │
-│  2. Server: Returns only changes where change.hlc > sinceHLC                │
+│  2. Server: Returns only whole transactions with ChangeSet.hlc > sinceHLC   │
 │  3. Client: applyChanges(), updates peerSyncState                           │
 │                                                                             │
 │  On local change:                                                           │
 │  1. Local change triggers debounced send (50ms window)                      │
-│  2. Client: getChangesSince(serverSiteId, lastSentHLC) → filtered changes   │
+│  2. Client: getChangesSince(serverSiteId, lastSentHLC) → per-tx ChangeSets  │
 │  3. Client: apply_changes { changes }                                       │
-│  4. Client: pendingSentHLC = max HLC of sent changes                        │
+│  4. Client: pendingSentHLC = max ChangeSet.hlc of sent transactions         │
 │  5. Server: apply_result { applied, ... }                                   │
 │  6. Client: lastSentHLC = pendingSentHLC (on success)                       │
 │                                                                             │

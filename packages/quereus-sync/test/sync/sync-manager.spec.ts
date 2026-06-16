@@ -81,6 +81,116 @@ describe('SyncManager', () => {
     });
   });
 
+  describe('getChangesSince transaction grouping', () => {
+    const flush = () => new Promise(resolve => setTimeout(resolve, 10));
+
+    it('returns one ChangeSet per transaction with a deterministic id and max-fact hlc', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      // One transaction, three columns => three facts.
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a', 'b', 'c'] });
+      await flush();
+
+      const sets = await manager.getChangesSince(peer);
+      expect(sets).to.have.lengthOf(1);
+      expect(sets[0].changes).to.have.lengthOf(3);
+      // Deterministic id: "{wallTime}:{counter}:{base64(22)}", never a random UUID.
+      expect(sets[0].transactionId).to.match(/^\d+:\d+:[A-Za-z0-9_-]{22}$/);
+      // ChangeSet.hlc is the transaction's max fact HLC.
+      const maxOpSeq = Math.max(...sets[0].changes.map(c => c.hlc.opSeq));
+      expect(sets[0].hlc.opSeq).to.equal(maxOpSeq);
+      // Stable across repeated extraction.
+      const again = await manager.getChangesSince(peer);
+      expect(again[0].transactionId).to.equal(sets[0].transactionId);
+    });
+
+    it('never merges two separate transactions', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a'] });
+      await flush();
+      source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [2], newRow: ['b'] });
+      await flush();
+
+      const sets = await manager.getChangesSince(peer);
+      expect(sets).to.have.lengthOf(2);
+      expect(sets[0].transactionId).to.not.equal(sets[1].transactionId);
+      expect(compareHLC(sets[0].hlc, sets[1].hlc)).to.be.lessThan(0);
+    });
+
+    it('groups DDL and DML committed together into one ChangeSet (DDL at lower opSeq)', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      source.commit({
+        schema: [{ type: 'create', objectType: 'table', schemaName: 'main', objectName: 'users', ddl: 'create table users (id integer primary key, name text)' }],
+        data: [{ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['x', 'y'] }],
+      });
+      await flush();
+
+      const sets = await manager.getChangesSince(peer);
+      expect(sets).to.have.lengthOf(1);
+      expect(sets[0].schemaMigrations).to.have.lengthOf(1);
+      expect(sets[0].changes).to.have.lengthOf(2);
+      // Migration sorts below the same transaction's data facts.
+      const minDataOpSeq = Math.min(...sets[0].changes.map(c => c.hlc.opSeq));
+      expect(sets[0].schemaMigrations[0].hlc.opSeq).to.be.lessThan(minDataOpSeq);
+    });
+
+    it('returns an oversized transaction whole and telemeters it', async () => {
+      config.batchSize = 2;
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      const warnings: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (msg: string) => warnings.push(String(msg));
+      try {
+        source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: ['a', 'b', 'c', 'd', 'e'] });
+        await flush();
+
+        const sets = await manager.getChangesSince(peer);
+        expect(sets).to.have.lengthOf(1);
+        expect(sets[0].changes).to.have.lengthOf(5);
+        expect(warnings.some(w => w.includes('Oversized transaction'))).to.be.true;
+      } finally {
+        console.warn = origWarn;
+      }
+    });
+
+    it('round-trips across a batchSize boundary: each transaction exactly once, in order', async () => {
+      config.batchSize = 3;
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peer = generateSiteId();
+
+      // Three transactions, two facts each.
+      for (const id of [1, 2, 3]) {
+        source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [id], newRow: [`a${id}`, `b${id}`] });
+        await flush();
+      }
+
+      const collected: ChangeSet[] = [];
+      let sinceHLC: HLC | undefined = undefined;
+      for (let i = 0; i < 5; i++) {
+        const sets: ChangeSet[] = await manager.getChangesSince(peer, sinceHLC);
+        if (sets.length === 0) break;
+        collected.push(...sets);
+        sinceHLC = sets[sets.length - 1].hlc;
+      }
+
+      // All three transactions returned exactly once.
+      expect(collected).to.have.lengthOf(3);
+      expect(new Set(collected.map(cs => cs.transactionId)).size).to.equal(3);
+      for (const cs of collected) expect(cs.changes).to.have.lengthOf(2);
+      // Strictly ascending, no repeats/gaps.
+      for (let i = 1; i < collected.length; i++) {
+        expect(compareHLC(collected[i - 1].hlc, collected[i].hlc)).to.be.lessThan(0);
+      }
+    });
+  });
+
   describe('canDeltaSync', () => {
     it('should return false for unknown peer', async () => {
       const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);

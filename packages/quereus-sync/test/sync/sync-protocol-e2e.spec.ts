@@ -1561,6 +1561,55 @@ describe('Sync Protocol E2E', () => {
     });
   });
 
+  describe('Transaction Grouping (two replicas)', () => {
+    it('delta-syncs two multi-row transactions as two atomic ChangeSets, halting the watermark at the second commit boundary', async () => {
+      const host = await createReplica('host', config);
+      const guest = await createReplica('guest', config);
+
+      // Transaction 1: two rows committed together.
+      host.storeEvents.commit({
+        data: [
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: [1, 'Alice'] },
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [2], newRow: [2, 'Bob'] },
+        ],
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      // Transaction 2: two more rows committed together.
+      host.storeEvents.commit({
+        data: [
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [3], newRow: [3, 'Carol'] },
+          { type: 'insert', schemaName: 'main', tableName: 'users', key: [4], newRow: [4, 'Dave'] },
+        ],
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      const changeSets = await host.manager.getChangesSince(guest.manager.getSiteId());
+
+      // Exactly two transactions — never split, never merged.
+      expect(changeSets).to.have.lengthOf(2);
+      expect(changeSets[0].transactionId).to.not.equal(changeSets[1].transactionId);
+      expect(compareHLC(changeSets[0].hlc, changeSets[1].hlc)).to.be.lessThan(0);
+      // Each transaction carries both rows' column facts (2 rows × 2 columns).
+      expect(changeSets[0].changes).to.have.lengthOf(4);
+      expect(changeSets[1].changes).to.have.lengthOf(4);
+
+      // Guest applies both ChangeSets atomically.
+      const result = await guest.manager.applyChanges(changeSets);
+      expect(result.transactions).to.equal(2);
+      expect(result.applied).to.equal(8);
+
+      // Watermark lands on the SECOND transaction's HLC (a real commit boundary).
+      const watermark = changeSets[changeSets.length - 1].hlc;
+      await guest.manager.updatePeerSyncState(host.manager.getSiteId(), watermark);
+      expect(compareHLC(watermark, changeSets[0].hlc)).to.be.greaterThan(0);
+
+      // Re-fetch from the watermark: both transactions already consumed, nothing repeats.
+      const after = await host.manager.getChangesSince(guest.manager.getSiteId(), watermark);
+      expect(after).to.have.lengthOf(0);
+    });
+  });
+
   describe('Multiple Tables', () => {
     it('should sync data across multiple tables independently', async () => {
       const host = await createReplica('host', config);

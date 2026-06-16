@@ -76,19 +76,32 @@ export interface SchemaMigration {
 // ============================================================================
 
 /**
- * A transaction's worth of changes.
- * All changes within a ChangeSet are applied atomically.
+ * Exactly one source transaction's worth of changes.
+ *
+ * A ChangeSet **is** one commit: `getChangesSince` emits one ChangeSet per source
+ * transaction (grouped by HLC identity `(wallTime, counter, siteId)`), never
+ * splitting a commit across ChangeSets and never merging two commits into one. All
+ * changes within a ChangeSet are applied atomically.
  */
 export interface ChangeSet {
-  /** Origin replica */
+  /** Origin replica (the single site that produced this transaction). */
   readonly siteId: SiteId;
-  /** Unique transaction identifier */
+  /**
+   * Deterministic id of this one source transaction — `deterministicTxnId(base)`
+   * over the transaction's base HLC `(wallTime, counter, siteId)`. Stable across
+   * peers (every replica that replays the transaction derives the same id), not a
+   * random UUID.
+   */
   readonly transactionId: string;
-  /** Transaction commit time */
+  /**
+   * The transaction's commit boundary: its **maximum** fact HLC (the last
+   * `opSeq`). A consumer that sets `lastSyncHLC = ChangeSet.hlc` and re-fetches
+   * resumes strictly *after* the whole transaction.
+   */
   readonly hlc: HLC;
-  /** Data changes in this transaction */
+  /** Data changes in this transaction, in `opSeq` (intra-transaction write) order. */
   readonly changes: Change[];
-  /** Schema migrations in this transaction */
+  /** Schema migrations in this transaction (DDL sorts below the same tx's DML). */
   readonly schemaMigrations: SchemaMigration[];
 }
 
