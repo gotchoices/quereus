@@ -456,6 +456,30 @@ describe('Transaction-Commit Grouping', () => {
 		assert.equal(dataEvents[1].tableName, 't2');
 	});
 
+	it('groups insert, update, and delete of one transaction into a single batch', async () => {
+		// Exercises the widened auto-event gate on all three DML paths
+		// (insert/update/delete in dml-executor) with ONLY an onTransactionCommit
+		// listener subscribed — the multi-row INSERT test alone leaves the update
+		// and delete gates unverified for the standalone channel.
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec("insert into t values (1, 'a'), (2, 'b')");
+		batches = [];
+
+		await db.exec('begin');
+		await db.exec("insert into t values (3, 'c')");
+		await db.exec("update t set v = 'B' where id = 2");
+		await db.exec('delete from t where id = 1');
+		await db.exec('commit');
+
+		assert.equal(batches.length, 1);
+		const { dataEvents, schemaEvents } = batches[0];
+		assert.equal(schemaEvents.length, 0);
+		assert.deepEqual(
+			dataEvents.map((e) => [e.type, e.key]),
+			[['insert', [3]], ['update', [2]], ['delete', [1]]],
+		);
+	});
+
 	it('carries both schema and data events of one DDL+DML transaction in the same batch', async () => {
 		await db.exec('begin');
 		await db.exec('create table c (id integer primary key, v text)');
