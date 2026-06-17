@@ -161,6 +161,37 @@ describe('recordLensDeployment — basis lifecycle classification', () => {
     expect(detachEv?.newState).to.equal('detached');
   });
 
+  it('re-mapping after an exit resets mappedSince and clears unmappedSince', async () => {
+    const db = makeDb('store', [
+      { schema: 'store', name: 'Contact_v1' },
+      { schema: 'store', name: 'Contact_v2', sourceTables: ['store.contact_v1'] },
+    ]);
+    const mapV1 = () => makeSnapshot('store', 'h', [{ logicalTable: 'C', relations: ['store.contact_v1'] }]);
+    const mapV2 = () => makeSnapshot('store', 'h', [{ logicalTable: 'C', relations: ['store.contact_v2'] }]);
+
+    // Map → flip away (now derivation-source-only with unmappedSince stamped).
+    await mgr.recordLensDeployment(db, 'app', mapV1());
+    const firstMappedSince = (await getRec('store', 'contact_v1'))?.mappedSince;
+    await mgr.recordLensDeployment(db, 'app', mapV2());
+    const exited = await getRec('store', 'contact_v1');
+    expect(exited?.state).to.equal('derivation-source-only');
+    expect(exited?.unmappedSince).to.be.a('number');
+
+    // Re-map Contact_v1 — re-entry into directly-mapped: unmappedSince cleared,
+    // mappedSince re-stamped (>= the original), and the transition emits an event.
+    events = [];
+    await mgr.recordLensDeployment(db, 'app', mapV1());
+    const remapped = await getRec('store', 'contact_v1');
+    expect(remapped?.state).to.equal('directly-mapped');
+    expect(remapped?.mappedBy).to.deep.equal(['app']);
+    expect(remapped?.unmappedSince, 'unmappedSince cleared on re-entry').to.be.undefined;
+    expect(remapped?.mappedSince).to.be.a('number');
+    expect(remapped!.mappedSince!).to.be.at.least(firstMappedSince!); // re-stamped, never earlier
+    const remapEv = events.find(e => e.table.toLowerCase() === 'contact_v1');
+    expect(remapEv?.previousState).to.equal('derivation-source-only');
+    expect(remapEv?.newState).to.equal('directly-mapped');
+  });
+
   it('two logical schemas: stays directly-mapped until the last mapper drops it', async () => {
     const db = makeDb('store', [
       { schema: 'store', name: 'Contact_v1' },
