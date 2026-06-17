@@ -47,8 +47,9 @@ interface SerializedQuarantineEntry {
   readonly r: number;        // receivedAt (ms)
   readonly col?: string;     // column (column changes only)
   readonly v?: unknown;      // encodeSqlValue(value) (column changes only)
-  readonly pv?: unknown;     // encodeSqlValue(priorValue) — before-image, present iff prior exists
-  readonly ph?: SerializedHLC; // hlcToJson(priorHlc) — before-image, present iff prior exists
+  readonly pv?: unknown;     // encodeSqlValue(priorValue) — column before-image, present iff prior exists
+  readonly ph?: SerializedHLC; // hlcToJson(priorHlc) — column before-image, present iff prior exists
+  readonly pr?: unknown[];   // encodeSqlValue per element — delete row before-image, present iff priorRow exists
 }
 
 /**
@@ -64,14 +65,18 @@ export function serializeQuarantineEntry(entry: QuarantineEntry): Uint8Array {
     h: hlcToJson(c.hlc),
     r: entry.receivedAt,
   };
-  // Preserve the per-cell before-image verbatim so a late/manual replay keeps the
-  // full wire fidelity the module promises (present together or not at all).
+  // Preserve the before-image verbatim so a late/manual replay keeps the full wire
+  // fidelity the module promises: the per-cell prior on column changes, the row
+  // image on deletes (each present only when the wire change carried it).
   const prior = c.type === 'column' && c.priorHlc !== undefined
     ? { pv: encodeSqlValue(c.priorValue ?? null), ph: hlcToJson(c.priorHlc) }
     : undefined;
+  const priorRow = c.type === 'delete' && c.priorRow !== undefined
+    ? { pr: c.priorRow.map(encodeSqlValue) }
+    : undefined;
   const obj: SerializedQuarantineEntry = c.type === 'column'
     ? { ...base, col: c.column, v: encodeSqlValue(c.value), ...prior }
-    : base;
+    : { ...base, ...priorRow };
   return new TextEncoder().encode(JSON.stringify(obj));
 }
 
@@ -93,8 +98,11 @@ export function deserializeQuarantineEntry(buffer: Uint8Array): QuarantineEntry 
       receivedAt: obj.r,
     };
   }
+  // Restore the row before-image when present (spread only then, matching the
+  // producer path — a prior-less delete stays free of phantom undefined fields).
+  const priorRow = obj.pr !== undefined ? { priorRow: obj.pr.map(decodeSqlValue) } : undefined;
   return {
-    change: { type: 'delete', schema: obj.s, table: obj.tb, pk, hlc },
+    change: { type: 'delete', schema: obj.s, table: obj.tb, pk, hlc, ...priorRow },
     receivedAt: obj.r,
   };
 }

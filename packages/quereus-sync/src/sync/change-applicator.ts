@@ -512,7 +512,11 @@ function commitDeleteMetadata(
 	if (oldTombstone) {
 		ctx.changeLog.deleteEntryBatch(batch, oldTombstone.hlc, 'delete', change.schema, change.table, change.pk);
 	}
-	ctx.tombstones.setTombstoneBatch(batch, change.schema, change.table, change.pk, change.hlc);
+	// Persist the incoming change's before-image (when present) onto the tombstone so
+	// a receiver relaying via getChangesSince re-emits it. Only the winning delete's
+	// metadata is written here (in-batch losers never persist), so the surviving
+	// priorRow is the latest delete's row image.
+	ctx.tombstones.setTombstoneBatch(batch, change.schema, change.table, change.pk, change.hlc, change.priorRow);
 	ctx.changeLog.recordDeletionBatch(batch, change.hlc, change.schema, change.table, change.pk);
 }
 

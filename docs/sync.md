@@ -468,7 +468,7 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 | Prefix | Purpose | Format |
 |--------|---------|--------|
 | `cv:{schema}.{table}:{pk}:{col}` | Column version | `{hlc, value}` |
-| `tb:{schema}.{table}:{pk}` | Tombstone | `{hlc}` |
+| `tb:{schema}.{table}:{pk}` | Tombstone | `{hlc, createdAt, priorRow?}` |
 | `tx:{txId}` | *Reserved — not persisted.* The transaction id is **derived** from the base HLC (see *Deterministic transaction id*), so no transaction record is written. The `tx:` prefix and `buildTransactionKey` remain reserved for a future durable txn log. | — |
 | `ps:{siteId}` | Peer sync state | `{lastSyncHlc}` |
 | `sm:{schema}.{table}:{version}` | Schema migration | `{ddl, hlc}` |
@@ -542,9 +542,32 @@ interface RowDeletion {
   table: string;
   pk: SqlValue[];
   hlc: HLC;
+  priorRow?: Row;                    // last-known row image before deletion (audit/undo)
 }
 
 type Change = ColumnChange | RowDeletion;
+```
+
+**Row before-image (`priorRow`).** The row-level companion to the per-cell
+before-image: an optional, purely additive last-known row image carried on a
+deletion, so a receiver can show or undo *what was removed* without having
+reconstructed it beforehand.
+
+- **Source = the engine's `oldRow`**, captured at delete time (already on the
+  event, no extra read). Unlike the per-cell `priorValue` — which comes from the
+  prior tracked cell version — the row image is the column-ordered row the engine
+  deleted.
+- **Persisted on the tombstone.** `getChangesSince` re-resolves deletions from the
+  `TombstoneStore`, so the image is stored on the `Tombstone` (the row analog of
+  storing the cell prior on the `ColumnVersion`) and survives re-emission/relay.
+- **Best-effort.** Absent when the delete carried no `oldRow` (relayed/synthesized
+  deletes) and on snapshot-reconstructed tombstones (a snapshot is a fresh basis
+  with no history). Producers may omit it; receivers ignore it when absent. A
+  tombstone with no `priorRow` serializes to its unchanged fixed-size form.
+- **Storage cost.** Every tombstone may now hold a full row image, retained until
+  retention-horizon GC. Bounded but non-trivial for wide rows; an opt-out config
+  flag is a possible future follow-up.
+```typescript
 
 /** A schema modification */
 interface SchemaMigration {

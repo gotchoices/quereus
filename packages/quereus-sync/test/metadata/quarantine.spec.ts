@@ -3,7 +3,8 @@
  *
  * The quarantine store persists the raw wire `Change` verbatim so a late/manual
  * replay keeps full fidelity — including the optional per-cell before-image
- * (`priorValue`/`priorHlc`) that rides on a `ColumnChange`.
+ * (`priorValue`/`priorHlc`) on a `ColumnChange` and the optional row before-image
+ * (`priorRow`) on a `RowDeletion`.
  */
 
 import { expect } from 'chai';
@@ -70,12 +71,32 @@ describe('Quarantine entry serialization', () => {
     expect(restoredNull.priorHlc).to.not.be.undefined;
   });
 
-  it('round-trips a delete change unchanged (no before-image fields)', () => {
+  it('round-trips a delete change with no before-image (absent, not undefined)', () => {
     const change: RowDeletion = { type: 'delete', schema: 'main', table: 'users', pk: [1], hlc };
     const restored = deserializeQuarantineEntry(
       serializeQuarantineEntry({ change, receivedAt: 99 }),
     ).change;
     expect(restored.type).to.equal('delete');
     expect(restored).to.not.have.property('priorValue');
+    expect(restored).to.not.have.property('priorRow');
+  });
+
+  it('preserves a delete priorRow (incl. Uint8Array/bigint/null cells) verbatim', () => {
+    const blob = new Uint8Array([0, 1, 127, 255]);
+    const big = 9007199254740993n;
+    const change: RowDeletion = {
+      type: 'delete', schema: 'main', table: 'users', pk: [1], hlc,
+      priorRow: [big, 'Alice', blob, null],
+    };
+    const restored = deserializeQuarantineEntry(
+      serializeQuarantineEntry({ change, receivedAt: 7 }),
+    ).change as RowDeletion;
+
+    expect(restored.priorRow).to.not.be.undefined;
+    expect(restored.priorRow![0]).to.equal(big);
+    expect(restored.priorRow![1]).to.equal('Alice');
+    expect(restored.priorRow![2]).to.be.instanceOf(Uint8Array);
+    expect(Array.from(restored.priorRow![2] as Uint8Array)).to.deep.equal(Array.from(blob));
+    expect(restored.priorRow![3]).to.be.null;
   });
 });

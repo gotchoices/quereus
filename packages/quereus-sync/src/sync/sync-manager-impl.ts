@@ -404,7 +404,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			}
 
 			const hlc = nextHlc();
-			this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, hlc);
+			// Carry the row's last-known image (the engine `oldRow`) as a best-effort
+			// before-image on both the persisted tombstone and the inline change. Copy
+			// it so neither aliases the engine's row buffer; absent when the event
+			// carried no `oldRow` (relayed/synthesized deletes).
+			const priorRow: Row | undefined = oldRow ? [...oldRow] : undefined;
+			this.tombstones.setTombstoneBatch(batch, schemaName, tableName, pk, hlc, priorRow);
 			this.changeLog.recordDeletionBatch(batch, hlc, schemaName, tableName, pk);
 			await this.columnVersions.deleteRowVersions(schemaName, tableName, pk);
 
@@ -414,6 +419,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				table: tableName,
 				pk,
 				hlc,
+				...(priorRow !== undefined ? { priorRow } : {}),
 			};
 			changes.push(change);
 		} else if (newRow) {
@@ -649,6 +655,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			table: logEntry.table,
 			pk: logEntry.pk,
 			hlc: tombstone.hlc,
+			// Re-emit the stored before-image (spread only when present) so a
+			// receiver/relay forwards the origin's last-known row image unchanged.
+			...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
 		};
 		return deletion;
 	}
@@ -703,6 +712,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				table: parsed.table,
 				pk: parsed.pk,
 				hlc: tombstone.hlc,
+				...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
 			};
 			changes.push(deletion);
 		}

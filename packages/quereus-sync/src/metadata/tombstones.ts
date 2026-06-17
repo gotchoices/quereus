@@ -5,10 +5,14 @@
  * Tombstones prevent deleted rows from being resurrected by older writes.
  */
 
-import type { SqlValue } from '@quereus/quereus';
+import type { Row, SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
+import { encodeSqlValue, decodeSqlValue } from './column-version.js';
 import { buildTombstoneKey, buildTombstoneScanBounds, decodePK } from './keys.js';
+
+/** Fixed-size head of a serialized tombstone: 30 bytes HLC + 8 bytes createdAt. */
+const TOMBSTONE_HEAD_BYTES = 38;
 
 /**
  * Tombstone record.
@@ -16,31 +20,58 @@ import { buildTombstoneKey, buildTombstoneScanBounds, decodePK } from './keys.js
 export interface Tombstone {
   hlc: HLC;
   createdAt: number;  // Wall clock time for TTL calculation
+  /**
+   * Optional last-known row image before deletion (the engine's `oldRow` at delete
+   * time). Persisted so it reaches a receiver via `getChangesSince`, which
+   * re-resolves deletions from the tombstone. Best-effort audit/undo metadata:
+   * absent when the delete carried no `oldRow` and on snapshot-reconstructed
+   * tombstones. A tombstone with no `priorRow` serializes to the fixed 38-byte head.
+   */
+  priorRow?: Row;
 }
 
 /**
  * Serialize a tombstone for storage.
- * Format: 30 bytes HLC + 8 bytes createdAt
+ *
+ * Format: 30 bytes HLC + 8 bytes createdAt, then — only when a `priorRow` is
+ * present — a trailing JSON array of the row's values, each through the column
+ * version `encodeSqlValue` helper so `Uint8Array`/`bigint`/`null` cells round-trip.
+ * A tombstone with no `priorRow` serializes to the unchanged 38-byte head.
  */
 export function serializeTombstone(tombstone: Tombstone): Uint8Array {
-  const result = new Uint8Array(38);
+  const head = new Uint8Array(TOMBSTONE_HEAD_BYTES);
   const hlcBytes = serializeHLC(tombstone.hlc);
-  result.set(hlcBytes, 0);
+  head.set(hlcBytes, 0);
 
-  const view = new DataView(result.buffer);
+  const view = new DataView(head.buffer);
   view.setBigUint64(30, BigInt(tombstone.createdAt), false);
 
+  if (tombstone.priorRow === undefined) return head;
+
+  const payload = new TextEncoder().encode(JSON.stringify(tombstone.priorRow.map(encodeSqlValue)));
+  const result = new Uint8Array(head.length + payload.length);
+  result.set(head, 0);
+  result.set(payload, head.length);
   return result;
 }
 
 /**
- * Deserialize a tombstone from storage.
+ * Deserialize a tombstone from storage. Absent-tolerant: bytes beyond the 38-byte
+ * head are the JSON-encoded `priorRow` (see {@link serializeTombstone}); a
+ * head-only buffer (no before-image, or a snapshot-reconstructed tombstone)
+ * deserializes with `priorRow` absent.
  */
 export function deserializeTombstone(buffer: Uint8Array): Tombstone {
   const hlc = deserializeHLC(buffer.slice(0, 30));
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const createdAt = Number(view.getBigUint64(30, false));
-  return { hlc, createdAt };
+  const tombstone: Tombstone = { hlc, createdAt };
+
+  if (buffer.byteLength > TOMBSTONE_HEAD_BYTES) {
+    const values = JSON.parse(new TextDecoder().decode(buffer.slice(TOMBSTONE_HEAD_BYTES))) as unknown[];
+    tombstone.priorRow = values.map(decodeSqlValue);
+  }
+  return tombstone;
 }
 
 /**
@@ -67,31 +98,35 @@ export class TombstoneStore {
   }
 
   /**
-   * Create a tombstone for a deleted row.
+   * Create a tombstone for a deleted row. `priorRow` (optional) is the row's
+   * last-known image, persisted as best-effort audit/undo metadata.
    */
   async setTombstone(
     schemaName: string,
     tableName: string,
     pk: SqlValue[],
-    hlc: HLC
+    hlc: HLC,
+    priorRow?: Row
   ): Promise<void> {
     const key = buildTombstoneKey(schemaName, tableName, pk);
-    const tombstone: Tombstone = { hlc, createdAt: Date.now() };
+    const tombstone: Tombstone = { hlc, createdAt: Date.now(), ...(priorRow !== undefined ? { priorRow } : {}) };
     await this.kv.put(key, serializeTombstone(tombstone));
   }
 
   /**
-   * Set tombstone in a batch.
+   * Set tombstone in a batch. `priorRow` (optional) is the row's last-known image,
+   * persisted as best-effort audit/undo metadata.
    */
   setTombstoneBatch(
     batch: WriteBatch,
     schemaName: string,
     tableName: string,
     pk: SqlValue[],
-    hlc: HLC
+    hlc: HLC,
+    priorRow?: Row
   ): void {
     const key = buildTombstoneKey(schemaName, tableName, pk);
-    const tombstone: Tombstone = { hlc, createdAt: Date.now() };
+    const tombstone: Tombstone = { hlc, createdAt: Date.now(), ...(priorRow !== undefined ? { priorRow } : {}) };
     batch.put(key, serializeTombstone(tombstone));
   }
 

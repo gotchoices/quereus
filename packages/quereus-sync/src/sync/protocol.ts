@@ -46,6 +46,16 @@ export interface RowDeletion {
   readonly table: string;
   readonly pk: SqlValue[];      // Primary key of deleted row
   readonly hlc: HLC;            // When deletion occurred
+  /**
+   * Optional last-known row image at the origin: the row's column-ordered values
+   * just before it was deleted. Sourced from the engine's `oldRow` at delete time
+   * (no extra read), so it pairs with `pk`/`hlc`. The row side of the per-cell
+   * before-image — lets a receiver show or undo what was removed without having
+   * reconstructed it beforehand. Absent when the delete carried no `oldRow`
+   * (relayed/synthesized deletes) and on snapshot-reconstructed tombstones. Purely
+   * additive and best-effort: producers may omit it, receivers ignore it when absent.
+   */
+  readonly priorRow?: Row;
 }
 
 /**

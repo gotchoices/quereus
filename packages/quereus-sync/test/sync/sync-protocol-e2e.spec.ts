@@ -17,6 +17,7 @@ import {
   type SnapshotChunk,
   type ChangeSet,
   type ColumnChange,
+  type RowDeletion,
 } from '../../src/sync/protocol.js';
 import { StoreEventEmitter, InMemoryKVStore, StoreModule, type KVStoreProvider } from '@quereus/store';
 import { generateSiteId } from '../../src/clock/site.js';
@@ -1485,6 +1486,97 @@ describe('Sync Protocol E2E', () => {
       expect(stored!.priorValue).to.equal('v0');
       expect(stored!.priorHlc).to.not.be.undefined;
       expect(stored!.priorHlc!.wallTime).to.equal(1000n); // h0, not h1 (2000n)
+    });
+  });
+
+  describe('Row before-image (delete priorRow)', () => {
+    /** Flatten all deletions out of a list of ChangeSets. */
+    function deletions(changes: ChangeSet[]): RowDeletion[] {
+      return changes
+        .flatMap(cs => cs.changes)
+        .filter((c): c is RowDeletion => c.type === 'delete');
+    }
+
+    it('carries priorRow matching the pre-delete row image', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      // Insert then delete; the delete should carry the row's last-known image.
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'Alice']);
+    });
+
+    it('omits priorRow when the delete event carried no oldRow', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      // A relayed/synthesized delete: pk present, but no oldRow on the event.
+      host.storeEvents.commitData({
+        type: 'delete',
+        schemaName: 'main',
+        tableName: 'users',
+        key: [7],
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0]).to.not.have.property('priorRow');
+    });
+
+    it('re-emits the latest row image after delete -> reinsert -> delete', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      // Reuse the same pk with a new value, then delete again. The tombstone dedup
+      // drops the prior delete entry, so exactly one delete survives — carrying the
+      // SECOND delete's row image, not the first.
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice v2']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice v2']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'Alice v2']);
+    });
+
+    it('in-batch delete dedup keeps the winning delete row image', async () => {
+      const receiver = await createReplica('receiver', config);
+      const siteA = generateSiteId();
+      const freshPeer = generateSiteId();
+
+      const mkDelete = (priorRow: SqlValue[], wallTime: bigint): RowDeletion => ({
+        type: 'delete', schema: 'main', table: 'users', pk: [1],
+        hlc: { wallTime, counter: 0, siteId: siteA, opSeq: 0 } as HLC,
+        priorRow,
+      });
+      const cs = (transactionId: string, change: RowDeletion): ChangeSet => ({
+        siteId: siteA, transactionId, hlc: change.hlc, changes: [change], schemaMigrations: [],
+      });
+
+      // One applyChanges with two stacked deletes of the same pk: both Phase-1
+      // resolve against the empty pre-batch state, so only the max-HLC winner's
+      // metadata (and priorRow) persists — never the in-batch loser's.
+      await receiver.manager.applyChanges([
+        cs('tx1', mkDelete([1, 'loser'], 2000n)),
+        cs('tx2', mkDelete([1, 'winner'], 3000n)),
+      ]);
+
+      const dels = deletions(await receiver.manager.getChangesSince(freshPeer));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'winner']);
+      expect(dels[0].hlc.wallTime).to.equal(3000n);
     });
   });
 

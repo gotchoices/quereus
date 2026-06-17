@@ -24,6 +24,68 @@ describe('Tombstone', () => {
       expect(deserialized.hlc.counter).to.equal(tombstone.hlc.counter);
       expect(deserialized.createdAt).to.equal(tombstone.createdAt);
     });
+
+    it('serializes to the fixed 38-byte head when priorRow is absent', () => {
+      const siteId = generateSiteId();
+      const tombstone: Tombstone = {
+        hlc: { wallTime: BigInt(1234567890), counter: 7, siteId, opSeq: 0 },
+        createdAt: 1700000000000,
+      };
+
+      const serialized = serializeTombstone(tombstone);
+      expect(serialized.byteLength).to.equal(38);
+
+      const deserialized = deserializeTombstone(serialized);
+      expect(deserialized.priorRow).to.be.undefined;
+      expect(deserialized.createdAt).to.equal(tombstone.createdAt);
+    });
+
+    it('round-trips a priorRow with text/number/null cells', () => {
+      const siteId = generateSiteId();
+      const tombstone: Tombstone = {
+        hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        createdAt: 1700000000001,
+        priorRow: [1, 'Alice', null],
+      };
+
+      const serialized = serializeTombstone(tombstone);
+      expect(serialized.byteLength).to.be.greaterThan(38);
+      expect(deserializeTombstone(serialized).priorRow).to.deep.equal([1, 'Alice', null]);
+    });
+
+    it('round-trips Uint8Array and bigint cells in priorRow', () => {
+      const siteId = generateSiteId();
+      const blob = new Uint8Array([1, 2, 3, 250]);
+      const big = 9007199254740993n; // beyond Number.MAX_SAFE_INTEGER
+      const tombstone: Tombstone = {
+        hlc: { wallTime: BigInt(3000), counter: 0, siteId, opSeq: 0 },
+        createdAt: 1700000000002,
+        priorRow: [big, blob, 'x'],
+      };
+
+      const deserialized = deserializeTombstone(serializeTombstone(tombstone));
+      expect(deserialized.priorRow).to.not.be.undefined;
+      expect(deserialized.priorRow![0]).to.equal(big);
+      expect(deserialized.priorRow![1]).to.be.instanceOf(Uint8Array);
+      expect(Array.from(deserialized.priorRow![1] as Uint8Array)).to.deep.equal([1, 2, 3, 250]);
+      expect(deserialized.priorRow![2]).to.equal('x');
+    });
+
+    it('preserves an empty priorRow as present (distinct from absent)', () => {
+      // An empty row image still serializes past the 38-byte head and round-trips
+      // to [] — not undefined — so "deleted a zero-column row" is not confused with
+      // "no before-image captured".
+      const siteId = generateSiteId();
+      const tombstone: Tombstone = {
+        hlc: { wallTime: BigInt(4000), counter: 0, siteId, opSeq: 0 },
+        createdAt: 1700000000003,
+        priorRow: [],
+      };
+
+      const serialized = serializeTombstone(tombstone);
+      expect(serialized.byteLength).to.be.greaterThan(38);
+      expect(deserializeTombstone(serialized).priorRow).to.deep.equal([]);
+    });
   });
 
   describe('TombstoneStore', () => {
@@ -50,6 +112,44 @@ describe('Tombstone', () => {
     it('should return undefined for non-existent tombstones', async () => {
       const result = await store.getTombstone('main', 'users', [999]);
       expect(result).to.be.undefined;
+    });
+
+    it('should persist and retrieve priorRow on the tombstone', async () => {
+      const siteId = generateSiteId();
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 };
+
+      await store.setTombstone('main', 'users', [1], hlc, [1, 'Alice', null]);
+      const retrieved = await store.getTombstone('main', 'users', [1]);
+
+      expect(retrieved).to.not.be.undefined;
+      expect(retrieved!.priorRow).to.deep.equal([1, 'Alice', null]);
+    });
+
+    it('should omit priorRow when none is provided', async () => {
+      const siteId = generateSiteId();
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId, opSeq: 0 };
+
+      await store.setTombstone('main', 'users', [1], hlc);
+      const retrieved = await store.getTombstone('main', 'users', [1]);
+
+      expect(retrieved).to.not.be.undefined;
+      expect(retrieved!.priorRow).to.be.undefined;
+    });
+
+    it('delete -> reinsert -> delete keeps the latest row image', async () => {
+      const siteId = generateSiteId();
+      const firstDelete: HLC = { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 };
+      const secondDelete: HLC = { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 };
+
+      // First delete records the original image; after a reinsert at the same pk a
+      // later delete overwrites the (same-key) tombstone, so the survivor carries
+      // the LATEST delete's row image — never a stale earlier one.
+      await store.setTombstone('main', 'users', [1], firstDelete, [1, 'Alice']);
+      await store.setTombstone('main', 'users', [1], secondDelete, [1, 'Alice v2']);
+
+      const retrieved = await store.getTombstone('main', 'users', [1]);
+      expect(retrieved!.hlc.wallTime).to.equal(2000n);
+      expect(retrieved!.priorRow).to.deep.equal([1, 'Alice v2']);
     });
 
     it('should block writes when tombstone exists and resurrection not allowed', async () => {
