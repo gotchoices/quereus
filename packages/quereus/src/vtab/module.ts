@@ -326,6 +326,26 @@ export interface VirtualTableModule<
 	): Promise<void>;
 
 	/**
+	 * Optional. Discard the durable backing {@link ensureBackingForAttach} freshly
+	 * created when a FRESH attach (not a re-attach over an already-maintained table)
+	 * FAILS after the store was created (a reconcile / declared-constraint
+	 * violation). The table reverts to its original ordinary form; this drops the
+	 * just-created store and leaves ordinary storage UNTOUCHED — distinct from
+	 * {@link retireBackingForAttach}, which migrates store rows back into ordinary
+	 * storage (here the ordinary storage still holds the pre-attach rows and the
+	 * store is empty / rolled-back, so a migrate would clobber them).
+	 *
+	 * Only called for a fresh attach (no prior derivation) whose reconcile did not
+	 * commit. No-op for modules with a single physical storage. Omit ⇒ attach
+	 * failure is catalog-only rollback (today's behavior).
+	 */
+	discardBackingForAttach?(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+	): Promise<void>;
+
+	/**
 	 * Alter an existing table's structure. Called by ALTER TABLE for
 	 * data-affecting changes — every `SchemaChangeInfo` arm: ADD / DROP /
 	 * RENAME COLUMN, ADD / DROP / RENAME CONSTRAINT, ALTER COLUMN, ALTER

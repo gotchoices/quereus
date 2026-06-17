@@ -1,254 +1,351 @@
 /**
- * LevelDB KVStore provider implementation.
+ * LevelDB KVStoreProvider — shared-root layout.
  *
- * Manages LevelDB stores for the StoreModule.
+ * All of a database's stores live inside ONE physical LevelDB at `basePath`, each
+ * as a sublevel keyed by its store name:
  *
- * Storage naming convention:
- *   {basePath}/{schema}/{table}              - Data store (row data)
- *   {basePath}/{schema}/{table}_idx_{name}   - Index store (secondary indexes)
- *   {basePath}/__stats__                     - Unified stats store (row counts for all tables)
- *   {basePath}/__catalog__                   - Catalog store (DDL metadata)
+ *   {schema}.{table}            - table data       (buildDataStoreName)
+ *   {schema}.{table}_idx_{name} - secondary index  (buildIndexStoreName)
+ *   __stats__                   - unified stats     (STATS_STORE_NAME)
+ *   __catalog__                 - catalog / DDL     (CATALOG_STORE_NAME)
+ *
+ * Because every sublevel shares one physical store, a single chained batch
+ * (`root.batch()…write()`) commits across sublevels atomically and durably — see
+ * {@link LevelDBProvider.beginAtomicBatch}. This is the crash-safe single commit
+ * that the prior per-directory layout (a separate ClassicLevel per table) could
+ * not provide: separate physical databases cannot share a write batch.
+ *
+ * HARD CUTOVER: this is the only LevelDB layout. Databases written by the prior
+ * per-directory layout (`{basePath}/{schema}/{table}`) are NOT read here and must
+ * be re-created (pre-1.0 dev data). There is no on-disk migration. See README.
  */
 
-import path from 'node:path';
-import fs from 'node:fs';
-import type { KVStore, KVStoreProvider } from '@quereus/store';
-import { STORE_SUFFIX, CATALOG_STORE_NAME, STATS_STORE_NAME } from '@quereus/store';
+import { ClassicLevel, type ChainedBatch } from 'classic-level';
+import type { AbstractSublevel } from 'abstract-level';
+import type { AtomicBatch, KVStore, KVStoreProvider } from '@quereus/store';
+import { buildDataStoreName, buildIndexStoreName, CATALOG_STORE_NAME, STATS_STORE_NAME } from '@quereus/store';
+import { QuereusError, StatusCode } from '@quereus/quereus';
 import { LevelDBStore } from './store.js';
+
+/** The shared physical root database. */
+type LevelRoot = ClassicLevel<Uint8Array, Uint8Array>;
+
+/** A sublevel of the shared root — one logical store. */
+type Sublevel = AbstractSublevel<LevelRoot, string | Buffer | Uint8Array, Uint8Array, Uint8Array>;
+
+const textEncoder = new TextEncoder();
+
+/**
+ * Encode a logical store name into a sublevel-safe name.
+ *
+ * abstract-level requires every byte of a sublevel name to be in `(separator, 127)`
+ * — with the default `!` separator that is 35..126. Logical store names are
+ * `{schema}.{table}` identifiers that may contain spaces, punctuation, or non-ASCII
+ * (e.g. a quoted table name `"Table With Spaces"`), so any byte outside the safe set
+ * is percent-encoded. The mapping is deterministic and injective (distinct logical
+ * names → distinct sublevel names), which is all the provider's name-keyed caching
+ * and the StoreModule's collision checks require; the sublevel name is never decoded
+ * back. Common names (lowercase identifiers, `.`, `_`) pass through unchanged.
+ */
+function encodeSublevelName(name: string): string {
+	let out = '';
+	for (const b of textEncoder.encode(name)) {
+		// Safe: printable ASCII in (34, 127) except '%' (0x25), which is reserved as
+		// the escape introducer so the encoding stays injective.
+		if (b > 34 && b < 127 && b !== 0x25) {
+			out += String.fromCharCode(b);
+		} else {
+			out += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+		}
+	}
+	return out;
+}
 
 /**
  * Options for creating a LevelDB provider.
  */
 export interface LevelDBProviderOptions {
 	/**
-	 * Base path for all LevelDB stores.
-	 * Each table gets a subdirectory under this path.
+	 * Base path for the single shared LevelDB database. Every table, index, the
+	 * catalog, and stats live as sublevels inside this one physical store.
 	 */
 	basePath: string;
 
 	/**
-	 * Create directories if they don't exist.
+	 * Create the database if it doesn't exist.
 	 * @default true
 	 */
 	createIfMissing?: boolean;
+
+	/**
+	 * fsync each atomic transaction commit (the chained batch issued by
+	 * {@link LevelDBProvider.beginAtomicBatch}) before resolving. Default true —
+	 * a committed transaction then survives power loss, which is the crash-safe
+	 * guarantee this layout exists to provide. The cost is one fsync per commit;
+	 * set false to trade durability for lower commit latency.
+	 * @default true
+	 */
+	syncCommits?: boolean;
 }
 
 /**
- * LevelDB implementation of KVStoreProvider.
- *
- * Creates separate LevelDB databases for each table, stored
- * in subdirectories under the configured base path.
+ * LevelDB implementation of KVStoreProvider over a single shared root with one
+ * sublevel per logical store.
  */
 export class LevelDBProvider implements KVStoreProvider {
 	private basePath: string;
 	private createIfMissing: boolean;
+	private syncCommits: boolean;
+
+	/** The shared physical root, once opened. */
+	private root: LevelRoot | null = null;
+	/** Memoized in-flight root open so concurrent first-opens share one handle. */
+	private rootOpening: Promise<LevelRoot> | null = null;
+
+	/** Cached store handles, keyed by store (sublevel) name. */
 	private stores = new Map<string, LevelDBStore>();
-	private storePaths = new Map<string, string>();
-	// In-flight opens, keyed by store name, so concurrent getOrCreateStore calls
-	// for the same store share a single LevelDB handle instead of each racing to
-	// open the directory (LevelDB holds an exclusive LOCK; the loser throws).
+	/** In-flight sublevel opens, keyed by store name, so concurrent callers dedupe. */
 	private storeOpening = new Map<string, Promise<LevelDBStore>>();
-	private catalogStore: LevelDBStore | null = null;
-	private catalogStoreOpening: Promise<LevelDBStore> | null = null;
-	private statsStore: LevelDBStore | null = null;
-	private statsStoreOpening: Promise<LevelDBStore> | null = null;
+	/**
+	 * Sublevel + ownership proof for every store this provider produced. Used by the
+	 * atomic batch to map a {@link KVStore} handle back to its sublevel and to reject
+	 * a foreign handle (a non-LevelDB store, or one from another provider, is absent).
+	 */
+	private sublevelByStore = new WeakMap<KVStore, Sublevel>();
 
 	constructor(options: LevelDBProviderOptions) {
 		this.basePath = options.basePath;
 		this.createIfMissing = options.createIfMissing ?? true;
+		this.syncCommits = options.syncCommits ?? true;
 	}
 
-	async getStore(schemaName: string, tableName: string, options?: Record<string, unknown>): Promise<KVStore> {
-		const storeName = `${schemaName}.${tableName}`.toLowerCase();
-		const storePath = (options?.path as string) || path.join(this.basePath, schemaName, tableName);
-		return this.getOrCreateStore(storeName, storePath);
+	async getStore(schemaName: string, tableName: string, _options?: Record<string, unknown>): Promise<KVStore> {
+		// NOTE: the prior per-directory layout honored an `options.path` override to
+		// place a table's database elsewhere. With one shared root there is no
+		// per-table path, so the override is gone (the engine never passed it).
+		return this.getOrCreateStore(buildDataStoreName(schemaName, tableName));
 	}
 
 	async getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore> {
-		const storeName = `${schemaName}.${tableName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase();
-		const storePath = path.join(this.basePath, schemaName, `${tableName}${STORE_SUFFIX.INDEX}${indexName}`);
-		return this.getOrCreateStore(storeName, storePath);
+		return this.getOrCreateStore(buildIndexStoreName(schemaName, tableName, indexName));
 	}
 
 	async getStatsStore(_schemaName: string, _tableName: string): Promise<KVStore> {
-		// Use the unified __stats__ store for all tables.
-		if (this.statsStore) return this.statsStore;
-		if (!this.statsStoreOpening) {
-			const statsPath = path.join(this.basePath, STATS_STORE_NAME);
-			this.statsStoreOpening = LevelDBStore.open({
-				path: statsPath,
-				createIfMissing: this.createIfMissing,
-			}).then(store => {
-				this.statsStore = store;
-				this.statsStoreOpening = null;
-				return store;
-			}).catch(err => {
-				this.statsStoreOpening = null;
-				throw err;
-			});
-		}
-		return this.statsStoreOpening;
+		// Unified __stats__ store for all tables.
+		return this.getOrCreateStore(STATS_STORE_NAME);
 	}
 
 	async getCatalogStore(): Promise<KVStore> {
-		// Memoize the in-flight open so concurrent callers (e.g. a lazy DDL flush
-		// racing an ALTER's own catalog write) share a single handle. Caching only
-		// the resolved store left a window where a second caller passed the null
-		// check and opened a duplicate handle, which LevelDB's exclusive LOCK rejects.
-		if (this.catalogStore) return this.catalogStore;
-		if (!this.catalogStoreOpening) {
-			const catalogPath = path.join(this.basePath, CATALOG_STORE_NAME);
-			this.catalogStoreOpening = LevelDBStore.open({
-				path: catalogPath,
-				createIfMissing: this.createIfMissing,
-			}).then(store => {
-				this.catalogStore = store;
-				this.catalogStoreOpening = null;
-				return store;
-			}).catch(err => {
-				this.catalogStoreOpening = null;
-				throw err;
-			});
-		}
-		return this.catalogStoreOpening;
+		return this.getOrCreateStore(CATALOG_STORE_NAME);
 	}
 
 	async closeStore(schemaName: string, tableName: string): Promise<void> {
-		const storeName = `${schemaName}.${tableName}`.toLowerCase();
-		await this.closeStoreByName(storeName);
+		await this.closeStoreByName(buildDataStoreName(schemaName, tableName));
 	}
 
 	async closeIndexStore(schemaName: string, tableName: string, indexName: string): Promise<void> {
-		const storeName = `${schemaName}.${tableName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase();
-		await this.closeStoreByName(storeName);
+		await this.closeStoreByName(buildIndexStoreName(schemaName, tableName, indexName));
 	}
 
 	async closeAll(): Promise<void> {
-		// Await any in-flight opens first so we don't strand a freshly-opened
-		// handle (and its file LOCK) after clearing the maps below.
+		// Await any in-flight opens (stores + root) first so we don't strand a
+		// freshly-opened sublevel/root after clearing the caches and closing the root.
 		await Promise.allSettled([
 			...this.storeOpening.values(),
-			this.catalogStoreOpening,
-			this.statsStoreOpening,
+			this.rootOpening,
 		].filter(Boolean) as Promise<unknown>[]);
 
+		// Close each cached sublevel handle, then close the root. Closing the root
+		// would itself cascade to attached sublevels, but closing handles first
+		// marks our store wrappers closed and keeps the close ordering explicit.
 		for (const store of this.stores.values()) {
 			await store.close();
 		}
 		this.stores.clear();
 		this.storeOpening.clear();
 
-		if (this.catalogStore) {
-			await this.catalogStore.close();
-			this.catalogStore = null;
+		if (this.root) {
+			await this.root.close();
+			this.root = null;
 		}
-		this.catalogStoreOpening = null;
-
-		if (this.statsStore) {
-			await this.statsStore.close();
-			this.statsStore = null;
-		}
-		this.statsStoreOpening = null;
+		this.rootOpening = null;
 	}
 
 	async deleteIndexStore(schemaName: string, tableName: string, indexName: string): Promise<void> {
-		const storeName = `${schemaName}.${tableName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase();
-		const storePath = this.storePaths.get(storeName)
-			?? path.join(this.basePath, schemaName, `${tableName}${STORE_SUFFIX.INDEX}${indexName}`);
-		await this.closeStoreByName(storeName);
-		await removeDir(storePath);
+		await this.clearAndDropStore(buildIndexStoreName(schemaName, tableName, indexName));
 	}
 
 	async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void> {
-		const oldDataStoreName = `${schemaName}.${oldName}`.toLowerCase();
-		const newDataStoreName = `${schemaName}.${newName}`.toLowerCase();
+		const root = await this.getRoot();
+		const oldDataStoreName = buildDataStoreName(schemaName, oldName);
+		const newDataStoreName = buildDataStoreName(schemaName, newName);
 
 		if (this.stores.has(newDataStoreName)) {
 			throw new Error(`Cannot rename '${oldName}' to '${newName}': store already open under the new name`);
 		}
 
-		// Plan every directory move up front and check ALL destinations before
-		// touching anything: a destination check interleaved with the moves would
-		// fail only after earlier directories had already relocated, leaving a
-		// half-renamed table (and on POSIX, renaming onto an existing EMPTY
-		// directory succeeds — a silent clobber, not even an error). Source paths
-		// mirror getStore/getIndexStore (original-case `{table}` /
-		// `{table}_idx_{index}`), and only directories named in the schema are
-		// moved rather than readdir-scanning the `{oldName}_idx_` prefix (which
-		// would relocate a sibling table's directory too).
-		const schemaDir = path.join(this.basePath, schemaName);
-		const moves: Array<{ from: string; to: string }> = [];
-		const planMove = async (from: string, to: string) => {
-			if (!(await pathExists(from))) return; // not yet materialized — nothing to move
-			if (await pathExists(to)) {
-				throw new Error(`Cannot rename '${oldName}' to '${newName}': destination path '${to}' already exists`);
+		// (old → new) store-name pairs: data store + each schema index, built
+		// exact-by-name via buildIndexStoreName — never a `${oldName}_idx_` prefix
+		// scan, which would also match a sibling table literally named
+		// `${oldName}_idx_<x>` (its data store) and relocate its keys.
+		const pairs: Array<{ old: string; new: string }> = [
+			{ old: oldDataStoreName, new: newDataStoreName },
+		];
+		for (const indexName of indexNames) {
+			pairs.push({
+				old: buildIndexStoreName(schemaName, oldName, indexName),
+				new: buildIndexStoreName(schemaName, newName, indexName),
+			});
+		}
+
+		// Open destination sublevels and assert each is empty BEFORE moving anything.
+		// A non-empty (or already-open) destination is a silent clobber/merge — this
+		// is the backstop equivalent of the prior fs "destination already exists"
+		// guard (e.g. an index relocating onto a sibling table's data store).
+		const destSublevels = new Map<string, Sublevel>();
+		try {
+			for (const pair of pairs) {
+				if (this.stores.has(pair.new)) {
+					throw new Error(`Cannot rename '${oldName}' to '${newName}': destination store '${pair.new}' already open`);
+				}
+				const dest = this.openSublevel(root, pair.new);
+				await dest.open();
+				if (await sublevelHasAnyKey(dest)) {
+					throw new Error(`Cannot rename '${oldName}' to '${newName}': destination store '${pair.new}' already exists`);
+				}
+				destSublevels.set(pair.new, dest);
 			}
-			moves.push({ from, to });
-		};
-		await planMove(path.join(schemaDir, oldName), path.join(schemaDir, newName));
-		for (const indexName of indexNames) {
-			await planMove(
-				path.join(schemaDir, `${oldName}${STORE_SUFFIX.INDEX}${indexName}`),
-				path.join(schemaDir, `${newName}${STORE_SUFFIX.INDEX}${indexName}`),
-			);
-		}
 
-		// Close all open handles for the old table (data + indexes) so LevelDB
-		// releases its file locks before we move the directories. Index handles are
-		// closed by exact store key, not by scanning `{oldName}_idx_` — that prefix
-		// also matches a sibling table named `{oldName}_idx_<x>`.
-		await this.closeStoreByName(oldDataStoreName);
-		for (const indexName of indexNames) {
-			await this.closeStoreByName(`${schemaName}.${oldName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase());
-		}
+			// Relocate every pair's keys in ONE chained batch over the shared root:
+			// put → new sublevel, del → old sublevel. A single write() is atomic and
+			// durable, so the rename is all-or-nothing across data + every index.
+			const batch = root.batch();
+			for (const pair of pairs) {
+				const oldStore = await this.getOrCreateStore(pair.old);
+				const oldSublevel = this.sublevelByStore.get(oldStore)!;
+				const dest = destSublevels.get(pair.new)!;
+				for await (const { key, value } of oldStore.iterate()) {
+					batch.put(key, value, { sublevel: dest });
+					batch.del(key, { sublevel: oldSublevel });
+				}
+			}
+			if (batch.length > 0) {
+				await batch.write({ sync: this.syncCommits });
+			} else {
+				await batch.close();
+			}
 
-		for (const { from, to } of moves) {
-			await fs.promises.rename(from, to);
+			// Drop old handles so subsequent getStore/getIndexStore open fresh
+			// sublevels under the new name (the old keyspaces are now empty).
+			for (const pair of pairs) {
+				await this.closeStoreByName(pair.old);
+			}
+		} finally {
+			// Close the temporary destination handles; the next getStore(newName)
+			// opens and caches a fresh sublevel over the now-populated keyspace.
+			for (const dest of destSublevels.values()) {
+				await dest.close().catch(() => { /* best-effort cleanup */ });
+			}
 		}
 	}
 
 	async deleteTableStores(schemaName: string, tableName: string, indexNames: readonly string[]): Promise<void> {
-		// Close and remove data store directory
-		const dataStoreName = `${schemaName}.${tableName}`.toLowerCase();
-		const dataStorePath = this.storePaths.get(dataStoreName)
-			?? path.join(this.basePath, schemaName, tableName);
-		await this.closeStoreByName(dataStoreName);
-		await removeDir(dataStorePath);
+		// Clear and drop the data store's keyspace.
+		await this.clearAndDropStore(buildDataStoreName(schemaName, tableName));
 
-		// Stats are in the unified __stats__ store, so no need to close a separate store
-		// The individual stats entry will be removed by the calling code if needed
+		// Stats live in the unified __stats__ store; the individual stats entry is
+		// removed by the calling code (StoreModule), not by clearing a store.
 
-		// Close and remove exactly the table's index directories (by name). This
-		// also covers the post-restart case — the names come from the rehydrated
-		// schema — without the ambiguity of a `{tableName}_idx_` directory sweep,
-		// which would also delete a sibling table named `{tableName}_idx_<x>`.
-		// Tradeoff: a truly orphaned index dir not present in the schema (e.g. left
-		// by a crash mid-DROP INDEX) is no longer incidentally swept.
-		const schemaDir = path.join(this.basePath, schemaName);
+		// Clear exactly the table's index stores (by name). Built via
+		// buildIndexStoreName from the authoritative schema index list — never a
+		// `${tableName}_idx_` prefix scan, which would also match a sibling table
+		// literally named `${tableName}_idx_<x>` and destroy its data.
 		for (const indexName of indexNames) {
-			const storeName = `${schemaName}.${tableName}${STORE_SUFFIX.INDEX}${indexName}`.toLowerCase();
-			const indexPath = this.storePaths.get(storeName)
-				?? path.join(schemaDir, `${tableName}${STORE_SUFFIX.INDEX}${indexName}`);
-			await this.closeStoreByName(storeName);
-			await removeDir(indexPath);
+			await this.clearAndDropStore(buildIndexStoreName(schemaName, tableName, indexName));
 		}
 	}
 
-	private async getOrCreateStore(storeName: string, storePath: string): Promise<LevelDBStore> {
-		const existing = this.stores.get(storeName);
-		if (existing) return existing;
+	/**
+	 * Open an atomic batch across this provider's sublevels, or undefined when the
+	 * shared root has not been opened yet (no stores exist → nothing to commit).
+	 *
+	 * All sublevels share one physical LevelDB, so a single chained batch
+	 * (`root.batch()…write()`) with each op targeting its sublevel commits them
+	 * atomically and durably. The transaction coordinator uses this to commit a
+	 * table's data + secondary-index stores in one physical batch, closing the
+	 * crash window where a per-store loop could leave them divergent.
+	 *
+	 * In practice the coordinator only calls this once it has pending ops — which
+	 * means stores (hence the root) were already opened — so the undefined branch
+	 * is defensive (the coordinator falls back to per-store `batch()`).
+	 */
+	beginAtomicBatch(): AtomicBatch | undefined {
+		const root = this.root;
+		if (!root) return undefined;
+		return new LevelDBAtomicBatch(root, (store) => this.resolveSublevel(store), this.syncCommits);
+	}
 
-		// Share a single in-flight open across concurrent callers for the same
-		// store name; opening a second LevelDB handle on the same directory while
-		// the first is still open trips the exclusive LOCK.
+	/**
+	 * Map a {@link KVStore} handle this provider handed out back to its sublevel.
+	 * A handle not produced by this provider (wrong type, or from another provider)
+	 * is absent from the ownership map — a programming error.
+	 */
+	private resolveSublevel(store: KVStore): Sublevel {
+		const sublevel = this.sublevelByStore.get(store);
+		if (!sublevel) {
+			throw new QuereusError(
+				'AtomicBatch received a KVStore handle not produced by this provider',
+				StatusCode.MISUSE,
+			);
+		}
+		return sublevel;
+	}
+
+	/** Open (memoized) the shared physical root database. */
+	private async getRoot(): Promise<LevelRoot> {
+		if (this.root) return this.root;
+		if (!this.rootOpening) {
+			const db = new ClassicLevel<Uint8Array, Uint8Array>(this.basePath, {
+				keyEncoding: 'view',
+				valueEncoding: 'view',
+				createIfMissing: this.createIfMissing,
+			});
+			this.rootOpening = db.open().then(() => {
+				this.root = db;
+				this.rootOpening = null;
+				return db;
+			}).catch(err => {
+				this.rootOpening = null;
+				throw err;
+			});
+		}
+		return this.rootOpening;
+	}
+
+	/** Create a sublevel handle over the shared root, with the store's byte encodings. */
+	private openSublevel(root: LevelRoot, storeName: string): Sublevel {
+		return root.sublevel<Uint8Array, Uint8Array>(encodeSublevelName(storeName), {
+			keyEncoding: 'view',
+			valueEncoding: 'view',
+		});
+	}
+
+	private async getOrCreateStore(storeName: string): Promise<LevelDBStore> {
+		const existing = this.stores.get(storeName);
+		if (existing && !existing.isClosed()) return existing;
+		if (existing) {
+			// A handle handed out earlier was closed out-of-band (e.g. the StoreTable's
+			// releaseIndexStore closes the index handle before dropIndex calls
+			// deleteIndexStore). Evict the stale entry and reopen a fresh sublevel.
+			this.stores.delete(storeName);
+		}
+
+		// Share a single in-flight open across concurrent callers for the same store
+		// name so we cache exactly one handle (and one sublevel) per name.
 		let opening = this.storeOpening.get(storeName);
 		if (!opening) {
-			opening = LevelDBStore.open({
-				path: storePath,
-				createIfMissing: this.createIfMissing,
-			}).then(store => {
+			opening = this.openSublevelStore(storeName).then(store => {
 				this.stores.set(storeName, store);
-				this.storePaths.set(storeName, storePath);
 				this.storeOpening.delete(storeName);
 				return store;
 			}).catch(err => {
@@ -260,28 +357,81 @@ export class LevelDBProvider implements KVStoreProvider {
 		return opening;
 	}
 
+	private async openSublevelStore(storeName: string): Promise<LevelDBStore> {
+		const root = await this.getRoot();
+		const sublevel = this.openSublevel(root, storeName);
+		await sublevel.open();
+		const store = LevelDBStore.overSublevel(sublevel);
+		this.sublevelByStore.set(store, sublevel);
+		return store;
+	}
+
 	private async closeStoreByName(storeName: string): Promise<void> {
 		const store = this.stores.get(storeName);
 		if (store) {
-			// Remove from maps before awaiting close, so a concurrent
+			// Remove from the map before awaiting close, so a concurrent
 			// getOrCreateStore cannot observe a store that is about to be closed.
 			this.stores.delete(storeName);
-			this.storePaths.delete(storeName);
-			await store.close();
+			await store.close(); // drops the sublevel handle; the shared root stays open
 		}
+	}
+
+	/** Clear a store's keyspace (sublevel.clear) and drop its cached handle. */
+	private async clearAndDropStore(storeName: string): Promise<void> {
+		const store = await this.getOrCreateStore(storeName);
+		await store.clear();
+		await this.closeStoreByName(storeName);
 	}
 }
 
-async function removeDir(dirPath: string): Promise<void> {
-	await fs.promises.rm(dirPath, { recursive: true, force: true });
+/** True if the sublevel has at least one key. */
+async function sublevelHasAnyKey(sublevel: Sublevel): Promise<boolean> {
+	for await (const _key of sublevel.keys({ limit: 1 })) {
+		return true;
+	}
+	return false;
 }
 
-async function pathExists(p: string): Promise<boolean> {
-	try {
-		await fs.promises.access(p);
-		return true;
-	} catch {
-		return false;
+/**
+ * {@link AtomicBatch} over the shared root's chained batch.
+ *
+ * Every op targets its store's sublevel via the chained-batch `{ sublevel }`
+ * option, so a single `write()` commits across all referenced sublevels in one
+ * atomic, durable physical commit. Handles are mapped to sublevels by the
+ * provider's `resolveSublevel`.
+ */
+class LevelDBAtomicBatch implements AtomicBatch {
+	private readonly batch: ChainedBatch<LevelRoot, Uint8Array, Uint8Array>;
+
+	constructor(
+		root: LevelRoot,
+		private readonly resolveSublevel: (store: KVStore) => Sublevel,
+		private readonly sync: boolean,
+	) {
+		this.batch = root.batch();
+	}
+
+	put(store: KVStore, key: Uint8Array, value: Uint8Array): void {
+		this.batch.put(key, value, { sublevel: this.resolveSublevel(store) });
+	}
+
+	delete(store: KVStore, key: Uint8Array): void {
+		this.batch.del(key, { sublevel: this.resolveSublevel(store) });
+	}
+
+	async write(): Promise<void> {
+		if (this.batch.length === 0) {
+			// Free the chained batch's resources without a no-op commit.
+			await this.batch.close();
+			return;
+		}
+		// sync=true → fsync the commit so a committed transaction survives power loss
+		// (the crash-safe commit this layout exists to provide). One fsync per commit.
+		await this.batch.write({ sync: this.sync });
+	}
+
+	clear(): void {
+		this.batch.clear();
 	}
 }
 

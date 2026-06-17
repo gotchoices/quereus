@@ -1351,6 +1351,7 @@ async function runSetMaintained(
 		rctx.db, live, select,
 		/*recordedColumns*/ explicit ? columns : undefined,
 		/*positionalRename*/ explicit, /*allowReshape*/ true,
+		/*discardBackingOnFailure*/ true,
 	);
 	log('Attached derivation to table %s.%s', live.schemaName, live.name);
 	return null;

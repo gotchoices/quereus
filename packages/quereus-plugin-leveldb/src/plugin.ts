@@ -13,17 +13,25 @@ import { LevelDBProvider } from './provider.js';
  */
 export interface LevelDBPluginConfig {
 	/**
-	 * Base path for all LevelDB stores.
-	 * Each table gets a subdirectory under this path.
+	 * Base path for the single shared LevelDB database. Every table, index, the
+	 * catalog, and stats live as sublevels inside this one physical store.
 	 * @default './data'
 	 */
 	basePath?: string;
 
 	/**
-	 * Create directories if they don't exist.
+	 * Create the database if it doesn't exist.
 	 * @default true
 	 */
 	createIfMissing?: boolean;
+
+	/**
+	 * fsync each transaction commit before resolving, so a committed transaction
+	 * survives power loss. The cost is one fsync per commit; set false to trade
+	 * durability for lower commit latency.
+	 * @default true
+	 */
+	syncCommits?: boolean;
 
 	/**
 	 * Module name to register. Tables are created with `USING <moduleName>`.
@@ -50,10 +58,12 @@ export default function register(
 	const createIfMissing = config.createIfMissing !== false;
 	const moduleName = (config.moduleName as string) ?? 'store';
 	const isolation = (config.isolation as boolean) ?? true;
+	const syncCommits = config.syncCommits !== false;
 
 	const provider = new LevelDBProvider({
 		basePath,
 		createIfMissing,
+		syncCommits,
 	});
 
 	const storeModule = isolation

@@ -75,7 +75,7 @@ import {
 	type MaintenanceSourceStats,
 	type MaintenanceStrategy,
 } from '../planner/cost/index.js';
-import { resolveBackingHost, isBodyIrrelevantTableChange, tryRecompileMaterializedViewLive } from '../runtime/emit/materialized-view-helpers.js';
+import { resolveBackingHost, tryResolveBackingHost, isBodyIrrelevantTableChange, tryRecompileMaterializedViewLive } from '../runtime/emit/materialized-view-helpers.js';
 import { assertTransitiveRestrictsForParentMutation, executeForeignKeyActionsAndLens } from '../runtime/foreign-key-actions.js';
 import { buildDerivedRowValidator, makePoisonedDerivedRowValidator, validateDerivedRowImage, type DerivedRowConstraintValidator } from './derived-row-validator.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
@@ -1454,8 +1454,16 @@ export class MaterializedViewManager {
 		// demanding host. Two gates of the same shape: a non-replicable FUNCTION (which the
 		// body walk's function-bearing nodes carry) and a non-replicable COLLATION (which rides
 		// each scalar node's resolved type plus the backing key's declared collations).
-		const host = this.backingHost(mv);
-		if (host.requiresReplicableDerivations) {
+		// Resolve the host LENIENTLY: at the create-time gate registration of an
+		// `alter table … set maintained` attach, a module that materializes its durable
+		// backing late (lamina's `ensureBackingForAttach`, after this gate) has no host
+		// yet. The host is used here ONLY for the host-conditional, default-inert
+		// `requiresReplicableDerivations` gate — a host that sets it (the synced-store
+		// flavor) always exists by plan-build time, so skipping the gate when the host
+		// is absent never lets a non-replicable body slip past. The reconcile resolves
+		// the host for real, and the maintenance arms re-resolve it per use.
+		const host = tryResolveBackingHost(db, mv);
+		if (host?.requiresReplicableDerivations) {
 			const offendingFn = findNonReplicableFunction(analyzed);
 			if (offendingFn) throw nonReplicableDerivationError(mv.name, offendingFn);
 			const offendingCollation = findNonReplicableCollation(analyzed, mv, db);

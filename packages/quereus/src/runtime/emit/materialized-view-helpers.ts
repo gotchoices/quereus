@@ -939,6 +939,16 @@ export async function attachMaintainedDerivation(
 	recordedColumns: ReadonlyArray<string> | undefined,
 	positionalRename = false,
 	allowReshape = false,
+	/**
+	 * When true, a FAILED FRESH attach discards (via {@link VirtualTableModule.discardBackingForAttach})
+	 * any backing store {@link VirtualTableModule.ensureBackingForAttach} created IN
+	 * THIS attach. Set by the `set maintained` ATTACH verb ({@link runSetMaintained}),
+	 * which owns its own backing cleanup. NOT set by `create table … maintained`
+	 * ({@link createMaintainedTable}) — there the store was created by the prior
+	 * `createTable(preferBacking)`, and the create path's own `dropTable` cleanup
+	 * retires it; a discard here would double-drop and strand the catalog entry.
+	 */
+	discardBackingOnFailure = false,
 ): Promise<MaintainedTableSchema> {
 	const sm = db.schemaManager;
 	const schemaName = table.schemaName;
@@ -1165,6 +1175,16 @@ export async function attachMaintainedDerivation(
 			restoreReshaped(current);
 		} else {
 			restorePrior();
+		}
+		// Discard a backing store freshly created by `ensureBackingForAttach` for a
+		// FAILED FRESH attach (no prior derivation): the table reverts to ordinary,
+		// whose storage still holds the pre-attach rows, so the just-created (empty /
+		// rolled-back) store must be dropped — otherwise the module would keep routing
+		// reads to it. A re-attach (priorMaintained) reused the existing store, which
+		// `restorePrior` keeps for the restored prior derivation, so it is NOT
+		// discarded. The reconcile-committed branch keeps its committed store (stale).
+		if (discardBackingOnFailure && !reconcileCommitted && !priorMaintained) {
+			await module.discardBackingForAttach?.(db, schemaName, name);
 		}
 		throw e;
 	}
@@ -2357,6 +2377,24 @@ export function resolveBackingHost(db: Database, backingSchema: TableSchema): Ba
 		);
 	}
 	return host;
+}
+
+/**
+ * Lenient counterpart of {@link resolveBackingHost}: returns the backing host, or
+ * `undefined` when the owning module cannot (yet) resolve one — instead of
+ * throwing. Used at maintenance-PLAN-BUILD time (the create-time gate registration),
+ * where the only use of the host is the host-conditional, default-inert
+ * `requiresReplicableDerivations` gate. A module that materializes its durable
+ * backing LATE in the attach flow (e.g. lamina's `ensureBackingForAttach`, which
+ * runs after the gate registration) has no host yet at plan-build time; the host is
+ * resolved for real at the reconcile, and the steady-state maintenance arms
+ * re-resolve it per use. Skipping the replicable gate when the host is absent is
+ * sound: a host that sets `requiresReplicableDerivations` (the synced-store flavor)
+ * always exists by plan-build time, so the gate still binds it.
+ */
+export function tryResolveBackingHost(db: Database, backingSchema: TableSchema): BackingHost | undefined {
+	const module = requireVtabModule(backingSchema);
+	return module.getBackingHost?.(db, backingSchema.schemaName, backingSchema.name);
 }
 
 /**

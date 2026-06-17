@@ -63,7 +63,14 @@
         "label": "Create If Missing",
         "type": "boolean",
         "default": true,
-        "help": "Create directories if they don't exist"
+        "help": "Create the database if it doesn't exist"
+      },
+      {
+        "key": "syncCommits",
+        "label": "Sync Commits",
+        "type": "boolean",
+        "default": true,
+        "help": "fsync each transaction commit so it survives power loss (slower commits when on)"
       },
       {
         "key": "moduleName",
@@ -90,6 +97,7 @@
   "dependencies": {
     "@quereus/quereus": "workspace:^",
     "@quereus/store": "workspace:^",
+    "abstract-level": "^3.1.0",
     "classic-level": "^3.0.0"
   },
   "devDependencies": {
