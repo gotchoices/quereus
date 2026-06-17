@@ -47,6 +47,8 @@ interface SerializedQuarantineEntry {
   readonly r: number;        // receivedAt (ms)
   readonly col?: string;     // column (column changes only)
   readonly v?: unknown;      // encodeSqlValue(value) (column changes only)
+  readonly pv?: unknown;     // encodeSqlValue(priorValue) — before-image, present iff prior exists
+  readonly ph?: SerializedHLC; // hlcToJson(priorHlc) — before-image, present iff prior exists
 }
 
 /**
@@ -62,8 +64,13 @@ export function serializeQuarantineEntry(entry: QuarantineEntry): Uint8Array {
     h: hlcToJson(c.hlc),
     r: entry.receivedAt,
   };
+  // Preserve the per-cell before-image verbatim so a late/manual replay keeps the
+  // full wire fidelity the module promises (present together or not at all).
+  const prior = c.type === 'column' && c.priorHlc !== undefined
+    ? { pv: encodeSqlValue(c.priorValue ?? null), ph: hlcToJson(c.priorHlc) }
+    : undefined;
   const obj: SerializedQuarantineEntry = c.type === 'column'
-    ? { ...base, col: c.column, v: encodeSqlValue(c.value) }
+    ? { ...base, col: c.column, v: encodeSqlValue(c.value), ...prior }
     : base;
   return new TextEncoder().encode(JSON.stringify(obj));
 }
@@ -76,8 +83,13 @@ export function deserializeQuarantineEntry(buffer: Uint8Array): QuarantineEntry 
   const hlc = hlcFromJson(obj.h);
   const pk = obj.pk.map(decodeSqlValue);
   if (obj.t === 'column') {
+    // Restore the before-image when present (spread only then — keeps prior-less
+    // changes free of phantom undefined fields, matching the producer path).
+    const prior = obj.ph !== undefined
+      ? { priorValue: decodeSqlValue(obj.pv), priorHlc: hlcFromJson(obj.ph) }
+      : undefined;
     return {
-      change: { type: 'column', schema: obj.s, table: obj.tb, pk, column: obj.col!, value: decodeSqlValue(obj.v), hlc },
+      change: { type: 'column', schema: obj.s, table: obj.tb, pk, column: obj.col!, value: decodeSqlValue(obj.v), hlc, ...prior },
       receivedAt: obj.r,
     };
   }
