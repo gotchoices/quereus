@@ -1303,7 +1303,7 @@ interface SyncConfig {
    * basis (an out-of-basis straggler delta — see § Unknown-Table Disposition
    * and migration.md § Contract). Default: `'quarantine'`.
    */
-  unknownTableDisposition: 'ignore' | 'quarantine';
+  unknownTableDisposition: 'ignore' | 'quarantine' | 'store-and-forward';
 
   /**
    * Default policy for reclaiming a *detached* basis table's lingering local
