@@ -2345,6 +2345,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				return;
 			case 'materialized_view_removed': {
 				const { schemaName, objectName } = event;
+				// DROP MAINTAINED detaches catalog-only: the engine has already swapped the
+				// catalog entry to a plain (derivation-less) schema before firing this event,
+				// but a connected `StoreTable` still caches the maintained schema. The store's
+				// `alterTable` reads that cache (`getSchema`), so a following structural ALTER
+				// would spread the stale `derivation` onto the rebuilt schema and re-register
+				// the table as a materialized view (rejecting the next ALTER). Refresh the cache
+				// to the now-plain catalog entry. When the entry is gone entirely (DROP TABLE /
+				// DROP MATERIALIZED VIEW), there is nothing to refresh — `destroy` retires it.
+				const plain = this.subscribedDb?.schemaManager.getTable(schemaName, objectName);
+				if (plain && !isMaintainedTable(plain)) {
+					const connected = this.tables.get(`${schemaName}.${objectName}`.toLowerCase());
+					if (connected) connected.updateSchema(plain);
+				}
 				this.enqueuePersist(() => this.removeMaterializedViewDDL(schemaName, objectName));
 				return;
 			}
