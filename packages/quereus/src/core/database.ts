@@ -1976,8 +1976,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * order (each change's `oldRow` must be the true before-image of *that*
 	 * change — the prior change's `newRow`). The FK-actions facet re-reads
 	 * post-write merged storage and is order-independent for realistic batch
-	 * shapes (see `docs/materialized-views.md` § External row-change ingestion
-	 * for the (E)/(F) exotic-topology caveats). The seam
+	 * shapes (see `docs/sync.md` § Transactional Integrity During Sync for the
+	 * (E)/(F) exotic-topology caveats). The seam
 	 * trusts the origin — it re-validates NOTHING (no CHECK / NOT NULL /
 	 * UNIQUE / child-side FK existence), and it does NOT emit module data
 	 * events (the external writer owns those, including the `remote` flag).
