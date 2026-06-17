@@ -582,27 +582,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			table?.getSchema() ?? db.schemaManager.getTable(schemaName, tableName);
 		const indexNames = (currentSchema?.indexes ?? []).map(i => i.name);
 
-		// Clear internal maps synchronously before any await, so a concurrent
-		// create() cannot observe the stale table/store/coordinator across a
-		// microtask boundary mid-destroy.
-		this.tables.delete(tableKey);
-		this.stores.delete(tableKey);
-		this.coordinators.delete(tableKey);
-
-		if (table) {
-			await table.disconnect();
-		}
-
-		// Delete all stores for this table (data, indexes, stats)
-		if (this.provider.deleteTableStores) {
-			await this.provider.deleteTableStores(schemaName, tableName, indexNames);
-		} else {
-			// Fallback: just close the data store
-			await this.provider.closeStore(schemaName, tableName);
-		}
-
-		// Remove DDL from catalog
-		await this.removeTableDDL(schemaName, tableName);
+		await this.tearDownTableStorage(schemaName, tableName, indexNames);
 
 		// Emit schema change event for table drop
 		this.eventEmitter?.emitSchemaChange({
@@ -638,11 +618,29 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		tableName: string,
 		indexNames: readonly string[],
 	): Promise<void> {
+		await this.tearDownTableStorage(schemaName, tableName, indexNames);
+	}
+
+	/**
+	 * Tear down a table's in-memory handles and physical storage: evict the cached
+	 * StoreTable / store / coordinator (synchronously, before any await, so a
+	 * concurrent reconnect cannot observe a stale instance mid-teardown), disconnect
+	 * the handle, delete the provider's data / index / stats stores (by the exact
+	 * index names — never a `{table}_idx_` prefix scan, which could clobber a sibling
+	 * table literally named `{table}_idx_<x>`), and remove the catalog DDL.
+	 *
+	 * Shared by {@link destroy} (live `drop table`) and {@link reclaimDetachedTable}
+	 * (post-detach eviction). The caller owns the index-name source (live schema vs.
+	 * the captured pre-detach list) and any schema-change event. Idempotent: the
+	 * provider no-ops on absent stores and `removeTableDDL` no-ops on an absent key.
+	 */
+	private async tearDownTableStorage(
+		schemaName: string,
+		tableName: string,
+		indexNames: readonly string[],
+	): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 
-		// Evict any lingering in-memory references synchronously before any await,
-		// matching destroy()'s ordering so a concurrent reconnect cannot observe a
-		// stale instance mid-reclaim.
 		const table = this.tables.get(tableKey);
 		this.tables.delete(tableKey);
 		this.stores.delete(tableKey);
@@ -652,12 +650,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			await table.disconnect();
 		}
 
+		// Delete all stores for this table (data, indexes, stats)
 		if (this.provider.deleteTableStores) {
 			await this.provider.deleteTableStores(schemaName, tableName, indexNames);
 		} else {
+			// Fallback: just close the data store
 			await this.provider.closeStore(schemaName, tableName);
 		}
 
+		// Remove DDL from catalog
 		await this.removeTableDDL(schemaName, tableName);
 	}
 

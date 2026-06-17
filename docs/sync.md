@@ -1284,6 +1284,18 @@ interface SyncConfig {
    */
   unknownTableDisposition: 'ignore' | 'quarantine';
 
+  /**
+   * Default policy for reclaiming a *detached* basis table's lingering local
+   * storage (see migration.md § 4 Contract). `{ mode: 'horizon' }` (default)
+   * evicts once the table has been quiet for `horizonMs` (default
+   * `retentionHorizonMs`); `'never'` keeps storage forever; `'immediate'`
+   * reclaims on the first sweep after detach. A per-table `quereus.sync.evict`
+   * reserved tag overrides this. The sweep — `evictExpiredBasisTables(now?)` — is
+   * host-driven (like `pruneTombstones` / `pruneQuarantine`; no library timer) and
+   * a no-op when no `dropLocalTable` reclaim callback is wired.
+   */
+  basisEviction?: { mode: 'horizon' | 'never' | 'immediate'; horizonMs?: number };
+
   /** Site ID (auto-generated if not provided) */
   siteId?: Uint8Array;
 }
