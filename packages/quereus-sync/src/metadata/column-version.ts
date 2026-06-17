@@ -7,29 +7,53 @@
 
 import type { SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
-import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc.js';
+import { type HLC, type SerializedHLC, serializeHLC, deserializeHLC, compareHLC, hlcToJson, hlcFromJson } from '../clock/hlc.js';
 import { buildColumnVersionKey, buildColumnVersionScanBounds } from './keys.js';
 
 /**
  * Column version record stored in the KV store.
+ *
+ * `priorHlc`/`priorValue` are an optional per-cell before-image: the cell version
+ * this one replaced (its replica-local lineage). They are written together (both
+ * present or both absent) and are absent on the first write of a cell and on
+ * snapshot-reconstructed cells (a snapshot is a fresh basis with no history).
  */
 export interface ColumnVersion {
   hlc: HLC;
   value: SqlValue;
+  priorHlc?: HLC;        // hlc of the version this one replaced
+  priorValue?: SqlValue; // value of the version this one replaced
+}
+
+/**
+ * Self-describing JSON payload for the value portion of a serialized column
+ * version. `v` is the current value; `pv`/`ph` are the optional before-image
+ * (value + HLC), present together or not at all. All values go through
+ * `encodeSqlValue` so `Uint8Array`/`bigint` round-trip.
+ */
+interface SerializedColumnVersionPayload {
+  v: unknown;          // encodeSqlValue(value)
+  pv?: unknown;        // encodeSqlValue(priorValue) — present iff prior exists
+  ph?: SerializedHLC;  // hlcToJson(priorHlc) — present iff prior exists
 }
 
 /**
  * Serialize a column version for storage.
- * Format: 30 bytes HLC + JSON value
+ * Format: 30 bytes HLC + JSON payload `{ v, pv?, ph? }`.
  *
- * Uint8Array values are encoded as `{"__bin":"<base64>"}` so they survive
- * the JSON round-trip (plain JSON.stringify turns Uint8Array into an object
- * with numeric keys, which loses type information).
+ * Uint8Array values are encoded as `{"__bin":"<base64>"}` (bigint as
+ * `{"__bigint":"..."}`) so they survive the JSON round-trip; the same encoding
+ * covers the before-image (`pv`). The before-image fields are omitted entirely
+ * when the version has no prior, keeping first-writes and snapshot cells compact.
  */
 export function serializeColumnVersion(cv: ColumnVersion): Uint8Array {
   const hlcBytes = serializeHLC(cv.hlc);
-  const valueJson = JSON.stringify(encodeSqlValue(cv.value));
-  const valueBytes = new TextEncoder().encode(valueJson);
+  const payload: SerializedColumnVersionPayload = { v: encodeSqlValue(cv.value) };
+  if (cv.priorHlc !== undefined) {
+    payload.ph = hlcToJson(cv.priorHlc);
+    payload.pv = encodeSqlValue(cv.priorValue ?? null);
+  }
+  const valueBytes = new TextEncoder().encode(JSON.stringify(payload));
 
   const result = new Uint8Array(hlcBytes.length + valueBytes.length);
   result.set(hlcBytes, 0);
@@ -38,13 +62,18 @@ export function serializeColumnVersion(cv: ColumnVersion): Uint8Array {
 }
 
 /**
- * Deserialize a column version from storage.
+ * Deserialize a column version from storage. Tolerant of the before-image being
+ * absent (first-writes and snapshot-reconstructed cells carry none).
  */
 export function deserializeColumnVersion(buffer: Uint8Array): ColumnVersion {
   const hlc = deserializeHLC(buffer.slice(0, 30));
-  const valueJson = new TextDecoder().decode(buffer.slice(30));
-  const value = decodeSqlValue(JSON.parse(valueJson));
-  return { hlc, value };
+  const payload = JSON.parse(new TextDecoder().decode(buffer.slice(30))) as SerializedColumnVersionPayload;
+  const cv: ColumnVersion = { hlc, value: decodeSqlValue(payload.v) };
+  if (payload.ph !== undefined) {
+    cv.priorHlc = hlcFromJson(payload.ph);
+    cv.priorValue = decodeSqlValue(payload.pv);
+  }
+  return cv;
 }
 
 // ============================================================================

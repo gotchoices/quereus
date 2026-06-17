@@ -334,6 +334,12 @@ export async function resolveChange(
 			change.column,
 		);
 
+		// Surface the incoming change's before-image to the resolver and conflict
+		// events (spread only when present — keeps the no-prior fast path identical).
+		const remotePrior = change.priorHlc !== undefined
+			? { remotePriorHlc: change.priorHlc, remotePriorValue: change.priorValue }
+			: undefined;
+
 		if (localVersion) {
 			const remoteWins = ctx.config.conflictResolver
 				? ctx.config.conflictResolver({
@@ -345,6 +351,7 @@ export async function resolveChange(
 					localHlc: localVersion.hlc,
 					remoteValue: change.value,
 					remoteHlc: change.hlc,
+					...remotePrior,
 				}) === 'remote'
 				: compareHLC(change.hlc, localVersion.hlc) > 0;
 
@@ -358,6 +365,7 @@ export async function resolveChange(
 					remoteValue: change.value,
 					winner: 'local',
 					winningHLC: localVersion.hlc,
+					...remotePrior,
 				});
 				return { outcome: 'conflict', change };
 			}
@@ -386,6 +394,7 @@ export async function resolveChange(
 				remoteValue: change.value,
 				winner: 'remote',
 				winningHLC: change.hlc,
+				...remotePrior,
 			});
 		}
 
@@ -518,13 +527,21 @@ function commitColumnMetadata(
 	if (oldColumnVersion) {
 		ctx.changeLog.deleteEntryBatch(batch, oldColumnVersion.hlc, 'column', change.schema, change.table, change.pk, change.column);
 	}
+	// Persist the before-image as this replica's local lineage: the version this
+	// write replaced here (`oldColumnVersion`). In causal-order delivery that equals
+	// the origin's prior, so re-relay forwards the origin's chain (the prior's own
+	// origin HLC, never reset to this receiver's clock). A first write here records
+	// no prior, matching the local write path in `recordColumnVersions`.
+	const prior = oldColumnVersion
+		? { priorHlc: oldColumnVersion.hlc, priorValue: oldColumnVersion.value }
+		: undefined;
 	ctx.columnVersions.setColumnVersionBatch(
 		batch,
 		change.schema,
 		change.table,
 		change.pk,
 		change.column,
-		{ hlc: change.hlc, value: change.value },
+		{ hlc: change.hlc, value: change.value, ...prior },
 	);
 	ctx.changeLog.recordColumnChangeBatch(batch, change.hlc, change.schema, change.table, change.pk, change.column);
 }

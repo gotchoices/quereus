@@ -60,6 +60,14 @@ export interface ConflictEvent {
   readonly winner: 'local' | 'remote';
   /** HLC of the winning value */
   readonly winningHLC: HLC;
+  /**
+   * The incoming (remote) change's before-image: the value it overwrote at its
+   * origin. Absent when the change carried no prior. Additive and informational —
+   * useful for audit trails and conflict debugging.
+   */
+  readonly remotePriorValue?: SqlValue;
+  /** HLC of the remote before-image. Present iff `remotePriorValue` is. */
+  readonly remotePriorHlc?: HLC;
 }
 
 /**

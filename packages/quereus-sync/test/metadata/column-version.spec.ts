@@ -68,6 +68,90 @@ describe('ColumnVersion', () => {
       expect(Array.from(result)).to.deep.equal(Array.from(blob));
     });
 
+    it('should omit the before-image when no prior version exists', () => {
+      const siteId = generateSiteId();
+      const version: ColumnVersion = {
+        hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        value: 'v2',
+      };
+
+      const deserialized = deserializeColumnVersion(serializeColumnVersion(version));
+
+      expect(deserialized.value).to.equal('v2');
+      // Absent, not undefined-valued: a prior-less version round-trips with no
+      // before-image fields at all.
+      expect(deserialized).to.not.have.property('priorHlc');
+      expect(deserialized).to.not.have.property('priorValue');
+    });
+
+    it('should round-trip the before-image (prior value + prior hlc)', () => {
+      const siteId = generateSiteId();
+      const priorHlc: HLC = { wallTime: BigInt(1000), counter: 3, siteId, opSeq: 7 };
+      const version: ColumnVersion = {
+        hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        value: 'v2',
+        priorHlc,
+        priorValue: 'v1',
+      };
+
+      const deserialized = deserializeColumnVersion(serializeColumnVersion(version));
+
+      expect(deserialized.value).to.equal('v2');
+      expect(deserialized.priorValue).to.equal('v1');
+      expect(deserialized.priorHlc).to.not.be.undefined;
+      expect(deserialized.priorHlc!.wallTime).to.equal(priorHlc.wallTime);
+      expect(deserialized.priorHlc!.counter).to.equal(priorHlc.counter);
+      expect(deserialized.priorHlc!.opSeq).to.equal(priorHlc.opSeq);
+      expect(Array.from(deserialized.priorHlc!.siteId)).to.deep.equal(Array.from(siteId));
+    });
+
+    it('should round-trip a null before-image value', () => {
+      const siteId = generateSiteId();
+      const version: ColumnVersion = {
+        hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        value: 'v2',
+        priorHlc: { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 },
+        priorValue: null,
+      };
+
+      const deserialized = deserializeColumnVersion(serializeColumnVersion(version));
+
+      // Prior present (so priorHlc survives) with a genuine null prior value.
+      expect(deserialized.priorValue).to.be.null;
+      expect(deserialized.priorHlc).to.not.be.undefined;
+    });
+
+    it('should round-trip a Uint8Array before-image value', () => {
+      const siteId = generateSiteId();
+      const priorBlob = new Uint8Array([0, 1, 127, 255, 7, 8]);
+      const version: ColumnVersion = {
+        hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        value: 'v2',
+        priorHlc: { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 },
+        priorValue: priorBlob,
+      };
+
+      const deserialized = deserializeColumnVersion(serializeColumnVersion(version));
+
+      expect(deserialized.priorValue).to.be.instanceOf(Uint8Array);
+      expect(Array.from(deserialized.priorValue as Uint8Array)).to.deep.equal(Array.from(priorBlob));
+    });
+
+    it('should round-trip a bigint before-image value', () => {
+      const siteId = generateSiteId();
+      const priorBig = 9007199254740993n; // beyond Number.MAX_SAFE_INTEGER
+      const version: ColumnVersion = {
+        hlc: { wallTime: BigInt(2000), counter: 0, siteId, opSeq: 0 },
+        value: 'v2',
+        priorHlc: { wallTime: BigInt(1000), counter: 0, siteId, opSeq: 0 },
+        priorValue: priorBig,
+      };
+
+      const deserialized = deserializeColumnVersion(serializeColumnVersion(version));
+
+      expect(deserialized.priorValue).to.equal(priorBig);
+    });
+
     it('should recover legacy corrupted Uint8Array format', () => {
       // Simulate old corrupted format: JSON.stringify(Uint8Array) â†’ {"0":65,"1":66,"2":67}
       const corrupted = { '0': 65, '1': 66, '2': 67 };

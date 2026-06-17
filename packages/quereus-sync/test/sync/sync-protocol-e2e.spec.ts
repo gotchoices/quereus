@@ -15,10 +15,12 @@ import {
   type SchemaChangeToApply,
   type ApplyToStoreCallback,
   type SnapshotChunk,
+  type ChangeSet,
+  type ColumnChange,
 } from '../../src/sync/protocol.js';
 import { StoreEventEmitter, InMemoryKVStore, StoreModule, type KVStoreProvider } from '@quereus/store';
 import { generateSiteId } from '../../src/clock/site.js';
-import { compareHLC } from '../../src/clock/hlc.js';
+import { compareHLC, type HLC } from '../../src/clock/hlc.js';
 import type { SyncManager } from '../../src/sync/manager.js';
 import { Database, type SqlValue, type TableSchema } from '@quereus/quereus';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
@@ -1380,6 +1382,109 @@ describe('Sync Protocol E2E', () => {
       // Guest's data store should have the schema change applied via callback
       const schemaChanges = guest.dataStore.changeLog.filter(c => c.type === 'schema');
       expect(schemaChanges.length).to.be.at.least(1, 'Snapshot should apply schema migrations to store');
+    });
+  });
+
+  describe('Before-image (per-cell prior)', () => {
+    /** Flatten all column changes out of a list of ChangeSets. */
+    function columnChanges(changes: ChangeSet[]): ColumnChange[] {
+      return changes
+        .flatMap(cs => cs.changes)
+        .filter((c): c is ColumnChange => c.type === 'column');
+    }
+
+    it('omits prior on first insert and carries it on a later overwrite', async () => {
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+
+      // First write of each cell: no before-image anywhere.
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Original']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const afterInsert = columnChanges(await host.manager.getChangesSince(freshPeer));
+      expect(afterInsert.length).to.be.greaterThan(0);
+      for (const c of afterInsert) {
+        expect(c).to.not.have.property('priorValue');
+        expect(c).to.not.have.property('priorHlc');
+      }
+      const insertedValueCol = afterInsert.find(c => c.column === 'col_1');
+      expect(insertedValueCol).to.exist;
+      const insertHlc = insertedValueCol!.hlc;
+
+      // Overwrite the value column in a separate transaction.
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalUpdate(host, 'main', 'users', [1], [1, 'Original'], [1, 'Updated']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const overwritten = columnChanges(await host.manager.getChangesSince(freshPeer))
+        .find(c => c.column === 'col_1');
+      expect(overwritten).to.exist;
+      expect(overwritten!.value).to.equal('Updated');
+      expect(overwritten!.priorValue).to.equal('Original');
+      expect(overwritten!.priorHlc).to.not.be.undefined;
+      // The before-image HLC is exactly the overwritten version's HLC.
+      expect(compareHLC(overwritten!.priorHlc!, insertHlc)).to.equal(0);
+    });
+
+    it('preserves the origin prior chain when relayed through a receiver', async () => {
+      const host = await createReplica('host', config);
+      const relay = await createReplica('relay', config);
+      const freshPeer = generateSiteId();
+
+      // Round 1: relay receives the insert (so relay holds the pre-overwrite version).
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Original']);
+      await new Promise(r => setTimeout(r, 10));
+      const r1 = await host.manager.getChangesSince(relay.manager.getSiteId());
+      await relay.manager.applyChanges(r1);
+      const insertHlc = columnChanges(r1).find(c => c.column === 'col_1')!.hlc;
+
+      // Round 2: relay receives the overwrite; its local lineage prior is the insert.
+      emitLocalUpdate(host, 'main', 'users', [1], [1, 'Original'], [1, 'Updated']);
+      await new Promise(r => setTimeout(r, 10));
+      const r2 = await host.manager.getChangesSince(relay.manager.getSiteId());
+      await relay.manager.applyChanges(r2);
+
+      // Relay re-emits the origin's prior (its stored before-image), not its own clock.
+      const relayed = columnChanges(await relay.manager.getChangesSince(freshPeer))
+        .find(c => c.column === 'col_1');
+      expect(relayed).to.exist;
+      expect(relayed!.value).to.equal('Updated');
+      expect(relayed!.priorValue).to.equal('Original');
+      expect(relayed!.priorHlc).to.not.be.undefined;
+      expect(compareHLC(relayed!.priorHlc!, insertHlc)).to.equal(0);
+    });
+
+    it('in-batch dedup keeps the pre-batch prior, not an in-batch loser', async () => {
+      const receiver = await createReplica('receiver', config);
+      const siteA = generateSiteId();
+      const freshPeer = generateSiteId();
+
+      const mk = (value: SqlValue, wallTime: bigint): ColumnChange => ({
+        type: 'column', schema: 'main', table: 'users', pk: [1], column: 'col_1', value,
+        hlc: { wallTime, counter: 0, siteId: siteA, opSeq: 0 } as HLC,
+      });
+      const cs = (transactionId: string, change: ColumnChange): ChangeSet => ({
+        siteId: siteA, transactionId, hlc: change.hlc, changes: [change], schemaMigrations: [],
+      });
+
+      // Pre-batch: receiver stores v0@1000 (first write here, no prior).
+      await receiver.manager.applyChanges([cs('tx0', mk('v0', 1000n))]);
+
+      // One applyChanges with two stacked versions of the same cell; BOTH Phase-1
+      // resolve against the pre-batch v0@1000, so the surviving winner's prior is
+      // v0@1000 — never the in-batch loser v1@2000.
+      await receiver.manager.applyChanges([
+        cs('tx1', mk('v1', 2000n)),
+        cs('tx2', mk('v2', 3000n)),
+      ]);
+
+      const stored = columnChanges(await receiver.manager.getChangesSince(freshPeer))
+        .find(c => c.column === 'col_1');
+      expect(stored).to.exist;
+      expect(stored!.value).to.equal('v2');
+      expect(stored!.priorValue).to.equal('v0');
+      expect(stored!.priorHlc).to.not.be.undefined;
+      expect(stored!.priorHlc!.wallTime).to.equal(1000n); // h0, not h1 (2000n)
     });
   });
 

@@ -131,6 +131,13 @@ const { syncManager } = await createSyncModule(kv, storeEvents, {
 
 When no `conflictResolver` is configured, the fast-path HLC comparison is used directly (no extra KV read per column). Schema conflicts remain non-pluggable.
 
+The `ctx` (`ConflictContext`) also carries the incoming change's optional before-image as
+`ctx.remotePriorValue` / `ctx.remotePriorHlc` — the value (and its HLC) the remote write
+overwrote at its origin (see § Data Structures → per-cell before-image). This lets a
+resolver or transition validator see what the source changed *from* (e.g. accept the
+remote only if it transitioned from the value the receiver still holds). Both are absent
+when the incoming change carried no prior, and they do **not** affect default resolution.
+
 > **Future Work**: The architecture supports extending to other CRDT types (counters, sets, RGA for text) by tracking different metadata per column type.
 
 ### Tombstones and Deletions
@@ -499,7 +506,34 @@ interface ColumnChange {
   column: string;
   value: SqlValue;
   hlc: HLC;
+  priorValue?: SqlValue;             // before-image: the value this write overwrote
+  priorHlc?: HLC;                    // HLC of the overwritten cell version
 }
+```
+
+**Per-cell before-image (`priorValue` / `priorHlc`).** An optional, purely additive
+before-image mirroring Lamina's `UpdateCellFact(new_value, prior_value?, prior_hlc?)`.
+It carries the cell version this write replaced, so a receiver can see *what changed
+from what* (audit trails, undo, conflict debugging) without a separate lookup.
+
+- **Source = the prior tracked cell version**, not the engine's `oldRow[i]`. `oldRow`
+  has no HLC and can diverge from the CRDT cell lineage; the before-image is the prior
+  `ColumnVersion` (`{ hlc, value }`), so it pairs semantically with `value`/`hlc`.
+- **Replica-local lineage.** Stored on each `ColumnVersion` as "what this write replaced
+  *here*" (`oldVersion` on the local write path, `oldColumnVersion` on apply). In
+  causal-order delivery that equals the origin's prior, so a relaying receiver re-emits
+  the origin's chain (the prior's own origin HLC, never reset to the receiver's clock).
+- **Best-effort.** Both fields are absent on the first write of a cell and on
+  snapshot-reconstructed cells (a snapshot is a fresh basis with no history). Producers
+  may omit them; receivers ignore them when absent; the no-`conflictResolver` HLC fast
+  path is unchanged. Repeated local overwrites before a pull keep one change-log entry
+  per cell, whose prior is the *immediately* overwritten version — "what the winning
+  write overwrote", not "the value at last sync" (intended Lamina semantics).
+- **Not used to skip the receiver's re-read.** The receiver's own `localValue` still
+  comes from its `getColumnVersion` read; the before-image is exposed only for the
+  resolver/validator. The "skip the re-read" optimization is intentionally **not** taken
+  (it would risk regressing the fast path).
+```typescript
 
 /** A row deletion */
 interface RowDeletion {
@@ -894,6 +928,8 @@ interface ConflictEvent {
   remoteValue: SqlValue;
   winner: 'local' | 'remote';
   winningHLC: HLC;
+  remotePriorValue?: SqlValue;       // incoming change's before-image (what it overwrote at its origin)
+  remotePriorHlc?: HLC;              // HLC of that before-image; present iff remotePriorValue is
 }
 
 interface UnknownTableEvent {

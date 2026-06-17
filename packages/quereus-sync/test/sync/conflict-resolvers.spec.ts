@@ -422,6 +422,95 @@ describe('Pluggable Conflict Resolution', () => {
 		});
 	});
 
+	describe('Remote before-image exposure', () => {
+		it('passes remotePriorValue/remotePriorHlc into the ConflictContext', async () => {
+			const capturedContexts: ConflictContext[] = [];
+			const spy: ConflictResolver = (ctx) => {
+				capturedContexts.push(ctx);
+				return 'local';
+			};
+
+			const host = await createReplica({ ...DEFAULT_SYNC_CONFIG });
+			const guest = await createReplica({ ...DEFAULT_SYNC_CONFIG, conflictResolver: spy });
+
+			emitInsert(host, 'main', 'items', [1], [1, 'V0']);
+			await delay(5);
+			await syncBidirectional(host, guest);
+
+			// Two host overwrites before the next pull: the surviving change's prior
+			// is the immediately-overwritten V1 (Lamina "what the winning write
+			// overwrote", not "value at last sync").
+			emitUpdate(host, 'main', 'items', [1], [1, 'V0'], [1, 'V1']);
+			await delay(20);
+			emitUpdate(host, 'main', 'items', [1], [1, 'V1'], [1, 'V2']);
+			await delay(20);
+
+			// Guest still holds V0 locally, so applying host's V2 triggers the resolver.
+			await syncOneway(host, guest);
+
+			const ctx = capturedContexts.find(c => c.column === 'col_1');
+			expect(ctx).to.exist;
+			expect(ctx!.localValue).to.equal('V0');
+			expect(ctx!.remoteValue).to.equal('V2');
+			expect(ctx!.remotePriorValue).to.equal('V1');
+			expect(ctx!.remotePriorHlc).to.not.be.undefined;
+		});
+
+		it('emits the remote before-image on an LWW conflict with no resolver', async () => {
+			const config: SyncConfig = { ...DEFAULT_SYNC_CONFIG };
+			const host = await createReplica(config);
+			const guest = await createReplica(config);
+
+			const conflicts: ConflictEvent[] = [];
+			guest.syncEvents.onConflictResolved(e => conflicts.push(e));
+
+			emitInsert(host, 'main', 'users', [1], [1, 'Original']);
+			await delay(5);
+			await syncBidirectional(host, guest);
+
+			// Guest writes first (older), host writes later (newer — wins via LWW).
+			emitUpdate(guest, 'main', 'users', [1], [1, 'Original'], [1, 'Guest Value']);
+			await delay(50);
+			emitUpdate(host, 'main', 'users', [1], [1, 'Original'], [1, 'Host Value']);
+			await delay(10);
+
+			await syncOneway(host, guest);
+
+			const e = conflicts.find(ev => ev.column === 'col_1');
+			expect(e).to.exist;
+			expect(e!.winner).to.equal('remote');
+			// Fast path (no resolver) still resolves by HLC; the event now also carries
+			// the remote write's before-image (the 'Original' it overwrote at the host).
+			expect(e!.remotePriorValue).to.equal('Original');
+			expect(e!.remotePriorHlc).to.not.be.undefined;
+		});
+
+		it('omits remotePrior fields when the incoming change has no prior', async () => {
+			const capturedContexts: ConflictContext[] = [];
+			const spy: ConflictResolver = (ctx) => {
+				capturedContexts.push(ctx);
+				return 'local';
+			};
+
+			// Host re-inserts the SAME pk both replicas already hold, so guest sees a
+			// conflict whose incoming change is a first-write (no before-image).
+			const host = await createReplica({ ...DEFAULT_SYNC_CONFIG });
+			const guest = await createReplica({ ...DEFAULT_SYNC_CONFIG, conflictResolver: spy });
+
+			emitInsert(guest, 'main', 'users', [1], [1, 'GuestSolo']);
+			await delay(5);
+			emitInsert(host, 'main', 'users', [1], [1, 'HostSolo']);
+			await delay(10);
+
+			await syncOneway(host, guest);
+
+			const ctx = capturedContexts.find(c => c.column === 'col_1');
+			expect(ctx).to.exist;
+			expect(ctx).to.not.have.property('remotePriorValue');
+			expect(ctx).to.not.have.property('remotePriorHlc');
+		});
+	});
+
 	describe('lwwResolver (explicit)', () => {
 		it('should behave identically to default fast path', async () => {
 			const config: SyncConfig = { ...DEFAULT_SYNC_CONFIG, conflictResolver: lwwResolver };

@@ -25,6 +25,16 @@ export interface ColumnChange {
   readonly column: string;      // Column name
   readonly value: SqlValue;     // New value
   readonly hlc: HLC;            // When this change occurred
+  /**
+   * Optional per-cell before-image: the value this write overwrote at the origin.
+   * Sourced from the prior *tracked* cell version (not the engine's `oldRow`), so
+   * it pairs semantically with `value`/`hlc`. Absent on the first write of a cell
+   * (no prior version) and on snapshot-reconstructed cells. Purely additive and
+   * best-effort: producers may omit it, receivers ignore it when absent.
+   */
+  readonly priorValue?: SqlValue;
+  /** HLC of the overwritten cell version. Present iff `priorValue` is. */
+  readonly priorHlc?: HLC;
 }
 
 /**
@@ -386,6 +396,16 @@ export interface ConflictContext {
   readonly localHlc: HLC;
   readonly remoteValue: SqlValue;
   readonly remoteHlc: HLC;
+  /**
+   * The incoming change's before-image: the value the remote write overwrote at
+   * its origin. Lets a resolver / transition validator see what the remote side
+   * changed *from*. Absent when the incoming change carried no prior (first write
+   * at the origin, snapshot-loaded cell, or a producer that omits it). Informational
+   * only — it does not affect resolution.
+   */
+  readonly remotePriorValue?: SqlValue;
+  /** HLC of the remote before-image. Present iff `remotePriorValue` is. */
+  readonly remotePriorHlc?: HLC;
 }
 
 /**

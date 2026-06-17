@@ -462,7 +462,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				}
 
 				const hlc = nextHlc();
-				const version: ColumnVersion = { hlc, value: newValue };
+				// Carry the overwritten cell version as a best-effort before-image on
+				// both the persisted version and the inline change. Spread only when a
+				// prior exists — first writes carry neither field (absent, not undefined).
+				const prior = oldVersion
+					? { priorHlc: oldVersion.hlc, priorValue: oldVersion.value }
+					: undefined;
+				const version: ColumnVersion = { hlc, value: newValue, ...prior };
 				this.columnVersions.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
 				this.changeLog.recordColumnChangeBatch(batch, hlc, schemaName, tableName, pk, column);
 
@@ -474,6 +480,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 					column,
 					value: newValue,
 					hlc,
+					...prior,
 				};
 				changes.push(change);
 			}
@@ -622,6 +629,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				column: logEntry.column!,
 				value: cv.value,
 				hlc: cv.hlc,
+				// Re-emit the stored before-image (spread only when present), so a
+				// receiver/relay forwards the origin's prior chain unchanged.
+				...(cv.priorHlc !== undefined ? { priorHlc: cv.priorHlc, priorValue: cv.priorValue } : {}),
 			};
 			return columnChange;
 		}
@@ -674,6 +684,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				column: parsed.column,
 				value: cv.value,
 				hlc: cv.hlc,
+				...(cv.priorHlc !== undefined ? { priorHlc: cv.priorHlc, priorValue: cv.priorValue } : {}),
 			};
 			changes.push(columnChange);
 		}
