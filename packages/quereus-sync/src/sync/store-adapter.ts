@@ -179,7 +179,10 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
     }
 
     // Effective changes accumulated across all tables, in apply order,
-    // for the single end-of-invocation seam call.
+    // for the single end-of-invocation seam call. The order here is
+    // table-grouped (first-appearance opSeq); it is NOT a dependency
+    // order and the FK-actions facet does not require one — both FK
+    // helpers re-read post-write storage applied above.
     const seamBatch: ExternalRowChange[] = [];
 
     // Apply data changes per table; the resolved StoreTable owns key

@@ -265,6 +265,84 @@ describe('Database.ingestExternalRowChanges (external row-change ingestion)', ()
 			);
 			expect((await readAll(db, 'select id from c')).map(r => Number(r.id))).to.deep.equal([10]);
 		});
+
+		it('multi-parent cascade: both orders succeed and empty the child table', async () => {
+			// Two independent parent rows each with one cascade child.
+			// Neither child has a FK to the other parent, so the two cascades
+			// are completely independent — the seam batch order must not matter.
+			await db.exec(`
+				create table p2 (id integer primary key);
+				create table c2 (id integer primary key, pid integer not null references p2(id) on delete cascade);
+				insert into p2 values (1), (2);
+				insert into c2 values (10, 1), (20, 2);
+			`);
+
+			// Order A: parent 1 delete before parent 2 delete.
+			await directWrite(db, 'p2', 'delete', undefined, [1]);
+			await directWrite(db, 'p2', 'delete', undefined, [2]);
+			await db.ingestExternalRowChanges(
+				[
+					chg('p2', { op: 'delete', oldRow: [1] }),
+					chg('p2', { op: 'delete', oldRow: [2] }),
+				],
+				{ applyForeignKeyActions: true },
+			);
+			expect(await readAll(db, 'select * from c2'), 'order A: both children cascaded').to.deep.equal([]);
+
+			// Restore for order B.
+			await db.exec('insert into p2 values (1), (2); insert into c2 values (10, 1), (20, 2)');
+			// Order B: parent 2 delete before parent 1 delete.
+			await directWrite(db, 'p2', 'delete', undefined, [2]);
+			await directWrite(db, 'p2', 'delete', undefined, [1]);
+			await db.ingestExternalRowChanges(
+				[
+					chg('p2', { op: 'delete', oldRow: [2] }),
+					chg('p2', { op: 'delete', oldRow: [1] }),
+				],
+				{ applyForeignKeyActions: true },
+			);
+			expect(await readAll(db, 'select * from c2'), 'order B: both children cascaded').to.deep.equal([]);
+		});
+
+		it('direct child delete alongside parent delete: both orders succeed', async () => {
+			// The child row is already gone from storage when the cascade would
+			// run — both orderings must succeed (the cascade finds no child to
+			// delete, which is a no-op, not an error).
+			await db.exec(`
+				create table p3 (id integer primary key);
+				create table c3 (id integer primary key, pid integer not null references p3(id) on delete cascade);
+				insert into p3 values (1);
+				insert into c3 values (10, 1);
+			`);
+
+			// Order A: report child delete first, then parent delete.
+			await directWrite(db, 'c3', 'delete', undefined, [10]);
+			await directWrite(db, 'p3', 'delete', undefined, [1]);
+			await db.ingestExternalRowChanges(
+				[
+					chg('c3', { op: 'delete', oldRow: [10, 1] }),
+					chg('p3', { op: 'delete', oldRow: [1] }),
+				],
+				{ applyForeignKeyActions: true },
+			);
+			expect(await readAll(db, 'select * from c3'), 'order A: empty').to.deep.equal([]);
+			expect(await readAll(db, 'select * from p3'), 'order A: parent gone').to.deep.equal([]);
+
+			// Restore for order B.
+			await db.exec('insert into p3 values (1); insert into c3 values (10, 1)');
+			// Order B: report parent delete first, then child delete.
+			await directWrite(db, 'p3', 'delete', undefined, [1]);
+			await directWrite(db, 'c3', 'delete', undefined, [10]);
+			await db.ingestExternalRowChanges(
+				[
+					chg('p3', { op: 'delete', oldRow: [1] }),
+					chg('c3', { op: 'delete', oldRow: [10, 1] }),
+				],
+				{ applyForeignKeyActions: true },
+			);
+			expect(await readAll(db, 'select * from c3'), 'order B: empty').to.deep.equal([]);
+			expect(await readAll(db, 'select * from p3'), 'order B: parent gone').to.deep.equal([]);
+		});
 	});
 
 	describe('FK RESTRICT mid-batch: batch atomicity for derived effects', () => {

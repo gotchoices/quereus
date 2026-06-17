@@ -195,6 +195,18 @@ export async function ingestExternalRowChangeBatch(
 				// already happened (there is no pre-mutation point) and the
 				// child rows it keys off still exist because the cascade has
 				// not run yet.
+				//
+				// Cross-change order-independence: the store adapter writes
+				// every table's rows to storage BEFORE making this seam call,
+				// so both helpers re-read the fully-merged post-write state
+				// regardless of which change appears first in `changes`. This
+				// makes realistic shapes (single parent mutation, multiple
+				// independent parent mutations, parent + direct child write)
+				// order-independent. The two exotic limitations no ordering
+				// fixes: (E) RESTRICT vs. CASCADE on the same child across
+				// two parent mutations; (F) diverging actions (cascade-delete
+				// vs. set-null) on a shared child. Both are handled by keeping
+				// applyForeignKeyActions off (default) or by a global assertion.
 				if (applyForeignKeyActions && change.op !== 'insert') {
 					await assertTransitiveRestrictsForParentMutation(
 						db, tableSchema, change.op, change.oldRow, change.newRow);

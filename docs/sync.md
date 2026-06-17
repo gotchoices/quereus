@@ -434,16 +434,25 @@ introduce a violation; see `store-adapter.ts`.)
 Consequence for cross-table ordering: because child-side FK existence is never checked
 on apply, a child fact carrying a lower `opSeq` than its parent (the per-coordinator
 commit order putting the child's table first) is harmless — there is no fact-granular
-FK check to trip. The two facets that *are* enforced run over the **merged state at the
-batch boundary**, after every fact has landed, so they are order-independent by
-construction: **global assertions** — the home for referential invariants you want the
-replica itself to enforce, and which cover self-referential and cyclic FKs that no
-topological table sort can order — and **opt-in FK actions** (`applyForeignKeyActions`,
-default off). The FK-actions path is the lone order-sensitive consumer: it assumes
-parents-before-children but currently receives the seam batch table-grouped in
-first-appearance `opSeq` order. See
-[`tickets/backlog/sync-cross-table-apply-ordering.md`](../tickets/backlog/sync-cross-table-apply-ordering.md)
-for the scope of remaining work.
+FK check to trip. The two facets that *are* enforced are order-independent for
+realistic batch shapes: **global assertions** — the home for referential invariants you
+want the replica itself to enforce, and which cover self-referential and cyclic FKs that
+no topological table sort can handle — and **opt-in FK actions** (`applyForeignKeyActions`,
+default off). The FK-actions facet is order-independent because the adapter writes every
+table's rows to storage *before* the single seam call, so both FK helpers (the RESTRICT
+walk and cascade DML) re-read the fully-merged post-write state regardless of which
+parent's change entry appears first in the seam batch.
+
+The two exotic limitations that no seam-batch ordering fixes: **(E)** a child referenced
+by two FKs where one parent mutation carries a CASCADE that relieves the same child row
+blocked by another parent's RESTRICT — the outcome depends on which cascade fires first,
+and the seam batch carries no intra-transaction DML order to reconstruct that; **(F)** a
+child of two parents with diverging actions (cascade-delete vs. set-null) where the
+final child state depends on evaluation order. Both topologies are handled by keeping
+`applyForeignKeyActions` off (the default — let the stream carry the origin's cascade
+effects) or by expressing the referential invariant as a **global assertion** (evaluated
+over merged state at the batch boundary; order-independent by construction and able to
+cover self-referential and cyclic shapes).
 
 **Per-Table Batching**: Within each table, changes should be applied using `WriteBatch` for atomicity. The `TransactionCoordinator` in the Store module provides this capability.
 

@@ -1972,9 +1972,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * bypassing the DML executor. The precise, in-transaction alternative to
 	 * the coarse whole-table {@link notifyExternalChange}.
 	 *
-	 * `changes` is a flat ORDERED array (order is semantic for FK actions and
-	 * capture: origin order = parents-before-children etc.); each change's
-	 * `oldRow` must be the accurate before-image of *that* change. The seam
+	 * `changes` is a flat ordered array; same-row changes must appear in event
+	 * order (each change's `oldRow` must be the true before-image of *that*
+	 * change — the prior change's `newRow`). The FK-actions facet re-reads
+	 * post-write merged storage and is order-independent for realistic batch
+	 * shapes (see `docs/materialized-views.md` § External row-change ingestion
+	 * for the (E)/(F) exotic-topology caveats). The seam
 	 * trusts the origin — it re-validates NOTHING (no CHECK / NOT NULL /
 	 * UNIQUE / child-side FK existence), and it does NOT emit module data
 	 * events (the external writer owns those, including the `remote` flag).
