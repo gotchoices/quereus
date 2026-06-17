@@ -614,6 +614,54 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Reclaim the local storage of a DETACHED basis table by name — the store-side
+	 * target of the sync layer's basis-eviction sweep
+	 * (`SyncManager.evictExpiredBasisTables`, `docs/migration.md` § 4 Contract).
+	 *
+	 * Unlike {@link destroy}, the table is no longer in the engine schema (it was
+	 * removed from the basis on detach; only its physical storage lingered), so
+	 * there is no `db`/schema to consult and NO schema-change event is emitted — the
+	 * engine already saw the detach. The caller (the sync recorder) supplies the
+	 * captured secondary-index name list it retained from before detach, because the
+	 * table schema (and its index list) is gone: passing the exact names avoids the
+	 * provider prefix-scanning `{table}_idx_`, which can clobber a sibling table
+	 * literally named `{table}_idx_<x>`.
+	 *
+	 * Idempotent: any cached handles are evicted and disconnected, then the data /
+	 * index / stats stores and the catalog DDL are removed. Storage already gone (a
+	 * prior real `drop table` ran `destroy`) is treated as success — the provider's
+	 * `deleteTableStores` no-ops on absent stores and `removeTableDDL` no-ops on an
+	 * absent key.
+	 */
+	async reclaimDetachedTable(
+		schemaName: string,
+		tableName: string,
+		indexNames: readonly string[],
+	): Promise<void> {
+		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+
+		// Evict any lingering in-memory references synchronously before any await,
+		// matching destroy()'s ordering so a concurrent reconnect cannot observe a
+		// stale instance mid-reclaim.
+		const table = this.tables.get(tableKey);
+		this.tables.delete(tableKey);
+		this.stores.delete(tableKey);
+		this.coordinators.delete(tableKey);
+
+		if (table) {
+			await table.disconnect();
+		}
+
+		if (this.provider.deleteTableStores) {
+			await this.provider.deleteTableStores(schemaName, tableName, indexNames);
+		} else {
+			await this.provider.closeStore(schemaName, tableName);
+		}
+
+		await this.removeTableDDL(schemaName, tableName);
+	}
+
+	/**
 	 * Returns the connected StoreTable for `schemaName.tableName`, lazily
 	 * reconnecting from the engine's schema registry when absent.
 	 *

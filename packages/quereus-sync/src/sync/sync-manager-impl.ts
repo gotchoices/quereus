@@ -15,7 +15,7 @@ import type {
 	DatabaseDataChangeEvent,
 	DatabaseSchemaChangeEvent,
 } from '@quereus/quereus';
-import { QuereusError, StatusCode } from '@quereus/quereus';
+import { QuereusError, StatusCode, SYNC_EVICT_TAG } from '@quereus/quereus';
 import type { GetTableSchemaCallback, TransactionCommitSource } from '../create-sync-module.js';
 import { HLCManager, type HLC, compareHLC, createHLC, deterministicTxnId, MAX_OPSEQ } from '../clock/hlc.js';
 import {
@@ -37,7 +37,11 @@ import {
 	classifyBasisLifecycle,
 	basisLifecycleRecordChanged,
 	splitRelKey,
+	parseEvictPolicyTag,
+	isEvictable,
+	quietSince,
 	type BasisTableLifecycleRecord,
+	type EvictPolicy,
 } from '../metadata/basis-lifecycle.js';
 import type { BasisTableLifecycleEvent } from './events.js';
 import {
@@ -63,6 +67,7 @@ import type {
 	SnapshotChunk,
 	SnapshotProgress,
 	ApplyToStoreCallback,
+	DropLocalTableCallback,
 	UnknownTableDisposition,
 } from './protocol.js';
 import { SyncEventEmitterImpl } from './events.js';
@@ -140,6 +145,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 	private readonly getTableSchema?: GetTableSchemaCallback;
+	/** Reclaim-by-name callback for the eviction sweep; absent ⇒ sweep is a no-op. */
+	private readonly dropLocalTable?: DropLocalTableCallback;
 
 	// Last basis hash recorded per basis schema (in-memory, advisory). Drives the
 	// basis-drift warning in recordLensDeployment — a warning, not durable state.
@@ -157,7 +164,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		hlcManager: HLCManager,
 		syncEvents: SyncEventEmitterImpl,
 		applyToStore?: ApplyToStoreCallback,
-		getTableSchema?: GetTableSchemaCallback
+		getTableSchema?: GetTableSchemaCallback,
+		dropLocalTable?: DropLocalTableCallback,
 	) {
 		this.kv = kv;
 		this.config = config;
@@ -165,6 +173,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.syncEvents = syncEvents;
 		this.applyToStore = applyToStore;
 		this.getTableSchema = getTableSchema;
+		this.dropLocalTable = dropLocalTable;
 		this.columnVersions = new ColumnVersionStore(kv);
 		this.tombstones = new TombstoneStore(kv, config.retentionHorizonMs);
 		this.peerStates = new PeerStateStore(kv);
@@ -187,6 +196,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * @param syncEvents - Sync event emitter for UI integration
 	 * @param applyToStore - Optional callback for applying remote changes to the store
 	 * @param getTableSchema - Optional callback for getting table schema by name
+	 * @param dropLocalTable - Optional reclaim-by-name callback for the basis-table
+	 *   eviction sweep; when absent (e.g. a relay-only coordinator) the sweep is a no-op.
 	 */
 	static async create(
 		kv: KVStore,
@@ -194,7 +205,8 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		config: SyncConfig,
 		syncEvents: SyncEventEmitterImpl,
 		applyToStore?: ApplyToStoreCallback,
-		getTableSchema?: GetTableSchemaCallback
+		getTableSchema?: GetTableSchemaCallback,
+		dropLocalTable?: DropLocalTableCallback,
 	): Promise<SyncManagerImpl> {
 		// Load or create site identity
 		const siteIdKey = new TextEncoder().encode(SITE_ID_KEY);
@@ -225,7 +237,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		}
 
 		const hlcManager = new HLCManager(siteId, hlcState);
-		const manager = new SyncManagerImpl(kv, config, hlcManager, syncEvents, applyToStore, getTableSchema);
+		const manager = new SyncManagerImpl(kv, config, hlcManager, syncEvents, applyToStore, getTableSchema, dropLocalTable);
 
 		// Capture local changes at the engine transaction boundary: one grouped
 		// `onTransactionCommit` batch ⇒ one transaction ⇒ one HLC. The store's
@@ -332,6 +344,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		const basisMembership = new Set<string>();
 		const derivationSources = new Set<string>();
 		const displayName = new Map<string, { schema: string; table: string }>();
+		// Snapshot the eviction-policy tag + secondary-index names of each in-basis
+		// table NOW: both are gone once the table detaches (its schema + tag vanish),
+		// and the eviction sweep needs the index list to reclaim index stores by name.
+		const evictPolicyByKey = new Map<string, EvictPolicy>();
+		const indexNamesByKey = new Map<string, string[]>();
 		if (basisSchema) {
 			for (const table of basisSchema.getAllTables()) {
 				const key = `${table.schemaName}.${table.name}`.toLowerCase();
@@ -340,6 +357,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				for (const src of table.derivation?.sourceTables ?? []) {
 					derivationSources.add(src.toLowerCase());
 				}
+				const policy = parseEvictPolicyTag(table.tags?.[SYNC_EVICT_TAG] ?? null);
+				if (policy !== undefined) evictPolicyByKey.set(key, policy);
+				const indexNames = (table.indexes ?? []).map(i => i.name);
+				if (indexNames.length > 0) indexNamesByKey.set(key, indexNames);
 			}
 		} else if (snapshot.basisSchemaName) {
 			console.warn(
@@ -402,6 +423,20 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				unmappedSince = now;
 			}
 
+			// Stamp detached-at on entry into detached (the eviction quiet-clock
+			// fallback when the table was never directly mapped); clear it on re-attach.
+			const wasDetached = prior?.state === 'detached';
+			const isDetached = state === 'detached';
+			let detachedAt = prior?.detachedAt;
+			if (isDetached && !wasDetached) detachedAt = now;
+			else if (!isDetached) detachedAt = undefined;
+
+			// Eviction override + index list: while in-basis the tag/index list are
+			// authoritative (re-captured each deploy, so a removed tag clears the
+			// override); once out of basis they are gone, so carry the prior record's.
+			const evictPolicy = inBasis ? evictPolicyByKey.get(key) : prior?.evictPolicy;
+			const indexNames = inBasis ? indexNamesByKey.get(key) : prior?.indexNames;
+
 			const display = displayName.get(key)
 				?? (prior ? { schema: prior.schema, table: prior.table } : splitRelKey(key));
 
@@ -414,9 +449,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				inBasis,
 				...(mappedSince !== undefined ? { mappedSince } : {}),
 				...(unmappedSince !== undefined ? { unmappedSince } : {}),
-				// Reserved fields owned by basis-eviction-policy — carry through untouched.
+				...(detachedAt !== undefined ? { detachedAt } : {}),
+				// The dynamic signal is owned by the change applicator — carry through here.
 				...(prior?.lastDirectlyMappedWriteAt !== undefined ? { lastDirectlyMappedWriteAt: prior.lastDirectlyMappedWriteAt } : {}),
-				...(prior?.evictPolicy !== undefined ? { evictPolicy: prior.evictPolicy } : {}),
+				...(evictPolicy !== undefined ? { evictPolicy } : {}),
+				...(indexNames && indexNames.length > 0 ? { indexNames } : {}),
 			};
 
 			if (!prior || basisLifecycleRecordChanged(prior, record)) {
@@ -448,6 +485,60 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	async getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]> {
 		return this.basisLifecycle.list();
+	}
+
+	/**
+	 * Reclaim the local storage of every detached basis table that has been quiet
+	 * past its effective retention horizon (`docs/migration.md` § 4 Contract).
+	 * Host-driven (like {@link pruneTombstones} / {@link pruneQuarantine}) — the
+	 * host schedules it; the library adds no timer. Returns the number of tables
+	 * evicted.
+	 *
+	 * No-op when no `dropLocalTable` reclaim callback is wired (e.g. a relay-only
+	 * coordinator with no store). For each evictable record it re-reads the record
+	 * and re-checks eligibility immediately before dropping — guarding against a
+	 * concurrent re-deploy that re-mapped the table between the scan and the drop —
+	 * then drops the storage, emits `onBasisTableEvicted`, and clears the record. A
+	 * `dropLocalTable` throw leaves the record in place to retry next sweep (the
+	 * drop is idempotent).
+	 */
+	async evictExpiredBasisTables(now: number = Date.now()): Promise<number> {
+		if (!this.dropLocalTable) return 0;
+
+		const records = await this.basisLifecycle.list();
+		let evicted = 0;
+		for (const candidate of records) {
+			if (!isEvictable(candidate, now, this.config)) continue;
+
+			// Re-read + re-check immediately before the drop: a concurrent re-deploy
+			// may have re-mapped (and so re-attached) the table since the scan.
+			const fresh = await this.basisLifecycle.get(candidate.schema, candidate.table);
+			if (!fresh || fresh.state !== 'detached' || !isEvictable(fresh, now, this.config)) continue;
+
+			try {
+				await this.dropLocalTable(fresh.schema, fresh.table, fresh.indexNames ?? []);
+			} catch (error) {
+				// Leave the record; retry next sweep. The drop is idempotent, so a
+				// partial reclaim is re-attempted rather than stranded.
+				console.warn(
+					`[Sync] evictExpiredBasisTables: dropLocalTable failed for '${fresh.schema}.${fresh.table}'; `
+						+ `record retained for retry: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				continue;
+			}
+
+			// Storage reclaimed — clear the record (a later re-create starts fresh) and
+			// emit AFTER the drop succeeded.
+			await this.basisLifecycle.delete(fresh.schema, fresh.table);
+			this.syncEvents.emitBasisTableEvicted({
+				schema: fresh.schema,
+				table: fresh.table,
+				at: now,
+				quietForMs: now - quietSince(fresh),
+			});
+			evicted++;
+		}
+		return evicted;
 	}
 
 	// ============================================================================

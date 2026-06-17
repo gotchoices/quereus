@@ -137,6 +137,28 @@ export interface BasisTableLifecycleEvent {
 }
 
 /**
+ * Fired when the eviction sweep ({@link SyncManager.evictExpiredBasisTables})
+ * reclaims a detached basis table's local storage (`docs/migration.md` § 4
+ * Contract). Emitted after `dropLocalTable` succeeds and the lifecycle record is
+ * cleared. The table was already out of the local basis (detached) before this;
+ * the event reports that its lingering storage has now been reclaimed.
+ */
+export interface BasisTableEvictedEvent {
+  /** Basis schema of the evicted table. */
+  readonly schema: string;
+  /** Basis table whose local storage was reclaimed. */
+  readonly table: string;
+  /** Wall-clock ms when the eviction ran. */
+  readonly at: number;
+  /**
+   * How long (ms) the table had been quiet at eviction time (`now - quietSince`),
+   * i.e. since the later of unmap/detach and the last observed directly-mapped
+   * write. Diagnostic — lets a host see how far past the horizon the drop ran.
+   */
+  readonly quietForMs: number;
+}
+
+/**
  * Sync connection state.
  */
 export type SyncState =
@@ -204,6 +226,12 @@ export interface SyncEventEmitter {
    * (`directly-mapped → derivation-source-only` is the "safe to retire" signal).
    */
   onBasisTableLifecycle(listener: (event: BasisTableLifecycleEvent) => void): Unsubscribe;
+
+  /**
+   * Subscribe to basis-table eviction events.
+   * Fired when the eviction sweep reclaims a detached basis table's local storage.
+   */
+  onBasisTableEvicted(listener: (event: BasisTableEvictedEvent) => void): Unsubscribe;
 }
 
 // ============================================================================
@@ -221,6 +249,7 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   private unknownTableListeners = new Set<(event: UnknownTableEvent) => void>();
   private assertionViolationListeners = new Set<(event: AssertionViolationEvent) => void>();
   private basisTableLifecycleListeners = new Set<(event: BasisTableLifecycleEvent) => void>();
+  private basisTableEvictedListeners = new Set<(event: BasisTableEvictedEvent) => void>();
 
   onRemoteChange(listener: (event: RemoteChangeEvent) => void): Unsubscribe {
     this.remoteChangeListeners.add(listener);
@@ -255,6 +284,11 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   onBasisTableLifecycle(listener: (event: BasisTableLifecycleEvent) => void): Unsubscribe {
     this.basisTableLifecycleListeners.add(listener);
     return () => this.basisTableLifecycleListeners.delete(listener);
+  }
+
+  onBasisTableEvicted(listener: (event: BasisTableEvictedEvent) => void): Unsubscribe {
+    this.basisTableEvictedListeners.add(listener);
+    return () => this.basisTableEvictedListeners.delete(listener);
   }
 
   // Internal emit methods
@@ -297,6 +331,12 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
 
   emitBasisTableLifecycle(event: BasisTableLifecycleEvent): void {
     for (const listener of this.basisTableLifecycleListeners) {
+      listener(event);
+    }
+  }
+
+  emitBasisTableEvicted(event: BasisTableEvictedEvent): void {
+    for (const listener of this.basisTableEvictedListeners) {
       listener(event);
     }
   }

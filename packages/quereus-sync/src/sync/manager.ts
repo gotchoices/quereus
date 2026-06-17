@@ -153,10 +153,25 @@ export interface SyncManager {
 
   /**
    * Read the persisted basis-table lifecycle records (survives restart — no
-   * in-memory-only state). `lastDirectlyMappedWriteAt` / `evictPolicy` come back
-   * as the reserved (undefined) fields until `basis-eviction-policy` populates them.
+   * in-memory-only state). Each record combines the static classification
+   * (`state` + `mappedSince` / `unmappedSince` / `detachedAt`) with the dynamic
+   * `lastDirectlyMappedWriteAt` signal and any captured `evictPolicy` override —
+   * the "safe to retire" reading is `state` is `derivation-source-only` /
+   * `detached` and the quiet clock is older than the effective horizon.
    */
   getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]>;
+
+  /**
+   * Reclaim the local storage of every detached basis table quiet past its
+   * effective retention horizon (`docs/migration.md` § 4 Contract). Host-driven —
+   * call from the same periodic maintenance path as {@link pruneTombstones} /
+   * {@link pruneQuarantine}; the library adds no timer. A no-op when no
+   * `dropLocalTable` reclaim callback was wired (e.g. a relay-only coordinator).
+   * Returns the number of tables evicted. Fires `onBasisTableEvicted` per drop.
+   *
+   * @param now - Wall-clock ms used for horizon math (defaults to `Date.now()`).
+   */
+  evictExpiredBasisTables(now?: number): Promise<number>;
 
   // ============================================================================
   // Streaming Snapshot API

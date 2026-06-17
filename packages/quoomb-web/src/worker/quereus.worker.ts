@@ -643,13 +643,22 @@ class QuereusWorker implements QuereusWorkerAPI {
       events: this.storeEvents,
     });
 
+    // Reclaim-by-name callback for the basis-eviction sweep: a detached basis
+    // table's lingering local storage is dropped through the store module's
+    // reclaim-by-name helper (docs/migration.md § 4 Contract). The sweep
+    // (syncManager.evictExpiredBasisTables) is host-driven — like the tombstone /
+    // quarantine prunes, the library adds no timer.
+    const storeModule = this.storeModule;
+    const dropLocalTable = (schemaName: string, tableName: string, indexNames: readonly string[]) =>
+      storeModule.reclaimDetachedTable(schemaName, tableName, indexNames);
+
     // Create sync module with the store adapter and schema lookup.
     // getTableSchema maps column indices to names; transactionSource (the engine
     // Database) drives local-change capture at the transaction boundary — one HLC
     // per committed transaction.
     const { syncManager, syncEvents } = await createSyncModule(
       this.kvStore,
-      { applyToStore, getTableSchema, transactionSource: db }
+      { applyToStore, getTableSchema, dropLocalTable, transactionSource: db }
     );
 
     this.syncManager = syncManager;

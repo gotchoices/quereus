@@ -92,6 +92,9 @@ export {
   type ConflictResolver,
   // Unknown-table disposition
   type UnknownTableDisposition,
+  // Basis-table eviction
+  type BasisEvictionConfig,
+  type DropLocalTableCallback,
   // Configuration
   type SyncConfig,
   DEFAULT_SYNC_CONFIG,
@@ -128,6 +131,7 @@ export {
   type UnknownTableEvent,
   type AssertionViolationEvent,
   type BasisTableLifecycleEvent,
+  type BasisTableEvictedEvent,
   type SyncState,
   type Unsubscribe,
   type SyncEventEmitter,
@@ -172,8 +176,13 @@ export {
   // Basis-table lifecycle (legacy-table retirement bookkeeping)
   type BasisLifecycleState,
   type BasisTableLifecycleRecord,
+  type EvictPolicy,
   BasisLifecycleStore,
   classifyBasisLifecycle,
+  parseEvictPolicyTag,
+  effectiveEvictHorizonMs,
+  quietSince,
+  isEvictable,
   serializeBasisLifecycleRecord,
   deserializeBasisLifecycleRecord,
   buildBasisLifecycleKey,

@@ -231,6 +231,11 @@ export async function applyChanges(
 				}
 				await qBatch.write();
 			}
+
+			// Dynamic basis-retirement signal: a remote write to a non-directly-mapped
+			// tracked table bumps its `lastDirectlyMappedWriteAt`, deferring eviction
+			// (docs/migration.md § 2 Converge). Advisory — never aborts the apply.
+			await bumpLastDirectlyMappedWrites(ctx, appliedChanges);
 		},
 		// Merging the batch max once is equivalent to receiving each changeset's
 		// HLC (receive is a monotonic max-merge); on a mid-batch abort the clock
@@ -548,4 +553,59 @@ function commitColumnMetadata(
 		{ hlc: change.hlc, value: change.value, ...prior },
 	);
 	ctx.changeLog.recordColumnChangeBatch(batch, change.hlc, change.schema, change.table, change.pk, change.column);
+}
+
+/**
+ * Bump `lastDirectlyMappedWriteAt` for each non-directly-mapped tracked basis
+ * table that received an inbound (remote) write this apply — the dynamic
+ * basis-retirement signal (docs/migration.md § 2 Converge). Every `appliedChange`
+ * is remote (self-origin is skipped before resolution), so any write to a legacy
+ * table is presumed to originate at a peer that still maps it directly: a
+ * deliberately conservative over-estimate that errs toward RETAINING storage
+ * (under-counting would risk a premature drop). A `directly-mapped` table (the
+ * local peer still maps it) is ordinary sync traffic, not a retirement signal —
+ * skipped, so the common pre-migration case touches nothing.
+ *
+ * Cheap in the common case: one bounded `getAll` scan, and an immediate return
+ * when no lifecycle records exist. Batched — one KV update per touched table, not
+ * per change. Advisory: a failure is logged and swallowed so it can never abort
+ * the apply (the next inbound write re-bumps the clock).
+ */
+async function bumpLastDirectlyMappedWrites(
+	ctx: SyncContext,
+	appliedChanges: Array<{ change: Change; siteId: SiteId }>,
+): Promise<void> {
+	if (appliedChanges.length === 0) return;
+	try {
+		const stored = await ctx.basisLifecycle.getAll();
+		if (stored.size === 0) return; // pre-migration: nothing tracked, zero overhead
+
+		// Per-table max inbound wall-time among writes to a NON-directly-mapped record.
+		const maxWall = new Map<string, bigint>();
+		for (const { change } of appliedChanges) {
+			const key = `${change.schema}.${change.table}`.toLowerCase();
+			const record = stored.get(key);
+			if (!record || record.state === 'directly-mapped') continue;
+			const cur = maxWall.get(key);
+			if (cur === undefined || change.hlc.wallTime > cur) maxWall.set(key, change.hlc.wallTime);
+		}
+		if (maxWall.size === 0) return;
+
+		const batch = ctx.kv.batch();
+		let wrote = false;
+		for (const [key, wall] of maxWall) {
+			const record = stored.get(key)!;
+			const next = Math.max(record.lastDirectlyMappedWriteAt ?? 0, Number(wall));
+			if (next !== (record.lastDirectlyMappedWriteAt ?? 0)) {
+				ctx.basisLifecycle.put(batch, { ...record, lastDirectlyMappedWriteAt: next });
+				wrote = true;
+			}
+		}
+		if (wrote) await batch.write();
+	} catch (error) {
+		console.warn(
+			`[Sync] bumpLastDirectlyMappedWrites failed (advisory; eviction clock not updated this apply): `
+				+ `${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 }

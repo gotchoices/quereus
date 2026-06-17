@@ -13,6 +13,7 @@ import type { TombstoneStore } from '../metadata/tombstones.js';
 import type { ChangeLogStore } from '../metadata/change-log.js';
 import type { SchemaMigrationStore } from '../metadata/schema-migration.js';
 import type { QuarantineStore } from '../metadata/quarantine.js';
+import type { BasisLifecycleStore } from '../metadata/basis-lifecycle.js';
 import type { SyncConfig, ApplyToStoreCallback, ApplyToStoreResult, UnknownTableDisposition } from './protocol.js';
 import type { SyncEventEmitterImpl } from './events.js';
 import { SYNC_KEY_PREFIX } from '../metadata/keys.js';
@@ -32,6 +33,7 @@ export interface SyncContext {
 	readonly changeLog: ChangeLogStore;
 	readonly schemaMigrations: SchemaMigrationStore;
 	readonly quarantine: QuarantineStore;
+	readonly basisLifecycle: BasisLifecycleStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 

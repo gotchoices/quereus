@@ -24,7 +24,9 @@
  * SqlValue / HLC encoding is needed (unlike `quarantine.ts` / `column-version.ts`).
  */
 
+import type { SqlValue } from '@quereus/quereus';
 import type { KVStore, WriteBatch } from '@quereus/store';
+import type { SyncConfig } from '../sync/protocol.js';
 import { buildBasisLifecycleKey, buildAllBasisLifecycleScanBounds } from './keys.js';
 
 /** The aggregate lifecycle state of one basis table. */
@@ -33,6 +35,15 @@ export type BasisLifecycleState =
   | 'derivation-source-only'
   | 'unreferenced'
   | 'detached';
+
+/**
+ * Per-table eviction override (the `quereus.sync.evict` reserved tag, captured
+ * into the lifecycle record at observation time). `never` opts the table out of
+ * auto-eviction; `immediate` evicts on the first sweep after detach (zero
+ * horizon); a number is a custom horizon in milliseconds. Absent ⇒ fall back to
+ * the global {@link SyncConfig.basisEviction} mode.
+ */
+export type EvictPolicy = 'never' | 'immediate' | number;
 
 /**
  * The persisted lifecycle record for one basis table.
@@ -60,10 +71,30 @@ export interface BasisTableLifecycleRecord {
   mappedSince?: number;
   /** Wall-clock ms when it last left `directly-mapped` (the retirement hint timestamp). */
   unmappedSince?: number;
-  /** Populated by `basis-eviction-policy` (dynamic signal); reserved here. */
+  /** Wall-clock ms when the state last entered `detached` (cleared on re-attach). */
+  detachedAt?: number;
+  /**
+   * The dynamic network signal: the wall-time (ms) of the latest *inbound remote*
+   * write observed while this table was NOT directly mapped locally — presumed to
+   * originate at a peer that still maps it directly (a conservative over-estimate;
+   * see `docs/migration.md` § 2 Converge). Bumped by the change applicator; resets
+   * the eviction quiet clock. Absent until the first such write.
+   */
   lastDirectlyMappedWriteAt?: number;
-  /** Populated by `basis-eviction-policy` (override knob); reserved here. */
-  evictPolicy?: 'never' | 'immediate' | number;
+  /**
+   * Per-table eviction override, captured from the `quereus.sync.evict` reserved
+   * tag at observation time (the tag is gone once the table detaches, so it is
+   * snapshotted while in-basis and carried through detach). Absent ⇒ the global
+   * {@link SyncConfig.basisEviction} mode governs.
+   */
+  evictPolicy?: EvictPolicy;
+  /**
+   * Secondary-index names captured while the table was in-basis, so the eviction
+   * sweep can reclaim the index stores by name after detach (the table schema —
+   * and its index list — is gone once detached). Carried through detach; absent
+   * for an index-less table.
+   */
+  indexNames?: string[];
 }
 
 /**
@@ -111,10 +142,89 @@ export function basisLifecycleRecordChanged(
     || a.inBasis !== b.inBasis
     || a.mappedSince !== b.mappedSince
     || a.unmappedSince !== b.unmappedSince
+    || a.detachedAt !== b.detachedAt
     || a.lastDirectlyMappedWriteAt !== b.lastDirectlyMappedWriteAt
     || a.evictPolicy !== b.evictPolicy
     || a.mappedBy.length !== b.mappedBy.length
-    || a.mappedBy.some((v, i) => v !== b.mappedBy[i]);
+    || a.mappedBy.some((v, i) => v !== b.mappedBy[i])
+    || (a.indexNames ?? []).length !== (b.indexNames ?? []).length
+    || (a.indexNames ?? []).some((v, i) => v !== (b.indexNames ?? [])[i]);
+}
+
+/**
+ * Parse a `quereus.sync.evict` reserved-tag value into an {@link EvictPolicy}, or
+ * `undefined` when absent / malformed (a malformed tag falls back to the global
+ * mode rather than failing the deploy — the engine's reserved-tag validator
+ * surfaces the shape error separately). Accepts `'never'` / `'immediate'`
+ * (case-insensitive) and a non-negative number (numeric value or numeric string).
+ */
+export function parseEvictPolicyTag(value: SqlValue): EvictPolicy | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'number') return Number.isFinite(value) && value >= 0 ? value : undefined;
+  if (typeof value === 'bigint') return value >= 0n ? Number(value) : undefined;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (v === 'never') return 'never';
+    if (v === 'immediate') return 'immediate';
+    if (v.length === 0) return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a record's effective eviction horizon (ms) by composing its per-table
+ * {@link EvictPolicy} override with the global {@link SyncConfig.basisEviction}
+ * mode. Returns `null` for "never evict", `0` for "evict immediately once
+ * detached", or a positive horizon in milliseconds. The per-table override always
+ * wins over the global mode.
+ */
+export function effectiveEvictHorizonMs(
+  record: Pick<BasisTableLifecycleRecord, 'evictPolicy'>,
+  config: Pick<SyncConfig, 'basisEviction' | 'retentionHorizonMs'>,
+): number | null {
+  const p = record.evictPolicy;
+  if (p === 'never') return null;
+  if (p === 'immediate') return 0;
+  if (typeof p === 'number') return p;
+  // No per-table override — fall back to the global mode.
+  const eviction = config.basisEviction ?? { mode: 'horizon' as const };
+  switch (eviction.mode) {
+    case 'never': return null;
+    case 'immediate': return 0;
+    case 'horizon':
+    default: return eviction.horizonMs ?? config.retentionHorizonMs;
+  }
+}
+
+/**
+ * The wall-time (ms) the table's "quiet" clock starts from: the later of when the
+ * local peer stopped directly mapping it (`unmappedSince`, falling back to
+ * `detachedAt` for a table never directly mapped) and the last observed inbound
+ * remote write (`lastDirectlyMappedWriteAt`). See `docs/migration.md` § 4 Contract.
+ */
+export function quietSince(record: BasisTableLifecycleRecord): number {
+  const base = record.unmappedSince ?? record.detachedAt ?? 0;
+  return Math.max(base, record.lastDirectlyMappedWriteAt ?? 0);
+}
+
+/**
+ * Whether a record is eligible for storage reclamation at `now`. Default eviction
+ * targets `detached` tables ONLY — an in-basis `unreferenced` table is a signal,
+ * never auto-dropped (dropping it would diverge from the basis the app still
+ * declares, and a re-map would resurrect it). `'never'` opts out entirely;
+ * `'immediate'` still requires `detached`.
+ */
+export function isEvictable(
+  record: BasisTableLifecycleRecord,
+  now: number,
+  config: Pick<SyncConfig, 'basisEviction' | 'retentionHorizonMs'>,
+): boolean {
+  if (record.state !== 'detached') return false;
+  const horizon = effectiveEvictHorizonMs(record, config);
+  if (horizon === null) return false;            // 'never'
+  return now - quietSince(record) >= horizon;
 }
 
 /** Serialize a lifecycle record to bytes (flat JSON — see file header). */
@@ -148,6 +258,15 @@ export class BasisLifecycleStore {
    */
   put(batch: WriteBatch, record: BasisTableLifecycleRecord): void {
     batch.put(buildBasisLifecycleKey(record.schema, record.table), serializeBasisLifecycleRecord(record));
+  }
+
+  /**
+   * Delete one record by basis `schema.table` (the eviction sweep clears the
+   * record once a detached table's storage is reclaimed; a later re-create starts
+   * fresh). Idempotent — deleting an absent key is a no-op.
+   */
+  async delete(schemaName: string, tableName: string): Promise<void> {
+    await this.kv.delete(buildBasisLifecycleKey(schemaName, tableName));
   }
 
   /**

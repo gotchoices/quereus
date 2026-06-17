@@ -462,6 +462,48 @@ export type ConflictResolver = (ctx: ConflictContext) => ConflictResolution;
 export type UnknownTableDisposition = 'ignore' | 'quarantine';
 
 // ============================================================================
+// Basis-table eviction
+// ============================================================================
+
+/**
+ * Global default policy for reclaiming a detached basis table's local storage
+ * (`docs/migration.md` § 4 Contract — retention-horizon retirement). A per-table
+ * `quereus.sync.evict` reserved tag overrides this for one table.
+ *
+ * - `horizon` (default) — evict a detached table once it has been quiet (no
+ *   directly-mapped write network-wide) for {@link horizonMs} (defaulting to
+ *   {@link SyncConfig.retentionHorizonMs}).
+ * - `never` — never auto-evict (storage lingers until the app drops it).
+ * - `immediate` — evict a detached table on the first sweep after detach (zero
+ *   horizon). Still requires the table to be `detached` — never drops an in-basis
+ *   table.
+ */
+export interface BasisEvictionConfig {
+  /** Global default mode. `horizon` (default) | `never` | `immediate`. */
+  mode: 'horizon' | 'never' | 'immediate';
+  /** Override horizon for `horizon` mode; defaults to {@link SyncConfig.retentionHorizonMs}. */
+  horizonMs?: number;
+}
+
+/**
+ * Reclaim a detached basis table's local storage by name. Wired by the host
+ * (the worker) to a store-side reclaim-by-name helper
+ * (`StoreModule.reclaimDetachedTable`); `indexNames` is the captured secondary-
+ * index name list the lifecycle record retained from before detach (the table
+ * schema — and its index list — is gone once detached, so the provider's
+ * `deleteTableStores` needs it supplied rather than prefix-scanned, which could
+ * clobber sibling `*_idx_*` tables).
+ *
+ * Must be idempotent: storage already gone (the app issued a real `drop table`)
+ * is treated as success — the sweep still clears the record and emits the event.
+ */
+export type DropLocalTableCallback = (
+  schema: string,
+  table: string,
+  indexNames: readonly string[],
+) => Promise<void>;
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
@@ -515,6 +557,17 @@ export interface SyncConfig {
    * is inert and the store adapter's defensive throw remains the fallback.
    */
   unknownTableDisposition: UnknownTableDisposition;
+
+  /**
+   * Default policy for reclaiming a detached basis table's local storage
+   * (`docs/migration.md` § 4 Contract). Default `{ mode: 'horizon' }`, which
+   * evicts a detached table once it has been quiet for `retentionHorizonMs`. A
+   * per-table `quereus.sync.evict` reserved tag overrides this for one table.
+   * The eviction sweep ({@link SyncManager.evictExpiredBasisTables}) is
+   * host-driven (no timer inside the library) and is a no-op when no
+   * `dropLocalTable` reclaim callback is wired (e.g. a relay-only coordinator).
+   */
+  basisEviction?: BasisEvictionConfig;
 }
 
 /**
@@ -525,5 +578,6 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   allowResurrection: false,
   batchSize: 1000,
   unknownTableDisposition: 'quarantine',
+  basisEviction: { mode: 'horizon' },
 };
 

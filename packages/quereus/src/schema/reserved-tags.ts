@@ -93,6 +93,19 @@ export const LENS_WRITABLE_INTENT_TAG = 'quereus.lens.writable';
 export const SYNC_REPLICATE_TAG = 'quereus.sync.replicate';
 
 /**
+ * The per-table basis-eviction override (docs/migration.md § 4 Contract). On a
+ * basis table whose physical storage lingers after detach, this tag overrides the
+ * global `SyncConfig.basisEviction` mode for that one table: `'never'` opts it out
+ * of auto-reclamation, `'immediate'` reclaims on the first sweep after detach, and
+ * a non-negative number is a custom retention horizon in milliseconds. The sync
+ * layer captures the value into its lifecycle record at lens-deploy time (the tag
+ * is gone once the table detaches). Sited like {@link SYNC_REPLICATE_TAG} (the two
+ * authoring forms of a basis/migration table). Exported so the sync recorder keys
+ * off this single constant rather than re-spelling the literal.
+ */
+export const SYNC_EVICT_TAG = 'quereus.sync.evict';
+
+/**
  * The shape a reserved tag's value must satisfy. Validation here is purely
  * structural — e.g. a `'string'` value must be TEXT; what the text *means* is
  * the consuming ticket's concern, not this registry's.
@@ -102,7 +115,8 @@ export type TagValueSchema =
 	| 'boolean'                            // a SQL boolean (true/false); e.g. expose_implicit_index
 	| 'csv-of-identifiers'                 // comma-separated identifier names (e.g. decomp shared-key columns)
 	| { readonly enum: readonly string[] } // closed value set, e.g. a lens decomp role/presence/keykind
-	| 'required-nonempty-rationale';       // non-empty TEXT; empty => warning
+	| 'required-nonempty-rationale'        // non-empty TEXT; empty => warning
+	| 'eviction-policy';                   // 'never' | 'immediate' | non-negative ms (number or numeric string)
 
 /**
  * One entry in the reserved-tag spec table. `key` is either an exact key string
@@ -208,6 +222,21 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		valueSchema: 'boolean',
 		description: 'Opt this maintained table / materialized view\'s maintenance writes into the sync change log '
 			+ '(the backing host records column versions / tombstones for each derivation write). Default off.',
+	},
+	// --- quereus.sync.evict : per-table basis-eviction override ---
+	// docs/migration.md § 4 Contract. Overrides the global SyncConfig.basisEviction
+	// mode for one basis table: 'never' (keep storage forever), 'immediate' (reclaim
+	// on the first sweep after detach), or a non-negative number of milliseconds (a
+	// custom retention horizon). The sync layer captures it into its lifecycle record
+	// at lens-deploy time. Sited like quereus.sync.replicate — the two authoring forms
+	// of a basis table (the `create materialized view … with tags` form and the
+	// canonical `create table … using store()` form). Engine-global spec, consumed by
+	// the sync layer (the engine attaches no eviction behavior).
+	{
+		key: SYNC_EVICT_TAG,
+		sites: siteSet('view-ddl', 'physical-table'),
+		valueSchema: 'eviction-policy',
+		description: 'Per-table basis-eviction override: \'never\', \'immediate\', or a non-negative retention horizon in milliseconds.',
 	},
 	// --- quereus.lens.* : lens advisory acknowledgments / access hints ---
 	// (The former quereus.update.* family is gone: routing became per-row
@@ -495,7 +524,38 @@ function validateTagValue(
 			return validateCsvOfIdentifiers(key, value, site);
 		case 'required-nonempty-rationale':
 			return validateRationale(key, value, site);
+		case 'eviction-policy':
+			return validateEvictionPolicy(key, value, site);
 	}
+}
+
+/**
+ * A `quereus.sync.evict` value: the keyword `'never'` / `'immediate'`
+ * (case-insensitive), or a non-negative number of milliseconds (a numeric value
+ * or a numeric string). Anything else is an error. Structural only — the sync
+ * layer re-parses the accepted shapes into its {@link EvictPolicy}.
+ */
+function validateEvictionPolicy(
+	key: string,
+	value: SqlValue,
+	site: TagSite,
+): TagDiagnostic | undefined {
+	if (typeof value === 'string') {
+		const v = value.trim().toLowerCase();
+		if (v === 'never' || v === 'immediate') return undefined;
+		const n = Number(v);
+		if (v.length > 0 && Number.isFinite(n) && n >= 0) return undefined;
+	} else if (typeof value === 'number') {
+		if (Number.isFinite(value) && value >= 0) return undefined;
+	} else if (typeof value === 'bigint') {
+		if (value >= 0n) return undefined;
+	}
+	return invalidValue(
+		key,
+		site,
+		`must be 'never', 'immediate', or a non-negative number of milliseconds`,
+		'error',
+	);
 }
 
 function validateEnum(
@@ -565,7 +625,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.sync.replicate, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.sync.replicate, quereus.sync.evict, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 

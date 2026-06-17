@@ -9,7 +9,7 @@ import type { KVStore } from '@quereus/store';
 import type { TableSchema, TransactionCommitBatch } from '@quereus/quereus';
 import { SyncManagerImpl } from './sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from './sync/events.js';
-import { DEFAULT_SYNC_CONFIG, type SyncConfig, type ApplyToStoreCallback } from './sync/protocol.js';
+import { DEFAULT_SYNC_CONFIG, type SyncConfig, type ApplyToStoreCallback, type DropLocalTableCallback } from './sync/protocol.js';
 import type { SyncManager } from './sync/manager.js';
 
 /**
@@ -71,6 +71,15 @@ export interface CreateSyncModuleOptions extends Partial<SyncConfig> {
   getTableSchema?: GetTableSchemaCallback;
 
   /**
+   * Callback to reclaim a detached basis table's local storage by name, used by
+   * the host-driven eviction sweep (`SyncManager.evictExpiredBasisTables`,
+   * `docs/migration.md` § 4 Contract). Typically wired to the store module's
+   * `reclaimDetachedTable`. When omitted (e.g. a relay-only coordinator with no
+   * store) the sweep is a no-op.
+   */
+  dropLocalTable?: DropLocalTableCallback;
+
+  /**
    * Engine transaction-commit source for capturing local changes.
    *
    * When provided (typically the Quereus `Database`), the SyncManager
@@ -123,7 +132,7 @@ export async function createSyncModule(
   kv: KVStore,
   options: CreateSyncModuleOptions = {}
 ): Promise<CreateSyncModuleResult> {
-  const { applyToStore, getTableSchema, transactionSource, ...configOverrides } = options;
+  const { applyToStore, getTableSchema, dropLocalTable, transactionSource, ...configOverrides } = options;
 
   const fullConfig: SyncConfig = {
     ...DEFAULT_SYNC_CONFIG,
@@ -138,7 +147,8 @@ export async function createSyncModule(
     fullConfig,
     syncEvents,
     applyToStore,
-    getTableSchema
+    getTableSchema,
+    dropLocalTable
   );
 
   return {

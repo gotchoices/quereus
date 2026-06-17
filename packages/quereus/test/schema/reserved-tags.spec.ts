@@ -283,6 +283,46 @@ describe('Reserved tag registry', () => {
 		});
 	});
 
+	describe('quereus.sync.evict (eviction-policy, view-ddl + physical-table)', () => {
+		it('accepts \'never\', \'immediate\', and a non-negative ms (number or numeric string)', () => {
+			for (const site of ['view-ddl', 'physical-table'] as const) {
+				expect(check({ 'quereus.sync.evict': 'never' }, site), `never @ ${site}`).to.have.length(0);
+				expect(check({ 'quereus.sync.evict': 'immediate' }, site), `immediate @ ${site}`).to.have.length(0);
+				expect(check({ 'quereus.sync.evict': 86400000 }, site), `ms number @ ${site}`).to.have.length(0);
+				expect(check({ 'quereus.sync.evict': '86400000' }, site), `ms string @ ${site}`).to.have.length(0);
+				expect(check({ 'quereus.sync.evict': 0 }, site), `0 @ ${site}`).to.have.length(0);
+			}
+		});
+
+		it('accepts the keyword case-insensitively', () => {
+			expect(check({ 'quereus.sync.evict': 'Never' }, 'physical-table')).to.have.length(0);
+			expect(check({ 'quereus.sync.evict': 'IMMEDIATE' }, 'physical-table')).to.have.length(0);
+		});
+
+		it('rejects a bad keyword / negative number (error)', () => {
+			for (const bad of ['eventually', -1, 'soon', true] as const) {
+				const diags = check({ 'quereus.sync.evict': bad }, 'physical-table');
+				expect(diags, `bad value ${String(bad)}`).to.have.length(1);
+				expect(diags[0].reason).to.equal('invalid-tag-value');
+				expect(diags[0].severity).to.equal('error');
+			}
+		});
+
+		it('is not allowed on a logical-column / logical-table site (governs a basis table)', () => {
+			for (const site of ['logical-column', 'logical-table'] as const) {
+				const diags = check({ 'quereus.sync.evict': 'never' }, site);
+				expect(diags, `evict @ ${site}`).to.have.length(1);
+				expect(diags[0].reason).to.equal('tag-not-allowed-here');
+			}
+		});
+
+		it('flags a typo as unknown-reserved-tag', () => {
+			const diags = check({ 'quereus.sync.evic': 'never' }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+		});
+	});
+
 	describe('getReservedTag (typed, exact key)', () => {
 		it('reads a string value verbatim', () => {
 			const tags = { 'quereus.lens.policy.error-on': 'lens.no-backing-index' };
@@ -407,16 +447,17 @@ describe('Reserved tag registry', () => {
 			}
 		});
 
-		it('seeds all documented keys (rename hints + expose_implicit_index + sync replicate + lens advisory + writable intent + escalation policy + lens decomposition families)', () => {
+		it('seeds all documented keys (rename hints + expose_implicit_index + sync replicate/evict + lens advisory + writable intent + escalation policy + lens decomposition families)', () => {
 			// 2 rename hints (quereus.id / quereus.previous_name) + 1 quereus.expose_implicit_index
-			// + 1 quereus.sync.replicate + 2 quereus.lens.{ack,access} + 1 quereus.lens.writable
-			// + 2 quereus.lens.policy.* + 9 quereus.lens.decomp.* = 18.
-			expect(RESERVED_TAGS).to.have.length(18);
+			// + 1 quereus.sync.replicate + 1 quereus.sync.evict + 2 quereus.lens.{ack,access}
+			// + 1 quereus.lens.writable + 2 quereus.lens.policy.* + 9 quereus.lens.decomp.* = 19.
+			expect(RESERVED_TAGS).to.have.length(19);
 			const keys = RESERVED_TAGS.map(s => (typeof s.key === 'string' ? s.key : s.key.template));
 			expect(keys).to.include('quereus.id');
 			expect(keys).to.include('quereus.previous_name');
 			expect(keys).to.include('quereus.expose_implicit_index');
 			expect(keys).to.include('quereus.sync.replicate');
+			expect(keys).to.include('quereus.sync.evict');
 			expect(keys).to.include('quereus.lens.writable');
 			expect(keys).to.include('quereus.lens.policy.error-on');
 			expect(keys).to.include('quereus.lens.policy.require-ack');
