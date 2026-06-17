@@ -667,3 +667,166 @@ select id, x from btw order by id;
 → [{"id":1,"x":2},{"id":8,"x":3}]
 select id, x from oth order by id;
 → [{"id":2,"x":50},{"id":9,"x":50}]
+
+-- ===================================================================
+-- Product-coordinate addressing via projected-constant discriminators
+-- (`set-op-projected-constant-product-coordinate`): a body with MULTIPLE literal
+-- discriminator columns forms a discriminator grid — here `kind ∈ {red,large}` × `src ∈ {A,B}`,
+-- the `{inX,inY} × {inA,inB}` product grid the shelved product-coordinate model targeted. A write
+-- addresses a coordinate by filtering on those READ-ONLY discriminator columns:
+--   • both axes pinned (`kind='red' and src='A'`)  → writes the one co-satisfiable leg
+--   • one axis pinned (`kind='red'`)               → fans to every consistent leg
+--   • same-axis contradiction (`kind='red' and kind='large'`) / off-grid value → clean no-op
+-- This is the recommended surface for product-coordinate write-through — the product *use case*
+-- is served by the shipped flag-less write path, with no bespoke writable-membership build needed.
+-- (Fresh `pca`/`pcb` fixtures: the same two-axis grid as `U`/`U4`, self-contained so the matrix
+-- assertions do not depend on the mutated state of the views above.) See
+-- docs/view-updateability.md § Set Operations.
+-- ===================================================================
+create table pca (id integer primary key, x integer, color text null, size text null);
+create table pcb (id integer primary key, x integer, color text null, size text null);
+insert into pca values (1,10,'red','small'),(2,20,'blue','large');
+insert into pcb values (3,30,'red','small'),(4,40,'blue','large');
+create view PC as
+  select id, x, 'red' as kind, 'A' as src from pca where color = 'red'
+  union all
+  select id, x, 'red' as kind, 'B' as src from pcb where color = 'red'
+  union all
+  select id, x, 'large' as kind, 'A' as src from pca where size = 'large'
+  union all
+  select id, x, 'large' as kind, 'B' as src from pcb where size = 'large';
+
+select * from PC order by id;
+→ [{"id":1,"x":10,"kind":"red","src":"A"},{"id":2,"x":20,"kind":"large","src":"A"},{"id":3,"x":30,"kind":"red","src":"B"},{"id":4,"x":40,"kind":"large","src":"B"}]
+
+-- static surface: a view that CAN produce a zero-leg write at runtime is still statically writable
+-- (the no-op is a per-predicate runtime outcome, not a shape rejection). Plain columns YES;
+-- discriminators read-only (NO). (Must agree with U above — same grid shape.)
+select is_insertable_into, is_updatable, is_deletable, effective_targets from view_info('PC');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES","effective_targets":"[\"pca\",\"pcb\"]"}]
+select cid, column_name, is_updatable, base_table, base_column from column_info('PC');
+→ [{"cid":0,"column_name":"id","is_updatable":"YES","base_table":null,"base_column":null},{"cid":1,"column_name":"x","is_updatable":"YES","base_table":null,"base_column":null},{"cid":2,"column_name":"kind","is_updatable":"NO","base_table":null,"base_column":null},{"cid":3,"column_name":"src","is_updatable":"NO","base_table":null,"base_column":null}]
+
+-- --- Cross-axis pin: both axes specified → the one co-satisfiable leg (pca red) only ---
+-- `kind='red' and src='A'` is sat ONLY with the `red,A` leg (`from pca where color='red'`); the
+-- other three legs each contradict one axis ⇒ unsat ⇒ skipped. So only pca id 1 (the red row) is
+-- touched; pca id 2 (large) and all of pcb are untouched.
+update PC set x = x + 100 where kind = 'red' and src = 'A';
+select id, x from pca order by id;
+→ [{"id":1,"x":110},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":30},{"id":4,"x":40}]
+
+-- --- Single-axis fan (UPDATE companion to the existing one-axis DELETE/UPDATE fans): `kind='red'`
+-- fans to BOTH red legs (red+A on pca, red+B on pcb); the two `large` legs are unsat ⇒ skipped. ---
+update PC set x = x + 1 where kind = 'red';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- --- Same-axis contradiction → clean no-op (the bug fix: this threw `requires at least one base
+-- operation` before). `kind='red' and kind='large'` is provably unsat for EVERY leg (each leg pins
+-- one kind, the other conjunct contradicts it) ⇒ zero legs ⇒ 0 rows deleted, base tables unchanged. ---
+delete from PC where kind = 'red' and kind = 'large';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- the symmetric same-axis contradiction on the other axis (`src='A' and src='B'`) is also a no-op.
+delete from PC where src = 'A' and src = 'B';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- --- Off-grid value → clean no-op (also the bug fix). `kind='zzz'` matches no leg's kind
+-- discriminator ⇒ every leg unsat ⇒ zero-leg DELETE is 0 rows; the UPDATE form is the same. ---
+delete from PC where kind = 'zzz';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+update PC set x = x + 1000 where src = 'zzz';
+select id, x from pca order by id;
+→ [{"id":1,"x":111},{"id":2,"x":20}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31},{"id":4,"x":40}]
+
+-- --- Positive write beside the no-ops (the no-op guard must NOT swallow a real write): a single-axis
+-- DELETE `kind='large'` still fans to both large legs and removes pca id 2 + pcb id 4. ---
+delete from PC where kind = 'large';
+select id, x from pca order by id;
+→ [{"id":1,"x":111}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31}]
+
+-- --- INSERT is the deliberate contrast to the no-op DELETE/UPDATE: an insert routing to no leg is a
+-- genuine "this row belongs to no branch" reject (NOT softened to a no-op) — the row would be
+-- invisible through every branch. The off-grid `kind='zzz'` makes every leg unsat. ---
+insert into PC (id, x, kind, src) values (8, 80, 'zzz', 'A');
+-- error: consistent with no writable leg
+-- base tables untouched by the rejected insert.
+select id, x from pca order by id;
+→ [{"id":1,"x":111}]
+select id, x from pcb order by id;
+→ [{"id":3,"x":31}]
+
+-- --- RETURNING is rejected up front regardless of leg count: a no-op-predicate DELETE that carries
+-- RETURNING still errors on RETURNING (the reject precedes the zero-leg short-circuit). ---
+delete from PC where kind = 'zzz' returning id;
+-- error: RETURNING
+
+-- ===================================================================
+-- Zero-leg no-op reaches the `intersect` / `except` fan paths too — a discriminator-less body has
+-- no literal axis, so the zero-leg case is driven by a contradictory base-column predicate
+-- (`id = 1 and id = 2`, provably unsat). `fanLegsForFanOut` returns [] (intersect: every leg unsat;
+-- except: the LEFT operand inconsistent), and the shared no-op guard covers both — never the
+-- internal `requires at least one base operation` error.
+-- ===================================================================
+create table zia (id integer primary key, v integer);
+create table zib (id integer primary key, v integer);
+insert into zia values (1,10),(2,20);
+insert into zib values (2,20),(3,30);
+create view ZIV as select id, v from zia intersect select id, v from zib;
+select * from ZIV order by id;
+→ [{"id":2,"v":20}]
+
+-- contradictory predicate → every intersect leg unsat → zero-leg no-op, base tables unchanged.
+delete from ZIV where id = 1 and id = 2;
+select id from zia order by id;
+→ [{"id":1},{"id":2}]
+select id from zib order by id;
+→ [{"id":2},{"id":3}]
+
+-- positive intersect delete beside it: id=2 is resident in both legs, so it leaves both bases.
+delete from ZIV where id = 2;
+select id from zia order by id;
+→ [{"id":1}]
+select id from zib order by id;
+→ [{"id":3}]
+
+create table zea (id integer primary key, v integer);
+create table zeb (id integer primary key, v integer);
+insert into zea values (1,10),(2,20);
+insert into zeb values (2,20);
+create view ZEV as select id, v from zea except select id, v from zeb;
+select * from ZEV order by id;
+→ [{"id":1,"v":10}]
+
+-- `except` fans the LEFT operand only; the contradictory predicate makes the left leg inconsistent,
+-- so the fan is empty → clean no-op, base tables unchanged.
+delete from ZEV where id = 1 and id = 2;
+select id from zea order by id;
+→ [{"id":1},{"id":2}]
+select id from zeb order by id;
+→ [{"id":2}]
+
+-- positive except delete beside it: id=1 is in the left (and not the right), so it leaves the difference.
+delete from ZEV where id = 1;
+select id from zea order by id;
+→ [{"id":2}]
+select id from zeb order by id;
+→ [{"id":2}]

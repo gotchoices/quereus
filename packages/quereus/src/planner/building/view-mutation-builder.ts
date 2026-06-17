@@ -21,6 +21,8 @@ import { buildDeleteStmt } from './delete.js';
 import { buildSelectStmt, buildValuesStmt } from './select.js';
 import { buildExpression } from './expression.js';
 import { EnvelopeScanNode } from '../nodes/envelope-scan-node.js';
+import { SinkNode } from '../nodes/sink-node.js';
+import { EmptyRelationNode } from '../nodes/empty-relation-node.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { isRelationalNode } from '../nodes/plan-node.js';
@@ -515,6 +517,23 @@ function buildSetOpMutation(
 	writeFn: (ctx: PlanningContext, view: MutableViewLike, req: MutationRequest) => SetOpWritePlan,
 ): PlanNode {
 	const { baseOps, capture, nestedCaptures, joinLegInserts } = writeFn(ctx, view, req);
+	// Zero-leg DELETE / data-UPDATE → clean no-op. When the write's predicate is provably
+	// `unsat` for EVERY leg (an off-grid or same-axis-contradiction filter over the projected-
+	// constant discriminators, or any predicate inconsistent with each leg's σ), the fan narrows
+	// to zero legs (`fanLegsForFanOut` → []), so `writeFn` returns an empty decomposition (no base
+	// ops, no join-leg inserts). A delete/update that matches no rows is a clean no-op (0 rows
+	// affected) — standard SQL — so return a void sink rather than constructing `ViewMutationNode([])`
+	// (whose constructor throws `requires at least one base operation`). The discarded `capture` /
+	// `nestedCaptures` are plan-time descriptors with no runtime side effect — nothing reads them once
+	// there are no base ops. INSERT is deliberately excluded: a flag-less insert routing to no leg is a
+	// genuine "this row belongs to no branch" rejection, already raised in `buildFlaglessInsert`
+	// (`consistent with no writable leg`), so it never reaches here with an empty decomposition for a
+	// real reject — and must NOT be softened to a no-op. Placing the guard at this shared boundary also
+	// defends the `exists`-membership path (`buildSetOpWrite`) and any future fan rule that legitimately
+	// narrows to zero branches.
+	if (req.op !== 'insert' && baseOps.length === 0 && (joinLegInserts?.length ?? 0) === 0) {
+		return buildNoOpMutationSink(ctx, req.op);
+	}
 	// Each probe-driven branch op reads the capture back through `__vmupd_keys`; inject a
 	// fresh context-backed key ref (sharing the one capture descriptor) per op, exactly as
 	// the multi-source update/delete path does. Insert-through has no capture ⇒ no injection.
@@ -543,6 +562,25 @@ function buildSetOpMutation(
 	// so a join-leg-free set-op write lowers byte-identically to the pre-list substrate.
 	const nested = (nestedCaptures ?? []).map(c => ({ source: c.source, descriptor: c.descriptor }));
 	return new ViewMutationNode(ctx.scope, children, undefined, undefined, undefined, identityCapture, nested.length > 0 ? nested : undefined);
+}
+
+/**
+ * The void no-op sink for a set-op DELETE / data-UPDATE that decomposed to zero base ops (its
+ * predicate is provably `unsat` for every leg). Mirrors a base-table delete/update matching no
+ * rows: a {@link SinkNode} over a zero-row {@link EmptyRelationNode} source — the emitter drains
+ * it (yielding nothing) and reports 0 rows affected. Used in place of `ViewMutationNode([])`,
+ * which rejects an empty base-op list (see {@link buildSetOpMutation}).
+ */
+function buildNoOpMutationSink(ctx: PlanningContext, op: string): PlanNode {
+	const voidRelation: RelationType = {
+		typeClass: 'relation',
+		isReadOnly: true,
+		isSet: false,
+		columns: [],
+		keys: [],
+		rowConstraints: [],
+	};
+	return new SinkNode(ctx.scope, new EmptyRelationNode(ctx.scope, [], voidRelation), op);
 }
 
 /**

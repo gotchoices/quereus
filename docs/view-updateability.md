@@ -402,10 +402,14 @@ unwrapped; a projecting or filtering derived table (`select x from (A∪B) v`) s
 relation. This is the **sum** surface (distinct flag names → distinct columns). Two siblings that
 **reuse** the same flag names (the **product** model — reused names merging into shared coordinate
 columns) are out of scope and currently rejected at create (the duplicate names collide in the set-op
-output scope); that merge is the **shelved** `set-op-product-coordinate-model` (backlog) — a projected
-attribute records a row's *origin* (the sum model), not `tuple ∈ <union of like-named leaves>` (a probe
-semantic a stored value cannot express), so the sum model is the honest scope and the merge is built only
-if a use case needs writable membership over a non-literal σ-guard. Writes through the left
+output scope); that merge — reused flag names valued `tuple ∈ <union of like-named leaves>` — is **not
+built** as a bespoke surface: the product *use case* (addressing a discriminator grid) is served instead by
+**multiple projected-constant discriminator columns** (§ Set Operations → Product-coordinate addressing via
+projected-constant discriminators). A projected attribute records a row's *origin* (the sum model), not the
+probe semantic a stored value cannot express, so the sum model is the honest scope. The only genuinely
+out-of-scope residue is **writable boolean membership over a non-literal σ-guard** (a range / correlated /
+function predicate the FD framework cannot fold to a constant and whose co-satisfiability the sat-checker
+returns `unknown` on) — no use case has required it; reopen only if one does. Writes through the left
 wrapper landed as `set-op-leftwrap-write` (see § Set-operation membership writes → Parenthesized LEFT
 subtree operand): the write path unwraps the same pure wrapper, so the LEFT subtree fans out for the
 unambiguous operations exactly as the right subtree does.
@@ -606,10 +610,12 @@ inserts into the LEFT subtree (`set <subtreeFlag> = true`, a surfaced left-subtr
 insert-through routing into the left subtree side) stay deferred to `set-op-membership-nested`, and the
 static surfaces walk **both** operands so `is_insertable_into` reports `NO` and the surfaced left-inner
 flags report `is_updatable = NO`. The orthogonal **product** model (two siblings *reusing* flag names,
-merging into shared coordinate columns) is the **shelved** `set-op-product-coordinate-model` (backlog):
-projected attributes express the **sum** model (origin tags), not the **merge** (`tuple ∈ <union of
-like-named leaves>`), so the merge ships only on a use case needing writable membership over a non-literal
-σ-guard.
+merging into shared coordinate columns) is **not built** as a bespoke surface: its *use case* — addressing
+a discriminator grid — is served by **multiple projected-constant discriminator columns** (see
+Product-coordinate addressing via projected-constant discriminators, below). Projected attributes express
+the **sum** model (origin tags), not the **merge** (`tuple ∈ <union of like-named leaves>`); the only
+genuinely out-of-scope residue is **writable boolean membership over a non-literal σ-guard** (which the
+sat-checker decides `unknown` on anyway). No use case has required it — reopen only if one does.
 
 **Flag-less predicate-honest writes (the preferred surface, `set-op-flagless-predicate-honest-writes`).**
 A flag-less set-op body whose legs carry *regular projected columns* — plain base columns plus literal
@@ -673,6 +679,34 @@ column in a writable branch is rejected. **Static-surface partial on a subtree f
 subtree flag (`inSub`) carries an `existence` site, so `column_info` reports it
 `is_updatable = YES` — accurate for its `= false` delete (which works) but optimistic for the
 deferred `= true` insert; the dynamic write still rejects the latter cleanly.
+
+**Product-coordinate addressing via projected-constant discriminators (the recommended product surface,
+`set-op-projected-constant-product-coordinate`).** A flag-less body with **multiple** literal discriminator
+columns forms a **discriminator grid** — e.g. `kind ∈ {red, large}` × `src ∈ {A, B}` is the two-axis
+`{inX,inY} × {inA,inB}` product grid the shelved product model targeted. A write **addresses a coordinate**
+by filtering on those (read-only) discriminator columns, and the per-leg branch oracle does the routing:
+
+| Addressing | Filter | Result |
+|---|---|---|
+| pin one leg (fully-specified coordinate) | both axes (`where kind='red' and src='A'`) | writes the single co-satisfiable leg |
+| fan to a sub-grid (partially-specified) | one axis (`where kind='red'`) | fans to every consistent leg (`red+A`, `red+B`) |
+| contradictory / off-grid | same axis twice (`where kind='red' and kind='large'`) or an unknown value (`where kind='zzz'`) | matches no leg ⇒ clean **no-op** |
+
+This serves the product *use case*: the addressing the shelved `set-op-product-coordinate-model` wanted
+falls out of filtering read-only discriminator columns, with no bespoke writable-membership build. The
+contradiction case is *more* natural here than in the product model — discriminators are read-only and
+addressed by `where`, so a contradictory filter simply selects nothing; there is no incoherent
+"write two mutually-exclusive memberships" request to reject, hence **no `predicate-contradiction` gate**.
+
+**Zero-leg DELETE / data-UPDATE is a clean no-op.** When a DELETE / data-UPDATE predicate is provably
+`unsat` for **every** leg (a same-axis contradiction, an off-grid discriminator value, or any predicate
+inconsistent with each leg's σ), the fan narrows to zero legs and the write affects **0 rows** — standard
+SQL for a no-match DELETE/UPDATE. (Implemented at the shared `buildSetOpMutation` boundary: an empty
+decomposition for a non-insert op lowers to a void `SinkNode` instead of constructing an empty
+`ViewMutationNode`, whose constructor rejects a zero-base-op list.) This is the delete/update dual of — and
+deliberately contrasts with — the **INSERT** empty-route, which stays a genuine **`consistent with no
+writable leg`** diagnostic: a row that routes to no branch would be invisible through every branch, so it
+is an error, not a silent no-op.
 
 **Static surfaces gate on branch writability.** `view_info` / `column_info` for a
 membership body now mirror the **non-decomposable join shape gate**: they confirm the
