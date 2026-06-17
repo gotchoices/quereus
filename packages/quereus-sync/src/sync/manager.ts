@@ -120,15 +120,18 @@ export interface SyncManager {
    * disposition; `byTable` counts diverted changes per `schema.table` (the union
    * across all dispositions — the per-disposition counters partition it).
    * `forwarded` counts changes **held as forwardable at apply time** under the
-   * `store-and-forward` disposition; it is distinct from any per-relay "relayed"
-   * volume the relay ticket may add (a forwardable entry is held once but may be
-   * relayed many times until it GCs). Mirrors the engine's
-   * `getMaterializedViewCollisionStats()` pattern (observe-only, in-memory).
+   * `store-and-forward` disposition (held once). `relayed` counts forwardable
+   * changes **re-offered through `getChangesSince`** — relay activity, distinct
+   * from `forwarded`: one held entry is relayed possibly many times until it GCs,
+   * so `relayed` grows with outbound relay traffic rather than with distinct
+   * stragglers. Mirrors the engine's `getMaterializedViewCollisionStats()` pattern
+   * (observe-only, in-memory).
    */
   getUnknownTableStats(): {
     ignored: number;
     quarantined: number;
     forwarded: number;
+    relayed: number;
     byTable: Map<string, number>;
   };
 

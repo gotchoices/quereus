@@ -157,6 +157,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	private unknownTableIgnored = 0;
 	private unknownTableQuarantined = 0;
 	private unknownTableForwarded = 0;
+	// Cumulative forwardable changes re-offered through getChangesSince (the
+	// store-and-forward relay's outbound activity). Distinct from
+	// unknownTableForwarded, which counts apply-time holds: a held entry is held
+	// ONCE but relayed possibly MANY times until GC, so this counter grows with
+	// relay activity, not with distinct stragglers. Bumped in collectForwardableChanges.
+	private unknownTableRelayed = 0;
 	private readonly unknownTableByTable = new Map<string, number>();
 
 	private constructor(
@@ -297,11 +303,12 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.unknownTableByTable.set(key, (this.unknownTableByTable.get(key) ?? 0) + changeCount);
 	}
 
-	getUnknownTableStats(): { ignored: number; quarantined: number; forwarded: number; byTable: Map<string, number> } {
+	getUnknownTableStats(): { ignored: number; quarantined: number; forwarded: number; relayed: number; byTable: Map<string, number> } {
 		return {
 			ignored: this.unknownTableIgnored,
 			quarantined: this.unknownTableQuarantined,
 			forwarded: this.unknownTableForwarded,
+			relayed: this.unknownTableRelayed,
 			byTable: new Map(this.unknownTableByTable),
 		};
 	}
@@ -781,9 +788,28 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * commit boundary (docs/sync.md § Transaction-Based Change Grouping → Read side).
 	 */
 	async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
-		const changes: Change[] = sinceHLC
+		const dataChanges: Change[] = sinceHLC
 			? await this.collectChangesSince(peerSiteId, sinceHLC, this.config.batchSize)
 			: await this.collectAllChanges(peerSiteId);
+
+		// Fold forwardable held changes (the `store-and-forward` relay's outbound
+		// half) into the SAME ChangeSet[] return — no new transport surface. Each
+		// keeps its ORIGINAL hlc + siteId, so buildTransactionChangeSets re-forms the
+		// straggler's transaction by deterministicTxnId: a forwarded change rejoins any
+		// applied part of the same straggler txn (e.g. a txn that wrote both a live and
+		// a now-retired-here table), correct by construction.
+		//
+		// BOUND + ORDERING (verify, no extra code): collectChangesSince early-exits its
+		// change-log scan at a transaction cut C; collectForwardableChanges is FULLY
+		// scanned (all `> sinceHLC`). buildTransactionChangeSets re-bounds the UNION at
+		// batchSize at a transaction boundary M ≤ C. Everything ≤ M from BOTH sources is
+		// present (change-log up to C ⊇ ≤ M; forwardable fully scanned ⊇ ≤ M), so the
+		// returned prefix is contiguous, advancing the consumer's watermark to M loses
+		// nothing, and forwardable entries with HLC in (M, …] are re-collected next round
+		// (still `> sinceHLC`). Groups are HLC-ordered, so a forwarded change interleaves
+		// with change-log changes in global HLC order — never out of order.
+		const forwardable = await this.collectForwardableChanges(peerSiteId, sinceHLC);
+		const changes = forwardable.length > 0 ? [...dataChanges, ...forwardable] : dataChanges;
 
 		const schemaMigrations = await this.collectSchemaMigrations(peerSiteId, sinceHLC);
 
@@ -992,6 +1018,64 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			changes.push(deletion);
 		}
 
+		return changes;
+	}
+
+	/**
+	 * Collect forwardable held changes to re-offer to a peer — the outbound half of
+	 * the `store-and-forward` unknown-table disposition. Source is
+	 * {@link QuarantineStore.listForwardable}: straggler changes this peer held
+	 * because it has retired the table, marked forwardable. Each is re-offered with
+	 * its ORIGINAL `hlc` + `siteId` (the straggler's fact, not a new local one) — the
+	 * identity that makes the relay loop-free and convergent across hops with NO
+	 * per-table peer-membership oracle (none exists): a peer that already holds the
+	 * change re-holds it idempotently (HLC-keyed) and the per-peer watermark stops
+	 * re-send after one exchange.
+	 *
+	 * Two filters, mirroring {@link collectChangesSince} / {@link collectAllChanges}:
+	 *  - **Echo exclusion** — drop a change whose origin (`change.hlc.siteId`) is the
+	 *    peer itself, so a straggler's fact is never echoed back to its own author.
+	 *  - **Watermark filter** — when `sinceHLC` is defined (delta path), keep only
+	 *    `compareHLC(change.hlc, sinceHLC) > 0`. REQUIRED: the consumer advances its
+	 *    per-peer `lastSyncHLC` to `max(returned ChangeSet.hlc)`, so a round that
+	 *    returned a forwarded change with HLC ≤ the watermark would REGRESS it and
+	 *    trigger a re-scan/re-deliver flood. Filtering `> sinceHLC` keeps the merged
+	 *    response a safe contiguous prefix — exactly the change-log contract. When
+	 *    `sinceHLC` is undefined (from-zero / {@link collectAllChanges} path) there is
+	 *    no lower bound, so all (origin ≠ peer) are kept.
+	 *
+	 * Accepted limitation (documented intent, not a defect): a straggler whose change
+	 * is causally older than the holder's sync recency with a peer (`HLC ≤ sinceHLC`)
+	 * is NOT relayed via this delta path — the same scalar-watermark limitation the
+	 * base delta layer already has. store-and-forward targets the transitional
+	 * uneven-retirement window, where the straggler's writes are recent enough to
+	 * exceed holder watermarks; quarantine already prevents write loss outside it.
+	 *
+	 * Snapshot carve-out: forwardable entries are DELTA-ONLY. The snapshot collectors
+	 * scan only `cv:`/`tb:`/`sm:` (never `qt:`), since a snapshot transfers the
+	 * offering peer's OWN basis and a forwarded change is for a table that peer does
+	 * not have.
+	 *
+	 * Full horizon-bounded scan (no early-exit), paralleling {@link collectAllChanges}:
+	 * the forwardable set is bounded by the retention horizon and is EMPTY — so this
+	 * is zero-cost — in the no-straggler case.
+	 */
+	private async collectForwardableChanges(peerSiteId: SiteId, sinceHLC?: HLC): Promise<Change[]> {
+		const held = await this.quarantine.listForwardable();
+		const changes: Change[] = [];
+		for (const entry of held) {
+			const change = entry.change;
+			// Echo exclusion: the change's HLC siteId is the straggler origin.
+			if (siteIdEquals(change.hlc.siteId, peerSiteId)) continue;
+			// Watermark filter on the delta path (see contract above).
+			if (sinceHLC && compareHLC(change.hlc, sinceHLC) <= 0) continue;
+			changes.push(change);
+		}
+		// Relay-activity telemetry: a held entry is counted on EVERY getChangesSince
+		// that re-offers it (repeatedly until GC), and the batch bound may defer some to
+		// a later round (re-counted then) — so this measures relay ACTIVITY, not distinct
+		// deliveries (distinct from the apply-time `forwarded` hold count).
+		this.unknownTableRelayed += changes.length;
 		return changes;
 	}
 
