@@ -1512,6 +1512,25 @@ describe('Sync Protocol E2E', () => {
       expect(dels[0].priorRow).to.deep.equal([1, 'Alice']);
     });
 
+    it('re-emits priorRow on the incremental (sinceHLC) relay path', async () => {
+      // The no-sinceHLC tests above drain via collectAllChanges; passing a sinceHLC
+      // forces the change-log replay path (collectChangesSince -> resolveLogEntry),
+      // which re-emits the stored image from a separate code site. A zero HLC sits
+      // before any real delete, so the delete is included.
+      const host = await createReplica('host', config);
+      const freshPeer = generateSiteId();
+      const zeroHLC: HLC = { wallTime: 0n, counter: 0, siteId: generateSiteId(), opSeq: 0 };
+
+      emitLocalInsert(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 5));
+      emitLocalDelete(host, 'main', 'users', [1], [1, 'Alice']);
+      await new Promise(r => setTimeout(r, 10));
+
+      const dels = deletions(await host.manager.getChangesSince(freshPeer, zeroHLC));
+      expect(dels).to.have.lengthOf(1);
+      expect(dels[0].priorRow).to.deep.equal([1, 'Alice']);
+    });
+
     it('omits priorRow when the delete event carried no oldRow', async () => {
       const host = await createReplica('host', config);
       const freshPeer = generateSiteId();
