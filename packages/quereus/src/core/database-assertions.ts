@@ -37,6 +37,23 @@ const log = createLogger('core:assertions');
 const MAX_VIOLATION_SAMPLES = 5;
 
 /**
+ * A single commit-time global-assertion violation, collected (rather than
+ * thrown) when {@link AssertionEvaluator.runGlobalAssertions} is driven in
+ * report mode. Surfaced to the external-row ingestion seam's caller so a
+ * trust-the-origin inbound merge can land its data and still be notified of
+ * the broken invariant. See `docs/materialized-views.md` § Trust boundary.
+ */
+export interface AssertionViolation {
+	/** Name of the violated assertion. */
+	readonly assertion: string;
+	/** Up to {@link MAX_VIOLATION_SAMPLES} sample rows. For a full-violation
+	 *  query these are the query's output rows; for per-tuple residual dispatch
+	 *  the single binding-key tuple. Diagnostic only — the assertion SELECT's
+	 *  output shape, not full table rows. */
+	readonly samples: SqlValue[][];
+}
+
+/**
  * Interface for accessing Database internals needed by the assertion evaluator.
  * This decouples the evaluator from the full Database class.
  */
@@ -117,6 +134,11 @@ export class AssertionEvaluator {
 	private unsubscribeSchemaChanges: (() => void) | null = null;
 	/** The shared delta dispatcher */
 	private readonly executor: DeltaExecutor;
+	/** Transient violation sink for a single `runGlobalAssertions` pass. When
+	 *  non-null (report mode), violations are pushed here and execution
+	 *  continues; when null (default) violations throw. Set/restored by
+	 *  `runGlobalAssertions`. */
+	private violationSink: AssertionViolation[] | null = null;
 
 	constructor(private readonly ctx: AssertionEvaluatorContext) {
 		const executorCtx: DeltaExecutorContext = {
@@ -177,34 +199,55 @@ export class AssertionEvaluator {
 	 * The DeltaExecutor walks all live subscriptions; assertion subscriptions
 	 * dispatch their own residual scheduler per binding tuple.
 	 *
-	 * @throws QuereusError with CONSTRAINT status if any assertion is violated.
+	 * In the default (throw) mode the first violation throws a CONSTRAINT
+	 * `QuereusError`. When `sink` is supplied (report mode), violations are
+	 * **collected** into it and execution continues — so EVERY live assertion is
+	 * walked and ALL violations across the batch are gathered, not just the
+	 * first. Report mode is used by the external-row ingestion seam so a
+	 * trusted inbound merge can land its data and still surface the broken
+	 * invariant (see `docs/materialized-views.md` § Trust boundary).
+	 *
+	 * @param sink When provided, collect violations here instead of throwing.
+	 * @throws QuereusError with CONSTRAINT status if any assertion is violated
+	 *   and no `sink` is supplied.
 	 */
-	async runGlobalAssertions(): Promise<void> {
+	async runGlobalAssertions(sink?: AssertionViolation[]): Promise<void> {
 		const assertions = this.ctx.schemaManager.getAllAssertions();
 		if (assertions.length === 0) return;
 
 		const changedBases = this.ctx.getChangedBaseTables();
 		if (changedBases.size === 0) return;
 
-		// Ensure every assertion is compiled (registers its subscription on first
-		// touch). Subsequent commits reuse the cached subscription unless schema
-		// has changed.
-		for (const assertion of assertions) {
-			this.getOrCompilePlan(assertion);
-		}
-
-		// Assertions with no table dependencies (e.g. CHECK (1 = 0)) must run on
-		// every commit regardless of what changed — the kernel skips them because
-		// it dispatches on dependency overlap. Handle them directly here.
-		for (const assertion of assertions) {
-			const cached = this.cache.get(assertion.name.toLowerCase());
-			if (cached && cached.baseTablesInPlan.size === 0) {
-				await this.executeViolationOnce(assertion.name, assertion.violationSql);
+		// Install the sink for the duration of this pass; restore null after so a
+		// subsequent ordinary commit throws as usual (try/finally guards a throw
+		// from the no-dependency loop or the kernel walk in throw mode).
+		this.violationSink = sink ?? null;
+		try {
+			// Ensure every assertion is compiled (registers its subscription on
+			// first touch). Subsequent commits reuse the cached subscription unless
+			// schema has changed.
+			for (const assertion of assertions) {
+				this.getOrCompilePlan(assertion);
 			}
-		}
 
-		// Kernel walks all live subscriptions; assertions throw on violation.
-		await this.executor.runAll();
+			// Assertions with no table dependencies (e.g. CHECK (1 = 0)) must run on
+			// every commit regardless of what changed — the kernel skips them because
+			// it dispatches on dependency overlap. Handle them directly here. In
+			// report mode these collect (do not throw), so all are evaluated.
+			for (const assertion of assertions) {
+				const cached = this.cache.get(assertion.name.toLowerCase());
+				if (cached && cached.baseTablesInPlan.size === 0) {
+					await this.executeViolationOnce(assertion.name, assertion.violationSql);
+				}
+			}
+
+			// Kernel walks all live subscriptions. In throw mode the first violation
+			// aborts the walk; in report mode every subscription runs and all
+			// violations are collected.
+			await this.executor.runAll();
+		} finally {
+			this.violationSink = null;
+		}
 	}
 
 	private getOrCompilePlan(assertion: { name: string; violationSql: string }): CachedAssertionPlan {
@@ -390,7 +433,7 @@ export class AssertionEvaluator {
 				if (violatingRows.length >= MAX_VIOLATION_SAMPLES) break;
 			}
 			if (violatingRows.length > 0) {
-				throw this.buildViolationError(assertionName, violatingRows);
+				this.raiseViolation(assertionName, violatingRows);
 			}
 		} finally {
 			await stmt.finalize();
@@ -425,10 +468,25 @@ export class AssertionEvaluator {
 			const result = await scheduler.run(runtimeCtx);
 			if (isAsyncIterable(result)) {
 				for await (const _ of result as AsyncIterable<unknown>) {
-					throw this.buildViolationError(assertionName, [tuple as SqlValue[]]);
+					// First violating tuple for this binding: throw (default) or
+					// collect-and-stop (report mode mirrors the throw's method exit).
+					this.raiseViolation(assertionName, [tuple as SqlValue[]]);
+					return;
 				}
 			}
 		}
+	}
+
+	/**
+	 * Raise one violation: throw a CONSTRAINT error in the default mode, or push
+	 * to {@link violationSink} (report mode) and let the caller continue/return.
+	 */
+	private raiseViolation(assertionName: string, samples: SqlValue[][]): void {
+		if (this.violationSink) {
+			this.violationSink.push({ assertion: assertionName, samples });
+			return;
+		}
+		throw this.buildViolationError(assertionName, samples);
 	}
 
 	private buildViolationError(assertionName: string, samples: SqlValue[][]): QuereusError {

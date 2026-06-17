@@ -13,6 +13,7 @@ import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { Row, SqlValue } from '../common/types.js';
 import type { UniqueConstraintSchema } from '../schema/table.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
+import type { AssertionViolation } from './database-assertions.js';
 
 /**
  * One externally-applied row change to report through
@@ -42,6 +43,27 @@ export interface IngestExternalChangesOptions {
 	 *  a replication stream usually already carries the origin's cascade effects;
 	 *  re-running them would double-apply). */
 	applyForeignKeyActions?: boolean;
+	/** How a commit-time global-assertion violation over the inbound batch is
+	 *  handled (default `'throw'`):
+	 *   - `'throw'` — the implicit commit throws and rolls the batch's derived
+	 *     effects back (the externally-applied storage rows stay applied);
+	 *   - `'report'` — the violation is COLLECTED into the result and the batch
+	 *     still commits (derived effects land, watch dispatches). Trust-the-origin:
+	 *     the data lands; the caller is notified. Honored ONLY for the seam-owned
+	 *     implicit transaction with `captureChanges` on; ignored (assertions fire
+	 *     at the owning commit in throw mode) inside an explicit caller transaction
+	 *     or with capture off. */
+	assertionFailureMode?: 'throw' | 'report';
+}
+
+/** Result of {@link DatabaseInternal.ingestExternalRowChanges}. */
+export interface IngestExternalChangesResult {
+	/** Commit-time global-assertion violations collected under
+	 *  `assertionFailureMode: 'report'`. Empty in throw mode, when no assertion
+	 *  is violated, when capture is off, or when an explicit caller transaction
+	 *  owns the commit (assertions then fire at the caller's commit in throw
+	 *  mode). One entry per violated assertion. */
+	readonly assertionViolations: AssertionViolation[];
 }
 
 /**
@@ -183,9 +205,14 @@ export interface DatabaseInternal {
 	 * {@link _maintainRowTimeCoveringStructures} covers that context. For the
 	 * coarse, no-transaction whole-table watch invalidation alternative, see
 	 * `Database.notifyExternalChange`.
+	 *
+	 * Returns the collected commit-time global-assertion violations (see
+	 * {@link IngestExternalChangesResult}); always empty unless
+	 * `assertionFailureMode: 'report'` is set and the seam owns the implicit
+	 * commit.
 	 */
 	ingestExternalRowChanges(
 		changes: readonly ExternalRowChange[],
 		options?: IngestExternalChangesOptions,
-	): Promise<void>;
+	): Promise<IngestExternalChangesResult>;
 }

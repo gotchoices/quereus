@@ -572,17 +572,30 @@ interface ExternalRowChange {
 }
 
 interface IngestExternalChangesOptions {
-	maintainMaterializedViews?: boolean;  // default true
-	captureChanges?: boolean;             // default true
-	applyForeignKeyActions?: boolean;     // default FALSE (opt-in)
+	maintainMaterializedViews?: boolean;          // default true
+	captureChanges?: boolean;                     // default true
+	applyForeignKeyActions?: boolean;             // default FALSE (opt-in)
+	assertionFailureMode?: 'throw' | 'report';    // default 'throw'
+}
+
+interface IngestExternalChangesResult {
+	assertionViolations: AssertionViolation[];    // empty unless report mode collected
+}
+
+interface AssertionViolation {
+	assertion: string;     // name of the violated assertion
+	samples: SqlValue[][]; // up to 5 violation-query output rows (diagnostic)
 }
 ```
+
+`ingestExternalRowChanges` resolves with an `IngestExternalChangesResult`. In the default `assertionFailureMode: 'throw'` it is always `{ assertionViolations: [] }` (a violation throws instead); `'report'` collects violations into it — see [Facets](#facets-per-call-dml-executor-order-per-change) and [Trust boundary](#trust-boundary). Widening the prior `void` return to an object is source-compatible for callers that ignore it.
 
 `changes` is a flat **ordered** array — order is semantic for FK actions and capture (origin order = parents-before-children etc.). Rows are FULL table rows in schema column order (shape-checked → `MISUSE`: a recognized `op`, the images that op requires — insert: new, delete: old, update: both — each matching the table's column count); an unknown table or schema errors with `NOTFOUND` before any effect. `oldRow` images must be accurate before-images — they key the backing deletes and the capture log; when the same row changes twice in one batch, each change's `oldRow` must be the true before-image of *that* change (the prior change's `newRow`). The table key is derived from the **resolved** schema (`schemaName.tableName`, byte-identical to the DML executor's), so capture/watch matching gets executor parity.
 
 ### Facets (per call; DML-executor order per change)
 
 - **`captureChanges`** (default on) — `_recordInsert/_recordUpdate/_recordDelete`: feeds `Database.watch` post-commit dispatch (row-granular hits, fires at commit) AND commit-time global-assertion evaluation. With capture on, inbound changes participate in assertion evaluation — intended (delegated invariant maintenance); capture off opts out of both watch and assertions.
+  - **`assertionFailureMode`** (`'throw'` default / `'report'`) governs only the assertion arm of this facet. In `'throw'` mode a commit-time global-assertion violation throws and rolls the batch's derived effects back (the externally-applied storage rows stay applied) — unchanged default behavior. In `'report'` mode the violation is **collected** and returned in `IngestExternalChangesResult.assertionViolations` while the batch still commits: derived effects land (MV backing deltas, capture/watch entries), watch dispatches, and the caller is notified of the broken invariant. Report mode is honored **only** for the seam-owned implicit transaction with capture on; it gathers ALL violated assertions (one entry per assertion), not just the first.
 - **`maintainMaterializedViews`** (default on) — row-time covering-structure maintenance over the reported changes, batch-amortized exactly like one statement: bounded-delta arms apply per change immediately; full-rebuild MVs are dirtied per change and rebuilt **once per batch** at the flush — O(body), not O(rows × body); MV-over-MV consumers converge via the existing flush worklist.
 - **`applyForeignKeyActions`** (default **off**) — parent-side actions for `update`/`delete` changes only (inserts have no parent-side actions): the transitive RESTRICT walk, then CASCADE / SET NULL / SET DEFAULT propagation. Off by default because a replication stream usually already carries the origin's cascade effects — re-running them would double-apply. The RESTRICT walk runs POST-application (like the executor's REPLACE-eviction handling): the storage change already happened, there is no pre-mutation point, and the child rows it keys off still exist because the cascade hasn't run yet. Cascade DML issued by the seam re-enters the full DML pipeline, so cascaded child writes get their own capture, MV maintenance, and transitive actions. Both FK helpers run `lensRouted = false` (an external change is a physical basis write), and both early-return under `pragma foreign_keys = off` (no error, no action).
 
@@ -596,6 +609,8 @@ The seam re-validates **nothing** — no CHECK, NOT NULL, UNIQUE, or child-side 
 
 A change reported against a maintained table directly is out of contract — its contents are engine-owned (derived).
 
+**Global assertions are evaluated but, in report mode, do not block.** Unlike the other constraint types the seam re-validates nothing for, commit-time global assertions are *deliberately* evaluated over inbound merges (`captureChanges` on) — a cross-origin column-LWW merge can produce a global-invariant state no single origin ever saw, so the engine keeps checking. But for the inbound-merge case the data **must** land (trust-the-origin): a blocking throw would leave an incoherent half-state (storage has the row; derived projections were rolled back) and the sync retry never re-drives the derived effects. So `assertionFailureMode: 'report'` makes the seam **detect-and-notify** rather than block — the violation is returned to the caller (the sync adapter surfaces it to the host), the inbound data and its derived effects (MV backing, watch) all land, and there is no MV/watch divergence. A blocking throw (`'throw'`, the default) remains available for callers that own storage transactionally and want the batch rejected.
+
 ### Transaction & visibility contract
 
 - The call runs inside an active coordinated transaction (or its own implicit one); backing connections register lazily and `registerConnection` replays the active savepoint depth — which includes the batch savepoint — so commit/rollback/savepoint stay in lockstep (existing behavior, no new code).
@@ -604,6 +619,7 @@ A change reported against a maintained table directly is out of contract — its
 - Batch boundaries mirror `runWithStatementSavepoints`: the deferred full-rebuild flush runs after every change has been applied (each rebuild reads the whole batch) and BEFORE the savepoint release (a failed rebuild unwinds the batch). With no active transaction the seam begins an implicit one and commits it at batch end (watch dispatch fires there); inside an explicit caller transaction, dispatch waits for the caller's commit, and a caller rollback discards backing deltas and capture in lockstep. A mid-batch error inside an explicit caller transaction leaves the transaction open with the batch savepoint unwound (caller decides).
 - The whole batch is serialized against concurrent statements via the exec mutex. **Do not call from within statement execution or vtab callbacks** (deadlock on the mutex); the two-arg eviction seam covers that context.
 - An empty batch is a true no-op: no transaction begin, no savepoint.
+- **`assertionFailureMode: 'report'` is honored only for the seam-owned implicit transaction.** The seam installs a transient collect-sink immediately before *its* implicit commit and clears it in a `finally` (so a non-assertion commit failure — a connection error, a deferred row constraint — still throws and rolls back, and a later commit is never silently left in collect mode); the commit consumes-and-clears the sink. Inside an explicit caller transaction the seam does not commit (the caller owns it), so the sink is never installed and assertions fire at the caller's commit in **throw** mode; the seam returns `{ assertionViolations: [] }`. With `captureChanges: false`, assertions never run and the result is empty regardless of mode. After a reported violation the MV backing reflects the violating row (row-time maintenance ran in the batch and committed), so the MV is consistent with the base and watch fires for the row — no divergence, no refresh.
 
 ### Relationship to `Database.notifyExternalChange`
 

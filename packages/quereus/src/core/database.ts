@@ -58,8 +58,8 @@ import {
 } from './database-events.js';
 import { TransactionManager, type TransactionManagerContext } from './database-transaction.js';
 import { ingestExternalRowChangeBatch } from './database-external-changes.js';
-import type { ExternalRowChange, IngestExternalChangesOptions } from './database-internal.js';
-import { AssertionEvaluator, type AssertionEvaluatorContext } from './database-assertions.js';
+import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
+import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { MaterializedViewManager, type BackingConnectionCache } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
@@ -1888,8 +1888,16 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (!this.isOpen) throw new MisuseError("Database is closed");
 	}
 
-	public async runGlobalAssertions(): Promise<void> {
-		await this.assertionEvaluator.runGlobalAssertions();
+	public async runGlobalAssertions(sink?: AssertionViolation[]): Promise<void> {
+		await this.assertionEvaluator.runGlobalAssertions(sink);
+	}
+
+	/** @internal Install (or clear, with `null`) the report-mode sink the next
+	 *  commit's global-assertion pass collects into instead of throwing. Used by
+	 *  the external-row ingestion seam around its implicit commit; see
+	 *  {@link ingestExternalRowChanges} and `database-transaction.ts`. */
+	public _setPendingCommitAssertionSink(sink: AssertionViolation[] | null): void {
+		this.transactionManager.setPendingCommitAssertionSink(sink);
 	}
 
 	/**
@@ -1982,13 +1990,21 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * two-arg `_maintainRowTimeCoveringStructures` is the seam for that
 	 * context. See `docs/materialized-views.md` § External row-change
 	 * ingestion for the full contract.
+	 *
+	 * Returns the collected commit-time global-assertion violations. With the
+	 * default `assertionFailureMode: 'throw'` a violation throws (and rolls the
+	 * batch's derived effects back) so the returned list is always empty; with
+	 * `'report'` — honored only for the seam-owned implicit transaction with
+	 * capture on — a violation is collected and the batch still commits (derived
+	 * effects land, watch dispatches), so the returned list names every violated
+	 * assertion. Empty in every other case.
 	 */
 	public async ingestExternalRowChanges(
 		changes: readonly ExternalRowChange[],
 		options?: IngestExternalChangesOptions,
-	): Promise<void> {
+	): Promise<IngestExternalChangesResult> {
 		this.checkOpen();
-		await ingestExternalRowChangeBatch(this, changes, options);
+		return ingestExternalRowChangeBatch(this, changes, options);
 	}
 
 	/** @internal Compile + register an MV for row-time write-through maintenance.

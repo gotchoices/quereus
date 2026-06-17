@@ -392,6 +392,110 @@ describe('Database.ingestExternalRowChanges (external row-change ingestion)', ()
 			expect(events, 'no watch dispatch on a failed commit').to.have.length(0);
 		});
 
+		it("assertionFailureMode: 'throw' (explicit) behaves identically to the default", async () => {
+			await directWrite(db, 't', 'insert', [1, -5]);
+			const events: WatchEvent[] = [];
+			const sub = db.watch(rowsWatch('t', 'id', 1), e => { events.push(e); });
+
+			await expectThrows(
+				() => db.ingestExternalRowChanges(
+					[chg('t', { op: 'insert', newRow: [1, -5] })],
+					{ assertionFailureMode: 'throw' }),
+				'non_negative',
+			);
+			sub.unsubscribe();
+
+			expect(db.getAutocommit(), 'failed commit resets to autocommit').to.equal(true);
+			expect(events, 'no watch dispatch on a failed commit').to.have.length(0);
+		});
+
+		it('report mode collects the violation, commits the batch, and fires the watch', async () => {
+			await directWrite(db, 't', 'insert', [1, -5]);
+			const events: WatchEvent[] = [];
+			const sub = db.watch(rowsWatch('t', 'id', 1), e => { events.push(e); });
+
+			const result = await db.ingestExternalRowChanges(
+				[chg('t', { op: 'insert', newRow: [1, -5] })],
+				{ assertionFailureMode: 'report' },
+			);
+			sub.unsubscribe();
+
+			expect(result.assertionViolations.map(v => v.assertion)).to.deep.equal(['non_negative']);
+			expect(result.assertionViolations[0].samples.length, 'samples non-empty').to.be.greaterThan(0);
+			// Contrast the throw-mode test above: the batch committed (not rolled
+			// back) and the watch DID fire for the violating row.
+			expect(db.getAutocommit(), 'batch committed, not rolled back').to.equal(true);
+			expect(events, 'watch fired for the row').to.have.length(1);
+			expect(events[0].matched[0].hits).to.deep.equal([[1]]);
+		});
+
+		it('report mode + a covering MV: the violation is reported and the MV still converges', async () => {
+			await db.exec('create materialized view mv as select id, v from t');
+			await directWrite(db, 't', 'insert', [1, -5]);
+
+			const result = await db.ingestExternalRowChanges(
+				[chg('t', { op: 'insert', newRow: [1, -5] })],
+				{ assertionFailureMode: 'report' },
+			);
+
+			expect(result.assertionViolations.map(v => v.assertion)).to.deep.equal(['non_negative']);
+			// Derived effects persisted: the MV row is present and equals the base
+			// row — consistent, no refresh. This is the whole point of report mode.
+			const mvRows = (await readAll(db, 'select id, v from mv order by id'))
+				.map(r => ({ id: Number(r.id), v: Number(r.v) }));
+			expect(mvRows).to.deep.equal([{ id: 1, v: -5 }]);
+			expect(db.getAutocommit()).to.equal(true);
+		});
+
+		it('report mode collects ALL violated assertions in one batch', async () => {
+			await db.exec(
+				'create assertion also_non_negative check (not exists (select 1 from t where v < 0))');
+			await directWrite(db, 't', 'insert', [1, -5]);
+
+			const result = await db.ingestExternalRowChanges(
+				[chg('t', { op: 'insert', newRow: [1, -5] })],
+				{ assertionFailureMode: 'report' },
+			);
+
+			expect(result.assertionViolations.map(v => v.assertion))
+				.to.have.members(['non_negative', 'also_non_negative']);
+			expect(db.getAutocommit()).to.equal(true);
+		});
+
+		it('report mode collects a no-dependency assertion (CHECK (1=0))', async () => {
+			// A no-dependency assertion is evaluated via the direct loop whenever
+			// the batch changed something. A non-negative row keeps `non_negative`
+			// satisfied, isolating the no-dependency collection.
+			await db.exec('create assertion always_false check (1 = 0)');
+			await directWrite(db, 't', 'insert', [1, 5]);
+
+			const result = await db.ingestExternalRowChanges(
+				[chg('t', { op: 'insert', newRow: [1, 5] })],
+				{ assertionFailureMode: 'report' },
+			);
+
+			expect(result.assertionViolations.map(v => v.assertion)).to.deep.equal(['always_false']);
+			expect(db.getAutocommit()).to.equal(true);
+		});
+
+		it('report mode inside an explicit caller transaction does not collect (caller owns commit)', async () => {
+			// The seam-owned implicit commit is the only place report mode is
+			// honored. Inside an explicit transaction the seam does not commit, so
+			// the sink is never consumed; assertions fire at the caller's commit in
+			// throw mode.
+			await db.exec('begin');
+			// The violating row rides the caller's transaction so the assertion sees
+			// it at the caller's commit.
+			await directWrite(db, 't', 'insert', [1, -5]);
+			const result = await db.ingestExternalRowChanges(
+				[chg('t', { op: 'insert', newRow: [1, -5] })],
+				{ assertionFailureMode: 'report' },
+			);
+			expect(result.assertionViolations, 'no collection under an explicit transaction').to.have.length(0);
+			// The caller's commit still enforces the assertion (throw mode).
+			await expectThrows(() => db.exec('commit'), 'non_negative');
+		});
+
 		it('captureChanges: false opts the batch out of assertion evaluation', async () => {
 			await directWrite(db, 't', 'insert', [1, -5]);
 			// Nothing captured → empty change log → assertions are not evaluated

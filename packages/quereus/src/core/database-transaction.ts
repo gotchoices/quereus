@@ -16,6 +16,7 @@ import { StatusCode } from '../common/types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import type { DatabaseEventEmitter } from './database-events.js';
 import type { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
+import type { AssertionViolation } from './database-assertions.js';
 
 const log = createLogger('core:transaction');
 const debugLog = log.extend('debug');
@@ -37,8 +38,10 @@ export interface TransactionManagerContext {
 	getEventEmitter(): DatabaseEventEmitter;
 	/** Get the deferred constraint queue */
 	getDeferredConstraints(): DeferredConstraintQueue;
-	/** Run global assertions before commit */
-	runGlobalAssertions(): Promise<void>;
+	/** Run global assertions before commit. When `sink` is supplied (report
+	 *  mode), violations are collected into it and the commit proceeds instead
+	 *  of throwing on the first violation. */
+	runGlobalAssertions(sink?: AssertionViolation[]): Promise<void>;
 	/** Run deferred row constraints before commit */
 	runDeferredRowConstraints(): Promise<void>;
 	/** Fire post-commit watchers (Database.watch). Errors logged, never rolled
@@ -118,6 +121,12 @@ export class TransactionManager {
 	/** Flag indicating we're in a coordinated multi-connection commit */
 	private inCoordinatedCommit = false;
 
+	/** Sink the next commit's global-assertion pass collects violations into
+	 *  instead of throwing (report mode). Installed by the external-row
+	 *  ingestion seam right before its implicit commit and consumed-and-cleared
+	 *  by {@link commitTransaction}; null for every ordinary commit. */
+	private pendingCommitAssertionSink: AssertionViolation[] | null = null;
+
 	constructor(private readonly ctx: TransactionManagerContext) {}
 
 	// ============================================================================
@@ -137,6 +146,17 @@ export class TransactionManager {
 	/** Get the source of the current transaction, or null if not in a transaction */
 	getTransactionSource(): TransactionSource | null {
 		return this.transactionSource;
+	}
+
+	/**
+	 * Install (or clear, with `null`) the sink the NEXT commit's global-assertion
+	 * pass collects violations into instead of throwing. The external-row
+	 * ingestion seam sets this immediately before its seam-owned implicit commit
+	 * and clears it in a finally; {@link commitTransaction} also consumes-and-
+	 * clears it, so an ordinary commit is never left in collect mode.
+	 */
+	setPendingCommitAssertionSink(sink: AssertionViolation[] | null): void {
+		this.pendingCommitAssertionSink = sink;
 	}
 
 	/** Check if we're in an implicit transaction */
@@ -228,10 +248,20 @@ export class TransactionManager {
 		// Snapshot connections before evaluating deferred constraints
 		const connectionsToCommit = this.ctx.getAllConnections();
 
+		// Consume the pending report-mode sink read-and-clear: even if this commit
+		// fails for another reason (a connection commit error, a deferred row
+		// constraint), the NEXT ordinary commit must throw on violation as usual.
+		const assertionSink = this.pendingCommitAssertionSink;
+		this.pendingCommitAssertionSink = null;
+
 		let commitSucceeded = false;
 		try {
-			// Evaluate global assertions and deferred row constraints BEFORE committing
-			await this.ctx.runGlobalAssertions();
+			// Evaluate global assertions and deferred row constraints BEFORE
+			// committing. With a sink (report mode) a violation is collected and the
+			// commit proceeds — derived effects land and watch dispatches; with none
+			// (default) the first violation throws into the catch below and rolls
+			// back, discarding batched events.
+			await this.ctx.runGlobalAssertions(assertionSink ?? undefined);
 			await this.ctx.runDeferredRowConstraints();
 
 			// Mark coordinated commit to relax layer validation for sibling layers

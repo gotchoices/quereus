@@ -24,7 +24,8 @@ import type { TableSchema } from '../schema/table.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { BackingConnectionCache } from './database-materialized-views.js';
 import type { Database } from './database.js';
-import type { ExternalRowChange, IngestExternalChangesOptions } from './database-internal.js';
+import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
+import type { AssertionViolation } from './database-assertions.js';
 import {
 	assertTransitiveRestrictsForParentMutation,
 	executeForeignKeyActionsAndLens,
@@ -126,13 +127,14 @@ export async function ingestExternalRowChangeBatch(
 	db: Database,
 	changes: readonly ExternalRowChange[],
 	options?: IngestExternalChangesOptions,
-): Promise<void> {
+): Promise<IngestExternalChangesResult> {
 	// Empty batch: a true no-op — no transaction begin, no savepoint.
-	if (changes.length === 0) return;
+	if (changes.length === 0) return { assertionViolations: [] };
 
 	const captureChanges = options?.captureChanges ?? true;
 	const maintainMaterializedViews = options?.maintainMaterializedViews ?? true;
 	const applyForeignKeyActions = options?.applyForeignKeyActions ?? false;
+	const assertionFailureMode = options?.assertionFailureMode ?? 'throw';
 
 	// Serialize against concurrent statements for the whole batch: FK-action
 	// cascades re-enter the DML pipeline via _execWithinTransaction (the
@@ -221,8 +223,28 @@ export async function ingestExternalRowChangeBatch(
 		// watch dispatch fires here. Inside an explicit caller transaction this
 		// is a no-op — dispatch waits for the caller's commit.
 		if (db._isImplicitTransaction()) {
+			// Report mode is honored ONLY when the seam owns the commit (this
+			// implicit branch) AND capture is on (assertions don't run with capture
+			// off). Install a sink so a violation is collected and the batch still
+			// commits — derived effects land, watch dispatches. The finally clears
+			// the pending sink even if the commit throws for a NON-assertion reason
+			// (connection error, deferred row constraint), so a subsequent commit is
+			// never silently put into collect mode.
+			if (assertionFailureMode === 'report' && captureChanges) {
+				const sink: AssertionViolation[] = [];
+				try {
+					db._setPendingCommitAssertionSink(sink);
+					await db._commitTransaction();
+				} finally {
+					db._setPendingCommitAssertionSink(null);
+				}
+				return { assertionViolations: sink };
+			}
 			await db._commitTransaction();
 		}
+		// Throw mode, capture-off report mode, or an explicit caller transaction
+		// (assertions fire at the caller's commit in throw mode): nothing collected.
+		return { assertionViolations: [] };
 	} finally {
 		releaseMutex();
 	}
