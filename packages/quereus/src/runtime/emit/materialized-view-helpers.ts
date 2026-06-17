@@ -1306,7 +1306,13 @@ export async function createMaintainedTable(db: Database, stmt: AST.CreateTableS
 		);
 	}
 
-	const table = await sm.createTable(stmt);
+	// `preferBacking = true`: route the create through the module's durable backing
+	// seam (`createBacking?() ?? create()`) so a durable-backing module (lamina)
+	// builds the basis `RowStore` that `resolveBackingHost` → `getBackingHost`
+	// resolves below for the attach-to-empty fill. Without this the table is an
+	// ordinary relational collection with no basis store and the fill throws
+	// `backing host not found`. Memory (no `createBacking`) falls through to `create`.
+	const table = await sm.createTable(stmt, /*preferBacking*/ true);
 	try {
 		return await attachMaintainedDerivation(
 			db, table, stmt.maintained!.select,

@@ -242,8 +242,12 @@ below the same transaction's DML (§ DDL Application Order).
 buffers its table's events in DML order); **cross-table** order is the deterministic
 per-coordinator commit order, not the global DML interleave. This is sufficient for
 intra-transaction atomicity, intra-table parent-before-child, and full determinism
-(same facts ⇒ same `opSeq` on every peer). True cross-table dependency ordering on
-*apply* is a separate concern.
+(same facts ⇒ same `opSeq` on every peer). Cross-table order being the per-coordinator
+commit order — not the DML interleave — is **not** an apply-correctness hazard: the
+apply path re-validates no declared constraint (child-side FK existence included — see
+§ Transactional Integrity During Sync → *Apply-time validation*), so a child fact
+landing before its parent cannot trip one. It matters only to the opt-in parent-side
+FK *actions* path.
 
 Edge cases:
 - **Rollback / discard** — the engine fires no group, so `tick()` is never called
@@ -277,7 +281,7 @@ getChangesSince(peerSiteId, sinceHLC):
   migrations = sm: scan, after sinceHLC, not from peerSiteId
   group facts+migrations by transaction identity (wallTime, counter, siteId):
     each group ⇒ one ChangeSet:
-      changes:          group's facts in opSeq order (parent-before-child apply)
+      changes:          group's facts in opSeq order (intra-table write order)
       schemaMigrations: group's migrations in opSeq order (DDL below the tx's DML)
       hlc:              group's MAX fact HLC (last opSeq) — the commit boundary
       transactionId:    deterministicTxnId(base)          — same derivation as write side
@@ -378,6 +382,33 @@ In all cases no metadata is committed, so the caller does not advance its per-pe
 Selective commit (commit the succeeded subset, skip the failed) is intentionally **not** done: a batch spans multiple HLCs but peer re-fetch is governed by a single `lastSyncHLC` watermark, which cannot express "all but the failed change", so a skipped change would never be re-sent. The wire batch is therefore admitted as **one** all-or-nothing `admitGroup` unit, not once per `ChangeSet`.
 
 **Current Status**: ✓ Data is written first (`applyToStore`), then metadata, aborting with no metadata on any whole-batch throw or per-change `ApplyToStoreResult.errors`. The unified admission core (`admitGroup` + `applyDataToStore`, `admission.ts`) centralizes this for the wire and non-streaming snapshot paths; the streaming path reuses the `applyDataToStore` seam for consistent error emission while keeping its checkpoint-based model.
+
+**Apply-time validation — trust-the-origin.** The apply path does **not** re-run the
+engine's constraint machinery. The production adapter (`createStoreAdapter`, the
+`applyToStore` implementation) writes inbound data straight to module storage via
+`StoreTable.applyExternalRowChanges` — bypassing the DML executor, so there is **no**
+per-row CHECK / NOT NULL / UNIQUE / **child-side FK-existence** check at write time —
+then makes a single end-of-invocation seam call, `db.ingestExternalRowChanges`, which
+drives the post-write pipeline: capture for `Database.watch`, commit-time **global
+assertions**, materialized-view maintenance, and *opt-in* parent-side FK actions. The
+seam explicitly re-validates nothing — it trusts that the origin already enforced every
+declared constraint at its own commit, and merging the origin's already-consistent
+facts into the receiver cannot violate a per-row / child-side constraint that held at
+the source.
+
+Consequence for cross-table ordering: because child-side FK existence is never checked
+on apply, a child fact carrying a lower `opSeq` than its parent (the per-coordinator
+commit order putting the child's table first) is harmless — there is no fact-granular
+FK check to trip. The two facets that *are* enforced run over the **merged state at the
+batch boundary**, after every fact has landed, so they are order-independent by
+construction: **global assertions** — the home for referential invariants you want the
+replica itself to enforce, and which cover self-referential and cyclic FKs that no
+topological table sort can order — and **opt-in FK actions** (`applyForeignKeyActions`,
+default off). The FK-actions path is the lone order-sensitive consumer: it assumes
+parents-before-children but currently receives the seam batch table-grouped in
+first-appearance `opSeq` order. See
+[`tickets/backlog/sync-cross-table-apply-ordering.md`](../tickets/backlog/sync-cross-table-apply-ordering.md)
+for the scope of remaining work.
 
 **Per-Table Batching**: Within each table, changes should be applied using `WriteBatch` for atomicity. The `TransactionCoordinator` in the Store module provides this capability.
 

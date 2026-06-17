@@ -2609,7 +2609,17 @@ export class SchemaManager {
 
 		let tableInstance: VirtualTable;
 		try {
-			tableInstance = await moduleInfo.module.create(this.db, baseTableSchema);
+			// `preferBacking` (set only by the maintained-table create path) routes
+			// through the durable backing seam — the SAME `createBacking?() ?? create()`
+			// preference {@link createBackingTable} uses — so a durable-backing module
+			// builds the basis `RowStore` that `getBackingHost` later resolves for
+			// row-time maintenance. An ordinary user CREATE leaves it false and stays
+			// byte-for-byte on `module.create`; a module without `createBacking` (memory)
+			// falls through to `create` regardless.
+			const create = preferBacking
+				? (moduleInfo.module.createBacking?.bind(moduleInfo.module) ?? moduleInfo.module.create.bind(moduleInfo.module))
+				: moduleInfo.module.create.bind(moduleInfo.module);
+			tableInstance = await create(this.db, baseTableSchema);
 		} catch (e: unknown) {
 			const message = e instanceof Error ? e.message : String(e);
 			const code = e instanceof QuereusError ? e.code : StatusCode.ERROR;
