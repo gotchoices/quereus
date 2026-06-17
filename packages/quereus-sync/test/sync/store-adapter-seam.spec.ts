@@ -381,6 +381,50 @@ describe('store-adapter seam integration', () => {
 			expect(relayedAfter.flatMap(cs => cs.changes)).to.have.length(1);
 		});
 
+		it('snapshot bootstrap of a violating row fires NO assertion event (the seam is skipped; finalize converges the MV)', async () => {
+			// Detect-and-notify lives on the INCREMENTAL seam only. A snapshot bootstrap
+			// installs one origin's already-converged state wholesale — its per-flush
+			// writes pass `bootstrap: true` so the adapter skips the seam entirely, and
+			// `finalizeBootstrap` converges via `refreshAllMaterializedViews` (which does
+			// not evaluate assertions). So a bootstrapped row that would violate a local
+			// assertion must NOT throw and must NOT notify — it just lands, MV and all.
+			await db.exec('create table t (id text primary key, v integer) using store');
+			await db.exec('create materialized view mv as select id, v from t');
+			await db.exec('create assertion non_negative check (not exists (select 1 from t where v < 0))');
+
+			const syncEvents = new SyncEventEmitterImpl();
+			const violations: AssertionViolationEvent[] = [];
+			syncEvents.onAssertionViolation(e => violations.push(e));
+
+			const syncManager = await SyncManagerImpl.create(
+				new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
+			);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			const snapshotId = 'snap-assert-1';
+			const chunks: SnapshotChunk[] = [
+				{ type: 'header', siteId: remoteSiteId, hlc: remoteHLC.tick(), tableCount: 1, migrationCount: 0, snapshotId },
+				{ type: 'table-start', schema: 'main', table: 't', estimatedEntries: 0 },
+				{ type: 'column-versions', schema: 'main', table: 't', entries: [['["x"]:v', remoteHLC.tick(), -7]] },
+				{ type: 'table-end', schema: 'main', table: 't', entriesWritten: 1 },
+				{ type: 'footer', snapshotId, totalTables: 1, totalEntries: 1, totalMigrations: 0 },
+			];
+			async function* stream(): AsyncIterable<SnapshotChunk> {
+				for (const c of chunks) yield c;
+			}
+
+			// No throw despite the violating row...
+			await syncManager.applySnapshotStream(stream());
+
+			// ...the row landed and the MV converged via finalize (not the seam)...
+			expect((await collect(db, 'select v from t')).map(r => Number(r.v))).to.deep.equal([-7]);
+			expect((await collect(db, 'select v from mv')).map(r => Number(r.v))).to.deep.equal([-7]);
+			// ...and the host was NOT notified — bootstrap is detect-nothing by design.
+			expect(violations, 'bootstrap path does not evaluate assertions').to.have.length(0);
+		});
+
 		it('no CRDT echo: applying remote changes records nothing as local', async () => {
 			await db.exec('create table t (id text primary key, v text) using store');
 
