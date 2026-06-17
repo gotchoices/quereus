@@ -655,6 +655,14 @@ class QuereusWorker implements QuereusWorkerAPI {
     this.syncManager = syncManager;
     this.syncEvents = syncEvents;
 
+    // Forward each logical `apply schema` lens deployment from the basis-backing
+    // store module to the sync layer's basis-table lifecycle bookkeeping. The
+    // store module guards this call (advisory; a bookkeeping failure never aborts
+    // a deploy), so we wire the recorder straight through.
+    this.storeModule.setLensDeploymentListener((listenerDb, logicalSchemaName, snapshot) =>
+      syncManager.recordLensDeployment(listenerDb, logicalSchemaName, snapshot),
+    );
+
     // Subscribe to sync events and forward to UI
     this.setupSyncEventListeners();
   }

@@ -11,6 +11,7 @@
  *   hc: - HLC clock state
  *   cl: - Change log (HLC-indexed for efficient delta queries)
  *   qt: - Quarantine (held out-of-basis straggler changes)
+ *   bl: - Basis-table lifecycle (mapped/derivation-source/unreferenced/detached bookkeeping)
  */
 
 import type { SqlValue } from '@quereus/quereus';
@@ -30,6 +31,7 @@ export const SYNC_KEY_PREFIX = {
   HLC_STATE: encoder.encode('hc:'),
   CHANGE_LOG: encoder.encode('cl:'),
   QUARANTINE: encoder.encode('qt:'),
+  BASIS_LIFECYCLE: encoder.encode('bl:'),
 } as const;
 
 /** Separator between key components. */
@@ -558,5 +560,31 @@ export function buildQuarantineScanBounds(
   return {
     gte: SYNC_KEY_PREFIX.QUARANTINE,
     lt: incrementLastByte(SYNC_KEY_PREFIX.QUARANTINE),
+  };
+}
+
+/**
+ * Build a basis-table lifecycle key.
+ * Format: bl:{schema}.{table} (both lowercased — basis relations are keyed
+ * lowercased throughout the lens deployment snapshot, so the lifecycle key
+ * matches `relationBacking` / `derivation.sourceTables` keys exactly).
+ *
+ * One record per basis table; the value carries the full
+ * {@link import('./basis-lifecycle.js').BasisTableLifecycleRecord}, so the key
+ * is written and iterated but never parsed back.
+ */
+export function buildBasisLifecycleKey(schemaName: string, tableName: string): Uint8Array {
+  return encoder.encode(`bl:${schemaName.toLowerCase()}.${tableName.toLowerCase()}`);
+}
+
+/**
+ * Build scan bounds over all basis-table lifecycle records (operator
+ * introspection / `getBasisTableLifecycle`). The volume is bounded by the basis
+ * table count.
+ */
+export function buildAllBasisLifecycleScanBounds(): { gte: Uint8Array; lt: Uint8Array } {
+  return {
+    gte: SYNC_KEY_PREFIX.BASIS_LIFECYCLE,
+    lt: incrementLastByte(SYNC_KEY_PREFIX.BASIS_LIFECYCLE),
   };
 }

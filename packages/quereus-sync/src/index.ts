@@ -127,6 +127,7 @@ export {
   type ConflictEvent,
   type UnknownTableEvent,
   type AssertionViolationEvent,
+  type BasisTableLifecycleEvent,
   type SyncState,
   type Unsubscribe,
   type SyncEventEmitter,
@@ -168,6 +169,15 @@ export {
   deserializeQuarantineEntry,
   buildQuarantineKey,
   buildQuarantineScanBounds,
+  // Basis-table lifecycle (legacy-table retirement bookkeeping)
+  type BasisLifecycleState,
+  type BasisTableLifecycleRecord,
+  BasisLifecycleStore,
+  classifyBasisLifecycle,
+  serializeBasisLifecycleRecord,
+  deserializeBasisLifecycleRecord,
+  buildBasisLifecycleKey,
+  buildAllBasisLifecycleScanBounds,
   // Peer state
   type PeerState,
   PeerStateStore,

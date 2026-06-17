@@ -10,3 +10,4 @@ export * from './schema-migration.js';
 export * from './schema-version.js';
 export * from './change-log.js';
 export * from './quarantine.js';
+export * from './basis-lifecycle.js';

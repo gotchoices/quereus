@@ -9,6 +9,8 @@ import type { KVStore, WriteBatch } from '@quereus/store';
 import type {
 	SqlValue,
 	Row,
+	Database,
+	LensDeploymentSnapshot,
 	TransactionCommitBatch,
 	DatabaseDataChangeEvent,
 	DatabaseSchemaChangeEvent,
@@ -30,6 +32,14 @@ import { PeerStateStore } from '../metadata/peer-state.js';
 import { SchemaMigrationStore, deserializeMigration } from '../metadata/schema-migration.js';
 import { ChangeLogStore, type ChangeLogEntry } from '../metadata/change-log.js';
 import { QuarantineStore } from '../metadata/quarantine.js';
+import {
+	BasisLifecycleStore,
+	classifyBasisLifecycle,
+	basisLifecycleRecordChanged,
+	splitRelKey,
+	type BasisTableLifecycleRecord,
+} from '../metadata/basis-lifecycle.js';
+import type { BasisTableLifecycleEvent } from './events.js';
 import {
 	SYNC_KEY_PREFIX,
 	buildAllColumnVersionsScanBounds,
@@ -126,9 +136,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	readonly changeLog: ChangeLogStore;
 	readonly schemaMigrations: SchemaMigrationStore;
 	readonly quarantine: QuarantineStore;
+	readonly basisLifecycle: BasisLifecycleStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
 	private readonly getTableSchema?: GetTableSchemaCallback;
+
+	// Last basis hash recorded per basis schema (in-memory, advisory). Drives the
+	// basis-drift warning in recordLensDeployment — a warning, not durable state.
+	private readonly lastBasisHash = new Map<string, string>();
 
 	// Cumulative unknown-table disposition counters (in-memory, observe-only —
 	// mirrors the engine's materialized-view collision stats).
@@ -156,6 +171,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.changeLog = new ChangeLogStore(kv);
 		this.schemaMigrations = new SchemaMigrationStore(kv);
 		this.quarantine = new QuarantineStore(kv);
+		this.basisLifecycle = new BasisLifecycleStore(kv);
 	}
 
 	/**
@@ -270,6 +286,168 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			quarantined: this.unknownTableQuarantined,
 			byTable: new Map(this.unknownTableByTable),
 		};
+	}
+
+	// ============================================================================
+	// Basis-table lifecycle (legacy-table retirement bookkeeping)
+	// ============================================================================
+
+	/**
+	 * Record one logical schema's lens deployment over its basis, recomputing the
+	 * durable per-basis-table lifecycle classification (`docs/migration.md`
+	 * § 2 Converge). See {@link SyncManager.recordLensDeployment}.
+	 *
+	 * The snapshot is scoped to ONE logical schema, so this schema's directly-mapped
+	 * contribution is stored per-schema (`mappedBy`) and the aggregate state ORs all
+	 * schemas — a basis table stays `directly-mapped` until the last mapper drops it.
+	 * The classification is a pure function of `(snapshot, basis schema)`, both
+	 * reachable from `db`: the directly-mapped set is the union of every table
+	 * snapshot's `relationBacking` keys (plus deferred surrogate-split members), and
+	 * the basis membership / derivation sources come from enumerating the basis
+	 * schema's tables.
+	 */
+	async recordLensDeployment(
+		db: Database,
+		logicalSchemaName: string,
+		snapshot: LensDeploymentSnapshot,
+	): Promise<void> {
+		const logical = logicalSchemaName.toLowerCase();
+
+		// This schema's directly-mapped contribution: the union of every table
+		// snapshot's basis relations. surrogateMemberKeys mark deferred surrogate-split
+		// members that back the table INDIRECTLY — fold them in as referenced so a
+		// deferred member is never misclassified as an eviction candidate.
+		const directlyMapped = new Set<string>();
+		for (const tableSnapshot of snapshot.tables.values()) {
+			for (const key of tableSnapshot.relationBacking.keys()) directlyMapped.add(key);
+			if (tableSnapshot.surrogateMemberKeys) {
+				for (const key of tableSnapshot.surrogateMemberKeys) directlyMapped.add(key);
+			}
+		}
+
+		// Enumerate the basis schema (the common case is `main`, but the basis may be
+		// an attached schema — resolve by name). basisMembership = all table keys;
+		// derivationSources = union of every maintained table's sourceTables.
+		const basisSchema = db.schemaManager.getSchema(snapshot.basisSchemaName);
+		const basisMembership = new Set<string>();
+		const derivationSources = new Set<string>();
+		const displayName = new Map<string, { schema: string; table: string }>();
+		if (basisSchema) {
+			for (const table of basisSchema.getAllTables()) {
+				const key = `${table.schemaName}.${table.name}`.toLowerCase();
+				basisMembership.add(key);
+				displayName.set(key, { schema: table.schemaName, table: table.name });
+				for (const src of table.derivation?.sourceTables ?? []) {
+					derivationSources.add(src.toLowerCase());
+				}
+			}
+		} else if (snapshot.basisSchemaName) {
+			console.warn(
+				`[Sync] recordLensDeployment: basis schema '${snapshot.basisSchemaName}' not found; basis membership treated as empty`,
+			);
+		}
+
+		// Basis-drift detection: warn (don't silently reclassify) when the basis hash
+		// changed out-of-band vs. the last deploy we recorded for this basis.
+		const priorHash = this.lastBasisHash.get(snapshot.basisSchemaName);
+		if (priorHash !== undefined && priorHash !== snapshot.basisHash) {
+			console.warn(
+				`[Sync] recordLensDeployment: basis '${snapshot.basisSchemaName}' hash drifted out-of-band `
+					+ `(recorded ${priorHash || '∅'}, current ${snapshot.basisHash || '∅'})`,
+			);
+		}
+		this.lastBasisHash.set(snapshot.basisSchemaName, snapshot.basisHash);
+
+		const stored = await this.basisLifecycle.getAll();
+
+		// The universe of basis-relation keys to (re)classify: the current basis +
+		// its derivation sources + this schema's directly-mapped set + every stored
+		// record. directlyMapped is folded in (beyond the ticket's literal
+		// membership/derivation/stored universe) so every relation the lens maps is
+		// tracked even in the defensive case where the basis schema can't be resolved
+		// — a no-op normally, since a mapped relation is a real basis table. Stored
+		// keys keep an empty/detach deploy revisiting tables it no longer maps.
+		const keys = new Set<string>([...basisMembership, ...derivationSources, ...directlyMapped, ...stored.keys()]);
+
+		const now = Date.now();
+		const batch = this.kv.batch();
+		let wroteAny = false;
+		const pendingEvents: BasisTableLifecycleEvent[] = [];
+
+		for (const key of keys) {
+			const prior = stored.get(key);
+
+			// OR this schema's contribution into the per-schema mapper set: add when it
+			// maps the table now, remove when it no longer does (so the LAST mapper
+			// dropping it is what flips the aggregate off directly-mapped).
+			const mapped = new Set((prior?.mappedBy ?? []).map(s => s.toLowerCase()));
+			if (directlyMapped.has(key)) mapped.add(logical);
+			else mapped.delete(logical);
+			const mappedBy = [...mapped].sort();
+
+			const derivationSource = derivationSources.has(key);
+			const inBasis = basisMembership.has(key);
+			const state = classifyBasisLifecycle(mappedBy, derivationSource, inBasis);
+
+			// Stamp mapped-since on entry into directly-mapped (clearing any prior
+			// unmapped-since); unmapped-since on exit from it (the retirement hint).
+			const wasMapped = prior?.state === 'directly-mapped';
+			const isMapped = state === 'directly-mapped';
+			let mappedSince = prior?.mappedSince;
+			let unmappedSince = prior?.unmappedSince;
+			if (isMapped && !wasMapped) {
+				mappedSince = now;
+				unmappedSince = undefined;
+			} else if (!isMapped && wasMapped) {
+				unmappedSince = now;
+			}
+
+			const display = displayName.get(key)
+				?? (prior ? { schema: prior.schema, table: prior.table } : splitRelKey(key));
+
+			const record: BasisTableLifecycleRecord = {
+				schema: display.schema,
+				table: display.table,
+				state,
+				mappedBy,
+				derivationSource,
+				inBasis,
+				...(mappedSince !== undefined ? { mappedSince } : {}),
+				...(unmappedSince !== undefined ? { unmappedSince } : {}),
+				// Reserved fields owned by basis-eviction-policy — carry through untouched.
+				...(prior?.lastDirectlyMappedWriteAt !== undefined ? { lastDirectlyMappedWriteAt: prior.lastDirectlyMappedWriteAt } : {}),
+				...(prior?.evictPolicy !== undefined ? { evictPolicy: prior.evictPolicy } : {}),
+			};
+
+			if (!prior || basisLifecycleRecordChanged(prior, record)) {
+				this.basisLifecycle.put(batch, record);
+				wroteAny = true;
+			}
+			// Emit only on an ACTUAL state change of an already-tracked table — a
+			// brand-new table's first classification and an idempotent re-apply emit
+			// nothing (a spurious event would mislead the retirement hint).
+			if (prior && prior.state !== state) {
+				pendingEvents.push({
+					schema: record.schema,
+					table: record.table,
+					previousState: prior.state,
+					newState: state,
+					at: now,
+				});
+			}
+		}
+
+		if (wroteAny) await batch.write();
+
+		// Emit AFTER the records are durable, so a listener that reads back
+		// getBasisTableLifecycle() sees the committed transition.
+		for (const event of pendingEvents) {
+			this.syncEvents.emitBasisTableLifecycle(event);
+		}
+	}
+
+	async getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]> {
+		return this.basisLifecycle.list();
 	}
 
 	// ============================================================================

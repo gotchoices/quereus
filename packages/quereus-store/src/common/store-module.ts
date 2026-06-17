@@ -33,6 +33,7 @@ import type {
 	ViewSchema,
 	MaintainedTableSchema,
 	BackingHost,
+	LensDeploymentSnapshot,
 } from '@quereus/quereus';
 import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
@@ -83,6 +84,19 @@ export interface RehydrationError {
 }
 
 /**
+ * Listener the host binds via {@link StoreModule.setLensDeploymentListener} to
+ * forward a logical `apply schema` lens deployment onward (typically to the sync
+ * layer's basis-table lifecycle bookkeeping). Kept as a plain callback so
+ * `@quereus/store` stays free of a `@quereus/sync` dependency; the worker — which
+ * depends on both — wires the two together.
+ */
+export type LensDeploymentListener = (
+	db: Database,
+	logicalSchemaName: string,
+	snapshot: LensDeploymentSnapshot,
+) => void | Promise<void>;
+
+/**
  * Configuration options for StoreModule tables.
  */
 export interface StoreModuleConfig extends BaseModuleConfig {
@@ -111,6 +125,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	private coordinators: Map<string, TransactionCoordinator> = new Map();
 	private tables: Map<string, StoreTable> = new Map();
 	private eventEmitter?: StoreEventEmitter;
+
+	/**
+	 * Optional listener wired by the host (the worker) to forward a logical
+	 * `apply schema` lens deployment to the sync layer's lifecycle bookkeeping.
+	 * The store module is the only basis-backing host with both persistence and a
+	 * `db` handle, so it is the forwarder; `@quereus/store` must not depend on
+	 * `@quereus/sync`, so the listener is a plain callback the worker binds.
+	 */
+	private lensDeploymentListener?: LensDeploymentListener;
 
 	/** Unsubscribe thunk for the engine `SchemaChangeNotifier` listener, set on first hook with a `db`. */
 	private schemaListenerUnsub?: () => void;
@@ -239,6 +262,45 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 */
 	getEventEmitter(): StoreEventEmitter | undefined {
 		return this.eventEmitter;
+	}
+
+	/**
+	 * Bind (or clear, with `undefined`) the lens-deployment forwarder. The host
+	 * (worker) calls this to route a logical `apply schema`'s deployment to the
+	 * sync layer; see {@link notifyLensDeployment}.
+	 */
+	setLensDeploymentListener(listener: LensDeploymentListener | undefined): void {
+		this.lensDeploymentListener = listener;
+	}
+
+	/**
+	 * Engine `notifyLensDeployment` hook: a logical `apply schema X` fires this on
+	 * every registered module once the lens catalog mutation + snapshot rotation
+	 * complete (see `VirtualTableModule.notifyLensDeployment`). The store module —
+	 * the basis-backing host — forwards the deployment to the bound listener so the
+	 * sync layer can update its basis-table lifecycle bookkeeping.
+	 *
+	 * INVERSION OF THE ENGINE FIRING CONTRACT: the engine documents that a throwing
+	 * notification aborts `apply schema X`. We deliberately wrap the listener in
+	 * try/catch and SWALLOW (structured-log only) here — lifecycle bookkeeping is
+	 * advisory and must never brick a schema apply. A bookkeeping bug is a logged
+	 * warning, not a failed deploy.
+	 */
+	async notifyLensDeployment(
+		db: Database,
+		logicalSchemaName: string,
+		snapshot: LensDeploymentSnapshot,
+	): Promise<void> {
+		if (!this.lensDeploymentListener) return;
+		try {
+			await this.lensDeploymentListener(db, logicalSchemaName, snapshot);
+		} catch (e) {
+			// Advisory bookkeeping — swallow so a listener bug cannot abort the deploy.
+			console.warn(
+				`[StoreModule] lens-deployment listener failed for logical schema '${logicalSchemaName}'; `
+					+ `lifecycle bookkeeping skipped: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
 	}
 
 	/**

@@ -5,9 +5,11 @@
  * Applications implement their own transport layer and call these methods.
  */
 
+import type { Database, LensDeploymentSnapshot } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import type { ApplyResult, ChangeSet, Snapshot, SnapshotChunk, SnapshotProgress } from './protocol.js';
+import type { BasisTableLifecycleRecord } from '../metadata/basis-lifecycle.js';
 
 /**
  * Main sync manager interface.
@@ -123,6 +125,38 @@ export interface SyncManager {
     quarantined: number;
     byTable: Map<string, number>;
   };
+
+  // ============================================================================
+  // Basis-table lifecycle (legacy-table retirement bookkeeping)
+  // ============================================================================
+
+  /**
+   * Record one logical schema's lens deployment over its basis, updating the
+   * durable per-basis-table lifecycle classification (`docs/migration.md`
+   * § 2 Converge). Driven by the `notifyLensDeployment` engine hook, forwarded
+   * from the basis-backing store module.
+   *
+   * The snapshot is scoped to one logical schema, so each schema's directly-mapped
+   * contribution is stored separately (`mappedBy`) and the aggregate state ORs
+   * them — a basis table stays `directly-mapped` until the *last* mapper drops it.
+   * Transitions stamp `mappedSince` / `unmappedSince` and emit `onBasisTableLifecycle`.
+   *
+   * Advisory bookkeeping: a throwing call must never abort the deploy. The store
+   * forwarder wraps the listener in try/catch, so an exception here is logged and
+   * swallowed there.
+   */
+  recordLensDeployment(
+    db: Database,
+    logicalSchemaName: string,
+    snapshot: LensDeploymentSnapshot,
+  ): Promise<void>;
+
+  /**
+   * Read the persisted basis-table lifecycle records (survives restart — no
+   * in-memory-only state). `lastDirectlyMappedWriteAt` / `evictPolicy` come back
+   * as the reserved (undefined) fields until `basis-eviction-policy` populates them.
+   */
+  getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]>;
 
   // ============================================================================
   // Streaming Snapshot API

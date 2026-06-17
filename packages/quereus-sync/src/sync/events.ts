@@ -9,6 +9,7 @@ import type { SqlValue } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import type { Change, UnknownTableDisposition } from './protocol.js';
+import type { BasisLifecycleState } from '../metadata/basis-lifecycle.js';
 
 // ============================================================================
 // Event Types
@@ -112,6 +113,30 @@ export interface UnknownTableEvent {
 }
 
 /**
+ * Fired when a basis table's aggregate lifecycle state changes across a lens
+ * deploy (`recordLensDeployment`). Emitted only on an *actual* state transition
+ * of an already-tracked table — a brand-new table's first classification and an
+ * idempotent re-apply emit nothing.
+ *
+ * The `directly-mapped → derivation-source-only` transition is the developer's
+ * "this table is now legacy — safe to schedule retirement" signal: the local
+ * lens has flipped off it, and it now survives only as a maintained table's
+ * source. See `docs/migration.md` § 2 Converge.
+ */
+export interface BasisTableLifecycleEvent {
+  /** Basis schema of the table whose state changed. */
+  readonly schema: string;
+  /** Basis table whose state changed. */
+  readonly table: string;
+  /** The state before this deploy. */
+  readonly previousState: BasisLifecycleState;
+  /** The state after this deploy. */
+  readonly newState: BasisLifecycleState;
+  /** Wall-clock ms when the transition was recorded. */
+  readonly at: number;
+}
+
+/**
  * Sync connection state.
  */
 export type SyncState =
@@ -172,6 +197,13 @@ export interface SyncEventEmitter {
    * event is informational so the host can decide policy.
    */
   onAssertionViolation(listener: (event: AssertionViolationEvent) => void): Unsubscribe;
+
+  /**
+   * Subscribe to basis-table lifecycle transitions.
+   * Fired when a basis table's aggregate state changes across a lens deploy
+   * (`directly-mapped → derivation-source-only` is the "safe to retire" signal).
+   */
+  onBasisTableLifecycle(listener: (event: BasisTableLifecycleEvent) => void): Unsubscribe;
 }
 
 // ============================================================================
@@ -188,6 +220,7 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   private conflictListeners = new Set<(event: ConflictEvent) => void>();
   private unknownTableListeners = new Set<(event: UnknownTableEvent) => void>();
   private assertionViolationListeners = new Set<(event: AssertionViolationEvent) => void>();
+  private basisTableLifecycleListeners = new Set<(event: BasisTableLifecycleEvent) => void>();
 
   onRemoteChange(listener: (event: RemoteChangeEvent) => void): Unsubscribe {
     this.remoteChangeListeners.add(listener);
@@ -217,6 +250,11 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   onAssertionViolation(listener: (event: AssertionViolationEvent) => void): Unsubscribe {
     this.assertionViolationListeners.add(listener);
     return () => this.assertionViolationListeners.delete(listener);
+  }
+
+  onBasisTableLifecycle(listener: (event: BasisTableLifecycleEvent) => void): Unsubscribe {
+    this.basisTableLifecycleListeners.add(listener);
+    return () => this.basisTableLifecycleListeners.delete(listener);
   }
 
   // Internal emit methods
@@ -253,6 +291,12 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
 
   emitAssertionViolation(event: AssertionViolationEvent): void {
     for (const listener of this.assertionViolationListeners) {
+      listener(event);
+    }
+  }
+
+  emitBasisTableLifecycle(event: BasisTableLifecycleEvent): void {
+    for (const listener of this.basisTableLifecycleListeners) {
       listener(event);
     }
   }

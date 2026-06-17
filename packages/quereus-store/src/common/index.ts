@@ -115,7 +115,7 @@ export { StoreConnection } from './store-connection.js';
 export { StoreBackingHost } from './backing-host.js';
 
 // Generic store module
-export { StoreModule, type StoreModuleConfig, type RehydrationResult, type RehydrationError } from './store-module.js';
+export { StoreModule, type StoreModuleConfig, type RehydrationResult, type RehydrationError, type LensDeploymentListener } from './store-module.js';
 
 // Isolation layer utilities
 export {
