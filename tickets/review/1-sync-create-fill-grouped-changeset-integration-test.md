@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-17T06:54:03.079Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\1-sync-create-fill-grouped-changeset-integration-test.review.2026-06-17T06-54-03-079Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Review a new end-to-end test that proves turning on replication for a materialized view over an already-populated table publishes those existing rows to peers as one batched change.
 prereq:
 files:
