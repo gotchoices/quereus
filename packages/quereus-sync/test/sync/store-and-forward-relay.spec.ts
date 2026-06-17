@@ -48,6 +48,7 @@ async function makePeer(opts: {
   disposition?: UnknownTableDisposition;
   known?: string[];                 // 'schema.table' in this peer's basis
   retentionHorizonMs?: number;
+  batchSize?: number;               // outbound getChangesSince transaction-granularity bound
 }): Promise<Peer> {
   const kv = new InMemoryKVStore();
   const syncEvents = new SyncEventEmitterImpl();
@@ -57,6 +58,7 @@ async function makePeer(opts: {
     siteId: site,
     unknownTableDisposition: opts.disposition ?? DEFAULT_SYNC_CONFIG.unknownTableDisposition,
     ...(opts.retentionHorizonMs !== undefined ? { retentionHorizonMs: opts.retentionHorizonMs } : {}),
+    ...(opts.batchSize !== undefined ? { batchSize: opts.batchSize } : {}),
   };
 
   const applyToStore = async (data: DataChangeToApply[], schema: SchemaChangeToApply[]) => ({
@@ -313,6 +315,49 @@ describe('store-and-forward relay', () => {
       // After GC: C no longer relays.
       const after = await R.manager.getChangesSince(generateSiteId());
       expect(tablesIn(after), 'C no longer relays after GC').to.not.include(RETIRED);
+    });
+  });
+
+  describe('bound: merged change-log + forwardable truncation', () => {
+    it('truncates the union at batchSize on a transaction boundary, deferring the forwardable tail to a later round (re-collected, still > sinceHLC), with no gap or duplicate', async () => {
+      const S = generateSiteId();        // straggler origin of the forwarded change
+      const X = generateSiteId();        // origin of R's live-table change-log writes
+      const consumer = generateSiteId(); // the peer pulling (neither S nor X, so nothing echo-excluded)
+      // R retired `orders`; holds `users`/`live`. batchSize 1 forces a per-transaction cut,
+      // so each round returns exactly one whole transaction — the truncation we want to exercise.
+      const R = await makePeer({ disposition: 'store-and-forward', known: ['main.users', 'main.live'], batchSize: 1 });
+
+      // Two live change-log writes straddle a forwarded (orders) change in global HLC order.
+      // The change-log scan (collectChangesSince) and the full forwardable scan are different
+      // sources; the union is what buildTransactionChangeSets must bound contiguously.
+      await R.manager.applyChanges([changeSet(X, 'tx-a', [col(X, 1000, 'live', 1, 'a', 'x')])]);
+      await R.manager.applyChanges([changeSet(S, 'tx-b', [col(S, 1500, RETIRED, 1, 'note', 'hi')])]);
+      await R.manager.applyChanges([changeSet(X, 'tx-c', [col(X, 2000, 'live', 2, 'b', 'y')])]);
+
+      // Pull round-by-round, advancing the watermark to max(ChangeSet.hlc) each time (the
+      // transport contract). With batchSize 1 each round returns exactly one transaction.
+      const seen: Array<{ table: string; wall: number }> = [];
+      let since: HLC | undefined;
+      for (let round = 0; round < 3; round++) {
+        const sets = await R.manager.getChangesSince(consumer, since);
+        const flat = flatten(sets);
+        expect(flat, `round ${round} returns exactly one change`).to.have.lengthOf(1);
+        seen.push({ table: flat[0].table, wall: Number(flat[0].hlc.wallTime) });
+        since = maxSetHLC(sets);
+      }
+
+      // All three delivered exactly once, in global HLC order, the forwarded change interleaved
+      // at its true position: the bound never dropped the forwardable tail nor duplicated it, and
+      // the deferred forwardable entry was re-collected next round (still `> sinceHLC`).
+      expect(seen, 'contiguous HLC-ordered prefix across rounds').to.deep.equal([
+        { table: 'live', wall: 1000 },
+        { table: RETIRED, wall: 1500 },
+        { table: 'live', wall: 2000 },
+      ]);
+
+      // Fully drained: nothing remains after the final watermark (no re-relay of the forwarded change).
+      const drained = await R.manager.getChangesSince(consumer, since);
+      expect(flatten(drained), 'nothing remains after the last watermark').to.have.lengthOf(0);
     });
   });
 
