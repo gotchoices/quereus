@@ -1108,6 +1108,16 @@ export async function attachMaintainedDerivation(
 			schema.addTable(live);
 		}
 
+		// Materialize the durable backing store the reconcile will write into,
+		// BEFORE resolving the host. A module whose `getBackingHost` resolves over a
+		// SEPARATE durable store (e.g. lamina) needs the store created here — the
+		// attach core only RESOLVES the host, never creates it, and on the
+		// non-reshape path there is no other async module call beforehand. Placed
+		// AFTER the reshape `preReconcileOps` + `schema.addTable(live)` so `live`
+		// carries the reshaped shape and the store is sized to it. A no-op for
+		// modules that omit the hook (memory hosts the live table directly).
+		await module.ensureBackingForAttach?.(db, schemaName, name, live);
+
 		// Verify-by-diff reconcile against the (possibly reshaped) backing: the
 		// re-resolved host keys the 'replace-all' diff by the module's CURRENT
 		// physical PK, so a reshape that shifted PK column indices stays aligned.

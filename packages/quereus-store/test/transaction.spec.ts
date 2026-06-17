@@ -6,7 +6,7 @@ import { expect } from 'chai';
 import { TransactionCoordinator, type PendingStoreOps, type TransactionCallbacks } from '../src/common/transaction.js';
 import { StoreEventEmitter, type DataChangeEvent } from '../src/common/events.js';
 import { InMemoryKVStore } from '../src/common/memory-store.js';
-import type { KVStore } from '../src/common/kv-store.js';
+import type { AtomicBatch, KVStore } from '../src/common/kv-store.js';
 import { bytesToHex, compareBytes } from '../src/common/bytes.js';
 
 describe('TransactionCoordinator', () => {
@@ -570,6 +570,259 @@ describe('TransactionCoordinator', () => {
 			expect(lazy.getPendingOpsForStore(target).puts.size).to.equal(1);
 			await lazy.commit();
 			expect(await target.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+		});
+	});
+
+	describe('atomic batch path', () => {
+		/**
+		 * A shared-domain in-memory AtomicBatch factory with spies. `InMemoryKVStore`
+		 * cannot crash, so "atomic" is modeled trivially (buffer ops keyed by store
+		 * handle, apply on write); the spies let the coordinator's atomic-path
+		 * routing be asserted deterministically.
+		 */
+		interface AtomicSpy {
+			factory: () => AtomicBatch | undefined;
+			beginCalls: number;
+			writeCalls: number;
+			/** When false, the factory yields undefined → coordinator falls back. */
+			yieldBatch: boolean;
+			/** When true, the produced batch's write() rejects. */
+			failWrite: boolean;
+			/** Every store handle passed to put/delete (to assert per-store folding). */
+			storeHandles: KVStore[];
+		}
+
+		function makeAtomicSpy(): AtomicSpy {
+			const spy: AtomicSpy = {
+				factory: () => undefined,
+				beginCalls: 0,
+				writeCalls: 0,
+				yieldBatch: true,
+				failWrite: false,
+				storeHandles: [],
+			};
+			spy.factory = () => {
+				spy.beginCalls++;
+				if (!spy.yieldBatch) return undefined;
+				const ops: Array<{ type: 'put' | 'delete'; store: KVStore; key: Uint8Array; value?: Uint8Array }> = [];
+				return {
+					put(store, key, value) {
+						spy.storeHandles.push(store);
+						ops.push({ type: 'put', store, key, value });
+					},
+					delete(store, key) {
+						spy.storeHandles.push(store);
+						ops.push({ type: 'delete', store, key });
+					},
+					async write() {
+						spy.writeCalls++;
+						if (spy.failWrite) throw new Error('atomic write failed');
+						for (const op of ops) {
+							if (op.type === 'put') {
+								await op.store.put(op.key, op.value!);
+							} else {
+								await op.store.delete(op.key);
+							}
+						}
+						ops.length = 0;
+					},
+					clear() {
+						ops.length = 0;
+					},
+				};
+			};
+			return spy;
+		}
+
+		/** Monkey-patch a store's batch() to count fallback-path invocations. */
+		function spyBatch(target: InMemoryKVStore): () => number {
+			const orig = target.batch.bind(target);
+			let n = 0;
+			target.batch = () => { n++; return orig(); };
+			return () => n;
+		}
+
+		it('routes through the atomic batch when the factory yields one (data + index together)', async () => {
+			const spy = makeAtomicSpy();
+			const idx = new InMemoryKVStore();
+			const dataBatchCount = spyBatch(store);
+			const idxBatchCount = spyBatch(idx);
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));        // default/data store
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);  // index store
+			await coord.commit();
+
+			// One atomic commit, no per-store batch() fallback.
+			expect(spy.beginCalls).to.equal(1);
+			expect(spy.writeCalls).to.equal(1);
+			expect(dataBatchCount()).to.equal(0);
+			expect(idxBatchCount()).to.equal(0);
+			// Data + index landed together.
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await idx.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+			await idx.close();
+		});
+
+		it('falls back to per-store batch() when the factory yields undefined', async () => {
+			const spy = makeAtomicSpy();
+			spy.yieldBatch = false;
+			const idx = new InMemoryKVStore();
+			const dataBatchCount = spyBatch(store);
+			const idxBatchCount = spyBatch(idx);
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
+			await coord.commit();
+
+			expect(spy.beginCalls).to.equal(1);
+			expect(spy.writeCalls).to.equal(0);
+			expect(dataBatchCount()).to.equal(1);
+			expect(idxBatchCount()).to.equal(1);
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await idx.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+			await idx.close();
+		});
+
+		it('byte-identical fallback when no factory is supplied at all', async () => {
+			// The capability-absent default: a coordinator with no factory must
+			// behave exactly as before (per-store batch loop).
+			const idx = new InMemoryKVStore();
+			const dataBatchCount = spyBatch(store);
+			const coord = new TransactionCoordinator(store, emitter);
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
+			await coord.commit();
+
+			expect(dataBatchCount()).to.equal(1);
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await idx.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+			await idx.close();
+		});
+
+		it('a rejected atomic write propagates, clears state, and leaks no ops', async () => {
+			const spy = makeAtomicSpy();
+			spy.failWrite = true;
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+
+			let err: unknown;
+			try { await coord.commit(); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(Error);
+			expect((err as Error).message).to.match(/atomic write failed/);
+			// finally { clearTransaction() } still ran.
+			expect(coord.isInTransaction()).to.be.false;
+			// write() threw before applying — nothing landed.
+			expect(await store.get(new Uint8Array([1]))).to.be.undefined;
+
+			// No ops leak into the next transaction; a now-succeeding write commits clean.
+			spy.failWrite = false;
+			coord.begin();
+			coord.put(new Uint8Array([2]), new Uint8Array([20]));
+			await coord.commit();
+			expect(await store.get(new Uint8Array([1]))).to.be.undefined; // not resurrected
+			expect(await store.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+		});
+
+		it('fires pending events and commit callbacks on the atomic path', async () => {
+			const spy = makeAtomicSpy();
+			const events: DataChangeEvent[] = [];
+			emitter.onDataChange(e => events.push(e));
+			let committed = false;
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			coord.registerCallbacks({ onCommit: () => { committed = true; }, onRollback: () => {} });
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.queueEvent({ type: 'insert', schemaName: 'main', tableName: 't' });
+			await coord.commit();
+
+			expect(spy.writeCalls).to.equal(1);
+			expect(events).to.have.length(1);
+			expect(committed).to.be.true;
+		});
+
+		it('routes a default-only bucket through one atomic batch', async () => {
+			const spy = makeAtomicSpy();
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			await coord.commit();
+			expect(spy.writeCalls).to.equal(1);
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+		});
+
+		it('routes an index-only bucket without ever resolving the default store', async () => {
+			const spy = makeAtomicSpy();
+			const idx = new InMemoryKVStore();
+			let opened = 0;
+			const coord = new TransactionCoordinator(
+				async () => { opened++; return new InMemoryKVStore(); },
+				emitter,
+				spy.factory,
+			);
+			coord.begin();
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
+			await coord.commit();
+			expect(spy.writeCalls).to.equal(1);
+			expect(opened).to.equal(0); // default bucket empty → never resolved
+			expect(await idx.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+			await idx.close();
+		});
+
+		it('folds default-addressed-by-handle ops into one store entry (no double-write)', async () => {
+			const spy = makeAtomicSpy();
+			// `store` is a concrete handle → resolvedStore === store from construction,
+			// so an explicit `store` handle folds into the default (null) bucket.
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));         // by omission
+			coord.put(new Uint8Array([1]), new Uint8Array([99]), store);  // by handle, same key
+			await coord.commit();
+
+			expect(spy.writeCalls).to.equal(1);
+			// Both ops addressed the single resolved default handle.
+			expect(new Set(spy.storeHandles).size).to.equal(1);
+			expect(spy.storeHandles[0]).to.equal(store);
+			// Last-write-wins applied in order.
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([99]));
+		});
+
+		it('commit after rollback-to-savepoint writes exactly the surviving ops via the atomic batch', async () => {
+			const spy = makeAtomicSpy();
+			const idx = new InMemoryKVStore();
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
+			coord.createSavepoint(0);
+			coord.put(new Uint8Array([3]), new Uint8Array([30]));
+			coord.put(new Uint8Array([4]), new Uint8Array([40]), idx);
+			coord.rollbackToSavepoint(0);
+			await coord.commit();
+
+			expect(spy.writeCalls).to.equal(1);
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await idx.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+			expect(await store.get(new Uint8Array([3]))).to.be.undefined;
+			expect(await idx.get(new Uint8Array([4]))).to.be.undefined;
+			await idx.close();
+		});
+
+		it('opens no atomic batch for an empty transaction', async () => {
+			const spy = makeAtomicSpy();
+			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			coord.begin();
+			await coord.commit();
+			expect(spy.beginCalls).to.equal(0);
+			expect(spy.writeCalls).to.equal(0);
 		});
 	});
 });

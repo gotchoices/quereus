@@ -281,6 +281,51 @@ export interface VirtualTableModule<
 	getBackingHost?(db: Database, schemaName: string, tableName: string): BackingHost | undefined;
 
 	/**
+	 * Optional. Materialize a durable backing for an ALREADY-EXISTING ordinary
+	 * table that is being attached as maintained (`alter table … set maintained
+	 * as <body>` / `create table … maintained`), BEFORE the attach reconcile
+	 * resolves the table's backing host via {@link getBackingHost}. A module whose
+	 * `getBackingHost` resolves over a SEPARATE durable store (not the live table's
+	 * own storage) needs this seam because the engine's attach core only RESOLVES
+	 * (never creates) the host on the non-reshape path, so the store must exist by
+	 * the time `resolveBackingHost` runs.
+	 *
+	 * `backingSchema` is the (possibly reshaped) live schema the store must be
+	 * sized to — call it AFTER the reshape `preReconcileOps` and `schema.addTable`.
+	 * Idempotent: a re-attach over an already-maintained table reuses the existing
+	 * store. No-op for modules whose `getBackingHost` already resolves over the
+	 * live table (e.g. memory) — they omit the method entirely, so the optional
+	 * call is a pure no-op. Omit ⇒ the engine resolves the host as-is (today's
+	 * behavior).
+	 */
+	ensureBackingForAttach?(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		backingSchema: TableSchema,
+	): Promise<void>;
+
+	/**
+	 * Optional. Retire the durable backing when a maintained table is detached
+	 * (`alter table … drop maintained`), leaving the table ORDINARY and
+	 * user-writable with its current (maintained) rows intact. The counterpart to
+	 * {@link ensureBackingForAttach}: a module that migrated the table into a
+	 * separate durable store on attach migrates the rows back into ordinary
+	 * storage here and drops the store, so subsequent reads/writes route through
+	 * the ordinary table surface.
+	 *
+	 * `plainSchema` is the detached (derivation-less) schema. No-op for modules
+	 * with a single physical storage (e.g. memory) — they omit the method. Omit ⇒
+	 * detach is catalog-only (today's behavior).
+	 */
+	retireBackingForAttach?(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		plainSchema: TableSchema,
+	): Promise<void>;
+
+	/**
 	 * Alter an existing table's structure. Called by ALTER TABLE for
 	 * data-affecting changes — every `SchemaChangeInfo` arm: ADD / DROP /
 	 * RENAME COLUMN, ADD / DROP / RENAME CONSTRAINT, ALTER COLUMN, ALTER

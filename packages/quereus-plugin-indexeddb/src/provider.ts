@@ -12,7 +12,7 @@
  *   __catalog__                   - Catalog store (DDL metadata)
  */
 
-import type { KVStore, KVStoreProvider } from '@quereus/store';
+import type { AtomicBatch, KVStore, KVStoreProvider } from '@quereus/store';
 import {
 	buildDataStoreName,
 	buildIndexStoreName,
@@ -21,7 +21,8 @@ import {
 	STATS_STORE_NAME,
 	type CacheOptions,
 } from '@quereus/store';
-import { IndexedDBStore } from './store.js';
+import { QuereusError, StatusCode } from '@quereus/quereus';
+import { IndexedDBStore, MultiStoreWriteBatch } from './store.js';
 import { IndexedDBManager } from './manager.js';
 
 /**
@@ -223,6 +224,40 @@ export class IndexedDBProvider implements KVStoreProvider {
 	}
 
 	/**
+	 * Open an atomic batch across this provider's object stores.
+	 *
+	 * All of this provider's stores live in one IndexedDB database, so a single
+	 * `db.transaction(storeNames, 'readwrite')` (driven by {@link MultiStoreWriteBatch})
+	 * commits them atomically and durably. The transaction coordinator uses this
+	 * to commit a table's data + secondary-index stores in one physical batch.
+	 */
+	beginAtomicBatch(): AtomicBatch {
+		return new IndexedDBAtomicBatch(
+			this.manager,
+			(store) => this.resolveStoreName(store),
+			(storeName) => this.invalidateStore(storeName),
+		);
+	}
+
+	/**
+	 * Map a {@link KVStore} handle this provider handed out back to its object
+	 * store name. Handles are `CachedKVStore(IndexedDBStore)` (or a raw
+	 * `IndexedDBStore` when caching is disabled). A handle not produced by this
+	 * provider — wrong type, or an `IndexedDBStore` bound to a different manager —
+	 * is a programming error.
+	 */
+	private resolveStoreName(store: KVStore): string {
+		const raw = store instanceof CachedKVStore ? store.getUnderlying() : store;
+		if (!(raw instanceof IndexedDBStore) || raw.getManager() !== this.manager) {
+			throw new QuereusError(
+				'AtomicBatch received a KVStore handle not produced by this provider',
+				StatusCode.MISUSE,
+			);
+		}
+		return raw.getStoreName();
+	}
+
+	/**
 	 * Invalidate the read cache for a specific table's data and index stores.
 	 * Called by cross-tab sync when remote data changes are detected.
 	 */
@@ -297,6 +332,51 @@ export class IndexedDBProvider implements KVStoreProvider {
 			await store.close();
 			this.stores.delete(storeName);
 		}
+	}
+}
+
+/**
+ * {@link AtomicBatch} over the unified IndexedDB database.
+ *
+ * Wraps {@link MultiStoreWriteBatch} (one `db.transaction(storeNames, 'readwrite')`
+ * = native IDB multi-store atomicity), translating each {@link KVStore} handle to
+ * its object store name via the provider's `resolveStoreName`. After a successful
+ * `write()` the atomic write has bypassed every `CachedKVStore` wrapper, so each
+ * touched store's read cache would be stale; the batch invalidates them via the
+ * provider's `invalidateStore` to preserve read-your-own-writes across the cache.
+ */
+class IndexedDBAtomicBatch implements AtomicBatch {
+	private readonly batch: MultiStoreWriteBatch;
+
+	constructor(
+		manager: IndexedDBManager,
+		private readonly resolveStoreName: (store: KVStore) => string,
+		private readonly invalidateStore: (storeName: string) => void,
+	) {
+		this.batch = new MultiStoreWriteBatch(manager);
+	}
+
+	put(store: KVStore, key: Uint8Array, value: Uint8Array): void {
+		this.batch.putToStore(this.resolveStoreName(store), key, value);
+	}
+
+	delete(store: KVStore, key: Uint8Array): void {
+		this.batch.deleteFromStore(this.resolveStoreName(store), key);
+	}
+
+	async write(): Promise<void> {
+		// Capture before write() — MultiStoreWriteBatch clears nothing on write,
+		// but read the names up front so cache invalidation is independent of the
+		// batch's internal state afterward.
+		const storeNames = this.batch.getStoreNames();
+		await this.batch.write();
+		for (const storeName of storeNames) {
+			this.invalidateStore(storeName);
+		}
+	}
+
+	clear(): void {
+		this.batch.clear();
 	}
 }
 

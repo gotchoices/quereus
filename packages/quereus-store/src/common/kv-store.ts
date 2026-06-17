@@ -71,6 +71,29 @@ export interface WriteBatch {
 }
 
 /**
+ * An atomic batch spanning multiple stores of ONE provider. `write()` commits
+ * every queued op across every referenced store in a single durable,
+ * all-or-nothing physical commit. Obtained from
+ * {@link KVStoreProvider.beginAtomicBatch}; a provider exposes that method iff
+ * its stores share one atomic commit domain. All stores passed to `put`/`delete`
+ * must have been produced by the same provider.
+ *
+ * Stores are addressed by {@link KVStore} handle (matching how the transaction
+ * coordinator already tracks each op's target store), not by name — so it
+ * composes with the coordinator's per-store bucketing without a name lookup.
+ */
+export interface AtomicBatch {
+	/** Queue a put against the given store. */
+	put(store: KVStore, key: Uint8Array, value: Uint8Array): void;
+	/** Queue a delete against the given store. */
+	delete(store: KVStore, key: Uint8Array): void;
+	/** Commit all queued ops across all referenced stores atomically + durably. */
+	write(): Promise<void>;
+	/** Discard all queued ops. */
+	clear(): void;
+}
+
+/**
  * Abstract key-value store interface.
  * Provides sorted key-value storage with range iteration support.
  */
@@ -254,4 +277,17 @@ export interface KVStoreProvider {
 	 * @param indexNames - The table's secondary-index names (exact, from the schema)
 	 */
 	renameTableStores?(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]): Promise<void>;
+
+	/**
+	 * Open an atomic batch across this provider's stores, or return undefined
+	 * when the provider has no shared atomic commit domain (callers then fall
+	 * back to per-store {@link KVStore.batch}).
+	 *
+	 * A provider implements this iff all of its stores commit into one durable,
+	 * all-or-nothing physical domain (e.g. IndexedDB's single database with
+	 * multiple object stores). The transaction coordinator uses it to commit a
+	 * table's data + secondary-index stores in one batch, closing the crash
+	 * window where a per-store loop could leave them divergent.
+	 */
+	beginAtomicBatch?(): AtomicBatch | undefined;
 }

@@ -9,6 +9,7 @@ export type {
   WriteBatch,
   WriteOptions,
   BatchOp,
+  AtomicBatch,
   IterateOptions,
   KVStoreFactory,
   KVStoreOptions,

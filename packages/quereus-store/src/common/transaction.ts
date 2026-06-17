@@ -8,7 +8,7 @@
 import { QuereusError, StatusCode } from '@quereus/quereus';
 import { bytesToHex, compareBytes } from './bytes.js';
 import type { DataChangeEvent, StoreEventEmitter } from './events.js';
-import type { KVStore } from './kv-store.js';
+import type { AtomicBatch, KVStore } from './kv-store.js';
 
 /** Operation recorded in the transaction. */
 interface PendingOp {
@@ -106,6 +106,13 @@ export class TransactionCoordinator {
   private resolvedStore: KVStore | null;
   private storePromise: Promise<KVStore> | null = null;
   private eventEmitter?: StoreEventEmitter;
+  /**
+   * Optional factory yielding an {@link AtomicBatch} that spans the provider's
+   * stores. Re-evaluated per commit so a provider that gains/loses the
+   * capability (or is swapped under test) is always honored; returning
+   * `undefined` falls back to the per-store {@link KVStore.batch} loop.
+   */
+  private atomicBatchFactory?: () => AtomicBatch | undefined;
 
   // Transaction state
   private inTransaction = false;
@@ -122,10 +129,15 @@ export class TransactionCoordinator {
    */
   private pendingIndex = new Map<KVStore | null, PendingBucket>();
 
-  constructor(store: DefaultStoreSource, eventEmitter?: StoreEventEmitter) {
+  constructor(
+    store: DefaultStoreSource,
+    eventEmitter?: StoreEventEmitter,
+    atomicBatchFactory?: () => AtomicBatch | undefined,
+  ) {
     this.storeSource = store;
     this.resolvedStore = typeof store === 'function' ? null : store;
     this.eventEmitter = eventEmitter;
+    this.atomicBatchFactory = atomicBatchFactory;
   }
 
   /** Register callbacks for transaction lifecycle events. */
@@ -206,22 +218,43 @@ export class TransactionCoordinator {
 
         // Resolve the default store lazily here — and only when default-bucket
         // ops exist, so a coordinator that only ever targeted explicit stores
-        // never opens the default. Resolving BEFORE any batch is written keeps
-        // a failed resolve from stranding a partial multi-store commit.
+        // never opens the default. Resolving BEFORE any batch is opened keeps a
+        // failed resolve from stranding a partial multi-store commit (atomic and
+        // fallback paths alike).
         const defaultStore = opsByStore.has(null) ? await this.resolveStore() : null;
 
-        // Write a batch per store.
-        for (const [target, ops] of opsByStore) {
-          const targetStore = target ?? defaultStore!;
-          const batch = targetStore.batch();
-          for (const op of ops) {
-            if (op.type === 'put') {
-              batch.put(op.key, op.value!);
-            } else {
-              batch.delete(op.key);
+        // Atomic path — when the provider exposes a shared commit domain, queue
+        // every grouped op into one AtomicBatch (default bucket → resolved
+        // defaultStore handle) and commit once. opsByStore is already folded by
+        // `bucketKey`, so each physical store appears at most once: no
+        // double-write of the same store within the single atomic batch.
+        const atomicBatch = this.atomicBatchFactory?.();
+        if (atomicBatch) {
+          for (const [target, ops] of opsByStore) {
+            const targetStore = target ?? defaultStore!;
+            for (const op of ops) {
+              if (op.type === 'put') {
+                atomicBatch.put(targetStore, op.key, op.value!);
+              } else {
+                atomicBatch.delete(targetStore, op.key);
+              }
             }
           }
-          await batch.write();
+          await atomicBatch.write();
+        } else {
+          // Fallback path — one batch per store, written sequentially.
+          for (const [target, ops] of opsByStore) {
+            const targetStore = target ?? defaultStore!;
+            const batch = targetStore.batch();
+            for (const op of ops) {
+              if (op.type === 'put') {
+                batch.put(op.key, op.value!);
+              } else {
+                batch.delete(op.key);
+              }
+            }
+            await batch.write();
+          }
         }
       }
 

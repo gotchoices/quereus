@@ -1375,7 +1375,14 @@ async function runDropMaintained(
 			StatusCode.ERROR,
 		);
 	}
-	detachMaintainedDerivation(rctx.db, live);
+	const plain = detachMaintainedDerivation(rctx.db, live);
+	// Retire the durable backing store the attach materialized, migrating its
+	// rows back into ordinary storage so the detached table stays readable and
+	// user-writable. `detachMaintainedDerivation` stays SYNC (catalog-only); the
+	// async store retirement rides here, in its sole caller. A no-op for modules
+	// that omit the hook (memory detaches catalog-only — one physical storage).
+	const module = requireVtabModule(live);
+	await module.retireBackingForAttach?.(rctx.db, plain.schemaName, plain.name, plain);
 	log('Detached derivation from table %s.%s', live.schemaName, live.name);
 	return null;
 }

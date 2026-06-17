@@ -1840,7 +1840,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	getCoordinator(tableKey: string, config: StoreTableConfig): TransactionCoordinator {
 		let coordinator = this.coordinators.get(tableKey);
 		if (!coordinator) {
-			coordinator = new TransactionCoordinator(() => this.getStore(tableKey, config), this.eventEmitter);
+			coordinator = new TransactionCoordinator(
+				() => this.getStore(tableKey, config),
+				this.eventEmitter,
+				// Re-evaluated per commit (see TransactionCoordinator.atomicBatchFactory)
+				// so a provider that gains/loses the capability is always honored.
+				() => this.provider.beginAtomicBatch?.(),
+			);
 			this.coordinators.set(tableKey, coordinator);
 		}
 		return coordinator;

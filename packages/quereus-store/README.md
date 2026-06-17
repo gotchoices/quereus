@@ -200,6 +200,47 @@ const caps = storeModule.getCapabilities();
 - Savepoints (create / release / rollback-to) work within a transaction via the coordinator's buffered op log
   - Caveat: a DDL-commit operation (`replaceContents` / `renameTable`, e.g. `refresh materialized view` or `alter table … rename`) commits the coordinator mid-transaction, clearing the savepoint stack. A later `rollback to` / `release` targeting a now-vanished savepoint degrades to a no-op (warn-and-return) rather than throwing; the committed DDL and everything before it stays committed
 
+## Atomic multi-store commit
+
+`TransactionCoordinator.commit()` writes a table's data store and each of its
+secondary-index stores. By default it writes **one `KVStore.batch()` per store,
+sequentially** — a crash between those batches can leave a table's rows and its
+indexes divergent on disk, with no automatic healing.
+
+A provider whose stores share a single durable commit domain can close that
+window by implementing the optional `KVStoreProvider.beginAtomicBatch()`:
+
+```typescript
+interface AtomicBatch {
+  put(store: KVStore, key: Uint8Array, value: Uint8Array): void;
+  delete(store: KVStore, key: Uint8Array): void;
+  write(): Promise<void>;   // one durable, all-or-nothing physical commit
+  clear(): void;
+}
+
+interface KVStoreProvider {
+  // ...
+  // Open a batch spanning this provider's stores, or undefined when the provider
+  // has no shared commit domain (the coordinator then falls back to per-store batch()).
+  beginAtomicBatch?(): AtomicBatch | undefined;
+}
+```
+
+The batch addresses stores by **`KVStore` handle**, so it composes with the
+coordinator's existing per-store bucketing without a name lookup. When present,
+`commit()` queues every pending op (data + indexes) into one `AtomicBatch` and
+issues a single `write()`; the whole table commits or rolls back together. When
+absent — or when the factory returns `undefined` — behavior is byte-identical to
+the per-store loop, so providers without a shared domain are unaffected.
+
+The capability surface deliberately spans **multiple stores of one provider**
+(not just one table's), so a future module-wide cross-table commit can reuse the
+exact same batch with no interface change. The
+[`@quereus/plugin-indexeddb`](../quereus-plugin-indexeddb) provider implements it
+over its single IndexedDB database (multiple object stores, one
+`db.transaction(...,'readwrite')`), invalidating each touched store's read cache
+after a successful write so read-your-own-writes survives the cache.
+
 ## Materialized-View Backing Host
 
 The store module implements the engine's backing-host capability
@@ -306,6 +347,7 @@ console.log(hasIsolation(isolatedModule)); // true
 | `KVStore` | Key-value store interface (type) |
 | `KVStoreProvider` | Store factory interface (type) |
 | `WriteBatch` | Batch write interface (type) |
+| `AtomicBatch` | Cross-store all-or-nothing batch from `KVStoreProvider.beginAtomicBatch` (type) |
 | `IterateOptions` | Iteration options (type) |
 | `StoreModule` | Generic VirtualTableModule |
 | `StoreTable` | Virtual table implementation (incl. `applyExternalRowChanges` / `readRowByPk` for externally-applied source writes) |
