@@ -528,10 +528,13 @@ select id, x from oj1 order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
 
 -- ===================================================================
--- Non-equi (theta) INNER join leg deferral (`set-op-write-multisource-leg-compose` ships INNER
--- EQUI-join legs): a join leg whose ON is a non-equi predicate (`ne1.x > ne2.lo and ne1.x <
--- ne2.hi`) is deferred — the body is conservatively non-writable, so the static surfaces report
--- all-`NO` and the dynamic write rejects cleanly (never the internal `k.k0_0` capture error).
+-- Missing-discriminator deferral (union-all body, non-equi INNER join leg, no literal
+-- discriminator): the body has no literal discriminator in either leg, so `flaglessShape`
+-- returns null — INSERT routing is ambiguous. The static surfaces report all-`NO` and the
+-- dynamic write rejects with `unsupported-set-op`.
+-- Note: the all-`NO` is NOT because the join is non-equi — `isWritableLeafLeg` admits a
+-- non-equi INNER join identically to an equi-join. The deferral is entirely due to the
+-- missing literal discriminator in a union-all body.
 -- ===================================================================
 create table ne1 (id integer primary key, x integer);
 create table ne2 (id integer primary key, lo integer, hi integer);
@@ -550,6 +553,31 @@ delete from NEV where id = 1;
 -- base tables untouched.
 select id, x from ne1 order by id;
 → [{"id":1,"x":10},{"id":2,"x":20}]
+
+-- ===================================================================
+-- Positive: non-equi INNER join leg WITH a literal discriminator (`set-op-flagless-write`).
+-- `isWritableLeafLeg` admits a non-equi INNER join (keys only on `joinType`), and the literal
+-- `tag` discriminator resolves the insert-routing ambiguity. So this body is writable for
+-- UPDATE / DELETE (is_updatable=YES, is_deletable=YES); INSERT is deferred because the join
+-- leg itself has no shared-surrogate envelope (is_insertable_into=NO, same as equi-join legs).
+-- Only id=1 is visible through the view (x=10 satisfies 5 < x < 15); id=2 (x=20) is not.
+-- ===================================================================
+create view NEVD as
+  select ne1.id as id, ne1.x as x, 'ne' as tag from ne1 join ne2 on ne1.x > ne2.lo and ne1.x < ne2.hi
+  union all
+  select id, x, 'plain' as tag from ne1 where id = 99;
+select is_insertable_into, is_updatable, is_deletable from view_info('NEVD');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+
+-- UPDATE through the non-equi join leg: id=1 is visible (x=10 is in range), update x.
+update NEVD set x = 11 where id = 1;
+select id, x from ne1 order by id;
+→ [{"id":1,"x":11},{"id":2,"x":20}]
+
+-- DELETE through the non-equi join leg: id=1 is now x=11 (still in range), delete it.
+delete from NEVD where id = 1;
+select id, x from ne1 order by id;
+→ [{"id":2,"x":20}]
 
 -- ===================================================================
 -- Range-σ write-branch oracle (`set-op-flagless-range-sigma-oracle`): a RANGE σ

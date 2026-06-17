@@ -330,8 +330,9 @@ export function isDecomposableJoinBody(selectAst: AST.QueryExpr): boolean {
 /**
  * True iff `selectAst` is a decomposable join body ({@link isDecomposableJoinBody}) whose
  * joins are **all INNER**. The set-op join-leg compose
- * (`set-op-write-multisource-leg-compose`) ships INNER equi-join legs; an OUTER
- * (left/right/full) join leg's set-op write composition is a follow-up. The set-op
+ * (`set-op-write-multisource-leg-compose`) ships INNER join legs — the gate is purely
+ * `joinType`-based, so a non-equi (theta) INNER join is admitted identically to an equi-join.
+ * An OUTER (left/right/full) join leg's set-op write composition is deferred. The set-op
  * recognizers gate on this so a body with an outer-join leg reports the conservative
  * all-`NO` static surface AND rejects the dynamic write cleanly (never an internal error),
  * matching exactly. A cross / no-ON join (not decomposable) likewise fails this and is

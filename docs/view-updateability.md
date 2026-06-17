@@ -497,9 +497,10 @@ or an **uncovered NOT NULL** base column on the non-key side; a subtree operand 
 cleanly at branch classification (`isInnerJoinBody` is false). A
 **non-equi (theta) inner** join leg, by contrast, is admitted by `isInnerJoinBody` (which keys only
 on `joinType`) and composes here **exactly as the standalone join-view path admits it** — so a
-membership body's non-equi inner-join branch is writable, not deferred. (The flag-less route, by
-contrast, is stricter: its recognizer conservatively defers a non-equi leg to all-`NO`. Aligning
-non-equi handling across the two set-op paths is a follow-up — `set-op-write-multisource-leg-nonequi`.)
+membership body's non-equi inner-join branch is writable, not deferred. The flag-less set-op path
+admits non-equi inner legs identically: `isWritableLeafLeg` (which gates `flaglessShape`) also keys
+only on `joinType`, so all three paths (standalone, membership, flag-less) accept a non-equi inner
+join leg for UPDATE / DELETE.
 A branch that bottoms out in a base table emits one base op; a branch that is itself a
 `SetOperationNode` (a **subtree operand**) **recurses here** for the
 unambiguous fan-out — a data-column UPDATE, a DELETE, and a `set <subtreeFlag> = false` drop

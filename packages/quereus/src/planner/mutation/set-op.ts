@@ -201,8 +201,8 @@ function isOperandWritable(operand: AST.QueryExpr, hasGatingFlag: boolean): bool
 	// capture chained off the outer set-op capture). An OUTER (left/right/full) / cross join leg is
 	// deferred, so it reports non-writable here — matching the dynamic `buildBranch` reject exactly.
 	// (`isInnerJoinBody` keys only on `joinType`, so a NON-EQUI inner join is admitted and composes,
-	// exactly as the standalone join-view path admits it — the flag-less route is stricter; see
-	// docs/view-updateability.md § Set Operations.) This recurses to leaves at every depth, so a
+	// exactly as the standalone join-view path and the flag-less route admit it.) This recurses to
+	// leaves at every depth, so a
 	// nested join leaf is classified too. Insertability through a join leg is deferred separately
 	// (gated in `schema.ts`).
 	if (tryBranchColumnNames(effective) === null) return false;
@@ -1562,13 +1562,14 @@ function hasLiteralDiscriminator(leaf: AST.SelectStmt): boolean {
 /** True iff a leaf SELECT is a writable flag-less leg: single-source, no compound, ≥1 plain/literal column, all admitted. */
 function isWritableLeafLeg(leaf: AST.SelectStmt): boolean {
 	if (leaf.compound) return false;
-	// A multi-source (join) leg is writable for UPDATE / DELETE when it is a plain INNER equi-join
+	// A multi-source (join) leg is writable for UPDATE / DELETE when it is an INNER join
 	// (`set-op-write-multisource-leg-compose`, which builds an inner per-branch capture chained
-	// off the outer set-op capture). An OUTER (left/right/full) / cross / non-equi join leg is
-	// deferred: falling to `false` here drops the WHOLE body out of the flag-less route (via
-	// `flaglessShape`'s per-leg walk) → conservative all-`NO` static surface + the single-source
-	// spine's clean `unsupported-set-op` reject. (Comma joins are unreachable — the reader rejects
-	// multiple FROM sources at build time.)
+	// off the outer set-op capture). `isInnerJoinBody` keys only on `joinType`, so a non-equi
+	// (theta) INNER join is admitted here exactly as on the membership and standalone paths. An
+	// OUTER (left/right/full) / cross join leg is deferred: falling to `false` here drops the
+	// WHOLE body out of the flag-less route (via `flaglessShape`'s per-leg walk) → conservative
+	// all-`NO` static surface + the single-source spine's clean `unsupported-set-op` reject.
+	// (Comma joins are unreachable — the reader rejects multiple FROM sources at build time.)
 	if (isJoinBody(leaf) && !isInnerJoinBody(leaf)) return false;
 	if (!leaf.columns || leaf.columns.length === 0) return false;
 	return leaf.columns.every(rc => legColumnKind(rc) !== null);

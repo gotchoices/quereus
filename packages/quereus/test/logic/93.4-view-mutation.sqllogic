@@ -4360,3 +4360,68 @@ update qv_join set note = 'X2' where cid = 10 returning qv_join.*;
 
 delete from qv_join where cid = 10 returning qv_join.*;
 → [{"cid":10,"note":"X2","label":"L1"}]
+
+-- ===================================================================
+-- Standalone non-equi (theta) INNER join view: `isInnerJoinBody` keys only on `joinType`,
+-- so a join whose ON is a non-equi predicate is admitted for UPDATE / DELETE exactly like an
+-- equi-join. Static surfaces: is_insertable_into=YES, is_updatable=YES, is_deletable=YES.
+-- Only rows where the theta predicate holds are visible (id=1: x=10, 5<10<15 → visible).
+-- ===================================================================
+create table nj_a (id integer primary key, x integer);
+create table nj_b (id integer primary key, lo integer, hi integer);
+insert into nj_a values (1,10),(2,20);
+insert into nj_b values (1,5,15);
+create view NJV as
+  select nj_a.id as id, nj_a.x as x from nj_a join nj_b on nj_a.x > nj_b.lo and nj_a.x < nj_b.hi;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('NJV');
+→ [{"is_insertable_into":"YES","is_updatable":"YES","is_deletable":"YES"}]
+
+-- Only id=1 is visible (x=10 satisfies 5 < x < 15).
+select id, x from NJV order by id;
+→ [{"id":1,"x":10}]
+
+-- UPDATE through the non-equi join: x maps to nj_a.x.
+update NJV set x = 12 where id = 1;
+select id, x from nj_a order by id;
+→ [{"id":1,"x":12},{"id":2,"x":20}]
+
+-- DELETE through the non-equi join: id=1 (x=12 still in range) is removed from nj_a.
+delete from NJV where id = 1;
+select id, x from nj_a order by id;
+→ [{"id":2,"x":20}]
+
+-- ===================================================================
+-- Membership set-op with a non-equi (theta) INNER join leg: the join leg composes for
+-- UPDATE / DELETE (is_updatable=YES, is_deletable=YES); INSERT into the join leg is deferred
+-- (is_insertable_into=NO, same as equi-join legs). Proves the flag-less and membership paths
+-- agree on non-equi inner-join admittance.
+-- ===================================================================
+create table nmj_a (id integer primary key, x integer);
+create table nmj_b (id integer primary key, lo integer, hi integer);
+create table nmj_p (id integer primary key, x integer);
+insert into nmj_a values (1,10),(2,20);
+insert into nmj_b values (1,5,15);
+insert into nmj_p values (3,30);
+create view NMV as
+  select nmj_a.id as id, nmj_a.x as x
+    from nmj_a join nmj_b on nmj_a.x > nmj_b.lo and nmj_a.x < nmj_b.hi
+  union exists left as inJ, exists right as inP
+  select id, x from nmj_p;
+
+select is_insertable_into, is_updatable, is_deletable from view_info('NMV');
+→ [{"is_insertable_into":"NO","is_updatable":"YES","is_deletable":"YES"}]
+
+-- id=1 is visible through the join leg (x=10 satisfies 5<10<15); id=3 through the plain leg.
+select id, x, inJ, inP from NMV order by id;
+→ [{"id":1,"x":10,"inJ":true,"inP":false},{"id":3,"x":30,"inJ":false,"inP":true}]
+
+-- UPDATE through the non-equi join leg.
+update NMV set x = 13 where inJ = true;
+select id, x from nmj_a order by id;
+→ [{"id":1,"x":13},{"id":2,"x":20}]
+
+-- DELETE through the non-equi join leg (id=1 still visible: x=13 satisfies 5<13<15).
+delete from NMV where inJ = true;
+select id, x from nmj_a order by id;
+→ [{"id":2,"x":20}]
