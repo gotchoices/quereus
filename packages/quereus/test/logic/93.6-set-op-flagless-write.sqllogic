@@ -558,8 +558,10 @@ select id, x from ne1 order by id;
 -- Positive: non-equi INNER join leg WITH a literal discriminator (`set-op-flagless-write`).
 -- `isWritableLeafLeg` admits a non-equi INNER join (keys only on `joinType`), and the literal
 -- `tag` discriminator resolves the insert-routing ambiguity. So this body is writable for
--- UPDATE / DELETE (is_updatable=YES, is_deletable=YES); INSERT is deferred because the join
--- leg itself has no shared-surrogate envelope (is_insertable_into=NO, same as equi-join legs).
+-- UPDATE / DELETE (is_updatable=YES, is_deletable=YES). INSERT is deferred precisely BECAUSE the
+-- join is non-equi: `setOpJoinLegsInsertable` probes the leg with `analyzeMultiSourceInsert`,
+-- which rejects a non-equi ON (`unsupported-join`) → is_insertable_into=NO. An equi-join leg with
+-- a qualifying shared key WOULD be insertable here (cf. the equi-join MXV body above, which is YES).
 -- Only id=1 is visible through the view (x=10 satisfies 5 < x < 15); id=2 (x=20) is not.
 -- ===================================================================
 create view NEVD as

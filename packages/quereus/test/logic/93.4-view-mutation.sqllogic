@@ -4393,9 +4393,11 @@ select id, x from nj_a order by id;
 
 -- ===================================================================
 -- Membership set-op with a non-equi (theta) INNER join leg: the join leg composes for
--- UPDATE / DELETE (is_updatable=YES, is_deletable=YES); INSERT into the join leg is deferred
--- (is_insertable_into=NO, same as equi-join legs). Proves the flag-less and membership paths
--- agree on non-equi inner-join admittance.
+-- UPDATE / DELETE (is_updatable=YES, is_deletable=YES). INSERT is deferred precisely BECAUSE the
+-- join is non-equi: `setOpJoinLegsInsertable` probes the leg with `analyzeMultiSourceInsert`,
+-- which rejects a non-equi ON (`unsupported-join`) → is_insertable_into=NO. (An equi-join
+-- membership leg with a qualifying shared key WOULD report YES — `set-op-write-multisource-leg-insert`.)
+-- Proves the flag-less and membership paths agree on non-equi inner-join admittance for UPDATE/DELETE.
 -- ===================================================================
 create table nmj_a (id integer primary key, x integer);
 create table nmj_b (id integer primary key, lo integer, hi integer);
