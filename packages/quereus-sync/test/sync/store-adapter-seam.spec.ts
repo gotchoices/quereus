@@ -385,10 +385,21 @@ describe('store-adapter seam integration', () => {
 		// throwing (it keeps applying other tables). The consumer must still treat
 		// any non-empty `errors` like a whole-batch throw: emit error + throw, with
 		// NO CRDT metadata committed, so the whole batch re-resolves next sync.
+		//
+		// The trigger here is a basis/store-ownership MISMATCH: the oracle reports
+		// `no_such_table` as in-basis (so unknown-table detection passes it through
+		// to the adapter rather than diverting it to quarantine), but no backing
+		// store table exists, so the adapter's defensive `Table not found for
+		// external write` throw fires as a per-change error. This is the exact net
+		// the unknown-table-disposition work leaves in place for ownership drift —
+		// distinct from a genuinely retired (out-of-basis) table, which is diverted.
 		const makeSyncManager = (syncEvents: SyncEventEmitterImpl) =>
 			SyncManagerImpl.create(
 				new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
-				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
+				(schemaName, tableName): TableSchema | undefined =>
+					tableName === 'no_such_table'
+						? ({} as TableSchema)
+						: db.schemaManager.getTable(schemaName, tableName),
 			);
 
 		it('applyChanges: a per-change storage failure throws and commits no metadata; retry converges', async () => {

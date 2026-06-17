@@ -1,7 +1,7 @@
 <!-- resume-note -->
 RESUME: A prior agent run on this ticket did not complete.
-  Prior run: 2026-06-16T23:32:47.953Z (agent: claude)
-  Log file: C:\projects\quereus\tickets\.logs\2-sync-unknown-table-disposition.implement.2026-06-16T23-32-47-953Z.log
+  Prior run: 2026-06-17T02:28:36.866Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\2-sync-unknown-table-disposition.implement.2026-06-17T02-28-36-866Z.log
 Read the log to see what was done. Resume where it left off.
 If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
 <!-- /resume-note -->

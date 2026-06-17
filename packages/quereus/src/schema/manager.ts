@@ -2546,7 +2546,21 @@ export class SchemaManager {
 		return this.buildTableSchemaFromAST(stmt, moduleName, effectiveModuleArgs, moduleInfo, defaultCollation);
 	}
 
-	async createTable(stmt: AST.CreateTableStmt): Promise<TableSchema> {
+	/**
+	 * `preferBacking` routes the module instantiation through the durable backing
+	 * seam — `createBacking?() ?? create()`, the SAME preference
+	 * {@link createBackingTable} uses — instead of `module.create` directly. It is
+	 * set ONLY by the maintained-table create path (`createMaintainedTable`), so a
+	 * durable-backing module (e.g. lamina) builds the basis `RowStore` that
+	 * `getBackingHost` later resolves for row-time maintenance; without it the table
+	 * is an ordinary relational collection with no basis store, and the maintained
+	 * fill throws `backing host not found`. An ordinary user CREATE leaves it false
+	 * and stays byte-for-byte on `module.create`. A module without `createBacking`
+	 * (e.g. memory) falls through to `create` regardless, so the flag is a no-op
+	 * there. Every gate above (determinism, FK-collation) runs identically in both
+	 * modes — the flag only selects the factory method.
+	 */
+	async createTable(stmt: AST.CreateTableStmt, preferBacking = false): Promise<TableSchema> {
 		const targetSchemaName = stmt.table.schema || this.getCurrentSchemaName();
 		const tableName = stmt.table.name;
 

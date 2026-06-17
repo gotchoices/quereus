@@ -143,6 +143,25 @@ Deletions are recorded as "tombstones" with an HLC timestamp. Tombstones prevent
 
 **Tombstone TTL**: Tombstones are retained for a configurable duration (default: 30 days). Sync attempts after TTL expiration should fall back to full snapshot transfer.
 
+### Unknown-Table Disposition
+
+After a basis table retires everywhere (see [migration.md § Contract](migration.md#4-contract--retire-the-old-table)), a long-offline **straggler** can reconnect and send changes for a table the receiver no longer has. The receiver detects this **structurally** during Phase 1 of `applyChanges` — the table simply isn't in the local basis (`getTableSchema` returns nothing); there is no version negotiation. Detection unions the current basis with the batch's own in-flight DDL, so a `create_table` earlier in the same batch makes its table known and a `drop_table` makes one unknown. The self-origin echo skip runs first, so a peer never quarantines its own change.
+
+Diverted changes are **never resolved, applied, or recorded as CRDT metadata** — keeping the change log clean for a table the receiver does not have — and are handled per `SyncConfig.unknownTableDisposition`:
+
+| Disposition | Behavior |
+|---|---|
+| `quarantine` (default) | Durably hold each diverted `Change` verbatim under a `qt:` key, HLC-keyed (idempotent re-apply: one entry per change), committed inside the same admission unit as the data/metadata so a crash cannot strand a straggler's write. Inspect with `QuarantineStore.list`; GC at the retention horizon via `pruneQuarantine()` (same `now - receivedAt > retentionHorizonMs` test tombstones use). |
+| `ignore` | Drop the diverted changes (nothing durable written). The deliberate opt-out — write loss is intentional and observable, not silent. |
+
+**Telemetry fires either way**, because the failure mode the disposition guards against is otherwise silent write loss the straggler never learns about:
+
+- `onUnknownTable(listener)` — one `UnknownTableEvent` per distinct unknown table per apply (see § Reactive Hooks).
+- `getUnknownTableStats()` — cumulative, observe-only: `{ ignored, quarantined, byTable }` (counts of diverted changes by disposition and by `schema.table`). Mirrors the engine's `getMaterializedViewCollisionStats()` pattern.
+- `ApplyResult.unknownTable` — count of changes diverted this apply, for callers that don't subscribe.
+
+When `getTableSchema` is absent (e.g. a relay-only coordinator with no basis oracle) detection is **inert**, and the store adapter's defensive `Table not found for external write` throw remains the fallback. Snapshot bootstrap paths (`applySnapshot` / `applySnapshotStream`) are out of scope — they transfer a whole basis, not a straggler delta, so an unknown table there still hits that defensive throw. The `store-and-forward` relay disposition (hold *and* re-offer to peers that still have the table) is deferred to the `sync-unknown-table-store-and-forward` backlog ticket.
+
 ### Transaction-Based Change Grouping
 
 Changes are grouped by transaction. When syncing:
@@ -517,6 +536,7 @@ interface ApplyResult {
   skipped: number;      // Changes already present (no-op due to LWW)
   conflicts: number;    // Conflicts resolved (remote won or lost)
   transactions: number; // Number of transactions processed
+  unknownTable?: number; // Changes diverted for out-of-basis tables (see § Unknown-Table Disposition)
 }
 
 interface Snapshot {
@@ -812,6 +832,13 @@ interface SyncEventEmitter {
 
   /** Fired when a conflict is resolved */
   onConflictResolved(listener: (event: ConflictEvent) => void): () => void;
+
+  /**
+   * Fired when inbound changes reference a table outside the local basis
+   * (an out-of-basis straggler delta), regardless of the configured
+   * disposition. See § Unknown-Table Disposition.
+   */
+  onUnknownTable(listener: (event: UnknownTableEvent) => void): () => void;
 }
 
 interface RemoteChangeEvent {
@@ -836,6 +863,15 @@ interface ConflictEvent {
   remoteValue: SqlValue;
   winner: 'local' | 'remote';
   winningHLC: HLC;
+}
+
+interface UnknownTableEvent {
+  schema: string;
+  table: string;
+  disposition: 'ignore' | 'quarantine';
+  changeCount: number;   // Changes diverted for this table in this apply
+  siteId: SiteId;        // Straggler origin (from the changeset)
+  latestHLC: HLC;        // Max HLC among the diverted changes
 }
 
 type SyncState =
@@ -1121,6 +1157,13 @@ interface SyncConfig {
 
   /** Maximum changes per sync batch (default: 1000) */
   batchSize: number;
+
+  /**
+   * What to do with inbound changes that reference a table outside the local
+   * basis (an out-of-basis straggler delta — see § Unknown-Table Disposition
+   * and migration.md § Contract). Default: `'quarantine'`.
+   */
+  unknownTableDisposition: 'ignore' | 'quarantine';
 
   /** Site ID (auto-generated if not provided) */
   siteId?: Uint8Array;
