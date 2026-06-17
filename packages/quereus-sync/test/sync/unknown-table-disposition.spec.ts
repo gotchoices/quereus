@@ -27,7 +27,7 @@ import {
 } from '../../src/sync/protocol.js';
 import { InMemoryKVStore } from '@quereus/store';
 import { generateSiteId, siteIdEquals, type SiteId } from '../../src/clock/site.js';
-import { type HLC, compareHLC, createHLC } from '../../src/clock/hlc.js';
+import { compareHLC, createHLC } from '../../src/clock/hlc.js';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
 interface ApplyCall {

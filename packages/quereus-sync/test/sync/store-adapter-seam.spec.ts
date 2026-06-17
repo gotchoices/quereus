@@ -23,7 +23,7 @@ import {
 import { createStoreAdapter, type SyncStoreAdapterOptions } from '../../src/sync/store-adapter.js';
 import type { ApplyToStoreCallback, DataChangeToApply, Snapshot, SnapshotChunk } from '../../src/sync/protocol.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl, type SyncState } from '../../src/sync/events.js';
+import { SyncEventEmitterImpl, type SyncState, type UnknownTableEvent } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager } from '../../src/clock/hlc.js';
@@ -518,6 +518,61 @@ describe('store-adapter seam integration', () => {
 			expect(states.map(s => s.status)).to.not.include('synced');
 
 			// Metadata batch is flushed only after the data flush → none committed.
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
+		});
+	});
+
+	describe('out-of-basis table diverts to quarantine (real adapter)', () => {
+		// Companion to the ownership-mismatch case above: there the oracle CLAIMS the
+		// table so the change passes detection and the adapter's defensive throw
+		// fires; here the oracle reports the table as genuinely out of basis
+		// (`getTable` returns undefined), so Phase 1 diverts the change to quarantine
+		// and it NEVER reaches the adapter — no throw, no per-change error. This
+		// proves the unit-harness control flow holds against the production
+		// `createStoreAdapter` seam end to end.
+		it('diverts the change to quarantine without applying or throwing', async () => {
+			await db.exec('create table t (id text primary key, v text) using store');
+
+			const syncEvents = new SyncEventEmitterImpl();
+			const states: SyncState[] = [];
+			syncEvents.onSyncStateChange(s => states.push(s));
+			const unknownEvents: UnknownTableEvent[] = [];
+			syncEvents.onUnknownTable(e => unknownEvents.push(e));
+
+			const syncManager = await SyncManagerImpl.create(
+				new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
+				// 'orders' is retired (out of basis → undefined); 't' resolves live.
+				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
+			);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			const changeSets = [{
+				siteId: remoteSiteId,
+				transactionId: 'tx1',
+				hlc: remoteHLC.tick(),
+				changes: [{
+					type: 'column' as const, schema: 'main', table: 'orders',
+					pk: ['o1'], column: 'note', value: 'late', hlc: remoteHLC.tick(),
+				}],
+				schemaMigrations: [],
+			}];
+
+			// No throw despite there being no 'orders' backing store — the change
+			// never reaches the adapter's defensive throw.
+			const result = await syncManager.applyChanges(changeSets);
+			expect(result.unknownTable).to.equal(1);
+			expect(result.applied).to.equal(0);
+			expect(states.map(s => s.status), 'no error state emitted').to.not.include('error');
+
+			// Durably quarantined verbatim; telemetry fired.
+			const held = await syncManager.quarantine.list('main', 'orders');
+			expect(held).to.have.length(1);
+			expect(held[0].change.table).to.equal('orders');
+			expect(unknownEvents.map(e => e.table)).to.deep.equal(['orders']);
+
+			// No CRDT metadata for the retired table — nothing to relay onward.
 			const relayed = await syncManager.getChangesSince(generateSiteId());
 			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
 		});
