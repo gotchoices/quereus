@@ -56,7 +56,7 @@
         "label": "Base Path",
         "type": "string",
         "default": "./data",
-        "help": "Base directory for all LevelDB stores"
+        "help": "Directory of the single shared LevelDB database"
       },
       {
         "key": "createIfMissing",
