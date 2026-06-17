@@ -116,13 +116,19 @@ export interface SyncManager {
   /**
    * Cumulative unknown-table disposition stats since process start.
    *
-   * `ignored` / `quarantined` count diverted changes by disposition; `byTable`
-   * counts diverted changes per `schema.table`. Mirrors the engine's
+   * `ignored` / `quarantined` / `forwarded` count diverted changes by
+   * disposition; `byTable` counts diverted changes per `schema.table` (the union
+   * across all dispositions — the per-disposition counters partition it).
+   * `forwarded` counts changes **held as forwardable at apply time** under the
+   * `store-and-forward` disposition; it is distinct from any per-relay "relayed"
+   * volume the relay ticket may add (a forwardable entry is held once but may be
+   * relayed many times until it GCs). Mirrors the engine's
    * `getMaterializedViewCollisionStats()` pattern (observe-only, in-memory).
    */
   getUnknownTableStats(): {
     ignored: number;
     quarantined: number;
+    forwarded: number;
     byTable: Map<string, number>;
   };
 

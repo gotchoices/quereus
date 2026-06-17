@@ -42,7 +42,8 @@ export interface ResolvedChange {
 
 /**
  * Diverted out-of-basis straggler changes for one `(schema, table)`, accumulated
- * across the batch before disposition (quarantine / ignore) and telemetry.
+ * across the batch before disposition (quarantine / ignore / store-and-forward)
+ * and telemetry.
  */
 interface UnknownTableGroup {
 	schema: string;
@@ -92,7 +93,8 @@ function computeBatchTableDelta(changes: ChangeSet[]): { created: Set<string>; d
  * (a retired-table straggler delta — see `docs/migration.md` § 4 Contract) is
  * **diverted** during resolution — never resolved, applied, or recorded as CRDT
  * metadata, so the change log stays clean (no survivor-HLC pollution). Diverted
- * changes are quarantined (durably, idempotently) or ignored per
+ * changes are held (durably, idempotently — `quarantine`, or `store-and-forward`
+ * which additionally marks them forwardable) or ignored per
  * {@link SyncConfig.unknownTableDisposition}, and telemetered either way.
  */
 export async function applyChanges(
@@ -218,15 +220,19 @@ export async function applyChanges(
 				});
 			}
 
-			// Quarantine diverted changes as part of the admission unit — durable
-			// BEFORE the watermark advances below, so a crash never strands a
-			// straggler's change with no re-delivery (the batch re-resolves and
-			// re-quarantines idempotently, HLC-keyed). `ignore` writes nothing.
-			if (disposition === 'quarantine' && unknownByTable.size > 0) {
+			// Hold diverted changes as part of the admission unit — durable BEFORE
+			// the watermark advances below, so a crash never strands a straggler's
+			// change with no re-delivery (the batch re-resolves and re-holds
+			// idempotently, HLC-keyed). Both `quarantine` and `store-and-forward`
+			// hold identically; `store-and-forward` additionally marks each entry
+			// forwardable so the relay (sibling ticket) can re-offer it. `ignore`
+			// writes nothing.
+			if ((disposition === 'quarantine' || disposition === 'store-and-forward') && unknownByTable.size > 0) {
+				const forwardable = disposition === 'store-and-forward';
 				const qBatch = ctx.kv.batch();
 				for (const group of unknownByTable.values()) {
 					for (const change of group.changes) {
-						ctx.quarantine.put(qBatch, change, receivedAt);
+						ctx.quarantine.put(qBatch, change, receivedAt, forwardable);
 					}
 				}
 				await qBatch.write();

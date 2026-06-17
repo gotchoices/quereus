@@ -3,10 +3,12 @@
  *
  * A retired-table straggler delta — inbound changes for a table outside the
  * local basis — is diverted during Phase 1 resolution and either quarantined
- * (default) or ignored per `SyncConfig.unknownTableDisposition`, with always-on
- * telemetry (`onUnknownTable` + `getUnknownTableStats`). See
- * `docs/migration.md` § 4 Contract and the `sync-unknown-table-disposition`
- * ticket § Edge cases & interactions — this spec covers each case there.
+ * (default), ignored, or held forwardable (`store-and-forward`) per
+ * `SyncConfig.unknownTableDisposition`, with always-on telemetry
+ * (`onUnknownTable` + `getUnknownTableStats`). See `docs/migration.md`
+ * § 4 Contract and the `sync-unknown-table-disposition` /
+ * `sync-store-and-forward-hold` tickets § Edge cases & interactions — this spec
+ * covers each case there.
  */
 
 import { expect } from 'chai';
@@ -127,6 +129,7 @@ describe('unknown-table disposition', () => {
       const stats = h.manager.getUnknownTableStats();
       expect(stats.quarantined).to.equal(1);
       expect(stats.ignored).to.equal(0);
+      expect(stats.forwarded).to.equal(0);
       expect(stats.byTable.get(`main.${RETIRED}`)).to.equal(1);
     });
 
@@ -192,6 +195,144 @@ describe('unknown-table disposition', () => {
       const stats = h.manager.getUnknownTableStats();
       expect(stats.ignored).to.equal(1);
       expect(stats.quarantined).to.equal(0);
+      expect(stats.forwarded).to.equal(0);
+    });
+  });
+
+  describe('store-and-forward', () => {
+    it('durably holds the change marked forwardable, applies nothing, telemeters forwarded', async () => {
+      const h = await makeHarness({ disposition: 'store-and-forward' });
+      const change = col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi');
+
+      const result = await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [change])]);
+
+      // Diverted (not applied), like quarantine.
+      expect(result.applied).to.equal(0);
+      expect(result.unknownTable).to.equal(1);
+      expect(h.applyCalls).to.have.lengthOf(0);
+
+      // Held verbatim AND marked forwardable.
+      const held = await h.manager.quarantine.list('main', RETIRED);
+      expect(held).to.have.lengthOf(1);
+      expect(held[0].change).to.deep.equal(change);
+      expect(held[0].forwardable).to.equal(true);
+
+      // listForwardable surfaces it.
+      const fwd = await h.manager.quarantine.listForwardable();
+      expect(fwd).to.have.lengthOf(1);
+      expect(fwd[0].change).to.deep.equal(change);
+
+      // Telemetry: event reports the new disposition; counter is `forwarded`.
+      expect(h.events).to.have.lengthOf(1);
+      expect(h.events[0].disposition).to.equal('store-and-forward');
+      const stats = h.manager.getUnknownTableStats();
+      expect(stats.forwarded).to.equal(1);
+      expect(stats.quarantined).to.equal(0);
+      expect(stats.ignored).to.equal(0);
+      // byTable is the union across dispositions.
+      expect(stats.byTable.get(`main.${RETIRED}`)).to.equal(1);
+    });
+
+    it('writes no CRDT metadata for the unknown table (same diversion as quarantine)', async () => {
+      const h = await makeHarness({ disposition: 'store-and-forward' });
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
+        col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi'),
+        del(h.remoteSite, 1001, RETIRED, 2),
+      ])]);
+
+      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note')).to.be.undefined;
+      expect(await h.manager.tombstones.getTombstone('main', RETIRED, [2])).to.be.undefined;
+    });
+
+    it('idempotent re-apply keeps exactly one forwardable entry per change', async () => {
+      const h = await makeHarness({ disposition: 'store-and-forward' });
+      const batch = [changeSet(h.remoteSite, 'tx-1', [
+        col(h.remoteSite, 1000, RETIRED, 1, 'note', 'x'),
+      ])];
+
+      await h.manager.applyChanges(batch);
+      await h.manager.applyChanges(batch); // re-delivery
+
+      const held = await h.manager.quarantine.list('main', RETIRED);
+      expect(held, 'one entry per change, not duplicated').to.have.lengthOf(1);
+      expect(held[0].forwardable).to.equal(true);
+    });
+
+    it('disposition flip is last-writer-wins on the flag (quarantine → store-and-forward)', async () => {
+      const h = await makeHarness({ disposition: 'quarantine' });
+      const batch = [changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'x')])];
+
+      await h.manager.applyChanges(batch);
+      let held = await h.manager.quarantine.list('main', RETIRED);
+      expect(held).to.have.lengthOf(1);
+      expect(held[0].forwardable).to.equal(false);
+
+      // Config changed between applies; the same change re-arrives (HLC-keyed).
+      h.manager.config.unknownTableDisposition = 'store-and-forward';
+      await h.manager.applyChanges(batch);
+
+      held = await h.manager.quarantine.list('main', RETIRED);
+      expect(held, 'still one entry (HLC-keyed)').to.have.lengthOf(1);
+      expect(held[0].forwardable, 'latest disposition governs').to.equal(true);
+    });
+
+    it('disposition flip is last-writer-wins on the flag (store-and-forward → quarantine)', async () => {
+      const h = await makeHarness({ disposition: 'store-and-forward' });
+      const batch = [changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'x')])];
+
+      await h.manager.applyChanges(batch);
+      expect((await h.manager.quarantine.list('main', RETIRED))[0].forwardable).to.equal(true);
+
+      h.manager.config.unknownTableDisposition = 'quarantine';
+      await h.manager.applyChanges(batch);
+
+      const held = await h.manager.quarantine.list('main', RETIRED);
+      expect(held).to.have.lengthOf(1);
+      expect(held[0].forwardable, 'flag cleared by the later quarantine apply').to.equal(false);
+      // listForwardable no longer surfaces it.
+      expect(await h.manager.quarantine.listForwardable()).to.have.lengthOf(0);
+    });
+
+    it('listForwardable returns only forwardable entries (filters plain-quarantine)', async () => {
+      const h = await makeHarness({ disposition: 'quarantine' });
+      // Quarantine one change.
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'a', 'x')])]);
+      // Forward a distinct change (different HLC + pk ⇒ distinct entry).
+      h.manager.config.unknownTableDisposition = 'store-and-forward';
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [col(h.remoteSite, 2000, RETIRED, 2, 'b', 'y')])]);
+
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(2);
+      const fwd = await h.manager.quarantine.listForwardable();
+      expect(fwd).to.have.lengthOf(1);
+      expect(fwd[0].change.pk).to.deep.equal([2]);
+      expect(fwd[0].forwardable).to.equal(true);
+    });
+
+    it('GC reclaims forwardable entries past the horizon like quarantined ones', async () => {
+      const h = await makeHarness({ disposition: 'store-and-forward', retentionHorizonMs: 1 });
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
+        col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi'),
+      ])]);
+      expect(await h.manager.quarantine.listForwardable()).to.have.lengthOf(1);
+
+      await new Promise(r => setTimeout(r, 10)); // exceed the 1ms horizon
+      const pruned = await h.manager.pruneQuarantine();
+      expect(pruned).to.equal(1);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.listForwardable()).to.have.lengthOf(0);
+    });
+
+    it('never holds a self-origin change to a retired table (echo skip first)', async () => {
+      const h = await makeHarness({ disposition: 'store-and-forward' });
+      const self = h.manager.getSiteId();
+      const result = await h.manager.applyChanges([changeSet(self, 'tx-self', [
+        col(self, 1000, RETIRED, 1, 'note', 'hi'),
+      ])]);
+
+      expect(result.unknownTable).to.be.undefined;
+      expect(result.skipped).to.equal(1);
+      expect(await h.manager.quarantine.listForwardable()).to.have.lengthOf(0);
+      expect(h.manager.getUnknownTableStats().forwarded).to.equal(0);
     });
   });
 

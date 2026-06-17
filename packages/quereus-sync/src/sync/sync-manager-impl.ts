@@ -156,6 +156,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// mirrors the engine's materialized-view collision stats).
 	private unknownTableIgnored = 0;
 	private unknownTableQuarantined = 0;
+	private unknownTableForwarded = 0;
 	private readonly unknownTableByTable = new Map<string, number>();
 
 	private constructor(
@@ -285,17 +286,22 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	): void {
 		if (disposition === 'quarantine') {
 			this.unknownTableQuarantined += changeCount;
+		} else if (disposition === 'store-and-forward') {
+			this.unknownTableForwarded += changeCount;
 		} else {
 			this.unknownTableIgnored += changeCount;
 		}
+		// byTable is the union across all dispositions (the per-disposition counters
+		// partition it) — accumulated unconditionally, never against `forwarded` alone.
 		const key = `${schema}.${table}`;
 		this.unknownTableByTable.set(key, (this.unknownTableByTable.get(key) ?? 0) + changeCount);
 	}
 
-	getUnknownTableStats(): { ignored: number; quarantined: number; byTable: Map<string, number> } {
+	getUnknownTableStats(): { ignored: number; quarantined: number; forwarded: number; byTable: Map<string, number> } {
 		return {
 			ignored: this.unknownTableIgnored,
 			quarantined: this.unknownTableQuarantined,
+			forwarded: this.unknownTableForwarded,
 			byTable: new Map(this.unknownTableByTable),
 		};
 	}

@@ -30,6 +30,14 @@ import { buildQuarantineKey, buildQuarantineScanBounds } from './keys.js';
 export interface QuarantineEntry {
   readonly change: Change;
   readonly receivedAt: number;
+  /**
+   * Whether this held change is eligible to be re-offered to peers that still
+   * have the table (the `store-and-forward` disposition). A plain `quarantine`
+   * hold is `false`. The relay (sibling ticket `sync-store-and-forward-relay`)
+   * consumes this flag via {@link QuarantineStore.listForwardable}; the change
+   * is held identically either way — the flag only governs re-offer eligibility.
+   */
+  readonly forwardable: boolean;
 }
 
 /**
@@ -50,6 +58,8 @@ interface SerializedQuarantineEntry {
   readonly pv?: unknown;     // encodeSqlValue(priorValue) — column before-image, present iff prior exists
   readonly ph?: SerializedHLC; // hlcToJson(priorHlc) — column before-image, present iff prior exists
   readonly pr?: unknown[];   // encodeSqlValue per element — delete row before-image, present iff priorRow exists
+  readonly f?: 1;            // forwardable mark (store-and-forward) — emitted ONLY when true, so plain
+                             // quarantine entries stay byte-identical to today and decode to false
 }
 
 /**
@@ -74,9 +84,12 @@ export function serializeQuarantineEntry(entry: QuarantineEntry): Uint8Array {
   const priorRow = c.type === 'delete' && c.priorRow !== undefined
     ? { pr: c.priorRow.map(encodeSqlValue) }
     : undefined;
+  // Emit the forwardable mark only when set, so plain-quarantine entries stay
+  // byte-identical to the pre-store-and-forward encoding (and decode to false).
+  const fwd = entry.forwardable ? { f: 1 as const } : undefined;
   const obj: SerializedQuarantineEntry = c.type === 'column'
-    ? { ...base, col: c.column, v: encodeSqlValue(c.value), ...prior }
-    : { ...base, ...priorRow };
+    ? { ...base, col: c.column, v: encodeSqlValue(c.value), ...prior, ...fwd }
+    : { ...base, ...priorRow, ...fwd };
   return new TextEncoder().encode(JSON.stringify(obj));
 }
 
@@ -96,6 +109,7 @@ export function deserializeQuarantineEntry(buffer: Uint8Array): QuarantineEntry 
     return {
       change: { type: 'column', schema: obj.s, table: obj.tb, pk, column: obj.col!, value: decodeSqlValue(obj.v), hlc, ...prior },
       receivedAt: obj.r,
+      forwardable: obj.f === 1,
     };
   }
   // Restore the row before-image when present (spread only then, matching the
@@ -104,6 +118,7 @@ export function deserializeQuarantineEntry(buffer: Uint8Array): QuarantineEntry 
   return {
     change: { type: 'delete', schema: obj.s, table: obj.tb, pk, hlc, ...priorRow },
     receivedAt: obj.r,
+    forwardable: obj.f === 1,
   };
 }
 
@@ -115,13 +130,16 @@ export class QuarantineStore {
 
   /**
    * Stage a held change into a caller-owned batch. HLC-keyed, so re-staging the
-   * same change overwrites its own entry (idempotent re-apply).
+   * same change overwrites its own entry (idempotent re-apply). The HLC key does
+   * NOT include `forwardable`, so re-delivering a change under a different
+   * disposition overwrites its own entry with the new flag — last-writer-wins on
+   * the flag, which is correct: the latest disposition governs.
    */
-  put(batch: WriteBatch, change: Change, receivedAt: number): void {
+  put(batch: WriteBatch, change: Change, receivedAt: number, forwardable: boolean): void {
     const entryType = change.type === 'column' ? 'column' : 'delete';
     const column = change.type === 'column' ? change.column : undefined;
     const key = buildQuarantineKey(change.schema, change.table, change.hlc, entryType, change.pk, column);
-    batch.put(key, serializeQuarantineEntry({ change, receivedAt }));
+    batch.put(key, serializeQuarantineEntry({ change, receivedAt, forwardable }));
   }
 
   /**
@@ -133,6 +151,25 @@ export class QuarantineStore {
     const entries: QuarantineEntry[] = [];
     for await (const entry of this.kv.iterate(bounds)) {
       entries.push(deserializeQuarantineEntry(entry.value));
+    }
+    return entries;
+  }
+
+  /**
+   * Yield held entries marked forwardable (the `store-and-forward` disposition).
+   * A full `qt:` scan filtered to {@link QuarantineEntry.forwardable}, so it is
+   * bounded by the retention horizon exactly like {@link list} — and zero-cost
+   * when no straggler was ever stored forwardable. The relay (sibling ticket
+   * `sync-store-and-forward-relay`) filters these further by HLC/origin before
+   * re-offering them; this method stays deliberately dumb so it is independently
+   * testable here.
+   */
+  async listForwardable(): Promise<QuarantineEntry[]> {
+    const bounds = buildQuarantineScanBounds();
+    const entries: QuarantineEntry[] = [];
+    for await (const entry of this.kv.iterate(bounds)) {
+      const parsed = deserializeQuarantineEntry(entry.value);
+      if (parsed.forwardable) entries.push(parsed);
     }
     return entries;
   }

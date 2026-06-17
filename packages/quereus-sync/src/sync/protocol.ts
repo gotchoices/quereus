@@ -154,7 +154,7 @@ export interface ApplyResult {
   /**
    * Changes diverted because they referenced a table outside the local basis
    * (an out-of-basis straggler delta). Omitted when none were diverted. The
-   * disposition (`ignore` / `quarantine`) is governed by
+   * disposition (`ignore` / `quarantine` / `store-and-forward`) is governed by
    * {@link SyncConfig.unknownTableDisposition}; see also the `onUnknownTable`
    * event and `getUnknownTableStats()`.
    */
@@ -454,12 +454,15 @@ export type ConflictResolver = (ctx: ConflictContext) => ConflictResolution;
  * - `quarantine` (default) — durably hold the diverted changes for manual / late
  *   processing. No write loss, operator-inspectable, and bounded: quarantine
  *   entries GC at the retention horizon like tombstones.
- *
- * The `store-and-forward` (relay) disposition is parked in the backlog ticket
- * `sync-unknown-table-store-and-forward`; it needs outbound `getChangesSince`
- * integration and is not required for write-loss protection.
+ * - `store-and-forward` — durably hold the diverted changes (identically to
+ *   `quarantine`) **and** mark them forwardable, so peers that still have the
+ *   table receive them via outbound delta sync. The hold + forwardable mark is
+ *   implemented in `sync-store-and-forward-hold`; the outbound relay wiring (the
+ *   actual re-offer through `getChangesSince`) lands in the sibling ticket
+ *   `sync-store-and-forward-relay`. A forwarded change keeps its **original
+ *   `hlc` + `siteId`**, which is what makes the relay loop-free and convergent.
  */
-export type UnknownTableDisposition = 'ignore' | 'quarantine';
+export type UnknownTableDisposition = 'ignore' | 'quarantine' | 'store-and-forward';
 
 // ============================================================================
 // Basis-table eviction

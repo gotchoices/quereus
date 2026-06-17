@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-17T20:38:55.008Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\6-sync-store-and-forward-hold.implement.2026-06-17T20-38-55-008Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: When a peer no longer has a table, let an operator configure it to durably keep an incoming straggler's edits for that table AND mark them as ready to be passed along to other peers — this ticket builds the "keep and mark" half (the actual passing-along is a follow-up).
 prereq:
 files:
