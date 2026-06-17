@@ -23,7 +23,7 @@ import {
 import { createStoreAdapter, type SyncStoreAdapterOptions } from '../../src/sync/store-adapter.js';
 import type { ApplyToStoreCallback, DataChangeToApply, Snapshot, SnapshotChunk } from '../../src/sync/protocol.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl, type SyncState, type UnknownTableEvent } from '../../src/sync/events.js';
+import { SyncEventEmitterImpl, type SyncState, type UnknownTableEvent, type AssertionViolationEvent } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager } from '../../src/clock/hlc.js';
@@ -300,7 +300,13 @@ describe('store-adapter seam integration', () => {
 		});
 	});
 
-	describe('seam-throw propagation through the sync layer', () => {
+	describe('inbound assertion violation: detect-and-notify through the sync layer', () => {
+		// A local commit-time global assertion that an inbound merge trips is
+		// DETECT-AND-NOTIFY: trust-the-origin means the data must land, so the seam
+		// runs in report mode — the batch commits (base table, MV, and watch
+		// converge on the FIRST attempt) and the violation surfaces to the host as
+		// an `onAssertionViolation` event rather than throwing. No divergence, no
+		// retry, no MV refresh needed.
 		/** One remote single-column change set against `main.t`. */
 		const remoteChangeSet = (remoteHLC: HLCManager, remoteSiteId: Uint8Array, value: SqlValue) => [{
 			siteId: remoteSiteId,
@@ -318,42 +324,59 @@ describe('store-adapter seam integration', () => {
 			schemaMigrations: [],
 		}];
 
-		it('assertion failure propagates, leaves CRDT metadata uncommitted; retry converges', async () => {
+		it('converges base/MV/watch on the first apply and notifies the host; idempotent re-apply does not re-fire', async () => {
 			await db.exec('create table t (id text primary key, v integer) using store');
+			await db.exec('create materialized view mv as select id, v from t');
 			await db.exec('create assertion non_negative check (not exists (select 1 from t where v < 0))');
 
 			const syncEvents = new SyncEventEmitterImpl();
+			const violations: AssertionViolationEvent[] = [];
+			syncEvents.onAssertionViolation(e => violations.push(e));
+
 			const syncManager = await SyncManagerImpl.create(
 				new InMemoryKVStore(), undefined, { ...DEFAULT_SYNC_CONFIG }, syncEvents, applyToStore,
 				(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
 			);
 
+			// Watch the violating row: it must fire on the converging apply (it did
+			// not before, when the throw unwound the derived effects).
+			const watchEvents: WatchEvent[] = [];
+			const sub = db.watch(rowsWatch('t', 'id', 'x'), e => { watchEvents.push(e); });
+
 			const remoteSiteId = generateSiteId();
 			const remoteHLC = new HLCManager(remoteSiteId);
 			const changeSets = remoteChangeSet(remoteHLC, remoteSiteId, -5);
 
-			// First attempt: storage applies, then the seam's commit-time assertion
-			// evaluation throws → applyChanges propagates, metadata uncommitted.
-			let thrown: unknown;
-			try {
-				await syncManager.applyChanges(changeSets);
-			} catch (e) {
-				thrown = e;
-			}
-			expect(String(thrown)).to.contain('non_negative');
+			// First (and only) attempt: applyChanges RESOLVES — no throw — and the
+			// change is applied.
+			const result = await syncManager.applyChanges(changeSets);
+			expect(result.applied).to.be.greaterThan(0);
+			sub.unsubscribe();
 
-			// Storage rows stay applied (trust-the-origin posture)...
+			// The violating row landed in the base table (trust-the-origin)...
 			expect((await collect(db, 'select v from t')).map(r => Number(r.v))).to.deep.equal([-5]);
-			// ...but no CRDT metadata committed: nothing to relay to a third peer.
-			const relayed = await syncManager.getChangesSince(generateSiteId());
-			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
+			// ...and the covering MV converged with it on the FIRST attempt — the
+			// regression the old throw-then-suppress chain left divergent.
+			expect((await collect(db, 'select v from mv')).map(r => Number(r.v))).to.deep.equal([-5]);
+			// The row-granular watch fired for the converging change.
+			expect(watchEvents).to.have.length(1);
+			expect(watchEvents[0].matched[0].hits).to.deep.equal([['x']]);
 
-			// Retry with the SAME change sets: re-application is a value-identical
-			// upsert → suppressed → empty seam batch (no assertion re-evaluation) →
-			// metadata commits. The violating row persists (origin trusted) and the
-			// derived effects for it were unwound — recovery policy is the host's.
-			const retry = await syncManager.applyChanges(changeSets);
-			expect(retry.applied).to.be.greaterThan(0);
+			// CRDT metadata committed on the first attempt: the change relays to a
+			// third peer immediately — no second attempt required.
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes)).to.have.length(1);
+
+			// The host was notified exactly once, naming the violated assertion with
+			// non-empty diagnostic samples.
+			expect(violations).to.have.length(1);
+			expect(violations[0].assertion).to.equal('non_negative');
+			expect(violations[0].samples.length).to.be.greaterThan(0);
+
+			// A second identical apply is a value-identical no-op (empty seam batch →
+			// no assertion re-evaluation): no new violation event, no double-relay.
+			await syncManager.applyChanges(changeSets);
+			expect(violations, 'no re-fire on benign idempotent retry').to.have.length(1);
 			const relayedAfter = await syncManager.getChangesSince(generateSiteId());
 			expect(relayedAfter.flatMap(cs => cs.changes)).to.have.length(1);
 		});

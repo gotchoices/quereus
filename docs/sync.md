@@ -379,7 +379,7 @@ This order is safe because:
 The reverse order (metadata first) would be dangerous: if we crash after writing metadata but before data, the CRDT state believes the change is applied but data is missing—and re-sync won't retry.
 
 **Invariant — metadata follows a landed data write**: CRDT metadata must **not** be committed for any change whose data write did not land. This covers two failure shapes, handled identically:
-- **Whole-batch throw**: the `applyToStore` callback throws (e.g. a commit-time global-assertion failure over the inbound batch). The exception propagates; no metadata is committed.
+- **Whole-batch throw**: the `applyToStore` callback throws (e.g. the seam commit fails on a connection error or a deferred row constraint). The exception propagates; no metadata is committed. A commit-time **global-assertion** violation is *not* one of these — it is detect-and-notify (see *Apply-time validation* below), so it does not throw and does not block the metadata commit.
 - **Per-change failure**: the store adapter does *not* throw on a single change's failure — it keeps applying the other tables (maximizing idempotent storage progress) and records each failure in `ApplyToStoreResult.errors`. The **consumer** treats any non-empty `errors` exactly like a whole-batch throw: it emits `status: 'error'` and throws **before** committing any metadata.
 
 **Unified admission core** (`admission.ts`): both failure shapes — and the data-first/metadata-second/abort-with-no-metadata ordering — are centralized in one seam so every ingress modality behaves identically. `applyDataToStore` is the data-first half: it runs `applyToStore`, emits `status: 'error'` and rethrows on a whole-batch throw, then aborts via `throwIfApplyErrors` on any per-change `errors` (the two are mutually exclusive, so the error state is emitted at most once). `admitGroup` wraps it as a full group-atomic unit — data first, then the caller's `commitMetadata`, then the local HLC clock watermark — used by the wire path (`change-applicator`) and the non-streaming snapshot (`snapshot`). The streaming snapshot (`snapshot-stream`) keeps its own checkpoint-based model (interleaved metadata/data flushes, resume on a saved checkpoint) but reuses `applyDataToStore` for each flush, so a whole-batch flush throw now emits the same `status: 'error'` event the other paths do.
@@ -402,6 +402,22 @@ seam explicitly re-validates nothing — it trusts that the origin already enfor
 declared constraint at its own commit, and merging the origin's already-consistent
 facts into the receiver cannot violate a per-row / child-side constraint that held at
 the source.
+
+**Global assertions are detect-and-notify, not block.** A cross-origin *merge* — unlike
+a single origin's commit — can produce a global-invariant violation no single origin
+ever saw, and that is exactly what a global assertion declared on the receiver guards.
+But trust-the-origin means the merged data must still land: a local assertion can only
+usefully *notify*, not reject (rejecting would diverge the receiver from the converged
+truth the network agrees on). So the adapter drives the incremental seam in **report
+mode** (`assertionFailureMode: 'report'`): a violation is **collected and returned**
+instead of thrown, and the batch **commits** — the violating row's derived effects (MV
+maintenance, `Database.watch` capture) land on the **first** apply, so the MV stays
+consistent with the base table and there is no divergence and no retry. The consumer
+then surfaces each collected violation to the host as an **`onAssertionViolation`**
+event (see § Reactive Hooks). The host owns policy: alert, audit, or trigger an
+out-of-band reconciliation. (Snapshot bootstrap does not evaluate assertions at all —
+it installs one origin's already-converged state wholesale, so there is no merge to
+introduce a violation; see `store-adapter.ts`.)
 
 Consequence for cross-table ordering: because child-side FK existence is never checked
 on apply, a child fact carrying a lower `opSeq` than its parent (the per-coordinator
@@ -927,6 +943,14 @@ interface SyncEventEmitter {
    * disposition. See § Unknown-Table Disposition.
    */
   onUnknownTable(listener: (event: UnknownTableEvent) => void): () => void;
+
+  /**
+   * Fired when an inbound batch's merged row state trips a local commit-time
+   * global assertion. Detect-and-notify: the data has already converged (the
+   * batch committed in report mode), so this is informational — the host
+   * decides policy. See § Apply-time validation.
+   */
+  onAssertionViolation(listener: (event: AssertionViolationEvent) => void): () => void;
 }
 
 interface RemoteChangeEvent {
@@ -962,6 +986,11 @@ interface UnknownTableEvent {
   changeCount: number;   // Changes diverted for this table in this apply
   siteId: SiteId;        // Straggler origin (from the changeset)
   latestHLC: HLC;        // Max HLC among the diverted changes
+}
+
+interface AssertionViolationEvent {
+  assertion: string;     // Name of the violated local assertion
+  samples: SqlValue[][]; // Sample rows from the violation query (diagnostic; capped)
 }
 
 type SyncState =

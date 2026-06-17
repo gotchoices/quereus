@@ -34,6 +34,13 @@ import { persistHLCState, throwIfApplyErrors, toError } from './sync-context.js'
  *
  * The two failure shapes are mutually exclusive (a throw never reaches
  * `throwIfApplyErrors`), so `status:'error'` is emitted at most once.
+ *
+ * On the SUCCESS branch (no throw, no per-change errors), any commit-time
+ * global-assertion violations the seam reported (`result.assertionViolations`,
+ * collected under the adapter's report mode) are surfaced to the host as
+ * `onAssertionViolation` events. The data has already converged — these events
+ * are informational (detect-and-notify) and do NOT abort the apply or block the
+ * metadata commit that follows.
  */
 export async function applyDataToStore(
 	ctx: SyncContext,
@@ -58,6 +65,19 @@ export async function applyDataToStore(
 	// metadata committed, so the whole batch re-resolves and re-applies
 	// idempotently on the next sync. See throwIfApplyErrors / docs/sync.md.
 	throwIfApplyErrors(ctx, result);
+
+	// Success branch only (after the abort gate above): the apply converged. If
+	// the seam reported any local assertion violations over the merged state,
+	// notify the host once per violated assertion. Convergence is NOT aborted —
+	// the data landed and the metadata commit proceeds.
+	if (result.assertionViolations) {
+		for (const violation of result.assertionViolations) {
+			ctx.syncEvents.emitAssertionViolation({
+				assertion: violation.assertion,
+				samples: violation.samples,
+			});
+		}
+	}
 }
 
 /**

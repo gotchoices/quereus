@@ -24,7 +24,9 @@
  *      carrying accurate `oldRow` before-images and derived `changedColumns`.
  *   5. After all tables' storage writes, ONE seam call reports the
  *      accumulated effective changes: `db.ingestExternalRowChanges(batch,
- *      { applyForeignKeyActions })` — capture + MV facets default on.
+ *      { applyForeignKeyActions, assertionFailureMode: 'report' })` — capture +
+ *      MV facets default on, commit-time global assertions in REPORT mode (a
+ *      violation is collected into the result and the batch still commits).
  *      Changes recorded in `result.errors` are excluded from the batch.
  *
  * Snapshot bootstrap (per-call, not sticky): a known-complete wholesale load
@@ -65,14 +67,22 @@
  *     capture. The caller issues it before clearing the snapshot checkpoint, so
  *     a finalize throw leaves the checkpoint in place and the transfer retries.
  *
- * A seam throw (e.g. a commit-time global-assertion failure over the inbound
- * batch) PROPAGATES out of the callback: the seam's batch savepoint has
- * unwound the derived effects (MV backing deltas, capture entries), the
- * storage rows stay applied, and the sync layer leaves CRDT metadata
- * uncommitted — the same changes re-resolve on the next sync attempt.
- * Re-application is idempotent (value-identical upserts suppress), then the
- * seam retries. A batch that keeps failing an assertion retries forever
- * (poison batch); detection/recovery policy is the host's.
+ * Inbound assertion violations are DETECT-AND-NOTIFY, not throw. Under the
+ * seam's trust-the-origin contract the merged data must land regardless, so a
+ * **local** commit-time global assertion can only usefully *notify*: the seam
+ * runs in report mode, so a violation is collected and RETURNED in
+ * `result.assertionViolations` while the batch commits — the derived effects
+ * (MV backing deltas, capture entries) for the violating row land on the FIRST
+ * attempt, so an incremental MV / `Database.watch` subscriber stays consistent
+ * with the base table and there is no divergence and no retry. The consumer
+ * (admission.ts) surfaces each returned violation to the host as an
+ * `onAssertionViolation` event; the host decides policy.
+ *
+ * A genuine per-change STORAGE failure is different and still aborts: the
+ * adapter collects it in `result.errors` (it keeps applying other tables), and
+ * the consumer treats any non-empty `errors` like a whole-batch throw — emit
+ * `status:'error'`, leave CRDT metadata uncommitted, re-resolve next sync.
+ * Re-application is idempotent (value-identical upserts suppress).
  *
  * Constraints (see docs/materialized-views.md § External row-change
  * ingestion): the callback is host-driven — never invoke it from within
@@ -213,14 +223,25 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
       }
     }
 
-    // One seam call per invocation, after all storage writes. A throw
-    // propagates: derived effects are unwound by the seam's batch savepoint,
-    // storage rows stay applied, the sync layer leaves CRDT metadata
-    // uncommitted and the same changes re-resolve on the next attempt. Empty on
-    // a bootstrap flush (the batch was never built — maintenance is deferred to
-    // the end-of-snapshot `bootstrapFinalize` convergence).
+    // One seam call per invocation, after all storage writes. Driven in
+    // assertion REPORT mode: a commit-time global-assertion violation over the
+    // inbound batch is COLLECTED and returned (not thrown), and the batch still
+    // commits — derived effects (MV deltas, watch capture) for the violating row
+    // land on this FIRST attempt, so there is no divergence and no retry. The
+    // returned violations are copied into the result for the consumer to surface
+    // to the host (see admission.ts). Empty on a bootstrap flush (the batch was
+    // never built — maintenance is deferred to the end-of-snapshot
+    // `bootstrapFinalize` convergence). A genuine per-change storage failure
+    // (collected in `result.errors`) still aborts the apply — that path is
+    // orthogonal.
     if (seamBatch.length > 0) {
-      await db.ingestExternalRowChanges(seamBatch, { applyForeignKeyActions });
+      const seamResult = await db.ingestExternalRowChanges(seamBatch, {
+        applyForeignKeyActions,
+        assertionFailureMode: 'report',
+      });
+      if (seamResult.assertionViolations.length > 0) {
+        result.assertionViolations = seamResult.assertionViolations;
+      }
     }
 
     return result;

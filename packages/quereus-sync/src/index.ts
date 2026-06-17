@@ -126,6 +126,7 @@ export {
   type LocalChangeEvent,
   type ConflictEvent,
   type UnknownTableEvent,
+  type AssertionViolationEvent,
   type SyncState,
   type Unsubscribe,
   type SyncEventEmitter,

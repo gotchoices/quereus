@@ -6,7 +6,7 @@
  * and send via WebSocket, HTTP, WebRTC, or any other transport.
  */
 
-import type { Row, SqlValue } from '@quereus/quereus';
+import type { AssertionViolation, Row, SqlValue } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 
@@ -356,6 +356,16 @@ export interface ApplyToStoreResult {
   schemaChangesApplied: number;
   /** Errors encountered (empty if all succeeded). */
   errors: Array<{ change: DataChangeToApply | SchemaChangeToApply; error: Error }>;
+  /**
+   * Commit-time global-assertion violations the engine seam **collected** rather
+   * than threw (the adapter drives the incremental seam in report mode under the
+   * trust-the-origin posture: the data lands and the batch commits regardless).
+   * One entry per violated local assertion; omitted/empty when none. The consumer
+   * surfaces these to the host via `onAssertionViolation` after a successful apply
+   * — they do NOT abort convergence. Orthogonal to `errors` (a genuine per-change
+   * storage failure still aborts the whole apply).
+   */
+  assertionViolations?: AssertionViolation[];
 }
 
 /**

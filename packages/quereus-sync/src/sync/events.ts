@@ -71,6 +71,27 @@ export interface ConflictEvent {
 }
 
 /**
+ * Fired when an inbound batch's merged row state trips a **local** commit-time
+ * global assertion. Under the seam's trust-the-origin posture the data still
+ * lands (the batch commits in report mode, so the MV / `Database.watch`
+ * subscribers for the violating row stay consistent with the base table) — the
+ * event is purely host-facing: it tells the application its converged data
+ * violates a rule the application declared, so it can alert, audit, or trigger
+ * an out-of-band reconciliation. The host decides policy; the sync layer does
+ * not abort, retry, or refresh anything. See `docs/sync.md` § Reactive Hooks.
+ *
+ * Assertion-scoped, not table-scoped: an assertion may span several tables, so
+ * no single schema/table is meaningful.
+ */
+export interface AssertionViolationEvent {
+  /** Name of the violated local assertion. */
+  readonly assertion: string;
+  /** Sample rows from the assertion's violation query (diagnostic; capped by
+   *  the engine). The assertion SELECT's output shape, not full table rows. */
+  readonly samples: SqlValue[][];
+}
+
+/**
  * Fired when inbound changes reference a table outside the local basis (an
  * out-of-basis straggler delta). Always emitted, regardless of disposition, so
  * an operator sees straggler traffic even when it is being dropped.
@@ -143,6 +164,14 @@ export interface SyncEventEmitter {
    * regardless of the configured disposition.
    */
   onUnknownTable(listener: (event: UnknownTableEvent) => void): Unsubscribe;
+
+  /**
+   * Subscribe to assertion-violation events.
+   * Fired when an inbound batch's converged row state trips a local commit-time
+   * global assertion. The data has already landed (detect-and-notify); the
+   * event is informational so the host can decide policy.
+   */
+  onAssertionViolation(listener: (event: AssertionViolationEvent) => void): Unsubscribe;
 }
 
 // ============================================================================
@@ -158,6 +187,7 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   private syncStateListeners = new Set<(state: SyncState) => void>();
   private conflictListeners = new Set<(event: ConflictEvent) => void>();
   private unknownTableListeners = new Set<(event: UnknownTableEvent) => void>();
+  private assertionViolationListeners = new Set<(event: AssertionViolationEvent) => void>();
 
   onRemoteChange(listener: (event: RemoteChangeEvent) => void): Unsubscribe {
     this.remoteChangeListeners.add(listener);
@@ -182,6 +212,11 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   onUnknownTable(listener: (event: UnknownTableEvent) => void): Unsubscribe {
     this.unknownTableListeners.add(listener);
     return () => this.unknownTableListeners.delete(listener);
+  }
+
+  onAssertionViolation(listener: (event: AssertionViolationEvent) => void): Unsubscribe {
+    this.assertionViolationListeners.add(listener);
+    return () => this.assertionViolationListeners.delete(listener);
   }
 
   // Internal emit methods
@@ -212,6 +247,12 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
 
   emitUnknownTable(event: UnknownTableEvent): void {
     for (const listener of this.unknownTableListeners) {
+      listener(event);
+    }
+  }
+
+  emitAssertionViolation(event: AssertionViolationEvent): void {
+    for (const listener of this.assertionViolationListeners) {
       listener(event);
     }
   }
