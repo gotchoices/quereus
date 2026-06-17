@@ -1756,8 +1756,8 @@ export class MemoryTableManager {
 				.map(idx => ({
 					...idx,
 					columns: idx.columns
-						.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
 						.filter(ic => ic.index !== colIndex)
+						.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index }))
 				})).filter(idx => idx.columns.length > 0);
 
 			const finalNewTableSchema: TableSchema = Object.freeze({
