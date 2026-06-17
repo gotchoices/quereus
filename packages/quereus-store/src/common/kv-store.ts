@@ -30,6 +30,26 @@ export interface KVEntry {
 }
 
 /**
+ * Per-write durability hint for the point-write surface (`put`/`delete`).
+ */
+export interface WriteOptions {
+	/**
+	 * Flush this write to stable storage before resolving. Default false.
+	 *
+	 * Backends without a durability knob (in-memory, and any backend that cannot
+	 * sync) silently ignore it — best-effort, never an error. IndexedDB is already
+	 * durable at transaction `oncomplete`; `sync` additionally requests
+	 * `durability: 'strict'` where the engine supports it.
+	 *
+	 * Used by the materialized-view clean-shutdown marker consume-delete to force
+	 * the delete durable before any of the session's data writes can become durable
+	 * (otherwise a power loss could resurrect a consumed marker — see
+	 * `docs/materialized-views.md` § Cross-module atomicity).
+	 */
+	sync?: boolean;
+}
+
+/**
  * Batch operation types.
  */
 export type BatchOp =
@@ -63,13 +83,15 @@ export interface KVStore {
 
 	/**
 	 * Put a key-value pair.
+	 * @param options - Optional per-write durability hint (see {@link WriteOptions}).
 	 */
-	put(key: Uint8Array, value: Uint8Array): Promise<void>;
+	put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void>;
 
 	/**
 	 * Delete a key.
+	 * @param options - Optional per-write durability hint (see {@link WriteOptions}).
 	 */
-	delete(key: Uint8Array): Promise<void>;
+	delete(key: Uint8Array, options?: WriteOptions): Promise<void>;
 
 	/**
 	 * Check if a key exists.

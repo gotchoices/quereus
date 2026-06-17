@@ -59,6 +59,16 @@ describe('InMemoryKVStore', () => {
 			expect(await store.has(new Uint8Array([99]))).to.be.false;
 		});
 
+		it('put/delete accept and silently ignore the WriteOptions durability hint', async () => {
+			// An in-memory store has no crash window, so `sync: true` is a no-op — it
+			// must neither throw nor change observable behavior.
+			const key = new Uint8Array([7]);
+			await store.put(key, new Uint8Array([70]), { sync: true });
+			expect(await store.get(key)).to.deep.equal(new Uint8Array([70]));
+			await store.delete(key, { sync: true });
+			expect(await store.get(key)).to.be.undefined;
+		});
+
 		it('stores copies to prevent external mutation', async () => {
 			const key = new Uint8Array([1]);
 			const val = new Uint8Array([10]);

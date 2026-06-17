@@ -9,7 +9,7 @@
  * Keys are stored using hex encoding for correct lexicographic ordering.
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions } from './kv-store.js';
+import type { KVStore, KVEntry, WriteBatch, IterateOptions, WriteOptions } from './kv-store.js';
 
 /**
  * Convert Uint8Array to hex string for Map key storage.
@@ -39,7 +39,9 @@ export class InMemoryKVStore implements KVStore {
     return this.data.get(keyToHex(key))?.value;
   }
 
-  async put(key: Uint8Array, value: Uint8Array): Promise<void> {
+  // `_options` is accepted to satisfy the KVStore signature; an in-memory store
+  // has no crash window, so the durability hint is a no-op here.
+  async put(key: Uint8Array, value: Uint8Array, _options?: WriteOptions): Promise<void> {
     this.checkOpen();
     // Store copies to prevent external mutation
     this.data.set(keyToHex(key), {
@@ -48,7 +50,7 @@ export class InMemoryKVStore implements KVStore {
     });
   }
 
-  async delete(key: Uint8Array): Promise<void> {
+  async delete(key: Uint8Array, _options?: WriteOptions): Promise<void> {
     this.checkOpen();
     this.data.delete(keyToHex(key));
   }

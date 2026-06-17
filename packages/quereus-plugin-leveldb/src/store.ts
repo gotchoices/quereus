@@ -5,7 +5,7 @@
  */
 
 import { ClassicLevel } from 'classic-level';
-import type { KVStore, KVEntry, WriteBatch, IterateOptions, KVStoreOptions } from '@quereus/store';
+import type { KVStore, KVEntry, WriteBatch, IterateOptions, KVStoreOptions, WriteOptions } from '@quereus/store';
 
 /**
  * LevelDB implementation of KVStore.
@@ -39,14 +39,16 @@ export class LevelDBStore implements KVStore {
     return await this.db.get(key);
   }
 
-  async put(key: Uint8Array, value: Uint8Array): Promise<void> {
+  async put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
     this.checkOpen();
-    await this.db.put(key, value);
+    // classic-level forwards `sync` to the underlying LevelDB write, fsync'ing the
+    // log before resolving when requested.
+    await this.db.put(key, value, { sync: options?.sync });
   }
 
-  async delete(key: Uint8Array): Promise<void> {
+  async delete(key: Uint8Array, options?: WriteOptions): Promise<void> {
     this.checkOpen();
-    await this.db.del(key);
+    await this.db.del(key, { sync: options?.sync });
   }
 
   async has(key: Uint8Array): Promise<boolean> {

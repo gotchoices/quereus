@@ -7,6 +7,7 @@ export type {
   KVStore,
   KVEntry,
   WriteBatch,
+  WriteOptions,
   BatchOp,
   IterateOptions,
   KVStoreFactory,

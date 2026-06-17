@@ -63,6 +63,20 @@ describe('LevelDBStore', () => {
       expect(await store.has(key)).to.be.true;
     });
 
+    it('should forward the WriteOptions sync hint without error and persist', async () => {
+      // classic-level forwards { sync } to the underlying write; the durable delete
+      // is what the clean-shutdown marker consume relies on. Here we only assert the
+      // hint is accepted and the write/delete still take effect.
+      const key = new Uint8Array([42]);
+      const value = new Uint8Array([1, 2, 3]);
+
+      await store.put(key, value, { sync: true });
+      expect(await store.get(key)).to.deep.equal(value);
+
+      await store.delete(key, { sync: true });
+      expect(await store.get(key)).to.be.undefined;
+    });
+
     it('should overwrite existing values', async () => {
       const key = new Uint8Array([1, 2, 3]);
       const value1 = new Uint8Array([4, 5, 6]);

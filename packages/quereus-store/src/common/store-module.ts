@@ -2152,7 +2152,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const markerKey = buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME);
 		const raw = await catalogStore.get(markerKey);
 		if (raw === undefined) return { trusted: false, staleAtClose: new Set() };
-		await catalogStore.delete(markerKey); // single-use, regardless of parse outcome
+		// Single-use AND durable-before-session-writes: forcing this delete to stable
+		// storage before any of the session's (independently flushed, different-store)
+		// data writes can land closes the power-loss window where a persisted data write
+		// outlives a lost marker-delete and resurrects a consumed marker. (Backends
+		// without a durability knob no-op the hint — losing it is conservative there, and
+		// memory has no crash.) See docs/materialized-views.md § Cross-module atomicity.
+		await catalogStore.delete(markerKey, { sync: true }); // single-use, regardless of parse outcome
 
 		try {
 			const parsed: unknown = JSON.parse(new TextDecoder().decode(raw));

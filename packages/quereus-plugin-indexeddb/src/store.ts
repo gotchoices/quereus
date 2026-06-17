@@ -6,7 +6,7 @@
  * This enables cross-table atomic transactions using native IDB transaction support.
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions, KVStoreOptions } from '@quereus/store';
+import type { KVStore, KVEntry, WriteBatch, IterateOptions, KVStoreOptions, WriteOptions } from '@quereus/store';
 import { IndexedDBManager } from './manager.js';
 
 /**
@@ -96,11 +96,11 @@ export class IndexedDBStore implements KVStore {
     });
   }
 
-  async put(key: Uint8Array, value: Uint8Array): Promise<void> {
+  async put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
     this.checkOpen();
     const db = await this.manager.ensureOpen();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, 'readwrite');
+      const tx = this.openWriteTx(db, options?.sync ?? false);
       const store = tx.objectStore(this.storeName);
       store.put(value, toKey(key));
       tx.onerror = () => reject(tx.error);
@@ -108,16 +108,37 @@ export class IndexedDBStore implements KVStore {
     });
   }
 
-  async delete(key: Uint8Array): Promise<void> {
+  async delete(key: Uint8Array, options?: WriteOptions): Promise<void> {
     this.checkOpen();
     const db = await this.manager.ensureOpen();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.storeName, 'readwrite');
+      const tx = this.openWriteTx(db, options?.sync ?? false);
       const store = tx.objectStore(this.storeName);
       store.delete(toKey(key));
       tx.onerror = () => reject(tx.error);
       tx.oncomplete = () => resolve();
     });
+  }
+
+  /**
+   * Open a readwrite transaction on this store. An IDB write is already durable
+   * at `oncomplete`; when `durable` is requested we additionally ask for
+   * `durability: 'strict'` so the engine flushes to disk before completing.
+   *
+   * The options bag is passed defensively: older engines (and some fakes) reject
+   * an unrecognized third argument, so an exception falls back to the plain
+   * transaction — whose `oncomplete` await is already correct, making `sync`
+   * belt-and-suspenders here.
+   */
+  private openWriteTx(db: IDBDatabase, durable: boolean): IDBTransaction {
+    if (durable) {
+      try {
+        return db.transaction(this.storeName, 'readwrite', { durability: 'strict' });
+      } catch {
+        // Engine predates the durability options bag — fall through to the default.
+      }
+    }
+    return db.transaction(this.storeName, 'readwrite');
   }
 
   async has(key: Uint8Array): Promise<boolean> {

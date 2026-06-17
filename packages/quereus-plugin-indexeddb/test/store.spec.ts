@@ -71,6 +71,21 @@ describe('IndexedDBStore', () => {
       expect(await store.has(key)).to.be.true;
     });
 
+    it('should honor the WriteOptions sync hint (durability: strict) defensively', async () => {
+      // `sync: true` asks for `durability: 'strict'`. fake-indexeddb may or may not
+      // accept the options bag; either way put/delete must persist correctly — the
+      // store falls back to a plain transaction (whose oncomplete await is already
+      // durable) if the engine rejects the third argument.
+      const key = new Uint8Array([7, 8, 9]);
+      const value = new Uint8Array([10, 11, 12]);
+
+      await store.put(key, value, { sync: true });
+      expect(await store.get(key)).to.deep.equal(value);
+
+      await store.delete(key, { sync: true });
+      expect(await store.get(key)).to.be.undefined;
+    });
+
     it('should overwrite existing values', async () => {
       const key = new Uint8Array([1, 2, 3]);
       const value1 = new Uint8Array([4, 5, 6]);

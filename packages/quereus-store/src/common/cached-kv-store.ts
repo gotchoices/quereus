@@ -6,7 +6,7 @@
  * Iteration always delegates to the underlying store (range consistency is hard).
  */
 
-import type { KVStore, KVEntry, WriteBatch, IterateOptions, BatchOp } from './kv-store.js';
+import type { KVStore, KVEntry, WriteBatch, IterateOptions, BatchOp, WriteOptions } from './kv-store.js';
 
 /** Configuration options for the CachedKVStore. */
 export interface CacheOptions {
@@ -100,8 +100,10 @@ export class CachedKVStore implements KVStore {
 		return value !== undefined;
 	}
 
-	async put(key: Uint8Array, value: Uint8Array): Promise<void> {
-		await this.store.put(key, value);
+	async put(key: Uint8Array, value: Uint8Array, options?: WriteOptions): Promise<void> {
+		// Forward `options` so the durability hint reaches the real store even when a
+		// cached store happens to be marker-bearing.
+		await this.store.put(key, value, options);
 		if (!this.enabled) return;
 
 		const hex = toHex(key);
@@ -117,8 +119,8 @@ export class CachedKVStore implements KVStore {
 		}
 	}
 
-	async delete(key: Uint8Array): Promise<void> {
-		await this.store.delete(key);
+	async delete(key: Uint8Array, options?: WriteOptions): Promise<void> {
+		await this.store.delete(key, options);
 		if (!this.enabled) return;
 
 		// Insert negative cache entry (known absent)
