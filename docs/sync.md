@@ -181,6 +181,8 @@ The `store-and-forward` disposition holds diverted changes identically to `quara
 - **Snapshot carve-out.** Forwardable entries are **delta-only**. A snapshot transfers the offering peer's own basis; a forwarded change is for a table that peer does not have, so it has no place in a basis snapshot. The snapshot collectors scan only `cv:` / `tb:` / `sm:` and never carry forwardable (`qt:`) entries.
 - **GC vs in-flight relay.** A forwardable entry pruned at the horizon while a slow peer still needed it is acceptable — that peer was already past the delivery guarantee. After `pruneQuarantine` removes it, `getChangesSince` no longer relays it.
 
+The metadata-layer mechanics above are covered by `store-and-forward-relay.spec.ts`; that a relayed change actually materializes as a live SQL row on the holder (real `Database` + `StoreModule` + store adapter, queried back with `select`, carrying the straggler's origin HLC) is covered end-to-end by `store-and-forward-relay-e2e.spec.ts`.
+
 ### Transaction-Based Change Grouping
 
 Changes are grouped by transaction. When syncing:
