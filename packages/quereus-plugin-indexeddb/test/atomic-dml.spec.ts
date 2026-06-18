@@ -150,6 +150,22 @@ describe('IndexedDB atomic DML commit', () => {
 		expect(objectStores(), 'index store materialized by warmup').to.include(index);
 	}
 
+	/**
+	 * Two-secondary-index variant of {@link warmup}: table `t (id, b, c)` with a
+	 * secondary index over each of `b` and `c`, plus a seed row — all outside the
+	 * recording window. Used to prove the atomic batch spans EVERY index store, not
+	 * just one.
+	 */
+	async function warmupTwoIndexes(indexC: string): Promise<void> {
+		await db.exec(`create table t (id integer primary key, b integer, c integer) using store`);
+		await db.exec(`create index ix_b on t (b)`);
+		await db.exec(`create index ix_c on t (c)`);
+		await db.exec(`insert into t values (1, 10, 100)`); // materializes data + both index stores
+		expect(objectStores(), 'data store materialized by warmup').to.include(data);
+		expect(objectStores(), 'first index store materialized by warmup').to.include(index);
+		expect(objectStores(), 'second index store materialized by warmup').to.include(indexC);
+	}
+
 	/** Run `action` with the spy recording, returning the captured rw txns. */
 	async function record(action: () => Promise<void>): Promise<TxRecord[]> {
 		log.length = 0;
@@ -182,6 +198,25 @@ describe('IndexedDB atomic DML commit', () => {
 
 		// Data + index both committed and the index is usable.
 		expect(await rows(`select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
+	});
+
+	it('insert with TWO secondary indexes: data + BOTH index stores commit in ONE rw tx', async () => {
+		const indexC = buildIndexStoreName('main', 't', 'ix_c'); // main.t_idx_ix_c
+		await warmupTwoIndexes(indexC);
+
+		const records = await record(() => db.exec(`insert into t values (2, 20, 200)`));
+
+		// The single atomic tx touches `data`, so relevantRw captures it; assert it
+		// spans the data store AND every index store, proving the atomic batch is not
+		// limited to a single index.
+		const relevant = relevantRw(records);
+		expect(relevant, 'exactly one rw tx for the data + two-index commit').to.have.length(1);
+		expect(relevant[0].stores, 'atomic: data and BOTH index stores in ONE tx')
+			.to.include.members([data, index, indexC]);
+
+		// Both indexes moved with the row and are usable.
+		expect(await rows(`select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
+		expect(await rows(`select id from t where c = 200`)).to.deep.equal([{ id: 2 }]);
 	});
 
 	it('update that moves the indexed value: old+new index entry + data rewrite in ONE rw tx', async () => {
