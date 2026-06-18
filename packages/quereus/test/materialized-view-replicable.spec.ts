@@ -75,7 +75,8 @@ class EagerDemandWithSeamModule extends MemoryTableModule {
 class LateBackingModule extends MemoryTableModule {
 	readonly ensured: string[] = [];
 	private readonly ready = new Set<string>();
-	constructor(private readonly demanding: boolean) { super(); }
+	private readonly demanding: boolean;
+	constructor(demanding: boolean) { super(); this.demanding = demanding; }
 	override getBackingHost(db: Database, schemaName: string, tableName: string): BackingHost | undefined {
 		const key = `${schemaName}.${tableName}`;
 		if (!this.ready.has(key)) return undefined; // late: no host until the seam runs
