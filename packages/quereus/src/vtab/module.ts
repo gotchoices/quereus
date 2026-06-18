@@ -457,6 +457,14 @@ export interface VirtualTableModule<
 	 *   notification that throws aborts `apply schema X` with that error so the
 	 *   caller learns the module's reconcile failed. The deployed lens is **not**
 	 *   rolled back — a subsequent re-apply re-fires the notification.
+	 * - **Fires while the exec mutex is held.** `apply schema X` is a statement, so
+	 *   this hook is awaited mid-statement. A listener whose reconcile re-enters the
+	 *   engine (e.g. `Database.ingestExternalRowChanges`, which re-acquires the same
+	 *   mutex) MUST NOT await that re-entrant work inline — it deadlocks on the
+	 *   chained mutex. Detect the context via {@link Database._isExecuting} and defer
+	 *   the re-entrant work to fire-and-forget (it queues on the mutex and runs the
+	 *   instant the apply releases it). The sync layer's basis-lifecycle recorder is
+	 *   the reference consumer.
 	 *
 	 * May be sync or async; the engine awaits the result. Omit ⇒ the module is
 	 * never consulted on deploy (today's behavior).
