@@ -292,6 +292,39 @@ describe('real-engine held-change drain (revival): straggler → hold → re-cre
 		expect(await collect(H.db, 'select id, note from orders'), 'row value-unchanged by the re-drain').to.deep.equal([{ id: 1, note: 'hi' }]);
 	});
 
+	it('a drain BEFORE the table is re-created is a genuine no-op: nothing materializes, the hold survives', async () => {
+		const S = await spawn('S', { createOrders: true });
+		const H = await spawn('H'); // quarantine, NO orders — and it stays absent here
+
+		await localWrite(S, "insert into orders values (1, 'hi')");
+		await relay(S, H);
+		expect(await H.manager.quarantine.list('main', 'orders'), 'H holds the straggler insert').to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+		expect(H.db.schemaManager.getTable('main', 'orders'), 'H still has no orders table').to.be.undefined;
+
+		// Drain while orders is still out of basis: the basis gate skips the group, so the
+		// real store adapter is never reached — no premature materialization, no DDL side
+		// effect, no drained event, and the durable hold is left fully intact.
+		const drainedEvents: HeldChangesDrainedEvent[] = [];
+		H.manager.getEventEmitter().onHeldChangesDrained(e => drainedEvents.push(e));
+		const drained = await H.manager.drainHeldChanges('main', 'orders');
+		await settle();
+
+		expect(drained, 'drain returns 0 while the table is absent').to.equal(0);
+		expect(drainedEvents, 'no drained event fired for an absent table').to.have.lengthOf(0);
+		expect(H.db.schemaManager.getTable('main', 'orders'), 'the drain did not conjure the table').to.be.undefined;
+		expect(
+			await H.manager.quarantine.list('main', 'orders'),
+			'the hold survives the no-op drain unchanged',
+		).to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+
+		// And a subsequent revive + drain still materializes — the held entries were not
+		// consumed (or corrupted) by the premature drain.
+		await reviveOrders(H);
+		expect(await H.manager.drainHeldChanges('main', 'orders'), 'the later revive drain clears the hold').to.equal(COLUMNS_PER_FRESH_INSERT);
+		await settle();
+		expect(await collect(H.db, 'select id, note from orders'), 'the row materializes once the table is back').to.deep.equal([{ id: 1, note: 'hi' }]);
+	});
+
 	it('a revival drain drives materialized-view maintenance and Database.watch (the claim the stub cannot make)', async () => {
 		const S = await spawn('S', { createOrders: true });
 		const H = await spawn('H');
