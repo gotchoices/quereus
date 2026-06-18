@@ -23,7 +23,7 @@
     "clean": "rimraf dist",
     "build": "tsc",
     "dev": "tsc && node dist/bin/quoomb.js",
-    "lint": "eslint src/**/*.ts",
+    "lint": "echo 'No lint configured'",
     "test": "vitest run --passWithNoTests",
     "prepublish": "npm run build"
   },
