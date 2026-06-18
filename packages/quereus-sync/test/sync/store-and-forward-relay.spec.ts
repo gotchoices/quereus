@@ -383,4 +383,136 @@ describe('store-and-forward relay', () => {
       expect(R.manager.getUnknownTableStats().relayed, 'echo-excluded pull adds nothing').to.equal(2);
     });
   });
+
+  describe('multi-hop relay chain (depth >= 3)', () => {
+    // S → R1 → R2 → R3 → H: a straggler's change traverses THREE store-and-forward
+    // relays (none of which hold `orders`) before reaching a distant holder H. The
+    // ping-pong spec proves loop-freedom at depth 2; this proves the SAME identity
+    // argument — original `hlc` + `siteId` at every hop, no peer-membership oracle —
+    // holds at depth 3+. A regression that broke convergence only at hop ≥ 3 (a
+    // re-stamp on re-dispose, unbounded re-hold growth) would slip past depth-2 cover.
+
+    // Build a fresh chain per spec: S is the straggler origin (never a peer); R1/R2/R3
+    // are store-and-forward relays without `orders`; H holds `orders` in its basis.
+    async function buildChain(): Promise<{ S: SiteId; R1: Peer; R2: Peer; R3: Peer; H: Peer; C: ColumnChange }> {
+      const S = generateSiteId();
+      const R1 = await makePeer({ disposition: 'store-and-forward', known: ['main.users'] });
+      const R2 = await makePeer({ disposition: 'store-and-forward', known: ['main.users'] });
+      const R3 = await makePeer({ disposition: 'store-and-forward', known: ['main.users'] });
+      const H = await makePeer({ disposition: 'quarantine', known: ['main.users', `main.${RETIRED}`] });
+      const C = col(S, 1500, RETIRED, 1, 'note', 'hi');
+      return { S, R1, R2, R3, H, C };
+    }
+
+    it('relays a straggler change across three hops to a distant holder exactly once, keeping the origin hlc + siteId', async () => {
+      const { S, R1, R2, R3, H, C } = await buildChain();
+
+      // S → R1 (direct apply): R1 retired `orders`, so it holds C forwardable.
+      await R1.manager.applyChanges([changeSet(S, 'tx-s', [C])]);
+      expect(await R1.manager.quarantine.listForwardable(), 'R1 holds C forwardable').to.have.lengthOf(1);
+
+      // R1 → R2 → R3 (from-zero pulls): each relay re-disposes the forwarded change
+      // per its OWN config (recursive re-dispose), re-holding exactly one entry. C
+      // carries S's hlc + siteId the whole way — that identity, not any oracle, is
+      // what keeps the chain loop-free and convergent.
+      const toR2 = await pull(R1, R2, undefined);
+      expect(tablesIn(toR2.sets), 'C is offered to R2').to.include(RETIRED);
+      expect(await R2.manager.quarantine.listForwardable(), 'R2 re-holds exactly one entry').to.have.lengthOf(1);
+      expect(R2.manager.getUnknownTableStats().forwarded, 'R2 re-disposed the forwarded change').to.equal(1);
+
+      const toR3 = await pull(R2, R3, undefined);
+      expect(tablesIn(toR3.sets), 'C is offered to R3').to.include(RETIRED);
+      expect(await R3.manager.quarantine.listForwardable(), 'R3 re-holds exactly one entry').to.have.lengthOf(1);
+      expect(R3.manager.getUnknownTableStats().forwarded, 'R3 re-disposed the forwarded change').to.equal(1);
+
+      // R3 → H (from-zero): H is the ONLY peer with `orders` in its basis, so it
+      // materializes C rather than re-holding it.
+      const toH = await pull(R3, H, undefined);
+      expect(tablesIn(toH.sets), 'C is offered to H').to.include(RETIRED);
+      expect(await H.manager.quarantine.listForwardable(), 'the holder does not hold — it materializes').to.have.lengthOf(0);
+
+      // Each non-holder still holds EXACTLY ONE forwardable entry after the full
+      // chain — HLC-keyed re-holds are idempotent, so N hops never create N copies.
+      expect(await R1.manager.quarantine.listForwardable(), 'R1: no growth from being upstream of a 3-hop chain').to.have.lengthOf(1);
+      expect(await R2.manager.quarantine.listForwardable(), 'R2: one entry').to.have.lengthOf(1);
+      expect(await R3.manager.quarantine.listForwardable(), 'R3: one entry').to.have.lengthOf(1);
+
+      // Exactly once at the holder, with S's origin HLC — not duplicated by the
+      // multiple hops, not re-stamped to any relay's siteId.
+      const cv = await H.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note');
+      expect(cv, 'C materialized on H').to.not.be.undefined;
+      expect(cv!.value).to.equal('hi');
+      expect(siteIdEquals(cv!.hlc.siteId, S), 'materialized with S\'s origin siteId, not any relay\'s').to.be.true;
+      expect(compareHLC(cv!.hlc, C.hlc), 'materialized with S\'s original HLC').to.equal(0);
+
+      // The chain does not dead-end at the first holder: H serves C onward from its
+      // OWN change log (origin intact), so a peer one hop past H would receive it.
+      const hServes = await H.manager.getChangesSince(generateSiteId());
+      const hRelayable = flatten(hServes).filter(c => c.table === RETIRED);
+      expect(hRelayable, 'H serves C onward exactly once from its own log').to.have.lengthOf(1);
+      expect(siteIdEquals(hRelayable[0].hlc.siteId, S), 'onward serve keeps S\'s origin siteId').to.be.true;
+      expect(compareHLC(hRelayable[0].hlc, C.hlc), 'onward serve keeps S\'s original HLC').to.equal(0);
+    });
+
+    it('quiesces at every hop after one exchange — no unbounded re-send, one forwardable entry per non-holder', async () => {
+      const { S, R1, R2, R3, H, C } = await buildChain();
+      await R1.manager.applyChanges([changeSet(S, 'tx-s', [C])]);
+
+      // From-zero pulls along the chain, capturing each consumer's advanced watermark
+      // (the per-peer max(ChangeSet.hlc) the transport persists).
+      const toR2 = await pull(R1, R2, undefined);
+      const toR3 = await pull(R2, R3, undefined);
+      const toH = await pull(R3, H, undefined);
+      expect(tablesIn(toR2.sets), 'first R1→R2 pass carries C').to.include(RETIRED);
+      expect(tablesIn(toR3.sets), 'first R2→R3 pass carries C').to.include(RETIRED);
+      expect(tablesIn(toH.sets), 'first R3→H pass carries C').to.include(RETIRED);
+
+      // Re-pull each hop at its advanced watermark: C (HLC == watermark) is filtered
+      // (`> sinceHLC` is false), so the scalar watermark stops re-send after ONE
+      // exchange at EVERY depth — RETIRED is excluded on the second pass everywhere.
+      const toR2again = await pull(R1, R2, toR2.since);
+      const toR3again = await pull(R2, R3, toR3.since);
+      const toHagain = await pull(R3, H, toH.since);
+      expect(tablesIn(toR2again.sets), 'R1→R2 quiesces after one exchange').to.not.include(RETIRED);
+      expect(tablesIn(toR3again.sets), 'R2→R3 quiesces after one exchange').to.not.include(RETIRED);
+      expect(tablesIn(toHagain.sets), 'R3→H quiesces after one exchange').to.not.include(RETIRED);
+
+      // No unbounded growth: still exactly one forwardable entry per relay.
+      expect(await R1.manager.quarantine.listForwardable(), 'R1 still holds one entry').to.have.lengthOf(1);
+      expect(await R2.manager.quarantine.listForwardable(), 'R2 still holds one entry').to.have.lengthOf(1);
+      expect(await R3.manager.quarantine.listForwardable(), 'R3 still holds one entry').to.have.lengthOf(1);
+    });
+
+    it('never echoes the forwarded change back toward its author from deep in the chain', async () => {
+      const { S, R1, R2, R3, H, C } = await buildChain();
+      await R1.manager.applyChanges([changeSet(S, 'tx-s', [C])]);
+      await pull(R1, R2, undefined);
+      await pull(R2, R3, undefined);
+      await pull(R3, H, undefined);
+
+      // R3 is two relays deep, yet C's origin siteId is still S, so a pull toward the
+      // author excludes it — echo exclusion holds regardless of how many relays C
+      // traversed (from-zero AND delta).
+      const fromZero = await R3.manager.getChangesSince(S);
+      expect(tablesIn(fromZero), 'C is not echoed back to its author S from R3 (from-zero)').to.not.include(RETIRED);
+      const delta = await R3.manager.getChangesSince(S, createHLC(1000n, 1, S, 0));
+      expect(tablesIn(delta), 'C is not echoed back to its author S from R3 (delta)').to.not.include(RETIRED);
+    });
+
+    it('stays loop-free under a back-relay deep in the chain (mirrors the depth-2 ping-pong)', async () => {
+      const { S, R1, R2, R3, H, C } = await buildChain();
+      await R1.manager.applyChanges([changeSet(S, 'tx-s', [C])]);
+      await pull(R1, R2, undefined);
+      await pull(R2, R3, undefined);
+      void H; // holder not exercised here; the loop-freedom claim is about the relays
+
+      // A reverse pull offers C back to a peer that already holds it. The re-hold is
+      // HLC-keyed idempotent, so R2 still has exactly one entry — no infinite re-hold,
+      // same loop-freedom the depth-2 ping-pong proves, now one hop deeper.
+      const back = await pull(R3, R2, undefined);
+      expect(tablesIn(back.sets), 'C is offered back to R2').to.include(RETIRED);
+      expect(await R2.manager.quarantine.listForwardable(), 'R2 still holds exactly one entry after a back-relay').to.have.lengthOf(1);
+      expect(await R3.manager.quarantine.listForwardable(), 'R3 unchanged by the back-relay').to.have.lengthOf(1);
+    });
+  });
 });
