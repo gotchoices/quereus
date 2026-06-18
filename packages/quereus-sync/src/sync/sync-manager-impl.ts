@@ -73,7 +73,7 @@ import type {
 import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCStateBatch, toError } from './sync-context.js';
-import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl } from './change-applicator.js';
+import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl, drainReappearedTables } from './change-applicator.js';
 import { buildTransactionChangeSets } from './change-grouping.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
 import {
@@ -418,6 +418,11 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		const batch = this.kv.batch();
 		let wroteAny = false;
 		const pendingEvents: BasisTableLifecycleEvent[] = [];
+		// Tables transitioning detached → present this deploy: a retired table the lens
+		// re-maps back into the basis. Its held out-of-basis changes should replay NOW
+		// (after the lifecycle records are durable) rather than waiting on the periodic
+		// sweep — the lens-redeploy sibling of the inbound-create_table reappearance path.
+		const reappeared: Array<{ schema: string; table: string }> = [];
 
 		for (const key of keys) {
 			const prior = stored.get(key);
@@ -496,6 +501,18 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 					at: now,
 				});
 			}
+
+			// Detached → present (any in-basis state): a previously-retired table this
+			// deploy re-mapped back into the basis — its held out-of-basis changes should
+			// replay now. Use the precise `detached → present` transition rather than the
+			// broader "inBasis newly true": held entries only ever exist for previously
+			// out-of-basis tables, so the precise check skips spurious scoped scans for
+			// brand-new tables (excluded anyway by the `prior` guard). A cheapness
+			// optimization, not a correctness gate — drainHeldChanges' oracle gate makes
+			// any over-trigger a harmless no-op.
+			if (wasDetached && !isDetached) {
+				reappeared.push({ schema: record.schema, table: record.table });
+			}
 		}
 
 		if (wroteAny) await batch.write();
@@ -505,6 +522,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		for (const event of pendingEvents) {
 			this.syncEvents.emitBasisTableLifecycle(event);
 		}
+
+		// Reactive low-latency drain (sync-drain-reappear-lens-redeploy): a table this
+		// deploy re-mapped detached → present may hold out-of-basis changes waiting on it.
+		// Replay them NOW — as a SEPARATE post-commit apply unit, after the lifecycle batch
+		// above is durable and its events have fired, so the oracle (getTableColumnNames)
+		// sees the re-attached table and the held changes LWW-resolve against the present
+		// basis — instead of waiting up to one periodic-sweep interval. Symmetric with the
+		// inbound-create_table path in applyChanges. Advisory: drainReappearedTables logs +
+		// swallows any per-table failure, so a drain throw never aborts the deploy (which is
+		// itself advisory bookkeeping — the store-module forwarder wraps it in try/catch).
+		await drainReappearedTables(this, reappeared);
 	}
 
 	async getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]> {

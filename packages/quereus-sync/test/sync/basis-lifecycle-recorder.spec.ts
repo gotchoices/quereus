@@ -12,13 +12,15 @@
  */
 
 import { expect } from 'chai';
-import { Database, type LensDeploymentSnapshot, type LensTableSnapshot, type LensRelationBacking, type Database as DatabaseType } from '@quereus/quereus';
+import { Database, type SqlValue, type TableSchema, type LensDeploymentSnapshot, type LensTableSnapshot, type LensRelationBacking, type Database as DatabaseType } from '@quereus/quereus';
 import { InMemoryKVStore } from '@quereus/store';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl, type BasisTableLifecycleEvent } from '../../src/sync/events.js';
-import { DEFAULT_SYNC_CONFIG, type SyncConfig } from '../../src/sync/protocol.js';
+import { SyncEventEmitterImpl, type BasisTableLifecycleEvent, type HeldChangesDrainedEvent, type RemoteChangeEvent } from '../../src/sync/events.js';
+import { DEFAULT_SYNC_CONFIG, type SyncConfig, type ColumnChange, type DataChangeToApply, type SchemaChangeToApply } from '../../src/sync/protocol.js';
 import type { BasisTableLifecycleRecord } from '../../src/metadata/basis-lifecycle.js';
 import { splitRelKey } from '../../src/metadata/basis-lifecycle.js';
+import { createHLC } from '../../src/clock/hlc.js';
+import { generateSiteId, siteIdEquals, type SiteId } from '../../src/clock/site.js';
 
 // --- Fake snapshot / db builders ------------------------------------------------
 
@@ -313,5 +315,215 @@ describe('recordLensDeployment — basis lifecycle classification', () => {
     expect(r?.mappedSince).to.be.a('number');
 
     await db.close();
+  });
+});
+
+// ============================================================================
+// Low-latency scoped drain when a lens redeploy re-maps a basis table back into
+// the basis (sync-drain-reappear-lens-redeploy). A `detached → present` transition
+// in recordLensDeployment triggers an immediate scoped drain of that table's held
+// out-of-basis changes — the lens-redeploy sibling of the inbound-create_table
+// reappearance path (covered in unknown-table-disposition.spec.ts).
+//
+// These cases need BOTH a basis oracle (getTableColumnNames, so the drain can
+// resolve) AND seeded quarantine entries. The recorder's own classification reads
+// db.schemaManager and is INDEPENDENT of the oracle, so the detach / re-map is
+// driven by the db+snapshot while the oracle is flipped present to let the drain
+// land — mirroring the drain harness in unknown-table-disposition.spec.ts.
+// ============================================================================
+describe('recordLensDeployment — low-latency drain on detached → re-mapped', () => {
+  let kv: InMemoryKVStore;
+  let syncEvents: SyncEventEmitterImpl;
+  let config: SyncConfig;
+  let mgr: SyncManagerImpl;
+  let drained: HeldChangesDrainedEvent[];
+  let remoteChanges: RemoteChangeEvent[];
+  let lifecycleEvents: BasisTableLifecycleEvent[];
+  let remoteSite: SiteId;
+  // Mutable oracle: 'schema.table' → column names. getTableSchema reports a table
+  // present iff it has an entry here; absent ⇒ out of basis (the drain gate skips it).
+  let oracleColumns: Map<string, string[]>;
+  // In-memory store the drain's applyToStore writes into, so a drained held change is
+  // observable as a value. `failApply` fails the drain's data apply (the only
+  // applyToStore caller on this path) to exercise the advisory-swallow contract.
+  let store: Map<string, SqlValue>;
+  let failApply: { value: boolean };
+
+  beforeEach(async () => {
+    kv = new InMemoryKVStore();
+    syncEvents = new SyncEventEmitterImpl();
+    config = { ...DEFAULT_SYNC_CONFIG };
+    oracleColumns = new Map();
+    store = new Map();
+    failApply = { value: false };
+
+    const getTableSchema = (schema: string, table: string): TableSchema | undefined => {
+      const cols = oracleColumns.get(`${schema}.${table}`);
+      return cols ? ({ columns: cols.map(name => ({ name })) } as unknown as TableSchema) : undefined;
+    };
+    const applyToStore = async (data: DataChangeToApply[], schema: SchemaChangeToApply[]) => {
+      if (failApply.value) throw new Error('drain apply failed (test)');
+      for (const change of data) {
+        const rowPrefix = `${change.schema}.${change.table}:${JSON.stringify(change.pk)}:`;
+        if (change.type === 'delete') {
+          for (const key of [...store.keys()]) if (key.startsWith(rowPrefix)) store.delete(key);
+        } else {
+          for (const [c, value] of Object.entries(change.columns ?? {})) store.set(`${rowPrefix}${c}`, value);
+        }
+      }
+      return { dataChangesApplied: data.length, schemaChangesApplied: schema.length, errors: [] };
+    };
+
+    mgr = await SyncManagerImpl.create(kv, undefined, config, syncEvents, applyToStore, getTableSchema);
+    drained = [];
+    remoteChanges = [];
+    lifecycleEvents = [];
+    syncEvents.onHeldChangesDrained(e => drained.push(e));
+    syncEvents.onRemoteChange(e => remoteChanges.push(e));
+    syncEvents.onBasisTableLifecycle(e => lifecycleEvents.push(e));
+    remoteSite = generateSiteId();
+  });
+
+  async function getRec(schema: string, table: string): Promise<BasisTableLifecycleRecord | undefined> {
+    const all = await mgr.getBasisTableLifecycle();
+    const key = `${schema}.${table}`.toLowerCase();
+    return all.find(r => `${r.schema}.${r.table}`.toLowerCase() === key);
+  }
+
+  /** Seed a held (quarantined) column change for `main.<table>` from a remote origin. */
+  async function seedHeld(table: string, pk: number, column: string, value: string, wall: number): Promise<void> {
+    const change: ColumnChange = {
+      type: 'column', schema: 'main', table, pk: [pk], column, value,
+      hlc: createHLC(BigInt(wall), 1, remoteSite, 0),
+    };
+    const batch = mgr.kv.batch();
+    mgr.quarantine.put(batch, change, Date.now(), false);
+    await batch.write();
+  }
+
+  /** A db whose `main` basis schema contains exactly `names` (lowercase tables). */
+  const mapDb = (...names: string[]) => makeDb('main', names.map(n => ({ schema: 'main', name: n })));
+  /** A snapshot directly mapping each of `names` (logical 1:1 onto `main.<name>`). */
+  const mapSnap = (hash: string, ...names: string[]) =>
+    makeSnapshot('main', hash, names.map(n => ({ logicalTable: n, relations: [`main.${n}`] })));
+  const held = (table: string) => mgr.quarantine.list('main', table);
+
+  it('detached → re-mapped triggers an immediate scoped drain (no explicit sweep)', async () => {
+    // Map orders, then detach it (out of basis + unmapped ⇒ detached).
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h1', 'orders'));
+    await mgr.recordLensDeployment(makeDb('main', []), 'app', makeSnapshot('main', 'h2', []));
+    expect((await getRec('main', 'orders'))?.state).to.equal('detached');
+
+    // A straggler change is held for the now-detached table.
+    await seedHeld('orders', 1, 'note', 'hi', 1000);
+    expect(await held('orders')).to.have.lengthOf(1);
+
+    // orders reappears in the oracle (re-provisioned) and the lens re-maps it.
+    oracleColumns.set('main.orders', ['note']);
+    drained.length = 0; remoteChanges.length = 0;
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h3', 'orders'));
+
+    // The held change replayed WITHOUT an explicit drainHeldChanges call.
+    expect(await held('orders')).to.have.lengthOf(0);
+    expect(store.get('main.orders:[1]:note')).to.equal('hi');
+    expect(await mgr.columnVersions.getColumnVersion('main', 'orders', [1], 'note')).to.not.be.undefined;
+
+    // One drained event, applied + skipped === drained, keyed by the original origin.
+    expect(drained).to.have.lengthOf(1);
+    expect(drained[0]).to.include({ schema: 'main', table: 'orders', drained: 1, applied: 1, skipped: 0 });
+    expect(drained[0].applied + drained[0].skipped).to.equal(drained[0].drained);
+    const revived = remoteChanges.flatMap(e => e.changes).filter(c => c.table === 'orders');
+    expect(revived).to.have.lengthOf(1);
+    expect(siteIdEquals(remoteChanges[0].siteId, remoteSite)).to.be.true;
+  });
+
+  it('an idempotent re-deploy (no detached → present transition) does not drain', async () => {
+    // orders stays directly-mapped throughout; legacy is mapped then detached.
+    await mgr.recordLensDeployment(mapDb('orders', 'legacy'), 'app', mapSnap('h1', 'orders', 'legacy'));
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h2', 'orders'));
+    expect((await getRec('main', 'legacy'))?.state).to.equal('detached');
+
+    // Held entries seeded for the still-detached legacy table; present in the oracle so
+    // a drain WOULD land if one fired — isolating "no transition" as the reason it doesn't.
+    await seedHeld('legacy', 1, 'note', 'hi', 1000);
+    oracleColumns.set('main.legacy', ['note']);
+    drained.length = 0;
+
+    // Re-deploy the SAME mapping: orders stays directly-mapped, legacy stays detached.
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h2', 'orders'));
+
+    expect(drained).to.have.lengthOf(0);
+    expect(await held('legacy')).to.have.lengthOf(1);
+  });
+
+  it('a brand-new table (no prior record) does not drain even with held entries', async () => {
+    // Held entries for a table that has never been classified; present in the oracle.
+    await seedHeld('orders', 1, 'note', 'hi', 1000);
+    oracleColumns.set('main.orders', ['note']);
+    expect(await held('orders')).to.have.lengthOf(1);
+
+    // First-ever deploy maps orders → directly-mapped. prior is undefined, so the
+    // `prior?.state === 'detached'` guard excludes it from the reappearance set.
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h1', 'orders'));
+
+    expect(drained).to.have.lengthOf(0);
+    expect(await held('orders')).to.have.lengthOf(1);
+    expect(store.get('main.orders:[1]:note')).to.be.undefined;
+
+    // The held entries remain drainable — the host sweep still catches them.
+    expect(await mgr.drainHeldChanges('main', 'orders')).to.equal(1);
+  });
+
+  it('drainOnReappear=false defers a re-mapped table to the host sweep', async () => {
+    config.drainOnReappear = false;
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h1', 'orders'));
+    await mgr.recordLensDeployment(makeDb('main', []), 'app', makeSnapshot('main', 'h2', []));
+    await seedHeld('orders', 1, 'note', 'hi', 1000);
+    oracleColumns.set('main.orders', ['note']);
+    drained.length = 0;
+
+    // Re-map with the flag off: the deploy records the transition but does NOT auto-drain.
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h3', 'orders'));
+    expect((await getRec('main', 'orders'))?.state).to.equal('directly-mapped');
+    expect(drained).to.have.lengthOf(0);
+    expect(await held('orders')).to.have.lengthOf(1);
+    expect(store.get('main.orders:[1]:note')).to.be.undefined;
+
+    // An explicit host sweep still drains (the primitive is not gated by the flag).
+    expect(await mgr.drainHeldChanges('main', 'orders')).to.equal(1);
+    expect(store.get('main.orders:[1]:note')).to.equal('hi');
+    expect(await held('orders')).to.have.lengthOf(0);
+  });
+
+  it('a thrown reactive drain is swallowed: the deploy completes, entries stay held', async () => {
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h1', 'orders'));
+    await mgr.recordLensDeployment(makeDb('main', []), 'app', makeSnapshot('main', 'h2', []));
+    await seedHeld('orders', 1, 'note', 'hi', 1000);
+    oracleColumns.set('main.orders', ['note']);
+    drained.length = 0; lifecycleEvents.length = 0;
+
+    // Arm the drain-apply crash hook; the deploy's lifecycle batch commits, its
+    // follow-on reappear drain throws and is logged + swallowed.
+    failApply.value = true;
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h3', 'orders'));
+
+    // The deploy's lifecycle records are durable (orders re-classified directly-mapped)
+    // and its transition event fired, despite the swallowed drain.
+    expect((await getRec('main', 'orders'))?.state).to.equal('directly-mapped');
+    const ev = lifecycleEvents.find(e => e.table.toLowerCase() === 'orders');
+    expect(ev?.previousState).to.equal('detached');
+    expect(ev?.newState).to.equal('directly-mapped');
+
+    // No drain landed: no event, entries stay held, nothing written.
+    expect(drained).to.have.lengthOf(0);
+    expect(await held('orders')).to.have.lengthOf(1);
+    expect(store.get('main.orders:[1]:note')).to.be.undefined;
+
+    // Disarm: a later sweep drains cleanly, no double-apply.
+    failApply.value = false;
+    expect(await mgr.drainHeldChanges('main', 'orders')).to.equal(1);
+    expect(await held('orders')).to.have.lengthOf(0);
+    expect(store.get('main.orders:[1]:note')).to.equal('hi');
+    expect(drained).to.have.lengthOf(1);
   });
 });
