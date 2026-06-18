@@ -56,6 +56,8 @@ interface Harness {
   columnsByTable: Map<string, string[]>;
   /** Data the apply path wrote, keyed 'schema.table:pkJson:column' -> value. */
   store: Map<string, SqlValue>;
+  /** Flip `.value` true to make the next `applyToStore` throw (crash-path tests). */
+  failApply: { value: boolean };
 }
 
 async function makeHarness(opts: {
@@ -78,7 +80,11 @@ async function makeHarness(opts: {
   // queryable. `update` sets each (pk, column) cell; `delete` clears the row.
   const store = new Map<string, SqlValue>();
   const applyCalls: ApplyCall[] = [];
+  // Crash hook: when set, throw BEFORE recording or mutating anything, so a failed
+  // apply is a true no-op (matches the real adapter aborting with no data written).
+  const failApply = { value: false };
   const applyToStore = async (data: DataChangeToApply[], schema: SchemaChangeToApply[]) => {
+    if (failApply.value) throw new Error('apply failed (test)');
     applyCalls.push({ data, schema });
     for (const change of data) {
       const rowPrefix = `${change.schema}.${change.table}:${JSON.stringify(change.pk)}:`;
@@ -119,7 +125,7 @@ async function makeHarness(opts: {
 
   return {
     manager, syncEvents, applyCalls, events, drained, remoteChanges,
-    remoteSite: generateSiteId(), basis, columnsByTable, store,
+    remoteSite: generateSiteId(), basis, columnsByTable, store, failApply,
   };
 }
 
@@ -759,6 +765,34 @@ describe('unknown-table disposition', () => {
       // Second sweep finds the entries gone.
       expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(0);
       expect(h.drained).to.have.lengthOf(0);
+    });
+
+    it('a crash during the drain apply leaves entries held; a later drain succeeds', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      reappear(h, RETIRED, ['note']);
+
+      // Data-apply throws → admitGroup aborts before committing metadata or clearing
+      // the hold (data-first / metadata-second ordering). The held entry must survive.
+      h.failApply.value = true;
+      let threw: Error | undefined;
+      try {
+        await h.manager.drainHeldChanges('main', RETIRED);
+      } catch (error) {
+        threw = error as Error;
+      }
+      expect(threw?.message).to.equal('apply failed (test)');
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+      expect(h.drained).to.have.lengthOf(0);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.be.undefined;
+
+      // Recover: the re-drain resolves the still-held change and clears it. No
+      // double-apply — resolution is idempotent against whatever did/didn't commit.
+      h.failApply.value = false;
+      expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(1);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('hi');
+      expect(h.drained).to.have.lengthOf(1);
     });
   });
 });

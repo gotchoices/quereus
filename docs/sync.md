@@ -183,6 +183,18 @@ The `store-and-forward` disposition holds diverted changes identically to `quara
 
 The metadata-layer mechanics above are covered by `store-and-forward-relay.spec.ts`; that a relayed change actually materializes as a live SQL row on the holder (real `Database` + `StoreModule` + store adapter, queried back with `select`, carrying the straggler's origin HLC) is covered end-to-end by `store-and-forward-relay-e2e.spec.ts`.
 
+#### Revival / drain
+
+A retired table can come **back** — re-created app-side, or a `create_table` for it arrives in an inbound batch. When it does, its held changes (both `quarantine` and forwardable `store-and-forward` — a held change is a held change regardless of *why* it was held) are **replayed into the now-present table** rather than waiting on horizon GC, via the host-driven `SyncManager.drainHeldChanges(schema?, table?)` — a sibling of `pruneTombstones` / `pruneQuarantine` / `evictExpiredBasisTables`, called from the same maintenance path (or right after the host re-creates a table). The library adds **no timer** and never drains inline during `applyChanges`.
+
+- **Scope** mirrors `QuarantineStore.list`: `(schema, table)` drains one table, `(schema)` a schema, the no-arg form sweeps every held entry whose table is back. Returns the number of held entries cleared.
+- **Resolution** runs each held change against the reappeared table exactly like a fresh inbound change (LWW / tombstone-blocking / `allowResurrection`), then **clears it from the hold on resolution whether or not it applied** — a held change that lost LWW or was tombstone-blocked resolves identically on any later sweep, so holding it longer is pointless; only entries for still-absent tables stay held. A held column change for a column the re-created table no longer has is **drift-dropped** (resolved-and-cleared, never sent to the store), so one stale entry cannot poison the table's whole drain admission.
+- **Ordering.** Drain runs as a *separate* apply, **after** any re-creating batch has committed, so the fresh data lands first and the older held changes simply LWW-resolve against it — no intra-admission interleaving and no re-merge of the (already-merged) HLC watermark. The whole call is one `admitGroup` unit (data first → CRDT metadata + held-entry deletes second), so a crash before the metadata commit leaves the entries held and a re-drain re-resolves them idempotently.
+- **Events.** Applied changes fire `onRemoteChange` (so MV maintenance / `Database.watch` / UI react to the revival), grouped by each held change's **original origin** `hlc.siteId`; each drained table fires `onHeldChangesDrained` (`{ schema, table, drained, applied, skipped }`, with `applied + skipped === drained`). A forwarded entry that drains stops being relay-offered and rides the normal change log thereafter (it is a real local version now).
+- **No-oracle no-op.** Without `getTableSchema` a relay-only coordinator cannot tell which held tables are present, so `drainHeldChanges` returns 0 and touches nothing — exactly as unknown-table detection is inert there. Zero-cost when nothing is held.
+
+Covered by the `drainHeldChanges (revival)` block in `unknown-table-disposition.spec.ts` (CRDT-metadata + in-memory stub-store level); an integration pass through the real store adapter is a hardening follow-up.
+
 ### Transaction-Based Change Grouping
 
 Changes are grouped by transaction. When syncing:
