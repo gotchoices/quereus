@@ -57,6 +57,7 @@ import {
 	parseMaterializedViewCatalogKey,
 	buildMetaCatalogKey,
 	CLEAN_SHUTDOWN_META_NAME,
+	STALE_MVS_META_NAME,
 	classifyCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
@@ -153,6 +154,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * and is drained by `closeAll` (and `whenCatalogPersisted`) before the provider closes.
 	 */
 	private persistQueue: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * The JSON-serialized stale-MV set last enqueued onto {@link persistQueue} (the
+	 * `\x00meta\x00stale_mvs` value), or `undefined` when no baseline is established
+	 * for the current subscription. The schema-change listener compares each
+	 * recomputed set against this so an unrelated `table_modified` (e.g. a tag swap
+	 * that changes no MV's staleness) costs no extra fsync. Reset to `undefined`
+	 * whenever a fresh `Database` is subscribed ({@link ensureSchemaSubscription}) so
+	 * a reopened module re-establishes the baseline from the first relevant event (or
+	 * the rehydrate tail).
+	 */
+	private lastPersistedStaleMvs: string | undefined;
 
 	constructor(provider: KVStoreProvider, eventEmitter?: StoreEventEmitter) {
 		this.provider = provider;
@@ -2158,11 +2171,33 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// store-table create/connect to establish the subscription.)
 		this.ensureSchemaSubscription(db);
 
-		// Consume the clean-shutdown marker FIRST (before the catalog scan): its
-		// presence is the adopt trust basis for this rehydration only, and deleting
-		// it immediately makes it single-use. Its payload names the MVs that were
-		// stale-at-close — those are withheld from the fast path per-entry below.
+		// Capability check (method presence — matching the coordinator's own gate): an
+		// atomic-commit provider commits a source write and its same-module backing in
+		// one all-or-nothing batch, so a crash can no longer tear them apart (the
+		// crash-divergence window gate 5 historically guarded). In that domain, gate 4
+		// alone governs same-module backings and a non-stale backing adopts after a crash
+		// too — the LOGICAL-staleness window is closed instead by the durable stale-MV
+		// set, which (unlike the clean-shutdown marker) survives a crash.
+		const atomic = typeof this.provider.beginAtomicBatch === 'function';
+		const durableStale = await this.readDurableStaleMvSet();
+
+		// Consume the clean-shutdown marker FIRST (before the catalog scan): in the
+		// non-atomic domain its presence is the adopt trust basis for this rehydration
+		// only, and deleting it immediately makes it single-use. Its payload names the MVs
+		// that were stale-at-close. Always consumed for single-use hygiene even in the
+		// atomic branch (where its trust bit is ignored in favor of the durable set).
 		const { trusted, staleAtClose } = await this.consumeCleanShutdownMarker();
+
+		// Per-entry adopt trust basis, capability-aware:
+		// - Atomic domain WITH a durable stale-set on disk → gate 4 alone governs; the
+		//   marker is NOT required, so a non-stale backing adopts even after a crash. A
+		//   present-but-unparseable stale-set (`stale === null`) refills everything.
+		// - Otherwise (non-atomic provider, OR atomic but no stale-set yet — the upgrade
+		//   path) → today's marker path, byte-for-byte.
+		const trustBacking = (name: string): boolean =>
+			atomic && durableStale.present
+				? durableStale.stale !== null && !durableStale.stale.has(name)
+				: trusted && !staleAtClose.has(name);
 
 		const entries = await this.loadCatalogEntries();
 		const result: RehydrationResult = { tables: [], indexes: [], views: [], materializedViews: [], errors: [] };
@@ -2235,14 +2270,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					const pendingDerivations = new Set(
 						pending.filter(p => p !== entry).map(p => p.name),
 					);
-					// Trust this backing only under a clean shutdown AND when the MV was
-					// not stale-at-close — a stale-at-close MV's row-time maintenance was
-					// detached mid-session, so its durable backing may be behind. Refilling
-					// it recomputes content and re-arms maintenance (clearing `stale`); a
-					// refilled MV is also never added to `adoptedBackings`, so the ledger
-					// gate forces its MV-over-MV dependents to refill too.
+					// Trust this backing only when the per-entry capability-aware basis
+					// (`trustBacking`) holds: in the atomic domain a non-stale backing is
+					// trusted (even after a crash); otherwise a clean shutdown AND not
+					// stale-at-close. A withheld MV refills — recomputing content and
+					// re-arming maintenance (clearing `stale`) — and is never added to
+					// `adoptedBackings`, so the ledger gate forces its MV-over-MV dependents
+					// to refill too.
 					const imported = await db.schemaManager.importCatalog([entry.ddl], {
-						trustBackings: trusted && !staleAtClose.has(entry.name),
+						trustBackings: trustBacking(entry.name),
 						adoptedBackings,
 						pendingDerivations,
 					});
@@ -2273,6 +2309,17 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			const fresh = db.schemaManager.getTable(current.schemaName, current.name);
 			if (fresh) table.updateSchema(fresh);
 		}
+
+		// Recompute the durable stale-MV set from the now-current flags and compare-write
+		// it: refilled MVs cleared `stale`, adopted MVs were never stale, so the on-disk
+		// entry (which a crash may have left naming an MV this rehydrate just refilled)
+		// now reflects post-rehydrate truth — preventing a wasteful re-refill at the next
+		// open. Phase 3's `importCatalog` is silent (no schema-change events fire), so the
+		// listener never ran this rehydration; this explicit tail write establishes the
+		// session baseline (`lastPersistedStaleMvs`). It rides `persistQueue`, drained by
+		// the next `closeAll`/`whenCatalogPersisted`. (An optimization, not soundness: a
+		// crash before it lands leaves a stale-set that only over-names → a sound refill.)
+		this.persistStaleMvSetIfChanged();
 
 		return result;
 	}
@@ -2419,6 +2466,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			return;
 		}
 		this.subscribedDb = db;
+		// A fresh subscription has no on-disk stale-set baseline yet (this module never
+		// wrote one this session); reset so the first relevant event — or the rehydrate
+		// tail — re-establishes it rather than comparing against a prior subscription's.
+		this.lastPersistedStaleMvs = undefined;
 		this.schemaListenerUnsub = db.schemaManager.getChangeNotifier().addListener(this.onEngineSchemaChange);
 	}
 
@@ -2447,8 +2498,27 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * Synchronous by contract (`notifyChange` does not await listeners); every async write
 	 * rides `persistQueue`, drained by `closeAll`/`whenCatalogPersisted`.
+	 *
+	 * After dispatching the event's own catalog persistence, the listener recomputes the
+	 * durable stale-MV set and compare-writes it (see {@link persistStaleMvSetIfChanged}).
+	 * Because the engine's MV manager subscribes to the same notifier in the `Database`
+	 * constructor — before this lazy subscription — its listener runs first, so the
+	 * `derivation.stale` flags are already current when this recompute reads them.
 	 */
 	private onEngineSchemaChange = (event: EngineSchemaChangeEvent): void => {
+		this.dispatchSchemaChange(event);
+		// Every staleness SET transition is bracketed by an event observed here (a source
+		// `table_modified`/`table_removed`, or the synthetic backing-invalidation
+		// `table_modified` for an MV-over-MV cascade), and every CLEAR but the no-event
+		// rename-restore fires one too — so recompute on each event keeps the durable set
+		// current. Enqueued on `persistQueue` AFTER the dispatch above, so the `sync` lands
+		// after the event's own source-DDL write is queued (the durability ordering the
+		// adopt soundness argument relies on — see `docs/materialized-views.md`).
+		this.persistStaleMvSetIfChanged();
+	};
+
+	/** Dispatch a single engine schema-change event to its catalog-persistence arm. */
+	private dispatchSchemaChange(event: EngineSchemaChangeEvent): void {
 		switch (event.type) {
 			case 'table_modified': {
 				// SET TAGS does not call `table.updateSchema`, so a connected instance's cached
@@ -2504,7 +2574,100 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			default:
 				return;
 		}
-	};
+	}
+
+	/**
+	 * The qualified lowercased `schema.mv` names of every maintained table currently
+	 * marked `derivation.stale` — an MV whose row-time maintenance detached mid-session
+	 * (a body-relevant `table_modified`/`table_removed` on a source, or a cascade
+	 * backing-invalidation), so its durable backing may be behind. The single source of
+	 * truth for both the clean-shutdown marker payload and the durable stale-MV set.
+	 *
+	 * No subscribed db ⇒ the empty set: every path that can mark an MV stale requires a
+	 * session in which this module observed the db (a store source create/connect or
+	 * `rehydrateCatalog`, both of which subscribe), so a session without `subscribedDb`
+	 * never detached any persisted MV's maintenance. Memory-backed MVs that appear here
+	 * are harmless — their catalog entries always refill (no phase-1 pre-existing
+	 * backing), so withholding trust from them is a no-op.
+	 */
+	private computeStaleMvSet(): string[] {
+		return this.subscribedDb
+			? this.subscribedDb.schemaManager.getAllMaintainedTables()
+				.filter(mv => mv.derivation.stale)
+				.map(mv => `${mv.schemaName}.${mv.name}`.toLowerCase())
+			: [];
+	}
+
+	/**
+	 * Recompute the durable stale-MV set and, only when it differs from the last value
+	 * enqueued this subscription ({@link lastPersistedStaleMvs}), enqueue a `sync: true`
+	 * point-write of it onto {@link persistQueue}. The compare-skip keeps an unrelated
+	 * `table_modified` (a tag swap that changes no MV's staleness) from costing an fsync.
+	 *
+	 * The recompute reads `derivation.stale` synchronously (the flags are current at
+	 * listener-dispatch time); the field is updated synchronously at enqueue time, and
+	 * `persistQueue` serializes the writes in order, so the field always names the last
+	 * enqueued value. Riding `persistQueue` (rather than a bare `put`) also serializes
+	 * this `sync` behind the triggering event's own source-DDL compare-write, so the
+	 * stale-set becomes durable no-later-than the source DDL that caused the staleness —
+	 * the ordering the adopt soundness argument depends on.
+	 */
+	private persistStaleMvSetIfChanged(): void {
+		const json = JSON.stringify(this.computeStaleMvSet());
+		if (json === this.lastPersistedStaleMvs) return;
+		this.lastPersistedStaleMvs = json;
+		this.enqueuePersist(() => this.writeDurableStaleMvSet(json));
+	}
+
+	/**
+	 * Write the durable stale-MV set (`\x00meta\x00stale_mvs`) with `sync: true`. Unlike
+	 * the clean-shutdown marker this entry is persistent current-truth — overwritten as
+	 * staleness changes, never deleted — so a crash leaves the last synced value intact.
+	 * The `sync` mirrors the marker-consume delete's durability discipline (and carries
+	 * the same documented backend caveat: a backend without a durability knob no-ops it).
+	 */
+	private async writeDurableStaleMvSet(json: string): Promise<void> {
+		const catalogStore = await this.provider.getCatalogStore();
+		await catalogStore.put(
+			buildMetaCatalogKey(STALE_MVS_META_NAME),
+			new TextEncoder().encode(json),
+			{ sync: true },
+		);
+	}
+
+	/**
+	 * Read + conservative-parse the durable stale-MV set, mirroring
+	 * {@link consumeCleanShutdownMarker}'s parse discipline (but READ-only — never
+	 * deleted). Returns:
+	 * - `{ present: false }` — no entry on disk (a pre-atomic store, or an upgrade where
+	 *   the capability was gained but no stale-set has been written yet) → the caller
+	 *   falls back to the clean-shutdown marker path.
+	 * - `{ present: true, stale }` — the parsed set of qualified `schema.mv` names.
+	 * - `{ present: true, stale: null }` — a present but unparseable / wrong-shape payload
+	 *   → the caller refills everything (the always-safe posture).
+	 */
+	private async readDurableStaleMvSet(): Promise<
+		{ present: false } | { present: true; stale: ReadonlySet<string> | null }
+	> {
+		const catalogStore = await this.provider.getCatalogStore();
+		const raw = await catalogStore.get(buildMetaCatalogKey(STALE_MVS_META_NAME));
+		if (raw === undefined) return { present: false };
+		try {
+			const parsed: unknown = JSON.parse(new TextDecoder().decode(raw));
+			if (!Array.isArray(parsed) || !parsed.every((s): s is string => typeof s === 'string')) {
+				console.warn('[StoreModule] durable stale-MV set payload is not a string array; refilling all backings.');
+				return { present: true, stale: null };
+			}
+			return { present: true, stale: new Set(parsed) };
+		} catch (e) {
+			console.warn(
+				`[StoreModule] durable stale-MV set payload did not parse as JSON; refilling all backings: ${
+					e instanceof Error ? e.message : String(e)
+				}`,
+			);
+			return { present: true, stale: null };
+		}
+	}
 
 	/**
 	 * Shared MV add/modify/refresh handling. Narrow defensively — a derivation-less
@@ -2600,11 +2763,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// persisted MV's maintenance. Memory-backed MVs that appear in the set are
 		// harmless: their catalog entries always refill (no phase-1 pre-existing backing),
 		// so withholding trust from them is a no-op.
-		const staleAtClose = this.subscribedDb
-			? this.subscribedDb.schemaManager.getAllMaintainedTables()
-				.filter(mv => mv.derivation.stale)
-				.map(mv => `${mv.schemaName}.${mv.name}`.toLowerCase())
-			: [];
+		const staleAtClose = this.computeStaleMvSet();
 
 		// Stop listening first so no new persist work is enqueued mid-close, then drain
 		// the queued catalog writes (tag swaps) before the provider closes.
@@ -2631,6 +2790,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const catalogStore = await this.provider.getCatalogStore();
 		await catalogStore.put(
 			buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME),
+			new TextEncoder().encode(JSON.stringify(staleAtClose)),
+		);
+
+		// Also write the DURABLE stale-MV set (persistent current-truth, NOT single-use).
+		// Same array as the marker payload, under a separate reserved meta key that the
+		// next open READS (never deletes). In the atomic-commit domain this — not the
+		// crash-losable marker — is the adopt fast path's logical-staleness exclusion
+		// basis, so a clean close (a) corrects any rename-restore drift (the one staleness
+		// CLEAR transition that fires no event) and (b) guarantees the entry exists even in
+		// a session with no staleness events. `provider.closeAll()` below flushes it.
+		await catalogStore.put(
+			buildMetaCatalogKey(STALE_MVS_META_NAME),
 			new TextEncoder().encode(JSON.stringify(staleAtClose)),
 		);
 

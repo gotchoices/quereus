@@ -189,8 +189,8 @@ export function parseMaterializedViewCatalogKey(key: Uint8Array): string {
  * `\x00meta\x00{name}` — same reserved leading-`0x00` scheme as the view/MV
  * prefixes, so a meta key can never collide with a table entry, and the 'm'-vs
  * `\x00meta`/`\x00mview` byte sequences diverge at the second character.
- * Today's only meta entry is the clean-shutdown marker
- * ({@link CLEAN_SHUTDOWN_META_NAME}).
+ * The meta entries are the clean-shutdown marker ({@link CLEAN_SHUTDOWN_META_NAME})
+ * and the durable stale-MV set ({@link STALE_MVS_META_NAME}).
  */
 export function buildMetaCatalogKey(name: string): Uint8Array {
 	return encoder.encode(`${META_KEY_PREFIX}${name}`);
@@ -210,6 +210,28 @@ export function buildMetaCatalogKey(name: string): Uint8Array {
  * (including a legacy bare `'1'`) degrades to refill-everything: the safe posture.
  */
 export const CLEAN_SHUTDOWN_META_NAME = 'clean_shutdown';
+
+/**
+ * Reserved meta-entry name for the durable stale-MV set: the crash-survivable
+ * record of which materialized views have **logically** fallen out of date
+ * (`derivation.stale` — row-time maintenance detached mid-session by a
+ * body-relevant source schema change, so later source writes never reached the
+ * backing). Modeled on {@link CLEAN_SHUTDOWN_META_NAME} but, unlike the marker,
+ * it is **persistent current-truth, not single-use**: `StoreModule` overwrites it
+ * (a `sync: true` point-write) whenever the stale set changes during a session and
+ * at clean close, `rehydrateCatalog` only **reads** it (never deletes it), and a
+ * crash leaves the last synced value intact.
+ *
+ * The **value** is a JSON array of lowercased qualified `schema.mv` names currently
+ * stale (e.g. `[]` or `["main.mv","main.mv2"]`). In the atomic-commit domain (a
+ * provider exposing {@link KVStoreProvider.beginAtomicBatch}) this is the adopt
+ * fast path's logical-staleness exclusion basis — `!durableStale.has(name)` —
+ * which (unlike the clean-shutdown marker) survives a crash, so a non-stale backing
+ * adopts even after a crash. Any unparseable / wrong-shape payload degrades to
+ * refill-everything: the safe posture (see `docs/materialized-views.md`
+ * § Cross-module atomicity).
+ */
+export const STALE_MVS_META_NAME = 'stale_mvs';
 
 /**
  * Classify a loaded catalog key by its reserved prefix so `rehydrateCatalog` can

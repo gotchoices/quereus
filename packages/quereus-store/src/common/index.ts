@@ -56,6 +56,7 @@ export {
 	parseMaterializedViewCatalogKey,
 	buildMetaCatalogKey,
 	CLEAN_SHUTDOWN_META_NAME,
+	STALE_MVS_META_NAME,
 	classifyCatalogKey,
 	type CatalogEntryKind,
 	buildFullScanBounds,

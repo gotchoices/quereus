@@ -32,15 +32,37 @@ import {
 	buildMetaCatalogKey,
 	buildMaterializedViewCatalogKey,
 	CLEAN_SHUTDOWN_META_NAME,
+	STALE_MVS_META_NAME,
+	type AtomicBatch,
+	type KVStore,
 	type KVStoreProvider,
 	type RehydrationResult,
 } from '../src/index.js';
 
-function createPersistentProvider(): KVStoreProvider & {
+type PersistentProvider = KVStoreProvider & {
 	stores: Map<string, InMemoryKVStore>;
 	_hardClose: () => void;
-} {
-	const stores = new Map<string, InMemoryKVStore>();
+};
+
+/**
+ * A persistent in-memory provider mirroring `view-mv-persistence.spec.ts`: byte
+ * maps whose `closeStore`/`closeAll` are no-ops, so a logical `StoreModule.closeAll()`
+ * survives and a fresh module can reopen the same storage; skipping `closeAll()`
+ * therefore simulates a crash.
+ *
+ * `opts.atomic` additionally exposes `beginAtomicBatch` — the capability the adopt
+ * fast path's gate-5 drop hinges on (method PRESENCE is the gate, matching both the
+ * coordinator wiring and `rehydrateCatalog`'s check). The batch is faithfully
+ * all-or-nothing for these logical tests: in-memory has no torn-write crash, so
+ * applying the queued ops sequentially on `write()` is atomic enough; what matters is
+ * that the provider advertises the capability so rehydrate trusts the durable
+ * stale-MV set instead of the crash-losable clean-shutdown marker.
+ *
+ * `opts.stores` lets two providers share one byte-map — used to model a capability
+ * gained (upgrade) or lost (downgrade) BETWEEN sessions over the same on-disk store.
+ */
+function createPersistentProvider(opts?: { atomic?: boolean; stores?: Map<string, InMemoryKVStore> }): PersistentProvider {
+	const stores = opts?.stores ?? new Map<string, InMemoryKVStore>();
 	const getOrCreate = (key: string): InMemoryKVStore => {
 		let s = stores.get(key);
 		if (!s) {
@@ -48,6 +70,22 @@ function createPersistentProvider(): KVStoreProvider & {
 			stores.set(key, s);
 		}
 		return s;
+	};
+
+	const beginAtomicBatch = (): AtomicBatch => {
+		const ops: Array<{ store: KVStore; key: Uint8Array; value?: Uint8Array }> = [];
+		return {
+			put(store, key, value) { ops.push({ store, key, value }); },
+			delete(store, key) { ops.push({ store, key }); },
+			async write() {
+				for (const op of ops) {
+					if (op.value !== undefined) await op.store.put(op.key, op.value);
+					else await op.store.delete(op.key);
+				}
+				ops.length = 0;
+			},
+			clear() { ops.length = 0; },
+		};
 	};
 
 	return {
@@ -72,6 +110,7 @@ function createPersistentProvider(): KVStoreProvider & {
 			stores.delete(`${schemaName}.${tableName}`);
 			for (const i of indexNames) stores.delete(`${schemaName}.${tableName}_idx_${i}`);
 		},
+		...(opts?.atomic ? { beginAtomicBatch } : {}),
 		_hardClose() {
 			for (const s of stores.values()) void s.close();
 			stores.clear();
@@ -115,6 +154,26 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 	async function markerPresent(): Promise<boolean> {
 		const catalog = await provider.getCatalogStore();
 		return (await catalog.get(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME))) !== undefined;
+	}
+
+	/** Raw clean-shutdown marker value, or undefined when absent. */
+	async function markerValue(): Promise<string | undefined> {
+		const catalog = await provider.getCatalogStore();
+		const raw = await catalog.get(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME));
+		return raw ? new TextDecoder().decode(raw) : undefined;
+	}
+
+	/** Raw durable stale-MV set value, or undefined when absent. */
+	async function durableStaleValue(): Promise<string | undefined> {
+		const catalog = await provider.getCatalogStore();
+		const raw = await catalog.get(buildMetaCatalogKey(STALE_MVS_META_NAME));
+		return raw ? new TextDecoder().decode(raw) : undefined;
+	}
+
+	/** Delete the durable stale-MV set entry (simulate a pre-ticket store / old code). */
+	async function deleteDurableStale(): Promise<void> {
+		const catalog = await provider.getCatalogStore();
+		await catalog.delete(buildMetaCatalogKey(STALE_MVS_META_NAME));
 	}
 
 	/** Standard first session: store source + store-backed MV (+ a plain view so
@@ -457,13 +516,6 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 	});
 
 	describe('stale-at-close exclusion', () => {
-		/** Read the raw clean-shutdown marker value, or undefined when absent. */
-		async function markerValue(): Promise<string | undefined> {
-			const catalog = await provider.getCatalogStore();
-			const raw = await catalog.get(buildMetaCatalogKey(CLEAN_SHUTDOWN_META_NAME));
-			return raw ? new TextDecoder().decode(raw) : undefined;
-		}
-
 		it('a stale-at-close MV refills even under a clean shutdown (structural alter + post-stale DML)', async () => {
 			const { db, mod } = open();
 			await db.exec('create table src (id integer primary key, v integer) using store');
@@ -664,6 +716,284 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 			}
 			expect(message).to.match(/already exists in module 'memory', not the MV's backing module 'store'/i);
 			expect(db.schemaManager.getTable('main', 'mv')!.vtabModuleName, 'squatter untouched').to.equal('memory');
+		});
+	});
+
+	// A provider WITHOUT `beginAtomicBatch` (the default here) keeps gate 5 exactly as
+	// before: the durable stale-set entry is written (closeAll/listener) but IGNORED at
+	// rehydrate — the clean-shutdown marker alone governs trust. This is the downgrade
+	// direction (a store written with the capability, reopened without it) and the parity
+	// guarantee for any minimal provider.
+	it('without beginAtomicBatch the durable stale-set is ignored — the marker governs (downgrade/parity)', async () => {
+		const { db, mod } = open();
+		await db.exec('create table src (id integer primary key, v integer) using store');
+		await db.exec('insert into src values (1, 10)');
+		await db.exec('create materialized view mv using store as select id, v from src');
+		// Flush the incrementally-written durable stale-set ([]) WITHOUT a clean close.
+		await mod.whenCatalogPersisted();
+		expect(await durableStaleValue(), 'durable stale-set present and empty').to.equal('[]');
+		expect(await markerPresent(), 'no marker (crash)').to.equal(false);
+		await plantSentinel('main.mv', [99, 990]);
+
+		const { db: db2, result } = await reopen();
+		expect(result.errors).to.have.lengthOf(0);
+		// No capability ⇒ marker path ⇒ no marker ⇒ refill, even though the durable set
+		// says nothing is stale. The sentinel is scrubbed.
+		expect(await rows(db2, 'select id from mv where id = 99'), 'durable set ignored without capability — refilled')
+			.to.deep.equal([]);
+	});
+
+	describe('atomic-commit domain (gate 5 dropped for same-module backings)', () => {
+		// Override the shared provider with an atomic-capable one (exposes beginAtomicBatch).
+		// Mocha runs this AFTER the parent beforeEach, so it replaces the non-atomic default;
+		// the parent afterEach still tears the (replaced) provider down.
+		beforeEach(() => { provider = createPersistentProvider({ atomic: true }); });
+
+		/** A session that creates a store source + store-backed MV WITHOUT a clean close
+		 *  (a crash): flushes the durable stale-set, leaves no marker. */
+		async function crashAfterSeed(): Promise<void> {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			await db.exec('create materialized view mv using store as select id, v from src');
+			await mod.whenCatalogPersisted();
+		}
+
+		it('a non-stale backing adopts across a crash with NO marker — gate 4 alone governs', async () => {
+			await crashAfterSeed();
+			expect(await markerPresent(), 'no marker without closeAll (a crash)').to.equal(false);
+			expect(await durableStaleValue(), 'durable stale-set written incrementally: nothing stale').to.equal('[]');
+			await plantSentinel('main.mv', [99, 990]);
+
+			const { db, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(result.materializedViews).to.deep.equal(['main.mv']);
+			// Adopted despite the missing marker: the sentinel survives and serves — proof
+			// the body was NOT re-run (the crash-divergence window is closed by the atomic
+			// commit domain, so gate 4 alone governs).
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 99, v: 990 }]);
+			// Live maintenance is armed on the adopted backing.
+			await db.exec('insert into src values (3, 30)');
+			await db.exec('delete from src where id = 1');
+			expect(await rows(db, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 2, v: 20 }, { id: 3, v: 30 }, { id: 99, v: 990 }]);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale ?? false).to.equal(false);
+		});
+
+		it('a stale-at-close MV refills across a crash — driven by the durable stale-set, not the lost marker', async () => {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			await db.exec('create materialized view mv using store as select id, v from src');
+			// A shape-shifting structural ALTER on the projected column v stales mv and
+			// detaches its row-time maintenance.
+			await db.exec('alter table src alter column v drop not null');
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale, 'alter staled mv').to.equal(true);
+			// NOT propagated to the backing (maintenance detached) — the divergence.
+			await db.exec('insert into src (id, v) values (3, 30)');
+			await mod.whenCatalogPersisted();
+			expect(await markerPresent(), 'crash: no marker').to.equal(false);
+			expect(await durableStaleValue(), 'durable stale-set names mv').to.equal('["main.mv"]');
+			await plantSentinel('main.mv', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			// Refilled: sentinel + behind-backing scrubbed, post-stale row present. A stale
+			// adopt would have served [1,2,99]. Proves the LOGICAL-staleness window stays
+			// sound under the dropped gate.
+			expect(await rows(db2, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }]);
+			expect(db2.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale ?? false, 'refill cleared staleness')
+				.to.equal(false);
+		});
+
+		it('residual content-stale hole: a value-semantics ALTER on a read-only-in-WHERE column refills after a crash', async () => {
+			const { db, mod } = open();
+			await db.exec("create table src (id integer primary key, v integer, g text not null default 'keep') using store");
+			await db.exec("insert into src values (1, 10, 'keep'), (2, 20, 'keep')");
+			// `g` is read ONLY in the WHERE predicate, never projected → the projected
+			// backing shape is (id, v).
+			await db.exec("create materialized view mv using store as select id, v from src where g <> 'skip'");
+			// A collation change on `g` (a read column) is content-relevant but shape-stable:
+			// gate 2 (backingShapeMatches over (id, v)) passes, yet the engine declines the
+			// in-place recompile and marks mv stale. Pin the trigger (the specific hole).
+			await db.exec('alter table src alter column g set collate nocase');
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale,
+				'value-semantics ALTER on a read column staled mv (projected shape unchanged)').to.equal(true);
+			await mod.whenCatalogPersisted();
+			expect(await durableStaleValue(), 'durable stale-set names mv').to.equal('["main.mv"]');
+			await plantSentinel('main.mv', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			// Must REFILL (sentinel scrubbed): the durable stale-set closes the hole that
+			// gates 2/3/4 alone would have adopted straight through.
+			expect(await rows(db2, 'select id from mv where id = 99'), 'refilled — sentinel scrubbed').to.deep.equal([]);
+			expect(await rows(db2, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		});
+
+		it('capability present but no durable stale-set yet falls back to the marker path (upgrade)', async () => {
+			// A clean close writes BOTH the marker and the stale-set; delete the stale-set to
+			// model a store written by pre-ticket code (capability gained on reopen, no entry).
+			await seedSession();
+			await deleteDurableStale();
+			expect(await durableStaleValue(), 'no stale-set entry (old store)').to.be.undefined;
+			expect(await markerPresent(), 'marker present from the clean close').to.equal(true);
+			await plantSentinel('main.mv', [99, 990]);
+
+			const { db, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			// Adopts via the marker fallback (clean shutdown, not stale-at-close).
+			expect(await rows(db, 'select id from mv where id = 99'), 'adopted via the marker fallback')
+				.to.deep.equal([{ id: 99 }]);
+		});
+
+		it('a stale-then-refreshed MV adopts across a crash (refresh cleared it from the durable set)', async () => {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			await db.exec('create materialized view mv using store as select id, v from src');
+			await db.exec('alter table src alter column v drop not null'); // stale
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale).to.equal(true);
+			await db.exec('refresh materialized view mv'); // re-materialize + re-arm, clears stale
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale ?? false).to.equal(false);
+			await db.exec('insert into src (id, v) values (3, 30)'); // maintained into the backing again
+			await mod.whenCatalogPersisted();
+			expect(await durableStaleValue(), 'refresh recomputed the durable set to empty').to.equal('[]');
+			expect(await markerPresent(), 'crash: no marker').to.equal(false);
+			await plantSentinel('main.mv', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			// Adopted: the now-healthy backing's sentinel survives (a refill would scrub it).
+			expect(await rows(db2, 'select id, v from mv order by id'))
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }, { id: 3, v: 30 }, { id: 99, v: 990 }]);
+		});
+
+		it('MV-over-MV: a stale upstream forces both to refill across a crash (cascade in the durable set)', async () => {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			await db.exec('create materialized view mv1 using store as select id, v from src');
+			await db.exec('create materialized view mv2 using store as select id, v from mv1');
+			// A body-relevant ALTER on mv1's source stales mv1; the backing-invalidation
+			// cascade (synthetic table_modified on mv1) stales mv2 too.
+			await db.exec('alter table src alter column v drop not null');
+			expect(db.schemaManager.getMaintainedTable('main', 'mv1')!.derivation.stale, 'mv1 stale').to.equal(true);
+			expect(db.schemaManager.getMaintainedTable('main', 'mv2')!.derivation.stale, 'mv2 stale (cascade)').to.equal(true);
+			await mod.whenCatalogPersisted();
+			expect(JSON.parse((await durableStaleValue())!), 'both MVs in the durable set')
+				.to.have.members(['main.mv1', 'main.mv2']);
+			expect(await markerPresent(), 'crash: no marker').to.equal(false);
+			await plantSentinel('main.mv1', [98, 980]);
+			await plantSentinel('main.mv2', [99, 990]);
+
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db2, 'select id, v from mv1 order by id'), 'upstream refilled')
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+			expect(await rows(db2, 'select id, v from mv2 order by id'), 'dependent refilled')
+				.to.deep.equal([{ id: 1, v: 10 }, { id: 2, v: 20 }]);
+		});
+
+		it('listener ordering: a source ALTER\'s stale flag is visible in the persisted durable stale-set', async () => {
+			// The engine MV manager subscribes in the Database constructor — before the
+			// store's lazy subscription — so its listener runs first and the store's
+			// recompute observes the already-updated stale flags. Asserted end-to-end: the
+			// durable entry written DURING the ALTER event names the just-staled MV.
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10)');
+			await db.exec('create materialized view mv using store as select id, v from src');
+			await mod.whenCatalogPersisted();
+			expect(await durableStaleValue(), 'nothing stale yet').to.equal('[]');
+
+			await db.exec('alter table src alter column v drop not null');
+			await mod.whenCatalogPersisted();
+			expect(await durableStaleValue(), 'the ALTER event observed the post-transition stale flag')
+				.to.equal('["main.mv"]');
+		});
+
+		it('a memory-backed MV named in the durable stale-set is harmless (always refills)', async () => {
+			const { db, mod } = open();
+			// A store source establishes persistence; the MV itself is MEMORY-hosted.
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10)');
+			await db.exec('create materialized view memmv as select id, v from src');
+			await db.exec('alter table src alter column v drop not null'); // stales memmv
+			expect(db.schemaManager.getMaintainedTable('main', 'memmv')!.derivation.stale).to.equal(true);
+			await mod.whenCatalogPersisted();
+			expect(JSON.parse((await durableStaleValue())!), 'memory MV named in the durable set')
+				.to.include('main.memmv');
+
+			// Reopen: a memory MV has no phase-1 durable backing, so withholding trust is a
+			// no-op — it refills from the (store-persisted) source regardless.
+			const { db: db2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db2, 'select id, v from memmv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
+		});
+
+		it('rename-restore conservatism: a no-event clear yields a sound (wasteful) refill across a crash', async () => {
+			const { db, mod } = open();
+			await db.exec('create table src (id integer primary key, v integer) using store');
+			await db.exec('insert into src values (1, 10), (2, 20)');
+			// A `select *` body follows a source column rename (pure name shift).
+			await db.exec('create materialized view mv using store as select * from src');
+			await mod.whenCatalogPersisted();
+			expect(await durableStaleValue(), 'nothing stale yet').to.equal('[]');
+
+			// The rename stales mv DURING the event (the store writes the durable name),
+			// then restoreUnaffectedMaterializedViews restores it — firing NO clear event.
+			await db.exec('alter table src rename column v to v2');
+			await mod.whenCatalogPersisted();
+			expect(db.schemaManager.getMaintainedTable('main', 'mv')!.derivation.stale ?? false, 'restored live')
+				.to.equal(false);
+			expect(await durableStaleValue(), 'durable set over-names the restored MV (the clear fired no event)')
+				.to.equal('["main.mv"]');
+			expect(await markerPresent(), 'crash: no marker').to.equal(false);
+
+			// Reopen across the crash: the durable set names mv → conservative refill.
+			// Wasteful (the backing was actually current) but SOUND — content matches the body.
+			const { db: db2, mod: mod2, result } = await reopen();
+			expect(result.errors).to.have.lengthOf(0);
+			expect(await rows(db2, 'select id, v2 from mv order by id'), 'refill is sound (correct content)')
+				.to.deep.equal([{ id: 1, v2: 10 }, { id: 2, v2: 20 }]);
+
+			// The next clean close recomputes the drift away (mv is not stale at close).
+			await mod2.closeAll();
+			expect(await durableStaleValue(), 'clean close corrected the over-naming').to.equal('[]');
+		});
+
+		it('catalog fixed point: clean atomic-domain reopen cycles converge to identical catalog bytes', async () => {
+			// In the atomic domain, the durable stale-set ([]) makes every clean reopen adopt.
+			// Two clean adopt+close cycles must leave byte-identical catalog — including the
+			// new meta entries (marker + durable stale-set). (The adopt-vs-refill byte parity
+			// is covered by the non-atomic 'catalog fixed point' test above.)
+			await seedSession();
+
+			const snapshot = async (): Promise<Array<[string, string]>> => {
+				const catalog = await provider.getCatalogStore();
+				const dec = new TextDecoder();
+				const out: Array<[string, string]> = [];
+				for await (const e of catalog.iterate({ gte: new Uint8Array(0), lt: new Uint8Array([0xff]) })) {
+					out.push([Array.from(e.key).join(','), dec.decode(e.value)]);
+				}
+				return out;
+			};
+
+			const first = await reopen();
+			expect(first.result.errors).to.have.lengthOf(0);
+			await first.mod.closeAll();
+			const afterFirst = await snapshot();
+
+			const second = await reopen();
+			expect(second.result.errors).to.have.lengthOf(0);
+			await second.mod.closeAll();
+			const afterSecond = await snapshot();
+
+			expect(afterFirst, 'two clean adopt sessions converge to identical catalog bytes').to.deep.equal(afterSecond);
 		});
 	});
 });
