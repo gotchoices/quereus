@@ -82,7 +82,13 @@
  * adapter collects it in `result.errors` (it keeps applying other tables), and
  * the consumer treats any non-empty `errors` like a whole-batch throw — emit
  * `status:'error'`, leave CRDT metadata uncommitted, re-resolve next sync.
- * Re-application is idempotent (value-identical upserts suppress).
+ * Re-application is idempotent (value-identical upserts suppress). "Orthogonal"
+ * (above) means the two outcomes are independent facts, NOT that a co-occurring
+ * violation is dropped: when ONE batch carries both a per-change error and a
+ * reported violation, the violation's row already committed in report mode, so
+ * the consumer surfaces the `onAssertionViolation` event BEFORE the per-change
+ * abort throws (see admission.ts `applyDataToStore`). The abort still blocks the
+ * metadata commit and the batch still re-resolves.
  *
  * Constraints (see docs/materialized-views.md § External row-change
  * ingestion): the callback is host-driven — never invoke it from within

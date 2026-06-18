@@ -520,6 +520,76 @@ describe('store-adapter seam integration', () => {
 			expect(relayedAfter.flatMap(cs => cs.changes)).to.have.length(2);
 		});
 
+		it('a reported assertion violation is emitted BEFORE the co-occurring per-change abort throws', async () => {
+			// The mixed batch: change B (`t` v=-5) resolves and trips `non_negative`
+			// while change A (`no_such_table`) is a per-change storage failure. B's
+			// report-mode seam COMMITS its row + MV delta durably, then the per-change
+			// `errors` abort throws to block the metadata commit. The violation event
+			// MUST fire before that throw — otherwise the retry's value-identical
+			// suppression (empty seam batch → no assertion re-eval) means the host is
+			// NEVER notified about durably-committed violating data.
+			await db.exec('create table t (id text primary key, v integer) using store');
+			await db.exec('create materialized view mv as select id, v from t');
+			await db.exec('create assertion non_negative check (not exists (select 1 from t where v < 0))');
+
+			const syncEvents = new SyncEventEmitterImpl();
+			const violations: AssertionViolationEvent[] = [];
+			syncEvents.onAssertionViolation(e => violations.push(e));
+			const syncManager = await makeSyncManager(syncEvents);
+
+			const remoteSiteId = generateSiteId();
+			const remoteHLC = new HLCManager(remoteSiteId);
+			// One change set: a resolvable-but-violating `t` change and an
+			// unresolvable `no_such_table` change. Built once, reused across both
+			// attempts so the HLCs stay stable.
+			const changeSets = [{
+				siteId: remoteSiteId,
+				transactionId: 'tx1',
+				hlc: remoteHLC.tick(),
+				changes: [
+					{ type: 'column' as const, schema: 'main', table: 't', pk: ['x'], column: 'v', value: -5, hlc: remoteHLC.tick() },
+					{ type: 'column' as const, schema: 'main', table: 'no_such_table', pk: ['k'], column: 'v', value: 'b', hlc: remoteHLC.tick() },
+				],
+				schemaMigrations: [],
+			}];
+
+			// First attempt: `no_such_table` fails → the abort throws, but the
+			// violation event fired first.
+			let thrown: unknown;
+			try {
+				await syncManager.applyChanges(changeSets);
+			} catch (e) {
+				thrown = e;
+			}
+			expect(String(thrown)).to.contain('no_such_table');
+			expect((thrown as Error).message).to.contain('apply-to-store failed for');
+
+			// The violation surfaced BEFORE the throw (the regression this closes).
+			expect(violations).to.have.length(1);
+			expect(violations[0].assertion).to.equal('non_negative');
+			expect(violations[0].samples.length).to.be.greaterThan(0);
+
+			// B's row landed durably and the MV converged — the report-mode seam
+			// committed despite the per-change abort blocking the metadata commit.
+			expect((await collect(db, 'select v from t')).map(r => Number(r.v))).to.deep.equal([-5]);
+			expect((await collect(db, 'select v from mv')).map(r => Number(r.v))).to.deep.equal([-5]);
+
+			// No CRDT metadata committed — nothing relays after the abort.
+			const relayed = await syncManager.getChangesSince(generateSiteId());
+			expect(relayed.flatMap(cs => cs.changes)).to.have.length(0);
+
+			// Resolve A and re-apply the SAME change set: both apply, metadata
+			// commits, both relay. B is now value-identical (its row already
+			// committed) → suppressed → empty seam contribution → `non_negative` is
+			// NOT re-evaluated, so the violation does NOT double-fire.
+			await db.exec('create table no_such_table (id text primary key, v text) using store');
+			const retry = await syncManager.applyChanges(changeSets);
+			expect(retry.applied).to.equal(2);
+			const relayedAfter = await syncManager.getChangesSince(generateSiteId());
+			expect(relayedAfter.flatMap(cs => cs.changes)).to.have.length(2);
+			expect(violations, 'no double-fire on value-identical retry').to.have.length(1);
+		});
+
 		it('applySnapshot: an unresolvable table throws before clearing/rewriting metadata', async () => {
 			const syncEvents = new SyncEventEmitterImpl();
 			const syncManager = await makeSyncManager(syncEvents);

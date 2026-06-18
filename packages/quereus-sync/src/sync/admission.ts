@@ -27,20 +27,33 @@ import { persistHLCState, throwIfApplyErrors, toError } from './sync-context.js'
 
 /**
  * Data-first half of the admission invariant: apply this unit's data + schema to
- * the store, emit `status:'error'` and rethrow on a whole-batch throw, then abort
- * (throw) on any per-change `ApplyToStoreResult.errors` — all BEFORE the caller
- * commits any CRDT metadata. No-op when there is no `applyToStore` callback or
- * nothing to apply.
+ * the store, emit `status:'error'` and rethrow on a whole-batch throw, surface any
+ * reported assertion violations, then abort (throw) on any per-change
+ * `ApplyToStoreResult.errors` — all BEFORE the caller commits any CRDT metadata.
+ * No-op when there is no `applyToStore` callback or nothing to apply.
  *
  * The two failure shapes are mutually exclusive (a throw never reaches
- * `throwIfApplyErrors`), so `status:'error'` is emitted at most once.
+ * `throwIfApplyErrors`), so `status:'error'` is emitted at most once. The
+ * violation emit does not touch sync-state, so it cannot affect that invariant.
  *
- * On the SUCCESS branch (no throw, no per-change errors), any commit-time
- * global-assertion violations the seam reported (`result.assertionViolations`,
- * collected under the adapter's report mode) are surfaced to the host as
- * `onAssertionViolation` events. The data has already converged — these events
- * are informational (detect-and-notify) and do NOT abort the apply or block the
- * metadata commit that follows.
+ * Assertion violations are emitted BEFORE the per-change abort gate. Whenever the
+ * seam reports a violation it ran in REPORT mode and the batch already COMMITTED —
+ * the violating row's data + derived effects (MV deltas, watch capture) are
+ * durably in storage. A later `throwIfApplyErrors` throw blocks only the CRDT-
+ * metadata commit; it does NOT roll back those storage writes. So a reported
+ * violation is a fact about already-committed data and must be surfaced even when
+ * an unrelated per-change error aborts the batch in the same invocation — the two
+ * facts are orthogonal: "B's data landed and broke a local invariant" and "the
+ * batch can't fully admit because A failed and will retry" are both true.
+ *
+ * Emitting before the abort closes a permanent-notification-loss gap: were the
+ * emit on the success branch only, a mixed batch (per-change error + reported
+ * violation) would throw past it, drop the event, and on retry the value-identical
+ * row is suppressed → empty seam batch → the assertion is never re-evaluated →
+ * the host is never notified about durably-committed violating data. That same
+ * value-identical suppression now correctly prevents DOUBLE-notification on retry
+ * (B is suppressed, so no second event fires), matching the idempotent-re-apply
+ * guarantee. On the pure-success path (no per-change errors) behavior is unchanged.
  */
 export async function applyDataToStore(
 	ctx: SyncContext,
@@ -60,16 +73,11 @@ export async function applyDataToStore(
 		throw error;
 	}
 
-	// Per-change storage failures (the adapter collects rather than throws) abort
-	// the apply identically to a whole-batch throw: emit error + throw, with no
-	// metadata committed, so the whole batch re-resolves and re-applies
-	// idempotently on the next sync. See throwIfApplyErrors / docs/sync.md.
-	throwIfApplyErrors(ctx, result);
-
-	// Success branch only (after the abort gate above): the apply converged. If
-	// the seam reported any local assertion violations over the merged state,
-	// notify the host once per violated assertion. Convergence is NOT aborted —
-	// the data landed and the metadata commit proceeds.
+	// Surface any local assertion violations the seam reported. A reported
+	// violation means the report-mode seam COMMITTED the violating row (data +
+	// derived effects durable); we notify the host once per violated assertion.
+	// This runs BEFORE the abort gate below so a co-occurring per-change error
+	// cannot drop the notification about data that is already committed.
 	if (result.assertionViolations) {
 		for (const violation of result.assertionViolations) {
 			ctx.syncEvents.emitAssertionViolation({
@@ -78,6 +86,12 @@ export async function applyDataToStore(
 			});
 		}
 	}
+
+	// Per-change storage failures (the adapter collects rather than throws) abort
+	// the apply identically to a whole-batch throw: emit error + throw, with no
+	// metadata committed, so the whole batch re-resolves and re-applies
+	// idempotently on the next sync. See throwIfApplyErrors / docs/sync.md.
+	throwIfApplyErrors(ctx, result);
 }
 
 /**
