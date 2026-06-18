@@ -132,6 +132,21 @@ export interface DatabaseInternal {
 	getConnectionsForTable(tableName: string): VirtualTableConnection[];
 
 	/**
+	 * Removes all active connections for a specific table, bypassing the implicit
+	 * transaction deferral that {@link unregisterConnection} honours.
+	 *
+	 * Use only when the table's connections are definitively stale — on drop, or
+	 * after a module rename has DDL-committed and disposed the old incarnation — so
+	 * a recreated/renamed same-named table never reuses a dead connection. The
+	 * engine calls this from the drop path; modules whose rename is not covered by
+	 * the generic rename path (which does not evict) call it themselves.
+	 *
+	 * @param schemaName The schema of the table
+	 * @param tableName The unqualified table name
+	 */
+	removeConnectionsForTable(schemaName: string, tableName: string): void;
+
+	/**
 	 * Gets all active connections.
 	 *
 	 * @returns Array of all active connections

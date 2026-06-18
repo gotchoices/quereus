@@ -118,4 +118,29 @@ describe('store connection name leak (drop/recreate must not grow activeConnecti
 
 		await db.close();
 	});
+
+	it('connections are evicted on rename (no orphan per rename)', async () => {
+		const db = new Database();
+		db.registerModule('store', new StoreModule(provider, events));
+
+		// A long-lived sibling keeps baseline > 0 and one live ping-pong table.
+		await db.exec(`create table keep (id integer primary key) using store`);
+		await db.exec(`insert into keep values (1)`);
+		await db.exec(`create table a (id integer primary key, v integer) using store`);
+
+		const baseline = (db as unknown as DbWithConnections).getAllConnections().length;
+
+		// Ping-pong rename a<->b, writing after each so the fresh instance attaches a
+		// connection. Without the rename-side eviction this grows +1 per rename.
+		for (let i = 0; i < 6; i++) {
+			const from = i % 2 === 0 ? 'a' : 'b';
+			const to = i % 2 === 0 ? 'b' : 'a';
+			await db.exec(`insert into ${from} values (${i + 2}, ${i})`);
+			await db.exec(`alter table ${from} rename to ${to}`);
+		}
+
+		expect((db as unknown as DbWithConnections).getAllConnections().length).to.equal(baseline);
+
+		await db.close();
+	});
 });

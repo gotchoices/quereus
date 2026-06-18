@@ -15,6 +15,7 @@
 
 import type {
 	Database,
+	DatabaseInternal,
 	TableSchema,
 	TableIndexSchema,
 	UniqueConstraintSchema,
@@ -1696,6 +1697,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		this.stores.delete(oldKey);
 		// The coordinator is module-wide (flushed above); it is not per-table, so
 		// it is not evicted here.
+
+		// Evict the disposed instance's registered engine connection. It is bound to
+		// the OLD qualified name and its owning StoreTable is now disposed, so it is
+		// definitively stale. Unlike drop — where the engine's schema manager calls
+		// `removeConnectionsForTable` for us — the generic rename path
+		// (`alter-table.ts` renameTableImpl) does NOT, so the store must evict it
+		// here or the connection leaks one per rename. Safe because the module
+		// DDL-commit above already flushed its pending ops (no uncommitted writes to
+		// lose).
+		(db as DatabaseInternal).removeConnectionsForTable(schemaName, oldName);
 
 		// Move physical storage (data directory + index directories).
 		if (this.provider.renameTableStores) {
