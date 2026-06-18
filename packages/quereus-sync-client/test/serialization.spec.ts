@@ -296,7 +296,10 @@ describe('Serialization', () => {
         schemaMigrations: [],
       };
 
-      const result = deserializeChangeSet(serializeChangeSet(cs));
+      // Route through actual JSON.stringify/parse — the real wire hop — so a value
+      // that slipped through unencoded (a raw bigint/Uint8Array) would throw or
+      // corrupt here rather than pass silently on an in-process object.
+      const result = deserializeChangeSet(JSON.parse(JSON.stringify(serializeChangeSet(cs))));
       const blobChange = result.changes[0];
       const bigChange = result.changes[1];
       if (blobChange.type === 'column') {
@@ -305,6 +308,8 @@ describe('Serialization', () => {
         expect(blobChange.priorHlc).to.not.be.undefined;
         expect(blobChange.priorHlc!.wallTime).to.equal(BigInt(1234567890));
         expect(blobChange.priorHlc!.counter).to.equal(7);
+        // The before-image HLC's per-transaction sub-order survives the wire too.
+        expect(blobChange.priorHlc!.opSeq).to.equal(3);
       }
       if (bigChange.type === 'column') {
         expect(bigChange.priorValue).to.equal(9007199254740993n);
@@ -328,7 +333,7 @@ describe('Serialization', () => {
         schemaMigrations: [],
       };
 
-      const result = deserializeChangeSet(serializeChangeSet(cs));
+      const result = deserializeChangeSet(JSON.parse(JSON.stringify(serializeChangeSet(cs))));
       const del = result.changes[0];
       if (del.type === 'delete') {
         expect(del.priorRow).to.not.be.undefined;
