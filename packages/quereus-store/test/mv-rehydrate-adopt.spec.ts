@@ -720,27 +720,61 @@ describe('materialized-view adopt-without-refill at rehydrate', () => {
 	});
 
 	// A provider WITHOUT `beginAtomicBatch` (the default here) keeps gate 5 exactly as
-	// before: the durable stale-set entry is written (closeAll/listener) but IGNORED at
-	// rehydrate — the clean-shutdown marker alone governs trust. This is the downgrade
-	// direction (a store written with the capability, reopened without it) and the parity
-	// guarantee for any minimal provider.
-	it('without beginAtomicBatch the durable stale-set is ignored — the marker governs (downgrade/parity)', async () => {
+	// before: it NEVER writes the durable stale-set (the write is gated on the capability —
+	// the set's sole reader/truster is an atomic provider, so a non-atomic session writing
+	// it would be useless and a soundness hazard for a later atomic reopen). The
+	// clean-shutdown marker alone governs trust — the parity guarantee for any minimal
+	// provider.
+	it('without beginAtomicBatch the durable stale-set is never written — the marker governs (parity)', async () => {
 		const { db, mod } = open();
 		await db.exec('create table src (id integer primary key, v integer) using store');
 		await db.exec('insert into src values (1, 10)');
 		await db.exec('create materialized view mv using store as select id, v from src');
-		// Flush the incrementally-written durable stale-set ([]) WITHOUT a clean close.
+		// Drain the persist queue WITHOUT a clean close: a non-atomic provider enqueues no
+		// durable-set write at all, so the entry stays absent.
 		await mod.whenCatalogPersisted();
-		expect(await durableStaleValue(), 'durable stale-set present and empty').to.equal('[]');
+		expect(await durableStaleValue(), 'non-atomic provider never writes the durable set').to.be.undefined;
 		expect(await markerPresent(), 'no marker (crash)').to.equal(false);
 		await plantSentinel('main.mv', [99, 990]);
 
 		const { db: db2, result } = await reopen();
 		expect(result.errors).to.have.lengthOf(0);
-		// No capability ⇒ marker path ⇒ no marker ⇒ refill, even though the durable set
-		// says nothing is stale. The sentinel is scrubbed.
-		expect(await rows(db2, 'select id from mv where id = 99'), 'durable set ignored without capability — refilled')
+		// No capability ⇒ marker path ⇒ no marker ⇒ refill. The sentinel is scrubbed.
+		expect(await rows(db2, 'select id from mv where id = 99'), 'no capability ⇒ marker path ⇒ refilled')
 			.to.deep.equal([]);
+	});
+
+	// The genuine DOWNGRADE direction the comment above only gestured at: a store WRITTEN by
+	// an atomic session (durable set present on disk) then REOPENED by a non-atomic provider
+	// over the same byte-map. The non-atomic reopen must IGNORE the on-disk set and fall back
+	// to the marker — proving the read is gated, not just the write.
+	it('an atomic-written durable set is ignored when reopened non-atomic — the marker governs (true downgrade)', async () => {
+		const shared = new Map<string, InMemoryKVStore>();
+		// Session 1: atomic provider, clean close ⇒ writes BOTH the marker and the durable set.
+		const atomicProvider = createPersistentProvider({ atomic: true, stores: shared });
+		const mod1 = new StoreModule(atomicProvider);
+		const db1 = new Database();
+		db1.registerModule('store', mod1);
+		await db1.exec('create table src (id integer primary key, v integer) using store');
+		await db1.exec('insert into src values (1, 10)');
+		await db1.exec('create materialized view mv using store as select id, v from src');
+		await mod1.closeAll();
+		// The atomic session left the durable set on disk.
+		const catalog1 = await atomicProvider.getCatalogStore();
+		expect((await catalog1.get(buildMetaCatalogKey(STALE_MVS_META_NAME))) !== undefined,
+			'atomic clean close wrote the durable set').to.equal(true);
+
+		// Session 2: NON-atomic provider over the SAME byte-map. The marker (from the clean
+		// close) governs; the on-disk durable set is not consulted. Adopts via the marker.
+		const plainProvider = createPersistentProvider({ stores: shared });
+		const mod2 = new StoreModule(plainProvider);
+		const db2 = new Database();
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors).to.have.lengthOf(0);
+		// Marker present from the clean close ⇒ non-stale MV adopts (live-at-close).
+		expect(await rows(db2, 'select id, v from mv order by id')).to.deep.equal([{ id: 1, v: 10 }]);
+		await mod2.closeAll();
 	});
 
 	describe('atomic-commit domain (gate 5 dropped for same-module backings)', () => {

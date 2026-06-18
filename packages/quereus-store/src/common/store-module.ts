@@ -167,9 +167,24 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 */
 	private lastPersistedStaleMvs: string | undefined;
 
+	/**
+	 * Whether the provider exposes an atomic cross-store commit domain
+	 * ({@link KVStoreProvider.beginAtomicBatch}) — the capability the MV adopt fast
+	 * path's gate-5 drop hinges on. Fixed for the provider's lifetime, so cached at
+	 * construction (and used as the single gate for both writing AND reading the durable
+	 * stale-MV set). Gating the **write** on it is load-bearing for soundness, not just an
+	 * fsync saving: only an atomic-capable session — whose commits can never tear a source
+	 * from its same-module backing — ever writes the durable set, so the set a later atomic
+	 * session reads was necessarily written under that same no-tear guarantee. A persistent
+	 * non-atomic provider therefore can never leave a torn-but-"not-stale" set for an atomic
+	 * reopen to trust (it writes none); such a store falls back to the clean-shutdown marker.
+	 */
+	private readonly atomicProvider: boolean;
+
 	constructor(provider: KVStoreProvider, eventEmitter?: StoreEventEmitter) {
 		this.provider = provider;
 		this.eventEmitter = eventEmitter;
+		this.atomicProvider = typeof provider.beginAtomicBatch === 'function';
 	}
 
 	/**
@@ -2171,15 +2186,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// store-table create/connect to establish the subscription.)
 		this.ensureSchemaSubscription(db);
 
-		// Capability check (method presence — matching the coordinator's own gate): an
+		// Capability gate (method presence — matching the coordinator's own gate): an
 		// atomic-commit provider commits a source write and its same-module backing in
 		// one all-or-nothing batch, so a crash can no longer tear them apart (the
 		// crash-divergence window gate 5 historically guarded). In that domain, gate 4
 		// alone governs same-module backings and a non-stale backing adopts after a crash
 		// too — the LOGICAL-staleness window is closed instead by the durable stale-MV
-		// set, which (unlike the clean-shutdown marker) survives a crash.
-		const atomic = typeof this.provider.beginAtomicBatch === 'function';
-		const durableStale = await this.readDurableStaleMvSet();
+		// set, which (unlike the clean-shutdown marker) survives a crash. A non-atomic
+		// provider never writes the set (see {@link atomicProvider}), so skip the read.
+		const atomic = this.atomicProvider;
+		const durableStale = atomic ? await this.readDurableStaleMvSet() : { present: false } as const;
 
 		// Consume the clean-shutdown marker FIRST (before the catalog scan): in the
 		// non-atomic domain its presence is the adopt trust basis for this rehydration
@@ -2613,6 +2629,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * the ordering the adopt soundness argument depends on.
 	 */
 	private persistStaleMvSetIfChanged(): void {
+		// Only an atomic-capable session writes the durable set — it is the sole reader and
+		// trust basis (see {@link atomicProvider}); a non-atomic session's trust basis is the
+		// clean-shutdown marker, so writing the set there is both useless and a soundness
+		// hazard (it could be trusted by a later atomic reopen). Skip before recomputing.
+		if (!this.atomicProvider) return;
 		const json = JSON.stringify(this.computeStaleMvSet());
 		if (json === this.lastPersistedStaleMvs) return;
 		this.lastPersistedStaleMvs = json;
@@ -2793,17 +2814,21 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			new TextEncoder().encode(JSON.stringify(staleAtClose)),
 		);
 
-		// Also write the DURABLE stale-MV set (persistent current-truth, NOT single-use).
-		// Same array as the marker payload, under a separate reserved meta key that the
-		// next open READS (never deletes). In the atomic-commit domain this — not the
-		// crash-losable marker — is the adopt fast path's logical-staleness exclusion
-		// basis, so a clean close (a) corrects any rename-restore drift (the one staleness
-		// CLEAR transition that fires no event) and (b) guarantees the entry exists even in
-		// a session with no staleness events. `provider.closeAll()` below flushes it.
-		await catalogStore.put(
-			buildMetaCatalogKey(STALE_MVS_META_NAME),
-			new TextEncoder().encode(JSON.stringify(staleAtClose)),
-		);
+		// Also write the DURABLE stale-MV set (persistent current-truth, NOT single-use) —
+		// but ONLY for an atomic provider, the sole reader/truster of it (see
+		// {@link atomicProvider}). Same array as the marker payload, under a separate
+		// reserved meta key that the next open READS (never deletes). In the atomic-commit
+		// domain this — not the crash-losable marker — is the adopt fast path's
+		// logical-staleness exclusion basis, so a clean close (a) corrects any rename-restore
+		// drift (the one staleness CLEAR transition that fires no event) and (b) guarantees
+		// the entry exists even in a session with no staleness events. `provider.closeAll()`
+		// below flushes it.
+		if (this.atomicProvider) {
+			await catalogStore.put(
+				buildMetaCatalogKey(STALE_MVS_META_NAME),
+				new TextEncoder().encode(JSON.stringify(staleAtClose)),
+			);
+		}
 
 		await this.provider.closeAll();
 		this.stores.clear();
