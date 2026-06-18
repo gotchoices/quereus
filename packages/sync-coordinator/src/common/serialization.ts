@@ -17,6 +17,7 @@ import {
 	decodeSqlValue,
 	type ChangeSet,
 	type ColumnChange,
+	type RowDeletion,
 	type SnapshotChunk,
 } from '@quereus/sync';
 
@@ -38,9 +39,32 @@ export function serializeChangeSet(cs: ChangeSet): object {
 				hlc: Buffer.from(serializeHLC(c.hlc)).toString('base64'),
 			};
 			if (c.type === 'column') {
-				return { ...base, column: (c as ColumnChange).column, value: encodeSqlValue((c as ColumnChange).value) };
+				const cc = c as ColumnChange;
+				return {
+					...base,
+					column: cc.column,
+					value: encodeSqlValue(cc.value),
+					// Carry the per-cell before-image (value + HLC) present-only: write both
+					// together gated on priorHlc, never a phantom key. priorHlc reuses the same
+					// base64-binary HLC encoding as `hlc`; priorValue rides encodeSqlValue.
+					...(cc.priorHlc !== undefined
+						? {
+								priorValue: encodeSqlValue(cc.priorValue ?? null),
+								priorHlc: Buffer.from(serializeHLC(cc.priorHlc)).toString('base64'),
+							}
+						: {}),
+				};
 			}
-			return base;
+			const rd = c as RowDeletion;
+			return {
+				...base,
+				// Carry the row before-image present-only. An empty array is present:
+				// [].map(...) is still [] and [] !== undefined, so the conditional spread
+				// preserves the empty-present vs absent boundary.
+				...(rd.priorRow !== undefined
+					? { priorRow: rd.priorRow.map(v => encodeSqlValue(v)) }
+					: {}),
+			};
 		}),
 		schemaMigrations: cs.schemaMigrations.map(m => ({
 			...m,
@@ -151,9 +175,26 @@ export function deserializeChangeSet(cs: unknown): ChangeSet {
 				hlc: deserializeHLC(Buffer.from(c.hlc as string, 'base64')),
 			};
 			if (c.type === 'column') {
-				return { ...base, column: c.column, value: decodeSqlValue(c.value) };
+				return {
+					...base,
+					column: c.column,
+					value: decodeSqlValue(c.value),
+					// Mirror serialize: attach the before-image only when the serialized
+					// object carries it, so absent stays absent (not a phantom undefined).
+					...(c.priorHlc !== undefined
+						? {
+								priorValue: decodeSqlValue(c.priorValue),
+								priorHlc: deserializeHLC(Buffer.from(c.priorHlc as string, 'base64')),
+							}
+						: {}),
+				};
 			}
-			return base;
+			return {
+				...base,
+				...(c.priorRow !== undefined
+					? { priorRow: (c.priorRow as unknown[]).map(v => decodeSqlValue(v)) }
+					: {}),
+			};
 		}),
 		schemaMigrations: ((obj.schemaMigrations as Record<string, unknown>[]) || []).map(m => ({
 			...m,

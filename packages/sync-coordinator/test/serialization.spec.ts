@@ -116,6 +116,121 @@ describe('Serialization', () => {
 		});
 	});
 
+	describe('before-image (prior) round-trip', () => {
+		it('keeps the before-image absent when the source had none', () => {
+			const siteId = generateSiteId();
+			const hlc = createHLC(BigInt(Date.now()) * 1000n, 0, siteId);
+			const cs: ChangeSet = {
+				siteId,
+				transactionId: 'tx-absent',
+				hlc,
+				changes: [
+					{ type: 'column', schema: 'main', table: 'users', pk: [1], column: 'name', value: 'Alice', hlc },
+					{ type: 'delete', schema: 'main', table: 'users', pk: [2], hlc },
+				],
+				schemaMigrations: [],
+			};
+
+			const serialized = serializeChangeSet(cs) as any;
+			expect(serialized.changes[0]).to.not.have.property('priorValue');
+			expect(serialized.changes[0]).to.not.have.property('priorHlc');
+			expect(serialized.changes[1]).to.not.have.property('priorRow');
+
+			const result = deserializeChangeSet(serialized);
+			const col = result.changes[0];
+			const del = result.changes[1];
+			expect('priorValue' in col).to.equal(false);
+			expect('priorHlc' in col).to.equal(false);
+			expect('priorRow' in del).to.equal(false);
+		});
+
+		it('round-trips a column before-image incl. Uint8Array and bigint', () => {
+			const siteId = generateSiteId();
+			const hlc = createHLC(BigInt(Date.now()) * 1000n, 5, siteId);
+			const priorHlc = createHLC(BigInt(1234567890), 7, siteId, 3);
+			const priorBlob = new Uint8Array([0, 1, 127, 255]);
+			const cs: ChangeSet = {
+				siteId,
+				transactionId: 'tx-prior-col',
+				hlc,
+				changes: [
+					{
+						type: 'column', schema: 'main', table: 'docs', pk: [1], column: 'blob',
+						value: 'v2', hlc, priorValue: priorBlob, priorHlc,
+					},
+					{
+						type: 'column', schema: 'main', table: 'docs', pk: [2], column: 'big',
+						value: 'v2', hlc, priorValue: 9007199254740993n, priorHlc,
+					},
+				],
+				schemaMigrations: [],
+			};
+
+			const result = deserializeChangeSet(serializeChangeSet(cs));
+			const blobChange = result.changes[0] as any;
+			const bigChange = result.changes[1] as any;
+			expect(blobChange.priorValue).to.be.instanceOf(Uint8Array);
+			expect(Array.from(blobChange.priorValue as Uint8Array)).to.deep.equal([0, 1, 127, 255]);
+			expect(blobChange.priorHlc.wallTime).to.equal(BigInt(1234567890));
+			expect(blobChange.priorHlc.counter).to.equal(7);
+			expect(bigChange.priorValue).to.equal(9007199254740993n);
+		});
+
+		it('round-trips a delete priorRow incl. Uint8Array, bigint, and null cells', () => {
+			const siteId = generateSiteId();
+			const hlc = createHLC(BigInt(Date.now()) * 1000n, 0, siteId);
+			const blob = new Uint8Array([9, 8, 7]);
+			const cs: ChangeSet = {
+				siteId,
+				transactionId: 'tx-prior-row',
+				hlc,
+				changes: [
+					{
+						type: 'delete', schema: 'main', table: 'users', pk: [1], hlc,
+						priorRow: [42n, 'Alice', blob, null],
+					},
+				],
+				schemaMigrations: [],
+			};
+
+			const result = deserializeChangeSet(serializeChangeSet(cs));
+			const del = result.changes[0] as any;
+			expect(del.priorRow).to.not.be.undefined;
+			expect(del.priorRow[0]).to.equal(42n);
+			expect(del.priorRow[1]).to.equal('Alice');
+			expect(del.priorRow[2]).to.be.instanceOf(Uint8Array);
+			expect(Array.from(del.priorRow[2] as Uint8Array)).to.deep.equal([9, 8, 7]);
+			expect(del.priorRow[3]).to.be.null;
+		});
+
+		it('preserves the empty-array priorRow boundary (present [] vs absent)', () => {
+			const siteId = generateSiteId();
+			const hlc = createHLC(BigInt(Date.now()) * 1000n, 0, siteId);
+			const cs: ChangeSet = {
+				siteId,
+				transactionId: 'tx-empty-row',
+				hlc,
+				changes: [
+					{ type: 'delete', schema: 'main', table: 'users', pk: [1], hlc, priorRow: [] },
+					{ type: 'delete', schema: 'main', table: 'users', pk: [2], hlc },
+				],
+				schemaMigrations: [],
+			};
+
+			const serialized = serializeChangeSet(cs) as any;
+			expect(serialized.changes[0]).to.have.property('priorRow');
+			expect(serialized.changes[0].priorRow).to.have.lengthOf(0);
+			expect(serialized.changes[1]).to.not.have.property('priorRow');
+
+			const result = deserializeChangeSet(serialized);
+			const present = result.changes[0] as any;
+			const absent = result.changes[1];
+			expect(present.priorRow).to.not.be.undefined;
+			expect(present.priorRow).to.have.lengthOf(0);
+			expect('priorRow' in absent).to.equal(false);
+		});
+	});
+
 	describe('serializeSnapshotChunk', () => {
 		it('should serialize header chunk with base64 fields', () => {
 			const siteId = generateSiteId();

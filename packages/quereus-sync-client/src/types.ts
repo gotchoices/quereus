@@ -236,6 +236,9 @@ export interface SerializedChange {
   column?: string;
   value?: unknown;
   hlc: string;
+  priorValue?: unknown;   // encodeSqlValue(priorValue) — column, present iff priorHlc
+  priorHlc?: string;      // base64-binary HLC — column, present iff priorValue
+  priorRow?: unknown[];   // encodeSqlValue per cell — delete, present-only ([] is present)
 }
 
 export interface SerializedSchemaMigration {
