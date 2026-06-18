@@ -228,13 +228,15 @@ This is the boundary the sync layer anchors an HLC to: one `onTransactionCommit`
 batch ⇒ one transaction ⇒ one HLC. It is purely additive — the per-event
 `onDataChange` / `onSchemaChange` channels are untouched.
 
-**Why not the per-table store coordinator.** The store has one
-`TransactionCoordinator` *per table* (`store-module.ts` `getCoordinator(tableKey)`),
-each with its own `StoreConnection` firing its own event burst. A cross-table
-transaction therefore commits several coordinators separately — so a
-per-coordinator (per-table) commit would split one logical transaction into
-multiple groups and assign it multiple HLCs, breaking the referential-integrity
-property above. Only the engine emitter sees the whole transaction at once.
+**Why not the store coordinator.** The store has one `TransactionCoordinator`
+*per module* (`store-module.ts` `getCoordinator()`), shared by every table. A
+single-module transaction now commits through that one coordinator, but a
+**cross-module** transaction (e.g. a store source plus a memory source, or two
+durable modules) still spans several coordinators/emitters, each firing its own
+event burst — so a per-coordinator commit would split such a logical transaction
+into multiple groups and assign it multiple HLCs, breaking the
+referential-integrity property above. Only the engine emitter sees the whole
+transaction at once.
 
 Ordering within a batch is the engine flush order: base batch then each savepoint
 layer in push order — i.e. per-module/per-table arrival order at commit, not

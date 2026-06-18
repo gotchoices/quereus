@@ -87,7 +87,6 @@ export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintained
 export {
   TransactionCoordinator,
   type TransactionCallbacks,
-  type DefaultStoreSource,
   type PendingStoreOps,
   type OrderedPendingOps,
 } from './transaction.js';

@@ -9,11 +9,12 @@
  * ## Pending state = the per-table coordinator
  *
  * Where the memory host writes a connection's private pending
- * `TransactionLayer`, this host queues ops into the table's shared
- * {@link TransactionCoordinator} — the same pending state `StoreTable`'s read
- * paths merge over the committed store (reads-own-writes). The visibility
- * granularity is therefore per-table-coordinator, not per-connection: every
- * connection this host creates shares one pending view. That satisfies the
+ * `TransactionLayer`, this host queues ops into the module's shared
+ * {@link TransactionCoordinator} (addressed by the backing table's data-store
+ * handle) — the same pending state `StoreTable`'s read paths merge over the
+ * committed store (reads-own-writes). The visibility granularity is therefore
+ * per-module-coordinator, not per-connection: every connection this host
+ * creates shares one pending view. That satisfies the
  * contract (later reads on the writing connection observe the ops) and is the
  * store's documented RYOW posture; the per-connection invisibility the memory
  * host happens to provide is an isolation property, not a contract point. Under
@@ -23,11 +24,15 @@
  *
  * ## Incarnation pinning
  *
- * One host instance is bound to one (StoreTable, coordinator) pair = one
- * backing-table incarnation. `StoreModule.destroy` evicts both the table and
- * the coordinator from the module maps, so a drop+recreate yields fresh
- * instances and `ownsConnection`'s coordinator-identity comparison rejects the
- * old incarnation's connections — memory-parity pinning.
+ * One host instance is bound to one StoreTable instance = one backing-table
+ * incarnation. The coordinator is now module-wide (shared by every table), so
+ * coordinator identity can no longer distinguish incarnations; pinning moves to
+ * the StoreTable instance. `StoreModule.destroy` evicts the table from
+ * `this.tables`, so a drop+recreate yields a fresh StoreTable and
+ * `ownsConnection`'s `conn.owner === this.table` comparison rejects the old
+ * incarnation's connections (whose `owner` is the evicted StoreTable) — and a
+ * foreign module's connection (not a StoreConnection, or a different owner)
+ * alike. Memory-parity pinning.
  *
  * ## Events: off by default, opt-in per table
  *
@@ -82,6 +87,7 @@ import {
 
 import type { StoreTable } from './store-table.js';
 import type { TransactionCoordinator } from './transaction.js';
+import type { KVStore } from './kv-store.js';
 import type { DataChangeEvent } from './events.js';
 import { StoreConnection } from './store-connection.js';
 import { bytesToHex } from './bytes.js';
@@ -104,23 +110,28 @@ export class StoreBackingHost implements BackingHost {
 	) {}
 
 	/**
-	 * True when `conn` is a StoreConnection on THIS incarnation's coordinator.
-	 * Coordinators are per (schema.table) and evicted on destroy, so identity
-	 * comparison rejects both another table's connection and a stale connection
-	 * from a dropped+recreated incarnation.
+	 * True when `conn` is a StoreConnection THIS host's backing table owns.
+	 * The coordinator is module-wide (shared by every table), so it can no longer
+	 * pin an incarnation; ownership is the StoreTable instance, set on the
+	 * connection's `owner` at {@link connect} time. `this.table` is evicted from
+	 * the module on destroy, so identity comparison rejects another table's
+	 * connection, a stale connection from a dropped+recreated incarnation (its
+	 * `owner` is the evicted StoreTable), and a foreign module's connection (not a
+	 * StoreConnection) alike.
 	 */
 	ownsConnection(conn: VirtualTableConnection): boolean {
-		return conn instanceof StoreConnection && conn.getCoordinator() === this.coordinator;
+		return conn instanceof StoreConnection && conn.owner === this.table;
 	}
 
 	/**
-	 * Fresh connection on this incarnation's coordinator. Synchronous by design
-	 * (the substrate made the coordinator thunk-constructed). The caller registers
-	 * it with the Database; `registerConnection`'s begin + savepoint-stack replay
-	 * then drives the coordinator into the live transaction state.
+	 * Fresh connection owned by this incarnation's StoreTable, on the module
+	 * coordinator. Synchronous by design (the coordinator is handle-addressed, so
+	 * never store-opening). The caller registers it with the Database;
+	 * `registerConnection`'s begin + savepoint-stack replay then drives the
+	 * coordinator into the live transaction state.
 	 */
 	connect(): VirtualTableConnection {
-		return new StoreConnection(this.table.tableName, this.coordinator);
+		return new StoreConnection(this.table.tableName, this.coordinator, this.table);
 	}
 
 	/**
@@ -137,6 +148,11 @@ export class StoreBackingHost implements BackingHost {
 		this.assertOwned(conn);
 		const changes: BackingRowChange[] = [];
 		if (ops.length === 0) return changes;
+		// Resolve the backing's data-store handle once. Every coordinator op the
+		// backing queues is addressed by this handle (the module coordinator is
+		// shared, so each table's ops MUST carry their own store), and it is the
+		// same handle `StoreTable`'s read paths bucket under (reads-own-writes).
+		const store = await this.table.openDataStore();
 		if (!this.coordinator.isInTransaction()) {
 			this.coordinator.begin();
 		}
@@ -147,7 +163,7 @@ export class StoreBackingHost implements BackingHost {
 					const key = this.table.encodeDataKey(this.normalizePkValues(op.key));
 					const existing = await this.table.readEffectiveRowByKey(key);
 					if (existing) {
-						this.coordinator.delete(key);
+						this.coordinator.delete(key, store);
 						this.table.trackPrivilegedMutation(-1);
 						changes.push({ op: 'delete', oldRow: existing });
 					}
@@ -166,7 +182,7 @@ export class StoreBackingHost implements BackingHost {
 						// update.
 						break;
 					}
-					this.coordinator.put(key, serializeRow(op.row));
+					this.coordinator.put(key, serializeRow(op.row), store);
 					if (!existing) this.table.trackPrivilegedMutation(+1);
 					changes.push(existing
 						? { op: 'update', oldRow: existing, newRow: op.row }
@@ -185,14 +201,14 @@ export class StoreBackingHost implements BackingHost {
 						matched.push({ key: entry.key, row: deserializeRow(entry.value) });
 					}
 					for (const { key, row } of matched) {
-						this.coordinator.delete(key);
+						this.coordinator.delete(key, store);
 						this.table.trackPrivilegedMutation(-1);
 						changes.push({ op: 'delete', oldRow: row });
 					}
 					break;
 				}
 				case 'replace-all': {
-					await this.applyReplaceAll(op.rows, changes);
+					await this.applyReplaceAll(op.rows, changes, store);
 					break;
 				}
 				default: {
@@ -262,7 +278,7 @@ export class StoreBackingHost implements BackingHost {
 	 * `applyMaintenanceToLayer` skips them — so a collation-equal / byte-different
 	 * paired row is an `update` that re-keys the stored bytes.
 	 */
-	private async applyReplaceAll(rows: readonly Row[], changes: BackingRowChange[]): Promise<void> {
+	private async applyReplaceAll(rows: readonly Row[], changes: BackingRowChange[], store: KVStore): Promise<void> {
 		// Snapshot the old effective contents first (stable before-image for the
 		// diff). Map preserves insertion order = scan order = ascending key order,
 		// so the delete pass below emits in PK order like memory's.
@@ -278,11 +294,11 @@ export class StoreBackingHost implements BackingHost {
 			newKeys.add(hex);
 			const existing = oldByKey.get(hex);
 			if (!existing) {
-				this.coordinator.put(key, serializeRow(newRow));
+				this.coordinator.put(key, serializeRow(newRow), store);
 				this.table.trackPrivilegedMutation(+1);
 				changes.push({ op: 'insert', newRow });
 			} else if (!rowsValueIdentical(existing.row, newRow)) {
-				this.coordinator.put(key, serializeRow(newRow));
+				this.coordinator.put(key, serializeRow(newRow), store);
 				changes.push({ op: 'update', oldRow: existing.row, newRow });
 			}
 			// else: byte-identical at this key — a true no-op, no emitted change. The skip is
@@ -293,7 +309,7 @@ export class StoreBackingHost implements BackingHost {
 
 		for (const { key, row } of oldByKey.values()) {
 			if (newKeys.has(bytesToHex(key))) continue;
-			this.coordinator.delete(key);
+			this.coordinator.delete(key, store);
 			this.table.trackPrivilegedMutation(-1);
 			changes.push({ op: 'delete', oldRow: row });
 		}

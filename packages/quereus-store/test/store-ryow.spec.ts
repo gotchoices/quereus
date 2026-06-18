@@ -201,14 +201,15 @@ describe('StoreTable read-your-own-writes (bare StoreModule)', () => {
 			const harness = new HarnessStoreTable(db, module, schema!, { collation: 'NOCASE' }, undefined, true);
 			const store = await harness.open();
 
-			// Pending ops via the SHARED per-table coordinator (the same one SQL DML
-			// would use): puts at 20 and 60, delete of committed 30.
-			const coordinator = module.getCoordinator('main.t', { collation: 'NOCASE' });
+			// Pending ops via the SHARED module coordinator (the same one SQL DML
+			// would use), addressed by this table's data-store handle: puts at 20
+			// and 60, delete of committed 30.
+			const coordinator = module.getCoordinator();
 			coordinator.begin();
 			try {
-				coordinator.put(buildDataKey([20]), serializeRow([20] as Row));
-				coordinator.put(buildDataKey([60]), serializeRow([60] as Row));
-				coordinator.delete(buildDataKey([30]));
+				coordinator.put(buildDataKey([20]), serializeRow([20] as Row), store);
+				coordinator.put(buildDataKey([60]), serializeRow([60] as Row), store);
+				coordinator.delete(buildDataKey([30]), store);
 
 				const keysOf = async (bounds: IterateOptions, reverse?: boolean) => {
 					const out: string[] = [];

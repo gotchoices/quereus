@@ -122,7 +122,13 @@ export interface StoreModuleConfig extends BaseModuleConfig {
 export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleConfig>, StoreTableModule {
 	private provider: KVStoreProvider;
 	private stores: Map<string, KVStore> = new Map();
-	private coordinators: Map<string, TransactionCoordinator> = new Map();
+	/**
+	 * The single transaction coordinator shared by every {@link StoreTable} this
+	 * module owns — the unit of cross-table atomicity (see {@link getCoordinator}).
+	 * Lives for the module's lifetime: a single table's drop must NOT evict it
+	 * (sibling tables still use it); only {@link closeAll} clears it.
+	 */
+	private moduleCoordinator?: TransactionCoordinator;
 	private tables: Map<string, StoreTable> = new Map();
 	private eventEmitter?: StoreEventEmitter;
 
@@ -644,7 +650,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const table = this.tables.get(tableKey);
 		this.tables.delete(tableKey);
 		this.stores.delete(tableKey);
-		this.coordinators.delete(tableKey);
+		// NOTE: the coordinator is module-wide and shared by sibling tables, so a
+		// single table's teardown must NOT evict it. The StoreTable eviction above
+		// (this.tables.delete) is now the backing-host pinning identity.
 
 		if (table) {
 			await table.disconnect();
@@ -1657,12 +1665,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// ALTER TABLE is effectively DDL-committing on a store-backed table:
 		// once we move the on-disk directory, prior buffered writes can no
 		// longer be rolled back through the coordinator. Flush any pending
-		// ops to the old store NOW, before its handle is closed. Subsequent
+		// ops NOW, before the old store's handle is closed. Subsequent
 		// commit() calls on the same coordinator are no-ops (inTransaction
 		// is cleared), which keeps the enclosing transaction safe.
-		const coordinator = this.coordinators.get(oldKey);
-		if (coordinator?.isInTransaction()) {
-			await coordinator.commit();
+		//
+		// The coordinator is module-wide, so this DDL-commits the WHOLE module
+		// transaction — every table's pending ops, not just the renamed table's —
+		// in one all-or-nothing batch. That is the correct, consistent posture
+		// for a store DDL-commit: an ALTER cannot half-commit some sibling tables.
+		if (this.moduleCoordinator?.isInTransaction()) {
+			await this.moduleCoordinator.commit();
 		}
 
 		// Flush any lazy stats the cached handle was buffering; disconnect failures
@@ -1677,7 +1689,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 		this.tables.delete(oldKey);
 		this.stores.delete(oldKey);
-		this.coordinators.delete(oldKey);
+		// The coordinator is module-wide (flushed above); it is not per-table, so
+		// it is not evicted here.
 
 		// Move physical storage (data directory + index directories).
 		if (this.provider.renameTableStores) {
@@ -1940,27 +1953,27 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Get or create a transaction coordinator for a table.
+	 * Get (lazily constructing) the SINGLE transaction coordinator shared by every
+	 * table this module owns — the unit of cross-table atomicity. Every
+	 * {@link StoreTable} attaches to the same instance, so a transaction touching
+	 * several of the module's tables commits/rolls back as one all-or-nothing
+	 * batch.
 	 *
-	 * Synchronously constructible: the coordinator receives a lazy thunk for its
-	 * default store and only resolves it when a commit actually needs the
-	 * concrete handle. This lets callers that must stay synchronous (e.g. a
-	 * `BackingHost.connect()`) obtain a working coordinator before the table's
-	 * store has ever been opened.
+	 * Synchronously constructible: ops are addressed by explicit store handle, so
+	 * the coordinator never needs to open a store to be created. This lets callers
+	 * that must stay synchronous (e.g. a `BackingHost.connect()`) obtain a working
+	 * coordinator before any table's store has been opened.
 	 */
-	getCoordinator(tableKey: string, config: StoreTableConfig): TransactionCoordinator {
-		let coordinator = this.coordinators.get(tableKey);
-		if (!coordinator) {
-			coordinator = new TransactionCoordinator(
-				() => this.getStore(tableKey, config),
+	getCoordinator(): TransactionCoordinator {
+		if (!this.moduleCoordinator) {
+			this.moduleCoordinator = new TransactionCoordinator(
 				this.eventEmitter,
 				// Re-evaluated per commit (see TransactionCoordinator.atomicBatchFactory)
 				// so a provider that gains/loses the capability is always honored.
 				() => this.provider.beginAtomicBatch?.(),
 			);
-			this.coordinators.set(tableKey, coordinator);
 		}
-		return coordinator;
+		return this.moduleCoordinator;
 	}
 
 	/**
@@ -2590,7 +2603,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			await table.disconnect();
 		}
 		this.tables.clear();
-		this.coordinators.clear();
+		this.moduleCoordinator = undefined;
 
 		// Every batch has flushed (persist queue drained, tables disconnected):
 		// attest the clean shutdown so the next open may take the materialized-view

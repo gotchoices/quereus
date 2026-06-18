@@ -146,11 +146,12 @@ export interface StoreTableModule {
 	/** Get the stats store for a table. */
 	getStatsStore(schemaName: string, tableName: string): Promise<KVStore>;
 	/**
-	 * Get a coordinator for a table. Synchronous: the coordinator's default
-	 * store may be a lazy thunk resolved at commit time, so obtaining one never
-	 * requires opening storage.
+	 * Get the module's single shared transaction coordinator (one per storage
+	 * module, shared by every table — the unit of cross-table atomicity).
+	 * Synchronous: ops are addressed by explicit store handle, so obtaining a
+	 * coordinator never requires opening storage.
 	 */
-	getCoordinator(tableKey: string, config: StoreTableConfig): TransactionCoordinator;
+	getCoordinator(): TransactionCoordinator;
 	/** Save table DDL to persistent storage. */
 	saveTableDDL(tableSchema: TableSchema): Promise<void>;
 }
@@ -498,20 +499,27 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
-	 * Resolve + cache this table's TransactionCoordinator and hook the stats
-	 * lifecycle callbacks, WITHOUT creating or registering a connection.
-	 * Synchronous (the coordinator is thunk-constructed — see
+	 * Resolve + cache the module's shared TransactionCoordinator and hook the
+	 * stats lifecycle callbacks, WITHOUT creating or registering a connection.
+	 * Synchronous (the coordinator is handle-addressed, never store-opening — see
 	 * `StoreTableModule.getCoordinator`), so the backing host's resolution path can
 	 * call it eagerly. Attaching matters for reads: `iterateEffective` /
 	 * `readEffectiveRowByKey` consult `this.coordinator` for the pending merge, so a
 	 * table whose only writer is the privileged backing host (which queues ops on the
-	 * module-level coordinator, never through `update()`) must still hold the
+	 * module coordinator, never through `update()`) must still hold the
 	 * reference for its read paths to be reads-own-writes.
+	 *
+	 * The coordinator is module-wide, so its commit/rollback callback array holds
+	 * one {stats apply/discard} pair per PARTICIPATING table; each table's
+	 * `applyPendingStats` early-returns when its own `pendingStatsDelta` is 0, so a
+	 * table that did no work contributes nothing. Registers only on first call per
+	 * StoreTable instance (the `if (!this.coordinator)` guard); a fresh instance
+	 * after drop+recreate re-registers against the shared coordinator — acceptable,
+	 * the old instance is evicted and GC'd.
 	 */
 	attachCoordinator(): TransactionCoordinator {
 		if (!this.coordinator) {
-			const tableKey = `${this.schemaName}.${this.tableName}`.toLowerCase();
-			this.coordinator = this.storeModule.getCoordinator(tableKey, this.config);
+			this.coordinator = this.storeModule.getCoordinator();
 
 			this.coordinator.registerCallbacks({
 				onCommit: () => this.applyPendingStats(),
@@ -654,11 +662,9 @@ export class StoreTable extends VirtualTable {
 	 * pending puts outside `bounds` are excluded. With no active transaction
 	 * (or an empty pending bucket) it degrades to the bare committed iterate.
 	 *
-	 * The pending side is the coordinator's DEFAULT-store bucket — the
-	 * coordinator is per-table and its default store IS this table's data store
-	 * (both resolve through `StoreModule.getStore(tableKey)`), and addressing by
-	 * role keeps the lookup correct while a lazily-constructed coordinator's
-	 * default handle is still unresolved.
+	 * The pending side is the module coordinator's bucket for THIS table's data
+	 * store handle (`store`) — every data op is queued under that exact handle, so
+	 * a sibling table's pending ops (a different data-store handle) never bleed in.
 	 */
 	protected async *iterateEffective(
 		store: KVStore,
@@ -666,7 +672,7 @@ export class StoreTable extends VirtualTable {
 		reverse = false,
 	): AsyncIterable<KVEntry> {
 		const pending = this.coordinator?.isInTransaction()
-			? this.coordinator.getOrderedPendingOps()
+			? this.coordinator.getOrderedPendingOps(store)
 			: null;
 		const iterOptions: IterateOptions = reverse ? { ...bounds, reverse } : bounds;
 
@@ -987,7 +993,7 @@ export class StoreTable extends VirtualTable {
 				const oldRow = existingRow;
 				const serializedRow = serializeRow(coerced);
 				if (inTransaction) {
-					coordinator.put(key, serializedRow);
+					coordinator.put(key, serializedRow, store);
 				} else {
 					await store.put(key, serializedRow);
 				}
@@ -1131,7 +1137,7 @@ export class StoreTable extends VirtualTable {
 				// Delete old key if PK changed
 				if (pkChanged) {
 					if (inTransaction) {
-						coordinator.delete(oldKey);
+						coordinator.delete(oldKey, store);
 					} else {
 						await store.delete(oldKey);
 					}
@@ -1139,7 +1145,7 @@ export class StoreTable extends VirtualTable {
 
 				const serializedRow = serializeRow(coerced);
 				if (inTransaction) {
-					coordinator.put(newKey, serializedRow);
+					coordinator.put(newKey, serializedRow, store);
 				} else {
 					await store.put(newKey, serializedRow);
 				}
@@ -1183,7 +1189,7 @@ export class StoreTable extends VirtualTable {
 				const oldRow = await this.readEffectiveRowByKey(key);
 
 				if (inTransaction) {
-					coordinator.delete(key);
+					coordinator.delete(key, store);
 				} else {
 					await store.delete(key);
 				}
@@ -1439,11 +1445,11 @@ export class StoreTable extends VirtualTable {
 		selfPks: SqlValue[][],
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
 		const store = await this.ensureStore();
-		// Default-store bucket: the per-table coordinator's default store IS this
-		// table's data store, and addressing by role (no handle) stays correct
-		// even while a lazily-constructed coordinator's default is unresolved.
+		// Pending ops for THIS table's data store handle — the same handle the
+		// write path queues data ops under, so the merge sees only this table's
+		// pending state, never a sibling table's on the shared module coordinator.
 		const pending = this.coordinator?.isInTransaction()
-			? this.coordinator.getPendingOpsForStore()
+			? this.coordinator.getPendingOpsForStore(store)
 			: null;
 		const constrainedCols = uc.columns;
 		// One comparison collation per constrained column — the index's per-column
@@ -1568,9 +1574,9 @@ export class StoreTable extends VirtualTable {
 	 */
 	async readEffectiveRowByKey(key: Uint8Array): Promise<Row | null> {
 		const store = await this.ensureStore();
-		// Default-store bucket — see the matching note in findUniqueConflict.
+		// Pending ops for THIS table's data store handle — see findUniqueConflict.
 		const pending = this.coordinator?.isInTransaction()
-			? this.coordinator.getPendingOpsForStore()
+			? this.coordinator.getPendingOpsForStore(store)
 			: null;
 		if (pending) {
 			const hex = bytesToHex(key);
@@ -1785,7 +1791,7 @@ export class StoreTable extends VirtualTable {
 		const store = await this.ensureStore();
 		const key = buildDataKey(pk, this.encodeOptions, this.pkDirections, this.pkKeyCollations);
 		if (inTransaction && this.coordinator) {
-			this.coordinator.delete(key);
+			this.coordinator.delete(key, store);
 		} else {
 			await store.delete(key);
 		}

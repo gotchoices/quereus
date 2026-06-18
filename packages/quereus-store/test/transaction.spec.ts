@@ -1,13 +1,99 @@
 /**
  * Tests for TransactionCoordinator.
+ *
+ * The coordinator is module-wide: one instance is shared by every table of a
+ * storage module, and every op is addressed by its explicit target store handle
+ * (data ops included — there is no longer a default-store bucket). A single
+ * commit therefore writes EVERY touched store of EVERY table in one atomic batch
+ * (when the provider exposes one), giving cross-table all-or-nothing commit.
  */
 
 import { expect } from 'chai';
-import { TransactionCoordinator, type PendingStoreOps, type TransactionCallbacks } from '../src/common/transaction.js';
+import { TransactionCoordinator, type PendingStoreOps } from '../src/common/transaction.js';
 import { StoreEventEmitter, type DataChangeEvent } from '../src/common/events.js';
 import { InMemoryKVStore } from '../src/common/memory-store.js';
 import type { AtomicBatch, KVStore } from '../src/common/kv-store.js';
 import { bytesToHex, compareBytes } from '../src/common/bytes.js';
+
+/** A shared-domain in-memory AtomicBatch factory with spies (module-scope so the
+ *  atomic-path and cross-table describes can both use it). `InMemoryKVStore`
+ *  cannot crash, so "atomic" is modeled trivially (buffer ops keyed by store
+ *  handle, apply on write); the spies let the coordinator's atomic-path routing
+ *  be asserted deterministically. */
+interface AtomicSpy {
+	factory: () => AtomicBatch | undefined;
+	beginCalls: number;
+	writeCalls: number;
+	/** When false, the factory yields undefined → coordinator falls back. */
+	yieldBatch: boolean;
+	/** When true, the produced batch's write() rejects. */
+	failWrite: boolean;
+	/** Every store handle passed to put/delete (to assert per-store routing). */
+	storeHandles: KVStore[];
+}
+
+function makeAtomicSpy(): AtomicSpy {
+	const spy: AtomicSpy = {
+		factory: () => undefined,
+		beginCalls: 0,
+		writeCalls: 0,
+		yieldBatch: true,
+		failWrite: false,
+		storeHandles: [],
+	};
+	spy.factory = () => {
+		spy.beginCalls++;
+		if (!spy.yieldBatch) return undefined;
+		const ops: Array<{ type: 'put' | 'delete'; store: KVStore; key: Uint8Array; value?: Uint8Array }> = [];
+		return {
+			put(store, key, value) {
+				spy.storeHandles.push(store);
+				ops.push({ type: 'put', store, key, value });
+			},
+			delete(store, key) {
+				spy.storeHandles.push(store);
+				ops.push({ type: 'delete', store, key });
+			},
+			async write() {
+				spy.writeCalls++;
+				if (spy.failWrite) throw new Error('atomic write failed');
+				for (const op of ops) {
+					if (op.type === 'put') {
+						await op.store.put(op.key, op.value!);
+					} else {
+						await op.store.delete(op.key);
+					}
+				}
+				ops.length = 0;
+			},
+			clear() {
+				ops.length = 0;
+			},
+		};
+	};
+	return spy;
+}
+
+/** Monkey-patch a store's batch() to count fallback-path invocations. */
+function spyBatch(target: InMemoryKVStore): () => number {
+	const orig = target.batch.bind(target);
+	let n = 0;
+	target.batch = () => { n++; return orig(); };
+	return () => n;
+}
+
+/** Run `fn` with console.warn captured; returns the first warning, or null. */
+function captureWarn(fn: () => void): string | null {
+	const original = console.warn;
+	let captured: string | null = null;
+	console.warn = (...args: unknown[]) => { if (captured === null) captured = args.map(String).join(' '); };
+	try {
+		fn();
+	} finally {
+		console.warn = original;
+	}
+	return captured;
+}
 
 describe('TransactionCoordinator', () => {
 	let store: InMemoryKVStore;
@@ -17,7 +103,7 @@ describe('TransactionCoordinator', () => {
 	beforeEach(() => {
 		store = new InMemoryKVStore();
 		emitter = new StoreEventEmitter();
-		coordinator = new TransactionCoordinator(store, emitter);
+		coordinator = new TransactionCoordinator(emitter);
 	});
 
 	afterEach(async () => {
@@ -43,19 +129,19 @@ describe('TransactionCoordinator', () => {
 
 	describe('put / delete outside transaction', () => {
 		it('throws when put called outside transaction', () => {
-			expect(() => coordinator.put(new Uint8Array([1]), new Uint8Array([2]))).to.throw(/outside transaction/i);
+			expect(() => coordinator.put(new Uint8Array([1]), new Uint8Array([2]), store)).to.throw(/outside transaction/i);
 		});
 
 		it('throws when delete called outside transaction', () => {
-			expect(() => coordinator.delete(new Uint8Array([1]))).to.throw(/outside transaction/i);
+			expect(() => coordinator.delete(new Uint8Array([1]), store)).to.throw(/outside transaction/i);
 		});
 	});
 
 	describe('commit', () => {
 		it('writes pending operations to the store', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
-			coordinator.put(new Uint8Array([2]), new Uint8Array([20]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), store);
 			await coordinator.commit();
 
 			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
@@ -91,7 +177,7 @@ describe('TransactionCoordinator', () => {
 	describe('rollback', () => {
 		it('discards pending operations', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.rollback();
 
 			expect(await store.get(new Uint8Array([1]))).to.be.undefined;
@@ -133,9 +219,9 @@ describe('TransactionCoordinator', () => {
 	describe('savepoints', () => {
 		it('creates and releases savepoint', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.createSavepoint(0);
-			coordinator.put(new Uint8Array([2]), new Uint8Array([20]));
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), store);
 			coordinator.releaseSavepoint(0);
 			await coordinator.commit();
 
@@ -145,9 +231,9 @@ describe('TransactionCoordinator', () => {
 
 		it('rollback to savepoint discards ops after savepoint', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.createSavepoint(0);
-			coordinator.put(new Uint8Array([2]), new Uint8Array([20]));
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), store);
 			coordinator.rollbackToSavepoint(0);
 			await coordinator.commit();
 
@@ -172,11 +258,11 @@ describe('TransactionCoordinator', () => {
 
 		it('nested savepoints', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.createSavepoint(0);
-			coordinator.put(new Uint8Array([2]), new Uint8Array([20]));
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), store);
 			coordinator.createSavepoint(1);
-			coordinator.put(new Uint8Array([3]), new Uint8Array([30]));
+			coordinator.put(new Uint8Array([3]), new Uint8Array([30]), store);
 			coordinator.rollbackToSavepoint(1);
 			await coordinator.commit();
 
@@ -214,9 +300,9 @@ describe('TransactionCoordinator', () => {
 			// Follow-up savepoint round-trip on the same coordinator must still work correctly.
 			coordinator.begin();
 			coordinator.createSavepoint(0);
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.createSavepoint(1);
-			coordinator.put(new Uint8Array([2]), new Uint8Array([20]));
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), store);
 			coordinator.rollbackToSavepoint(1);
 			await coordinator.commit();
 			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
@@ -232,12 +318,6 @@ describe('TransactionCoordinator', () => {
 		});
 	});
 
-	describe('getStore', () => {
-		it('returns the underlying store', () => {
-			expect(coordinator.getStore()).to.equal(store);
-		});
-	});
-
 	describe('multi-store operations', () => {
 		let indexStore: InMemoryKVStore;
 
@@ -249,9 +329,9 @@ describe('TransactionCoordinator', () => {
 			await indexStore.close();
 		});
 
-		it('commit writes to both default and explicit stores', async () => {
+		it('commit writes to both stores, each in its own bucket', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), indexStore);
 			await coordinator.commit();
 
@@ -264,7 +344,7 @@ describe('TransactionCoordinator', () => {
 
 		it('rollback discards operations on all stores', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), indexStore);
 			coordinator.rollback();
 
@@ -285,10 +365,10 @@ describe('TransactionCoordinator', () => {
 
 		it('savepoint rollback discards multi-store ops after savepoint', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), indexStore);
 			coordinator.createSavepoint(0);
-			coordinator.put(new Uint8Array([3]), new Uint8Array([30]));
+			coordinator.put(new Uint8Array([3]), new Uint8Array([30]), store);
 			coordinator.put(new Uint8Array([4]), new Uint8Array([40]), indexStore);
 			coordinator.rollbackToSavepoint(0);
 			await coordinator.commit();
@@ -304,19 +384,17 @@ describe('TransactionCoordinator', () => {
 
 	describe('pending-op index (getPendingOpsForStore)', () => {
 		/** A recorded op, mirroring what the coordinator buffers. */
-		interface RefOp { type: 'put' | 'delete'; store?: KVStore; key: Uint8Array; value?: Uint8Array }
+		interface RefOp { type: 'put' | 'delete'; store: KVStore; key: Uint8Array; value?: Uint8Array }
 
 		/**
 		 * Reference implementation replicating the legacy full-array-scan
 		 * semantics of getPendingOpsForStore, for equivalence checking.
 		 */
-		function referenceView(ops: RefOp[], defaultStore: KVStore, target?: KVStore): PendingStoreOps {
-			const t = target ?? defaultStore;
+		function referenceView(ops: RefOp[], target: KVStore): PendingStoreOps {
 			const puts = new Map<string, { key: Uint8Array; value: Uint8Array }>();
 			const deletes = new Set<string>();
 			for (const op of ops) {
-				const opStore = op.store ?? defaultStore;
-				if (opStore !== t) continue;
+				if (op.store !== target) continue;
 				const hex = bytesToHex(op.key);
 				if (op.type === 'put') {
 					puts.set(hex, { key: op.key, value: op.value! });
@@ -356,6 +434,9 @@ describe('TransactionCoordinator', () => {
 			const rand = mulberry32(0xc0ffee);
 			const idx1 = new InMemoryKVStore();
 			const idx2 = new InMemoryKVStore();
+			// Three explicit stores in one op log — the coordinator must bucket each
+			// by its own handle (there is no longer any default/role addressing).
+			const stores = [store, idx1, idx2];
 
 			for (let round = 0; round < 50; round++) {
 				const ops: RefOp[] = [];
@@ -363,11 +444,7 @@ describe('TransactionCoordinator', () => {
 				for (let i = 0; i < 40; i++) {
 					const key = new Uint8Array([Math.floor(rand() * 8)]);
 					const isPut = rand() < 0.6;
-					// Address the default store as `undefined` or via its handle, plus
-					// two explicit index stores — all four addressing forms in one log.
-					const pick = rand();
-					const target: KVStore | undefined =
-						pick < 0.4 ? undefined : pick < 0.6 ? store : pick < 0.8 ? idx1 : idx2;
+					const target = stores[Math.floor(rand() * stores.length)];
 					if (isPut) {
 						const value = new Uint8Array([Math.floor(rand() * 256)]);
 						coordinator.put(key, value, target);
@@ -378,10 +455,10 @@ describe('TransactionCoordinator', () => {
 					}
 				}
 
-				for (const target of [undefined, store, idx1, idx2]) {
+				for (const target of stores) {
 					expectViewsEqual(
 						coordinator.getPendingOpsForStore(target),
-						referenceView(ops, store, target),
+						referenceView(ops, target),
 					);
 				}
 				coordinator.rollback();
@@ -391,50 +468,50 @@ describe('TransactionCoordinator', () => {
 		it('last-write-wins: put then delete then put on the same key', () => {
 			const key = new Uint8Array([7]);
 			coordinator.begin();
-			coordinator.put(key, new Uint8Array([1]));
-			coordinator.delete(key);
-			let view = coordinator.getPendingOpsForStore();
+			coordinator.put(key, new Uint8Array([1]), store);
+			coordinator.delete(key, store);
+			let view = coordinator.getPendingOpsForStore(store);
 			expect(view.deletes.has(bytesToHex(key))).to.be.true;
 			expect(view.puts.has(bytesToHex(key))).to.be.false;
 
-			coordinator.put(key, new Uint8Array([2]));
-			view = coordinator.getPendingOpsForStore();
+			coordinator.put(key, new Uint8Array([2]), store);
+			view = coordinator.getPendingOpsForStore(store);
 			expect(view.deletes.has(bytesToHex(key))).to.be.false;
 			expect(view.puts.get(bytesToHex(key))!.value).to.deep.equal(new Uint8Array([2]));
 		});
 
 		it('clears on commit and rollback', async () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			await coordinator.commit();
-			expect(coordinator.getPendingOpsForStore().puts.size).to.equal(0);
+			expect(coordinator.getPendingOpsForStore(store).puts.size).to.equal(0);
 
 			coordinator.begin();
-			coordinator.delete(new Uint8Array([1]));
+			coordinator.delete(new Uint8Array([1]), store);
 			coordinator.rollback();
-			expect(coordinator.getPendingOpsForStore().deletes.size).to.equal(0);
+			expect(coordinator.getPendingOpsForStore(store).deletes.size).to.equal(0);
 		});
 
 		it('rollback-to-savepoint rebuild equals a from-scratch replay', () => {
 			const k1 = new Uint8Array([1]);
 			const k2 = new Uint8Array([2]);
 			coordinator.begin();
-			coordinator.put(k1, new Uint8Array([10]));
-			coordinator.delete(k2);
+			coordinator.put(k1, new Uint8Array([10]), store);
+			coordinator.delete(k2, store);
 			coordinator.createSavepoint(0);
-			coordinator.put(k1, new Uint8Array([99])); // overwrite
-			coordinator.put(k2, new Uint8Array([20])); // un-deletes k2
+			coordinator.put(k1, new Uint8Array([99]), store); // overwrite
+			coordinator.put(k2, new Uint8Array([20]), store); // un-deletes k2
 			coordinator.rollbackToSavepoint(0);
 
 			// State must equal the pre-savepoint log replayed from scratch.
-			const view = coordinator.getPendingOpsForStore();
+			const view = coordinator.getPendingOpsForStore(store);
 			expect(view.puts.get(bytesToHex(k1))!.value).to.deep.equal(new Uint8Array([10]));
 			expect(view.puts.has(bytesToHex(k2))).to.be.false;
 			expect(view.deletes.has(bytesToHex(k2))).to.be.true;
 
 			// And the index must keep tracking ops queued after the rollback-to.
-			coordinator.put(k2, new Uint8Array([21]));
-			const after = coordinator.getPendingOpsForStore();
+			coordinator.put(k2, new Uint8Array([21]), store);
+			const after = coordinator.getPendingOpsForStore(store);
 			expect(after.puts.get(bytesToHex(k2))!.value).to.deep.equal(new Uint8Array([21]));
 			expect(after.deletes.has(bytesToHex(k2))).to.be.false;
 		});
@@ -445,10 +522,10 @@ describe('TransactionCoordinator', () => {
 			coordinator.begin();
 			coordinator.put(key, new Uint8Array([1]), idx);
 			coordinator.createSavepoint(0);
-			coordinator.put(key, new Uint8Array([2])); // default store, same key bytes
+			coordinator.put(key, new Uint8Array([2]), store); // other store, same key bytes
 			coordinator.rollbackToSavepoint(0);
 
-			expect(coordinator.getPendingOpsForStore().puts.size).to.equal(0);
+			expect(coordinator.getPendingOpsForStore(store).puts.size).to.equal(0);
 			expect(coordinator.getPendingOpsForStore(idx).puts.get(bytesToHex(key))!.value)
 				.to.deep.equal(new Uint8Array([1]));
 		});
@@ -457,12 +534,12 @@ describe('TransactionCoordinator', () => {
 	describe('getOrderedPendingOps', () => {
 		it('returns puts sorted ascending by key bytes plus the delete set', () => {
 			coordinator.begin();
-			coordinator.put(new Uint8Array([3, 1]), new Uint8Array([30]));
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
-			coordinator.put(new Uint8Array([2, 0xff]), new Uint8Array([20]));
-			coordinator.delete(new Uint8Array([9]));
+			coordinator.put(new Uint8Array([3, 1]), new Uint8Array([30]), store);
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			coordinator.put(new Uint8Array([2, 0xff]), new Uint8Array([20]), store);
+			coordinator.delete(new Uint8Array([9]), store);
 
-			const ordered = coordinator.getOrderedPendingOps();
+			const ordered = coordinator.getOrderedPendingOps(store);
 			const keys = ordered.puts.map(p => Array.from(p.key));
 			expect(keys).to.deep.equal([[1], [2, 0xff], [3, 1]]);
 			for (let i = 1; i < ordered.puts.length; i++) {
@@ -473,185 +550,51 @@ describe('TransactionCoordinator', () => {
 
 		it('returns an empty view when there are no ops for the store', () => {
 			coordinator.begin();
-			const ordered = coordinator.getOrderedPendingOps();
+			const ordered = coordinator.getOrderedPendingOps(store);
 			expect(ordered.puts).to.have.length(0);
 			expect(ordered.deletes.size).to.equal(0);
 		});
 
-		it('addresses the default bucket via undefined or the resolved handle', () => {
+		it('buckets two stores separately', () => {
+			const idx = new InMemoryKVStore();
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
-			expect(coordinator.getOrderedPendingOps().puts).to.have.length(1);
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), idx);
 			expect(coordinator.getOrderedPendingOps(store).puts).to.have.length(1);
+			expect(coordinator.getOrderedPendingOps(idx).puts).to.have.length(1);
+			// Each store sees only its own op.
+			expect(coordinator.getOrderedPendingOps(store).puts[0].value).to.deep.equal(new Uint8Array([10]));
+			expect(coordinator.getOrderedPendingOps(idx).puts[0].value).to.deep.equal(new Uint8Array([20]));
 		});
 
 		it('returns a stable snapshot unaffected by later coordinator mutations', () => {
 			// Merge scans hold the view across awaits where pipelined DML can queue
 			// further ops — those must not bleed into an in-flight scan's view.
 			coordinator.begin();
-			coordinator.put(new Uint8Array([1]), new Uint8Array([10]));
-			coordinator.delete(new Uint8Array([2]));
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			coordinator.delete(new Uint8Array([2]), store);
 
-			const view = coordinator.getOrderedPendingOps();
-			coordinator.put(new Uint8Array([3]), new Uint8Array([30]));
-			coordinator.delete(new Uint8Array([4]));
-			coordinator.put(new Uint8Array([2]), new Uint8Array([20])); // un-deletes 2
+			const view = coordinator.getOrderedPendingOps(store);
+			coordinator.put(new Uint8Array([3]), new Uint8Array([30]), store);
+			coordinator.delete(new Uint8Array([4]), store);
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), store); // un-deletes 2
 
 			expect(view.puts.map(p => Array.from(p.key))).to.deep.equal([[1]]);
 			expect([...view.deletes]).to.deep.equal([bytesToHex(new Uint8Array([2]))]);
 		});
 	});
 
-	describe('lazy default store', () => {
-		it('constructs synchronously and resolves only at commit', async () => {
-			let opened = 0;
-			const target = new InMemoryKVStore();
-			const lazy = new TransactionCoordinator(async () => { opened++; return target; });
-
-			lazy.begin();
-			lazy.put(new Uint8Array([1]), new Uint8Array([10]));
-			expect(opened).to.equal(0);
-
-			await lazy.commit();
-			expect(opened).to.equal(1);
-			expect(await target.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
-		});
-
-		it('never resolves the default when only explicit stores are written', async () => {
-			let opened = 0;
-			const idx = new InMemoryKVStore();
-			const lazy = new TransactionCoordinator(async () => { opened++; return new InMemoryKVStore(); });
-
-			lazy.begin();
-			lazy.put(new Uint8Array([1]), new Uint8Array([10]), idx);
-			await lazy.commit();
-
-			expect(opened).to.equal(0);
-			expect(await idx.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
-		});
-
-		it('resolves the thunk once across multiple commits', async () => {
-			let opened = 0;
-			const target = new InMemoryKVStore();
-			const lazy = new TransactionCoordinator(async () => { opened++; return target; });
-
-			for (let i = 0; i < 3; i++) {
-				lazy.begin();
-				lazy.put(new Uint8Array([i]), new Uint8Array([i * 10]));
-				await lazy.commit();
-			}
-			expect(opened).to.equal(1);
-		});
-
-		it('getStore throws before resolution and returns the handle after', async () => {
-			const target = new InMemoryKVStore();
-			const lazy = new TransactionCoordinator(async () => target);
-			expect(() => lazy.getStore()).to.throw(/not yet resolved/i);
-
-			lazy.begin();
-			lazy.put(new Uint8Array([1]), new Uint8Array([10]));
-			await lazy.commit();
-			expect(lazy.getStore()).to.equal(target);
-		});
-
-		it('folds an explicit handle into the default bucket once resolved', async () => {
-			const target = new InMemoryKVStore();
-			const lazy = new TransactionCoordinator(async () => target);
-
-			// Resolve via a first commit.
-			lazy.begin();
-			lazy.put(new Uint8Array([0]), new Uint8Array([0]));
-			await lazy.commit();
-
-			// Now address the default store explicitly by handle: same bucket.
-			lazy.begin();
-			lazy.put(new Uint8Array([1]), new Uint8Array([10]), target);
-			expect(lazy.getPendingOpsForStore().puts.size).to.equal(1);
-			expect(lazy.getPendingOpsForStore(target).puts.size).to.equal(1);
-			await lazy.commit();
-			expect(await target.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
-		});
-	});
-
 	describe('atomic batch path', () => {
-		/**
-		 * A shared-domain in-memory AtomicBatch factory with spies. `InMemoryKVStore`
-		 * cannot crash, so "atomic" is modeled trivially (buffer ops keyed by store
-		 * handle, apply on write); the spies let the coordinator's atomic-path
-		 * routing be asserted deterministically.
-		 */
-		interface AtomicSpy {
-			factory: () => AtomicBatch | undefined;
-			beginCalls: number;
-			writeCalls: number;
-			/** When false, the factory yields undefined → coordinator falls back. */
-			yieldBatch: boolean;
-			/** When true, the produced batch's write() rejects. */
-			failWrite: boolean;
-			/** Every store handle passed to put/delete (to assert per-store folding). */
-			storeHandles: KVStore[];
-		}
-
-		function makeAtomicSpy(): AtomicSpy {
-			const spy: AtomicSpy = {
-				factory: () => undefined,
-				beginCalls: 0,
-				writeCalls: 0,
-				yieldBatch: true,
-				failWrite: false,
-				storeHandles: [],
-			};
-			spy.factory = () => {
-				spy.beginCalls++;
-				if (!spy.yieldBatch) return undefined;
-				const ops: Array<{ type: 'put' | 'delete'; store: KVStore; key: Uint8Array; value?: Uint8Array }> = [];
-				return {
-					put(store, key, value) {
-						spy.storeHandles.push(store);
-						ops.push({ type: 'put', store, key, value });
-					},
-					delete(store, key) {
-						spy.storeHandles.push(store);
-						ops.push({ type: 'delete', store, key });
-					},
-					async write() {
-						spy.writeCalls++;
-						if (spy.failWrite) throw new Error('atomic write failed');
-						for (const op of ops) {
-							if (op.type === 'put') {
-								await op.store.put(op.key, op.value!);
-							} else {
-								await op.store.delete(op.key);
-							}
-						}
-						ops.length = 0;
-					},
-					clear() {
-						ops.length = 0;
-					},
-				};
-			};
-			return spy;
-		}
-
-		/** Monkey-patch a store's batch() to count fallback-path invocations. */
-		function spyBatch(target: InMemoryKVStore): () => number {
-			const orig = target.batch.bind(target);
-			let n = 0;
-			target.batch = () => { n++; return orig(); };
-			return () => n;
-		}
-
 		it('routes through the atomic batch when the factory yields one (data + index together)', async () => {
 			const spy = makeAtomicSpy();
 			const idx = new InMemoryKVStore();
 			const dataBatchCount = spyBatch(store);
 			const idxBatchCount = spyBatch(idx);
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			const coord = new TransactionCoordinator(emitter, spy.factory);
 
 			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));        // default/data store
-			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);  // index store
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);    // data store
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);      // index store
 			await coord.commit();
 
 			// One atomic commit, no per-store batch() fallback.
@@ -671,10 +614,10 @@ describe('TransactionCoordinator', () => {
 			const idx = new InMemoryKVStore();
 			const dataBatchCount = spyBatch(store);
 			const idxBatchCount = spyBatch(idx);
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			const coord = new TransactionCoordinator(emitter, spy.factory);
 
 			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
 			await coord.commit();
 
@@ -692,10 +635,10 @@ describe('TransactionCoordinator', () => {
 			// behave exactly as before (per-store batch loop).
 			const idx = new InMemoryKVStore();
 			const dataBatchCount = spyBatch(store);
-			const coord = new TransactionCoordinator(store, emitter);
+			const coord = new TransactionCoordinator(emitter);
 
 			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
 			await coord.commit();
 
@@ -708,10 +651,10 @@ describe('TransactionCoordinator', () => {
 		it('a rejected atomic write propagates, clears state, and leaks no ops', async () => {
 			const spy = makeAtomicSpy();
 			spy.failWrite = true;
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			const coord = new TransactionCoordinator(emitter, spy.factory);
 
 			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
 
 			let err: unknown;
 			try { await coord.commit(); } catch (e) { err = e; }
@@ -725,7 +668,7 @@ describe('TransactionCoordinator', () => {
 			// No ops leak into the next transaction; a now-succeeding write commits clean.
 			spy.failWrite = false;
 			coord.begin();
-			coord.put(new Uint8Array([2]), new Uint8Array([20]));
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), store);
 			await coord.commit();
 			expect(await store.get(new Uint8Array([1]))).to.be.undefined; // not resurrected
 			expect(await store.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
@@ -736,11 +679,11 @@ describe('TransactionCoordinator', () => {
 			const events: DataChangeEvent[] = [];
 			emitter.onDataChange(e => events.push(e));
 			let committed = false;
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			const coord = new TransactionCoordinator(emitter, spy.factory);
 			coord.registerCallbacks({ onCommit: () => { committed = true; }, onRollback: () => {} });
 
 			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coord.queueEvent({ type: 'insert', schemaName: 'main', tableName: 't' });
 			await coord.commit();
 
@@ -749,61 +692,25 @@ describe('TransactionCoordinator', () => {
 			expect(committed).to.be.true;
 		});
 
-		it('routes a default-only bucket through one atomic batch', async () => {
+		it('routes a single-store bucket through one atomic batch', async () => {
 			const spy = makeAtomicSpy();
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			const coord = new TransactionCoordinator(emitter, spy.factory);
 			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			await coord.commit();
 			expect(spy.writeCalls).to.equal(1);
 			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
 		});
 
-		it('routes an index-only bucket without ever resolving the default store', async () => {
-			const spy = makeAtomicSpy();
-			const idx = new InMemoryKVStore();
-			let opened = 0;
-			const coord = new TransactionCoordinator(
-				async () => { opened++; return new InMemoryKVStore(); },
-				emitter,
-				spy.factory,
-			);
-			coord.begin();
-			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
-			await coord.commit();
-			expect(spy.writeCalls).to.equal(1);
-			expect(opened).to.equal(0); // default bucket empty → never resolved
-			expect(await idx.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
-			await idx.close();
-		});
-
-		it('folds default-addressed-by-handle ops into one store entry (no double-write)', async () => {
-			const spy = makeAtomicSpy();
-			// `store` is a concrete handle → resolvedStore === store from construction,
-			// so an explicit `store` handle folds into the default (null) bucket.
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
-			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));         // by omission
-			coord.put(new Uint8Array([1]), new Uint8Array([99]), store);  // by handle, same key
-			await coord.commit();
-
-			expect(spy.writeCalls).to.equal(1);
-			// Both ops addressed the single resolved default handle.
-			expect(new Set(spy.storeHandles).size).to.equal(1);
-			expect(spy.storeHandles[0]).to.equal(store);
-			// Last-write-wins applied in order.
-			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([99]));
-		});
-
 		it('commit after rollback-to-savepoint writes exactly the surviving ops via the atomic batch', async () => {
 			const spy = makeAtomicSpy();
 			const idx = new InMemoryKVStore();
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			const coord = new TransactionCoordinator(emitter, spy.factory);
 			coord.begin();
-			coord.put(new Uint8Array([1]), new Uint8Array([10]));
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
 			coord.put(new Uint8Array([2]), new Uint8Array([20]), idx);
 			coord.createSavepoint(0);
-			coord.put(new Uint8Array([3]), new Uint8Array([30]));
+			coord.put(new Uint8Array([3]), new Uint8Array([30]), store);
 			coord.put(new Uint8Array([4]), new Uint8Array([40]), idx);
 			coord.rollbackToSavepoint(0);
 			await coord.commit();
@@ -818,11 +725,174 @@ describe('TransactionCoordinator', () => {
 
 		it('opens no atomic batch for an empty transaction', async () => {
 			const spy = makeAtomicSpy();
-			const coord = new TransactionCoordinator(store, emitter, spy.factory);
+			const coord = new TransactionCoordinator(emitter, spy.factory);
 			coord.begin();
 			await coord.commit();
 			expect(spy.beginCalls).to.equal(0);
 			expect(spy.writeCalls).to.equal(0);
+		});
+	});
+
+	describe('cross-table atomicity', () => {
+		// Two tables, each with a data store and a secondary-index store — four
+		// distinct handles on ONE module coordinator. The headline guarantee: a
+		// transaction touching both tables commits/rolls back as a single batch.
+		it('commits two tables (data + index) in one atomic batch spanning all stores', async () => {
+			const spy = makeAtomicSpy();
+			const tADataC = spyBatch(store);             // table A data = `store`
+			const tAIdx = new InMemoryKVStore();
+			const tBData = new InMemoryKVStore();
+			const tBIdx = new InMemoryKVStore();
+			const coord = new TransactionCoordinator(emitter, spy.factory);
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);   // A data
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), tAIdx);   // A index
+			coord.put(new Uint8Array([3]), new Uint8Array([30]), tBData);  // B data
+			coord.put(new Uint8Array([4]), new Uint8Array([40]), tBIdx);   // B index
+			await coord.commit();
+
+			// One atomic batch carried every store; no per-store fallback.
+			expect(spy.writeCalls).to.equal(1);
+			expect(tADataC()).to.equal(0);
+			expect(new Set(spy.storeHandles).size).to.equal(4);
+			expect(new Set(spy.storeHandles)).to.deep.equal(new Set([store, tAIdx, tBData, tBIdx]));
+
+			// All four stores landed together.
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await tAIdx.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+			expect(await tBData.get(new Uint8Array([3]))).to.deep.equal(new Uint8Array([30]));
+			expect(await tBIdx.get(new Uint8Array([4]))).to.deep.equal(new Uint8Array([40]));
+
+			await Promise.all([tAIdx.close(), tBData.close(), tBIdx.close()]);
+		});
+
+		it('a fault at write time leaves ALL tables unchanged (all-or-nothing)', async () => {
+			const spy = makeAtomicSpy();
+			spy.failWrite = true;
+			const tBData = new InMemoryKVStore();
+			const coord = new TransactionCoordinator(emitter, spy.factory);
+
+			// Pre-seed both tables with committed state that must survive the failed commit.
+			await store.put(new Uint8Array([0]), new Uint8Array([100]));
+			await tBData.put(new Uint8Array([0]), new Uint8Array([200]));
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), tBData);
+
+			let err: unknown;
+			try { await coord.commit(); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(Error);
+			expect(coord.isInTransaction()).to.be.false;
+
+			// Neither table received any of the transaction's writes...
+			expect(await store.get(new Uint8Array([1]))).to.be.undefined;
+			expect(await tBData.get(new Uint8Array([2]))).to.be.undefined;
+			// ...and pre-existing committed state on both tables is intact.
+			expect(await store.get(new Uint8Array([0]))).to.deep.equal(new Uint8Array([100]));
+			expect(await tBData.get(new Uint8Array([0]))).to.deep.equal(new Uint8Array([200]));
+
+			await tBData.close();
+		});
+
+		it('without the atomic capability, each store gets its own batch (no worse than prior per-table commits)', async () => {
+			const tBData = new InMemoryKVStore();
+			const aBatchCount = spyBatch(store);
+			const bBatchCount = spyBatch(tBData);
+			const coord = new TransactionCoordinator(emitter); // no factory → fallback
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), tBData);
+			await coord.commit();
+
+			// One batch per store (two stores → two batches).
+			expect(aBatchCount()).to.equal(1);
+			expect(bBatchCount()).to.equal(1);
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await tBData.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
+
+			await tBData.close();
+		});
+	});
+
+	describe('module-wide savepoints (idempotency)', () => {
+		// With one shared coordinator, N connections (plus registerConnection's
+		// savepoint replay) all push the SAME depth onto one stack. createSavepoint
+		// must be depth-idempotent so a duplicate same-depth push is ignored.
+		it('a duplicate createSavepoint at the same depth (registration replay) does not double-push', () => {
+			coordinator.begin();
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			coordinator.createSavepoint(0);   // first connection: pushes depth 0
+			coordinator.createSavepoint(0);   // registerConnection replay: must be a no-op
+
+			// Only depth 0 exists: a rollback-to depth 1 is out of range and warns.
+			// (Had the duplicate pushed a second entry, depth 1 would exist and not warn.)
+			const warned = captureWarn(() => coordinator.rollbackToSavepoint(1));
+			expect(warned).to.match(/out of range/i);
+
+			coordinator.rollback();
+		});
+
+		it('a broadcast second savepoint to all connections records exactly one entry', () => {
+			coordinator.begin();
+			coordinator.createSavepoint(0);   // push depth 0 (length 1)
+			coordinator.createSavepoint(1);   // push depth 1 (length 2)
+			coordinator.createSavepoint(1);   // broadcast duplicate at depth 1: no-op
+
+			// Depth 1 exists (no warn) but depth 2 does not (warn).
+			expect(captureWarn(() => coordinator.rollbackToSavepoint(1))).to.equal(null);
+			expect(captureWarn(() => coordinator.rollbackToSavepoint(2))).to.match(/out of range/i);
+
+			coordinator.rollback();
+		});
+
+		it('rollbackToSavepoint after an idempotent savepoint undoes post-savepoint ops across both tables', async () => {
+			const storeB = new InMemoryKVStore();
+
+			coordinator.begin();
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);    // A pre-savepoint
+			coordinator.put(new Uint8Array([1]), new Uint8Array([11]), storeB);   // B pre-savepoint
+			coordinator.createSavepoint(0);   // first connection pushes
+			coordinator.createSavepoint(0);   // second connection's replay: no-op
+			coordinator.put(new Uint8Array([2]), new Uint8Array([20]), store);    // A post-savepoint
+			coordinator.put(new Uint8Array([2]), new Uint8Array([21]), storeB);   // B post-savepoint
+			coordinator.rollbackToSavepoint(0);
+			await coordinator.commit();
+
+			// Pre-savepoint writes survive on both tables...
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+			expect(await storeB.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([11]));
+			// ...post-savepoint writes are undone on both tables.
+			expect(await store.get(new Uint8Array([2]))).to.be.undefined;
+			expect(await storeB.get(new Uint8Array([2]))).to.be.undefined;
+
+			await storeB.close();
+		});
+	});
+
+	describe('idempotent commit / rollback ordering (sequential per-connection loop)', () => {
+		// The engine commits each registered connection in turn. With a shared
+		// coordinator the FIRST connection.commit() flushes everything; subsequent
+		// commit()/rollback() calls on the same coordinator must no-op.
+		it('a second commit after the first flushes nothing and does not throw', async () => {
+			coordinator.begin();
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			await coordinator.commit();                  // first connection flushes
+			expect(coordinator.isInTransaction()).to.be.false;
+
+			await coordinator.commit();                  // second connection: no-op
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
+		});
+
+		it('a rollback after a commit is a no-op (committed data survives)', async () => {
+			coordinator.begin();
+			coordinator.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			await coordinator.commit();
+
+			coordinator.rollback();                      // not in transaction → no-op
+			expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
 		});
 	});
 });

@@ -200,12 +200,23 @@ const caps = storeModule.getCapabilities();
 - Savepoints (create / release / rollback-to) work within a transaction via the coordinator's buffered op log
   - Caveat: a DDL-commit operation (`replaceContents` / `renameTable`, e.g. `refresh materialized view` or `alter table … rename`) commits the coordinator mid-transaction, clearing the savepoint stack. A later `rollback to` / `release` targeting a now-vanished savepoint degrades to a no-op (warn-and-return) rather than throwing; the committed DDL and everything before it stays committed
 
-## Atomic multi-store commit
+## Atomic multi-store commit (module-wide, cross-table)
 
-`TransactionCoordinator.commit()` writes a table's data store and each of its
-secondary-index stores. By default it writes **one `KVStore.batch()` per store,
-sequentially** — a crash between those batches can leave a table's rows and its
-indexes divergent on disk, with no automatic healing.
+A single `TransactionCoordinator` is shared by **every table of one storage
+module** — it is the unit of cross-table atomicity. Every buffered op is
+addressed by its explicit target `KVStore` handle (data ops, secondary-index
+ops, and backing-host writes alike), so a transaction touching tables A and B
+accumulates all of their stores' ops in one coordinator. Because the engine
+commits virtual-table connections **sequentially** and the coordinator's
+`commit()`/`rollback()` are **idempotent**, the first connection to commit
+flushes **every** touched store of **every** table the transaction wrote; the
+remaining connections no-op.
+
+`TransactionCoordinator.commit()` thus writes each table's data store and each of
+its secondary-index stores. By default it writes **one `KVStore.batch()` per
+store, sequentially** — a crash between those batches can leave tables/indexes
+divergent on disk, with no automatic healing (no worse than the prior per-table
+commits, which were already non-atomic across tables).
 
 A provider whose stores share a single durable commit domain can close that
 window by implementing the optional `KVStoreProvider.beginAtomicBatch()`:
@@ -228,14 +239,15 @@ interface KVStoreProvider {
 
 The batch addresses stores by **`KVStore` handle**, so it composes with the
 coordinator's existing per-store bucketing without a name lookup. When present,
-`commit()` queues every pending op (data + indexes) into one `AtomicBatch` and
-issues a single `write()`; the whole table commits or rolls back together. When
-absent — or when the factory returns `undefined` — behavior is byte-identical to
-the per-store loop, so providers without a shared domain are unaffected.
+`commit()` queues every pending op — every store of **every table** in the
+transaction — into one `AtomicBatch` and issues a single `write()`; all of those
+tables commit or roll back together. When absent — or when the factory returns
+`undefined` — behavior is byte-identical to the per-store loop, so providers
+without a shared domain are unaffected.
 
-The capability surface deliberately spans **multiple stores of one provider**
-(not just one table's), so a future module-wide cross-table commit can reuse the
-exact same batch with no interface change. The
+The capability surface spans **multiple stores of one provider** (every store of
+every table the module owns), giving full module-wide cross-table atomicity with
+no interface change. The
 [`@quereus/plugin-indexeddb`](../quereus-plugin-indexeddb) provider implements it
 over its single IndexedDB database (multiple object stores, one
 `db.transaction(...,'readwrite')`), invalidating each touched store's read cache
@@ -246,8 +258,10 @@ after a successful write so read-your-own-writes survives the cache.
 The store module implements the engine's backing-host capability
 (`StoreBackingHost`), so `create materialized view mv using store as <body>`
 places the MV's backing table in persistent storage. Maintenance writes ride
-the per-table `TransactionCoordinator`'s pending state (committing/rolling back
-in lockstep with the source write), mid-transaction reads of the MV see pending
+the module's shared `TransactionCoordinator`'s pending state (committing/rolling
+back in lockstep with the source write — and, since the coordinator is
+module-wide, in the same all-or-nothing batch as a write to a same-module
+source), mid-transaction reads of the MV see pending
 maintenance through the read-your-own-writes merge, and the backing's text
 primary-key columns are keyed under the store's `collation` arg (default
 `NOCASE` — pass `using store(collation = 'BINARY')` for byte-exact keys). The
