@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-18T02:48:06.822Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\2-mv-discard-backing-attach-coverage.implement.2026-06-18T02-48-06-822Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: When attaching a maintained view fails, the engine has a hook to clean up a freshly-created storage backing — but nothing in this repo uses or tests it, so add a test that proves the cleanup fires only in the right cases.
 files:
   - packages/quereus/src/vtab/module.ts
