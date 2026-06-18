@@ -546,7 +546,7 @@ export class StoreTable extends VirtualTable {
 		const coordinator = this.attachCoordinator();
 
 		if (!this.connection) {
-			this.connection = new StoreConnection(this.tableName, coordinator);
+			this.connection = new StoreConnection(`${this.schemaName}.${this.tableName}`, coordinator);
 			await (this.db as DatabaseInternal).registerConnection(this.connection);
 		}
 

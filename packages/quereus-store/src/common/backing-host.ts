@@ -131,7 +131,7 @@ export class StoreBackingHost implements BackingHost {
 	 * coordinator into the live transaction state.
 	 */
 	connect(): VirtualTableConnection {
-		return new StoreConnection(this.table.tableName, this.coordinator, this.table);
+		return new StoreConnection(`${this.table.schemaName}.${this.table.tableName}`, this.coordinator, this.table);
 	}
 
 	/**
