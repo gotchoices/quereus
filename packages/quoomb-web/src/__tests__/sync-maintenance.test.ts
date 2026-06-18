@@ -76,6 +76,25 @@ describe('runSyncMaintenancePass', () => {
     expect(log).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledWith('pruneQuarantine', boom);
   });
+
+  it('isolates each failing sweep independently: two failures both run and both log', async () => {
+    const boom1 = new Error('drain boom');
+    const boom2 = new Error('evict boom');
+    const { target, calls } = makeFakeTarget({
+      drainHeldChanges: () => Promise.reject(boom1),
+      evictExpiredBasisTables: () => Promise.reject(boom2),
+    });
+    const log = vi.fn();
+
+    await expect(runSyncMaintenancePass(target, log)).resolves.toBeUndefined();
+
+    // Both failing sweeps and the two healthy ones in between all ran.
+    expect(calls).toEqual(ALL_SWEEPS);
+    // One log per failure, with the right (step, error) pair — no dedup / short-circuit.
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith('drainHeldChanges', boom1);
+    expect(log).toHaveBeenCalledWith('evictExpiredBasisTables', boom2);
+  });
 });
 
 describe('createSyncMaintenanceTicker', () => {
