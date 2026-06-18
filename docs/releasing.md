@@ -5,6 +5,14 @@
 Quereus uses [bumpp](https://github.com/antfu/bumpp) for version bumping and follows semver.
 Tags use the `v` prefix (e.g. `v1.0.0`).
 
+## Release notes
+
+Curate release notes during the cycle in an **untracked** `.release-notes.pending.md`
+at the repo root (gitignored). When `yarn gh-release` runs, it uses that file as the
+GitHub release body and then consumes (deletes) it. If the file is absent, the release
+falls back to GitHub's auto-generated notes — so the file is entirely optional. There is
+no committed `CHANGELOG.md`; the published GitHub releases are the canonical history.
+
 ## Prerequisites
 
 - `yarn build` succeeds
@@ -62,11 +70,14 @@ yarn pub:sync
 # etc.
 ```
 
-### 4. Create a GitHub release (optional)
+### 4. Create a GitHub release
 
 ```bash
-gh release create v{version} --generate-notes
+yarn gh-release
 ```
+
+Uses `.release-notes.pending.md` as the body if present (then deletes it), otherwise
+falls back to `gh release create v{version} --generate-notes`.
 
 ## Prerelease / RC
 
@@ -99,5 +110,6 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 - [ ] `yarn build` succeeds
 - [ ] `yarn test` passes
 - [ ] Clean working tree
+- [ ] `.release-notes.pending.md` curated (optional — omit for auto-generated notes)
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
-- [ ] GitHub release created
+- [ ] GitHub release created (`yarn gh-release`)

@@ -14,6 +14,9 @@ tasks/.logs/
 # Transient scheduled-tasks lock (per-session pid/lock; must not be committed)
 .claude/scheduled_tasks.lock
 
+# Pending release notes — curated during a cycle, consumed by `yarn gh-release`
+.release-notes.pending.md
+
 # Benchmark results
 packages/quereus/bench/results/
 
