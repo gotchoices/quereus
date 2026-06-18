@@ -1,4 +1,4 @@
-description: Upstream the inheritree COW-delete rebalance fix to the inheritree repo, cut a release, bump the dep, and drop the local Yarn patch.
+description: DONE (2026-06-17) — inheritree COW-delete fix published upstream as 0.4.0; local Yarn patch retired and dep bumped to ^0.4.0 in this repo.
 prereq:
 files:
   - .yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch   # the two-function patch to land upstream
@@ -8,6 +8,21 @@ files:
   - packages/quereus/test/logic/01.8.1-delete-range-cow.sqllogic
 difficulty: easy
 ----
+
+## Completed (2026-06-17)
+
+The upstream `inheritree` source was fixed and published as **0.4.0** (the two-function
+COW delete-rebalance fix documented below). In this repo all three remaining steps are done:
+- `packages/quereus/package.json` depends on `"inheritree": "^0.4.0"` (was the `patch:` locator).
+- `.yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch` deleted; `yarn.lock` regenerated
+  (`yarn install` resolved `inheritree@npm:0.4.0`, dropping patched 0.3.4).
+- Verified: full `@quereus/quereus` suite = **1070 passing**. The single observed failure
+  (`external-row-change-ingestion.spec.ts` "FK RESTRICT on apply") is **unrelated** — it is a
+  concurrent runner's in-flight `sync-fk-actions-restrict-skip-on-apply` work (the nested-cascade
+  scope flagged in that ticket), not this dep change. A B-tree regression would break hundreds of
+  memory-vtab tests, not one FK test.
+
+The original spec is retained below for history.
 
 # Upstream the `inheritree` COW range-delete fix and retire the local Yarn patch
 
