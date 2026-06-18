@@ -52,7 +52,15 @@ export type SyncStatus =
 /**
  * Sync event types for UI notifications.
  */
-export type SyncEventType = 'remote-change' | 'local-change' | 'conflict' | 'state-change' | 'error' | 'info';
+export type SyncEventType =
+  | 'remote-change'
+  | 'local-change'
+  | 'conflict'
+  | 'state-change'
+  | 'error'
+  | 'info'
+  | 'held-changes-drained'
+  | 'basis-evicted';
 
 /**
  * Sync event for UI display.
@@ -66,6 +74,8 @@ export interface SyncEvent {
     changeCount?: number;
     conflicts?: number;
     skipped?: number;
+    drained?: number;
+    applied?: number;
     conflictColumn?: string;
     winner?: 'local' | 'remote';
   };

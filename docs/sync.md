@@ -195,6 +195,8 @@ A retired table can come **back** — re-created app-side, or a `create_table` f
 
 Covered by the `drainHeldChanges (revival)` block in `unknown-table-disposition.spec.ts` (CRDT-metadata + in-memory stub-store level); an integration pass through the real store adapter is a hardening follow-up.
 
+**Who drives the sweep.** The library schedules nothing; the host owns cadence. The **quoomb-web worker** is the concrete host: it runs `drainHeldChanges` alongside `pruneQuarantine` / `pruneTombstones` / `evictExpiredBasisTables` on one periodic maintenance loop (5-minute default cadence, all four sweeps per pass, plus an immediate pass when the sync module initializes), so a reappeared table's held changes replay within one interval rather than waiting on horizon GC. The loop is owned by the sync **module** (starts on init, stops on `close()`, survives `disconnectSync()` so held changes drain even while offline); passes are single-flight and per-sweep error-isolated. The relay-only `sync-coordinator` has **no** such loop — with no `getTableSchema` oracle, `drainHeldChanges` is a no-op there anyway.
+
 ### Transaction-Based Change Grouping
 
 Changes are grouped by transaction. When syncing:

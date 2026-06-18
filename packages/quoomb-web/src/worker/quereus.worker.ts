@@ -14,7 +14,13 @@ import {
   type LocalChangeEvent,
   type ConflictEvent,
   type SyncState,
+  type HeldChangesDrainedEvent,
+  type BasisTableEvictedEvent,
 } from '@quereus/sync';
+import {
+  SYNC_MAINTENANCE_INTERVAL_MS,
+  createSyncMaintenanceTicker,
+} from './sync-maintenance.js';
 import { SyncClient, type SyncStatus as SyncClientStatus, type SyncEvent as SyncClientEvent } from '@quereus/sync-client';
 import type {
   QuereusWorkerAPI,
@@ -52,6 +58,11 @@ class QuereusWorker implements QuereusWorkerAPI {
   private syncStatus: SyncStatus = { status: 'disconnected' };
   private syncEventHistory: SyncEvent[] = [];
   private syncEventSubscribers = new Map<string, (event: SyncEvent) => void>();
+
+  // Periodic sync-maintenance loop. The library is timer-free; this worker owns
+  // the cadence that drives drainHeldChanges + the prune/evict sweeps. The
+  // re-entrancy / null-target guards live inside the ticker closure.
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
 
   // Database-level event subscribers (forwarded to UI via Comlink)
   private dataChangeSubscribers = new Map<string, DataChangeCallback>();
@@ -674,6 +685,11 @@ class QuereusWorker implements QuereusWorkerAPI {
 
     // Subscribe to sync events and forward to UI
     this.setupSyncEventListeners();
+
+    // Start the periodic maintenance loop. It lives with the sync *module* (not
+    // the connection): held changes drain even while offline, and the loop must
+    // survive disconnectSync() — so it is torn down only in close().
+    this.startSyncMaintenance();
   }
 
   private setupSyncEventListeners(): void {
@@ -726,6 +742,64 @@ class QuereusWorker implements QuereusWorkerAPI {
         message: `Sync state: ${state.status}`,
       });
     });
+
+    // Held out-of-basis changes replayed into a reappeared table by the
+    // maintenance loop's drainHeldChanges sweep (applied + skipped === drained).
+    this.syncEvents.onHeldChangesDrained((event: HeldChangesDrainedEvent) => {
+      this.addSyncEvent({
+        type: 'held-changes-drained',
+        timestamp: Date.now(),
+        message: `Drained ${event.drained} held change(s) into ${event.table} (applied ${event.applied}, skipped ${event.skipped})`,
+        details: {
+          table: event.table,
+          drained: event.drained,
+          applied: event.applied,
+          skipped: event.skipped,
+        },
+      });
+    });
+
+    // Detached basis table reclaimed by the maintenance loop's
+    // evictExpiredBasisTables sweep (now reachable because the loop runs it).
+    this.syncEvents.onBasisTableEvicted((event: BasisTableEvictedEvent) => {
+      this.addSyncEvent({
+        type: 'basis-evicted',
+        timestamp: Date.now(),
+        message: `Evicted detached basis table ${event.table}`,
+        details: {
+          table: event.table,
+        },
+      });
+    });
+  }
+
+  /**
+   * Arm the periodic sync-maintenance loop. Idempotent — a no-op if already
+   * armed (so a reconnect / re-init does not stack a second timer). Kicks off one
+   * immediate pass so held changes from a prior offline session drain on startup
+   * rather than waiting a full interval. The tick is fire-and-forget (errors are
+   * isolated inside the pass) and guarded against overlap + a null manager.
+   */
+  private startSyncMaintenance(): void {
+    if (this.maintenanceTimer) return; // already armed
+
+    const tick = createSyncMaintenanceTicker(
+      () => this.syncManager,
+      (step, error) => console.warn(`[quoomb-web] sync-maintenance step "${step}" failed:`, error),
+    );
+
+    this.maintenanceTimer = setInterval(() => void tick(), SYNC_MAINTENANCE_INTERVAL_MS);
+
+    // Immediate kick-off so a prior offline session's held changes drain now.
+    void tick();
+  }
+
+  /** Stop the periodic sync-maintenance loop. Idempotent. */
+  private stopSyncMaintenance(): void {
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
   }
 
   private convertSyncState(state: SyncState): SyncStatus {
@@ -902,6 +976,10 @@ class QuereusWorker implements QuereusWorkerAPI {
   }
 
   async close(): Promise<void> {
+    // Stop the maintenance loop before nulling syncManager below, so a timer
+    // firing mid-teardown cannot race the manager out from under a sweep.
+    this.stopSyncMaintenance();
+
     // Clean up sync connection
     if (this.syncClient) {
       await this.syncClient.disconnect();
