@@ -2202,6 +2202,7 @@ __metadata:
     "@quereus/store": "workspace:^"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.0.9"
+    abstract-level: "npm:^3.1.0"
     chai: "npm:^6.2.2"
     classic-level: "npm:^3.0.0"
     mocha: "npm:^11.7.5"
@@ -2301,7 +2302,7 @@ __metadata:
     eslint-plugin-import: "npm:^2.32.0"
     fast-check: "npm:^4.5.3"
     fast-json-patch: "npm:^3.1.1"
-    inheritree: "patch:inheritree@npm%3A0.3.4#~/.yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch"
+    inheritree: "npm:^0.4.0"
     moat-maker: "npm:^2.2.0"
     mocha: "npm:^11.7.5"
     rimraf: "npm:^6.1.2"
@@ -6594,17 +6595,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"inheritree@npm:0.3.4":
-  version: 0.3.4
-  resolution: "inheritree@npm:0.3.4"
-  checksum: 10c0/31c3791c5d140a04c952ccd9ca8db05bc5a5cfbc89cd6b966f483e5548819f084a9d1776a4f8e2d31c5da5f627c383a8ef62a5ae228ee3625fb3889811c97c27
-  languageName: node
-  linkType: hard
-
-"inheritree@patch:inheritree@npm%3A0.3.4#~/.yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch":
-  version: 0.3.4
-  resolution: "inheritree@patch:inheritree@npm%3A0.3.4#~/.yarn/patches/inheritree-npm-0.3.4-ab742b70cb.patch::version=0.3.4&hash=4a59ee"
-  checksum: 10c0/b91c87ea27bde963878932e67a6ef8a7f523a9e74b4a42b2cad55ce2708dea7a3d1662fce1b9ef55816d3e15609c46bd83bf30575b1f8447d83f4242fa349d9e
+"inheritree@npm:^0.4.0":
+  version: 0.4.0
+  resolution: "inheritree@npm:0.4.0"
+  checksum: 10c0/d96011ee4ac3b07724fb3cfb59af16c9e53ea9b614db40da26fa5b2ba84b1cb51459213c3ac8fb703edd744d18b46c6f01f7134c1a6098832af1acade2fb5e12
   languageName: node
   linkType: hard
 
