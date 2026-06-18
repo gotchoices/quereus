@@ -196,6 +196,51 @@ async function makeFilledPeer(
 	return peer;
 }
 
+/**
+ * Filtered-schema sibling of {@link makeFilledPeer}: `src` carries a third
+ * WHERE-only column `g` (the staleness lever for the stale-drift refresh suite —
+ * see its docstring). The MV PROJECTS only `(id, v)` but FILTERS on `g <> 'skip'`,
+ * so `g` is read by the body yet absent from the MV's shape. `src` is seeded
+ * BEFORE the tagged MV (one multi-row insert → one src transaction), so the MV's
+ * create-fill is non-empty; every seeded row must satisfy `g <> 'skip'` (the
+ * caller's contract) so the fill equals the full seed.
+ */
+async function makeFilteredFilledPeer(
+	name: string,
+	seedRows: ReadonlyArray<{ id: number; v: string; g: string }>,
+): Promise<Peer> {
+	const peer = await makeBarePeer(name);
+
+	await peer.db.exec('create table src (id integer primary key, v text, g text) using store');
+	const values = seedRows.map(r => `(${r.id}, '${r.v}', '${r.g}')`).join(', ');
+	await peer.db.exec(`insert into src values ${values}`);
+	await peer.db.exec(
+		`create materialized view mv using store as select id, v from src where g <> 'skip' `
+		+ `with tags ("quereus.sync.replicate" = true)`,
+	);
+
+	return peer;
+}
+
+/**
+ * Filtered-schema sibling of {@link makePeer}: identical schema to
+ * {@link makeFilteredFilledPeer} but the MV is created over an EMPTY `src`, so its
+ * own create-fill emits nothing. This is the peer that INGESTS A's relayed drift
+ * (it never receives the `alter`, so its MV stays live) and must converge + stay
+ * quiescent — exactly like the empty `makePeer` does for the row-time / cold paths.
+ */
+async function makeFilteredEmptyPeer(name: string): Promise<Peer> {
+	const peer = await makeBarePeer(name);
+
+	await peer.db.exec('create table src (id integer primary key, v text, g text) using store');
+	await peer.db.exec(
+		`create materialized view mv using store as select id, v from src where g <> 'skip' `
+		+ `with tags ("quereus.sync.replicate" = true)`,
+	);
+
+	return peer;
+}
+
 async function closePeer(peer: Peer): Promise<void> {
 	await peer.db.close();
 	await peer.provider.closeAll();
@@ -589,14 +634,248 @@ describe('create-fill of a populated source publishes one grouped change-set', (
 		expect(afterMvSets.length, 'still exactly one mv ChangeSet after refresh').to.equal(1);
 		const afterMvChanges = after.flatMap(cs => cs.changes).filter(c => c.table === 'mv').length;
 		expect(afterMvChanges, 'no new mv changes published by refresh').to.equal(beforeMvChanges);
+	});
+});
 
-		// DEFERRED — the non-empty refresh-grouping half (a refresh that diffs to >= 1
-		// delta and groups it under one HLC) needs the committed MV to have DRIFTED from
-		// its body WITHOUT row-time maintenance having applied it (the "stale table"
-		// trigger in rebuildBacking's docstring, materialized-view-helpers.ts:1391).
-		// That cannot be staged in this synced-MV harness without hacking internals, so
-		// it is filed as backlog ticket `sync-refresh-stale-fill-grouped-changeset-test`.
-		// The unit suite already covers refresh-path delta correctness; residual
-		// grouping risk is low.
+/**
+ * Stale-drift refresh grouping: the SECOND `replaceContents` call site —
+ * `rebuildBacking`'s fast path (materialized-view-helpers.ts), reached by `refresh
+ * materialized view` when `backingShapeMatches` (materialized-view.ts) — for a
+ * refresh that diffs to >= 1 delta. This asserts that delta publishes to peers as
+ * ONE grouped change-set under a single HLC, exactly like the create-fill path
+ * proven in the suite above. (The non-empty refresh-grouping half the create-fill
+ * suite deferred.)
+ *
+ * Staging a genuine stale drift needs NO engine-internal hook — it is fully
+ * expressible in public SQL with a WHERE-only column `g` as the staleness lever
+ * (the recipe in `maintained-table-refresh-revalidation.spec.ts`):
+ *
+ *   - `alter table src alter column g set collate nocase` is a value-semantics
+ *     change to a column the body READS (in its `where g <> 'skip'` predicate). The
+ *     content-stability gate (`valueSemanticsChangedColumns ∩ referencedSourceColumns
+ *     ≠ ∅`) therefore declines an in-place recompile → the MV is marked STALE and its
+ *     row-time plan DETACHED. `g` is NOT projected, so the derived backing shape stays
+ *     `(id, v)` → `backingShapeMatches` stays true → refresh takes the `replaceContents`
+ *     FAST PATH (not the reshape arm — the seam this test targets).
+ *   - while stale, `update src set v = …` is NOT maintained into the MV → the committed
+ *     MV backing LAGS the body (the genuine drift).
+ *   - `refresh` recomputes the body; the replicating `replaceContents` diffs the
+ *     recomputed rows against the committed before-image and queues `op:'update'` per
+ *     drifted key, batched under `db._ensureTransaction()` → ONE grouped change-set /
+ *     one HLC.
+ *
+ * Peer-side convergence is identical to the create-fill / row-time quiescence proofs.
+ * B is built over an EMPTY filtered `src` and stays LIVE — it never receives the
+ * `alter` (relay strips `schemaMigrations`, pinning data echo not DDL). A→B relays
+ * the src drift rows + the mv refresh delta; B's seam re-derives the mv from the
+ * ingested src updates AFTER A's relayed mv rows are already committed →
+ * value-identical → `mv-noop-upsert-suppression` fires → no B-origin echo.
+ *
+ * Collation-qualification parity (must hold): B's `g` stays BINARY while A's becomes
+ * NOCASE, so the seed value `'keep'` is chosen because `'keep' <> 'skip'` is true
+ * under BOTH BINARY and NOCASE — the same rows qualify on both peers and the mv
+ * content cannot diverge for a collation reason. (Never a `g` value that differs from
+ * `'skip'` only by case.)
+ */
+describe('stale-drift refresh of a materialized view publishes one grouped change-set', () => {
+	// Seed all-qualifying (`g <> 'skip'` under both BINARY and NOCASE), so create-fill
+	// equals the full seed and the convergence deep-equal is meaningful.
+	const SEED: ReadonlyArray<{ id: number; v: string; g: string }> = [
+		{ id: 1, v: 'a', g: 'keep' },
+		{ id: 2, v: 'b', g: 'keep' },
+		{ id: 3, v: 'c', g: 'keep' },
+	];
+	const N = SEED.length;
+	// The MV projects `(id, v)` — `g` is WHERE-only, NOT in the MV schema — so a cold
+	// create-fill row records 2 ColumnChanges (id + v, PK included for a fresh insert),
+	// exactly like the create-fill suite above. Used only for the before-refresh
+	// precondition guard.
+	const COLUMNS_PER_FRESH_INSERT = 2;
+	// The drift updates `v` on two of the three rows (id=1, id=2); id=3 is left
+	// untouched, so the refresh diffs to exactly two `op:'update'` deltas.
+	const DRIFTED_ROWS = 2;
+	// An UPDATE records only the columns that DIFFER (`recordColumnVersions`): `id` is
+	// unchanged, so ONLY the non-PK `v` is recorded per drifted row — the PK is NOT
+	// re-recorded (contrast the fresh-insert create-fill, which records `id` too). So
+	// the refresh set carries `DRIFTED_ROWS × this`. Pinned as a named const (mirroring
+	// COLUMNS_PER_FRESH_INSERT) so a future multi-column drift doesn't silently break it.
+	const CHANGED_NONPK_COLUMNS = 1;
+	// The converged `(id, v)` contents after the drift + refresh: id=1,2 carry the
+	// drifted `v`, id=3 keeps the seed `v`.
+	const DRIFTED_CONTENTS = [
+		{ id: 1, v: 'A2' },
+		{ id: 2, v: 'B2' },
+		{ id: 3, v: 'c' },
+	];
+
+	let A: Peer; // producer: filtered src seeded BEFORE the tagged MV → non-empty create-fill
+	let B: Peer; // peer: filtered MV over an empty src → its own create-fill emits nothing
+
+	beforeEach(async () => {
+		A = await makeFilteredFilledPeer('A', SEED);
+		B = await makeFilteredEmptyPeer('B');
+		await settle(); // flush A's fire-and-forget create-fill capture before reading its log
+	});
+
+	afterEach(async () => {
+		await closePeer(A);
+		await closePeer(B);
+	});
+
+	const mvRecord = (peer: Peer) => peer.db.schemaManager.getMaintainedTable('main', 'mv');
+
+	/**
+	 * Stale the MV (value-semantics ALTER on the WHERE-only column `g`) then drift two
+	 * rows in the now-unmaintained `src`. Three SEPARATE `exec` calls → three separate
+	 * engine transactions (the alter is metadata-only / DDL; each update its own src
+	 * commit) — so the refresh's grouping cannot accidentally fuse with the drift.
+	 */
+	async function staleAndDrift(): Promise<void> {
+		await A.db.exec('alter table src alter column g set collate nocase');
+		await A.db.exec("update src set v = 'A2' where id = 1");
+		await A.db.exec("update src set v = 'B2' where id = 2");
+		await settle();
+	}
+
+	it('A: the refresh delta surfaces as exactly one ChangeSet (drifted rows × changed columns, one transaction, one base HLC)', async () => {
+		// Precondition: before the refresh A's ONLY mv ChangeSet is the create-fill (the
+		// alter + drift below do not touch the stale MV). Capture its txn ids so the new
+		// (refresh) set is identifiable by exclusion.
+		const beforeSets = await A.manager.getChangesSince(generateSiteId());
+		const beforeMvSets = beforeSets.filter(cs => cs.changes.some(c => c.table === 'mv'));
+		expect(beforeMvSets.length, 'before refresh: exactly the create-fill mv ChangeSet').to.equal(1);
+		expect(
+			beforeMvSets[0].changes.filter(c => c.table === 'mv').length,
+			'create-fill change count (rows × columns-per-fresh-insert)',
+		).to.equal(N * COLUMNS_PER_FRESH_INSERT);
+		const createFillTxnId = beforeMvSets[0].transactionId;
+		const beforeTxnIds = new Set(beforeSets.map(cs => cs.transactionId));
+
+		await staleAndDrift();
+
+		// VACUOUS-GREEN GUARD: the drift actually drifted. A stale MV serves its committed
+		// (lagging) contents on read, so it still shows the SEED values — proving the drift
+		// was NOT maintained in and the refresh therefore has genuine deltas to publish. A
+		// silent stale-trigger failure would surface the drifted values here and go red.
+		expect(
+			await collect(A.db, 'select id, v from mv order by id'),
+			'committed MV lags the body before refresh (drift not maintained)',
+		).to.deep.equal(SEED.map(r => ({ id: r.id, v: r.v })));
+		// Direct read of the staleness gate: the value-semantics ALTER marked the MV stale.
+		expect(mvRecord(A)?.derivation.stale, 'the alter marked the MV stale').to.equal(true);
+
+		await A.db.exec('refresh materialized view mv');
+		await settle();
+
+		// FAST-PATH / SHAPE PIN: the MV's column set stays `(id, v)`. `g` MUST remain
+		// WHERE-only — if a future edit projected it, the alter would RESHAPE and the test
+		// would silently drift off the `replaceContents` fast path onto the reshape arm.
+		expect(
+			mvRecord(A)?.columns.map(c => c.name),
+			'MV shape stays (id, v) → refresh stays on the replaceContents fast path (not reshape)',
+		).to.deep.equal(['id', 'v']);
+		// A successful fast-path rebuild clears stale.
+		expect(mvRecord(A)?.derivation.stale, 'the refresh cleared stale').to.equal(false);
+		// Convergence on A: the refresh recomputed the drifted body.
+		expect(await collect(A.db, 'select id, v from mv order by id')).to.deep.equal(DRIFTED_CONTENTS);
+
+		// THE GROUPING CRUX. After the refresh A has exactly TWO mv ChangeSets: the
+		// (dedup-trimmed) create-fill set and the refresh delta set. The refresh delta is
+		// exactly ONE set — N ungrouped singletons (the regression this guards) would be N.
+		const afterSets = await A.manager.getChangesSince(generateSiteId());
+		const afterMvSets = afterSets.filter(cs => cs.changes.some(c => c.table === 'mv'));
+		expect(afterMvSets.length, 'after refresh: create-fill set + one refresh delta set').to.equal(2);
+
+		const refreshSets = afterMvSets.filter(cs => !beforeTxnIds.has(cs.transactionId));
+		expect(refreshSets.length, 'the refresh delta is exactly one new grouped ChangeSet').to.equal(1);
+		const refreshSet = refreshSets[0];
+		const refreshMvChanges = refreshSet.changes.filter(c => c.table === 'mv');
+
+		// NON-EMPTY GUARD: a drift that silently propagated (or an alter that failed to
+		// stale) would make this vacuously green — go red instead.
+		expect(refreshMvChanges.length, 'refresh delta is non-empty').to.be.greaterThan(0);
+		// GRANULARITY: one ColumnChange per drifted row × changed non-PK column. The PK is
+		// excluded for an UPDATE — distinct from the fresh-insert create-fill set above
+		// (which records the PK too: N × COLUMNS_PER_FRESH_INSERT).
+		expect(
+			refreshMvChanges.length,
+			'one ColumnChange per drifted row × changed non-PK column',
+		).to.equal(DRIFTED_ROWS * CHANGED_NONPK_COLUMNS);
+		// Each refresh change is a column write of the only drifted non-PK column, `v`.
+		expect(
+			refreshMvChanges.every(c => c.type === 'column' && c.column === 'v'),
+			'each refresh change is a v-column write',
+		).to.equal(true);
+		// The drifted values are distinguishable — one distinct `v` per drifted row.
+		const driftedValues = refreshMvChanges
+			.filter((c): c is ColumnChange => c.type === 'column' && c.column === 'v')
+			.map(c => c.value)
+			.sort();
+		expect(driftedValues, 'distinct drifted v per row').to.deep.equal(['A2', 'B2']);
+
+		// ONE TRANSACTION / ONE BASE HLC: every refresh change shares the set's
+		// transactionId and the same base HLC (wallTime/counter/siteId equal; only opSeq
+		// differs) — the explicit single-HLC claim, exactly as the create-fill test asserts.
+		for (const c of refreshMvChanges) {
+			expect(deterministicTxnId(c.hlc), 'refresh change belongs to the set transaction').to.equal(refreshSet.transactionId);
+			expect(c.hlc.wallTime, 'same base wallTime').to.equal(refreshSet.hlc.wallTime);
+			expect(c.hlc.counter, 'same base counter').to.equal(refreshSet.hlc.counter);
+			expect(Array.from(c.hlc.siteId), 'same base siteId').to.deep.equal(Array.from(refreshSet.hlc.siteId));
+		}
+
+		// DISTINCTNESS: the refresh delta is its OWN commit group — not fused into the
+		// create-fill set, nor into any src ChangeSet (the seed and the two drift updates).
+		expect(refreshSet.transactionId, 'refresh txn distinct from create-fill txn').to.not.equal(createFillTxnId);
+		const srcTxnIds = afterSets.filter(cs => cs.changes.some(c => c.table === 'src')).map(cs => cs.transactionId);
+		expect(
+			srcTxnIds.includes(refreshSet.transactionId),
+			'refresh txn distinct from every src (seed + drift) txn',
+		).to.equal(false);
+	});
+
+	it('A→B: the refresh delta is delivered remotely as a grouped transaction, converges, and stays quiescent', async () => {
+		// Subscribe BEFORE the relay so we can prove B applies the relayed mv rows
+		// remote:true and fires NO local re-derivation (the suppression proof the echo-loop
+		// + cold-fill suites use, reused here for the refresh-delta path).
+		const bEvents: DataChangeEvent[] = [];
+		B.events.onDataChange(e => bEvents.push(e));
+
+		// Precondition: B's own create-fill is empty (B's src was empty when B's MV was
+		// created), so B holds ZERO B-origin mv changes before the relay.
+		const bBefore = await changesFor(B, A.manager.getSiteId());
+		expect(
+			bBefore.some(c => (c as { table: string }).table === 'mv'),
+			'B has no B-origin mv change before the relay',
+		).to.equal(false);
+
+		await staleAndDrift();
+		await A.db.exec('refresh materialized view mv');
+		await settle();
+
+		const res = await relay(A, B);
+		expect(res.applied, "B applied A's relayed drift + refresh delta").to.be.greaterThan(0);
+
+		// Convergence: B's mv equals the drifted rows AND equals A's mv; likewise src.
+		expect(await collect(B.db, 'select id, v from mv order by id')).to.deep.equal(DRIFTED_CONTENTS);
+		expect(
+			await collect(B.db, 'select id, v from mv order by id'),
+			"B's mv deep-equals A's mv",
+		).to.deep.equal(await collect(A.db, 'select id, v from mv order by id'));
+		expect(
+			await collect(B.db, 'select id, v from src order by id'),
+			"B's src deep-equals A's src",
+		).to.deep.equal(await collect(A.db, 'select id, v from src order by id'));
+
+		// GROUPED, QUIESCENT DELIVERY (the remote-event proof reused from the create-fill
+		// suite): B received the relayed mv rows remote:true, fired NO local mv
+		// re-derivation, and logs zero B-origin echo.
+		const remoteMvEvents = bEvents.filter(e => e.tableName === 'mv' && e.remote);
+		expect(remoteMvEvents.length, 'B received the relayed mv delta as remote writes').to.be.greaterThan(0);
+		const localMvEvents = bEvents.filter(e => e.tableName === 'mv' && !e.remote);
+		expect(localMvEvents, 'no local mv re-derivation on B (refresh delta suppressed)').to.have.length(0);
+		expect(
+			await changesFor(B, A.manager.getSiteId()),
+			'no B-origin echo recorded (refresh-delta quiescence)',
+		).to.have.length(0);
 	});
 });
