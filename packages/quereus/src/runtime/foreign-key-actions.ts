@@ -172,6 +172,9 @@ export async function assertTransitiveRestrictsForParentMutation(
 	visited?: Set<string>,
 ): Promise<void> {
 	log('TRANSITIVE entry: parent=%s op=%s lensRouted=%o fk-pragma=%o', parentTable.name, operation, lensRouted, db.options.getBooleanOption('foreign_keys'));
+	// Trust-the-origin apply path: RESTRICT is enforced by the origin at its own commit,
+	// so the receiver skips it (gating cascade-action propagation is intentionally NOT here).
+	if (db._isFkRestrictSuppressed()) return;
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
 	const visitedSet = visited ?? new Set<string>();
@@ -345,6 +348,9 @@ export async function assertNoRestrictedChildrenForParentMutation(
 	newRow?: Row,
 	lensRouted = false,
 ): Promise<void> {
+	// Trust-the-origin apply path: RESTRICT is enforced by the origin at its own commit,
+	// so the receiver skips it (gating cascade-action propagation is intentionally NOT here).
+	if (db._isFkRestrictSuppressed()) return;
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
 	// Basis RESTRICT FKs a divergent non-RESTRICT logical FK overrides — their RESTRICT
@@ -756,6 +762,9 @@ export async function assertLensRestrictsForParentMutation(
 	oldRow: Row,
 	newRow?: Row,
 ): Promise<void> {
+	// Trust-the-origin apply path: RESTRICT is enforced by the origin at its own commit,
+	// so the receiver skips it (gating cascade-action propagation is intentionally NOT here).
+	if (db._isFkRestrictSuppressed()) return;
 	if (!db.options.getBooleanOption('foreign_keys')) return;
 
 	const sm = db.schemaManager;

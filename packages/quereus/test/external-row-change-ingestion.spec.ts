@@ -345,8 +345,14 @@ describe('Database.ingestExternalRowChanges (external row-change ingestion)', ()
 		});
 	});
 
-	describe('FK RESTRICT mid-batch: batch atomicity for derived effects', () => {
-		it('throws, rolls back an earlier change\'s backing delta, fires no watch', async () => {
+	describe('FK RESTRICT on apply: trust-the-origin skip', () => {
+		// Decision (signed off): the external-row apply path skips parent-side FK RESTRICT
+		// entirely. The origin already enforced RESTRICT at its own commit; re-enforcing here
+		// would throw -> no metadata commit -> re-apply the identical batch -> throw forever,
+		// wedging the stream. Only the non-RESTRICT actions (cascade / set-null / set-default)
+		// propagate. A replica-only RESTRICT invariant is, by design, not enforced on apply;
+		// express it as a global assertion (detect-and-notify) if the receiver must be notified.
+		it('a parent-delete whose child is on delete restrict COMMITS - RESTRICT skipped, child survives, no cascade', async () => {
 			await db.exec(`
 				create table t (id integer primary key, v text);
 				create materialized view mv as select id, v from t;
@@ -358,20 +364,91 @@ describe('Database.ingestExternalRowChanges (external row-change ingestion)', ()
 			const events: WatchEvent[] = [];
 			const sub = db.watch(db.prepare('select * from t').getChangeScope(), e => { events.push(e); });
 
-			await expectThrows(
-				() => db.ingestExternalRowChanges([
-					chg('t', { op: 'insert', newRow: [1, 'a'] }),
-					chg('p', { op: 'delete', oldRow: [1] }),
-				], { applyForeignKeyActions: true }),
-				'RESTRICT',
-			);
+			// The same batch that used to throw RESTRICT + roll back now commits.
+			await db.ingestExternalRowChanges([
+				chg('t', { op: 'insert', newRow: [1, 'a'] }),
+				chg('p', { op: 'delete', oldRow: [1] }),
+			], { applyForeignKeyActions: true });
 			sub.unsubscribe();
 
-			// The earlier change's backing delta unwound with the batch savepoint;
-			// the implicit transaction rolled back; capture never dispatched.
-			expect(await readAll(db, 'select * from mv')).to.deep.equal([]);
-			expect(events).to.have.length(0);
-			expect(db.getAutocommit(), 'no transaction left open').to.equal(true);
+			const mvRows = (await readAll(db, 'select id, v from mv order by id')).map(r => ({ id: Number(r.id), v: r.v }));
+			expect(mvRows, "t's insert landed in the MV").to.deep.equal([{ id: 1, v: 'a' }]);
+			expect(events, 'watch on t fired post-commit').to.have.length(1);
+			expect(db.getAutocommit(), 'batch committed, not rolled back').to.equal(true);
+			expect((await readAll(db, 'select id from c')).map(r => Number(r.id)),
+				'RESTRICT child survives (RESTRICT is not an action, nothing cascades)').to.deep.equal([10]);
+			expect(db._isFkRestrictSuppressed(), 'suppression flag cleared after the batch').to.equal(false);
+		});
+
+		it('a nested cascade reaching a RESTRICT grandchild COMMITS - child cascade-deleted, grandchild dangles, no throw', async () => {
+			// Depth >= 1: delete p cascades to c (on delete cascade); the cascade DELETE on c
+			// re-enters the DML executor, whose RESTRICT pre-check would normally trip on g
+			// (on delete restrict). The apply-mode flag suppresses that nested RESTRICT too, so
+			// the cascade completes: c is deleted, g is left dangling - the trust-the-origin
+			// outcome (the origin's stream carries g's consistent state separately).
+			await db.exec(`
+				create table p (id integer primary key);
+				create table c (id integer primary key, pid integer not null references p(id) on delete cascade);
+				create table g (id integer primary key, cid integer not null references c(id) on delete restrict);
+				insert into p values (1);
+				insert into c values (10, 1);
+				insert into g values (100, 10);
+			`);
+
+			await db.ingestExternalRowChanges(
+				[chg('p', { op: 'delete', oldRow: [1] })],
+				{ applyForeignKeyActions: true },
+			);
+
+			expect(await readAll(db, 'select * from c'), 'child cascade-deleted').to.deep.equal([]);
+			expect((await readAll(db, 'select id from g')).map(r => Number(r.id)),
+				'RESTRICT grandchild survives (dangling)').to.deep.equal([100]);
+			expect(db.getAutocommit(), 'batch committed').to.equal(true);
+		});
+
+		it('post-batch: a normal delete still enforces RESTRICT (the flag was restored)', async () => {
+			await db.exec(`
+				create table p (id integer primary key);
+				create table c (id integer primary key, pid integer not null references p(id) on delete restrict);
+				insert into p values (1);
+				insert into c values (10, 1);
+			`);
+
+			// An apply batch with the facet on sets the suppression flag; the RESTRICT on c is
+			// skipped. The facet does not remove p from storage, so p and c both survive.
+			await db.ingestExternalRowChanges(
+				[chg('p', { op: 'delete', oldRow: [1] })],
+				{ applyForeignKeyActions: true },
+			);
+			expect(db._isFkRestrictSuppressed(), 'flag restored after the batch').to.equal(false);
+
+			// The SAME RESTRICT now blocks a normal DML delete (proves no leak past the batch).
+			await expectThrows(() => db.exec('delete from p'), 'constraint failed');
+			expect(db.getAutocommit(), 'failed normal delete left no open transaction').to.equal(true);
+			expect((await readAll(db, 'select id from c')).map(r => Number(r.id)),
+				'normal delete blocked, child intact').to.deep.equal([10]);
+		});
+
+		it('flag is restored after a NON-RESTRICT throw mid-batch (cascade trips NOT NULL)', async () => {
+			// A cascade SET NULL onto a NOT NULL child column throws NOT NULL (a non-RESTRICT
+			// failure) mid-batch. The `finally` must still restore the suppression flag so a
+			// later normal statement re-enforces RESTRICT - the load-bearing correctness property.
+			await db.exec(`
+				create table p (id integer primary key);
+				create table c (id integer primary key, pid integer not null references p(id) on delete set null);
+				insert into p values (1);
+				insert into c values (10, 1);
+			`);
+
+			await expectThrows(
+				() => db.ingestExternalRowChanges(
+					[chg('p', { op: 'delete', oldRow: [1] })],
+					{ applyForeignKeyActions: true },
+				),
+				'NOT NULL',
+			);
+			expect(db._isFkRestrictSuppressed(), 'flag restored even after a non-RESTRICT throw').to.equal(false);
+			expect(db.getAutocommit(), 'failed implicit batch rolled back to autocommit').to.equal(true);
 		});
 	});
 

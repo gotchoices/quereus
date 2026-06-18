@@ -441,16 +441,34 @@ realistic batch shapes: **global assertions** — the home for referential invar
 want the replica itself to enforce, and which cover self-referential and cyclic FKs that
 no topological table sort can handle — and **opt-in FK actions** (`applyForeignKeyActions`,
 default off). The FK-actions facet is order-independent because the adapter writes every
-table's rows to storage *before* the single seam call, so both FK helpers (the RESTRICT
-walk and cascade DML) re-read the fully-merged post-write state regardless of which
-parent's change entry appears first in the seam batch.
+table's rows to storage *before* the single seam call, so the cascade DML re-reads the
+fully-merged post-write state regardless of which parent's change entry appears first in
+the seam batch.
 
-The two exotic limitations that no seam-batch ordering fixes: **(E)** a child referenced
-by two FKs where one parent mutation carries a CASCADE that relieves the same child row
-blocked by another parent's RESTRICT — the outcome depends on which cascade fires first,
-and the seam batch carries no intra-transaction DML order to reconstruct that; **(F)** a
-child of two parents with diverging actions (cascade-delete vs. set-null) where the
-final child state depends on evaluation order. Both topologies are handled by keeping
+**Parent-side RESTRICT is not enforced on apply.** Trust-the-origin means the origin
+already enforced RESTRICT at its own commit; re-enforcing it on the receiver would *wedge*
+the stream (the RESTRICT throw aborts the batch → no metadata commit → the same batch is
+re-resolved and re-applied → it throws again, forever). So the apply path skips parent-side
+RESTRICT entirely and propagates only the non-RESTRICT actions (cascade / set-null /
+set-default), at **every cascade depth**. This is implemented as an **apply-mode RESTRICT
+suppression** threaded through the whole DML pipeline: the seam sets a flag for the duration
+of the batch (mutex held, restored in a `finally`), and it is honored uniformly by the
+runtime RESTRICT pre-checks (`runtime/foreign-key-actions.ts`), by every **nested cascade
+DML** and **MV-maintenance** FK pass those re-enter, and — crucially — by the **plan-time
+parent-side FK check** synthesized into each cascade statement's plan
+(`runtime/emit/constraint-check.ts`, the `fk-parent` constraint kind), which is the primary
+enforcer a depth-≥1 cascade would otherwise trip. A replica-only RESTRICT invariant is, **by
+design, not enforced on apply**; if the receiver must be *notified* of a referential
+invariant, express it as a **global assertion** (detect-and-notify), which covers
+self-referential and cyclic shapes that no table sort can.
+
+The one exotic limitation that no seam-batch ordering fixes: **(F)** a child of two parents
+with diverging actions (cascade-delete vs. set-null) where the final child state depends on
+evaluation order — the seam batch carries no intra-transaction DML order to reconstruct it.
+(**(E)** — a child referenced by two FKs where one parent's CASCADE relieves the same row
+another parent's RESTRICT blocks — is now moot: RESTRICT never throws on apply, so it no
+longer wedges; at worst the cascade outcome on the shared child depends on which cascade
+fires first, the same evaluation-order caveat as (F).) Both are handled by keeping
 `applyForeignKeyActions` off (the default — let the stream carry the origin's cascade
 effects) or by expressing the referential invariant as a **global assertion** (evaluated
 over merged state at the batch boundary; order-independent by construction and able to

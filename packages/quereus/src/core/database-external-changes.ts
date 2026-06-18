@@ -27,7 +27,6 @@ import type { Database } from './database.js';
 import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
 import type { AssertionViolation } from './database-assertions.js';
 import {
-	assertTransitiveRestrictsForParentMutation,
 	executeForeignKeyActionsAndLens,
 } from '../runtime/foreign-key-actions.js';
 import { createLogger } from '../common/logger.js';
@@ -141,6 +140,14 @@ export async function ingestExternalRowChangeBatch(
 	// already-holding-the-mutex variant), and the batch's savepoint scope must
 	// not interleave with another statement's.
 	const releaseMutex = await db._acquireExecMutex();
+	// Trust-the-origin apply path: skip parent-side FK RESTRICT enforcement for the whole
+	// batch (the origin already enforced it at its own commit; re-enforcing here would wedge
+	// the sync stream). Set BEFORE the change loop so every nested cascade DML and
+	// MV-maintenance FK pass observes it too. The mutex is held, so no concurrent statement
+	// sees the flag; the `finally` restores the prior value even on a non-RESTRICT throw, so
+	// a later normal statement re-enforces RESTRICT. Only armed when the FK-actions facet is
+	// on — with it off no FK action fires and the flag must stay clear.
+	const priorSuppress = applyForeignKeyActions ? db._setFkRestrictSuppressed(true) : false;
 	try {
 		// Run inside the caller's active transaction when one exists; otherwise
 		// begin an implicit one this call finalizes itself. Holding the mutex
@@ -188,28 +195,35 @@ export async function ingestExternalRowChangeBatch(
 
 				// Parent-side FK actions: update/delete only (inserts have no
 				// parent-side actions; child-side existence is deliberately NOT
-				// checked — trust boundary). Both calls run with
-				// lensRouted = false: an external change is a physical basis
-				// write. The RESTRICT walk runs POST-application — like the DML
-				// executor's REPLACE-eviction handling, the storage change
-				// already happened (there is no pre-mutation point) and the
-				// child rows it keys off still exist because the cascade has
-				// not run yet.
+				// checked - trust boundary). The call runs with lensRouted =
+				// false: an external change is a physical basis write.
+				//
+				// Trust-the-origin: parent-side RESTRICT is NOT enforced on apply.
+				// The `_fkRestrictSuppressed` flag set above for the batch makes
+				// every nested cascade DML and MV-maintenance FK pass skip its
+				// RESTRICT pre-check too (and there is no top-level RESTRICT call
+				// here - it would no-op under the flag anyway). The origin already
+				// enforced RESTRICT at its own commit; re-enforcing it here would
+				// throw -> no metadata commit -> re-resolve -> re-apply the
+				// identical batch -> throw forever, wedging the stream. Only the
+				// non-RESTRICT actions (cascade / set-null / set-default) propagate,
+				// at every cascade depth. A replica-only RESTRICT invariant is, by
+				// design, not enforced on apply; express it as a global assertion
+				// (detect-and-notify) if the receiver must be notified.
 				//
 				// Cross-change order-independence: the store adapter writes
 				// every table's rows to storage BEFORE making this seam call,
-				// so both helpers re-read the fully-merged post-write state
+				// so the cascade DML re-reads the fully-merged post-write state
 				// regardless of which change appears first in `changes`. This
 				// makes realistic shapes (single parent mutation, multiple
 				// independent parent mutations, parent + direct child write)
 				// order-independent. The two exotic limitations no ordering
-				// fixes: (E) RESTRICT vs. CASCADE on the same child across
-				// two parent mutations; (F) diverging actions (cascade-delete
-				// vs. set-null) on a shared child. Both are handled by keeping
-				// applyForeignKeyActions off (default) or by a global assertion.
+				// fixes: (E) the cascade outcome on a child shared by two parent
+				// mutations may depend on which cascade fires first; (F) diverging
+				// actions (cascade-delete vs. set-null) on a shared child. Both are
+				// handled by keeping applyForeignKeyActions off (default) or by a
+				// global assertion.
 				if (applyForeignKeyActions && change.op !== 'insert') {
-					await assertTransitiveRestrictsForParentMutation(
-						db, tableSchema, change.op, change.oldRow, change.newRow);
 					await executeForeignKeyActionsAndLens(
 						db, tableSchema, change.op, change.oldRow, change.newRow);
 				}
@@ -258,6 +272,11 @@ export async function ingestExternalRowChangeBatch(
 		// (assertions fire at the caller's commit in throw mode): nothing collected.
 		return { assertionViolations: [] };
 	} finally {
+		// Restore the prior RESTRICT-suppression value (save-and-restore, never a blind
+		// reset to false, so any future nesting restores correctly). Runs even on a
+		// non-RESTRICT mid-batch throw (a cascade DML tripping CHECK / NOT NULL / a
+		// connection error), so a subsequent normal statement re-enforces RESTRICT.
+		if (applyForeignKeyActions) db._setFkRestrictSuppressed(priorSuppress);
 		releaseMutex();
 	}
 }

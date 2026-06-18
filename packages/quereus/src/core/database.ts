@@ -1900,6 +1900,30 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.transactionManager.setPendingCommitAssertionSink(sink);
 	}
 
+	/** @internal Apply-mode RESTRICT suppression flag — see {@link _setFkRestrictSuppressed}. */
+	private _fkRestrictSuppressed = false;
+
+	/** @internal Apply-mode RESTRICT suppression. While set, the parent-side FK
+	 *  RESTRICT pre-checks ({@link assertTransitiveRestrictsForParentMutation} and its
+	 *  callees) early-return — the trust-the-origin external-row apply path: the origin
+	 *  already enforced RESTRICT at its own commit, so re-enforcing it on the receiver
+	 *  would wedge the sync stream. Cascade / set-null / set-default propagation is
+	 *  unaffected. Set for the duration of an apply batch (mutex held, so no concurrent
+	 *  statement observes it) and honored by every nested cascade DML and MV-maintenance
+	 *  FK pass. Returns the prior value so the caller restores it in a `finally`
+	 *  (supports nesting). */
+	public _setFkRestrictSuppressed(value: boolean): boolean {
+		const prior = this._fkRestrictSuppressed;
+		this._fkRestrictSuppressed = value;
+		return prior;
+	}
+
+	/** @internal Whether apply-mode RESTRICT suppression is active — see
+	 *  {@link _setFkRestrictSuppressed}. */
+	public _isFkRestrictSuppressed(): boolean {
+		return this._fkRestrictSuppressed;
+	}
+
 	/**
 	 * Subscribe to changes described by a {@link ChangeScope}.
 	 *

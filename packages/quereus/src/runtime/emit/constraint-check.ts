@@ -313,6 +313,15 @@ async function checkCheckConstraints(
 		const metadata = constraintMetadata[i];
 		const evaluator = evaluatorFunctions[i] ?? metadata.evaluator;
 
+		// Trust-the-origin apply path: the synthesized parent-side FK RESTRICT (NOT EXISTS)
+		// check is the plan-time dual of the runtime RESTRICT pre-checks. While applying
+		// external row changes the receiver skips it (the origin already enforced RESTRICT at
+		// its own commit) - otherwise a cascade DML re-entering this executor under the apply
+		// flag would throw here, wedging the sync stream. Only 'fk-parent' checks are gated;
+		// user CHECKs and child-side FK existence checks are untouched.
+		// (See database-external-changes.ts and runtime/foreign-key-actions.ts for the runtime dual.)
+		if (metadata.kind === 'fk-parent' && rctx.db._isFkRestrictSuppressed()) continue;
+
 		// Parent-side FK UPDATE: skip the NOT EXISTS subquery when none of the
 		// referenced parent columns actually changed.
 		if (
