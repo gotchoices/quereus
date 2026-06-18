@@ -21,6 +21,7 @@ import {
   SYNC_MAINTENANCE_INTERVAL_MS,
   createSyncMaintenanceTicker,
 } from './sync-maintenance.js';
+import { createLocalCreateDrainListener } from './sync-local-create-drain.js';
 import { SyncClient, type SyncStatus as SyncClientStatus, type SyncEvent as SyncClientEvent } from '@quereus/sync-client';
 import type {
   QuereusWorkerAPI,
@@ -63,6 +64,10 @@ class QuereusWorker implements QuereusWorkerAPI {
   // the cadence that drives drainHeldChanges + the prune/evict sweeps. The
   // re-entrancy / null-target guards live inside the ticker closure.
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Eager scoped drain on local `create table` — registered in initializeSyncModule,
+  // torn down in close() (survives disconnectSync so offline re-creates still drain).
+  private syncDrainSchemaUnsub: (() => void) | null = null;
 
   // Database-level event subscribers (forwarded to UI via Comlink)
   private dataChangeSubscribers = new Map<string, DataChangeCallback>();
@@ -690,6 +695,18 @@ class QuereusWorker implements QuereusWorkerAPI {
     // the connection): held changes drain even while offline, and the loop must
     // survive disconnectSync() — so it is torn down only in close().
     this.startSyncMaintenance();
+
+    // Eager scoped drain: fire drainHeldChanges immediately when the app locally
+    // re-creates a table, so held edits replay without waiting for the next
+    // maintenance interval. Torn down in close(), not disconnectSync(), for the
+    // same reason as the maintenance loop.
+    this.syncDrainSchemaUnsub = db.onSchemaChange(
+      createLocalCreateDrainListener(
+        () => this.syncManager,
+        (schema, table, error) =>
+          console.warn(`[quoomb-web] eager drain on local create ${schema}.${table} failed:`, error),
+      ),
+    );
   }
 
   private setupSyncEventListeners(): void {
@@ -979,6 +996,12 @@ class QuereusWorker implements QuereusWorkerAPI {
     // Stop the maintenance loop before nulling syncManager below, so a timer
     // firing mid-teardown cannot race the manager out from under a sweep.
     this.stopSyncMaintenance();
+
+    // Tear down the eager-drain schema listener.
+    if (this.syncDrainSchemaUnsub) {
+      this.syncDrainSchemaUnsub();
+      this.syncDrainSchemaUnsub = null;
+    }
 
     // Clean up sync connection
     if (this.syncClient) {
