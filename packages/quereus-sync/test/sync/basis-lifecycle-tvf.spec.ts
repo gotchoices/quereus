@@ -15,7 +15,7 @@ import { InMemoryKVStore } from '@quereus/store';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from '../../src/sync/events.js';
 import { DEFAULT_SYNC_CONFIG, type SyncConfig } from '../../src/sync/protocol.js';
-import { splitRelKey } from '../../src/metadata/basis-lifecycle.js';
+import { splitRelKey, BasisLifecycleStore, type BasisTableLifecycleRecord, type EvictPolicy } from '../../src/metadata/basis-lifecycle.js';
 import { registerBasisLifecycleTvf } from '../../src/sql/basis-lifecycle-tvf.js';
 
 // --- Fake snapshot / db builders (mirrors basis-lifecycle-recorder.spec.ts) -----
@@ -222,6 +222,39 @@ describe('quereus_basis_lifecycle() TVF', () => {
     expect(rows[0].mappedSince).to.be.a('number');
 
     await db2.close();
+  });
+
+  it('renders non-null evictPolicy + lastDirectlyMappedWriteAt (reserved-field projection)', async () => {
+    // `evictPolicy` and `lastDirectlyMappedWriteAt` are populated by the
+    // basis-eviction-policy machinery / the change applicator — neither reachable
+    // through the recorder fakes the other cases drive. Inject records straight
+    // into the same KV store to pin the `rowFromRecord` branches those fakes never
+    // exercise: the `EvictPolicy` union collapse (`String(...)` over 'never' /
+    // 'immediate' / a numeric ms horizon) and the non-null INTEGER timestamp path.
+    const mk = (table: string, evictPolicy: EvictPolicy, lastWrite?: number): BasisTableLifecycleRecord => ({
+      schema: 'store', table, state: 'detached', mappedBy: [],
+      derivationSource: false, inBasis: false, detachedAt: 1000,
+      evictPolicy, lastDirectlyMappedWriteAt: lastWrite,
+    });
+    const batch = kv.batch();
+    const store = new BasisLifecycleStore(kv);
+    store.put(batch, mk('NeverTbl', 'never', 4242));
+    store.put(batch, mk('NowTbl', 'immediate'));
+    store.put(batch, mk('HorizonTbl', 86_400_000));
+    await batch.write();
+
+    const rows = await query(
+      queryDb,
+      `select "table", evictPolicy, lastDirectlyMappedWriteAt from ${TVF} order by "table"`,
+    );
+    const by = (t: string) => rows.find(r => r.table === t)!;
+    // String union: 'never' / 'immediate' pass through; a numeric horizon → its decimal string.
+    expect(by('NeverTbl').evictPolicy).to.equal('never');
+    expect(by('NowTbl').evictPolicy).to.equal('immediate');
+    expect(by('HorizonTbl').evictPolicy).to.equal('86400000');
+    // Non-null INTEGER comes back as a number; absent stays null (distinct from a 0 horizon).
+    expect(by('NeverTbl').lastDirectlyMappedWriteAt).to.equal(4242);
+    expect(by('HorizonTbl').lastDirectlyMappedWriteAt).to.equal(null);
   });
 
   it('a repeat registration replaces rather than corrupting (idempotent host call)', async () => {
