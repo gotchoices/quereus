@@ -191,6 +191,71 @@ describe('StoreTable read-your-own-writes (bare StoreModule)', () => {
 		await db.exec(`rollback`);
 	});
 
+	describe('cross-table transaction (module-wide coordinator)', () => {
+		// The headline behavior, exercised at the SQL level over a real Database:
+		// two store tables share ONE module coordinator, so a single transaction
+		// reads-its-own-writes across both, and commit/rollback are all-or-nothing
+		// across both. (The in-memory provider has no beginAtomicBatch, so this is
+		// the fallback per-store-batch path; the atomic-batch fault path is covered
+		// by transaction.spec.ts and the IDB suite.)
+
+		it('reads own writes across two tables mid-transaction; commit persists both', async () => {
+			await db.exec(`create table a (id integer primary key, v text) using store`);
+			await db.exec(`create table b (id integer primary key, v text) using store`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into a values (1, 'a1')`);
+			await db.exec(`insert into b values (2, 'b2')`);
+
+			// Both tables' pending writes are visible mid-transaction on the same
+			// connection — proving the two tables bucket separately on one shared
+			// coordinator (no cross-bleed, no missing writes).
+			expect(await collect(db, `select v from a where id = 1`)).to.deep.equal([{ v: 'a1' }]);
+			expect(await collect(db, `select v from b where id = 2`)).to.deep.equal([{ v: 'b2' }]);
+
+			await db.exec(`commit`);
+			expect(await collect(db, `select v from a`)).to.deep.equal([{ v: 'a1' }]);
+			expect(await collect(db, `select v from b`)).to.deep.equal([{ v: 'b2' }]);
+		});
+
+		it('rollback discards writes to BOTH tables', async () => {
+			await db.exec(`create table a (id integer primary key) using store`);
+			await db.exec(`create table b (id integer primary key) using store`);
+			await db.exec(`insert into a values (1)`);
+			await db.exec(`insert into b values (1)`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into a values (2)`);
+			await db.exec(`insert into b values (2)`);
+			await db.exec(`rollback`);
+
+			// Pre-transaction rows survive on both; in-transaction rows vanish on both.
+			expect(await collect(db, `select id from a`)).to.deep.equal([{ id: 1 }]);
+			expect(await collect(db, `select id from b`)).to.deep.equal([{ id: 1 }]);
+		});
+
+		it('savepoint rollback undoes the tail on both tables, keeps the pre-savepoint head', async () => {
+			await db.exec(`create table a (id integer primary key) using store`);
+			await db.exec(`create table b (id integer primary key) using store`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into a values (1)`);
+			await db.exec(`insert into b values (1)`);
+			await db.exec(`savepoint s1`);
+			await db.exec(`insert into a values (2)`);
+			await db.exec(`insert into b values (2)`);
+			await db.exec(`rollback to s1`);
+
+			// Post-savepoint writes gone on both; pre-savepoint writes intact on both.
+			expect(await collect(db, `select id from a`)).to.deep.equal([{ id: 1 }]);
+			expect(await collect(db, `select id from b`)).to.deep.equal([{ id: 1 }]);
+
+			await db.exec(`commit`);
+			expect(await collect(db, `select id from a`)).to.deep.equal([{ id: 1 }]);
+			expect(await collect(db, `select id from b`)).to.deep.equal([{ id: 1 }]);
+		});
+	});
+
 	describe('iterateEffective (direct merge harness)', () => {
 		it('bounded merge excludes out-of-bounds pending puts; reverse mirrors forward', async () => {
 			await db.exec(`create table t (id integer primary key) using store`);

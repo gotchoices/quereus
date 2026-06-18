@@ -70,10 +70,5 @@ export class StoreConnection implements VirtualTableConnection {
       this.coordinator.rollback();
     }
   }
-
-  /** Get the coordinator for mutation operations. */
-  getCoordinator(): TransactionCoordinator {
-    return this.coordinator;
-  }
 }
 
