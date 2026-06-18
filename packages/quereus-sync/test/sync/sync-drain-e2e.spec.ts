@@ -292,6 +292,52 @@ describe('real-engine held-change drain (revival): straggler → hold → re-cre
 		expect(await collect(H.db, 'select id, note from orders'), 'row value-unchanged by the re-drain').to.deep.equal([{ id: 1, note: 'hi' }]);
 	});
 
+	it('an inbound create_table reactively drains the hold mid-applyChanges — no explicit drain call', async () => {
+		const S = await spawn('S', { createOrders: true });
+		const H = await spawn('H'); // quarantine (default), NO orders
+
+		// (1) Straggler writes the row; capture S's origin HLC for the cross-hop check.
+		await localWrite(S, "insert into orders values (1, 'hi')");
+		const sCv = await S.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'note');
+		const original = sCv!.hlc;
+
+		// (2) Relay DATA only (migrations stripped) → H has no orders → the change is held.
+		await relay(S, H);
+		expect(await H.manager.quarantine.list('main', 'orders'), 'H holds the straggler insert').to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+		expect(H.db.schemaManager.getTable('main', 'orders'), 'H has no orders at hold time').to.be.undefined;
+
+		// (3) Relay ONLY S's `create_table orders` migration (no data). H's applyChanges
+		//     builds the table via the store adapter, then the REACTIVE post-commit drain
+		//     replays the held rows — WITHOUT anyone calling drainHeldChanges. (Stripping
+		//     the data proves the row can only reach storage through the held-change drain,
+		//     not an inline apply of fresh data.)
+		const drainedEvents: HeldChangesDrainedEvent[] = [];
+		H.manager.getEventEmitter().onHeldChangesDrained(e => drainedEvents.push(e));
+		const schemaOnly = (await S.manager.getChangesSince(H.manager.getSiteId()))
+			.map(cs => ({ ...cs, changes: [] }))
+			.filter(cs => cs.schemaMigrations.some(m => m.type === 'create_table' && m.table === 'orders'));
+		expect(schemaOnly, 'S has a create_table orders migration to relay').to.have.length.greaterThan(0);
+		await H.manager.applyChanges(schemaOnly);
+		await settle();
+
+		// THE HEADLINE: the held row is live in H's real store-backed table, drained
+		// reactively by the inbound create_table — no host sweep, no explicit drain call.
+		expect(H.db.schemaManager.getTable('main', 'orders'), 'the inbound create_table built orders on H').to.not.be.undefined;
+		expect(
+			await collect(H.db, 'select id, note from orders'),
+			'reactive drain materialized S\'s row',
+		).to.deep.equal([{ id: 1, note: 'hi' }]);
+		expect(await H.manager.quarantine.list('main', 'orders'), 'hold cleared by the reactive drain').to.have.lengthOf(0);
+		expect(drainedEvents, 'the reactive drain fired one drained event for orders').to.have.lengthOf(1);
+		expect(drainedEvents[0]).to.include({ schema: 'main', table: 'orders', drained: COLUMNS_PER_FRESH_INSERT });
+
+		// Origin identity preserved: S's origin HLC + siteId, not re-stamped to H's clock.
+		const hCv = await H.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'note');
+		expect(hCv!.value, 'materialized note value is the straggler\'s').to.equal('hi');
+		expect(compareHLC(hCv!.hlc, original), 'materialized with S\'s original HLC').to.equal(0);
+		expect(siteIdEquals(hCv!.hlc.siteId, S.manager.getSiteId()), 'materialized with S\'s origin siteId').to.be.true;
+	});
+
 	it('a drain BEFORE the table is re-created is a genuine no-op: nothing materializes, the hold survives', async () => {
 		const S = await spawn('S', { createOrders: true });
 		const H = await spawn('H'); // quarantine, NO orders — and it stays absent here

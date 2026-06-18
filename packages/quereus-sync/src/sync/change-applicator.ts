@@ -252,6 +252,26 @@ export async function applyChanges(
 	// Emit remote change events (grouped by the relaying changeset's siteId).
 	emitRemoteChanges(ctx, appliedChanges);
 
+	// Reactive low-latency drain (sync-drain-reappear-inbound-ddl): every APPLIED
+	// create_table may have revived a previously-retired table that has held
+	// out-of-basis changes waiting on it. Replay them NOW — as a SEPARATE post-commit
+	// apply unit, after the admitting batch above has fully committed (fresh data lands
+	// first, held changes LWW-resolve against it) — instead of waiting up to one
+	// periodic-sweep interval. Only applied migrations are in `pendingSchemaMigrations`
+	// (an HLC-dominated create_table `continue`s before being pushed), so a losing
+	// create never triggers a drain. A create+drop in the same batch leaves the table
+	// absent, so its key is skipped to avoid a wasted scoped `quarantine.list`.
+	// Advisory: `drainReappearedTables` logs + swallows any failure, so a drain throw
+	// never turns this successful apply into an error.
+	const reappeared = new Map<string, { schema: string; table: string }>();
+	for (const { migration } of pendingSchemaMigrations) {
+		if (migration.type !== 'create_table') continue;
+		const key = tableKey(migration.schema, migration.table);
+		if (batchDropped.has(key)) continue;
+		if (!reappeared.has(key)) reappeared.set(key, { schema: migration.schema, table: migration.table });
+	}
+	await drainReappearedTables(ctx, [...reappeared.values()]);
+
 	// Unknown-table telemetry AFTER successful admission, regardless of disposition
 	// (the operator must see straggler traffic even when it is being dropped).
 	let unknownTableCount = 0;
@@ -322,11 +342,15 @@ function emitRemoteChanges(
  * unknown-table-divert machinery: held changes have no DDL and their table is, by
  * the basis gate, already present.
  *
- * Host-driven, not inline: the host calls {@link SyncManager.drainHeldChanges} from
- * its periodic maintenance path (or right after re-creating a table). Running drain
- * as a SEPARATE apply, after any re-creating batch has fully committed, means fresh
- * data is already in storage and the older held changes simply LWW-resolve against
- * it — no intra-admission interleaving of held + fresh changes.
+ * Driven two ways, never interleaved: the host calls {@link SyncManager.drainHeldChanges}
+ * from its periodic maintenance sweep, and {@link drainReappearedTables} calls it
+ * reactively from {@link applyChanges} the moment an inbound `create_table` revives a
+ * held table (gated by {@link SyncConfig.drainOnReappear}). Either way drain runs as a
+ * SEPARATE apply, after any re-creating batch has fully committed — fresh data is
+ * already in storage and the older held changes simply LWW-resolve against it. The
+ * invariant is "never INTERLEAVE drain into the admitting batch", not "never drain
+ * inline": a reactive post-commit drain is its own admission unit, distinct from the
+ * batch it follows.
  *
  * Scope mirrors {@link QuarantineStore.list}: `(schema, table)` drains one table,
  * `(schema)` drains a schema, `()` sweeps every held entry whose table is back.
@@ -446,6 +470,39 @@ async function drainTableGroup(
 	});
 
 	return group.changes.length;
+}
+
+/**
+ * Best-effort scoped drain of tables that just reappeared in the local basis, run as
+ * SEPARATE post-commit apply unit(s) after the re-creating batch committed. Advisory:
+ * each table is drained independently and any failure is logged + swallowed (the held
+ * entries stay held for the periodic sweep). No-op when {@link SyncConfig.drainOnReappear}
+ * is disabled or the list is empty. Each {@link drainHeldChanges} call is cheap when
+ * nothing is held (a scoped `quarantine.list` returning `[]`) and a no-op when the table
+ * is still absent (the oracle gate in {@link drainTableGroup}).
+ */
+export async function drainReappearedTables(
+	ctx: SyncContext,
+	tables: ReadonlyArray<{ schema: string; table: string }>,
+): Promise<void> {
+	if (!ctx.config.drainOnReappear || tables.length === 0) return;
+
+	// Per-table try/catch so one table's drain failure never aborts the others — and,
+	// crucially, never propagates out of applyChanges to turn a committed apply into a
+	// throw. The create_table + data are already durable; a swallowed drain leaves the
+	// held entries for the next periodic sweep (drain is idempotent — a re-drain of an
+	// already-drained table returns 0).
+	for (const { schema, table } of tables) {
+		try {
+			await drainHeldChanges(ctx, schema, table);
+		} catch (error) {
+			console.warn(
+				`[Sync] drainReappearedTables failed for ${schema}.${table} `
+					+ `(advisory; held entries stay held for the periodic sweep): `
+					+ `${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
 }
 
 /**

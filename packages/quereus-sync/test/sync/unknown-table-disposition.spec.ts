@@ -56,8 +56,12 @@ interface Harness {
   columnsByTable: Map<string, string[]>;
   /** Data the apply path wrote, keyed 'schema.table:pkJson:column' -> value. */
   store: Map<string, SqlValue>;
-  /** Flip `.value` true to make the next `applyToStore` throw (crash-path tests). */
-  failApply: { value: boolean };
+  /**
+   * Crash hooks for `applyToStore`. `.value` true fails every apply (whole-batch
+   * crash tests); `.drainTable` set fails only a reactive post-commit drain unit for
+   * that table (data-only apply), letting the re-creating create_table batch commit.
+   */
+  failApply: { value: boolean; drainTable?: string };
 }
 
 async function makeHarness(opts: {
@@ -76,16 +80,41 @@ async function makeHarness(opts: {
     ...(opts.retentionHorizonMs !== undefined ? { retentionHorizonMs: opts.retentionHorizonMs } : {}),
   };
 
+  // Mutable basis + column oracle, declared before applyToStore so the stub can flip a
+  // table present when it applies an inbound create_table (modeling the engine).
+  const basis = new Set(opts.known ?? ['main.users']);
+  const columnsByTable = new Map<string, string[]>(Object.entries(opts.columns ?? {}));
+
   // A minimal in-memory data store so drain tests can assert a held value became
   // queryable. `update` sets each (pk, column) cell; `delete` clears the row.
   const store = new Map<string, SqlValue>();
   const applyCalls: ApplyCall[] = [];
-  // Crash hook: when set, throw BEFORE recording or mutating anything, so a failed
-  // apply is a true no-op (matches the real adapter aborting with no data written).
-  const failApply = { value: false };
+  // Crash hooks (both throw BEFORE recording or mutating anything, so a failed apply is
+  // a true no-op, matching the real adapter aborting with no data written):
+  //   `value`     — fail EVERY apply (whole-batch crash-path tests).
+  //   `drainTable`— fail only a reactive post-commit DRAIN unit for that table. A drain
+  //                 unit carries data with NO schema change, so this shape lets the
+  //                 re-creating create_table batch (which carries the schema change)
+  //                 commit while its follow-on reappear drain throws.
+  const failApply: { value: boolean; drainTable?: string } = { value: false };
   const applyToStore = async (data: DataChangeToApply[], schema: SchemaChangeToApply[]) => {
     if (failApply.value) throw new Error('apply failed (test)');
+    if (failApply.drainTable !== undefined && schema.length === 0
+        && data.some(d => d.table === failApply.drainTable)) {
+      throw new Error('drain apply failed (test)');
+    }
     applyCalls.push({ data, schema });
+    // Model the engine's basis mutation: an applied create_table makes the table
+    // present (with whatever columns the test pre-seeded, else none); a drop removes it.
+    for (const sc of schema) {
+      const qt = `${sc.schema}.${sc.table}`;
+      if (sc.type === 'create_table') {
+        basis.add(qt);
+        if (!columnsByTable.has(qt)) columnsByTable.set(qt, []);
+      } else if (sc.type === 'drop_table') {
+        basis.delete(qt);
+      }
+    }
     for (const change of data) {
       const rowPrefix = `${change.schema}.${change.table}:${JSON.stringify(change.pk)}:`;
       if (change.type === 'delete') {
@@ -101,8 +130,6 @@ async function makeHarness(opts: {
     return { dataChangesApplied: data.length, schemaChangesApplied: schema.length, errors: [] };
   };
 
-  const basis = new Set(opts.known ?? ['main.users']);
-  const columnsByTable = new Map<string, string[]>(Object.entries(opts.columns ?? {}));
   const withOracle = opts.withOracle ?? true;
   // The oracle reports identity (undefined ⇒ out of basis) plus column names — read
   // LIVE from the mutable `basis` / `columnsByTable`, so a test can flip a retired
@@ -141,6 +168,21 @@ function col(site: SiteId, wall: number, table: string, pk: number, column: stri
 
 function del(site: SiteId, wall: number, table: string, pk: number, opSeq = 0): RowDeletion {
   return { type: 'delete', schema: 'main', table, pk: [pk], hlc: createHLC(BigInt(wall), 1, site, opSeq) };
+}
+
+function createTable(site: SiteId, wall: number, table: string, version = 1, opSeq = 0): SchemaMigration {
+  return {
+    type: 'create_table', schema: 'main', table,
+    ddl: `create table ${table} (id integer primary key, note text)`,
+    hlc: createHLC(BigInt(wall), 1, site, opSeq), schemaVersion: version,
+  };
+}
+
+function dropTable(site: SiteId, wall: number, table: string, version = 2, opSeq = 0): SchemaMigration {
+  return {
+    type: 'drop_table', schema: 'main', table, ddl: `drop table ${table}`,
+    hlc: createHLC(BigInt(wall), 1, site, opSeq), schemaVersion: version,
+  };
 }
 
 function changeSet(site: SiteId, txId: string, changes: Change[], migrations: SchemaMigration[] = []): ChangeSet {
@@ -789,6 +831,136 @@ describe('unknown-table disposition', () => {
       // Recover: the re-drain resolves the still-held change and clears it. No
       // double-apply — resolution is idempotent against whatever did/didn't commit.
       h.failApply.value = false;
+      expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(1);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('hi');
+      expect(h.drained).to.have.lengthOf(1);
+    });
+  });
+
+  // ==========================================================================
+  // Reactive low-latency drain: an inbound create_table reviving a held table
+  // drains it immediately, as a SEPARATE post-commit apply within applyChanges,
+  // without the host calling drainHeldChanges explicitly (drainOnReappear=true).
+  // ==========================================================================
+  describe('reactive drain on inbound create_table (revival)', () => {
+    it('drains a held table the instant an inbound create_table revives it (no fresh data)', async () => {
+      const h = await makeHarness({ columns: { [`main.${RETIRED}`]: ['note'] } });
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      // A remote peer re-creates the table. The create_table commits, then the held
+      // edit replays as a separate post-commit drain — WITHOUT an explicit sweep.
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [], [createTable(h.remoteSite, 900, RETIRED)])]);
+
+      // Held entry replayed into the now-present table and cleared from the hold.
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('hi');
+      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note')).to.not.be.undefined;
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+
+      // One drained event, applied + skipped === drained, keyed by the original origin.
+      expect(h.drained).to.have.lengthOf(1);
+      expect(h.drained[0]).to.include({ schema: 'main', table: RETIRED, drained: 1, applied: 1, skipped: 0 });
+      expect(h.drained[0].applied + h.drained[0].skipped).to.equal(h.drained[0].drained);
+      const revived = h.remoteChanges.flatMap(e => e.changes).filter(c => c.table === RETIRED);
+      expect(revived).to.have.lengthOf(1);
+    });
+
+    it('LWW-resolves the held edit against fresh data carried in the same revival batch', async () => {
+      const h = await makeHarness({ columns: { [`main.${RETIRED}`]: ['note'] } });
+      // Hold an OLD edit (HLC 1000).
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'held-old')])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      // The revival batch re-creates the table AND carries a NEWER edit (HLC 2000) for
+      // the same cell. Fresh data lands first; the older held edit loses LWW on drain.
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2',
+        [col(h.remoteSite, 2000, RETIRED, 1, 'note', 'fresh-new', 1)],
+        [createTable(h.remoteSite, 900, RETIRED)])]);
+
+      // Converges to the max-HLC value; held entry cleared even though it lost.
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('fresh-new');
+      expect((await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note'))!.value).to.equal('fresh-new');
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(h.drained).to.have.lengthOf(1);
+      expect(h.drained[0]).to.include({ drained: 1, applied: 0, skipped: 1 });
+    });
+
+    it('create + drop of the same table in one batch is a no-op drain (table absent after commit)', async () => {
+      const h = await makeHarness({ columns: { [`main.${RETIRED}`]: ['note'] } });
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      // Batch creates then drops the table; it is absent post-commit, so the drain key
+      // is skipped (and would be a no-op even if not) — held entry survives untouched.
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [],
+        [createTable(h.remoteSite, 900, RETIRED, 1), dropTable(h.remoteSite, 950, RETIRED, 2)])]);
+
+      expect(h.drained).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.be.undefined;
+    });
+
+    it('an HLC-dominated (skipped) create_table does not trigger a drain', async () => {
+      const h = await makeHarness({ columns: { [`main.${RETIRED}`]: ['note'] } });
+      // Pre-record a DOMINATING migration (v1, HLC 3000) WITHOUT making the table
+      // present (recordMigration touches only migration metadata, not the basis).
+      await h.manager.schemaMigrations.recordMigration('main', RETIRED, {
+        type: 'create_table', ddl: `create table ${RETIRED} (id integer primary key, note text)`,
+        hlc: createHLC(3000n, 1, h.remoteSite, 0), schemaVersion: 1,
+      });
+      // Seed a held entry (RETIRED still absent → quarantined).
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      // An OLDER create_table (HLC 2000, v1) arrives — loses resolution, never applied,
+      // so it is not in pendingSchemaMigrations and triggers no drain.
+      const result = await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [], [createTable(h.remoteSite, 2000, RETIRED)])]);
+
+      expect(result.skipped).to.be.greaterThan(0);
+      expect(h.drained).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.be.undefined;
+    });
+
+    it('drainOnReappear=false defers to the host sweep (held entry survives the create_table)', async () => {
+      const h = await makeHarness({ columns: { [`main.${RETIRED}`]: ['note'] } });
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      // Flag off: the inbound create_table commits but does NOT auto-drain.
+      h.manager.config.drainOnReappear = false;
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [], [createTable(h.remoteSite, 900, RETIRED)])]);
+
+      expect(h.drained).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.be.undefined;
+
+      // An explicit host sweep still drains (the primitive is not gated by the flag).
+      expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(1);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('hi');
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+    });
+
+    it('a thrown reactive drain is swallowed: the create_table apply still succeeds, entries stay held', async () => {
+      const h = await makeHarness({ columns: { [`main.${RETIRED}`]: ['note'] } });
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      // Arm the drain-only crash hook; the create_table batch (carries schema) commits,
+      // its follow-on reappear drain (data only) throws and is logged + swallowed.
+      h.failApply.drainTable = RETIRED;
+      const result = await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [], [createTable(h.remoteSite, 900, RETIRED)])]);
+
+      // The apply returned its ApplyResult for the committed create_table batch.
+      expect(result.applied).to.equal(1); // the create_table migration
+      // No drain landed: no event, entries stay held, nothing written.
+      expect(h.drained).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.be.undefined;
+
+      // Disarm: a later sweep drains cleanly, no double-apply.
+      h.failApply.drainTable = undefined;
       expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(1);
       expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
       expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('hi');

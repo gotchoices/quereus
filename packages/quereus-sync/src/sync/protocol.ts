@@ -571,6 +571,16 @@ export interface SyncConfig {
    * `dropLocalTable` reclaim callback is wired (e.g. a relay-only coordinator).
    */
   basisEviction?: BasisEvictionConfig;
+
+  /**
+   * When true (default), replay a reappeared table's held out-of-basis changes
+   * immediately — as a SEPARATE post-commit apply — the moment the table comes back
+   * (an inbound create_table, or a lens redeploy re-mapping it into the basis), instead
+   * of waiting for the host's periodic drainHeldChanges sweep. Idempotent with the sweep
+   * (a second drain returns 0). A no-op on a relay-only peer (no basis oracle ⇒ every
+   * group is skipped). Set false to leave all drain timing to the host's periodic sweep.
+   */
+  drainOnReappear: boolean;
 }
 
 /**
@@ -582,5 +592,6 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   batchSize: 1000,
   unknownTableDisposition: 'quarantine',
   basisEviction: { mode: 'horizon' },
+  drainOnReappear: true,
 };
 
