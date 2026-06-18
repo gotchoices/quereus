@@ -3,6 +3,7 @@ import { StoreModule, StoreEventEmitter, InMemoryKVStore, type KVStoreProvider }
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from '../../src/sync/events.js';
+import { type SiteId } from '../../src/clock/site.js';
 import {
 	DEFAULT_SYNC_CONFIG,
 	type ApplyResult, type Change, type ChangeSet, type SyncConfig, type UnknownTableDisposition,
@@ -120,7 +121,7 @@ export async function relay(from: Peer, to: Peer): Promise<ApplyResult> {
 }
 
 /** Flatten a peer's relayable log, excluding the given siteId. Settles before reading. */
-export async function changesFor(peer: Peer, excludeSiteId: Uint8Array): Promise<Change[]> {
+export async function changesFor(peer: Peer, excludeSiteId: SiteId): Promise<Change[]> {
 	await settle();
 	const sets = await peer.manager.getChangesSince(excludeSiteId);
 	return sets.flatMap(cs => [...cs.changes]);
