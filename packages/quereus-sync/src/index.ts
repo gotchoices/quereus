@@ -114,6 +114,9 @@ export { SyncManagerImpl } from './sync/sync-manager-impl.js';
 // Store adapter for applying remote changes
 export { createStoreAdapter, type SyncStoreAdapterOptions } from './sync/store-adapter.js';
 
+// In-SQL introspection TVF (opt-in: host calls after createSyncModule)
+export { registerBasisLifecycleTvf } from './sql/basis-lifecycle-tvf.js';
+
 // Factory function
 export {
   createSyncModule,
