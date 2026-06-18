@@ -251,6 +251,23 @@ export interface BackingHost {
 	 *  behavior change. NOT escapable by `pragma nondeterministic_schema` — that
 	 *  lifts the per-database determinism gate, a separate and weaker concern; a
 	 *  replicating host's bit-identity requirement cannot be locally waived without
-	 *  breaking convergence. */
+	 *  breaking convergence.
+	 *
+	 *  **Eager-resolution invariant (NORMATIVE).** A host that declares this flag
+	 *  MUST resolve via {@link VirtualTableModule.getBackingHost} at
+	 *  maintenance-plan-build time — i.e. eagerly, BEFORE any
+	 *  {@link VirtualTableModule.ensureBackingForAttach}. The replicable gate runs
+	 *  at MV registration (`registerMaterializedView`), which on the
+	 *  `alter table … set maintained` attach path fires BEFORE the late-backing seam
+	 *  (the attach core resolves the host leniently via `tryResolveBackingHost` there
+	 *  and skips the gate when no host resolves — sound ONLY because a demanding host
+	 *  resolves eagerly). A host MAY materialize its physical/durable store late, but
+	 *  its host *capability surface* — the object carrying this flag — must resolve
+	 *  eagerly. Violating this (a host that both defers `getBackingHost` to
+	 *  `ensureBackingForAttach` AND demands replicable) would let a non-replicable
+	 *  body slip the gate; the attach core's defensive guard
+	 *  (`attachMaintainedDerivation` in `runtime/emit/materialized-view-helpers.ts`)
+	 *  converts that into a loud INTERNAL error rather than a silent
+	 *  convergence-breaking hole. */
 	readonly requiresReplicableDerivations?: boolean;
 }

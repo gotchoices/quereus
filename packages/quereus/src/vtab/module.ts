@@ -297,6 +297,15 @@ export interface VirtualTableModule<
 	 * live table (e.g. memory) — they omit the method entirely, so the optional
 	 * call is a pure no-op. Omit ⇒ the engine resolves the host as-is (today's
 	 * behavior).
+	 *
+	 * **Late-backing seam vs the replicable gate.** This is the seam the MV
+	 * replicable-determinism gate fires BEFORE (the gate runs at
+	 * `registerMaterializedView`, ahead of this call). A module materializing its
+	 * store late here is therefore fine PROVIDED its `getBackingHost` capability
+	 * surface still resolves eagerly — see the eager-resolution invariant on
+	 * {@link BackingHost.requiresReplicableDerivations}. A host that both demands
+	 * replicable derivations AND defers `getBackingHost` to this call would slip the
+	 * gate; the attach core's defensive guard catches that as a loud INTERNAL error.
 	 */
 	ensureBackingForAttach?(
 		db: Database,

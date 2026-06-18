@@ -4,6 +4,7 @@ import { createScalarFunction, createTableValuedFunction } from '../src/func/reg
 import { INTEGER_TYPE } from '../src/types/builtin-types.js';
 import type { Row, SqlValue } from '../src/common/types.js';
 import type { BackingHost } from '../src/vtab/backing-host.js';
+import type { TableSchema } from '../src/schema/table.js';
 
 /**
  * The REPLICABLE determinism class (ticket `replicable-determinism-class`). A
@@ -39,6 +40,52 @@ class ReplBackingModule extends MemoryTableModule {
 	override getBackingHost(db: Database, schemaName: string, tableName: string): BackingHost | undefined {
 		const inner = super.getBackingHost(db, schemaName, tableName);
 		return inner ? demandReplicable(inner) : undefined;
+	}
+}
+
+/**
+ * Models the synced-store shape for the ATTACH path: a module that materializes its
+ * durable backing in the LATE `ensureBackingForAttach` seam (recorded via `ensured`)
+ * BUT whose `getBackingHost` resolves EAGERLY and demands replicable — the contract
+ * the demanding-host capability requires (the host capability surface exists at
+ * plan-build time even though the physical store is built late). Because the host is
+ * eager, the replicable gate fires at registration BEFORE the seam, so `ensured` stays
+ * empty on a reject and is reached only on an accept.
+ */
+class EagerDemandWithSeamModule extends MemoryTableModule {
+	readonly ensured: string[] = [];
+	override getBackingHost(db: Database, schemaName: string, tableName: string): BackingHost | undefined {
+		const inner = super.getBackingHost(db, schemaName, tableName);
+		return inner ? demandReplicable(inner) : undefined;
+	}
+	async ensureBackingForAttach(_db: Database, schemaName: string, tableName: string, _backingSchema: TableSchema): Promise<void> {
+		this.ensured.push(`${schemaName}.${tableName}`);
+	}
+}
+
+/**
+ * The CONTRACT-VIOLATING combination the defensive guard exists to catch (and the
+ * negative control when `demanding` is false): a module that is BOTH late — its
+ * `getBackingHost` returns `undefined` until `ensureBackingForAttach` flips the
+ * per-table ready flag — AND (optionally) demanding. With `demanding: true` the
+ * replicable gate is skipped at registration (no host yet), so without the guard a
+ * non-replicable body would slip through; the guard re-checks the now-present host and
+ * raises a loud INTERNAL error. With `demanding: false` lateness alone is inert.
+ */
+class LateBackingModule extends MemoryTableModule {
+	readonly ensured: string[] = [];
+	private readonly ready = new Set<string>();
+	constructor(private readonly demanding: boolean) { super(); }
+	override getBackingHost(db: Database, schemaName: string, tableName: string): BackingHost | undefined {
+		const key = `${schemaName}.${tableName}`;
+		if (!this.ready.has(key)) return undefined; // late: no host until the seam runs
+		const inner = super.getBackingHost(db, schemaName, tableName);
+		if (!inner) return undefined;
+		return this.demanding ? demandReplicable(inner) : inner;
+	}
+	async ensureBackingForAttach(_db: Database, schemaName: string, tableName: string, _backingSchema: TableSchema): Promise<void> {
+		this.ensured.push(`${schemaName}.${tableName}`);
+		this.ready.add(`${schemaName}.${tableName}`); // host now resolves (eagerly, going forward)
 	}
 }
 
@@ -315,6 +362,99 @@ describe('Materialized view replicable-determinism gate', () => {
 			// top-level projection/WHERE (gap #4 in the handoff: previously unpinned).
 			const err = await captureError("create materialized view m_subq using repl as select id from t where id in (select id from t t2 where t2.c collate MYLOCALE = 'alpha');");
 			expectReplicableCollationReject(err, 'MYLOCALE', 'm_subq');
+		});
+	});
+
+	/**
+	 * Attach-path coverage for the LENIENT `tryResolveBackingHost` gate resolution and the
+	 * defensive guard that backs its soundness claim (ticket
+	 * `mv-replicable-gate-late-host-coverage`). The create-MV path is covered above; the
+	 * `alter table … set maintained` ATTACH path runs the SAME gate at registration but
+	 * resolves the host LENIENTLY — a module materializing its backing late has no host at
+	 * gate time. These pin: (1) the attach-path gate rejects a non-replicable FUNCTION
+	 * (existing attach coverage was collation-only); (2) the gate fires for an eager host
+	 * that ALSO has a late seam, regardless of the seam; (3) the defensive guard converts
+	 * the late+demanding contract violation into a loud INTERNAL error; (4) lateness alone
+	 * (non-demanding) is inert.
+	 */
+	describe('attach-path gate + late-host defensive guard', () => {
+		/** Assert the INTERNAL defensive-guard reject — the late+demanding contract violation. */
+		function expectGuardReject(err: Error, mvName: string): void {
+			expect(err.message).to.contain(mvName);
+			expect(err.message).to.contain('requiresReplicableDerivations');
+			expect(err.message).to.contain('plan-build time');
+			expect(db.schemaManager.getMaintainedTable('main', mvName), `${mvName} must not register`).to.be.undefined;
+		}
+
+		it('rejects a non-replicable FUNCTION on the attach path (gate, host present at gate time)', async () => {
+			// Existing attach coverage is collation-only; this pins the FUNCTION arm over the
+			// `alter table … set maintained` ATTACH verb. `repl`'s host resolves eagerly, so the
+			// gate fires at registration exactly as on the create path.
+			await db.exec('create table mt_fn (id integer primary key, nv integer) using repl;');
+			const err = await captureError('alter table mt_fn set maintained as select id, nonrepl(v) as nv from t;');
+			expectReplicableReject(err, 'nonrepl', 'mt_fn');
+		});
+
+		it('gate fires for an eager host with a late-backing seam, and the seam runs only on accept', async () => {
+			// Models the synced-store: host eager + demanding, durable store built in the late
+			// `ensureBackingForAttach` seam. The gate must fire at registration BEFORE the seam, so
+			// a reject never reaches `ensureBackingForAttach` — proving the gate firing does not
+			// depend on the absence of a late seam.
+			const mod = new EagerDemandWithSeamModule();
+			db.registerModule('eager_seam', mod);
+
+			await db.exec('create table mt_eager (id integer primary key, nv integer) using eager_seam;');
+			const err = await captureError('alter table mt_eager set maintained as select id, nonrepl(v) as nv from t;');
+			expectReplicableReject(err, 'nonrepl', 'mt_eager');
+			expect(mod.ensured, 'the gate fires before the late seam on a reject').to.be.empty;
+
+			// Accept control: a builtin-only body passes the gate, so the seam IS reached.
+			await db.exec('create table mt_eager_ok (id integer primary key, av integer) using eager_seam;');
+			await db.exec('alter table mt_eager_ok set maintained as select id, abs(v) as av from t;');
+			expect(db.schemaManager.getMaintainedTable('main', 'mt_eager_ok'), 'builtin-only attach registers').to.not.be.undefined;
+			expect(mod.ensured, 'the late seam ran on the accept').to.deep.equal(['main.mt_eager_ok']);
+		});
+
+		it('defensive guard: a late+demanding host rejects a BUILTIN-only body (INTERNAL, isolated from the gate)', async () => {
+			// The canonical guard proof. The host resolves NO host until the late seam AND demands
+			// replicable, so the gate at registration is skipped (no host). The body is builtin-only
+			// (`abs`), so the ONLY thing that can reject is the GUARD, not the replicable gate. This
+			// test FAILS if the guard is removed: the late host would silently register a maintained
+			// table whose gate never ran — and a non-replicable body would then slip through.
+			const mod = new LateBackingModule(/*demanding*/ true);
+			db.registerModule('late_demand', mod);
+
+			await db.exec('create table mt_late (id integer primary key, av integer) using late_demand;');
+			const err = await captureError('alter table mt_late set maintained as select id, abs(v) as av from t;');
+			expectGuardReject(err, 'mt_late');
+			// The late seam was reached (it is where the host becomes resolvable); the guard fired
+			// AFTER it, on the now-present demanding host.
+			expect(mod.ensured, 'the late seam ran before the guard fired').to.deep.equal(['main.mt_late']);
+		});
+
+		it('defensive guard: the same late+demanding host also rejects a NON-replicable body (the hole is real)', async () => {
+			// Proves the hole the guard closes: a `nonrepl` body on a late+demanding host SKIPS the
+			// replicable gate (no host at gate time), so only the guard catches it — the same
+			// INTERNAL error as the builtin-only case, NOT the replicable-function diagnostic.
+			const mod = new LateBackingModule(/*demanding*/ true);
+			db.registerModule('late_demand2', mod);
+
+			await db.exec('create table mt_late2 (id integer primary key, nv integer) using late_demand2;');
+			const err = await captureError('alter table mt_late2 set maintained as select id, nonrepl(v) as nv from t;');
+			expectGuardReject(err, 'mt_late2');
+		});
+
+		it('negative control: a late but NON-demanding host attaches a non-replicable body fine (lateness alone is inert)', async () => {
+			// Lateness is not the trigger — only late+demanding is. A non-demanding late host leaves
+			// `requiresReplicableDerivations` undefined, so the guard is a no-op and the `nonrepl`
+			// body attaches (mirrors the existing "inert on a non-demanding host" tests).
+			const mod = new LateBackingModule(/*demanding*/ false);
+			db.registerModule('late_inert', mod);
+
+			await db.exec('create table mt_late_ok (id integer primary key, nv integer) using late_inert;');
+			await db.exec('alter table mt_late_ok set maintained as select id, nonrepl(v) as nv from t;');
+			expect(db.schemaManager.getMaintainedTable('main', 'mt_late_ok'), 'non-demanding late host attaches').to.not.be.undefined;
+			expect(mod.ensured, 'the late seam ran (the host resolved through it)').to.deep.equal(['main.mt_late_ok']);
 		});
 	});
 });

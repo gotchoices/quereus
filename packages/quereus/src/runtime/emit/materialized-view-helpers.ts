@@ -1065,6 +1065,17 @@ export async function attachMaintainedDerivation(
 		}
 	};
 
+	// Defensive-guard input: capture whether the gate-time backing host is absent
+	// BEFORE the gate registration below. Resolved against `table` — the pre-reshape
+	// catalog record the gate registration also resolves against
+	// (`tryResolveBackingHost` keys only on schema+name, never the shape). A module
+	// that materializes its host LATE (`getBackingHost` undefined until
+	// `ensureBackingForAttach`) reads absent here, so the replicable-determinism gate
+	// inside `registerMaterializedView` was skipped; the guard after the late seam
+	// re-checks once the now-present host is in hand. See the eager-resolution
+	// invariant on `BackingHost.requiresReplicableDerivations`.
+	const gateHostAbsent = tryResolveBackingHost(db, table) === undefined;
+
 	const maintained = sm.attachDerivation(schemaName, name, buildTableDerivation(def, shape));
 	try {
 		// The create-time gates (determinism, keyed-or-coarsened body, relational
@@ -1132,6 +1143,30 @@ export async function attachMaintainedDerivation(
 		// re-resolved host keys the 'replace-all' diff by the module's CURRENT
 		// physical PK, so a reshape that shifted PK column indices stays aligned.
 		const host = resolveBackingHost(db, live);
+
+		// Defensive guard (defense-in-depth — see `tryResolveBackingHost` and the
+		// eager-resolution invariant on `BackingHost.requiresReplicableDerivations`).
+		// The gate-time host was absent, so the replicable-determinism gate inside
+		// `registerMaterializedView` could not run — yet the now-resolved host DEMANDS
+		// replicable derivations. A demanding host MUST resolve eagerly (at plan-build
+		// time, before this late-backing seam); reaching here means it violated that
+		// contract and a non-replicable body would have slipped the gate. Fail loud
+		// rather than corrupt peers. The throw is inside this try, so the catch runs
+		// `restorePrior()` / `discardBackingForAttach` cleanup and the statement rolls
+		// back — the table reverts to ordinary, untouched. INTERNAL because reaching it
+		// is a host-author contract violation, not user error. Single-sited after the
+		// sole `resolveBackingHost(db, live)`, so it covers the reshape arm too.
+		if (gateHostAbsent && host.requiresReplicableDerivations) {
+			throw new QuereusError(
+				`cannot attach derivation to '${schemaName}.${name}': its backing host requires `
+					+ `replicable derivations but did not resolve until after the durable backing was `
+					+ `materialized, so the replicable-determinism gate could not run. A host that sets `
+					+ `requiresReplicableDerivations must resolve via getBackingHost at plan-build time `
+					+ `(before ensureBackingForAttach).`,
+				StatusCode.INTERNAL,
+			);
+		}
+
 		const conn = await resolveAttachConnection(db, host, `${schemaName}.${name}`);
 		changes = await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);
 		// Declared CHECK / child-side FK over the reconciled (derived) row set —
@@ -2390,7 +2425,15 @@ export function resolveBackingHost(db: Database, backingSchema: TableSchema): Ba
  * resolved for real at the reconcile, and the steady-state maintenance arms
  * re-resolve it per use. Skipping the replicable gate when the host is absent is
  * sound: a host that sets `requiresReplicableDerivations` (the synced-store flavor)
- * always exists by plan-build time, so the gate still binds it.
+ * always exists by plan-build time, so the gate still binds it — the
+ * eager-resolution invariant on {@link BackingHost.requiresReplicableDerivations}.
+ *
+ * That soundness rests on the invariant being honored, not on prose: a host that
+ * BOTH demands replicable derivations AND defers its host to the late seam would
+ * skip the gate here unnoticed. The attach core's defensive guard
+ * ({@link attachMaintainedDerivation}) re-checks once the late host is in hand and
+ * raises a loud INTERNAL error in exactly that case, so this lenient skip can never
+ * silently let a non-replicable body through.
  */
 export function tryResolveBackingHost(db: Database, backingSchema: TableSchema): BackingHost | undefined {
 	const module = requireVtabModule(backingSchema);
