@@ -12,9 +12,14 @@
  */
 
 import { expect } from 'chai';
-import type { TableSchema } from '@quereus/quereus';
+import type { SqlValue, TableSchema } from '@quereus/quereus';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl, type UnknownTableEvent } from '../../src/sync/events.js';
+import {
+  SyncEventEmitterImpl,
+  type UnknownTableEvent,
+  type HeldChangesDrainedEvent,
+  type RemoteChangeEvent,
+} from '../../src/sync/events.js';
 import {
   DEFAULT_SYNC_CONFIG,
   type SyncConfig,
@@ -42,12 +47,21 @@ interface Harness {
   syncEvents: SyncEventEmitterImpl;
   applyCalls: ApplyCall[];
   events: UnknownTableEvent[];
+  drained: HeldChangesDrainedEvent[];
+  remoteChanges: RemoteChangeEvent[];
   remoteSite: SiteId;
+  /** Mutable local basis ('schema.table'); add a table to simulate it reappearing. */
+  basis: Set<string>;
+  /** Per-table column names the oracle reports (drives getTableColumnNames). */
+  columnsByTable: Map<string, string[]>;
+  /** Data the apply path wrote, keyed 'schema.table:pkJson:column' -> value. */
+  store: Map<string, SqlValue>;
 }
 
 async function makeHarness(opts: {
   disposition?: UnknownTableDisposition;
   known?: string[];                 // 'schema.table' in the local basis
+  columns?: Record<string, string[]>; // per-table column names (drain gate + drift filter)
   retentionHorizonMs?: number;
   withOracle?: boolean;             // default true
 } = {}): Promise<Harness> {
@@ -60,27 +74,59 @@ async function makeHarness(opts: {
     ...(opts.retentionHorizonMs !== undefined ? { retentionHorizonMs: opts.retentionHorizonMs } : {}),
   };
 
+  // A minimal in-memory data store so drain tests can assert a held value became
+  // queryable. `update` sets each (pk, column) cell; `delete` clears the row.
+  const store = new Map<string, SqlValue>();
   const applyCalls: ApplyCall[] = [];
   const applyToStore = async (data: DataChangeToApply[], schema: SchemaChangeToApply[]) => {
     applyCalls.push({ data, schema });
+    for (const change of data) {
+      const rowPrefix = `${change.schema}.${change.table}:${JSON.stringify(change.pk)}:`;
+      if (change.type === 'delete') {
+        for (const key of [...store.keys()]) {
+          if (key.startsWith(rowPrefix)) store.delete(key);
+        }
+      } else {
+        for (const [col, value] of Object.entries(change.columns ?? {})) {
+          store.set(`${rowPrefix}${col}`, value);
+        }
+      }
+    }
     return { dataChangesApplied: data.length, schemaChangesApplied: schema.length, errors: [] };
   };
 
-  const known = new Set(opts.known ?? ['main.users']);
+  const basis = new Set(opts.known ?? ['main.users']);
+  const columnsByTable = new Map<string, string[]>(Object.entries(opts.columns ?? {}));
   const withOracle = opts.withOracle ?? true;
-  // The oracle only needs identity (undefined ⇒ out of basis); a non-undefined
-  // stub stands in for the basis table's schema.
+  // The oracle reports identity (undefined ⇒ out of basis) plus column names — read
+  // LIVE from the mutable `basis` / `columnsByTable`, so a test can flip a retired
+  // table back into the basis (with its columns) between applies and then drain.
   const getTableSchema = withOracle
     ? (schema: string, table: string): TableSchema | undefined =>
-        known.has(`${schema}.${table}`) ? ({} as TableSchema) : undefined
+        basis.has(`${schema}.${table}`)
+          ? ({ columns: (columnsByTable.get(`${schema}.${table}`) ?? []).map(name => ({ name })) } as unknown as TableSchema)
+          : undefined
     : undefined;
 
   const manager = await SyncManagerImpl.create(kv, source, config, syncEvents, applyToStore, getTableSchema);
 
   const events: UnknownTableEvent[] = [];
   syncEvents.onUnknownTable(e => events.push(e));
+  const drained: HeldChangesDrainedEvent[] = [];
+  syncEvents.onHeldChangesDrained(e => drained.push(e));
+  const remoteChanges: RemoteChangeEvent[] = [];
+  syncEvents.onRemoteChange(e => remoteChanges.push(e));
 
-  return { manager, syncEvents, applyCalls, events, remoteSite: generateSiteId() };
+  return {
+    manager, syncEvents, applyCalls, events, drained, remoteChanges,
+    remoteSite: generateSiteId(), basis, columnsByTable, store,
+  };
+}
+
+/** Mark a retired table as reappeared in the local basis with the given columns. */
+function reappear(h: Harness, table: string, columns: string[], schema = 'main'): void {
+  h.basis.add(`${schema}.${table}`);
+  h.columnsByTable.set(`${schema}.${table}`, columns);
 }
 
 function col(site: SiteId, wall: number, table: string, pk: number, column: string, value: string, opSeq = 0): ColumnChange {
@@ -472,6 +518,247 @@ describe('unknown-table disposition', () => {
       const stats = h.manager.getUnknownTableStats();
       expect(stats.byTable.get('main.orders')).to.equal(1);
       expect(stats.byTable.get('main.invoices')).to.equal(1);
+    });
+  });
+
+  // ==========================================================================
+  // Drain held changes when their table reappears (the revival path).
+  // ==========================================================================
+  describe('drainHeldChanges (revival)', () => {
+    it('drains a held quarantine change into a reappeared table (scoped)', async () => {
+      const h = await makeHarness();
+      const change = col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi');
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [change])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      // orders reappears in the basis (re-created app-side) with a `note` column.
+      reappear(h, RETIRED, ['note']);
+
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+      expect(drained).to.equal(1);
+
+      // The held change is now a real local version: queryable + cleared from the hold.
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('hi');
+      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note')).to.not.be.undefined;
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+
+      // One drained event (applied: 1) + a remote-change fired for downstream reactivity,
+      // keyed by the held change's ORIGINAL origin.
+      expect(h.drained).to.have.lengthOf(1);
+      expect(h.drained[0]).to.include({ schema: 'main', table: RETIRED, drained: 1, applied: 1, skipped: 0 });
+      const revived = h.remoteChanges.flatMap(e => e.changes).filter(c => c.table === RETIRED);
+      expect(revived).to.have.lengthOf(1);
+      expect(siteIdEquals(h.remoteChanges[0].siteId, h.remoteSite)).to.be.true;
+    });
+
+    it('sweep form drains present tables and leaves still-absent ones held', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
+        col(h.remoteSite, 1000, 'orders', 1, 'note', 'o'),
+        col(h.remoteSite, 1001, 'invoices', 1, 'note', 'i'),
+      ])]);
+      expect(await h.manager.quarantine.list()).to.have.lengthOf(2);
+
+      // Only `orders` comes back.
+      reappear(h, 'orders', ['note']);
+
+      const drained = await h.manager.drainHeldChanges();
+      expect(drained).to.equal(1);
+
+      // orders drained + cleared; invoices stays held (still absent).
+      expect(await h.manager.quarantine.list('main', 'orders')).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.list('main', 'invoices')).to.have.lengthOf(1);
+      expect(h.drained.map(e => e.table)).to.deep.equal(['orders']);
+      expect(h.store.get('main.orders:[1]:note')).to.equal('o');
+    });
+
+    it('drains a forwardable (store-and-forward) entry and drops it from listForwardable', async () => {
+      const h = await makeHarness({ disposition: 'store-and-forward' });
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      expect(await h.manager.quarantine.listForwardable()).to.have.lengthOf(1);
+
+      reappear(h, RETIRED, ['note']);
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      expect(drained).to.equal(1);
+      // No longer surfaced as forwardable — it is a real local version now, relayed
+      // via the normal change-log path henceforth.
+      expect(await h.manager.quarantine.listForwardable()).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('hi');
+    });
+
+    it('drift-drops a held column change for a column absent on re-create; siblings apply', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
+        col(h.remoteSite, 1000, RETIRED, 1, 'note', 'keep'),
+        col(h.remoteSite, 1001, RETIRED, 1, 'gone', 'drop'),
+      ])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(2);
+
+      // Re-created WITHOUT the `gone` column (the migration dropped it).
+      reappear(h, RETIRED, ['note']);
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      // Both held entries cleared; no throw; only the present-column change applied.
+      expect(drained).to.equal(2);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('keep');
+      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'gone')).to.be.undefined;
+      expect(h.drained[0]).to.include({ drained: 2, applied: 1, skipped: 1 });
+    });
+
+    it('clears a held entry that loses LWW against a newer present cell (value unchanged)', async () => {
+      const h = await makeHarness();
+      // Hold an OLD change for orders.
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'old')])]);
+
+      // orders reappears; a NEWER change arrives via the normal path and wins.
+      reappear(h, RETIRED, ['note']);
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [col(h.remoteSite, 2000, RETIRED, 1, 'note', 'new')])]);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('new');
+
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      // Entry cleared even though it lost; local newer value stands.
+      expect(drained).to.equal(1);
+      expect(h.drained[0]).to.include({ applied: 0, skipped: 1 });
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('new');
+      expect((await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note'))!.value).to.equal('new');
+    });
+
+    it('a held change newer than the fresh data wins (ordering converges by HLC)', async () => {
+      const h = await makeHarness();
+      // Held change has the LATER HLC.
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 2000, RETIRED, 1, 'note', 'held')])]);
+
+      // orders reappears; an OLDER fresh change lands first via the normal path.
+      reappear(h, RETIRED, ['note']);
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'fresh')])]);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('fresh');
+
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      // Held (2000) beats fresh (1000); converges to the max-HLC value.
+      expect(drained).to.equal(1);
+      expect(h.drained[0]).to.include({ applied: 1, skipped: 0 });
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('held');
+      expect((await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note'))!.value).to.equal('held');
+    });
+
+    it('a tombstone blocks a held column change (allowResurrection=false); row stays deleted', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+
+      // orders reappears; a delete tombstones pk=1.
+      reappear(h, RETIRED, ['note']);
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [del(h.remoteSite, 2000, RETIRED, 1)])]);
+
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      expect(drained).to.equal(1);
+      expect(h.drained[0]).to.include({ applied: 0, skipped: 1 });
+      // No resurrection: the column version was not written; the row stays deleted.
+      expect(await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note')).to.be.undefined;
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.be.undefined;
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+    });
+
+    it('resurrects a held column change past an older tombstone (allowResurrection=true)', async () => {
+      const h = await makeHarness();
+      h.manager.config.allowResurrection = true;
+      // Held change carries the LATER HLC, so it can resurrect.
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 2000, RETIRED, 1, 'note', 'back')])]);
+
+      // orders reappears; an OLDER delete tombstones pk=1.
+      reappear(h, RETIRED, ['note']);
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-2', [del(h.remoteSite, 1000, RETIRED, 1)])]);
+
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      expect(drained).to.equal(1);
+      expect(h.drained[0]).to.include({ applied: 1, skipped: 0 });
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('back');
+      expect((await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note'))!.value).to.equal('back');
+    });
+
+    it('collapses multiple held versions of one (pk, column) to the max-HLC winner; all cleared', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
+        col(h.remoteSite, 1000, RETIRED, 1, 'note', 'a'),
+        col(h.remoteSite, 2000, RETIRED, 1, 'note', 'b'),
+      ])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(2);
+
+      reappear(h, RETIRED, ['note']);
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      // Both entries cleared; the surviving value is the max-HLC winner.
+      expect(drained).to.equal(2);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.equal('b');
+      expect((await h.manager.columnVersions.getColumnVersion('main', RETIRED, [1], 'note'))!.value).to.equal('b');
+    });
+
+    it('drains mixed column + delete held entries for the same pk (delete wins, higher HLC)', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [
+        col(h.remoteSite, 1000, RETIRED, 1, 'note', 'x'),
+        del(h.remoteSite, 2000, RETIRED, 1),
+      ])]);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(2);
+
+      reappear(h, RETIRED, ['note']);
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      // Both resolved independently and cleared; the later delete leaves the row gone.
+      expect(drained).to.equal(2);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(0);
+      expect(await h.manager.tombstones.getTombstone('main', RETIRED, [1])).to.not.be.undefined;
+      expect(h.store.get(`main.${RETIRED}:[1]:note`)).to.be.undefined;
+    });
+
+    it('scoped drain of a still-absent table is a clean no-op', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+
+      // orders is NOT re-added to the basis.
+      const drained = await h.manager.drainHeldChanges('main', RETIRED);
+
+      expect(drained).to.equal(0);
+      expect(h.drained).to.have.lengthOf(0);
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+    });
+
+    it('is a no-op (returns 0) with no basis oracle', async () => {
+      const h = await makeHarness({ withOracle: false });
+      // With no oracle the apply path treats every table as known, so seed a held
+      // entry directly — the point is that drain must touch nothing without an oracle.
+      const batch = h.manager.kv.batch();
+      h.manager.quarantine.put(batch, col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi'), Date.now(), false);
+      await batch.write();
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+
+      const drained = await h.manager.drainHeldChanges();
+
+      expect(drained).to.equal(0);
+      expect(h.drained).to.have.lengthOf(0);
+      // The held entry is untouched (no oracle ⇒ cannot tell the table is present).
+      expect(await h.manager.quarantine.list('main', RETIRED)).to.have.lengthOf(1);
+    });
+
+    it('idempotent re-drain returns 0 and writes nothing new', async () => {
+      const h = await makeHarness();
+      await h.manager.applyChanges([changeSet(h.remoteSite, 'tx-1', [col(h.remoteSite, 1000, RETIRED, 1, 'note', 'hi')])]);
+      reappear(h, RETIRED, ['note']);
+
+      expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(1);
+      h.drained.length = 0;
+
+      // Second sweep finds the entries gone.
+      expect(await h.manager.drainHeldChanges('main', RETIRED)).to.equal(0);
+      expect(h.drained).to.have.lengthOf(0);
     });
   });
 });

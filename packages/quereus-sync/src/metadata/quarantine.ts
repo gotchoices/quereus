@@ -143,6 +143,20 @@ export class QuarantineStore {
   }
 
   /**
+   * Stage deletion of a held entry by its change, rebuilding the `qt:` key from
+   * the change exactly as {@link put} does (HLC + type + pk (+ column)) — so it
+   * is symmetric with `put` and clears precisely the entry that change produced.
+   * Used by the drain path (`change-applicator.drainHeldChanges`) to clear a held
+   * entry atomically with the apply that replays it into the reappeared table.
+   */
+  delete(batch: WriteBatch, change: Change): void {
+    const entryType = change.type === 'column' ? 'column' : 'delete';
+    const column = change.type === 'column' ? change.column : undefined;
+    const key = buildQuarantineKey(change.schema, change.table, change.hlc, entryType, change.pk, column);
+    batch.delete(key);
+  }
+
+  /**
    * List held changes, optionally scoped to a schema (and table). For operator
    * inspection — the volume is bounded by the retention horizon.
    */

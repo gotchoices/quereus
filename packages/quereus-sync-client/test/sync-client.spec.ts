@@ -14,7 +14,9 @@ import {
   type SnapshotCheckpoint,
   type SnapshotProgress,
   type SiteId,
+  type BasisTableLifecycleRecord,
 } from '@quereus/sync';
+import type { Database, LensDeploymentSnapshot } from '@quereus/quereus';
 import { serializeChangeSet } from '../src/serialization.js';
 
 // ============================================================================
@@ -169,6 +171,24 @@ class MockSyncManager implements SyncManager {
   }
 
   async pruneQuarantine(): Promise<number> {
+    return 0;
+  }
+
+  async drainHeldChanges(_schema?: string, _table?: string): Promise<number> {
+    return 0;
+  }
+
+  async recordLensDeployment(
+    _db: Database,
+    _logicalSchemaName: string,
+    _snapshot: LensDeploymentSnapshot,
+  ): Promise<void> {}
+
+  async getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]> {
+    return [];
+  }
+
+  async evictExpiredBasisTables(_now?: number): Promise<number> {
     return 0;
   }
 

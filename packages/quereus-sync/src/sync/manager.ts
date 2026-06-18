@@ -114,6 +114,28 @@ export interface SyncManager {
   pruneQuarantine(): Promise<number>;
 
   /**
+   * Replay held out-of-basis changes (`quarantine` + forwardable `store-and-forward`
+   * entries) into tables that have since reappeared in the local basis — the revival
+   * path of the unknown-table contract (`docs/migration.md` § 4 Contract). Each held
+   * change is resolved against the now-present table exactly like a fresh inbound
+   * change (LWW / tombstone-blocking / `allowResurrection`) and cleared from the hold
+   * on resolution, whether or not it applied.
+   *
+   * Host-driven — call from the same periodic maintenance path as
+   * {@link pruneTombstones} / {@link pruneQuarantine} / {@link evictExpiredBasisTables},
+   * or right after re-creating a table / applying an inbound `create_table`. The
+   * library adds no timer and never drains inline during {@link applyChanges}.
+   *
+   * Scope mirrors `QuarantineStore.list`: `(schema, table)` drains one table,
+   * `(schema)` a schema, `()` sweeps every held entry whose table is back. A no-op
+   * returning 0 without a `getTableSchema` oracle (a relay-only coordinator cannot
+   * tell which held tables are present). Returns the number of held entries drained
+   * (cleared from the hold). Fires `onHeldChangesDrained` once per drained table and
+   * `onRemoteChange` for the applied changes.
+   */
+  drainHeldChanges(schema?: string, table?: string): Promise<number>;
+
+  /**
    * Cumulative unknown-table disposition stats since process start.
    *
    * `ignored` / `quarantined` / `forwarded` count diverted changes by

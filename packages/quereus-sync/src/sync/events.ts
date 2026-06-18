@@ -159,6 +159,28 @@ export interface BasisTableEvictedEvent {
 }
 
 /**
+ * Fired once per table whose held out-of-basis changes were replayed into it by
+ * the host-driven drain ({@link SyncManager.drainHeldChanges}) after the table
+ * reappeared in the local basis (`docs/migration.md` § 4 Contract — revival).
+ * `drained` is every held entry cleared from the hold for this table (applied or
+ * not); `applied` won LWW and reached the store; `skipped` lost LWW, was blocked
+ * by a tombstone, or was drift-dropped (a held column change for a column the
+ * re-created table no longer has). `applied + skipped === drained`.
+ */
+export interface HeldChangesDrainedEvent {
+  /** Schema of the reappeared table whose held changes drained. */
+  readonly schema: string;
+  /** Reappeared table whose held changes drained. */
+  readonly table: string;
+  /** Held entries cleared from the hold for this table (applied + skipped). */
+  readonly drained: number;
+  /** Held changes that won resolution and were applied to the store. */
+  readonly applied: number;
+  /** Held changes cleared without applying (LWW loss, tombstone-blocked, drift). */
+  readonly skipped: number;
+}
+
+/**
  * Sync connection state.
  */
 export type SyncState =
@@ -232,6 +254,13 @@ export interface SyncEventEmitter {
    * Fired when the eviction sweep reclaims a detached basis table's local storage.
    */
   onBasisTableEvicted(listener: (event: BasisTableEvictedEvent) => void): Unsubscribe;
+
+  /**
+   * Subscribe to held-change drain events.
+   * Fired once per table whose held out-of-basis changes were replayed into it
+   * after the table reappeared in the local basis (the drain sweep).
+   */
+  onHeldChangesDrained(listener: (event: HeldChangesDrainedEvent) => void): Unsubscribe;
 }
 
 // ============================================================================
@@ -250,6 +279,7 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   private assertionViolationListeners = new Set<(event: AssertionViolationEvent) => void>();
   private basisTableLifecycleListeners = new Set<(event: BasisTableLifecycleEvent) => void>();
   private basisTableEvictedListeners = new Set<(event: BasisTableEvictedEvent) => void>();
+  private heldChangesDrainedListeners = new Set<(event: HeldChangesDrainedEvent) => void>();
 
   onRemoteChange(listener: (event: RemoteChangeEvent) => void): Unsubscribe {
     this.remoteChangeListeners.add(listener);
@@ -289,6 +319,11 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   onBasisTableEvicted(listener: (event: BasisTableEvictedEvent) => void): Unsubscribe {
     this.basisTableEvictedListeners.add(listener);
     return () => this.basisTableEvictedListeners.delete(listener);
+  }
+
+  onHeldChangesDrained(listener: (event: HeldChangesDrainedEvent) => void): Unsubscribe {
+    this.heldChangesDrainedListeners.add(listener);
+    return () => this.heldChangesDrainedListeners.delete(listener);
   }
 
   // Internal emit methods
@@ -337,6 +372,12 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
 
   emitBasisTableEvicted(event: BasisTableEvictedEvent): void {
     for (const listener of this.basisTableEvictedListeners) {
+      listener(event);
+    }
+  }
+
+  emitHeldChangesDrained(event: HeldChangesDrainedEvent): void {
+    for (const listener of this.heldChangesDrainedListeners) {
       listener(event);
     }
   }

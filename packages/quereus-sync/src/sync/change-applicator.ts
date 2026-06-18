@@ -249,30 +249,8 @@ export async function applyChanges(
 		watermarkHLC: maxHLC(changes.map(cs => cs.hlc)),
 	});
 
-	// Emit remote change events
-	if (appliedChanges.length > 0) {
-		const changesBySite = new Map<string, Change[]>();
-		for (const { change, siteId } of appliedChanges) {
-			const siteKey = Array.from(siteId).join(',');
-			const siteChanges = changesBySite.get(siteKey);
-			if (siteChanges) {
-				siteChanges.push(change);
-			} else {
-				changesBySite.set(siteKey, [change]);
-			}
-		}
-
-		const appliedAt = ctx.hlcManager.now();
-		for (const [siteKey, siteChanges] of changesBySite) {
-			const siteIdBytes = new Uint8Array(siteKey.split(',').map(Number));
-			ctx.syncEvents.emitRemoteChange({
-				siteId: siteIdBytes,
-				transactionId: crypto.randomUUID(),
-				changes: siteChanges,
-				appliedAt,
-			});
-		}
-	}
+	// Emit remote change events (grouped by the relaying changeset's siteId).
+	emitRemoteChanges(ctx, appliedChanges);
 
 	// Unknown-table telemetry AFTER successful admission, regardless of disposition
 	// (the operator must see straggler traffic even when it is being dropped).
@@ -298,6 +276,176 @@ export async function applyChanges(
 		transactions: changes.length,
 		...(unknownTableCount > 0 ? { unknownTable: unknownTableCount } : {}),
 	};
+}
+
+/**
+ * Emit `onRemoteChange` for applied changes, grouped by a per-change origin site
+ * id. Shared by the wire apply (grouping by the relaying changeset's `siteId`) and
+ * the drain path (grouping by each held change's original origin `hlc.siteId`), so
+ * downstream reactivity — MV maintenance, `Database.watch`, UI — fires identically
+ * on a revival as on a fresh remote apply. No-op for an empty set.
+ */
+function emitRemoteChanges(
+	ctx: SyncContext,
+	entries: Array<{ change: Change; siteId: SiteId }>,
+): void {
+	if (entries.length === 0) return;
+
+	const changesBySite = new Map<string, Change[]>();
+	for (const { change, siteId } of entries) {
+		const siteKey = Array.from(siteId).join(',');
+		const siteChanges = changesBySite.get(siteKey);
+		if (siteChanges) {
+			siteChanges.push(change);
+		} else {
+			changesBySite.set(siteKey, [change]);
+		}
+	}
+
+	const appliedAt = ctx.hlcManager.now();
+	for (const [siteKey, siteChanges] of changesBySite) {
+		const siteIdBytes = new Uint8Array(siteKey.split(',').map(Number));
+		ctx.syncEvents.emitRemoteChange({
+			siteId: siteIdBytes,
+			transactionId: crypto.randomUUID(),
+			changes: siteChanges,
+			appliedAt,
+		});
+	}
+}
+
+/**
+ * Replay held out-of-basis changes (`quarantine` + forwardable `store-and-forward`
+ * entries) into tables that have since reappeared in the local basis — the revival
+ * half of the unknown-table contract (`docs/migration.md` § 4 Contract). The
+ * sibling of {@link applyChanges}' data branch, minus the schema-migration and
+ * unknown-table-divert machinery: held changes have no DDL and their table is, by
+ * the basis gate, already present.
+ *
+ * Host-driven, not inline: the host calls {@link SyncManager.drainHeldChanges} from
+ * its periodic maintenance path (or right after re-creating a table). Running drain
+ * as a SEPARATE apply, after any re-creating batch has fully committed, means fresh
+ * data is already in storage and the older held changes simply LWW-resolve against
+ * it — no intra-admission interleaving of held + fresh changes.
+ *
+ * Scope mirrors {@link QuarantineStore.list}: `(schema, table)` drains one table,
+ * `(schema)` drains a schema, `()` sweeps every held entry whose table is back.
+ * Bounded by the held set (itself bounded by the retention horizon); zero-cost when
+ * nothing is held. With NO basis oracle every group's table reports `undefined`
+ * column names ⇒ every group is skipped ⇒ this returns 0 (the relay-only no-op).
+ *
+ * @returns the number of held entries cleared from the hold (across present tables).
+ */
+export async function drainHeldChanges(
+	ctx: SyncContext,
+	schema?: string,
+	table?: string,
+): Promise<number> {
+	const held = await ctx.quarantine.list(schema, table);
+	if (held.length === 0) return 0;
+
+	// Group held changes by (schema, table) — drain admits one table at a time.
+	const groups = new Map<string, { schema: string; table: string; changes: Change[] }>();
+	for (const entry of held) {
+		const change = entry.change;
+		const key = tableKey(change.schema, change.table);
+		let group = groups.get(key);
+		if (!group) {
+			group = { schema: change.schema, table: change.table, changes: [] };
+			groups.set(key, group);
+		}
+		group.changes.push(change);
+	}
+
+	let totalDrained = 0;
+	for (const group of groups.values()) {
+		totalDrained += await drainTableGroup(ctx, group);
+	}
+	return totalDrained;
+}
+
+/**
+ * Drain one `(schema, table)` group of held changes. Returns the number of held
+ * entries cleared for this table (0 when the table is still absent).
+ */
+async function drainTableGroup(
+	ctx: SyncContext,
+	group: { schema: string; table: string; changes: Change[] },
+): Promise<number> {
+	// Basis gate: a table not back in the local basis (oracle returns undefined —
+	// also the no-oracle case) stays held; skip the whole group, drain nothing.
+	const columns = ctx.getTableColumnNames(group.schema, group.table);
+	if (columns === undefined) return 0;
+	const columnSet = new Set(columns);
+
+	const dataChangesToApply: DataChangeToApply[] = [];
+	const resolvedDataChanges: ResolvedChange[] = [];
+	const appliedEntries: Array<{ change: Change; siteId: SiteId }> = [];
+	let applied = 0;
+	let skipped = 0;
+
+	for (const change of group.changes) {
+		// Schema-drift filter: a held column change for a column the re-created table
+		// no longer has is resolved-and-dropped (never sent to resolveChange or the
+		// store), so one stale entry cannot abort the table's whole drain admission.
+		// Its held entry is still cleared below. Deletes are never drift-filtered — a
+		// delete of an absent pk is a store no-op, not a poison.
+		if (change.type === 'column' && !columnSet.has(change.column)) {
+			skipped++;
+			continue;
+		}
+
+		// Identical LWW / tombstone-blocking / allowResurrection semantics as a fresh
+		// receive — the held change is just an older inbound change resolved late.
+		const resolved = await resolveChange(ctx, change);
+		if (resolved.outcome === 'applied') {
+			applied++;
+			resolvedDataChanges.push(resolved);
+			if (resolved.dataChange) dataChangesToApply.push(resolved.dataChange);
+			// Group revival events by the held change's ORIGINAL origin (its HLC
+			// siteId) — a held change carries no relaying changeset.
+			appliedEntries.push({ change, siteId: change.hlc.siteId });
+		} else {
+			skipped++;
+		}
+	}
+
+	// One admission unit: data first → CRDT metadata + held-entry deletes second.
+	// No watermarkHLC — these HLCs were already merged into the local clock at the
+	// original receive (applyChanges merges the batch maxHLC even for diverted
+	// changes), so re-merging would be a no-op; omitting it keeps drain a pure replay.
+	await admitGroup(ctx, {
+		dataChanges: dataChangesToApply,
+		schemaChanges: [],
+		applyOptions: { remote: true },
+		commitMetadata: async () => {
+			await commitChangeMetadata(ctx, resolvedDataChanges);
+			// Clear every held entry CONSIDERED this drain (applied, LWW-lost, blocked,
+			// or drift-dropped) in the SAME unit, so the hold clears atomically with the
+			// apply. Once a held change has resolved against the present table, holding
+			// it longer changes nothing — a future drain resolves it identically — so a
+			// non-applied outcome is cleared too. A data-apply failure aborts before
+			// this callback, so on a crash the entries stay held and re-drain next sweep.
+			const qBatch = ctx.kv.batch();
+			for (const change of group.changes) {
+				ctx.quarantine.delete(qBatch, change);
+			}
+			await qBatch.write();
+		},
+	});
+
+	// Revival events AFTER the unit commits (so a listener reading back sees the
+	// applied data): remote-change per origin, then one drained event for the table.
+	emitRemoteChanges(ctx, appliedEntries);
+	ctx.syncEvents.emitHeldChangesDrained({
+		schema: group.schema,
+		table: group.table,
+		drained: group.changes.length,
+		applied,
+		skipped,
+	});
+
+	return group.changes.length;
 }
 
 /**

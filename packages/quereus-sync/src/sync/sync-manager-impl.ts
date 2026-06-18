@@ -73,7 +73,7 @@ import type {
 import { SyncEventEmitterImpl } from './events.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCStateBatch, toError } from './sync-context.js';
-import { applyChanges as applyChangesImpl } from './change-applicator.js';
+import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl } from './change-applicator.js';
 import { buildTransactionChangeSets } from './change-grouping.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
 import {
@@ -278,6 +278,17 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 */
 	isTableInBasis(schema: string, table: string): boolean {
 		return this.getTableSchema ? this.getTableSchema(schema, table) !== undefined : true;
+	}
+
+	/**
+	 * Current column names for an in-basis table via the `getTableSchema` oracle, or
+	 * `undefined` when the table is outside the basis (oracle returns nothing) OR no
+	 * oracle was wired. Backs the drain path's basis gate + schema-drift filter (see
+	 * {@link SyncContext.getTableColumnNames}). The no-oracle `undefined` makes drain
+	 * a clean no-op on a relay-only coordinator, exactly as detection is inert there.
+	 */
+	getTableColumnNames(schema: string, table: string): readonly string[] | undefined {
+		return this.getTableSchema?.(schema, table)?.columns?.map(c => c.name);
 	}
 
 	/**
@@ -1126,6 +1137,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 	async applyChanges(changes: ChangeSet[]): Promise<ApplyResult> {
 		return applyChangesImpl(this, changes);
+	}
+
+	async drainHeldChanges(schema?: string, table?: string): Promise<number> {
+		return drainHeldChangesImpl(this, schema, table);
 	}
 
 	async canDeltaSync(peerSiteId: SiteId, sinceHLC: HLC): Promise<boolean> {

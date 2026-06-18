@@ -135,6 +135,7 @@ export {
   type AssertionViolationEvent,
   type BasisTableLifecycleEvent,
   type BasisTableEvictedEvent,
+  type HeldChangesDrainedEvent,
   type SyncState,
   type Unsubscribe,
   type SyncEventEmitter,

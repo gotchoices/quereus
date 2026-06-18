@@ -49,6 +49,16 @@ export interface SyncContext {
 	isTableInBasis(schema: string, table: string): boolean;
 
 	/**
+	 * Current column names for an in-basis table, or `undefined` when the table is
+	 * outside the local basis (or no `getTableSchema` oracle was wired). Backs both
+	 * the drain path's basis gate (`undefined` ⇒ the held group's table is not back,
+	 * skip it) and its schema-drift filter (a held column change for a column absent
+	 * from this set is drift-dropped). Implemented via `getTableSchema` in
+	 * `SyncManagerImpl`.
+	 */
+	getTableColumnNames(schema: string, table: string): readonly string[] | undefined;
+
+	/**
 	 * Record cumulative unknown-table disposition stats (surfaced via
 	 * `SyncManager.getUnknownTableStats`). Telemetry-only; called once per
 	 * diverted `(schema, table)` group after successful admission.
