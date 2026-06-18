@@ -27,37 +27,7 @@ import { SyncEventEmitterImpl, type SyncState, type UnknownTableEvent, type Asse
 import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { HLCManager } from '../../src/clock/hlc.js';
-
-function createInMemoryProvider(): { provider: KVStoreProvider; stores: Map<string, InMemoryKVStore> } {
-	const stores = new Map<string, InMemoryKVStore>();
-	const get = (key: string): InMemoryKVStore => {
-		let s = stores.get(key);
-		if (!s) {
-			s = new InMemoryKVStore();
-			stores.set(key, s);
-		}
-		return s;
-	};
-	const provider: KVStoreProvider = {
-		async getStore(s, t) { return get(`${s}.${t}`); },
-		async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
-		async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
-		async getCatalogStore() { return get('__catalog__'); },
-		async closeStore() {},
-		async closeIndexStore() {},
-		async closeAll() {
-			for (const store of stores.values()) await store.close();
-			stores.clear();
-		},
-	};
-	return { provider, stores };
-}
-
-async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
-	const out: Record<string, SqlValue>[] = [];
-	for await (const row of db.eval(sql)) out.push(row);
-	return out;
-}
+import { createInMemoryProvider, collect } from './_peer-harness.js';
 
 /** Hand-built row-granular watch scope on a single-column-PK table. */
 function rowsWatch(table: string, key: string, value: SqlValue): ChangeScope {

@@ -51,158 +51,22 @@
  */
 
 import { expect } from 'chai';
-import { Database, type SqlValue } from '@quereus/quereus';
-import {
-	StoreModule,
-	StoreEventEmitter,
-	InMemoryKVStore,
-	type DataChangeEvent,
-	type KVStoreProvider,
-} from '@quereus/store';
-import { createStoreAdapter } from '../../src/sync/store-adapter.js';
-import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
-import { SyncEventEmitterImpl } from '../../src/sync/events.js';
-import {
-	DEFAULT_SYNC_CONFIG,
-	type SyncConfig,
-	type ChangeSet,
-	type Change,
-	type ColumnChange,
-	type UnknownTableDisposition,
-} from '../../src/sync/protocol.js';
-import { generateSiteId, siteIdEquals, type SiteId } from '../../src/clock/site.js';
+import { type DataChangeEvent } from '@quereus/store';
+import { type ColumnChange } from '../../src/sync/protocol.js';
+import { generateSiteId, siteIdEquals } from '../../src/clock/site.js';
 import { compareHLC, createHLC } from '../../src/clock/hlc.js';
-
-/** One CRDT ColumnChange per column of a fresh insert — PK included (id + note). */
-const COLUMNS_PER_FRESH_INSERT = 2;
-
-/** Per-store-key in-memory KV provider (copied from echo-loop-quiescence.spec.ts). */
-function createInMemoryProvider(): { provider: KVStoreProvider; stores: Map<string, InMemoryKVStore> } {
-	const stores = new Map<string, InMemoryKVStore>();
-	const get = (key: string): InMemoryKVStore => {
-		let s = stores.get(key);
-		if (!s) {
-			s = new InMemoryKVStore();
-			stores.set(key, s);
-		}
-		return s;
-	};
-	const provider: KVStoreProvider = {
-		async getStore(s, t) { return get(`${s}.${t}`); },
-		async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
-		async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
-		async getCatalogStore() { return get('__catalog__'); },
-		async closeStore() {},
-		async closeIndexStore() {},
-		async closeAll() {
-			for (const store of stores.values()) await store.close();
-			stores.clear();
-		},
-	};
-	return { provider, stores };
-}
-
-async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
-	const out: Record<string, SqlValue>[] = [];
-	for await (const row of db.eval(sql)) out.push(row);
-	return out;
-}
-
-/**
- * Local-change capture is anchored to the engine transaction boundary and runs
- * fire-and-forget *after* the commit, so this manual-relay harness must let the
- * capture settle before reading the change log. (A generous in-memory delay; the
- * handler completes in microtasks.)
- */
-const settle = () => new Promise<void>(resolve => setTimeout(resolve, 25));
-
-/** A self-contained sync peer: real Database + StoreModule + adapter + SyncManager. */
-interface Peer {
-	readonly name: string;
-	readonly db: Database;
-	readonly provider: KVStoreProvider;
-	readonly events: StoreEventEmitter;
-	readonly storeModule: StoreModule;
-	readonly manager: SyncManagerImpl;
-}
-
-/**
- * Build a real-engine peer parameterized by its unknown-table disposition and whether
- * it creates the `orders` base table. The basis oracle is the table-lookup function
- * itself (`db.schemaManager.getTable`), so a peer that never creates `orders` reports
- * it out-of-basis — that is exactly how R "retires" the table.
- */
-async function makePeer(
-	name: string,
-	opts: { createOrders?: boolean; disposition?: UnknownTableDisposition } = {},
-): Promise<Peer> {
-	const { provider } = createInMemoryProvider();
-	const events = new StoreEventEmitter();
-	const db = new Database();
-	const storeModule = new StoreModule(provider, events);
-	db.registerModule('store', storeModule);
-	const applyToStore = createStoreAdapter({ db, storeModule, events });
-
-	const config: SyncConfig = {
-		...DEFAULT_SYNC_CONFIG,
-		...(opts.disposition ? { unknownTableDisposition: opts.disposition } : {}),
-	};
-
-	const manager = await SyncManagerImpl.create(
-		new InMemoryKVStore(),
-		db,
-		config,
-		new SyncEventEmitterImpl(),
-		applyToStore,
-		(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
-	);
-
-	if (opts.createOrders) {
-		await db.exec('create table orders (id integer primary key, note text) using store');
-	}
-
-	return { name, db, provider, events, storeModule, manager };
-}
-
-async function closePeer(peer: Peer): Promise<void> {
-	await peer.db.close();
-	await peer.provider.closeAll();
-}
-
-/** Apply one local SQL write and let its transaction-boundary capture settle. */
-async function localWrite(peer: Peer, sql: string): Promise<void> {
-	await peer.db.exec(sql);
-	await settle();
-}
-
-/**
- * One-directional full DATA relay (real-db analogue of a transport pull):
- * `from`'s data changes excluding `to`-origin → `to`, from-zero (no `sinceHLC`).
- * Schema migrations are stripped — each peer creates its own schema directly, so the
- * relay pins data echo, not DDL propagation.
- */
-async function relay(from: Peer, to: Peer): Promise<{ applied: number }> {
-	await settle(); // flush `from`'s pending local capture before reading its log
-	const sets = await from.manager.getChangesSince(to.manager.getSiteId());
-	const dataOnly = sets.map(cs => ({ ...cs, schemaMigrations: [] }));
-	const res = await to.manager.applyChanges(dataOnly);
-	await settle(); // flush `to`'s capture from the apply
-	await to.manager.updatePeerSyncState(from.manager.getSiteId(), from.manager.getCurrentHLC());
-	return res;
-}
-
-/** Flatten a peer's relayable change log (from-zero) for a given peer-id exclusion. */
-async function changesFor(peer: Peer, excludeSiteId: SiteId): Promise<Change[]> {
-	await settle(); // flush any pending local capture before reading the log
-	const sets = await peer.manager.getChangesSince(excludeSiteId);
-	return sets.flatMap(cs => [...cs.changes]);
-}
-
-/** Flatten a ChangeSet[] to its data changes. */
-const flattenSets = (sets: ChangeSet[]): Change[] => sets.flatMap(cs => [...cs.changes]);
-
-/** Whether any flattened change targets the `orders` table. */
-const hasOrders = (changes: Change[]): boolean => changes.some(c => c.table === 'orders');
+import {
+	COLUMNS_PER_FRESH_INSERT,
+	type Peer,
+	makePeer,
+	closePeer,
+	localWrite,
+	relay,
+	changesFor,
+	flattenSets,
+	hasOrders,
+	collect,
+} from './_peer-harness.js';
 
 describe('real-engine store-and-forward relay: straggler → relay → holder', () => {
 	let S: Peer; // straggler: has `orders`, writes the row

@@ -11,41 +11,16 @@
  */
 
 import { expect } from 'chai';
-import { Database, type SqlValue } from '@quereus/quereus';
+import { Database } from '@quereus/quereus';
 import {
 	StoreModule,
 	StoreEventEmitter,
-	InMemoryKVStore,
 	type KVStoreProvider,
 } from '@quereus/store';
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import type { ApplyToStoreCallback } from '../../src/sync/protocol.js';
+import { createInMemoryProvider, collect } from './_peer-harness.js';
 
-async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
-	const out: Record<string, SqlValue>[] = [];
-	for await (const row of db.eval(sql)) out.push(row);
-	return out;
-}
-
-function createInMemoryProvider(): KVStoreProvider {
-	const stores = new Map<string, InMemoryKVStore>();
-	const get = (key: string) => {
-		if (!stores.has(key)) stores.set(key, new InMemoryKVStore());
-		return stores.get(key)!;
-	};
-	return {
-		async getStore(s, t) { return get(`${s}.${t}`); },
-		async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
-		async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
-		async getCatalogStore() { return get('__catalog__'); },
-		async closeStore() {},
-		async closeIndexStore() {},
-		async closeAll() {
-			for (const store of stores.values()) await store.close();
-			stores.clear();
-		},
-	};
-}
 
 describe('store-adapter PK key collation', () => {
 	let db: Database;
@@ -55,7 +30,7 @@ describe('store-adapter PK key collation', () => {
 
 	beforeEach(() => {
 		db = new Database();
-		provider = createInMemoryProvider();
+		provider = createInMemoryProvider().provider;
 		events = new StoreEventEmitter();
 		const storeModule = new StoreModule(provider, events);
 		db.registerModule('store', storeModule);

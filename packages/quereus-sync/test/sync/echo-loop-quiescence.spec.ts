@@ -43,73 +43,31 @@
  */
 
 import { expect } from 'chai';
-import { Database, type SqlValue } from '@quereus/quereus';
+import { Database } from '@quereus/quereus';
 import {
 	StoreModule,
 	StoreEventEmitter,
 	InMemoryKVStore,
 	type DataChangeEvent,
-	type KVStoreProvider,
 } from '@quereus/store';
 import { createStoreAdapter } from '../../src/sync/store-adapter.js';
 import { SyncManagerImpl } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl } from '../../src/sync/events.js';
-import { DEFAULT_SYNC_CONFIG, type ApplyResult, type ColumnChange } from '../../src/sync/protocol.js';
+import { DEFAULT_SYNC_CONFIG, type ColumnChange } from '../../src/sync/protocol.js';
 import { generateSiteId } from '../../src/clock/site.js';
 import { deterministicTxnId } from '../../src/clock/hlc.js';
+import {
+	createInMemoryProvider,
+	collect,
+	settle,
+	type Peer,
+	closePeer,
+	localWrite,
+	relay,
+	changesFor,
+	COLUMNS_PER_FRESH_INSERT,
+} from './_peer-harness.js';
 
-/** Per-store-key in-memory KV provider (copied from store-adapter-seam.spec.ts). */
-function createInMemoryProvider(): { provider: KVStoreProvider; stores: Map<string, InMemoryKVStore> } {
-	const stores = new Map<string, InMemoryKVStore>();
-	const get = (key: string): InMemoryKVStore => {
-		let s = stores.get(key);
-		if (!s) {
-			s = new InMemoryKVStore();
-			stores.set(key, s);
-		}
-		return s;
-	};
-	const provider: KVStoreProvider = {
-		async getStore(s, t) { return get(`${s}.${t}`); },
-		async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
-		async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
-		async getCatalogStore() { return get('__catalog__'); },
-		async closeStore() {},
-		async closeIndexStore() {},
-		async closeAll() {
-			for (const store of stores.values()) await store.close();
-			stores.clear();
-		},
-	};
-	return { provider, stores };
-}
-
-async function collect(db: Database, sql: string): Promise<Record<string, SqlValue>[]> {
-	const out: Record<string, SqlValue>[] = [];
-	for await (const row of db.eval(sql)) out.push(row);
-	return out;
-}
-
-/**
- * Local-change capture is anchored to the engine transaction boundary and runs
- * fire-and-forget *after* the commit (the `onTransactionCommit` listener cannot
- * await the async metadata write). In production the sync loop is driven by the
- * post-capture `onLocalChange` event, so there is no race; this manual-relay
- * harness reads the change log directly, so it must let the capture settle
- * before reading. (A generous in-memory delay; the handler completes in
- * microtasks.)
- */
-const settle = () => new Promise<void>(resolve => setTimeout(resolve, 25));
-
-/** A self-contained sync peer: real Database + StoreModule + adapter + SyncManager. */
-interface Peer {
-	readonly name: string;
-	readonly db: Database;
-	readonly provider: KVStoreProvider;
-	readonly events: StoreEventEmitter;
-	readonly storeModule: StoreModule;
-	readonly manager: SyncManagerImpl;
-}
 
 /**
  * Build the peer WIRING — provider, store event emitter, Database, StoreModule,
@@ -239,51 +197,6 @@ async function makeFilteredEmptyPeer(name: string): Promise<Peer> {
 	);
 
 	return peer;
-}
-
-async function closePeer(peer: Peer): Promise<void> {
-	await peer.db.close();
-	await peer.provider.closeAll();
-}
-
-/**
- * Apply one local SQL write and let its transaction-boundary capture settle, so
- * the peer's change log reflects the write before any subsequent relay/read.
- */
-async function localWrite(peer: Peer, sql: string): Promise<void> {
-	await peer.db.exec(sql);
-	await settle();
-}
-
-/**
- * One-directional full DATA relay (real-db analogue of `performBidirectionalSync`):
- * `from`'s data changes excluding `to`-origin → `to`. Uses full sync (no
- * `sinceHLC`), so `getChangesSince(to.siteId)` returns every change `from` holds
- * that did not originate at `to` — exactly the set `to` should ingest.
- *
- * Schema migrations are stripped: each peer creates its schema directly via
- * `db.exec` (the ticket pins data echo, NOT DDL propagation — covered
- * elsewhere), but the SyncManager records each peer's local DDL as schema
- * migrations regardless. Relaying a peer's `create table`/`create materialized
- * view` DDL to the other (which already holds the table) errors "already
- * exists", so we sync only the data changes — modelling two peers that already
- * agree on schema.
- */
-async function relay(from: Peer, to: Peer): Promise<ApplyResult> {
-	await settle(); // flush `from`'s pending local capture before reading its log
-	const sets = await from.manager.getChangesSince(to.manager.getSiteId());
-	const dataOnly = sets.map(cs => ({ ...cs, schemaMigrations: [] }));
-	const res = await to.manager.applyChanges(dataOnly);
-	await settle(); // flush `to`'s re-derivation capture from the apply
-	await to.manager.updatePeerSyncState(from.manager.getSiteId(), from.manager.getCurrentHLC());
-	return res;
-}
-
-/** Flatten a peer's relayable change log for a given peer-id exclusion. */
-async function changesFor(peer: Peer, excludeSiteId: Uint8Array): Promise<readonly unknown[]> {
-	await settle(); // flush any pending local capture before reading the log
-	const sets = await peer.manager.getChangesSince(excludeSiteId);
-	return sets.flatMap(cs => cs.changes);
 }
 
 describe('echo-loop quiescence across two synced peers', () => {
@@ -488,8 +401,6 @@ describe('create-fill of a populated source publishes one grouped change-set', (
 	// the column count (not a flat "N") so a future multi-column MV doesn't silently
 	// break the reasoning. (An UPDATE, by contrast, records only the differing
 	// columns — see the steady-state tests in the suite above.)
-	const COLUMNS_PER_FRESH_INSERT = 2; // id + v — PK included for a fresh insert
-
 	let A: Peer; // producer: src seeded BEFORE the tagged MV → non-empty create-fill
 	let B: Peer; // peer: MV over an empty src → its own create-fill emits nothing
 
@@ -690,7 +601,6 @@ describe('stale-drift refresh of a materialized view publishes one grouped chang
 	// create-fill row records 2 ColumnChanges (id + v, PK included for a fresh insert),
 	// exactly like the create-fill suite above. Used only for the before-refresh
 	// precondition guard.
-	const COLUMNS_PER_FRESH_INSERT = 2;
 	// The drift updates `v` on two of the three rows (id=1, id=2); id=3 is left
 	// untouched, so the refresh diffs to exactly two `op:'update'` deltas.
 	const DRIFTED_ROWS = 2;
