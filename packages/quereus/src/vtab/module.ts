@@ -345,8 +345,13 @@ export interface VirtualTableModule<
 	 * store is empty / rolled-back, so a migrate would clobber them).
 	 *
 	 * Only called for a fresh attach (no prior derivation) whose reconcile did not
-	 * commit. No-op for modules with a single physical storage. Omit ⇒ attach
-	 * failure is catalog-only rollback (today's behavior).
+	 * commit, AND only from the `alter table … set maintained` verb — NOT from
+	 * `create table … maintained`, where the create path's own `dropTable` already
+	 * retires the store (a discard there would double-drop). That verb gating lives
+	 * on the `discardBackingOnFailure` flag of `attachMaintainedDerivation`, where
+	 * the full rationale and the firing condition are documented. No-op for modules
+	 * with a single physical storage. Omit ⇒ attach failure is catalog-only rollback
+	 * (today's behavior).
 	 */
 	discardBackingForAttach?(
 		db: Database,
