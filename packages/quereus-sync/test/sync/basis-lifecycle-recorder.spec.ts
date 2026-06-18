@@ -437,6 +437,28 @@ describe('recordLensDeployment — low-latency drain on detached → re-mapped',
     expect(siteIdEquals(remoteChanges[0].siteId, remoteSite)).to.be.true;
   });
 
+  it('detached → unreferenced (back in basis but unmapped) also drains — the gate is detached → present, not detached → directly-mapped', async () => {
+    // Map orders, then detach it.
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', mapSnap('h1', 'orders'));
+    await mgr.recordLensDeployment(makeDb('main', []), 'app', makeSnapshot('main', 'h2', []));
+    expect((await getRec('main', 'orders'))?.state).to.equal('detached');
+
+    await seedHeld('orders', 1, 'note', 'hi', 1000);
+    oracleColumns.set('main.orders', ['note']);
+    drained.length = 0; remoteChanges.length = 0;
+
+    // orders is back in the basis (db lists it) but the lens maps NOTHING to it →
+    // classified `unreferenced`, not `directly-mapped`. The `detached → present`
+    // gate (`wasDetached && !isDetached`) still fires, so the held change drains.
+    await mgr.recordLensDeployment(mapDb('orders'), 'app', makeSnapshot('main', 'h3', []));
+    expect((await getRec('main', 'orders'))?.state).to.equal('unreferenced');
+
+    expect(await held('orders')).to.have.lengthOf(0);
+    expect(store.get('main.orders:[1]:note')).to.equal('hi');
+    expect(drained).to.have.lengthOf(1);
+    expect(drained[0]).to.include({ schema: 'main', table: 'orders', drained: 1, applied: 1, skipped: 0 });
+  });
+
   it('an idempotent re-deploy (no detached → present transition) does not drain', async () => {
     // orders stays directly-mapped throughout; legacy is mapped then detached.
     await mgr.recordLensDeployment(mapDb('orders', 'legacy'), 'app', mapSnap('h1', 'orders', 'legacy'));
