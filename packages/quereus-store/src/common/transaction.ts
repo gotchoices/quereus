@@ -131,9 +131,32 @@ export class TransactionCoordinator {
     this.atomicBatchFactory = atomicBatchFactory;
   }
 
-  /** Register callbacks for transaction lifecycle events. */
-  registerCallbacks(callbacks: TransactionCallbacks): void {
+  /**
+   * Register callbacks for transaction lifecycle events.
+   *
+   * Returns a disposer that removes this EXACT pair (identity-matched). The splice
+   * runs only at teardown — never inside the commit/rollback fire loops — so there
+   * is no iterate-during-mutate hazard. The coordinator is module-wide and never
+   * prunes on its own, so a hard table eviction (drop / recreate / rename) MUST
+   * call its disposer; otherwise the pair's closures — and the {@link StoreTable}
+   * they capture — stay pinned for the module's lifetime (the leak this fixes).
+   */
+  registerCallbacks(callbacks: TransactionCallbacks): () => void {
     this.callbacks.push(callbacks);
+    return () => {
+      const i = this.callbacks.indexOf(callbacks);
+      if (i >= 0) this.callbacks.splice(i, 1);
+    };
+  }
+
+  /**
+   * Number of registered lifecycle-callback pairs. Introspection for tests
+   * (regression coverage that hard eviction deregisters its pair, so the count
+   * stays O(live tables) rather than O(drop/recreate cycles)); not part of the
+   * transactional contract.
+   */
+  get callbackCount(): number {
+    return this.callbacks.length;
   }
 
   /** Check if a transaction is active. */

@@ -651,11 +651,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		this.tables.delete(tableKey);
 		this.stores.delete(tableKey);
 		// NOTE: the coordinator is module-wide and shared by sibling tables, so a
-		// single table's teardown must NOT evict it. The StoreTable eviction above
-		// (this.tables.delete) is now the backing-host pinning identity.
-
+		// single table's teardown must NOT evict the coordinator itself. But the
+		// evicted StoreTable's stats-callback pair MUST be deregistered, or its
+		// closures (capturing this instance) stay pinned on the shared coordinator
+		// for the module's lifetime — a leak bounded by drop/recreate count.
+		// table.dispose() both flushes pending stats and runs that disposer.
 		if (table) {
-			await table.disconnect();
+			await table.dispose();
 		}
 
 		// Delete all stores for this table (data, indexes, stats)
@@ -1677,11 +1679,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			await this.moduleCoordinator.commit();
 		}
 
-		// Flush any lazy stats the cached handle was buffering; disconnect failures
-		// must not block the rename.
+		// Hard-dispose the evicted handle: flush any lazy stats it was buffering AND
+		// deregister its coordinator stats-callback pair (the renamed instance is
+		// gone after this — the next connect()/getOrReconnectTable mints a fresh one
+		// that re-registers against the shared coordinator). Dispose failures must
+		// not block the physical rename.
 		if (existing) {
 			try {
-				await existing.disconnect();
+				await existing.dispose();
 			} catch {
 				/* ignore — physical rename must proceed */
 			}

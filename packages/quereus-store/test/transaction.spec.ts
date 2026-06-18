@@ -207,6 +207,68 @@ describe('TransactionCoordinator', () => {
 		});
 	});
 
+	describe('callback disposer (hard-eviction deregistration)', () => {
+		// The coordinator is module-wide and never prunes on its own; a hard table
+		// eviction (drop / recreate / rename) must run its disposer or the pair —
+		// and the StoreTable its closures capture — stays pinned for the module's
+		// lifetime. registerCallbacks returns that disposer.
+		it('registerCallbacks returns a disposer that removes exactly that pair', () => {
+			const base = coordinator.callbackCount;
+			const dispose = coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => {} });
+			expect(coordinator.callbackCount).to.equal(base + 1);
+			dispose();
+			expect(coordinator.callbackCount).to.equal(base);
+		});
+
+		it('double-dispose is a no-op (does not splice an unrelated pair)', () => {
+			const base = coordinator.callbackCount;
+			coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => {} }); // survivor
+			const dispose = coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => {} });
+			dispose();
+			dispose(); // second call must find nothing and leave the survivor intact
+			expect(coordinator.callbackCount).to.equal(base + 1);
+		});
+
+		it('a disposed callback no longer fires on commit (only the survivor runs)', async () => {
+			let survivorCommits = 0;
+			let disposedCommits = 0;
+			coordinator.registerCallbacks({ onCommit: () => { survivorCommits++; }, onRollback: () => {} });
+			const dispose = coordinator.registerCallbacks({ onCommit: () => { disposedCommits++; }, onRollback: () => {} });
+			dispose();
+
+			coordinator.begin();
+			await coordinator.commit();
+			expect(survivorCommits).to.equal(1);
+			expect(disposedCommits).to.equal(0);
+		});
+
+		it('a disposed callback no longer fires on rollback (only the survivor runs)', () => {
+			let survivorRollbacks = 0;
+			let disposedRollbacks = 0;
+			coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => { survivorRollbacks++; } });
+			const dispose = coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => { disposedRollbacks++; } });
+			dispose();
+
+			coordinator.begin();
+			coordinator.rollback();
+			expect(survivorRollbacks).to.equal(1);
+			expect(disposedRollbacks).to.equal(0);
+		});
+
+		it('callbackCount returns to baseline after N register→dispose cycles (no O(N) growth)', () => {
+			const base = coordinator.callbackCount;
+			// Two long-lived "tables" plus repeated drop/recreate churn of a third.
+			coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => {} });
+			coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => {} });
+			for (let i = 0; i < 50; i++) {
+				const dispose = coordinator.registerCallbacks({ onCommit: () => {}, onRollback: () => {} });
+				dispose(); // hard eviction each cycle
+			}
+			// O(live tables) == base + 2, not base + 52.
+			expect(coordinator.callbackCount).to.equal(base + 2);
+		});
+	});
+
 	describe('queueEvent outside transaction', () => {
 		it('emits immediately when not in transaction', () => {
 			const events: DataChangeEvent[] = [];

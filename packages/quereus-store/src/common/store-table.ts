@@ -182,6 +182,13 @@ export class StoreTable extends VirtualTable {
 	protected indexStores: Map<string, KVStore> = new Map();
 	protected statsStore: KVStore | null = null;
 	protected coordinator: TransactionCoordinator | null = null;
+	/**
+	 * Disposer returned by the coordinator's `registerCallbacks`, captured on the
+	 * first {@link attachCoordinator}. Run by {@link dispose} at hard eviction to
+	 * deregister this instance's {stats apply/discard} pair from the module-wide
+	 * coordinator; null until attached, and nulled again after dispose.
+	 */
+	private coordinatorDisposer: (() => void) | null = null;
 	protected connection: StoreConnection | null = null;
 	protected eventEmitter?: StoreEventEmitter;
 	protected encodeOptions: EncodeOptions;
@@ -514,14 +521,17 @@ export class StoreTable extends VirtualTable {
 	 * `applyPendingStats` early-returns when its own `pendingStatsDelta` is 0, so a
 	 * table that did no work contributes nothing. Registers only on first call per
 	 * StoreTable instance (the `if (!this.coordinator)` guard); a fresh instance
-	 * after drop+recreate re-registers against the shared coordinator — acceptable,
-	 * the old instance is evicted and GC'd.
+	 * after drop+recreate re-registers against the shared coordinator. The OLD
+	 * instance is not GC'd on its own — its callback closures capture `this` and
+	 * stay pinned on the module-wide coordinator until {@link dispose} runs the
+	 * captured disposer (called at the genuine eviction sites, see
+	 * `StoreModule.tearDownTableStorage` / `renameTable`).
 	 */
 	attachCoordinator(): TransactionCoordinator {
 		if (!this.coordinator) {
 			this.coordinator = this.storeModule.getCoordinator();
 
-			this.coordinator.registerCallbacks({
+			this.coordinatorDisposer = this.coordinator.registerCallbacks({
 				onCommit: () => this.applyPendingStats(),
 				onRollback: () => this.discardPendingStats(),
 			});
@@ -1856,6 +1866,33 @@ export class StoreTable extends VirtualTable {
 		}
 		// Store remains available for subsequent queries.
 		// Use destroy() to fully clean up the table.
+	}
+
+	/**
+	 * Hard teardown: fully detach this instance from the module-wide coordinator.
+	 *
+	 * Distinct from the per-scan {@link disconnect} (which only flushes stats and
+	 * deliberately keeps the table hooked mid-life). Called ONLY at the genuine
+	 * eviction sites — `StoreModule.tearDownTableStorage` (drop / reclaim) and
+	 * `renameTable` — where this instance is removed from the module's `tables` map
+	 * and will never be used again. It best-effort flushes any buffered stats (the
+	 * backing store is about to be deleted / relocated, so this is the last chance,
+	 * same posture as the teardown-time `disconnect` it replaces), then runs the
+	 * coordinator disposer so this instance's {stats apply/discard} callback pair —
+	 * and the `this` its closures capture — is spliced off the shared coordinator's
+	 * array rather than pinned for the module's lifetime.
+	 *
+	 * Idempotent: the disposer is run at most once and both it and the coordinator
+	 * reference are nulled, so a double-dispose is a no-op and a re-`attachCoordinator`
+	 * after dispose registers a fresh pair instead of double-registering.
+	 */
+	async dispose(): Promise<void> {
+		if (this.mutationCount > 0 && this.store) {
+			await this.flushStats();
+		}
+		this.coordinatorDisposer?.();
+		this.coordinatorDisposer = null;
+		this.coordinator = null;
 	}
 
 	/** Get the current estimated row count. */
