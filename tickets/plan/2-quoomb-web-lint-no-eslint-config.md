@@ -1,4 +1,4 @@
-description: The `lint` script in quoomb-web (and quoomb-cli, shared-ui) invokes eslint but ships no flat config, so under ESLint v9 the command aborts during config discovery before evaluating any source. Decide whether to give these packages a real React/TS flat config or retire the vestigial scripts, then apply consistently.
+description: The `lint` script in quoomb-web (and quoomb-cli, shared-ui) invokes eslint but ships no flat config, so under ESLint v9 the command aborts during config discovery before evaluating any source. DECIDED (overnight): retire the vestigial scripts (no-op echo, matching quereus-vscode) rather than stand up new linting — aligns with AGENTS.md (only quereus lints) and defers the large, unreviewed linting-adoption effort to a deliberate decision.
 files:
   - packages/quoomb-web/package.json    # "lint": "eslint src/**/*.{ts,tsx}" — no eslint.config.* beside it
   - packages/quoomb-cli/package.json     # "lint": "eslint src/**/*.ts" — same problem
@@ -9,6 +9,26 @@ files:
 difficulty: low
 
 # quoomb-web (and quoomb-cli, shared-ui) lint aborts: no ESLint flat config
+
+## Decision (overnight autonomous, 2026-06-18): Option 2 — retire the vestigial scripts
+
+No human available to authorize the larger linting-adoption effort, so picked the
+conservative, tightly-scoped, reversible option. Rationale: AGENTS.md § Build & Test already
+states only `packages/quereus` carries a lint script; these three scripts are vestigial,
+broken since the ESLint v9 bump, and gate nothing (CI/agents never invoke them). Option 1
+(stand up React/TS flat configs) would surface a flood of pre-existing violations across
+~9,500 never-linted lines — a genuine project investment needing deliberate sign-off, not an
+autonomous overnight change.
+
+Implementation for the plan/implement pass:
+- Set `"lint": "echo 'No lint configured'"` (one consistent string) in `packages/quoomb-web`,
+  `packages/quoomb-cli`, and `packages/shared-ui` package.json, matching the `quereus-vscode`
+  precedent.
+- Dropping the now-unused eslint devDependencies is OPTIONAL — do it only if trivially safe
+  (nothing else references them and the yarn.lock delta is contained); otherwise just no-op
+  the scripts (minimal, safest change).
+- Confirm AGENTS.md § Build & Test stays accurate (it already says only quereus lints).
+- Do NOT adopt Option 1 here; if real linting is wanted later, file a separate investment ticket.
 
 ## Failing command
 
