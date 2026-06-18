@@ -406,6 +406,42 @@ describe('Database.ingestExternalRowChanges (external row-change ingestion)', ()
 			expect(db.getAutocommit(), 'batch committed').to.equal(true);
 		});
 
+		it('a nested cascade UPDATE reaching a RESTRICT grandchild COMMITS - the plan-time fk-parent gate is op-agnostic', async () => {
+			// The UPDATE analog of the DELETE-cascade case above, exercising the gate on the
+			// UPDATE path. Re-keying p cascades to c.k (on update cascade); that cascade UPDATE
+			// re-enters the DML executor carrying the plan-time `fk-parent` NOT EXISTS check for
+			// g (on update restrict on c.k), which would normally throw because g.ck still
+			// references the old c.k. The apply-mode flag suppresses it, so c.k is re-keyed and
+			// g dangles. c.k is a separate column (not c's PK) so the child-side check on c.k
+			// (deliberately NOT suppressed) is satisfied once p's new key is in storage.
+			//
+			// The apply contract is that the adapter writes storage BEFORE the seam call, so the
+			// external re-key of p is staged with directWrite (delete old + insert new) ahead of
+			// the ingest — exactly as the delete-cascade tests stage their parent delete.
+			await db.exec(`
+				create table p (id integer primary key);
+				create table c (id integer primary key, k integer unique references p(id) on update cascade);
+				create table g (id integer primary key, ck integer not null references c(k) on update restrict);
+				insert into p values (1);
+				insert into c values (10, 1);
+				insert into g values (100, 1);
+			`);
+			await directWrite(db, 'p', 'delete', undefined, [1]);
+			await directWrite(db, 'p', 'insert', [2]);
+
+			await db.ingestExternalRowChanges(
+				[chg('p', { op: 'update', oldRow: [1], newRow: [2] })],
+				{ applyForeignKeyActions: true },
+			);
+
+			expect((await readAll(db, 'select id, k from c')).map(r => ({ id: Number(r.id), k: Number(r.k) })),
+				'child cascade-updated to the new parent key').to.deep.equal([{ id: 10, k: 2 }]);
+			expect((await readAll(db, 'select id, ck from g')).map(r => ({ id: Number(r.id), ck: Number(r.ck) })),
+				'RESTRICT grandchild survives, now dangling on the old key').to.deep.equal([{ id: 100, ck: 1 }]);
+			expect(db.getAutocommit(), 'batch committed').to.equal(true);
+			expect(db._isFkRestrictSuppressed(), 'flag cleared after the batch').to.equal(false);
+		});
+
 		it('post-batch: a normal delete still enforces RESTRICT (the flag was restored)', async () => {
 			await db.exec(`
 				create table p (id integer primary key);
