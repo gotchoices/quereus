@@ -7,7 +7,7 @@ import 'fake-indexeddb/auto';
 import { IndexedDBStore } from '../src/store.js';
 import { IndexedDBManager } from '../src/manager.js';
 import { IndexedDBProvider } from '../src/provider.js';
-import { Database, asyncIterableToArray, type Row } from '@quereus/quereus';
+import { Database, asyncIterableToArray } from '@quereus/quereus';
 import { StoreModule, createIsolatedStoreModule } from '@quereus/store';
 
 describe('IndexedDBStore', () => {
