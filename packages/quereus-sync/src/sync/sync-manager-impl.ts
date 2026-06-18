@@ -525,14 +525,31 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 		// Reactive low-latency drain (sync-drain-reappear-lens-redeploy): a table this
 		// deploy re-mapped detached → present may hold out-of-basis changes waiting on it.
-		// Replay them NOW — as a SEPARATE post-commit apply unit, after the lifecycle batch
-		// above is durable and its events have fired, so the oracle (getTableColumnNames)
-		// sees the re-attached table and the held changes LWW-resolve against the present
-		// basis — instead of waiting up to one periodic-sweep interval. Symmetric with the
+		// Replay them as a SEPARATE post-commit apply unit, after the lifecycle batch above
+		// is durable and its events have fired, so the oracle (getTableColumnNames) sees the
+		// re-attached table and the held changes LWW-resolve against the present basis —
+		// instead of waiting up to one periodic-sweep interval. Symmetric with the
 		// inbound-create_table path in applyChanges. Advisory: drainReappearedTables logs +
 		// swallows any per-table failure, so a drain throw never aborts the deploy (which is
 		// itself advisory bookkeeping — the store-module forwarder wraps it in try/catch).
-		await drainReappearedTables(this, reappeared);
+		//
+		// RE-ENTRANCY: in production this runs inside the firing `apply schema` statement,
+		// which holds the engine exec mutex (the module `notifyLensDeployment` hook is awaited
+		// mid-statement). The drain re-enters the engine via `applyToStore` →
+		// `db.ingestExternalRowChanges`, which acquires that same mutex — awaiting it inline
+		// would deadlock (the statement can't release the mutex until this returns). So when
+		// the engine reports it is mid-statement, defer the drain to fire-and-forget: it queues
+		// on the mutex and runs the instant `apply schema` commits and releases it (callers
+		// observe the drained rows after the capture settle, exactly like the local-change
+		// capture). Outside a live statement (e.g. unit tests over a stub store that never
+		// touches the engine mutex), await inline so the drain completes before returning.
+		if (reappeared.length > 0) {
+			if (db._isExecuting?.()) {
+				void drainReappearedTables(this, reappeared);
+			} else {
+				await drainReappearedTables(this, reappeared);
+			}
+		}
 	}
 
 	async getBasisTableLifecycle(): Promise<BasisTableLifecycleRecord[]> {

@@ -89,6 +89,13 @@ export async function makePeer(
 		(schemaName, tableName) => db.schemaManager.getTable(schemaName, tableName),
 	);
 
+	// Forward a logical `apply schema` lens deployment to the basis-table lifecycle
+	// recorder exactly as production does (worker wiring), so the lens-redeploy
+	// revival path drives `recordLensDeployment` end-to-end. Harmless to the data-only
+	// tests: they never run `apply schema`, so this never fires.
+	storeModule.setLensDeploymentListener((listenerDb, logicalSchemaName, snapshot) =>
+		manager.recordLensDeployment(listenerDb, logicalSchemaName, snapshot));
+
 	if (opts?.createOrders) {
 		await db.exec(opts.ordersDdl ?? DEFAULT_ORDERS_DDL);
 	}
@@ -137,4 +144,49 @@ export const hasOrders = (changes: Change[]): boolean => changes.some(c => c.tab
 export async function reviveOrders(peer: Peer, ddl: string = DEFAULT_ORDERS_DDL): Promise<void> {
 	await peer.db.exec(ddl);
 	await settle();
+}
+
+/**
+ * Deploy the `app` logical lens that maps `orders` onto the (sole physical) `main`
+ * basis. `apply schema app` is the firing transaction: it drives
+ * `notifyLensDeploymentAll` → `StoreModule.notifyLensDeployment` →
+ * `manager.recordLensDeployment`, fully awaited (including any reactive drain), so
+ * `select … from orders` still resolves to the physical `main.orders`, not the
+ * logical `app.orders` view.
+ */
+export async function deployOrdersLens(peer: Peer): Promise<void> {
+	await peer.db.exec('declare logical schema app { table orders { id integer primary key, note text } }');
+	await peer.db.exec('apply schema app');
+	await settle();
+}
+
+/**
+ * Retire `orders` on a holder via an empty-lens redeploy.
+ *
+ * Ordering is load-bearing: the physical `drop table orders` MUST precede the empty
+ * `declare logical schema app { }` redeploy. Dropping first takes `orders` out of
+ * basis, so the empty redeploy classifies it `detached` (out of basis AND unmapped) —
+ * the precondition the revive's `detached → present` reactive drain depends on. If the
+ * empty lens were redeployed while `orders` was still present, it would classify
+ * `unreferenced` (in basis, unmapped), and the later revive would transition
+ * `unreferenced → directly-mapped` — NOT `detached → present` — so no reactive drain
+ * would fire and the test would silently prove nothing.
+ */
+export async function retireOrdersViaRedeploy(peer: Peer): Promise<void> {
+	await peer.db.exec('drop table orders');
+	await peer.db.exec('declare logical schema app { }');
+	await peer.db.exec('apply schema app');
+	await settle();
+}
+
+/**
+ * Bring `orders` back on a holder: re-create the store-backed basis table (so the live
+ * basis oracle flips it back into basis), then re-map it via {@link deployOrdersLens}.
+ * The `apply schema app` inside the lens deploy is the trigger under test — it fires
+ * the reactive `detached → present` drain WITHOUT any explicit `drainHeldChanges` call.
+ * `ddl` overrides the basis column set (the schema-drift case re-creates without `memo`).
+ */
+export async function reviveOrdersViaRedeploy(peer: Peer, ddl: string = DEFAULT_ORDERS_DDL): Promise<void> {
+	await peer.db.exec(ddl);
+	await deployOrdersLens(peer);
 }

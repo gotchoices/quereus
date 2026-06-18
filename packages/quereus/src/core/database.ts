@@ -104,6 +104,14 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * transaction state, matching SQLite's behavior of serializing writes.
 	 */
 	private execMutex: Promise<void> = Promise.resolve();
+	/**
+	 * Depth of currently-held exec-mutex acquisitions. >0 while a statement
+	 * (`exec`/`eval`), an external-change ingest, or an MV-refresh sweep holds the
+	 * mutex. Read via {@link _isExecuting} so a re-entrant caller (e.g. a module
+	 * `notifyLensDeployment` listener that would itself re-enter the engine) can
+	 * detect it must defer rather than deadlock on the held mutex.
+	 */
+	private execMutexDepth = 0;
 	/** Database-level event emitter for unified reactivity */
 	private readonly eventEmitter = new DatabaseEventEmitter();
 	/** Transaction management */
@@ -443,7 +451,33 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			releaseMutex = resolve;
 		});
 		await previousMutex;
-		return releaseMutex!;
+		// Mark the mutex held from acquisition until the returned release runs, so a
+		// re-entrant caller can detect it (see _isExecuting). The wrapper decrements
+		// at most once even if release is invoked more than once.
+		this.execMutexDepth++;
+		let released = false;
+		return () => {
+			if (!released) {
+				released = true;
+				this.execMutexDepth--;
+			}
+			releaseMutex!();
+		};
+	}
+
+	/**
+	 * True while the exec mutex is held — i.e. a statement (`exec`/`eval`), an
+	 * external-change ingest, or an MV-refresh sweep is in flight. A caller that
+	 * would re-enter the engine (acquire the mutex again) from inside such a context
+	 * — e.g. a `notifyLensDeployment` module listener whose work calls
+	 * `ingestExternalRowChanges` — MUST check this and defer that work to run after
+	 * the current statement releases the mutex; re-entering synchronously deadlocks
+	 * on the chained mutex. Deliberately part of the consumable type surface (kept out
+	 * of the internal-only set) so a basis-backing host in another package can make
+	 * that defer-vs-await decision.
+	 */
+	_isExecuting(): boolean {
+		return this.execMutexDepth > 0;
 	}
 
 	/**

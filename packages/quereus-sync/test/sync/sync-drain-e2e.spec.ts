@@ -47,6 +47,27 @@
  *    the host explicitly calls `drainHeldChanges`. The drain runs as a SEPARATE
  *    apply after the re-creating DDL has committed, so older held changes simply
  *    LWW-resolve against whatever fresh data is present.
+ *
+ * TWO reappearance triggers fire this low-latency scoped drain, both covered here:
+ *  1. An inbound `create_table` mid-`applyChanges` (the first describe block) — and
+ *     the host-explicit `drainHeldChanges` baseline alongside it.
+ *  2. A LOCAL `apply schema` lens redeploy that re-maps a basis table `detached →
+ *     present` (the second describe block, `recordLensDeployment`'s `wasDetached &&
+ *     !isDetached` gate). The redeploy reaches the recorder through the real engine
+ *     hook chain — `db.exec('apply schema app')` → `notifyLensDeploymentAll` →
+ *     `StoreModule.notifyLensDeployment` (wired to `recordLensDeployment` in the
+ *     harness) → `drainReappearedTables` — with NO explicit `drainHeldChanges` call,
+ *     mirroring the inbound reactive case at real-engine fidelity. The in-memory/stub
+ *     coverage of trigger 2 lives in `basis-lifecycle-recorder.spec.ts`.
+ *
+ *     REAL-ENGINE DEFERRAL (what only this suite can prove): the lens hook fires
+ *     INSIDE the `apply schema` statement, which holds the engine exec mutex; the drain
+ *     re-enters the engine via `db.ingestExternalRowChanges`, which re-acquires that
+ *     mutex. Awaiting it inline deadlocks — so `recordLensDeployment` defers the drain
+ *     to fire-and-forget when `db._isExecuting()` (it runs the instant `apply schema`
+ *     releases the mutex). Hence these tests `await settle()` after the revive deploy
+ *     before reading. The in-memory stub never re-enters the engine, so it could not
+ *     surface this; the inline-awaited drain it tested deadlocks against a real engine.
  */
 
 import { expect } from 'chai';
@@ -66,6 +87,9 @@ import {
 	flattenSets,
 	hasOrders,
 	reviveOrders,
+	deployOrdersLens,
+	retireOrdersViaRedeploy,
+	reviveOrdersViaRedeploy,
 	collect,
 	settle,
 } from './_peer-harness.js';
@@ -368,5 +392,211 @@ describe('real-engine held-change drain (revival): straggler → hold → re-cre
 			'the drift-dropped memo column was never recorded',
 		).to.be.undefined;
 		expect(await H.manager.quarantine.list('main', 'orders'), 'hold cleared').to.have.lengthOf(0);
+	});
+});
+
+describe('real-engine held-change drain (revival): straggler → hold → lens redeploy → reactive drain', () => {
+	// The straggler S stays a plain store-backed peer; only the holder H deals with the
+	// lens. Heterogeneous per-test setups, so peers are spawned + tracked for teardown.
+	let tracked: Peer[] = [];
+	const spawn = async (name: string, opts?: Parameters<typeof makePeer>[1]): Promise<Peer> => {
+		const peer = await makePeer(name, opts);
+		tracked.push(peer);
+		return peer;
+	};
+
+	beforeEach(() => { tracked = []; });
+	afterEach(async () => {
+		for (const peer of tracked) await closePeer(peer);
+		tracked = [];
+	});
+
+	it('a lens redeploy re-mapping orders detached → present reactively drains the hold — no explicit drain call, idempotently', async () => {
+		const S = await spawn('S', { createOrders: true });
+		const H = await spawn('H'); // quarantine (default)
+
+		// (1) Straggler writes the row; capture S's origin HLC for the cross-hop check.
+		await localWrite(S, "insert into orders values (1, 'hi')");
+		const sCv = await S.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'note');
+		expect(sCv, 'S logged the note column under its own HLC').to.not.be.undefined;
+		const original = sCv!.hlc;
+
+		// (2) On H: deploy the mapping (directly-mapped), then retire orders via the empty
+		//     redeploy (detached). The drop-before-empty-redeploy ordering inside
+		//     retireOrdersViaRedeploy is load-bearing — assert `detached` to guard it.
+		await reviveOrders(H);            // create the store-backed basis table (empty)
+		await deployOrdersLens(H);        // map orders → directly-mapped
+		await retireOrdersViaRedeploy(H); // drop, then empty redeploy → detached
+		const afterRetire = (await H.manager.getBasisTableLifecycle())
+			.find(r => r.schema === 'main' && r.table === 'orders');
+		expect(afterRetire?.state, 'orders is detached after the retire redeploy (guards drop-before-empty ordering)').to.equal('detached');
+
+		// (3) Relay S→H: orders is absent (dropped) → the change is diverted and held.
+		await relay(S, H);
+		expect(await H.manager.quarantine.list('main', 'orders'), 'H holds the straggler insert as one entry per column').to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+		expect(H.db.schemaManager.getTable('main', 'orders'), 'H has no orders at hold time').to.be.undefined;
+
+		// (4) Subscribe BEFORE the revive, then re-map orders back into basis via redeploy.
+		//     The `apply schema app` inside the revive is the firing transaction; no
+		//     explicit drainHeldChanges call.
+		const drainedEvents: HeldChangesDrainedEvent[] = [];
+		H.manager.getEventEmitter().onHeldChangesDrained(e => drainedEvents.push(e));
+		const hEvents: DataChangeEvent[] = [];
+		H.events.onDataChange(e => hEvents.push(e));
+
+		await reviveOrdersViaRedeploy(H); // create table + deploy lens → reactive drain
+		await settle();
+
+		// THE HEADLINE: the held row is live in H's real store-backed table, drained
+		// reactively by the lens redeploy — no host sweep, no explicit drain call.
+		expect(
+			await collect(H.db, 'select id, note from orders'),
+			'select on H deep-equals the row S wrote',
+		).to.deep.equal([{ id: 1, note: 'hi' }]);
+
+		// Origin identity preserved end to end: S's siteId + original HLC, not H's clock.
+		const hCv = await H.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'note');
+		expect(hCv, 'the note column materialized on H').to.not.be.undefined;
+		expect(hCv!.value, 'materialized note value is the straggler\'s').to.equal('hi');
+		expect(siteIdEquals(hCv!.hlc.siteId, S.manager.getSiteId()), 'materialized with S\'s origin siteId').to.be.true;
+		expect(compareHLC(hCv!.hlc, original), 'materialized with S\'s original HLC').to.equal(0);
+
+		// The hold cleared.
+		expect(await H.manager.quarantine.list('main', 'orders'), 'hold cleared after the reactive drain').to.have.lengthOf(0);
+
+		// Exactly one drained event for orders.
+		expect(drainedEvents, 'the reactive drain fired one drained event for orders').to.have.lengthOf(1);
+		expect(drainedEvents[0]).to.include({ schema: 'main', table: 'orders', drained: COLUMNS_PER_FRESH_INSERT });
+
+		// No spurious local echo: arrived remote:true, no non-remote orders event, no H-origin echo.
+		expect(hEvents.filter(e => e.tableName === 'orders' && e.remote), 'H received orders remote:true').to.have.length.greaterThan(0);
+		expect(hEvents.filter(e => e.tableName === 'orders' && !e.remote), 'no local orders event on H (no spurious echo)').to.have.length(0);
+		expect(hasOrders(await changesFor(H, S.manager.getSiteId())), 'no H-origin orders echo recorded').to.equal(false);
+
+		// H is now a second-order relay: it serves the orders change from its OWN change
+		// log with S's origin intact.
+		const hServes = flattenSets(await H.manager.getChangesSince(generateSiteId())).filter(c => c.table === 'orders');
+		expect(hServes, 'H serves the orders change from its own log').to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+		expect(hServes.every(c => siteIdEquals(c.hlc.siteId, S.manager.getSiteId())), 'H serves it with S\'s origin').to.equal(true);
+
+		// Idempotent re-deploy: re-map the SAME (orders present + mapped) — no detached →
+		// present transition this time, so NO new drained event, row + hold unchanged.
+		const before = await collect(H.db, 'select id, note from orders');
+		await deployOrdersLens(H);
+		await settle();
+		expect(drainedEvents, 'no new drained event on the idempotent re-deploy').to.have.lengthOf(1);
+		expect(await collect(H.db, 'select id, note from orders'), 'row value-unchanged by the idempotent re-deploy').to.deep.equal(before);
+		expect(await H.manager.quarantine.list('main', 'orders'), 'hold stays empty after the idempotent re-deploy').to.have.lengthOf(0);
+	});
+
+	it('drains around schema drift across a redeploy: a held column absent on the revived basis is drift-dropped, siblings apply', async () => {
+		const S = await spawn('S', {
+			createOrders: true,
+			ordersDdl: 'create table orders (id integer primary key, note text, memo text) using store',
+		});
+		const H = await spawn('H'); // quarantine; basis here only ever maps (id, note)
+
+		await localWrite(S, "insert into orders values (1, 'keep', 'dropme')");
+
+		// Deploy + retire on H. H's basis orders is the default 2-column table.
+		await reviveOrders(H);
+		await deployOrdersLens(H);
+		await retireOrdersViaRedeploy(H);
+
+		await relay(S, H);
+		expect(
+			await H.manager.quarantine.list('main', 'orders'),
+			'three held column entries (id, note, memo)',
+		).to.have.lengthOf(3);
+
+		const drainedEvents: HeldChangesDrainedEvent[] = [];
+		H.manager.getEventEmitter().onHeldChangesDrained(e => drainedEvents.push(e));
+
+		// Revive WITHOUT memo (default 2-column DDL) and re-map via the lens → reactive drain.
+		await reviveOrdersViaRedeploy(H);
+		await settle();
+
+		// No throw; all held entries cleared; only the present-column changes applied.
+		expect(drainedEvents, 'one drained event').to.have.lengthOf(1);
+		expect(drainedEvents[0]).to.include({ schema: 'main', table: 'orders', drained: 3, applied: 2, skipped: 1 });
+		expect(drainedEvents[0].applied, 'applied < drained (the memo entry was drift-dropped)').to.be.lessThan(drainedEvents[0].drained);
+
+		expect(
+			await collect(H.db, 'select id, note from orders'),
+			'surviving cells materialized',
+		).to.deep.equal([{ id: 1, note: 'keep' }]);
+		expect(
+			await H.manager.columnVersions.getColumnVersion('main', 'orders', [1], 'memo'),
+			'the drift-dropped memo column was never recorded',
+		).to.be.undefined;
+		expect(await H.manager.quarantine.list('main', 'orders'), 'hold cleared').to.have.lengthOf(0);
+	});
+
+	it('a lens-redeploy revival drives materialized-view maintenance and Database.watch', async () => {
+		const S = await spawn('S', { createOrders: true });
+		const H = await spawn('H');
+
+		await localWrite(S, "insert into orders values (1, 'hi')");
+
+		await reviveOrders(H);
+		await deployOrdersLens(H);
+		await retireOrdersViaRedeploy(H);
+
+		await relay(S, H);
+		expect(await H.manager.quarantine.list('main', 'orders')).to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+
+		// Re-create the basis table, register a full watch + an MV over it, THEN re-map it
+		// via the lens so the redeploy is the firing transaction (a watch/MV against a
+		// missing table would fail scope validation / have no source).
+		await reviveOrders(H);
+		await H.db.exec('create materialized view orders_mv as select id, note from orders');
+		const watchEvents: WatchEvent[] = [];
+		const sub = H.db.watch(H.db.prepare('select id, note from orders').getChangeScope(), e => { watchEvents.push(e); });
+
+		await deployOrdersLens(H);
+		await settle();
+		sub.unsubscribe();
+
+		// The watch fired with `orders` in `matched` — the revival drove capture.
+		expect(watchEvents.length, 'watch fired on the revival').to.be.greaterThan(0);
+		expect(
+			watchEvents.some(e => e.matched.some(m => m.watch.table.table === 'orders')),
+			'a fired watch matched orders',
+		).to.equal(true);
+
+		// The MV reflects the drained row via `select` — derived-effect maintenance ran.
+		expect(
+			await collect(H.db, 'select id, note from orders_mv'),
+			'the MV reflects the drained row',
+		).to.deep.equal([{ id: 1, note: 'hi' }]);
+	});
+
+	it('a forwardable held change drains on the lens-redeploy revival and leaves the forwardable hold', async () => {
+		const S = await spawn('S', { createOrders: true });
+		const H = await spawn('H', { disposition: 'store-and-forward' });
+
+		await localWrite(S, "insert into orders values (1, 'hi')");
+
+		await reviveOrders(H);
+		await deployOrdersLens(H);
+		await retireOrdersViaRedeploy(H);
+
+		await relay(S, H);
+		expect(
+			await H.manager.quarantine.listForwardable(),
+			'held forwardable before the redeploy drain',
+		).to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+
+		await reviveOrdersViaRedeploy(H);
+		await settle();
+
+		// No longer forwardable — it is a real local version now; the forwardable hold
+		// (and the hold) are empty, and the value materialized.
+		expect(await H.manager.quarantine.listForwardable(), 'forwardable hold empty after the redeploy drain').to.have.lengthOf(0);
+		expect(await H.manager.quarantine.list('main', 'orders'), 'hold fully cleared').to.have.lengthOf(0);
+		expect(await collect(H.db, 'select id, note from orders')).to.deep.equal([{ id: 1, note: 'hi' }]);
+		const hServes = flattenSets(await H.manager.getChangesSince(generateSiteId())).filter(c => c.table === 'orders');
+		expect(hServes, 'H serves the orders change from its own log').to.have.lengthOf(COLUMNS_PER_FRESH_INSERT);
+		expect(hServes.every(c => siteIdEquals(c.hlc.siteId, S.manager.getSiteId())), 'served with S\'s origin').to.equal(true);
 	});
 });
