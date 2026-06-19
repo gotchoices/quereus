@@ -45,6 +45,10 @@ interface ScalarFuncOptions {
 	 * (`LogicalType.bucketBounds(kind, value)`).
 	 */
 	rangeRewriteOnArg?: { readonly [argIndex: number]: { readonly kind: string } };
+	/** When `true`, omit from the `schema()` catalog listing while keeping the
+	 *  function callable and visible to `function_info()`. See
+	 *  {@link import('../schema/function.js').BaseFunctionSchema.hidden}. */
+	hidden?: boolean;
 }
 
 /**
@@ -133,6 +137,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 		injectiveOnArgs: options.injectiveOnArgs,
 		monotoneOnArgs: options.monotoneOnArgs,
 		rangeRewriteOnArg: options.rangeRewriteOnArg,
+		hidden: options.hidden,
 	};
 }
 

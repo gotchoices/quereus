@@ -188,8 +188,9 @@ export const schemaFunc = createIntegratedTableValuedFunction(
 					] as Row;
 				}
 
-				// Process Functions
+				// Process Functions (skip hidden internal helpers)
 				for (const funcSchema of schemaInstance._getAllFunctions()) {
+					if (funcSchema.hidden) continue;
 					yield [
 						schemaName,
 						'function',

@@ -1075,6 +1075,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			deterministic?: boolean;
 			replicable?: boolean;
 			flags?: number;
+			hidden?: boolean;
 		},
 		func: (...args: SqlValue[]) => SqlValue
 	): void {
@@ -1084,7 +1085,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const flags = options.flags ?? baseFlags;
 
 		const schema = createScalarFunction(
-			{ name, numArgs: options.numArgs, flags, replicable: options.replicable },
+			{ name, numArgs: options.numArgs, flags, replicable: options.replicable, hidden: options.hidden },
 			func
 		);
 

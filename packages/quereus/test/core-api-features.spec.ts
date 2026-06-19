@@ -70,6 +70,33 @@ describe('Core API Features', () => {
 					void expect((err as Error).message).to.include('kaboom');
 				}
 			});
+
+			it('should hide a hidden function from schema() but keep it callable and in function_info()', async () => {
+				db.createScalarFunction('secret_helper', { numArgs: 0, hidden: true }, () => 7);
+				db.createScalarFunction('visible_helper', { numArgs: 0 }, () => 9);
+
+				// Hidden functions remain fully callable.
+				const row = await db.get('select secret_helper() as result');
+				void expect(row!.result).to.equal(7);
+
+				const inSchema: string[] = [];
+				for await (const r of db.eval(
+					"select name from schema() where type = 'function' and name in ('secret_helper', 'visible_helper')"
+				)) {
+					inSchema.push((r as any).name);
+				}
+				// schema() omits the hidden helper but still lists the visible one.
+				void expect(inSchema).to.deep.equal(['visible_helper']);
+
+				const inFunctionInfo: string[] = [];
+				for await (const r of db.eval(
+					"select name from function_info() where name in ('secret_helper', 'visible_helper') order by name"
+				)) {
+					inFunctionInfo.push((r as any).name);
+				}
+				// function_info() lists both — the hidden flag does not affect introspection.
+				void expect(inFunctionInfo).to.deep.equal(['secret_helper', 'visible_helper']);
+			});
 		});
 
 		describe('createAggregateFunction()', () => {

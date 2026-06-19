@@ -93,6 +93,13 @@ interface BaseFunctionSchema {
 	 */
 	customEmitter?: CustomEmitterHook;
 	/**
+	 * When `true`, this function is omitted from the `schema()` catalog listing
+	 * but remains fully callable and visible to `function_info()`. Used by
+	 * hosts (e.g. Lamina) to hide synthesized internal helpers from the
+	 * user-facing schema catalog without preventing them from resolving.
+	 */
+	hidden?: boolean;
+	/**
 	 * Argument indices on which this function is injective when all other
 	 * arguments are held constant. Combines with operand-level recursion in
 	 * `ScalarFunctionCallNode.isInjectiveIn`.
