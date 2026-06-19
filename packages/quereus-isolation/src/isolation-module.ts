@@ -221,22 +221,38 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			};
 		}
 
+		// The attach seams swap the underlying storage flavor in place (ordinary ⇄
+		// durable backing) the way `set/drop maintained` does. `connect()` memoizes
+		// the underlying VirtualTable per (schema,table) in `underlyingTables` and
+		// re-serves the cached handle, so a bare forward would keep serving the
+		// PRE-transition table after the swap (stale rows / evicted handle / stale
+		// column layout). After delegating, evict the memoized state — exactly as
+		// `destroy()` does — so the next `connect()` re-resolves the fresh flavor
+		// from the underlying. Evict only on success: a thrown attach leaves the
+		// prior flavor (and its still-valid cache) intact, and the failure-cleanup
+		// path is `discardBackingForAttach`, which evicts in its own right.
 		const underlyingEnsure = this.underlying.ensureBackingForAttach;
 		if (underlyingEnsure) {
-			this.ensureBackingForAttach = (db, schemaName, tableName, backingSchema) =>
-				underlyingEnsure.call(this.underlying, db, schemaName, tableName, backingSchema);
+			this.ensureBackingForAttach = async (db, schemaName, tableName, backingSchema) => {
+				await underlyingEnsure.call(this.underlying, db, schemaName, tableName, backingSchema);
+				this.removeUnderlyingState(schemaName, tableName);
+			};
 		}
 
 		const underlyingRetire = this.underlying.retireBackingForAttach;
 		if (underlyingRetire) {
-			this.retireBackingForAttach = (db, schemaName, tableName, plainSchema) =>
-				underlyingRetire.call(this.underlying, db, schemaName, tableName, plainSchema);
+			this.retireBackingForAttach = async (db, schemaName, tableName, plainSchema) => {
+				await underlyingRetire.call(this.underlying, db, schemaName, tableName, plainSchema);
+				this.removeUnderlyingState(schemaName, tableName);
+			};
 		}
 
 		const underlyingDiscard = this.underlying.discardBackingForAttach;
 		if (underlyingDiscard) {
-			this.discardBackingForAttach = (db, schemaName, tableName) =>
-				underlyingDiscard.call(this.underlying, db, schemaName, tableName);
+			this.discardBackingForAttach = async (db, schemaName, tableName) => {
+				await underlyingDiscard.call(this.underlying, db, schemaName, tableName);
+				this.removeUnderlyingState(schemaName, tableName);
+			};
 		}
 	}
 
