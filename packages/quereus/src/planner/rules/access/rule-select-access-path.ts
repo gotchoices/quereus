@@ -404,9 +404,16 @@ function selectPhysicalNodeFromPlan(
 						exprs: Array.isArray(c.valueExpr) ? c.valueExpr : undefined,
 					});
 				} else {
-					// Single equality value for this column
+					// Single equality value for this column. Carry the dynamic value
+					// expression of a single-element IN component (parameter / correlated
+					// binding) so the cross-product seeks on the bound expression rather
+					// than Literal(undefined) — the composite analogue of the match-all bug.
 					const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown as SqlValue[])[0] : c.value as SqlValue;
-					columnValues.push({ colIdx, values: [val] });
+					columnValues.push({
+						colIdx,
+						values: [val],
+						exprs: Array.isArray(c.valueExpr) ? c.valueExpr : undefined,
+					});
 				}
 			}
 
@@ -510,12 +517,9 @@ function selectPhysicalNodeFromPlan(
 		}
 
 		// Standard equality seek on all seek columns
-		const seekKeys: ScalarPlanNode[] = seekCols.map(colIdx => {
-			const c = eqBySeekCol.get(colIdx)!;
-			if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr;
-			const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown as SqlValue[])[0] : (c.value as SqlValue);
-			return literalFromValue(tableRef.scope, val);
-		});
+		const seekKeys: ScalarPlanNode[] = seekCols.map(colIdx =>
+			equalitySeekKey(tableRef.scope, eqBySeekCol.get(colIdx)!)
+		);
 
 		const eqConstraints: { constraint: IndexConstraint; argvIndex: number }[] = seekCols.map((colIdx, i) => ({
 			constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
@@ -610,10 +614,7 @@ function selectPhysicalNodeFromPlan(
 				const c = (constraintsByCol.get(colIdx) ?? []).find(c =>
 					(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
 					handledByCol.has(c.columnIndex))!;
-				const val = c.op === 'IN' && Array.isArray(c.value) ? (c.value as unknown as SqlValue[])[0] : (c.value as SqlValue);
-				seekKeys.push(c.valueExpr && !Array.isArray(c.valueExpr)
-					? c.valueExpr
-					: literalFromValue(tableRef.scope, val));
+				seekKeys.push(equalitySeekKey(tableRef.scope, c));
 				allConstraints.push({ constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true }, argvIndex: argv });
 				argv++;
 			}
@@ -878,11 +879,9 @@ function selectPhysicalNodeLegacy(
 			return cover.residual ? new FilterNode(tableRef.scope, scan, cover.residual) : scan;
 		}
 
-		const seekKeys: ScalarPlanNode[] = pkCols.map(pk => {
-			const c = eqByCol.get(pk.index)!;
-			if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr;
-			return literalFromValue(tableRef.scope, c.value as SqlValue);
-		});
+		const seekKeys: ScalarPlanNode[] = pkCols.map(pk =>
+			equalitySeekKey(tableRef.scope, eqByCol.get(pk.index)!)
+		);
 
 		const eqConstraints: { constraint: IndexConstraint; argvIndex: number }[] = pkCols.map((pk, i) => ({
 			constraint: { iColumn: pk.index, op: IndexConstraintOp.EQ, usable: true },
@@ -1063,6 +1062,35 @@ function opToIndexOp(op: RangeOp): IndexConstraintOp {
 function literalFromValue(scope: Scope, value: SqlValue): LiteralNode {
 	const lit: AST.LiteralExpr = { type: 'literal', value };
 	return new LiteralNode(scope, lit);
+}
+
+/**
+ * Seek key for an equality / single-value-IN constraint. A single-element IN that
+ * carries a dynamic value expression (parameter or correlated binding) reduces to
+ * `col = <expr>`, so prefer that expression; otherwise use the inline `valueExpr`
+ * (for `=`) or fall back to a literal of the constraint's plan-time value.
+ *
+ * Without the single-element-IN arm, an `in (?)` constraint — whose `valueExpr` is
+ * an *array* of length 1 and whose `value[0]` is `undefined` for a bound param —
+ * would seek on `Literal(undefined)` and degrade to a full-index walk (match-all).
+ * See `tickets/complete/quereus-single-element-in-list-matches-all`.
+ *
+ * NOTE (array-valued scalar param): binding `in (?)` with an *array* value (params
+ * `[[1,2]]`) is not IN-list expansion — the engine has no such concept. The seek key
+ * is the parameter expression, so at runtime the array compares unequal to every
+ * scalar column value and the predicate matches *nothing* (previously it match-alled).
+ * Rejecting an array-bound scalar param at bind time is tracked separately; see the
+ * `quereus-reject-array-valued-scalar-param` backlog ticket.
+ */
+function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint): ScalarPlanNode {
+	if (c.op === 'IN' && Array.isArray(c.valueExpr) && c.valueExpr.length === 1) {
+		return c.valueExpr[0];
+	}
+	if (c.valueExpr && !Array.isArray(c.valueExpr)) return c.valueExpr;
+	const val = c.op === 'IN' && Array.isArray(c.value)
+		? (c.value as unknown as SqlValue[])[0]
+		: (c.value as SqlValue);
+	return literalFromValue(scope, val);
 }
 
 /**

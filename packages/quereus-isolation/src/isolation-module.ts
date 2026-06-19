@@ -192,6 +192,14 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	createBacking?: (db: Database, tableSchema: TableSchema) => Promise<IsolatedTable>;
 
+	/** Attach-lifecycle seam forwards — assigned only when the underlying implements them,
+	 *  mirroring presence so the wrapper advertises each capability iff the underlying does.
+	 *  Backing writes bypass the per-connection overlay (see {@link getBackingHost}), so
+	 *  these are straight delegates with no overlay bookkeeping. */
+	ensureBackingForAttach?: (db: Database, schemaName: string, tableName: string, backingSchema: TableSchema) => Promise<void>;
+	retireBackingForAttach?: (db: Database, schemaName: string, tableName: string, plainSchema: TableSchema) => Promise<void>;
+	discardBackingForAttach?: (db: Database, schemaName: string, tableName: string) => Promise<void>;
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
@@ -211,6 +219,24 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				this.setUnderlyingState(tableSchema.schemaName, tableSchema.name, state);
 				return new IsolatedTable(db, this, underlyingTable);
 			};
+		}
+
+		const underlyingEnsure = this.underlying.ensureBackingForAttach;
+		if (underlyingEnsure) {
+			this.ensureBackingForAttach = (db, schemaName, tableName, backingSchema) =>
+				underlyingEnsure.call(this.underlying, db, schemaName, tableName, backingSchema);
+		}
+
+		const underlyingRetire = this.underlying.retireBackingForAttach;
+		if (underlyingRetire) {
+			this.retireBackingForAttach = (db, schemaName, tableName, plainSchema) =>
+				underlyingRetire.call(this.underlying, db, schemaName, tableName, plainSchema);
+		}
+
+		const underlyingDiscard = this.underlying.discardBackingForAttach;
+		if (underlyingDiscard) {
+			this.discardBackingForAttach = (db, schemaName, tableName) =>
+				underlyingDiscard.call(this.underlying, db, schemaName, tableName);
 		}
 	}
 
