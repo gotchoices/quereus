@@ -590,9 +590,11 @@ export interface ReferencedWriteRowRelation {
  * registers `<corr>.<col>` for the op's own target relation. So a row-local CHECK over one
  * member's column resolves on that member's op while a sibling-member term fails to resolve
  * (a loud `Column not found` rather than a silent wrong answer) — matching the per-op gate's
- * relation-identity routing. As reserved-feeling as `NEW`: the `__lens_new__` prefix is not
- * producible by a parsed user identifier, so it cannot be shadow-captured by a subquery FROM
- * source (the capture-safety reason the bare basis table name could NOT be used here).
+ * relation-identity routing. Capture-safe for the same reason `NEW` is: neither `new` nor the
+ * `__lens_new__` prefix is a reserved keyword, but both are vanishingly implausible as a
+ * user-written subquery-FROM alias — unlike the bare basis table name, which a subquery's FROM
+ * routinely references, and which therefore could NOT be used here without reintroducing the
+ * shadow-capture bug `NEW` was added to avoid.
  */
 export function writeRowRelationCorrelation(schema: string, table: string): string {
 	return `__lens_new__${schema.toLowerCase()}__${table.toLowerCase()}`;

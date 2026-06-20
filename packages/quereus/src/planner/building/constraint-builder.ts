@@ -99,9 +99,10 @@ export function buildConstraintChecks(
     // op's OWN target relation lets a CHECK whose terms all live on this member resolve here,
     // while a sibling-member term fails to resolve (a loud `Column not found`, not a silent
     // wrong answer) — fail-safe, matching the per-op gate's relation-identity routing. The
-    // synthetic `__lens_new__…` name is not producible by a parsed identifier, so it cannot
-    // collide with a real FROM source; additive and inert for a non-lens / single-source
-    // write (whose rewrites stay on `NEW` and never reference it).
+    // synthetic `__lens_new__…` name is not a reserved keyword but is vanishingly implausible
+    // as a user-written FROM alias, so it does not collide with a real source in practice;
+    // additive and inert for a non-lens / single-source write (whose rewrites stay on `NEW`
+    // and never reference it).
     const writeRowCorr = writeRowRelationCorrelation(tableSchema.schemaName, tableSchema.name);
 
     // Register column symbols (similar to current emitConstraintCheck logic)

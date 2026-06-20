@@ -210,10 +210,12 @@ function makeLensRewriteScope(
 	// CHECK's meaning when a renamed logical column's basis spelling collides with a
 	// subquery-source column. This is the lens analogue of the single-source descent's
 	// `makeBaseQualifier` (which qualifies with the lowered target's alias for the same
-	// reason); the decomposition correlation is collision-proof for the SAME reason `NEW`
-	// is — `__lens_new__…` is not producible by a parsed identifier, so a subquery FROM
-	// cannot shadow-capture it (using the bare basis table name would reintroduce exactly
-	// the capture bug `NEW` was added to fix). At the top level `<corr>.<basis>` resolves to
+	// reason); the decomposition correlation is capture-safe for the SAME reason `NEW`
+	// is — neither is a reserved keyword, but `__lens_new__…` (like `NEW`) is vanishingly
+	// implausible as a user-written subquery-FROM alias, so it is not shadow-captured in
+	// practice (using the bare basis table name WOULD reintroduce the capture bug `NEW` was
+	// added to fix — a subquery's FROM routinely names the basis table). At the top level
+	// `<corr>.<basis>` resolves to
 	// the write row identically to the prior bare form, so behavior is unchanged except in
 	// the collision corner. Mirrors the FK / set-level synthesizers, which likewise qualify
 	// their write-row side `NEW.*`.
