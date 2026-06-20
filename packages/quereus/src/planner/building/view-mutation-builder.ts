@@ -251,11 +251,13 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// multi-op fan-out (a decomposition UPDATE) those columns may live on only some
 	// members, so threading the SAME `extraConstraints` onto every base op would make a
 	// member op that lacks a referenced column fail to build (`NEW.<col> isn't a column`).
-	// Gate per op: a constraint rides a base op iff every write-row column it references
-	// resolves on that op's target table — so a uniqueness CHECK rides only the op that
-	// owns (and can change) the key, and a cross-member CHECK/FK rides the single member
-	// that resolves it (or none — deferred, as on decomposition INSERT). Single-source has
-	// exactly one base op carrying all basis columns, so this is a no-op there.
+	// Gate per op by *owning relation identity* (not bare column name): a constraint rides
+	// a base op iff every write-row column it references is owned by that op's target
+	// relation — so a uniqueness CHECK rides only the op that owns (and can change) the key,
+	// and a cross-member CHECK/FK rides the single member that owns it (or none — deferred,
+	// as on decomposition INSERT). Relation identity is what keeps a constraint over one
+	// member's `val` off a sibling member that merely also spells a column `val`.
+	// Single-source has exactly one base op carrying all basis columns, so this is a no-op there.
 	const riddenConstraints = new Set<RowConstraintSchema>();
 	const children = baseOps.map(op => {
 		// A CTE self-read base op re-plans under `ctxSelfRead`, so its `from t` predicate /
@@ -459,7 +461,7 @@ function lensParentSideForeignKeyConstraints(
  */
 function lensSetLevelConstraints(ctx: PlanningContext, view: MutableViewLike): RowConstraintSchema[] {
 	const slot = ctx.schemaManager.getSchema(view.schemaName)?.getLensSlot(view.name);
-	return slot ? collectLensSetLevelConstraints(slot) : [];
+	return slot ? collectLensSetLevelConstraints(slot, ctx.schemaManager) : [];
 }
 
 /**
@@ -1055,18 +1057,27 @@ function quoteIdent(name: string): string {
 
 /**
  * Filter the lens-synthesized `extraConstraints` to those a base op can build: a
- * constraint rides `op` iff every write-row column it references resolves on the op's
- * target-table columns (case-insensitive). Each constraint that rides ≥1 op is recorded
- * in `ridden` so the caller can trace any that rode none (a silently-deferred cross-member
- * CHECK/FK, or a dropped uniqueness scan on a key-unchanged UPDATE).
+ * constraint rides `op` iff every write-row column it references is **owned by the op's
+ * target relation** (schema + table, case-insensitive). Each constraint that rides ≥1 op
+ * is recorded in `ridden` so the caller can trace any that rode none (a silently-deferred
+ * cross-member CHECK/FK, or a dropped uniqueness scan on a key-unchanged UPDATE).
  *
- * The write-row column set comes from one of two sources. A lens-synthesized **row-local
- * CHECK** carries `referencedWriteRowColumns` — prover-supplied lowercased basis names
- * (`collectLensRowLocalConstraints`) — which is preferred because the AST walk
- * ({@link writeRowColumns}) under-collects a correlated bare write-row ref that appears
- * only inside a subquery (a subquery-bearing row-local CHECK, which the prover still
- * classifies `enforced-row-local`). The FK / set-level classes leave it undefined and fall
- * back to the walk, which collects their `NEW.*` / `OLD.*` refs unambiguously anywhere.
+ * The match is by **relation identity**, not bare column name. Every lens class now
+ * supplies `referencedWriteRowRelations` — each referenced write-row basis column tagged
+ * with the member relation that owns it (`lens-enforcement.ts` sources it from the slot's
+ * decomposition advertisement / single basis source). This is load-bearing on a
+ * decomposition whose members back distinct logical columns with **same-named** basis
+ * columns (e.g. two members both spelling their value column `val`): a bare-name gate
+ * would mis-thread a constraint over member A's `val` onto sibling member B's op (which
+ * also has a `val`), and the deferred check then crashes on B's row context. Relation
+ * matching routes it onto member A's op alone (or onto none — deferred — when its columns
+ * span more than one member).
+ *
+ * Only when a constraint's owning relation could not be resolved (`referencedWriteRowRelations`
+ * undefined — an EAV-pivot / opaque slot) does the gate fall back to the bare-name path:
+ * the prover-supplied `referencedWriteRowColumns` (row-local) else the {@link writeRowColumns}
+ * AST walk (FK / set-level). The walk under-collects a correlated bare write-row ref nested
+ * in a subquery, which is why the row-local metadata is preferred even in the fallback.
  *
  * `extraConstraints` is exclusively lens-synthesized (the basis table's own checks are
  * added inside `buildConstraintChecks` from `tableSchema.checkConstraints`, never via
@@ -1085,15 +1096,30 @@ function constraintsForOp(
 	ridden: Set<RowConstraintSchema>,
 ): RowConstraintSchema[] {
 	if (extraConstraints.length === 0) return [];
+	const opSchema = op.table.tableSchema.schemaName.toLowerCase();
+	const opName = op.table.tableSchema.name.toLowerCase();
 	const opCols = new Set(op.table.tableSchema.columns.map(c => c.name.toLowerCase()));
 	const kept: RowConstraintSchema[] = [];
 	for (const c of extraConstraints) {
-		// Prefer the prover-supplied row-local metadata (already lowercased basis names);
-		// fall back to the AST walk for FK / set-level constraints (which leave it undefined).
-		const refs = c.referencedWriteRowColumns ?? writeRowColumns(c.expr);
-		let resolvable = true;
-		for (const col of refs) {
-			if (!opCols.has(col)) { resolvable = false; break; }
+		let resolvable: boolean;
+		if (c.referencedWriteRowRelations) {
+			// Relation-qualified gate (every lens class now supplies this): the constraint
+			// rides this op iff every referenced write-row column is owned by the op's TARGET
+			// relation (schema + table, case-insensitive) — not merely some op whose table
+			// carries a column of that name. This is what stops a constraint over one member's
+			// `val` from mis-routing onto a sibling member that also spells a column `val`.
+			resolvable = c.referencedWriteRowRelations.every(r =>
+				r.schema.toLowerCase() === opSchema && r.table.toLowerCase() === opName && opCols.has(r.column));
+		} else {
+			// Fallback for a constraint whose owning relation could not be resolved (an
+			// EAV-pivot / opaque slot): prefer the prover-supplied bare row-local names, else
+			// the AST walk. Bare-name matching is ambiguous across same-named sibling columns,
+			// but it is only reached when relation attribution is unavailable.
+			const refs = c.referencedWriteRowColumns ?? writeRowColumns(c.expr);
+			resolvable = true;
+			for (const col of refs) {
+				if (!opCols.has(col)) { resolvable = false; break; }
+			}
 		}
 		if (resolvable) {
 			ridden.add(c);
@@ -1117,13 +1143,14 @@ function constraintsForOp(
  * child/parent alias) are assumed to resolve against the subquery's own FROM, not the
  * write row, so they are ignored.
  *
- * That subquery-free assumption is now only ever applied to the FK / set-level classes,
- * whose bare-in-subquery refs are genuinely FROM-resolved aliases. The **row-local CHECK**
- * class no longer reaches this walk: a subquery-bearing row-local CHECK could carry a
- * *correlated* bare write-row ref inside its subquery (the prover does not forbid a
- * subquery in a row-local CHECK), which this walk would under-collect, so the gate prefers
- * the prover-supplied `referencedWriteRowColumns` metadata for that class (see
- * {@link constraintsForOp} and `collectLensRowLocalConstraints`).
+ * This walk is now only a **fallback**, reached by {@link constraintsForOp} only for a
+ * constraint whose relation-qualified `referencedWriteRowRelations` could not be resolved
+ * (an EAV-pivot / opaque slot). Every lens class normally supplies that metadata (and the
+ * row-local class additionally supplies the bare `referencedWriteRowColumns`, preferred
+ * here because this walk under-collects a *correlated* bare write-row ref nested inside a
+ * subquery — the prover does not forbid a subquery in a row-local CHECK). The subquery-free
+ * assumption below (treat bare-in-subquery refs as FROM-resolved aliases) therefore only
+ * matters for the FK / set-level fallback, whose bare-in-subquery refs are genuine aliases.
  */
 function writeRowColumns(expr: AST.Expression): Set<string> {
 	const cols = new Set<string>();

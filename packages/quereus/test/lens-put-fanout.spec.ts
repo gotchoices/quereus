@@ -2749,3 +2749,188 @@ describe('lens decomposition put: surrogate-keyed optional-member UPDATE', () =>
 		}
 	});
 });
+
+/**
+ * Per-op gate routes a lens-synthesized constraint by its **owning basis relation**, not
+ * by bare column name (`lens-update-deferred-pk-check-per-op-gate-relation-identity`).
+ *
+ * A name-match per-column decomposition: each logical column lives in its own `(rowId, val)`
+ * member joined on a SURROGATE `rowId`, and — the load-bearing twist — BOTH members spell
+ * their value column `val`. The logical PK `id` is a value column (basis `w_id.val`) with no
+ * basis covering structure ⇒ commit-time `enforced-set-level` ⇒ the lens synthesizes the
+ * deferred `lens:pk` count CHECK whose write-row side is `NEW.val` (`w_id.val`).
+ *
+ * The bug: the per-op gate decided which member op carries that CHECK by matching the bare
+ * basis-column name `val`. A non-key UPDATE (`set name='B'`) fans out to the `w_name` op
+ * ALONE; `w_name` ALSO has a column named `val` (its own value), so the bare-name gate
+ * wrongly threaded the id-uniqueness CHECK onto the name-only op. At commit the deferred
+ * CHECK re-evaluated with the `w_name` row context active, its count subquery's get-join hit
+ * the *other* member's surrogate-key reference with no populated row context, and threw
+ * `No row context found for column rowId` — losing the update.
+ *
+ * Matching by owning relation (`id`'s `val` lives on `w_id`, not `w_name`) routes the CHECK
+ * onto NO op of a name-only fan-out — correct, a name change cannot introduce an id
+ * duplicate — so the UPDATE commits cleanly, while a key-changing UPDATE still routes the
+ * CHECK onto the `w_id` op and enforces it (unique re-key commits, duplicate ABORTs). The
+ * distinct-value-name variants in the originating ticket already passed; the colliding-name
+ * fixture here is the one that exposed the gate bug.
+ */
+describe('lens decomposition put: per-op gate routes by owning basis relation (colliding value-column names)', () => {
+	function perColumnAd(): MappingAdvertisement {
+		return {
+			id: 'w_id',
+			logicalTable: 'W',
+			role: 'primary-storage',
+			storage: {
+				anchorRelationId: 'w_id',
+				members: [
+					// Both members back their logical column with a basis column NAMED `val` — the
+					// collision the bare-name gate could not disambiguate.
+					{ relationId: 'w_id', relation: { schema: 'main', table: 'w_id' }, presence: 'mandatory', columns: [colMap('id', 'val')] },
+					{ relationId: 'w_name', relation: { schema: 'main', table: 'w_name' }, presence: 'mandatory', columns: [colMap('name', 'val')] },
+				],
+				// Surrogate key, spelled IDENTICALLY (`rowId`) across members — the headline repro.
+				sharedKey: { kind: 'surrogate', keyColumnsByRelation: keyMap(['w_id', ['rowId']], ['w_name', ['rowId']]) },
+			},
+		};
+	}
+
+	// Seed three logical rows {1:'a', 2:'b', 3:'c'}; the anchor `w_id` carries the
+	// high-water-mark surrogate allocator default (the per-column INSERT value source).
+	async function setupPerColumn(db: Database, extraLogical = ''): Promise<void> {
+		const mod = new AdvertisingModule();
+		mod.ads = [perColumnAd()];
+		db.registerModule('widgetmod', mod);
+		await db.exec('create table w_id (rowId integer primary key default (coalesce((select max(rowId) from w_id), 0) + mutation_ordinal()), val integer) using widgetmod');
+		await db.exec('create table w_name (rowId integer primary key, val text) using widgetmod');
+		await db.exec(`declare logical schema x { table W { id integer primary key, name text${extraLogical} } }`);
+		await db.exec('apply schema x');
+		await db.exec('insert into main.w_id (rowId, val) values (1, 1), (2, 2), (3, 3)');
+		await db.exec("insert into main.w_name (rowId, val) values (1, 'a'), (2, 'b'), (3, 'c')");
+	}
+
+	it('a non-key UPDATE (set name) commits and round-trips — no "No row context" throw, no lost update', async () => {
+		const db = new Database();
+		try {
+			await setupPerColumn(db);
+			// The repro: `set name='B'` fans out to the w_name op alone. Pre-fix the lens:pk CHECK
+			// (NEW.val on w_id) mis-routed onto it (w_name also has `val`) and threw at commit.
+			await db.exec("update x.W set name = 'B' where id = 2");
+			// The basis member persisted the write...
+			expect(await rows(db, 'select val from main.w_name order by val')).to.deep.equal([{ val: 'B' }, { val: 'a' }, { val: 'c' }]);
+			// ...and it round-trips through the lens view (no lost update).
+			expect(await rows(db, 'select id, name from x.W order by id')).to.deep.equal([
+				{ id: 1, name: 'a' }, { id: 2, name: 'B' }, { id: 3, name: 'c' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a non-key UPDATE commits through an explicit transaction (begin; update; commit)', async () => {
+		const db = new Database();
+		try {
+			await setupPerColumn(db);
+			await db.exec('begin');
+			await db.exec("update x.W set name = 'B' where id = 2");
+			await db.exec('commit');
+			expect(await rows(db, 'select id, name from x.W order by id')).to.deep.equal([
+				{ id: 1, name: 'a' }, { id: 2, name: 'B' }, { id: 3, name: 'c' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a unique key-changing UPDATE (set id) commits — the CHECK rides the w_id op and passes', async () => {
+		const db = new Database();
+		try {
+			await setupPerColumn(db);
+			// `set id=22` writes w_id.val; the lens:pk CHECK rides the w_id op (relation match) and
+			// sees count 1 ⇒ passes. (Pre-fix this op-routing already worked — the key arm was never
+			// the bug; pinned here so the fix does not over-correct and drop a needed enforcement.)
+			await db.exec('update x.W set id = 22 where id = 2');
+			expect(await rows(db, 'select val from main.w_id order by val')).to.deep.equal([{ val: 1 }, { val: 3 }, { val: 22 }]);
+			expect(await rows(db, 'select id, name from x.W order by id')).to.deep.equal([
+				{ id: 1, name: 'a' }, { id: 3, name: 'c' }, { id: 22, name: 'b' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a duplicate key-changing UPDATE (set id to an existing id) ABORTs at commit (lens:pk)', async () => {
+		const db = new Database();
+		try {
+			await setupPerColumn(db);
+			// `set id=1 where id=2` makes two logical rows with id=1 ⇒ the deferred count CHECK sees
+			// count 2 ⇒ ABORT. The CHECK genuinely fires on the key-owning w_id op.
+			await expectThrows(() => db.exec('update x.W set id = 1 where id = 2'), /lens:pk|primary|unique|constraint/i);
+			// Rolled back atomically: id 2 survives, no duplicate landed.
+			expect(await rows(db, 'select id, name from x.W order by id')).to.deep.equal([
+				{ id: 1, name: 'a' }, { id: 2, name: 'b' }, { id: 3, name: 'c' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('DELETE by key reaches both members (unaffected by the gate fix)', async () => {
+		const db = new Database();
+		try {
+			await setupPerColumn(db);
+			await db.exec('delete from x.W where id = 3');
+			expect(await rows(db, 'select val from main.w_id order by val')).to.deep.equal([{ val: 1 }, { val: 2 }]);
+			expect(await rows(db, 'select val from main.w_name order by val')).to.deep.equal([{ val: 'a' }, { val: 'b' }]);
+			expect(await rows(db, 'select id, name from x.W order by id')).to.deep.equal([
+				{ id: 1, name: 'a' }, { id: 2, name: 'b' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('INSERT fans out across both members; the commit-time key still ABORTs a duplicate', async () => {
+		const db = new Database();
+		try {
+			await setupPerColumn(db);
+			// A fresh logical row inserts across both members off the shared-surrogate envelope.
+			await db.exec("insert into x.W (id, name) values (4, 'd')");
+			expect(await rows(db, 'select id, name from x.W order by id')).to.deep.equal([
+				{ id: 1, name: 'a' }, { id: 2, name: 'b' }, { id: 3, name: 'c' }, { id: 4, name: 'd' },
+			]);
+			// Inserting a duplicate logical id (1 already exists) ABORTs at commit (count ≥ 2): the
+			// lens:pk CHECK rides the w_id anchor insert op (relation match), not the colliding w_name.
+			await expectThrows(() => db.exec("insert into x.W (id, name) values (1, 'z')"), /lens:pk|primary|unique|constraint/i);
+			// Atomic: no duplicate id=1 row landed in either member.
+			expect(await rows(db, 'select count(*) as n from main.w_id where val = 1')).to.deep.equal([{ n: 1 }]);
+			expect(await rows(db, "select count(*) as n from main.w_name where val = 'z'")).to.deep.equal([{ n: 0 }]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a single-member row-local CHECK rides only its owning member (general gate, not just set-level)', async () => {
+		const db = new Database();
+		try {
+			// `length(name) < 5` references logical `name` → basis `w_name.val`. The colliding sibling
+			// `w_id` ALSO has a `val` column (backing id), but relation identity keeps the CHECK off
+			// the w_id op. A too-long name ABORTs on the w_name op; a key-only UPDATE (set id) fans out
+			// to w_id alone and must NOT carry the name CHECK (no spurious enforcement, no mis-route).
+			await setupPerColumn(db, ', constraint namelen check (length(name) < 5)');
+			await expectThrows(() => db.exec("update x.W set name = 'toolong' where id = 2"), /check|constraint|namelen/i);
+			expect(await rows(db, 'select val from main.w_name order by val')).to.deep.equal([{ val: 'a' }, { val: 'b' }, { val: 'c' }]); // rolled back
+			// A valid name update commits (rides w_name, passes).
+			await db.exec("update x.W set name = 'ok' where id = 2");
+			expect(await rows(db, 'select name from x.W where id = 2')).to.deep.equal([{ name: 'ok' }]);
+			// A key-only UPDATE fans out to w_id alone — the name CHECK is not routed there, so it
+			// commits cleanly (pre-fix the bare-name gate would have mis-routed it onto w_id's `val`).
+			await db.exec('update x.W set id = 22 where id = 2');
+			expect(await rows(db, 'select id, name from x.W order by id')).to.deep.equal([
+				{ id: 1, name: 'a' }, { id: 3, name: 'c' }, { id: 22, name: 'ok' },
+			]);
+		} finally {
+			await db.close();
+		}
+	});
+});

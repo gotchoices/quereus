@@ -1,8 +1,9 @@
 import type * as AST from '../../parser/ast.js';
 import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
-import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema } from '../../schema/table.js';
+import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema, ReferencedWriteRowRelation } from '../../schema/table.js';
 import { RowOpFlag } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
+import type { BasisRelationRef } from '../../vtab/mapping-advertisement.js';
 import { resolveSlotBasisSource, collectColumnRefNames, authoredForwardMap } from '../../schema/lens-prover.js';
 import {
 	logicalToBasisColumnMap,
@@ -68,6 +69,71 @@ const log = createLogger('planner:lens-enforcement');
 
 /** Marker tag stamped on a routed basis-term constraint so its lens origin is visible. */
 export const LENS_BOUNDARY_ATTACHED_TAG = 'quereus.lens.boundary.attached';
+
+/**
+ * Resolves, per logical column of a slot, the **basis relation that owns it** — the
+ * member relation under a decomposition advertisement, or the slot's single basis
+ * source for a non-decomposition lens. The per-op decomposition gate
+ * (`constraintsForOp` in `view-mutation-builder`) needs this to route a
+ * lens-synthesized constraint onto the exact member op that owns each referenced
+ * write-row column, instead of any sibling member op that merely shares the basis
+ * column NAME (the bug this metadata fixes: two members both spelling their value
+ * column `val`).
+ *
+ * Sourced from `slot.advertisement.storage.members` (each member's `relation` +
+ * the `logicalColumn`s it backs) when a decomposition backs the table; else from
+ * {@link resolveSlotBasisSource} (the single basis relation answers for every
+ * column). Returns `undefined` for a column it cannot attribute (an EAV-pivot
+ * logical column, an opaque slot) — the caller then omits the relation metadata for
+ * that constraint, so the gate falls back to its bare-name path.
+ */
+function makeOwningRelationResolver(
+	slot: LensSlot,
+	schemaManager: SchemaManager | undefined,
+): (logicalColumn: string) => BasisRelationRef | undefined {
+	const members = slot.advertisement?.storage?.members;
+	if (members && members.length > 0) {
+		const byLogical = new Map<string, BasisRelationRef>();
+		for (const m of members) {
+			for (const cm of m.columns) byLogical.set(cm.logicalColumn.toLowerCase(), m.relation);
+		}
+		return (logicalColumn) => byLogical.get(logicalColumn.toLowerCase());
+	}
+	const basis = schemaManager ? resolveSlotBasisSource(slot, schemaManager) : undefined;
+	if (basis) {
+		const ref: BasisRelationRef = { schema: basis.schemaName, table: basis.name };
+		return () => ref;
+	}
+	return () => undefined;
+}
+
+/**
+ * Builds one relation-qualified write-row entry per `(owning relation, basis column)`
+ * pair, given the referenced logical column it derives from. Returns `undefined`
+ * (signalling "omit the relation metadata, fall back to the bare-name gate") if any
+ * logical column's owning relation cannot be resolved — so an incomplete attribution
+ * is never silently treated as a complete one. The returned list is deduped by
+ * `(schema, table, column)`.
+ */
+function buildWriteRowRelations(
+	owningRelation: (logicalColumn: string) => BasisRelationRef | undefined,
+	entries: ReadonlyArray<{ logicalColumn: string; basisColumns: readonly string[] }>,
+): ReferencedWriteRowRelation[] | undefined {
+	const out: ReferencedWriteRowRelation[] = [];
+	const seen = new Set<string>();
+	for (const { logicalColumn, basisColumns } of entries) {
+		const rel = owningRelation(logicalColumn);
+		if (!rel) return undefined;
+		for (const basisColumn of basisColumns) {
+			const column = basisColumn.toLowerCase();
+			const key = `${rel.schema.toLowerCase()}.${rel.table.toLowerCase()}.${column}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			out.push({ schema: rel.schema, table: rel.table, column });
+		}
+	}
+	return out;
+}
 
 /**
  * The {@link ScopeContext} for the logical→basis row-local CHECK rewrite — the
@@ -212,25 +278,36 @@ function rewriteToBasisTerms(
  *
  * An authored-inverse column contributes its forward `get` expression's basis
  * refs (the columns the substituted CHECK actually reads on the write row).
+ *
+ * Returned per-referenced-logical-column (`{ logicalColumn, basisColumns }`) so the
+ * caller can both flatten it to the bare {@link RowConstraintSchema.referencedWriteRowColumns}
+ * list AND attribute each basis column to its owning relation for the relation-qualified
+ * gate metadata. A logical column referenced more than once contributes a single entry
+ * (deduped by lowercased logical name).
  */
-function rowLocalReferencedBasisColumns(
+function rowLocalReferencedWriteRow(
 	expr: AST.Expression,
 	map: ReadonlyMap<string, string>,
 	forwards: ReadonlyMap<string, AST.Expression>,
-): string[] {
-	const cols = new Set<string>();
+): Array<{ logicalColumn: string; basisColumns: string[] }> {
+	const entries: Array<{ logicalColumn: string; basisColumns: string[] }> = [];
+	const seen = new Set<string>();
 	for (const name of collectColumnRefNames(expr)) {
-		const basis = map.get(name.toLowerCase());
+		const lc = name.toLowerCase();
+		if (seen.has(lc)) continue;
+		const basis = map.get(lc);
 		if (basis !== undefined) {
-			cols.add(basis.toLowerCase());
+			seen.add(lc);
+			entries.push({ logicalColumn: name, basisColumns: [basis.toLowerCase()] });
 			continue;
 		}
-		const forward = forwards.get(name.toLowerCase());
+		const forward = forwards.get(lc);
 		if (forward !== undefined) {
-			for (const f of collectColumnRefNames(forward)) cols.add(f.toLowerCase());
+			seen.add(lc);
+			entries.push({ logicalColumn: name, basisColumns: collectColumnRefNames(forward).map(f => f.toLowerCase()) });
 		}
 	}
-	return [...cols];
+	return entries;
 }
 
 /**
@@ -239,11 +316,14 @@ function rowLocalReferencedBasisColumns(
  * and tags it with {@link LENS_BOUNDARY_ATTACHED_TAG}. The result is merged into
  * the basis INSERT/UPDATE's constraint-check pipeline by the base-table builder.
  *
- * Each constraint also carries {@link rowLocalReferencedBasisColumns} as
- * `referencedWriteRowColumns` — prover-supplied metadata the per-op decomposition gate
- * uses instead of an AST walk, so a subquery-bearing row-local CHECK (which the prover
- * still classifies `enforced-row-local`) gates onto the member op that owns its correlated
- * write-row column rather than crashing on a member that cannot resolve it.
+ * Each constraint also carries its {@link rowLocalReferencedWriteRow} dependency set as
+ * `referencedWriteRowColumns` (bare basis names) **and** `referencedWriteRowRelations`
+ * (each basis column qualified by its owning member relation) — prover-supplied metadata
+ * the per-op decomposition gate uses instead of an AST walk, so a subquery-bearing
+ * row-local CHECK (which the prover still classifies `enforced-row-local`) gates onto the
+ * member op that owns its correlated write-row column — by relation identity, not bare
+ * name — rather than crashing on a member that cannot resolve it (or mis-routing onto a
+ * sibling member that merely shares the basis-column name).
  *
  * Returns `[]` when the slot is un-proved (`obligations` undefined) or carries no
  * row-local checks — the common case, so a non-lens / check-free write pays nothing.
@@ -252,19 +332,23 @@ export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensS
 	if (!slot.obligations || slot.obligations.length === 0) return [];
 	const map = logicalToBasisColumnMap(slot);
 	const forwards = authoredForwardMap(slot);
+	const owningRelation = makeOwningRelationResolver(slot, ctx.schemaManager);
 	const logicalTableName = slot.logicalTable.name;
 	const constraints: RowConstraintSchema[] = [];
 	for (const obligation of slot.obligations) {
 		if (obligation.kind !== 'enforced-row-local') continue;
 		if (obligation.constraint.kind !== 'check') continue;
 		const source = obligation.constraint.constraint;
+		const writeRow = rowLocalReferencedWriteRow(source.expr, map, forwards);
 		constraints.push({
 			name: source.name ? `lens:${source.name}` : 'lens:check',
 			expr: rewriteToBasisTerms(ctx, source.expr, map, forwards, logicalTableName),
 			// A logical CHECK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
-			// Prover-supplied write-row dependency set for the per-op decomposition gate.
-			referencedWriteRowColumns: rowLocalReferencedBasisColumns(source.expr, map, forwards),
+			// Prover-supplied write-row dependency set for the per-op decomposition gate
+			// (bare names for introspection; relation-qualified for the gate itself).
+			referencedWriteRowColumns: [...new Set(writeRow.flatMap(e => e.basisColumns))],
+			referencedWriteRowRelations: buildWriteRowRelations(owningRelation, writeRow),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}
@@ -451,6 +535,7 @@ function lensParentSideForeignKeyRedundant(
 export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: SchemaManager): RowConstraintSchema[] {
 	if (!slot.obligations || slot.obligations.length === 0) return [];
 	const map = logicalToBasisColumnMap(slot);
+	const owningRelation = makeOwningRelationResolver(slot, schemaManager);
 	const logicalSchemaName = slot.logicalTable.schemaName;
 	const constraints: RowConstraintSchema[] = [];
 	for (const obligation of slot.obligations) {
@@ -480,16 +565,20 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
 		// Rewrite each FK child column index → logical name → basis column. A column
 		// the prover proved reconstructible maps; otherwise it falls back to the logical
 		// name (the prover would have errored on a non-reconstructible FK child column).
-		const childColumns = fk.columns.map(childIdx => {
+		// The child (NEW) columns are the constraint's write-row refs; attribute each to
+		// the member relation that owns it for the per-op decomposition gate.
+		const writeRow = fk.columns.map(childIdx => {
 			const logicalName = slot.logicalTable.columns[childIdx]?.name ?? `#${childIdx}`;
-			return map.get(logicalName.toLowerCase()) ?? logicalName;
+			return { logicalColumn: logicalName, basisColumns: [map.get(logicalName.toLowerCase()) ?? logicalName] };
 		});
+		const childColumns = writeRow.map(e => e.basisColumns[0]);
 		const expr = synthesizeFKExistsExpr(fk.referencedTable, parentColumns, childColumns, 'NEW', referencedSchema);
 		constraints.push({
 			name: fk.name ? `lens:fk:${fk.name}` : 'lens:fk',
 			expr,
 			// Child-side FK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
+			referencedWriteRowRelations: buildWriteRowRelations(owningRelation, writeRow),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}
@@ -652,6 +741,16 @@ export function collectLensParentSideForeignKeyConstraints(
 			name: fk.name ? `lens:fk:parent:${fk.name}` : 'lens:fk:parent',
 			expr,
 			operations: operation,
+			// The OLD/NEW referenced columns are this constraint's write-row refs; they ride
+			// the parent's basis write row, which is exactly `basisParent` (this collector
+			// only runs for a single-source parent — it early-returned otherwise). The child
+			// columns inside the NOT EXISTS stay logical (subquery-FROM resolved) and are not
+			// write-row refs, so they are not attributed.
+			referencedWriteRowRelations: parentBasisColumns.map(column => ({
+				schema: basisParent.schemaName,
+				table: basisParent.name,
+				column: column.toLowerCase(),
+			})),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}
@@ -750,10 +849,11 @@ function synthesizeUniqueCountExpr(
  * view / proved-key write pays nothing. DELETE never introduces a duplicate, so the
  * caller restricts this to insert/update.
  */
-export function collectLensSetLevelConstraints(slot: LensSlot): RowConstraintSchema[] {
+export function collectLensSetLevelConstraints(slot: LensSlot, schemaManager?: SchemaManager): RowConstraintSchema[] {
 	if (!slot.obligations || slot.obligations.length === 0) return [];
 	const map = logicalToBasisColumnMap(slot);
 	const forwards = authoredForwardMap(slot);
+	const owningRelation = makeOwningRelationResolver(slot, schemaManager);
 	const logicalSchemaName = slot.logicalTable.schemaName;
 	const logicalTableName = slot.logicalTable.name;
 	const constraints: RowConstraintSchema[] = [];
@@ -771,18 +871,24 @@ export function collectLensSetLevelConstraints(slot: LensSlot): RowConstraintSch
 		// `get` image for a proven-bijective `with inverse` column (so the count compares
 		// logical value to logical value). A non-reconstructible, non-authored key would
 		// have made the table read-only — no write reaches here — but the bare-name
-		// fallback keeps the synthesis total.
+		// fallback keeps the synthesis total. `writeRow` accumulates, per key column, the
+		// basis columns its NEW side references — the per-op decomposition gate's write-row
+		// dependency set, attributed below to each column's owning member relation.
+		const writeRow: Array<{ logicalColumn: string; basisColumns: string[] }> = [];
 		const keyColumns = logicalColumns.map(li => {
 			const logicalColumn = slot.logicalTable.columns[li]?.name ?? `#${li}`;
 			const lc = logicalColumn.toLowerCase();
 			const basisColumn = map.get(lc);
 			if (basisColumn !== undefined) {
+				writeRow.push({ logicalColumn, basisColumns: [basisColumn.toLowerCase()] });
 				return { logicalColumn, newSide: { type: 'column', name: basisColumn, table: 'NEW' } as AST.ColumnExpr };
 			}
 			const forward = forwards.get(lc);
 			if (forward !== undefined) {
+				writeRow.push({ logicalColumn, basisColumns: collectColumnRefNames(forward).map(f => f.toLowerCase()) });
 				return { logicalColumn, newSide: transformExpr(forward, col => ({ type: 'column', name: col.name, table: 'NEW' })) };
 			}
+			writeRow.push({ logicalColumn, basisColumns: [logicalColumn.toLowerCase()] });
 			return { logicalColumn, newSide: { type: 'column', name: logicalColumn, table: 'NEW' } as AST.ColumnExpr };
 		});
 		constraints.push({
@@ -791,6 +897,7 @@ export function collectLensSetLevelConstraints(slot: LensSlot): RowConstraintSch
 			// A duplicate is only introduced by an insert or a key-changing update;
 			// a delete cannot create one (and is excluded by the caller anyway).
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
+			referencedWriteRowRelations: buildWriteRowRelations(owningRelation, writeRow),
 			tags: { [LENS_BOUNDARY_ATTACHED_TAG]: true },
 		});
 	}

@@ -536,16 +536,46 @@ export interface RowConstraintSchema {
 	/**
 	 * Lens-synthesized **row-local CHECK only**: the lowercased basis-column names this
 	 * constraint depends on, supplied by the prover (`collectLensRowLocalConstraints`)
-	 * rather than re-derived from the AST. The per-op decomposition gate (`constraintsForOp`
-	 * in `view-mutation-builder`) prefers this over its `writeRowColumns` walk, so a
-	 * subquery-bearing row-local CHECK whose correlated write-row column the walker would
-	 * miss *inside* the subquery still gates onto the member op that owns it. Transient —
-	 * set only on a write-plan-time constraint, never persisted to the catalog and never
-	 * compared by the declarative differ. Undefined on FK / set-level lens constraints
-	 * (they keep the AST walk, whose `NEW.*` / `OLD.*` refs it collects unambiguously) and
-	 * on every basis-declared CHECK.
+	 * rather than re-derived from the AST. Superseded for the per-op decomposition gate by
+	 * {@link referencedWriteRowRelations} (which additionally carries each column's owning
+	 * basis relation, disambiguating two members that share a basis-column name) but kept
+	 * as the bare-name introspection surface. Transient — set only on a write-plan-time
+	 * constraint, never persisted to the catalog and never compared by the declarative
+	 * differ. Undefined on FK / set-level lens constraints and on every basis-declared CHECK.
 	 */
 	referencedWriteRowColumns?: readonly string[];
+	/**
+	 * Lens-synthesized constraint (row-local CHECK / set-level uniqueness / child-FK /
+	 * parent-FK): the write-row columns this constraint references, **each qualified by the
+	 * basis relation that owns it**. The per-op decomposition gate (`constraintsForOp` in
+	 * `view-mutation-builder`) prefers this over both {@link referencedWriteRowColumns} and
+	 * its `writeRowColumns` AST walk: a constraint rides a member op iff every entry's
+	 * `(schema, table)` matches the op's target relation. This is what fixes mis-routing a
+	 * constraint onto a *sibling* decomposition member that merely shares a basis-column
+	 * NAME with the column-owning member (e.g. two members both spelling their value column
+	 * `val`). Lens collectors source the owning relation from the slot's decomposition
+	 * advertisement members (or its single basis source for a non-decomposition lens), so it
+	 * is populated for every lens class. Transient — never persisted to the catalog and
+	 * never compared by the declarative differ. Undefined on basis-declared CHECKs and when
+	 * the owning relation could not be resolved (the gate then falls back to the bare-name
+	 * path).
+	 */
+	referencedWriteRowRelations?: readonly ReferencedWriteRowRelation[];
+}
+
+/**
+ * One write-row column of a lens-synthesized constraint, qualified by the basis
+ * relation that owns it — the relation-identity unit the per-op decomposition gate
+ * matches against an op's target relation. See
+ * {@link RowConstraintSchema.referencedWriteRowRelations}.
+ */
+export interface ReferencedWriteRowRelation {
+	/** Owning basis relation's schema (original case; matched case-insensitively). */
+	readonly schema: string;
+	/** Owning basis relation's table name (original case; matched case-insensitively). */
+	readonly table: string;
+	/** The basis column name on that relation (lowercased). */
+	readonly column: string;
 }
 
 /**
