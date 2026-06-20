@@ -579,6 +579,26 @@ export interface ReferencedWriteRowRelation {
 }
 
 /**
+ * The collision-proof per-relation **write-row correlation name** — the decomposition
+ * analogue of the `NEW` write-row correlation, distinct per owning member relation so two
+ * basis columns that share a NAME across decomposition members never collapse to the same
+ * rewritten AST term.
+ *
+ * The lens logical→basis CHECK rewrite (`planner/mutation/lens-enforcement.ts`) qualifies a
+ * mapped write-row column with this name (instead of bare `NEW`) on a multi-member
+ * decomposition, and the per-op constraint scope (`planner/building/constraint-builder.ts`)
+ * registers `<corr>.<col>` for the op's own target relation. So a row-local CHECK over one
+ * member's column resolves on that member's op while a sibling-member term fails to resolve
+ * (a loud `Column not found` rather than a silent wrong answer) — matching the per-op gate's
+ * relation-identity routing. As reserved-feeling as `NEW`: the `__lens_new__` prefix is not
+ * producible by a parsed user identifier, so it cannot be shadow-captured by a subquery FROM
+ * source (the capture-safety reason the bare basis table name could NOT be used here).
+ */
+export function writeRowRelationCorrelation(schema: string, table: string): string {
+	return `__lens_new__${schema.toLowerCase()}__${table.toLowerCase()}`;
+}
+
+/**
  * Represents a FOREIGN KEY constraint linking child columns to a parent table
  */
 export interface ForeignKeyConstraintSchema {

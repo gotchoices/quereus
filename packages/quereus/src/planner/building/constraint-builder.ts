@@ -1,6 +1,6 @@
 import type { PlanningContext } from '../planning-context.js';
 import type { TableSchema, RowConstraintSchema } from '../../schema/table.js';
-import { RowOpFlag } from '../../schema/table.js';
+import { RowOpFlag, writeRowRelationCorrelation } from '../../schema/table.js';
 import type { Attribute, RowDescriptor } from '../nodes/plan-node.js';
 import type { ConstraintCheck, NotNullDefaultPlan } from '../nodes/constraint-check-node.js';
 import { RegisteredScope } from '../scopes/registered.js';
@@ -91,6 +91,19 @@ export function buildConstraintChecks(
       }
     });
 
+    // The per-relation write-row correlation for THIS op's target relation — the
+    // decomposition analogue of `NEW`. A lens row-local CHECK rewritten over a multi-member
+    // decomposition qualifies its write-row terms with `writeRowRelationCorrelation(owning
+    // member)` instead of bare `NEW`, so two members spelling their value column the same
+    // name (`w_id.val` / `w_name.val`) stay distinct. Registering `<corr>.<col>` against the
+    // op's OWN target relation lets a CHECK whose terms all live on this member resolve here,
+    // while a sibling-member term fails to resolve (a loud `Column not found`, not a silent
+    // wrong answer) — fail-safe, matching the per-op gate's relation-identity routing. The
+    // synthetic `__lens_new__…` name is not producible by a parsed identifier, so it cannot
+    // collide with a real FROM source; additive and inert for a non-lens / single-source
+    // write (whose rewrites stay on `NEW` and never reference it).
+    const writeRowCorr = writeRowRelationCorrelation(tableSchema.schemaName, tableSchema.name);
+
     // Register column symbols (similar to current emitConstraintCheck logic)
     tableSchema.columns.forEach((tableColumn, tableColIndex) => {
       const colNameLower = tableColumn.name.toLowerCase();
@@ -105,6 +118,11 @@ export function buildConstraintChecks(
 
         // NEW.column
         constraintScope.registerSymbol(`new.${colNameLower}`, (exp, s) =>
+          new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttrId, tableColIndex));
+
+        // Relation-qualified write-row correlation (lens decomposition rewrite) — the
+        // `<corr>.<col>` analogue of `new.<col>` for this member relation.
+        constraintScope.registerSymbol(`${writeRowCorr}.${colNameLower}`, (exp, s) =>
           new ColumnReferenceNode(s, exp as AST.ColumnExpr, newColumnType, newAttrId, tableColIndex));
 
         // For INSERT/UPDATE, unqualified column defaults to NEW

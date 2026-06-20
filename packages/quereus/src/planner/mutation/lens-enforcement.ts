@@ -1,7 +1,7 @@
 import type * as AST from '../../parser/ast.js';
 import type { LensSlot, LogicalConstraint } from '../../schema/lens.js';
 import type { RowConstraintSchema, ForeignKeyConstraintSchema, TableSchema, ReferencedWriteRowRelation } from '../../schema/table.js';
-import { RowOpFlag } from '../../schema/table.js';
+import { RowOpFlag, writeRowRelationCorrelation } from '../../schema/table.js';
 import type { SchemaManager } from '../../schema/manager.js';
 import type { BasisRelationRef } from '../../vtab/mapping-advertisement.js';
 import { resolveSlotBasisSource, collectColumnRefNames, authoredForwardMap } from '../../schema/lens-prover.js';
@@ -147,19 +147,24 @@ function buildWriteRowRelations(
  * per column:
  *
  * - **Qualified by the logical table name** and mapped ⇒ a qualified write-row ref ⇒
- *   replace with the basis column qualified `NEW.<basis>` (the write-row correlation name).
+ *   replace with the basis column qualified `<corr>.<basis>` (the write-row correlation name).
  *   Any other qualifier (`Allowed.name`, a subquery FROM source) ⇒ left untouched — it
  *   resolves against the subquery FROM. This is the negative-case guard against
  *   over-rewriting a foreign ref whose name happens to equal a logical column.
  * - **Bare**, shadowed by a (this-or-enclosing) subquery FROM ⇒ left untouched
- *   (subquery-local); else, name maps ⇒ replace with `NEW.<basis>` (a correlated
+ *   (subquery-local); else, name maps ⇒ replace with `<corr>.<basis>` (a correlated
  *   write-row ref); else ⇒ left untouched.
  *
- * The replacement is qualified `NEW.<basis>` rather than left bare so a ref emitted
- * inside a correlated subquery cannot be captured by a same-named column the subquery's
- * own FROM introduces (the lens analogue of the single-source descent's
- * {@link import('./single-source.js').makeBaseQualifier}); see {@link makeLensRewriteScope}'s
- * `resolve`. At the top level it resolves to the write row identically to a bare ref.
+ * `<corr>` is `NEW` for a single-source lens and the per-relation
+ * {@link import('../../schema/table.js').writeRowRelationCorrelation} on a multi-member
+ * decomposition (`relationQualify`): two members that back distinct logical columns with the
+ * SAME basis-column name (`id`,`name` → `val` on `w_id`,`w_name`) then rewrite to *distinct*
+ * terms instead of collapsing to one `NEW.val`. The qualifier (rather than a bare ref) is
+ * load-bearing so a ref emitted inside a correlated subquery cannot be captured by a
+ * same-named column the subquery's own FROM introduces (the lens analogue of the single-source
+ * descent's {@link import('./single-source.js').makeBaseQualifier}); see
+ * {@link makeLensRewriteScope}'s `resolve`. At the top level it resolves to the write row
+ * identically to a bare ref.
  *
  * The old top-level behavior — strip the qualifier of an *unmapped* qualified column — is
  * intentionally dropped: the prover errors at deploy on a CHECK over a non-reconstructible
@@ -172,21 +177,46 @@ function buildWriteRowRelations(
  * diagnostic rather than mis-rewrite or fall through to a cryptic build crash. A foreign /
  * qualified ref in a tainted scope is still left untouched (its name is not a logical column).
  */
-function makeLensRewriteScope(map: ReadonlyMap<string, string>, forwards: ReadonlyMap<string, AST.Expression>, logicalTableName: string): ScopeContext {
+function makeLensRewriteScope(
+	map: ReadonlyMap<string, string>,
+	forwards: ReadonlyMap<string, AST.Expression>,
+	logicalTableName: string,
+	owningRelation: (logicalColumn: string) => BasisRelationRef | undefined,
+	relationQualify: boolean,
+): ScopeContext {
 	const lcTable = logicalTableName.toLowerCase();
-	// A rewritten write-row ref is qualified `NEW.<basis>` — the write-row correlation
+	// The write-row correlation name for a mapped logical column: on a **multi-member
+	// decomposition** (`relationQualify`), the per-relation synthetic correlation keyed by
+	// the column's owning member (so two members spelling their value column the same NAME
+	// stay distinct — `id`'s `val` on `w_id` vs `name`'s `val` on `w_name`), else bare `NEW`.
+	// Falls back to `NEW` when the owning relation cannot be attributed (an EAV-pivot / opaque
+	// column) — mirroring `buildWriteRowRelations` returning `undefined` (gate falls back to
+	// the bare-name path), so the rewrite and the gate metadata agree on those columns.
+	const writeRowCorrelation = (name: string): string => {
+		if (!relationQualify) return 'NEW';
+		const rel = owningRelation(name);
+		return rel ? writeRowRelationCorrelation(rel.schema, rel.table) : 'NEW';
+	};
+	// A rewritten write-row ref is qualified `<corr>.<basis>` — the write-row correlation
 	// name the constraint scope registers (`building/constraint-builder.ts` registers
-	// `new.<col>` for every basis column on an INSERT/UPDATE check; row-local lens
-	// checks are INSERT|UPDATE only). The qualifier is load-bearing for a ref emitted
-	// INSIDE a correlated subquery: a *bare* basis column there would re-bind to a
-	// same-named column the subquery's own FROM introduces (innermost SQL scoping)
-	// instead of the write row — silently changing the CHECK's meaning when a renamed
-	// logical column's basis spelling collides with a subquery-source column. This is
-	// the lens analogue of the single-source descent's `makeBaseQualifier` (which
-	// qualifies with the lowered target's alias for the same reason). At the top level
-	// `NEW.<basis>` resolves to the write row identically to the prior bare form, so the
-	// behavior is unchanged except in the collision corner. Mirrors the FK / set-level
-	// synthesizers, which likewise qualify their write-row side `NEW.*`.
+	// `new.<col>` AND `<writeRowRelationCorrelation(opSchema,opTable)>.<col>` for every
+	// basis column on an INSERT/UPDATE check; row-local lens checks are INSERT|UPDATE only).
+	// On a **single-source** lens `<corr>` is `NEW`; on a **multi-member decomposition** it
+	// is the per-relation correlation (above) so two members whose value columns share a
+	// NAME do not collapse to the same term (the `id`/`name` → `val` collision). The
+	// qualifier is load-bearing for a ref emitted INSIDE a correlated subquery: a *bare*
+	// basis column there would re-bind to a same-named column the subquery's own FROM
+	// introduces (innermost SQL scoping) instead of the write row — silently changing the
+	// CHECK's meaning when a renamed logical column's basis spelling collides with a
+	// subquery-source column. This is the lens analogue of the single-source descent's
+	// `makeBaseQualifier` (which qualifies with the lowered target's alias for the same
+	// reason); the decomposition correlation is collision-proof for the SAME reason `NEW`
+	// is — `__lens_new__…` is not producible by a parsed identifier, so a subquery FROM
+	// cannot shadow-capture it (using the bare basis table name would reintroduce exactly
+	// the capture bug `NEW` was added to fix). At the top level `<corr>.<basis>` resolves to
+	// the write row identically to the prior bare form, so behavior is unchanged except in
+	// the collision corner. Mirrors the FK / set-level synthesizers, which likewise qualify
+	// their write-row side `NEW.*`.
 	//
 	// An **authored-inverse** column has no single basis spelling — substitute its
 	// forward `get` expression instead, every base ref `NEW.`-qualified for the same
@@ -197,9 +227,12 @@ function makeLensRewriteScope(map: ReadonlyMap<string, string>, forwards: Readon
 	// exactly that same set, keeping deploy and write-time in lockstep.
 	const resolve = (name: string): AST.Expression | undefined => {
 		const basisColumn = map.get(name);
-		if (basisColumn !== undefined) return { type: 'column', name: basisColumn, table: 'NEW' };
+		if (basisColumn !== undefined) return { type: 'column', name: basisColumn, table: writeRowCorrelation(name) };
 		const forward = forwards.get(name);
 		if (forward !== undefined) {
+			// Authored-inverse forward: `authoredForwardMap` admits only subquery-free
+			// single-source forwards, so it is never decomposition-ambiguous — its base refs
+			// stay on `NEW`.
 			return transformExpr(forward, col => ({ type: 'column', name: col.name, table: 'NEW' }));
 		}
 		return undefined;
@@ -250,8 +283,10 @@ function rewriteToBasisTerms(
 	map: ReadonlyMap<string, string>,
 	forwards: ReadonlyMap<string, AST.Expression>,
 	logicalTableName: string,
+	owningRelation: (logicalColumn: string) => BasisRelationRef | undefined,
+	relationQualify: boolean,
 ): AST.Expression {
-	return transformScopedExpr(ctx, makeLensRewriteScope(map, forwards, logicalTableName), expr);
+	return transformScopedExpr(ctx, makeLensRewriteScope(map, forwards, logicalTableName, owningRelation, relationQualify), expr);
 }
 
 /**
@@ -333,6 +368,12 @@ export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensS
 	const map = logicalToBasisColumnMap(slot);
 	const forwards = authoredForwardMap(slot);
 	const owningRelation = makeOwningRelationResolver(slot, ctx.schemaManager);
+	// Relation-qualify the rewrite ONLY on a multi-member decomposition, where the same
+	// basis-column NAME can denote different physical columns on different members. A
+	// single-source lens (or a degenerate single-member decomposition) has no such ambiguity,
+	// so it keeps the `NEW` write-row correlation — no rewrite/behavior change there.
+	const members = slot.advertisement?.storage?.members;
+	const relationQualify = !!members && members.length > 1;
 	const logicalTableName = slot.logicalTable.name;
 	const constraints: RowConstraintSchema[] = [];
 	for (const obligation of slot.obligations) {
@@ -342,7 +383,7 @@ export function collectLensRowLocalConstraints(ctx: PlanningContext, slot: LensS
 		const writeRow = rowLocalReferencedWriteRow(source.expr, map, forwards);
 		constraints.push({
 			name: source.name ? `lens:${source.name}` : 'lens:check',
-			expr: rewriteToBasisTerms(ctx, source.expr, map, forwards, logicalTableName),
+			expr: rewriteToBasisTerms(ctx, source.expr, map, forwards, logicalTableName, owningRelation, relationQualify),
 			// A logical CHECK guards the row being written: insert and update only.
 			operations: RowOpFlag.INSERT | RowOpFlag.UPDATE,
 			// Prover-supplied write-row dependency set for the per-op decomposition gate

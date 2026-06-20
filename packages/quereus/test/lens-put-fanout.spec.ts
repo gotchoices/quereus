@@ -2933,4 +2933,29 @@ describe('lens decomposition put: per-op gate routes by owning basis relation (c
 			await db.close();
 		}
 	});
+
+	it('a cross-member row-local CHECK rewrites to relation-distinct write-row terms (no NEW.val collapse)', async () => {
+		const db = new Database();
+		try {
+			// `id <> length(name)` references BOTH logical columns: `id` → basis `w_id.val`,
+			// `name` → basis `w_name.val`. They share the bare basis NAME `val`, so a bare
+			// `NEW`-qualified rewrite would collapse both write-row terms to a single `NEW.val`
+			// — silently confusing the two members (the `name` ref becoming `w_id`'s `val`). The
+			// relation-qualified rewrite keeps them distinct, each carrying its owning member's
+			// synthetic write-row correlation. (This CHECK spans two members ⇒ the per-op gate
+			// defers it on a decomposition write, so the rewrite is never evaluated today — this
+			// unit asserts it would be CORRECT, not collapsed, if a future change ever routed it.)
+			await setupPerColumn(db, ', constraint xmember check (id <> length(name))');
+			const constraints = collectLensRowLocalConstraints(makeCtx(db), slotX(db, 'W'));
+			expect(constraints.length, 'one routed row-local check').to.equal(1);
+			const exprSql = astToString(constraints[0].expr).toLowerCase();
+			// The two write-row terms are relation-qualified and DISTINCT — the `id` term on the
+			// w_id member, the `name` term on the w_name member — not both collapsed to `new.val`.
+			expect(exprSql, 'id term carries the w_id member correlation').to.contain('__lens_new__main__w_id.val');
+			expect(exprSql, 'name term carries the w_name member correlation').to.contain('__lens_new__main__w_name.val');
+			expect(exprSql, 'not collapsed onto the bare NEW write-row correlation').to.not.contain('new.val');
+		} finally {
+			await db.close();
+		}
+	});
 });
