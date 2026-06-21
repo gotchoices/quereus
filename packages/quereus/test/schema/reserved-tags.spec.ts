@@ -220,6 +220,35 @@ describe('Reserved tag registry', () => {
 		});
 	});
 
+	describe('quereus.engine_managed (boolean, table-only)', () => {
+		it('accepts a boolean value at the physical-table site', () => {
+			expect(check({ 'quereus.engine_managed': true }, 'physical-table')).to.have.length(0);
+			expect(check({ 'quereus.engine_managed': false }, 'physical-table')).to.have.length(0);
+		});
+
+		it('rejects a non-boolean value (error)', () => {
+			// catalog.ts reads it via a strict `=== true`, so only a real boolean is meaningful.
+			const diags = check({ 'quereus.engine_managed': 'true' }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('invalid-tag-value');
+			expect(diags[0].severity).to.equal('error');
+		});
+
+		it('is not allowed on a column / constraint / index site (table-only)', () => {
+			for (const site of ['physical-column', 'physical-constraint', 'physical-index', 'logical-column'] as const) {
+				const diags = check({ 'quereus.engine_managed': true }, site);
+				expect(diags, `engine_managed @ ${site}`).to.have.length(1);
+				expect(diags[0].reason).to.equal('tag-not-allowed-here');
+			}
+		});
+
+		it('flags a typo as unknown-reserved-tag', () => {
+			const diags = check({ 'quereus.engine_managd': true }, 'physical-table');
+			expect(diags).to.have.length(1);
+			expect(diags[0].reason).to.equal('unknown-reserved-tag');
+		});
+	});
+
 	describe('quereus.lens.writable (boolean, logical-column only)', () => {
 		it('accepts a boolean value at the logical-column site', () => {
 			expect(check({ 'quereus.lens.writable': true }, 'logical-column')).to.have.length(0);
@@ -447,15 +476,17 @@ describe('Reserved tag registry', () => {
 			}
 		});
 
-		it('seeds all documented keys (rename hints + expose_implicit_index + sync replicate/evict + lens advisory + writable intent + escalation policy + lens decomposition families)', () => {
+		it('seeds all documented keys (rename hints + expose_implicit_index + engine_managed + sync replicate/evict + lens advisory + writable intent + escalation policy + lens decomposition families)', () => {
 			// 2 rename hints (quereus.id / quereus.previous_name) + 1 quereus.expose_implicit_index
-			// + 1 quereus.sync.replicate + 1 quereus.sync.evict + 2 quereus.lens.{ack,access}
-			// + 1 quereus.lens.writable + 2 quereus.lens.policy.* + 9 quereus.lens.decomp.* = 19.
-			expect(RESERVED_TAGS).to.have.length(19);
+			// + 1 quereus.engine_managed + 1 quereus.sync.replicate + 1 quereus.sync.evict
+			// + 2 quereus.lens.{ack,access} + 1 quereus.lens.writable + 2 quereus.lens.policy.*
+			// + 9 quereus.lens.decomp.* = 20.
+			expect(RESERVED_TAGS).to.have.length(20);
 			const keys = RESERVED_TAGS.map(s => (typeof s.key === 'string' ? s.key : s.key.template));
 			expect(keys).to.include('quereus.id');
 			expect(keys).to.include('quereus.previous_name');
 			expect(keys).to.include('quereus.expose_implicit_index');
+			expect(keys).to.include('quereus.engine_managed');
 			expect(keys).to.include('quereus.sync.replicate');
 			expect(keys).to.include('quereus.sync.evict');
 			expect(keys).to.include('quereus.lens.writable');

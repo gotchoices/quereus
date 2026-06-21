@@ -20,6 +20,8 @@ import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
+import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
+import { isObjectClassValue } from '../util/comparison.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
@@ -43,6 +45,14 @@ export class Statement {
 	private schemaChangeUnsubscriber: (() => void) | null = null;
 	/** Parameter types established at prepare time (either explicit or inferred from initial values) */
 	private parameterTypes: Map<string | number, ScalarType> | undefined = undefined;
+	/**
+	 * Parameter names/indices used directly as a comparand in a scalar comparison
+	 * (`= <> < <= > >=` / `IN` / `BETWEEN`) against a non-object scalar operand.
+	 * Binding any of these to a JS array / plain object can never match, so it is
+	 * rejected at bind time in {@link validateParameterTypes}. Recomputed on each
+	 * (re)compilation from the logical plan; see `analysis/scalar-param-usage.ts`.
+	 */
+	private scalarRequiredParams: Set<string | number> = new Set();
 	/** Debug options set via Database.prepareDebug(). @internal */
 	_debugOptions?: import('../planner/planning-context.js').DebugOptions;
 
@@ -144,6 +154,10 @@ export class Statement {
 
 			// Pass parameter types directly to planning
 			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], this.parameterTypes);
+			// Collect array-valued-scalar-param guard targets from the LOGICAL plan,
+			// before the access-path optimizer folds `col = ?` comparisons into index
+			// seeks (which erases the comparison node). See validateParameterTypes.
+			this.scalarRequiredParams = collectScalarRequiredParams(rawPlan);
 			plan = this.db.optimizer.optimize(rawPlan, this.db) as BlockNode;
 
 			// Set up schema change invalidation if we have dependencies
@@ -569,6 +583,29 @@ export class Statement {
 	 * @throws QuereusError if parameter types don't match
 	 */
 	private validateParameterTypes(): void {
+		// Ensure the plan is compiled so `scalarRequiredParams` reflects the current
+		// statement (compile() is memoized — cheap when already planned).
+		this.compile();
+
+		// Reject an array/object value bound to a parameter that is used as a scalar
+		// comparand (`= <> < <= > >=` / `IN` / `BETWEEN` against a scalar operand).
+		// Such a binding can never match — the OBJECT storage class sorts above every
+		// scalar — so we diagnose it here at bind time rather than letting the query
+		// silently return no rows. The set is collected structurally at plan time
+		// (JSON-vs-JSON comparisons are excluded), so this never over-fires.
+		for (const key of this.scalarRequiredParams) {
+			const value = typeof key === 'string'
+				? (this.boundArgs[key] ?? this.boundArgs[`:${key}`])
+				: this.boundArgs[key];
+			if (value !== undefined && isObjectClassValue(value)) {
+				throw new QuereusError(
+					`parameter ${typeof key === 'number' ? `?${key}` : `:${key}`} ` +
+					`bound to an array/object value but used in a scalar comparison`,
+					StatusCode.MISMATCH
+				);
+			}
+		}
+
 		if (!this.parameterTypes) return; // No parameter types established yet
 
 		for (const [key, expectedType] of this.parameterTypes.entries()) {

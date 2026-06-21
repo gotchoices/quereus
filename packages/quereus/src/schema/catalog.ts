@@ -8,6 +8,7 @@ import { createTableToString, createViewToString, createMaterializedViewToString
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
+import { ENGINE_MANAGED_TABLE_TAG } from './reserved-tags.js';
 
 /**
  * Represents a catalog snapshot of the current database schema state
@@ -136,6 +137,22 @@ function isAutoConstraintName(name: string): boolean {
 }
 
 /**
+ * True when a table is **engine-managed** — a relation the engine (or an
+ * engine-driven module) synthesizes and owns, marked with the reserved
+ * `quereus.engine_managed = true` tag. Such a table is excluded from the catalog
+ * entirely (see {@link collectSchemaCatalog}), so the declarative differ never
+ * emits a create/drop for it and `export_schema` omits it — while it stays
+ * resolvable via `getTable` / `getAllTables` for every other path. The motivating
+ * case is Lamina's lens basis layer, whose per-column `(rowId, value)` member
+ * relations register into the basis scope's `Schema`; without this exclusion a
+ * bare in-place `apply schema <basis>` would diff them as orphan tables and drop
+ * each. Sibling of the implicit-covering-index exclusion (`CatalogIndex.implicit`).
+ */
+function isEngineManagedTable(tableSchema: TableSchema): boolean {
+	return tableSchema.tags?.[ENGINE_MANAGED_TABLE_TAG] === true;
+}
+
+/**
  * Collects current schema state from the database into a catalog representation
  */
 export function collectSchemaCatalog(db: Database, schemaName: string = 'main'): SchemaCatalog {
@@ -165,6 +182,14 @@ export function collectSchemaCatalog(db: Database, schemaName: string = 'main'):
 	// backing detail, not differ-managed objects. (Check maintained BEFORE isView:
 	// a maintained table may legacy-carry isView.)
 	for (const tableSchema of schema.getAllTables()) {
+		// Engine-managed tables (e.g. Lamina's per-column `(rowId, value)` basis
+		// member relations) are excluded from the catalog UNCONDITIONALLY — before
+		// the maintained / isView branches — so the declarative differ never sees
+		// them as orphans to drop nor as objects to create, and `export_schema`
+		// omits them. They remain resolvable via `getTable` / `getAllTables` for
+		// compile / introspection / servicing. Sibling of the implicit-covering-index
+		// exclusion (see `CatalogIndex.implicit`).
+		if (isEngineManagedTable(tableSchema)) continue;
 		if (isMaintainedTable(tableSchema)) {
 			tables.push(tableSchemaToCatalog(tableSchema, db));
 			continue;

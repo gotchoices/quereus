@@ -1077,10 +1077,13 @@ function literalFromValue(scope: Scope, value: SqlValue): LiteralNode {
  *
  * NOTE (array-valued scalar param): binding `in (?)` with an *array* value (params
  * `[[1,2]]`) is not IN-list expansion — the engine has no such concept. The seek key
- * is the parameter expression, so at runtime the array compares unequal to every
- * scalar column value and the predicate matches *nothing* (previously it match-alled).
- * Rejecting an array-bound scalar param at bind time is tracked separately; see the
- * `quereus-reject-array-valued-scalar-param` backlog ticket.
+ * is the parameter expression, so at runtime the array would compare unequal to every
+ * scalar column value and the predicate would match *nothing*. This is now rejected
+ * at bind time: the parameter is recognized as a scalar comparand on the *logical*
+ * plan (before this rule folds the comparison into a seek) by
+ * `collectScalarRequiredParams` (`planner/analysis/scalar-param-usage.ts`), and
+ * `Statement.validateParameterTypes` throws `StatusCode.MISMATCH` when such a
+ * parameter is bound to an array/object value.
  */
 function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint): ScalarPlanNode {
 	if (c.op === 'IN' && Array.isArray(c.valueExpr) && c.valueExpr.length === 1) {

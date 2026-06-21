@@ -106,6 +106,30 @@ export const SYNC_REPLICATE_TAG = 'quereus.sync.replicate';
 export const SYNC_EVICT_TAG = 'quereus.sync.evict';
 
 /**
+ * The per-table engine-managed marker.
+ * `= true` declares this physical table is a relation the ENGINE (or an
+ * engine-driven module) synthesizes and owns — not a user-declared object a
+ * declarative schema can address. {@link collectSchemaCatalog} skips an
+ * engine-managed table entirely, so the declarative differ never sees it as an
+ * orphan to drop (nor as a declared object to create) and `export_schema` omits
+ * it; it stays fully resolvable via `getTable` / `getAllTables` for every other
+ * path (compile, introspection, servicing).
+ *
+ * The motivating producer is Lamina's lens basis layer: each per-column cell
+ * store is exposed as a real `(rowId, value)` basis relation registered into the
+ * basis scope's `Schema` (so the lens compiler's `resolveBasisRelation` finds
+ * it). Without this marker a bare in-place `apply schema <basis>` would diff those
+ * member relations as orphan tables and emit a `DROP TABLE` for each. This is the
+ * engine-managed-table sibling of `quereus.expose_implicit_index`'s
+ * implicit-covering-index exclusion — both keep an engine-synthesized backing out
+ * of the user-visible declarative diff. Boolean (consumers read `=== true`),
+ * default absent (an ordinary differ-managed table). Exported so a producing
+ * module (e.g. `lamina-quereus`) stamps off this single constant rather than
+ * re-spelling the literal.
+ */
+export const ENGINE_MANAGED_TABLE_TAG = 'quereus.engine_managed';
+
+/**
  * The shape a reserved tag's value must satisfy. Validation here is purely
  * structural — e.g. a `'string'` value must be TEXT; what the text *means* is
  * the consuming ticket's concern, not this registry's.
@@ -201,6 +225,25 @@ const RESERVED_TAG_SPECS: ReservedTagSpec[] = [
 		sites: siteSet('physical-constraint'),
 		valueSchema: 'boolean',
 		description: 'Surface a UNIQUE constraint\'s implicit covering structure in the catalog / export_schema (boolean; default hidden).',
+	},
+	// --- quereus.engine_managed : engine-synthesized physical table excluded from the declarative diff ---
+	// `= true` marks a physical table the engine (or an engine-driven module) owns
+	// rather than a user-declared object. `collectSchemaCatalog` skips it entirely,
+	// so the declarative differ never emits a create/drop for it and `export_schema`
+	// omits it; it stays resolvable via `getTable` / `getAllTables` everywhere else.
+	// The motivating producer is Lamina's lens basis layer — its per-column
+	// `(rowId, value)` member relations register into the basis scope's Schema, and
+	// without this marker a bare in-place `apply schema <basis>` would diff them as
+	// orphan tables and drop each. Sibling of `quereus.expose_implicit_index` (the
+	// implicit-covering-index exclusion). Physical-table site only (it governs a
+	// physical backing, not a lens column or constraint). First-class spec rather
+	// than a catalog-local string so a typo fails loudly on every tag-validation
+	// path, the same posture the rest of the namespace has.
+	{
+		key: ENGINE_MANAGED_TABLE_TAG,
+		sites: siteSet('physical-table'),
+		valueSchema: 'boolean',
+		description: 'Mark a physical table as engine-synthesized/owned; excluded from the declarative diff and export_schema (boolean; default absent).',
 	},
 	// --- quereus.sync.replicate : per-table maintenance-write change-log opt-in ---
 	// docs/migration.md § Synced vs. local derived tables. `= true` records a
@@ -625,7 +668,7 @@ function unknownReservedTag(key: string, site: TagSite): TagDiagnostic {
 		key,
 		site,
 		message: `Unknown reserved tag ${formatValue(key)} on ${siteLabel(site)}: no such key in the reserved 'quereus.*' namespace`,
-		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.sync.replicate, quereus.sync.evict, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
+		suggestion: `Recognized keys: quereus.{id, previous_name}, quereus.expose_implicit_index, quereus.engine_managed, quereus.sync.replicate, quereus.sync.evict, quereus.lens.ack.<code>, quereus.lens.access.<col>, quereus.lens.writable, quereus.lens.policy.{error-on, require-ack}, quereus.lens.decomp.{logical,role,anchor,member,presence,keykind,key}.<id>, quereus.lens.decomp.{col,pivot}.<id>.<...>`,
 	};
 }
 

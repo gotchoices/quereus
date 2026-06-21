@@ -40,6 +40,33 @@ describe('Schema Catalog', () => {
 			expect(table!.columns[1].name).to.equal('name');
 		});
 
+		it('excludes an engine-managed table (quereus.engine_managed = true) from the catalog', async () => {
+			await db.exec('CREATE TABLE plain_t (id INTEGER PRIMARY KEY, name TEXT)');
+			await db.exec(
+				'CREATE TABLE managed_t (id INTEGER PRIMARY KEY, v INTEGER) WITH TAGS ("quereus.engine_managed" = true)',
+			);
+
+			const catalog = collectSchemaCatalog(db, 'main');
+			// The plain table is present; the engine-managed table is skipped entirely,
+			// so the declarative differ never sees it as an orphan to drop / an object to
+			// create, and export_schema omits it. (Motivating case: Lamina's per-column
+			// `(rowId, value)` basis member relations.)
+			expect(catalog.tables.find(t => t.name === 'plain_t'), 'plain table present').to.exist;
+			expect(catalog.tables.find(t => t.name === 'managed_t'), 'engine-managed table excluded').to.not.exist;
+			// Yet it stays fully resolvable in the live Schema for every other path.
+			expect(db.schemaManager.getSchema('main')!.getTable('managed_t'), 'still resolvable via getTable').to.exist;
+		});
+
+		it('keeps a table with engine_managed = false (or absent) in the catalog', async () => {
+			// The exclusion is strict `=== true`; a false / absent value is an ordinary
+			// differ-managed table.
+			await db.exec(
+				'CREATE TABLE not_managed_t (id INTEGER PRIMARY KEY) WITH TAGS ("quereus.engine_managed" = false)',
+			);
+			const catalog = collectSchemaCatalog(db, 'main');
+			expect(catalog.tables.find(t => t.name === 'not_managed_t'), 'engine_managed=false → present').to.exist;
+		});
+
 		it('should collect tables with composite primary keys', async () => {
 			await db.exec('CREATE TABLE comp_pk (a INTEGER, b TEXT, c REAL, PRIMARY KEY (a, b))');
 

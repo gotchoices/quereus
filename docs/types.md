@@ -775,6 +775,7 @@ Parameter type validation ensures type safety across executions:
 - **Flexible logical types**: Different logical types with the same physical type are compatible (e.g., `number` and `bigint` both work for INTEGER physical type)
 - **No implicit conversion**: Physical type mismatches are rejected with clear error messages
 - **Explicit conversion**: Use conversion functions like `integer()`, `real()`, `text()`, `date()`, etc. in your SQL to convert between types
+- **Array/object scalar guard**: A parameter used directly (through `CAST`s) as a comparand in a scalar comparison (`= <> < <= > >=`, `IN`, `BETWEEN`) against a non-object scalar operand may not be bound to a JS array or plain object. The OBJECT storage class sorts above every scalar, so such a binding could never match — instead of silently returning no rows it throws `StatusCode.MISMATCH` at bind time (e.g. `where id = ?` with `[[1, 2]]`). JSON-vs-JSON comparisons (`jsoncol = :p`), function arguments (`json_array_length(?)`), projections (`select ? as v`), and storing into a JSON column are never flagged. Collected by `src/planner/analysis/scalar-param-usage.ts` from the logical plan.
 
 **Examples of physical type compatibility:**
 - INTEGER physical type accepts: `number` (integer), `bigint`

@@ -281,6 +281,16 @@ export function compareSqlValuesFast(a: SqlValue, b: SqlValue, collationFunc: Co
 }
 
 /**
+ * True when a {@link SqlValue} is a non-scalar JSON value — a JS array or plain
+ * object (StorageClass.OBJECT). BLOBs (`Uint8Array`) and `null` are scalars/NULL
+ * here, not object-class. Used by the bind-time array-valued-scalar-parameter
+ * guard ({@link import('../core/statement.js').Statement.validateParameterTypes}).
+ */
+export function isObjectClassValue(v: SqlValue): boolean {
+	return typeof v === 'object' && v !== null && !(v instanceof Uint8Array);
+}
+
+/**
  * Direction flags for optimized comparisons (avoids string comparison in hot path)
  */
 export const enum SortDirection {
