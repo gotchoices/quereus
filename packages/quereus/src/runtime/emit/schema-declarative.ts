@@ -23,6 +23,18 @@ function uint8ArrayToHex(bytes: Uint8Array): string {
 	return hex;
 }
 
+/** Render a seed value as a SQL literal for a generated INSERT statement. */
+function formatSeedValue(v: SqlValue): string {
+	return (
+		v === null ? 'NULL' :
+		typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` :
+		typeof v === 'number' || typeof v === 'bigint' ? String(v) :
+		typeof v === 'boolean' ? (v ? '1' : '0') :
+		v instanceof Uint8Array ? `X'${uint8ArrayToHex(v)}'` :
+		'NULL'
+	);
+}
+
 export function emitDeclareSchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
 	const declareStmt = (plan as unknown as { statementAst: AST.DeclareSchemaStmt }).statementAst;
 
@@ -219,35 +231,42 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 			await runBatchedMigrationLoop(rctx.db, schemaName, migrationStatements);
 		}
 
-		// Apply seed data if requested
+		// Apply seed data if requested.
+		//
+		// Seed application is idempotent: each row is written with
+		// `INSERT OR REPLACE`, so re-applying a schema whose tables were already
+		// created and seeded in a prior `Database` — and whose in-memory catalog
+		// was NOT rehydrated on reopen (the row data lives in a host-backed vtab,
+		// not the ephemeral catalog) — upserts the seed rows instead of colliding
+		// on their primary keys.
+		//
+		// Why not the old `DELETE FROM <tbl>`-then-`INSERT`? A `DELETE` is a
+		// query-plan full scan routed through the host's snapshot resolver at
+		// `asOf(ep.startedAt)` — an HLC sampled BEFORE the schema-batch fact-group
+		// commit, at which point a freshly-created table does not yet exist in the
+		// fact log → fault. (The old code skipped the DELETE only when it could
+		// detect the table as freshly created, via the ephemeral catalog — a
+		// signal that is empty on a non-rehydrated reopen, so a persisted table is
+		// misclassified as fresh, the wipe is skipped, and the bare INSERTs
+		// collide with the persisted rows: the reopen PK-collision bug.)
+		//
+		// `INSERT OR REPLACE` never scans. Its conflict resolution is a point-key
+		// probe against the live overlay / effective image, which reads pending
+		// writes from the current transaction — including the `CREATE TABLE` just
+		// applied in this same schema batch. So a fresh-table probe sees the table
+		// and finds no conflicting row, rather than resolving a historical snapshot
+		// that predates it. This is the standard vtab `update()` write-path
+		// contract, not a store-specific quirk.
+		//
+		// Semantics: seed PKs are upserted (seed values win on conflict) and any
+		// non-seed rows are left in place — a reopen must not destroy user data.
+		// This differs from the old DELETE-then-INSERT, which fully reset the table
+		// to exactly the seed rows; no spec test pinned that full-reset behavior.
 		if (applyStmt.withSeed) {
 			const allSeedData = rctx.db.declaredSchemaManager.getAllSeedData(schemaName);
 			log('Seed data available for %d tables', allSeedData.size);
-			// Identify tables freshly created by this apply (declared but not
-			// in the pre-apply catalog). For those, skip the `DELETE FROM <tbl>`
-			// wipe: the table is structurally empty by construction, and the
-			// DELETE's scan would route through the host's snapshot resolver at
-			// `asOf(ep.startedAt)` — an HLC sampled BEFORE the schema-batch
-			// fact-group commit, at which point the new table did not yet
-			// exist in the fact log. Pre-existing tables retain the wipe-then-
-			// reseed semantics.
-			// Both sides of the comparison are lower-cased: `actualCatalog`
-			// table names come from the live catalog (case as declared by
-			// DDL), and `getAllSeedData` keys seed rows by `tableName.toLowerCase()`
-			// (see DeclaredSchemaManager.setSeedData). Normalising here keeps
-			// the lookup symmetric regardless of how the declared schema
-			// cased its table identifiers.
-			const preApplyTableNames = new Set(actualCatalog.tables.map(t => t.name.toLowerCase()));
-			const freshlyCreatedTables = new Set<string>();
-			for (const item of declaredSchema.items) {
-				if (item.type === 'declaredTable') {
-					const lowerName = item.tableStmt.table.name.toLowerCase();
-					if (!preApplyTableNames.has(lowerName)) {
-						freshlyCreatedTables.add(lowerName);
-					}
-				}
-			}
 			for (const [tableName, rows] of allSeedData) {
+				if (rows.length === 0) continue;
 				log('Applying seed data to %s.%s (%d rows)', schemaName, tableName, rows.length);
 
 				// Qualify table name with schema if not main
@@ -255,33 +274,21 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 					? `${schemaName}.${tableName}`
 					: tableName;
 
-				const isFreshlyCreated = freshlyCreatedTables.has(tableName.toLowerCase());
-				// Delete existing rows (only when the table pre-existed), then
-				// insert seed rows in one batch.
-				const deleteAndInsertSql = [
-					...(isFreshlyCreated ? [] : [`DELETE FROM ${qualifiedTableName}`]),
-					...rows.map(row => {
-						const values = row.map(v =>
-							v === null ? 'NULL' :
-							typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` :
-							typeof v === 'number' || typeof v === 'bigint' ? String(v) :
-							typeof v === 'boolean' ? (v ? '1' : '0') :
-							v instanceof Uint8Array ? `X'${uint8ArrayToHex(v)}'` :
-							'NULL'
-						).join(', ');
-						return `INSERT INTO ${qualifiedTableName} VALUES (${values})`;
-					})
-				].join('; ');
+				// One idempotent upsert per seed row, batched in a single exec.
+				const seedSql = rows.map(row => {
+					const values = row.map(formatSeedValue).join(', ');
+					return `INSERT OR REPLACE INTO ${qualifiedTableName} VALUES (${values})`;
+				}).join('; ');
 
-				log('Executing seed SQL (length=%d): %s', deleteAndInsertSql.length, deleteAndInsertSql);
+				log('Executing seed SQL (length=%d): %s', seedSql.length, seedSql);
 				try {
-					await rctx.db._execWithinTransaction(deleteAndInsertSql);
+					await rctx.db._execWithinTransaction(seedSql);
 					log('Seed application succeeded for table %s', tableName);
 				} catch (e) {
 					log('Seed application failed for table %s: %O', tableName, e);
 					const errorMessage = e instanceof Error ? e.message : String(e);
 					throw new QuereusError(
-						`Failed to apply seed data for table ${tableName}. SQL: ${deleteAndInsertSql}\nError: ${errorMessage}`,
+						`Failed to apply seed data for table ${tableName}. SQL: ${seedSql}\nError: ${errorMessage}`,
 						StatusCode.ERROR,
 						e instanceof Error ? e : undefined
 					);

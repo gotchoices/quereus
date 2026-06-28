@@ -736,9 +736,10 @@ If `beginSchemaBatch` itself throws, already-started modules receive `endSchemaB
 
 Declared schemas can include seed data (`seed <tableName> values ...`). When `apply schema ... with seed` is executed:
 
-1. Existing rows in each seeded table are deleted (`DELETE FROM`)
-2. Declared seed rows are inserted
-3. This happens per-table, after all structural migrations complete (and after `endSchemaBatch` has fired)
+1. Each declared seed row is written with `INSERT OR REPLACE` — the application is **idempotent**: re-applying a schema whose tables already hold their seed rows upserts the seed PKs (seed values win) rather than colliding on them. Non-seed rows are left in place, so a reopen never destroys user data.
+2. This happens per-table, after all structural migrations complete (and after `endSchemaBatch` has fired).
+
+> **Why upsert, not wipe-then-reseed?** The earlier implementation ran `DELETE FROM <tbl>` before the inserts, skipping the wipe only when it could detect the table as freshly created by diffing against the in-memory catalog. On a reopen where that catalog was not rehydrated (host-backed row data lives outside the ephemeral catalog), an already-seeded table was misclassified as fresh, the wipe was skipped, and bare `INSERT`s collided with the persisted rows (`UNIQUE constraint failed: <table> PK`). `INSERT OR REPLACE` removes the heuristic entirely: its conflict resolution is a point-key probe against the live/pending image (not a `DELETE` full-scan routed through the host's `asOf` read-snapshot), so a fresh table created in the same schema batch is seen by the probe and a persisted table upserts cleanly. One behavioral consequence: `OR REPLACE` is delete-then-insert on a conflicting row, so re-seeding a parent referenced by `ON DELETE CASCADE` children fires that cascade even when the replaced values are unchanged.
 
 ### Schema Hashing
 

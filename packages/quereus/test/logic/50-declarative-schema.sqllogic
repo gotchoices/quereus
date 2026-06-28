@@ -1297,3 +1297,55 @@ diff schema main;
 
 drop table mvr_mv;
 drop table mvr_t;
+
+-- ===================================================================
+-- Seed application is idempotent (ticket
+-- declarative-seed-reopen-pk-collision). Re-applying `apply schema …
+-- with seed` over a table that already holds its seed rows must UPSERT
+-- (INSERT OR REPLACE per row) rather than collide on the seed PKs.
+-- The store package covers the reopen-without-rehydrate crash directly;
+-- this memory-backed case pins the in-engine SEMANTICS: the second apply
+-- re-asserts the seed values AND preserves a non-seed user row (the
+-- documented change from the old DELETE-then-INSERT full reset).
+-- ===================================================================
+
+declare schema decl_seed_idem using (default_vtab_module = 'memory') {
+	table meta {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+
+	seed meta (
+		(1, 'AllSite'),
+		(2, 'Other')
+	)
+}
+
+-- run
+
+-- First apply seeds the freshly-created table.
+apply schema decl_seed_idem with seed;
+
+-- run
+
+select id, name from decl_seed_idem.meta order by id;
+→ [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Other"}]
+
+-- A user adds a non-seed row and edits a seeded row.
+insert into decl_seed_idem.meta values (3, 'UserAdded');
+update decl_seed_idem.meta set name = 'Edited' where id = 2;
+select id, name from decl_seed_idem.meta order by id;
+→ [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Edited"}, {"id": 3, "name": "UserAdded"}]
+
+-- Re-apply the SAME schema with seed: no DDL diff, but the seed re-runs.
+-- Previously this DELETE-then-INSERT-wiped the table (losing id=3); now it
+-- upserts — the seed PKs are re-asserted to their declared values and the
+-- non-seed row survives.
+apply schema decl_seed_idem with seed;
+
+-- run
+
+select id, name from decl_seed_idem.meta order by id;
+→ [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Other"}, {"id": 3, "name": "UserAdded"}]
+
+drop table decl_seed_idem.meta;
