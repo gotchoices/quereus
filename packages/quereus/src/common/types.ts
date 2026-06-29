@@ -39,6 +39,19 @@ export type OutputValue = MaybePromise<RuntimeValue>;
 export type SqlParameters = Record<string, SqlValue> | SqlValue[];
 
 /**
+ * Per-call options for statement execution (`Database.exec`, `Database.eval`).
+ */
+export interface StatementOptions {
+	/**
+	 * Cooperative cancellation. When the signal aborts, in-flight execution is
+	 * interrupted at the next row or statement boundary and the call rejects with
+	 * an `AbortError`. A signal that is already aborted causes an immediate reject
+	 * before any work is performed.
+	 */
+	signal?: AbortSignal;
+}
+
+/**
  * Standard status/error codes that significantly match SQLite.
  * Used for error handling and determining operation results.
  */

@@ -15,10 +15,10 @@ export { Table } from './core/table-handle.js';
 
 // Common data types and constants
 export { StatusCode, SqlDataType } from './common/types.js';
-export type { SqlValue, JsonSqlValue, SqlParameters, Row, MaybePromise, RowOp, ConstraintType, UpdateResult } from './common/types.js';
+export type { SqlValue, JsonSqlValue, SqlParameters, StatementOptions, Row, MaybePromise, RowOp, ConstraintType, UpdateResult } from './common/types.js';
 export { isUpdateOk, isConstraintViolation, isSqlValue } from './common/types.js';
 export { ConflictResolution, IndexConstraintOp, VTabConfig, FunctionFlags } from './common/constants.js';
-export { QuereusError, MisuseError, ConstraintError, unwrapError, formatErrorChain, getPrimaryError } from './common/errors.js';
+export { QuereusError, MisuseError, ConstraintError, AbortError, throwIfAborted, unwrapError, formatErrorChain, getPrimaryError } from './common/errors.js';
 export type { ErrorInfo } from './common/errors.js';
 
 // Virtual Table API

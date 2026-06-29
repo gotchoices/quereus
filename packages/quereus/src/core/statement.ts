@@ -1,6 +1,6 @@
 import { createLogger } from '../common/logger.js';
 import { type SqlValue, StatusCode, type Row, type SqlParameters, type DeepReadonly, isSqlValue, describeSqlValueViolation } from '../common/types.js';
-import { MisuseError, QuereusError } from '../common/errors.js';
+import { MisuseError, QuereusError, throwIfAborted } from '../common/errors.js';
 import type { Database } from './database.js';
 import { isRelationType, type ColumnDef, type ScalarType } from '../common/datatype.js';
 import { Parser } from '../parser/parser.js';
@@ -300,10 +300,14 @@ export class Statement {
 		runtimeOverrides?: {
 			tracer?: InstructionTracer;
 			enableMetrics?: boolean;
+			signal?: AbortSignal;
 		}
 	): AsyncIterable<Row> {
 		this.validateStatement("iterate rows for");
 		if (this.busy) throw new MisuseError("Statement busy, another iteration may be in progress or reset needed.");
+
+		// Pre-flight cancellation: reject immediately on an already-aborted signal.
+		throwIfAborted(runtimeOverrides?.signal);
 
 		if (params) this.bindAll(params);
 
@@ -320,6 +324,7 @@ export class Statement {
 			const scheduler = new Scheduler(rootInstruction);
 			const tracer = runtimeOverrides?.tracer ?? this.db.getInstructionTracer();
 			const enableMetrics = runtimeOverrides?.enableMetrics ?? Boolean(this.db.getOption('runtime_metrics'));
+			const signal = runtimeOverrides?.signal;
 			const runtimeCtx: RuntimeContext = {
 				db: this.db,
 				stmt: this,
@@ -328,6 +333,7 @@ export class Statement {
 				tableContexts: wrapTableContextsStrict(new Map()),
 				tracer,
 				enableMetrics,
+				signal,
 			};
 
 			const results = await scheduler.run(runtimeCtx);
@@ -335,10 +341,10 @@ export class Statement {
 				if (Array.isArray(results) && results.length) {
 					const lastStatementOutput = results[results.length - 1];
 					if (isAsyncIterable(lastStatementOutput)) {
-						yield* lastStatementOutput as AsyncIterable<Row>;
+						yield* this._iterateWithSignal(lastStatementOutput as AsyncIterable<Row>, signal);
 					}
 				} else if (isAsyncIterable(results)) {
-					yield* results as AsyncIterable<Row>;
+					yield* this._iterateWithSignal(results as AsyncIterable<Row>, signal);
 				}
 			}
 		} catch (e) {
@@ -351,9 +357,26 @@ export class Statement {
 		}
 	}
 
+	/**
+	 * Re-yields a row stream while honoring a cancellation signal at every row
+	 * boundary. Covers output stages with no underlying table scan (e.g. `values`,
+	 * recursive CTEs) that the scan-leaf checkpoint cannot reach.
+	 * @internal
+	 */
+	private async *_iterateWithSignal(source: AsyncIterable<Row>, signal?: AbortSignal): AsyncIterable<Row> {
+		if (!signal) {
+			yield* source;
+			return;
+		}
+		for await (const row of source) {
+			throwIfAborted(signal);
+			yield row;
+		}
+	}
+
 	/** @internal Low-level row iteration without overrides. */
-	async *_iterateRowsRaw(params?: SqlParameters | SqlValue[]): AsyncIterable<Row> {
-		yield* this._iterateRowsRawInternal(params);
+	async *_iterateRowsRaw(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncIterable<Row> {
+		yield* this._iterateRowsRawInternal(params, { signal });
 	}
 
 	/**

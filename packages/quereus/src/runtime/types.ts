@@ -26,6 +26,13 @@ export type RuntimeContext = {
 	/** Whether to collect runtime execution metrics */
 	enableMetrics: boolean;
 	/**
+	 * Cooperative cancellation signal for the current statement, if the caller
+	 * supplied one via `exec`/`eval` options. Honored at row and statement
+	 * boundaries (notably the table-scan leaf) so a long-running query can be
+	 * interrupted — e.g. on a request timeout. Undefined when no signal was given.
+	 */
+	signal?: AbortSignal;
+	/**
 	 * The 1-based ordinal of the row currently being produced within the active
 	 * INSERT / mutation-context evaluation, or undefined outside one. Exposed to
 	 * the `mutation_ordinal()` builtin so a column `default` can author a per-row

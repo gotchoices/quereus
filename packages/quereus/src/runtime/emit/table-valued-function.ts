@@ -15,6 +15,17 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 
 	// Create row descriptor for function output attributes
 	const rowDescriptor = buildRowDescriptor(plan.getAttributes());
+	const declaredColumnCount = plan.getAttributes().length;
+
+	// Normalize yielded rows to the declared column count: pad short rows with null,
+	// truncate over-wide rows. Keeps positional access (ArrayIndex) consistent with
+	// the declared schema regardless of what the TVF implementation actually yields.
+	const normalizeRow = (row: Row): Row =>
+		row.length === declaredColumnCount
+			? row
+			: row.length < declaredColumnCount
+				? [...row, ...new Array(declaredColumnCount - row.length).fill(null)]
+				: row.slice(0, declaredColumnCount);
 
 	// Look up the function during emission and record the dependency
 	// First try exact argument count, then try variable argument function
@@ -53,8 +64,9 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			const slot = createRowSlot(innerCtx, rowDescriptor);
 			try {
 				for await (const row of iterable) {
-					slot.set(row);
-					yield row;
+					const normalized = normalizeRow(row);
+					slot.set(normalized);
+					yield normalized;
 				}
 			} finally {
 				slot.close();
@@ -96,8 +108,9 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			const slot = createRowSlot(innerCtx, rowDescriptor);
 			try {
 				for await (const row of iterable) {
-					slot.set(row);
-					yield row;
+					const normalized = normalizeRow(row);
+					slot.set(normalized);
+					yield normalized;
 				}
 			} finally {
 				slot.close();

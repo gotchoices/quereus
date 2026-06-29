@@ -1,6 +1,6 @@
 import { StatusCode, type Row, type SqlValue } from "../../common/types.js";
 import { SeqScanNode, IndexScanNode, IndexSeekNode } from "../../planner/nodes/table-access-nodes.js";
-import { QuereusError } from "../../common/errors.js";
+import { AbortError, QuereusError, throwIfAborted } from "../../common/errors.js";
 import type { VirtualTable } from "../../vtab/table.js";
 import type { BaseModuleConfig, AnyVirtualTableModule } from "../../vtab/module.js";
 import type { FilterInfo } from "../../vtab/filter-info.js";
@@ -103,11 +103,18 @@ export function emitSeqScan(
       }
 
       const asyncRowIterable = vtabInstance.query(effectiveFilterInfo);
+			throwIfAborted(runtimeCtx.signal);
 			for await (const row of asyncRowIterable) {
+				// Cooperative cancellation checkpoint: a request-timeout (or any
+				// caller abort) interrupts the scan between rows so the whole query
+				// pipeline unwinds promptly instead of draining the table.
+				throwIfAborted(runtimeCtx.signal);
 				rowSlot.set(row);
 				yield row;
 			}
 		} catch (e: unknown) {
+			// Preserve cancellation identity — don't re-wrap it as a generic query error.
+			if (e instanceof AbortError) throw e;
 			const message = e instanceof Error ? e.message : String(e);
 			throw new QuereusError(`Error during query on table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
 		} finally {

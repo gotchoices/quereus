@@ -71,6 +71,37 @@ export class RollbackConflictError extends ConstraintError {
 }
 
 /**
+ * Error thrown when an in-flight statement is cancelled via an `AbortSignal`
+ * (e.g. a request-timeout). Extends `QuereusError` (so it survives the engine's
+ * `instanceof QuereusError` re-throw paths unchanged) while exposing the web
+ * convention `name === 'AbortError'` for callers that match on that.
+ */
+export class AbortError extends QuereusError {
+	constructor(message: string = 'Operation aborted', cause?: Error) {
+		super(message, StatusCode.ABORT, cause);
+		this.name = 'AbortError';
+		Object.setPrototypeOf(this, AbortError.prototype);
+	}
+}
+
+/**
+ * Cooperative-cancellation checkpoint. Throws an {@link AbortError} when the
+ * supplied signal has already been aborted; a no-op when the signal is absent
+ * or still active. Called at row and statement boundaries during execution.
+ *
+ * The signal's `reason` (if any) is preserved: an `Error` reason becomes the
+ * thrown error's `cause`, and a string reason becomes its message.
+ */
+export function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	const reason = (signal as { reason?: unknown }).reason;
+	if (reason instanceof Error) {
+		throw new AbortError(reason.message, reason);
+	}
+	throw new AbortError(typeof reason === 'string' ? reason : 'Operation aborted');
+}
+
+/**
  * Error thrown when the API is used incorrectly
  */
 export class MisuseError extends QuereusError {

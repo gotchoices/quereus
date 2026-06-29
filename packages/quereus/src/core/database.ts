@@ -1,6 +1,6 @@
 import { createLogger } from '../common/logger.js';
-import { MisuseError, QuereusError, FailConflictError, RollbackConflictError } from '../common/errors.js';
-import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue } from '../common/types.js';
+import { MisuseError, QuereusError, FailConflictError, RollbackConflictError, throwIfAborted } from '../common/errors.js';
+import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue, type StatementOptions } from '../common/types.js';
 import type { ScalarType } from '../common/datatype.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { Statement } from './statement.js';
@@ -597,7 +597,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Executes a single AST statement. Does not manage mutex or transactions.
 	 * Used as the innermost execution primitive.
 	 */
-	private async _executeSingleStatement(statementAst: AST.Statement, params?: SqlParameters | SqlValue[]): Promise<void> {
+	private async _executeSingleStatement(statementAst: AST.Statement, params?: SqlParameters | SqlValue[], signal?: AbortSignal): Promise<void> {
+		// Pre-flight cancellation: reject before building/optimizing the plan.
+		throwIfAborted(signal);
+
 		const { plan } = this._buildPlan([statementAst], params);
 
 		if (plan.statements.length === 0) return; // No-op for this AST
@@ -623,6 +626,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			tableContexts: wrapTableContextsStrict(new Map()),
 			tracer: this.instructionTracer,
 			enableMetrics: this.options.getBooleanOption('runtime_stats'),
+			signal,
 		};
 
 		await scheduler.run(runtimeCtx);
@@ -664,12 +668,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *
 	 * @param sql The SQL string(s) to execute.
 	 * @param params Optional parameters to bind.
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before each statement and at row
+	 *   boundaries during execution).
 	 * @returns A Promise resolving when execution completes.
-	 * @throws QuereusError on failure.
+	 * @throws QuereusError on failure (an `AbortError` if the signal fired).
 	 */
-	async exec(sql: string, params?: SqlParameters): Promise<void> {
+	async exec(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<void> {
 		this.checkOpen();
 		log('Executing SQL block: %s', sql);
+
+		const signal = options?.signal;
+		// Pre-flight cancellation before acquiring the mutex / parsing.
+		throwIfAborted(signal);
 
 		const batch = this._parseSql(sql);
 		if (batch.length === 0) return;
@@ -683,7 +694,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			// statements that follow a mid-batch `BEGIN`.
 			for (const statementAst of batch) {
 				try {
-					await this._executeSingleStatement(statementAst, params);
+					await this._executeSingleStatement(statementAst, params, signal);
 					if (this.transactionManager.isImplicitTransaction()) {
 						await this._commitTransaction();
 					}
@@ -1557,10 +1568,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *
 	 * @param sql The SQL query string to execute.
 	 * @param params Optional parameters to bind (array for positional, object for named).
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked at row boundaries so iteration can be
+	 *   interrupted on a request timeout).
 	 * @yields Each result row as an object (`Record<string, SqlValue>`).
 	 * @returns An `AsyncIterableIterator` yielding result rows.
 	 * @throws MisuseError if the database is closed.
-	 * @throws QuereusError on prepare/bind/execution errors.
+	 * @throws QuereusError on prepare/bind/execution errors (an `AbortError` if the signal fired).
 	 *
 	 * @example
 	 * ```typescript
@@ -1573,8 +1587,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * }
 	 * ```
 	 */
-	eval(sql: string, params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Record<string, SqlValue>> {
-		return wrapAsyncIterator(this._evalGenerator(sql, params), (commit, error) =>
+	eval(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Record<string, SqlValue>> {
+		return wrapAsyncIterator(this._evalGenerator(sql, params, options?.signal), (commit, error) =>
 			this._finalizeImplicitTransaction(commit, error)
 		);
 	}
@@ -1584,8 +1598,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Transaction finalization is handled by the wrapper returned by eval().
 	 * @internal
 	 */
-	private async *_evalGenerator(sql: string, params?: SqlParameters | SqlValue[]): AsyncGenerator<Record<string, SqlValue>> {
+	private async *_evalGenerator(sql: string, params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
 		this.checkOpen();
+		// Pre-flight cancellation before acquiring the mutex / preparing.
+		throwIfAborted(signal);
 
 		const releaseMutex = await this._acquireExecMutex();
 		let stmt: Statement | null = null;
@@ -1601,14 +1617,14 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				// Multi-statement batch: execute all but the last statement,
 				// then yield results from the last statement
 				for (let i = 0; i < stmt.astBatch.length - 1; i++) {
-					await this._executeSingleStatement(stmt.astBatch[i], params);
+					await this._executeSingleStatement(stmt.astBatch[i], params, signal);
 				}
 
 				const lastStmt = new Statement(this, [stmt.astBatch[stmt.astBatch.length - 1]]);
 				this.statements.add(lastStmt);
 				try {
 					const names = lastStmt.getColumnNames();
-					for await (const row of lastStmt._iterateRowsRaw(params)) {
+					for await (const row of lastStmt._iterateRowsRaw(params, signal)) {
 						yield rowToObject(row, names);
 					}
 				} finally {
@@ -1616,7 +1632,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				}
 			} else {
 				const names = stmt.getColumnNames();
-				for await (const row of stmt._iterateRowsRaw(params)) {
+				for await (const row of stmt._iterateRowsRaw(params, signal)) {
 					yield rowToObject(row, names);
 				}
 			}
