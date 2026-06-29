@@ -159,23 +159,22 @@ describe('declarative seed: reopen idempotency (store)', () => {
 		await db2.close();
 	});
 
-	// (d) Upsert semantics: a re-apply with seed on a table that already holds BOTH
-	// seed rows and a non-seed user row leaves the user row in place (the documented
-	// behavior change from the old full-reset DELETE-then-INSERT — a reopen must not
-	// destroy user data). The seed PKs are upserted to their declared values.
-	it('preserves a non-seed user row across a reopen reseed (upsert, not full reset)', async () => {
+	// (d) OR IGNORE semantics: a re-apply with seed on a table that already holds BOTH
+	// seed rows and a non-seed user row leaves all existing rows intact — both the
+	// user-added row and the user-edited seed row are preserved unchanged.
+	it('preserves user edits and non-seed rows across a reopen reseed (OR IGNORE)', async () => {
 		const { db: db1, mod: mod1 } = await open(true);
 		// A user adds a row beyond the seed set, and mutates a seeded row.
 		await db1.exec(`insert into tablemetadata values (3, 'UserAdded')`);
 		await db1.exec(`update tablemetadata set name = 'Edited' where id = 2`);
 		await mod1.whenCatalogPersisted();
 
-		// Reopen (no rehydrate) and re-seed: the seed rows are upserted back to their
-		// declared values; the user-added row (id=3) survives untouched.
+		// Reopen (no rehydrate) and re-seed: OR IGNORE skips existing PKs, so both
+		// the user edit (id=2) and the user-added row (id=3) survive unchanged.
 		const { db: db2 } = await open(true);
 		expect(await readSeedTable(db2)).to.deep.equal([
 			{ id: 1, name: 'AllSite' },
-			{ id: 2, name: 'Other' },     // seed value re-asserted over the edit
+			{ id: 2, name: 'Edited' },    // user edit preserved (OR IGNORE skips existing row)
 			{ id: 3, name: 'UserAdded' }, // non-seed row preserved
 		]);
 

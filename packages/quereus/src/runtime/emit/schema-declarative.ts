@@ -233,35 +233,20 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 
 		// Apply seed data if requested.
 		//
-		// Seed application is idempotent: each row is written with
-		// `INSERT OR REPLACE`, so re-applying a schema whose tables were already
-		// created and seeded in a prior `Database` — and whose in-memory catalog
-		// was NOT rehydrated on reopen (the row data lives in a host-backed vtab,
-		// not the ephemeral catalog) — upserts the seed rows instead of colliding
-		// on their primary keys.
+		// Seed application is idempotent: each row is written with `INSERT OR IGNORE`.
+		// An existing row (matching PK) is left completely untouched — user edits
+		// survive a reopen reseed and no ON DELETE CASCADE fires for a parent row
+		// whose values are unchanged (OR REPLACE would delete-then-insert even when
+		// the replacement values are identical, triggering cascades unnecessarily).
+		// A freshly-created table has no existing rows, so OR IGNORE inserts all seed
+		// rows on the first apply.
 		//
-		// Why not the old `DELETE FROM <tbl>`-then-`INSERT`? A `DELETE` is a
-		// query-plan full scan routed through the host's snapshot resolver at
-		// `asOf(ep.startedAt)` — an HLC sampled BEFORE the schema-batch fact-group
-		// commit, at which point a freshly-created table does not yet exist in the
-		// fact log → fault. (The old code skipped the DELETE only when it could
-		// detect the table as freshly created, via the ephemeral catalog — a
-		// signal that is empty on a non-rehydrated reopen, so a persisted table is
-		// misclassified as fresh, the wipe is skipped, and the bare INSERTs
-		// collide with the persisted rows: the reopen PK-collision bug.)
-		//
-		// `INSERT OR REPLACE` never scans. Its conflict resolution is a point-key
-		// probe against the live overlay / effective image, which reads pending
-		// writes from the current transaction — including the `CREATE TABLE` just
-		// applied in this same schema batch. So a fresh-table probe sees the table
-		// and finds no conflicting row, rather than resolving a historical snapshot
-		// that predates it. This is the standard vtab `update()` write-path
-		// contract, not a store-specific quirk.
-		//
-		// Semantics: seed PKs are upserted (seed values win on conflict) and any
-		// non-seed rows are left in place — a reopen must not destroy user data.
-		// This differs from the old DELETE-then-INSERT, which fully reset the table
-		// to exactly the seed rows; no spec test pinned that full-reset behavior.
+		// Historical note: the original implementation used DELETE-then-INSERT, then
+		// OR REPLACE. The delete path was dropped because `DELETE FROM <tbl>` routes
+		// through the host's snapshot resolver at `asOf(ep.startedAt)` and faults on
+		// a freshly-created table that predates the snapshot. OR REPLACE fixed the
+		// crash but fired ON DELETE CASCADE on every reopen for unchanged seed parents.
+		// OR IGNORE is the final form: no scan, no cascade, user edits preserved.
 		if (applyStmt.withSeed) {
 			const allSeedData = rctx.db.declaredSchemaManager.getAllSeedData(schemaName);
 			log('Seed data available for %d tables', allSeedData.size);
@@ -274,10 +259,13 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 					? `${schemaName}.${tableName}`
 					: tableName;
 
-				// One idempotent upsert per seed row, batched in a single exec.
+				// One idempotent insert per seed row, batched in a single exec.
+				// OR IGNORE: an existing row (matching PK) is left untouched, so user
+				// edits survive a reopen reseed and no ON DELETE CASCADE fires for
+				// unchanged rows.
 				const seedSql = rows.map(row => {
 					const values = row.map(formatSeedValue).join(', ');
-					return `INSERT OR REPLACE INTO ${qualifiedTableName} VALUES (${values})`;
+					return `INSERT OR IGNORE INTO ${qualifiedTableName} VALUES (${values})`;
 				}).join('; ');
 
 				log('Executing seed SQL (length=%d): %s', seedSql.length, seedSql);
