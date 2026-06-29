@@ -168,6 +168,29 @@ try {
 }
 ```
 
+#### Cancelling an In-Flight Query (`AbortSignal`)
+
+`db.eval`/`exec`/`get` and `Statement.run`/`get`/`iterateRows`/`all` accept a trailing, fully-optional options bag `{ signal }`. Aborting the signal cancels the in-flight statement cooperatively at the next yield seam: the call rejects with an `AbortError` (`instanceof QuereusError`, `code === StatusCode.ABORT`, `name === 'AbortError'`) and any implicit transaction rolls back. An already-aborted signal rejects before any work starts. Existing call sites are unaffected — omit the bag and behavior is unchanged.
+
+```typescript
+import { isAbortError } from 'quereus';
+
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 1000); // cancel if it runs too long
+
+try {
+  for await (const row of db.eval("select * from big_table", undefined, { signal: controller.signal })) {
+    // …
+  }
+} catch (err) {
+  if (isAbortError(err)) {
+    console.log("query cancelled");
+  }
+}
+```
+
+Cancellation interrupts *execution* (the row-by-row drain), not an already-started commit: an abort that races a commit is a no-op, so a cancelled write can never leave a partially-committed state. A fully-synchronous, await-free in-memory operator (e.g. an in-memory sort over an already-drained array) is uninterruptible by construction — the drain that *fills* it is interruptible, but the CPU-bound pass itself runs to completion. See [errors.md](./errors.md) for `AbortError`/`isAbortError`/`throwIfAborted`.
+
 ### Transactions
 
 Quereus supports explicit transaction control using `BEGIN`, `COMMIT`, and `ROLLBACK`. Additionally, both `db.exec()` and `statement.run()` automatically wrap their execution in implicit transactions when in autocommit mode.
