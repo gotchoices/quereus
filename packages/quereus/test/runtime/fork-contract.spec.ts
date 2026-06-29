@@ -43,6 +43,9 @@ const EXPECTED_FORK_POLICY = {
 	// Per-row INSERT/envelope ordinal: set+restored synchronously by the sequential
 	// insert path, never mutated inside a parallel fork — each child snapshots it.
 	mutationOrdinal: 'shared-frozen',
+	// Cooperative cancellation signal: shared by reference so every branch honors the
+	// same abort; the runtime only ever reads it (never mutates), so it is frozen.
+	signal: 'shared-frozen',
 	contextTracker: 'shared-sink',
 	planStack: 'shared-sink',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
@@ -174,6 +177,7 @@ describe('Fork contract (test harness)', () => {
 			parent.activeConnection = {} as unknown as RuntimeContext['activeConnection'];
 			parent.contextTracker = {} as unknown as RuntimeContext['contextTracker'];
 			parent.planStack = [];
+			parent.signal = new AbortController().signal;
 
 			const [fork] = driver.fork(parent, 1);
 
