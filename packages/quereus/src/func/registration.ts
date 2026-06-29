@@ -145,6 +145,13 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
  * Creates a function schema for a table-valued function.
  * Table-valued functions return AsyncIterable<Row> and can be used in FROM clauses.
  *
+ * Row-width contract: each yielded row is normalized to the declared
+ * `returnType.columns` width before it enters the relational pipeline — short
+ * rows are padded with SQL NULL, over-wide rows are truncated. This keeps
+ * positional access consistent with the declared schema regardless of what the
+ * implementation actually yields. A function that declares no `returnType`
+ * (empty columns) opts out of normalization (its rows are passed through as-is).
+ *
  * @param options Configuration options for the function
  * @param jsFunc The JavaScript implementation function
  * @returns A FunctionSchema ready for registration

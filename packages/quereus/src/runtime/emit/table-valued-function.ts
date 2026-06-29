@@ -20,12 +20,15 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 	// Normalize yielded rows to the declared column count: pad short rows with null,
 	// truncate over-wide rows. Keeps positional access (ArrayIndex) consistent with
 	// the declared schema regardless of what the TVF implementation actually yields.
-	const normalizeRow = (row: Row): Row =>
-		row.length === declaredColumnCount
-			? row
-			: row.length < declaredColumnCount
-				? [...row, ...new Array(declaredColumnCount - row.length).fill(null)]
-				: row.slice(0, declaredColumnCount);
+	// A TVF that declares no columns (e.g. `split_string`, registered without a
+	// `returnType`) opts out entirely — it has no positional slots to align, so
+	// truncating to zero width would silently drop the row payload.
+	const normalizeRow = (row: Row): Row => {
+		if (declaredColumnCount === 0 || row.length === declaredColumnCount) return row;
+		return row.length < declaredColumnCount
+			? [...row, ...new Array(declaredColumnCount - row.length).fill(null)]
+			: row.slice(0, declaredColumnCount);
+	};
 
 	// Look up the function during emission and record the dependency
 	// First try exact argument count, then try variable argument function
