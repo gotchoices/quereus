@@ -1348,3 +1348,60 @@ select id, name from decl_seed_idem.meta order by id;
 → [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Edited"}, {"id": 3, "name": "UserAdded"}]
 
 drop table decl_seed_idem.meta;
+
+-- ===================================================================
+-- Seed re-application must NOT fire ON DELETE CASCADE for an unchanged
+-- seed parent (ticket seed-reseed-or-replace-cascade-tradeoff). This is
+-- the headline reason the seed insert uses OR IGNORE rather than OR
+-- REPLACE: OR REPLACE is delete-then-insert on a PK conflict, so a
+-- reseed of an already-seeded parent would delete the parent row, fire
+-- ON DELETE CASCADE, and destroy child rows — even when the replacement
+-- values are identical. OR IGNORE skips the existing parent entirely
+-- (no delete), so the cascade never fires and children survive.
+-- ===================================================================
+
+pragma foreign_keys = true;
+
+declare schema decl_seed_cascade using (default_vtab_module = 'memory') {
+	table parent {
+		id INTEGER PRIMARY KEY,
+		name TEXT
+	}
+
+	table child {
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER,
+		constraint fk_parent foreign key (parent_id) references parent(id) on delete cascade
+	}
+
+	seed parent (
+		(1, 'P1')
+	)
+}
+
+-- run
+
+apply schema decl_seed_cascade with seed;
+
+-- run
+
+-- A user adds a child referencing the seeded parent.
+insert into decl_seed_cascade.child values (10, 1);
+select id, parent_id from decl_seed_cascade.child order by id;
+→ [{"id": 10, "parent_id": 1}]
+
+-- Re-apply the seed: OR IGNORE skips the already-present parent (1) with
+-- no delete, so ON DELETE CASCADE never fires and the child survives.
+apply schema decl_seed_cascade with seed;
+
+-- run
+
+select id, parent_id from decl_seed_cascade.child order by id;
+→ [{"id": 10, "parent_id": 1}]
+
+-- The seed parent is still present and unchanged.
+select id, name from decl_seed_cascade.parent order by id;
+→ [{"id": 1, "name": "P1"}]
+
+drop table decl_seed_cascade.child;
+drop table decl_seed_cascade.parent;
