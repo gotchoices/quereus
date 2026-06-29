@@ -56,3 +56,5 @@ reviewer's.
 No code is changed by filing this ticket; it captures the decision so it isn't
 lost. If the dev picks `OR IGNORE` (or value-diff), promote to `fix/` (or
 `plan/` for value-diff) with the chosen option.
+
+** Human decision **: switch to `or ignore`

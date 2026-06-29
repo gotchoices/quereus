@@ -170,7 +170,9 @@ try {
 
 #### Cancelling an In-Flight Query (`AbortSignal`)
 
-`db.eval`/`exec`/`get` and `Statement.run`/`get`/`iterateRows`/`all` accept a trailing, fully-optional options bag `{ signal }`. Aborting the signal cancels the in-flight statement cooperatively at the next yield seam: the call rejects with an `AbortError` (`instanceof QuereusError`, `code === StatusCode.ABORT`, `name === 'AbortError'`) and any implicit transaction rolls back. An already-aborted signal rejects before any work starts. Existing call sites are unaffected — omit the bag and behavior is unchanged.
+`db.exec` and `db.eval` accept a trailing, fully-optional options bag `{ signal }`. Aborting the signal cancels the in-flight statement cooperatively at the next yield seam: the call rejects with an `AbortError` (`instanceof QuereusError`, `code === StatusCode.ABORT`, `name === 'AbortError'`) and any implicit transaction rolls back. An already-aborted signal rejects before any work starts. Existing call sites are unaffected — omit the bag and behavior is unchanged.
+
+> The cancellation checkpoints currently live at the physical table-access leaf (the seq-scan / index-scan / index-seek row loop) and at the statement's output-row boundary. A statement that neither scans a table nor streams output rows (e.g. a pure-DDL or purely-computational instruction) is only checked at the pre-flight boundary, so it runs to completion once started. Extending `{ signal }` to `db.get` and the `Statement.*` methods is tracked separately.
 
 ```typescript
 import { isAbortError } from 'quereus';
@@ -189,7 +191,7 @@ try {
 }
 ```
 
-Cancellation interrupts *execution* (the row-by-row drain), not an already-started commit: an abort that races a commit is a no-op, so a cancelled write can never leave a partially-committed state. A fully-synchronous, await-free in-memory operator (e.g. an in-memory sort over an already-drained array) is uninterruptible by construction — the drain that *fills* it is interruptible, but the CPU-bound pass itself runs to completion. See [errors.md](./errors.md) for `AbortError`/`isAbortError`/`throwIfAborted`.
+Cancellation interrupts *execution* (the row-by-row drain), not an already-started commit: an abort that races a commit is a no-op, so a cancelled write can never leave a partially-committed state. A fully-synchronous, await-free in-memory operator (e.g. an in-memory sort over an already-drained array) is uninterruptible by construction — the drain that *fills* it is interruptible, but the CPU-bound pass itself runs to completion. See [errors.md](./errors.md) for `AbortError` / `isAbortError` / `throwIfAborted`.
 
 ### Transactions
 

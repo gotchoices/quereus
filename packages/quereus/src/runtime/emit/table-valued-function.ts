@@ -1,6 +1,6 @@
 import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
 import { emitPlanNode, createValidatedInstruction } from '../emitters.js';
-import { QuereusError } from '../../common/errors.js';
+import { AbortError, QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
 import type { FunctionSchema, IntegratedTableValuedFunc, TableValuedFunc } from '../../schema/function.js';
 import { isTableValuedFunctionSchema } from '../../schema/function.js';
@@ -75,6 +75,8 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 				slot.close();
 			}
 		} catch (error: unknown) {
+			// Preserve cancellation identity — don't re-wrap an abort as a generic TVF error.
+			if (error instanceof AbortError) throw error;
 			const message = error instanceof Error ? error.message : String(error);
 			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}
@@ -119,6 +121,8 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 				slot.close();
 			}
 		} catch (error: unknown) {
+			// Preserve cancellation identity — don't re-wrap an abort as a generic TVF error.
+			if (error instanceof AbortError) throw error;
 			const message = error instanceof Error ? error.message : String(error);
 			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}

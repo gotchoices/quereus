@@ -15,8 +15,9 @@
 
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
-import { AbortError, QuereusError } from '../src/common/errors.js';
-import { StatusCode, type SqlValue } from '../src/common/types.js';
+import { AbortError, QuereusError, isAbortError } from '../src/common/errors.js';
+import { createTableValuedFunction } from '../src/func/registration.js';
+import { StatusCode, type Row, type SqlValue } from '../src/common/types.js';
 
 describe('exec/eval AbortSignal cancellation', () => {
 	let db: Database;
@@ -142,5 +143,52 @@ describe('exec/eval AbortSignal cancellation', () => {
 		const ids: number[] = [];
 		for await (const row of db.eval('select id from t order by id')) ids.push(row.id as number);
 		expect(ids).to.deep.equal([1, 2, 3, 4, 5, 6]);
+	});
+
+	it('preserves AbortError identity when it surfaces through a table-valued function body', async () => {
+		// The TVF emitter wraps a thrown body error into a generic
+		// "Table-valued function ... failed" QuereusError. An AbortError must pass
+		// through unchanged so cooperative cancellation keeps its name/code identity.
+		db.registerFunction(createTableValuedFunction(
+			{ name: 'abort_tvf', numArgs: 0, deterministic: false },
+			// eslint-disable-next-line require-yield
+			async function* (): AsyncIterable<Row> {
+				throw new AbortError('cancelled inside tvf');
+			},
+		));
+
+		let caught: unknown;
+		try {
+			for await (const _ of db.eval('select * from abort_tvf()')) { /* drain */ }
+		} catch (e) {
+			caught = e;
+		}
+
+		expect(caught).to.be.instanceOf(AbortError);
+		expect((caught as QuereusError).code).to.equal(StatusCode.ABORT);
+		expect((caught as Error).message).to.equal('cancelled inside tvf');
+	});
+});
+
+describe('isAbortError type guard', () => {
+	it('is true for our AbortError', () => {
+		expect(isAbortError(new AbortError('x'))).to.equal(true);
+	});
+
+	it('is true for a foreign error following the web AbortError convention', () => {
+		const foreign = new Error('aborted');
+		foreign.name = 'AbortError';
+		expect(isAbortError(foreign)).to.equal(true);
+	});
+
+	it('is false for an unrelated QuereusError', () => {
+		expect(isAbortError(new QuereusError('boom', StatusCode.ERROR))).to.equal(false);
+	});
+
+	it('is false for non-error values', () => {
+		expect(isAbortError(undefined)).to.equal(false);
+		expect(isAbortError(null)).to.equal(false);
+		expect(isAbortError('AbortError')).to.equal(false);
+		expect(isAbortError({ name: 'AbortError' })).to.equal(false);
 	});
 });

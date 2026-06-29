@@ -102,6 +102,17 @@ export function throwIfAborted(signal?: AbortSignal): void {
 }
 
 /**
+ * Type guard recognizing cancellation errors. Returns `true` for our own
+ * {@link AbortError} and for any foreign error that follows the web convention
+ * `name === 'AbortError'` (e.g. a platform `DOMException` raised by a fetch /
+ * stream abort), so callers can classify cancellation uniformly regardless of
+ * which layer produced it.
+ */
+export function isAbortError(e: unknown): boolean {
+	return e instanceof AbortError || (e instanceof Error && e.name === 'AbortError');
+}
+
+/**
  * Error thrown when the API is used incorrectly
  */
 export class MisuseError extends QuereusError {
