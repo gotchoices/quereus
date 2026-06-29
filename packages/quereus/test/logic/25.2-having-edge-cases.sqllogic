@@ -88,3 +88,22 @@ select val * 2 as v2 from hu group by val * 2 having val * 2 > 30 order by v2;
 → [{"v2":40}]
 
 drop table hu;
+
+-- =============================================================================
+-- HAVING with bound parameters must resolve via the parameter scope
+-- =============================================================================
+
+create table hp (id integer, grp text, val integer);
+insert into hp values (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',5);
+
+-- Anonymous ? parameter in HAVING: groups with count(*) matching the bound value.
+-- params: [2]
+select grp from hp group by grp having count(*) = ?;
+→ [{"grp":"a"},{"grp":"b"}]
+
+-- Named parameter in HAVING: groups whose sum exceeds the bound threshold.
+-- params: {"threshold":15}
+select grp from hp group by grp having sum(val) > :threshold order by grp;
+→ [{"grp":"a"}]
+
+drop table hp;

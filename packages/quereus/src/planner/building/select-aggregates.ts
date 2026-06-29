@@ -337,8 +337,9 @@ function buildHavingFilter(
 	const aggregateAttributes = input.getAttributes();
 
 	// Create a hybrid scope that first tries the aggregate output scope,
-	// then falls back to the original source scope for column resolution
-	const hybridScope = new RegisteredScope();
+	// then falls back to the original source scope for column resolution.
+	// Parent is set so parameters (and named params) resolve via the ancestor chain.
+	const hybridScope = new RegisteredScope(selectContext.scope);
 
 	// Copy all symbols from aggregate output scope
 	for (const [symbolKey, callback] of aggregateOutputScope.getSymbols()) {
