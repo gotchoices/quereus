@@ -1305,8 +1305,9 @@ drop table mvr_t;
 -- collide on the seed PKs.
 -- The store package covers the reopen-without-rehydrate crash directly;
 -- this memory-backed case pins the in-engine SEMANTICS: the second apply
--- uses INSERT OR IGNORE — existing rows (including user-edited seed rows)
--- are left untouched, and non-seed rows survive (no full-reset DELETE).
+-- uses INSERT … ON CONFLICT (<pk>) DO NOTHING — existing rows (including
+-- user-edited seed rows) are left untouched, and non-seed rows survive
+-- (no full-reset DELETE).
 -- ===================================================================
 
 declare schema decl_seed_idem using (default_vtab_module = 'memory') {
@@ -1338,8 +1339,8 @@ select id, name from decl_seed_idem.meta order by id;
 → [{"id": 1, "name": "AllSite"}, {"id": 2, "name": "Edited"}, {"id": 3, "name": "UserAdded"}]
 
 -- Re-apply the SAME schema with seed: no DDL diff, but the seed re-runs.
--- INSERT OR IGNORE skips existing PKs, so user edits and non-seed rows
--- survive unchanged.
+-- ON CONFLICT (<pk>) DO NOTHING skips existing PKs, so user edits and
+-- non-seed rows survive unchanged.
 apply schema decl_seed_idem with seed;
 
 -- run
@@ -1352,12 +1353,13 @@ drop table decl_seed_idem.meta;
 -- ===================================================================
 -- Seed re-application must NOT fire ON DELETE CASCADE for an unchanged
 -- seed parent (ticket seed-reseed-or-replace-cascade-tradeoff). This is
--- the headline reason the seed insert uses OR IGNORE rather than OR
--- REPLACE: OR REPLACE is delete-then-insert on a PK conflict, so a
--- reseed of an already-seeded parent would delete the parent row, fire
--- ON DELETE CASCADE, and destroy child rows — even when the replacement
--- values are identical. OR IGNORE skips the existing parent entirely
--- (no delete), so the cascade never fires and children survive.
+-- the headline reason the seed insert skips an existing PK (via ON
+-- CONFLICT (<pk>) DO NOTHING) rather than using OR REPLACE: OR REPLACE
+-- is delete-then-insert on a PK conflict, so a reseed of an
+-- already-seeded parent would delete the parent row, fire ON DELETE
+-- CASCADE, and destroy child rows — even when the replacement values are
+-- identical. DO NOTHING skips the existing parent entirely (no delete),
+-- so the cascade never fires and children survive.
 -- ===================================================================
 
 pragma foreign_keys = true;
@@ -1390,8 +1392,9 @@ insert into decl_seed_cascade.child values (10, 1);
 select id, parent_id from decl_seed_cascade.child order by id;
 → [{"id": 10, "parent_id": 1}]
 
--- Re-apply the seed: OR IGNORE skips the already-present parent (1) with
--- no delete, so ON DELETE CASCADE never fires and the child survives.
+-- Re-apply the seed: ON CONFLICT (<pk>) DO NOTHING skips the
+-- already-present parent (1) with no delete, so ON DELETE CASCADE never
+-- fires and the child survives.
 apply schema decl_seed_cascade with seed;
 
 -- run
@@ -1515,3 +1518,46 @@ declare schema decl_seed_bad_fk using (default_vtab_module = 'memory') {
 
 apply schema decl_seed_bad_fk with seed;
 -- error: CHECK constraint failed
+
+-- Composite PRIMARY KEY: the conflict clause names every PK column
+-- (`on conflict (a, b) do nothing`). A reseed over an already-present
+-- composite key is skipped (idempotent), a user edit to a non-PK column
+-- survives, and a non-seed row is preserved — the multi-column analogue
+-- of decl_seed_idem.
+declare schema decl_seed_composite using (default_vtab_module = 'memory') {
+	table pair {
+		a INTEGER,
+		b INTEGER,
+		label TEXT,
+		primary key (a, b)
+	}
+
+	seed pair (
+		(1, 1, 'one-one'),
+		(1, 2, 'one-two')
+	)
+}
+
+-- run
+
+apply schema decl_seed_composite with seed;
+
+-- run
+
+select a, b, label from decl_seed_composite.pair order by a, b;
+→ [{"a": 1, "b": 1, "label": "one-one"}, {"a": 1, "b": 2, "label": "one-two"}]
+
+-- A user edits a non-PK column on a seeded row and adds a non-seed row.
+update decl_seed_composite.pair set label = 'edited' where a = 1 and b = 2;
+insert into decl_seed_composite.pair values (2, 1, 'user-added');
+
+-- Reseed: the composite-key conflict is skipped (no overwrite of the
+-- edit), and the non-seed row survives.
+apply schema decl_seed_composite with seed;
+
+-- run
+
+select a, b, label from decl_seed_composite.pair order by a, b;
+→ [{"a": 1, "b": 1, "label": "one-one"}, {"a": 1, "b": 2, "label": "edited"}, {"a": 2, "b": 1, "label": "user-added"}]
+
+drop table decl_seed_composite.pair;
