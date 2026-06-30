@@ -266,12 +266,19 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			//    short-circuits on the first violation, so even full
 			//    constraint-identity tracking couldn't fix this without it
 			//    reporting every violated constraint.
-			//  - Collation-sensitive keys: sqlValuesEqual is binary/byte-exact and
-			//    collation-unaware, so a conflict that holds under a coarser
-			//    collation (e.g. NOCASE) but differs only by case would compare
-			//    unequal and abort rather than skip. If this bites, compare via the
+			//  - Representation-sensitive keys: sqlValuesEqual is a raw JS-equality
+			//    check, but `proposedRow` reaches us pre-affinity-coercion (the
+			//    insert pipeline defers type conversion to the vtab's storage
+			//    layer) while `existingRow` is the already-coerced stored row. So a
+			//    conflict the vtab raised under affinity (e.g. insert '1' into an
+			//    INTEGER key holding 1) OR under a coarser collation (e.g. NOCASE
+			//    case-variant) compares unequal here and aborts rather than skips.
+			//    Both share one fix: compare the way the constraint enforces — apply
+			//    the column's affinity to the proposed value and compare via the
 			//    constraint's enforcement collation (uniqueEnforcementCollations +
-			//    compareSqlValuesFast) instead of sqlValuesEqual.
+			//    compareSqlValuesFast) instead of sqlValuesEqual. Well-formed seeds
+			//    re-present byte-identical literals, so seed idempotency is
+			//    unaffected; this only bites type-mismatched ON CONFLICT writes.
 			const conflictMatch = clause.conflictTargetIndices.every(idx =>
 				sqlValuesEqual(existingRow[idx], proposedRow[idx])
 			);
