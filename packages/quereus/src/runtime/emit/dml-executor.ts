@@ -231,6 +231,17 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 
 	/**
 	 * Match an UPSERT clause against a unique constraint violation.
+	 *
+	 * The vtab's constraint result reports the conflicting `existingRow` but not
+	 * which specific UNIQUE constraint fired. We therefore infer the match by
+	 * value: a clause covers the conflict only when the proposed row equals the
+	 * existing row at every one of the clause's conflict-target columns. This is
+	 * what scopes `DO NOTHING` / `DO UPDATE` to its declared target — including a
+	 * PK-targeted clause, which simply has the PK columns as its targets. A
+	 * conflict on a *different* unique constraint (e.g. a secondary UNIQUE) leaves
+	 * the target columns unequal, so no clause matches and the caller aborts with
+	 * a UNIQUE constraint error.
+	 *
 	 * Returns the matching clause if found, undefined otherwise.
 	 */
 	function matchUpsertClause(
@@ -244,18 +255,23 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				return clause;
 			}
 
-			// Check if the conflict target columns match the PK columns
-			// For now, we match if the conflict target is the PK or a subset
-			// A more complete implementation would track which specific constraint was violated
-			const isPkMatch = clause.conflictTargetIndices.length === pkColumnIndicesInSchema.length &&
-				clause.conflictTargetIndices.every((idx, i) => idx === pkColumnIndicesInSchema[i]);
-
-			if (isPkMatch) {
-				return clause;
-			}
-
-			// Check if proposed values at conflict target indices match existing row
-			// (this handles the case where the conflict is on those specific columns)
+			// Match when the proposed values equal the existing row at the clause's
+			// conflict-target columns — i.e. the conflict is on those columns.
+			// NOTE: two residual corners this value-comparison cannot disambiguate,
+			// neither in scope here:
+			//  - Multi-constraint coincidence: if an insert violates the targeted
+			//    constraint AND another unique constraint at once, and the vtab
+			//    returns the targeted constraint's existingRow, the row is still
+			//    suppressed though the uncovered conflict should abort. The vtab
+			//    short-circuits on the first violation, so even full
+			//    constraint-identity tracking couldn't fix this without it
+			//    reporting every violated constraint.
+			//  - Collation-sensitive keys: sqlValuesEqual is binary/byte-exact and
+			//    collation-unaware, so a conflict that holds under a coarser
+			//    collation (e.g. NOCASE) but differs only by case would compare
+			//    unequal and abort rather than skip. If this bites, compare via the
+			//    constraint's enforcement collation (uniqueEnforcementCollations +
+			//    compareSqlValuesFast) instead of sqlValuesEqual.
 			const conflictMatch = clause.conflictTargetIndices.every(idx =>
 				sqlValuesEqual(existingRow[idx], proposedRow[idx])
 			);

@@ -1561,3 +1561,28 @@ select a, b, label from decl_seed_composite.pair order by a, b;
 → [{"a": 1, "b": 1, "label": "one-one"}, {"a": 1, "b": 2, "label": "edited"}, {"a": 2, "b": 1, "label": "user-added"}]
 
 drop table decl_seed_composite.pair;
+
+-- Secondary UNIQUE collision: two seed rows share a UNIQUE value but have
+-- distinct PKs (a typo in the seed data). The seed insert targets the PK
+-- with `ON CONFLICT (<pk>) DO NOTHING`, so the second row's conflict is on
+-- the `email` UNIQUE constraint, NOT the targeted PK — it must abort the
+-- apply rather than vanish silently (ticket
+-- seed-secondary-unique-silently-skipped). Previously the PK-targeted
+-- clause short-circuited and swallowed any unique conflict.
+declare schema decl_seed_dup_unique using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		email TEXT,
+		constraint uq_email unique (email)
+	}
+
+	seed t (
+		(1, 'dup@x'),
+		(2, 'dup@x')
+	)
+}
+
+-- run
+
+apply schema decl_seed_dup_unique with seed;
+-- error: UNIQUE constraint failed
