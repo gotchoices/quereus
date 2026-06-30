@@ -420,14 +420,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *
 	 * @param sql The SQL query string to execute.
 	 * @param params Optional parameters to bind.
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before preparing and at the row
+	 *   boundary while the first row is produced).
 	 * @returns A Promise resolving to the first result row as an object, or undefined if no rows.
-	 * @throws QuereusError on failure.
+	 * @throws QuereusError on failure (an `AbortError` if the signal fired).
 	 */
-	async get(sql: string, params?: SqlParameters | SqlValue[]): Promise<Record<string, SqlValue> | undefined> {
+	async get(sql: string, params?: SqlParameters | SqlValue[], options?: StatementOptions): Promise<Record<string, SqlValue> | undefined> {
 		this.checkOpen();
+		// Pre-flight cancellation before preparing/planning.
+		throwIfAborted(options?.signal);
 		const stmt = this.prepare(sql, params);
 		try {
-			return await stmt.get(params);
+			return await stmt.get(params, options);
 		} finally {
 			await stmt.finalize();
 		}

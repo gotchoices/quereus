@@ -1,5 +1,5 @@
 import { createLogger } from '../common/logger.js';
-import { type SqlValue, StatusCode, type Row, type SqlParameters, type DeepReadonly, isSqlValue, describeSqlValueViolation } from '../common/types.js';
+import { type SqlValue, StatusCode, type Row, type SqlParameters, type StatementOptions, type DeepReadonly, isSqlValue, describeSqlValueViolation } from '../common/types.js';
 import { MisuseError, QuereusError, throwIfAborted } from '../common/errors.js';
 import type { Database } from './database.js';
 import { isRelationType, type ColumnDef, type ScalarType } from '../common/datatype.js';
@@ -382,9 +382,13 @@ export class Statement {
 	/**
 	 * Iterates over result rows. Handles JIT transaction management - commits
 	 * implicit transactions on successful completion, rolls back on error.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked on the first pull and at every row
+	 *   boundary so iteration can be interrupted on a request timeout).
 	 */
-	iterateRows(params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Row> {
-		return wrapAsyncIterator(this._iterateRowsRaw(params), (commit, error) =>
+	iterateRows(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Row> {
+		return wrapAsyncIterator(this._iterateRowsRaw(params, options?.signal), (commit, error) =>
 			this.db._finalizeImplicitTransaction(commit, error)
 		);
 	}
@@ -457,15 +461,21 @@ export class Statement {
 	 *
 	 * The execution is serialized through the database mutex to prevent concurrent
 	 * transactions from interfering with each other.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before acquiring the mutex and at
+	 *   execution boundaries during the run).
 	 */
-	async run(params?: SqlParameters | SqlValue[]): Promise<void> {
+	async run(params?: SqlParameters | SqlValue[], options?: StatementOptions): Promise<void> {
 		this.validateStatement("run");
+		// Pre-flight cancellation: reject before acquiring the mutex / doing work.
+		throwIfAborted(options?.signal);
 
 		await this.db._runWithMutex(async () => {
 			let success = false;
 			let runError: unknown;
 			try {
-				for await (const _ of this._iterateRowsRaw(params)) {
+				for await (const _ of this._iterateRowsRaw(params, options?.signal)) {
 					/* Consume all rows */
 				}
 				success = true;
@@ -481,9 +491,15 @@ export class Statement {
 	/**
 	 * Executes the prepared statement, binds parameters, and retrieves the first result row.
 	 * Transactions are started lazily (just-in-time) when needed.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before acquiring the mutex and at the
+	 *   row boundary while the first row is produced).
 	 */
-	async get(params?: SqlParameters | SqlValue[]): Promise<Record<string, SqlValue> | undefined> {
+	async get(params?: SqlParameters | SqlValue[], options?: StatementOptions): Promise<Record<string, SqlValue> | undefined> {
 		this.validateStatement("get first row for");
+		// Pre-flight cancellation: reject before acquiring the mutex / doing work.
+		throwIfAborted(options?.signal);
 
 		return this.db._runWithMutex(async () => {
 			let result: Record<string, SqlValue> | undefined;
@@ -492,7 +508,7 @@ export class Statement {
 
 			try {
 				const names = this.getColumnNames();
-				for await (const row of this._iterateRowsRaw(params)) {
+				for await (const row of this._iterateRowsRaw(params, options?.signal)) {
 					result = rowToObject(row, names);
 					break; // Only need the first row
 				}
@@ -511,11 +527,15 @@ export class Statement {
 	 * Executes the prepared statement, binds parameters, and retrieves all result rows.
 	 * Transactions are started lazily (just-in-time) when needed.
 	 * The mutex is held for the entire iteration.
+	 *
+	 * @param options Optional execution options (e.g. an `AbortSignal` for
+	 *   cooperative cancellation — checked before acquiring the mutex and at every
+	 *   row boundary so streaming can be interrupted on a request timeout).
 	 */
-	all(params?: SqlParameters | SqlValue[]): AsyncIterableIterator<Record<string, SqlValue>> {
+	all(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Record<string, SqlValue>> {
 		this.validateStatement("get all rows for");
 
-		return wrapAsyncIterator(this._allGenerator(params), (commit, error) =>
+		return wrapAsyncIterator(this._allGenerator(params, options?.signal), (commit, error) =>
 			this.db._finalizeImplicitTransaction(commit, error)
 		);
 	}
@@ -525,12 +545,14 @@ export class Statement {
 	 * Transaction finalization is handled by the wrapper returned by all().
 	 * @internal
 	 */
-	private async *_allGenerator(params?: SqlParameters | SqlValue[]): AsyncGenerator<Record<string, SqlValue>> {
+	private async *_allGenerator(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Record<string, SqlValue>> {
+		// Pre-flight cancellation before acquiring the mutex, mirroring eval().
+		throwIfAborted(signal);
 		const releaseMutex = await this.db._acquireExecMutex();
 
 		try {
 			const names = this.getColumnNames();
-			for await (const row of this._iterateRowsRaw(params)) {
+			for await (const row of this._iterateRowsRaw(params, signal)) {
 				yield rowToObject(row, names);
 			}
 		} finally {

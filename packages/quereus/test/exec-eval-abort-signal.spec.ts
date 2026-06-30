@@ -170,6 +170,202 @@ describe('exec/eval AbortSignal cancellation', () => {
 	});
 });
 
+describe('get / Statement.* AbortSignal cancellation', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, v integer);');
+		await db.exec('insert into t values (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	// --- Database.get ---------------------------------------------------------
+
+	it('db.get rejects immediately on a pre-aborted signal', async () => {
+		const controller = new AbortController();
+		controller.abort();
+
+		let caught: unknown;
+		try {
+			await db.get('select * from t where id = ?', [1], { signal: controller.signal });
+		} catch (e) {
+			caught = e;
+		}
+
+		expect(caught).to.be.instanceOf(AbortError);
+		expect((caught as QuereusError).code).to.equal(StatusCode.ABORT);
+	});
+
+	it('db.get still works with the 2-arg form (no options)', async () => {
+		const row = await db.get('select v from t where id = ?', [2]);
+		expect(row?.v).to.equal(20);
+	});
+
+	// --- Statement.get --------------------------------------------------------
+
+	it('stmt.get rejects immediately on a pre-aborted signal', async () => {
+		const controller = new AbortController();
+		controller.abort();
+
+		const stmt = db.prepare('select v from t where id = ?');
+		let caught: unknown;
+		try {
+			await stmt.get([1], { signal: controller.signal });
+		} catch (e) {
+			caught = e;
+		} finally {
+			await stmt.finalize();
+		}
+
+		expect(caught).to.be.instanceOf(AbortError);
+	});
+
+	it('stmt.get still works with the 2-arg form (no options)', async () => {
+		const stmt = db.prepare('select v from t where id = ?');
+		try {
+			const row = await stmt.get([3]);
+			expect(row?.v).to.equal(30);
+		} finally {
+			await stmt.finalize();
+		}
+	});
+
+	// --- Statement.run --------------------------------------------------------
+
+	it('stmt.run rejects immediately on a pre-aborted signal (no side effects)', async () => {
+		const controller = new AbortController();
+		controller.abort();
+
+		const stmt = db.prepare('insert into t values (6, 60)');
+		let caught: unknown;
+		try {
+			await stmt.run([], { signal: controller.signal });
+		} catch (e) {
+			caught = e;
+		} finally {
+			await stmt.finalize();
+		}
+
+		expect(caught).to.be.instanceOf(AbortError);
+
+		const row = await db.get('select id from t where id = 6');
+		expect(row).to.equal(undefined);
+	});
+
+	// --- Statement.all --------------------------------------------------------
+
+	it('stmt.all interrupts iteration at the next row boundary when aborted mid-stream', async () => {
+		const controller = new AbortController();
+
+		const stmt = db.prepare('select id from t order by id');
+		const seen: number[] = [];
+		let caught: unknown;
+		try {
+			for await (const row of stmt.all([], { signal: controller.signal })) {
+				seen.push(row.id as number);
+				if (seen.length === 2) controller.abort();
+			}
+		} catch (e) {
+			caught = e;
+		} finally {
+			await stmt.finalize();
+		}
+
+		expect(seen).to.deep.equal([1, 2]);
+		expect(caught).to.be.instanceOf(AbortError);
+	});
+
+	it('stmt.all still works with the 2-arg form (no options)', async () => {
+		const stmt = db.prepare('select id from t order by id');
+		const ids: number[] = [];
+		try {
+			for await (const row of stmt.all()) ids.push(row.id as number);
+		} finally {
+			await stmt.finalize();
+		}
+		expect(ids).to.deep.equal([1, 2, 3, 4, 5]);
+	});
+
+	// --- Statement.iterateRows (raw rows) ------------------------------------
+
+	it('stmt.iterateRows rejects immediately on a pre-aborted signal', async () => {
+		const controller = new AbortController();
+		controller.abort();
+
+		const stmt = db.prepare('select id from t');
+		const rows: Row[] = [];
+		let caught: unknown;
+		try {
+			for await (const row of stmt.iterateRows([], { signal: controller.signal })) {
+				rows.push(row);
+			}
+		} catch (e) {
+			caught = e;
+		} finally {
+			await stmt.finalize();
+		}
+
+		expect(rows).to.have.length(0);
+		expect(caught).to.be.instanceOf(AbortError);
+	});
+});
+
+describe('DML-drain AbortSignal cancellation (scan-less mutations)', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table dest (id integer primary key);');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('interrupts a scan-less bulk INSERT (VALUES source) when the signal fires during the drain', async () => {
+		const controller = new AbortController();
+
+		// A non-deterministic scalar that trips the abort the first time it runs.
+		// The INSERT's source is a VALUES list (no table scan), so neither the
+		// scan-leaf nor the output-row checkpoint can see the abort — only the DML
+		// drain-loop checkpoint does.
+		let calls = 0;
+		db.createScalarFunction(
+			'trip',
+			{ numArgs: 1, deterministic: false },
+			(v: SqlValue) => {
+				if (++calls === 1) controller.abort();
+				return v;
+			}
+		);
+
+		let caught: unknown;
+		try {
+			await db.exec('insert into dest values (trip(1)), (trip(2)), (trip(3))', [], { signal: controller.signal });
+		} catch (e) {
+			caught = e;
+		}
+
+		expect(caught).to.be.instanceOf(AbortError);
+
+		// The implicit transaction rolled back: no rows landed in dest.
+		const landed: Row[] = [];
+		for await (const row of db.eval('select * from dest')) landed.push(row as unknown as Row);
+		expect(landed).to.have.length(0);
+	});
+
+	it('a scan-less bulk INSERT completes normally without a signal', async () => {
+		await db.exec('insert into dest values (1), (2), (3)');
+		const ids: number[] = [];
+		for await (const row of db.eval('select id from dest order by id')) ids.push(row.id as number);
+		expect(ids).to.deep.equal([1, 2, 3]);
+	});
+});
+
 describe('isAbortError type guard', () => {
 	it('is true for our AbortError', () => {
 		expect(isAbortError(new AbortError('x'))).to.equal(true);

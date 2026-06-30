@@ -39,7 +39,10 @@ export type OutputValue = MaybePromise<RuntimeValue>;
 export type SqlParameters = Record<string, SqlValue> | SqlValue[];
 
 /**
- * Per-call options for statement execution (`Database.exec`, `Database.eval`).
+ * Per-call options for statement execution. Accepted by the database-level
+ * entry points (`Database.exec`, `Database.eval`, `Database.get`) and the
+ * prepared-statement methods (`Statement.run`, `Statement.get`,
+ * `Statement.iterateRows`, `Statement.all`).
  */
 export interface StatementOptions {
 	/**

@@ -1,7 +1,7 @@
 import type { DmlExecutorNode } from '../../planner/nodes/dml-executor-node.js';
 import type { Instruction, RuntimeContext, InstructionRun, OutputValue } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
-import { QuereusError, ConstraintError, FailConflictError, RollbackConflictError } from '../../common/errors.js';
+import { QuereusError, ConstraintError, FailConflictError, RollbackConflictError, throwIfAborted } from '../../common/errors.js';
 import { StatusCode, type Row, type SqlValue, isConstraintViolation } from '../../common/types.js';
 import { getVTable, disconnectVTable } from '../utils.js';
 import { ConflictResolution } from '../../common/constants.js';
@@ -423,6 +423,18 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		try {
 			try {
 				for await (const flatRow of rows) {
+					// Cooperative cancellation checkpoint for scan-less / output-less
+					// mutations. A bulk INSERT/UPDATE/DELETE whose source is not a table
+					// scan (e.g. INSERT … VALUES, or INSERT … SELECT from a TVF / CTE with
+					// no base-table read) is reached by neither the scan-leaf checkpoint
+					// nor the statement output-row boundary, so without this poll a
+					// caller's abort could only take effect once the whole drain finished.
+					// Polling once per source row interrupts the drain at the next row
+					// boundary; the throw routes through the savepoint machinery below,
+					// unwinding this statement's partial writes. Cheap relative to the
+					// per-row vtab.update() this loop already awaits.
+					throwIfAborted(ctx.signal);
+
 					// OR FAIL per-row savepoint. Broadcast (not the bare variant)
 					// so a connection registering mid-row keeps its stack in
 					// lockstep — see the doc comment above.

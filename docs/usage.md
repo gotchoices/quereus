@@ -170,9 +170,26 @@ try {
 
 #### Cancelling an In-Flight Query (`AbortSignal`)
 
-`db.exec` and `db.eval` accept a trailing, fully-optional options bag `{ signal }`. Aborting the signal cancels the in-flight statement cooperatively at the next yield seam: the call rejects with an `AbortError` (`instanceof QuereusError`, `code === StatusCode.ABORT`, `name === 'AbortError'`) and any implicit transaction rolls back. An already-aborted signal rejects before any work starts. Existing call sites are unaffected — omit the bag and behavior is unchanged.
+Every execution entry point accepts a trailing, fully-optional options bag `{ signal }`: the database-level `db.exec`, `db.eval`, and `db.get`, plus the prepared-statement methods `stmt.run`, `stmt.get`, `stmt.iterateRows`, and `stmt.all`. Aborting the signal cancels the in-flight statement cooperatively at the next yield seam: the call rejects with an `AbortError` (`instanceof QuereusError`, `code === StatusCode.ABORT`, `name === 'AbortError'`) and any implicit transaction rolls back. An already-aborted signal rejects before any work starts. Existing call sites are unaffected — omit the bag and behavior is unchanged (the 2-argument forms are preserved).
 
-> The cancellation checkpoints currently live at the physical table-access leaf (the seq-scan / index-scan / index-seek row loop) and at the statement's output-row boundary. A statement that neither scans a table nor streams output rows (e.g. a pure-DDL or purely-computational instruction) is only checked at the pre-flight boundary, so it runs to completion once started. Extending `{ signal }` to `db.get` and the `Statement.*` methods is tracked separately.
+> **Where cancellation is checked.** Cooperative checkpoints live at three seams:
+> the physical table-access leaf (the seq-scan / index-scan / index-seek row loop),
+> the statement's output-row boundary (where rows are streamed back to the caller),
+> and the DML drain loop (each source row of an `INSERT` / `UPDATE` / `DELETE`,
+> which covers a scan-less bulk mutation such as `INSERT … VALUES` or
+> `INSERT … SELECT` from a table-valued function or CTE with no base-table read).
+> Together these cover every long-running streaming or mutating statement.
+>
+> What remains uninterruptible by construction is work that happens *inside a
+> single instruction* with no `await` seam — a tight CPU-bound computation, an
+> in-memory sort over an already-drained array, or a single heavy DDL operation.
+> The engine deliberately does **not** poll the signal between scheduler
+> instructions: the synchronous fast path cannot observe an abort anyway (the
+> timer/microtask that calls `controller.abort()` cannot run while synchronous
+> engine code holds the thread), and a between-instruction poll cannot reach the
+> intra-instruction loops above, so it would add hot-path cost for no additional
+> coverage. Such a statement is checked at the pre-flight boundary and then runs
+> to completion once started.
 
 ```typescript
 import { isAbortError } from 'quereus';
@@ -188,6 +205,16 @@ try {
   if (isAbortError(err)) {
     console.log("query cancelled");
   }
+}
+
+// The same options bag works on a prepared statement:
+const stmt = db.prepare("select * from big_table");
+try {
+  for await (const row of stmt.all([], { signal: controller.signal })) {
+    // …
+  }
+} finally {
+  await stmt.finalize();
 }
 ```
 
@@ -453,23 +480,23 @@ db.getOption('foreign_keys');                    // returns OptionValue
 
 ## Database API Reference
 
-### `db.exec(sql: string, params?: SqlParameters): Promise<void>`
-Executes one or more SQL statements separated by semicolons. Primarily intended for DDL, transaction control, or DML without results. Supports optional parameters.
+### `db.exec(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<void>`
+Executes one or more SQL statements separated by semicolons. Primarily intended for DDL, transaction control, or DML without results. Supports optional parameters and an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 **Implicit Transaction Behavior:** When in autocommit mode (not within an explicit `BEGIN...COMMIT`), `exec()` automatically wraps the entire batch of statements in an implicit transaction. All statements commit together on success, or all rollback on error. This provides batch-level atomicity.
 
 ### `db.prepare(sql: string): Statement`
 Prepares an SQL statement for execution, returning a `Statement` object. This is the entry point for using the `Statement` API (`run`, `get`, `all`, `bind`, etc.).
 
-### `db.get(sql: string, params?: SqlParameters): Promise<Record<string, SqlValue> | undefined>`
-Convenience method to execute a query and return the first result row, or undefined if no rows. Equivalent to `db.prepare(sql).get(params)`.
+### `db.get(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<Record<string, SqlValue> | undefined>`
+Convenience method to execute a query and return the first result row, or undefined if no rows. Equivalent to `db.prepare(sql).get(params, options)`. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 ```typescript
 const user = await db.get("select * from users where id = ?", [1]);
 ```
 
-### `db.eval(sql: string, params?: SqlParameters): AsyncIterable<Record<string, SqlValue>>`
-A high-level async generator for executing a query and iterating over its results. Handles statement preparation, parameter binding, and automatic finalization.
+### `db.eval(sql: string, params?: SqlParameters, options?: StatementOptions): AsyncIterable<Record<string, SqlValue>>`
+A high-level async generator for executing a query and iterating over its results. Handles statement preparation, parameter binding, and automatic finalization. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 ### `db.beginTransaction()`, `db.commit()`, `db.rollback()`
 Standard transaction control methods.
@@ -566,9 +593,9 @@ Closes the database connection and finalizes all open statements.
 
 Prepared statements provide methods for executing parameterized SQL.
 
-#### `stmt.run(params?: SqlValue[] | Record<string, SqlValue>): Promise<void>`
+#### `stmt.run(params?: SqlValue[] | Record<string, SqlValue>, options?: StatementOptions): Promise<void>`
 
-Executes the statement until completion, ignoring any result rows. Ideal for INSERT, UPDATE, or DELETE operations.
+Executes the statement until completion, ignoring any result rows. Ideal for INSERT, UPDATE, or DELETE operations. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 **Implicit Transaction Behavior:** When in autocommit mode (not within an explicit `BEGIN...COMMIT`), `run()` automatically wraps its execution in an implicit transaction. The statement commits on success, or rolls back on error.
 
@@ -577,9 +604,9 @@ await stmt.run(["param1", 42]); // Positional parameters
 await stmt.run({ ":name": "Alice", ":age": 30 }); // Named parameters
 ```
 
-#### `stmt.get(params?: SqlValue[] | Record<string, SqlValue>): Promise<Record<string, SqlValue> | undefined>`
+#### `stmt.get(params?: SqlValue[] | Record<string, SqlValue>, options?: StatementOptions): Promise<Record<string, SqlValue> | undefined>`
 
-Executes the statement and returns the first result row as an object, or undefined if no rows are returned.
+Executes the statement and returns the first result row as an object, or undefined if no rows are returned. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 ```typescript
 const user = await stmt.get([1]); // e.g., "select * from users where id = ?"
@@ -588,9 +615,9 @@ if (user) {
 }
 ```
 
-#### `stmt.all(params?: SqlValue[] | Record<string, SqlValue>): AsyncIterable<Record<string, SqlValue>>`
+#### `stmt.all(params?: SqlValue[] | Record<string, SqlValue>, options?: StatementOptions): AsyncIterable<Record<string, SqlValue>>`
 
-Returns an async iterator over all result rows. Use `for await` to stream results:
+Returns an async iterator over all result rows. Use `for await` to stream results. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)). (`stmt.iterateRows` accepts the same options bag and returns raw `Row` arrays instead of objects.)
 
 ```typescript
 for await (const user of stmt.all([30])) {
