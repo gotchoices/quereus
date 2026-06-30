@@ -3,6 +3,36 @@ import { Database } from '../src/core/database.js';
 import { QuereusError } from '../src/common/errors.js';
 
 // ============================================================================
+// Reproducibility seed
+// ============================================================================
+//
+// fast-check is random by default. That is good for cumulative coverage across
+// runs, but it makes a rare failure impossible to replay — and a *Mocha timeout*
+// is the worst case, because it kills the test before fast-check can print the
+// seed it would normally report on an assertion failure.
+//
+// So we resolve a single base seed per process — from QUEREUS_FUZZ_SEED when
+// set, otherwise random — print it once, and feed it to every `fc.assert` (which
+// drives the property inputs) AND every `fc.sample` (which draws the SQL strings
+// and seed rows inside each property body). With both seeded, an entire run is
+// deterministic: read the printed seed and re-run with
+// `QUEREUS_FUZZ_SEED=<seed>` to reproduce it exactly, including a timeout.
+//
+// The default stays random so the suite keeps exploring new inputs run-to-run;
+// pinning the env var only narrows it to one reproducible run.
+const FUZZ_SEED: number = (() => {
+	const raw = process.env.QUEREUS_FUZZ_SEED;
+	if (raw !== undefined && raw.trim() !== '') {
+		const parsed = Number(raw);
+		if (Number.isFinite(parsed)) return Math.trunc(parsed);
+		console.warn(`[fuzz] ignoring non-numeric QUEREUS_FUZZ_SEED=${JSON.stringify(raw)}; using a random seed`);
+	}
+	return Math.floor(Math.random() * 0x1_0000_0000);
+})();
+
+console.log(`[fuzz] QUEREUS_FUZZ_SEED=${FUZZ_SEED} — set this env var to reproduce this run (including any timeout).`);
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -125,10 +155,12 @@ async function createSchema(db: Database, schema: SchemaInfo): Promise<void> {
 	}
 }
 
-async function seedTable(db: Database, table: TableInfo, rowCount: number): Promise<void> {
+async function seedTable(db: Database, table: TableInfo, rowCount: number, seed: number): Promise<void> {
 	if (rowCount === 0) return;
-	// Generate and execute seed rows using fast-check's sample
-	const rows = fc.sample(arbSeedRow(table), rowCount);
+	// Generate and execute seed rows using fast-check's sample. Seeded for
+	// reproducibility (see FUZZ_SEED); the caller varies the seed per table so
+	// two same-shaped tables don't end up with identical data.
+	const rows = fc.sample(arbSeedRow(table), { numRuns: rowCount, seed });
 	for (const sql of rows) {
 		try {
 			await db.exec(sql);
@@ -141,8 +173,8 @@ async function seedTable(db: Database, table: TableInfo, rowCount: number): Prom
 
 async function setupSchema(db: Database, schema: SchemaInfo, rowsPerTable: number): Promise<void> {
 	await createSchema(db, schema);
-	for (const table of schema.tables) {
-		await seedTable(db, table, rowsPerTable);
+	for (let t = 0; t < schema.tables.length; t++) {
+		await seedTable(db, schema.tables[t], rowsPerTable, FUZZ_SEED + t);
 	}
 }
 
@@ -502,6 +534,13 @@ function buildSqlArbitraries(schema: SchemaInfo) {
 // Phase 3: Test Harness
 // ============================================================================
 
+// NOTE: queries run without a per-query time budget — a genuine engine hang
+// surfaces only as the describe block's 120s Mocha timeout, which names no SQL.
+// The seed printed at startup makes such a run replayable; if a real hang ever
+// shows up, wrap these execs in an `AbortSignal` (db.exec/db.eval accept
+// `{ signal }`) timed well above the slowest legitimate query (~20ms observed)
+// so it fails fast and names the offending SQL instead of an opaque 120s stall.
+
 /**
  * Execute SQL and drain all results. Returns true if successful, throws on
  * unexpected (non-QuereusError) exceptions.
@@ -565,7 +604,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					try {
 						await setupSchema(db, schema, rowCount);
 						const arbs = buildSqlArbitraries(schema);
-						const sqls = fc.sample(arbs.select as fc.Arbitrary<string>, sampleCount);
+						const sqls = fc.sample(arbs.select as fc.Arbitrary<string>, { numRuns: sampleCount, seed: FUZZ_SEED });
 						for (const sql of sqls) {
 							await evalAndDrain(db, sql);
 						}
@@ -574,7 +613,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 200, endOnFailure: true }
+			{ numRuns: 200, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -589,7 +628,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					try {
 						await setupSchema(db, schema, rowCount);
 						const arbs = buildSqlArbitraries(schema);
-						const sqls = fc.sample(arbs.dml as fc.Arbitrary<string>, sampleCount);
+						const sqls = fc.sample(arbs.dml as fc.Arbitrary<string>, { numRuns: sampleCount, seed: FUZZ_SEED });
 						for (const sql of sqls) {
 							await execAndDrain(db, sql);
 						}
@@ -598,7 +637,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -614,8 +653,8 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					try {
 						await setupSchema(db, schema, rowCount);
 						const arbs = buildSqlArbitraries(schema);
-						const ctes = fc.sample(arbs.cte as fc.Arbitrary<string>, cteSampleCount);
-						const compounds = fc.sample(arbs.select as fc.Arbitrary<string>, compoundSampleCount);
+						const ctes = fc.sample(arbs.cte as fc.Arbitrary<string>, { numRuns: cteSampleCount, seed: FUZZ_SEED });
+						const compounds = fc.sample(arbs.select as fc.Arbitrary<string>, { numRuns: compoundSampleCount, seed: FUZZ_SEED });
 						for (const sql of [...ctes, ...compounds]) {
 							await evalAndDrain(db, sql);
 						}
@@ -624,7 +663,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -639,7 +678,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					try {
 						await setupSchema(db, schema, rowCount);
 						const arbs = buildSqlArbitraries(schema);
-						const sqls = fc.sample(arbs.windowSelect as fc.Arbitrary<string>, sampleCount);
+						const sqls = fc.sample(arbs.windowSelect as fc.Arbitrary<string>, { numRuns: sampleCount, seed: FUZZ_SEED });
 						for (const sql of sqls) {
 							await evalAndDrain(db, sql);
 						}
@@ -648,7 +687,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -663,7 +702,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					try {
 						await setupSchema(db, schema, rowCount);
 						const arbs = buildSqlArbitraries(schema);
-						const sqls = fc.sample(arbs.statement as fc.Arbitrary<string>, sampleCount);
+						const sqls = fc.sample(arbs.statement as fc.Arbitrary<string>, { numRuns: sampleCount, seed: FUZZ_SEED });
 						for (const sql of sqls) {
 							// Use eval for SELECT-like, exec for DML
 							const trimmed = sql.trimStart().toLowerCase();
@@ -678,7 +717,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 200, endOnFailure: true }
+			{ numRuns: 200, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -692,7 +731,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					try {
 						await setupSchema(db, schema, rowCount);
 						const arbs = buildSqlArbitraries(schema);
-						const sqls = fc.sample(arbs.select as fc.Arbitrary<string>, 5);
+						const sqls = fc.sample(arbs.select as fc.Arbitrary<string>, { numRuns: 5, seed: FUZZ_SEED });
 						for (const sql of sqls) {
 							const r1 = await tryCollectRows(db, sql);
 							if (r1 === null) continue; // query errored, skip
@@ -714,7 +753,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -740,7 +779,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -766,7 +805,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -813,7 +852,7 @@ describe('Grammar-Based SQL Fuzzing', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 });
@@ -855,7 +894,7 @@ describe('Algebraic Identities', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -889,7 +928,7 @@ describe('Algebraic Identities', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -951,7 +990,7 @@ describe('Algebraic Identities', function () {
 					}
 				}
 			),
-			{ numRuns: 75, endOnFailure: true }
+			{ numRuns: 75, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1008,7 +1047,7 @@ describe('Algebraic Identities', function () {
 					}
 				}
 			),
-			{ numRuns: 75, endOnFailure: true }
+			{ numRuns: 75, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1037,7 +1076,7 @@ describe('Algebraic Identities', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1093,7 +1132,7 @@ describe('Algebraic Identities', function () {
 					}
 				}
 			),
-			{ numRuns: 100, endOnFailure: true }
+			{ numRuns: 100, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 });
@@ -1146,9 +1185,12 @@ describe('Optimizer Equivalence', function () {
 		await createSchema(dbFull, schema);
 		await createSchema(dbRestricted, schema);
 
-		// Seed with identical data — verify both DBs agree on each insert
-		for (const table of schema.tables) {
-			const rows = fc.sample(arbSeedRow(table), rowCount);
+		// Seed with identical data — verify both DBs agree on each insert.
+		// Seeded per table (see FUZZ_SEED) so the paired DBs get identical data
+		// and same-shaped tables don't collide on identical rows.
+		for (let t = 0; t < schema.tables.length; t++) {
+			const table = schema.tables[t];
+			const rows = fc.sample(arbSeedRow(table), { numRuns: rowCount, seed: FUZZ_SEED + t });
 			for (const sql of rows) {
 				let fullOk = true;
 				let restrictedOk = true;
@@ -1225,7 +1267,7 @@ describe('Optimizer Equivalence', function () {
 	): Promise<void> {
 		const [dbFull, dbRestricted] = await createPairedDatabases(schema, rowCount, disabledRuleIds);
 		try {
-			const queries = fc.sample(queryArbitrary, queryCount);
+			const queries = fc.sample(queryArbitrary, { numRuns: queryCount, seed: FUZZ_SEED });
 			for (const sql of queries) {
 				const fullResult = await tryCollectRows(dbFull, sql);
 				const restrictedResult = await tryCollectRows(dbRestricted, sql);
@@ -1250,7 +1292,7 @@ describe('Optimizer Equivalence', function () {
 					);
 				}
 			),
-			{ numRuns: 25, endOnFailure: true }
+			{ numRuns: 25, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1267,7 +1309,7 @@ describe('Optimizer Equivalence', function () {
 					);
 				}
 			),
-			{ numRuns: 25, endOnFailure: true }
+			{ numRuns: 25, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1284,7 +1326,7 @@ describe('Optimizer Equivalence', function () {
 					);
 				}
 			),
-			{ numRuns: 25, endOnFailure: true }
+			{ numRuns: 25, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1305,7 +1347,7 @@ describe('Optimizer Equivalence', function () {
 					);
 				}
 			),
-			{ numRuns: 25, endOnFailure: true }
+			{ numRuns: 25, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1322,7 +1364,7 @@ describe('Optimizer Equivalence', function () {
 					);
 				}
 			),
-			{ numRuns: 25, endOnFailure: true }
+			{ numRuns: 25, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 
@@ -1344,7 +1386,7 @@ describe('Optimizer Equivalence', function () {
 					);
 				}
 			),
-			{ numRuns: 20, endOnFailure: true }
+			{ numRuns: 20, endOnFailure: true, seed: FUZZ_SEED }
 		);
 	});
 });
