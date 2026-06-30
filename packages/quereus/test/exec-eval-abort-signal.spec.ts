@@ -256,6 +256,43 @@ describe('get / Statement.* AbortSignal cancellation', () => {
 		expect(row).to.equal(undefined);
 	});
 
+	it('stmt.run interrupts a mid-execution scan and rolls back partial writes', async () => {
+		const controller = new AbortController();
+
+		// A non-deterministic predicate UDF that trips the abort once the scan is
+		// already under way (third probed row), so this exercises mid-execution
+		// cancellation of run() — not the pre-flight check — over a real table scan.
+		let calls = 0;
+		db.createScalarFunction(
+			'tick',
+			{ numArgs: 1, deterministic: false },
+			(v: SqlValue) => {
+				if (++calls === 3) controller.abort();
+				return v;
+			}
+		);
+
+		const stmt = db.prepare('update t set v = v + 100 where tick(id) >= 0');
+		let caught: unknown;
+		try {
+			await stmt.run([], { signal: controller.signal });
+		} catch (e) {
+			caught = e;
+		} finally {
+			await stmt.finalize();
+		}
+
+		expect(caught).to.be.instanceOf(AbortError);
+
+		// The implicit transaction rolled back: every row keeps its original value,
+		// so no partial UPDATE survived the abort.
+		const after: Array<[number, number]> = [];
+		for await (const row of db.eval('select id, v from t order by id')) {
+			after.push([row.id as number, row.v as number]);
+		}
+		expect(after).to.deep.equal([[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]]);
+	});
+
 	// --- Statement.all --------------------------------------------------------
 
 	it('stmt.all interrupts iteration at the next row boundary when aborted mid-stream', async () => {
