@@ -1405,3 +1405,113 @@ select id, name from decl_seed_cascade.parent order by id;
 
 drop table decl_seed_cascade.child;
 drop table decl_seed_cascade.parent;
+
+-- ===================================================================
+-- A malformed seed row aborts on first apply instead of vanishing
+-- (ticket seed-or-ignore-masks-malformed-rows). The seed insert uses
+-- `ON CONFLICT (<pk>) DO NOTHING`, which suppresses ONLY the seed-PK
+-- already-present conflict (the idempotency cases above). A row that
+-- violates a CHECK, a NOT NULL column, or a child-side FK is NOT a PK
+-- conflict, so it aborts with a clear error rather than being silently
+-- dropped the way `INSERT OR IGNORE` used to drop it.
+-- ===================================================================
+
+-- Positive control: valid seed rows on a CHECK-constrained table apply
+-- cleanly, and a re-apply stays idempotent (the PK-targeted conflict
+-- clause skips the already-present rows, it does not re-run the CHECK
+-- into an error).
+declare schema decl_seed_good_check using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		n INTEGER,
+		constraint positive check (n > 0)
+	}
+
+	seed t (
+		(1, 5),
+		(2, 10)
+	)
+}
+
+-- run
+
+apply schema decl_seed_good_check with seed;
+
+-- run
+
+select id, n from decl_seed_good_check.t order by id;
+→ [{"id": 1, "n": 5}, {"id": 2, "n": 10}]
+
+-- Idempotent reseed: existing seed PKs are skipped, no CHECK re-fires.
+apply schema decl_seed_good_check with seed;
+
+-- run
+
+select id, n from decl_seed_good_check.t order by id;
+→ [{"id": 1, "n": 5}, {"id": 2, "n": 10}]
+
+drop table decl_seed_good_check.t;
+
+-- CHECK violation: a seed row failing `check (n < 10)` aborts the apply
+-- (was silently dropped under OR IGNORE). (Seed literals must be bare —
+-- the parser rejects unary-minus — so the violation uses an over-large
+-- positive value rather than a negative one.)
+declare schema decl_seed_bad_check using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		n INTEGER,
+		constraint small check (n < 10)
+	}
+
+	seed t (
+		(1, 50)
+	)
+}
+
+-- run
+
+apply schema decl_seed_bad_check with seed;
+-- error: CHECK constraint failed
+
+-- NOT NULL violation: a seed row supplying NULL for a NOT NULL column
+-- aborts the apply.
+declare schema decl_seed_bad_nn using (default_vtab_module = 'memory') {
+	table t {
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL
+	}
+
+	seed t (
+		(1, NULL)
+	)
+}
+
+-- run
+
+apply schema decl_seed_bad_nn with seed;
+-- error: NOT NULL constraint failed
+
+-- Child-side FK violation: a seed child row referencing a missing parent
+-- aborts the apply (the FK existence check is synthesized as a CHECK).
+pragma foreign_keys = true;
+
+declare schema decl_seed_bad_fk using (default_vtab_module = 'memory') {
+	table parent {
+		id INTEGER PRIMARY KEY
+	}
+
+	table child {
+		id INTEGER PRIMARY KEY,
+		parent_id INTEGER NOT NULL,
+		constraint fk_parent foreign key (parent_id) references parent(id)
+	}
+
+	seed child (
+		(1, 999)
+	)
+}
+
+-- run
+
+apply schema decl_seed_bad_fk with seed;
+-- error: CHECK constraint failed

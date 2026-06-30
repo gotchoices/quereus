@@ -14,10 +14,12 @@ import { StoreModule, InMemoryKVStore, type KVStoreProvider } from '../src/index
 // freshly-created, skipped the `DELETE` wipe, and ran bare `INSERT`s that
 // collided with the persisted rows → `UNIQUE constraint failed: <table> PK`.
 //
-// The fix makes seed application idempotent (`INSERT OR REPLACE` per row), so a
-// reopen reseeds cleanly regardless of whether the catalog was rehydrated. The
-// store path has no `asOf` snapshot fault, so it both reproduces the original
-// crash and serves as the in-repo regression harness.
+// The fix makes seed application idempotent — each seed row is written as
+// `INSERT INTO <tbl> VALUES (…) ON CONFLICT (<pk>) DO NOTHING` (ticket
+// seed-or-ignore-masks-malformed-rows; previously `INSERT OR IGNORE`, before
+// that `INSERT OR REPLACE`) — so a reopen reseeds cleanly regardless of whether
+// the catalog was rehydrated. The store path has no `asOf` snapshot fault, so it
+// both reproduces the original crash and serves as the in-repo regression harness.
 
 function createInMemoryProvider(): KVStoreProvider & { stores: Map<string, InMemoryKVStore> } {
 	const stores = new Map<string, InMemoryKVStore>();
@@ -159,22 +161,23 @@ describe('declarative seed: reopen idempotency (store)', () => {
 		await db2.close();
 	});
 
-	// (d) OR IGNORE semantics: a re-apply with seed on a table that already holds BOTH
-	// seed rows and a non-seed user row leaves all existing rows intact — both the
-	// user-added row and the user-edited seed row are preserved unchanged.
-	it('preserves user edits and non-seed rows across a reopen reseed (OR IGNORE)', async () => {
+	// (d) ON CONFLICT (<pk>) DO NOTHING semantics: a re-apply with seed on a table that
+	// already holds BOTH seed rows and a non-seed user row leaves all existing rows
+	// intact — both the user-added row and the user-edited seed row are preserved
+	// unchanged.
+	it('preserves user edits and non-seed rows across a reopen reseed (ON CONFLICT DO NOTHING)', async () => {
 		const { db: db1, mod: mod1 } = await open(true);
 		// A user adds a row beyond the seed set, and mutates a seeded row.
 		await db1.exec(`insert into tablemetadata values (3, 'UserAdded')`);
 		await db1.exec(`update tablemetadata set name = 'Edited' where id = 2`);
 		await mod1.whenCatalogPersisted();
 
-		// Reopen (no rehydrate) and re-seed: OR IGNORE skips existing PKs, so both
-		// the user edit (id=2) and the user-added row (id=3) survive unchanged.
+		// Reopen (no rehydrate) and re-seed: ON CONFLICT (<pk>) DO NOTHING skips existing
+		// PKs, so both the user edit (id=2) and the user-added row (id=3) survive unchanged.
 		const { db: db2 } = await open(true);
 		expect(await readSeedTable(db2)).to.deep.equal([
 			{ id: 1, name: 'AllSite' },
-			{ id: 2, name: 'Edited' },    // user edit preserved (OR IGNORE skips existing row)
+			{ id: 2, name: 'Edited' },    // user edit preserved (DO NOTHING skips existing row)
 			{ id: 3, name: 'UserAdded' }, // non-seed row preserved
 		]);
 

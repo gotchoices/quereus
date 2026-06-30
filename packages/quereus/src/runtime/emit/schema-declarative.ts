@@ -11,6 +11,8 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanNode } from '../../planner/nodes/plan-node.js';
 import type { Database } from '../../core/database.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
+import type { TableSchema } from '../../schema/table.js';
+import { quoteIdentifier } from '../../emit/ast-stringify.js';
 
 const log = createLogger('runtime:emit:declare');
 
@@ -33,6 +35,33 @@ function formatSeedValue(v: SqlValue): string {
 		v instanceof Uint8Array ? `X'${uint8ArrayToHex(v)}'` :
 		'NULL'
 	);
+}
+
+/**
+ * Build the `on conflict (<pk-cols>) do nothing` tail for an idempotent seed
+ * insert.
+ *
+ * Targeting the seed table's PRIMARY KEY (rather than the blunt `INSERT OR
+ * IGNORE`) keeps reseed idempotency intact — an already-present seed PK is
+ * skipped with no delete, so no `ON DELETE CASCADE` fires and user edits to a
+ * seeded row survive — while NOT masking a *malformed* seed row. A row that
+ * violates a `CHECK`, a `NOT NULL` column, or a child-side FK is evaluated by
+ * the ConstraintCheckNode (which sees no statement-level OR clause here, so it
+ * resolves to ABORT) and aborts the apply with a clear error, where `OR IGNORE`
+ * used to drop it silently. See ticket seed-or-ignore-masks-malformed-rows and
+ * docs/schema.md § Seed Data.
+ *
+ * A table whose PK is empty (`primary key ()` — a 0-or-1-row singleton) has no
+ * columns to name, so it falls back to the untargeted `on conflict do nothing`;
+ * the only possible conflict there is the singleton key.
+ */
+function buildSeedConflictClause(tableSchema: TableSchema): string {
+	const pkCols = tableSchema.primaryKeyDefinition.map(def =>
+		quoteIdentifier(tableSchema.columns[def.index].name)
+	);
+	return pkCols.length > 0
+		? ` on conflict (${pkCols.join(', ')}) do nothing`
+		: ' on conflict do nothing';
 }
 
 export function emitDeclareSchema(plan: PlanNode, _ctx: EmissionContext): Instruction {
@@ -233,20 +262,30 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 
 		// Apply seed data if requested.
 		//
-		// Seed application is idempotent: each row is written with `INSERT OR IGNORE`.
-		// An existing row (matching PK) is left completely untouched — user edits
+		// Seed application is idempotent: each row is written as
+		// `INSERT INTO <tbl> VALUES (…) ON CONFLICT (<pk>) DO NOTHING`. An existing
+		// row (matching the seed PK) is left completely untouched — user edits
 		// survive a reopen reseed and no ON DELETE CASCADE fires for a parent row
 		// whose values are unchanged (OR REPLACE would delete-then-insert even when
 		// the replacement values are identical, triggering cascades unnecessarily).
-		// A freshly-created table has no existing rows, so OR IGNORE inserts all seed
-		// rows on the first apply.
+		// A freshly-created table has no existing rows, so every seed row inserts on
+		// the first apply.
+		//
+		// Targeting the PK conflict (vs the blunt `OR IGNORE`) is deliberate: it
+		// suppresses ONLY the seed-PK-already-present conflict, so a *malformed* seed
+		// row — one that violates a CHECK, a NOT NULL column, or a child-side FK —
+		// still aborts the apply with a clear error instead of vanishing silently.
+		// (See `buildSeedConflictClause` and ticket seed-or-ignore-masks-malformed-rows.)
 		//
 		// Historical note: the original implementation used DELETE-then-INSERT, then
-		// OR REPLACE. The delete path was dropped because `DELETE FROM <tbl>` routes
-		// through the host's snapshot resolver at `asOf(ep.startedAt)` and faults on
-		// a freshly-created table that predates the snapshot. OR REPLACE fixed the
-		// crash but fired ON DELETE CASCADE on every reopen for unchanged seed parents.
-		// OR IGNORE is the final form: no scan, no cascade, user edits preserved.
+		// OR REPLACE, then OR IGNORE. The delete path was dropped because
+		// `DELETE FROM <tbl>` routes through the host's snapshot resolver at
+		// `asOf(ep.startedAt)` and faults on a freshly-created table that predates the
+		// snapshot. OR REPLACE fixed the crash but fired ON DELETE CASCADE on every
+		// reopen for unchanged seed parents. OR IGNORE removed the cascade but masked
+		// every constraint failure, so a typo'd seed row vanished. ON CONFLICT (pk) DO
+		// NOTHING is the final form: no scan, no cascade, user edits preserved, and
+		// malformed rows surfaced.
 		if (applyStmt.withSeed) {
 			const allSeedData = rctx.db.declaredSchemaManager.getAllSeedData(schemaName);
 			log('Seed data available for %d tables', allSeedData.size);
@@ -259,13 +298,26 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 					? `${schemaName}.${tableName}`
 					: tableName;
 
+				// Resolve the just-migrated table to learn its PK column list for the
+				// per-row conflict target. The migration loop above created/aligned the
+				// table, so it is present in the catalog here.
+				const tableSchema = rctx.db.schemaManager.getTable(schemaName, tableName);
+				if (!tableSchema) {
+					throw new QuereusError(
+						`Cannot apply seed data: table '${schemaName}.${tableName}' not found after migration`,
+						StatusCode.ERROR,
+					);
+				}
+				const conflictClause = buildSeedConflictClause(tableSchema);
+
 				// One idempotent insert per seed row, batched in a single exec.
-				// OR IGNORE: an existing row (matching PK) is left untouched, so user
-				// edits survive a reopen reseed and no ON DELETE CASCADE fires for
-				// unchanged rows.
+				// ON CONFLICT (<pk>) DO NOTHING: an existing row (matching the seed PK)
+				// is left untouched — so user edits survive a reopen reseed and no
+				// ON DELETE CASCADE fires for unchanged rows — while a malformed row
+				// (CHECK / NOT NULL / child-FK violation) still aborts.
 				const seedSql = rows.map(row => {
 					const values = row.map(formatSeedValue).join(', ');
-					return `INSERT OR IGNORE INTO ${qualifiedTableName} VALUES (${values})`;
+					return `INSERT INTO ${qualifiedTableName} VALUES (${values})${conflictClause}`;
 				}).join('; ');
 
 				log('Executing seed SQL (length=%d): %s', seedSql.length, seedSql);
