@@ -122,7 +122,7 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 	if (!assessment && vtabModule.getBestAccessPlan && typeof vtabModule.getBestAccessPlan === 'function') {
 		if (canTranslateToIndexConstraints(node)) {
 			log('Testing index-style fallback for %s', node.nodeType);
-			assessment = fallbackIndexSupports(node, candidatePipeline, context, tableRef);
+			assessment = fallbackIndexSupports(node, context, tableRef, retrieveChild.moduleCtx);
 
 			if (assessment) {
 				log('Index-style fallback supports pipeline (cost: %d)', assessment.cost);
@@ -248,13 +248,29 @@ function canTranslateToIndexConstraints(node: PlanNode): boolean {
  */
 function fallbackIndexSupports(
 	node: PlanNode,
-	candidatePipeline: PlanNode,
 	context: OptContext,
-	tableRef: TableReferenceNode
+	tableRef: TableReferenceNode,
+	existingCtx?: unknown
 ): SupportAssessment | undefined {
 
 	const vtabModule = tableRef.vtabModule;
 	const tableSchema = tableRef.tableSchema;
+
+	// If the RetrieveNode we are growing over already carries an index-style
+	// context that provides an ordering (e.g. a reverse plan absorbed from a
+	// Sort by trySortAbsorbViaIndexOrdering), we must re-derive a
+	// direction-matching plan here. A plain no-ordering re-probe can return an
+	// oppositely-ordered plan (a module that serves DESC by reverse-scanning an
+	// ascending index yields the forward plan when ordering is not requested);
+	// equipping that plan silently clobbers the absorbed reverse plan while the
+	// Sort has already been dropped, so rows stream in the wrong direction. See
+	// `fix/quereus-reverse-order-sort-absorb-desync`.
+	const equippedOrdering: readonly OrderingSpec[] | undefined =
+		isIndexStyleContext(existingCtx)
+			&& existingCtx.accessPlan.providesOrdering
+			&& existingCtx.accessPlan.providesOrdering.length > 0
+			? existingCtx.accessPlan.providesOrdering
+			: undefined;
 
 	// Build BestAccessPlanRequest based on node type
 	const request: BestAccessPlanRequest = {
@@ -343,6 +359,13 @@ function fallbackIndexSupports(
 		return undefined;
 	}
 
+	// Carry the equipped ordering into the re-probe (unless the node type already
+	// derived one, e.g. a Sort) so the module returns a direction-matching plan
+	// instead of a no-ordering one that would clobber the absorbed reverse plan.
+	if (equippedOrdering && !request.requiredOrdering) {
+		request.requiredOrdering = equippedOrdering.map(o => ({ columnIndex: o.columnIndex, desc: o.desc }));
+	}
+
 	log('Built access plan request: %d filters, ordering: %s, limit: %s',
 		request.filters.length,
 		request.requiredOrdering ? 'yes' : 'no',
@@ -351,11 +374,32 @@ function fallbackIndexSupports(
 	// Get access plan from module
 	const accessPlan = vtabModule.getBestAccessPlan!(context.db, tableSchema, request);
 
+	// No-clobber guard: never replace an equipped ordering plan with one that does
+	// not provide the same ordering (same column indexes + directions). Declining
+	// here leaves the current (correct) tree in place — a redundant Filter above a
+	// reverse Retrieve is safe because a Filter preserves row order, so rows still
+	// emerge in the absorbed direction.
+	// NOTE: the end-to-end regression that proves this guard is load-bearing lives
+	// in Lamina's cross-repo suite (ordinal-seek-range-bounds.test.ts), not here —
+	// the synthetic reverse-scan spec physicalizes before the re-grow can race in,
+	// so it exercises trySortAbsorbViaIndexOrdering's satisfaction check but not
+	// this clobber. If you refactor this branch, run Lamina's suite too, or add a
+	// Quereus-native repro that re-grows over an already-reverse-equipped Retrieve.
+	if (equippedOrdering && !orderingMatches(accessPlan.providesOrdering, equippedOrdering)) {
+		log('Re-probe would clobber equipped ordering; declining grow to preserve absorbed plan');
+		return undefined;
+	}
+
 	// Check if the plan is beneficial
 	const handlesAnyFilter = request.filters.length > 0 &&
 		accessPlan.handledFilters.some(handled => handled);
-	const providesOrdering = request.requiredOrdering &&
-		accessPlan.providesOrdering;
+	// Only count ordering as a benefit when the plan provides the SAME columns and
+	// directions that were requested — a wrong-direction (or wrong-column)
+	// providesOrdering of equal length must not let a Sort be grown into (and thus
+	// dropped by) this Retrieve. Direction-aware, not length-only.
+	const providesOrdering = request.requiredOrdering
+		? orderingMatches(accessPlan.providesOrdering, request.requiredOrdering)
+		: false;
 
 	// Calculate baseline cost
 	const estimatedRows = request.estimatedRows ?? 1000;
@@ -413,6 +457,28 @@ function fallbackIndexSupports(
 		cost: accessPlan.cost,
 		ctx: indexCtx
 	};
+}
+
+/**
+ * True when `provided` satisfies `required` position-for-position — same column
+ * indexes and same descending flags for every required position (the plan may
+ * provide extra trailing ordering, so `provided` need only be at least as long).
+ * Used both to gate the sort-absorb satisfaction check and to guard a re-grow
+ * from clobbering an already-equipped ordering plan. Comparing the ordering as
+ * data (columnIndex + desc) keeps a single representation — see the `OrderingSpec`
+ * shape in `best-access-plan.ts`.
+ */
+function orderingMatches(
+	provided: readonly OrderingSpec[] | undefined,
+	required: readonly OrderingSpec[],
+): boolean {
+	if (!provided || provided.length < required.length) return false;
+	for (let i = 0; i < required.length; i++) {
+		if (provided[i].columnIndex !== required[i].columnIndex || provided[i].desc !== required[i].desc) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /**
@@ -493,8 +559,11 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 
 	const accessPlan = vtabModule.getBestAccessPlan(context.db, tableSchema, request) as BestAccessPlanResult;
 
-	// Only proceed if the plan actually satisfies the ordering.
-	if (!accessPlan.providesOrdering || accessPlan.providesOrdering.length < requiredOrdering.length) {
+	// Only proceed if the plan actually satisfies the ordering — every requested
+	// position must be provided by the SAME column and direction, not merely
+	// matched on length. A length-only check would let an ascending
+	// providesOrdering of equal length wrongly drop a DESC Sort.
+	if (!orderingMatches(accessPlan.providesOrdering, requiredOrdering)) {
 		log('Access plan does not satisfy required ordering; leaving Sort in place');
 		return null;
 	}
