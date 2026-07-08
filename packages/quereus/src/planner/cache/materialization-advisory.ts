@@ -245,6 +245,12 @@ export class MaterializationAdvisory {
 		if (childrenChanged) {
 			// Let withChildren handle the transformation
 			// This will maintain proper attribute IDs and node structure
+			// NOTE: this catch degrades to "no caching for this subtree" (returns
+			// the untransformed node, dropping every CacheNode under it) rather
+			// than propagating like reference-graph does. Kept swallowing because
+			// it's perf-only — an uncached subtree still computes correct results —
+			// so a withChildren quirk shouldn't fail planning. If missed caching
+			// ever needs to be a hard error, promote this to a throw.
 			try {
 				return node.withChildren(transformedChildren);
 			} catch (e) {
