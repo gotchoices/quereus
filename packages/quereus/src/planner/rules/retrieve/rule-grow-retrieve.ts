@@ -40,22 +40,9 @@ import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
 import type * as AST from '../../../parser/ast.js';
 import { ExistsNode, InNode } from '../../nodes/subquery.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
+import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
-
-/**
- * Context data stored in RetrieveNode.moduleCtx for index-style fallback
- */
-interface IndexStyleContext {
-	kind: 'index-style';
-	accessPlan: BestAccessPlanResult;
-	residualPredicate?: PlanNode;
-	originalConstraints: PredicateConstraint[];
-}
-
-function isIndexStyleContext(ctx: unknown): ctx is IndexStyleContext {
-	return !!ctx && typeof ctx === 'object' && (ctx as { kind?: string }).kind === 'index-style';
-}
 
 export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode | null {
 	// This rule runs in a TOP-DOWN pass, looking for any relational operation
@@ -172,8 +159,8 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 	let residualAbove: ScalarPlanNode | undefined;
 
 	if (isIndexStyleContext(moduleCtx) && moduleCtx.residualPredicate
-		&& predicateContainsCorrelatedSubquery(moduleCtx.residualPredicate as ScalarPlanNode)) {
-		residualAbove = moduleCtx.residualPredicate as ScalarPlanNode;
+		&& predicateContainsCorrelatedSubquery(moduleCtx.residualPredicate)) {
+		residualAbove = moduleCtx.residualPredicate;
 		moduleCtx = { ...moduleCtx, residualPredicate: undefined };
 	}
 
@@ -288,7 +275,7 @@ function fallbackIndexSupports(
 	};
 
 	// Extract information based on node type
-	let residualPredicate: PlanNode | undefined;
+	let residualPredicate: ScalarPlanNode | undefined;
 	let plannerConstraints: PredicateConstraint[] | undefined;
 
 	if (node instanceof FilterNode) {
@@ -429,7 +416,7 @@ function fallbackIndexSupports(
 			}
 		}
 		if (unhandledExprs.length > 0) {
-			const parts: ScalarPlanNode[] = residualPredicate ? [residualPredicate as ScalarPlanNode, ...unhandledExprs] : unhandledExprs;
+			const parts: ScalarPlanNode[] = residualPredicate ? [residualPredicate, ...unhandledExprs] : unhandledExprs;
 			if (parts.length === 1) {
 				residualPredicate = parts[0];
 			} else {
@@ -593,8 +580,8 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 	// Equip the Retrieve with index-style context so rule-select-access-path
 	// uses this plan. Existing source pipeline (which may already contain
 	// pushed-down filters) is preserved.
-	const indexCtx = {
-		kind: 'index-style' as const,
+	const indexCtx: IndexStyleContext = {
+		kind: 'index-style',
 		accessPlan,
 		residualPredicate,
 		originalConstraints: [...constraints],

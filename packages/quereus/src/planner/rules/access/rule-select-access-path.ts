@@ -34,6 +34,7 @@ import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effective
 import type { TableSchema } from '../../../schema/table.js';
 import type * as AST from '../../../parser/ast.js';
 import { IndexConstraintOp } from '../../../common/constants.js';
+import { isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:select-access-path');
 
@@ -73,7 +74,7 @@ export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanN
 	if (isIndexStyleContext(retrieveNode.moduleCtx)) {
 		log('Using index-style context provided by grow-retrieve');
 		const accessPlan = retrieveNode.moduleCtx.accessPlan;
-		const originalConstraints = retrieveNode.moduleCtx.originalConstraints as unknown as PlannerPredicateConstraint[];
+		const originalConstraints = retrieveNode.moduleCtx.originalConstraints;
 		const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, originalConstraints);
 		if (retrieveNode.moduleCtx.residualPredicate) {
 			return new FilterNode(retrieveNode.scope, physicalLeaf, retrieveNode.moduleCtx.residualPredicate);
@@ -146,7 +147,7 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 		// Use pre-computed access plan from grow rule
 		log('Using pre-computed access plan from grow rule');
 		accessPlan = retrieveNode.moduleCtx.accessPlan;
-		constraints = (retrieveNode.moduleCtx.originalConstraints as PlannerPredicateConstraint[]) || [];
+		constraints = retrieveNode.moduleCtx.originalConstraints;
 		residualPredicate = retrieveNode.moduleCtx.residualPredicate;
 	} else {
 		// Extract constraints from grown pipeline in source using table instance key
@@ -994,11 +995,6 @@ function selectPhysicalNodeLegacy(
 
 	log('Using sequential scan (no beneficial index access)');
 	return createSeqScan(tableRef, filterInfo, accessPlan.cost);
-}
-
-// Narrow module context originating from grow-retrieve index-style fallback
-function isIndexStyleContext(ctx: unknown): ctx is { kind: 'index-style'; accessPlan: BestAccessPlanResult; residualPredicate?: ScalarPlanNode; originalConstraints: unknown[] } {
-	return !!ctx && typeof ctx === 'object' && (ctx as { kind?: string }).kind === 'index-style';
 }
 
 /**
