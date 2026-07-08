@@ -259,7 +259,10 @@ describe('commit recording is serialized (no interleave)', () => {
 				{ type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: [1, 'Alice'], newRow: [1, 'Alice2'] },
 			],
 		});
-		await settle();
+		// Deterministic drain via the serialization tail — both commits are already
+		// enqueued synchronously above, so this awaits both handlers through their KV
+		// writes with no timing dependence (and exercises the whenCommitsSettled hook).
+		await manager.whenCommitsSettled();
 
 		const sets = await manager.getChangesSince(peer, fromZero);
 		const nameChanges = sets
