@@ -5,6 +5,9 @@ import { Parser } from '../../src/parser/parser.js';
 import { QuereusError } from '../../src/common/errors.js';
 import { StatusCode, type SqlValue } from '../../src/common/types.js';
 import type * as AST from '../../src/parser/ast.js';
+import { buildFullRebuildPlan } from '../../src/core/database-materialized-views-plan-builders.js';
+import type { MaintainedTableSchema } from '../../src/schema/derivation.js';
+import type { BlockNode } from '../../src/planner/nodes/block.js';
 
 /**
  * Maintenance-equivalence property harness — the correctness oracle for row-time
@@ -700,12 +703,21 @@ interface FullRebuildPlanLike {
 /** White-box reach into the manager internals the swap helper drives. The map key is
  *  lowercase `schema.name` (see `mvKey` in database-materialized-views.ts). */
 interface MvManagerInternals {
-	buildFullRebuildPlan(mv: unknown, analyzed: unknown): FullRebuildPlanLike;
 	releaseRowTime(key: string): void;
 	readonly rowTime: Map<string, { kind: string }>;
 	readonly rowTimeBySource: Map<string, Set<string>>;
 }
 interface ManagerHandle { readonly materializedViewManager: MvManagerInternals; }
+
+/**
+ * Build a `'full-rebuild'` plan via the extracted plan-builder. Since phase-2 decomposition
+ * the builder is a free function over the manager context — the manager is constructed with
+ * the {@link Database} as its context, so `db` is that context. Casts the loosely-typed
+ * test inputs (`unknown` MV / analyzed plan) to the builder's parameter types.
+ */
+function buildFloorPlan(db: Database, mv: unknown, analyzed: unknown): FullRebuildPlanLike {
+	return buildFullRebuildPlan(db, mv as MaintainedTableSchema, analyzed as BlockNode);
+}
 
 /**
  * Swap a registered MV's maintenance plan for a freshly-built `'full-rebuild'` plan over
@@ -734,7 +746,7 @@ function forceFullRebuild(db: Database, schemaName: string, name: string): FullR
 	const analyzed = db.schemaManager.withSuppressedMaterializedViewRewrite(
 		() => db.optimizer.optimizeForAnalysis(db._buildPlan([mv!.derivation.selectAst as AST.Statement]).plan, db),
 	);
-	const plan = mgr.buildFullRebuildPlan(mv, analyzed);
+	const plan = buildFloorPlan(db, mv, analyzed);
 	const key = `${schemaName}.${name}`.toLowerCase();
 	mgr.releaseRowTime(key);
 	mgr.rowTime.set(key, plan as unknown as { kind: string });
@@ -1034,7 +1046,6 @@ describe('Materialized-view maintenance equivalence (full-rebuild floor, MV-over
  */
 describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 	let db: Database;
-	let mgr: MvManagerInternals;
 
 	beforeEach(async () => {
 		db = new Database();
@@ -1043,7 +1054,6 @@ describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 		// A real keyed-set MV so a backing (the maintained table `okmv` itself, PK id) exists
 		// for the cases that pass the relational/determinism gates and reach the backing lookup.
 		await db.exec('create materialized view okmv as select id, a from src');
-		mgr = (db as unknown as ManagerHandle).materializedViewManager;
 	});
 	afterEach(async () => { await db.close(); });
 
@@ -1054,7 +1064,7 @@ describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 		// table IS the backing now, so no separate backingTableName exists).
 		const fakeMv = { name: 'bag', schemaName: 'main' };
 		let caught: unknown;
-		try { mgr.buildFullRebuildPlan(fakeMv, analyzeBody(db, 'select a from src')); }
+		try { buildFloorPlan(db, fakeMv, analyzeBody(db, 'select a from src')); }
 		catch (e) { caught = e; }
 		expect(caught, 'a bag body must reject').to.be.instanceOf(QuereusError);
 		expect((caught as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
@@ -1069,7 +1079,7 @@ describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 		// okmv backing (PK id) does not match its shape, so it fails at the backing-PK derivation
 		// rather than the bag gate. The point pinned here: it is NOT rejected as a bag.
 		let caught: unknown;
-		try { mgr.buildFullRebuildPlan(okMv(), analyzeBody(db, 'select distinct a, k from src')); }
+		try { buildFloorPlan(db, okMv(), analyzeBody(db, 'select distinct a, k from src')); }
 		catch (e) { caught = e; }
 		// Either it builds (no throw) or it fails past the bag gate — never the bag diagnostic.
 		if (caught !== undefined) {
@@ -1081,7 +1091,7 @@ describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 	it('rejects a non-deterministic body unless pragma nondeterministic_schema is set', () => {
 		// Keyed (id is the source PK) so the determinism gate — not the bag gate — fires.
 		let caught: unknown;
-		try { mgr.buildFullRebuildPlan(okMv(), analyzeBody(db, 'select id, random() as r from src')); }
+		try { buildFloorPlan(db, okMv(), analyzeBody(db, 'select id, random() as r from src')); }
 		catch (e) { caught = e; }
 		expect(caught, 'a non-deterministic body must reject').to.be.instanceOf(QuereusError);
 		expect((caught as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
@@ -1092,7 +1102,7 @@ describe('Materialized-view full-rebuild floor — build-time rejects', () => {
 		await db.exec('pragma nondeterministic_schema = true');
 		// keysOf(id) is a key; determinism gate lifted; the okmv backing (PK id) matches the
 		// (id, r) body's leading key column — so a plan is built (no throw).
-		const plan = mgr.buildFullRebuildPlan(okMv(), analyzeBody(db, 'select id, random() as r from src'));
+		const plan = buildFloorPlan(db, okMv(), analyzeBody(db, 'select id, random() as r from src'));
 		expect(plan.kind).to.equal('full-rebuild');
 		expect(plan.sourceBases).to.deep.equal(['main.src']);
 	});
