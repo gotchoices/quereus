@@ -281,9 +281,6 @@ export function emitMyOperation(plan: MyOperationNode, ctx: EmissionContext): In
 	//     return undefined;
 	// }
 
-	// Emit child instructions
-	const sourceInstruction = emitPlanNode(plan.source, ctx);
-
 	return {
 		params: [sourceInstruction],
 		run,
