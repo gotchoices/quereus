@@ -536,6 +536,44 @@ describe('IsolationModule', () => {
 			const b = await db.get(`SELECT * FROM t WHERE id = 2`);
 			expect(b?.u).to.equal('y');
 		});
+
+		it('evicts the UNIQUE-colliding row when OR REPLACE revives a tombstoned PK in the same txn', async () => {
+			await db.exec(`
+				CREATE TABLE t (
+					id INTEGER PRIMARY KEY,
+					u TEXT UNIQUE
+				) USING isolated
+			`);
+
+			// Seed + commit A (pk=1, u='x') and B (pk=2, u='y').
+			await db.exec(`INSERT INTO t VALUES (1, 'x')`);
+			await db.exec(`INSERT INTO t VALUES (2, 'y')`);
+
+			await db.exec('BEGIN');
+			// Tombstone A, then revive pk=1 with u='y' via OR REPLACE — collides with B
+			// on UNIQUE(u). Unlike the ABORT case, REPLACE must resolve the collision by
+			// evicting B (tombstoning its PK in the overlay) rather than throwing. This
+			// exercises the tombstone-revival branch's merged UNIQUE check on its REPLACE
+			// path (checkMergedUniqueConstraints -> insertTombstoneForPK + evicted).
+			await db.exec(`DELETE FROM t WHERE id = 1`);
+			await db.exec(`INSERT OR REPLACE INTO t VALUES (1, 'y')`);
+
+			// Within the txn the merged view holds exactly the revived row; B is evicted.
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM t ORDER BY id`));
+			expect(rows.length).to.equal(1);
+			expect(rows[0].id).to.equal(1);
+			expect(rows[0].u).to.equal('y');
+			const gone = await db.get(`SELECT * FROM t WHERE id = 2`);
+			expect(gone).to.equal(undefined);
+
+			await db.exec('ROLLBACK');
+
+			// After rollback the committed A and B are both intact.
+			const a = await db.get(`SELECT * FROM t WHERE id = 1`);
+			expect(a?.u).to.equal('x');
+			const b = await db.get(`SELECT * FROM t WHERE id = 2`);
+			expect(b?.u).to.equal('y');
+		});
 	});
 
 	describe('per-connection isolation', () => {

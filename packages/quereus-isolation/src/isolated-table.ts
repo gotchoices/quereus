@@ -413,6 +413,15 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// to shadow the underlying 'abc', surfacing both rows). One normalizer per PK
 		// column, drawn from that column's declared collation, so equal keys under the
 		// PK collation encode to identical strings — matching getComparePK/keysEqual.
+		// NOTE: resolveKeyNormalizer only knows BINARY/NOCASE/RTRIM; a custom
+		// comparator-only collation (or a custom collation with a registered
+		// normalizer) falls back to BINARY here, so a case-only PK rewrite under such
+		// a collation could fail to shadow the underlying row (duplicate in a scan).
+		// This matches the engine-wide hash-key convention (bloom-join / window /
+		// hash-aggregate / store UNIQUE all use the same resolver and accept the same
+		// residual — see docs/schema.md). If custom-collation PKs ever need exact
+		// merge shadowing, thread db._getCollationNormalizer through here (and fix the
+		// other hash sites too, since the divergence is shared).
 		const pkNormalizers = pkIndices.map(i =>
 			resolveKeyNormalizer(this.tableSchema!.columns[i].collation));
 
