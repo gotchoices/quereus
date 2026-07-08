@@ -44,7 +44,7 @@ quereus/                   # Main SQL engine — see its README for detailed src
 quoomb-cli/                # CLI tool
 quoomb-web/                # Web UI
 quereus-store/             # Persistent key-value store abstraction
-quereus-isolation/         # Snapshot isolation layer
+quereus-isolation/         # Transaction isolation layer (read-your-own-writes; not snapshot isolation)
 quereus-sync/              # Sync engine
 quereus-sync-client/       # Sync client
 sync-coordinator/          # Sync server/coordinator
