@@ -363,10 +363,10 @@ describe('Planner Framework', () => {
 	});
 
 	// ---------------------------------------------------------------------------
-	// RuleRegistry (registry.ts) — tested through module-level helpers + OptContext
+	// Visited-rule tracking (registry.ts)
 	// ---------------------------------------------------------------------------
 
-	describe('RuleRegistry (visited rules)', () => {
+	describe('Visited-rule tracking', () => {
 
 		it('markRuleApplied / hasRuleBeenApplied round-trip', () => {
 			const ctx = makeContext();

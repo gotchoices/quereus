@@ -629,8 +629,14 @@ export function ruleMyOptimization(
 
 2. **Register Rule** in optimizer:
 ```typescript
-// src/planner/optimizer.ts
-this.registerRule('MyRule', PlanNodeType.Target, ruleMyOptimization);
+// src/planner/optimizer.ts, inside registerRulesToPasses()
+this.passManager.addRuleToPass(PassId.Structural, {
+  id: 'MyRule',
+  nodeType: PlanNodeType.Target,
+  phase: 'rewrite',
+  fn: ruleMyOptimization,
+  sideEffectMode: 'safe', // or 'aware' — see § Audit discipline below
+});
 ```
 
 3. **Add Tests** with golden plans:
@@ -661,10 +667,10 @@ SELECT * FROM users WHERE active = true;
 
 ## Audit discipline (`sideEffectMode`)
 
-Every rule registered via `addRuleToPass` (or the global `registerRule`)
-**must** declare its `sideEffectMode`. The registry validates the field at
-registration time and rejects any rule that fails to declare. This is the
-load-bearing audit gate the side-effect-aware optimizer rests on.
+Every rule registered via `addRuleToPass` **must** declare its
+`sideEffectMode`. `validateSideEffectMode` (`framework/registry.ts`) checks
+the field at registration time and rejects any rule that fails to declare.
+This is the load-bearing audit gate the side-effect-aware optimizer rests on.
 
 ### The signal
 

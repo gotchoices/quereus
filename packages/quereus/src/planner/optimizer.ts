@@ -6,11 +6,10 @@ import { OptimizerTuning, DEFAULT_TUNING } from './optimizer-tuning.js';
 // Re-export for convenience
 export { DEFAULT_TUNING };
 
-import { applyRules } from './framework/registry.js';
-import { tracePhaseStart, tracePhaseEnd, traceNodeStart, traceNodeEnd } from './framework/trace.js';
+import { tracePhaseStart, tracePhaseEnd } from './framework/trace.js';
 import { type StatsProvider } from './stats/index.js';
 import { CatalogStatsProvider } from './stats/catalog-stats.js';
-import { createOptContext, type OptContext } from './framework/context.js';
+import { createOptContext } from './framework/context.js';
 import type { OptimizerDiagnostics } from './framework/context.js';
 import { PassManager, PassId } from './framework/pass.js';
 // Phase 2 rules
@@ -1054,62 +1053,6 @@ export class Optimizer {
 		} finally {
 			tracePhaseEnd('pre-physical-analysis');
 		}
-	}
-
-	optimizeNode(node: PlanNode, context: OptContext): PlanNode {
-		traceNodeStart(node);
-
-		// Check if we've already optimized this exact node instance
-		const cached = context.optimizedNodes.get(node.id);
-		if (cached) {
-			log('Reusing optimized version of shared node %s (%s)', node.id, node.nodeType);
-			traceNodeEnd(node, cached);
-			return cached;
-		}
-
-		// Note: We removed the broken `if (node.physical)` check here
-		// The `physical` property is always truthy (it returns a PhysicalProperties object)
-		// Physical vs logical distinction should be handled by the rules themselves
-
-		// First optimize all children
-		const optimizedNode = this.optimizeChildren(node, context);
-
-		// Apply rules
-		const rulesApplied = applyRules(optimizedNode, context);
-
-		if (rulesApplied !== optimizedNode) {
-			// Rules transformed the node
-			log(`Rules applied to ${optimizedNode.nodeType}, transformed to ${rulesApplied.nodeType}`);
-			traceNodeEnd(node, rulesApplied);
-
-			// Cache the final result
-			context.optimizedNodes.set(node.id, rulesApplied);
-			return rulesApplied;
-		}
-
-		// No rule applied - assume node is physical
-		traceNodeEnd(node, optimizedNode);
-
-		// Cache the result even if no rules applied
-		context.optimizedNodes.set(node.id, optimizedNode);
-		return optimizedNode;
-	}
-
-	private optimizeChildren(node: PlanNode, context: OptContext): PlanNode {
-		// Generic tree walk using withChildren
-		const originalChildren = node.getChildren();
-		const optimizedChildren = originalChildren.map(child => this.optimizeNode(child, context));
-
-		// Check if any children changed
-		const childrenChanged = optimizedChildren.some((child, i) => child !== originalChildren[i]);
-
-		if (!childrenChanged) {
-			return node; // No changes
-		}
-
-		// Use withChildren to create new node with optimized children
-		// withChildren is a required contract - any errors should propagate
-		return node.withChildren(optimizedChildren);
 	}
 
 	/**

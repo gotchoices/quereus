@@ -6,9 +6,8 @@ This directory contains the core framework components for the Titan optimizer Ph
 
 ### Registry (`registry.ts`)
 - **RuleHandle**: Structured rule registration with ID, node type, phase, and priority
-- **Loop Detection**: Prevents infinite rule application using visited rule tracking
-- **Priority Ordering**: Rules execute in priority order (lower numbers first)
-- **Comprehensive Tracing**: Detailed logging and trace hooks for debugging
+- **Loop Detection**: `hasRuleBeenApplied` / `markRuleApplied` prevent infinite rule application using per-node visited-rule tracking (consulted by `PassManager`)
+- **`validateSideEffectMode`**: Rejects any rule handle missing its `sideEffectMode` declaration
 
 ### Trace Framework (`trace.ts`)
 - **TraceHook Interface**: Extensible hooks for rule and node processing events
@@ -33,16 +32,15 @@ This directory contains the core framework components for the Titan optimizer Ph
 
 ### Rule Registration
 ```typescript
-import { registerRule, createRule } from '../framework/registry.js';
-
-registerRule(createRule(
-  'Aggregate→StreamAggregate',
-  PlanNodeType.Aggregate,
-  'impl',
-  ruleAggregateStreaming,
-  'safe', // sideEffectMode — see docs/optimizer.md § Audit discipline
-  10      // priority
-));
+// src/planner/optimizer.ts, inside registerRulesToPasses()
+this.passManager.addRuleToPass(PassId.Physical, {
+  id: 'Aggregate→StreamAggregate',
+  nodeType: PlanNodeType.Aggregate,
+  phase: 'impl',
+  fn: ruleAggregateStreaming,
+  sideEffectMode: 'safe', // see docs/optimizer.md § Audit discipline
+  priority: 10,
+});
 ```
 
 ### Rule Implementation
