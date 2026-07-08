@@ -4,12 +4,12 @@ Generic transaction isolation layer for Quereus virtual table modules.
 
 ## Overview
 
-The `@quereus/isolation` package provides MVCC-style transaction isolation semantics for any Quereus virtual table module. It wraps existing modules to add:
+The `@quereus/isolation` package provides connection-level transaction isolation for any Quereus virtual table module. It wraps existing modules to add:
 
 - **Read-your-own-writes** — See uncommitted changes within your transaction
-- **Snapshot isolation** — Consistent reads throughout the transaction
+- **Read-committed reads of shared state** — Reads merge against the *live* underlying table, so another connection's committed writes can become visible mid-transaction. This is **not** snapshot isolation — reads are not a stable point-in-time view. A stable snapshot, if needed, is the job of whatever module is layered beneath this one (see [Isolation Level](#isolation-level) below).
 - **Savepoint support** — Nested transaction control
-- **ACID semantics** — Full transaction guarantees
+- **No write-write conflict detection** — Concurrent writers to the same row are not detected; the last connection to flush wins.
 
 This allows module authors to focus on storage concerns while getting isolation "for free."
 
@@ -79,6 +79,26 @@ The isolation layer operates at the **row level**, merging query results from tw
 │  └────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────┘
 ```
+
+## Isolation Level
+
+The guarantee this layer actually provides is closer to **read-committed with
+read-your-own-writes** than to snapshot isolation:
+
+- **Read-your-own-writes** — a connection always sees its own uncommitted overlay
+  changes.
+- **Live reads of shared state** — the merged read path queries the *live* underlying
+  table on every read, not a point-in-time copy taken at `BEGIN`. If another
+  connection commits mid-transaction, the next read in this transaction can observe
+  that write. Reads are **not** isolated from concurrent commits.
+- **No write-write conflict detection** — two connections that write the same row in
+  overlapping transactions are not detected as conflicting; whichever connection
+  flushes (commits) last overwrites the other.
+- **Snapshotting is delegated downward** — if a consumer needs a stable, point-in-time
+  view of the data, that guarantee must come from the module wrapped *beneath* this
+  layer (the `underlying` module), not from `IsolationModule` itself. A future
+  optional snapshotting pass-through module may be added below the isolation layer
+  for consumers that need this; it does not exist today.
 
 ### Key Features
 

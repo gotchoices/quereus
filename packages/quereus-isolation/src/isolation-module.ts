@@ -105,7 +105,10 @@ interface AddColumnBackfillContext {
  *
  * This provides ACID semantics including:
  * - Read-your-own-writes within a transaction
- * - Snapshot isolation (reads see consistent state)
+ * - Read-committed reads of shared state (the underlying table is live and shared
+ *   across connections — this is NOT snapshot isolation; another connection's commit
+ *   can become visible mid-transaction, and there is no write-write conflict
+ *   detection). A stable snapshot, if needed, is the underlying module's job.
  * - Savepoint support via overlay module's transaction support
  */
 export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseModuleConfig> {

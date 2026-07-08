@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes a **generic transaction isolation layer** that can wrap any `VirtualTableModule` to provide ACID transaction semantics with read-your-own-writes, snapshot isolation, and savepoint support.
+This document describes a **generic transaction isolation layer** that can wrap any `VirtualTableModule` to provide ACID transaction semantics with read-your-own-writes and savepoint support. It does **not** provide snapshot isolation or write-write conflict detection — see [Isolation Level Provided](#isolation-level-provided) below.
 
 The goal is to decouple **storage** concerns from **isolation** concerns:
 
@@ -30,7 +30,7 @@ The store modules (`quereus-store`) currently have no read isolation—queries s
 A composable isolation layer that:
 
 - Wraps any underlying module transparently
-- Provides consistent MVCC-style isolation semantics
+- Provides read-your-own-writes isolation semantics (not a stable snapshot — see below)
 - Handles savepoints via nested layers
 - Is well-tested in one place rather than per-module
 
@@ -121,6 +121,37 @@ This architecture ensures:
 - Read-your-own-writes: A connection sees its own uncommitted changes
 - Isolation: Other connections don't see uncommitted changes
 - Efficiency: No overlay created for read-only transactions
+
+---
+
+## Isolation Level Provided
+
+It's worth being precise about what level of isolation this layer actually delivers,
+since "MVCC-style" and "isolation layer" can suggest snapshot isolation. It does not
+provide that. The actual guarantee is **read-committed reads plus read-your-own-writes**:
+
+- **Read-your-own-writes** — a connection always sees its own uncommitted overlay
+  changes (inserts/updates/deletes it has staged but not yet committed).
+- **Reads of shared state are live, not a snapshot** — the merged read path
+  (`IsolatedTable.query`) merges the overlay against the *live* underlying table on
+  every read, and the underlying table is shared across all connections. If another
+  connection commits between two reads in this transaction, the second read can
+  observe that commit. There is no point-in-time view captured at `BEGIN`.
+- **No write-write conflict detection** — this layer does not detect when two
+  connections write the same row in overlapping transactions. At commit, each
+  connection's overlay is flushed to the underlying independently
+  (`flushOverlayToUnderlying`); whichever connection flushes last wins, silently
+  overwriting the other's write.
+- **Snapshotting, if needed, is the underlying module's job** — a module wrapped by
+  this layer (the `underlying` module) is free to provide its own stable-snapshot
+  reads; the isolation layer neither provides nor blocks that. If a consumer needs
+  guaranteed snapshot isolation on top of a non-snapshotting underlying module, the
+  intended extension point is an optional snapshotting pass-through module inserted
+  *below* the isolation layer — no such module exists today.
+
+This is intentional scope, not a gap to be closed here: this layer's job is
+read-your-own-writes plus savepoints on top of an arbitrary underlying module: not
+cross-connection consistency, which is a storage-layer concern.
 
 ---
 
@@ -234,7 +265,7 @@ Modules should advertise their isolation support so consumers can make informed 
 
 ```typescript
 interface ModuleCapabilities {
-  /** Module provides transaction isolation (read-your-own-writes, snapshot reads) */
+  /** Module provides transaction isolation (read-your-own-writes; not necessarily snapshot reads — see the module's own docs for the actual isolation level) */
   isolation?: boolean;
 
   /** Module supports savepoints within transactions */
