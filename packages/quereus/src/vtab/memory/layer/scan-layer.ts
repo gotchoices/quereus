@@ -128,7 +128,7 @@ export function* scanLayer(
 			}
 		}
 
-		for (const value of safeIterate(tree, isAscending, startKey)) {
+		for (const value of safeIterate(tree, isAscending, startKey, primaryKeyExtractorFromRow)) {
 			const row = value as Row;
 			const primaryKey = primaryKeyExtractorFromRow(row);
 			if (!planAppliesToKey(plan, primaryKey, primaryKeyComparator)) {
@@ -228,7 +228,7 @@ export function* scanLayer(
 			}
 		}
 
-		for (const indexEntry of safeIterate(indexTree, isAscending, startKey)) {
+		for (const indexEntry of safeIterate(indexTree, isAscending, startKey, entry => entry.indexKey)) {
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator)) {
 				// Early termination for prefix-range: break when prefix no longer matches
 				if (plan.equalityPrefix) {

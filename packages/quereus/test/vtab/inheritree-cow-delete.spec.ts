@@ -42,7 +42,7 @@ describe('inheritree COW BTree — non-front-anchored delete', () => {
 		for (let i = 1; i <= n; i++) {
 			expect(base.insert(i).on, `base insert ${i}`).to.equal(true);
 		}
-		const cow = new BTree<number, number>(idFn, cmp, base);
+		const cow = new BTree<number, number>(idFn, cmp, { base });
 		return { base, cow };
 	}
 

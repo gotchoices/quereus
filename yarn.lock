@@ -2032,7 +2032,7 @@ __metadata:
     eslint-plugin-import: "npm:^2.32.0"
     fast-check: "npm:^4.8.0"
     fast-json-patch: "npm:^3.1.1"
-    inheritree: "npm:^0.4.0"
+    inheritree: "npm:^1.0.1"
     moat-maker: "npm:^2.2.0"
     mocha: "npm:^11.7.6"
     rimraf: "npm:^6.1.3"
@@ -5676,10 +5676,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"inheritree@npm:^0.4.0":
-  version: 0.4.0
-  resolution: "inheritree@npm:0.4.0"
-  checksum: 10c0/d96011ee4ac3b07724fb3cfb59af16c9e53ea9b614db40da26fa5b2ba84b1cb51459213c3ac8fb703edd744d18b46c6f01f7134c1a6098832af1acade2fb5e12
+"inheritree@npm:^1.0.1":
+  version: 1.0.1
+  resolution: "inheritree@npm:1.0.1"
+  checksum: 10c0/062476fed0dcb8a8c9a8e1ce424eae33b720cefd80590514b479222b606c49447aa3382cad5e79e42cb207296aaf19095761921ddbb366a2858d406c70350f06
   languageName: node
   linkType: hard
 

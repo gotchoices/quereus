@@ -171,7 +171,7 @@ export class MemoryIndex {
 		return new BTree<BTreeKeyForIndex, MemoryIndexEntry>(
 			(entry: MemoryIndexEntry) => entry.indexKey,
 			this.compareKeys,
-			baseInheritreeTable
+			{ base: baseInheritreeTable }
 		);
 	}
 

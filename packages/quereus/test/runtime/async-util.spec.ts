@@ -118,6 +118,26 @@ describe('async-util tee()', () => {
 		expect(state.returned, 'source closed once after last consumer leaves').to.equal(1);
 		expect(state.finallyRan).to.equal(1);
 	});
+
+	it('propagates a source error to the consumer and runs its finally', async () => {
+		const { iterable, state } = makeSource<number>([1], { throwAt: 1 }); // yields 1, then throws
+		const [a] = tee(iterable);
+
+		const seen: number[] = [];
+		let caught: Error | undefined;
+		try {
+			for await (const x of a) seen.push(x);
+		} catch (e) {
+			caught = e as Error;
+		}
+
+		expect(seen).to.deep.equal([1]);
+		expect(caught, 'source error propagated to consumer').to.be.instanceOf(Error);
+		expect(caught!.message).to.match(/boom at 1/);
+		// The source threw internally, so its finally ran exactly once as part of
+		// the throw — cleanup happened, no leak.
+		expect(state.finallyRan, 'source finally ran on throw').to.equal(1);
+	});
 });
 
 describe('async-util merge()', () => {

@@ -71,7 +71,7 @@ export class TransactionLayer implements Layer {
 		this.primaryModifications = new BTree(
 			btreeKeyFromValue,
 			primaryKeyComparator,
-			parentPrimaryTree || undefined // Use parent's primary tree as base
+			{ base: parentPrimaryTree || undefined } // Use parent's primary tree as base
 		);
 
 		// Initialize secondary indexes that inherit from parent's secondary indexes
