@@ -1459,7 +1459,7 @@ export class MemoryTableManager {
 					// Collect-then-delete avoids mutating the tree mid-iteration.
 					const scanPlan: ScanPlan = { indexName: 'primary', descending: false, equalityPrefix: op.keyPrefix };
 					const matched: Array<{ key: BTreeKeyForPrimary; row: Row }> = [];
-					for await (const row of scanLayerImpl(layer, scanPlan)) {
+					for (const row of scanLayerImpl(layer, scanPlan)) {
 						matched.push({ key: this.primaryKeyFunctions.extractFromRow(row), row });
 					}
 					for (const { key, row } of matched) {
@@ -1484,7 +1484,7 @@ export class MemoryTableManager {
 						e => e.key,
 						this.comparePrimaryKeys,
 					);
-					for await (const row of scanLayerImpl(layer, { indexName: 'primary', descending: false })) {
+					for (const row of scanLayerImpl(layer, { indexName: 'primary', descending: false })) {
 						oldByKey.insert({ key: this.primaryKeyFunctions.extractFromRow(row), row });
 					}
 
@@ -2622,9 +2622,22 @@ export class MemoryTableManager {
 		this.baseLayer.rebuildPrimaryTreeFromRows(allRows);
 	}
 
-	/** Scans a layer according to the given plan, yielding matching rows. */
+	/**
+	 * Sync scan — the hot path (query()/internal maintenance) avoids the async hop.
+	 * The backing BTree (inheritree) and all per-row filter/early-term logic are
+	 * fully synchronous, so no async boundary belongs here.
+	 */
+	public scanLayerSync(layer: Layer, plan: ScanPlan): Iterable<Row> {
+		return scanLayerImpl(layer, plan);
+	}
+
+	/**
+	 * Async adapter for external `AsyncIterable<Row>` callers (tests,
+	 * `module.scanEffective`, the backing-host). Retained deliberately — do not
+	 * delete thinking it is dead; delegates to {@link scanLayerSync}.
+	 */
 	public async* scanLayer(layer: Layer, plan: ScanPlan): AsyncIterable<Row> {
-		yield* scanLayerImpl(layer, plan);
+		yield* this.scanLayerSync(layer, plan);
 	}
 }
 

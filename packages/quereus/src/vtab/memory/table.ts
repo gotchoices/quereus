@@ -245,10 +245,12 @@ export class MemoryTable extends VirtualTable {
 		const startLayer = this.readCommitted ? conn.readLayer : (conn.pendingTransactionLayer ?? conn.readLayer);
 		logger.debugLog(`query reading from layer ${startLayer.getLayerId()}`);
 
-		// Delegate scanning to the manager, which handles layer recursion
-		for await (const row of this.manager.scanLayer(startLayer, plan)) {
-			yield row;
-		}
+		// Delegate scanning to the manager, which handles layer recursion.
+		// `scanLayerSync` is synchronous (the backing BTree and all per-row filter
+		// logic are sync); `query` is already async solely for the awaited
+		// `ensureConnection` above, so this is the sole sync→async boundary on the
+		// memory-scan hot path — no extra per-layer promise round-trips.
+		yield* this.manager.scanLayerSync(startLayer, plan);
 	}
 
 	// Note: getBestAccessPlan is handled by the MemoryTableModule, not the table instance.

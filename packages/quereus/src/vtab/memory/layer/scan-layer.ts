@@ -23,10 +23,10 @@ function seekKeyHasNull(key: BTreeKey): boolean {
  * Scans a layer (base or transaction) according to a ScanPlan, yielding matching rows.
  * Operates on the Layer interface — the inherited BTrees handle data inheritance transparently.
  */
-export async function* scanLayer(
+export function* scanLayer(
 	layer: Layer,
 	plan: ScanPlan
-): AsyncIterable<Row> {
+): Iterable<Row> {
 	// Multi-seek: iterate over multiple equality keys (e.g. `col IN (v1, v2, …)`).
 	// This is set-membership, not a bag, so two faults must be avoided:
 	//  - A duplicate seek key (`IN (5, 5)`, or two case-variant literals that hit the
@@ -47,7 +47,7 @@ export async function* scanLayer(
 		for (const key of plan.equalityKeys) {
 			if (seekKeyHasNull(key)) continue;
 			const singlePlan: ScanPlan = { ...plan, equalityKey: key, equalityKeys: undefined };
-			for await (const row of scanLayer(layer, singlePlan)) {
+			for (const row of scanLayer(layer, singlePlan)) {
 				const encoded = encodePk(primaryKeyExtractorFromRow(row));
 				// A key already in `seen` means this row was yielded by an earlier seek.
 				if (seen.has(encoded)) continue;
@@ -128,7 +128,7 @@ export async function* scanLayer(
 			}
 		}
 
-		for await (const value of safeIterate(tree, isAscending, startKey)) {
+		for (const value of safeIterate(tree, isAscending, startKey)) {
 			const row = value as Row;
 			const primaryKey = primaryKeyExtractorFromRow(row);
 			if (!planAppliesToKey(plan, primaryKey, primaryKeyComparator)) {
@@ -228,7 +228,7 @@ export async function* scanLayer(
 			}
 		}
 
-		for await (const indexEntry of safeIterate(indexTree, isAscending, startKey)) {
+		for (const indexEntry of safeIterate(indexTree, isAscending, startKey)) {
 			if (!planAppliesToKey(plan, indexEntry.indexKey, primaryKeyComparator)) {
 				// Early termination for prefix-range: break when prefix no longer matches
 				if (plan.equalityPrefix) {

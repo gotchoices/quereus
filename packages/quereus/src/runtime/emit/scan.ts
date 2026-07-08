@@ -108,6 +108,9 @@ export function emitSeqScan(
 				// Cooperative cancellation checkpoint: a request-timeout (or any
 				// caller abort) interrupts the scan between rows so the whole query
 				// pipeline unwinds promptly instead of draining the table.
+				// NOTE: for the memory vtab this is now the ONLY per-row cancellation
+				// checkpoint — the inner scan layers (safeIterate/scanLayer) went sync,
+				// so do not remove it expecting an inner checkpoint to cover the scan.
 				throwIfAborted(runtimeCtx.signal);
 				rowSlot.set(row);
 				yield row;
