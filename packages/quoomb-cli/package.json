@@ -24,6 +24,7 @@
     "build": "tsc",
     "dev": "tsc && node dist/bin/quoomb.js",
     "lint": "echo 'No lint configured'",
+    "//test": "NOTE: no test files yet; --passWithNoTests keeps this package visible to `yarn test` (not silently skipped) but the green is empty, not earned.",
     "test": "vitest run --passWithNoTests",
     "prepublish": "npm run build"
   },

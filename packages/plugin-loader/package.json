@@ -25,7 +25,10 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "lint": "echo 'No lint configured'",
+    "typecheck": "tsc --noEmit",
+    "//test": "NOTE: no test files yet; --passWithNoTests keeps this package visible to `yarn test`/foreach (not silently skipped) but the green is empty, not earned. Add real vitest specs when plugin-loader gets coverage.",
+    "test": "vitest run --passWithNoTests"
   },
   "peerDependencies": {
     "@quereus/quereus": "workspace:^"
@@ -34,7 +37,8 @@
     "@types/debug": "^4.1.13",
     "@types/node": "^25.9.3",
     "rimraf": "^6.1.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.17"
   },
   "dependencies": {
     "@quereus/quereus": "workspace:^",

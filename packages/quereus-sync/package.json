@@ -41,6 +41,7 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
+    "lint": "echo 'No lint configured'",
     "typecheck": "tsc --noEmit",
     "test": "cd ../.. && node --import ./packages/quereus-sync/register.mjs node_modules/mocha/bin/mocha.js \"packages/quereus-sync/test/**/*.spec.ts\" --reporter min --colors",
     "test:single": "cd ../.. && node --import ./packages/quereus-sync/register.mjs node_modules/mocha/bin/mocha.js --bail"
