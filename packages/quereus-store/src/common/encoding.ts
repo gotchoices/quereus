@@ -9,7 +9,7 @@
  *   0x01 - INTEGER (signed, big-endian with sign flip)
  *   0x02 - REAL (IEEE 754 with sign flip)
  *   0x03 - TEXT (UTF-8, null-terminated, NOCASE by default)
- *   0x04 - BLOB (length-prefixed)
+ *   0x04 - BLOB (raw bytes, escaped + null-terminated)
  *
  * Collation support:
  *   Collations can register a CollationEncoder to transform strings before
@@ -226,32 +226,27 @@ function encodeReal(value: number): Uint8Array {
 }
 
 /**
- * Encode text with collation support.
- * Uses null-termination with escape sequences for embedded nulls.
+ * Encode raw bytes as an order-preserving, null-terminated sequence behind a
+ * type tag. Each 0x00 content byte becomes `0x01 0x01` and each 0x01 becomes
+ * `0x01 0x02`, then a single 0x00 terminator is appended. This preserves memcmp
+ * order for variable-length byte strings: the terminator (0x00) sorts below any
+ * escaped content continuation (which begins at 0x01, or a raw byte >= 0x02), so
+ * a proper prefix always sorts before its extensions, and the escape map is
+ * monotonic in the source byte. Shared by TEXT, OBJECT, and BLOB.
  */
-function encodeText(value: string, collation: string): Uint8Array {
-  // Apply collation transformation via encoder registry
-  const collationEncoder = getCollationEncoder(collation) ?? NOCASE_ENCODER;
-  const sortValue = collationEncoder.encode(value);
-
-  // Encode as UTF-8
-  const encoder = new TextEncoder();
-  const utf8 = encoder.encode(sortValue);
-
+function writeEscapedWithTerminator(typeTag: number, bytes: Uint8Array): Uint8Array {
   // Count bytes needing escape (null bytes and escape bytes)
   let escapeCount = 0;
-  for (const byte of utf8) {
-    if (byte === NULL_BYTE || byte === ESCAPE_BYTE) {
-      escapeCount++;
-    }
+  for (const byte of bytes) {
+    if (byte === NULL_BYTE || byte === ESCAPE_BYTE) escapeCount++;
   }
 
   // Allocate: type prefix + escaped content + null terminator
-  const result = new Uint8Array(1 + utf8.length + escapeCount + 1);
-  result[0] = TYPE_TEXT;
+  const result = new Uint8Array(1 + bytes.length + escapeCount + 1);
+  result[0] = typeTag;
 
   let writePos = 1;
-  for (const byte of utf8) {
+  for (const byte of bytes) {
     if (byte === NULL_BYTE) {
       result[writePos++] = ESCAPE_BYTE;
       result[writePos++] = 0x01; // Escaped null
@@ -268,16 +263,28 @@ function encodeText(value: string, collation: string): Uint8Array {
 }
 
 /**
- * Encode a blob with length prefix.
- * Length is encoded as a variable-length integer for compact storage.
+ * Encode text with collation support.
+ * Uses null-termination with escape sequences for embedded nulls.
+ */
+function encodeText(value: string, collation: string): Uint8Array {
+  // Apply collation transformation via encoder registry
+  const collationEncoder = getCollationEncoder(collation) ?? NOCASE_ENCODER;
+  const sortValue = collationEncoder.encode(value);
+
+  // Encode as UTF-8
+  const utf8 = new TextEncoder().encode(sortValue);
+  return writeEscapedWithTerminator(TYPE_TEXT, utf8);
+}
+
+/**
+ * Encode a blob so its stored bytes sort element-by-element (matching SQL blob
+ * comparison). Emits the raw content bytes through the shared escape + 0x00
+ * terminator scheme — a blob is already raw bytes, so there is no collation or
+ * UTF-8 step. (The prior length-prefix layout sorted a shorter blob before a
+ * longer one regardless of content, which broke leading-PK range seeks.)
  */
 function encodeBlob(value: Uint8Array): Uint8Array {
-  const lengthBytes = encodeVarInt(value.length);
-  const result = new Uint8Array(1 + lengthBytes.length + value.length);
-  result[0] = TYPE_BLOB;
-  result.set(lengthBytes, 1);
-  result.set(value, 1 + lengthBytes.length);
-  return result;
+  return writeEscapedWithTerminator(TYPE_BLOB, value);
 }
 
 /**
@@ -287,50 +294,8 @@ function encodeBlob(value: Uint8Array): Uint8Array {
 function encodeObject(jsonString: string, collation: string): Uint8Array {
   const collationEncoder = getCollationEncoder(collation) ?? NOCASE_ENCODER;
   const sortValue = collationEncoder.encode(jsonString);
-  const encoder = new TextEncoder();
-  const utf8 = encoder.encode(sortValue);
-
-  let escapeCount = 0;
-  for (const byte of utf8) {
-    if (byte === NULL_BYTE || byte === ESCAPE_BYTE) escapeCount++;
-  }
-
-  const result = new Uint8Array(1 + utf8.length + escapeCount + 1);
-  result[0] = TYPE_OBJECT;
-
-  let writePos = 1;
-  for (const byte of utf8) {
-    if (byte === NULL_BYTE) {
-      result[writePos++] = ESCAPE_BYTE;
-      result[writePos++] = 0x01;
-    } else if (byte === ESCAPE_BYTE) {
-      result[writePos++] = ESCAPE_BYTE;
-      result[writePos++] = 0x02;
-    } else {
-      result[writePos++] = byte;
-    }
-  }
-  result[writePos] = NULL_BYTE;
-
-  return result;
-}
-
-/**
- * Encode an unsigned integer as a variable-length byte sequence.
- * Uses high bit continuation: 1xxxxxxx means more bytes follow.
- */
-function encodeVarInt(value: number): Uint8Array {
-  if (value < 0) throw new Error('VarInt must be non-negative');
-
-  const bytes: number[] = [];
-  do {
-    let byte = value & 0x7f;
-    value >>>= 7;
-    if (value > 0) byte |= 0x80;
-    bytes.push(byte);
-  } while (value > 0);
-
-  return new Uint8Array(bytes);
+  const utf8 = new TextEncoder().encode(sortValue);
+  return writeEscapedWithTerminator(TYPE_OBJECT, utf8);
 }
 
 // ============================================================================
@@ -441,12 +406,17 @@ function decodeReal(buffer: Uint8Array, offset: number): { value: number; bytesR
   return { value, bytesRead: 9 };
 }
 
-function decodeText(
+/**
+ * Decode a null-terminated escaped byte sequence written by
+ * {@link writeEscapedWithTerminator}, starting at the type byte at `offset`.
+ * Un-escapes `0x01 0x01` -> 0x00 and `0x01 0x02` -> 0x01, stops at the 0x00
+ * terminator, and returns the content bytes plus total bytes consumed (type tag
+ * and terminator included). Shared by TEXT, OBJECT, and BLOB.
+ */
+function readEscapedUntilTerminator(
   buffer: Uint8Array,
-  offset: number,
-  _collation: string
-): { value: string; bytesRead: number } {
-  // Find null terminator, handling escapes
+  offset: number
+): { bytes: Uint8Array; bytesRead: number } {
   const bytes: number[] = [];
   let i = offset + 1;
 
@@ -477,64 +447,31 @@ function decodeText(
     }
   }
 
-  const decoder = new TextDecoder();
-  const value = decoder.decode(new Uint8Array(bytes));
+  return { bytes: new Uint8Array(bytes), bytesRead: i - offset };
+}
+
+function decodeText(
+  buffer: Uint8Array,
+  offset: number,
+  _collation: string
+): { value: string; bytesRead: number } {
+  const { bytes, bytesRead } = readEscapedUntilTerminator(buffer, offset);
+  const value = new TextDecoder().decode(bytes);
 
   // Note: We return the lowercase version if NOCASE was used during encoding.
   // The original case is preserved in the row value, not the key.
-  return { value, bytesRead: i - offset };
+  return { value, bytesRead };
 }
 
 function decodeBlob(buffer: Uint8Array, offset: number): { value: Uint8Array; bytesRead: number } {
-  const { value: length, bytesRead: lengthBytes } = decodeVarInt(buffer, offset + 1);
-  const dataStart = offset + 1 + lengthBytes;
-
-  if (dataStart + length > buffer.length) {
-    throw new Error('Buffer underflow: BLOB data truncated');
-  }
-
-  const value = buffer.slice(dataStart, dataStart + length);
-  return { value, bytesRead: 1 + lengthBytes + length };
+  const { bytes, bytesRead } = readEscapedUntilTerminator(buffer, offset);
+  return { value: bytes, bytesRead };
 }
 
 function decodeObject(buffer: Uint8Array, offset: number): { value: SqlValue; bytesRead: number } {
-  // Decode like TEXT (null-terminated with escapes) then parse JSON
-  const bytes: number[] = [];
-  let i = offset + 1;
-
-  while (i < buffer.length) {
-    const byte = buffer[i];
-    if (byte === NULL_BYTE) { i++; break; }
-    if (byte === ESCAPE_BYTE && i + 1 < buffer.length) {
-      const next = buffer[i + 1];
-      if (next === 0x01) { bytes.push(NULL_BYTE); i += 2; }
-      else if (next === 0x02) { bytes.push(ESCAPE_BYTE); i += 2; }
-      else { bytes.push(byte); i++; }
-    } else {
-      bytes.push(byte);
-      i++;
-    }
-  }
-
-  const decoder = new TextDecoder();
-  const jsonString = decoder.decode(new Uint8Array(bytes));
+  const { bytes, bytesRead } = readEscapedUntilTerminator(buffer, offset);
+  const jsonString = new TextDecoder().decode(bytes);
   const value = JSON.parse(jsonString) as SqlValue;
-  return { value, bytesRead: i - offset };
-}
-
-function decodeVarInt(buffer: Uint8Array, offset: number): { value: number; bytesRead: number } {
-  let value = 0;
-  let shift = 0;
-  let bytesRead = 0;
-
-  while (offset + bytesRead < buffer.length) {
-    const byte = buffer[offset + bytesRead];
-    bytesRead++;
-    value |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) break;
-    shift += 7;
-  }
-
   return { value, bytesRead };
 }
 

@@ -344,6 +344,50 @@ describe('StoreModule predicate pushdown', () => {
 		});
 	});
 
+	// Regression for `store-blob-key-varint-not-memcmp-ordered`: a BLOB primary key
+	// must encode so its stored bytes sort element-by-element (matching SQL blob
+	// comparison). The old length-prefix layout sorted a shorter blob before a
+	// longer one regardless of content, so a leading-PK range seek silently dropped
+	// qualifying rows the mis-ordered window skipped (matchesFilters can only
+	// re-filter rows the seek already yielded — it cannot recover a skipped one).
+	describe('blob primary key range seek (store-blob-key-varint-not-memcmp-ordered)', () => {
+		// x'0102' < x'03' element-wise (0x01 < 0x03), yet a length-first byte layout
+		// sorts the shorter x'03' (len 1) before x'0102' (len 2). x'0102ff' also
+		// exercises prefix < extension (a proper prefix must sort before its
+		// extensions). Ordered by b: x'0102'(1), x'0102ff'(3), x'03'(2).
+		async function seedBlobs(name: string, using: string): Promise<void> {
+			await db.exec(`create table ${name} (b blob primary key, n integer) ${using}`);
+			await db.exec(`insert into ${name} values (x'0102', 1), (x'03', 2), (x'0102ff', 3)`);
+		}
+
+		it('ASC: b >= x\'0102\' matches the memory-vtab oracle (no under-fetch)', async () => {
+			await seedBlobs('bstore', 'using store');
+			await seedBlobs('bmem', ''); // default in-memory vtab = full-scan oracle
+			const q = (t: string) => `select n from ${t} where b >= x'0102' order by b`;
+			const storeRows = (await asyncIterableToArray(db.eval(q('bstore')))).map(r => r.n);
+			const memRows = (await asyncIterableToArray(db.eval(q('bmem')))).map(r => r.n);
+			// Oracle and store agree, and both equal the element-wise order.
+			expect(memRows).to.deep.equal([1, 3, 2]);
+			expect(storeRows).to.deep.equal(memRows);
+		});
+
+		it('ASC: b > x\'0102\' excludes the equal blob', async () => {
+			await seedBlobs('bstore2', 'using store');
+			const rows = await asyncIterableToArray(db.eval(`select n from bstore2 where b > x'0102' order by b`));
+			expect(rows.map(r => r.n)).to.deep.equal([3, 2]);
+		});
+
+		// DESC blob PK: encodeCompositeKey bit-inverts each component's bytes; the
+		// variable-length + terminator scheme must stay order-correct under inversion.
+		it('DESC: b >= x\'0102\' seeks under inversion and returns correct rows', async () => {
+			await db.exec(`create table bdesc (b blob primary key desc, n integer) using store`);
+			await db.exec(`insert into bdesc values (x'0102', 1), (x'03', 2), (x'0102ff', 3)`);
+			const rows = await asyncIterableToArray(db.eval(`select n from bdesc where b >= x'0102' order by b desc`));
+			// order by b desc: x'03'(2), x'0102ff'(3), x'0102'(1)
+			expect(rows.map(r => r.n)).to.deep.equal([2, 3, 1]);
+		});
+	});
+
 	// A leading PK key collation with NO registered byte encoder must NOT produce a
 	// narrowed window — `encodeText` silently falls back to NOCASE bytes that do not
 	// track the column's logical order, so a derived window could under-fetch.
