@@ -11,6 +11,9 @@ packages/sync-coordinator/.data
 # Task runner agent logs
 tasks/.logs/
 
+# Transient validation logs (agent `tee` output; must not be committed)
+*.log
+
 # Transient scheduled-tasks lock (per-session pid/lock; must not be committed)
 .claude/scheduled_tasks.lock
 
