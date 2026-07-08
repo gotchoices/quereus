@@ -201,6 +201,7 @@ export type SnapshotChunkType =
   | 'header'
   | 'table-start'
   | 'column-versions'
+  | 'tombstone'
   | 'table-end'
   | 'schema-migration'
   | 'footer';
@@ -241,6 +242,28 @@ export interface SnapshotColumnVersionsChunk {
 }
 
 /**
+ * Tombstone chunk - a batch of deletion records for one `(schema, table)`.
+ *
+ * Emitted as its own stream section (a GLOBAL pass over every tombstone), NOT
+ * folded into the column-version table sections, so a fully-deleted row — whose
+ * columns are gone but whose tombstone remains — still travels even when its
+ * table has no live column-versions left. An explicit entry object (not a
+ * positional tuple) because `priorRow` is optional.
+ */
+export interface SnapshotTombstoneChunk {
+  readonly type: 'tombstone';
+  readonly schema: string;
+  readonly table: string;
+  readonly entries: ReadonlyArray<{
+    readonly pk: SqlValue[];
+    readonly hlc: HLC;
+    readonly createdAt: number;
+    /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */
+    readonly priorRow?: Row;
+  }>;
+}
+
+/**
  * Table end chunk - marks end of a table's data.
  */
 export interface SnapshotTableEndChunk {
@@ -276,6 +299,7 @@ export type SnapshotChunk =
   | SnapshotHeaderChunk
   | SnapshotTableStartChunk
   | SnapshotColumnVersionsChunk
+  | SnapshotTombstoneChunk
   | SnapshotTableEndChunk
   | SnapshotSchemaMigrationChunk
   | SnapshotFooterChunk;

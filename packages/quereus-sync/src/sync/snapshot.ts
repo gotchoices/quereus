@@ -7,6 +7,7 @@
 
 import type { SqlValue, Row } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
+import { assertWithinDrift } from '../clock/hlc.js';
 import { deserializeColumnVersion, type ColumnVersion } from '../metadata/column-version.js';
 import { deserializeMigration } from '../metadata/schema-migration.js';
 import {
@@ -26,6 +27,7 @@ import type {
 	SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
+import { toError } from './sync-context.js';
 import { admitGroup } from './admission.js';
 
 /**
@@ -116,6 +118,21 @@ export async function applySnapshot(
 	ctx: SyncContext,
 	snapshot: Snapshot,
 ): Promise<void> {
+	// Pre-commit drift validation (mirrors applyChanges / applySnapshotStream): reject a
+	// snapshot whose HLC is beyond the drift bound BEFORE clearing or writing anything,
+	// so a far-future peer cannot land poison LWW winners. Emit status:'error' first for
+	// UI parity with the data-apply failure path.
+	// NOTE: this non-streaming path still OMITS tombstones from the snapshot (the
+	// `Snapshot`/`TableSnapshot` interface carries none), so a deleted row can resurrect
+	// after an `applySnapshot` bootstrap — the same defect fixed for the streaming path.
+	// Tracked as ticket `bug-nonstreaming-snapshot-tombstones`.
+	try {
+		assertWithinDrift(snapshot.hlc.wallTime, BigInt(Date.now()));
+	} catch (error) {
+		ctx.syncEvents.emitSyncStateChange({ status: 'error', error: toError(error) });
+		throw error;
+	}
+
 	// PHASE 1: Build data changes from snapshot
 	const dataChangesToApply: DataChangeToApply[] = [];
 	const schemaChangesToApply: SchemaChangeToApply[] = [];

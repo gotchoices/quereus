@@ -107,6 +107,23 @@ export function serializeSnapshotChunk(chunk: SnapshotChunk): object {
 					hlc: Buffer.from(serializeHLC(chunk.migration.hlc)).toString('base64'),
 				},
 			};
+		case 'tombstone':
+			// Each entry carries an HLC (bigint wallTime) and blob-capable pk/priorRow,
+			// so it MUST go through serializeHLC / encodeSqlValue — the default passthrough
+			// would throw on the bigint at JSON.stringify (e.g. the S3 snapshot upload).
+			return {
+				type: chunk.type,
+				schema: chunk.schema,
+				table: chunk.table,
+				entries: chunk.entries.map(e => ({
+					pk: e.pk.map(v => encodeSqlValue(v)),
+					hlc: Buffer.from(serializeHLC(e.hlc)).toString('base64'),
+					createdAt: e.createdAt,
+					...(e.priorRow !== undefined
+						? { priorRow: e.priorRow.map(v => encodeSqlValue(v)) }
+						: {}),
+				})),
+			};
 		// table-start, table-end, footer have no binary fields
 		default:
 			return chunk;
@@ -150,6 +167,20 @@ export function deserializeSnapshotChunk(obj: unknown): SnapshotChunk {
 				},
 			} as SnapshotChunk;
 		}
+		case 'tombstone':
+			return {
+				type: 'tombstone',
+				schema: chunk.schema as string,
+				table: chunk.table as string,
+				entries: (chunk.entries as Record<string, unknown>[]).map(e => ({
+					pk: (e.pk as unknown[]).map(v => decodeSqlValue(v)),
+					hlc: deserializeHLC(Buffer.from(e.hlc as string, 'base64')),
+					createdAt: e.createdAt as number,
+					...(e.priorRow !== undefined
+						? { priorRow: (e.priorRow as unknown[]).map(v => decodeSqlValue(v)) }
+						: {}),
+				})),
+			} as SnapshotChunk;
 		// table-start, table-end, footer have no binary fields
 		default:
 			return chunk as unknown as SnapshotChunk;

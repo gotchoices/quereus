@@ -88,6 +88,18 @@ both for storage (`serializeHLC`) and as the sortable change-log key component
 (`serializeHLCForKey`), where the `opSeq` bytes sit after `siteId` so lexicographic
 key order matches `compareHLC`.
 
+**Clock-drift bound — rejected pre-commit.** A remote HLC whose `wallTime` exceeds
+the local wall time by more than `MAX_DRIFT_MS` (60 s) is rejected: a peer with a
+badly-wrong clock would otherwise land far-future LWW winners that permanently beat
+every legitimate future write. The check (`assertWithinDrift` in `clock/hlc.ts`) is a
+side-effect-free bound that both the apply paths and `HLCManager.receive` share. It
+runs as **pre-commit validation** — the wire path checks the batch's maximum fact HLC
+at the top of `applyChanges`, and the snapshot path checks the header HLC before
+`clearExistingMetadata`, both **before any data or CRDT metadata is written**. So a
+rejected drifted batch/snapshot lands **nothing** (the receiver's existing metadata is
+not even cleared); `receive`'s own late check remains only as a harmless last-line
+defense.
+
 ### Conflict Resolution: Column-Level Last-Write-Wins (LWW)
 
 Each column of each row is tracked independently. When the same column is modified on multiple replicas, the write with the highest HLC wins.
@@ -149,6 +161,8 @@ Deletions are recorded as "tombstones" with an HLC timestamp. Tombstones prevent
 - **Optional: Resurrection Allowed** - An insert/update with HLC > T1 can resurrect a deleted row
 
 **Tombstone TTL**: Tombstones are retained for a configurable duration (default: 30 days). Sync attempts after TTL expiration should fall back to full snapshot transfer.
+
+**Tombstones travel in snapshots**: A snapshot (streamed or whole) carries its tombstones alongside column-versions, so a fresh replica bootstrapped from a snapshot ends with the sender's tombstones — a row deleted before the snapshot stays deleted, and a later stale write for it stays tombstone-blocked. (The streamed form is a global `tombstone`-chunk pass; see the Streaming Snapshot section.) One caveat: `createdAt` is re-based to bootstrap time on the receiver — a bootstrapped tombstone lives a full TTL horizon from the bootstrap, not from the original deletion.
 
 ### Unknown-Table Disposition
 
@@ -420,6 +434,8 @@ This order is safe because:
 - If crash occurs after metadata: all writes complete, consistent state
 
 The reverse order (metadata first) would be dangerous: if we crash after writing metadata but before data, the CRDT state believes the change is applied but data is missing—and re-sync won't retry.
+
+**Clock-drift rejection is pre-commit validation** (not a post-commit failure). Both apply paths validate the incoming clock — the wire path the batch's maximum fact HLC at the top of `applyChanges`, the snapshot path the header HLC before `clearExistingMetadata` — **before** any data or CRDT metadata is written (see the HLC section's *Clock-drift bound*). A drifted batch/snapshot is therefore rejected with **nothing landed**; it does not first commit far-future poison winners and then throw. This is orthogonal to the data-first/metadata-second ordering below, which governs a batch that passed validation.
 
 **Invariant — metadata follows a landed data write**: CRDT metadata must **not** be committed for any change whose data write did not land. This covers two failure shapes, handled identically:
 - **Whole-batch throw**: the `applyToStore` callback throws (e.g. the seam commit fails on a connection error or a deferred row constraint). The exception propagates; no metadata is committed. A commit-time **global-assertion** violation is *not* one of these — it is detect-and-notify (see *Apply-time validation* below), so it does not throw and does not block the metadata commit.
@@ -749,11 +765,18 @@ interface SyncManager {
    *
    * A fresh apply replaces all local CRDT metadata: the up-front clear wipes
    * column versions, tombstones, and the change log before the chunks rewrite
-   * them. On a *resumed* apply the sender skips already-completed tables and
-   * never re-emits their metadata, so the receiver consults the persisted
+   * them. Tombstones ARE carried in the stream (a global `tombstone`-chunk pass,
+   * separate from the per-table column-version sections), so a deleted row stays
+   * deleted after bootstrap — a later stale write for it stays tombstone-blocked
+   * instead of resurrecting. On a *resumed* apply the sender skips already-completed
+   * tables and never re-emits their metadata, so the receiver consults the persisted
    * checkpoint (saved under `sc:{snapshotId}`) and preserves those completed
    * tables through the clear — otherwise their CRDT state would be wiped and
-   * never rewritten, diverging from the row data still in the store.
+   * never rewritten, diverging from the row data still in the store. (Tombstones
+   * are re-emitted wholesale on resume and re-written idempotently.)
+   *
+   * The header HLC is drift-validated before the clear (see the HLC section): a
+   * far-future snapshot is rejected before any local metadata is touched.
    */
   applySnapshotStream(
     chunks: AsyncIterable<SnapshotChunk>,
@@ -773,9 +796,10 @@ interface SyncManager {
 
 /** Snapshot chunk types for streaming */
 type SnapshotChunk =
-  | SnapshotHeaderChunk      // Sent first with metadata
+  | SnapshotHeaderChunk      // Sent first with metadata (HLC drift-validated here)
   | SnapshotTableStartChunk  // Marks beginning of a table
   | SnapshotColumnVersionsChunk  // Batch of column versions
+  | SnapshotTombstoneChunk   // Batch of deletion records (global pass; carries fully-deleted rows)
   | SnapshotTableEndChunk    // Marks end of a table
   | SnapshotSchemaMigrationChunk  // Schema migration
   | SnapshotFooterChunk;     // Sent last with stats

@@ -476,5 +476,49 @@ describe('Serialization', () => {
 
 			expect(restored[4].type).to.equal('footer');
 		});
+
+		it('should round-trip a tombstone chunk through JSON.stringify/parse (bigint HLC + blob/bigint/null cells)', () => {
+			const siteId = generateSiteId();
+			const hlc = createHLC(BigInt(1234567890), 4, siteId, 2);
+			const blob = new Uint8Array([9, 8, 7]);
+			const original: SnapshotChunk = {
+				type: 'tombstone',
+				schema: 'main',
+				table: 'users',
+				entries: [
+					{ pk: ['r1'], hlc, createdAt: 111 },
+					{ pk: [42n], hlc, createdAt: 222, priorRow: [42n, 'Alice', blob, null] },
+				],
+			};
+
+			// Real wire hop (the S3 store/download path): serialize → JSON string → parse
+			// → deserialize. A raw bigint HLC that slipped through the default passthrough
+			// would throw at JSON.stringify here rather than pass silently.
+			const restored = deserializeSnapshotChunk(
+				JSON.parse(JSON.stringify(serializeSnapshotChunk(original))),
+			) as any;
+
+			expect(restored.type).to.equal('tombstone');
+			expect(restored.schema).to.equal('main');
+			expect(restored.table).to.equal('users');
+			expect(restored.entries).to.have.length(2);
+
+			// Entry 0: no priorRow; HLC preserved including opSeq; createdAt preserved.
+			expect(restored.entries[0].pk).to.deep.equal(['r1']);
+			expect(restored.entries[0].hlc.wallTime).to.equal(BigInt(1234567890));
+			expect(restored.entries[0].hlc.counter).to.equal(4);
+			expect(restored.entries[0].hlc.opSeq).to.equal(2);
+			expect(restored.entries[0].createdAt).to.equal(111);
+			expect('priorRow' in restored.entries[0]).to.equal(false);
+
+			// Entry 1: bigint pk + a priorRow carrying bigint, string, blob, and null cells.
+			expect(restored.entries[1].pk[0]).to.equal(42n);
+			expect(restored.entries[1].createdAt).to.equal(222);
+			expect(restored.entries[1].priorRow[0]).to.equal(42n);
+			expect(restored.entries[1].priorRow[1]).to.equal('Alice');
+			expect(restored.entries[1].priorRow[2]).to.be.instanceOf(Uint8Array);
+			expect(Array.from(restored.entries[1].priorRow[2] as Uint8Array)).to.deep.equal([9, 8, 7]);
+			expect(restored.entries[1].priorRow[3]).to.be.null;
+		});
 	});
 });

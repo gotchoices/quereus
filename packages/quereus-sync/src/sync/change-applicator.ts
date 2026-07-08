@@ -8,7 +8,7 @@
  */
 
 import type { WriteBatch } from '@quereus/store';
-import { compareHLC, maxHLC } from '../clock/hlc.js';
+import { compareHLC, maxHLC, assertWithinDrift } from '../clock/hlc.js';
 import { siteIdEquals, type SiteId } from '../clock/site.js';
 import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
@@ -24,6 +24,7 @@ import type {
 	SchemaMigration,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
+import { toError } from './sync-context.js';
 import { admitGroup } from './admission.js';
 
 /**
@@ -118,6 +119,24 @@ export async function applyChanges(
 	const unknownByTable = new Map<string, UnknownTableGroup>();
 
 	const { created: batchCreated, dropped: batchDropped } = computeBatchTableDelta(changes);
+
+	// Pre-commit drift validation: reject a batch whose maximum fact HLC is beyond the
+	// drift bound BEFORE any resolution, data write, or CRDT metadata commit — so a peer
+	// with a badly-wrong clock cannot land far-future LWW winners that then beat every
+	// legitimate future write. `cs.hlc` is each transaction's max fact HLC, so the batch
+	// max bounds every fact in the batch. This same value is the merge watermark below
+	// (one `maxHLC` computation, reused). Throwing here exits before `admitGroup`, so no
+	// data and no metadata commit; emit `status:'error'` first for parity with the
+	// `applyDataToStore` failure path so the UI reacts identically to a rejected batch.
+	const watermarkHLC = maxHLC(changes.map(cs => cs.hlc));
+	if (watermarkHLC) {
+		try {
+			assertWithinDrift(watermarkHLC.wallTime, BigInt(Date.now()));
+		} catch (error) {
+			ctx.syncEvents.emitSyncStateChange({ status: 'error', error: toError(error) });
+			throw error;
+		}
+	}
 
 	// PHASE 1: Resolve all changes (no writes yet). The clock watermark is merged
 	// once after a successful admission (see admitGroup below), not per changeset —
@@ -245,8 +264,10 @@ export async function applyChanges(
 		},
 		// Merging the batch max once is equivalent to receiving each changeset's
 		// HLC (receive is a monotonic max-merge); on a mid-batch abort the clock
-		// does not advance and the batch re-resolves next sync.
-		watermarkHLC: maxHLC(changes.map(cs => cs.hlc)),
+		// does not advance and the batch re-resolves next sync. Computed once at the
+		// top (drift-validated there); undefined only for an empty batch, which
+		// admitGroup treats as no watermark merge.
+		watermarkHLC,
 	});
 
 	// Emit remote change events (grouped by the relaying changeset's siteId).

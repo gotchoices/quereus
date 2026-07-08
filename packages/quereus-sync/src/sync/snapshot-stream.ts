@@ -7,8 +7,10 @@
 
 import type { SqlValue } from '@quereus/quereus';
 import type { HLC } from '../clock/hlc.js';
+import { assertWithinDrift } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import { deserializeColumnVersion } from '../metadata/column-version.js';
+import { deserializeTombstone } from '../metadata/tombstones.js';
 import { deserializeMigration } from '../metadata/schema-migration.js';
 import {
 	buildAllColumnVersionsScanBounds,
@@ -29,6 +31,7 @@ import type {
 	SnapshotHeaderChunk,
 	SnapshotTableStartChunk,
 	SnapshotColumnVersionsChunk,
+	SnapshotTombstoneChunk,
 	SnapshotTableEndChunk,
 	SnapshotSchemaMigrationChunk,
 	SnapshotFooterChunk,
@@ -36,7 +39,7 @@ import type {
 	SchemaChangeToApply,
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
-import { persistHLCState } from './sync-context.js';
+import { persistHLCState, toError } from './sync-context.js';
 import { applyDataToStore } from './admission.js';
 
 /** Default chunk size for streaming snapshots. */
@@ -61,6 +64,15 @@ interface StreamSnapshotOptions {
 	completedTables?: Set<string>;
 	/** Initial entry count (for resumed transfers). */
 	initialEntryCount?: number;
+}
+
+/** Assemble one tombstone chunk for a `(schema, table)` batch of entries. */
+function buildTombstoneChunk(
+	schema: string,
+	table: string,
+	entries: Array<SnapshotTombstoneChunk['entries'][number]>,
+): SnapshotTombstoneChunk {
+	return { type: 'tombstone', schema, table, entries };
 }
 
 /**
@@ -184,6 +196,53 @@ async function* streamSnapshotChunks(
 			},
 		};
 		yield migrationChunk;
+	}
+
+	// Stream tombstones — a GLOBAL pass over every tombstone (not a per-`tableKeys`
+	// pass), batched by `(schema, table)` into `chunkSize` chunks. A row whose columns
+	// were all deleted has a tombstone but no live column-versions, so its table may be
+	// absent from `tableKeys`; the global pass carries it regardless. The scan is
+	// key-sorted, so all tombstones for one `(schema, table)` are contiguous (the
+	// `tb:{schema}.{table}:` prefix + `:` separator guarantee no interleaving) — a fresh
+	// chunk starts whenever the table changes or the batch fills.
+	// NOTE: on a RESUMED transfer this re-emits ALL tombstones regardless of the
+	// checkpoint's completed tables (tombstones are not tracked per-table there). The
+	// consumer re-writes them idempotently (same key, same bytes) — a deliberate
+	// simplification (correctness over minimal bytes), not a bug.
+	const tsBounds = buildAllTombstonesScanBounds();
+	let tsEntries: Array<SnapshotTombstoneChunk['entries'][number]> = [];
+	let tsSchema: string | undefined;
+	let tsTable: string | undefined;
+
+	for await (const entry of ctx.kv.iterate(tsBounds)) {
+		const parsed = parseTombstoneKey(entry.key);
+		if (!parsed) continue;
+
+		// Table boundary: flush the prior table's accumulated entries first.
+		if (parsed.schema !== tsSchema || parsed.table !== tsTable) {
+			if (tsEntries.length > 0 && tsSchema !== undefined && tsTable !== undefined) {
+				yield buildTombstoneChunk(tsSchema, tsTable, tsEntries);
+			}
+			tsEntries = [];
+			tsSchema = parsed.schema;
+			tsTable = parsed.table;
+		}
+
+		const tombstone = deserializeTombstone(entry.value);
+		tsEntries.push({
+			pk: parsed.pk,
+			hlc: tombstone.hlc,
+			createdAt: tombstone.createdAt,
+			...(tombstone.priorRow !== undefined ? { priorRow: tombstone.priorRow } : {}),
+		});
+
+		if (tsEntries.length >= chunkSize) {
+			yield buildTombstoneChunk(tsSchema, tsTable, tsEntries);
+			tsEntries = [];
+		}
+	}
+	if (tsEntries.length > 0 && tsSchema !== undefined && tsTable !== undefined) {
+		yield buildTombstoneChunk(tsSchema, tsTable, tsEntries);
 	}
 
 	// Yield footer
@@ -324,6 +383,28 @@ export async function applySnapshotStream(
 	let batchSize = 0;
 	const BATCH_FLUSH_SIZE = 1000;
 
+	// Flush the accumulated metadata batch and (on a live transfer) save a resume
+	// checkpoint. Shared by the column-version and tombstone chunk handlers so both
+	// honor the same BATCH_FLUSH_SIZE bound and checkpoint cadence.
+	const flushMetadataBatch = async (): Promise<void> => {
+		await batch.write();
+		batch = ctx.kv.batch();
+		batchSize = 0;
+
+		if (snapshotId && snapshotHLC) {
+			await saveSnapshotCheckpoint(ctx, {
+				snapshotId,
+				siteId: ctx.getSiteId(),
+				hlc: snapshotHLC,
+				lastTableIndex: tablesProcessed,
+				lastEntryIndex: entriesProcessed,
+				completedTables: [...completedTables],
+				entriesProcessed,
+				createdAt: Date.now(),
+			});
+		}
+	};
+
 	let currentTableSchema: string | undefined;
 	let currentTableName: string | undefined;
 	const rowColumns = new Map<string, Record<string, SqlValue>>();
@@ -334,6 +415,18 @@ export async function applySnapshotStream(
 				snapshotId = chunk.snapshotId;
 				snapshotHLC = chunk.hlc;
 				totalTables = chunk.tableCount;
+
+				// Pre-commit drift validation: reject a snapshot whose header HLC is beyond
+				// the drift bound BEFORE clearing local metadata or applying any chunk — so a
+				// far-future peer cannot wipe the receiver's state or land poison LWW winners.
+				// The footer's `receive(snapshotHLC)` then merges a known-in-bound clock. Emit
+				// `status:'error'` first for parity with the data-apply failure path.
+				try {
+					assertWithinDrift(chunk.hlc.wallTime, BigInt(Date.now()));
+				} catch (error) {
+					ctx.syncEvents.emitSyncStateChange({ status: 'error', error: toError(error) });
+					throw error;
+				}
 
 				// On a resumed transfer the sender skips tables it already streamed and
 				// never re-emits their metadata. Look up the persisted checkpoint (saved
@@ -398,23 +491,7 @@ export async function applySnapshotStream(
 					entriesProcessed++;
 
 					if (batchSize >= BATCH_FLUSH_SIZE) {
-						await batch.write();
-						batch = ctx.kv.batch();
-						batchSize = 0;
-
-						// Save checkpoint
-						if (snapshotId && snapshotHLC) {
-							await saveSnapshotCheckpoint(ctx, {
-								snapshotId,
-								siteId: ctx.getSiteId(),
-								hlc: snapshotHLC,
-								lastTableIndex: tablesProcessed,
-								lastEntryIndex: entriesProcessed,
-								completedTables: [...completedTables],
-								entriesProcessed,
-								createdAt: Date.now(),
-							});
-						}
+						await flushMetadataBatch();
 					}
 				}
 
@@ -427,6 +504,26 @@ export async function applySnapshotStream(
 						totalEntries,
 						currentTable,
 					});
+				}
+				break;
+
+			case 'tombstone':
+				// Tombstones are pure CRDT metadata: write each into the same batch as
+				// column-versions, honoring the shared BATCH_FLUSH_SIZE / checkpoint path.
+				// There is NO store data for a deleted row, so nothing is pushed to
+				// `pendingDataChanges`. `clearExistingMetadata` already ran at `header`, so
+				// these writes repopulate the just-cleared tombstone space.
+				for (const { pk, hlc, priorRow } of chunk.entries) {
+					// NOTE: `setTombstoneBatch` stamps `createdAt = Date.now()` internally and
+					// ignores the sender's `entry.createdAt`, so a bootstrapped tombstone's TTL
+					// horizon is re-based to bootstrap time rather than preserved. Acceptable
+					// for phase 1 (the tombstone lives a full horizon from bootstrap).
+					ctx.tombstones.setTombstoneBatch(batch, chunk.schema, chunk.table, pk, hlc, priorRow);
+
+					batchSize++;
+					if (batchSize >= BATCH_FLUSH_SIZE) {
+						await flushMetadataBatch();
+					}
 				}
 				break;
 

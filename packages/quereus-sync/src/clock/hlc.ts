@@ -51,7 +51,24 @@ export const MAX_OPSEQ = 0xFFFFFFFF;
  * Maximum allowed clock drift in milliseconds (1 minute).
  * Rejects remote timestamps that are too far in the future.
  */
-const MAX_DRIFT_MS = 60_000n;
+export const MAX_DRIFT_MS = 60_000n;
+
+/**
+ * Assert a remote wall time is within the drift bound of `now`.
+ *
+ * Throws when `remoteWallTime` exceeds `now` by more than {@link MAX_DRIFT_MS}.
+ * Side-effect-free (no clock mutation), so the apply paths can validate a batch's
+ * clock BEFORE any data or CRDT metadata is written — rejecting a far-future peer
+ * up front rather than after its poison LWW winners have durably committed.
+ * {@link HLCManager.receive} delegates here so the bound has a single definition.
+ */
+export function assertWithinDrift(remoteWallTime: bigint, now: bigint): void {
+  if (remoteWallTime > now + MAX_DRIFT_MS) {
+    throw new Error(
+      `Remote clock too far in future: ${remoteWallTime - now}ms ahead (max ${MAX_DRIFT_MS}ms)`
+    );
+  }
+}
 
 /**
  * Compare two HLCs for ordering.
@@ -325,12 +342,9 @@ export class HLCManager {
   receive(remote: HLC): HLC {
     const now = BigInt(Date.now());
 
-    // Check for excessive drift
-    if (remote.wallTime > now + MAX_DRIFT_MS) {
-      throw new Error(
-        `Remote clock too far in future: ${remote.wallTime - now}ms ahead (max ${MAX_DRIFT_MS}ms)`
-      );
-    }
+    // Check for excessive drift (single source of truth — kept here as a harmless
+    // last-line defense even though the apply paths now validate pre-commit).
+    assertWithinDrift(remote.wallTime, now);
 
     // Merge: take max of local, remote, and now
     const maxWall = now > this.wallTime
