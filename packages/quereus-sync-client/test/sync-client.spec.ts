@@ -1065,6 +1065,25 @@ describe('SyncClient', () => {
       const delta = syncManager.getChangesSinceCalls.find(c => c.sinceHLC !== undefined);
       expect(delta!.sinceHLC).to.deep.equal(hlc);
     });
+
+    it('never drags an ahead-of-persisted in-memory watermark backward when seeding', async () => {
+      // Models an auto-reconnect: in-flight pushes advanced the in-memory
+      // watermark past the last durable write. Seeding must keep the higher
+      // in-memory value, not regress to the stale persisted one.
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      const { client } = createClient({ syncManager });
+      await connectAndHandshake(client);
+
+      const ahead: HLC = { wallTime: 9000n, counter: 5, siteId: site, opSeq: 0 };
+      const stale: HLC = { wallTime: 3000n, counter: 1, siteId: site, opSeq: 0 };
+      (client as any).lastSentHLC = ahead;
+      syncManager.peerSentState = stale;
+
+      await (client as any).seedSentWatermark();
+
+      expect((client as any).lastSentHLC).to.deep.equal(ahead);
+    });
   });
 
   // ==========================================================================
