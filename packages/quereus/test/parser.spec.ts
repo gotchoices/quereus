@@ -296,6 +296,21 @@ describe('Parser', () => {
 				}
 			}
 		});
+
+		it('should propagate a typed ParseError unchanged, preserving subclass and location', () => {
+			// This site (unknown rename_policy value) is one of the few that throws
+			// the ParseError subclass directly rather than the base QuereusError.
+			try {
+				parse(`apply schema temp options (rename_policy = 'bogus')`);
+				expect.fail('Should have thrown');
+			} catch (e: unknown) {
+				expect(e).to.be.instanceOf(ParseError);
+				const err = e as ParseError;
+				expect(err.line).to.be.a('number');
+				expect(err.column).to.be.a('number');
+				expect(err.message).to.include('Unknown rename_policy');
+			}
+		});
 	});
 
 	describe('Equality Operators', () => {

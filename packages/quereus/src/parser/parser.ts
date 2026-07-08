@@ -105,7 +105,7 @@ export class Parser {
 
 			} catch (e) {
 				// error() method now throws QuereusError directly with location info
-				if (e instanceof Error && e.name === 'QuereusError') {
+				if (e instanceof QuereusError) {
 					throw e;
 				}
 
