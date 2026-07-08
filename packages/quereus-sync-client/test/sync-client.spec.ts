@@ -17,7 +17,7 @@ import {
   type BasisTableLifecycleRecord,
 } from '@quereus/sync';
 import type { Database, LensDeploymentSnapshot } from '@quereus/quereus';
-import { serializeChangeSet } from '../src/serialization.js';
+import { serializeChangeSet, serializeHLCForTransport } from '../src/serialization.js';
 
 // ============================================================================
 // Mock WebSocket
@@ -151,6 +151,9 @@ class MockSyncManager implements SyncManager {
 
   async updatePeerSyncState(peerSiteId: SiteId, hlc: HLC): Promise<void> {
     this.updatePeerSyncStateCalls.push({ peerSiteId, hlc });
+    // Mirror the durable store: a confirmed advance is what a later
+    // getPeerSyncState / get_changes catch-up reads back.
+    this.peerSyncState = hlc;
   }
 
   async getPeerSyncState(_peerSiteId: SiteId): Promise<HLC | undefined> {
@@ -519,11 +522,15 @@ describe('SyncClient', () => {
       expect(syncManager.applyChangesCalls.length).to.be.greaterThanOrEqual(1);
     });
 
-    it('should handle push_changes the same as changes', async () => {
+    it('applies push_changes but does not advance the received watermark', async () => {
+      // push_changes is a fire-and-forget broadcast — it must be applied
+      // (idempotently) but must NOT move the received watermark, so a missed
+      // earlier broadcast is still recoverable on the next catch-up.
       const syncManager = new MockSyncManager();
       syncManager.applyChangesResult = { applied: 1, skipped: 0, conflicts: 0, transactions: 1 };
       const { client } = createClient({ syncManager });
       const ws = await connectAndHandshake(client);
+      syncManager.updatePeerSyncStateCalls.length = 0;
 
       const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: generateSiteId(), opSeq: 0 };
       const cs: ChangeSet = {
@@ -537,7 +544,10 @@ describe('SyncClient', () => {
       ws.simulateMessage({ type: 'push_changes', changeSets: [serializeChangeSet(cs)] });
       await new Promise(r => setTimeout(r, 20));
 
+      // Applied…
       expect(syncManager.applyChangesCalls.length).to.be.greaterThanOrEqual(1);
+      // …but watermark unmoved.
+      expect(syncManager.updatePeerSyncStateCalls.length).to.equal(0);
     });
 
     it('should call onRemoteChanges callback', async () => {
@@ -597,6 +607,83 @@ describe('SyncClient', () => {
       // Should not throw
       ws.simulateMessage({ type: 'unknown_type' });
       await new Promise(r => setTimeout(r, 10));
+    });
+  });
+
+  // ==========================================================================
+  // Received watermark: broadcast vs ordered reply
+  // ==========================================================================
+
+  describe('received watermark advancement', () => {
+    /** A one-column ChangeSet stamped with the given HLC. */
+    function changeSet(site: SiteId, txId: string, hlc: HLC): ChangeSet {
+      return {
+        siteId: site,
+        transactionId: txId,
+        hlc,
+        changes: [{ type: 'column', schema: 'main', table: 'items', pk: [1], column: 'n', value: txId, hlc }],
+        schemaMigrations: [],
+      };
+    }
+
+    it('advances the watermark on an ordered `changes` reply', async () => {
+      const syncManager = new MockSyncManager();
+      syncManager.applyChangesResult = { applied: 1, skipped: 0, conflicts: 0, transactions: 1 };
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      syncManager.updatePeerSyncStateCalls.length = 0;
+
+      const site = generateSiteId();
+      const hlc5: HLC = { wallTime: 5000n, counter: 1, siteId: site, opSeq: 0 };
+      ws.simulateMessage({ type: 'changes', changeSets: [serializeChangeSet(changeSet(site, 'tx5', hlc5))] });
+      await new Promise(r => setTimeout(r, 20));
+
+      expect(syncManager.applyChangesCalls.length).to.be.greaterThanOrEqual(1);
+      expect(syncManager.updatePeerSyncStateCalls.length).to.equal(1);
+      expect(syncManager.updatePeerSyncStateCalls[0].hlc).to.deep.equal(hlc5);
+    });
+
+    it('does not lose a change when a later broadcast arrives before the ordered reply', async () => {
+      // Reproduces the fire-and-forget change-loss bug: a broadcast at HLC 6 is
+      // received, but an earlier broadcast at HLC 5 was dropped. If HLC 6 were
+      // allowed to advance the watermark, the next get_changes would start at 6
+      // and HLC 5 would be lost forever. With the fix, the broadcast leaves the
+      // watermark at 5 (set by the ordered reply), so HLC 5 stays fetchable.
+      const syncManager = new MockSyncManager();
+      syncManager.applyChangesResult = { applied: 1, skipped: 0, conflicts: 0, transactions: 1 };
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      syncManager.updatePeerSyncStateCalls.length = 0;
+      ws.sentMessages.length = 0;
+
+      const site = generateSiteId();
+      const hlc5: HLC = { wallTime: 5000n, counter: 1, siteId: site, opSeq: 0 };
+      const hlc6: HLC = { wallTime: 6000n, counter: 1, siteId: site, opSeq: 0 };
+
+      // A delivered broadcast at HLC 6 (an earlier HLC 5 broadcast was dropped).
+      ws.simulateMessage({ type: 'push_changes', changeSets: [serializeChangeSet(changeSet(site, 'tx6', hlc6))] });
+      await new Promise(r => setTimeout(r, 20));
+
+      // Applied, but the watermark must NOT jump to 6.
+      expect(syncManager.applyChangesCalls.length).to.be.greaterThanOrEqual(1);
+      expect(syncManager.updatePeerSyncStateCalls.length).to.equal(0);
+
+      // The ordered catch-up reply carries HLC 5 and advances the watermark to 5.
+      ws.simulateMessage({ type: 'changes', changeSets: [serializeChangeSet(changeSet(site, 'tx5', hlc5))] });
+      await new Promise(r => setTimeout(r, 20));
+      expect(syncManager.updatePeerSyncStateCalls.length).to.equal(1);
+      expect(syncManager.updatePeerSyncStateCalls[0].hlc).to.deep.equal(hlc5);
+
+      // A subsequent catch-up requests get_changes sinceHLC=5 (not 6): the
+      // dropped HLC 5 is still within reach and will be redelivered.
+      ws.sentMessages.length = 0;
+      await (client as any).requestChangesFromServer();
+      const getChanges = ws.getSentMessages().find(m => m.type === 'get_changes') as { sinceHLC?: string };
+      expect(getChanges, 'a get_changes should be sent').to.exist;
+      // sinceHLC is the transport-serialized watermark. It must equal HLC 5, NOT
+      // the broadcast's HLC 6 — proving the broadcast did not advance the watermark.
+      expect(getChanges.sinceHLC).to.equal(serializeHLCForTransport(hlc5));
+      expect(getChanges.sinceHLC).to.not.equal(serializeHLCForTransport(hlc6));
     });
   });
 

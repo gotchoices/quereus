@@ -294,8 +294,19 @@ export class SyncClient {
         break;
 
       case 'changes':
+        // Ordered reply to an explicit get_changes: server-ordered, gap-free.
+        // Safe to advance the received watermark.
+        await this.handleChanges(message.changeSets || [], true);
+        break;
+
       case 'push_changes':
-        await this.handleChanges(message.changeSets || []);
+        // Fire-and-forget broadcast relaying a peer's change. Delivery is not
+        // acked, so a dropped broadcast is invisible to the coordinator. Apply
+        // it eagerly, but do NOT advance the watermark — otherwise a missed
+        // earlier broadcast would never be redelivered on the next catch-up.
+        // The change is re-fetched (and idempotently re-applied) by the next
+        // get_changes since the watermark stays below it.
+        await this.handleChanges(message.changeSets || [], false);
         break;
 
       case 'apply_result':
@@ -386,12 +397,27 @@ export class SyncClient {
     }
   }
 
-  private async handleChanges(serializedChangeSets: SerializedChangeSet[]): Promise<void> {
+  /**
+   * Apply received changesets to the local store, optionally advancing the
+   * received watermark (`lastSyncHLC`).
+   *
+   * @param advanceWatermark Only the ordered `changes` reply is contiguous and
+   *   gap-free, so only it may advance the watermark. A `push_changes`
+   *   broadcast is applied (idempotently) but must leave the watermark unmoved,
+   *   so a broadcast the client never received is still redelivered by the next
+   *   `get_changes sinceHLC=<watermark>`.
+   */
+  private async handleChanges(
+    serializedChangeSets: SerializedChangeSet[],
+    advanceWatermark: boolean
+  ): Promise<void> {
     const changeSets = serializedChangeSets.map(cs => deserializeChangeSet(cs));
     const result = await this.syncManager.applyChanges(changeSets);
 
-    // Update peer sync state with the max HLC from received changes
-    if (changeSets.length > 0 && this.serverSiteId) {
+    // Advance peer sync state with the max HLC from received changes — but only
+    // on the ordered path, where contiguity guarantees nothing below maxHlc was
+    // missed.
+    if (advanceWatermark && changeSets.length > 0 && this.serverSiteId) {
       const maxHlc = maxHLC(changeSets.map(cs => cs.hlc));
       if (maxHlc) {
         await this.syncManager.updatePeerSyncState(this.serverSiteId, maxHlc);

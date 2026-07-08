@@ -911,8 +911,8 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 | Type | Purpose | Payload |
 |------|---------|---------|
 | `handshake_ack` | Confirm authentication | `{ serverSiteId, connectionId }` |
-| `changes` | Response to `get_changes` | `{ changeSets: ChangeSet[] }` |
-| `push_changes` | Broadcast from another client | `{ changeSets: ChangeSet[] }` |
+| `changes` | Ordered response to `get_changes` (gap-free; **advances** received watermark) | `{ changeSets: ChangeSet[] }` |
+| `push_changes` | Fire-and-forget broadcast from another client (applied, but **never** advances the received watermark) | `{ changeSets: ChangeSet[] }` |
 | `apply_result` | Confirm changes applied | `{ requestId?, applied, skipped, conflicts }` |
 | `snapshot_chunk` | Streamed snapshot data | `{ chunk: SnapshotChunk }` |
 | `error` | Error response | `{ code, message }` |
@@ -974,7 +974,7 @@ watermark is a **`ChangeSet.hlc`** — a transaction commit boundary (the max ov
 batch-slice boundary — so advancing it can only ever land *between* whole
 transactions (§ Transaction-Based Change Grouping → Read side):
 
-1. **Receiving changes**: After applying server changes, client updates `peerSyncState[serverSiteId]` (the *received* watermark) with the max `ChangeSet.hlc` received
+1. **Receiving changes**: Only the ordered `changes` reply (contiguous, gap-free) advances `peerSyncState[serverSiteId]` (the *received* watermark) to the max `ChangeSet.hlc` received. A `push_changes` **broadcast** is applied idempotently but must **not** advance the watermark — broadcast delivery is fire-and-forget, so a dropped broadcast is invisible to the coordinator; leaving the watermark below it means the next `get_changes sinceHLC=<watermark>` redelivers (and harmlessly re-applies) it, closing the fire-and-forget change-loss hole
 2. **Sending changes**: Client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values. On each confirmed ack the client persists `lastSentHLC` durably per peer via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
 3. **Reconnection / restart**: On reconnect, client sends `get_changes` with `sinceHLC` from the received watermark, and re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`) so a fresh process resumes delta-push from the last confirmed HLC instead of replaying its entire local history. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
 4. **Server tracking**: Server uses client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity
@@ -1698,7 +1698,7 @@ The WebSocket sync client is now available as a standalone package: [`@quereus/s
 
 **Features:**
 - [x] WebSocket connection and handshake (`handshake` → `handshake_ack`)
-- [x] Message dispatch (`changes`, `push_changes`, `apply_result`, `error`, `pong`)
+- [x] Message dispatch (`changes` advances the received watermark; `push_changes` applies without advancing it; `apply_result`, `error`, `pong`)
 - [x] ChangeSet serialization/deserialization (HLC, siteId encoding)
 - [x] Local change debouncing (configurable, default 50ms)
 - [x] Delta sync optimization (`lastSentHLC`, `pendingSentHLC` tracking)

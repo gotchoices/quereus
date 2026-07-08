@@ -628,6 +628,12 @@ export class CoordinatorService {
   /**
    * Broadcast changes to all connected clients on the same database except the sender.
    */
+  // NOTE: fire-and-forget — a failed/dropped broadcast is only logged, never
+  // acked or retried. Correctness does not depend on it: the client applies
+  // push_changes without advancing its received watermark, so any missed
+  // broadcast is redelivered on its next get_changes catch-up. Revisit only if
+  // push-recovery latency (how fast a missed change reaches a peer) becomes a
+  // problem — then consider ack/retry/backpressure here.
   private broadcastChanges(databaseId: string, senderSiteId: SiteId, changes: ChangeSet[]): void {
     // Serialize changesets for JSON transport
     const serializedChangeSets = changes.map(cs => serializeChangeSet(cs));
