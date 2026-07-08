@@ -203,9 +203,10 @@ This ensures type information flows through the entire planning and execution pi
 - Physical: `PhysicalType.OBJECT`
 - Values: Native JS objects, arrays, and JSON-compatible primitives (stored in memory as-is)
 - Validation: Must be valid JSON; accepts objects, arrays, numbers, booleans, strings (parsed as JSON), and null
-- Comparison: Deep equality via JSON string comparison
+- Comparison: Deep structural comparison (`deepCompareJson`). **Object key order is not significant** — `{a:1,b:2}` equals `{b:2,a:1}` — but **array element order is** (positional). Numeric storage class holds, so a JSON scalar `5` equals `5.0`.
+- Keys: hash keys (GROUP BY / DISTINCT / join partitioning) and persisted byte keys (JSON PK / index) derive from a **single canonical form** (`canonicalJsonString` — recursive object-key sort, arrays positional) so a value's key always agrees with the comparator: reorder-equal objects group/de-dup/conflict as one, distinct objects never over-merge. The canonical form is used **only to derive keys** — never for storage or display.
 - Collations: None
-- Serialization: `serialize()` converts to JSON string for storage; `deserialize()` parses back to native object
+- Serialization: `serialize()` converts to JSON string for storage; `deserialize()` parses back to native object. Storage and display preserve **insertion order** (only key derivation canonicalizes)
 - Conversion: `json(value)` parses a JSON string into a native object; inserting a JSON string into a JSON column auto-parses it
 - Functions: All `json_*` functions accept both native objects and JSON strings as input
 

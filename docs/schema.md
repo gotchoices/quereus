@@ -399,6 +399,16 @@ full SET COLLATE contract, including the non-PK UNIQUE re-validation and the
 custom-comparator dedup residual (a comparator-only collation with no registered byte
 encoder still keys/dedups under NOCASE bytes).
 
+**JSON (OBJECT-class) PK / index key encoding.** A JSON value keyed as a PK or index
+column encodes through a **canonical JSON string** (`canonicalJsonString` from
+`@quereus/quereus` — recursive object-key sort, array order preserved) rather than a bare
+`JSON.stringify`. So reorder-equal objects (`{"a":1,"b":2}` and `{"b":2,"a":1}`) encode to
+identical key bytes and collide as one row (matching `deepCompareJson` and the memory
+module), while array order stays significant. The canonical form governs only the *key*
+bytes — the stored/displayed row value keeps its insertion order (rows round-trip through
+`serializeRow`/`deserializeRow`, independent of the key). Collation still applies to the
+canonical string as for text.
+
 **Index-derived UNIQUE enforcement collation.** A `CREATE UNIQUE INDEX … (col COLLATE x)`
 synthesizes a `derivedFromIndex` UNIQUE constraint whose DML enforcement resolves each
 column's comparison collation from the **index's** per-column `COLLATE` clause (falling

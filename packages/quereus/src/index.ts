@@ -203,6 +203,11 @@ export { Latches } from './util/latches.js';
 // UNIQUE re-validation that honors a per-column NOCASE/RTRIM/BINARY collation).
 export { resolveKeyNormalizer, serializeRowKey } from './util/key-serializer.js';
 
+// Canonical JSON key form (recursive object-key sort) — used by store modules to
+// derive persisted byte keys that agree with the in-memory JSON comparator, so
+// reorder-equal JSON values ({a:1,b:2} vs {b:2,a:1}) encode to identical bytes.
+export { canonicalJsonString } from './util/json-canonical.js';
+
 // Plugin helper for static loading (React Native, etc.)
 export { registerPlugin } from './util/plugin-helper.js';
 export type { PluginFunction } from './util/plugin-helper.js';

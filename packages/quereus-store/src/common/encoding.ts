@@ -16,7 +16,8 @@
  *   binary encoding, preserving their sort semantics in the key-value store.
  */
 
-import type { SqlValue } from '@quereus/quereus';
+import type { SqlValue, JsonSqlValue } from '@quereus/quereus';
+import { canonicalJsonString } from '@quereus/quereus';
 
 // ============================================================================
 // Collation Encoder Infrastructure
@@ -127,9 +128,11 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
     return encodeInteger(value ? 1n : 0n);
   }
 
-  // JSON objects/arrays — serialize to JSON string and encode as text with OBJECT prefix
+  // JSON objects/arrays — serialize to a canonical (recursive object-key-sorted)
+  // JSON string so reorder-equal values ({a:1,b:2} vs {b:2,a:1}) encode to the
+  // same bytes, matching the in-memory JSON comparator. Arrays stay positional.
   if (typeof value === 'object') {
-    return encodeObject(JSON.stringify(value), collation);
+    return encodeObject(canonicalJsonString(value as JsonSqlValue), collation);
   }
 
   throw new Error(`Cannot encode value of type ${typeof value}`);

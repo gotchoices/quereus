@@ -6,6 +6,8 @@
  * declared collation) if and only if their serialized keys are identical strings.
  */
 import type { Row, SqlValue } from '../common/types.js';
+import type { JSONValue } from '../common/json-types.js';
+import { canonicalJsonString } from './json-canonical.js';
 
 /** Identity normalizer for BINARY collation (no-op). */
 const IDENTITY_NORMALIZER = (s: string) => s;
@@ -40,21 +42,46 @@ export const BUILTIN_NORMALIZERS: Readonly<Record<string, (s: string) => string>
 };
 
 /**
+ * Normalize a numeric SQL value (number | bigint | boolean) to a decimal string
+ * so that values equal under {@link import('./comparison.js').compareSqlValues}
+ * (numeric storage class: `5n` == `5`, `true` == `1`) serialize identically.
+ *
+ * Integer-valued numbers route through `BigInt(n)` so `5`, `5.0`, and `5n` all
+ * yield `"5"` — and `BigInt` captures a float's exact mathematical value, so an
+ * imprecise integer float (e.g. `1e30`) matches whatever the mixed number/bigint
+ * comparator sees. Non-integer numbers keep their `String(n)` form.
+ *
+ * NOTE: NaN/±Infinity fall to `String(n)` ("NaN"/"Infinity"), so two NaN key
+ * alike but NaN never keys equal to a finite value — the numeric comparator
+ * treats NaN as equal to everything, a degenerate edge not worth splitting keys
+ * over. If NaN-valued numeric keys ever matter, revisit here.
+ */
+function canonicalNumeric(val: number | bigint | boolean): string {
+	if (typeof val === 'boolean') return val ? '1' : '0';
+	if (typeof val === 'bigint') return val.toString();
+	if (Number.isInteger(val)) return BigInt(val).toString();
+	return String(val);
+}
+
+/**
  * Core serialization of a single SQL value with type tag and optional collation normalizer.
  * Appends to the key accumulator.  Returns false if the value is NULL (caller decides semantics).
+ *
+ * The tag/normalization rules mirror `compareSqlValues`: numeric-class values
+ * (number/bigint/boolean) share the `n:` tag via {@link canonicalNumeric} so
+ * equal-but-differently-typed numerics key alike, and OBJECT-class values route
+ * through {@link canonicalJsonString} so reorder-equal JSON objects key alike.
  */
 function appendValue(val: SqlValue, normalizer: (s: string) => string): string | null {
 	if (val === null || val === undefined) return null;
 	if (typeof val === 'string') {
 		return 's:' + normalizer(val);
-	} else if (typeof val === 'number') {
-		return 'n:' + val;
-	} else if (typeof val === 'bigint') {
-		return 'b:' + val;
+	} else if (typeof val === 'number' || typeof val === 'bigint' || typeof val === 'boolean') {
+		return 'n:' + canonicalNumeric(val);
 	} else if (val instanceof Uint8Array) {
 		return 'x:' + Array.from(val).join(',');
 	} else {
-		return 'o:' + String(val);
+		return 'o:' + canonicalJsonString(val as JSONValue);
 	}
 }
 

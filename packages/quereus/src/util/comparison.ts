@@ -1,4 +1,6 @@
 import type { Row, SqlValue } from '../common/types.js';
+import type { JSONValue } from '../common/json-types.js';
+import { canonicalJsonString } from './json-canonical.js';
 import { createLogger } from '../common/logger.js';
 import type { LogicalType, CollationFunction } from '../types/logical-type.js';
 import { StatusCode } from '../common/types.js';
@@ -182,9 +184,10 @@ function compareNumbers(a: number | bigint, b: number | bigint): number {
  * (no lifetime coupling / manual eviction).
  *
  * NOTE: keyed by JS object identity — two structurally-equal but distinct objects
- * serialize independently (correct, just not shared). This uses `JSON.stringify`'s
- * insertion-order output as the canonical form; keep that in step with the canonical
- * form defined in the `json-canonical-key-hashing` work if that lands a different one.
+ * serialize independently (correct, just not shared). The canonical form is
+ * {@link canonicalJsonString} (recursive object-key sort), so OBJECT-class equality
+ * and ordering here agree with `deepCompareJson` (`types/json-type.ts`) and with the
+ * runtime hash-key / persisted byte-key paths — reorder-equal objects compare equal.
  *
  * NOTE: assumes OBJECT-class values are treated as immutable — the string is cached on
  * first serialization and never invalidated, so mutating a value in place after it has
@@ -196,7 +199,7 @@ const objectCanonicalCache = new WeakMap<object, string>();
 function objectCanonicalString(v: object): string {
 	let s = objectCanonicalCache.get(v);
 	if (s === undefined) {
-		s = JSON.stringify(v);
+		s = canonicalJsonString(v as JSONValue);
 		objectCanonicalCache.set(v, s);
 	}
 	return s;

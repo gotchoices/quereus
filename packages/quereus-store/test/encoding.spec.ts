@@ -3,6 +3,7 @@
  */
 
 import { expect } from 'chai';
+import type { SqlValue } from '@quereus/quereus';
 import {
   encodeValue,
   encodeCompositeKey,
@@ -131,6 +132,34 @@ describe('Key Encoding', () => {
         const { value } = decodeValue(encoded);
         expect(value).to.deep.equal(blob);
       }
+    });
+
+    describe('JSON object canonical key encoding', () => {
+      it('encodes reorder-equal objects to identical bytes', () => {
+        // {a:1,b:2} and {b:2,a:1} compare equal (deepCompareJson sorts keys), so
+        // their persisted byte keys MUST match — otherwise a JSON PK stores two rows.
+        const a = encodeValue({ a: 1, b: 2 } as unknown as SqlValue);
+        const b = encodeValue({ b: 2, a: 1 } as unknown as SqlValue);
+        expect(compareBytes(a, b)).to.equal(0);
+      });
+
+      it('encodes reorder-equal nested objects to identical bytes', () => {
+        const a = encodeValue({ outer: { z: 1, a: 2 }, list: [{ q: 1, p: 2 }] } as unknown as SqlValue);
+        const b = encodeValue({ list: [{ p: 2, q: 1 }], outer: { a: 2, z: 1 } } as unknown as SqlValue);
+        expect(compareBytes(a, b)).to.equal(0);
+      });
+
+      it('encodes structurally distinct objects to different bytes', () => {
+        const a = encodeValue({ a: 1 } as unknown as SqlValue);
+        const b = encodeValue({ a: 2 } as unknown as SqlValue);
+        expect(compareBytes(a, b)).to.not.equal(0);
+      });
+
+      it('keeps array element order significant', () => {
+        const a = encodeValue([1, 2] as unknown as SqlValue);
+        const b = encodeValue([2, 1] as unknown as SqlValue);
+        expect(compareBytes(a, b)).to.not.equal(0);
+      });
     });
   });
 
