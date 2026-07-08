@@ -11,8 +11,7 @@
 
 import { createLogger } from '../common/logger.js';
 import type { Row, SqlValue } from '../common/types.js';
-import type { JSONValue } from '../common/json-types.js';
-import { canonicalJsonString } from '../util/json-canonical.js';
+import { encodeKeyTuple, decodeKeyTuple } from '../util/key-tuple-codec.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
@@ -448,14 +447,15 @@ export class TransactionManager {
 	/**
 	 * Serialize a tuple of SqlValues for stable Map keying.
 	 *
-	 * Uses the canonical (recursive object-key-sorted) JSON form, not a bare
-	 * `JSON.stringify`, so a JSON-object PK component keys by the same canonical form
-	 * the value comparator uses — reorder-equal objects (`{a:1,b:2}` ≡ `{b:2,a:1}`)
-	 * coalesce to one change-log entry instead of splitting. Array/tuple order stays
-	 * positional, so scalar tuples serialize byte-identically to before.
+	 * Uses the reversible, type-faithful {@link encodeKeyTuple} codec so a bigint
+	 * PK (any integer beyond `Number.MAX_SAFE_INTEGER`) no longer crashes the
+	 * write, blobs round-trip, and a JSON-object PK component keeps its canonical
+	 * (recursive object-key-sorted) form — reorder-equal objects still coalesce to
+	 * one change-log entry. Numeric type identity is preserved (bigint stays
+	 * distinct from number); see the codec's NOTE for the coalescing tripwire.
 	 */
 	private serializeKeyTuple(values: readonly SqlValue[]): string {
-		return canonicalJsonString(values as unknown as JSONValue);
+		return encodeKeyTuple(values);
 	}
 
 	/** The active (top) layer that should receive change records. */
@@ -635,7 +635,7 @@ export class TransactionManager {
 			for (const pkKey of rowMap.keys()) {
 				if (seen.has(pkKey)) continue;
 				seen.add(pkKey);
-				tuples.push(JSON.parse(pkKey) as SqlValue[]);
+				tuples.push(decodeKeyTuple(pkKey));
 			}
 		};
 		collect(this.changeLog);
@@ -683,7 +683,9 @@ export class TransactionManager {
 			if (!projection) return;
 			const tuple: SqlValue[] = [];
 			for (const i of projectionIndices) tuple.push(projection[i] as SqlValue);
-			const tkey = JSON.stringify(tuple);
+			// Encode-only (never decoded here) — the type-faithful codec also
+			// avoids the bigint `JSON.stringify` crash on a captured column value.
+			const tkey = encodeKeyTuple(tuple);
 			if (seen.has(tkey)) return;
 			seen.add(tkey);
 			out.push(tuple);
