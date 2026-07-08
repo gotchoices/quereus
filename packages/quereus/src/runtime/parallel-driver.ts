@@ -142,6 +142,48 @@ interface BranchPullResult<T> {
 	error: unknown;
 }
 
+/**
+ * Close a single live source. Two invariants:
+ *
+ * - **Prompt cancellation.** A source parked mid-`next()` is interrupted via
+ *   `return()`, not waited out — matching {@link ParallelDriver.drive}'s
+ *   best-effort return()-close contract (and the sibling parallel primitive in
+ *   `emit/fanout-lookup-join.ts`). Native async generators queue the `return()`
+ *   safely behind the in-flight `next()`; cooperative sources use it to unblock
+ *   the parked pull.
+ * - **No cleanup racing ahead of an in-flight pull.** After signalling
+ *   `return()` we also await the branch's outstanding pull, so the source is
+ *   fully quiesced before it is considered closed. The current fault this fixes:
+ *   `closeAll` used to await only the `return()`s and discard the in-flight
+ *   pulls, letting cleanup resolve while a `next()` it started was still
+ *   executing (and possibly still touching cursor/vtab state).
+ *
+ * All failures (a rejecting `return()` or pull) are settled, never rethrown, so
+ * one bad close cannot abort the others.
+ *
+ * NOTE: awaiting the outstanding pull assumes `return()` causes that pull to
+ * settle — true for native generators and any source that honors cancellation.
+ * A source that both ignores `return()` and parks its `next()` forever would
+ * hang cleanup here rather than leak a runaway pull; that is an acceptable, loud
+ * failure for a source already violating the cancellation contract.
+ */
+async function closeBranch<T>(
+	it: AsyncIterator<T>,
+	pendingPull: Promise<BranchPullResult<T>> | undefined,
+): Promise<void> {
+	const settles: Promise<unknown>[] = [];
+	if (typeof it.return === 'function') {
+		try {
+			settles.push(Promise.resolve(it.return()).catch(() => undefined));
+		} catch {
+			// Synchronous throw from return() — swallow; we are already in cleanup.
+		}
+	}
+	// schedulePull never lets the pull reject, but settle defensively regardless.
+	if (pendingPull) settles.push(pendingPull.catch(() => undefined));
+	if (settles.length > 0) await Promise.allSettled(settles);
+}
+
 async function* driveImpl<T>(
 	factories: ReadonlyArray<(ctx: RuntimeContext) => AsyncIterable<T>>,
 	forks: ReadonlyArray<RuntimeContext>,
@@ -226,19 +268,15 @@ async function* driveImpl<T>(
 	};
 
 	const closeAll = async (): Promise<void> => {
+		// Close every still-live source: signal wind-down via return() AND await
+		// each branch's outstanding pull (see closeBranch). Capturing the pending
+		// pull happens synchronously here, before pendingPulls.clear() below.
 		const closingPromises: Promise<unknown>[] = [];
 		for (let i = 0; i < branchCount; i++) {
 			const it = iterators[i];
 			if (it && branchStates[i] !== 'done') {
 				markDone(i);
-				if (typeof it.return === 'function') {
-					try {
-						const p = it.return();
-						closingPromises.push(Promise.resolve(p).catch(() => undefined));
-					} catch {
-						// Synchronous throw from return() — swallow; we are already in cleanup.
-					}
-				}
+				closingPromises.push(closeBranch(it, pendingPulls.get(i)));
 			}
 			iterators[i] = null;
 		}
