@@ -78,6 +78,48 @@ describe('Key Encoding', () => {
       }
     });
 
+    it('should preserve mixed int/real sort order across the type boundary', () => {
+      // Regression for store-numeric-key-mixed-int-real-sort-order: whole numbers
+      // (bigint-shaped) must NOT all sort before fractional ones. The encoded bytes
+      // must memcmp in the exact order compareNumbers gives. The old per-shape
+      // TYPE_INTEGER(0x01) < TYPE_REAL(0x02) tag put every integer below every real,
+      // so 3n would have sorted below 2.5 — the silent-under-fetch bug.
+      const values: SqlValue[] = [-3.5, -3n, -2.5, 0n, 2.5, 3n, 3.5];
+      const encoded = values.map(v => encodeValue(v));
+      for (let i = 0; i < encoded.length - 1; i++) {
+        expect(compareBytes(encoded[i], encoded[i + 1])).to.be.lessThan(
+          0, `${values[i]} should sort before ${values[i + 1]}`);
+      }
+    });
+
+    it('preserves full int64 precision where large integers share a nearest double', () => {
+      // 2^53 and 2^53+1 both round to the double 2^53 (2^53+1 is not representable);
+      // the tie-break tail must keep them DISTINCT (no key collision / data loss) and
+      // ORDERED. 2^53+2 is exactly representable again.
+      const values: bigint[] = [
+        9007199254740992n, // 2^53
+        9007199254740993n, // 2^53 + 1 (rounds to the 2^53 double)
+        9007199254740994n, // 2^53 + 2 (exact)
+      ];
+      const encoded = values.map(v => encodeValue(v));
+      // Distinct + ascending (a naive "encode as a double" scheme collides 0 and 1).
+      expect(compareBytes(encoded[0], encoded[1])).to.be.lessThan(0);
+      expect(compareBytes(encoded[1], encoded[2])).to.be.lessThan(0);
+      // Exact roundtrip — no precision loss.
+      for (const v of values) {
+        expect(decodeValue(encodeValue(v)).value).to.equal(v, `roundtrip ${v}`);
+      }
+    });
+
+    it('normalizes -0 so -0, +0 and 0n encode to the same key', () => {
+      // compareNumbers(-0, 0) === 0, so all three must collide to one byte key.
+      const negZero = encodeValue(-0);
+      const posZero = encodeValue(0);
+      const bigZero = encodeValue(0n);
+      expect(compareBytes(negZero, posZero)).to.equal(0);
+      expect(compareBytes(posZero, bigZero)).to.equal(0);
+    });
+
     it('should encode and decode strings with NOCASE', () => {
       const testCases = ['', 'hello', 'Hello World', 'UPPERCASE', 'MixedCase'];
 

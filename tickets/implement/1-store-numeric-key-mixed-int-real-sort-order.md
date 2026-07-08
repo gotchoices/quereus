@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-08T16:05:18.853Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\1-store-numeric-key-mixed-int-real-sort-order.implement.2026-07-08T16-05-18-851Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: In the persistent store, a numeric primary/index key column that mixes whole and fractional numbers sorts wrong, so a range query silently skips rows it should return. Fix the byte-key encoder so all numbers order by value.
 prereq:
 files:

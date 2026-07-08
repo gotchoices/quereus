@@ -6,8 +6,7 @@
  *
  * Type prefixes ensure correct cross-type ordering:
  *   0x00 - NULL (sorts first)
- *   0x01 - INTEGER (signed, big-endian with sign flip)
- *   0x02 - REAL (IEEE 754 with sign flip)
+ *   0x01 - NUMERIC (bigint + number unified; orders by value across int/real)
  *   0x03 - TEXT (UTF-8, null-terminated, NOCASE by default)
  *   0x04 - BLOB (raw bytes, escaped + null-terminated)
  *
@@ -88,11 +87,19 @@ export interface EncodeOptions {
 
 /** Type prefix bytes. */
 const TYPE_NULL = 0x00;
-const TYPE_INTEGER = 0x01;
-const TYPE_REAL = 0x02;
+/**
+ * Unified numeric tag for BOTH bigint (INTEGER) and number (REAL). A single tag
+ * is required so a whole number and a fractional number interleave by value:
+ * a per-shape INTEGER/REAL tag would sort every integer-shaped value before
+ * every real-shaped one (0x01 < 0x02), placing 3.0 below 2.5. See encodeNumeric.
+ */
+const TYPE_NUMERIC = 0x01;
 const TYPE_TEXT = 0x03;
 const TYPE_BLOB = 0x04;
 const TYPE_OBJECT = 0x05;
+
+/** Fixed width of a TYPE_NUMERIC key: tag + sortable double + signed tie-break. */
+const NUMERIC_KEY_LENGTH = 17;
 
 /** Escape byte for null bytes within strings. */
 const ESCAPE_BYTE = 0x01;
@@ -108,12 +115,8 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
     return new Uint8Array([TYPE_NULL]);
   }
 
-  if (typeof value === 'bigint' || (typeof value === 'number' && Number.isInteger(value))) {
-    return encodeInteger(typeof value === 'bigint' ? value : BigInt(value));
-  }
-
-  if (typeof value === 'number') {
-    return encodeReal(value);
+  if (typeof value === 'bigint' || typeof value === 'number') {
+    return encodeNumeric(value);
   }
 
   if (typeof value === 'string') {
@@ -125,7 +128,7 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
   }
 
   if (typeof value === 'boolean') {
-    return encodeInteger(value ? 1n : 0n);
+    return encodeNumeric(value ? 1n : 0n);
   }
 
   // JSON objects/arrays — serialize to a canonical (recursive object-key-sorted)
@@ -182,45 +185,64 @@ export function encodeCompositeKey(
 }
 
 /**
- * Encode an integer with sign-preserving byte ordering.
- * Uses big-endian with XOR on sign bit so negative < positive.
+ * Encode any numeric value — bigint (INTEGER) OR number (REAL) — into ONE
+ * order-preserving key whose memcmp order matches `compareNumbers` (the
+ * in-memory NUMERIC comparator): every value orders by true magnitude across the
+ * int/real boundary, with full int64 precision preserved even where a large
+ * integer shares its nearest double with a neighbour.
+ *
+ * Layout (fixed 17 bytes so the DESC bit-inversion `encodeCompositeKey` applies
+ * stays trivially order-correct, exactly as the old fixed-width int/real bodies):
+ *
+ *   [TYPE_NUMERIC][ 8-byte sortable double ][ 8-byte signed tie-break ]
+ *
+ * Primary 8 bytes: the sortable-double transform (IEEE-754 big-endian, all bits
+ * flipped for negatives / sign bit only for non-negatives) of the nearest double
+ * `p = Number(value)`. This alone orders every value correctly EXCEPT ties, and
+ * preserves `-Inf < … < +Inf < NaN`. Two distinct finite doubles never share a
+ * bit pattern, so the ONLY prefix collisions are among integers that round to the
+ * same double (a contiguous run of int64s past 2^53).
+ *
+ * Tie-break 8 bytes: the exact signed residual `offset = value - p` (big-endian
+ * with sign bit flipped, so negative < positive). Within a same-double tie-set
+ * the true order is integer order, which `offset` reproduces exactly — its
+ * magnitude is bounded by half the double's ulp (≤ ~2^11 for int64). A `number`
+ * is its own exact double (`p === value`), so its offset is always 0 and it never
+ * ties with anything.
+ *
+ * `-0` is normalized to `+0` so `-0`, `+0`, and `0n` collide to one key
+ * (`compareNumbers` treats them equal).
  */
-function encodeInteger(value: bigint): Uint8Array {
-  const buffer = new Uint8Array(9);
-  buffer[0] = TYPE_INTEGER;
-
-  // Convert to 64-bit signed representation
+function encodeNumeric(value: number | bigint): Uint8Array {
+  const buffer = new Uint8Array(NUMERIC_KEY_LENGTH);
+  buffer[0] = TYPE_NUMERIC;
   const view = new DataView(buffer.buffer);
 
-  // Write as big-endian int64
-  view.setBigInt64(1, value, false);
-
-  // Flip sign bit so negative numbers sort before positive
-  buffer[1] ^= 0x80;
-
-  return buffer;
-}
-
-/**
- * Encode a floating-point number with proper sort ordering.
- * IEEE 754 with sign manipulation for correct ordering.
- */
-function encodeReal(value: number): Uint8Array {
-  const buffer = new Uint8Array(9);
-  buffer[0] = TYPE_REAL;
-
-  const view = new DataView(buffer.buffer);
-  view.setFloat64(1, value, false); // big-endian
-
-  // Flip all bits for negative, just sign bit for positive
-  // This makes: -Inf < -1 < -0 < +0 < +1 < +Inf < NaN
-  if (value < 0 || Object.is(value, -0)) {
-    for (let i = 1; i < 9; i++) {
-      buffer[i] ^= 0xff;
-    }
+  // Nearest double + exact residual. A number is exact (offset 0); a bigint's
+  // nearest double is always integer-valued, so the residual is an exact integer.
+  let primary: number;
+  let offset: bigint;
+  if (typeof value === 'bigint') {
+    primary = Number(value);
+    offset = value - BigInt(primary);
   } else {
+    primary = Object.is(value, -0) ? 0 : value;
+    offset = 0n;
+  }
+
+  // Primary: sortable IEEE-754 double.
+  view.setFloat64(1, primary, false); // big-endian
+  if (primary < 0) {
+    // Negative: flip all bits so more-negative sorts first.
+    for (let i = 1; i < 9; i++) buffer[i] ^= 0xff;
+  } else {
+    // Non-negative (incl. +0, +Inf, NaN): flip only the sign bit.
     buffer[1] ^= 0x80;
   }
+
+  // Tie-break: signed int64 residual, big-endian with sign bit flipped.
+  view.setBigInt64(9, offset, false);
+  buffer[9] ^= 0x80;
 
   return buffer;
 }
@@ -321,11 +343,8 @@ export function decodeValue(
     case TYPE_NULL:
       return { value: null, bytesRead: 1 };
 
-    case TYPE_INTEGER:
-      return decodeInteger(buffer, offset);
-
-    case TYPE_REAL:
-      return decodeReal(buffer, offset);
+    case TYPE_NUMERIC:
+      return decodeNumeric(buffer, offset);
 
     case TYPE_TEXT:
       return decodeText(buffer, offset, options?.collation ?? 'NOCASE');
@@ -365,45 +384,45 @@ export function decodeCompositeKey(
   return values;
 }
 
-function decodeInteger(buffer: Uint8Array, offset: number): { value: bigint; bytesRead: number } {
-  if (offset + 9 > buffer.length) {
-    throw new Error('Buffer underflow: expected 9 bytes for INTEGER');
+/**
+ * Decode a {@link encodeNumeric} key: reconstruct the primary double and the
+ * signed residual, then return the exact value. Integer-valued results return a
+ * `bigint`, non-integers a `number` — matching the pre-existing decode contract
+ * (integer-valued reals like `0.0` encode/roundtrip to `0n`). Every downstream
+ * comparator is numeric-class-tolerant (`5n` equals `5.0`), so the bigint/number
+ * choice never affects correctness.
+ */
+function decodeNumeric(buffer: Uint8Array, offset: number): { value: SqlValue; bytesRead: number } {
+  if (offset + NUMERIC_KEY_LENGTH > buffer.length) {
+    throw new Error(`Buffer underflow: expected ${NUMERIC_KEY_LENGTH} bytes for NUMERIC`);
   }
 
-  // Copy and flip sign bit back
-  const copy = buffer.slice(offset + 1, offset + 9);
-  copy[0] ^= 0x80;
-
-  const view = new DataView(copy.buffer, copy.byteOffset, 8);
-  const value = view.getBigInt64(0, false);
-
-  return { value, bytesRead: 9 };
-}
-
-function decodeReal(buffer: Uint8Array, offset: number): { value: number; bytesRead: number } {
-  if (offset + 9 > buffer.length) {
-    throw new Error('Buffer underflow: expected 9 bytes for REAL');
-  }
-
-  const copy = buffer.slice(offset + 1, offset + 9);
-
-  // Check sign bit (before any flipping)
-  const isNegative = (buffer[offset + 1] & 0x80) === 0;
-
-  if (isNegative) {
-    // Was negative: flip all bits back
-    for (let i = 0; i < 8; i++) {
-      copy[i] ^= 0xff;
-    }
+  // Primary double: reverse the sortable-double sign manipulation. The encoder
+  // sets the top bit to 1 for non-negatives, so a cleared top bit ⇒ was negative.
+  const primaryBytes = buffer.slice(offset + 1, offset + 9);
+  const wasNegative = (buffer[offset + 1] & 0x80) === 0;
+  if (wasNegative) {
+    for (let i = 0; i < 8; i++) primaryBytes[i] ^= 0xff;
   } else {
-    // Was positive: flip just sign bit back
-    copy[0] ^= 0x80;
+    primaryBytes[0] ^= 0x80;
   }
+  const primary = new DataView(primaryBytes.buffer, primaryBytes.byteOffset, 8).getFloat64(0, false);
 
-  const view = new DataView(copy.buffer, copy.byteOffset, 8);
-  const value = view.getFloat64(0, false);
+  // Tie-break residual: reverse the sign-bit flip.
+  const offsetBytes = buffer.slice(offset + 9, offset + NUMERIC_KEY_LENGTH);
+  offsetBytes[0] ^= 0x80;
+  const residual = new DataView(offsetBytes.buffer, offsetBytes.byteOffset, 8).getBigInt64(0, false);
 
-  return { value, bytesRead: 9 };
+  if (residual === 0n) {
+    // Exact value == primary double. Integer-valued (incl. large whole reals) ⇒
+    // bigint; fractional / non-finite ⇒ number.
+    return Number.isInteger(primary)
+      ? { value: BigInt(primary), bytesRead: NUMERIC_KEY_LENGTH }
+      : { value: primary, bytesRead: NUMERIC_KEY_LENGTH };
+  }
+  // Non-zero residual ⇒ a large integer whose nearest double is `primary` (always
+  // integer-valued here). Reconstruct the exact int64: primary + residual.
+  return { value: BigInt(primary) + residual, bytesRead: NUMERIC_KEY_LENGTH };
 }
 
 /**

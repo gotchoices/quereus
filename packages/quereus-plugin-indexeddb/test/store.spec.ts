@@ -283,11 +283,12 @@ describe('IndexedDB Store Integration', () => {
       expect(entries).to.have.length(1);
 
       // The key should not be empty - integer 42 should be encoded
-      expect(entries[0].key.length).to.be.greaterThan(0);      // For an integer, the encoded key should have:
-      // - 1 byte type prefix (0x01 for INTEGER)
-      // - 8 bytes for the bigint value (big-endian with sign flip)
-      // Total: 9 bytes
-      expect(entries[0].key.length).to.equal(9);
+      expect(entries[0].key.length).to.be.greaterThan(0);      // For a numeric, the encoded key should have:
+      // - 1 byte type prefix (0x01 for NUMERIC)
+      // - 8 bytes sortable double (big-endian with sign flip)
+      // - 8 bytes signed tie-break tail
+      // Total: 17 bytes
+      expect(entries[0].key.length).to.equal(17);
     });
 
     it('should handle zero as integer primary key', async () => {
@@ -565,10 +566,11 @@ describe('IndexedDB Store Integration with Isolation', () => {
       expect(entries).to.have.length(1);
       expect(entries[0].key.length).to.be.greaterThan(0);
 
-      // Verify the key is a properly encoded integer (9 bytes: 1 type prefix + 8 value bytes)
-      expect(entries[0].key.length).to.equal(9);
+      // Verify the key is a properly encoded numeric (17 bytes: 1 type prefix +
+      // 8-byte sortable double + 8-byte signed tie-break tail).
+      expect(entries[0].key.length).to.equal(17);
 
-      // First byte should be 0x01 (TYPE_INTEGER)
+      // First byte should be 0x01 (TYPE_NUMERIC — unified int/real numeric tag)
       expect(entries[0].key[0]).to.equal(0x01);
     });
 

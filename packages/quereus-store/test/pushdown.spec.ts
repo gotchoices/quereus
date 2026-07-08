@@ -388,6 +388,52 @@ describe('StoreModule predicate pushdown', () => {
 		});
 	});
 
+	// Regression for `store-numeric-key-mixed-int-real-sort-order`: a numeric primary
+	// key that mixes whole and fractional values must encode so its stored bytes sort
+	// by numeric VALUE, not by JS runtime shape. The old per-shape TYPE_INTEGER(0x01) <
+	// TYPE_REAL(0x02) tag made every whole number sort below every fractional one, so a
+	// leading-PK range seek built a byte window that skipped qualifying whole numbers
+	// the mis-ordered layout placed outside it (matchesFilters can only re-filter rows
+	// the seek already yielded — it cannot recover a skipped one).
+	describe('numeric primary key mixed int/real range seek (store-numeric-key-mixed-int-real-sort-order)', () => {
+		// Whole numbers (2, 3) interleave with fractional (2.5, 3.5); the whole ones
+		// must NOT all sort before the fractional ones. Ordered by x: 2, 2.5, 3, 3.5.
+		async function seedNums(name: string, using: string): Promise<void> {
+			await db.exec(`create table ${name} (x real primary key, n integer) ${using}`);
+			await db.exec(`insert into ${name} values (2, 20), (2.5, 25), (3, 30), (3.5, 35)`);
+		}
+
+		it("ASC: x >= 2.5 matches the memory-vtab oracle (no under-fetch)", async () => {
+			await seedNums('nstore', 'using store');
+			await seedNums('nmem', ''); // default in-memory vtab = full-scan oracle
+			const q = (t: string) => `select n from ${t} where x >= 2.5 order by x`;
+			const storeRows = (await asyncIterableToArray(db.eval(q('nstore')))).map(r => r.n);
+			const memRows = (await asyncIterableToArray(db.eval(q('nmem')))).map(r => r.n);
+			expect(memRows).to.deep.equal([25, 30, 35]); // 2.5, 3, 3.5 — includes whole 3
+			expect(storeRows).to.deep.equal(memRows);     // FAILS pre-fix: store drops n=30
+		});
+
+		it('BETWEEN spanning the int/real boundary matches the oracle', async () => {
+			await seedNums('nstore2', 'using store');
+			await seedNums('nmem2', '');
+			const q = (t: string) => `select n from ${t} where x between 2.5 and 3 order by x`;
+			const storeRows = (await asyncIterableToArray(db.eval(q('nstore2')))).map(r => r.n);
+			const memRows = (await asyncIterableToArray(db.eval(q('nmem2')))).map(r => r.n);
+			expect(memRows).to.deep.equal([25, 30]); // 2.5, 3
+			expect(storeRows).to.deep.equal(memRows);
+		});
+
+		// DESC numeric PK: encodeCompositeKey bit-inverts the whole 17-byte component;
+		// the fixed-width layout must stay order-correct under inversion.
+		it('DESC: x >= 2.5 seeks under inversion and matches the oracle', async () => {
+			await db.exec(`create table ndesc (x real primary key desc, n integer) using store`);
+			await db.exec(`insert into ndesc values (2, 20), (2.5, 25), (3, 30), (3.5, 35)`);
+			const rows = await asyncIterableToArray(db.eval(`select n from ndesc where x >= 2.5 order by x desc`));
+			// order by x desc: 3.5(35), 3(30), 2.5(25)
+			expect(rows.map(r => r.n)).to.deep.equal([35, 30, 25]);
+		});
+	});
+
 	// A leading PK key collation with NO registered byte encoder must NOT produce a
 	// narrowed window — `encodeText` silently falls back to NOCASE bytes that do not
 	// track the column's logical order, so a derived window could under-fetch.
