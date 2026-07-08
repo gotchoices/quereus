@@ -1,9 +1,10 @@
-import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, RowOp } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, isUpdateOk, isConstraintViolation, IndexConstraintOp, ConflictResolution, compilePredicate, QuereusError, StatusCode, uniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
+import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, uniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
 import type { MergeEntry, MergeConfig } from './merge-types.js';
+import { makeFullScanFilterInfo, makePkPointLookupFilter } from './filter-info.js';
 
 /**
  * Information about which index is being scanned.
@@ -1053,26 +1054,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * Creates a FilterInfo for a full table scan (no constraints).
 	 */
 	private createFullScanFilterInfo(): FilterInfo {
-		return {
-			idxNum: 0,
-			idxStr: null,
-			constraints: [],
-			args: [],
-			indexInfoOutput: {
-				nConstraint: 0,
-				aConstraint: [],
-				nOrderBy: 0,
-				aOrderBy: [],
-				colUsed: 0n,
-				aConstraintUsage: [],
-				idxNum: 0,
-				idxStr: null,
-				orderByConsumed: false,
-				estimatedCost: 1000000,
-				estimatedRows: 1000000n,
-				idxFlags: 0,
-			},
-		};
+		return makeFullScanFilterInfo();
 	}
 
 	/**
@@ -1080,32 +1062,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * This produces O(log n) lookups instead of O(n) full scans.
 	 */
 	private buildPKPointLookupFilter(pk: SqlValue[]): FilterInfo {
-		const pkIndices = this.getPrimaryKeyIndices();
-		const constraints = pkIndices.map((colIdx, i) => ({
-			constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
-			argvIndex: i + 1,
-		}));
-
-		return {
-			idxNum: 0,
-			idxStr: 'idx=_primary_(0);plan=2',
-			constraints,
-			args: pk,
-			indexInfoOutput: {
-				nConstraint: constraints.length,
-				aConstraint: constraints.map(c => c.constraint),
-				nOrderBy: 0,
-				aOrderBy: [],
-				colUsed: 0n,
-				aConstraintUsage: constraints.map(c => ({ argvIndex: c.argvIndex, omit: true })),
-				idxNum: 0,
-				idxStr: 'idx=_primary_(0);plan=2',
-				orderByConsumed: false,
-				estimatedCost: 1,
-				estimatedRows: 1n,
-				idxFlags: 0,
-			},
-		};
+		return makePkPointLookupFilter(this.getPrimaryKeyIndices(), pk);
 	}
 
 	// ==================== Merged-View Conflict Detection ====================
@@ -1361,141 +1318,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	async commit(): Promise<void> {
-		await this.flushAndClearOverlay();
-		await this.underlyingTable.commit?.();
-	}
-
-	/**
-	 * Flushes overlay changes to underlying (if any) and discards the overlay.
-	 * Shared by commit() and onConnectionCommit().
-	 */
-	private async flushAndClearOverlay(): Promise<void> {
-		// A poisoned overlay must never be flushed to the (already-altered) underlying:
-		// its rows are in the pre-alter layout. Throwing here is how a connection that
-		// never touches the poisoned table again still errors at commit, failing the
-		// whole transaction. The overlay is left intact so a subsequent rollback clears
-		// it (and the poison).
-		this.assertOverlayUsable();
-		const overlay = this.overlayTable;
-		if (this.hasChanges && overlay) {
-			await this.flushOverlayToUnderlying(overlay);
-		}
-		this.clearOverlay();
-	}
-
-	/**
-	 * Flushes all overlay changes to the underlying table.
-	 * Called during commit to persist changes.
-	 *
-	 * This method manages the underlying table's transaction lifecycle independently
-	 * to ensure that flushed data is committed and won't be rolled back by subsequent
-	 * transaction rollbacks.
-	 */
-	private async flushOverlayToUnderlying(overlay: VirtualTable): Promise<void> {
-		if (!overlay.query) return;
-
-		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
-		const pkIndices = this.getPrimaryKeyIndices();
-
-		// Collect all overlay entries first
-		const overlayEntries: { row: Row; isTombstone: boolean; pk: SqlValue[]; dataRow: Row }[] = [];
-		for await (const overlayRow of overlay.query(this.createFullScanFilterInfo())) {
-			const isTombstone = overlayRow[tombstoneIndex] === 1;
-			const pk = pkIndices.map(i => overlayRow[i]);
-			const dataRow = overlayRow.slice(0, tombstoneIndex);
-			overlayEntries.push({ row: overlayRow, isTombstone, pk, dataRow });
-		}
-
-		if (overlayEntries.length === 0) return;
-
-		// Apply deletes (tombstones) before inserts/updates so a write that collides
-		// on a secondary UNIQUE with a row being deleted in this same flush sees the
-		// slot freed first (e.g. INSERT OR REPLACE that both replaces a PK-colliding
-		// row AND evicts a different row on a secondary UNIQUE). Each PK appears at
-		// most once in the overlay, so there is no same-PK delete-then-insert pair
-		// this reordering could invert; sort() is stable in V8/Node, preserving the
-		// original PK order within each group.
-		const ordered = [...overlayEntries].sort((a, b) =>
-			(a.isTombstone === b.isTombstone ? 0 : a.isTombstone ? -1 : 1));
-
-		// Begin a transaction on the underlying table for the flush
-		await this.underlyingTable.begin?.();
-
-		try {
-			// Apply all overlay entries to underlying
-			for (const entry of ordered) {
-				if (entry.isTombstone) {
-					// Delete from underlying
-					const result = await this.underlyingTable.update({
-						operation: 'delete',
-						values: undefined,
-						oldKeyValues: entry.pk,
-					});
-					this.assertFlushWriteOk(result, 'delete', entry.pk);
-				} else {
-					// Check if row exists in underlying to decide insert vs update
-					const existsInUnderlying = await this.rowExistsInUnderlying(entry.pk);
-
-					if (existsInUnderlying) {
-						const result = await this.underlyingTable.update({
-							operation: 'update',
-							values: entry.dataRow,
-							oldKeyValues: entry.pk,
-							preCoerced: true,
-							trustedWrite: true,
-						});
-						this.assertFlushWriteOk(result, 'update', entry.pk);
-					} else {
-						const result = await this.underlyingTable.update({
-							operation: 'insert',
-							values: entry.dataRow,
-							preCoerced: true,
-							trustedWrite: true,
-						});
-						this.assertFlushWriteOk(result, 'insert', entry.pk);
-					}
-				}
-			}
-
-			// Commit the underlying table's transaction
-			await this.underlyingTable.commit?.();
-		} catch (error) {
-			// Rollback underlying on error
-			await this.underlyingTable.rollback?.();
-			throw error;
-		}
-	}
-
-	/**
-	 * Asserts that an underlying write performed during the commit flush succeeded.
-	 *
-	 * The overlay's merged-view pre-checks ({@link checkMergedPKConflict} /
-	 * {@link checkMergedUniqueConstraints}) resolve every constraint before commit, so a
-	 * `constraint` result returned here means a real invariant was violated *after* those
-	 * checks. Historically this result was discarded, silently dropping the colliding
-	 * write and surfacing as data corruption. Convert it into a loud INTERNAL error; the
-	 * caller's try/catch rolls back the underlying flush transaction and rethrows.
-	 */
-	private assertFlushWriteOk(result: UpdateResult, operation: RowOp, pk: SqlValue[]): void {
-		if (isConstraintViolation(result)) {
-			throw new QuereusError(
-				`Isolation flush ${operation} on '${this.tableName}' (pk=[${pk.join(', ')}]) hit a ${result.constraint} constraint: ${result.message ?? 'no message'}. The overlay merged-view pre-checks should have resolved this before commit; this indicates an isolation-layer invariant violation.`,
-				StatusCode.INTERNAL,
-			);
-		}
-	}
-
-	/**
-	 * Checks if a row with the given primary key exists in the underlying table.
-	 * Uses O(log n) point lookup via the PK index.
-	 */
-	private async rowExistsInUnderlying(pk: SqlValue[]): Promise<boolean> {
-		if (!this.underlyingTable.query) return false;
-
-		for await (const _row of this.underlyingTable.query(this.buildPKPointLookupFilter(pk))) {
-			return true;
-		}
-		return false;
+		// Route through the module coordinator (see onConnectionCommit) so even the
+		// table-level commit path performs the atomic apply-all-then-commit-all flush
+		// across the whole db-transaction's overlays, rather than committing this
+		// table's underlying in isolation (which tears a multi-table commit).
+		await this.isolationModule.commitConnectionOverlays(this.db);
 	}
 
 	async rollback(): Promise<void> {
@@ -1605,7 +1432,16 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * Flushes overlay to underlying and clears overlay.
 	 */
 	async onConnectionCommit(): Promise<void> {
-		await this.flushAndClearOverlay();
+		// Delegate to the module coordinator, which flushes EVERY overlay this
+		// db-transaction staged (not just this table's) in one apply-all-then-commit-all
+		// pass and clears them — so a multi-table commit is atomic. The first connection
+		// in the database's commit loop performs the whole flush; later connections find
+		// their overlay already cleared and this is a no-op. Poison is enforced inside
+		// the coordinator (it aborts before any table commits).
+		await this.isolationModule.commitConnectionOverlays(this.db);
+		// Clear this table's pre-overlay savepoint set. Kept per-connection (rather than
+		// inside the coordinator) so a table that took a savepoint before its first write
+		// but never got an overlay still has its set cleared here.
 		this.isolationModule.clearPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
 	}
 

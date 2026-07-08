@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode } from '@quereus/quereus';
-import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
 
@@ -2508,6 +2508,138 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(bob?.name).to.equal('Bob');
 
 			await sdb.exec('ROLLBACK');
+		});
+	});
+
+	describe('atomic multi-table commit (torn-commit fix)', () => {
+		type UnderlyingTable = Awaited<ReturnType<MemoryTableModule['create']>>;
+
+		// A memory module that injects a flush failure: when armed for a table, that
+		// table's underlying `update` throws on the commit-flush path — marked by the
+		// `trustedWrite` flag the isolation flush sets — while ordinary user DML (which
+		// never sets `trustedWrite`) passes through untouched. This reproduces "a later
+		// table's flush fails after an earlier table already committed" without needing
+		// a real IO fault.
+		class FaultyFlushModule extends MemoryTableModule {
+			/** Underlying table name whose commit-flush write should throw (null = never). */
+			failOnTable: string | null = null;
+
+			override async create(...args: Parameters<MemoryTableModule['create']>): Promise<UnderlyingTable> {
+				return this.wrap(await super.create(...args));
+			}
+			override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<UnderlyingTable> {
+				return this.wrap(await super.connect(...args));
+			}
+
+			private wrap(table: UnderlyingTable): UnderlyingTable {
+				// eslint-disable-next-line @typescript-eslint/no-this-alias
+				const module = this;
+				return new Proxy(table, {
+					get(target, prop) {
+						if (prop === 'update') {
+							return (updateArgs: UpdateArgs) => {
+								if (updateArgs.trustedWrite && module.failOnTable === target.tableName) {
+									throw new QuereusError(`injected flush failure on '${target.tableName}'`, StatusCode.IOERR);
+								}
+								return target.update(updateArgs);
+							};
+						}
+						const value = Reflect.get(target, prop, target);
+						return typeof value === 'function' ? value.bind(target) : value;
+					},
+				});
+			}
+		}
+
+		let underlying: FaultyFlushModule;
+		let tdb: Database;
+
+		beforeEach(async () => {
+			underlying = new FaultyFlushModule();
+			tdb = new Database();
+			// The faulty memory module is the UNDERLYING; the isolation layer wraps it.
+			tdb.registerModule('isolated', new IsolationModule({ underlying }));
+			await tdb.exec(`CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+			await tdb.exec(`CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+		});
+
+		async function rows(table: string): Promise<Array<[unknown, unknown]>> {
+			const out = await asyncIterableToArray(tdb.eval(`SELECT id, v FROM ${table} ORDER BY id`));
+			return out.map((r: any) => [r.id, r.v]);
+		}
+
+		async function expectCommitThrows(): Promise<void> {
+			let threw = false;
+			try {
+				await tdb.exec('COMMIT');
+			} catch {
+				threw = true;
+			}
+			expect(threw, 'COMMIT should surface the injected flush failure').to.be.true;
+		}
+
+		it('happy path: a multi-table commit persists every table', async () => {
+			await tdb.exec('BEGIN');
+			await tdb.exec(`INSERT INTO a VALUES (1, 'a1')`);
+			await tdb.exec(`INSERT INTO b VALUES (1, 'b1')`);
+			await tdb.exec('COMMIT');
+
+			expect(await rows('a')).to.deep.equal([[1, 'a1']]);
+			expect(await rows('b')).to.deep.equal([[1, 'b1']]);
+		});
+
+		it('a failure flushing the SECOND table aborts the whole commit atomically', async () => {
+			// The reproduced defect: table a flushed+committed before b's flush failed,
+			// leaving a durably committed and the transaction torn. Both must be empty.
+			underlying.failOnTable = 'b';
+			await tdb.exec('BEGIN');
+			await tdb.exec(`INSERT INTO a VALUES (1, 'a1')`);
+			await tdb.exec(`INSERT INTO b VALUES (1, 'b1')`);
+
+			await expectCommitThrows();
+
+			expect(await rows('a'), 'table a must NOT be left committed').to.deep.equal([]);
+			expect(await rows('b')).to.deep.equal([]);
+		});
+
+		it('a failure flushing the FIRST table aborts the whole commit atomically', async () => {
+			// Order-independence: the failure firing on the first-applied table must also
+			// abort cleanly, leaving the second table (never flushed) empty too.
+			underlying.failOnTable = 'a';
+			await tdb.exec('BEGIN');
+			await tdb.exec(`INSERT INTO a VALUES (1, 'a1')`);
+			await tdb.exec(`INSERT INTO b VALUES (1, 'b1')`);
+
+			await expectCommitThrows();
+
+			expect(await rows('a')).to.deep.equal([]);
+			expect(await rows('b')).to.deep.equal([]);
+		});
+
+		it('an aborted multi-table commit leaves pre-existing committed rows intact', async () => {
+			// Durable baseline (autocommit, before the fault is armed).
+			await tdb.exec(`INSERT INTO a VALUES (1, 'a1')`);
+			await tdb.exec(`INSERT INTO b VALUES (1, 'b1')`);
+			underlying.failOnTable = 'b';
+
+			await tdb.exec('BEGIN');
+			await tdb.exec(`INSERT INTO a VALUES (2, 'a2')`);
+			await tdb.exec(`UPDATE b SET v = 'b1-mod' WHERE id = 1`);
+
+			await expectCommitThrows();
+
+			// The transaction's staged changes are discarded; the pre-transaction state stands.
+			expect(await rows('a'), 'table a keeps only its pre-transaction row').to.deep.equal([[1, 'a1']]);
+			expect(await rows('b'), 'table b keeps its pre-transaction value').to.deep.equal([[1, 'b1']]);
+		});
+
+		it('a single-table commit still persists (degenerate one-overlay case unchanged)', async () => {
+			await tdb.exec('BEGIN');
+			await tdb.exec(`INSERT INTO a VALUES (1, 'a1'), (2, 'a2')`);
+			await tdb.exec('COMMIT');
+
+			expect(await rows('a')).to.deep.equal([[1, 'a1'], [2, 'a2']]);
+			expect(await rows('b')).to.deep.equal([]);
 		});
 	});
 });

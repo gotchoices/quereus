@@ -1,7 +1,9 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, FilterInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
+import { applyOverlayToUnderlying } from './flush.js';
+import { makeFullScanFilterInfo } from './filter-info.js';
 
 let overlayIdCounter = 0;
 
@@ -373,6 +375,104 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Commits every overlay this db-transaction staged as ONE coordinated two-phase
+	 * flush, instead of each table flushing+committing its own underlying
+	 * independently. The per-table approach tears a multi-table commit: table A's
+	 * underlying `commit()` durably lands (and, for a shared-coordinator
+	 * `quereus-store`, flushes *every* pending table) before table B has even
+	 * applied, so a failure in B leaves A committed. See the fix ticket and
+	 * `quereus-store/README` § "Atomic multi-store commit".
+	 *
+	 * Phase 1 (apply): for every staged overlay, begin its underlying table and
+	 * apply the overlay's rows WITHOUT committing (see {@link applyOverlayToUnderlying}).
+	 * For a `quereus-store` underlying, every table's writes accumulate in the
+	 * module's single shared coordinator (the first `begin()` opens it; the rest are
+	 * idempotent no-ops).
+	 *
+	 * Phase 2 (commit): once ALL overlays have applied, commit the affected
+	 * underlying tables. For `quereus-store` the first `commit()` flushes every
+	 * table's ops in one atomic coordinator commit — a single `AtomicBatch.write()`
+	 * on a provider that exposes `beginAtomicBatch` — and the rest no-op. For an
+	 * underlying with per-table transaction domains (the memory vtab), each table
+	 * commits independently.
+	 *
+	 * On any Phase-1 error, roll back every underlying begun so far and rethrow;
+	 * nothing was committed, so the transaction aborts atomically. Because all the
+	 * fallible data work (constraint re-checks, injected/IO write errors) happens in
+	 * Phase 1 before any commit, a data-driven abort is always clean. Full
+	 * crash-atomicity across the commit phase itself is contingent on the underlying
+	 * exposing a shared atomic commit domain (see docs/design-isolation-layer.md
+	 * § "Commit Failure Recovery").
+	 *
+	 * A poisoned overlay (a cross-connection ALTER left its rows in the pre-alter
+	 * layout) aborts the whole commit before any apply — mirroring the per-connection
+	 * `assertOverlayUsable` check, now with the added benefit that no earlier table is
+	 * left committed. The overlay is left intact so the ensuing rollback discards it.
+	 *
+	 * Driven once per db-transaction: the first `IsolatedConnection.commit()` in the
+	 * database's commit loop runs this whole flush and clears every overlay, so the
+	 * remaining connections find no overlay for their table and this is a no-op — no
+	 * explicit "already flushed" latch is needed, the cleared-overlay state guards
+	 * itself.
+	 */
+	async commitConnectionOverlays(db: Database): Promise<void> {
+		const prefix = `${this.getDbId(db)}:`;
+		const entries: { key: string; state: ConnectionOverlayState; underlyingTable: VirtualTable }[] = [];
+		for (const [key, state] of this.connectionOverlays.entries()) {
+			if (!key.startsWith(prefix)) continue;
+			// A poisoned overlay can neither be flushed nor merged (its rows are in the
+			// pre-alter column layout). Abort the whole commit before applying anything;
+			// the overlay is left intact so the ensuing rollback discards it (and its
+			// poison). A poisoned overlay always has hasChanges === true.
+			if (state.poison) {
+				throw new QuereusError(state.poison.message, StatusCode.CONSTRAINT);
+			}
+			// The overlay key is `<dbId>:<schema>.<table>`; the suffix after the dbId is
+			// exactly the `underlyingTables` key (both lowercased).
+			const underlyingKey = key.slice(prefix.length);
+			const underlyingState = this.underlyingTables.get(underlyingKey);
+			if (!underlyingState) continue; // no underlying to flush (defensive)
+			entries.push({ key, state, underlyingTable: underlyingState.underlyingTable });
+		}
+
+		// Phase 1: apply every staged overlay to its underlying WITHOUT committing.
+		const applied: VirtualTable[] = [];
+		try {
+			for (const { state, underlyingTable } of entries) {
+				if (!state.hasChanges) continue;
+				// Track BEFORE applying: applyOverlayToUnderlying begins the underlying up
+				// front, so a mid-apply throw still needs this table in the rollback set.
+				applied.push(underlyingTable);
+				await applyOverlayToUnderlying(underlyingTable, state.overlayTable, this.tombstoneColumn);
+			}
+		} catch (error) {
+			// Nothing committed yet — roll back every underlying we began so no table is
+			// left half-applied, then propagate (the transaction aborts atomically). For a
+			// shared-coordinator store the first rollback discards all pending ops and the
+			// rest no-op. allSettled mirrors the engine's own rollback-during-abort posture
+			// in database-transaction.ts (rollback failures must not mask the original error).
+			await Promise.allSettled(applied.map(underlyingTable => underlyingTable.rollback?.()));
+			throw error;
+		}
+
+		// Phase 2: commit the affected underlyings. For a shared-coordinator store the
+		// first commit flushes all tables in one atomic batch and the rest no-op; for
+		// per-table domains (memory) each commits independently.
+		for (const underlyingTable of applied) {
+			await underlyingTable.commit?.();
+		}
+
+		// Clear every overlay for this db — the transaction's staged state is now
+		// durable (or was empty). Subsequent IsolatedConnection.commit()s in the loop
+		// find no overlay and no-op. Pre-overlay savepoint sets are cleared per table
+		// by each connection's onConnectionCommit (which also covers a table that has
+		// savepoints but never got an overlay).
+		for (const { key } of entries) {
+			this.connectionOverlays.delete(key);
+		}
+	}
+
+	/**
 	 * Coalesces concurrent covering-connection builds for one (db, table) onto a
 	 * single in-flight promise, keyed identically to {@link connectionOverlays}
 	 * (see {@link connectionInFlight}).
@@ -712,7 +812,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const newOverlayTable = await this.overlayModule.create(db, newOverlaySchema);
 
 		if (oldState.hasChanges && oldOverlay.query) {
-			for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
+			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
 				await newOverlayTable.update({ operation: 'insert', values: oldRow as SqlValue[], preCoerced: true });
 			}
 		}
@@ -950,7 +1050,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			// column's NOT NULL flag) was precomputed once per ALTER by the caller and already
 			// dry-run validated against these same staged rows; undefined for non-addColumn
 			// change types, which append nothing to staged rows.
-			for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
+			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
 				const addColumnValue = addColumnCtx
 					? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
 					: undefined;
@@ -1035,7 +1135,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		}
 
 		if (!addColumnCtx) return;
-		for await (const oldRow of oldOverlay.query(this.makeFullScanFilterInfo())) {
+		for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
 			// Discard the result — this is validation only. A NOT NULL violation throws here.
 			await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx);
 		}
@@ -1119,30 +1219,6 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		}
 
 		return [...newData, tombstoneValue];
-	}
-
-	/** Creates a FilterInfo for a full table scan (no constraints). */
-	private makeFullScanFilterInfo(): FilterInfo {
-		return {
-			idxNum: 0,
-			idxStr: null,
-			constraints: [],
-			args: [],
-			indexInfoOutput: {
-				nConstraint: 0,
-				aConstraint: [],
-				nOrderBy: 0,
-				aOrderBy: [],
-				colUsed: 0n,
-				aConstraintUsage: [],
-				idxNum: 0,
-				idxStr: null,
-				orderByConsumed: false,
-				estimatedCost: 1000000,
-				estimatedRows: 1000000n,
-				idxFlags: 0,
-			},
-		};
 	}
 
 	/**

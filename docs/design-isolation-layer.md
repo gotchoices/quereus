@@ -228,27 +228,48 @@ This is analogous to LSM-tree merge or 3-way merge in version control.
 
 ### Commit
 
-1. Collect all changes from overlay
-2. Apply to underlying module via `update()` calls, **tombstones (deletes) first,
-   then inserts/updates**. The ordering matters when one commit both writes a row and
-   evicts a different row on a shared secondary UNIQUE (e.g. an `INSERT OR REPLACE` that
-   replaces a PK-colliding row *and* evicts a UNIQUE-colliding row at another PK): the
-   delete must free the constrained value before the colliding write is applied, or the
-   underlying module rejects the write on a UNIQUE conflict. Each PK appears at most once
-   in the overlay, so reordering across PKs never inverts a same-PK delete/insert pair.
-   The insert/update flushes are issued as **trusted writes** (`trustedWrite: true`): the
-   underlying module skips its own per-write PK/UNIQUE re-enforcement and just persists the
-   already-validated final state. This is required because a value-swap cycle (e.g. two rows
-   exchanging a UNIQUE value within one txn) has no conflict-free row-by-row apply order — an
-   intermediate row would transiently duplicate a UNIQUE value and a naive per-write check
-   would wrongly reject it. The merged-view pre-checks are therefore the sole authority for
-   the final committed state; secondary-index maintenance still runs incrementally per write,
-   and a transient duplicate index value is harmless because index keys are suffixed with the PK.
-   Any `constraint` result returned by an underlying `update()` here is a violated
-   invariant (the merged-view pre-checks should have resolved it before commit) and is
-   thrown as an INTERNAL error rather than silently swallowed.
-3. Call `underlyingConnection.commit()`
-4. Clear overlay state
+The database drives commit as a **sequential loop over registered connections**, and the
+isolation layer registers **one covering connection per table**. So a transaction that wrote
+to *N* tables has *N* connections in that loop. To keep a multi-table commit atomic, the flush
+does **not** run per connection; instead the **first** connection's commit drives one
+transaction-wide, two-phase flush across **every** overlay the db-transaction staged
+(`IsolationModule.commitConnectionOverlays`), and clears them all — so the remaining
+connections in the loop find their overlay already gone and no-op. (Earlier, each connection
+flushed *and committed* its own underlying table independently; table A's underlying commit
+landed durably before table B had even applied, so a failure in B left A committed — a torn
+transaction. The two-phase flush below is the fix.)
+
+**Phase 1 — apply all (no commit).** For every staged overlay, `begin()` its underlying table
+and apply the overlay's rows via `update()` calls, **tombstones (deletes) first, then
+inserts/updates**, but do **not** commit. The delete-before-insert ordering matters when one
+commit both writes a row and evicts a different row on a shared secondary UNIQUE (e.g. an
+`INSERT OR REPLACE` that replaces a PK-colliding row *and* evicts a UNIQUE-colliding row at
+another PK): the delete must free the constrained value before the colliding write, or the
+underlying rejects it on a UNIQUE conflict. Each PK appears at most once in the overlay, so
+reordering across PKs never inverts a same-PK delete/insert pair. The insert/update flushes
+are issued as **trusted writes** (`trustedWrite: true`): the underlying module skips its own
+per-write PK/UNIQUE re-enforcement and just persists the already-validated final state. This
+is required because a value-swap cycle (e.g. two rows exchanging a UNIQUE value within one txn)
+has no conflict-free row-by-row apply order — an intermediate row would transiently duplicate a
+UNIQUE value and a naive per-write check would wrongly reject it. The merged-view pre-checks are
+therefore the sole authority for the final committed state; secondary-index maintenance still
+runs incrementally per write, and a transient duplicate index value is harmless because index
+keys are suffixed with the PK. Any `constraint` result returned by an underlying `update()` here
+is a violated invariant (the merged-view pre-checks should have resolved it before commit) and
+is thrown as an INTERNAL error rather than silently swallowed.
+
+**Phase 2 — commit all.** Once **every** overlay has applied, `commit()` the affected
+underlying tables. For a `quereus-store` underlying (whose tables share one module-wide
+`TransactionCoordinator`) Phase 1's begins/applies all accumulate in that single coordinator,
+so the first `commit()` flushes **every** table's ops in one atomic coordinator commit — a
+single `AtomicBatch.write()` on a provider that exposes `beginAtomicBatch` (IndexedDB, LevelDB)
+— and the remaining commits no-op. For an underlying with per-table transaction domains (the
+default memory vtab) each table commits independently.
+
+**On any Phase-1 error:** roll back every underlying begun so far and rethrow. Nothing was
+committed, so the transaction aborts atomically.
+
+Finally, clear all overlay state (and, per connection, its pre-overlay savepoint set).
 
 ### Rollback
 
@@ -516,13 +537,34 @@ PK that has a tombstone in the overlay.
 
 ### 3. Commit Failure Recovery
 
-**Challenge:** If the underlying module fails mid-commit, the overlay has partially flushed.
+**Challenge:** If a commit that spans several tables fails partway through, some tables must
+not be left committed while others roll back (a *torn* transaction).
 
-**Mitigation:**
-- Collect all changes before any writes
-- Write all changes, then commit underlying transaction
-- If writes fail, underlying transaction rolls back (atomic)
-- Overlay remains intact; user can retry or rollback
+**Mitigation — apply-all, then commit-all (see § Commit).** The flush is transaction-wide and
+two-phase: Phase 1 begins every touched underlying table and applies its overlay rows *without*
+committing; Phase 2 commits them only once **all** have applied. All the fallible data work
+(constraint re-checks, injected/IO write errors) happens in Phase 1, before any commit, so a
+data-driven failure aborts cleanly — Phase 1 rolls back every begun table and nothing was
+committed. The overlays remain intact, so the ensuing transaction rollback discards them and the
+user can retry.
+
+**Atomicity contract — depends on the underlying's commit domain.**
+- **Shared atomic commit domain (full crash-atomicity).** When the underlying commits its tables
+  through one shared atomic domain — the `quereus-store` module-wide `TransactionCoordinator`
+  plus a provider that exposes `beginAtomicBatch` (IndexedDB, LevelDB) — Phase 2's first
+  `commit()` writes *every* table's ops in a single atomic batch and the rest no-op. The
+  multi-table commit is then fully atomic even against a crash mid-commit.
+- **Per-table commit domains (data-driven-clean only).** For an underlying whose tables commit
+  independently (the default memory vtab), Phase 2 commits each table in turn. Because all
+  fallible work already completed in Phase 1, a *data-driven* abort is still clean (nothing
+  committed). But a bare infrastructure/IO failure *during the commit phase itself* can still
+  leave earlier tables committed — the isolation layer cannot prevent this without an atomic
+  underlying. Full crash-atomicity is therefore **contingent on the underlying's capability**;
+  the isolation layer does not attempt distributed two-phase commit or capability negotiation.
+
+This is distinct from the deliberately out-of-scope cross-*connection* "last writer wins / no
+write-write conflict detection" behavior documented above — that concerns two different
+connections racing on the same row, not atomicity within a single connection's own commit.
 
 ### 4. Performance Overhead
 
