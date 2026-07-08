@@ -13,6 +13,7 @@ import { hasRuleBeenApplied, markRuleApplied, validateSideEffectMode } from './r
 import { createLogger } from '../../common/logger.js';
 import { performConstantFolding } from '../analysis/const-pass.js';
 import { createRuntimeExpressionEvaluator, createRuntimeRelationalEvaluator } from '../analysis/const-evaluator.js';
+import { MaterializationAdvisory } from '../cache/materialization-advisory.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 
@@ -73,6 +74,9 @@ export enum PassId {
 	/** Post-optimization cleanup and caching */
 	PostOptimization = 'post-opt',
 
+	/** Cache materialization advisory — one whole-tree pass */
+	Materialization = 'materialization',
+
 	/** Final validation */
 	Validation = 'validation',
 }
@@ -122,6 +126,49 @@ function createConstantFoldingPass(): OptimizationPass {
 }
 
 /**
+ * Create the materialization-advisory pass with custom execution.
+ *
+ * Runs the cache materialization advisory exactly ONCE over the whole plan.
+ * `analyzeAndTransform` builds a single reference graph (parent counts are then
+ * global — strictly more correct than the previous per-anchor-subtree-local
+ * counts, which under-counted sharing that spanned two anchors) and walks every
+ * descendant via `getChildren()`, wrapping each recommended relational node with
+ * a `CacheNode`. This replaces the previous 12 per-anchor-type `RuleHandle`
+ * registrations, each of which rebuilt a reference graph over its own subtree
+ * (O(anchors) graph builds per optimize, now 1).
+ *
+ * Placement (order 35) is between PostOptimization (30) and Validation (40) so
+ * the advisory runs AFTER the CacheNodes injected by `cte-optimization` /
+ * `in-subquery-cache` are already in place — it skips `nodeType === Cache`, so
+ * running last avoids double-wrapping.
+ *
+ * Side-effect soundness (a custom `execute` bypasses `sideEffectMode`
+ * validation, so the reasoning lives here rather than in a RuleHandle field):
+ * the advisory does not explicitly consult `hasSideEffects` — soundness for
+ * impure subtrees rests on CacheNode itself being a run-once fence
+ * (materialize-on-first-read, replay thereafter), so a side-effect-bearing
+ * subtree that the advisory would otherwise wrap runs exactly once instead of
+ * per-reference. That is a count-change but order-preserving rewrite — and
+ * matches the run-once contract the scalar / IN / EXISTS emitters apply
+ * directly when their inner is impure (see `docs/runtime.md`).
+ */
+function createMaterializationPass(): OptimizationPass {
+	return {
+		id: PassId.Materialization,
+		name: 'Materialization Advisory',
+		description: 'Inject caching where reference analysis shows materialization pays off',
+		traversalOrder: TraversalOrder.BottomUp,
+		rules: [],
+		enabled: true,
+		order: 35,
+		execute: (plan: PlanNode, context: OptContext) => {
+			const advisory = new MaterializationAdvisory(context.tuning);
+			return advisory.analyzeAndTransform(plan);
+		},
+	};
+}
+
+/**
  * Standard pass definitions
  */
 export const STANDARD_PASSES: OptimizationPass[] = [
@@ -150,6 +197,8 @@ export const STANDARD_PASSES: OptimizationPass[] = [
 		30,
 		TraversalOrder.BottomUp
 	),
+
+	createMaterializationPass(),
 
 	createPass(
 		PassId.Validation,

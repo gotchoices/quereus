@@ -89,9 +89,14 @@ The optimizer executes transformations through a series of **optimization passes
 
 #### Pass 3: Post-Optimization (Bottom-up)
 - **Purpose**: Final cleanup, materialization decisions, and caching
-- **Key Rules**: `ruleMaterializationAdvisory`, `ruleCteOptimization`, `ruleMutatingSubqueryCache`, `ruleInSubqueryCache`
+- **Key Rules**: `ruleCteOptimization`, `ruleMutatingSubqueryCache`, `ruleInSubqueryCache`
 - **Traversal**: Bottom-up for global analysis and cache injection
 - **Result**: Optimized plan with caching and materialization points
+
+#### Pass 3.5: Materialization Advisory (single whole-tree pass, order 35)
+- **Purpose**: Inject caching where reference analysis shows materialization pays off
+- **Implementation**: A custom-`execute` pass (no per-node rules) that runs `MaterializationAdvisory.analyzeAndTransform` **once** over the whole plan — one reference-graph build with global parent counts, versus the previous 12 per-anchor-type rule firings that each rebuilt a graph over their own subtree. Runs after Post-Optimization so it observes the `CacheNode`s already injected by `cte-optimization` / `in-subquery-cache` (it skips `nodeType === Cache`, avoiding double-wrapping). See `createMaterializationPass` in `framework/pass.ts` for the coverage and side-effect-soundness rationale.
+- **Result**: `CacheNode`s wrapping relational subtrees that benefit from materialization (multi-parent sharing, loop contexts)
 
 #### Pass 4: Validation (Bottom-up)
 - **Purpose**: Validate the correctness of the optimized plan
@@ -476,7 +481,7 @@ Rules are organized by optimization family in `src/planner/rules/`:
 **Caching** (`cache/`)
 - `ruleCteOptimization`: Adds caching to frequently-accessed CTEs
 - `ruleInSubqueryCache`: Wraps uncorrelated, deterministic IN-subquery sources in CacheNode
-- `ruleMaterializationAdvisory`: Global analysis for cache injection
+- `MaterializationAdvisory`: Global analysis for cache injection. Runs once over the whole plan as a dedicated custom-`execute` pass (`PassId.Materialization`, order 35), not as a per-node rule.
 - `ruleMaterializedViewRewrite`: Automatic materialized-view query rewrite (read side). Rewrites an *arbitrary* scan-projection-filter, 1:1-join, or grouped-aggregate query that never names an MV to scan (and, for an aggregate rollup, re-aggregate) the MV's backing table when a covering MV answers it — including eliminating a 1:1 inner/cross join at read time. Registered on both `Project` (projection-filter + join arms) and `Aggregate`. See § [Materialized-view query rewrite (read side)](#materialized-view-query-rewrite-read-side).
 - `ruleMutatingSubqueryCache`: Ensures mutating subqueries execute once
 - `ruleScalarCSE`: Scalar common subexpression elimination. Detects duplicate deterministic scalar expressions across a ProjectNode and its child chain (Filter, Sort), injects a lower ProjectNode that computes each deduplicated expression once, and replaces duplicates with column references. Skips bare column references, literals, and non-deterministic expressions. Runs in the Structural pass at priority 22.

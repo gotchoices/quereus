@@ -125,37 +125,40 @@ export class ReferenceGraphBuilder {
 	}
 
 	/**
-	 * Visit all children of a node
+	 * Visit every distinct child of a node exactly once.
+	 *
+	 * `getChildren()` is the full child set (scalar + relational); `getRelations()`
+	 * is a subset of it (the base implementation is
+	 * `getChildren().filter(isRelationalNode)`). `buildReferences` never early-returns
+	 * on an already-seen node, so visiting a relational child from BOTH loops re-walks
+	 * its whole subtree once per level — exponential in the relational-spine depth.
+	 * Deduping to one visit per child collapses that back to a single linear walk;
+	 * it is behavior-preserving because the parent `Set` already dedups parent counts
+	 * and both loops carry the same `childContext`, so no stat changes.
+	 *
+	 * A `getChildren()` / `getRelations()` throw is a real bug, not an expected state,
+	 * so it now propagates (no-silent-exceptions) — the previous catch silently dropped
+	 * the whole subtree from the graph, which would suppress caching without a trace.
 	 */
 	private visitAllChildren(node: PlanNode, childContext: TraversalContext): void {
-		// 1. Scalar children (expressions)
-		try {
-			const children = node.getChildren();
-			for (const child of children) {
-				if (child) {
-					this.buildReferences(child, childContext);
-				}
+		const visited = new Set<PlanNode>();
+
+		for (const child of node.getChildren()) {
+			if (child && !visited.has(child)) {
+				visited.add(child);
+				this.buildReferences(child, childContext);
 			}
-		} catch (e) {
-			log('Warning: Failed to get children for node %s: %s', node.nodeType, e);
 		}
 
-		// 2. Relational children
-		// Note: getRelations() returns a subset of getChildren() for nodes that have relational children
-		// We need to be careful not to double-count, but since we're using a Set for parents,
-		// and checking if we've already added a parent, this should be fine
+		// Defensive: pick up any relation not already surfaced by getChildren().
+		// With the base getRelations() this loop is a no-op, but a node that
+		// overrides getRelations() to expose an extra relation still gets counted.
 		if (isRelationalNode(node)) {
-			try {
-				const relations = node.getRelations();
-				for (const relation of relations) {
-					if (relation) {
-						// For now, treat all relational children the same
-						// In the future, nodes could provide hints about execution patterns
-						this.buildReferences(relation, childContext);
-					}
+			for (const relation of node.getRelations()) {
+				if (relation && !visited.has(relation)) {
+					visited.add(relation);
+					this.buildReferences(relation, childContext);
 				}
-			} catch (e) {
-				log('Warning: Failed to get relations for node %s: %s', node.nodeType, e);
 			}
 		}
 	}

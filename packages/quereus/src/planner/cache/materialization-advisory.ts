@@ -226,28 +226,27 @@ export class MaterializationAdvisory {
 	}
 
 	/**
-	 * Transform children of a node
-	 * This handles both scalar and relational children using a simpler approach
+	 * Recurse into every child of a node and splice back any rewritten children.
 	 */
 	private transformChildren(node: PlanNode, recommendations: Map<PlanNode, CacheRecommendation>): PlanNode {
-		// For nodes that we know how to handle, transform their children
-		// For others, return the node as-is (the optimizer will handle it)
-
-		// First, try to transform scalar children using withChildren
-		const scalarChildren = node.getChildren();
-		const transformedScalarChildren = scalarChildren.map(child =>
+		// getChildren() is the full child set — scalar AND relational
+		// (getRelations ⊆ getChildren). Recurse into every child; if any comes
+		// back wrapped in a CacheNode (or otherwise rewritten), splice the new
+		// children back in via withChildren.
+		const children = node.getChildren();
+		const transformedChildren = children.map(child =>
 			this.transformTree(child, recommendations)
 		);
 
-		const scalarChanged = transformedScalarChildren.some((child, idx) =>
-			child !== scalarChildren[idx]
+		const childrenChanged = transformedChildren.some((child, idx) =>
+			child !== children[idx]
 		);
 
-		if (scalarChanged) {
+		if (childrenChanged) {
 			// Let withChildren handle the transformation
 			// This will maintain proper attribute IDs and node structure
 			try {
-				return node.withChildren(transformedScalarChildren);
+				return node.withChildren(transformedChildren);
 			} catch (e) {
 				// If withChildren fails, log and return original
 				log('Warning: withChildren failed for %s: %s', node.nodeType, e);
@@ -255,11 +254,11 @@ export class MaterializationAdvisory {
 			}
 		}
 
-		// If no scalar children changed, check if this node has relational children
-		// that might need caching. For now, we'll return the node as-is and let
-		// individual optimization rules handle relational transformations.
-		// This is safer than trying to recreate complex nodes.
-
+		// Nothing under this node changed. Because getChildren() already includes
+		// relational children, any recommended CacheNode deeper in the tree was
+		// spliced in via the withChildren branch above and propagated up — there
+		// are no untransformed relational children left for other rules to handle.
+		// Return the node unchanged.
 		return node;
 	}
 }

@@ -13,7 +13,6 @@ import { createOptContext } from './framework/context.js';
 import type { OptimizerDiagnostics } from './framework/context.js';
 import { PassManager, PassId } from './framework/pass.js';
 // Phase 2 rules
-import { ruleMaterializationAdvisory } from './rules/cache/rule-materialization-advisory.js';
 import { ruleMaterializedViewRewrite } from './rules/cache/rule-materialized-view-rewrite.js';
 // Phase 1.5 rules
 import { ruleSelectAccessPath } from './rules/access/rule-select-access-path.js';
@@ -956,41 +955,12 @@ export class Optimizer {
 			sideEffectMode: 'aware',
 		});
 
-		// Register materialization advisory for multiple node types
-		const nodeTypesForMaterialization = [
-			PlanNodeType.Block,
-			PlanNodeType.ScalarSubquery,
-			PlanNodeType.Exists,
-			PlanNodeType.In,
-			PlanNodeType.Insert,
-			PlanNodeType.Update,
-			PlanNodeType.Delete,
-			PlanNodeType.CTE,
-			PlanNodeType.RecursiveCTE,
-			PlanNodeType.Returning,
-			PlanNodeType.ScalarFunctionCall,
-			PlanNodeType.CaseExpr,
-		];
-
-		for (const nodeType of nodeTypesForMaterialization) {
-			this.passManager.addRuleToPass(PassId.PostOptimization, {
-				id: `materialization-advisory-${nodeType}`,
-				nodeType,
-				phase: 'rewrite',
-				fn: ruleMaterializationAdvisory,
-				priority: 30,
-				// Delegates to MaterializationAdvisory. The advisory does not
-				// explicitly consult `hasSideEffects` — soundness for impure
-				// subtrees rests on CacheNode itself being a run-once fence
-				// (materialize-on-first-read, replay thereafter), so a
-				// side-effect-bearing subtree that the advisory would otherwise
-				// wrap runs exactly once instead of per-reference. That is a
-				// count-change but order-preserving rewrite — and matches the
-				// run-once contract the scalar / IN / EXISTS emitters apply
-				// directly when their inner is impure (see `docs/runtime.md`).
-				sideEffectMode: 'aware',
-			});
-		}
+		// The materialization advisory no longer registers per-node-type rules
+		// here. It runs once over the whole plan as a dedicated custom-execute
+		// pass (`PassId.Materialization`, order 35 — after PostOptimization so it
+		// observes the CacheNodes injected by `cte-optimization` /
+		// `in-subquery-cache`). See `createMaterializationPass` in framework/pass.ts
+		// for the single-walk rationale and the side-effect-soundness argument.
 
 		log('Registered rules to optimization passes');
 	}
