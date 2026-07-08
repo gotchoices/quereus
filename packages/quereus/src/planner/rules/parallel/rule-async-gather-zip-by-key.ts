@@ -605,10 +605,9 @@ function keyCollationsAgree(
 ): boolean {
 	const norm = (c: string | undefined): string => (c && c.length > 0 ? c.toUpperCase() : 'BINARY');
 	const collationOf = (branch: RelationalPlanNode, attrId: number): string => {
-		const attrs = branch.getAttributes();
 		const cols = branch.getType().columns;
-		const ix = attrs.findIndex((a: Attribute) => a.id === attrId);
-		return ix >= 0 ? norm(cols[ix].type.collationName) : 'BINARY';
+		const ix = branch.getAttributeIndex().get(attrId);
+		return ix !== undefined ? norm(cols[ix].type.collationName) : 'BINARY';
 	};
 	for (let pos = 0; pos < k; pos++) {
 		const base = collationOf(branches[0], branchKeyAttrs[0][pos]);
