@@ -453,5 +453,59 @@ describe('StoreManager', () => {
       expect(manager.openCount).to.equal(2);
     });
   });
+
+  describe('close/acquire race', () => {
+    // Reproduces the bug where an acquire that lands while a store is mid-close
+    // (idle cleanup) receives the handle being torn down instead of a live one.
+    // Deterministic via a barrier that parks store.close() so the racing acquire
+    // is guaranteed to run during the close window.
+    it('acquire during an in-flight close returns a live handle, not the closing one', async () => {
+      const raceDataDir = join(tmpdir(), `sync-race-test-${randomUUID()}`);
+      const raceManager = new StoreManager({
+        dataDir: raceDataDir,
+        maxOpenStores: 10,
+        idleTimeoutMs: 0,      // eligible for close the moment refCount hits 0
+        cleanupIntervalMs: 20, // cleanup fires quickly
+      });
+      raceManager.start();
+
+      try {
+        const entry = await raceManager.acquire(TEST_DATABASE_ID);
+        raceManager.release(TEST_DATABASE_ID); // refCount → 0; cleanup will close it
+        // NOTE: no await between release and the close patch below — cleanup cannot
+        // interpose, so the store is always patched before its close() is invoked.
+
+        let releaseBarrier!: () => void;
+        const closeBarrier = new Promise<void>(resolve => { releaseBarrier = resolve; });
+        let signalCloseStarted!: () => void;
+        const closeStarted = new Promise<void>(resolve => { signalCloseStarted = resolve; });
+
+        const originalClose = entry.store.close.bind(entry.store);
+        entry.store.close = async () => {
+          signalCloseStarted();
+          await closeBarrier;   // park mid-close so an acquire can race
+          await originalClose();
+        };
+
+        // Wait until cleanup has entered close() and is parked on the barrier.
+        await closeStarted;
+
+        // Race an acquire against the in-flight close, then let the close finish.
+        const acquireP = raceManager.acquire(TEST_DATABASE_ID);
+        releaseBarrier();
+        const entry2 = await acquireP;
+
+        // The acquired handle must be live — not the one that was being closed.
+        expect(entry2.store.isClosed()).to.be.false;
+        // And usable: a read must not throw "LevelDBStore is closed".
+        await entry2.store.get(new Uint8Array([1]));
+
+        raceManager.release(TEST_DATABASE_ID);
+      } finally {
+        await raceManager.shutdown();
+        await rm(raceDataDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+  });
 });
 

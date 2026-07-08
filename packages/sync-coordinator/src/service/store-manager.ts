@@ -140,6 +140,8 @@ export class StoreManager {
   private readonly isValidDatabaseId: (databaseId: string, context?: StoreContext) => boolean;
   private readonly stores = new Map<string, StoreEntry>();
   private readonly pendingOpens = new Map<string, Promise<StoreEntry>>();
+  /** In-flight closes keyed by databaseId. An acquire awaits this before opening a fresh handle. */
+  private readonly pendingCloses = new Map<string, Promise<void>>();
   private readonly onStoreCreated?: (entry: StoreEntry) => Promise<void>;
   /** Tracks closed stores eligible for disk eviction: databaseId → { storagePath, closedAt } */
   private readonly closedStores = new Map<string, { storagePath: string; closedAt: number }>();
@@ -169,13 +171,30 @@ export class StoreManager {
 
   /**
    * Get or open a store for a database. Increments refCount.
-   * Uses pendingOpens to prevent concurrent open+restore for the same databaseId.
+   * Uses pendingOpens to prevent concurrent open+restore for the same databaseId,
+   * and awaits pendingCloses so an in-flight close of the same key fully finishes
+   * before we vend or re-open a handle (see closeStore for the serialization invariant).
    * @param databaseId The database identifier
    * @param context Optional auth context for auth-aware path resolution
    */
   async acquire(databaseId: string, context?: StoreContext): Promise<StoreEntry> {
+    // Reject once shutdown has begun — the store map is being torn down and a
+    // handle vended here would never be closed by shutdown().
+    if (this._shuttingDown) {
+      throw new Error(`Cannot acquire store ${databaseId}: StoreManager is shutting down`);
+    }
+
     // Remove from eviction candidates — store is being (re-)opened
     this.closedStores.delete(databaseId);
+
+    // Serialize against an in-flight close of the SAME key: closeStore synchronously
+    // removes the entry from this.stores and registers its close promise here before
+    // awaiting close(). Waiting for it guarantees we never observe (and refCount++) a
+    // handle mid-teardown; after it resolves we fall through and open a fresh handle.
+    const closing = this.pendingCloses.get(databaseId);
+    if (closing) {
+      await closing;
+    }
 
     // Check if already open
     let entry = this.stores.get(databaseId);
@@ -445,8 +464,17 @@ export class StoreManager {
 
   /**
    * Close a specific store.
-   * Re-checks refCount to avoid closing a store acquired between the eviction
-   * decision and this call (race window across await boundaries).
+   *
+   * Serialization invariant: the close decision and the removal from this.stores
+   * happen in ONE synchronous section (no await between the refCount guard and the
+   * stores.delete). JS is single-threaded, so that section is atomic w.r.t. any
+   * racing acquire:
+   *   - acquire's sync section ran first → it bumped refCount, the guard here bails,
+   *     the entry stays live.
+   *   - this sync section runs first → the entry is gone from this.stores and the
+   *     in-flight close is registered in pendingCloses BEFORE we await close(); a
+   *     later acquire finds no entry, awaits pendingCloses, then opens a fresh handle
+   *     (correct for LevelDB's single-open lock — old handle fully closed first).
    */
   private async closeStore(databaseId: string, context?: StoreContext): Promise<void> {
     const entry = this.stores.get(databaseId);
@@ -456,20 +484,30 @@ export class StoreManager {
     // between the caller's refCount check and now.
     if (entry.refCount > 0) return;
 
-    // Resolve storage path before closing (needed for eviction tracking)
+    // Synchronously retire the entry from the live map so no acquire can observe it
+    // mid-teardown, and resolve the storage path (sync) before any await.
+    this.stores.delete(databaseId);
     const storagePath = this.resolveStoragePath(databaseId, context);
 
-    try {
-      await entry.store.close();
-      this.stores.delete(databaseId);
-      serviceLog('Store closed: %s', databaseId);
+    const closePromise = (async () => {
+      try {
+        await entry.store.close();
+        serviceLog('Store closed: %s', databaseId);
 
-      // Track for disk eviction if configured
-      if (this.diskEvictionIdleMs > 0 && this.onEvictStore) {
-        this.closedStores.set(databaseId, { storagePath, closedAt: Date.now() });
+        // Track for disk eviction if configured
+        if (this.diskEvictionIdleMs > 0 && this.onEvictStore) {
+          this.closedStores.set(databaseId, { storagePath, closedAt: Date.now() });
+        }
+      } catch (err) {
+        serviceLog('Error closing store %s: %O', databaseId, err);
       }
-    } catch (err) {
-      serviceLog('Error closing store %s: %O', databaseId, err);
+    })();
+
+    this.pendingCloses.set(databaseId, closePromise);
+    try {
+      await closePromise;
+    } finally {
+      this.pendingCloses.delete(databaseId);
     }
   }
 }
