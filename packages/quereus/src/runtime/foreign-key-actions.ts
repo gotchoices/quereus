@@ -431,6 +431,13 @@ export async function assertNoRestrictedChildrenForParentMutation(
  * outer's `true`, the outermost to `false`, and a thrown cascade still restores the
  * prior value (the flag never latches on across statements).
  */
+// NOTE: the flag is per-Database mutable state, held across the `await fn()` window by
+// synchronous save/restore. Correct only while statements on one connection do not truly
+// interleave (per-connection serialization holds today). The sibling `_fkRestrictSuppressed`
+// is only ever set under the apply-path mutex; this flag is set on the general user-DML
+// cascade path, so if Quereus ever runs concurrent statements on one Database a flag set by
+// one cascade could be observed by an unrelated statement's write during that await gap —
+// scope it to the executing statement/connection then.
 async function withFkCascadeReentry<T>(db: Database, fn: () => Promise<T>): Promise<T> {
 	const prior = db._setFkCascadeReentry(true);
 	try {
