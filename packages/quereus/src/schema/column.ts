@@ -54,6 +54,14 @@ export interface ColumnSchema {
 	defaultConflict?: ConflictResolution;
 	/** Arbitrary metadata tags (informational only, does not affect behavior or hashing) */
 	tags?: Readonly<Record<string, SqlValue>>;
+	/**
+	 * Raw declared type token verbatim from the DDL (e.g. 'BIGINT', 'TIMESTAMP'), before
+	 * {@link logicalType} flattening collapses it onto a shared logical type (e.g. both
+	 * map to INTEGER). Informational only — not hashed, not compared, not read anywhere in
+	 * Quereus; exists so an external host can recover the distinction the flattened
+	 * `logicalType` erases. Absent when the column def had no declared type.
+	 */
+	declaredType?: string;
 }
 
 /**

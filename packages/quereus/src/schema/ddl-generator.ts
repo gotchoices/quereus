@@ -452,6 +452,11 @@ function qualifiedName(schemaName: string | undefined, name: string, currentSche
 
 function formatColumnDef(col: ColumnSchema, tableSchema: TableSchema, defaultNotNull: boolean | undefined, synthesizedKey: boolean): string {
 	let colDef = quoteName(col.name);
+	// NOTE: emits the flattened col.logicalType.name (e.g. 'INTEGER'), not col.declaredType
+	// (e.g. 'BIGINT'). That's intentional today — declaredType is informational-only, read
+	// by an external host, not by Quereus's own DDL round-trip — but if this ever needs to
+	// regenerate a byte-faithful CREATE TABLE, prefer col.declaredType here so the raw token
+	// isn't silently dropped again.
 	if (col.logicalType) colDef += ` ${col.logicalType.name}`;
 
 	const nullAnnotation = nullabilityAnnotation(col.notNull, defaultNotNull);

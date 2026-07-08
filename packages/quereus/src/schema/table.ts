@@ -265,6 +265,7 @@ export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true
 		defaultValue: null,
 		collation: resolveDefaultCollation(logicalType, defaultCollation),
 		generated: false,
+		declaredType: def.dataType,
 	};
 
 	for (const constraint of def.constraints ?? []) {
