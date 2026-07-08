@@ -24,6 +24,48 @@ describe('Latches', () => {
 		expect(order).to.deep.equal(['first-holds', 'second-acquired']);
 	});
 
+	describe('instance scoping', () => {
+		it('two instances do NOT contend on the same key', async () => {
+			// Models two independent Database instances that both lock an
+			// identically-named table: they must proceed in parallel.
+			const a = new Latches();
+			const b = new Latches();
+			const key = 'MemoryTable.Commit:main.t';
+
+			// `a` holds the key and never releases within the test window.
+			await a.acquire(key);
+
+			// `b` acquiring the SAME key must not be blocked by `a`.
+			let bAcquired = false;
+			const bDone = b.acquire(key).then((releaseB) => {
+				bAcquired = true;
+				releaseB();
+			});
+
+			await bDone;
+			expect(bAcquired, 'second instance should acquire independently').to.equal(true);
+		});
+
+		it('a single instance still serializes same-key acquires', async () => {
+			const latches = new Latches();
+			const key = 'MemoryTable.Commit:main.t';
+			const order: string[] = [];
+
+			const release1 = await latches.acquire(key);
+			const acquire2 = latches.acquire(key).then((release2) => {
+				order.push('second-acquired');
+				release2();
+			});
+
+			order.push('first-holds');
+			await Promise.resolve();
+			release1();
+			await acquire2;
+
+			expect(order).to.deep.equal(['first-holds', 'second-acquired']);
+		});
+	});
+
 	describe('timeout deadlock guard', () => {
 		it('rejects with BUSY when the predecessor does not release in time', async () => {
 			const key = 'Latches.spec.timeout:1';

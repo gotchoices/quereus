@@ -8,16 +8,20 @@ const warnLog = log.extend('warn');
 /**
  * Lightweight mutex lock queue for serializing concurrent access by string key.
  *
- * NOTE: the queue map is a process-global `static` keyed only by the string argument,
- * so it is shared across *all* `Database` instances — two independent databases that
- * pass the same key contend on the same latch. Every current caller namespaces its key
- * with `schema.table`, which keeps intra-process collisions to genuinely same-named
- * tables. Scoping the registry per-database (an owned `Latches` instance) is tracked
- * separately in the `latches-database-scoping` ticket.
+ * Each `Latches` instance owns its own queue map, so two independent owners (e.g.
+ * two `Database` instances) never share a latch even when they pass the same key.
+ * The engine holds one instance per `Database` (`db.latches`); callers namespace
+ * their key with `schema.table` to keep intra-database collisions to genuinely
+ * same-named tables.
+ *
+ * A process-global default instance backs the {@link Latches.acquire} *static*
+ * method, preserving the original shared-queue entry point for standalone
+ * callers (e.g. external store modules) that hold no `Database`.
  */
 export class Latches {
-	// Stores the promise representing the completion of the last queued operation for a key.
-	private static lockQueues = new Map<string, Promise<void>>();
+	// Stores the promise representing the completion of the last queued operation
+	// for a key. Instance-scoped: one map per Latches instance.
+	private readonly lockQueues = new Map<string, Promise<void>>();
 
 	/**
 	 * Acquires a lock for the given key. Waits if another operation holds the lock.
@@ -33,7 +37,7 @@ export class Latches {
 	 *            original never-reject behavior.
 	 * @returns A function that must be called to release the lock
 	 */
-	static async acquire(key: string, timeoutMs?: number): Promise<() => void> {
+	async acquire(key: string, timeoutMs?: number): Promise<() => void> {
 		// Get the promise the current operation needs to wait for (if any)
 		const currentTail = this.lockQueues.get(key) ?? Promise.resolve();
 
@@ -85,5 +89,19 @@ export class Latches {
 			if (timer !== undefined) clearTimeout(timer);
 		}
 		return release;
+	}
+
+	/** Process-global default instance backing the static {@link Latches.acquire}. */
+	private static readonly global = new Latches();
+
+	/**
+	 * Backward-compatible static entry point delegating to a single process-global
+	 * instance. Same shared-queue semantics this class had before it became
+	 * instance-based — kept for standalone callers (external store modules) that
+	 * hold no `Database`. Engine call sites should prefer the owned per-database
+	 * instance (`db.latches`) so two databases never contend on the same key.
+	 */
+	static acquire(key: string, timeoutMs?: number): Promise<() => void> {
+		return this.global.acquire(key, timeoutMs);
 	}
 }

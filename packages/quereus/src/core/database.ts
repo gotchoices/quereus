@@ -47,6 +47,7 @@ import { registerType as registerTypeInRegistry } from '../types/registry.js';
 import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
+import { Latches } from '../util/latches.js';
 import {
 	DatabaseEventEmitter,
 	type DatabaseDataChangeEvent,
@@ -130,6 +131,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  replicable-collation gate when the backing host demands it
 	 *  (see {@link _isCollationReplicable}). */
 	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string; replicable?: boolean }>();
+	/**
+	 * Per-database latch registry — serializes commit / collapse / consolidate /
+	 * destroy / schema-change work by string key *within this database*. Scoped to
+	 * the `Database` instance (not process-global) so two databases never contend
+	 * on the same key. Memory-table managers reach it via `this.db.latches`.
+	 */
+	public readonly latches = new Latches();
 
 	constructor() {
 		this.schemaManager = new SchemaManager(this);

@@ -8,7 +8,6 @@ import { TransactionLayer } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
 import { MemoryVirtualTableConnection } from '../connection.js';
-import { Latches } from '../../../util/latches.js';
 import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
@@ -435,7 +434,7 @@ export class MemoryTableManager {
 		const changes = eventChunks.reverse().flat();
 
 		const lockKey = `MemoryTable.Commit:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		logger.debugLog(`[Commit ${connection.connectionId}] Acquired lock for ${this._tableName}`);
 		try {
 			// Walk up the parent chain to find if the current committed layer is an ancestor
@@ -512,7 +511,7 @@ export class MemoryTableManager {
 		const lockKey = `MemoryTable.Collapse:${this.schemaName}.${this._tableName}`;
 		let release: (() => void) | null = null;
 		try {
-			const acquirePromise = Latches.acquire(lockKey);
+			const acquirePromise = this.db.latches.acquire(lockKey);
 			const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 10)); // Short timeout
 			const result = await Promise.race([
 				acquirePromise.then(releaseFn => ({ release: releaseFn })),
@@ -1336,7 +1335,7 @@ export class MemoryTableManager {
 			throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		}
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		try {
 			// Drain any in-flight transaction layers down to the base so the swap
 			// below isn't shadowed by a committed transaction layer ahead of base.
@@ -1604,7 +1603,7 @@ export class MemoryTableManager {
 	async addColumn(columnDefAst: ASTColumnDef, backfillEvaluator?: (row: Row) => SqlValue | Promise<SqlValue>): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -1687,7 +1686,7 @@ export class MemoryTableManager {
 	async dropColumn(columnName: string): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -1781,7 +1780,7 @@ export class MemoryTableManager {
 	async renameColumn(oldName: string, newColumnDefAst: ASTColumnDef): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -1856,7 +1855,7 @@ export class MemoryTableManager {
 	}): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -2038,7 +2037,7 @@ export class MemoryTableManager {
 	async createIndex(newIndexSchemaEntry: IndexSchema, ifNotExistsFromAst?: boolean): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -2105,7 +2104,7 @@ export class MemoryTableManager {
 	async dropIndex(indexName: string, ifExists?: boolean): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -2165,7 +2164,7 @@ export class MemoryTableManager {
 	async dropConstraint(constraintName: string): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -2237,7 +2236,7 @@ export class MemoryTableManager {
 	async renameConstraint(oldName: string, newName: string): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -2331,7 +2330,7 @@ export class MemoryTableManager {
 	async addConstraint(constraint: ASTTableConstraint): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
 		try {
 			await this.ensureSchemaChangeSafety();
@@ -2493,7 +2492,7 @@ export class MemoryTableManager {
 
 	public async destroy(): Promise<void> {
 		const lockKey = `MemoryTable.Destroy:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 		try {
 			for (const connection of this.connections.values()) {
 				if (connection.pendingTransactionLayer) connection.rollback();
@@ -2569,7 +2568,7 @@ export class MemoryTableManager {
 	/** Consolidates all transaction data into the base layer for schema changes */
 	private async consolidateToBaseLayer(): Promise<void> {
 		const lockKey = `MemoryTable.Consolidate:${this.schemaName}.${this._tableName}`;
-		const release = await Latches.acquire(lockKey);
+		const release = await this.db.latches.acquire(lockKey);
 
 		try {
 			logger.debugLog(`[Consolidate] Acquired lock for ${this._tableName}`);
