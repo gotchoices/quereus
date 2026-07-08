@@ -76,7 +76,7 @@ test/
 └── util/                     # Test utilities
 ```
 
-Key relationships: each PlanNode in `planner/nodes/` has a matching emitter in `runtime/emit/`. Optimizer rules in `planner/rules/` are registered via `planner/framework/registry.ts`. Tests go in `test/logic/*.sqllogic` (SQL logic tests) or `test/plan/` (plan shape tests).
+Key relationships: each PlanNode in `planner/nodes/` has a matching emitter in `runtime/emit/`. Optimizer rules in `planner/rules/` are registered in `planner/optimizer.ts` (via `this.passManager.addRuleToPass(...)`). Tests go in `test/logic/*.sqllogic` (SQL logic tests) or `test/plan/` (plan shape tests).
 
 ## Common Implementation Patterns
 
