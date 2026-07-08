@@ -134,6 +134,29 @@ describe('Key Encoding', () => {
       }
     });
 
+    it('should preserve blob sort order (element-wise, matching SQL)', () => {
+      // Regression for store-blob-key-varint-not-memcmp-ordered: the encoded
+      // bytes must memcmp in element-wise blob order, not by length. Covers the
+      // exact bug (x'0102' < x'03' though shorter), prefix < extension, empty <
+      // non-empty, and the escaped content bytes 0x00/0x01/0x02 in order.
+      const blobs = [
+        new Uint8Array([]),          // empty sorts first
+        new Uint8Array([0x00]),      // escaped 0x00
+        new Uint8Array([0x00, 0x00]),
+        new Uint8Array([0x01]),      // escaped 0x01
+        new Uint8Array([0x01, 0x02]),
+        new Uint8Array([0x01, 0x02, 0xff]), // prefix < extension
+        new Uint8Array([0x02]),      // raw byte
+        new Uint8Array([0x03]),      // x'0102' (above) must sort before this
+        new Uint8Array([0xff]),
+      ];
+      const encoded = blobs.map(b => encodeValue(b));
+      for (let i = 0; i < encoded.length - 1; i++) {
+        expect(compareBytes(encoded[i], encoded[i + 1])).to.be.lessThan(
+          0, `blob ${i} should sort before blob ${i + 1}`);
+      }
+    });
+
     describe('JSON object canonical key encoding', () => {
       it('encodes reorder-equal objects to identical bytes', () => {
         // {a:1,b:2} and {b:2,a:1} compare equal (deepCompareJson sorts keys), so
@@ -214,6 +237,23 @@ describe('Key Encoding', () => {
         const encoded = values.map(v =>
           encodeCompositeKey([v], { collation: 'NOCASE' }, [true]),
         );
+        expect(compareBytes(encoded[2], encoded[1])).to.be.lessThan(0);
+        expect(compareBytes(encoded[1], encoded[0])).to.be.lessThan(0);
+      });
+
+      it('single DESC BLOB inverts variable-length order under bit inversion', () => {
+        // The escape+terminator scheme must stay order-correct after ^0xff. Uses
+        // a prefix pair (x'0102' < x'0102ff') and the length-vs-content pair
+        // (x'0102' < x'03') to exercise the terminator under inversion.
+        const values = [
+          new Uint8Array([0x01, 0x02]),
+          new Uint8Array([0x01, 0x02, 0xff]),
+          new Uint8Array([0x03]),
+        ];
+        const encoded = values.map(v =>
+          encodeCompositeKey([v], { collation: 'NOCASE' }, [true]),
+        );
+        // DESC: larger blobs sort first, so ASC index 2 > 1 > 0 reverses.
         expect(compareBytes(encoded[2], encoded[1])).to.be.lessThan(0);
         expect(compareBytes(encoded[1], encoded[0])).to.be.lessThan(0);
       });
