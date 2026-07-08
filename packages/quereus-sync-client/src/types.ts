@@ -139,6 +139,13 @@ export interface GetChangesMessage {
 export interface ApplyChangesMessage {
   type: 'apply_changes';
   changes: SerializedChangeSet[];
+  /**
+   * Correlation id echoed back on the resulting `apply_result`, so the client
+   * can tie an ack to the exact batch that produced it (and only then advance
+   * its delta-sync watermark). Optional: peer-relay pushes that carry no
+   * watermark to promote omit it — see SyncClient.pushLocalChanges.
+   */
+  requestId?: string;
 }
 
 /** Client → Server: Request snapshot */
@@ -180,6 +187,12 @@ export interface PushChangesMessage {
 /** Server → Client: Apply result */
 export interface ApplyResultMessage {
   type: 'apply_result';
+  /**
+   * The `requestId` of the `apply_changes` this acknowledges, reflected back
+   * verbatim by the server. Absent when the originating push carried none (a
+   * peer-relay push) or on a legacy coordinator that predates correlation.
+   */
+  requestId?: string;
   applied: number;
   skipped: number;
   conflicts: number;

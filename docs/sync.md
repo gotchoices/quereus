@@ -847,9 +847,9 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 │    │                                                  │                    │
 │    │◄─────── { type: "changes", changeSets: [...] } ──│                    │
 │    │                                                  │                    │
-│    │──────── { type: "apply_changes", changes } ─────►│  (local changes)   │
+│    │─── { type: "apply_changes", requestId, changes } ►│  (local changes)   │
 │    │                                                  │                    │
-│    │◄─────── { type: "apply_result", applied, ... } ──│                    │
+│    │◄── { type: "apply_result", requestId, applied } ─│                    │
 │    │                                                  │                    │
 │    │◄────── { type: "push_changes", changeSets } ─────│  (from other peer) │
 │    │                                                  │                    │
@@ -867,7 +867,7 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 |------|---------|---------|
 | `handshake` | Authenticate and establish session | `{ siteId, token? }` |
 | `get_changes` | Request changes since an HLC | `{ sinceHLC? }` (base64) |
-| `apply_changes` | Push local changes to server | `{ changes: ChangeSet[] }` |
+| `apply_changes` | Push local changes to server | `{ changes: ChangeSet[], requestId? }` |
 | `get_snapshot` | Request full snapshot | (none) |
 | `ping` | Heartbeat / keepalive | (none) |
 
@@ -878,10 +878,21 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 | `handshake_ack` | Confirm authentication | `{ serverSiteId, connectionId }` |
 | `changes` | Response to `get_changes` | `{ changeSets: ChangeSet[] }` |
 | `push_changes` | Broadcast from another client | `{ changeSets: ChangeSet[] }` |
-| `apply_result` | Confirm changes applied | `{ applied, skipped, conflicts }` |
+| `apply_result` | Confirm changes applied | `{ requestId?, applied, skipped, conflicts }` |
 | `snapshot_chunk` | Streamed snapshot data | `{ chunk: SnapshotChunk }` |
 | `error` | Error response | `{ code, message }` |
 | `pong` | Heartbeat response | (none) |
+
+**Push/ack correlation (`requestId`).** Each `apply_changes` the client sends to
+advance its delta-sync watermark carries a monotonic `requestId` (`apply-1`,
+`apply-2`, …). The server keeps no state — it reflects the id back verbatim on
+the resulting `apply_result`. The client promotes its `lastSentHLC` watermark
+only for the ack whose `requestId` matches the batch that produced it, and only
+ever forward. This makes a stale, duplicate, or out-of-order ack (e.g.
+redelivered across a reconnect) inert, rather than crediting the wrong batch and
+mis-advancing the watermark. Pushes with no watermark to promote (a peer-relay
+`apply_changes`) omit the id; the server then echoes none, and the client leaves
+its watermark untouched.
 
 #### Connection Lifecycle
 
@@ -955,10 +966,10 @@ transactions (§ Transaction-Based Change Grouping → Read side):
 │  On local change:                                                           │
 │  1. Local change triggers debounced send (50ms window)                      │
 │  2. Client: getChangesSince(serverSiteId, lastSentHLC) → per-tx ChangeSets  │
-│  3. Client: apply_changes { changes }                                       │
-│  4. Client: pendingSentHLC = max ChangeSet.hlc of sent transactions         │
-│  5. Server: apply_result { applied, ... }                                   │
-│  6. Client: lastSentHLC = pendingSentHLC (on success)                       │
+│  3. Client: apply_changes { requestId: apply-N, changes }                   │
+│  4. Client: pendingSentHLCs[requestId] = max ChangeSet.hlc of sent txns     │
+│  5. Server: apply_result { requestId, applied, ... }  (id echoed verbatim)  │
+│  6. Client: on matching requestId, lastSentHLC = that HLC (forward-only)    │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```

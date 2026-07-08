@@ -797,7 +797,7 @@ describe('SyncClient', () => {
   // ==========================================================================
 
   describe('send failure', () => {
-    it('should not advance pendingSentHLC when the send throws', async () => {
+    it('should not register a pending watermark when the send throws', async () => {
       const syncEvents = new SyncEventEmitterImpl();
       const syncManager = new MockSyncManager();
       const { client, syncEventsLog } = createClient({ syncManager, syncEvents });
@@ -821,10 +821,110 @@ describe('SyncClient', () => {
       (syncEvents as any).localChangeListeners.forEach((fn: any) => fn({ table: 'items' }));
       await new Promise(r => setTimeout(r, 50));
 
-      // Failed send must not advance the delta-sync watermark.
-      expect((client as any).pendingSentHLC).to.be.null;
+      // Failed send must not register a pending watermark (nothing to promote).
+      expect((client as any).pendingSentHLCs.size).to.equal(0);
       // And the failure is surfaced, not swallowed.
       expect(syncEventsLog.some(e => e.type === 'error' && e.message.includes('Failed to send'))).to.be.true;
+    });
+  });
+
+  // ==========================================================================
+  // apply_result correlation (requestId)
+  // ==========================================================================
+
+  describe('apply_result correlation', () => {
+    /** A one-column ChangeSet stamped with the given HLC. */
+    function changeSet(site: SiteId, txId: string, hlc: HLC): ChangeSet {
+      return {
+        siteId: site,
+        transactionId: txId,
+        hlc,
+        changes: [{ type: 'column', schema: 'main', table: 'items', pk: [1], column: 'n', value: txId, hlc }],
+        schemaMigrations: [],
+      };
+    }
+
+    it('stamps each apply_changes push with a monotonic requestId', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      ws.sentMessages.length = 0;
+
+      const site = syncManager.getSiteId();
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 })];
+      await (client as any).pushLocalChanges();
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx2', { wallTime: 2000n, counter: 1, siteId: site, opSeq: 0 })];
+      await (client as any).pushLocalChanges();
+
+      const pushes = ws.getSentMessages().filter(m => m.type === 'apply_changes') as Array<{ requestId?: string }>;
+      expect(pushes.map(p => p.requestId)).to.deep.equal(['apply-1', 'apply-2']);
+    });
+
+    it('advances lastSentHLC only for the matching apply_result requestId', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      ws.sentMessages.length = 0;
+
+      const site = syncManager.getSiteId();
+      const hlc: HLC = { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 };
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc)];
+      await (client as any).pushLocalChanges();
+
+      const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId?: string };
+      expect(push.requestId).to.be.a('string');
+      // Pending until acked — nothing promoted yet.
+      expect((client as any).lastSentHLC).to.be.null;
+      expect((client as any).pendingSentHLCs.size).to.equal(1);
+
+      // A non-matching ack (stale / duplicate / unknown push) must NOT promote.
+      ws.simulateMessage({ type: 'apply_result', requestId: 'apply-999', applied: 0 });
+      await new Promise(r => setTimeout(r, 5));
+      expect((client as any).lastSentHLC).to.be.null;
+      expect((client as any).pendingSentHLCs.size).to.equal(1);
+
+      // The matching ack promotes exactly once and clears the pending entry.
+      ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 5));
+      expect((client as any).lastSentHLC).to.deep.equal(hlc);
+      expect((client as any).pendingSentHLCs.size).to.equal(0);
+    });
+
+    it('does not regress lastSentHLC on an out-of-order or duplicate apply_result', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      ws.sentMessages.length = 0;
+
+      const site = syncManager.getSiteId();
+      const hlc1: HLC = { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 };
+      const hlc2: HLC = { wallTime: 2000n, counter: 1, siteId: site, opSeq: 0 };
+
+      // Two pushes in flight (second re-sends a superset, as delta sync does
+      // when the first has not yet been acked).
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc1)];
+      await (client as any).pushLocalChanges();
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc1), changeSet(site, 'tx2', hlc2)];
+      await (client as any).pushLocalChanges();
+
+      const pushes = ws.getSentMessages().filter(m => m.type === 'apply_changes') as Array<{ requestId?: string }>;
+      const [id1, id2] = [pushes[0].requestId!, pushes[1].requestId!];
+      expect(id1).to.not.equal(id2);
+
+      // Ack the newer push first.
+      ws.simulateMessage({ type: 'apply_result', requestId: id2, applied: 2 });
+      await new Promise(r => setTimeout(r, 5));
+      expect((client as any).lastSentHLC).to.deep.equal(hlc2);
+
+      // The older push's ack arrives late — must NOT drag the watermark back.
+      ws.simulateMessage({ type: 'apply_result', requestId: id1, applied: 1 });
+      await new Promise(r => setTimeout(r, 5));
+      expect((client as any).lastSentHLC).to.deep.equal(hlc2);
+
+      // A duplicate of the newer ack is also inert.
+      ws.simulateMessage({ type: 'apply_result', requestId: id2, applied: 2 });
+      await new Promise(r => setTimeout(r, 5));
+      expect((client as any).lastSentHLC).to.deep.equal(hlc2);
     });
   });
 

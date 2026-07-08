@@ -6,13 +6,14 @@
  * - Message dispatch (changes, push_changes, apply_result, error, pong)
  * - Reconnection with exponential backoff
  * - Local change debouncing
- * - Delta sync tracking (lastSentHLC, pendingSentHLC)
+ * - Delta sync tracking (lastSentHLC + per-request pending watermarks)
  */
 
 import {
   siteIdToBase64,
   siteIdFromBase64,
   maxHLC,
+  compareHLC,
   type SyncManager,
   type SyncEventEmitter,
   type HLC,
@@ -86,9 +87,23 @@ export class SyncClient {
     'ALREADY_AUTHENTICATED',
   ]);
 
-  // Delta sync tracking
+  // Delta sync tracking. `lastSentHLC` is the high-water mark of local changes
+  // the server has acknowledged. Each in-flight push is tracked by its request
+  // id → the HLC that ack would promote `lastSentHLC` to; keying by request id
+  // correlates each `apply_result` to the exact batch that produced it, so a
+  // stale, duplicate, or out-of-order ack can't mis-advance the watermark.
   private lastSentHLC: HLC | null = null;
-  private pendingSentHLC: HLC | null = null;
+  // NOTE: bounded by in-flight pushes — every successful ack prunes itself plus
+  // any batch its watermark subsumes (see promoteWatermark), and disconnect
+  // clears it. If a server ever accepts apply_changes but never acks them, this
+  // would grow one entry per push; cap it (evict oldest) only if that shows up.
+  private readonly pendingSentHLCs = new Map<string, HLC>();
+  // Monotonic per-client counter backing apply-request ids. Deterministic (no
+  // Date.now / Math.random) so tests can predict the ids. Intentionally NOT
+  // reset on disconnect: pendingSentHLCs is cleared there instead, so a stale
+  // ack redelivered after a reconnect carries an id we no longer hold (dropped)
+  // rather than colliding with a freshly-reused id and crediting the wrong batch.
+  private applyRequestSeq = 0;
 
   // Local change debouncing
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -255,7 +270,7 @@ export class SyncClient {
 
     this.serverSiteId = null;
     this.lastSentHLC = null;
-    this.pendingSentHLC = null;
+    this.pendingSentHLCs.clear();
     this.setStatus({ status: 'disconnected' });
     this.emitSyncEvent('state-change', 'Disconnected from sync server (manual)');
   }
@@ -387,17 +402,56 @@ export class SyncClient {
     this.setStatus({ status: 'synced', lastSyncTime: Date.now() });
   }
 
-  private handleApplyResult(message: { applied?: number; rejected?: Array<{ reason: string; code?: string }> }): void {
-    // Update lastSentHLC to enable delta sync on next send
-    if (this.pendingSentHLC) {
-      this.lastSentHLC = this.pendingSentHLC;
-      this.pendingSentHLC = null;
-    }
+  private handleApplyResult(message: {
+    requestId?: string;
+    applied?: number;
+    rejected?: Array<{ reason: string; code?: string }>;
+  }): void {
+    this.promoteWatermark(message.requestId);
+
     this.emitSyncEvent('info', `Server applied ${message.applied ?? 0} change(s)`);
 
     if (message.rejected?.length) {
       for (const r of message.rejected) {
         this.emitSyncEvent('rejected', r.reason, { rejections: [r] });
+      }
+    }
+  }
+
+  /**
+   * Advance `lastSentHLC` for the acknowledged push identified by `requestId`.
+   *
+   * Only the push whose id we recorded in {@link pushLocalChanges} promotes the
+   * watermark, and only ever forward — never regressing past a newer batch a
+   * later ack already promoted. Acks we can't correlate are dropped:
+   *  - a `requestId` we don't hold → a stale or duplicate ack (e.g. redelivered
+   *    across a reconnect, or the server double-acked); logged, then ignored.
+   *  - no `requestId` → an untracked push (a peer-relay `apply_changes`) or a
+   *    legacy coordinator that doesn't echo the id; nothing to promote.
+   */
+  private promoteWatermark(requestId: string | undefined): void {
+    if (requestId === undefined) return;
+
+    const promoted = this.pendingSentHLCs.get(requestId);
+    if (!promoted) {
+      this.emitSyncEvent('info', `Ignoring apply_result for unknown push (requestId: ${requestId})`);
+      return;
+    }
+
+    this.pendingSentHLCs.delete(requestId);
+
+    // Never move the watermark backward: an out-of-order ack for an older batch
+    // must not undo a newer batch a prior ack already promoted.
+    if (!this.lastSentHLC || compareHLC(promoted, this.lastSentHLC) > 0) {
+      this.lastSentHLC = promoted;
+    }
+
+    // Drop any still-pending batches the new watermark now subsumes (a later
+    // push re-sends everything since the last ack, so its range covers theirs),
+    // so their late/duplicate acks can't re-promote an already-covered HLC.
+    for (const [id, hlc] of this.pendingSentHLCs) {
+      if (compareHLC(hlc, this.lastSentHLC) <= 0) {
+        this.pendingSentHLCs.delete(id);
       }
     }
   }
@@ -527,19 +581,32 @@ export class SyncClient {
       changeCount: changes.length,
     });
 
+    // Correlate this push with its ack: the server echoes requestId back on the
+    // apply_result, so we promote lastSentHLC only when the matching ack returns.
+    const requestId = this.nextApplyRequestId();
     const sent = this.send({
       type: 'apply_changes',
+      requestId,
       changes: serialized,
     });
 
-    // Only advance the delta-sync watermark / clear pending state if the bytes
-    // actually left. A dropped send must be retried on the next push, so leave
-    // lastSentHLC (via pendingSentHLC) and the pending count untouched.
+    // Only advance delta-sync state if the bytes actually left. A dropped send
+    // must be retried on the next push, so register no pending watermark and
+    // leave the pending count untouched.
     if (!sent) return;
 
-    // Track the max HLC we're sending for delta sync
-    this.pendingSentHLC = maxHLC(changes.map(cs => cs.hlc)) ?? null;
+    // Record the max HLC this batch carries against its request id; the matching
+    // apply_result promotes lastSentHLC to it (see promoteWatermark).
+    const batchHLC = maxHLC(changes.map(cs => cs.hlc));
+    if (batchHLC) {
+      this.pendingSentHLCs.set(requestId, batchHLC);
+    }
     this.pendingLocalChangeCount = 0;
+  }
+
+  /** Next monotonic apply-request id. Deterministic for test predictability. */
+  private nextApplyRequestId(): string {
+    return `apply-${++this.applyRequestSeq}`;
   }
 
   // ==========================================================================

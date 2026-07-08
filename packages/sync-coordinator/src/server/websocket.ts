@@ -38,6 +38,9 @@ interface GetChangesMessage {
 interface ApplyChangesMessage {
   type: 'apply_changes';
   changes: unknown[];
+  /** Correlation id, reflected back verbatim on the apply_result. Optional:
+   *  a peer-relay push carries none. The server keeps no state — it only echoes. */
+  requestId?: string;
 }
 
 interface GetSnapshotMessage {
@@ -235,7 +238,10 @@ export function registerWebSocket(
 
         const result = await service.applyChanges(session.databaseId, session.identity, changes);
 
-        sendMessage({ type: 'apply_result', ...result });
+        // Echo the client's correlation id so it can tie this ack to the exact
+        // batch it sent. `requestId: undefined` is dropped by JSON.stringify, so
+        // a push without one (or a legacy client) simply gets no id back.
+        sendMessage({ type: 'apply_result', requestId: msg.requestId, ...result });
       } catch (err) {
         const msg2 = err instanceof Error ? err.message : 'Failed to apply changes';
         wsLog('apply_changes error: %s', msg2);
