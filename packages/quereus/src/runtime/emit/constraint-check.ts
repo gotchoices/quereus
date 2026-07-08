@@ -12,7 +12,7 @@ import { ConflictResolution } from '../../common/constants.js';
 import { withAsyncRowContext, createRowSlot } from '../context-helpers.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { composeCombinedDescriptor } from '../descriptor-helpers.js';
-import { sqlValuesEqual } from '../../util/comparison.js';
+import { sqlValuesEqual, isTruthy } from '../../util/comparison.js';
 import { validateAndParse } from '../../types/validation.js';
 
 interface ConstraintMetadataEntry {
@@ -369,8 +369,8 @@ async function checkCheckConstraints(
 		const rawResult = evaluator(rctx);
 		const result = (rawResult instanceof Promise ? await rawResult : rawResult) as SqlValue;
 
-		// CHECK passes if truthy or NULL; fails on false / 0 (SQLite numeric boolean).
-		if (result === false || result === 0) {
+		// CHECK passes if truthy or NULL; fails otherwise (shared isTruthy semantics).
+		if (result !== null && !isTruthy(result)) {
 			const exprHint = metadata.constraintExpr.length <= 60
 				? ` (${metadata.constraintExpr})`
 				: '';

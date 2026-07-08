@@ -8,6 +8,7 @@ import { createRowSlot } from './context-helpers.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from './strict-fork.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { composeCombinedDescriptor } from './descriptor-helpers.js';
+import { isTruthy } from '../util/comparison.js';
 
 export interface DeferredConstraintRow {
 	row: Row;
@@ -101,7 +102,7 @@ export class DeferredConstraintQueue {
 		try {
 			slot.set(evaluationRow);
 			const value = await entry.evaluator(runtimeCtx) as SqlValue;
-			if (value === false || value === 0) {
+			if (value !== null && !isTruthy(value)) {
 				throw new QuereusError(`CHECK constraint failed: ${entry.constraintName}`, StatusCode.CONSTRAINT);
 			}
 		} finally {

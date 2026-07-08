@@ -426,3 +426,35 @@ insert into t_riv_newfold values (1, 5);
 select * from t_riv_newfold where v <= 0;
 → []
 drop table t_riv_newfold;
+
+-- ===================================
+-- CHECK truthiness must match the engine-wide isTruthy rule, not a narrower
+-- `result === false || result === 0` test. Integer literals evaluate to
+-- bigint at runtime, and CHECK must reject bigint-zero and the string '0'
+-- exactly like FilterNode / WHERE does.
+-- ===================================
+
+create table t_truthy (id integer primary key, v any, check (v));
+
+insert into t_truthy values (1, 5);
+insert into t_truthy values (2, true);
+
+select count(*) as cnt from t_truthy;
+→ [{"cnt":2}]
+
+-- bare integer literal is bigint 0n at runtime — must fail like SQLite's 0.
+insert into t_truthy values (3, 0);
+-- error: CHECK
+
+-- string '0' is falsy under isTruthy's numeric conversion — must fail too.
+insert into t_truthy values (4, '0');
+-- error: CHECK
+
+-- boolean false still fails (control, unchanged).
+insert into t_truthy values (5, false);
+-- error: CHECK
+
+select count(*) as cnt from t_truthy;
+→ [{"cnt":2}]
+
+drop table t_truthy;
