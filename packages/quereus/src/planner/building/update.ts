@@ -321,6 +321,22 @@ export function buildUpdateStmt(
       // Register OLD.column for UPDATE RETURNING (original values)
       returningScope.registerSymbol(`old.${tableColumn.name.toLowerCase()}`, (exp, s) =>
         new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, oldAttributeId, columnIndex));
+
+      // Also register the lowered target's correlation-name-qualified form
+      // (`<alias>.column` — the view-mutation SELF_ALIAS `__vm_self.column`, or a
+      // user-written `update t as x`), defaulting to NEW like the table-qualified form.
+      // A RETURNING subquery that correlates to the outer mutated row through that alias
+      // must bind the STABLE NEW attribute (which stays in context throughout RETURNING
+      // projection) rather than falling through to the target scan's transient row
+      // context. Without this the ref resolves to the scan row, which an eager mutation
+      // executor (e.g. the store backend) tears down before the subquery projects — so
+      // the correlated lookup fails with "No row context found". Only added when the
+      // correlation name differs from the table name (the alias case); otherwise the
+      // table-qualified registration above already covers it.
+      if (correlationName !== tableName) {
+        returningScope.registerSymbol(`${correlationName}.${tableColumn.name.toLowerCase()}`, (exp, s) =>
+          new ColumnReferenceNode(s, exp as AST.ColumnExpr, columnType, newAttributeId, columnIndex));
+      }
     });
 
     const returningProjections: ReturningProjection[] = [];

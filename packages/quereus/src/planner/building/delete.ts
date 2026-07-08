@@ -302,6 +302,20 @@ export function buildDeleteStmt(
       returningScope.registerSymbol(tblQualified, (exp, s) =>
         new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldAttr.type, oldAttr.id, columnIndex)
       );
+
+      // Correlation-name-qualified form (`<alias>.column` — the view-mutation SELF_ALIAS
+      // `__vm_self.column`, or a user-written `delete from t as x`), defaulting to OLD
+      // like the table-qualified form. A RETURNING subquery correlating to the outer
+      // deleted row through that alias must bind the STABLE OLD attribute (live throughout
+      // RETURNING projection) rather than falling through to the target scan's transient
+      // row context, which an eager mutation executor (e.g. the store backend) tears down
+      // before the subquery projects. Only added when the correlation name differs from
+      // the table name; otherwise the table-qualified registration above covers it.
+      if (correlationName !== tableName) {
+        returningScope.registerSymbol(`${correlationName}.${tableColumn.name.toLowerCase()}`, (exp, s) =>
+          new ColumnReferenceNode(s, exp as AST.ColumnExpr, oldAttr.type, oldAttr.id, columnIndex)
+        );
+      }
     });
 
     // Build RETURNING projections in the OLD/NEW context. A `*` / `t.*` expands
