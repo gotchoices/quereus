@@ -6,6 +6,14 @@ import debug from 'debug';
 const log = debug('quereus:plugin-loader');
 
 /**
+ * Protocols a plugin module may be loaded from. Enforced inside
+ * {@link dynamicLoadModule} (the single choke point every load path funnels
+ * through) so no caller can reach the loader with a disallowed protocol, and
+ * re-used by {@link validatePluginUrl} for pre-flight UI validation.
+ */
+const ALLOWED_PLUGIN_PROTOCOLS = ['https:', 'file:'];
+
+/**
  * Plugin module interface - what we expect from a plugin module
  */
 export interface PluginModule {
@@ -88,6 +96,16 @@ export async function dynamicLoadModule(
 	try {
 		const moduleUrl = new URL(url);
 
+		// Enforce the protocol allowlist here, at the loader itself, so a caller
+		// that reaches dynamicLoadModule without going through validatePluginUrl
+		// (e.g. the web worker's loadModule) still cannot load an arbitrary scheme.
+		if (!ALLOWED_PLUGIN_PROTOCOLS.includes(moduleUrl.protocol)) {
+			throw new Error(
+				`Unsupported plugin URL protocol '${moduleUrl.protocol}'. ` +
+				`Allowed: ${ALLOWED_PLUGIN_PROTOCOLS.join(', ')}.`
+			);
+		}
+
 		// Add cache-busting timestamp for local development
 		if (moduleUrl.protocol === 'file:' || moduleUrl.hostname === 'localhost') {
 			moduleUrl.searchParams.set('t', Date.now().toString());
@@ -118,8 +136,8 @@ export function validatePluginUrl(url: string): boolean {
 	try {
 		const parsed = new URL(url);
 
-		// Only allow secure protocols
-		if (!['https:', 'file:'].includes(parsed.protocol)) {
+		// Only allow secure protocols (shared with the loader's enforced allowlist)
+		if (!ALLOWED_PLUGIN_PROTOCOLS.includes(parsed.protocol)) {
 			return false;
 		}
 

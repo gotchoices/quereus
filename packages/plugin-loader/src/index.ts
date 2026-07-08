@@ -28,7 +28,8 @@ export {
 	interpolateEnvVars,
 	interpolateConfigEnvVars,
 	loadPluginsFromConfig,
-	validateConfig
+	validateConfig,
+	toPluginSqlConfig
 } from './config-loader.js';
 export type { PluginConfig, QuoombConfig } from './config-loader.js';
 

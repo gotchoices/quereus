@@ -2,13 +2,25 @@
 
 import { Command } from 'commander';
 import { REPL } from '../repl.js';
-import { Database } from '@quereus/quereus';
-import { loadPluginsFromConfig, interpolateConfigEnvVars, validateConfig } from '@quereus/plugin-loader';
+import { Database, type SqlValue } from '@quereus/quereus';
+import { loadPluginsFromConfig, interpolateConfigEnvVars, validateConfig, type QuoombConfig } from '@quereus/plugin-loader';
 import chalk from 'chalk';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import Table from 'cli-table3';
+
+/** Options parsed by commander from the `quoomb` argv. */
+interface CliOptions {
+  json?: boolean;
+  file?: string;
+  cmd?: string;
+  config?: string;
+  /** `--no-autoload` sets this to false. */
+  autoload?: boolean;
+  /** `--no-color` sets this to false. */
+  color?: boolean;
+}
 
 const program = new Command();
 
@@ -22,7 +34,7 @@ program
   .option('--config <path>', 'load configuration from file')
   .option('--no-autoload', 'do not auto-load plugins from config')
   .option('--no-color', 'disable colored output')
-  .action(async (options) => {
+  .action(async (options: CliOptions) => {
     try {
       if (options.file) {
         await executeFile(options.file, options);
@@ -34,16 +46,16 @@ program
         console.log(chalk.gray('Use Ctrl+C or .exit to quit\n'));
 
         // Load config if available
-        let config: any = undefined;
+        let config: QuoombConfig | undefined;
         const configPath = await resolveConfigPath(options.config);
         if (configPath) {
           try {
-            config = await loadConfigFile(configPath);
-            if (!validateConfig(config)) {
-              console.warn(chalk.yellow(`Warning: Invalid config file at ${configPath}`));
-              config = undefined;
-            } else {
+            const parsed = await loadConfigFile(configPath);
+            if (validateConfig(parsed)) {
+              config = parsed;
               console.log(chalk.gray(`Loaded config from ${configPath}`));
+            } else {
+              console.warn(chalk.yellow(`Warning: Invalid config file at ${configPath}`));
             }
           } catch (error) {
             console.warn(chalk.yellow(`Warning: ${error instanceof Error ? error.message : 'Failed to load config'}`));
@@ -100,7 +112,7 @@ async function resolveConfigPath(configOption?: string): Promise<string | null> 
 /**
  * Load and parse config file
  */
-async function loadConfigFile(configPath: string): Promise<any> {
+async function loadConfigFile(configPath: string): Promise<unknown> {
   try {
     const content = await fs.readFile(configPath, 'utf-8');
     return JSON.parse(content);
@@ -109,7 +121,7 @@ async function loadConfigFile(configPath: string): Promise<any> {
   }
 }
 
-async function executeFile(filePath: string, options: any): Promise<void> {
+async function executeFile(filePath: string, options: CliOptions): Promise<void> {
   try {
     const sql = await fs.readFile(filePath, 'utf-8');
     await executeCommand(sql.trim(), options);
@@ -118,7 +130,7 @@ async function executeFile(filePath: string, options: any): Promise<void> {
   }
 }
 
-async function executeCommand(sql: string, options: any): Promise<void> {
+async function executeCommand(sql: string, options: CliOptions): Promise<void> {
   const db = new Database();
   const startTime = Date.now();
 
@@ -142,7 +154,7 @@ async function executeCommand(sql: string, options: any): Promise<void> {
     // Check if this is a query that returns results
     const trimmedSql = sql.trim().toLowerCase();
     if (trimmedSql.startsWith('select') || trimmedSql.startsWith('with')) {
-      const results = [];
+      const results: Record<string, SqlValue>[] = [];
       for await (const row of db.eval(sql)) {
         results.push(row);
       }
@@ -184,7 +196,7 @@ async function executeCommand(sql: string, options: any): Promise<void> {
   }
 }
 
-function printTable(results: any[], options: any): void {
+function printTable(results: Record<string, SqlValue>[], options: CliOptions): void {
   if (results.length === 0) {
     console.log(options.color !== false ? chalk.yellow('No rows returned') : 'No rows returned');
     return;

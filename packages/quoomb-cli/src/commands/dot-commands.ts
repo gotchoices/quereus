@@ -1,19 +1,23 @@
-import { Database } from '@quereus/quereus';
+import { Database, quoteIdentifier } from '@quereus/quereus';
 import chalk from 'chalk';
 import Table from 'cli-table3';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import Papa from 'papaparse';
 import { dynamicLoadModule, validatePluginUrl } from '@quereus/plugin-loader';
-import type { PluginRecord, PluginManifest } from '@quereus/plugin-loader';
+import type { PluginRecord, PluginSetting } from '@quereus/plugin-loader';
 import type { SqlValue } from '@quereus/quereus';
+import type { Interface as ReadlineInterface } from 'node:readline';
 import os from 'os';
 import crypto from 'crypto';
+
+/** A parsed CSV row: header → cell value (papaparse coerces numeric cells). */
+type CsvRow = Record<string, string | number | null>;
 
 export class DotCommands {
   constructor(private db: Database) {}
 
-  async handle(command: string, rl: any): Promise<boolean> {
+  async handle(command: string, rl: ReadlineInterface): Promise<boolean> {
     const parts = command.slice(1).split(/\s+/);
     const cmd = parts[0];
     const args = parts.slice(1);
@@ -144,9 +148,14 @@ Examples:
 
         console.log(chalk.white(String(results[0].sql) + ';'));
 
-        // Also show column info
+        // Also show column info. `table_info` is a table-valued function taking
+        // the table name as a *string* argument, so bind it as a parameter rather
+        // than interpolating the identifier into the SQL text (injection-shaped).
         const columns = [];
-        for await (const row of this.db.eval(`PRAGMA table_info(${tableName})`)) {
+        for await (const row of this.db.eval(
+          `select cid, name, type, notnull, dflt_value, pk from table_info(?)`,
+          [tableName]
+        )) {
           columns.push(row);
         }
 
@@ -188,7 +197,7 @@ Examples:
       const parseResult = Papa.parse(fileContent, {
         header: true,
         skipEmptyLines: true,
-        transform: (value, field) => {
+        transform: (value, _field) => {
           // Try to convert numbers
           if (value === '') return null;
           const num = Number(value);
@@ -218,9 +227,10 @@ Examples:
         .replace(/^[0-9]/, '_$&'); // Ensure it doesn't start with a number
 
       // Infer column types from data
-      const firstRow = parseResult.data[0] as Record<string, any>;
+      const rows = parseResult.data as CsvRow[];
+      const firstRow = rows[0];
       const columns = Object.keys(firstRow).map(col => {
-        const sampleValues = parseResult.data.slice(0, 10).map(row => (row as any)[col]);
+        const sampleValues = rows.slice(0, 10).map(row => row[col]);
         const hasNumbers = sampleValues.some(val => typeof val === 'number');
         const hasStrings = sampleValues.some(val => typeof val === 'string' && val !== '');
 
@@ -231,11 +241,12 @@ Examples:
           type = 'TEXT'; // Mixed, so use TEXT
         }
 
-        return `"${col}" ${type}`;
+        // quoteIdentifier escapes embedded quotes; a CSV header could contain any character.
+        return `${quoteIdentifier(col)} ${type}`;
       });
 
       // Create table
-      const createSql = `CREATE TABLE "${tableName}" (${columns.join(', ')})`;
+      const createSql = `CREATE TABLE ${quoteIdentifier(tableName)} (${columns.join(', ')})`;
       await this.db.exec(createSql);
 
       console.log(chalk.green(`Created table: ${tableName}`));
@@ -243,14 +254,14 @@ Examples:
       // Insert data
       const columnNames = Object.keys(firstRow);
       const placeholders = columnNames.map(() => '?').join(', ');
-      const insertSql = `INSERT INTO "${tableName}" (${columnNames.map(c => `"${c}"`).join(', ')}) VALUES (${placeholders})`;
+      const insertSql = `INSERT INTO ${quoteIdentifier(tableName)} (${columnNames.map(c => quoteIdentifier(c)).join(', ')}) VALUES (${placeholders})`;
 
       const stmt = await this.db.prepare(insertSql);
       let insertCount = 0;
 
       try {
-        for (const row of parseResult.data) {
-          const values = columnNames.map(col => (row as any)[col]);
+        for (const row of rows) {
+          const values = columnNames.map(col => row[col]);
           await stmt.run(values);
           insertCount++;
         }
@@ -304,7 +315,7 @@ Examples:
 export const handleDotCommand = async (
   line: string,
   db: Database,
-  readlineInterface: any
+  _readlineInterface: ReadlineInterface
 ): Promise<boolean> => {
   // ... existing commands ...
 
@@ -591,7 +602,7 @@ const configPluginCommand = async (args: string[], db: Database): Promise<void> 
     }
 
     const value = valueParts.join('=');
-    const setting = plugin.manifest?.settings?.find((s: any) => s.key === key);
+    const setting = plugin.manifest?.settings?.find((s: PluginSetting) => s.key === key);
 
     if (!setting) {
       console.log(`Unknown setting: ${key}`);

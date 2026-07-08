@@ -69,18 +69,38 @@ function buildProcessEnv(): Record<string, string> {
 }
 
 /**
- * Converts a plugin config value to a SqlValue.
- * Complex types are serialized as JSON strings.
+ * Convert a plugin's config object (as read from a config file or settings —
+ * already JSON-compatible) into the `SqlValue`-typed config the plugin channel
+ * carries.
+ *
+ * Nested objects/arrays are valid {@link SqlValue}s (the `JsonSqlValue` arm) and
+ * are passed through **unchanged**, NOT flattened to JSON strings. Plugins
+ * receive the structured config they declare (e.g. IndexedDB's
+ * `cache: CacheOptions`). Flattening here would silently deliver a *string* to a
+ * plugin that casts the value straight to an object, dropping the setting.
+ *
+ * This is the single encode step for the plugin config channel; the decode side
+ * is the plugin reading `config.<key>` directly, so the round-trip is symmetric.
  */
-function toSqlValue(value: unknown): SqlValue {
-	if (value === null || value === undefined) return null;
-	if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
-	return JSON.stringify(value);
+export function toPluginSqlConfig(config: Record<string, unknown> | undefined): Record<string, SqlValue> {
+	const sqlConfig: Record<string, SqlValue> = {};
+	for (const [key, value] of Object.entries(config ?? {})) {
+		// JSON values (primitives, arrays, plain objects) are all valid SqlValues.
+		sqlConfig[key] = value === undefined ? null : (value as SqlValue);
+	}
+	return sqlConfig;
 }
 
 /**
  * Load plugins from a config object.
  * Collects all load failures and throws an aggregate error when any plugins fail.
+ *
+ * NOTE: this is the shared direct-import config-load loop; the CLI (bin + repl)
+ * calls it directly. The web app cannot reuse it because it must load plugins
+ * through the Comlink worker (`api.loadModule`) rather than importing in-process,
+ * so it re-implements the loop over that boundary — but shares the config→SqlValue
+ * encoding via `toPluginSqlConfig` (the part that was actually duplicated and buggy).
+ * Unifying the loop bodies too would force a worker-boundary dependency edge.
  */
 export async function loadPluginsFromConfig(
 	db: Database,
@@ -95,11 +115,7 @@ export async function loadPluginsFromConfig(
 
 	for (const pluginConfig of config.plugins) {
 		try {
-			const sqlConfig: Record<string, SqlValue> = {};
-			for (const [key, value] of Object.entries(pluginConfig.config ?? {})) {
-				sqlConfig[key] = toSqlValue(value);
-			}
-			await loadPlugin(pluginConfig.source, db, sqlConfig, options);
+			await loadPlugin(pluginConfig.source, db, toPluginSqlConfig(pluginConfig.config), options);
 		} catch (error) {
 			const err = error instanceof Error ? error : new Error(String(error));
 			log('Failed to load plugin from %s: %s', pluginConfig.source, err.message);
