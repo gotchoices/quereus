@@ -344,12 +344,14 @@ function unaryBodyNeedsParens(expr: AST.UnaryExpr): boolean {
 // Module-level (built once) because `needsParens` runs hot during canonical-DDL /
 // body-hash stringification. These are the emitter's own round-trip precedences (NOT
 // SQLite's exact grammar table) — do not renumber existing operators or emitted SQL
-// shifts. `<>` mirrors `!=`; the binary (distinct-from) `IS` / `IS NOT` join the
-// equality group so they parenthesize correctly instead of defaulting to 0.
+// shifts. The keys must match the `operator` strings the parser actually stores on a
+// `binary` node: `<>` is normalized to `!=` at parse time (never stored), and `IS` /
+// `IS NOT` only ever form *unary* nodes (`IS NULL` / `IS [NOT] TRUE|FALSE`) — there is
+// no binary distinct-from operator — so none of those appear here.
 const BINARY_OPERATOR_PRECEDENCE: Record<string, number> = {
 	'OR': 1, 'XOR': 1,
 	'AND': 2,
-	'=': 3, '==': 3, '!=': 3, '<>': 3, 'IS': 3, 'IS NOT': 3,
+	'=': 3, '==': 3, '!=': 3,
 	'<': 4, '<=': 4, '>': 4, '>=': 4, 'LIKE': 4, 'GLOB': 4, 'MATCH': 4, 'REGEXP': 4,
 	'+': 5, '-': 5,
 	'*': 6, '/': 6, '%': 6,

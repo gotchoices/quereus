@@ -185,6 +185,11 @@ function compareNumbers(a: number | bigint, b: number | bigint): number {
  * serialize independently (correct, just not shared). This uses `JSON.stringify`'s
  * insertion-order output as the canonical form; keep that in step with the canonical
  * form defined in the `json-canonical-key-hashing` work if that lands a different one.
+ *
+ * NOTE: assumes OBJECT-class values are treated as immutable — the string is cached on
+ * first serialization and never invalidated, so mutating a value in place after it has
+ * been compared/equated would return a stale canonical string. If OBJECT values ever
+ * become mutated in place, drop this cache (or key it on a version stamp).
  */
 const objectCanonicalCache = new WeakMap<object, string>();
 
