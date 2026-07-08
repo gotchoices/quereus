@@ -1,5 +1,5 @@
 import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, RowOp } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, isUpdateOk, isConstraintViolation, IndexConstraintOp, ConflictResolution, compilePredicate, QuereusError, StatusCode, uniqueEnforcementCollations } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, isUpdateOk, isConstraintViolation, IndexConstraintOp, ConflictResolution, compilePredicate, QuereusError, StatusCode, uniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
@@ -407,11 +407,21 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const pkIndices = this.getPrimaryKeyIndices();
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
 
+		// Key the modified-PK set with the engine's canonical, bigint-safe,
+		// collation-aware encoder — NOT JSON.stringify, which throws on a bigint PK
+		// value and ignores collation (a NOCASE PK rewritten 'abc' -> 'ABC' would fail
+		// to shadow the underlying 'abc', surfacing both rows). One normalizer per PK
+		// column, drawn from that column's declared collation, so equal keys under the
+		// PK collation encode to identical strings — matching getComparePK/keysEqual.
+		const pkNormalizers = pkIndices.map(i =>
+			resolveKeyNormalizer(this.tableSchema!.columns[i].collation));
+
 		// Step 1: Collect all PKs modified in overlay (full scan)
 		const modifiedPKs = new Set<string>();
 		for await (const row of overlay.query(this.createFullScanFilterInfo())) {
-			const pk = pkIndices.map(i => row[i]);
-			modifiedPKs.add(JSON.stringify(pk));
+			// `!` is safe: PK columns are NOT NULL, so serializeRowKey never returns
+			// null here; both sides use the same encoder so they stay consistent.
+			modifiedPKs.add(serializeRowKey(row, pkIndices, pkNormalizers)!);
 		}
 
 		// Step 2: Query overlay via secondary index for non-tombstone data rows
@@ -431,8 +441,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Merge two sorted, disjoint streams
 		let oi = 0;
 		for await (const underlyingRow of this.underlyingTable.query!(filterInfo)) {
-			const pk = pkIndices.map(i => underlyingRow[i]);
-			if (modifiedPKs.has(JSON.stringify(pk))) {
+			// `!` is safe for the same reason as the build loop above (PK NOT NULL).
+			if (modifiedPKs.has(serializeRowKey(underlyingRow, pkIndices, pkNormalizers)!)) {
 				continue; // Skip rows modified in overlay
 			}
 
@@ -756,7 +766,16 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				if (pk) {
 					const existingRow = await this.getOverlayRow(overlay, pk);
 					if (existingRow && existingRow[tombstoneIndex] === 1) {
-						// Convert tombstone to regular row (delete then re-insert same PK)
+						// Convert tombstone to regular row (delete then re-insert same PK).
+						// Run the same merged non-PK UNIQUE check the normal insert path runs
+						// (~below) before writing — otherwise a revived row that collides on a
+						// secondary UNIQUE is flushed with trustedWrite (store skips its re-check),
+						// yielding an opaque INTERNAL error at commit or silent corruption.
+						// selfPks = [pk] excludes this row's own PK from conflict detection.
+						const ucResult = await this.checkMergedUniqueConstraints(
+							overlay, values!, [pk], tombstoneIndex, args.onConflict, evicted);
+						if (ucResult !== null) return ucResult;
+
 						const overlayRow = [...(values ?? []), 0];
 						const result = await overlay.update({
 							operation: 'update',
@@ -764,7 +783,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 							oldKeyValues: pk,
 							onConflict: effectiveOR,
 						});
-						return this.stripTombstoneFromResult(result, tombstoneIndex);
+						const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
+						return this.attachEvicted(stripped, evicted, tombstoneIndex);
 					}
 
 					if (existingRow) {

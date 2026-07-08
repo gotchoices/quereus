@@ -369,6 +369,15 @@ When scanning via secondary index:
    - Overlay row for PK → emit overlay row, skip underlying
    - No overlay entry → emit underlying row
 
+The set of PKs modified in the overlay (used to exclude shadowed underlying rows)
+is keyed with the engine's canonical `serializeRowKey` encoder — one string
+normalizer per PK column, drawn from that column's declared collation — **not**
+`JSON.stringify`. `JSON.stringify` throws on a bigint PK value and ignores
+collation, so under a NOCASE PK a case-only key rewrite (`'abc'` → `'ABC'`) would
+fail to shadow the underlying row and surface both. The canonical encoder tags
+bigint safely and maps collation-equal keys to identical strings, agreeing with
+`getComparePK`/`keysEqual`.
+
 ---
 
 ## Key Ordering
@@ -454,6 +463,12 @@ For each declared non-PK UNIQUE constraint:
 - ABORT returns the constraint result; IGNORE no-ops; REPLACE writes a
   tombstone for the conflicting underlying PK so the row is evicted at flush,
   then continues.
+
+An INSERT that reuses a PK tombstoned earlier in the same transaction (reviving
+the tombstone into a live row) runs this same merged UNIQUE check before the
+overlay write — otherwise a revived row colliding on a non-PK UNIQUE would be
+missed here and later flushed with `trustedWrite` (the store skips its own
+re-check), producing an opaque INTERNAL error at commit or silent corruption.
 
 ### Tombstones for Evicted Rows
 

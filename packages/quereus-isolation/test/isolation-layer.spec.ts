@@ -421,6 +421,123 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	describe('merged secondary-index key encoding (bigint / collation)', () => {
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			const memoryModule = new MemoryTableModule();
+			isolatedModule = new IsolationModule({
+				underlying: memoryModule,
+			});
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		it('scans a secondary index while a bigint-PK table has pending overlay changes', async () => {
+			await db.exec(`
+				CREATE TABLE big (
+					id INTEGER PRIMARY KEY,
+					tag TEXT
+				) USING isolated
+			`);
+			await db.exec(`CREATE INDEX idx_tag ON big(tag)`);
+
+			// A committed small-int-PK row (seeded via SQL).
+			await db.exec(`INSERT INTO big VALUES (1, 'alpha')`);
+
+			// Stage a pending overlay INSERT at a bigint PK by injecting into the overlay
+			// directly, rather than via a SQL INSERT inside BEGIN. A SQL INSERT of a bigint
+			// PK trips a SEPARATE, pre-existing engine defect — the transaction change-log
+			// key encoder (`TransactionManager.serializeKeyTuple`) also uses JSON.stringify
+			// and throws on a bigint before the isolation merge path is ever reached. That
+			// core bug is out of scope for the isolation layer under test here and is tracked
+			// in fix/txn-changelog-bigint-key. Direct injection isolates the merge-path
+			// bug so this spec fails ONLY on the isolation-layer defect it targets.
+			const BIG = 9007199254740994n; // 2^53 + 2 — a JS bigint (beyond MAX_SAFE_INTEGER)
+			const underlying = isolatedModule.getUnderlyingState('main', 'big')!.underlyingTable;
+			const overlay = await isolatedModule.overlayModule.create(
+				db, isolatedModule.createOverlaySchema(underlying.tableSchema!));
+			// Overlay rows carry a trailing tombstone column (0 = live).
+			await overlay.update({ operation: 'insert', values: [BIG, 'beta', 0] });
+			isolatedModule.setConnectionOverlay(db, 'main', 'big', { overlayTable: overlay, hasChanges: true });
+
+			// Secondary-index scan hitting the committed row. The merge builds a modified-PK
+			// set over the overlay (which now holds a bigint PK); pre-fix that build throws
+			// "Do not know how to serialize a BigInt" via JSON.stringify.
+			const alpha = await asyncIterableToArray(db.eval(`SELECT * FROM big WHERE tag = 'alpha'`));
+			expect(alpha.length).to.equal(1);
+			expect(alpha[0].id).to.equal(1);
+
+			// Secondary-index scan hitting the staged bigint-PK overlay row — confirms the
+			// bigint PK round-trips through the merge intact.
+			const beta = await asyncIterableToArray(db.eval(`SELECT * FROM big WHERE tag = 'beta'`));
+			expect(beta.length).to.equal(1);
+			expect(beta[0].id).to.equal(BIG);
+		});
+
+		it('does not duplicate a NOCASE-PK row whose key changes only in case', async () => {
+			await db.exec(`
+				CREATE TABLE items (
+					id TEXT COLLATE NOCASE PRIMARY KEY,
+					tag TEXT
+				) USING isolated
+			`);
+			await db.exec(`CREATE INDEX idx_tag ON items(tag)`);
+
+			// Seed + commit a lowercase-keyed row.
+			await db.exec(`INSERT INTO items VALUES ('abc', 'shared')`);
+
+			await db.exec('BEGIN');
+			// Rewrite the PK to differ only in case — the SAME logical key under NOCASE,
+			// so the overlay row shadows the underlying 'abc'. Pre-fix the JSON key encoding
+			// ignores collation ('ABC' != 'abc'), so the underlying row is not excluded and
+			// the scan yields BOTH.
+			await db.exec(`UPDATE items SET id = 'ABC' WHERE id = 'abc'`);
+
+			const rows = await asyncIterableToArray(
+				db.eval(`SELECT * FROM items WHERE tag = 'shared'`)
+			);
+			expect(rows.length).to.equal(1);
+			expect(rows[0].id).to.equal('ABC');
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('enforces a non-PK UNIQUE when an insert revives a tombstoned PK in the same txn', async () => {
+			await db.exec(`
+				CREATE TABLE t (
+					id INTEGER PRIMARY KEY,
+					u TEXT UNIQUE
+				) USING isolated
+			`);
+
+			// Seed + commit A (pk=1, u='x') and B (pk=2, u='y').
+			await db.exec(`INSERT INTO t VALUES (1, 'x')`);
+			await db.exec(`INSERT INTO t VALUES (2, 'y')`);
+
+			await db.exec('BEGIN');
+			// Tombstone A, then revive pk=1 with u='y' — collides with B on UNIQUE(u).
+			// Pre-fix the revival branch early-returns without the merged UNIQUE check,
+			// so the collision is missed here and later flushed with trustedWrite, yielding
+			// an opaque INTERNAL error at commit instead of a clean constraint violation.
+			await db.exec(`DELETE FROM t WHERE id = 1`);
+
+			let err: unknown;
+			try {
+				await db.exec(`INSERT INTO t VALUES (1, 'y')`);
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'reviving a tombstoned PK into a UNIQUE collision must throw').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+			await db.exec('ROLLBACK');
+
+			// B is intact after rollback.
+			const b = await db.get(`SELECT * FROM t WHERE id = 2`);
+			expect(b?.u).to.equal('y');
+		});
+	});
+
 	describe('per-connection isolation', () => {
 		it('separate SQL statements share the same overlay within a transaction', async () => {
 			// This test verifies the fix for the original architecture flaw where
