@@ -89,16 +89,54 @@ export class Scheduler {
 			result = this.runWithTracing(ctx);
 		}
 
-		// Check for remaining contexts and warn rather than error
-		if (ctx.context.size > 0 || ctx.tableContexts.size > 0) {
-			contextLog('Context leak detected - remaining row contexts: %d, table contexts: %d', ctx.context.size, ctx.tableContexts.size);
+		// Context-leak diagnostic. A program's result is frequently an unconsumed
+		// Promise or AsyncIterable — row/table contexts are opened and closed *during*
+		// iteration (e.g. a scan's row slot closes in the generator's `finally`), so
+		// checking synchronously here fires before any leak could occur and reports
+		// false positives (or misses real leaks entirely). Defer the check to
+		// settlement, and only when the context logger is enabled so production runs
+		// pay nothing for a debug-only diagnostic.
+		if (contextLog.enabled) {
+			return this.checkContextLeaksOnSettle(ctx, result);
 		}
 
-		if (ctx.contextTracker && ctx.contextTracker.hasRemainingContexts()) {
-			const remaining = ctx.contextTracker.getRemainingContexts();
-			contextLog('Context tracker recorded remaining contexts: %O', remaining.map(c => c.source));
+		return result;
+	}
+
+	/**
+	 * Run the context-leak check once `result` has settled: after a Promise
+	 * resolves/rejects, or after an AsyncIterable is fully drained. A synchronous
+	 * result is checked immediately. Only invoked when `contextLog.enabled`.
+	 */
+	private checkContextLeaksOnSettle(ctx: RuntimeContext, result: OutputValue): OutputValue {
+		const check = (): void => {
+			if (ctx.context.size > 0 || ctx.tableContexts.size > 0) {
+				contextLog('Context leak detected - remaining row contexts: %d, table contexts: %d', ctx.context.size, ctx.tableContexts.size);
+			}
+			if (ctx.contextTracker && ctx.contextTracker.hasRemainingContexts()) {
+				const remaining = ctx.contextTracker.getRemainingContexts();
+				contextLog('Context tracker recorded remaining contexts: %O', remaining.map(c => c.source));
+			}
+		};
+
+		if (isAsyncIterable<Row>(result)) {
+			const iterable: AsyncIterable<Row> = result;
+			return (async function* (): AsyncIterable<Row> {
+				try {
+					for await (const row of iterable) {
+						yield row;
+					}
+				} finally {
+					check();
+				}
+			})();
 		}
 
+		if (result instanceof Promise) {
+			return result.finally(check);
+		}
+
+		check();
 		return result;
 	}
 

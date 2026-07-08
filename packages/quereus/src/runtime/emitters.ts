@@ -1,9 +1,8 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { QuereusError } from "../common/errors.js";
 import type { PlanNode } from "../planner/nodes/plan-node.js";
 import type { PlanNodeType } from "../planner/nodes/plan-node-type.js";
 import type { Instruction, InstructionRun, RuntimeContext } from "./types.js";
-import { StatusCode, type OutputValue } from '../common/types.js';
+import { StatusCode, type OutputValue, type Row, type RuntimeValue } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { Scheduler } from "./scheduler.js";
 import type { EmissionContext } from "./emission-context.js";
@@ -68,11 +67,11 @@ export function getEmitterMeta(nodeType: PlanNodeType): EmitterMeta | undefined 
  * Only adds overhead when tracing is enabled.
  */
 function instrumentRunForTracing(plan: PlanNode, originalRun: InstructionRun): InstructionRun {
-	return function (ctx: RuntimeContext, ...args: any[]) {
+	return function (ctx: RuntimeContext, ...args: RuntimeValue[]): OutputValue {
 		const stack = (ctx.planStack = ctx.planStack || []);
 		stack.push(plan);
 
-		let result: any;
+		let result: OutputValue;
 		try {
 			result = originalRun(ctx, ...args);
 		} catch (err) {
@@ -82,10 +81,10 @@ function instrumentRunForTracing(plan: PlanNode, originalRun: InstructionRun): I
 		}
 
 		// If the result is an async iterable, defer the pop until iteration completes
-		if (isAsyncIterable(result)) {
-			const iterable = result as AsyncIterable<unknown>;
+		if (isAsyncIterable<Row>(result)) {
+			const iterable: AsyncIterable<Row> = result;
 			// Wrap iterable to pop stack in a finally block once iteration ends
-			return (async function* () {
+			return (async function* (): AsyncIterable<Row> {
 				try {
 					for await (const item of iterable) {
 						yield item;
@@ -97,8 +96,8 @@ function instrumentRunForTracing(plan: PlanNode, originalRun: InstructionRun): I
 		}
 
 		// If the result is a promise, pop once it settles
-		if (result && typeof (result as Promise<unknown>).then === 'function') {
-			return (result as Promise<unknown>).finally(() => {
+		if (result !== null && typeof result === 'object' && typeof (result as PromiseLike<unknown>).then === 'function') {
+			return (result as Promise<RuntimeValue>).finally(() => {
 				stack.pop();
 			});
 		}
@@ -167,7 +166,7 @@ export function createValidatedInstruction(
 	}
 
 	// Wrap the run function to validate schema before execution
-	const validatedRun: InstructionRun = (ctx: RuntimeContext, ...args: any[]) => {
+	const validatedRun: InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => {
 		// Validate schema objects are still available
 		emissionCtx.validateCapturedSchemaObjects();
 		// If validation passes, run the original instruction

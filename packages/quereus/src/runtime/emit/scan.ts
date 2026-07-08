@@ -54,7 +54,7 @@ export function emitSeqScan(
 	// Capture the module info key for runtime retrieval
 	const moduleKey = `vtab_module:${schema.vtabModuleName}`;
 
-  async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
+	async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
 		// Use the captured module info instead of doing a fresh lookup
 		const capturedModuleInfo = ctx.getCapturedSchemaObject<{ module: AnyVirtualTableModule, auxData?: unknown }>(moduleKey);
 		if (!capturedModuleInfo) {
@@ -66,24 +66,24 @@ export function emitSeqScan(
 			throw new QuereusError(`Virtual table module '${schema.vtabModuleName}' does not implement connect`, StatusCode.MISUSE);
 		}
 
-	let vtabInstance: VirtualTable;
-    try {
-      const options: BaseModuleConfig = {
-        ...(schema.vtabArgs ?? {}),
-        ...(source.readCommitted ? { _readCommitted: true } : {})
-      };
-		vtabInstance = await module.connect(
-			runtimeCtx.db,
-			capturedModuleInfo.auxData,
-			schema.vtabModuleName,
-			schema.schemaName,
-			schema.name,
-			options
-		);
-	} catch (e: unknown) {
-		const message = e instanceof Error ? e.message : String(e);
-		throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
-	}
+		let vtabInstance: VirtualTable;
+		try {
+			const options: BaseModuleConfig = {
+				...(schema.vtabArgs ?? {}),
+				...(source.readCommitted ? { _readCommitted: true } : {})
+			};
+			vtabInstance = await module.connect(
+				runtimeCtx.db,
+				capturedModuleInfo.auxData,
+				schema.vtabModuleName,
+				schema.schemaName,
+				schema.name,
+				options
+			);
+		} catch (e: unknown) {
+			const message = e instanceof Error ? e.message : String(e);
+			throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
+		}
 
 		if (typeof vtabInstance.query !== 'function') {
 			// Fallback or error if query is not available. For now, throwing an error.
@@ -93,16 +93,16 @@ export function emitSeqScan(
 
 		const rowSlot = createRowSlot(runtimeCtx, rowDescriptor);
 		try {
-      // If this is an IndexSeek with dynamic seek keys, populate args from params
-      let effectiveFilterInfo: FilterInfo = (plan instanceof IndexSeekNode && dynamicArgs && dynamicArgs.length > 0)
-        ? { ...plan.filterInfo, args: dynamicArgs }
-        : plan.filterInfo;
+			// If this is an IndexSeek with dynamic seek keys, populate args from params
+			let effectiveFilterInfo: FilterInfo = (plan instanceof IndexSeekNode && dynamicArgs && dynamicArgs.length > 0)
+				? { ...plan.filterInfo, args: dynamicArgs }
+				: plan.filterInfo;
 
-      if (filterInfoOverride) {
-        effectiveFilterInfo = await filterInfoOverride(effectiveFilterInfo, runtimeCtx, dynamicArgs);
-      }
+			if (filterInfoOverride) {
+				effectiveFilterInfo = await filterInfoOverride(effectiveFilterInfo, runtimeCtx, dynamicArgs);
+			}
 
-      const asyncRowIterable = vtabInstance.query(effectiveFilterInfo);
+			const asyncRowIterable = vtabInstance.query(effectiveFilterInfo);
 			throwIfAborted(runtimeCtx.signal);
 			for await (const row of asyncRowIterable) {
 				// Cooperative cancellation checkpoint: a request-timeout (or any
@@ -124,18 +124,18 @@ export function emitSeqScan(
 		}
 	}
 
-  // Emit parameter instructions for dynamic seek keys (IndexSeek only)
-  const params: Instruction[] = [];
-  if (plan instanceof IndexSeekNode) {
-    for (const key of plan.getSeekKeys()) {
-      params.push(emitPlanNode(key, ctx));
-    }
-  }
+	// Emit parameter instructions for dynamic seek keys (IndexSeek only)
+	const params: Instruction[] = [];
+	if (plan instanceof IndexSeekNode) {
+		for (const key of plan.getSeekKeys()) {
+			params.push(emitPlanNode(key, ctx));
+		}
+	}
 
-  return createValidatedInstruction(
-    params,
-    run as InstructionRun,
-    ctx,
-    `${plan.nodeType}(${schema.name})`
-  );
+	return createValidatedInstruction(
+		params,
+		run as InstructionRun,
+		ctx,
+		`${plan.nodeType}(${schema.name})`
+	);
 }

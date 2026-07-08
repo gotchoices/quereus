@@ -1,4 +1,3 @@
-import { BTree } from 'inheritree';
 import type { ScanPlan } from './scan-plan.js';
 import type { Layer } from './interface.js';
 import type { BTreeKey, BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
@@ -8,6 +7,7 @@ import { StatusCode, type Row } from '../../../common/types.js';
 import { safeIterate } from './safe-iterate.js';
 import { QuereusError } from '../../../common/errors.js';
 import { planAppliesToKey } from './plan-filter.js';
+import { createPrimaryKeyFunctions } from '../utils/primary-key.js';
 
 /**
  * True if a multi-seek key is SQL NULL (scalar) or contains any NULL component
@@ -37,20 +37,21 @@ export async function* scanLayer(
 	//    (the point-seek branches gate on `equalityKey != null`).
 	if (plan.equalityKeys && plan.equalityKeys.length > 0) {
 		const seekSchema = layer.getSchema();
-		const { primaryKeyExtractorFromRow, primaryKeyComparator } =
-			layer.getPkExtractorsAndComparators(seekSchema);
-		const seen = new BTree<BTreeKeyForPrimary, BTreeKeyForPrimary>(
-			(k: BTreeKeyForPrimary) => k,
-			primaryKeyComparator,
-		);
+		const { primaryKeyExtractorFromRow } = layer.getPkExtractorsAndComparators(seekSchema);
+		// Dedup by encoded primary key. Membership is all we need (ordered iteration
+		// of the seen-set is not), so a Set of the lossless, type-aware PK encoding
+		// (collation-independent — see utils/primary-key-encode.ts) is lighter than a
+		// full BTree and keys on the same value-identity the PK comparator would.
+		const encodePk = createPrimaryKeyFunctions(seekSchema).encode;
+		const seen = new Set<string>();
 		for (const key of plan.equalityKeys) {
 			if (seekKeyHasNull(key)) continue;
 			const singlePlan: ScanPlan = { ...plan, equalityKey: key, equalityKeys: undefined };
 			for await (const row of scanLayer(layer, singlePlan)) {
-				const pk = primaryKeyExtractorFromRow(row);
-				// insert returns a path whose `.on` is true only for a newly added key;
-				// a false `.on` means this row was already yielded by an earlier seek.
-				if (!seen.insert(pk).on) continue;
+				const encoded = encodePk(primaryKeyExtractorFromRow(row));
+				// A key already in `seen` means this row was yielded by an earlier seek.
+				if (seen.has(encoded)) continue;
+				seen.add(encoded);
 				yield row;
 			}
 		}

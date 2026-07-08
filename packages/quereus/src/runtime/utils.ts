@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { TableSchema } from '../schema/table.js';
@@ -161,7 +160,7 @@ export async function getVTable(ctx: RuntimeContext, tableSchema: TableSchema): 
 export async function disconnectVTable(ctx: RuntimeContext, vtab: VirtualTable): Promise<void> {
 	// Disconnect the VirtualTable instance
 	if (typeof vtab.disconnect === 'function') {
-		await vtab.disconnect().catch((e: any) => {
+		await vtab.disconnect().catch((e: unknown) => {
 			errorLog(`Error during disconnect for table '${vtab.tableName}': ${e}`);
 		});
 	}

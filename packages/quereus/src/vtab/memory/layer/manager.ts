@@ -569,9 +569,7 @@ export class MemoryTableManager {
 				logger.debugLog(`[Collapse] Layer ${layerToPromote.getLayerId()} is now independent for ${this._tableName}`);
 			}
 
-			// Trigger garbage collection of unreferenced layers
 			if (collapsedCount > 0) {
-				void this.cleanupUnreferencedLayers();
 				logger.operation('Collapse Layers', this._tableName, { collapsedCount, iterations });
 			} else {
 				logger.debugLog(`[Collapse] No layers collapsed for ${this._tableName}. Current: ${this._currentCommittedLayer.getLayerId()}`);
@@ -618,27 +616,6 @@ export class MemoryTableManager {
 			}
 		}
 		return false;
-	}
-
-	/**
-	 * Performs garbage collection of layers that are no longer referenced
-	 * by any connections or the current committed layer chain.
-	 */
-	private cleanupUnreferencedLayers(): void {
-		// For now, this is a no-op since JavaScript's garbage collector
-		// will handle cleanup of unreferenced objects automatically.
-		// In the future, we could implement more aggressive cleanup
-		// or tracking of layer references for memory monitoring.
-		logger.debugLog(`[Cleanup] Triggering garbage collection hint for ${this._tableName}`);
-
-		// Optional: Force garbage collection if available (Node.js with --expose-gc)
-		if (typeof global !== 'undefined' && global.gc) {
-			try {
-				global.gc();
-			} catch {
-				// Ignore errors - gc() might not be available
-			}
-		}
 	}
 
 	// With inherited BTrees, lookupEffectiveRow is much simpler

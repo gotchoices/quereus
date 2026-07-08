@@ -351,7 +351,7 @@ treat it as the reference for "what happens if my module doesn't do X".
 
 | Signaling | Members | Engine consults it? |
 | --- | --- | --- |
-| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment`, `shadowName` | yes, per call site (varies) |
+| **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment` | yes, per call site (varies) |
 | **Static field** | `concurrencyMode`, `expectedLatencyMs` | yes, before dispatch (the clean model) |
 | **`getCapabilities()` flag** | `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators` (live); `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` (informational) | only the first two |
 
@@ -376,7 +376,6 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `getMappingAdvertisements` | presence | engine-side fallback (name-match only) | ✓ tags | ✓ tags | forwards | via store |
 | `getBackingHost` | presence | negotiated rejection (`create materialized view … using <module>` and catalog import both reject a capability-less module with a sited `UNSUPPORTED`; resolving a host on an already-created backing without the capability is a sited `INTERNAL` — engine bug) | ✓ | ✓ (`StoreBackingHost` — coordinator-pending) | conditional forward (constructor-assigned **only when the underlying implements it**, so method presence mirrors the underlying — a wrapper around a capability-less module must not advertise) | via store |
 | `createIndex` / `dropIndex` | presence | negotiated rejection (`SchemaManager.createIndex` — "does not support CREATE INDEX") | ✓ | ✓ | forwards (instance-level preferred) | via store |
-| `shadowName` | presence | **dead** — declared on the interface but **never called anywhere** (see note below) | — | — | — | — |
 | `alterTable` (method present) | presence | negotiated rejection (each data-affecting `run*` in `runtime/emit/alter-table.ts` throws a sited `UNSUPPORTED` if absent — except `renameColumn`, which degrades to an engine-side schema-only rename) | ✓ | ✓ | forwards (throws if underlying lacks) | via store |
 | `renameTable` | presence | engine-side fallback (schema-only rename) | ✓ | ✓ physical move | forwards + rekeys maps | via store |
 | `beginSchemaBatch` / `endSchemaBatch` | presence | engine-side fallback (per-DDL commits) | n/a | ✓ | forwards | via store |
@@ -386,8 +385,6 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `getCapabilities().delegatesNotNullBackfill` | flag (live) | engine-side gate (ADD COLUMN skips `validateNotNullBackfill`) | off | off | inherits underlying | off |
 | `getCapabilities().permitsGrandfatheredCheckViolators` | flag (live) | engine-side gate (`getTrustedCheckExtraction` returns the empty extraction, so `TableReferenceNode` skips the CHECK lift and the lens prover refuses the table's CHECK-derived enum domains) | off | off | inherits underlying | off |
 | `getCapabilities().{isolation,savepoints,persistent,secondaryIndexes,rangeScans}` | flag (informational) | **never consulted by engine** — asserted only in tests; isolation augments `isolation` / `savepoints` but nothing reads them | varies | varies | augments | varies |
-
-> **`shadowName` is unwired.** It is declared on `VirtualTableModule` but is never called anywhere in the engine. Treat it as deprecated / dead — do not implement a contract around it expecting the engine to consult it.
 
 > **Isolation wrapper asymmetry is intentional.** `IsolationModule` forwards the isolation-transparent hooks (`getBestAccessPlan`, `getMappingAdvertisements`, the batch + lens lifecycle hooks, `renameTable`, `alterTable`) but **suppresses** `supports` (so the overlay always sees every row to merge), computes a conservative `concurrencyMode` (the weaker of the underlying and overlay modes, capped at `reentrant-reads` because its own write path is never fully-reentrant), and forwards the underlying's `expectedLatencyMs`. See the **Transparent hook forwarding** paragraph in [`packages/quereus-isolation/README.md`](../packages/quereus-isolation/README.md) for the full rationale — do not restate it divergently here.
 

@@ -261,19 +261,6 @@ export interface VirtualTableModule<
 	): Promise<void>;
 
 	/**
-	 * Checks for shadow table name conflicts.
-	 *
-	 * UNWIRED / DEAD: this hook is declared but is never called anywhere in the
-	 * engine. Treat it as deprecated — do not build a contract around it expecting
-	 * the engine to consult it. See docs/module-authoring.md § "Capability
-	 * negotiation surface".
-	 *
-	 * @param name The name to check
-	 * @returns true if the name would conflict
-	 */
-	shadowName?(name: string): boolean;
-
-	/**
 	 * Returns capability flags for this module.
 	 * Used for runtime capability discovery.
 	 */
