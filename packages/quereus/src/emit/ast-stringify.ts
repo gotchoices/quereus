@@ -168,6 +168,9 @@ export function astToString(node: AST.AstNode): string {
 			return `explain schema ${quoteIdentifier((node as unknown as AST.ExplainSchemaStmt).schemaName || 'main')}`;
 
 		default:
+			// NOTE: switch is not compiler-enforced exhaustive; a new Statement/Expression AST
+			// variant added without a matching case falls through here and renders as `[type]`
+			// (e.g. surfaces via getBlockSql()/originalSql). If that ever bites, make this throw.
 			return `[${node.type}]`; // Fallback for unknown node types
 	}
 }
