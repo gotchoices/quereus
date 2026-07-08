@@ -16,7 +16,7 @@
  */
 
 import type { SqlValue } from '@quereus/quereus';
-import type { SiteId } from '../clock/site.js';
+import { type SiteId, siteIdToBase64, siteIdFromBase64 } from '../clock/site.js';
 import type { HLC } from '../clock/hlc.js';
 
 const encoder = new TextEncoder();
@@ -89,49 +89,12 @@ export function buildTransactionKey(transactionId: string): Uint8Array {
   return encoder.encode(`tx:${transactionId}`);
 }
 
-// Base64url alphabet (RFC 4648 Section 5)
-const BASE64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-
-/** Encode a site id as base64url (inlined here to avoid an import cycle). */
-function siteIdToBase64Url(siteId: SiteId): string {
-  let base64 = '';
-  for (let i = 0; i < siteId.length; i += 3) {
-    const byte1 = siteId[i];
-    const byte2 = i + 1 < siteId.length ? siteId[i + 1] : 0;
-    const byte3 = i + 2 < siteId.length ? siteId[i + 2] : 0;
-    const triplet = (byte1 << 16) | (byte2 << 8) | byte3;
-    base64 += BASE64URL_CHARS[(triplet >>> 18) & 0x3f];
-    base64 += BASE64URL_CHARS[(triplet >>> 12) & 0x3f];
-    if (i + 1 < siteId.length) base64 += BASE64URL_CHARS[(triplet >>> 6) & 0x3f];
-    if (i + 2 < siteId.length) base64 += BASE64URL_CHARS[triplet & 0x3f];
-  }
-  return base64;
-}
-
-/** Decode a base64url-encoded site id (inverse of {@link siteIdToBase64Url}). */
-export function base64UrlToSiteId(encoded: string): SiteId {
-  const bytes: number[] = [];
-  for (let i = 0; i < encoded.length; i += 4) {
-    const c1 = BASE64URL_CHARS.indexOf(encoded[i]);
-    const c2 = BASE64URL_CHARS.indexOf(encoded[i + 1]);
-    const hasThird = i + 2 < encoded.length;
-    const hasFourth = i + 3 < encoded.length;
-    const c3 = hasThird ? BASE64URL_CHARS.indexOf(encoded[i + 2]) : 0;
-    const c4 = hasFourth ? BASE64URL_CHARS.indexOf(encoded[i + 3]) : 0;
-
-    bytes.push(((c1 << 2) | (c2 >>> 4)) & 0xff);
-    if (hasThird) bytes.push(((c2 << 4) | (c3 >>> 2)) & 0xff);
-    if (hasFourth) bytes.push(((c3 << 6) | c4) & 0xff);
-  }
-  return new Uint8Array(bytes);
-}
-
 /**
  * Build a peer sync state key (received watermark).
  * Format: ps:{siteId_base64url}
  */
 export function buildPeerStateKey(siteId: SiteId): Uint8Array {
-  return encoder.encode(`ps:${siteIdToBase64Url(siteId)}`);
+  return encoder.encode(`ps:${siteIdToBase64(siteId)}`);
 }
 
 /**
@@ -140,7 +103,22 @@ export function buildPeerStateKey(siteId: SiteId): Uint8Array {
  * Format: pt:{siteId_base64url}
  */
 export function buildPeerSentStateKey(siteId: SiteId): Uint8Array {
-  return encoder.encode(`pt:${siteIdToBase64Url(siteId)}`);
+  return encoder.encode(`pt:${siteIdToBase64(siteId)}`);
+}
+
+/**
+ * Parse a peer state key (received `ps:` or sent `pt:` watermark) back to its
+ * site id — the inverse of {@link buildPeerStateKey} / {@link buildPeerSentStateKey}.
+ * Returns null for a key outside those prefixes or with a malformed suffix.
+ */
+export function parsePeerStateKey(key: Uint8Array): SiteId | null {
+  const keyStr = new TextDecoder().decode(key);
+  if (!keyStr.startsWith('ps:') && !keyStr.startsWith('pt:')) return null;
+  try {
+    return siteIdFromBase64(keyStr.slice(3));
+  } catch {
+    return null;
+  }
 }
 
 /**

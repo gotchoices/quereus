@@ -8,7 +8,7 @@
 import type { KVStore } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
-import { buildPeerStateKey, buildPeerSentStateKey, base64UrlToSiteId } from './keys.js';
+import { buildPeerStateKey, buildPeerSentStateKey, parsePeerStateKey } from './keys.js';
 import { SYNC_KEY_PREFIX } from './keys.js';
 
 /**
@@ -108,9 +108,11 @@ export class PeerStateStore {
     lt[lt.length - 1]++;
 
     for await (const entry of this.kv.iterate({ gte: prefix, lt })) {
-      // Extract site ID from key: ps:{siteId_base64url}
-      const keyStr = new TextDecoder().decode(entry.key);
-      const siteId = base64UrlToSiteId(keyStr.slice(3));  // Skip "ps:"
+      // Reconstruct the peer's site id from the key: ps:{siteId_base64url}
+      const siteId = parsePeerStateKey(entry.key);
+      if (!siteId) {
+        throw new Error(`Malformed peer state key in ps: range: ${new TextDecoder().decode(entry.key)}`);
+      }
 
       yield { siteId, state: deserializePeerState(entry.value) };
     }
