@@ -1,0 +1,12 @@
+----
+description: Re-running an already-prepared query redoes expensive setup work every single time — rebuilding the execution plan's runtime form and re-checking the whole database structure — instead of doing that work once and reusing it.
+files: packages/quereus/src/core/statement.ts, packages/quereus/src/runtime/emitters.ts, packages/quereus/src/runtime/emit/scan.ts
+difficulty: medium
+----
+Prepared statements cache the optimized plan tree but still redo substantial work on every execution, and again per inner row inside nested-loop joins. Two distinct overheads:
+
+**(a) Per-execution instruction re-emission.** Although the plan is cached, `emitPlanNode` plus `new Scheduler(...)` run again on every execution (`core/statement.ts:323`, `runtime/emitters.ts:170`). Emitting walks the whole plan tree and allocates a fresh closure-based instruction tree each time the statement is reused. The instruction tree should be cacheable: it depends only on the plan and the emission context, so it can be built once and reused across executions, keyed on an emission-context fingerprint that captures whatever the emitters actually close over (collations, schema-object identities, etc.).
+
+**(b) Per-run and per-inner-row schema re-validation.** `validateCapturedSchemaObjects` re-validates the entire captured schema snapshot on every validated-instruction run — cost O(instructions × snapshot-size). Worse, inside an un-cached nested-loop-join inner it re-fires per outer row, and those inners also re-run `module.connect`/`disconnect` per outer row (`runtime/emit/scan.ts:75`). Validation should happen once per statement execution, not per instruction and not per inner-loop row; the NLJ inner should reuse a connection rather than reconnect per outer row.
+
+Expected behavior: preparing a statement once and executing it many times should amortize plan-emission and schema-validation to roughly once per execution (or less), with no per-inner-row reconnect. This is a design ticket: resolve (1) the shape and lifetime of the emission-context fingerprint / instruction-tree cache and its invalidation on schema change, and (2) where validation should hoist to and how the NLJ inner should retain its connection. Coordinate with the memory-scan and adopt-connection tickets, which touch the same scan/connect surface. Produce one or more implement tickets once the caching key and invalidation rules are settled.

@@ -22,6 +22,7 @@ import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
 import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
 import { isObjectClassValue } from '../util/comparison.js';
+import { astToString } from '../emit/ast-stringify.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
@@ -76,7 +77,7 @@ export class Statement {
 		} else {
 			this.astBatch = sqlOrAstBatch;
 			// Try to reconstruct originalSql if possible, or set a generic name
-			this.originalSql = this.astBatch.map(s => s.toString()).join('; '); // TODO: replace with better AST stringification
+			this.originalSql = this.astBatch.map(s => astToString(s)).join('; ');
 		}
 
 		// Handle explicit parameter types or initial values
@@ -130,7 +131,7 @@ export class Statement {
 		if (this.astBatchIndex < 0 || this.astBatchIndex >= this.astBatch.length) {
 			return "";
 		}
-		return this.getAstStatement().toString();	// TODO: replace with better AST stringification
+		return astToString(this.getAstStatement());
 	}
 
 	/** @internal Plans the current AST statement */

@@ -1,0 +1,8 @@
+----
+description: When two connections commit changes to the same in-memory table at nearly the same time, one connection's committed changes can be silently overwritten and lost instead of the conflict being detected.
+files: packages/quereus/src/vtab/memory/layer/manager.ts
+difficulty: medium
+----
+The memory virtual-table layer manager handles a coordinated commit across sibling connections. In the sibling path (`manager.ts` approx lines 453-479), when a sibling connection has already committed a new layer for the same table during the coordinated commit, the pending layer overwrites the sibling's committed layer rather than building on top of it. The sibling's committed changes disappear from the committed layer chain — a silent last-writer-wins data loss.
+
+Expected behavior: a commit must never drop another connection's already-committed changes to the same table. When the manager detects that the table's committed head has advanced past the base the pending layer was built on, it must either (a) rebase the pending layer onto the current sibling head so both sets of changes are preserved in the chain, or (b) reject the commit with a BUSY-style conflict so the caller can retry. This ticket is to reproduce the concurrent-sibling-commit scenario (two connections committing layers for the same table under coordinated commit), confirm the loss, and determine which resolution (rebase vs BUSY) matches the manager's isolation model and existing retry semantics — then specify the fix. Investigate whether the layer chain supports rebasing a pending layer onto a new head, or whether BUSY is the only consistent option here.
