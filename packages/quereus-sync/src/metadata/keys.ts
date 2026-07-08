@@ -108,6 +108,24 @@ function siteIdToBase64Url(siteId: SiteId): string {
   return base64;
 }
 
+/** Decode a base64url-encoded site id (inverse of {@link siteIdToBase64Url}). */
+export function base64UrlToSiteId(encoded: string): SiteId {
+  const bytes: number[] = [];
+  for (let i = 0; i < encoded.length; i += 4) {
+    const c1 = BASE64URL_CHARS.indexOf(encoded[i]);
+    const c2 = BASE64URL_CHARS.indexOf(encoded[i + 1]);
+    const hasThird = i + 2 < encoded.length;
+    const hasFourth = i + 3 < encoded.length;
+    const c3 = hasThird ? BASE64URL_CHARS.indexOf(encoded[i + 2]) : 0;
+    const c4 = hasFourth ? BASE64URL_CHARS.indexOf(encoded[i + 3]) : 0;
+
+    bytes.push(((c1 << 2) | (c2 >>> 4)) & 0xff);
+    if (hasThird) bytes.push(((c2 << 4) | (c3 >>> 2)) & 0xff);
+    if (hasFourth) bytes.push(((c3 << 6) | c4) & 0xff);
+  }
+  return new Uint8Array(bytes);
+}
+
 /**
  * Build a peer sync state key (received watermark).
  * Format: ps:{siteId_base64url}
