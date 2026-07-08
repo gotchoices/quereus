@@ -59,6 +59,38 @@ function moduleHasNativeDataEvents(ctx: RuntimeContext, tableSchema: TableSchema
 }
 
 /**
+ * Returns true when the target table's owning *module* guarantees per-scan
+ * snapshot isolation — a `query()` iterator sees a stable snapshot even if
+ * `update()` mutates the same table mid-scan. Consulted by runUpdate/runDelete
+ * to decide whether a predicate DELETE/UPDATE may stream the source scan or must
+ * first drain it (physical Halloween avoidance). Consults the MODULE, not the
+ * vtab instance — mirrors moduleHasNativeDataEvents. Default (flag unset) =
+ * false = not snapshot-isolated = drain before mutating.
+ */
+function moduleHasScanSnapshotIsolation(ctx: RuntimeContext, tableSchema: TableSchema): boolean {
+	const moduleName = tableSchema.vtabModuleName;
+	const moduleReg = moduleName ? ctx.db._getVtabModule(moduleName) : undefined;
+	return moduleReg?.module?.scanSnapshotIsolation === true;
+}
+
+/**
+ * Fully drain a source scan into an in-memory array, closing the scan cursor
+ * before any write is applied. This is the read-phase / write-phase separation
+ * that avoids the physical Halloween hazard for modules WITHOUT per-scan
+ * snapshot isolation: a predicate DELETE/UPDATE must finish reading which rows
+ * to change before it starts changing them, or the first write invalidates the
+ * cursor path the scan is still walking. Reads are side-effect-free, so draining
+ * before the statement savepoint opens is safe.
+ */
+async function drainSourceRows(rows: AsyncIterable<Row>): Promise<Row[]> {
+	const buffered: Row[] = [];
+	for await (const row of rows) {
+		buffered.push(row);
+	}
+	return buffered;
+}
+
+/**
  * Emit an automatic data change event for modules without native event support.
  */
 function emitAutoDataEvent(
@@ -423,7 +455,12 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	async function* runWithStatementSavepoints(
 		ctx: RuntimeContext,
 		vtab: VirtualTable,
-		rows: AsyncIterable<Row>,
+		// AsyncIterable when streaming the source scan (INSERT, and
+		// snapshot-isolated UPDATE/DELETE targets); a buffered Row[] when a
+		// non-snapshot-isolated UPDATE/DELETE has drained its source up front to
+		// separate the read phase from the write phase. `for await ... of`
+		// consumes either — the savepoint/FAIL-mode logic below is unchanged.
+		rows: AsyncIterable<Row> | Iterable<Row>,
 		isFailMode: boolean,
 		processRow: (flatRow: Row) => Promise<Row | undefined>,
 		deferredRebuilds: Set<string>,
@@ -780,8 +817,19 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const deferredRebuilds = new Set<string>();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
+		// Physical Halloween avoidance: unless the target module guarantees per-scan
+		// snapshot isolation, fully drain the source match set (closing the scan
+		// cursor) BEFORE applying any write — otherwise the first UPDATE invalidates
+		// the very cursor path the source scan is still walking.
+		// NOTE: draining materializes the whole match set; a non-snapshot-isolated
+		// `UPDATE big SET ... WHERE rare` matching millions buffers them all. That is
+		// the accepted cost of correctness (such a module cannot safely stream-update
+		// anyway); memory tables set scanSnapshotIsolation and keep streaming.
+		const sourceRows = moduleHasScanSnapshotIsolation(ctx, tableSchema)
+			? rows
+			: await drainSourceRows(rows);
 		yield* runWithStatementSavepoints(
-			ctx, vtab, rows, isFailMode,
+			ctx, vtab, sourceRows, isFailMode,
 			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds),
 			deferredRebuilds, backingConnCache,
 		);
@@ -928,8 +976,15 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const deferredRebuilds = new Set<string>();
 
 		const isFailMode = plan.onConflict === ConflictResolution.FAIL;
+		// Physical Halloween avoidance — see the matching note in runUpdate. Unless
+		// the target module guarantees per-scan snapshot isolation, drain the source
+		// match set (closing the scan cursor) before applying any DELETE, so the
+		// first delete cannot invalidate the cursor path the scan is still walking.
+		const sourceRows = moduleHasScanSnapshotIsolation(ctx, tableSchema)
+			? rows
+			: await drainSourceRows(rows);
 		yield* runWithStatementSavepoints(
-			ctx, vtab, rows, isFailMode,
+			ctx, vtab, sourceRows, isFailMode,
 			(flatRow) => processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds),
 			deferredRebuilds, backingConnCache,
 		);

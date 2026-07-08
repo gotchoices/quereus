@@ -146,6 +146,17 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	 */
 	readonly concurrencyMode = 'reentrant-reads' as const;
 
+	/**
+	 * Memory tables snapshot the connection's read layer once at `query()` entry
+	 * and iterate the captured layer's immutable BTree (see `concurrencyMode`
+	 * above and `layer/connection.ts`). A `DELETE`/`UPDATE` that mutates the table
+	 * mid-scan writes a fresh child layer, leaving the in-flight scan's captured
+	 * layer untouched — so the scan cursor never observes its own statement's
+	 * writes. That is exactly per-scan snapshot isolation, so the DML executor may
+	 * STREAM predicate DELETE/UPDATE against memory tables (no eager buffering).
+	 */
+	readonly scanSnapshotIsolation = true as const;
+
 	public readonly tables: Map<string, MemoryTableManager> = new Map();
 	private eventEmitter?: VTableEventEmitter;
 

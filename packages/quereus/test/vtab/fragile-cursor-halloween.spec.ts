@@ -1,6 +1,8 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { SqlValue } from '../../src/common/types.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import type { AnyVirtualTableModule } from '../../src/vtab/module.js';
 import {
 	TestFragileCursorModule,
 	setFragileData,
@@ -20,13 +22,13 @@ import {
  * fixture does not, so it fails loudly until the executor drains the match set
  * before mutating.
  *
- * SKIPPED until the executor fix lands. This spec is the reproducing/regression
- * case for ticket `fix-halloween-predicate-dml-scan-cursor`. Confirmed to fail
- * (5 of 6) against HEAD with `Path is invalid due to mutation of the tree`; the
- * lone passing case is the zero-match control. The implement stage flips
- * `describe.skip` back to `describe`.
+ * The fix: the DML executor drains the source match set (closing the scan
+ * cursor) before applying any write, UNLESS the target module declares
+ * `scanSnapshotIsolation` (memory does; this fragile fixture does not). See
+ * `docs/runtime.md` § "DML executor: read/write phase separation" and
+ * `src/runtime/emit/dml-executor.ts` (runUpdate/runDelete).
  */
-describe.skip('predicate DELETE/UPDATE does not invalidate its own scan cursor (Halloween)', () => {
+describe('predicate DELETE/UPDATE does not invalidate its own scan cursor (Halloween)', () => {
 	let db: Database;
 
 	beforeEach(() => {
@@ -151,5 +153,48 @@ describe.skip('predicate DELETE/UPDATE does not invalidate its own scan cursor (
 		const returned = await evalRows("delete from lei4 where entry_id = 'e1' returning item_id");
 		expect(returned.map(r => r.item_id).sort()).to.deep.equal(['i1', 'i2']);
 		expect(getFragileRows('main', 'lei4')).to.have.length(0);
+	});
+
+	it('FK cascade delete drains both the parent scan and each cascaded child scan', async () => {
+		// A parent predicate DELETE matching multiple rows (drains the parent scan)
+		// whose ON DELETE CASCADE fires a fresh child DELETE per parent (each of
+		// which must drain the child fragile scan too). Both tables use the fragile
+		// module, so streaming either scan would throw mid-mutation.
+		await db.exec(`create table par (
+			id text primary key,
+			tag text
+		) using fragile`);
+		await db.exec(`create table chld (
+			cid text primary key,
+			par_id text references par(id) on delete cascade
+		) using fragile`);
+		setFragileData('main', 'par', [
+			['p1', 'kill'],
+			['p2', 'kill'],
+			['p3', 'keep'],
+		]);
+		setFragileData('main', 'chld', [
+			['c1', 'p1'],
+			['c2', 'p1'],
+			['c3', 'p2'],
+			['c4', 'p3'],
+		]);
+
+		await db.exec("delete from par where tag = 'kill'");
+
+		expect(getFragileRows('main', 'par').map(r => r[0]).sort()).to.deep.equal(['p3']);
+		expect(getFragileRows('main', 'chld').map(r => r[0]).sort()).to.deep.equal(['c4']);
+	});
+
+	it('memory advertises scan snapshot isolation (keeps streaming); fragile does not (buffers)', () => {
+		// The gating input the executor reads: a `true` flag means the module keeps
+		// the streaming path (no eager buffering); a falsy flag means it drains.
+		// This pins that memory opts into streaming while the fragile fixture (the
+		// non-snapshot-isolated stand-in) does not — so memory pays no buffering
+		// regression while the fragile store is made correct.
+		const memory: AnyVirtualTableModule = new MemoryTableModule();
+		const fragile: AnyVirtualTableModule = new TestFragileCursorModule();
+		expect(memory.scanSnapshotIsolation).to.equal(true);
+		expect(fragile.scanSnapshotIsolation).to.not.equal(true);
 	});
 });

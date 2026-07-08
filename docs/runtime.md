@@ -946,6 +946,46 @@ backing connection, which registers lazily on the first maintenance call:
 includes the statement savepoint created before the row loop) onto it, so the
 backing write participates in the same rollback/release.
 
+### DML executor: read/write phase separation (physical Halloween)
+
+A predicate `DELETE`/`UPDATE` reads its target table (the source scan) and writes
+it (the per-row `vtab.update()`). Streaming those two phases on one live cursor —
+pull a source row, apply its mutation inline, pull the next — is the classic
+**physical Halloween hazard**: the write mutates the very structure the scan
+cursor is still walking. A backing store whose scan cursor caches a path into a
+shared b-tree has that path invalidated by the first write and the next
+`cursor.next()` throws (e.g. `Path is invalid due to mutation of the tree`).
+
+Whether streaming is safe is a **module property**, so it is gated on a module
+capability flag, `VirtualTableModule.scanSnapshotIsolation` (default **false**):
+
+- **Snapshot-isolated (`true`)** — a `query()` iterator sees a stable snapshot
+  even if `update()` mutates the same table mid-scan. The memory module qualifies
+  (it captures an immutable layer at `query()` entry and writes a fresh child
+  layer), so `runUpdate`/`runDelete` **stream** the source, paying no buffering
+  cost. This is the common path and keeps existing behavior unchanged.
+- **Not snapshot-isolated (default)** — `runUpdate`/`runDelete` fully **drain**
+  the source match set into an array (`drainSourceRows`), closing the scan cursor,
+  **before** applying any write. The read phase now precedes the write phase in
+  full, matching SQLite's "figure out which rows to change, then change them".
+
+The false default is correctness-first: any durable / third-party store is correct
+out of the box (it buffers) and opts into streaming only after it can prove
+per-scan snapshot isolation. Buffering costs O(match-set) memory for such a store
+(a `DELETE big WHERE rare` matching millions materializes them all) — the accepted
+price of correctness, since such a store cannot safely stream-delete anyway. The
+drain feeds the same `runWithStatementSavepoints` loop, so savepoint / FAIL-mode /
+RETURNING semantics are unchanged (RETURNING still streams per row after the
+drain). An FK cascade issues its own child `DELETE`/`UPDATE` through a fresh
+executor call, which makes its own drain-or-stream decision from the *child*
+module's flag.
+
+**Boundary — INSERT-source Halloween is out of scope here.** An
+`INSERT … SELECT` that reads the same table it inserts into is a *different*
+Halloween shape (the insert node, `runInsert`); it is not addressed by this
+read/write split and relies on the memory savepoint snapshot + the existing
+CTE/Halloween machinery for today's tested paths.
+
 ### Per-row post-write pipeline and internal evictions
 
 After each successful `vtab.update()`, the executor's `processRow` body runs one

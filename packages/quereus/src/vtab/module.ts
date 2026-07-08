@@ -95,6 +95,33 @@ export interface VirtualTableModule<
 	readonly expectedLatencyMs?: number;
 
 	/**
+	 * Declares whether a `query()` iterator opened against a table of this module
+	 * sees a STABLE snapshot even if `update()` mutates the same table mid-scan —
+	 * i.e. the module is immune to the physical Halloween hazard where a predicate
+	 * `DELETE`/`UPDATE` mutates the very structure its own source scan cursor is
+	 * still walking.
+	 *
+	 * The DML executor consults this to decide whether a predicate DELETE/UPDATE
+	 * may stream (pull one source row, apply the mutation inline, pull the next
+	 * from the same live cursor) or must first fully drain the source match set
+	 * into a buffer before applying any write:
+	 *
+	 * - `true` — the module snapshots reads (e.g. onto an immutable layer), so the
+	 *   scan cursor never observes the concurrent write. The executor STREAMS,
+	 *   avoiding the O(match-set) buffering spike.
+	 * - `false` / omitted (**default**) — the module's scan cursor may cache a path
+	 *   into a shared structure that a mid-scan write invalidates (a plain b-tree
+	 *   cursor). The executor DRAINS the match set before mutating, so the cursor
+	 *   is closed before the first write.
+	 *
+	 * The false default is **correctness-first**: any durable / third-party store
+	 * is safe out of the box (it buffers) and opts into streaming only after it can
+	 * prove per-scan snapshot isolation. See `docs/runtime.md` § "DML executor:
+	 * read/write phase separation".
+	 */
+	readonly scanSnapshotIsolation?: boolean;
+
+	/**
 	 * Creates the persistent definition of a virtual table.
 	 * Called by CREATE VIRTUAL TABLE to define schema and initialize storage.
 	 *
