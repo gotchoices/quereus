@@ -421,6 +421,25 @@ export async function assertNoRestrictedChildrenForParentMutation(
 	}
 }
 
+/**
+ * Runs `fn` (a cascade child-DML re-entry) with the Database's cascade-reentry
+ * flag set, restoring the prior value in a `finally`. Wraps every physical + lens
+ * cascade child write (cascade DELETE / UPDATE, SET NULL, SET DEFAULT) so a host
+ * vtab can tell Quereus's own cascade re-entry from a direct user DML on the same
+ * child table — see {@link Database._setFkCascadeReentry}. Save-and-restore (never
+ * a blind reset to false) keeps nesting correct: an inner cascade restores to the
+ * outer's `true`, the outermost to `false`, and a thrown cascade still restores the
+ * prior value (the flag never latches on across statements).
+ */
+async function withFkCascadeReentry<T>(db: Database, fn: () => Promise<T>): Promise<T> {
+	const prior = db._setFkCascadeReentry(true);
+	try {
+		return await fn();
+	} finally {
+		db._setFkCascadeReentry(prior);
+	}
+}
+
 async function executeSingleFKAction(
 	db: Database,
 	childTable: TableSchema,
@@ -444,7 +463,7 @@ async function executeSingleFKAction(
 				// CASCADE DELETE: delete matching child rows
 				const sql = `DELETE FROM ${qualifiedChildTable} WHERE ${whereClause}`;
 				log('CASCADE DELETE: %s with params %o', sql, oldParentValues);
-				await db._execWithinTransaction(sql, oldParentValues);
+				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
 			} else {
 				// CASCADE UPDATE: update child FK columns to new parent values
 				const newParentValues = parentColIndices.map(idx => newRow[idx]);
@@ -457,7 +476,7 @@ async function executeSingleFKAction(
 				const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereParamsClause}`;
 				const params = [...newParentValues, ...oldParentValues];
 				log('CASCADE UPDATE: %s with params %o', sql, params);
-				await db._execWithinTransaction(sql, params);
+				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, params));
 			}
 			break;
 		}
@@ -465,7 +484,7 @@ async function executeSingleFKAction(
 			const setClauses = childColNames.map(name => `"${name}" = NULL`).join(', ');
 			const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereClause}`;
 			log('SET NULL: %s with params %o', sql, oldParentValues);
-			await db._execWithinTransaction(sql, oldParentValues);
+			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
 			break;
 		}
 		case 'setDefault': {
@@ -480,7 +499,7 @@ async function executeSingleFKAction(
 			}).join(', ');
 			const sql = `UPDATE ${qualifiedChildTable} SET ${setClauses} WHERE ${whereClause}`;
 			log('SET DEFAULT: %s with params %o', sql, oldParentValues);
-			await db._execWithinTransaction(sql, oldParentValues);
+			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
 			break;
 		}
 	}
@@ -690,7 +709,7 @@ async function issueLensFkAction(
 			if (operation === 'delete') {
 				const sql = `delete from ${qualifiedChild} where ${whereClause}`;
 				log('LENS CASCADE DELETE: %s with params %o', sql, oldParentValues);
-				await db._execWithinTransaction(sql, oldParentValues);
+				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
 			} else {
 				// CASCADE UPDATE: rewrite the child FK columns to the NEW parent values
 				// (SET) for rows that still reference the OLD values (WHERE).
@@ -698,7 +717,7 @@ async function issueLensFkAction(
 				const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
 				const params = [...(newParentValues ?? []), ...oldParentValues];
 				log('LENS CASCADE UPDATE: %s with params %o', sql, params);
-				await db._execWithinTransaction(sql, params);
+				await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, params));
 			}
 			break;
 		}
@@ -706,7 +725,7 @@ async function issueLensFkAction(
 			const setClauses = childLogicalColumns.map(c => `${quoteIdentifier(c)} = null`).join(', ');
 			const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
 			log('LENS SET NULL: %s with params %o', sql, oldParentValues);
-			await db._execWithinTransaction(sql, oldParentValues);
+			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
 			break;
 		}
 		case 'setDefault': {
@@ -719,7 +738,7 @@ async function issueLensFkAction(
 			}).join(', ');
 			const sql = `update ${qualifiedChild} set ${setClauses} where ${whereClause}`;
 			log('LENS SET DEFAULT: %s with params %o', sql, oldParentValues);
-			await db._execWithinTransaction(sql, oldParentValues);
+			await withFkCascadeReentry(db, () => db._execWithinTransaction(sql, oldParentValues));
 			break;
 		}
 	}

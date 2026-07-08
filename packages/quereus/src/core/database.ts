@@ -1980,6 +1980,34 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this._fkRestrictSuppressed;
 	}
 
+	/** @internal FK cascade re-entry flag — see {@link _setFkCascadeReentry}. */
+	private _fkCascadeReentry = false;
+
+	/** @internal Marks that the DML currently re-entering the executor is one of
+	 *  Quereus's own FK cascade child writes (cascade DELETE / UPDATE, SET NULL,
+	 *  SET DEFAULT — physical or lens), not a direct user DML on the child table.
+	 *  Set only for the duration of each cascade child write by
+	 *  `withFkCascadeReentry` in `runtime/foreign-key-actions.ts`, so a host vtab
+	 *  module can distinguish a cascade re-entry from a user write on the same
+	 *  child and suppress redundant child-side FK re-validation only for the
+	 *  former. Independent of {@link _setFkRestrictSuppressed} (a cascade path may
+	 *  legitimately have both semantics in play). Returns the prior value so the
+	 *  caller restores it in a `finally` — nesting-safe: an inner cascade restores
+	 *  to the outer's `true`, the outermost to `false`, and a thrown cascade cannot
+	 *  latch the flag on. Nothing inside Quereus reads it; it exposes the signal the
+	 *  host consumes. */
+	public _setFkCascadeReentry(value: boolean): boolean {
+		const prior = this._fkCascadeReentry;
+		this._fkCascadeReentry = value;
+		return prior;
+	}
+
+	/** @internal Whether the current DML re-entry is a Quereus FK cascade child
+	 *  write — see {@link _setFkCascadeReentry}. */
+	public _isFkCascadeReentry(): boolean {
+		return this._fkCascadeReentry;
+	}
+
 	/**
 	 * Subscribe to changes described by a {@link ChangeScope}.
 	 *
