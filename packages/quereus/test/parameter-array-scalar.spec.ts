@@ -129,4 +129,28 @@ describe('Array-valued scalar parameter guard', () => {
 			expect(rows.map(r => r.id)).to.deep.equal([1]);
 		});
 	});
+
+	describe('respects a named parameter legitimately bound to null', () => {
+		// Regression: the scalar-required-param guard resolved the value with
+		// `boundArgs[key] ?? boundArgs[':'+key]`. A bare key bound to `null` fell
+		// through the `??` to the `:`-prefixed alternate, so a real `null` binding was
+		// masked by (and could wrongly adopt) an unrelated `:key` value. The fix uses
+		// a presence check, so a bound `null` is honored.
+		it('honors a null bare binding rather than the :-prefixed alternate', async () => {
+			// Both keys present: bare `needle` bound to null (a valid scalar), and the
+			// `:needle` alternate bound to an array. The bound null must win — falling
+			// through to the array would wrongly raise the array-valued-scalar mismatch.
+			const rows = await collect('select * from t where name = :needle', {
+				needle: null,
+				':needle': [1, 2],
+			});
+			// `name = NULL` matches nothing, but crucially raises no error.
+			expect(rows).to.have.length(0);
+		});
+
+		it('a null-bound scalar-comparison param executes without error', async () => {
+			const rows = await collect('select * from t where name = :needle', { needle: null });
+			expect(rows).to.have.length(0);
+		});
+	});
 });

@@ -173,6 +173,31 @@ function compareNumbers(a: number | bigint, b: number | bigint): number {
 }
 
 /**
+ * Canonical-string cache for OBJECT-class (JSON array/object) values.
+ *
+ * A sort of n OBJECT values would otherwise `JSON.stringify` the same value on the
+ * order of log n times each (O(n log n) serializations); caching the canonical
+ * string per value collapses that to one serialization per distinct value. A
+ * `WeakMap` keys on object identity, so cached strings evaporate with their values
+ * (no lifetime coupling / manual eviction).
+ *
+ * NOTE: keyed by JS object identity — two structurally-equal but distinct objects
+ * serialize independently (correct, just not shared). This uses `JSON.stringify`'s
+ * insertion-order output as the canonical form; keep that in step with the canonical
+ * form defined in the `json-canonical-key-hashing` work if that lands a different one.
+ */
+const objectCanonicalCache = new WeakMap<object, string>();
+
+function objectCanonicalString(v: object): string {
+	let s = objectCanonicalCache.get(v);
+	if (s === undefined) {
+		s = JSON.stringify(v);
+		objectCanonicalCache.set(v, s);
+	}
+	return s;
+}
+
+/**
  * Optimized comparison for same-type values.
  * @param a First value
  * @param b Second value
@@ -203,9 +228,9 @@ function compareSameType(a: SqlValue, b: SqlValue, storageClass: StorageClass, c
 			return blobA.length < blobB.length ? -1 : blobA.length > blobB.length ? 1 : 0;
 		}
 		case StorageClass.OBJECT: {
-			// Compare JSON objects by their stringified representation
-			const strA = JSON.stringify(a);
-			const strB = JSON.stringify(b);
+			// Compare JSON objects by their canonical stringified representation.
+			const strA = objectCanonicalString(a as object);
+			const strB = objectCanonicalString(b as object);
 			return strA < strB ? -1 : strA > strB ? 1 : 0;
 		}
 		default: {
@@ -490,10 +515,10 @@ export function sqlValuesEqual(a: SqlValue, b: SqlValue): boolean {
 		}
 		return true;
 	}
-	// JSON object comparison by value
+	// JSON object comparison by value (shares the OBJECT-class canonical cache)
 	if (typeof a === 'object' && a !== null && !(a instanceof Uint8Array) &&
 		typeof b === 'object' && b !== null && !(b instanceof Uint8Array)) {
-		return JSON.stringify(a) === JSON.stringify(b);
+		return objectCanonicalString(a) === objectCanonicalString(b);
 	}
 	return a === b;
 }

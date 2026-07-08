@@ -270,8 +270,7 @@ export class Parser {
 
 		if (innerWith) {
 			if (this.statementSupportsWithClause(stmt)) {
-				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				(stmt as any).withClause = innerWith;
+				stmt.withClause = innerWith;
 				if (innerWith.loc && stmt.loc) {
 					stmt.loc.start = innerWith.loc.start;
 				}
@@ -387,8 +386,7 @@ export class Parser {
 
 		// Attach WITH clause if present and supported
 		if (withClause && this.statementSupportsWithClause(stmt)) {
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			(stmt as any).withClause = withClause;
+			stmt.withClause = withClause;
 			if (withClause.loc && stmt.loc) {
 				stmt.loc.start = withClause.loc.start;
 			}
@@ -899,7 +897,7 @@ export class Parser {
 						const aliasToken = this.advance();
 						// For STRING tokens, use literal; for identifiers, use getIdentifierValue
 						alias = aliasToken.type === TokenType.STRING
-							? aliasToken.literal
+							? aliasToken.literal as string
 							: this.getIdentifierValue(aliasToken);
 					} else {
 						throw this.error(this.peek(), "Expected identifier or string after 'AS'.");
@@ -2625,7 +2623,7 @@ export class Parser {
 						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 							// Positional argument
 							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = token.literal;
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
 						} else if (this.check(TokenType.IDENTIFIER)) {
 							// Could be named argument or identifier value
 							const nameValue = this.nameValueItem('module argument');
@@ -2969,7 +2967,7 @@ export class Parser {
 					do {
 						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = token.literal;
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
 						} else if (this.check(TokenType.IDENTIFIER)) {
 							const nameValue = this.nameValueItem('module argument');
 							moduleArgs[nameValue.name] = nameValue.value && nameValue.value.type === 'literal'
@@ -3667,7 +3665,7 @@ export class Parser {
 						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 							// Positional argument
 							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = token.literal;
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
 						} else if (this.check(TokenType.IDENTIFIER)) {
 							// Could be named argument or identifier value
 							const nv = this.nameValueItem('module argument');
@@ -3841,7 +3839,7 @@ export class Parser {
 					do {
 						if (this.check(TokenType.STRING) || this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 							const token = this.advance();
-							moduleArgs[String(positionalIndex++)] = token.literal;
+							moduleArgs[String(positionalIndex++)] = this.tokenLiteralValue(token);
 						} else if (this.check(TokenType.IDENTIFIER)) {
 							const nameValue = this.nameValueItem('module argument');
 							moduleArgs[nameValue.name] = nameValue.value && nameValue.value.type === 'literal'
@@ -4042,13 +4040,13 @@ export class Parser {
 				} else if (token.type === TokenType.FALSE) {
 					literal_value = 0;
 				} else {
-					literal_value = token.literal;
+					literal_value = this.tokenLiteralValue(token);
 				}
 				value = { type: 'literal', value: literal_value };
 			} else if (this.match(TokenType.MINUS)) {
 				if (this.check(TokenType.INTEGER) || this.check(TokenType.FLOAT)) {
 					const token = this.advance();
-					value = { type: 'literal', value: -token.literal };
+					value = { type: 'literal', value: -(token.literal as number) };
 				} else {
 					throw this.error(this.peek(), "Expected number after '-'.");
 				}
@@ -4102,6 +4100,16 @@ export class Parser {
 	 */
 	private getIdentifierValue(token: Token): string {
 		return token.literal !== undefined ? String(token.literal) : token.lexeme;
+	}
+
+	/**
+	 * @internal The literal payload of a value token (STRING / INTEGER / FLOAT / BLOB)
+	 * as a {@link SqlValue}. Those token types always carry a literal, so this only
+	 * coalesces the type-level `undefined` (never reached at runtime for value tokens)
+	 * to `null`. Use at sites that have already matched a value token type.
+	 */
+	private tokenLiteralValue(token: Token): SqlValue {
+		return token.literal ?? null;
 	}
 
 	/** @internal Helper to consume an IDENTIFIER token and return its lexeme */
@@ -4847,7 +4855,9 @@ export class Parser {
 		return typeKeywords.includes(lexeme.toUpperCase());
 	}
 
-	private statementSupportsWithClause(statement: AST.AstNode): boolean {
+	private statementSupportsWithClause(
+		statement: AST.AstNode
+	): statement is AST.SelectStmt | AST.InsertStmt | AST.UpdateStmt | AST.DeleteStmt {
 		return statement.type === 'select' ||
 			statement.type === 'insert' ||
 			statement.type === 'update' ||

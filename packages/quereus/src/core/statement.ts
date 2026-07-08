@@ -640,8 +640,10 @@ export class Statement {
 		// silently return no rows. The set is collected structurally at plan time
 		// (JSON-vs-JSON comparisons are excluded), so this never over-fires.
 		for (const key of this.scalarRequiredParams) {
+			// Presence check, not `??`: a parameter legitimately bound to `null` must
+			// use that binding, not fall through to the `:`-prefixed alternate key.
 			const value = typeof key === 'string'
-				? (this.boundArgs[key] ?? this.boundArgs[`:${key}`])
+				? (Object.hasOwn(this.boundArgs, key) ? this.boundArgs[key] : this.boundArgs[`:${key}`])
 				: this.boundArgs[key];
 			if (value !== undefined && isObjectClassValue(value)) {
 				throw new QuereusError(

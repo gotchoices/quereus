@@ -340,22 +340,30 @@ function unaryBodyNeedsParens(expr: AST.UnaryExpr): boolean {
 	return expr.expr.type === 'binary';
 }
 
+// Binary-operator precedence for round-trip parenthesization; higher binds tighter.
+// Module-level (built once) because `needsParens` runs hot during canonical-DDL /
+// body-hash stringification. These are the emitter's own round-trip precedences (NOT
+// SQLite's exact grammar table) — do not renumber existing operators or emitted SQL
+// shifts. `<>` mirrors `!=`; the binary (distinct-from) `IS` / `IS NOT` join the
+// equality group so they parenthesize correctly instead of defaulting to 0.
+const BINARY_OPERATOR_PRECEDENCE: Record<string, number> = {
+	'OR': 1, 'XOR': 1,
+	'AND': 2,
+	'=': 3, '==': 3, '!=': 3, '<>': 3, 'IS': 3, 'IS NOT': 3,
+	'<': 4, '<=': 4, '>': 4, '>=': 4, 'LIKE': 4, 'GLOB': 4, 'MATCH': 4, 'REGEXP': 4,
+	'+': 5, '-': 5,
+	'*': 6, '/': 6, '%': 6,
+	'||': 7,
+};
+
+const ASSOCIATIVE_BINARY_OPERATORS = new Set(['AND', 'OR', 'XOR', '+', '*', '||']);
+
 // Helper to determine if parentheses are needed for binary operations
 function needsParens(expr: AST.Expression, parentOp: string, side: 'left' | 'right'): boolean {
 	if (expr.type !== 'binary') return false;
 
-	const precedence: Record<string, number> = {
-		'OR': 1, 'XOR': 1,
-		'AND': 2,
-		'=': 3, '==': 3, '!=': 3,
-		'<': 4, '<=': 4, '>': 4, '>=': 4, 'LIKE': 4, 'GLOB': 4, 'MATCH': 4, 'REGEXP': 4,
-		'+': 5, '-': 5,
-		'*': 6, '/': 6, '%': 6,
-		'||': 7,
-	};
-
-	const parentPrec = precedence[parentOp.toUpperCase()] || 0;
-	const childPrec = precedence[expr.operator.toUpperCase()] || 0;
+	const parentPrec = BINARY_OPERATOR_PRECEDENCE[parentOp.toUpperCase()] || 0;
+	const childPrec = BINARY_OPERATOR_PRECEDENCE[expr.operator.toUpperCase()] || 0;
 
 	if (childPrec < parentPrec) return true;
 	if (childPrec === parentPrec && side === 'right' && !isAssociative(parentOp)) return true;
@@ -364,8 +372,7 @@ function needsParens(expr: AST.Expression, parentOp: string, side: 'left' | 'rig
 }
 
 function isAssociative(op: string): boolean {
-	const associativeOps = ['AND', 'OR', 'XOR', '+', '*', '||'];
-	return associativeOps.includes(op.toUpperCase());
+	return ASSOCIATIVE_BINARY_OPERATORS.has(op.toUpperCase());
 }
 
 // Helper for window definitions
