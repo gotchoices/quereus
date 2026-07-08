@@ -1,14 +1,19 @@
 import type { SqlValue } from '../../../common/types.js';
+import type { JSONValue } from '../../../common/json-types.js';
 import type { BTreeKeyForPrimary } from '../types.js';
+import { canonicalJsonString } from '../../../util/json-canonical.js';
 
 /**
  * Lossless, type-aware encoding of a primary key to a string suitable for keying
  * a `Map<string, BTreeKeyForPrimary>` (the per-entry PK container of a
  * {@link MemoryIndex}). It mirrors {@link compareSqlValuesFast}'s storage-class
  * EQUALITY — NULL < NUMERIC < TEXT < BLOB < OBJECT(JSON), with booleans/bigints in
- * NUMERIC and JSON compared by `JSON.stringify` — so two values the PK comparator
- * treats as equal encode to the same key, and two it treats as distinct encode to
- * different keys.
+ * NUMERIC and JSON reduced to its canonical (recursive object-key-sorted) string via
+ * {@link canonicalJsonString} — so two values the PK comparator treats as equal encode
+ * to the same key, and two it treats as distinct encode to different keys. The JSON
+ * form MUST match the comparator's OBJECT-class canonical form (`objectCanonicalString`
+ * in `util/comparison.ts`), so reorder-equal objects (`{a:1,b:2}` ≡ `{b:2,a:1}`) key
+ * alike; a bare `JSON.stringify` would split them and disagree with the comparator.
  *
  * This is NOT a collation transform. Two collation-EQUAL-but-byte-distinct TEXT
  * values (NOCASE `'A'`/`'a'`; a custom collation's `'café'`/`'cafe'`) encode to
@@ -66,9 +71,11 @@ export function encodeScalar(v: SqlValue): string {
 		case 'string': return 't' + v;
 		case 'object': {
 			if (v instanceof Uint8Array) return 'b' + bytesToHex(v);
-			// JSON object/array. JSON values never contain bigint (JSON.stringify would
-			// throw), so the OBJECT path never sees the numeric-normalization ambiguity.
-			return 'j' + JSON.stringify(v);
+			// JSON object/array. Canonical (recursive object-key-sorted) form so
+			// reorder-equal objects key alike and agree with the PK comparator; array
+			// order stays positional. JSON values never contain bigint (JSON.stringify
+			// would throw), so the OBJECT path never sees the numeric-normalization ambiguity.
+			return 'j' + canonicalJsonString(v as JSONValue);
 		}
 		default: {
 			// SqlValue admits nothing else; guard rather than silently mis-key.

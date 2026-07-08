@@ -11,6 +11,8 @@
 
 import { createLogger } from '../common/logger.js';
 import type { Row, SqlValue } from '../common/types.js';
+import type { JSONValue } from '../common/json-types.js';
+import { canonicalJsonString } from '../util/json-canonical.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
@@ -443,9 +445,17 @@ export class TransactionManager {
 	// Change Log Management
 	// ============================================================================
 
-	/** Serialize a tuple of SqlValues for stable Map keying. */
+	/**
+	 * Serialize a tuple of SqlValues for stable Map keying.
+	 *
+	 * Uses the canonical (recursive object-key-sorted) JSON form, not a bare
+	 * `JSON.stringify`, so a JSON-object PK component keys by the same canonical form
+	 * the value comparator uses — reorder-equal objects (`{a:1,b:2}` ≡ `{b:2,a:1}`)
+	 * coalesce to one change-log entry instead of splitting. Array/tuple order stays
+	 * positional, so scalar tuples serialize byte-identically to before.
+	 */
 	private serializeKeyTuple(values: readonly SqlValue[]): string {
-		return JSON.stringify(values);
+		return canonicalJsonString(values as unknown as JSONValue);
 	}
 
 	/** The active (top) layer that should receive change records. */

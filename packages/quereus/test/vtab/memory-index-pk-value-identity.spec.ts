@@ -4,6 +4,7 @@ import { createPrimaryKeyFunctions } from '../../src/vtab/memory/utils/primary-k
 import { encodeScalar, encodePrimaryKey } from '../../src/vtab/memory/utils/primary-key-encode.js';
 import { createDefaultColumnSchema } from '../../src/schema/column.js';
 import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
+import { JSON_TYPE } from '../../src/types/json-type.js';
 import type { ColumnSchema } from '../../src/schema/column.js';
 import type { TableSchema, PrimaryKeyColumnDefinition } from '../../src/schema/table.js';
 
@@ -228,6 +229,26 @@ describe('MemoryIndex primaryKeys value-identity', () => {
 			index.addEntry(1, [5, 7]); // value-equal element-wise under numeric normalization
 			expect(index.getPrimaryKeys(1)).to.have.length(1);
 		});
+
+		it('single-column JSON PK: reorder-equal objects collapse to one bucket member and remove by value', () => {
+			// A JSON PK column: the PK comparator (JSON_TYPE.compare -> deepCompareJson)
+			// treats {a:1,b:2} and {b:2,a:1} as equal, so the encoder MUST too, or the
+			// primaryKeys Map would hold two members for one logical PK.
+			const columns = [
+				{ ...createDefaultColumnSchema('c0'), logicalType: INTEGER_TYPE },
+				{ ...createDefaultColumnSchema('c1'), logicalType: JSON_TYPE },
+			];
+			const index = makeIndex(columns, [{ index: 1 }]);
+
+			index.addEntry(1, { a: 1, b: 2 });
+			index.addEntry(1, { b: 2, a: 1 }); // reorder-equal — must dedup
+			expect(index.getPrimaryKeys(1)).to.have.length(1);
+
+			// Remove with a differently-ordered but equal object — must match by value.
+			index.removeEntry(1, { b: 2, a: 1 });
+			expect(index.getPrimaryKeys(1)).to.have.length(0);
+			expect(index.size).to.equal(0);
+		});
 	});
 
 	// An owned (in-place) mutation must invalidate the memoized sorted view so the
@@ -294,9 +315,18 @@ describe('primary-key-encode', () => {
 			expect(encodeScalar(new Uint8Array([10]))).to.not.equal(encodeScalar(new Uint8Array([1, 0])));
 		});
 
-		it('encodes JSON values by JSON.stringify', () => {
+		it('encodes JSON values by their canonical (object-key-sorted) form', () => {
 			expect(encodeScalar({ a: 1, b: 2 })).to.equal(encodeScalar({ a: 1, b: 2 }));
 			expect(encodeScalar([1, 2])).to.not.equal(encodeScalar([1, 3]));
+			// Reorder-equal objects MUST encode alike — the PK comparator treats them
+			// equal (canonical form), so a bare JSON.stringify would split one JSON PK
+			// into two Map members and disagree with the comparator.
+			expect(encodeScalar({ a: 1, b: 2 })).to.equal(encodeScalar({ b: 2, a: 1 }));
+			// Recursively, through nested objects and inside arrays.
+			expect(encodeScalar({ outer: { z: 1, a: 2 }, list: [{ q: 1, p: 2 }] }))
+				.to.equal(encodeScalar({ list: [{ p: 2, q: 1 }], outer: { a: 2, z: 1 } }));
+			// Array element order stays significant.
+			expect(encodeScalar([1, 2])).to.not.equal(encodeScalar([2, 1]));
 		});
 	});
 
