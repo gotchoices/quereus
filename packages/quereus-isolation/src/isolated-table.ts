@@ -13,6 +13,26 @@ type IndexScanInfo =
 	| { type: 'secondary'; indexName: string; columnIndices: number[] };
 
 /**
+ * The overlay `MemoryTable` always advertises its primary-key index under the bare
+ * name `_primary_`. An underlying virtual table, however, may advertise its PK
+ * access plan under a *suffixed* name: `lamina-quereus` mints a per-plan unique key
+ * by appending a monotonic counter (`_primary_` → `_primary_1`, `_primary_2`, …) so
+ * it can recover the exact plan later. The isolation layer must bridge the two
+ * vocabularies — classify the suffixed form as the PK family, and normalise it back
+ * to `_primary_` before querying the overlay in the overlay's own vocabulary.
+ *
+ * Both patterns require the suffix to be purely numeric, so a genuine secondary index
+ * whose name merely starts with `_primary_` (e.g. `_primary_extra_idx`) never matches.
+ *
+ * NOTE: assumes the underlying's PK-plan suffix is a bare numeric counter (lamina's
+ * current scheme). If an underlying ever mints a non-numeric unique PK name (e.g.
+ * `_primary_a`), it would be misclassified as a secondary index again — widen these
+ * patterns (and the overlay-strip) to match that shape when it appears.
+ */
+const PK_INDEX_NAME_RE = /^_primary_\d*$/;
+const SUFFIXED_PK_IDXSTR_RE = /(^|;)idx=_primary_\d+\(/;
+
+/**
  * A table wrapper that provides transaction isolation via an overlay.
  *
  * Each IsolatedTable instance accesses a connection-scoped overlay that is:
@@ -459,7 +479,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		}
 
 		const indexName = idxMatch[1];
-		if (indexName === '_primary_') {
+		if (PK_INDEX_NAME_RE.test(indexName)) {
 			return { type: 'primary' };
 		}
 
@@ -491,8 +511,28 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private adaptFilterInfoForOverlay(filterInfo: FilterInfo): FilterInfo {
 		// The overlay table has the same schema plus a tombstone column at the end.
 		// Column indices for data columns are the same, so FilterInfo constraints work as-is.
-		// The overlay module will interpret the constraints correctly.
-		return filterInfo;
+		//
+		// The one mismatch is the index NAME. The underlying may advertise its PK plan
+		// under a suffixed name (e.g. `_primary_1`) that the overlay MemoryTable does not
+		// know — the overlay always names its PK index `_primary_`. Rewrite a suffixed PK
+		// idxStr back to the base so the overlay re-plans it as a primary-key scan instead
+		// of failing to resolve a non-existent secondary index of that name. Genuine
+		// secondary index names (and the bare `_primary_`) contain no numeric suffix, so
+		// SUFFIXED_PK_IDXSTR_RE leaves them untouched and this returns filterInfo as-is.
+		const { idxStr } = filterInfo;
+		if (!idxStr || !SUFFIXED_PK_IDXSTR_RE.test(idxStr)) {
+			return filterInfo;
+		}
+		const strip = (s: string): string => s.replace(SUFFIXED_PK_IDXSTR_RE, '$1idx=_primary_(');
+		const outIdxStr = filterInfo.indexInfoOutput.idxStr;
+		return {
+			...filterInfo,
+			idxStr: strip(idxStr),
+			indexInfoOutput: {
+				...filterInfo.indexInfoOutput,
+				idxStr: outIdxStr ? strip(outIdxStr) : outIdxStr,
+			},
+		};
 	}
 
 	/**

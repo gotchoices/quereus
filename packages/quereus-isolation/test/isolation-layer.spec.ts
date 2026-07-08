@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode } from '@quereus/quereus';
-import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
 
@@ -2220,6 +2220,139 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(sortRows(a)).to.deep.equal(committed);
 			expect(sortRows(b)).to.deep.equal(committed);
 			expect(conns().length, 'read-committed fast path registers no connection').to.equal(0);
+		});
+	});
+
+	describe('suffixed primary-key index name (underlying-advertised)', () => {
+		// Regression: an underlying virtual table may advertise its PK access plan under a
+		// per-plan unique name — lamina-quereus appends a monotonic counter so it can recover
+		// the exact plan later (`_primary_` → `_primary_1`, `_primary_2`, …). With a live
+		// overlay (any buffered write), a PK point lookup then carried idxStr
+		// `idx=_primary_1(...)`, which the isolation layer misclassified as a secondary index
+		// and routed to the overlay MemoryTable — which has no such secondary index, so it
+		// threw `QuereusError: Secondary index '_primary_1' not found.`
+
+		/**
+		 * Rewrites a suffixed PK idxStr (`idx=_primary_<n>(...)`) back to the base
+		 * `_primary_`. The MemoryTable underlying only resolves `_primary_`, so its own
+		 * query recovers the PK scan here exactly as lamina's private plan registry does —
+		 * this is the load-bearing underlying-side behavior the isolation fix must tolerate,
+		 * NOT change.
+		 */
+		function recoverSuffixedPk(filterInfo: FilterInfo): FilterInfo {
+			const re = /(^|;)idx=_primary_\d+\(/;
+			const { idxStr } = filterInfo;
+			if (!idxStr || !re.test(idxStr)) return filterInfo;
+			const strip = (s: string): string => s.replace(re, '$1idx=_primary_(');
+			const outIdxStr = filterInfo.indexInfoOutput.idxStr;
+			return {
+				...filterInfo,
+				idxStr: strip(idxStr),
+				indexInfoOutput: { ...filterInfo.indexInfoOutput, idxStr: outIdxStr ? strip(outIdxStr) : outIdxStr },
+			};
+		}
+
+		type UnderlyingTable = Awaited<ReturnType<MemoryTableModule['create']>>;
+
+		/** Wraps a MemoryTable so its `query` recovers a suffixed PK name before delegating.
+		 *  Every other member is forwarded to the real table (bound to it, so private fields
+		 *  resolve). */
+		function wrapUnderlying(table: UnderlyingTable): UnderlyingTable {
+			return new Proxy(table, {
+				get(target, prop) {
+					if (prop === 'query') {
+						return (filterInfo: FilterInfo) => target.query!(recoverSuffixedPk(filterInfo));
+					}
+					const value = Reflect.get(target, prop, target);
+					return typeof value === 'function' ? value.bind(target) : value;
+				},
+			});
+		}
+
+		/** Underlying module that advertises its PK plan under the suffixed name `_primary_1`,
+		 *  mimicking how lamina-quereus mints per-plan unique keys. Secondary index names are
+		 *  advertised verbatim, so secondary routing is unaffected. */
+		class SuffixedPkMemoryModule extends MemoryTableModule {
+			override getBestAccessPlan(db: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
+				const plan = super.getBestAccessPlan(db, tableInfo, request);
+				return plan.indexName === '_primary_' ? { ...plan, indexName: '_primary_1' } : plan;
+			}
+			override async create(...args: Parameters<MemoryTableModule['create']>): Promise<UnderlyingTable> {
+				return wrapUnderlying(await super.create(...args));
+			}
+			override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<UnderlyingTable> {
+				return wrapUnderlying(await super.connect(...args));
+			}
+		}
+
+		let sdb: Database;
+		beforeEach(() => {
+			sdb = new Database();
+			sdb.registerModule('isolated', new IsolationModule({ underlying: new SuffixedPkMemoryModule() }));
+		});
+
+		it('PK point lookup resolves through a live overlay (the original repro)', async () => {
+			await sdb.exec(`CREATE TABLE Site (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await sdb.exec(`INSERT INTO Site (id, name) VALUES (1, 'Scene A')`);
+
+			await sdb.exec('BEGIN');
+			// A buffered write creates the live overlay for this connection.
+			await sdb.exec(`INSERT INTO Site (id, name) VALUES (2, 'Scene B')`);
+
+			// Point lookup of the committed row: threw "Secondary index '_primary_1' not found"
+			// before the fix.
+			const existing = await sdb.get(`SELECT name FROM Site WHERE id = 1`);
+			expect(existing?.name).to.equal('Scene A');
+
+			// The overlay-buffered row is visible via the same suffixed-PK path.
+			const buffered = await sdb.get(`SELECT name FROM Site WHERE id = 2`);
+			expect(buffered?.name).to.equal('Scene B');
+
+			await sdb.exec('COMMIT');
+
+			const afterCommit = await asyncIterableToArray(sdb.eval(`SELECT id, name FROM Site ORDER BY id`));
+			expect(afterCommit.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'Scene A'], [2, 'Scene B']]);
+		});
+
+		it('bare `_primary_` (no overlay-affecting suffix) still resolves — read without a live overlay', async () => {
+			await sdb.exec(`CREATE TABLE Site (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await sdb.exec(`INSERT INTO Site (id, name) VALUES (1, 'Scene A')`);
+			// Autocommit read — no overlay, delegates straight to the underlying.
+			const row = await sdb.get(`SELECT name FROM Site WHERE id = 1`);
+			expect(row?.name).to.equal('Scene A');
+		});
+
+		it('PK range scan resolves through a live overlay with a suffixed PK name', async () => {
+			await sdb.exec(`CREATE TABLE Site (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await sdb.exec(`INSERT INTO Site (id, name) VALUES (1, 'A'), (2, 'B'), (3, 'C')`);
+
+			await sdb.exec('BEGIN');
+			await sdb.exec(`INSERT INTO Site (id, name) VALUES (4, 'D')`);   // creates overlay
+			await sdb.exec(`UPDATE Site SET name = 'B2' WHERE id = 2`);
+
+			const rows = await asyncIterableToArray(sdb.eval(`SELECT id, name FROM Site WHERE id >= 2 ORDER BY id`));
+			expect(rows.map((r: any) => [r.id, r.name])).to.deep.equal([[2, 'B2'], [3, 'C'], [4, 'D']]);
+
+			await sdb.exec('ROLLBACK');
+		});
+
+		it('genuine secondary index still routes to the overlay secondary scan under the suffixed module', async () => {
+			// The PK-suffix rewrite must NOT disturb real secondary index names. Here the
+			// underlying advertises the secondary index `idx_email` verbatim, so a lookup by
+			// email with a live overlay must merge overlay + underlying secondary streams.
+			await sdb.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, name TEXT) USING isolated`);
+			await sdb.exec(`CREATE INDEX idx_email ON users(email)`);
+			await sdb.exec(`INSERT INTO users VALUES (1, 'alice@example.com', 'Alice')`);
+
+			await sdb.exec('BEGIN');
+			await sdb.exec(`INSERT INTO users VALUES (2, 'bob@example.com', 'Bob')`); // creates overlay
+
+			const alice = await sdb.get(`SELECT name FROM users WHERE email = 'alice@example.com'`);
+			expect(alice?.name).to.equal('Alice');
+			const bob = await sdb.get(`SELECT name FROM users WHERE email = 'bob@example.com'`);
+			expect(bob?.name).to.equal('Bob');
+
+			await sdb.exec('ROLLBACK');
 		});
 	});
 });
