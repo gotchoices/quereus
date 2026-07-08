@@ -148,6 +148,13 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	/** Reclaim-by-name callback for the eviction sweep; absent ⇒ sweep is a no-op. */
 	private readonly dropLocalTable?: DropLocalTableCallback;
 
+	// Tail-promise chain serializing commit recording. Each commit chains onto the
+	// prior handler's completion so N+1's dedup reads see N's durable writes,
+	// preserving the change-log ordering invariant (docs/sync.md § Transaction-Based
+	// Change Grouping). Without this, two rapid commits interleave at the first
+	// `await` and a stale change-log entry survives.
+	private commitChain: Promise<void> = Promise.resolve();
+
 	// Last basis hash recorded per basis schema (in-memory, advisory). Drives the
 	// basis-drift warning in recordLensDeployment — a warning, not durable state.
 	private readonly lastBasisHash = new Map<string, string>();
@@ -252,7 +259,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		// multi-table transaction (docs/sync.md § Transaction-Based Change Grouping),
 		// so we subscribe here, not there. Omitted for relay-only deployments.
 		transactionSource?.onTransactionCommit((batch) => {
-			void manager.handleTransactionCommit(batch);
+			manager.enqueueTransactionCommit(batch);
 		});
 
 		return manager;
@@ -613,6 +620,30 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	// ============================================================================
 	// Local change capture (engine transaction boundary)
 	// ============================================================================
+
+	/**
+	 * Serialize commit recording: chain each commit onto the prior handler's
+	 * completion so N+1's dedup reads observe N's durable writes (the change-log
+	 * ordering invariant, docs/sync.md § Transaction-Based Change Grouping). The
+	 * defensive `.catch` guards the tail: `handleTransactionCommit` already swallows
+	 * and telemeters its own errors, but any unexpected throw must not poison the
+	 * chain for every subsequent commit. Returns `void` — fire-and-forget from the
+	 * engine's perspective; only inter-handler ordering changes.
+	 */
+	enqueueTransactionCommit(batch: TransactionCommitBatch): void {
+		this.commitChain = this.commitChain
+			.then(() => this.handleTransactionCommit(batch))
+			.catch(error => console.error('[Sync] Commit chain link failed:', error));
+	}
+
+	/**
+	 * Await the commit-recording tail — resolves once every commit enqueued so far
+	 * has fully recorded (through its KV batch write). Test/diagnostic hook for
+	 * deterministic draining without a timed sleep.
+	 */
+	whenCommitsSettled(): Promise<void> {
+		return this.commitChain;
+	}
 
 	/**
 	 * Record CRDT metadata for one committed local transaction.

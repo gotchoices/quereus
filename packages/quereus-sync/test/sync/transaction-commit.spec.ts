@@ -13,8 +13,8 @@ import { Database, type TableSchema } from '@quereus/quereus';
 import { InMemoryKVStore } from '@quereus/store';
 import { SyncManagerImpl, assertOpSeqInRange } from '../../src/sync/sync-manager-impl.js';
 import { SyncEventEmitterImpl, type LocalChangeEvent } from '../../src/sync/events.js';
-import { DEFAULT_SYNC_CONFIG } from '../../src/sync/protocol.js';
-import { deterministicTxnId, MAX_OPSEQ, type HLC } from '../../src/clock/hlc.js';
+import { DEFAULT_SYNC_CONFIG, type ColumnChange } from '../../src/sync/protocol.js';
+import { deterministicTxnId, createHLC, MAX_OPSEQ, type HLC } from '../../src/clock/hlc.js';
 import { generateSiteId, siteIdEquals } from '../../src/clock/site.js';
 import { FakeTransactionSource } from '../helpers/fake-transaction-source.js';
 
@@ -229,6 +229,48 @@ describe('per-transaction HLC tick + opSeq (write side)', () => {
 			expect(() => assertOpSeqInRange(MAX_OPSEQ)).to.not.throw();
 			expect(() => assertOpSeqInRange(MAX_OPSEQ + 1)).to.throw(/opSeq exhausted/);
 		});
+	});
+});
+
+describe('commit recording is serialized (no interleave)', () => {
+	it('two back-to-back commits on the same (pk, column) dedup to one change-log entry', async () => {
+		const { manager, source } = await makeManager();
+
+		// A peer that is not our site, so none of our facts are filtered as the
+		// peer's own; a from-zero sinceHLC forces the DELTA path (collectChangesSince),
+		// which reads the change LOG — the store the interleave bug corrupts. The full
+		// snapshot path (collectAllChanges) reads the by-key column-version store and
+		// would hide the duplicate.
+		const peer = generateSiteId();
+		const fromZero: HLC = createHLC(0n, 0, generateSiteId(), 0);
+
+		// Two commits fired back-to-back with NO settle() between them: on current
+		// `main` (void-fired handler) they interleave — commit 2's dedup read runs
+		// against pre-commit-1 state, misses the prior `name` version, and leaves a
+		// stale change-log entry, so `name` resolves twice. Serialized, commit 2 sees
+		// commit 1's durable write and deletes the prior entry.
+		source.commit({
+			data: [
+				{ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: [1, 'Alice'] },
+			],
+		});
+		source.commit({
+			data: [
+				{ type: 'update', schemaName: 'main', tableName: 'users', key: [1], oldRow: [1, 'Alice'], newRow: [1, 'Alice2'] },
+			],
+		});
+		await settle();
+
+		const sets = await manager.getChangesSince(peer, fromZero);
+		const nameChanges = sets
+			.flatMap(s => s.changes)
+			.filter((c): c is ColumnChange =>
+				c.type === 'column' && JSON.stringify(c.pk) === '[1]' && c.column === 'name');
+
+		// Exactly one surviving change for (pk=[1], name) — no duplicate.
+		expect(nameChanges, 'no duplicate change-log entry for (pk=[1], name)').to.have.length(1);
+		// Commit 2's dedup observed commit 1's write: the survivor is the latest value.
+		expect(nameChanges[0].value).to.equal('Alice2');
 	});
 });
 

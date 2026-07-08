@@ -278,6 +278,16 @@ of the transaction shares that triple and differs only in `opSeq` — exactly th
 identity the read side groups on. DDL events take the lowest `opSeq`s so they sort
 below the same transaction's DML (§ DDL Application Order).
 
+**Commit recording is serialized.** `handleTransactionCommit` does async dedup reads
+(the prior column-version / tombstone lookups that delete a superseded change-log entry)
+before its single `kvBatch.write()`. Two rapid commits must not interleave at those
+awaits, or commit N+1's dedup would read pre-N-write state, miss the prior version, and
+leave a stale change-log entry — breaking the *at most one surviving entry per key*
+invariant the read side relies on (§ Read side). `SyncManagerImpl` therefore chains each
+commit onto a tail promise (`enqueueTransactionCommit`), so N+1's reads always observe
+N's durable writes. The tick itself is synchronous and already ordered; only the
+post-tick dedup reads need this serialization.
+
 `opSeq` ordering semantics: **intra-table** order is true write order (a coordinator
 buffers its table's events in DML order); **cross-table** order is the deterministic
 per-coordinator commit order, not the global DML interleave. This is sufficient for
