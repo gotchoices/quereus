@@ -98,7 +98,15 @@ const TYPE_TEXT = 0x03;
 const TYPE_BLOB = 0x04;
 const TYPE_OBJECT = 0x05;
 
-/** Fixed width of a TYPE_NUMERIC key: tag + sortable double + signed tie-break. */
+/**
+ * Fixed width of a TYPE_NUMERIC key: tag + sortable double + signed tie-break.
+ *
+ * NOTE: this is ~2x the old 9-byte int/real key. The 8-byte tie-break tail is
+ * bulletproof but wider than needed — the residual `value - nearestDouble` for an
+ * int64 is bounded by ~2^11, so a 4-byte (int32) tail would suffice. If numeric-PK
+ * key size ever shows up as a storage/index-size problem, shrink the tail to 4
+ * bytes (keep it fixed-width so DESC bit-inversion stays trivially correct).
+ */
 const NUMERIC_KEY_LENGTH = 17;
 
 /** Escape byte for null bytes within strings. */
