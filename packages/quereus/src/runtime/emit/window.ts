@@ -171,7 +171,9 @@ async function groupByPartitions(
 		// would race on the shared inner-scan RowSlot.
 		const partitionValues: SqlValue[] = [];
 		for (const callback of partitionCallbacks) {
-			partitionValues.push(await callback(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const raw = callback(rctx);
+			partitionValues.push((raw instanceof Promise ? await raw : raw) as SqlValue);
 		}
 		const partitionKey = serializeKeyNullGrouping(partitionValues, keyNormalizers);
 
@@ -299,7 +301,9 @@ async function sortRows(
 		sourceSlot.set(row);
 		const values: SqlValue[] = [];
 		for (const callback of orderByCallbacks) {
-			values.push(await callback(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const raw = callback(rctx);
+			values.push((raw instanceof Promise ? await raw : raw) as SqlValue);
 		}
 		rowsWithValues.push({ row, values });
 	}
@@ -1012,14 +1016,18 @@ async function* runStreaming(
 		// RowSlot.
 		const partitionValues: SqlValue[] = [];
 		for (const cb of partitionCallbacks) {
-			partitionValues.push(await cb(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const rawP = cb(rctx);
+			partitionValues.push((rawP instanceof Promise ? await rawP : rawP) as SqlValue);
 		}
 		const partitionKey = serializeKeyNullGrouping(partitionValues, partitionKeyNormalizers);
 
 		// Resolve ORDER BY values (same shared-subtree concern as above).
 		const orderByValues: SqlValue[] = [];
 		for (const cb of orderByCallbacks) {
-			orderByValues.push(await cb(rctx) as SqlValue);
+			// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+			const rawO = cb(rctx);
+			orderByValues.push((rawO instanceof Promise ? await rawO : rawO) as SqlValue);
 		}
 
 		// Partition boundary: close out the previous partition.

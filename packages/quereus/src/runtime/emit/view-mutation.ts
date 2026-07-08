@@ -182,7 +182,9 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 						// single value threads into every member's key column via the EC.
 						rctx.mutationOrdinal = ordinal;
 						keySlot?.set(row as Row);
-						const minted = await keyDefaultCb(rctx);
+						// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+						const rawMinted = keyDefaultCb(rctx);
+						const minted = rawMinted instanceof Promise ? await rawMinted : rawMinted;
 						rows.push([...row, minted as SqlValue] as Row);
 					} else {
 						rows.push(row as Row);

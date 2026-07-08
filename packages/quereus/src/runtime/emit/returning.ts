@@ -31,7 +31,11 @@ export function emitReturning(plan: ReturningNode, ctx: EmissionContext): Instru
 				// serialize-project-subquery-evaluation for the canonical fix.
 				const outputs: OutputValue[] = [];
 				for (const func of projectionCallbacks) {
-					outputs.push(await func(rctx));
+					// Resolve each column without a per-column microtask hop: `await`
+					// only when the sub-program is genuinely a promise (rare). See
+					// resolveMaybe in runtime/async-util.ts for the rationale.
+					const value = func(rctx);
+					outputs.push(value instanceof Promise ? await value : value);
 				}
 				yield outputs as Row;
 			}

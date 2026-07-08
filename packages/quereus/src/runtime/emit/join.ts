@@ -1,7 +1,7 @@
 import type { JoinNode } from '../../planner/nodes/join-node.js';
 import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
-import type { Row, OutputValue } from '../../common/types.js';
+import type { Row, OutputValue, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
@@ -10,6 +10,7 @@ import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-col
 
 import { createRowSlot } from '../context-helpers.js';
 import { joinOutputRow } from './join-output.js';
+import { resolveMaybe } from '../async-util.js';
 
 const log = createLogger('runtime:emit:join');
 
@@ -87,9 +88,12 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 		// the runtime context after BOTH slots are set, so it is agnostic to which
 		// side drives the iteration: callback (ON) / USING / unconditional (cross or
 		// a bare join with no predicate).
-		const conditionMet = async (leftRow: Row, rightRow: Row): Promise<boolean> => {
+		// Returns `MaybePromise<boolean>` (not always a promise): the ON sub-program
+		// almost always completes synchronously, so callers branch on the result and
+		// only `await` on the rare async path. See resolveMaybe in runtime/async-util.ts.
+		const conditionMet = (leftRow: Row, rightRow: Row): MaybePromise<boolean> => {
 			if (conditionCallback) {
-				return !!(await conditionCallback(rctx));
+				return resolveMaybe(conditionCallback(rctx), (v) => !!v);
 			}
 			if (usingResolved) {
 				return evaluateUsingCondition(leftRow, rightRow, usingResolved);
@@ -106,7 +110,8 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 
 				for await (const rightRow of rightCallback(rctx)) {
 					rightSlot.set(rightRow);
-					if (await conditionMet(leftRow, rightRow)) {
+					const leftMet = conditionMet(leftRow, rightRow);
+					if (leftMet instanceof Promise ? await leftMet : leftMet) {
 						matched = true;
 						if (isSemiOrAnti) {
 							// Semi: emit left row on first match and stop scanning right.
@@ -152,7 +157,8 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 				for (let i = 0; i < leftRows.length; i++) {
 					const leftRow = leftRows[i];
 					leftSlot.set(leftRow);
-					if (await conditionMet(leftRow, rightRow)) {
+					const rightMet = conditionMet(leftRow, rightRow);
+					if (rightMet instanceof Promise ? await rightMet : rightMet) {
 						rightMatched = true;
 						if (leftMatched) leftMatched[i] = true;
 						yield (matchedFlags ? [...leftRow, ...rightRow, ...matchedFlags] : [...leftRow, ...rightRow]) as Row;

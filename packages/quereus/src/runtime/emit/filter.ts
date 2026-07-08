@@ -7,6 +7,7 @@ import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 import { QuereusError } from '../../common/errors.js';
 import { isTruthy } from '../../util/comparison.js';
+import { resolveMaybe } from '../async-util.js';
 
 function asPredicateScalar(value: unknown): SqlValue {
 	if (value === null) return null;
@@ -27,8 +28,11 @@ export function emitFilter(plan: FilterNode, ctx: EmissionContext): Instruction 
 		try {
 			for await (const sourceRow of source) {
 				sourceSlot.set(sourceRow);
-				const result = await predicate(rctx);
-				if (isTruthy(asPredicateScalar(result))) {
+				// Resolve the predicate without a per-row microtask hop: the sub-program
+				// almost always completes synchronously, so `await` only when it is
+				// genuinely a promise. See resolveMaybe in runtime/async-util.ts.
+				const decision = resolveMaybe(predicate(rctx), (result) => isTruthy(asPredicateScalar(result)));
+				if (decision instanceof Promise ? await decision : decision) {
 					yield sourceRow;
 				}
 			}

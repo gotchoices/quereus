@@ -10,6 +10,35 @@ import { getAsyncIterator } from './utils.js';
 const log = createLogger('runtime:async-util');
 
 /**
+ * Resolve a possibly-pending value and apply `fn`, WITHOUT a microtask hop on
+ * the synchronous common case.
+ *
+ * Scalar sub-programs (a filter predicate, a projected column, a join
+ * condition) run through a sub-scheduler that completes synchronously and
+ * returns a concrete value whenever no instruction in the sub-program is itself
+ * async — which is the overwhelmingly common case. But `await value` still
+ * schedules a microtask even when `value` is not a thenable (per spec,
+ * `await x` ≡ `await Promise.resolve(x)`), so a per-row/per-column
+ * `await subprogram(rctx)` pays that tick N times for nothing. Branching on
+ * `instanceof Promise` keeps the hot path fully synchronous and only defers
+ * when the value is genuinely pending.
+ *
+ * The result is itself `MaybePromise<R>`: when the input is concrete, `fn` runs
+ * inline and the mapped value is returned directly; only a genuinely pending
+ * input chains through `.then`. Callers that need the plain value must still
+ * branch at the extraction point (`r instanceof Promise ? await r : r`) — that
+ * final `await` then runs only on the rare async path, never on the hot path.
+ *
+ * NOTE: pure-extraction sites (no mapping — e.g. collecting projected columns
+ * into a row array) inline the same `instanceof Promise` branch directly rather
+ * than wrapping an identity `fn` here; a value-returning helper cannot host the
+ * caller's `await` without reintroducing the very hop this avoids.
+ */
+export function resolveMaybe<T, R>(value: MaybePromise<T>, fn: (v: T) => R): MaybePromise<R> {
+	return value instanceof Promise ? value.then(fn) : fn(value);
+}
+
+/**
  * Transform rows using a mapping function
  */
 export async function* mapRows<T extends Row, R>(

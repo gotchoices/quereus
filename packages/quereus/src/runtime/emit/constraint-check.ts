@@ -133,7 +133,10 @@ export function emitConstraintCheck(plan: ConstraintCheckNode, ctx: EmissionCont
 
 			contextRow = [];
 			for (const contextEvaluator of contextEvalFunctions) {
-				const value = await contextEvaluator(rctx) as SqlValue;
+				// Resolve without a per-row microtask hop: `await` only when the
+				// sub-program is genuinely a promise. See runtime/async-util.ts.
+				const raw = contextEvaluator(rctx);
+				const value = (raw instanceof Promise ? await raw : raw) as SqlValue;
 				contextRow.push(value);
 			}
 
@@ -362,7 +365,9 @@ async function checkCheckConstraints(
 			continue;
 		}
 
-		const result = await evaluator(rctx) as SqlValue;
+		// Resolve without a per-row microtask hop (see runtime/async-util.ts).
+		const rawResult = evaluator(rctx);
+		const result = (rawResult instanceof Promise ? await rawResult : rawResult) as SqlValue;
 
 		// CHECK passes if truthy or NULL; fails on false / 0 (SQLite numeric boolean).
 		if (result === false || result === 0) {

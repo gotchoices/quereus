@@ -36,7 +36,11 @@ export function emitProject(plan: ProjectNode, ctx: EmissionContext): Instructio
 				sourceSlot.set(sourceRow);
 				const outputs: OutputValue[] = [];
 				for (const fn of projectionFunctions) {
-					outputs.push(await fn(rctx));
+					// Resolve each column without a per-column microtask hop: `await`
+					// only when the sub-program is genuinely a promise (rare). See
+					// resolveMaybe in runtime/async-util.ts for the rationale.
+					const value = fn(rctx);
+					outputs.push(value instanceof Promise ? await value : value);
 				}
 				const outputRow = outputs as Row;
 

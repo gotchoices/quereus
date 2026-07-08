@@ -148,9 +148,12 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 						const rightRow = rightRows[ri];
 						rightSlot.set(rightRow);
 
-						// Evaluate residual condition if present
+						// Evaluate residual condition if present. Resolve without a
+						// per-row microtask hop: `await` only when the sub-program is
+						// genuinely a promise. See resolveMaybe in runtime/async-util.ts.
 						if (residualCallback) {
-							const result = await residualCallback(rctx);
+							const raw = residualCallback(rctx);
+							const result = raw instanceof Promise ? await raw : raw;
 							if (!result) continue;
 						}
 
