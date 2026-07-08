@@ -16,6 +16,7 @@ import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } fr
 import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
+import { isTruthy } from '../../util/comparison.js';
 import {
 	snapshotStaleMaterializedViews,
 	propagateTableRenameToMaterializedViews,
@@ -404,8 +405,8 @@ async function runAddColumn(
 				for (let i = 0; i < checkPredicates.length; i++) {
 					const resultRaw = checkCbs[i](rctx);
 					const result = (resultRaw instanceof Promise ? await resultRaw : resultRaw) as SqlValue;
-					// CHECK passes on truthy / NULL; fails on false / 0 (matches write-time semantics).
-					if (result === false || result === 0) {
+					// CHECK passes on truthy / NULL; fails otherwise (shared isTruthy semantics, matches write-time).
+					if (result !== null && !isTruthy(result)) {
 						const pred = checkPredicates[i];
 						const hint = pred.exprText ? ` (${pred.exprText})` : '';
 						throw new QuereusError(

@@ -458,3 +458,26 @@ select count(*) as cnt from t_truthy;
 → [{"cnt":2}]
 
 drop table t_truthy;
+
+-- A subquery-bearing CHECK auto-defers to the DeferredConstraintQueue path,
+-- which shares the same isTruthy fix. `check ((select v))` yields the row's own
+-- v (bigint 0n for v=0) through the deferred evaluator — must reject like the
+-- immediate path, not slip past a narrow `value === false || value === 0`.
+create table t_defer (id integer primary key, v any, check ((select v)));
+
+insert into t_defer values (1, 5);
+select count(*) as cnt from t_defer;
+→ [{"cnt":1}]
+
+-- deferred CHECK result is bigint 0n → must fail.
+insert into t_defer values (2, 0);
+-- error: CHECK
+
+-- deferred CHECK result is string '0' → falsy under isTruthy → must fail.
+insert into t_defer values (3, '0');
+-- error: CHECK
+
+select count(*) as cnt from t_defer;
+→ [{"cnt":1}]
+
+drop table t_defer;

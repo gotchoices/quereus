@@ -78,6 +78,7 @@ import type { RuntimeContext } from '../runtime/types.js';
 import { StatusCode, type Row, type SqlValue } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 import { expressionToString } from '../emit/ast-stringify.js';
+import { isTruthy } from '../util/comparison.js';
 
 /** One compiled declared constraint over a single derived row image. */
 interface CompiledDerivedRowCheck {
@@ -175,8 +176,9 @@ function compileDerivedRowCheck(
 	const scheduler = new Scheduler(emitPlanNode(optimized, new EmissionContext(db)));
 	const evaluator = async (rctx: RuntimeContext): Promise<SqlValue> => {
 		const value = await scheduler.run(rctx) as SqlValue;
-		// The constraint-check truthy/NULL-pass rule: fail only on false / 0.
-		if (value === false || value === 0) throw violation();
+		// The constraint-check truthy/NULL-pass rule (shared isTruthy semantics):
+		// NULL passes, everything else fails unless truthy.
+		if (value !== null && !isTruthy(value)) throw violation();
 		return value;
 	};
 	return { kind, constraintName, needsDeferred: plan.needsDeferred, evaluator };

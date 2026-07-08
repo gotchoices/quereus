@@ -351,3 +351,31 @@ insert into hqsrc values (2, 500);
 -- error: row derived into maintained table 'main.hmq'
 select count(*) as n from hmq;
 → [{"n":1}]
+
+-- ===================================
+-- 13. CHECK truthiness: the derived-row validator must reject a bigint-0n / '0'
+-- CHECK result exactly like write-time DML, not the old narrower
+-- `value === false || value === 0` test that missed 0n. A bare-column `check (v)`
+-- yields bigint 0n for an integer 0 at steady-state maintenance time.
+-- ===================================
+
+create table tsrc (id integer primary key, v any not null);
+insert into tsrc values (1, 5);
+create table tmt (id integer primary key, v any not null check (v)) maintained as select id, v from tsrc;
+
+-- steady-state insert of v=0 → bigint 0n → must fail the derived-row CHECK.
+insert into tsrc values (2, 0);
+-- error: row derived into maintained table 'main.tmt'
+select count(*) as n from tmt;
+→ [{"n":1}]
+
+-- string '0' derives falsy under isTruthy's numeric conversion — also rejected.
+insert into tsrc values (3, '0');
+-- error: row derived into maintained table 'main.tmt'
+select count(*) as n from tmt;
+→ [{"n":1}]
+
+-- conforming steady-state maintenance still flows (truthy non-zero passes).
+insert into tsrc values (4, 7);
+select count(*) as n from tmt;
+→ [{"n":2}]

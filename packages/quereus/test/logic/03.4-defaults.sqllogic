@@ -428,6 +428,26 @@ select id, base, c from ac_chk_future order by id;
 → [{"id":1,"base":5,"c":10}]
 DROP TABLE ac_chk_future;
 
+-- TRUTHINESS: a bare-column CHECK yields bigint 0n for a backfilled 0 (integer
+-- literals lex to bigint at runtime). The old backfill test `result === false ||
+-- result === 0` missed 0n and silently admitted the row; the shared isTruthy rule
+-- rejects it. base=0 → c=0n → CHECK fails → ALTER aborts, table unchanged.
+create table ac_chk_truthy (id integer primary key, base integer null);
+insert into ac_chk_truthy (id, base) values (1, 5), (2, 0);
+alter table ac_chk_truthy add column c integer default (new.base) check (c);
+-- error:
+select * from ac_chk_truthy order by id;
+→ [{"id":1,"base":5},{"id":2,"base":0}]
+DROP TABLE ac_chk_truthy;
+
+-- TRUTHINESS control: all backfilled values truthy → column added.
+create table ac_chk_truthy_ok (id integer primary key, base integer null);
+insert into ac_chk_truthy_ok (id, base) values (1, 5), (2, 3);
+alter table ac_chk_truthy_ok add column c integer default (new.base) check (c);
+select id, base, c from ac_chk_truthy_ok order by id;
+→ [{"id":1,"base":5,"c":5},{"id":2,"base":3,"c":3}]
+DROP TABLE ac_chk_truthy_ok;
+
 -- COLLATION parity: a `collate nocase` new column with a CHECK comparing it to a lowercase
 -- literal. The backfilled value 'ABC' equals 'abc' only under NOCASE — so this passes iff the
 -- new column's declared collation drives the backfill-time CHECK (matching write-time).

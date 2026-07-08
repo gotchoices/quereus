@@ -640,7 +640,8 @@ export function collectLensForeignKeyConstraints(slot: LensSlot, schemaManager: 
  * synthesize into a constraint AST. Crucially this evaluates to a definite **false**
  * (never NULL) when exactly one side is NULL: the naive `(OLD = NEW) or (OLD is null
  * and NEW is null)` instead yields `NULL or false = NULL` there, which the
- * deferred-constraint check (`value === false || value === 0`) does not treat as a
+ * constraint check (NULL passes; only a non-NULL non-truthy value fails, per the
+ * shared `isTruthy` rule) does not treat as a
  * failure — so it would wrongly admit an orphaning value→NULL update.
  *
  * Null-safety matters for a **nullable** referenced parent key: a value→NULL update
