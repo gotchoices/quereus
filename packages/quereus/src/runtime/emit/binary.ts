@@ -3,11 +3,13 @@ import { quereusError } from "../../common/errors.js";
 import type { SqlValue } from "../../common/types.js";
 import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
 import type { BinaryOpNode } from "../../planner/nodes/scalar.js";
+import { LiteralNode } from "../../planner/nodes/scalar.js";
+import type { ScalarPlanNode } from "../../planner/nodes/plan-node.js";
 import { emitPlanNode } from "../emitters.js";
 import { compareSqlValuesFast, isTruthy } from "../../util/comparison.js";
 import type { CollationFunction } from "../../util/comparison.js";
 import { coerceToNumberForArithmetic } from "../../util/coercion.js";
-import { simpleLike } from "../../util/patterns.js";
+import { simpleLike, compileLikeMatcher } from "../../util/patterns.js";
 import type { EmissionContext } from "../emission-context.js";
 import { tryTemporalArithmetic, tryTemporalComparison } from "./temporal-arithmetic.js";
 import { effectiveComparisonCollation } from "../../planner/analysis/comparison-collation.js";
@@ -366,7 +368,43 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 	};
 }
 
+/**
+ * If `node` is a literal-constant, non-NULL pattern, return the exact string the
+ * per-row path would derive from it (`String(value)`), otherwise undefined.
+ * A NULL literal, a not-yet-resolved Promise value, or any non-literal node
+ * falls through to the dynamic (memoized) per-row path so semantics are
+ * unchanged. Cast/collate-wrapped literals are intentionally NOT unwrapped —
+ * emitLikeOp ignores collation, and peeling could silently diverge.
+ */
+function constLikePattern(node: ScalarPlanNode): string | undefined {
+	if (!(node instanceof LiteralNode)) return undefined;
+	const value = node.expression.value;
+	if (value === null || value === undefined || value instanceof Promise) return undefined;
+	return String(value);
+}
+
 export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
+	const leftExpr = emitPlanNode(plan.left, ctx);
+
+	// Fast path: the pattern operand is a literal constant. Compile the matcher
+	// once here at emit time and capture it in the closure, so no per-row compile
+	// or cache lookup happens at all. The literal operand is not emitted as a
+	// param since its value is already baked into `matcher`.
+	const constPattern = constLikePattern(plan.right);
+	if (constPattern !== undefined) {
+		const matcher = compileLikeMatcher(constPattern);
+		function runConstPattern(_ctx: RuntimeContext, text: SqlValue): SqlValue {
+			// text LIKE <const>: NULL text → NULL, else run the pre-compiled matcher.
+			if (text === null) return null;
+			return matcher(String(text));
+		}
+		return {
+			params: [leftExpr],
+			run: runConstPattern as InstructionRun,
+			note: 'LIKE(like-const)'
+		};
+	}
+
 	function run(ctx: RuntimeContext, text: SqlValue, pattern: SqlValue): SqlValue {
 		// SQL LIKE logic: text LIKE pattern
 		// NULL handling: if either operand is NULL, result is NULL
@@ -374,14 +412,13 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 			return null;
 		}
 
-		// Convert both operands to strings and perform LIKE matching
+		// Convert both operands to strings and perform LIKE matching (memoized compile).
 		const textStr = String(text);
 		const patternStr = String(pattern);
 
 		return simpleLike(patternStr, textStr);
 	}
 
-	const leftExpr = emitPlanNode(plan.left, ctx);
 	const rightExpr = emitPlanNode(plan.right, ctx);
 
 	return {
