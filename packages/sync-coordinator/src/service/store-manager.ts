@@ -180,6 +180,11 @@ export class StoreManager {
   async acquire(databaseId: string, context?: StoreContext): Promise<StoreEntry> {
     // Reject once shutdown has begun — the store map is being torn down and a
     // handle vended here would never be closed by shutdown().
+    // NOTE: best-effort only — this checks _shuttingDown at entry, but the awaits
+    // below (pendingCloses, evictLRU, openAndRestore) can yield to a shutdown() that
+    // flips the flag mid-acquire, so a handle could still be opened after teardown
+    // started. Harmless today: no caller acquires concurrently with shutdown. If that
+    // ever changes, re-check _shuttingDown after each await and back out the open.
     if (this._shuttingDown) {
       throw new Error(`Cannot acquire store ${databaseId}: StoreManager is shutting down`);
     }

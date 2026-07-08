@@ -506,6 +506,60 @@ describe('StoreManager', () => {
         await rm(raceDataDir, { recursive: true, force: true }).catch(() => {});
       }
     });
+
+    // Sibling of the test above, but the close is driven by LRU eviction from INSIDE
+    // acquire() (not the cleanup timer). Same closeStore serialization must hold, so an
+    // acquire of the evicted key racing its eviction still gets a live handle.
+    it('acquire of an LRU-evicted key racing its eviction returns a live handle', async () => {
+      const raceDataDir = join(tmpdir(), `sync-race-evict-${randomUUID()}`);
+      const raceManager = new StoreManager({
+        dataDir: raceDataDir,
+        maxOpenStores: 1,        // opening a second store forces eviction of the first
+        idleTimeoutMs: 60_000,   // cleanup must never interpose — eviction is the only closer
+        cleanupIntervalMs: 60_000,
+      });
+      // Deliberately NOT started: no cleanup timer, so the ONLY close path is evictLRU.
+
+      try {
+        const victim = await raceManager.acquire(TEST_DATABASE_ID);
+        raceManager.release(TEST_DATABASE_ID); // refCount → 0; now LRU-evictable
+
+        let releaseBarrier!: () => void;
+        const closeBarrier = new Promise<void>(resolve => { releaseBarrier = resolve; });
+        let signalCloseStarted!: () => void;
+        const closeStarted = new Promise<void>(resolve => { signalCloseStarted = resolve; });
+
+        const originalClose = victim.store.close.bind(victim.store);
+        victim.store.close = async () => {
+          signalCloseStarted();
+          await closeBarrier;   // park mid-close so an acquire of the same key can race
+          await originalClose();
+        };
+
+        // Acquiring a second store trips maxOpenStores and evicts TEST_DATABASE_ID.
+        // This acquire parks on the barrier (evictLRU → closeStore → close), so we hold
+        // its promise rather than awaiting it here.
+        const acquireBP = raceManager.acquire(TEST_DATABASE_ID_2);
+
+        // Wait until eviction has entered close() and is parked on the barrier.
+        await closeStarted;
+
+        // Race an acquire of the evicted key against its in-flight eviction.
+        const acquireVictimP = raceManager.acquire(TEST_DATABASE_ID);
+        releaseBarrier();
+        const [reopened] = await Promise.all([acquireVictimP, acquireBP]);
+
+        // The re-acquired handle must be live — not the one eviction was tearing down.
+        expect(reopened.store.isClosed()).to.be.false;
+        await reopened.store.get(new Uint8Array([1]));
+
+        raceManager.release(TEST_DATABASE_ID);
+        raceManager.release(TEST_DATABASE_ID_2);
+      } finally {
+        await raceManager.shutdown();
+        await rm(raceDataDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
   });
 });
 
