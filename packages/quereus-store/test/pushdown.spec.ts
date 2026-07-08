@@ -432,6 +432,15 @@ describe('StoreModule predicate pushdown', () => {
 			// order by x desc: 3.5(35), 3(30), 2.5(25)
 			expect(rows.map(r => r.n)).to.deep.equal([35, 30, 25]);
 		});
+
+		// NOTE: an end-to-end SQL range seek over |int| >= 2^53 through the store
+		// (the "gap 1" combined test) cannot live here yet: a bigint PK crashes the
+		// engine upstream in the transaction change log (serializeKeyTuple ->
+		// canonicalJsonString -> JSON.stringify throws "Do not know how to serialize
+		// a BigInt"), tracked in fix/txn-changelog-bigint-key. The STORE encoding of
+		// large ints is proven at the unit level in encoding.spec.ts (byte order +
+		// exact roundtrip across the shared-double boundary); the combined SQL test
+		// belongs in that fix's suite once bigint PKs can be written at all.
 	});
 
 	// A leading PK key collation with NO registered byte encoder must NOT produce a
