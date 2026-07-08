@@ -563,6 +563,19 @@ export class PassManager {
 		let currentNode = node;
 		let changed = true;
 
+		// Rules that declined (returned null / the same node) on the *current*
+		// node id. A declining rule is deterministic in its input node, so once it
+		// declines on a given node it will decline again on the same node — no
+		// point re-offering it every `while` fixpoint iteration. This set is
+		// ephemeral (not stored on the context) and, crucially, is reset whenever
+		// a transform mints a NEW node: the plan piece changed, so every decliner
+		// gets a fresh shot on the new node (a rule that declined on the old shape
+		// may well apply to the new one). Applied rules are handled separately by
+		// `hasRuleBeenApplied` (they are inherited across the re-mint for loop
+		// prevention); declines are not inherited, so no plan output changes vs.
+		// re-scanning every iteration — only redundant same-node re-runs are cut.
+		let declinedOnCurrent = new Set<string>();
+
 		while (changed) {
 			changed = false;
 
@@ -570,6 +583,7 @@ export class PassManager {
 				if (rule.nodeType !== currentNode.nodeType) continue;
 				if (context.tuning.disabledRules?.has(rule.id)) continue;
 				if (hasRuleBeenApplied(currentNode.id, rule.id, context)) continue;
+				if (declinedOnCurrent.has(rule.id)) continue;
 
 				const result = rule.fn(currentNode, context);
 				if (result && result !== currentNode) {
@@ -584,7 +598,18 @@ export class PassManager {
 					}
 					log('Rule %s transformed node in pass %s', rule.id, pass.id);
 					currentNode = result;
+					// New node id — the plan piece changed, so re-offer every decliner.
+					declinedOnCurrent = new Set();
 					changed = true;
+				} else {
+					// Declined on this exact node id; suppress re-offering it until
+					// the node changes (a transform resets the set above).
+					// NOTE: this assumes a decline is a pure function of the node — a
+					// rule that declines but mutates shared `context` state expecting
+					// to re-apply on the *same unchanged* node next iteration would no
+					// longer get that second look. No such rule exists today; if one
+					// is added, exclude it here or key the skip on a context epoch.
+					declinedOnCurrent.add(rule.id);
 				}
 			}
 		}

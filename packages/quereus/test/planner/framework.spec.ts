@@ -360,6 +360,122 @@ describe('Planner Framework', () => {
 			expect(pass1Cached).to.equal(true);
 			expect(pass2Cached).to.equal(false);
 		});
+
+		// -------------------------------------------------------------------
+		// Decline tracking (ticket 3.5): a rule that declines on a node is not
+		// re-offered to that SAME (unchanged) node every fixpoint iteration, but
+		// IS re-offered once the node is transformed. Ephemeral per-node set, not
+		// inherited — so no plan output changes.
+		// -------------------------------------------------------------------
+
+		it('declining rule is not re-run on the same node across fixpoint iterations (the win)', () => {
+			const pass = createPass('decl', 'Decline', '', 10, TraversalOrder.BottomUp);
+			let declineCalls = 0;
+			let transformed = false;
+
+			// Transformer runs FIRST (mints N0→N1), decliner SECOND (declines on
+			// N1). The while loop iterates again to confirm fixpoint: the decliner
+			// is offered on the *same* N1 a second time. Pre-fix it re-ran (2
+			// calls); now the ephemeral decline set suppresses the redundant re-run.
+			const transformer = makeRule('transformer', PlanNodeType.Filter, () => {
+				if (transformed) return null;
+				transformed = true;
+				return relNode({ nodeType: PlanNodeType.Filter });
+			});
+			const decliner = makeRule('decliner', PlanNodeType.Filter, () => {
+				declineCalls++;
+				return null;
+			});
+			pass.rules.push(transformer, decliner);
+
+			const pm = new PassManager([pass]);
+			pm.execute(relNode({ nodeType: PlanNodeType.Filter }), makeContext());
+
+			// Offered exactly once on N1 — the redundant same-node re-run is cut.
+			expect(declineCalls).to.equal(1);
+		});
+
+		it('declining rule IS re-offered after a sibling transform changes the node (soundness)', () => {
+			const pass = createPass('reoffer', 'Reoffer', '', 10, TraversalOrder.BottomUp);
+			let declineCalls = 0;
+			let transformed = false;
+
+			// Decliner runs FIRST on N0 (declines), then the transformer mints
+			// N0→N1. The plan piece changed, so on the next iteration the decliner
+			// must be re-offered on N1 (it might now apply — this is exactly the
+			// pattern that inheriting declines would wrongly suppress, silently
+			// changing plans). Expect two calls: once on N0, once on N1.
+			const decliner = makeRule('decliner', PlanNodeType.Filter, () => {
+				declineCalls++;
+				return null;
+			});
+			const transformer = makeRule('transformer', PlanNodeType.Filter, () => {
+				if (transformed) return null;
+				transformed = true;
+				return relNode({ nodeType: PlanNodeType.Filter });
+			});
+			pass.rules.push(decliner, transformer);
+
+			const pm = new PassManager([pass]);
+			pm.execute(relNode({ nodeType: PlanNodeType.Filter }), makeContext());
+
+			expect(declineCalls).to.equal(2);
+		});
+
+		it('transform still offers previously-unoffered rules to the new node', () => {
+			const pass = createPass('freshRules', 'Fresh', '', 10, TraversalOrder.BottomUp);
+			let projectRuleCalls = 0;
+
+			// T rewrites Filter → Project. U only matches Project, so it was never
+			// offered to the original Filter and must fire on the transformed node —
+			// decline suppression must not touch genuinely-new rules.
+			const t = makeRule('filter-to-project', PlanNodeType.Filter, () =>
+				relNode({ nodeType: PlanNodeType.Project }));
+			const u = makeRule('project-rule', PlanNodeType.Project, () => {
+				projectRuleCalls++;
+				return null;
+			});
+			pass.rules.push(t, u);
+
+			const pm = new PassManager([pass]);
+			pm.execute(relNode({ nodeType: PlanNodeType.Filter }), makeContext());
+
+			expect(projectRuleCalls).to.equal(1);
+		});
+
+		it('same-node decline re-runs are cut across a fan of nodes (regression guard)', () => {
+			// Chain of three Filter nodes. Per node the transformer runs first
+			// (once), then the decliner declines on the transformed node; the
+			// fixpoint re-iteration must NOT re-run the decliner on that same node.
+			// New behavior: decliner offered once per node (3 total). Pre-fix: twice
+			// per node (6 total), the redundant same-node re-run.
+			const pass = createPass('scale', 'Scale', '', 10, TraversalOrder.BottomUp);
+			let declineCalls = 0;
+			const transformedIds = new Set<string>();
+
+			// Transform once per distinct node id (preserve children so the tree
+			// stays coherent). The applied-rule inheritance stops it re-firing on
+			// its own output; the guard keeps intent explicit.
+			const transformer = makeRule('transformer', PlanNodeType.Filter, (node) => {
+				if (transformedIds.has(node.id)) return null;
+				transformedIds.add(node.id);
+				return relNode({ nodeType: PlanNodeType.Filter, children: [...node.getChildren()] });
+			});
+			const decliner = makeRule('decliner', PlanNodeType.Filter, () => {
+				declineCalls++;
+				return null;
+			});
+			pass.rules.push(transformer, decliner);
+
+			const leaf = relNode({ nodeType: PlanNodeType.Filter });
+			const mid = relNode({ nodeType: PlanNodeType.Filter, children: [leaf] });
+			const root = relNode({ nodeType: PlanNodeType.Filter, children: [mid] });
+
+			const pm = new PassManager([pass]);
+			pm.execute(root, makeContext());
+
+			expect(declineCalls).to.equal(3);
+		});
 	});
 
 	// ---------------------------------------------------------------------------

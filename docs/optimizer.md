@@ -1221,7 +1221,7 @@ interface OptContext {
   db: Database;
   
   // Context-scoped tracking
-  visitedRules: Map<string, Set<string>>;     // nodeId → ruleIds applied in this context
+  visitedRules: Map<string, Set<string>>;     // nodeId → ruleIds applied (transformed) in this context
   optimizedNodes: Map<string, PlanNode>;      // nodeId → optimized result cache
 }
 ```
@@ -1250,10 +1250,11 @@ The cache is cleared at the start of each pass (so Physical Selection can still 
 
 ### Rule Application Control
 
-Rules are prevented from infinite loops through per-context tracking:
+Rules are prevented from infinite loops through per-context tracking of
+*transforming* applications:
 
 ```typescript
-// Registry checks context-local visited state
+// Registry checks context-local applied state
 hasRuleBeenApplied(nodeId: string, ruleId: string, context: OptContext): boolean {
   const nodeVisited = context.visitedRules.get(nodeId);
   return nodeVisited?.has(ruleId) ?? false;
@@ -1267,6 +1268,24 @@ markRuleApplied(nodeId: string, ruleId: string, context: OptContext): void {
   context.visitedRules.get(nodeId)!.add(ruleId);
 }
 ```
+
+When a rule transforms a node the `PassManager` inherits the applied set onto the
+freshly-minted node (`inheritVisitedRules`), so an applied rule is not re-tried
+on its own output (loop prevention).
+
+**Declines are tracked separately and ephemerally.** Inside a single
+`applyPassRules` fixpoint loop, a rule that declines (returns `null` / the same
+node) on the current node id is remembered so it is not re-offered on that
+*unchanged* node every `while` iteration — the rule is deterministic in its
+input node, so the re-run would be pure waste. This decline set is **reset the
+moment any rule transforms the node**: the plan piece changed, so every decliner
+gets a fresh shot on the new node (a rule that declined on the old shape may well
+apply to the new one). Because declines are never inherited across a transform,
+this is a strict speedup with **no plan-output change** — only same-node re-runs
+are cut, never a legitimate re-offer after the node actually changes. (An earlier
+design inheriting declines across the re-mint was rejected: it suppresses a
+decliner that becomes applicable after a *sibling* rule reshapes the node —
+`ruleAsyncGatherZipByKey` is a concrete case — silently changing plans.)
 
 Individual rules can also be disabled via `OptimizerTuning.disabledRules` (a `ReadonlySet<string>` of rule IDs). Both the pass-based and registry-based rule application paths skip disabled rules. This is primarily intended for testing (e.g., verifying semantic equivalence with/without a specific rewrite).
 

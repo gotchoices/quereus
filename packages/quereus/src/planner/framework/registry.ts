@@ -66,7 +66,12 @@ export interface RuleHandle {
 }
 
 /**
- * Check if a rule has already been applied to a node
+ * Check if a rule has already been applied to a node.
+ *
+ * Records only *transforming* applications (loop prevention), inherited across
+ * a transform's re-mint by `PassManager.inheritVisitedRules`. A rule that
+ * *declines* is tracked separately and ephemerally inside
+ * `PassManager.applyPassRules` (per node id, not inherited) — see that method.
  */
 export function hasRuleBeenApplied(nodeId: string, ruleId: string, context: OptContext): boolean {
 	const nodeVisited = context.visitedRules.get(nodeId);

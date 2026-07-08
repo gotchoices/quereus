@@ -6,7 +6,7 @@ This directory contains the core framework components for the Titan optimizer Ph
 
 ### Registry (`registry.ts`)
 - **RuleHandle**: Structured rule registration with ID, node type, phase, and priority
-- **Loop Detection**: `hasRuleBeenApplied` / `markRuleApplied` prevent infinite rule application using per-node visited-rule tracking (consulted by `PassManager`)
+- **Loop Detection**: `hasRuleBeenApplied` / `markRuleApplied` prevent infinite rule application using per-node visited-rule tracking (consulted by `PassManager`). Records transforming applications only, inherited across a transform's re-mint. A rule that *declines* is tracked ephemerally per node id inside `PassManager.applyPassRules` so it is not re-run on the same unchanged node every fixpoint iteration; that decline suppression is dropped the moment the node is transformed (the plan piece changed), so no plan output changes
 - **`validateSideEffectMode`**: Rejects any rule handle missing its `sideEffectMode` declaration
 
 ### Trace Framework (`trace.ts`)
