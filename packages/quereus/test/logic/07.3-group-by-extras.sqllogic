@@ -136,3 +136,82 @@ select grp, count(*) from gf where 1 = 0 group by grp;
 → []
 
 drop table gf;
+
+-- ---------------------------------------------------------------------------
+-- GROUP BY two qualified columns that share a base name (i.id / c.id → `id`).
+-- Standard SQL allows this; it must group correctly rather than crash at plan
+-- time on a duplicate scope symbol.
+-- ---------------------------------------------------------------------------
+create table items (id integer primary key, name text, category_id integer);
+create table categories (id integer primary key, name text, type_id integer);
+create table log_entry_items (entry_id integer primary key, item_id integer);
+insert into items values (1, 'Widget', 100), (2, 'Gadget', 100), (3, 'Gizmo', 200);
+insert into categories values (100, 'Tools', 7), (200, 'Toys', 7);
+insert into log_entry_items values (10, 1), (11, 1), (12, 2);
+
+-- The exact reproduction from the ticket: two qualified same-base-name keys
+-- (`i.id`/`c.id`, `i.name`/`c.name`) group correctly; qualified SELECT columns
+-- resolve to their respective group keys. `usageCount` is 0 for the item with
+-- no log entries (count of a nullable left-join column).
+select i.id, i.name, c.id as categoryId, c.name as categoryName, count(lei.entry_id) as usageCount
+from items i
+join categories c on c.id = i.category_id
+left join log_entry_items lei on lei.item_id = i.id
+where c.type_id = ?
+group by i.id, i.name, c.id, c.name
+order by i.id;
+-- params: [7]
+→ [{"id":1,"name":"Widget","categoryId":100,"categoryName":"Tools","usageCount":2},{"id":2,"name":"Gadget","categoryId":100,"categoryName":"Tools","usageCount":1},{"id":3,"name":"Gizmo","categoryId":200,"categoryName":"Toys","usageCount":0}]
+
+-- Qualified reference in ORDER BY resolves to the group key (bare `id` would be
+-- ambiguous, but the qualifier disambiguates).
+select i.id as itemId, c.id as catId, count(*) as n
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+order by c.id, i.id;
+→ [{"itemId":1,"catId":100,"n":1},{"itemId":2,"catId":100,"n":1},{"itemId":3,"catId":200,"n":1}]
+
+-- Qualified reference in HAVING resolves to the group key.
+select i.id as itemId, c.id as catId
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+having i.id >= 2
+order by i.id;
+→ [{"itemId":2,"catId":100},{"itemId":3,"catId":200}]
+
+-- Two same-base-name columns projected unqualified-but-aliased → distinct output
+-- columns, no crash.
+select i.id as a, c.id as b, count(*) as n
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+order by i.id;
+→ [{"a":1,"b":100,"n":1},{"a":2,"b":100,"n":1},{"a":3,"b":200,"n":1}]
+
+-- Degenerate duplicate key `group by i.id, i.id` (same column twice) must not
+-- crash; the qualified key still resolves.
+select i.id as itemId, count(*) as n
+from items i
+group by i.id, i.id
+order by i.id;
+→ [{"itemId":1,"n":1},{"itemId":2,"n":1},{"itemId":3,"n":1}]
+
+-- Negative: a genuinely ambiguous *bare* reference (HAVING `id` with two `id`
+-- group keys) raises the clear ambiguity error rather than crashing or silently
+-- binding to one source column.
+select i.id as itemId, c.id as catId
+from items i join categories c on c.id = i.category_id
+group by i.id, c.id
+having id >= 0;
+-- error: ambiguous column name: id
+
+-- Regression: single-table `group by c.id, c.name` (distinct base names) still
+-- works and resolves qualified references.
+select c.id, c.name, count(*) as n
+from categories c
+group by c.id, c.name
+order by c.id;
+→ [{"id":100,"name":"Tools","n":1},{"id":200,"name":"Toys","n":1}]
+
+drop table items;
+drop table categories;
+drop table log_entry_items;

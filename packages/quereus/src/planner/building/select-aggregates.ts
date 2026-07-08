@@ -300,19 +300,86 @@ function createAggregateOutputScope(
 	const aggregateOutputScope = new RegisteredScope(parentScope);
 	const aggregateAttributes = aggregateNode.getAttributes();
 
-	// Register GROUP BY columns
+	// Mirror the source-side (FROM/JOIN) naming semantics: a qualified reference
+	// (`i.id`) resolves through its qualifier, while a bare name (`id`) shared by
+	// two distinct outputs is ambiguous. Standard SQL allows `GROUP BY i.id, c.id`
+	// even though both keys share the base name `id`; without this the flat
+	// bare-name registration below would throw on the second `id`.
+	//
+	// "Distinct" is by column identity, so a degenerate `GROUP BY i.id, i.id`
+	// (same column twice) is tolerated — its bare name resolves rather than turning
+	// ambiguous, and the qualified key is registered only once.
+	const bareNameOwners = new Map<string, Set<string>>();
+	const noteBareOwner = (bareKey: string, identity: string) => {
+		let owners = bareNameOwners.get(bareKey);
+		if (!owners) {
+			owners = new Set<string>();
+			bareNameOwners.set(bareKey, owners);
+		}
+		owners.add(identity);
+	};
+
+	// Identity of a GROUP BY column key: qualifier-qualified base name when a
+	// qualifier is present, else the bare name; non-column keys use their unique
+	// `group_N` attribute name. Aggregate keys are each their own identity.
+	const groupIdentity = (expr: ScalarPlanNode, bareKey: string): string => {
+		if (expr instanceof ColumnReferenceNode && expr.expression.table) {
+			return `${expr.expression.table.toLowerCase()}.${bareKey}`;
+		}
+		return bareKey;
+	};
+
 	groupByExpressions.forEach((expr, index) => {
-		const attr = aggregateAttributes[index];
-		aggregateOutputScope.registerSymbol(attr.name.toLowerCase(), (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, expr.getType(), attr.id, index));
+		const bareKey = aggregateAttributes[index].name.toLowerCase();
+		noteBareOwner(bareKey, groupIdentity(expr, bareKey));
+	});
+	aggregates.forEach((agg, index) => {
+		noteBareOwner(agg.alias.toLowerCase(), `agg#${index}`);
 	});
 
-	// Register aggregate columns by their aliases
+	const isBareAmbiguous = (bareKey: string): boolean =>
+		(bareNameOwners.get(bareKey)?.size ?? 0) > 1;
+
+	// Register GROUP BY columns. Always register the qualified key (deduped) so
+	// `i.id` and `c.id` resolve to their respective group keys; register the bare
+	// key only when unique, otherwise mark it ambiguous.
+	const registeredQualifiedKeys = new Set<string>();
+	const registeredBareKeys = new Set<string>();
+	groupByExpressions.forEach((expr, index) => {
+		const attr = aggregateAttributes[index];
+		const bareKey = attr.name.toLowerCase();
+		const makeRef = (exp: AST.Expression, s: Scope) =>
+			new ColumnReferenceNode(s, exp as AST.ColumnExpr, expr.getType(), attr.id, index);
+
+		if (expr instanceof ColumnReferenceNode && expr.expression.table) {
+			const qualifiedKey = `${expr.expression.table.toLowerCase()}.${bareKey}`;
+			if (!registeredQualifiedKeys.has(qualifiedKey)) {
+				registeredQualifiedKeys.add(qualifiedKey);
+				aggregateOutputScope.registerSymbol(qualifiedKey, makeRef);
+			}
+		}
+
+		if (isBareAmbiguous(bareKey)) {
+			aggregateOutputScope.markAmbiguous(bareKey);
+		} else if (!registeredBareKeys.has(bareKey)) {
+			registeredBareKeys.add(bareKey);
+			aggregateOutputScope.registerSymbol(bareKey, makeRef);
+		}
+	});
+
+	// Register aggregate columns by their aliases. An alias colliding with a
+	// group-key base name (or another alias) is ambiguous as a bare reference.
 	aggregates.forEach((agg, index) => {
 		const columnIndex = groupByExpressions.length + index;
 		const attr = aggregateAttributes[columnIndex];
-		aggregateOutputScope.registerSymbol(agg.alias.toLowerCase(), (exp, s) =>
-			new ColumnReferenceNode(s, exp as AST.ColumnExpr, agg.expression.getType(), attr.id, columnIndex));
+		const aliasKey = agg.alias.toLowerCase();
+		if (isBareAmbiguous(aliasKey)) {
+			aggregateOutputScope.markAmbiguous(aliasKey);
+		} else if (!registeredBareKeys.has(aliasKey)) {
+			registeredBareKeys.add(aliasKey);
+			aggregateOutputScope.registerSymbol(aliasKey, (exp, s) =>
+				new ColumnReferenceNode(s, exp as AST.ColumnExpr, agg.expression.getType(), attr.id, columnIndex));
+		}
 	});
 
 	// Note: the aggregate node advertises exactly its GROUP BY + aggregate columns.
@@ -344,6 +411,13 @@ function buildHavingFilter(
 	// Copy all symbols from aggregate output scope
 	for (const [symbolKey, callback] of aggregateOutputScope.getSymbols()) {
 		hybridScope.registerSymbol(symbolKey, callback);
+	}
+
+	// Carry over bare-name ambiguity (e.g. `id` shared by `i.id`/`c.id` group keys)
+	// so a bare HAVING reference stays ambiguous rather than binding to the source
+	// column registered as a fallback below.
+	for (const ambiguousKey of aggregateOutputScope.getAmbiguousSymbols()) {
+		hybridScope.markAmbiguous(ambiguousKey);
 	}
 
 	// For any source columns not already registered, register them with
