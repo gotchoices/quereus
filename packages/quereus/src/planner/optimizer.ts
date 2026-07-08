@@ -98,12 +98,6 @@ export class Optimizer {
 		this.tuning = tuning;
 	}
 
-	private static globalRulesRegistered = false;
-
-	/**
-	 * Legacy method removed; keep empty to avoid duplicate registrations
-	 */
-
 	/**
 	 * Register rules with their appropriate passes
 	 */

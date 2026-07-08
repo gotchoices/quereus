@@ -37,9 +37,9 @@ export type RulePhase = 'rewrite' | 'impl';
  *   side effects through run-once memoization (e.g. mutating-subquery-cache).
  *
  * This field is intentionally not optional: every future rule author has to
- * actively pick one. The registry validates the choice at registration time
- * and rejects rules that fail to declare. See `docs/optimizer.md` § Audit
- * discipline.
+ * actively pick one. `PassManager.addRuleToPass` validates the choice via
+ * `validateSideEffectMode` at registration time and rejects rules that fail to
+ * declare. See `docs/optimizer.md` § Audit discipline.
  */
 export type SideEffectMode = 'safe' | 'aware';
 
