@@ -65,8 +65,7 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			: (srcRows ?? est);
 
 		const sourceAttrs = this.source.getAttributes();
-		const attrIdToIndex = new Map<number, number>();
-		sourceAttrs.forEach((a, i) => attrIdToIndex.set(a.id, i));
+		const attrIdToIndex = this.source.getAttributeIndex();
 		const { fds: predFds, equivPairs, constantBindings: predBindings } = extractEqualityFds(this.predicate, attrIdToIndex);
 
 		// Merge ECs and bindings up front so guard activation can consult the
@@ -128,6 +127,16 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		// Attempt logical covered-key detection: if equality conjuncts cover a
 		// unique key on the source table, the Filter emits at-most-one row. Encode
 		// that as the singleton FD `∅ → all_cols`.
+		// NOTE: this re-runs on every re-mint even when `this.predicate` is the
+		// same object (the common `withChildren` source-only-remint case). A
+		// predicate-keyed cache was considered (ticket 3-planner-plan-time-mechanical)
+		// but `tableInfo.relationKey` embeds the source's per-instance node id, so it
+		// never agrees across two distinct source instances — and the covered-key
+		// result also depends on `tableInfo.fds`/`equivClasses`, which are
+		// physical-strategy-dependent and not cheaply hashable, so a signature broad
+		// enough to be sound would need to fingerprint those too. If this shows up
+		// hot in profiling, revisit with a cache keyed on `this.predicate` (WeakMap)
+		// plus a signature over `tableInfo.uniqueKeys`/`fds`/`equivClasses`.
 		const tableInfo = createTableInfoFromNode(this.source);
 		if (tableInfo.uniqueKeys && tableInfo.uniqueKeys.length > 0) {
 			const result = extractConstraints(this.predicate, [tableInfo]);

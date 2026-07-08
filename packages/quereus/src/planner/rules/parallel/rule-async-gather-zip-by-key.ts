@@ -575,11 +575,11 @@ function branchesKeyUnique(
 	branchKeyAttrs: readonly (readonly number[])[],
 ): boolean {
 	for (let b = 0; b < branches.length; b++) {
-		const attrs = branches[b].getAttributes();
+		const attrIndex = branches[b].getAttributeIndex();
 		const keyIndices = new Set<number>();
 		for (const id of branchKeyAttrs[b]) {
-			const ix = attrs.findIndex((a: Attribute) => a.id === id);
-			if (ix < 0) return false;
+			const ix = attrIndex.get(id);
+			if (ix === undefined) return false;
 			keyIndices.add(ix);
 		}
 		const declaredKeys = branches[b].getType().keys;
