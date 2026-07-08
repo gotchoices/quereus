@@ -203,6 +203,11 @@ class MockSyncManager implements SyncManager {
 // Helper to create a connected client
 // ============================================================================
 
+// Clients created via createClient(); disconnected in afterEach so leaked
+// reconnect timers (autoReconnect: true keeps firing connect() on a timer)
+// don't pollute later tests' assertions.
+const activeClients: SyncClient[] = [];
+
 function createClient(opts?: {
   syncManager?: MockSyncManager;
   syncEvents?: SyncEventEmitterImpl;
@@ -228,6 +233,8 @@ function createClient(opts?: {
     onSyncEvent: (e) => syncEventsLog.push(e),
     onError: (e) => errors.push(e),
   });
+
+  activeClients.push(client);
 
   return { client, syncManager, syncEvents, statusChanges, syncEventsLog, errors };
 }
@@ -267,11 +274,18 @@ async function connectAndHandshake(
 
 describe('SyncClient', () => {
   beforeEach(() => {
+    activeClients.length = 0;
     MockWebSocket.reset();
     installMockWebSocket();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Disconnect any client the test created to stop its reconnect/debounce
+    // timers before the next test runs.
+    for (const c of activeClients) {
+      await c.disconnect();
+    }
+    activeClients.length = 0;
     uninstallMockWebSocket();
   });
 
@@ -701,6 +715,116 @@ describe('SyncClient', () => {
 
       // A new WebSocket should have been created
       expect(MockWebSocket.instances.length).to.be.greaterThan(instanceCount);
+    });
+
+    it('should keep session and reconnect alive after a transient server error', async () => {
+      const { client } = createClient({ autoReconnect: true });
+      const ws = await connectAndHandshake(client);
+
+      // A per-request (transient) error — no `fatal` flag, code not in the
+      // fatal fallback set.
+      ws.simulateMessage({ type: 'error', code: 'APPLY_CHANGES_ERROR', message: 'one apply failed' });
+      await new Promise(r => setTimeout(r, 10));
+
+      // Session survives: not flagged for shutdown, socket still open.
+      expect((client as any).intentionalDisconnect).to.be.false;
+      expect((client as any).stopReconnect).to.be.false;
+      expect(client.isConnected).to.be.true;
+
+      // And a subsequent drop still triggers a reconnect.
+      const instanceCount = MockWebSocket.instances.length;
+      ws.simulateClose();
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.be.greaterThan(instanceCount);
+    });
+
+    it('should stop reconnect after a fatal server error', async () => {
+      const { client } = createClient({ autoReconnect: true });
+      const ws = await connectAndHandshake(client);
+
+      ws.simulateMessage({ type: 'error', code: 'AUTH_FAILED', message: 'bad token', fatal: true });
+      await new Promise(r => setTimeout(r, 10));
+
+      expect((client as any).stopReconnect).to.be.true;
+      // Fatal server error must NOT be conflated with a manual disconnect.
+      expect((client as any).intentionalDisconnect).to.be.false;
+      expect(client.status.status).to.equal('error');
+
+      // No reconnect should be scheduled even after the socket closes.
+      const instanceCount = MockWebSocket.instances.length;
+      ws.simulateClose();
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.equal(instanceCount);
+    });
+
+    it('should treat known fatal codes as fatal even without the fatal flag (legacy server)', async () => {
+      const { client } = createClient({ autoReconnect: true });
+      const ws = await connectAndHandshake(client);
+
+      // Legacy coordinator: fatal code, but no `fatal` field on the message.
+      ws.simulateMessage({ type: 'error', code: 'AUTH_FAILED', message: 'bad token' });
+      await new Promise(r => setTimeout(r, 10));
+
+      expect((client as any).stopReconnect).to.be.true;
+
+      const instanceCount = MockWebSocket.instances.length;
+      ws.simulateClose();
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.equal(instanceCount);
+    });
+
+    it('should not schedule a reconnect from a stale socket after connect() replaced it', async () => {
+      const { client } = createClient({ autoReconnect: true });
+      const ws1 = await connectAndHandshake(client);
+
+      // Replace the socket with a fresh connect(); this detaches ws1's handlers.
+      const p2 = client.connect('ws://localhost:8080/sync', 'test-db');
+      const ws2 = MockWebSocket.lastInstance!;
+      ws2.simulateOpen();
+      simulateHandshakeAck(ws2);
+      await p2;
+
+      const instanceCount = MockWebSocket.instances.length;
+      // Fire the dead socket's onclose — it must be detached and a no-op.
+      ws1.simulateClose();
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.equal(instanceCount);
+    });
+  });
+
+  // ==========================================================================
+  // send() failure handling
+  // ==========================================================================
+
+  describe('send failure', () => {
+    it('should not advance pendingSentHLC when the send throws', async () => {
+      const syncEvents = new SyncEventEmitterImpl();
+      const syncManager = new MockSyncManager();
+      const { client, syncEventsLog } = createClient({ syncManager, syncEvents });
+      const ws = await connectAndHandshake(client);
+
+      // Queue a local change to push.
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 1, siteId: syncManager.getSiteId(), opSeq: 0 };
+      syncManager.getChangesSinceResult = [{
+        siteId: syncManager.getSiteId(),
+        transactionId: 'tx-local',
+        hlc,
+        changes: [{ type: 'column', schema: 'main', table: 'items', pk: [1], column: 'name', value: 'X', hlc }],
+        schemaMigrations: [],
+      }];
+
+      // Make the underlying socket send throw.
+      ws.send = () => { throw new Error('socket write failed'); };
+      syncEventsLog.length = 0;
+
+      // Trigger the debounced push.
+      (syncEvents as any).localChangeListeners.forEach((fn: any) => fn({ table: 'items' }));
+      await new Promise(r => setTimeout(r, 50));
+
+      // Failed send must not advance the delta-sync watermark.
+      expect((client as any).pendingSentHLC).to.be.null;
+      // And the failure is surfaced, not swallowed.
+      expect(syncEventsLog.some(e => e.type === 'error' && e.message.includes('Failed to send'))).to.be.true;
     });
   });
 

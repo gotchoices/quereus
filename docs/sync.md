@@ -972,6 +972,29 @@ When the WebSocket connection drops unexpectedly:
 3. Manual `disconnectSync()` sets `intentionalDisconnect = true` to prevent auto-reconnect
 4. Reconnect attempts use the same URL and token from the original connection
 
+#### Server Errors: Fatal vs Transient
+
+A server `error` message does **not** by itself stop the client. Reconnect is
+gated by two independent flags: `intentionalDisconnect` (set **only** when the
+client calls `disconnect()`) and `stopReconnect` (set only by a fatal server
+error). The coordinator tags each `error` message with a `fatal` boolean:
+
+- **Fatal** (`fatal: true`) — the session is unrecoverable and the coordinator
+  typically also closes the socket: `AUTH_FAILED`, `MISSING_DATABASE_ID`,
+  `ALREADY_AUTHENTICATED`. The client sets `status: 'error'`, settles any pending
+  `connect()`, and sets `stopReconnect` so auto-reconnect halts (a bare retry
+  would just fail again).
+- **Transient** (`fatal` absent or false) — one request failed but the session
+  is fine: `APPLY_CHANGES_ERROR`, `GET_CHANGES_ERROR`, `SNAPSHOT_ERROR`,
+  `NOT_AUTHENTICATED`, `UNKNOWN_MESSAGE`, `MESSAGE_ERROR`. The client surfaces the
+  error (`error` sync event + `onError`) but keeps the connection **and its
+  auto-reconnect** intact, and does not enter a lasting `error` status. A single
+  transient per-request error never disables auto-reconnect.
+
+For coordinators predating the `fatal` flag, the client falls back to a small
+built-in set of known-fatal codes (the three fatal codes above); every other
+code is treated as transient.
+
 #### Local Change Debouncing
 
 Rapid local changes are batched to reduce network overhead:

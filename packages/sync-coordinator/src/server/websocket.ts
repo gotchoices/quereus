@@ -84,8 +84,11 @@ export function registerWebSocket(
     let session: ClientSession | null = null;
     let socketClosed = false;
 
-    const sendError = (code: string, message: string) => {
-      socket.send(JSON.stringify({ type: 'error', code, message }));
+    // `fatal` tells the client whether to stop auto-reconnecting. Fatal errors
+    // are ones where the session is unrecoverable and we typically also close
+    // the socket; transient per-request errors leave the session intact.
+    const sendError = (code: string, message: string, fatal = false) => {
+      socket.send(JSON.stringify({ type: 'error', code, message, fatal }));
     };
 
     const sendMessage = (msg: object) => {
@@ -141,12 +144,12 @@ export function registerWebSocket(
     // Handler functions
     async function handleHandshake(msg: HandshakeMessage) {
       if (session) {
-        sendError('ALREADY_AUTHENTICATED', 'Already authenticated');
+        sendError('ALREADY_AUTHENTICATED', 'Already authenticated', true);
         return;
       }
 
       if (!msg.databaseId) {
-        sendError('MISSING_DATABASE_ID', 'databaseId is required');
+        sendError('MISSING_DATABASE_ID', 'databaseId is required', true);
         socket.close(4002, 'Missing databaseId');
         return;
       }
@@ -190,7 +193,7 @@ export function registerWebSocket(
           session = null;
         }
         const errMsg = err instanceof Error ? err.message : 'Authentication failed';
-        sendError('AUTH_FAILED', errMsg);
+        sendError('AUTH_FAILED', errMsg, true);
         socket.close(4001, 'Authentication failed');
       }
     }

@@ -99,10 +99,11 @@ describe('WebSocket Handler', () => {
         const response = await sendAndReceive(ws, {
           type: 'handshake',
           siteId: TEST_SITE_ID_1,
-        }) as { type: string; code: string };
+        }) as { type: string; code: string; fatal: boolean };
 
         expect(response.type).to.equal('error');
         expect(response.code).to.equal('MISSING_DATABASE_ID');
+        expect(response.fatal).to.be.true;
       } finally {
         ws.close();
       }
@@ -114,10 +115,11 @@ describe('WebSocket Handler', () => {
         const response = await sendAndReceive(ws, {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
-        }) as { type: string; code: string };
+        }) as { type: string; code: string; fatal: boolean };
 
         expect(response.type).to.equal('error');
         expect(response.code).to.equal('AUTH_FAILED');
+        expect(response.fatal).to.be.true;
       } finally {
         ws.close();
       }
@@ -198,10 +200,11 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
-        }) as { type: string; code: string };
+        }) as { type: string; code: string; fatal: boolean };
 
         expect(response.type).to.equal('error');
         expect(response.code).to.equal('ALREADY_AUTHENTICATED');
+        expect(response.fatal).to.be.true;
       } finally {
         ws.close();
       }
@@ -221,10 +224,12 @@ describe('WebSocket Handler', () => {
 
         const response = await sendAndReceive(ws, {
           type: 'totally_unknown',
-        }) as { type: string; code: string };
+        }) as { type: string; code: string; fatal: boolean };
 
         expect(response.type).to.equal('error');
         expect(response.code).to.equal('UNKNOWN_MESSAGE');
+        // Transient: one bad message shouldn't kill the client's reconnect.
+        expect(response.fatal).to.be.false;
       } finally {
         ws.close();
       }

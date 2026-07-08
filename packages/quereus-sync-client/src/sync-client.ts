@@ -66,7 +66,25 @@ export class SyncClient {
   // Reconnection state
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // True only when the client itself called disconnect(). Never set by a
+  // server error — see stopReconnect for server-driven shutdown.
   private intentionalDisconnect = false;
+  // True when the server told us to stop reconnecting (a fatal error). Kept
+  // separate from intentionalDisconnect so a transient server error can never
+  // masquerade as a deliberate client disconnect.
+  private stopReconnect = false;
+
+  /**
+   * Server error codes that are fatal even when the server does not send the
+   * `fatal` flag (coordinators predating it). These correspond to sendError
+   * calls where the coordinator also closes the socket or leaves the session
+   * unrecoverable, so reconnecting as-is cannot succeed.
+   */
+  private static readonly FATAL_ERROR_CODES: ReadonlySet<string> = new Set([
+    'AUTH_FAILED',
+    'MISSING_DATABASE_ID',
+    'ALREADY_AUTHENTICATED',
+  ]);
 
   // Delta sync tracking
   private lastSentHLC: HLC | null = null;
@@ -126,6 +144,7 @@ export class SyncClient {
     this.connectionDatabaseId = databaseId;
     this.connectionToken = token;
     this.intentionalDisconnect = false;
+    this.stopReconnect = false;
 
     // Clear any pending reconnect timer
     this.clearReconnectTimer();
@@ -133,8 +152,11 @@ export class SyncClient {
     // Abandon any prior unsettled connect promise
     this.settleConnect(new Error('Superseded by new connect() call'));
 
-    // Close existing connection
+    // Close existing connection. Detach its handlers first so a late event
+    // from the dead socket (e.g. its deferred onclose) can't drive this client
+    // — only the live socket should.
     if (this.ws) {
+      this.detachSocketHandlers(this.ws);
       this.ws.close();
       this.ws = null;
     }
@@ -223,8 +245,10 @@ export class SyncClient {
       this.localChangeUnsubscribe = null;
     }
 
-    // Close WebSocket
+    // Close WebSocket. Detach handlers first so its deferred onclose can't
+    // fire back into the client after we've torn down.
     if (this.ws) {
+      this.detachSocketHandlers(this.ws);
       this.ws.close();
       this.ws = null;
     }
@@ -258,13 +282,7 @@ export class SyncClient {
         break;
 
       case 'error':
-        this.emitSyncEvent('error', `Server error: ${message.message} (${message.code})`);
-        this.options.onError?.(new Error(message.message));
-        // Server explicitly rejected — stop auto-reconnect to avoid tight loops.
-        // The caller's retry mechanism (with its own backoff) will handle retrying.
-        this.intentionalDisconnect = true;
-        this.setStatus({ status: 'error', message: message.message });
-        this.settleConnect(new Error(message.message));
+        this.handleServerError(message);
         break;
 
       case 'pong':
@@ -283,6 +301,37 @@ export class SyncClient {
           console.warn('Unknown sync message type:', message.type);
         }
     }
+  }
+
+  /**
+   * Handle a server `error` message.
+   *
+   * Default behavior keeps the session alive: a per-request (transient) error
+   * is surfaced but does not stop the connection or its auto-reconnect. Only a
+   * fatal error (server rejected the session and typically closed the socket)
+   * flips `stopReconnect` and puts the client into a lasting `error` status.
+   */
+  private handleServerError(message: { code: string; message: string; fatal?: boolean }): void {
+    // Always surface the error to listeners.
+    this.emitSyncEvent('error', `Server error: ${message.message} (${message.code})`);
+    this.options.onError?.(new Error(message.message));
+
+    // Trust the server's `fatal` flag when present; fall back to the known
+    // fatal-code set for coordinators that predate it.
+    const fatal = message.fatal ?? SyncClient.FATAL_ERROR_CODES.has(message.code);
+
+    if (fatal) {
+      // Unrecoverable — a bare reconnect would just fail again. Stop reconnect
+      // and settle any pending connect(). Note: NOT intentionalDisconnect,
+      // which means only "the client called disconnect()".
+      this.stopReconnect = true;
+      this.setStatus({ status: 'error', message: message.message });
+      this.settleConnect(new Error(message.message));
+    }
+    // Transient: keep the connection and auto-reconnect intact. Deliberately do
+    // not set a lingering 'error' status — a per-request failure shouldn't
+    // masquerade as connection death (onclose keys its disconnected transition
+    // off status === 'error').
   }
 
   private async handleHandshakeAck(message: { serverSiteId?: string; connectionId?: string }): Promise<void> {
@@ -396,10 +445,38 @@ export class SyncClient {
     }
   }
 
-  private send(message: ClientMessage): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
+  /**
+   * Send a message to the server.
+   *
+   * @returns true if the bytes were handed to the socket, false if the send was
+   *          dropped (socket not open) or threw. Callers that advance state on a
+   *          send (e.g. the delta-sync watermark) must check this — a dropped
+   *          send is not success.
+   */
+  private send(message: ClientMessage): boolean {
+    if (this.ws?.readyState !== WebSocket.OPEN) {
+      // NOTE: warns on every send attempted while the socket is down; if reconnect
+      // windows ever get chatty, downgrade this to debug or rate-limit per type.
+      console.warn(`Sync send skipped, socket not open: ${message.type}`);
+      return false;
     }
+    try {
+      this.ws.send(JSON.stringify(message));
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'unknown error';
+      console.error(`Sync send failed for ${message.type}:`, err);
+      this.emitSyncEvent('error', `Failed to send ${message.type}: ${msg}`);
+      return false;
+    }
+  }
+
+  /** Detach a socket's event handlers so it can no longer drive this client. */
+  private detachSocketHandlers(ws: WebSocket): void {
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
   }
 
 
@@ -443,9 +520,6 @@ export class SyncClient {
 
     if (changes.length === 0) return;
 
-    // Track the max HLC we're sending for delta sync
-    this.pendingSentHLC = maxHLC(changes.map(cs => cs.hlc)) ?? null;
-
     // Serialize and send
     const serialized = changes.map(cs => serializeChangeSet(cs));
 
@@ -453,11 +527,18 @@ export class SyncClient {
       changeCount: changes.length,
     });
 
-    this.send({
+    const sent = this.send({
       type: 'apply_changes',
       changes: serialized,
     });
 
+    // Only advance the delta-sync watermark / clear pending state if the bytes
+    // actually left. A dropped send must be retried on the next push, so leave
+    // lastSentHLC (via pendingSentHLC) and the pending count untouched.
+    if (!sent) return;
+
+    // Track the max HLC we're sending for delta sync
+    this.pendingSentHLC = maxHLC(changes.map(cs => cs.hlc)) ?? null;
     this.pendingLocalChangeCount = 0;
   }
 
@@ -466,7 +547,7 @@ export class SyncClient {
   // ==========================================================================
 
   private scheduleReconnect(): void {
-    if (this.intentionalDisconnect || !this.connectionUrl || !this.options.autoReconnect) {
+    if (this.intentionalDisconnect || this.stopReconnect || !this.connectionUrl || !this.options.autoReconnect) {
       return;
     }
 

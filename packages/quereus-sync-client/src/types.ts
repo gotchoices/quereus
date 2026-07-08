@@ -197,6 +197,13 @@ export interface ErrorMessage {
   type: 'error';
   code: string;
   message: string;
+  /**
+   * When true, the error is fatal: the server rejected the session
+   * unrecoverably (and typically closed the socket), so the client stops
+   * auto-reconnecting. Absent or false means a transient per-request error —
+   * the session and its auto-reconnect stay intact.
+   */
+  fatal?: boolean;
 }
 
 /** Server → Client: Heartbeat response */
