@@ -8,7 +8,7 @@
 import type { KVStore } from '@quereus/store';
 import { type HLC, serializeHLC, deserializeHLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
-import { buildPeerStateKey } from './keys.js';
+import { buildPeerStateKey, buildPeerSentStateKey } from './keys.js';
 import { SYNC_KEY_PREFIX } from './keys.js';
 
 /**
@@ -73,6 +73,32 @@ export class PeerStateStore {
   }
 
   /**
+   * Get the sent watermark for a peer — the highest HLC we have pushed to it
+   * and had acknowledged. Distinct from {@link getPeerState}, which tracks the
+   * received watermark; the two are keyed separately (`pt:` vs `ps:`).
+   */
+  async getPeerSentState(peerSiteId: SiteId): Promise<HLC | undefined> {
+    const key = buildPeerSentStateKey(peerSiteId);
+    const data = await this.kv.get(key);
+    if (!data) return undefined;
+    return deserializePeerState(data).lastSyncHLC;
+  }
+
+  /**
+   * Update the sent watermark for a peer. Reuses the {@link PeerState} byte
+   * layout (HLC + timestamp); the caller is responsible for only advancing it
+   * forward.
+   */
+  async setPeerSentState(peerSiteId: SiteId, hlc: HLC): Promise<void> {
+    const key = buildPeerSentStateKey(peerSiteId);
+    const state: PeerState = {
+      lastSyncHLC: hlc,
+      lastSyncTime: Date.now(),
+    };
+    await this.kv.put(key, serializePeerState(state));
+  }
+
+  /**
    * Get all known peers.
    */
   async *getAllPeers(): AsyncIterable<{ siteId: SiteId; state: PeerState }> {
@@ -100,6 +126,10 @@ export class PeerStateStore {
   async deletePeerState(peerSiteId: SiteId): Promise<void> {
     const key = buildPeerStateKey(peerSiteId);
     await this.kv.delete(key);
+    // NOTE: deletes only the received watermark (ps:). The sent watermark (pt:)
+    // is left behind; if peer removal ever needs to be complete (GC of stale
+    // peers), also delete buildPeerSentStateKey(peerSiteId) here. No caller
+    // exercises full peer removal today, so the orphaned pt: entry is inert.
   }
 }
 

@@ -115,8 +115,10 @@ class MockSyncManager implements SyncManager {
   getChangesSinceResult: ChangeSet[] = [];
   applyChangesResult: ApplyResult = { applied: 0, skipped: 0, conflicts: 0, transactions: 0 };
   peerSyncState: HLC | undefined = undefined;
+  peerSentState: HLC | undefined = undefined;
   applyChangesCalls: ChangeSet[][] = [];
   updatePeerSyncStateCalls: { peerSiteId: SiteId; hlc: HLC }[] = [];
+  updatePeerSentStateCalls: { peerSiteId: SiteId; hlc: HLC }[] = [];
   getChangesSinceCalls: { peerSiteId: SiteId; sinceHLC?: HLC }[] = [];
 
   getSiteId(): SiteId {
@@ -153,6 +155,15 @@ class MockSyncManager implements SyncManager {
 
   async getPeerSyncState(_peerSiteId: SiteId): Promise<HLC | undefined> {
     return this.peerSyncState;
+  }
+
+  async updatePeerSentState(peerSiteId: SiteId, hlc: HLC): Promise<void> {
+    this.updatePeerSentStateCalls.push({ peerSiteId, hlc });
+    this.peerSentState = hlc;
+  }
+
+  async getPeerSentState(_peerSiteId: SiteId): Promise<HLC | undefined> {
+    return this.peerSentState;
   }
 
   async *getSnapshotStream(_chunkSize?: number): AsyncIterable<SnapshotChunk> {}
@@ -954,6 +965,105 @@ describe('SyncClient', () => {
       await new Promise(r => setTimeout(r, 5));
       expect((client as any).lastSentHLC).to.be.null;
       expect((client as any).pendingSentHLCs.size).to.equal(0);
+    });
+  });
+
+  // ==========================================================================
+  // Sent watermark persistence (restart resume)
+  // ==========================================================================
+
+  describe('sent watermark persistence', () => {
+    /** A one-column ChangeSet stamped with the given HLC. */
+    function changeSet(site: SiteId, txId: string, hlc: HLC): ChangeSet {
+      return {
+        siteId: site,
+        transactionId: txId,
+        hlc,
+        changes: [{ type: 'column', schema: 'main', table: 'items', pk: [1], column: 'n', value: txId, hlc }],
+        schemaMigrations: [],
+      };
+    }
+
+    it('seeds lastSentHLC from the persisted watermark on handshake, so a restart does not replay history', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      // Simulate a fresh process whose store already holds a confirmed watermark.
+      const persisted: HLC = { wallTime: 7000n, counter: 3, siteId: site, opSeq: 0 };
+      syncManager.peerSentState = persisted;
+
+      const { client } = createClient({ syncManager });
+      await connectAndHandshake(client);
+
+      // The post-handshake delta push must query getChangesSince with the
+      // persisted watermark, NOT undefined (undefined re-sends everything).
+      const delta = syncManager.getChangesSinceCalls.find(c => c.sinceHLC !== undefined);
+      expect(delta, 'delta-push should query getChangesSince with a watermark').to.exist;
+      expect(delta!.sinceHLC).to.deep.equal(persisted);
+      expect((client as any).lastSentHLC).to.deep.equal(persisted);
+    });
+
+    it('persists the sent watermark on a confirmed ack, and only then', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      ws.sentMessages.length = 0;
+      syncManager.updatePeerSentStateCalls.length = 0;
+
+      const site = syncManager.getSiteId();
+      const hlc: HLC = { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 };
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc)];
+      await (client as any).pushLocalChanges();
+
+      const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId?: string };
+      // In-flight: nothing persisted until the matching ack lands.
+      expect(syncManager.updatePeerSentStateCalls.length).to.equal(0);
+
+      ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 5));
+
+      expect(syncManager.updatePeerSentStateCalls.length).to.equal(1);
+      expect(syncManager.updatePeerSentStateCalls[0].hlc).to.deep.equal(hlc);
+      expect(syncManager.peerSentState).to.deep.equal(hlc);
+    });
+
+    it('does not persist on an uncorrelated (stale/unknown) ack', async () => {
+      const syncManager = new MockSyncManager();
+      const { client: _client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(_client);
+      syncManager.updatePeerSentStateCalls.length = 0;
+
+      ws.simulateMessage({ type: 'apply_result', requestId: 'apply-999', applied: 0 });
+      await new Promise(r => setTimeout(r, 5));
+
+      expect(syncManager.updatePeerSentStateCalls.length).to.equal(0);
+    });
+
+    it('retains the persisted watermark across a manual disconnect (resume, not replay)', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+
+      const site = syncManager.getSiteId();
+      const hlc: HLC = { wallTime: 4000n, counter: 2, siteId: site, opSeq: 0 };
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx1', hlc)];
+      await (client as any).pushLocalChanges();
+      const push = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId?: string };
+      ws.simulateMessage({ type: 'apply_result', requestId: push.requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 5));
+      expect(syncManager.peerSentState).to.deep.equal(hlc);
+
+      await client.disconnect();
+      // In-memory watermark cleared…
+      expect((client as any).lastSentHLC).to.be.null;
+      // …but the durable per-peer watermark survives the disconnect.
+      expect(syncManager.peerSentState).to.deep.equal(hlc);
+
+      // Reconnect re-seeds from the durable watermark and resumes from there.
+      syncManager.getChangesSinceCalls.length = 0;
+      await connectAndHandshake(client);
+      expect((client as any).lastSentHLC).to.deep.equal(hlc);
+      const delta = syncManager.getChangesSinceCalls.find(c => c.sinceHLC !== undefined);
+      expect(delta!.sinceHLC).to.deep.equal(hlc);
     });
   });
 

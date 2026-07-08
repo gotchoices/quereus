@@ -1229,6 +1229,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		return state?.lastSyncHLC;
 	}
 
+	async updatePeerSentState(peerSiteId: SiteId, hlc: HLC): Promise<void> {
+		await this.peerStates.setPeerSentState(peerSiteId, hlc);
+	}
+
+	async getPeerSentState(peerSiteId: SiteId): Promise<HLC | undefined> {
+		return this.peerStates.getPeerSentState(peerSiteId);
+	}
+
 	async pruneTombstones(): Promise<number> {
 		const now = Date.now();
 		let count = 0;

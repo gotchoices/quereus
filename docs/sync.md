@@ -548,7 +548,8 @@ CRDT metadata is stored alongside data in the same KV store using distinct key p
 | `cv:{schema}.{table}:{pk}:{col}` | Column version | `{hlc, value}` |
 | `tb:{schema}.{table}:{pk}` | Tombstone | `{hlc, createdAt, priorRow?}` |
 | `tx:{txId}` | *Reserved — not persisted.* The transaction id is **derived** from the base HLC (see *Deterministic transaction id*), so no transaction record is written. The `tx:` prefix and `buildTransactionKey` remain reserved for a future durable txn log. | — |
-| `ps:{siteId}` | Peer sync state | `{lastSyncHlc}` |
+| `ps:{siteId}` | Peer sync state (received watermark) | `{lastSyncHlc}` |
+| `pt:{siteId}` | Peer sent state (sent watermark: highest HLC pushed to a peer and acked) | `{lastSyncHlc}` |
 | `sm:{schema}.{table}:{version}` | Schema migration | `{ddl, hlc}` |
 | `si:` | Site identity | `{siteId, createdAt}` |
 | `hc:` | HLC state | `{wallTime, counter}` |
@@ -939,9 +940,9 @@ watermark is a **`ChangeSet.hlc`** — a transaction commit boundary (the max ov
 batch-slice boundary — so advancing it can only ever land *between* whole
 transactions (§ Transaction-Based Change Grouping → Read side):
 
-1. **Receiving changes**: After applying server changes, client updates `peerSyncState[serverSiteId]` with the max `ChangeSet.hlc` received
-2. **Sending changes**: Client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values
-3. **Reconnection**: On reconnect, client sends `get_changes` with `sinceHLC` from peer sync state
+1. **Receiving changes**: After applying server changes, client updates `peerSyncState[serverSiteId]` (the *received* watermark) with the max `ChangeSet.hlc` received
+2. **Sending changes**: Client tracks `lastSentHLC` (confirmed) and `pendingSentHLC` (awaiting ack), both `ChangeSet.hlc` values. On each confirmed ack the client persists `lastSentHLC` durably per peer via `updatePeerSentState` (the *sent* watermark, `pt:` prefix — kept separate from the received `ps:` watermark)
+3. **Reconnection / restart**: On reconnect, client sends `get_changes` with `sinceHLC` from the received watermark, and re-seeds `lastSentHLC` from the persisted sent watermark (`getPeerSentState`) so a fresh process resumes delta-push from the last confirmed HLC instead of replaying its entire local history. A manual `disconnect()` clears only the in-memory copy; the persisted watermark is intentionally retained
 4. **Server tracking**: Server uses client's `sinceHLC` to return only new transactions — whole ChangeSets after that boundary, bounded by `batchSize` at transaction granularity
 
 ```
@@ -969,7 +970,8 @@ transactions (§ Transaction-Based Change Grouping → Read side):
 │  3. Client: apply_changes { requestId: apply-N, changes }                   │
 │  4. Client: pendingSentHLCs[requestId] = max ChangeSet.hlc of sent txns     │
 │  5. Server: apply_result { requestId, applied, ... }  (id echoed verbatim)  │
-│  6. Client: on matching requestId, lastSentHLC = that HLC (forward-only)    │
+│  6. Client: on matching requestId, lastSentHLC = that HLC (forward-only),   │
+│     persisted per peer (updatePeerSentState) for restart resume             │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1554,7 +1556,8 @@ const syncManager = new SyncManagerImpl(metadataKvStore, storeEvents, applyToSto
 - [x] Implement SyncManagerImpl (`sync/sync-manager-impl.ts`)
   - [x] `applyChanges()` - Apply with LWW conflict resolution
   - [x] `canDeltaSync()` - TTL check for delta vs snapshot
-  - [x] `updatePeerSyncState()` / `getPeerSyncState()` - Track peer sync progress
+  - [x] `updatePeerSyncState()` / `getPeerSyncState()` - Track peer sync progress (received watermark)
+  - [x] `updatePeerSentState()` / `getPeerSentState()` - Persist sent watermark for restart resume
 
 #### Phase 3: Event Integration ✅
 - [x] Subscribe to `StoreEventEmitter` for data change events

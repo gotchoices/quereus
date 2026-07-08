@@ -404,6 +404,47 @@ describe('SyncManager', () => {
     });
   });
 
+  describe('peerSentState', () => {
+    it('should store and retrieve the sent watermark', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peerSiteId = generateSiteId();
+      const hlc: HLC = { wallTime: BigInt(Date.now()), counter: 7, siteId: peerSiteId, opSeq: 0 };
+
+      await manager.updatePeerSentState(peerSiteId, hlc);
+      const retrieved = await manager.getPeerSentState(peerSiteId);
+
+      expect(retrieved).to.not.be.undefined;
+      expect(retrieved!.wallTime).to.equal(hlc.wallTime);
+      expect(retrieved!.counter).to.equal(hlc.counter);
+    });
+
+    it('should return undefined for unknown peer', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peerSiteId = generateSiteId();
+      const retrieved = await manager.getPeerSentState(peerSiteId);
+      expect(retrieved).to.be.undefined;
+    });
+
+    it('keys the sent watermark separately from the received watermark', async () => {
+      const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);
+      const peerSiteId = generateSiteId();
+      const sent: HLC = { wallTime: 5000n, counter: 1, siteId: peerSiteId, opSeq: 0 };
+      const received: HLC = { wallTime: 9000n, counter: 2, siteId: peerSiteId, opSeq: 0 };
+
+      // Writing one watermark must not disturb the other for the same peer.
+      await manager.updatePeerSentState(peerSiteId, sent);
+      await manager.updatePeerSyncState(peerSiteId, received);
+
+      const gotSent = await manager.getPeerSentState(peerSiteId);
+      const gotReceived = await manager.getPeerSyncState(peerSiteId);
+
+      expect(gotSent!.wallTime).to.equal(sent.wallTime);
+      expect(gotSent!.counter).to.equal(sent.counter);
+      expect(gotReceived!.wallTime).to.equal(received.wallTime);
+      expect(gotReceived!.counter).to.equal(received.counter);
+    });
+  });
+
   describe('getSnapshot', () => {
     it('should return snapshot with site ID and HLC', async () => {
       const manager = await SyncManagerImpl.create(kv, source, config, syncEvents);

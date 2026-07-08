@@ -98,6 +98,25 @@ export interface SyncManager {
   getPeerSyncState(peerSiteId: SiteId): Promise<HLC | undefined>;
 
   /**
+   * Update the sent watermark for a peer — the highest HLC we have pushed to it
+   * and had acknowledged. Persisted separately from {@link updatePeerSyncState}
+   * (the received watermark) so a client can resume delta-push after a restart
+   * instead of re-sending its entire local history.
+   *
+   * @param peerSiteId - The peer we pushed to
+   * @param hlc - The HLC we have confirmed sent up to
+   */
+  updatePeerSentState(peerSiteId: SiteId, hlc: HLC): Promise<void>;
+
+  /**
+   * Get the sent watermark for a peer.
+   *
+   * @param peerSiteId - The peer to check
+   * @returns The highest HLC we have confirmed pushed, or undefined if none
+   */
+  getPeerSentState(peerSiteId: SiteId): Promise<HLC | undefined>;
+
+  /**
    * Prune expired tombstones.
    *
    * Should be called periodically to clean up old tombstones.

@@ -150,6 +150,7 @@ export {
   buildTombstoneKey,
   buildTransactionKey,
   buildPeerStateKey,
+  buildPeerSentStateKey,
   buildSchemaMigrationKey,
   buildColumnVersionScanBounds,
   buildTableColumnVersionScanBounds,

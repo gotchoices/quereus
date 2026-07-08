@@ -88,10 +88,13 @@ export class SyncClient {
   ]);
 
   // Delta sync tracking. `lastSentHLC` is the high-water mark of local changes
-  // the server has acknowledged. Each in-flight push is tracked by its request
-  // id → the HLC that ack would promote `lastSentHLC` to; keying by request id
-  // correlates each `apply_result` to the exact batch that produced it, so a
-  // stale, duplicate, or out-of-order ack can't mis-advance the watermark.
+  // the server has acknowledged. It is durably persisted per peer on each
+  // confirmed ack (SyncManager.updatePeerSentState) and re-seeded on handshake,
+  // so a process restart resumes delta-push instead of replaying local history.
+  // Each in-flight push is tracked by its request id → the HLC that ack would
+  // promote `lastSentHLC` to; keying by request id correlates each
+  // `apply_result` to the exact batch that produced it, so a stale, duplicate,
+  // or out-of-order ack can't mis-advance the watermark.
   private lastSentHLC: HLC | null = null;
   // NOTE: bounded by in-flight pushes — every successful ack prunes itself plus
   // any batch its watermark subsumes (see promoteWatermark), and disconnect
@@ -269,6 +272,9 @@ export class SyncClient {
     }
 
     this.serverSiteId = null;
+    // Clear only the in-memory watermark. The persisted per-peer sent watermark
+    // (SyncManager.updatePeerSentState) is intentionally left intact so a later
+    // reconnect resumes delta-push instead of replaying local history.
     this.lastSentHLC = null;
     this.pendingSentHLCs.clear();
     this.setStatus({ status: 'disconnected' });
@@ -293,7 +299,7 @@ export class SyncClient {
         break;
 
       case 'apply_result':
-        this.handleApplyResult(message);
+        await this.handleApplyResult(message);
         break;
 
       case 'error':
@@ -365,6 +371,11 @@ export class SyncClient {
     // Request changes from server since our last sync with this peer
     await this.requestChangesFromServer();
 
+    // Seed the sent watermark from durable per-peer state so a fresh process
+    // (or a reconnect) resumes delta-push where it left off instead of
+    // replaying the entire local history to the server.
+    await this.seedSentWatermark();
+
     // In read-only (pull-only) mode, skip push entirely
     if (!this.options.readOnly) {
       // Subscribe to local changes for pushing to server
@@ -402,12 +413,12 @@ export class SyncClient {
     this.setStatus({ status: 'synced', lastSyncTime: Date.now() });
   }
 
-  private handleApplyResult(message: {
+  private async handleApplyResult(message: {
     requestId?: string;
     applied?: number;
     rejected?: Array<{ reason: string; code?: string }>;
-  }): void {
-    this.promoteWatermark(message.requestId);
+  }): Promise<void> {
+    await this.promoteWatermark(message.requestId);
 
     this.emitSyncEvent('info', `Server applied ${message.applied ?? 0} change(s)`);
 
@@ -429,7 +440,7 @@ export class SyncClient {
    *  - no `requestId` → an untracked push (a peer-relay `apply_changes`) or a
    *    legacy coordinator that doesn't echo the id; nothing to promote.
    */
-  private promoteWatermark(requestId: string | undefined): void {
+  private async promoteWatermark(requestId: string | undefined): Promise<void> {
     if (requestId === undefined) return;
 
     const promoted = this.pendingSentHLCs.get(requestId);
@@ -444,6 +455,13 @@ export class SyncClient {
     // must not undo a newer batch a prior ack already promoted.
     if (!this.lastSentHLC || compareHLC(promoted, this.lastSentHLC) > 0) {
       this.lastSentHLC = promoted;
+      // Persist the confirmed watermark per peer so a restart resumes delta-push
+      // from here instead of replaying local history. Only written on a real
+      // forward advance, and only for a correlated ack (so we persist a
+      // watermark we actually confirmed sent).
+      if (this.serverSiteId) {
+        await this.syncManager.updatePeerSentState(this.serverSiteId, this.lastSentHLC);
+      }
     }
 
     // Drop any still-pending batches the new watermark now subsumes (a later
@@ -496,6 +514,24 @@ export class SyncClient {
       this.send({ type: 'get_changes', sinceHLC: serializeHLCForTransport(lastSyncHLC) });
     } else {
       this.send({ type: 'get_changes' });
+    }
+  }
+
+  /**
+   * Seed `lastSentHLC` from the durable per-peer sent watermark. Called on every
+   * handshake so a fresh process resumes delta-push from the last confirmed HLC
+   * rather than re-sending its whole local history.
+   *
+   * Takes the persisted value only when it is ahead of the in-memory one, so an
+   * auto-reconnect that still holds an advanced in-memory watermark (its
+   * in-flight pushes may have promoted memory past the last durable write) is
+   * never dragged backward.
+   */
+  private async seedSentWatermark(): Promise<void> {
+    if (!this.serverSiteId) return;
+    const persisted = await this.syncManager.getPeerSentState(this.serverSiteId);
+    if (persisted && (!this.lastSentHLC || compareHLC(persisted, this.lastSentHLC) > 0)) {
+      this.lastSentHLC = persisted;
     }
   }
 

@@ -5,7 +5,8 @@
  *   cv: - Column versions (HLC per column per row)
  *   tb: - Tombstones (deleted row markers)
  *   tx: - Transaction records
- *   ps: - Peer sync state
+ *   ps: - Peer sync state (received watermark: highest HLC pulled from a peer)
+ *   pt: - Peer sent state (sent watermark: highest HLC pushed to a peer and acked)
  *   sm: - Schema migrations
  *   si: - Site identity
  *   hc: - HLC clock state
@@ -26,6 +27,7 @@ export const SYNC_KEY_PREFIX = {
   TOMBSTONE: encoder.encode('tb:'),
   TRANSACTION: encoder.encode('tx:'),
   PEER_STATE: encoder.encode('ps:'),
+  PEER_SENT_STATE: encoder.encode('pt:'),
   SCHEMA_MIGRATION: encoder.encode('sm:'),
   SITE_IDENTITY: encoder.encode('si:'),
   HLC_STATE: encoder.encode('hc:'),
@@ -90,12 +92,8 @@ export function buildTransactionKey(transactionId: string): Uint8Array {
 // Base64url alphabet (RFC 4648 Section 5)
 const BASE64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 
-/**
- * Build a peer sync state key.
- * Format: ps:{siteId_base64url}
- */
-export function buildPeerStateKey(siteId: SiteId): Uint8Array {
-  // Inline base64url encoding to avoid import cycle
+/** Encode a site id as base64url (inlined here to avoid an import cycle). */
+function siteIdToBase64Url(siteId: SiteId): string {
   let base64 = '';
   for (let i = 0; i < siteId.length; i += 3) {
     const byte1 = siteId[i];
@@ -107,7 +105,24 @@ export function buildPeerStateKey(siteId: SiteId): Uint8Array {
     if (i + 1 < siteId.length) base64 += BASE64URL_CHARS[(triplet >>> 6) & 0x3f];
     if (i + 2 < siteId.length) base64 += BASE64URL_CHARS[triplet & 0x3f];
   }
-  return encoder.encode(`ps:${base64}`);
+  return base64;
+}
+
+/**
+ * Build a peer sync state key (received watermark).
+ * Format: ps:{siteId_base64url}
+ */
+export function buildPeerStateKey(siteId: SiteId): Uint8Array {
+  return encoder.encode(`ps:${siteIdToBase64Url(siteId)}`);
+}
+
+/**
+ * Build a peer sent state key (sent watermark). Keyed separately from
+ * {@link buildPeerStateKey} so the sent and received watermarks never collide.
+ * Format: pt:{siteId_base64url}
+ */
+export function buildPeerSentStateKey(siteId: SiteId): Uint8Array {
+  return encoder.encode(`pt:${siteIdToBase64Url(siteId)}`);
 }
 
 /**
