@@ -25,7 +25,7 @@ no committed `CHANGELOG.md`; the published GitHub releases are the canonical his
 yarn release
 ```
 
-This runs `yarn bump` (interactive version prompt, commits, tags, pushes) then `yarn pub` (clean + build + publish each package).
+This first runs `scripts/release-guard.js` — an interactive gate that prints a banner and requires you to type `yes` to confirm `yarn check` passed on this commit (it aborts on a non-interactive terminal). Only then does it run `yarn bump` (interactive version prompt, commits, tags, pushes), `yarn pub` (clean + build + publish each package), and `yarn gh-release`.
 
 ## Step by Step
 
@@ -106,7 +106,7 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 
 ## Checklist
 
-- [ ] CI green on `main`
+- [ ] `yarn check` passes (there is no CI — this local run is the only pre-publish safety net)
 - [ ] `yarn build` succeeds
 - [ ] `yarn test` passes
 - [ ] Clean working tree
