@@ -26,7 +26,6 @@ import { astToString } from '../emit/ast-stringify.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
-const warnLog = log.extend('warn');
 
 /**
  * Represents a prepared SQL statement.
@@ -161,13 +160,16 @@ export class Statement {
 			this.scalarRequiredParams = collectScalarRequiredParams(rawPlan);
 			plan = this.db.optimizer.optimize(rawPlan, this.db) as BlockNode;
 
-			// Set up schema change invalidation if we have dependencies
-			if (dependencies && dependencies.hasAnyDependencies()) {
-				// Remove any existing listener
-				if (this.schemaChangeUnsubscriber) {
-					this.schemaChangeUnsubscriber();
-				}
+			// Always drop the previous listener before (re)compiling, even when the new
+			// plan has no dependencies — otherwise a zero-dependency recompile leaks the
+			// old listener on the schema-change notifier.
+			if (this.schemaChangeUnsubscriber) {
+				this.schemaChangeUnsubscriber();
+				this.schemaChangeUnsubscriber = null;
+			}
 
+			// Set up schema change invalidation only when we have dependencies
+			if (dependencies && dependencies.hasAnyDependencies()) {
 				// Add new listener for schema changes that affect our dependencies
 				this.schemaChangeUnsubscriber = this.db.schemaManager.getChangeNotifier().addListener(event => {
 					// Map event type to the dependency type(s) it can affect
@@ -389,9 +391,33 @@ export class Statement {
 	 *   boundary so iteration can be interrupted on a request timeout).
 	 */
 	iterateRows(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncIterableIterator<Row> {
-		return wrapAsyncIterator(this._iterateRowsRaw(params, options?.signal), (commit, error) =>
+		return wrapAsyncIterator(this._iterateRowsGenerator(params, options?.signal), (commit, error) =>
 			this.db._finalizeImplicitTransaction(commit, error)
 		);
+	}
+
+	/**
+	 * Internal generator for iterateRows() that holds the exec mutex for the whole
+	 * iteration, so two public iterations over the same db can't interleave the
+	 * implicit-transaction lifecycle. Mirrors {@link _allGenerator}, but yields raw
+	 * `Row` (no `rowToObject`). Transaction finalization is handled by the wrapper
+	 * returned by iterateRows().
+	 *
+	 * NOTE: on normal completion wrapAsyncIterator runs the transaction-finalize
+	 * cleanup after this generator's finally (mutex release), so the implicit-txn
+	 * commit lands just outside the mutex — same ordering as all()/`_allGenerator`.
+	 * @internal
+	 */
+	private async *_iterateRowsGenerator(params?: SqlParameters | SqlValue[], signal?: AbortSignal): AsyncGenerator<Row> {
+		// Pre-flight cancellation before acquiring the mutex, mirroring _allGenerator/eval().
+		throwIfAborted(signal);
+		const releaseMutex = await this.db._acquireExecMutex();
+
+		try {
+			yield* this._iterateRowsRaw(params, signal);
+		} finally {
+			releaseMutex();
+		}
 	}
 
 	/**
@@ -415,10 +441,11 @@ export class Statement {
 	 */
 	async reset(): Promise<void> {
 		this.validateStatement("reset");
-		if (this.busy) {
-			warnLog("Statement reset while busy. Iteration may not have completed.");
-		}
-		this.busy = false;
+		// Refuse while an iteration is in flight, matching bind/bindAll/clearBindings/
+		// nextStatement. Clearing `busy` here would let a second iteration slip past the
+		// guard in _iterateRowsRawInternal → two concurrent iterations over one statement.
+		// finalize() remains the escape hatch that force-clears `busy`.
+		if (this.busy) throw new MisuseError("Statement busy, cannot reset an in-flight iteration; complete or finalize it first.");
 	}
 
 	/**

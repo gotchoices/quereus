@@ -440,7 +440,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		throwIfAborted(options?.signal);
 		const stmt = this.prepare(sql, params);
 		try {
-			return await stmt.get(params, options);
+			// Params were already bound (and their types inferred) by prepare();
+			// don't re-pass them or stmt.get() would rebind + re-validate every value.
+			return await stmt.get(undefined, options);
 		} finally {
 			await stmt.finalize();
 		}
