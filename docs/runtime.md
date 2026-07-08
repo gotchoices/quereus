@@ -768,7 +768,9 @@ contextAttributes.forEach((attr, contextVarIndex) => {
 // Evaluate context once per statement
 const contextRow: Row = [];
 for (const contextEvaluator of contextEvalFunctions) {
-  const value = await contextEvaluator(rctx) as SqlValue;
+  // Hop-free on the synchronous fast path (see Scheduler-Centric Execution Model).
+  const raw = contextEvaluator(rctx);
+  const value = (raw instanceof Promise ? await raw : raw) as SqlValue;
   contextRow.push(value);
 }
 
@@ -1642,10 +1644,11 @@ if (result) {
 
 **✅ ALWAYS use scheduler callbacks:**
 ```typescript
-// CORRECT - scheduler handles execution and dependency resolution
+// CORRECT - scheduler handles execution and dependency resolution.
+// resolveMaybe keeps the synchronous case hop-free (see the note below).
 if (conditionCallback) {
-    const conditionResult = await conditionCallback(rctx);
-    conditionMet = !!conditionResult;
+    const met = resolveMaybe(conditionCallback(rctx), (r) => !!r);
+    conditionMet = met instanceof Promise ? await met : met;
 }
 ```
 
@@ -1653,6 +1656,33 @@ if (conditionCallback) {
 - The scheduler manages instruction dependencies and execution order
 - Direct calls bypass dependency resolution and can cause race conditions
 - Callbacks ensure proper context setup and error handling
+
+**Avoid a per-row microtask hop on the synchronous fast path.** A scalar
+sub-program (filter predicate, projected column, join condition, order/partition
+key, constraint check) runs through a sub-scheduler that completes
+*synchronously* and returns a concrete value whenever no instruction in it is
+itself async — the overwhelmingly common case. But `await value` still schedules
+a microtask even when `value` is not a thenable (`await x` ≡
+`await Promise.resolve(x)`), so a per-row/per-column `await callback(rctx)` pays
+that tick N times for nothing. Branch on `instanceof Promise` instead:
+
+```typescript
+// Pure-extraction site — value consumed as-is:
+const raw = callback(rctx);
+const value = raw instanceof Promise ? await raw : raw;
+
+// Transform site — value mapped before use: route through resolveMaybe,
+// then await only on the rare async path (async-util.ts):
+const decision = resolveMaybe(predicate(rctx), (r) => isTruthy(r));
+if (decision instanceof Promise ? await decision : decision) { /* ... */ }
+```
+
+The `await` must stay *lexical* at the extraction point — a value-returning
+helper the caller then `await`s just reintroduces the hop. `instanceof Promise`
+is the right test (not a duck-typed `.then` check): the scheduler itself decides
+async transitions with `instanceof Promise`, so instructions only ever return a
+native `Promise` or a concrete value. Genuinely-async sub-programs (e.g. a
+correlated scalar subquery) still work — they take the promise branch.
 
 ### Scope Resolution Debugging
 
