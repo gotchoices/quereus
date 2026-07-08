@@ -926,6 +926,35 @@ describe('SyncClient', () => {
       await new Promise(r => setTimeout(r, 5));
       expect((client as any).lastSentHLC).to.deep.equal(hlc2);
     });
+
+    it('relays a peer request as an apply_changes with no requestId, whose ack never promotes', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      ws.sentMessages.length = 0;
+
+      // A peer-relay push: the server relays another peer's request_changes.
+      // The changes carry an HLC, but this push is NOT our local delta — its ack
+      // must never move our watermark, so it goes out with no requestId.
+      const peerSite = generateSiteId();
+      const hlc: HLC = { wallTime: 5000n, counter: 1, siteId: peerSite, opSeq: 0 };
+      syncManager.getChangesSinceResult = [changeSet(peerSite, 'tx-relay', hlc)];
+
+      ws.simulateMessage({ type: 'request_changes', siteId: siteIdToBase64(peerSite) });
+      await new Promise(r => setTimeout(r, 5));
+
+      const relayPush = ws.getSentMessages().find(m => m.type === 'apply_changes') as { requestId?: string };
+      expect(relayPush).to.exist;
+      expect(relayPush.requestId).to.be.undefined;
+      // Nothing recorded to promote.
+      expect((client as any).pendingSentHLCs.size).to.equal(0);
+
+      // The server echoes no requestId back; the ack must leave the watermark untouched.
+      ws.simulateMessage({ type: 'apply_result', applied: 1 });
+      await new Promise(r => setTimeout(r, 5));
+      expect((client as any).lastSentHLC).to.be.null;
+      expect((client as any).pendingSentHLCs.size).to.equal(0);
+    });
   });
 
   // ==========================================================================
