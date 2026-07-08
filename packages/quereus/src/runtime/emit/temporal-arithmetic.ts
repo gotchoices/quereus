@@ -1,7 +1,8 @@
 import { StatusCode } from "../../common/types.js";
 import { QuereusError } from "../../common/errors.js";
 import type { SqlValue } from "../../common/types.js";
-import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
+import type { Instruction, RuntimeContext } from "../types.js";
+import { asRun } from "../types.js";
 import type { BinaryOpNode } from "../../planner/nodes/scalar.js";
 import { emitPlanNode } from "../emitters.js";
 import type { EmissionContext } from "../emission-context.js";
@@ -353,7 +354,7 @@ export function emitTemporalArithmetic(plan: BinaryOpNode, ctx: EmissionContext)
 
 	return {
 		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${operator}(temporal)`
 	};
 }

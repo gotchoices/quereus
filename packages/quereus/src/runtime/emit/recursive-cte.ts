@@ -1,5 +1,6 @@
 import type { RecursiveCTENode } from '../../planner/nodes/recursive-cte-node.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
 import type { MaybePromise, Row, SqlValue } from '../../common/types.js';
@@ -155,7 +156,7 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `recursiveCTE(${plan.cteName})`
 	};
 }

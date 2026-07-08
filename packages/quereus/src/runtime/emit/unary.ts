@@ -1,7 +1,8 @@
 import { StatusCode } from "../../common/types.js";
 import { quereusError } from "../../common/errors.js";
 import type { SqlValue } from "../../common/types.js";
-import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
+import type { Instruction, RuntimeContext } from "../types.js";
+import { asRun } from "../types.js";
 import type { UnaryOpNode } from "../../planner/nodes/scalar.js";
 import { emitPlanNode } from "../emitters.js";
 import type { EmissionContext } from "../emission-context.js";
@@ -127,7 +128,7 @@ export function emitUnaryOp(plan: UnaryOpNode, ctx: EmissionContext): Instructio
 
 	return {
 		params: [operandExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note
 	};
 }

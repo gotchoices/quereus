@@ -1,5 +1,6 @@
 import type { DropIndexNode } from '../../planner/nodes/drop-index-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import type { SqlValue } from '../../common/types.js';
 
@@ -15,7 +16,7 @@ export function emitDropIndex(plan: DropIndexNode, _ctx: EmissionContext): Instr
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `dropIndex(${plan.schemaName}.${plan.indexName})`
 	};
 }

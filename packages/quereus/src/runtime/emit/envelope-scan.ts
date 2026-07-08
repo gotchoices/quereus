@@ -1,5 +1,6 @@
 import type { EnvelopeScanNode } from '../../planner/nodes/envelope-scan-node.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createValidatedInstruction } from '../emitters.js';
@@ -26,5 +27,5 @@ export function emitEnvelopeScan(plan: EnvelopeScanNode, ctx: EmissionContext): 
 		yield* getter();
 	}
 
-	return createValidatedInstruction([], run as InstructionRun, ctx, `envelopeScan(${plan.attributes.length} cols)`);
+	return createValidatedInstruction([], asRun(run), ctx, `envelopeScan(${plan.attributes.length} cols)`);
 }

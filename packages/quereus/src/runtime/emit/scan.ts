@@ -4,7 +4,8 @@ import { AbortError, QuereusError, throwIfAborted } from "../../common/errors.js
 import type { VirtualTable } from "../../vtab/table.js";
 import type { BaseModuleConfig, AnyVirtualTableModule } from "../../vtab/module.js";
 import type { FilterInfo } from "../../vtab/filter-info.js";
-import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
+import type { Instruction, RuntimeContext } from "../types.js";
+import { asRun } from "../types.js";
 import type { EmissionContext } from "../emission-context.js";
 import { createValidatedInstruction, emitPlanNode } from "../emitters.js";
 import { disconnectVTable } from "../utils.js";
@@ -137,7 +138,7 @@ export function emitSeqScan(
 
 	return createValidatedInstruction(
 		params,
-		run as InstructionRun,
+		asRun(run),
 		ctx,
 		`${plan.nodeType}(${schema.name})`
 	);

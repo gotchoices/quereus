@@ -1,4 +1,5 @@
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode, createValidatedInstruction } from '../emitters.js';
 import { AbortError, QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
@@ -133,7 +134,7 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 
 	return createValidatedInstruction(
 		[...operandExprs],
-		runFunction as InstructionRun,
+		asRun(runFunction),
 		ctx,
 		`TVF:${plan.functionName}(${plan.operands.length})`
 	);

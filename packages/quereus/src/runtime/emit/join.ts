@@ -1,5 +1,6 @@
 import type { JoinNode } from '../../planner/nodes/join-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
 import type { Row, OutputValue, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -212,7 +213,7 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.joinType} join (nested loop)`
 	};
 }

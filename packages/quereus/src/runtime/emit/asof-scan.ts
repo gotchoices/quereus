@@ -1,5 +1,6 @@
 import type { AsofScanNode } from '../../planner/nodes/asof-scan-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -271,7 +272,7 @@ function emitAsofScanHash(plan: AsofScanNode, ctx: EmissionContext): Instruction
 
 	return {
 		params: [leftInstruction, rightInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.outer ? 'left' : 'inner'} asof scan [hash]${strict ? ' strict' : ''}`,
 	};
 }
@@ -507,7 +508,7 @@ function emitAsofScanMerge(plan: AsofScanNode, ctx: EmissionContext): Instructio
 
 	return {
 		params: [leftInstruction, rightInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.outer ? 'left' : 'inner'} asof scan [merge]${strict ? ' strict' : ''}`,
 	};
 }

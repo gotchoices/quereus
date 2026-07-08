@@ -1,6 +1,7 @@
 import type { ViewMutationNode } from '../../planner/nodes/view-mutation-node.js';
 import { isRelationalNode } from '../../planner/nodes/plan-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { RuntimeValue, OutputValue, Row, SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
@@ -302,7 +303,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	const nestedNote = nestedCaptures.length > 0 ? ` +nested(${nestedCaptures.length})` : '';
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `viewMutation(${baseOpCount} base op${baseOpCount === 1 ? '' : 's'}${envelope ? ' +envelope' : ''}${retNote}${nestedNote})`,
 	};
 }

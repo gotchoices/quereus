@@ -1,5 +1,6 @@
 import type { InNode, ExistsNode, ScalarSubqueryNode } from '../../planner/nodes/subquery.js';
 import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { SqlValue, Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -48,7 +49,7 @@ export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContex
 
 		return {
 			params: [innerInstruction],
-			run: runImpure as InstructionRun,
+			run: asRun(runImpure),
 			note: 'SCALAR_SUBQUERY(impure)'
 		};
 	}
@@ -75,7 +76,7 @@ export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContex
 
 	return {
 		params: [innerInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: 'SCALAR_SUBQUERY'
 	};
 }
@@ -133,7 +134,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 			return {
 				params: [sourceInstruction, conditionExpr],
-				run: runImpure as InstructionRun,
+				run: asRun(runImpure),
 				note: 'IN(impure)'
 			};
 		}
@@ -169,7 +170,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 		return {
 			params: [sourceInstruction, conditionExpr],
-			run: runSubqueryStreaming as InstructionRun,
+			run: asRun(runSubqueryStreaming),
 			note: `IN (subquery)`
 		};
 	} else if (plan.values) {
@@ -208,7 +209,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 			if (values.some(val => val instanceof Promise)) {
 				// Must resolve promises at runtime
-				runFunc = (async (rctx: RuntimeContext, condition: SqlValue): Promise<SqlValue> => {
+				runFunc = asRun(async (rctx: RuntimeContext, condition: SqlValue): Promise<SqlValue> => {
 					const resolved = await Promise.all(values);
 
 					for (const value of resolved) {
@@ -220,7 +221,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 					}
 
 					return innerConstantRun(rctx, condition);
-				}) as InstructionRun;
+				});
 			} else {
 				for (const value of values) {
 					if (value === null) {
@@ -229,14 +230,14 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 					}
 					tree.insert(value as SqlValue);
 				}
-				runFunc = innerConstantRun as InstructionRun;
+				runFunc = asRun(innerConstantRun);
 			}
 
 			const conditionExpr = emitPlanNode(plan.condition, ctx);
 
 			return {
 				params: [conditionExpr],
-				run: runFunc as InstructionRun,
+				run: runFunc,
 				note: `IN (${plan.values.length} constant values)`
 			};
 		} else {
@@ -268,7 +269,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 			return {
 				params: [conditionExpr, ...valueExprs],
-				run: runDynamicValues as InstructionRun,
+				run: asRun(runDynamicValues),
 				note: `IN (${plan.values.length} dynamic values)`
 			};
 		}
@@ -303,7 +304,7 @@ export function emitExists(plan: ExistsNode, ctx: EmissionContext): Instruction 
 
 		return {
 			params: [innerInstruction],
-			run: runImpure as InstructionRun,
+			run: asRun(runImpure),
 			note: 'EXISTS(impure)'
 		};
 	}
@@ -319,7 +320,7 @@ export function emitExists(plan: ExistsNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params: [innerInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: 'EXISTS'
 	};
 }

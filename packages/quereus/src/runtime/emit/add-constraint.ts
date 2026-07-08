@@ -1,5 +1,6 @@
 import type { AddConstraintNode } from '../../planner/nodes/add-constraint-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { SqlValue, StatusCode } from '../../common/types.js';
@@ -39,7 +40,7 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `addConstraint(${plan.table.tableSchema.name}, ${plan.constraint.name || 'unnamed'})`
 	};
 }

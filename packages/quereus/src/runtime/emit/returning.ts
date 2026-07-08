@@ -1,5 +1,6 @@
 import type { ReturningNode } from '../../planner/nodes/returning-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row, OutputValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
@@ -49,7 +50,7 @@ export function emitReturning(plan: ReturningNode, ctx: EmissionContext): Instru
 
 	return {
 		params: [executorInstruction, ...projectionEvaluators],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `returning(${plan.projections.length} cols)`
 	};
 }

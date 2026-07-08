@@ -1,5 +1,6 @@
 import type { InsertNode } from '../../planner/nodes/insert-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -36,7 +37,7 @@ export function emitInsert(plan: InsertNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params: [sourceInstruction],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `insertPrep(${plan.table.tableSchema.name})`
 	};
 }

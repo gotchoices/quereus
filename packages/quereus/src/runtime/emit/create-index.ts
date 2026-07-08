@@ -1,5 +1,6 @@
 import type { CreateIndexNode } from '../../planner/nodes/create-index-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 
@@ -14,5 +15,5 @@ export function emitCreateIndex(plan: CreateIndexNode, _ctx: EmissionContext): I
 		return null; // Explicitly return null for successful void operations
 	}
 
-	return { params: [], run: run as InstructionRun, note: `createIndex(${plan.statementAst.index.name})` };
+	return { params: [], run: asRun(run), note: `createIndex(${plan.statementAst.index.name})` };
 }

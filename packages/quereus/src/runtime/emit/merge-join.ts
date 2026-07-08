@@ -1,5 +1,6 @@
 import type { MergeJoinNode } from '../../planner/nodes/merge-join-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
 import type { Row, OutputValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -185,7 +186,7 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.joinType} join (merge)`
 	};
 }

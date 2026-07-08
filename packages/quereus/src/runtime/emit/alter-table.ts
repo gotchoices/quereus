@@ -1,5 +1,6 @@
 import type { AlterTableNode, AddColumnBackfill, AddColumnCheck } from '../../planner/nodes/alter-table-node.js';
-import type { Instruction, RuntimeContext, InstructionRun, OutputValue } from '../types.js';
+import type { Instruction, RuntimeContext, OutputValue } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { createRowSlot } from '../context-helpers.js';
@@ -161,7 +162,7 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 
 	return {
 		params,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note,
 	};
 }

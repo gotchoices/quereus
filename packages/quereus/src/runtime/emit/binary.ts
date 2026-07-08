@@ -1,7 +1,8 @@
 import { StatusCode } from "../../common/types.js";
 import { quereusError } from "../../common/errors.js";
 import type { SqlValue } from "../../common/types.js";
-import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
+import type { Instruction, RuntimeContext } from "../types.js";
+import { asRun } from "../types.js";
 import type { BinaryOpNode } from "../../planner/nodes/scalar.js";
 import { LiteralNode } from "../../planner/nodes/scalar.js";
 import type { ScalarPlanNode } from "../../planner/nodes/plan-node.js";
@@ -204,7 +205,7 @@ export function emitNumericOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 
 	return {
 		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note
 	};
 }
@@ -254,7 +255,7 @@ export function emitComparisonOp(plan: BinaryOpNode, ctx: EmissionContext): Inst
 
 	return {
 		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.expression.operator}(${noteTag}${collationName !== 'BINARY' ? ` ${collationName}` : ''})`
 	};
 }
@@ -316,7 +317,7 @@ export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 
 	return {
 		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: '||(concat)'
 	};
 }
@@ -363,7 +364,7 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 
 	return {
 		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${plan.expression.operator}(logical)`
 	};
 }
@@ -400,7 +401,7 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 		}
 		return {
 			params: [leftExpr],
-			run: runConstPattern as InstructionRun,
+			run: asRun(runConstPattern),
 			note: 'LIKE(like-const)'
 		};
 	}
@@ -423,7 +424,7 @@ export function emitLikeOp(plan: BinaryOpNode, ctx: EmissionContext): Instructio
 
 	return {
 		params: [leftExpr, rightExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: 'LIKE(like)'
 	};
 }

@@ -1,5 +1,6 @@
 import type { HashAggregateNode } from '../../planner/nodes/hash-aggregate.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { type SqlValue, type Row, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -381,7 +382,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 	return {
 		params: [sourceInstruction, ...groupByInstructions, ...aggregateArgInstructions],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `hash_aggregate(${plan.groupBy.length > 0 ? `GROUP BY ${plan.groupBy.length}` : 'no grouping'}, ${plan.aggregates.length} aggs)`
 	};
 }

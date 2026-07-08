@@ -1,5 +1,6 @@
 import type { CreateAssertionNode } from '../../planner/nodes/create-assertion-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { SqlValue, StatusCode } from '../../common/types.js';
@@ -86,7 +87,7 @@ export function emitCreateAssertion(plan: CreateAssertionNode, _ctx: EmissionCon
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `createAssertion(${plan.name})`
 	};
 }

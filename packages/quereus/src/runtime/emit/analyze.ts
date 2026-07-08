@@ -5,7 +5,8 @@
 
 import type { EmissionContext } from '../emission-context.js';
 import type { AnalyzePlanNode } from '../../planner/nodes/analyze-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { TableSchema } from '../../schema/table.js';
 import { requireVtabModule } from '../../schema/table.js';
@@ -86,7 +87,7 @@ export function emitAnalyze(plan: AnalyzePlanNode, _ctx: EmissionContext): Instr
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `ANALYZE ${plan.targetTableName ?? 'all tables'}`
 	};
 }

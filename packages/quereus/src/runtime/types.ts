@@ -64,6 +64,31 @@ export type Instruction = {
 };
 
 /**
+ * Adapts an emitter's precisely-typed `run` (e.g.
+ * `(ctx, v1: SqlValue, v2: SqlValue) => SqlValue`) to the general
+ * {@link InstructionRun} that the scheduler drives every instruction through.
+ *
+ * A specific `run` is *not* structurally assignable to `InstructionRun`. The
+ * scheduler holds instructions generically and calls `run(ctx, ...args)` with
+ * every arg widened to `RuntimeValue`, so a function that declares narrower
+ * params (`SqlValue`, `AsyncIterable<Row>`, a fixed arity, an optional callback)
+ * is rejected by parameter contravariance under `strictFunctionTypes` — exactly
+ * as it would be if a caller passed more, fewer, or differently-typed args. Each
+ * emitter therefore has to assert the conversion. This helper is the single
+ * audited home for that assertion: emit sites write `run: asRun(run)` and the
+ * only `as`-to-`InstructionRun` in the runtime lives here.
+ *
+ * The parameter is deliberately loose — first arg is the runtime context, the
+ * rest and the return are unconstrained — because the ~80 `run` functions span
+ * every arity and return shape (`SqlValue`, `AsyncIterable<Row>`,
+ * `Promise<RuntimeValue>`, void-ish DDL). `never[]` accepts any argument list
+ * without widening to `any`; the body performs the one unchecked cast.
+ */
+export function asRun(run: (ctx: RuntimeContext, ...args: never[]) => unknown): InstructionRun {
+	return run as unknown as InstructionRun;
+}
+
+/**
  * Runtime statistics for instruction execution
  */
 export interface InstructionRuntimeStats {

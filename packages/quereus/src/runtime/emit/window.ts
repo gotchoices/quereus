@@ -1,5 +1,6 @@
 import type { WindowNode } from '../../planner/nodes/window-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { OutputValue, Row, SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
@@ -150,7 +151,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params: [sourceInstruction, ...allCallbacks],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `window(${plan.functions.map(f => f.functionName).join(', ')})`
 	};
 }

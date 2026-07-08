@@ -1,5 +1,6 @@
 import type { DropAssertionNode } from '../../planner/nodes/drop-assertion-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { QuereusError } from '../../common/errors.js';
 import { SqlValue, StatusCode } from '../../common/types.js';
@@ -45,7 +46,7 @@ export function emitDropAssertion(plan: DropAssertionNode, _ctx: EmissionContext
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `dropAssertion(${plan.name})`
 	};
 }

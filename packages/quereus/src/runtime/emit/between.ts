@@ -1,5 +1,6 @@
 import type { SqlValue } from "../../common/types.js";
-import type { Instruction, InstructionRun, RuntimeContext } from "../types.js";
+import type { Instruction, RuntimeContext } from "../types.js";
+import { asRun } from "../types.js";
 import type { BetweenNode } from "../../planner/nodes/scalar.js";
 import { emitPlanNode } from "../emitters.js";
 import { compareSqlValuesFast } from "../../util/comparison.js";
@@ -41,7 +42,7 @@ export function emitBetween(plan: BetweenNode, ctx: EmissionContext): Instructio
 
 	return {
 		params: [valueExpr, lowerExpr, upperExpr],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `${notPrefix}BETWEEN${formatBetweenCollationNote(lowerCollationName, upperCollationName)}`
 	};
 }

@@ -1,5 +1,6 @@
 import type { EmissionContext } from '../emission-context.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { createLogger } from '../../common/logger.js';
 import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
@@ -93,7 +94,7 @@ export function emitDeclareSchema(plan: PlanNode, _ctx: EmissionContext): Instru
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `declare schema ${declareStmt.schemaName || 'main'}`
 	};
 }
@@ -129,7 +130,7 @@ export function emitDeclareLens(plan: PlanNode, _ctx: EmissionContext): Instruct
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `declare lens for ${lensStmt.logicalSchema} over ${lensStmt.basisSchema}`,
 	};
 }
@@ -167,7 +168,7 @@ export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instructi
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `diff schema ${diffStmt.schemaName || 'main'}`
 	};
 }
@@ -342,7 +343,7 @@ export function emitApplySchema(plan: PlanNode, _ctx: EmissionContext): Instruct
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `apply schema ${applyStmt.schemaName || 'main'}${applyStmt.withSeed ? ' with seed' : ''}`
 	};
 }
@@ -373,7 +374,7 @@ export function emitExplainSchema(plan: PlanNode, _ctx: EmissionContext): Instru
 
 	return {
 		params: [],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `explain schema ${explainStmt.schemaName || 'main'}`
 	};
 }

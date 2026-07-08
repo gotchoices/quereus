@@ -1,5 +1,6 @@
 import type { CreateTableNode } from '../../planner/nodes/create-table-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createMaintainedTable } from './materialized-view-helpers.js';
@@ -23,5 +24,5 @@ export function emitCreateTable(plan: CreateTableNode, _ctx: EmissionContext): I
 		return null; // Explicitly return null for successful void operations
 	}
 
-	return { params: [], run: run as InstructionRun, note: `createTable(${plan.statementAst.table.name})` };
+	return { params: [], run: asRun(run), note: `createTable(${plan.statementAst.table.name})` };
 }

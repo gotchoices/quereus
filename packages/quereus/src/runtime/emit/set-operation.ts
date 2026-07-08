@@ -1,5 +1,6 @@
 import type { SetOperationNode } from '../../planner/nodes/set-operation-node.js';
 import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode } from '../emitters.js';
 import type { Row } from '../../common/types.js';
@@ -232,20 +233,20 @@ export function emitSetOperation(plan: SetOperationNode, ctx: EmissionContext): 
 
   let run: InstructionRun;
   if (plan.hasSurfacedFlags) {
-    run = runWithSurfacedFlags as InstructionRun;
+    run = asRun(runWithSurfacedFlags);
   } else {
     switch (plan.op) {
       case 'unionAll':
-        run = runUnionAll as InstructionRun;
+        run = asRun(runUnionAll);
         break;
       case 'union':
-        run = runUnionDistinct as InstructionRun;
+        run = asRun(runUnionDistinct);
         break;
       case 'intersect':
-        run = runIntersect as InstructionRun;
+        run = asRun(runIntersect);
         break;
       case 'except':
-        run = runExcept as InstructionRun;
+        run = asRun(runExcept);
         break;
     }
   }

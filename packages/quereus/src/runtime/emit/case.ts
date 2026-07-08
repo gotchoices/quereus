@@ -1,5 +1,6 @@
 import type { CaseExprNode } from '../../planner/nodes/scalar.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import { type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -81,7 +82,7 @@ export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruct
 
 	return {
 		params: paramInstructions,
-		run: (plan.baseExpr ? runSimpleCase : runSearchedCase) as InstructionRun,
+		run: asRun(plan.baseExpr ? runSimpleCase : runSearchedCase),
 		note: `case(${plan.whenThenClauses.length} when clauses${plan.elseExpr ? ', else' : ''})`
 	};
 }

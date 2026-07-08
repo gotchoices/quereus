@@ -13,7 +13,8 @@ import { coerceToJsonValue, resolveJsonPathForModify, prepareJsonValue, deepCopy
 import { JSON_TYPE } from '../../types/json-type.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../../runtime/types.js';
+import type { Instruction, RuntimeContext } from '../../runtime/types.js';
+import { asRun } from '../../runtime/types.js';
 import { PlanNodeType } from '../../planner/nodes/plan-node-type.js';
 import { LiteralNode } from '../../planner/nodes/scalar.js';
 import { emitPlanNode } from '../../runtime/emitters.js';
@@ -78,7 +79,7 @@ function emitJsonSchema(
 
 				return {
 					params: [jsonArgInstruction],
-					run: run as InstructionRun,
+					run: asRun(run),
 					note: `json_schema(cached:${schemaDef.substring(0, 20)}...)`
 				};
 			} catch (e) {

@@ -1,7 +1,8 @@
 import { createScalarFunction } from '../registration.js';
 import type { ScalarFunctionCallNode } from '../../planner/nodes/function.js';
 import type { EmissionContext } from '../../runtime/emission-context.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../../runtime/types.js';
+import type { Instruction, RuntimeContext } from '../../runtime/types.js';
+import { asRun } from '../../runtime/types.js';
 import { INTEGER_TYPE } from '../../types/builtin-types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type OutputValue, type SqlValue } from '../../common/types.js';
@@ -47,7 +48,7 @@ function emitMutationOrdinal(
 		}
 		return ordinal as SqlValue;
 	}
-	return { params: [], run: run as InstructionRun, note: 'mutation_ordinal()' };
+	return { params: [], run: asRun(run), note: 'mutation_ordinal()' };
 }
 
 export const mutationOrdinalFunc = createScalarFunction(

@@ -1,5 +1,6 @@
 import type { FilterNode } from '../../planner/nodes/filter.js';
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { OutputValue, StatusCode, type Row, type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -43,7 +44,7 @@ export function emitFilter(plan: FilterNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params: [sourceInstruction, predicateFunc],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `filter(${plan.predicate.toString()})`
 	};
 }

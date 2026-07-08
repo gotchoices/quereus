@@ -1,5 +1,6 @@
 import type { DropTableNode } from '../../planner/nodes/drop-table-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -37,5 +38,5 @@ export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instru
 		return null;
 	}
 
-	return { params: [], run: run as InstructionRun, note: `dropTable(${targetSchemaName}.${objectName})` };
+	return { params: [], run: asRun(run), note: `dropTable(${targetSchemaName}.${objectName})` };
 }

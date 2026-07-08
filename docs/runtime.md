@@ -232,6 +232,7 @@ This standardized format ensures plan viewers receive consistent, comprehensive 
 // src/runtime/emit/my-operation.ts
 import type { MyOperationNode } from '../../planner/nodes/my-operation-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode } from '../emitters.js';
@@ -283,11 +284,19 @@ export function emitMyOperation(plan: MyOperationNode, ctx: EmissionContext): In
 
 	return {
 		params: [sourceInstruction],
-		run,
+		run: asRun(run),
 		note: `myOperation(${plan.operationParam})`
 	};
 }
 ```
+
+Wrap the `run` function in `asRun(...)`. A `run` that declares specific
+parameters (`SqlValue`, `AsyncIterable<Row>`, a fixed arity) is not structurally
+assignable to the general `InstructionRun` the scheduler drives — parameter
+contravariance under `strictFunctionTypes` rejects it. `asRun` is the single
+audited home for that unavoidable cast (`src/runtime/types.ts`), so emit sites
+stay cast-free. Emitters that build through `createValidatedInstruction(...)`
+pass `asRun(run)` as the run argument the same way.
 
 ### 2. Register the Emitter
 

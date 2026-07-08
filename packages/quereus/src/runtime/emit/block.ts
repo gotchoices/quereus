@@ -1,5 +1,6 @@
 import type { BlockNode } from '../../planner/nodes/block.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
 import type { RuntimeValue, OutputValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -24,7 +25,7 @@ export function emitBlock(plan: BlockNode, ctx: EmissionContext): Instruction {
 
 	return {
 		params: statements,
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `block(${plan.statements.length} stmts, result idx: ${valueIndex})`
 	};
 }

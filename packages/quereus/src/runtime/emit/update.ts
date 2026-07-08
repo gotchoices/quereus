@@ -1,5 +1,6 @@
 import type { UpdateNode } from '../../planner/nodes/update-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
@@ -83,7 +84,7 @@ export function emitUpdate(plan: UpdateNode, ctx: EmissionContext): Instruction 
 
 	return {
 		params: [sourceInstruction, ...assignmentEvaluators],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `transformUpdateRows(${plan.table.tableSchema.name}, ${plan.assignments.length} cols)`
 	};
 }

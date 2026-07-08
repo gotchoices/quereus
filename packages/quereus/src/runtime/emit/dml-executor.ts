@@ -1,5 +1,6 @@
 import type { DmlExecutorNode } from '../../planner/nodes/dml-executor-node.js';
 import type { Instruction, RuntimeContext, InstructionRun, OutputValue } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { QuereusError, ConstraintError, FailConflictError, RollbackConflictError, throwIfAborted } from '../../common/errors.js';
 import { StatusCode, type Row, type SqlValue, isConstraintViolation } from '../../common/types.js';
@@ -1096,9 +1097,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	// Select the correct generator based on operation
 	let run: InstructionRun;
 	switch (plan.operation) {
-		case 'insert': run = runInsert as InstructionRun; break;
-		case 'update': run = runUpdate as InstructionRun; break;
-		case 'delete': run = runDelete as InstructionRun; break;
+		case 'insert': run = asRun(runInsert); break;
+		case 'update': run = asRun(runUpdate); break;
+		case 'delete': run = asRun(runDelete); break;
 		default:
 			throw new QuereusError(`Unknown DML operation: ${plan.operation}`, StatusCode.INTERNAL);
 	}
