@@ -71,6 +71,31 @@ describe('exec/eval AbortSignal cancellation', () => {
 		expect(caught).to.be.instanceOf(AbortError);
 	});
 
+	it('interrupts an unbuffered memory scan mid-stream (scan-leaf checkpoint, no Sort)', async () => {
+		// Guards the sole per-row cancellation checkpoint on the memory-scan path
+		// (`runtime/emit/scan.ts` — `throwIfAborted` before yielding each row). The
+		// inner scan layers (safeIterate/scanLayer) are synchronous, so a plain
+		// `select` with no `order by` (no Sort buffering the rows) must still abort
+		// between rows at that checkpoint rather than draining the whole table.
+		// Memory scans yield in PK order, so the row sequence is deterministic.
+		const controller = new AbortController();
+
+		const seen: number[] = [];
+		let caught: unknown;
+		try {
+			for await (const row of db.eval('select id from t', [], { signal: controller.signal })) {
+				seen.push(row.id as number);
+				if (seen.length === 2) controller.abort();
+			}
+		} catch (e) {
+			caught = e;
+		}
+
+		expect(seen).to.deep.equal([1, 2]);
+		expect(caught).to.be.instanceOf(AbortError);
+		expect((caught as QuereusError).code).to.equal(StatusCode.ABORT);
+	});
+
 	it('exec rejects immediately on a pre-aborted signal (no side effects)', async () => {
 		const controller = new AbortController();
 		controller.abort();
