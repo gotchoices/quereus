@@ -52,6 +52,10 @@ function encodeElement(value: SqlValue): string {
 	if (value === null || value === undefined) return '0';
 	switch (typeof value) {
 		case 'string': return 's' + value;
+		// NOTE: JSON.stringify(NaN|±Infinity) → "null" and -0 → "0", so those
+		// degenerate number PKs decode lossily (NaN→null, -0→0). Matches the prior
+		// canonical-JSON keying (no regression); a NaN/±Inf PK is nonsensical and
+		// unreachable via real DML. Fix here + in decodeElement together if it ever matters.
 		case 'number': return 'n' + JSON.stringify(value);        // round-trips via JSON.parse
 		case 'bigint': return 'i' + value.toString();             // decode: BigInt(rest)
 		case 'boolean': return value ? 'b1' : 'b0';

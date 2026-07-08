@@ -434,13 +434,14 @@ describe('StoreModule predicate pushdown', () => {
 		});
 
 		// NOTE: an end-to-end SQL range seek over |int| >= 2^53 through the store
-		// (the "gap 1" combined test) cannot live here yet: a bigint PK crashes the
-		// engine upstream in the transaction change log (serializeKeyTuple ->
-		// canonicalJsonString -> JSON.stringify throws "Do not know how to serialize
-		// a BigInt"), tracked in fix/txn-changelog-bigint-key. The STORE encoding of
-		// large ints is proven at the unit level in encoding.spec.ts (byte order +
-		// exact roundtrip across the shared-double boundary); the combined SQL test
-		// belongs in that fix's suite once bigint PKs can be written at all.
+		// (the "gap 1" combined test) is now unblocked — the upstream change-log
+		// crash on a bigint PK (serializeKeyTuple -> canonicalJsonString ->
+		// JSON.stringify) was fixed under txn-changelog-bigint-key (the change log
+		// now keys via the reversible key-tuple-codec). The STORE encoding of large
+		// ints is proven at the unit level in encoding.spec.ts (byte order + exact
+		// roundtrip across the shared-double boundary); the combined store-path SQL
+		// test is not yet written — tracked in
+		// backlog/debt-bigint-pk-store-range-seek-test.
 	});
 
 	// A leading PK key collation with NO registered byte encoder must NOT produce a
