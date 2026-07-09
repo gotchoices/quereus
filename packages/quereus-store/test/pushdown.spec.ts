@@ -501,15 +501,56 @@ describe('StoreModule predicate pushdown', () => {
 			expect(rows.map(r => r.n)).to.deep.equal([35, 30, 25]);
 		});
 
-		// NOTE: an end-to-end SQL range seek over |int| >= 2^53 through the store
-		// (the "gap 1" combined test) is now unblocked — the upstream change-log
-		// crash on a bigint PK (serializeKeyTuple -> canonicalJsonString ->
-		// JSON.stringify) was fixed under txn-changelog-bigint-key (the change log
-		// now keys via the reversible key-tuple-codec). The STORE encoding of large
-		// ints is proven at the unit level in encoding.spec.ts (byte order + exact
-		// roundtrip across the shared-double boundary); the combined store-path SQL
-		// test is not yet written — tracked in
-		// backlog/debt-bigint-pk-store-range-seek-test.
+	});
+
+	// Regression / gap-closer for `debt-bigint-pk-store-range-seek-test`: an
+	// end-to-end SQL range seek over an integer PK >= 2^53 through the persistent
+	// store path. The upstream change-log crash on a bigint PK (serializeKeyTuple
+	// -> canonicalJsonString -> JSON.stringify) was fixed under
+	// txn-changelog-bigint-key (the change log now keys via the reversible
+	// key-tuple-codec, see util/key-tuple-codec.ts), which unblocked writing this
+	// test. The STORE byte encoding of large ints is proven separately at the unit
+	// level in encoding.spec.ts (sort order + exact roundtrip across the
+	// shared-double boundary); this test closes the gap by exercising the full
+	// INSERT -> range-SELECT path against the store module.
+	describe('bigint primary key range seek (debt-bigint-pk-store-range-seek-test)', () => {
+		// 2^53 + 1 — the smallest positive integer that cannot be represented
+		// exactly as a JS number, so it must flow as a bigint end-to-end. A lossy
+		// `number` cast would collapse it (and the next row's key) to 2^53.
+		const BIG = 9007199254740993n; // 2^53 + 1
+
+		async function seed(name: string, using: string): Promise<void> {
+			await db.exec(`create table ${name} (id integer primary key, v integer) ${using}`);
+			await db.exec(
+				`insert into ${name} values (1, 10), (2, 20), (${BIG.toString()}, 30), (${(BIG + 1n).toString()}, 40)`,
+			);
+		}
+
+		it('range seek over a bigint PK matches the memory-vtab oracle, in order, with exact values', async () => {
+			await seed('bigstore', 'using store');
+			await seed('bigmem', ''); // default in-memory vtab = full-scan oracle
+
+			const q = (t: string) => `select id, v from ${t} where id >= ${BIG.toString()} order by id`;
+			const storeRows = await asyncIterableToArray(db.eval(q('bigstore')));
+			const memRows = await asyncIterableToArray(db.eval(q('bigmem')));
+
+			expect(memRows).to.deep.equal([
+				{ id: BIG, v: 30 },
+				{ id: BIG + 1n, v: 40 },
+			]);
+			expect(storeRows).to.deep.equal(memRows);
+			expect(typeof storeRows[0].id).to.equal('bigint');
+		});
+
+		it('the range seek uses the index-seek path, not a full scan', async () => {
+			await seed('bigstore2', 'using store');
+			const rows = await asyncIterableToArray(
+				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [
+					`select id from bigstore2 where id >= ${BIG.toString()} order by id`,
+				]),
+			);
+			expect(rows[0].ops as string).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+		});
 	});
 
 	// Every PK key collation reaching `buildPKRangeBounds` has a key normalizer:
