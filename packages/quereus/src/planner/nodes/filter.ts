@@ -30,6 +30,11 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		// [source, predicate]) — flow in via getTotalCost(). Self is the per-row
 		// predicate-evaluation overhead; the predicate's own subtree cost is added
 		// once as a child, so it must NOT be folded here.
+		// NOTE: under self-cost-only the predicate's subtree cost is added once, not
+		// multiplied by row count (the pre-fix formula did rows * predicate.getTotalCost()).
+		// So an expensive predicate over a large input is now under-weighted; if predicate
+		// complexity ever needs to drive plan choice, fold a per-row predicate factor into
+		// filterCost() rather than re-summing the child here.
 		super(scope, estimatedCostOverride ?? filterCost(source.estimatedRows ?? 1));
 	}
 
