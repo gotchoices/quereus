@@ -2542,8 +2542,9 @@ covering view, coarsening-collision telemetry) and the optimizer's contradiction
 latter declines to prove a predicate unsatisfiable at all when it cannot resolve a column's
 collation, rather than assuming byte order and dropping rows.
 
-**Grouping and hash keys.** `GROUP BY`, window `PARTITION BY`, the hash-join Bloom filter, and
-`AS OF` partitioning group rows by a normalized *string* form of each key value rather than by
+**Grouping and hash keys.** `GROUP BY`, window `PARTITION BY`, the hash-join Bloom filter,
+`AS OF` partitioning, and the isolation layer's set of primary keys staged by the open
+transaction group rows by a normalized *string* form of each key value rather than by
 running the comparator. They resolve that normalizer against the connection's collation registry
 (`db.getKeyNormalizerResolver()`), so grouping, `where`, `order by`, and `distinct` all agree on
 which rows are equal — including under a custom or replaced collation. A collation registered

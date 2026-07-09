@@ -481,6 +481,17 @@ fail to shadow the underlying row and surface both. The canonical encoder tags
 bigint safely and maps collation-equal keys to identical strings, agreeing with
 `getComparePK`/`keysEqual`.
 
+Those normalizers resolve through the **owning connection** (`db.getKeyNormalizerResolver()`,
+bound in the `IsolatedTable` constructor beside `getCollationResolver()`), never a
+process-global built-ins table — otherwise a collation registered or overridden with
+`db.registerCollation` would key the overlay row differently from the comparator that
+merges it, and the staged row would again fail to shadow the base row. As a consequence, a
+text PK column under a collation registered **without** a `normalizer` raises `collation
+<name> has no key normalizer` on this path rather than silently under-shadowing; primary-key
+scans, which need only the comparator, are unaffected. A PK column whose declared type can
+never hold text (`n integer collate mycoll`) takes the identity normalizer and never
+consults the collation, matching the engine's own hash-key sites.
+
 ---
 
 ## Key Ordering
@@ -527,10 +538,13 @@ For text columns with non-binary collation (`NOCASE`, `RTRIM`, or one registered
 `db.registerCollation`):
 
 - The underlying module's comparator must respect the collation
-- Collation names resolve against the **owning connection** (`db.getCollationResolver()`), never
+- Collation names resolve against the **owning connection** (`db.getCollationResolver()`, and
+  `db.getKeyNormalizerResolver()` for the secondary-index merge's modified-PK set), never
   a process-global registry — an application may replace `NOCASE`/`RTRIM` per database
 - The overlay uses the same comparator
 - Both iterate in the same order
+- A collation named on a **text** PK column must carry a `normalizer` if the table is ever
+  scanned through a secondary index inside a transaction with pending writes
 
 The store's *physical key bytes* are a separate matter: they come from an encoder registry that
 does not consult the database, so a custom or overridden collation governs comparison but not

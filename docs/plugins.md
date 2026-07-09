@@ -1455,7 +1455,9 @@ any of:
 
 - a compound index key;
 - a `GROUP BY` key or a window `PARTITION BY` key;
-- a hash/bloom join key, or an `AS OF` partition key.
+- a hash/bloom join key, or an `AS OF` partition key;
+- a `PRIMARY KEY` column of an isolation-wrapped table (`using isolated`), when a
+  transaction with pending writes on it is scanned through a secondary index.
 
 A comparator-only registration still works for `ORDER BY` and standalone
 comparisons. Index creation naming it is rejected, and a query that groups or

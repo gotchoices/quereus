@@ -205,6 +205,13 @@ export { Latches } from './util/latches.js';
 // UNIQUE re-validation that honors a per-column NOCASE/RTRIM/BINARY collation).
 export { resolveKeyNormalizer, serializeRowKey } from './util/key-serializer.js';
 
+// Whether a column's declared type can ever hold text, and therefore whether a key
+// built over it needs a key normalizer at all. Out-of-package hash-key sites (the
+// isolation overlay's modified-PK set) must gate on this exactly as the engine's own
+// emitters do via `hashKeyCollationName`, or a comparator-only collation named on a
+// non-text primary-key column raises where the engine would not.
+export { logicalTypeCanHoldText } from './planner/analysis/comparison-collation.js';
+
 // Canonical JSON key form (recursive object-key sort) — used by store modules to
 // derive persisted byte keys that agree with the in-memory JSON comparator, so
 // reorder-equal JSON values ({a:1,b:2} vs {b:2,a:1}) encode to identical bytes.

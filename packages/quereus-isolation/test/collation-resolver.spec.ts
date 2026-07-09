@@ -122,6 +122,11 @@ describe('IsolatedTable collation resolution', () => {
 		});
 	});
 
+	// NOTE: every test here reaches `mergedSecondaryIndexQuery` only because the planner
+	// picks `ix_v` for `where v = ...`. If it ever stops doing so the scan falls back to the
+	// primary-key merge, which shadows correctly for other reasons — so these tests would
+	// pass vacuously rather than fail. If you change index selection, re-verify that
+	// reverting `pkNormalizers` to `resolveKeyNormalizer` still makes them fail.
 	describe('secondary-index scan under a custom PK collation', () => {
 		it('shadows the base row exactly once when the PK is rewritten to a collation-equal value', async () => {
 			// Same override-NOCASE probe as above, but the read path is a secondary-index
@@ -165,6 +170,26 @@ describe('IsolatedTable collation resolution', () => {
 			}
 			expect(err, 'expected a missing-key-normalizer error').to.not.be.null;
 			expect(err!.message).to.match(/has no key normalizer/i);
+			await db.exec(`rollback`);
+		});
+
+		it('needs no key normalizer for a PK column whose type can never hold text', async () => {
+			// `serializeRowKey` normalizes only string values, so an INTEGER PK buckets by
+			// value under any collation. INTEGER declares no supported-collation list, so DDL
+			// accepts the name; demanding a normalizer here would reject a valid query that
+			// the engine's own hash sites (`hashKeyCollationName`) accept.
+			db.registerCollation('MYCOLL', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
+			await db.exec(`create table t (n integer collate MYCOLL primary key, v integer) using isolated`);
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(`insert into t values (1, 10), (2, 20)`);
+
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 11 where n = 1`);
+
+			const rows = await collect(db, `select n, v from t where v = 11`);
+			expect(rows, 'the staged row shadows the base row exactly once').to.deep.equal([
+				{ n: 1, v: 11 },
+			]);
 			await db.exec(`rollback`);
 		});
 	});

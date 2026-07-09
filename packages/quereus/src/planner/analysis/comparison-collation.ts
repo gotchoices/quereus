@@ -313,7 +313,7 @@ function isStaticallyNonTextual(node: ScalarPlanNode): boolean {
  *
  * NOTE: deliberately stricter than {@link isNonTextualLogicalType} above, which exempts
  * `JSON` and is the subject of `bug-json-columns-classified-as-non-textual`. Mirrors
- * `columnCanHoldText` in `quereus-store/src/common/store-table.ts`; the three collapse into
+ * `columnCanHoldText` in `quereus-store/src/common/store-table.ts`; the two collapse into
  * one predicate once that ticket lands.
  */
 const NEVER_TEXT_PHYSICAL_TYPES: ReadonlySet<PhysicalType> = new Set([
@@ -323,12 +323,25 @@ const NEVER_TEXT_PHYSICAL_TYPES: ReadonlySet<PhysicalType> = new Set([
 	PhysicalType.BOOLEAN,
 ]);
 
+/**
+ * True when a value of this logical type could be a text string at runtime. Absent
+ * type ⇒ unknown ⇒ yes.
+ *
+ * The gate for "does this key need a key normalizer": key serialization applies a
+ * normalizer only to a string value, so a key that can never hold text never consults
+ * the collation. Callers outside the planner (the isolation overlay's modified-PK set)
+ * hold a `ColumnSchema` rather than a `ScalarType`, hence the split from
+ * {@link hashKeyCollationName}.
+ */
+export function logicalTypeCanHoldText(logicalType: LogicalType | undefined): boolean {
+	if (!logicalType) return true;
+	if (logicalType.isTextual === true) return true;
+	return !NEVER_TEXT_PHYSICAL_TYPES.has(logicalType.physicalType);
+}
+
 /** True when a value of this type could be a text string at runtime. Absent type ⇒ unknown ⇒ yes. */
 function typeCanHoldText(t: ScalarType): boolean {
-	const lt = t.logicalType;
-	if (!lt) return true;
-	if (lt.isTextual === true) return true;
-	return !NEVER_TEXT_PHYSICAL_TYPES.has(lt.physicalType);
+	return logicalTypeCanHoldText(t.logicalType);
 }
 
 /**
