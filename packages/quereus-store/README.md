@@ -54,6 +54,20 @@ This design eliminates redundant prefixes and groups related stores together by 
 
 **Catalog DDL is re-persisted on catalog-only mutations.** `ALTER … SET TAGS` (and the programmatic `setTableTags` / `setColumnTags` / `setConstraintTags` / `setViewTags` / `setMaterializedViewTags`), plus `CREATE`/`DROP VIEW` and `CREATE`/`DROP MATERIALIZED VIEW`, never reach `module.alterTable`/`module.destroy`. The module subscribes to the engine's schema-change events (`table_modified`, the `view_*` events, and the `materialized_view_*` events) and writes the matching `__catalog__` entry when its `generate*DDL` output changes — table / column / constraint / **index** / **view** / **materialized-view** tags, and view/MV lifecycle, all survive close → reopen. A table's bundle is its `CREATE TABLE` DDL, one `CREATE [UNIQUE] INDEX` line per secondary index, and one trailing `alter index … set tags (…)` line per *exposed implicit index* carrying user tags (an exposed implicit index is never materialized in store mode, so its `UniqueConstraintSchema.exposedIndexTags` has no `CREATE INDEX` line to ride; the alter line re-applies silently on import). These async writes are serialized and drained by `closeAll()` (or the `whenCatalogPersisted()` barrier) before the provider closes. On reopen, `rehydrateCatalog` classifies entries by key prefix and imports them in phases — tables → views → materialized views, all through the engine's `importCatalog` (MVs re-materialize silently via the shared create core, dependency-ordered for MV-over-MV by fixpoint retry). See [`docs/schema.md`](../../docs/schema.md#view-and-materialized-view-persistence) for the full design.
 
+**How a UNIQUE constraint is enforced.** For each row written, the store looks for a conflicting row through the cheapest sound route available:
+
+1. **A linked row-time covering materialized view** — its backing table answers the uniqueness question.
+2. **A physical secondary index realizing the constraint** — one bounded seek into the index store. Available when the constraint came from a `CREATE UNIQUE INDEX` (it names its own index), or when some *full* (non-partial) index's columns exactly match the constraint's. The index need not itself be UNIQUE.
+3. **A full scan of the data store** — always correct, and O(rows) per row written.
+
+Route 2 turns a bulk insert from O(n²) into roughly O(n log n). It is skipped for a constraint the index cannot answer soundly:
+
+- A plain `UNIQUE` declared at `CREATE TABLE` (or added by `ALTER TABLE … ADD CONSTRAINT`) gets **no** backing index store here — unlike the memory backend, the store never materializes an implicit per-constraint index — so it full-scans unless a matching `CREATE INDEX` happens to exist.
+- A **partial** index cannot serve a constraint it does not derive from: it physically omits its out-of-scope rows, so a seek would miss a conflict among them.
+- Index-column bytes are encoded under the **table key collation** `K` (the `collation` module option, default `NOCASE`), not under the constraint's enforcement collation `C`. A seek returns exactly the rows `K`-equal to the new row, so it is a sound *superset* of the true conflict set only when `K` is coarser-than-or-equal-to `C` (non-text column; `C == K`; or `K = NOCASE` over `C = BINARY`). When `K` is finer — `K = BINARY` over `C = NOCASE`, or `K = NOCASE` over `C = RTRIM` — a seek would under-fetch and silently accept a real duplicate, so the constraint falls back to the full scan.
+
+Whichever route runs, the conflicting row is re-validated identically: the row being written is excluded by primary key, each constrained column is compared under its enforcement collation (a `CREATE UNIQUE INDEX … (col COLLATE x)` enforces `x`, else the column's declared collation), and a partial constraint's predicate must hold on the candidate.
+
 ## Installation
 
 ```bash

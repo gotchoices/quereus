@@ -18,6 +18,8 @@ async function collect(db: Database, sql: string): Promise<Record<string, SqlVal
 import {
 	StoreModule,
 	InMemoryKVStore,
+	type IterateOptions,
+	type KVEntry,
 	type KVStoreProvider,
 } from '../src/index.js';
 
@@ -37,6 +39,55 @@ function createInMemoryProvider(): KVStoreProvider {
 		async closeAll() {
 			for (const store of stores.values()) await store.close();
 			stores.clear();
+		},
+	};
+}
+
+/**
+ * Data store that tallies how many entries its `iterate` actually YIELDS.
+ * Counting yielded entries (not `iterate` calls) is what separates an O(rows)
+ * full scan from a bounded index seek: the full-scan UNIQUE check bails out
+ * early on a conflict, so call-counting would under-report it. Mirrors
+ * `pushdown.spec.ts`' CountingKVStore.
+ */
+class CountingKVStore extends InMemoryKVStore {
+	public iterateEntryCount = 0;
+	override async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
+		for await (const entry of super.iterate(options)) {
+			this.iterateEntryCount++;
+			yield entry;
+		}
+	}
+}
+
+/**
+ * An in-memory provider whose DATA stores count iterated entries; index / stats
+ * / catalog stores stay plain, so only data-row iteration is tallied.
+ */
+function createCountingProvider(): KVStoreProvider & { dataEntriesScanned(table: string): number } {
+	const dataStores = new Map<string, CountingKVStore>();
+	const auxStores = new Map<string, InMemoryKVStore>();
+	const aux = (key: string) => {
+		if (!auxStores.has(key)) auxStores.set(key, new InMemoryKVStore());
+		return auxStores.get(key)!;
+	};
+	return {
+		dataEntriesScanned(table: string) { return dataStores.get(`main.${table}`)?.iterateEntryCount ?? 0; },
+		async getStore(s, t) {
+			const key = `${s}.${t}`;
+			if (!dataStores.has(key)) dataStores.set(key, new CountingKVStore());
+			return dataStores.get(key)!;
+		},
+		async getIndexStore(s, t, i) { return aux(`${s}.${t}_idx_${i}`); },
+		async getStatsStore(s, t) { return aux(`${s}.${t}.__stats__`); },
+		async getCatalogStore() { return aux('__catalog__'); },
+		async closeStore() {},
+		async closeIndexStore() {},
+		async closeAll() {
+			for (const store of dataStores.values()) await store.close();
+			for (const store of auxStores.values()) await store.close();
+			dataStores.clear();
+			auxStores.clear();
 		},
 	};
 }
@@ -539,6 +590,268 @@ describe('StoreTable UNIQUE constraints', () => {
 			// OR REPLACE: the NOCASE-equal duplicate (id=1) is evicted, the new row lands.
 			await db.exec(`INSERT OR REPLACE INTO cr VALUES (3, 'BOB')`);
 			expect(await collect(db, `SELECT id, b FROM cr ORDER BY id`)).to.deep.equal([{ id: 3, b: 'BOB' }]);
+		});
+	});
+
+	// When a UNIQUE constraint is realized by a physical secondary index, the conflict
+	// search is a bounded seek into that index rather than a full table scan
+	// (store-unique-check-via-index). The index seek only narrows the CANDIDATE set —
+	// the self-PK exclusion, per-column enforcement-collation compare and partial
+	// predicate re-check are identical to the full-scan finder, so every behaviour
+	// pinned above must survive the reroute. These tests pin the reroute's own edges.
+	describe('index-backed UNIQUE point lookup', () => {
+		async function rejects(sql: string): Promise<void> {
+			let err: Error | null = null;
+			try { await db.exec(sql); } catch (e) { err = e as Error; }
+			expect(err, `expected "${sql}" to be rejected`).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+		}
+
+		it('an index-derived UNIQUE rejects a duplicate and admits a distinct value', async () => {
+			await db.exec(`CREATE TABLE ix1 (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ix1_v ON ix1 (v)`);
+			await db.exec(`INSERT INTO ix1 VALUES (1, 'aaa'), (2, 'bbb')`);
+			await rejects(`INSERT INTO ix1 VALUES (3, 'aaa')`);
+			await db.exec(`INSERT INTO ix1 VALUES (3, 'ccc')`);
+			expect(await collect(db, `SELECT id, v FROM ix1 ORDER BY id`)).to.deep.equal([
+				{ id: 1, v: 'aaa' }, { id: 2, v: 'bbb' }, { id: 3, v: 'ccc' },
+			]);
+		});
+
+		it('a NON-unique index over a table-level UNIQUE still serves the check', async () => {
+			// The index need not be UNIQUE — a plain index over the constrained columns
+			// holds every row, so a seek narrows the candidate set soundly.
+			await db.exec(`CREATE TABLE nu (id INTEGER PRIMARY KEY, v TEXT, UNIQUE (v)) USING store`);
+			await db.exec(`CREATE INDEX nu_v ON nu (v)`);
+			await db.exec(`INSERT INTO nu VALUES (1, 'aaa')`);
+			await rejects(`INSERT INTO nu VALUES (2, 'aaa')`);
+			await db.exec(`INSERT INTO nu VALUES (2, 'bbb')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM nu`)).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('multiple NULLs insert — the seek is never reached for a NULL key', async () => {
+			await db.exec(`CREATE TABLE ixn (id INTEGER PRIMARY KEY, v TEXT NULL) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ixn_v ON ixn (v)`);
+			await db.exec(`INSERT INTO ixn VALUES (1, null), (2, null), (3, null)`);
+			await db.exec(`INSERT INTO ixn VALUES (4, 'x')`);
+			await rejects(`INSERT INTO ixn VALUES (5, 'x')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ixn`)).to.deep.equal([{ n: 4 }]);
+		});
+
+		it('detects an intra-transaction duplicate through the pending index merge', async () => {
+			await db.exec(`CREATE TABLE ryw (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ryw_v ON ryw (v)`);
+
+			await db.exec(`begin`);
+			await db.exec(`INSERT INTO ryw VALUES (1, 'dup')`);
+			// The pending index put for row 1 must be visible to row 2's seek.
+			await rejects(`INSERT INTO ryw VALUES (2, 'dup')`);
+			await db.exec(`rollback`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ryw`)).to.deep.equal([{ n: 0 }]);
+		});
+
+		it('a delete within the transaction frees the value for re-insert', async () => {
+			await db.exec(`CREATE TABLE rywd (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX rywd_v ON rywd (v)`);
+			await db.exec(`INSERT INTO rywd VALUES (1, 'v')`); // committed
+
+			await db.exec(`begin`);
+			await db.exec(`DELETE FROM rywd WHERE id = 1`);
+			// The pending index delete must suppress the committed entry for row 1.
+			await db.exec(`INSERT INTO rywd VALUES (2, 'v')`);
+			await db.exec(`commit`);
+			expect(await collect(db, `SELECT id, v FROM rywd ORDER BY id`)).to.deep.equal([{ id: 2, v: 'v' }]);
+		});
+
+		it('an UPDATE that keeps the unique value is not a self-conflict', async () => {
+			await db.exec(`CREATE TABLE ixu (id INTEGER PRIMARY KEY, v TEXT, w INTEGER) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ixu_v ON ixu (v)`);
+			await db.exec(`INSERT INTO ixu VALUES (1, 'a', 10), (2, 'b', 20)`);
+
+			// Re-writing the row's own unique value: selfPks excludes it.
+			await db.exec(`UPDATE ixu SET v = 'a', w = 11 WHERE id = 1`);
+			// Moving onto another row's value conflicts.
+			await rejects(`UPDATE ixu SET v = 'a' WHERE id = 2`);
+			// A PK-change UPDATE passes [oldPk, newPk]; neither may self-match.
+			await db.exec(`UPDATE ixu SET id = 3 WHERE id = 2`);
+			expect(await collect(db, `SELECT id, v, w FROM ixu ORDER BY id`)).to.deep.equal([
+				{ id: 1, v: 'a', w: 11 }, { id: 3, v: 'b', w: 20 },
+			]);
+		});
+
+		it('OR REPLACE evicts the row the index seek found', async () => {
+			await db.exec(`CREATE TABLE ixr (id INTEGER PRIMARY KEY, v TEXT, tag TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ixr_v ON ixr (v)`);
+			await db.exec(`INSERT INTO ixr VALUES (1, 'a', 'old'), (2, 'b', 'keep')`);
+
+			await db.exec(`INSERT OR REPLACE INTO ixr VALUES (9, 'a', 'new')`);
+			expect(await collect(db, `SELECT id, v, tag FROM ixr ORDER BY id`)).to.deep.equal([
+				{ id: 2, v: 'b', tag: 'keep' }, { id: 9, v: 'a', tag: 'new' },
+			]);
+			// The evicted row's index entry is gone too: 'a' is free again.
+			await db.exec(`INSERT OR REPLACE INTO ixr VALUES (10, 'a', 'newer')`);
+			expect(await collect(db, `SELECT id, v FROM ixr ORDER BY id`)).to.deep.equal([
+				{ id: 2, v: 'b' }, { id: 10, v: 'a' },
+			]);
+		});
+
+		it('a REPLACE eviction and a re-insert of the same value in ONE statement agree', async () => {
+			// Row 1 is evicted by row 9 (queueing an index delete), then row 10 collides
+			// with row 9 and evicts it. Every step reads the pending index merge.
+			await db.exec(`CREATE TABLE ixm (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ixm_v ON ixm (v)`);
+			await db.exec(`INSERT INTO ixm VALUES (1, 'a')`);
+			await db.exec(`INSERT OR REPLACE INTO ixm VALUES (9, 'a'), (10, 'a')`);
+			expect(await collect(db, `SELECT id, v FROM ixm ORDER BY id`)).to.deep.equal([{ id: 10, v: 'a' }]);
+		});
+
+		it('a composite unique index seeks on ALL its columns', async () => {
+			await db.exec(`CREATE TABLE ixc (id INTEGER PRIMARY KEY, a TEXT, b INTEGER) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ixc_ab ON ixc (a, b)`);
+			await db.exec(`INSERT INTO ixc VALUES (1, 'x', 1), (2, 'x', 2), (3, 'y', 1)`);
+			// A leading-column-only match must NOT be treated as a conflict.
+			await db.exec(`INSERT INTO ixc VALUES (4, 'x', 3)`);
+			await rejects(`INSERT INTO ixc VALUES (5, 'x', 1)`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ixc`)).to.deep.equal([{ n: 4 }]);
+		});
+
+		it('a DESC index column encodes its seek bounds inverted', async () => {
+			await db.exec(`CREATE TABLE ixd (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ixd_v ON ixd (v DESC)`);
+			await db.exec(`INSERT INTO ixd VALUES (1, 'aaa'), (2, 'bbb')`);
+			await rejects(`INSERT INTO ixd VALUES (3, 'bbb')`);
+			await db.exec(`INSERT INTO ixd VALUES (3, 'ccc')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ixd`)).to.deep.equal([{ n: 3 }]);
+		});
+
+		it('a partial unique index constrains only its in-scope rows', async () => {
+			await db.exec(`CREATE TABLE ixp (id INTEGER PRIMARY KEY, v TEXT, active INTEGER) USING store`);
+			await db.exec(`CREATE UNIQUE INDEX ixp_v ON ixp (v) WHERE active = 1`);
+			await db.exec(`INSERT INTO ixp VALUES (1, 'dup', 1)`);
+			// Out of scope (active = 0): no conflict, and no index entry is written.
+			await db.exec(`INSERT INTO ixp VALUES (2, 'dup', 0)`);
+			await db.exec(`INSERT INTO ixp VALUES (3, 'dup', 0)`);
+			// In scope: conflicts with row 1.
+			await rejects(`INSERT INTO ixp VALUES (4, 'dup', 1)`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ixp`)).to.deep.equal([{ n: 3 }]);
+			// Moving an out-of-scope row INTO scope now collides.
+			await rejects(`UPDATE ixp SET active = 1 WHERE id = 2`);
+			// Moving the in-scope row OUT frees the value.
+			await db.exec(`UPDATE ixp SET active = 0 WHERE id = 1`);
+			await db.exec(`UPDATE ixp SET active = 1 WHERE id = 2`);
+			expect(await collect(db, `SELECT id FROM ixp WHERE active = 1`)).to.deep.equal([{ id: 2 }]);
+		});
+
+		it('a non-derived UNIQUE never seeks a PARTIAL index (it omits out-of-scope rows)', async () => {
+			// The table-level UNIQUE(v) covers every row; the partial index over the same
+			// column holds only `active = 1` rows. Seeking it would miss the conflict with
+			// row 1, so the constraint must fall back to the full scan.
+			await db.exec(`CREATE TABLE ixq (id INTEGER PRIMARY KEY, v TEXT, active INTEGER, UNIQUE (v)) USING store`);
+			await db.exec(`CREATE INDEX ixq_v ON ixq (v) WHERE active = 1`);
+			await db.exec(`INSERT INTO ixq VALUES (1, 'dup', 0)`); // not in the partial index
+			await rejects(`INSERT INTO ixq VALUES (2, 'dup', 1)`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ixq`)).to.deep.equal([{ n: 1 }]);
+		});
+
+		// Collation guard: index-column bytes are encoded under the TABLE KEY collation K,
+		// not the constraint's enforcement collation C. A seek is a sound superset only
+		// when K is coarser-or-equal to C. With K = BINARY and C = NOCASE it UNDER-fetches,
+		// so the constraint must fall back to the full scan or a real duplicate is admitted.
+		describe('collation guard', () => {
+			it('K = BINARY over C = NOCASE falls back to the full scan (still rejects the dup)', async () => {
+				await db.exec(`CREATE TABLE gb (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store(collation = 'BINARY')`);
+				await db.exec(`CREATE UNIQUE INDEX gb_b ON gb (b)`);
+				await db.exec(`INSERT INTO gb VALUES (1, 'Bob')`);
+				// 'BOB' is NOCASE-equal to 'Bob' but BINARY-distinct: its index bytes land in
+				// a DIFFERENT seek window, so an unguarded seek would find nothing.
+				await rejects(`INSERT INTO gb VALUES (2, 'BOB')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gb`)).to.deep.equal([{ n: 1 }]);
+				await db.exec(`INSERT INTO gb VALUES (3, 'Carol')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gb`)).to.deep.equal([{ n: 2 }]);
+			});
+
+			it('K = BINARY over C = RTRIM falls back to the full scan', async () => {
+				await db.exec(`CREATE TABLE gr (id INTEGER PRIMARY KEY, b TEXT COLLATE RTRIM) USING store(collation = 'BINARY')`);
+				await db.exec(`CREATE UNIQUE INDEX gr_b ON gr (b)`);
+				await db.exec(`INSERT INTO gr VALUES (1, 'abc')`);
+				await rejects(`INSERT INTO gr VALUES (2, 'abc   ')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gr`)).to.deep.equal([{ n: 1 }]);
+			});
+
+			it('K = NOCASE over C = RTRIM falls back to the full scan', async () => {
+				// NOCASE is not coarser than RTRIM: 'abc' and 'abc   ' are RTRIM-equal but
+				// encode to different NOCASE bytes.
+				await db.exec(`CREATE TABLE gn (id INTEGER PRIMARY KEY, b TEXT COLLATE RTRIM) USING store`);
+				await db.exec(`CREATE UNIQUE INDEX gn_b ON gn (b)`);
+				await db.exec(`INSERT INTO gn VALUES (1, 'abc')`);
+				await rejects(`INSERT INTO gn VALUES (2, 'abc   ')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gn`)).to.deep.equal([{ n: 1 }]);
+			});
+
+			it('an ANY column is treated as potentially textual (K = BINARY over C = NOCASE)', async () => {
+				// ANY carries no `isTextual` marker and a NULL physicalType, but its `parse`
+				// is the identity — it stores text as text and keys it through the collation
+				// encoder. Exempting it as "non-text" would skip the guard and admit the dup.
+				await db.exec(`CREATE TABLE ga (id INTEGER PRIMARY KEY, x ANY COLLATE NOCASE) USING store(collation = 'BINARY')`);
+				await db.exec(`CREATE UNIQUE INDEX ga_x ON ga (x)`);
+				await db.exec(`INSERT INTO ga VALUES (1, 'Bob')`);
+				await rejects(`INSERT INTO ga VALUES (2, 'BOB')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM ga`)).to.deep.equal([{ n: 1 }]);
+			});
+
+			it('K = BINARY over C = BINARY seeks the index (equal collations)', async () => {
+				await db.exec(`CREATE TABLE gq (id INTEGER PRIMARY KEY, b TEXT) USING store(collation = 'BINARY')`);
+				await db.exec(`CREATE UNIQUE INDEX gq_b ON gq (b)`);
+				await db.exec(`INSERT INTO gq VALUES (1, 'Bob')`);
+				await db.exec(`INSERT INTO gq VALUES (2, 'BOB')`); // BINARY-distinct ⇒ admitted
+				await rejects(`INSERT INTO gq VALUES (3, 'Bob')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gq`)).to.deep.equal([{ n: 2 }]);
+			});
+
+			it('K = NOCASE over C = BINARY seeks the index and re-validates under BINARY', async () => {
+				// K strictly coarser: the seek for 'bob' also returns 'Bob''s entry, which
+				// the BINARY re-validation discards.
+				await db.exec(`CREATE TABLE gc (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE) USING store`);
+				await db.exec(`CREATE UNIQUE INDEX gc_b ON gc (b COLLATE BINARY)`);
+				await db.exec(`INSERT INTO gc VALUES (1, 'Bob')`);
+				await db.exec(`INSERT INTO gc VALUES (2, 'bob')`);
+				await rejects(`INSERT INTO gc VALUES (3, 'bob')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gc`)).to.deep.equal([{ n: 2 }]);
+			});
+		});
+
+		// The point of the reroute: inserting n rows under a UNIQUE constraint must not
+		// re-scan the n already-present rows. Asserted structurally (entries yielded by the
+		// data store's iterators) rather than by wall-clock, so it cannot flake.
+		describe('scaling', () => {
+			const ROWS = 100;
+
+			it('an index-backed UNIQUE never full-scans the data store; a bare UNIQUE does', async () => {
+				const counting = createCountingProvider();
+				const cdb = new Database();
+				cdb.registerModule('store', new StoreModule(counting));
+				try {
+					await cdb.exec(`CREATE TABLE bare (id INTEGER PRIMARY KEY, v INTEGER, UNIQUE (v)) USING store`);
+					await cdb.exec(`CREATE TABLE idxd (id INTEGER PRIMARY KEY, v INTEGER) USING store`);
+					await cdb.exec(`CREATE UNIQUE INDEX idxd_v ON idxd (v)`);
+
+					for (let i = 0; i < ROWS; i++) {
+						await cdb.exec(`INSERT INTO bare VALUES (${i}, ${i})`);
+						await cdb.exec(`INSERT INTO idxd VALUES (${i}, ${i})`);
+					}
+
+					// The bare UNIQUE re-scans every prior row: Θ(ROWS²/2) entries.
+					expect(counting.dataEntriesScanned('bare')).to.be.greaterThan(ROWS * 10);
+					// The index-backed UNIQUE resolves each candidate by data-store `get`,
+					// never by iterating the data store.
+					expect(counting.dataEntriesScanned('idxd')).to.equal(0);
+
+					expect(await collect(cdb, `SELECT count(*) AS n FROM idxd`)).to.deep.equal([{ n: ROWS }]);
+				} finally {
+					await cdb.close();
+					await counting.closeAll();
+				}
+			});
 		});
 	});
 });

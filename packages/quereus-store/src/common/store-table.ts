@@ -22,6 +22,7 @@ import {
 	compilePredicate,
 	maintainedTableUniqueViolationError,
 	uniqueEnforcementCollations,
+	PhysicalType,
 	type Database,
 	type DatabaseInternal,
 	type ColumnSchema,
@@ -124,6 +125,39 @@ export function resolvePkKeyCollations(
 		return (col.collation || fallback).toUpperCase();
 	});
 }
+
+/**
+ * True when `col` can produce a TEXT value at runtime, and so when its physical
+ * key bytes are produced by a collation encoder rather than a type-native
+ * encoding. Both collation-safety guards over the store's secondary indexes —
+ * the write-side {@link StoreTable.indexSeekHonorsEnforcementCollation} and the
+ * read-side `StoreModule.tryIndexAccessPlan` — exempt a never-text column from
+ * their K-vs-C comparison, so a false "non-text" answer here is a silent
+ * wrong-result (a seek under the wrong collation, with the residual dropped).
+ *
+ * Mirrors the engine's `isNonTextualLogicalType`
+ * (planner/analysis/comparison-collation.ts), negated. A bare `isTextual` test
+ * is NOT sufficient: `ANY` carries no `isTextual` marker and a `physicalType` of
+ * NULL, yet its `parse` is the identity, so an `ANY` column stores text as text
+ * and keys it through the collation encoder. An absent logical type is unknown —
+ * treated as potentially textual.
+ */
+export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
+	const lt = col?.logicalType;
+	if (!lt) return true;
+	return lt.isTextual === true || lt.physicalType === PhysicalType.TEXT || lt.name === 'ANY';
+}
+
+/** A UNIQUE conflict: the offending row and the primary key it lives at. */
+type UniqueConflict = { pk: SqlValue[]; row: Row };
+
+/**
+ * Returned by {@link StoreTable.findUniqueConflictViaIndex} when the index
+ * cannot soundly answer the check and the caller must fall back to the full
+ * data-store scan. Distinct from `null`, which means "the index answered: no
+ * conflict".
+ */
+const INDEX_UNUSABLE = Symbol('store.uniqueIndexUnusable');
 
 /**
  * Configuration for a store table.
@@ -1655,15 +1689,7 @@ export class StoreTable extends VirtualTable {
 			const predicate = this.compileFor(uc);
 			if (predicate && predicate.evaluate(newRow) !== true) continue;
 
-			// Prefer a linked row-time covering MV: its backing table (hosted by any
-			// backing-host-capable module — memory by default, this store module under
-			// `using store` — queried through the db with reads-own-writes) answers
-			// the uniqueness question, mirroring the memory enforcement path. Falls
-			// back to the per-scan source search when no row-time covering MV exists.
-			const coveringMv = (this.db as DatabaseInternal)._findRowTimeCoveringStructure(schema.schemaName, schema.name, uc);
-			const conflict = coveringMv
-				? await this.findUniqueConflictViaCoveringMv(coveringMv, uc, predicate, newRow, selfPks)
-				: await this.findUniqueConflict(uc, predicate, newRow, selfPks);
+			const conflict = await this.findUniqueConflictFor(uc, predicate, newRow, selfPks);
 			if (!conflict) continue;
 
 			// Resolve action per-constraint: statement OR > per-UC default > ABORT.
@@ -1694,6 +1720,184 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
+	 * Route one UNIQUE constraint's conflict search to the cheapest SOUND finder,
+	 * in descending preference:
+	 *
+	 *  1. A linked row-time covering MV — its backing table (hosted by any
+	 *     backing-host-capable module — memory by default, this store module under
+	 *     `using store` — queried through the db with reads-own-writes) answers the
+	 *     uniqueness question, mirroring the memory enforcement path.
+	 *  2. A physical secondary index realizing the constraint — one prefix seek
+	 *     instead of a full table scan (see {@link findIndexForUniqueConstraint}).
+	 *  3. The full data-store scan ({@link findUniqueConflict}) — always correct,
+	 *     O(rows) per checked row.
+	 *
+	 * Every finder returns the SAME `{pk, row}` shape, so the caller's conflict
+	 * action (ABORT / IGNORE / REPLACE eviction) is finder-independent.
+	 */
+	private async findUniqueConflictFor(
+		uc: UniqueConstraintSchema,
+		predicate: CompiledPredicate | undefined,
+		newRow: Row,
+		selfPks: SqlValue[][],
+	): Promise<UniqueConflict | null> {
+		const schema = this.tableSchema!;
+		const coveringMv = (this.db as DatabaseInternal)._findRowTimeCoveringStructure(schema.schemaName, schema.name, uc);
+		if (coveringMv) return this.findUniqueConflictViaCoveringMv(coveringMv, uc, predicate, newRow, selfPks);
+
+		const index = this.findIndexForUniqueConstraint(uc);
+		if (index) {
+			const viaIndex = await this.findUniqueConflictViaIndex(index, uc, predicate, newRow, selfPks);
+			if (viaIndex !== INDEX_UNUSABLE) return viaIndex;
+		}
+		return this.findUniqueConflict(uc, predicate, newRow, selfPks);
+	}
+
+	/**
+	 * The `schema.indexes` entry whose physical index store can serve `uc`'s
+	 * conflict search as a point seek, or undefined when none can.
+	 *
+	 * The store materializes an index store ONLY for an explicit `CREATE INDEX` /
+	 * `CREATE UNIQUE INDEX` — a plain column- or table-level `UNIQUE` gets a
+	 * `uniqueConstraints` entry but no backing store (unlike the memory backend,
+	 * which auto-builds an implicit `_uc_*` covering index). So a UC is
+	 * index-servable only when:
+	 *
+	 *  - it is index-derived (`derivedFromIndex`, from `CREATE UNIQUE INDEX`) and
+	 *    its named index is still present — the index's partial predicate then
+	 *    equals the constraint's by construction (`appendIndexToTableSchema`); or
+	 *  - some FULL (non-partial) index's columns equal `uc.columns` positionally.
+	 *    A partial index cannot serve a non-derived UC: it physically omits its
+	 *    out-of-scope rows, so a seek would MISS a conflict among them. The index
+	 *    need not be UNIQUE — a plain index over the constrained columns still
+	 *    holds every row and narrows the candidate set.
+	 *
+	 * Collation guard (see {@link indexSeekHonorsEnforcementCollation}) may still
+	 * reject the found index, which routes the check back to the full scan.
+	 */
+	private findIndexForUniqueConstraint(uc: UniqueConstraintSchema): TableIndexSchema | undefined {
+		// NOTE: re-resolved for every constrained ROW written, and the collation guard
+		// below re-derives `uniqueEnforcementCollations` each time. Both are linear in
+		// `schema.indexes` / `uc.columns` and dwarfed by the seek's I/O, so this is fine
+		// now. If a table with many indexes ever shows up on an insert-heavy profile,
+		// memoize the (uc → index | undefined) resolution in a WeakMap keyed on the
+		// frozen UniqueConstraintSchema, as `predicateCache` above does — a CREATE/DROP
+		// INDEX yields fresh constraint objects, so such a cache invalidates itself.
+		const indexes = this.tableSchema?.indexes;
+		if (!indexes || indexes.length === 0) return undefined;
+
+		const index = uc.derivedFromIndex
+			? indexes.find(ix => ix.name === uc.derivedFromIndex)
+			: indexes.find(ix => !ix.predicate
+				&& ix.columns.length === uc.columns.length
+				&& ix.columns.every((c, i) => c.index === uc.columns[i]));
+		if (!index) return undefined;
+		return this.indexSeekHonorsEnforcementCollation(uc) ? index : undefined;
+	}
+
+	/**
+	 * True when a point seek into the index realizing `uc` returns a SUPERSET of
+	 * the constraint's true conflict set — the only condition under which the
+	 * seek may replace the full scan.
+	 *
+	 * An index key's leading (index-column) bytes are encoded under the TABLE KEY
+	 * collation K (`buildIndexKey` passes `this.encodeOptions`), NOT the index's
+	 * declared per-column COLLATE and NOT the constraint's enforcement collation
+	 * C (`uniqueEnforcementCollations` — the index's per-column COLLATE for an
+	 * index-derived UC, else the declared column collation). A seek therefore
+	 * fetches exactly `{rows K-equal to newRow}` while the re-validation keeps
+	 * `{rows C-equal to newRow}`. Soundness needs
+	 * `{C-equal} ⊆ {K-equal}`, i.e. K must be COARSER-OR-EQUAL to C per column:
+	 *
+	 *  - non-text column → its bytes are type-native, collation-independent: safe.
+	 *  - C == K → the sets coincide: safe.
+	 *  - K = NOCASE, C = BINARY → K strictly coarser: safe superset.
+	 *  - otherwise (K = BINARY over C = NOCASE/RTRIM; K = NOCASE over C = RTRIM)
+	 *    the seek UNDER-fetches and a real duplicate would be silently accepted:
+	 *    reject, so the caller full-scans.
+	 *
+	 * Also rejects when K has no registered byte encoder (its window bytes would
+	 * not track logical order). Same direction and same admitted cases as the
+	 * read-side guard in `StoreModule.tryIndexAccessPlan`; conservative rather
+	 * than exhaustive (K = RTRIM over C = BINARY is provably safe but declined),
+	 * which costs an optimization, never correctness.
+	 */
+	private indexSeekHonorsEnforcementCollation(uc: UniqueConstraintSchema): boolean {
+		const schema = this.tableSchema!;
+		const K = (this.encodeOptions.collation ?? 'NOCASE').toUpperCase();
+		if (getCollationEncoder(K) === undefined) return false;
+
+		const collations = uniqueEnforcementCollations(schema, uc);
+		return uc.columns.every((colIdx, i) => {
+			if (!columnCanHoldText(schema.columns[colIdx])) return true;
+			const C = (collations[i] ?? 'BINARY').toUpperCase();
+			return C === K || (K === 'NOCASE' && C === 'BINARY');
+		});
+	}
+
+	/**
+	 * The index analogue of {@link findUniqueConflict}: seek the index realizing
+	 * `uc` at the point formed by `newRow`'s constrained-column values, and
+	 * re-validate each resolved candidate exactly as the full scan does.
+	 *
+	 * The seek encodes ALL of `uc.columns` (positionally aligned with the index's
+	 * columns, guaranteed by `appendIndexToTableSchema` / the column-set match in
+	 * {@link findIndexForUniqueConstraint}) as a leading prefix of the index key,
+	 * under the same key collation and per-column DESC directions
+	 * {@link updateSecondaryIndexes} used to write it. The remaining suffix is the
+	 * row's PK, so the window spans every entry sharing those column values.
+	 * {@link iterateEffective} merges this transaction's pending index puts/deletes
+	 * over the committed entries, giving read-your-own-writes; each entry resolves
+	 * to its LIVE row through the data key stored as the entry's value.
+	 *
+	 * The seek only narrows the CANDIDATE set to a superset (guaranteed by
+	 * {@link indexSeekHonorsEnforcementCollation}); the authoritative comparison is
+	 * the identical self-PK exclusion, per-column enforcement-collation compare,
+	 * and partial-predicate scope check the full scan performs. A partial index
+	 * already excludes out-of-scope rows physically — the predicate re-check is
+	 * kept as defense in depth.
+	 *
+	 * Returns {@link INDEX_UNUSABLE} rather than a (possibly wrong) answer when an
+	 * entry carries a legacy empty value.
+	 */
+	private async findUniqueConflictViaIndex(
+		index: TableIndexSchema,
+		uc: UniqueConstraintSchema,
+		predicate: CompiledPredicate | undefined,
+		newRow: Row,
+		selfPks: SqlValue[][],
+	): Promise<UniqueConflict | null | typeof INDEX_UNUSABLE> {
+		const indexStore = await this.ensureIndexStore(index.name);
+		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
+		const bounds = buildIndexPrefixBounds(
+			uc.columns.map(c => newRow[c]),
+			this.encodeOptions,
+			index.columns.map(c => !!c.desc),
+		);
+
+		for await (const entry of this.iterateEffective(indexStore, bounds)) {
+			// A legacy index store (written before index values carried the data key)
+			// holds EMPTY values. `scanIndex` may skip such an entry — a read that
+			// returns too few rows. Skipping here would instead ACCEPT a duplicate, so
+			// abandon the index and let the caller full-scan. See the NOTE in
+			// `scanIndex` for the durable fix.
+			if (entry.value.length === 0) return INDEX_UNUSABLE;
+
+			// Resolve to the LIVE row: a pending index delete normally suppresses the
+			// entry, but a committed entry can lag a row deleted this transaction.
+			const candidate = await this.readEffectiveRowByKey(entry.value);
+			if (!candidate) continue;
+
+			const pk = this.extractPK(candidate);
+			if (selfPks.some(skip => this.keysEqual(pk, skip))) continue;
+			if (uc.columns.some((c, i) => compareSqlValues(newRow[c], candidate[c], collations[i]) !== 0)) continue;
+			if (predicate && predicate.evaluate(candidate) !== true) continue;
+			return { pk, row: candidate };
+		}
+		return null;
+	}
+
+	/**
 	 * Scan committed + pending data rows for a row matching `newRow` on
 	 * `uc.columns` whose PK is not in `selfPks`. For partial UNIQUE, candidates
 	 * whose row does not satisfy the predicate are skipped. Returns the first
@@ -1704,7 +1908,7 @@ export class StoreTable extends VirtualTable {
 		predicate: CompiledPredicate | undefined,
 		newRow: Row,
 		selfPks: SqlValue[][],
-	): Promise<{ pk: SqlValue[]; row: Row } | null> {
+	): Promise<UniqueConflict | null> {
 		const store = await this.ensureStore();
 		// Pending ops for THIS table's data store handle — the same handle the
 		// write path queues data ops under, so the merge sees only this table's
@@ -1717,7 +1921,7 @@ export class StoreTable extends VirtualTable {
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
 		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
 
-		const matches = (candidate: Row): { pk: SqlValue[]; row: Row } | null => {
+		const matches = (candidate: Row): UniqueConflict | null => {
 			const pk = this.extractPK(candidate);
 			for (const skip of selfPks) {
 				if (this.keysEqual(pk, skip)) return null;
@@ -1768,7 +1972,7 @@ export class StoreTable extends VirtualTable {
 		predicate: CompiledPredicate | undefined,
 		newRow: Row,
 		selfPks: SqlValue[][],
-	): Promise<{ pk: SqlValue[]; row: Row } | null> {
+	): Promise<UniqueConflict | null> {
 		const newSourcePk = this.extractPK(newRow);
 		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
 		const candidates = await (this.db as DatabaseInternal)._lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
@@ -1887,8 +2091,10 @@ export class StoreTable extends VirtualTable {
 	 * and would miss a same-batch colliding pair. The conflict action is a hard
 	 * abort (a derivation write carries no user OR clause, and a declared
 	 * `on conflict replace`/`ignore` default must not evict or drop derived
-	 * rows). Per-image cost is one effective scan — the same full-scan posture
-	 * the store's DML UNIQUE enforcement already takes.
+	 * rows). Per-image cost is one effective full scan: unlike the DML path
+	 * ({@link findUniqueConflictFor}), this one is NOT routed through
+	 * {@link findUniqueConflictViaIndex}, because a backing table keeps no
+	 * secondary indexes by design — there is never an index store to seek.
 	 *
 	 * Zero overhead when the table declares no secondary UNIQUE (every MV-sugar
 	 * backing, and most maintained tables): one empty-array check.

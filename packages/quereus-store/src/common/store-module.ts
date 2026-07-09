@@ -43,7 +43,7 @@ import type { KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreBackingHost } from './backing-host.js';
-import { StoreTable, resolvePkKeyCollations, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable, resolvePkKeyCollations, columnCanHoldText, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
@@ -1986,7 +1986,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// must be a superset relative to C. See the guard doc above.
 		const safeToHandle = (colIdx: number): boolean => {
 			const col = tableInfo.columns[colIdx];
-			if (!col.logicalType.isTextual) return true;            // non-text: type-native bytes
+			// Exempt only columns that can NEVER hold text — their key bytes are
+			// type-native and collation-independent. A bare `isTextual` test wrongly
+			// exempts an `ANY` column (no marker, but it stores text as text), which
+			// would seek under K, drop the residual, and silently lose rows.
+			if (!columnCanHoldText(col)) return true;
 			const indexCol = index.columns.find(c => c.index === colIdx);
 			const C = (indexCol?.collation ?? col.collation ?? 'BINARY').toUpperCase();
 			if (C === K) return true;                               // equal

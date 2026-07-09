@@ -666,6 +666,25 @@ describe('StoreModule predicate pushdown', () => {
 			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 2 }]);
 		});
 
+		// Same guard, over an `ANY`-typed column. ANY carries no `isTextual` marker and a
+		// NULL physicalType, yet its `parse` is the identity — so it stores text as text
+		// and keys it through the collation encoder. The bare `!isTextual` exemption
+		// classified it as never-text, skipped the K-vs-C check, seeked under K = BINARY
+		// and dropped the residual: `where x = 'BOB'` returned NOTHING, while the SAME
+		// query over the SAME rows without an index returned the row. Creating an index
+		// must never change a query's results.
+		it('collation-unsafe index over an ANY column declines the seek but stays correct', async () => {
+			await db.exec(`create table t (id integer primary key, x ANY collate nocase) using store (collation = binary)`);
+			await db.exec(`insert into t values (1, 'Bob')`);
+
+			const q = `select id from t where x = 'BOB' order by id`;
+			// Pin the no-index answer first: it is the oracle the indexed plan must match.
+			expect(await asyncIterableToArray(db.eval(q)), 'NOCASE-equal row matches with no index').to.deep.equal([{ id: 1 }]);
+
+			await db.exec(`create index ix_x on t (x)`);
+			expect(await asyncIterableToArray(db.eval(q)), 'and still matches once an index exists').to.deep.equal([{ id: 1 }]);
+		});
+
 		// Regression: `tryIndexAccessPlan` must mark handled ONLY the constraints
 		// rule-select-access-path actually consumes — per seek column the FIRST '=', or
 		// the FIRST lower and FIRST upper bound (its `colConstraints.find(...)` picks by
