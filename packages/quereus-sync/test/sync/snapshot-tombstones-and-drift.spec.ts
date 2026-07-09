@@ -111,12 +111,19 @@ describe('non-streaming snapshot carries tombstones', () => {
 		// The global pass carried the tombstone even though R has no live column-versions;
 		// a per-table collection keyed off `snap.tables` would miss it (R's table is absent).
 		expect(snap.tombstones.length, 'snapshot carries the tombstone globally').to.be.greaterThan(0);
+		// The producer carries the delete before-image (the engine `oldRow`) into the snapshot.
+		const snapTs = snap.tombstones.find(t => t.table === 'orders' && String(t.pk[0]) === 'r1');
+		expect(snapTs?.priorRow, 'snapshot tombstone carries the before-image').to.deep.equal(['r1', 'hello']);
 
 		await receiver.manager.applySnapshot(snap);
 
 		// The receiver ends with the sender's tombstone for R.
 		const ts = await receiver.manager.tombstones.getTombstone('main', 'orders', ['r1']);
 		expect(ts, 'receiver has a tombstone for the deleted row after bootstrap').to.not.equal(undefined);
+		// The before-image round-trips: applySnapshot forwards priorRow to setTombstoneBatch,
+		// so the receiver's reconstructed tombstone still carries it.
+		expect(ts!.priorRow, 'receiver tombstone preserves the before-image after bootstrap')
+			.to.deep.equal(['r1', 'hello']);
 
 		// Deliver a stale write for R with HLC strictly older than the deletion, from a
 		// foreign site (so it is not self-origin-skipped).
