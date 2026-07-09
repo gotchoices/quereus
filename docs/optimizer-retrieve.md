@@ -197,122 +197,17 @@ export function emitRemoteQuery(plan: RemoteQueryNode, ctx: EmissionContext): In
 
 ### Dynamic support growth with ruleGrowRetrieve
 
-The `ruleGrowRetrieve` optimization rule enables dynamic sliding of operations into virtual table modules:
+`ruleGrowRetrieve` is a **structural, capability-bounded** sliding rule. It maximizes the
+query segment each virtual table module executes for itself, without consulting cost.
 
-**Algorithm**: Structural top-down growth pass that:
-1. Creates a candidate pipeline by grafting the parent operation onto the current pipeline
-2. Calls `module.supports(candidatePipeline)` or index-style fallback (`getBestAccessPlan`) for assessment
-3. If supported, replaces the parent with a new `RetrieveNode` containing the expanded pipeline
-4. Continues sliding upward until the module declines or the tree top is reached
-
-**Benefits**:
-- Multi-pass architecture ensures structural growth happens before physical selection
-- Cost-based decision making between local and remote execution
-- Modules evaluate exactly the operations they commit to handle
-
-This architecture establishes Quereus as a powerful federation engine while maintaining its lean, readable codebase philosophy and excellent virtual table integration.
-
-## ApplyNode Architecture for Correlated Joins
-
-> **Status: design proposal, not implemented.** No `ApplyNode` exists under
-> `src/planner/nodes/`. Correlated and lateral joins are planned today as `JoinNode`s
-> and driven by the nested-loop emitter. This section records the intended shape, not
-> current behavior.
-
-### Design Philosophy
-
-To enable lateral joins and sophisticated push-down optimization, Quereus uses an **ApplyNode** abstraction that replaces traditional `JoinNode` semantics. This design provides a unified framework for handling correlated operations while maintaining clean separation between logical and physical execution strategies.
-
-### Core Concept
-
-The `ApplyNode` represents a correlated operation where the right-side subtree is executed once per row from the left side, with correlation context passed through:
-
-```typescript
-interface ApplyNode {
-  left: RelationalPlanNode;     // Drive relation
-  right: RelationalPlanNode;    // Applied relation (may start with RetrieveNode)
-  predicate: ScalarPlanNode | null;  // Join condition
-  outer: boolean;               // LEFT JOIN semantics when true
-}
-```
-
-### SQL Mapping
-
-Traditional SQL join constructs map naturally to ApplyNode semantics:
-
-| SQL Construct | ApplyNode Form |
-|---------------|----------------|
-| `A CROSS JOIN B` | `Apply(A, B, null, false)` |
-| `A INNER JOIN B ON p` | `Apply(A, Filter(p, B), p, false)` |
-| `A LEFT JOIN B ON p` | `Apply(A, Filter(p, B), p, true)` |
-
-### Push-down Integration
-
-The ApplyNode design enables sophisticated push-down optimization:
-
-**Correlated Push-down**: When the right side contains a `RetrieveNode`, correlation values from the left side can be pushed into the virtual table module as additional constraints.
-
-**Index Seek Optimization**: Virtual table modules can use correlation values to perform efficient index seeks rather than full scans.
-
-**Pipeline Composition**: The right-side pipeline can be arbitrarily complex, allowing modules to optimize entire correlated subqueries.
-
-### Execution Model
-
-**Runtime Semantics**:
-1. Iterate through each row from the left relation
-2. Pass correlation context to the right relation's execution
-3. Execute right relation with correlated values as additional constraints
-4. Combine results according to join semantics (inner/outer)
-
-**Virtual Table Integration**:
-```typescript
-// Right-side RetrieveNode receives correlation context
-const correlatedConstraints = extractCorrelationConstraints(leftRow, rightPipeline);
-const assessment = vtabModule.supports(rightPipeline, correlatedConstraints);
-if (assessment) {
-  // Module can optimize correlated access (e.g., index seek)
-  yield* table.executePlan(db, rightPipeline, {
-    ...assessment.ctx,
-    correlation: correlatedConstraints
-  });
-}
-```
-
-### Performance Characteristics
-
-**Nested Loop Foundation**: ApplyNode provides a clean nested-loop foundation that can be optimized based on virtual table capabilities.
-
-**Progressive Optimization**: Modules can choose between full scans and index seeks based on correlation selectivity. Runtime cardinality feedback at pipeline breakers drives tier promotion and re-optimization (see [progressive-optimizer.md](./progressive-optimizer.md)).
-
-**Later Physical Optimization**: Non-correlated Apply operations can be transformed into bloom joins or merge joins by later optimization phases.
-
-### Benefits
-
-**Orthogonality**: Clean separation between correlation logic and push-down optimization.
-
-**Extensibility**: Virtual table modules can implement sophisticated correlated access patterns.
-
-**Simplicity**: Unified execution model eliminates special cases for different join types.
-
-**Federation**: Enables complex correlated queries to be pushed to remote systems (e.g., SQL databases, document stores).
-
-This design positions Quereus to handle complex analytical workloads while maintaining the flexibility to optimize across diverse data sources and virtual table implementations.
-
-### ruleGrowRetrieve Design
-
-The `ruleGrowRetrieve` optimizer rule implements a **structural, capability-bounded** sliding algorithm that maximizes the query segment each virtual table module can execute:
-
-**Algorithm**:
-1. **Top-down traversal (Structural pass)**: Walk the plan tree from root toward leaves so parents can be slid into their `RetrieveNode` children
-2. **Capability testing**: For each candidate, test `supports(candidatePipeline)` where candidatePipeline = current pipeline + parent node; else use index-style fallback
-3. **Slide on success**: If the module supports the expanded pipeline, slide the `RetrieveNode` upward to encompass the parent
-4. **Stop on failure**: When `supports()` returns undefined, the `RetrieveNode` has reached its maximum extent
-
-**Key Properties**:
-- Purely structural - no cost modeling required during growth phase
-- Deterministic - always finds the maximum supportable pipeline
-- Module-bounded - respects exactly what each module declares it can handle
-- Foundation for subsequent push-down - establishes the "query segment" baseline
+**Algorithm** — registered on every relational node type in the Structural pass, which
+runs top-down so a parent is visited before the `RetrieveNode` child it may slide into:
+1. Graft the parent operation onto the child `RetrieveNode`'s current pipeline, forming a
+   candidate pipeline
+2. Assess it with `module.supports(candidatePipeline)`, or the index-style fallback
+   (`getBestAccessPlan`)
+3. On support, replace the parent with a new `RetrieveNode` carrying the expanded pipeline
+4. On decline, stop — the `RetrieveNode` has reached its maximum extent
 
 ```typescript
 // Example: Filter above table reference
@@ -323,7 +218,28 @@ Filter(condition)
 RetrieveNode(source: Filter(condition, TableRef))
 ```
 
+**Key properties**:
+- Purely structural — no cost modeling during growth, so the segment boundary is
+  deterministic and reproducible
+- Module-bounded — a module evaluates exactly the operations it commits to handle
+- Runs before physical selection, so access-path choice sees the final segment
+- Establishes the "query segment" baseline every later push-down rule builds on
+
 **Modules can accept arbitrary nodes**: `supports()` may accept complex subtrees, including joins across multiple tables that reside in the same module. When a module declares support for such a subtree, `ruleGrowRetrieve` will slide those operations into the `RetrieveNode` boundary, enabling efficient intra-module execution.
+
+## Correlated and lateral access
+
+A correlated or lateral join is planned as an ordinary `JoinNode` and executed by the
+nested-loop emitter: the right subtree is re-executed once per left row, with the
+correlated values visible through the runtime context. When the right side reduces to a
+seek on an indexed column, the
+[fan-out lookup join](optimizer-joins.md#fan-out-lookup-join-fkpk--1n-cross) clusters those
+per-row lookups into one concurrently-driven node.
+
+There is no separate `ApplyNode` abstraction. Pushing correlation values into a module as
+*declared constraints* — so the module, rather than the runtime, drives the seek — is
+future work; see
+[`docs/todo.md` § Push-down & Federation Roadmap](todo.md#-push-down--federation-roadmap-active-items).
 
 ## TVF Property Declarations
 

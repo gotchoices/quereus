@@ -16,7 +16,7 @@ Quereus uses the **QuickPick** algorithm (Neumann & Kemper, VLDB 2020) for join 
 **Simplicity**: ~200 lines of TypeScript vs thousands for traditional optimizers
 - No complex memo structures or dynamic programming tables
 - No equivalence classes or group management
-- Just a tour generator and a min-heap of best plans
+- Just a tour generator and a running best plan
 
 **Performance**: Achieves >95% of optimal plan quality with <1% of the time
 - Scales linearly with number of joins × number of tours
@@ -31,56 +31,41 @@ Quereus uses the **QuickPick** algorithm (Neumann & Kemper, VLDB 2020) for join 
 
 ### Algorithm Design
 
-```typescript
-interface JoinTour {
-  relations: Set<RelationId>;
-  currentPlan: RelationalPlanNode;
-  totalCost: number;
-}
+`ruleQuickPickJoinEnumeration` is an ordinary rule — `(node, context) => PlanNode | null`
+— that fires on a `JoinNode`. It proceeds in four steps:
 
-class QuickPickOptimizer {
-  async optimizeJoins(
-    relations: RelationalPlanNode[],
-    predicates: JoinPredicate[],
-    options: { maxTours: number }
-  ): Promise<RelationalPlanNode> {
-    const bestPlans: RelationalPlanNode[] = [];
-    
-    for (let i = 0; i < options.maxTours; i++) {
-      const tour = await this.runGreedyTour(relations, predicates);
-      bestPlans.push(tour);
-    }
-    
-    return this.selectBestPlan(bestPlans);
-  }
-  
-  private async runGreedyTour(
-    relations: RelationalPlanNode[],
-    predicates: JoinPredicate[]
-  ): Promise<RelationalPlanNode> {
-    // Start with random relation
-    const shuffled = [...relations].sort(() => Math.random() - 0.5);
-    let current = shuffled[0];
-    const remaining = new Set(shuffled.slice(1));
-    
-    while (remaining.size > 0) {
-      // Find cheapest next join using surrogate cost
-      const next = this.findCheapestJoin(current, remaining, predicates);
-      current = this.createJoinNode(current, next.relation, next.predicate);
-      remaining.delete(next.relation);
-    }
-    
-    return current;
-  }
-}
-```
+1. **Extract the join graph.** `extractJoinGraph` walks the contiguous inner-join region
+   below the node, collecting leaf relations and the equi-predicates that connect pairs of
+   them. It bails out (returns `null`, so the rule declines) on anything it cannot model,
+   and the rule declines outright on fewer than three relations, where enumeration cannot
+   beat the plan the builder already produced.
+2. **Refuse on side effects.** If any participating relation's subtree carries a write
+   (`PlanNodeCharacteristics.subtreeHasSideEffects`), the rule declines: reordering would
+   change the user-visible order in which the writes run. See
+   [Audit discipline](optimizer.md#audit-discipline-sideeffectmode).
+3. **Run greedy tours.** Each tour picks a start relation, then repeatedly appends the
+   remaining relation whose resulting left-deep plan costs least, penalizing a candidate
+   with no predicate connecting it to the already-chosen set by 10× so cross products lose
+   to any connected alternative. Tours run until `maxTours` or `timeLimitMs` is exhausted,
+   varying only the start relation (alternating between the two smallest by
+   `estimatedRows`). One greedy **bushy** plan — repeatedly merge the cheapest pair of
+   components — is built per invocation and compared against the best tour.
+4. **Adopt only on a real win.** The best plan replaces the original only if it costs less
+   than 90% of the baseline; otherwise the rule declines. Either way, tour count and best
+   cost land in `context.diagnostics.quickpick`.
+
+Cost throughout is `PlanNode.getTotalCost()` on the candidate plan — the accumulated
+subtree cost, which already reflects the `estimatedRows` reduction a key-covered join
+earns from `computePhysical`.
 
 ### Integration Points
 
 1. **Multi-pass optimizer framework**: QuickPick runs in the Physical pass (bottom-up)
-2. **Cost model enhancement**: Uses `estimatedCostFromNode.getTotalCost()` for join ordering decisions
-3. **Rule registration**: Registered as a Physical pass rule with priority 5
-4. **Tuning parameters**: Expose `maxTours` and early-stop thresholds via `tuning.quickpick`
+2. **Cost model**: Uses `PlanNode.getTotalCost()` for join ordering decisions
+3. **Rule registration**: Registered as a Physical pass rule with priority 5,
+   `sideEffectMode: 'aware'`
+4. **Tuning parameters**: `tuning.quickpick` supplies `enabled`, `maxTours`,
+   `timeLimitMs`, and `minTriggerCost`
 
 ## Physical Join Algorithm Selection
 

@@ -325,3 +325,21 @@ The logical type system enables significant runtime performance improvements by 
 - [ ] **Range Seeks**: Pass dynamic lower/upper bounds and extend Memory module scan/seek plan to use them
 - [ ] **IN-list strategy**: Choose between seek-union vs residual based on index coverage and list size
 
+**Phase 4 – Correlated push-down (`ApplyNode` proposal)**
+
+Correlated and lateral joins plan as `JoinNode` today; the nested-loop emitter re-executes
+the right subtree per outer row and a right-side `RetrieveNode` is re-assessed each time.
+The proposal replaces that with an explicit `Apply(left, right, predicate, outer)` node —
+"execute `right` once per row of `left`, with correlation context threaded through" —
+mapping `CROSS`/`INNER`/`LEFT JOIN` onto the same shape and eliminating the per-join-type
+special cases. Its value is push-down, not execution: with the correlated operation named,
+the optimizer can hand the left row's correlation values to `module.supports()` as extra
+constraints, letting a module turn a correlated subquery into one index seek — or ship the
+whole correlated pipeline to a remote system. Non-correlated `Apply`s remain free to
+become bloom or merge joins in the Physical pass.
+
+- [ ] Introduce `ApplyNode` and build correlated / lateral joins onto it
+- [ ] Extend `supports()` with a correlation-constraint channel
+- [ ] Teach the memory module to answer a correlated seek through it
+- [ ] Retire the `JoinNode` special-casing for lateral once the above lands
+

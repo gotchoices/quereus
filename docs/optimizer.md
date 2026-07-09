@@ -903,10 +903,10 @@ the `maxRulesFired` cap.
 
 The context-scoped design enables sophisticated optimization strategies:
 
-**QuickPick Join Enumeration**:
-- Each tour gets fresh context
-- Same join nodes can be optimized differently in each tour
-- Best plan selected across all contexts
+**[QuickPick Join Enumeration](optimizer-joins.md#join-optimization-with-quickpick)**:
+- The rule builds and costs each candidate join tree in-place, outside the visited set
+- Only the winning tree is returned, so exactly one transform is recorded for the node
+- Discarded candidates leave no visited-tracking residue to invalidate
 
 **Progressive Optimization** (see [progressive-optimizer.md](./progressive-optimizer.md)):
 - Contexts can carry different statistics or cost models
@@ -976,35 +976,25 @@ every `RetrieveNode` with a concrete access node (`SeqScan`, `IndexScan`, `Index
 
 Quereus uses a **characteristic-based** optimization pipeline that leverages the unique logical properties of different node types to apply rules in optimal sequence. The RetrieveNode's unique logical representation makes it an ideal boundary marker for this approach.
 
-### Phase Sequencing Strategy
+### Why the segment boundary comes first
 
-**0. Builder Output**
-- Every `TableReferenceNode` automatically wrapped in `RetrieveNode`
-- Establishes clear module execution boundaries from the start
+The builder wraps every `TableReferenceNode` in a `RetrieveNode`, so module execution
+boundaries exist before any rule runs. `ruleGrowRetrieve` then slides operators into those
+boundaries in the Structural pass — ahead of predicate push-down, ahead of join
+enumeration, ahead of physical selection.
 
-**1. Grow-Retrieve (Structural Phase)**
-- **Target**: `RetrieveNode` characteristics
-- **Purpose**: Find maximum contiguous pipeline each module can execute
-- **Method**: Bottom-up sliding based on `supports()` responses
-- **Result**: Fixed, module-guaranteed "query segments" for every base relation
+That ordering is the point. Growth is purely structural (it asks `supports()`, never the
+cost model), so it always terminates at the same segment for a given plan. Once the
+segments are fixed, every later rule sees a base relation whose `estimatedRows` already
+reflects everything the module will do for itself — which is what makes join enumeration's
+cost comparisons meaningful. Enumerating first and pushing afterwards would order joins
+against cardinalities that the push-down then invalidates.
 
-**2. Early Predicate Push-down (Cost-Light Phase)**  
-- **Target**: Filter nodes with simple characteristics (constant predicates, key equality, etc.)
-- **Purpose**: Improve cardinality estimates before expensive join enumeration
-- **Method**: Push obviously beneficial predicates into established query segments
-- **Constraint**: Only push predicates that modules explicitly support
-
-**3. Join Enumeration & Rewriting (Cost-Heavy Phase)**
-- **Target**: Join tree characteristics and cardinality estimates
-- **Purpose**: Find optimal join order using realistic row estimates
-- **Method**: Traditional dynamic programming with accurate base relation costs
-- **Foundation**: Benefits from realistic cardinality estimates from phases 1-2
-
-**4. Advanced Predicate Push-down (Cost-Precise Phase)**
-- **Target**: Complex filter characteristics (OR-predicates, subquery filters, etc.)
-- **Purpose**: Final optimization opportunities with complete cost model
-- **Method**: Sophisticated cost-based decisions on predicate placement
-- **Context**: Full join plan available for accurate cost assessment
+The concrete pass list, with what runs in each, is
+[Multi-Pass Optimization System](#multi-pass-optimization-system) above. Push-down work
+still on the roadmap — projection and aggregation push-down, cost-precise placement of OR
+and subquery predicates, correlated push-down — is tracked in
+[`docs/todo.md`](todo.md#-push-down--federation-roadmap-active-items).
 
 ### Characteristic-Based Rule Design Philosophy
 
