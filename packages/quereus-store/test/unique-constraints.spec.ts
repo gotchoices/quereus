@@ -799,6 +799,17 @@ describe('StoreTable UNIQUE constraints', () => {
 				expect(await collect(db, `SELECT count(*) AS n FROM ga`)).to.deep.equal([{ n: 1 }]);
 			});
 
+			it('a JSON column is treated as potentially textual (K = BINARY over C = NOCASE)', async () => {
+				// JSON's physicalType is OBJECT, but its `parse` passes a JSON scalar string
+				// straight through, so the column holds text and keys it through the
+				// collation encoder — exactly like ANY. `'"Bob"'` stores the string `Bob`.
+				await db.exec(`CREATE TABLE gj (id INTEGER PRIMARY KEY, j JSON) USING store(collation = 'BINARY')`);
+				await db.exec(`CREATE UNIQUE INDEX gj_j ON gj (j COLLATE NOCASE)`);
+				await db.exec(`INSERT INTO gj VALUES (1, '"Bob"')`);
+				await rejects(`INSERT INTO gj VALUES (2, '"BOB"')`);
+				expect(await collect(db, `SELECT count(*) AS n FROM gj`)).to.deep.equal([{ n: 1 }]);
+			});
+
 			it('K = BINARY over C = BINARY seeks the index (equal collations)', async () => {
 				await db.exec(`CREATE TABLE gq (id INTEGER PRIMARY KEY, b TEXT) USING store(collation = 'BINARY')`);
 				await db.exec(`CREATE UNIQUE INDEX gq_b ON gq (b)`);
@@ -817,6 +828,52 @@ describe('StoreTable UNIQUE constraints', () => {
 				await db.exec(`INSERT INTO gc VALUES (2, 'bob')`);
 				await rejects(`INSERT INTO gc VALUES (3, 'bob')`);
 				expect(await collect(db, `SELECT count(*) AS n FROM gc`)).to.deep.equal([{ n: 2 }]);
+			});
+		});
+
+		// The index-backed check TRUSTS the index store to hold an entry for every live
+		// row. `CREATE INDEX` populates it from the table's effective row stream, so a
+		// row inserted earlier in the SAME open transaction is indexed too. Building
+		// from the committed stream alone would leave that row unindexed and the seek
+		// would silently accept a duplicate of it.
+		describe('an index created mid-transaction indexes the pending rows', () => {
+			it('a duplicate of a pending row is still rejected after CREATE UNIQUE INDEX', async () => {
+				await db.exec(`CREATE TABLE mt (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+				await db.exec(`BEGIN`);
+				await db.exec(`INSERT INTO mt VALUES (1, 'a')`);
+				await db.exec(`CREATE UNIQUE INDEX mt_v ON mt (v)`);
+				await rejects(`INSERT INTO mt VALUES (2, 'a')`);
+				await db.exec(`INSERT INTO mt VALUES (2, 'b')`);
+				await db.exec(`COMMIT`);
+				expect(await collect(db, `SELECT id, v FROM mt ORDER BY id`)).to.deep.equal([
+					{ id: 1, v: 'a' }, { id: 2, v: 'b' },
+				]);
+			});
+
+			it('CREATE UNIQUE INDEX over pending duplicates fails its in-pass check', async () => {
+				await db.exec(`CREATE TABLE mtd (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+				await db.exec(`BEGIN`);
+				await db.exec(`INSERT INTO mtd VALUES (1, 'a'), (2, 'a')`);
+				await rejects(`CREATE UNIQUE INDEX mtd_v ON mtd (v)`);
+				await db.exec(`ROLLBACK`);
+			});
+
+			it('a rolled-back pending row leaves no phantom conflict behind', async () => {
+				// The index store is written outside the coordinator, so a ROLLBACK leaves
+				// its entries behind. Both readers resolve each entry to its live row and
+				// drop it when the row is gone or no longer matches, so the stale entry can
+				// never manufacture a conflict.
+				await db.exec(`CREATE TABLE mtr (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+				await db.exec(`BEGIN`);
+				await db.exec(`INSERT INTO mtr VALUES (1, 'a')`);
+				await db.exec(`CREATE UNIQUE INDEX mtr_v ON mtr (v)`);
+				await db.exec(`ROLLBACK`);
+				await db.exec(`INSERT INTO mtr VALUES (1, 'b')`);
+				await db.exec(`INSERT INTO mtr VALUES (2, 'a')`);
+				expect(await collect(db, `SELECT id, v FROM mtr ORDER BY id`)).to.deep.equal([
+					{ id: 1, v: 'b' }, { id: 2, v: 'a' },
+				]);
+				await rejects(`INSERT INTO mtr VALUES (3, 'a')`);
 			});
 		});
 

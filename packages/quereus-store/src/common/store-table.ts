@@ -127,6 +127,20 @@ export function resolvePkKeyCollations(
 }
 
 /**
+ * The physical representations whose values are PROVABLY never a JS string, so a
+ * column of that representation is keyed by type-native, collation-independent
+ * bytes. Every other representation — TEXT obviously, but also `NULL` (the `ANY`
+ * type's, whose `parse` is the identity) and `OBJECT` (the JSON type's, whose
+ * `parse` passes a JSON scalar string straight through) — can carry text.
+ */
+const NEVER_TEXT_PHYSICAL_TYPES: ReadonlySet<PhysicalType> = new Set([
+	PhysicalType.INTEGER,
+	PhysicalType.REAL,
+	PhysicalType.BLOB,
+	PhysicalType.BOOLEAN,
+]);
+
+/**
  * True when `col` can produce a TEXT value at runtime, and so when its physical
  * key bytes are produced by a collation encoder rather than a type-native
  * encoding. Both collation-safety guards over the store's secondary indexes —
@@ -135,17 +149,22 @@ export function resolvePkKeyCollations(
  * their K-vs-C comparison, so a false "non-text" answer here is a silent
  * wrong-result (a seek under the wrong collation, with the residual dropped).
  *
- * Mirrors the engine's `isNonTextualLogicalType`
- * (planner/analysis/comparison-collation.ts), negated. A bare `isTextual` test
- * is NOT sufficient: `ANY` carries no `isTextual` marker and a `physicalType` of
- * NULL, yet its `parse` is the identity, so an `ANY` column stores text as text
- * and keys it through the collation encoder. An absent logical type is unknown —
- * treated as potentially textual.
+ * The test is an ALLOW-list over `physicalType`, not a deny-list over type names:
+ * only a representation that can never be a string is exempt. A bare `isTextual`
+ * check is not sufficient (neither `ANY` nor `JSON` carries the marker, yet both
+ * store text as text), and neither is a `name === 'ANY'` escape hatch (`JSON`
+ * needs the same treatment, and so would any future string-capable type). An
+ * absent logical type is unknown — treated as potentially textual.
+ *
+ * Strictly more conservative than the engine's `isNonTextualLogicalType`
+ * (planner/analysis/comparison-collation.ts), which classifies `JSON` as
+ * non-textual. Erring conservative here costs an index seek, never correctness.
  */
 export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
 	const lt = col?.logicalType;
 	if (!lt) return true;
-	return lt.isTextual === true || lt.physicalType === PhysicalType.TEXT || lt.name === 'ANY';
+	if (lt.isTextual === true) return true;
+	return !NEVER_TEXT_PHYSICAL_TYPES.has(lt.physicalType);
 }
 
 /** A UNIQUE conflict: the offending row and the primary key it lives at. */

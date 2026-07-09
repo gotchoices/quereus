@@ -39,7 +39,7 @@ import type {
 import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
 import type { CompiledPredicate } from '@quereus/quereus';
 
-import type { KVStore, KVStoreProvider } from './kv-store.js';
+import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreBackingHost } from './backing-host.js';
@@ -782,11 +782,24 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Create the index store
 		const indexStore = await this.provider.getIndexStore(schemaName, tableName, indexSchema.name);
 
-		// Build index entries for existing rows
-		const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
+		// Build index entries for every row the table can currently SEE — committed
+		// rows merged with this transaction's pending writes (`iterateEffectiveEntries`).
+		// The committed-only stream would leave a row inserted earlier in an open
+		// transaction unindexed, and `StoreTable.findUniqueConflictViaIndex` trusts the
+		// index to hold every live row: a `CREATE UNIQUE INDEX` would miss a pending
+		// duplicate, and a later insert colliding with that pending row would be
+		// silently ACCEPTED. Entries written here for rows that a subsequent ROLLBACK
+		// discards are harmless: both readers resolve each entry to its live row and
+		// drop it when the row is gone or no longer matches (see `scanIndex`).
 		const tableSchema = table.getSchema();
 		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
-		await this.buildIndexEntries(dataStore, indexStore, tableSchema, indexSchema, keyCollation);
+		await this.buildIndexEntries(
+			table.iterateEffectiveEntries(buildFullScanBounds()),
+			indexStore,
+			tableSchema,
+			indexSchema,
+			keyCollation,
+		);
 
 		// Refresh the connected table's cached schema so subsequent DML
 		// maintains the new index (the engine's schema registry is updated
@@ -898,6 +911,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	/**
 	 * Build index entries for all existing rows in a table.
 	 *
+	 * `dataEntries` is the row stream to index. Callers choose its visibility:
+	 * `createIndex` passes the table's EFFECTIVE stream (committed + pending, so
+	 * an open transaction's rows are indexed too), while `rebuildSecondaryIndexes`
+	 * passes the raw committed stream — it runs immediately after an ALTER has
+	 * re-encoded the data store in place, and any pending ops still address the
+	 * pre-ALTER key bytes.
+	 *
 	 * For UNIQUE indexes, performs an in-pass duplicate check (honoring partial
 	 * predicates and SQL NULL semantics: multiple NULLs are allowed) and throws
 	 * CONSTRAINT before any entries are written. Mirrors the memory module's
@@ -905,7 +925,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * atomically.
 	 */
 	private async buildIndexEntries(
-		dataStore: KVStore,
+		dataEntries: AsyncIterable<KVEntry>,
 		indexStore: KVStore,
 		tableSchema: TableSchema,
 		indexSchema: TableIndexSchema,
@@ -934,11 +954,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				resolveKeyNormalizer(col.collation ?? tableSchema.columns[col.index].collation))
 			: undefined;
 
-		// Scan all data rows
-		const bounds = buildFullScanBounds();
 		const batch = indexStore.batch();
 
-		for await (const entry of dataStore.iterate(bounds)) {
+		for await (const entry of dataEntries) {
 			const row = deserializeRow(entry.value);
 
 			// Partial index: skip rows whose predicate is not unambiguously TRUE.
@@ -1014,7 +1032,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				clearBatch.delete(entry.key);
 			}
 			await clearBatch.write();
-			await this.buildIndexEntries(dataStore, indexStore, schema, indexSchema, keyCollation);
+			await this.buildIndexEntries(
+				dataStore.iterate(buildFullScanBounds()),
+				indexStore,
+				schema,
+				indexSchema,
+				keyCollation,
+			);
 		}
 	}
 
