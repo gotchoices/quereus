@@ -9,7 +9,7 @@
  * Ordering: (wallTime, counter, siteId, opSeq) compared lexicographically
  */
 
-import type { SiteId } from './site.js';
+import { type SiteId, siteIdToBase64, siteIdFromBase64 } from './site.js';
 
 /**
  * Hybrid Logical Clock timestamp.
@@ -145,7 +145,7 @@ export function createHLC(wallTime: bigint, counter: number, siteId: SiteId, opS
  * all facts of one transaction share a single id.
  */
 export function deterministicTxnId(base: HLC): string {
-  return `${base.wallTime.toString()}:${base.counter}:${siteIdToBase64Local(base.siteId)}`;
+  return `${base.wallTime.toString()}:${base.counter}:${siteIdToBase64(base.siteId)}`;
 }
 
 /**
@@ -217,7 +217,7 @@ export function hlcToJson(hlc: HLC): SerializedHLC {
   return {
     wallTime: hlc.wallTime.toString(),
     counter: hlc.counter,
-    siteId: siteIdToBase64Local(hlc.siteId),
+    siteId: siteIdToBase64(hlc.siteId),
     opSeq: hlc.opSeq,
   };
 }
@@ -229,57 +229,9 @@ export function hlcFromJson(json: SerializedHLC): HLC {
   return createHLC(
     BigInt(json.wallTime),
     json.counter,
-    siteIdFromBase64Local(json.siteId),
+    siteIdFromBase64(json.siteId),
     json.opSeq ?? 0
   );
-}
-
-// Base64url alphabet (RFC 4648 Section 5)
-const BASE64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-
-/**
- * Convert site ID to base64url string (local helper to avoid circular import).
- */
-function siteIdToBase64Local(siteId: SiteId): string {
-  let result = '';
-  for (let i = 0; i < siteId.length; i += 3) {
-    const byte1 = siteId[i];
-    const byte2 = i + 1 < siteId.length ? siteId[i + 1] : 0;
-    const byte3 = i + 2 < siteId.length ? siteId[i + 2] : 0;
-    const triplet = (byte1 << 16) | (byte2 << 8) | byte3;
-    result += BASE64URL_CHARS[(triplet >>> 18) & 0x3f];
-    result += BASE64URL_CHARS[(triplet >>> 12) & 0x3f];
-    if (i + 1 < siteId.length) result += BASE64URL_CHARS[(triplet >>> 6) & 0x3f];
-    if (i + 2 < siteId.length) result += BASE64URL_CHARS[triplet & 0x3f];
-  }
-  return result;
-}
-
-/**
- * Parse site ID from base64url string (local helper to avoid circular import).
- */
-function siteIdFromBase64Local(base64: string): SiteId {
-  if (base64.length !== 22) {
-    throw new Error(`Invalid site ID base64 length: ${base64.length}, expected 22`);
-  }
-  // Build reverse lookup table
-  const lookup: Record<string, number> = {};
-  for (let i = 0; i < BASE64URL_CHARS.length; i++) {
-    lookup[BASE64URL_CHARS[i]] = i;
-  }
-  const result = new Uint8Array(16);
-  let writePos = 0;
-  for (let i = 0; i < base64.length; i += 4) {
-    const c1 = lookup[base64[i]] ?? 0;
-    const c2 = lookup[base64[i + 1]] ?? 0;
-    const c3 = i + 2 < base64.length ? lookup[base64[i + 2]] ?? 0 : 0;
-    const c4 = i + 3 < base64.length ? lookup[base64[i + 3]] ?? 0 : 0;
-    const triplet = (c1 << 18) | (c2 << 12) | (c3 << 6) | c4;
-    if (writePos < 16) result[writePos++] = (triplet >>> 16) & 0xff;
-    if (writePos < 16) result[writePos++] = (triplet >>> 8) & 0xff;
-    if (writePos < 16) result[writePos++] = triplet & 0xff;
-  }
-  return result;
 }
 
 /**
