@@ -98,6 +98,40 @@ describe('coordinated-commit sibling layer (last-writer-wins loss)', () => {
 		expect(rows).to.deep.equal([[2, 'b1'], [3, 'c2'], [4, 'd2']]);
 	});
 
+	it('maintains a secondary index when rebasing a sibling', async () => {
+		// The rebase replay passes each own-write's effective row (re-derived on the
+		// NEW head) to recordUpsert/recordDelete so secondary-index maintenance runs.
+		// The other cases carry no index, so this is the only coverage of that path.
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec('create index ix on t(v)');
+		await db.exec("insert into t values (1, 'base')");
+
+		const manager = getManager(db, 't');
+
+		const conn1 = manager.connect();
+		const conn2 = manager.connect();
+		conn1.explicitTransaction = true;
+		conn2.explicitTransaction = true;
+
+		await manager.performMutation(conn1, 'insert', [100, 'aaa']);
+		await manager.performMutation(conn2, 'insert', [200, 'bbb']);
+
+		await manager.commitTransaction(conn1); // head P1 indexes base, aaa
+		await manager.commitTransaction(conn2); // rebased P2 must index bbb on top
+
+		const head = manager.currentCommittedLayer;
+		const indexName = head.getSchema().indexes![0].name;
+		const idxTree = head.getSecondaryIndexTree!(indexName);
+		if (!idxTree) throw new Error('secondary index tree missing after rebase');
+		// One entry per distinct v: base, aaa (from P1) and bbb (replayed by rebase).
+		// A rebase that skipped index maintenance would be missing bbb.
+		expect([...idxTree.entries()].length).to.equal(3);
+
+		// And the primary chain still has all three rows.
+		const ids = committedRows(manager).map(r => r[0]).sort((a, b) => (a as number) - (b as number));
+		expect(ids).to.deep.equal([1, 100, 200]);
+	});
+
 	it('preserves all rows across a three-way chain of successive rebases', async () => {
 		await db.exec('create table t (id integer primary key, v text)');
 		await db.exec("insert into t values (1, 'base')");
