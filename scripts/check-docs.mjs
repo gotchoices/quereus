@@ -361,6 +361,9 @@ function checkInvariantPointer(meta, at, fail) {
 	// NOTE: a plain substring match, so a symbol surviving only in a comment still passes. That is
 	// the intended strength — this validates pointers, not semantics. If it ever needs to be
 	// stricter, match against the file with comments stripped rather than parsing TypeScript here.
+	// Consequence for `guard:`: a common token (`isSet`) matches anywhere in the spec file and a
+	// heading-style comment matches too, so a guard can name something that is not a test and still
+	// pass. Write the exact `describe`/`it` title, or the name of the function driving the law.
 	if (meta.symbol && !readText(abs).includes(meta.symbol)) {
 		fail(`${at.where}: ${meta.kind}: symbol '${meta.symbol}' no longer appears in '${meta.path}'`);
 	}

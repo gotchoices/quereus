@@ -52,12 +52,14 @@ self-guarding: `validateSideEffectMode` raises `QuereusError(INTERNAL)` at regis
 - doc: [Optimizer § The two declarations](optimizer.md#the-two-declarations)
 
 A rule that moves, duplicates, drops, or merges a subtree it has not separately proven pure
-declares `'aware'` and consults `PlanNodeCharacteristics.hasSideEffects` /
-`subtreeHasSideEffects`, refusing or weakening when a participating subtree carries a write.
-`'safe'` is the counter-claim that the transform's structural shape preserves side effects
-by itself. Two `'aware'` rules — `cte-optimization`, `in-subquery-cache` — refuse nothing:
-they wrap the subtree in a run-once `CacheNode`, which preserves the write. The guard covers
-the fold rules only; the declaration is not machine-checked against a rule's body.
+declares `'aware'` and consults a purity signal, refusing or weakening when a participating
+subtree carries a write. Usually that signal is `PlanNodeCharacteristics.hasSideEffects` /
+`subtreeHasSideEffects`; `in-subquery-cache` instead refuses on `isFunctional`
+(`physical.readonly` **and** deterministic), which is strictly stronger. `'safe'` is the
+counter-claim that the transform's structural shape preserves side effects by itself. One
+`'aware'` rule, `cte-optimization`, consults nothing: it wraps the subtree in a run-once
+`CacheNode`, which preserves the write. The guard covers the fold rules only; the declaration
+is not machine-checked against a rule's body.
 
 ### OPT-004 — A custom-`execute` pass argues its own soundness
 
@@ -186,7 +188,7 @@ error, not as this message.
 
 ### OPT-022 — A Retrieve pipeline holds only supported operations
 
-- code: `packages/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts`
+- code: `packages/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts` — `fallbackIndexSupports`
 - code: `packages/quereus/src/planner/rules/predicate/rule-predicate-pushdown.ts`
 - guard: `packages/quereus/test/optimizer/remote-grow-retrieve.spec.ts` — `Retrieve growth with supports() (remote query)`
 - doc: [Retrieve § Supported-only placement policy](optimizer-retrieve.md#supported-only-placement-policy)
@@ -195,9 +197,12 @@ Everything beneath a `RetrieveNode` is an operation the module committed to exec
 `supports()` accepted the candidate pipeline, or the index-style `getBestAccessPlan()`
 fallback did. Anything else stays above the boundary as a residual. Both rules that move work
 across the boundary construct a supported-only fragment and leave the remainder above;
-neither pushes a predicate speculatively. Growth is purely structural (it never consults
-cost), so a given plan always reaches the same segment boundary, which is what makes the
-later join-enumeration cost comparisons meaningful.
+neither pushes a predicate speculatively. Growth over a `supports()` module is purely
+structural; the index-style fallback additionally demands the access plan beat a sequential
+scan, or provide the required ordering, before `fallbackIndexSupports` returns an assessment.
+Either way the decision is a function of the plan alone, so a given plan always reaches the
+same segment boundary — which is what makes the later join-enumeration cost comparisons
+meaningful.
 
 ### OPT-024 — An unconsumed seek constraint is reattached
 
@@ -392,7 +397,7 @@ exists for diagnostics and for explaining a plan, not for driving one.
 
 - code: `packages/quereus/src/common/datatype.ts` — `isSet`
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `keysOf`
-- guard: `packages/quereus/test/optimizer/keysof-isunique.spec.ts` — `isSet`
+- guard: `packages/quereus/test/optimizer/keysof-isunique.spec.ts` — `falls back to the all-columns key for a set with no smaller key`
 - doc: [Functional Dependencies § kind: uniqueness provenance](optimizer-fd.md#kind-uniqueness-provenance)
 
 "All output columns together form a key" has no non-trivial FD encoding, so it lives on
@@ -420,7 +425,7 @@ an FD with a surviving dependent), outer joins drop the padded side, full outer 
 
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `addSingletonFd`
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `isAtMostOneRow`
-- guard: `packages/quereus/test/property.spec.ts` — `Singleton equivalence law`
+- guard: `packages/quereus/test/property.spec.ts` — `checkSingletonEquivalence`
 - doc: [Functional Dependencies § Singleton equivalence](optimizer-fd.md#singleton-equivalence)
 
 Three channels encode "this relation has at most one row": an empty key in

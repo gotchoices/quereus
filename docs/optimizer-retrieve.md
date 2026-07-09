@@ -55,7 +55,7 @@ This policy ensures the `Retrieve` pipeline is always a precise description of w
 
 > **Invariant:** [OPT-020](invariants.md#opt-020--no-logical-only-node-reaches-emission)
 
-- During the physical selection pass, all `Retrieve` nodes must be rewritten to concrete access nodes (`SeqScan`, `IndexScan`, or `IndexSeek`) or `RemoteQuery`. A validation invariant enforces that no `Retrieve` nodes reach emission.
+- During the physical selection pass, all `Retrieve` nodes must be rewritten to concrete access nodes (`SeqScan`, `IndexScan`, or `IndexSeek`) or `RemoteQuery`. `validatePhysicalNodeType` asserts this, but it runs only under `tuning.debug.validatePlan`, which is off by default — so in a release build a surviving `Retrieve` surfaces as a missing-emitter error rather than as that assertion.
 
 ### Robust primary-key equality seeks
 
