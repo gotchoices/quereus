@@ -66,7 +66,7 @@ The optimizer enforces a strict policy: **only operations the module can handle 
 1. **For query-based modules**: The `supports()` method returns a result
 2. **For index-based modules**: The `getBestAccessPlan()` method marks filters as handled via `handledFilters` array
 
-If a module claims to handle an operation but fails at runtime, data corruption can result. Always be conservative in capability reporting.
+If a module claims to handle an operation but fails at runtime, data corruption can result. Always be conservative in capability reporting. See *Claiming `handledFilters`* below for the exact per-column, per-role rule the planner applies.
 
 ## Module Capability APIs
 
@@ -160,6 +160,25 @@ interface BestAccessPlanResult {
 - `supportsOrdinalSeek` enables the `monotonic-limit-pushdown` rule: when advertised, the runtime may stamp `FilterInfo.offset`/`FilterInfo.limit` and the module must seek directly to the kth monotonic row (see `query()` contract above). Modules that advertise `supportsOrdinalSeek` but ignore the directives at runtime degrade to a streaming `LIMIT` (the rule's slice operator enforces the cap above the leaf).
 - `supportsAsofRight` enables the `lateral-top1-asof` rule: forward-only repositioning per left row.
 
+**Claiming `handledFilters` — the positional contract**:
+
+A module may set `handledFilters[i] = true` only for a filter it will actually apply.
+For the seek-family operators (`=`, `IN`, `<`, `<=`, `>`, `>=`, `OR_RANGE`) the planner
+consumes at most one filter per column per role — the first `=`, the first lower bound,
+the first upper bound, **in `request.filters` order**. Claim positionally: mark the first
+match, leave redundant same-column same-role filters unhandled so they survive as a
+residual `Filter`. The planner defends itself against an over-claim by reattaching any
+seek-family filter it did not consume, so an over-claiming module costs a redundant
+filter, not a wrong answer.
+
+Two corollaries worth spelling out:
+
+- **Count distinct columns, not filters.** `a = 1 and a = 2` on a composite primary key
+  `(a, b)` is *not* a full key match. Deduplicate by `columnIndex` before deciding that
+  every key column is pinned.
+- **Only claim what you can seek.** A range on a non-leading key column, for instance,
+  is not turned into a bound; leave it unhandled.
+
 **When to use**: Most modules (in-memory tables, file-based storage, traditional indexes).
 
 **Example**: Memory table with primary key index:
@@ -169,14 +188,13 @@ getBestAccessPlan(
   tableInfo: TableSchema,
   request: BestAccessPlanRequest
 ): BestAccessPlanResult {
-  // Check for equality on primary key
-  const pkConstraints = request.filters.filter(f =>
-    f.op === '=' && f.columnIndex === 0 // PK is column 0
-  );
+  // Check for equality on the primary key (column 0). Claim the FIRST '=' only —
+  // a second `id = ...` is redundant, is never seeked, and must stay residual.
+  const pkIndex = request.filters.findIndex(f => f.op === '=' && f.columnIndex === 0);
 
-  if (pkConstraints.length > 0) {
+  if (pkIndex >= 0) {
     return {
-      handledFilters: request.filters.map(f => pkConstraints.includes(f)),
+      handledFilters: request.filters.map((_f, i) => i === pkIndex),
       cost: 1,                    // Very cheap
       rows: 1,                    // Unique lookup
       isSet: true,                // Guarantees unique rows

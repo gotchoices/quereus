@@ -604,6 +604,28 @@ Virtual tables communicate their capabilities, allowing the optimizer to:
 - Preserve beneficial orderings
 - Estimate result cardinalities
 
+#### The `handledFilters` contract
+
+`handledFilters[i] = true` is a promise that filter `i` is enforced somewhere other than
+the residual `Filter` — and the only channel available is `FilterInfo.constraints`, the
+seek bounds `rule-select-access-path` builds. `rule-grow-retrieve` residualizes exactly
+the constraints whose flag is `false`, so a claimed filter that never becomes a seek
+bound would be applied nowhere.
+
+A module may set `handledFilters[i] = true` only for a filter it will actually apply.
+For the seek-family operators (`=`, `IN`, `<`, `<=`, `>`, `>=`, `OR_RANGE`) the planner
+consumes at most one filter per column per role — the first `=`, the first lower bound,
+the first upper bound, **in `request.filters` order**. Claim positionally: mark the first
+match, leave redundant same-column same-role filters unhandled so they survive as a
+residual `Filter`. The planner defends itself against an over-claim by reattaching any
+seek-family filter it did not consume (`reattachUnconsumedConstraints`), so an
+over-claiming module costs a redundant filter, not a wrong answer.
+
+Ops outside the seek family (`IS NULL`, `IS NOT NULL`, `LIKE`, `GLOB`, `MATCH`,
+`NOT IN`) are never pushed into `FilterInfo` by this rule, so a module claiming one is
+taken at its word — claim only when the predicate is tautological over the rows you
+return (the memory module's `IS NOT NULL` on a `NOT NULL` column).
+
 ### Debugging and Tracing
 
 The optimizer provides comprehensive debugging support:

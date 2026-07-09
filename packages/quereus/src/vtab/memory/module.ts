@@ -592,7 +592,14 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	}
 
 	/**
-	 * Find range match for a column
+	 * Find range match for a column.
+	 *
+	 * Claims at most the FIRST lower ('>'/'>=') and the FIRST upper ('<'/'<=') bound,
+	 * matching what `rule-select-access-path` actually turns into seek bounds (it picks
+	 * per column by position). Claiming a redundant same-side bound as handled would
+	 * drop it from the residual filter without ever applying it — `where v > 10 and
+	 * v > 30` would wrongly return the `v > 10` rows. Redundant bounds stay unhandled
+	 * and survive as a residual `Filter`.
 	 */
 	private findRangeMatch(
 		indexCol: IndexColumnSchema,
@@ -604,14 +611,13 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		for (let i = 0; i < filters.length; i++) {
 			const filter = filters[i];
-			if (filter.columnIndex === indexCol.index && filter.usable) {
-				if (filter.op === '>' || filter.op === '>=') {
-					handledFilters[i] = true;
-					hasLower = true;
-				} else if (filter.op === '<' || filter.op === '<=') {
-					handledFilters[i] = true;
-					hasUpper = true;
-				}
+			if (filter.columnIndex !== indexCol.index || !filter.usable) continue;
+			if (!hasLower && (filter.op === '>' || filter.op === '>=')) {
+				handledFilters[i] = true;
+				hasLower = true;
+			} else if (!hasUpper && (filter.op === '<' || filter.op === '<=')) {
+				handledFilters[i] = true;
+				hasUpper = true;
 			}
 		}
 

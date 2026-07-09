@@ -23,6 +23,7 @@ import type {
 	BaseModuleConfig,
 	BestAccessPlanRequest,
 	BestAccessPlanResult,
+	PredicateConstraint,
 	OrderingSpec,
 	SqlValue,
 	ModuleCapabilities,
@@ -120,6 +121,51 @@ const EQ_OPS = ['='] as const;
 const LOWER_BOUND_OPS = ['>', '>='] as const;
 const UPPER_BOUND_OPS = ['<', '<='] as const;
 const RANGE_OPS = [...LOWER_BOUND_OPS, ...UPPER_BOUND_OPS] as readonly string[];
+
+/** One (column, operator-group) slot that the access-path rule fills from a single filter. */
+interface SeekRole {
+	colIdx: number;
+	ops: readonly string[];
+}
+
+/**
+ * Build `handledFilters` by claiming ONLY the constraints `rule-select-access-path`
+ * actually consumes: per seek column the FIRST '=' (equality seek), or the FIRST lower
+ * ('>'/'>=') plus the FIRST upper ('<'/'<=') bound, selected by `colConstraints.find(...)`
+ * in `request.filters` order.
+ *
+ * That rule collapses `handledFilters` into a per-COLUMN set, so a redundant same-column,
+ * same-role constraint marked handled is neither turned into a seek bound nor kept by
+ * `ruleGrowRetrieve` as a residual — its predicate would be LOST (`where v > 10 and v > 30`
+ * would wrongly return the `v > 10` rows; `where v = 20 and v = 30` would wrongly return
+ * the `v = 20` row). The engine now reattaches such orphans defensively, but a module that
+ * over-claims still pays a redundant predicate evaluation per fetched row.
+ *
+ * Claiming must therefore be POSITIONAL and match the rule's first-match pick: claiming the
+ * tighter-but-later duplicate instead would be actively wrong (the rule would still seek on
+ * the earlier one). Any later duplicate stays unhandled so it survives in the residual Filter.
+ */
+function claimFirstPerRole(
+	filters: readonly PredicateConstraint[],
+	roles: readonly SeekRole[],
+): boolean[] {
+	const claimed = new Set<number>();
+	for (const { colIdx, ops } of roles) {
+		const i = filters.findIndex(f => f.columnIndex === colIdx && ops.includes(f.op));
+		if (i >= 0) claimed.add(i);
+	}
+	return filters.map((_f, i) => claimed.has(i));
+}
+
+/** The lower-bound + upper-bound roles a single-column range seek on `colIdx` fills. */
+function rangeRoles(colIdx: number): SeekRole[] {
+	return [{ colIdx, ops: LOWER_BOUND_OPS }, { colIdx, ops: UPPER_BOUND_OPS }];
+}
+
+/** The one equality role each seek column of an equality/prefix seek fills. */
+function equalityRoles(colIdxs: readonly number[]): SeekRole[] {
+	return colIdxs.map(colIdx => ({ colIdx, ops: EQ_OPS }));
+}
 
 /**
  * Generic store module that works with any KVStoreProvider.
@@ -1838,22 +1884,23 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	): BestAccessPlanResult {
 		const estimatedRows = request.estimatedRows ?? 1000;
 
-		// Check for primary key equality constraints
+		// Check for primary key equality constraints. Count DISTINCT pinned PK columns:
+		// counting raw '=' filters would read `a = 1 and a = 2` on a composite PK (a, b)
+		// as "both PK columns pinned", claim both filters handled, then — with no
+		// complete PK equality set to seek — degrade to a sequential scan whose residual
+		// has already been discarded, returning the whole table.
 		const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
-		const pkFilters = request.filters.filter(f =>
-			f.columnIndex !== undefined &&
-			pkColumns.includes(f.columnIndex) &&
-			f.op === '='
+		const pinnedPkColumns = new Set(
+			request.filters
+				.filter(f => f.columnIndex !== undefined && pkColumns.includes(f.columnIndex) && f.op === '=')
+				.map(f => f.columnIndex)
 		);
 
-		if (pkFilters.length === pkColumns.length && pkColumns.length > 0) {
+		if (pinnedPkColumns.size === pkColumns.length && pkColumns.length > 0) {
 			// Full PK match - point lookup (single row; no monotonic advertisement)
-			const handledFilters = request.filters.map(f =>
-				pkFilters.some(pf => pf.columnIndex === f.columnIndex && pf.op === f.op)
-			);
 			return AccessPlanBuilder
 				.eqMatch(1, 0.1)
-				.setHandledFilters(handledFilters)
+				.setHandledFilters(claimFirstPerRole(request.filters, equalityRoles(pkColumns)))
 				.setIsSet(true)
 				.setIndexName('_primary_')
 				.setExplanation('Store primary key lookup')
@@ -1865,27 +1912,20 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// range bounds for primaryKeyDefinition[0]; ranges on later PK columns
 		// are silently dropped if marked handled. So only claim handled=true
 		// when the range is on the first PK column.
-		const rangeOps = ['<', '<=', '>', '>='];
 		const firstPkColumn = tableInfo.primaryKeyDefinition[0]?.index;
-		const rangeFilters = firstPkColumn !== undefined
-			? request.filters.filter(f =>
-				f.columnIndex === firstPkColumn &&
-				rangeOps.includes(f.op))
-			: [];
+		const hasLeadingPkRange = firstPkColumn !== undefined
+			&& request.filters.some(f => f.columnIndex === firstPkColumn && RANGE_OPS.includes(f.op));
 
-		if (rangeFilters.length > 0) {
+		if (hasLeadingPkRange) {
 			// Range scan on first PK column. Iteration is by PK key order (see
 			// StoreTable.scanPKRange), so we can advertise monotonic emission on
 			// the leading PK column. The scan seeks to the window start and
 			// early-terminates (StoreTable.buildPKRangeBounds derives the encoded
 			// bounds), and the leading-PK order guarantee holds throughout.
-			const handledFilters = request.filters.map(f =>
-				rangeFilters.some(rf => rf.columnIndex === f.columnIndex && rf.op === f.op)
-			);
 			const rangeRows = Math.max(1, Math.floor(estimatedRows * 0.3));
 			const plan = AccessPlanBuilder
 				.rangeScan(rangeRows, 0.2)
-				.setHandledFilters(handledFilters)
+				.setHandledFilters(claimFirstPerRole(request.filters, rangeRoles(firstPkColumn!)))
 				.setIndexName('_primary_')
 				.setSeekColumns([firstPkColumn!])
 				.setExplanation('Store primary key range scan')
@@ -2025,33 +2065,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			return costOnly('cost-only; key collation may under-fetch');
 		}
 
-		// Mark handled ONLY the constraints `rule-select-access-path` actually consumes.
-		// Per seek column that rule takes the FIRST '=' (equality seek), or the FIRST
-		// lower ('>'/'>=') plus the FIRST upper ('<'/'<=') bound, selected by
-		// `colConstraints.find(...)` in `request.filters` order. It also collapses
-		// `handledFilters` into a per-COLUMN set (`handledByCol`), so a redundant
-		// same-column, same-side constraint we mark handled is neither turned into a
-		// seek bound nor kept by `ruleGrowRetrieve` as a residual — its predicate is
-		// silently LOST (`where v > 10 and v > 30` would wrongly return the `v > 10`
-		// rows; `where v = 20 and v = 30` would wrongly return the `v = 20` row).
-		//
-		// Marking must therefore be POSITIONAL and match the rule's first-match pick:
-		// claiming the tighter-but-later duplicate instead would be actively wrong (the
-		// rule would still seek on the earlier one, and the tighter bound — marked
-		// handled — would never be applied anywhere). Any later duplicate stays
-		// unhandled so it survives in the residual Filter.
-		const claimed = new Set<number>();
-		const claimFirst = (colIdx: number, ops: readonly string[]): void => {
-			const i = request.filters.findIndex(f => f.columnIndex === colIdx && ops.includes(f.op));
-			if (i >= 0) claimed.add(i);
-		};
-		if (isRange) {
-			claimFirst(leadingCol, LOWER_BOUND_OPS);
-			claimFirst(leadingCol, UPPER_BOUND_OPS);
-		} else {
-			for (const colIdx of eqCols) claimFirst(colIdx, EQ_OPS);
-		}
-		const handledFilters = request.filters.map((_f, i) => claimed.has(i));
+		// Claim positionally — see {@link claimFirstPerRole}.
+		const handledFilters = claimFirstPerRole(
+			request.filters,
+			isRange ? rangeRoles(leadingCol) : equalityRoles(eqCols),
+		);
 
 		return (isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
 			.setHandledFilters(handledFilters)

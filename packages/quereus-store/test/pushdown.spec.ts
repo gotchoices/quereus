@@ -160,6 +160,74 @@ describe('StoreModule predicate pushdown', () => {
 		});
 	});
 
+	// Same positional-claim contract as `tryIndexAccessPlan`, but for the primary-key
+	// branches of `computeBestAccessPlan`. The PK range branch over-claimed EVERY
+	// same-op bound on the leading PK column, and the PK equality branch counted raw
+	// '=' filters rather than DISTINCT pinned columns — so on a composite PK,
+	// `a = 1 and a = 2` looked like a full key match, claimed both filters, found no
+	// complete equality set to seek, and full-scanned with the residual already gone.
+	describe('redundant same-column constraints on the primary key', () => {
+		async function planOps(query: string): Promise<string> {
+			const rows = await asyncIterableToArray(
+				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
+			);
+			expect(rows).to.have.lengthOf(1);
+			return rows[0].ops as string;
+		}
+
+		describe('single-column primary key', () => {
+			const ids = async (q: string) =>
+				(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
+
+			beforeEach(async () => {
+				await db.exec(`create table t (id integer primary key, v integer) using store`);
+				await db.exec(`insert into t values (10, 1), (20, 2), (30, 3), (40, 4)`);
+			});
+
+			it('two lower bounds: the tighter one is not dropped', async () =>
+				expect(await ids(`select id from t where id > 10 and id > 30 order by id`)).to.deep.equal([40]));
+
+			it('two upper bounds: the tighter one is not dropped', async () =>
+				expect(await ids(`select id from t where id < 40 and id < 20 order by id`)).to.deep.equal([10]));
+
+			it('mixed same-side ops (> and >=) keep both', async () =>
+				expect(await ids(`select id from t where id > 10 and id >= 30 order by id`)).to.deep.equal([30, 40]));
+
+			it('contradictory equality pair yields no rows', async () =>
+				expect(await ids(`select id from t where id = 20 and id = 30`)).to.deep.equal([]));
+
+			it('a two-sided range still seeks and stays correct', async () => {
+				expect(await ids(`select id from t where id > 10 and id < 40 order by id`)).to.deep.equal([20, 30]);
+				expect(await planOps(`select id from t where id > 10 and id < 40`)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			});
+		});
+
+		describe('composite primary key (a, b)', () => {
+			beforeEach(async () => {
+				await db.exec(`create table c (a integer not null, b integer not null, primary key (a, b)) using store`);
+				await db.exec(`insert into c values (1, 1), (1, 2), (2, 1)`);
+			});
+
+			// Before the dedupe, this returned EVERY row in the table.
+			it('contradictory equality pair on the leading key column yields no rows', async () =>
+				expect(await asyncIterableToArray(db.eval(`select a, b from c where a = 1 and a = 2`))).to.deep.equal([]));
+
+			it('a genuine full-key equality still finds its row', async () =>
+				expect(await asyncIterableToArray(db.eval(`select a, b from c where a = 1 and b = 2`)))
+					.to.deep.equal([{ a: 1, b: 2 }]));
+
+			it('a redundant equality alongside a full key match keeps the residual', async () =>
+				expect(await asyncIterableToArray(db.eval(`select a, b from c where a = 1 and b = 2 and a = 2`)))
+					.to.deep.equal([]));
+
+			// Only the leading key column is pinned — no full key match, so the plan falls
+			// through to the PK range/scan arms and the equalities stay residual.
+			it('a partial key equality still returns its rows', async () =>
+				expect(await asyncIterableToArray(db.eval(`select a, b from c where a = 1 order by b`)))
+					.to.deep.equal([{ a: 1, b: 1 }, { a: 1, b: 2 }]));
+		});
+	});
+
 	describe('table without explicit PRIMARY KEY', () => {
 		beforeEach(async () => {
 			// No PK declared — every column becomes part of the implicit PK.

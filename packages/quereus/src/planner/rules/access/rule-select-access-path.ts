@@ -215,6 +215,63 @@ function rebuildPipelineWithNewLeaf(
 }
 
 /**
+ * The constraint operators this rule can turn into seek bounds, and therefore the
+ * only ones {@link reattachUnconsumedConstraints} can recover when a module claims
+ * a filter the rule never consumes.
+ *
+ * NOTE: ops outside this set (IS NULL / IS NOT NULL / LIKE / GLOB / MATCH / NOT IN) are never
+ * pushed into FilterInfo by this rule, so a module claiming one is taken at its word.
+ * Sound today: the only such claim is memory's tautological IS NOT NULL on a NOT NULL
+ * column. If a module ever claims a non-tautological non-seek op, its predicate is lost
+ * — widen this set, or make grow-retrieve refuse the claim.
+ */
+const RECLAIMABLE_OPS: ReadonlySet<string> = new Set(['=', 'IN', '>', '>=', '<', '<=', 'OR_RANGE']);
+
+/**
+ * The set of constraints a physical-node selection actually turned into a seek key,
+ * a `FilterInfo.constraints` entry, or a collation-cover residual. Threaded (mutable)
+ * through {@link selectPhysicalNodeFromPlan} / {@link selectPhysicalNodeLegacy} so
+ * {@link reattachUnconsumedConstraints} can tell which claimed filters were dropped.
+ * Membership is by object identity — constraint objects are unique per predicate.
+ */
+type ConsumedSet = Set<PlannerPredicateConstraint>;
+
+/**
+ * `handledFilters[i] === true` is a module's promise that filter `i` will be enforced
+ * somewhere else — and the only "somewhere else" available is `FilterInfo.constraints`
+ * (the seek bounds this rule builds). This rule consumes at most one constraint per
+ * column per role: the first `=`/`IN`, the first lower bound, the first upper bound.
+ * A module that claims a redundant same-column same-role filter (`v > 10 and v > 30`)
+ * therefore hands the planner a predicate that is seeked nowhere and — because
+ * `rule-grow-retrieve` residualizes only *unhandled* constraints — filtered nowhere.
+ *
+ * Reattach those as a residual `Filter` so an over-claiming module costs a redundant
+ * predicate evaluation, never a wrong answer. Skipped for an `EmptyResultNode` leaf
+ * (filtering an empty relation is dead weight) and restricted to {@link RECLAIMABLE_OPS}.
+ */
+function reattachUnconsumedConstraints(
+	tableRef: TableReferenceNode,
+	accessPlan: BestAccessPlanResult,
+	constraints: PlannerPredicateConstraint[],
+	consumed: ConsumedSet,
+	leaf: RelationalPlanNode,
+): RelationalPlanNode {
+	if (leaf instanceof EmptyResultNode) return leaf;
+
+	const lost = constraints.filter((c, i) =>
+		accessPlan.handledFilters[i] === true
+		&& !consumed.has(c)
+		&& RECLAIMABLE_OPS.has(c.op));
+	if (lost.length === 0) return leaf;
+
+	const predicate = combineResidualExpressions(lost.map(c => c.sourceExpression));
+	if (!predicate) return leaf;
+
+	log('Reattaching %d handled-but-unconsumed constraint(s) as a residual filter', lost.length);
+	return new FilterNode(tableRef.scope, leaf, predicate);
+}
+
+/**
  * Select the appropriate physical node based on access plan
  */
 function selectPhysicalNode(
@@ -257,13 +314,15 @@ function selectPhysicalNode(
 		desc: spec.desc
 	}));
 
-	// --- Index-aware path: use module-provided index identity ---
-	if (accessPlan.indexName && accessPlan.seekColumnIndexes && accessPlan.seekColumnIndexes.length > 0) {
-		return selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering);
-	}
+	const consumed: ConsumedSet = new Set();
 
+	// --- Index-aware path: use module-provided index identity ---
 	// --- Legacy fallback: infer access method from constraints and PK definition ---
-	return selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering);
+	const leaf = (accessPlan.indexName && accessPlan.seekColumnIndexes && accessPlan.seekColumnIndexes.length > 0)
+		? selectPhysicalNodeFromPlan(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed)
+		: selectPhysicalNodeLegacy(tableRef, accessPlan, constraints, filterInfo, providesOrdering, consumed);
+
+	return reattachUnconsumedConstraints(tableRef, accessPlan, constraints, consumed, leaf);
 }
 
 /**
@@ -275,7 +334,8 @@ function selectPhysicalNodeFromPlan(
 	accessPlan: BestAccessPlanResult,
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
-	providesOrdering: { column: number; desc: boolean }[] | undefined
+	providesOrdering: { column: number; desc: boolean }[] | undefined,
+	consumed: ConsumedSet
 ): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	// Whether this module's runtime honours the index collation for range bounds —
@@ -300,6 +360,19 @@ function selectPhysicalNodeFromPlan(
 		if (accessPlan.handledFilters[i] === true) handledByCol.add(c.columnIndex);
 	});
 
+	// Per-column, per-role pickers. Each returns the FIRST constraint in `constraints`
+	// order filling that role — the positional contract module authors must claim
+	// against (see docs/module-authoring.md). Redundant same-role duplicates are never
+	// picked and are recovered by `reattachUnconsumedConstraints`.
+	const isHandled = (c: PlannerPredicateConstraint): boolean => handledByCol.has(c.columnIndex);
+	const findPrefixEq = (colIdx: number): PlannerPredicateConstraint | undefined =>
+		(constraintsByCol.get(colIdx) ?? []).find(c =>
+			(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) && isHandled(c));
+	const findLower = (colIdx: number): PlannerPredicateConstraint | undefined =>
+		(constraintsByCol.get(colIdx) ?? []).find(c => (c.op === '>' || c.op === '>=') && isHandled(c));
+	const findUpper = (colIdx: number): PlannerPredicateConstraint | undefined =>
+		(constraintsByCol.get(colIdx) ?? []).find(c => (c.op === '<' || c.op === '<=') && isHandled(c));
+
 	// Check if all seek columns have equality constraints (=, single-value IN, or multi-value IN)
 	const eqBySeekCol = new Map<number, PlannerPredicateConstraint>();
 	let allEquality = true;
@@ -318,6 +391,11 @@ function selectPhysicalNodeFromPlan(
 	}
 
 	if (allEquality && eqBySeekCol.size === seekCols.length) {
+		// Every arm below returns, and each consumes exactly the per-seek-column
+		// equality constraints — as seek keys, or (on a collation decline) as the
+		// residual re-applied above the scan.
+		for (const c of eqBySeekCol.values()) consumed.add(c);
+
 		// Collation-cover analysis: a seek over an index whose per-column collation
 		// differs from the predicate's effective comparison collation is NOT a
 		// complete substitute for the predicate. Decline (scan + residual) on an
@@ -551,33 +629,33 @@ function selectPhysicalNodeFromPlan(
 		const prefixEqCols: number[] = [];
 		let trailingRangeCol: number | undefined;
 		for (const colIdx of seekCols) {
-			const colConstraints = constraintsByCol.get(colIdx) ?? [];
-			const eqConstraint = colConstraints.find(c =>
-				(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
-				handledByCol.has(c.columnIndex));
-			if (eqConstraint) {
+			if (findPrefixEq(colIdx)) {
 				prefixEqCols.push(colIdx);
 			} else {
-				const hasRange = colConstraints.some(c =>
-					['>', '>=', '<', '<='].includes(c.op) && handledByCol.has(c.columnIndex));
-				if (hasRange) trailingRangeCol = colIdx;
+				if (findLower(colIdx) || findUpper(colIdx)) trailingRangeCol = colIdx;
 				break;
 			}
 		}
 
 		if (prefixEqCols.length > 0 && trailingRangeCol !== undefined) {
+			const prefixConstraints: ConsumedConstraint[] = prefixEqCols.map(colIdx =>
+				({ colIdx, constraint: findPrefixEq(colIdx)! }));
+			const lower = findLower(trailingRangeCol);
+			const upper = findUpper(trailingRangeCol);
+
+			// Every arm below returns, consuming the prefix equalities plus the first
+			// lower/upper trailing bound — as seek keys, or (on a collation decline) as
+			// the residual re-applied above the scan.
+			for (const { constraint } of prefixConstraints) consumed.add(constraint);
+			if (lower) consumed.add(lower);
+			if (upper) consumed.add(upper);
+
 			// A literal NULL in any prefix-equality column makes every row-value
 			// comparison UNKNOWN ⇒ no match. Emit an empty result rather than relying
 			// on the runtime prefix walk breaking on the first row. Part A does not
 			// cover this path (it walks via `equalityPrefix`, not `equalityKey`), so
 			// the plan-time check is the robustness guarantee here.
-			const prefixHasLiteralNull = prefixEqCols.some(colIdx => {
-				const c = (constraintsByCol.get(colIdx) ?? []).find(c =>
-					(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
-					handledByCol.has(c.columnIndex));
-				return c !== undefined && isLiteralNullEquality(c);
-			});
-			if (prefixHasLiteralNull) {
+			if (prefixConstraints.some(({ constraint }) => isLiteralNullEquality(constraint))) {
 				log('Prefix-range seek on %s has a literal NULL prefix key — using empty result', physicalIndexName);
 				return createEmptyResultNode(tableRef);
 			}
@@ -586,19 +664,10 @@ function selectPhysicalNodeFromPlan(
 			// the walked index window (it is no longer a contiguous superset), so it
 			// cannot be salvaged with a residual — decline to a scan + residual.
 			{
-				const consumed: ConsumedConstraint[] = [];
-				for (const colIdx of prefixEqCols) {
-					const c = (constraintsByCol.get(colIdx) ?? []).find(c =>
-						(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
-						handledByCol.has(c.columnIndex))!;
-					consumed.push({ colIdx, constraint: c });
-				}
-				const trailing = constraintsByCol.get(trailingRangeCol) ?? [];
-				const lo = trailing.find(c => (c.op === '>' || c.op === '>=') && handledByCol.has(c.columnIndex));
-				const hi = trailing.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
-				if (lo) consumed.push({ colIdx: trailingRangeCol, constraint: lo });
-				if (hi) consumed.push({ colIdx: trailingRangeCol, constraint: hi });
-				const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
+				const coverConstraints: ConsumedConstraint[] = [...prefixConstraints];
+				if (lower) coverConstraints.push({ colIdx: trailingRangeCol, constraint: lower });
+				if (upper) coverConstraints.push({ colIdx: trailingRangeCol, constraint: upper });
+				const cover = classifyCollationCover(coverConstraints, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
 				if (!cover.useIndex) {
 					log('Declining prefix-range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
 					const scan = createSeqScan(tableRef);
@@ -611,20 +680,13 @@ function selectPhysicalNodeFromPlan(
 			let argv = 1;
 
 			// Add prefix equality values
-			for (const colIdx of prefixEqCols) {
-				const c = (constraintsByCol.get(colIdx) ?? []).find(c =>
-					(c.op === '=' || (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1)) &&
-					handledByCol.has(c.columnIndex))!;
-				seekKeys.push(equalitySeekKey(tableRef.scope, c));
+			for (const { colIdx, constraint } of prefixConstraints) {
+				seekKeys.push(equalitySeekKey(tableRef.scope, constraint));
 				allConstraints.push({ constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true }, argvIndex: argv });
 				argv++;
 			}
 
 			// Add trailing range values
-			const trailingConstraints = constraintsByCol.get(trailingRangeCol) ?? [];
-			const lower = trailingConstraints.find(c => (c.op === '>' || c.op === '>=') && handledByCol.has(c.columnIndex));
-			const upper = trailingConstraints.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
-
 			if (lower) {
 				allConstraints.push({ constraint: { iColumn: trailingRangeCol, op: opToIndexOp(lower.op as RangeOp), usable: true }, argvIndex: argv });
 				seekKeys.push(lower.valueExpr && !Array.isArray(lower.valueExpr) ? lower.valueExpr : literalFromValue(tableRef.scope, lower.value as SqlValue));
@@ -659,24 +721,25 @@ function selectPhysicalNodeFromPlan(
 
 	// Check for range constraints on the seek columns
 	// Use the first (or only) seek column that has range constraints
-	const rangeCol = seekCols.find(colIdx => {
-		const colConstraints = constraintsByCol.get(colIdx) ?? [];
-		return colConstraints.some(c => ['>', '>=', '<', '<='].includes(c.op) && handledByCol.has(c.columnIndex));
-	});
+	const rangeCol = seekCols.find(colIdx => findLower(colIdx) || findUpper(colIdx));
 
 	if (rangeCol !== undefined) {
-		const colConstraints = constraintsByCol.get(rangeCol) ?? [];
-		const lower = colConstraints.find(c => (c.op === '>' || c.op === '>=') && handledByCol.has(c.columnIndex));
-		const upper = colConstraints.find(c => (c.op === '<' || c.op === '<=') && handledByCol.has(c.columnIndex));
+		const lower = findLower(rangeCol);
+		const upper = findUpper(rangeCol);
+
+		// Both arms below return, consuming the first lower/upper bound — as seek
+		// bounds, or (on a collation decline) as the residual above the scan.
+		if (lower) consumed.add(lower);
+		if (upper) consumed.add(upper);
 
 		// Collation-cover: a range seek under a collation that differs from the
 		// predicate's reorders the index window, so it is never a superset — decline
 		// to a scan + residual on any mismatch.
 		{
-			const consumed: ConsumedConstraint[] = [];
-			if (lower) consumed.push({ colIdx: rangeCol, constraint: lower });
-			if (upper) consumed.push({ colIdx: rangeCol, constraint: upper });
-			const cover = classifyCollationCover(consumed, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
+			const coverConstraints: ConsumedConstraint[] = [];
+			if (lower) coverConstraints.push({ colIdx: rangeCol, constraint: lower });
+			if (upper) coverConstraints.push({ colIdx: rangeCol, constraint: upper });
+			const cover = classifyCollationCover(coverConstraints, false, indexColumnCollationLookup(tableRef.tableSchema, accessPlan), honorsCollatedRangeBounds);
 			if (!cover.useIndex) {
 				log('Declining range seek on %s (collation mismatch) — sequential scan + residual', physicalIndexName);
 				const scan = createSeqScan(tableRef);
@@ -727,6 +790,10 @@ function selectPhysicalNodeFromPlan(
 
 	if (orRangeConstraint && orRangeConstraint.ranges) {
 		const ranges = orRangeConstraint.ranges as RangeSpec[];
+
+		// Both arms below return, consuming this OR_RANGE — as the multi-range seek's
+		// bounds, or (on a collation decline) as the residual above the scan.
+		consumed.add(orRangeConstraint);
 
 		// Collation-cover: an OR_RANGE seek walks multiple index windows whose order
 		// follows the index collation; any mismatch makes them non-supersets, so
@@ -833,7 +900,8 @@ function selectPhysicalNodeLegacy(
 	accessPlan: BestAccessPlanResult,
 	constraints: PlannerPredicateConstraint[],
 	filterInfo: FilterInfo,
-	providesOrdering: { column: number; desc: boolean }[] | undefined
+	providesOrdering: { column: number; desc: boolean }[] | undefined,
+	consumed: ConsumedSet
 ): RelationalPlanNode {
 	const advertisement = extractAdvertisement(accessPlan);
 	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
@@ -848,12 +916,19 @@ function selectPhysicalNodeLegacy(
 
 	const maybeRows = accessPlan.rows || 0;
 	const pkCols = tableRef.tableSchema.primaryKeyDefinition ?? [];
+	// FIRST '=' per column, matching the positional contract the index-aware path and
+	// `docs/module-authoring.md` state. Keeping the last would seek on a constraint a
+	// module claiming positionally never expected to be consumed.
 	const eqByCol = new Map<number, PlannerPredicateConstraint>();
-	for (const c of eqHandled) eqByCol.set(c.columnIndex, c);
+	for (const c of eqHandled) if (!eqByCol.has(c.columnIndex)) eqByCol.set(c.columnIndex, c);
 	const coversPk = pkCols.length > 0 && pkCols.every(pk => eqByCol.has(pk.index));
 	const treatAsHandledPk = coversPk && pkCols.every(pk => handledByCol.has(pk.index) || eqByCol.has(pk.index));
 
 	if ((hasEqualityConstraints && coversPk || treatAsHandledPk) && maybeRows <= 10) {
+		// Every arm below returns, consuming the per-PK-column equality — as a seek
+		// key, or (on a collation decline) as the residual re-applied above the scan.
+		for (const pk of pkCols) consumed.add(eqByCol.get(pk.index)!);
+
 		// A literal NULL in any PK column makes the point-seek UNKNOWN ⇒ no row can
 		// match. Emit an empty result instead of a doomed seek (mirrors the
 		// index-aware path; the scan-layer runtime guard covers the dynamic case).
@@ -918,13 +993,18 @@ function selectPhysicalNodeLegacy(
 		const lower = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '>' || c.op === '>='));
 		const upper = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '<' || c.op === '<='));
 
+		// Both arms below return, consuming the first lower/upper bound on the leading
+		// PK column — as seek bounds, or (on a collation decline) as the scan residual.
+		if (lower) consumed.add(lower);
+		if (upper) consumed.add(upper);
+
 		// Collation-cover: a PK range seek under a mismatched collation reorders the
 		// walked window, so decline to a scan + residual on any mismatch.
 		{
-			const consumed: ConsumedConstraint[] = [];
-			if (lower) consumed.push({ colIdx: primaryFirstCol, constraint: lower });
-			if (upper) consumed.push({ colIdx: primaryFirstCol, constraint: upper });
-			const cover = classifyCollationCover(consumed, false, primaryKeyCollationLookup(tableRef.tableSchema), honorsCollatedRangeBounds);
+			const coverConstraints: ConsumedConstraint[] = [];
+			if (lower) coverConstraints.push({ colIdx: primaryFirstCol, constraint: lower });
+			if (upper) coverConstraints.push({ colIdx: primaryFirstCol, constraint: upper });
+			const cover = classifyCollationCover(coverConstraints, false, primaryKeyCollationLookup(tableRef.tableSchema), honorsCollatedRangeBounds);
 			if (!cover.useIndex) {
 				log('Declining PK range seek (collation mismatch) — sequential scan + residual (legacy)');
 				const scan = createSeqScan(tableRef);
