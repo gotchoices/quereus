@@ -161,7 +161,33 @@ describe('StoreModule secondary-index persistence', () => {
 		expect(r).to.deep.equal([{ id: 2 }]);
 	});
 
-	it('secondary index is rebuilt consistently after an ALTER COLUMN SET COLLATE re-key of the PK', async () => {
+	it('the secondary-index scan arm reads reattached entries after reopen (seek + range)', async () => {
+			// Entries written pre-reopen carry the row's data key as their value; after
+			// reopen the store's index-scan arm resolves each entry back to its base row
+			// through that stored data key, so an index seek returns correct rows without
+			// a rebuild.
+			const { db, mod } = open();
+			await db.exec(`create table t (id integer primary key, b integer) using store`);
+			await db.exec(`create index ix_b on t (b)`);
+			await db.exec(`insert into t values (1, 10), (2, 20), (3, 30), (4, 20)`);
+			await mod.closeAll();
+
+			const { db: db2 } = await reopen();
+
+			// EQ seek across the reattached index (two rows share b = 20).
+			expect(await rows(db2, `select id from t where b = 20 order by id`))
+				.to.deep.equal([{ id: 2 }, { id: 4 }]);
+
+			// Range seek across the reattached index; order by b, id → 20, 20, 30.
+			expect(await rows(db2, `select id from t where b > 15 order by b, id`))
+				.to.deep.equal([{ id: 2 }, { id: 4 }, { id: 3 }]);
+
+			// The plan actually uses the index (not a full scan + residual).
+			const planRows = await rows(db2, `select json_group_array(op) as ops from query_plan('select id from t where b = 20')`);
+			expect(planRows[0].ops as string).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+		});
+
+		it('secondary index is rebuilt consistently after an ALTER COLUMN SET COLLATE re-key of the PK', async () => {
 		const { db } = open();
 		// Text PK keyed BINARY + a secondary index on a value column. Uppercase PK values
 		// so the BINARY→NOCASE re-key actually changes the data-key bytes (and thus the PK

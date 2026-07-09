@@ -559,4 +559,111 @@ describe('StoreModule predicate pushdown', () => {
 			expect(rows.map(r => r.n)).to.deep.equal([96, 970, 98, 99, 200]);
 		});
 	});
+
+	// Secondary-index scan arm (store-index-scan-read-primitive): StoreTable.query
+	// derives an encoded window over the chosen secondary index and resolves each
+	// entry to its base row, and getBestAccessPlan advertises the index with
+	// honestly-handled filters — subject to the collation-safety guard.
+	describe('secondary-index scan (store-index-scan-read-primitive)', () => {
+		async function planOps(query: string): Promise<string> {
+			const rows = await asyncIterableToArray(
+				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
+			);
+			expect(rows).to.have.lengthOf(1);
+			return rows[0].ops as string;
+		}
+
+		it('EQ on an indexed non-text column seeks the index and returns correct rows', async () => {
+			await db.exec(`create table t (id integer primary key, name text, age integer) using store`);
+			await db.exec(`create index ix_age on t (age)`);
+			await db.exec(`insert into t values (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 30)`);
+
+			const q = `select id from t where age = 30 order by id`;
+			expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 3 }]);
+		});
+
+		it('range on an indexed non-text column seeks the index and returns correct rows', async () => {
+			await db.exec(`create table t (id integer primary key, name text, age integer) using store`);
+			await db.exec(`create index ix_age on t (age)`);
+			await db.exec(`insert into t values (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 35)`);
+
+			const q = `select id from t where age > 25 order by age`;
+			expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 3 }]);
+		});
+
+		it('text EQ on a NOCASE column (declared == K) seeks and matches case-insensitively', async () => {
+			// The column is declared COLLATE NOCASE so matchesFilters compares under
+			// NOCASE, matching the store's default key collation K = NOCASE (declared ==
+			// K → collation-safe seek). Without the explicit COLLATE the column would be
+			// BINARY and `= 'alice'` would match nothing (a distinct, correct behavior).
+			await db.exec(`create table t (id integer primary key, name text collate nocase) using store`);
+			await db.exec(`create index ix_name on t (name)`);
+			await db.exec(`insert into t values (1, 'Alice'), (2, 'bob'), (3, 'ALICE')`);
+
+			const q = `select id from t where name = 'alice' order by id`;
+			expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 3 }]);
+		});
+
+		it('composite index: full-prefix EQ and leading-only EQ both return correct rows', async () => {
+			await db.exec(`create table t (id integer primary key, a integer, b integer) using store`);
+			await db.exec(`create index ix_ab on t (a, b)`);
+			await db.exec(`insert into t values (1, 5, 10), (2, 5, 20), (3, 6, 10)`);
+
+			// Full prefix (a, b) → single-entry point.
+			const q1 = `select id from t where a = 5 and b = 20`;
+			expect(await planOps(q1)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await asyncIterableToArray(db.eval(q1))).to.deep.equal([{ id: 2 }]);
+
+			// Leading column only → prefix window over both a = 5 rows.
+			const q2 = `select id from t where a = 5 order by id`;
+			expect(await planOps(q2)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await asyncIterableToArray(db.eval(q2))).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		});
+
+		it('DESC index column seeks under byte inversion and returns correct rows', async () => {
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			await db.exec(`create index ix_v on t (v desc)`);
+			await db.exec(`insert into t values (1, 10), (2, 20), (3, 30)`);
+
+			const q = `select id from t where v > 15 order by v`;
+			expect(await planOps(q)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 2 }, { id: 3 }]);
+		});
+
+		it('a partial index is NOT chosen for a seek (no predicate-implication check); rows stay correct', async () => {
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			await db.exec(`create index ix_pos on t (v) where v > 0`);
+			await db.exec(`insert into t values (1, 10), (2, 20), (3, -5)`);
+
+			// A partial index physically omits out-of-scope rows; since nothing checks
+			// that the query's WHERE implies the index predicate, the store must NOT seek
+			// it (it would drop rows an out-of-scope query needs). It full-scans +
+			// residual instead — no index seek, correct rows.
+			const inScope = `select id from t where v = 20`;
+			expect(await planOps(inScope), 'partial index not chosen for a seek').to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(await asyncIterableToArray(db.eval(inScope))).to.deep.equal([{ id: 2 }]);
+
+			// An out-of-scope query (needs the row the partial index omits) is correct.
+			const outScope = `select id from t where v = -5`;
+			expect(await asyncIterableToArray(db.eval(outScope))).to.deep.equal([{ id: 3 }]);
+		});
+
+		// Collation-safety guard against under-fetch: a BINARY-config store (K = BINARY)
+		// with an index on a NOCASE-declared column would MISS a case-variant row if the
+		// BINARY window were trusted, so the plan must NOT mark the filter handled — no
+		// index seek, residual retained, and the result stays NOCASE-correct.
+		it('collation-unsafe index (K=BINARY over a NOCASE column) declines the seek but stays correct', async () => {
+			await db.exec(`create table t (id integer primary key, v text collate nocase) using store (collation = binary)`);
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(`insert into t values (1, 'Apple'), (2, 'apple'), (3, 'Banana')`);
+
+			const q = `select id from t where v = 'apple' order by id`;
+			expect(await planOps(q), 'guard leaves the filter unhandled — no index seek').to.not.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			// NOCASE-correct: both 'Apple' and 'apple' match.
+			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 2 }]);
+		});
+	});
 });

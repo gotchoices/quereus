@@ -191,6 +191,33 @@ describe('StoreTable read-your-own-writes (bare StoreModule)', () => {
 		await db.exec(`rollback`);
 	});
 
+	it('secondary-index seek reads its own pending index puts and deletes', async () => {
+		// The index scan iterates `iterateEffective(indexStore, …)`, so pending index
+		// puts/deletes must be visible mid-transaction — not just the committed entries.
+		await db.exec(`create table t (id integer primary key, v integer) using store`);
+		await db.exec(`create index ix_v on t (v)`);
+		await db.exec(`insert into t values (1, 10), (2, 20)`); // committed
+
+		await db.exec(`begin`);
+		// Pending insert: seek finds the not-yet-committed value.
+		await db.exec(`insert into t values (3, 30)`);
+		expect(await collect(db, `select id from t where v = 30`)).to.deep.equal([{ id: 3 }]);
+
+		// Update the indexed column: old value misses, new value hits.
+		await db.exec(`update t set v = 99 where id = 1`);
+		expect(await collect(db, `select id from t where v = 10`), 'old index value gone').to.deep.equal([]);
+		expect(await collect(db, `select id from t where v = 99`), 'new index value present').to.deep.equal([{ id: 1 }]);
+
+		// Delete: the entry is suppressed by the pending index delete.
+		await db.exec(`delete from t where id = 2`);
+		expect(await collect(db, `select id from t where v = 20`), 'deleted row not seekable').to.deep.equal([]);
+
+		await db.exec(`commit`);
+		// Committed state reflects the whole transaction.
+		expect(await collect(db, `select id, v from t order by id`))
+			.to.deep.equal([{ id: 1, v: 99 }, { id: 3, v: 30 }]);
+	});
+
 	describe('cross-table transaction (module-wide coordinator)', () => {
 		// The headline behavior, exercised at the SQL level over a real Database:
 		// two store tables share ONE module coordinator, so a single transaction

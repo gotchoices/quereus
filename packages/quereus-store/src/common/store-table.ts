@@ -48,6 +48,7 @@ import { StoreConnection } from './store-connection.js';
 import {
 	buildDataKey,
 	buildIndexKey,
+	buildIndexPrefixBounds,
 	buildFullScanBounds,
 	buildPkPrefixBounds,
 	buildStatsKey,
@@ -651,6 +652,17 @@ export class StoreTable extends VirtualTable {
 			return;
 		}
 
+		// Secondary-index scan arm — reached only when the predicate did NOT resolve
+		// to a PK point/range (PK access is cheaper and already handled above). When
+		// the planner chose a secondary index (idxStr carries `idx=<name>(…)`), derive
+		// its byte window and iterate it instead of full-scanning.
+		const indexAccess = this.analyzeIndexAccess(filterInfo);
+		if (indexAccess) {
+			const indexStore = await this.ensureIndexStore(indexAccess.index.name);
+			yield* this.scanIndex(indexStore, indexAccess, filterInfo);
+			return;
+		}
+
 		// Full table scan
 		const bounds = buildFullScanBounds();
 		for await (const entry of this.iterateEffective(store, bounds)) {
@@ -860,8 +872,211 @@ export class StoreTable extends VirtualTable {
 		}
 	}
 
-	/** Check if a row matches the filter constraints. */
-	protected matchesFilters(row: Row, filterInfo: FilterInfo): boolean {
+	/**
+	 * Resolve the secondary index chosen by the planner from `filterInfo.idxStr`.
+	 *
+	 * The planner emits `idx=<name>(<n>);plan=…` when its access plan set both an
+	 * `indexName` and `seekColumnIndexes` (see `getBestAccessPlan` and
+	 * rule-select-access-path.ts). Mirrors `isolated-table.ts`'
+	 * `parseIndexFromFilterInfo` so the store and the isolation overlay resolve the
+	 * SAME index for one idxStr. Returns null for the PK/scan sentinels
+	 * (`_primary_`, `fullscan`), a missing `idx=` param, or a name absent from
+	 * `schema.indexes` — every one of which routes back to a PK/full-scan arm.
+	 */
+	protected resolveIndexFromIdxStr(idxStr: string | null): TableIndexSchema | null {
+		if (!idxStr) return null;
+		const params = new Map<string, string>();
+		idxStr.split(';').forEach(part => {
+			const [key, value] = part.split('=', 2);
+			if (key && value !== undefined) params.set(key, value);
+		});
+		const idx = params.get('idx');
+		if (!idx) return null;
+		const match = idx.match(/^(.*?)\((\d+)\)$/);
+		const name = match ? match[1] : idx;
+		if (!name || name === '_primary_' || name === 'fullscan') return null;
+		const indexes = this.tableSchema?.indexes ?? [];
+		return indexes.find(i => i.name.toLowerCase() === name.toLowerCase()) ?? null;
+	}
+
+	/**
+	 * Analyze filter info to determine a secondary-index access pattern, mirroring
+	 * {@link analyzePKAccess} but over the index chosen in `idxStr`.
+	 *
+	 * A contiguous leading-prefix EQ on the index columns yields a `point` window
+	 * (the prefix covers every entry sharing those leading values — an index seek
+	 * is a PREFIX scan, not a single row, since the index need not be unique and
+	 * the PK suffix varies); otherwise a range (LT/LE/GT/GE) on the LEADING index
+	 * column yields a `range` window. Returns null when neither applies, when the
+	 * index is unresolved, or when the table key collation K has no registered byte
+	 * encoder (its window bytes would not track logical order — mirrors
+	 * {@link buildPKRangeBounds}' comparator-only fallback). {@link matchesFilters}
+	 * stays the authoritative row filter, so the window need only be a SUPERSET.
+	 */
+	protected analyzeIndexAccess(filterInfo: FilterInfo): IndexAccessPattern | null {
+		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
+		if (!index) return null;
+
+		// Index-column bytes are encoded under the table key collation K (NOT the
+		// index's per-column declared collation — see buildIndexKey). A K with no
+		// registered byte encoder cannot produce a sound window; fall back to a full
+		// scan (matchesFilters remains authoritative).
+		const coll = this.encodeOptions.collation ?? 'NOCASE';
+		if (getCollationEncoder(coll) === undefined) return null;
+
+		const indexCols = index.columns.map(c => c.index);
+		const indexDirections = index.columns.map(c => !!c.desc);
+
+		// Contiguous leading-prefix EQ → point/prefix window.
+		const eqValues: SqlValue[] = [];
+		for (let i = 0; i < indexCols.length; i++) {
+			const eq = filterInfo.constraints?.find(
+				c => c.constraint.iColumn === indexCols[i]
+					&& c.constraint.op === IndexConstraintOp.EQ
+					&& c.argvIndex > 0,
+			);
+			if (!eq) break;
+			eqValues.push(filterInfo.args[eq.argvIndex - 1]);
+		}
+		if (eqValues.length > 0) {
+			const bounds = buildIndexPrefixBounds(
+				eqValues,
+				{ collation: coll },
+				indexDirections.slice(0, eqValues.length),
+			);
+			return { index, type: 'point', bounds };
+		}
+
+		// Else a range on the LEADING index column.
+		const leadingCol = indexCols[0];
+		const rangeOps = [IndexConstraintOp.LT, IndexConstraintOp.LE, IndexConstraintOp.GT, IndexConstraintOp.GE];
+		const rangeConstraints = (filterInfo.constraints ?? []).filter(
+			c => c.constraint.iColumn === leadingCol && rangeOps.includes(c.constraint.op),
+		);
+		if (rangeConstraints.length > 0) {
+			const bounds = this.buildIndexRangeBounds(
+				rangeConstraints.map(c => ({
+					op: c.constraint.op,
+					value: c.argvIndex > 0 ? filterInfo.args[c.argvIndex - 1] : undefined,
+				})),
+				indexDirections[0],
+				coll,
+			);
+			return { index, type: 'range', bounds };
+		}
+
+		return null;
+	}
+
+	/**
+	 * Convert leading-index-column LT/LE/GT/GE constraints into one encoded-byte
+	 * `gte`/`lt` window — the secondary-index analogue of {@link buildPKRangeBounds}.
+	 *
+	 * Each bound value is encoded under the table key collation K (`coll`) and the
+	 * leading index column's DESC `dir` — exactly as {@link buildIndexKey} encodes
+	 * that column — via {@link buildIndexPrefixBounds}, giving the byte region
+	 * `[lo, hi)` whose leading column equals that value. The op maps that region's
+	 * endpoints onto `gte`/`lt`, with the same DESC lower/upper SWAP as the PK path:
+	 *
+	 *   | op | ASC      | DESC     |
+	 *   |----|----------|----------|
+	 *   | GE | gte = lo | lt  = hi |
+	 *   | GT | gte = hi | lt  = lo |
+	 *   | LE | lt  = hi | gte = lo |
+	 *   | LT | lt  = lo | gte = hi |
+	 *
+	 * Across constraints keep the MAX lower and MIN upper. An `undefined` upper (an
+	 * `hi` whose increment overflowed all-0xff) leaves that side unbounded — a safe
+	 * SUPERSET. A NULL/missing bound value is skipped (the planner never pushes
+	 * `= NULL`, and a range op against NULL rejects every row in matchesFilters).
+	 */
+	protected buildIndexRangeBounds(
+		constraints: Array<{ op: IndexConstraintOp; value?: SqlValue }>,
+		dir: boolean,
+		coll: string,
+	): IterateOptions {
+		const full = buildFullScanBounds();
+		let gte: Uint8Array = full.gte;
+		let lt: Uint8Array | undefined;
+
+		for (const c of constraints) {
+			if (c.value === undefined || c.value === null) continue;
+			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], { collation: coll }, [dir]);
+			const lower = !dir
+				? (c.op === IndexConstraintOp.GE ? lo : c.op === IndexConstraintOp.GT ? hi : undefined)
+				: (c.op === IndexConstraintOp.LE ? lo : c.op === IndexConstraintOp.LT ? hi : undefined);
+			const upper = !dir
+				? (c.op === IndexConstraintOp.LE ? hi : c.op === IndexConstraintOp.LT ? lo : undefined)
+				: (c.op === IndexConstraintOp.GE ? hi : c.op === IndexConstraintOp.GT ? lo : undefined);
+			if (lower && compareBytes(lower, gte) > 0) gte = lower;
+			if (upper && (lt === undefined || compareBytes(upper, lt) < 0)) lt = upper;
+		}
+
+		return lt === undefined ? { gte } : { gte, lt };
+	}
+
+	/**
+	 * Scan a secondary index over `access.bounds`, resolving each index entry to its
+	 * base row and re-filtering.
+	 *
+	 * {@link iterateEffective} yields the committed index entries merged with this
+	 * transaction's pending index puts/deletes (read-your-own-writes over the
+	 * index), in index-key byte order — the order the isolation overlay merge relies
+	 * on (`isolated-table.ts` § buildSortKey). We resolve each entry to its row via
+	 * its stored data-key value WITHOUT reordering, so index-key order is preserved.
+	 *
+	 * Defense in depth mirroring the memory layer's live-recheck: a resolved-null
+	 * row (the entry's row was deleted — a pending index delete would normally
+	 * suppress the entry, but a committed entry can lag) is skipped, and every
+	 * resolved row is re-checked by {@link matchesFilters} (the byte window is only
+	 * a superset, and a stale entry whose indexed column no longer matches is
+	 * dropped).
+	 */
+	protected async *scanIndex(
+		indexStore: KVStore,
+		access: IndexAccessPattern,
+		filterInfo: FilterInfo,
+	): AsyncIterable<Row> {
+		// Re-check each resolved row under the INDEX's per-column collation (see
+		// matchesFilters): the planner dropped the residual based on the index
+		// column's collation, which an explicit index `COLLATE` can make differ from
+		// the table column's declared collation.
+		const indexCollations = this.indexColumnCollations(access.index);
+		for await (const entry of this.iterateEffective(indexStore, access.bounds)) {
+			// A legacy index store (written before index values carried the data key)
+			// holds empty values; a zero-length data key is not a row key, so skip it
+			// rather than resolve it to the wrong row. Such stores need a rebuild to be
+			// index-scannable (documented in the review handoff).
+			if (entry.value.length === 0) continue;
+			// NOTE: one extra data-store `get` per matched index entry — the row lives
+			// in the data store, not the index (the index value carries only the data
+			// key, no covering payload). Fine now; if index-covered scans ever dominate
+			// a profile, consider storing the serialized row as a covering index value,
+			// at the cost of an index rewrite on EVERY column change (not just indexed
+			// columns) — deliberately not done here.
+			const row = await this.readEffectiveRowByKey(entry.value);
+			if (row && this.matchesFilters(row, filterInfo, indexCollations)) {
+				yield row;
+			}
+		}
+	}
+
+	/**
+	 * Check if a row matches the filter constraints.
+	 *
+	 * `collationOverride`, when supplied, maps a column index to the collation this
+	 * check must compare that column under, OVERRIDING the column's declared
+	 * collation. The secondary-index scan arm passes it so an index column is
+	 * re-checked under the INDEX's per-column collation, not the table column's
+	 * declared collation — see {@link scanIndex}. Columns absent from the map (and
+	 * every caller that omits it — PK point/range, full scan) keep the declared
+	 * collation.
+	 */
+	protected matchesFilters(
+		row: Row,
+		filterInfo: FilterInfo,
+		collationOverride?: ReadonlyMap<number, string | undefined>,
+	): boolean {
 		if (!filterInfo.constraints || filterInfo.constraints.length === 0) {
 			return true;
 		}
@@ -880,7 +1095,12 @@ export class StoreTable extends VirtualTable {
 			// a pushed constraint is fully covered, and the same source this file's
 			// UNIQUE checks compare under. On a collation MATCH the planner drops the
 			// residual Filter, so this filter alone must reproduce the predicate.
-			const collation = this.tableSchema!.columns[constraint.iColumn]?.collation;
+			// For an index scan the planner's MATCH is against the INDEX column's
+			// collation (which an explicit `COLLATE` on the index can make differ from
+			// the table column's declared collation), so the override supplies it.
+			const collation = collationOverride?.has(constraint.iColumn)
+				? collationOverride.get(constraint.iColumn)
+				: this.tableSchema!.columns[constraint.iColumn]?.collation;
 
 			if (!this.compareValues(rowValue, constraint.op, filterValue, collation)) {
 				return false;
@@ -888,6 +1108,23 @@ export class StoreTable extends VirtualTable {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Effective per-column comparison collation for a secondary index's columns:
+	 * the index column's own `COLLATE` when present, else the underlying table
+	 * column's declared collation. Mirrors the resolution `StoreModule`'s
+	 * index-maintenance UNIQUE dedup uses (`indexCol.collation ?? tableColumn`), so
+	 * a re-checked index-scan row compares under the same collation the planner used
+	 * to justify dropping (or keeping) the residual Filter.
+	 */
+	protected indexColumnCollations(index: TableIndexSchema): Map<number, string | undefined> {
+		const cols = this.tableSchema!.columns;
+		const map = new Map<number, string | undefined>();
+		for (const c of index.columns) {
+			map.set(c.index, c.collation ?? cols[c.index]?.collation);
+		}
+		return map;
 	}
 
 	/**
@@ -1292,13 +1529,20 @@ export class StoreTable extends VirtualTable {
 					this.pkDirections,
 					this.pkKeyCollations,
 				);
-				// Index value is empty - we just need the key for lookups
-				const emptyValue = new Uint8Array(0);
+				// Index value = the row's encoded DATA key. The index-entry key can
+				// locate a row's byte window, but its PK suffix is not losslessly
+				// recoverable to SqlValues (a NOCASE/RTRIM PK column encodes lossily)
+				// and its length varies per entry in a range scan — so a scan resolves
+				// each entry back to its base row via this stored data key
+				// (`scanIndex` → `readEffectiveRowByKey(entry.value)`), never by
+				// decoding the suffix. `newPk` is the PK the entry is keyed under, so
+				// its data key byte-matches the data store's key for this row.
+				const dataKeyValue = this.encodeDataKey(newPk);
 
 				if (inTransaction && this.coordinator) {
-					this.coordinator.put(newIndexKey, emptyValue, indexStore);
+					this.coordinator.put(newIndexKey, dataKeyValue, indexStore);
 				} else {
-					await indexStore.put(newIndexKey, emptyValue);
+					await indexStore.put(newIndexKey, dataKeyValue);
 				}
 			}
 		}
@@ -1944,4 +2188,17 @@ interface PKAccessPattern {
 	values?: SqlValue[];
 	columnIndex?: number;
 	constraints?: Array<{ columnIndex: number; op: IndexConstraintOp; value?: SqlValue }>;
+}
+
+/**
+ * Secondary-index access pattern analysis result: the chosen index plus the
+ * encoded byte window {@link StoreTable.scanIndex} iterates. `point` is a
+ * leading-prefix EQ window, `range` a leading-column LT/LE/GT/GE window; both
+ * resolve to a `bounds` scan (an index seek is always a prefix scan, never a
+ * single entry).
+ */
+interface IndexAccessPattern {
+	index: TableIndexSchema;
+	type: 'point' | 'range';
+	bounds: IterateOptions;
 }

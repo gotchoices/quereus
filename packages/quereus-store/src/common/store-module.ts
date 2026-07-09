@@ -47,6 +47,7 @@ import { StoreTable, resolvePkKeyCollations, type StoreTableConfig, type StoreTa
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
+	buildDataKey,
 	buildDataStoreName,
 	buildIndexKey,
 	buildIndexStoreName,
@@ -61,6 +62,7 @@ import {
 	classifyCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
+import { getCollationEncoder } from './encoding.js';
 import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
 
 /**
@@ -964,7 +966,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				pkDirections,
 				pkCollations,
 			);
-			batch.put(indexKey, new Uint8Array(0)); // Index value is empty
+			// Index value = the row's encoded DATA key, so an index scan resolves each
+			// entry back to its base row via a direct data-store read (see
+			// `StoreTable.scanIndex`). Encoded under the same PK directions + per-column
+			// PK collations as `buildDataKey` / `updateSecondaryIndexes`, so the value
+			// byte-matches the data store's key for this row.
+			const dataKey = buildDataKey(pkValues, encodeOptions, pkDirections, pkCollations);
+			batch.put(indexKey, dataKey);
 		}
 
 		await batch.write();
@@ -1850,30 +1858,25 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
 		}
 
-		// Check for secondary index usage
-		// Note: query() does not yet implement secondary index scans — it falls
-		// back to a full table scan + matchesFilters.  We still advertise better
-		// cost estimates when a usable index exists (so the planner prefers this
-		// table access) but we must NOT mark filters as handled, otherwise the
-		// engine won't supply them to matchesFilters and rows pass unfiltered.
+		// Check for secondary index usage. `StoreTable.query` now implements the
+		// secondary-index scan arm (leading-prefix EQ point / leading-column range),
+		// so we advertise the index with `indexName` + `seekColumns` and mark the
+		// covered filters handled — subject to the collation-safety guard in
+		// {@link tryIndexAccessPlan}. A cost-only plan (no seek) is kept as a fallback
+		// when no index yields a collation-safe seek, preserving the prior "cheaper
+		// cost, filters unhandled, residual retained" behavior.
 		const indexes = tableInfo.indexes || [];
+		let costOnlyFallback: BestAccessPlanResult | null = null;
 		for (const index of indexes) {
-			const indexColumns = index.columns.map(c => c.index);
-			const indexFilters = request.filters.filter(f =>
-				f.columnIndex !== undefined &&
-				indexColumns.includes(f.columnIndex) &&
-				f.op === '='
-			);
-
-			if (indexFilters.length > 0) {
-				const matchedRows = Math.max(1, Math.floor(estimatedRows * 0.1));
-				return AccessPlanBuilder
-					.eqMatch(matchedRows, 0.3)
-					.setHandledFilters(new Array(request.filters.length).fill(false))
-					.setExplanation(`Store index scan on ${index.name}`)
-					.build();
-			}
+			if (index.columns.length === 0) continue;
+			const plan = this.tryIndexAccessPlan(tableInfo, request, index, estimatedRows);
+			if (!plan) continue;
+			// A fully-handled seek (indexName + seekColumns set) wins immediately.
+			if (plan.seekColumnIndexes && plan.seekColumnIndexes.length > 0) return plan;
+			// Otherwise remember the first cost-only advertisement as a fallback.
+			if (!costOnlyFallback) costOnlyFallback = plan;
 		}
+		if (costOnlyFallback) return costOnlyFallback;
 
 		// Fallback to full scan. The store iterates rows in PK key order
 		// (see StoreTable.query / store.iterate over buildFullScanBounds), so
@@ -1886,6 +1889,117 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			.setExplanation('Store full table scan')
 			.build();
 		return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
+	}
+
+	/**
+	 * Build the access plan for one secondary index against `request`, or null when
+	 * the index is not usable for this predicate.
+	 *
+	 * Usable = a contiguous leading-prefix EQ on the index columns (an index seek /
+	 * point), or a LT/LE/GT/GE range on the LEADING index column. These mirror the
+	 * two windows {@link StoreTable.analyzeIndexAccess} can build.
+	 *
+	 * **Collation-safety guard against under-fetch.** The store's index-column
+	 * window is encoded under the table key collation K, but `matchesFilters`
+	 * compares under the COLUMN's declared collation. Marking a filter handled drops
+	 * the residual Filter, so the K-window must be a guaranteed SUPERSET of the
+	 * qualifying rows. That holds only when K is coarser-or-equal to the column's
+	 * declared collation. To stay provably safe with minimal logic we mark the
+	 * covered filters handled — setting `indexName` + `seekColumns` — only when every
+	 * seek column is non-text, OR its declared collation equals K, OR (K = NOCASE
+	 * while the column is BINARY, i.e. K strictly coarser). Otherwise we return a
+	 * cost-only plan (cheaper cost, filters unhandled, residual retained — correct,
+	 * just not sped up). If K itself has no registered byte encoder we cannot seek at
+	 * all and likewise return the cost-only plan (mirrors `buildPKRangeBounds`'
+	 * comparator-only fallback).
+	 */
+	private tryIndexAccessPlan(
+		tableInfo: TableSchema,
+		request: BestAccessPlanRequest,
+		index: TableIndexSchema,
+		estimatedRows: number,
+	): BestAccessPlanResult | null {
+		// Exclude PARTIAL indexes from access planning: neither the engine nor this
+		// module checks that the query's WHERE implies the index predicate, so seeking
+		// a partial index for a query it doesn't cover would silently drop the rows the
+		// index omits (an out-of-scope predicate returns nothing). Treat partial indexes
+		// purely as uniqueness enforcers — the query full-scans + residual instead.
+		// Mirrors MemoryTableModule.getAvailableIndexes (`if (idx.predicate) continue`).
+		if (index.predicate) return null;
+
+		const indexColIndexes = index.columns.map(c => c.index);
+		const rangeOps = ['<', '<=', '>', '>='];
+
+		// Contiguous leading-prefix EQ → point/prefix seek.
+		const eqCols: number[] = [];
+		for (const colIdx of indexColIndexes) {
+			if (!request.filters.some(f => f.columnIndex === colIdx && f.op === '=')) break;
+			eqCols.push(colIdx);
+		}
+		const leadingCol = indexColIndexes[0];
+		const hasLeadingRange = request.filters.some(
+			f => f.columnIndex === leadingCol && rangeOps.includes(f.op),
+		);
+
+		let seekCols: number[];
+		let isRange: boolean;
+		if (eqCols.length > 0) {
+			seekCols = eqCols;
+			isRange = false;
+		} else if (hasLeadingRange) {
+			seekCols = [leadingCol];
+			isRange = true;
+		} else {
+			return null; // this index cannot serve this predicate
+		}
+
+		const rows = isRange
+			? Math.max(1, Math.floor(estimatedRows * 0.3))
+			: Math.max(1, Math.floor(estimatedRows * 0.1));
+		const costOnly = (why: string): BestAccessPlanResult =>
+			(isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
+				.setHandledFilters(new Array(request.filters.length).fill(false))
+				.setExplanation(`Store index scan on ${index.name} (${why})`)
+				.build();
+
+		// Table key collation K for this table (default NOCASE), and its encoder.
+		const K = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation ?? 'NOCASE').toUpperCase();
+		if (getCollationEncoder(K) === undefined) {
+			return costOnly(`cost-only; key collation ${K} has no byte encoder`);
+		}
+
+		// A seek column is collation-safe to mark handled iff K is coarser-or-equal
+		// to the INDEX column's effective comparison collation C (the index column's
+		// own COLLATE, else the table column's declared collation). C — not the table
+		// column's declared collation — is what matchesFilters compares an index-scan
+		// row under and what the planner matched to drop the residual, so the K-window
+		// must be a superset relative to C. See the guard doc above.
+		const safeToHandle = (colIdx: number): boolean => {
+			const col = tableInfo.columns[colIdx];
+			if (!col.logicalType.isTextual) return true;            // non-text: type-native bytes
+			const indexCol = index.columns.find(c => c.index === colIdx);
+			const C = (indexCol?.collation ?? col.collation ?? 'BINARY').toUpperCase();
+			if (C === K) return true;                               // equal
+			if (K === 'NOCASE' && C === 'BINARY') return true;      // K strictly coarser
+			return false;
+		};
+		if (!seekCols.every(safeToHandle)) {
+			return costOnly('cost-only; key collation may under-fetch');
+		}
+
+		const handledFilters = request.filters.map(f => {
+			if (f.columnIndex === undefined) return false;
+			return isRange
+				? (f.columnIndex === leadingCol && rangeOps.includes(f.op))
+				: (eqCols.includes(f.columnIndex) && f.op === '=');
+		});
+
+		return (isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
+			.setHandledFilters(handledFilters)
+			.setIndexName(index.name)
+			.setSeekColumns(seekCols)
+			.setExplanation(`Store index ${isRange ? 'range scan' : 'seek'} on ${index.name}`)
+			.build();
 	}
 
 	/**

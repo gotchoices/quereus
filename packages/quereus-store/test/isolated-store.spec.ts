@@ -214,6 +214,48 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	// Secondary-index scan under isolation (store-index-scan-read-primitive): the
+	// underlying store's index scan MUST emit in index-key order (index-column bytes,
+	// then PK suffix) so the isolation overlay's `[indexKeyParts…, pkParts…]` merge is
+	// correct. This exercises overlay-pending inserts + deletes merged over a
+	// committed underlying index scan.
+	describe('secondary-index scan under an open transaction', () => {
+		beforeEach(async () => {
+			const isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`create table t (id integer primary key, v integer) using store`);
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(`insert into t values (1, 10), (2, 20), (3, 30)`);
+		});
+
+		it('merges overlay-pending inserts and deletes over the underlying index scan', async () => {
+			await db.exec('BEGIN');
+			// Overlay-pending: a new in-window row (v = 25) and a delete of a committed
+			// in-window row (v = 20).
+			await db.exec(`insert into t values (4, 25)`);
+			await db.exec(`delete from t where id = 2`);
+
+			const rows = await asyncIterableToArray(
+				db.eval(`select id from t where v >= 20 order by v`),
+			);
+			// Committed 30, overlay-inserted 25, minus overlay-deleted 20 → 25(id4), 30(id3).
+			expect(rows).to.deep.equal([{ id: 4 }, { id: 3 }]);
+
+			await db.exec('ROLLBACK');
+		});
+
+		it('an EQ index seek merges an overlay-pending row at the same value', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`insert into t values (5, 30)`); // second row at v = 30 (overlay)
+			const rows = await asyncIterableToArray(
+				db.eval(`select id from t where v = 30 order by id`),
+			);
+			// Committed id 3 and overlay-pending id 5 both share v = 30.
+			expect(rows).to.deep.equal([{ id: 3 }, { id: 5 }]);
+			await db.exec('ROLLBACK');
+		});
+	});
+
 	// Note: The following tests verify the isolation layer infrastructure when wrapping
 	// the store module. Full integration requires additional work on transaction
 	// coordination between the store module and the overlay memory module.
