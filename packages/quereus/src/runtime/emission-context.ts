@@ -187,17 +187,21 @@ export class EmissionContext {
 	}
 
 	/**
-	 * Resolves a collation name to its function, with BINARY fallback.
-	 * Records the dependency for plan invalidation.
-	 * Use this in emitters instead of the global resolveCollation().
+	 * Resolves a collation name to its function against this emission's database,
+	 * recording the dependency for plan invalidation. Use this in emitters instead of
+	 * the deprecated global `resolveCollation()`.
+	 *
+	 * Throws `QuereusError` (`no such collation sequence: X`) on an unknown name — the
+	 * miss is delegated to {@link Database.getCollationResolver} so build-time and
+	 * emit-time resolution report the same error. There is deliberately no BINARY
+	 * fallback: it would silently produce wrong sort order, wrong UNIQUE enforcement,
+	 * and wrong index seeks. An unresolvable name here means the *producer* of the name
+	 * is wrong (DDL validates column collations at create time) — fix the producer.
 	 */
 	resolveCollation(collationName: string): CollationFunction {
 		if (collationName === 'BINARY') return BINARY_COLLATION; // Fast path
 		const func = this.getCollation(collationName);
-		if (!func) {
-			log('Unknown collation requested: %s. Falling back to BINARY.', collationName);
-			return BINARY_COLLATION;
-		}
+		if (!func) return this.db.getCollationResolver()(collationName);
 		return func;
 	}
 

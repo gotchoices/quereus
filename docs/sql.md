@@ -2523,6 +2523,13 @@ whole expression. For example `x BETWEEN 'a' COLLATE NOCASE AND 'z'` compares `x
 `NOCASE` but `x <= 'z'` under the default collation; to collate both sides, put the `COLLATE` on
 the tested expression (`x COLLATE NOCASE BETWEEN 'a' AND 'z'`).
 
+**Custom collations are per-connection.** `BINARY`, `NOCASE`, and `RTRIM` are always available.
+Any other collation must be registered with `db.registerCollation(name, comparator)` on **every**
+`Database` that opens a table, index, or query naming it — and before that table is queried.
+Naming an unregistered collation raises `no such collation sequence: <name>` rather than silently
+comparing by byte order, matching SQLite. For a persisted database whose DDL carries a custom
+`COLLATE`, register the collation immediately after opening the connection.
+
 **CAST Expression:**
 ```sql
 cast(expr as type)

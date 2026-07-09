@@ -14,6 +14,7 @@ import type { Row, SqlValue } from '../common/types.js';
 import type { UniqueConstraintSchema } from '../schema/table.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { AssertionViolation } from './database-assertions.js';
+import type { CollationResolver } from '../types/logical-type.js';
 
 /**
  * One externally-applied row change to report through
@@ -243,4 +244,14 @@ export interface DatabaseInternal {
 		changes: readonly ExternalRowChange[],
 		options?: IngestExternalChangesOptions,
 	): Promise<IngestExternalChangesResult>;
+
+	/**
+	 * The canonical collation resolver for this database — the only supported way for
+	 * an extension package to turn a collation name into a comparison function that
+	 * honors `db.registerCollation`. Stable identity across calls; reads the live
+	 * registry; throws `QuereusError` on an unknown name (never falls back to BINARY).
+	 *
+	 * Call it at comparator-construction time (index build, cursor setup), not per row.
+	 */
+	getCollationResolver(): CollationResolver;
 }

@@ -102,6 +102,25 @@ export function resolveCollation(collationName: string): CollationFunction {
 }
 
 /**
+ * Resolves only the built-in collations (BINARY / NOCASE / RTRIM). For standalone
+ * utility code and tests that have no `Database`. Returns `undefined` for any other
+ * name — callers must decide whether that is an error or a reason to bail.
+ *
+ * Deliberately a `switch`, not a registry lookup: it must keep working once the
+ * deprecated process-global `collations` map above is deleted, and it must never
+ * observe a caller's `registerCollation` override of a built-in name.
+ * @param name The collation name (case-insensitive)
+ */
+export function builtinCollationResolver(name: string): CollationFunction | undefined {
+	switch (name.toUpperCase()) {
+		case 'BINARY': return BINARY_COLLATION;
+		case 'NOCASE': return NOCASE_COLLATION;
+		case 'RTRIM': return RTRIM_COLLATION;
+		default: return undefined;
+	}
+}
+
+/**
  * Normalizes a collation name to its canonical form (trimmed, uppercase).
  * SQLite treats collation names case-insensitively; the registry and resolvers
  * all key on the uppercase name, so this yields the SQLite-canonical spelling

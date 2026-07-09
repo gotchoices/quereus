@@ -42,7 +42,7 @@ import { MAINTENANCE_REBUILD_ROW_THRESHOLD } from '../planner/cost/index.js';
 import type { InstructionTracer } from '../runtime/types.js';
 import { DeclaredSchemaManager } from '../schema/declared-schema-manager.js';
 import { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
-import { type LogicalType } from '../types/logical-type.js';
+import { type LogicalType, type CollationResolver } from '../types/logical-type.js';
 import { registerType as registerTypeInRegistry } from '../types/registry.js';
 import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
@@ -131,6 +131,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  replicable-collation gate when the backing host demands it
 	 *  (see {@link _isCollationReplicable}). */
 	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string; replicable?: boolean }>();
+	/** Lazily-bound {@link getCollationResolver} closure — created once so callers can
+	 *  compare resolver identity, while still reading the live `collations` map. */
+	private collationResolver?: CollationResolver;
 	/**
 	 * Per-database latch registry — serializes commit / collapse / consolidate /
 	 * destroy / schema-change work by string key *within this database*. Scoped to
@@ -1308,6 +1311,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * // SELECT * FROM contacts ORDER BY phone COLLATE PHONENUMBER;
 	 * // CREATE INDEX phone_idx ON contacts(phone COLLATE PHONENUMBER);
 	 */
+	// NOTE: registration is not retroactive. Comparators are resolved once, at
+	// comparator-construction time (index build, plan emission), so a collation
+	// registered — or re-registered with a different comparator — after a structure
+	// was built does not rebuild it. Register collations before creating tables and
+	// indexes that name them. If retroactive re-registration ever needs to be
+	// supported, invalidate dependent indexes and cached plans here.
 	registerCollation(
 		name: string,
 		func: CollationFunction,
@@ -1416,6 +1425,41 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 */
 	getInstructionTracer(): InstructionTracer | undefined {
 		return this.instructionTracer;
+	}
+
+	/**
+	 * The canonical way to turn a collation name into a comparison function for this
+	 * database. Every comparator-construction site should route through this rather
+	 * than the deprecated process-global registry in `util/comparison.ts`, so a
+	 * collation registered with {@link registerCollation} is actually honored.
+	 *
+	 * The returned resolver:
+	 * - has stable identity across calls (bound once) and reads the live per-database
+	 *   registry, so a collation registered *after* the resolver was handed out is
+	 *   visible to later calls;
+	 * - resolves names case-insensitively;
+	 * - **throws** `QuereusError` (`no such collation sequence: X`) on an unknown name.
+	 *   An unresolvable collation is never downgraded to BINARY: byte-order results
+	 *   would be silently wrong for ORDER BY, UNIQUE, and index seeks alike;
+	 * - fast-paths the exact name `BINARY`, so `BINARY` alone cannot be overridden by
+	 *   `registerCollation` (pre-existing `EmissionContext` behavior). Any other
+	 *   built-in — including `NOCASE` and `RTRIM` — can be overridden per database.
+	 *
+	 * It performs no `checkOpen()` check: it runs on hot comparator-construction paths,
+	 * and reading the registry of a closed database is harmless.
+	 */
+	getCollationResolver(): CollationResolver {
+		if (this.collationResolver === undefined) {
+			this.collationResolver = (collationName: string): CollationFunction => {
+				if (collationName === 'BINARY') return BINARY_COLLATION;
+				const func = this._getCollation(collationName);
+				if (!func) {
+					throw new QuereusError(`no such collation sequence: ${collationName}`, StatusCode.ERROR);
+				}
+				return func;
+			};
+		}
+		return this.collationResolver;
 	}
 
 	/** @internal Gets a registered collation function */

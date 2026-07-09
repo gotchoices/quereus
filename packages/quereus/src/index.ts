@@ -75,6 +75,7 @@ export {
 	registerCollation,
 	getCollation,
 	resolveCollation,
+	builtinCollationResolver,
 	// Core comparison functions (critical for module implementations)
 	compareSqlValues,
 	compareSqlValuesFast,
@@ -97,7 +98,7 @@ export {
 } from './util/comparison.js';
 
 // Type system
-export type { LogicalType, CollationFunction as TypeCollationFunction } from './types/logical-type.js';
+export type { LogicalType, CollationResolver, CollationFunction as TypeCollationFunction } from './types/logical-type.js';
 export { PhysicalType } from './types/logical-type.js';
 export {
 	NULL_TYPE,

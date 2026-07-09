@@ -7,6 +7,16 @@ import type { SqlValue } from '../common/types.js';
 export type CollationFunction = (a: string, b: string) => number;
 
 /**
+ * Resolves a collation name to its comparison function for one specific
+ * database. Throws `QuereusError(StatusCode.ERROR)` when the name is not
+ * registered on that database — an unresolvable collation is never silently
+ * downgraded to BINARY, because byte-order results would be wrong and invisible.
+ *
+ * Names are case-insensitive (see `normalizeCollationName`).
+ */
+export type CollationResolver = (collationName: string) => CollationFunction;
+
+/**
  * Physical types represent how values are stored in memory and on disk.
  * These are the actual runtime representations.
  */
