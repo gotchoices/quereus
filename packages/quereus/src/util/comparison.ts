@@ -451,10 +451,16 @@ export function isTruthy(value: SqlValue): boolean {
  * Compares two rows for SQL DISTINCT semantics.
  * Returns -1, 0, or 1 for BTree ordering.
  *
- * NOTE: deliberately BINARY-only. It backs DISTINCT ordering in a BTree whose caller
- * has already applied collation-aware key normalization, so the collation has been
- * folded into the bytes before this ever runs. Collation-aware row comparison is
- * {@link createCollationRowComparator}, which takes pre-resolved per-column functions.
+ * Deliberately BINARY-only, and it takes no collation name because it has no `Database`
+ * to resolve one against. Its sole production caller is the recursive-CTE `union`
+ * (DISTINCT) dedup BTree in `runtime/emit/recursive-cte.ts`, which compares raw rows —
+ * matching SQLite, whose recursive queue table carries no `COLLATE`. Collation-aware row
+ * identity goes through {@link createCollationRowComparator} instead, with per-column
+ * functions pre-resolved from `db.getCollationResolver()` — that is what the `distinct`
+ * and `set-operation` emitters use.
+ *
+ * NOTE: if a future caller needs collation-aware row identity here, do not add a name
+ * parameter — take pre-resolved functions, as `createCollationRowComparator` does.
  */
 export function compareRows(a: Row, b: Row): number {
 	// Let's assume correct rows

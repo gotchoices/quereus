@@ -104,12 +104,10 @@ describe('materialized-view maintenance under a database-registered collation', 
 describe('the maintained-table "must be a set" gate resolves collations through the database', () => {
 	// `assertDerivedRowsAreSet` / `assertRefreshRowsAreSet`
 	// (runtime/emit/materialized-view-helpers.ts) pair derived rows under the backing
-	// primary-key collations. Attach rejects a body whose column collation differs from
-	// the declared one, so the derived key always compares under the SOURCE column's
-	// collation — which means a database override of `NOCASE` that is *stricter* than the
-	// built-in is the reachable failure. Here `NOCASE` is overridden to fold nothing, so
-	// the source PK admits both 'aa' and 'AA'; a gate that resolved `NOCASE` from a
-	// process-global registry would fold them together and reject a set that is a set.
+	// primary-key collations, resolved through `db.getCollationResolver()`. Here `NOCASE`
+	// is overridden to fold nothing, so 'aa' and 'AA' are distinct keys; a gate that
+	// resolved `NOCASE` from a process-global registry would fold them together and reject
+	// a set that is a set. Both the admitting and the rejecting branch are covered.
 	const caseSensitiveNocase = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 	let db: Database;
 
@@ -145,6 +143,44 @@ describe('the maintained-table "must be a set" gate resolves collations through 
 		]);
 	});
 
+	describe('the rejecting branch also decides under the database collation', () => {
+		// The derived key is a NON-key source column (`src`'s primary key is `id`), so the
+		// body can genuinely collide and the gate is the first check that can see it. The
+		// coverage prover rejects this body as a bag too, but only *after* the attach has
+		// evaluated the rows and run the gate — so which of the two errors surfaces reports
+		// the gate's verdict.
+		async function attachCollidingBody(database: Database): Promise<string> {
+			await database.exec('create table src2 (id integer primary key, x text collate nocase not null)');
+			await database.exec("insert into src2 values (1, 'aa'), (2, 'AA')");
+			try {
+				await database.exec('create table mt2 (x text collate nocase primary key) maintained as select x from src2');
+			} catch (e) {
+				return (e as Error).message;
+			}
+			return '';
+		}
+
+		/** The gate's own error. The coverage prover's bag error also says "must be a set". */
+		const GATE_REJECTION = /produces duplicate rows for primary key/;
+
+		it('rejects the colliding body under the built-in NOCASE', async () => {
+			const builtin = new Database();
+			try {
+				expect(await attachCollidingBody(builtin)).to.match(GATE_REJECTION);
+			} finally {
+				await builtin.close();
+			}
+		});
+
+		it('admits the same body when the database overrides NOCASE to fold nothing', async () => {
+			// `db` already has the case-sensitive NOCASE registered. The gate must let both
+			// rows through; the bag error that follows comes from the coverage prover, not
+			// the gate. Against the pre-change global lookup the gate rejected here.
+			const message = await attachCollidingBody(db);
+			expect(message).to.match(/no provable unique key/);
+			expect(message).to.not.match(GATE_REJECTION);
+		});
+	});
 });
 
 describe('materialized-view apply-path key comparisons use the plan-resolved collation', () => {
