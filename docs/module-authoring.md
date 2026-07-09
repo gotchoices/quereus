@@ -558,8 +558,25 @@ class MyTable extends VirtualTable {
 | `registerConnection(conn)` | Registers a connection for transaction management. If a transaction is already active, `begin()` is called on the connection and the active savepoint stack is replayed by calling `createSavepoint(depth)` for each open depth, so subsequent `releaseSavepoint` / `rollbackToSavepoint` broadcasts targeting earlier depths are in-range on the new connection. |
 | `unregisterConnection(id)` | Unregisters a connection. May be deferred during implicit transactions. |
 | `getConnection(id)` | Gets a connection by ID. |
-| `getConnectionsForTable(name)` | Gets all connections for a table. Useful for connection reuse. |
+| `getConnectionsForTable(name)` | Gets all connections for a table. Matches the qualified name *or* the bare table name, so it can reach a same-named table in another schema. Useful for connection reuse. |
 | `getAllConnections()` | Gets all active connections. |
+| `removeConnectionsForTable(schema, table)` | Force-removes **every** connection registered under `schema.table`, bypassing the implicit-transaction deferral. Only correct when the table itself is going away (`destroy` / drop), where no connection under that name can still have state worth committing. The engine calls it for you on drop. |
+| `removeConnection(id)` | Force-removes one connection by id, bypassing the deferral. This is the tool a `renameTable` implementation needs. |
+
+**Evicting connections on `renameTable`:**
+
+The engine's rename path does *not* evict connections, so a module whose connections are pinned to the old table name must evict them itself or leak one per rename. Evict **only the connections your own module created** — discriminate with `instanceof` (or a brand property) *and* an exact qualified-name match, then call `removeConnection(conn.connectionId)` on each:
+
+```typescript
+const oldQualified = `${schemaName}.${oldName}`.toLowerCase();
+for (const conn of dbInternal.getAllConnections()) {
+  if (conn instanceof MyConnection && conn.tableName.toLowerCase() === oldQualified) {
+    dbInternal.removeConnection(conn.connectionId);
+  }
+}
+```
+
+Do **not** reach for `removeConnectionsForTable` here. A wrapping module — `IsolationModule` is the one in-tree — registers its own connection under the same qualified name, and that connection is the only thing that drives its staged writes to storage at `COMMIT`. A blanket name-keyed sweep deletes it, and the transaction's writes vanish while the commit reports success.
 
 **Connection reuse pattern:**
 

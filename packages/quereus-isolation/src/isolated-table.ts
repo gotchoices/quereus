@@ -273,6 +273,13 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private async buildConnection(): Promise<IsolatedConnection> {
 		// Reuse an existing covering (IsolatedConnection) if one is already registered
 		// for this table — avoids accumulating one IsolatedConnection per statement.
+		//
+		// NOTE: a rename leaves the covering connection registered under the OLD name
+		// (StoreModule.renameTable evicts only its own StoreConnections), so a table later
+		// created under that freed name adopts that stale connection here. Sound today only
+		// because the overlay and underlying maps are keyed by table name rather than by
+		// connection, so each table still resolves its own state. If per-connection state
+		// ever moves onto IsolatedConnection, retarget the connection across the rename.
 		const qualifiedName = `${this.schemaName}.${this.tableName}`;
 		const existing = (this.db as DatabaseInternal).getConnectionsForTable(qualifiedName);
 		const existingCovering = existing.find((c: VirtualTableConnection) => c.isCovering) as IsolatedConnection | undefined;

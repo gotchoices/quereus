@@ -99,6 +99,31 @@ describe('store connection name leak (drop/recreate must not grow activeConnecti
 		await db.close();
 	});
 
+	// The backing host's connection is a StoreConnection pinned to its owning StoreTable
+	// (`StoreConnection.owner`), and `StoreModule.renameTable` discriminates on the class,
+	// not on the pin — so it must be evicted alongside ordinary DML connections.
+	it('MV-backing host connections are evicted on rename', async () => {
+		const db = new Database();
+		db.registerModule('store', new StoreModule(provider, events));
+
+		await db.exec(`create table src (id integer primary key, v integer) using store`);
+		await db.exec(`insert into src values (1, 10)`);
+		await db.exec(`create materialized view mv using store as select id, v from src`);
+
+		const baseline = (db as unknown as DbWithConnections).getAllConnections().length;
+
+		for (let i = 0; i < 6; i++) {
+			const from = i % 2 === 0 ? 'mv' : 'mv2';
+			const to = i % 2 === 0 ? 'mv2' : 'mv';
+			await db.exec(`insert into src values (${i + 2}, ${i})`);
+			await db.exec(`alter table ${from} rename to ${to}`);
+		}
+
+		expect((db as unknown as DbWithConnections).getAllConnections().length).to.equal(baseline);
+
+		await db.close();
+	});
+
 	it('ordinary DML connections are evicted on drop+recreate', async () => {
 		const db = new Database();
 		db.registerModule('store', new StoreModule(provider, events));

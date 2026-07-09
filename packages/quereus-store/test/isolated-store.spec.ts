@@ -304,6 +304,60 @@ describe('Isolated Store Module', () => {
 			expect(rows).to.deep.equal([{ id: 1, name: 'a' }, { id: 2, name: 'b' }]);
 		});
 
+		/**
+		 * The surviving `IsolatedConnection` keeps the OLD name, and it is `isCovering`, so
+		 * a table later created under that freed name finds it in the
+		 * `getConnectionsForTable` reuse lookup of `IsolatedTable.ensureRegisteredConnection`
+		 * and adopts it. That is only sound because the overlay/underlying maps are keyed by
+		 * name (not by connection), so both tables still resolve to their own state.
+		 */
+		it('a table recreated under the freed old name keeps its rows separate', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+			await db.exec(`INSERT INTO widget VALUES (2, 'b')`);
+			await db.exec('COMMIT');
+
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`))).to.deep.equal([{ id: 1, name: 'a' }]);
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.widget`))).to.deep.equal([{ id: 2, name: 'b' }]);
+		});
+
+		it('ROLLBACK discards both tables when the old name was recreated', async () => {
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO gadget VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO widget VALUES (2, 'b')`);
+			await db.exec('ROLLBACK');
+
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM gadget`)), 'gadget rolled back').to.deep.equal([]);
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM widget`)), 'widget rolled back').to.deep.equal([]);
+		});
+
+		it('renaming a table that never registered a StoreConnection still commits later writes', async () => {
+			// Nothing wrote before the rename, so the eviction loop matches no StoreConnection
+			// at all and the underlying must still be re-resolved under the new name.
+			await db.exec('BEGIN');
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`INSERT INTO gadget VALUES (1, 'a')`);
+			await db.exec('COMMIT');
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`))).to.deep.equal([{ id: 1, name: 'a' }]);
+		});
+
+		/** Guards the bound claimed by the `NOTE:` tripwire in `StoreModule.renameTable`. */
+		it('renaming back and forth does not grow the connection set without bound', async () => {
+			const count = () => (db as unknown as DatabaseInternal).getAllConnections().length;
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`ALTER TABLE gadget RENAME TO widget`);
+			const afterFirstRoundTrip = count();
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec(`ALTER TABLE gadget RENAME TO widget`);
+			expect(count(), 'a second round trip registers nothing new').to.equal(afterFirstRoundTrip);
+		});
+
 		it('evicts the store-owned connection for the old name', async () => {
 			await db.exec('BEGIN');
 			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);

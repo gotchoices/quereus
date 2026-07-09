@@ -185,8 +185,10 @@ The invariant has a second dependency that lives outside this layer: **the wrapp
 only thing that ever drives `commitConnectionOverlays`. An underlying module that evicts *every*
 connection registered under the old table name (rather than only the ones it created itself)
 therefore deletes the sole path from the staged overlay to storage, and the commit reports success
-having written nothing. `StoreModule.renameTable` evicts by `instanceof StoreConnection`, not by
-name, for exactly this reason.
+having written nothing. `StoreModule.renameTable` therefore evicts on class identity (`instanceof
+StoreConnection`) *and* an exact qualified-name match, never on the name alone. See **Evicting
+connections on `renameTable`** in [`module-authoring.md`](module-authoring.md) — the same rule binds
+any module that means to be wrappable.
 
 #### Mid-transaction rename on a store-backed table is a partial commit
 
