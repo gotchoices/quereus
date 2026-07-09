@@ -53,6 +53,9 @@ const repoPath = (abs) => toPosix(relative(ROOT, abs));
  */
 const readText = (path) => readFileSync(path, 'utf8').replace(/\r\n?/g, '\n');
 
+// NOTE: the tree is re-walked and every file re-read on each run (~1s for this repo). If the
+// checker ever shows up as slow in `yarn check`, cache results by mtime rather than trimming
+// the corpus — a check that skips files is a check that misses breakage.
 function walk(dir, predicate, found = []) {
 	if (!existsSync(dir)) return found;
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -78,13 +81,21 @@ function docFiles() {
 	return walk(join(ROOT, 'docs'), (f) => f.endsWith('.md')).filter((f) => !EXEMPT.has(repoPath(f)));
 }
 
-/** Package READMEs, top-level and nested under `src/`. These are source-tree docs. */
+/**
+ * The repo README plus every package README, top-level and nested under `src/` or `test/`.
+ * These are source-tree docs. The repo README carries the documentation index, so it is the
+ * most link-dense file in the tree and the one whose rot is most visible to a newcomer.
+ */
 function readmeFiles() {
 	const files = [];
+	const rootReadme = join(ROOT, 'README.md');
+	if (existsSync(rootReadme)) files.push(rootReadme);
 	for (const pkg of packageDirs()) {
 		const top = join(pkg, 'README.md');
 		if (existsSync(top)) files.push(top);
-		files.push(...walk(join(pkg, 'src'), (f) => f.endsWith(`${sep}README.md`)));
+		const nested = (f) => f.endsWith(`${sep}README.md`);
+		files.push(...walk(join(pkg, 'src'), nested));
+		files.push(...walk(join(pkg, 'test'), nested));
 	}
 	return files;
 }
@@ -285,10 +296,13 @@ function checkLinks(fail) {
 		for (const ref of markdownLinks(content)) checkReference(ref, file, fail);
 	}
 	// Bare `docs/*.md` refs live in the source tree, never in `docs/` prose — a design doc
-	// legitimately names a sibling doc (or a planned one) in running text.
+	// legitimately names a sibling doc (or a planned one) in running text. A README's fenced
+	// blocks are stripped for the same reason they are stripped above: a doc path inside a
+	// shell example is an illustration, not a pointer. TypeScript has no fences to strip.
 	for (const file of [...readmeFiles(), ...sourceFiles()]) {
 		const content = readText(file);
-		for (const ref of bareDocRefs(content)) checkReference(ref, file, fail);
+		const scanned = file.endsWith('.md') ? stripFences(content) : content;
+		for (const ref of bareDocRefs(scanned)) checkReference(ref, file, fail);
 	}
 }
 
@@ -300,7 +314,14 @@ const INVARIANT_HEADING = /^### ((?:OPT|MV|RT|SCH|SYNC|LENS))-(\d{3}) — .+$/;
 const META_LINE = /^-\s+(code|guard|doc):\s*(.*)$/;
 const MAX_INVARIANT_BODY_WORDS = 120;
 
-/** Split `docs/invariants.md` into `### ID — title` blocks, keeping line numbers. */
+/**
+ * Split `docs/invariants.md` into `### ID — title` blocks, keeping line numbers.
+ *
+ * NOTE: every line after a `### ` heading joins that block's body, including a following
+ * `## <Area>` group heading. Such a heading contributes its ~3 words to the preceding block's
+ * 120-word budget. Harmless at that magnitude; if the register ever grows section prose
+ * between blocks, end a block at the next heading of any level instead.
+ */
 function parseInvariantBlocks(content) {
 	const blocks = [];
 	stripFences(content)
@@ -438,6 +459,9 @@ function measureDocs() {
 	return sizes;
 }
 
+// NOTE: a ratchet entry naming a doc that no longer exists is not reported — it is inert, and
+// `--update-ratchet` removes it. If a stale entry ever masks a re-added doc's real size, make
+// this fail on the orphan instead.
 function checkRatchet(fail) {
 	const budget = readBudget();
 	for (const [doc, words] of measureDocs()) {
@@ -542,8 +566,17 @@ function main() {
 		process.exit(updateRatchet(args.includes('--force')));
 	}
 
+	// One breakage can reach `fail` twice: a `[x](docs/foo.md)` link in a README matches both the
+	// markdown-link and the bare-`docs/*.md` extractor, and a `doc:` line in the invariant register
+	// is a markdown link that Check A already resolved. The message carries its own `path:line`, so
+	// identical strings are the same defect. Report each once, in discovery order.
 	const failures = [];
-	const fail = (message) => failures.push(message);
+	const seen = new Set();
+	const fail = (message) => {
+		if (seen.has(message)) return;
+		seen.add(message);
+		failures.push(message);
+	};
 
 	selfTest(fail);
 	checkLinks(fail);

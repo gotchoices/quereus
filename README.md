@@ -136,6 +136,7 @@ This repository contains multiple packages:
 ### Advanced Topics
 - **[Query Optimizer](docs/optimizer.md)** — Query planning and optimization
 - **[Usage Examples](docs/usage.md)** — Practical examples and patterns
+- **[Documentation Conventions](docs/doc-conventions.md)** — What belongs in a design doc, and the checks that keep them honest
 
 ## Features
 
