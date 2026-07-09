@@ -1,5 +1,6 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey } from '@quereus/quereus';
+import type { KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
@@ -79,6 +80,13 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private readonly collationResolver: CollationResolver;
 
 	/**
+	 * `db.getKeyNormalizerResolver()`, bound once at connect beside {@link collationResolver}
+	 * for the same reason: the modified-PK set's key encoding and the comparators above must
+	 * agree on which rows are equal, or a staged row fails to shadow the base row it replaces.
+	 */
+	private readonly keyNormalizerResolver: KeyNormalizerResolver;
+
+	/**
 	 * Per-PK-column comparison functions and sort directions, resolved from the PK
 	 * columns' declared collations and memoized against the `TableSchema` object
 	 * identity — an `alter table` hands this instance a fresh (frozen) schema object,
@@ -131,6 +139,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		this.underlyingTable = underlyingTable;
 		this.readCommitted = readCommitted;
 		this.collationResolver = db.getCollationResolver();
+		this.keyNormalizerResolver = db.getKeyNormalizerResolver();
 		// Schema comes from underlying - may be populated lazily by the underlying module
 		this.tableSchema = underlyingTable.tableSchema;
 	}
@@ -465,21 +474,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// collation-aware encoder — NOT JSON.stringify, which throws on a bigint PK
 		// value and ignores collation (a NOCASE PK rewritten 'abc' -> 'ABC' would fail
 		// to shadow the underlying 'abc', surfacing both rows). One normalizer per PK
-		// column, drawn from that column's declared collation, so equal keys under the
-		// PK collation encode to identical strings — matching getComparePK/keysEqual.
-		// NOTE: resolveKeyNormalizer only knows BINARY/NOCASE/RTRIM; a custom
-		// comparator-only collation (or a custom collation with a registered
-		// normalizer) falls back to BINARY here, so a case-only PK rewrite under such
-		// a collation could fail to shadow the underlying row (duplicate in a scan).
-		// The engine's own hash sites (bloom-join / window / hash-aggregate / asof)
-		// no longer share this divergence — they resolve through
-		// `db.getKeyNormalizerResolver()`. This site and the store's key encoder are
-		// the two remaining built-ins-only callers; fixing this one means threading a
-		// `Database` (or its normalizer resolver) to this call site and using that
-		// resolver instead. Tracked by
-		// `bug-isolation-overlay-key-ignores-database-collations`.
+		// column, drawn from that column's declared collation via the connection's own
+		// resolver, so equal keys under the PK collation encode to identical strings —
+		// matching getComparePK/keysEqual and agreeing with `db.registerCollation`.
 		const pkNormalizers = pkIndices.map(i =>
-			resolveKeyNormalizer(this.tableSchema!.columns[i].collation));
+			this.keyNormalizerResolver(this.tableSchema!.columns[i].collation));
 
 		// Step 1: Collect all PKs modified in overlay (full scan)
 		const modifiedPKs = new Set<string>();

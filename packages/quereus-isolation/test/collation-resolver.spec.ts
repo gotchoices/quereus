@@ -122,6 +122,53 @@ describe('IsolatedTable collation resolution', () => {
 		});
 	});
 
+	describe('secondary-index scan under a custom PK collation', () => {
+		it('shadows the base row exactly once when the PK is rewritten to a collation-equal value', async () => {
+			// Same override-NOCASE probe as above, but the read path is a secondary-index
+			// scan (`mergedSecondaryIndexQuery`), which keys its modified-PK set separately
+			// from the primary-key merge exercised above.
+			db.registerCollation('NOCASE', noSpace, stripSpaces);
+			await db.exec(`create table t (k text collate NOCASE primary key, v integer) using isolated`);
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(`insert into t values ('a b', 1)`);
+
+			await db.exec(`begin`);
+			await db.exec(`update t set k = 'ab' where k = 'a b'`);
+
+			const rows = await collect(db, `select k, v from t where v = 1`);
+			expect(rows, 'the staged row shadows the base row exactly once').to.deep.equal([
+				{ k: 'ab', v: 1 },
+			]);
+			await db.exec(`rollback`);
+		});
+
+		it('raises rather than under-shadowing when the PK collation has no key normalizer', async () => {
+			// A comparator-only collation (no `normalizer` passed to `registerCollation`) can
+			// order rows but cannot bucket them into a Set key — `getKeyNormalizerResolver()`
+			// throws instead of silently falling back to identity, which would reproduce the
+			// duplicate-row bug this suite guards against.
+			db.registerCollation('NOCASE', noSpace);
+			await db.exec(`create table t (k text collate NOCASE primary key, v integer) using isolated`);
+			await db.exec(`create index ix_v on t (v)`);
+			await db.exec(`insert into t values ('a b', 1)`);
+
+			await db.exec(`begin`);
+			await db.exec(`update t set k = 'ab' where k = 'a b'`);
+
+			// `attempt`/`db.exec` doesn't fully drain a bare SELECT's row stream, so the
+			// error (raised while iterating rows) must be caught around `collect`/`db.eval`.
+			let err: Error | null = null;
+			try {
+				await collect(db, `select k, v from t where v = 1`);
+			} catch (e) {
+				err = e as Error;
+			}
+			expect(err, 'expected a missing-key-normalizer error').to.not.be.null;
+			expect(err!.message).to.match(/has no key normalizer/i);
+			await db.exec(`rollback`);
+		});
+	});
+
 	describe('UNIQUE against committed rows', () => {
 		it('enforces an index-derived UNIQUE under a custom collation named on the index column', async () => {
 			db.registerCollation('NOSPACE', noSpace, stripSpaces);
