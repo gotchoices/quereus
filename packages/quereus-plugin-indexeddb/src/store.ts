@@ -18,6 +18,23 @@ function toKey(key: Uint8Array): ArrayBuffer {
   return copy;
 }
 
+/** Max entries read per iterate batch — bounds memory to one batch, not the whole range. */
+const BATCH = 256;
+
+/** A single edge of a key range: the boundary key and whether it is exclusive (`open`). */
+interface KeyBound {
+  key: ArrayBuffer;
+  open: boolean;
+}
+
+/** Build an IDBKeyRange from independent lower/upper bounds (either may be absent). */
+function makeKeyRange(lower: KeyBound | undefined, upper: KeyBound | undefined): IDBKeyRange | undefined {
+  if (lower && upper) return IDBKeyRange.bound(lower.key, upper.key, lower.open, upper.open);
+  if (lower) return IDBKeyRange.lowerBound(lower.key, lower.open);
+  if (upper) return IDBKeyRange.upperBound(upper.key, upper.open);
+  return undefined;
+}
+
 /**
  * Extended options for IndexedDB store.
  */
@@ -155,27 +172,56 @@ export class IndexedDBStore implements KVStore {
 
   async *iterate(options?: IterateOptions): AsyncIterable<KVEntry> {
     this.checkOpen();
-    const entries = await this.collectEntries(options);
-    for (const entry of entries) {
-      yield entry;
+
+    const reverse = options?.reverse ?? false;
+    const direction: IDBCursorDirection = reverse ? 'prev' : 'next';
+    const { lower, upper } = this.rangeBounds(options);
+    let remaining = options?.limit; // undefined ⇒ unbounded
+    let resumeKey: ArrayBuffer | undefined; // last key yielded — exclusive resume edge
+
+    // NOTE: one tx per batch — a single cursor can't survive consumer awaits (IDB
+    // auto-commits an idle readonly tx → TransactionInactiveError). Page in bounded
+    // batches, each in its own short-lived tx, resuming from the last key seen.
+    for (;;) {
+      if (remaining !== undefined && remaining <= 0) return;
+      const want = remaining === undefined ? BATCH : Math.min(BATCH, remaining);
+
+      // Resume just past the last key seen: forward tightens the lower bound,
+      // reverse tightens the upper bound — exclusive so no entry repeats.
+      const effLower = !reverse && resumeKey !== undefined ? { key: resumeKey, open: true } : lower;
+      const effUpper = reverse && resumeKey !== undefined ? { key: resumeKey, open: true } : upper;
+
+      const batch = await this.readBatch(effLower, effUpper, direction, want);
+      for (const entry of batch) {
+        yield entry;
+      }
+      if (remaining !== undefined) remaining -= batch.length;
+      if (batch.length < want) return; // range exhausted before filling the batch
+      resumeKey = toKey(batch[batch.length - 1].key);
     }
   }
 
-  private async collectEntries(options?: IterateOptions): Promise<KVEntry[]> {
+  /**
+   * Read up to `want` entries in a single short-lived readonly transaction. The tx
+   * opens and commits within this call, so it never spans a consumer await.
+   */
+  private async readBatch(
+    lower: KeyBound | undefined,
+    upper: KeyBound | undefined,
+    direction: IDBCursorDirection,
+    want: number,
+  ): Promise<KVEntry[]> {
     const db = await this.manager.ensureOpen();
+    const range = makeKeyRange(lower, upper);
     return new Promise((resolve, reject) => {
       const tx = db.transaction(this.storeName, 'readonly');
       const store = tx.objectStore(this.storeName);
-      const range = this.buildKeyRange(options);
-      const direction = options?.reverse ? 'prev' : 'next';
       const request = store.openCursor(range, direction);
       const entries: KVEntry[] = [];
-      const limit = options?.limit;
-
       request.onerror = () => reject(request.error);
       request.onsuccess = () => {
         const cursor = request.result;
-        if (cursor && (limit === undefined || entries.length < limit)) {
+        if (cursor && entries.length < want) {
           entries.push({
             key: new Uint8Array(cursor.key as ArrayBuffer),
             value: new Uint8Array(cursor.value as ArrayBuffer),
@@ -188,25 +234,20 @@ export class IndexedDBStore implements KVStore {
     });
   }
 
+  /** Derive lower/upper key bounds from iterate options (resume edges applied by the caller). */
+  private rangeBounds(options?: IterateOptions): { lower?: KeyBound; upper?: KeyBound } {
+    let lower: KeyBound | undefined;
+    let upper: KeyBound | undefined;
+    if (options?.gte) lower = { key: toKey(options.gte), open: false };
+    else if (options?.gt) lower = { key: toKey(options.gt), open: true };
+    if (options?.lte) upper = { key: toKey(options.lte), open: false };
+    else if (options?.lt) upper = { key: toKey(options.lt), open: true };
+    return { lower, upper };
+  }
+
   private buildKeyRange(options?: IterateOptions): IDBKeyRange | undefined {
-    if (options?.gte && options?.lt) {
-      return IDBKeyRange.bound(toKey(options.gte), toKey(options.lt), false, true);
-    } else if (options?.gte && options?.lte) {
-      return IDBKeyRange.bound(toKey(options.gte), toKey(options.lte), false, false);
-    } else if (options?.gt && options?.lt) {
-      return IDBKeyRange.bound(toKey(options.gt), toKey(options.lt), true, true);
-    } else if (options?.gt && options?.lte) {
-      return IDBKeyRange.bound(toKey(options.gt), toKey(options.lte), true, false);
-    } else if (options?.gte) {
-      return IDBKeyRange.lowerBound(toKey(options.gte), false);
-    } else if (options?.gt) {
-      return IDBKeyRange.lowerBound(toKey(options.gt), true);
-    } else if (options?.lte) {
-      return IDBKeyRange.upperBound(toKey(options.lte), false);
-    } else if (options?.lt) {
-      return IDBKeyRange.upperBound(toKey(options.lt), true);
-    }
-    return undefined;
+    const { lower, upper } = this.rangeBounds(options);
+    return makeKeyRange(lower, upper);
   }
 
   batch(): WriteBatch {
@@ -274,7 +315,12 @@ class IndexedDBWriteBatch implements WriteBatch {
         }
       }
       tx.onerror = () => reject(tx.error);
-      tx.oncomplete = () => resolve();
+      tx.oncomplete = () => {
+        // Clear only on success so a committed batch does not re-apply on reuse
+        // (matches LevelDB, which clears ops after a successful batch()).
+        this.ops = [];
+        resolve();
+      };
     });
   }
 
@@ -345,7 +391,12 @@ export class MultiStoreWriteBatch implements WriteBatch {
       }
 
       tx.onerror = () => reject(tx.error);
-      tx.oncomplete = () => resolve();
+      tx.oncomplete = () => {
+        // Clear only on success so a committed batch does not re-apply on reuse.
+        this.ops = [];
+        this.storeNames.clear();
+        resolve();
+      };
     });
   }
 

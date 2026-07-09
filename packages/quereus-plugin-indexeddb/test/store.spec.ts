@@ -4,7 +4,7 @@
 
 import { expect } from 'chai';
 import 'fake-indexeddb/auto';
-import { IndexedDBStore } from '../src/store.js';
+import { IndexedDBStore, MultiStoreWriteBatch } from '../src/store.js';
 import { IndexedDBManager } from '../src/manager.js';
 import { IndexedDBProvider } from '../src/provider.js';
 import { Database, asyncIterableToArray } from '@quereus/quereus';
@@ -165,16 +165,18 @@ describe('IndexedDBStore', () => {
       batch.put(new Uint8Array([10]), new Uint8Array([100]));
       batch.put(new Uint8Array([11]), new Uint8Array([110]));
 
-      // Start the upgrade — this runs synchronously until its first internal await
+      // Start the upgrade. doUpgrade() closes the current connection before
+      // reopening at the bumped version, so getDatabase() briefly returns null.
       const upgradePromise = manager.ensureObjectStore('new-table-for-race-test');
-      // Yield one microtask tick so ensureObjectStore progresses past ensureOpen()
-      // into doUpgrade(), which closes the database and sets upgradePromise on
-      // the manager.  This simulates the real scenario where an upgrade is
-      // already in flight when a write batch fires.
-      await Promise.resolve();
+      // Wait until that in-flight window is observable (bounded, so we never spin):
+      // this guarantees the write below fires while a version upgrade is genuinely
+      // in flight, forcing it through ensureOpen()'s wait-for-schema-queue path.
+      for (let i = 0; i < 50 && manager.getDatabase() !== null; i++) {
+        await Promise.resolve();
+      }
 
       // Now start the batch write while the upgrade is in-flight.
-      // ensureOpen() sees upgradePromise and waits for the upgrade to complete.
+      // ensureOpen() awaits the schema queue and then returns the reopened db.
       const writePromise = batch.write();
 
       await Promise.all([upgradePromise, writePromise]);
@@ -185,6 +187,103 @@ describe('IndexedDBStore', () => {
 
       // The new object store should also exist
       expect(manager.hasObjectStore('new-table-for-race-test')).to.be.true;
+    });
+  });
+
+  describe('Iteration across batch boundaries (streaming)', () => {
+    // store.ts pages iteration in 256-entry batches; use more than one batch worth
+    // so the resume-across-batches path is exercised.
+    const COUNT = 306;
+    const enc = (n: number) => new Uint8Array([(n >> 8) & 0xff, n & 0xff]);
+    const dec = (k: Uint8Array) => (k[0] << 8) | k[1];
+
+    beforeEach(async () => {
+      const b = store.batch();
+      for (let i = 0; i < COUNT; i++) {
+        b.put(enc(i), new Uint8Array([i & 0xff]));
+      }
+      await b.write();
+    });
+
+    it('streams every entry in order across batch boundaries, tolerating consumer awaits', async () => {
+      const keys: number[] = [];
+      for await (const entry of store.iterate({})) {
+        // Await an unrelated store op mid-iteration. A naive single-cursor iterate
+        // would let its readonly tx auto-commit here and throw TransactionInactiveError
+        // on the next cursor.continue(); the per-batch tx design tolerates it.
+        await store.get(enc(0));
+        keys.push(dec(entry.key));
+      }
+      expect(keys).to.have.length(COUNT);
+      // Strictly ascending across the boundary — no gaps, no repeats.
+      for (let i = 0; i < COUNT; i++) {
+        expect(keys[i]).to.equal(i);
+      }
+    });
+
+    it('honors reverse across the batch boundary', async () => {
+      const keys: number[] = [];
+      for await (const entry of store.iterate({ reverse: true })) {
+        keys.push(dec(entry.key));
+      }
+      expect(keys).to.have.length(COUNT);
+      for (let i = 0; i < COUNT; i++) {
+        expect(keys[i]).to.equal(COUNT - 1 - i);
+      }
+    });
+
+    it('honors a limit that spans the batch boundary', async () => {
+      const limit = 300; // > one 256-entry batch
+      const keys: number[] = [];
+      for await (const entry of store.iterate({ limit })) {
+        keys.push(dec(entry.key));
+      }
+      expect(keys).to.have.length(limit);
+      expect(keys[0]).to.equal(0);
+      expect(keys[limit - 1]).to.equal(limit - 1);
+    });
+  });
+
+  describe('Batch reuse after commit', () => {
+    it('does not re-apply a committed IndexedDBWriteBatch on reuse', async () => {
+      const k1 = new Uint8Array([1]);
+      const v1 = new Uint8Array([11]);
+      const k2 = new Uint8Array([2]);
+      const v2 = new Uint8Array([22]);
+
+      const b = store.batch();
+      b.put(k1, v1);
+      await b.write();
+      expect(await store.get(k1)).to.deep.equal(v1);
+
+      // Remove k1 out-of-band, then reuse the same batch handle for a second write.
+      await store.delete(k1);
+      b.put(k2, v2);
+      await b.write();
+
+      // If write() had not cleared ops, the second commit would resurrect k1.
+      expect(await store.get(k1)).to.be.undefined;
+      expect(await store.get(k2)).to.deep.equal(v2);
+    });
+
+    it('does not re-apply a committed MultiStoreWriteBatch on reuse', async () => {
+      const manager = store.getManager();
+      const k1 = new Uint8Array([3]);
+      const v1 = new Uint8Array([33]);
+      const k2 = new Uint8Array([4]);
+      const v2 = new Uint8Array([44]);
+
+      const mb = new MultiStoreWriteBatch(manager);
+      mb.putToStore(storeName, k1, v1);
+      await mb.write();
+      expect(await store.get(k1)).to.deep.equal(v1);
+
+      await store.delete(k1);
+      mb.putToStore(storeName, k2, v2);
+      await mb.write();
+
+      expect(await store.get(k1)).to.be.undefined;
+      expect(await store.get(k2)).to.deep.equal(v2);
     });
   });
 });

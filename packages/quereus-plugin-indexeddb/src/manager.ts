@@ -25,11 +25,26 @@ export class IndexedDBManager {
   private dbVersion: number = 1;
   private objectStores: Set<string> = new Set();
   private openPromise: Promise<void> | null = null;
-  private upgradePromise: Promise<void> | null = null;
+  /** Tail of the serialized schema-mutation queue (create/delete/rename stores). */
+  private schemaTail: Promise<void> = Promise.resolve();
   private closed = false;
 
   private constructor(dbName: string) {
     this.dbName = dbName;
+  }
+
+  /**
+   * Run a schema mutation serialized against all other schema mutations. Version
+   * upgrades close and reopen the database at a bumped version; two overlapping
+   * upgrades would race their `onupgradeneeded` transitions and throw VersionError,
+   * so every version-changing op is chained through this single queue.
+   */
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    // Chain regardless of prior outcome so one failure doesn't wedge the queue.
+    const run = this.schemaTail.then(fn, fn);
+    // Keep the tail alive but swallow the result so a rejection doesn't poison later ops.
+    this.schemaTail = run.then(() => {}, () => {});
+    return run;
   }
 
   /**
@@ -66,10 +81,16 @@ export class IndexedDBManager {
       throw new Error('IndexedDBManager is closed');
     }
 
-    // Wait for any ongoing upgrade to complete
-    if (this.upgradePromise) {
-      await this.upgradePromise;
-    }
+    // Let any in-flight schema mutation finish first: doUpgrade/doDelete/doRename
+    // null out this.db while reopening, so returning it mid-op would hand back a
+    // stale/closed handle.
+    // NOTE: this only waits for schema ops enqueued *before* this call. A schema
+    // mutation enqueued in the microtask gap between this await resolving and the
+    // caller building its transaction can still close the returned handle out from
+    // under a data write. IDB close() defers to already-open transactions, so the
+    // common concurrent case survives; if data-write-vs-DDL interleaving ever
+    // surfaces InvalidStateError, make the write path retry on a closed handle.
+    await this.schemaTail;
 
     if (this.db) {
       return this.db;
@@ -81,9 +102,14 @@ export class IndexedDBManager {
       return this.db!;
     }
 
+    // Reset openPromise in finally so a failed open (timeout / onerror) doesn't
+    // stay cached — a later call re-attempts instead of replaying the rejection.
     this.openPromise = this.doOpen();
-    await this.openPromise;
-    this.openPromise = null;
+    try {
+      await this.openPromise;
+    } finally {
+      this.openPromise = null;
+    }
     return this.db!;
   }
 
@@ -189,24 +215,18 @@ export class IndexedDBManager {
    * Creates the store via database version upgrade if needed.
    */
   async ensureObjectStore(storeName: string): Promise<void> {
-    // Wait for any ongoing upgrade to complete
-    if (this.upgradePromise) {
-      await this.upgradePromise;
-    }
-
     await this.ensureOpen();
 
     if (this.objectStores.has(storeName)) {
       return; // Already exists
     }
 
-    // Serialize upgrades to prevent race conditions
-    this.upgradePromise = this.doUpgrade(storeName);
-    try {
-      await this.upgradePromise;
-    } finally {
-      this.upgradePromise = null;
-    }
+    await this.runSerialized(async () => {
+      // Re-check inside the lock: a queued peer may have already created it,
+      // which avoids a redundant version bump.
+      if (this.objectStores.has(storeName)) return;
+      await this.doUpgrade(storeName);
+    });
   }
 
   private async doUpgrade(storeName: string): Promise<void> {
@@ -264,24 +284,17 @@ export class IndexedDBManager {
    * Delete an object store (table).
    */
   async deleteObjectStore(storeName: string): Promise<void> {
-    // Wait for any ongoing upgrade to complete
-    if (this.upgradePromise) {
-      await this.upgradePromise;
-    }
-
     await this.ensureOpen();
 
     if (!this.objectStores.has(storeName)) {
       return; // Doesn't exist
     }
 
-    // Serialize against concurrent operations via upgradePromise
-    this.upgradePromise = this.doDeleteObjectStore(storeName);
-    try {
-      await this.upgradePromise;
-    } finally {
-      this.upgradePromise = null;
-    }
+    await this.runSerialized(async () => {
+      // Re-check inside the lock: a queued peer may have already deleted it.
+      if (!this.objectStores.has(storeName)) return;
+      await this.doDeleteObjectStore(storeName);
+    });
   }
 
   private async doDeleteObjectStore(storeName: string): Promise<void> {
@@ -343,36 +356,30 @@ export class IndexedDBManager {
    * (old stores intact, new stores never created).
    */
   async renameObjectStores(renames: Array<{ from: string; to: string }>): Promise<void> {
-    // Wait for any ongoing upgrade to complete
-    if (this.upgradePromise) {
-      await this.upgradePromise;
-    }
-
     await this.ensureOpen();
 
-    // Only move sources that actually materialized as object stores. A table
-    // that was declared but never connected has no backing store yet — mirrors
-    // LevelDB's pathExists guard for a never-materialized directory.
-    const filtered = renames.filter((r) => this.objectStores.has(r.from));
-    if (filtered.length === 0) {
-      return; // nothing physical to move
-    }
+    await this.runSerialized(async () => {
+      // Evaluate the filter and collision guard inside the lock so they see state
+      // committed by any queued peer, not a stale snapshot from before we waited.
 
-    // Pre-bump collision guard: refuse before mutating anything if any target
-    // already exists, so a failed rename never leaves a half-created store.
-    for (const { from, to } of filtered) {
-      if (this.objectStores.has(to)) {
-        throw new Error(`Cannot rename object store '${from}' to '${to}': object store '${to}' already exists`);
+      // Only move sources that actually materialized as object stores. A table
+      // that was declared but never connected has no backing store yet — mirrors
+      // LevelDB's pathExists guard for a never-materialized directory.
+      const filtered = renames.filter((r) => this.objectStores.has(r.from));
+      if (filtered.length === 0) {
+        return; // nothing physical to move
       }
-    }
 
-    // Serialize against concurrent operations via upgradePromise.
-    this.upgradePromise = this.doRenameObjectStores(filtered);
-    try {
-      await this.upgradePromise;
-    } finally {
-      this.upgradePromise = null;
-    }
+      // Pre-bump collision guard: refuse before mutating anything if any target
+      // already exists, so a failed rename never leaves a half-created store.
+      for (const { from, to } of filtered) {
+        if (this.objectStores.has(to)) {
+          throw new Error(`Cannot rename object store '${from}' to '${to}': object store '${to}' already exists`);
+        }
+      }
+
+      await this.doRenameObjectStores(filtered);
+    });
   }
 
   private async doRenameObjectStores(renames: Array<{ from: string; to: string }>): Promise<void> {

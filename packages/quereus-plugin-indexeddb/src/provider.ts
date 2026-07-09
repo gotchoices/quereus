@@ -365,9 +365,8 @@ class IndexedDBAtomicBatch implements AtomicBatch {
 	}
 
 	async write(): Promise<void> {
-		// Capture before write() — MultiStoreWriteBatch clears nothing on write,
-		// but read the names up front so cache invalidation is independent of the
-		// batch's internal state afterward.
+		// Capture before write() — a successful write() clears the batch's ops and
+		// store names, so read the names up front for post-write cache invalidation.
 		const storeNames = this.batch.getStoreNames();
 		await this.batch.write();
 		for (const storeName of storeNames) {
