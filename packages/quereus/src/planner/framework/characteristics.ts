@@ -430,6 +430,10 @@ export class CapabilityDetectors {
 		// carried functionSchema is the real, intentional marker. Chosen over an
 		// instanceof AggregateFunctionCallNode check to keep this file duck-typed and
 		// free of concrete node-class coupling.
+		// NOTE: isAggregateFunctionSchema does `'x' in schema`, which throws on a
+		// null/undefined functionSchema. Real nodes always carry an object schema
+		// (constructor-required, typed non-null), so this is safe today; add an
+		// object/non-null pre-check here if a node ever carries functionSchema: null.
 		return PlanNodeCharacteristics.isScalar(node) &&
 			'functionSchema' in node &&
 			isAggregateFunctionSchema((node as any).functionSchema);

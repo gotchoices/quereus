@@ -269,39 +269,6 @@ export class PlanNodeCharacteristics {
 }
 ```
 
-### Capability Interface Registry
-
-```typescript
-export class CapabilityRegistry {
-  private static readonly detectors = new Map<string, (node: PlanNode) => boolean>();
-  
-  static register<T extends PlanNode>(
-    capability: string,
-    detector: (node: PlanNode) => node is T
-  ): void {
-    this.detectors.set(capability, detector);
-  }
-  
-  static hasCapability(node: PlanNode, capability: string): boolean {
-    const detector = this.detectors.get(capability);
-    return detector ? detector(node) : false;
-  }
-  
-  static getCapable<T extends PlanNode>(
-    nodes: readonly PlanNode[], 
-    capability: string
-  ): T[] {
-    const detector = this.detectors.get(capability);
-    if (!detector) return [];
-    return nodes.filter(detector) as T[];
-  }
-}
-
-// Usage in rules:
-CapabilityRegistry.register('predicate-pushdown', canPushDownPredicate);
-CapabilityRegistry.register('table-access', isTableAccess);
-```
-
 ## Rule Development Guidelines
 
 ### 1. Start with Capabilities
