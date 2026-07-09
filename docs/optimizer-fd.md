@@ -144,6 +144,8 @@ Bindings are closed over equivalence classes: at every node that contributes bin
 
 ## Per-operator propagation
 
+This table is canonical. [Optimizer § Key-driven row-count reduction](optimizer.md#key-driven-row-count-reduction) restates the join arms from `analyzeJoinKeyCoverage`'s point of view; if the two ever disagree, this one is right.
+
 | Operator                                  | FDs / ECs added or transformed                                                                                                              |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TableReferenceNode`                      | Seed `key → others` for each declared key (PK + UNIQUE), `kind: 'unique'`. Additionally seed FDs / EC pairs / constant bindings / `domainConstraints` from declared CHECK constraints **and from assertion-hoisted `not exists (…)` predicates** (cached per `TableSchema`); see *Check-derived contributions* below. CHECK / hoisted FDs fold **unconditionally** — they are `'determination'` (or guarded) claims and the kind-aware readers never read a determination as a uniqueness claim. EC pairs merge as always; bindings are then closed over the resulting EC list. |

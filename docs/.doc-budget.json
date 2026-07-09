@@ -2,9 +2,9 @@
 	"maxWords": 12000,
 	"note": "Ratchet entries record a doc's size at the time it was grandfathered in. A doc may shrink; it may never grow past its recorded size. New docs must come in under maxWords. Lower an entry with `node scripts/check-docs.mjs --update-ratchet` after a doc shrinks. See docs/doc-conventions.md.",
 	"ratchet": {
-		"docs/lens.md": 17931,
-		"docs/materialized-views.md": 28574,
-		"docs/optimizer.md": 27935,
+		"docs/lens.md": 17929,
+		"docs/materialized-views.md": 28570,
+		"docs/optimizer.md": 27929,
 		"docs/runtime.md": 13018,
 		"docs/schema.md": 15683,
 		"docs/sql.md": 28654,
