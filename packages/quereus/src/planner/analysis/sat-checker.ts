@@ -231,7 +231,12 @@ function resolveColumnCollations(
  * names for types that declare a supported list (TEXT), so `k integer collate
  * frobnicate` reaches the planner unvalidated (see the `feat-ddl-accepts-registered-collations`
  * backlog ticket). Throwing here would fail a query that runs fine today, from an
- * optimizer rule that is supposed to be an optimization.
+ * optimizer rule that is supposed to be an optimization. Reachable today via a
+ * `CHECK` on such a column, which publishes a `DomainConstraint` naming it:
+ *   create table t (id integer primary key, k integer collate frobnicate check (k > 0));
+ *   select id from t where id = 1;
+ * `resolveColumnCollations` must resolve `k` (a domain mentions it) even though no
+ * emitted comparison touches it, so a rethrow here would break that `select`.
  */
 function tryResolve(resolver: CollationResolver, name: string): CollationFunction | undefined {
 	try {

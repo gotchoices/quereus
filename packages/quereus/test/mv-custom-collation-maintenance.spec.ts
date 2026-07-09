@@ -85,16 +85,18 @@ describe('materialized-view maintenance under a database-registered collation', 
 		expect(await results(db, 'select x, id from ix')).to.deep.equal([{ x: 'zz', id: 1 }]);
 	});
 
-	it('the covering path and uniqueEnforcementCollations agree on the enforcement collation', async () => {
+	it('the declared collation the covering path compares under resolves through the database', async () => {
 		await db.exec('create table t (id integer primary key, x text collate nocase not null, unique (x))');
 		const schema = db.schemaManager.getTable('main', 't')!;
 		const uc = schema.uniqueConstraints![0];
-		// `lookupCoveringConflicts` compares under the *declared source column* collation.
-		// For a non-index-derived UNIQUE that is exactly what the shared helper reports, and
-		// both resolve through the same database resolver — not the process-global registry.
+		// `lookupCoveringConflicts` compares candidates under the *declared source column*
+		// collation, never the constraint's enforcement collation — see its comment. For this
+		// non-index-derived UNIQUE the two coincide, which is what lets the shared helper stand
+		// in below; what the assertion pins is that the name resolves through the database
+		// resolver to the connection's comparator, not the process-global registry.
 		expect(uniqueEnforcementCollations(schema, uc))
 			.to.deep.equal(uc.columns.map(c => schema.columns[c].collation));
-		const [fn] = resolveCollationFunctions(db.getCollationResolver(), uniqueEnforcementCollations(schema, uc));
+		const [fn] = resolveCollationFunctions(db.getCollationResolver(), uc.columns.map(c => schema.columns[c].collation));
 		expect(fn).to.equal(lengthOnly);
 	});
 });

@@ -87,6 +87,11 @@ const DEFAULT_SOURCE_ROWS = 1000;
  * until the MV is re-registered — which any schema change does, but a bare `registerCollation`
  * does not. Same exposure as index comparators, which resolve once at table open; if that ever
  * needs fixing, fix it for both.
+ *
+ * NOTE: `resolver` throws on an unregistered collation name. Unreachable today — the memory
+ * module rejects the backing `create` first — so this never converts a working `create
+ * materialized view` into an error. If a backing host is ever added that tolerates an
+ * unregistered name on a key column, this becomes the first site to throw, at plan-build time.
  */
 function resolveBackingPkColumns(backing: TableSchema, resolver: CollationResolver): BackingPkColumn[] {
 	return backing.primaryKeyDefinition.map(d => ({

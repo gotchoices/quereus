@@ -1010,10 +1010,17 @@ export class MaterializedViewManager {
 		const host = backingHost(this.ctx, backing);
 		const connection = await getBackingConnection(this.ctx, host, `${plan.backingSchema}.${plan.backingTableName}`);
 
-		// Both comparisons below run per scanned backing row, so resolve the enforcement
-		// collations once here. They are the **source** column's collations — the UC's own
-		// enforcement collation and the source PK's — which may be coarser or finer than the
-		// backing column's; see `uniqueEnforcementCollations` for the same name selection.
+		// Both comparisons below run per scanned backing row, so resolve their collations
+		// once here, against this database (a redefined NOCASE must be honored).
+		//
+		// These are the source column's **declared** collations, NOT the constraint's
+		// enforcement collation (`uniqueEnforcementCollations`, which prefers the index's
+		// per-column collation). That is deliberate: this method generates conflict
+		// *candidates* which the re-validators then filter under the index collation, and
+		// the declared-collation candidate set is a sound superset only because
+		// `findRowTimeCoveringStructure` declines any MV whose index collation is finer or
+		// incomparable (`coveringMvHonorsIndexCollation`). Swapping in the enforcement
+		// collation here would break that pairing — do not "DRY" these together.
 		const resolver = this.ctx.getCollationResolver();
 		const ucCollationFns = resolveCollationFunctions(
 			resolver, uc.columns.map(c => sourceSchema.columns[c]?.collation));

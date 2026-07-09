@@ -470,4 +470,15 @@ describe('Predicate contradiction folding (end-to-end)', () => {
 		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
 		expect(await results(db, sql)).to.have.lengthOf(1);
 	});
+
+	it('an unregistered collation on an unrelated column does not fail the query', async () => {
+		// Column DDL does not validate collation names on non-TEXT types, and a CHECK on such
+		// a column publishes a DomainConstraint naming it — so the checker must resolve a
+		// collation no emitted comparison ever touches. It answers `unknown` (logs a warning)
+		// instead of letting the resolver's throw escape an optimizer rule.
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER COLLATE FROBNICATE CHECK (k > 0))');
+		const sql = 'SELECT id FROM t WHERE id = 1';
+		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
+		expect(await results(db, sql)).to.have.lengthOf(0);
+	});
 });
