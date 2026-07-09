@@ -9,8 +9,9 @@ import {
   deserializeHLC,
   hlcToJson,
   hlcFromJson,
+  deterministicTxnId,
 } from '../../src/clock/hlc.js';
-import { generateSiteId, siteIdEquals } from '../../src/clock/site.js';
+import { generateSiteId, siteIdEquals, siteIdToBase64 } from '../../src/clock/site.js';
 
 describe('HLC (Hybrid Logical Clock)', () => {
   describe('compareHLC', () => {
@@ -232,6 +233,28 @@ describe('HLC (Hybrid Logical Clock)', () => {
       const restored = hlcFromJson(JSON.parse(JSON.stringify(json)));
       expect(restored.opSeq).to.equal(123456);
       expect(hlcEquals(restored, hlc)).to.be.true;
+    });
+
+    it('should reject a siteId that is not 22 characters', () => {
+      expect(() => hlcFromJson({ wallTime: '1', counter: 0, siteId: 'AAAA', opSeq: 0 }))
+        .to.throw(/expected 22/);
+    });
+  });
+
+  describe('deterministicTxnId', () => {
+    it('should encode the siteId with the shared base64url encoder', () => {
+      const siteId = generateSiteId();
+      const hlc = createHLC(1234567890123n, 42, siteId, 7);
+
+      expect(deterministicTxnId(hlc))
+        .to.equal(`1234567890123:42:${siteIdToBase64(siteId)}`);
+    });
+
+    it('should ignore opSeq so all facts of one transaction share an id', () => {
+      const siteId = generateSiteId();
+
+      expect(deterministicTxnId(createHLC(1000n, 1, siteId, 0)))
+        .to.equal(deterministicTxnId(createHLC(1000n, 1, siteId, 99)));
     });
   });
 
