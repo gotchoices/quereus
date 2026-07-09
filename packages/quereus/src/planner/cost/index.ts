@@ -220,9 +220,13 @@ export function chooseCheapest<T>(options: Array<{ cost: number; option: T }>): 
  * ────────────────────────────────────────────────────────────────────────── */
 
 /**
- * The maintenance strategies the incremental substrate names. Mirrors
- * `MaintenancePlan['kind']` in core/database-materialized-views.ts (the maintenance
- * arms reference this type for their `kind`/`chosenStrategy` fields).
+ * The maintenance strategies the incremental substrate **costs** — a subset of
+ * `MaintenancePlan['kind']` in core/database-materialized-views.ts. The arms the cost
+ * model does not distinguish (`'prefix-delete'`, `'join-residual'`) record the strategy
+ * they are costed as (`'residual-recompute'`) in their `chosenStrategy`. Each arm builder
+ * calls {@link selectMaintenanceStrategy} with its own singleton sound set and rejects any
+ * other answer as INTERNAL, so the gate can never hand back a strategy no arm implements
+ * (docs/invariants.md MV-007).
  */
 export type MaintenanceStrategy = 'inverse-projection' | 'residual-recompute' | 'full-rebuild';
 

@@ -525,8 +525,8 @@ operation, recursive CTE, `DISTINCT`, window, `LIMIT` — is grounds for rejecti
 five create-time rejections exist, all non-shape: a non-deterministic body (absent `pragma
 nondeterministic_schema`); a bag with no provable unique key and no coarsened lineage key;
 a body with no relational output; a body reading no source table; and a full-rebuild-only
-body whose largest source exceeds `materialized_view_rebuild_row_threshold`. Adding a sixth
-is a breaking change. MV-008 adds a host-conditional gate that is inert by default.
+body whose largest source exceeds `materialized_view_rebuild_row_threshold`. Adding an
+unconditional sixth is a breaking change. MV-008 adds host-conditional gates, inert by default.
 
 ### MV-007 — The strategy gate can be slow, never wrong
 
@@ -706,6 +706,7 @@ dependency returns — never a silent pass.
 ### MV-019 — Secondary UNIQUE is enforced by the host, post-batch
 
 - code: `packages/quereus/src/vtab/memory/layer/manager.ts` — `enforceSecondaryUniqueOnMaintenance`
+- code: `packages/quereus-store/src/common/store-table.ts` — `enforceSecondaryUniqueForMaintenance`
 - guard: `packages/quereus/test/logic/51.9-maintained-table-secondary-unique.sqllogic`
 - doc: [Derived-Row Constraints § Declared secondary UNIQUE](mv-constraints.md#declared-secondary-unique)
 
@@ -777,16 +778,19 @@ stale until `REFRESH`.
 
 ### MV-024 — A durable backing is refilled unless it is provably adoptable
 
+- code: `packages/quereus/src/schema/manager.ts` — `tryAdoptPreExistingBacking`
 - code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `backingShapeMatches`
 - guard: `packages/quereus/test/view-mv-ddl-persistence.spec.ts` — `rebuilds + fills the backing, keeps maintenance live, names it in .materializedViews, fires no event`
 - doc: [Backing-host capability § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity)
 
 Coordinated commit is not two-phase commit: with the backing in one durable module and the
-sources in another, a crash between commit acknowledgements can leave them divergent on
-disk. The engine's answer is not to restrict module combinations but to make catalog
-rehydrate **refill from the body by default**, so any divergence self-heals at the next open.
-A pre-existing durable backing is adopted as-is only when the body hash, the derived backing
-shape, the module identity, same-module sourcing, and a crash-durable trust basis all agree.
+sources in another, a crash between commit acknowledgements can leave them divergent.
+The answer is not to restrict module combinations but to make catalog rehydrate
+**refill from the body by default**, so any divergence self-heals at the next open. A
+pre-existing backing is adopted as-is only when five gates agree: a crash-durable trust
+basis, the derived backing shape, module identity, the body hash (re-derived from the
+persisted DDL), and same-module sourcing — which further requires that a maintained source
+was itself adopted, not refilled.
 
 ## RT — Runtime
 

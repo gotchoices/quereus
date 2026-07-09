@@ -16,6 +16,13 @@
  * module-agnostic. A module that cannot provide the ordered prefix scan must
  * NOT advertise the capability — the engine does not gate per maintenance arm.
  *
+ * NOTE: this obligation is normative but unenforced — nothing checks it at
+ * runtime, so a module advertising the capability without the ordered prefix
+ * scan degrades silently (correct results, linear cost). Only the in-tree
+ * memory and store hosts implement it today. If third-party backing hosts
+ * appear, promote this to a shared conformance suite the module runs against
+ * (docs/invariants.md MV-015).
+ *
  * ## Effective-change reporting
  *
  * Reporting the EFFECTIVE per-row changes from {@link BackingHost.applyMaintenance}

@@ -317,19 +317,24 @@ const MAX_INVARIANT_BODY_WORDS = 120;
 /**
  * Split `docs/invariants.md` into `### ID — title` blocks, keeping line numbers.
  *
- * NOTE: every line after a `### ` heading joins that block's body, including a following
- * `## <Area>` group heading AND any preamble prose under it. The MV area has such a preamble,
- * so the last OPT block pays for it out of its own 120-word budget (~30 words of headroom
- * left). An area preamble must therefore stay short. If preambles ever need real length, end
- * a block at the next heading of ANY level instead of only at `### `.
+ * A block ends at the next heading of ANY level, so an area's `## <Area>` heading and the
+ * preamble prose under it are charged to nobody — not to the preceding invariant's 120-word
+ * budget. (Before this, an area preamble silently ate the last block's headroom.)
  */
 function parseInvariantBlocks(content) {
 	const blocks = [];
+	let open = null;
 	stripFences(content)
 		.split('\n')
 		.forEach((line, index) => {
-			if (/^### /.test(line)) blocks.push({ heading: line, line: index + 1, body: [] });
-			else if (blocks.length) blocks.at(-1).body.push({ text: line, line: index + 1 });
+			if (/^### /.test(line)) {
+				open = { heading: line, line: index + 1, body: [] };
+				blocks.push(open);
+			} else if (/^#{1,6} /.test(line)) {
+				open = null; // a heading of any other level closes the current block
+			} else if (open) {
+				open.body.push({ text: line, line: index + 1 });
+			}
 		});
 	return blocks;
 }
