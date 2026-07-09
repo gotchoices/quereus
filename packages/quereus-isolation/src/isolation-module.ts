@@ -222,7 +222,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				const underlyingTable = await underlyingCreateBacking.call(this.underlying, db, tableSchema);
 				const state: UnderlyingTableState = { underlyingTable };
 				this.setUnderlyingState(tableSchema.schemaName, tableSchema.name, state);
-				return new IsolatedTable(db, this, underlyingTable);
+				return new IsolatedTable(db, this, tableSchema.schemaName, tableSchema.name, underlyingTable);
 			};
 		}
 
@@ -645,8 +645,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const state: UnderlyingTableState = { underlyingTable };
 		this.setUnderlyingState(tableSchema.schemaName, tableSchema.name, state);
 
-		// 3. Return wrapped table (overlay will be created lazily on first write)
-		return new IsolatedTable(db, this, underlyingTable);
+		// 3. Return wrapped table (overlay will be created lazily on first write).
+		//    Keyed off the schema's own (schemaName, name) — the pair `underlyingTables` uses —
+		//    never off the underlying table's self-reported names (see IsolatedTable's ctor doc).
+		return new IsolatedTable(db, this, tableSchema.schemaName, tableSchema.name, underlyingTable);
 	}
 
 	/**
@@ -685,8 +687,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const readCommitted = (options as { _readCommitted?: boolean } | undefined)?._readCommitted === true;
 
 		// Return a fresh IsolatedTable instance that will look up its overlay
-		// from connection-scoped storage (shared with other instances in same transaction)
-		return new IsolatedTable(db, this, state.underlyingTable, readCommitted);
+		// from connection-scoped storage (shared with other instances in same transaction).
+		// Pass the connect-time (schemaName, tableName) — the pair `underlyingTables` is keyed
+		// by — never the underlying's self-reported names (see IsolatedTable's ctor doc).
+		return new IsolatedTable(db, this, schemaName, tableName, state.underlyingTable, readCommitted);
 	}
 
 	/**

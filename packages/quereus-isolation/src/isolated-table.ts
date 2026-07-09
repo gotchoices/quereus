@@ -74,14 +74,28 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		return this.isolationModule.getPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
 	}
 
+	/**
+	 * @param schemaName Schema name as supplied to `IsolationModule.create()`/`.connect()` — the
+	 *   same identity `IsolationModule.underlyingTables` is keyed by.
+	 * @param tableName Bare table name from the same source. These MUST NOT be read off
+	 *   `underlyingTable.schemaName` / `.tableName`: `VirtualTable.tableName` is contracted bare,
+	 *   but an underlying module that reports a schema-qualified name there (lamina-quereus does,
+	 *   using the field as a catalogue key) would key this table's overlay as
+	 *   `<dbId>:store.store.widget` while `underlyingTables` holds `store.widget`. The commit
+	 *   flush looks the overlay's key up in `underlyingTables`, misses, and silently discards
+	 *   every staged row. Keying off the connect-time pair keeps both maps on one identity by
+	 *   construction, whatever the underlying self-reports.
+	 */
 	constructor(
 		db: Database,
 		module: IsolationModule,
+		schemaName: string,
+		tableName: string,
 		underlyingTable: VirtualTable,
 		readCommitted: boolean = false
 	) {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		super(db, module as any, underlyingTable.schemaName, underlyingTable.tableName);
+		super(db, module as any, schemaName, tableName);
 		this.isolationModule = module;
 		this.underlyingTable = underlyingTable;
 		this.readCommitted = readCommitted;

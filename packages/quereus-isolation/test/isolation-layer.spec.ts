@@ -4,6 +4,7 @@ import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrency
 import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
+import { makeFullScanFilterInfo } from '../src/filter-info.js';
 
 describe('IsolationModule', () => {
 	let db: Database;
@@ -2508,6 +2509,114 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(bob?.name).to.equal('Bob');
 
 			await sdb.exec('ROLLBACK');
+		});
+	});
+
+	describe('schema-qualified tableName (underlying-advertised)', () => {
+		// Regression: `VirtualTable.tableName` is contracted bare, but an underlying module may
+		// report a schema-qualified name there (lamina-quereus does — it uses the field as a
+		// catalogue/projector lookup key). IsolatedTable used to take its identity from the
+		// underlying's self-reported names, so its overlay keyed as `<dbId>:main.main.widget`
+		// while `underlyingTables` held `main.widget`. The commit flush looks the overlay key up
+		// in `underlyingTables`, missed, hit the `continue`, and dropped every staged row — while
+		// still reporting the commit as successful. Reads on the same connection still merged the
+		// overlay, so the loss was invisible until something else read the storage.
+
+		type UnderlyingTable = Awaited<ReturnType<MemoryTableModule['create']>>;
+
+		/** Wraps a MemoryTable so it self-reports a schema-qualified `tableName`. Every other
+		 *  member forwards to the real table (bound to it, so private fields resolve). */
+		function qualify(table: UnderlyingTable): UnderlyingTable {
+			return new Proxy(table, {
+				get(target, prop) {
+					if (prop === 'tableName') return `${target.schemaName}.${target.tableName}`;
+					const value = Reflect.get(target, prop, target);
+					return typeof value === 'function' ? value.bind(target) : value;
+				},
+			});
+		}
+
+		/** Underlying module whose tables report a qualified `tableName`. Keeps the RAW tables so
+		 *  a test can read storage directly, bypassing the isolation layer's overlay merge. */
+		class QualifiedNameMemoryModule extends MemoryTableModule {
+			/** Raw (un-proxied) tables, keyed `<schema>.<table>`. Named `rawTables` because the
+			 *  base class already owns `tables` (its manager registry). */
+			readonly rawTables = new Map<string, UnderlyingTable>();
+
+			private track(table: UnderlyingTable): UnderlyingTable {
+				this.rawTables.set(`${table.schemaName}.${table.tableName}`.toLowerCase(), table);
+				return qualify(table);
+			}
+			override async create(...args: Parameters<MemoryTableModule['create']>): Promise<UnderlyingTable> {
+				return this.track(await super.create(...args));
+			}
+			override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<UnderlyingTable> {
+				return this.track(await super.connect(...args));
+			}
+		}
+
+		let qdb: Database;
+		let underlyingModule: QualifiedNameMemoryModule;
+
+		beforeEach(() => {
+			qdb = new Database();
+			underlyingModule = new QualifiedNameMemoryModule();
+			qdb.registerModule('isolated', new IsolationModule({ underlying: underlyingModule }));
+		});
+
+		/** Reads the raw underlying storage, bypassing IsolatedTable entirely. */
+		async function readUnderlying(qualifiedName: string): Promise<Row[]> {
+			const table = underlyingModule.rawTables.get(qualifiedName);
+			expect(table, `underlying table '${qualifiedName}' was created`).to.not.be.undefined;
+			return await asyncIterableToArray(table!.query!(makeFullScanFilterInfo()));
+		}
+
+		it('an autocommitted insert reaches the underlying storage', async () => {
+			await qdb.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await qdb.exec(`INSERT INTO widget VALUES (1, 'a')`);
+
+			// Through the isolation layer (overlay merge) — passed even before the fix.
+			const viaIso = await asyncIterableToArray(qdb.eval(`SELECT id, name FROM widget`));
+			expect(viaIso.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'a']]);
+
+			// Through the underlying — where the row must actually be. 0 rows before the fix.
+			expect(await readUnderlying('main.widget'), 'row reached the underlying storage')
+				.to.deep.equal([[1, 'a']]);
+		});
+
+		it('an explicit COMMIT flushes inserts, updates and deletes to the underlying storage', async () => {
+			await qdb.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+			await qdb.exec(`INSERT INTO widget VALUES (1, 'a'), (2, 'b')`);
+
+			await qdb.exec('BEGIN');
+			await qdb.exec(`INSERT INTO widget VALUES (3, 'c')`);
+			await qdb.exec(`UPDATE widget SET name = 'b2' WHERE id = 2`);
+			await qdb.exec(`DELETE FROM widget WHERE id = 1`);
+			await qdb.exec('COMMIT');
+
+			expect(await readUnderlying('main.widget')).to.deep.equal([[2, 'b2'], [3, 'c']]);
+		});
+
+		it('a ROLLBACK still discards staged rows from the underlying storage', async () => {
+			await qdb.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+
+			await qdb.exec('BEGIN');
+			await qdb.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await qdb.exec('ROLLBACK');
+
+			expect(await readUnderlying('main.widget')).to.deep.equal([]);
+		});
+
+		it('the isolated table exposes the bare connect-time tableName, not the underlying qualified one', async () => {
+			await qdb.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+
+			const isolationModule = new IsolationModule({ underlying: underlyingModule });
+			const isolated = await isolationModule.connect(
+				qdb, null, 'isolated', 'main', 'widget', {} as BaseModuleConfig,
+			);
+			expect(isolated).to.be.instanceOf(IsolatedTable);
+			expect(isolated.schemaName).to.equal('main');
+			expect(isolated.tableName).to.equal('widget');
 		});
 	});
 

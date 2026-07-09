@@ -122,6 +122,28 @@ This architecture ensures:
 - Isolation: Other connections don't see uncommitted changes
 - Efficiency: No overlay created for read-only transactions
 
+#### Table identity: the connect-time name is authoritative
+
+Both maps above are keyed on the same `(schemaName, tableName)` pair, and the commit flush
+(`commitConnectionOverlays`) crosses between them: it strips the `dbId:` prefix from an overlay
+key and looks the remainder up in `underlyingTables`. If the two maps ever key the same table
+differently, that lookup misses and the staged rows are dropped — while the commit still reports
+success.
+
+The single identity for a table is therefore the `(schemaName, tableName)` pair passed to
+`IsolationModule.create()` / `.connect()`, threaded into `IsolatedTable`'s constructor and used
+for every keyed lookup it performs (overlay, pre-overlay savepoints, in-flight build coalescing,
+the registered connection's qualified name).
+
+`IsolatedTable` must **never** take its identity from `underlyingTable.schemaName` /
+`.tableName`. `VirtualTable.tableName` is contracted bare (see `packages/quereus/src/vtab/table.ts`),
+but an underlying module may violate that and report a schema-qualified name — `lamina-quereus`
+does, using the field as a catalogue lookup key. Keying off the connect-time pair makes the two
+maps agree by construction, whatever the underlying self-reports.
+
+The same reasoning rules out keying off `underlyingTable.tableSchema` — that field is documented
+as possibly populated lazily by the underlying module, so it may be absent at construction time.
+
 ---
 
 ## Isolation Level Provided

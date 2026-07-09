@@ -51,7 +51,15 @@ export interface UpdateArgs {
 export abstract class VirtualTable {
 	public readonly module: AnyVirtualTableModule;
 	public readonly db: Database;
+	/**
+	 * The **bare** table name — never schema-qualified. The engine composes the qualified
+	 * form itself as `` `${schemaName}.${tableName}` `` (~20 sites: database-events.ts,
+	 * key-filter.ts, alter-table.ts, schema/manager.ts, …), so a module that stores a
+	 * qualified name here doubles the schema in every one of them. Modules needing a
+	 * qualified lookup key must derive it, not overload this field.
+	 */
 	public readonly tableName: string;
+	/** The schema (database) this table lives in, e.g. `main`. */
 	public readonly schemaName: string;
 	public errorMessage?: string;
 	public tableSchema?: TableSchema;
