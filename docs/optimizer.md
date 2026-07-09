@@ -2071,10 +2071,13 @@ The reasoning is implemented by `planner/analysis/sat-checker.ts` — a single-p
 - **Out of scope** (clauses set a per-column `sawUnknown` flag; never produces a false `unsat`):
   - `OR` / `CASE` branch analysis — would require case-decomposition.
   - Cross-column arithmetic (`a + b > 10`), function calls, `LIKE` patterns, `IS NULL` / `IS NOT NULL`, `NOT (...)`, parameter bindings (the runtime value isn't known at plan time).
+  - A value-changing `CAST`, or any `COLLATE` wrapper, on a compared operand. Only a no-op cast (target logical type == the operand's) is unwrapped: erasing `cast(x as integer)` would read `x = '1' and cast(x as integer) = 1` as a cross-storage-class contradiction, and erasing `collate` would compare `x collate nocase = 'a' and x collate nocase = 'A'` under `x`'s own (BINARY) collation. Both predicates are satisfiable; both would fold to empty. (`analysis/constraint-extractor.ts`'s `unwrapCast` carries the same COLLATE reasoning for seek witnesses.)
   - Outer-join `on`-clause contradiction (null padding survives; deferred).
   - Inner-join `on`-clause contradiction — covered by the filter rule whenever `predicate-pushdown` has lowered the predicate onto a Filter, which is the canonical shape. The standalone `on`-clause variant is a tracked follow-up.
 
 The `sawUnknown` flag is **per column**, not global: a LIKE pattern on `b` does not block proving an interval-range contradiction on `a`.
+
+**Collation.** Literal comparisons use the compared column's declared collation, resolved through the owning `Database` (`db.getCollationResolver()`), so `x = 'a' and x = 'A'` is `unsat` on a BINARY column and satisfiable on a `NOCASE` one — including a `NOCASE` the embedder redefined via `db.registerCollation`. Every mentioned column's collation is resolved **once**, before the conjunct loop. If a name cannot be resolved — no resolver was supplied, or the name is not registered (column DDL does not yet validate collation names on non-TEXT types) — the entire check returns `unknown` and the Filter stands. Assuming BINARY there would let a satisfiable predicate be proved `unsat`, silently dropping rows. The same resolver reaches the set-operation write path's per-leg oracle (`planner/mutation/set-op.ts`), where a false `unsat` would skip a leg the incoming row belongs in.
 
 Prereqs in the propagation chain (already landed):
 - `optimizer-check-derived-fds-and-domains` — populates `PhysicalProperties.domainConstraints` from declared CHECK.

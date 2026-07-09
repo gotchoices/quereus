@@ -3,6 +3,7 @@ import type { PlanningContext } from '../planning-context.js';
 import type { Scope } from '../scopes/scope.js';
 import type { ScalarType } from '../../common/datatype.js';
 import type { SqlValue } from '../../common/types.js';
+import type { CollationResolver } from '../../types/logical-type.js';
 import { isRelationalNode, type RelationalPlanNode, type ScalarPlanNode, type ConstantBinding, type DomainConstraint } from '../nodes/plan-node.js';
 import { checkSatisfiability, type SatResult } from '../analysis/sat-checker.js';
 import { splitConjuncts } from '../analysis/predicate-conjuncts.js';
@@ -1681,6 +1682,10 @@ interface FlaglessLeg {
 	readonly attrIndex: (attrId: number) => number | undefined;
 	/** The declared collation of this leg's output column `col`, for the checker. */
 	readonly getCollation: (col: number) => string | undefined;
+	/** Resolves those collation names against the owning database, so a collation registered
+	 *  with `db.registerCollation(...)` is honored rather than silently degraded to BINARY —
+	 *  which could mint a false `unsat` and skip a leg the incoming row belongs in. */
+	readonly collationResolver: CollationResolver;
 }
 
 /** Decompose a flag-less set-op view mutation. Throws a structured diagnostic for unsupported shapes. */
@@ -1813,6 +1818,7 @@ function buildFlaglessLeg(
 		branch, plainPositions, discriminatorPositions, scope, bindings, domains, sigmaConjuncts,
 		attrIndex: (attrId) => attrIdToIndex.get(attrId),
 		getCollation: (col) => legAttrs[col]?.type.collationName,
+		collationResolver: ctx.db.getCollationResolver(),
 	};
 }
 
@@ -1852,7 +1858,10 @@ function legConsistency(ctx: PlanningContext, leg: FlaglessLeg, predicate: AST.E
 	// projected column (`where x < 5`) is invisible to the bindings/domains the leg forwards,
 	// so a supplied value that provably violates it (`x = 7`) only contradicts here ⇒ `unsat`
 	// ⇒ skip the leg (no phantom base row). Non-projected-column conjuncts are inert.
-	return checkSatisfiability([...conjuncts, ...leg.sigmaConjuncts], leg.domains, leg.bindings, leg.attrIndex, leg.getCollation);
+	return checkSatisfiability(
+		[...conjuncts, ...leg.sigmaConjuncts], leg.domains, leg.bindings,
+		leg.attrIndex, leg.getCollation, leg.collationResolver,
+	);
 }
 
 // --- flag-less INSERT (route to the consistent legs) ----------------------

@@ -12,6 +12,8 @@
 
 import type { SchemaManager } from '../schema/manager.js';
 import type { SqlValue, Row } from '../common/types.js';
+import type { CollationFunction, CollationResolver } from '../types/logical-type.js';
+import type { PrimaryKeyColumnDefinition } from '../schema/table.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
 import type { MaintenanceSourceStats, MaintenanceStrategy } from '../planner/cost/index.js';
@@ -37,6 +39,13 @@ export interface MaterializedViewManagerContext {
 	 *  {@link MaintenanceCollisionEvent}s here. Already exposed for the transaction
 	 *  manager; reused narrowly. */
 	getEventEmitter(): DatabaseEventEmitter;
+
+	/** Name→function collation lookup against the owning database's registry (throws on an
+	 *  unregistered name). Every collation-aware comparison the manager makes — key identity,
+	 *  UNIQUE self-conflict, coarsening-collision divergence — resolves through this, so a
+	 *  collation registered with `db.registerCollation(...)` is honored instead of silently
+	 *  degrading to byte comparison. */
+	getCollationResolver(): CollationResolver;
 
 	_buildPlan(statements: AST.Statement[]): import('./database.js').BuildPlanResult;
 	_findTable(tableName: string, schemaName?: string): ReturnType<Database['_findTable']>;
@@ -67,6 +76,20 @@ export type MaintenancePlan =
 	| JoinResidualPlan;
 
 /**
+ * One backing primary-key column as a {@link MaintenancePlan} sees it: the btree's declared
+ * `(index, direction, collation-name)` triple plus the collation *function* the name resolves
+ * to, resolved once when the plan is built (`resolveBackingPkColumns`).
+ *
+ * The name stays for logging and plan equality; the function is what the per-row key
+ * comparisons in `database-materialized-views-apply.ts` call, so they never pay a registry
+ * lookup — nor silently fall back to byte comparison — per row.
+ */
+export interface BackingPkColumn extends PrimaryKeyColumnDefinition {
+	/** Resolved comparator for {@link collation}; BINARY when the column declares no COLLATE. */
+	readonly collationFn: CollationFunction;
+}
+
+/**
  * Structural subset of the fields the forward (driving-source) residual-recompute
  * apply path reads — shared by the aggregate {@link ResidualRecomputePlan} and the
  * 1:1-join {@link JoinResidualPlan} so both drive {@link MaterializedViewManager.applyForwardResidual}
@@ -83,7 +106,7 @@ export interface ForwardResidualPlan {
 	bindParamPrefix: 'gk' | 'pk';
 	/** Source-column indices of the forward binding key (group columns / `T`'s PK columns). */
 	bindColumns: number[];
-	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	backingPkDefinition: ReadonlyArray<BackingPkColumn>;
 	backingPkSourceCols: number[];
 }
 
@@ -116,6 +139,8 @@ export interface CoarseningWatchColumn {
 	readonly index: number;
 	/** Source key enforcement collation (pre-coarsening); the divergence test compares under it. */
 	readonly sourceCollation: string;
+	/** {@link sourceCollation} resolved against the database registry, once at registration. */
+	readonly sourceCollationFn: CollationFunction;
 	/** Output (coarsened) collation the backing key enforces. */
 	readonly outputCollation: string;
 	/** Backing/output column name (for the event payload's `weakenedColumns`). */
@@ -162,7 +187,7 @@ export interface MaintenancePlanCommon {
 export interface InverseProjectionPlan extends MaintenancePlanCommon {
 	readonly kind: 'inverse-projection';
 	/** Backing-table physical primary-key definition (the column order the btree keys on). */
-	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	backingPkDefinition: ReadonlyArray<BackingPkColumn>;
 	/** `projectors[j]` derives backing output column `j` from the changed source row —
 	 *  either a passthrough copy of a source column or a deterministic scalar expression
 	 *  over the source row. Every PK / backing-key column is `'passthrough'` (eligibility
@@ -244,7 +269,7 @@ export interface ResidualRecomputePlan extends MaintenancePlanCommon {
 	 *  affected key tuple is `bindColumns.map(c => changedRow[c])`, bound to `${prefix}{i}`. */
 	bindColumns: number[];
 	/** Backing-table physical primary-key definition (the column order the btree keys on). */
-	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	backingPkDefinition: ReadonlyArray<BackingPkColumn>;
 	/** Source column projected (passthrough) into each backing-PK column, in
 	 *  `backingPkDefinition` order. The old backing slice's delete key for a changed row
 	 *  `R` is `buildPrimaryKeyFromValues(backingPkSourceCols.map(sc => R[sc]), backingPkDefinition)`. */
@@ -291,7 +316,7 @@ export interface PrefixDeletePlan extends MaintenancePlanCommon {
 	 *  `bindColumns.map(c => changedRow[c])`, bound to `pk{i}`. */
 	bindColumns: number[];
 	/** Full backing-table physical primary key (base-PK prefix ++ TVF-key tail). */
-	backingPkDefinition: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>;
+	backingPkDefinition: ReadonlyArray<BackingPkColumn>;
 	/** Number of leading backing-PK columns that form the base-PK prefix (= `bindColumns.length`). */
 	basePrefixLength: number;
 	/** Source-`T` column projected into each leading (base-prefix) backing-PK column, in

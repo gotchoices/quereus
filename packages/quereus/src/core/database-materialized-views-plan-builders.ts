@@ -66,11 +66,36 @@ import type {
 	MaintenancePlan,
 	FullRebuildPlan,
 	BackingProjector,
+	BackingPkColumn,
 } from './database-materialized-views-plans.js';
+import type { CollationResolver } from '../types/logical-type.js';
+import { BINARY_COLLATION } from '../util/comparison.js';
 
 /** Fallback source row estimate when the StatsProvider has no count (mirrors the
  *  optimizer's naive default). Only feeds the create-time maintenance cost gate. */
 const DEFAULT_SOURCE_ROWS = 1000;
+
+/**
+ * Snapshot a backing table's physical primary key as the maintenance plans consume it: the
+ * declared `(index, desc, collation)` triple plus the collation comparator that name resolves
+ * to on this database. Every arm builds its `backingPkDefinition` through here, so the per-row
+ * key comparisons in `database-materialized-views-apply.ts` never do a registry lookup — and
+ * never silently degrade a custom collation to byte order.
+ *
+ * NOTE: this freezes the comparator into the plan. Re-registering a collation name with
+ * `db.registerCollation(...)` after the plan was built leaves the plan on the old comparator
+ * until the MV is re-registered — which any schema change does, but a bare `registerCollation`
+ * does not. Same exposure as index comparators, which resolve once at table open; if that ever
+ * needs fixing, fix it for both.
+ */
+function resolveBackingPkColumns(backing: TableSchema, resolver: CollationResolver): BackingPkColumn[] {
+	return backing.primaryKeyDefinition.map(d => ({
+		index: d.index,
+		desc: d.desc,
+		collation: d.collation,
+		collationFn: d.collation ? resolver(d.collation) : BINARY_COLLATION,
+	}));
+}
 
 /**
  * Build the row-time maintenance plan for an MV — **cost-gated, with a floor, never a
@@ -309,7 +334,7 @@ export function buildInverseProjectionPlan(
 		if (!passthroughSourceCols.has(pk)) return null; // PK not passthrough-projected → floor
 	}
 
-	const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+	const backingPkDefinition = resolveBackingPkColumns(backing, ctx.getCollationResolver());
 
 	// A computed column may never land in the backing primary key: the btree keys on
 	// it and `lookupCoveringConflicts` recovers the source PK from it, both of which
@@ -443,7 +468,7 @@ export function buildAggregateResidualPlan(
 			StatusCode.INTERNAL,
 		);
 	}
-	const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+	const backingPkDefinition = resolveBackingPkColumns(backing, ctx.getCollationResolver());
 
 	// Map each backing-PK column back to the source group column it projects, so a
 	// changed row's old backing-slice delete key can be built. Every backing-PK column
@@ -546,7 +571,7 @@ export function buildJoinResidualPlan(
 			StatusCode.INTERNAL,
 		);
 	}
-	const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+	const backingPkDefinition = resolveBackingPkColumns(backing, ctx.getCollationResolver());
 
 	const rootAttrs = relationalAttributes(analyzed);
 	if (!rootAttrs) return null;
@@ -973,7 +998,7 @@ export function buildLateralTvfPrefixDeletePlan(
 			StatusCode.INTERNAL,
 		);
 	}
-	const backingPkDefinition = backing.primaryKeyDefinition.map(d => ({ index: d.index, desc: d.desc, collation: d.collation }));
+	const backingPkDefinition = resolveBackingPkColumns(backing, ctx.getCollationResolver());
 
 	// Map each output attribute to a base-T source column (or `undefined` for a TVF
 	// output column). T's attributes pass through the join unchanged, so a base-PK

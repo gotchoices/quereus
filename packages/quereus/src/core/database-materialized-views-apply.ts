@@ -22,7 +22,7 @@ import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
 import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import type { BackingHost, BackingRowChange, MaintenanceOp } from '../vtab/backing-host.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
-import { compareSqlValues, rowsValueIdentical } from '../util/comparison.js';
+import { compareSqlValuesFast, rowsValueIdentical } from '../util/comparison.js';
 import type { TableSchema } from '../schema/table.js';
 import type { Database } from './database.js';
 import { canonKeyValues } from './database-materialized-views-analysis.js';
@@ -34,6 +34,7 @@ import type {
 	JoinResidualPlan,
 	PrefixDeletePlan,
 	BackingConnectionCache,
+	BackingPkColumn,
 } from './database-materialized-views-plans.js';
 
 /**
@@ -399,7 +400,7 @@ export async function applyForwardResidual(
 export function residualRowMatchesKey(plan: ForwardResidualPlan, row: Row, keyVals: readonly SqlValue[]): boolean {
 	for (let i = 0; i < plan.backingPkDefinition.length; i++) {
 		const d = plan.backingPkDefinition[i];
-		if (compareSqlValues(row[d.index], keyVals[i], d.collation) !== 0) return false;
+		if (compareSqlValuesFast(row[d.index], keyVals[i], d.collationFn) !== 0) return false;
 	}
 	return true;
 }
@@ -622,12 +623,12 @@ export async function applyPrefixDelete(
  * recomputed row that replaces it in {@link applyPrefixDelete}'s keyed diff.
  */
 export function backingPkEqual(
-	pkDef: ReadonlyArray<{ index: number; desc?: boolean; collation?: string }>,
+	pkDef: ReadonlyArray<BackingPkColumn>,
 	a: Row,
 	b: Row,
 ): boolean {
 	for (const d of pkDef) {
-		if (compareSqlValues(a[d.index], b[d.index], d.collation) !== 0) return false;
+		if (compareSqlValuesFast(a[d.index], b[d.index], d.collationFn) !== 0) return false;
 	}
 	return true;
 }
@@ -641,7 +642,7 @@ export function backingPkEqual(
 export function residualRowMatchesBasePrefix(plan: PrefixDeletePlan, row: Row, prefixVals: readonly SqlValue[]): boolean {
 	for (let i = 0; i < plan.basePrefixLength; i++) {
 		const d = plan.backingPkDefinition[i];
-		if (compareSqlValues(row[d.index], prefixVals[i], d.collation) !== 0) return false;
+		if (compareSqlValuesFast(row[d.index], prefixVals[i], d.collationFn) !== 0) return false;
 	}
 	return true;
 }

@@ -47,7 +47,7 @@ import { buildSourceUnionScope } from '../planner/analysis/change-scope.js';
 import { isBodyIrrelevantTableChange, tryRecompileMaterializedViewLive } from '../runtime/emit/materialized-view-helpers.js';
 import { buildDerivedRowValidator, makePoisonedDerivedRowValidator } from './derived-row-validator.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
-import { compareSqlValues } from '../util/comparison.js';
+import { compareSqlValuesFast, resolveCollationFunctions } from '../util/comparison.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import { coveringMvHonorsIndexCollation } from '../schema/unique-enforcement.js';
@@ -475,6 +475,7 @@ export class MaterializedViewManager {
 	private buildCoarseningWatch(mv: MaintainedTableSchema): ReadonlyArray<CoarseningWatchColumn> | undefined {
 		const coarsened = mv.derivation.coarsenedKey;
 		if (!coarsened || coarsened.weakened.length === 0) return undefined;
+		const resolver = this.ctx.getCollationResolver();
 		const watch: CoarseningWatchColumn[] = [];
 		for (const w of coarsened.weakened) {
 			const index = mv.columnIndexMap.get(w.column.toLowerCase());
@@ -488,6 +489,7 @@ export class MaterializedViewManager {
 			watch.push({
 				index,
 				sourceCollation: w.sourceCollation,
+				sourceCollationFn: resolver(w.sourceCollation),
 				outputCollation: w.outputCollation,
 				column: w.column,
 			});
@@ -535,7 +537,7 @@ export class MaterializedViewManager {
 			if (change.op !== 'update') continue;
 			const weakenedColumns: string[] = [];
 			for (const w of watch) {
-				if (compareSqlValues(change.oldRow[w.index], change.newRow[w.index], w.sourceCollation) !== 0) {
+				if (compareSqlValuesFast(change.oldRow[w.index], change.newRow[w.index], w.sourceCollationFn) !== 0) {
 					weakenedColumns.push(w.column);
 				}
 			}
@@ -1008,6 +1010,16 @@ export class MaterializedViewManager {
 		const host = backingHost(this.ctx, backing);
 		const connection = await getBackingConnection(this.ctx, host, `${plan.backingSchema}.${plan.backingTableName}`);
 
+		// Both comparisons below run per scanned backing row, so resolve the enforcement
+		// collations once here. They are the **source** column's collations — the UC's own
+		// enforcement collation and the source PK's — which may be coarser or finer than the
+		// backing column's; see `uniqueEnforcementCollations` for the same name selection.
+		const resolver = this.ctx.getCollationResolver();
+		const ucCollationFns = resolveCollationFunctions(
+			resolver, uc.columns.map(c => sourceSchema.columns[c]?.collation));
+		const pkCollationFns = resolveCollationFunctions(
+			resolver, pkDef.map(d => d.collation));
+
 		const conflicts: Array<{ pk: SqlValue[]; row?: Row }> = [];
 		// Fast path: a backing-PK prefix scan keyed on `newRow`'s UC values. The
 		// covering-index shape guarantees the leading backing-PK columns are the UC
@@ -1022,8 +1034,7 @@ export class MaterializedViewManager {
 		for await (const backingRow of host.scanEffective(connection, { equalityPrefix })) {
 			let match = true;
 			for (let k = 0; k < uc.columns.length; k++) {
-				const coll = sourceSchema.columns[uc.columns[k]]?.collation;
-				if (compareSqlValues(newRow[uc.columns[k]], backingRow[ucBackingCols[k]], coll) !== 0) {
+				if (compareSqlValuesFast(newRow[uc.columns[k]], backingRow[ucBackingCols[k]], ucCollationFns[k]) !== 0) {
 					match = false;
 					break;
 				}
@@ -1034,7 +1045,7 @@ export class MaterializedViewManager {
 			// Exclude the row currently being written (its own source PK).
 			let isSelf = sourcePk.length === newSourcePk.length;
 			for (let i = 0; isSelf && i < sourcePk.length; i++) {
-				if (compareSqlValues(sourcePk[i], newSourcePk[i], pkDef[i]?.collation) !== 0) isSelf = false;
+				if (compareSqlValuesFast(sourcePk[i], newSourcePk[i], pkCollationFns[i]) !== 0) isSelf = false;
 			}
 			if (isSelf) continue;
 

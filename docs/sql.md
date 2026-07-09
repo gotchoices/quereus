@@ -2536,7 +2536,19 @@ collation names against the connection that owns the table, so a replaced `NOCAS
 that table's keys sort and which values collide. The same now holds for the persistent
 key-value store tables (`@quereus/store`) and the transaction-isolation overlay
 (`@quereus/isolation`): pushed-constraint re-checks, `UNIQUE` conflict detection, and the
-overlay/underlying merge comparator all resolve through the owning connection.
+overlay/underlying merge comparator all resolve through the owning connection. So do
+materialized-view maintenance (backing-key identity, `UNIQUE` self-conflict resolution through a
+covering view, coarsening-collision telemetry) and the optimizer's contradiction check — the
+latter declines to prove a predicate unsatisfiable at all when it cannot resolve a column's
+collation, rather than assuming byte order and dropping rows.
+
+**Grouping caveat — hash keys.** `GROUP BY`, window `PARTITION BY`, the hash-join Bloom filter,
+and `AS OF` partitioning group rows by a normalized *string* form of each key value, produced by a
+lookup that knows only `BINARY`, `NOCASE`, and `RTRIM` with their built-in meanings; any other
+name — and any redefinition of those three — falls back to grouping by raw bytes. So on a column
+carrying a custom collation, `where`, `order by`, and `distinct` agree with the connection's
+comparator while `group by` does not. Until that is fixed, treat `GROUP BY` / `PARTITION BY` over
+such a column as byte-grouped.
 
 **Store caveat — physical key bytes.** The store encodes each text key into a sort-preserving
 byte string through a *separate* encoder registry that knows only `BINARY`, `NOCASE`, and
