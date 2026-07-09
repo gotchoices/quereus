@@ -57,8 +57,17 @@ function asIntegerLiteral(node: ScalarPlanNode): { expr: AST.LiteralExpr; value:
 }
 
 /** True for a `cast(x as T)` whose target logical type equals the operand's (a value-preserving no-op).
- *  Exported for the coarsened-key derivation (`coarsened-key.ts`), whose value-preserving
- *  unwrap must agree with this registry's passthrough classification. */
+ *  Exported as the single definition of "value-preserving cast" for every analysis whose unwrap
+ *  discards the wrapper — `coarsened-key.ts`, `sat-checker.ts` and `constraint-extractor.ts` —
+ *  so all of them agree with this registry's passthrough classification.
+ *
+ *  NOTE: logical types compare by identity (registry singletons). A plugin-registered type that
+ *  duplicates a builtin's name as a distinct object would read as *converting*, costing pushdown
+ *  but never soundness. If duplicate-name types become common, compare by name instead.
+ *
+ *  NOTE: "no-op" holds only because stored values are coerced to their column's declared type on
+ *  write, so a TEXT column never holds a number. If Quereus ever adopts SQLite-style loose column
+ *  typing, `cast(x as text)` stops being value-preserving and every caller here becomes unsound. */
 export function isNoOpCast(node: CastNode): boolean {
 	return node.operand.getType().logicalType === node.getType().logicalType;
 }

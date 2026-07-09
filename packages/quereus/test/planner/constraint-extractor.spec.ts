@@ -1471,6 +1471,72 @@ describe('Constraint Extractor — Mutation Killing Tests', () => {
 			expect(result.allConstraints[0].op).to.equal('IN');
 			expect(result.allConstraints[0].value).to.deep.equal([1, 2]);
 		});
+
+		// A converting cast on the column side no longer makes that column the
+		// constrained one. When the *other* side is a bare column of another
+		// table, the constraint rebinds to it: `u.y = cast(t.a as text)` is a
+		// sound correlated seek on `u`, with the cast evaluated at runtime.
+		it('converting CAST(t.a) = u.y → constraint binds to u.y, cast kept in valueExpr', () => {
+			const a = colRef(101, 'a', 1);
+			const y = colRef(201, 'y', 1);
+			const cast = castNode(a, 'TEXT');
+			const expr = binOp('=', cast, y);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			expect(result.allConstraints).to.have.length(1);
+			const c = result.allConstraints[0];
+			expect(c.targetRelation).to.equal('u');
+			expect(c.attributeId).to.equal(201);
+			expect(c.op).to.equal('=');
+			expect(c.bindingKind).to.equal('correlated');
+			expect(c.correlated).to.equal(true);
+			expect(c.valueExpr).to.equal(cast);
+		});
+
+		// Same-table on both sides: the value is unknown until the row is
+		// scanned, so no seek key exists either way.
+		it('converting CAST(t.a) = t.b → no constraint, residual predicate', () => {
+			const a = colRef(101, 'a', 1);
+			const b = colRef(102, 'b', 2);
+			const expr = binOp('=', castNode(a, 'TEXT'), b);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		// Value side is the cast: the column side is untouched, so the seek on
+		// `t.a` survives and evaluates the cast per outer row.
+		it('t.a = converting CAST(u.y) → correlated constraint on t.a, cast kept in valueExpr', () => {
+			const a = colRef(101, 'a', 1);
+			const y = colRef(201, 'y', 1);
+			const cast = castNode(y, 'TEXT');
+			const expr = binOp('=', a, cast);
+			const result = extractConstraints(expr, [TABLE_A, TABLE_B]);
+			const c = result.allConstraints.find(x => x.targetRelation === 't')!;
+			expect(c).to.exist;
+			expect(c.attributeId).to.equal(101);
+			expect(c.bindingKind).to.equal('correlated');
+			expect(c.valueExpr).to.equal(cast);
+		});
+
+		// IN list elements go through `getLiteralValue`, which returns the
+		// pre-cast value — so a converting cast in the list must decline rather
+		// than extract `a IN (1)` for `a IN (cast(1 as text))`.
+		it('col IN (converting CAST(lit)) → no constraint, residual predicate', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = inNode(col, [castNode(lit(1), 'TEXT')]);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(0);
+			expect(result.residualPredicate).to.exist;
+		});
+
+		it('col IN (no-op CAST(lit)) → extracts with the literal value', () => {
+			const col = colRef(101, 'a', 1);
+			const expr = inNode(col, [castNode(lit(1), 'REAL')]);
+			const result = extractConstraints(expr, [TABLE_A]);
+			expect(result.allConstraints).to.have.length(1);
+			expect(result.allConstraints[0].op).to.equal('IN');
+			expect(result.allConstraints[0].value).to.deep.equal([1]);
+		});
 	});
 
 	// ===================================================================
