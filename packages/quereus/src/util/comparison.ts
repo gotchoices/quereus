@@ -2,7 +2,7 @@ import type { Row, SqlValue } from '../common/types.js';
 import type { JSONValue } from '../common/json-types.js';
 import { canonicalJsonString } from './json-canonical.js';
 import { createLogger } from '../common/logger.js';
-import type { LogicalType, CollationFunction } from '../types/logical-type.js';
+import type { LogicalType, CollationFunction, CollationResolver } from '../types/logical-type.js';
 import { StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 
@@ -317,6 +317,23 @@ export function rowsValueIdentical(a: readonly SqlValue[], b: readonly SqlValue[
  */
 export function sqlValueIdentical(a: SqlValue, b: SqlValue): boolean {
 	return compareSqlValuesFast(a, b, BINARY_COLLATION) === 0;
+}
+
+/**
+ * Batch name→function resolution for a list of declared collation names, as
+ * produced by {@link uniqueEnforcementCollations} or a primary-key definition.
+ * An `undefined` entry means "no COLLATE was declared" and resolves to BINARY.
+ *
+ * Call this ONCE per comparator / per constraint check, above any row loop: the
+ * resolver throws on an unregistered name and is not inlinable, so a per-row
+ * call is pure overhead. Do not hold the returned functions across a
+ * `registerCollation` call — re-resolve instead.
+ */
+export function resolveCollationFunctions(
+	resolver: CollationResolver,
+	names: readonly (string | undefined)[],
+): CollationFunction[] {
+	return names.map(name => (name ? resolver(name) : BINARY_COLLATION));
 }
 
 /**

@@ -76,6 +76,7 @@ export {
 	getCollation,
 	resolveCollation,
 	builtinCollationResolver,
+	resolveCollationFunctions,
 	// Core comparison functions (critical for module implementations)
 	compareSqlValues,
 	compareSqlValuesFast,

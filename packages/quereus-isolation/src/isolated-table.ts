@@ -1,5 +1,5 @@
-import type { Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, uniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
+import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, uniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
@@ -64,6 +64,26 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private readonly predicateCache: WeakMap<UniqueConstraintSchema, CompiledPredicate> = new WeakMap();
 
 	/**
+	 * `db.getCollationResolver()`, bound once at connect. Both the overlay/underlying
+	 * merge comparators and the UNIQUE conflict checks resolve collation names through
+	 * it, so a collation registered with `db.registerCollation` participates instead of
+	 * silently degrading to BINARY.
+	 *
+	 * The overlay's key comparator and the underlying table's must agree, or a staged
+	 * row fails to shadow the base row it replaces; both now derive from this one
+	 * database registry.
+	 */
+	private readonly collationResolver: CollationResolver;
+
+	/**
+	 * Per-PK-column comparison functions, resolved from the PK columns' declared
+	 * collations and memoized against the `TableSchema` object identity — an
+	 * `alter table` hands this instance a fresh (frozen) schema object, which
+	 * invalidates the entry.
+	 */
+	private pkCollationCache?: { schema: TableSchema; functions: CollationFunction[] };
+
+	/**
 	 * Returns the connection-scoped set of savepoint depths that pre-date the overlay.
 	 * Stored in IsolationModule (keyed by db+schema+table) so all IsolatedTable instances
 	 * for the same connection see the same set — important because each statement creates
@@ -107,6 +127,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		this.isolationModule = module;
 		this.underlyingTable = underlyingTable;
 		this.readCommitted = readCommitted;
+		this.collationResolver = db.getCollationResolver();
 		// Schema comes from underlying - may be populated lazily by the underlying module
 		this.tableSchema = underlyingTable.tableSchema;
 	}
@@ -681,6 +702,30 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
+	 * Per-PK-column comparison functions for this table's current schema, resolved
+	 * against THIS database's collation registry (so `db.registerCollation` names
+	 * participate) rather than the process-global built-in trio.
+	 *
+	 * A PK column with no declared `COLLATE` resolves to BINARY; a PK definition
+	 * shorter than the key being compared (or absent entirely) yields BINARY for the
+	 * trailing positions, matching the prior `collation === undefined` behaviour.
+	 *
+	 * Memoized on the schema object so comparator construction — and the per-call
+	 * {@link keysEqual} — never re-resolves per row. Resolution is not retroactive: a
+	 * collation registered *after* a comparator was built is not picked up, the same
+	 * contract `Database.registerCollation` documents engine-wide.
+	 */
+	private getPkCollations(): CollationFunction[] {
+		const schema = this.tableSchema;
+		if (!schema) return [];
+		if (this.pkCollationCache?.schema !== schema) {
+			const names = (schema.primaryKeyDefinition ?? []).map(pk => schema.columns[pk.index]?.collation);
+			this.pkCollationCache = { schema, functions: resolveCollationFunctions(this.collationResolver, names) };
+		}
+		return this.pkCollationCache.functions;
+	}
+
+	/**
 	 * Gets the primary key comparator, preferring the underlying table's comparator.
 	 */
 	private getComparePK(): (a: SqlValue[], b: SqlValue[]) => number {
@@ -695,11 +740,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// rows collation-aware. A binary comparator would treat a case-only-updated
 		// overlay row ('APPLE') and the underlying row it shadows ('apple') as distinct
 		// keys, surfacing BOTH in a scan instead of the overlay shadowing the underlying.
-		const pkDef = this.tableSchema?.primaryKeyDefinition;
+		const collations = this.getPkCollations();
 		return (a: SqlValue[], b: SqlValue[]) => {
 			for (let i = 0; i < a.length; i++) {
-				const collation = pkDef ? this.tableSchema!.columns[pkDef[i].index].collation : undefined;
-				const cmp = compareSqlValues(a[i], b[i], collation);
+				const cmp = compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
 				if (cmp !== 0) return cmp;
 			}
 			return 0;
@@ -1118,10 +1162,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// rewrite ('apple' → 'APPLE') is the SAME logical key. A binary comparison here
 		// would mis-classify it as a PK relocation, then resolve the "new" key back to the
 		// same physical underlying row and raise a false UNIQUE PK conflict.
-		const pkDef = this.tableSchema?.primaryKeyDefinition;
+		const collations = this.getPkCollations();
 		for (let i = 0; i < a.length; i++) {
-			const collation = pkDef ? this.tableSchema!.columns[pkDef[i].index].collation : undefined;
-			if (compareSqlValues(a[i], b[i], collation) !== 0) return false;
+			if (compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION) !== 0) return false;
 		}
 		return true;
 	}
@@ -1245,7 +1288,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const constrainedCols = uc.columns;
 		// One comparison collation per constrained column — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
-		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
+		// Resolved once, above the candidate scan.
+		const collations = resolveCollationFunctions(
+			this.collationResolver,
+			uniqueEnforcementCollations(this.tableSchema!, uc),
+		);
 
 		for await (const underlyingRow of this.underlyingTable.query(this.createFullScanFilterInfo())) {
 			const pk = pkIndices.map(i => underlyingRow[i]);
@@ -1270,7 +1317,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				// column collation), so a UNIQUE over a collated column is enforced
 				// against committed rows through the isolation merge path
 				// (unique-constraint-honors-column-collation / store-index-derived-unique).
-				return compareSqlValues(newRow[idx], mergedRow[idx], collations[i]) === 0;
+				return compareSqlValuesFast(newRow[idx], mergedRow[idx], collations[i]) === 0;
 			});
 			if (!matches) continue;
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.

@@ -17,6 +17,9 @@ import {
 	QuereusError,
 	StatusCode,
 	compareSqlValues,
+	compareSqlValuesFast,
+	resolveCollationFunctions,
+	BINARY_COLLATION,
 	rowsValueIdentical,
 	validateAndParse,
 	compilePredicate,
@@ -25,6 +28,8 @@ import {
 	PhysicalType,
 	type Database,
 	type DatabaseInternal,
+	type CollationFunction,
+	type CollationResolver,
 	type ColumnSchema,
 	type MaintainedTableSchema,
 	type TableSchema,
@@ -255,6 +260,21 @@ export class StoreTable extends VirtualTable {
 	 * {@link updateSchema} (an ALTER COLUMN SET COLLATE on a PK member changes it).
 	 */
 	protected pkKeyCollations: (string | undefined)[];
+	/**
+	 * `db.getCollationResolver()`, bound once at construction. Every collation-aware
+	 * VALUE comparison this table makes — pushed-constraint re-check, UNIQUE conflict
+	 * detection — resolves names through it, so a collation registered with
+	 * `db.registerCollation` on *this* connection is honored rather than silently
+	 * degraded to BINARY by the process-global built-in registry.
+	 *
+	 * Only the resolver closure is cached: it reads the live registry, so a collation
+	 * registered after connect is still visible. Resolved *functions* are hoisted no
+	 * further than the comparator or constraint check that resolved them.
+	 *
+	 * Distinct from {@link pkKeyCollations}, which names the *encoders* that produce
+	 * physical key bytes — a separate registry (see `encoding.ts`) this does not touch.
+	 */
+	protected readonly collationResolver: CollationResolver;
 	protected ddlSaved = false;
 
 	// Statistics tracking
@@ -289,6 +309,7 @@ export class StoreTable extends VirtualTable {
 		this.tableSchema = tableSchema;
 		this.config = config;
 		this.eventEmitter = eventEmitter;
+		this.collationResolver = db.getCollationResolver();
 		this.encodeOptions = { collation: config.collation || 'NOCASE' };
 		this.pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 		this.pkKeyCollations = resolvePkKeyCollations(
@@ -694,7 +715,7 @@ export class StoreTable extends VirtualTable {
 
 		if (pkAccess.type === 'point') {
 			const row = await this.readLiveRowByPk(pkAccess.values!);
-			if (row && this.matchesFilters(row, filterInfo)) {
+			if (row && this.matchesFilters(row, filterInfo, this.resolveFilterCollations(filterInfo))) {
 				yield row;
 			}
 			return;
@@ -717,10 +738,11 @@ export class StoreTable extends VirtualTable {
 		}
 
 		// Full table scan
+		const collations = this.resolveFilterCollations(filterInfo);
 		const bounds = buildFullScanBounds();
 		for await (const entry of this.iterateEffective(store, bounds)) {
 			const row = deserializeRow(entry.value);
-			if (this.matchesFilters(row, filterInfo)) {
+			if (this.matchesFilters(row, filterInfo, collations)) {
 				yield row;
 			}
 		}
@@ -916,10 +938,11 @@ export class StoreTable extends VirtualTable {
 		access: PKAccessPattern,
 		filterInfo: FilterInfo
 	): AsyncIterable<Row> {
+		const collations = this.resolveFilterCollations(filterInfo);
 		const bounds = this.buildPKRangeBounds(access);
 		for await (const entry of this.iterateEffective(store, bounds)) {
 			const row = deserializeRow(entry.value);
-			if (this.matchesFilters(row, filterInfo)) {
+			if (this.matchesFilters(row, filterInfo, collations)) {
 				yield row;
 			}
 		}
@@ -1094,7 +1117,7 @@ export class StoreTable extends VirtualTable {
 		// matchesFilters): the planner dropped the residual based on the index
 		// column's collation, which an explicit index `COLLATE` can make differ from
 		// the table column's declared collation.
-		const indexCollations = this.indexColumnCollations(access.index);
+		const indexCollations = this.resolveFilterCollations(filterInfo, this.indexColumnCollations(access.index));
 		for await (const entry of this.iterateEffective(indexStore, access.bounds)) {
 			// NOTE: a legacy index store (written before index values carried the data
 			// key) holds EMPTY values; a zero-length data key is not a row key, so skip
@@ -1135,7 +1158,7 @@ export class StoreTable extends VirtualTable {
 	protected matchesFilters(
 		row: Row,
 		filterInfo: FilterInfo,
-		collationOverride?: ReadonlyMap<number, string | undefined>,
+		collations: ReadonlyMap<number, CollationFunction>,
 	): boolean {
 		if (!filterInfo.constraints || filterInfo.constraints.length === 0) {
 			return true;
@@ -1149,18 +1172,7 @@ export class StoreTable extends VirtualTable {
 
 			const rowValue = row[constraint.iColumn];
 			const filterValue = filterInfo.args[argvIndex - 1];
-			// Compare under the column's DECLARED collation (undefined ⇒ BINARY) — the
-			// same resolution the access path's collation-cover analysis uses
-			// (indexColumnCollationLookup / primaryKeyCollationLookup) when it decides
-			// a pushed constraint is fully covered, and the same source this file's
-			// UNIQUE checks compare under. On a collation MATCH the planner drops the
-			// residual Filter, so this filter alone must reproduce the predicate.
-			// For an index scan the planner's MATCH is against the INDEX column's
-			// collation (which an explicit `COLLATE` on the index can make differ from
-			// the table column's declared collation), so the override supplies it.
-			const collation = collationOverride?.has(constraint.iColumn)
-				? collationOverride.get(constraint.iColumn)
-				: this.tableSchema!.columns[constraint.iColumn]?.collation;
+			const collation = collations.get(constraint.iColumn) ?? BINARY_COLLATION;
 
 			if (!this.compareValues(rowValue, constraint.op, filterValue, collation)) {
 				return false;
@@ -1168,6 +1180,46 @@ export class StoreTable extends VirtualTable {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Resolve, ONCE per scan, the comparison collation function for every pushed
+	 * constraint column, keyed by column index.
+	 *
+	 * The name for a column is its DECLARED collation (absent ⇒ BINARY) — the same
+	 * resolution the access path's collation-cover analysis uses
+	 * (indexColumnCollationLookup / primaryKeyCollationLookup) when it decides a
+	 * pushed constraint is fully covered, and the same source this file's UNIQUE
+	 * checks compare under. On a collation MATCH the planner drops the residual
+	 * Filter, so {@link matchesFilters} alone must reproduce the predicate.
+	 *
+	 * `indexCollationNames` (from {@link indexColumnCollations}) overrides the
+	 * declared name for the secondary-index scan arm: the planner's MATCH there is
+	 * against the INDEX column's collation, which an explicit `COLLATE` on the index
+	 * can make differ from the table column's.
+	 *
+	 * Names resolve against {@link collationResolver}, so an unregistered collation
+	 * raises `no such collation sequence` at scan setup rather than byte-ordering
+	 * every row.
+	 */
+	protected resolveFilterCollations(
+		filterInfo: FilterInfo,
+		indexCollationNames?: ReadonlyMap<number, string | undefined>,
+	): ReadonlyMap<number, CollationFunction> {
+		const resolved = new Map<number, CollationFunction>();
+		if (!filterInfo.constraints) return resolved;
+
+		for (const { constraint, argvIndex } of filterInfo.constraints) {
+			if (constraint.iColumn < 0 || argvIndex <= 0) continue;
+			if (resolved.has(constraint.iColumn)) continue;
+
+			const name = indexCollationNames?.has(constraint.iColumn)
+				? indexCollationNames.get(constraint.iColumn)
+				: this.tableSchema!.columns[constraint.iColumn]?.collation;
+			resolved.set(constraint.iColumn, name ? this.collationResolver(name) : BINARY_COLLATION);
+		}
+
+		return resolved;
 	}
 
 	/**
@@ -1188,20 +1240,20 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
-	 * Compare two values according to an operator, under `collation` (the column's
-	 * declared collation; undefined ⇒ BINARY). Delegates to the engine's
-	 * `compareSqlValues`, so the LT/LE/GT/GE range bounds honour a NOCASE/RTRIM
-	 * column collation rather than a raw BINARY JS comparison — the capability
+	 * Compare two values according to an operator, under `collationFunc` (already
+	 * resolved by {@link resolveFilterCollations} against this database's collation
+	 * registry). So the LT/LE/GT/GE range bounds honour a NOCASE/RTRIM/custom column
+	 * collation rather than a raw BINARY JS comparison — the capability
 	 * `StoreModule.getBestAccessPlan` advertises via `honorsCollatedRangeBounds`.
 	 * NULL on either side fails every operator except EQ-with-both-NULL (the
 	 * internal point-lookup convention; the planner never pushes `= NULL`).
 	 */
-	protected compareValues(a: SqlValue, op: IndexConstraintOp, b: SqlValue, collation?: string): boolean {
+	protected compareValues(a: SqlValue, op: IndexConstraintOp, b: SqlValue, collationFunc: CollationFunction): boolean {
 		if (a === null || b === null) {
 			return op === IndexConstraintOp.EQ ? a === b : false;
 		}
 
-		const cmp = compareSqlValues(a, b, collation);
+		const cmp = compareSqlValuesFast(a, b, collationFunc);
 		switch (op) {
 			case IndexConstraintOp.EQ: return cmp === 0;
 			case IndexConstraintOp.NE: return cmp !== 0;
@@ -1887,7 +1939,13 @@ export class StoreTable extends VirtualTable {
 		selfPks: SqlValue[][],
 	): Promise<UniqueConflict | null | typeof INDEX_UNUSABLE> {
 		const indexStore = await this.ensureIndexStore(index.name);
-		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
+		// Resolved once, above the candidate loop: the resolver throws on an
+		// unregistered name and cannot be inlined, so a per-candidate call would be
+		// pure overhead.
+		const collations = resolveCollationFunctions(
+			this.collationResolver,
+			uniqueEnforcementCollations(this.tableSchema!, uc),
+		);
 		const bounds = buildIndexPrefixBounds(
 			uc.columns.map(c => newRow[c]),
 			this.encodeOptions,
@@ -1909,7 +1967,7 @@ export class StoreTable extends VirtualTable {
 
 			const pk = this.extractPK(candidate);
 			if (selfPks.some(skip => this.keysEqual(pk, skip))) continue;
-			if (uc.columns.some((c, i) => compareSqlValues(newRow[c], candidate[c], collations[i]) !== 0)) continue;
+			if (uc.columns.some((c, i) => compareSqlValuesFast(newRow[c], candidate[c], collations[i]) !== 0)) continue;
 			if (predicate && predicate.evaluate(candidate) !== true) continue;
 			return { pk, row: candidate };
 		}
@@ -1938,7 +1996,11 @@ export class StoreTable extends VirtualTable {
 		const constrainedCols = uc.columns;
 		// One comparison collation per constrained column — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
-		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
+		// Resolved once here, not per candidate row.
+		const collations = resolveCollationFunctions(
+			this.collationResolver,
+			uniqueEnforcementCollations(this.tableSchema!, uc),
+		);
 
 		const matches = (candidate: Row): UniqueConflict | null => {
 			const pk = this.extractPK(candidate);
@@ -1947,7 +2009,7 @@ export class StoreTable extends VirtualTable {
 			}
 			for (let i = 0; i < constrainedCols.length; i++) {
 				const idx = constrainedCols[i];
-				if (compareSqlValues(newRow[idx], candidate[idx], collations[i]) !== 0) return null;
+				if (compareSqlValuesFast(newRow[idx], candidate[idx], collations[i]) !== 0) return null;
 			}
 			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
 			if (predicate && predicate.evaluate(candidate) !== true) return null;
@@ -1993,7 +2055,11 @@ export class StoreTable extends VirtualTable {
 		selfPks: SqlValue[][],
 	): Promise<UniqueConflict | null> {
 		const newSourcePk = this.extractPK(newRow);
-		const collations = uniqueEnforcementCollations(this.tableSchema!, uc);
+		// Resolved once, above the candidate loop.
+		const collations = resolveCollationFunctions(
+			this.collationResolver,
+			uniqueEnforcementCollations(this.tableSchema!, uc),
+		);
 		const candidates = await (this.db as DatabaseInternal)._lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
 		for (const cand of candidates) {
 			const liveRow = await this.readLiveRowByPk(cand.pk);
@@ -2009,7 +2075,7 @@ export class StoreTable extends VirtualTable {
 			// index over a BINARY column) is declined upstream by the collation gate in
 			// findRowTimeCoveringStructure, so only BINARY-floor or equal-collation MVs
 			// reach here — the superset this re-validation can soundly filter.
-			if (uc.columns.some((c, i) => compareSqlValues(newRow[c], liveRow[c], collations[i]) !== 0)) continue;
+			if (uc.columns.some((c, i) => compareSqlValuesFast(newRow[c], liveRow[c], collations[i]) !== 0)) continue;
 			if (predicate && predicate.evaluate(liveRow) !== true) continue;
 			return { pk: cand.pk, row: liveRow };
 		}

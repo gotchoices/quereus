@@ -2533,7 +2533,18 @@ may be replaced by re-registering them; `BINARY` may not — the engine resolves
 `registerCollation('BINARY', ...)` is rejected rather than partially honored. A memory table's
 primary key, secondary indexes, range seeks, and `UNIQUE` enforcement all resolve their declared
 collation names against the connection that owns the table, so a replaced `NOCASE` changes how
-that table's keys sort and which values collide.
+that table's keys sort and which values collide. The same now holds for the persistent
+key-value store tables (`@quereus/store`) and the transaction-isolation overlay
+(`@quereus/isolation`): pushed-constraint re-checks, `UNIQUE` conflict detection, and the
+overlay/underlying merge comparator all resolve through the owning connection.
+
+**Store caveat — physical key bytes.** The store encodes each text key into a sort-preserving
+byte string through a *separate* encoder registry that knows only `BINARY`, `NOCASE`, and
+`RTRIM`, and falls back to the `NOCASE` encoder for any other name. So a custom (or overridden)
+collation governs *comparison* but not the physical key layout: two values the connection's
+comparator calls equal can still land at distinct store keys, and a primary-key `UNIQUE` check
+that goes through the key can miss the collision. Until that is fixed, treat a store table's
+`PRIMARY KEY` collation as limited to the three built-ins with their built-in meanings.
 
 A **column**'s `COLLATE` clause is presently restricted to the collations its logical type
 declares support for — `BINARY`/`NOCASE`/`RTRIM` for TEXT — so a custom collation cannot yet be

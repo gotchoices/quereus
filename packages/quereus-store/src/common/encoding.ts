@@ -297,7 +297,13 @@ function writeEscapedWithTerminator(typeTag: number, bytes: Uint8Array): Uint8Ar
  * Uses null-termination with escape sequences for embedded nulls.
  */
 function encodeText(value: string, collation: string): Uint8Array {
-  // Apply collation transformation via encoder registry
+  // Apply collation transformation via encoder registry.
+  //
+  // This registry is PROCESS-GLOBAL and holds only the three built-ins with their
+  // built-in meanings, so it disagrees with `Database.getCollationResolver()` — which
+  // StoreTable's value comparisons now use — whenever an embedder registers a custom
+  // collation or overrides NOCASE/RTRIM. Two values the comparator calls equal then land
+  // at distinct keys. Tracked by fix/bug-store-key-encoder-ignores-database-collations.
   const collationEncoder = getCollationEncoder(collation) ?? NOCASE_ENCODER;
   const sortValue = collationEncoder.encode(value);
 

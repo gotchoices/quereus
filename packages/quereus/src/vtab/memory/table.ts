@@ -16,7 +16,8 @@ import type { VirtualTableConnection } from '../connection.js';
 import { MemoryVirtualTableConnection } from './connection.js';
 
 import type { VTableEventEmitter } from '../events.js';
-import { compareSqlValues, createTypedComparator } from '../../util/comparison.js';
+import { BINARY_COLLATION, compareSqlValuesFast, createTypedComparator, resolveCollationFunctions } from '../../util/comparison.js';
+import type { CollationFunction } from '../../types/logical-type.js';
 import type { TableStatistics, ColumnStatistics } from '../../planner/stats/catalog-stats.js';
 import { buildHistogram } from '../../planner/stats/histogram.js';
 
@@ -36,6 +37,8 @@ export class MemoryTable extends VirtualTable {
 	private cachedVtabConnection: MemoryVirtualTableConnection | null = null;
 	/** @internal When true, reads from committed (pre-transaction) state only */
 	private readonly readCommitted: boolean;
+	/** @internal Memoized PK collation functions; see {@link getPrimaryKeyCollations} */
+	private pkCollationCache?: { schema: TableSchema; functions: CollationFunction[] };
 
 	/**
 	 * @internal - Use MemoryTableModule.connect or create
@@ -420,16 +423,39 @@ export class MemoryTable extends VirtualTable {
 	}
 
 	/**
-	 * Compare two rows by their primary key values.
-	 * Uses compareSqlValues for each PK column in order.
+	 * Compare two rows by their primary key values, under each PK column's declared
+	 * collation resolved against THIS database's registry — the same functions the
+	 * table's own layer BTrees are keyed by.
+	 *
+	 * The isolation layer adopts this comparator for its overlay/underlying merge
+	 * (`IsolatedTable.getComparePK`). A BINARY comparison here would order the merge
+	 * differently from the memory table's own collated scan order, so an overlay row
+	 * could fail to shadow the base row it replaces.
+	 *
 	 * @returns negative if a < b, 0 if equal, positive if a > b
 	 */
 	comparePrimaryKey(a: SqlValue[], b: SqlValue[]): number {
+		const collations = this.getPrimaryKeyCollations();
 		for (let i = 0; i < a.length; i++) {
-			const cmp = compareSqlValues(a[i], b[i]);
+			const cmp = compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
 			if (cmp !== 0) return cmp;
 		}
 		return 0;
+	}
+
+	/**
+	 * Per-PK-column comparison functions, memoized on the `TableSchema` object identity
+	 * (an `alter table` installs a fresh frozen schema, invalidating the entry) so
+	 * {@link comparePrimaryKey} never re-resolves per comparison.
+	 */
+	private getPrimaryKeyCollations(): CollationFunction[] {
+		const schema = this.tableSchema;
+		if (!schema) return [];
+		if (this.pkCollationCache?.schema !== schema) {
+			const names = schema.primaryKeyDefinition.map(pk => schema.columns[pk.index]?.collation);
+			this.pkCollationCache = { schema, functions: resolveCollationFunctions(this.db.getCollationResolver(), names) };
+		}
+		return this.pkCollationCache.functions;
 	}
 
 	/**
