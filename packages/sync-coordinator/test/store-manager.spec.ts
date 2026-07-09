@@ -139,40 +139,62 @@ describe('StoreManager', () => {
   });
 
   describe('LRU eviction', () => {
+    let lruManager: StoreManager;
+    let lruDataDir: string;
+
+    beforeEach(() => {
+      lruDataDir = join(tmpdir(), `sync-lru-test-${randomUUID()}`);
+      lruManager = new StoreManager({
+        dataDir: lruDataDir,
+        maxOpenStores: 3,
+        idleTimeoutMs: 60_000,
+        cleanupIntervalMs: 60_000,
+      });
+      // Deliberately NOT started: no cleanup timer, so the ONLY close path is evictLRU.
+      // The shared manager's short idleTimeoutMs lets idle cleanup close a released store
+      // while later stores are still opening (LevelDB open + createSyncModule can exceed
+      // the timeout under load), which races the eviction behaviour under test.
+    });
+
+    afterEach(async () => {
+      await lruManager.shutdown();
+      await rm(lruDataDir, { recursive: true, force: true }).catch(() => {});
+    });
+
     it('should evict LRU store when maxOpenStores reached', async () => {
       // maxOpenStores is 3 - open 3 stores
-      await manager.acquire('db-a');
-      manager.release('db-a');
-      await manager.acquire('db-b');
-      manager.release('db-b');
-      await manager.acquire('db-c');
-      manager.release('db-c');
+      await lruManager.acquire('db-a');
+      lruManager.release('db-a');
+      await lruManager.acquire('db-b');
+      lruManager.release('db-b');
+      await lruManager.acquire('db-c');
+      lruManager.release('db-c');
 
-      expect(manager.openCount).to.equal(3);
+      expect(lruManager.openCount).to.equal(3);
 
       // Opening a 4th should evict the oldest (db-a)
-      await manager.acquire('db-d');
-      expect(manager.openCount).to.be.at.most(3);
-      expect(manager.isOpen('db-d')).to.be.true;
+      await lruManager.acquire('db-d');
+      expect(lruManager.openCount).to.be.at.most(3);
+      expect(lruManager.isOpen('db-d')).to.be.true;
     });
 
     it('should not evict a store that was re-acquired before close', async () => {
       // Fill to capacity and release all
-      await manager.acquire('db-a');
-      manager.release('db-a');
-      await manager.acquire('db-b');
-      manager.release('db-b');
-      await manager.acquire('db-c');
-      manager.release('db-c');
+      await lruManager.acquire('db-a');
+      lruManager.release('db-a');
+      await lruManager.acquire('db-b');
+      lruManager.release('db-b');
+      await lruManager.acquire('db-c');
+      lruManager.release('db-c');
 
       // Re-acquire db-a (the LRU candidate) so refCount > 0
-      await manager.acquire('db-a');
+      await lruManager.acquire('db-a');
 
       // Acquiring a 4th triggers eviction — db-a should be skipped
       // because its refCount is now 1
-      await manager.acquire('db-d');
-      expect(manager.isOpen('db-a')).to.be.true;
-      expect(manager.isOpen('db-d')).to.be.true;
+      await lruManager.acquire('db-d');
+      expect(lruManager.isOpen('db-a')).to.be.true;
+      expect(lruManager.isOpen('db-d')).to.be.true;
     });
   });
 
