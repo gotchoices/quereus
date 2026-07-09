@@ -1450,7 +1450,8 @@ For example, `NOCASE`'s normalizer is `s => s.toLowerCase()`, and `RTRIM`'s
 strips only trailing ASCII spaces (matching its comparator — note that
 `s.trimEnd()` would *disagree* by also stripping tabs/NBSP).
 
-Supply a normalizer if the collation will be used for any of:
+Supply a normalizer if the collation will be used, **over a text-typed key**, for
+any of:
 
 - a compound index key;
 - a `GROUP BY` key or a window `PARTITION BY` key;
@@ -1458,9 +1459,12 @@ Supply a normalizer if the collation will be used for any of:
 
 A comparator-only registration still works for `ORDER BY` and standalone
 comparisons. Index creation naming it is rejected, and a query that groups or
-hash-joins on it raises `collation <name> has no key normalizer` — the engine
-never guesses a built-in normalizer, because a normalizer that disagrees with
-the comparator produces confidently wrong groups rather than a visible error.
+hash-joins a text key under it raises `collation <name> has no key normalizer` —
+the engine never guesses a built-in normalizer, because a normalizer that
+disagrees with the comparator produces confidently wrong groups rather than a
+visible error. A key whose type can never hold text (say `n integer collate
+mycoll`) needs no normalizer: the collation cannot affect how such values bucket,
+so the engine ignores it there rather than raising.
 
 Normalizer-and-comparator agreement is a hard contract. If they diverge, index
 lookups silently miss rows and groups split or merge wrongly.

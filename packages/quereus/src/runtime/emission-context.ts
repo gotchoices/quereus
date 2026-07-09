@@ -221,6 +221,10 @@ export class EmissionContext {
 	 * Throws `QuereusError` on an unknown name, and on a comparator-only collation that
 	 * carries no normalizer — both delegated to {@link Database.getKeyNormalizerResolver}
 	 * so every caller reports the same error.
+	 *
+	 * Pass the name through `hashKeyCollationName()` first: a key whose operand types can
+	 * never hold text never consults its collation, so demanding a normalizer for it would
+	 * reject a valid query.
 	 */
 	resolveKeyNormalizer(collationName: string | undefined): KeyNormalizer {
 		if (!collationName || collationName === 'BINARY') return BUILTIN_NORMALIZERS.BINARY; // Fast path

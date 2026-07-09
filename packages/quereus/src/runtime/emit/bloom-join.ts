@@ -8,7 +8,7 @@ import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 import { serializeRowKey } from '../../util/key-serializer.js';
-import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
+import { effectiveCollationOfTypes, hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:bloom-join');
@@ -47,8 +47,10 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		// explicit/declared conflict — a loud backstop; `equi-pair-extractor`'s
 		// matched-collation gate keeps such pairs out of this path (see the lockstep
 		// note there).
-		const collationName = effectiveCollationOfTypes(leftAttributes[li].type, rightAttributes[ri].type);
-		keyNormalizers.push(ctx.resolveKeyNormalizer(collationName));
+		const leftType = leftAttributes[li].type;
+		const rightType = rightAttributes[ri].type;
+		const collationName = effectiveCollationOfTypes(leftType, rightType);
+		keyNormalizers.push(ctx.resolveKeyNormalizer(hashKeyCollationName(collationName, [leftType, rightType])));
 	}
 
 	const rightColCount = rightAttributes.length;

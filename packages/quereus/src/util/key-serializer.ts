@@ -33,8 +33,10 @@ const NOCASE_NORMALIZER = (s: string): string => s.toLowerCase();
  * see a collation registered with `db.registerCollation`, so it buckets rows the
  * database's own comparator considers equal into different groups. It survives only for
  * `quereus-store`'s key encoder and `quereus-isolation/src/isolated-table.ts` (~470),
- * neither of which has a `Database` threaded to the call site yet; both are tracked by
- * their own tickets. Delete this function once those two are converted.
+ * neither of which has a `Database` threaded to the call site yet — tracked by
+ * `bug-store-key-encoder-ignores-database-collations` and
+ * `bug-isolation-overlay-key-ignores-database-collations` respectively. Delete this
+ * function once those two are converted.
  */
 export function resolveKeyNormalizer(collationName: string | undefined): (s: string) => string {
 	if (!collationName || collationName === 'BINARY') return IDENTITY_NORMALIZER;

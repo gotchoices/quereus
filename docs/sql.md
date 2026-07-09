@@ -2548,9 +2548,11 @@ running the comparator. They resolve that normalizer against the connection's co
 (`db.getKeyNormalizerResolver()`), so grouping, `where`, `order by`, and `distinct` all agree on
 which rows are equal — including under a custom or replaced collation. A collation registered
 **without** a `normalizer` can order rows but cannot bucket them: naming it as a grouping,
-partition, or hash-join key raises `collation <name> has no key normalizer` rather than silently
-grouping by bytes. Supply `{ normalizer }` to `registerCollation` for any collation you intend to
-group by.
+partition, or hash-join key over a **text** key raises `collation <name> has no key normalizer`
+rather than silently grouping by bytes. Supply `{ normalizer }` to `registerCollation` for any
+collation you intend to group by. A key whose declared type can never hold text (`n integer
+collate mycoll`) buckets by value under any collation, so it needs no normalizer and does not
+raise.
 
 **Store caveat — physical key bytes.** The store encodes each text key into a sort-preserving
 byte string through a *separate* encoder registry that knows only `BINARY`, `NOCASE`, and

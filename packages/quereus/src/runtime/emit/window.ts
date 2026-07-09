@@ -8,6 +8,7 @@ import { resolveWindowFunction, type WindowFunctionSchema } from '../../schema/w
 import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { createTypedComparator, createOrderByComparatorFast } from '../../util/comparison.js';
+import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createLogger } from '../../common/logger.js';
@@ -66,9 +67,10 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 	});
 
 	// Pre-resolve collation normalizers for partition key serialization
-	const partitionKeyNormalizers = plan.partitionExpressions.map(exprPlan =>
-		ctx.resolveKeyNormalizer(exprPlan.getType().collationName)
-	);
+	const partitionKeyNormalizers = plan.partitionExpressions.map(exprPlan => {
+		const exprType = exprPlan.getType();
+		return ctx.resolveKeyNormalizer(hashKeyCollationName(exprType.collationName, [exprType]));
+	});
 
 	async function* run(
 		rctx: RuntimeContext,

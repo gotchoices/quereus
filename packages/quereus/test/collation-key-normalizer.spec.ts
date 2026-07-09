@@ -171,6 +171,160 @@ describe('hash-keyed operators reject a collation that cannot bucket', () => {
 			await db.close();
 		}
 	});
+
+	// A normalizer is only ever applied to a *string* key value, so a key that can never
+	// hold text does not need one — demanding it would reject a query the collation cannot
+	// affect. `hashKeyCollationName()` drops the inert name before the resolver sees it.
+	describe('but not when the key can never hold text', () => {
+		it('groups an INTEGER column declared under a comparator-only collation', async () => {
+			const db = new Database();
+			try {
+				db.registerCollation('NOCASE', lengthOnly);
+				await db.exec('create table src (id integer primary key, n integer collate nocase, v integer)');
+				await db.exec('insert into src values (1, 7, 10), (2, 7, 5), (3, 9, 1)');
+				expect(await results(db, 'select n, sum(v) as s from src group by n order by n'))
+					.to.deep.equal([{ n: 7, s: 15 }, { n: 9, s: 1 }]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('groups an INTEGER expression under an explicit comparator-only COLLATE', async () => {
+			const db = new Database();
+			try {
+				db.registerCollation('CMPONLY', lengthOnly);
+				await db.exec('create table src (id integer primary key, n integer, v integer)');
+				await db.exec('insert into src values (1, 7, 10), (2, 7, 5)');
+				expect(await sums(db, 'select sum(v) as s from src group by n collate cmponly'))
+					.to.deep.equal([15]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('partitions an INTEGER window key under a comparator-only collation', async () => {
+			const db = new Database();
+			try {
+				db.registerCollation('NOCASE', lengthOnly);
+				await db.exec('create table src (id integer primary key, n integer collate nocase, v integer)');
+				await db.exec('insert into src values (1, 7, 10), (2, 7, 5)');
+				expect(await results(db, 'select id, sum(v) over (partition by n) as s from src order by id'))
+					.to.deep.equal([{ id: 1, s: 15 }, { id: 2, s: 15 }]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('bloom-joins INTEGER keys declared under a comparator-only collation', async () => {
+			const db = new Database();
+			try {
+				db.registerCollation('NOCASE', lengthOnly);
+				await db.exec('create table a (id integer primary key, n integer collate nocase)');
+				await db.exec('create table b (id integer primary key, n integer collate nocase)');
+				// Enough rows that the optimizer prefers the bloom/hash join over nested loops.
+				const vals = Array.from({ length: 300 }, (_, i) => `(${i},${i})`).join(',');
+				await db.exec(`insert into a values ${vals}`);
+				await db.exec(`insert into b values ${vals}`);
+
+				const sql = 'select count(*) as c from a join b on a.n = b.n';
+				expect(await usesBloomJoin(db, sql), 'bloom join is the path under test').to.equal(true);
+				expect(await results(db, sql)).to.deep.equal([{ c: 300 }]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('groups a BLOB key under a comparator-only collation', async () => {
+			const db = new Database();
+			try {
+				db.registerCollation('CMPONLY', lengthOnly);
+				await db.exec('create table src (id integer primary key, b blob, v integer)');
+				await db.exec("insert into src values (1, x'01', 10), (2, x'01', 5)");
+				expect(await sums(db, 'select sum(v) as s from src group by b collate cmponly'))
+					.to.deep.equal([15]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('still raises for a TEXT key alongside an inert INTEGER one', async () => {
+			// The text key in the same GROUP BY list is not excused by its integer sibling.
+			const db = new Database();
+			try {
+				db.registerCollation('NOCASE', lengthOnly);
+				await db.exec('create table src (id integer primary key, n integer collate nocase, k text collate nocase, v integer)');
+				await db.exec("insert into src values (1, 7, 'aa', 10)");
+				expect(await errorFrom(db, 'select sum(v) as s from src group by n, k'))
+					.to.match(/collation NOCASE has no key normalizer/);
+			} finally {
+				await db.close();
+			}
+		});
+
+		// A JSON value can BE a text string: `JSON_TYPE.parse` passes a JSON scalar string
+		// through, so `'"Bob"'` stores the ordinary string `Bob`. The "can never hold text"
+		// test must therefore be an allow-list over the physical representation
+		// (INTEGER/REAL/BLOB/BOOLEAN), not `physicalType !== TEXT` — which would exempt
+		// JSON's OBJECT and silently group `'Bob'`/`'BOB'` apart under NOCASE. See
+		// `bug-json-columns-classified-as-non-textual`.
+		it('still normalizes a JSON key, whose value can be a text string', async () => {
+			const db = new Database();
+			try {
+				await db.exec('create table src (id integer primary key, j json, v integer)');
+				await db.exec(`insert into src values (1, '"Bob"', 10), (2, '"BOB"', 5)`);
+				expect(await sums(db, 'select sum(v) as s from src group by j collate nocase'))
+					.to.deep.equal([15]);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('still raises for a JSON key under a comparator-only collation', async () => {
+			const db = new Database();
+			try {
+				db.registerCollation('CMPONLY', lengthOnly);
+				await db.exec('create table src (id integer primary key, j json, v integer)');
+				await db.exec(`insert into src values (1, '"Bob"', 10)`);
+				expect(await errorFrom(db, 'select sum(v) as s from src group by j collate cmponly'))
+					.to.match(/collation CMPONLY has no key normalizer/);
+			} finally {
+				await db.close();
+			}
+		});
+
+		it('still raises for an ANY key, which can hold text', async () => {
+			const db = new Database();
+			try {
+				db.registerCollation('CMPONLY', lengthOnly);
+				await db.exec('create table src (id integer primary key, a any, v integer)');
+				await db.exec("insert into src values (1, 'Bob', 10)");
+				expect(await errorFrom(db, 'select sum(v) as s from src group by a collate cmponly'))
+					.to.match(/collation CMPONLY has no key normalizer/);
+			} finally {
+				await db.close();
+			}
+		});
+	});
+});
+
+describe('re-registering a collation changes later grouping', () => {
+	it('a statement prepared after the re-registration groups under the new normalizer', async () => {
+		const db = new Database();
+		try {
+			db.registerCollation('NOCASE', lengthOnly, { normalizer: lengthNormalizer });
+			await db.exec('create table src (id integer primary key, k text collate nocase, v integer)');
+			await db.exec("insert into src values (1, 'aa', 10), (2, 'bb', 5)");
+			// Length-only: 'aa' and 'bb' are one group.
+			expect(await sums(db, 'select sum(v) as s from src group by k')).to.deep.equal([15]);
+
+			// Swap in the real NOCASE semantics; the same SQL must now see two groups.
+			const lower = (s: string): string => s.toLowerCase();
+			db.registerCollation('NOCASE', (a, b) => (lower(a) < lower(b) ? -1 : lower(a) > lower(b) ? 1 : 0), { normalizer: lower });
+			expect(await sums(db, 'select sum(v) as s from src group by k order by k')).to.deep.equal([10, 5]);
+		} finally {
+			await db.close();
+		}
+	});
 });
 
 describe('built-in collations group unchanged on a fresh database', () => {

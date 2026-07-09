@@ -10,7 +10,7 @@ import { createRowSlot } from '../context-helpers.js';
 import { compareSqlValuesFast } from '../../util/comparison.js';
 import type { CollationFunction } from '../../util/comparison.js';
 import { serializeRowKey } from '../../util/key-serializer.js';
-import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
+import { effectiveCollationOfTypes, hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:asof-scan');
@@ -80,9 +80,11 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 		// declared NOCASE on either side groups case-variant keys together regardless
 		// of which side declares it; the comparator and the hash-bucket normalizer
 		// both key off the one resolved name so they cannot disagree.
-		const collationName = effectiveCollationOfTypes(leftAttrs[leftIdx].type, rightAttrs[rightIdx].type);
+		const leftType = leftAttrs[leftIdx].type;
+		const rightType = rightAttrs[rightIdx].type;
+		const collationName = effectiveCollationOfTypes(leftType, rightType);
 		partitionCollations.push(ctx.resolveCollation(collationName));
-		keyNormalizers.push(ctx.resolveKeyNormalizer(collationName));
+		keyNormalizers.push(ctx.resolveKeyNormalizer(hashKeyCollationName(collationName, [leftType, rightType])));
 	}
 
 	const rightOutputColumnIndices = plan.getRightOutputColumnIndices();

@@ -474,9 +474,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// The engine's own hash sites (bloom-join / window / hash-aggregate / asof)
 		// no longer share this divergence — they resolve through
 		// `db.getKeyNormalizerResolver()`. This site and the store's key encoder are
-		// the two remaining built-ins-only callers. If custom-collation PKs ever need
-		// exact merge shadowing, thread a `Database` (or its normalizer resolver) to
-		// this call site and use that resolver instead.
+		// the two remaining built-ins-only callers; fixing this one means threading a
+		// `Database` (or its normalizer resolver) to this call site and using that
+		// resolver instead. Tracked by
+		// `bug-isolation-overlay-key-ignores-database-collations`.
 		const pkNormalizers = pkIndices.map(i =>
 			resolveKeyNormalizer(this.tableSchema!.columns[i].collation));
 

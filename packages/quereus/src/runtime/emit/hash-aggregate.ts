@@ -18,6 +18,7 @@ import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { AggValue } from '../../func/registration.js';
 import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createTypedComparator } from '../../util/comparison.js';
+import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
 
@@ -53,7 +54,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 	// Pre-resolve collation normalizers for GROUP BY key serialization
 	const keyNormalizers = plan.groupBy.map(expr => {
 		const exprType = expr.getType();
-		return ctx.resolveKeyNormalizer(exprType.collationName);
+		return ctx.resolveKeyNormalizer(hashKeyCollationName(exprType.collationName, [exprType]));
 	});
 
 	// Pre-resolve typed comparators for DISTINCT aggregate tracking per aggregate

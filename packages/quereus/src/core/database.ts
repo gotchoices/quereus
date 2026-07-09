@@ -1315,12 +1315,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * // SELECT * FROM contacts ORDER BY phone COLLATE PHONENUMBER;
 	 * // CREATE INDEX phone_idx ON contacts(phone COLLATE PHONENUMBER);
 	 */
-	// NOTE: registration is not retroactive. Comparators are resolved once, at
-	// comparator-construction time (index build, plan emission), so a collation
-	// registered — or re-registered with a different comparator — after a structure
-	// was built does not rebuild it. Register collations before creating tables and
-	// indexes that name them. If retroactive re-registration ever needs to be
-	// supported, invalidate dependent indexes and cached plans here.
+	// NOTE: registration is not retroactive. Comparators and key normalizers are
+	// resolved once, at comparator-construction time (index build, plan emission), so a
+	// collation registered — or re-registered with a different comparator/normalizer —
+	// after a structure was built does not rebuild it. A statement emitted *after* the
+	// re-registration does see the new one. Register collations before creating tables
+	// and indexes that name them. If retroactive re-registration ever needs to be
+	// supported, invalidate dependent indexes and cached plans here: the collation
+	// dependency `EmissionContext` records only drives an existence check before
+	// execution (`validateCapturedSchemaObjects`), which warns — it does not invalidate.
 	registerCollation(
 		name: string,
 		func: CollationFunction,

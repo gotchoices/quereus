@@ -52,7 +52,7 @@ Complete implementation following Titan architecture principles:
 - **Proper expression evaluation** - Uses callbacks for all expressions
 - **Frame-aware execution** - Implements correct windowing semantics
 - **SQL-compliant sorting** - Uses `compareSqlValues` for proper NULL handling
-- **Collation-aware partitioning** - PARTITION BY and ranking keys use shared key serialization (`util/key-serializer.ts`) with per-column collation normalizers (e.g., NOCASE → case-insensitive grouping)
+- **Collation-aware partitioning** - PARTITION BY and ranking keys use shared key serialization (`util/key-serializer.ts`) with per-column collation normalizers resolved against the connection's collation registry via `EmissionContext.resolveKeyNormalizer()` (e.g., NOCASE → case-insensitive grouping; a custom `registerCollation` normalizer is honored too)
 
 **Execution Model:**
 1. **Materialization**: Collects all input rows (required for window functions)

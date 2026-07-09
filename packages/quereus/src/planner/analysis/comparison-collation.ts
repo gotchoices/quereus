@@ -307,6 +307,54 @@ function isStaticallyNonTextual(node: ScalarPlanNode): boolean {
 }
 
 /**
+ * Physical representations that provably never hold a JS string. `OBJECT` is absent on
+ * purpose: `JSON_TYPE.parse` passes a JSON scalar string straight through, so a `JSON`
+ * value can be the ordinary string `Bob`. So is `NULL` (`ANY`'s representation).
+ *
+ * NOTE: deliberately stricter than {@link isNonTextualLogicalType} above, which exempts
+ * `JSON` and is the subject of `bug-json-columns-classified-as-non-textual`. Mirrors
+ * `columnCanHoldText` in `quereus-store/src/common/store-table.ts`; the three collapse into
+ * one predicate once that ticket lands.
+ */
+const NEVER_TEXT_PHYSICAL_TYPES: ReadonlySet<PhysicalType> = new Set([
+	PhysicalType.INTEGER,
+	PhysicalType.REAL,
+	PhysicalType.BLOB,
+	PhysicalType.BOOLEAN,
+]);
+
+/** True when a value of this type could be a text string at runtime. Absent type ⇒ unknown ⇒ yes. */
+function typeCanHoldText(t: ScalarType): boolean {
+	const lt = t.logicalType;
+	if (!lt) return true;
+	if (lt.isTextual === true) return true;
+	return !NEVER_TEXT_PHYSICAL_TYPES.has(lt.physicalType);
+}
+
+/**
+ * The collation that actually governs a hash key built from `operandTypes`, or
+ * `undefined` when none does — the input for `EmissionContext.resolveKeyNormalizer`.
+ *
+ * Key serialization applies a normalizer only to a *string* value (`util/key-serializer.ts`
+ * tags numerics, blobs, and JSON objects without consulting it), so a key no operand of
+ * which can ever hold text never reaches the collation. Demanding a normalizer for such a
+ * key would reject a valid query: `group by n` over `n integer collate nocase` buckets by
+ * number under any collation, including a comparator-only one. Any operand that *could*
+ * hold text keeps the name — dropping it there would silently group by bytes, which is the
+ * bug `bug-key-normalizer-ignores-database-collations` fixed.
+ *
+ * Every operand is checked, not just one, because a join's build and probe sides share a
+ * single normalizer array: text on either side must normalize.
+ */
+export function hashKeyCollationName(
+	collationName: string | undefined,
+	operandTypes: readonly ScalarType[],
+): string | undefined {
+	if (!collationName || operandTypes.length === 0) return collationName;
+	return operandTypes.some(typeCanHoldText) ? collationName : undefined;
+}
+
+/**
  * True iff an equality `left = right` is **value-discriminating**: rows it
  * passes are genuinely value-equal on the compared operands, so the conjunct
  * may mint value-level facts (constant pins `∅ → col`, `col1 = col2` mirror
