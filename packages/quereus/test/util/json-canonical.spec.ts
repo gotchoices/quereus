@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { canonicalJsonString } from '../../src/util/json-canonical.js';
 import { serializeKey, resolveKeyNormalizer } from '../../src/util/key-serializer.js';
-import { compareSqlValues, sqlValuesEqual } from '../../src/util/comparison.js';
+import { compareSqlValues, sqlValueIdentical } from '../../src/util/comparison.js';
 import type { SqlValue } from '../../src/common/types.js';
 import type { JSONValue } from '../../src/common/json-types.js';
 
@@ -92,9 +92,9 @@ describe('serializeKey equality invariant (appendValue)', () => {
 		for (const [a, b] of pairs) {
 			const keysEqual = key(a as SqlValue) === key(b as SqlValue);
 			const cmpEqual = compareSqlValues(a as SqlValue, b as SqlValue) === 0;
-			const valEqual = sqlValuesEqual(a as SqlValue, b as SqlValue);
+			const valEqual = sqlValueIdentical(a as SqlValue, b as SqlValue);
 			expect(keysEqual).to.equal(cmpEqual, `key/compare disagree for ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
-			expect(keysEqual).to.equal(valEqual, `key/sqlValuesEqual disagree for ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+			expect(keysEqual).to.equal(valEqual, `key/sqlValueIdentical disagree for ${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
 		}
 	});
 });

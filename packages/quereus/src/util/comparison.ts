@@ -278,9 +278,19 @@ export function compareSqlValues(a: SqlValue, b: SqlValue, collationName: string
 export function rowsValueIdentical(a: readonly SqlValue[], b: readonly SqlValue[]): boolean {
 	if (a.length !== b.length) return false;
 	for (let i = 0; i < a.length; i++) {
-		if (compareSqlValuesFast(a[i], b[i], BINARY_COLLATION) !== 0) return false;
+		if (!sqlValueIdentical(a[i], b[i])) return false;
 	}
 	return true;
+}
+
+/**
+ * Byte-faithful single-value identity: {@link compareSqlValuesFast} under
+ * BINARY. Numeric-storage-class tolerant (`5n` equals `5`), bytewise for blobs,
+ * canonical-JSON for object-class values, byte-exact for text. This is the
+ * scalar form of {@link rowsValueIdentical} and shares its contract.
+ */
+export function sqlValueIdentical(a: SqlValue, b: SqlValue): boolean {
+	return compareSqlValuesFast(a, b, BINARY_COLLATION) === 0;
 }
 
 /**
@@ -509,26 +519,6 @@ export function compareRows(a: Row, b: Row): number {
 		}
 	}
 	return 0;
-}
-
-/**
- * Check two SQL values for equality, with proper handling of BLOBs (Uint8Array).
- * Unlike compareSqlValues, this performs byte-wise comparison for BLOBs.
- */
-export function sqlValuesEqual(a: SqlValue, b: SqlValue): boolean {
-	if (a instanceof Uint8Array && b instanceof Uint8Array) {
-		if (a.length !== b.length) return false;
-		for (let i = 0; i < a.length; i++) {
-			if (a[i] !== b[i]) return false;
-		}
-		return true;
-	}
-	// JSON object comparison by value (shares the OBJECT-class canonical cache)
-	if (typeof a === 'object' && a !== null && !(a instanceof Uint8Array) &&
-		typeof b === 'object' && b !== null && !(b instanceof Uint8Array)) {
-		return objectCanonicalString(a) === objectCanonicalString(b);
-	}
-	return a === b;
 }
 
 /**

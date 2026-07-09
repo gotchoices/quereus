@@ -13,7 +13,7 @@ import type { UpdateArgs, VirtualTable } from '../../vtab/table.js';
 import type { TableSchema } from '../../schema/table.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { hasNativeEventSupport } from '../../util/event-support.js';
-import { sqlValuesEqual } from '../../util/comparison.js';
+import { sqlValueIdentical } from '../../util/comparison.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
@@ -328,21 +328,21 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			//    short-circuits on the first violation, so even full
 			//    constraint-identity tracking couldn't fix this without it
 			//    reporting every violated constraint.
-			//  - Representation-sensitive keys: sqlValuesEqual is a raw JS-equality
-			//    check, but `proposedRow` reaches us pre-affinity-coercion (the
-			//    insert pipeline defers type conversion to the vtab's storage
-			//    layer) while `existingRow` is the already-coerced stored row. So a
-			//    conflict the vtab raised under affinity (e.g. insert '1' into an
+			//  - Representation-sensitive keys: sqlValueIdentical is numeric-storage-class
+			//    tolerant (bigint/number no longer diverge), but `proposedRow` reaches us
+			//    pre-affinity-coercion (the insert pipeline defers type conversion to the
+			//    vtab's storage layer) while `existingRow` is the already-coerced stored
+			//    row. So a conflict the vtab raised under affinity (e.g. insert '1' into an
 			//    INTEGER key holding 1) OR under a coarser collation (e.g. NOCASE
 			//    case-variant) compares unequal here and aborts rather than skips.
 			//    Both share one fix: compare the way the constraint enforces — apply
 			//    the column's affinity to the proposed value and compare via the
 			//    constraint's enforcement collation (uniqueEnforcementCollations +
-			//    compareSqlValuesFast) instead of sqlValuesEqual. Well-formed seeds
+			//    compareSqlValuesFast) instead of sqlValueIdentical. Well-formed seeds
 			//    re-present byte-identical literals, so seed idempotency is
 			//    unaffected; this only bites type-mismatched ON CONFLICT writes.
 			const conflictMatch = clause.conflictTargetIndices.every(idx =>
-				sqlValuesEqual(existingRow[idx], proposedRow[idx])
+				sqlValueIdentical(existingRow[idx], proposedRow[idx])
 			);
 
 			if (conflictMatch) {
@@ -728,7 +728,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 					if (needsAutoEvents) {
 						const changedColumns: string[] = [];
 						for (let i = 0; i < tableSchema.columns.length; i++) {
-							if (!sqlValuesEqual(result.existingRow![i], updateResult.updatedRow[i])) {
+							if (!sqlValueIdentical(result.existingRow![i], updateResult.updatedRow[i])) {
 								changedColumns.push(tableSchema.columns[i].name);
 							}
 						}
@@ -767,7 +767,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			if (needsAutoEvents) {
 				const changedColumns: string[] = [];
 				for (let i = 0; i < tableSchema.columns.length; i++) {
-					if (!sqlValuesEqual(replacedRow[i], newRow[i])) {
+					if (!sqlValueIdentical(replacedRow[i], newRow[i])) {
 						changedColumns.push(tableSchema.columns[i].name);
 					}
 				}
@@ -980,7 +980,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			for (let i = 0; i < tableSchema.columns.length; i++) {
 				const oldVal = oldRow[i];
 				const newVal = newRow[i];
-				if (!sqlValuesEqual(oldVal, newVal)) {
+				if (!sqlValueIdentical(oldVal, newVal)) {
 					changedColumns.push(tableSchema.columns[i].name);
 				}
 			}

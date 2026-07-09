@@ -13,7 +13,7 @@ import { ConflictResolution } from '../../common/constants.js';
 import { withAsyncRowContext, createRowSlot } from '../context-helpers.js';
 import { expressionToString } from '../../emit/ast-stringify.js';
 import { composeCombinedDescriptor } from '../descriptor-helpers.js';
-import { sqlValuesEqual, isTruthy } from '../../util/comparison.js';
+import { sqlValueIdentical, isTruthy } from '../../util/comparison.js';
 import { validateAndParse } from '../../types/validation.js';
 
 interface ConstraintMetadataEntry {
@@ -338,7 +338,7 @@ async function checkCheckConstraints(
 			for (const colIdx of metadata.referencedColumnIndices) {
 				const oldVal = row[colIdx] as SqlValue;           // OLD section: 0..n-1
 				const newVal = row[numCols + colIdx] as SqlValue; // NEW section: n..2n-1
-				if (!sqlValuesEqual(oldVal, newVal)) {
+				if (!sqlValueIdentical(oldVal, newVal)) {
 					anyChanged = true;
 					break;
 				}

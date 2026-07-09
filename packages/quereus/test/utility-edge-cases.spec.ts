@@ -4,7 +4,7 @@ import {
 	compareSqlValuesFast,
 	isTruthy,
 	compareRows,
-	sqlValuesEqual,
+	sqlValueIdentical,
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
 	RTRIM_COLLATION,
@@ -421,24 +421,34 @@ describe('Utility Edge Cases', () => {
 		});
 	});
 
-	describe('sqlValuesEqual', () => {
+	describe('sqlValueIdentical', () => {
 		it('should treat null === null as true', () => {
-			expect(sqlValuesEqual(null, null)).to.be.true;
+			expect(sqlValueIdentical(null, null)).to.be.true;
 		});
 
 		it('should compare numbers', () => {
-			expect(sqlValuesEqual(1, 1)).to.be.true;
-			expect(sqlValuesEqual(1, 2)).to.be.false;
+			expect(sqlValueIdentical(1, 1)).to.be.true;
+			expect(sqlValueIdentical(1, 2)).to.be.false;
 		});
 
 		it('should compare strings', () => {
-			expect(sqlValuesEqual('a', 'a')).to.be.true;
+			expect(sqlValueIdentical('a', 'a')).to.be.true;
 		});
 
 		it('should compare blobs byte-wise', () => {
-			expect(sqlValuesEqual(new Uint8Array([1, 2]), new Uint8Array([1, 2]))).to.be.true;
-			expect(sqlValuesEqual(new Uint8Array([1, 2]), new Uint8Array([1, 3]))).to.be.false;
-			expect(sqlValuesEqual(new Uint8Array([1]), new Uint8Array([1, 2]))).to.be.false;
+			expect(sqlValueIdentical(new Uint8Array([1, 2]), new Uint8Array([1, 2]))).to.be.true;
+			expect(sqlValueIdentical(new Uint8Array([1, 2]), new Uint8Array([1, 3]))).to.be.false;
+			expect(sqlValueIdentical(new Uint8Array([1]), new Uint8Array([1, 2]))).to.be.false;
+		});
+
+		it('should treat cross-representation numeric-storage-class values as identical', () => {
+			expect(sqlValueIdentical(5n, 5)).to.be.true;
+			expect(sqlValueIdentical(true, 1)).to.be.true;
+			expect(sqlValueIdentical(false, 0)).to.be.true;
+		});
+
+		it('should not treat TEXT and NUMERIC storage classes as identical', () => {
+			expect(sqlValueIdentical('1', 1)).to.be.false;
 		});
 	});
 

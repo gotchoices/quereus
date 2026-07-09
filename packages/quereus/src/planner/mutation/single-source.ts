@@ -4,7 +4,7 @@ import type { TableSchema } from '../../schema/table.js';
 import { isRelationalNode, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { type SqlValue, StatusCode } from '../../common/types.js';
 import { QuereusError } from '../../common/errors.js';
-import { sqlValuesEqual } from '../../util/comparison.js';
+import { sqlValueIdentical } from '../../util/comparison.js';
 import { buildSelectStmt } from '../building/select.js';
 import { classifyViewBody } from './propagate.js';
 import { raiseMutationDiagnostic } from './mutation-diagnostic.js';
@@ -1108,7 +1108,7 @@ function checkContradiction(source: AST.QueryExpr, columnIndex: number, fc: Filt
 	for (const row of source.values) {
 		const cell = row[columnIndex];
 		if (!cell || cell.type !== 'literal' || cell.value instanceof Promise) continue;
-		if (!sqlValuesEqual(cell.value, fc.value)) {
+		if (!sqlValueIdentical(cell.value, fc.value)) {
 			raiseMutationDiagnostic({
 				reason: 'predicate-contradiction',
 				column: fc.baseColumnName,

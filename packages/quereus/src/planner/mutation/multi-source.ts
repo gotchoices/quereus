@@ -7,7 +7,7 @@ import type { ColumnSchema } from '../../schema/column.js';
 import { PlanNode, type RelationalPlanNode, type Attribute, type TableDescriptor, type RelationalComponentRef } from '../nodes/plan-node.js';
 import type { RelationType, ScalarType } from '../../common/datatype.js';
 import type { SqlValue } from '../../common/types.js';
-import { sqlValuesEqual } from '../../util/comparison.js';
+import { sqlValueIdentical } from '../../util/comparison.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../nodes/reference.js';
 import { InternalRecursiveCTERefNode } from '../nodes/internal-recursive-cte-ref-node.js';
 import { analyzeBodyLineage } from './backward-body.js';
@@ -1009,7 +1009,7 @@ function checkJoinFilterContradiction(source: AST.QueryExpr, columnIndex: number
 	for (const row of source.values) {
 		const cell = row[columnIndex];
 		if (!cell || cell.type !== 'literal' || cell.value instanceof Promise) continue;
-		if (!sqlValuesEqual(cell.value, fc.value)) {
+		if (!sqlValueIdentical(cell.value, fc.value)) {
 			raiseMutationDiagnostic({
 				reason: 'predicate-contradiction',
 				column: fc.baseColumn,

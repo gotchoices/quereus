@@ -79,6 +79,7 @@ export {
 	compareSqlValues,
 	compareSqlValuesFast,
 	rowsValueIdentical,
+	sqlValueIdentical,
 	compareRows,
 	compareTypedValues,
 	createTypedComparator,

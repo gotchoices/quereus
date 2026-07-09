@@ -7,7 +7,7 @@ import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
 import { expressionToString, quoteIdentifier } from '../emit/ast-stringify.js';
-import { sqlValuesEqual } from '../util/comparison.js';
+import { sqlValueIdentical } from '../util/comparison.js';
 import type { LensSlot } from '../schema/lens.js';
 import { resolveSlotBasisSource } from '../schema/lens-prover.js';
 import {
@@ -240,7 +240,7 @@ export async function assertTransitiveRestrictsForParentMutation(
 			if (operation === 'update' && newRow !== undefined) {
 				let anyChanged = false;
 				for (const idx of parentColIndices) {
-					if (!sqlValuesEqual(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
+					if (!sqlValueIdentical(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
 						anyChanged = true;
 						break;
 					}
@@ -379,7 +379,7 @@ export async function assertNoRestrictedChildrenForParentMutation(
 		if (operation === 'update' && newRow !== undefined) {
 			let anyChanged = false;
 			for (const idx of parentColIndices) {
-				if (!sqlValuesEqual(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
+				if (!sqlValueIdentical(oldRow[idx] as SqlValue, newRow[idx] as SqlValue)) {
 					anyChanged = true;
 					break;
 				}
@@ -588,7 +588,7 @@ type LensFkAction = Extract<ForeignKeyAction, 'cascade' | 'setNull' | 'setDefaul
  * (⇒ skip this ref) when:
  *  - a referenced column has no plain basis projection (cannot read its basis value);
  *  - MATCH SIMPLE: any OLD referenced value is NULL (participates in no FK match); or
- *  - UPDATE: no referenced parent column actually changed (`sqlValuesEqual` short-circuit).
+ *  - UPDATE: no referenced parent column actually changed (`sqlValueIdentical` short-circuit).
  */
 function resolveLensFkParentReferencedValues(
 	ref: LogicalParentFkRef,
@@ -619,7 +619,7 @@ function resolveLensFkParentReferencedValues(
 	if (operation === 'update' && newRow !== undefined) {
 		let anyChanged = false;
 		for (const i of basisIndices) {
-			if (!sqlValuesEqual(oldRow[i] as SqlValue, newRow[i] as SqlValue)) { anyChanged = true; break; }
+			if (!sqlValueIdentical(oldRow[i] as SqlValue, newRow[i] as SqlValue)) { anyChanged = true; break; }
 		}
 		if (!anyChanged) return undefined;
 		newParentValues = basisIndices.map(i => newRow[i]) as SqlValue[];
