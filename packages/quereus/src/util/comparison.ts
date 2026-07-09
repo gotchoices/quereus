@@ -169,6 +169,13 @@ export function getSqlDataTypeName(v: SqlValue): 'null' | 'integer' | 'real' | '
  * @param a First number
  * @param b Second number
  * @returns -1 if a < b, 0 if a === b, 1 if a > b
+ *
+ * NOTE: a NaN operand makes both relational tests false, so this reports 0 —
+ * NaN compares "equal" to everything. Unreachable today: arithmetic maps
+ * non-finite results to NULL (`runtime/emit/binary.ts`) and the affinity /
+ * coercion paths reject NaN. If NaN ever becomes a storable value (e.g. a bound
+ * parameter that skips affinity), sort order and `sqlValueIdentical` both break
+ * here, not at the call sites.
  */
 function compareNumbers(a: number | bigint, b: number | bigint): number {
 	return a < b ? -1 : a > b ? 1 : 0;

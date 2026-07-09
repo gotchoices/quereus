@@ -5,6 +5,7 @@ import {
 	isTruthy,
 	compareRows,
 	sqlValueIdentical,
+	rowsValueIdentical,
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
 	RTRIM_COLLATION,
@@ -449,6 +450,26 @@ describe('Utility Edge Cases', () => {
 
 		it('should not treat TEXT and NUMERIC storage classes as identical', () => {
 			expect(sqlValueIdentical('1', 1)).to.be.false;
+		});
+
+		it('should not treat NULL as identical to a non-NULL value', () => {
+			expect(sqlValueIdentical(null, 0)).to.be.false;
+			expect(sqlValueIdentical(null, '')).to.be.false;
+			expect(sqlValueIdentical(0, null)).to.be.false;
+		});
+	});
+
+	describe('rowsValueIdentical', () => {
+		it('should inherit the per-value contract of sqlValueIdentical', () => {
+			expect(rowsValueIdentical([5n, true, 'a'], [5, 1, 'a'])).to.be.true;
+			expect(rowsValueIdentical(['1'], [1])).to.be.false;
+			expect(rowsValueIdentical([new Uint8Array([1])], [new Uint8Array([1])])).to.be.true;
+		});
+
+		it('should never treat rows of differing width as identical', () => {
+			expect(rowsValueIdentical([1], [1, 2])).to.be.false;
+			expect(rowsValueIdentical([], [null])).to.be.false;
+			expect(rowsValueIdentical([], [])).to.be.true;
 		});
 	});
 
