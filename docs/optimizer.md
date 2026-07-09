@@ -718,10 +718,11 @@ beneath a SELECT marks every ancestor as side-effect-bearing.
 
 ```typescript
 PlanNodeCharacteristics.hasSideEffects(node)         // local node only
-PlanNodeCharacteristics.subtreeHasSideEffects(node)  // recursive walk (defensive)
+PlanNodeCharacteristics.subtreeHasSideEffects(node)  // iterative subtree walk (defensive)
 ```
 
-The defensive recursive helper exists so a rule's intent reads clearly
+The defensive subtree helper (an explicit worklist, so a deep plan cannot
+overflow the native call stack) exists so a rule's intent reads clearly
 (*"refuse if any subtree I move / drop / dedup carries a write"*) and so
 the audit gate still fires when a custom `computePhysical` override fails
 to propagate `readonly=false`.

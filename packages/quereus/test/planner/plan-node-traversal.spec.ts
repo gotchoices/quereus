@@ -166,6 +166,74 @@ describe('PlanNode: deep-plan traversal does not overflow the stack', () => {
 	});
 });
 
+/**
+ * Multi-child synthetic node that counts how many times its physical is folded.
+ * Used to prove the iterative `physical` fold visits a shared (DAG) subtree node
+ * exactly once. `computePhysical` bumps a per-instance counter and returns an
+ * empty override so the defaults/merge path runs unchanged.
+ */
+class CountingNode extends PlanNode {
+	readonly nodeType = 'CountingNode' as PlanNodeType;
+	readonly kids: readonly PlanNode[];
+	physicalComputeCount = 0;
+
+	constructor(scope: Scope, kids: readonly PlanNode[] = []) {
+		super(scope, 1);
+		this.kids = kids;
+	}
+
+	getType(): BaseType {
+		return { typeClass: 'void' };
+	}
+
+	getChildren(): readonly PlanNode[] {
+		return this.kids;
+	}
+
+	withChildren(_newChildren: readonly PlanNode[]): PlanNode {
+		return this;
+	}
+
+	computePhysical(_children: readonly PhysicalProperties[]): Partial<PhysicalProperties> {
+		this.physicalComputeCount++;
+		return {};
+	}
+}
+
+describe('PlanNode: physical fold visits a shared (DAG) subtree node once', () => {
+	let db: Database;
+	let scope: Scope;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, v text) using memory');
+		scope = db.getPlan('select id, v from t').scope;
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('folds a diamond DAG (A→[B,C], B→[D], C→[D]) computing D exactly once', () => {
+		// D is reachable via two parents. The isDone memo guard must fold it once
+		// and populate its `_physical` before either parent reads it.
+		const d = new CountingNode(scope);
+		const b = new CountingNode(scope, [d]);
+		const c = new CountingNode(scope, [d]);
+		const a = new CountingNode(scope, [b, c]);
+
+		void a.physical;
+
+		expect(d.physicalComputeCount, 'shared node D folded exactly once').to.equal(1);
+		expect(b.physicalComputeCount).to.equal(1);
+		expect(c.physicalComputeCount).to.equal(1);
+		expect(a.physicalComputeCount).to.equal(1);
+		// Every node's memo is populated after the single fold.
+		expect(d.physical).to.equal(d.physical);
+		expect(d.physicalComputeCount, 'memoized — no recompute on re-read').to.equal(1);
+	});
+});
+
 describe('PlanNode: iterative traversal matches a recursive reference on real plans', () => {
 	let db: Database;
 
