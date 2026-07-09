@@ -135,6 +135,15 @@ describe('StoreModule predicate pushdown', () => {
 		await provider.closeAll();
 	});
 
+	/** The `query_plan()` op names for `query`, as a JSON array string. */
+	async function planOps(query: string): Promise<string> {
+		const rows = await asyncIterableToArray(
+			db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
+		);
+		expect(rows).to.have.lengthOf(1);
+		return rows[0].ops as string;
+	}
+
 	describe('explicit PRIMARY KEY (id)', () => {
 		beforeEach(async () => {
 			await db.exec(`
@@ -167,14 +176,6 @@ describe('StoreModule predicate pushdown', () => {
 	// `a = 1 and a = 2` looked like a full key match, claimed both filters, found no
 	// complete equality set to seek, and full-scanned with the residual already gone.
 	describe('redundant same-column constraints on the primary key', () => {
-		async function planOps(query: string): Promise<string> {
-			const rows = await asyncIterableToArray(
-				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
-			);
-			expect(rows).to.have.lengthOf(1);
-			return rows[0].ops as string;
-		}
-
 		describe('single-column primary key', () => {
 			const ids = async (q: string) =>
 				(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
@@ -274,14 +275,6 @@ describe('StoreModule predicate pushdown', () => {
 	// cover drops the residual Filter, StoreTable.compareValues alone must
 	// reproduce the predicate's collation semantics.
 	describe('collated PK range seek (store-range-seek-collation-bounds)', () => {
-		async function planOps(query: string): Promise<string> {
-			const rows = await asyncIterableToArray(
-				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
-			);
-			expect(rows).to.have.lengthOf(1);
-			return rows[0].ops as string;
-		}
-
 		async function values(query: string): Promise<unknown[]> {
 			const rows = await asyncIterableToArray(db.eval(query));
 			return rows.map(r => r.n);
@@ -522,7 +515,9 @@ describe('StoreModule predicate pushdown', () => {
 		async function seed(name: string, using: string): Promise<void> {
 			await db.exec(`create table ${name} (id integer primary key, v integer) ${using}`);
 			await db.exec(
-				`insert into ${name} values (1, 10), (2, 20), (${BIG.toString()}, 30), (${(BIG + 1n).toString()}, 40)`,
+				`insert into ${name} values `
+				+ `(${(-BIG - 1n).toString()}, 5), (${(-BIG).toString()}, 6), `
+				+ `(1, 10), (2, 20), (${BIG.toString()}, 30), (${(BIG + 1n).toString()}, 40)`,
 			);
 		}
 
@@ -542,14 +537,38 @@ describe('StoreModule predicate pushdown', () => {
 			expect(typeof storeRows[0].id).to.equal('bigint');
 		});
 
+		it('an exclusive bound at 2^53+1 excludes only that row', async () => {
+			await seed('bigstore3', 'using store');
+			await seed('bigmem3', '');
+			const q = (t: string) => `select id from ${t} where id > ${BIG.toString()} order by id`;
+			const storeRows = await asyncIterableToArray(db.eval(q('bigstore3')));
+			// A bound rounded through a double would compare equal to BIG's neighbour
+			// and let the excluded row through.
+			expect(storeRows).to.deep.equal([{ id: BIG + 1n }]);
+			expect(storeRows).to.deep.equal(await asyncIterableToArray(db.eval(q('bigmem3'))));
+		});
+
+		// Sign flips the key's byte layout; a scheme that only stayed order-correct
+		// above zero would mis-order the two magnitudes past -2^53 here.
+		it('a range seek below -2^53 matches the oracle, in order, with exact values', async () => {
+			await seed('bigstore4', 'using store');
+			await seed('bigmem4', '');
+			const q = (t: string) => `select id, v from ${t} where id <= ${(-BIG).toString()} order by id`;
+			const storeRows = await asyncIterableToArray(db.eval(q('bigstore4')));
+
+			expect(storeRows).to.deep.equal([
+				{ id: -BIG - 1n, v: 5 },
+				{ id: -BIG, v: 6 },
+			]);
+			expect(storeRows).to.deep.equal(await asyncIterableToArray(db.eval(q('bigmem4'))));
+			expect(typeof storeRows[0].id).to.equal('bigint');
+		});
+
 		it('the range seek uses the index-seek path, not a full scan', async () => {
 			await seed('bigstore2', 'using store');
-			const rows = await asyncIterableToArray(
-				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [
-					`select id from bigstore2 where id >= ${BIG.toString()} order by id`,
-				]),
-			);
-			expect(rows[0].ops as string).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			const ops = await planOps(`select id from bigstore2 where id >= ${BIG.toString()} order by id`);
+			expect(ops).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			expect(ops).to.not.match(/SEQSCAN|SEQ SCAN|SeqScan/i);
 		});
 	});
 
@@ -668,14 +687,6 @@ describe('StoreModule predicate pushdown', () => {
 	// entry to its base row, and getBestAccessPlan advertises the index with
 	// honestly-handled filters — subject to the collation-safety guard.
 	describe('secondary-index scan (store-index-scan-read-primitive)', () => {
-		async function planOps(query: string): Promise<string> {
-			const rows = await asyncIterableToArray(
-				db.eval(`select json_group_array(op) as ops from query_plan(?)`, [query]),
-			);
-			expect(rows).to.have.lengthOf(1);
-			return rows[0].ops as string;
-		}
-
 		it('EQ on an indexed non-text column seeks the index and returns correct rows', async () => {
 			await db.exec(`create table t (id integer primary key, name text, age integer) using store`);
 			await db.exec(`create index ix_age on t (age)`);
