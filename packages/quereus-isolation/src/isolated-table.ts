@@ -69,6 +69,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * for the same connection see the same set — important because each statement creates
 	 * a fresh IsolatedTable instance via module.connect(), so instance-local state would
 	 * be lost between the createSavepoint callback and the ensureOverlay() call.
+	 *
+	 * NOTE: keyed by the name this IsolatedTable was *constructed* with, which after a
+	 * mid-transaction `alter table … rename to …` is the pre-rename name. Deliberate:
+	 * this same instance stays the registered connection's callback object for the rest
+	 * of the transaction and clears the set at commit/rollback, so the key must not move
+	 * out from under it. A statement after the rename connects a fresh IsolatedTable under
+	 * the new name and rebuilds its own set via `Database.registerConnection`'s savepoint
+	 * replay. See `IsolationModule.renameTable`.
 	 */
 	private get savepointsBeforeOverlay(): Set<number> {
 		return this.isolationModule.getPreOverlaySavepoints(this.db, this.schemaName, this.tableName);

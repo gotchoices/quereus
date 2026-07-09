@@ -969,6 +969,52 @@ describe('IsolationModule', () => {
 			expect(afterCommit.length).to.equal(1);
 			expect(afterCommit[0].id).to.equal(1);
 		});
+
+		/** Every live pre-overlay savepoint set, keyed `<dbId>:<schema>.<table>`. */
+		function preOverlaySavepointEntries(): [string, Set<number>][] {
+			const map = (isolatedModule as unknown as { preOverlaySavepoints: Map<string, Set<number>> }).preOverlaySavepoints;
+			return [...map.entries()];
+		}
+
+		it('a mid-transaction RENAME TO leaves no pre-overlay savepoint depths behind after commit', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec('begin');
+			await db.exec('savepoint s1');
+			await db.exec(`insert into widget values (1, 'a')`);
+			await db.exec('alter table widget rename to gadget');
+			await db.exec('commit');
+
+			// Pre-fix, renameTable re-keyed the depth set onto `gadget`, where the old-name
+			// IsolatedTable's commit callback could not clear it.
+			for (const [key, depths] of preOverlaySavepointEntries()) {
+				expect([...depths], `stranded savepoint depths under ${key}`).to.deep.equal([]);
+			}
+		});
+
+		it('a stale pre-overlay depth from a renaming transaction does not wipe the next transaction\'s overlay', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+
+			// Txn 1: two user savepoints before the first write, then rename. Pre-fix this
+			// leaked depths {0, 1} under `gadget`. Depth 1 survives statement-level scrubbing.
+			await db.exec('begin');
+			await db.exec('savepoint a');
+			await db.exec('savepoint b');
+			await db.exec(`insert into widget values (1, 'a')`);
+			await db.exec('alter table widget rename to gadget');
+			await db.exec('commit');
+
+			// Txn 2: row 2 is written before any savepoint, so it must survive the rollback.
+			await db.exec('begin');
+			await db.exec(`insert into gadget values (2, 'b')`);
+			await db.exec('savepoint s1');
+			await db.exec('savepoint s2');               // depth 1 — matched the stale entry
+			await db.exec(`insert into gadget values (3, 'c')`);
+			await db.exec('rollback to savepoint s2');   // pre-fix: discarded the whole overlay
+			await db.exec('commit');
+
+			const rows = await asyncIterableToArray(db.eval('select id from gadget order by id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2]);
+		});
 	});
 
 	describe('compound primary keys', () => {

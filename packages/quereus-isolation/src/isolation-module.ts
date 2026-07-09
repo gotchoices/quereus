@@ -1089,16 +1089,22 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// is closed" errors.
 		this.removeUnderlyingState(schemaName, oldName);
 
-		// Re-key per-connection overlay and savepoint state, preserving the
-		// connection-id prefix so overlays created earlier in an open
-		// transaction remain visible under the new name.
+		// Re-key per-connection overlay state, preserving the connection-id prefix so
+		// overlays created earlier in an open transaction remain visible under the new
+		// name — the commit flush resolves an overlay's underlying by current name.
 		const movedOverlays = this.rekeyConnectionScopedMap(this.connectionOverlays, schemaName, oldName, newName);
-		// NOTE: re-keying the savepoint set here strands it. The registered connection's
-		// callback object is the IsolatedTable built under the OLD name, so its
-		// onConnectionCommit/Rollback clears `<dbId>:<schema>.<oldName>` and the moved
-		// `<newName>` set survives the transaction, to be re-read by the next one. Tracked
-		// in fix/iso-preoverlay-savepoints-stranded-by-rename.
-		this.rekeyConnectionScopedMap(this.preOverlaySavepoints, schemaName, oldName, newName);
+
+		// `preOverlaySavepoints` is deliberately NOT re-keyed. The set's own maintainers —
+		// the savepoint/commit/rollback callbacks on the already-registered
+		// IsolatedConnection — resolve the name the IsolatedTable was constructed with,
+		// which stays `oldName` for the life of the transaction. Moving the set to
+		// `newName` would strand it: the old-name instance clears a key that no longer
+		// exists and the moved set survives into the next transaction, where a matching
+		// `rollback to savepoint` depth would wrongly discard the whole overlay.
+		// Nothing needs carrying over: the first statement after the rename connects a
+		// fresh IsolatedTable under `newName`, whose ensureConnection() registers a new
+		// IsolatedConnection, and `Database.registerConnection` replays the active
+		// savepoint stack onto it — rebuilding the set under the new name from scratch.
 
 		if (movedOverlays > 0) {
 			await this.reconnectUnderlyingAfterRename(db, schemaName, newName, preRenameSchema);
