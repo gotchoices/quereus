@@ -38,6 +38,14 @@ export const STATS_STORE_NAME = '__stats__';
  * Build the store name for a table's data.
  * Format: {schema}.{table}
  */
+// NOTE: composes with a literal '.' delimiter, so the schema/table boundary is
+// not recoverable from the physical name. A lone dotted identifier round-trips
+// fine (both create and reconnect compose the same name), but two distinct
+// logical pairs that differ only in where the dot falls — e.g. (schema 'x',
+// table 'y.z') vs (schema 'x.y', table 'z') — collapse to the same physical
+// store 'x.y.z' and would clobber each other. Harmless today (schema names are
+// effectively never dotted); if dotted schema names become reachable, switch to
+// a boundary-safe encoding (length-prefix or escape the delimiter).
 export function buildDataStoreName(schemaName: string, tableName: string): string {
 	return `${schemaName}.${tableName}`.toLowerCase();
 }
