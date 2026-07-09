@@ -182,4 +182,4 @@ Because maintenance is part of the writing transaction and never re-reads the so
 
 `Database.watch` on a materialized view projects to the MV's **sources** (the maintained table is written off the user change log) — see [Change-scope projection](materialized-views.md#change-scope-projection).
 
-Everything above is driven from *inside* the engine's own write path. Two seams exist for writes the engine did **not** execute: the vtab-internal two-arg `DatabaseInternal._maintainRowTimeCoveringStructures(sourceBase, change)` (the REPLACE-eviction hook a source vtab calls from *within* a statement — MV-only, cold, per-row) and the batch ingestion seam below (the host-facing surface for everything else).
+Everything above is driven from *inside* the engine's own write path. Two seams exist for writes the engine did **not** execute: the vtab-internal two-arg `DatabaseInternal._maintainRowTimeCoveringStructures(sourceBase, change)` (the REPLACE-eviction hook a source vtab calls from *within* a statement — MV-only, cold, per-row) and the [batch ingestion seam](mv-ingestion.md) (the host-facing surface for everything else).

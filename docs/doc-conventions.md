@@ -31,7 +31,7 @@ a changelog entry, it reads as current truth.
 
 > "Historically 'same module ⇒ one atomic commit' did **not** hold even within the store
 > module — a per-store `batch()` loop could tear a source and backing apart…"
-> (`materialized-views.md`)
+> (once in `materialized-views.md`; deleted)
 
 ## Where each one goes
 

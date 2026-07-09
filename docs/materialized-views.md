@@ -8,6 +8,12 @@ This document is the **overview**: what a materialized view is, how to declare o
 
 ## Topic documents
 
+<!-- NOTE: the sections below that moved into a topic document left a stub behind under their
+     original heading, so their old anchors still resolve here. `yarn docs:check` therefore
+     cannot tell a deliberately-kept link to a stub from one that should have been retargeted
+     and wasn't. If a doc ever needs to link at real content that lives in a topic document,
+     link the topic document — not the stub. -->
+
 | Document | Covers | Written for |
 | --- | --- | --- |
 | [Materialized-View Maintenance](mv-maintenance.md) | Strategy selection, the four bounded-delta arms, the full-rebuild floor, MV-over-MV cascade, the per-statement contract. | An engine developer changing how a view is kept fresh. |
@@ -368,7 +374,7 @@ be built, and what makes it hard — lives in [`docs/todo.md` § Materialized vi
 
 - **No bounded-delta arm for a fanning join, an outer 1:1 join, or a scalar aggregate.** They are maintained correctly by the [full-rebuild floor](mv-maintenance.md#full-rebuild-floor); a bounded-delta arm would only make them cheaper.
 - **The bounded-delta arms apply per source row, never coalesced across a statement.** The [full-rebuild floor](mv-maintenance.md#synchronous-transactional-per-statement) already flushes once per statement; the incremental arms cannot, without breaking the enforcement-visibility invariant.
-- **A body with no provable unique key is rejected at create** — no [coarsened lineage key](#coarsened-backing-keys), no row identity, no materialization. Bag (multiplicity-keyed) backings would lift this.
+- **A body with no provable unique key — and no [coarsened lineage key](#coarsened-backing-keys) — is rejected at create.** There is no row identity to materialize on. Bag (multiplicity-keyed) backings would lift this.
 - **No concurrent refresh** beyond the current atomic base-layer swap.
 - **No MV-over-MV write-through.** DML against a materialized view whose source is itself a materialized view is rejected.
 - **A covering materialized view with a non-binary leading key falls back to a full backing scan**, not the prefix scan.

@@ -56,7 +56,7 @@ Full design: [Materialized Views](materialized-views.md).
 
 ### Covering-structure links
 
-A UNIQUE constraint is logical; the structure that enforces it is optional (see [Materialized Views § Covering structures](mv-constraints.md#covering-structures)). Two schema fields record the constraint↔structure association:
+A UNIQUE constraint is logical; the structure that enforces it is optional (see [Derived-Row Constraints § Covering structures](mv-constraints.md#covering-structures)). Two schema fields record the constraint↔structure association:
 
 - **`UniqueConstraintSchema.coveringStructureName`** — the **forward pointer** and **source of truth**: the name of the covering structure realizing this constraint (an auto-built secondary index, or an explicit covering materialized view — the maintained table's own name — recognized by the coverage prover). Set eagerly when a covering MV is created; cleared when that MV is dropped.
 - **`TableDerivation.covers`** — the convenience **reverse link** `{ schemaName, tableName, constraintName? }` back to the covered constraint.

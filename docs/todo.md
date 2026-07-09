@@ -398,6 +398,12 @@ maintained table. Routing one level down to the inner view's own write-through w
 projects to a `full` watch per source. A per-source row/group scope, mirroring the maintenance
 projection the manager already derives, would narrow it.
 
+**Coarsened-key advisory surface.** `TableDerivation.coarsenedKey` is stamped at create but is
+programmatic-only — no SQL or introspection-TVF surface exposes it. If the lens deploy-report
+pipeline grows an advisory surface, the coarsened-key fact is a natural candidate to carry
+there. It must read the live record rather than persist; the stamp stays non-serialized. See
+[`materialized-views.md` § Coarsened backing keys](materialized-views.md#coarsened-backing-keys).
+
 **Backing-host stale-set portability.** The durable stale-MV set's soundness currently rests
 on write-ahead-log ordering: the source DDL is queued before the `sync: true` stale-set write
 on the same queue. Folding the two into one atomic `batch()` would remove the WAL-ordering
