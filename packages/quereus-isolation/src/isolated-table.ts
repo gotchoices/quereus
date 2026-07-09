@@ -75,7 +75,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * this same instance stays the registered connection's callback object for the rest
 	 * of the transaction and clears the set at commit/rollback, so the key must not move
 	 * out from under it. A statement after the rename connects a fresh IsolatedTable under
-	 * the new name and rebuilds its own set via `Database.registerConnection`'s savepoint
+	 * the new name, which builds its own set from `Database.registerConnection`'s savepoint
 	 * replay. See `IsolationModule.renameTable`.
 	 */
 	private get savepointsBeforeOverlay(): Set<number> {

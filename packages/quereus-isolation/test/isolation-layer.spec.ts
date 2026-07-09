@@ -1015,6 +1015,41 @@ describe('IsolationModule', () => {
 			const rows = await asyncIterableToArray(db.eval('select id from gadget order by id'));
 			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2]);
 		});
+
+		it('a savepoint taken before the overlay still discards it after a RENAME TO', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec('begin');
+			await db.exec('savepoint s1');                    // pre-dates the overlay
+			await db.exec('alter table widget rename to gadget');
+			await db.exec(`insert into gadget values (1, 'a')`);
+			await db.exec('rollback to savepoint s1');
+			await db.exec('commit');
+
+			// The post-rename IsolatedTable rebuilds its own pre-overlay depth set from
+			// Database.registerConnection's savepoint replay, so nothing had to be carried
+			// across the rename for the rollback to reach the overlay. The table is still
+			// `gadget` afterwards: Quereus DDL is non-transactional, so `rollback to` does
+			// not undo the rename — only the row staged after the savepoint.
+			const rows = await asyncIterableToArray(db.eval('select id from gadget'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([]);
+		});
+
+		it('two RENAME TO in one transaction strand no pre-overlay savepoint depths', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec('begin');
+			await db.exec('savepoint s1');
+			await db.exec(`insert into widget values (1, 'a')`);
+			await db.exec('alter table widget rename to gadget');
+			await db.exec(`insert into gadget values (2, 'b')`);
+			await db.exec('alter table gadget rename to doohickey');
+			await db.exec('commit');
+
+			for (const [key, depths] of preOverlaySavepointEntries()) {
+				expect([...depths], `stranded savepoint depths under ${key}`).to.deep.equal([]);
+			}
+			const rows = await asyncIterableToArray(db.eval('select id from doohickey order by id'));
+			expect(rows.map((r: any) => r.id)).to.deep.equal([1, 2]);
+		});
 	});
 
 	describe('compound primary keys', () => {

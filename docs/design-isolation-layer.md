@@ -163,6 +163,13 @@ what keep that true, and each has to do explicit work:
   name and args from the pre-rename catalog entry (the hook's signature carries neither, and the
   engine updates the catalog only *after* the hook returns). With no overlay carried across there
   is nothing to flush, so the eviction alone suffices and the next `connect()` re-resolves lazily.
+  It deliberately does **not** re-key `preOverlaySavepoints`: that set is maintained and cleared by
+  the callbacks of the `IsolatedTable` the registered `IsolatedConnection` was built from, and that
+  instance keeps the pre-rename name for the rest of the transaction. Moving the set would leave the
+  old-name instance clearing a key nobody owns while the moved set leaked into the next transaction,
+  where a matching `rollback to savepoint` depth would wrongly discard that transaction's overlay.
+  The first statement after the rename registers a new connection under the new name and
+  `Database.registerConnection` replays the active savepoint stack onto it, so nothing is lost.
 
 A staged overlay (`hasChanges === true`) that still fails to resolve at commit is a violation of
 this invariant, and `commitConnectionOverlays` raises `StatusCode.INTERNAL`. It never silently

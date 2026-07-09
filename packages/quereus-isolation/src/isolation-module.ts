@@ -1104,7 +1104,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// Nothing needs carrying over: the first statement after the rename connects a
 		// fresh IsolatedTable under `newName`, whose ensureConnection() registers a new
 		// IsolatedConnection, and `Database.registerConnection` replays the active
-		// savepoint stack onto it — rebuilding the set under the new name from scratch.
+		// savepoint stack onto it. If no overlay was carried across, that replay rebuilds
+		// the depth set under the new name from scratch; if one was, the replay adds
+		// nothing (the depths no longer pre-date an overlay) and the overlay's own
+		// registered connection already holds a snapshot per active depth, taken when
+		// `ensureOverlay` pre-registered it.
 
 		if (movedOverlays > 0) {
 			await this.reconnectUnderlyingAfterRename(db, schemaName, newName, preRenameSchema);
