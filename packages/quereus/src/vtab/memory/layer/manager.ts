@@ -13,7 +13,8 @@ import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
 import { uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
-import { compareSqlValues, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
+import { compareSqlValues, compareSqlValuesFast, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
+import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
 import { scanLayer as scanLayerImpl } from './scan-layer.js';
@@ -75,6 +76,14 @@ export class MemoryTableManager {
 	public readonly isReadOnly: boolean;
 	public tableSchema: TableSchema;
 
+	/**
+	 * `db.getCollationResolver()`, bound once. Every comparator this manager or its
+	 * layers build — primary key, secondary index, UNIQUE enforcement, scan bounds —
+	 * resolves names through it, so a collation registered on *this* database is
+	 * honored and one registered on no database raises instead of byte-ordering.
+	 */
+	private readonly collationResolver: CollationResolver;
+
 	private primaryKeyFunctions!: PrimaryKeyFunctions;
 
 	/**
@@ -101,6 +110,7 @@ export class MemoryTableManager {
 	) {
 		this.managerId = tableManagerCounter++;
 		this.db = db;
+		this.collationResolver = db.getCollationResolver();
 		this.schemaName = schemaName;
 		this._tableName = tableName;
 		this.tableSchema = initialSchema;
@@ -120,12 +130,12 @@ export class MemoryTableManager {
 		}
 		this.initializePrimaryKeyFunctions();
 
-		this.baseLayer = new BaseLayer(this.tableSchema);
+		this.baseLayer = new BaseLayer(this.tableSchema, this.collationResolver);
 		this._currentCommittedLayer = this.baseLayer;
 	}
 
 	private initializePrimaryKeyFunctions(): void {
-		this.primaryKeyFunctions = createPrimaryKeyFunctions(this.tableSchema);
+		this.primaryKeyFunctions = createPrimaryKeyFunctions(this.tableSchema, this.collationResolver);
 	}
 
 	/**
@@ -1172,6 +1182,14 @@ export class MemoryTableManager {
 	): UpdateResult | null {
 		const indexKey = index.keyFromRow(newRowData);
 		const existingPKs = index.getPrimaryKeys(indexKey);
+		// The overwhelmingly common insert has no candidate at all; bail before paying
+		// for the collation resolves below.
+		if (existingPKs.length === 0) return null;
+
+		// Resolve the per-column enforcement collations once, ahead of the candidate loop
+		// (which collation governs, and why, is spelled out at the compare below).
+		const enforcementCollations = uc.columns.map((col, i) =>
+			this.collationResolver(index.specColumns[i]?.collation ?? schema.columns[col].collation ?? 'BINARY'));
 
 		for (const existingPK of existingPKs) {
 			if (this.comparePrimaryKeys(newPrimaryKey, existingPK) === 0) continue;
@@ -1210,10 +1228,8 @@ export class MemoryTableManager {
 			// is a finding, not a reason to widen the helper).
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
-			if (!uc.columns.every((col, i) => compareSqlValues(
-				newRowData[col], conflictingRow[col],
-				index.specColumns[i]?.collation ?? schema.columns[col].collation,
-			) === 0)) continue;
+			if (!uc.columns.every((col, i) =>
+				compareSqlValuesFast(newRowData[col], conflictingRow[col], enforcementCollations[i]) === 0)) continue;
 			if (index.predicate && !index.rowMatchesPredicate(conflictingRow)) continue;
 
 			// Found a different live row with the same unique key values
@@ -1279,7 +1295,7 @@ export class MemoryTableManager {
 		// index-derived UNIQUE whose declared candidate set could be a subset is declined
 		// upstream by findRowTimeCoveringStructure's collation gate, so only BINARY-floor
 		// or equal-collation MVs ever reach here.
-		const collations = uniqueEnforcementCollations(schema, uc);
+		const collations = uniqueEnforcementCollations(schema, uc).map(name => this.collationResolver(name ?? 'BINARY'));
 
 		for (const conflict of conflicts) {
 			const existingPK = buildPrimaryKeyFromValues(conflict.pk, schema.primaryKeyDefinition);
@@ -1288,7 +1304,7 @@ export class MemoryTableManager {
 			// Validate against the live source row: skip stale backing candidates.
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
 			if (!conflictingRow) continue;
-			if (!uc.columns.every((col, i) => compareSqlValues(newRowData[col], conflictingRow[col], collations[i]) === 0)) continue;
+			if (!uc.columns.every((col, i) => compareSqlValuesFast(newRowData[col], conflictingRow[col], collations[i]) === 0)) continue;
 
 			if (onConflict === ConflictResolution.IGNORE) {
 				return { status: 'ok', row: undefined };
@@ -1329,6 +1345,9 @@ export class MemoryTableManager {
 			? compilePredicate(uc.predicate, schema.columns)
 			: undefined;
 
+		// One resolve per column, not per scanned row.
+		const collations = uc.columns.map(colIdx => this.collationResolver(schema.columns[colIdx].collation ?? 'BINARY'));
+
 		for (const path of primaryTree.ascending(primaryTree.first())) {
 			const existingRow = primaryTree.at(path)!;
 			const existingPK = this.primaryKeyFromRow(existingRow);
@@ -1337,7 +1356,7 @@ export class MemoryTableManager {
 			if (predicate && predicate.evaluate(existingRow) !== true) continue;
 
 			const allMatch = uc.columns.every(
-				colIdx => compareSqlValues(newRowData[colIdx], existingRow[colIdx], schema.columns[colIdx].collation) === 0
+				(colIdx, i) => compareSqlValuesFast(newRowData[colIdx], existingRow[colIdx], collations[i]) === 0
 			);
 			if (!allMatch) continue;
 
@@ -1436,7 +1455,7 @@ export class MemoryTableManager {
 			await this.ensureSchemaChangeSafety();
 
 			const oldBase = this.baseLayer;
-			const newBase = new BaseLayer(this.tableSchema);
+			const newBase = new BaseLayer(this.tableSchema, this.collationResolver);
 			for (const row of rows) {
 				const key = this.primaryKeyFunctions.extractFromRow(row);
 				const path = newBase.primaryTree.find(key);
@@ -2592,7 +2611,7 @@ export class MemoryTableManager {
 				if (connection.pendingTransactionLayer) connection.rollback();
 			}
 			this.connections.clear();
-			this.baseLayer = new BaseLayer(this.tableSchema);
+			this.baseLayer = new BaseLayer(this.tableSchema, this.collationResolver);
 			this._currentCommittedLayer = this.baseLayer;
 			logger.operation('Destroy', this._tableName, 'Manager destroyed and data cleared');
 		} finally {

@@ -3,12 +3,25 @@ import type { TableSchema } from '../../../schema/table.js';
 import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
 import type { Row } from '../../../common/types.js';
 import type { MemoryIndex } from '../index.js';
+import type { CollationResolver } from '../../../types/logical-type.js';
 
 /**
  * Represents a snapshot or a set of changes in the MemoryTable MVCC model.
  * Layers form a chain, starting from a BaseLayer.
  */
 export interface Layer {
+	/**
+	 * Resolves a collation name to its comparison function for the database this
+	 * layer's table belongs to (`Database.getCollationResolver()`). Every comparator
+	 * built inside the layer stack — primary key, secondary index, scan bound — must
+	 * come from here, so a collation registered on the connection is honored and an
+	 * unregistered one raises instead of silently byte-ordering.
+	 *
+	 * A `TransactionLayer` inherits its parent's resolver, so an inherited secondary
+	 * BTree and the child's `compareKeys` are always built from the same function.
+	 */
+	readonly collationResolver: CollationResolver;
+
 	/** Returns the layer ID (unique identifier, potentially timestamp or sequence) */
 	getLayerId(): number;
 

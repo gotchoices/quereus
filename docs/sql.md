@@ -2530,7 +2530,16 @@ Naming an unregistered collation raises `no such collation sequence: <name>` rat
 comparing by byte order, matching SQLite. For a persisted database whose DDL carries a custom
 `COLLATE`, register the collation immediately after opening the connection. `NOCASE` and `RTRIM`
 may be replaced by re-registering them; `BINARY` may not — the engine resolves it directly, so
-`registerCollation('BINARY', ...)` is rejected rather than partially honored.
+`registerCollation('BINARY', ...)` is rejected rather than partially honored. A memory table's
+primary key, secondary indexes, range seeks, and `UNIQUE` enforcement all resolve their declared
+collation names against the connection that owns the table, so a replaced `NOCASE` changes how
+that table's keys sort and which values collide.
+
+A **column**'s `COLLATE` clause is presently restricted to the collations its logical type
+declares support for — `BINARY`/`NOCASE`/`RTRIM` for TEXT — so a custom collation cannot yet be
+declared on a column, only on an index column (`create index … (v collate REVERSE)`) or in a
+query. Types that declare no supported list (INTEGER, REAL, BLOB) accept any name at DDL and fail
+later, when a comparator is built.
 
 **CAST Expression:**
 ```sql

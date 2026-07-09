@@ -9,6 +9,7 @@ import type { IndexSchema } from '../../../schema/table.js';
 import { createPrimaryKeyFunctions, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { createMemoryTableLoggers } from '../utils/logging.js';
 import { QuereusError } from '../../../common/errors.js';
+import type { CollationResolver } from '../../../types/logical-type.js';
 
 let baseLayerCounter = 0;
 const logger = createMemoryTableLoggers('layer:base');
@@ -16,13 +17,15 @@ const logger = createMemoryTableLoggers('layer:base');
 export class BaseLayer implements Layer {
 	private readonly layerId: number;
 	public tableSchema: TableSchema;
+	public readonly collationResolver: CollationResolver;
 	private primaryKeyFunctions!: PrimaryKeyFunctions;
 	public primaryTree: BTree<BTreeKeyForPrimary, Row>;
 	public readonly secondaryIndexes: Map<string, MemoryIndex>;
 
-	constructor(schema: TableSchema) {
+	constructor(schema: TableSchema, collationResolver: CollationResolver) {
 		this.layerId = baseLayerCounter++;
 		this.tableSchema = schema;
+		this.collationResolver = collationResolver;
 		this.initializePrimaryKeyFunctions();
 
 		// Use the same key extraction pattern as TransactionLayer for consistency
@@ -47,7 +50,18 @@ export class BaseLayer implements Layer {
 	}
 
 	private initializePrimaryKeyFunctions(): void {
-		this.primaryKeyFunctions = createPrimaryKeyFunctions(this.tableSchema);
+		this.primaryKeyFunctions = createPrimaryKeyFunctions(this.tableSchema, this.collationResolver);
+	}
+
+	/** Builds a `MemoryIndex` for `indexSchema` under this layer's collation resolver and PK functions. */
+	private createMemoryIndex(indexSchema: IndexSchema): MemoryIndex {
+		return new MemoryIndex(
+			indexSchema,
+			this.tableSchema.columns,
+			this.collationResolver,
+			this.primaryKeyFunctions.compare,
+			this.primaryKeyFunctions.encode,
+		);
 	}
 
 	public rebuildAllSecondaryIndexes(): void {
@@ -80,7 +94,7 @@ export class BaseLayer implements Layer {
 
 		const newIndexes = new Map<string, MemoryIndex>();
 		for (const indexSchema of this.tableSchema.indexes!) {
-			const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare, this.primaryKeyFunctions.encode);
+			const memoryIndex = this.createMemoryIndex(indexSchema);
 			this.populateNewIndex(memoryIndex, indexSchema); // throws CONSTRAINT on duplicate
 			newIndexes.set(indexSchema.name, memoryIndex);
 		}
@@ -152,7 +166,7 @@ export class BaseLayer implements Layer {
 
 		for (const indexSchema of this.tableSchema.indexes!) {
 			try {
-				const memoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare, this.primaryKeyFunctions.encode);
+				const memoryIndex = this.createMemoryIndex(indexSchema);
 				newIndexes.set(indexSchema.name, memoryIndex);
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			} catch (e: any) {
@@ -318,7 +332,7 @@ export class BaseLayer implements Layer {
 			indexName: indexSchema.name
 		});
 
-		const newMemoryIndex = new MemoryIndex(indexSchema, this.tableSchema.columns, this.primaryKeyFunctions.compare, this.primaryKeyFunctions.encode);
+		const newMemoryIndex = this.createMemoryIndex(indexSchema);
 		this.populateNewIndex(newMemoryIndex, indexSchema);
 		this.secondaryIndexes.set(indexSchema.name, newMemoryIndex);
 	}

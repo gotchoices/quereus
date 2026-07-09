@@ -8,6 +8,7 @@ import { createLogger } from '../../../common/logger.js';
 import { createPrimaryKeyFunctions } from '../utils/primary-key.js';
 import { QuereusError } from '../../../common/errors.js';
 import { StatusCode } from '../../../common/types.js';
+import type { CollationResolver } from '../../../types/logical-type.js';
 
 const log = createLogger('vtab:memory:layer:transaction');
 const warnLog = log.extend('warn');
@@ -46,6 +47,13 @@ export interface OwnWrite {
 export class TransactionLayer implements Layer {
 	private readonly layerId: number;
 	public readonly parentLayer: Layer;
+	/**
+	 * Inherited verbatim from the parent layer: this layer's secondary BTrees are
+	 * built over the parent's (`new MemoryIndex(..., parentSecondaryTree)`), so the
+	 * child's `compareKeys` must come from the same collation function the parent
+	 * ordered those nodes with.
+	 */
+	public readonly collationResolver: CollationResolver;
 	private readonly tableSchemaAtCreation: TableSchema; // Schema when this layer was started
 
 	// Primary modifications BTree that inherits from parent
@@ -72,6 +80,7 @@ export class TransactionLayer implements Layer {
 	constructor(parent: Layer) {
 		this.layerId = transactionLayerCounter++;
 		this.parentLayer = parent;
+		this.collationResolver = parent.collationResolver;
 		const schema = parent.getSchema();
 		if (!schema) {
 			throw new QuereusError(
@@ -109,7 +118,7 @@ export class TransactionLayer implements Layer {
 		// All layers of a table derive the PK comparator and encoder from the same PK
 		// definition, so an inherited entry's `primaryKeys` Map keys stay valid for this
 		// layer's value add/remove on each MemoryIndex entry.
-		const pkFunctions = createPrimaryKeyFunctions(schema);
+		const pkFunctions = createPrimaryKeyFunctions(schema, this.collationResolver);
 
 		for (const indexSchema of schema.indexes) {
 			const parentSecondaryTree = this.parentLayer.getSecondaryIndexTree?.(indexSchema.name);
@@ -117,6 +126,7 @@ export class TransactionLayer implements Layer {
 			const memoryIndex = new MemoryIndex(
 				indexSchema,
 				schema.columns,
+				this.collationResolver,
 				pkFunctions.compare,
 				pkFunctions.encode,
 				parentSecondaryTree || undefined // Use parent's secondary index tree as base
@@ -182,7 +192,7 @@ export class TransactionLayer implements Layer {
 
 		// Use the centralized primary key functions instead of duplicating the logic
 		// This ensures consistent handling of empty primary key definitions
-		const pkFunctions = createPrimaryKeyFunctions(this.tableSchemaAtCreation);
+		const pkFunctions = createPrimaryKeyFunctions(this.tableSchemaAtCreation, this.collationResolver);
 		return {
 			primaryKeyExtractorFromRow: pkFunctions.extractFromRow,
 			primaryKeyComparator: pkFunctions.compare

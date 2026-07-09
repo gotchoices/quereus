@@ -1,0 +1,230 @@
+/**
+ * The memory virtual table must resolve collation names against the `Database` it
+ * belongs to, not a process-global registry. Before this suite's fix, everything
+ * under `vtab/memory/` called the global `resolveCollation` (or passed a name to the
+ * three-argument `compareSqlValues`), so a collation registered — or overridden —
+ * with `db.registerCollation` was invisible to primary keys, secondary indexes, range
+ * seeks, and UNIQUE enforcement: they silently ordered by raw byte value.
+ *
+ * Two reachable shapes exercise that:
+ *  - **overriding a built-in** (`NOCASE`/`RTRIM`) on one database. DDL accepts the
+ *    name on a TEXT column, but the comparator must be the database's.
+ *  - **a custom-named collation on an index column** (`create index … collate REVERSE`).
+ *    `IndexColumnSchema.collation` is not gated by `LogicalType.supportedCollations`,
+ *    so a custom name reaches the index comparator. (A *column* declaring
+ *    `collate REVERSE` is still rejected at DDL by that gate — see
+ *    `feat-ddl-accepts-registered-collations` in the backlog.)
+ */
+import { expect } from 'chai';
+import { Database } from '../../src/core/database.js';
+import { ConflictResolution, IndexConstraintOp } from '../../src/common/constants.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import type { MemoryTableManager } from '../../src/vtab/memory/layer/manager.js';
+import type { ScanPlan } from '../../src/vtab/memory/layer/scan-plan.js';
+import type { CollationFunction } from '../../src/types/logical-type.js';
+import type { Row, SqlValue } from '../../src/common/types.js';
+
+/** Descending lexicographic order — the inverse of BINARY. */
+const REVERSE: CollationFunction = (a, b) => (a < b ? 1 : a > b ? -1 : 0);
+
+/** Case-insensitive *descending* order — the inverse of the built-in NOCASE. */
+const REVERSE_NOCASE: CollationFunction = (a, b) => REVERSE(a.toLowerCase(), b.toLowerCase());
+
+/** The memory manager backing `main.<tableName>` on `db`. */
+function getManager(db: Database, tableName: string): MemoryTableManager {
+	const schema = db.schemaManager.getTable('main', tableName);
+	expect(schema, `schema for '${tableName}'`).to.not.be.undefined;
+	expect(schema!.vtabModule, `'${tableName}' module`).to.be.instanceOf(MemoryTableModule);
+	const manager = (schema!.vtabModule as MemoryTableModule).tables.get(`main.${tableName}`.toLowerCase());
+	expect(manager, `memory manager for '${tableName}'`).to.not.be.undefined;
+	return manager!;
+}
+
+/**
+ * Scans a table's committed layer under `plan` directly. The planner does not
+ * currently choose an index whose collation differs from the query's, so driving the
+ * index scan by hand is the only way to observe the index comparator's ordering.
+ */
+async function scanCommitted(db: Database, tableName: string, plan: ScanPlan): Promise<Row[]> {
+	const manager = getManager(db, tableName);
+	const rows: Row[] = [];
+	for await (const row of manager.scanLayer(manager.currentCommittedLayer, plan)) rows.push(row);
+	return rows;
+}
+
+/** Collects one column of a query result, preserving row order. */
+async function column(db: Database, sql: string, name: string): Promise<SqlValue[]> {
+	const values: SqlValue[] = [];
+	for await (const row of db.eval(sql)) values.push(row[name] as SqlValue);
+	return values;
+}
+
+describe('memory vtab resolves collations against its own database', () => {
+	describe('primary key ordering', () => {
+		it('honors a per-database override of a built-in collation', async () => {
+			const db = new Database();
+			db.registerCollation('NOCASE', REVERSE_NOCASE);
+			await db.exec('create table t (k text collate nocase primary key)');
+			await db.exec("insert into t values ('a'), ('b'), ('c')");
+
+			// A bare `select` walks the primary BTree in key order, so this observes the
+			// PK comparator directly. Under the global NOCASE it returned a, b, c.
+			expect(await column(db, 'select k from t', 'k')).to.deep.equal(['c', 'b', 'a']);
+			await db.close();
+		});
+
+		it('leaves a database that did not override the built-in alone', async () => {
+			const db = new Database();
+			await db.exec('create table t (k text collate nocase primary key)');
+			await db.exec("insert into t values ('a'), ('b'), ('c')");
+
+			expect(await column(db, 'select k from t', 'k')).to.deep.equal(['a', 'b', 'c']);
+			await db.close();
+		});
+	});
+
+	describe('secondary index ordering', () => {
+		let db: Database;
+
+		beforeEach(async () => {
+			db = new Database();
+			db.registerCollation('REVERSE', REVERSE);
+			await db.exec('create table t (id integer primary key, v text)');
+			await db.exec('create index ix_v on t (v collate REVERSE)');
+			await db.exec("insert into t values (1,'a'), (2,'b'), (3,'c')");
+		});
+
+		afterEach(async () => { await db.close(); });
+
+		it('walks a REVERSE-collated index in REVERSE key order', async () => {
+			const rows = await scanCommitted(db, 't', { indexName: 'ix_v', descending: false });
+			expect(rows.map(r => r[1])).to.deep.equal(['c', 'b', 'a']);
+		});
+
+		it('seeks a range bound under the index collation, not byte order', async () => {
+			// Under REVERSE, 'a' sorts after 'b'. So `v > 'b'` selects 'a' alone —
+			// the exact inverse of the BINARY answer ('c').
+			const plan: ScanPlan = {
+				indexName: 'ix_v',
+				descending: false,
+				lowerBound: { op: IndexConstraintOp.GT, value: 'b' },
+				boundCollation: 'REVERSE',
+			};
+			const rows = await scanCommitted(db, 't', plan);
+			expect(rows.map(r => r[1])).to.deep.equal(['a']);
+		});
+
+		it('orders a transaction layer over an inherited REVERSE index consistently', async () => {
+			// The child layer wraps the parent's secondary BTree as its base, so its
+			// compareKeys must be built from the same collation function the parent
+			// ordered those nodes with — otherwise the inherited nodes are unreachable
+			// or mis-ordered.
+			const manager = getManager(db, 't');
+			const conn = manager.connect();
+			conn.begin();
+			await manager.performMutation(conn, 'insert', [4, 'b5'], undefined, ConflictResolution.ABORT);
+
+			const layer = conn.pendingTransactionLayer ?? conn.readLayer;
+			const rows: Row[] = [];
+			for await (const r of manager.scanLayer(layer, { indexName: 'ix_v', descending: false })) rows.push(r);
+			expect(rows.map(r => r[1])).to.deep.equal(['c', 'b5', 'b', 'a']);
+			conn.rollback();
+		});
+
+		it('never passes NULL to a collation function', async () => {
+			// Collation functions only ever see the TEXT branch of compareSameType;
+			// NULLs are ordered by storage class before any comparator runs.
+			const seen: unknown[] = [];
+			const db2 = new Database();
+			db2.registerCollation('REVERSE', (a, b) => { seen.push(a, b); return REVERSE(a, b); });
+			await db2.exec('create table n (id integer primary key, v text null)');
+			await db2.exec('create index ix_n on n (v collate REVERSE)');
+			await db2.exec("insert into n values (1, null), (2, 'x'), (3, null), (4, 'y')");
+			await scanCommitted(db2, 'n', { indexName: 'ix_n', descending: false });
+
+			expect(seen.length, 'collation was exercised').to.be.greaterThan(0);
+			expect(seen.every(v => typeof v === 'string'), `saw ${JSON.stringify(seen)}`).to.be.true;
+			await db2.close();
+		});
+	});
+
+	describe('two databases, same collation name, opposite comparators', () => {
+		it('sorts each memory table by its own database rules', async () => {
+			const ascending = new Database();
+			const descending = new Database();
+			ascending.registerCollation('REVERSE', (a, b) => (a < b ? -1 : a > b ? 1 : 0)); // deliberately NOT reversed
+			descending.registerCollation('REVERSE', REVERSE);
+
+			for (const db of [ascending, descending]) {
+				await db.exec('create table t (id integer primary key, v text)');
+				await db.exec('create index ix_v on t (v collate REVERSE)');
+				await db.exec("insert into t values (1,'a'), (2,'b'), (3,'c')");
+			}
+
+			const plan: ScanPlan = { indexName: 'ix_v', descending: false };
+			expect((await scanCommitted(ascending, 't', plan)).map(r => r[1])).to.deep.equal(['a', 'b', 'c']);
+			expect((await scanCommitted(descending, 't', plan)).map(r => r[1])).to.deep.equal(['c', 'b', 'a']);
+
+			await ascending.close();
+			await descending.close();
+		});
+	});
+
+	describe('UNIQUE enforcement', () => {
+		it('still rejects a case-variant duplicate under the built-in NOCASE', async () => {
+			const db = new Database();
+			await db.exec('create table t (id integer primary key, email text collate nocase unique)');
+			await db.exec("insert into t values (1, 'abc')");
+
+			let message = '';
+			try { await db.exec("insert into t values (2, 'ABC')"); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/UNIQUE constraint failed/);
+			await db.close();
+		});
+
+		it('enforces UNIQUE under the overriding database NOCASE comparator', async () => {
+			// A NOCASE override that only folds case for ASCII letters still unifies
+			// 'abc'/'ABC'; what changes is that the comparator is the database's.
+			const db = new Database();
+			db.registerCollation('NOCASE', REVERSE_NOCASE);
+			await db.exec('create table t (id integer primary key, email text collate nocase unique)');
+			await db.exec("insert into t values (1, 'abc')");
+
+			let message = '';
+			try { await db.exec("insert into t values (2, 'ABC')"); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/UNIQUE constraint failed/);
+
+			// A non-equal value still inserts.
+			await db.exec("insert into t values (3, 'abd')");
+			expect(await column(db, 'select count(*) as n from t', 'n')).to.deep.equal([2]);
+			await db.close();
+		});
+	});
+
+	describe('unregistered collation', () => {
+		it('raises rather than silently byte-ordering', async () => {
+			// A TEXT column's COLLATE is gated earlier by LogicalType.supportedCollations,
+			// so use a column type that carries no such list: the memory table's PK
+			// comparator construction is then the first thing to see the unknown name.
+			const db = new Database();
+			let message = '';
+			try { await db.exec('create table t (k integer collate frobnicate primary key)'); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/no such collation sequence: FROBNICATE/i);
+			await db.close();
+		});
+
+		it('reports the DDL validation error first for a TEXT column', async () => {
+			// Pinned by test/logic/102.1-unique-edge-cases.sqllogic: the type-level
+			// "Unknown collation" message must not be pre-empted by the resolver's throw.
+			const db = new Database();
+			let message = '';
+			try { await db.exec('create table t (id integer primary key, x text collate frobnicate)'); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/Unknown collation/);
+			await db.close();
+		});
+	});
+});

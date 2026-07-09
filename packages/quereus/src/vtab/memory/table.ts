@@ -16,7 +16,7 @@ import type { VirtualTableConnection } from '../connection.js';
 import { MemoryVirtualTableConnection } from './connection.js';
 
 import type { VTableEventEmitter } from '../events.js';
-import { compareSqlValues, resolveCollation, createTypedComparator } from '../../util/comparison.js';
+import { compareSqlValues, createTypedComparator } from '../../util/comparison.js';
 import type { TableStatistics, ColumnStatistics } from '../../planner/stats/catalog-stats.js';
 import { buildHistogram } from '../../planner/stats/histogram.js';
 
@@ -453,9 +453,10 @@ export class MemoryTable extends VirtualTable {
 		const index = schema.indexes?.find(idx => idx.name.toLowerCase() === indexName.toLowerCase());
 		if (!index) return undefined;
 
+		const collationResolver = this.db.getCollationResolver();
 		return index.columns.map(col => {
 			const columnSchema = schema.columns[col.index];
-			const collationFunc = col.collation ? resolveCollation(col.collation) : undefined;
+			const collationFunc = col.collation ? collationResolver(col.collation) : undefined;
 			const typedComparator = createTypedComparator(columnSchema.logicalType, collationFunc);
 
 			if (col.desc) {

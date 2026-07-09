@@ -1,6 +1,7 @@
 import { BTree } from 'inheritree';
 import { StatusCode, type Row, type SqlValue } from '../../common/types.js';
-import { createTypedComparator, resolveCollation } from '../../util/comparison.js';
+import { createTypedComparator } from '../../util/comparison.js';
+import type { CollationResolver } from '../../types/logical-type.js';
 import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from './types.js';
 import type { IndexColumnSchema as IndexColumnSpec } from '../../schema/table.js'; // Renamed for clarity
 import type { ColumnSchema } from '../../schema/column.js';
@@ -52,9 +53,17 @@ export class MemoryIndex {
 	 */
 	private readonly encode: (pk: BTreeKeyForPrimary) => string;
 
+	/**
+	 * Resolves this index's declared column collations against the owning database.
+	 * A layer hands down its own resolver, so a child layer's comparator is built
+	 * from the same collation function as the parent tree it inherits.
+	 */
+	private readonly collationResolver: CollationResolver;
+
 	constructor(
 		spec: IndexSpec,
 		allTableColumnsSchema: ReadonlyArray<ColumnSchema>,
+		collationResolver: CollationResolver,
 		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number,
 		encode: (pk: BTreeKeyForPrimary) => string,
 		baseInheritreeTable?: BTree<BTreeKeyForIndex, MemoryIndexEntry>,
@@ -62,6 +71,7 @@ export class MemoryIndex {
 		this.name = spec.name;
 		this.specColumns = Object.freeze(spec.columns.map(c => ({ ...c })));
 		this.allTableColumnsSchema = allTableColumnsSchema;
+		this.collationResolver = collationResolver;
 		this.primaryKeyComparator = primaryKeyComparator;
 		this.encode = encode;
 
@@ -107,7 +117,7 @@ export class MemoryIndex {
 		const descMultiplier = specCol.desc ? -1 : 1;
 
 		// Create type-aware comparator
-		const collationFunc = specCol.collation ? resolveCollation(specCol.collation) : undefined;
+		const collationFunc = specCol.collation ? this.collationResolver(specCol.collation) : undefined;
 		const typedComparator = createTypedComparator(columnSchema.logicalType, collationFunc);
 
 		const keyFromRow = (row: Row): BTreeKeyForIndex => {
@@ -128,7 +138,7 @@ export class MemoryIndex {
 		// Pre-create type-aware comparators for each column
 		const comparators = localSpecColumns.map(sc => {
 			const columnSchema = this.allTableColumnsSchema[sc.index];
-			const collationFunc = sc.collation ? resolveCollation(sc.collation) : undefined;
+			const collationFunc = sc.collation ? this.collationResolver(sc.collation) : undefined;
 			return createTypedComparator(columnSchema.logicalType, collationFunc);
 		});
 

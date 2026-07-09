@@ -1,7 +1,8 @@
 import type { TableSchema, PrimaryKeyColumnDefinition } from '../../../schema/table.js';
 import type { Row, SqlValue } from '../../../common/types.js';
 import type { BTreeKeyForPrimary } from '../types.js';
-import { resolveCollation, createTypedComparator } from '../../../util/comparison.js';
+import { createTypedComparator } from '../../../util/comparison.js';
+import type { CollationResolver } from '../../../types/logical-type.js';
 import { QuereusError } from '../../../common/errors.js';
 import { StatusCode } from '../../../common/types.js';
 import { encodePrimaryKey } from './primary-key-encode.js';
@@ -28,8 +29,12 @@ type ExtractAndCompare = Pick<PrimaryKeyFunctions, 'extractFromRow' | 'compare'>
 /**
  * Creates optimized primary key extraction and comparison functions for a given table schema.
  * This centralizes the logic that was previously duplicated across BaseLayer and TransactionLayer.
+ *
+ * @param collationResolver Resolves the PK columns' declared collation names against the
+ *   owning database (`Database.getCollationResolver()`). Never defaulted to a global
+ *   lookup: a memory table must sort by the collations registered on *its* connection.
  */
-export function createPrimaryKeyFunctions(schema: TableSchema): PrimaryKeyFunctions {
+export function createPrimaryKeyFunctions(schema: TableSchema, collationResolver: CollationResolver): PrimaryKeyFunctions {
 	const pkDefinition = schema.primaryKeyDefinition
 		// Use all columns if no primary key is defined (that's different from an empty primary key)
 		// This is an important design change and documented deviation from SQLite behavior, and not something we want to change
@@ -44,9 +49,9 @@ export function createPrimaryKeyFunctions(schema: TableSchema): PrimaryKeyFuncti
 	if (arity === 0) {
 		base = createSingletonPrimaryKeyFunctions();
 	} else if (arity === 1) {
-		base = createSingleColumnPrimaryKeyFunctions(pkDefinition[0], schema);
+		base = createSingleColumnPrimaryKeyFunctions(pkDefinition[0], schema, collationResolver);
 	} else {
-		base = createCompositeColumnPrimaryKeyFunctions(pkDefinition, schema);
+		base = createCompositeColumnPrimaryKeyFunctions(pkDefinition, schema, collationResolver);
 	}
 
 	return { ...base, encode };
@@ -71,14 +76,15 @@ function createSingletonPrimaryKeyFunctions(): ExtractAndCompare {
  */
 function createSingleColumnPrimaryKeyFunctions(
 	columnDef: PrimaryKeyColumnDefinition,
-	schema: TableSchema
+	schema: TableSchema,
+	collationResolver: CollationResolver
 ): ExtractAndCompare {
 	const pkColIndex = columnDef.index;
 	const descMultiplier = columnDef.desc ? -1 : 1;
 
 	// Get the column's logical type and create type-aware comparator
 	const columnSchema = schema.columns[pkColIndex];
-	const collationFunc = columnDef.collation ? resolveCollation(columnDef.collation) : undefined;
+	const collationFunc = columnDef.collation ? collationResolver(columnDef.collation) : undefined;
 	const typedComparator = createTypedComparator(columnSchema.logicalType, collationFunc);
 
 	const extractFromRow = (row: Row): BTreeKeyForPrimary => {
@@ -109,12 +115,13 @@ function createSingleColumnPrimaryKeyFunctions(
  */
 function createCompositeColumnPrimaryKeyFunctions(
 	pkDefinition: ReadonlyArray<PrimaryKeyColumnDefinition>,
-	schema: TableSchema
+	schema: TableSchema,
+	collationResolver: CollationResolver
 ): ExtractAndCompare {
 	// Pre-create type-aware comparators for each primary key column
 	const comparators = pkDefinition.map(def => {
 		const columnSchema = schema.columns[def.index];
-		const collationFunc = def.collation ? resolveCollation(def.collation) : undefined;
+		const collationFunc = def.collation ? collationResolver(def.collation) : undefined;
 		return createTypedComparator(columnSchema.logicalType, collationFunc);
 	});
 

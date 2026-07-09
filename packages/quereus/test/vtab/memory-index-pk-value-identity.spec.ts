@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { MemoryIndex } from '../../src/vtab/memory/index.js';
 import { createPrimaryKeyFunctions } from '../../src/vtab/memory/utils/primary-key.js';
+import { testBuiltinCollationResolver } from '../util/builtin-collation-resolver.js';
 import { encodeScalar, encodePrimaryKey } from '../../src/vtab/memory/utils/primary-key-encode.js';
 import { createDefaultColumnSchema } from '../../src/schema/column.js';
 import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
@@ -47,8 +48,8 @@ function makeSchema(columns: ColumnSchema[], primaryKeyDefinition: PrimaryKeyCol
 
 /** A single-column secondary index (on column 0) whose entries hold PKs compared/encoded for `pkDefinition`. */
 function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[]): MemoryIndex {
-	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition));
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pk.compare, pk.encode);
+	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition), testBuiltinCollationResolver);
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode);
 }
 
 /**
@@ -60,8 +61,8 @@ function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefini
  * shared entry in place.
  */
 function makeChildIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[], base: MemoryIndex): MemoryIndex {
-	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition));
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, pk.compare, pk.encode, base.data);
+	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition), testBuiltinCollationResolver);
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode, base.data);
 }
 
 describe('MemoryIndex primaryKeys value-identity', () => {

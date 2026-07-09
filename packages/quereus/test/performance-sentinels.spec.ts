@@ -14,6 +14,7 @@ import { Database } from '../src/index.js';
 import { Parser } from '../src/parser/parser.js';
 import { MemoryIndex } from '../src/vtab/memory/index.js';
 import { createPrimaryKeyFunctions } from '../src/vtab/memory/utils/primary-key.js';
+import { testBuiltinCollationResolver } from './util/builtin-collation-resolver.js';
 import { createDefaultColumnSchema } from '../src/schema/column.js';
 import { INTEGER_TYPE } from '../src/types/builtin-types.js';
 import type { TableSchema } from '../src/schema/table.js';
@@ -356,10 +357,11 @@ describe('Performance sentinels', function () {
 				vtabModuleName: 'memory',
 				isView: false,
 			};
-			const pk = createPrimaryKeyFunctions(schema);
+			const pk = createPrimaryKeyFunctions(schema, testBuiltinCollationResolver);
 			const index = new MemoryIndex(
 				{ name: 'ix_status', columns: [{ index: 0 }] },
 				columns,
+				testBuiltinCollationResolver,
 				pk.compare,
 				pk.encode,
 			);

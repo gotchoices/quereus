@@ -664,7 +664,7 @@ describe("Memory VTable Module", () => {
 				{ name: 'id', logicalType: INTEGER_TYPE, notNull: true, primaryKey: false, pkOrder: 0, defaultValue: null, collation: 'BINARY', generated: false },
 				{ name: 'value', logicalType: TEXT_TYPE, notNull: false, primaryKey: false, pkOrder: 0, defaultValue: null, collation: 'BINARY', generated: false },
 			], ['id']);
-			return new BaseLayer(schema);
+			return new BaseLayer(schema, db.getCollationResolver());
 		}
 
 		it("should return false for a fresh layer with no modifications", () => {
