@@ -1,7 +1,7 @@
 import { BTree } from 'inheritree';
 import type { TableSchema } from '../../../schema/table.js';
 import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
-import type { Layer } from './interface.js';
+import type { Layer, PkExtractorsAndComparators } from './interface.js';
 import { MemoryIndex } from '../index.js';
 import { StatusCode, type Row, type SqlValue } from '../../../common/types.js';
 import { type ColumnSchema } from '../../../schema/column.js';
@@ -161,6 +161,27 @@ export class BaseLayer implements Layer {
 		return Boolean(this.tableSchema.indexes && this.tableSchema.indexes.length > 0);
 	}
 
+	/**
+	 * Constructs (does not populate) a `MemoryIndex` per declared index.
+	 *
+	 * A construction failure is logged and the index is dropped from the rebuilt map.
+	 * That is NOT benign, and this catch is not a design choice worth keeping — see
+	 * `bug-rename-column-drops-partial-index`. `ALTER TABLE … RENAME COLUMN` calls
+	 * `handleColumnRename()` (⇒ this rebuild) *before* `propagateColumnRename` has
+	 * rewritten the partial-index predicate ASTs, so a partial index whose `WHERE`
+	 * names the renamed column throws `compilePredicate`'s "unknown column" here.
+	 * Removing the catch turns that into a failed `RENAME COLUMN`; keeping it turns
+	 * it into a silently missing index (the catalog still advertises it, and a scan
+	 * that picks it later raises `Secondary index '<name>' not found`).
+	 *
+	 * An unregistered collation now also throws from `createMemoryIndex`. It cannot
+	 * reach here today — an index naming one could never have been created, and the
+	 * per-database registry has no `unregisterCollation` — but if it ever does, it
+	 * lands in the same silent-drop hole.
+	 *
+	 * Duplicate-key tolerance — the one thing the non-strict rebuild is legitimately
+	 * lenient about — lives in {@link populateSecondaryIndexes}, not here.
+	 */
 	private createSecondaryIndexes(): Map<string, MemoryIndex> {
 		const newIndexes = new Map<string, MemoryIndex>();
 
@@ -218,16 +239,14 @@ export class BaseLayer implements Layer {
 	getSecondaryIndex = (indexName: string): MemoryIndex | undefined =>
 		this.secondaryIndexes.get(indexName);
 
-	public getPkExtractorsAndComparators(schema: TableSchema): {
-		primaryKeyExtractorFromRow: (row: Row) => BTreeKeyForPrimary;
-		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number
-	} {
+	public getPkExtractorsAndComparators(schema: TableSchema): PkExtractorsAndComparators {
 		if (schema !== this.tableSchema) {
 			logger.warn('PK Extractors', this.tableSchema.name, 'Called with different schema');
 		}
 		return {
 			primaryKeyExtractorFromRow: this.primaryKeyFunctions.extractFromRow,
-			primaryKeyComparator: this.primaryKeyFunctions.compare
+			primaryKeyComparator: this.primaryKeyFunctions.compare,
+			primaryKeyEncoder: this.primaryKeyFunctions.encode
 		};
 	}
 

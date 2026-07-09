@@ -3,9 +3,9 @@ import type { TableSchema } from '../../../schema/table.js';
 import { MemoryIndex } from '../index.js';
 import type { Row } from '../../../common/types.js';
 import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
-import type { Layer } from './interface.js';
+import type { Layer, PkExtractorsAndComparators } from './interface.js';
 import { createLogger } from '../../../common/logger.js';
-import { createPrimaryKeyFunctions } from '../utils/primary-key.js';
+import { createPrimaryKeyFunctions, type PrimaryKeyFunctions } from '../utils/primary-key.js';
 import { QuereusError } from '../../../common/errors.js';
 import { StatusCode } from '../../../common/types.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
@@ -56,6 +56,13 @@ export class TransactionLayer implements Layer {
 	public readonly collationResolver: CollationResolver;
 	private readonly tableSchemaAtCreation: TableSchema; // Schema when this layer was started
 
+	/**
+	 * Built once from {@link tableSchemaAtCreation} (which never changes for a layer),
+	 * so the primary tree, every inherited secondary index, and every scan share one
+	 * comparator/encoder set — and one pass of collation resolution.
+	 */
+	private readonly pkFunctions: PrimaryKeyFunctions;
+
 	// Primary modifications BTree that inherits from parent
 	private primaryModifications: BTree<BTreeKeyForPrimary, Row>;
 
@@ -90,11 +97,12 @@ export class TransactionLayer implements Layer {
 			);
 		}
 		this.tableSchemaAtCreation = schema; // Schema is fixed at creation
+		this.pkFunctions = createPrimaryKeyFunctions(schema, this.collationResolver);
 
 		// Initialize primary modifications BTree with parent's primary tree as base
-		const { primaryKeyExtractorFromRow, primaryKeyComparator } = this.getPkExtractorsAndComparators(this.tableSchemaAtCreation);
+		const { extractFromRow, compare: primaryKeyComparator } = this.pkFunctions;
 		const btreeKeyFromValue = (value: Row): BTreeKeyForPrimary => {
-			const result = primaryKeyExtractorFromRow(value);
+			const result = extractFromRow(value);
 			return result;
 		};
 
@@ -118,7 +126,7 @@ export class TransactionLayer implements Layer {
 		// All layers of a table derive the PK comparator and encoder from the same PK
 		// definition, so an inherited entry's `primaryKeys` Map keys stay valid for this
 		// layer's value add/remove on each MemoryIndex entry.
-		const pkFunctions = createPrimaryKeyFunctions(schema, this.collationResolver);
+		const pkFunctions = this.pkFunctions;
 
 		for (const indexSchema of schema.indexes) {
 			const parentSecondaryTree = this.parentLayer.getSecondaryIndexTree?.(indexSchema.name);
@@ -182,20 +190,17 @@ export class TransactionLayer implements Layer {
 		return this.ownWrites;
 	}
 
-	public getPkExtractorsAndComparators(schema: TableSchema): {
-		primaryKeyExtractorFromRow: (row: Row) => BTreeKeyForPrimary;
-		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number
-	} {
+	public getPkExtractorsAndComparators(schema: TableSchema): PkExtractorsAndComparators {
 		if (schema !== this.tableSchemaAtCreation) {
 			warnLog("TransactionLayer.getPkExtractorsAndComparators called with a schema different from its creation schema. Using creation schema.");
 		}
 
 		// Use the centralized primary key functions instead of duplicating the logic
 		// This ensures consistent handling of empty primary key definitions
-		const pkFunctions = createPrimaryKeyFunctions(this.tableSchemaAtCreation, this.collationResolver);
 		return {
-			primaryKeyExtractorFromRow: pkFunctions.extractFromRow,
-			primaryKeyComparator: pkFunctions.compare
+			primaryKeyExtractorFromRow: this.pkFunctions.extractFromRow,
+			primaryKeyComparator: this.pkFunctions.compare,
+			primaryKeyEncoder: this.pkFunctions.encode
 		};
 	}
 

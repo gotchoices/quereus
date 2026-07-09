@@ -6,6 +6,18 @@ import type { MemoryIndex } from '../index.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
 
 /**
+ * The primary-key functions a layer exposes to its scanners: extraction from a row,
+ * ordering, and the lossless encoding used for value-identity keying (dedup sets).
+ * All three come from one `createPrimaryKeyFunctions` build, so a caller never has to
+ * re-resolve the PK columns' collations to obtain the encoder.
+ */
+export interface PkExtractorsAndComparators {
+	primaryKeyExtractorFromRow: (row: Row) => BTreeKeyForPrimary;
+	primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number;
+	primaryKeyEncoder: (pk: BTreeKeyForPrimary) => string;
+}
+
+/**
  * Represents a snapshot or a set of changes in the MemoryTable MVCC model.
  * Layers form a chain, starting from a BaseLayer.
  */
@@ -57,8 +69,5 @@ export interface Layer {
 	/**
 	 * This method provides PK extractor and comparator based on a given schema (usually its own)
 	 */
-	getPkExtractorsAndComparators(schema: TableSchema): {
-		primaryKeyExtractorFromRow: (row: Row) => BTreeKeyForPrimary;
-		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number;
-	};
+	getPkExtractorsAndComparators(schema: TableSchema): PkExtractorsAndComparators;
 }

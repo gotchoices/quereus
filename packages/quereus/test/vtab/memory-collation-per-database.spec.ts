@@ -30,6 +30,12 @@ const REVERSE: CollationFunction = (a, b) => (a < b ? 1 : a > b ? -1 : 0);
 /** Case-insensitive *descending* order — the inverse of the built-in NOCASE. */
 const REVERSE_NOCASE: CollationFunction = (a, b) => REVERSE(a.toLowerCase(), b.toLowerCase());
 
+/** Byte order. Registered under the name `NOCASE`, it makes that name case-sensitive. */
+const BINARY_LIKE: CollationFunction = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Ignores *leading* spaces. Registered under `RTRIM`, it inverts which variants collide. */
+const LTRIM: CollationFunction = (a, b) => BINARY_LIKE(a.replace(/^ +/, ''), b.replace(/^ +/, ''));
+
 /** The memory manager backing `main.<tableName>` on `db`. */
 function getManager(db: Database, tableName: string): MemoryTableManager {
 	const schema = db.schemaManager.getTable('main', tableName);
@@ -199,6 +205,62 @@ describe('memory vtab resolves collations against its own database', () => {
 			// A non-equal value still inserts.
 			await db.exec("insert into t values (3, 'abd')");
 			expect(await column(db, 'select count(*) as n from t', 'n')).to.deep.equal([2]);
+			await db.close();
+		});
+
+		it('lets an overriding NOCASE that does not fold case admit a case variant', async () => {
+			// The discriminating case: the two tests above pass whichever comparator the
+			// storage layer picked, because both the built-in NOCASE and REVERSE_NOCASE
+			// unify 'abc'/'ABC'. Here the database's NOCASE is case-*sensitive*, so 'ABC'
+			// must insert. Against the global registry's NOCASE it raised UNIQUE.
+			const db = new Database();
+			db.registerCollation('NOCASE', BINARY_LIKE);
+			await db.exec('create table t (id integer primary key, email text collate nocase unique)');
+			await db.exec("insert into t values (1, 'abc')");
+			await db.exec("insert into t values (2, 'ABC')");
+
+			expect(await column(db, 'select count(*) as n from t', 'n')).to.deep.equal([2]);
+
+			// And an exact duplicate still collides.
+			let message = '';
+			try { await db.exec("insert into t values (3, 'abc')"); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/UNIQUE constraint failed/);
+			await db.close();
+		});
+
+		it('enforces UNIQUE under an overriding RTRIM comparator', async () => {
+			// RTRIM's override is the same seam as NOCASE's but a different built-in;
+			// here the database's RTRIM ignores *leading* spaces instead of trailing.
+			const db = new Database();
+			db.registerCollation('RTRIM', LTRIM);
+			await db.exec('create table t (id integer primary key, tag text collate rtrim unique)');
+			await db.exec("insert into t values (1, 'x')");
+
+			// Trailing-space variant is distinct under LTRIM (the built-in would unify it).
+			await db.exec("insert into t values (2, 'x  ')");
+			// Leading-space variant collides under LTRIM (the built-in would not).
+			let message = '';
+			try { await db.exec("insert into t values (3, '  x')"); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/UNIQUE constraint failed/);
+
+			expect(await column(db, 'select count(*) as n from t', 'n')).to.deep.equal([2]);
+			await db.close();
+		});
+	});
+
+	describe('composite primary key', () => {
+		it('applies the overridden collation to a trailing key column', async () => {
+			// The single-column PK path and the composite path build their comparators
+			// separately (createSingleColumn… / createCompositeColumn…); only the latter
+			// resolves a collation for a non-leading column.
+			const db = new Database();
+			db.registerCollation('NOCASE', REVERSE_NOCASE);
+			await db.exec('create table t (a integer, b text collate nocase, primary key (a, b))');
+			await db.exec("insert into t values (1,'a'), (1,'b'), (1,'c')");
+
+			expect(await column(db, 'select b from t', 'b')).to.deep.equal(['c', 'b', 'a']);
 			await db.close();
 		});
 	});

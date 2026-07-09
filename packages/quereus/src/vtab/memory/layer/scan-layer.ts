@@ -7,7 +7,6 @@ import { StatusCode, type Row } from '../../../common/types.js';
 import { safeIterate } from './safe-iterate.js';
 import { QuereusError } from '../../../common/errors.js';
 import { planAppliesToKey, resolveScanCollations, type ResolvedScanCollations } from './plan-filter.js';
-import { createPrimaryKeyFunctions } from '../utils/primary-key.js';
 
 /**
  * True if a multi-seek key is SQL NULL (scalar) or contains any NULL component
@@ -55,12 +54,12 @@ function* scanLayerResolved(
 	//    (the point-seek branches gate on `equalityKey != null`).
 	if (plan.equalityKeys && plan.equalityKeys.length > 0) {
 		const seekSchema = layer.getSchema();
-		const { primaryKeyExtractorFromRow } = layer.getPkExtractorsAndComparators(seekSchema);
 		// Dedup by encoded primary key. Membership is all we need (ordered iteration
 		// of the seen-set is not), so a Set of the lossless, type-aware PK encoding
 		// (collation-independent — see utils/primary-key-encode.ts) is lighter than a
 		// full BTree and keys on the same value-identity the PK comparator would.
-		const encodePk = createPrimaryKeyFunctions(seekSchema, layer.collationResolver).encode;
+		const { primaryKeyExtractorFromRow, primaryKeyEncoder: encodePk } =
+			layer.getPkExtractorsAndComparators(seekSchema);
 		const seen = new Set<string>();
 		for (const key of plan.equalityKeys) {
 			if (seekKeyHasNull(key)) continue;
