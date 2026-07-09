@@ -49,7 +49,7 @@ const logger = createMemoryTableLoggers('layer:manager');
  *    conflict-resolution path (physical schemas otherwise never reach it, since
  *    the auto-index always exists) and is exactly the structure the lens layer
  *    makes sole once the auto-index is retired. See
- *    `docs/materialized-views.md` § Covering structures.
+ *    `docs/mv-constraints.md` § Covering structures.
  */
 export type CoveringStructure =
 	| { kind: 'memory-index'; index: MemoryIndex }
@@ -1653,7 +1653,7 @@ export class MemoryTableManager {
 	 * Declared secondary-UNIQUE enforcement for maintenance writes — the
 	 * collision-shaped half of the derived-row constraint contract (CHECK / FK
 	 * are per-row properties and validate engine-side; see
-	 * docs/materialized-views.md § Derived-row constraint validation). The
+	 * docs/mv-constraints.md § Derived-row constraint validation). The
 	 * privileged surface bypasses the DML constraint pipeline, so without this
 	 * the batch above would store two derived rows colliding on a declared
 	 * UNIQUE silently.

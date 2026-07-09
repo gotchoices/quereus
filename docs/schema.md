@@ -56,7 +56,7 @@ Full design: [Materialized Views](materialized-views.md).
 
 ### Covering-structure links
 
-A UNIQUE constraint is logical; the structure that enforces it is optional (see [Materialized Views § Covering structures](materialized-views.md#covering-structures)). Two schema fields record the constraint↔structure association:
+A UNIQUE constraint is logical; the structure that enforces it is optional (see [Materialized Views § Covering structures](mv-constraints.md#covering-structures)). Two schema fields record the constraint↔structure association:
 
 - **`UniqueConstraintSchema.coveringStructureName`** — the **forward pointer** and **source of truth**: the name of the covering structure realizing this constraint (an auto-built secondary index, or an explicit covering materialized view — the maintained table's own name — recognized by the coverage prover). Set eagerly when a covering MV is created; cleared when that MV is dropped.
 - **`TableDerivation.covers`** — the convenience **reverse link** `{ schemaName, tableName, constraintName? }` back to the covered constraint.
@@ -232,7 +232,7 @@ Imports existing schema objects without creating new storage. Used when connecti
 - Schema change events are not emitted (these are existing objects)
 
 **Options** (`ImportCatalogOptions`) — all default off; a plain `importCatalog(ddl)` always refills:
-- `trustBackings` — caller-attested trust in pre-existing durable backings: the caller asserts no crash since they were last written (the store module sets this from its consumed clean-shutdown catalog marker). This is adopt gate 5; the full gate set and its rationale live in [`docs/materialized-views.md` § Cross-module atomicity](materialized-views.md#cross-module-atomicity).
+- `trustBackings` — caller-attested trust in pre-existing durable backings: the caller asserts no crash since they were last written (the store module sets this from its consumed clean-shutdown catalog marker). This is adopt gate 5; the full gate set and its rationale live in [`docs/mv-backing-host.md` § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity).
 - `adoptedBackings` — a shared `Set<string>` of lowercased qualified table names (`schema.<table>`) of every maintained table adopted so far this rehydration session (appended on each adopt). An MV whose body reads another maintained table adopts only when that upstream is in the set — pass ONE set across all of the session's `importCatalog` calls so trust composes through fixpoint rounds.
 - `pendingDerivations` — lowercased qualified names of maintained tables whose own `create materialized view` entries have NOT yet imported this session. An entry whose body reads any of these is deferred (throws, to be retried in a later fixpoint round): the source already exists as a *plain* pre-rehydrated table, so the body would plan — and adopt/refill against content the upstream's own import may be about to replace.
 
@@ -437,7 +437,7 @@ each enforces its own equivalence (matches SQLite and the store, which never reu
 index) (`memory-nonderived-unique-reused-finer-index-under-enforcement`). When a row-time covering
 materialized view is *also* linked to such a constraint, a finer/incomparable index collation
 disqualifies the MV from answering it — see the [covering-MV collation eligibility
-gate](materialized-views.md#enforcement-through-a-covering-mv) — so enforcement falls back to
+gate](mv-constraints.md#enforcement-through-a-covering-mv) — so enforcement falls back to
 this per-scan / auto-index path (still under the index collation). The gate reads the same
 `index.columns[i].collation` this resolver does, so the two stay consistent across an `ALTER
 COLUMN … SET COLLATE`.
@@ -501,7 +501,7 @@ gate — or adopts the phase-1 table without a refill). Phase 3 threads
 call — `trustBackings` is decided **per entry** (`<marker present> && this MV was not
 stale-at-close`), enabling the store-hosted-backing **adopt fast path**
 (no refill) when every gate passes — see
-[`docs/materialized-views.md` § Cross-module atomicity](materialized-views.md#cross-module-atomicity).
+[`docs/mv-backing-host.md` § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity).
 Import is silent — no `materialized_view_added` fires — so rehydration writes
 nothing back to the catalog and a second consecutive reopen yields identical catalog
 bytes (adopt included: an adopted MV record is byte-identical to a refilled one).

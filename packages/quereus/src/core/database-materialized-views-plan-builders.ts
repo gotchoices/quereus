@@ -771,7 +771,7 @@ export function compileLookupMembershipResidual(
  * Build a `'full-rebuild'` plan — the always-correct floor — for an MV whose body matches
  * no bounded-delta arm, or throw with a non-shape diagnostic. This is the fall-through
  * builder {@link tryBuildBoundedDeltaArm} routes to on a `null` (no bounded-delta arm fits).
- * See {@link FullRebuildPlan} and `docs/materialized-views.md` § Full-rebuild floor /
+ * See {@link FullRebuildPlan} and `docs/mv-maintenance.md` § Full-rebuild floor /
  * § Primary key inference.
  *
  * Create-time rejections (none shape-based — the floor accepts general bodies):

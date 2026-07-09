@@ -2215,7 +2215,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * are NOT unwound by Quereus). Serialized via the exec mutex — do NOT call
 	 * from within statement execution or vtab callbacks (deadlock); the
 	 * two-arg `_maintainRowTimeCoveringStructures` is the seam for that
-	 * context. See `docs/materialized-views.md` § External row-change
+	 * context. See `docs/mv-ingestion.md` § External row-change
 	 * ingestion for the full contract.
 	 *
 	 * Returns the collected commit-time global-assertion violations. With the
@@ -2276,7 +2276,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * statement execution or a vtab callback (deadlock; same constraint as
 	 * `refresh materialized view` itself). Returns the refreshed MV identifiers
 	 * (for coarse watch notification); `[]` (no mutex, no transaction) when there
-	 * are no maintained tables. See `docs/materialized-views.md` § Converging all
+	 * are no maintained tables. See `docs/mv-ingestion.md` § Converging all
 	 * materialized views.
 	 */
 	public async refreshAllMaterializedViews(): Promise<Array<{ schemaName: string; name: string }>> {
@@ -2367,7 +2367,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  plus name/staleness checks) with an O(1) negative fast path, so the UNIQUE-check
 	 *  path can consult it without async overhead. When it returns an MV, conflict
 	 *  resolution routes through the covering MV's backing table (in preference to the
-	 *  auto-index) — see `docs/materialized-views.md` § Covering structures. */
+	 *  auto-index) — see `docs/mv-constraints.md` § Covering structures. */
 	public _findRowTimeCoveringStructure(
 		schemaName: string,
 		tableName: string,

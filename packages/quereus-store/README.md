@@ -287,7 +287,7 @@ maintenance through the read-your-own-writes merge, and the backing's text
 primary-key columns are keyed under the store's `collation` arg (default
 `NOCASE` — pass `using store(collation = 'BINARY')` for byte-exact keys). The
 isolation wrapper forwards the capability automatically. See
-[`docs/materialized-views.md` § The store host](../../docs/materialized-views.md#the-store-host-using-store).
+[`docs/mv-backing-host.md` § The store host](../../docs/mv-backing-host.md#the-store-host-using-store).
 
 ## External Row-Write Entry Point
 

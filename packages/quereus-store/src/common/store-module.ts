@@ -2597,7 +2597,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// data writes can land closes the power-loss window where a persisted data write
 		// outlives a lost marker-delete and resurrects a consumed marker. (Backends
 		// without a durability knob no-op the hint — losing it is conservative there, and
-		// memory has no crash.) See docs/materialized-views.md § Cross-module atomicity.
+		// memory has no crash.) See docs/mv-backing-host.md § Cross-module atomicity.
 		await catalogStore.delete(markerKey, { sync: true }); // single-use, regardless of parse outcome
 
 		try {
@@ -2760,7 +2760,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// rename-restore fires one too — so recompute on each event keeps the durable set
 		// current. Enqueued on `persistQueue` AFTER the dispatch above, so the `sync` lands
 		// after the event's own source-DDL write is queued (the durability ordering the
-		// adopt soundness argument relies on — see `docs/materialized-views.md`).
+		// adopt soundness argument relies on — see `docs/mv-backing-host.md` § Cross-module atomicity).
 		this.persistStaleMvSetIfChanged();
 	};
 

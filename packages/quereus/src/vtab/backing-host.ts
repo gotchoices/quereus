@@ -165,7 +165,7 @@ import type { BTreeKeyForPrimary } from './memory/types.js';
  * The point ops (`delete-key`/`upsert`) keep a one-source-row → one-backing-row
  * delta (covering-index, aggregate-residual); `delete-by-prefix` is the
  * one-source-row → N-backing-rows primitive; `replace-all` is the whole-table
- * primitive — see `docs/materialized-views.md` § Row-time refresh and
+ * primitive — see `docs/mv-maintenance.md` § Maintenance (row-time, per-statement) and
  * `docs/incremental-maintenance.md` § prefix-delete / § replace-all.
  */
 export type MaintenanceOp =

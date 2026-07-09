@@ -6,7 +6,7 @@
  * watch column, the per-statement {@link BackingConnectionCache}, and the
  * {@link MaterializedViewManagerContext} the manager runs against. Split out of
  * `database-materialized-views.ts` (its class + orchestration) so the type surface reads
- * on its own; see that file and `docs/materialized-views.md` for how each arm is built and
+ * on its own; see that file and `docs/mv-maintenance.md` for how each arm is built and
  * applied.
  */
 
@@ -214,7 +214,7 @@ export interface InverseProjectionPlan extends MaintenancePlanCommon {
  * fits ({@link MaterializedViewManager.tryBuildBoundedDeltaArm} returns `null`). It is the
  * one **deferred** arm — marked dirty per source row and rebuilt exactly once at the
  * end-of-statement flush ({@link MaterializedViewManager.flushDeferredRebuilds}), so a bulk
- * write is O(body) not O(rows × body). See `docs/materialized-views.md` § Full-rebuild floor.
+ * write is O(body) not O(rows × body). See `docs/mv-maintenance.md` § Full-rebuild floor.
  */
 export interface FullRebuildPlan extends MaintenancePlanCommon {
 	readonly kind: 'full-rebuild';
@@ -410,7 +410,7 @@ export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidual
  * boundary defers to a single end-of-statement {@link MaterializedViewManager.flushDeferredRebuilds}
  * (tracked in a separate per-statement dirty set, not this cache) — sound because a
  * full-rebuild MV is never a covering structure, so no enforcement scan depends on its
- * per-row visibility. See `docs/materialized-views.md` § Synchronous, transactional,
+ * per-row visibility. See `docs/mv-maintenance.md` § Synchronous, transactional,
  * per-statement. Because the cache is scoped to one generator run, the connection it holds
  * cannot be torn down mid-statement; the cold enforcement/eviction paths that omit the cache
  * re-resolve the *same* connection deterministically, so reads-own-writes is unaffected.

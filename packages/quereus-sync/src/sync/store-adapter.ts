@@ -48,7 +48,7 @@
  *     `bootstrapFinalize` therefore does NOT evaluate any global assertion —
  *     not even a no-dependency one. This uniform skip is consistent with the
  *     seam's general trust-the-origin posture for every other constraint type
- *     (see `docs/materialized-views.md` § Trust boundary). MV-backed assertions
+ *     (see `docs/mv-ingestion.md` § Trust boundary). MV-backed assertions
  *     would see the MV only after `refreshAllMaterializedViews()`; under
  *     trust-the-origin they are not evaluated at finalize at all, so MV-refresh
  *     ordering is moot for assertions. Residual risk (a corrupt/hostile snapshot
@@ -90,7 +90,7 @@
  * abort throws (see admission.ts `applyDataToStore`). The abort still blocks the
  * metadata commit and the batch still re-resolves.
  *
- * Constraints (see docs/materialized-views.md § External row-change
+ * Constraints (see docs/mv-ingestion.md § External row-change
  * ingestion): the callback is host-driven — never invoke it from within
  * statement execution or vtab callbacks (exec-mutex deadlock), and hosts
  * should not drive it while holding an open explicit transaction on `db`

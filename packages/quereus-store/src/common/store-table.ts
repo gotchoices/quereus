@@ -2191,7 +2191,7 @@ export class StoreTable extends VirtualTable {
 	 * Declared secondary-UNIQUE enforcement for maintenance writes — the store
 	 * mirror of the memory manager's `enforceSecondaryUniqueOnMaintenance` (see
 	 * `vtab/backing-host.ts` § Constraint validation for the contract and
-	 * docs/materialized-views.md § Derived-row constraint validation for the
+	 * docs/mv-constraints.md § Derived-row constraint validation for the
 	 * semantics). Called by `StoreBackingHost.applyMaintenance` AFTER the op
 	 * batch lands in the coordinator's pending state: post-batch is load-bearing
 	 * (a `replace-all` diff applies puts before deletes, so a per-op check would

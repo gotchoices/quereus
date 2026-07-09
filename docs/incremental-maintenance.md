@@ -88,7 +88,7 @@ covering structure answers it.
 > assertion evaluator uses), and upserts the recomputed group row — the backing key IS
 > the group key, so the upsert replaces the old row wholesale (no delete-first), and a
 > value-identical recompute is suppressed by the host's skip-identical upsert
-> ([materialized-views.md § no-op suppression](materialized-views.md#value-identical-no-op-write-suppression)).
+> ([mv-maintenance.md § no-op suppression](mv-maintenance.md#value-identical-no-op-write-suppression)).
 > A group-key-changing UPDATE recomputes both the OLD and NEW groups; an emptied group's
 > residual returns zero rows, which maps to the point delete that removes its backing
 > row. Per-row recompute is correct without per-statement batching — every change to a
@@ -334,7 +334,7 @@ covering structure answers it.
 > through `Database.ingestExternalRowChanges`, whose batch replays the same facets — change
 > capture, batch-amortized row-time maintenance (one `BackingConnectionCache` + one deferred
 > full-rebuild set + one flush per batch), and opt-in FK actions — inside the coordinated
-> transaction. See [Materialized Views § External row-change ingestion](materialized-views.md#external-row-change-ingestion).
+> transaction. See [Materialized Views § External row-change ingestion](mv-ingestion.md#external-row-change-ingestion).
 
 ## Pipeline at a glance
 
@@ -561,7 +561,7 @@ const dispose = deltaExecutor.register({
 - Analysis surface ("what to bind"): [Optimizer Assertion Analysis § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable)
 - Public reactive API / `ChangeScope`: [Change-scope Documentation](change-scope.md)
 - Synchronous (off-kernel) materialization: [Materialized Views](materialized-views.md)
-- Externally-applied writes → this pipeline: [Materialized Views § External row-change ingestion](materialized-views.md#external-row-change-ingestion)
+- Externally-applied writes → this pipeline: [Materialized Views § External row-change ingestion](mv-ingestion.md#external-row-change-ingestion)
 - Layered schemas / lenses: [Lenses and Layered Schemas](lens.md)
 - Source: `src/planner/analysis/binding-extractor.ts`,
   `src/planner/analysis/key-filter.ts`, `src/runtime/delta-executor.ts`,

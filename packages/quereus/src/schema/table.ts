@@ -697,7 +697,7 @@ export interface UniqueConstraintSchema {
 	 * "constraint is logical, structure is optional" surface. When the named
 	 * structure is a covering MV (every MV is row-time maintained), UNIQUE conflict
 	 * resolution routes through its backing table in preference to the auto-index
-	 * (see `docs/materialized-views.md` § Enforcement through a row-time covering MV);
+	 * (see `docs/mv-constraints.md` § Enforcement through a covering MV);
 	 * a `stale` covering MV is not row-time consistent and is not used for
 	 * enforcement. See `docs/schema.md`.
 	 */

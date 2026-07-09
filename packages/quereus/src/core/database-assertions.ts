@@ -41,7 +41,7 @@ const MAX_VIOLATION_SAMPLES = 5;
  * thrown) when {@link AssertionEvaluator.runGlobalAssertions} is driven in
  * report mode. Surfaced to the external-row ingestion seam's caller so a
  * trust-the-origin inbound merge can land its data and still be notified of
- * the broken invariant. See `docs/materialized-views.md` § Trust boundary.
+ * the broken invariant. See `docs/mv-ingestion.md` § Trust boundary.
  */
 export interface AssertionViolation {
 	/** Name of the violated assertion. */
@@ -205,7 +205,7 @@ export class AssertionEvaluator {
 	 * walked and ALL violations across the batch are gathered, not just the
 	 * first. Report mode is used by the external-row ingestion seam so a
 	 * trusted inbound merge can land its data and still surface the broken
-	 * invariant (see `docs/materialized-views.md` § Trust boundary).
+	 * invariant (see `docs/mv-ingestion.md` § Trust boundary).
 	 *
 	 * @param sink When provided, collect violations here instead of throwing.
 	 * @throws QuereusError with CONSTRAINT status if any assertion is violated

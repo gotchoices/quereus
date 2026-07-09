@@ -236,7 +236,7 @@ export const CLEAN_SHUTDOWN_META_NAME = 'clean_shutdown';
  * fast path's logical-staleness exclusion basis — `!durableStale.has(name)` —
  * which (unlike the clean-shutdown marker) survives a crash, so a non-stale backing
  * adopts even after a crash. Any unparseable / wrong-shape payload degrades to
- * refill-everything: the safe posture (see `docs/materialized-views.md`
+ * refill-everything: the safe posture (see `docs/mv-backing-host.md`
  * § Cross-module atomicity).
  */
 export const STALE_MVS_META_NAME = 'stale_mvs';

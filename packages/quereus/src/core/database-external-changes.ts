@@ -13,7 +13,7 @@
  * the DML generators' per-statement amortization (one
  * {@link BackingConnectionCache}, one deferred full-rebuild set, one
  * savepoint-broadcast scope per batch). See
- * `docs/materialized-views.md` § External row-change ingestion for the full
+ * `docs/mv-ingestion.md` § External row-change ingestion for the full
  * contract (facet semantics, trust boundary, transaction & visibility rules).
  */
 

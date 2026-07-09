@@ -44,7 +44,7 @@ export interface WriteOptions {
 	 * Used by the materialized-view clean-shutdown marker consume-delete to force
 	 * the delete durable before any of the session's data writes can become durable
 	 * (otherwise a power loss could resurrect a consumed marker — see
-	 * `docs/materialized-views.md` § Cross-module atomicity).
+	 * `docs/mv-backing-host.md` § Cross-module atomicity).
 	 */
 	sync?: boolean;
 }

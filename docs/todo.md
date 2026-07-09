@@ -343,3 +343,66 @@ become bloom or merge joins in the Physical pass.
 - [ ] Teach the memory module to answer a correlated seek through it
 - [ ] Retire the `JoinNode` special-casing for lateral once the above lands
 
+
+## Materialized views
+
+Everything below is unimplemented. The one-line pointers under
+[`materialized-views.md` § Current limitations](materialized-views.md#current-limitations)
+name each item; the design detail lives here.
+
+**Bounded-delta arms for floor-covered shapes.** A fanning (non-1:1) keyed join, an outer 1:1
+join, and a scalar (no-`GROUP BY`) aggregate are maintained correctly by the
+[full-rebuild floor](mv-maintenance.md#full-rebuild-floor) but have no *bounded-delta* arm.
+These are pure performance refinements — they shrink the rebuild fallback without changing
+coverage:
+
+- [ ] Delta-arithmetic aggregate arm (`sum` / `count`), with a rescan-on-retraction fallback for `min` / `max`
+- [ ] Null-extending reverse residual, giving outer 1:1 joins a bounded-delta arm
+- [ ] By-prefix fanning-join arm — the natural next consumer of the `'prefix-delete'` machinery
+- [ ] A possible **unified maintenance substrate** folding the row-time arms and the post-commit `DeltaExecutor` binding kernel under one abstraction; the arms above would retarget onto it if it lands
+
+**Statement-level op-coalescing for the incremental arms.** The bounded-delta arms apply per
+row; their per-statement batching caches connection resolution only, never buffering ops. A
+true op-buffering flush (with the cost gate's `degradeToRebuild`) would require
+`lookupCoveringConflicts` to union the not-yet-flushed buffer, or to flush before every
+enforcement read — otherwise it breaks the enforcement-visibility invariant in
+[`mv-maintenance.md` § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement).
+The full-rebuild floor is *already* deferred to a once-per-statement flush; this item is the
+analogous flush for the incremental arms, and is harder for exactly that reason.
+
+- [ ] Op-buffering flush for the bounded-delta arms
+- [ ] Union the buffer into `lookupCoveringConflicts` (or flush before each enforcement read)
+- [ ] Wire the cost gate's `degradeToRebuild`
+
+**Bag (multiplicity-keyed) materialization.** A body with no provable unique key — and no
+[coarsened lineage key](materialized-views.md#coarsened-backing-keys) — is rejected at create
+today, because there is no row identity to materialize on. A Z-set-style backing (distinct
+rows plus a multiplicity count, expanded on read) would lift the restriction, at the cost of
+a hidden count column and a read-time expansion.
+
+- [ ] Z-set backing with a hidden multiplicity column
+- [ ] Read-time expansion, and its interaction with the covering-structure prover
+
+**Concurrent refresh.** Overlapping refreshes, and refresh-while-read beyond the current
+atomic base-layer swap.
+
+**MV-over-MV write-through.** DML against a materialized view whose body's source is itself a
+materialized view is rejected today; its rewrite would target the inner view's read-only
+maintained table. Routing one level down to the inner view's own write-through would lift it.
+
+**Non-binary covering-MV prefix scan.**
+
+- [ ] Thread per-column collation into `ScanPlan.equalityPrefix` matching (`plan-filter.ts` / `scan-layer.ts`) so a non-binary covering materialized view uses the prefix scan instead of the full-scan fallback
+
+**Precise change-scope projection.** `Database.watch` on a materialized view currently
+projects to a `full` watch per source. A per-source row/group scope, mirroring the maintenance
+projection the manager already derives, would narrow it.
+
+**Backing-host stale-set portability.** The durable stale-MV set's soundness currently rests
+on write-ahead-log ordering: the source DDL is queued before the `sync: true` stale-set write
+on the same queue. Folding the two into one atomic `batch()` would remove the WAL-ordering
+dependency and make the adopt fast path portable to any backend. It requires reworking
+`alterTable`'s eager source-DDL persist across every alter kind. See
+[`mv-backing-host.md` § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity).
+
+- [ ] Fold the stale-set write into the source DDL's atomic batch

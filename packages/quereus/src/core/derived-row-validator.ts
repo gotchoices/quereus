@@ -25,7 +25,7 @@
  * {@link makePoisonedDerivedRowValidator} handles the one rebuild that cannot
  * recompile (the subquery-CHECK target was dropped).
  *
- * Semantics (documented in `docs/materialized-views.md` § Derived-row
+ * Semantics (documented in `docs/mv-constraints.md` § Derived-row
  * constraint validation):
  *  - **op-mask collapse** — a derived row image is neither a user INSERT nor
  *    UPDATE (which op maintenance realizes is an artifact of backing-key

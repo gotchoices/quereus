@@ -5,7 +5,7 @@
  * uniqueness question. Pure analysis: it records a constraint↔structure link
  * (see `runtime/emit/materialized-view.ts`); **nothing enforces through the MV's
  * backing table in this ticket** (that needs row-time write-through maintenance
- * — see `docs/materialized-views.md` § Covering structures, the soundness note).
+ * — see `docs/mv-constraints.md` § Covering structures, the soundness note).
  *
  * Shape — the body, after optimization, walks down to a single constrained base
  * table `T` through a chain of:

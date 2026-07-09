@@ -815,7 +815,7 @@ function hasApplicableConstraints(db: Database, mt: TableSchema): boolean {
  * derived row set in the connection's pending layer, scan the table's EFFECTIVE
  * (pending-over-committed) contents against every declared CHECK whose op-mask
  * intersects INSERT | UPDATE (the derived-row op-mask collapse — a derived row's
- * presence is neither a user INSERT nor UPDATE, see docs/materialized-views.md)
+ * presence is neither a user INSERT nor UPDATE, see docs/mv-constraints.md)
  * and every declared child-side FK (pragma-gated inside the FK validator,
  * MATCH SIMPLE). Post-reconcile contents are exactly the derived set, so this
  * validates every row the table will hold — which is also why detach can never
@@ -2380,7 +2380,7 @@ async function reshapeBackingInPlace(
 	// whose truth flips under the column's NEW logical type (e.g. `v < '9'` retyped
 	// TEXT → INTEGER) is likewise validated under the OLD type and missed (documented
 	// limitation; see the note in rebuildBacking's constraint-bearing branch and
-	// docs/materialized-views.md).
+	// docs/materialized-views.md § REFRESH MATERIALIZED VIEW).
 	for (const op of plan.postReconcileOps) {
 		current = await module.alterTable(db, mv.schemaName, mv.name, reshapeOpToChange(op));
 		live = graftReshapedRecord(current, mv);

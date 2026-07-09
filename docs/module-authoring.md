@@ -332,7 +332,7 @@ the host owns its own concurrency discipline under the module's declared
 host (`StoreBackingHost` in `@quereus/store` — pending state on the per-table
 `TransactionCoordinator`, reads-own-writes via the store's pending-merge read
 paths, with the isolation wrapper forwarding the capability conditionally); see
-[`docs/materialized-views.md` § Backing-host capability](materialized-views.md#backing-host-capability)
+[`docs/mv-backing-host.md`](mv-backing-host.md#backing-host-capability)
 for the engine-side view.
 
 A capability-advertising module is selectable as an MV's backing host via
@@ -357,7 +357,7 @@ open** — the store module's vehicle is a single-use clean-shutdown catalog
 marker written by `closeAll` and consumed at `rehydrateCatalog`. Never pass
 `trustBackings` unconditionally: the engine's remaining gates are DDL-level and
 cannot see content divergence from a crash. See
-[`docs/materialized-views.md` § Cross-module atomicity](materialized-views.md#cross-module-atomicity)
+[`docs/mv-backing-host.md` § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity)
 for the full gate set.
 
 ## Capability negotiation surface
