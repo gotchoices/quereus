@@ -206,6 +206,9 @@ export function resolveVtabModule(
 
 /**
  * Resolves a collation function at build time and records the dependency.
+ * Delegates the lookup to `db.getCollationResolver()` — the one resolution
+ * primitive — so a build-time miss reports the same `no such collation
+ * sequence: X` error as emit time, and never falls back to BINARY.
  */
 export function resolveCollation(
 	ctx: PlanningContext,
@@ -220,14 +223,7 @@ export function resolveCollation(
 		return cached as CollationFunction;
 	}
 
-	// Resolve collation
-	const collation = ctx.db._getCollation(collationName);
-	if (!collation) {
-		throw new QuereusError(
-			`Collation not found: ${collationName}`,
-			StatusCode.ERROR
-		);
-	}
+	const collation = ctx.db.getCollationResolver()(collationName);
 
 	// Record dependency
 	const dependency: SchemaDependency = {

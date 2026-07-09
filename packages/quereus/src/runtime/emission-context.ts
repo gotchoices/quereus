@@ -172,6 +172,10 @@ export class EmissionContext {
 	 * Looks up a collation and records the dependency.
 	 * Also captures the collation reference for runtime use.
 	 */
+	// NOTE: the dependency is keyed on the name as written, so `collation:nocase` and
+	// `collation:NOCASE` are distinct keys for one collation. Harmless — validation
+	// re-resolves case-insensitively — but it can list the same collation twice in a
+	// plan fingerprint; normalize the key if fingerprint identity ever has to be exact.
 	getCollation(collationName: string): CollationFunction | undefined {
 		const collation = this.db._getCollation(collationName);
 		if (collation) {

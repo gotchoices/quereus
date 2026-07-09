@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
-import { QuereusError } from '../src/common/errors.js';
+import { MisuseError, QuereusError } from '../src/common/errors.js';
 import {
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
@@ -52,6 +52,12 @@ describe('Database.getCollationResolver', () => {
 		expect(() => resolve('   ')).to.throw(QuereusError, /no such collation sequence:/);
 	});
 
+	it('tolerates surrounding whitespace on a resolvable name', () => {
+		const resolve = db.getCollationResolver();
+		expect(resolve('  nocase  ')).to.equal(NOCASE_COLLATION);
+		expect(resolve(' BINARY ')).to.equal(BINARY_COLLATION);
+	});
+
 	it('has stable identity across calls', () => {
 		expect(db.getCollationResolver()).to.equal(db.getCollationResolver());
 	});
@@ -67,6 +73,17 @@ describe('Database.getCollationResolver', () => {
 		const resolve = db.getCollationResolver();
 		db.registerCollation('NOCASE', reverse);
 		expect(resolve('NOCASE')).to.equal(reverse);
+	});
+
+	it('rejects an attempt to override BINARY, whatever its spelling', () => {
+		// The exact-'BINARY' fast path would bypass such an override for the canonical
+		// spelling while honoring it for any other, so the registration is refused
+		// outright rather than half-applied.
+		expect(() => db.registerCollation('BINARY', reverse)).to.throw(MisuseError, /BINARY cannot be overridden/);
+		expect(() => db.registerCollation('binary', reverse)).to.throw(MisuseError, /BINARY cannot be overridden/);
+		const resolve = db.getCollationResolver();
+		expect(resolve('BINARY')).to.equal(BINARY_COLLATION);
+		expect(resolve('binary')).to.equal(BINARY_COLLATION);
 	});
 
 	it('is reachable through the DatabaseInternal seam', () => {
@@ -114,6 +131,7 @@ describe('builtinCollationResolver', () => {
 		expect(builtinCollationResolver('BINARY')).to.equal(BINARY_COLLATION);
 		expect(builtinCollationResolver('nocase')).to.equal(NOCASE_COLLATION);
 		expect(builtinCollationResolver('RTrim')).to.equal(RTRIM_COLLATION);
+		expect(builtinCollationResolver('  rtrim ')).to.equal(RTRIM_COLLATION);
 	});
 
 	it('returns undefined for anything else', () => {

@@ -2528,7 +2528,9 @@ Any other collation must be registered with `db.registerCollation(name, comparat
 `Database` that opens a table, index, or query naming it — and before that table is queried.
 Naming an unregistered collation raises `no such collation sequence: <name>` rather than silently
 comparing by byte order, matching SQLite. For a persisted database whose DDL carries a custom
-`COLLATE`, register the collation immediately after opening the connection.
+`COLLATE`, register the collation immediately after opening the connection. `NOCASE` and `RTRIM`
+may be replaced by re-registering them; `BINARY` may not — the engine resolves it directly, so
+`registerCollation('BINARY', ...)` is rejected rather than partially honored.
 
 **CAST Expression:**
 ```sql

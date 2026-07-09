@@ -112,7 +112,7 @@ export function resolveCollation(collationName: string): CollationFunction {
  * @param name The collation name (case-insensitive)
  */
 export function builtinCollationResolver(name: string): CollationFunction | undefined {
-	switch (name.toUpperCase()) {
+	switch (normalizeCollationName(name)) {
 		case 'BINARY': return BINARY_COLLATION;
 		case 'NOCASE': return NOCASE_COLLATION;
 		case 'RTRIM': return RTRIM_COLLATION;
