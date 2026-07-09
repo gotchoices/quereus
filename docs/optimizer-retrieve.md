@@ -1,0 +1,381 @@
+# Optimizer Retrieve Push-down
+
+How operations slide across the virtual-table boundary: the `RetrieveNode`
+abstraction, the module capability API, access-path selection, and the correlated
+(lateral) access model. Table-valued functions advertise the same physical properties
+a virtual table does, so their declaration surface lives here too.
+
+## Retrieve-based Push-down Architecture
+
+### Overview
+
+The Quereus optimizer features a comprehensive push-down infrastructure built around the `RetrieveNode` abstraction. This system enables virtual table modules to execute arbitrary query pipelines within their own execution context, providing a clean boundary between Quereus execution and module-specific optimization.
+
+### RetrieveNode Infrastructure
+
+**Core Concept**: Every `TableReferenceNode` is wrapped in a `RetrieveNode` at build time, marking the exact boundary where data transitions from virtual table module execution to Quereus execution.
+
+```typescript
+// Builder automatically wraps table references
+export function buildTableReference(fromClause: AST.FromClause, context: PlanningContext): RetrieveNode {
+  const tableRef = new TableReferenceNode(/* ... */);
+  return new RetrieveNode(context.scope, tableRef, tableRef); // pipeline starts as just the table
+}
+```
+
+**Structure**:
+```
+RetrieveNode
+  └─ pipeline: RelationalPlanNode  (operations handled by the module)
+      └─ TableReferenceNode        (leaf table reference)
+  [bindings: ScalarPlanNode[]]     (captured params/correlated expressions)
+```
+
+### Supported-only placement policy
+
+- **Pushdown rule**: When sliding a `Filter` down into a `Retrieve`, the optimizer:
+  - Normalizes the predicate, extracts constraints for the `Retrieve` table, and constructs a supported-only predicate fragment.
+  - Inserts only that fragment as a `Filter` inside the `Retrieve` pipeline.
+  - Leaves any residual (unsupported) predicate above the `Retrieve` boundary.
+  - Merges newly referenced bindings (parameters/correlations) into `Retrieve.bindings`.
+
+- **Grow-retrieve rule**: When sliding `Retrieve` upward over a `Filter` (index-style fallback):
+  - The rule mirrors the pushdown behavior: only supported fragments of the enveloped node are placed beneath `Retrieve` as a new `Filter`. The residual remains above.
+  - Bindings are collected from the added fragment and merged into `Retrieve.bindings`.
+
+This policy ensures the `Retrieve` pipeline is always a precise description of what the module/index can handle; unsupported parts never enter the boundary.
+
+### Set operations and growth boundaries
+
+- `SetOperation` (`UNION`, `INTERSECT`, `EXCEPT`, `DIFF`) is excluded from the grow-retrieve structural pass. Sliding a `Retrieve` boundary across set operations can cause structural oscillation and provides little benefit to index-style modules. Predicate push-down into the branches remains supported via the supported-only policy.
+
+### Physicalization invariant
+
+- During the physical selection pass, all `Retrieve` nodes must be rewritten to concrete access nodes (`SeqScan`, `IndexScan`, or `IndexSeek`) or `RemoteQuery`. A validation invariant enforces that no `Retrieve` nodes reach emission.
+
+### Robust primary-key equality seeks
+
+- For index-style modules, full primary-key equality (including parameterized values) will select `IndexSeek` even if the provider’s `handledFilters` ordering differs from planner constraint extraction. The optimizer aligns constraints by column index and constructs dynamic seek keys from parameters/correlated expressions.
+
+### Diagnostics and verification
+
+- `query_plan(sql)` exposes `RETRIEVE` rows with logical properties including `bindingsCount` and `bindingsNodeTypes`, which reveal whether parameters and/or correlated column references have been captured by the pipeline.
+- For test assertions, prefer checking for the presence of `ParameterReference` nodes in the plan (logical indicator of binding presence) rather than relying on `RETRIEVE` presence post-physical selection, since physical rules may replace `Retrieve` with concrete access operators.
+
+### Module Capability API
+
+**VirtualTableModule Interface**:
+```typescript
+interface VirtualTableModule {
+  // Query-based push-down
+  supports?(node: PlanNode): SupportAssessment | undefined;
+  
+  // Index-based access
+  getBestAccessPlan?(req: BestAccessPlanRequest): BestAccessPlanResult;
+}
+
+interface SupportAssessment {
+  cost: number;    // Module's cost estimate for executing this pipeline
+  ctx?: unknown;   // Opaque context data cached for runtime execution
+}
+```
+
+**VirtualTable Interface**:
+```typescript
+interface VirtualTable {
+  // Runtime execution of pushed-down pipelines
+  executePlan?(db: Database, plan: PlanNode, ctx?: unknown): AsyncIterable<Row>;
+
+  // Standard index-based query execution
+  query?(filterInfo: FilterInfo): AsyncIterable<Row>;
+}
+```
+
+### Architecture Modes
+
+**1. Query-based Push-down** (implements `supports()` + `executePlan()`)
+- Module analyzes entire query pipelines
+- Returns cost assessment for execution within module
+- Examples: SQL federation modules, document databases, remote APIs
+
+**2. Index-based Access** (implements `getBestAccessPlan()` + `query()`)
+- Module exposes index capabilities
+- Quereus pushes individual predicates via BestAccessPlan API
+- Examples: MemoryTable, SQLite vtabs, file-based storage
+
+**3. Hybrid Modules** (can implement both, but they're mutually exclusive per query)
+- Modules can provide both interfaces
+- Optimizer chooses based on cost assessment
+
+### Access Path Selection
+
+The `ruleSelectAccessPath` optimizer rule handles the routing decision:
+
+```typescript
+export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanNode | null {
+  if (!(node instanceof RetrieveNode)) return null;
+  
+  const vtabModule = node.vtabModule;
+  
+  // Query-based push-down takes priority
+  if (vtabModule.supports) {
+    const assessment = vtabModule.supports(node.source);
+    if (assessment) {
+      return new RemoteQueryNode(node.scope, node.source, node.tableRef, assessment.ctx);
+    }
+    // Module declined - fall back to sequential scan
+    return createSeqScan(node.tableRef);
+  }
+  
+  // Index-based access
+  if (vtabModule.getBestAccessPlan) {
+    return createIndexBasedAccess(node, context);
+  }
+  
+  // Default sequential scan
+  return createSeqScan(node.tableRef);
+}
+```
+
+### Physical Execution Nodes
+
+**RemoteQueryNode**:
+- Represents execution of a pipeline within a virtual table module
+- Calls `VirtualTable.xExecutePlan()` at runtime
+- Passes the original plan pipeline and cached context
+
+**Traditional Access Nodes**:
+- `SeqScanNode`: Full table scan
+- `IndexScanNode`: Index-based scan with filters
+- `IndexSeekNode`: Index-based point/range lookups
+- `EmptyResultNode`: Zero-row short-circuit at the access boundary (e.g., `IS NULL` on NOT NULL column). Sibling node `EmptyRelationNode` (`planner/nodes/empty-relation-node.ts`) covers the schema-polymorphic empty case for general fold rules — `EmptyResultNode` stays bound to a `TableReferenceNode` (for EXPLAIN), while `EmptyRelationNode` is detached from any specific source. See [Rules § Empty-relation folding](optimizer-rules.md#empty-relation-folding).
+
+### Parameterization hand-off
+
+- Modules that implement `getBestAccessPlan` can return `indexName` and `seekColumnIndexes` to identify the chosen index and its key columns. When present, `selectPhysicalNodeFromPlan` builds seek keys from the correct constraint columns — not hardcoded to PK.
+- When these fields are absent, the legacy PK-based heuristic path (`selectPhysicalNodeLegacy`) is used for backward compatibility.
+- Equality constraints that fully cover a primary or secondary index prefix are translated into `IndexSeekNode` with dynamic seek keys:
+  - Seek keys are stored as scalar expressions (parameters or correlated refs), evaluated at runtime by the emitter and passed to the module via the existing `FilterInfo.args` mechanism.
+  - Range bounds (>=/<=) similarly pass dynamic lower/upper expressions.
+
+This establishes a clean “call-like” boundary: `Retrieve.bindings` declares required inputs; physical access nodes evaluate those inputs and deliver them to the module.
+
+### Runtime Execution
+
+**Query-based Execution**:
+```typescript
+// emitRemoteQuery.ts
+export function emitRemoteQuery(plan: RemoteQueryNode, ctx: EmissionContext): Instruction {
+  async function* run(rctx: RuntimeContext): AsyncIterable<Row> {
+    const table = plan.vtabModule.connect(/* ... */);
+    yield* table.executePlan!(rctx.db, plan.source, plan.moduleCtx);
+  }
+  return { params: [], run, note: `remoteQuery(${plan.tableRef.tableSchema.name})` };
+}
+```
+
+**Index-based Execution**:
+- Uses existing `query()` with `FilterInfo` parameter
+- Leverages `BestAccessPlan` API for predicate push-down
+
+### Integration Points
+
+**Builder Integration**:
+- All table references automatically wrapped in `RetrieveNode`
+- DML operations (INSERT/UPDATE/DELETE) extract `tableRef` from `RetrieveNode`
+- Maintains backward compatibility with existing code
+
+**Optimizer Integration**:
+- `ruleSelectAccessPath` registered for `PlanNodeType.Retrieve`
+- Physical properties correctly propagated through `RemoteQueryNode`
+- Cost estimation integrated with existing cost model
+
+**Runtime Integration**:
+- `RemoteQueryNode` emitter registered in runtime system
+- Error handling for modules without `xExecutePlan()` implementation
+- Seamless execution alongside traditional access methods
+
+### Dynamic support growth with ruleGrowRetrieve
+
+The `ruleGrowRetrieve` optimization rule enables dynamic sliding of operations into virtual table modules:
+
+**Algorithm**: Structural top-down growth pass that:
+1. Creates a candidate pipeline by grafting the parent operation onto the current pipeline
+2. Calls `module.supports(candidatePipeline)` or index-style fallback (`getBestAccessPlan`) for assessment
+3. If supported, replaces the parent with a new `RetrieveNode` containing the expanded pipeline
+4. Continues sliding upward until the module declines or the tree top is reached
+
+**Benefits**:
+- Multi-pass architecture ensures structural growth happens before physical selection
+- Cost-based decision making between local and remote execution
+- Modules evaluate exactly the operations they commit to handle
+
+This architecture establishes Quereus as a powerful federation engine while maintaining its lean, readable codebase philosophy and excellent virtual table integration.
+
+## ApplyNode Architecture for Correlated Joins
+
+> **Status: design proposal, not implemented.** No `ApplyNode` exists under
+> `src/planner/nodes/`. Correlated and lateral joins are planned today as `JoinNode`s
+> and driven by the nested-loop emitter. This section records the intended shape, not
+> current behavior.
+
+### Design Philosophy
+
+To enable lateral joins and sophisticated push-down optimization, Quereus uses an **ApplyNode** abstraction that replaces traditional `JoinNode` semantics. This design provides a unified framework for handling correlated operations while maintaining clean separation between logical and physical execution strategies.
+
+### Core Concept
+
+The `ApplyNode` represents a correlated operation where the right-side subtree is executed once per row from the left side, with correlation context passed through:
+
+```typescript
+interface ApplyNode {
+  left: RelationalPlanNode;     // Drive relation
+  right: RelationalPlanNode;    // Applied relation (may start with RetrieveNode)
+  predicate: ScalarPlanNode | null;  // Join condition
+  outer: boolean;               // LEFT JOIN semantics when true
+}
+```
+
+### SQL Mapping
+
+Traditional SQL join constructs map naturally to ApplyNode semantics:
+
+| SQL Construct | ApplyNode Form |
+|---------------|----------------|
+| `A CROSS JOIN B` | `Apply(A, B, null, false)` |
+| `A INNER JOIN B ON p` | `Apply(A, Filter(p, B), p, false)` |
+| `A LEFT JOIN B ON p` | `Apply(A, Filter(p, B), p, true)` |
+
+### Push-down Integration
+
+The ApplyNode design enables sophisticated push-down optimization:
+
+**Correlated Push-down**: When the right side contains a `RetrieveNode`, correlation values from the left side can be pushed into the virtual table module as additional constraints.
+
+**Index Seek Optimization**: Virtual table modules can use correlation values to perform efficient index seeks rather than full scans.
+
+**Pipeline Composition**: The right-side pipeline can be arbitrarily complex, allowing modules to optimize entire correlated subqueries.
+
+### Execution Model
+
+**Runtime Semantics**:
+1. Iterate through each row from the left relation
+2. Pass correlation context to the right relation's execution
+3. Execute right relation with correlated values as additional constraints
+4. Combine results according to join semantics (inner/outer)
+
+**Virtual Table Integration**:
+```typescript
+// Right-side RetrieveNode receives correlation context
+const correlatedConstraints = extractCorrelationConstraints(leftRow, rightPipeline);
+const assessment = vtabModule.supports(rightPipeline, correlatedConstraints);
+if (assessment) {
+  // Module can optimize correlated access (e.g., index seek)
+  yield* table.executePlan(db, rightPipeline, {
+    ...assessment.ctx,
+    correlation: correlatedConstraints
+  });
+}
+```
+
+### Performance Characteristics
+
+**Nested Loop Foundation**: ApplyNode provides a clean nested-loop foundation that can be optimized based on virtual table capabilities.
+
+**Progressive Optimization**: Modules can choose between full scans and index seeks based on correlation selectivity. Runtime cardinality feedback at pipeline breakers drives tier promotion and re-optimization (see [progressive-optimizer.md](./progressive-optimizer.md)).
+
+**Later Physical Optimization**: Non-correlated Apply operations can be transformed into bloom joins or merge joins by later optimization phases.
+
+### Benefits
+
+**Orthogonality**: Clean separation between correlation logic and push-down optimization.
+
+**Extensibility**: Virtual table modules can implement sophisticated correlated access patterns.
+
+**Simplicity**: Unified execution model eliminates special cases for different join types.
+
+**Federation**: Enables complex correlated queries to be pushed to remote systems (e.g., SQL databases, document stores).
+
+This design positions Quereus to handle complex analytical workloads while maintaining the flexibility to optimize across diverse data sources and virtual table implementations.
+
+### ruleGrowRetrieve Design
+
+The `ruleGrowRetrieve` optimizer rule implements a **structural, capability-bounded** sliding algorithm that maximizes the query segment each virtual table module can execute:
+
+**Algorithm**:
+1. **Top-down traversal (Structural pass)**: Walk the plan tree from root toward leaves so parents can be slid into their `RetrieveNode` children
+2. **Capability testing**: For each candidate, test `supports(candidatePipeline)` where candidatePipeline = current pipeline + parent node; else use index-style fallback
+3. **Slide on success**: If the module supports the expanded pipeline, slide the `RetrieveNode` upward to encompass the parent
+4. **Stop on failure**: When `supports()` returns undefined, the `RetrieveNode` has reached its maximum extent
+
+**Key Properties**:
+- Purely structural - no cost modeling required during growth phase
+- Deterministic - always finds the maximum supportable pipeline
+- Module-bounded - respects exactly what each module declares it can handle
+- Foundation for subsequent push-down - establishes the "query segment" baseline
+
+```typescript
+// Example: Filter above table reference
+Filter(condition) 
+  └── RetrieveNode(source: TableRef)
+
+// After ruleGrowRetrieve (assuming module supports filtering):
+RetrieveNode(source: Filter(condition, TableRef))
+```
+
+**Modules can accept arbitrary nodes**: `supports()` may accept complex subtrees, including joins across multiple tables that reside in the same module. When a module declares support for such a subtree, `ruleGrowRetrieve` will slide those operations into the `RetrieveNode` boundary, enabling efficient intra-module execution.
+
+## TVF Property Declarations
+
+Table-valued functions can advertise relational and physical characteristics through an optional `relationalAdvertisement` field on `TableValuedFunctionSchema`. Without it, a TVF's logical `returnType.keys` / `returnType.isSet` are exposed but `physical` defaults are conservative (no key FDs, no `ordering`, no `monotonicOn`, default `estimatedRows`). With an advertisement, `TableFunctionCallNode.computePhysical` consumes it on the standard physical-property path so downstream rules (FD propagation, DISTINCT elimination, sort/monotonic-window rules, cardinality estimation) see the same information they get from a real vtab.
+
+**Advertisement surface** — each field is either a static value or a `TVFAdvertiseFn<T>` that receives the call's operands and the schema and may return `undefined` to decline:
+
+| Field | Type | Notes |
+|---|---|---|
+| `isSet` | `boolean` | Overrides `returnType.isSet` when present. |
+| `keys` | `ReadonlyArray<ReadonlyArray<ColRef>>` | Output-column unique keys; lifted into `physical.fds` as `key → other-cols` FDs and into `getType().keys`. |
+| `fds` | `ReadonlyArray<FunctionalDependency>` | Additional (non-key) FDs over output columns. |
+| `equivClasses` | `ReadonlyArray<ReadonlyArray<number>>` | Equivalence classes; each class must have ≥ 2 members. |
+| `ordering` | `ReadonlyArray<{column, desc}>` | Output ordering. |
+| `monotonicOnColumns` | `ReadonlyArray<{column, direction, strict?}>` | Column-keyed monotonicity; preferred over `monotonicOn` because the node mints attribute IDs per call — the node translates `column → attrId` when assembling physical props. |
+| `monotonicOn` | `ReadonlyArray<MonotonicOnInfo>` | Direct form for advanced uses where the author already has the attrId. |
+| `constantBindings` | `ReadonlyArray<ConstantBinding>` | Columns pinned to a single value over the call. |
+| `estimatedRows` | `number` | Row-count estimate; the `TableFunctionCallNode.estimatedRows` getter consults this before falling back to the default. |
+| `accessCapabilities` | `PhysicalProperties['accessCapabilities']` | `ordinalSeek` / `asofRight`. |
+| `deterministic`, `readonly`, `idempotent` | `boolean` | Overrides the FunctionFlags-derived defaults. |
+
+**Literal operand inspection** — `evaluateLiteralOperand(operand)` (from `schema/function.js`) returns `operand.expression.value` when the operand is a literal and `undefined` otherwise. Use it in a `TVFAdvertiseFn` closure to declare parameter-dependent values:
+
+```typescript
+estimatedRows: (operands) => {
+  const start = evaluateLiteralOperand(operands[0]);
+  const end = evaluateLiteralOperand(operands[1]);
+  if (typeof start === 'number' && typeof end === 'number' && end >= start) {
+    return end - start + 1;
+  }
+  return undefined;  // Decline when bounds are non-literal.
+},
+```
+
+**Validation** — every advertised field is shape-checked against the call's column count and attribute set before it lands in `physical`. Bad advertisements (out-of-range column indices, empty FD dependents, equivalence classes of size < 1, duplicate ordering columns, etc.) are dropped silently with a single warning on the `planner:tvf` log channel — they never break planning. A `TVFAdvertiseFn` closure that throws is treated the same way. This guarantees a buggy third-party advertisement degrades to "no advertisement" instead of poisoning the optimizer.
+
+**Built-in annotations** — the following TVFs ship with relational advertisements:
+
+| TVF | Advertisement |
+|---|---|
+| `generate_series(start, end)` | `isSet`, `keys=[[value]]`, `ordering=[{value, asc}]`, `monotonicOnColumns=[{value, asc, strict}]`, `estimatedRows` (when bounds are literal). |
+| `json_each(json[, path])` | `isSet`, `keys=[[id]]`. |
+| `json_tree(json[, path])` | `isSet`, `keys=[[id]]`. |
+| `query_plan(sql)` | `isSet`, `keys=[[id]]`. |
+| `table_info(table)` | `isSet`, `keys=[[cid]]`. |
+| `index_info(table)` | `isSet`, `keys=[[index_name, seq]]`. |
+| `foreign_key_info(table)` | `isSet`, `keys=[[id, seq]]`. |
+| `unique_constraint_info(table)` | `isSet`, `keys=[[id, seq]]`. |
+| `check_constraint_info(table)` | `isSet`, `keys=[[id]]`. |
+| `assertion_info()` | `isSet`, `keys=[[name]]`. |
+| `function_info()` | `isSet`, `keys=[[name, num_args]]`. |
+
+Non-deterministic or trace-only TVFs (`execution_trace`, `row_trace`, `stack_trace`, `scheduler_program`, `schema_size`, `explain_assertion`, `schema`) skip advertisement.
+
+**Relevant to materialized-view maintenance (deferred shape).** The TVF `relationalAdvertisement` (`keys` / `isSet`) is the surface a lateral-TVF row-time materialized-view body would consume to bound a fan-out (`base t cross join lateral json_each(t.arr) je`): a base-row change maps to many backing rows that a prefix-delete + recomputed-fan-out maintenance would need to prove set on the backing PK. This shape is **not** in the current row-time eligibility gate — it is deferred to `materialized-view-rowtime-general-bodies`. `combineJoinKeys` (`planner/util/key-utils.ts`) now forms the **product key** `(leftKey ∪ shiftedRightKey)` for a keyed cross/lateral join (when both sides are keyed and neither is equi-covered), so `keysOf` surfaces the keyed cross-product key — see [Joins § Keyed cross/inner (and lateral) product keys](optimizer-joins.md#keyed-crossinner-and-lateral-product-keys). The remaining lateral-TVF consumption work (proving a recomputed fan-out set on the backing PK) is tracked by `materialized-view-rowtime-general-bodies`. See [Materialized Views](materialized-views.md).

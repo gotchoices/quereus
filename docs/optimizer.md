@@ -1,6 +1,26 @@
 # Quereus Query Optimizer
 
-The Quereus optimizer transforms logical query plans into efficient physical execution plans through a rule-based transformation system. This document provides a comprehensive reference for understanding and extending the optimizer.  This document reflects the current or future design of the system.  See TODO.md for descriptions of enhancements.
+The optimizer turns the logical plan the builder produced into a physical plan the
+emitter can compile, by running rewrite rules over the plan tree in a fixed sequence of
+passes. This document is the **hub**: it covers the pass framework, the shared machinery
+every rule stands on (physical properties, cost model, attribute identity, visited
+tracking), and the discipline a new rule must follow. The rules themselves, and the
+subsystems that grew large enough to read on their own, live in the topic documents below.
+
+## Topic documents
+
+| Document | Covers |
+| --- | --- |
+| [Optimizer Rules](optimizer-rules.md) | The rule catalog, plus the predicate, constant-folding, and cardinality/key families. |
+| [Optimizer Joins](optimizer-joins.md) | Join ordering (QuickPick), physical join selection, fan-out lookup joins, join key propagation. |
+| [Optimizer Retrieve Push-down](optimizer-retrieve.md) | The `RetrieveNode` module boundary, access-path selection, correlated access, TVF property declarations. |
+| [Optimizer Streaming Recognition](optimizer-streaming.md) | Asof scan, and the monotonic LIMIT/OFFSET, range-scan, and window recognitions. |
+| [Optimizer Parallel Track](optimizer-parallel.md) | Recognition rules for concurrent execution: async gather, eager prefetch. |
+| [Optimizer Assertion Analysis](optimizer-assertions.md) | Row/group/global classification and binding-aware delta planning. |
+| [Functional Dependencies](optimizer-fd.md) | FDs, equivalence classes, constant bindings, inclusion dependencies, coverage proving. |
+| [Constant Folding System](optimizer-const.md) | The three-phase constant-folding algorithm in full. |
+| [Optimizer Conventions](optimizer-conventions.md) | House style for writing a rule. |
+| [Progressive Query Optimization](progressive-optimizer.md) | The tiered, feedback-driven optimization strategy. |
 
 ## Philosophy
 
@@ -142,7 +162,7 @@ interface OptimizationPass {
 **Physical Properties** (`src/planner/framework/physical-utils.ts`)
 - Captures execution characteristics: ordering, uniqueness, cardinality, monotonic-on-attribute
 - `monotonicOn` (per `MonotonicOnInfo` in `nodes/plan-node.ts`) is stronger than `ordering`: it identifies an attribute the relation is totally ordered on (with optional `strict` to assert no duplicates), and is meaningful only for total-order-preserving sources (vtab access plans that advertise it; sort nodes; merge join). Propagation rules live alongside each operator's `computePhysical`.
-- `rangeBoundedOn` is a non-relational annotation set by `monotonic-range-access` on physical leaves whose access plan walks a `MonotonicOn(x)` path bounded by a recognized range predicate on `x`. See [Monotonic range-scan recognition](#monotonic-range-scan-recognition) below.
+- `rangeBoundedOn` is a non-relational annotation set by `monotonic-range-access` on physical leaves whose access plan walks a `MonotonicOn(x)` path bounded by a recognized range predicate on `x`. See [Streaming § Monotonic range-scan recognition](optimizer-streaming.md#monotonic-range-scan-recognition).
 - Propagates properties through plan transformations
 - Enables property-based optimization decisions
 
@@ -334,148 +354,30 @@ The base class returns conservative defaults (`{ injective: false }` / `{ monoto
 
 The function-call traits compose with the operand's own `monotonicityIn` / `isInjectiveIn`, so `f(g(x))` is treated correctly when both layers are annotated. `rangeRewriteIn` is intentionally tighter: it only rewrites the `f(x) op c` case, requiring the operand to be a bare `ColumnReferenceNode` for the queried attribute (anything else would conflate value spaces).
 
-Consumers (key propagation through non-trivial projections, sargable predicate rewrites for `date(ts) = D`, etc.) build on this surface — see [Sargable range rewrites](#sargable-range-rewrites) below.
+Consumers (key propagation through non-trivial projections, sargable predicate rewrites for `date(ts) = D`, etc.) build on this surface — see [Rules § Sargable range rewrites](optimizer-rules.md#sargable-range-rewrites).
+
+### Constant folding
+
+Constant expressions are evaluated at plan time rather than at runtime, via a three-phase
+classify / border-detect / replace algorithm that folds even expressions whose column
+references resolve to constants further up the tree. See
+[Constant Folding System](optimizer-const.md) for the algorithm and
+[Rules § Constant Folding Subsystem](optimizer-rules.md#constant-folding-subsystem) for the
+`constant` property's requirements and the `ConstantNode` contract.
 
 ### Sargable range rewrites
 
-Rule `rule-sargable-range-rewrite` (Structural pass, priority 18 — runs before `aggregate-predicate-pushdown` / `predicate-pushdown`) turns predicates of the form `f(col) = c` into the equivalent half-open range on `col`:
+A predicate of the form `f(col) = c` — notably `date(ts) = D` — is rewritten to the
+half-open range `col >= lower(c) and col < upper(c)`, restoring a bare `col op literal`
+shape the constraint extractor can push into an index seek. See
+[Rules § Sargable range rewrites](optimizer-rules.md#sargable-range-rewrites).
 
-```
-f(col) = c    →    col >= lower(c)  AND  col < upper(c)
-```
+### TVF property declarations
 
-This converts a function-of-column equality (which the constraint extractor cannot push down) into a bare `col op literal` shape that `rule-predicate-pushdown` carries through the Retrieve pipeline and `rule-select-access-path` can convert to an `IndexSeek` or range scan.
-
-**Wiring.** The rule consults the per-function trait `FunctionSchema.rangeRewriteOnArg` (see [Scalar Expression Properties](#scalar-expression-properties-per-attribute)) which names a bucketing **kind**; the actual boundary computation lives on the column's `LogicalType.bucketBounds(kind, value)`. Bounds are wrapped in `LiteralNode`s typed with the column's logical type, so the result rides the same coercion-free path the constraint extractor already knows.
-
-**Initial coverage.** Only `=` is rewritten; `<`/`<=`/`>`/`>=` require direction analysis on `monotonicityIn` and are deferred. Built-in trait wiring covers the unary `date(x)` form (`func/builtins/conversion.ts`) and `DATE_TYPE` / `DATETIME_TYPE` `bucketBounds`. The variadic `dateFunc` (`func/builtins/datetime.ts`, `numArgs: -1`) is intentionally **not** annotated — its trailing modifiers can shift or re-bucket the result. Build-time dispatch picks the unary `numArgs: 1` form when an SQL `date(col)` call has exactly one argument.
-
-**Identity / null constraints.** The rule never rewrites `f(g(col)) = c` — `bucketBounds` answers in `col`'s value space, not `g(col)`'s, so only a bare column reference is safe. A `null` constant is left alone (`f(col) = null` is already null-rejecting). A null column row continues to be rejected because `col >= L` and `col < U` both evaluate to null.
-
-**Parameter-bound RHS** (`where date(ts) = :p`) is out of scope here — the rule needs a literal RHS at plan time. A follow-up will introduce scalar bound functions (`bucket_lower(:p)` / `bucket_upper(:p)`) backed by the same `bucketBounds`.
-
-### TVF Property Declarations
-
-Table-valued functions can advertise relational and physical characteristics through an optional `relationalAdvertisement` field on `TableValuedFunctionSchema`. Without it, a TVF's logical `returnType.keys` / `returnType.isSet` are exposed but `physical` defaults are conservative (no key FDs, no `ordering`, no `monotonicOn`, default `estimatedRows`). With an advertisement, `TableFunctionCallNode.computePhysical` consumes it on the standard physical-property path so downstream rules (FD propagation, DISTINCT elimination, sort/monotonic-window rules, cardinality estimation) see the same information they get from a real vtab.
-
-**Advertisement surface** — each field is either a static value or a `TVFAdvertiseFn<T>` that receives the call's operands and the schema and may return `undefined` to decline:
-
-| Field | Type | Notes |
-|---|---|---|
-| `isSet` | `boolean` | Overrides `returnType.isSet` when present. |
-| `keys` | `ReadonlyArray<ReadonlyArray<ColRef>>` | Output-column unique keys; lifted into `physical.fds` as `key → other-cols` FDs and into `getType().keys`. |
-| `fds` | `ReadonlyArray<FunctionalDependency>` | Additional (non-key) FDs over output columns. |
-| `equivClasses` | `ReadonlyArray<ReadonlyArray<number>>` | Equivalence classes; each class must have ≥ 2 members. |
-| `ordering` | `ReadonlyArray<{column, desc}>` | Output ordering. |
-| `monotonicOnColumns` | `ReadonlyArray<{column, direction, strict?}>` | Column-keyed monotonicity; preferred over `monotonicOn` because the node mints attribute IDs per call — the node translates `column → attrId` when assembling physical props. |
-| `monotonicOn` | `ReadonlyArray<MonotonicOnInfo>` | Direct form for advanced uses where the author already has the attrId. |
-| `constantBindings` | `ReadonlyArray<ConstantBinding>` | Columns pinned to a single value over the call. |
-| `estimatedRows` | `number` | Row-count estimate; the `TableFunctionCallNode.estimatedRows` getter consults this before falling back to the default. |
-| `accessCapabilities` | `PhysicalProperties['accessCapabilities']` | `ordinalSeek` / `asofRight`. |
-| `deterministic`, `readonly`, `idempotent` | `boolean` | Overrides the FunctionFlags-derived defaults. |
-
-**Literal operand inspection** — `evaluateLiteralOperand(operand)` (from `schema/function.js`) returns `operand.expression.value` when the operand is a literal and `undefined` otherwise. Use it in a `TVFAdvertiseFn` closure to declare parameter-dependent values:
-
-```typescript
-estimatedRows: (operands) => {
-  const start = evaluateLiteralOperand(operands[0]);
-  const end = evaluateLiteralOperand(operands[1]);
-  if (typeof start === 'number' && typeof end === 'number' && end >= start) {
-    return end - start + 1;
-  }
-  return undefined;  // Decline when bounds are non-literal.
-},
-```
-
-**Validation** — every advertised field is shape-checked against the call's column count and attribute set before it lands in `physical`. Bad advertisements (out-of-range column indices, empty FD dependents, equivalence classes of size < 1, duplicate ordering columns, etc.) are dropped silently with a single warning on the `planner:tvf` log channel — they never break planning. A `TVFAdvertiseFn` closure that throws is treated the same way. This guarantees a buggy third-party advertisement degrades to "no advertisement" instead of poisoning the optimizer.
-
-**Built-in annotations** — the following TVFs ship with relational advertisements:
-
-| TVF | Advertisement |
-|---|---|
-| `generate_series(start, end)` | `isSet`, `keys=[[value]]`, `ordering=[{value, asc}]`, `monotonicOnColumns=[{value, asc, strict}]`, `estimatedRows` (when bounds are literal). |
-| `json_each(json[, path])` | `isSet`, `keys=[[id]]`. |
-| `json_tree(json[, path])` | `isSet`, `keys=[[id]]`. |
-| `query_plan(sql)` | `isSet`, `keys=[[id]]`. |
-| `table_info(table)` | `isSet`, `keys=[[cid]]`. |
-| `index_info(table)` | `isSet`, `keys=[[index_name, seq]]`. |
-| `foreign_key_info(table)` | `isSet`, `keys=[[id, seq]]`. |
-| `unique_constraint_info(table)` | `isSet`, `keys=[[id, seq]]`. |
-| `check_constraint_info(table)` | `isSet`, `keys=[[id]]`. |
-| `assertion_info()` | `isSet`, `keys=[[name]]`. |
-| `function_info()` | `isSet`, `keys=[[name, num_args]]`. |
-
-Non-deterministic or trace-only TVFs (`execution_trace`, `row_trace`, `stack_trace`, `scheduler_program`, `schema_size`, `explain_assertion`, `schema`) skip advertisement.
-
-**Relevant to materialized-view maintenance (deferred shape).** The TVF `relationalAdvertisement` (`keys` / `isSet`) is the surface a lateral-TVF row-time materialized-view body would consume to bound a fan-out (`base t cross join lateral json_each(t.arr) je`): a base-row change maps to many backing rows that a prefix-delete + recomputed-fan-out maintenance would need to prove set on the backing PK. This shape is **not** in the current row-time eligibility gate — it is deferred to `materialized-view-rowtime-general-bodies`. `combineJoinKeys` (`planner/util/key-utils.ts`) now forms the **product key** `(leftKey ∪ shiftedRightKey)` for a keyed cross/lateral join (when both sides are keyed and neither is equi-covered), so `keysOf` surfaces the keyed cross-product key — see [Keyed cross/inner (and lateral) product keys](#keyed-crossinner-and-lateral-product-keys). The remaining lateral-TVF consumption work (proving a recomputed fan-out set on the backing PK) is tracked by `materialized-view-rowtime-general-bodies`. See [Materialized Views](materialized-views.md).
-
-### Constant Folding Subsystem
-
-Constant folding is an elaborate optimization that evaluates constant expressions at plan time rather than runtime. The system uses a three-phase algorithm with sophisticated dependency tracking.
-
-See [Constant Folding System](optimizer-const.md) for details.
-
-**Core Concepts**
-
-The `constant` physical property has strict requirements:
-- A node is `constant: true` **only if** it implements the `ConstantNode` interface with `getValue()`
-- This means the node can statically provide its value at plan time
-- Examples: `LiteralNode`, materialized relation nodes
-
-```typescript
-interface ConstantNode extends PlanNode {
-  getValue(): OutputValue;  // Must return the constant value
-}
-```
-
-**Three-Phase Algorithm**
-
-Rather than stopping propagation when a column reference is found, the optimizer notes the reference and continues to see if the expressions remains otherwise constant at the point where said column is resolved.  This allows even complex queries to be fully folded, if they truly are constant.
-
-1. **Bottom-up Classification**: Assigns `ConstInfo` to every node
-   - `const`: Nodes with `physical.constant === true` that implement `getValue()`
-   - `dep`: Nodes depending on specific attribute IDs (e.g., column references)
-   - `non-const`: Non-functional nodes or those with non-const children
-
-2. **Top-down Border Detection**: Identifies foldable nodes
-   - Const nodes are always border nodes
-   - Dep nodes become border nodes when their dependencies are resolved
-   - Tracks which attributes are known constants in each scope
-
-3. **Replacement Phase**: Replaces border nodes with literals
-   - Scalar expressions → `LiteralNode`
-   - Relational expressions → Materialized relation nodes (future)
-
-**Dependency Resolution**
-
-The system tracks constant attribute propagation through the plan:
-```typescript
-// ProjectNode produces constant attribute 42 if its expression is const
-if (exprInfo?.kind === 'const') {
-  updatedKnownAttrs.add(42);  // Attribute 42 is now a known constant
-}
-
-// Later, ColumnReference to attribute 42 can be folded
-if (nodeInfo?.kind === 'dep' && isSubsetOf(nodeInfo.deps, knownConstAttrs)) {
-  // This dep node can be folded because its dependencies are resolved
-}
-```
-
-**Important Constraints**
-
-- **Never set `constant: true` without implementing `getValue()`** - This will cause runtime errors
-- **Constant folding respects functional properties** - Only nodes with `deterministic && readonly` are considered
-- **The optimizer uses runtime evaluation** - Complex expressions are evaluated using the actual runtime, ensuring correctness
-
-**Example: Constant Propagation**
-```sql
--- Original query
-SELECT x + 1 AS y FROM t WHERE y > 5;
-
--- After constant folding with known x = 10
-SELECT 11 AS y FROM t WHERE 11 > 5;  -- Expression folded
-SELECT 11 AS y FROM t WHERE true;    -- Predicate folded
-```
+Table-valued functions can advertise keys, ordering, monotonicity, and row estimates
+through `relationalAdvertisement`, so the optimizer reasons about a TVF exactly as it does
+about a virtual table. See
+[Retrieve § TVF Property Declarations](optimizer-retrieve.md#tvf-property-declarations).
 
 ## Component Reference
 
@@ -495,79 +397,15 @@ All plan nodes extend the base `PlanNode` class and implement category-specific 
 - `computePhysical()`: Optionally overrides specific physical properties
 - `getLogicalProperties()`: Returns logical plan information
 
-### Optimization Rules
+### Rule catalog
 
-Rules are organized by optimization family in `src/planner/rules/`:
-
-**Access Path Selection** (`access/`)
-- `ruleSelectAccessPath`: Chooses between sequential scan, index scan, and index seek for both primary and secondary indexes. **Collation cover**: an index seek is only a complete substitute for a predicate when the index column's collation equals the predicate's effective comparison collation (resolved at plan time exactly as `emitComparisonOp` / `emitIn` do at runtime). On a mismatch the rule classifies the cover relation per consumed seek constraint: a *coarser* equality index (a BINARY predicate over a NOCASE/RTRIM index) over-fetches a provable superset, so the seek is kept and the original predicate is re-applied as a residual `Filter` above the leaf; a *finer* index (a NOCASE/RTRIM predicate over a BINARY index, which under-fetches) declines the seek entirely and falls back to a `SeqScan` with the full predicate retained as a residual. **Range / prefix-range / OR_RANGE seeks are held to a stricter rule** because a coarser index over-fetch is not recoverable for a range (a collation mismatch reorders the walked window rather than producing a superset). A BINARY range over a BINARY index always reproduces the predicate. A collation-**matched** non-BINARY range (predicate collation = index collation ≠ BINARY) reproduces it only when the module's runtime filters the range bounds — and early-terminates the walk — under that same index collation rather than a fixed BINARY comparator; such a module advertises `BestAccessPlanResult.honorsCollatedRangeBounds`. The in-memory vtab does this (it threads each index column's collation through `scan-plan.ts` → `plan-filter.ts` / `scan-layer.ts`) and sets the flag; the store module does too (`StoreTable.buildPKRangeBounds` encodes each LT/LE/GT/GE bound into one `gte`/`lt` window under the same per-column key collations the data keys use, so `StoreTable.scanPKRange` seeks to the window start and early-terminates; the post-fetch row filter `StoreTable.compareValues` compares every pushed bound under the column's declared collation and stays authoritative because the window is a guaranteed superset) — so a `NOCASE`/`RTRIM` range or `BETWEEN` over a matching-collation index uses the seek on both backends. A module that bound-filters BINARY leaves the flag off and keeps the conservative decline (`SeqScan` + residual) for any non-BINARY range — identical to the pre-flag behaviour. Any collation **mismatch** (BINARY predicate over a non-BINARY index, or vice versa) is always declined to a `SeqScan` + residual. Effective comparison collation is resolved at plan time exactly as `emitComparisonOp` / `emitIn` / `emitBetween` do at runtime (the symmetric provenance lattice — explicit `COLLATE` > declared column collation > defaults; for a `BETWEEN` each bound is resolved independently by the constraint's `op`). The cover logic lives in the rule so it covers every index-style module uniformly (a module that matches constraints to index columns by position alone — e.g. the memory module — never sees collation). See `tickets/complete/index-collation-mismatch-residual-filter`, `tickets/complete/memory-range-seek-collation-bounds`, and `tickets/complete/store-range-seek-collation-bounds`.
-
-**Aggregation** (`aggregate/`)
-- `ruleAggregatePhysical`: Cost-based selection between `StreamAggregateNode` and `HashAggregateNode`. Scalar aggregates (no GROUP BY) always use stream. Already-sorted input always uses stream (preserves ordering). Unsorted input compares sort+stream cost vs hash cost and picks the cheaper option.
-- `ruleGroupByFdSimplification`: Drops GROUP BY columns that are functionally determined by other GROUP BY columns under the aggregate-output FDs and equivalence classes (PK / UNIQUE / EC bridges; FK-derived FDs when that ticket lands). Each dropped column is re-emitted as a `MIN(<original-column>)` picker aggregate, with the original output attribute ID preserved via `AggregateNode.preserveAttributeIds` so downstream `Filter`/`Sort`/`Project` bindings survive untouched. Targets the common FK-join-then-aggregate shape (e.g. `GROUP BY c.id, c.name, c.email` where `id` is the PK) — cuts hash-key width and sort-key width before `ruleAggregatePhysical` makes its stream/hash choice. Runs in the Structural pass at priority 23 (after `aggregate-predicate-pushdown` so filter-derived ECs are on the source, before `ruleAggregatePhysical` in the Physical pass). Skips when fewer than two GROUP BY columns are bare `ColumnReferenceNode`s. See [Functional Dependency Tracking](optimizer-fd.md) for the propagation rules the rule consumes.
-
-**Caching** (`cache/`)
-- `ruleCteOptimization`: Adds caching to frequently-accessed CTEs
-- `ruleInSubqueryCache`: Wraps uncorrelated, deterministic IN-subquery sources in CacheNode
-- `MaterializationAdvisory`: Global analysis for cache injection. Runs once over the whole plan as a dedicated custom-`execute` pass (`PassId.Materialization`, order 35), not as a per-node rule.
-- `ruleMaterializedViewRewrite`: Automatic materialized-view query rewrite (read side). Rewrites an *arbitrary* scan-projection-filter, 1:1-join, or grouped-aggregate query that never names an MV to scan (and, for an aggregate rollup, re-aggregate) the MV's backing table when a covering MV answers it — including eliminating a 1:1 inner/cross join at read time. Registered on both `Project` (projection-filter + join arms) and `Aggregate`. See § [Materialized-view query rewrite (read side)](#materialized-view-query-rewrite-read-side).
-- `ruleMutatingSubqueryCache`: Ensures mutating subqueries execute once
-- `ruleScalarCSE`: Scalar common subexpression elimination. Detects duplicate deterministic scalar expressions across a ProjectNode and its child chain (Filter, Sort), injects a lower ProjectNode that computes each deduplicated expression once, and replaces duplicates with column references. Skips bare column references, literals, and non-deterministic expressions. Runs in the Structural pass at priority 22.
-
-**Retrieve** (`retrieve/`)
-- `ruleProjectionPruning`: Prunes unused inner projections in Project-on-Project patterns (common after view expansion). Collects attribute IDs referenced by the outer project's scalar expressions, then filters the inner project to only those projections whose output attributes are referenced. Skips when all inner projections are used or pruning would yield zero projections. Runs in the Structural pass at priority 19 (between distinct-elimination at 18 and predicate-pushdown at 20).
-
-**Sort** (`sort/`)
-- `ruleOrderByFdPruning`: Drops trailing `ORDER BY` keys functionally determined by the leading bare-column keys under the source's FDs and equivalence classes (PK-driven, EC-driven via `WHERE a = b`, etc.). Walks the keys front-to-back maintaining `determined = closure({leading bare-column source-indices}, fds, ECs)`; drops any subsequent bare-column key whose source-attribute index is already in `determined`. Non-bare-column keys (expressions) are opaque — they neither contribute to nor consume the determined set, and are never droppable. The rule reasons in source-attribute-INDEX space (positions in `source.getAttributes()`) since `node.source.physical.fds` / `equivClasses` are indexed that way. Direction and NULL placement of the dropped trailing key are irrelevant — once a preceding key pins every value of that column to a single value per equivalence group, the trailing key cannot reorder anything. Skips when fewer than two keys are present, or when no keys are droppable. Runs in the Structural pass at priority 26, which is automatically before `monotonic-limit-pushdown` (PostOptimization priority 8) so single-key reductions enable the pushdown. See the LIMIT/OFFSET pushdown section below for the load-bearing interaction.
-
-**Join** (`join/`)
-- `ruleJoinPhysicalSelection`: Selects hash join or merge join over nested loop for equi-joins when cheaper. Three-way cost comparison (nested-loop vs hash vs merge). Supports INNER, LEFT, SEMI, and ANTI join types. Merge-join recognition here is positional on `physical.ordering`.
-- `ruleMonotonicMergeJoin`: Recognises merge-join opportunities whenever both sides advertise `MonotonicOn` on the equi-pair attributes — strictly broader than ordering-based recognition. Picks up cases the ordering-based rule misses (notably parent joins on a child `MergeJoin`'s right-side equi-pair attribute, where the child's `physical.ordering` reflects only the left side but `monotonicOn` covers both). Single driving equi-pair in v1; remaining equi-pairs become residual conjuncts. Defers to `ruleJoinPhysicalSelection` whenever ordering already covers all pairs (so multi-key merge joins keep full unique-key propagation). Runs at priority 4 in PostOptimization, ahead of `ruleJoinPhysicalSelection` (priority 5).
-- `ruleJoinElimination`: Drops a `JOIN` whose non-preserved side is never referenced above the join and is at-most-one-matching per a declared FK→PK relationship. Fires on `ProjectNode`, walks down through `Filter` / `Sort` / `LimitOffset` / `Distinct` / `Alias` collecting demanded attribute IDs; when the walk reaches a `JoinNode`, the demanded set is final for that chain. Requires an AND-of-column-equalities ON-clause and an FK→PK alignment verified via `checkFkPkAlignment` (same helper that drives FK-aware key/row-count reduction in `analyzeJoinKeyCoverage`). LEFT/RIGHT outer joins may only drop the non-preserved side; INNER joins may drop either side but additionally require (a) every FK column to be `NOT NULL` (otherwise NULL FK rows that wouldn't have matched would now survive) and (b) the eliminable side to be a row-preserving path to its base table — only `TableReference` / `Retrieve` (bare-source) / `Alias` / `Sort` wrappers are permitted, since a `Filter` / `LimitOffset` / `Distinct` / `Project` between the join and the table would either drop rows the FK→PK guarantee assumes are present or break the table-column-index→attribute-index mapping `checkFkPkAlignment` relies on. Most commonly fires on views that join a parent table for FK-side selects the outer caller never references. Runs in the Structural pass at priority 24 (after `predicate-pushdown` at 20, so right-side residual predicates have already landed below the join and protect themselves from elimination).
-- `ruleJoinExistencePruning` / `ruleJoinExistencePruningUnderAggregate`: Demand-gated drop of an unused outer-join `exists … as` existence flag, with two entrypoints that mirror `ruleJoinElimination` / `ruleJoinEliminationUnderAggregate`. `ruleJoinExistencePruning` fires on `ProjectNode` (id `join-existence-pruning`); `ruleJoinExistencePruningUnderAggregate` fires on `AggregateNode` (id `join-existence-pruning-aggregate`) for a flag-bearing join that sits under a `count(*)` / `group by` with no enclosing `Project`. Both reuse `ruleJoinElimination`'s demand analysis verbatim (the exported `collectAttrIds` / `walkChain` / `rebuildChain` / `rebuildProject` helpers): collect the attr ids the anchor demands (the Project's projections, or the Aggregate's group-by + aggregate expressions — its only scalar children), walk the `Filter` / `Sort` / `LimitOffset` / `Distinct` / `Alias` pass-through chain to the first `JoinNode`, then rebuild that join without any `ExistenceColumnSpec` whose output attribute id is absent from the demanded set (the Aggregate variant rebuilds the `AggregateNode` with `preserveAttributeIds` so its output ids stay stable). HAVING is a `FilterNode` *above* the Aggregate that can only reference the Aggregate's outputs, never the raw flag, so it needs no special handling. When the last spec is dropped, `existence` becomes `undefined`, `hasExistenceColumns` flips `false`, and the five flag-guarded join rules (`join-elimination`, `fanout-lookup-join`, `join-physical-selection`, `monotonic-merge-join`, `lateral-top1-asof`) re-enable on the now flag-free join. Both run in the Structural pass at priority 22 — after `projection-pruning` (19) / `predicate-pushdown` (20) / `scalar-cse` (22) so demand is settled, and before `fanout-lookup-join` (23) and `join-elimination` (24) / `join-elimination-aggregate` (26) so the freshly-pruned anchor threads through them in the same `applyRules` loop; the PostOptimization join rules and the top-down-visited `lateral-top1-asof` see the flag-free join automatically. `sideEffectMode: 'safe'`: it drops only a derived, read-only `{true,false}` column and preserves both join sides verbatim. Pure optimization — no correctness defect today; a flag-bearing join was simply pinned to nested-loop purely to compute a column no one read. Dropping even a *middle* flag is runtime-safe because column resolution is by attribute id (the `RowDescriptor` rebuilt from `getAttributes()`), not the build-time `columnIndex`. The write half is unaffected: a writable flag is always SELECTed by its view's projection, so the demand gate retains it. **Note on the aggregate anchor (cascade):** `exists … as` is only valid on an *outer* join (the parser rejects it on inner). Pruning the unused flag under an aggregate yields a flag-free outer join, which `ruleJoinEliminationUnderAggregate` — now that it eliminates FK→PK `left`/`right` joins, not just `inner` — eliminates entirely. So an undemanded `count(*) … left join … exists right as` collapses to **zero join ops** (prune at priority 22 → eliminate at priority 26, same `applyRules` pass), not merely to physical join selection.
-- `ruleSemijoinExistenceRecovery` / `ruleSemijoinExistenceRecoveryUnderAggregate` (ids `semijoin-existence-recovery` / `semijoin-existence-recovery-aggregate`): The demand-**SHAPE** complement of `join-existence-pruning`'s demand-**PRESENCE** prune. Where pruning drops a flag *nothing* reads, this recovers a semi/anti join when the sole `exists … as` flag on a `left join` is demanded but **only** as a top-level boolean probe — `where flag` ⇒ `semi`, `where not flag` ⇒ `anti` (also `not not flag`, `flag = true/false`, and the `IS` forms `flag is true` / `flag is not false` ⇒ `semi`, `flag is false` / `flag is not true` ⇒ `anti`, each normalized via `normalizePredicate`). The `is not …` collapses (`is not false` ≡ `= true`, `is not true` ≡ `= false`) are exact only because the flag is provably non-null (`EXISTENCE_FLAG_TYPE.nullable === false`); for the same reason `flag is [not] null` is a *constant* over the non-null flag (not a probe) and the matcher abstains. Fires on `ProjectNode` (the anchor must bound everything any ancestor can reference; a Filter anchor would be unsound because rewriting the join to semi drops the right columns + flag, which only the Project's projection list can prove unreferenced). **Two entrypoints** (mirroring `join-existence-pruning` / `…UnderAggregate`): the second entrypoint `ruleSemijoinExistenceRecoveryUnderAggregate` (id `semijoin-existence-recovery-aggregate`, also priority 23, but `nodeType: Aggregate`) anchors on `AggregateNode` for the bare `count(*) … where flag` / `group by` shape that plans with **no enclosing Project** (the probe Filter + flag-bearing join sit *under* the Aggregate, so the Project entrypoint walks past them). It shares ALL of the probe-detection + chain-rewrite machinery — the exported `analyzeChain` now takes a **pre-seeded** demand set so both anchors reuse it — differing only in the demand seed (the Aggregate's group-by + aggregate expressions vs a Project's projections) and the rebuild epilogue (reconstruct the `AggregateNode` with `preserveAttributeIds` so its output ids stay stable). The aggregate anchor has **no inner-join fallback**: a right-column-demanded or fan-out *positive* probe under an aggregate stays a flag-bearing `left` join (sound, just unoptimized) — the `count(*) … where flag` shape is the target — unlike the Project anchor, which hands those off to `inner-join-existence-recovery`. HAVING is a `FilterNode` *above* the Aggregate that can reference only the aggregate output (group keys / aggregate results), never the raw flag, so it never appears in `walkChain` and does not block. Reuses `ruleJoinElimination`'s `walkChain` / `collectAttrIds` / `rebuildChain` / `rebuildProject`; builds the demand set conjunct-by-conjunct so the single probe conjunct is excluded, then requires (a) exactly one flag-referencing conjunct, in probe normal form; (b) the flag absent from the residual demand set (a *selected* or *sorted-on* flag lands there and abstains); (c) no right-side column demanded (`select *` / `select c.*, p.col … where flag` abstain here and hand off to `inner-join-existence-recovery`, which rewrites that shape to an inner join — it is not a semi-join); (d) `existence.length === 1` (a semi join collapses the right side and cannot also emit other flags — when a sibling flag is merely undemanded, `join-existence-pruning` drops it first, leaving a sole flag this rule then recovers in a later `applyRules` iteration); and (e) `subtreeHasSideEffects(right) === false` (a semi join short-circuits the right scan at the first match, changing R's execution count); and (f, **SEMI only**) the right side matches *at most one* row per left row — `rightMatchesAtMostOne`, i.e. the equi-join columns cover a unique key of R via `isUnique`. The fan-out guard (f) is the soundness crux: a plain `left join … exists right as` is a *normal* left join with an appended flag bit, so `emitLoopJoin` yields one output row per **matching** right row — `where flag` keeps **K rows** for a left row with K matches, whereas `semi(L,R,cond)` keeps **one**. They agree only when every left row matches ≤1 R row (FK→PK, or a ≤1-row R); a non-unique / non-equi condition makes the SEMI shape unsound and the rule abstains — `inner-join-existence-recovery` then recovers a fan-out-safe inner join from that abstention point (a positive no-right-col probe over a fan-out R), so the two rules partition the *entire* positive-probe space and, consulting the same `rightMatchesAtMostOne`, are disjoint independent of registration order. The **anti** path needs no such guard: an unmatched left row yields exactly one null-extension regardless of fan-out, and matched rows are filtered out, so `anti(L,R,cond)` equals `left join … where not flag` for *arbitrary* `cond`. The recovered join carries the full ON `condition` verbatim; a residual conjunct over a covered unique key only narrows the ≤1 match further (still ≤1), so the downstream IND folders gate on AND-of-equalities and abstain on any residual, leaving a plain semi/anti (hash semi-join still beats nested-loop+flag). The probe Filter is rebuilt with its non-probe conjuncts (or omitted when the probe was its only conjunct). Runs in the Structural pass at priority 23 — after `join-existence-pruning` (22) so an undemanded sibling flag is gone first, and (in registration order) before `fanout-lookup-join`, `join-elimination`, and the Join-typed IND folders `anti-join-fk-empty` / `semi-join-fk-trivial` (26) so the recovered semi/anti threads into them in the same top-down descent (exactly why `subquery-decorrelation` precedes those folders). `sideEffectMode: 'aware'` (the impure-R guard). Pure optimization: rows are byte-identical to the nested-loop+flag baseline. Write-half safe by construction — a flag writable through a view is always SELECTed by its routing Project, so it lands in `demanded` and check (b) abstains, and the write path never reaches this rewrite. Only `left join … exists right as` is reachable (the parser rejects `exists … as` on inner/cross, the runtime rejects RIGHT/FULL), so the rule is guarded by `joinType === 'left' && spec.side === 'right'`. Deferred: `case`-wrapped probe forms (truthiness-of-integer, not a boolean probe — file a backlog ticket if a real workload produces them) and an aggregate-anchored *inner* fallback (the right-col-demanded / fan-out positive-probe cases the aggregate anchor leaves as a `left` join — out of scope, file a follow-up if a real workload wants it). The positive-probe cases the SEMI rule abstains on — a right column demanded, OR a fan-out (non-unique) R — are both handled by `inner-join-existence-recovery` (next bullet).
-- `ruleInnerJoinExistenceRecovery` (id `inner-join-existence-recovery`): The **fallback** complement of `semijoin-existence-recovery` — same probe machinery, covering **both** positive-probe shapes the semi rule abstains on. When the sole `exists … as` flag on a `left join` is a **positive** top-level probe (`where flag` / `flag = true` / `flag is true` / `flag is not false` / `not not flag` — all the `'semi'`-polarity forms) **and EITHER ≥1 right-side column is demanded above the join OR R fans out** (is non-unique on the join column), it rewrites the flag-bearing `JoinNode` to a plain **inner join** (drop the flag, keep both sides) instead of a semi join (which would either drop the right columns the caller needs, or collapse the fanned-out duplicates K→1). Fires on `ProjectNode`; reuses `walkChain` / `rebuildProject` from `join-elimination` and the sibling's exported `analyzeChain` / `rebuildChainStrippingProbe` / `ProbeMatch` (added `export`; no logic change), so the demand SHAPE proof and probe normalization are shared verbatim. Guards: `joinType === 'left' && spec.side === 'right'`, `existence.length === 1`, `condition` present, `probe.polarity === 'semi'` (a negative/anti probe with a right column must stay a `left` join — an anti row has an all-NULL right side, so an inner join would drop the rows anti keeps), `!demanded.has(flagId)` (a selected/sorted-on flag abstains), the gate `!(!rightColDemanded && rightMatchesAtMostOne(join))` — fire when a right column is demanded OR R fans out, deferring to the semi rule ONLY where it can actually fire (no right column AND unique R, the ≤1-match case where the leaner semi join is sound) — and `subtreeHasSideEffects(right) === false`. **Soundness (and why it is simpler than the semi rule):** `emitLoopJoin` drives a `left join … exists right as` as a normal left join with one appended flag bit — a matched left row with K right matches yields K rows each `flag=true`, an unmatched left row yields one null-extended row `flag=false`. A positive `where flag` keeps exactly the K matched rows per left row; an inner join on the same condition yields exactly those K rows — **identical row-for-row for ANY condition**. So unlike the semi rule there is **no fan-out guard for soundness** (an inner join does not collapse K→1, so the conversion is sound under *any* fan-out — `rightMatchesAtMostOne` is consulted only to locate the abstention boundary, never as a correctness precondition — and this rule therefore *does* convert the fan-out case the semi rule cannot), **no condition-shape restriction** (the ON `condition` is carried verbatim, non-equi / residual conditions included), and **no NOT-NULL FK requirement** (a NULL FK is unmatched under both the flag and the inner join, so no orphan leaks). `buildJoinAttributes` emits the same `[left…, right…]` ids for `left` and `inner` (only the right columns' `nullable` flag differs), so right columns resolve by attribute id at the same ids and dropping the appended flag shifts nothing; the inner join's non-nullable right typing is a sound strengthening (after `where flag` only matched rows survive, on which the right side is fully present) that re-enables downstream FD/key/IND reasoning. The probe conjunct is subsumed by the inner join and stripped via `rebuildChainStrippingProbe` (residual conjuncts retained above the join; Filter omitted when the probe was its sole conjunct). Note `join-elimination` does **not** fire on the recovered inner join within this rule's domain: while a right column is demanded it requires the non-preserved side unreferenced, and in the no-right-col fan-out domain it requires an at-most-one unique FK→PK alignment that the non-unique R contradicts; the in-scope win is physical join selection + non-nullable typing + FD/IND reasoning, not elimination. `sideEffectMode: 'aware'` (the impure-R guard): the logical inner join scans R the same number of times as the flag-bearing left join, but dropping the flag re-enables `join-physical-selection`, which can pick a hash join that scans R once total — changing an impure R's execution count. Pure optimization: rows are byte-identical to the nested-loop+flag baseline. Write-half safe by construction (a flag writable through a view is always SELECTed by its routing Project → lands in `demanded` → abstains). Runs in the Structural pass at priority 23. The two recovery rules consult the **same** `rightMatchesAtMostOne` and so are provably disjoint on the positive-probe space **independent of registration order** (semi fires iff `!rightColDemanded && unique-R`; inner iff `rightColDemanded || !unique-R`; the intersection is empty), making registration order (semi then inner) merely conventional. Registered (in registration order) before `fanout-lookup-join`, `join-elimination` (24), and the Join-typed IND folders (26). Termination: the output inner join has no existence spec, so re-running sees `joinType !== 'left'` and no-ops.
-- `ruleLateralTop1Asof`: Recognizes the lateral-top-1 idiom and rewrites it to a streaming `AsofScanNode` (see "Streaming asof scan" below).
-
-**Predicate** (`predicate/`)
-- `ruleAggregatePredicatePushdown`: Splits `Filter(predicate, Aggregate|StreamAggregate|HashAggregate)` so that conjuncts referencing only GROUP-BY-determined columns are rewritten onto the aggregate's source attribute IDs and moved below the aggregate; conjuncts referencing aggregate outputs (sum/count/etc.) or non-column GROUP-BY expressions stay above. Subsumes the WHERE-on-group-by-column and HAVING-on-group-by-column cases. Uses `computeClosure` over the aggregate's `physical.fds` so composite GROUP BYs whose members FD-determine each other widen the pushable set (see the FD framework section). Runs in the Structural pass at priority 19, ahead of `rulePredicatePushdown` so anything it places below an aggregate can propagate further.
-- `rulePredicatePushdown`: Pushes filter predicates down across safe commuting nodes (Sort, Distinct, Alias, eligible Project) and into RetrieveNode boundaries where the virtual table module supports them, reducing rows processed upstream.
-- `ruleFilterMerge`: Merges adjacent Filter nodes into a single Filter with an AND-combined predicate. Iteratively absorbs entire chains of adjacent filters in one visit. Runs in the Structural pass at priority 21 (after predicate pushdown at 20).
-- `rulePredicateInferenceEquivalence`: Materializes inferred equality predicates from the cross of predicate-derived constant bindings and the source's equivalence classes. For a `Filter(predicate, source)` where `predicate` pins `t.k = V` (literal or parameter) and `source.physical.equivClasses` includes a class containing `t.k`'s column index, the rule emits `col = V` for every other class member not already pinned by the predicate. The augmented predicate is ANDed into the outer Filter; for `inner`/`cross` join sources, single-side inferred conjuncts are additionally injected as `FilterNode` wrappers on the corresponding branch so subsequent `predicate-pushdown` (priority 20) iterations carry them into branch-level vtab access plans. LEFT/RIGHT/FULL joins fall back to the simple form (outer Filter only) — the safety case relies on `propagateJoinFds` already having stripped NULL-padded sides' bindings/ECs from the join's output. Idempotent: a second invocation finds every EC member already in the predicate's bound set and emits nothing. Runs in the Structural pass at priority 22; no collision with `scalar-cse` (priority 22) since they target different node types. Worked example: `t INNER JOIN u ON t.k = u.k WHERE t.k = 5` produces a `Filter(u.k = 5)` wrapper above the u-side Retrieve, which the next pushdown iteration carries into the leaf and lets the vtab handle as an index seek instead of a sequential scan. Range and `IS NULL` inference are intentionally out of scope.
-- `ruleSargableRangeRewrite`: Rewrites `f(col) = c` into `col >= lower(c) AND col < upper(c)` using `LogicalType.bucketBounds`, restoring sargability for bare-column equality on lossy-monotone transforms (notably `date(ts) = D`). Structural pass priority 18 — ahead of `aggregate-predicate-pushdown` / `predicate-pushdown` so the rewritten range flows through the rest of the predicate pipeline. See § [Sargable range rewrites](#sargable-range-rewrites) for the wiring (function-schema `rangeRewriteOnArg` trait + per-type `bucketBounds`) and the identity/null/parameter guards.
-- `ruleFilterContradiction`: Recognises when a Filter's predicate, conjoined with the source's `domainConstraints` and literal `constantBindings`, is provably unsatisfiable and emits `EmptyRelationNode` carrying the Filter's own attribute IDs / RelationType. Structural pass priority 27, downstream of `rule-empty-relation-folding` at the same priority so the cascade can collapse the surrounding subtree. Reasoning is per-column range/enum intersection (`planner/analysis/sat-checker.ts`); OR / CASE / cross-column arithmetic stay out of scope. See § [Predicate contradiction detection](#predicate-contradiction-detection).
-- `ruleEmptyRelationFolding`: Cascades `EmptyRelationNode` up through immediate `Filter` / `Project` / `Sort` / `LimitOffset` / `Distinct` / inner-or-cross-or-semi-anti joins, lifting the host's attribute IDs / RelationType onto the new empty result. Also folds `Filter(_, false|null|0)` directly. Structural pass priority 27 — after the IND rules at 26 so anti-join-to-empty rewrites can cascade in the same visit. See § [Empty-relation folding](#empty-relation-folding).
-
-**Subquery** (`subquery/`)
-- `ruleSubqueryDecorrelation`: Transforms correlated EXISTS/IN subqueries in WHERE-clause filters into semi/anti joins, enabling hash join selection and eliminating per-row re-execution. Handles: correlated EXISTS → semi join, NOT EXISTS → anti join, correlated IN → semi join. NOT IN is deferred (NULL semantics complexity). Runs in the Structural pass at priority 25 (after predicate pushdown).
-- `ruleSemiJoinFkTrivial`: `SemiJoin(L, R)` whose equi-pairs cover a non-null FK on L referencing R's PK (with R a row-preserving path to its base table) rewrites to `L` when every FK column is `NOT NULL`, otherwise to `Filter(L, fk_col IS NOT NULL AND …)`. Structural pass priority 26, after `rule-subquery-decorrelation` has materialized `EXISTS / IN` as semi joins. See § [Inclusion-dependency reasoning](#key-driven-row-count-reduction).
-- `ruleAntiJoinFkEmpty`: `AntiJoin(L, R)` with the same preconditions rewrites to `EmptyRelationNode` carrying L's attribute IDs and `RelationType` — every (non-null) L row is guaranteed a parent in R, so the anti-join is empty. Structural pass priority 26; the empty result then feeds `rule-empty-relation-folding` at priority 27 for further cascade. See § [Inclusion-dependency reasoning](#key-driven-row-count-reduction).
-
-**Constant Folding** (pass)
-- Constant folding pass: Evaluates constant expressions at plan time
-
-### Materialized-view query rewrite (read side)
-
-`ruleMaterializedViewRewrite` (`rules/cache/rule-materialized-view-rewrite.ts`) is the read-side dual of the [coverage prover](materialized-views.md#explicit-covering-structures-the-coverage-prover): it recognizes when an *arbitrary* scan-projection-filter query — one that **never names** a materialized view — is *answered from* a covering MV, and rewrites it to scan the MV's backing table (`_mv_<name>`) with a residual projection/filter instead of recomputing the body against the base tables. Because the replacement is an ordinary `TableReference`, `query_plan()` shows the backing scan for free.
-
-**Matcher** (`planner/analysis/query-rewrite-matcher.ts`, sibling to `coverage-prover.ts`). The question is **output-relation subsumption**: do the MV's stored rows contain a superset (re-coverable via a bounded residual) of the rows the fragment produces, keyed so the residual recovers exactly the fragment's output? It shares the coverage prover's entailment vocabulary (`recognizeConjunctiveClauses` / `guardClausesEntail`), so NULL semantics are identical. Soundness mirrors the prover exactly — **a false NotMatch only forgoes a speedup; a false Match returns wrong rows** — so every check forgoes the rewrite on doubt, and the rule only ever replaces the correct recompute-over-base plan with a provably row-equivalent backing scan (non-regressing).
-
-- **Shape.** The fragment must be a single-source `Project(Filter?(scan(TableReference)))` over base `T`; the MV body (read from `mv.selectAst`) the same projection-and-filter over the same `T`. DISTINCT / set-op / LIMIT on either side ⇒ NotMatch (`shape`). An **aggregate** fragment and a **1:1-join** fragment are each handled by a separate arm (both below).
-- **Predicate entailment (containment).** The fragment's row set must be a subset of the MV's: the MV's WHERE `P_mv` must be entailed by the fragment's WHERE `P_q`. The residual is the conjunction of `P_q` conjuncts not already entailed by `P_mv`, applied as a `Filter` on the backing scan (`predicate-not-entailed` otherwise). An MV with no WHERE subsumes any fragment WHERE (residual = full `P_q`); a fragment with no WHERE requires `P_mv` empty too.
-- **Projection coverage.** Every fragment output column (a bare passthrough of a `T` column) must be a column the MV projects; the residual's columns likewise (`missing-column` otherwise). A computed fragment output is not re-derived in v1.
-- **Gates.** A **stale** MV (its backing is an unmaintained snapshot), a **non-deterministic body** (reuses the function-registry determinism metadata — a registered MV is already deterministic by construction), or a **source-schema mismatch** are all rejected before shape matching.
-
-**Aggregate-rollup arm** (`analyzeAggregateFragment` / `matchAggregateFragmentToMv`). Fires when the fragment root is a logical `Aggregate(Filter?(scan(T)))` and the MV body is a grouped aggregate over the same `T`. Query and MV GROUP BY are mapped to bare source-column sets (computed group key ⇒ `aggregate-shape`); query key ⊆ MV key required (⊄ ⇒ `group-key-mismatch`). Two sub-cases: **exact-key** (query key == MV key) scans the backing directly — each output is a passthrough of a stored group column or an *exactly* matching stored aggregate, with an optional residual `Filter`/`Project` and **no re-aggregation**; **rollup** (query key ⊊ MV key, incl. the empty global key) re-aggregates the backing partials down to the query key via the decomposable-aggregate allowlist (`sum`→`sum`, `count`→`coalesce(sum,0)`, `min`/`max`→`min`/`max`, `avg`→`sum(sum)/sum(count)`; `count(distinct)` / `group_concat` / any `distinct` ⇒ `aggregate-not-decomposable`). The one-row-per-group witness is `backingPkIsGroupKey` (the backing PK equals the MV group key — the schema-level `proveEffectiveKeyUnique`). A residual may reference only MV group-key columns (`missing-column` otherwise) — these partition whole MV groups, so the residual `Filter` on the backing scan commutes with the rollup re-aggregate (a rollup needing a residual is therefore sound, and the rule builds that `Filter` before the re-aggregate). One forgo guard remains: `group-key-pinned` (a multi-key query pinning/equating a group column would diverge from the base's `rule-groupby-fd-simplification` column reorder). See [docs/materialized-views.md § Aggregate rollup](materialized-views.md#aggregate-rollup-indexed-view-matching) for the recombine table and the avg-NULL/count-zero semantics.
-
-**Join-subsumption arm** (`analyzeJoinQueryFragment` / `matchJoinFragmentToMv`). Fires when the fragment root is `Project(Filter?(Join(T, P)))` and a 1:1 inner/cross-join MV body materializes the same join — answering it from the backing and **eliminating the join at read time**. The soundness pivot reuses the coverage prover's shared `proveOneToOneJoin` (no-row-loss descent + `proveJoinNoFanout`): a 1:1 join's output is in bijection with the driving table `T`'s governed rows, so two 1:1 joins over the *same tables, equi-pairs, and type* produce the same relation. The matcher runs `proveOneToOneJoin` on **both** the fragment join and the MV body join (the rule plans the MV body once, suppressed, and caches its optimized root in a `WeakMap`), then requires the **same driving `T`, same lookup `P`, an inner/cross top join on each side** (outer is deferred — its null-extended rows differ from an inner-join query), and **equi-pair equivalence** in `(driving-col, lookup-col)` terms (a different FK to the same lookup ⇒ `shape`, the load-bearing guard). Projection coverage maps every fragment output (including lookup-side columns) to a stored backing column through stable attribute ids (`missing-column` otherwise). The stored-column map keys each backing column by the MV body's output **position**, so the arm first verifies the backing columns still correspond positionally (count + name) to the body output — the invariant established when the backing is built from the body. `refresh` keeps that invariant intact even across a schema-shifting source `alter`: it [re-derives the backing shape and rebuilds the backing table](materialized-views.md#refresh-materialized-view) when a re-planned `select *` body interleaves a new source column, so the rebuilt backing re-aligns with the body and the rewrite **re-enables** (no matcher change needed). `backingAlignsWithBody` is retained as **defense-in-depth** — it now passes in the happy path but still forgoes the rewrite (`no-candidate`, leaving the correct base recompute) should any future path ever leave the backing desynchronized from the body, so the matcher never trusts position blindly. A join MV body carries **no WHERE** (the row-time `'join-residual'` create gate rejects a partial join body), so predicate entailment is trivial — the whole post-join WHERE is the residual `Filter`, re-bound onto the backing by **source attribute id** (a base-column index is ambiguous across a join). **Read-side relaxation:** a WHERE term on a *lookup-side* column is allowed here (the row-time arm forbids it), since the rewrite only *reads* the already-materialized join; a residual on a non-stored column ⇒ `missing-column`, a subquery conjunct ⇒ `predicate-not-entailed` (preserving the no-subquery invariant behind `sideEffectMode: 'safe'`). The replacement is the foundation's emission unchanged (backing scan → residual `Filter` → residual `Project`). See [docs/materialized-views.md § Join subsumption](materialized-views.md#join-subsumption).
-
-**Pass placement.** Registered FIRST in the Structural `rewrite` pass (pass rules fire in *registration* order, not by `priority`), so it sees the pristine `Project(Filter?(Retrieve(TableReference)))` and reads the fragment's WHERE off the live plan — *before* `grow-retrieve` / `predicate-pushdown` reposition the Filter and before the Physical pass absorbs a predicate into a range scan (where the matcher could no longer see it and would falsely treat the fragment as unfiltered). The **join arm shares the `Project` registration**: the same firing point means the fragment's join is still the pristine **logical** `JoinNode` with its `ON` condition intact (physical join selection runs in a later pass), and the fragment WHERE is still an explicit `Filter` above the join. The aggregate arm is a **second registration** of the same rule function on the `Aggregate` node type (pass rules fire only on their `nodeType` and are deduped by id, so the two arms need separate handles); it carries a distinct id (`materialized-view-rewrite-aggregate`) but honors the canonical `materialized-view-rewrite` disable switch internally, so one `disabledRules` entry turns off both arms. The aggregate fragment is the **logical** `Aggregate` at this point — physical Stream/Hash selection (`aggregate-physical`) and `groupby-fd-simplification` run in later passes. Logical→logical, so the substituted backing `TableReference` (exact-key) or re-aggregate node (rollup) flows through the normal Physical-pass access-path and aggregate-strategy selection. `sideEffectMode: 'safe'`: the matcher admits only a read-only fragment (recognized predicates, no subqueries), so the dropped base-scan subtree is pure, and the replacement re-emits the fragment's identical output attribute ids so the parent splice stays valid.
-
-**Cost gate.** The projection-filter arm compares the recompute-over-base cost (`seqScanCost(baseRows) + filter + project`) to the MV-backed cost (`seqScanCost(backingRows) + residual + project`); the aggregate arm compares recompute-over-base (`seqScanCost(baseRows) + filter + aggregateCost(baseRows, queryGroups)`) to the MV path — exact-key `seqScanCost(mvGroups) + residual + project` (skips the aggregation) or rollup `… + aggregateCost(mvGroups, queryGroups) + project`. The join arm's recompute estimate additionally pays **both base scans plus the join** (`seqScanCost(tRows) + seqScanCost(pRows) + hashJoinCost(…) + filter + project`, using the cheaper physical equi-join so the gate stays conservative), versus the MV-backed `seqScanCost(backingRows) + residual + project` — so the backing scan (one row per driving row) wins decisively. All arms choose the MV only when strictly cheaper, picking the cheapest match with a stable lowercased-name tiebreak. Backing cardinality prefers a real stat and otherwise applies a discount — a WHERE-selectivity discount (projection-filter) or a GROUP-BY grouping-factor discount (aggregate, `mvGroups ≪ baseRows`) — so a covering MV wins even when the stats provider reports no row counts (memory tables). A no-win case (e.g. an MV with no WHERE answering a no-WHERE query) is equal-cost and declines.
-
-**Self-maintenance suppression.** The rule is disabled (`SchemaManager.withSuppressedMaterializedViewRewrite`) while planning an MV's own body to (re)compute or maintain its backing (create / refresh / row-time-maintenance compile), so a body matching a registered MV is never re-pointed at the backing it is populating.
-
-The soundness backstop is the equivalence property harness (`test/query-rewrite-equivalence.spec.ts`): over random base data it asserts `rewritten(query) == unrewritten(query)` row-for-row (including NULLs and empty results) for a corpus of covering and near-miss queries, run with the rule enabled vs disabled. A second block extends it with the aggregate shapes — exact-key, rollup-to-coarser-key (including rollup with a residual on a dropped MV group key, which filters whole backing groups before the re-aggregate), and global-scalar over a grouped MV — over a nullable aggregated column and a row count starting at zero, so every run exercises the load-bearing `sum`-over-zero-rows ⇒ NULL, `count`-over-zero-rows ⇒ 0, and `avg` recombine NULL/division semantics. A third block extends it with the join shapes — driving-side and lookup-side residual WHEREs over a 1:1 FK→PK join MV — across the FK→PK boundary (the generator only emits child rows for existing parents), NULL lookup columns, and the empty-lookup case. Matcher per-reason outcomes and golden plans (a 1:1-join query → backing scan with **no join in the plan**; a fanning near-miss → base recompute) live in `test/query-rewrite-join.spec.ts`.
+Rules live in `src/planner/rules/`, one directory per optimization family
+(`access`, `aggregate`, `cache`, `distinct`, `join`, `predicate`, `retrieve`, `sort`,
+`subquery`, `parallel`), and are registered to passes in `src/planner/optimizer.ts`.
+That file is the single source of truth for which rule runs in which pass, at what
+priority, under which `sideEffectMode`. The prose catalog — what each rule matches, its
+guards, and its soundness argument — is
+[Optimizer Rules § Optimization Rules](optimizer-rules.md#optimization-rules).
 
 ### Virtual Table Integration
 
@@ -843,36 +681,12 @@ which pins the predicate's contract and the negative-fold cases.
 
 ## Common Patterns
 
-### Predicate Analysis and Pushdown
+### Predicate analysis and pushdown
 
-The optimizer includes sophisticated predicate analysis for pushdown optimization:
-
-```typescript
-import { extractConstraints, createTableInfoFromNode } from '../analysis/constraint-extractor.js';
-
-// Extract constraints from filter predicates for pushdown
-const tableInfo = createTableInfoFromNode(tableNode, 'main.users');
-const result = extractConstraints(filterPredicate, [tableInfo]);
-
-// Use constraints for virtual table pushdown
-const tableConstraints = result.constraintsByTable.get('main.users');
-if (tableConstraints) {
-  // Push constraints to virtual table via BestAccessPlan API
-  const pushedTable = new TableReferenceWithConstraintsNode(
-    scope, tableSchema, vtabModule, tableConstraints
-  );
-}
-```
-
-**Predicate Pushdown Implementation:**
-- **Normalization**: Pushes NOT, flattens AND/OR (no CNF/DNF), inverts comparisons; collapses small OR-of-equalities to `IN` (only when every disjunct's effective collation matches — see the OR-collapse gates under § Collation gate on equality facts); preserves BETWEEN (NOT BETWEEN remains residual).
-- **Constraint Extraction**: Analyzes equality/range (`=`, `>`, `>=`, `<`, `<=`), `IS NULL`/`IS NOT NULL`, `BETWEEN` (as `>=`/`<=`), and `IN` value lists. Supports dynamic bindings: parameters and correlated references are captured alongside literal values.
-  - **Wrapper rule** (ticket `bug-cast-stripped-from-seek-constraints`): shape matching sees through a `CAST` only when it is a no-op (target logical type == the operand's, per `isNoOpCast`), and never through a `COLLATE`. A converting cast on either compared operand changes the value the seek key would carry — `cast(x as integer) = 1` over a `text` key would seek the integer `1` against stored text — so the conjunct stays residual. The planner reaches this shape without any written `cast(...)`: `insertCrossTypeCoercion` wraps the textual operand of `where x = 1`. The one exception is the *value* side's `bindingKind` classification, which looks through any cast because the emitted constraint retains the whole `CastNode` in `valueExpr` and evaluates it at runtime — that keeps `x = cast(:p as integer)` seekable. Pinned by `test/logic/05.2-cast-seek-correctness.sqllogic` (rows) and `test/plan/cast-seek-blocking.spec.ts` (plan shape).
-- **Supported-only placement**: Only the portion of a predicate that is known to be supported by the target module/index is pushed into the `Retrieve` pipeline. Any residual (unsupported) part remains above the `Retrieve`. This guarantees the `Retrieve` pipeline exclusively contains supported operations.
-- **Module Validation via supports()**: For query-based modules, a predicate (or entire filter node) is only pushed below the `RetrieveNode` when `supports()` accepts the resulting pipeline. Acceptance typically implies significantly lower cost and should be preferred over mere proximity to the data source.
-- **Index-style Fallback**: When a module does not implement `supports()`, push-down uses `getBestAccessPlan()` for constraints translation; benefits may come from filter handling, ordering, and limit pushdown.
-- **Filter Elimination**: Removes Filter nodes when all predicates are successfully handled by the module/index.
-- **Multi-table Support**: Modules may accept complex subtrees (including joins) in a single `supports()` call when multiple relations belong to the same module.
+Filter predicates are normalized, split into constraints, and pushed as far toward the data
+as each module will accept — the supported-only placement policy keeps unsupported residuals
+above the `Retrieve` boundary. See
+[Rules § Predicate Analysis and Pushdown](optimizer-rules.md#predicate-analysis-and-pushdown).
 
 ### Property Propagation
 ```typescript
@@ -916,230 +730,37 @@ if (shouldCache(node, context)) {
 - Avoid keeping references to old plan nodes
 - Clean up temporary data structures
 
-## Known Issues
+## Current limitations
 
-**Current Limitations**
-- **OR predicate extraction**: The constraint extractor handles OR-of-equality disjunctions (collapsed to IN for index multi-seek) and OR-of-range disjunctions on the same indexed column (collapsed to OR_RANGE for multi-range index seek). Both collapses are gated on matching disjunct collation (see the OR-collapse gates under § Collation gate on equality facts); a mismatch leaves the whole OR residual. OR disjunctions across different indexes (`tickets/plan/2-or-to-union-rewriting.md`) remain as residual filters.
-- **Constant Folding**: Both scalar and relational constant folding are implemented. Constant relational subtrees (e.g., all-literal VALUES, constant subqueries) are replaced with `TableLiteralNode` via deferred materialization. See `docs/optimizer-const.md`.
-- **Access Path Selection**: Supports primary and secondary index seek/range via module-provided `indexName`/`seekColumnIndexes`. Prefix-equality + trailing-range on composite indexes is not yet supported (`tickets/plan/2-composite-index-advanced-seeks.md`). A seek over an index whose per-column collation differs from the predicate's effective comparison collation re-applies the predicate as a residual `Filter` (coarser equality index) or declines to a filtered scan (finer index, or any range mismatch) — see the collation-cover note under **Access Path Selection** in the Rule Catalog above.
+- **OR predicate extraction across different indexes** remains a residual filter. The
+  same-column collapses (OR-of-equalities ⇒ `IN`, OR-of-ranges ⇒ `OR_RANGE`) are
+  implemented and gated on matching disjunct collation. Tracked by
+  `tickets/plan/2-or-to-union-rewriting.md`.
+- **Prefix-equality + trailing-range seeks on composite indexes** are not supported.
+  Tracked by `tickets/plan/2-composite-index-advanced-seeks.md`.
+- **Collation-mismatched index seeks** re-apply the predicate as a residual `Filter`
+  (coarser equality index) or decline to a filtered scan (finer index, or any range
+  mismatch). See the collation-cover note under `ruleSelectAccessPath` in the
+  [rule catalog](optimizer-rules.md#optimization-rules).
+- Longer-range optimizer work is listed in [`docs/todo.md`](todo.md) and `tickets/plan/`.
 
-## Streaming asof scan
+## Streaming and monotonic recognition
 
-The "asof join" — for each left row, a single right row whose key relates to
-the left's key by the asof predicate, optionally per partition — is a recurring
-shape in time-series and event-stream queries. Two symmetric forms are
-recognized:
+Several rules recognize that a plan's input already arrives in the order an operator would
+otherwise have to establish, and replace the buffering operator with a one-pass streaming
+one. They all read the `physical.monotonicOn` advertisement. Covered in
+[Optimizer Streaming Recognition](optimizer-streaming.md):
 
-- **Latest-le** (`direction = 'desc'`): largest right.K ≤ left.K. Predicate
-  `q.K <= t.K` (or strict `<`), sort `order by q.K desc limit 1`.
-- **Earliest-ge** (`direction = 'asc'`): smallest right.K ≥ left.K. Predicate
-  `q.K >= t.K` (or strict `>`), sort `order by q.K asc limit 1`.
-
-Standard SQL writes both as a lateral-top-1 subquery:
-
-```sql
--- Latest-le (desc):
-select t.*, q.bid, q.ask
-from (select * from trades order by ts) t
-left join lateral (
-  select bid, ask from quotes q
-  where q.symbol = t.symbol and q.ts <= t.ts
-  order by q.ts desc limit 1
-) q on true;
-
--- Earliest-ge (asc):
-select t.*, q.bid
-from (select * from trades order by ts) t
-left join lateral (
-  select bid from quotes q
-  where q.symbol = t.symbol and q.ts >= t.ts
-  order by q.ts asc limit 1
-) q on true;
-```
-
-Without specialization this executes as a per-left-row re-evaluation of the
-lateral subquery — `O(L · log R)` at best. The `ruleLateralTop1Asof` rule
-recognizes the pattern and rewrites the JoinNode to an `AsofScanNode`, which
-runs in `O(L + R)`.
-
-The node carries a `strategy` discriminator picked up by
-`rule-asof-strategy-select` after the children's physical properties are
-finalized:
-
-- **`'hash'`** (default): bucket the right by partition key into
-  `Map<string, Row[]>`; stream the left with per-bucket cursors. Memory `O(R)`,
-  latency = first emit after R fully arrives. The right's monotonic
-  matchAttr advertisement is the only ordering required.
-- **`'merge'`**: co-stream both inputs in lockstep when both already arrive in
-  `[partition cols..., matchAttr]` order. Memory `O(1)` (one in-flight
-  partition's saved match), emits as left rows arrive.
-
-**Required pattern** (peeled in any nesting order; AliasNode is transparent):
-
-```
-JoinNode (joinType ∈ {inner, left, cross}, condition absent or trivially true)
-  left:  Left
-  right: ProjectNode? | LimitOffsetNode(LIMIT 1, no OFFSET) | SortNode (single column key)
-            └─ FilterNode (ANDed: q.K op left.K  AND  q.P_i = left.P_i ...)
-                  └─ ...some pipeline... TableReference
-```
-
-`op` is `<=`/`<` (latest-le) or `>=`/`>` (earliest-ge). The lateral-side
-projection must be trivial column references (so the rule can preserve
-attribute IDs). The Sort must be a single column reference; its direction must
-agree with the predicate (`desc` ↔ `<=`/`<`, `asc` ↔ `>=`/`>`).
-
-**Required vtab capabilities**: the underlying right table's `getBestAccessPlan`
-must advertise `monotonicOn(K)` and `supportsAsofRight: true` for an ordered
-scan on the asof match column. The `memory` module advertises this for the
-leading column of the primary key.
-
-**Required left ordering**: the left input must expose
-`physical.monotonicOn(matchAttr)` — typically by wrapping the left in
-`ORDER BY matchAttr` (or by relying on a PK that orders by the match column).
-Without this, the per-bucket cursor would regress and produce wrong rows for
-out-of-order left input. When the precondition is unmet the rule does not fire
-and the existing nested-loop lateral path executes unchanged.
-
-**Bail conditions**: the rule does not fire when
-
-- the right access plan lacks `monotonicOn(K)` or `supportsAsofRight`,
-- the lateral has multiple inequalities on the right key,
-- the lateral's projection contains a non-trivial expression,
-- `LIMIT n` for `n ≠ 1` or `OFFSET ≠ 0`,
-- the sort is on a computed expression (not a trivial column reference),
-- the sort direction disagrees with the predicate (e.g. `q.K <= t.K` with `order by q.K asc`),
-- the left is not monotonic on the match attribute.
-
-The rule runs in the Structural pass at priority 5 — before
-`predicate-pushdown` (priority 20) — so the lateral's `FilterNode` carrying
-the asof predicate is intact when matching.
-
-### Strategy selection (hash → merge)
-
-`rule-asof-strategy-select` runs in the PostOptimization pass at priority 11,
-after `monotonic-range-access` has finalized the leaves' `physical.ordering` /
-`monotonicOn` advertisements. It is a predicate-driven rewrite (no cost-side
-search) that promotes `AsofScanNode.strategy` from `'hash'` to `'merge'` when:
-
-- Both children's `physical.ordering` carries a leading
-  `[partition cols..., matchAttr]` prefix. Partition columns may appear in any
-  permutation, but the *positions* on left and right must pair via the
-  `partitionAttrs` equi-pairs, with matching directions on each side.
-- The trailing match-attr ordering is **ASC** on both sides. The merge emitter
-  walks both inputs forward — `direction='desc'` accumulates the latest
-  qualifier seen, `direction='asc'` returns the first qualifier — and that
-  forward walk requires ascending match-attr sort regardless of asof
-  direction.
-- The right's estimated row count meets `tuning.asof.mergeRowThreshold`
-  (default `10000`). Below the threshold, hash buffering's constant factors
-  beat merge-state bookkeeping.
-
-Bails (and the node stays on `'hash'`) on any failure. Disable via
-`tuning.disabledRules` containing `'asof-strategy-select'`. Force-enable for
-testing by setting `tuning.asof.mergeRowThreshold` to `0`.
-
-The merge variant assumes the children's iterator already emits in the
-required order; it does not synthesize the ordering. The current
-`ruleLateralTop1Asof` precondition (`physical.monotonicOn(left.matchAttr)`)
-typically requires the user to wrap the left in `ORDER BY matchAttr` — which
-provides global match-attr monotonicity but no partition prefix. The
-unpartitioned (`partitionAttrs.length === 0`) case is the natural fit today;
-partitioned merge requires a left input with `[partition..., matchAttr]`
-ordering, which is not yet recognized as "monotonic within partition" by the
-recognition rule. That extension is a follow-up.
-
-## Monotonic LIMIT/OFFSET pushdown
-
-Paginating into the middle of a sorted result — `select … from t order by x limit n offset k` — is a common shape. Without specialization the runtime sorts/buffers `k + n` rows and discards `k` of them. When the access path advertises both `monotonicOn(x)` and `supportsOrdinalSeek`, the `monotonic-limit-pushdown` rule replaces the `LimitOffset[/Sort]/leaf` subtree with an `OrdinalSliceNode` that stamps `offset`/`limit` onto the leaf's `FilterInfo` so the vtab seeks directly to the kth row in `O(log N)` and emits at most `n` rows.
-
-**Required pattern** (peeled top-down from `LimitOffsetNode`):
-
-```
-LimitOffsetNode
-  └─ SortNode?           (single trivial column ref matching leaf monotonicOn)
-        └─ (ProjectNode | AliasNode)*   (only trivial column-reference projections)
-              └─ IndexScan / IndexSeek / SeqScan
-                    (advertises monotonicOn AND accessCapabilities.ordinalSeek)
-```
-
-`OrdinalSliceNode` slots in directly above the leaf, preserving the original `Project`/`Alias` chain above it. The `Sort` is dropped — the slice's source already emits in the requested order, and re-sorting would be wasted work.
-
-**Required vtab capabilities**: the leaf's access plan must advertise both `monotonicOn` and `supportsOrdinalSeek`. The vtab's `query()` implementation must honor `FilterInfo.offset` (positioning its iterator at the kth monotonic row) and `FilterInfo.limit` (capping output). Modules that advertise `supportsOrdinalSeek` but ignore the directives degrade silently to a streaming `LIMIT` (the slice still enforces the row cap as a guard above the leaf).
-
-**Bail conditions**: the rule does not fire when
-
-- the leaf lacks `accessCapabilities.ordinalSeek` or `monotonicOn`,
-- a `Sort` sits between `LimitOffset` and the leaf with a different attribute, direction, or multiple keys,
-- a non-trivial intermediate node (`Filter`, `Distinct`, `Aggregate`, `Project` with computed expressions, etc.) sits between `LimitOffset` and the leaf — the offset arithmetic only holds when the chain preserves row count and order,
-- both `LIMIT` and `OFFSET` are absent (degenerate node),
-- `ORDER BY` references multiple columns.
-
-When the precondition is unmet the rule does not fire and the existing `LimitOffsetNode` path executes unchanged. The `memory` module currently does **not** advertise `supportsOrdinalSeek` (its layered store does not cheaply support ordinal seek across overlay layers); custom modules with native ordinal indexing — IndexedDB-backed stores, sorted external datasets — can opt in.
-
-**Composes with `ruleOrderByFdPruning`**: a multi-key `ORDER BY` (the last bail condition) frequently arises from `ORDER BY pk, name` shapes where the trailing keys are functionally determined by the PK. The Structural-pass `ruleOrderByFdPruning` (rule catalog above, under Sort) reduces such sorts to single-key form, which then satisfies this rule's `Sort`-shape precondition. Structural runs before PostOptimization, so the ordering is automatic.
-
-The rule runs in the PostOptimization pass at priority 8 (after `join-physical-selection`, before `mutating-subquery-cache`) — late enough that `select-access-path` has produced the physical leaf with its capabilities, early enough to interact with downstream cache and materialization rules.
-
-The rule id `monotonic-limit-pushdown` can be disabled via `tuning.disabledRules`.
-
-## Monotonic range-scan recognition
-
-Range predicates that bound a `MonotonicOn` access column (`WHERE id BETWEEN 2 AND 5`, `WHERE id >= 2 AND id < 8`, `WHERE id > 4`, etc.) are already lowered to a range index seek by `rule-select-access-path`, which lifts the underlying access plan's `monotonicOn` advertisement onto the physical leaf. The `monotonic-range-access` rule sits on top of that plumbing and adds two things:
-
-1. **Symbolic annotation (`rangeBoundedOn`)** — when the leaf advertises `monotonicOn(x)` and its `FilterInfo.constraints` carries a handled range/equality on `x`, the rule sets `physical.rangeBoundedOn` on the leaf so EXPLAIN and downstream rules can read off the symbolic bound:
-
-	```jsonc
-	"rangeBoundedOn": {
-		"attrId": 17,
-		"lower": { "op": ">=", "valueLiteral": 2 },
-		"upper": { "op": "<=", "valueLiteral": 5 }
-	}
-	```
-
-	`valueLiteral` is populated when the bound is a literal; for parameter / correlated bounds it is omitted (the bound is still recognized; only the literal display is). Half-open ranges omit `lower` or `upper`. The annotation is a pure label — it does not change the row stream.
-
-2. **Defensive `monotonicOn` drop** — if a `FilterNode` sits directly above a leaf that advertises `monotonicOn(x)` and the Filter's predicate carries a range/equality on `x`, the vtab returned `handledFilters[i] = false` for the bound. The row stream emerging from the *Filter* is no longer monotonic over the WHERE-restricted set, so the rule drops `monotonicOn` (and the implied `accessCapabilities`) from the leaf via a `suppressMonotonic` flag on the leaf. In well-behaved modules this case never fires; the escalation is purely defensive against a misbehaving vtab.
-
-### Recognition patterns
-
-| SQL shape | Bound translation |
-| --- | --- |
-| `x BETWEEN a AND b` | `>= a` and `<= b` |
-| `x >= a AND x <= b`, `x >= a AND x < b`, `x > a AND x <= b`, `x > a AND x < b` | as written |
-| `x = c` | `>= c` and `<= c` (degenerate range; only fires when the leaf actually advertises `monotonicOn` for equality, which the memory module does not) |
-| `x >= a` (alone), `x < b` (alone) | half-bounded `[a, ∞)` / `(-∞, b)` |
-| `x IN (c1, c2, …)` | not annotated — multi-IN multi-seek emit is non-monotonic; the memory module does not advertise `monotonicOn` for it, so the rule no-ops |
-
-### Composition with other rules
-
-`rangeBoundedOn` is a passive annotation today — no other optimizer rule reads it. `monotonic-merge-join`, `monotonic-limit-pushdown`, and `lateral-top1-asof` continue to inspect `physical.monotonicOn` / `accessCapabilities`, so they compose cleanly with range-bounded leaves (a range-bounded merge / asof / slice still operates on the range's emit order).
-
-The defensive `monotonicOn` drop, by contrast, is load-bearing: it is the safety net against a vtab that advertises `monotonicOn(x)` while declining a range filter on `x`.
-
-### Registration
-
-The rule is registered in the PostOptimization pass at priority 9, on each of the four targeted node types: `IndexScan`, `IndexSeek`, `SeqScan` (annotation pass), and `Filter` (defensive drop). Its rule ids are `monotonic-range-access-IndexScan`, `monotonic-range-access-IndexSeek`, `monotonic-range-access-SeqScan`, and `monotonic-range-access-filter`, all individually disable-able via `tuning.disabledRules`.
-
-## Monotonic streaming-window recognition
-
-Window functions over a stream that already arrives in `[PARTITION BY..., ORDER BY[0]]` order don't actually need the buffer/sort the buffered emitter applies. The `monotonic-window` rule recognises these cases on a `WindowNode` and tags it with a `streaming` config that flips the runtime to a one-pass emitter (`runStreaming` in `runtime/emit/window.ts`). The streaming emitter walks rows in source order, maintains O(P) per-partition state (one partition alive at a time), and emits in source order — saving the `O(N log N)` sort and the `O(N)` materialisation buffer.
-
-**Required preconditions** (all must hold; the rule no-ops on any failure):
-
-- The leading ORDER BY key is a trivial `ColumnReferenceNode` whose `attrId` matches a `physical.monotonicOn` entry on the source, with the same direction.
-- The source's `physical.ordering` covers any subsequent ORDER BY keys (in declared order, with matching directions).
-- PARTITION BY columns are an emit-order prefix of the source ordering (any permutation; the rule reorders).
-- All partition-by expressions are trivial column references.
-- Every function in the `WindowNode` is individually recognised (see the [streaming fast-path table](./window-functions.md#streaming-fast-path-over-monotonicon) for the supported set).
-- The frame is either absent (default) or the explicit equivalent of `UNBOUNDED PRECEDING TO CURRENT ROW` (in `ROWS` or `RANGE` mode). Sliding frames are deferred to a follow-up.
-- No function is `DISTINCT`.
-
-**Output invariant**: a streaming `WindowNode` preserves the source's `monotonicOn` unchanged (the streaming runtime is row-pass-through, no sort intervenes). Downstream rules that key off `physical.monotonicOn` — `monotonic-limit-pushdown`, `monotonic-merge-join`, `monotonic-range-access` — compose naturally above streaming windows.
-
-The rule runs in the PostOptimization pass at priority 6 (after `monotonic-merge-join@4` so child joins have already become MergeJoins and propagated their `monotonicOn`; before `monotonic-limit-pushdown@8`, though they don't directly interact since they target different node types). Its rule id `monotonic-window` is disable-able via `tuning.disabledRules`.
-
-When the rule no-ops, the existing buffered emitter runs unchanged.
+- **[Streaming asof scan](optimizer-streaming.md#streaming-asof-scan)** — rewrites the
+  lateral-top-1 idiom (`left join lateral (… order by q.ts desc limit 1)`) to an
+  `AsofScanNode` that runs in `O(L + R)` instead of `O(L · log R)`.
+- **[Monotonic LIMIT/OFFSET pushdown](optimizer-streaming.md#monotonic-limitoffset-pushdown)**
+  — seeks straight to the kth row when the access path advertises ordinal seek.
+- **[Monotonic range-scan recognition](optimizer-streaming.md#monotonic-range-scan-recognition)**
+  — annotates a range-bounded monotonic leaf, and defensively drops `monotonicOn` when a
+  module declines a range filter it claimed to order on.
+- **[Monotonic streaming-window recognition](optimizer-streaming.md#monotonic-streaming-window-recognition)**
+  — flips a `WindowNode` to a one-pass emitter, dropping the sort and the buffer.
 
 ## Future Directions
 
@@ -1147,121 +768,13 @@ The overarching optimization strategy is **progressive, JIT-inspired**: robust h
 
 See `tickets/plan/` for planned optimizer work.
 
-## Join Optimization with QuickPick
+## Join planning
 
-### Overview
-
-Quereus will adopt the **QuickPick** algorithm (Neumann & Kemper, VLDB 2020) for join order optimization. This approach treats join ordering as a Traveling Salesman Problem (TSP) and uses random greedy tours to find near-optimal plans with minimal complexity.
-
-### Why QuickPick?
-
-**Simplicity**: ~200 lines of TypeScript vs thousands for traditional optimizers
-- No complex memo structures or dynamic programming tables
-- No equivalence classes or group management
-- Just a tour generator and a min-heap of best plans
-
-**Performance**: Achieves >95% of optimal plan quality with <1% of the time
-- Scales linearly with number of joins × number of tours
-- Naturally parallelizable (each tour is independent)
-- Works well with approximate or missing statistics
-
-**Perfect fit for Quereus**:
-- Aligns with the project's lean, readable codebase philosophy
-- Handles virtual tables with unknown cardinalities gracefully
-- Integrates easily with async architecture
-- Provides tunable quality/time tradeoff via `maxTours` parameter
-
-### Algorithm Design
-
-```typescript
-interface JoinTour {
-  relations: Set<RelationId>;
-  currentPlan: RelationalPlanNode;
-  totalCost: number;
-}
-
-class QuickPickOptimizer {
-  async optimizeJoins(
-    relations: RelationalPlanNode[],
-    predicates: JoinPredicate[],
-    options: { maxTours: number }
-  ): Promise<RelationalPlanNode> {
-    const bestPlans: RelationalPlanNode[] = [];
-    
-    for (let i = 0; i < options.maxTours; i++) {
-      const tour = await this.runGreedyTour(relations, predicates);
-      bestPlans.push(tour);
-    }
-    
-    return this.selectBestPlan(bestPlans);
-  }
-  
-  private async runGreedyTour(
-    relations: RelationalPlanNode[],
-    predicates: JoinPredicate[]
-  ): Promise<RelationalPlanNode> {
-    // Start with random relation
-    const shuffled = [...relations].sort(() => Math.random() - 0.5);
-    let current = shuffled[0];
-    const remaining = new Set(shuffled.slice(1));
-    
-    while (remaining.size > 0) {
-      // Find cheapest next join using surrogate cost
-      const next = this.findCheapestJoin(current, remaining, predicates);
-      current = this.createJoinNode(current, next.relation, next.predicate);
-      remaining.delete(next.relation);
-    }
-    
-    return current;
-  }
-}
-```
-
-### Integration Points
-
-1. **Multi-pass optimizer framework**: QuickPick runs in the Physical pass (bottom-up)
-2. **Cost model enhancement**: Uses `estimatedCostFromNode.getTotalCost()` for join ordering decisions
-3. **Rule registration**: Registered as a Physical pass rule with priority 5
-4. **Tuning parameters**: Expose `maxTours` and early-stop thresholds via `tuning.quickpick`
-
-## Physical Join Algorithm Selection
-
-After join ordering (QuickPick), the optimizer selects a physical join algorithm for each join node. This runs in the PostOptimization pass (after QuickPick in the Physical pass) so the full logical join tree is visible to QuickPick before any physical conversion.
-
-The selection rule (`ruleJoinPhysicalSelection`) extracts equi-join pairs from AND-of-equalities in the ON condition (or USING columns), performs a three-way cost comparison (nested-loop vs hash vs merge), and selects the cheapest physical algorithm.
-
-### Bloom (Hash) Join
-
-- **Build phase**: Materializes the smaller input into a `Map<string, Row[]>` keyed by serialized equi-join column values
-- **Probe phase**: Streams the larger input, probing the hash map for matches
-- **Complexity**: O(n + m) vs O(n × m) for nested loop
-- **Supports**: INNER, LEFT, SEMI, and ANTI joins with equi-predicates
-- **Null handling**: Null keys are never inserted into the hash map (SQL null != null semantics)
-- **Collation awareness**: Each equi-pair's key normalizer is resolved through the shared comparison-collation lattice (`resolveComparisonCollation` — explicit > declared > default > BINARY, **symmetric**), so build- and probe-side keys normalize identically and agree with the merge/nested-loop comparators (e.g., NOCASE → toLowerCase, RTRIM → trimEnd). The `equi-pair-extractor` matched-collation gate keeps asymmetric/conflicting pairs out of the hash path (they demote to the residual); a same-rank explicit/declared conflict reaching the emitter throws as a loud backstop.
-- **Residual conditions**: Non-equi parts of the ON clause are evaluated as a residual filter after hash lookup
-- **Side selection**: For INNER JOINs, the smaller input is the build side; for LEFT/SEMI/ANTI JOINs, the left side is always the probe side to preserve semantics
-- **Semi join**: Emits left row on first match, producing at most one output per left row (used for EXISTS decorrelation)
-- **Anti join**: Emits left row only when no match is found (used for NOT EXISTS decorrelation)
-
-### Merge Join
-
-Selected when both inputs are already sorted on the equi-join columns (or when sorting + merge is still cheaper than hash join):
-
-- **Algorithm**: Single linear pass over both sorted inputs. Materializes the right side into an array for run detection; streams the left side with a pointer into the right array.
-- **Complexity**: O(n + m) when pre-sorted; O(n log n + m log m) when sort is needed
-- **Supports**: INNER, LEFT, SEMI, and ANTI joins with equi-predicates
-- **Ordering preservation**: Preserves left-side ordering in output (unlike hash join which destroys ordering)
-- **Sort insertion**: The optimizer detects existing ascending ordering via `PlanNodeCharacteristics.getOrdering()` and inserts `SortNode`s only when inputs aren't already sorted on the equi-pair columns
-- **Duplicate key runs**: Correctly produces cross-product of matching runs when both sides have duplicate key values
-- **Null handling**: NULL keys never match (consistent with SQL null != null semantics)
-- **Collation awareness**: Each equi-pair's key comparator is resolved through the same shared lattice as bloom/nested-loop. Because the physical ordering property (`PhysicalProperties.ordering`) is collation-blind, merge correctness depends on both inputs being sorted under the resolved collation — the `equi-pair-extractor` matched-collation gate (both operands' collation names must agree) is the lockstep that guarantees the resolved key collation equals each input's declared sort collation, so the gate is deliberately kept conservative even though the resolver could resolve some asymmetric pairs cleanly.
-
-**Cost model** (from `src/planner/cost/index.ts`):
-- Merge join: `(leftRows + rightRows) × 0.3` + sort costs if needed
-- Hash join: `buildRows × 0.8 + probeRows × 0.4`
-- Nested loop: `outerRows × 1.0 + outerRows × innerRows × 0.1`
-
-For a 50×1000 self-join, hash join cost = 1000×0.8 + 50×0.4 = 820 vs nested loop = 50×1.0 + 50×1000×0.1 = 5050.
+Join order is chosen by a randomized greedy tour search (QuickPick); a physical algorithm
+(nested loop, hash, or merge) is then selected per join by cost. Separately, a chain of
+per-outer-row lookups can be clustered into one concurrently-driven fan-out node, and the
+keys a join propagates to its output are derived from equi-pair coverage. See
+[Optimizer Joins](optimizer-joins.md).
 
 ## Visited Tracking Architecture
 
@@ -1342,10 +855,7 @@ moment any rule transforms the node**: the plan piece changed, so every decliner
 gets a fresh shot on the new node (a rule that declined on the old shape may well
 apply to the new one). Because declines are never inherited across a transform,
 this is a strict speedup with **no plan-output change** — only same-node re-runs
-are cut, never a legitimate re-offer after the node actually changes. (An earlier
-design inheriting declines across the re-mint was rejected: it suppresses a
-decliner that becomes applicable after a *sibling* rule reshapes the node —
-`ruleAsyncGatherZipByKey` is a concrete case — silently changing plans.)
+are cut, never a legitimate re-offer after the node actually changes.
 
 Individual rules can also be disabled via `OptimizerTuning.disabledRules` (a `ReadonlySet<string>` of rule IDs). Both the pass-based and registry-based rule application paths skip disabled rules. This is primarily intended for testing (e.g., verifying semantic equivalence with/without a specific rewrite).
 
@@ -1403,7 +913,7 @@ The context-scoped design enables sophisticated optimization strategies:
 - Tier 2 re-optimization re-runs physical selection with runtime stats overlay
 - Runtime cardinality feedback updates stats between executions
 
-### Attribute provenance
+## Attribute provenance
 
 Attribute IDs have two distinct lifecycle operations that `getAttributes()` smears together:
 
@@ -1420,780 +930,47 @@ A companion per-node surface, `PlanNode.getAttributeIndex(): ReadonlyMap<number,
 
 This provenance surface is the **future** mechanism for the [lens](lens.md#overrides-are-merged-per-attribute) sparse-override merge: addressing override coverage by stable attribute ID is what the lens prover (`lens-prover-and-constraint-attachment`) needs when it plans the compiled body to read the FD/key surface. **v1 of the merge does not yet use it** — it composes at the AST level, reading coverage by output-column *name* and recomputing (re-reading the override from source) on every deploy, which delivers the same rename-then-add composability without pulling the planner into the lens compiler. When the prover lands, the merge moves onto the plan tree and addresses attributes by ID.
 
-### Functional Dependency Tracking
+## Functional Dependency Tracking
 
 Functional dependencies (FDs) are the canonical surface for "what determines what" on a relational node's output. A unique key `K` is encoded as the FD `K → (all_cols \ K)` rather than carried in a separate field, and `∅ → all_cols` encodes the at-most-one-row claim. Equivalence classes, constant bindings, domain constraints, and inclusion dependencies ride the same per-operator propagation. Consumers read uniqueness through `keysOf` / `isUnique` / `isUniqueDeterminant` in `planner/util/fd-utils.ts` and never hand-check the underlying surfaces.
 
 See [Functional Dependency Tracking](optimizer-fd.md) for the type definitions, the per-operator propagation tables, the collation gates, and the producer/consumer catalog.
 
-### Key-driven row-count reduction
-
-* If a predicate contains **equality** on all columns of a unique key the result cardinality ≤ 1.
-* See [Functional Dependency Tracking](optimizer-fd.md); a unique key is encoded as the FD `key → all_other_cols`, and the broader `fds`/`equivClasses` fields capture additional non-key dependencies.
-
-**Shared join key-coverage analysis** (`analyzeJoinKeyCoverage` in `key-utils.ts`):
-- Extracts equi-join column index pairs from join conditions
-- Checks coverage via the unified `isUnique(eqIndices, side)` surface — kind-aware, with empty-key (≤1-row) recognition: a ≤1-row side has `[]` in `keysOf`, and `[] ⊆ anything`, so it is reported covered regardless of equi-pairs. (Builds a `KeyRel` per side over `getType()` + `physical`; when the side's logical type is unavailable it falls back to declared-logical-keys-coverage OR `isUniqueDeterminant(eqSet, fds, colCount, /* isSet */ false)` — conservative, since coverage alone must never mint a preserved key: `withKeyFds` turns preserved keys into `'unique'` FDs downstream.)
-- Preserved keys are sourced from `keysOf(side)` (declared + FD-derived + empty key), so FD-only keys flow through (the prior logical-keys-only completeness gap is closed). When **both** sides are ≤1-row (`isAtMostOneRow(side)`), the empty key `[]` is pushed for inner / cross / left / right (not full outer), which `propagateJoinFds` materializes as the singleton `∅ → all_cols` FD
-- INNER / CROSS: when side B's key is covered, preserves side A's unique keys (both directions can apply) — `propagateJoinFds` materializes each preserved key as a `key → all_other_join_cols` FD (`kind: 'unique'`) on the join output — and caps `estimatedRows` at side A's row count. **Fanning-side FDs are downgraded, not dropped:** when a side is *not* preserved (no preserved key lies entirely within its columns) the join fans it out, so `propagateJoinFds` downgrades that side's FDs — guarded ones included — `'unique'` → `'determination'` (`downgradeUniqueFds`). The value claims survive for closure consumers (ORDER BY pruning, GROUP BY simplification), and the kind-aware readers never read them as keys. The genuinely-surviving keys (e.g. the composite product key of a bare cross join) are added via the preserved-key list
-- LEFT outer: when the **right** side's key is covered, preserves the **left** side's unique keys and caps `estimatedRows` at left's row count. The right-side keys are NOT propagated — unmatched left rows produce NULL-padded right columns, breaking right uniqueness. If the right key is not covered the left side fans out, so no keys propagate and `propagateJoinFds` downgrades the left side's FDs to `'determination'` (mirroring INNER/CROSS)
-- RIGHT outer: symmetric to LEFT
-- FULL outer: no keys propagate (both sides can be NULL-padded)
-- SEMI / ANTI: left's keys pass through unchanged (left-only output, no null-padding)
-- Used by all three join node types: `JoinNode`, `BloomJoinNode`, `MergeJoinNode`
-
-**FK→PK inference** (`rule-join-key-inference.ts` + `CatalogStatsProvider`):
-- When equi-join pairs align with a foreign key→primary key relationship, the PK side's key is guaranteed covered (each FK row matches ≤1 PK row)
-- `CatalogStatsProvider.joinSelectivity()` uses FK→PK detection to produce tighter selectivity (`1/ndv_pk`) instead of the general `1/max(ndv_left, ndv_right)`
-- FK constraints stored in `TableSchema.foreignKeys`, extracted from AST during CREATE TABLE
-- Unique constraints stored in `TableSchema.uniqueConstraints`, surfaced as additional `RelationType.keys` (only when **all constrained columns are NOT NULL** and the constraint is **not partial** — partial UNIQUE constraints, i.e. those carrying a `predicate` from `CREATE UNIQUE INDEX ... WHERE ...`, only guarantee uniqueness within their scope and would derive an unsound `K → all-other-cols` FD over the whole table; see `relationTypeFromTableSchema` in `src/planner/type-utils.ts`). Partial UCs are instead routed through `partial-unique-extraction.ts` to emit *guarded* FDs that Filter activation discharges when a surrounding predicate entails the partial WHERE — see § Guarded (conditional) FDs above.
-
-**Inclusion-dependency reasoning** (`util/ind-utils.ts` + `rule-anti-join-fk-empty.ts` + `rule-semi-join-fk-trivial.ts` + `rule-join-elimination.ts`):
-
-Foreign keys are inclusion dependencies — `child.fk ⊆ parent.pk` — and three optimizer rules exploit them to remove parent-side access entirely. All three run in the Structural pass at priority 26, after `rule-subquery-decorrelation` (priority 25) has materialized `EXISTS / NOT EXISTS / IN` as semi/anti joins — and after `semijoin-existence-recovery` (priority 23) has recovered a semi/anti join from a probe-only outer-join `exists … as` flag (`where flag` / `where not flag`), which the folders treat identically (a covering-FK semi recovered from `where flag` folds to L just as a decorrelated `EXISTS` semi does). The shared util `lookupCoveringFK` walks `TableSchema.foreignKeys`, matches the equi-pairs against the FK's declared *positional* pairing (`fk.columns[i] → referencedColumns[i]` — a permuted equi-pair set on a composite FK such as `(fa = b AND fb = a)` against `FOREIGN KEY (fa, fb) REFERENCES p(a, b)` is **not** covered and the rule abstains), and reports the matched FK plus whether any child column is nullable; `isRowPreservingPathToTable` guards against parent-side filters/limits/distincts that would invalidate the IND under filtering.
-
-- **`rule-anti-join-fk-empty`**: `AntiJoin(L, R, p)` where `p` is AND-of-column-equalities, the equi-pairs cover a non-null FK on L referencing R's PK, and R is a row-preserving path to its base table → rewrite to `EmptyRelationNode` carrying L's attribute IDs and `RelationType`. Correct because the IND guarantees every (non-null) L row has a matching parent in R, so the anti-join is empty.
-- **`rule-semi-join-fk-trivial`**: `SemiJoin(L, R, p)` with the same preconditions → rewrite to `L` (every L row matches) if every FK column is NOT NULL, otherwise to `Filter(L, fk_col IS NOT NULL AND …)` (rows with NULL in any FK column never match the equi-condition).
-- **`rule-join-elimination` (Aggregate entrypoint)**: `Aggregate(group, aggs, source = chain → Join(L, R))` where the FK-covered `left`/`right`/`inner` join's non-preserved side is referenced by neither the group keys nor any aggregate expression → drop the join, keep the wrapper chain. For `inner` this needs a non-null FK and a row-preserving R (`|L ⋈ R| == |L|` only when no NULL-FK row is silently dropped); for `left`/`right` it needs **neither** — `L LEFT JOIN R` preserves every L row (matched → 1, unmatched → 1 null-padded) and FK→PK alignment caps matches at ≤1, so `|L LEFT JOIN R| == |L|` *unconditionally*. Covers `count(*) from child left join parent on …`. A `hasExistenceColumns` guard abstains when a live `exists … as` flag is present (its attr id is invisible to the demand scan); the sibling `join-existence-pruning-aggregate` strips undemanded flags first, so the two cascade. The `right` arm is the mirror of `left` (FK on the *preserved* right side); since RIGHT-JOIN execution is unimplemented (`emit/join.ts` throws `RIGHT JOIN is not supported yet`), eliminating an FK-covered RIGHT join is what lets a `count(*)` over it return a result at all rather than throw.
-
-The federated-vtab payoff: each fold removes a remote round-trip to the parent table. Rules abstain conservatively when: the FK is undeclared, equi-pairs don't cover all FK columns, the parent side has a row-reducing wrapper (Filter, LimitOffset, Distinct, Project, non-trivial Retrieve pipeline), or — for the anti-join and inner-join cases — any FK column is nullable.
-
-The anti-join-to-empty rewrite emits `EmptyRelationNode` carrying L's attribute IDs and `RelationType`. Downstream the const-fold pass (`rule-empty-relation-folding`, Structural priority 27) cascades that emptiness up through immediate Filter / Project / Sort / LimitOffset / Distinct / inner-or-cross-or-semi-anti joins; see "Empty-relation folding" below.
-
-> **IND promotion note.** INDs are now *also* a first-class propagated dependency-family
-> member of `PhysicalProperties` (`inds`) — seeded from declared FKs at the table
-> reference and propagated through joins/projections; see § [Inclusion Dependency
-> Tracking](optimizer-fd.md#inclusion-dependency-tracking). That propagated set is a **parallel
-> derivation surface**, not a migration: the three rules above still consume the FK
-> *declaration* directly via the on-demand `util/ind-utils.ts` helpers (they need the
-> nullability split and positional composite pairing a coarse `child ⊆ parent` fact does
-> not carry). No consumer reads `inds` yet — Wave 1 is plumbing + a soundness harness; the
-> coverage prover (Wave 2) reads the FK-seeded `kind:'table'` INDs; the lens
-> existence-anchor injection (Wave 3, `lens-multi-source-ind-injection`) is the first
-> `kind:'relation'` producer. For a primary-storage advertisement's **synthesized
-> decomposition body**, the lens compiler (`computeExistenceAnchorInds` in
-> `schema/lens-compiler.ts`) mints one IND per **mandatory**, non-anchor, non-EAV
-> member asserting `anchor.key ⊆ member.key` — `cols` = the **anchor's** shared-key
-> indices, `target = { kind:'relation', relationId: <member>, targetCols: <member's
-> shared-key indices> }`, `nullRejecting:false` (total existence). The direction is
-> load-bearing: `compileDecompositionBody` roots the left-deep join at the anchor and
-> inner-joins each mandatory member, so the no-row-loss obligation is "no anchor row is
-> dropped", which the consumer discharges from an IND **on the anchor**
-> (`anchor.key ⊆ member.key`). `presence:'mandatory'` ("every logical row has it")
-> guarantees exactly that totality; the converse (`member ⊆ anchor`) is intentionally
-> **not** asserted because no stated property guarantees member→anchor referential
-> integrity — emitting it would over-claim (an orphan mandatory-member row is filtered
-> by the inner join, leaving the converse false). Optional members (outer-joined), EAV
-> pivots (never inner-joined), and the empty-key singleton inject nothing — any would
-> over-claim. Injection is gated to the synthesized-decomposition body: a full
-> hand-authored override / single-source default body carries no advertised
-> `anchor ⋈ member` join, so it injects nothing. The surrogate join carries no declared
-> SQL FK, so `seedTableForeignKeyInds` is blind to it; the fact is recorded on
-> `LensSlot.injectedInds` and read by the lens prover off the slot, **not** seeded at
-> the member scan (the body is planned before the slot is committed, so a scan-time seed
-> would never reach the prover). The trade-off: the relation-IND is visible only to the
-> prover (its sole intended consumer), not the general optimizer.
-
-### Fan-out lookup join (FK→PK + 1:n cross)
-
-`rule-fanout-lookup-join.ts` (Structural pass priority 23, registered ahead of `join-elimination` at 24) clusters a Project-rooted set of N per-outer-row branches into one physical `FanOutLookupJoinNode` (see `docs/runtime.md` § FanOutLookupJoinNode for the runtime). A branch is either *at-most-one* (≤1 row per outer row — `atMostOne-left` / `atMostOne-inner`) or *cross* (data-driven 1:n, Cartesian product per outer row — `cross` for INNER/CROSS, `cross-left` for an outer-preserving LEFT 1:n). Three branch kinds are recognized and combined into a single cluster (a chain may mix all three):
-
-**1. Join-spine branches.** A chain of LEFT/INNER/CROSS joins from a common outer where every join's non-preserved side is a parameterized equi-lookup. The recognition primitives are shared with `rule-join-elimination`:
-
-- `isAndOfColumnEqualities` — the ON clause must be an AND of `colRef = colRef` atoms; any residual disqualifies the branch.
-- `checkFkPkAlignment` + `lookupCoveringFK` (`util/key-utils.ts`, `util/ind-utils.ts`) — when the join's equi-pairs match an FK on the outer's table referencing the lookup's PK (in the FK's declared positional order), the branch is **at-most-one**. INNER at-most-one branches additionally require a non-null FK and a row-preserving path to the PK table (the same `isRowPreservingPathToTable` guard the join-elim rule uses); an aligned INNER branch that fails this (nullable FK / non-row-preserving) **bails** the whole cluster rather than degrading to cross — FK→PK is still ≤1 match, so the issue is inner-drop semantics, not cardinality.
-- When FK→PK alignment is **absent** (no FK, or FK→non-unique) the lookup is data-driven 1:n. An INNER/CROSS join becomes a **cross** branch (inner-drop: an empty branch collapses the outer row). A **LEFT** join becomes a **cross-left** branch — same 1:n product when the branch matches, but an empty branch emits one NULL-padded factor row so the outer row is preserved (LEFT semantics), and the branch's output attributes are nullable-widened (mirroring `atMostOne-left`). Both contribute a 1:n factor gated by the row/product guards below; the cardinality/widening predicates are centralized as `isCrossBranchMode` / `isLeftBranchMode` on `FanOutLookupJoinNode`.
-- When a spine is present the outer subtree must resolve to a single base table (`extractTableSchema`) so the FK column indices are well-defined — middle-of-chain joins that don't resolve to a single schema are not eligible. `extractTableSchema` is consulted **only** when there is a spine; pure-subquery clusters skip it.
-
-Each recognized spine branch becomes a `FanOutBranchSpec` whose `child` is the lookup wrapped in a `FilterNode` carrying the original equi-condition.
-
-**Cross-branch memory guard.** A cross branch's 1:n fan-out makes the cluster output the Cartesian product of the outer side and every cross branch (both `cross` and `cross-left` count — a `cross-left` empty match only adds the single preserved NULL row, so it still widens the product), so before clustering the rule applies (in `crossGuardsPass`): (a) skip if any cross branch's lookup estimate exceeds `tuning.parallel.maxCrossBranchRows`; (b) skip if `outer.estimatedRows × Π(cross-branch estimatedRows)` exceeds `tuning.parallel.maxCrossProduct`. **Unknown estimates (`undefined`) are treated as exceeding the cap** so a missing statistic never authorizes an unbounded product; the chain then stays a streaming / re-executing nested-loop join (already memory-safe). At-most-one branches contribute a ×1 factor and are exempt. (Caveat: synthetic memory-vtab leaves resolve `estimatedRows` to `0` rather than `undefined`, so the product guard is permissive there — the cost gate's latency requirement is the primary thing keeping the rule inert on local plans; the product guard bites only against real positive estimates, e.g. vtab-supplied statistics.)
-
-**2. Subquery branches (correlated scalar aggregates).** A correlated scalar-aggregate `ScalarSubqueryNode` found anywhere in a projection's scalar expression tree — bare (`(select count(*) from c where c.fk = o.k)`, `(select json_group_array(...) from l where l.order_id = o.id)`) or wrapped inside a scalar expression (`coalesce((select sum(...) ...), 0)`, `json((select json_group_array(...) ...))`, an arithmetic/`cast` wrapper). A scalar aggregate with no `GROUP BY` emits exactly one row per outer row regardless of how many child rows match (aggregate of the empty set is still one row — `count→0`, `json_group_array→null`), so relationally it is an `atMostOne-left` branch driven per outer row. This **subsumes** the once-proposed `array` branch mode — there is no new `FanOutBranchMode`; the JSON/array shape is whatever the query expresses. Recognition walks each projection with `collectScalarSubqueries` (pre-order, not descending into a subquery's own relational body so a nested inner subquery stays part of its enclosing branch), then gates each candidate with `recognizeSubqueryBranch`:
-
-- the candidate is a `ScalarSubqueryNode` reached anywhere in the projection's scalar tree — multiple wrapped subqueries per projection, and a mix of wrapped + bare, may all cluster (each contributes one wide-row column);
-- the subquery must be correlated **and every external reference must resolve against the outer subtree** — `collectExternalReferences(subquery)` must be non-empty and a subset of the outer's attribute IDs. Non-correlated subqueries are constant-per-query and left alone; a subquery correlating to a *sibling spine-branch* attribute is rejected because at runtime the fan-out installs only the outer row's slot before forking, so such a reference would be unresolvable inside the branch;
-- beneath pass-through wrappers (Project/Alias/Sort/LimitOffset) the relational root must satisfy `CapabilityDetectors.isAggregating(root) && root.getGroupingKeys().length === 0` — this matches both the logical `AggregateNode` and the physical `StreamAggregate`/`HashAggregate`, so it is robust to pass ordering. A `GROUP BY` subquery (may yield >1 row) is rejected here;
-- the subquery's relational root exposes exactly one output column (it is a scalar subquery).
-
-Aggregate nodes advertise exactly their logical GROUP-BY + aggregate schema in both their logical and physical (`StreamAggregate`/`HashAggregate`) forms — source columns needed for HAVING/correlated access flow through the runtime row-descriptor context, never as output columns — so a no-`GROUP-BY` scalar-aggregate subquery root is already single-column. The branch `child` is therefore the subquery root verbatim, with its column-0 attribute (= `valueAttr`) contributing the scalar value to the wide row. The surrounding Project's affected projection is rewritten by `substituteSubqueries`, which rebuilds the scalar tree (via `getChildren`/`withChildren`) replacing only the matched inner `ScalarSubqueryNode`(s) with a `ColumnReferenceNode` into the fan-out's wide row — a bare-subquery projection is swapped wholesale, a wrapped one keeps its wrapping expression (`coalesce(<colref>, 0)`) intact. Correctness comes from the attribute ID (resolved by the row descriptor); the projection keeps its own `attributeId`/`alias`. This is fan-out-targeted recognition, **not** generic decorrelation — the WHERE-clause EXISTS/IN path (`rule-subquery-decorrelation.ts`) is untouched, and decorrelating a scalar aggregate to a build-side hash group-by would defeat the per-row streaming concurrency this rule exists to exploit.
-
-**Cluster layout & runtime.** Spine branches are ordered first (preserving left-deep order), then subquery branches. The outer is the deepest `.left` of the spine, or — with no spine — the bottom relational node beneath the chain wrappers. At runtime, `FanOutLookupJoinNode` installs the outer row's slot on `rctx.context` before forking each branch, so both a spine branch's Filter and a subquery branch's internal correlation predicate resolve their outer-side `ColumnReferenceNode`s through the parent fork's snapshot. Because the branch is driven to its one finalized aggregate row, the `atMostOne-left` zero-row NULL-fill path never fires for a subquery branch — an outer row with no matching children yields the aggregate's empty-set value (`count→0`), not NULL.
-
-**Cost gate.** The rule fires only when
-```
-(N − concurrencyCap) × max(expectedLatencyMs across branches) > N × tuning.parallel.branchSetupCost
-```
-where `concurrencyCap = min(tuning.parallel.concurrency, N)`. Practical consequences:
-
-- `expectedLatencyMs == 0` ⇒ no rewrite. Local-only paths (memory vtab, in-process compute) leave the latency field at the default 0, so the gate is inert and `test/plan/`-style memory-vtab goldens never change shape under this rule. The gate becomes meaningful only when a remote-vtab plugin populates `VirtualTableModule.expectedLatencyMs` with a non-zero hint (`TableReferenceNode.computePhysical` reads it; the value propagates as `max(children)` through the subtree).
-- `concurrencyCap ≥ N` ⇒ savings clamps to 0 (or negative, treated as 0). Fan-out wins only when concurrency-bound; below that, the nested-loop chain is already an upper bound on wall-clock and a fresh round of branch setup is pure cost.
-- `N < tuning.parallel.minBranches` (default 2) ⇒ no rewrite; a single-branch fan-out has no parallelism to exploit. `N` is the **combined** spine + subquery branch count, so a lone correlated subquery with no other branch never clusters.
-
-**Tuning knobs** (`OptimizerTuning.parallel`):
-
-- `minBranches` (default 2) — minimum branch count before clustering is considered.
-- `branchSetupCost` (default 1.0) — per-branch fixed overhead in `expectedLatencyMs`-equivalent units (anchored against `COST_CONSTANTS.NL_JOIN_PER_OUTER_ROW`).
-- `concurrency` (default 8) — static cap on in-flight branches per outer row, also fed to the constructed `FanOutLookupJoinNode.concurrencyCap`.
-- `outerBatchConcurrency` (default 16) — global in-flight budget for a `outerMode: 'batched'` fan-out (shared across all in-flight outer rows, not per row). Consumed at emit time by `runFanOutLookupJoinBatched`; also read by `rule-fanout-batched-outer` as the per-row budget-saturation threshold (see "Fan-out batched outer" below). See `docs/runtime.md` § FanOutLookupJoinNode → Outer execution modes.
-- `maxOuterReadAhead` (default 64) — hard clamp on outer rows admitted ahead of the emit frontier in a batched fan-out, bounding the reorder buffer and forked per-row contexts. Also the buffer size `rule-fanout-batched-outer` gives the `EagerPrefetchNode` it wraps the outer in.
-- `maxCrossBranchRows` (default 10000) — per-branch row cap for cross (1:n) branches (`cross` / `cross-left`); a cross lookup whose estimate exceeds this stays a nested-loop join. At-most-one branches are exempt.
-- `maxCrossProduct` (default 1e6) — whole-product cap for a cross fan-out (`outer × Π cross-branch rows`, including `cross-left`); unknown estimates count as exceeding it.
-
-**Relationship to `join-elimination`.** The fan-out rule runs first (priority 23). A successful cluster removes all eligible branches from the chain. If the rule abstains (branch count < `minBranches`, or the cost gate rejects), the remaining single-branch joins fall through to `join-elimination` at priority 24, which can still eliminate them individually when the non-preserved side isn't referenced upstream.
-
-**Out of scope.** Subqueries nested inside a larger scalar expression (`coalesce((subq), 0)`, arithmetic on a subquery) are not recognized — v1 requires the projection node to *be* a `ScalarSubqueryNode` (tracked as backlog `parallel-fanout-aggregate-branch-wrapped-subquery`). The relational 1:n product case is recognized as `cross` (INNER/CROSS) and `cross-left` (LEFT, nullable-widened, outer-preserving on an empty branch) branches (see above). Connection-per-branch acquisition is not implemented — v1 always reuses the outer's connection, and `'serial'`-mode branches serialize through the per-connection lock; correctness is preserved but the parallelism payoff is module-mode-gated. Adaptive concurrency, latency-driven branch ordering, and the tighter per-branch equi-pair FD propagation in `FanOutLookupJoinNode.computePhysical` are all tracked as follow-ups.
-
-### Fan-out batched outer
-
-`rule-fanout-batched-outer.ts` (`PassId.PostOptimization` priority 16) flips an already-formed `FanOutLookupJoinNode` from the default `serial` outer mode to `batched` (cross-row pipelined — see `docs/runtime.md` § FanOutLookupJoinNode → Outer execution modes). It is a *post-pass* over the node `rule-fanout-lookup-join` built in `Structural`, not a new recognition path: by PostOptimization, physical-pass selection has finalized leaf `expectedLatencyMs` / `estimatedRows` / `concurrencySafe`, which the cost model reads. The rule matches `PlanNodeType.FanOutLookupJoin`.
-
-**When batched wins.** Batched mode overlaps lookups *across* outer rows, so it pays off only when there are **many outer rows but few branches per row** — the per-row branch count under-saturates the shared global in-flight budget, and admitting more outer rows ahead of the emit frontier is the only way to fill it. All of these must hold:
-
-- **`branchCount < tuning.parallel.outerBatchConcurrency`** — budget under-saturated per row. When one row's branches already meet/exceed the global budget, cross-row admission buys nothing.
-- **`max(expectedLatencyMs across branches) >= tuning.parallel.batchedOuterThresholdMs`** (default 25 ms) — the slowest branch must be high-latency. 0 on every memory-vtab leaf, so the rule is **inert by design on local-only plans** (same discipline as `gatherThresholdMs` / `prefetchProbeThresholdMs`); the golden sweep is unaffected.
-- **`outer.estimatedRows >= tuning.parallel.batchedOuterMinRows`** (default 256, ≈ 4× `maxOuterReadAhead`) — large outer cardinality so cross-row overlap dominates the reorder-buffer + per-row-fork overhead. An **unknown estimate fails the gate** (never flip on a missing statistic). Because several pass-through wrappers (notably `AliasNode`) propagate `estimatedRows` through the `.estimatedRows` getter, which the leaves do not all populate, the rule reads the node's own estimate then descends single-relation pass-throughs to recover the leaf's `physical.estimatedRows`. Synthetic memory-vtab leaves resolve to 0, so the default also keeps the rule inert there independent of the latency gate.
-- **`outer.physical.concurrencySafe === true`** — the batched driver pumps the outer concurrently with in-flight branch forks (serial mode never overlapped these), so the outer must be proven safe (mirrors `eager-prefetch-probe` / `async-gather`).
-
-**Cross branches are out of scope.** A node carrying any cross (1:n) branch — `cross` or `cross-left` — is left serial; the streaming-cross + batched combination is owned by `parallel-fanout-lookup-join-cross-mode`. The rule only flips clusters whose branches are all `atMostOne-*`.
-
-**Batched implies prefetch (outer-source isolation).** The batched driver calls `outerIter.next()` *concurrently* with live per-row branch forks. The scheduler runs every instruction against one shared `RuntimeContext`, so a raw outer sub-plan that mutates `rctx.context` during the pump (installing a row slot, etc.) would (a) risk a torn read for any branch reading that entry and (b) throw a strict-fork violation when the fan-out is nested under another fork (so `rctx.context` is strict-wrapped) and the live row forks hold the bump counter. To neutralize both, the rule wraps the outer in an `EagerPrefetchNode` (sized to `maxOuterReadAhead`) when it flips to batched: the prefetch pump runs the outer sub-plan against its *own* forked context (mutations land on the fork, never on the shared `rctx.context` the row forks bump), and the batched pump merely drains the prefetch buffer — a pure buffer read that never touches `rctx.context`. The same buffer also feeds the read-ahead window the batched driver consumes across rows, so prefetch and batched compose rather than duplicate work. The reverse implication does **not** hold — `eager-prefetch-probe` uses `EagerPrefetchNode` independently for hash-join probes. The branch correlations are already safe by construction: `rule-fanout-lookup-join` only clusters branches (spine lookups + correlated scalar-aggregate subqueries) that reference the outer row's attributes, which the batched driver isolates per row in its own boxed slot.
-
-**Pass placement.** Priority 16 sits between `eager-prefetch-probe` (15) and the `async-gather` rules (17), after physical selection and before `materialization-advisory` (30), so the `EagerPrefetchNode` the rule inserts is already in place when the advisory walks the tree (it will not re-wrap the outer in a `Cache`). **Idempotence:** after the rewrite `outerMode === 'batched'`, so a second firing returns null.
-
-**Tuning knobs** (`OptimizerTuning.parallel`):
-
-- `outerBatchConcurrency` (default 16) — per-row budget-saturation threshold (`branchCount < outerBatchConcurrency`) and, at emit time, the global in-flight budget.
-- `batchedOuterThresholdMs` (default 25) — minimum slowest-branch latency to flip.
-- `batchedOuterMinRows` (default 256) — minimum estimated outer rows to flip.
-- `maxOuterReadAhead` (default 64) — buffer size for the inserted `EagerPrefetchNode` (and, at emit time, the reorder-buffer clamp).
-
-### Async gather UNION ALL
-
-`rule-async-gather-union-all.ts` (PostOptimization pass priority 17) folds a chain of `SetOperationNode(op='unionAll')` into one N-ary `AsyncGatherNode({ kind: 'unionAll' })` that drives the branches concurrently via the runtime's `ParallelDriver` (see `docs/runtime.md` § AsyncGatherNode). The rule walks the entire tree of unionAll-`SetOperationNode`s (any shape — left-deep, right-deep, balanced) plus any unionAll `AsyncGatherNode`s the rule has already produced on inner sub-chains, flattening them into a single child list.
-
-**Two gates must clear** for the rewrite to fire:
-
-1. **`concurrencySafe` AND across children** — every flattened child must declare `physical.concurrencySafe === true`. Any non-safe branch (mutating subplan, holding a non-reentrant cursor, sitting over a `'serial'` module without a per-branch connection) poisons the rewrite; leave the chain as sequential `SetOperationNode`s. This mirrors the `SetOperationNode` ➜ `AsyncGatherNode` physical-property contract: both drop ordering / FDs / ECs / constant bindings / domain constraints for `unionAll`, but the gather node additionally requires concurrent execution to be safe across all children.
-
-2. **`max(expectedLatencyMs across children) ≥ tuning.parallel.gatherThresholdMs`** — the slowest child must clear the threshold. `expectedLatencyMs` is 0 by default for all in-process / memory-vtab paths (only remote-vtab plugins populate non-zero values via `VirtualTableModule.expectedLatencyMs`), so the rule is **inert by design in local-only configurations**. The default threshold is 25 ms (matches the synthetic high-latency vtab fixture in `test/optimizer/parallel-async-gather.spec.ts`); any positive value satisfies the no-rewrite-on-local invariant the `test/plan/` golden sweep depends on.
-
-**Pass placement.** The rule runs in `PassId.PostOptimization` at priority 17, **after** physical-pass selection has finalized `expectedLatencyMs` / `concurrencySafe` on the leaves (so the gates have real values to read) and **before** `materialization-advisory` at priority 30 (so any cache the advisory introduces sits *inside* each gather branch — preserving the parallel-drive intent of overlapping high-latency I/O with branch-local compute).
-
-**Attribute IDs.** The gather node inherits the outermost `SetOperationNode`'s attributes via `preserveAttributeIds`. `SetOperationNode.buildAttributes` mirrors the leftmost child's attributes verbatim, so downstream consumers (including `ORDER BY x` references) continue to resolve unchanged across the rewrite.
-
-**Idempotence.** After the rewrite the root node is an `AsyncGatherNode`, not a `SetOperationNode`, so the rule's `node instanceof SetOperationNode` matcher rejects on a second firing. Additionally, the flatten helper absorbs unionAll-`AsyncGatherNode` children — necessary because bottom-up traversal fires the rule on inner sub-chains first; without the absorption, the outer firing would wrap an already-built gather in a second gather.
-
-**Tuning knobs** (`OptimizerTuning.parallel`, shared with the fan-out rule):
-
-- `minBranches` (default 2) — minimum branch count after flattening.
-- `concurrency` (default 8) — fed to `AsyncGatherNode.concurrencyCap` (clamped to `Math.min(concurrency, branchCount)`).
-- `gatherThresholdMs` (default 25) — minimum slowest-child latency required for the rewrite.
-
-**Relationship to `SetOperationNode.computePhysical`.** Both nodes drop the same set of relational invariants for `unionAll` (ordering, monotonicOn, FDs, ECs, constant bindings, domain constraints). The rewrite is therefore physical-properties-preserving for the consumer; downstream rules see identical properties whether they look at the SetOp tree or the post-rewrite gather.
-
-**Out of scope for v1.** The `crossProduct` combinator is opt-in only (no recognition rule yet); the `zipByKey` combinator has its own recognition rule (see *Async gather ZIP BY KEY* below). The `materialization-advisory`-wraps-a-high-latency-child interaction is not patched here — if the advisory introduces a `CacheNode` over a remote-vtab branch *inside* the gather, the prefetch overlap is partially defeated (the cache materializes serially before the gather sees rows); follow-up if it surfaces in practice. The mixed-branches case (one slow, two local) currently fires the rule on the simple "max-of-children" gate; an adaptive per-branch decision is parked. Sort-above-gather under `QUEREUS_FORK_STRICT=1` trips the strict-fork contract due to a pre-existing interaction between the Sort emitter (mutates parent context) and AsyncGather (keeps forks live during yielding); the optimizer-spec for this rule skips that case under strict-fork and the rest of the suite is strict-fork clean.
-
-### Async gather ZIP BY KEY
-
-`rule-async-gather-zip-by-key.ts` (PostOptimization pass priority 17) generalizes the UNION ALL fold to the `zipByKey` combinator. It recognizes a `ProjectNode` over a chain of binary full-outer `JoinNode`s that all equate the **same** key column set across every participating relation, and folds the whole shape into one N-ary `AsyncGatherNode({ kind: 'zipByKey', branchKeyAttrs, outputKeyAttrs })` (a symmetric N-way hash-merge — see `docs/runtime.md` § AsyncGatherNode). Binary `FULL JOIN` has **no runtime lowering of its own**, so this rewrite is its only execution path; a recognized full-outer-on-shared-key query that fails any gate simply stays a `JoinNode(full)` and errors at emit (`FULL JOIN is not supported`), exactly as before the rule existed.
-
-**Recognized shape.** The natural spelling
-
-```sql
-select coalesce(a.k, b.k, c.k) as k, a.av, b.bv, c.cv
-  from a full outer join b on a.k = b.k
-         full outer join c on a.k = c.k
-```
-
-builds as `Project[ coalesce(a.k,b.k,c.k) as k, a.av, b.bv, c.cv ]` over a left-deep `Join(full)` chain. The matcher requires:
-
-1. The full-join chain flattens (any nesting) into ≥ `minBranches` branches; each `ON` is a pure conjunction of column-ref equalities (any residual / non-equi conjunct blocks).
-2. Those equalities partition the branches' key columns into K equivalence classes ("key positions"), and **every branch contributes exactly one column to every class** (the shared-key precondition — a branch absent from any class would be a cross-product, not a zip).
-3. The projection list, **in any order**, expresses: K merged keys (each a `coalesce(...)` whose argument set is exactly one key class's per-branch key attrs), the forwarded non-key column refs it selects (a subset is fine), plus arbitrary additional pure scalar expressions over those outputs (e.g. `coalesce(a.k, b.k) * 10`). The one hard constraint: a branch *key* column may appear **only** inside a recognizing full-group `coalesce` — a bare/partial reference (`select a.k …`) blocks, because the per-branch key is consumed into the single merged key and is unavailable above the gather.
-
-**Reordering Project wrapper.** When the projection happens to be exactly the emitter's canonical order (`[K coalesce calls][branch0 non-key][branch1 non-key]…`), the gather replaces the `Project` outright — the fast path, no wrapper. Otherwise the gather is built in its canonical layout and wrapped in a thin reordering `Project` that reproduces the user's list: each full-group `coalesce` is rewritten to a bare reference to the gather's minted merged-key output (`outputKeyAttrs[i]`), forwarded non-key refs pass through, and any surrounding pure scalar structure is rebuilt around them. The wrapper carries the original `Project`'s output attribute ids, so downstream references stay valid.
-
-**Gates** mirror the UNION ALL rule: `concurrencySafe === true` on every branch; the slowest branch's `expectedLatencyMs ≥ gatherThresholdMs` (inert on memory-vtab plans where it is 0); every branch uncorrelated (`isCorrelatedSubquery` false — the driver forks independent contexts). One extra gate is specific to keyed merge: **every key column at a given key position must declare the same collation across all branches** (binary or not). The runtime comparator derives solely from branch 0's collations, so a disagreement would compare keys under the wrong collation — the rule declines (gracefully; `AsyncGatherNode.validateZipByKey` enforces the same *agreement* invariant and *throws* on a true mismatch). Non-binary collations are fine: the emitter composes the merged key deterministically from the lowest-indexed present branch, matching `coalesce`'s left-to-right pick even when collation-equal keys are byte-distinct (e.g. NOCASE merging `'A'`/`'a'` always yields the branch-0 value, never the arrival-order winner).
-
-**Attribute provenance (Option A).** Each branch keeps its own key attr ids (`branchKeyAttrs[b]`, distinct per branch — provenance-clean), and the gather **mints** the K merged key ids (`outputKeyAttrs`) — which are exactly the ids the `Project` already minted for its `coalesce` outputs (computed expressions → fresh ids, disjoint from all child ids). `preserveAttributeIds` is the `Project`'s full output attribute list, which (because the canonical order matched) equals `[minted keys] ++ [each branch's non-key attrs]`, so downstream references to the coalesced key and the forwarded non-key columns continue to resolve.
-
-**Idempotence.** After the rewrite the matched node is an `AsyncGatherNode`, not a `ProjectNode`, so the `node instanceof ProjectNode` matcher rejects on a second firing.
-
-**Out of scope.** Only symmetric `FULL OUTER` chains are recognized (`LEFT`/`RIGHT` outer chains are asymmetric and not zipByKey). `USING` / `NATURAL` full joins are **not** recognized: the builder stores their equated columns as `usingColumns` and synthesizes no explicit `ON` condition, so the chain walk (which requires `JoinNode.condition`) declines them; they remain an unsupported binary `FULL JOIN` and error at emit (pinned by an explicit non-fold test). Recognizing them would require synthesizing the per-column equality + merged-key projection at build time first.
-
-**Tuning knobs** (`OptimizerTuning.parallel`, shared with the UNION ALL and fan-out rules): `minBranches`, `concurrency` (→ `concurrencyCap`), `gatherThresholdMs`.
-
-### Eager-prefetch probe wrap
-
-`rule-eager-prefetch-probe.ts` (PostOptimization pass priority 15) wraps the probe (`left`) input of a physical hash join (`BloomJoinNode`, `PlanNodeType.HashJoin`) in an `EagerPrefetchNode` when the build (`right`) side advertises high first-row latency. Note the `BloomJoinNode` convention: **`left` is the probe (streamed) side** and `right` is the build (materialized) side — opposite of the textbook ordering. The buffered prefetch pump then pipelines probe-side reads with the parent emit's per-row work.
-
-**Cost gate.** `node.right.physical.expectedLatencyMs ≥ tuning.parallel.prefetchProbeThresholdMs`. Like the fan-out and gather rules, `expectedLatencyMs` is 0 on every in-process / memory-vtab leaf, so the rule is **inert by design on local-only plans** (the `test/plan/` golden sweep is unaffected). The gate is on the build side specifically: if `left` were the slow one the consumer above the join takes that latency hit regardless, so prefetching it would not change first-row time meaningfully.
-
-**Concurrency gate.** Since the prefetch pump now starts on `run()` (see runtime.md § EagerPrefetchNode), the probe (`left`) subtree iterates **concurrently** with the build's for-await over `right`. If either side sits over a non-reentrant (`'serial'`) cursor, concurrent iteration corrupts state. The rule therefore only fires when **both** `node.left.physical.concurrencySafe === true` and `node.right.physical.concurrencySafe === true` — mirroring `rule-async-gather-union-all`'s strict `=== true` check (wrap only when *proven* safe; `undefined` blocks). Memory-vtab leaves declare `concurrencyMode = 'reentrant-reads'` → `concurrencySafe === true`, so local plans clear this gate (but remain blocked by the cost gate).
-
-**Skip predicates.** The wrap is suppressed when the probe is already pump-driven or pre-materialized: `left` is an `EagerPrefetchNode` (idempotence), a `Cache` (pre-materialized — a prefetch over a cache buys nothing), or an `AsyncGather` (already drives its branches concurrently). Pure-`nodeType` checks; no capability detector.
-
-**Pass placement.** Priority 15 in PostOptimization — after `mutating-subquery-cache` (10) and `asof-strategy-select` (11, finalizes leaf physical properties incl. `expectedLatencyMs`), and before `cte-optimization` (20) and `materialization-advisory` (30, so the advisory sees the prefetch-wrapped tree and does not re-wrap the probe in a Cache).
-
-**Tuning knobs** (`OptimizerTuning.parallel`): `prefetchProbeThresholdMs` (default 25 — shares the synthetic high-latency vtab fixture value) and `prefetchBufferSize` (default 64 — mirrors the `EagerPrefetchNode` constructor default).
-
-**Out of scope (follow-on backlog).** A broad cost-driven gate independent of remoteness; merge / nested-loop / asof join shapes; wrapping the build side (consumed once linearly, no benefit); and wrapping arbitrary high-latency subtrees.
-
-### Empty-relation folding
-
-`EmptyRelationNode` (`planner/nodes/empty-relation-node.ts`) is a schema-polymorphic zero-row relation. Its constructor takes the exact `Attribute[]` and `RelationType` that the surrounding node would have produced, so attribute IDs above the fold site remain stable. It is distinct from `EmptyResultNode` (a `TableAccessNode` tied to a `TableReferenceNode` — the table-access-bound empty result for impossible predicates inferred during access-path planning); `EmptyRelationNode` is unmoored from any specific source.
-
-`rule-empty-relation-folding.ts` runs in the Structural pass at priority 27 — after the IND rules at 26 — and rewrites the following shapes (`E = EmptyRelationNode`):
-
-| Host shape                                  | Rewrite                                                          | Note |
-|---------------------------------------------|------------------------------------------------------------------|------|
-| `Filter(x, lit-false / null / 0)`           | `EmptyRelationNode(x.getAttributes(), x.getType())`              | WHERE-clause truthiness — `false`, `NULL`, `0`, `0n` all reject. |
-| `Filter(E, _)`                              | `E` (schema unchanged)                                            | Pass-through. |
-| `Project(E, projections)`                   | `EmptyRelationNode(project.getAttributes(), project.getType())`  | Lifts Project's own attribute IDs. |
-| `Sort(E, _)`, `LimitOffset(E, _)`, `Distinct(E)` | `E`                                                              | Schema unchanged. |
-| `Join(E, R, inner \| cross \| semi)` or `Join(L, E, inner \| cross \| semi)` | `EmptyRelationNode(join.getAttributes(), join.getType())`     | |
-| `Join(E, R, left)` or `Join(L, E, right)`   | `EmptyRelationNode(join.getAttributes(), join.getType())`        | Empty driving side. |
-| `Join(E, _, anti)`                          | `EmptyRelationNode(join.getAttributes(), join.getType())`        | Anti drives from left only. |
-| `Join(E, E, full)` (both empty)             | `EmptyRelationNode(join.getAttributes(), join.getType())`        | A single empty side under FULL still null-pads — don't fold. |
-
-The fold rule's `isEmpty` helper looks through `AliasNode` wrappers (FROM-clause subquery aliases produce these). This is sound for the fold itself because the host node (Join, Filter, Project, …) supplies its own attribute IDs when constructing the new `EmptyRelationNode`; the Alias's rename is discarded along with the Alias.
-
-Cascade limits: the Structural pass traverses top-down, so a parent's rules fire BEFORE its children are visited. When an inner Filter folds to `EmptyRelation` mid-traversal, the residual operators above it (Sort, LimitOffset, Project, Join, …) have already been rule-visited and won't re-fire automatically. The runtime is unaffected — `EmptyRelation` yields no rows, so output is correct — but the plan may still show residual operators above the `EmptyRelation`. The IND rules and the fold rules co-located in the Structural pass mean that whenever the IND rule rewrites an anti-join to `EmptyRelation` *within the same node visit*, the JoinFoldEmpty rule can still fire via the per-node fixed-point loop in `applyPassRules`.
-
-### Predicate contradiction detection
-
-`rule-filter-contradiction.ts` (Structural pass priority 27) recognizes when a Filter's predicate, conjoined with the source's `domainConstraints` and literal `constantBindings`, is provably unsatisfiable, and emits `EmptyRelationNode` carrying the Filter's own attribute IDs / RelationType. The const-fold cascade above (Project / Sort / LimitOffset / Distinct / inner-or-cross-or-semi Join) then collapses the surrounding subtree.
-
-The reasoning is implemented by `planner/analysis/sat-checker.ts` — a single-pass per-column accumulator over the conjuncts. Scope is intentionally narrow:
-
-- **In-scope** (can prove `unsat`):
-  - Single-column comparisons against literals: `= / == / != / <> / < / <= / > / >=`.
-  - Single-column positive `BETWEEN literal AND literal`.
-  - Single-column `IN (lit, lit, ...)` and intersection across multiple IN-lists; the empty form `x IN ()` is recognized as trivially `unsat`.
-  - Range intersection across multiple bounds, with inclusive/exclusive arithmetic.
-  - Domain-vs-predicate intersection (CHECK-derived `range` and `enum`).
-  - Literal `ConstantBinding` from the source (treated as a degenerate point range plus singleton enum).
-- **Out of scope** (clauses set a per-column `sawUnknown` flag; never produces a false `unsat`):
-  - `OR` / `CASE` branch analysis — would require case-decomposition.
-  - Cross-column arithmetic (`a + b > 10`), function calls, `LIKE` patterns, `IS NULL` / `IS NOT NULL`, `NOT (...)`, parameter bindings (the runtime value isn't known at plan time).
-  - A value-changing `CAST`, or any `COLLATE` wrapper, on a compared operand. Only a no-op cast (target logical type == the operand's) is unwrapped: erasing `cast(x as integer)` would read `x = '1' and cast(x as integer) = 1` as a cross-storage-class contradiction, and erasing `collate` would compare `x collate nocase = 'a' and x collate nocase = 'A'` under `x`'s own (BINARY) collation. Both predicates are satisfiable; both would fold to empty. (`analysis/constraint-extractor.ts`'s `unwrapCast` and `analysis/coarsened-key.ts` apply the same no-op-cast-only rule; for seek witnesses, erasing a converting cast pushes a seek key that is not the stored column value — `cast(x as integer) = 1` over a `text` primary key seeks the integer `1` and matches nothing, with the conjunct consumed so no residual `FILTER` remains. The planner synthesizes exactly that cast for a bare `where x = 1` on a `text` column via `insertCrossTypeCoercion`, so no explicit `cast(...)` is needed to reach the shape.)
-  - Outer-join `on`-clause contradiction (null padding survives; deferred).
-  - Inner-join `on`-clause contradiction — covered by the filter rule whenever `predicate-pushdown` has lowered the predicate onto a Filter, which is the canonical shape. The standalone `on`-clause variant is a tracked follow-up.
-
-The `sawUnknown` flag is **per column**, not global: a LIKE pattern on `b` does not block proving an interval-range contradiction on `a`.
-
-**Collation.** Literal comparisons use the compared column's declared collation, resolved through the owning `Database` (`db.getCollationResolver()`), so `x = 'a' and x = 'A'` is `unsat` on a BINARY column and satisfiable on a `NOCASE` one — including a `NOCASE` the embedder redefined via `db.registerCollation`. Every mentioned column's collation is resolved **once**, before the conjunct loop. If a name cannot be resolved — no resolver was supplied, or the name is not registered (column DDL does not yet validate collation names on non-TEXT types) — the entire check returns `unknown` and the Filter stands. Assuming BINARY there would let a satisfiable predicate be proved `unsat`, silently dropping rows. The same resolver reaches the set-operation write path's per-leg oracle (`planner/mutation/set-op.ts`), where a false `unsat` would skip a leg the incoming row belongs in.
-
-Prereqs in the propagation chain (already landed):
-- `optimizer-check-derived-fds-and-domains` — populates `PhysicalProperties.domainConstraints` from declared CHECK.
-- `optimizer-empty-relation-node` — supplies the schema-polymorphic empty target so the rewrite preserves attribute IDs.
-
-**Worked example**:
-
-```sql
-CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER, CHECK (qty >= 0));
-
--- Source advertises domainConstraints = [{ kind: 'range', column: 1, min: 0, minInclusive: true }].
--- WHERE qty < 0 contributes the conjunct `qty < 0` → upper bound 0 exclusive on column 1.
--- Intersection: min=0 (inclusive) ∧ max=0 (exclusive) → empty range → 'unsat'.
-SELECT * FROM t WHERE qty < 0;
--- → EmptyRelationNode (the SeqScan and downstream Filter are eliminated by the fold cascade).
-```
-
-**DISTINCT elimination** (`rule-distinct-elimination.ts`):
-- When a `DistinctNode`'s source already has a key (`keysOf(source).length > 0` — declared `RelationType.keys`, a kind-aware FD-derived key, the ≤1-row empty key, or the `isSet` all-columns key), the DISTINCT is redundant and removed
-- Registered in the structural pass at priority 18 (after key inference, before predicate pushdown)
-
-### Key inference after projections / joins
-
-* `projectKeys(keys, columnMapping)` pushes keys through `ProjectNode` / `ReturningNode`.
-* `combineJoinKeys(leftKeys, rightKeys, joinType, leftColumnCount, equiPairs?)` combines logical `RelationType.keys` across joins:
-  * **INNER / CROSS**: coverage-gated, mirroring `analyzeJoinKeyCoverage` — left's keys survive only when `equiPairs` cover a right-side key (each left row matches ≤ 1 right row), and right's keys (shifted) survive only when `equiPairs` cover a left-side key. A key=key join covers both. When neither side is covered but **both** sides are keyed (a bare cross join, or an inner join whose predicate touches no key), the result is keyed by the **composite product key** `(leftKey ∪ rightKey-shifted)` — see [Keyed cross/inner (and lateral) product keys](#keyed-crossinner-and-lateral-product-keys). One lex-min product key is emitted (blow-up containment); full-row set-ness is additionally carried by `isSet`. An unconditional union of both sides' individual keys would over-claim: `ta CROSS JOIN tb` repeats `ta`'s PK once per `tb` row, so `ta`'s PK alone is not a key of the product — only the *pair* is.
-  * **LEFT**: when `equiPairs` cover any right-side key, left's keys survive (each left row matches ≤ 1 right row); otherwise empty. Right's keys never survive (NULL-padded right columns break uniqueness).
-  * **RIGHT**: symmetric — when `equiPairs` cover any left-side key, right's keys (shifted) survive.
-  * **FULL**: empty (both sides can be NULL-padded).
-  * **SEMI / ANTI**: left's keys pass through unchanged.
-  * **Empty-key (≤1-row) coverage**: a length-0 entry in either side's `keys` (e.g. TableDee, or a logically-≤1-row source) is unconditional coverage — `joinPairsCoverKey` treats `[]` as covering regardless of `equiPairs` (a ≤1-row side caps the partner at one match), so LEFT/RIGHT/inner/cross no longer early-return `[]` on an empty `equiPairs` when the opposite side is ≤1-row. When **both** sides carry the empty key, the inner/cross/left/right result advertises the empty key (deduped). Full outer stays empty.
-  * If `equiPairs` is omitted, LEFT/RIGHT preserve keys only via an empty-key (≤1-row) opposite side; otherwise they return empty.
-  * Equi-pair coverage at the logical-type layer mirrors the physical-side check in `analyzeJoinKeyCoverage`: callers (`JoinNode.getType`, `BloomJoinNode.getType`, `MergeJoinNode.getType`) extract column-index pairs from their condition/`equiPairs` field and pass them through.
-
-* **Logical-vs-physical layering** (why `combineJoinKeys` has no FD-superkey branch): the two layers stay distinct and consistent. `combineJoinKeys` (logical → `getType().keys`) recognizes only the **logical** empty key (a length-0 `RelationType.keys` entry); it has no FD access by design — `getType()` is the logical type and must not read physical properties. The FD-aware coverage (empty key from `∅ → all` FDs, FD-derived keys) lives in the **physical** path (`analyzeJoinKeyCoverage` → `propagateJoinFds`), where FDs exist, via a single `isUnique` call. Downstream consumers read uniqueness through `keysOf` / `isUnique`, which consult **both** `getType().keys` and `physical.fds` — so a join whose ≤1-row-ness is only FD-provable still surfaces the empty key through the physical FD branch. `getType().keys` carrying only logical-derived keys is therefore correct and sufficient.
-
-## Row‑specific vs Global Classification for Assertions
-
-### Problem Statement
-
-Global transaction‑deferred integrity assertions are expressed as violation queries that return rows when a constraint is broken. To avoid full re‑evaluation on every COMMIT, we must:
-- Classify each table reference instance in an assertion plan as row‑specific (≤1 row per changed key) or global (potentially many rows)
-- Track per‑transaction changes keyed by table instance
-- Execute efficient delta checks: full scan only when necessary; otherwise run parameterized checks per changed key
-
-### Core Definitions
-
-- relationKey: Unique identifier for a table reference instance within a plan. Format: `schema.table#<nodeId>` or `schema.table@alias#<nodeId>`.
-- unique key: A set of column indices on a node's output that uniquely identifies each row. Encoded as the FD `key → (all_cols \ key)` in `PhysicalProperties.fds`. The empty set (`∅ → all_cols`) is the singleton/"at-most-one-row" form.
-- coveredKey: A unique key that is fully constrained by equality predicates at a node boundary, **or whose columns lie in the FD-closure of the equality-covered column set**. Presence of a covered key implies `estimatedRows ≤ 1`. Closure expansion uses the table reference's physical FDs/ECs — so equality on a UNIQUE column closes to the PK via the table's `unique → other-columns` FD, and equality on column `a` plus an EC `{a, b}` closes to include `b`.
-- Row‑specific: A table reference instance classified as producing at most one row for any given unique key binding at COMMIT time (covered-key holds and no identity-breaking node above demotes it).
-- Group-specific: A table reference instance beneath an aggregate whose `GROUP BY` columns (under FD closure at the aggregate's source) cover a unique key of the reference. The aggregate output is row-unique per group key, so the runtime can parameterize on changed group keys.
-- Global: Any instance not provably row- or group-specific.
-
-### Logical Analysis Pipeline
-
-1) Optimizer pre‑physical analysis
-- Use an analysis entrypoint that runs constant folding and structural rewrites, stops before physical selection.
-- This stabilizes logical shape and enables reliable key propagation without physical access assumptions.
-
-2) Unique key propagation rules
-- Filter: If predicate covers a full unique key on the source, emit the singleton FD `∅ → all_cols` and cap `estimatedRows = 1`; otherwise propagate source FDs (which carry the source's key encodings) unchanged.
-- Project/Returning: Project source logical keys (`RelationType.keys`) through the column mapping; for each surviving key emit the FD `key → all_other_out_cols`. Source FDs project through the same column map (FDs that lose a determinant column are dropped; surviving dependents stay).
-- Join (INNER/CROSS): Preserve side keys when equi‑join predicates cover the other side's key; emit each preserved key as a `key → all_other_join_cols` FD. For OUTER joins, only preserve non‑null‑safe keys on the preserved side.
-- Aggregate: `GROUP BY` columns are a unique key on the output; emit `{0..groupCount-1} → all_other_out_cols`. Global aggregates without grouping emit the singleton `∅ → all_out_cols`.
-- Distinct: Set semantics is encoded via `RelationType.isSet = true` (the all-columns "key" has no non-trivial FD encoding). Source FDs pass through unchanged.
-- Set operations/window functions: Conservatively drop key-encoding FDs unless proven otherwise.
-
-3) Covered key detection
-- Constraint extractor emits `coveredKeysByTable: Map<relationKey, number[][]>` by matching normalized equality predicates to the table's logical `RelationType.keys`. Closure expansion uses the table reference's physical FDs/ECs.
-- A table reference instance is row‑specific at a node if any covered key is present or the FD set carries the singleton `∅ → all_cols`.
-
-### Classification API
-
-```ts
-// Pre‑physical plan only
-type RowClassification = 'row' | 'group' | 'global';
-
-interface RowSpecificResult {
-  classifications: Map<string /* relationKey */, RowClassification>;
-  /** For 'group'-classified relations, the minimal group-key columns expressed as
-   *  output column indices on the underlying table reference. */
-  groupKeys: Map<string /* relationKey */, number[]>;
-}
-
-function analyzeRowSpecific(plan: RelationalPlanNode | PlanNode): RowSpecificResult;
-```
-
-Algorithm (concise):
-1. **Initial pass.** Traverse plan; collect `TableInfo` for each table reference instance, including its `uniqueKeys`, physical `fds`, and `equivClasses`.
-2. **Covered-key under FD closure.** Walk predicates along the path to each instance and gather equality-covered columns `E`. Compute `closure(E)` under the table reference's local FDs + EC-derived FDs. A unique key is covered if every column lies in the closure. Classify as `'row'` if any key is covered, else `'global'`.
-3. **Identity-breaking adjustment pass.** Walk the tree top-down:
-   - **Aggregate** (`AggregateNode`, `StreamAggregateNode`, `HashAggregateNode`): for each table reference beneath, compute `closure(group-by-bare-cols)` at the aggregate's source physical context (FDs + ECs). If the closure covers a unique key (mapped through the source-to-table column correspondence), classify the reference as `'group'` and store the minimal subset of GROUP BY columns whose closure still covers a key (greedy minimization). If the reference already holds `'row'` (equality cover at a Filter beneath the aggregate), keep `'row'` — it is strictly stronger than `'group'`. Otherwise demote to `'global'`. Aggregate without GROUP BY is single-group: existing classifications survive.
-   - **SetOperation**: conservatively demote all references beneath to `'global'`.
-   - **Window**: pass-through. Windowing preserves input row count, so the classification at the Filter level survives upward.
-
-Notes:
-- Multi‑reference handling: Classify per‑instance via `relationKey`. The same base table may have both row‑specific and global instances in one assertion.
-- Joins with equality on a unique key reduce the joined side to row‑specific; push this information upward to avoid false global classifications.
-- All three modes (`'row'`, `'group'`, `'global'`) are now driven by the reusable `DeltaExecutor` kernel; `'group'` classifications parameterize per changed group-key tuple. See [`docs/incremental-maintenance.md`](incremental-maintenance.md) for the kernel surface.
-
-### Transaction Change Tracking
-
-Goal: Build a per‑transaction delta of changed rows, keyed by table instance.
-
-Data structures:
-- `transactionLog: Map<relationKey | baseTableName, Set<KeyTuple>>`
-  - Initially use base table name; after analysis, map to instance `relationKey`s for assertions. For MVP, base table scope is sufficient and simpler.
-- `KeyTuple` supports composite keys via ordered arrays of values.
-
-Events captured:
-- INSERT: add NEW primary key
-- UPDATE: add OLD and NEW primary keys (if key changes)
-- DELETE: add OLD primary key
-
-Savepoints:
-- Maintain a stack of change sets; on SAVEPOINT push a new layer; on ROLLBACK TO SAVEPOINT discard the top layer; on RELEASE merge.
-
-### Commit‑time Evaluation Engine
-
-High‑level algorithm:
-1) Collect assertions impacted by the transaction: `dependentTables ∩ changedTables ≠ ∅` (dependent tables discovered during assertion preparation by examining the violation plan).
-2) For each impacted assertion:
-   a) Build/obtain pre‑physical plan via analysis entrypoint; run `analyzeRowSpecific(plan)`.
-   b) If any dependent reference is classified 'global' AND that base table changed: execute the original violation SQL once. If any row returns → fail.
-   c) Otherwise, for each row‑specific dependent table with changes: execute a parameterized variant once per changed key. If any run returns rows → fail early.
-3) On first failure: throw `QuereusError(StatusCode.CONSTRAINT)`; the COMMIT path rolls back all connections.
-
-### Prepared, Parameterized Assertion Variants
-
-For each assertion and each row‑specific dependent table reference instance:
-- Parameterization: Bind the full unique key (declared PK or any covered unique key) as parameters at the earliest reference to that instance.
-- Injection point: Add a Filter on the table’s own attributes with `= ?` parameters; do not restructure joins (no equality‑join injection), allowing the optimizer to infer `IndexSeek` or equivalent logically.
-- Metadata: For composite keys, maintain stable parameter order matching the declared key column order.
-- Multiple instances: Prepare one variant per row‑specific instance (`relationKey`) to avoid parameter collision across multiple references to the same base table.
-
-Execution strategy:
-- For N changed keys of table T, execute the prepared variant N times (MVP). A future enhancement will batch keys via `IN`/`VALUES`.
-
-### Dependency Discovery & Invalidation
-
-During assertion creation/update:
-- Parse and normalize the violation expression into a SELECT form `SELECT 1 WHERE NOT (<check>)` if provided as CHECK.
-- Plan using analysis entrypoint and extract base tables with `relationKey`s at earliest references; store as `dependentTables` with preliminary classification (updated at COMMIT time to reflect current statistics/rewrites).
-- On schema change (table/column/index/constraint) touching any dependent object: mark assertion stale; re‑prepare on next COMMIT or on `VALIDATE ASSERTION`.
-
-### Diagnostics & Tooling
-
-- `explain_assertion(name)` TVF: returns normalized SQL plus concise logical plan (pre‑physical) and the classification map `{ relationKey → 'row' | 'group' | 'global' }`. The `prepared_pk_params` column lists the parameter names a parameterized variant would bind: for `'row'`, PK column names (`pk0`, `pk1`, ...); for `'group'`, the minimal group-key column names from `RowSpecificResult.groupKeys`. Both modes are now executed by the `DeltaExecutor` kernel at COMMIT time.
-- Error formatting on violation: include assertion name and up to N sample violating key tuples when available from parameterized runs.
-
-### Guarantees and Safety
-
-- Classification is conservative: when uncertain, classify as 'global' to preserve correctness.
-- Parameterized execution binds only table‑local attributes; no cross‑relation value injection is required for correctness.
-- Transactional semantics: Assertions run atomically before commit; failures rollback all connections.
-
-## Binding-aware Delta Planning (Reusable)
-
-The same analysis used for assertions generalizes to reactive watches, the lens layer, and other delta-driven features. `analyzeRowSpecific` returns a `RowSpecificResult { classifications, groupKeys }`; `extractBindings` packages that into a `PlanBindings { perRelation, relationToBase }` map of `BindingMode` per `TableReferenceNode` instance. The full runtime surface is documented in [`docs/incremental-maintenance.md`](incremental-maintenance.md).
-
-The **public** projection of this analysis is the `ChangeScope` data contract — a JSON-serializable description of "what state does this prepared statement depend on?". `Statement.getChangeScope()` returns one for any prepared statement; see [`docs/change-scope.md`](change-scope.md). One refinement lives at this boundary: a read of a materialized view resolves to a reference on its (never-user-written) backing table, so the analyzer projects it onto the MV's source tables — `getChangeScope()` reports (and `Database.watch` fires on) *source* mutations rather than the backing table. See [`docs/change-scope.md` § Materialized-view reference projection](change-scope.md#materialized-view-reference-projection).
-
-### Modes of Specificity
-- Row-specific (`'row'`): unique key fully covered (under FD closure including FK→PK and EC-derived FDs); bind PK/unique key columns.
-- Group-specific (`'group'`): aggregate `GROUP BY` columns (under FD closure at the aggregate's source) cover a unique key of the underlying table reference; bind the minimal group-key column subset (`groupKeys[relKey]`). Group-membership transitions (when an UPDATE changes a captured column) drive OLD/NEW projection emission so both old and new group keys are re-evaluated.
-- Global (`'global'`): no safe binding → evaluate full query once.
-
-### Binding Extraction
-`extractBindings(plan)` (see `src/planner/analysis/binding-extractor.ts`) walks the plan once, runs `analyzeRowSpecific`, and emits one `BindingMode` per `TableReferenceNode`:
-- From predicates: equality that covers a declared/inferred unique key.
-- From aggregations: grouping keys whose closure covers a unique key.
-- From joins: propagate bindings through equi-joins; when `T.k = U.k` and `k` is a binding key on `T`, it binds `U` as well.
-
-For `'row'` bindings, the chosen key prefers the table's primary key when it's among the covered keys; otherwise it picks the lex-min covered key for determinism.
-
-### Residual Construction
-- Do not rewrite joins structurally; inject a Filter on the bound relation’s own attributes with `= ?` parameters (`injectKeyFilter` in `database-assertions.ts`).
-- Preserve attribute IDs; parameter order follows key column order. `'row'` parameters use the prefix `pk0..pkN-1`; `'group'` parameters use `gk0..gkN-1`.
-- Each consumer owns its residual cache, keyed by `(relationKey, BindingMode.kind, columnsJoined)`.
-
-### Runtime execution
-
-The runtime side — how a `DeltaSubscription` is registered, how capture demand and
-the savepoint-layered change log work, the cost-fallback-to-global rule, and the
-plug-in pattern for new consumers — is documented in
-[Incremental Maintenance](incremental-maintenance.md). This section is only the
-*analysis* half: classifying references and choosing binding keys. The live
-consumers are assertions and `Database.watch`; the [lens layer](lens.md) consumes
-the kernel for set-level constraint maintenance/enforcement where no covering
-structure answers it; triggers/signals are future consumers. Materialized views are
-maintained synchronously at the DML write boundary, **not** through this kernel (see
-[Materialized Views](materialized-views.md)).
-
-This places “what to bind” in the optimizer and “when/how to execute residuals” in the runtime, enabling reuse across features.
-
-## Retrieve-based Push-down Architecture
-
-### Overview
-
-The Quereus optimizer features a comprehensive push-down infrastructure built around the `RetrieveNode` abstraction. This system enables virtual table modules to execute arbitrary query pipelines within their own execution context, providing a clean boundary between Quereus execution and module-specific optimization.
-
-### RetrieveNode Infrastructure
-
-**Core Concept**: Every `TableReferenceNode` is wrapped in a `RetrieveNode` at build time, marking the exact boundary where data transitions from virtual table module execution to Quereus execution.
-
-```typescript
-// Builder automatically wraps table references
-export function buildTableReference(fromClause: AST.FromClause, context: PlanningContext): RetrieveNode {
-  const tableRef = new TableReferenceNode(/* ... */);
-  return new RetrieveNode(context.scope, tableRef, tableRef); // pipeline starts as just the table
-}
-```
-
-**Structure**:
-```
-RetrieveNode
-  └─ pipeline: RelationalPlanNode  (operations handled by the module)
-      └─ TableReferenceNode        (leaf table reference)
-  [bindings: ScalarPlanNode[]]     (captured params/correlated expressions)
-```
-
-### Supported-only placement policy
-
-- **Pushdown rule**: When sliding a `Filter` down into a `Retrieve`, the optimizer:
-  - Normalizes the predicate, extracts constraints for the `Retrieve` table, and constructs a supported-only predicate fragment.
-  - Inserts only that fragment as a `Filter` inside the `Retrieve` pipeline.
-  - Leaves any residual (unsupported) predicate above the `Retrieve` boundary.
-  - Merges newly referenced bindings (parameters/correlations) into `Retrieve.bindings`.
-
-- **Grow-retrieve rule**: When sliding `Retrieve` upward over a `Filter` (index-style fallback):
-  - The rule mirrors the pushdown behavior: only supported fragments of the enveloped node are placed beneath `Retrieve` as a new `Filter`. The residual remains above.
-  - Bindings are collected from the added fragment and merged into `Retrieve.bindings`.
-
-This policy ensures the `Retrieve` pipeline is always a precise description of what the module/index can handle; unsupported parts never enter the boundary.
-
-### Set operations and growth boundaries
-
-- `SetOperation` (`UNION`, `INTERSECT`, `EXCEPT`, `DIFF`) is excluded from the grow-retrieve structural pass. Sliding a `Retrieve` boundary across set operations can cause structural oscillation and provides little benefit to index-style modules. Predicate push-down into the branches remains supported via the supported-only policy.
-
-### Physicalization invariant
-
-- During the physical selection pass, all `Retrieve` nodes must be rewritten to concrete access nodes (`SeqScan`, `IndexScan`, or `IndexSeek`) or `RemoteQuery`. A validation invariant enforces that no `Retrieve` nodes reach emission.
-
-### Robust primary-key equality seeks
-
-- For index-style modules, full primary-key equality (including parameterized values) will select `IndexSeek` even if the provider’s `handledFilters` ordering differs from planner constraint extraction. The optimizer aligns constraints by column index and constructs dynamic seek keys from parameters/correlated expressions.
-
-### Diagnostics and verification
-
-- `query_plan(sql)` exposes `RETRIEVE` rows with logical properties including `bindingsCount` and `bindingsNodeTypes`, which reveal whether parameters and/or correlated column references have been captured by the pipeline.
-- For test assertions, prefer checking for the presence of `ParameterReference` nodes in the plan (logical indicator of binding presence) rather than relying on `RETRIEVE` presence post-physical selection, since physical rules may replace `Retrieve` with concrete access operators.
-
-### Module Capability API
-
-**VirtualTableModule Interface**:
-```typescript
-interface VirtualTableModule {
-  // Query-based push-down
-  supports?(node: PlanNode): SupportAssessment | undefined;
-  
-  // Index-based access
-  getBestAccessPlan?(req: BestAccessPlanRequest): BestAccessPlanResult;
-}
-
-interface SupportAssessment {
-  cost: number;    // Module's cost estimate for executing this pipeline
-  ctx?: unknown;   // Opaque context data cached for runtime execution
-}
-```
-
-**VirtualTable Interface**:
-```typescript
-interface VirtualTable {
-  // Runtime execution of pushed-down pipelines
-  executePlan?(db: Database, plan: PlanNode, ctx?: unknown): AsyncIterable<Row>;
-
-  // Standard index-based query execution
-  query?(filterInfo: FilterInfo): AsyncIterable<Row>;
-}
-```
-
-### Architecture Modes
-
-**1. Query-based Push-down** (implements `supports()` + `executePlan()`)
-- Module analyzes entire query pipelines
-- Returns cost assessment for execution within module
-- Examples: SQL federation modules, document databases, remote APIs
-
-**2. Index-based Access** (implements `getBestAccessPlan()` + `query()`)
-- Module exposes index capabilities
-- Quereus pushes individual predicates via BestAccessPlan API
-- Examples: MemoryTable, SQLite vtabs, file-based storage
-
-**3. Hybrid Modules** (can implement both, but they're mutually exclusive per query)
-- Modules can provide both interfaces
-- Optimizer chooses based on cost assessment
-
-### Access Path Selection
-
-The `ruleSelectAccessPath` optimizer rule handles the routing decision:
-
-```typescript
-export function ruleSelectAccessPath(node: PlanNode, context: OptContext): PlanNode | null {
-  if (!(node instanceof RetrieveNode)) return null;
-  
-  const vtabModule = node.vtabModule;
-  
-  // Query-based push-down takes priority
-  if (vtabModule.supports) {
-    const assessment = vtabModule.supports(node.source);
-    if (assessment) {
-      return new RemoteQueryNode(node.scope, node.source, node.tableRef, assessment.ctx);
-    }
-    // Module declined - fall back to sequential scan
-    return createSeqScan(node.tableRef);
-  }
-  
-  // Index-based access
-  if (vtabModule.getBestAccessPlan) {
-    return createIndexBasedAccess(node, context);
-  }
-  
-  // Default sequential scan
-  return createSeqScan(node.tableRef);
-}
-```
-
-### Physical Execution Nodes
-
-**RemoteQueryNode**:
-- Represents execution of a pipeline within a virtual table module
-- Calls `VirtualTable.xExecutePlan()` at runtime
-- Passes the original plan pipeline and cached context
-
-**Traditional Access Nodes**:
-- `SeqScanNode`: Full table scan
-- `IndexScanNode`: Index-based scan with filters
-- `IndexSeekNode`: Index-based point/range lookups
-- `EmptyResultNode`: Zero-row short-circuit at the access boundary (e.g., `IS NULL` on NOT NULL column). Sibling node `EmptyRelationNode` (`planner/nodes/empty-relation-node.ts`) covers the schema-polymorphic empty case for general fold rules — `EmptyResultNode` stays bound to a `TableReferenceNode` (for EXPLAIN), while `EmptyRelationNode` is detached from any specific source. See § Empty-relation folding.
-
-### Parameterization hand-off
-
-- Modules that implement `getBestAccessPlan` can return `indexName` and `seekColumnIndexes` to identify the chosen index and its key columns. When present, `selectPhysicalNodeFromPlan` builds seek keys from the correct constraint columns — not hardcoded to PK.
-- When these fields are absent, the legacy PK-based heuristic path (`selectPhysicalNodeLegacy`) is used for backward compatibility.
-- Equality constraints that fully cover a primary or secondary index prefix are translated into `IndexSeekNode` with dynamic seek keys:
-  - Seek keys are stored as scalar expressions (parameters or correlated refs), evaluated at runtime by the emitter and passed to the module via the existing `FilterInfo.args` mechanism.
-  - Range bounds (>=/<=) similarly pass dynamic lower/upper expressions.
-
-This establishes a clean “call-like” boundary: `Retrieve.bindings` declares required inputs; physical access nodes evaluate those inputs and deliver them to the module.
-
-### Runtime Execution
-
-**Query-based Execution**:
-```typescript
-// emitRemoteQuery.ts
-export function emitRemoteQuery(plan: RemoteQueryNode, ctx: EmissionContext): Instruction {
-  async function* run(rctx: RuntimeContext): AsyncIterable<Row> {
-    const table = plan.vtabModule.connect(/* ... */);
-    yield* table.executePlan!(rctx.db, plan.source, plan.moduleCtx);
-  }
-  return { params: [], run, note: `remoteQuery(${plan.tableRef.tableSchema.name})` };
-}
-```
-
-**Index-based Execution**:
-- Uses existing `query()` with `FilterInfo` parameter
-- Leverages `BestAccessPlan` API for predicate push-down
-
-### Integration Points
-
-**Builder Integration**:
-- All table references automatically wrapped in `RetrieveNode`
-- DML operations (INSERT/UPDATE/DELETE) extract `tableRef` from `RetrieveNode`
-- Maintains backward compatibility with existing code
-
-**Optimizer Integration**:
-- `ruleSelectAccessPath` registered for `PlanNodeType.Retrieve`
-- Physical properties correctly propagated through `RemoteQueryNode`
-- Cost estimation integrated with existing cost model
-
-**Runtime Integration**:
-- `RemoteQueryNode` emitter registered in runtime system
-- Error handling for modules without `xExecutePlan()` implementation
-- Seamless execution alongside traditional access methods
-
-### Dynamic support growth with ruleGrowRetrieve
-
-The `ruleGrowRetrieve` optimization rule enables dynamic sliding of operations into virtual table modules:
-
-**Algorithm**: Structural top-down growth pass that:
-1. Creates a candidate pipeline by grafting the parent operation onto the current pipeline
-2. Calls `module.supports(candidatePipeline)` or index-style fallback (`getBestAccessPlan`) for assessment
-3. If supported, replaces the parent with a new `RetrieveNode` containing the expanded pipeline
-4. Continues sliding upward until the module declines or the tree top is reached
-
-**Benefits**:
-- Multi-pass architecture ensures structural growth happens before physical selection
-- Cost-based decision making between local and remote execution
-- Modules evaluate exactly the operations they commit to handle
-
-This architecture establishes Quereus as a powerful federation engine while maintaining its lean, readable codebase philosophy and excellent virtual table integration.
-
-## ApplyNode Architecture for Correlated Joins
-
-### Design Philosophy
-
-To enable lateral joins and sophisticated push-down optimization, Quereus uses an **ApplyNode** abstraction that replaces traditional `JoinNode` semantics. This design provides a unified framework for handling correlated operations while maintaining clean separation between logical and physical execution strategies.
-
-### Core Concept
-
-The `ApplyNode` represents a correlated operation where the right-side subtree is executed once per row from the left side, with correlation context passed through:
-
-```typescript
-interface ApplyNode {
-  left: RelationalPlanNode;     // Drive relation
-  right: RelationalPlanNode;    // Applied relation (may start with RetrieveNode)
-  predicate: ScalarPlanNode | null;  // Join condition
-  outer: boolean;               // LEFT JOIN semantics when true
-}
-```
-
-### SQL Mapping
-
-Traditional SQL join constructs map naturally to ApplyNode semantics:
-
-| SQL Construct | ApplyNode Form |
-|---------------|----------------|
-| `A CROSS JOIN B` | `Apply(A, B, null, false)` |
-| `A INNER JOIN B ON p` | `Apply(A, Filter(p, B), p, false)` |
-| `A LEFT JOIN B ON p` | `Apply(A, Filter(p, B), p, true)` |
-
-### Push-down Integration
-
-The ApplyNode design enables sophisticated push-down optimization:
-
-**Correlated Push-down**: When the right side contains a `RetrieveNode`, correlation values from the left side can be pushed into the virtual table module as additional constraints.
-
-**Index Seek Optimization**: Virtual table modules can use correlation values to perform efficient index seeks rather than full scans.
-
-**Pipeline Composition**: The right-side pipeline can be arbitrarily complex, allowing modules to optimize entire correlated subqueries.
-
-### Execution Model
-
-**Runtime Semantics**:
-1. Iterate through each row from the left relation
-2. Pass correlation context to the right relation's execution
-3. Execute right relation with correlated values as additional constraints
-4. Combine results according to join semantics (inner/outer)
-
-**Virtual Table Integration**:
-```typescript
-// Right-side RetrieveNode receives correlation context
-const correlatedConstraints = extractCorrelationConstraints(leftRow, rightPipeline);
-const assessment = vtabModule.supports(rightPipeline, correlatedConstraints);
-if (assessment) {
-  // Module can optimize correlated access (e.g., index seek)
-  yield* table.executePlan(db, rightPipeline, {
-    ...assessment.ctx,
-    correlation: correlatedConstraints
-  });
-}
-```
-
-### Performance Characteristics
-
-**Nested Loop Foundation**: ApplyNode provides a clean nested-loop foundation that can be optimized based on virtual table capabilities.
-
-**Progressive Optimization**: Modules can choose between full scans and index seeks based on correlation selectivity. Runtime cardinality feedback at pipeline breakers drives tier promotion and re-optimization (see [progressive-optimizer.md](./progressive-optimizer.md)).
-
-**Later Physical Optimization**: Non-correlated Apply operations can be transformed into bloom joins or merge joins by later optimization phases.
-
-### Benefits
-
-**Orthogonality**: Clean separation between correlation logic and push-down optimization.
-
-**Extensibility**: Virtual table modules can implement sophisticated correlated access patterns.
-
-**Simplicity**: Unified execution model eliminates special cases for different join types.
-
-**Federation**: Enables complex correlated queries to be pushed to remote systems (e.g., SQL databases, document stores).
-
-This design positions Quereus to handle complex analytical workloads while maintaining the flexibility to optimize across diverse data sources and virtual table implementations.
-
-### ruleGrowRetrieve Design
-
-The `ruleGrowRetrieve` optimizer rule implements a **structural, capability-bounded** sliding algorithm that maximizes the query segment each virtual table module can execute:
-
-**Algorithm**:
-1. **Top-down traversal (Structural pass)**: Walk the plan tree from root toward leaves so parents can be slid into their `RetrieveNode` children
-2. **Capability testing**: For each candidate, test `supports(candidatePipeline)` where candidatePipeline = current pipeline + parent node; else use index-style fallback
-3. **Slide on success**: If the module supports the expanded pipeline, slide the `RetrieveNode` upward to encompass the parent
-4. **Stop on failure**: When `supports()` returns undefined, the `RetrieveNode` has reached its maximum extent
-
-**Key Properties**:
-- Purely structural - no cost modeling required during growth phase
-- Deterministic - always finds the maximum supportable pipeline
-- Module-bounded - respects exactly what each module declares it can handle
-- Foundation for subsequent push-down - establishes the "query segment" baseline
-
-```typescript
-// Example: Filter above table reference
-Filter(condition) 
-  └── RetrieveNode(source: TableRef)
-
-// After ruleGrowRetrieve (assuming module supports filtering):
-RetrieveNode(source: Filter(condition, TableRef))
-```
-
-**Modules can accept arbitrary nodes**: `supports()` may accept complex subtrees, including joins across multiple tables that reside in the same module. When a module declares support for such a subtree, `ruleGrowRetrieve` will slide those operations into the `RetrieveNode` boundary, enabling efficient intra-module execution.
+## Cardinality and key rules
+
+Equality on every column of a unique key caps a relation at one row; foreign keys are
+inclusion dependencies that let a semi-join fold to its left side and an anti-join fold to
+empty; an unsatisfiable predicate folds to `EmptyRelationNode`, which then cascades. These
+rules and the key-propagation rules that feed them are in
+[Optimizer Rules](optimizer-rules.md#key-driven-row-count-reduction).
+
+## Parallel-track recognition
+
+Three rules recognize plan shapes that can be driven concurrently: independent `union all`
+branches (`AsyncGatherNode`, `unionAll`), a shared-key full-outer join chain
+(`AsyncGatherNode`, `zipByKey`), and a hash join whose build side is high-latency
+(`EagerPrefetchNode` over the probe). Every one is inert on local-only plans, because the
+gate reads `expectedLatencyMs`, which memory-backed leaves leave at 0. See
+[Optimizer Parallel Track](optimizer-parallel.md); the runtime contracts are in
+[Runtime](runtime.md).
+
+## Assertion delta analysis
+
+A `create assertion` violation query is re-checked at COMMIT. Re-running it whole on every
+commit is unaffordable, so each table reference inside the plan is classified `'row'`,
+`'group'`, or `'global'`: whether a change to that table can be re-checked by binding a
+unique key, a group key, or not at all. The same analysis is reused by `Database.watch` and
+the lens layer. See [Optimizer Assertion Analysis](optimizer-assertions.md) for the
+classification and binding rules, and [Incremental Maintenance](incremental-maintenance.md)
+for the runtime that executes the residuals.
+
+## Retrieve push-down and correlated access
+
+Every `TableReferenceNode` is wrapped in a `RetrieveNode` at build time, marking the exact
+boundary between module execution and Quereus execution. Structural rules slide supported
+operations across that boundary — never unsupported ones — and the physical pass replaces
+every `RetrieveNode` with a concrete access node (`SeqScan`, `IndexScan`, `IndexSeek`) or a
+`RemoteQuery`. See [Optimizer Retrieve Push-down](optimizer-retrieve.md).
 
 ## Optimization Pipeline Architecture
 
@@ -2244,37 +1021,16 @@ Quereus uses a **characteristic-based** optimization pipeline that leverages the
 - Clear separation of concerns between different optimization phases
 - Predictable rule application order based on logical properties
 
+## Rejected alternatives
 
-## Keyed cross/inner (and lateral) product keys
-
-`combineJoinKeys` (logical `RelationType.keys`) and `analyzeJoinKeyCoverage` →
-`propagateJoinFds` (physical FDs) both derive keys for joins. For an
-`inner`/`cross` join where **neither** side's key is covered by the equi-predicate
-(a bare cross join, or an inner join whose predicate touches no key) but **both**
-sides advertise a non-empty unique key, the relational product is itself keyed by
-the pair `(leftKey, rightKey)`: each `(leftKey-value, rightKey-value)` combination
-occurs at most once, because `inner`/`cross` only *removes* `(leftRow, rightRow)`
-pairs, never duplicates one. These layers now emit that composite product key
-`(leftKey ∪ rightKey-shifted-by-leftColumnCount)`, so `keysOf` surfaces a real
-column key for the product (used by DISTINCT elimination, covering proofs, and MV
-backing-PK derivation) instead of falling back to all-columns. Full-row set-ness
-is *additionally* carried by `RelationType.isSet`.
-
-Policy and gating:
-
-- **One key per node (blow-up containment).** Exactly one product key is emitted:
-  the lex-min key from each side — fewest columns, ties broken by lowest
-  first-column index — concatenated. This bounds growth to ≤1 new key per join
-  node regardless of how many alternative keys each side carries, keeping chained
-  joins tractable.
-- **Gate.** The product key fires only when (1) the join is `inner`/`cross`,
-  (2) neither the right-key-covered nor the left-key-covered survivor branch fired
-  (an equi-join that covers one side already yields that side's individual key),
-  and (3) both sides have a non-empty key. A ≤1-row side carries only the empty
-  key, which already trips a survivor branch and yields `undefined` from the
-  lex-min selection, so the ≤1-row case keeps its existing behavior and never
-  reaches the product key.
-
-Equi-join (one-side-covered), `left`/`right`/`full` outer, `semi`/`anti`, and the
-≤1-row (`∅ → all-cols`) paths are unchanged — the product key is confined to the
-previously-empty "both keyed, neither covered" gap.
+- **Inheriting a rule's *declines* across a transform.** Decline sets are reset the moment
+  any rule transforms a node, and are never carried onto the freshly-minted node. Carrying
+  them would suppress a rule that becomes applicable only after a *sibling* rule reshapes
+  the node — `ruleAsyncGatherZipByKey` is a concrete case — silently changing plans in
+  exchange for a small amount of re-run work.
+- **A global visited set.** Tracking is context-scoped instead, so the same rule may apply
+  to a shared subtree along different paths, and a later pass can revisit what an earlier
+  one cached. See [Visited Tracking Architecture](#visited-tracking-architecture).
+- **Separate logical and physical plan hierarchies.** One `PlanNode` tree transitions from
+  logical to physical by property annotation; see
+  [Single Hierarchy, Dual Phase](#single-hierarchy-dual-phase).

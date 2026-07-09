@@ -250,7 +250,7 @@ same construction**: a flag writable through a view is always SELECTed by its
 routing Project, so it is demanded outside the probe and recovery abstains (the
 rewrite drops the right columns and the flag, so it requires the consuming
 Project to reference neither). The write path therefore never reaches the
-rewrite. See `docs/optimizer.md` § `ruleSemijoinExistenceRecovery`.
+rewrite. See `docs/optimizer-rules.md` § `ruleSemijoinExistenceRecovery`.
 
 **Writing the flag (the write half).** The existence column is the explicit, per-row
 control surface for the non-preserved side's existence — *writing* the flag **is** the

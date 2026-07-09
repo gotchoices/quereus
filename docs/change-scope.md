@@ -4,7 +4,7 @@ The **change-scope** API exposes — as a small JSON-serializable data
 contract — what base-table state and external inputs a prepared
 `Statement` reads from. It is the external projection of the internal
 binding-key analysis used by assertions and incremental view
-maintenance (see [optimizer.md](optimizer.md) § "Binding-aware Delta
+maintenance (see [optimizer-assertions.md](optimizer-assertions.md) § "Binding-aware Delta
 Planning").
 
 A `ChangeScope` answers questions like:
@@ -161,7 +161,7 @@ scope mentions.
 
 1. Calls `extractBindings(plan)` from `binding-extractor.ts` to obtain
    a `BindingMode` per `TableReferenceNode` instance (see
-   [optimizer.md](optimizer.md)).
+   [optimizer-assertions.md](optimizer-assertions.md)).
 2. Walks the scalar-expression tree to collect, per
    `TableReferenceNode`, the set of column indices its
    `ColumnReferenceNode`s touch.
@@ -458,7 +458,7 @@ events.
 
 ## See also
 
-- [optimizer.md](optimizer.md) — § "Binding-aware Delta Planning" describes
+- [optimizer-assertions.md](optimizer-assertions.md) — § "Binding-aware Delta Planning" describes
   the internal `BindingMode` shape this API projects.
 - [incremental-maintenance.md](incremental-maintenance.md) — runtime
   surface for delta-driven consumers (assertions today, MVs and

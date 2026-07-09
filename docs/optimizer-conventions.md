@@ -149,7 +149,7 @@ const determined = computeClosure(seedCols, node.physical.fds ?? []);
 7. **Set semantics is not an FD — but the readers consume it.** "All output columns together form a key" lives on `RelationType.isSet`, not in `fds`. The kind-aware readers take it as a parameter (`hasAnyKey(fds, columnCount, isSet)` / `hasSingletonFd(fds, columnCount, isSet)` / `isUniqueDeterminant(…, isSet)`); node-level consumers should prefer `keysOf` / `isUnique`, which read `getType().isSet` themselves.
 8. **Provenance is informational.** FD / `ConstantBinding` / `DomainConstraint` entries may carry a `source` tag (`'declared-check'`, `{kind: 'assertion', name}`, etc.). Dedup helpers ignore `source` by design — never branch rule logic on it.
 
-See [Functional Dependency Tracking](optimizer-fd.md#functional-dependency-tracking) for the producer/consumer catalog and the per-operator propagation table, and [Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable) for the `analyzeRowSpecific` / `extractBindings` analysis surface that builds on this layer.
+See [Functional Dependency Tracking](optimizer-fd.md#functional-dependency-tracking) for the producer/consumer catalog and the per-operator propagation table, and [Assertions § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable) for the `analyzeRowSpecific` / `extractBindings` analysis surface that builds on this layer.
 
 ### Caching Eligibility
 

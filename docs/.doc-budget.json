@@ -4,7 +4,6 @@
 	"ratchet": {
 		"docs/lens.md": 17929,
 		"docs/materialized-views.md": 28570,
-		"docs/optimizer.md": 27929,
 		"docs/runtime.md": 13018,
 		"docs/schema.md": 15683,
 		"docs/sql.md": 28654,

@@ -247,7 +247,7 @@ At partition close, all remaining pending entries are flushed with their
 right edges clamped to the last row.
 
 The rule id `monotonic-window` can be disabled via `tuning.disabledRules`. See
-[Monotonic streaming-window recognition](./optimizer.md#monotonic-streaming-window-recognition).
+[Monotonic streaming-window recognition](./optimizer-streaming.md#monotonic-streaming-window-recognition).
 
 ## Testing
 

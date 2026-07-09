@@ -6,7 +6,7 @@ registered consumer — what slice to recompute, how to bind it, and when to fal
 back to a full re-evaluation. This document is the **definitive description of the
 kernel** and its plug-in contract; the optimizer-side *analysis* that feeds it
 (`analyzeRowSpecific` / `extractBindings`) is detailed in
-[Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable),
+[Optimizer Assertion Analysis § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable),
 and the public projection of that analysis is the
 [`ChangeScope` data contract](change-scope.md).
 
@@ -429,7 +429,7 @@ the `Database.watch` consumer runs *after* commit and swallows handler errors
 `extractBindings(plan)` walks a plan and emits a `PlanBindings` describing, per
 `TableReferenceNode` instance, how the plan binds to changes on its underlying base
 table (full analysis in
-[Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable)):
+[Optimizer Assertion Analysis § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable)):
 
 ```ts
 type BindingMode =
@@ -558,7 +558,7 @@ const dispose = deltaExecutor.register({
 
 ## Cross-references
 
-- Analysis surface ("what to bind"): [Optimizer § Binding-aware Delta Planning](optimizer.md#binding-aware-delta-planning-reusable)
+- Analysis surface ("what to bind"): [Optimizer Assertion Analysis § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable)
 - Public reactive API / `ChangeScope`: [Change-scope Documentation](change-scope.md)
 - Synchronous (off-kernel) materialization: [Materialized Views](materialized-views.md)
 - Externally-applied writes → this pipeline: [Materialized Views § External row-change ingestion](materialized-views.md#external-row-change-ingestion)

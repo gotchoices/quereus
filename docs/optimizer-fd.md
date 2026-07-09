@@ -144,7 +144,7 @@ Bindings are closed over equivalence classes: at every node that contributes bin
 
 ## Per-operator propagation
 
-This table is canonical. [Optimizer § Key-driven row-count reduction](optimizer.md#key-driven-row-count-reduction) restates the join arms from `analyzeJoinKeyCoverage`'s point of view; if the two ever disagree, this one is right.
+This table is canonical. [Rules § Key-driven row-count reduction](optimizer-rules.md#key-driven-row-count-reduction) restates the join arms from `analyzeJoinKeyCoverage`'s point of view; if the two ever disagree, this one is right.
 
 | Operator                                  | FDs / ECs added or transformed                                                                                                              |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -213,7 +213,7 @@ type IndTarget =
 | `AggregateNode` / `SetOperationNode` / `WindowNode`            | Emit none — these reshape relational identity.                                                                                             |
 | `AsyncGatherNode` (crossProduct)                               | Could shift+merge like FDs, but **deferred** (no consumer) — left undefined with a code comment.                                           |
 
-**Relationship to the FK-declaration helpers.** The propagated IND set is a **parallel derivation surface**, not a migration of `util/ind-utils.ts`. The three FK rules (`rule-anti-join-fk-empty`, `rule-semi-join-fk-trivial`, `rule-join-elimination`) and the `lookupCoveringFK` / `isRowPreservingPathToTable` helpers still consume the FK *declaration* directly — they need the nullability split and positional composite pairing that a coarse `child ⊆ parent` fact does not carry. The **only consumer** of `PhysicalProperties.inds` is the coverage prover: its inner/cross no-row-loss obligation tries the propagated IND surface first and falls back to the structural `lookupCoveringFK` check (see [Coverage proving](#coverage-proving) below). See [Optimizer § Key-driven row-count reduction](optimizer.md#key-driven-row-count-reduction) for the on-demand helpers and rules.
+**Relationship to the FK-declaration helpers.** The propagated IND set is a **parallel derivation surface**, not a migration of `util/ind-utils.ts`. The three FK rules (`rule-anti-join-fk-empty`, `rule-semi-join-fk-trivial`, `rule-join-elimination`) and the `lookupCoveringFK` / `isRowPreservingPathToTable` helpers still consume the FK *declaration* directly — they need the nullability split and positional composite pairing that a coarse `child ⊆ parent` fact does not carry. The **only consumer** of `PhysicalProperties.inds` is the coverage prover: its inner/cross no-row-loss obligation tries the propagated IND surface first and falls back to the structural `lookupCoveringFK` check (see [Coverage proving](#coverage-proving) below). See [Optimizer Rules § Key-driven row-count reduction](optimizer-rules.md#key-driven-row-count-reduction) for the on-demand helpers and rules.
 
 ## Check-derived contributions
 
@@ -411,7 +411,7 @@ The companion **independent-channel singleton law** (same harness) closes the pr
 
 ## Consumers
 
-`ruleAggregatePredicatePushdown` ([Optimizer § Optimization Rules](optimizer.md#optimization-rules)) consumes `physical.fds`: it uses `computeClosure` over the aggregate's output FDs to widen the set of pushable conjuncts on composite GROUP BYs.
+`ruleAggregatePredicatePushdown` ([Rules § Optimization Rules](optimizer-rules.md#optimization-rules)) consumes `physical.fds`: it uses `computeClosure` over the aggregate's output FDs to widen the set of pushable conjuncts on composite GROUP BYs.
 
 `rulePredicateInferenceEquivalence` consumes `physical.constantBindings` × `physical.equivClasses`: for `SELECT ... FROM t JOIN u ON t.k = u.k WHERE t.k = 5`, the join contributes an EC `{t.k, u.k}` and the filter contributes a binding `{t.k → 5}`. The rule crosses them and emits a `u.k = 5` conjunct on the u-branch, which subsequent `predicate-pushdown` iterations carry into the leaf so the vtab can pick a seek over a scan. The same shape works for parameter bindings (`t.k = ?`) and chains transitively across multiple equi-joins.
 
