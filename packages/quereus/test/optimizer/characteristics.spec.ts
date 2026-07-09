@@ -8,8 +8,7 @@ import { expect } from 'chai';
 import {
 	PlanNodeCharacteristics,
 	CapabilityDetectors,
-	CachingAnalysis,
-	CapabilityRegistry
+	CachingAnalysis
 } from '../../src/planner/framework/characteristics.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 
@@ -72,39 +71,6 @@ describe('CachingAnalysis', () => {
 		const threshold = CachingAnalysis.getCacheThreshold(node);
 		expect(threshold).to.be.a('number');
 		expect(threshold).to.be.greaterThan(0);
-	});
-});
-
-describe('CapabilityRegistry', () => {
-	afterEach(() => {
-		// Clean up test registrations
-		CapabilityRegistry.unregister('test-capability');
-	});
-
-	it('should register and detect custom capabilities', () => {
-		// Define a custom capability
-		const isTestNode = (node: PlanNode): boolean => {
-			return 'testProperty' in node;
-		};
-
-		// Register the capability
-		CapabilityRegistry.register('test-capability', isTestNode);
-
-		// Test detection
-		const regularNode = {} as PlanNode;
-		const testNode = { testProperty: true } as any;
-
-		expect(CapabilityRegistry.hasCapability(regularNode, 'test-capability')).to.be.false;
-		expect(CapabilityRegistry.hasCapability(testNode, 'test-capability')).to.be.true;
-	});
-
-	it('should list all registered capabilities', () => {
-		const capabilities = CapabilityRegistry.getAllCapabilities();
-
-		expect(capabilities).to.be.an('array');
-		expect(capabilities).to.include('predicate-pushdown');
-		expect(capabilities).to.include('table-access');
-		expect(capabilities).to.include('aggregation');
 	});
 });
 

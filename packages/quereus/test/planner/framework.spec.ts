@@ -21,8 +21,12 @@ import {
 import {
 	PlanNodeCharacteristics,
 	CapabilityDetectors,
-	CapabilityRegistry,
 } from '../../src/planner/framework/characteristics.js';
+import { AggregateFunctionCallNode } from '../../src/planner/nodes/aggregate-function.js';
+import { ScalarFunctionCallNode } from '../../src/planner/nodes/function.js';
+import { FunctionFlags } from '../../src/common/constants.js';
+import type { AggregateFunctionSchema, ScalarFunctionSchema } from '../../src/schema/function.js';
+import type * as AST from '../../src/parser/ast.js';
 import {
 	extractOrderingFromSortKeys,
 	mergeOrderings,
@@ -711,46 +715,53 @@ describe('Planner Framework', () => {
 			(node as any).isDistinct = false;
 			expect(CapabilityDetectors.isWindowFunction(node)).to.equal(false);
 		});
-	});
 
-	// ---------------------------------------------------------------------------
-	// CapabilityRegistry
-	// ---------------------------------------------------------------------------
+		it('isColumnBindingProvider detects a node whose getBindingRelationName is a function', () => {
+			const node = relNode();
+			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(false);
 
-	describe('CapabilityRegistry', () => {
-
-		afterEach(() => {
-			// Clean up custom test registrations
-			CapabilityRegistry.unregister('test-cap');
+			(node as any).getBindingRelationName = () => 'my_table';
+			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(true);
 		});
 
-		it('register + hasCapability round-trip', () => {
-			CapabilityRegistry.register('test-cap', (n) => n.nodeType === PlanNodeType.Sort);
-			const sortNode = relNode({ nodeType: PlanNodeType.Sort });
-			const filterNode = relNode({ nodeType: PlanNodeType.Filter });
-
-			expect(CapabilityRegistry.hasCapability(sortNode, 'test-cap')).to.equal(true);
-			expect(CapabilityRegistry.hasCapability(filterNode, 'test-cap')).to.equal(false);
+		it('isColumnBindingProvider rejects a non-function getBindingRelationName', () => {
+			// Regression: a same-named data member (string) must NOT be mistaken for
+			// the ColumnBindingProvider method.
+			const node = relNode();
+			(node as any).getBindingRelationName = 'my_table';
+			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(false);
 		});
 
-		it('getCapable filters nodes by capability', () => {
-			CapabilityRegistry.register('test-cap', (n) => n.nodeType === PlanNodeType.Sort);
-			const nodes = [
-				relNode({ nodeType: PlanNodeType.Sort }),
-				relNode({ nodeType: PlanNodeType.Filter }),
-				relNode({ nodeType: PlanNodeType.Sort }),
-			];
+		it('isAggregateFunction detects AggregateFunctionCallNode, rejects scalar + look-alikes', () => {
+			const scalarType = { typeClass: 'scalar' as const, logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true };
+			const funcExpr = { type: 'function', name: 'count', args: [], distinct: false } as AST.FunctionExpr;
 
-			const capable = CapabilityRegistry.getCapable(nodes, 'test-cap');
-			expect(capable).to.have.length(2);
-		});
+			const aggSchema: AggregateFunctionSchema = {
+				name: 'count', numArgs: 0, flags: FunctionFlags.DETERMINISTIC, returnType: scalarType,
+				stepFunction: (acc: number) => acc + 1,
+				finalizeFunction: (acc: number) => acc,
+			};
+			const scalarSchema: ScalarFunctionSchema = {
+				name: 'abs', numArgs: 1, flags: FunctionFlags.DETERMINISTIC, returnType: scalarType,
+				implementation: (v: any) => v,
+			};
 
-		it('unregister removes capability', () => {
-			CapabilityRegistry.register('test-cap', () => true);
-			expect(CapabilityRegistry.hasCapability(relNode(), 'test-cap')).to.equal(true);
+			const aggNode = new AggregateFunctionCallNode(mockScope, funcExpr, 'count', aggSchema, [], false);
+			const scalarFnNode = new ScalarFunctionCallNode(mockScope, funcExpr, scalarSchema, []);
 
-			CapabilityRegistry.unregister('test-cap');
-			expect(CapabilityRegistry.hasCapability(relNode(), 'test-cap')).to.equal(false);
+			// Real aggregate schema → detected.
+			expect(CapabilityDetectors.isAggregateFunction(aggNode)).to.equal(true);
+			// Scalar function node (scalar schema) → not an aggregate.
+			expect(CapabilityDetectors.isAggregateFunction(scalarFnNode)).to.equal(false);
+
+			// Regression: a plain scalar node that merely wears the old duck-typed
+			// shape (functionName/isDistinct/args) but carries no aggregate schema
+			// must NOT be classified as an aggregate.
+			const lookAlike = scalarNode({ nodeType: PlanNodeType.ScalarFunctionCall });
+			(lookAlike as any).functionName = 'count';
+			(lookAlike as any).isDistinct = false;
+			(lookAlike as any).args = [];
+			expect(CapabilityDetectors.isAggregateFunction(lookAlike)).to.equal(false);
 		});
 	});
 

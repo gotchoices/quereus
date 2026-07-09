@@ -11,6 +11,7 @@ import type { PlanNode, RelationalPlanNode, ScalarPlanNode, ConstantNode, TableD
 import { isRelationalNode } from '../nodes/plan-node.js';
 import type * as AST from '../../parser/ast.js';
 import type { TableSchema } from '../../schema/table.js';
+import { isAggregateFunctionSchema } from '../../schema/function.js';
 import { hasAnyKey, hasSingletonFd } from '../util/fd-utils.js';
 
 // Default row estimate when not available
@@ -369,7 +370,7 @@ export class CapabilityDetectors {
 
 	static isColumnBindingProvider(node: PlanNode): node is ColumnBindingProvider {
 		return 'getBindingRelationName' in node &&
-			(typeof (node as any).getBindingRelationName === 'string' || typeof (node as any).getBindingRelationName === 'function');
+			typeof (node as any).getBindingRelationName === 'function';
 	}
 
 	static canProject(node: PlanNode): node is ProjectionCapable {
@@ -422,15 +423,16 @@ export class CapabilityDetectors {
 
 	static isAggregateFunction(node: PlanNode): node is AggregateFunctionCapable {
 		if (!node) return false;
-		// Check for AggregateFunctionCallNode - it uses ScalarFunctionCall nodeType but has args property
+		// Discriminator: aggregate schema guard. AggregateFunctionCallNode and
+		// ScalarFunctionCallNode share nodeType === ScalarFunctionCall, so nodeType
+		// can't tell them apart; the aggregate/scalar split is decided at build time
+		// via isAggregateFunctionSchema (building/function-call.ts), so testing the
+		// carried functionSchema is the real, intentional marker. Chosen over an
+		// instanceof AggregateFunctionCallNode check to keep this file duck-typed and
+		// free of concrete node-class coupling.
 		return PlanNodeCharacteristics.isScalar(node) &&
-			'functionName' in node &&
-			typeof (node as any).functionName === 'string' &&
-			'isDistinct' in node &&
-			typeof (node as any).isDistinct === 'boolean' &&
-			'args' in node &&
-			Array.isArray((node as any).args) &&
-			'functionSchema' in node;
+			'functionSchema' in node &&
+			isAggregateFunctionSchema((node as any).functionSchema);
 	}
 
 	static isRecursiveCTERef(node: PlanNode): node is RecursiveCTERefCapable {
@@ -439,42 +441,6 @@ export class CapabilityDetectors {
 			'cteName' in node &&
 			typeof (node as any).cteName === 'string' &&
 			'workingTableDescriptor' in node;
-	}
-}
-
-/**
- * Extensible capability registry for custom characteristics
- */
-export class CapabilityRegistry {
-	private static readonly detectors = new Map<string, (node: PlanNode) => boolean>();
-
-	static register(
-		capability: string,
-		detector: (node: PlanNode) => boolean
-	): void {
-		this.detectors.set(capability, detector);
-	}
-
-	static hasCapability(node: PlanNode, capability: string): boolean {
-		const detector = this.detectors.get(capability);
-		return detector ? detector(node) : false;
-	}
-
-	static getCapable(
-		nodes: readonly PlanNode[],
-		capability: string
-	): PlanNode[] {
-		const detector = this.detectors.get(capability);
-		if (!detector) return [];
-		return nodes.filter(detector);
-	}
-
-	static getAllCapabilities(): string[] {
-		return Array.from(this.detectors.keys());
-	}
-
-	static unregister(capability: string): boolean {
-		return this.detectors.delete(capability);
 	}
 }
 
@@ -531,42 +497,3 @@ export class CachingAnalysis {
 	}
 }
 
-/**
- * Predicate analysis utilities
- */
-export class PredicateAnalysis {
-	static canPushDown(predicate: ScalarPlanNode, targetNode: PlanNode): boolean {
-		if (!CapabilityDetectors.canPushDownPredicate(targetNode)) {
-			return false;
-		}
-
-		// Check if predicate only references columns from target
-		return this.predicateReferencesOnly(predicate, targetNode);
-	}
-
-	static canCombine(pred1: ScalarPlanNode, pred2: ScalarPlanNode): boolean {
-		// Basic heuristic: both must be deterministic
-		return PlanNodeCharacteristics.isDeterministic(pred1) &&
-			PlanNodeCharacteristics.isDeterministic(pred2);
-	}
-
-	private static predicateReferencesOnly(_predicate: ScalarPlanNode, _targetNode: PlanNode): boolean {
-		// TODO: Implement column reference analysis
-		// For now, conservatively return true
-		return true;
-	}
-}
-
-// Register built-in capabilities
-CapabilityRegistry.register('predicate-pushdown', CapabilityDetectors.canPushDownPredicate);
-CapabilityRegistry.register('table-access', CapabilityDetectors.isTableAccess);
-CapabilityRegistry.register('aggregation', CapabilityDetectors.isAggregating);
-CapabilityRegistry.register('sort', CapabilityDetectors.isSortable);
-CapabilityRegistry.register('projection', CapabilityDetectors.canProject);
-CapabilityRegistry.register('join', CapabilityDetectors.isJoin);
-CapabilityRegistry.register('cache', CapabilityDetectors.isCached);
-CapabilityRegistry.register('cte', CapabilityDetectors.isCTE);
-CapabilityRegistry.register('column-reference', CapabilityDetectors.isColumnReference);
-CapabilityRegistry.register('window-function', CapabilityDetectors.isWindowFunction);
-CapabilityRegistry.register('aggregate-function', CapabilityDetectors.isAggregateFunction);
-CapabilityRegistry.register('recursive-cte-ref', CapabilityDetectors.isRecursiveCTERef);
