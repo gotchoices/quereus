@@ -437,7 +437,356 @@ rewriting its inherited logical keys.
 
 ## MV — Materialized views
 
-Populated by `docs-invariants-mv`.
+The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no
+query rewrites onto is still correct. See
+[Optimizer Rules](optimizer-rules.md#materialized-view-query-rewrite-read-side).
+
+### MV-001 — A materialized view is a faster plain view
+
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `maintainRowTime`
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `materializeView`
+- guard: `packages/quereus/test/incremental/maintenance-equivalence.spec.ts` — `read(MV) == evaluate(body) across random mutations, in-txn and after rollback`
+- doc: [Materialized Views § Why one model](materialized-views.md#why-one-model)
+
+Reading a materialized view returns exactly what evaluating its body against the current
+sources returns — mid-statement, mid-transaction, and after a rollback. The equivalence is
+observational and immediate, not eventual: there is one maintenance model (row-time), no
+refresh-policy knob, and no interval in which a view and its body disagree. Every other
+entry in this area is a consequence of this one. `REFRESH` exists to recover a view whose
+maintenance a schema change detached (MV-022), never to schedule freshness.
+
+### MV-002 — Maintenance rides the writing statement's transaction
+
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `maintainRowTime`
+- code: `packages/quereus/src/vtab/backing-host.ts` — `applyMaintenance`
+- guard: `packages/quereus/test/mv-backing-module.spec.ts` — `a transaction rollback reverts the mem2 backing in lockstep with the source`
+- doc: [Materialized-View Maintenance § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)
+
+Maintenance is driven from the runtime DML write boundary and writes the backing
+connection's *pending* transaction state, so the backing delta commits and rolls back in
+lockstep with the source write under the Database's coordinated commit. There is no
+post-commit window, no asynchronous drift, and therefore no divergence-detection or
+self-heal machinery anywhere in the subsystem. A maintenance failure fails the source
+statement.
+
+### MV-003 — Bounded-delta maintenance applies per row, immediately
+
+- code: `packages/quereus/src/core/database-materialized-views-plans.ts` — `BackingConnectionCache`
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `findRowTimeCoveringStructure`
+- guard: `packages/quereus/test/covering-structure.spec.ts` — `a bare-DDL covering MV is row-time and is used for enforcement`
+- doc: [Materialized-View Maintenance § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)
+
+The per-statement `BackingConnectionCache` amortizes *connection resolution* only. Each
+source row's backing ops are applied immediately, never buffered for an end-of-statement
+flush. This is load-bearing rather than incidental: covering-UNIQUE enforcement runs inside
+the source table's `update()` and scans the backing, so a later row of the same statement
+must observe an earlier row's backing write (`insert into t values (1,'a'),(2,'a')` over a
+covering `unique(x)` detects the duplicate). A coalescing write buffer would break
+enforcement unless the conflict probe also read the buffer.
+
+### MV-004 — Full-rebuild is the one deferred arm, and never a covering structure
+
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `flushDeferredRebuilds`
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `assertFlushRounds`
+- guard: `packages/quereus/test/incremental/maintenance-equivalence.spec.ts` — `read(MV) == evaluate(body) across random t/p mutations, in-txn and after rollback`
+- doc: [Materialized-View Maintenance § Full-rebuild floor](mv-maintenance.md#full-rebuild-floor)
+
+Running the floor per source row would cost O(rows × body), so a full-rebuild plan is
+dirtied per row and rebuilt once per statement, inside the statement-atomicity savepoint
+(and on the `OR FAIL` throw path, which has no such savepoint). This does not weaken
+MV-003, because a full-rebuild backing is never read mid-statement: the conflict probe
+consults only `'inverse-projection'` backings, which stay per-row-immediate. The flush is a
+worklist over the producer→consumer DAG, bounded by the registered row-time view count.
+
+### MV-005 — An MV-over-MV cascade completes in the originating transaction
+
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `maintainRowTime`
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `assertCascadeDepth`
+- guard: `packages/quereus/test/materialized-view-cascade.spec.ts` — `a transaction of cascade writes is visible mid-statement and reverts the whole chain on rollback`
+- doc: [Materialized-View Maintenance § MV-over-MV cascade](mv-maintenance.md#mv-over-mv-cascade)
+
+A maintenance write into a maintained table is itself a row change, routed back through
+`maintainRowTime` for every view reading that table. A view's sources are fixed at create
+and its producers must already exist, so the dependency graph is acyclic and the
+depth-first recursion is DAG-ordered: a producer's backing is fully written before its
+consumers run. Every level commits or rolls back with the originating write. `assertCascadeDepth`
+is a defense-in-depth backstop for the structurally impossible cycle, not a load-bearing bound.
+
+### MV-006 — No body is rejected for its shape
+
+- code: `packages/quereus/src/core/database-materialized-views-plan-builders.ts` — `tryBuildBoundedDeltaArm`
+- code: `packages/quereus/src/core/database-materialized-views-plan-builders.ts` — `buildFullRebuildPlan`
+- guard: `packages/quereus/test/materialized-view-diagnostics.spec.ts` — `names the MV + reason and steers to view / create-table, not the backing table or a refresh policy`
+- doc: [Materialized-View Maintenance § Maintenance strategy](mv-maintenance.md#maintenance-strategy)
+
+Maintenance coverage is total. A body matching no bounded-delta arm falls through to the
+always-correct full-rebuild floor; no relational operator — join, outer join, set
+operation, recursive CTE, `DISTINCT`, window, `LIMIT` — is grounds for rejection. Exactly
+five create-time rejections exist, all non-shape: a non-deterministic body (absent `pragma
+nondeterministic_schema`); a bag with no provable unique key and no coarsened lineage key;
+a body with no relational output; a body reading no source table; and a full-rebuild-only
+body whose largest source exceeds `materialized_view_rebuild_row_threshold`. Adding a sixth
+is a breaking change. MV-008 adds a host-conditional gate that is inert by default.
+
+### MV-007 — The strategy gate can be slow, never wrong
+
+- code: `packages/quereus/src/planner/cost/index.ts` — `selectMaintenanceStrategy`
+- code: `packages/quereus/src/planner/cost/index.ts` — `isFullRebuildPathological`
+- guard: `packages/quereus/test/incremental/maintenance-equivalence.spec.ts` — `read(MV) == evaluate(body) across random mutations, in-txn and after rollback`
+- doc: [Materialized-View Maintenance § Maintenance strategy](mv-maintenance.md#maintenance-strategy)
+
+Strategy selection is a backward (maintenance-direction) cost argmin over the body's
+*structurally sound* strategies, and an empty sound set resolves to the floor. So every
+strategy the gate may pick already maintains the body correctly, and a mis-estimated cost
+can only make maintenance slower than necessary — never produce a backing that disagrees
+with the body. The one exception where cost becomes a *rejection* rather than a preference
+is the size threshold in MV-006, which fires only when full-rebuild is the sole sound
+strategy.
+
+### MV-008 — The replicable-derivation gate is host-conditional and not locally waivable
+
+- code: `packages/quereus/src/vtab/backing-host.ts` — `requiresReplicableDerivations`
+- code: `packages/quereus/src/core/database-materialized-views-analysis.ts` — `nonReplicableDerivationError`
+- guard: `packages/quereus/test/materialized-view-replicable.spec.ts` — `Materialized view replicable-determinism gate`
+- doc: [Materialized-View Maintenance § Maintenance strategy](mv-maintenance.md#maintenance-strategy)
+
+A backing host whose storage replicates across peers declares `requiresReplicableDerivations`;
+the create then rejects a body using any function or collation not asserted bit-identical
+across peers, platforms, and application versions. Built-ins auto-qualify. This sits beside,
+not inside, the determinism gate — a replicating host's bit-identity requirement is strictly
+stronger than per-database determinism — so `pragma nondeterministic_schema` does not lift
+it. A host declaring the flag must resolve its capability surface eagerly, before any late
+backing-materialization seam; the attach core converts a violation into a loud `INTERNAL`
+error.
+
+### MV-009 — A materialized view is exactly one schema object
+
+- code: `packages/quereus/src/schema/derivation.ts` — `MaintainedTableSchema`
+- code: `packages/quereus/src/schema/derivation.ts` — `TableDerivation`
+- guard: `packages/quereus/test/logic/51-materialized-views.sqllogic`
+- doc: [Materialized Views § Substrate: a maintained table](materialized-views.md#substrate-a-maintained-table)
+
+A materialized view is realized as an ordinary `TableSchema` registered under the view's
+own name, carrying a `TableDerivation`. There is no separate hidden backing object: the
+"backing table" the host capability operates on *is* that table. One catalog name, one
+physical incarnation, occupying the ordinary table namespace — `create table x` over a
+maintained table `x` errors, and `schema()` lists it exactly once. Identity, storage module,
+tags, and the physical key live on the table; the derivation carries the body and its
+maintenance state.
+
+### MV-010 — The maintained relation is always a set
+
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `deriveBackingShape`
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `materializedViewNotASetError`
+- guard: `packages/quereus/test/materialized-view-diagnostics.spec.ts` — `a duplicate-producing body fails the set contract with a non-leaking diagnostic`
+- doc: [Materialized Views § Primary key inference](materialized-views.md#primary-key-inference)
+
+The maintained table's logical key is the body's own key, so each body row maps to exactly
+one stored row. A body with no provable unique key has no row identity to materialize on
+and is rejected (MV-006); a body that nonetheless produces duplicates fails the set
+contract at fill rather than silently collapsing rows onto a colliding backing key. The
+single carve-out is the coarsened backing key (MV-011), where the stored key is
+deliberately coarser than row identity.
+
+### MV-011 — A coarsened backing key is derived once and read by both sides
+
+- code: `packages/quereus/src/planner/analysis/coarsened-key.ts` — `deriveCoarsenedBackingKey`
+- guard: `packages/quereus/test/coarsened-backing-key.spec.ts` — `keys the backing on the coarsened lineage key and stamps the record`
+- doc: [Materialized Views § Coarsened backing keys](materialized-views.md#coarsened-backing-keys)
+
+The collation-weakening parallel-migration shape produces a keyless body whose source key
+survives through value-preserving passthrough lineage. Such a body is keyed on that
+coarsened lineage key rather than rejected. The key the maintenance plan admits and the key
+the backing shape is built with come from the *same* `deriveCoarsenedBackingKey` call over
+the same fully-optimized body, so they agree by construction. Colliding rows then
+last-write-win under the floor's collation-keyed diff — a deliberate weakening of MV-010,
+reported through the coarsening-collision telemetry.
+
+### MV-012 — A maintained table is read-only to user DML
+
+- code: `packages/quereus/src/runtime/emit/dml-executor.ts` — `assertNotMaintainedTableTarget`
+- code: `packages/quereus/src/schema/derivation.ts` — `maintainedTableViewLike`
+- guard: `packages/quereus/test/mv-dml-executor-backstop.spec.ts` — `stops throwing once the derivation is detached (structural keying, not by name)`
+- doc: [Materialized Views § Write boundary (write-through)](materialized-views.md#write-boundary-write-through)
+
+Nothing but the privileged backing surface writes a maintained table's rows. `INSERT` /
+`UPDATE` / `DELETE` naming a materialized view is rewritten to target its source, through
+the same view-mutation rewrite a plain view uses — checked both at name dispatch and again
+on the schema-path-resolved table. Behind that, the runtime DML executor rejects any
+mutation plan whose target still carries a derivation, keyed structurally on the derivation
+rather than on the name. The privileged surface bypasses both by construction: it never
+routes through the DML executor.
+
+### MV-013 — `bodyHash` is the identity of the definition
+
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `computeBodyHash`
+- guard: `packages/quereus/test/maintained-table-migration-capstone.spec.ts` — `a body change with unchanged shape is a single re-attach (content refresh, not a recreate)`
+- doc: [Materialized Views § Declarative-schema integration](materialized-views.md#declarative-schema-integration)
+
+`computeBodyHash` over the canonical definition is what the declarative differ compares. A
+changed body re-attaches the derivation and refreshes the contents; an unchanged body is a
+no-op, so re-applying a schema never rebuilds. Anything that rewrites the body without
+changing what it means — most importantly rename propagation (MV-023) — must recompute the
+hash on the rewritten form, or the differ reports a phantom body change on the next apply.
+The catalog persists DDL, not the hash, so import recomputes it from the same formula.
+
+### MV-014 — Every privileged operation routes through the backing host
+
+- code: `packages/quereus/src/vtab/backing-host.ts` — `BackingHost`
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `resolveBackingHost`
+- guard: `packages/quereus/test/mv-backing-module.spec.ts` — `create places the backing in mem2; maintenance, refresh, and drop all stay there`
+- doc: [Backing-host capability](mv-backing-host.md#backing-host-capability)
+
+The engine never reaches into the hosting module's internals. Maintenance writes, the
+create/refresh fill, and the UNIQUE enforcement scan all route through the module-neutral
+`BackingHost` capability, which a module advertises by implementing
+`VirtualTableModule.getBackingHost`. Every materialized-view semantic in this area — row-time
+maintenance, reads-own-writes, commit/rollback lockstep, the MV-over-MV cascade, covering
+enforcement, refresh, rename propagation, drop — holds regardless of which module hosts the
+table. The memory module is the default and the reference implementation.
+
+### MV-015 — A backing host owes ordered, keyed storage
+
+- code: `packages/quereus/src/vtab/backing-host.ts` — `scanEffective`
+- guard: `packages/quereus/test/vtab/backing-host.spec.ts` — `scanEffective honors equalityPrefix as a leading-PK range and descending order`
+- doc: [Backing-host capability](mv-backing-host.md#backing-host-capability)
+
+A module that advertises the capability must provide primary-key-ordered storage with
+O(log n) keyed upsert, delete, and point lookup, plus an ordered prefix-range scan that
+seeks to a leading-key equality prefix, walks in key order, and terminates early. That cost
+contract is what keeps every maintenance arm and the covering-UNIQUE prefix probe
+module-agnostic; the engine does not gate per arm. A module that cannot provide the ordered
+prefix scan must not advertise the capability at all — there is no partial conformance.
+
+### MV-016 — `applyMaintenance` reports exactly the changes it realized
+
+- code: `packages/quereus/src/vtab/backing-host.ts` — `applyMaintenance`
+- code: `packages/quereus/src/util/comparison.ts` — `rowsValueIdentical`
+- guard: `packages/quereus/test/vtab/backing-host.spec.ts` — `a value-identical upsert writes nothing and reports nothing (skip-identical contract)`
+- doc: [Materialized-View Maintenance § Value-identical (no-op) write suppression](mv-maintenance.md#value-identical-no-op-write-suppression)
+
+The returned `BackingRowChange[]` drives the MV-over-MV cascade (MV-005) and, on a
+change-logged backing, the replication change log — so over- or under-reporting corrupts
+consumers. Fidelity cuts both ways: an op that changes nothing reports nothing. A
+value-identical upsert against the connection's *effective* row therefore writes nothing,
+fires no cascade, and produces no change-log entry. This is a semantic guarantee, not an
+optimization. Value identity is byte-faithful (`rowsValueIdentical`), never
+collation-aware: a collation-equal, byte-different write is a real change.
+
+### MV-017 — Declared constraints are validated against derived rows, before the cascade
+
+- code: `packages/quereus/src/core/derived-row-validator.ts` — `validateDerivedRowImage`
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `validateDeclaredConstraintsOverContents`
+- guard: `packages/quereus/test/maintained-table-declared-constraints.spec.ts` — `Maintained-table declared-constraint validation`
+- doc: [Derived-Row Constraints § Derived-row constraint validation](mv-constraints.md#derived-row-constraint-validation-declared-check--fk--secondary-unique)
+
+Derivation writes bypass the DML constraint pipeline, so a maintained table's declared
+CHECK and child-side FK constraints are validated by the engine at the maintenance
+boundary: a bulk scan over the reconciled contents on the create-fill, attach, and
+constraint-bearing refresh paths; a compiled per-row validator over each maintenance delta
+in steady state, run *before* the row cascades to consumers. The writing statement fails,
+attributed to the maintained table. A violation is always a hard abort — derivation writes
+carry no `OR` clause, so `IGNORE` / `REPLACE` can never mask one.
+
+### MV-018 — The derived-row validator tracks its constraint-only dependencies
+
+- code: `packages/quereus/src/core/derived-row-validator.ts` — `dependencyTables`
+- code: `packages/quereus/src/core/derived-row-validator.ts` — `makePoisonedDerivedRowValidator`
+- guard: `packages/quereus/test/maintained-table-declared-constraints.spec.ts` — `self-heal on dependency re-create`
+- doc: [Derived-Row Constraints § Derived-row constraint validation](mv-constraints.md#derived-row-constraint-validation-declared-check--fk--secondary-unique)
+
+A compiled validator bakes in the live incarnations of the tables its checks reference — an
+FK parent, a subquery-CHECK target. These are not derivation *sources*, so no source-change
+path rebuilds them; the validator records them on `dependencyTables` and is rebuilt when one
+is renamed, dropped, or re-created. Rebuilding touches the validator only: no staleness, no
+maintenance interruption. A target that cannot recompile installs a *poisoned* validator that
+re-raises the sited planning error on the next derivation write and self-heals when the
+dependency returns — never a silent pass.
+
+### MV-019 — Secondary UNIQUE is enforced by the host, post-batch
+
+- code: `packages/quereus/src/vtab/memory/layer/manager.ts` — `enforceSecondaryUniqueOnMaintenance`
+- guard: `packages/quereus/test/logic/51.9-maintained-table-secondary-unique.sqllogic`
+- doc: [Derived-Row Constraints § Declared secondary UNIQUE](mv-constraints.md#declared-secondary-unique)
+
+A UNIQUE collision is a property of a *pair* of rows, so it does not fit the per-row
+validator of MV-017. The host checks each written image against the batch's final effective
+contents after the batch lands. Post-batch is load-bearing: a `'replace-all'` diff applies
+upserts before deletes, so a per-op check would false-positive whenever the derived set
+merely moves a value between keys. Checking only written images is complete, since any
+colliding pair contains one. The probe never routes through a covering view, which lags the
+batch. Always a hard abort.
+
+### MV-020 — A maintenance write fires parent-side referential actions
+
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `enforceParentSideReferentialActions`
+- guard: `packages/quereus/test/runtime/maintained-parent-fk.spec.ts` — `Parent-side referential enforcement for maintained-table maintenance writes`
+- doc: [Derived-Row Constraints § Parent-side referential enforcement](mv-constraints.md#parent-side-referential-enforcement-m-as-an-fk-target)
+
+An FK declared on an ordinary table that *references* a maintained table lives on the child,
+so it never appears in the maintained table's plan or its derived-row validator. A
+maintenance delete or key-update of the referenced row would otherwise silently orphan the
+child. Each backing delete/update change therefore runs the transitive RESTRICT walk and the
+declared CASCADE / SET NULL / SET DEFAULT propagation through the *same* referential-action
+engine the DML executor and the ingestion seam use — one engine, a third entry point. A
+surviving RESTRICT rolls the source write back.
+
+### MV-021 — The ingestion seam trusts its origin and re-validates nothing
+
+- code: `packages/quereus/src/core/database-external-changes.ts` — `ingestExternalRowChanges`
+- guard: `packages/quereus/test/external-row-change-ingestion.spec.ts` — `explicit: rollback discards the backing delta and capture in lockstep`
+- doc: [External row-change ingestion § Trust boundary](mv-ingestion.md#trust-boundary)
+
+A host that has already applied row changes directly to module storage reports them through
+this seam so the post-write pipeline still runs. The seam re-checks no CHECK, NOT NULL,
+UNIQUE, or child-side FK — the origin enforced them, and an origin-unenforced UNIQUE
+collision degrades to last-writer-wins in the backing. What it *does* owe is transactional
+lockstep: the derived effects (backing deltas, capture entries, cascade DML) unwind with the
+batch savepoint, while externally-applied storage rows are the caller's to reconcile.
+Reporting a change against a maintained table is out of contract; its contents are derived.
+
+### MV-022 — A stale view serves its snapshot and propagates nothing
+
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `markMaterializedViewStale`
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `tryRecompileMaterializedViewLive`
+- guard: `packages/quereus/test/mv-structural-alter-restore.spec.ts` — `frozen ALTER releases the plan, emits backing invalidation, and reads stale until REFRESH`
+- doc: [Materialized Views § Schema-change staleness](materialized-views.md#schema-change-staleness)
+
+A source schema change that a body provably cannot observe recompiles the view in place;
+anything else marks it **stale** and detaches its row-time plan, so it serves its last
+snapshot and source writes stop propagating. `stale` is the only read-state flag. Staleness
+is how MV-001 stays honest under DDL: a view that can no longer be maintained refuses to
+pretend, and its next reference re-validates the body — erroring with a staleness diagnostic
+rather than serving rows against a broken definition. Only `REFRESH`, or drop-and-recreate,
+clears the flag.
+
+### MV-023 — A rename rewrites the stored body rather than stranding it
+
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `propagateTableRenameToMaterializedViews`
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `restoreUnaffectedMaterializedViews`
+- guard: `packages/quereus/test/mv-rename-propagation.spec.ts` — `TABLE rename re-keys sourceTables/bodyHash/sql and fires materialized_view_modified`
+- doc: [Schema-change staleness § Rename propagation](mv-schema-change.md#rename-propagation-mv--faster-view)
+
+`RENAME TO` / `RENAME COLUMN` on a source rewrites a dependent view's body in place — the
+same AST walkers a plain view's body gets — rather than staling it, and re-registers
+maintenance against the renamed catalog. This is MV-001 applied to DDL: a plain view follows
+a rename, so a materialized view must too. Derived fields (`sourceTables`, `bodyHash`) are
+recomputed on the rewritten form (MV-013). A stale flag that predates the statement survives
+the rewrite — the backing may already be behind — so the body is fixed but the view stays
+stale until `REFRESH`.
+
+### MV-024 — A durable backing is refilled unless it is provably adoptable
+
+- code: `packages/quereus/src/runtime/emit/materialized-view-helpers.ts` — `backingShapeMatches`
+- guard: `packages/quereus/test/view-mv-ddl-persistence.spec.ts` — `rebuilds + fills the backing, keeps maintenance live, names it in .materializedViews, fires no event`
+- doc: [Backing-host capability § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity)
+
+Coordinated commit is not two-phase commit: with the backing in one durable module and the
+sources in another, a crash between commit acknowledgements can leave them divergent on
+disk. The engine's answer is not to restrict module combinations but to make catalog
+rehydrate **refill from the body by default**, so any divergence self-heals at the next open.
+A pre-existing durable backing is adopted as-is only when the body hash, the derived backing
+shape, the module identity, same-module sourcing, and a crash-durable trust basis all agree.
 
 ## RT — Runtime
 

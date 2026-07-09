@@ -318,9 +318,10 @@ const MAX_INVARIANT_BODY_WORDS = 120;
  * Split `docs/invariants.md` into `### ID — title` blocks, keeping line numbers.
  *
  * NOTE: every line after a `### ` heading joins that block's body, including a following
- * `## <Area>` group heading. Such a heading contributes its ~3 words to the preceding block's
- * 120-word budget. Harmless at that magnitude; if the register ever grows section prose
- * between blocks, end a block at the next heading of any level instead.
+ * `## <Area>` group heading AND any preamble prose under it. The MV area has such a preamble,
+ * so the last OPT block pays for it out of its own 120-word budget (~30 words of headroom
+ * left). An area preamble must therefore stay short. If preambles ever need real length, end
+ * a block at the next heading of ANY level instead of only at `### `.
  */
 function parseInvariantBlocks(content) {
 	const blocks = [];

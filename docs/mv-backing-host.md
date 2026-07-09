@@ -1,5 +1,7 @@
 # Backing-host capability
 
+> **Invariant:** [MV-014](invariants.md#mv-014--every-privileged-operation-routes-through-the-backing-host), [MV-015](invariants.md#mv-015--a-backing-host-owes-ordered-keyed-storage)
+
 The module-author contract for hosting a [materialized view](materialized-views.md)'s stored rows: the privileged surface a virtual-table module must implement so the engine can maintain, refill, and enforce constraints over a maintained table whose storage it does not own.
 
 The privileged surface the engine needs from the maintained table's hosting module is factored into a module-neutral capability, `BackingHost` (`vtab/backing-host.ts`), resolved per table via the optional `VirtualTableModule.getBackingHost(db, schemaName, tableName)` — presence of the method is the capability, mirroring `getMappingAdvertisements`. The "backing table" the capability hosts is the maintained table itself. One `BackingHost` instance corresponds to one live table *incarnation*: a drop+recreate (an explicit drop + re-create, or the declarative differ's body-change rebuild) yields a new host whose `ownsConnection` rejects the previous incarnation's connections, so a stale same-name connection is never adopted. Refresh's [shape reshape](materialized-views.md#refresh-materialized-view) is deliberately **not** such an event — it reconciles the live table in place (the host module's `alterTable`), preserving the incarnation and its connections.
@@ -38,6 +40,8 @@ Store-specific semantics to know:
 - **Catalog.** A store-hosted maintained table persists **two** catalog entries: its ordinary table bundle (landed via the lazy first-access DDL save during the create fill — `replaceContents` opens the data store) plus the `create materialized view` entry under the reserved MV key. On reopen, rehydrate phase 1 connects the table bundle as a plain table; phase 3's MV entry then adopts or refills it — the precondition the rehydrate/adopt phasing builds on. (A *memory*-hosted MV in a store database persists exactly one catalog entry — the MV form — and always refills on reopen.)
 
 ## Cross-module atomicity
+
+> **Invariant:** [MV-024](invariants.md#mv-024--a-durable-backing-is-refilled-unless-it-is-provably-adoptable)
 
 With the backing in module **B** and the body's sources in module **A**, one source-write transaction spans both modules' connections. The Database's coordinated commit covers them — the backing delta and the source write commit or roll back together in normal operation — but coordinated commit is **not two-phase commit**: with two *durable* modules, a crash between their commit acknowledgements can leave source and backing divergent on disk. The accepted position is to document this window rather than restrict module combinations: catalog **rehydrate refills the maintained table from the body** by default (import re-materializes; a durable module's own pre-rehydrated table at the MV's name is dropped and refilled), so any divergence self-heals at the next open.
 

@@ -24,14 +24,18 @@ This document is the **overview**: what a materialized view is, how to declare o
 
 ## Why one model
 
+> **Invariant:** [MV-001](invariants.md#mv-001--a-materialized-view-is-a-faster-plain-view), [MV-002](invariants.md#mv-002--maintenance-rides-the-writing-statements-transaction)
+
 A materialized view exists to be a *correctness-free* optimization: the user adds it for speed and nothing about query results should change. That requires the view to be consistent with its sources from a reader's point of view at all times — the same guarantee a plain view gives. Only synchronous, in-transaction (row-time) maintenance provides it:
 
 - It is **semantically transparent** — MV ≡ faster view, reads-own-writes. A model that lagged within a transaction would itself be a semantic "switch" the user has to model.
 - It is **transactional** — maintenance is part of the writing statement, so a failed maintain simply rolls back with the write. There is no post-commit window, no asynchronous drift, and therefore no divergence / self-heal machinery to reason about.
 
-Synchronous per-write maintenance is cheapest when the backing delta is a bounded projection of the changed row, but it is **never restricted to those shapes**: every body is maintainable. The **incremental arms** (projection/filter, aggregate, lateral-TVF fan-out, 1:1 join) keep the common shapes a bounded per-row delta; an always-correct **full-rebuild floor** maintains everything else by re-evaluating the body once per writing statement. A backward (maintenance-direction) cost gate picks the cheapest sound strategy. So no body is *rejected for its shape* — the only create-time rejections are a **non-deterministic** body (which no maintenance could keep equal to the view), a **bag** body with no provable unique key (no row identity to materialize on), a body with **no relational output**, and a **full-rebuild-only** body over a source past the configurable size threshold (where synchronous per-statement rebuild would be pathological). See [Maintenance strategy](mv-maintenance.md#maintenance-strategy).
+Synchronous per-write maintenance is cheapest when the backing delta is a bounded projection of the changed row, but it is **never restricted to those shapes**: every body is maintainable. The **incremental arms** (projection/filter, aggregate, lateral-TVF fan-out, 1:1 join) keep the common shapes a bounded per-row delta; an always-correct **full-rebuild floor** maintains everything else by re-evaluating the body once per writing statement. A backward (maintenance-direction) cost gate picks the cheapest sound strategy. So no body is *rejected for its shape* — the only create-time rejections are a **non-deterministic** body (which no maintenance could keep equal to the view), a **bag** body with no provable unique key (no row identity to materialize on), a body with **no relational output**, a body that **reads no source table** (`select 42` — no source write could ever maintain it), and a **full-rebuild-only** body over a source past the configurable size threshold (where synchronous per-statement rebuild would be pathological). See [Maintenance strategy](mv-maintenance.md#maintenance-strategy).
 
 ## Substrate: a maintained table
+
+> **Invariant:** [MV-009](invariants.md#mv-009--a-materialized-view-is-exactly-one-schema-object)
 
 A table is a stored relation; a *derivation* is an optional maintenance contract attached to it. A materialized view is realized as exactly **one** schema object — an ordinary `TableSchema`, registered under the view's own name, carrying a `derivation` (`TableDerivation`, `schema/derivation.ts`). One `TableSchema`, one catalog name, one physical incarnation:
 
@@ -54,6 +58,8 @@ CREATE MATERIALIZED VIEW mv [USING <module>(...)] AS <body>
 
 ### Primary key inference
 
+> **Invariant:** [MV-010](invariants.md#mv-010--the-maintained-relation-is-always-a-set)
+
 The maintained table's logical key is the body's own key, so each body row maps to exactly one stored row and the materialized relation is **always a set**:
 
 - For the bounded-delta arms the key is structural: the **covering-index** shape maps `T`'s primary key through the projection (the gate requires every PK column to be a passthrough output column); the **aggregate** arm keys on the group key; the **lateral-TVF** arm keys on the composite product key `(T.pk ∪ tvf-key)`; the **1:1-join** arm keys on the driving table's PK.
@@ -64,6 +70,8 @@ A body with **no** provable unique key is offered one more derivation before rej
 > **Physical vs logical key.** The maintained table's *physical* `primaryKeyDefinition` may lead with the body's `order by` columns (so a btree scan reproduces the body order), appending the logical key as a uniqueness-preserving tiebreaker. `TableDerivation.logicalKey` keeps the logical identity. The covering-structure work generalizes this into a proper materialized index.
 
 #### Coarsened backing keys
+
+> **Invariant:** [MV-011](invariants.md#mv-011--a-coarsened-backing-key-is-derived-once-and-read-by-both-sides)
 
 The collation-weakening migration shape ([migration.md § Convergence hazards](migration.md#convergence-hazards)) — `select handle collate nocase as handle, email from Contact_v1` over a BINARY-keyed source — has **no provable key**: the collation-weakening projection correctly drops the source key from `keysOf`, since two source rows (`'Bob'`, `'bob'`) can collide under the output collation. Yet the projected source key is the *intended backing identity*. At create, when `keysOf` is empty, `deriveCoarsenedBackingKey` (`planner/analysis/coarsened-key.ts`) recognizes this shape:
 
@@ -84,6 +92,8 @@ Row-time maintenance for the canonical shape rides the ordinary [covering-index 
 
 
 ### Backing-host capability
+
+> **Invariant:** [MV-014](invariants.md#mv-014--every-privileged-operation-routes-through-the-backing-host)
 
 Every privileged operation on the maintained table — the maintenance write, the wholesale create/refresh fill, the covering-UNIQUE enforcement scan — routes through a module-neutral capability, `BackingHost` (`vtab/backing-host.ts`), which any registered module may implement. The memory module is the default and reference implementation; the store module makes `using store` a persistent backing. Because the engine never reaches into a hosting module's internals, every MV semantic below holds regardless of which module hosts the rows.
 
@@ -204,7 +214,9 @@ Drops the maintained table — one record, one drop: the table, its rows, and it
 
 ## Maintenance strategy
 
-Every materialized-view body is maintainable; the only question is *how cheaply*. At create the manager picks the cheapest **structurally-sound** strategy via a backward (maintenance-direction) cost gate, falling back to an always-correct **full-rebuild floor**. **No body is rejected for its shape.** Four create-time rejections remain, none shape-based: a non-deterministic body, a bag body with no provable unique key, a body with no relational output, and a full-rebuild-only body over a source past the configurable size threshold.
+> **Invariant:** [MV-006](invariants.md#mv-006--no-body-is-rejected-for-its-shape), [MV-007](invariants.md#mv-007--the-strategy-gate-can-be-slow-never-wrong)
+
+Every materialized-view body is maintainable; the only question is *how cheaply*. At create the manager picks the cheapest **structurally-sound** strategy via a backward (maintenance-direction) cost gate, falling back to an always-correct **full-rebuild floor**. **No body is rejected for its shape.** Five create-time rejections remain, none shape-based: a non-deterministic body, a bag body with no provable unique key, a body with no relational output, a body that reads no source table, and a full-rebuild-only body over a source past the configurable size threshold.
 
 See [Materialized-View Maintenance](mv-maintenance.md#maintenance-strategy) for the four bounded-delta shapes, the [full-rebuild floor](mv-maintenance.md#full-rebuild-floor), the host-conditional replicable-determinism gate, and the size threshold.
 
@@ -285,6 +297,8 @@ The replacement is the foundation's emission unchanged — backing scan → resi
 
 ## Write boundary (write-through)
 
+> **Invariant:** [MV-012](invariants.md#mv-012--a-maintained-table-is-read-only-to-user-dml)
+
 `INSERT` / `UPDATE` / `DELETE` targeting an MV *name* is **rewritten to target the MV's source table `T`** and re-planned through the ordinary base-table builder — the identical AST-level rewrite plain-view mutation performs, reached via the same view dispatch wired into all three DML builders: each checks `getView(…)`, then falls back to the maintained table's `maintainedTableViewLike` adapter (`schema/derivation.ts`), which presents the derivation's body AST / column list / insert-defaults to the view-mutation rewrite. The plain-table DML path checks for a `derivation` **before** treating the name as an ordinary writable table — both at name dispatch (current-schema default) and again on the schema-path-**resolved** table, so an unqualified name that reaches a maintained table through the schema path routes through the same rewrite rather than writing the derived contents directly. Every MV is (post row-time consolidation) a single-source projection-and-filter — a strict subset of the [view-updateability](view-updateability.md) projection-and-filter shape — so write-through is pure routing, with no MV-specific propagation code. The rewritten write hits `T`, which fires the row-time maintenance hook, so the backing is brought into sync **inside the same statement / transaction**: a subsequent `select … from mv` sees the write (reads-own-writes) and a rollback reverts source + backing in lockstep. A write-through to an MV is observably **indistinguishable from writing the source and reading the MV**.
 
 Behind this dispatch sits an engine-level **READONLY backstop** in the runtime DML executor (`runtime/emit/dml-executor.ts` `assertNotMaintainedTableTarget`): it rejects, at emit time, any mutation plan whose target still carries a derivation. The dispatch above (name check + resolved-schema backstop) is the primary path; the backstop is the defense-in-depth second net, converting a hypothetical plan-time mis-dispatch — a direct-write plan that would silently diverge the derived contents from the source — into a loud error keyed structurally on `derivation` presence (never on the table name). It is deliberately unreachable from SQL on the supported path; the privileged maintenance surface bypasses it by construction (see [§ Read-only to user DML](mv-backing-host.md#backing-host-capability)).
@@ -313,17 +327,23 @@ See [Materialized-View Maintenance](mv-maintenance.md#maintenance-row-time-per-s
 
 ## Derived-row constraint validation (declared CHECK / FK / secondary UNIQUE)
 
+> **Invariant:** [MV-017](invariants.md#mv-017--declared-constraints-are-validated-against-derived-rows-before-the-cascade)
+
 A `create table … maintained as` table may declare CHECK, FOREIGN KEY, and secondary UNIQUE constraints. Derivation writes bypass the DML constraint pipeline, so those constraints are validated by their own mechanisms — a bulk scan on the create/attach/refresh paths, a compiled per-row validator in steady state — and the writing statement fails, attributed to the maintained table, when a derived row violates one. A maintained table may also be an FK *target*, which gets its own parent-side hook.
 
 See [Derived-Row Constraints and Covering Structures](mv-constraints.md#derived-row-constraint-validation-declared-check--fk--secondary-unique).
 
 ## External row-change ingestion
 
+> **Invariant:** [MV-021](invariants.md#mv-021--the-ingestion-seam-trusts-its-origin-and-re-validates-nothing)
+
 `Database.ingestExternalRowChanges(changes, options?)` is the batch seam by which a host that has applied row changes **directly to module storage** — sync-inbound replication, a direct row-store write — reports them so the post-write pipeline (materialized-view maintenance, watch capture, optional foreign-key actions) runs anyway, inside the coordinated transaction. The seam re-validates nothing: it trusts the origin.
 
 See [External row-change ingestion](mv-ingestion.md) for the facets, the trust boundary, the transaction and visibility contract, and when to prefer DML replay instead.
 
 ## Schema-change staleness
+
+> **Invariant:** [MV-022](invariants.md#mv-022--a-stale-view-serves-its-snapshot-and-propagates-nothing)
 
 Row-time maintenance keeps a materialized view consistent with its sources' *data*. A *schema* change to a source can break the body outright, so the manager marks affected views **stale** — serving their last snapshot, propagating no writes — until a `refresh` (or a drop-and-recreate) recovers them. Changes a body provably cannot observe recompile in place instead, and a rename rewrites the body rather than staling it.
 
@@ -336,6 +356,8 @@ A `select` from a materialized view is an ordinary table reference, so `Statemen
 A precise per-source row/group scope, mirroring the maintenance projection the manager already derives, is a future refinement.
 
 ## Declarative-schema integration
+
+> **Invariant:** [MV-013](invariants.md#mv-013--bodyhash-is-the-identity-of-the-definition)
 
 Maintained tables participate in the [declarative-schema](schema.md#declarative-schema) pipeline. A `declare schema { ... }` block accepts a `materialized view` item — or the equivalent `create table … maintained as` table form; both normalize to the **same** declared record, so they compare equal against the same live maintained table:
 

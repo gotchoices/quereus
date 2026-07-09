@@ -6,6 +6,8 @@ Covering structures are documented here rather than in [Lenses and Layered Schem
 
 ## Derived-row constraint validation (declared CHECK / FK / secondary UNIQUE)
 
+> **Invariant:** [MV-017](invariants.md#mv-017--declared-constraints-are-validated-against-derived-rows-before-the-cascade), [MV-018](invariants.md#mv-018--the-derived-row-validator-tracks-its-constraint-only-dependencies)
+
 A `create table … maintained as` table registers through the ordinary `createTable` path, so declared CHECK, FOREIGN KEY, and secondary (non-PK) UNIQUE constraints live on the backing `TableSchema` — but derivation writes bypass the DML constraint pipeline entirely (they go through the privileged backing surface). Declared constraints are real claims over the derivation: **the writing statement fails when a row the derivation writes violates a declared CHECK, child-side FK, or secondary UNIQUE**, with a diagnostic attributed to the *maintained table* — attribution is load-bearing because the failing statement targeted a different table (a source write, or the create/attach statement itself):
 
 ```
@@ -33,6 +35,8 @@ Semantics shared by both mechanisms:
 
 ### Declared secondary UNIQUE
 
+> **Invariant:** [MV-019](invariants.md#mv-019--secondary-unique-is-enforced-by-the-host-post-batch)
+
 A UNIQUE collision is a property of a **pair** of rows, not a single row image, so it does not fit the per-row validator above. It is enforced by the **backing host** instead — exactly where each host's DML UNIQUE machinery already lives (memory: the auto-built covering index; store: the effective full scan) — as a **post-batch** check inside `applyMaintenance`: after an op batch lands in the pending state, each written (insert/update) image is checked against the batch's final effective contents for a row at a *different* primary key matching the constraint, and a hit throws the attributed error above (memory `MemoryTableManager.enforceSecondaryUniqueOnMaintenance`; store `StoreTable.enforceSecondaryUniqueForMaintenance`; contract in `vtab/backing-host.ts` § Constraint validation). One mechanism covers every maintenance shape — the attach/create-fill `'replace-all'` reconcile (the bulk write IS a batch), steady-state bounded deltas, the full-rebuild flush, and MV-over-MV cascaded writes — with one diagnostic.
 
 - **Post-batch is load-bearing.** A `'replace-all'` diff applies its upserts before its deletes, so a per-op check would false-positive whenever the derived set *moves* a unique value from one primary key to another. After the batch, the pending state holds exactly the final contents, so checking each written image against it is exact. Checking only written images is also complete: pre-existing rows entered through DML / ADD CONSTRAINT / earlier validated maintenance, so any colliding pair includes at least one written image. Within a multi-row source statement, bounded-delta maintenance applies per source row — so a value *swap* across two source rows aborts mid-statement exactly as the equivalent multi-row UPDATE on an ordinary table would, while a full-rebuild body realizes the swap as one batch and succeeds.
@@ -43,6 +47,8 @@ A UNIQUE collision is a property of a **pair** of rows, not a single row image, 
 - **Detach guarantee** holds identically: bulk + steady-state coverage means no committed state ever holds a colliding pair, so a detached table's rows already satisfy the (now user-enforced) UNIQUE.
 
 ### Parent-side referential enforcement (`M` as an FK target)
+
+> **Invariant:** [MV-020](invariants.md#mv-020--a-maintenance-write-fires-parent-side-referential-actions)
 
 Everything above is **child-side** — constraints declared *on* `M`. The dual case is an FK declared on an **ordinary** table `C` that *references* `M` (`create table C (… references M(col) …)`): a maintenance-driven **delete** or **key-update** of the referenced `M` row would silently orphan `C`, bypassing the declared RESTRICT / referential action. Because that FK lives on `C`, it never appears in `M`'s plan or its derived-row validator — so it needs its own hook.
 

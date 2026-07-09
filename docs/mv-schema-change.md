@@ -1,5 +1,7 @@
 # Schema-change staleness
 
+> **Invariant:** [MV-022](invariants.md#mv-022--a-stale-view-serves-its-snapshot-and-propagates-nothing)
+
 What happens to a [materialized view](materialized-views.md) when one of its source tables changes shape. Most such changes are survivable — the view recompiles in place, or its body is rewritten to follow a rename — and the rest mark the view **stale**: it serves its last snapshot and propagates no writes until a `refresh` recovers it.
 
 Row-time maintenance keeps an MV consistent with its sources' *data*. But a *schema* change to a source (drop / alter) can break the body outright. The `MaterializedViewManager` subscribes to `table_removed` / `table_modified` change events and marks any MV whose `sourceTables` includes the changed table as **stale**.
@@ -29,6 +31,8 @@ An *in-transaction* source schema change (e.g. `alter table … add column`, whi
 The emit fires per qualifying source change rather than only on the `stale` false→true transition. The unconditional firing is what re-propagates the cascade down an MV-over-MV chain; for the *single-level* compiled-while-stale case it is defensive redundancy — a plan compiled while the MV is already stale carries a **direct** dependency on the source table, so a later source change invalidates it through the ordinary dependency path even without the emit.
 
 ## Rename propagation ("MV ≡ faster view")
+
+> **Invariant:** [MV-023](invariants.md#mv-023--a-rename-rewrites-the-stored-body-rather-than-stranding-it)
 
 `ALTER TABLE … RENAME TO` / `RENAME COLUMN` is the other source schema change (besides the body-irrelevant recompile above) that does **not** leave a dependent MV stale — but where the recompile path re-plans an unchanged body, a rename must rewrite the body itself: the rename propagation (`propagate{Table,Column}RenameToMaterializedViews` in `runtime/emit/materialized-view-helpers.ts`, driven from the ALTER emitter alongside the plain-view loop) rewrites the MV's body **in place**, exactly as it rewrites a plain view's:
 

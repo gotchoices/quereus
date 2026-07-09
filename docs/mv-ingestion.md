@@ -43,6 +43,8 @@ Facet selection is per-call only — there is no registered per-source policy (e
 
 ## Trust boundary
 
+> **Invariant:** [MV-021](invariants.md#mv-021--the-ingestion-seam-trusts-its-origin-and-re-validates-nothing)
+
 The seam re-validates **nothing** — no CHECK, NOT NULL, UNIQUE, or child-side FK existence (the origin enforced them). Covering-UNIQUE backings are maintained **blindly**: the inverse-projection upsert is keyed by backing PK, so an origin-unenforced UNIQUE collision degrades to last-writer-wins in the backing — identical to the existing eviction path. Garbage in, garbage out.
 
 **Module data events are NOT a facet.** The external writer owns its module event emission and the `remote` flag (a sync adapter already emits `remote: true` itself; the seam re-emitting would double-fire sync change recording).

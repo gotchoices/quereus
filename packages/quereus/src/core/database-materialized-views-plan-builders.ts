@@ -107,14 +107,16 @@ function resolveBackingPkColumns(backing: TableSchema, resolver: CollationResolv
  * shape allowlist**. The builder tries to match a bounded-delta arm by shape
  * ({@link tryBuildBoundedDeltaArm}); a body that matches **none** falls through to the
  * always-correct {@link buildFullRebuildPlan} floor (re-evaluate the whole body, replace
- * the backing transactionally). **No body is rejected for its shape.** Only four
- * create-time rejections remain, all non-shape:
+ * the backing transactionally). **No body is rejected for its shape.** Only five
+ * create-time rejections remain, all non-shape (docs/invariants.md MV-006):
  *  - a **non-deterministic** body without `pragma nondeterministic_schema` — a hard reject
  *    in the matched arm (so the arm-specific determinism diagnostic survives) or, for a
  *    body matching no arm, in the floor's whole-body determinism check;
  *  - a **bag** (no provable unique key) — the floor's `keysOf` reject (a duplicate-producing
  *    body usually fails the set contract earlier, at create-fill);
  *  - a body with **no relational output**;
+ *  - a body that **reads no source table** (`select 42`) — the floor's `sourceBases` reject;
+ *    there is no source to index the plan under and no write that could dirty it;
  *  - a **full-rebuild-only body over a source past the size threshold**
  *    ({@link isFullRebuildPathological}, the `materialized_view_rebuild_row_threshold` option).
  *
