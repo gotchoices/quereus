@@ -25,7 +25,7 @@ import {
 	compilePredicate,
 	maintainedTableUniqueViolationError,
 	uniqueEnforcementCollations,
-	PhysicalType,
+	logicalTypeCanHoldText,
 	type Database,
 	type DatabaseInternal,
 	type CollationFunction,
@@ -134,44 +134,17 @@ export function resolvePkKeyCollations(
 }
 
 /**
- * The physical representations whose values are PROVABLY never a JS string, so a
- * column of that representation is keyed by type-native, collation-independent
- * bytes. Every other representation — TEXT obviously, but also `NULL` (the `ANY`
- * type's, whose `parse` is the identity) and `OBJECT` (the JSON type's, whose
- * `parse` passes a JSON scalar string straight through) — can carry text.
- */
-const NEVER_TEXT_PHYSICAL_TYPES: ReadonlySet<PhysicalType> = new Set([
-	PhysicalType.INTEGER,
-	PhysicalType.REAL,
-	PhysicalType.BLOB,
-	PhysicalType.BOOLEAN,
-]);
-
-/**
  * True when `col` can produce a TEXT value at runtime, and so when its physical
- * key bytes are produced by a collation encoder rather than a type-native
- * encoding. Both collation-safety guards over the store's secondary indexes —
- * the write-side {@link StoreTable.indexSeekHonorsEnforcementCollation} and the
- * read-side `StoreModule.tryIndexAccessPlan` — exempt a never-text column from
- * their K-vs-C comparison, so a false "non-text" answer here is a silent
+ * key bytes are produced by a collation normalizer rather than a type-native
+ * encoding. The `ColumnSchema`-shaped wrapper over the engine's
+ * {@link logicalTypeCanHoldText}; both collation-safety guards over the store's
+ * secondary indexes — the write-side {@link StoreTable.indexSeekHonorsEnforcementCollation}
+ * and the read-side `StoreModule.tryIndexAccessPlan` — exempt a never-text column
+ * from their K-vs-C comparison, so a false "non-text" answer is a silent
  * wrong-result (a seek under the wrong collation, with the residual dropped).
- *
- * The test is an ALLOW-list over `physicalType`, not a deny-list over type names:
- * only a representation that can never be a string is exempt. A bare `isTextual`
- * check is not sufficient (neither `ANY` nor `JSON` carries the marker, yet both
- * store text as text), and neither is a `name === 'ANY'` escape hatch (`JSON`
- * needs the same treatment, and so would any future string-capable type). An
- * absent logical type is unknown — treated as potentially textual.
- *
- * Strictly more conservative than the engine's `isNonTextualLogicalType`
- * (planner/analysis/comparison-collation.ts), which classifies `JSON` as
- * non-textual. Erring conservative here costs an index seek, never correctness.
  */
 export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
-	const lt = col?.logicalType;
-	if (!lt) return true;
-	if (lt.isTextual === true) return true;
-	return !NEVER_TEXT_PHYSICAL_TYPES.has(lt.physicalType);
+	return logicalTypeCanHoldText(col?.logicalType);
 }
 
 /** A UNIQUE conflict: the offending row and the primary key it lives at. */
@@ -323,7 +296,7 @@ export class StoreTable extends VirtualTable {
 			tableSchema.columns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
-		this.validateKeyCollations(tableSchema);
+		this.validateKeyCollations(tableSchema, this.pkKeyCollations);
 		this.ddlSaved = isConnected;
 	}
 
@@ -338,30 +311,35 @@ export class StoreTable extends VirtualTable {
 	 * Both raise here rather than at the first insert.
 	 *
 	 * Checked over exactly the collations the key encoding actually uses:
-	 *   - every defined {@link pkKeyCollations} entry (text-capable PK columns);
+	 *   - every defined `pkKeyCollations` entry (text-capable PK columns);
 	 *   - the table key collation K, but only when it is reachable — a secondary index
-	 *     encodes its index-column bytes under K (`buildIndexKey`), and a PK member that
-	 *     `resolvePkKeyCollations` left `undefined` yet whose declared type can still hold
-	 *     a string (ANY / JSON) falls back to K inside `encodeValue`.
+	 *     encodes a TEXT-CAPABLE index column's bytes under K (`buildIndexKey`), and a PK
+	 *     member that {@link resolvePkKeyCollations} left `undefined` yet whose declared
+	 *     type can still hold a string (ANY / JSON) falls back to K inside `encodeValue`.
 	 *
-	 * So a table with an integer PK and no secondary index is never made unopenable by a
-	 * key collation it does not encode with.
+	 * So neither a table with an integer PK and no secondary index, nor one whose every
+	 * index column is type-natively keyed, is made unopenable by a K it never encodes with.
 	 *
 	 * Blast radius: this also fires on catalog rehydration. Reopening a persisted database
 	 * from a connection that has not re-registered its custom collation now throws at
 	 * CREATE-TABLE-from-catalog rather than silently reading rows under a key layout it
 	 * cannot reproduce. See `docs/plugins.md`.
+	 *
+	 * Takes `pkKeyCollations` rather than reading the field so `updateSchema` can validate
+	 * the incoming schema BEFORE it overwrites its own state with it.
 	 */
-	private validateKeyCollations(schema: TableSchema): void {
+	private validateKeyCollations(schema: TableSchema, pkKeyCollations: ReadonlyArray<string | undefined>): void {
 		const names = new Set<string>();
-		for (const collation of this.pkKeyCollations) {
+		for (const collation of pkKeyCollations) {
 			if (collation !== undefined) names.add(collation);
 		}
-		const usesTableKeyCollation =
-			(schema.indexes?.length ?? 0) > 0
-			|| schema.primaryKeyDefinition.some((def, i) =>
-				this.pkKeyCollations[i] === undefined && columnCanHoldText(schema.columns[def.index]));
-		if (usesTableKeyCollation) names.add((this.encodeOptions.collation ?? 'NOCASE').toUpperCase());
+		const indexKeysText = (schema.indexes ?? []).some(index =>
+			index.columns.some(col => columnCanHoldText(schema.columns[col.index])));
+		const pkFallsBackToTableKeyCollation = schema.primaryKeyDefinition.some((def, i) =>
+			pkKeyCollations[i] === undefined && columnCanHoldText(schema.columns[def.index]));
+		if (indexKeysText || pkFallsBackToTableKeyCollation) {
+			names.add((this.encodeOptions.collation ?? 'NOCASE').toUpperCase());
+		}
 
 		const dbInternal = this.db as DatabaseInternal;
 		for (const name of names) {
@@ -387,16 +365,22 @@ export class StoreTable extends VirtualTable {
 		return this.tableSchema!;
 	}
 
-	/** Update the table schema after an ALTER TABLE operation. */
+	/**
+	 * Update the table schema after an ALTER TABLE / CREATE INDEX operation.
+	 *
+	 * Validates the incoming schema's key collations before adopting any of it, so a
+	 * rejection leaves this table on its previous, consistent schema.
+	 */
 	updateSchema(newSchema: TableSchema): void {
-		this.tableSchema = newSchema;
-		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
-		this.pkKeyCollations = resolvePkKeyCollations(
+		const pkKeyCollations = resolvePkKeyCollations(
 			newSchema.primaryKeyDefinition,
 			newSchema.columns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
-		this.validateKeyCollations(newSchema);
+		this.validateKeyCollations(newSchema, pkKeyCollations);
+		this.tableSchema = newSchema;
+		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
+		this.pkKeyCollations = pkKeyCollations;
 	}
 
 	/**
@@ -945,13 +929,13 @@ export class StoreTable extends VirtualTable {
 	 * NOTE: a range window over a text PK column is sound only when the column's key
 	 * normalizer is ORDER-preserving with respect to its comparator — i.e. the comparator
 	 * orders two strings the way memcmp orders their normalized bytes. All three built-ins
-	 * satisfy this, and today only a built-in NAME can reach a PK column (DDL rejects any
-	 * other). `db.registerCollation` guarantees only that a normalizer partitions strings
-	 * the way the comparator calls them equal, NOT that it preserves order — so once
-	 * custom collation names become nameable on a column (`feat-ddl-accepts-registered-
-	 * collations`), an order-reversing normalizer here would UNDER-fetch. If that lands,
-	 * gate this window (and `analyzeIndexAccess`) on an order-preservation assertion at
-	 * registration, or restrict seeks to collations the engine knows are order-preserving.
+	 * satisfy this, but `db.registerCollation` guarantees only that a normalizer PARTITIONS
+	 * strings the way the comparator calls them equal, not that it preserves order — and a
+	 * built-in NAME may be re-registered with a custom comparator + normalizer pair that
+	 * does not. Such a pair makes this window (and `analyzeIndexAccess`') UNDER-fetch and
+	 * silently drop rows. Tracked by `backlog/bug-store-range-seek-assumes-order-preserving-
+	 * key-normalizer`; the fix is an order-preservation assertion at registration, or
+	 * restricting range seeks to collations the engine knows are order-preserving.
 	 */
 	protected buildPKRangeBounds(access: PKAccessPattern): IterateOptions {
 		const full = buildFullScanBounds();

@@ -191,6 +191,111 @@ describe('Store key bytes under a database-registered collation', () => {
 		expect((await db.get(`select v from t where id = 1`))?.v).to.equal('x');
 	});
 
+	it('leaves an all-integer secondary index unaffected by an unusable K', async () => {
+		// A secondary index encodes its INDEX-COLUMN bytes under K — but only when a
+		// column can hold text. An integer index column over an integer PK never
+		// consults K, so an unusable K must not make the index uncreatable.
+		db.registerCollation('NOCASE', noSpace);
+		await db.exec(`create table t (id integer primary key, n integer) using store`);
+		await db.exec(`insert into t values (1, 10), (2, 20)`);
+		expect(await attempt(db, `create index ix_n on t (n)`)).to.be.null;
+
+		const rows = await all(db, `select id from t where n >= 10 order by n`);
+		expect(rows.map(r => r.id)).to.deep.equal([1, 2]);
+	});
+
+	it('rejects a secondary index over a text column when K cannot key', async () => {
+		// The mirror of the above: `v` can hold text, so its index bytes are encoded
+		// under K. An unusable K must be rejected rather than reached at write time.
+		db.registerCollation('NOCASE', noSpace);
+		await db.exec(`create table t (id integer primary key, v text) using store`);
+
+		const err = await attempt(db, `create index ix_v on t (v)`);
+		expect(err, 'expected CREATE INDEX to reject the unusable key collation').to.not.be.null;
+		expect(err!.message).to.match(/cannot key a persisted structure/i);
+	});
+
+	it('rejects ADD CONSTRAINT UNIQUE when existing rows collide under the override', async () => {
+		// `validateUniqueOverExistingRows` buckets the existing rows through the
+		// connection's key normalizers; under the override 'a b' and 'ab' are one value.
+		db.registerCollation('NOCASE', noSpace, stripSpaces);
+		await db.exec(`create table t (id integer primary key, v text collate NOCASE) using store`);
+		await db.exec(`insert into t values (1, 'a b'), (2, 'ab')`);
+
+		const err = await attempt(db, `alter table t add constraint uq_v unique (v)`);
+		expect(err, 'expected the existing-row scan to see the two values as one').to.not.be.null;
+		expect(err!.message).to.match(/unique/i);
+
+		// The same rows are accepted once they are distinct under the override.
+		await db.exec(`update t set v = 'zz' where id = 2`);
+		expect(await attempt(db, `alter table t add constraint uq_v unique (v)`)).to.be.null;
+	});
+
+	it('rebuilds secondary indexes under the override when a PK column changes collation', async () => {
+		// `alter column … set collate` on a PK member rekeys the data store and rebuilds
+		// every index; the rebuilt PK suffix must be encoded through the same resolver.
+		db.registerCollation('NOCASE', noSpace, stripSpaces);
+		await db.exec(`create table t (k text collate BINARY primary key, n integer) using store`);
+		await db.exec(`create index ix_n on t (n)`);
+		await db.exec(`insert into t values ('a b', 10), ('c d', 20)`);
+
+		await db.exec(`alter table t alter column k set collate NOCASE`);
+
+		// Each index entry must still resolve to its live row through the rekeyed PK suffix.
+		const rows = await all(db, `select k, n from t where n >= 10 order by n`);
+		expect(rows.map(r => r.k)).to.deep.equal(['a b', 'c d']);
+
+		// And the rekeyed PK now collapses the override's equivalence class.
+		expect((await db.get(`select n from t where k = 'ab'`))?.n).to.equal(10);
+
+		// Maintenance recomputes the index key from the LIVE resolver; a rebuild that
+		// wrote the PK suffix under a different normalizer leaves this delete an orphan.
+		await db.exec(`delete from t where k = 'ab'`);
+		expect((await all(db, `select k from t where n >= 10`)).map(r => r.k)).to.deep.equal(['c d']);
+	});
+
+	it('re-keys a persisted table only for a connection carrying the same override', async () => {
+		const mod = new StoreModule(provider);
+		const db1 = new Database();
+		db1.registerCollation('NOCASE', noSpace, stripSpaces);
+		db1.registerModule('store', mod);
+		await db1.exec(`create table t (k text collate NOCASE primary key, v text) using store`);
+		await db1.exec(`insert into t values ('a b', 'one')`);
+		await mod.whenCatalogPersisted();
+		await db1.close();
+
+		// A connection that re-registers the override reproduces the key layout.
+		const restored = new Database();
+		const restoredMod = new StoreModule(provider);
+		restored.registerCollation('NOCASE', noSpace, stripSpaces);
+		restored.registerModule('store', restoredMod);
+		await restoredMod.rehydrateCatalog(restored);
+		expect((await restored.get(`select v from t where k = 'ab'`))?.v).to.equal('one');
+		await restored.close();
+
+		// A connection whose NOCASE cannot key at all refuses the table outright rather
+		// than reading rows under a layout it cannot reproduce. Rehydration logs and skips
+		// the entry, so the table is simply absent.
+		const comparatorOnly = new Database();
+		const comparatorOnlyMod = new StoreModule(provider);
+		comparatorOnly.registerCollation('NOCASE', noSpace);
+		comparatorOnly.registerModule('store', comparatorOnlyMod);
+		await comparatorOnlyMod.rehydrateCatalog(comparatorOnly);
+		const err = await attempt(comparatorOnly, `select v from t where k = 'ab'`);
+		expect(err, 'expected the comparator-only connection not to reach the table').to.not.be.null;
+		expect(err!.message).to.match(/not found/i);
+		await comparatorOnly.close();
+	});
+
+	it('rejects an ANY-typed PK column when the table key collation K cannot key', async () => {
+		// `resolvePkKeyCollations` leaves an ANY/JSON member `undefined` (no `isTextual`
+		// marker), so `encodeValue` falls back to K for it — K must therefore be keyable.
+		db.registerCollation('NOCASE', noSpace);
+		const err = await attempt(db, `create table t (k any primary key, v text) using store`);
+		expect(err, 'expected CREATE TABLE to reject the unusable K behind an ANY PK').to.not.be.null;
+		expect(err!.message).to.match(/cannot key a persisted structure/i);
+	});
+
 	it('keeps BINARY and NOCASE key bytes byte-identical to the retired encoders', () => {
 		const utf8 = (s: string) => new TextEncoder().encode(s);
 		const expected = (tag: number, s: string) =>

@@ -1907,9 +1907,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * (via `StoreTable.buildPKRangeBounds`) encodes the LT/LE/GT/GE bounds under the
 	 * same per-column key collations the data keys use and iterates that
 	 * seek-start/early-termination window. The window is a SUPERSET, so the post-fetch
-	 * row filter still reproduces the exact collation semantics — and a comparator-only
-	 * collation with no byte encoder safely falls back to a full scan. Mirrors the
-	 * memory module's advertisement.
+	 * row filter still reproduces the exact collation semantics. (A collation that cannot
+	 * key at all never reaches a PK column: `StoreTable`'s constructor rejects it at DDL
+	 * time.) Mirrors the memory module's advertisement.
 	 */
 	getBestAccessPlan(
 		_db: Database,
@@ -2025,9 +2025,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * seek column is non-text, OR its declared collation equals K, OR (K = NOCASE
 	 * while the column is BINARY, i.e. K strictly coarser). Otherwise we return a
 	 * cost-only plan (cheaper cost, filters unhandled, residual retained — correct,
-	 * just not sped up). If K itself has no registered byte encoder we cannot seek at
-	 * all and likewise return the cost-only plan (mirrors `buildPKRangeBounds`'
-	 * comparator-only fallback).
+	 * just not sped up). K itself always keys: `StoreTable`'s constructor rejects a
+	 * table whose key encoding would need a collation it cannot resolve to a normalizer.
+	 *
+	 * NOTE: the RANGE arm additionally assumes the normalizer is order-preserving with
+	 * respect to its comparator — see the NOTE on `StoreTable.buildPKRangeBounds` and
+	 * `backlog/bug-store-range-seek-assumes-order-preserving-key-normalizer`.
 	 */
 	private tryIndexAccessPlan(
 		tableInfo: TableSchema,

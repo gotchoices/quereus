@@ -312,9 +312,8 @@ function isStaticallyNonTextual(node: ScalarPlanNode): boolean {
  * value can be the ordinary string `Bob`. So is `NULL` (`ANY`'s representation).
  *
  * NOTE: deliberately stricter than {@link isNonTextualLogicalType} above, which exempts
- * `JSON` and is the subject of `bug-json-columns-classified-as-non-textual`. Mirrors
- * `columnCanHoldText` in `quereus-store/src/common/store-table.ts`; the two collapse into
- * one predicate once that ticket lands.
+ * `JSON` and is the subject of `bug-json-columns-classified-as-non-textual`. The two
+ * collapse into one predicate once that ticket lands.
  */
 const NEVER_TEXT_PHYSICAL_TYPES: ReadonlySet<PhysicalType> = new Set([
 	PhysicalType.INTEGER,

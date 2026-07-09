@@ -527,10 +527,10 @@ or overridden with `db.registerCollation`.
 
 A collation registered with a comparator but **no** normalizer cannot key a persisted
 structure, and neither can an unregistered name. Both are rejected at `CREATE TABLE`
-(and at `ALTER`), over exactly the collations the table's key encoding uses: each
-text-capable primary-key column, plus the table key collation `K` when the table has a
-secondary index or a primary-key column whose type can carry text without declaring a
-collation of its own.
+(and at `CREATE INDEX` / `ALTER`), over exactly the collations the table's key encoding
+uses: each text-capable primary-key column, plus the table key collation `K` when the
+table has a secondary index over a text-capable column, or a primary-key column whose
+type can carry text without declaring a collation of its own.
 
 ### Built-in Collations
 
@@ -548,10 +548,12 @@ encoder stripped every Unicode whitespace character, so `'a\t'` and `'a'` shared
 despite comparing distinct — a distinct row could be clobbered by its neighbour.)
 
 A range/prefix seek over a text key additionally assumes the normalizer is
-*order-preserving* with respect to the comparator. The three built-ins are; a custom
-collation whose comparator does not order strings the way memcmp orders their normalized
-bytes would narrow the seek window incorrectly. Custom collation names cannot yet be
-declared on a column, so this is not reachable today.
+*order-preserving* with respect to the comparator. The three built-ins are. A collation
+whose comparator does not order strings the way memcmp orders their normalized bytes
+narrows the seek window incorrectly and silently drops rows — `registerCollation`
+requires only that the normalizer partition strings the way the comparator calls them
+equal, and `NOCASE` / `RTRIM` may be re-registered with such a pair. Tracked by
+`backlog/bug-store-range-seek-assumes-order-preserving-key-normalizer`.
 
 ## Package Structure
 
