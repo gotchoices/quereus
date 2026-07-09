@@ -10,17 +10,20 @@ import type { HLC } from '../clock/hlc.js';
 import { assertWithinDrift } from '../clock/hlc.js';
 import { deserializeColumnVersion, type ColumnVersion } from '../metadata/column-version.js';
 import { deserializeMigration } from '../metadata/schema-migration.js';
+import { deserializeTombstone } from '../metadata/tombstones.js';
 import {
 	buildAllColumnVersionsScanBounds,
 	buildAllTombstonesScanBounds,
 	buildAllSchemaMigrationsScanBounds,
 	buildAllChangeLogScanBounds,
 	parseColumnVersionKey,
+	parseTombstoneKey,
 	parseSchemaMigrationKey,
 	encodePK,
 } from '../metadata/keys.js';
 import type {
 	Snapshot,
+	SnapshotTombstone,
 	SchemaMigration,
 	TableSnapshot,
 	DataChangeToApply,
@@ -103,11 +106,32 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 		});
 	}
 
+	// Collect all tombstones — a GLOBAL pass (not keyed off `tables`), mirroring the
+	// streaming producer: a fully-deleted row has a tombstone but no live
+	// column-versions, so its `(schema, table)` may be absent from `tables`. The
+	// global scan carries it regardless.
+	const tombstones: SnapshotTombstone[] = [];
+	for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
+		const parsed = parseTombstoneKey(entry.key);
+		if (!parsed) continue;
+
+		const ts = deserializeTombstone(entry.value);
+		tombstones.push({
+			schema: parsed.schema,
+			table: parsed.table,
+			pk: parsed.pk,
+			hlc: ts.hlc,
+			createdAt: ts.createdAt,
+			...(ts.priorRow !== undefined ? { priorRow: ts.priorRow } : {}),
+		});
+	}
+
 	return {
 		siteId: ctx.getSiteId(),
 		hlc: ctx.getCurrentHLC(),
 		tables,
 		schemaMigrations,
+		tombstones,
 	};
 }
 
@@ -122,10 +146,6 @@ export async function applySnapshot(
 	// snapshot whose HLC is beyond the drift bound BEFORE clearing or writing anything,
 	// so a far-future peer cannot land poison LWW winners. Emit status:'error' first for
 	// UI parity with the data-apply failure path.
-	// NOTE: this non-streaming path still OMITS tombstones from the snapshot (the
-	// `Snapshot`/`TableSnapshot` interface carries none), so a deleted row can resurrect
-	// after an `applySnapshot` bootstrap — the same defect fixed for the streaming path.
-	// Tracked as ticket `bug-nonstreaming-snapshot-tombstones`.
 	try {
 		assertWithinDrift(snapshot.hlc.wallTime, BigInt(Date.now()));
 	} catch (error) {
@@ -242,6 +262,16 @@ export async function applySnapshot(
 					hlc: migration.hlc,
 					schemaVersion,
 				});
+			}
+
+			// Re-write the snapshot's tombstones (the clearBatch above wiped the
+			// receiver's existing ones). Mirrors the streaming consumer.
+			// NOTE: `setTombstoneBatch` stamps `createdAt = Date.now()` internally and
+			// ignores the sender's `ts.createdAt`, so a bootstrapped tombstone's TTL
+			// horizon re-bases to bootstrap time rather than preserved. Accepted phase-1
+			// behavior (the tombstone lives a full horizon from bootstrap).
+			for (const ts of snapshot.tombstones) {
+				ctx.tombstones.setTombstoneBatch(applyBatch, ts.schema, ts.table, ts.pk, ts.hlc, ts.priorRow);
 			}
 
 			await applyBatch.write();

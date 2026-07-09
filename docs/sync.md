@@ -736,7 +736,10 @@ interface Snapshot {
   siteId: SiteId;
   hlc: HLC;
   tables: TableSnapshot[];
-  schema: SchemaMigration[];
+  schemaMigrations: SchemaMigration[];
+  // Global tombstone pass (table-independent) so a fully-deleted row — a
+  // tombstone with no live column-versions — survives an applySnapshot bootstrap.
+  tombstones: SnapshotTombstone[];
 }
 
 interface TableSnapshot {

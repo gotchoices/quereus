@@ -144,7 +144,7 @@ class MockSyncManager implements SyncManager {
   }
 
   async getSnapshot(): Promise<Snapshot> {
-    return { siteId: this.siteId, hlc: this.getCurrentHLC(), tables: [], schemaMigrations: [] };
+    return { siteId: this.siteId, hlc: this.getCurrentHLC(), tables: [], schemaMigrations: [], tombstones: [] };
   }
 
   async applySnapshot(_snapshot: Snapshot): Promise<void> {}

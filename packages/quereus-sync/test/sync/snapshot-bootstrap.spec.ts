@@ -186,6 +186,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 			hlc: remoteHLC.tick(),
 			tables: [{ schema: 'main', table: 't', rows: [], columnVersions }],
 			schemaMigrations: [],
+			tombstones: [],
 		};
 
 		await syncManager.applySnapshot(snapshot);
@@ -443,6 +444,7 @@ describe('snapshot bootstrap defers MV maintenance', () => {
 				hlc: remoteHLC.tick(),
 				tables: [{ schema: 'main', table: 't', rows: [], columnVersions }],
 				schemaMigrations: [],
+				tombstones: [],
 			};
 
 			let thrown: unknown;

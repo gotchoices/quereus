@@ -181,6 +181,22 @@ export interface TableSnapshot {
 }
 
 /**
+ * A tombstone (deletion record) carried in a non-streaming snapshot. A GLOBAL
+ * collection on `Snapshot` (not nested under `TableSnapshot`) so a fully-deleted
+ * row — a tombstone with no live column-versions, hence no `TableSnapshot` — still
+ * travels. Mirrors the streaming `SnapshotTombstoneChunk` entry shape.
+ */
+export interface SnapshotTombstone {
+  readonly schema: string;
+  readonly table: string;
+  readonly pk: SqlValue[];
+  readonly hlc: HLC;
+  readonly createdAt: number;
+  /** Last-known row image before deletion; absent on snapshot-reconstructed tombstones. */
+  readonly priorRow?: Row;
+}
+
+/**
  * Full database snapshot.
  */
 export interface Snapshot {
@@ -188,6 +204,12 @@ export interface Snapshot {
   readonly hlc: HLC;
   readonly tables: TableSnapshot[];
   readonly schemaMigrations: SchemaMigration[];
+  /**
+   * GLOBAL tombstone collection (table-independent) so a fully-deleted row — a
+   * tombstone with no live column-versions — travels the bootstrap. See
+   * {@link SnapshotTombstone}.
+   */
+  readonly tombstones: SnapshotTombstone[];
 }
 
 // ============================================================================

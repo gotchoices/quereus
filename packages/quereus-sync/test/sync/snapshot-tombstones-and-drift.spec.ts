@@ -85,6 +85,60 @@ describe('snapshot carries tombstones', () => {
 	});
 });
 
+describe('non-streaming snapshot carries tombstones', () => {
+	let sender: Peer;
+	let receiver: Peer;
+
+	beforeEach(async () => {
+		sender = await makePeer('sender', { createOrders: true, ordersDdl: TEXT_ORDERS });
+		// Fresh replica: the snapshot's own `create_table` migration installs `orders`.
+		receiver = await makePeer('receiver');
+	});
+
+	afterEach(async () => {
+		await closePeer(sender);
+		await closePeer(receiver);
+	});
+
+	it('a deleted row stays deleted after applySnapshot bootstrap; a stale older write is tombstone-blocked', async () => {
+		// Sender: write R, then delete R. The delete leaves a tombstone but NO live
+		// column-versions, so R's table is absent from the column-version pass — only the
+		// global tombstone pass carries it (the fully-deleted-row case).
+		await localWrite(sender, "insert into orders (id, note) values ('r1', 'hello')");
+		await localWrite(sender, "delete from orders where id = 'r1'");
+
+		const snap = await sender.manager.getSnapshot();
+		// The global pass carried the tombstone even though R has no live column-versions;
+		// a per-table collection keyed off `snap.tables` would miss it (R's table is absent).
+		expect(snap.tombstones.length, 'snapshot carries the tombstone globally').to.be.greaterThan(0);
+
+		await receiver.manager.applySnapshot(snap);
+
+		// The receiver ends with the sender's tombstone for R.
+		const ts = await receiver.manager.tombstones.getTombstone('main', 'orders', ['r1']);
+		expect(ts, 'receiver has a tombstone for the deleted row after bootstrap').to.not.equal(undefined);
+
+		// Deliver a stale write for R with HLC strictly older than the deletion, from a
+		// foreign site (so it is not self-origin-skipped).
+		const foreignSite = generateSiteId();
+		const staleHlc = createHLC(ts!.hlc.wallTime - 1n, 0, foreignSite);
+		const staleChange: ColumnChange = {
+			type: 'column', schema: 'main', table: 'orders', pk: ['r1'], column: 'note', value: 'resurrected', hlc: staleHlc,
+		};
+		const cs: ChangeSet = {
+			siteId: foreignSite, transactionId: 'stale-tx', hlc: staleHlc, changes: [staleChange], schemaMigrations: [],
+		};
+		await receiver.manager.applyChanges([cs]);
+
+		// The stale write is tombstone-blocked: R does NOT resurrect.
+		expect(await count(receiver, "select count(*) as n from orders where id = 'r1'"))
+			.to.equal(0);
+		// The tombstone is still in place.
+		expect(await receiver.manager.tombstones.getTombstone('main', 'orders', ['r1']))
+			.to.not.equal(undefined);
+	});
+});
+
 describe('clock drift is rejected pre-commit', () => {
 	let receiver: Peer;
 

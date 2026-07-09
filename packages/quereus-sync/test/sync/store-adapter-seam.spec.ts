@@ -577,6 +577,7 @@ describe('store-adapter seam integration', () => {
 					columnVersions: new Map([['["k"]:v', { hlc: remoteHLC.tick(), value: 'b' }]]),
 				}],
 				schemaMigrations: [],
+				tombstones: [],
 			};
 
 			let thrown: unknown;
