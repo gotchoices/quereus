@@ -36,6 +36,20 @@ function makeKeyRange(lower: KeyBound | undefined, upper: KeyBound | undefined):
 }
 
 /**
+ * True when the bounds describe a range that can hold nothing: crossed, or a
+ * single point excluded by either edge. `IDBKeyRange.bound` throws DataError on
+ * exactly these inputs, so the caller must short-circuit instead of building one.
+ * This arises on the resume iteration when a batch fills exactly to a boundary
+ * key that also equals an inclusive opposite bound (e.g. `iterate({lte: max})`
+ * over a range whose size is a multiple of BATCH).
+ */
+function isEmptyRange(lower: KeyBound | undefined, upper: KeyBound | undefined): boolean {
+  if (!lower || !upper) return false;
+  const c = indexedDB.cmp(lower.key, upper.key);
+  return c > 0 || (c === 0 && (lower.open || upper.open));
+}
+
+/**
  * Extended options for IndexedDB store.
  */
 export interface IndexedDBStoreOptions extends KVStoreOptions {
@@ -211,6 +225,9 @@ export class IndexedDBStore implements KVStore {
     direction: IDBCursorDirection,
     want: number,
   ): Promise<KVEntry[]> {
+    // An exhausted resume edge can collapse the bounds to an empty range, which
+    // IDBKeyRange.bound would reject with DataError — treat it as "no more entries".
+    if (isEmptyRange(lower, upper)) return [];
     const db = await this.manager.ensureOpen();
     const range = makeKeyRange(lower, upper);
     return new Promise((resolve, reject) => {

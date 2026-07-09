@@ -242,6 +242,31 @@ describe('IndexedDBStore', () => {
       expect(keys[0]).to.equal(0);
       expect(keys[limit - 1]).to.equal(limit - 1);
     });
+
+    it('handles an inclusive upper bound landing on an exact batch boundary', async () => {
+      // Range [0..255] is exactly 256 = one BATCH, and its max key equals the
+      // inclusive `lte` bound. The resume edge then collapses to an empty range;
+      // the store must treat that as exhausted, not throw DataError on IDBKeyRange.
+      const keys: number[] = [];
+      for await (const entry of store.iterate({ lte: enc(255) })) {
+        keys.push(dec(entry.key));
+      }
+      expect(keys).to.have.length(256);
+      expect(keys[0]).to.equal(0);
+      expect(keys[255]).to.equal(255);
+    });
+
+    it('handles an inclusive lower bound landing on an exact reverse batch boundary', async () => {
+      // Reverse mirror: range [50..305] is exactly 256, its min key equals the
+      // inclusive `gte` bound, and reverse iteration resumes on the upper edge.
+      const keys: number[] = [];
+      for await (const entry of store.iterate({ gte: enc(50), reverse: true })) {
+        keys.push(dec(entry.key));
+      }
+      expect(keys).to.have.length(256);
+      expect(keys[0]).to.equal(305);
+      expect(keys[255]).to.equal(50);
+    });
   });
 
   describe('Batch reuse after commit', () => {
