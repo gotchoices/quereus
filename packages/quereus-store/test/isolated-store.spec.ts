@@ -181,6 +181,58 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	/**
+	 * `IsolationModule.renameTable` evicts its cached underlying handle (StoreModule
+	 * disposes the `StoreTable` and re-opens the store during a rename, so the old
+	 * handle is dead) and re-keys any staged overlay onto the new name. It must then
+	 * re-connect an underlying under the new name, or the commit flush cannot resolve
+	 * the overlay. This pins the re-connect against a real `StoreModule`, where it has
+	 * to survive the dispose/re-open that the memory module never performs.
+	 *
+	 * NOTE: this does NOT assert that the staged rows reach the store, because on the
+	 * store path they currently do not. `StoreModule.renameTable` calls
+	 * `removeConnectionsForTable(schema, oldName)`, so by COMMIT no connection remains
+	 * to drive `commitConnectionOverlays` at all — the overlay survives the commit as a
+	 * zombie that keeps merging into this connection's reads while the store stays
+	 * empty. That is a distinct defect from the map-miss this suite's sibling covers;
+	 * tracked in fix/iso-rename-in-txn-never-flushes-staged-rows.
+	 */
+	describe('mid-transaction RENAME TO with staged writes', () => {
+		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
+
+		beforeEach(async () => {
+			isolatedModule = createIsolatedStoreModule({ provider });
+			db.registerModule('store', isolatedModule);
+			await db.exec(`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT) USING store`);
+		});
+
+		it('re-resolves the underlying store table under the new name', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+
+			// The staged overlay moved to `gadget`; an underlying must exist there too, or the
+			// commit flush has nothing to flush into. Re-connecting means calling
+			// StoreModule.connect() right after it disposed the old StoreTable.
+			expect(isolatedModule.getUnderlyingState('main', 'gadget'), 'underlying re-connected under the new name')
+				.to.not.be.undefined;
+			expect(isolatedModule.getUnderlyingState('main', 'widget'), 'stale handle evicted')
+				.to.be.undefined;
+
+			await db.exec('COMMIT');
+		});
+
+		it('leaves no underlying entry under the new name when nothing was staged', async () => {
+			// No overlay to carry across, so nothing must be flushed and the eviction alone is
+			// correct — the next connect() re-resolves lazily.
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			expect(isolatedModule.getUnderlyingState('main', 'gadget')).to.be.undefined;
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM gadget`));
+			expect(rows).to.deep.equal([]);
+		});
+	});
+
 	// Regression for `store-range-seek-collation-bounds` on the MERGED query path:
 	// with the store advertising `honorsCollatedRangeBounds`, a collation-matched
 	// NOCASE PK range is pushed down with NO residual Filter, so inside a

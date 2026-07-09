@@ -144,6 +144,34 @@ maps agree by construction, whatever the underlying self-reports.
 The same reasoning rules out keying off `underlyingTable.tableSchema` — that field is documented
 as possibly populated lazily by the underlying module, so it may be absent at construction time.
 
+#### Invariant: every staged overlay resolves to an underlying table at commit
+
+Keying the two maps consistently is necessary but not sufficient — the entries must also both
+still *exist* when `commitConnectionOverlays` crosses between them. The table-lifecycle hooks are
+what keep that true, and each has to do explicit work:
+
+- **`destroy()` (DROP TABLE)** removes the `underlyingTables` entry, so it also deletes the
+  `connectionOverlays` and `preOverlaySavepoints` entries for that table across **every** db id.
+  DROP TABLE is not transaction-scoped: the table is gone for all connections, so discarding their
+  staged writes is correct — but it must happen because `destroy()` dropped them deliberately, not
+  because a lookup missed later. Without this the single-table case also leaked the overlay (and
+  its savepoint set) for the lifetime of the `Database`.
+- **`renameTable()` (ALTER TABLE … RENAME TO)** evicts the cached underlying handle for the old
+  name (the underlying module may have closed it — `StoreModule` closes and re-opens stores during
+  a rename) and re-keys any staged overlay onto the new name. It must therefore **re-connect** a
+  fresh underlying under the new name whenever it carried an overlay across, using the vtab module
+  name and args from the pre-rename catalog entry (the hook's signature carries neither, and the
+  engine updates the catalog only *after* the hook returns). With no overlay carried across there
+  is nothing to flush, so the eviction alone suffices and the next `connect()` re-resolves lazily.
+
+A staged overlay (`hasChanges === true`) that still fails to resolve at commit is a violation of
+this invariant, and `commitConnectionOverlays` raises `StatusCode.INTERNAL`. It never silently
+drops the rows: doing so reported a *successful* commit that persisted nothing, and — because the
+skipped overlay also never reached the clear-loop — left a zombie overlay that kept merging into
+every later read on that `Database`, so the connection that lost the data was the last to notice.
+A **clean** overlay (`hasChanges === false`) that fails to resolve staged nothing, so it is simply
+discarded.
+
 ---
 
 ## Isolation Level Provided
@@ -615,6 +643,7 @@ connections racing on the same row, not atomicity within a single connection's o
 - DDL mutates the shared underlying module directly — it is not transaction-scoped and the underlying auto-commits immediately, so it is not isolated in the same way as DML.
 - Schema changes may have their own transactional semantics.
 - **Open overlays are migrated, not bypassed.** Any per-connection overlay holding staged rows in the *old* column layout would be structurally inconsistent with the post-DDL schema, so `IsolationModule` migrates each affected overlay forward rather than ignoring it. `dropIndex` rebuilds each overlay under the post-drop schema (preserving rows + tombstones); `alterTable` translates every staged row to the new column layout. See *ALTER overlay migration & cross-connection poison* below.
+- **Open overlays are never orphaned.** `destroy` (DROP TABLE) drops every connection's overlay for the table; `renameTable` re-connects an underlying under the new name whenever it re-keys an overlay onto it. See *Invariant: every staged overlay resolves to an underlying table at commit* above — a residual miss on a staged overlay is an `INTERNAL` error, never a silent discard.
 
 #### ALTER overlay migration & cross-connection poison
 

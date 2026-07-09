@@ -1230,6 +1230,170 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	/**
+	 * Regressions for overlays orphaned by the table-lifecycle hooks.
+	 *
+	 * `commitConnectionOverlays` crosses from an overlay key (`<dbId>:<schema>.<table>`)
+	 * to the `underlyingTables` entry with the same `<schema>.<table>` suffix. It used to
+	 * `continue` past a miss, so a staged overlay whose underlying had been evicted by
+	 * DROP TABLE or ALTER TABLE … RENAME TO had its rows silently discarded while COMMIT
+	 * still reported success. `renameTable` now re-connects the underlying under the new
+	 * name, `destroy` deliberately drops every connection's overlay for the dropped table,
+	 * and a residual miss on a *staged* overlay is an INTERNAL error.
+	 */
+	describe('orphaned overlays across DROP TABLE / RENAME TO', () => {
+		let iso: IsolationModule;
+
+		beforeEach(() => {
+			iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', iso);
+		});
+
+		/**
+		 * Rows actually present in the UNDERLYING storage, bypassing the merged read.
+		 * The merged read is not a witness of a successful flush: a zombie overlay that
+		 * survives its commit keeps merging into every subsequent read on this Database,
+		 * so `select` returns the row even when nothing was persisted.
+		 */
+		async function underlyingRows(table: string): Promise<Row[]> {
+			const underlying = iso.getUnderlyingState('main', table)!.underlyingTable;
+			return await asyncIterableToArray(underlying.query!(makeFullScanFilterInfo()));
+		}
+
+		/** Live overlay keys (`<dbId>:<schema>.<table>`) across all connections. */
+		function overlayKeys(): string[] {
+			return [...(iso as unknown as { connectionOverlays: Map<string, unknown> }).connectionOverlays.keys()];
+		}
+
+		/** Live pre-overlay savepoint keys, keyed identically to the overlays. */
+		function preOverlaySavepointKeys(): string[] {
+			return [...(iso as unknown as { preOverlaySavepoints: Map<string, unknown> }).preOverlaySavepoints.keys()];
+		}
+
+		it('a mid-transaction RENAME TO still flushes the staged rows to underlying storage', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec(`begin`);
+			await db.exec(`insert into widget values (1, 'a')`);
+			await db.exec(`alter table widget rename to gadget`);
+			await db.exec(`commit`);
+
+			// Pre-fix: the overlay was re-keyed onto `gadget` but no underlying existed under
+			// that name, so the flush skipped it AND the clear-loop never removed it. Storage
+			// stayed empty while the zombie overlay kept answering this connection's reads.
+			expect(await underlyingRows('gadget'), 'row must be persisted in underlying storage')
+				.to.deep.equal([[1, 'a']]);
+			expect(overlayKeys(), 'no overlay may survive a successful commit').to.deep.equal([]);
+
+			const merged = await asyncIterableToArray(db.eval(`select * from gadget`));
+			expect(merged.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'a']]);
+		});
+
+		it('a mid-transaction RENAME TO of a table with no staged writes leaves storage intact', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec(`insert into widget values (1, 'a')`);
+
+			await db.exec(`begin`);
+			await db.exec(`alter table widget rename to gadget`);
+			await db.exec(`commit`);
+
+			const merged = await asyncIterableToArray(db.eval(`select * from gadget`));
+			expect(merged.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'a']]);
+			expect(overlayKeys()).to.deep.equal([]);
+		});
+
+		it('DROP TABLE mid-transaction discards that table\'s overlay and commits the survivor', async () => {
+			await db.exec(`create table a (id integer primary key, v text) using isolated`);
+			await db.exec(`create table b (id integer primary key, v text) using isolated`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into a values (1, 'a1')`);
+			await db.exec(`insert into b values (1, 'b1')`);
+			await db.exec(`drop table b`);
+			await db.exec(`commit`);
+
+			// The surviving table's staged row lands; b's overlay was dropped by destroy(),
+			// so the commit flush never sees an unresolvable staged overlay and never throws.
+			expect(await underlyingRows('a')).to.deep.equal([[1, 'a1']]);
+			expect(overlayKeys(), 'the dropped table leaves no overlay behind').to.deep.equal([]);
+		});
+
+		it('DROP TABLE mid-transaction of the only written table leaks no overlay or savepoint set', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into widget values (1, 'a')`);
+			expect(overlayKeys().length, 'the insert stages an overlay').to.equal(1);
+			await db.exec(`drop table widget`);
+
+			// Dropping the table disconnects it, so commitConnectionOverlays never runs for it.
+			// Pre-fix the overlay (and its pre-overlay savepoint set) survived for the lifetime
+			// of the Database; destroy() must clear both.
+			expect(overlayKeys(), 'destroy() clears the overlay').to.deep.equal([]);
+			expect(preOverlaySavepointKeys(), 'destroy() clears the savepoint set').to.deep.equal([]);
+
+			await db.exec(`commit`);
+			expect(overlayKeys()).to.deep.equal([]);
+			expect(preOverlaySavepointKeys()).to.deep.equal([]);
+		});
+
+		it('DROP TABLE discards another connection\'s staged overlay for the same table', async () => {
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			// A second Database sharing the module gets its own dbId, hence its own overlay key.
+			// The overlay is injected directly (as the cross-connection ALTER suite does) — the
+			// point under test is the sweep across db ids, not how the foreign overlay arose.
+			const other = new Database();
+			const underlying = iso.getUnderlyingState('main', 'shared')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(other, iso.createOverlaySchema(underlying.tableSchema!));
+			await overlay.update({ operation: 'insert', values: [1, 'from-other', 0] });
+			iso.setConnectionOverlay(other, 'main', 'shared', { overlayTable: overlay, hasChanges: true });
+			expect(overlayKeys().length, 'the foreign connection stages an overlay').to.equal(1);
+
+			await db.exec(`drop table shared`);
+
+			// The table is gone for EVERY connection, so its staged writes are gone too. Left in
+			// place, that overlay would trip the new INTERNAL guard at the foreign commit.
+			expect(overlayKeys(), 'destroy() sweeps overlays across all db ids').to.deep.equal([]);
+			await other.close();
+		});
+
+		it('commitConnectionOverlays throws INTERNAL for a staged overlay with no underlying', async () => {
+			await db.exec(`create table t (id integer primary key, v text) using isolated`);
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+
+			// Hand-plant a staged overlay under a name that has no `underlyingTables` entry —
+			// the state DROP TABLE / RENAME TO used to leave behind. Silently dropping these
+			// rows and reporting a successful commit is the failure mode under test.
+			const overlay = await iso.overlayModule.create(db, iso.createOverlaySchema(underlying.tableSchema!));
+			await overlay.update({ operation: 'insert', values: [1, 'staged', 0] }); // trailing 0 = live
+			iso.setConnectionOverlay(db, 'main', 'ghost', { overlayTable: overlay, hasChanges: true });
+
+			let caught: unknown;
+			try {
+				await iso.commitConnectionOverlays(db);
+			} catch (e) {
+				caught = e;
+			}
+			expect(caught, 'an unresolvable staged overlay must not be silently dropped').to.be.instanceOf(QuereusError);
+			expect((caught as QuereusError).code).to.equal(StatusCode.INTERNAL);
+			expect((caught as QuereusError).message).to.contain('main.ghost');
+		});
+
+		it('commitConnectionOverlays clears — never throws on — a CLEAN overlay with no underlying', async () => {
+			await db.exec(`create table t (id integer primary key, v text) using isolated`);
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+
+			const overlay = await iso.overlayModule.create(db, iso.createOverlaySchema(underlying.tableSchema!));
+			iso.setConnectionOverlay(db, 'main', 'ghost', { overlayTable: overlay, hasChanges: false });
+
+			// Staged nothing, so nothing is lost. It also never reached the apply set, so the
+			// clear-loop had to be taught about it explicitly or it would leak.
+			await iso.commitConnectionOverlays(db);
+			expect(iso.getConnectionOverlay(db, 'main', 'ghost'), 'clean orphan is cleared, not leaked')
+				.to.be.undefined;
+		});
+	});
+
 	describe('DROP INDEX forwards through the isolation layer', () => {
 		// Regression: SchemaManager.dropIndex only invokes the registered module's
 		// dropIndex hook. Without IsolationModule.dropIndex, the underlying

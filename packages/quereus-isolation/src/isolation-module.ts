@@ -375,6 +375,25 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Returns every key of a connection-scoped map (`<dbId>:<schema>.<table>`, the
+	 * shape of {@link connectionOverlays} / {@link preOverlaySavepoints} /
+	 * {@link connectionInFlight}) that belongs to `schemaName.tableName`, across ALL
+	 * db ids. Both maps embed the db id as a prefix, so a per-table sweep is a suffix
+	 * match on `:<schema>.<table>`.
+	 *
+	 * The keys are materialized into an array rather than yielded, so callers may
+	 * delete or re-key entries while walking the result.
+	 */
+	private connectionScopedKeys(map: ReadonlyMap<string, unknown>, schemaName: string, tableName: string): string[] {
+		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
+		const keys: string[] = [];
+		for (const key of map.keys()) {
+			if (key.endsWith(suffix)) keys.push(key);
+		}
+		return keys;
+	}
+
+	/**
 	 * Commits every overlay this db-transaction staged as ONE coordinated two-phase
 	 * flush, instead of each table flushing+committing its own underlying
 	 * independently. The per-table approach tears a multi-table commit: table A's
@@ -414,10 +433,22 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * remaining connections find no overlay for their table and this is a no-op — no
 	 * explicit "already flushed" latch is needed, the cleared-overlay state guards
 	 * itself.
+	 *
+	 * **Invariant: every staged overlay resolves to an underlying table here.** The
+	 * table-lifecycle hooks are what keep that true — {@link destroy} drops the
+	 * overlays of a dropped table across every connection, and {@link renameTable}
+	 * re-connects the underlying under the new name whenever it re-keys an overlay
+	 * onto it. A miss is therefore a layer-invariant violation, not a routine
+	 * condition, and is raised as `StatusCode.INTERNAL`: the alternative — dropping
+	 * the staged rows and letting the commit report success — is silent data loss.
+	 * Only a CLEAN overlay (`hasChanges === false`) may miss harmlessly; it staged
+	 * nothing, so it is simply discarded.
 	 */
 	async commitConnectionOverlays(db: Database): Promise<void> {
 		const prefix = `${this.getDbId(db)}:`;
 		const entries: { key: string; state: ConnectionOverlayState; underlyingTable: VirtualTable }[] = [];
+		/** Clean overlays with no underlying — never applied, but must still be cleared. */
+		const orphanedCleanKeys: string[] = [];
 		for (const [key, state] of this.connectionOverlays.entries()) {
 			if (!key.startsWith(prefix)) continue;
 			// A poisoned overlay can neither be flushed nor merged (its rows are in the
@@ -431,7 +462,19 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			// exactly the `underlyingTables` key (both lowercased).
 			const underlyingKey = key.slice(prefix.length);
 			const underlyingState = this.underlyingTables.get(underlyingKey);
-			if (!underlyingState) continue; // no underlying to flush (defensive)
+			if (!underlyingState) {
+				if (state.hasChanges) {
+					throw new QuereusError(
+						`Isolation layer: staged overlay '${key}' has no underlying table '${underlyingKey}' to flush. `
+						+ `A table-lifecycle hook (destroy / renameTable) failed to keep the overlay and underlying maps in step.`,
+						StatusCode.INTERNAL,
+					);
+				}
+				// Staged nothing, so nothing is lost. It never reaches `entries`, so the
+				// clear-loop below would not see it — collect it explicitly or it leaks.
+				orphanedCleanKeys.push(key);
+				continue;
+			}
 			entries.push({ key, state, underlyingTable: underlyingState.underlyingTable });
 		}
 
@@ -463,11 +506,16 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		}
 
 		// Clear every overlay for this db — the transaction's staged state is now
-		// durable (or was empty). Subsequent IsolatedConnection.commit()s in the loop
-		// find no overlay and no-op. Pre-overlay savepoint sets are cleared per table
-		// by each connection's onConnectionCommit (which also covers a table that has
-		// savepoints but never got an overlay).
+		// durable (or was empty). Every key cleared here was either applied above
+		// (`hasChanges`) or staged nothing; a staged overlay that could not be applied
+		// threw INTERNAL before Phase 1 and never reaches this point. Subsequent
+		// IsolatedConnection.commit()s in the loop find no overlay and no-op. Pre-overlay
+		// savepoint sets are cleared per table by each connection's onConnectionCommit
+		// (which also covers a table that has savepoints but never got an overlay).
 		for (const { key } of entries) {
+			this.connectionOverlays.delete(key);
+		}
+		for (const key of orphanedCleanKeys) {
 			this.connectionOverlays.delete(key);
 		}
 	}
@@ -694,7 +742,24 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Destroys the underlying table.
+	 * Destroys the underlying table and discards every connection's staged state for it.
+	 *
+	 * DROP TABLE is not transaction-scoped: the table is gone for *every* connection the
+	 * moment this returns, so any overlay staging writes against it — the dropping
+	 * connection's or another's — can never be flushed. Discarding those rows is the
+	 * correct outcome, but it must happen *because we deliberately dropped them here*,
+	 * not because `commitConnectionOverlays` missed an `underlyingTables` lookup and
+	 * silently skipped the flush. That miss is now an INTERNAL error (see
+	 * {@link commitConnectionOverlays}), so this cleanup is what keeps DROP TABLE legal.
+	 *
+	 * Both maps are keyed `<dbId>:<schema>.<table>`, so the sweep spans all db ids. The
+	 * `preOverlaySavepoints` set is dropped alongside: without this it outlived the table
+	 * for the lifetime of the `Database` (nothing else is keyed to reap it once the table
+	 * is gone).
+	 *
+	 * Cleared BEFORE delegating, mirroring the pre-existing `removeUnderlyingState`
+	 * ordering: a throwing `underlying.destroy` leaves the table's state evicted either
+	 * way, and the next `connect()` re-resolves it from the underlying.
 	 */
 	async destroy(
 		db: Database,
@@ -703,6 +768,12 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		schemaName: string,
 		tableName: string
 	): Promise<void> {
+		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
+			this.connectionOverlays.delete(key);
+		}
+		for (const key of this.connectionScopedKeys(this.preOverlaySavepoints, schemaName, tableName)) {
+			this.preOverlaySavepoints.delete(key);
+		}
 		this.removeUnderlyingState(schemaName, tableName);
 		await this.underlying.destroy(db, pAux, moduleName, schemaName, tableName);
 	}
@@ -786,17 +857,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const updatedSchema = state?.underlyingTable.tableSchema;
 		if (!updatedSchema) return;
 
-		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
-		for (const [key, overlayState] of this.connectionOverlays.entries()) {
-			if (key.endsWith(suffix)) {
-				// A poisoned overlay (cross-connection ALTER) holds rows in the pre-alter column
-				// layout, narrower/wider than `updatedSchema`. Rebuilding it here would copy
-				// layout-mismatched rows AND drop the poison flag (the new state carries none),
-				// silently un-poisoning a connection that must still roll back. Leave it as-is.
-				if (overlayState.poison) continue;
-				const newState = await this.migrateOverlayForDropIndex(db, overlayState, updatedSchema);
-				this.connectionOverlays.set(key, newState);
-			}
+		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
+			const overlayState = this.connectionOverlays.get(key)!;
+			// A poisoned overlay (cross-connection ALTER) holds rows in the pre-alter column
+			// layout, narrower/wider than `updatedSchema`. Rebuilding it here would copy
+			// layout-mismatched rows AND drop the poison flag (the new state carries none),
+			// silently un-poisoning a connection that must still roll back. Leave it as-is.
+			if (overlayState.poison) continue;
+			const newState = await this.migrateOverlayForDropIndex(db, overlayState, updatedSchema);
+			this.connectionOverlays.set(key, newState);
 		}
 	}
 
@@ -866,12 +935,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// left for its owning connection to error on, while the issuer's ALTER proceeds.
 		// Already-poisoned overlays (own or foreign) are skipped entirely: they hold rows
 		// from before an earlier ALTER, stay poisoned, and must not be re-read/migrated.
-		const suffix = `:${schemaName}.${tableName}`.toLowerCase();
 		const ownKey = this.makeConnectionOverlayKey(db, schemaName, tableName);
 		let ownEntry: [string, ConnectionOverlayState] | undefined;
 		const foreign: [string, ConnectionOverlayState][] = [];
-		for (const [key, state] of this.connectionOverlays.entries()) {
-			if (!key.endsWith(suffix)) continue;
+		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
+			const state = this.connectionOverlays.get(key)!;
 			// An already-poisoned overlay (from an earlier ALTER) holds pre-alter rows and must
 			// never be re-read or migrated — checked BEFORE the ownKey split so the poisoned
 			// connection's OWN later ALTER cannot route its overlay through migration, which
@@ -977,6 +1045,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Done in this order so a failure in the underlying rename leaves our
 	 * internal maps untouched (the engine will not update the schema catalog
 	 * if this method throws).
+	 *
+	 * **Why the underlying is re-connected, not re-keyed.** A rename mid-transaction
+	 * moves any staged overlay onto the new name, and `commitConnectionOverlays`
+	 * resolves an overlay's underlying by that name. Simply re-keying
+	 * `underlyingTables` old→new would be cheaper, but the cached `VirtualTable` may
+	 * be dead: `StoreModule.renameTable` closes and re-opens the store, so the stale
+	 * handle yields "store is closed". So we evict it and, when an overlay was
+	 * carried onto the new name, immediately connect a fresh underlying under that
+	 * name — otherwise the transaction commits against a table that is in neither
+	 * map, and the overlay's rows vanish (see {@link commitConnectionOverlays}'s
+	 * invariant). With no overlay carried over there is nothing to flush, so the
+	 * eviction alone is enough and the next `connect()` re-resolves lazily.
 	 */
 	async renameTable(
 		db: Database,
@@ -984,6 +1064,12 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		oldName: string,
 		newName: string,
 	): Promise<void> {
+		// Read the catalog entry BEFORE anything mutates: `runtime/emit/alter-table.ts`
+		// calls this hook ahead of the catalog swap, so the table is still registered
+		// under `oldName` here. It carries the vtab module name / args that
+		// `reconnectUnderlyingAfterRename` needs — the hook's own signature has neither.
+		const preRenameSchema = db.schemaManager.getTable(schemaName, oldName);
+
 		if (this.underlying.renameTable) {
 			await this.underlying.renameTable(db, schemaName, oldName, newName);
 		}
@@ -991,40 +1077,84 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// Drop our cached underlying VirtualTable for the old name. It may have
 		// been disconnected by the underlying module (e.g. StoreModule closes
 		// and re-opens stores during rename), so reusing it would yield "store
-		// is closed" errors. The next connect() under the new name will fetch a
-		// fresh underlying table from the underlying module.
+		// is closed" errors.
 		this.removeUnderlyingState(schemaName, oldName);
 
 		// Re-key per-connection overlay and savepoint state, preserving the
 		// connection-id prefix so overlays created earlier in an open
 		// transaction remain visible under the new name.
-		this.rekeyConnectionScopedMap(this.connectionOverlays, schemaName, oldName, newName);
+		const movedOverlays = this.rekeyConnectionScopedMap(this.connectionOverlays, schemaName, oldName, newName);
+		// NOTE: re-keying the savepoint set here strands it. The registered connection's
+		// callback object is the IsolatedTable built under the OLD name, so its
+		// onConnectionCommit/Rollback clears `<dbId>:<schema>.<oldName>` and the moved
+		// `<newName>` set survives the transaction, to be re-read by the next one. Tracked
+		// in fix/iso-preoverlay-savepoints-stranded-by-rename.
 		this.rekeyConnectionScopedMap(this.preOverlaySavepoints, schemaName, oldName, newName);
+
+		if (movedOverlays > 0) {
+			await this.reconnectUnderlyingAfterRename(db, schemaName, newName, preRenameSchema);
+		}
+	}
+
+	/**
+	 * Connects a fresh underlying table under the post-rename name and records it in
+	 * `underlyingTables`, restoring the "every staged overlay resolves to an underlying"
+	 * invariant that {@link renameTable}'s eviction would otherwise break.
+	 *
+	 * `preRenameSchema` is the catalog's pre-rename `TableSchema`; it is cloned under the
+	 * new name so the underlying module sees the same column layout, PK, and vtab args it
+	 * was created with. `pAux` is passed as `undefined`: the aux data the engine hands
+	 * `IsolationModule.connect()` belongs to *this* wrapper's registration, not the
+	 * underlying's, and both bundled underlyings (`MemoryTableModule`, `StoreModule`)
+	 * ignore the parameter — the same assumption `connect()` already relies on when it
+	 * forwards its own caller's `pAux` straight through.
+	 */
+	private async reconnectUnderlyingAfterRename(
+		db: Database,
+		schemaName: string,
+		newName: string,
+		preRenameSchema: TableSchema | undefined,
+	): Promise<void> {
+		if (!preRenameSchema) {
+			throw new QuereusError(
+				`Isolation layer: cannot re-resolve underlying table for renamed '${schemaName}.${newName}' — `
+				+ `no catalog entry for the pre-rename name, and a staged overlay depends on it.`,
+				StatusCode.INTERNAL,
+			);
+		}
+		const renamedSchema: TableSchema = { ...preRenameSchema, name: newName };
+		const underlyingTable = await this.underlying.connect(
+			db,
+			undefined,
+			preRenameSchema.vtabModuleName,
+			schemaName,
+			newName,
+			preRenameSchema.vtabArgs ?? {},
+			renamedSchema,
+		);
+		this.setUnderlyingState(schemaName, newName, { underlyingTable });
 	}
 
 	/**
 	 * Re-keys all entries of a connection-scoped map (`<dbId>:<schema>.<table>`)
 	 * from oldName to newName, leaving entries for other tables untouched.
+	 * Returns how many entries moved.
 	 */
 	private rekeyConnectionScopedMap<V>(
 		map: Map<string, V>,
 		schemaName: string,
 		oldName: string,
 		newName: string,
-	): void {
-		const oldSuffix = `:${schemaName}.${oldName}`.toLowerCase();
+	): number {
+		const oldSuffixLength = `:${schemaName}.${oldName}`.length;
 		const newSuffix = `:${schemaName}.${newName}`.toLowerCase();
-		const moved: Array<[string, V]> = [];
-		for (const [key, value] of map.entries()) {
-			if (key.endsWith(oldSuffix)) {
-				const prefix = key.substring(0, key.length - oldSuffix.length);
-				moved.push([`${prefix}${newSuffix}`, value]);
-				map.delete(key);
-			}
+		const oldKeys = this.connectionScopedKeys(map, schemaName, oldName);
+		for (const oldKey of oldKeys) {
+			const value = map.get(oldKey)!;
+			map.delete(oldKey);
+			map.set(`${oldKey.substring(0, oldKey.length - oldSuffixLength)}${newSuffix}`, value);
 		}
-		for (const [newKey, value] of moved) {
-			map.set(newKey, value);
-		}
+		return oldKeys.length;
 	}
 
 	/**
