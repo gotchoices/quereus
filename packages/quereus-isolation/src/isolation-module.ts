@@ -236,6 +236,14 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// from the underlying. Evict only on success: a thrown attach leaves the
 		// prior flavor (and its still-valid cache) intact, and the failure-cleanup
 		// path is `discardBackingForAttach`, which evicts in its own right.
+		//
+		// NOTE: these three seams evict `underlyingTables` without touching
+		// `connectionOverlays`, unlike `destroy()`. That is safe only because writes to a
+		// materialized-view backing table are privileged and bypass the overlay, so no
+		// overlay is ever staged against a table that crosses a seam. If a seam ever runs
+		// on a table an open transaction has staged writes for, `commitConnectionOverlays`
+		// will raise its INTERNAL invariant error — give the seams the same overlay sweep
+		// `destroy()` performs.
 		const underlyingEnsure = this.underlying.ensureBackingForAttach;
 		if (underlyingEnsure) {
 			this.ensureBackingForAttach = async (db, schemaName, tableName, backingSchema) => {
@@ -378,8 +386,8 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Returns every key of a connection-scoped map (`<dbId>:<schema>.<table>`, the
 	 * shape of {@link connectionOverlays} / {@link preOverlaySavepoints} /
 	 * {@link connectionInFlight}) that belongs to `schemaName.tableName`, across ALL
-	 * db ids. Both maps embed the db id as a prefix, so a per-table sweep is a suffix
-	 * match on `:<schema>.<table>`.
+	 * db ids. Those maps embed the db id as a prefix, so a per-table sweep is a suffix
+	 * match on `:<schema>.<table>`. Keys are stored lowercased, so the suffix is too.
 	 *
 	 * The keys are materialized into an array rather than yielded, so callers may
 	 * delete or re-key entries while walking the result.
@@ -757,9 +765,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * for the lifetime of the `Database` (nothing else is keyed to reap it once the table
 	 * is gone).
 	 *
-	 * Cleared BEFORE delegating, mirroring the pre-existing `removeUnderlyingState`
-	 * ordering: a throwing `underlying.destroy` leaves the table's state evicted either
-	 * way, and the next `connect()` re-resolves it from the underlying.
+	 * Nothing is discarded until the underlying destroy SUCCEEDS. A throwing
+	 * `underlying.destroy` means the table still exists, so every connection's staged
+	 * writes are still flushable and every map entry must survive untouched — the same
+	 * reason {@link renameTable} delegates before mutating its maps.
 	 */
 	async destroy(
 		db: Database,
@@ -768,14 +777,14 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		schemaName: string,
 		tableName: string
 	): Promise<void> {
+		await this.underlying.destroy(db, pAux, moduleName, schemaName, tableName);
+		this.removeUnderlyingState(schemaName, tableName);
 		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
 			this.connectionOverlays.delete(key);
 		}
 		for (const key of this.connectionScopedKeys(this.preOverlaySavepoints, schemaName, tableName)) {
 			this.preOverlaySavepoints.delete(key);
 		}
-		this.removeUnderlyingState(schemaName, tableName);
-		await this.underlying.destroy(db, pAux, moduleName, schemaName, tableName);
 	}
 
 	/**
@@ -1103,11 +1112,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 *
 	 * `preRenameSchema` is the catalog's pre-rename `TableSchema`; it is cloned under the
 	 * new name so the underlying module sees the same column layout, PK, and vtab args it
-	 * was created with. `pAux` is passed as `undefined`: the aux data the engine hands
+	 * was created with.
+	 *
+	 * NOTE: `pAux` is passed as `undefined`: the aux data the engine hands
 	 * `IsolationModule.connect()` belongs to *this* wrapper's registration, not the
 	 * underlying's, and both bundled underlyings (`MemoryTableModule`, `StoreModule`)
 	 * ignore the parameter — the same assumption `connect()` already relies on when it
-	 * forwards its own caller's `pAux` straight through.
+	 * forwards its own caller's `pAux` straight through. If a third-party underlying ever
+	 * reads `pAux` in `connect()`, `IsolationModule` must capture the underlying's own aux
+	 * data at registration and hand it back here.
 	 */
 	private async reconnectUnderlyingAfterRename(
 		db: Database,
@@ -1146,7 +1159,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		oldName: string,
 		newName: string,
 	): number {
-		const oldSuffixLength = `:${schemaName}.${oldName}`.length;
+		// Length of the LOWERCASED suffix: keys are stored lowercased, and case folding is
+		// not always length-preserving (`'İ'.toLowerCase()` is two code units).
+		const oldSuffixLength = `:${schemaName}.${oldName}`.toLowerCase().length;
 		const newSuffix = `:${schemaName}.${newName}`.toLowerCase();
 		const oldKeys = this.connectionScopedKeys(map, schemaName, oldName);
 		for (const oldKey of oldKeys) {

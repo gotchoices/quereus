@@ -1288,6 +1288,37 @@ describe('IsolationModule', () => {
 			expect(merged.map((r: any) => [r.id, r.name])).to.deep.equal([[1, 'a']]);
 		});
 
+		it('a mid-transaction RENAME TO preserves rows committed before the transaction', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec(`insert into widget values (1, 'before')`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into widget values (2, 'staged')`);
+			await db.exec(`alter table widget rename to gadget`);
+			await db.exec(`commit`);
+
+			// The re-connected underlying must be the SAME storage the pre-transaction row
+			// lives in, not a fresh empty table: `underlying.renameTable` re-keys the storage
+			// first, so `connect()` under the new name resolves the existing one.
+			expect(await underlyingRows('gadget')).to.deep.equal([[1, 'before'], [2, 'staged']]);
+			expect(overlayKeys()).to.deep.equal([]);
+		});
+
+		it('two RENAME TOs in one transaction still flush the staged rows', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec(`begin`);
+			await db.exec(`insert into widget values (1, 'a')`);
+			await db.exec(`alter table widget rename to gadget`);
+			await db.exec(`insert into gadget values (2, 'b')`);
+			await db.exec(`alter table gadget rename to doohickey`);
+			await db.exec(`commit`);
+
+			// The second rename re-connects off the underlying the FIRST one registered, so the
+			// chain has to survive an evict/re-connect at every hop.
+			expect(await underlyingRows('doohickey')).to.deep.equal([[1, 'a'], [2, 'b']]);
+			expect(overlayKeys()).to.deep.equal([]);
+		});
+
 		it('a mid-transaction RENAME TO of a table with no staged writes leaves storage intact', async () => {
 			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
 			await db.exec(`insert into widget values (1, 'a')`);
@@ -1355,6 +1386,36 @@ describe('IsolationModule', () => {
 			// place, that overlay would trip the new INTERNAL guard at the foreign commit.
 			expect(overlayKeys(), 'destroy() sweeps overlays across all db ids').to.deep.equal([]);
 			await other.close();
+		});
+
+		it('a failed underlying destroy leaves the overlay and underlying maps untouched', async () => {
+			await db.exec(`create table widget (id integer primary key, name text) using isolated`);
+			await db.exec(`begin`);
+			await db.exec(`insert into widget values (1, 'a')`);
+			expect(overlayKeys().length).to.equal(1);
+
+			// The table still exists after a failed destroy, so its staged writes are still
+			// flushable — discarding them (or evicting the underlying) before the underlying
+			// module has agreed to the drop would lose them for good.
+			const underlying = (iso as unknown as { underlying: MemoryTableModule }).underlying;
+			const realDestroy = underlying.destroy.bind(underlying);
+			underlying.destroy = async () => { throw new Error('storage refused the drop'); };
+			let caught: unknown;
+			try {
+				await db.exec(`drop table widget`);
+			} catch (e) {
+				caught = e;
+			} finally {
+				underlying.destroy = realDestroy;
+			}
+			expect(caught, 'the failed drop propagates').to.not.be.undefined;
+
+			expect(overlayKeys().length, 'staged overlay survives a failed drop').to.equal(1);
+			expect(iso.getUnderlyingState('main', 'widget'), 'underlying handle survives a failed drop')
+				.to.not.be.undefined;
+
+			await db.exec(`commit`);
+			expect(await underlyingRows('widget')).to.deep.equal([[1, 'a']]);
 		});
 
 		it('commitConnectionOverlays throws INTERNAL for a staged overlay with no underlying', async () => {
