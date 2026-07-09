@@ -626,6 +626,14 @@ Ops outside the seek family (`IS NULL`, `IS NOT NULL`, `LIKE`, `GLOB`, `MATCH`,
 taken at its word — claim only when the predicate is tautological over the rows you
 return (the memory module's `IS NOT NULL` on a `NOT NULL` column).
 
+Which seek-family filters the rule *can* consume is further shaped by the seek encodings.
+Seek keys are positional, so a standalone range bound is only ever seeked on the
+**leading** seek column; a range on a later seek column requires the prefix-range
+encoding, which needs every preceding seek column pinned by a single-valued equality. A
+multi-value `IN` is not a single-valued prefix key, so `a in (1, 2) and b > 15` over an
+index on `(a, b)` declines to a sequential scan with both predicates as residuals rather
+than seeking `b`'s bound against `a`.
+
 ### Debugging and Tracing
 
 The optimizer provides comprehensive debugging support:

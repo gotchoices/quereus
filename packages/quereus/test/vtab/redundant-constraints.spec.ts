@@ -62,6 +62,23 @@ describe('redundant same-column constraints keep their predicate (memory vtab)',
 			expect(await ids('select id from t where id > 10 and id < 40 order by id')).to.deep.equal([20, 30]);
 			expect(await planOps('select id from t where id > 10 and id < 40')).to.match(/IndexSeek/i);
 		});
+
+		// Claim-tightness floor: with the planner's safety net in place, a module that
+		// over-claims still yields correct rows — only the plan shape betrays it. Pin
+		// the shape so a regression in the module's positional claim is caught here and
+		// not silently absorbed by `reattachUnconsumedConstraints`.
+		it('a non-redundant bound seeks with no residual filter', async () => {
+			expect(await planOps('select id from t where id > 10')).to.not.match(/Filter/i);
+			expect(await planOps('select id from t where id > 10 and id < 40')).to.not.match(/Filter/i);
+		});
+
+		it('a redundant bound is re-applied as exactly one residual filter', async () => {
+			const ops: string[] = [];
+			for await (const row of db.eval('select op from query_plan(?)', ['select id from t where id > 10 and id > 30'])) {
+				ops.push(row.op as string);
+			}
+			expect(ops.filter(op => /^filter$/i.test(op))).to.have.lengthOf(1);
+		});
 	});
 
 	describe('bounds on a secondary index column', () => {
@@ -91,6 +108,47 @@ describe('redundant same-column constraints keep their predicate (memory vtab)',
 			expect(await ids('select id from t where v > 10 and v < 40 order by id')).to.deep.equal([2, 3]);
 			expect(await planOps('select id from t where v > 10 and v < 40')).to.match(/IndexSeek/i);
 		});
+
+		it('a non-redundant bound seeks with no residual filter', async () => {
+			expect(await planOps('select id from t where v > 10')).to.not.match(/Filter/i);
+			expect(await planOps('select id from t where v > 10 and v < 40')).to.not.match(/Filter/i);
+		});
+
+		// `IN` and `OR_RANGE` are seek-family ops the rule consumes at most once per
+		// column, so a redundant second one must come back as a residual too.
+		it('a redundant IN pair intersects rather than dropping one side', async () =>
+			expect(await ids('select id from t where v in (10, 20) and v in (20, 30) order by id')).to.deep.equal([2]));
+
+		it('an IN alongside a contradicting equality yields no rows', async () =>
+			expect(await ids('select id from t where v in (10, 20) and v = 30')).to.deep.equal([]));
+
+		it('a redundant OR_RANGE pair intersects rather than dropping one side', async () =>
+			expect(await ids('select id from t where (v < 15 or v > 35) and (v < 12 or v > 38) order by id')).to.deep.equal([1, 4]));
+	});
+
+	// An index on `(a, b)` whose leading column is pinned by a MULTI-VALUE `IN` is not a
+	// seekable prefix (the rule's prefix key must be a single value), so a bound on `b`
+	// cannot be seeked either — the seek keys are positional and the runtime would apply
+	// `b`'s bound to `a`. The rule must decline to a scan and keep both predicates.
+	describe('multi-value IN prefix with a trailing range on a composite index', () => {
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table t (a integer, b integer, id integer primary key) using memory');
+			await db.exec('create index ix_ab on t (a, b)');
+			await db.exec('insert into t values (1, 10, 1), (1, 20, 2), (2, 10, 3), (2, 20, 4), (3, 10, 5)');
+		});
+
+		it('applies both the IN prefix and the trailing bound', async () =>
+			expect(await ids('select id from t where a in (1, 2) and b > 15 order by id')).to.deep.equal([2, 4]));
+
+		it('a single-value IN prefix still seeks the trailing bound', async () =>
+			expect(await ids('select id from t where a in (1) and b > 15 order by id')).to.deep.equal([2]));
+
+		it('an equality prefix still seeks the trailing bound', async () =>
+			expect(await ids('select id from t where a = 1 and b > 15 order by id')).to.deep.equal([2]));
+
+		it('a multi-value IN prefix with a trailing equality is unaffected', async () =>
+			expect(await ids('select id from t where a in (1, 2) and b = 20 order by id')).to.deep.equal([2, 4]));
 	});
 
 	// A composite primary key with a redundant equality on its leading column: the

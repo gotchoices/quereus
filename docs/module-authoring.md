@@ -171,13 +171,17 @@ residual `Filter`. The planner defends itself against an over-claim by reattachi
 seek-family filter it did not consume, so an over-claiming module costs a redundant
 filter, not a wrong answer.
 
-Two corollaries worth spelling out:
+Three corollaries worth spelling out:
 
 - **Count distinct columns, not filters.** `a = 1 and a = 2` on a composite primary key
   `(a, b)` is *not* a full key match. Deduplicate by `columnIndex` before deciding that
   every key column is pinned.
 - **Only claim what you can seek.** A range on a non-leading key column, for instance,
   is not turned into a bound; leave it unhandled.
+- **A range bound is seeked only on the leading seek column.** A range on a later seek
+  column is usable only as the trailing bound of a prefix seek, and only when every
+  preceding seek column is pinned by a *single-valued* equality (`a = 1`, or `a in (1)`
+  — not `a in (1, 2)`). Otherwise the planner declines the seek entirely and scans.
 
 **When to use**: Most modules (in-memory tables, file-based storage, traditional indexes).
 

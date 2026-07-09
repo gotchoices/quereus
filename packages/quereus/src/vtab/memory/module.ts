@@ -490,7 +490,15 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 				.build();
 		}
 
-		// Prefix-equality + trailing-range on composite indexes
+		// Prefix-equality + trailing-range on composite indexes.
+		//
+		// NOTE: `findEqualityMatches` counts a multi-value `IN` as a prefix match, but
+		// `rule-select-access-path` can only seek a *single-valued* prefix key, so for
+		// e.g. `a in (1, 2) and b > 15` it declines to a sequential scan and reattaches
+		// both predicates as a residual. Correct, but the cost advertised below is a
+		// range scan. If multi-value-IN prefixes with trailing ranges ever show up as
+		// slow plans, teach the rule a cross-product prefix-range seek (or stop claiming
+		// the trailing range here so the estimate matches the plan).
 		if (equalityMatches.matchCount > 0 && equalityMatches.matchCount < indexCols.length) {
 			const trailingCol = indexCols[equalityMatches.matchCount];
 			const trailingRange = this.findRangeMatch(trailingCol, request.filters);

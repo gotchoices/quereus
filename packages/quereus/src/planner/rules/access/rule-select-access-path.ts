@@ -174,7 +174,14 @@ function createIndexBasedAccess(retrieveNode: RetrieveNode, context: OptContext)
 	// Choose physical node based on access plan
 	const physicalLeaf: RelationalPlanNode = selectPhysicalNode(retrieveNode.tableRef, accessPlan, constraints);
 
-	// If the Retrieve source contained a pipeline (e.g., Filter/Sort/Project), rebuild it above the physical leaf
+	// If the Retrieve source contained a pipeline (e.g., Filter/Sort/Project), rebuild it above the physical leaf.
+	//
+	// NOTE: on this path (no index-style moduleCtx) an absorbed `Filter` in `source` is
+	// preserved verbatim, so a constraint that `reattachUnconsumedConstraints` recovers is
+	// already applied above — the reattached `Filter` is then redundant, not wrong. Only
+	// reachable for a module exposing BOTH `supports()` (declining here) and
+	// `getBestAccessPlan()`. If that ever shows up as a duplicated predicate in EXPLAIN,
+	// pass the consumed set out and skip the reattach when `source !== tableRef`.
 	let rebuiltPipeline: RelationalPlanNode = physicalLeaf;
 	if (retrieveNode.source !== retrieveNode.tableRef) {
 		log('Rebuilding Retrieve pipeline above physical access node');
@@ -719,9 +726,19 @@ function selectPhysicalNodeFromPlan(
 		}
 	}
 
-	// Check for range constraints on the seek columns
-	// Use the first (or only) seek column that has range constraints
-	const rangeCol = seekCols.find(colIdx => findLower(colIdx) || findUpper(colIdx));
+	// Check for range constraints on the LEADING seek column only. A standalone range
+	// seek emits its bounds positionally into `seekKeys` and the runtime applies them to
+	// the index's leading column, so a range on a *later* seek column is usable only via
+	// the prefix-range path above — which requires every preceding seek column to be
+	// pinned by a single-valued equality. Picking a later column here would bound the
+	// leading column with the wrong value and silently drop rows (`a in (1,2) and b > 15`
+	// over an index on `(a, b)`: the multi-value IN is not a prefix key, so `b`'s bound
+	// would be seeked against `a`). When the leading column carries no bound we decline;
+	// `reattachUnconsumedConstraints` re-applies the claimed range as a residual.
+	const leadingSeekCol = seekCols[0];
+	const rangeCol = (leadingSeekCol !== undefined && (findLower(leadingSeekCol) || findUpper(leadingSeekCol)))
+		? leadingSeekCol
+		: undefined;
 
 	if (rangeCol !== undefined) {
 		const lower = findLower(rangeCol);
@@ -910,8 +927,10 @@ function selectPhysicalNodeLegacy(
 	constraints.forEach((c, i) => {
 		if (accessPlan.handledFilters[i] === true) handledByCol.add(c.columnIndex);
 	});
-	const eqHandled = constraints.filter(c => c.op === '=');
-	const hasEqualityConstraints = eqHandled.length > 0;
+	// Every '=' constraint, handled or not: an unhandled one still makes a sound seek key
+	// (grow-retrieve keeps it in the residual), so it may complete a PK cover.
+	const eqConstraints = constraints.filter(c => c.op === '=');
+	const hasEqualityConstraints = eqConstraints.length > 0;
 	const hasRangeConstraints = constraints.some(c => ['>', '>=', '<', '<='].includes(c.op) && handledByCol.has(c.columnIndex));
 
 	const maybeRows = accessPlan.rows || 0;
@@ -920,7 +939,7 @@ function selectPhysicalNodeLegacy(
 	// `docs/module-authoring.md` state. Keeping the last would seek on a constraint a
 	// module claiming positionally never expected to be consumed.
 	const eqByCol = new Map<number, PlannerPredicateConstraint>();
-	for (const c of eqHandled) if (!eqByCol.has(c.columnIndex)) eqByCol.set(c.columnIndex, c);
+	for (const c of eqConstraints) if (!eqByCol.has(c.columnIndex)) eqByCol.set(c.columnIndex, c);
 	const coversPk = pkCols.length > 0 && pkCols.every(pk => eqByCol.has(pk.index));
 	const treatAsHandledPk = coversPk && pkCols.every(pk => handledByCol.has(pk.index) || eqByCol.has(pk.index));
 
@@ -984,15 +1003,19 @@ function selectPhysicalNodeLegacy(
 		return cover.residual ? new FilterNode(tableRef.scope, pkSeek, cover.residual) : pkSeek;
 	}
 
-	if (hasRangeConstraints) {
-		const rangeCols = constraints
-			.filter(c => ['>', '>=', '<', '<='].includes(c.op) && handledByCol.has(c.columnIndex))
-			.sort((a, b) => a.columnIndex - b.columnIndex);
+	const rangeCols = constraints
+		.filter(c => ['>', '>=', '<', '<='].includes(c.op) && handledByCol.has(c.columnIndex))
+		.sort((a, b) => a.columnIndex - b.columnIndex);
+	const primaryFirstCol = (tableRef.tableSchema.primaryKeyDefinition?.[0]?.index) ?? (rangeCols[0]?.columnIndex ?? 0);
+	const lower = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '>' || c.op === '>='));
+	const upper = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '<' || c.op === '<='));
 
-		const primaryFirstCol = (tableRef.tableSchema.primaryKeyDefinition?.[0]?.index) ?? (rangeCols[0]?.columnIndex ?? 0);
-		const lower = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '>' || c.op === '>='));
-		const upper = rangeCols.find(c => c.columnIndex === primaryFirstCol && (c.op === '<' || c.op === '<='));
-
+	// A PK range seek needs at least one bound on the LEADING PK column: seek keys are
+	// positional and the runtime walks the primary key. When every handled range sits on
+	// a later PK column there is nothing to seek with, and a zero-key `IndexSeekNode`
+	// would be a full index walk dressed up as a seek. Decline instead — the claimed
+	// range comes back as a residual via `reattachUnconsumedConstraints`.
+	if (hasRangeConstraints && (lower || upper)) {
 		// Both arms below return, consuming the first lower/upper bound on the leading
 		// PK column — as seek bounds, or (on a collation decline) as the scan residual.
 		if (lower) consumed.add(lower);
