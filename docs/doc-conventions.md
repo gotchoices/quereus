@@ -1,0 +1,105 @@
+# Documentation Conventions
+
+How to write and maintain the design docs under `docs/`. Two mechanical gates back this
+document: `yarn docs:check` (`scripts/check-docs.mjs`) fails the build on a broken link and
+on a doc that has grown past its recorded size.
+
+The problem this exists to prevent: two docs reached 38,000 and 28,500 words. At that size
+nobody re-reads a doc against the code, so it drifts, and a doc that has drifted is worse
+than no doc — it confidently tells the next developer something false.
+
+## The three vocabularies
+
+Almost every sentence in a topic doc is one of three things. They have different lifetimes
+and different homes, and mixing them is what makes a doc unmaintainable.
+
+**Normative invariant** — a statement the *code* must satisfy. Violating it is a bug, not a
+missed optimization, and you can check it against the implementation by reading one file.
+
+> Every registered optimizer rule declares `sideEffectMode`, and the registry rejects one
+> that does not (`validateSideEffectMode`, `planner/framework/registry.ts`).
+
+**Rationale** — why the design is shaped this way, including why *not* the alternatives.
+Not checkable against code, but load-bearing: it stops the next person re-litigating a
+settled call.
+
+> "There is exactly one maintenance model — row-time — and no refresh-policy knob… The
+> user never reasons about *when* the view is consistent." (`materialized-views.md`)
+
+**Narrative history** — how the code got here. To a reader who does not already know it is
+a changelog entry, it reads as current truth.
+
+> "Historically 'same module ⇒ one atomic commit' did **not** hold even within the store
+> module — a per-store `batch()` loop could tear a source and backing apart…"
+> (`materialized-views.md`)
+
+## Where each one goes
+
+| Kind | Home |
+| --- | --- |
+| Normative invariant | The repo-wide register, `docs/invariants.md` |
+| Rationale | The topic doc, including a `### Rejected alternatives` section |
+| Narrative history | **Nowhere.** Delete it. |
+| Future / planned work | `docs/todo.md`, or a ticket in `tickets/backlog/` |
+
+**History is deleted, not archived.** Do not create `docs/archive/`. The project already
+keeps two histories — `git log`, and `tickets/complete/`, which holds a written account of
+every change. A third copy is a third thing that has to be kept true, and it will not be.
+
+**The one exception is a rejected alternative.** When a passage says "we now do X; we used
+to do Y" *and* gives the reason Y was wrong, that reason is rationale, not history — nobody
+recovers it by grepping deleted text. Condense it to a single bullet under
+`### Rejected alternatives` in the topic doc, and delete the rest of the passage.
+
+**Future work leaves the docs.** A doc describing an unimplemented capability is
+indistinguishable, to a reader, from a doc that has drifted. Move the passage to
+`docs/todo.md` or a backlog ticket; leave at most a one-line pointer under
+`## Current limitations`.
+
+## The invariant register
+
+`docs/invariants.md` is one file, read end-to-end against the code in one sitting. That is
+the whole point of it — an invariant buried in the middle of a 38,000-word doc is an
+invariant nobody audits.
+
+Copy the shape of an existing entry rather than working from a grammar restated here; the
+checker's Check B is the source of truth. It enforces that each entry:
+
+- has a heading `### <AREA>-<NNN> — <title>`, where `<AREA>` is one of `OPT`, `MV`, `RT`,
+  `SCH`, `SYNC`, `LENS`. IDs are unique, and ascend within an area. Gaps are fine — a
+  retired invariant's number is never reused.
+- carries at least one `code:` line and **exactly one** `guard:` line. `guard: none — <reason>`
+  is legal; a bare `guard: none` is not, because the reason is the point.
+- names, on every `code:` / `guard:` / `doc:` line, a file that exists — and where the line
+  ends in a `` `symbol` ``, a symbol that still appears in that file.
+- states itself in **120 words or fewer**. An invariant you cannot state in 120 words is two
+  invariants, or it is rationale wearing an invariant's clothes.
+
+The checker validates *pointers*, not semantics: it asserts an invariant still names a real
+file and a real symbol, never that the invariant holds. Pointer rot is the drift that
+actually happens; semantic verification is what tests are for.
+
+## The size ratchet
+
+`docs/.doc-budget.json` records each large doc's current word count. A doc may shrink; it
+may never grow past its recorded size. A doc with no entry must come in under `maxWords`
+(12,000 — roughly the largest doc still readable end-to-end in one sitting).
+
+Word count is whitespace-separated tokens over the whole file, fenced code included. A doc
+whose bulk is code samples is just as unreviewable as one whose bulk is prose.
+
+After a doc shrinks, lower its entry — this is expected routine, not an event:
+
+```bash
+node scripts/check-docs.mjs --update-ratchet
+```
+
+It only ever lowers. It refuses to raise or add an entry, and exits non-zero naming the doc
+and the delta; a ratchet you can silently raise is not a ratchet. When a raise is genuinely
+justified — say a convention adds a header line to every topic doc — `--update-ratchet --force`
+will do it, and the commit message must carry a line saying why.
+
+## Frozen artifacts
+
+`docs/review.html` and `docs/review.md` are review artifacts. They describe a past state of
+the codebase **on purpose**, are exempt from every check, and must not be "corrected."

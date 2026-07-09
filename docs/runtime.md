@@ -1434,7 +1434,7 @@ The runtime's column reference resolution relies on the optimizer's attribute ID
 - Runtime column lookup uses attribute IDs, not names or positions
 - This enables robust resolution across arbitrary plan transformations
 
-For comprehensive optimizer details, see the [Optimizer Documentation](../optimizer.md).
+For comprehensive optimizer details, see the [Optimizer Documentation](optimizer.md).
 
 ## ParallelDriver (Runtime Primitive)
 
@@ -1797,8 +1797,6 @@ DEBUG=quereus:runtime:emit:join yarn test
 # Full runtime tracing (verbose)
 DEBUG=quereus:runtime* yarn test
 ```
-
-[Recursive CTE Execution Pattern](./recursive-cte.md)
 
 ### Context Helper Functions
 

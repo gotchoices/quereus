@@ -634,7 +634,7 @@ assignment:
 - `with schema`: Specifies schema search path for resolving table names (see section 2.1.1)
 - `returning`: Returns specified expressions from the inserted rows. `*` (or `table.*`) expands to every table column in declaration order, projecting the NEW (inserted) image; named expressions support the NEW qualifier
 
-**Conflict Resolution (OR clause):**
+#### Conflict Resolution (OR clause)
 
 When inserting a row that would violate a `UNIQUE`, `PRIMARY KEY`, `NOT NULL`, `CHECK`, or `FOREIGN KEY` constraint, the `OR` clause specifies how to handle the conflict:
 

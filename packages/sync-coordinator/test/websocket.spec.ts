@@ -10,7 +10,7 @@ import { rm } from 'node:fs/promises';
 import WebSocket from 'ws';
 import { createCoordinatorServer, loadConfig, type CoordinatorServer } from '../src/index.js';
 
-// Test database ID in <org_id>:<type>_<id> format (see docs/database-sync.md)
+// Test database ID in <org_id>:<type>_<id> format
 const TEST_DATABASE_ID = 'default:s_test-scenario';
 
 // Valid 22-character base64url site IDs (16 bytes each)

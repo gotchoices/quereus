@@ -525,7 +525,7 @@ cover self-referential and cyclic shapes).
 
 **Atomicity Gap (IndexedDB)**: The legacy `IndexedDBModule` uses separate databases per table. The new `UnifiedIndexedDBModule` (Store Phase 7) solves this by placing all tables in a single database with object stores, enabling atomic cross-table transactions via `MultiStoreWriteBatch`.
 
-**Isolation Gap**: Even with correct write ordering, readers may see partially-applied state during sync. True isolation would require Store-level support—see [Future: Store Isolation](#future-store-isolation) below.
+**Isolation Gap**: Even with correct write ordering, readers may see partially-applied state during sync. True isolation would require Store-level support—see [Future: Store Isolation](#store-isolation-store-phase-8---future) below.
 
 ### Single-Database Architecture (Store Phase 7) ✓
 
@@ -1680,7 +1680,7 @@ const syncManager = new SyncManagerImpl(metadataKvStore, storeEvents, applyToSto
 
 #### Store Isolation (Longer-term - Store Phase 8)
 - [ ] Implement isolation in Store module using memory vtab's TransactionLayer pattern
-- [ ] Leverage Store isolation for sync to get true ACID semantics (see [Future: Store Isolation](#future-store-isolation))
+- [ ] Leverage Store isolation for sync to get true ACID semantics (see [Future: Store Isolation](#store-isolation-store-phase-8---future))
 
 #### Advanced Testing
 - [ ] Tombstone TTL expiration and fallback to snapshot
@@ -1697,7 +1697,7 @@ const syncManager = new SyncManagerImpl(metadataKvStore, storeEvents, applyToSto
 
 #### Reusable Sync Client Package (`@quereus/sync-client`) ✅
 
-The WebSocket sync client is now available as a standalone package: [`@quereus/sync-client`](../../quereus-sync-client/).
+The WebSocket sync client is now available as a standalone package: [`@quereus/sync-client`](../packages/quereus-sync-client/).
 
 **Features:**
 - [x] WebSocket connection and handshake (`handshake` → `handshake_ack`)
