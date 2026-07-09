@@ -742,7 +742,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		tableName: string,
 		indexSchema: TableIndexSchema
 	): Promise<void> {
-		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const table = this.getOrReconnectTable(db, schemaName, tableName);
 
 		if (!table) {
@@ -771,7 +770,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const indexStore = await this.provider.getIndexStore(schemaName, tableName, indexSchema.name);
 
 		// Build index entries for existing rows
-		const dataStore = await this.getStore(tableKey, table.getConfig());
+		const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
 		const tableSchema = table.getSchema();
 		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
 		await this.buildIndexEntries(dataStore, indexStore, tableSchema, indexSchema, keyCollation);
@@ -984,12 +983,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	private async rebuildSecondaryIndexes(
 		schemaName: string,
 		tableName: string,
-		tableKey: string,
 		table: StoreTable,
 		schema: TableSchema,
 	): Promise<void> {
 		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
-		const dataStore = await this.getStore(tableKey, table.getConfig());
+		const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
 		for (const indexSchema of schema.indexes ?? []) {
 			const indexStore = await this.getIndexStore(schemaName, tableName, indexSchema.name);
 			const clearBatch = indexStore.batch();
@@ -1065,7 +1063,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		change: SchemaChangeInfo,
 	): Promise<TableSchema> {
 		this.ensureSchemaSubscription(db);
-		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const table = this.getOrReconnectTable(db, schemaName, tableName);
 
 		if (!table) {
@@ -1312,7 +1309,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 				// Secondary index keys embed the PK suffix — clear + rebuild every
 				// index against the now-rekeyed data store.
-				await this.rebuildSecondaryIndexes(schemaName, tableName, tableKey, table, updatedSchema);
+				await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema);
 
 				table.updateSchema(updatedSchema);
 				await this.saveTableDDL(updatedSchema);
@@ -1336,7 +1333,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// (no separate index store), so there is nothing physical to build —
 					// but we must validate the existing rows before persisting.
 					const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
-					const dataStore = await this.getStore(tableKey, table.getConfig());
+					const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
 					await this.validateUniqueOverExistingRows(dataStore, oldSchema, uc);
 					updatedSchema = {
 						...oldSchema,
@@ -1589,7 +1586,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 						.filter(uc => uc.columns.includes(colIndex));
 					if (coveringConstraints.length > 0) {
-						const dataStore = await this.getStore(tableKey, table.getConfig());
+						const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
 						for (const uc of coveringConstraints) {
 							await this.validateUniqueOverExistingRows(dataStore, updatedSchema, uc);
 						}
@@ -1607,7 +1604,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				// carries the new collation, so the new key bytes follow it.
 				if (collationChanged && oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
 					await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
-					await this.rebuildSecondaryIndexes(schemaName, tableName, tableKey, table, updatedSchema);
+					await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema);
 				}
 
 				table.updateSchema(updatedSchema);
@@ -1967,10 +1964,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	/**
 	 * Get or create a data store for a table.
 	 */
-	async getStore(tableKey: string, _config: StoreTableConfig): Promise<KVStore> {
+	async getStore(schemaName: string, tableName: string, _config: StoreTableConfig): Promise<KVStore> {
+		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		let store = this.stores.get(tableKey);
 		if (!store) {
-			const [schemaName, tableName] = tableKey.split('.');
 			store = await this.provider.getStore(schemaName, tableName);
 
 			if (!store) {

@@ -140,7 +140,7 @@ export interface StoreTableConfig {
  */
 export interface StoreTableModule {
 	/** Get the data store for a table. */
-	getStore(tableKey: string, config: StoreTableConfig): Promise<KVStore>;
+	getStore(schemaName: string, tableName: string, config: StoreTableConfig): Promise<KVStore>;
 	/** Get an index store for a table. */
 	getIndexStore(schemaName: string, tableName: string, indexName: string): Promise<KVStore>;
 	/** Get the stats store for a table. */
@@ -464,7 +464,7 @@ export class StoreTable extends VirtualTable {
 		const tableKey = `${this.schemaName}.${this.tableName}`.toLowerCase();
 
 		try {
-			this.store = await this.storeModule.getStore(tableKey, this.config);
+			this.store = await this.storeModule.getStore(this.schemaName, this.tableName, this.config);
 
 			if (!this.store) {
 				throw new Error(`getStore returned null/undefined for ${tableKey}`);

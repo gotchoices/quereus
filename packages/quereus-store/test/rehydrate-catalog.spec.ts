@@ -754,4 +754,39 @@ describe('StoreModule.rehydrateCatalog()', () => {
 
 		await db2.close();
 	});
+
+	// Quoted identifiers may legally contain a dot: table "a.b" composes a
+	// tableKey of 'main.a.b'. StoreModule.getStore used to recover
+	// (schemaName, tableName) by splitting that composite key on '.', which
+	// mis-routed the extra segment — 'main.a.b'.split('.') dropped the 'b'
+	// and opened the physical store for ('main', 'a') instead of ('main', 'a.b').
+	// The bug only surfaced on a `this.stores` cache miss, i.e. the first touch
+	// of a table's store after a fresh StoreModule (reconnect/rehydrate) — so
+	// this test must reopen with a NEW StoreModule instance, not reuse mod1.
+	it('quoted table name containing a dot survives reconnect (tableKey split mis-route)', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+
+		await db1.exec(`CREATE TABLE "a.b" (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+		await db1.exec(`CREATE TABLE "a.c" (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+		await db1.exec(`INSERT INTO "a.b" VALUES (1, 'from-b')`);
+		await db1.exec(`INSERT INTO "a.c" VALUES (1, 'from-c')`);
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed dotted-identifier DDL parses cleanly').to.have.lengthOf(0);
+		expect(result.tables).to.have.lengthOf(2);
+
+		// Each table reads back its own row from its own physical store — not
+		// collapsed onto ('main', 'a') nor onto each other.
+		const bRows = await asyncIterableToArray(db2.eval(`select v from "a.b" where id = 1`));
+		expect(bRows, '"a.b" reads back its own row after reconnect').to.deep.equal([{ v: 'from-b' }]);
+
+		const cRows = await asyncIterableToArray(db2.eval(`select v from "a.c" where id = 1`));
+		expect(cRows, '"a.c" reads back its own row after reconnect').to.deep.equal([{ v: 'from-c' }]);
+	});
 });
