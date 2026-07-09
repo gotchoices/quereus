@@ -52,11 +52,22 @@ export abstract class VirtualTable {
 	public readonly module: AnyVirtualTableModule;
 	public readonly db: Database;
 	/**
-	 * The **bare** table name — never schema-qualified. The engine composes the qualified
-	 * form itself as `` `${schemaName}.${tableName}` `` (~20 sites: database-events.ts,
-	 * key-filter.ts, alter-table.ts, schema/manager.ts, …), so a module that stores a
-	 * qualified name here doubles the schema in every one of them. Modules needing a
-	 * qualified lookup key must derive it, not overload this field.
+	 * The **bare** table name — never schema-qualified. It is the `tableName` the module's
+	 * `create()`/`connect()` was called with, and every consumer that wants the qualified form
+	 * composes `` `${schemaName}.${tableName}` `` itself. A module that stores a qualified name
+	 * here doubles the schema in each of those compositions:
+	 * - `vtab/memory/table.ts` and `quereus-store/src/common/store-table.ts` name the
+	 *   `VirtualTableConnection` they register with the database. The engine matches that name
+	 *   against `<schema>.<table>` when resolving a connection (see
+	 *   `runtime/deferred-constraint-queue.ts`), so a doubled name never matches.
+	 * - `quereus-isolation` keys its per-connection overlays by the pair; a mismatch there used
+	 *   to discard staged rows at commit (`docs/design-isolation-layer.md` § "Table identity").
+	 *
+	 * Modules needing a qualified lookup key must derive it, not overload this field.
+	 *
+	 * NOTE: nothing enforces this at runtime — every in-repo module complies. If third-party
+	 * modules start violating it, assert bareness in the constructor rather than hardening
+	 * each consumer.
 	 */
 	public readonly tableName: string;
 	/** The schema (database) this table lives in, e.g. `main`. */

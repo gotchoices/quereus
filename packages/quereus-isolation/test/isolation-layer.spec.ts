@@ -2618,6 +2618,35 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(isolated.schemaName).to.equal('main');
 			expect(isolated.tableName).to.equal('widget');
 		});
+
+		it('createBacking keys the wrapper off the tableSchema, not the underlying qualified name', async () => {
+			// The createBacking forward is the third IsolatedTable construction site. It only
+			// exists when the underlying declares createBacking, which MemoryTableModule does
+			// not — so give a qualifying underlying one, and assert the wrapper's identity
+			// agrees with the `underlyingTables` key the same call registered.
+			class BackingQualifiedModule extends QualifiedNameMemoryModule {
+				async createBacking(callDb: Database, tableSchema: TableSchema): Promise<UnderlyingTable> {
+					return this.create(callDb, tableSchema);
+				}
+			}
+			const backingUnderlying = new BackingQualifiedModule();
+			const isolationModule = new IsolationModule({ underlying: backingUnderlying });
+			const backingDb = new Database();
+			backingDb.registerModule('isolated', isolationModule);
+			await backingDb.exec(`CREATE TABLE src (id INTEGER PRIMARY KEY, v TEXT) USING isolated`);
+
+			const srcSchema = backingDb.schemaManager.getTable('main', 'src');
+			expect(srcSchema, 'source schema resolved').to.exist;
+			const backingSchema = { ...srcSchema!, name: 'src_backing' };
+
+			const backing = await isolationModule.createBacking!(backingDb, backingSchema);
+			expect(backing.schemaName).to.equal('main');
+			expect(backing.tableName).to.equal('src_backing');
+			// The same call registered the underlying under this pair — the two must agree,
+			// or the commit flush cannot cross from an overlay key to its underlying.
+			expect(isolationModule.getUnderlyingState('main', 'src_backing'), 'underlying keyed by the same pair')
+				.to.not.be.undefined;
+		});
 	});
 
 	describe('atomic multi-table commit (torn-commit fix)', () => {
