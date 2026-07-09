@@ -1043,10 +1043,17 @@ export class StoreTable extends VirtualTable {
 		// the table column's declared collation.
 		const indexCollations = this.indexColumnCollations(access.index);
 		for await (const entry of this.iterateEffective(indexStore, access.bounds)) {
-			// A legacy index store (written before index values carried the data key)
-			// holds empty values; a zero-length data key is not a row key, so skip it
-			// rather than resolve it to the wrong row. Such stores need a rebuild to be
-			// index-scannable (documented in the review handoff).
+			// NOTE: a legacy index store (written before index values carried the data
+			// key) holds EMPTY values; a zero-length data key is not a row key, so skip
+			// it rather than resolve it to the wrong row. Because the access plan marked
+			// the filter handled and dropped the residual, an indexed query over such a
+			// store returns NOTHING rather than the matching rows — a silent wrong
+			// result, not an error. Backwards compatibility is waived project-wide
+			// (AGENTS.md) and no test provider carries on-disk data, so nothing exercises
+			// this today. If real persisted stores predating this format come into play,
+			// their indexes must be dropped + recreated (or the table rebuilt); the
+			// durable fix is to version-stamp the index store and rebuild on open, or to
+			// fall back to a full scan the first time an empty value is seen.
 			if (entry.value.length === 0) continue;
 			// NOTE: one extra data-store `get` per matched index entry — the row lives
 			// in the data store, not the index (the index value carries only the data

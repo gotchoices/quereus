@@ -665,5 +665,106 @@ describe('StoreModule predicate pushdown', () => {
 			// NOCASE-correct: both 'Apple' and 'apple' match.
 			expect(await asyncIterableToArray(db.eval(q))).to.deep.equal([{ id: 1 }, { id: 2 }]);
 		});
+
+		// Regression: `tryIndexAccessPlan` must mark handled ONLY the constraints
+		// rule-select-access-path actually consumes — per seek column the FIRST '=', or
+		// the FIRST lower and FIRST upper bound (its `colConstraints.find(...)` picks by
+		// position). That rule collapses handledFilters into a per-COLUMN set, so a
+		// redundant same-column, same-side constraint marked handled is neither seeked
+		// nor retained as a residual: its predicate vanishes and the query silently
+		// returns the looser bound's rows. Each case below returned extra rows before
+		// the positional claim in `tryIndexAccessPlan`.
+		describe('redundant same-column constraints keep their predicate', () => {
+			const ids = async (q: string) =>
+				(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
+
+			beforeEach(async () => {
+				await db.exec(`create table t (id integer primary key, v integer) using store`);
+				await db.exec(`create index ix_v on t (v)`);
+				await db.exec(`insert into t values (1, 10), (2, 20), (3, 30), (4, 40)`);
+			});
+
+			it('two lower bounds: the tighter one is not dropped', async () =>
+				expect(await ids(`select id from t where v > 10 and v > 30 order by id`)).to.deep.equal([4]));
+
+			it('two upper bounds: the tighter one is not dropped', async () =>
+				expect(await ids(`select id from t where v < 40 and v < 20 order by id`)).to.deep.equal([1]));
+
+			it('mixed same-side ops (> and >=) keep both', async () =>
+				expect(await ids(`select id from t where v > 10 and v >= 30 order by id`)).to.deep.equal([3, 4]));
+
+			it('contradictory equality pair yields no rows', async () =>
+				expect(await ids(`select id from t where v = 20 and v = 30`)).to.deep.equal([]));
+
+			it('equality plus a contradicting range yields no rows', async () =>
+				expect(await ids(`select id from t where v = 30 and v > 35`)).to.deep.equal([]));
+
+			it('a two-sided range still seeks and stays correct', async () => {
+				expect(await ids(`select id from t where v > 10 and v < 40 order by id`)).to.deep.equal([2, 3]);
+				expect(await planOps(`select id from t where v > 10 and v < 40`)).to.match(/INDEXSEEK|INDEX SEEK|IndexSeek/i);
+			});
+		});
+
+		// The encoded index window maps LT/LE/GT/GE onto gte/lt with a lower/upper SWAP
+		// for a DESC column (bit-inverted bytes ⇒ larger value, smaller bytes). Exercise
+		// every arm of that table in both directions — a single-op test cannot catch a
+		// swapped assignment.
+		for (const dir of ['asc', 'desc'] as const) {
+			describe(`range-bound matrix on a ${dir.toUpperCase()} index column`, () => {
+				const ids = async (q: string) =>
+					(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
+
+				beforeEach(async () => {
+					await db.exec(`create table t (id integer primary key, v integer null) using store`);
+					await db.exec(`create index ix_v on t (v ${dir})`);
+					await db.exec(`insert into t values (1, 10), (2, 20), (3, 30), (4, 40), (5, 20)`);
+				});
+
+				it('GT', async () => expect(await ids(`select id from t where v > 20 order by id`)).to.deep.equal([3, 4]));
+				it('GE', async () => expect(await ids(`select id from t where v >= 20 order by id`)).to.deep.equal([2, 3, 4, 5]));
+				it('LT', async () => expect(await ids(`select id from t where v < 30 order by id`)).to.deep.equal([1, 2, 5]));
+				it('LE', async () => expect(await ids(`select id from t where v <= 20 order by id`)).to.deep.equal([1, 2, 5]));
+
+				it('two-sided inclusive and exclusive windows', async () => {
+					expect(await ids(`select id from t where v >= 20 and v <= 30 order by id`)).to.deep.equal([2, 3, 5]);
+					expect(await ids(`select id from t where v > 10 and v < 40 order by id`)).to.deep.equal([2, 3, 5]);
+				});
+
+				it('an empty window yields no rows', async () =>
+					expect(await ids(`select id from t where v > 40`)).to.deep.equal([]));
+
+				it('NULLs never satisfy a range bound', async () => {
+					await db.exec(`insert into t values (6, null)`);
+					expect(await ids(`select id from t where v > 5 order by id`)).to.deep.equal([1, 2, 3, 4, 5]);
+					expect(await ids(`select id from t where v < 100 order by id`)).to.deep.equal([1, 2, 3, 4, 5]);
+				});
+			});
+
+			it(`text range bounds on a ${dir.toUpperCase()} NOCASE index column`, async () => {
+				await db.exec(`create table t (id integer primary key, s text collate nocase) using store`);
+				await db.exec(`create index ix_s on t (s ${dir})`);
+				await db.exec(`insert into t values (1, 'apple'), (2, 'Banana'), (3, 'cherry'), (4, 'date')`);
+				const ids = async (q: string) =>
+					(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
+
+				expect(await ids(`select id from t where s > 'banana' order by id`)).to.deep.equal([3, 4]);
+				expect(await ids(`select id from t where s >= 'Banana' order by id`)).to.deep.equal([2, 3, 4]);
+				expect(await ids(`select id from t where s < 'cherry' order by id`)).to.deep.equal([1, 2]);
+				expect(await ids(`select id from t where s <= 'CHERRY' order by id`)).to.deep.equal([1, 2, 3]);
+			});
+		}
+
+		it('composite index (a asc, b desc): prefix EQ, trailing range, and leading range', async () => {
+			await db.exec(`create table t (id integer primary key, a integer, b integer) using store`);
+			await db.exec(`create index ix_ab on t (a asc, b desc)`);
+			await db.exec(`insert into t values (1, 5, 10), (2, 5, 20), (3, 6, 10), (4, 5, 30)`);
+			const ids = async (q: string) =>
+				(await asyncIterableToArray(db.eval(q))).map(r => r.id as number);
+
+			expect(await ids(`select id from t where a = 5 and b = 20`)).to.deep.equal([2]);
+			expect(await ids(`select id from t where a = 5 order by id`)).to.deep.equal([1, 2, 4]);
+			expect(await ids(`select id from t where a = 5 and b > 15 order by id`)).to.deep.equal([2, 4]);
+			expect(await ids(`select id from t where a > 5 order by id`)).to.deep.equal([3]);
+		});
 	});
 });

@@ -111,6 +111,17 @@ export interface StoreModuleConfig extends BaseModuleConfig {
 }
 
 /**
+ * Planner-side constraint operator groups, as `BestAccessPlanRequest.filters` spells
+ * them. Kept as one source of truth for the access-plan code below: `getBestAccessPlan`
+ * classifies each pushed filter with these, and `tryIndexAccessPlan` claims a filter as
+ * handled only when it falls in the group the engine's access-path rule will consume.
+ */
+const EQ_OPS = ['='] as const;
+const LOWER_BOUND_OPS = ['>', '>='] as const;
+const UPPER_BOUND_OPS = ['<', '<='] as const;
+const RANGE_OPS = [...LOWER_BOUND_OPS, ...UPPER_BOUND_OPS] as readonly string[];
+
+/**
  * Generic store module that works with any KVStoreProvider.
  *
  * Usage:
@@ -1928,7 +1939,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		if (index.predicate) return null;
 
 		const indexColIndexes = index.columns.map(c => c.index);
-		const rangeOps = ['<', '<=', '>', '>='];
 
 		// Contiguous leading-prefix EQ → point/prefix seek.
 		const eqCols: number[] = [];
@@ -1938,7 +1948,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 		const leadingCol = indexColIndexes[0];
 		const hasLeadingRange = request.filters.some(
-			f => f.columnIndex === leadingCol && rangeOps.includes(f.op),
+			f => f.columnIndex === leadingCol && RANGE_OPS.includes(f.op),
 		);
 
 		let seekCols: number[];
@@ -1987,12 +1997,33 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			return costOnly('cost-only; key collation may under-fetch');
 		}
 
-		const handledFilters = request.filters.map(f => {
-			if (f.columnIndex === undefined) return false;
-			return isRange
-				? (f.columnIndex === leadingCol && rangeOps.includes(f.op))
-				: (eqCols.includes(f.columnIndex) && f.op === '=');
-		});
+		// Mark handled ONLY the constraints `rule-select-access-path` actually consumes.
+		// Per seek column that rule takes the FIRST '=' (equality seek), or the FIRST
+		// lower ('>'/'>=') plus the FIRST upper ('<'/'<=') bound, selected by
+		// `colConstraints.find(...)` in `request.filters` order. It also collapses
+		// `handledFilters` into a per-COLUMN set (`handledByCol`), so a redundant
+		// same-column, same-side constraint we mark handled is neither turned into a
+		// seek bound nor kept by `ruleGrowRetrieve` as a residual — its predicate is
+		// silently LOST (`where v > 10 and v > 30` would wrongly return the `v > 10`
+		// rows; `where v = 20 and v = 30` would wrongly return the `v = 20` row).
+		//
+		// Marking must therefore be POSITIONAL and match the rule's first-match pick:
+		// claiming the tighter-but-later duplicate instead would be actively wrong (the
+		// rule would still seek on the earlier one, and the tighter bound — marked
+		// handled — would never be applied anywhere). Any later duplicate stays
+		// unhandled so it survives in the residual Filter.
+		const claimed = new Set<number>();
+		const claimFirst = (colIdx: number, ops: readonly string[]): void => {
+			const i = request.filters.findIndex(f => f.columnIndex === colIdx && ops.includes(f.op));
+			if (i >= 0) claimed.add(i);
+		};
+		if (isRange) {
+			claimFirst(leadingCol, LOWER_BOUND_OPS);
+			claimFirst(leadingCol, UPPER_BOUND_OPS);
+		} else {
+			for (const colIdx of eqCols) claimFirst(colIdx, EQ_OPS);
+		}
+		const handledFilters = request.filters.map((_f, i) => claimed.has(i));
 
 		return (isRange ? AccessPlanBuilder.rangeScan(rows, 0.2) : AccessPlanBuilder.eqMatch(rows, 0.3))
 			.setHandledFilters(handledFilters)
