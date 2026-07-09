@@ -74,7 +74,9 @@ export class SetOperationNode extends PlanNode implements BinaryRelationalNode {
      */
     public readonly membership?: readonly SetOpMembershipSpec[],
   ) {
-    super(scope, left.getTotalCost() + right.getTotalCost());
+    // Self-cost only: both operands are in getChildren(), so their subtree costs
+    // flow in via getTotalCost(). The combinator's own overhead is negligible.
+    super(scope, 0.01);
     // Validate DATA column counts only. Alignment / the union schema / dedup / set
     // identity are all on data columns (model (b), `nestable-flagged-set-ops`): an
     // operand may itself be a (flagged) `SetOperationNode` whose flag columns inflate

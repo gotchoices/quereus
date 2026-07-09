@@ -42,7 +42,10 @@ export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
 		// Merge cost only (no sort cost here — SortNodes are inserted upstream if needed)
-		const cost = left.getTotalCost() + right.getTotalCost() + mergeJoinCost(leftRows, rightRows, false, false);
+		// Self-cost only: children (left, right, residualCondition) flow in via
+		// getTotalCost(). Self is the merge cost (no sort cost — SortNodes are
+		// inserted upstream if needed).
+		const cost = mergeJoinCost(leftRows, rightRows, false, false);
 		super(scope, cost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());

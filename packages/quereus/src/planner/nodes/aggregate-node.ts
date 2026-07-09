@@ -10,6 +10,7 @@ import { formatExpressionList } from '../../util/plan-formatter.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
 import type { AggregationCapable } from '../framework/characteristics.js';
+import { aggregateCost } from '../cost/index.js';
 
 export interface AggregateExpression {
   expression: ScalarPlanNode;
@@ -119,7 +120,12 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     estimatedCostOverride?: number,
     public readonly preserveAttributeIds?: readonly Attribute[]
   ) {
-    super(scope, estimatedCostOverride ?? source.getTotalCost());
+    // Self-cost only: the source (and group-by/aggregate exprs) flow in via
+    // getChildren(). Self is a modeled aggregate cost (mirrors estimatedRows'
+    // group-count heuristic); the prior `source.getTotalCost()` double-counted.
+    const sourceRows = source.estimatedRows ?? 1000;
+    const outputRows = groupBy.length > 0 ? Math.max(1, Math.floor(sourceRows / 2)) : 1;
+    super(scope, estimatedCostOverride ?? aggregateCost(sourceRows, outputRows));
 
     this.outputTypeCache = new Cached(() => this.buildOutputType());
     this.attributesCache = new Cached(() => this.buildAttributes());

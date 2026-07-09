@@ -9,6 +9,7 @@ import { extractOrderingFromSortKeys } from '../framework/physical-utils.js';
 import { SortCapable } from '../framework/characteristics.js';
 import { ColumnReferenceNode } from './reference.js';
 import { isUniqueDeterminant } from '../util/fd-utils.js';
+import { sortCost } from '../cost/index.js';
 
 /**
  * Represents a sort key for ordering results
@@ -37,13 +38,15 @@ export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapab
 		public readonly sortKeys: readonly SortKey[],
 		estimatedCostOverride?: number
 	) {
-		// Cost: cost of source + cost of sorting (O(n log n) * cost of evaluating sort expressions)
-		// This is a simplified cost model - a more sophisticated one would consider the actual data size
+		// Self-cost only: getChildren() is `[source, ...sortKeys.map(k => k.expression)]`,
+		// so BOTH the source and every sort-key expression are children — their
+		// subtree costs flow in once via getTotalCost(). Self is the O(n log n)
+		// sorting overhead alone; the key-expression evaluation cost must NOT be
+		// folded in (as the prior `sortCost * keyCost` multiplier did — it would
+		// re-count the key subtrees that already arrive as children).
 		const sourceRows = source.estimatedRows ?? 1000;
-		const sortCost = sourceRows * Math.log2(sourceRows + 1);
-		const keyCost = sortKeys.reduce((sum, key) => sum + key.expression.getTotalCost(), 0);
 
-		super(scope, estimatedCostOverride ?? (source.getTotalCost() + sortCost * keyCost));
+		super(scope, estimatedCostOverride ?? sortCost(sourceRows));
 	}
 
 	getType(): RelationType {

@@ -29,7 +29,9 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 		/** Captured binding expressions used by the enveloped pipeline (params/correlated) */
 		public readonly bindings?: ReadonlyArray<ScalarPlanNode>
 	) {
-		super(scope, source.getTotalCost());
+		// Self-cost only: the source pipeline flows in via getChildren(). This node
+		// is just the module/Quereus execution boundary marker — negligible self cost.
+		super(scope, 0.01);
 		this.typeCache = new Cached(() => this.source.getType());
 	}
 

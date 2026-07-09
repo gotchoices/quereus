@@ -37,7 +37,9 @@ export class OrdinalSliceNode extends PlanNode implements UnaryRelationalNode {
 		public readonly direction: 'asc' | 'desc',
 		estimatedCostOverride?: number,
 	) {
-		super(scope, estimatedCostOverride ?? source.getTotalCost());
+		// Self-cost only: the source flows in via getChildren(). Slicing a monotonic
+		// prefix is negligible self work.
+		super(scope, estimatedCostOverride ?? 0.01);
 	}
 
 	getType(): RelationType {

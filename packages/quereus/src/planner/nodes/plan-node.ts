@@ -704,7 +704,18 @@ export abstract class PlanNode {
   constructor(
 		/** The scope in which this node is planned. */
     public readonly scope: Scope,
-	  /** Estimated cost to execute this node itself (excluding its children). */
+	  /**
+		 * Self-cost of executing this node itself, EXCLUDING its children
+		 * (self-cost-only convention). Whole-subtree cost is `getTotalCost()`,
+		 * which sums this node's `estimatedCost` with every child's total.
+		 *
+		 * A node constructor MUST NOT fold `child.getTotalCost()` or a child's
+		 * `estimatedCost` into this value — doing so double-counts once
+		 * `getTotalCost()` adds the children again, growing exponentially with
+		 * nesting depth. Only the vtab leaf's own IndexInfo cost is a genuine
+		 * self-cost (see `table-access-nodes.ts`). The static guard in
+		 * `test/planner/cost-additivity.spec.ts` enforces this.
+		 */
 		public readonly estimatedCost = 0.01
 
 	) {
@@ -773,8 +784,37 @@ export abstract class PlanNode {
    */
   getProducingExprs?(): Map<number, ScalarPlanNode>;
 
+	/** Memoized whole-subtree cost; see getTotalCost(). */
+	private _totalCostCache?: number;
+
+	/**
+	 * Whole-subtree cost: this node's self-cost (`estimatedCost`) plus every
+	 * child's total cost, walking `getChildren()`. This is the ONLY place child
+	 * costs are summed — node constructors store self-cost only (see
+	 * `estimatedCost`), so a subtree's cost grows linearly, not exponentially,
+	 * with nesting depth.
+	 *
+	 * Memoized per instance. Safe because PlanNodes are immutable: `withChildren`
+	 * mints a fresh instance (with a fresh, empty cache), and no constructor calls
+	 * `getTotalCost()`, so the first call always happens after the tree is fully
+	 * built. The ONE in-place mutator — `RecursiveCTENode.setRecursiveCaseQuery` —
+	 * clears the cache via `invalidateTotalCostCache()`.
+	 */
 	getTotalCost(): number {
-		return this.estimatedCost + this.getChildren().reduce((acc, child) => acc + child.getTotalCost(), 0);
+		if (this._totalCostCache === undefined) {
+			this._totalCostCache = this.estimatedCost +
+				this.getChildren().reduce((acc, child) => acc + child.getTotalCost(), 0);
+		}
+		return this._totalCostCache;
+	}
+
+	/**
+	 * Clear the memoized total-cost. Needed only by nodes that mutate a child in
+	 * place after construction (`RecursiveCTENode.setRecursiveCaseQuery`); the
+	 * immutable `withChildren` path never needs it (it re-mints a fresh instance).
+	 */
+	protected invalidateTotalCostCache(): void {
+		this._totalCostCache = undefined;
 	}
 
   visit(visitor: PlanNodeVisitor): void {

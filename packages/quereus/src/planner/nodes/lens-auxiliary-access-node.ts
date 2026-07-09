@@ -81,7 +81,10 @@ export class LensAuxiliaryAccessNode extends PlanNode implements UnaryRelational
 		/** The routable auxiliaries, resolved at build time. Non-empty by construction. */
 		public readonly routables: readonly RoutableAuxiliary[],
 	) {
-		super(scope, source.estimatedCost);
+		// Self-cost only: pure pass-through marker, the source flows in via
+		// getChildren(). Using source.estimatedCost here would double-count the
+		// source's self-cost.
+		super(scope, 0.01);
 	}
 
 	getType(): RelationType {

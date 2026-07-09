@@ -42,7 +42,9 @@ export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, Joi
 	) {
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
-		const cost = left.getTotalCost() + right.getTotalCost() + hashJoinCost(rightRows, leftRows);
+		// Self-cost only: children (left, right, residualCondition) flow in via
+		// getTotalCost(). Self is the hash-join build+probe cost.
+		const cost = hashJoinCost(rightRows, leftRows);
 		super(scope, cost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());

@@ -185,7 +185,11 @@ export class ViewMutationNode extends PlanNode {
 		 */
 		public readonly nestedCaptures?: readonly IdentityCapture[],
 	) {
-		super(scope, baseOps.reduce((cost, op) => cost + op.getTotalCost(), 0.1));
+		// Self-cost only: every base op (and the returning re-query / capture /
+		// envelope children) is in getChildren(), so their subtree costs flow in via
+		// getTotalCost(). Self is the fixed mutation-sequencing overhead. (Previously
+		// only baseOps were folded, so the other children were under-counted.)
+		super(scope, 0.1);
 		if (baseOps.length === 0) {
 			throw new QuereusError('ViewMutationNode requires at least one base operation', StatusCode.INTERNAL);
 		}

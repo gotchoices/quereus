@@ -133,7 +133,9 @@ export class AsyncGatherNode extends PlanNode implements RelationalPlanNode {
 		public readonly preserveAttributeIds?: readonly Attribute[],
 	) {
 		AsyncGatherNode.validateConstruction(children, combinator, concurrencyCap);
-		super(scope, children.reduce((acc, c) => acc + c.getTotalCost(), 0));
+		// Self-cost only: every child is in getChildren(), so their subtree costs
+		// flow in via getTotalCost(). The gather's own overhead is negligible.
+		super(scope, 0.01);
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.zipIndicesCache = new Cached(() => this.computeZipByKeyIndices());
 	}

@@ -26,12 +26,13 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
     estimatedCostOverride?: number,
     public readonly preserveAttributeIds?: readonly Attribute[]
   ) {
-    // Streaming aggregation is cheaper than hash aggregation
-    // Cost is linear in the number of input rows
+    // Self-cost only: the source (and group-by/aggregate exprs) flow in via
+    // getChildren(). Self is the streaming pass — linear in input rows, cheaper
+    // than hash aggregation.
     const sourceRows = source.estimatedRows ?? 1000;
     const streamingCost = sourceRows * 0.1; // Lower cost multiplier for streaming
 
-    super(scope, estimatedCostOverride ?? (source.getTotalCost() + streamingCost));
+    super(scope, estimatedCostOverride ?? streamingCost);
 
     this.attributesCache = new Cached(() => this.buildAttributes());
   }

@@ -91,8 +91,9 @@ export class AsofScanNode extends PlanNode implements BinaryRelationalNode {
 	) {
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
-		// O(L + R) per-row work plus the children's own costs.
-		const cost = left.getTotalCost() + right.getTotalCost() + leftRows + rightRows;
+		// Self-cost only: children (left, right) flow in via getTotalCost(). Self is
+		// the O(L + R) per-row work.
+		const cost = leftRows + rightRows;
 		super(scope, cost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());

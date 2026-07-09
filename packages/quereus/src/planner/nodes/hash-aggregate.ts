@@ -34,7 +34,9 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 		const hashCost = sourceRows * COST_CONSTANTS.HASH_AGG_BUILD_PER_ROW
 			+ estimatedGroups * COST_CONSTANTS.HASH_AGG_PER_GROUP;
 
-		super(scope, estimatedCostOverride ?? (source.getTotalCost() + hashCost));
+		// Self-cost only: the source (and group-by/aggregate exprs) flow in via
+		// getChildren(). Self is the hash build + per-group finalization cost.
+		super(scope, estimatedCostOverride ?? hashCost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());
 	}

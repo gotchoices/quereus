@@ -33,7 +33,10 @@ export class AssertedKeysNode extends PlanNode implements UnaryRelationalNode {
 		/** The encoded logical keys, in this node's output-column-index space. */
 		public readonly assertedFds: readonly FunctionalDependency[],
 	) {
-		super(scope, source.estimatedCost);
+		// Self-cost only: pure pass-through marker, the source flows in via
+		// getChildren(). Using source.estimatedCost here would double-count the
+		// source's self-cost.
+		super(scope, 0.01);
 	}
 
 	getType(): RelationType {

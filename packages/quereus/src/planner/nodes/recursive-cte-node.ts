@@ -31,7 +31,10 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		public readonly limitExpr?: ScalarPlanNode,
 		public readonly offsetExpr?: ScalarPlanNode
 	) {
-		super(scope, baseCaseQuery.getTotalCost() + recursiveCaseQuery.getTotalCost() + 50); // Higher cost for recursion
+		// Self-cost only: the base and recursive cases are both in getChildren(),
+		// so their subtree costs flow in once via getTotalCost(). Self is the fixed
+		// recursion overhead.
+		super(scope, 50);
 		this._recursiveCaseQuery = recursiveCaseQuery;
 		this.tableDescriptor = tableDescriptor || {}; // Identity object for table context lookup
 		this.attributesCache = new Cached(() => this.buildAttributes());
@@ -48,9 +51,12 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 	 */
 	setRecursiveCaseQuery(query: RelationalPlanNode): void {
 		this._recursiveCaseQuery = query;
-		// Clear caches since they might depend on the recursive case
+		// Clear caches since they might depend on the recursive case. The memoized
+		// total-cost captured the placeholder recursive case at construction, so it
+		// must be invalidated too (self-cost is a constant, but a child changed).
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.typeCache = new Cached(() => this.buildType());
+		this.invalidateTotalCostCache();
 	}
 
 	private buildAttributes(): Attribute[] {

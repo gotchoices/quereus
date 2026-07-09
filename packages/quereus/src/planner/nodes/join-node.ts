@@ -115,15 +115,12 @@ export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapa
 		public readonly usingColumns?: readonly string[],
 		public readonly existence?: readonly ExistenceColumnSpec[],
 	) {
-		// Cost estimate: base cost is sum of children plus join cost
-		const leftCost = left.getTotalCost();
-		const rightCost = right.getTotalCost();
+		// Self-cost only: the children (left, right, condition) flow in via
+		// getTotalCost(); self is the nested-loop join cost heuristic.
 		const leftRows = left.estimatedRows ?? 100;
 		const rightRows = right.estimatedRows ?? 100;
-
-		// Simple join cost heuristic - nested loop cost
 		const joinCost = leftRows * rightRows;
-		super(scope, leftCost + rightCost + joinCost);
+		super(scope, joinCost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());
 	}

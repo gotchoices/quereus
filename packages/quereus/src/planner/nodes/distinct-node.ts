@@ -17,11 +17,11 @@ export class DistinctNode extends PlanNode implements UnaryRelationalNode {
     public readonly source: RelationalPlanNode,
     estimatedCostOverride?: number
   ) {
-    // Cost: cost of source + cost of deduplication (roughly O(n log n) for sorting approach)
-    const sourceCost = source.getTotalCost();
+    // Self-cost only: the source flows in via getChildren(). Self is the
+    // deduplication cost (roughly O(n log n) for a sorting approach).
     const sourceRows = source.estimatedRows ?? 1;
     const deduplicationCost = sourceRows * Math.log2(Math.max(1, sourceRows));
-    super(scope, estimatedCostOverride ?? (sourceCost + deduplicationCost));
+    super(scope, estimatedCostOverride ?? deduplicationCost);
   }
 
   getType(): RelationType {

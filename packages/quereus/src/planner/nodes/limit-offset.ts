@@ -23,9 +23,9 @@ export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, Li
 		public readonly offset: ScalarPlanNode | undefined,
 		estimatedCostOverride?: number
 	) {
-		// Cost is proportional to offset + limit (rows we need to process)
-		// We assume limit and offset are constants, but in practice they could be expressions
-		super(scope, estimatedCostOverride ?? source.getTotalCost());
+		// Self-cost only: the source (and limit/offset exprs) flow in via
+		// getChildren(). Slicing rows is negligible self work.
+		super(scope, estimatedCostOverride ?? 0.01);
 	}
 
 	// LimitCapable interface

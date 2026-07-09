@@ -20,7 +20,9 @@ export class AliasNode extends PlanNode implements UnaryRelationalNode {
 		public readonly source: RelationalPlanNode,
 		public readonly alias: string
 	) {
-		super(scope, source.estimatedCost);
+		// Self-cost only: pure rename, the source flows in via getChildren(). Using
+		// source.estimatedCost here would double-count the source's self-cost.
+		super(scope, 0.01);
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.typeCache = new Cached(() => this.buildType());
 	}

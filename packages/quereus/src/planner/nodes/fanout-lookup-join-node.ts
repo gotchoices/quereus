@@ -153,8 +153,10 @@ export class FanOutLookupJoinNode extends PlanNode implements RelationalPlanNode
 		public readonly outerMode: FanOutOuterMode = 'serial',
 	) {
 		FanOutLookupJoinNode.validateConstruction(outer, branches, concurrencyCap, preserveAttributeIds, outerMode);
-		const branchCost = branches.reduce((acc, b) => acc + b.child.getTotalCost(), 0);
-		super(scope, outer.getTotalCost() + branchCost);
+		// Self-cost only: the outer and every branch child are in getChildren(), so
+		// their subtree costs flow in via getTotalCost(). The fan-out node's own
+		// overhead is negligible (it forks child sub-plans; no per-row work of its own).
+		super(scope, 0.01);
 		this.attributesCache = new Cached(() => this.buildAttributes());
 	}
 

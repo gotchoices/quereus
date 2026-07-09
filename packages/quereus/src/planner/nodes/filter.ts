@@ -10,6 +10,7 @@ import { createTableInfoFromNode, extractConstraints } from '../analysis/constra
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
 import { deriveFilterAttributeDefaults } from '../analysis/update-lineage.js';
+import { filterCost } from '../cost/index.js';
 
 /**
  * Represents a filter operation (WHERE clause).
@@ -25,8 +26,11 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		public readonly predicate: ScalarPlanNode,
 		estimatedCostOverride?: number
 	) {
-		// Cost: cost of source + cost of evaluating predicate for each source row
-		super(scope, estimatedCostOverride ?? (source.getTotalCost() + (source.estimatedRows ?? 1) * predicate.getTotalCost()));
+		// Self-cost only: both children — source AND predicate (getChildren() is
+		// [source, predicate]) — flow in via getTotalCost(). Self is the per-row
+		// predicate-evaluation overhead; the predicate's own subtree cost is added
+		// once as a child, so it must NOT be folded here.
+		super(scope, estimatedCostOverride ?? filterCost(source.estimatedRows ?? 1));
 	}
 
 	getType(): RelationType {

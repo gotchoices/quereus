@@ -51,7 +51,9 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 		public readonly materializationHint: 'materialized' | 'not_materialized' | undefined,
 		public readonly isRecursive: boolean = false
 	) {
-		super(scope, source.getTotalCost() + 10); // Add small overhead for CTE materialization
+		// Self-cost only: the source flows in via getChildren(). Self is the CTE
+		// materialization overhead.
+		super(scope, 10);
 		this.attributesCache = new Cached(() => this.buildAttributes());
 		this.typeCache = new Cached(() => this.buildType());
 	}

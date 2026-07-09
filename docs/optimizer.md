@@ -215,6 +215,34 @@ Cost estimation is centralized in `src/planner/cost/index.ts`:
 - Tunable parameters via `OptimizerTuning`
 - Clear units (rows, cost units, bytes)
 
+#### Self-cost-only convention
+
+`PlanNode.estimatedCost` stores **only the node's own incremental (self) cost**,
+excluding its children. The whole-subtree cost is `PlanNode.getTotalCost()`, which
+is the **sole** place child costs are summed — it walks `getChildren()` and adds
+each child's total to this node's self-cost.
+
+A node constructor must never fold `child.getTotalCost()` (or a child's
+`estimatedCost`) into its own `estimatedCost`. Doing so double-counts the child once
+`getTotalCost()` sums the children again, which compounds with nesting depth and
+inflates deeply nested plans exponentially — skewing which plan the optimizer picks.
+The only genuine leaf self-cost that reads an `estimatedCost` is the vtab access
+node's own `xBestIndex` IndexInfo cost (`table-access-nodes.ts`).
+
+`getTotalCost()` is memoized per instance. This is sound because PlanNodes are
+immutable (`withChildren` mints a fresh instance with a fresh, empty cache) and no
+constructor calls `getTotalCost()`, so the first call always happens after the tree
+is fully built. The one in-place mutator — `RecursiveCTENode.setRecursiveCaseQuery()`
+— clears the memo via `invalidateTotalCostCache()`.
+
+Two guards keep the two conventions from silently re-mixing (see
+`test/planner/cost-additivity.spec.ts`):
+- `validateCostAdditivity(plan)` (`planner/validation/plan-validator.ts`) asserts, per
+  node, `getTotalCost() === estimatedCost + Σ child.getTotalCost()` and that
+  `estimatedCost` is finite and `>= 0`.
+- A static source-scan test fails if any node constructor reintroduces
+  `getTotalCost(`/child `.estimatedCost` in its self-cost.
+
 ### Statistics Abstraction
 The `StatsProvider` interface allows pluggable statistics sources:
 ```typescript
