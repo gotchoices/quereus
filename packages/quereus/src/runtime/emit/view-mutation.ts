@@ -22,7 +22,7 @@ type Callback = (ctx: RuntimeContext) => OutputValue;
  *
  * This sequencing is load-bearing for multi-source decomposition: the scheduler
  * kicks off sibling params concurrently (it does not await one before starting
- * the next — see `Scheduler.runAsync`), so a bare-param fan-out would interleave
+ * the next — see `Scheduler.runAsyncLoop`), so a bare-param fan-out would interleave
  * the base writes and lose the FK-parent-before-child ordering the decomposition
  * decided. Driving the callbacks in list order here makes the emitted order the
  * executed order. For the single-source spine there is exactly one base op, so

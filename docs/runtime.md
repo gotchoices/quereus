@@ -420,6 +420,26 @@ The Scheduler executes instructions in dependency order:
 2. **Dependency Resolution**: Ensures instructions execute after their dependencies
 3. **Async Handling**: Uses `Promise.all()` for concurrent dependency resolution
 4. **Memory Management**: Clears instruction arguments after execution
+5. **Error-unwind sweep**: An instruction's output is parked in `instrArgs[destination]`
+   until the consuming instruction awaits it. If an instruction throws before a
+   destination that holds a still-pending promise runs, that promise would otherwise
+   be abandoned and surface as an unhandled rejection (process-fatal under strict
+   rejection handling). On any throw, the async loop drains every remaining parked
+   promise via `Promise.allSettled` (logging rejections, not swallowing them) and
+   re-throws the original error.
+
+Dispatch is factored into one synchronous entry loop and one async continuation
+loop, parameterized by a small per-mode `RunHooks` seam (optimized / tracing /
+metrics). The sweep lives once, in the async loop. The synchronous loop hands off to
+the async loop the instant an instruction returns a promise, so it never parks a
+promise — nothing to sweep there. Tracing eagerly awaits each promise output before
+tracing it (so trace events are ordered by settlement), which means it can never
+abandon a promise; the sweep there is defensive. Metrics parks its timing-wrapped
+promises like the optimized path and defers awaiting to the destination.
+NOTE: `logAggregateMetrics` runs on the normal-completion path only; if the final
+instruction returns a bare `Promise` (rare — a SELECT root is an async iterable,
+counted synchronously), that one instruction's `out` count may not yet be recorded in
+the debug-only aggregate log. Not observable outside the `runtime:metrics` logger.
 
 ### Key Points for Emitter Authors
 
