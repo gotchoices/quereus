@@ -1,10 +1,12 @@
 /**
  * Shared UNIQUE-enforcement collation helpers. {@link uniqueEnforcementCollations}
  * is the single source of truth across packages — it is re-exported from the
- * package index (`@quereus/quereus`) and imported directly by the store and
- * isolation re-validators (`quereus-store/store-table.ts`,
- * `quereus-isolation/isolated-table.ts`), so cross-package drift is eliminated by
- * construction rather than by a test.
+ * package index (`@quereus/quereus`) and reached by the store and isolation
+ * re-validators (`quereus-store/store-table.ts`,
+ * `quereus-isolation/isolated-table.ts`) through
+ * {@link resolveUniqueEnforcementCollations}, which pairs it with the owning
+ * database's collation resolver. Cross-package drift is eliminated by construction
+ * rather than by a test.
  *
  * Two facts about a UNIQUE constraint that both the row-time covering-MV
  * eligibility gate and memory's covering-MV re-validation need:
@@ -48,7 +50,8 @@
  *    test fires is declined (perf-only loss in an already-exotic shape).
  */
 
-import { normalizeCollationName } from '../util/comparison.js';
+import { normalizeCollationName, resolveCollationFunctions } from '../util/comparison.js';
+import type { CollationFunction, CollationResolver } from '../types/logical-type.js';
 import type { TableSchema, UniqueConstraintSchema } from './table.js';
 
 /**
@@ -71,6 +74,24 @@ export function uniqueEnforcementCollations(
 		? schema.indexes?.find(ix => ix.name === uc.derivedFromIndex)
 		: undefined;
 	return uc.columns.map((col, i) => index?.columns[i]?.collation ?? schema.columns[col].collation);
+}
+
+/**
+ * {@link uniqueEnforcementCollations} resolved to comparison functions against the
+ * owning database's registry (`Database.getCollationResolver()`), so a collation
+ * registered on the connection is honoured instead of degrading to BINARY.
+ *
+ * Call ONCE per constraint check, above the candidate loop: the resolver throws on an
+ * unregistered name, so a per-candidate call is pure overhead. Every out-of-package
+ * UNIQUE re-validator (store, isolation) resolves through here rather than pairing the
+ * two calls itself.
+ */
+export function resolveUniqueEnforcementCollations(
+	schema: TableSchema,
+	uc: UniqueConstraintSchema,
+	resolver: CollationResolver,
+): CollationFunction[] {
+	return resolveCollationFunctions(resolver, uniqueEnforcementCollations(schema, uc));
 }
 
 /**

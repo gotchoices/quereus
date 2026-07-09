@@ -3086,4 +3086,94 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(await rows('b')).to.deep.equal([]);
 		});
 	});
+	describe('DESC primary key (overlay/underlying merge ordering)', () => {
+		// Regression: the merge aligns overlay and underlying entries by a PK comparator, so
+		// that comparator must reproduce the underlying's NATIVE key order. A `primary key
+		// (k desc)` table scans descending, but both the memory table's `comparePrimaryKey`
+		// and the isolation layer's own fallback compared ascending — the merge never lined
+		// the two streams up, so a staged UPDATE surfaced alongside the base row it replaces.
+
+		type UnderlyingTable = Awaited<ReturnType<MemoryTableModule['create']>>;
+
+		/** Hides `comparePrimaryKey` so `IsolatedTable` takes its fallback comparator — the
+		 *  arm every store-backed underlying (which exposes none) takes. */
+		function hideComparePk(table: UnderlyingTable): UnderlyingTable {
+			return new Proxy(table, {
+				get(target, prop) {
+					if (prop === 'comparePrimaryKey') return undefined;
+					const value = Reflect.get(target, prop, target);
+					return typeof value === 'function' ? value.bind(target) : value;
+				},
+				has(target, prop) {
+					return prop === 'comparePrimaryKey' ? false : Reflect.has(target, prop);
+				},
+			});
+		}
+
+		class NoComparatorMemoryModule extends MemoryTableModule {
+			override async create(...args: Parameters<MemoryTableModule['create']>): Promise<UnderlyingTable> {
+				return hideComparePk(await super.create(...args));
+			}
+			override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<UnderlyingTable> {
+				return hideComparePk(await super.connect(...args));
+			}
+		}
+
+		async function rowsOf(target: Database, sql: string): Promise<SqlValue[][]> {
+			return (await asyncIterableToArray(target.eval(sql))).map(r => Object.values(r) as SqlValue[]);
+		}
+
+		/** Exercises the merge over a DESC PK for one underlying module. */
+		function describeUnderlying(label: string, makeModule: () => MemoryTableModule): void {
+			describe(label, () => {
+				let ddb: Database;
+				beforeEach(async () => {
+					ddb = new Database();
+					ddb.registerModule('isolated', new IsolationModule({ underlying: makeModule() }));
+					await ddb.exec(`create table t (k integer, v text, primary key (k desc)) using isolated`);
+					await ddb.exec(`insert into t values (1, 'a'), (2, 'b'), (3, 'c')`);
+				});
+				afterEach(async () => { await ddb.close(); });
+
+				it('scans committed rows in descending key order', async () => {
+					expect(await rowsOf(ddb, `select k, v from t`)).to.deep.equal([[3, 'c'], [2, 'b'], [1, 'a']]);
+				});
+
+				it('shadows the base row exactly once when a staged update rewrites a non-key column', async () => {
+					await ddb.exec('begin');
+					await ddb.exec(`update t set v = 'B' where k = 2`);
+					expect(await rowsOf(ddb, `select k, v from t`)).to.deep.equal([[3, 'c'], [2, 'B'], [1, 'a']]);
+					await ddb.exec('rollback');
+					expect(await rowsOf(ddb, `select k, v from t`)).to.deep.equal([[3, 'c'], [2, 'b'], [1, 'a']]);
+				});
+
+				it('hides a deleted base row and orders a staged insert into place', async () => {
+					await ddb.exec('begin');
+					await ddb.exec(`delete from t where k = 3`);
+					await ddb.exec(`insert into t values (4, 'd')`);
+					expect(await rowsOf(ddb, `select k, v from t`)).to.deep.equal([[4, 'd'], [2, 'b'], [1, 'a']]);
+					await ddb.exec('commit');
+					expect(await rowsOf(ddb, `select k, v from t`)).to.deep.equal([[4, 'd'], [2, 'b'], [1, 'a']]);
+				});
+			});
+		}
+
+		// The underlying exposes `comparePrimaryKey`; the isolation layer adopts it.
+		describeUnderlying('underlying supplies comparePrimaryKey (MemoryTable)', () => new MemoryTableModule());
+		// The underlying exposes none; IsolatedTable's own fallback comparator must agree.
+		describeUnderlying('underlying supplies no comparePrimaryKey (store-shaped)', () => new NoComparatorMemoryModule());
+
+		it('orders a composite mixed-direction key by the declared directions', async () => {
+			const mdb = new Database();
+			mdb.registerModule('isolated', new IsolationModule({ underlying: new MemoryTableModule() }));
+			await mdb.exec(`create table t (a integer, b integer, v text, primary key (a desc, b)) using isolated`);
+			await mdb.exec(`insert into t values (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')`);
+
+			await mdb.exec('begin');
+			await mdb.exec(`update t set v = 'Y' where a = 1 and b = 2`);
+			expect(await rowsOf(mdb, `select a, b, v from t`)).to.deep.equal([[2, 1, 'z'], [1, 1, 'x'], [1, 2, 'Y']]);
+			await mdb.exec('rollback');
+			await mdb.close();
+		});
+	});
 });

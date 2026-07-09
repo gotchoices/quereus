@@ -491,8 +491,8 @@ For merge iteration to work correctly, the overlay must iterate in the **same or
 
 | Module | Ordering |
 |--------|----------|
-| Memory vtab | `compareSqlValues()` with collation support |
-| Store module | Binary-encoded keys (lexicographic byte order) |
+| Memory vtab | Its layer BTrees' primary-key comparator (`createPrimaryKeyFunctions`): per-column logical type, declared collation, and `DESC` direction |
+| Store module | Binary-encoded keys (lexicographic byte order), with the same collation and direction folded into the bytes |
 
 If these differ, merge produces incorrect results.
 
@@ -515,13 +515,27 @@ interface IsolationCapableTable extends VirtualTable {
 
 The isolation layer passes these comparators to the overlay module (if configurable) or validates that the overlay and underlying modules use compatible orderings.
 
+`comparePrimaryKey` is optional. When the underlying table does not expose it — every
+store-backed table today — `IsolatedTable` falls back to its own comparator, which walks the
+PK columns under their declared collations and declared `DESC` directions. Any underlying whose
+native key order is not reproducible that way (a custom encoding, a locale-aware byte order)
+**must** expose `comparePrimaryKey`.
+
 ### Collation Considerations
 
-For text columns with non-binary collation (NOCASE, etc.):
+For text columns with non-binary collation (`NOCASE`, `RTRIM`, or one registered with
+`db.registerCollation`):
 
 - The underlying module's comparator must respect the collation
+- Collation names resolve against the **owning connection** (`db.getCollationResolver()`), never
+  a process-global registry — an application may replace `NOCASE`/`RTRIM` per database
 - The overlay uses the same comparator
 - Both iterate in the same order
+
+The store's *physical key bytes* are a separate matter: they come from an encoder registry that
+does not consult the database, so a custom or overridden collation governs comparison but not
+key layout. See the `COLLATE` section of `docs/sql.md` for the caveat this places on a store
+table's `PRIMARY KEY` collation.
 
 ---
 

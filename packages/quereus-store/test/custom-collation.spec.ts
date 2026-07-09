@@ -165,9 +165,9 @@ describe('StoreTable UNIQUE under a database-registered collation', () => {
 		expect(err!.message).to.match(/UNIQUE constraint failed/i);
 	});
 
-	it('resolves an empty collation-name list without throwing', async () => {
-		// `resolveCollationFunctions` over a zero-length name array (a UNIQUE over no
-		// columns cannot exist, but the mapping must be total).
+	it('scans a table with no pushed constraints, resolving an empty collation map', async () => {
+		// The degenerate arm of `resolveFilterCollations` / `resolveCollationFunctions`:
+		// a zero-length name list must map to a zero-length function list, not throw.
 		db.registerCollation('NOSPACE', noSpace, stripSpaces);
 		await db.exec(`create table t (id integer primary key, code text) using store`);
 		await db.exec(`insert into t values (1, 'x')`);

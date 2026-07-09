@@ -1,10 +1,13 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, uniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey, resolveKeyNormalizer } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
 import type { MergeEntry, MergeConfig } from './merge-types.js';
 import { makeFullScanFilterInfo, makePkPointLookupFilter } from './filter-info.js';
+
+/** Returned when the schema has not been populated yet; never mutated. */
+const EMPTY_PK_KEY_SHAPE: { functions: CollationFunction[]; directions: boolean[] } = { functions: [], directions: [] };
 
 /**
  * Information about which index is being scanned.
@@ -76,12 +79,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	private readonly collationResolver: CollationResolver;
 
 	/**
-	 * Per-PK-column comparison functions, resolved from the PK columns' declared
-	 * collations and memoized against the `TableSchema` object identity — an
-	 * `alter table` hands this instance a fresh (frozen) schema object, which
-	 * invalidates the entry.
+	 * Per-PK-column comparison functions and sort directions, resolved from the PK
+	 * columns' declared collations and memoized against the `TableSchema` object
+	 * identity — an `alter table` hands this instance a fresh (frozen) schema object,
+	 * which invalidates the entry.
 	 */
-	private pkCollationCache?: { schema: TableSchema; functions: CollationFunction[] };
+	private pkCollationCache?: { schema: TableSchema; functions: CollationFunction[]; directions: boolean[] };
 
 	/**
 	 * Returns the connection-scoped set of savepoint depths that pre-date the overlay.
@@ -714,15 +717,36 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * {@link keysEqual} — never re-resolves per row. Resolution is not retroactive: a
 	 * collation registered *after* a comparator was built is not picked up, the same
 	 * contract `Database.registerCollation` documents engine-wide.
+	 *
+	 * NOTE: this is the *comparison* collation only. The store's physical key bytes come
+	 * from a separate encoder registry that does not consult the database — see
+	 * `fix/bug-store-key-encoder-ignores-database-collations`.
 	 */
 	private getPkCollations(): CollationFunction[] {
+		return this.getPkKeyShape().functions;
+	}
+
+	/**
+	 * Per-PK-column sort directions (`true` ⇒ DESC), positionally aligned with
+	 * {@link getPkCollations}. Only the ordering comparator needs them; `keysEqual`
+	 * asks about equality, which direction cannot change.
+	 */
+	private getPkDirections(): boolean[] {
+		return this.getPkKeyShape().directions;
+	}
+
+	private getPkKeyShape(): { functions: CollationFunction[]; directions: boolean[] } {
 		const schema = this.tableSchema;
-		if (!schema) return [];
+		if (!schema) return EMPTY_PK_KEY_SHAPE;
 		if (this.pkCollationCache?.schema !== schema) {
-			const names = (schema.primaryKeyDefinition ?? []).map(pk => schema.columns[pk.index]?.collation);
-			this.pkCollationCache = { schema, functions: resolveCollationFunctions(this.collationResolver, names) };
+			const pkDef = schema.primaryKeyDefinition ?? [];
+			this.pkCollationCache = {
+				schema,
+				functions: resolveCollationFunctions(this.collationResolver, pkDef.map(pk => schema.columns[pk.index]?.collation)),
+				directions: pkDef.map(pk => !!pk.desc),
+			};
 		}
-		return this.pkCollationCache.functions;
+		return this.pkCollationCache;
 	}
 
 	/**
@@ -735,16 +759,19 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		}
 
 		// Fallback to default comparator. Compare under each PK column's declared
-		// collation (e.g. NOCASE), not BINARY: the merge aligns overlay and underlying
-		// entries by this comparator to decide shadowing, and the underlying store keys
-		// rows collation-aware. A binary comparator would treat a case-only-updated
-		// overlay row ('APPLE') and the underlying row it shadows ('apple') as distinct
-		// keys, surfacing BOTH in a scan instead of the overlay shadowing the underlying.
+		// collation (e.g. NOCASE), not BINARY, and in its declared direction: the merge
+		// aligns overlay and underlying entries by this comparator to decide shadowing,
+		// and the underlying store keys rows both collation-aware and DESC-aware. A
+		// binary comparator would treat a case-only-updated overlay row ('APPLE') and
+		// the underlying row it shadows ('apple') as distinct keys; an ascending one
+		// walks a `primary key (k desc)` table against its scan order. Either way both
+		// rows surface in a scan instead of the overlay shadowing the underlying.
 		const collations = this.getPkCollations();
+		const directions = this.getPkDirections();
 		return (a: SqlValue[], b: SqlValue[]) => {
 			for (let i = 0; i < a.length; i++) {
 				const cmp = compareSqlValuesFast(a[i], b[i], collations[i] ?? BINARY_COLLATION);
-				if (cmp !== 0) return cmp;
+				if (cmp !== 0) return directions[i] ? -cmp : cmp;
 			}
 			return 0;
 		};
@@ -1289,10 +1316,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// One comparison collation per constrained column — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
 		// Resolved once, above the candidate scan.
-		const collations = resolveCollationFunctions(
-			this.collationResolver,
-			uniqueEnforcementCollations(this.tableSchema!, uc),
-		);
+		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
 
 		for await (const underlyingRow of this.underlyingTable.query(this.createFullScanFilterInfo())) {
 			const pk = pkIndices.map(i => underlyingRow[i]);

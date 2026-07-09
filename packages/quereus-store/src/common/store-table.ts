@@ -18,7 +18,7 @@ import {
 	StatusCode,
 	compareSqlValues,
 	compareSqlValuesFast,
-	resolveCollationFunctions,
+	resolveUniqueEnforcementCollations,
 	BINARY_COLLATION,
 	rowsValueIdentical,
 	validateAndParse,
@@ -1147,13 +1147,13 @@ export class StoreTable extends VirtualTable {
 	/**
 	 * Check if a row matches the filter constraints.
 	 *
-	 * `collationOverride`, when supplied, maps a column index to the collation this
-	 * check must compare that column under, OVERRIDING the column's declared
-	 * collation. The secondary-index scan arm passes it so an index column is
-	 * re-checked under the INDEX's per-column collation, not the table column's
-	 * declared collation — see {@link scanIndex}. Columns absent from the map (and
-	 * every caller that omits it — PK point/range, full scan) keep the declared
-	 * collation.
+	 * `collations` maps a constrained column index to the comparison function that
+	 * column must be re-checked under; every caller builds it once per scan with
+	 * {@link resolveFilterCollations}, whose doc comment explains how the name is
+	 * chosen. A column absent from the map compares BINARY — the same result
+	 * {@link resolveFilterCollations} produces for an undeclared collation, and the
+	 * only reachable absence, since both walk the constraint list under identical
+	 * skip conditions.
 	 */
 	protected matchesFilters(
 		row: Row,
@@ -1201,6 +1201,10 @@ export class StoreTable extends VirtualTable {
 	 * Names resolve against {@link collationResolver}, so an unregistered collation
 	 * raises `no such collation sequence` at scan setup rather than byte-ordering
 	 * every row.
+	 *
+	 * NOTE: rebuilt on every `query()` / `scanPKRange()` / `scanIndex()` call — one
+	 * registry lookup per distinct constrained column, dwarfed by the scan's I/O. If a
+	 * point-lookup-heavy profile ever shows it, memoize on the `FilterInfo`.
 	 */
 	protected resolveFilterCollations(
 		filterInfo: FilterInfo,
@@ -1942,10 +1946,7 @@ export class StoreTable extends VirtualTable {
 		// Resolved once, above the candidate loop: the resolver throws on an
 		// unregistered name and cannot be inlined, so a per-candidate call would be
 		// pure overhead.
-		const collations = resolveCollationFunctions(
-			this.collationResolver,
-			uniqueEnforcementCollations(this.tableSchema!, uc),
-		);
+		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
 		const bounds = buildIndexPrefixBounds(
 			uc.columns.map(c => newRow[c]),
 			this.encodeOptions,
@@ -1997,10 +1998,7 @@ export class StoreTable extends VirtualTable {
 		// One comparison collation per constrained column — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
 		// Resolved once here, not per candidate row.
-		const collations = resolveCollationFunctions(
-			this.collationResolver,
-			uniqueEnforcementCollations(this.tableSchema!, uc),
-		);
+		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
 
 		const matches = (candidate: Row): UniqueConflict | null => {
 			const pk = this.extractPK(candidate);
@@ -2056,10 +2054,7 @@ export class StoreTable extends VirtualTable {
 	): Promise<UniqueConflict | null> {
 		const newSourcePk = this.extractPK(newRow);
 		// Resolved once, above the candidate loop.
-		const collations = resolveCollationFunctions(
-			this.collationResolver,
-			uniqueEnforcementCollations(this.tableSchema!, uc),
-		);
+		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
 		const candidates = await (this.db as DatabaseInternal)._lookupCoveringConflicts(mv, uc, newRow, newSourcePk);
 		for (const cand of candidates) {
 			const liveRow = await this.readLiveRowByPk(cand.pk);

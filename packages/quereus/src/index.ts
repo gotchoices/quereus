@@ -150,7 +150,7 @@ export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSche
 // Per-column UNIQUE-enforcement collation resolver — the single source of truth
 // shared by store/isolation re-validators (memory's `checkUniqueViaIndex` is
 // conformance-locked against it rather than importing, see unique-enforcement.ts).
-export { uniqueEnforcementCollations } from './schema/unique-enforcement.js';
+export { uniqueEnforcementCollations, resolveUniqueEnforcementCollations } from './schema/unique-enforcement.js';
 export type { ColumnSchema } from './schema/column.js';
 export type { ViewSchema } from './schema/view.js';
 export type { TableDerivation, MaintainedTableSchema } from './schema/derivation.js';
