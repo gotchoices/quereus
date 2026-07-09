@@ -13,6 +13,26 @@ import { StoreManager } from '../src/service/store-manager.js';
 const TEST_DATABASE_ID = 'test-db-1';
 const TEST_DATABASE_ID_2 = 'test-db-2';
 
+/**
+ * Poll `predicate` until it returns true or `timeoutMs` elapses.
+ *
+ * Used by the disk-eviction tests instead of a fixed sleep. Store close is
+ * async (awaits LevelDB `store.close()` before the store is registered as an
+ * eviction candidate), so under CPU/IO load the close can land well after a
+ * fixed wall-clock deadline — a fixed `setTimeout` then asserting the
+ * intermediate candidate count races that latency and flakes. Polling waits
+ * for the actual state to settle, with a generous timeout as the failure cap.
+ */
+async function waitFor(predicate: () => boolean, timeoutMs = 1000, intervalMs = 5): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
+    }
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  }
+}
+
 describe('StoreManager', () => {
   let manager: StoreManager;
   let testDataDir: string;
@@ -239,8 +259,8 @@ describe('StoreManager', () => {
       evictManager.release(TEST_DATABASE_ID);
       expect(evictManager.evictionCandidateCount).to.equal(0);
 
-      // Wait for idle close
-      await new Promise(resolve => setTimeout(resolve, 120));
+      // Wait for idle close to register the store as an eviction candidate.
+      await waitFor(() => evictManager.evictionCandidateCount === 1);
       expect(evictManager.isOpen(TEST_DATABASE_ID)).to.be.false;
       expect(evictManager.evictionCandidateCount).to.equal(1);
     });
@@ -284,7 +304,7 @@ describe('StoreManager', () => {
       evictManager.release(TEST_DATABASE_ID);
 
       // Wait for idle close (but not eviction threshold)
-      await new Promise(resolve => setTimeout(resolve, 120));
+      await waitFor(() => evictManager.evictionCandidateCount === 1);
       expect(evictManager.isOpen(TEST_DATABASE_ID)).to.be.false;
       expect(evictManager.evictionCandidateCount).to.equal(1);
 
@@ -314,8 +334,8 @@ describe('StoreManager', () => {
       await evictManager.acquire(TEST_DATABASE_ID);
       evictManager.release(TEST_DATABASE_ID);
 
-      // Wait for idle close
-      await new Promise(resolve => setTimeout(resolve, 120));
+      // Wait for idle close to register the eviction candidate.
+      await waitFor(() => evictManager.evictionCandidateCount === 1);
       expect(evictManager.evictionCandidateCount).to.equal(1);
 
       await evictManager.shutdown();
