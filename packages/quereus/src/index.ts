@@ -68,14 +68,13 @@ export { AccessPlanBuilder, validateAccessPlan } from './vtab/best-access-plan.j
 // Collation and comparison functions
 export type { CollationFunction } from './util/comparison.js';
 export {
-	// Collation registration and lookup
+	// Built-in collation functions. Custom collations are registered per-database
+	// with `db.registerCollation(...)` and resolved via `db.getCollationResolver()`.
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
 	RTRIM_COLLATION,
-	registerCollation,
-	getCollation,
-	resolveCollation,
 	builtinCollationResolver,
+	normalizeCollationName,
 	resolveCollationFunctions,
 	// Core comparison functions (critical for module implementations)
 	compareSqlValues,
@@ -85,10 +84,10 @@ export {
 	compareRows,
 	compareTypedValues,
 	createTypedComparator,
+	createTypedRowComparator,
+	createCollationRowComparator,
 	// ORDER BY comparison utilities
-	compareWithOrderBy,
 	compareWithOrderByFast,
-	createOrderByComparator,
 	createOrderByComparatorFast,
 	SortDirection,
 	NullsOrdering,

@@ -28,7 +28,8 @@ import { createLogger } from '../../common/logger.js';
 import type { BackingHost, BackingRowChange } from '../../vtab/backing-host.js';
 import type { VirtualTableConnection } from '../../vtab/connection.js';
 import type { SchemaChangeInfo } from '../../vtab/module.js';
-import { compareSqlValues } from '../../util/comparison.js';
+import { compareSqlValuesFast, resolveCollationFunctions } from '../../util/comparison.js';
+import type { CollationResolver } from '../../types/logical-type.js';
 
 const log = createLogger('runtime:emit:materialized-view');
 const warnLog = log.extend('warn');
@@ -713,18 +714,27 @@ function assertNoDerivationCycle(db: Database, schemaName: string, tableName: st
  * {@link materializedViewNotASetError} through {@link assertRefreshRowsAreSet} so
  * its constraint-bearing branch rejects duplicates identically to the
  * `replaceContents` fast path, single-sourcing the collation-aware dup detection.
+ *
+ * The declared key collation names resolve against the OWNING database
+ * (`db.getCollationResolver()`), so a database-replaced `NOCASE` — or a custom
+ * collation registered only on this connection — decides key identity here exactly
+ * as it does in the backing host's own keying. Resolution happens once, above the
+ * sort, and throws `no such collation sequence` on an unregistered name.
  */
 function assertDerivedRowsAreSet(
 	rows: readonly Row[],
 	pk: ReadonlyArray<{ index: number; collation?: string }>,
+	collationResolver: CollationResolver,
 	schemaName: string,
 	name: string,
 	onDuplicate?: (keyVals: string) => QuereusError,
 ): void {
 	if (rows.length < 2) return;
+	const keyCollations = resolveCollationFunctions(collationResolver, pk.map(c => c.collation));
 	const compareKeys = (ra: Row, rb: Row): number => {
-		for (const c of pk) {
-			const cmp = compareSqlValues(ra[c.index], rb[c.index], c.collation ?? 'BINARY');
+		for (let i = 0; i < pk.length; i++) {
+			const idx = pk[i].index;
+			const cmp = compareSqlValuesFast(ra[idx], rb[idx], keyCollations[i]);
 			if (cmp !== 0) return cmp;
 		}
 		return 0;
@@ -755,10 +765,11 @@ function assertDerivedRowsAreSet(
 function assertRefreshRowsAreSet(
 	rows: readonly Row[],
 	pk: ReadonlyArray<{ index: number; collation?: string }>,
+	collationResolver: CollationResolver,
 	schemaName: string,
 	name: string,
 ): void {
-	assertDerivedRowsAreSet(rows, pk, schemaName, name, () => materializedViewNotASetError(schemaName, name));
+	assertDerivedRowsAreSet(rows, pk, collationResolver, schemaName, name, () => materializedViewNotASetError(schemaName, name));
 }
 
 /**
@@ -1027,7 +1038,7 @@ export async function attachMaintainedDerivation(
 	// table's own PK definition may carry pre-reshape indices; equivalent otherwise.
 	const shapePk = computeBackingPrimaryKey(shape)
 		.map(c => ({ index: c.index, collation: shape.columns[c.index]?.collation }));
-	assertDerivedRowsAreSet(rows, shapePk, schemaName, name);
+	assertDerivedRowsAreSet(rows, shapePk, db.getCollationResolver(), schemaName, name);
 
 	const def: MaterializeViewDefinition = {
 		schemaName,
@@ -1468,7 +1479,7 @@ export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): P
 		index: c.index,
 		collation: c.collation ?? backing.columns[c.index]?.collation,
 	}));
-	assertRefreshRowsAreSet(rows, shapePk, mv.schemaName, mv.name);
+	assertRefreshRowsAreSet(rows, shapePk, db.getCollationResolver(), mv.schemaName, mv.name);
 
 	const conn = await resolveAttachConnection(db, host, `${mv.schemaName}.${mv.name}`);
 	await host.applyMaintenance(conn, [{ kind: 'replace-all', rows }]);

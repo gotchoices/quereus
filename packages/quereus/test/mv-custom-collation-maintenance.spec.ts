@@ -101,6 +101,52 @@ describe('materialized-view maintenance under a database-registered collation', 
 	});
 });
 
+describe('the maintained-table "must be a set" gate resolves collations through the database', () => {
+	// `assertDerivedRowsAreSet` / `assertRefreshRowsAreSet`
+	// (runtime/emit/materialized-view-helpers.ts) pair derived rows under the backing
+	// primary-key collations. Attach rejects a body whose column collation differs from
+	// the declared one, so the derived key always compares under the SOURCE column's
+	// collation — which means a database override of `NOCASE` that is *stricter* than the
+	// built-in is the reachable failure. Here `NOCASE` is overridden to fold nothing, so
+	// the source PK admits both 'aa' and 'AA'; a gate that resolved `NOCASE` from a
+	// process-global registry would fold them together and reject a set that is a set.
+	const caseSensitiveNocase = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		db.registerCollation('NOCASE', caseSensitiveNocase, { normalizer: (s: string) => s });
+		await db.exec('create table src (x text collate nocase primary key, id integer not null)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('admits an attach whose derived keys the registered collation keeps distinct', async () => {
+		await db.exec("insert into src values ('aa', 1), ('AA', 2)");
+		await db.exec('create table mt (x text collate nocase primary key, id integer not null) maintained as select x, id from src');
+		expect(await results(db, 'select x, id from mt order by id')).to.deep.equal([
+			{ x: 'aa', id: 1 }, { x: 'AA', id: 2 },
+		]);
+	});
+
+	it('admits a constraint-bearing refresh whose recomputed keys the registered collation keeps distinct', async () => {
+		await db.exec("insert into src values ('aa', 1)");
+		// The CHECK routes `refresh` through the constraint-bearing branch, the only arm
+		// that calls `assertRefreshRowsAreSet`.
+		await db.exec(`create table mt (x text collate nocase primary key, id integer not null, check (x <> 'poison'))
+			maintained as select x, id from src`);
+		// Stales the view and detaches its row-time plan, so the next insert drifts the
+		// source without being maintained into the backing.
+		await db.exec('alter table src add column pad integer null');
+		await db.exec("insert into src (x, id) values ('AA', 2)");
+
+		await db.exec('refresh materialized view mt');
+		expect(await results(db, 'select x, id from mt order by id')).to.deep.equal([
+			{ x: 'aa', id: 1 }, { x: 'AA', id: 2 },
+		]);
+	});
+
+});
+
 describe('materialized-view apply-path key comparisons use the plan-resolved collation', () => {
 	// The three per-row helpers read `collationFn` off each backing-PK descriptor, which the
 	// plan builder resolved against the database once. Exercised directly: the residual /

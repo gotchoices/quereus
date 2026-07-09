@@ -187,7 +187,7 @@ Quereus exports all critical utilities needed for plugin and module development:
 
 * **Comparison Functions** — `compareSqlValues`, `compareRows`, `compareTypedValues`, `createTypedComparator` — match Quereus SQL semantics in custom implementations
 * **Coercion Utilities** — `tryCoerceToNumber`, `coerceForAggregate` — handle type coercion for aggregates and arithmetic
-* **Collation Support** — `registerCollation`, `getCollation`, built-in collations (`BINARY_COLLATION`, `NOCASE_COLLATION`, `RTRIM_COLLATION`)
+* **Collation Support** — collations are registered per database with `db.registerCollation(name, func, options?)` and resolved through `db.getCollationResolver()`; the built-ins `BINARY`, `NOCASE`, and `RTRIM` are always present. Naming an unregistered collation raises `no such collation sequence`
 * **Type System** — full access to logical types, validation, and parsing utilities
 * **Event Hooks** — `VTableEventEmitter` interface for mutation and schema change events; enable reactive patterns, caching, and replication
 * **DDL Generation** — `generateTableDDL(tableSchema, db?)`, `generateIndexDDL(indexSchema, tableSchema, db?)` — canonical `CREATE TABLE` / `CREATE INDEX` output from runtime schema objects. With a `Database`, matches session defaults (schema qualification, `default_column_nullability`, `default_vtab_module`/`default_vtab_args`) for readable output; without one, emits fully-qualified, explicitly-annotated DDL safe for cross-session persistence. See [Schema Management — DDL Generation](../../docs/schema.md#ddl-generation).

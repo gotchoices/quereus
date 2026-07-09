@@ -192,8 +192,8 @@ export class EmissionContext {
 
 	/**
 	 * Resolves a collation name to its function against this emission's database,
-	 * recording the dependency for plan invalidation. Use this in emitters instead of
-	 * the deprecated global `resolveCollation()`.
+	 * recording the dependency for plan invalidation. This is the only collation
+	 * lookup an emitter should use — a name has no meaning outside a `Database`.
 	 *
 	 * Throws `QuereusError` (`no such collation sequence: X`) on an unknown name — the
 	 * miss is delegated to {@link Database.getCollationResolver} so build-time and

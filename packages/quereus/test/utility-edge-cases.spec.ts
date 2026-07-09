@@ -9,7 +9,7 @@ import {
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
 	RTRIM_COLLATION,
-	compareWithOrderBy,
+	createOrderByComparatorFast,
 	getSqlDataTypeName,
 	compareTypedValues,
 	createTypedComparator,
@@ -473,7 +473,15 @@ describe('Utility Edge Cases', () => {
 		});
 	});
 
-	describe('compareWithOrderBy', () => {
+	describe('createOrderByComparatorFast', () => {
+		/** The ORDER BY comparator under BINARY, applied to a single pair. */
+		const compareWithOrderBy = (
+			a: SqlValue,
+			b: SqlValue,
+			direction: 'asc' | 'desc',
+			nullsOrdering?: 'first' | 'last',
+		): number => createOrderByComparatorFast(direction, nullsOrdering, BINARY_COLLATION)(a, b);
+
 		it('should sort ascending by default', () => {
 			expect(compareWithOrderBy(1, 2, 'asc')).to.be.lessThan(0);
 			expect(compareWithOrderBy(2, 1, 'asc')).to.be.greaterThan(0);
@@ -506,6 +514,12 @@ describe('Utility Edge Cases', () => {
 			expect(compareWithOrderBy(null, 1, 'asc')).to.be.lessThan(0);
 			// Default: nulls first for DESC too
 			expect(compareWithOrderBy(null, 1, 'desc')).to.be.lessThan(0);
+		});
+
+		it('should compare text through the supplied collation', () => {
+			const nocase = createOrderByComparatorFast('asc', undefined, NOCASE_COLLATION);
+			expect(nocase('a', 'A')).to.equal(0);
+			expect(createOrderByComparatorFast('asc', undefined, BINARY_COLLATION)('a', 'A')).to.be.greaterThan(0);
 		});
 	});
 

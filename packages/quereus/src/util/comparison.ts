@@ -1,19 +1,12 @@
 import type { Row, SqlValue } from '../common/types.js';
 import type { JSONValue } from '../common/json-types.js';
 import { canonicalJsonString } from './json-canonical.js';
-import { createLogger } from '../common/logger.js';
 import type { LogicalType, CollationFunction, CollationResolver } from '../types/logical-type.js';
 import { StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
 
 
-const log = createLogger('util:comparison');
-const warnLog = log.extend('warn');
-
 export type { CollationFunction };
-
-// Map to store registered collations
-const collations = new Map<string, CollationFunction>();
 
 /**
  * Binary (default) collation function.
@@ -54,61 +47,15 @@ export const RTRIM_COLLATION: CollationFunction = (a, b) => {
 	return lenA - lenB;
 };
 
-// Register built-in collations
-collations.set('BINARY', BINARY_COLLATION);
-collations.set('NOCASE', NOCASE_COLLATION);
-collations.set('RTRIM', RTRIM_COLLATION);
-
-/**
- * Registers a collation function in the global registry.
- * @deprecated Use `db.registerCollation(name, func)` for per-database collation registration.
- * This global registry is retained for standalone utility use and built-in collation fallback.
- * @param name The name of the collation (case-insensitive)
- * @param func The collation function to register
- */
-export function registerCollation(name: string, func: CollationFunction): void {
-    const upperName = name.toUpperCase();
-    if (collations.has(upperName)) {
-        warnLog(`Overwriting existing collation: %s`, upperName);
-    }
-    collations.set(upperName, func);
-}
-
-/**
- * Gets a collation function from the global registry.
- * @deprecated Use `db._getCollation(name)` or `EmissionContext.getCollation()` for per-database lookup.
- * @param name The collation name (case-insensitive)
- * @returns The collation function, or undefined if not found
- */
-export function getCollation(name: string): CollationFunction | undefined {
-	return collations.get(name.toUpperCase());
-}
-
-/**
- * Resolves a collation name to its function from the global registry.
- * @deprecated Use `EmissionContext.resolveCollation()` for per-database resolution during emission.
- * This global version is retained for standalone comparison utilities and vtab internals.
- * @param collationName The collation name
- * @returns The collation function (defaults to BINARY if not found)
- */
-export function resolveCollation(collationName: string): CollationFunction {
-	if (collationName === 'BINARY') return BINARY_COLLATION; // Fast path for most common case
-	const func = collations.get(collationName.toUpperCase());
-	if (!func) {
-		warnLog(`Unknown collation requested: %s. Falling back to BINARY.`, collationName);
-		return BINARY_COLLATION;
-	}
-	return func;
-}
-
 /**
  * Resolves only the built-in collations (BINARY / NOCASE / RTRIM). For standalone
  * utility code and tests that have no `Database`. Returns `undefined` for any other
  * name — callers must decide whether that is an error or a reason to bail.
  *
- * Deliberately a `switch`, not a registry lookup: it must keep working once the
- * deprecated process-global `collations` map above is deleted, and it must never
- * observe a caller's `registerCollation` override of a built-in name.
+ * There is no process-global collation registry: every custom collation lives on a
+ * `Database` (`db.registerCollation`) and resolves through `db.getCollationResolver()`.
+ * This switch is the built-ins-only floor, and it never observes a database's
+ * override of `NOCASE` / `RTRIM`.
  * @param name The collation name (case-insensitive)
  */
 export function builtinCollationResolver(name: string): CollationFunction | undefined {
@@ -122,9 +69,9 @@ export function builtinCollationResolver(name: string): CollationFunction | unde
 
 /**
  * Normalizes a collation name to its canonical form (trimmed, uppercase).
- * SQLite treats collation names case-insensitively; the registry and resolvers
- * all key on the uppercase name, so this yields the SQLite-canonical spelling
- * used for DDL validation and downstream comparisons.
+ * SQLite treats collation names case-insensitively; the per-database registry and
+ * the resolvers all key on the uppercase name, so this yields the SQLite-canonical
+ * spelling used for DDL validation and downstream comparisons.
  * @param name The collation name as written
  * @returns The canonical (trimmed, uppercase) collation name
  */
@@ -274,17 +221,20 @@ function compareSameType(a: SqlValue, b: SqlValue, storageClass: StorageClass, c
 }
 
 /**
- * Compares two SQLite values based on SQLite's comparison rules.
- * Follows SQLite's type ordering: NULL < Numeric < TEXT < BLOB
+ * Compares two SQLite values based on SQLite's comparison rules, under the BINARY
+ * collation. Follows SQLite's type ordering: NULL < Numeric < TEXT < BLOB.
+ *
+ * Deliberately takes no collation name: a name can only be resolved against the
+ * `Database` that owns it. Pass a resolved {@link CollationFunction} to
+ * {@link compareSqlValuesFast} instead — obtain it from `db.getCollationResolver()`
+ * (or {@link builtinCollationResolver} when there is no `Database` in scope).
  *
  * @param a First value
  * @param b Second value
- * @param collationName The collation to use for text comparison (defaults to BINARY)
  * @returns -1 if a < b, 0 if a === b, 1 if a > b
  */
-export function compareSqlValues(a: SqlValue, b: SqlValue, collationName: string = 'BINARY'): number {
-	const collationFunc = collationName === 'BINARY' ? BINARY_COLLATION : resolveCollation(collationName);
-	return compareSqlValuesFast(a, b, collationFunc);
+export function compareSqlValues(a: SqlValue, b: SqlValue): number {
+	return compareSqlValuesFast(a, b, BINARY_COLLATION);
 }
 
 /**
@@ -327,7 +277,7 @@ export function sqlValueIdentical(a: SqlValue, b: SqlValue): boolean {
  * Call this ONCE per comparator / per constraint check, above any row loop: the
  * resolver throws on an unregistered name and is not inlinable, so a per-row
  * call is pure overhead. Do not hold the returned functions across a
- * `registerCollation` call — re-resolve instead.
+ * `db.registerCollation` call — re-resolve instead.
  */
 export function resolveCollationFunctions(
 	resolver: CollationResolver,
@@ -437,55 +387,7 @@ export function compareWithOrderByFast(
 }
 
 /**
- * Compares two SQL values with ORDER BY semantics including direction and NULL ordering.
- * This consolidates the comparison logic used by both sort and window operations.
- *
- * @param a First value
- * @param b Second value
- * @param direction Sort direction ('asc' or 'desc')
- * @param nullsOrdering Explicit NULLS ordering ('first', 'last', or undefined for default)
- * @param collationName The collation to use for text comparison (defaults to BINARY)
- * @returns -1 if a < b, 0 if a === b, 1 if a > b (after applying direction and null ordering)
- */
-export function compareWithOrderBy(
-	a: SqlValue,
-	b: SqlValue,
-	direction: 'asc' | 'desc' = 'asc',
-	nullsOrdering?: 'first' | 'last',
-	collationName: string = 'BINARY'
-): number {
-	// Convert to optimized flags and use fast path
-	const directionFlag = direction === 'desc' ? SortDirection.DESC : SortDirection.ASC;
-	const nullsFlag = nullsOrdering === 'first'
-		? NullsOrdering.FIRST
-		: nullsOrdering === 'last'
-			? NullsOrdering.LAST
-			: NullsOrdering.DEFAULT;
-	const collationFunc = collationName === 'BINARY' ? BINARY_COLLATION : resolveCollation(collationName);
-
-	return compareWithOrderByFast(a, b, directionFlag, nullsFlag, collationFunc);
-}
-
-/**
- * Factory function to create optimized comparison functions for repeated use.
- * Pre-resolves collation and converts string flags to numeric for maximum performance.
- *
- * @param direction Sort direction ('asc' or 'desc')
- * @param nullsOrdering Explicit NULLS ordering ('first', 'last', or undefined for default)
- * @param collationName The collation to use for text comparison (defaults to BINARY)
- * @returns An optimized comparison function
- */
-export function createOrderByComparator(
-	direction: 'asc' | 'desc' = 'asc',
-	nullsOrdering?: 'first' | 'last',
-	collationName: string = 'BINARY'
-): (a: SqlValue, b: SqlValue) => number {
-	const collationFunc = collationName === 'BINARY' ? BINARY_COLLATION : resolveCollation(collationName);
-	return createOrderByComparatorFast(direction, nullsOrdering, collationFunc);
-}
-
-/**
- * Optimized factory function that takes a pre-resolved collation function.
+ * Factory function that takes a pre-resolved collation function.
  * This is the most efficient option when the collation function is already available.
  *
  * @param direction Sort direction ('asc' or 'desc')
@@ -548,6 +450,11 @@ export function isTruthy(value: SqlValue): boolean {
 /**
  * Compares two rows for SQL DISTINCT semantics.
  * Returns -1, 0, or 1 for BTree ordering.
+ *
+ * NOTE: deliberately BINARY-only. It backs DISTINCT ordering in a BTree whose caller
+ * has already applied collation-aware key normalization, so the collation has been
+ * folded into the bytes before this ever runs. Collation-aware row comparison is
+ * {@link createCollationRowComparator}, which takes pre-resolved per-column functions.
  */
 export function compareRows(a: Row, b: Row): number {
 	// Let's assume correct rows

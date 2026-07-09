@@ -1627,11 +1627,12 @@ seen.add(key);
 **Correct** — pre-resolve comparators at emit time to avoid runtime overhead:
 ```typescript
 import { BTree } from 'inheritree';
-import { createCollationRowComparator, resolveCollation, BINARY_COLLATION } from '../util/comparison.js';
+import { createCollationRowComparator, BINARY_COLLATION } from '../util/comparison.js';
 
-// At emit time: pre-resolve collation-based row comparator
+// At emit time: pre-resolve collation-based row comparator. Names resolve against the
+// EmissionContext's database (`ctx.resolveCollation`) — there is no global registry.
 const collationRowComparator = createCollationRowComparator(
-  attributes.map(attr => attr.type.collationName ? resolveCollation(attr.type.collationName) : BINARY_COLLATION)
+  attributes.map(attr => attr.type.collationName ? ctx.resolveCollation(attr.type.collationName) : BINARY_COLLATION)
 );
 
 // At runtime: use pre-resolved comparator in BTree
@@ -1648,11 +1649,11 @@ if (!existingPath.on) {
 
 For typed contexts (where runtime types are guaranteed, e.g. GROUP BY keys):
 ```typescript
-import { createTypedComparator, resolveCollation } from '../util/comparison.js';
+import { createTypedComparator } from '../util/comparison.js';
 
 // At emit time: pre-resolve typed comparator from expression type
 const exprType = expr.getType();
-const collationFunc = exprType.collationName ? resolveCollation(exprType.collationName) : undefined;
+const collationFunc = exprType.collationName ? ctx.resolveCollation(exprType.collationName) : undefined;
 const comparator = createTypedComparator(exprType.logicalType, collationFunc);
 ```
 

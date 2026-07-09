@@ -1148,16 +1148,17 @@ Critical utilities for implementing virtual table modules and custom functions t
 ```typescript
 // Core comparison functions (match Quereus SQL semantics)
 import {
-  compareSqlValues,           // Compare two SQL values with collation support
-  compareSqlValuesFast,       // Optimized version with pre-resolved collation
-  compareRows,                // Compare entire rows for DISTINCT semantics
+  compareSqlValues,           // Compare two SQL values under BINARY
+  compareSqlValuesFast,       // Same, with a pre-resolved collation function
+  compareRows,                // Compare entire rows for DISTINCT semantics (BINARY)
   compareTypedValues,         // Type-aware comparison using LogicalType
   createTypedComparator,      // Factory for type-specific comparators
+  createTypedRowComparator,   // Factory for typed row comparators
+  createCollationRowComparator, // Factory for row comparators with per-column collations
 
   // ORDER BY comparison utilities
-  compareWithOrderBy,         // Compare with direction and NULL ordering
-  compareWithOrderByFast,     // Optimized version with numeric flags
-  createOrderByComparator,    // Factory for ORDER BY comparators
+  compareWithOrderByFast,     // Compare with direction, NULL ordering, and a collation function
+  createOrderByComparatorFast,// Factory for ORDER BY comparators
   SortDirection,              // Enum: ASC = 0, DESC = 1
   NullsOrdering,              // Enum: DEFAULT = 0, FIRST = 1, LAST = 2
 
@@ -1171,9 +1172,9 @@ import {
   BINARY_COLLATION,           // Standard lexicographical comparison
   NOCASE_COLLATION,           // Case-insensitive comparison
   RTRIM_COLLATION,            // Right-trim comparison
-  registerCollation,          // Register custom collation
-  getCollation,               // Get registered collation
-  resolveCollation,           // Resolve collation by name
+  builtinCollationResolver,   // Built-ins-only name lookup (no Database needed)
+  normalizeCollationName,     // Canonical (trimmed, uppercase) collation name
+  resolveCollationFunctions,  // Batch name→function resolution via a CollationResolver
 
   // Coercion utilities
   tryCoerceToNumber,          // Try to convert string to number
@@ -1459,12 +1460,18 @@ const BINARY_COLLATION: CollationFunction;    // Byte-by-byte comparison
 const NOCASE_COLLATION: CollationFunction;    // Case-insensitive comparison
 const RTRIM_COLLATION: CollationFunction;     // Right-trim before comparison
 
-// Collation management
-function registerCollation(
+// Collation management is per-database — there is no process-global registry.
+// Register on the connection that will run the query:
+db.registerCollation(
   name: string,
   func: CollationFunction,
-  normalizer?: (s: string) => string,
+  optionsOrNormalizer?: ((s: string) => string) | { normalizer?: (s: string) => string; replicable?: boolean },
 ): void;
-function getCollation(name: string): CollationFunction | undefined;
-function resolveCollation(collationName: string): CollationFunction;
+
+// Resolve a name to its function. Throws `no such collation sequence: <name>` if unregistered.
+db.getCollationResolver(): CollationResolver;   // (name: string) => CollationFunction
+
+// Built-ins-only lookup, for standalone utility code that has no `Database`.
+// Returns `undefined` for any name outside BINARY / NOCASE / RTRIM.
+function builtinCollationResolver(name: string): CollationFunction | undefined;
 ```

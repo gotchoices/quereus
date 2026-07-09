@@ -232,7 +232,7 @@ Quereus employs a multi-faceted testing strategy:
 	*   Uses the `fast-check` library to generate a wide range of inputs for specific, tricky areas.
 	*   Focuses on verifying fundamental properties and invariants that should hold true across many different values.
 	*   Currently includes tests for:
-		*   **Collation Consistency** — ensures `ORDER BY` results match the behavior of the `compareSqlValues` utility for `BINARY`, `NOCASE`, and `RTRIM` collations across various strings.
+		*   **Collation Consistency** — ensures `ORDER BY` results match the collation function the connection resolves (`db.getCollationResolver()`) for `BINARY`, `NOCASE`, and `RTRIM` across various strings.
 		*   **Numeric Affinity** — verifies that comparisons (`=`, `<`) in SQL handle mixed types (numbers, strings, booleans, nulls) consistently with SQLite's affinity rules, using `compareSqlValues` as the reference.
 		*   **JSON Roundtrip** — confirms that arbitrary JSON values survive being processed by `json_quote()` and `json_extract('$')` without data loss or corruption.
 		*   **Mixed Type Arithmetic** — checks that arithmetic on mixed types behaves consistently between SELECT and WHERE contexts.
