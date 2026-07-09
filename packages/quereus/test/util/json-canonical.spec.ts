@@ -1,11 +1,11 @@
 import { expect } from 'chai';
 import { canonicalJsonString } from '../../src/util/json-canonical.js';
-import { serializeKey, resolveKeyNormalizer } from '../../src/util/key-serializer.js';
+import { serializeKey, BUILTIN_NORMALIZERS } from '../../src/util/key-serializer.js';
 import { compareSqlValues, sqlValueIdentical } from '../../src/util/comparison.js';
 import type { SqlValue } from '../../src/common/types.js';
 import type { JSONValue } from '../../src/common/json-types.js';
 
-const BIN = resolveKeyNormalizer('BINARY');
+const BIN = BUILTIN_NORMALIZERS.BINARY;
 
 /** Single-value hash key for a SqlValue, using the BINARY normalizer. */
 function key(v: SqlValue): string | null {

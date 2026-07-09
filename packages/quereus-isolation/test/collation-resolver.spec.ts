@@ -126,7 +126,7 @@ describe('IsolatedTable collation resolution', () => {
 	// picks `ix_v` for `where v = ...`. If it ever stops doing so the scan falls back to the
 	// primary-key merge, which shadows correctly for other reasons — so these tests would
 	// pass vacuously rather than fail. If you change index selection, re-verify that
-	// reverting `pkNormalizers` to `resolveKeyNormalizer` still makes them fail.
+	// reverting `pkNormalizers` to a built-ins-only resolver still makes them fail.
 	describe('secondary-index scan under a custom PK collation', () => {
 		it('shadows the base row exactly once when the PK is rewritten to a collation-equal value', async () => {
 			// Same override-NOCASE probe as above, but the read path is a secondary-index

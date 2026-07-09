@@ -4,14 +4,13 @@
 
 import { expect } from 'chai';
 import type { SqlValue } from '@quereus/quereus';
+import type { KeyNormalizerResolver } from '@quereus/quereus';
 import {
   encodeValue,
   encodeCompositeKey,
   decodeValue,
   decodeCompositeKey,
-  registerCollationEncoder,
-  getCollationEncoder,
-  type CollationEncoder,
+  BUILTIN_KEY_NORMALIZER_RESOLVER,
 } from '../src/common/encoding.js';
 
 describe('Key Encoding', () => {
@@ -345,23 +344,48 @@ describe('Key Encoding', () => {
     });
   });
 
-  describe('CollationEncoder infrastructure', () => {
-    it('should have built-in NOCASE encoder', () => {
-      const encoder = getCollationEncoder('NOCASE');
-      expect(encoder).to.exist;
-      expect(encoder!.encode('HELLO')).to.equal('hello');
+  describe('key normalizer resolution', () => {
+    it('resolves the built-in NOCASE normalizer', () => {
+      expect(BUILTIN_KEY_NORMALIZER_RESOLVER('NOCASE')('HELLO')).to.equal('hello');
     });
 
-    it('should have built-in BINARY encoder', () => {
-      const encoder = getCollationEncoder('BINARY');
-      expect(encoder).to.exist;
-      expect(encoder!.encode('HELLO')).to.equal('HELLO');
+    it('resolves the built-in BINARY normalizer', () => {
+      expect(BUILTIN_KEY_NORMALIZER_RESOLVER('BINARY')('HELLO')).to.equal('HELLO');
     });
 
-    it('should have built-in RTRIM encoder', () => {
-      const encoder = getCollationEncoder('RTRIM');
-      expect(encoder).to.exist;
-      expect(encoder!.encode('hello   ')).to.equal('hello');
+    it('resolves an undefined collation to BINARY (identity)', () => {
+      expect(BUILTIN_KEY_NORMALIZER_RESOLVER(undefined)('HELLO')).to.equal('HELLO');
+    });
+
+    it('RTRIM strips trailing ASCII space (0x20) only, matching RTRIM_COLLATION', () => {
+      const rtrim = BUILTIN_KEY_NORMALIZER_RESOLVER('RTRIM');
+      expect(rtrim('hello   ')).to.equal('hello');
+      // The retired store-local encoder stripped /\s+$/ — tab, NBSP, every Unicode
+      // space — while the comparator strips only 0x20, so 'a\t' and 'a' shared one
+      // key byte string despite comparing distinct. The engine normalizer does not.
+      expect(rtrim('hello\t')).to.equal('hello\t');
+      expect(rtrim('hello ')).to.equal('hello ');
+      expect(rtrim('hello\t ')).to.equal('hello\t');
+    });
+
+    it('encodes RTRIM values ending in non-space whitespace to distinct keys', () => {
+      const a = encodeValue('a', { collation: 'RTRIM' });
+      const tab = encodeValue('a\t', { collation: 'RTRIM' });
+      const spaces = encodeValue('a  ', { collation: 'RTRIM' });
+      expect(compareBytes(a, spaces)).to.equal(0);   // trailing 0x20 stripped
+      expect(compareBytes(a, tab)).to.not.equal(0);  // trailing tab preserved
+    });
+
+    it('is case-insensitive for collation names', () => {
+      expect(BUILTIN_KEY_NORMALIZER_RESOLVER('nocase')('HELLO')).to.equal('hello');
+      expect(BUILTIN_KEY_NORMALIZER_RESOLVER('NoCase')('HELLO')).to.equal('hello');
+    });
+
+    it('throws on an unknown collation rather than falling back to NOCASE', () => {
+      expect(() => BUILTIN_KEY_NORMALIZER_RESOLVER('NOSPACE'))
+        .to.throw(/no such collation sequence: NOSPACE/);
+      expect(() => encodeValue('hello', { collation: 'NOSPACE' }))
+        .to.throw(/no such collation sequence: NOSPACE/);
     });
 
     it('should preserve RTRIM sort order', () => {
@@ -379,33 +403,25 @@ describe('Key Encoding', () => {
       expect(sorted[4]).to.match(/^b/);
     });
 
-    it('should allow registering custom collation encoder', () => {
-      const reverseEncoder: CollationEncoder = {
-        encode: (value: string) => value.split('').reverse().join(''),
-      };
-      registerCollationEncoder('REVERSE', reverseEncoder);
+    it('uses the supplied resolver for TEXT key bytes', () => {
+      const upper: KeyNormalizerResolver = (name) =>
+        name === 'UPPER' ? (s) => s.toUpperCase() : BUILTIN_KEY_NORMALIZER_RESOLVER(name);
 
-      const encoder = getCollationEncoder('REVERSE');
-      expect(encoder).to.exist;
-      expect(encoder!.encode('abc')).to.equal('cba');
+      const encoded = encodeValue('hello', { collation: 'UPPER', normalizers: upper });
+      expect(decodeValue(encoded).value).to.equal('HELLO');
     });
 
-    it('should be case-insensitive for encoder lookup', () => {
-      expect(getCollationEncoder('nocase')).to.exist;
-      expect(getCollationEncoder('NOCASE')).to.exist;
-      expect(getCollationEncoder('NoCase')).to.exist;
-    });
+    it('carries the resolver through per-column collation overrides in a composite key', () => {
+      const upper: KeyNormalizerResolver = (name) =>
+        name === 'UPPER' ? (s) => s.toUpperCase() : BUILTIN_KEY_NORMALIZER_RESOLVER(name);
 
-    it('should use custom encoder for key encoding', () => {
-      // Register a custom encoder that uppercases
-      const upperEncoder: CollationEncoder = {
-        encode: (value: string) => value.toUpperCase(),
-      };
-      registerCollationEncoder('UPPER', upperEncoder);
-
-      const encoded = encodeValue('hello', { collation: 'UPPER' });
-      const { value } = decodeValue(encoded);
-      expect(value).to.equal('HELLO');
+      const key = encodeCompositeKey(
+        ['hello', 'World'],
+        { collation: 'NOCASE', normalizers: upper },
+        undefined,
+        ['UPPER', undefined],
+      );
+      expect(decodeCompositeKey(key, 2)).to.deep.equal(['HELLO', 'world']);
     });
   });
 });

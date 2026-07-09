@@ -22,9 +22,7 @@ export {
   encodeCompositeKey,
   decodeValue,
   decodeCompositeKey,
-  registerCollationEncoder,
-  getCollationEncoder,
-  type CollationEncoder,
+  BUILTIN_KEY_NORMALIZER_RESOLVER,
   type EncodeOptions,
 } from './encoding.js';
 

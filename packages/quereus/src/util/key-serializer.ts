@@ -23,30 +23,17 @@ const RTRIM_NORMALIZER = (s: string): string => {
 
 const NOCASE_NORMALIZER = (s: string): string => s.toLowerCase();
 
-/**
- * Map a collation name to a string normalizer for key serialization, knowing only the
- * **built-in** collations — the exact analog of `builtinCollationResolver` in
- * `util/comparison.ts`. A name it does not recognize silently normalizes to identity.
- *
- * NOTE: any caller holding a `Database` must use `db.getKeyNormalizerResolver()` instead
- * (or `EmissionContext.resolveKeyNormalizer()` from an emitter) — this function cannot
- * see a collation registered with `db.registerCollation`, so it buckets rows the
- * database's own comparator considers equal into different groups. It survives only for
- * `quereus-store`'s key encoder, which has no `Database` threaded to the call site yet —
- * tracked by `bug-store-key-encoder-ignores-database-collations`. Delete this function
- * once that one is converted.
- */
-export function resolveKeyNormalizer(collationName: string | undefined): (s: string) => string {
-	if (!collationName || collationName === 'BINARY') return IDENTITY_NORMALIZER;
-	switch (collationName.toUpperCase()) {
-		case 'NOCASE': return NOCASE_NORMALIZER;
-		case 'RTRIM':  return RTRIM_NORMALIZER;
-		default:       return IDENTITY_NORMALIZER;
-	}
-}
-
 /** Built-in normalizers, exported so the `Database` collation registry can seed
- *  them alongside the comparators. Keys match the SQL canonical names. */
+ *  them alongside the comparators, and so a caller with no `Database` in scope (the
+ *  store's default key-normalizer resolver) can build a built-ins-only resolver over
+ *  the same three functions rather than a divergent local copy. Keys match the SQL
+ *  canonical names.
+ *
+ *  Any caller that DOES hold a `Database` must resolve through
+ *  `db.getKeyNormalizerResolver()` (or `EmissionContext.resolveKeyNormalizer()` from an
+ *  emitter) — indexing this map directly cannot see a collation registered with
+ *  `db.registerCollation`, so it buckets rows the database's own comparator considers
+ *  equal into different groups. */
 export const BUILTIN_NORMALIZERS: Readonly<Record<string, (s: string) => string>> = {
 	BINARY: IDENTITY_NORMALIZER,
 	NOCASE: NOCASE_NORMALIZER,

@@ -37,8 +37,8 @@ import type {
 	BackingHost,
 	LensDeploymentSnapshot,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, resolveKeyNormalizer, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
-import type { CompiledPredicate } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
+import type { CompiledPredicate, KeyNormalizerResolver } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
@@ -64,7 +64,6 @@ import {
 	classifyCatalogKey,
 } from './key-builder.js';
 import { deserializeRow } from './serialization.js';
-import { getCollationEncoder } from './encoding.js';
 import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
 
 /**
@@ -846,6 +845,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			tableSchema,
 			indexSchema,
 			keyCollation,
+			db.getKeyNormalizerResolver(),
 		);
 
 		// Refresh the connected table's cached schema so subsequent DML
@@ -970,6 +970,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * CONSTRAINT before any entries are written. Mirrors the memory module's
 	 * populateNewIndex so `CREATE UNIQUE INDEX` over duplicated data fails
 	 * atomically.
+	 *
+	 * `normalizers` MUST be the owning connection's `db.getKeyNormalizerResolver()` —
+	 * the same resolver `StoreTable.encodeOptions` carries. A rebuild that resolved
+	 * collations any other way would re-encode the PK suffix under different bytes than
+	 * the table writes at maintenance time, silently corrupting the index.
 	 */
 	private async buildIndexEntries(
 		dataEntries: AsyncIterable<KVEntry>,
@@ -977,11 +982,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		tableSchema: TableSchema,
 		indexSchema: TableIndexSchema,
 		keyCollation: string,
+		normalizers: KeyNormalizerResolver,
 	): Promise<void> {
 		// Index COLUMN values use the table-level key collation K; the PK SUFFIX uses
 		// each PK column's own key collation, so the suffix bytes match the data-store
 		// keys (and `StoreTable.updateSecondaryIndexes`' maintenance writes) exactly.
-		const encodeOptions = { collation: keyCollation };
+		const encodeOptions = { collation: keyCollation, normalizers };
 		const pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 		const pkCollations = resolvePkKeyCollations(tableSchema.primaryKeyDefinition, tableSchema.columns, keyCollation);
 		const indexDirections = indexSchema.columns.map(col => !!col.desc);
@@ -994,11 +1000,19 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Per-column normalizers for the in-pass UNIQUE dup check, drawing each
 		// column's collation from the index column (if it carries one) else the
 		// underlying table column — so the dedup signature honors a per-column
-		// NOCASE/RTRIM collation, matching write-time enforcement.
+		// collation registered on this connection, matching write-time enforcement.
+		// A column whose declared type can never hold text takes the identity
+		// normalizer regardless of its collation (`serializeRowKey` normalizes only
+		// string values), so a comparator-only collation named on an integer column
+		// is not rejected here when the engine's own hash sites would accept it.
 		const indexColIndices = indexSchema.columns.map(col => col.index);
 		const indexNormalizers = seen
-			? indexSchema.columns.map(col =>
-				resolveKeyNormalizer(col.collation ?? tableSchema.columns[col.index].collation))
+			? indexSchema.columns.map(col => {
+				const column = tableSchema.columns[col.index];
+				return normalizers(logicalTypeCanHoldText(column.logicalType)
+					? (col.collation ?? column.collation)
+					: undefined);
+			})
 			: undefined;
 
 		const batch = indexStore.batch();
@@ -1062,13 +1076,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * COLLATE` on a PK member (a PK column's key collation changes). Shared by both
 	 * arms so the clear-then-rebuild stays identical. `schema` must already be the
 	 * post-ALTER schema (its `primaryKeyDefinition` + column collations drive the new
-	 * PK-suffix encoding via {@link buildIndexEntries}).
+	 * PK-suffix encoding via {@link buildIndexEntries}). `normalizers` is the owning
+	 * connection's `db.getKeyNormalizerResolver()` — see {@link buildIndexEntries}.
 	 */
 	private async rebuildSecondaryIndexes(
 		schemaName: string,
 		tableName: string,
 		table: StoreTable,
 		schema: TableSchema,
+		normalizers: KeyNormalizerResolver,
 	): Promise<void> {
 		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
 		const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
@@ -1085,6 +1101,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				schema,
 				indexSchema,
 				keyCollation,
+				normalizers,
 			);
 		}
 	}
@@ -1102,21 +1119,27 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * No index store is written — store UNIQUE enforcement is a full-scan over
 	 * `uniqueConstraints` at write time. The signature is built by
-	 * {@link serializeRowKey} with one normalizer per constrained column drawn from
-	 * `tableSchema.columns[idx].collation`, so a per-column NOCASE/RTRIM collation
-	 * is honored (matching write-time `compareSqlValues` enforcement). Residual: a
-	 * custom comparator-only collation has no string normalizer and falls back to
-	 * BINARY for the dedup (see docs/schema.md store-collation note).
+	 * {@link serializeRowKey} with one normalizer per constrained column, resolved from
+	 * `tableSchema.columns[idx].collation` through the connection's
+	 * `db.getKeyNormalizerResolver()`, so a per-column collation registered with
+	 * `db.registerCollation` is honored (matching write-time `compareSqlValues`
+	 * enforcement). A comparator-only collation raises: rows that cannot be bucketed
+	 * cannot be deduped. Columns whose declared type can never hold text take the
+	 * identity normalizer and so never raise.
 	 */
 	private async validateUniqueOverExistingRows(
 		dataStore: KVStore,
 		tableSchema: TableSchema,
 		uc: UniqueConstraintSchema,
+		keyNormalizers: KeyNormalizerResolver,
 	): Promise<void> {
 		const predicate: CompiledPredicate | undefined = uc.predicate
 			? compilePredicate(uc.predicate, tableSchema.columns)
 			: undefined;
-		const normalizers = uc.columns.map(idx => resolveKeyNormalizer(tableSchema.columns[idx].collation));
+		const normalizers = uc.columns.map(idx => {
+			const column = tableSchema.columns[idx];
+			return keyNormalizers(logicalTypeCanHoldText(column.logicalType) ? column.collation : undefined);
+		});
 		const seen = new Set<string>();
 
 		for await (const entry of dataStore.iterate(buildFullScanBounds())) {
@@ -1399,7 +1422,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 				// Secondary index keys embed the PK suffix — clear + rebuild every
 				// index against the now-rekeyed data store.
-				await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema);
+				await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
 
 				table.updateSchema(updatedSchema);
 				await this.saveTableDDL(updatedSchema);
@@ -1424,7 +1447,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// but we must validate the existing rows before persisting.
 					const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
 					const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
-					await this.validateUniqueOverExistingRows(dataStore, oldSchema, uc);
+					await this.validateUniqueOverExistingRows(dataStore, oldSchema, uc, db.getKeyNormalizerResolver());
 					updatedSchema = {
 						...oldSchema,
 						uniqueConstraints: Object.freeze([...(oldSchema.uniqueConstraints ?? []), uc]),
@@ -1678,7 +1701,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					if (coveringConstraints.length > 0) {
 						const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
 						for (const uc of coveringConstraints) {
-							await this.validateUniqueOverExistingRows(dataStore, updatedSchema, uc);
+							await this.validateUniqueOverExistingRows(dataStore, updatedSchema, uc, db.getKeyNormalizerResolver());
 						}
 					}
 				}
@@ -1694,7 +1717,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				// carries the new collation, so the new key bytes follow it.
 				if (collationChanged && oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
 					await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
-					await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema);
+					await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
 				}
 
 				table.updateSchema(updatedSchema);
@@ -2054,11 +2077,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				.setExplanation(`Store index scan on ${index.name} (${why})`)
 				.build();
 
-		// Table key collation K for this table (default NOCASE), and its encoder.
+		// Table key collation K for this table (default NOCASE). Any K reaching here has a
+		// key normalizer: `StoreTable`'s constructor rejects one that cannot key, and a
+		// name we cannot resolve to a table falls back to the built-in NOCASE.
 		const K = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation ?? 'NOCASE').toUpperCase();
-		if (getCollationEncoder(K) === undefined) {
-			return costOnly(`cost-only; key collation ${K} has no byte encoder`);
-		}
 
 		// A seek column is collation-safe to mark handled iff K is coarser-or-equal
 		// to the INDEX column's effective comparison collation C (the index column's

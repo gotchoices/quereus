@@ -14,7 +14,7 @@ import type { Row, SqlValue } from '../common/types.js';
 import type { UniqueConstraintSchema } from '../schema/table.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { AssertionViolation } from './database-assertions.js';
-import type { CollationResolver, KeyNormalizerResolver } from '../types/logical-type.js';
+import type { CollationResolver, KeyNormalizer, KeyNormalizerResolver } from '../types/logical-type.js';
 
 /**
  * One externally-applied row change to report through
@@ -265,4 +265,17 @@ export interface DatabaseInternal {
 	 * Call it at key-encoder-construction time, not per row.
 	 */
 	getKeyNormalizerResolver(): KeyNormalizerResolver;
+
+	/**
+	 * Non-throwing probe of the key normalizer registered for `name`. Returns `undefined`
+	 * both for an unregistered collation and for one registered with a comparator but no
+	 * normalizer — the caller distinguishes the two (see `getCollationResolver`, which
+	 * throws `no such collation sequence` for the former).
+	 *
+	 * Use this where a collation must be VALIDATED without raising on the spot — e.g. a
+	 * store module rejecting a collation that cannot key a persisted structure at DDL
+	 * time, or a planner guard that must degrade rather than throw. Where an error is the
+	 * right answer, use {@link getKeyNormalizerResolver} instead.
+	 */
+	_getCollationNormalizer(name: string): KeyNormalizer | undefined;
 }

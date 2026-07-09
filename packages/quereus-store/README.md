@@ -415,7 +415,7 @@ console.log(hasIsolation(isolatedModule)); // true
 | `decodeValue` | Decode bytes back to SQL value |
 | `encodeCompositeKey` | Encode multiple values as composite key |
 | `decodeCompositeKey` | Decode composite key to values |
-| `registerCollationEncoder` | Register custom collation |
+| `BUILTIN_KEY_NORMALIZER_RESOLVER` | Built-ins-only key-normalizer resolver (`EncodeOptions.normalizers` default) |
 
 ### Serialization Utilities
 

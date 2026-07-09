@@ -512,15 +512,12 @@ describe('StoreModule predicate pushdown', () => {
 		// backlog/debt-bigint-pk-store-range-seek-test.
 	});
 
-	// A leading PK key collation with NO registered byte encoder must NOT produce a
-	// narrowed window — `encodeText` silently falls back to NOCASE bytes that do not
-	// track the column's logical order, so a derived window could under-fetch.
-	// `matchesFilters` (collation-aware) stays authoritative on the full scan.
-	//
-	// The engine restricts TEXT column collations to BINARY/NOCASE/RTRIM (all of
-	// which DO have a byte encoder), so this branch is defensive and unreachable via
-	// DDL today; we exercise it white-box by setting the key collation directly.
-	describe('comparator-only collation falls back to full scan (buildPKRangeBounds)', () => {
+	// Every PK key collation reaching `buildPKRangeBounds` has a key normalizer:
+	// `StoreTable`'s constructor rejects one that cannot key a persisted structure
+	// (`no such collation sequence` / `cannot key a persisted structure`), so there is
+	// no longer a "comparator-only" branch to fall back from. The window it derives is
+	// still only a SUPERSET — `matchesFilters` stays the authoritative row filter.
+	describe('buildPKRangeBounds narrows under a resolvable key collation', () => {
 		// Structural view of the protected surface under test.
 		interface RangeBoundsProbe {
 			pkKeyCollations: (string | undefined)[];
@@ -538,21 +535,7 @@ describe('StoreModule predicate pushdown', () => {
 				constraints: [{ columnIndex: 0, op: IndexConstraintOp.GT, value: 'banana' }],
 			});
 
-		it('returns full-scan bounds when the leading PK collation has no byte encoder', async () => {
-			await db.exec(`create table sorted (name text collate NOCASE primary key, n integer) using store`);
-			const table = storeModule.getTable('main', 'sorted');
-			expect(table, 'store table should be registered after create').to.exist;
-
-			// Force a comparator-only key collation (no registered byte encoder).
-			(table as unknown as RangeBoundsProbe).pkKeyCollations = ['CUSTOMSORT'];
-
-			const bounds = gtBananaBounds(table!);
-			// Full-scan bounds: empty gte, no lt — NOT a narrowed window.
-			expect(bounds.lt, 'comparator-only PK must not narrow the upper bound').to.be.undefined;
-			expect(bounds.gte, 'comparator-only PK must keep an unbounded lower bound').to.have.lengthOf(0);
-		});
-
-		it('a registered-encoder (NOCASE) PK DOES narrow (positive control)', async () => {
+		it('a NOCASE text PK narrows to a non-empty lower bound', async () => {
 			await db.exec(`create table plain (name text collate NOCASE primary key, n integer) using store`);
 			const table = storeModule.getTable('main', 'plain');
 			expect(table).to.exist;
@@ -560,6 +543,17 @@ describe('StoreModule predicate pushdown', () => {
 			const bounds = gtBananaBounds(table!);
 			expect(bounds.gte, 'NOCASE PK should seek to a lower bound').to.exist;
 			expect(bounds.gte!.length, 'NOCASE PK should seek to a non-empty lower bound').to.be.greaterThan(0);
+		});
+
+		it('an unresolvable key collation is rejected at CREATE TABLE, not at seek time', async () => {
+			let error: Error | null = null;
+			try {
+				await db.exec(`create table sorted (name text primary key) using store (collation = 'CUSTOMSORT')`);
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, 'expected CREATE TABLE to reject the unresolvable key collation').to.not.be.null;
+			expect(error!.message).to.match(/CUSTOMSORT/);
 		});
 	});
 

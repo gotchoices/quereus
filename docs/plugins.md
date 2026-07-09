@@ -1457,7 +1457,9 @@ any of:
 - a `GROUP BY` key or a window `PARTITION BY` key;
 - a hash/bloom join key, or an `AS OF` partition key;
 - a `PRIMARY KEY` column of an isolation-wrapped table (`using isolated`), when a
-  transaction with pending writes on it is scanned through a secondary index.
+  transaction with pending writes on it is scanned through a secondary index;
+- a `PRIMARY KEY` column of a persistent-store table (`using store`, and the
+  LevelDB / IndexedDB plugins built on it), or that table's key collation `K`.
 
 A comparator-only registration still works for `ORDER BY` and standalone
 comparisons. Index creation naming it is rejected, and a query that groups or
@@ -1470,6 +1472,14 @@ so the engine ignores it there rather than raising.
 
 Normalizer-and-comparator agreement is a hard contract. If they diverge, index
 lookups silently miss rows and groups split or merge wrongly.
+
+**Register store collations before opening the database.** A store table's physical
+key bytes come from its collation's normalizer, so the collation must be resolvable on
+every connection that reads the table — not only the one that created it. Reopening a
+persisted database from a connection that has not re-registered its custom collation now
+raises while rehydrating the catalog (`create table` from the stored DDL), naming the
+collation, rather than silently reading rows under a key layout it cannot reproduce.
+Call `db.registerCollation(...)` before the first statement that touches the store.
 
 ### Built-in Collations
 

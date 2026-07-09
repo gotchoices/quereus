@@ -66,7 +66,7 @@ import {
 	deserializeStats,
 	type TableStats,
 } from './serialization.js';
-import { getCollationEncoder, type EncodeOptions } from './encoding.js';
+import { type EncodeOptions } from './encoding.js';
 
 /** Number of mutations before persisting statistics. */
 const STATS_FLUSH_INTERVAL = 100;
@@ -104,18 +104,20 @@ function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | und
  *
  * The store encodes PRIMARY KEY uniqueness/ordering PHYSICALLY in the key bytes,
  * so each text PK column's key must be encoded under that column's declared
- * collation (BINARY / NOCASE / RTRIM — the registered encoders). Returns one
- * entry per PK member, in `pkDef` order:
+ * collation. Returns one entry per PK member, in `pkDef` order:
  *   - text member → its declared `collation` (normalized upper-case), or
  *     `fallback` (the table key collation K) when the column carries none.
  *   - non-text member → `undefined`: collation is meaningless for
  *     integer/real/blob keys (they encode type-natively), so the encoder ignores
  *     it and the data/index key bytes are identical regardless.
  *
- * A custom comparator-only collation with no registered byte encoder still maps
- * to NOCASE bytes inside `encodeText` (its `?? NOCASE_ENCODER` fallback); that
- * residual is the same one documented for store UNIQUE enforcement and is out of
- * scope here. Shared by {@link StoreTable} (data-key + index-maintenance) and
+ * Every name returned here is encoded through the key-normalizer resolver carried
+ * in `EncodeOptions.normalizers` (`db.getKeyNormalizerResolver()`), so a collation
+ * registered or overridden with `db.registerCollation` produces key bytes that agree
+ * with the comparator the store's UNIQUE enforcement uses. A collation that cannot
+ * key — unregistered, or registered with a comparator but no normalizer — is rejected
+ * at DDL time by {@link StoreTable.validateKeyCollations}, so no encode call ever has
+ * to fall back. Shared by {@link StoreTable} (data-key + index-maintenance) and
  * `StoreModule.buildIndexEntries` (index rebuild) so the PK suffix encoding can
  * never drift between the two.
  */
@@ -271,8 +273,9 @@ export class StoreTable extends VirtualTable {
 	 * registered after connect is still visible. Resolved *functions* are hoisted no
 	 * further than the comparator or constraint check that resolved them.
 	 *
-	 * Distinct from {@link pkKeyCollations}, which names the *encoders* that produce
-	 * physical key bytes — a separate registry (see `encoding.ts`) this does not touch.
+	 * Its key-bytes counterpart, `db.getKeyNormalizerResolver()`, is bound into
+	 * {@link encodeOptions} so the names in {@link pkKeyCollations} resolve to the same
+	 * per-connection registry.
 	 */
 	protected readonly collationResolver: CollationResolver;
 	protected ddlSaved = false;
@@ -310,14 +313,68 @@ export class StoreTable extends VirtualTable {
 		this.config = config;
 		this.eventEmitter = eventEmitter;
 		this.collationResolver = db.getCollationResolver();
-		this.encodeOptions = { collation: config.collation || 'NOCASE' };
+		this.encodeOptions = {
+			collation: config.collation || 'NOCASE',
+			normalizers: db.getKeyNormalizerResolver(),
+		};
 		this.pkDirections = tableSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 		this.pkKeyCollations = resolvePkKeyCollations(
 			tableSchema.primaryKeyDefinition,
 			tableSchema.columns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
+		this.validateKeyCollations(tableSchema);
 		this.ddlSaved = isConnected;
+	}
+
+	/**
+	 * Reject, at DDL time, any collation this table's key encoding would need but cannot
+	 * use — before a single row is written under bytes the connection cannot reproduce.
+	 *
+	 * A collation keys a persisted structure only if it carries a KEY NORMALIZER (the
+	 * `(s) => string` whose output equality partitions strings exactly as its comparator
+	 * does). `db.registerCollation(name, cmp)` with no `{ normalizer }` gives a collation
+	 * that can order rows but not key them; an unregistered name gives nothing at all.
+	 * Both raise here rather than at the first insert.
+	 *
+	 * Checked over exactly the collations the key encoding actually uses:
+	 *   - every defined {@link pkKeyCollations} entry (text-capable PK columns);
+	 *   - the table key collation K, but only when it is reachable — a secondary index
+	 *     encodes its index-column bytes under K (`buildIndexKey`), and a PK member that
+	 *     `resolvePkKeyCollations` left `undefined` yet whose declared type can still hold
+	 *     a string (ANY / JSON) falls back to K inside `encodeValue`.
+	 *
+	 * So a table with an integer PK and no secondary index is never made unopenable by a
+	 * key collation it does not encode with.
+	 *
+	 * Blast radius: this also fires on catalog rehydration. Reopening a persisted database
+	 * from a connection that has not re-registered its custom collation now throws at
+	 * CREATE-TABLE-from-catalog rather than silently reading rows under a key layout it
+	 * cannot reproduce. See `docs/plugins.md`.
+	 */
+	private validateKeyCollations(schema: TableSchema): void {
+		const names = new Set<string>();
+		for (const collation of this.pkKeyCollations) {
+			if (collation !== undefined) names.add(collation);
+		}
+		const usesTableKeyCollation =
+			(schema.indexes?.length ?? 0) > 0
+			|| schema.primaryKeyDefinition.some((def, i) =>
+				this.pkKeyCollations[i] === undefined && columnCanHoldText(schema.columns[def.index]));
+		if (usesTableKeyCollation) names.add((this.encodeOptions.collation ?? 'NOCASE').toUpperCase());
+
+		const dbInternal = this.db as DatabaseInternal;
+		for (const name of names) {
+			if (dbInternal._getCollationNormalizer(name)) continue;
+			// Unregistered names raise `no such collation sequence: X` from the resolver;
+			// reaching past it means the collation exists but is comparator-only.
+			this.collationResolver(name);
+			throw new QuereusError(
+				`collation ${name} cannot key a persisted structure: no key normalizer registered `
+					+ `— pass { normalizer } to registerCollation`,
+				StatusCode.ERROR,
+			);
+		}
 	}
 
 	/** Get the table configuration. */
@@ -339,6 +396,7 @@ export class StoreTable extends VirtualTable {
 			newSchema.columns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
+		this.validateKeyCollations(newSchema);
 	}
 
 	/**
@@ -884,11 +942,16 @@ export class StoreTable extends VirtualTable {
 	 * row filter. A NULL/missing bound value is likewise skipped (the planner never
 	 * pushes `= NULL`, and a range op against NULL rejects every row in matchesFilters).
 	 *
-	 * Falls back to a full scan when the leading text PK column declares a
-	 * comparator-only collation with no registered byte encoder: `encodeText` would
-	 * silently key it under NOCASE bytes that do not track the column's logical
-	 * order, so a derived window could UNDER-fetch. A non-text leading column has
-	 * `pkKeyCollations[0] === undefined` and encodes type-natively — always safe.
+	 * NOTE: a range window over a text PK column is sound only when the column's key
+	 * normalizer is ORDER-preserving with respect to its comparator — i.e. the comparator
+	 * orders two strings the way memcmp orders their normalized bytes. All three built-ins
+	 * satisfy this, and today only a built-in NAME can reach a PK column (DDL rejects any
+	 * other). `db.registerCollation` guarantees only that a normalizer partitions strings
+	 * the way the comparator calls them equal, NOT that it preserves order — so once
+	 * custom collation names become nameable on a column (`feat-ddl-accepts-registered-
+	 * collations`), an order-reversing normalizer here would UNDER-fetch. If that lands,
+	 * gate this window (and `analyzeIndexAccess`) on an order-preservation assertion at
+	 * registration, or restrict seeks to collations the engine knows are order-preserving.
 	 */
 	protected buildPKRangeBounds(access: PKAccessPattern): IterateOptions {
 		const full = buildFullScanBounds();
@@ -896,11 +959,6 @@ export class StoreTable extends VirtualTable {
 		if (!constraints || constraints.length === 0) return full;
 
 		const dir = this.pkDirections[0];
-		const coll = this.pkKeyCollations[0];
-		// A comparator-only collation (declared on the column, but with no registered
-		// byte encoder) is not seekable: its key bytes fall back to NOCASE and do not
-		// track the column's logical order. Stay full-scan; matchesFilters is authoritative.
-		if (coll !== undefined && getCollationEncoder(coll) === undefined) return full;
 
 		let gte: Uint8Array = full.gte;
 		let lt: Uint8Array | undefined;
@@ -983,22 +1041,16 @@ export class StoreTable extends VirtualTable {
 	 * (the prefix covers every entry sharing those leading values — an index seek
 	 * is a PREFIX scan, not a single row, since the index need not be unique and
 	 * the PK suffix varies); otherwise a range (LT/LE/GT/GE) on the LEADING index
-	 * column yields a `range` window. Returns null when neither applies, when the
-	 * index is unresolved, or when the table key collation K has no registered byte
-	 * encoder (its window bytes would not track logical order — mirrors
-	 * {@link buildPKRangeBounds}' comparator-only fallback). {@link matchesFilters}
-	 * stays the authoritative row filter, so the window need only be a SUPERSET.
+	 * column yields a `range` window. Returns null when neither applies or when the
+	 * index is unresolved. {@link matchesFilters} stays the authoritative row filter,
+	 * so the window need only be a SUPERSET. Index-column bytes are encoded under the
+	 * table key collation K (NOT the index's per-column declared collation — see
+	 * `buildIndexKey`); the same order-preservation caveat {@link buildPKRangeBounds}
+	 * records applies to K here.
 	 */
 	protected analyzeIndexAccess(filterInfo: FilterInfo): IndexAccessPattern | null {
 		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
 		if (!index) return null;
-
-		// Index-column bytes are encoded under the table key collation K (NOT the
-		// index's per-column declared collation — see buildIndexKey). A K with no
-		// registered byte encoder cannot produce a sound window; fall back to a full
-		// scan (matchesFilters remains authoritative).
-		const coll = this.encodeOptions.collation ?? 'NOCASE';
-		if (getCollationEncoder(coll) === undefined) return null;
 
 		const indexCols = index.columns.map(c => c.index);
 		const indexDirections = index.columns.map(c => !!c.desc);
@@ -1017,7 +1069,7 @@ export class StoreTable extends VirtualTable {
 		if (eqValues.length > 0) {
 			const bounds = buildIndexPrefixBounds(
 				eqValues,
-				{ collation: coll },
+				this.encodeOptions,
 				indexDirections.slice(0, eqValues.length),
 			);
 			return { index, type: 'point', bounds };
@@ -1036,7 +1088,6 @@ export class StoreTable extends VirtualTable {
 					value: c.argvIndex > 0 ? filterInfo.args[c.argvIndex - 1] : undefined,
 				})),
 				indexDirections[0],
-				coll,
 			);
 			return { index, type: 'range', bounds };
 		}
@@ -1048,8 +1099,9 @@ export class StoreTable extends VirtualTable {
 	 * Convert leading-index-column LT/LE/GT/GE constraints into one encoded-byte
 	 * `gte`/`lt` window — the secondary-index analogue of {@link buildPKRangeBounds}.
 	 *
-	 * Each bound value is encoded under the table key collation K (`coll`) and the
-	 * leading index column's DESC `dir` — exactly as {@link buildIndexKey} encodes
+	 * Each bound value is encoded under {@link encodeOptions} (the table key collation K
+	 * and its normalizer resolver) and the leading index column's DESC `dir` — exactly as
+	 * {@link buildIndexKey} encodes
 	 * that column — via {@link buildIndexPrefixBounds}, giving the byte region
 	 * `[lo, hi)` whose leading column equals that value. The op maps that region's
 	 * endpoints onto `gte`/`lt`, with the same DESC lower/upper SWAP as the PK path:
@@ -1069,7 +1121,6 @@ export class StoreTable extends VirtualTable {
 	protected buildIndexRangeBounds(
 		constraints: Array<{ op: IndexConstraintOp; value?: SqlValue }>,
 		dir: boolean,
-		coll: string,
 	): IterateOptions {
 		const full = buildFullScanBounds();
 		let gte: Uint8Array = full.gte;
@@ -1077,7 +1128,7 @@ export class StoreTable extends VirtualTable {
 
 		for (const c of constraints) {
 			if (c.value === undefined || c.value === null) continue;
-			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], { collation: coll }, [dir]);
+			const { gte: lo, lt: hi } = buildIndexPrefixBounds([c.value], this.encodeOptions, [dir]);
 			const lower = !dir
 				? (c.op === IndexConstraintOp.GE ? lo : c.op === IndexConstraintOp.GT ? hi : undefined)
 				: (c.op === IndexConstraintOp.LE ? lo : c.op === IndexConstraintOp.LT ? hi : undefined);
@@ -1891,16 +1942,16 @@ export class StoreTable extends VirtualTable {
 	 *    the seek UNDER-fetches and a real duplicate would be silently accepted:
 	 *    reject, so the caller full-scans.
 	 *
-	 * Also rejects when K has no registered byte encoder (its window bytes would
-	 * not track logical order). Same direction and same admitted cases as the
-	 * read-side guard in `StoreModule.tryIndexAccessPlan`; conservative rather
-	 * than exhaustive (K = RTRIM over C = BINARY is provably safe but declined),
-	 * which costs an optimization, never correctness.
+	 * Same direction and same admitted cases as the read-side guard in
+	 * `StoreModule.tryIndexAccessPlan`; conservative rather than exhaustive
+	 * (K = RTRIM over C = BINARY is provably safe but declined), which costs an
+	 * optimization, never correctness. The coarseness test is only sound for the
+	 * built-in names: a custom K equals a custom C only when the index column names
+	 * that same collation, and otherwise falls through to the full scan.
 	 */
 	private indexSeekHonorsEnforcementCollation(uc: UniqueConstraintSchema): boolean {
 		const schema = this.tableSchema!;
 		const K = (this.encodeOptions.collation ?? 'NOCASE').toUpperCase();
-		if (getCollationEncoder(K) === undefined) return false;
 
 		const collations = uniqueEnforcementCollations(schema, uc);
 		return uc.columns.every((colIdx, i) => {

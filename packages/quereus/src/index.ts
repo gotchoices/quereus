@@ -202,8 +202,10 @@ export {
 export { Latches } from './util/latches.js';
 
 // Collation-aware key serialization (used by store modules for existing-row
-// UNIQUE re-validation that honors a per-column NOCASE/RTRIM/BINARY collation).
-export { resolveKeyNormalizer, serializeRowKey } from './util/key-serializer.js';
+// UNIQUE re-validation that honors a per-column collation). `BUILTIN_NORMALIZERS`
+// backs a store's default key-normalizer resolver for callers that hold no Database;
+// any caller that DOES hold one must resolve through `db.getKeyNormalizerResolver()`.
+export { BUILTIN_NORMALIZERS, serializeRowKey } from './util/key-serializer.js';
 
 // Whether a column's declared type can ever hold text, and therefore whether a key
 // built over it needs a key normalizer at all. Out-of-package hash-key sites (the

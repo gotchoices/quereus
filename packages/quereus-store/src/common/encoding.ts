@@ -11,78 +11,51 @@
  *   0x04 - BLOB (raw bytes, escaped + null-terminated)
  *
  * Collation support:
- *   Collations can register a CollationEncoder to transform strings before
- *   binary encoding, preserving their sort semantics in the key-value store.
+ *   A TEXT/OBJECT value's key bytes are produced by running the value through the
+ *   collation's KEY NORMALIZER — the `(s: string) => string` whose output equality
+ *   partitions strings exactly as the collation's comparator does. Normalizers are
+ *   resolved through `EncodeOptions.normalizers`, which callers holding a `Database`
+ *   must set to `db.getKeyNormalizerResolver()` so key bytes and value comparisons
+ *   agree on which strings are the same value.
  */
 
-import type { SqlValue, JsonSqlValue } from '@quereus/quereus';
-import { canonicalJsonString } from '@quereus/quereus';
-
-// ============================================================================
-// Collation Encoder Infrastructure
-// ============================================================================
-
-/**
- * Interface for collation-aware string encoding.
- * Implementations transform strings to preserve collation sort order
- * when encoded as binary keys.
- */
-export interface CollationEncoder {
-  /** Transform a string for sort-preserving binary encoding. */
-  encode(value: string): string;
-}
-
-/** Registry of collation encoders. */
-const collationEncoders = new Map<string, CollationEncoder>();
-
-/**
- * Register a collation encoder.
- * @param name Collation name (case-insensitive)
- * @param encoder The encoder implementation
- */
-export function registerCollationEncoder(name: string, encoder: CollationEncoder): void {
-  collationEncoders.set(name.toUpperCase(), encoder);
-}
-
-/**
- * Get a registered collation encoder.
- * @param name Collation name (case-insensitive)
- * @returns The encoder, or undefined if not registered
- */
-export function getCollationEncoder(name: string): CollationEncoder | undefined {
-  return collationEncoders.get(name.toUpperCase());
-}
-
-// Built-in collation encoders
-
-/** NOCASE: Lowercase for case-insensitive ordering (default). */
-const NOCASE_ENCODER: CollationEncoder = {
-  encode: (value: string) => value.toLowerCase(),
-};
-
-/** BINARY: No transformation, native byte ordering. */
-const BINARY_ENCODER: CollationEncoder = {
-  encode: (value: string) => value,
-};
-
-/** RTRIM: Trim trailing spaces before encoding. */
-const RTRIM_ENCODER: CollationEncoder = {
-  encode: (value: string) => value.replace(/\s+$/, ''),
-};
-
-// Register built-in encoders
-registerCollationEncoder('NOCASE', NOCASE_ENCODER);
-registerCollationEncoder('BINARY', BINARY_ENCODER);
-registerCollationEncoder('RTRIM', RTRIM_ENCODER);
+import type { SqlValue, JsonSqlValue, KeyNormalizerResolver } from '@quereus/quereus';
+import { canonicalJsonString, BUILTIN_NORMALIZERS, QuereusError, StatusCode } from '@quereus/quereus';
 
 // ============================================================================
 // Encoding Options
 // ============================================================================
 
+/**
+ * Built-ins-only key-normalizer resolver: the default when no `Database` is threaded to
+ * an encode call site. Knows exactly BINARY / NOCASE / RTRIM, with the engine's own
+ * normalizer functions (never a store-local copy — a divergent RTRIM here would key rows
+ * the engine's `RTRIM_COLLATION` comparator calls distinct at identical bytes).
+ *
+ * Throws on any other name rather than falling back: guessing a normalizer would encode
+ * two comparator-distinct values to the same key, or split one value across two keys.
+ */
+export const BUILTIN_KEY_NORMALIZER_RESOLVER: KeyNormalizerResolver = (collationName) => {
+  if (!collationName || collationName === 'BINARY') return BUILTIN_NORMALIZERS.BINARY;
+  const normalizer = BUILTIN_NORMALIZERS[collationName.toUpperCase()];
+  if (!normalizer) {
+    throw new QuereusError(`no such collation sequence: ${collationName}`, StatusCode.ERROR);
+  }
+  return normalizer;
+};
+
 /** Options for encoding keys. */
 export interface EncodeOptions {
-  /** Collation name for TEXT values. Default: 'NOCASE'. */
+  /** Collation name for TEXT/OBJECT values. Default: 'NOCASE'. */
   collation?: string;
+  /**
+   * Resolves a collation name to the string normalizer that produces its key bytes.
+   * Supply `db.getKeyNormalizerResolver()` so key bytes and value comparisons agree
+   * on which strings are the same value. Defaults to
+   * {@link BUILTIN_KEY_NORMALIZER_RESOLVER} (BINARY / NOCASE / RTRIM only; throws on
+   * any other name) for the rare call site that holds no `Database`.
+   */
+  normalizers?: KeyNormalizerResolver;
 }
 
 /** Type prefix bytes. */
@@ -118,6 +91,7 @@ const NULL_BYTE = 0x00;
  */
 export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Array {
   const collation = options?.collation ?? 'NOCASE';
+  const normalizers = options?.normalizers ?? BUILTIN_KEY_NORMALIZER_RESOLVER;
 
   if (value === null) {
     return new Uint8Array([TYPE_NULL]);
@@ -128,7 +102,7 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
   }
 
   if (typeof value === 'string') {
-    return encodeText(value, collation);
+    return encodeText(value, collation, normalizers);
   }
 
   if (value instanceof Uint8Array) {
@@ -143,7 +117,7 @@ export function encodeValue(value: SqlValue, options?: EncodeOptions): Uint8Arra
   // JSON string so reorder-equal values ({a:1,b:2} vs {b:2,a:1}) encode to the
   // same bytes, matching the in-memory JSON comparator. Arrays stay positional.
   if (typeof value === 'object') {
-    return encodeObject(canonicalJsonString(value as JsonSqlValue), collation);
+    return encodeObject(canonicalJsonString(value as JsonSqlValue), collation, normalizers);
   }
 
   throw new Error(`Cannot encode value of type ${typeof value}`);
@@ -295,17 +269,14 @@ function writeEscapedWithTerminator(typeTag: number, bytes: Uint8Array): Uint8Ar
 /**
  * Encode text with collation support.
  * Uses null-termination with escape sequences for embedded nulls.
+ *
+ * `normalizers` resolves the collation to its key normalizer and RAISES on a name it
+ * cannot key (unregistered, or comparator-only). There is deliberately no fallback:
+ * silently keying under a different collation's normalizer is exactly how two values
+ * the database's comparator calls equal end up at two distinct primary keys.
  */
-function encodeText(value: string, collation: string): Uint8Array {
-  // Apply collation transformation via encoder registry.
-  //
-  // This registry is PROCESS-GLOBAL and holds only the three built-ins with their
-  // built-in meanings, so it disagrees with `Database.getCollationResolver()` — which
-  // StoreTable's value comparisons now use — whenever an embedder registers a custom
-  // collation or overrides NOCASE/RTRIM. Two values the comparator calls equal then land
-  // at distinct keys. Tracked by fix/bug-store-key-encoder-ignores-database-collations.
-  const collationEncoder = getCollationEncoder(collation) ?? NOCASE_ENCODER;
-  const sortValue = collationEncoder.encode(value);
+function encodeText(value: string, collation: string, normalizers: KeyNormalizerResolver): Uint8Array {
+  const sortValue = normalizers(collation)(value);
 
   // Encode as UTF-8
   const utf8 = new TextEncoder().encode(sortValue);
@@ -326,10 +297,17 @@ function encodeBlob(value: Uint8Array): Uint8Array {
 /**
  * Encode a JSON object/array as text with TYPE_OBJECT prefix.
  * Uses the same encoding as TEXT for sort order (by JSON string representation).
+ *
+ * NOTE: the collation normalizer runs over the CANONICAL JSON STRING, not over the
+ * object's text leaves — under the default NOCASE that already lowercases object keys
+ * and string values inside the key bytes, and a normalizer that reorders or deletes
+ * characters can leave a string `decodeObject` cannot `JSON.parse`. Latent today:
+ * nothing in the row path decodes an object key (rows are serialized separately, and
+ * `decodeCompositeKey` has no `src/` caller). If an object-valued key ever has to be
+ * decoded, normalize the leaves before canonicalization rather than the string after.
  */
-function encodeObject(jsonString: string, collation: string): Uint8Array {
-  const collationEncoder = getCollationEncoder(collation) ?? NOCASE_ENCODER;
-  const sortValue = collationEncoder.encode(jsonString);
+function encodeObject(jsonString: string, collation: string, normalizers: KeyNormalizerResolver): Uint8Array {
+  const sortValue = normalizers(collation)(jsonString);
   const utf8 = new TextEncoder().encode(sortValue);
   return writeEscapedWithTerminator(TYPE_OBJECT, utf8);
 }

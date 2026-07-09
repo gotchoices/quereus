@@ -515,41 +515,43 @@ Uses lazy migration: rows missing new columns return NULL or the declared defaul
 
 The store module uses collation-aware binary encoding to preserve sort order in the underlying key-value store.
 
-### Collation Encoders
+### Key Normalizers
 
-Collations can register a `CollationEncoder` that transforms strings before binary encoding:
+A text value's key bytes are produced by running it through the collation's **key
+normalizer** — the `(s: string) => string` whose output equality partitions strings
+exactly as the collation's comparator does. Normalizers are resolved against the owning
+connection's collation registry (`db.getKeyNormalizerResolver()`), which `StoreTable`
+binds once into `EncodeOptions.normalizers`. Key bytes and value comparisons therefore
+always agree on which strings are the same value, including under a collation registered
+or overridden with `db.registerCollation`.
 
-```typescript
-interface CollationEncoder {
-  /** Transform string for sort-preserving binary encoding */
-  encode(value: string): string;
-}
-```
+A collation registered with a comparator but **no** normalizer cannot key a persisted
+structure, and neither can an unregistered name. Both are rejected at `CREATE TABLE`
+(and at `ALTER`), over exactly the collations the table's key encoding uses: each
+text-capable primary-key column, plus the table key collation `K` when the table has a
+secondary index or a primary-key column whose type can carry text without declaring a
+collation of its own.
 
 ### Built-in Collations
 
-| Collation | Encoder | Ordering Support |
-|-----------|---------|------------------|
-| **NOCASE** | Lowercases before encoding | Full (default) |
-| **BINARY** | No transformation | Full |
-| **RTRIM** | Trims trailing spaces | Full |
-| **Custom** | Falls back to BINARY encoding | Requires Quereus re-sort |
+| Collation | Key normalizer | Ordering Support |
+|-----------|----------------|------------------|
+| **NOCASE** | `s => s.toLowerCase()` | Full (default) |
+| **BINARY** | identity | Full |
+| **RTRIM** | strips trailing ASCII space (`0x20`) only | Full |
+| **Custom** | whatever `registerCollation` supplied | Full, if the normalizer is order-preserving |
 
 The default collation is **NOCASE**, matching Quereus's case-insensitive comparison semantics.
 
-### Future Work
+`RTRIM` strips only ASCII `0x20`, matching `RTRIM_COLLATION`. (The retired store-local
+encoder stripped every Unicode whitespace character, so `'a\t'` and `'a'` shared one key
+despite comparing distinct — a distinct row could be clobbered by its neighbour.)
 
-**TODO**: Add per-column collation specification for primary keys and index columns:
-
-```sql
--- Future syntax (not yet implemented)
-CREATE TABLE t (
-  name TEXT COLLATE BINARY PRIMARY KEY,
-  email TEXT COLLATE NOCASE
-) USING leveldb;
-
-CREATE INDEX idx_name ON t(name COLLATE BINARY);
-```
+A range/prefix seek over a text key additionally assumes the normalizer is
+*order-preserving* with respect to the comparator. The three built-ins are; a custom
+collation whose comparator does not order strings the way memcmp orders their normalized
+bytes would narrow the seek window incorrectly. Custom collation names cannot yet be
+declared on a column, so this is not reachable today.
 
 ## Package Structure
 

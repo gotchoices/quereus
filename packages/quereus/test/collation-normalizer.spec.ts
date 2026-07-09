@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { expect } from 'chai';
 import { Database } from '../src/index.js';
-import { resolveKeyNormalizer, BUILTIN_NORMALIZERS } from '../src/util/key-serializer.js';
+import { BUILTIN_NORMALIZERS } from '../src/util/key-serializer.js';
 import {
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
@@ -43,21 +43,21 @@ function assertNormalizerMatchesComparator(
 }
 
 describe('Collation key normalizers', () => {
-	describe('resolveKeyNormalizer + comparator agreement', () => {
+	describe('BUILTIN_NORMALIZERS + comparator agreement', () => {
 		it('BINARY normalizer outputs equivalence-equal iff comparator equal', () => {
-			assertNormalizerMatchesComparator('BINARY', resolveKeyNormalizer('BINARY'), BINARY_COLLATION);
+			assertNormalizerMatchesComparator('BINARY', BUILTIN_NORMALIZERS.BINARY, BINARY_COLLATION);
 		});
 
 		it('NOCASE normalizer outputs equivalence-equal iff comparator equal', () => {
-			assertNormalizerMatchesComparator('NOCASE', resolveKeyNormalizer('NOCASE'), NOCASE_COLLATION);
+			assertNormalizerMatchesComparator('NOCASE', BUILTIN_NORMALIZERS.NOCASE, NOCASE_COLLATION);
 		});
 
 		it('RTRIM normalizer outputs equivalence-equal iff comparator equal (only ASCII space stripped)', () => {
-			assertNormalizerMatchesComparator('RTRIM', resolveKeyNormalizer('RTRIM'), RTRIM_COLLATION);
+			assertNormalizerMatchesComparator('RTRIM', BUILTIN_NORMALIZERS.RTRIM, RTRIM_COLLATION);
 		});
 
 		it('RTRIM normalizer preserves trailing tab/NBSP (not just trimEnd)', () => {
-			const norm = resolveKeyNormalizer('RTRIM');
+			const norm = BUILTIN_NORMALIZERS.RTRIM;
 			expect(norm('foo\t')).to.equal('foo\t');
 			expect(norm('foo ')).to.equal('foo ');
 			expect(norm('foo  ')).to.equal('foo');
