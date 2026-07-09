@@ -10,11 +10,12 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, asyncIterableToArray } from '@quereus/quereus';
+import { Database, asyncIterableToArray, type DatabaseInternal, type VirtualTableConnection } from '@quereus/quereus';
 import {
 	createIsolatedStoreModule,
 	hasIsolation,
 	StoreModule,
+	StoreConnection,
 	InMemoryKVStore,
 	type KVStoreProvider,
 } from '../src/index.js';
@@ -65,6 +66,26 @@ function createInMemoryProvider(): KVStoreProvider {
 				await store.close();
 			}
 			stores.clear();
+		},
+		async renameTableStores(schemaName: string, oldName: string, newName: string, indexNames: readonly string[]) {
+			const oldKey = `${schemaName}.${oldName}`;
+			const newKey = `${schemaName}.${newName}`;
+			const dataStore = stores.get(oldKey);
+			if (dataStore) {
+				stores.delete(oldKey);
+				stores.set(newKey, dataStore);
+			}
+			// Relocate exactly the table's index stores (by name), matching real
+			// provider semantics — a `{oldName}_idx_` prefix sweep would also move a
+			// sibling table named `{oldName}_idx_<x>`.
+			for (const indexName of indexNames) {
+				const from = `${schemaName}.${oldName}_idx_${indexName}`;
+				const store = stores.get(from);
+				if (store) {
+					stores.delete(from);
+					stores.set(`${schemaName}.${newName}_idx_${indexName}`, store);
+				}
+			}
 		},
 	};
 }
@@ -189,13 +210,13 @@ describe('Isolated Store Module', () => {
 	 * the overlay. This pins the re-connect against a real `StoreModule`, where it has
 	 * to survive the dispose/re-open that the memory module never performs.
 	 *
-	 * NOTE: this does NOT assert that the staged rows reach the store, because on the
-	 * store path they currently do not. `StoreModule.renameTable` calls
-	 * `removeConnectionsForTable(schema, oldName)`, so by COMMIT no connection remains
-	 * to drive `commitConnectionOverlays` at all — the overlay survives the commit as a
-	 * zombie that keeps merging into this connection's reads while the store stays
-	 * empty. That is a distinct defect from the map-miss this suite's sibling covers;
-	 * tracked in fix/iso-rename-in-txn-never-flushes-staged-rows.
+	 * `StoreModule.renameTable` must evict only the connections it created
+	 * (`StoreConnection`s), never every connection registered under the old qualified
+	 * name — the isolation layer registers its own connection there, and it is the only
+	 * thing that drives `commitConnectionOverlays` at COMMIT. Evicting it dropped the
+	 * transaction's writes while the abandoned overlay kept merging into the writing
+	 * connection's reads, masking the loss. Hence the assertions below read through
+	 * `committed.<table>` or a fresh Database, never a plain SELECT on the writer.
 	 */
 	describe('mid-transaction RENAME TO with staged writes', () => {
 		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
@@ -230,6 +251,74 @@ describe('Isolated Store Module', () => {
 
 			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM gadget`));
 			expect(rows).to.deep.equal([]);
+		});
+
+		it('flushes staged rows to the store on COMMIT', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec('COMMIT');
+
+			// `committed.*` bypasses the overlay, so it sees only what actually reached storage.
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`));
+			expect(rows).to.deep.equal([{ id: 1, name: 'a' }]);
+		});
+
+		it('the committed row is physically stored, not just cached (fresh Database)', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec('COMMIT');
+
+			const db2 = new Database();
+			const mod2 = new StoreModule(provider);
+			db2.registerModule('store', mod2);
+			await mod2.rehydrateCatalog(db2);
+
+			const rows = await asyncIterableToArray(db2.eval(`SELECT * FROM gadget`));
+			expect(rows).to.deep.equal([{ id: 1, name: 'a' }]);
+			await db2.close();
+		});
+
+		it('ROLLBACK after a mid-transaction rename discards the staged rows (no zombie overlay)', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+			await db.exec('ROLLBACK');
+
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget`)),
+				'nothing reached storage').to.deep.equal([]);
+			expect(await asyncIterableToArray(db.eval(`SELECT * FROM gadget`)),
+				'the writing connection sees no abandoned overlay').to.deep.equal([]);
+		});
+
+		it('two renames in one transaction land every staged row under the final name', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gizmo`);
+			await db.exec(`INSERT INTO gizmo VALUES (2, 'b')`);
+			await db.exec(`ALTER TABLE gizmo RENAME TO gadget`);
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM committed.gadget ORDER BY id`));
+			expect(rows).to.deep.equal([{ id: 1, name: 'a' }, { id: 2, name: 'b' }]);
+		});
+
+		it('evicts the store-owned connection for the old name', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO widget VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE widget RENAME TO gadget`);
+
+			// The StoreConnection bound to `main.widget` is gone (its StoreTable is disposed);
+			// the isolation layer's connection under that name must NOT be, or the overlay
+			// never reaches storage.
+			const all: VirtualTableConnection[] = (db as unknown as DatabaseInternal).getAllConnections();
+			const conns = all.filter(c => c.tableName.toLowerCase() === 'main.widget');
+			expect(conns.filter((c: VirtualTableConnection) => c instanceof StoreConnection),
+				'no StoreConnection remains for the old name').to.deep.equal([]);
+			expect(conns.length, 'the isolation layer connection survives').to.be.greaterThan(0);
+
+			await db.exec('COMMIT');
 		});
 	});
 

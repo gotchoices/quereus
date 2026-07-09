@@ -43,6 +43,7 @@ import type { CompiledPredicate } from '@quereus/quereus';
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
+import { StoreConnection } from './store-connection.js';
 import { StoreBackingHost } from './backing-host.js';
 import { StoreTable, resolvePkKeyCollations, columnCanHoldText, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
@@ -1812,15 +1813,32 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// The coordinator is module-wide (flushed above); it is not per-table, so
 		// it is not evicted here.
 
-		// Evict the disposed instance's registered engine connection. It is bound to
-		// the OLD qualified name and its owning StoreTable is now disposed, so it is
-		// definitively stale. Unlike drop — where the engine's schema manager calls
-		// `removeConnectionsForTable` for us — the generic rename path
-		// (`alter-table.ts` renameTableImpl) does NOT, so the store must evict it
-		// here or the connection leaks one per rename. Safe because the module
-		// DDL-commit above already flushed its pending ops (no uncommitted writes to
-		// lose).
-		(db as DatabaseInternal).removeConnectionsForTable(schemaName, oldName);
+		// Evict the disposed instance's registered engine connections — but ONLY the
+		// ones this module created. Unlike drop — where the engine's schema manager
+		// calls `removeConnectionsForTable` for us — the generic rename path
+		// (`alter-table.ts` renameTableImpl) does NOT, so the store must evict here or
+		// a StoreConnection leaks one per rename. Safe for `StoreConnection`s (both the
+		// StoreTable-owned DML connection and the StoreBackingHost-owned one): they hold
+		// no state of their own, delegating to the module-wide coordinator that the
+		// DDL-commit above already flushed, and their owning StoreTable is now disposed.
+		//
+		// A blanket name-keyed sweep is NOT safe: a wrapping module (the isolation layer)
+		// registers its own connection under the same qualified name, and that connection
+		// is the only thing that drives its staged overlay to storage at COMMIT. Evicting
+		// it silently drops the transaction's writes.
+		//
+		// NOTE: a rename onto a never-before-used name leaves the wrapper's connection
+		// registered under the stale old name (it is not retargeted here). Benign — the
+		// commit flush resolves overlays db-wide by their re-keyed names — but a workload
+		// that renames one table through many distinct names in a single process
+		// accumulates one such connection per name. If that ever matters, retarget the
+		// connection's `tableName` across the rename instead of leaving it stale.
+		const oldQualified = `${schemaName}.${oldName}`.toLowerCase();
+		for (const conn of (db as DatabaseInternal).getAllConnections()) {
+			if (conn instanceof StoreConnection && conn.tableName.toLowerCase() === oldQualified) {
+				(db as DatabaseInternal).removeConnection(conn.connectionId);
+			}
+		}
 
 		// Move physical storage (data directory + index directories).
 		if (this.provider.renameTableStores) {

@@ -147,6 +147,19 @@ export interface DatabaseInternal {
 	removeConnectionsForTable(schemaName: string, tableName: string): void;
 
 	/**
+	 * Removes one active connection by id, bypassing the implicit transaction
+	 * deferral that {@link unregisterConnection} honours.
+	 *
+	 * Use when a module must evict exactly the connections it owns rather than
+	 * every connection registered under a table name — a wrapping module (e.g.
+	 * the isolation layer) may hold a connection under that same name whose
+	 * uncommitted state still has to reach COMMIT.
+	 *
+	 * @param connectionId The ID of the connection to remove
+	 */
+	removeConnection(connectionId: string): void;
+
+	/**
 	 * Gets all active connections.
 	 *
 	 * @returns Array of all active connections

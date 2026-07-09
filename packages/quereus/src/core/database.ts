@@ -1908,6 +1908,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
+	 * @internal Force-removes one connection by id.
+	 * Unlike unregisterConnection, this bypasses the implicit transaction deferral —
+	 * the caller has established that this specific connection is definitively stale.
+	 */
+	removeConnection(connectionId: string): void {
+		const connection = this.activeConnections.get(connectionId);
+		if (connection) {
+			this.activeConnections.delete(connectionId);
+			log(`Removed stale connection ${connectionId} for table ${connection.tableName}`);
+		}
+	}
+
+	/**
 	 * @internal Gets all active connections for a specific table.
 	 * @param tableName The name of the table
 	 * @returns Array of connections for the table

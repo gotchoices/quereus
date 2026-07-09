@@ -179,6 +179,29 @@ every later read on that `Database`, so the connection that lost the data was th
 A **clean** overlay (`hasChanges === false`) that fails to resolve staged nothing, so it is simply
 discarded.
 
+The invariant has a second dependency that lives outside this layer: **the wrapper's registered
+`IsolatedConnection` must survive the underlying module's rename.** `Database` commits by calling
+`commit()` on every registered connection — the loop is name-agnostic — so that connection is the
+only thing that ever drives `commitConnectionOverlays`. An underlying module that evicts *every*
+connection registered under the old table name (rather than only the ones it created itself)
+therefore deletes the sole path from the staged overlay to storage, and the commit reports success
+having written nothing. `StoreModule.renameTable` evicts by `instanceof StoreConnection`, not by
+name, for exactly this reason.
+
+#### Mid-transaction rename on a store-backed table is a partial commit
+
+`StoreModule.renameTable` DDL-commits its module-wide `TransactionCoordinator` — every table's
+pending ops, not only the renamed table's — before it relocates the physical stores, because a
+directory move cannot be rolled back through the coordinator. So an `alter table … rename to`
+issued inside a transaction against a store-backed table *is*, by construction, a partial commit
+of the store module's pending writes. The isolation layer does not change that; it only ensures
+its own staged rows are flushed in the same batch instead of being dropped.
+
+The asymmetry that follows is inherited from those store rename semantics, not introduced by the
+isolation layer: a `rollback` after a mid-transaction rename still discards the overlay
+(`IsolatedConnection.rollback` → `onConnectionRollback`), even though the store's own pre-rename
+ops were already DDL-committed and cannot come back.
+
 ---
 
 ## Isolation Level Provided
