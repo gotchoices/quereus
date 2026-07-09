@@ -18,6 +18,7 @@ import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
 import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
+import { isNoOpCast } from './scalar-invertibility.js';
 
 const log = createLogger('planner:analysis:constraint-extractor');
 
@@ -418,7 +419,9 @@ function extractBinaryConstraint(
     const valueSide = (columnIsLeft ? rhs : lhs) as ScalarPlanNode;
     if (!isLiteralConstant(valueSide)) {
       result.valueExpr = valueSide;
-      const innerValue = unwrapCast(valueSide);
+      // Classification only — `valueExpr` above retains the cast, so a converting
+      // cast may be looked through here (see `unwrapCastForBindingKind`).
+      const innerValue = unwrapCastForBindingKind(valueSide);
       if (innerValue.nodeType === PlanNodeType.ParameterReference) {
         result.bindingKind = 'parameter';
       } else if (innerValue.nodeType === PlanNodeType.ColumnReference) {
@@ -901,23 +904,62 @@ function isOrExpression(expr: ScalarPlanNode): boolean {
 }
 
 /**
- * Unwrap a CastNode inserted by the planner for cross-category coercion.
- * Returns the inner operand if node is a Cast, otherwise returns the node itself.
+ * Strip only *value-preserving* wrappers, exposing the underlying literal /
+ * column reference for shape matching. Every caller of this helper discards the
+ * wrapper, so anything it strips must leave the compared value unchanged.
  *
- * Deliberately does NOT unwrap `CollateNode`: a collate-wrapped literal or
- * column changes the comparison's effective collation, so recognizing
+ * Only a no-op `CAST` (target logical type equal to the operand's — see
+ * {@link isNoOpCast}) qualifies, and chains of them are stripped. A **converting**
+ * `CAST` changes the compared value: `cast(x as integer) = 1` over a `text`
+ * column would be recognized as `x = 1` and pushed down as a seek key on the
+ * *stored* text, which under storage-class ordering matches nothing — and since
+ * the conjunct is reported as fully consumed, no residual `FILTER` survives to
+ * catch it. This is not exotic SQL: `insertCrossTypeCoercion`
+ * (`building/expression.ts`) synthesizes exactly that cast for a bare
+ * `where x = 1` against a `text` column. Symmetrically on the value side,
+ * `getLiteralValue` returns the *pre-cast* literal, so stripping
+ * `cast(1 as text)` would seek on the integer `1`.
+ *
+ * A `CollateNode` is never stripped either: a collate-wrapped literal or column
+ * changes the comparison's effective collation, so recognizing
  * `b = 'x' collate nocase` as an ordinary `col = lit` constraint would mint a
  * seek / covered-key witness under the column's declared collation while the
  * runtime compares NOCASE — wrong rows from a seek, false ≤1-row claims from
- * the covered-key path. Because this stays Cast-only, every recognized
+ * the covered-key path. Because only no-op casts are stripped, every recognized
  * `col = lit` comparison's effective collation equals the column's declared
  * collation (the key's enforcement collation), which is what keeps
- * `FilterNode`'s covered-key detection sound. Pinned by seek-correctness tests
- * (ticket `collation-blind-equality-fact-extraction`); do not add collate
- * stripping here without gating consumers on the wrapper's collation.
+ * `FilterNode`'s covered-key detection sound.
+ *
+ * Pinned by seek-correctness tests (tickets
+ * `collation-blind-equality-fact-extraction` and
+ * `bug-cast-stripped-from-seek-constraints`); do not loosen without gating
+ * consumers on the wrapper. `sat-checker.ts`'s `unwrap()` and
+ * `coarsened-key.ts` carry the same rule.
+ *
+ * Classification-only callers that *retain* the wrapper use
+ * {@link unwrapCastForBindingKind} instead.
  */
 function unwrapCast(node: ScalarPlanNode): ScalarPlanNode {
-	return node.nodeType === PlanNodeType.Cast ? (node as CastNode).operand : node;
+	let cur = node;
+	while (cur instanceof CastNode && isNoOpCast(cur)) cur = cur.operand;
+	return cur;
+}
+
+/**
+ * Strip *any* `CastNode` chain — including converting casts — to classify the
+ * shape of a value-side expression.
+ *
+ * Sound only where the cast is retained in the emitted constraint: the two
+ * callers (`extractBinaryConstraint`'s `bindingKind` selection and
+ * {@link isDynamicValue}) keep the whole cast node in `valueExpr`, which is
+ * evaluated at runtime. That preserves parameter / correlated seek pushdown for
+ * `x = cast(:p as integer)`. Never use this where the wrapper is discarded —
+ * see {@link unwrapCast}.
+ */
+function unwrapCastForBindingKind(node: ScalarPlanNode): ScalarPlanNode {
+	let cur = node;
+	while (cur instanceof CastNode) cur = cur.operand;
+	return cur;
 }
 
 function isColumnReference(node: ScalarPlanNode): node is ColumnReferenceNode {
@@ -925,28 +967,32 @@ function isColumnReference(node: ScalarPlanNode): node is ColumnReferenceNode {
 }
 
 /**
- * Extract the underlying ColumnReferenceNode, unwrapping a planner-inserted
- * CastNode if present.
+ * Extract the underlying ColumnReferenceNode, unwrapping a value-preserving
+ * (no-op) CastNode if present.
  */
 function getColumnReference(node: ScalarPlanNode): ColumnReferenceNode {
 	return unwrapCast(node) as unknown as ColumnReferenceNode;
 }
 
 /**
- * Check if node is a literal constant (sees through planner-inserted CastNodes).
+ * Check if node is a literal constant (sees through value-preserving CastNodes).
  */
 function isLiteralConstant(node: ScalarPlanNode): node is LiteralNode {
 	return unwrapCast(node).nodeType === PlanNodeType.Literal;
 }
 
+/**
+ * True when the value side is a parameter or a column reference from any table
+ * (correlation handled later). Classification only — the caller keeps the cast
+ * in `valueExpr` and evaluates it at runtime, so a converting cast is fine here.
+ */
 function isDynamicValue(node: ScalarPlanNode): boolean {
-  const inner = unwrapCast(node);
-  // Parameter or column reference from any table (correlation handled later)
+  const inner = unwrapCastForBindingKind(node);
   return inner.nodeType === PlanNodeType.ParameterReference || inner.nodeType === PlanNodeType.ColumnReference;
 }
 
 /**
- * Get literal value from literal node (sees through planner-inserted CastNodes).
+ * Get literal value from literal node (sees through value-preserving CastNodes).
  */
 function getLiteralValue(node: ScalarPlanNode): SqlValue {
 	const literalNode = unwrapCast(node) as LiteralNode;
