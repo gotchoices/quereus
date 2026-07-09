@@ -31,6 +31,43 @@ The `MemoryTable` implementation (`src/vtab/memory/`) provides a sophisticated, 
 *   **Savepoints:** Full support for nested savepoints within transactions (`SAVEPOINT`, `ROLLBACK TO`, `RELEASE`)
 *   **Layer Collapse:** Automatic promotion and cleanup of committed layers when safe
 
+#### Commit and sibling-layer rebase
+
+`commitTransaction` publishes a connection's pending `TransactionLayer` into the
+committed chain. Which of three relationships holds between the pending layer and
+the current committed head decides how:
+
+*   **Head is an ancestor of pending** — the normal case: the pending layer forked
+    off (a descendant of) the current head, so its chain already contains
+    everything committed so far. It is published *wholesale* as the new head.
+*   **Head advanced past pending's fork point** — a *sibling* commit. Two
+    connections forked pending layers off the same base `B`; the first committed
+    and moved the head to `P1`, so the second's pending `P2` is now a sibling of
+    `P1` rather than a descendant. Publishing `P2` wholesale would splice `P1` (and
+    its rows) out of the chain — a silent last-writer-wins data loss. Instead the
+    second commit **rebases**: it builds a fresh `TransactionLayer` parented on the
+    advanced head and *replays `P2`'s own writes on top*, so `P1`'s rows survive.
+    Rebasing chains — `B ← P1 ← rebased-P2`, then a third sibling rebased onto
+    that — so any number of sibling commits to one table all land.
+*   **No common ancestor** — a genuinely stale commit (e.g. the base was
+    consolidated away by an `ALTER TABLE`). Outside a coordinated commit this rolls
+    back with `BUSY` so the caller can retry; a schema drift between pending and the
+    advanced head also aborts with `BUSY` rather than replay stale-schema rows.
+
+The replay source is an **always-on per-layer write log** (`TransactionLayer.getOwnWrites()`),
+maintained independently of the event-tracking `pendingChanges` so it is a reliable
+record of the layer's own structural mutations.
+
+**Isolation-model boundary.** Rebase is the right resolution *because* every sibling
+connection in a coordinated commit belongs to the same `Database`'s single atomic
+transaction — a `BUSY` there would abort the whole `COMMIT` and, since the siblings
+arise deterministically from the same statements, a retry re-hits the identical path
+(permanent failure, not eventual success). The memory manager offers
+**read-your-own-writes**, *not* snapshot isolation: a primary key or secondary-`UNIQUE`
+value written by *both* siblings resolves last-writer-wins to the rebasing writer, and
+cross-sibling write-write / `UNIQUE` conflicts are **not** detected here. Full conflict
+detection lives in `quereus-isolation`.
+
 ### **Reactive Event Hooks:**
 *   **Data Change Events:** Subscribe to INSERT, UPDATE, DELETE events (fired on commit)
 *   **Schema Change Events:** Subscribe to CREATE/ALTER/DROP operations for tables, columns, and indexes

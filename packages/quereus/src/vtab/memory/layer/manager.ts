@@ -4,7 +4,7 @@ import { type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
 import { BaseLayer } from './base.js';
-import { TransactionLayer } from './transaction.js';
+import { TransactionLayer, type OwnWrite } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
 import { MemoryVirtualTableConnection } from '../connection.js';
@@ -411,73 +411,82 @@ export class MemoryTableManager {
 			return;
 		}
 
-		// Capture changes from pendingLayer and any ancestor TransactionLayers
-		// up to (but not including) the currentCommittedLayer. Ancestor layers
-		// in the chain are typically savepoint-promoted in-transaction layers
-		// whose pendingChanges were never emitted (they were never directly
-		// committed). Walking the chain ensures events from earlier writes
-		// in the same transaction aren't dropped just because a SAVEPOINT
-		// promotion swapped the pending layer mid-transaction.
-		const eventChunks: ReturnType<TransactionLayer['getPendingChanges']>[] = [];
-		{
-			let layer: Layer | null = pendingLayer;
-			while (layer && layer !== this._currentCommittedLayer) {
-				if (layer instanceof TransactionLayer) {
-					const events = layer.getPendingChanges();
-					if (events.length > 0) eventChunks.push(events);
-				}
-				layer = layer.getParent();
-			}
-		}
-		// Chunks are newest-layer-first; reverse to chronological order while
-		// preserving intra-layer event order.
-		const changes = eventChunks.reverse().flat();
-
 		const lockKey = `MemoryTable.Commit:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
 		logger.debugLog(`[Commit ${connection.connectionId}] Acquired lock for ${this._tableName}`);
 		try {
-			// Walk up the parent chain to find if the current committed layer is an ancestor
-			// This handles savepoint chains properly
-			let currentParent: Layer | null = pendingLayer.getParent();
-			let foundCommittedLayer = false;
-			while (currentParent) {
-				if (currentParent === this._currentCommittedLayer) {
-					foundCommittedLayer = true;
-					break;
+			// Relate the pending layer's chain to the current committed head.
+			//
+			// Case A — the head is an ancestor of the pending layer: pending forked
+			//   off (a descendant of) the current head, so its chain already
+			//   contains everything committed so far. Publish it wholesale.
+			// Case B — the head advanced past the pending layer's fork point
+			//   (a sibling connection committed a disjoint change to the same table
+			//   in a coordinated multi-connection commit): pending and head share a
+			//   common ancestor — the fork point — that is a *proper* ancestor of
+			//   the head. Rebase pending's own writes onto the head so the sibling's
+			//   already-committed rows are not discarded (the bug this guards).
+			// Case C — no common ancestor reachable: a genuinely stale commit. Roll
+			//   back with BUSY outside a coordinated commit (the caller can retry);
+			//   inside one, preserve the prior wholesale fallback.
+			let headIsAncestorOfPending = false;
+			{
+				let cur: Layer | null = pendingLayer;
+				while (cur) {
+					if (cur === this._currentCommittedLayer) { headIsAncestorOfPending = true; break; }
+					cur = cur.getParent();
 				}
-				currentParent = currentParent.getParent();
 			}
 
-			// Also check if the current committed layer and pending layer are siblings
-			// (both children of the same parent) - this handles coordinated multi-connection commits
-			if (!foundCommittedLayer) {
-				const pendingParent = pendingLayer.getParent();
-				let committedAncestor: Layer | null = this._currentCommittedLayer;
-				while (committedAncestor) {
-					if (committedAncestor === pendingParent) {
-						foundCommittedLayer = true;
-						break;
+			let committedLayer: TransactionLayer;
+			let changes: ReturnType<TransactionLayer['getPendingChanges']>;
+
+			if (headIsAncestorOfPending) {
+				// Case A: the un-emitted in-transaction event span ends at the head.
+				changes = this.collectPendingChanges(pendingLayer, this._currentCommittedLayer);
+				pendingLayer.markCommitted();
+				committedLayer = pendingLayer;
+			} else {
+				// Find the fork point: the deepest layer present in BOTH chains.
+				const headChain = this.layerChainSet(this._currentCommittedLayer);
+				let forkPoint: Layer | null = pendingLayer.getParent();
+				while (forkPoint && !headChain.has(forkPoint)) {
+					forkPoint = forkPoint.getParent();
+				}
+
+				if (forkPoint) {
+					// Schema drift: an ALTER consolidated the head to a different schema
+					// since the pending layer forked. Replaying stale-schema rows onto
+					// the new-schema head is unsafe — abort with BUSY rather than corrupt
+					// the committed head (mirrors the stale-ancestor caution above).
+					if (pendingLayer.getSchema() !== this.tableSchema) {
+						connection.pendingTransactionLayer = null;
+						connection.clearSavepoints();
+						logger.warn('Commit Transaction', this._tableName, 'Schema drift under sibling commit, rolling back', { connectionId: connection.connectionId });
+						throw new QuereusError(`Commit failed: schema changed under transaction on table ${this._tableName}. Retry.`, StatusCode.BUSY);
 					}
-					committedAncestor = committedAncestor.getParent();
-				}
-			}
-
-			if (!foundCommittedLayer) {
-				// During coordinated multi-connection commits (explicit COMMIT or implicit transaction commit),
-				// sibling layers are allowed. Only enforce strict validation outside coordinated commits.
-				if (!this.db._inCoordinatedCommit()) {
+					// Case B: rebase. Events come from the same fork-bounded pending-chain
+					// span; structural writes are replayed onto the advanced head.
+					changes = this.collectPendingChanges(pendingLayer, forkPoint);
+					committedLayer = this.rebaseLayerOntoHead(pendingLayer, forkPoint);
+				} else if (!this.db._inCoordinatedCommit()) {
 					connection.pendingTransactionLayer = null;
 					connection.clearSavepoints();
 					logger.warn('Commit Transaction', this._tableName, 'Stale commit detected, rolling back', { connectionId: connection.connectionId });
 					throw new QuereusError(`Commit failed: concurrent update on table ${this._tableName}. Retry.`, StatusCode.BUSY);
+				} else {
+					// Case C fallback inside a coordinated commit: no safe rebase target,
+					// but aborting would roll back every connection. Preserve the prior
+					// wholesale publish.
+					changes = this.collectPendingChanges(pendingLayer, this._currentCommittedLayer);
+					pendingLayer.markCommitted();
+					committedLayer = pendingLayer;
 				}
 			}
 
-			pendingLayer.markCommitted();
-			this._currentCommittedLayer = pendingLayer;
-			logger.debugLog(`[Commit ${connection.connectionId}] CurrentCommittedLayer set to ${pendingLayer.getLayerId()} for ${this._tableName}`);
-			connection.readLayer = pendingLayer;
+			this._currentCommittedLayer = committedLayer;
+			logger.debugLog(`[Commit ${connection.connectionId}] CurrentCommittedLayer set to ${committedLayer.getLayerId()} for ${this._tableName}`);
+			connection.readLayer = committedLayer;
 			connection.pendingTransactionLayer = null;
 			connection.clearSavepoints();
 
@@ -505,6 +514,91 @@ export class MemoryTableManager {
 			release();
 			logger.debugLog(`[Commit ${connection.connectionId}] Released lock for ${this._tableName}`);
 		}
+	}
+
+	/** All layers in `layer`'s parent chain, including `layer` itself. */
+	private layerChainSet(layer: Layer): Set<Layer> {
+		const chain = new Set<Layer>();
+		let cur: Layer | null = layer;
+		while (cur) {
+			chain.add(cur);
+			cur = cur.getParent();
+		}
+		return chain;
+	}
+
+	/**
+	 * Collect pending change events from `fromLayer` up to (but not including)
+	 * `boundary`, in chronological order (oldest layer first, intra-layer order
+	 * preserved). Mirrors the in-transaction event span whose writes are being
+	 * committed: savepoint-promoted ancestor layers whose events were never
+	 * directly emitted are included; already-committed layers at/below the
+	 * boundary are not (their events were emitted when they committed).
+	 */
+	private collectPendingChanges(fromLayer: Layer, boundary: Layer): ReturnType<TransactionLayer['getPendingChanges']> {
+		const eventChunks: ReturnType<TransactionLayer['getPendingChanges']>[] = [];
+		let layer: Layer | null = fromLayer;
+		while (layer && layer !== boundary) {
+			if (layer instanceof TransactionLayer) {
+				const events = layer.getPendingChanges();
+				if (events.length > 0) eventChunks.push(events);
+			}
+			layer = layer.getParent();
+		}
+		// Chunks are newest-layer-first; reverse to chronological order while
+		// preserving intra-layer event order.
+		return eventChunks.reverse().flat();
+	}
+
+	/**
+	 * Rebase a pending layer onto the current committed head after a sibling
+	 * connection advanced the head past this layer's fork point. Replays the
+	 * pending chain's own structural writes (pending + in-transaction ancestors
+	 * down to, but not including, `forkPoint`) onto a fresh {@link TransactionLayer}
+	 * parented on the head, so the sibling's already-committed rows survive.
+	 *
+	 * The head becomes the new layer's base, so every row the sibling committed is
+	 * inherited automatically; only this branch's own writes are replayed on top.
+	 */
+	private rebaseLayerOntoHead(pendingLayer: TransactionLayer, forkPoint: Layer): TransactionLayer {
+		// Gather own-writes from pendingLayer up to (excluding) the fork point.
+		// Chunks are newest-layer-first; reverse so the oldest layer replays first.
+		const writeChunks: (readonly OwnWrite[])[] = [];
+		let layer: Layer | null = pendingLayer;
+		while (layer && layer !== forkPoint) {
+			if (layer instanceof TransactionLayer) {
+				writeChunks.push(layer.getOwnWrites());
+			}
+			layer = layer.getParent();
+		}
+		const ownWrites = writeChunks.reverse().flat();
+
+		const rebased = new TransactionLayer(this._currentCommittedLayer);
+		if (this.eventEmitter?.hasDataListeners?.()) {
+			rebased.enableChangeTracking();
+		}
+
+		for (const write of ownWrites) {
+			// Re-derive the effective row at this PK on the NEW head (including
+			// earlier replays in this loop) and pass it as the old row, so
+			// secondary-index maintenance removes the correct pre-existing entry.
+			// NOTE: a primary key OR a secondary-UNIQUE value written by BOTH
+			// siblings resolves last-writer-wins to the rebasing writer's row —
+			// every non-contended key from both siblings survives. recordUpsert is
+			// the raw structural write and does not re-run checkUniqueConstraints, so
+			// a UNIQUE collision existing only BETWEEN the two siblings' rows is not
+			// detected here. This matches the memory manager's read-your-own-writes
+			// model (snapshot-isolation conflict detection lives in quereus-isolation).
+			const effective = this.lookupEffectiveRow(write.primaryKey, rebased);
+			if (write.type === 'upsert') {
+				rebased.recordUpsert(write.primaryKey, write.newRow!, effective);
+			} else if (effective) {
+				rebased.recordDelete(write.primaryKey, effective);
+			}
+		}
+
+		rebased.markCommitted();
+		return rebased;
 	}
 
 	async tryCollapseLayers(): Promise<void> {

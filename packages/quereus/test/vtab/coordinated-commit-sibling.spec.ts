@@ -69,4 +69,59 @@ describe('coordinated-commit sibling layer (last-writer-wins loss)', () => {
 		const ids = committedRows(manager).map(r => r[0]).sort((a, b) => (a as number) - (b as number));
 		expect(ids).to.deep.equal([1, 100, 200]);
 	});
+
+	it('rebases a sibling\'s UPDATE and DELETE, not just INSERT', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec("insert into t values (1, 'a'), (2, 'b'), (3, 'c')");
+
+		const manager = getManager(db, 't');
+
+		const conn1 = manager.connect();
+		const conn2 = manager.connect();
+		conn1.explicitTransaction = true;
+		conn2.explicitTransaction = true;
+
+		// conn1: delete id=1, update id=2 → 'b1'. (oldKeyValues carries PK columns only.)
+		await manager.performMutation(conn1, 'delete', undefined, [1]);
+		await manager.performMutation(conn1, 'update', [2, 'b1'], [2]);
+		// conn2 (sibling forked off the same base B): update id=3 → 'c2', insert id=4.
+		await manager.performMutation(conn2, 'update', [3, 'c2'], [3]);
+		await manager.performMutation(conn2, 'insert', [4, 'd2']);
+
+		await manager.commitTransaction(conn1); // head: {2:'b1', 3:'c'} (id=1 deleted)
+		await manager.commitTransaction(conn2); // rebase conn2's writes onto that head
+
+		const rows = committedRows(manager)
+			.sort((a, b) => (a[0] as number) - (b[0] as number));
+		// conn1's DELETE (id=1 gone) and UPDATE (2→'b1') both survive; conn2's
+		// UPDATE (3→'c2') and INSERT (4) replay on top.
+		expect(rows).to.deep.equal([[2, 'b1'], [3, 'c2'], [4, 'd2']]);
+	});
+
+	it('preserves all rows across a three-way chain of successive rebases', async () => {
+		await db.exec('create table t (id integer primary key, v text)');
+		await db.exec("insert into t values (1, 'base')");
+
+		const manager = getManager(db, 't');
+
+		// Three connections, all reading the same committed base B.
+		const conn1 = manager.connect();
+		const conn2 = manager.connect();
+		const conn3 = manager.connect();
+		conn1.explicitTransaction = true;
+		conn2.explicitTransaction = true;
+		conn3.explicitTransaction = true;
+
+		await manager.performMutation(conn1, 'insert', [10, 'from-conn1']);
+		await manager.performMutation(conn2, 'insert', [20, 'from-conn2']);
+		await manager.performMutation(conn3, 'insert', [30, 'from-conn3']);
+
+		// B ← P1, then B ← P1 ← rebased-P2, then a third sibling rebased onto that.
+		await manager.commitTransaction(conn1);
+		await manager.commitTransaction(conn2);
+		await manager.commitTransaction(conn3);
+
+		const ids = committedRows(manager).map(r => r[0]).sort((a, b) => (a as number) - (b as number));
+		expect(ids).to.deep.equal([1, 10, 20, 30]);
+	});
 });

@@ -25,6 +25,20 @@ interface PendingChange {
 }
 
 /**
+ * A single structural write this layer made, captured unconditionally (unlike
+ * {@link PendingChange}, which records only when change-tracking is enabled).
+ * Serves as the replay source when a sibling connection's commit advances the
+ * committed head past this layer's fork point and the layer must be rebased —
+ * see `MemoryTableManager.commitTransaction`.
+ */
+export interface OwnWrite {
+	type: 'upsert' | 'delete';
+	primaryKey: BTreeKeyForPrimary;
+	/** New row for an upsert; absent for a delete. */
+	newRow?: Row;
+}
+
+/**
  * Represents a set of modifications (inserts, updates, deletes) applied
  * on top of a parent Layer using inherited BTrees with copy-on-write semantics.
  * These layers are immutable once committed.
@@ -45,6 +59,15 @@ export class TransactionLayer implements Layer {
 
 	/** Pending changes for event emission. Null if tracking disabled. */
 	private pendingChanges: PendingChange[] | null = null;
+
+	// NOTE: always-on, one entry per record{Upsert,Delete} call — an ordered
+	// list, so repeated writes to the same PK are all retained (last-write-wins is
+	// applied at replay by re-deriving each key's effective row on the new head).
+	// If a write-heavy transaction ever shows memory pressure from this log,
+	// collapse it to a PK-keyed last-write map (only the net per-PK effect is ever
+	// replayed).
+	/** Always-maintained log of this layer's own structural writes (see {@link OwnWrite}). */
+	private readonly ownWrites: OwnWrite[] = [];
 
 	constructor(parent: Layer) {
 		this.layerId = transactionLayerCounter++;
@@ -144,6 +167,11 @@ export class TransactionLayer implements Layer {
 		return this.pendingChanges ?? [];
 	}
 
+	/** This layer's own structural writes, oldest-first — the rebase replay source. */
+	getOwnWrites(): readonly OwnWrite[] {
+		return this.ownWrites;
+	}
+
 	public getPkExtractorsAndComparators(schema: TableSchema): {
 		primaryKeyExtractorFromRow: (row: Row) => BTreeKeyForPrimary;
 		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number
@@ -180,6 +208,9 @@ export class TransactionLayer implements Layer {
 
 		this._hasModifications = true;
 		this.primaryModifications.upsert(newRowData);
+
+		// Always-on replay log (independent of change tracking).
+		this.ownWrites.push({ type: 'upsert', primaryKey, newRow: newRowData });
 
 		// Track change for event emission
 		if (this.pendingChanges) {
@@ -252,6 +283,9 @@ export class TransactionLayer implements Layer {
 		}
 		// If key doesn't exist, there's nothing to delete - no deletion marker needed
 		// Inheritree's copy-on-write semantics handle this properly
+
+		// Always-on replay log (independent of change tracking).
+		this.ownWrites.push({ type: 'delete', primaryKey });
 
 		// Track change for event emission
 		if (this.pendingChanges) {
