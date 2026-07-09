@@ -9,7 +9,7 @@ import { addFd } from '../util/fd-utils.js';
  * dependencies onto its source's physical FD surface — the declared logical
  * key(s) a lens *proves* or *enforces* at the inlined-view boundary that the
  * compiled body alone may not surface (docs/lens.md § Constraint Attachment;
- * docs/optimizer.md § Functional Dependency Tracking).
+ * docs/optimizer-fd.md).
  *
  * Pure planning-time marker, modeled on {@link AliasNode} / {@link RetrieveNode}:
  *  - column shape and attribute IDs are unchanged (`getType` / `getAttributes`

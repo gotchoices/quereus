@@ -2093,8 +2093,7 @@ function authoredPutTargetBasisColumn(ctx: ProveContext, logicalColumn: string, 
 
 // ---------------------------------------------------------------------------
 // Read-side: declared-key FD contribution to the optimizer (the inlined-view
-// boundary). See docs/lens.md § Constraint Attachment and docs/optimizer.md
-// § Functional Dependency Tracking.
+// boundary). See docs/lens.md § Constraint Attachment and docs/optimizer-fd.md.
 // ---------------------------------------------------------------------------
 
 /**

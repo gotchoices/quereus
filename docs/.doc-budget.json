@@ -4,11 +4,11 @@
 	"ratchet": {
 		"docs/lens.md": 17931,
 		"docs/materialized-views.md": 28574,
-		"docs/optimizer.md": 37997,
+		"docs/optimizer.md": 27935,
 		"docs/runtime.md": 13018,
 		"docs/schema.md": 15683,
 		"docs/sql.md": 28654,
 		"docs/sync.md": 14314,
-		"docs/view-updateability.md": 28016
+		"docs/view-updateability.md": 28014
 	}
 }

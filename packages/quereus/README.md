@@ -177,7 +177,7 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 * [Runtime](../../docs/runtime.md) — instruction-based execution and opcodes
 * [Error Handling](../../docs/errors.md) — error types and status codes
 * [Plugin System](../../docs/plugins.md) — virtual tables, functions, and collations
-* [Optimizer](../../docs/optimizer.md) / [Optimizer Conventions](../../docs/optimizer-conventions.md)
+* [Optimizer](../../docs/optimizer.md) / [Optimizer Conventions](../../docs/optimizer-conventions.md) / [Functional Dependencies](../../docs/optimizer-fd.md)
 * [Change-scope Introspection](../../docs/change-scope.md) — what a prepared statement reads from
 * [TODO List](../../docs/todo.md) — planned features
 

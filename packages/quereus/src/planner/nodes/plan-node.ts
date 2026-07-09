@@ -91,7 +91,7 @@ export interface FunctionalDependency {
  * An inclusion dependency (IND): a guarantee that for every row of THIS
  * relation, the tuple formed by `cols` exists in another relation's
  * `target.targetCols`. The *propagated* companion to the FK-declaration-bound
- * helpers in `planner/util/ind-utils.ts` — see `docs/optimizer.md` section
+ * helpers in `planner/util/ind-utils.ts` — see `docs/optimizer-fd.md` section
  * "Inclusion Dependency Tracking" for the seeding source and per-operator
  * propagation table.
  *
@@ -454,7 +454,7 @@ export interface PhysicalProperties {
    * `targetCols` (subject to `nullRejecting`). Seeded from declared foreign keys
    * at the table reference and propagated through joins/projections with
    * conservative drops — see `planner/util/fd-utils.ts` for the
-   * merge/project/shift helpers and `docs/optimizer.md` section "Inclusion
+   * merge/project/shift helpers and `docs/optimizer-fd.md` section "Inclusion
    * Dependency Tracking".
    *
    * Asserts *existence* of a tuple in another relation — strictly weaker than,

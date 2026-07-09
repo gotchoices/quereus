@@ -151,7 +151,7 @@ export interface LensSlot {
 	 * would not reach the prover — the body is planned before the slot is committed).
 	 * Only computed for the synthesized-decomposition body (not a full hand-authored
 	 * override or the single-source default body). See docs/lens.md § The module
-	 * mapping advertisement and docs/optimizer.md § Inclusion Dependency Tracking
+	 * mapping advertisement and docs/optimizer-fd.md § Inclusion Dependency Tracking
 	 * (Wave 3). Absent when no advertisement backs the table, the body is not the
 	 * synthesized decomposition, or the decomposition has only optional members / an
 	 * empty (singleton) key.

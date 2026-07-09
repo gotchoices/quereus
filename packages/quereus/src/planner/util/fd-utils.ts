@@ -1,8 +1,7 @@
 /**
  * Functional dependency (FD) and equivalence-class (EC) helpers used by
- * `computePhysical` on relational plan nodes. See `docs/optimizer.md`
- * section "Functional Dependency Tracking" for the propagation table and
- * design rationale.
+ * `computePhysical` on relational plan nodes. See `docs/optimizer-fd.md`
+ * for the propagation table and design rationale.
  */
 
 import { createLogger } from '../../common/logger.js';

@@ -161,7 +161,7 @@ export function deployLogicalSchema(
 		// mandatory non-anchor member, threaded to the prover via the slot so the
 		// mandatory inner-joins are provably row-loss-free and the put fan-out is
 		// sound against a derived existence fact. See docs/lens.md § The module
-		// mapping advertisement and docs/optimizer.md § Inclusion Dependency Tracking.
+		// mapping advertisement and docs/optimizer-fd.md § Inclusion Dependency Tracking.
 		//
 		// Gated (R2) to the synthesized-decomposition body: only
 		// `compileDecompositionBody` emits the advertised `anchor ⋈ member` joins the
