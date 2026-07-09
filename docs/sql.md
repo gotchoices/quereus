@@ -2542,13 +2542,15 @@ covering view, coarsening-collision telemetry) and the optimizer's contradiction
 latter declines to prove a predicate unsatisfiable at all when it cannot resolve a column's
 collation, rather than assuming byte order and dropping rows.
 
-**Grouping caveat — hash keys.** `GROUP BY`, window `PARTITION BY`, the hash-join Bloom filter,
-and `AS OF` partitioning group rows by a normalized *string* form of each key value, produced by a
-lookup that knows only `BINARY`, `NOCASE`, and `RTRIM` with their built-in meanings; any other
-name — and any redefinition of those three — falls back to grouping by raw bytes. So on a column
-carrying a custom collation, `where`, `order by`, and `distinct` agree with the connection's
-comparator while `group by` does not. Until that is fixed, treat `GROUP BY` / `PARTITION BY` over
-such a column as byte-grouped.
+**Grouping and hash keys.** `GROUP BY`, window `PARTITION BY`, the hash-join Bloom filter, and
+`AS OF` partitioning group rows by a normalized *string* form of each key value rather than by
+running the comparator. They resolve that normalizer against the connection's collation registry
+(`db.getKeyNormalizerResolver()`), so grouping, `where`, `order by`, and `distinct` all agree on
+which rows are equal — including under a custom or replaced collation. A collation registered
+**without** a `normalizer` can order rows but cannot bucket them: naming it as a grouping,
+partition, or hash-join key raises `collation <name> has no key normalizer` rather than silently
+grouping by bytes. Supply `{ normalizer }` to `registerCollation` for any collation you intend to
+group by.
 
 **Store caveat — physical key bytes.** The store encodes each text key into a sort-preserving
 byte string through a *separate* encoder registry that knows only `BINARY`, `NOCASE`, and

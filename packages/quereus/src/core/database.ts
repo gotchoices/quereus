@@ -42,7 +42,7 @@ import { MAINTENANCE_REBUILD_ROW_THRESHOLD } from '../planner/cost/index.js';
 import type { InstructionTracer } from '../runtime/types.js';
 import { DeclaredSchemaManager } from '../schema/declared-schema-manager.js';
 import { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
-import { type LogicalType, type CollationResolver } from '../types/logical-type.js';
+import { type LogicalType, type CollationResolver, type KeyNormalizer, type KeyNormalizerResolver } from '../types/logical-type.js';
 import { registerType as registerTypeInRegistry } from '../types/registry.js';
 import { getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
@@ -134,6 +134,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** Lazily-bound {@link getCollationResolver} closure — created once so callers can
 	 *  compare resolver identity, while still reading the live `collations` map. */
 	private collationResolver?: CollationResolver;
+	/** Lazily-bound {@link getKeyNormalizerResolver} closure — same identity/liveness
+	 *  contract as {@link collationResolver}. */
+	private keyNormalizerResolver?: KeyNormalizerResolver;
 	/**
 	 * Per-database latch registry — serializes commit / collapse / consolidate /
 	 * destroy / schema-change work by string key *within this database*. Scoped to
@@ -1469,23 +1472,59 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this.collationResolver;
 	}
 
+	/**
+	 * The canonical way to turn a collation name into a **key normalizer** for this
+	 * database — the hash-keyed counterpart of {@link getCollationResolver}. Every
+	 * operator that buckets rows by a text key (GROUP BY, window PARTITION BY, bloom /
+	 * hash join keys, AS OF partitioning) must resolve through this, so that grouping
+	 * and comparison agree on which rows are equal.
+	 *
+	 * Same contract as {@link getCollationResolver}: stable identity, reads the live
+	 * registry, no `checkOpen()`, and **no silent fallback**.
+	 *
+	 * - `undefined` or the exact name `BINARY` → the identity normalizer. `BINARY`
+	 *   cannot be overridden ({@link registerCollation} rejects it), which is this fast
+	 *   path's correctness precondition.
+	 * - A registered collation carrying a normalizer → that normalizer.
+	 * - A registered collation with **no** normalizer → throws. A comparator-only
+	 *   collation can order rows but cannot bucket them; guessing a normalizer would
+	 *   split or merge groups the comparator disagrees with.
+	 * - An unregistered name → throws `no such collation sequence: X`.
+	 */
+	getKeyNormalizerResolver(): KeyNormalizerResolver {
+		if (this.keyNormalizerResolver === undefined) {
+			this.keyNormalizerResolver = (collationName: string | undefined): KeyNormalizer => {
+				if (!collationName || collationName === 'BINARY') return BUILTIN_NORMALIZERS.BINARY;
+				const normalizer = this._getCollationNormalizer(collationName);
+				if (normalizer) return normalizer;
+				if (!this._getCollation(collationName)) {
+					throw new QuereusError(`no such collation sequence: ${collationName}`, StatusCode.ERROR);
+				}
+				throw new QuereusError(
+					`collation ${collationName} has no key normalizer; grouping and hash-join keys require one — pass { normalizer } to registerCollation`,
+					StatusCode.ERROR
+				);
+			};
+		}
+		return this.keyNormalizerResolver;
+	}
+
 	/** @internal Gets a registered collation function */
 	_getCollation(name: string): CollationFunction | undefined {
 		return this.collations.get(normalizeCollationName(name))?.comparator;
 	}
 
-	/** @internal Gets the registered key normalizer for a collation, falling back
-	 *  to the built-in normalizer for `BINARY` / `NOCASE` / `RTRIM` if the
-	 *  collation has no explicit normalizer registered. Returns `undefined` for
-	 *  comparator-only user-defined collations. */
-	_getCollationNormalizer(name: string): ((s: string) => string) | undefined {
-		const upper = normalizeCollationName(name);
-		const entry = this.collations.get(upper);
-		if (entry?.normalizer !== undefined) return entry.normalizer;
-		// Built-in fallback: even an entry that lost its normalizer (shouldn't
-		// happen for built-ins, but defends against external mutation) still
-		// resolves to the canonical built-in normalizer.
-		return BUILTIN_NORMALIZERS[upper];
+	/** @internal Gets the registered key normalizer for a collation. Returns `undefined`
+	 *  both for an unregistered name and for a comparator-only collation — the two are
+	 *  distinguished, and turned into errors, by {@link getKeyNormalizerResolver}.
+	 *
+	 *  There is deliberately no built-in fallback: an embedder that re-registers `NOCASE`
+	 *  with a custom comparator and no normalizer must get a loud error, not the built-in
+	 *  lowercase normalizer, which would partition strings differently from their
+	 *  comparator. The built-ins are seeded *with* their normalizers in
+	 *  `registerDefaultCollations()`, so a fresh database loses nothing. */
+	_getCollationNormalizer(name: string): KeyNormalizer | undefined {
+		return this.collations.get(normalizeCollationName(name))?.normalizer;
 	}
 
 	/** @internal True iff the named collation is asserted REPLICABLE — bit-identical

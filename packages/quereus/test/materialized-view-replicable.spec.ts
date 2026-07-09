@@ -100,9 +100,10 @@ describe('Materialized view replicable-determinism gate', () => {
 		// gate passes and the *replicable* gate is the one that bites (the two are orthogonal).
 		db.createScalarFunction('nonrepl', { numArgs: 1, deterministic: true }, (x) => Number(x) + 1);
 		// A non-replicable custom collation (opt-in defaults to false), for the collation gate.
-		// A comparator-only collation suffices — the replicable flag is independent of the
-		// (absent) normalizer, and the gate flags it whenever it governs the body.
-		db.registerCollation('MYLOCALE', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
+		// It carries a normalizer so it is usable as a GROUP BY key at all (a comparator-only
+		// collation is refused earlier, by the key normalizer resolver) — `replicable` is
+		// orthogonal to the normalizer, and the gate flags it whenever it governs the body.
+		db.registerCollation('MYLOCALE', (a, b) => (a < b ? -1 : a > b ? 1 : 0), { normalizer: (s) => s });
 		await db.exec(`
 			create table t (id integer primary key, k integer, v integer, c text);
 			insert into t values (1, 10, 100, 'alpha'), (2, 20, 200, 'beta');
@@ -296,7 +297,7 @@ describe('Materialized view replicable-determinism gate', () => {
 		it('accepts the same body once the collation is declared replicable', async () => {
 			// Re-register MYLOCALE replicable: true (overwrites the beforeEach non-replicable
 			// entry) — the demanding host then accepts the body the ORDER BY case rejected.
-			db.registerCollation('MYLOCALE', (a, b) => (a < b ? -1 : a > b ? 1 : 0), { replicable: true });
+			db.registerCollation('MYLOCALE', (a, b) => (a < b ? -1 : a > b ? 1 : 0), { normalizer: (s) => s, replicable: true });
 			await db.exec('create materialized view m_ord_ok using repl as select id, c from t order by c collate MYLOCALE;');
 			expect(db.schemaManager.getMaintainedTable('main', 'm_ord_ok'), 'replicable-collation body registers').to.not.be.undefined;
 		});

@@ -7,7 +7,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
-import { resolveKeyNormalizer, serializeRowKey } from '../../util/key-serializer.js';
+import { serializeRowKey } from '../../util/key-serializer.js';
 import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
@@ -48,7 +48,7 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 		// matched-collation gate keeps such pairs out of this path (see the lockstep
 		// note there).
 		const collationName = effectiveCollationOfTypes(leftAttributes[li].type, rightAttributes[ri].type);
-		keyNormalizers.push(resolveKeyNormalizer(collationName));
+		keyNormalizers.push(ctx.resolveKeyNormalizer(collationName));
 	}
 
 	const rightColCount = rightAttributes.length;

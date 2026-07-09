@@ -92,14 +92,58 @@ describe('Collation key normalizers', () => {
 			expect(db._getCollationNormalizer('CMPONLY')).to.equal(undefined);
 		});
 
-		it('overriding a built-in collation without a normalizer still falls back to the built-in normalizer', () => {
-			// Built-in fallback path: even if the user re-registers NOCASE without
-			// a normalizer (deprecated but allowed), _getCollationNormalizer
-			// resolves to BUILTIN_NORMALIZERS.NOCASE so persisted indexes keep working.
+		it('overriding a built-in collation without a normalizer leaves it with none', () => {
+			// No built-in fallback: handing back BUILTIN_NORMALIZERS.NOCASE here would
+			// partition strings the way the *replaced* comparator did, not the new one,
+			// so grouping would be confidently wrong. The raw accessor reports absence
+			// and the resolver turns that absence into a loud error.
 			const db = new Database();
 			db.registerCollation('NOCASE', (a, b) => a.localeCompare(b));
-			// Entry now has no normalizer; built-in fallback kicks in.
-			expect(db._getCollationNormalizer('NOCASE')).to.equal(BUILTIN_NORMALIZERS.NOCASE);
+			expect(db._getCollationNormalizer('NOCASE')).to.equal(undefined);
+			expect(() => db.getKeyNormalizerResolver()('NOCASE'))
+				.to.throw(/collation NOCASE has no key normalizer/);
+		});
+	});
+
+	describe('Database.getKeyNormalizerResolver', () => {
+		it('resolves undefined and BINARY to the identity normalizer', () => {
+			const db = new Database();
+			const resolve = db.getKeyNormalizerResolver();
+			expect(resolve(undefined)).to.equal(BUILTIN_NORMALIZERS.BINARY);
+			expect(resolve('BINARY')).to.equal(BUILTIN_NORMALIZERS.BINARY);
+			expect(resolve('BINARY')('Foo ')).to.equal('Foo ');
+		});
+
+		it('resolves the built-in NOCASE and RTRIM normalizers on a fresh database', () => {
+			const db = new Database();
+			const resolve = db.getKeyNormalizerResolver();
+			expect(resolve('NOCASE')('HeLLo')).to.equal('hello');
+			expect(resolve('nocase')('HeLLo')).to.equal('hello');
+			expect(resolve('RTRIM')('foo  ')).to.equal('foo');
+		});
+
+		it('has stable identity and reads the live registry', () => {
+			const db = new Database();
+			const resolve = db.getKeyNormalizerResolver();
+			expect(db.getKeyNormalizerResolver()).to.equal(resolve);
+
+			const lengthNormalizer = (s: string): string => 'x'.repeat(s.length);
+			db.registerCollation('NOCASE', (a, b) => a.length - b.length, { normalizer: lengthNormalizer });
+			// Registered *after* the resolver was handed out, yet visible to it.
+			expect(resolve('NOCASE')).to.equal(lengthNormalizer);
+		});
+
+		it('throws on an unregistered collation name', () => {
+			const db = new Database();
+			expect(() => db.getKeyNormalizerResolver()('NOSUCH'))
+				.to.throw(/no such collation sequence: NOSUCH/);
+		});
+
+		it('throws on a comparator-only collation, naming it', () => {
+			const db = new Database();
+			db.registerCollation('CMPONLY', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
+			expect(() => db.getKeyNormalizerResolver()('CMPONLY'))
+				.to.throw(/collation CMPONLY has no key normalizer/);
 		});
 	});
 

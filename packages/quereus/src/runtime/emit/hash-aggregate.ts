@@ -16,7 +16,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { AggValue } from '../../func/registration.js';
-import { serializeKeyNullGrouping, resolveKeyNormalizer } from '../../util/key-serializer.js';
+import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createTypedComparator } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
@@ -53,7 +53,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 	// Pre-resolve collation normalizers for GROUP BY key serialization
 	const keyNormalizers = plan.groupBy.map(expr => {
 		const exprType = expr.getType();
-		return resolveKeyNormalizer(exprType.collationName);
+		return ctx.resolveKeyNormalizer(exprType.collationName);
 	});
 
 	// Pre-resolve typed comparators for DISTINCT aggregate tracking per aggregate

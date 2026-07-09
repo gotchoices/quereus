@@ -14,7 +14,7 @@ import type { Row, SqlValue } from '../common/types.js';
 import type { UniqueConstraintSchema } from '../schema/table.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { AssertionViolation } from './database-assertions.js';
-import type { CollationResolver } from '../types/logical-type.js';
+import type { CollationResolver, KeyNormalizerResolver } from '../types/logical-type.js';
 
 /**
  * One externally-applied row change to report through
@@ -254,4 +254,15 @@ export interface DatabaseInternal {
 	 * Call it at comparator-construction time (index build, cursor setup), not per row.
 	 */
 	getCollationResolver(): CollationResolver;
+
+	/**
+	 * The canonical key-normalizer resolver for this database — the hash-keyed
+	 * counterpart of {@link getCollationResolver}, and the only supported way for an
+	 * extension package to bucket text keys in a way that honors `db.registerCollation`.
+	 * Stable identity; reads the live registry; throws `QuereusError` on an unknown name
+	 * or on a comparator-only collation (never guesses a built-in normalizer).
+	 *
+	 * Call it at key-encoder-construction time, not per row.
+	 */
+	getKeyNormalizerResolver(): KeyNormalizerResolver;
 }

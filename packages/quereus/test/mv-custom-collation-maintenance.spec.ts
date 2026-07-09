@@ -74,6 +74,29 @@ describe('materialized-view maintenance under a database-registered collation', 
 		]);
 	});
 
+	it('recomputes an aggregate MV whose group key is collation-equal but byte-different', async () => {
+		// The `residual-recompute` arm: the second insert binds the group key `'bb'`, the
+		// key-filtered residual recomputes the group and emits `'aa'` (the representative
+		// already in the backing table). `residualRowMatchesKey` must keep that row — a byte
+		// comparison would drop it and leave the backing sum stale.
+		await db.exec('create table src (id integer primary key, k text collate nocase not null, v integer not null)');
+		await db.exec('create table agg (k text collate nocase primary key, s real null) maintained as select k, sum(v) as s from src group by k');
+		await db.exec("insert into src values (1, 'aa', 10)");
+		expect(await results(db, 'select k, s from agg')).to.deep.equal([{ k: 'aa', s: 10 }]);
+
+		await db.exec("insert into src values (2, 'bb', 5)");
+		expect(await results(db, 'select k, s from agg')).to.deep.equal([{ k: 'aa', s: 15 }]);
+
+		// 'ccc' is a different length ⇒ its own group.
+		await db.exec("insert into src values (3, 'ccc', 7)");
+		expect(await results(db, 'select k, s from agg order by k, s'))
+			.to.deep.equal([{ k: 'aa', s: 15 }, { k: 'ccc', s: 7 }]);
+
+		// Deleting one member of the folded group leaves the other's contribution behind.
+		await db.exec('delete from src where id = 1');
+		expect(await results(db, 'select s from agg where k = \'bb\'')).to.deep.equal([{ s: 5 }]);
+	});
+
 	it('an UPDATE that is a no-op under the collation leaves the covering MV consistent', async () => {
 		await db.exec('create table t (id integer primary key, x text collate nocase not null, unique (x))');
 		await db.exec('create materialized view ix as select x, id from t order by x');
@@ -185,11 +208,10 @@ describe('the maintained-table "must be a set" gate resolves collations through 
 
 describe('materialized-view apply-path key comparisons use the plan-resolved collation', () => {
 	// The three per-row helpers read `collationFn` off each backing-PK descriptor, which the
-	// plan builder resolved against the database once. Exercised directly: the residual /
-	// prefix-delete arms these belong to need an aggregate or lateral-TVF body whose group
-	// key the hash-aggregate path cannot yet key under a custom collation (see the
-	// `bug-key-normalizer-ignores-database-collations` fix ticket), so end-to-end coverage
-	// of a *collation-equal, byte-different* key is not reachable through SQL today.
+	// plan builder resolved against the database once. Exercised directly here, at the unit
+	// level; the aggregate (`residual-recompute`) arm also has end-to-end SQL coverage above
+	// — see "recomputes an aggregate MV whose group key is collation-equal but
+	// byte-different". The prefix-delete arm's lateral-TVF body has no direct SQL coverage yet.
 	const pkCol = (index: number, collationFn = BINARY_COLLATION): BackingPkColumn =>
 		({ index, collation: 'NOCASE', collationFn });
 

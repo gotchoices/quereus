@@ -98,7 +98,7 @@ export {
 } from './util/comparison.js';
 
 // Type system
-export type { LogicalType, CollationResolver, CollationFunction as TypeCollationFunction } from './types/logical-type.js';
+export type { LogicalType, CollationResolver, KeyNormalizer, KeyNormalizerResolver, CollationFunction as TypeCollationFunction } from './types/logical-type.js';
 export { PhysicalType } from './types/logical-type.js';
 export {
 	NULL_TYPE,

@@ -471,11 +471,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// comparator-only collation (or a custom collation with a registered
 		// normalizer) falls back to BINARY here, so a case-only PK rewrite under such
 		// a collation could fail to shadow the underlying row (duplicate in a scan).
-		// This matches the engine-wide hash-key convention (bloom-join / window /
-		// hash-aggregate / store UNIQUE all use the same resolver and accept the same
-		// residual — see docs/schema.md). If custom-collation PKs ever need exact
-		// merge shadowing, thread db._getCollationNormalizer through here (and fix the
-		// other hash sites too, since the divergence is shared).
+		// The engine's own hash sites (bloom-join / window / hash-aggregate / asof)
+		// no longer share this divergence — they resolve through
+		// `db.getKeyNormalizerResolver()`. This site and the store's key encoder are
+		// the two remaining built-ins-only callers. If custom-collation PKs ever need
+		// exact merge shadowing, thread a `Database` (or its normalizer resolver) to
+		// this call site and use that resolver instead.
 		const pkNormalizers = pkIndices.map(i =>
 			resolveKeyNormalizer(this.tableSchema!.columns[i].collation));
 

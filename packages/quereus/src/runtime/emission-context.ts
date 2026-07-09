@@ -7,6 +7,8 @@ import { createLogger } from '../common/logger.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import { BINARY_COLLATION, type CollationFunction } from '../util/comparison.js';
+import { BUILTIN_NORMALIZERS } from '../util/key-serializer.js';
+import type { KeyNormalizer } from '../types/logical-type.js';
 
 const log = createLogger('runtime:emission-context');
 
@@ -207,6 +209,23 @@ export class EmissionContext {
 		const func = this.getCollation(collationName);
 		if (!func) return this.db.getCollationResolver()(collationName);
 		return func;
+	}
+
+	/**
+	 * Resolves a collation name to its key normalizer against this emission's database,
+	 * recording the dependency for plan invalidation. This is the only normalizer lookup
+	 * an emitter should use: an operator that buckets rows by a text key must partition
+	 * them exactly as {@link resolveCollation}'s comparator would, or grouping and
+	 * comparison disagree on the same column in the same connection.
+	 *
+	 * Throws `QuereusError` on an unknown name, and on a comparator-only collation that
+	 * carries no normalizer — both delegated to {@link Database.getKeyNormalizerResolver}
+	 * so every caller reports the same error.
+	 */
+	resolveKeyNormalizer(collationName: string | undefined): KeyNormalizer {
+		if (!collationName || collationName === 'BINARY') return BUILTIN_NORMALIZERS.BINARY; // Fast path
+		this.getCollation(collationName); // Record the dependency; the resolver owns the miss
+		return this.db.getKeyNormalizerResolver()(collationName);
 	}
 
 	/**

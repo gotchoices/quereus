@@ -17,6 +17,25 @@ export type CollationFunction = (a: string, b: string) => number;
 export type CollationResolver = (collationName: string) => CollationFunction;
 
 /**
+ * A per-collation string normalizer: two strings are equal under the collation
+ * iff their normalized forms are identical strings. Hash-keyed operators (GROUP BY,
+ * window PARTITION BY, hash/bloom joins, AS OF partitioning) bucket rows by the
+ * normalized form, so the normalizer must partition strings into exactly the
+ * equivalence classes the collation's comparator calls equal.
+ */
+export type KeyNormalizer = (s: string) => string;
+
+/**
+ * Resolves a collation name to its key normalizer for one specific database.
+ * `undefined` and `BINARY` resolve to the identity normalizer. A registered
+ * collation with no normalizer, and an unregistered name, both throw
+ * `QuereusError(StatusCode.ERROR)` — as with {@link CollationResolver} there is no
+ * silent fallback, since a wrong normalizer produces confidently wrong groupings
+ * rather than a visible error.
+ */
+export type KeyNormalizerResolver = (collationName: string | undefined) => KeyNormalizer;
+
+/**
  * Physical types represent how values are stored in memory and on disk.
  * These are the actual runtime representations.
  */

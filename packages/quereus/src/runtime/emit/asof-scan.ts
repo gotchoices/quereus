@@ -9,7 +9,7 @@ import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { createRowSlot } from '../context-helpers.js';
 import { compareSqlValuesFast } from '../../util/comparison.js';
 import type { CollationFunction } from '../../util/comparison.js';
-import { resolveKeyNormalizer, serializeRowKey } from '../../util/key-serializer.js';
+import { serializeRowKey } from '../../util/key-serializer.js';
 import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-collation.js';
 import { joinOutputRow } from './join-output.js';
 
@@ -82,7 +82,7 @@ function resolveSetup(plan: AsofScanNode, ctx: EmissionContext): AsofScanSetup {
 		// both key off the one resolved name so they cannot disagree.
 		const collationName = effectiveCollationOfTypes(leftAttrs[leftIdx].type, rightAttrs[rightIdx].type);
 		partitionCollations.push(ctx.resolveCollation(collationName));
-		keyNormalizers.push(resolveKeyNormalizer(collationName));
+		keyNormalizers.push(ctx.resolveKeyNormalizer(collationName));
 	}
 
 	const rightOutputColumnIndices = plan.getRightOutputColumnIndices();

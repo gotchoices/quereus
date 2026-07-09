@@ -9,7 +9,7 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { createTypedComparator, createOrderByComparatorFast } from '../../util/comparison.js';
 import type { LogicalType } from '../../types/logical-type.js';
-import { resolveKeyNormalizer, serializeKeyNullGrouping } from '../../util/key-serializer.js';
+import { serializeKeyNullGrouping } from '../../util/key-serializer.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { RowDescriptor } from '../../planner/nodes/plan-node.js';
@@ -67,7 +67,7 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 
 	// Pre-resolve collation normalizers for partition key serialization
 	const partitionKeyNormalizers = plan.partitionExpressions.map(exprPlan =>
-		resolveKeyNormalizer(exprPlan.getType().collationName)
+		ctx.resolveKeyNormalizer(exprPlan.getType().collationName)
 	);
 
 	async function* run(

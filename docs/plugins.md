@@ -541,11 +541,12 @@ SELECT filename FROM files ORDER BY filename COLLATE NUMERIC;
 SELECT * FROM files WHERE filename = 'file10.txt' COLLATE NUMERIC;
 ```
 
-> **Note** — to use a custom collation as the key for a compound index, supply
-> a `normalizer` alongside `func` (see [Key Normalizers and Index
-> Participation](#key-normalizers-and-index-participation) below). Comparator-only
-> registrations work for `ORDER BY` and standalone comparisons but index
-> creation referencing them is rejected.
+> **Note** — to use a custom collation as the key for a compound index, a
+> `GROUP BY` / `PARTITION BY` key, or a hash-join key, supply a `normalizer`
+> alongside `func` (see [Key Normalizers, Grouping, and Index
+> Participation](#key-normalizers-grouping-and-index-participation) below).
+> Comparator-only registrations work for `ORDER BY` and standalone comparisons;
+> index creation and grouping referencing them are rejected.
 
 ## Configuration
 
@@ -1439,18 +1440,30 @@ The function should return:
 - `0` if `a === b`
 - `1` if `a > b`
 
-### Key Normalizers and Index Participation
+### Key Normalizers, Grouping, and Index Participation
 
 A collation defines an equivalence relation on strings (the set of pairs where
-the comparator returns `0`). For a collation to back a compound index key, the
-engine needs a *normalizer* — a function whose output equality partitions
-strings into the same equivalence classes as the comparator. For example,
-`NOCASE`'s normalizer is `s => s.toLowerCase()`, and `RTRIM`'s strips only
-trailing ASCII spaces (matching its comparator — note that `s.trimEnd()` would
-*disagree* by also stripping tabs/NBSP).
+the comparator returns `0`). Anywhere the engine buckets rows by a key instead
+of comparing them pairwise, it needs a *normalizer* — a function whose output
+equality partitions strings into the same equivalence classes as the comparator.
+For example, `NOCASE`'s normalizer is `s => s.toLowerCase()`, and `RTRIM`'s
+strips only trailing ASCII spaces (matching its comparator — note that
+`s.trimEnd()` would *disagree* by also stripping tabs/NBSP).
+
+Supply a normalizer if the collation will be used for any of:
+
+- a compound index key;
+- a `GROUP BY` key or a window `PARTITION BY` key;
+- a hash/bloom join key, or an `AS OF` partition key.
+
+A comparator-only registration still works for `ORDER BY` and standalone
+comparisons. Index creation naming it is rejected, and a query that groups or
+hash-joins on it raises `collation <name> has no key normalizer` — the engine
+never guesses a built-in normalizer, because a normalizer that disagrees with
+the comparator produces confidently wrong groups rather than a visible error.
 
 Normalizer-and-comparator agreement is a hard contract. If they diverge, index
-lookups silently miss rows.
+lookups silently miss rows and groups split or merge wrongly.
 
 ### Built-in Collations
 
@@ -1470,6 +1483,11 @@ db.registerCollation(
 
 // Resolve a name to its function. Throws `no such collation sequence: <name>` if unregistered.
 db.getCollationResolver(): CollationResolver;   // (name: string) => CollationFunction
+
+// Resolve a name to its key normalizer, for anything that buckets rows by key rather than
+// comparing them. `undefined` / `BINARY` → identity. Throws on an unregistered name, and on
+// a registered collation that carries no normalizer — it never guesses a built-in.
+db.getKeyNormalizerResolver(): KeyNormalizerResolver;   // (name: string | undefined) => (s: string) => string
 
 // Built-ins-only lookup, for standalone utility code that has no `Database`.
 // Returns `undefined` for any name outside BINARY / NOCASE / RTRIM.
