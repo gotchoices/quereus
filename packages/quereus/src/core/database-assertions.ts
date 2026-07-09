@@ -216,6 +216,8 @@ export class AssertionEvaluator {
 		if (assertions.length === 0) return;
 
 		const changedBases = this.ctx.getChangedBaseTables();
+		// eslint-disable-next-line no-console
+		console.error(`[DIAG runGlobalAssertions] assertions=${assertions.map(a => a.name).join(',')} changedBases=${[...changedBases].join(',')}`);
 		if (changedBases.size === 0) return;
 
 		// Install the sink for the duration of this pass; restore null after so a
@@ -388,6 +390,8 @@ export class AssertionEvaluator {
 		const pkIndicesByBase = new Map<string, readonly number[]>(cached.pkIndicesByBase);
 
 		const apply = async (input: DeltaApplyInput): Promise<void> => {
+			// eslint-disable-next-line no-console
+			console.error(`[DIAG apply] assertion=${assertion.name} perRelationTuples=${[...input.perRelationTuples.keys()].join(',')} globalRelations=${[...input.globalRelations].join(',')}`);
 			// Per-binding dispatch for 'row'/'group' relations.
 			for (const [relKey, tuples] of input.perRelationTuples) {
 				const residual = cached.residualsByRelation.get(relKey);
@@ -432,6 +436,8 @@ export class AssertionEvaluator {
 				violatingRows.push(row as SqlValue[]);
 				if (violatingRows.length >= MAX_VIOLATION_SAMPLES) break;
 			}
+			// eslint-disable-next-line no-console
+			console.error(`[DIAG executeViolationOnce] assertion=${assertionName} sql=${JSON.stringify(sql)} violatingRows=${JSON.stringify(violatingRows)}`);
 			if (violatingRows.length > 0) {
 				this.raiseViolation(assertionName, violatingRows);
 			}
@@ -466,8 +472,14 @@ export class AssertionEvaluator {
 			};
 
 			const result = await scheduler.run(runtimeCtx);
+			// eslint-disable-next-line no-console
+			console.error(`[DIAG residualPerTuple] assertion=${assertionName} tuple=${JSON.stringify(tuple)} isAsyncIterable=${isAsyncIterable(result)}`);
 			if (isAsyncIterable(result)) {
+				let yielded = 0;
 				for await (const _ of result as AsyncIterable<unknown>) {
+					yielded++;
+					// eslint-disable-next-line no-console
+					console.error(`[DIAG residualPerTuple] assertion=${assertionName} YIELDED row -> violation`);
 					// First violating tuple for this binding: throw (default) or
 					// collect-and-stop (report mode mirrors the throw's method exit).
 					this.raiseViolation(assertionName, [tuple as SqlValue[]]);

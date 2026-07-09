@@ -37,9 +37,16 @@ export class PlanNodeCharacteristics {
 	 * forward the property through its own `computePhysical` override.
 	 */
 	static subtreeHasSideEffects(node: PlanNode): boolean {
-		if (this.hasSideEffects(node)) return true;
-		for (const child of node.getChildren()) {
-			if (this.subtreeHasSideEffects(child)) return true;
+		// Iterative worklist (not recursion) so a deep plan cannot overflow the
+		// native call stack — matching the pass framework's iterative traversal.
+		// Early-exits on the first side-effecting node rather than draining fully.
+		const stack: PlanNode[] = [node];
+		while (stack.length > 0) {
+			const current = stack.pop()!;
+			if (this.hasSideEffects(current)) return true;
+			for (const child of current.getChildren()) {
+				stack.push(child);
+			}
 		}
 		return false;
 	}

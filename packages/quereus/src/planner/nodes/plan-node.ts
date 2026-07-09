@@ -802,10 +802,27 @@ export abstract class PlanNode {
 	 */
 	getTotalCost(): number {
 		if (this._totalCostCache === undefined) {
-			this._totalCostCache = this.estimatedCost +
-				this.getChildren().reduce((acc, child) => acc + child.getTotalCost(), 0);
+			// Iterative post-order sum so an arbitrarily deep plan cannot overflow the
+			// native call stack — matching the pass framework's iterative traversal
+			// (framework/pass.ts). Populates every subtree node's `_totalCostCache`
+			// bottom-up, so each child's total is cached before its parent sums it.
+			PlanNode.computePostOrder(
+				this,
+				node => node._totalCostCache !== undefined,
+				node => {
+					// Sum children from 0 first, THEN add self — bit-identical to the
+					// original `estimatedCost + children.reduce(..., 0)` order, so the
+					// memoized total matches validateCostAdditivity's recomputation to
+					// the last floating-point ULP.
+					let childrenSum = 0;
+					for (const child of node.getChildren()) {
+						childrenSum += child._totalCostCache!;
+					}
+					node._totalCostCache = node.estimatedCost + childrenSum;
+				},
+			);
 		}
-		return this._totalCostCache;
+		return this._totalCostCache!;
 	}
 
 	/**
@@ -817,9 +834,61 @@ export abstract class PlanNode {
 		this._totalCostCache = undefined;
 	}
 
+	/**
+	 * Iterative post-order walk over `getChildren()`, used by the memoizing
+	 * bottom-up folds (`physical`, `getTotalCost`). Explicit worklist instead of
+	 * recursion so a deep plan cannot overflow the native call stack.
+	 *
+	 * `isDone(node)` reports whether the node's memo is already populated — such a
+	 * node is skipped (its subtree is not re-walked), which both preserves prior
+	 * memoization and makes shared-subtree DAGs correct and O(1) on re-visit.
+	 * `compute(node)` runs exactly once per not-yet-done node, AFTER all of its
+	 * children have been computed, so it may read each child's memo directly.
+	 */
+	private static computePostOrder(
+		root: PlanNode,
+		isDone: (node: PlanNode) => boolean,
+		compute: (node: PlanNode) => void,
+	): void {
+		const stack: { node: PlanNode; expanded: boolean }[] = [{ node: root, expanded: false }];
+		while (stack.length > 0) {
+			const frame = stack[stack.length - 1];
+			const node = frame.node;
+			if (isDone(node)) {
+				// Already computed (memo hit, or reached again via a shared subtree).
+				stack.pop();
+				continue;
+			}
+			if (!frame.expanded) {
+				// First visit: schedule children, then revisit this frame to compute.
+				frame.expanded = true;
+				const children = node.getChildren();
+				for (let i = children.length - 1; i >= 0; i--) {
+					stack.push({ node: children[i], expanded: false });
+				}
+			} else {
+				// Revisit: every child is now done — compute and pop.
+				stack.pop();
+				compute(node);
+			}
+		}
+	}
+
   visit(visitor: PlanNodeVisitor): void {
-    visitor(this);
-    this.getChildren().forEach(child => child.visit(visitor));
+    // Iterative pre-order walk (visit before descending) so a deep plan cannot
+    // overflow the native call stack. Children are pushed in reverse so they pop
+    // left-to-right, preserving the original visitation order. Mirrors the
+    // recursive version's semantics exactly — no per-node dedup, so a node
+    // reachable by two paths is still visited once per path.
+    const stack: PlanNode[] = [this];
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      visitor(node);
+      const children = node.getChildren();
+      for (let i = children.length - 1; i >= 0; i--) {
+        stack.push(children[i]);
+      }
+    }
   }
 
 	toString(): string {
@@ -864,34 +933,53 @@ export abstract class PlanNode {
 	/** Infer and cache the physical properties of this node */
 	get physical(): PhysicalProperties {
 		if (!this._physical) {
-			const childrenPhysical = this.getChildren().map(child => child.physical);
-
-			// Get the node-specific overrides
-			const propsOverride = this.computePhysical?.(childrenPhysical);
-
-			// Derive defaults from children if there are any, else leaf defaults
-			const defaults = childrenPhysical.length
-				? {
-					deterministic: childrenPhysical.every(child => child.deterministic),
-					idempotent: childrenPhysical.every(child => child.idempotent),
-					readonly: childrenPhysical.every(child => child.readonly),
-					// constant: DON'T INHERIT - only ValueNodes can be directly constant
-					// expectedLatencyMs: max of children — slowest child gates first-row
-					// latency. 0 default for local-only paths.
-					expectedLatencyMs: childrenPhysical.reduce(
-						(acc, child) => Math.max(acc, child.expectedLatencyMs ?? 0),
-						0,
-					),
-					// concurrencySafe: AND of children — any non-safe child poisons the
-					// parent. Default true so missing values do not spuriously disable
-					// parallelism; leaves that need stricter behavior set false.
-					concurrencySafe: childrenPhysical.every(child => child.concurrencySafe !== false),
-				}
-				: DEFAULT_PHYSICAL;
-
-			this._physical = { ...defaults, ...propsOverride };
+			// Iterative post-order fold so a deep plan cannot overflow the native
+			// call stack. Populates `_physical` bottom-up: every child's `_physical`
+			// is set before its parent computes, so `computePhysicalFromChildren`
+			// reads cached values (never a recursive `.physical` access).
+			PlanNode.computePostOrder(
+				this,
+				node => node._physical !== undefined,
+				node => node.computePhysicalFromChildren(),
+			);
 		}
-		return this._physical;
+		return this._physical!;
+	}
+
+	/**
+	 * Compute and store this node's `_physical` from its children's already-cached
+	 * `_physical`. Called by the `physical` getter's post-order walk once every
+	 * child is populated. The defaults/override merge is identical to a direct
+	 * recursive computation — only the child-physical source (cached, not a
+	 * recursive `.physical` read) differs.
+	 */
+	private computePhysicalFromChildren(): void {
+		const childrenPhysical = this.getChildren().map(child => child._physical!);
+
+		// Get the node-specific overrides
+		const propsOverride = this.computePhysical?.(childrenPhysical);
+
+		// Derive defaults from children if there are any, else leaf defaults
+		const defaults = childrenPhysical.length
+			? {
+				deterministic: childrenPhysical.every(child => child.deterministic),
+				idempotent: childrenPhysical.every(child => child.idempotent),
+				readonly: childrenPhysical.every(child => child.readonly),
+				// constant: DON'T INHERIT - only ValueNodes can be directly constant
+				// expectedLatencyMs: max of children — slowest child gates first-row
+				// latency. 0 default for local-only paths.
+				expectedLatencyMs: childrenPhysical.reduce(
+					(acc, child) => Math.max(acc, child.expectedLatencyMs ?? 0),
+					0,
+				),
+				// concurrencySafe: AND of children — any non-safe child poisons the
+				// parent. Default true so missing values do not spuriously disable
+				// parallelism; leaves that need stricter behavior set false.
+				concurrencySafe: childrenPhysical.every(child => child.concurrencySafe !== false),
+			}
+			: DEFAULT_PHYSICAL;
+
+		this._physical = { ...defaults, ...propsOverride };
 	}
 
   /** Helper to generate unique attribute IDs */

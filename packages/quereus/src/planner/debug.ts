@@ -338,6 +338,11 @@ export function formatPlanTree(rootNode: PlanNode, options: PlanDisplayOptions =
 	const lines: string[] = [];
 	const nodesSeen = new Set<PlanNode>();
 
+	// NOTE: recursive tree-walk (also formatPlanSummary/collectPath below). Unlike
+	// the read-time accessors (physical/getTotalCost/visit), this is diagnostic-only
+	// (EXPLAIN / plan display), so a deep plan is not on the query hot path. If plan
+	// formatting ever needs to run on arbitrarily deep plans, convert to an explicit
+	// worklist like PlanNode.computePostOrder / visit.
 	function formatNode(node: PlanNode, depth: number, isLast: boolean, prefix: string): void {
 		if (maxDepth !== undefined && depth > maxDepth) {
 			return;
