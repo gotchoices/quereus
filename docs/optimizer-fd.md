@@ -56,6 +56,8 @@ The "all-columns is a key" claim (DISTINCT, schema-set tables with no smaller ke
 
 ## `kind`: uniqueness provenance
 
+> **Invariant:** [OPT-040](invariants.md#opt-040--a-fanning-join-downgrades-the-non-preserved-side), [OPT-044](invariants.md#opt-044--fd-identity-is-structural-unique-wins-on-merge), [OPT-054](invariants.md#opt-054--all-columns-key-ness-lives-on-isset)
+
 Every FD carries a **required** `kind: 'unique' | 'determination'` field:
 
 - **`'unique'`** — the relation has at most one row per distinct determinant tuple (for a guarded FD: restricted to rows satisfying the guard). This is a semantic claim about *this* relation, not a historical note about where the FD came from: any transform that can break determinant row-uniqueness (fan-out) **must downgrade** the FD to `'determination'`.
@@ -87,6 +89,8 @@ The field is required (not optional) on purpose: every construction site must de
 
 ## Collation gate on equality facts
 
+> **Invariant:** [OPT-050](invariants.md#opt-050--equality-facts-require-a-value-discriminating-collation)
+
 Every equality-derived fact above is a **value-level** claim, but a SQL equality only implies value equality when its effective comparison collation is value-discriminating — a NOCASE/RTRIM comparison passes value-*different* rows (`'Bob' = 'bob'` under NOCASE). Extraction is therefore gated per conjunct:
 
 - **Effective collation is resolved exactly as the runtime does**, via the shared helpers in `planner/analysis/comparison-collation.ts`: the symmetric provenance lattice (explicit `COLLATE` > declared column collation > defaulted collation > BINARY; see `docs/types.md` § Comparison collation resolution) — a binary comparison resolves both operands' contributions (`emitComparisonOp`); `IN` merges the condition with every listed value / the subquery column (`emitIn`); each BETWEEN bound resolves against the tested expression independently (`emitBetween`). The access-path rule's collation-cover analysis (`effectivePredicateCollation`) is built on the same helpers, so plan-time facts and runtime behavior cannot drift. Note that constant folding preserves type metadata, so `'bob' COLLATE NOCASE` folds to a *literal whose type still carries NOCASE* — shape checks alone do not see the wrapper; the gates read operand **types**.
@@ -101,6 +105,8 @@ Every equality-derived fact above is a **value-level** claim, but a SQL equality
 The Key Soundness property harness checks claimed keys under each key column's **output collation** (NOCASE folds case, RTRIM folds trailing spaces) over a mixed-case text zoo, so a regression in any of these gates surfaces as an observable over-claim.
 
 ## The reader rule: `isUniqueDeterminant`
+
+> **Invariant:** [OPT-032](invariants.md#opt-032--coverage-is-not-uniqueness)
 
 The single reader-side uniqueness primitive (`planner/util/fd-utils.ts`):
 
@@ -120,6 +126,8 @@ Pure value coverage (no uniqueness claim) is available as `closureCoversAll(attr
 All FD-surface uniqueness readers route through the primitive and take `isSet`: `deriveKeysFromFds(fds, columnCount, isSet)`, `hasAnyKey(fds, columnCount, isSet)`, `hasSingletonFd(fds, columnCount, isSet)` (≡ `isUniqueDeterminant(∅, …)` — constant pins on a bag do not claim ≤1-row; pinning every column of a *set* is a sound ≤1-row derivation), and the `isUnique` closure branch. Callers needing a positive uniqueness claim (sort/window strict-`monotonicOn`) call `isUniqueDeterminant` directly.
 
 ## `keysOf` / `isUnique`: the single uniqueness read path
+
+> **Invariant:** [OPT-030](invariants.md#opt-030--uniqueness-is-read-through-one-surface)
 
 Consumers must **not** hand-check all three surfaces. Read uniqueness through the two helpers in `planner/util/fd-utils.ts`, which reconcile them:
 
@@ -143,6 +151,8 @@ Parameters are constants here. A `ParameterReferenceNode` is bound once before i
 Bindings are closed over equivalence classes: at every node that contributes bindings (Filter, inner join), if a binding pins column `c` to value `v` and there's an EC `{c, c2, ...}`, the binding's `attrs` are extended to cover every EC member. So `WHERE t.k = u.k AND t.k = 5` lands as a single binding `{ attrs: [t.k, u.k], value: literal 5 }` on the join's output — exactly the input the predicate-inference rule will read.
 
 ## Per-operator propagation
+
+> **Invariant:** [OPT-042](invariants.md#opt-042--an-outer-join-drops-the-null-padded-sides-facts), [OPT-048](invariants.md#opt-048--dependency-facts-index-output-columns)
 
 This table is canonical. [Rules § Key-driven row-count reduction](optimizer-rules.md#key-driven-row-count-reduction) restates the join arms from `analyzeJoinKeyCoverage`'s point of view; if the two ever disagree, this one is right.
 
@@ -172,6 +182,8 @@ This table is canonical. [Rules § Key-driven row-count reduction](optimizer-rul
 `domainConstraints` propagate alongside `constantBindings` using the same projection / shift / drop rules: pass-through nodes (Filter, Distinct, Alias, Window, Sort, Limit, scan family) inherit them unchanged; Project/Returning/Aggregate keep only constraints whose column maps to an output column; inner/cross joins concat with shift; LEFT/RIGHT outer keep only the preserved side; FULL outer and SetOperation drop everything. Filter does **not** intersect domains with the filter predicate; multiple constraints on the same column may coexist (no implicit intersection at this layer).
 
 ## Inclusion Dependency Tracking
+
+> **Invariant:** [OPT-056](invariants.md#opt-056--an-inclusion-dependency-is-dropped-when-unsure)
 
 An **inclusion dependency** (IND) is a fourth dependency-family member of `PhysicalProperties`, sitting beside `fds` / `equivClasses` / `constantBindings` / `domainConstraints`. Where an FD asserts *determination within* this relation, an IND asserts *existence in another* relation: for every row of this node, the tuple formed by `cols` is guaranteed to appear in another relation's `targetCols`. It is strictly weaker than, and orthogonal to, an FD.
 
@@ -304,6 +316,8 @@ This is **not** a generalization of base-table `proveCoverage`, and is deliberat
 
 ## Assertion-derived premises
 
+> **Invariant:** [OPT-052](invariants.md#opt-052--provenance-is-informational)
+
 `CREATE ASSERTION` whose CHECK matches the canonical *trivially universal* shape
 
 ```
@@ -356,6 +370,8 @@ violation query at COMMIT and remains the source of truth.
 
 ## Guard activation
 
+> **Invariant:** [OPT-034](invariants.md#opt-034--closure-helpers-skip-guarded-fds), [OPT-036](invariants.md#opt-036--a-guard-is-discharged-only-at-the-producing-filter), [OPT-038](invariants.md#opt-038--projection-drops-an-fd-whose-guard-loses-a-column)
+
 **Activation lives at `FilterNode.computePhysical`.** Before extracting predicate-derived FDs, the filter walks inherited FDs and asks `predicateImpliesGuard(predicate, fd.guard, ecs, bindings, attrIdToIndex, isColumnNonNullable, isColumnNumeric, declaredCollationOf)` — a conservative implication check that flattens the predicate's `AND` conjunction and matches each guard clause against direct conjuncts, equivalence classes, constant bindings, and (for `is-null negated:true`) the source column's nullability. `isColumnNumeric` gates the `NOT col → col = 0` rewrite (numeric columns only — see above); `declaredCollationOf` feeds the per-conjunct collation gate on the facts themselves (see below). When entailed, the guard is stripped and the FD becomes an ordinary unconditional FD downstream; otherwise the guarded FD passes through unchanged so a later Filter / Join can still activate it once additional facts land.
 
 **Propagation rules:**
@@ -371,6 +387,8 @@ Predicates `predicateImpliesGuard` recognizes today: `col = literal` / `col = co
 **Discharge facts are collation-gated per conjunct** (`buildPredicateFacts`): a fact may only discharge a guard when the filter's runtime comparison keeps filter-rows ⊆ guard-scope-rows, and the guard scope is evaluated under the column's *declared* collation at index-maintenance time. `col = lit` facts require the conjunct's effective collation to be BINARY (value equality implies equality under any collation) or to equal the column's declared collation (the same comparison the scope uses; the strict `sqlValueEquals` literal match then under-claims at worst) — so a `b = 'bob' COLLATE NOCASE` filter does not discharge a BINARY `eq-literal{b,'bob'}` guard while admitting out-of-scope rows. `col1 = col2` facts require both columns' contributed collations to agree (any resolution order then matches the guard's). Range facts over TEXT bounds are stricter: because the subset check above compares bounds under BINARY, both the conjunct's effective collation **and** the column's declared collation must be BINARY — collated text ranges never discharge (a deliberate completeness loss, never a soundness one). Non-text bounds are collation-inert and ungated. Plain `col IN (…)` facts are inherently declared-collation-matched (`emitIn` compares under the bare condition column's own collation) but run through the same gate for future-proofing.
 
 ## Helper surface
+
+> **Invariant:** [OPT-046](invariants.md#opt-046--addfd-is-the-only-fd-accumulation-path)
 
 In `planner/util/fd-utils.ts`:
 
@@ -404,6 +422,8 @@ In `planner/util/fd-utils.ts`:
 `fdsEqual` compares structural fields only: `kind`, `source`, and `valueEquality` are **not** part of FD identity.
 
 ## Singleton equivalence
+
+> **Invariant:** [OPT-058](invariants.md#opt-058--at-most-one-row-folds-through-addsingletonfd)
 
 Three representations encode the same "≤1-row" fact: an empty-key `[]` in `RelationType.keys`, the null-determinant `∅ → all_cols` FD in `physical.fds`, and `isAtMostOneRow` (= `isUnique([])`) returning true. Producers fold the FD through the canonical `addSingletonFd` helper; node-level consumers read `isAtMostOneRow`; and the **Singleton equivalence** property law in the Key Soundness harness (`test/property.spec.ts`) pins the channels to agree. Walking every relational node in the optimized plan it asserts both implications: `isAtMostOneRow(node)` ⇒ `keysOf(node)` contains the empty key `[]`, and `hasSingletonFd(node.physical?.fds, colCount, isSet)` ⇒ `isAtMostOneRow(node)`. Because `keysOf` consults `hasSingletonFd` and `isAtMostOneRow` consults `keysOf`, both implications hold *by construction* on today's read surface — so this law is a regression guard against a future refactor of `keysOf` / `isUnique` / `hasSingletonFd` that breaks their reconciliation, **not** a check on producers.
 

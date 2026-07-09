@@ -544,6 +544,11 @@ function selfTest(fail) {
 		['Selection (σ)', 'selection-σ'],
 		['4. Contract — retire the old table', '4-contract--retire-the-old-table'],
 		['Store Isolation (Store Phase 8 - Future)', 'store-isolation-store-phase-8---future'],
+		// Invariant headings: the em dash leaves a double hyphen, so a back-link written as
+		// the short `#opt-014` does NOT resolve. Every back-link in the tree uses the full
+		// slug; this case pins the form Check A resolves them against.
+		['OPT-014 — An attribute ID is originated exactly once', 'opt-014--an-attribute-id-is-originated-exactly-once'],
+		['OPT-030 — Uniqueness is read through one surface', 'opt-030--uniqueness-is-read-through-one-surface'],
 	];
 	for (const [heading, expected] of cases) {
 		const actual = slugify(headingText(heading));

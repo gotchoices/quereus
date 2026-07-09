@@ -62,6 +62,14 @@ indistinguishable, to a reader, from a doc that has drifted. Move the passage to
 the whole point of it — an invariant buried in the middle of a 38,000-word doc is an
 invariant nobody audits.
 
+**The register is the normative text.** A topic doc explains an invariant; the register
+states it. When the two disagree, the register wins and the topic doc is the one to fix. A
+topic-doc section an invariant summarizes carries a one-line
+`> **Invariant:** [OPT-014](invariants.md#opt-014--an-attribute-id-is-originated-exactly-once)`
+back-link near its heading, and does not restate the invariant. Back-links use the **full**
+heading slug — an invariant heading's em dash slugifies to a double hyphen, so the short
+`#opt-014` form does not resolve. `selfTest()` in the checker pins that form.
+
 Copy the shape of an existing entry rather than working from a grammar restated here; the
 checker's Check B is the source of truth. It enforces that each entry:
 

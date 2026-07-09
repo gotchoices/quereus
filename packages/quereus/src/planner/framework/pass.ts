@@ -275,6 +275,11 @@ export class PassManager {
 
 	/**
 	 * Register an optimization pass
+	 *
+	 * NOTE: `pass.rules` is taken as-is; only `addRuleToPass` runs
+	 * `validateSideEffectMode` (see docs/invariants.md § OPT-001). Every pass ships with
+	 * `rules: []`, so nothing bypasses the gate today. If a pass ever arrives pre-populated,
+	 * validate each rule here.
 	 */
 	registerPass(pass: OptimizationPass): void {
 		if (this.passes.has(pass.id)) {

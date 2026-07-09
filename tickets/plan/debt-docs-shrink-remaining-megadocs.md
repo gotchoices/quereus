@@ -65,3 +65,5 @@ For each document, in whatever order the maintainer prefers:
 `view-updateability.md` is the strongest candidate to go first: it is a design doc,
 its round-trip laws are already invariant-shaped, and it already has the test
 harness a `guard:` line wants to point at.
+
+**Nate:** sql.md is intended primarily as a reference manual.  It could be broken into sql-select.md, sql-agg.md, ... or something like that with sql.md being a little more of a table of contents.

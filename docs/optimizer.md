@@ -114,6 +114,9 @@ The optimizer executes transformations through a series of **optimization passes
 - **Result**: Optimized plan with caching and materialization points
 
 #### Pass 3.5: Materialization Advisory (single whole-tree pass, order 35)
+
+> **Invariant:** [OPT-004](invariants.md#opt-004--a-custom-execute-pass-argues-its-own-soundness)
+
 - **Purpose**: Inject caching where reference analysis shows materialization pays off
 - **Implementation**: A custom-`execute` pass (no per-node rules) that runs `MaterializationAdvisory.analyzeAndTransform` **once** over the whole plan — one reference-graph build with global parent counts, versus the previous 12 per-anchor-type rule firings that each rebuilt a graph over their own subtree. Runs after Post-Optimization so it observes the `CacheNode`s already injected by `cte-optimization` / `in-subquery-cache` (it skips `nodeType === Cache`, avoiding double-wrapping). See `createMaterializationPass` in `framework/pass.ts` for the coverage and side-effect-soundness rationale.
 - **Result**: `CacheNode`s wrapping relational subtrees that benefit from materialization (multi-parent sharing, loop contexts)
@@ -179,12 +182,18 @@ interface OptimizationPass {
 ## Design Decisions
 
 ### Immutable Plan Nodes
+
+> **Invariant:** [OPT-008](invariants.md#opt-008--plan-nodes-are-immutable)
+
 Plan nodes are never mutated after construction. All transformations create new nodes, ensuring:
 - Clear debugging with before/after comparisons
 - Safe concurrent access during optimization
 - Predictable transformation behavior
 
 ### Attribute ID Preservation
+
+> **Invariant:** [OPT-012](invariants.md#opt-012--withchildren-preserves-attribute-ids)
+
 The optimizer guarantees that attribute IDs remain stable across transformations:
 ```typescript
 // ProjectNode preserves original attribute IDs
@@ -236,6 +245,8 @@ Cost estimation is centralized in `src/planner/cost/index.ts`:
 - Clear units (rows, cost units, bytes)
 
 #### Self-cost-only convention
+
+> **Invariant:** [OPT-016](invariants.md#opt-016--estimatedcost-is-self-cost-only), [OPT-018](invariants.md#opt-018--the-total-cost-memo-is-invalidated-on-mutation)
 
 `PlanNode.estimatedCost` stores **only the node's own incremental (self) cost**,
 excluding its children. The whole-subtree cost is `PlanNode.getTotalCost()`, which
@@ -444,6 +455,8 @@ Virtual tables communicate their capabilities, allowing the optimizer to:
 
 #### The `handledFilters` contract
 
+> **Invariant:** [OPT-024](invariants.md#opt-024--an-unconsumed-seek-constraint-is-reattached)
+
 `handledFilters[i] = true` is a promise that filter `i` is enforced somewhere other than
 the residual `Filter` — and the only channel available is `FilterInfo.constraints`, the
 seek bounds `rule-select-access-path` builds. `rule-grow-retrieve` residualizes exactly
@@ -568,6 +581,8 @@ SELECT * FROM users WHERE active = true;
 
 ## Audit discipline (`sideEffectMode`)
 
+> **Invariant:** [OPT-001](invariants.md#opt-001--every-rule-declares-sideeffectmode)
+
 Every rule registered via `addRuleToPass` **must** declare its
 `sideEffectMode`. `validateSideEffectMode` (`framework/registry.ts`) checks
 the field at registration time and rejects any rule that fails to declare.
@@ -596,6 +611,8 @@ the audit gate still fires when a custom `computePhysical` override fails
 to propagate `readonly=false`.
 
 ### The two declarations
+
+> **Invariant:** [OPT-002](invariants.md#opt-002--an-aware-rule-consults-the-side-effect-signal)
 
 - `'safe'` — the rule never moves, duplicates, drops, or merges any
   subtree it does not separately verify pure. Annotation-only transforms,
@@ -640,6 +657,8 @@ weakening on the new shapes. The discipline is the safety net those
 landings stand on.
 
 ### Parallel-track side-effect refusal
+
+> **Invariant:** [OPT-006](invariants.md#opt-006--parallel-track-rules-refuse-an-impure-branch)
 
 The `parallel/` rules (`async-gather-union-all`, `async-gather-zip-by-key`,
 `eager-prefetch-probe`) and the `join/`-residing fan-out rules
@@ -823,6 +842,8 @@ The cache is cleared at the start of each pass (so Physical Selection can still 
 
 ### Rule Application Control
 
+> **Invariant:** [OPT-010](invariants.md#opt-010--visited-rules-are-inherited-across-a-re-mint-declines-are-not)
+
 Rules are prevented from infinite loops through per-context tracking of
 *transforming* applications:
 
@@ -914,6 +935,8 @@ The context-scoped design enables sophisticated optimization strategies:
 - Runtime cardinality feedback updates stats between executions
 
 ## Attribute provenance
+
+> **Invariant:** [OPT-014](invariants.md#opt-014--an-attribute-id-is-originated-exactly-once)
 
 Attribute IDs have two distinct lifecycle operations that `getAttributes()` smears together:
 

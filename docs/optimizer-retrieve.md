@@ -33,6 +33,8 @@ RetrieveNode
 
 ### Supported-only placement policy
 
+> **Invariant:** [OPT-022](invariants.md#opt-022--a-retrieve-pipeline-holds-only-supported-operations)
+
 - **Pushdown rule**: When sliding a `Filter` down into a `Retrieve`, the optimizer:
   - Normalizes the predicate, extracts constraints for the `Retrieve` table, and constructs a supported-only predicate fragment.
   - Inserts only that fragment as a `Filter` inside the `Retrieve` pipeline.
@@ -50,6 +52,8 @@ This policy ensures the `Retrieve` pipeline is always a precise description of w
 - `SetOperation` (`UNION`, `INTERSECT`, `EXCEPT`, `DIFF`) is excluded from the grow-retrieve structural pass. Sliding a `Retrieve` boundary across set operations can cause structural oscillation and provides little benefit to index-style modules. Predicate push-down into the branches remains supported via the supported-only policy.
 
 ### Physicalization invariant
+
+> **Invariant:** [OPT-020](invariants.md#opt-020--no-logical-only-node-reaches-emission)
 
 - During the physical selection pass, all `Retrieve` nodes must be rewritten to concrete access nodes (`SeqScan`, `IndexScan`, or `IndexSeek`) or `RemoteQuery`. A validation invariant enforces that no `Retrieve` nodes reach emission.
 

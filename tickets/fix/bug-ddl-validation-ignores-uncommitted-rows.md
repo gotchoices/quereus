@@ -55,4 +55,4 @@ manufacture a result), but it should be a deliberate, documented choice rather t
 accident. A decision here — DDL is auto-committing, versus DDL participates in the
 transaction — bounds how much of the above needs fixing.
 
-**Nate:** It would be good for quereus to *support* the cleanest version of transaction semantics (both DML and DDL), for modules that fully cooperate.  That said, modules may have degraded capabilities and for those we do some combination of trying to make up for shortcomings and documenting the limits of our guarantees (preferably providing a way to query those capabilities)
+**Nate:** Do what you can, but as a guiding rule, quereus should *support* the cleanest version of transaction semantics (both DML and DDL) for *modules that fully cooperate*.  That said, modules may have degraded capabilities and for those we do some combination of trying to make up for shortcomings and documenting the limits of our guarantees (preferably providing a way to query those capabilities).  So if this can be addressed reasonably, great, otherwise maybe it can be exposed as a capability.

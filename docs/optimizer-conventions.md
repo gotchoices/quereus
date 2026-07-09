@@ -138,16 +138,51 @@ import { computeClosure } from '../util/fd-utils.js';
 const determined = computeClosure(seedCols, node.physical.fds ?? []);
 ```
 
-**Key conventions for FD-aware rules:**
+**Key conventions for FD-aware rules.** Most of these are normative — the register is where
+they are stated, and where a reviewer checks them against the code. This guide keeps only
+what a rule author needs at the keyboard.
 
-1. **Reason via `computeClosure` / `determines` / `closureCoversAll` / `isUniqueDeterminant` / `hasAnyKey` / `hasSingletonFd`.** Walking `physical.fds` by hand will miss transitive closure and forget the subsumption / cap / guard semantics that `addFd` enforces. **Pick coverage vs uniqueness deliberately**: `closureCoversAll` is a pure value claim (a determined column is redundant in an ORDER BY / GROUP BY regardless of uniqueness); `isUniqueDeterminant(attrs, fds, columnCount, isSet)` is the only sound way to ask "is this set row-unique?" — coverage alone over a bag proves nothing (see [Functional Dependencies § The reader rule](optimizer-fd.md#the-reader-rule-isuniquedeterminant)).
-2. **Guarded FDs are not closure-time facts.** All closure helpers (`computeClosure`, `determines`, `closureCoversAll`, `isUniqueDeterminant`, `hasAnyKey`, `hasSingletonFd`, `deriveKeysFromFds`) **skip** guarded FDs by design — a conditional uniqueness claim cannot prove a key (nor serve as a `'unique'` witness) for an unrelated subtree. If your rule needs to discharge a guard, do it at the producing `Filter`'s `computePhysical` via `predicateImpliesGuard` + `stripGuard`, never at the consumer.
-3. **Column index space.** FDs / ECs / bindings are indexed by **output-column index** on the node carrying them, not by attribute ID. When you cross a Project / Returning / Aggregate / join boundary, translate via `projectFds` / `shiftFds` (and their EC / binding / domain mirrors) instead of hand-mapping. `shiftFds` shifts guard column indices alongside determinants/dependents; `projectFds` drops a guarded FD whose guard references a column missing from the mapping.
-4. **Use `addFd` (not `Array.push`) when accumulating FDs.** `addFd` performs subsumption (drop existing same-determinant FDs whose dependent set is a subset of the new one) and enforces `MAX_FDS_PER_NODE`. Pass `{ keyHints }` listing column-index sets that are known keys so cap eviction prefers to keep them; truncations are logged on the `quereus:planner:fd` debug channel.
-5. **Equivalence-class closure for bindings.** Whenever a rule adds a `ConstantBinding` at the same site as ECs (Filter, inner join), close it with `closeConstantBindingsOverEcs` so downstream consumers see the binding on every EC peer in a single pass. This is what makes `WHERE t.k = u.k AND t.k = 5` land as one binding covering both columns.
-6. **Outer joins drop the null-padded side.** Inheriting "everything from both children" is wrong for LEFT/RIGHT/FULL: NULL padding violates source FDs/ECs/bindings on the padded side, and a guarded FD whose guard references a NULL-padded column would also become activatable for the wrong rows. Follow the per-operator table in [Functional Dependency Tracking](optimizer-fd.md#functional-dependency-tracking) rather than inventing a propagation policy.
-7. **Set semantics is not an FD — but the readers consume it.** "All output columns together form a key" lives on `RelationType.isSet`, not in `fds`. The kind-aware readers take it as a parameter (`hasAnyKey(fds, columnCount, isSet)` / `hasSingletonFd(fds, columnCount, isSet)` / `isUniqueDeterminant(…, isSet)`); node-level consumers should prefer `keysOf` / `isUnique`, which read `getType().isSet` themselves.
-8. **Provenance is informational.** FD / `ConstantBinding` / `DomainConstraint` entries may carry a `source` tag (`'declared-check'`, `{kind: 'assertion', name}`, etc.). Dedup helpers ignore `source` by design — never branch rule logic on it.
+> **Invariant:** [OPT-030](invariants.md#opt-030--uniqueness-is-read-through-one-surface), [OPT-032](invariants.md#opt-032--coverage-is-not-uniqueness)
+
+Reason through the helpers, never by walking `physical.fds` yourself — hand-walking misses
+transitive closure and forgets the subsumption / cap / guard semantics `addFd` enforces. And
+pick coverage vs uniqueness deliberately: `closureCoversAll` is a pure value claim (a
+determined column is redundant in an `ORDER BY` / `GROUP BY` regardless of uniqueness),
+whereas `isUniqueDeterminant` — or, at node level, `keysOf` / `isUnique` — is the only sound
+way to ask "is this set row-unique?".
+
+> **Invariant:** [OPT-034](invariants.md#opt-034--closure-helpers-skip-guarded-fds), [OPT-036](invariants.md#opt-036--a-guard-is-discharged-only-at-the-producing-filter), [OPT-038](invariants.md#opt-038--projection-drops-an-fd-whose-guard-loses-a-column)
+
+If your rule needs a guarded FD's fact, do not discharge the guard yourself. Discharge happens
+at the producing `Filter`'s `computePhysical`, via `predicateImpliesGuard` + `stripGuard`.
+
+> **Invariant:** [OPT-048](invariants.md#opt-048--dependency-facts-index-output-columns)
+
+Crossing a Project / Returning / Aggregate / join boundary, translate via `projectFds` /
+`shiftFds` and their EC / binding / domain / IND mirrors instead of hand-mapping indices.
+
+> **Invariant:** [OPT-046](invariants.md#opt-046--addfd-is-the-only-fd-accumulation-path)
+
+Accumulate with `addFd`, not `Array.push`. Pass `{ keyHints }` listing column-index sets known
+to be keys so cap eviction prefers to keep them; truncations log on the `quereus:planner:fd`
+debug channel.
+
+> **Invariant:** [OPT-042](invariants.md#opt-042--an-outer-join-drops-the-null-padded-sides-facts)
+
+Do not invent a propagation policy for a new operator — follow the per-operator table in
+[Functional Dependency Tracking](optimizer-fd.md#per-operator-propagation).
+
+> **Invariant:** [OPT-054](invariants.md#opt-054--all-columns-key-ness-lives-on-isset), [OPT-052](invariants.md#opt-052--provenance-is-informational)
+
+Set-ness is not an FD, but the readers consume it: `hasAnyKey(fds, columnCount, isSet)` and
+friends take it as a parameter, while `keysOf` / `isUnique` read `getType().isSet` themselves.
+And a `source` tag is for diagnostics — never branch rule logic on it.
+
+**Not in the register** (a convention, not an invariant): whenever a rule adds a
+`ConstantBinding` at the same site as ECs (Filter, inner join), close it with
+`closeConstantBindingsOverEcs` so downstream consumers see the binding on every EC peer in one
+pass. That is what makes `WHERE t.k = u.k AND t.k = 5` land as one binding covering both
+columns.
 
 See [Functional Dependency Tracking](optimizer-fd.md#functional-dependency-tracking) for the producer/consumer catalog and the per-operator propagation table, and [Assertions § Binding-aware Delta Planning](optimizer-assertions.md#binding-aware-delta-planning-reusable) for the `analyzeRowSpecific` / `extractBindings` analysis surface that builds on this layer.
 
@@ -257,8 +292,13 @@ export class PlanNodeCharacteristics {
   static estimatesRows(node: PlanNode): number {
     return node.physical.estimatedRows ?? DEFAULT_ROW_ESTIMATE;
   }
+  // At-most-one-row. There is no `physical.uniqueKeys` field — the claim rides
+  // the `∅ → all_cols` FD (or, for a zero-column relation, `estimatedRows`).
   static guaranteesUniqueRows(node: PlanNode): boolean {
-    return node.physical.uniqueKeys?.some(key => key.length === 0) === true;
+    if (!isRelationalNode(node)) return false;
+    const colCount = node.getAttributes().length;
+    if (colCount === 0) return node.physical.estimatedRows === 1;
+    return hasSingletonFd(node.physical.fds, colCount, node.getType().isSet);
   }
   
   // Relational capabilities

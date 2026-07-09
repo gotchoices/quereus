@@ -58,3 +58,5 @@ will need to be rewritten to assert the foreign commit now fails.
 `docs/design-isolation-layer.md` currently documents the silent discard as correct (under
 *Invariant: every staged overlay resolves to an underlying table at commit*) and must be updated
 alongside.
+
+**Nate:** Do what you can, but as a guiding rule, quereus should *support* the cleanest version of transaction semantics (both DML and DDL) for *modules that fully cooperate*.  That said, modules may have degraded capabilities and for those we do some combination of trying to make up for shortcomings and documenting the limits of our guarantees (preferably providing a way to query those capabilities).  So if this can be addressed reasonably, great, otherwise maybe it can be exposed as a capability.

@@ -1,6 +1,6 @@
 # Quereus Architecture
 
-This document describes the internal architecture of the Quereus SQL engine: the pipeline from SQL text to result rows, the source layout, the conventions for extending the engine, and the design decisions that shape it. For the user-facing feature overview and quick start, see [`packages/quereus/README.md`](../packages/quereus/README.md). For what belongs in a design doc and how the docs are kept honest, see [Documentation Conventions](doc-conventions.md).
+This document describes the internal architecture of the Quereus SQL engine: the pipeline from SQL text to result rows, the source layout, the conventions for extending the engine, and the design decisions that shape it. For the user-facing feature overview and quick start, see [`packages/quereus/README.md`](../packages/quereus/README.md). For what belongs in a design doc and how the docs are kept honest, see [Documentation Conventions](doc-conventions.md). For the numbered statements the code must satisfy — each naming the file that upholds it and the test that guards it — see the [Invariant Register](invariants.md).
 
 ## Pipeline Overview
 

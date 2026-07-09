@@ -202,6 +202,8 @@ if (tableConstraints) {
 
 ## Key-driven row-count reduction
 
+> **Invariant:** [OPT-040](invariants.md#opt-040--a-fanning-join-downgrades-the-non-preserved-side), [OPT-042](invariants.md#opt-042--an-outer-join-drops-the-null-padded-sides-facts), [OPT-056](invariants.md#opt-056--an-inclusion-dependency-is-dropped-when-unsure)
+
 * If a predicate contains **equality** on all columns of a unique key the result cardinality ≤ 1.
 * See [Functional Dependency Tracking](optimizer-fd.md); a unique key is encoded as the FD `key → all_other_cols`, and the broader `fds`/`equivClasses` fields capture additional non-key dependencies.
 
