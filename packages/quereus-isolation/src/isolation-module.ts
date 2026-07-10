@@ -791,6 +791,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * the table is gone either way. If a caller ever needs the clean-unwind case to commit,
 	 * re-evaluate the poison on `onConnectionRollbackToSavepoint` rather than special-casing
 	 * here.
+	 *
+	 * NOTE: a connection whose own overlay was already poisoned (by another connection's
+	 * ALTER) escapes that poison for this table by dropping it — the own-overlay branch
+	 * deletes the state, poison and all. Correct as written: the rows it discards belong to
+	 * a table this connection just asked to remove. If poison ever carries a cause that
+	 * outlives the table, gate the own-overlay delete on it.
+	 *
+	 * NOTE: this mutates `connectionOverlays` while a foreign connection may be mid-scan in
+	 * `IsolatedTable.query`'s merged branch — that scan will keep merging against an overlay
+	 * whose underlying is now destroyed. The module clamps to `'reentrant-reads'`, so no
+	 * in-tree host reaches it. If a host ever runs a DROP concurrently with a foreign scan,
+	 * the merged iterator needs a per-scan snapshot of the overlay + underlying pair.
 	 */
 	async destroy(
 		db: Database,

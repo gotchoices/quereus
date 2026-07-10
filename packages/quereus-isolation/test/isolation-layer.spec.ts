@@ -1449,18 +1449,18 @@ describe('IsolationModule', () => {
 		});
 
 		/**
-		 * Stages an overlay for `forDb` against `main.shared` directly, exactly as the
+		 * Stages an overlay for `forDb` against `main.<table>` directly, exactly as the
 		 * cross-connection ALTER suite does. What is under test is `destroy()`'s per-key
 		 * decision across db ids, not how a foreign overlay came to exist.
 		 *
 		 * `dirty: true` inserts one live row so `hasChanges` is honest.
 		 */
-		async function stageOverlay(forDb: Database, dirty: boolean): Promise<ConnectionOverlayState> {
-			const underlying = iso.getUnderlyingState('main', 'shared')!.underlyingTable;
+		async function stageOverlay(forDb: Database, dirty: boolean, table = 'shared'): Promise<ConnectionOverlayState> {
+			const underlying = iso.getUnderlyingState('main', table)!.underlyingTable;
 			const overlay = await iso.overlayModule.create(forDb, iso.createOverlaySchema(underlying.tableSchema!));
 			if (dirty) await overlay.update({ operation: 'insert', values: [1, 'from-other', 0] });
 			const state: ConnectionOverlayState = { overlayTable: overlay, hasChanges: dirty };
-			iso.setConnectionOverlay(forDb, 'main', 'shared', state);
+			iso.setConnectionOverlay(forDb, 'main', table, state);
 			return state;
 		}
 
@@ -1576,6 +1576,71 @@ describe('IsolationModule', () => {
 			// reference, so a swept overlay would keep its message and pass vacuously.)
 			expect(overlayKeys().length, 'the poisoned overlay survives').to.equal(1);
 			expect(foreign.poison!.message).to.equal('poisoned earlier by an ALTER');
+			await other.close();
+		});
+
+		it('the dropping connection escapes a poison it was already carrying for that table', async () => {
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			// `db` was poisoned by some other connection's ALTER, then drops the table itself.
+			// The own-overlay branch deletes the state, poison and all — correct, because the
+			// rows it discards belong to a table this very connection asked to remove.
+			const own = await stageOverlay(db, true);
+			own.poison = { message: 'poisoned earlier by an ALTER' };
+
+			await db.exec(`drop table shared`);
+
+			expect(overlayKeys(), 'the dropping connection\'s poisoned overlay is discarded').to.deep.equal([]);
+			await iso.commitConnectionOverlays(db); // no poisoned overlay left to abort on
+		});
+
+		it('a drop-poisoned connection errors at its merged read and its next write', async () => {
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			// Connect BEFORE the drop: after it, `connect` can no longer resolve an underlying.
+			// The IsolatedTable keeps its underlying handle, so only assertOverlayUsable stands
+			// between the foreign connection and a destroyed table.
+			const other = new Database();
+			const tableOther = await iso.connect(other, undefined, 'isolated', 'main', 'shared', {} as BaseModuleConfig) as IsolatedTable;
+			await stageOverlay(other, true);
+
+			await db.exec(`drop table shared`);
+
+			let readErr: unknown;
+			try { await asyncIterableToArray(tableOther.query(makeFullScanFilterInfo())); } catch (e) { readErr = e; }
+			expect(readErr, 'merged read on a drop-poisoned overlay must throw').to.be.instanceOf(QuereusError);
+			expect((readErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			expect((readErr as QuereusError).message).to.contain('main.shared');
+
+			let writeErr: unknown;
+			try { await tableOther.update({ operation: 'insert', values: [2, 'more'] }); } catch (e) { writeErr = e; }
+			expect(writeErr, 'write on a drop-poisoned overlay must throw before staging').to.be.instanceOf(QuereusError);
+			expect((writeErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+			await other.close();
+		});
+
+		it('a drop-poisoned overlay aborts the foreign multi-table commit before any table applies', async () => {
+			await db.exec(`create table keep (id integer primary key, v text) using isolated`);
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			// `keep` is staged FIRST, so commitConnectionOverlays walks it before it reaches the
+			// poisoned `shared` entry. The poison check has to run over every overlay up front —
+			// if it were folded into the apply loop, `keep` would already be committed.
+			const other = new Database();
+			await stageOverlay(other, true, 'keep');
+			await stageOverlay(other, true, 'shared');
+
+			await db.exec(`drop table shared`);
+
+			let caught: unknown;
+			try { await iso.commitConnectionOverlays(other); } catch (e) { caught = e; }
+			expect(caught, 'the poisoned overlay aborts the whole commit').to.be.instanceOf(QuereusError);
+			expect((caught as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+			expect(await underlyingRows('keep'), 'no unrelated table may be left committed').to.deep.equal([]);
+			expect(overlayKeys().length, 'both overlays survive for the ensuing rollback').to.equal(2);
+
 			await other.close();
 		});
 

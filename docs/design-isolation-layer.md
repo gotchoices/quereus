@@ -730,6 +730,8 @@ The affected overlays are partitioned into the **issuer's own** (the connection 
 
 The drop poison is deliberately over-strict for a connection that unwinds all its staged rows past the drop and could arguably commit clean: the poison rides on the `ConnectionOverlayState`, not on the rows. The table is gone either way, so failing is the safe answer.
 
+The own-overlay branch discards the state whether or not it was already poisoned, so a connection carrying an ALTER poison escapes it for the table it drops. That is the intended reading — the rows it discards belong to a table it just asked to remove — and it clears the poison only for that table; an overlay poisoned on any other table still aborts the commit.
+
 ##### Observing poison
 
 A poisoned overlay always has `hasChanges === true`, so `IsolatedTable` errors (`QuereusError`, `CONSTRAINT`) at the data-op chokepoints — `update` (before staging), the *merged* branch of `query`, and the commit flush (`flushAndClearOverlay`) — but never on the committed-snapshot (`readCommitted`) read path, which bypasses the overlay and stays usable. This means a poisoned connection fails its next read/write/commit even if it never touches the table again, while a `committed.<table>` reader keeps working.
