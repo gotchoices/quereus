@@ -43,9 +43,16 @@ export function compareCodePoints(a: string, b: string): number {
 	if (a === b) return 0;
 	// No high surrogate on either side ⇒ code-unit order IS code-point order, so keep V8's
 	// native string compare rather than a per-unit JS loop. BINARY is the engine's hottest
-	// comparator and the guard keeps its cost flat: dropping the fast path and always
+	// comparator and the guard buys back most of its cost: dropping the fast path and always
 	// scanning measured ~6x slower on keys with a long common prefix, where the native
 	// compare memcmps but the JS loop pays per code unit.
+	//
+	// NOTE: the guard itself is O(length) — a full regex scan of BOTH operands, on V8's
+	// compiled-regex path (~15 ns for short keys). Measured only up to 40-char keys. If
+	// BINARY over long text columns (documents, blobs-as-text) ever shows up hot, narrow the
+	// guard: the two orders can only disagree when one operand holds a high surrogate AND the
+	// other holds a unit >= U+E000, so a cached per-string flag or a `lastIndexOf`-style
+	// early-out on the shorter operand would cut it.
 	if (!HAS_HIGH_SURROGATE.test(a) && !HAS_HIGH_SURROGATE.test(b)) {
 		return a < b ? -1 : 1;
 	}
@@ -215,9 +222,14 @@ function compareNumbers(a: number | bigint, b: number | bigint): number {
  *
  * NOTE: keyed by JS object identity — two structurally-equal but distinct objects
  * serialize independently (correct, just not shared). The canonical form is
- * {@link canonicalJsonString} (recursive object-key sort), so OBJECT-class equality
- * and ordering here agree with `deepCompareJson` (`types/json-type.ts`) and with the
- * runtime hash-key / persisted byte-key paths — reorder-equal objects compare equal.
+ * {@link canonicalJsonString} (recursive object-key sort), so OBJECT-class EQUALITY here
+ * agrees with `deepCompareJson` (`types/json-type.ts`) and with the runtime hash-key /
+ * persisted byte-key paths — reorder-equal objects compare equal.
+ *
+ * Their ORDERINGS are unrelated and always have been: this branch compares canonical JSON
+ * *syntax* (braces, quotes, commas included), while `deepCompareJson` ranks by JSON type,
+ * then key list, then values. Only this branch's order is load-bearing — it is what the
+ * store's `encodeObject` writes as UTF-8 and physically sorts by.
  *
  * NOTE: assumes OBJECT-class values are treated as immutable — the string is cached on
  * first serialization and never invalidated, so mutating a value in place after it has

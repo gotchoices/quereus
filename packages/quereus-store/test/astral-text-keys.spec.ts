@@ -100,10 +100,16 @@ describe('Astral text keys order identically in the store and in memory', () => 
 		}
 	}
 
-	/** Asserts the store answers `sql` (over `t`) exactly as memory answers it (over `m`). */
+	/**
+	 * Asserts the store answers `sql` (over `t`) exactly as memory answers it (over `m`).
+	 * Rewrites only the `from t` clause, never every bare `t` token, so a query whose
+	 * literals or aliases happen to contain a standalone `t` still derives correctly.
+	 */
 	async function agreesWithMemory(sql: string, name: string): Promise<SqlValue[]> {
+		const memorySql = sql.replace(/\bfrom\s+t\b/gi, 'from m');
+		expect(memorySql, `query must read the store twin \`t\`: ${sql}`).to.not.equal(sql);
 		const fromStore = await column(db, sql, name);
-		const fromMemory = await column(db, sql.replace(/\bt\b/g, 'm'), name);
+		const fromMemory = await column(db, memorySql, name);
 		expect(fromStore, `store and memory disagree for: ${sql}`).to.deep.equal(fromMemory);
 		return fromStore;
 	}

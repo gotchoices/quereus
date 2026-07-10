@@ -605,10 +605,10 @@ which has no UTF-8 encoding at all (`TextEncoder` folds each to `U+FFFD`), so th
 text keys are not injective over them — tracked by
 `bug-store-lone-surrogate-key-collision`.
 
-Note also that `any` and `json` primary-key columns are keyed under the table key collation
-`K` while the engine compares them under `BINARY`. Their range seeks and PK-order
-advertisement are declined for that reason, and their uniqueness is enforced under `K` —
-tracked by `fix/bug-store-any-json-pk-keyed-under-table-collation`.
+Note also that a text-capable but non-textual primary-key column (`any`, `json`, a date/time
+type) is keyed under `BINARY`, not under the table key collation `K` — matching the `BINARY`
+the engine compares it under, so its range seeks and PK-order advertisement stand and its
+uniqueness is enforced bytewise. See "Per-column PK key collation" in [schema.md](schema.md).
 
 ## Package Structure
 
