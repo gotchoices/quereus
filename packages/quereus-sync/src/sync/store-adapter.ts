@@ -290,6 +290,14 @@ async function finalizeBootstrap(
 
 /**
  * Group data changes by table (schema.table).
+ *
+ * NOTE: the joined key is ambiguous if a SCHEMA name contains a dot — schema
+ * `"main.a"` table `b` collides with schema `main` table `"a.b"`, merging two
+ * tables' changes into one group. Consumers must read `(schema, table)` off a
+ * grouped change (never re-split the key), so today the only cost is a
+ * misgrouped write when both dotted-schema tables exist. If dotted schema names
+ * ever become reachable, key on a delimiter that identifiers cannot contain
+ * (e.g. length-prefixed, or ` `).
  */
 function groupChangesByTable(
   changes: DataChangeToApply[]
