@@ -20,8 +20,10 @@ import { RemoteQueryNode } from '../../nodes/remote-query-node.js';
 import { SeqScanNode, IndexScanNode, IndexSeekNode, EmptyResultNode, type AccessPathAdvertisement } from '../../nodes/table-access-nodes.js';
 import { seqScanCost } from '../../cost/index.js';
 import type { ColumnMeta, BestAccessPlanRequest, BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
-import { FilterInfo } from '../../../vtab/filter-info.js';
-import type { IndexConstraint, IndexConstraintUsage } from '../../../vtab/index-info.js';
+import { makeEmptyFilterInfo, makeFullScanFilterInfo, type FilterInfo } from '../../../vtab/filter-info.js';
+import { PRIMARY_INDEX_NAME, PRIMARY_PHYSICAL_INDEX_NAME, resolveIndexDescriptor, type AccessPath, type IndexPlanKind } from '../../../vtab/index-descriptor.js';
+import { encodeIdxStr, makeIdxStrSpec } from '../../../vtab/idx-str.js';
+import type { IndexConstraint } from '../../../vtab/index-info.js';
 import type { SqlValue } from '../../../common/types.js';
 import { compareSqlValues, normalizeCollationName } from '../../../util/comparison.js';
 import type { Scope } from '../../scopes/scope.js';
@@ -37,6 +39,77 @@ import { IndexConstraintOp } from '../../../common/constants.js';
 import { isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:select-access-path');
+const warnLog = createLogger('optimizer:rule:select-access-path').extend('warn');
+
+/**
+ * Resolve the structured {@link AccessPath} for an index arm.
+ *
+ * `indexName` is the name that lands in `idxStr` — `accessPlan.indexName` for a seek,
+ * `accessPlan.orderingIndexName` for an ordering-only walk, `_primary_` for the legacy
+ * arms. When the engine cannot resolve it (a per-plan alias the module minted without
+ * supplying an `indexDescriptor`) we record `unresolvedIndex` and warn, rather than
+ * guessing: an order-sensitive consumer must be able to refuse the plan.
+ */
+function buildIndexAccessPath(
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult,
+	indexName: string,
+	plan: IndexPlanKind,
+): AccessPath {
+	const index = resolveIndexDescriptor(tableSchema, accessPlan, indexName);
+	if (index) return { kind: 'index', index, plan };
+	warnLog(
+		'access plan for table %s named index %s which the engine cannot resolve; module should return indexDescriptor',
+		tableSchema.name, indexName,
+	);
+	return { kind: 'unresolvedIndex', indexName, plan };
+}
+
+/**
+ * Derive a seek/scan FilterInfo from the arm's shared `base`: the encoded `idxStr` and
+ * the structured `accessPath` are both projections of the same (indexName, plan, params)
+ * triple, so they cannot drift.
+ */
+function makeIndexFilterInfo(
+	base: FilterInfo,
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult,
+	indexName: string,
+	plan: IndexPlanKind,
+	constraints: ReadonlyArray<{ constraint: IndexConstraint; argvIndex: number }>,
+	params?: ReadonlyMap<string, string>,
+): FilterInfo {
+	return {
+		...base,
+		constraints,
+		idxStr: encodeIdxStr(makeIdxStrSpec(indexName, plan, params)),
+		accessPath: buildIndexAccessPath(tableSchema, accessPlan, indexName, plan),
+	};
+}
+
+/**
+ * Derive the FilterInfo for an ordering-only index walk (`plan=0`). Unlike a seek this
+ * also stamps `indexInfoOutput.idxStr` and `orderByConsumed`, because the runtime reads
+ * the consumed-ordering flag off the IndexInfo rather than the FilterInfo.
+ */
+function makeOrderedScanFilterInfo(
+	base: FilterInfo,
+	tableSchema: TableSchema,
+	accessPlan: BestAccessPlanResult,
+	indexName: string,
+): FilterInfo {
+	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, 'scan'));
+	return {
+		...base,
+		idxStr,
+		accessPath: buildIndexAccessPath(tableSchema, accessPlan, indexName, 'scan'),
+		indexInfoOutput: {
+			...base.indexInfoOutput,
+			idxStr,
+			orderByConsumed: true,
+		},
+	};
+}
 
 /**
  * Extract the monotonic-ordering advertisement from a `BestAccessPlanResult`,
@@ -293,27 +366,9 @@ function selectPhysicalNode(
 		return createEmptyResultNode(tableRef);
 	}
 
-	// Create a default FilterInfo for the physical nodes
-	const filterInfo: FilterInfo = {
-		idxNum: 0,
-		idxStr: 'fullscan',
-		constraints: [],
-		args: [],
-		indexInfoOutput: {
-			nConstraint: 0,
-			aConstraint: [],
-			nOrderBy: 0,
-			aOrderBy: [],
-			aConstraintUsage: [] as IndexConstraintUsage[],
-			idxNum: 0,
-			idxStr: 'fullscan',
-			orderByConsumed: false,
-			estimatedCost: accessPlan.cost,
-			estimatedRows: BigInt(accessPlan.rows || 1000),
-			idxFlags: 0,
-			colUsed: 0n,
-		}
-	};
+	// Default FilterInfo for the physical nodes. Each index arm below spreads this and
+	// overrides `idxStr` / `accessPath` for the index it chose.
+	const filterInfo: FilterInfo = makeFullScanFilterInfo(accessPlan.cost, accessPlan.rows || 1000);
 
 	// Convert OrderingSpec[] to the format expected by physical nodes
 	const providesOrdering = accessPlan.providesOrdering?.map(spec => ({
@@ -350,7 +405,7 @@ function selectPhysicalNodeFromPlan(
 	const honorsCollatedRangeBounds = accessPlan.honorsCollatedRangeBounds === true;
 	const seekCols = accessPlan.seekColumnIndexes!;
 	// Map accessPlan.indexName to physical node indexName ('_primary_' → 'primary')
-	const physicalIndexName = accessPlan.indexName === '_primary_' ? 'primary' : accessPlan.indexName!;
+	const physicalIndexName = accessPlan.indexName === PRIMARY_INDEX_NAME ? PRIMARY_PHYSICAL_INDEX_NAME : accessPlan.indexName!;
 	// idxStr uses the raw name (scan-plan builder maps '_primary_' → 'primary')
 	const idxStrName = accessPlan.indexName!;
 
@@ -458,11 +513,10 @@ function selectPhysicalNodeFromPlan(
 				constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
 				argvIndex: i + 1,
 			}));
-			const fi: FilterInfo = {
-				...filterInfo,
-				constraints: inConstraints,
-				idxStr: `idx=${idxStrName}(0);plan=5;inCount=${seekKeys.length}`,
-			};
+				const fi = makeIndexFilterInfo(
+					filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'multiSeek', inConstraints,
+					new Map([['inCount', String(seekKeys.length)]]),
+				);
 
 			log('Using index multi-seek on %s (IN with %d values)', physicalIndexName, seekKeys.length);
 			return finishSeek(new IndexSeekNode(
@@ -530,11 +584,10 @@ function selectPhysicalNodeFromPlan(
 					constraint: { iColumn: seekCols[i % seekWidth], op: IndexConstraintOp.EQ, usable: true },
 					argvIndex: i + 1,
 				}));
-				const fi: FilterInfo = {
-					...filterInfo,
-					constraints: seekConstraints,
-					idxStr: `idx=${idxStrName}(0);plan=5;inCount=${effectiveTuples.length};seekWidth=${seekWidth}`,
-				};
+				const fi = makeIndexFilterInfo(
+					filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'multiSeek', seekConstraints,
+					new Map([['inCount', String(effectiveTuples.length)], ['seekWidth', String(seekWidth)]]),
+				);
 
 				log('Using composite index multi-seek on %s (cross-product of %d distinct non-null seeks, width %d)', physicalIndexName, effectiveTuples.length, seekWidth);
 				return finishSeek(new IndexSeekNode(
@@ -573,11 +626,10 @@ function selectPhysicalNodeFromPlan(
 				argvIndex: i + 1,
 			}));
 
-			const fi: FilterInfo = {
-				...filterInfo,
-				constraints: seekConstraints,
-				idxStr: `idx=${idxStrName}(0);plan=5;inCount=${crossProduct.length};seekWidth=${seekWidth}`,
-			};
+			const fi = makeIndexFilterInfo(
+				filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'multiSeek', seekConstraints,
+				new Map([['inCount', String(crossProduct.length)], ['seekWidth', String(seekWidth)]]),
+			);
 
 			log('Using composite index multi-seek on %s (cross-product of %d seeks, width %d)', physicalIndexName, crossProduct.length, seekWidth);
 			return finishSeek(new IndexSeekNode(
@@ -611,11 +663,9 @@ function selectPhysicalNodeFromPlan(
 			constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
 			argvIndex: i + 1,
 		}));
-		const fi: FilterInfo = {
-			...filterInfo,
-			constraints: eqConstraints,
-			idxStr: `idx=${idxStrName}(0);plan=2`,
-		};
+		const fi = makeIndexFilterInfo(
+			filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'eqSeek', eqConstraints,
+		);
 
 		log('Using index seek on %s (equality)', physicalIndexName);
 		return finishSeek(new IndexSeekNode(
@@ -705,11 +755,10 @@ function selectPhysicalNodeFromPlan(
 				argv++;
 			}
 
-			const fi: FilterInfo = {
-				...filterInfo,
-				constraints: allConstraints,
-				idxStr: `idx=${idxStrName}(0);plan=7;prefixLen=${prefixEqCols.length}`,
-			};
+			const fi = makeIndexFilterInfo(
+				filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'prefixRangeSeek', allConstraints,
+				new Map([['prefixLen', String(prefixEqCols.length)]]),
+			);
 
 			log('Using index prefix-range seek on %s (prefix=%d cols)', physicalIndexName, prefixEqCols.length);
 			return new IndexSeekNode(
@@ -779,11 +828,9 @@ function selectPhysicalNodeFromPlan(
 			argv++;
 		}
 
-		const fi: FilterInfo = {
-			...filterInfo,
-			constraints: rangeConstraints,
-			idxStr: `idx=${idxStrName}(0);plan=3`,
-		};
+		const fi = makeIndexFilterInfo(
+			filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'rangeSeek', rangeConstraints,
+		);
 
 		log('Using index seek (range) on %s', physicalIndexName);
 		return new IndexSeekNode(
@@ -856,11 +903,10 @@ function selectPhysicalNodeFromPlan(
 			argvIndex: i + 1,
 		}));
 
-		const fi: FilterInfo = {
-			...filterInfo,
-			constraints: orRangeConstraints,
-			idxStr: `idx=${idxStrName}(0);plan=6;rangeCount=${ranges.length};rangeOps=${rangeOps.join(',')}`,
-		};
+		const fi = makeIndexFilterInfo(
+			filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'multiRangeSeek', orRangeConstraints,
+			new Map([['rangeCount', String(ranges.length)], ['rangeOps', rangeOps.join(',')]]),
+		);
 
 		log('Using index multi-range seek on %s (%d ranges)', physicalIndexName, ranges.length);
 		return new IndexSeekNode(
@@ -879,18 +925,10 @@ function selectPhysicalNodeFromPlan(
 	// Ordering-only index scan
 	if (providesOrdering) {
 		const orderingIndexName = accessPlan.orderingIndexName ?? physicalIndexName;
-		const orderingIdxStr = orderingIndexName === 'primary' ? '_primary_' : orderingIndexName;
+		const orderingIdxStr = orderingIndexName === PRIMARY_PHYSICAL_INDEX_NAME ? PRIMARY_INDEX_NAME : orderingIndexName;
 		log('Using index scan (ordering provided by %s)', orderingIndexName);
 
-		const orderingFilterInfo: FilterInfo = {
-			...filterInfo,
-			idxStr: `idx=${orderingIdxStr}(0);plan=0`,
-			indexInfoOutput: {
-				...filterInfo.indexInfoOutput,
-				idxStr: `idx=${orderingIdxStr}(0);plan=0`,
-				orderByConsumed: true,
-			}
-		};
+		const orderingFilterInfo = makeOrderedScanFilterInfo(filterInfo, tableRef.tableSchema, accessPlan, orderingIdxStr);
 
 		return new IndexScanNode(
 			tableRef.scope,
@@ -982,11 +1020,9 @@ function selectPhysicalNodeLegacy(
 			constraint: { iColumn: pk.index, op: IndexConstraintOp.EQ, usable: true },
 			argvIndex: i + 1,
 		}));
-		const fi: FilterInfo = {
-			...filterInfo,
-			constraints: eqConstraints,
-			idxStr: 'idx=_primary_(0);plan=2',
-		};
+		const fi = makeIndexFilterInfo(
+			filterInfo, tableRef.tableSchema, accessPlan, PRIMARY_INDEX_NAME, 'eqSeek', eqConstraints,
+		);
 
 		log('Using index seek on primary key (legacy)');
 		const pkSeek = new IndexSeekNode(
@@ -1050,11 +1086,9 @@ function selectPhysicalNodeLegacy(
 			argv++;
 		}
 
-		const fi: FilterInfo = {
-			...filterInfo,
-			constraints: rangeConstraints,
-			idxStr: 'idx=_primary_(0);plan=3',
-		};
+		const fi = makeIndexFilterInfo(
+			filterInfo, tableRef.tableSchema, accessPlan, PRIMARY_INDEX_NAME, 'rangeSeek', rangeConstraints,
+		);
 
 		log('Using index seek (range) on primary key (legacy)');
 		return new IndexSeekNode(
@@ -1071,19 +1105,11 @@ function selectPhysicalNodeLegacy(
 	}
 
 	if (providesOrdering) {
-		const indexName = accessPlan.orderingIndexName ?? 'primary';
+		const indexName = accessPlan.orderingIndexName ?? PRIMARY_PHYSICAL_INDEX_NAME;
 		log('Using index scan (ordering provided by %s)', indexName);
 
-		const indexIdxStr = indexName === 'primary' ? '_primary_' : indexName;
-		const orderingFilterInfo: FilterInfo = {
-			...filterInfo,
-			idxStr: `idx=${indexIdxStr}(0);plan=0`,
-			indexInfoOutput: {
-				...filterInfo.indexInfoOutput,
-				idxStr: `idx=${indexIdxStr}(0);plan=0`,
-				orderByConsumed: true,
-			}
-		};
+		const indexIdxStr = indexName === PRIMARY_PHYSICAL_INDEX_NAME ? PRIMARY_INDEX_NAME : indexName;
+		const orderingFilterInfo = makeOrderedScanFilterInfo(filterInfo, tableRef.tableSchema, accessPlan, indexIdxStr);
 
 		return new IndexScanNode(
 			tableRef.scope,
@@ -1108,26 +1134,7 @@ function createSeqScan(tableRef: TableReferenceNode, filterInfo?: FilterInfo, co
 	const scanCost = cost ?? seqScanCost(tableRows);
 
 	// Create default FilterInfo if not provided
-	const effectiveFilterInfo = filterInfo || {
-		idxNum: 0,
-		idxStr: 'fullscan',
-		constraints: [],
-		args: [],
-		indexInfoOutput: {
-			nConstraint: 0,
-			aConstraint: [],
-			nOrderBy: 0,
-			aOrderBy: [],
-			aConstraintUsage: [] as IndexConstraintUsage[],
-			idxNum: 0,
-			idxStr: 'fullscan',
-			orderByConsumed: false,
-			estimatedCost: scanCost,
-			estimatedRows: BigInt(tableRows),
-			idxFlags: 0,
-			colUsed: 0n,
-		}
-	};
+	const effectiveFilterInfo = filterInfo ?? makeFullScanFilterInfo(scanCost, tableRows);
 
 	const seqScan = new SeqScanNode(
 		tableRef.scope,
@@ -1202,27 +1209,7 @@ function equalitySeekKey(scope: Scope, c: PlannerPredicateConstraint): ScalarPla
  * the literal-IN reduction below.
  */
 function createEmptyResultNode(tableRef: TableReferenceNode): EmptyResultNode {
-	const emptyFilterInfo: FilterInfo = {
-		idxNum: 0,
-		idxStr: 'empty',
-		constraints: [],
-		args: [],
-		indexInfoOutput: {
-			nConstraint: 0,
-			aConstraint: [],
-			nOrderBy: 0,
-			aOrderBy: [],
-			aConstraintUsage: [] as IndexConstraintUsage[],
-			idxNum: 0,
-			idxStr: 'empty',
-			orderByConsumed: false,
-			estimatedCost: 0,
-			estimatedRows: 0n,
-			idxFlags: 0,
-			colUsed: 0n,
-		}
-	};
-	return new EmptyResultNode(tableRef.scope, tableRef, emptyFilterInfo, 0);
+	return new EmptyResultNode(tableRef.scope, tableRef, makeEmptyFilterInfo(), 0);
 }
 
 /**

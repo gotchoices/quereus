@@ -30,6 +30,35 @@ export { MemoryTableModule } from './vtab/memory/module.js';
 export type { IndexInfo, IndexConstraint, IndexConstraintUsage, IndexOrderBy } from './vtab/index-info.js';
 export { IndexScanFlags } from './vtab/index-info.js';
 export type { FilterInfo } from './vtab/filter-info.js';
+export {
+	makeFullScanFilterInfo,
+	makeEmptyFilterInfo,
+	makeIndexEqSeekFilterInfo,
+	retargetFilterInfoIndex,
+} from './vtab/filter-info.js';
+
+// Structured access-path identity — the typed form of what `idxStr` encodes as text
+export type { IndexKeyColumn, IndexDescriptor, IndexPlanKind, AccessPath } from './vtab/index-descriptor.js';
+export {
+	PRIMARY_INDEX_NAME,
+	PRIMARY_PHYSICAL_INDEX_NAME,
+	isPrimaryIndexName,
+	primaryKeyDescriptor,
+	resolveIndexDescriptor,
+	validateIndexDescriptor,
+} from './vtab/index-descriptor.js';
+
+// The `idxStr` wire format: one encoder, one decoder
+export type { IdxStrSpec } from './vtab/idx-str.js';
+export {
+	encodeIdxStr,
+	decodeIdxStr,
+	idxStrSentinel,
+	retargetIdxStr,
+	makeIdxStrSpec,
+	planKindFromCode,
+	planCodeFromKind,
+} from './vtab/idx-str.js';
 export type { BaseModuleConfig, EffectiveRowSource, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
 export { getModuleConcurrencyMode, acquireConnectionLock } from './vtab/concurrency.js';
 

@@ -7,6 +7,8 @@ import type { IndexColumnSchema, PrimaryKeyColumnDefinition } from '../../../sch
 import type { IndexConstraint, IndexInfo } from '../../index-info.js';
 import { IndexConstraintOp as ActualIndexConstraintOp } from '../../../common/constants.js';
 import { normalizeCollationName } from '../../../util/comparison.js';
+import { decodeIdxStr } from '../../idx-str.js';
+import { PRIMARY_INDEX_NAME } from '../../index-descriptor.js';
 
 /** Describes an equality constraint for a scan plan */
 export interface ScanPlanEqConstraint {
@@ -74,18 +76,8 @@ interface IndexSchemaLike {
 
 type ArgvMap = ReadonlyMap<number, number>;
 
-function parseIdxStrParameters(idxStr: string | null): Map<string, string> {
-	const params = new Map<string, string>();
-	if (!idxStr) return params;
-
-	for (const part of idxStr.split(';')) {
-		const [key, value] = part.split('=', 2);
-		if (key && value !== undefined) {
-			params.set(key, value);
-		}
-	}
-	return params;
-}
+/** No decoded parameters — shared so the degenerate path allocates nothing. */
+const NO_PARAMS: ReadonlyMap<string, string> = new Map();
 
 function parseArgvMappings(raw: string | undefined): Map<number, number> {
 	const mappings = new Map<number, number>();
@@ -101,12 +93,6 @@ function parseArgvMappings(raw: string | undefined): Map<number, number> {
 	return mappings;
 }
 
-function resolveIndexName(idxParam: string | undefined): string | 'primary' {
-	const match = idxParam?.match(/^(.*?)\((\d+)\)$/);
-	if (!match) return 'primary';
-	return match[1] === '_primary_' ? 'primary' : match[1];
-}
-
 function resolveIndexSchema(
 	indexName: string | 'primary',
 	tableSchema: TableSchema,
@@ -120,7 +106,7 @@ function resolveIndexSchema(
 	return tableSchema.indexes?.find(idx => idx.name === indexName);
 }
 
-function isDescendingScan(params: Map<string, string>, planType: number): boolean {
+function isDescendingScan(params: ReadonlyMap<string, string>, planType: number): boolean {
 	return params.get('ordCons') === 'DESC' || planType === 1 || planType === 4;
 }
 
@@ -278,9 +264,15 @@ function extractRangeBounds(
 export function buildScanPlanFromFilterInfo(filterInfo: FilterInfo, tableSchema: TableSchema): ScanPlan {
 	const { idxNum, idxStr, constraints, args, indexInfoOutput } = filterInfo;
 
-	const params = parseIdxStrParameters(idxStr);
-	const indexName = resolveIndexName(params.get('idx'));
-	const planType = parseInt(params.get('plan') ?? '0', 10);
+	// An idxStr that names no index (null, `fullscan`, `empty`, or any string this
+	// engine never emitted) degenerates to an unbounded primary-key walk — the
+	// behaviour this builder has always had for an unparseable idxStr.
+	const spec = decodeIdxStr(idxStr);
+	const params = spec?.params ?? NO_PARAMS;
+	const indexName: string | 'primary' = spec
+		? (spec.indexName === PRIMARY_INDEX_NAME ? 'primary' : spec.indexName)
+		: 'primary';
+	const planType = spec?.plan ?? 0;
 	const descending = isDescendingScan(params, planType);
 	const argvMap = parseArgvMappings(params.get('argvMap'));
 	const indexSchema = resolveIndexSchema(indexName, tableSchema);

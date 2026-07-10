@@ -23,6 +23,7 @@ import {
 	rowsValueIdentical,
 	validateAndParse,
 	compilePredicate,
+	decodeIdxStr,
 	maintainedTableUniqueViolationError,
 	uniqueEnforcementCollations,
 	logicalTypeCanHoldText,
@@ -1136,24 +1137,17 @@ export class StoreTable extends VirtualTable {
 	 *
 	 * The planner emits `idx=<name>(<n>);plan=…` when its access plan set both an
 	 * `indexName` and `seekColumnIndexes` (see `getBestAccessPlan` and
-	 * rule-select-access-path.ts). Mirrors `isolated-table.ts`'
-	 * `parseIndexFromFilterInfo` so the store and the isolation overlay resolve the
-	 * SAME index for one idxStr. Returns null for the PK/scan sentinels
-	 * (`_primary_`, `fullscan`), a missing `idx=` param, or a name absent from
-	 * `schema.indexes` — every one of which routes back to a PK/full-scan arm.
+	 * rule-select-access-path.ts). Decoding goes through the engine's shared
+	 * `decodeIdxStr`, so the store, the in-memory vtab, and the isolation overlay all
+	 * read one format. Returns null for the PK/scan sentinels (`_primary_`, `fullscan`,
+	 * `empty`), an idxStr that names no index, or a name absent from `schema.indexes` —
+	 * every one of which routes back to a PK/full-scan arm.
 	 */
 	protected resolveIndexFromIdxStr(idxStr: string | null): TableIndexSchema | null {
-		if (!idxStr) return null;
-		const params = new Map<string, string>();
-		idxStr.split(';').forEach(part => {
-			const [key, value] = part.split('=', 2);
-			if (key && value !== undefined) params.set(key, value);
-		});
-		const idx = params.get('idx');
-		if (!idx) return null;
-		const match = idx.match(/^(.*?)\((\d+)\)$/);
-		const name = match ? match[1] : idx;
-		if (!name || name === '_primary_' || name === 'fullscan') return null;
+		const spec = decodeIdxStr(idxStr);
+		if (!spec) return null;
+		const name = spec.indexName;
+		if (!name || name === '_primary_') return null;
 		const indexes = this.tableSchema?.indexes ?? [];
 		return indexes.find(i => i.name.toLowerCase() === name.toLowerCase()) ?? null;
 	}

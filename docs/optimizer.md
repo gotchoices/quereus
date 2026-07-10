@@ -479,6 +479,26 @@ Ops outside the seek family (`IS NULL`, `IS NOT NULL`, `LIKE`, `GLOB`, `MATCH`,
 taken at its word — claim only when the predicate is tautological over the rows you
 return (the memory module's `IS NOT NULL` on a `NOT NULL` column).
 
+#### The access-path seam: `FilterInfo.accessPath`
+
+Alongside the free-text `idxStr`, `rule-select-access-path` records its choice on the
+physical leaf as a typed `FilterInfo.accessPath` (`vtab/index-descriptor.ts`): one of
+`{ kind: 'fullScan' }`, `{ kind: 'empty' }`, `{ kind: 'index', index, plan }`, or
+`{ kind: 'unresolvedIndex', indexName, plan }`. `idxStr` is the text *projection* of the
+same choice — both are emitted from one `(indexName, plan, params)` triple through
+`encodeIdxStr`, so they cannot drift, and every module runtime still parses `idxStr` via
+the shared `decodeIdxStr`. Consumers that need to know *what the index is* — above all the
+isolation overlay, which must merge in the underlying scan's sort order — read
+`accessPath.index` (its `role`, full `keyColumns`, `unique`) rather than re-parsing text.
+
+The `index` arm's descriptor is resolved by `resolveIndexDescriptor`: a module-supplied
+`indexDescriptor` wins, then `_primary_`, then a case-insensitive schema-index lookup. A
+name that resolves to none of these — a per-plan alias a module minted without a
+descriptor — becomes `unresolvedIndex`, logged at warn level; an order-sensitive consumer
+must refuse such a plan rather than guess it is the primary key. See
+[module authoring](module-authoring.md#2-index-based-access-standard) for the module-side
+contract.
+
 Which seek-family filters the rule *can* consume is further shaped by the seek encodings.
 Seek keys are positional, so a standalone range bound is only ever seeked on the
 **leading** seek column; a range on a later seek column requires the prefix-range

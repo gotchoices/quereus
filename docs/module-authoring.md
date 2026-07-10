@@ -142,6 +142,9 @@ interface BestAccessPlanResult {
   cost: number;                        // Cost estimate
   rows: number | undefined;            // Cardinality estimate
   providesOrdering?: readonly OrderingSpec[]; // If module provides ordering
+  indexName?: string;                  // Name of the chosen index ('_primary_' or a secondary)
+  indexDescriptor?: IndexDescriptor;   // Structured identity of that index (see below)
+  seekColumnIndexes?: readonly number[]; // Columns forming the seek key
   isSet?: boolean;                     // If result is guaranteed unique
   explains?: string;                   // Free-text explanation for debugging
   residualFilter?: (row: any) => boolean; // Optional JS filter for residual predicates
@@ -184,6 +187,44 @@ Three corollaries worth spelling out:
   column is usable only as the trailing bound of a prefix seek, and only when every
   preceding seek column is pinned by a *single-valued* equality (`a = 1`, or `a in (1)`
   — not `a in (1, 2)`). Otherwise the planner declines the seek entirely and scans.
+
+**Naming the chosen index — `indexName` and `indexDescriptor`**:
+
+When a module sets `indexName` (and `seekColumnIndexes`) the engine records the choice on
+the physical leaf as both a text `idxStr` and a structured `FilterInfo.accessPath`. Order-
+sensitive consumers — most importantly the transaction-isolation overlay, which must merge
+its per-connection changes in the *same sort order the underlying scan emits* — read the
+structured form to learn what the index actually is: whether it is the primary key, its full
+key columns, and whether it is unique.
+
+The engine resolves that structure itself in two cases:
+
+- `indexName` is `_primary_` (the primary key), or
+- `indexName` matches an index present in `tableInfo.indexes` (case-insensitive).
+
+If your module names the index anything else — most commonly a **per-plan alias** for the
+primary key, e.g. `_primary_1`, minted so a downstream layer can recover which plan produced
+a given scan — the engine cannot resolve it from the schema. You **must** then also return an
+`indexDescriptor`:
+
+```typescript
+interface IndexDescriptor {
+  name: string;                 // must equal the plan's indexName
+  role: 'primary' | 'secondary';
+  keyColumns: readonly { columnIndex: number; desc: boolean; collation?: string }[]; // FULL key, in index order
+  unique: boolean;
+}
+```
+
+`role` is authoritative, not `name`: a descriptor with `role: 'primary'` **is** the primary
+key however it is named. `validateAccessPlan` rejects a descriptor whose `name` disagrees with
+the plan's index name.
+
+A module that aliases an index name **without** supplying a matching `indexDescriptor` has its
+access path recorded as `{ kind: 'unresolvedIndex' }` (and the engine logs a warning). Order-
+sensitive consumers refuse an unresolved plan rather than guess — so the alias-without-
+descriptor path is a correctness bug in the module, not a slow path. Name the primary key
+`_primary_` or supply the descriptor.
 
 **When to use**: Most modules (in-memory tables, file-based storage, traditional indexes).
 

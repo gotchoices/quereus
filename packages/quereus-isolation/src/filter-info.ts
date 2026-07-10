@@ -1,64 +1,29 @@
-import type { FilterInfo, SqlValue } from '@quereus/quereus';
-import { IndexConstraintOp } from '@quereus/quereus';
+import type { FilterInfo, IndexDescriptor, SqlValue } from '@quereus/quereus';
+import { PRIMARY_INDEX_NAME, makeFullScanFilterInfo, makeIndexEqSeekFilterInfo } from '@quereus/quereus';
 
 /**
  * Creates a FilterInfo for a full table scan (no constraints).
  *
  * Shared by the overlay-merge read paths, the ALTER/DROP INDEX overlay
  * migrations, and the commit flush — a single definition keeps the several
- * scan sites from drifting.
+ * scan sites from drifting. Delegates to the engine's builder so the overlay
+ * scans present the same access path the planner would.
  */
-export function makeFullScanFilterInfo(): FilterInfo {
-	return {
-		idxNum: 0,
-		idxStr: null,
-		constraints: [],
-		args: [],
-		indexInfoOutput: {
-			nConstraint: 0,
-			aConstraint: [],
-			nOrderBy: 0,
-			aOrderBy: [],
-			colUsed: 0n,
-			aConstraintUsage: [],
-			idxNum: 0,
-			idxStr: null,
-			orderByConsumed: false,
-			estimatedCost: 1000000,
-			estimatedRows: 1000000n,
-			idxFlags: 0,
-		},
-	};
-}
+export { makeFullScanFilterInfo };
 
 /**
  * Creates a FilterInfo for a primary key point lookup (equality on all PK
  * columns). Produces O(log n) lookups instead of O(n) full scans.
+ *
+ * The overlay always names its primary-key index `_primary_`, so the descriptor is
+ * built here rather than resolved from a schema.
  */
 export function makePkPointLookupFilter(pkIndices: number[], pk: SqlValue[]): FilterInfo {
-	const constraints = pkIndices.map((colIdx, i) => ({
-		constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
-		argvIndex: i + 1,
-	}));
-
-	return {
-		idxNum: 0,
-		idxStr: 'idx=_primary_(0);plan=2',
-		constraints,
-		args: pk,
-		indexInfoOutput: {
-			nConstraint: constraints.length,
-			aConstraint: constraints.map(c => c.constraint),
-			nOrderBy: 0,
-			aOrderBy: [],
-			colUsed: 0n,
-			aConstraintUsage: constraints.map(c => ({ argvIndex: c.argvIndex, omit: true })),
-			idxNum: 0,
-			idxStr: 'idx=_primary_(0);plan=2',
-			orderByConsumed: false,
-			estimatedCost: 1,
-			estimatedRows: 1n,
-			idxFlags: 0,
-		},
+	const index: IndexDescriptor = {
+		name: PRIMARY_INDEX_NAME,
+		role: 'primary',
+		keyColumns: pkIndices.map(columnIndex => ({ columnIndex, desc: false })),
+		unique: true,
 	};
+	return makeIndexEqSeekFilterInfo(index, pkIndices, pk);
 }

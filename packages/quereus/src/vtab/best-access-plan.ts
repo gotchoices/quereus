@@ -6,6 +6,7 @@
 import { quereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
+import { validateIndexDescriptor, type IndexDescriptor } from './index-descriptor.js';
 
 /**
  * Constraint operators that can be pushed down to virtual tables
@@ -111,6 +112,18 @@ export interface BestAccessPlanResult {
 	orderingIndexName?: string;
 	/** Name of the index chosen for filtering (e.g., '_primary_' or a secondary index name) */
 	indexName?: string;
+	/**
+	 * Structured identity of the index named by `indexName` (or, for an ordering-only
+	 * plan, by `orderingIndexName`).
+	 *
+	 * OPTIONAL when that name is `_primary_` or matches an index present in the table
+	 * schema — the engine resolves those itself. REQUIRED when the module names the
+	 * index anything else (e.g. a per-plan alias like `_primary_1`): without it the
+	 * engine cannot tell a primary-key walk from a secondary-index walk, and consumers
+	 * that depend on scan order (the isolation layer's overlay merge) cannot trust the
+	 * plan. See `docs/module-authoring.md`.
+	 */
+	indexDescriptor?: IndexDescriptor;
 	/** Column indexes that form the seek/range key, in order */
 	seekColumnIndexes?: readonly number[];
 	/** Whether this plan guarantees unique rows (helps DISTINCT optimization) */
@@ -274,6 +287,15 @@ export class AccessPlanBuilder {
 	}
 
 	/**
+	 * Set the structured identity of the chosen index. Required when `indexName` is a
+	 * per-plan alias the engine cannot resolve from the table schema.
+	 */
+	setIndexDescriptor(indexDescriptor: IndexDescriptor): this {
+		this.result.indexDescriptor = indexDescriptor;
+		return this;
+	}
+
+	/**
 	 * Set the column indexes that form the seek/range key
 	 */
 	setSeekColumns(seekColumnIndexes: readonly number[]): this {
@@ -374,6 +396,18 @@ export function validateAccessPlan(
 				);
 			}
 		}
+	}
+
+	// A supplied indexDescriptor must describe the index the plan actually drives —
+	// a descriptor naming a different index than `indexName` is a module bug, and
+	// silently reconciling it would hand order-sensitive consumers the wrong sort key.
+	if (result.indexDescriptor) {
+		validateIndexDescriptor(
+			result.indexDescriptor,
+			result.indexName,
+			result.orderingIndexName,
+			request.columns.length,
+		);
 	}
 
 	// Validate monotonicOn column index is in range
