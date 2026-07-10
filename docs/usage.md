@@ -507,6 +507,24 @@ Returns a public handle to a table for inspection and per-table event subscripti
 ### `db.registerModule(...)`, `db.createScalarFunction(...)`, `db.createAggregateFunction(...)`, `db.registerCollation(...)`
 Methods for extending database functionality.
 
+#### `db.registerCollation(name, comparator, optionsOrNormalizer?)`
+
+Registers a comparison rule for text. `NOCASE` and `RTRIM` may be overridden; `BINARY` may not. The third argument is either a bare key normalizer (legacy positional form) or an options object:
+
+```typescript
+db.registerCollation('NOCASE', comparator, {
+  normalizer,             // (s: string) => string
+  replicable: true,       // bit-identical across peers/platforms/app-versions
+  orderPreserving: true,  // normalizer preserves ORDER, not just equality
+});
+```
+
+- **`normalizer`** — rewrites a string into a canonical form, so two strings the comparator calls equal always rewrite to the same form. Required for the collation to key a compound index or a persisted structure; `order by` and standalone comparisons work without it.
+- **`replicable`** — asserts the collation is bit-identical across peers, platforms, and app versions (not merely deterministic). Consulted by the materialized-view gate when a backing host declares `requiresReplicableDerivations`.
+- **`orderPreserving`** — asserts the normalizer preserves order: for all strings `x`, `y`, `sign(comparator(x, y))` equals `sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`. This is strictly stronger than the equality promise `normalizer` alone makes; a normalizer can agree with its comparator on equality and still disagree on order.
+
+Both assertions default to `false` for a custom collation and are stamped `true` on the three built-ins. `orderPreserving` matters for persistent storage: a store physically orders rows by normalized key bytes, so it may only seek a byte range — or advertise byte order as collation order — for a collation carrying the assertion. Without it, queries stay **correct** and simply run a full scan with a comparator-accurate filter instead of a seek. See [store.md § Order preservation](./store.md#order-preservation).
+
 ### `db.setInstructionTracer(tracer: InstructionTracer | undefined)`
 Sets an instruction tracer for debugging and performance analysis. The tracer receives callbacks for every instruction executed, enabling detailed visibility into query execution.
 

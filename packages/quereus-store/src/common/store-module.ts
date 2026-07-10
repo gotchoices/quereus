@@ -46,7 +46,7 @@ import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import { StoreBackingHost } from './backing-host.js';
-import { StoreTable, resolvePkKeyCollations, columnCanHoldText, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable, resolvePkKeyCollations, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
@@ -2077,20 +2077,30 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * row filter still reproduces the exact collation semantics. (A collation that cannot
 	 * key at all never reaches a PK column: `StoreTable`'s constructor rejects it at DDL
 	 * time.) Mirrors the memory module's advertisement.
+	 *
+	 * The seek/ordering claims are additionally gated on the key collation being
+	 * ORDER-PRESERVING — byte order and comparator order must coincide, or the seek would
+	 * under-fetch and the ordering advertisement would elide a Sort it must not. That gate
+	 * needs the connection's collation registry, hence `db` is threaded down.
 	 */
 	getBestAccessPlan(
-		_db: Database,
+		db: Database,
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest
 	): BestAccessPlanResult {
-		return { ...this.computeBestAccessPlan(tableInfo, request), honorsCollatedRangeBounds: true };
+		return { ...this.computeBestAccessPlan(db, tableInfo, request), honorsCollatedRangeBounds: true };
 	}
 
 	private computeBestAccessPlan(
+		db: Database,
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest
 	): BestAccessPlanResult {
 		const estimatedRows = request.estimatedRows ?? 1000;
+		// Table key collation K (default NOCASE). Any K reaching here has a key normalizer:
+		// `StoreTable`'s constructor rejects one that cannot key, and a name we cannot resolve
+		// to a table falls back to the built-in NOCASE.
+		const tableKeyCollation = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation ?? 'NOCASE').toUpperCase();
 
 		// Check for primary key equality constraints. Count DISTINCT pinned PK columns:
 		// counting raw '=' filters would read `a = 1 and a = 2` on a composite PK (a, b)
@@ -2120,8 +2130,20 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// range bounds for primaryKeyDefinition[0]; ranges on later PK columns
 		// are silently dropped if marked handled. So only claim handled=true
 		// when the range is on the first PK column.
+		//
+		// The seek is also declined when the leading PK column's key bytes do not order the
+		// way its comparator does (`pkOrderPreservingPrefix === 0`): `StoreTable.analyzePKAccess`
+		// declines the byte window under exactly that condition, so claiming the range filters
+		// handled here would drop the residual Filter and return the whole table.
+		const pkOrderPreservingPrefix = pkOrderPreservingPrefixLength(
+			db,
+			tableInfo,
+			resolvePkKeyCollations(tableInfo.primaryKeyDefinition, tableInfo.columns, tableKeyCollation),
+			tableKeyCollation,
+		);
 		const firstPkColumn = tableInfo.primaryKeyDefinition[0]?.index;
 		const hasLeadingPkRange = firstPkColumn !== undefined
+			&& pkOrderPreservingPrefix >= 1
 			&& request.filters.some(f => f.columnIndex === firstPkColumn && RANGE_OPS.includes(f.op));
 
 		if (hasLeadingPkRange) {
@@ -2138,7 +2160,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				.setSeekColumns([firstPkColumn!])
 				.setExplanation('Store primary key range scan')
 				.build();
-			return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
+			return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
 		}
 
 		// Check for secondary index usage. `StoreTable.query` now implements the
@@ -2152,7 +2174,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		let costOnlyFallback: BestAccessPlanResult | null = null;
 		for (const index of indexes) {
 			if (index.columns.length === 0) continue;
-			const plan = this.tryIndexAccessPlan(tableInfo, request, index, estimatedRows);
+			const plan = this.tryIndexAccessPlan(db, tableKeyCollation, tableInfo, request, index, estimatedRows);
 			if (!plan) continue;
 			// A fully-handled seek (indexName + seekColumns set) wins immediately.
 			if (plan.seekColumnIndexes && plan.seekColumnIndexes.length > 0) return plan;
@@ -2171,7 +2193,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			.setHandledFilters(new Array(request.filters.length).fill(false))
 			.setExplanation('Store full table scan')
 			.build();
-		return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request) };
+		return { ...plan, ...this.buildPkOrderingAdvertisement(tableInfo, request, pkOrderPreservingPrefix) };
 	}
 
 	/**
@@ -2195,11 +2217,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * just not sped up). K itself always keys: `StoreTable`'s constructor rejects a
 	 * table whose key encoding would need a collation it cannot resolve to a normalizer.
 	 *
-	 * NOTE: the RANGE arm additionally assumes the normalizer is order-preserving with
-	 * respect to its comparator — see the NOTE on `StoreTable.buildPKRangeBounds` and
-	 * `backlog/bug-store-range-seek-assumes-order-preserving-key-normalizer`.
+	 * NOTE: the coarser-K relaxation is sound for EQUALITY only. A RANGE window equates
+	 * memcmp of K-normalized bytes with C's comparator order, which a merely coarser K does
+	 * not give — under K = NOCASE and C = BINARY, 'K' (U+212A) is `> 'z'` yet keys as 'k',
+	 * before 'z'. So the range arm demands `C === K` *and* K's `orderPreserving` assertion,
+	 * via the shared {@link keyOrderMatchesCollation}; `StoreTable.analyzeIndexAccess`
+	 * declines the same windows, so the two decisions cannot disagree. The cost is that a
+	 * default-K (NOCASE) table with an index on a plain BINARY text column loses its index
+	 * RANGE seek and falls back to the cost-only plan; EQ seeks are unchanged.
 	 */
 	private tryIndexAccessPlan(
+		db: Database,
+		tableKeyCollation: string,
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest,
 		index: TableIndexSchema,
@@ -2247,31 +2276,35 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				.setExplanation(`Store index scan on ${index.name} (${why})`)
 				.build();
 
-		// Table key collation K for this table (default NOCASE). Any K reaching here has a
-		// key normalizer: `StoreTable`'s constructor rejects one that cannot key, and a
-		// name we cannot resolve to a table falls back to the built-in NOCASE.
-		const K = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation ?? 'NOCASE').toUpperCase();
-
-		// A seek column is collation-safe to mark handled iff K is coarser-or-equal
-		// to the INDEX column's effective comparison collation C (the index column's
-		// own COLLATE, else the table column's declared collation). C — not the table
-		// column's declared collation — is what matchesFilters compares an index-scan
-		// row under and what the planner matched to drop the residual, so the K-window
-		// must be a superset relative to C. See the guard doc above.
-		const safeToHandle = (colIdx: number): boolean => {
-			const col = tableInfo.columns[colIdx];
-			// Exempt only columns that can NEVER hold text — their key bytes are
-			// type-native and collation-independent. A bare `isTextual` test wrongly
-			// exempts an `ANY` column (no marker, but it stores text as text), which
-			// would seek under K, drop the residual, and silently lose rows.
-			if (!columnCanHoldText(col)) return true;
+		// The INDEX column's effective comparison collation C — the index column's own
+		// COLLATE, else the table column's declared collation. C, not the table column's
+		// declared collation, is what matchesFilters compares an index-scan row under and
+		// what the planner matched to drop the residual, so the K-window must be a superset
+		// relative to C.
+		const K = tableKeyCollation;
+		const effectiveCollation = (colIdx: number): string => {
 			const indexCol = index.columns.find(c => c.index === colIdx);
-			const C = (indexCol?.collation ?? col.collation ?? 'BINARY').toUpperCase();
+			return (indexCol?.collation ?? tableInfo.columns[colIdx]?.collation ?? 'BINARY').toUpperCase();
+		};
+
+		// EQUALITY: safe to mark handled iff K is coarser-or-equal to C. Exempt only columns
+		// that can NEVER hold text — their key bytes are type-native and collation-independent.
+		// A bare `isTextual` test wrongly exempts an `ANY` column (no marker, but it stores
+		// text as text), which would seek under K, drop the residual, and lose rows.
+		const eqSafeToHandle = (colIdx: number): boolean => {
+			const col = tableInfo.columns[colIdx];
+			if (!columnCanHoldText(col)) return true;
+			const C = effectiveCollation(colIdx);
 			if (C === K) return true;                               // equal
 			if (K === 'NOCASE' && C === 'BINARY') return true;      // K strictly coarser
 			return false;
 		};
-		if (!seekCols.every(safeToHandle)) {
+
+		// RANGE: coarser is not enough — byte order must BE comparator order. See the doc above.
+		const rangeSafeToHandle = (colIdx: number): boolean =>
+			keyOrderMatchesCollation(db, tableInfo.columns[colIdx], K, effectiveCollation(colIdx));
+
+		if (!seekCols.every(isRange ? rangeSafeToHandle : eqSafeToHandle)) {
 			return costOnly('cost-only; key collation may under-fetch');
 		}
 
@@ -2312,13 +2345,21 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * Returns an empty object when there is no PK (heap-only table) — without a
 	 * leading key column there is no natural emit order.
+	 *
+	 * Every claim here is about the PHYSICAL key-byte order the store iterates in, but the
+	 * consumers of `providesOrdering` / `monotonicOn` reason in the columns' COLLATION order.
+	 * `orderPreservingPrefix` (from {@link pkOrderPreservingPrefixLength}) is how many leading
+	 * PK members those two orders provably agree on: the advertisement is truncated to that
+	 * prefix, and voided entirely when even the leading member disagrees — otherwise the
+	 * absorb-Sort rule would elide a Sort and hand the caller byte-ordered rows.
 	 */
 	private buildPkOrderingAdvertisement(
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest,
+		orderPreservingPrefix: number,
 	): Pick<BestAccessPlanResult, 'providesOrdering' | 'orderingIndexName' | 'monotonicOn' | 'supportsAsofRight'> {
 		const pk = tableInfo.primaryKeyDefinition;
-		if (pk.length === 0) return {};
+		if (pk.length === 0 || orderPreservingPrefix === 0) return {};
 
 		const leading = pk[0];
 		const monotonicOn = {
@@ -2327,7 +2368,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			strict: pk.length === 1,
 		};
 
-		const pkOrdering: OrderingSpec[] = pk.map(col => ({
+		const pkOrdering: OrderingSpec[] = pk.slice(0, orderPreservingPrefix).map(col => ({
 			columnIndex: col.index,
 			desc: !!col.desc,
 		}));
@@ -2341,7 +2382,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// matched here — if the request specifies an explicit NULLS
 			// FIRST/LAST, leave the Sort in place rather than assume the PK
 			// scan's natural NULL placement matches.
-			if (required.length > pk.length) return { monotonicOn, supportsAsofRight: true };
+			if (required.length > pkOrdering.length) return { monotonicOn, supportsAsofRight: true };
 			for (let i = 0; i < required.length; i++) {
 				if (required[i].columnIndex !== pkOrdering[i].columnIndex) return { monotonicOn, supportsAsofRight: true };
 				if (required[i].desc !== pkOrdering[i].desc) return { monotonicOn, supportsAsofRight: true };

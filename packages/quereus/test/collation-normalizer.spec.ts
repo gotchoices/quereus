@@ -154,4 +154,98 @@ describe('Collation key normalizers', () => {
 				.to.throw(/normalizer must be a function/);
 		});
 	});
+
+	// `orderPreserving` asserts the normalizer preserves ORDER, not merely equality —
+	// the precondition a persistent store's byte-range seek and byte-order advertisement
+	// depend on. Like `replicable`, built-ins carry it and custom collations opt in.
+	describe('orderPreserving assertion', () => {
+		const noSpace = (s: string): string => s.replace(/ /g, '');
+		const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+		/** memcmp of the UTF-8 encodings, the order the store's key bytes actually take. */
+		const utf8Compare = (a: string, b: string): number => {
+			const enc = new TextEncoder();
+			const [x, y] = [enc.encode(a), enc.encode(b)];
+			for (let i = 0; i < Math.min(x.length, y.length); i++) {
+				if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+			}
+			return x.length === y.length ? 0 : x.length < y.length ? -1 : 1;
+		};
+
+		// The assertion the built-ins claim, checked against the same corpus the equality
+		// probe uses. (CORPUS is deliberately free of astral-plane characters — see the
+		// UTF-16-vs-UTF-8 NOTE on `Database.registerCollation`.)
+		it('holds for each built-in comparator over the corpus', () => {
+			const builtins: ReadonlyArray<[string, (s: string) => string, Cmp]> = [
+				['BINARY', BUILTIN_NORMALIZERS.BINARY, BINARY_COLLATION],
+				['NOCASE', BUILTIN_NORMALIZERS.NOCASE, NOCASE_COLLATION],
+				['RTRIM', BUILTIN_NORMALIZERS.RTRIM, RTRIM_COLLATION],
+			];
+			for (const [name, normalize, cmpFn] of builtins) {
+				for (const a of CORPUS) {
+					for (const b of CORPUS) {
+						const byComparator = Math.sign(cmpFn(a, b));
+						const byBytes = Math.sign(utf8Compare(normalize(a), normalize(b)));
+						expect(byBytes, `${name}: (${JSON.stringify(a)}, ${JSON.stringify(b)})`)
+							.to.equal(byComparator);
+					}
+				}
+			}
+		});
+
+		it('stamps the three built-ins', () => {
+			const db = new Database();
+			expect(db._isCollationOrderPreserving('BINARY')).to.be.true;
+			expect(db._isCollationOrderPreserving('NOCASE')).to.be.true;
+			expect(db._isCollationOrderPreserving('RTRIM')).to.be.true;
+			// Name resolution is case-insensitive, matching every other collation lookup.
+			expect(db._isCollationOrderPreserving('nocase')).to.be.true;
+		});
+
+		it('returns false for an unregistered collation', () => {
+			const db = new Database();
+			expect(db._isCollationOrderPreserving('NOSUCH')).to.be.false;
+		});
+
+		it('defaults to false for a custom collation registered with the options form', () => {
+			const db = new Database();
+			db.registerCollation('NOCASE', cmp, { normalizer: noSpace });
+			expect(db._isCollationOrderPreserving('NOCASE')).to.be.false;
+		});
+
+		it('defaults to false for the legacy positional-normalizer form', () => {
+			const db = new Database();
+			db.registerCollation('NOCASE', cmp, noSpace);
+			expect(db._isCollationOrderPreserving('NOCASE')).to.be.false;
+		});
+
+		it('honors orderPreserving: true in the options form', () => {
+			const db = new Database();
+			db.registerCollation('NOCASE', cmp, { normalizer: noSpace, orderPreserving: true });
+			expect(db._isCollationOrderPreserving('NOCASE')).to.be.true;
+		});
+
+		it('overriding a built-in name drops the built-in assertion', () => {
+			const db = new Database();
+			db.registerCollation('RTRIM', cmp, { normalizer: noSpace });
+			expect(db._isCollationOrderPreserving('RTRIM')).to.be.false;
+		});
+
+		it('is vacuous — and so false — without a normalizer', () => {
+			const db = new Database();
+			db.registerCollation('CMPONLY', cmp, { orderPreserving: true });
+			expect(db._isCollationOrderPreserving('CMPONLY')).to.be.false;
+		});
+
+		it('is independent of the replicable assertion', () => {
+			const db = new Database();
+			db.registerCollation('NOCASE', cmp, { normalizer: noSpace, replicable: true });
+			expect(db._isCollationReplicable('NOCASE')).to.be.true;
+			expect(db._isCollationOrderPreserving('NOCASE')).to.be.false;
+
+			db.registerCollation('RTRIM', cmp, { normalizer: noSpace, orderPreserving: true });
+			expect(db._isCollationReplicable('RTRIM')).to.be.false;
+			expect(db._isCollationOrderPreserving('RTRIM')).to.be.true;
+		});
+	});
 });

@@ -558,7 +558,7 @@ type can carry text without declaring a collation of its own.
 | **NOCASE** | `s => s.toLowerCase()` | Full (default) |
 | **BINARY** | identity | Full |
 | **RTRIM** | strips trailing ASCII space (`0x20`) only | Full |
-| **Custom** | whatever `registerCollation` supplied | Full, if the normalizer is order-preserving |
+| **Custom** | whatever `registerCollation` supplied | Point/equality always; range and PK order only with `{ orderPreserving: true }` |
 
 The default collation is **NOCASE**, matching Quereus's case-insensitive comparison semantics.
 
@@ -566,13 +566,34 @@ The default collation is **NOCASE**, matching Quereus's case-insensitive compari
 encoder stripped every Unicode whitespace character, so `'a\t'` and `'a'` shared one key
 despite comparing distinct — a distinct row could be clobbered by its neighbour.)
 
-A range/prefix seek over a text key additionally assumes the normalizer is
-*order-preserving* with respect to the comparator. The three built-ins are. A collation
-whose comparator does not order strings the way memcmp orders their normalized bytes
-narrows the seek window incorrectly and silently drops rows — `registerCollation`
-requires only that the normalizer partition strings the way the comparator calls them
-equal, and `NOCASE` / `RTRIM` may be re-registered with such a pair. Tracked by
-`backlog/bug-store-range-seek-assumes-order-preserving-key-normalizer`.
+### Order preservation
+
+Rows are physically ordered by memcmp of their normalized key bytes, but the engine
+orders and filters them with the collation's comparator. Three store decisions equate the
+two: the primary-key range window, the secondary-index range window, and the PK-order
+advertisement (`providesOrdering` / `monotonicOn`, which lets the optimizer drop a Sort).
+
+`registerCollation` promises only that a normalizer partitions strings the way the
+comparator calls them **equal** — never that it preserves **order**. A collation asserts
+the stronger property with `{ orderPreserving: true }`: for all strings `x`, `y`,
+`sign(comparator(x, y))` equals `sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`.
+The three built-ins carry the assertion; a custom collation (or an override of `NOCASE` /
+`RTRIM` — only `BINARY` is protected) must opt in.
+
+Without the assertion the store **declines the optimization, not the query**: the range
+window degrades to a full scan and the Sort is retained, with the collation-aware
+post-fetch filter still deciding every row. Point/equality seeks never need the assertion
+— they rely only on the equality guarantee — and are unaffected.
+
+A secondary-index **range** seek carries a second requirement: the index column's
+effective collation `C` must EQUAL the table key collation `K`, not merely be finer than
+it. The relaxation the equality seek is allowed to make (`K = NOCASE` over `C = BINARY`)
+is unsound for ranges even with the built-ins — `'K'` (U+212A KELVIN SIGN) compares
+greater than `'z'` under BINARY, yet keys as `'k'`, which sorts before `'z'`. So an index
+on a plain (BINARY) text column of a default-`K` (NOCASE) store table gets equality seeks
+but scans for ranges; declare the column `collate nocase` to keep the range seek.
+`backlog/debt-store-index-keys-use-column-collation` would restore it properly by encoding
+index-column bytes under `C`.
 
 ## Package Structure
 

@@ -278,4 +278,18 @@ export interface DatabaseInternal {
 	 * right answer, use {@link getKeyNormalizerResolver} instead.
 	 */
 	_getCollationNormalizer(name: string): KeyNormalizer | undefined;
+
+	/**
+	 * True iff `name` is registered with a key normalizer asserted ORDER-PRESERVING: for all
+	 * strings `x`, `y`, `sign(comparator(x, y))` equals
+	 * `sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`. Strictly stronger than the
+	 * equality partition a bare normalizer promises. False for an unregistered name, a
+	 * comparator-only collation, and any custom collation that did not opt in with
+	 * `registerCollation(..., { orderPreserving: true })`.
+	 *
+	 * A store that physically orders rows by normalized key bytes must consult this before
+	 * seeking a byte range, or before advertising byte order as collation order; without the
+	 * assertion it falls back to a full scan plus a comparator-accurate residual filter.
+	 */
+	_isCollationOrderPreserving(name: string): boolean;
 }

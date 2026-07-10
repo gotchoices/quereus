@@ -154,6 +154,76 @@ export function columnCanHoldText(col: ColumnSchema | undefined): boolean {
 	return logicalTypeCanHoldText(col?.logicalType);
 }
 
+/**
+ * True when a byte window — or a byte-order advertisement — over `column` is SOUND.
+ *
+ * The store physically orders rows by memcmp of each column's key bytes, which for a
+ * text-capable column are produced by `keyCollation`'s normalizer. A range seek (and the
+ * `providesOrdering` / `monotonicOn` advertisement) equates that byte order with the order
+ * `compareCollation`'s comparator defines. Two things must hold for that equation:
+ *
+ *  - **Same collation on both sides** (`compareCollation === keyCollation`). A `keyCollation`
+ *    merely COARSER than `compareCollation` — the relaxation the EQUALITY seek is allowed to
+ *    make, see `StoreModule.tryIndexAccessPlan` — is not enough here: it would need the key
+ *    normalizer to be monotone with respect to the OTHER collation's order. It generally is
+ *    not, even for built-ins: with `keyCollation = NOCASE` and `compareCollation = BINARY`,
+ *    'K' (U+212A KELVIN SIGN) is `> 'z'` under BINARY, yet its key bytes are
+ *    `toLowerCase('K') = 'k'`, which sorts BEFORE 'z' — the row falls outside a `> 'z'`
+ *    window and is silently dropped.
+ *  - **The normalizer preserves order** (`db._isCollationOrderPreserving`). `registerCollation`
+ *    promises only that a normalizer partitions strings the way the comparator calls them
+ *    equal; a custom pair may agree on equality and disagree on order.
+ *
+ * A never-text column is exempt: its key bytes are type-native and collation-independent.
+ *
+ * Returning `false` costs an optimization (the caller full-scans and lets the
+ * collation-aware `matchesFilters` residual decide); returning `true` wrongly is a silent
+ * wrong-result. Shared by `StoreTable`'s read arms and `StoreModule`'s access planner so the
+ * "mark handled" and "build a window" decisions can never disagree.
+ */
+export function keyOrderMatchesCollation(
+	db: Database,
+	column: ColumnSchema | undefined,
+	keyCollation: string,
+	compareCollation: string,
+): boolean {
+	if (!columnCanHoldText(column)) return true;
+	if (compareCollation.toUpperCase() !== keyCollation.toUpperCase()) return false;
+	return (db as DatabaseInternal)._isCollationOrderPreserving(keyCollation);
+}
+
+/**
+ * How many LEADING primary-key members have key bytes whose memcmp order matches their
+ * declared collation's comparator order, per {@link keyOrderMatchesCollation}.
+ *
+ * `pkKeyCollations` is {@link resolvePkKeyCollations}' output for this table; an `undefined`
+ * entry means the encoder falls back to the table key collation `tableKeyCollation`
+ * (see `encodeKey`), so that is the key collation to test. The comparison collation is the
+ * column's declared one — which `reconcilePkCollations` has already aligned with the key
+ * collation for every *textual* PK member, so the mismatch clause only bites on a
+ * text-capable-but-not-textual member (`any`, `json`), whose bytes are normalized under the
+ * table key collation while the engine compares it under BINARY.
+ *
+ * `0` ⇒ even the leading member is unsafe: no range seek, no PK-order advertisement.
+ * A prefix shorter than the PK truncates the ordering advertisement rather than voiding it.
+ */
+export function pkOrderPreservingPrefixLength(
+	db: Database,
+	schema: TableSchema,
+	pkKeyCollations: ReadonlyArray<string | undefined>,
+	tableKeyCollation: string,
+): number {
+	const pk = schema.primaryKeyDefinition;
+	let n = 0;
+	while (n < pk.length) {
+		const col = schema.columns[pk[n].index];
+		const keyCollation = pkKeyCollations[n] ?? tableKeyCollation;
+		if (!keyOrderMatchesCollation(db, col, keyCollation, col?.collation ?? 'BINARY')) break;
+		n++;
+	}
+	return n;
+}
+
 /** A UNIQUE conflict: the offending row and the primary key it lives at. */
 type UniqueConflict = { pk: SqlValue[]; row: Row };
 
@@ -880,6 +950,21 @@ export class StoreTable extends VirtualTable {
 		}
 	}
 
+	/**
+	 * True when a byte window over the LEADING PK column reproduces the comparator's order
+	 * — the precondition {@link buildPKRangeBounds} needs, and the exact condition
+	 * `StoreModule.computeBestAccessPlan` uses before claiming the range filters handled.
+	 * When false, the range arm degrades to a full scan + `matchesFilters` residual.
+	 */
+	protected leadingPkRangeIsOrderSafe(): boolean {
+		return pkOrderPreservingPrefixLength(
+			this.db,
+			this.tableSchema!,
+			this.pkKeyCollations,
+			this.encodeOptions.collation ?? 'NOCASE',
+		) >= 1;
+	}
+
 	/** Analyze filter info to determine PK access pattern. */
 	protected analyzePKAccess(filterInfo: FilterInfo): PKAccessPattern {
 		const schema = this.tableSchema!;
@@ -917,7 +1002,10 @@ export class StoreTable extends VirtualTable {
 			c => c.constraint.iColumn === firstPkCol && rangeOps.includes(c.constraint.op)
 		) || [];
 
-		if (rangeConstraints.length > 0) {
+		// A range window is only sound when the leading PK column's key bytes order the way
+		// its comparator does; otherwise fall through to the full scan, where matchesFilters
+		// applies the range under the real comparator.
+		if (rangeConstraints.length > 0 && this.leadingPkRangeIsOrderSafe()) {
 			return {
 				type: 'range',
 				columnIndex: firstPkCol,
@@ -961,14 +1049,14 @@ export class StoreTable extends VirtualTable {
 	 *
 	 * NOTE: a range window over a text PK column is sound only when the column's key
 	 * normalizer is ORDER-preserving with respect to its comparator — i.e. the comparator
-	 * orders two strings the way memcmp orders their normalized bytes. All three built-ins
-	 * satisfy this, but `db.registerCollation` guarantees only that a normalizer PARTITIONS
-	 * strings the way the comparator calls them equal, not that it preserves order — and a
-	 * built-in NAME may be re-registered with a custom comparator + normalizer pair that
-	 * does not. Such a pair makes this window (and `analyzeIndexAccess`') UNDER-fetch and
-	 * silently drop rows. Tracked by `backlog/bug-store-range-seek-assumes-order-preserving-
-	 * key-normalizer`; the fix is an order-preservation assertion at registration, or
-	 * restricting range seeks to collations the engine knows are order-preserving.
+	 * orders two strings the way memcmp orders their normalized bytes. That is NOT implied
+	 * by `db.registerCollation`'s normalizer contract, which promises only an equality
+	 * partition, and a built-in NAME may be re-registered with a comparator + normalizer
+	 * pair that preserves equality while inverting order. This method is therefore only
+	 * ever reached under {@link leadingPkRangeIsOrderSafe} — enforced by
+	 * {@link analyzePKAccess} here and mirrored by `StoreModule.computeBestAccessPlan`
+	 * before it claims the range filters handled. A collation without the
+	 * `orderPreserving` assertion costs the seek, never a row.
 	 */
 	protected buildPKRangeBounds(access: PKAccessPattern): IterateOptions {
 		const full = buildFullScanBounds();
@@ -1060,10 +1148,16 @@ export class StoreTable extends VirtualTable {
 	 * the PK suffix varies); otherwise a range (LT/LE/GT/GE) on the LEADING index
 	 * column yields a `range` window. Returns null when neither applies or when the
 	 * index is unresolved. {@link matchesFilters} stays the authoritative row filter,
-	 * so the window need only be a SUPERSET. Index-column bytes are encoded under the
-	 * table key collation K (NOT the index's per-column declared collation — see
-	 * `buildIndexKey`); the same order-preservation caveat {@link buildPKRangeBounds}
-	 * records applies to K here.
+	 * so the window need only be a SUPERSET.
+	 *
+	 * Index-column bytes are encoded under the table key collation K (NOT the index's
+	 * per-column declared collation — see `buildIndexKey`), while `matchesFilters` compares
+	 * under the index column's effective collation C. The EQ/prefix window is a superset
+	 * whenever K is coarser-or-equal to C, which `StoreModule.tryIndexAccessPlan` checked
+	 * before it named this index. The RANGE window additionally needs byte order to BE
+	 * comparator order, so it is gated on {@link keyOrderMatchesCollation} (which demands
+	 * `C === K` plus K's `orderPreserving` assertion); when that fails we return null and
+	 * the caller full-scans.
 	 */
 	protected analyzeIndexAccess(filterInfo: FilterInfo): IndexAccessPattern | null {
 		const index = this.resolveIndexFromIdxStr(filterInfo.idxStr);
@@ -1098,7 +1192,7 @@ export class StoreTable extends VirtualTable {
 		const rangeConstraints = (filterInfo.constraints ?? []).filter(
 			c => c.constraint.iColumn === leadingCol && rangeOps.includes(c.constraint.op),
 		);
-		if (rangeConstraints.length > 0) {
+		if (rangeConstraints.length > 0 && this.indexRangeIsOrderSafe(index, leadingCol)) {
 			const bounds = this.buildIndexRangeBounds(
 				rangeConstraints.map(c => ({
 					op: c.constraint.op,
@@ -1110,6 +1204,21 @@ export class StoreTable extends VirtualTable {
 		}
 
 		return null;
+	}
+
+	/**
+	 * True when a byte window over `leadingCol` of `index` reproduces the comparator's
+	 * order. Mirrors the range arm of `StoreModule.tryIndexAccessPlan`: the window's bytes
+	 * come from the table key collation K, the residual compares under the index column's
+	 * effective collation C, so both must be the same order-preserving collation.
+	 */
+	protected indexRangeIsOrderSafe(index: TableIndexSchema, leadingCol: number): boolean {
+		const schema = this.tableSchema!;
+		const K = this.encodeOptions.collation ?? 'NOCASE';
+		const col = schema.columns[leadingCol];
+		const indexCol = index.columns.find(c => c.index === leadingCol);
+		const C = indexCol?.collation ?? col?.collation ?? 'BINARY';
+		return keyOrderMatchesCollation(this.db, col, K, C);
 	}
 
 	/**

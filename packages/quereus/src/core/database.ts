@@ -77,6 +77,21 @@ export interface BuildPlanResult {
 	schemaDependencies: BuildTimeDependencyTracker;
 }
 
+/** Options accepted by {@link Database.registerCollation}'s third argument. */
+export interface RegisterCollationOptions {
+	normalizer?: (s: string) => string;
+	replicable?: boolean;
+	orderPreserving?: boolean;
+}
+
+/** One entry in the per-database collation registry. */
+interface CollationEntry {
+	comparator: CollationFunction;
+	normalizer?: (s: string) => string;
+	replicable?: boolean;
+	orderPreserving?: boolean;
+}
+
 /** Parse a comma-separated schema path string into an array of trimmed, non-empty names. */
 function parseSchemaPath(pathString: string): string[] | undefined {
 	if (!pathString) return undefined;
@@ -124,13 +139,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** Materialized-view schema-change staleness tracking */
 	private readonly materializedViewManager: MaterializedViewManager;
 	/** Per-database collation registry — comparator + optional key normalizer +
-	 *  optional REPLICABLE assertion. The normalizer is required for index
-	 *  participation; comparator-only collations may still be used in ORDER BY but
-	 *  cannot back a compound index. `replicable` (stamped `true` on the built-ins,
+	 *  optional REPLICABLE and ORDER-PRESERVING assertions. The normalizer is required
+	 *  for index participation; comparator-only collations may still be used in ORDER BY
+	 *  but cannot back a compound index. `replicable` (stamped `true` on the built-ins,
 	 *  opt-in for a custom collation) is consulted only by the materialized-view
 	 *  replicable-collation gate when the backing host demands it
-	 *  (see {@link _isCollationReplicable}). */
-	private readonly collations = new Map<string, { comparator: CollationFunction; normalizer?: (s: string) => string; replicable?: boolean }>();
+	 *  (see {@link _isCollationReplicable}). `orderPreserving` (same shape) is consulted
+	 *  by persistent stores before seeking a byte range or advertising byte order as
+	 *  collation order (see {@link _isCollationOrderPreserving}). */
+	private readonly collations = new Map<string, CollationEntry>();
 	/** Lazily-bound {@link getCollationResolver} closure — created once so callers can
 	 *  compare resolver identity, while still reading the live `collations` map. */
 	private collationResolver?: CollationResolver;
@@ -387,9 +404,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// bit-identical across peers' JS engines, exactly parallel to why built-in
 		// functions auto-qualify (see registerBuiltinFunctions). This is the single
 		// seam that *knows* a collation is a builtin.
-		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY, replicable: true });
-		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE, replicable: true });
-		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM,  replicable: true });
+		//
+		// Also stamped `orderPreserving: true`: each built-in comparator compares its
+		// operands' NORMALIZED forms with `<`/`>` (BINARY's normalizer is the identity,
+		// NOCASE's is `toLowerCase()`, RTRIM's an ASCII-space right-trim), which is the
+		// same order a memcmp of those normalized forms produces — see
+		// {@link _isCollationOrderPreserving}.
+		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY, replicable: true, orderPreserving: true });
+		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE, replicable: true, orderPreserving: true });
+		this.collations.set('RTRIM',  { comparator: RTRIM_COLLATION,  normalizer: BUILTIN_NORMALIZERS.RTRIM,  replicable: true, orderPreserving: true });
 		log("Default collations registered (BINARY, NOCASE, RTRIM)");
 	}
 
@@ -1289,7 +1312,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * @param name The name of the collation sequence (case-insensitive).
 	 * @param func The comparison function (a, b) => number (-1, 0, 1).
 	 * @param optionsOrNormalizer Either a bare key normalizer (the legacy positional
-	 *   form) or an options object `{ normalizer?, replicable? }`:
+	 *   form) or an options object `{ normalizer?, replicable?, orderPreserving? }`:
 	 *   - `normalizer` — a function whose output equality partitions strings into the
 	 *     same equivalence classes as `func` (modulo total ordering). Required to make
 	 *     this collation usable as the key for a compound index; ORDER BY / standalone
@@ -1299,6 +1322,16 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *     the materialized-view replicable-collation gate when a backing host declares
 	 *     `requiresReplicableDerivations`. Defaults to `false` — the conservative
 	 *     default for a custom collation (built-ins auto-qualify).
+	 *   - `orderPreserving` — assert the normalizer preserves ORDER, not merely
+	 *     equality: for all strings `x`, `y`,
+	 *     `sign(func(x, y)) === sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`.
+	 *     This is strictly stronger than the equality promise `normalizer` alone makes.
+	 *     Persistent stores physically order rows by the normalized key bytes, so they
+	 *     may only seek a byte range — or advertise byte order as collation order — for
+	 *     a collation carrying this assertion; without it they fall back to a full scan
+	 *     plus a comparator-accurate residual filter (correct, just slower). Defaults to
+	 *     `false` — correctness over speed for a custom collation (built-ins auto-qualify).
+	 *     See {@link _isCollationOrderPreserving}.
 	 * @example
 	 * // Example: Create a custom collation for phone numbers
 	 * db.registerCollation('PHONENUMBER', (a, b) => {
@@ -1310,6 +1343,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *
 	 * // A locale-independent custom collation a replicating backing can host:
 	 * db.registerCollation('CODEPOINT', cmp, { replicable: true });
+	 *
+	 * // A normalizer whose byte order matches its comparator, so store range seeks stay:
+	 * db.registerCollation('NOSPACE', cmp, { normalizer: s => s.replace(/ /g, ''), orderPreserving: true });
 	 *
 	 * // Then use it in SQL:
 	 * // SELECT * FROM contacts ORDER BY phone COLLATE PHONENUMBER;
@@ -1324,10 +1360,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	// supported, invalidate dependent indexes and cached plans here: the collation
 	// dependency `EmissionContext` records only drives an existence check before
 	// execution (`validateCapturedSchemaObjects`), which warns — it does not invalidate.
+	//
+	// NOTE: `orderPreserving` is stated against UTF-8 memcmp of the normalized forms,
+	// but the three built-in comparators use JS `<`/`>`, which is UTF-16 CODE-UNIT order.
+	// The two disagree for astral-plane characters: a surrogate pair (0xD800–0xDFFF) sorts
+	// below U+E000–U+FFFF in UTF-16 and above them in UTF-8. So a store range seek over
+	// text mixing an astral character with a U+E000–U+FFFF character can still mis-window,
+	// even under BINARY. Pre-existing and orthogonal to the assertion; if it ever bites,
+	// the fix is a code-point-order comparator for the built-ins (and a matching caveat
+	// for custom ones), not a weaker assertion here.
 	registerCollation(
 		name: string,
 		func: CollationFunction,
-		optionsOrNormalizer?: ((s: string) => string) | { normalizer?: (s: string) => string; replicable?: boolean },
+		optionsOrNormalizer?: ((s: string) => string) | RegisterCollationOptions,
 	): void {
 		this.checkOpen();
 		if (typeof name !== 'string' || !name) {
@@ -1337,15 +1382,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			throw new MisuseError('registerCollation: func must be a function');
 		}
 		// A function-typed third arg is the legacy normalizer-only path (existing call
-		// sites unchanged, `replicable` defaults to false); an object reads its fields;
-		// any other non-undefined third arg is a misused legacy normalizer.
+		// sites unchanged, `replicable` and `orderPreserving` default to false); an object
+		// reads its fields; any other non-undefined third arg is a misused legacy normalizer.
 		let normalizer: ((s: string) => string) | undefined;
 		let replicable = false;
+		let orderPreserving = false;
 		if (typeof optionsOrNormalizer === 'function') {
 			normalizer = optionsOrNormalizer;
 		} else if (typeof optionsOrNormalizer === 'object' && optionsOrNormalizer !== null) {
 			normalizer = optionsOrNormalizer.normalizer;
 			replicable = optionsOrNormalizer.replicable === true;
+			orderPreserving = optionsOrNormalizer.orderPreserving === true;
 		} else if (optionsOrNormalizer !== undefined) {
 			throw new MisuseError('registerCollation: normalizer must be a function when supplied');
 		}
@@ -1361,13 +1408,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		if (this.collations.has(upperName)) {
 			log('Overwriting existing collation: %s', upperName);
 		}
-		const entry: { comparator: CollationFunction; normalizer?: (s: string) => string; replicable?: boolean } = { comparator: func };
+		const entry: CollationEntry = { comparator: func };
 		if (normalizer !== undefined) entry.normalizer = normalizer;
 		if (replicable) entry.replicable = true;
+		if (orderPreserving) entry.orderPreserving = true;
 		this.collations.set(upperName, entry);
-		log('Registered collation: %s%s%s', upperName,
+		log('Registered collation: %s%s%s%s', upperName,
 			normalizer !== undefined ? ' (with normalizer)' : '',
-			replicable ? ' (replicable)' : '');
+			replicable ? ' (replicable)' : '',
+			orderPreserving ? ' (order-preserving)' : '');
 	}
 
 	/**
@@ -1539,6 +1588,28 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  `requiresReplicableDerivations`. */
 	_isCollationReplicable(name: string): boolean {
 		return this.collations.get(normalizeCollationName(name))?.replicable === true;
+	}
+
+	/** @internal True iff the named collation is asserted ORDER-PRESERVING: for all strings
+	 *  `x`, `y`, `sign(comparator(x, y))` equals
+	 *  `sign(memcmp(utf8(normalizer(x)), utf8(normalizer(y))))`. Strictly stronger than the
+	 *  equality-partition promise a bare normalizer makes — a normalizer may agree with the
+	 *  comparator on equality while disagreeing on order.
+	 *
+	 *  Built-ins are stamped `orderPreserving` at registration; a custom collation opts in
+	 *  with `orderPreserving: true`. An unregistered name, or a comparator-only collation
+	 *  (no normalizer, hence no key bytes at all), returns `false` defensively.
+	 *
+	 *  Consumed by persistent stores, which physically order rows by normalized key bytes:
+	 *  a byte-range seek, or an advertisement that byte order *is* collation order, is sound
+	 *  only under this assertion. Without it the store full-scans and lets its
+	 *  comparator-accurate residual filter decide — slower, never wrong. */
+	_isCollationOrderPreserving(name: string): boolean {
+		const entry = this.collations.get(normalizeCollationName(name));
+		// The assertion is *about* the normalizer, so it is vacuous without one; a
+		// comparator-only collation cannot key a persisted structure anyway (the store
+		// rejects it at DDL time), and answering `true` here would be a trap.
+		return entry?.orderPreserving === true && entry.normalizer !== undefined;
 	}
 
 	public _queueDeferredConstraintRow(baseTable: string, constraintName: string, row: Row, descriptor: RowDescriptor, evaluator: (ctx: RuntimeContext) => OutputValue, connectionId?: string, contextRow?: Row, contextDescriptor?: RowDescriptor): void {
