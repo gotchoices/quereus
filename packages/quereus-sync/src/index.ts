@@ -100,6 +100,54 @@ export {
   DEFAULT_SYNC_CONFIG,
 } from './sync/protocol.js';
 
+// Wire protocol - shared transport/JSON layer (base64 helpers, Serialized* types,
+// codec fns, message envelopes, PROTOCOL_VERSION). Single source of truth for the
+// format the sync client and coordinator exchange.
+export {
+  // Version
+  PROTOCOL_VERSION,
+  // Base64 + HLC transport helpers
+  bytesToBase64,
+  base64ToBytes,
+  serializeHLCForTransport,
+  deserializeHLCFromTransport,
+  // Serialized (JSON-shape) types
+  type SerializedChangeSet,
+  type SerializedChange,
+  type SerializedSchemaMigration,
+  type SerializedSnapshotChunk,
+  type SerializedSnapshotHeaderChunk,
+  type SerializedSnapshotTableStartChunk,
+  type SerializedSnapshotColumnVersionsChunk,
+  type SerializedSnapshotTombstoneChunk,
+  type SerializedSnapshotTableEndChunk,
+  type SerializedSnapshotSchemaMigrationChunk,
+  type SerializedSnapshotFooterChunk,
+  // Codec functions
+  serializeChangeSet,
+  deserializeChangeSet,
+  serializeSnapshotChunk,
+  deserializeSnapshotChunk,
+  // Message unions + per-message interfaces
+  type ClientMessage,
+  type HandshakeMessage,
+  type GetChangesMessage,
+  type ApplyChangesMessage,
+  type GetSnapshotMessage,
+  type ResumeSnapshotMessage,
+  type PingMessage,
+  type ServerMessage,
+  type HandshakeAckMessage,
+  type ChangesMessage,
+  type PushChangesMessage,
+  type ApplyResultMessage,
+  type SnapshotChunkMessage,
+  type SnapshotCompleteMessage,
+  type RequestChangesMessage,
+  type ErrorMessage,
+  type PongMessage,
+} from './sync/wire.js';
+
 // Built-in conflict resolvers
 export {
   lwwResolver,
