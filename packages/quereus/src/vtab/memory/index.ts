@@ -38,8 +38,9 @@ export class MemoryIndex {
 	 * used to sort each entry's `primaryKeys` on read (see {@link getSortedPrimaryKeys}).
 	 * It is per-index — identical for every entry — so it lives here, not duplicated
 	 * per entry. A PK-collation change via `ALTER COLUMN … SET COLLATE` forces a full
-	 * base rebuild (`rebuildAllSecondaryIndexes` / `rebuildPrimaryTreeStrict`),
-	 * recreating entries under the new comparator/encoder — so no stale order or
+	 * base rebuild (`rebuildAllSecondaryIndexes` / `rebuildPrimaryTreeStrict`) and, on
+	 * every layer of an open transaction, `TransactionLayer.rekeyPrimaryKey` — each
+	 * recreating its entries under the new comparator/encoder, so no stale order or
 	 * encoding survives an ALTER.
 	 */
 	private readonly primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number;

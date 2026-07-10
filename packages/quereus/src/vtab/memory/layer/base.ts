@@ -157,6 +157,14 @@ export class BaseLayer implements Layer {
 	 * two rows whose distinct old keys collapse to one under the new comparator
 	 * (e.g. a PK-column collation change BINARY→NOCASE) — throwing CONSTRAINT and
 	 * leaving the live tree intact for the caller's rollback.
+	 *
+	 * `MemoryTableManager.validateRekeyedPrimaryKey` proves these rows collision-free
+	 * before calling, so the throw is an invariant check rather than the enforcement
+	 * path (it is what a caller sees when the base is *not* the whole story — e.g. a
+	 * new call site that forgets the pre-pass).
+	 *
+	 * The tree object is REPLACED, so any layer inheriting the old one must be
+	 * re-pointed at the new one — that is `TransactionLayer.rekeyPrimaryKey`.
 	 */
 	public rebuildPrimaryTreeStrict(): void {
 		const oldTree = this.primaryTree;

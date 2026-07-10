@@ -234,13 +234,37 @@ against them, and its layers cannot be re-pointed at the new schema. `ensureSche
 raises `BUSY` in that case, the same posture as the pre-existing "older transaction versions
 are in use" branch.
 
-Two carve-outs. A collation change on a **primary key** column re-keys the base primary tree
-(`rebuildPrimaryTreeStrict`), which swaps that tree object out from under a pending layer's
-copy-on-write base and invalidates the layer's `pkFunctions`; `adoptSchema` is therefore not
-applied to it, and the case is only correct outside a transaction — see the
-`alter-collate-pk-in-transaction` ticket. And `DROP INDEX` / `DROP CONSTRAINT` inside a
-transaction keep enforcing for the rest of it — `adoptSchema` adds and replaces structures, but
-never removes them; see `tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
+One carve-out remains: `DROP INDEX` / `DROP CONSTRAINT` inside a transaction keep enforcing for
+the rest of it — `adoptSchema` adds and replaces structures, but never removes them; see
+`tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
+
+**3. A collation change on a PRIMARY KEY column obeys a stricter rule, because the primary tree
+is a map.** A secondary index is a multi-map and tolerates two primary keys under one index key,
+so re-keying it can never lose a row. The primary tree cannot: two rows whose keys collapse under
+the new comparator have nowhere to go. And every layer of the chain — the committed base, each
+savepoint snapshot, each statement-boundary layer — physically holds rows that a `ROLLBACK` or
+`ROLLBACK TO SAVEPOINT` must be able to restore, so *none* of them may hold such a pair, not just
+the transaction's effective view. `validateRekeyedPrimaryKey` checks all of them before anything
+is mutated:
+
+*   the **effective view** collides → `CONSTRAINT`; the duplicate is one a `SELECT` in this
+    transaction can see, so the change is simply illegal.
+*   a **layer beneath it** collides → `BUSY`, with the "commit/rollback and retry" message. The
+    duplicate is invisible right now (this transaction deleted it, or a later statement did) but
+    it is still resident and still restorable.
+
+The `BUSY` arm is deliberately conservative: a transaction that has held a colliding pair at
+*any* statement boundary is refused, even when its final view is clean and no savepoint can reach
+the offending layer. Narrowing that would mean re-parenting the view's tree past the unreachable
+layers — the rebase that savepoint snapshots exist to avoid.
+
+When the check passes, `BaseLayer.rebuildPrimaryTreeStrict` re-keys the base and
+`TransactionLayer.rekeyPrimaryKey` (not `adoptSchema`) re-keys each open layer oldest-first:
+`pkFunctions`, the primary tree, and *every* secondary index, since each derives its
+`primaryKeyComparator` / `encode` from the primary key definition. A layer's own writes are
+replayed onto the re-keyed parent by **net effect per key, deletions before upserts** — the raw
+write log cannot be replayed verbatim, because two keys that were distinct in it may now collapse
+into one.
 
 **Rule 1 assumes the transaction commits.** DDL is not undone by `ROLLBACK` or `ROLLBACK TO
 SAVEPOINT` (see `tickets/backlog/feat-ddl-transaction-capability.md`), but the rows it validated

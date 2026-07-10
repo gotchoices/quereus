@@ -685,6 +685,251 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 		});
 	});
 
+	/**
+	 * The primary tree is a map, not a multi-map: it cannot hold two rows whose keys collapse
+	 * under the new comparator, and `rollback` / `rollback to savepoint` must be able to restore
+	 * every row any layer of the chain physically holds. So the contract for a PK-column
+	 * collation change inside a transaction is stricter than for a secondary index:
+	 *
+	 *  - the transaction's effective rows collide  → `CONSTRAINT`
+	 *  - a layer beneath them collides             → `BUSY` ("commit/rollback and retry")
+	 *  - otherwise the new collation is genuinely in force for the rest of the transaction,
+	 *    and after it commits.
+	 */
+	describe('alter column … set collate on a PRIMARY KEY column', () => {
+		const collationOf = (table: string, column: string): string =>
+			getManager(db, table).tableSchema.columns.find(c => c.name === column)?.collation ?? 'BINARY';
+
+		/** First column of every row, in query order. */
+		const values = async (sql: string): Promise<SqlValue[]> => {
+			const out: SqlValue[] = [];
+			for await (const row of db.eval(sql)) out.push(Object.values(row)[0]);
+			return out;
+		};
+
+		it('governs the rest of the transaction — a later colliding insert is rejected', async () => {
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('a')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			await expectError(
+				() => db.exec(`insert into t values ('A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`commit`);
+			expect(await values(`select v from t`)).to.deep.equal(['a']);
+		});
+
+		it('survives commit — a colliding insert after commit is rejected', async () => {
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('a')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`commit`);
+
+			await expectError(
+				() => db.exec(`insert into t values ('A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			expect(await rowCount(db, 't')).to.equal(1);
+		});
+
+		it('rejects a duplicate that only exists in the pending layer', async () => {
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('a')`);
+			await db.exec(`insert into t values ('A')`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+
+			// The rejection mutated nothing: still BINARY, still comparing under it.
+			expect(collationOf('t', 'v')).to.equal('BINARY');
+			await db.exec(`commit`);
+			expect(await values(`select v from t order by v`)).to.deep.equal(['A', 'a']);
+		});
+
+		it('raises BUSY for a committed duplicate the transaction has deleted', async () => {
+			// The effective rows are collision-free, so the change is not illegal — but the base
+			// tree still physically holds both rows, and a rollback has to restore them.
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`insert into t values ('a'), ('A')`);
+			await db.exec(`begin`);
+			await db.exec(`delete from t where v = 'A'`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.BUSY,
+				/primary key column.*Commit\/rollback and retry/is,
+			);
+
+			// Rollback restores both rows, still under the original collation.
+			await db.exec(`rollback`);
+			expect(collationOf('t', 'v')).to.equal('BINARY');
+			expect(await values(`select v from t order by v`)).to.deep.equal(['A', 'a']);
+		});
+
+		it('raises BUSY for a collision held only at an earlier statement boundary', async () => {
+			// Net effect is collision-free ('A' alone), but the layer left behind by the second
+			// insert holds both rows and is the copy-on-write base the view reads through.
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('a')`);
+			await db.exec(`insert into t values ('A')`);
+			await db.exec(`delete from t where v = 'a'`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.BUSY,
+				/primary key column/i,
+			);
+
+			// The transaction survives the rejection and still compares under BINARY.
+			await db.exec(`insert into t values ('a')`);
+			await db.exec(`commit`);
+			expect(await values(`select v from t order by v`)).to.deep.equal(['A', 'a']);
+		});
+
+		it('raises BUSY for a duplicate held only in an eager savepoint snapshot', async () => {
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('a'), ('A')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`delete from t where v = 'A'`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.BUSY,
+				/primary key column/i,
+			);
+			await db.exec(`rollback`);
+			expect(await rowCount(db, 't')).to.equal(0);
+		});
+
+		it('after rollback to savepoint the new collation is still enforced', async () => {
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('a')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`insert into t values ('b')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`rollback to s`);
+
+			// The restored snapshot was re-keyed too: row 'a' survives, under NOCASE.
+			expect(await values(`select v from t`)).to.deep.equal(['a']);
+			await expectError(
+				() => db.exec(`insert into t values ('A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`insert into t values ('B')`);
+			await db.exec(`commit`);
+			expect(await rowCount(db, 't')).to.equal(2);
+		});
+
+		it('rollback restores the pre-transaction rows; the surviving collation still enforces', async () => {
+			await db.exec(`create table t (v text primary key)`);
+			await db.exec(`insert into t values ('a'), ('b')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('c')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`rollback`);
+
+			expect(await values(`select v from t order by v`)).to.deep.equal(['a', 'b']);
+			// DDL is not undone by ROLLBACK (see feat-ddl-transaction-capability), so the
+			// re-keyed committed base must still enforce NOCASE.
+			expect(collationOf('t', 'v')).to.equal('NOCASE');
+			await expectError(
+				() => db.exec(`insert into t values ('A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+		});
+
+		it('re-keys a row the transaction moved onto the colliding key', async () => {
+			// `update t set v='A' where v='a'` deletes the old PK and upserts the new one in one
+			// layer; under NOCASE those two keys collapse, so the re-key replay must apply the
+			// deletion before the upsert or the surviving row is lost.
+			await db.exec(`create table t (v text primary key, w text)`);
+			await db.exec(`insert into t values ('a', 'x')`);
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'A' where v = 'a'`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			expect(await values(`select w from t`)).to.deep.equal(['x']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t`)).to.deep.equal(['A']);
+			expect(await values(`select w from t where v = 'a'`)).to.deep.equal(['x']);
+		});
+
+		it('does not double-index a row whose old and new primary keys collapse', async () => {
+			// One layer, two own-writes: `update` records a delete of PK 'a' and an upsert of PK
+			// 'A', and moves the row's index key from 'x' to 'y'. Under NOCASE the two PKs are
+			// one key, so reading each touched key back out of the layer's own tree (what
+			// `reindexOwnWrites` does) resolves the DELETED key to the SURVIVING row and files it
+			// in the index under both primary keys — the row then comes back twice from an index
+			// scan. `reindexNetWrites` drives from the net effect instead.
+			await db.exec(`create table t (v text primary key, w text)`);
+			await db.exec(`create index tw on t (w)`);
+			await db.exec(`insert into t values ('a', 'x')`);
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'A', w = 'y' where v = 'a'`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			expect(await values(`select v from t where w = 'y'`)).to.deep.equal(['A']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t where w = 'y'`)).to.deep.equal(['A']);
+			expect(await values(`select v from t where w = 'x'`)).to.deep.equal([]);
+		});
+
+		it('re-keys the inherited secondary indexes of every open layer', async () => {
+			// Each index derives its primaryKeyComparator/encode from the PK definition, so all
+			// of them are rebuilt — including `tw`, which the altered column does not appear in.
+			await db.exec(`create table t (v text primary key, w text)`);
+			await db.exec(`create unique index tw on t (w)`);
+			await db.exec(`insert into t values ('a', 'x')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('b', 'y')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			await expectError(
+				() => db.exec(`insert into t values ('c', 'y')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			expect(await values(`select v from t where w = 'y'`)).to.deep.equal(['b']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t where w = 'x'`)).to.deep.equal(['a']);
+			await expectError(
+				() => db.exec(`insert into t values ('A', 'z')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+		});
+
+		it('re-keys a composite primary key on its second column', async () => {
+			await db.exec(`create table t (a integer, v text, primary key (a, v))`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'x')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			await expectError(
+				() => db.exec(`insert into t values (1, 'X')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`insert into t values (2, 'X')`);
+			await db.exec(`commit`);
+			expect(await values(`select a from t order by a`)).to.deep.equal([1, 2]);
+		});
+	});
+
 	describe('other connections', () => {
 		it('raises BUSY when a sibling connection holds uncommitted writes', async () => {
 			await db.exec(`create table t (id integer primary key, v text)`);

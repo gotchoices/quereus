@@ -55,21 +55,21 @@ export class TransactionLayer implements Layer {
 	 */
 	public readonly collationResolver: CollationResolver;
 	/**
-	 * Schema when this layer was started. Replaced only by {@link adoptSchema}, when
-	 * index/constraint DDL — additive, or a secondary-index re-key from `alter column …
-	 * set collate` — runs inside this layer's own transaction. The primary key definition
-	 * and column set are identical across every such swap, so {@link pkFunctions} and the
-	 * primary tree stay valid.
+	 * Schema when this layer was started. Replaced when DDL runs inside this layer's own
+	 * transaction: by {@link adoptSchema} for additive index/constraint DDL and for a
+	 * secondary-index re-key from `alter column … set collate`, and by
+	 * {@link rekeyPrimaryKey} when that collate change lands on a primary-key column.
+	 * The column set is identical across every such swap.
 	 */
 	private tableSchemaAtCreation: TableSchema;
 
 	/**
-	 * Built once from {@link tableSchemaAtCreation}'s primary key definition (which
-	 * never changes for a layer), so the primary tree, every inherited secondary index,
-	 * and every scan share one comparator/encoder set — and one pass of collation
-	 * resolution.
+	 * Derived from {@link tableSchemaAtCreation}'s primary key definition, so the primary
+	 * tree, every inherited secondary index, and every scan share one comparator/encoder
+	 * set — and one pass of collation resolution. Rebuilt only by {@link rekeyPrimaryKey},
+	 * which rebuilds the structures keyed by them in the same call.
 	 */
-	private readonly pkFunctions: PrimaryKeyFunctions;
+	private pkFunctions: PrimaryKeyFunctions;
 
 	// Primary modifications BTree that inherits from parent
 	private primaryModifications: BTree<BTreeKeyForPrimary, Row>;
@@ -179,10 +179,9 @@ export class TransactionLayer implements Layer {
 	 * copy-on-write, exactly as {@link initializeSecondaryIndexes} does at construction.
 	 *
 	 * Never applied to a column-set or primary-key change: either would invalidate
-	 * {@link pkFunctions} and the primary tree. `MemoryTableManager.alterColumn` keeps a
-	 * PK-column collation change off this path (see `alter-collate-pk-in-transaction`), and
-	 * `ensureSchemaChangeSafety` raises BUSY when any connection other than the DDL issuer
-	 * holds a pending layer.
+	 * {@link pkFunctions} and the primary tree. A PK-column collation change goes to
+	 * {@link rekeyPrimaryKey} instead, and `ensureSchemaChangeSafety` raises BUSY when any
+	 * connection other than the DDL issuer holds a pending layer.
 	 */
 	public adoptSchema(newSchema: TableSchema): void {
 		const oldSchema = this.tableSchemaAtCreation;
@@ -205,6 +204,125 @@ export class TransactionLayer implements Layer {
 			);
 			this.reindexOwnWrites(memoryIndex);
 			this.secondaryIndexes.set(indexSchema.name, memoryIndex);
+		}
+	}
+
+	/**
+	 * Adopts a schema change that re-keys the PRIMARY KEY — `alter column … set collate` on a
+	 * PK column — applied while THIS layer's transaction is still open. Rebuilds
+	 * {@link pkFunctions}, the primary tree, and every secondary index (each of which derives
+	 * its `primaryKeyComparator` / `encode` from the PK definition), so nothing this layer owns
+	 * survives the ALTER still keyed under the old collation.
+	 *
+	 * Like {@link adoptSchema}, the caller MUST apply this to a whole parent chain oldest-first
+	 * (base layer already re-keyed): the new tree inherits copy-on-write from the parent's new
+	 * one, so the parent's must already exist.
+	 *
+	 * ### Why the replay is by NET effect, deletes before upserts
+	 *
+	 * {@link ownWrites} is an ordered log that may touch one key repeatedly, and under the new
+	 * comparator two keys that were distinct in that log can collapse into one. Replaying it
+	 * verbatim would therefore let a later write land on an earlier write's row, or a deletion
+	 * remove a row a subsequent upsert had already placed. Instead each key the layer touched
+	 * contributes its NET effect — the layer's effective row, or a deletion — read out of the
+	 * pre-rekey tree, with deletions applied before upserts so a deleted key that now equals an
+	 * upserted key cannot take the surviving row with it.
+	 *
+	 * Soundness rests on a precondition `MemoryTableManager.validateRekeyedPrimaryKey` enforces
+	 * before any of this runs: NO layer in the chain — base included — holds two rows that
+	 * collide under the new comparator. Given that, every key here resolves to at most one row
+	 * in the parent, so a deletion removes exactly the row this layer removed and an upsert
+	 * lands at exactly one key.
+	 */
+	public rekeyPrimaryKey(newSchema: TableSchema): void {
+		const preRekeyTree = this.primaryModifications;
+		const preRekeyEncode = this.pkFunctions.encode;
+
+		this.tableSchemaAtCreation = newSchema;
+		this.pkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
+
+		const { extractFromRow, compare } = this.pkFunctions;
+		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
+		const rekeyed = new BTree<BTreeKeyForPrimary, Row>(
+			(value: Row): BTreeKeyForPrimary => extractFromRow(value),
+			compare,
+			{ base: parentPrimaryTree || undefined },
+		);
+
+		// Net per-key effect of this layer's own writes, read out of the pre-rekey tree
+		// (`get` traverses the inheritance chain, so it yields the layer's EFFECTIVE row).
+		const deletions: BTreeKeyForPrimary[] = [];
+		const upserts: Row[] = [];
+		const seen = new Set<string>();
+		for (const write of this.ownWrites) {
+			const encoded = preRekeyEncode(write.primaryKey);
+			if (seen.has(encoded)) continue;
+			seen.add(encoded);
+
+			const effectiveRow = preRekeyTree.get(write.primaryKey);
+			if (effectiveRow === undefined) deletions.push(write.primaryKey);
+			else upserts.push(effectiveRow);
+		}
+
+		for (const primaryKey of deletions) {
+			const path = rekeyed.find(primaryKey);
+			if (path.on) rekeyed.deleteAt(path);
+		}
+		for (const row of upserts) {
+			rekeyed.upsert(row);
+		}
+		this.primaryModifications = rekeyed;
+
+		// Every secondary index's key encoding and PK bookkeeping derive from `pkFunctions`,
+		// and each inherits the parent's freshly-rebuilt tree — so all of them are rebuilt,
+		// including ones the altered column does not appear in.
+		this.secondaryIndexes = new Map();
+		this.initializeSecondaryIndexes();
+		for (const index of this.secondaryIndexes.values()) {
+			this.reindexNetWrites(index, deletions, upserts);
+		}
+	}
+
+	/**
+	 * {@link reindexOwnWrites} for a re-keyed primary: brings a newly-inherited `MemoryIndex`
+	 * up to date with this layer's NET writes, as computed by {@link rekeyPrimaryKey}.
+	 *
+	 * Cannot reuse `reindexOwnWrites`, which reads each touched key back out of this layer's
+	 * primary tree. Under the NEW comparator a key this layer DELETED can resolve to a
+	 * different row this layer upserted (`delete 'a'; insert 'A'` under NOCASE), so that
+	 * read-back would index the surviving row under the deleted row's primary key. Driving
+	 * from the net lists — which were computed against the pre-rekey tree — avoids the
+	 * ambiguity entirely.
+	 */
+	private reindexNetWrites(index: MemoryIndex, deletions: readonly BTreeKeyForPrimary[], upserts: readonly Row[]): void {
+		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
+		const droppedParentEntries = new Set<string>();
+
+		// The parent's index already covers the parent's row at this key; drop that entry so
+		// this layer's deletion/replacement is not shadowed by it. A deleted key and an
+		// upserted key can resolve to the SAME parent row under the new comparator, hence the
+		// dedup set (and `removeEntry` is itself a no-op when the entry is already gone).
+		const dropParentEntry = (primaryKey: BTreeKeyForPrimary): void => {
+			const parentRow = parentPrimaryTree?.get(primaryKey);
+			if (parentRow === undefined) return;
+			const parentPrimaryKey = this.pkFunctions.extractFromRow(parentRow);
+			const encoded = this.pkFunctions.encode(parentPrimaryKey);
+			if (droppedParentEntries.has(encoded)) return;
+			droppedParentEntries.add(encoded);
+			if (index.rowMatchesPredicate(parentRow)) {
+				index.removeEntry(index.keyFromRow(parentRow), parentPrimaryKey);
+			}
+		};
+
+		for (const primaryKey of deletions) {
+			dropParentEntry(primaryKey);
+		}
+		for (const row of upserts) {
+			const primaryKey = this.pkFunctions.extractFromRow(row);
+			dropParentEntry(primaryKey);
+			if (index.rowMatchesPredicate(row)) {
+				index.addEntry(index.keyFromRow(row), primaryKey);
+			}
 		}
 	}
 

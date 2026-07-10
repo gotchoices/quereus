@@ -1970,6 +1970,8 @@ export class MemoryTableManager {
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
+		/** The base primary tree `rebuildPrimaryTreeStrict` replaced, for the catch's rollback. */
+		let basePrimaryTreeBeforeRekey: BTree<BTreeKeyForPrimary, Row> | null = null;
 		try {
 			await this.ensureSchemaChangeSafety();
 
@@ -2111,8 +2113,13 @@ export class MemoryTableManager {
 			// the transaction inserted that collides under the NEW collation must reject the
 			// change, and one it has deleted must not block it. A throw here leaves the schema,
 			// the base layer and the index map exactly as they were.
+			//
+			// The primary key gets a stricter pre-pass (`validateRekeyedPrimaryKey`): no layer in
+			// the chain, base included, may hold a collision. That is what lets every step below
+			// succeed unconditionally, and what `TransactionLayer.rekeyPrimaryKey` relies on.
 			if (collationChanged) {
 				this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex);
+				if (pkColumnRekeyed) this.validateRekeyedPrimaryKey(finalNewTableSchema);
 			}
 
 			this.baseLayer.updateSchema(finalNewTableSchema);
@@ -2120,12 +2127,14 @@ export class MemoryTableManager {
 			// A collation change re-sorts the structures that order by the column. The
 			// secondary rebuild is NON-enforcing (the pre-pass above owns uniqueness, and the
 			// base's rows are not a subset of the effective rows); the primary tree rebuild is
-			// strict, since a PK collision cannot be represented at all and the base tree IS
-			// the whole PK row set. It runs LAST so its throw leaves the live tree intact for
-			// the catch's rollback.
+			// strict, since a PK collision cannot be represented at all — the pre-pass has
+			// already proved the base collision-free, so the strict rebuild is a live invariant
+			// check, not the enforcement path. It runs LAST so its throw leaves the live tree
+			// intact for the catch's rollback.
 			if (collationChanged) {
 				this.baseLayer.rebuildAllSecondaryIndexes();
 				if (pkColumnRekeyed) {
+					basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
 					this.baseLayer.rebuildPrimaryTreeStrict();
 				}
 			}
@@ -2139,13 +2148,13 @@ export class MemoryTableManager {
 			// everything after the pending layer becomes the committed head at commit — keeps
 			// comparing under the old collation.
 			//
-			// A PK-column re-key is carved out: `rebuildPrimaryTreeStrict` swaps the base
-			// primary tree object out from under a pending layer's copy-on-write base, and
-			// `adoptSchema` may not rebuild `pkFunctions`. Tracked in
-			// `alter-collate-pk-in-transaction`; outside a transaction there are no open layers
-			// and the carve-out is a no-op.
-			if (collationChanged && !pkColumnRekeyed) {
-				this.adoptSchemaOnOpenLayers(finalNewTableSchema);
+			// When the altered column is part of the primary key, `rebuildPrimaryTreeStrict` also
+			// swapped the base primary tree object out from under those layers' copy-on-write
+			// bases and invalidated their `pkFunctions`; `rekeyPrimaryKey` rebuilds both, plus
+			// every secondary index (each derives its PK comparator/encoder from the PK
+			// definition). Outside a transaction there are no open layers and both are no-ops.
+			if (collationChanged) {
+				this.adoptSchemaOnOpenLayers(finalNewTableSchema, pkColumnRekeyed);
 			}
 
 			this.eventEmitter?.emitSchemaChange?.({
@@ -2158,19 +2167,20 @@ export class MemoryTableManager {
 
 			logger.operation('Alter Column', this._tableName, { columnName: change.columnName });
 		} catch (e: unknown) {
-			// Restore the prior schema, then re-key the secondary indexes back to it. The
-			// uniqueness pre-pass now runs before any mutation, so the only throw that can
-			// reach here with re-keyed structures in place is `rebuildPrimaryTreeStrict`'s
-			// PK collision. The primary tree is only swapped on full success, so it is
-			// already the original.
+			// Restore the prior schema and primary tree, then re-key the secondary indexes back
+			// to it. Both pre-passes now run before any mutation, so nothing below `updateSchema`
+			// is expected to throw; the restores are the safety net for an unexpected one (and
+			// for `rebuildPrimaryTreeStrict`'s invariant check, whose precondition
+			// `validateRekeyedPrimaryKey` has already established).
 			//
-			// NOTE: a throw from the pre-pass (or from `setNotNull`'s NULL scan) mutated
-			// nothing, so this rebuild only swaps the base's index trees for fresh,
-			// content-identical ones — an O(rows) cost on a pure rejection. Harmless (a
-			// pending layer keeps reading its orphaned but content-correct copy-on-write
-			// base), but if a rejected ALTER on a large table ever shows up as slow, gate
-			// the rebuild on a "mutation started" flag set just before `updateSchema`.
+			// NOTE: a throw from a pre-pass (or from `setNotNull`'s NULL scan) mutated nothing,
+			// so this rebuild only swaps the base's index trees for fresh, content-identical
+			// ones — an O(rows) cost on a pure rejection. Harmless (a pending layer keeps
+			// reading its orphaned but content-correct copy-on-write base), but if a rejected
+			// ALTER on a large table ever shows up as slow, gate the rebuild on a "mutation
+			// started" flag set just before `updateSchema`.
 			this.baseLayer.updateSchema(originalManagerSchema);
+			if (basePrimaryTreeBeforeRekey) this.baseLayer.primaryTree = basePrimaryTreeBeforeRekey;
 			this.baseLayer.rebuildAllSecondaryIndexes();
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
@@ -2872,7 +2882,93 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Propagates a schema change — a new index and/or UNIQUE constraint, or a set of indexes
+	 * PRIMARY KEY arm of the `alter column … set collate` pre-pass. Runs before anything is
+	 * mutated, so a rejection leaves the table, the schema and the transaction untouched.
+	 *
+	 * The primary tree is a map, not a multi-map, so — unlike a secondary index — it cannot
+	 * physically hold two rows whose keys collapse under the new comparator. Every layer the
+	 * DDL connection still reads through therefore has to be collision-free, not just the
+	 * transaction's effective view:
+	 *
+	 *  1. **The effective view collides** → `CONSTRAINT`. The duplicate is visible to a `select`
+	 *     in this transaction; the change is simply illegal.
+	 *  2. **A layer beneath it collides** → `BUSY`. Those rows are not visible now, but every
+	 *     such layer is the copy-on-write base the view reads through, and one of them may be a
+	 *     savepoint snapshot a `rollback to savepoint` must restore. A re-keyed tree could not
+	 *     represent the pair at all. Committing (or rolling back) settles the transaction and
+	 *     the ALTER can be retried — the same "commit/rollback and retry" posture as
+	 *     {@link ensureSchemaChangeSafety}.
+	 *
+	 * Case 2 is deliberately conservative. The chain holds one immutable layer per statement
+	 * boundary (see `MemoryTableConnection.createSavepoint`'s eager path), so it rejects any
+	 * transaction that has held a colliding pair at ANY statement boundary — even one whose
+	 * final view is clean and whose intermediate layer no savepoint can reach. Narrowing that
+	 * would mean re-parenting the view's tree past the unreachable layers, which is exactly the
+	 * rebase that savepoint snapshots exist to avoid. The tradeoff is a rare false BUSY on a
+	 * statement sequence the user can retry after committing, versus losing a row on rollback.
+	 *
+	 * This precondition is also what makes `TransactionLayer.rekeyPrimaryKey`'s replay sound:
+	 * with no collisions anywhere in the chain, every primary key resolves to at most one row
+	 * in each layer under the new comparator.
+	 */
+	private validateRekeyedPrimaryKey(newSchema: TableSchema): void {
+		const newPkFunctions = createPrimaryKeyFunctions(newSchema, this.collationResolver);
+		const connection = this.ddlConnection();
+		const view: Layer = connection
+			? (connection.pendingTransactionLayer ?? connection.readLayer)
+			: this.baseLayer;
+
+		this.assertNoPrimaryKeyCollision(
+			view,
+			newPkFunctions,
+			StatusCode.CONSTRAINT,
+			`UNIQUE constraint failed: ${this._tableName} primary key collides under new collation`,
+		);
+
+		// `ensureSchemaChangeSafety` has already drained every committed layer into the base and
+		// rejected sibling connections with open work, so the chain below the view holds only
+		// this transaction's own layers.
+		for (let layer: Layer | null = view.getParent(); layer; layer = layer.getParent()) {
+			this.assertNoPrimaryKeyCollision(
+				layer,
+				newPkFunctions,
+				StatusCode.BUSY,
+				`Cannot change the collation of a primary key column of table ${this._tableName}: `
+				+ `rows this transaction has removed still collide under the new collation and must survive a rollback. `
+				+ `Commit/rollback and retry.`,
+			);
+		}
+	}
+
+	/**
+	 * Raises `code` when two of `layer`'s rows share a primary key under `pkFunctions`.
+	 *
+	 * NOTE: O(rows) per layer, so O(layers × rows) for a whole chain — one more full pass than
+	 * the base rebuild the caller is about to do anyway. Fine for a statement this rare; if a
+	 * deep savepoint stack over a large table ever makes an ALTER slow, note that a layer's rows
+	 * differ from its parent's only at the keys it wrote, so the walk can be narrowed to those.
+	 */
+	private assertNoPrimaryKeyCollision(
+		layer: Layer,
+		pkFunctions: PrimaryKeyFunctions,
+		code: StatusCode,
+		message: string,
+	): void {
+		const tree = layer.getModificationTree('primary');
+		if (!tree) return;
+		const probe = new BTree<BTreeKeyForPrimary, Row>(
+			(row: Row): BTreeKeyForPrimary => pkFunctions.extractFromRow(row),
+			pkFunctions.compare,
+		);
+		for (const row of iteratePrimaryRows(tree)) {
+			const key = pkFunctions.extractFromRow(row);
+			if (probe.get(key) !== undefined) throw new QuereusError(message, code);
+			probe.insert(row);
+		}
+	}
+
+	/**
+	 * Propagates a schema change — a new index and/or UNIQUE constraint, or a set of structures
 	 * re-keyed by `alter column … set collate` — into every {@link TransactionLayer} the DDL
 	 * connection's open transaction still reads through: its pending layer and every savepoint
 	 * snapshot below it, which are exactly the transaction layers on the view layer's parent
@@ -2882,10 +2978,15 @@ export class MemoryTableManager {
 	 * for the rest of its life, a `rollback to savepoint` would restore a stale-schema layer,
 	 * and at commit the pending layer would become the committed head carrying its stale schema
 	 * and structures — shadowing the base's rebuilt ones. Rebasing would achieve the same but
-	 * invalidate those snapshots. Applied oldest-first: {@link TransactionLayer.adoptSchema}
-	 * inherits its parent's tree for each index.
+	 * invalidate those snapshots. Applied oldest-first: both
+	 * {@link TransactionLayer.adoptSchema} and {@link TransactionLayer.rekeyPrimaryKey} inherit
+	 * their parent's already-rebuilt trees.
+	 *
+	 * `rekeyPrimary` selects the heavier path, for the one change that invalidates a layer's
+	 * primary key functions and every structure derived from them: a collation change on a
+	 * primary key column.
 	 */
-	private adoptSchemaOnOpenLayers(newSchema: TableSchema): void {
+	private adoptSchemaOnOpenLayers(newSchema: TableSchema, rekeyPrimary = false): void {
 		const connection = this.ddlConnection();
 		if (!connection) return;
 
@@ -2902,7 +3003,8 @@ export class MemoryTableManager {
 			if (cur instanceof TransactionLayer) chain.push(cur);
 		}
 		for (let i = chain.length - 1; i >= 0; i--) {
-			chain[i].adoptSchema(newSchema);
+			if (rekeyPrimary) chain[i].rekeyPrimaryKey(newSchema);
+			else chain[i].adoptSchema(newSchema);
 		}
 	}
 
