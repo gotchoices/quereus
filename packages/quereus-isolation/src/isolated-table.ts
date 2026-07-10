@@ -1,4 +1,4 @@
-import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
+import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath } from '@quereus/quereus';
 import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey, logicalTypeCanHoldText, retargetFilterInfoIndex, PRIMARY_INDEX_NAME } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
@@ -563,6 +563,15 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					`A module that names an index anything other than '_primary_' or a schema index ` +
 					`must return an 'indexDescriptor' from getBestAccessPlan (see docs/module-authoring.md).`,
 					StatusCode.INTERNAL);
+			default: {
+				// A new AccessPath kind must extend this switch; never-assignment makes that a
+				// compile error rather than a silent `undefined` return that would crash at the
+				// `indexInfo.type` read in mergedQuery (noImplicitReturns is off in this package).
+				const _exhaustive: never = path;
+				throw new QuereusError(
+					`IsolatedTable '${this.tableName}': unhandled accessPath kind '${(path as AccessPath).kind}'`,
+					StatusCode.INTERNAL);
+			}
 		}
 	}
 
