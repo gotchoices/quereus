@@ -1107,15 +1107,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Validates the existing rows in `dataStore` against a UNIQUE constraint,
-	 * throwing `CONSTRAINT` on the first duplicate before any schema mutation.
-	 * Used by `ADD CONSTRAINT UNIQUE` (validate against the current collation) and
-	 * by `SET COLLATE` (pass an `updatedSchema` whose altered column carries the
+	 * Validates the rows in `entries` against a UNIQUE constraint, throwing
+	 * `CONSTRAINT` on the first duplicate before any schema mutation. Used by
+	 * `ADD CONSTRAINT UNIQUE` (validate against the current collation) and by
+	 * `SET COLLATE` (pass an `updatedSchema` whose altered column carries the
 	 * NEW collation, so the dedup is performed under it). Mirrors the duplicate
 	 * detection in {@link buildIndexEntries}: a `seen` Set keyed on a per-column
 	 * collation-aware signature of the constrained values, with SQL NULL semantics
 	 * (a row with any NULL constrained value never counts as a duplicate) and the
 	 * partial `predicate` honored.
+	 *
+	 * `entries` MUST be the table's EFFECTIVE stream (committed rows merged with
+	 * the open transaction's own pending puts/deletes — see
+	 * `StoreTable.iterateEffectiveEntries`), mirroring `buildIndexEntries`'s
+	 * identical parameterization. A committed-only stream would let a duplicate
+	 * inserted earlier in the same transaction slip past validation and land in
+	 * the table once the transaction commits.
 	 *
 	 * No index store is written — store UNIQUE enforcement is a full-scan over
 	 * `uniqueConstraints` at write time. The signature is built by
@@ -1128,7 +1135,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * identity normalizer and so never raise.
 	 */
 	private async validateUniqueOverExistingRows(
-		dataStore: KVStore,
+		entries: AsyncIterable<KVEntry>,
 		tableSchema: TableSchema,
 		uc: UniqueConstraintSchema,
 		keyNormalizers: KeyNormalizerResolver,
@@ -1142,7 +1149,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		});
 		const seen = new Set<string>();
 
-		for await (const entry of dataStore.iterate(buildFullScanBounds())) {
+		for await (const entry of entries) {
 			const row = deserializeRow(entry.value);
 
 			// Partial constraint: only rows the predicate unambiguously accepts count.
@@ -1446,8 +1453,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// (no separate index store), so there is nothing physical to build —
 					// but we must validate the existing rows before persisting.
 					const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
-					const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
-					await this.validateUniqueOverExistingRows(dataStore, oldSchema, uc, db.getKeyNormalizerResolver());
+					await this.validateUniqueOverExistingRows(
+						table.iterateEffectiveEntries(buildFullScanBounds()),
+						oldSchema,
+						uc,
+						db.getKeyNormalizerResolver(),
+					);
 					updatedSchema = {
 						...oldSchema,
 						uniqueConstraints: Object.freeze([...(oldSchema.uniqueConstraints ?? []), uc]),
@@ -1699,9 +1710,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 						.filter(uc => uc.columns.includes(colIndex));
 					if (coveringConstraints.length > 0) {
-						const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
 						for (const uc of coveringConstraints) {
-							await this.validateUniqueOverExistingRows(dataStore, updatedSchema, uc, db.getKeyNormalizerResolver());
+							await this.validateUniqueOverExistingRows(
+								table.iterateEffectiveEntries(buildFullScanBounds()),
+								updatedSchema,
+								uc,
+								db.getKeyNormalizerResolver(),
+							);
 						}
 					}
 				}

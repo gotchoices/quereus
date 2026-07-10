@@ -911,4 +911,55 @@ describe('StoreTable UNIQUE constraints', () => {
 			});
 		});
 	});
+
+	// ADD CONSTRAINT UNIQUE and the SET COLLATE non-PK re-validation both scan
+	// existing rows before accepting the schema change (validateUniqueOverExistingRows).
+	// That scan must see the table's EFFECTIVE row stream — committed rows merged
+	// with THIS transaction's own pending puts — or a duplicate written earlier in
+	// the same open transaction survives the ALTER
+	// (bug-store-add-constraint-unique-ignores-pending-rows).
+	describe('ADD CONSTRAINT UNIQUE / SET COLLATE validate pending rows', () => {
+		async function rejects(sql: string): Promise<void> {
+			let err: Error | null = null;
+			try { await db.exec(sql); } catch (e) { err = e as Error; }
+			expect(err, `expected "${sql}" to be rejected`).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+		}
+
+		it('ADD CONSTRAINT UNIQUE rejects when a pending duplicate is still uncommitted', async () => {
+			await db.exec(`CREATE TABLE ac1 (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`begin`);
+			await db.exec(`INSERT INTO ac1 VALUES (1, 'a'), (2, 'a')`);
+			await rejects(`ALTER TABLE ac1 ADD CONSTRAINT u UNIQUE (v)`);
+			await db.exec(`rollback`);
+		});
+
+		it('ADD CONSTRAINT UNIQUE with non-colliding pending rows is accepted and then enforced', async () => {
+			await db.exec(`CREATE TABLE ac2 (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`begin`);
+			await db.exec(`INSERT INTO ac2 VALUES (1, 'a'), (2, 'b')`);
+			await db.exec(`ALTER TABLE ac2 ADD CONSTRAINT u UNIQUE (v)`);
+			await rejects(`INSERT INTO ac2 VALUES (3, 'a')`);
+			await db.exec(`commit`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ac2`)).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('SET COLLATE NOCASE rejects when pending rows collide under the new collation', async () => {
+			await db.exec(`CREATE TABLE sc1 (id INTEGER PRIMARY KEY, v TEXT, CONSTRAINT u UNIQUE (v)) USING store`);
+			await db.exec(`begin`);
+			await db.exec(`INSERT INTO sc1 VALUES (1, 'a'), (2, 'A')`);
+			await rejects(`ALTER TABLE sc1 ALTER COLUMN v SET COLLATE NOCASE`);
+			await db.exec(`rollback`);
+		});
+
+		it('SET COLLATE NOCASE with non-colliding pending rows revalidates and keeps enforcing', async () => {
+			await db.exec(`CREATE TABLE sc2 (id INTEGER PRIMARY KEY, v TEXT, CONSTRAINT u UNIQUE (v)) USING store`);
+			await db.exec(`begin`);
+			await db.exec(`INSERT INTO sc2 VALUES (1, 'a'), (2, 'b')`);
+			await db.exec(`ALTER TABLE sc2 ALTER COLUMN v SET COLLATE NOCASE`);
+			await rejects(`INSERT INTO sc2 VALUES (3, 'A')`);
+			await db.exec(`commit`);
+			expect(await collect(db, `SELECT count(*) AS n FROM sc2`)).to.deep.equal([{ n: 2 }]);
+		});
+	});
 });
