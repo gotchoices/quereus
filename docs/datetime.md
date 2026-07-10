@@ -1,5 +1,7 @@
 # Date and Time Handling in Quereus
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 ## SQL Date/Time Functions
 
 The built-in SQL functions (`date`, `time`, `datetime`, `julianday`, `strftime`) are analogues to SQLite's functions. The `epoch_s`, `epoch_ms`, and `epoch_s_frac` functions provide first-class Unix epoch support.

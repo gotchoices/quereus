@@ -1,5 +1,7 @@
 ﻿# Sync Module - Multi-Master CRDT Replication
 
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
 This document describes the architecture for `quereus-sync`, a fully automatic multi-master CRDT replication system for Quereus. It enables offline-first applications where multiple replicas can independently modify data and converge to a consistent state.
 
 ## Design Goals

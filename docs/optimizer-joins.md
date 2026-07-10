@@ -1,5 +1,7 @@
 # Optimizer Joins
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 Join ordering, physical join algorithm selection, the fan-out lookup join, and the
 keys a join propagates. The rule catalog entries these sections expand on live in
 [Optimizer Rules](optimizer-rules.md); the runtime contracts for the physical nodes

@@ -1,5 +1,7 @@
 # Quereus SQL Reference Guide
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 ## 1. Introduction
 
 Quereus is a lightweight, TypeScript-native SQL engine inspired by SQLite, with a focus on in-memory data processing and extensibility via the virtual table (VTab) interface. It supports a rich subset of SQL for querying, manipulating, and joining data from virtual tables, with async operations and modern JavaScript/TypeScript idioms. Quereus is designed for use in Node.js, browsers, and other JS environments, and does not provide persistent file storage by default.
@@ -100,6 +102,8 @@ binding-site nor body-supplied names silently fall back to the synthesized
 form; they do **not** error.
 
 ### 2.0 Declarative Schema (Optional, Order-Independent)
+
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
 Quereus keeps traditional DDL fully intact. Declarative schema is an optional alternative for describing the desired end‑state in a single, order‑independent block. Modules continue to use DDL‑based interfaces; declarative workflows operate entirely in the engine and produce DDL.
 

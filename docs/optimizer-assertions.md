@@ -1,5 +1,7 @@
 # Optimizer Assertion Analysis
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 The analysis half of delta-driven features: deciding, for one table reference inside a
 plan, whether a change to that table can be re-checked by binding a key (cheap) or
 only by re-running the whole query (expensive). The runtime half — change capture,

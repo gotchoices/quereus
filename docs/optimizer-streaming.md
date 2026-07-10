@@ -1,5 +1,7 @@
 # Optimizer Streaming Recognition
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 Rules that recognize a plan shape whose input already arrives in the order the
 operator would otherwise have to establish, and replace the buffering operator with a
 one-pass streaming one. All of them read `physical.monotonicOn` — the "this relation

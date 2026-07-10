@@ -1,5 +1,7 @@
 # Materialized-View Maintenance
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 How a [materialized view](materialized-views.md) is kept equal to its body: how the engine chooses a maintenance strategy at create time, and what each strategy does to the stored rows when a source row changes. Maintenance is synchronous and transactional — it rides the writing statement — so there is no window in which a view disagrees with its sources.
 
 ## Maintenance strategy

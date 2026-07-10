@@ -1,5 +1,7 @@
 # Functional Dependency Tracking
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 Functional dependencies (FDs) are the canonical surface for "what determines what" on a relational physical node's output. There is no separate `uniqueKeys` field — a unique key `K` is encoded as the FD `K → (all_cols \ K)`, and `∅ → all_cols` encodes the at-most-one-row claim.
 
 This is the **forward** direction, and the [Key Soundness harness](architecture.md) backstops it: it never over-claims a key. The **backward** direction — view/lens update propagation (`put`) — reads this *same* per-node FD/EC/domain annotation rather than maintaining a parallel one, gated by a per-operator round-trip law (see [view updateability § Round-Trip Laws and the Derived Backward Walk](view-updateability.md#round-trip-laws-and-the-derived-backward-walk)).

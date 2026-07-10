@@ -1,5 +1,7 @@
 # Memory Table Module Documentation
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 The Memory Table Module provides virtual tables backed by memory for the Quereus engine. These tables support standard SQL operations with full ACID transaction support and can be used for high-performance in-memory data storage that requires SQL query capabilities.
 
 ## Architecture Overview

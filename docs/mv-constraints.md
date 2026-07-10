@@ -1,5 +1,7 @@
 # Derived-Row Constraints and Covering Structures
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 Two halves of one subject. The first is what happens when a [materialized view](materialized-views.md) *carries* a declared constraint — a CHECK, a foreign key, a secondary UNIQUE — given that derivation writes bypass the ordinary DML constraint pipeline. The second is the **covering structure**: the vocabulary for the physical shapes that *enforce* a UNIQUE constraint, one of which is a materialized view.
 
 Covering structures are documented here rather than in [Lenses and Layered Schemas](lens.md) because enforcement is what they exist for: a covering materialized view is admitted precisely when it can answer a UNIQUE conflict probe at the moment of the write. The lens layer is a consumer of that fact, not its home.

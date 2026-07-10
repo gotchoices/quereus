@@ -1,5 +1,7 @@
 # Quereus Runtime
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 The Quereus runtime executes query plans through a three-phase process: **Planning** (AST → Plan Nodes), **Emission** (Plan Nodes → Instructions), and **Execution** (Instructions → Results).
 
 ## Value Types
@@ -1438,6 +1440,8 @@ The runtime's column reference resolution relies on the optimizer's attribute ID
 For comprehensive optimizer details, see the [Optimizer Documentation](optimizer.md).
 
 ## ParallelDriver (Runtime Primitive)
+
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
 
 `src/runtime/parallel-driver.ts` exposes a `ParallelDriver` class with two operations:
 

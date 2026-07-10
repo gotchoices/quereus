@@ -1,5 +1,7 @@
 # Optimizer Parallel Track
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 The planner half of the parallel track: the rules that *recognize* when a plan shape
 can be driven concurrently. Execution — `ParallelDriver`, `AsyncGatherNode`,
 `EagerPrefetchNode` — is owned by [Runtime](runtime.md). Every rule here refuses to

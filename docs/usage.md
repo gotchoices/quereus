@@ -1,5 +1,7 @@
 # Quereus Usage Guide
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 Quereus provides a lightweight, TypeScript-native SQL interface with a focus on virtual tables that can be backed by any data source. This document explains how to use Quereus effectively in your applications.
 
 ## Quick Start
@@ -670,6 +672,8 @@ Resets the statement to its initial state, ready to be re-executed with new para
 Releases all resources associated with the statement. The statement cannot be used after finalizing.
 
 ## Change-scope introspection
+
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
 `Statement.getChangeScope(params?)` returns a JSON-serializable `ChangeScope`
 describing what base-table state and external inputs the statement reads

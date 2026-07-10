@@ -1,5 +1,7 @@
 # Incremental Maintenance
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 Quereus exposes a single, reusable **change-driven delta kernel** that runs at
 transaction boundaries. Given the rows a transaction changed, it decides — per
 registered consumer — what slice to recompute, how to bind it, and when to fall

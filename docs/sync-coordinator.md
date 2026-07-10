@@ -1,5 +1,7 @@
 # Sync Coordinator - Standalone Backend for Quereus Sync
 
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
 The **sync-coordinator** package provides a production-ready, standalone backend server for the Quereus Sync protocol. It serves as both a reference implementation and a deployable service for multi-master CRDT replication.
 
 ## Design Goals

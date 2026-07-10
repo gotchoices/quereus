@@ -1,5 +1,7 @@
 # Transaction Coordinator Architecture
 
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
 > **Current implementation note (module-scoped, no isolation).** The text below
 > describes the original connection-scoped *isolation* design. The shipped
 > `@quereus/store` coordinator differs in two ways the rest of this doc predates:

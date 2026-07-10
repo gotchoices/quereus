@@ -1,5 +1,7 @@
 # External row-change ingestion
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 The seam a host uses to tell Quereus about row changes it wrote to storage itself — an inbound sync batch, a direct row-store write — so that [materialized-view maintenance](mv-maintenance.md), watch capture, and (optionally) foreign-key actions still run, inside the coordinated transaction. The engine trusts the origin and re-validates nothing.
 
 `Database.ingestExternalRowChanges(changes, options?)` is the batch seam by which a host that has applied row changes **directly to module storage** — sync-inbound replication, a direct row-store write — reports them so the post-write pipeline runs anyway, inside the coordinated transaction. (The `maintainMaterializedViews` facet is what lets an upgraded peer act as a derivation proxy during a schema migration — see [Migration](migration.md).) The batch is the external analogue of one DML statement: one savepoint scope, one `BackingConnectionCache`, one deferred full-rebuild set, one flush.

@@ -1,5 +1,7 @@
 # Change-scope introspection
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 The **change-scope** API exposes — as a small JSON-serializable data
 contract — what base-table state and external inputs a prepared
 `Statement` reads from. It is the external projection of the internal

@@ -1,5 +1,7 @@
 # Schema Migration in a Synced Database
 
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
 How an application evolves its schema when the database is replicated across peers that upgrade at different times. This document builds directly on [Lenses and Layered Schemas](lens.md) and [Materialized Views](materialized-views.md); read those first. The sync machinery referenced here is `@quereus/sync` (CRDT column-level LWW over HLC timestamps).
 
 ## The problem

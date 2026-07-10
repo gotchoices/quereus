@@ -1,5 +1,7 @@
 # Quereus Plugin System (package.json–centric)
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 Quereus plugins are standard ESM packages that declare their capabilities in `package.json` and expose a single runtime entry. At runtime, the module provides registrations for:
 
 - **Virtual Tables** — Custom data sources that appear as SQL tables

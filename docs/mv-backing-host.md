@@ -1,5 +1,7 @@
 # Backing-host capability
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 > **Invariant:** [MV-014](invariants.md#mv-014--every-privileged-operation-routes-through-the-backing-host), [MV-015](invariants.md#mv-015--a-backing-host-owes-ordered-keyed-storage)
 
 The module-author contract for hosting a [materialized view](materialized-views.md)'s stored rows: the privileged surface a virtual-table module must implement so the engine can maintain, refill, and enforce constraints over a maintained table whose storage it does not own.

@@ -1,5 +1,7 @@
 # Schema Management
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 The schema subsystem manages database schemas, tables, views, functions, and indexes. It coordinates virtual table module lifecycle, resolves names across multi-schema search paths, and emits typed change events.
 
 ## Key Types

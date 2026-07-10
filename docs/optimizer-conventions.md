@@ -1,5 +1,7 @@
 # Optimizer Conventions: Characteristics-Based Patterns
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 This document establishes the **implemented patterns** for the Quereus optimizer, using characteristics-based detection to ensure robust, extensible optimization rules. This approach is **actively in use** throughout the optimizer and plan builders.
 
 ## Philosophy: Characteristics Over Identity

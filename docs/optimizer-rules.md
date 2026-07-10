@@ -1,5 +1,7 @@
 # Optimizer Rules
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 The catalog of optimizer rewrite rules, plus deep-dives on the predicate and
 cardinality families. The pass framework these rules register into, and the audit
 discipline every rule declares, live in [the optimizer hub](optimizer.md).

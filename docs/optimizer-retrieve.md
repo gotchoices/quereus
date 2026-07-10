@@ -1,5 +1,7 @@
 # Optimizer Retrieve Push-down
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 How operations slide across the virtual-table boundary: the `RetrieveNode`
 abstraction, the module capability API, access-path selection, and the correlated
 (lateral) access model. Table-valued functions advertise the same physical properties

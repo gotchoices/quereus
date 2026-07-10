@@ -1,5 +1,7 @@
 # Persistent Store Module Design
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 This document describes the design and architecture for the Quereus storage system:
 - `@quereus/store` - Core storage module (StoreModule, StoreTable, utilities)
 - `@quereus/plugin-leveldb` - LevelDB plugin for Node.js
@@ -477,6 +479,16 @@ This matches LevelDB's architecture (single database, key prefixes for tables) a
 |---------|-----------|-----------|
 | LevelDB | ✅ WriteBatch | ❌ Readers see intermediate state |
 | IndexedDB (single DB) | ✅ IDB transaction | ❌ Readers see intermediate state |
+
+**What the isolation layer does and does not give you.** The `@quereus/isolation` wrapper
+(`packages/quereus-isolation`) closes part of this gap, but only part of it. It provides
+**read-committed** visibility plus **read-your-own-writes**: a transaction sees its own
+uncommitted rows through its overlay, and otherwise sees whatever is committed *at the
+moment of the read*. It is **not snapshot isolation** — two reads of the same table inside
+one transaction may return different rows if another transaction commits between them. It
+also performs **no write-write conflict detection**: two transactions that update the same
+row concurrently both succeed, and the last connection to flush wins. Applications that
+need serializability must arrange it themselves. See [Isolation Layer Design](design-isolation-layer.md#isolation-level-provided).
 
 **Future direction**: Implement isolation using a layered architecture similar to the memory vtab module:
 

@@ -162,6 +162,7 @@ See [Store Documentation](../../docs/store.md) for the storage architecture and 
 **Architecture deep dive:** [Architecture](../../docs/architecture.md) — the pipeline (parser → planner → runtime), source layout, extension patterns, design decisions, constraints model, and testing strategy. Start here if you're working on the engine itself.
 
 **User & operator docs:**
+* [Stability Tiers](../../docs/stability.md) — what each tier promises, and which feature areas are Stable, Beta, Experimental, or Internal
 * [Usage Guide](../../docs/usage.md) — complete API reference (type mappings, parameter binding, logging, tracing, transactions)
 * [SQL Reference Guide](../../docs/sql.md) — SQL syntax (includes Declarative Schema)
 * [Schema Management](../../docs/schema.md) — SchemaManager API, change events, key types, DDL generation
@@ -198,7 +199,24 @@ See the [Plugin System documentation](../../docs/plugins.md#comparison-and-coerc
 
 Quereus is a feature-complete SQL query processor with a modern planner and instruction-based runtime architecture. The engine successfully handles complex SQL workloads including joins, window functions, subqueries, CTEs, constraints, and comprehensive DML/DDL operations.
 
-**Current capabilities include:**
+### Stability
+
+Quereus spans a battle-tested SQL core and several research tracks. Every feature area
+carries one of four tiers, which say how much a future release may break you:
+
+| Tier | A breaking change may land in | In short |
+| --- | --- | --- |
+| **Stable** | a major release only | Build on it. |
+| **Beta** | a minor release | Complete and tested; the surface is still being shaped. |
+| **Experimental** | **any** release, including a patch | A research track. Prototype on it; expect churn. |
+| **Internal** | any release | Engine internals — no user-facing contract. |
+
+A tier is about compatibility, not correctness: a wrong answer is a bug at every tier,
+including Experimental. See [Stability Tiers](../../docs/stability.md) for the definitions
+and the per-area assignment.
+
+### Capabilities
+
 *   **Modern Type System** — temporal types (DATE, TIME, DATETIME), JSON with deep equality, plugin-extensible custom types
 *   **Complete JOIN support** — INNER, LEFT, RIGHT, CROSS, SEMI, and ANTI joins with proper NULL padding
 *   **Advanced window functions** — ranking, aggregates, and frame specifications
@@ -211,9 +229,9 @@ Quereus is a feature-complete SQL query processor with a modern planner and inst
 *   **Rich built-in function library** — scalar, aggregate, window, JSON, and date/time functions
 *   **Rule-based optimizer** — constant folding, caching, streaming aggregation, bloom-join selection, and correlated subquery decorrelation. See [Architecture — Optimizer](../../docs/architecture.md#optimizer).
 *   **Change-scope introspection and reactive subscriptions** — `Statement.getChangeScope()` returns a JSON-serializable description of what base-table state and external inputs a prepared statement reads from. The companion `Database.watch(scope, handler)` consumes any `ChangeScope` value (analyzed, deserialized, or hand-built) and fires a post-commit callback whenever matching rows, groups, or tables change. See [Change-scope Documentation](../../docs/change-scope.md).
-*   **Updatable views** — `insert` / `update` / `delete` propagate through views, non-recursive CTEs, and subqueries in `from` to the underlying base tables (no `instead of` triggers; predicate-driven). Single-source projection-and-filter and multi-source key-preserving inner-join bodies are supported, with `returning`, the core-`select` `with defaults (col = expr, …)` and `with inverse (col = expr, …)` clauses (omitted-insert defaults and authored write-back expressions, both riding the body select), and per-row writable presence/membership columns for write routing. See [View Updateability](../../docs/view-updateability.md).
-*   **Materialized views** — `create materialized view` stores a query body as a keyed backing relation kept consistent with its sources **synchronously, inside the writing transaction** (row-time maintenance — no refresh-policy knob, reads-own-writes), with write-through DML and covering-structure constraint enforcement. See [Materialized Views](../../docs/materialized-views.md).
-*   **Logical schemas and lenses** — separate an embodiment-free logical design from a module-backed basis, mapped by per-table bidirectional **lenses** built on view updateability. See [Lenses and Layered Schemas](../../docs/lens.md).
+*   **Updatable views** *(Beta)* — `insert` / `update` / `delete` propagate through views, non-recursive CTEs, and subqueries in `from` to the underlying base tables (no `instead of` triggers; predicate-driven). Single-source projection-and-filter and multi-source key-preserving inner-join bodies are supported, with `returning`, the core-`select` `with defaults (col = expr, …)` and `with inverse (col = expr, …)` clauses (omitted-insert defaults and authored write-back expressions, both riding the body select), and per-row writable presence/membership columns for write routing. See [View Updateability](../../docs/view-updateability.md).
+*   **Materialized views** *(Beta)* — `create materialized view` stores a query body as a keyed backing relation kept consistent with its sources **synchronously, inside the writing transaction** (row-time maintenance — no refresh-policy knob, reads-own-writes), with write-through DML and covering-structure constraint enforcement. See [Materialized Views](../../docs/materialized-views.md).
+*   **Logical schemas and lenses** *(Experimental)* — separate an embodiment-free logical design from a module-backed basis, mapped by per-table bidirectional **lenses** built on view updateability. See [Lenses and Layered Schemas](../../docs/lens.md).
 
 [TODO List](../../docs/todo.md) has remaining priorities.
 

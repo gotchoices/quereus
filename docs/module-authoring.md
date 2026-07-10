@@ -1,5 +1,7 @@
 # Virtual Table Module Authoring Guide
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 This guide provides documentation for implementing virtual table modules in Quereus. It covers the architecture, optimization integration, and best practices for module authors.
 
 ## Overview
@@ -217,6 +219,8 @@ getBestAccessPlan(
 ```
 
 ### 3. Concurrency Mode (Parallel Runtime)
+
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
 
 When a parallel-runtime consumer (e.g. fan-out lookup join) wants to issue
 multiple vtab calls in flight on a single connection, it consults the

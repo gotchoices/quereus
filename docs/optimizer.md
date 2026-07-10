@@ -1,5 +1,7 @@
 # Quereus Query Optimizer
 
+> **Stability: Internal** — see [Stability Tiers](stability.md#tiers).
+
 The optimizer turns the logical plan the builder produced into a physical plan the
 emitter can compile, by running rewrite rules over the plan tree in a fixed sequence of
 passes. This document is the **hub**: it covers the pass framework, the shared machinery

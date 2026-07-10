@@ -1,5 +1,7 @@
 # View Updateability
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 Quereus treats views, CTEs, and subqueries-in-`from` uniformly: any relation expression that can be written as a `select` can also be the target of an `insert`, `update`, or `delete`. The engine derives the required base-table operations from the relation's predicate, its functional-dependency surface, and the per-operator semantics described below. There is no `with check option`, no `instead of` trigger surface, and no view-level flag declaring updateability. A relation is updateable iff a deterministic decomposition exists at plan time; if it does not, the mutation surfaces a structured diagnostic naming the operator and column that obstructed propagation.
 
 ## Overview

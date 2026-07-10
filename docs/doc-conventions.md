@@ -87,6 +87,34 @@ The checker validates *pointers*, not semantics: it asserts an invariant still n
 file and a real symbol, never that the invariant holds. Pointer rot is the drift that
 actually happens; semantic verification is what tests are for.
 
+## The stability banner
+
+Every user-facing feature doc declares which stability tier it belongs to, so a reader
+knows how much a future release may break them before reading a line of the doc. The tier
+definitions and the per-area assignment live in [Stability Tiers](stability.md); a doc
+*states* its tier and *links* the definitions rather than restating them — the same
+discipline as the invariant back-link above.
+
+A tiered doc carries exactly one banner, directly under its `#` heading and before the intro:
+
+```markdown
+# View Updateability
+
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+```
+
+The tier word is one of `Stable`, `Beta`, `Experimental`, `Internal`, and must match the
+doc's entry in `docs/.stability.json`, which is the machine-readable form of the same map.
+
+A **section** may override its doc's tier by carrying the same banner under that section's
+heading — that is how `declare schema` is marked Beta inside the Stable `sql.md`. The header
+banner states the doc's predominant tier; section banners are the exceptions, and there is
+never more than one banner in the window below the H1.
+
+Contributor and process docs — this one, `architecture.md`, `invariants.md`, `releasing.md`,
+the design notes — carry no banner and are listed under `untiered` in `docs/.stability.json`.
+Every `docs/*.md` appears in one list or the other.
+
 ## The size ratchet
 
 `docs/.doc-budget.json` records each large doc's current word count. A doc may shrink; it

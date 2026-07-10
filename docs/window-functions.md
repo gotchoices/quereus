@@ -1,5 +1,7 @@
 # Window Function Implementation in Quereus
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 This document describes the architecture and implementation of SQL window functions in Quereus's Titan runtime system.
 
 ## Overview

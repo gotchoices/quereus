@@ -1,5 +1,7 @@
 # Materialized Views
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 A **materialized view** in Quereus is a *transparent materialization cache*: a query body stored once into a keyed table and kept consistent with its sources **synchronously, inside the writing transaction**. Where a plain [view](schema.md#viewschema) re-evaluates its body on every reference, a materialized view serves reads from stored rows — but those rows are maintained at every source row-write, so a materialized view is observably **indistinguishable from the plain view it derives from, only faster**.
 
 There is exactly one maintenance model — **row-time** — and no refresh-policy knob. A materialized view always reflects its sources, including a write the same transaction just made (reads-own-writes); maintenance commits and rolls back in lockstep with the source write. The user never reasons about *when* the view is consistent.

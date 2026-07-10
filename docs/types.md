@@ -1,5 +1,7 @@
 # Quereus Type System
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 ## Overview
 
 Quereus implements a **logical type system** that separates type semantics from physical storage representation. This design provides strict type safety and extensibility while maintaining runtime performance.

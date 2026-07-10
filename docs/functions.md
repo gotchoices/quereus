@@ -1,5 +1,7 @@
 # Built-in Functions Reference
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 This document lists the built-in SQL functions available in Quereus. For the underlying type system, validation rules, and custom type registration, see the [Type System Documentation](types.md).
 
 ---

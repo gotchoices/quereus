@@ -1,5 +1,7 @@
 # Lenses and Layered Schemas
 
+> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).
+
 ## Overview
 
 A database has two faces that rarely match. There is the design you want to *think* in — clean tables with the columns, types, and rules your application cares about — and the storage you actually *run on*, which may split one designed table across several physical tables, fold it into key-value triples, or spread it across more than one storage module. A **lens** is the two-way mapping between them: it lets you read and write your designed tables normally while the engine translates, in both directions, to and from however the data is really stored.

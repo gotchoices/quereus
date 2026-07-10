@@ -1,5 +1,7 @@
 # Error Handling in Quereus
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 Quereus employs a structured approach to error handling to provide context and aid debugging. Errors are generally propagated as instances of `QuereusError` (or its subclasses) found in `src/common/errors.ts`.
 
 ## Error Class Hierarchy

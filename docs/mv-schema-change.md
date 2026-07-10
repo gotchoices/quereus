@@ -1,5 +1,7 @@
 # Schema-change staleness
 
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
 > **Invariant:** [MV-022](invariants.md#mv-022--a-stale-view-serves-its-snapshot-and-propagates-nothing)
 
 What happens to a [materialized view](materialized-views.md) when one of its source tables changes shape. Most such changes are survivable — the view recompiles in place, or its body is rewritten to follow a rename — and the rest mark the view **stale**: it serves its last snapshot and propagates no writes until a `refresh` recovers it.
