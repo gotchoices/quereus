@@ -795,6 +795,110 @@ describe('TransactionCoordinator', () => {
 		});
 	});
 
+	describe('commit failure clears pending callback state (stats-delta leak fix)', () => {
+		// Models a StoreTable's stats-callback pair: a delta accumulates during the
+		// transaction (trackMutation with inTransaction=true), onCommit folds it into
+		// the committed total and zeroes it, onRollback just discards it. The bug: a
+		// commit that throws fired NEITHER callback, so `pendingDelta` survived
+		// `clearTransaction()` and leaked into the next transaction on this module-wide
+		// coordinator.
+		function makeStatsTable() {
+			const t = {
+				pendingDelta: 0,
+				committed: 0,
+				onCommitCalls: 0,
+				onRollbackCalls: 0,
+				callbacks: {
+					onCommit: () => { t.onCommitCalls++; t.committed += t.pendingDelta; t.pendingDelta = 0; },
+					onRollback: () => { t.onRollbackCalls++; t.pendingDelta = 0; },
+				},
+			};
+			return t;
+		}
+
+		it('atomic-path write failure fires onRollback (not onCommit) for every table and leaks no delta', async () => {
+			const spy = makeAtomicSpy();
+			spy.failWrite = true;
+			const coord = new TransactionCoordinator(emitter, spy.factory);
+			const a = makeStatsTable();
+			const b = makeStatsTable();
+			coord.registerCallbacks(a.callbacks);
+			coord.registerCallbacks(b.callbacks);
+
+			// Two tables mutate in one transaction, buffering their deltas.
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			a.pendingDelta = 3;
+			b.pendingDelta = 5;
+
+			let err: unknown;
+			try { await coord.commit(); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(Error);
+
+			// onRollback fired for BOTH; onCommit for neither.
+			expect(a.onCommitCalls).to.equal(0);
+			expect(b.onCommitCalls).to.equal(0);
+			expect(a.onRollbackCalls).to.equal(1);
+			expect(b.onRollbackCalls).to.equal(1);
+			// Deltas discarded — nothing survives clearTransaction().
+			expect(a.pendingDelta).to.equal(0);
+			expect(b.pendingDelta).to.equal(0);
+			expect(a.committed).to.equal(0);
+			expect(b.committed).to.equal(0);
+
+			// The next transaction starts from the pre-failure baseline, not
+			// baseline + leaked delta: a clean commit of +2 yields committed === 2,
+			// not 3 + 2.
+			spy.failWrite = false;
+			coord.begin();
+			coord.put(new Uint8Array([2]), new Uint8Array([20]), store);
+			a.pendingDelta = 2;
+			await coord.commit();
+			expect(a.onCommitCalls).to.equal(1);
+			expect(a.committed).to.equal(2);
+		});
+
+		it('fallback-path (no atomic factory) write failure also clears pending deltas', async () => {
+			// A per-store batch whose write() rejects — the capability-absent commit path.
+			const throwingStore = new InMemoryKVStore();
+			throwingStore.batch = () => ({
+				put() {}, delete() {}, clear() {},
+				async write() { throw new Error('batch write failed'); },
+			});
+			const coord = new TransactionCoordinator(emitter); // no atomic factory → fallback loop
+			const a = makeStatsTable();
+			coord.registerCallbacks(a.callbacks);
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), throwingStore);
+			a.pendingDelta = 7;
+
+			let err: unknown;
+			try { await coord.commit(); } catch (e) { err = e; }
+			expect(err).to.be.instanceOf(Error);
+			expect(a.onCommitCalls).to.equal(0);
+			expect(a.onRollbackCalls).to.equal(1);
+			expect(a.pendingDelta).to.equal(0);
+			await throwingStore.close();
+		});
+
+		it('a clean commit fires onCommit only — the failure-path onRollback never runs', async () => {
+			const spy = makeAtomicSpy();
+			const coord = new TransactionCoordinator(emitter, spy.factory);
+			const a = makeStatsTable();
+			coord.registerCallbacks(a.callbacks);
+
+			coord.begin();
+			coord.put(new Uint8Array([1]), new Uint8Array([10]), store);
+			a.pendingDelta = 4;
+			await coord.commit();
+
+			expect(a.onCommitCalls).to.equal(1);
+			expect(a.onRollbackCalls).to.equal(0);
+			expect(a.committed).to.equal(4);
+		});
+	});
+
 	describe('cross-table atomicity', () => {
 		// Two tables, each with a data store and a secondary-index store — four
 		// distinct handles on ONE module coordinator. The headline guarantee: a

@@ -6,6 +6,7 @@
  * Iteration always delegates to the underlying store (range consistency is hard).
  */
 
+import { bytesToHex } from './bytes.js';
 import type { KVStore, KVEntry, WriteBatch, IterateOptions, BatchOp, WriteOptions } from './kv-store.js';
 
 /** Configuration options for the CachedKVStore. */
@@ -25,15 +26,6 @@ interface LRUNode {
 	size: number;
 	prev: LRUNode | null;
 	next: LRUNode | null;
-}
-
-/** Convert a Uint8Array to a hex string for use as a Map key. */
-function toHex(arr: Uint8Array): string {
-	let hex = '';
-	for (let i = 0; i < arr.length; i++) {
-		hex += (arr[i] < 16 ? '0' : '') + arr[i].toString(16);
-	}
-	return hex;
 }
 
 /**
@@ -71,7 +63,7 @@ export class CachedKVStore implements KVStore {
 	async get(key: Uint8Array): Promise<Uint8Array | undefined> {
 		if (!this.enabled) return this.store.get(key);
 
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const node = this.map.get(hex);
 		if (node) {
 			this.moveToHead(node);
@@ -87,7 +79,7 @@ export class CachedKVStore implements KVStore {
 	async has(key: Uint8Array): Promise<boolean> {
 		if (!this.enabled) return this.store.has(key);
 
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const node = this.map.get(hex);
 		if (node) {
 			this.moveToHead(node);
@@ -106,7 +98,7 @@ export class CachedKVStore implements KVStore {
 		await this.store.put(key, value, options);
 		if (!this.enabled) return;
 
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const existing = this.map.get(hex);
 		if (existing) {
 			this.totalBytes -= existing.size;
@@ -124,7 +116,7 @@ export class CachedKVStore implements KVStore {
 		if (!this.enabled) return;
 
 		// Insert negative cache entry (known absent)
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		const existing = this.map.get(hex);
 		if (existing) {
 			this.totalBytes -= existing.size;
@@ -157,7 +149,7 @@ export class CachedKVStore implements KVStore {
 
 	/** Invalidate a single key from the cache. */
 	invalidate(key: Uint8Array): void {
-		const hex = toHex(key);
+		const hex = bytesToHex(key);
 		this.removeEntry(hex);
 	}
 

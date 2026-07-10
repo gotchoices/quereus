@@ -14,6 +14,10 @@ const BIGINT_MARKER = '$bigint';
 const BLOB_MARKER = '$blob';
 const JSON_MARKER = '$json';
 
+// TextEncoder is stateless and reusable — hoist one instance rather than
+// allocating a fresh encoder on every serialize call.
+const textEncoder = new TextEncoder();
+
 /**
  * Serialize a row to a byte array for storage.
  */
@@ -21,7 +25,7 @@ export function serializeRow(row: Row): Uint8Array {
   // Pre-process row elements to handle JSON objects with marker-colliding keys
   const safeRow = row.map(wrapJsonIfNeeded);
   const json = JSON.stringify(safeRow, replacer);
-  return new TextEncoder().encode(json);
+  return textEncoder.encode(json);
 }
 
 /**
@@ -38,7 +42,7 @@ export function deserializeRow(buffer: Uint8Array): Row {
 export function serializeValue(value: SqlValue): Uint8Array {
   const safe = wrapJsonIfNeeded(value);
   const json = JSON.stringify(safe, replacer);
-  return new TextEncoder().encode(json);
+  return textEncoder.encode(json);
 }
 
 /**
@@ -156,7 +160,7 @@ export interface TableStats {
  * Serialize table statistics.
  */
 export function serializeStats(stats: TableStats): Uint8Array {
-  return new TextEncoder().encode(JSON.stringify(stats));
+  return textEncoder.encode(JSON.stringify(stats));
 }
 
 /**

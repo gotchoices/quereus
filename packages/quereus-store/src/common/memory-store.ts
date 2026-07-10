@@ -9,21 +9,21 @@
  * Keys are stored using hex encoding for correct lexicographic ordering.
  */
 
+import { bytesToHex } from './bytes.js';
 import type { KVStore, KVEntry, WriteBatch, IterateOptions, WriteOptions } from './kv-store.js';
 
 /**
  * Convert Uint8Array to hex string for Map key storage.
- * Hex encoding preserves lexicographic ordering.
+ * Hex encoding preserves lexicographic ordering. Shared with the coordinator's
+ * key index via {@link bytesToHex} — same lowercase two-char-per-byte alphabet.
  */
-function keyToHex(key: Uint8Array): string {
-  return Array.from(key).map(b => b.toString(16).padStart(2, '0')).join('');
-}
+const keyToHex = bytesToHex;
 
 /**
  * Compare two hex strings lexicographically.
  *
  * NOTE: `localeCompare` is ICU collation, which only coincides with the `memcmp` of the
- * underlying key bytes because `keyToHex`'s alphabet is `[0-9a-f]` — every locale ranks
+ * underlying key bytes because `bytesToHex`'s alphabet is `[0-9a-f]` — every locale ranks
  * digits before letters and both ascending. Widening that alphabet (upper-case hex, base64,
  * any non-ASCII) would silently mis-order this store, and it is the oracle the whole store
  * test suite compares against. Use a code-unit/byte compare if the encoding ever changes.

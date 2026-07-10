@@ -217,6 +217,13 @@ export class TransactionCoordinator {
       return;
     }
 
+    // Tracks whether we reached a clean onCommit for every callback. A write or
+    // notify that throws jumps to `finally` with `notified` still false, so the
+    // catch-up loop there fires onRollback semantics for every callback before
+    // the transaction is cleared. Without it, per-table pending stats deltas
+    // buffered during this transaction survive `clearTransaction()` and are
+    // double-counted in the NEXT transaction on this module-wide coordinator.
+    let notified = false;
     try {
       // Group pending operations by target store handle. Each physical store
       // appears once, so the atomic path never double-opens a store and the
@@ -272,7 +279,24 @@ export class TransactionCoordinator {
       for (const cb of this.callbacks) {
         cb.onCommit();
       }
+      notified = true;
     } finally {
+      if (!notified) {
+        // Commit failed before/while notifying: discard the pending per-callback
+        // state (stats deltas) so nothing carries into the next transaction.
+        //
+        // Deliberate tradeoff on the partial-notify path: if onCommit throws on
+        // callback k, callbacks 0..k-1 already applied their delta AND zeroed it,
+        // so onRollback (which just zeroes the delta) is a harmless no-op on them;
+        // k..n never applied and are discarded here. applyPendingStats does not
+        // throw in normal operation, so this is a defensive corner — leaving some
+        // deltas cleared-and-consistent beats leaking all of them. The invariant
+        // that matters: a commit that throws leaves every callback's pending
+        // state clean (delta === 0).
+        for (const cb of this.callbacks) {
+          cb.onRollback();
+        }
+      }
       this.clearTransaction();
     }
   }

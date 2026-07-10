@@ -2067,13 +2067,35 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		}
 		await this.removeTableDDL(schemaName, oldName);
 
-		// Relocate the stats entry (unified __stats__ store, keyed by schema.table).
+		// Migrate the stats entry (unified __stats__ store, keyed by schema.table).
+		// The entry is RE-KEYED, not physically moved with the directory: a unified
+		// store keys every table's stats under `schema.table` in one store, so the
+		// value must be copied from the old key to the new key and the old key
+		// dropped. `dispose()` above already flushed any buffered delta to disk under
+		// the old key, so the read here sees the current row-count estimate; deleting
+		// without copying (the prior behavior) blinded the planner — a freshly-renamed
+		// table reported getEstimatedRowCount() === 0 until stats were re-gathered.
+		//
+		// NOTE: this re-key reaches the old value only when getStatsStore(newName)
+		// returns a store that CONTAINS the old key — true for the shipped providers,
+		// which all share one unified __stats__ store, and for any provider whose
+		// renameTableStores physically relocates a per-table stats store. A provider
+		// that kept per-table stats stores and did NOT relocate them in
+		// renameTableStores would orphan the old-keyed value out of reach here (the
+		// prior delete-only code lost it just the same — no regression). No shipped
+		// provider does this; revisit if one ever keeps per-table, non-relocated stats.
 		try {
 			const statsStore = await this.provider.getStatsStore(schemaName, newName);
 			const oldStatsKey = buildStatsKey(schemaName, oldName);
+			const statsValue = await statsStore.get(oldStatsKey);
+			if (statsValue) {
+				// A table with no stats yet (never flushed) returns undefined here —
+				// skip the copy so no spurious zero-count entry lands under the new key.
+				await statsStore.put(buildStatsKey(schemaName, newName), statsValue);
+			}
 			await statsStore.delete(oldStatsKey);
 		} catch {
-			/* stats are advisory — a stale entry under the old key is harmless */
+			/* stats are advisory — a stats hiccup must never block the rename */
 		}
 
 		this.eventEmitter?.emitSchemaChange({
