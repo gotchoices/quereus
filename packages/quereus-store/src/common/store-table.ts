@@ -128,6 +128,13 @@ export function resolvePkKeyCollations(
 ): (string | undefined)[] {
 	return pkDef.map(def => {
 		const col = columns[def.index];
+		// NOTE: `isTextual`, not {@link columnCanHoldText} — deliberate. A JSON PK column
+		// can hold text but cannot declare a collation (`JSON_TYPE.supportedCollations`
+		// is empty), so it stays BINARY-keyed *and* BINARY-compared, consistently with
+		// `reconcilePkCollations` and the engine's own comparison. If JSON (or another
+		// non-`isTextual` type that can hold text) ever gains a non-empty
+		// `supportedCollations`, this must switch to `columnCanHoldText` or the key bytes
+		// will diverge from the enforced comparison.
 		if (!col || !col.logicalType.isTextual) return undefined;
 		return (col.collation || fallback).toUpperCase();
 	});

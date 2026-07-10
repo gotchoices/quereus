@@ -288,11 +288,11 @@ export function operandCollation(node: ScalarPlanNode): string {
 }
 
 /**
- * True when a logical type can never produce a text value at runtime. The
- * negation of {@link logicalTypeCanHoldText}'s physical-representation
- * allow-list — `JSON` (physical `OBJECT`) and `NULL_TYPE` (physical `NULL`,
- * which covers `ANY` too) are potentially textual, not exempt. An absent type
- * is unknown — potentially textual.
+ * True when a logical type can never produce a text value at runtime. Exactly
+ * the negation of {@link logicalTypeCanHoldText}'s physical-representation
+ * allow-list, so `JSON` (physical `OBJECT`), `ANY` and `NULL` (both physical
+ * `NULL`) are all potentially textual rather than exempt. An absent type is
+ * unknown — potentially textual.
  */
 function isNonTextualLogicalType(lt: LogicalType | undefined): boolean {
 	return !logicalTypeCanHoldText(lt);

@@ -4,10 +4,13 @@
  * Plan-time equality facts (constant pins, col=col mirrors/ECs, constant
  * bindings, guard-discharge facts, covered-key witnesses, join equi-pairs) are
  * VALUE-level claims, so they must be gated on the comparison's effective
- * collation being value-discriminating. These tests pin the four reproduced
+ * collation being value-discriminating. These tests pin the reproduced
  * unsoundness shapes, the sound declared-collation controls that must keep
  * working, and the sound-by-accident invariants (CollateNode non-injectivity,
  * constraint-extractor's Cast-only unwrap).
+ *
+ * Shape 5 is from `bug-json-columns-classified-as-non-textual`: a `JSON`
+ * operand can hold a text string at runtime, so it is not collation-exempt.
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
@@ -17,6 +20,8 @@ import { EmptyScope } from '../../src/planner/scopes/empty.js';
 import { BinaryOpNode, CollateNode, LiteralNode } from '../../src/planner/nodes/scalar.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import { INTEGER_TYPE, TEXT_TYPE } from '../../src/types/builtin-types.js';
+import { JSON_TYPE } from '../../src/types/json-type.js';
+import { isValueDiscriminatingAstComparison } from '../../src/planner/analysis/comparison-collation.js';
 import type * as AST from '../../src/parser/ast.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -94,6 +99,26 @@ describe('Collation soundness of plan-time equality facts', () => {
 			expect((await collect(db, q)).length).to.equal(2);
 			expect(isAtMostOneRow(root), 'false ≤1-row claim on JSON column').to.equal(false);
 			expect(keysOf(root).some(k => k.length === 0), 'empty key claimed').to.equal(false);
+		});
+	});
+
+	describe('AST-level gate (isValueDiscriminatingAstComparison)', () => {
+		const colExpr = (name: string): AST.Expression => ({ type: 'column', name } as AST.ColumnExpr);
+		const map = new Map([['j', 0], ['b', 1], ['n', 2]]);
+
+		it('a NOCASE-declared JSON column is not treated as collation-exempt', () => {
+			// JSON's physical representation is OBJECT, but `JSON_TYPE.parse` passes a
+			// JSON scalar string straight through, so a JSON value can be the string
+			// 'Bob'. Claiming non-textuality here would mint value-level facts from a
+			// NOCASE comparison that passes 'Bob' = 'bob'.
+			const columns = [{ collation: 'NOCASE', logicalType: JSON_TYPE }];
+			expect(isValueDiscriminatingAstComparison(colExpr('j'), colExpr('j'), map, columns)).to.equal(false);
+		});
+
+		it('a NOCASE-declared INTEGER column stays collation-exempt', () => {
+			const columns = [{ collation: 'NOCASE', logicalType: JSON_TYPE }, { collation: 'NOCASE', logicalType: TEXT_TYPE }, { collation: 'NOCASE', logicalType: INTEGER_TYPE }];
+			expect(isValueDiscriminatingAstComparison(colExpr('n'), colExpr('n'), map, columns)).to.equal(true);
+			expect(isValueDiscriminatingAstComparison(colExpr('b'), colExpr('b'), map, columns)).to.equal(false);
 		});
 	});
 
