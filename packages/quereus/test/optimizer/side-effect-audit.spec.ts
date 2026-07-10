@@ -299,6 +299,12 @@ const NO_SIGNAL_ALLOWLIST: ReadonlyMap<string, string> = new Map([
 ]);
 
 interface Unguarded {
+	/**
+	 * `'unresolved'` means the audit could not run on that rule at all, so the allowlist
+	 * must not excuse it — otherwise renaming an allowlisted rule's import would silently
+	 * stop auditing it.
+	 */
+	readonly kind: 'no-signal' | 'unresolved';
 	readonly id: string;
 	readonly reason: string;
 }
@@ -319,12 +325,17 @@ function auditAwareRules(
 		awareIds.push(reg.id);
 		const code = readRuleSource(reg.fn);
 		if (code === undefined) {
-			unguarded.push({ id: reg.id, reason: `cannot resolve rule function \`${reg.fn}\` to a source file` });
+			unguarded.push({ kind: 'unresolved', id: reg.id, reason: `cannot resolve rule function \`${reg.fn}\` to a source file` });
 		} else if (!SIDE_EFFECT_SIGNALS.some(s => code.includes(s))) {
-			unguarded.push({ id: reg.id, reason: `\`${reg.fn}\` consults none of ${SIDE_EFFECT_SIGNALS.join(', ')}` });
+			unguarded.push({ kind: 'no-signal', id: reg.id, reason: `\`${reg.fn}\` consults none of ${SIDE_EFFECT_SIGNALS.join(', ')}` });
 		}
 	}
 	return { awareIds, unguarded };
+}
+
+/** An `'aware'` rule is excused only when it is allowlisted *and* the audit actually ran on it. */
+function isExcused(u: Unguarded): boolean {
+	return u.kind === 'no-signal' && NO_SIGNAL_ALLOWLIST.has(u.id);
 }
 
 describe("OPT-002 static guard: every 'aware' rule consults a side-effect signal", () => {
@@ -335,6 +346,10 @@ describe("OPT-002 static guard: every 'aware' rule consults a side-effect signal
 	// collects every `'aware'` rule, resolves its `fn:` to the imported rule file, and
 	// fails if that file never names a purity signal. A miss here is a wrong-answer bug
 	// (a lost or duplicated write), not a missed optimization.
+	//
+	// NOTE: only the rule's own file is read. No rule currently delegates its refusal to a
+	// helper module; if one ever does, it will be flagged as unguarded — extend the reader
+	// to follow the rule file's imports rather than allowlisting the rule.
 	const plannerDir = join(dirname(fileURLToPath(import.meta.url)), '../../src/planner');
 	const optimizerFile = join(plannerDir, 'optimizer.ts');
 
@@ -360,7 +375,7 @@ describe("OPT-002 static guard: every 'aware' rule consults a side-effect signal
 		expect(awareIds.length, "found the 'aware' rules").to.be.greaterThan(20);
 
 		const offenders = unguarded
-			.filter(u => !NO_SIGNAL_ALLOWLIST.has(u.id))
+			.filter(u => !isExcused(u))
 			.map(u => `${u.id}: ${u.reason}`);
 		expect(offenders, `'aware' rules that consult no side-effect signal:\n${offenders.join('\n')}`).to.be.empty;
 	});
@@ -368,12 +383,12 @@ describe("OPT-002 static guard: every 'aware' rule consults a side-effect signal
 	it('the allowlist has no stale entries', () => {
 		const code = readCode(optimizerFile);
 		const { awareIds, unguarded } = auditAwareRules(code, ruleSourceReader(code));
-		const unguardedIds = new Set(unguarded.map(u => u.id));
+		const noSignalIds = new Set(unguarded.filter(u => u.kind === 'no-signal').map(u => u.id));
 
 		for (const id of NO_SIGNAL_ALLOWLIST.keys()) {
 			expect(awareIds, `allowlisted rule \`${id}\` is no longer registered as 'aware'`).to.include(id);
 			expect(
-				unguardedIds.has(id),
+				noSignalIds.has(id),
 				`allowlisted rule \`${id}\` now consults a signal — drop it from NO_SIGNAL_ALLOWLIST`,
 			).to.equal(true);
 		}
@@ -425,7 +440,21 @@ describe("OPT-002 static guard: every 'aware' rule consults a side-effect signal
 		`);
 		const { unguarded } = auditAwareRules(optimizer, () => undefined);
 		expect(unguarded[0].id).to.equal('ghost-rule');
+		expect(unguarded[0].kind).to.equal('unresolved');
 		expect(unguarded[0].reason).to.match(/^cannot resolve rule function/);
+	});
+
+	it('does not let the allowlist excuse a rule the audit could not read', () => {
+		const allowlisted = [...NO_SIGNAL_ALLOWLIST.keys()][0];
+		const optimizer = stripComments(`
+			this.passManager.addRuleToPass(PassId.Structural, {
+				id: '${allowlisted}',
+				fn: ruleVanished,
+				sideEffectMode: 'aware',
+			});
+		`);
+		const { unguarded } = auditAwareRules(optimizer, () => undefined);
+		expect(unguarded.filter(u => !isExcused(u)).map(u => u.id)).to.deep.equal([allowlisted]);
 	});
 
 	it('rejects a registration that omits sideEffectMode rather than skipping it', () => {

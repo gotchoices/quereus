@@ -353,9 +353,10 @@ subset of the newcomer's is dropped; a newcomer already subsumed is skipped) and
 `MAX_FDS_PER_NODE = 64`. Cap eviction keeps FDs whose determinants lie inside a caller-supplied
 `keyHints` set first, and within each partition prefers `'unique'` over `'determination'` —
 evicting a uniqueness witness is sound but causes downstream under-claims. Truncations log on
-`quereus:planner:fd`. The guard scans `planner/nodes/**` and `planner/analysis/**` for a
-`.push(` onto an FD-named receiver, with a short allowlist for local candidate lists that are
-handed to `addFd` by their consumer. It keys on receiver names, so it is a smoke alarm rather
+`quereus:planner:fd`. The guard scans `planner/**` — all but `util/fd-utils.ts`, which *is* the
+sanctioned path — for a `.push(` onto an FD-named receiver, with a short allowlist for local
+candidate lists that are handed to `addFd` (or to an FD reasoning helper) by their consumer.
+It keys on receiver names, so it is a smoke alarm rather
 than a proof; if the allowlist ever needs to grow past a handful of entries, delete the guard
 rather than maintain it.
 

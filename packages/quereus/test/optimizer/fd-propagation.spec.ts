@@ -567,8 +567,9 @@ function findFdPushes(relPath: string, code: string): FdPush[] {
 
 /**
  * Local candidate-list builds: an array assembled here, then handed to `addFd` /
- * `mergeFds` by its consumer. Each entry must name where that fold happens — if it
- * cannot, the push is a real violation, not an exception.
+ * `mergeFds` by its consumer, or consumed as pure reasoning input that never reaches a
+ * node's FD set. Each entry must name that consumer — if it cannot, the push is a real
+ * violation, not an exception.
  *
  * NOTE: this guard pays for itself only while the list stays short. If it grows past
  * a handful of entries the receiver-name heuristic has stopped discriminating, and
@@ -587,24 +588,28 @@ const LOCAL_FD_BUILD_ALLOWLIST: ReadonlyMap<string, string> = new Map([
 		'analysis/assertion-hoist-cache.ts::fds',
 		'`getAssertionHoistedConstraints` returns a candidate list; `reference.ts` folds it through `addFd`',
 	],
+	[
+		'rules/aggregate/rule-groupby-fd-simplification.ts::keyFds',
+		'candidate key FDs handed to `expandEcsToFds`/`minimalCover` as reasoning input; they never reach a node FD set',
+	],
 ]);
+
+/** The sanctioned accumulation path itself — its pushes are the implementation of `addFd`. */
+const FD_UTILS = 'util/fd-utils.ts';
 
 describe('OPT-046 static guard: addFd is the only FD accumulation path', () => {
 	// FDs are accumulated through `addFd` / `mergeFds`, which apply subsumption and
 	// enforce MAX_FDS_PER_NODE. Pushing straight onto the array skips both, and shows
-	// up as a missing key or an over-long FD list rather than a crash. Scan the two
-	// directories that build node FD sets and flag any `.push(` onto an FD-named
-	// receiver that is not a known local candidate build. `util/fd-utils.ts` is
-	// excluded: it *is* the sanctioned accumulation path.
+	// up as a missing key or an over-long FD list rather than a crash. Scan the whole
+	// planner and flag any `.push(` onto an FD-named receiver that is not a known local
+	// candidate build.
 	const plannerDir = join(dirname(fileURLToPath(import.meta.url)), '../../src/planner');
-	const scanRoots = ['nodes', 'analysis'];
 
 	function scanPushes(): FdPush[] {
-		return scanRoots.flatMap(root =>
-			tsFilesUnder(join(plannerDir, root)).flatMap(file =>
-				findFdPushes(relPosix(plannerDir, file), readCode(file)),
-			),
-		);
+		return tsFilesUnder(plannerDir)
+			.map(file => relPosix(plannerDir, file))
+			.filter(rel => rel !== FD_UTILS)
+			.flatMap(rel => findFdPushes(rel, readCode(join(plannerDir, rel))));
 	}
 
 	it('no FD list is accumulated by a bare .push()', () => {
