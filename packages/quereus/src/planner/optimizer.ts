@@ -86,7 +86,7 @@ const log = createLogger('optimizer');
  * `${id}-${nodeType}` (used by `grow-retrieve` and `monotonic-range-access`). A
  * scalar `nodeType` registers a single handle with `id` verbatim.
  */
-interface RuleManifestEntry {
+export interface RuleManifestEntry {
 	/** Pass this rule registers into. */
 	pass: PassId;
 	/**
@@ -971,6 +971,71 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 ];
 
 /**
+ * Register every entry of `manifest` with its pass on `passManager`, in manifest
+ * array order. That order is the execution contract: pass rules fire in
+ * registration order, so appending in manifest order reproduces the intended
+ * per-pass order.
+ *
+ * A fan-out entry (array `nodeType`) mints one handle per node type with id
+ * `${entry.id}-${nodeType}`; a scalar entry mints one handle with `entry.id`.
+ *
+ * Structural well-formedness is asserted here (once, at construction): the target
+ * pass must exist, and no two handles may share an id WITHIN a pass (the same id in
+ * two DIFFERENT passes is allowed — ids are scoped per pass). The duplicate check
+ * hard-fails with `quereusError(INTERNAL)` rather than silently skipping (as
+ * `PassManager.addRuleToPass` would) — a duplicate id is an author bug.
+ *
+ * Exported (not just the private method) so the guarantees above are unit-testable
+ * against a synthetic manifest; see `test/optimizer/rule-manifest.spec.ts`.
+ */
+export function registerManifest(
+	manifest: readonly RuleManifestEntry[],
+	passManager: PassManager,
+): void {
+	const seenIdsByPass = new Map<PassId, Set<string>>();
+
+	for (const entry of manifest) {
+		if (!passManager.getPass(entry.pass)) {
+			quereusError(
+				`Rule manifest entry '${entry.id}' targets unregistered pass '${entry.pass}'`,
+				StatusCode.INTERNAL,
+			);
+		}
+
+		let seenIds = seenIdsByPass.get(entry.pass);
+		if (!seenIds) {
+			seenIds = new Set();
+			seenIdsByPass.set(entry.pass, seenIds);
+		}
+
+		const nodeTypes = Array.isArray(entry.nodeType) ? entry.nodeType : [entry.nodeType];
+		const isFanOut = Array.isArray(entry.nodeType);
+
+		for (const nodeType of nodeTypes) {
+			const id = isFanOut ? `${entry.id}-${nodeType}` : entry.id;
+			if (seenIds.has(id)) {
+				quereusError(
+					`Duplicate optimizer rule id '${id}' in pass '${entry.pass}'`,
+					StatusCode.INTERNAL,
+				);
+			}
+			seenIds.add(id);
+
+			// addRuleToPass also runs validateSideEffectMode on the handle.
+			passManager.addRuleToPass(entry.pass, {
+				id,
+				nodeType,
+				phase: entry.phase,
+				fn: entry.fn,
+				sideEffectMode: entry.sideEffectMode,
+			});
+		}
+	}
+
+	log('Registered %d rule manifest entries to optimization passes', manifest.length);
+}
+
+/**
  * The query optimizer transforms logical plan trees into physical plan trees
  */
 export class Optimizer {
@@ -996,60 +1061,12 @@ export class Optimizer {
 	}
 
 	/**
-	 * Register every rule in `RULE_MANIFEST` with its pass, in manifest array
-	 * order. That order is the execution contract: pass rules fire in registration
-	 * order, so appending in manifest order reproduces the intended per-pass order.
-	 *
-	 * A fan-out entry (array `nodeType`) mints one handle per node type with id
-	 * `${entry.id}-${nodeType}`; a scalar entry mints one handle with `entry.id`.
-	 *
-	 * Structural well-formedness is asserted here (once, at construction): the
-	 * target pass must exist, and no two handles may share an id within a pass. The
-	 * duplicate check hard-fails rather than silently skipping (as
-	 * `PassManager.addRuleToPass` would) — a duplicate id is an author bug.
+	 * Register every rule in `RULE_MANIFEST` with its pass, in manifest array order.
+	 * Delegates to the exported {@link registerManifest} (kept module-level so the
+	 * ordering / dedup guarantees are unit-testable against a synthetic manifest).
 	 */
 	private registerRulesToPasses(): void {
-		const seenIdsByPass = new Map<PassId, Set<string>>();
-
-		for (const entry of RULE_MANIFEST) {
-			if (!this.passManager.getPass(entry.pass)) {
-				quereusError(
-					`Rule manifest entry '${entry.id}' targets unregistered pass '${entry.pass}'`,
-					StatusCode.INTERNAL,
-				);
-			}
-
-			let seenIds = seenIdsByPass.get(entry.pass);
-			if (!seenIds) {
-				seenIds = new Set();
-				seenIdsByPass.set(entry.pass, seenIds);
-			}
-
-			const nodeTypes = Array.isArray(entry.nodeType) ? entry.nodeType : [entry.nodeType];
-			const isFanOut = Array.isArray(entry.nodeType);
-
-			for (const nodeType of nodeTypes) {
-				const id = isFanOut ? `${entry.id}-${nodeType}` : entry.id;
-				if (seenIds.has(id)) {
-					quereusError(
-						`Duplicate optimizer rule id '${id}' in pass '${entry.pass}'`,
-						StatusCode.INTERNAL,
-					);
-				}
-				seenIds.add(id);
-
-				// addRuleToPass also runs validateSideEffectMode on the handle.
-				this.passManager.addRuleToPass(entry.pass, {
-					id,
-					nodeType,
-					phase: entry.phase,
-					fn: entry.fn,
-					sideEffectMode: entry.sideEffectMode,
-				});
-			}
-		}
-
-		log('Registered %d rule manifest entries to optimization passes', RULE_MANIFEST.length);
+		registerManifest(RULE_MANIFEST, this.passManager);
 	}
 
 	/**
