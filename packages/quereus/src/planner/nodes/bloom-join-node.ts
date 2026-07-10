@@ -24,6 +24,8 @@ export type { EquiJoinPair } from './join-utils.js';
  */
 export class BloomJoinNode extends PlanNode implements BinaryRelationalNode, JoinCapable, PredicateSourceCapable {
 	override readonly nodeType = PlanNodeType.HashJoin;
+	readonly isJoinCapable = true as const;
+	readonly isPredicateSourceCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 
 	constructor(

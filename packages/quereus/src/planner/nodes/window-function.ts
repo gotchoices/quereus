@@ -10,13 +10,15 @@ import { REAL_TYPE } from '../../types/builtin-types.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode, type DeepReadonly } from '../../common/types.js';
+import type { WindowFunctionCapable } from '../framework/characteristics.js';
 
 /**
  * Represents a window function call in the query plan.
  * Window functions are computed during window operation execution.
  */
-export class WindowFunctionCallNode extends PlanNode implements ZeroAryScalarNode {
+export class WindowFunctionCallNode extends PlanNode implements ZeroAryScalarNode, WindowFunctionCapable {
 	override readonly nodeType = PlanNodeType.WindowFunctionCall;
+	readonly isWindowFunctionCapable = true as const;
 
 	private outputTypeCache: Cached<ScalarType>;
 

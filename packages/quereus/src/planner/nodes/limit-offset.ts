@@ -15,6 +15,7 @@ import { addSingletonFd } from '../util/fd-utils.js';
  */
 export class LimitOffsetNode extends PlanNode implements UnaryRelationalNode, LimitCapable {
 	override readonly nodeType = PlanNodeType.LimitOffset;
+	readonly isLimitCapable = true as const;
 
 	constructor(
 		scope: Scope,

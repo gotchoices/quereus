@@ -108,6 +108,7 @@ export function propagateAggregateFds(
  */
 export class AggregateNode extends PlanNode implements UnaryRelationalNode, AggregationCapable {
   override readonly nodeType = PlanNodeType.Aggregate;
+  readonly isAggregationCapable = true as const;
 
   private outputTypeCache: Cached<RelationType>;
   private attributesCache: Cached<Attribute[]>;

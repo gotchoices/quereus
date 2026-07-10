@@ -7,7 +7,7 @@ import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import { StatusCode } from '../../common/types.js';
 import { quereusError } from '../../common/errors.js';
-import { JoinCapable, type PredicateSourceCapable } from '../framework/characteristics.js';
+import type { JoinCapable, PredicateSourceCapable } from '../framework/characteristics.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { combineJoinKeys, analyzeJoinKeyCoverage } from '../util/key-utils.js';
 import { BinaryOpNode } from './scalar.js';
@@ -104,6 +104,8 @@ export function extractEquiPairsFromCondition(
  */
 export class JoinNode extends PlanNode implements BinaryRelationalNode, JoinCapable, PredicateSourceCapable {
 	readonly nodeType = PlanNodeType.Join;
+	readonly isJoinCapable = true as const;
+	readonly isPredicateSourceCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 
 	constructor(

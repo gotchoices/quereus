@@ -23,6 +23,8 @@ import { analyzeJoinKeyCoverage, combineJoinKeys } from '../util/key-utils.js';
  */
 export class MergeJoinNode extends PlanNode implements BinaryRelationalNode, JoinCapable, PredicateSourceCapable {
 	override readonly nodeType = PlanNodeType.MergeJoin;
+	readonly isJoinCapable = true as const;
+	readonly isPredicateSourceCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 
 	constructor(

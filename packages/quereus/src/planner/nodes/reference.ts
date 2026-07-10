@@ -21,10 +21,13 @@ import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { getModuleConcurrencyMode } from '../../vtab/concurrency.js';
 import type { ColumnBindingProvider } from '../framework/characteristics.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
+import type { ColumnReferenceCapable } from '../framework/characteristics.js';
 
 /** Represents a reference to a table in the global schema. */
 export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNode, TableAccessCapable, ColumnBindingProvider {
 	override readonly nodeType = PlanNodeType.TableReference;
+	readonly isTableAccessCapable = true as const;
+	readonly isColumnBindingProviderCapable = true as const;
 
 	private typeCache: Cached<RelationType>;
 	private attributesCache: Cached<Attribute[]>;
@@ -358,8 +361,9 @@ export class TableFunctionReferenceNode extends PlanNode implements ZeroAryRelat
  * Represents a reference to a column from a relational node.
  * Uses attribute IDs for stable references across plan transformations.
  */
-export class ColumnReferenceNode extends PlanNode implements ZeroAryScalarNode {
+export class ColumnReferenceNode extends PlanNode implements ZeroAryScalarNode, ColumnReferenceCapable {
 	override readonly nodeType = PlanNodeType.ColumnReference;
+	readonly isColumnReferenceCapable = true as const;
 
 	constructor(
 		scope: Scope,

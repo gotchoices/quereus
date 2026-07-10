@@ -38,6 +38,7 @@ export interface CTEPlanNode extends UnaryRelationalNode {
  */
 export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTECapable {
 	readonly nodeType = PlanNodeType.CTE;
+	readonly isCTECapable = true as const;
 	readonly tableDescriptor: TableDescriptor = {}; // Identity object for table context lookup
 
 	private attributesCache: Cached<Attribute[]>;

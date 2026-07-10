@@ -639,61 +639,64 @@ describe('Planner Framework', () => {
 
 	describe('CapabilityDetectors', () => {
 
-		it('canPushDownPredicate detects getPredicate + withPredicate', () => {
+		// Post-branding, detection keys off a unique `is<X>Capable` brand — the method
+		// shape alone no longer qualifies a node. Each guard checks its own brand.
+
+		it('canPushDownPredicate detects the isPredicateCapable brand, not the method shape', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.canPushDownPredicate(node)).to.equal(false);
 
-			// Add the capability
+			// Methods without the brand are NOT enough post-branding.
 			(node as any).getPredicate = () => null;
 			(node as any).withPredicate = () => node;
+			expect(CapabilityDetectors.canPushDownPredicate(node)).to.equal(false);
+
+			// The brand is the contract.
+			(node as any).isPredicateCapable = true;
 			expect(CapabilityDetectors.canPushDownPredicate(node)).to.equal(true);
 		});
 
-		it('isTableAccess detects relational node with tableSchema + getAccessMethod', () => {
+		it('isTableAccess detects the isTableAccessCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isTableAccess(node)).to.equal(false);
 
-			(node as any).tableSchema = {};
-			(node as any).getAccessMethod = () => 'sequential';
+			(node as any).isTableAccessCapable = true;
 			expect(CapabilityDetectors.isTableAccess(node)).to.equal(true);
 		});
 
-		it('isSortable detects getSortKeys + withSortKeys', () => {
+		it('isSortable detects the isSortCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isSortable(node)).to.equal(false);
 
-			(node as any).getSortKeys = () => [];
-			(node as any).withSortKeys = () => node;
+			(node as any).isSortCapable = true;
 			expect(CapabilityDetectors.isSortable(node)).to.equal(true);
 		});
 
-		it('isJoin detects relational node with join methods', () => {
+		it('isJoin detects the isJoinCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isJoin(node)).to.equal(false);
 
-			(node as any).getJoinType = () => 'inner';
-			(node as any).getLeftSource = () => relNode();
-			(node as any).getRightSource = () => relNode();
+			(node as any).isJoinCapable = true;
 			expect(CapabilityDetectors.isJoin(node)).to.equal(true);
 		});
 
-		it('isCached detects getCacheStrategy', () => {
+		it('isCached detects the isCacheCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isCached(node)).to.equal(false);
 
-			(node as any).getCacheStrategy = () => null;
+			(node as any).isCacheCapable = true;
 			expect(CapabilityDetectors.isCached(node)).to.equal(true);
 		});
 
-		it('isColumnReference requires scalar with attributeId + columnIndex + expression', () => {
+		it('isColumnReference detects the isColumnReferenceCapable brand', () => {
 			const node = scalarNode({ nodeType: PlanNodeType.ColumnReference });
-			(node as any).attributeId = 1;
-			(node as any).columnIndex = 0;
-			(node as any).expression = {};
+			expect(CapabilityDetectors.isColumnReference(node)).to.equal(false);
+
+			(node as any).isColumnReferenceCapable = true;
 			expect(CapabilityDetectors.isColumnReference(node)).to.equal(true);
 		});
 
-		it('isColumnReference rejects relational nodes', () => {
+		it('isColumnReference rejects a node that lacks the brand (even with look-alike fields)', () => {
 			const node = relNode();
 			(node as any).attributeId = 1;
 			(node as any).columnIndex = 0;
@@ -701,33 +704,35 @@ describe('Planner Framework', () => {
 			expect(CapabilityDetectors.isColumnReference(node)).to.equal(false);
 		});
 
-		it('isWindowFunction checks nodeType === WindowFunctionCall', () => {
+		it('isWindowFunction detects the isWindowFunctionCapable brand', () => {
 			const node = scalarNode({ nodeType: PlanNodeType.WindowFunctionCall });
-			(node as any).functionName = 'row_number';
-			(node as any).isDistinct = false;
+			expect(CapabilityDetectors.isWindowFunction(node)).to.equal(false);
+
+			(node as any).isWindowFunctionCapable = true;
 			expect(CapabilityDetectors.isWindowFunction(node)).to.equal(true);
 		});
 
-		it('isWindowFunction rejects non-window nodeType', () => {
+		it('isWindowFunction rejects a node without the window brand', () => {
+			// A scalar-function-shaped node (shared nodeType space) is not a window fn.
 			const node = scalarNode({ nodeType: PlanNodeType.ScalarFunctionCall });
 			(node as any).functionName = 'row_number';
 			(node as any).isDistinct = false;
 			expect(CapabilityDetectors.isWindowFunction(node)).to.equal(false);
 		});
 
-		it('isColumnBindingProvider detects a node whose getBindingRelationName is a function', () => {
+		it('isColumnBindingProvider detects the isColumnBindingProviderCapable brand', () => {
 			const node = relNode();
 			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(false);
 
-			(node as any).getBindingRelationName = () => 'my_table';
+			(node as any).isColumnBindingProviderCapable = true;
 			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(true);
 		});
 
-		it('isColumnBindingProvider rejects a non-function getBindingRelationName', () => {
-			// Regression: a same-named data member (string) must NOT be mistaken for
-			// the ColumnBindingProvider method.
+		it('isColumnBindingProvider rejects a look-alike method without the brand', () => {
+			// A same-named member (function or string) must NOT be mistaken for the
+			// capability — only the brand qualifies.
 			const node = relNode();
-			(node as any).getBindingRelationName = 'my_table';
+			(node as any).getBindingRelationName = () => 'my_table';
 			expect(CapabilityDetectors.isColumnBindingProvider(node)).to.equal(false);
 		});
 

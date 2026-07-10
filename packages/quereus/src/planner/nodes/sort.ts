@@ -6,7 +6,7 @@ import { formatSortKey } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { extractOrderingFromSortKeys } from '../framework/physical-utils.js';
-import { SortCapable } from '../framework/characteristics.js';
+import type { SortCapable } from '../framework/characteristics.js';
 import { ColumnReferenceNode } from './reference.js';
 import { isUniqueDeterminant } from '../util/fd-utils.js';
 import { sortCost } from '../cost/index.js';
@@ -31,6 +31,7 @@ export interface SortKey {
  */
 export class SortNode extends PlanNode implements UnaryRelationalNode, SortCapable {
 	override readonly nodeType = PlanNodeType.Sort;
+	readonly isSortCapable = true as const;
 
 	constructor(
 		scope: Scope,

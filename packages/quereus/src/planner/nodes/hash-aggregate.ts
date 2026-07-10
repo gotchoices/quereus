@@ -9,6 +9,7 @@ import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
 import { COST_CONSTANTS } from '../cost/index.js';
 import { propagateAggregateFds } from './aggregate-node.js';
+import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
  * Physical node representing a hash-based aggregate operation.
@@ -16,8 +17,9 @@ import { propagateAggregateFds } from './aggregate-node.js';
  * Builds a hash map keyed by GROUP BY columns, accumulates aggregate state per group,
  * and emits all groups at the end.
  */
-export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
+export class HashAggregateNode extends PlanNode implements UnaryRelationalNode, AggregationCapable {
 	override readonly nodeType = PlanNodeType.HashAggregate;
+	readonly isAggregationCapable = true as const;
 
 	private attributesCache: Cached<Attribute[]>;
 
@@ -258,5 +260,34 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 			undefined,
 			this.preserveAttributeIds
 		);
+	}
+
+	// AggregationCapable interface. See StreamAggregateNode for why the physical
+	// aggregate carries these (brand contract + defensive fanout descent); the
+	// physical-selection rule never re-runs on this node.
+	getGroupingKeys(): readonly ScalarPlanNode[] {
+		return this.groupBy;
+	}
+
+	getAggregateExpressions(): readonly { expr: ScalarPlanNode; alias: string; attributeId: number }[] {
+		const attributes = this.getAttributes();
+		const groupByCount = this.groupBy.length;
+		return this.aggregates.map((agg, index) => ({
+			expr: agg.expression,
+			alias: agg.alias,
+			attributeId: attributes[groupByCount + index].id
+		}));
+	}
+
+	requiresOrdering(): boolean {
+		return false; // hash aggregation does not require ordered input
+	}
+
+	canStreamAggregate(): boolean {
+		return false; // this IS the hash strategy — not a streaming aggregate
+	}
+
+	getSource(): RelationalPlanNode {
+		return this.source;
 	}
 }

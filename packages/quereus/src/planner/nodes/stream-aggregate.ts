@@ -8,13 +8,15 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
 import { propagateAggregateFds } from './aggregate-node.js';
+import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
  * Physical node representing a streaming aggregate operation.
  * Requires input to be ordered by grouping columns.
  */
-export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode {
+export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode, AggregationCapable {
   override readonly nodeType = PlanNodeType.StreamAggregate;
+  readonly isAggregationCapable = true as const;
 
   private attributesCache: Cached<Attribute[]>;
 
@@ -277,5 +279,37 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
       undefined, // Let it recalculate cost
       this.preserveAttributeIds // Preserve the original attribute IDs
     );
+  }
+
+  // AggregationCapable interface. These members mirror the logical AggregateNode's
+  // so `CapabilityDetectors.isAggregating` recognizes the physical form too. The
+  // physical-selection rule (`ruleAggregatePhysical`) is nodeType-gated to the logical
+  // Aggregate and never re-runs on this node; these exist to honor the brand contract
+  // and to keep the defensive aggregate-root descent in `rule-fanout-lookup-join`
+  // correct should a physical aggregate ever surface at a subquery root.
+  getGroupingKeys(): readonly ScalarPlanNode[] {
+    return this.groupBy;
+  }
+
+  getAggregateExpressions(): readonly { expr: ScalarPlanNode; alias: string; attributeId: number }[] {
+    const attributes = this.getAttributes();
+    const groupByCount = this.groupBy.length;
+    return this.aggregates.map((agg, index) => ({
+      expr: agg.expression,
+      alias: agg.alias,
+      attributeId: attributes[groupByCount + index].id
+    }));
+  }
+
+  requiresOrdering(): boolean {
+    return true; // streaming aggregation consumes input ordered on the group keys
+  }
+
+  canStreamAggregate(): boolean {
+    return true;
+  }
+
+  getSource(): RelationalPlanNode {
+    return this.source;
   }
 }

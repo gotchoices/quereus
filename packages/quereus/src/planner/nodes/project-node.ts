@@ -10,7 +10,7 @@ import { formatProjection } from '../../util/plan-formatter.js';
 import { ColumnReferenceNode } from './reference.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { ProjectionCapable } from '../framework/characteristics.js';
+import type { ProjectionCapable } from '../framework/characteristics.js';
 import type { PhysicalProperties, FunctionalDependency, AuthoredInverseMeta } from './plan-node.js';
 import { projectMonotonicOnByAttrId, projectOrdering } from '../framework/physical-utils.js';
 import { deriveProjectUpdateLineage } from '../analysis/update-lineage.js';
@@ -64,6 +64,7 @@ function effectiveProjectionType(
  */
 export class ProjectNode extends PlanNode implements UnaryRelationalNode, ProjectionCapable {
 	override readonly nodeType = PlanNodeType.Project;
+	readonly isProjectionCapable = true as const;
 
 	private outputTypeCache: Cached<RelationType>;
 	private attributesCache: Cached<readonly Attribute[]>;

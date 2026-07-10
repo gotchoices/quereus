@@ -11,7 +11,7 @@ import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
 import type { FilterInfo } from '../../vtab/filter-info.js';
 import type { ScalarPlanNode } from './plan-node.js';
-import { TableAccessCapable } from '../framework/characteristics.js';
+import type { TableAccessCapable } from '../framework/characteristics.js';
 import { addSingletonFd } from '../util/fd-utils.js';
 
 /**
@@ -64,6 +64,8 @@ function liftAdvertisement(
  * Provides common functionality for sequential scan, index scan, and index seek
  */
 export abstract class TableAccessNode extends PlanNode implements UnaryRelationalNode, TableAccessCapable {
+	// Brand inherited by SeqScanNode / IndexScanNode / IndexSeekNode / EmptyResultNode.
+	readonly isTableAccessCapable = true as const;
 	private attributesCache: Cached<Attribute[]>;
 	private outputType: Cached<RelationType>;
 

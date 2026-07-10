@@ -17,6 +17,7 @@ export type CacheStrategy = 'memory' | 'spill'; // Future: spill-to-disk
  */
 export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCapable {
 	readonly nodeType = PlanNodeType.Cache;
+	readonly isCacheCapable = true as const;
 
 	constructor(
 		scope: Scope,

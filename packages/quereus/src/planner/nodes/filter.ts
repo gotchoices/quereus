@@ -5,7 +5,7 @@ import type { Scope } from '../scopes/scope.js';
 import { formatExpression } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
-import { PredicateCapable, type PredicateSourceCapable } from '../framework/characteristics.js';
+import type { PredicateCapable, PredicateSourceCapable } from '../framework/characteristics.js';
 import { createTableInfoFromNode, extractConstraints } from '../analysis/constraint-extractor.js';
 import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
@@ -19,6 +19,8 @@ import { filterCost } from '../cost/index.js';
  */
 export class FilterNode extends PlanNode implements UnaryRelationalNode, PredicateCapable, PredicateSourceCapable {
 	override readonly nodeType = PlanNodeType.Filter;
+	readonly isPredicateCapable = true as const;
+	readonly isPredicateSourceCapable = true as const;
 
 	constructor(
 		scope: Scope,
