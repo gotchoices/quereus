@@ -116,6 +116,14 @@ the design notes — carry no banner and are listed under `untiered` in `docs/.s
 Every `docs/*.md` appears in one list or the other, except the frozen review artifacts
 (`review.md`, `review.html`), which every doc check skips.
 
+`yarn docs:check` enforces all of this, so a new doc must be classified before `yarn check`
+passes: add it to `docs` with a tier and give it a banner, or add it to `untiered` and give it
+none. The checker also refuses a banner that is one character off the form above, an entry
+naming a doc that no longer exists, and a tier name that `stability.md` does not define. It
+does not — and cannot — tell you whether the tier you chose is the right one. There is no
+`--update-stability` flag for the same reason: a flag that classifies a doc for you would
+classify every doc `untiered`.
+
 ## The size ratchet
 
 `docs/.doc-budget.json` records each large doc's current word count. A doc may shrink; it

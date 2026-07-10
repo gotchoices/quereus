@@ -2,7 +2,7 @@
 
 // Documentation integrity gate. Cheapest link in `yarn check`, so it runs first.
 //
-// Three independent checks, all reporting to one failure list:
+// Four independent checks, all reporting to one failure list:
 //
 //   A. Link integrity   — every markdown link and every `docs/*.md` reference in
 //                         the source tree names a file that exists, and every
@@ -13,6 +13,10 @@
 //   C. Size ratchet     — a doc listed in `docs/.doc-budget.json` may shrink but never
 //                         grow past its recorded size; an unlisted doc must come in
 //                         under the global `maxWords`.
+//   D. Stability tiers  — every docs/*.md is classified in `docs/.stability.json`, every
+//                         tiered doc carries exactly one header banner naming its
+//                         recorded tier, and every tier named anywhere is one that
+//                         `docs/stability.md` defines.
 //
 // Usage:
 //   node scripts/check-docs.mjs                    run every check; exit 1 on any failure
@@ -29,6 +33,8 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BUDGET_PATH = join(ROOT, 'docs', '.doc-budget.json');
 const INVARIANTS_PATH = join(ROOT, 'docs', 'invariants.md');
+const STABILITY_PATH = join(ROOT, 'docs', '.stability.json');
+const STABILITY_DOC_PATH = join(ROOT, 'docs', 'stability.md');
 
 // Frozen review artifacts: they describe a past state on purpose and must not be "corrected".
 const EXEMPT = new Set(['docs/review.md', 'docs/review.html']);
@@ -44,14 +50,17 @@ const toPosix = (p) => p.split(sep).join('/');
 const repoPath = (abs) => toPosix(relative(ROOT, abs));
 
 /**
- * Read with line endings normalized to `\n`.
+ * Read with line endings normalized to `\n` and any leading byte-order mark dropped.
  *
  * NOTE: this is load-bearing on win32, where the working tree is CRLF. JavaScript's `.`
  * does not match `\r` (it is a line terminator), so a `(.*)$` pattern silently fails to
  * match any line of a CRLF file — fences never open and headings never parse. Every
  * regex in this module assumes LF; read through here, never `readFileSync` directly.
+ *
+ * The BOM strip is the same class of defect one character in: `docs/sync.md` opens with
+ * U+FEFF, so `/^# /` never matched its H1 and its title anchor was invisible to Check A.
  */
-const readText = (path) => readFileSync(path, 'utf8').replace(/\r\n?/g, '\n');
+const readText = (path) => readFileSync(path, 'utf8').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
 
 // NOTE: the tree is re-walked and every file re-read on each run (~1s for this repo). If the
 // checker ever shows up as slow in `yarn check`, cache results by mtime rather than trimming
@@ -537,6 +546,172 @@ function updateRatchet(force) {
 }
 
 // ---------------------------------------------------------------------------
+// Check D — stability banners
+// ---------------------------------------------------------------------------
+
+// The one legal banner form. Anchored, and deliberately not forgiving: a banner one character
+// off is a banner that gets copy-pasted wrong forever. The dash is an em dash (U+2014), matching
+// the `code:` / `guard:` line style of the invariant register.
+const BANNER = /^>\s+\*\*Stability:\s+(\w+)\*\*\s+—\s+see \[Stability Tiers\]\(stability\.md#tiers\)\.$/;
+
+// Anything a reader would call a banner. Matching this but not BANNER is a malformed banner,
+// reported as such — otherwise a wrong dash reads as "no banner at all".
+const BANNER_ISH = /^>\s*\*\*Stability\b/;
+
+/** `> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).` → `{ tier }`; anything else → `null`. */
+function parseBanner(line) {
+	const match = BANNER.exec(line.trimEnd());
+	return match ? { tier: match[1] } : null;
+}
+
+/** Every banner in `content`, fences already stripped, with 1-based line numbers. */
+function banners(strippedContent, fail, doc) {
+	const found = [];
+	strippedContent.split('\n').forEach((line, index) => {
+		const parsed = parseBanner(line);
+		if (parsed) found.push({ tier: parsed.tier, line: index + 1 });
+		else if (BANNER_ISH.test(line)) fail(`${doc}:${index + 1}: malformed stability banner: ${line.trim()}`);
+	});
+	return found;
+}
+
+/**
+ * The lines below the `#` H1 that a header banner may occupy: everything up to the first
+ * subsequent heading of any level, or six non-blank lines, whichever comes first. The
+ * line-count bound is a fallback for a doc whose H1 is followed by a long intro before its
+ * first `##`. Returns `null` when the doc has no H1.
+ *
+ * NOTE: every doc today puts its banner on the line right below the H1, so the six-line bound
+ * has no bite. If a doc ever needs a longer preamble above its banner, raise the bound rather
+ * than dropping it — a banner buried in an intro reads as a section override, and the doc then
+ * fails as if it had no header banner at all.
+ */
+function headerWindow(lines) {
+	const h1 = lines.findIndex((line) => /^# /.test(line));
+	if (h1 === -1) return null;
+
+	const window = new Set();
+	let nonBlank = 0;
+	for (let i = h1 + 1; i < lines.length; i++) {
+		if (/^#{1,6} /.test(lines[i])) break;
+		if (lines[i].trim() !== '' && ++nonBlank > 6) break;
+		window.add(i + 1); // 1-based, to match banner line numbers
+	}
+	return window;
+}
+
+/** The `###` headings under `## Tiers` in `docs/stability.md` — the vocabulary of tier names. */
+function definedTiers(content) {
+	const tiers = [];
+	let inTiers = false;
+	for (const line of stripFences(content).split('\n')) {
+		const match = /^(#{1,6})\s+(.*)$/.exec(line);
+		if (!match) continue;
+		if (match[1].length <= 2) inTiers = match[1] === '##' && headingText(match[2]) === 'Tiers';
+		else if (inTiers && match[1] === '###') tiers.push(headingText(match[2]));
+	}
+	return tiers;
+}
+
+function readStability() {
+	if (!existsSync(STABILITY_PATH)) {
+		throw new Error(`missing ${repoPath(STABILITY_PATH)} — the stability map has no data`);
+	}
+	return JSON.parse(readFileSync(STABILITY_PATH, 'utf8'));
+}
+
+/** Rule 1: the two sources of tier names must agree as a set, so a rename fails loudly. */
+function checkTierVocabulary(recorded, fail) {
+	const defined = definedTiers(readText(STABILITY_DOC_PATH));
+	if (!defined.length) fail(`docs/stability.md: no '###' tier headings under '## Tiers'`);
+
+	for (const tier of recorded) {
+		if (!defined.includes(tier)) fail(`docs/.stability.json: tier '${tier}' is not defined in docs/stability.md`);
+	}
+	for (const tier of defined) {
+		if (!recorded.includes(tier)) fail(`docs/stability.md: tier '${tier}' is defined here but missing from docs/.stability.json`);
+	}
+	return new Set(defined);
+}
+
+/** Rule 2: every doc is classified exactly once, and every entry names a doc that exists. */
+function checkClassification(stability, docs, fail) {
+	const tiered = new Map(Object.entries(stability.docs));
+	const untiered = new Set(stability.untiered);
+
+	for (const doc of tiered.keys()) {
+		if (untiered.has(doc)) fail(`docs/.stability.json: '${doc}' is classified twice — it is in both 'docs' and 'untiered'`);
+	}
+	// Unlike the ratchet, whose orphan entries are inert, a stale tier entry hides a missing
+	// classification: re-add the doc and rule 2 would pass on an assignment nobody reviewed.
+	for (const doc of [...tiered.keys(), ...untiered]) {
+		if (docs.has(doc)) continue;
+		if (EXEMPT.has(doc)) fail(`docs/.stability.json: entry '${doc}' is a frozen review artifact — every doc check skips it, so it must not be classified`);
+		else fail(`docs/.stability.json: entry '${doc}' names a file that does not exist`);
+	}
+	for (const doc of docs) {
+		if (!tiered.has(doc) && !untiered.has(doc)) {
+			fail(`${doc}: not classified in docs/.stability.json — add it to 'docs' with a tier, or to 'untiered'`);
+		}
+	}
+	return { tiered, untiered };
+}
+
+/** Rules 3 and 5: a tiered doc's header banner names its recorded tier; section banners only have to name a real tier. */
+function checkTieredDoc(doc, tier, found, window, vocabulary, fail) {
+	if (window === null) {
+		fail(`${doc}: tiered '${tier}' but has no '#' heading — cannot locate the header window`);
+		return;
+	}
+
+	const header = found.filter((banner) => window.has(banner.line));
+	if (!header.length) {
+		fail(`${doc}: tiered '${tier}' but carries no stability banner under its H1`);
+	} else if (header.length > 1) {
+		fail(`${doc}:${header[1].line}: a second stability banner in the header window — a doc declares exactly one tier`);
+	} else if (header[0].tier !== tier) {
+		fail(`${doc}:${header[0].line}: banner says '${header[0].tier}' but docs/.stability.json records '${tier}'`);
+	}
+
+	// A banner below the header window is a section override — that is how `declare schema` is
+	// Beta inside a Stable `sql.md`. Disagreeing with the doc's tier is its whole purpose, so it
+	// is checked for tier validity and nothing else.
+	for (const banner of found) {
+		if (window.has(banner.line)) continue;
+		if (!vocabulary.has(banner.tier)) {
+			fail(`${doc}:${banner.line}: section banner names tier '${banner.tier}', which is not defined in docs/stability.md`);
+		}
+	}
+}
+
+function checkStability(fail) {
+	const stability = readStability();
+	const docs = new Set(docFiles().map(repoPath));
+
+	const vocabulary = checkTierVocabulary(stability.tiers, fail);
+	const { tiered, untiered } = checkClassification(stability, docs, fail);
+
+	for (const [doc, tier] of tiered) {
+		if (!vocabulary.has(tier)) fail(`docs/.stability.json: '${doc}' is tiered '${tier}', which is not defined in docs/stability.md`);
+	}
+
+	for (const doc of docs) {
+		// Fences first: `doc-conventions.md` and `stability.md` both show the banner form as an
+		// illustration. Without this, `stability.md` fails rule 4 against its own example.
+		const content = stripFences(readText(resolve(ROOT, doc)));
+		const found = banners(content, fail, doc);
+
+		if (untiered.has(doc)) {
+			// Rule 4. Untiered docs never take the "missing banner" branch — the whole file is scanned,
+			// H1 or no H1, and any banner at all is the failure.
+			for (const banner of found) fail(`${doc}:${banner.line}: untiered doc carries a stability banner`);
+		} else if (tiered.has(doc)) {
+			checkTieredDoc(doc, tiered.get(doc), found, headerWindow(content.split('\n')), vocabulary, fail);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // self-test — pins the slugifier against forms that live links already depend on
 // ---------------------------------------------------------------------------
 
@@ -568,6 +743,35 @@ function selfTest(fail) {
 	for (const expected of ['overview', 'overview-1', 'overview-2']) {
 		if (!repeated.has(expected)) fail(`scripts/check-docs.mjs: duplicate-heading disambiguation lost '${expected}'`);
 	}
+
+	// Every stability banner links `stability.md#tiers`. Pinning the slug here means a rename of
+	// `## Tiers` is caught once, rather than as forty simultaneous dead-anchor failures.
+	if (slugify(headingText('Tiers')) !== 'tiers') fail(`scripts/check-docs.mjs: '## Tiers' no longer slugs to 'tiers'`);
+
+	const banner = '> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers).';
+	if (parseBanner(banner)?.tier !== 'Experimental') fail(`scripts/check-docs.mjs: the canonical stability banner no longer parses`);
+
+	const nearMisses = [
+		'> **Stability: Experimental** - see [Stability Tiers](stability.md#tiers).', // hyphen, not an em dash
+		'> **Stability: Experimental** — see Stability Tiers.', // no link
+		'> **stability: Experimental** — see [Stability Tiers](stability.md#tiers).', // lowercase
+		'> **Stability: Experimental** — see [Stability Tiers](stability.md#tiers)', // no full stop
+		'> **Stability: Experimental** — see [Stability Tiers](#tiers).', // link relative to the wrong file
+	];
+	for (const line of nearMisses) {
+		if (parseBanner(line)) fail(`scripts/check-docs.mjs: the banner regex tolerates a near-miss: ${line}`);
+	}
+
+	// A banner shown inside a fence is an illustration, not a declaration. `doc-conventions.md`
+	// and `stability.md` both rely on this, and `stability.md` is itself untiered.
+	const fenced = stripFences(`# Doc\n\n\`\`\`markdown\n${banner}\n\`\`\`\n`);
+	if (fenced.split('\n').some((line) => parseBanner(line))) fail(`scripts/check-docs.mjs: a fenced banner survives stripFences`);
+
+	// The header window ends at the first subsequent heading, so a banner under `## Section` is a
+	// section override — never the doc's header banner.
+	const window = headerWindow(`# Doc\n\n${banner}\n\n## Section\n\n${banner}\n`.split('\n'));
+	if (!window.has(3) || window.has(7)) fail(`scripts/check-docs.mjs: the header window no longer ends at the first subsequent heading`);
+	if (headerWindow(['no h1 here']) !== null) fail(`scripts/check-docs.mjs: headerWindow must report a missing H1 as null`);
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +799,7 @@ function main() {
 	selfTest(fail);
 	checkLinks(fail);
 	checkInvariants(fail);
+	checkStability(fail);
 	checkRatchet(fail);
 
 	if (failures.length) {
@@ -602,7 +807,7 @@ function main() {
 		console.error(`\n${failures.length} documentation failure(s). See docs/doc-conventions.md.`);
 		process.exit(1);
 	}
-	console.log('Docs OK: links resolve, invariants well-formed, sizes within ratchet.');
+	console.log('Docs OK: links resolve, invariants well-formed, sizes within ratchet, tiers declared.');
 }
 
 main();
