@@ -22,6 +22,8 @@ import { ColumnReferenceNode, TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
 import { RowOpFlag, type TableSchema, type RowConstraintSchema } from '../../schema/table.js';
+import { uniqueEnforcementCollations } from '../../schema/unique-enforcement.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { ReturningNode, type ReturningProjection } from '../nodes/returning-node.js';
 import { expandReturningStar } from './returning-star.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
@@ -258,6 +260,54 @@ function createGeneratedColumnProjection(
 }
 
 /**
+ * Resolve the per-target-column comparison metadata an `ON CONFLICT (cols)` clause
+ * needs to decide whether a UNIQUE violation matches it: the column affinity
+ * (logical type) and the enforcement collation NAME of the constraint the target
+ * names. Both arrays are index-aligned with `conflictTargetIndices` (the single
+ * source of column order) so the runtime match can compare the way the constraint
+ * *enforces* rather than by byte identity.
+ *
+ * The enforcement collation is the *constraint's*, not merely the column's declared
+ * collation:
+ *  - a PK target uses the PK column definition's collation (already column-collation
+ *    or BINARY — see `createPrimaryKeyFunctions`);
+ *  - a UNIQUE target uses {@link uniqueEnforcementCollations}, which prefers an
+ *    index-derived per-column COLLATE.
+ * Falls back to each column's declared collation when the target matches no declared
+ * constraint (defensive — a valid `ON CONFLICT` names exactly one). Column order in
+ * the target may differ from the constraint's, so each target index is mapped back to
+ * its own column's enforcement collation, never positionally.
+ */
+function resolveConflictTargetEnforcement(
+	tableSchema: TableSchema,
+	conflictTargetIndices: number[],
+): { collations: (string | undefined)[]; types: LogicalType[] } {
+	const types = conflictTargetIndices.map(idx => tableSchema.columns[idx].logicalType);
+
+	const targetSet = new Set(conflictTargetIndices);
+	const sameColumnSet = (cols: ReadonlyArray<number>): boolean =>
+		cols.length === conflictTargetIndices.length && cols.every(c => targetSet.has(c));
+
+	// PK target: the PK column definition carries the enforcement collation.
+	const pkDef = tableSchema.primaryKeyDefinition;
+	if (pkDef.length > 0 && sameColumnSet(pkDef.map(d => d.index))) {
+		const byIndex = new Map(pkDef.map(d => [d.index, d.collation]));
+		return { collations: conflictTargetIndices.map(idx => byIndex.get(idx)), types };
+	}
+
+	// UNIQUE target: the matching constraint's per-column enforcement collation.
+	const uc = tableSchema.uniqueConstraints?.find(u => sameColumnSet(u.columns));
+	if (uc) {
+		const ucCollations = uniqueEnforcementCollations(tableSchema, uc);
+		const byIndex = new Map(uc.columns.map((c, i) => [c, ucCollations[i]]));
+		return { collations: conflictTargetIndices.map(idx => byIndex.get(idx)), types };
+	}
+
+	// Defensive fallback: the columns' declared collations.
+	return { collations: conflictTargetIndices.map(idx => tableSchema.columns[idx].collation), types };
+}
+
+/**
  * Builds UPSERT clause plans from AST UPSERT clauses.
  *
  * In UPSERT expressions:
@@ -289,9 +339,19 @@ function buildUpsertClausePlans(
 			});
 		}
 
+		// Resolve the per-target-column affinity + enforcement collation once here, so
+		// the runtime conflict-target match compares the way the constraint enforces
+		// (collation-equal / affinity-coerced conflicts route to the DO UPDATE / DO
+		// NOTHING arm) without reaching back into the schema per row.
+		const enforcement = conflictTargetIndices
+			? resolveConflictTargetEnforcement(tableSchema, conflictTargetIndices)
+			: undefined;
+
 		if (clause.action === 'nothing') {
 			return {
 				conflictTargetIndices,
+				conflictTargetCollations: enforcement?.collations,
+				conflictTargetTypes: enforcement?.types,
 				action: 'nothing' as const,
 			};
 		}
@@ -394,6 +454,8 @@ function buildUpsertClausePlans(
 
 		return {
 			conflictTargetIndices,
+			conflictTargetCollations: enforcement?.collations,
+			conflictTargetTypes: enforcement?.types,
 			action: 'update' as const,
 			assignments,
 			whereCondition,

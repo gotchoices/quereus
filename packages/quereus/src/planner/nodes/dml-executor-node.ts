@@ -5,6 +5,7 @@ import type { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { ConflictResolution } from '../../common/constants.js';
 import { RowOp } from '../../common/types.js';
+import type { LogicalType } from '../../types/logical-type.js';
 
 /**
  * Represents a planned UPSERT clause for INSERT operations.
@@ -13,6 +14,26 @@ import { RowOp } from '../../common/types.js';
 export interface UpsertClausePlan {
 	/** Conflict target column indices (matches PK if undefined) */
 	conflictTargetIndices?: number[];
+	/**
+	 * Per-conflict-target-column enforcement collation NAME, index-aligned with
+	 * {@link conflictTargetIndices} (an `undefined` entry means BINARY). This is the
+	 * collation the targeted constraint *enforces* under — a PK column def's collation,
+	 * or a UNIQUE constraint's `uniqueEnforcementCollations` (which prefers an
+	 * index-derived per-column COLLATE) — not merely the column's declared collation.
+	 * Resolved to comparison functions at emit time; consumed by the runtime
+	 * conflict-target match so a collation-equal conflict (e.g. NOCASE case-variant)
+	 * routes to the DO UPDATE / DO NOTHING arm instead of aborting. Set only when
+	 * {@link conflictTargetIndices} is set.
+	 */
+	conflictTargetCollations?: (string | undefined)[];
+	/**
+	 * Per-conflict-target-column logical type, index-aligned with
+	 * {@link conflictTargetIndices}. The runtime match applies this column's affinity to
+	 * the (pre-affinity-coercion) proposed value before the enforcement-collation
+	 * comparison, so an affinity-coerced conflict (e.g. `'1'` proposed into an INTEGER
+	 * key holding `1`) matches. Set only when {@link conflictTargetIndices} is set.
+	 */
+	conflictTargetTypes?: LogicalType[];
 	/** Action: 'nothing' skips the row, 'update' performs column updates */
 	action: 'nothing' | 'update';
 	/**

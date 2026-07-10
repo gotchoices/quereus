@@ -13,7 +13,9 @@ import type { UpdateArgs, VirtualTable } from '../../vtab/table.js';
 import type { TableSchema } from '../../schema/table.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { hasNativeEventSupport } from '../../util/event-support.js';
-import { sqlValueIdentical } from '../../util/comparison.js';
+import { sqlValueIdentical, compareSqlValuesFast, BINARY_COLLATION, type CollationFunction } from '../../util/comparison.js';
+import { validateAndParse } from '../../types/validation.js';
+import type { LogicalType } from '../../types/logical-type.js';
 import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
@@ -34,6 +36,20 @@ let stmtSavepointCounter = 0;
  */
 interface RuntimeUpsertClause {
 	conflictTargetIndices?: number[];
+	/**
+	 * Per-conflict-target-column enforcement collation function, index-aligned with
+	 * {@link conflictTargetIndices}. Resolved once at emit from the plan's collation
+	 * NAMES; the conflict-target match compares each target column under it (an absent
+	 * array falls back to BINARY, i.e. the pre-fix byte-identity behavior).
+	 */
+	conflictTargetCollationFns?: CollationFunction[];
+	/**
+	 * Per-conflict-target-column logical type, index-aligned with
+	 * {@link conflictTargetIndices}. The match applies this column's affinity to the
+	 * proposed value (which reaches the executor pre-affinity-coercion) before comparing
+	 * against the already-coerced existing row.
+	 */
+	conflictTargetTypes?: LogicalType[];
 	action: 'nothing' | 'update';
 	/** Indices into the evaluators array for each assignment (column index -> evaluator index) */
 	assignmentIndices?: Map<number, number>;
@@ -43,6 +59,44 @@ interface RuntimeUpsertClause {
 	newRowDescriptor?: RowDescriptor;
 	/** Row descriptor for existing row references */
 	existingRowDescriptor?: RowDescriptor;
+}
+
+/**
+ * True when a proposed value equals the stored existing value at one conflict-target
+ * column the way the targeted constraint ENFORCES: the column's affinity is applied to
+ * the proposed value (which reaches the executor pre-affinity-coercion, while
+ * `existing` is the already-coerced stored value), then the two are compared under the
+ * column's precomputed enforcement collation.
+ *
+ * `targetPos` indexes the clause's per-target metadata arrays (which are aligned with
+ * `conflictTargetIndices`). When that metadata is absent — a defensively-old plan — it
+ * degrades to BINARY with no coercion, i.e. exactly the byte-identity semantics of
+ * `sqlValueIdentical`, preserving its numeric-storage-class tolerance via
+ * {@link compareSqlValuesFast}. A coercion failure likewise falls back to the raw
+ * proposed value (it then compares unequal and the caller aborts, as before).
+ */
+function conflictTargetValuesMatch(
+	existing: SqlValue,
+	proposed: SqlValue,
+	clause: RuntimeUpsertClause,
+	targetPos: number,
+): boolean {
+	const type = clause.conflictTargetTypes?.[targetPos];
+	const collationFn = clause.conflictTargetCollationFns?.[targetPos] ?? BINARY_COLLATION;
+	// NOTE: re-coerces the proposed value per conflicting row via validateAndParse; only
+	// reached on the (cold) UNIQUE-violation-with-upsert-clause path, so it is off the
+	// happy-path insert. If a workload ever hammers ON CONFLICT on a wide composite target,
+	// precompute per-target coercion closures at emit instead of dispatching on type here.
+	let coercedProposed = proposed;
+	if (type) {
+		try {
+			coercedProposed = validateAndParse(proposed, type);
+		} catch {
+			// Coercion failed — compare the raw proposed value (aborts, as pre-fix).
+			coercedProposed = proposed;
+		}
+	}
+	return compareSqlValuesFast(existing, coercedProposed, collationFn) === 0;
 }
 
 /**
@@ -269,6 +323,18 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 				existingRowDescriptor: clause.existingRowDescriptor,
 			};
 
+			// Resolve the per-target-column enforcement collation NAMES to functions once
+			// here (recording the collation dependency so a redefined collation re-emits),
+			// and carry the per-column logical types for affinity coercion. Consumed by
+			// matchUpsertClause so a collation-equal / affinity-coerced conflict on the
+			// targeted constraint routes to DO UPDATE / DO NOTHING instead of aborting.
+			if (clause.conflictTargetIndices && clause.conflictTargetCollations) {
+				runtime.conflictTargetCollationFns = clause.conflictTargetCollations.map(
+					name => ctx.resolveCollation(name ?? 'BINARY'),
+				);
+				runtime.conflictTargetTypes = clause.conflictTargetTypes;
+			}
+
 			if (clause.action === 'update' && clause.assignments) {
 				runtime.assignmentIndices = new Map();
 				for (const [colIndex, valueNode] of clause.assignments) {
@@ -318,31 +384,26 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			}
 
 			// Match when the proposed values equal the existing row at the clause's
-			// conflict-target columns — i.e. the conflict is on those columns.
-			// NOTE: two residual corners this value-comparison cannot disambiguate,
-			// neither in scope here:
-			//  - Multi-constraint coincidence: if an insert violates the targeted
-			//    constraint AND another unique constraint at once, and the vtab
-			//    returns the targeted constraint's existingRow, the row is still
-			//    suppressed though the uncovered conflict should abort. The vtab
-			//    short-circuits on the first violation, so even full
-			//    constraint-identity tracking couldn't fix this without it
-			//    reporting every violated constraint.
-			//  - Representation-sensitive keys: sqlValueIdentical is numeric-storage-class
-			//    tolerant (bigint/number no longer diverge), but `proposedRow` reaches us
-			//    pre-affinity-coercion (the insert pipeline defers type conversion to the
-			//    vtab's storage layer) while `existingRow` is the already-coerced stored
-			//    row. So a conflict the vtab raised under affinity (e.g. insert '1' into an
-			//    INTEGER key holding 1) OR under a coarser collation (e.g. NOCASE
-			//    case-variant) compares unequal here and aborts rather than skips.
-			//    Both share one fix: compare the way the constraint enforces — apply
-			//    the column's affinity to the proposed value and compare via the
-			//    constraint's enforcement collation (uniqueEnforcementCollations +
-			//    compareSqlValuesFast) instead of sqlValueIdentical. Well-formed seeds
-			//    re-present byte-identical literals, so seed idempotency is
-			//    unaffected; this only bites type-mismatched ON CONFLICT writes.
-			const conflictMatch = clause.conflictTargetIndices.every(idx =>
-				sqlValueIdentical(existingRow[idx], proposedRow[idx])
+			// conflict-target columns — i.e. the conflict is on those columns —
+			// compared the way the constraint ENFORCES: the column's affinity is
+			// applied to the (pre-affinity-coercion) proposed value, then it is compared
+			// under the constraint's enforcement collation. This routes a collation-equal
+			// (NOCASE case-variant, RTRIM trailing-space) or affinity-coerced (`'1'` vs a
+			// stored INTEGER `1`) conflict on the targeted constraint to the DO UPDATE /
+			// DO NOTHING arm rather than aborting with a UNIQUE error. The per-column
+			// collation functions + logical types are precomputed at emit; a BINARY,
+			// byte-identical key still compares 0 (well-formed seeds re-present
+			// byte-identical literals, so seed idempotency is unaffected).
+			//
+			// NOTE: one residual corner remains out of scope — multi-constraint
+			// coincidence. If an insert violates the targeted constraint AND another
+			// unique constraint at once and the vtab returns the targeted constraint's
+			// existingRow, the row is still suppressed though the uncovered conflict
+			// should abort. The vtab short-circuits on the first violation, so even full
+			// constraint-identity tracking couldn't fix this without it reporting every
+			// violated constraint; value comparison cannot disambiguate it.
+			const conflictMatch = clause.conflictTargetIndices.every((idx, targetPos) =>
+				conflictTargetValuesMatch(existingRow[idx], proposedRow[idx], clause, targetPos)
 			);
 
 			if (conflictMatch) {

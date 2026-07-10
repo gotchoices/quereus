@@ -679,6 +679,14 @@ insert into table_name (columns) values (...)
 - `ON CONFLICT (col1, col2, ...)` — Specifies which unique constraint to match. The columns must correspond to a PRIMARY KEY or UNIQUE constraint.
 - `ON CONFLICT` (without columns) — Matches any unique constraint violation.
 
+A targeted conflict is matched the way the named constraint *enforces* uniqueness: the target
+column's affinity is applied to the proposed value and it is compared under the constraint's
+collation. So a conflict that arises only through collation (e.g. `'abc'` proposed against a
+stored `'ABC'` under `COLLATE NOCASE`) or through affinity (e.g. `'1'` proposed against a stored
+integer `1` on an `INTEGER` key) still routes to the `DO UPDATE` / `DO NOTHING` arm rather than
+aborting with a UNIQUE error. A conflict on a *different* unique constraint than the one named
+still aborts.
+
 **Actions:**
 - `DO NOTHING` — Silently skip the conflicting row (equivalent to `INSERT OR IGNORE`)
 - `DO UPDATE SET col = expr, ...` — Update specific columns on the existing row
