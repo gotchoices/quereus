@@ -1490,8 +1490,9 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			if (effective === ConflictResolution.IGNORE) return { status: 'ok', row: undefined };
 			if (effective === ConflictResolution.REPLACE) {
 				await this.insertTombstoneForPK(overlay, conflict.pk, tombstoneIndex);
-				// Report the eviction (the conflicting row is the live underlying row,
-				// already user-facing). The executor maintains the covering backing.
+				// Report the eviction. `conflict.row` is the merged row in user-facing
+				// schema shape whether it was found overlay-side (Phase 1) or
+				// underlying-side (Phase 2). The executor maintains the covering backing.
 				evicted.push(conflict.row);
 				continue;
 			}
