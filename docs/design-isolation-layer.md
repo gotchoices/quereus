@@ -515,6 +515,47 @@ consults the collation, matching the engine's own hash-key sites.
 
 ## Key Ordering
 
+### Which index is being scanned (scan-order source of truth)
+
+Before it can merge, the layer must know the order the underlying scan emits — primary-key
+order, or `(secondaryIndexKey…, pk…)` order. It reads that from **`FilterInfo.accessPath`**,
+the planner's typed, validated {@link AccessPath} record (`resolveScanIndex` in
+`isolated-table.ts`), **not** by pattern-matching the free-text `idxStr` wire string. The map is:
+
+| `accessPath.kind`            | Merge order chosen                                             |
+|------------------------------|---------------------------------------------------------------|
+| `fullScan` / `empty`         | primary key (see the full-scan contract below)                |
+| `index`, `role: 'primary'`   | primary key — **regardless of the index's name** (an alias like `_primary_1` still merges by PK) |
+| `index`, `role: 'secondary'` | `(indexKey…, pk…)`, using the descriptor's full `keyColumns`   |
+| `unresolvedIndex`            | **INTERNAL error** (see below)                                |
+
+`role` is authoritative, not `name`. A module that mints a per-plan alias for its primary
+key (lamina-quereus appends a counter: `_primary_` → `_primary_1`, `_primary_2`, …) is still
+recognised as a PK walk because it returns an `indexDescriptor` with `role: 'primary'`. When
+that primary walk reaches the overlay `MemoryTable` — which only knows its PK index by the
+canonical name `_primary_` — `adaptFilterInfoForOverlay` retargets the FilterInfo's index name
+to `_primary_` via the engine's `retargetFilterInfoIndex`, so the overlay re-plans the same
+primary-key scan instead of failing to resolve a non-existent secondary index of the alias name.
+
+**Full-scan merge contract.** A `fullScan` (or provably-`empty`) access path merges by primary
+key because every underlying module the isolation layer wraps emits an unbounded scan in
+primary-key order. That is a contract the underlying owes, not an inference the layer draws from
+any string. The layer's own internal scans (overlay-merge, ALTER/DROP INDEX overlay migrations,
+the commit flush, PK point lookups) build their FilterInfo through the engine's
+`makeFullScanFilterInfo` / `makeIndexEqSeekFilterInfo` helpers, which always populate
+`accessPath`; a hand-built FilterInfo that omits it makes a *dirty-overlay* read throw INTERNAL
+(a clean, no-overlay read takes the fast path and never inspects `accessPath`).
+
+**The INTERNAL error a module earns by aliasing without a descriptor.** If a module names an
+index anything other than `_primary_` or a real schema index and does **not** return an
+`indexDescriptor`, the engine cannot resolve it and records `accessPath.kind:
+'unresolvedIndex'` (warning at plan time). The merge then has no way to know the scan's sort
+order, so `resolveScanIndex` throws a `QuereusError` (`StatusCode.INTERNAL`) naming the
+offending index rather than guessing primary-key order — guessing would silently reorder rows
+(the exact corruption this design removes). Fix is on the module: return an `indexDescriptor`
+from `getBestAccessPlan` (see `docs/module-authoring.md`). Note this fails loud only on the
+merged read path; a committed-snapshot (`readCommitted`) or no-overlay read bypasses the merge.
+
 ### The Problem
 
 For merge iteration to work correctly, the overlay must iterate in the **same order** as the underlying module. Different modules may use different orderings:
@@ -1087,6 +1128,11 @@ private buildPKPointLookupFilter(pk: SqlValue[]): FilterInfo {
   };
 }
 ```
+
+> This optimization is now implemented, but the real `buildPKPointLookupFilter` delegates to
+> the engine's `makeIndexEqSeekFilterInfo` (via `makePkPointLookupFilter`) so the FilterInfo
+> also carries a typed `accessPath` — required by the merge's scan-order resolution above. The
+> `idxStr: '_pk_point_lookup'` sketch here predates that and does not reflect the current shape.
 
 **Benefit:** O(log n) instead of O(n) for existence checks.
 

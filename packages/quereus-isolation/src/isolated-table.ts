@@ -1,5 +1,5 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey, logicalTypeCanHoldText } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey, logicalTypeCanHoldText, retargetFilterInfoIndex, PRIMARY_INDEX_NAME } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -16,26 +16,6 @@ const EMPTY_PK_KEY_SHAPE: { functions: CollationFunction[]; directions: boolean[
 type IndexScanInfo =
 	| { type: 'primary' }
 	| { type: 'secondary'; indexName: string; columnIndices: number[] };
-
-/**
- * The overlay `MemoryTable` always advertises its primary-key index under the bare
- * name `_primary_`. An underlying virtual table, however, may advertise its PK
- * access plan under a *suffixed* name: `lamina-quereus` mints a per-plan unique key
- * by appending a monotonic counter (`_primary_` → `_primary_1`, `_primary_2`, …) so
- * it can recover the exact plan later. The isolation layer must bridge the two
- * vocabularies — classify the suffixed form as the PK family, and normalise it back
- * to `_primary_` before querying the overlay in the overlay's own vocabulary.
- *
- * Both patterns require the suffix to be purely numeric, so a genuine secondary index
- * whose name merely starts with `_primary_` (e.g. `_primary_extra_idx`) never matches.
- *
- * NOTE: assumes the underlying's PK-plan suffix is a bare numeric counter (lamina's
- * current scheme). If an underlying ever mints a non-numeric unique PK name (e.g.
- * `_primary_a`), it would be misclassified as a secondary index again — widen these
- * patterns (and the overlay-strip) to match that shape when it appears.
- */
-const PK_INDEX_NAME_RE = /^_primary_\d*$/;
-const SUFFIXED_PK_IDXSTR_RE = /(^|;)idx=_primary_\d+\(/;
 
 /**
  * A table wrapper that provides transaction isolation via an overlay.
@@ -433,7 +413,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return;
 		}
 
-		const indexInfo = this.parseIndexFromFilterInfo(filterInfo);
+		const indexInfo = this.resolveScanIndex(filterInfo);
 
 		if (indexInfo.type === 'secondary') {
 			yield* this.mergedSecondaryIndexQuery(overlay, filterInfo, indexInfo);
@@ -542,82 +522,67 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Parses FilterInfo to determine which index is being used.
-	 * Returns null for full table scan or primary key scan, index name for secondary indexes.
+	 * Determine the order the underlying scan emits, from the planner's typed access path.
+	 *
+	 * A `fullScan` (or a provably-empty plan) merges by primary key: every underlying module
+	 * the isolation layer wraps emits an unbounded scan in primary-key order. That is a
+	 * contract on the underlying, not an inference from any string — see
+	 * docs/design-isolation-layer.md.
+	 *
+	 * `role` is authoritative over `name`: a descriptor with `role: 'primary'` IS the table's
+	 * primary key however the module named it (an alias like `_primary_1`), so it merges by PK.
+	 * An `unresolvedIndex` — a name the engine could not resolve to any index, with no
+	 * module-supplied descriptor — cannot yield a comparator, so we fail loudly rather than
+	 * silently merge by the wrong sort key.
 	 */
-	private parseIndexFromFilterInfo(filterInfo: FilterInfo): IndexScanInfo {
-		const { idxStr } = filterInfo;
-		if (!idxStr) {
-			return { type: 'primary' };
+	private resolveScanIndex(filterInfo: FilterInfo): IndexScanInfo {
+		const path = filterInfo.accessPath;
+		if (!path) {
+			throw new QuereusError(
+				`IsolatedTable '${this.tableName}': FilterInfo carries no accessPath, so the ` +
+				`underlying scan's sort order is unknown and the overlay cannot be merged. ` +
+				`Build FilterInfo with the engine's makeFullScanFilterInfo/makeIndexEqSeekFilterInfo helpers.`,
+				StatusCode.INTERNAL);
 		}
-
-		// Parse idxStr format: "idx=indexName(n);plan=2;..."
-		const params = new Map<string, string>();
-		idxStr.split(';').forEach(part => {
-			const [key, value] = part.split('=', 2);
-			if (key && value !== undefined) params.set(key, value);
-		});
-
-		const idxMatch = params.get('idx')?.match(/^(.*?)\((\d+)\)$/);
-		if (!idxMatch) {
-			return { type: 'primary' };
+		switch (path.kind) {
+			case 'fullScan':
+			case 'empty':
+				return { type: 'primary' };
+			case 'index':
+				return path.index.role === 'primary'
+					? { type: 'primary' }
+					: {
+						type: 'secondary',
+						indexName: path.index.name,
+						columnIndices: path.index.keyColumns.map(c => c.columnIndex),
+					};
+			case 'unresolvedIndex':
+				throw new QuereusError(
+					`IsolatedTable '${this.tableName}': the underlying module chose index ` +
+					`'${path.indexName}', which the engine could not resolve against the table schema. ` +
+					`A module that names an index anything other than '_primary_' or a schema index ` +
+					`must return an 'indexDescriptor' from getBestAccessPlan (see docs/module-authoring.md).`,
+					StatusCode.INTERNAL);
 		}
-
-		const indexName = idxMatch[1];
-		if (PK_INDEX_NAME_RE.test(indexName)) {
-			return { type: 'primary' };
-		}
-
-		// Secondary index scan
-		return {
-			type: 'secondary',
-			indexName,
-			columnIndices: this.getIndexColumnIndices(indexName),
-		};
-	}
-
-	/**
-	 * Gets the column indices for a secondary index.
-	 */
-	private getIndexColumnIndices(indexName: string): number[] {
-		const schema = this.tableSchema;
-		if (!schema?.indexes) return [];
-
-		const index = schema.indexes.find(idx => idx.name.toLowerCase() === indexName.toLowerCase());
-		if (!index) return [];
-
-		return index.columns.map(col => col.index);
 	}
 
 	/**
 	 * Adapts FilterInfo for the overlay table schema (which has an extra tombstone column).
 	 * The constraints and index references remain the same since the overlay has matching indexes.
+	 *
+	 * The one mismatch is the index NAME. The underlying may drive its PK plan under a per-plan
+	 * alias (e.g. `_primary_1`) that the overlay MemoryTable does not know — the overlay always
+	 * names its PK index `_primary_`. When the access path is the primary key under such an
+	 * alias, retarget the FilterInfo's index name to `_primary_` so the overlay re-plans it as a
+	 * primary-key scan instead of failing to resolve a non-existent secondary index of that name.
+	 * A genuine secondary scan (or the bare `_primary_`) is returned unchanged.
 	 */
 	private adaptFilterInfoForOverlay(filterInfo: FilterInfo): FilterInfo {
-		// The overlay table has the same schema plus a tombstone column at the end.
-		// Column indices for data columns are the same, so FilterInfo constraints work as-is.
-		//
-		// The one mismatch is the index NAME. The underlying may advertise its PK plan
-		// under a suffixed name (e.g. `_primary_1`) that the overlay MemoryTable does not
-		// know — the overlay always names its PK index `_primary_`. Rewrite a suffixed PK
-		// idxStr back to the base so the overlay re-plans it as a primary-key scan instead
-		// of failing to resolve a non-existent secondary index of that name. Genuine
-		// secondary index names (and the bare `_primary_`) contain no numeric suffix, so
-		// SUFFIXED_PK_IDXSTR_RE leaves them untouched and this returns filterInfo as-is.
-		const { idxStr } = filterInfo;
-		if (!idxStr || !SUFFIXED_PK_IDXSTR_RE.test(idxStr)) {
-			return filterInfo;
+		const path = filterInfo.accessPath;
+		if (path?.kind === 'index' && path.index.role === 'primary' && path.index.name !== PRIMARY_INDEX_NAME) {
+			return retargetFilterInfoIndex(filterInfo, PRIMARY_INDEX_NAME);
 		}
-		const strip = (s: string): string => s.replace(SUFFIXED_PK_IDXSTR_RE, '$1idx=_primary_(');
-		const outIdxStr = filterInfo.indexInfoOutput.idxStr;
-		return {
-			...filterInfo,
-			idxStr: strip(idxStr),
-			indexInfoOutput: {
-				...filterInfo.indexInfoOutput,
-				idxStr: outIdxStr ? strip(outIdxStr) : outIdxStr,
-			},
-		};
+		return filterInfo;
 	}
 
 	/**

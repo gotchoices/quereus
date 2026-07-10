@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode } from '@quereus/quereus';
+import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode, primaryKeyDescriptor } from '@quereus/quereus';
 import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
@@ -1952,6 +1952,7 @@ describe('IsolationModule', () => {
 				idxStr: null,
 				constraints: [],
 				args: [],
+				accessPath: { kind: 'fullScan' },
 				indexInfoOutput: {
 					nConstraint: 0,
 					aConstraint: [],
@@ -2648,15 +2649,17 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			await db.close();
 		});
 
-		/** A full-scan FilterInfo. `idxStr === null` → primary-key scan; a
-		 *  `idx=<name>(0);plan=2` string → a full ascending scan over that
-		 *  secondary index. Mirrors `IsolatedTable.createFullScanFilterInfo`. */
-		function fullScanFilter(idxStr: string | null): FilterInfo {
+		/** A primary-key full-scan FilterInfo. `idxStr` is left null (the wire form the
+		 *  memory module reads for a PK scan); `accessPath` — the source of truth the
+		 *  isolation layer's merge now reads — is `{ kind: 'fullScan' }`, which merges by
+		 *  primary key. Mirrors `makeFullScanFilterInfo`. */
+		function fullScanFilter(idxStr: string | null = null): FilterInfo {
 			return {
 				idxNum: 0,
 				idxStr,
 				constraints: [],
 				args: [],
+				accessPath: idxStr === null ? { kind: 'fullScan' } : undefined,
 				indexInfoOutput: {
 					nConstraint: 0,
 					aConstraint: [],
@@ -2670,6 +2673,29 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 					estimatedCost: 1000000,
 					estimatedRows: 1000000n,
 					idxFlags: 0,
+				},
+			};
+		}
+
+		/** A full scan over the secondary index on column `v`, as the planner would emit it:
+		 *  the `idx=<name>(0);plan=2` wire string the memory module reads AND the typed
+		 *  `accessPath` (a `role: 'secondary'` descriptor over `v`) the isolation layer's
+		 *  merge reads to pick the `(indexKey, pk)` comparator. */
+		function secondaryScanFilter(iso: IsolationModule): FilterInfo {
+			const schema = iso.getUnderlyingState('main', 't')!.underlyingTable.tableSchema!;
+			const vIdx = schema.columnIndexMap.get('v')!;
+			const idx = schema.indexes!.find(i => i.columns.some(c => c.index === vIdx))!;
+			return {
+				...fullScanFilter(`idx=${idx.name}(0);plan=2`),
+				accessPath: {
+					kind: 'index',
+					plan: 'eqSeek',
+					index: {
+						name: idx.name,
+						role: 'secondary',
+						keyColumns: idx.columns.map(c => ({ columnIndex: c.index, desc: c.desc === true })),
+						unique: idx.unique === true,
+					},
 				},
 			};
 		}
@@ -2720,14 +2746,6 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			return iso;
 		}
 
-		/** Builds the `idx=<name>(0);plan=2` string for the index over column `v`. */
-		function secondaryIdxStr(iso: IsolationModule): string {
-			const schema = iso.getUnderlyingState('main', 't')!.underlyingTable.tableSchema!;
-			const vIdx = schema.columnIndexMap.get('v')!;
-			const idx = schema.indexes!.find(i => i.columns.some(c => c.index === vIdx))!;
-			return `idx=${idx.name}(0);plan=2`;
-		}
-
 		it('primary scan: concurrent first-reads on one instance register exactly one connection and match the serial baseline', async () => {
 			const iso = await setupStagedOverlay(false);
 			const filter = () => fullScanFilter(null);
@@ -2754,8 +2772,7 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 
 		it('secondary-index scan: concurrent first-reads register exactly one connection and match the serial baseline', async () => {
 			const iso = await setupStagedOverlay(true);
-			const idxStr = secondaryIdxStr(iso);
-			const filter = () => fullScanFilter(idxStr);
+			const filter = () => secondaryScanFilter(iso);
 
 			const baseline = await asyncIterableToArray((await connectReader(iso)).query(filter()));
 			expect(sortRows(baseline)).to.deep.equal(EXPECTED);
@@ -2808,8 +2825,7 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 
 		it('secondary-index scan: concurrent first-reads across SEPARATE instances coalesce onto one covering connection', async () => {
 			const iso = await setupStagedOverlay(true);
-			const idxStr = secondaryIdxStr(iso);
-			const filter = () => fullScanFilter(idxStr);
+			const filter = () => secondaryScanFilter(iso);
 
 			clearConns();
 			expect(conns().length).to.equal(0);
@@ -2895,6 +2911,59 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(sortRows(b)).to.deep.equal(committed);
 			expect(conns().length, 'read-committed fast path registers no connection').to.equal(0);
 		});
+
+		it('secondary-index scan emits (indexKey, pk) order across a tombstone revival with a changed index key', async () => {
+			// committed (1,'a'),(2,'b'),(3,'c'); overlay stages +4 'd', tombstone id=2, update id=3 -> 'C'.
+			const iso = await setupStagedOverlay(true);
+
+			// Revive the tombstoned id=2 as a LIVE row at a new index key 'Z': its overlay
+			// index key now differs from the underlying 'b' it shadows, so the merge must
+			// place it by 'Z', not by the stale underlying value — the changed-index-key path.
+			const overlay = iso.getConnectionOverlay(db, 'main', 't')!.overlayTable;
+			await overlay.update({ operation: 'update', values: [2, 'Z', 0], oldKeyValues: [2] });
+
+			// Merged secondary view in (v, pk) order. Overlay live rows: (3,'C'),(2,'Z'),(4,'d');
+			// underlying surviving (id=1 unmodified): (1,'a'). BINARY order of v: 'C' < 'Z' < 'a' < 'd'.
+			const rows = await asyncIterableToArray((await connectReader(iso)).query(secondaryScanFilter(iso)));
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[3, 'C'], [2, 'Z'], [1, 'a'], [4, 'd']]);
+		});
+
+		it('FilterInfo without accessPath: clean read succeeds, dirty read throws INTERNAL', async () => {
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', iso);
+			await db.exec('create table t (id integer primary key, v text) using isolated');
+			await db.exec("insert into t values (1,'a'),(2,'b')");
+
+			// A hand-built full scan that declares no access path — the shape a caller that
+			// never went through the engine builders produces.
+			const noAccessPath: FilterInfo = { ...fullScanFilter(null), accessPath: undefined };
+
+			// No overlay → query() short-circuits to the underlying before resolveScanIndex,
+			// so the missing accessPath is harmless on a clean read.
+			const clean = await asyncIterableToArray((await connectReader(iso)).query(noAccessPath));
+			expect(sortRows(clean)).to.deep.equal([[1, 'a'], [2, 'b']]);
+
+			// Stage an overlay so the merged path runs; now the missing accessPath is fatal.
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(db, iso.createOverlaySchema(underlying.tableSchema!));
+			await overlay.update({ operation: 'insert', values: [3, 'c', 0] });
+			iso.setConnectionOverlay(db, 'main', 't', { overlayTable: overlay, hasChanges: true });
+
+			let err: unknown;
+			try { await asyncIterableToArray((await connectReader(iso)).query(noAccessPath)); } catch (e) { err = e; }
+			expect(err, 'dirty read with no accessPath must throw').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.INTERNAL);
+			expect((err as QuereusError).message).to.match(/no accessPath/i);
+		});
+
+		it('empty-plan accessPath merges by primary key (overlay rows over an empty underlying stream)', async () => {
+			// { kind: 'empty' } must resolve to a primary-key merge, not throw. idxStr stays null
+			// so both streams scan by PK; the accessPath alone drives the comparator choice.
+			const iso = await setupStagedOverlay(false);
+			const emptyPlan: FilterInfo = { ...fullScanFilter(null), accessPath: { kind: 'empty' } };
+			const rows = await asyncIterableToArray((await connectReader(iso)).query(emptyPlan));
+			expect(sortRows(rows)).to.deep.equal(EXPECTED);
+		});
 	});
 
 	describe('suffixed primary-key index name (underlying-advertised)', () => {
@@ -2944,9 +3013,32 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 		}
 
 		/** Underlying module that advertises its PK plan under the suffixed name `_primary_1`,
-		 *  mimicking how lamina-quereus mints per-plan unique keys. Secondary index names are
+		 *  mimicking how lamina-quereus mints per-plan unique keys. It ALSO supplies a matching
+		 *  `indexDescriptor` (`role: 'primary'`, name `_primary_1`) — the contract a module owes
+		 *  the engine when it aliases an index name, so an order-sensitive consumer (the isolation
+		 *  merge) can still recognise the walk as a primary-key scan. Secondary index names are
 		 *  advertised verbatim, so secondary routing is unaffected. */
 		class SuffixedPkMemoryModule extends MemoryTableModule {
+			override getBestAccessPlan(db: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
+				const plan = super.getBestAccessPlan(db, tableInfo, request);
+				if (plan.indexName !== '_primary_') return plan;
+				const pk = primaryKeyDescriptor(tableInfo)!;
+				return { ...plan, indexName: '_primary_1', indexDescriptor: { ...pk, name: '_primary_1' } };
+			}
+			override async create(...args: Parameters<MemoryTableModule['create']>): Promise<UnderlyingTable> {
+				return wrapUnderlying(await super.create(...args));
+			}
+			override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<UnderlyingTable> {
+				return wrapUnderlying(await super.connect(...args));
+			}
+		}
+
+		/** Same PK aliasing as {@link SuffixedPkMemoryModule} but WITHOUT supplying the
+		 *  `indexDescriptor` — the contract violation. The engine records the plan as an
+		 *  `unresolvedIndex`, and the isolation merge must refuse it rather than silently
+		 *  merge by the wrong sort key. The underlying still recovers the suffixed name so a
+		 *  clean (no-overlay) read, which bypasses the merge, keeps working. */
+		class NoDescriptorAliasedPkModule extends MemoryTableModule {
 			override getBestAccessPlan(db: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
 				const plan = super.getBestAccessPlan(db, tableInfo, request);
 				return plan.indexName === '_primary_' ? { ...plan, indexName: '_primary_1' } : plan;
@@ -2958,6 +3050,35 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 				return wrapUnderlying(await super.connect(...args));
 			}
 		}
+
+		it('aliased PK without an indexDescriptor: clean read OK, dirty read throws INTERNAL naming the index', async () => {
+			const ndb = new Database();
+			ndb.registerModule('isolated', new IsolationModule({ underlying: new NoDescriptorAliasedPkModule() }));
+			try {
+				await ndb.exec(`CREATE TABLE Site (id INTEGER PRIMARY KEY, name TEXT) USING isolated`);
+				await ndb.exec(`INSERT INTO Site (id, name) VALUES (1, 'Scene A')`);
+
+				// Clean autocommit read — no overlay, so query() bypasses the merge and the
+				// underlying recovers the suffixed name. No accessPath inspection, no throw.
+				const clean = await ndb.get(`SELECT name FROM Site WHERE id = 1`);
+				expect(clean?.name).to.equal('Scene A');
+
+				await ndb.exec('BEGIN');
+				await ndb.exec(`INSERT INTO Site (id, name) VALUES (2, 'Scene B')`); // creates the live overlay
+
+				// Dirty read reaches the merge, which finds an unresolvedIndex access path and
+				// must throw INTERNAL naming the offending index rather than mis-merge.
+				let err: unknown;
+				try { await ndb.get(`SELECT name FROM Site WHERE id = 1`); } catch (e) { err = e; }
+				expect(err, 'dirty read over an unresolved aliased index must throw').to.be.instanceOf(QuereusError);
+				expect((err as QuereusError).code).to.equal(StatusCode.INTERNAL);
+				expect((err as QuereusError).message).to.match(/_primary_1/);
+
+				await ndb.exec('ROLLBACK');
+			} finally {
+				await ndb.close();
+			}
+		});
 
 		let sdb: Database;
 		beforeEach(() => {
@@ -3027,6 +3148,89 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(bob?.name).to.equal('Bob');
 
 			await sdb.exec('ROLLBACK');
+		});
+	});
+
+	describe('accessPath merge-order: index named like the primary key, analyze, multi-table commit', () => {
+		let adb: Database;
+		beforeEach(() => { adb = new Database(); });
+		afterEach(async () => { await adb.close(); });
+
+		it('an index literally named `_primary_extra` merges as a secondary index', async () => {
+			// The old string parser classified any `_primary_`-prefixed name as the PK family via a
+			// regex; the descriptor makes it structural. A genuine secondary index NAMED
+			// `_primary_extra` resolves through the schema as role:'secondary' and must merge by
+			// (indexKey, pk), not by PK.
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			adb.registerModule('isolated', iso);
+			await adb.exec('create table t (id integer primary key, v text) using isolated');
+			await adb.exec('create index _primary_extra on t(v)');
+			await adb.exec("insert into t values (1,'a'),(2,'b'),(3,'c')");
+
+			// Stage an overlay directly: insert (4,'d'), tombstone id=2, update id=3 -> 'C'.
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(adb, iso.createOverlaySchema(underlying.tableSchema!));
+			await overlay.update({ operation: 'insert', values: [4, 'd', 0] });
+			await overlay.update({ operation: 'insert', values: [2, null, 1] });
+			await overlay.update({ operation: 'insert', values: [3, 'C', 0] });
+			iso.setConnectionOverlay(adb, 'main', 't', { overlayTable: overlay, hasChanges: true });
+
+			// A secondary full-scan FilterInfo naming _primary_extra (role: secondary).
+			const schema = underlying.tableSchema!;
+			const vIdx = schema.columnIndexMap.get('v')!;
+			const idxStr = 'idx=_primary_extra(0);plan=2';
+			const base = makeFullScanFilterInfo();
+			const filter: FilterInfo = {
+				...base,
+				idxStr,
+				accessPath: {
+					kind: 'index',
+					plan: 'eqSeek',
+					index: { name: '_primary_extra', role: 'secondary', keyColumns: [{ columnIndex: vIdx, desc: false }], unique: false },
+				},
+				indexInfoOutput: { ...base.indexInfoOutput, idxStr },
+			};
+
+			const table = await iso.connect(adb, undefined, 'isolated', 'main', 't', {} as unknown as BaseModuleConfig) as IsolatedTable;
+			const rows = await asyncIterableToArray(table.query!(filter));
+			// merged secondary view in (v, pk) order: 'C'(3) < 'a'(1) < 'd'(4).
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[3, 'C'], [1, 'a'], [4, 'd']]);
+		});
+
+		it('ANALYZE on an isolated table inside an open transaction with a dirty overlay succeeds', async () => {
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			adb.registerModule('isolated', iso);
+			await adb.exec('create table t (id integer primary key, v text) using isolated');
+			await adb.exec("insert into t values (1,'a'),(2,'b')");
+
+			await adb.exec('begin');
+			await adb.exec("insert into t values (3,'c')"); // dirty overlay
+
+			// ANALYZE hand-builds a full-scan FilterInfo (makeFullScanFilterInfo, carries
+			// accessPath) and scans the isolated table — which now merges the dirty overlay. It
+			// must complete rather than throw the no-accessPath INTERNAL error.
+			await adb.exec('analyze');
+
+			const rows = await asyncIterableToArray(adb.eval('select id, v from t order by id'));
+			expect(rows.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a'], [2, 'b'], [3, 'c']]);
+			await adb.exec('rollback');
+		});
+
+		it('a two-table commit still flushes both overlays through the full-scan path', async () => {
+			const iso = new IsolationModule({ underlying: new MemoryTableModule() });
+			adb.registerModule('isolated', iso);
+			await adb.exec('create table a (id integer primary key, v text) using isolated');
+			await adb.exec('create table b (id integer primary key, v text) using isolated');
+
+			await adb.exec('begin');
+			await adb.exec("insert into a values (1,'a1')");
+			await adb.exec("insert into b values (1,'b1')");
+			await adb.exec('commit');
+
+			const ra = await asyncIterableToArray(adb.eval('select id, v from a order by id'));
+			const rb = await asyncIterableToArray(adb.eval('select id, v from b order by id'));
+			expect(ra.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a1']]);
+			expect(rb.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'b1']]);
 		});
 	});
 
