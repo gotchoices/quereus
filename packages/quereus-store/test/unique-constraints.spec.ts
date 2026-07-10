@@ -961,5 +961,25 @@ describe('StoreTable UNIQUE constraints', () => {
 			await db.exec(`commit`);
 			expect(await collect(db, `SELECT count(*) AS n FROM sc2`)).to.deep.equal([{ n: 2 }]);
 		});
+
+		it('ADD CONSTRAINT UNIQUE still rejects a duplicate that is already committed', async () => {
+			await db.exec(`CREATE TABLE ac3 (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`INSERT INTO ac3 VALUES (1, 'a'), (2, 'a')`);
+			await rejects(`ALTER TABLE ac3 ADD CONSTRAINT u UNIQUE (v)`);
+		});
+
+		// The effective stream must honor pending DELETEs too, not only pending puts:
+		// a committed duplicate removed earlier in this transaction no longer exists
+		// for a reader in this transaction, so the constraint must be accepted.
+		it('ADD CONSTRAINT UNIQUE accepts when a pending DELETE removes the committed duplicate', async () => {
+			await db.exec(`CREATE TABLE ac4 (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`INSERT INTO ac4 VALUES (1, 'a'), (2, 'a')`);
+			await db.exec(`begin`);
+			await db.exec(`DELETE FROM ac4 WHERE id = 2`);
+			await db.exec(`ALTER TABLE ac4 ADD CONSTRAINT u UNIQUE (v)`);
+			await rejects(`INSERT INTO ac4 VALUES (3, 'a')`);
+			await db.exec(`commit`);
+			expect(await collect(db, `SELECT count(*) AS n FROM ac4`)).to.deep.equal([{ n: 1 }]);
+		});
 	});
 });

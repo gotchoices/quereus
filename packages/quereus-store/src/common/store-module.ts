@@ -1709,15 +1709,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				if (collationChanged) {
 					const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 						.filter(uc => uc.columns.includes(colIndex));
-					if (coveringConstraints.length > 0) {
-						for (const uc of coveringConstraints) {
-							await this.validateUniqueOverExistingRows(
-								table.iterateEffectiveEntries(buildFullScanBounds()),
-								updatedSchema,
-								uc,
-								db.getKeyNormalizerResolver(),
-							);
-						}
+					for (const uc of coveringConstraints) {
+						// Fresh generator per constraint — an async generator is single-shot.
+						await this.validateUniqueOverExistingRows(
+							table.iterateEffectiveEntries(buildFullScanBounds()),
+							updatedSchema,
+							uc,
+							db.getKeyNormalizerResolver(),
+						);
 					}
 				}
 
