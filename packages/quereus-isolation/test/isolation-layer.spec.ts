@@ -3560,5 +3560,62 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 
 			await db.exec('commit');
 		});
+
+		it('a live overlay row deleted in the same transaction releases its UNIQUE value', async () => {
+			// The row never existed underneath, so the delete rewrites a LIVE overlay row into
+			// a tombstone. The narrowed index must drop that row's entry on the transition,
+			// otherwise the value stays claimed for the rest of the transaction.
+			await db.exec(`create table t (id integer primary key, a integer) using isolated`);
+			await db.exec(`create unique index t_a_ux on t (a)`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 5)`);
+			await db.exec(`delete from t where id = 1`);
+			await db.exec(`insert into t values (2, 5)`);
+			await db.exec('commit');
+
+			const rows = await asyncIterableToArray(db.eval('select id, a from t'));
+			expect(rows.map(r => [r.id, r.a])).to.deep.equal([[2, 5]]);
+		});
+
+		it('a committed row deleted then its UNIQUE value reused at a new PK under a PK-covered index', async () => {
+			// Tombstone (from a committed row) and a live overlay row share the PK-covered
+			// UNIQUE column value `a = 1` simultaneously.
+			await db.exec(`create table t (a integer, b integer, primary key (a, b)) using isolated`);
+			await db.exec(`create unique index t_a_ux on t (a)`);
+			await db.exec(`insert into t values (1, 1)`);
+			await db.exec(`insert into t values (2, 1)`);
+
+			await db.exec('begin');
+			await db.exec('delete from t where a = 1');
+			await db.exec('insert into t values (1, 9)');
+			// The surviving live row (2, 1) still claims a = 2; a duplicate must be rejected.
+			let err: unknown;
+			try {
+				await db.exec('insert into t values (2, 9)');
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'a live/live duplicate must still be rejected across the merged view').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			await db.exec('rollback');
+
+			const rows = await asyncIterableToArray(db.eval('select a, b from t order by a, b'));
+			expect(rows.map(r => [r.a, r.b])).to.deep.equal([[1, 1], [2, 1]]);
+		});
+
+		it('an update that vacates a UNIQUE value inside a transaction frees it for a new row', async () => {
+			await db.exec(`create table t (id integer primary key, a integer) using isolated`);
+			await db.exec(`create unique index t_a_ux on t (a)`);
+			await db.exec(`insert into t values (1, 5)`);
+
+			await db.exec('begin');
+			await db.exec(`update t set a = 6 where id = 1`);
+			await db.exec(`insert into t values (2, 5)`);
+			await db.exec('commit');
+
+			const rows = await asyncIterableToArray(db.eval('select id, a from t order by id'));
+			expect(rows.map(r => [r.id, r.a])).to.deep.equal([[1, 6], [2, 5]]);
+		});
 	});
 });

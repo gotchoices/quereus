@@ -294,7 +294,9 @@ This is analogous to LSM-tree merge or 3-way merge in version control.
 1. Execute query against overlay first
 2. Execute same query against underlying module
 3. Merge results using primary key ordering
-4. For index scans: consult overlay's secondary index to find additional/removed keys
+4. For index scans: consult overlay's secondary index for its live rows' index keys, and its
+   primary-key scan for the set of PKs the overlay modified (tombstones included) so the
+   underlying's shadowed rows are dropped from the merge
 
 ### Write Operations
 
