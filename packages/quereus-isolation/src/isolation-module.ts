@@ -6,6 +6,9 @@ import { applyOverlayToUnderlying } from './flush.js';
 import { makeFullScanFilterInfo } from './filter-info.js';
 import { iterateEffectiveRows, makePkKeySerializer } from './overlay-rows.js';
 
+/** Partial-index predicate AST, as `IndexSchema`/`UniqueConstraintSchema` carry it. */
+type Predicate = NonNullable<IndexSchema['predicate']>;
+
 let overlayIdCounter = 0;
 
 /**
@@ -1682,12 +1685,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Called by IsolatedTable when lazily creating its overlay, and by the two overlay-rebuild
 	 * paths (`rebuildOverlayForIndexChange`, `migrateOverlayForAlter`).
 	 *
-	 * KNOWN DEFECT: the copied secondary indexes are enforced over TOMBSTONE rows too. A
-	 * tombstone carries its row's PK and NULL in every other column, so a UNIQUE index whose
-	 * columns all sit inside the PK sees two deleted rows as a duplicate — a spurious UNIQUE
-	 * failure on delete-then-reinsert, and an INTERNAL error out of the CREATE INDEX rebuild.
-	 * Non-PK unique indexes escape only because their tombstone key is NULL and SQL NULLs are
-	 * distinct. Tracked by `tickets/fix/overlay-unique-index-enforces-tombstones`.
+	 * Every copied secondary index — and every copied UNIQUE constraint, including the ones
+	 * a UNIQUE index derives — is narrowed to a PARTIAL structure over live rows only
+	 * (`<tombstone> = 0`), AND-ed onto whatever partial predicate it already carried. A
+	 * tombstone is a deletion marker, not a row, so no uniqueness rule may be evaluated over
+	 * it: it carries its row's PK and NULL everywhere else, so a UNIQUE structure whose
+	 * columns all sit inside the PK would otherwise see two deleted rows as duplicates.
+	 * (Non-PK unique columns escaped only because their tombstone key is NULL and SQL treats
+	 * NULLs as distinct.) The overlay's PRIMARY KEY uniqueness is NOT narrowed — it must keep
+	 * covering tombstones so a re-insert at a tombstoned PK is detected and converted.
+	 *
+	 * `IsolatedTable.mergedSecondaryIndexQuery` wants exactly the live overlay rows out of
+	 * these indexes, so narrowing them is what it already expects.
 	 */
 	createOverlaySchema(baseSchema: TableSchema): TableSchema {
 		const tombstoneColumn = {
@@ -1711,13 +1720,37 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// Use unique ID to avoid conflicts when multiple overlays exist
 		const overlayId = generateOverlayId();
 
+		const liveOnly = this.liveRowPredicate();
+
 		return {
 			...baseSchema,
 			name: `_overlay_${baseSchema.name}_${overlayId}`,
 			columns: newColumns,
 			columnIndexMap: newColumnIndexMap,
-			// Copy indexes - they'll be created on the overlay table
-			indexes: baseSchema.indexes,
+			indexes: baseSchema.indexes?.map(idx => ({ ...idx, predicate: andPredicate(idx.predicate, liveOnly) })),
+			uniqueConstraints: baseSchema.uniqueConstraints?.map(uc => ({ ...uc, predicate: andPredicate(uc.predicate, liveOnly) })),
 		};
 	}
+
+	/**
+	 * `<tombstoneColumn> = 0` — the partial-structure predicate that scopes an overlay index
+	 * or UNIQUE constraint to live rows. Built as an AST rather than parsed from text because
+	 * the tombstone column name is host-configurable.
+	 *
+	 * NOTE: the default overlay is a `MemoryTableModule`, which honors `IndexSchema.predicate`
+	 * and `UniqueConstraintSchema.predicate`. A host that injects its own `config.overlay`
+	 * module must honor them too, or its overlay will re-enforce uniqueness over tombstones.
+	 */
+	private liveRowPredicate(): Predicate {
+		return {
+			type: 'binary',
+			operator: '=',
+			left: { type: 'column', name: this.tombstoneColumn },
+			right: { type: 'literal', value: 0 },
+		};
+	}
+}
+
+function andPredicate(base: Predicate | undefined, extra: Predicate): Predicate {
+	return base ? { type: 'binary', operator: 'AND', left: base, right: extra } : extra;
 }
