@@ -197,25 +197,36 @@ await db.exec("alter table users rename column created_at to registration_date")
 
 ## DDL and transactions
 
-`CREATE INDEX` / `CREATE UNIQUE INDEX` / `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` may run
-inside an open transaction. Two rules define what that means.
+`CREATE INDEX` / `CREATE UNIQUE INDEX` / `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` /
+`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` may run inside an open transaction. Two rules
+define what that means.
 
 **1. Row-validating DDL sees exactly what a `SELECT` in the same transaction sees.**
-`MemoryTableManager` validates a new UNIQUE index or constraint against the DDL connection's
-*effective* rows — the committed base overlaid with that connection's uncommitted writes,
-i.e. the layer `pendingTransactionLayer ?? readLayer`. A duplicate the transaction inserted
-but has not committed raises `UNIQUE constraint failed`; a duplicate it has *deleted* does
-not block the build. Validation runs before anything is mutated, so a rejection leaves the
-schema, the base layer and the index map untouched.
+`MemoryTableManager` validates against the DDL connection's *effective* rows — the committed
+base overlaid with that connection's uncommitted writes, i.e. the layer
+`pendingTransactionLayer ?? readLayer`. A duplicate the transaction inserted but has not
+committed raises `UNIQUE constraint failed`; a duplicate it has *deleted* does not block the
+change. Validation runs before anything is mutated, so a rejection leaves the schema, the base
+layer and the index map untouched, and the transaction stays usable.
 
-**2. The constraint is enforced for the remainder of that transaction.** A `TransactionLayer`
-freezes its schema at construction, so a layer created before the DDL would otherwise carry
-neither the new `IndexSchema` (an index scan raises "Secondary index not found") nor the
-derived `uniqueConstraints` entry (a colliding insert is silently accepted).
-`TransactionLayer.adoptSchema` hands the new schema to the pending layer and to every
-savepoint snapshot beneath it, building each layer's new `MemoryIndex` over its parent's and
-re-indexing only that layer's own writes. Rebasing would achieve the same, but it would
-invalidate the savepoint snapshots a `ROLLBACK TO SAVEPOINT` must restore.
+A collation change is validated the same way, once per uniqueness-enforcing index that orders
+by the altered column (`indexEnforcesUnique` — the index's own `unique` flag, or its role as
+the auto-built covering structure for a declared UNIQUE constraint). The probe index is built
+under the *new* per-column collations, so it compares exactly as the rebuilt structure will.
+
+**2. The rule is enforced for the remainder of that transaction, and after it commits.** A
+`TransactionLayer` freezes its schema at construction, so a layer created before the DDL would
+otherwise carry neither the new `IndexSchema` (an index scan raises "Secondary index not found")
+nor the derived `uniqueConstraints` entry (a colliding insert is silently accepted) — and after a
+collation change it would go on comparing under the old collation, then *become* the committed
+head at commit and shadow the base's rebuilt structures entirely.
+
+`TransactionLayer.adoptSchema` hands the new schema to the pending layer and to every savepoint
+snapshot beneath it, oldest-first. It **adds** an index the layer does not hold, and **replaces**
+one whose `IndexSchema` object the new schema rebuilt (which is exactly what re-keying DDL does,
+and what additive DDL never does). Either way the layer's `MemoryIndex` is built over its parent's
+tree and then brought up to date with only that layer's own writes. Rebasing would achieve the
+same, but it would invalidate the savepoint snapshots a `ROLLBACK TO SAVEPOINT` must restore.
 
 **Only the DDL-issuing connection may hold uncommitted writes.** A sibling connection's
 pending rows are invisible to the DDL's transaction, so a new constraint cannot be validated
@@ -223,18 +234,23 @@ against them, and its layers cannot be re-pointed at the new schema. `ensureSche
 raises `BUSY` in that case, the same posture as the pre-existing "older transaction versions
 are in use" branch.
 
-Both rules are scoped to the index/constraint-building DDL named above. `ALTER TABLE ... ALTER
-COLUMN ... SET COLLATE` re-validates uniqueness by rebuilding the base layer's secondary indexes,
-which read committed rows only, so it still misses the issuing transaction's pending rows; see
-`tickets/fix/bug-memory-alter-collate-ignores-pending-rows.md`. `DROP INDEX` / `DROP CONSTRAINT`
-inside a transaction likewise keep enforcing for the rest of it — `adoptSchema` adds structures
-and never removes them; see `tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
+Two carve-outs. A collation change on a **primary key** column re-keys the base primary tree
+(`rebuildPrimaryTreeStrict`), which swaps that tree object out from under a pending layer's
+copy-on-write base and invalidates the layer's `pkFunctions`; `adoptSchema` is therefore not
+applied to it, and the case is only correct outside a transaction — see the
+`alter-collate-pk-in-transaction` ticket. And `DROP INDEX` / `DROP CONSTRAINT` inside a
+transaction keep enforcing for the rest of it — `adoptSchema` adds and replaces structures, but
+never removes them; see `tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
 
 ### Where the boundary sits
 
-The base layer's structures always contain **exactly the committed rows**: the new index is
-populated from the base primary tree only, never from pending rows, so one connection's
-uncommitted rows never surface in another's index scans. Two consequences follow.
+The base layer's structures are populated from the base primary tree only, never from pending
+rows, so one connection's uncommitted rows never surface in another's index scans. The base's
+rows are therefore **not a subset** of the DDL transaction's effective rows — a duplicate that
+transaction deleted still sits physically in the base tree — which is why every base build and
+rebuild (`addIndexToBase`, `rebuildAllSecondaryIndexes`) is *non-enforcing*: uniqueness is owned
+by the effective-rows pre-pass above, and checking again over base rows would reject a legal
+change. Two consequences follow.
 
 *   The base index can transiently hold an entry for a row the DDL transaction has deleted
     (case 1 above). That is harmless: a secondary index here is a *lookup* structure, not an

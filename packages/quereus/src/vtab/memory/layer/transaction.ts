@@ -56,9 +56,10 @@ export class TransactionLayer implements Layer {
 	public readonly collationResolver: CollationResolver;
 	/**
 	 * Schema when this layer was started. Replaced only by {@link adoptSchema}, when
-	 * additive index/constraint DDL runs inside this layer's own transaction — the
-	 * primary key definition and column set are identical across that swap, so
-	 * {@link pkFunctions} and the primary tree stay valid.
+	 * index/constraint DDL — additive, or a secondary-index re-key from `alter column …
+	 * set collate` — runs inside this layer's own transaction. The primary key definition
+	 * and column set are identical across every such swap, so {@link pkFunctions} and the
+	 * primary tree stay valid.
 	 */
 	private tableSchemaAtCreation: TableSchema;
 
@@ -151,32 +152,47 @@ export class TransactionLayer implements Layer {
 	}
 
 	/**
-	 * Adopts an ADDITIVE schema change (a new index and/or a new UNIQUE constraint)
-	 * that was applied to the table while THIS layer's transaction is still open, so
-	 * the rest of that transaction reads and enforces the new structure.
+	 * Adopts a schema change that was applied to the table while THIS layer's transaction
+	 * is still open, so the rest of that transaction reads and enforces the new structures.
+	 * Two kinds of change reach here:
 	 *
-	 * Without it, a layer created before the DDL keeps its creation-time schema: it has
-	 * neither the new `IndexSchema` (so an index scan raises "Secondary index not
-	 * found") nor the derived `uniqueConstraints` entry (so `checkUniqueConstraints`
-	 * silently skips it and a colliding insert is accepted).
+	 *  - **Additive** (`create index` / `create unique index` / `add constraint … unique`):
+	 *    a name absent from {@link secondaryIndexes} is built and added. Without it, a layer
+	 *    created before the DDL keeps its creation-time schema: it has neither the new
+	 *    `IndexSchema` (so an index scan raises "Secondary index not found") nor the derived
+	 *    `uniqueConstraints` entry (so `checkUniqueConstraints` silently skips it and a
+	 *    colliding insert is accepted).
+	 *  - **Re-keying** (`alter column … set collate`): an index whose `IndexSchema` object
+	 *    is no longer the one this layer holds is REPLACED. `BaseLayer.rebuildAllSecondaryIndexes`
+	 *    hands every index a fresh BTree under the new collation, so a layer that kept its old
+	 *    `MemoryIndex` would go on comparing under the old collation over an orphaned tree —
+	 *    and, once it becomes the committed head at commit, would shadow the base's rebuilt
+	 *    structures entirely.
 	 *
-	 * The caller MUST apply this to a whole parent chain oldest-first: each layer builds
-	 * its new `MemoryIndex` over its parent's tree for that index, so the parent's must
-	 * already exist. Only the layer's OWN writes are re-indexed — everything below is
-	 * inherited copy-on-write, exactly as `initializeSecondaryIndexes` does at
-	 * construction.
+	 * An index is considered unchanged only when the NEW schema's `IndexSchema` is the very
+	 * object the old schema carried. Every DDL path that re-keys rebuilds those objects, and
+	 * every additive path preserves them, so identity is the exact discriminator.
 	 *
-	 * Restricted to additive index/constraint DDL: a column or primary-key change would
-	 * invalidate {@link pkFunctions} and the primary tree, and is not reachable here
-	 * (`ensureSchemaChangeSafety` raises BUSY when any connection holds a pending layer,
-	 * except the DDL issuer's, and only `createIndex` / `addUniqueConstraint` call this).
+	 * The caller MUST apply this to a whole parent chain oldest-first: each layer builds its
+	 * `MemoryIndex` over its parent's tree for that index, so the parent's must already be the
+	 * new one. Only the layer's OWN writes are re-indexed — everything below is inherited
+	 * copy-on-write, exactly as {@link initializeSecondaryIndexes} does at construction.
+	 *
+	 * Never applied to a column-set or primary-key change: either would invalidate
+	 * {@link pkFunctions} and the primary tree. `MemoryTableManager.alterColumn` keeps a
+	 * PK-column collation change off this path (see `alter-collate-pk-in-transaction`), and
+	 * `ensureSchemaChangeSafety` raises BUSY when any connection other than the DDL issuer
+	 * holds a pending layer.
 	 */
 	public adoptSchema(newSchema: TableSchema): void {
+		const oldSchema = this.tableSchemaAtCreation;
 		this.tableSchemaAtCreation = newSchema;
 		if (!newSchema.indexes) return;
 
 		for (const indexSchema of newSchema.indexes) {
-			if (this.secondaryIndexes.has(indexSchema.name)) continue;
+			const held = this.secondaryIndexes.get(indexSchema.name);
+			const previous = oldSchema.indexes?.find(ix => ix.name === indexSchema.name);
+			if (held && previous === indexSchema) continue;
 
 			const parentSecondaryTree = this.parentLayer.getSecondaryIndexTree?.(indexSchema.name);
 			const memoryIndex = new MemoryIndex(

@@ -304,7 +304,7 @@ export class MemoryIndex {
 
 	/**
 	 * True when at least one PK is mapped under `indexKey`. O(1) (Map size), so the
-	 * build-time UNIQUE check (BaseLayer `populateNewIndex`) can probe per row without
+	 * build-time UNIQUE check (`populateIndexFromRows`) can probe per row without
 	 * sorting the bucket.
 	 */
 	hasAnyPrimaryKey(indexKey: BTreeKeyForIndex): boolean {

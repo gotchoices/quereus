@@ -52,7 +52,25 @@
 
 import { normalizeCollationName, resolveCollationFunctions } from '../util/comparison.js';
 import type { CollationFunction, CollationResolver } from '../types/logical-type.js';
-import type { TableSchema, UniqueConstraintSchema } from './table.js';
+import type { IndexSchema, TableSchema, UniqueConstraintSchema } from './table.js';
+
+/**
+ * True when populating `indexSchema` must reject duplicate keys: either the index
+ * is itself declared UNIQUE, or it is the auto-built covering structure for a
+ * declared UNIQUE constraint over the same column set. The latter never carries
+ * `unique: true` — insert-time enforcement runs through `uniqueConstraints` — so
+ * without this check a re-keying validation (e.g. `ALTER COLUMN ... SET COLLATE`)
+ * would silently accept rows that collide under the new collation.
+ */
+export function indexEnforcesUnique(schema: TableSchema, indexSchema: IndexSchema): boolean {
+	if (indexSchema.unique) return true;
+	const ucs = schema.uniqueConstraints;
+	if (!ucs) return false;
+	return ucs.some(uc =>
+		uc.columns.length === indexSchema.columns.length &&
+		uc.columns.every((colIdx, i) => indexSchema.columns[i].index === colIdx),
+	);
+}
 
 /**
  * The per-`uc.column` comparison collation for UNIQUE enforcement, one entry per

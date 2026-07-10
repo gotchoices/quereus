@@ -1,7 +1,11 @@
 /**
- * Row-validating DDL (`create unique index`, `alter table … add constraint … unique`)
- * must see the rows the issuing transaction wrote but has not yet committed, and the
- * constraint it declares must stay enforced for the rest of that transaction.
+ * Row-validating DDL (`create unique index`, `alter table … add constraint … unique`,
+ * `alter table … alter column … set collate`) must see the rows the issuing transaction
+ * wrote but has not yet committed, and the rule it declares must stay enforced for the
+ * rest of that transaction — and after it commits.
+ *
+ * Memory-only: the store backend reaches the same rules by a different route, and its
+ * isolation overlay does not yet honor them (`isolation-ddl-validation-ignores-overlay-rows`).
  *
  * See docs/memory-table.md § DDL and transactions.
  */
@@ -411,6 +415,230 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			await db.exec(`insert into t values (4, 'b')`);
 			await db.exec(`commit`);
 			expect(await rowCount(db, 't')).to.equal(2);
+		});
+	});
+
+	describe('alter column … set collate re-keys over the transaction\'s own rows', () => {
+		/** `create table t (id, v)` + a unique index on `v`, populated with `committed`. */
+		async function seed(committed: Array<[number, string | null]> = []): Promise<void> {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`create unique index ix on t (v)`);
+			for (const [id, v] of committed) {
+				await db.exec(`insert into t values (${id}, ${v === null ? 'null' : `'${v}'`})`);
+			}
+		}
+
+		const collationOf = (table: string, column: string): string =>
+			getManager(db, table).tableSchema.columns.find(c => c.name === column)?.collation ?? 'BINARY';
+
+		it('rejects a duplicate that only exists in the pending layer', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`insert into t values (2, 'A')`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+
+			// The rejection mutated nothing: the column is still BINARY, and the transaction
+			// is usable and still comparing under BINARY ('b' and 'B' stay distinct).
+			expect(collationOf('t', 'v')).to.equal('BINARY');
+			await db.exec(`insert into t values (3, 'b')`);
+			await db.exec(`insert into t values (4, 'B')`);
+			await db.exec(`commit`);
+			expect(await rowCount(db, 't')).to.equal(4);
+		});
+
+		it('rejects a committed row colliding with a pending row under the new collation', async () => {
+			await seed([[1, 'a']]);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, 'A')`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`rollback`);
+			expect(collationOf('t', 'v')).to.equal('BINARY');
+		});
+
+		it('sees a pending DELETE — a committed duplicate removed in-transaction does not block the change', async () => {
+			await seed([[1, 'a'], [2, 'A']]);
+			await db.exec(`begin`);
+			await db.exec(`delete from t where id = 2`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`commit`);
+
+			expect(await rowCount(db, 't')).to.equal(1);
+			expect(collationOf('t', 'v')).to.equal('NOCASE');
+			// The accepted change survived the commit: 'A' now collides with the surviving 'a'.
+			await expectError(
+				() => db.exec(`insert into t values (3, 'A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+		});
+
+		it('governs the rest of the transaction — a later colliding insert is rejected', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			await expectError(
+				() => db.exec(`insert into t values (2, 'A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+
+			await db.exec(`insert into t values (3, 'b')`);
+			await db.exec(`commit`);
+			expect(await rowCount(db, 't')).to.equal(2);
+		});
+
+		it('governs a later colliding UPDATE in the same transaction', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a'), (2, 'b')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			await expectError(
+				() => db.exec(`update t set v = 'A' where id = 2`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`rollback`);
+		});
+
+		it('survives commit — a colliding insert after commit is rejected', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`commit`);
+
+			await expectError(
+				() => db.exec(`insert into t values (2, 'A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			expect(await rowCount(db, 't')).to.equal(1);
+			// …and the re-keyed index still resolves the committed row under the new collation.
+			expect(await scalar(db, `select count(*) as c from t where v = 'a'`)).to.equal(1);
+		});
+
+		it('honors NULL semantics — multiple pending NULLs do not collide', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, null), (2, null), (3, 'a')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`commit`);
+
+			expect(await rowCount(db, 't')).to.equal(3);
+			expect(collationOf('t', 'v')).to.equal('NOCASE');
+		});
+
+		it('validates a table-level UNIQUE constraint (auto-index) over pending rows', async () => {
+			// No `create unique index` here: the covering structure is the auto-built `_uc_*`
+			// index, which carries no `unique: true` flag.
+			await db.exec(`create table u (id integer primary key, v text, unique (v))`);
+			await db.exec(`begin`);
+			await db.exec(`insert into u values (1, 'a'), (2, 'A')`);
+
+			await expectError(
+				() => db.exec(`alter table u alter column v set collate nocase`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`rollback`);
+		});
+
+		it('leaves a NON-unique index alone — a pending case-collision does not block the change', async () => {
+			await db.exec(`create table n (id integer primary key, v text)`);
+			await db.exec(`create index nx on n (v)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into n values (1, 'a'), (2, 'A')`);
+			await db.exec(`alter table n alter column v set collate nocase`);
+			await db.exec(`commit`);
+
+			expect(await rowCount(db, 'n')).to.equal(2);
+			// The re-keyed index resolves both rows under NOCASE.
+			expect(await scalar(db, `select count(*) as c from n where v = 'a'`)).to.equal(2);
+		});
+
+		it('sees a duplicate held only in an eager savepoint snapshot', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a'), (2, 'A')`);
+			await db.exec(`savepoint s`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`rollback`);
+			expect(await rowCount(db, 't')).to.equal(0);
+		});
+
+		it('after rollback to savepoint the new collation is still enforced', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`insert into t values (2, 'b')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`rollback to s`);
+
+			// Row 2 is gone; row 1 survives; the collation change declared after the savepoint
+			// must still govern the restored snapshot.
+			expect(await rowCount(db, 't')).to.equal(1);
+			await expectError(
+				() => db.exec(`insert into t values (3, 'A')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`insert into t values (4, 'b')`);
+			await db.exec(`commit`);
+			expect(await rowCount(db, 't')).to.equal(2);
+		});
+
+		it('raises BUSY when a sibling connection holds uncommitted writes', async () => {
+			await seed();
+			const manager = getManager(db, 't');
+
+			const sibling = manager.connect();
+			sibling.begin();
+			await manager.performMutation(sibling, 'insert', [9, 'z']);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set collate nocase`),
+				StatusCode.BUSY,
+				/uncommitted|transaction/i,
+			);
+
+			sibling.rollback();
+			await db.exec(`alter table t alter column v set collate nocase`);
+			expect(collationOf('t', 'v')).to.equal('NOCASE');
+		});
+
+		it('a metadata-only set collate binary on an already-binary column is a no-op', async () => {
+			await seed();
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a')`);
+			// Same collation, not yet explicit: flips `collationExplicit` only — no re-key, no
+			// re-validation, no layer adoption.
+			await db.exec(`alter table t alter column v set collate binary`);
+			await db.exec(`insert into t values (2, 'A')`);
+			await db.exec(`commit`);
+
+			expect(await rowCount(db, 't')).to.equal(2);
+			expect(collationOf('t', 'v')).to.equal('BINARY');
+			expect(getManager(db, 't').tableSchema.columns[1].collationExplicit).to.equal(true);
 		});
 	});
 

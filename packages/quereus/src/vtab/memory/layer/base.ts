@@ -122,6 +122,22 @@ export class BaseLayer implements Layer {
 		);
 	}
 
+	/**
+	 * Recreates every secondary index from the committed primary tree under the
+	 * CURRENT schema — call {@link updateSchema} first when the index key collation
+	 * changed, so each rebuilt `MemoryIndex` re-keys under it.
+	 *
+	 * Never enforcing, even for a re-keyed UNIQUE structure: base rows are not a
+	 * subset of the DDL transaction's effective rows (a duplicate that transaction
+	 * DELETED still sits in the base primary tree), so a duplicate check here would
+	 * reject a legal change. `MemoryTableManager.alterColumn` validates over the
+	 * effective rows before calling this; see {@link addIndexToBase} for why a base
+	 * index may hold an entry no live row backs.
+	 *
+	 * Every index gets a FRESH `MemoryIndex` and BTree, so any layer inheriting the
+	 * old trees must be re-pointed at the new ones — that is
+	 * `TransactionLayer.adoptSchema`'s replacement path.
+	 */
 	public rebuildAllSecondaryIndexes(): void {
 		this.clearExistingSecondaryIndexes();
 
@@ -131,31 +147,6 @@ export class BaseLayer implements Layer {
 
 		const newIndexes = this.createSecondaryIndexes();
 		this.populateSecondaryIndexes(newIndexes);
-		this.replaceSecondaryIndexes(newIndexes);
-	}
-
-	/**
-	 * Strict variant of {@link rebuildAllSecondaryIndexes}: rebuilds every
-	 * secondary index from the primary tree but surfaces a UNIQUE-index key
-	 * collision as a thrown CONSTRAINT error (the non-strict variant logs and
-	 * drops duplicates). Used by `ALTER COLUMN ... SET COLLATE`, where a value set
-	 * unique under the old collation may collide under the new one. On throw the
-	 * secondary index map is left cleared; the caller restores the prior schema and
-	 * calls the non-strict rebuild to recover a consistent state.
-	 */
-	public rebuildAllSecondaryIndexesStrict(): void {
-		this.clearExistingSecondaryIndexes();
-		if (!this.hasSecondaryIndexes()) {
-			this.secondaryIndexes.clear();
-			return;
-		}
-
-		const newIndexes = new Map<string, MemoryIndex>();
-		for (const indexSchema of this.tableSchema.indexes!) {
-			const memoryIndex = this.createMemoryIndex(indexSchema);
-			this.populateNewIndex(memoryIndex, indexSchema); // throws CONSTRAINT on duplicate
-			newIndexes.set(indexSchema.name, memoryIndex);
-		}
 		this.replaceSecondaryIndexes(newIndexes);
 	}
 
@@ -432,42 +423,6 @@ export class BaseLayer implements Layer {
 			this.tableSchema.columns,
 		);
 		this.secondaryIndexes.set(indexSchema.name, newMemoryIndex);
-	}
-
-	/**
-	 * Populates a freshly-created secondary index from the primary tree. Used by the
-	 * strict rebuild, where a re-keyed UNIQUE structure (e.g. `ALTER COLUMN … SET
-	 * COLLATE`) must reject a collision the new collation introduces — the base tree
-	 * IS the authoritative row set there, since `ensureSchemaChangeSafety` has drained
-	 * every committed layer into it and no connection may hold pending writes.
-	 */
-	private populateNewIndex(newIndex: MemoryIndex, indexSchema: IndexSchema): void {
-		populateIndexFromRows(
-			iteratePrimaryRows(this.primaryTree),
-			newIndex,
-			this.primaryKeyFunctions.extractFromRow,
-			this.indexEnforcesUnique(indexSchema),
-			this.tableSchema.name,
-			this.tableSchema.columns,
-		);
-	}
-
-	/**
-	 * True when populating `indexSchema` must reject duplicate keys: either the
-	 * index is itself declared UNIQUE, or it is the auto-built covering structure
-	 * for a declared UNIQUE constraint (same column set). The latter never carries
-	 * `unique: true` — insert-time enforcement runs through `uniqueConstraints` —
-	 * so without this check a strict rebuild (e.g. `ALTER COLUMN ... SET COLLATE`)
-	 * would silently accept rows that collide under the new collation.
-	 */
-	private indexEnforcesUnique(indexSchema: IndexSchema): boolean {
-		if (indexSchema.unique) return true;
-		const ucs = this.tableSchema.uniqueConstraints;
-		if (!ucs) return false;
-		return ucs.some(uc =>
-			uc.columns.length === indexSchema.columns.length &&
-			uc.columns.every((colIdx, i) => indexSchema.columns[i].index === colIdx),
-		);
 	}
 
 	async dropIndexFromBase(indexName: string): Promise<void> {

@@ -12,7 +12,7 @@ import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError } from '../../../schema/constraint-builder.js';
-import { uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
+import { indexEnforcesUnique, uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
 import { compareSqlValues, compareSqlValuesFast, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
@@ -2105,22 +2105,48 @@ export class MemoryTableManager {
 				indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
 			});
 
+			const pkColumnRekeyed = collationChanged && updatedPkDef.some(def => def.index === colIndex);
+
+			// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows: a pair
+			// the transaction inserted that collides under the NEW collation must reject the
+			// change, and one it has deleted must not block it. A throw here leaves the schema,
+			// the base layer and the index map exactly as they were.
+			if (collationChanged) {
+				this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex);
+			}
+
 			this.baseLayer.updateSchema(finalNewTableSchema);
 
-			// A collation change re-sorts structures that order by the column and
-			// re-validates uniqueness under the new collation. Rebuild the secondary
-			// indexes FIRST (strict — a UNIQUE collision throws CONSTRAINT) and the
-			// primary tree LAST (also strict — a PK collision throws), so a throw at
-			// either step leaves the live primary tree intact for the catch's rollback.
+			// A collation change re-sorts the structures that order by the column. The
+			// secondary rebuild is NON-enforcing (the pre-pass above owns uniqueness, and the
+			// base's rows are not a subset of the effective rows); the primary tree rebuild is
+			// strict, since a PK collision cannot be represented at all and the base tree IS
+			// the whole PK row set. It runs LAST so its throw leaves the live tree intact for
+			// the catch's rollback.
 			if (collationChanged) {
-				this.baseLayer.rebuildAllSecondaryIndexesStrict();
-				if (updatedPkDef.some(def => def.index === colIndex)) {
+				this.baseLayer.rebuildAllSecondaryIndexes();
+				if (pkColumnRekeyed) {
 					this.baseLayer.rebuildPrimaryTreeStrict();
 				}
 			}
 
 			this.tableSchema = finalNewTableSchema;
 			this.initializePrimaryKeyFunctions();
+
+			// The base rebuild handed every secondary index a fresh tree under the new
+			// collation; the DDL transaction's own layers still inherit the old ones and froze
+			// the old schema at construction. Re-key them, or the rest of the transaction — and
+			// everything after the pending layer becomes the committed head at commit — keeps
+			// comparing under the old collation.
+			//
+			// A PK-column re-key is carved out: `rebuildPrimaryTreeStrict` swaps the base
+			// primary tree object out from under a pending layer's copy-on-write base, and
+			// `adoptSchema` may not rebuild `pkFunctions`. Tracked in
+			// `alter-collate-pk-in-transaction`; outside a transaction there are no open layers
+			// and the carve-out is a no-op.
+			if (collationChanged && !pkColumnRekeyed) {
+				this.adoptSchemaOnOpenLayers(finalNewTableSchema);
+			}
 
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'alter',
@@ -2132,10 +2158,11 @@ export class MemoryTableManager {
 
 			logger.operation('Alter Column', this._tableName, { columnName: change.columnName });
 		} catch (e: unknown) {
-			// Restore the prior schema, then rebuild secondary indexes (non-strict) so
-			// a partially-cleared strict rebuild can't strand the index map in an
-			// inconsistent state. The primary tree is only swapped on full success, so
-			// it is already the original here.
+			// Restore the prior schema, then re-key the secondary indexes back to it. The
+			// uniqueness pre-pass now runs before any mutation, so the only throw that can
+			// reach here with re-keyed structures in place is `rebuildPrimaryTreeStrict`'s
+			// PK collision. The primary tree is only swapped on full success, so it is
+			// already the original.
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.baseLayer.rebuildAllSecondaryIndexes();
 			this.tableSchema = originalManagerSchema;
@@ -2522,10 +2549,10 @@ export class MemoryTableManager {
 
 	/**
 	 * UNIQUE arm of {@link addConstraint}. Builds the covering secondary index the
-	 * same way {@link ensureUniqueConstraintIndexes} does (validating existing rows
-	 * via `addIndexToBase` → `populateNewIndex`), unless an existing *unique* index
-	 * already covers the exact columns — in which case the data is already
-	 * validated and we only register the covering structure.
+	 * same way {@link ensureUniqueConstraintIndexes} does (validating the DDL
+	 * transaction's effective rows via {@link validateUniqueOverEffectiveRows} first),
+	 * unless an existing *unique* index already covers the exact columns — in which
+	 * case the data is already validated and we only register the covering structure.
 	 */
 	private async addUniqueConstraint(constraint: ASTTableConstraint): Promise<void> {
 		const uc = buildUniqueConstraintSchema(constraint, this.tableSchema.columnIndexMap);
@@ -2810,16 +2837,46 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Propagates an additive schema change (new index and/or new UNIQUE constraint) into
-	 * every {@link TransactionLayer} the DDL connection's open transaction still reads
-	 * through — its pending layer and every savepoint snapshot below it, which are exactly
-	 * the transaction layers on the view layer's parent chain above the base.
+	 * `ALTER COLUMN … SET COLLATE` arm of {@link validateUniqueOverEffectiveRows}: rejects the
+	 * change when it makes two of the DDL transaction's effective rows collide under any
+	 * uniqueness-enforcing structure that orders by the altered column. Runs before anything is
+	 * mutated, so a rejection leaves the table and schema untouched and the transaction usable.
 	 *
-	 * Without this the transaction would keep enforcing (and scanning) its creation-time
-	 * schema for the rest of its life, and a `rollback to savepoint` would restore a
-	 * stale-schema layer. Rebasing would achieve the same but invalidate those snapshots.
-	 * Applied oldest-first: {@link TransactionLayer.adoptSchema} inherits its parent's tree
-	 * for the new index.
+	 * `newSchema` carries the post-change per-column collations, so each probe index compares
+	 * exactly as the rebuilt structure will. Indexes that do not mention the column keep their
+	 * keys and need no re-check.
+	 *
+	 * NOTE: walks `schema.indexes`, so a UNIQUE constraint covered by a row-time materialized
+	 * view rather than its auto-index (`findIndexForConstraint` prefers the MV) is not re-checked
+	 * here. The auto-index always exists alongside, so the structure is still validated — but if
+	 * an MV-only covering shape ever becomes reachable, this walk must follow it.
+	 */
+	private validateRekeyedUniqueStructures(newSchema: TableSchema, alteredColumnIndex: number): void {
+		// NOTE: the probe index carries the manager's PRE-change `primaryKeyFunctions` (the new
+		// ones cannot exist before the schema swaps). Only the probe's per-entry PK bookkeeping
+		// uses them, and every effective row already has a distinct PK under the old encoder, so
+		// duplicate detection — which fires on the index key, before any PK is stored — is
+		// unaffected. If a probe ever needs to compare PKs semantically, pass the new functions in.
+		for (const indexSchema of newSchema.indexes ?? []) {
+			if (!indexSchema.columns.some(c => c.index === alteredColumnIndex)) continue;
+			if (!indexEnforcesUnique(newSchema, indexSchema)) continue;
+			this.validateUniqueOverEffectiveRows(indexSchema, newSchema);
+		}
+	}
+
+	/**
+	 * Propagates a schema change — a new index and/or UNIQUE constraint, or a set of indexes
+	 * re-keyed by `alter column … set collate` — into every {@link TransactionLayer} the DDL
+	 * connection's open transaction still reads through: its pending layer and every savepoint
+	 * snapshot below it, which are exactly the transaction layers on the view layer's parent
+	 * chain above the base.
+	 *
+	 * Without this the transaction would keep enforcing (and scanning) its creation-time schema
+	 * for the rest of its life, a `rollback to savepoint` would restore a stale-schema layer,
+	 * and at commit the pending layer would become the committed head carrying its stale schema
+	 * and structures — shadowing the base's rebuilt ones. Rebasing would achieve the same but
+	 * invalidate those snapshots. Applied oldest-first: {@link TransactionLayer.adoptSchema}
+	 * inherits its parent's tree for each index.
 	 */
 	private adoptSchemaOnOpenLayers(newSchema: TableSchema): void {
 		const connection = this.ddlConnection();
