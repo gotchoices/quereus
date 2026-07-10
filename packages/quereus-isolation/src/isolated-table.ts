@@ -868,6 +868,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Detection instead needs the coerced form: probing the overlay/underlying by an
 		// un-coerced PK (e.g. TEXT '1' against a stored INTEGER 1) misses the existing
 		// row entirely (bug-store-isolation-upsert-affinity-coerced-pk).
+		// NOTE: this coerces the full row on every isolation-layer write, and the overlay
+		// coerces it again on its own insert/update — two validateAndParse passes per write
+		// (two JSON.parse for JSON columns). Negligible now; if isolation-write throughput or
+		// large-JSON rows ever show as hot, thread the coerced row through as pre-coerced.
 		const coercedValues = values ? this.coerceRow(values) : values;
 
 		// Resolve the effective PK-level action once so the wrapped overlay vtab
