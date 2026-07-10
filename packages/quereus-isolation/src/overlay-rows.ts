@@ -17,7 +17,7 @@ export interface OverlayEntry {
 }
 
 /** Resolves the tombstone column's position in an overlay table's schema. */
-export function resolveTombstoneIndex(overlayTable: VirtualTable, tombstoneColumn: string): number {
+function resolveTombstoneIndex(overlayTable: VirtualTable, tombstoneColumn: string): number {
 	const overlaySchema = overlayTable.tableSchema;
 	if (!overlaySchema) {
 		throw new QuereusError('Overlay table has no schema', StatusCode.INTERNAL);

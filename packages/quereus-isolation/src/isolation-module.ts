@@ -1679,7 +1679,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Creates overlay schema from underlying schema.
 	 * Adds tombstone column and uses unique name to avoid conflicts.
 	 *
-	 * Called by IsolatedTable when lazily creating its overlay.
+	 * Called by IsolatedTable when lazily creating its overlay, and by the two overlay-rebuild
+	 * paths (`rebuildOverlayForIndexChange`, `migrateOverlayForAlter`).
+	 *
+	 * KNOWN DEFECT: the copied secondary indexes are enforced over TOMBSTONE rows too. A
+	 * tombstone carries its row's PK and NULL in every other column, so a UNIQUE index whose
+	 * columns all sit inside the PK sees two deleted rows as a duplicate — a spurious UNIQUE
+	 * failure on delete-then-reinsert, and an INTERNAL error out of the CREATE INDEX rebuild.
+	 * Non-PK unique indexes escape only because their tombstone key is NULL and SQL NULLs are
+	 * distinct. Tracked by `tickets/fix/overlay-unique-index-enforces-tombstones`.
 	 */
 	createOverlaySchema(baseSchema: TableSchema): TableSchema {
 		const tombstoneColumn = {
