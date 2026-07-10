@@ -218,21 +218,30 @@ export class TransactionLayer implements Layer {
 	 * (base layer already re-keyed): the new tree inherits copy-on-write from the parent's new
 	 * one, so the parent's must already exist.
 	 *
-	 * ### Why the replay is by NET effect, deletes before upserts
+	 * ### Why {@link ownWrites} is rewritten to its net effect
 	 *
-	 * {@link ownWrites} is an ordered log that may touch one key repeatedly, and under the new
+	 * `ownWrites` is an ordered log that may touch one key repeatedly, and under the new
 	 * comparator two keys that were distinct in that log can collapse into one. Replaying it
-	 * verbatim would therefore let a later write land on an earlier write's row, or a deletion
-	 * remove a row a subsequent upsert had already placed. Instead each key the layer touched
-	 * contributes its NET effect — the layer's effective row, or a deletion — read out of the
-	 * pre-rekey tree, with deletions applied before upserts so a deleted key that now equals an
-	 * upserted key cannot take the surviving row with it.
+	 * verbatim would let a later write land on an earlier write's row, or a deletion remove a
+	 * row a subsequent upsert had already placed. So the log is REWRITTEN here, in place, to
+	 * one entry per key: the layer's effective row (read out of the pre-rekey tree), or a
+	 * deletion — deletions first, and a deletion whose key an upsert now occupies is dropped
+	 * entirely. The rewritten log is what every later reader of it replays: this method's own
+	 * index rebuild, a `create index` later in the same transaction ({@link adoptSchema} →
+	 * {@link reindexOwnWrites}), and `MemoryTableManager.commitTransaction`'s rebase.
 	 *
 	 * Soundness rests on a precondition `MemoryTableManager.validateRekeyedPrimaryKey` enforces
 	 * before any of this runs: NO layer in the chain — base included — holds two rows that
 	 * collide under the new comparator. Given that, every key here resolves to at most one row
 	 * in the parent, so a deletion removes exactly the row this layer removed and an upsert
 	 * lands at exactly one key.
+	 *
+	 * NOTE: the deletion replay assumes a key this layer deleted was a key the PARENT held.
+	 * That holds because every DML operation gets its own layer (`MemoryTableConnection`'s
+	 * statement savepoints), so no layer both creates and destroys a key. If a single layer
+	 * ever does, `rekeyed.find(key)` can land on a *colliding* parent row and delete it: at
+	 * that point the deletion needs to verify, under the OLD comparator, that the row it found
+	 * is the row it removed.
 	 */
 	public rekeyPrimaryKey(newSchema: TableSchema): void {
 		const preRekeyTree = this.primaryModifications;
@@ -273,56 +282,25 @@ export class TransactionLayer implements Layer {
 		}
 		this.primaryModifications = rekeyed;
 
+		// A deleted key an upsert has since re-occupied (`update t set v='A' where v='a'` under
+		// NOCASE) is no longer a deletion of anything: keeping it would make the log claim both
+		// a deletion and an upsert of the same key.
+		const survivingDeletions = deletions.filter(primaryKey => rekeyed.get(primaryKey) === undefined);
+		this.ownWrites.length = 0;
+		for (const primaryKey of survivingDeletions) {
+			this.ownWrites.push({ type: 'delete', primaryKey });
+		}
+		for (const row of upserts) {
+			this.ownWrites.push({ type: 'upsert', primaryKey: extractFromRow(row), newRow: row });
+		}
+
 		// Every secondary index's key encoding and PK bookkeeping derive from `pkFunctions`,
 		// and each inherits the parent's freshly-rebuilt tree — so all of them are rebuilt,
 		// including ones the altered column does not appear in.
 		this.secondaryIndexes = new Map();
 		this.initializeSecondaryIndexes();
 		for (const index of this.secondaryIndexes.values()) {
-			this.reindexNetWrites(index, deletions, upserts);
-		}
-	}
-
-	/**
-	 * {@link reindexOwnWrites} for a re-keyed primary: brings a newly-inherited `MemoryIndex`
-	 * up to date with this layer's NET writes, as computed by {@link rekeyPrimaryKey}.
-	 *
-	 * Cannot reuse `reindexOwnWrites`, which reads each touched key back out of this layer's
-	 * primary tree. Under the NEW comparator a key this layer DELETED can resolve to a
-	 * different row this layer upserted (`delete 'a'; insert 'A'` under NOCASE), so that
-	 * read-back would index the surviving row under the deleted row's primary key. Driving
-	 * from the net lists — which were computed against the pre-rekey tree — avoids the
-	 * ambiguity entirely.
-	 */
-	private reindexNetWrites(index: MemoryIndex, deletions: readonly BTreeKeyForPrimary[], upserts: readonly Row[]): void {
-		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
-		const droppedParentEntries = new Set<string>();
-
-		// The parent's index already covers the parent's row at this key; drop that entry so
-		// this layer's deletion/replacement is not shadowed by it. A deleted key and an
-		// upserted key can resolve to the SAME parent row under the new comparator, hence the
-		// dedup set (and `removeEntry` is itself a no-op when the entry is already gone).
-		const dropParentEntry = (primaryKey: BTreeKeyForPrimary): void => {
-			const parentRow = parentPrimaryTree?.get(primaryKey);
-			if (parentRow === undefined) return;
-			const parentPrimaryKey = this.pkFunctions.extractFromRow(parentRow);
-			const encoded = this.pkFunctions.encode(parentPrimaryKey);
-			if (droppedParentEntries.has(encoded)) return;
-			droppedParentEntries.add(encoded);
-			if (index.rowMatchesPredicate(parentRow)) {
-				index.removeEntry(index.keyFromRow(parentRow), parentPrimaryKey);
-			}
-		};
-
-		for (const primaryKey of deletions) {
-			dropParentEntry(primaryKey);
-		}
-		for (const row of upserts) {
-			const primaryKey = this.pkFunctions.extractFromRow(row);
-			dropParentEntry(primaryKey);
-			if (index.rowMatchesPredicate(row)) {
-				index.addEntry(index.keyFromRow(row), primaryKey);
-			}
+			this.reindexOwnWrites(index);
 		}
 	}
 
@@ -336,6 +314,12 @@ export class TransactionLayer implements Layer {
 	 * Driven by {@link ownWrites} (deduplicated by primary key — the log is an ordered
 	 * list that may touch one key repeatedly) rather than a full scan, so the cost is
 	 * proportional to the transaction's writes, not the table's size.
+	 *
+	 * The parent's entry is dropped under the PARENT row's own primary key, not under the
+	 * key the write names. After {@link rekeyPrimaryKey} the two can differ — a write of
+	 * `'A'` resolves, under NOCASE, to a parent row keyed `'a'` — and filing the removal
+	 * under the write's key would leave the parent's entry in place, so an index scan would
+	 * return the row twice.
 	 */
 	private reindexOwnWrites(index: MemoryIndex): void {
 		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
@@ -348,13 +332,13 @@ export class TransactionLayer implements Layer {
 
 			const parentRow = parentPrimaryTree?.get(write.primaryKey);
 			if (parentRow !== undefined && index.rowMatchesPredicate(parentRow)) {
-				index.removeEntry(index.keyFromRow(parentRow), write.primaryKey);
+				index.removeEntry(index.keyFromRow(parentRow), this.pkFunctions.extractFromRow(parentRow));
 			}
 			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
 			// undefined when the layer deleted the key, the layer's own row otherwise.
 			const ownRow = this.primaryModifications.get(write.primaryKey);
 			if (ownRow !== undefined && index.rowMatchesPredicate(ownRow)) {
-				index.addEntry(index.keyFromRow(ownRow), write.primaryKey);
+				index.addEntry(index.keyFromRow(ownRow), this.pkFunctions.extractFromRow(ownRow));
 			}
 		}
 	}

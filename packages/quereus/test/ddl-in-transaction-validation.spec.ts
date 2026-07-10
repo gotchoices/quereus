@@ -871,10 +871,10 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 		it('does not double-index a row whose old and new primary keys collapse', async () => {
 			// One layer, two own-writes: `update` records a delete of PK 'a' and an upsert of PK
 			// 'A', and moves the row's index key from 'x' to 'y'. Under NOCASE the two PKs are
-			// one key, so reading each touched key back out of the layer's own tree (what
-			// `reindexOwnWrites` does) resolves the DELETED key to the SURVIVING row and files it
-			// in the index under both primary keys — the row then comes back twice from an index
-			// scan. `reindexNetWrites` drives from the net effect instead.
+			// one key, so reading each touched key back out of the layer's own tree resolves the
+			// DELETED key to the SURVIVING row and files it in the index under both primary keys
+			// — the row then comes back twice from an index scan. `rekeyPrimaryKey` collapses the
+			// write log to its net effect (dropping the subsumed deletion) before re-indexing.
 			await db.exec(`create table t (v text primary key, w text)`);
 			await db.exec(`create index tw on t (w)`);
 			await db.exec(`insert into t values ('a', 'x')`);
@@ -927,6 +927,67 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			await db.exec(`insert into t values (2, 'X')`);
 			await db.exec(`commit`);
 			expect(await values(`select a from t order by a`)).to.deep.equal([1, 2]);
+		});
+
+		it('a create index later in the same transaction does not double-index a re-keyed row', async () => {
+			// `create index` re-indexes each open layer from its own-write log. That log named PK
+			// 'a' (deleted) and PK 'A' (upserted), which the re-key collapsed into one key — so
+			// unless the re-key rewrote the log to its net effect, the new index files the
+			// surviving row under both keys and an index scan returns it twice.
+			await db.exec(`create table t (v text primary key, w text)`);
+			await db.exec(`insert into t values ('a', 'x')`);
+			await db.exec(`begin`);
+			await db.exec(`update t set v = 'A' where v = 'a'`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+			await db.exec(`create index tw on t (w)`);
+
+			expect(await values(`select v from t where w = 'x'`)).to.deep.equal(['A']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t where w = 'x'`)).to.deep.equal(['A']);
+		});
+
+		it('re-keys a descending primary key without losing its direction', async () => {
+			// `createPrimaryKeyFunctions` folds `desc` into the comparator; the re-key rebuilds
+			// the comparator from the new schema, so the direction must survive alongside the
+			// new collation.
+			await db.exec(`create table t (v text, primary key (v desc))`);
+			await db.exec(`insert into t values ('b')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values ('c')`);
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			await expectError(
+				() => db.exec(`insert into t values ('C')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`insert into t values ('a')`);
+			// A bare scan follows the primary tree, which orders descending.
+			expect(await values(`select v from t`)).to.deep.equal(['c', 'b', 'a']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t`)).to.deep.equal(['c', 'b', 'a']);
+		});
+
+		it('honors a partial index predicate while re-keying the primary key', async () => {
+			// `reindexOwnWrites` re-files only the rows the layer wrote, and only those the
+			// predicate admits: the row that leaves the index must lose its entry, the row that
+			// enters it must gain one, and the row that never qualified must stay out.
+			await db.exec(`create table t (v text primary key, w text)`);
+			await db.exec(`create index tw on t (w) where w <> 'skip'`);
+			await db.exec(`insert into t values ('a', 'x'), ('b', 'skip')`);
+			await db.exec(`begin`);
+			await db.exec(`update t set w = 'skip' where v = 'a'`);   // leaves the index
+			await db.exec(`update t set w = 'y' where v = 'b'`);      // enters the index
+			await db.exec(`insert into t values ('c', 'skip')`);      // never qualifies
+			await db.exec(`alter table t alter column v set collate nocase`);
+
+			expect(await values(`select v from t where w = 'x'`)).to.deep.equal([]);
+			expect(await values(`select v from t where w = 'y'`)).to.deep.equal(['b']);
+			expect(await values(`select v from t where w = 'skip' order by v`)).to.deep.equal(['a', 'c']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t where w = 'y'`)).to.deep.equal(['b']);
+			expect(await values(`select v from t where w = 'x'`)).to.deep.equal([]);
+			expect(await values(`select v from t where w = 'skip' order by v`)).to.deep.equal(['a', 'c']);
 		});
 	});
 

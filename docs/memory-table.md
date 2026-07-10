@@ -198,7 +198,7 @@ await db.exec("alter table users rename column created_at to registration_date")
 ## DDL and transactions
 
 `CREATE INDEX` / `CREATE UNIQUE INDEX` / `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` /
-`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` may run inside an open transaction. Two rules
+`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` may run inside an open transaction. Three rules
 define what that means.
 
 **1. Row-validating DDL sees exactly what a `SELECT` in the same transaction sees.**
@@ -261,10 +261,12 @@ layers — the rebase that savepoint snapshots exist to avoid.
 When the check passes, `BaseLayer.rebuildPrimaryTreeStrict` re-keys the base and
 `TransactionLayer.rekeyPrimaryKey` (not `adoptSchema`) re-keys each open layer oldest-first:
 `pkFunctions`, the primary tree, and *every* secondary index, since each derives its
-`primaryKeyComparator` / `encode` from the primary key definition. A layer's own writes are
-replayed onto the re-keyed parent by **net effect per key, deletions before upserts** — the raw
-write log cannot be replayed verbatim, because two keys that were distinct in it may now collapse
-into one.
+`primaryKeyComparator` / `encode` from the primary key definition. A layer's own-write log cannot
+be replayed verbatim onto the re-keyed parent, because two keys that were distinct in it may now
+collapse into one; `rekeyPrimaryKey` therefore **rewrites the log to its net effect per key** —
+one entry per key, deletions first, and a deletion whose key an upsert now occupies dropped. Every
+later reader of that log replays the rewritten form: the index rebuild, a `CREATE INDEX` later in
+the same transaction, and the commit-time rebase.
 
 **Rule 1 assumes the transaction commits.** DDL is not undone by `ROLLBACK` or `ROLLBACK TO
 SAVEPOINT` (see `tickets/backlog/feat-ddl-transaction-capability.md`), but the rows it validated
