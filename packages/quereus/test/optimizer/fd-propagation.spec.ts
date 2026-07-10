@@ -1,5 +1,8 @@
 import { expect } from 'chai';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { Database } from '../../src/core/database.js';
+import { lineAt, readCode, relPosix, stripComments, tsFilesUnder } from '../util/source-scan.js';
 import {
 	addEquivalence,
 	addFd,
@@ -535,5 +538,107 @@ describe('FD propagation per operator', () => {
 		expect(windowProps).to.not.equal(undefined);
 		// The PK FD from `w` (id → v) should survive — id stays as col 0 in the source.
 		expect(fdHas(windowProps!.fds, [0], [1])).to.equal(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// OPT-046 static guard
+// ---------------------------------------------------------------------------
+
+interface FdPush {
+	readonly key: string;
+	readonly where: string;
+}
+
+/**
+ * Every `<something>fds.push(...)` in `code`, keyed `<relPath>::<receiver>`. The
+ * receiver test is deliberately narrow: a name ending in `fd`/`fds` (any case),
+ * which is how every FD list in the planner is named.
+ */
+function findFdPushes(relPath: string, code: string): FdPush[] {
+	const out: FdPush[] = [];
+	for (const m of code.matchAll(/\b([A-Za-z_$][\w$]*)\.push\(/g)) {
+		const receiver = m[1];
+		if (!/fds?$/i.test(receiver)) continue;
+		out.push({ key: `${relPath}::${receiver}`, where: `${relPath}:${lineAt(code, m.index)} — ${receiver}.push(` });
+	}
+	return out;
+}
+
+/**
+ * Local candidate-list builds: an array assembled here, then handed to `addFd` /
+ * `mergeFds` by its consumer. Each entry must name where that fold happens — if it
+ * cannot, the push is a real violation, not an exception.
+ *
+ * NOTE: this guard pays for itself only while the list stays short. If it grows past
+ * a handful of entries the receiver-name heuristic has stopped discriminating, and
+ * the right move is to delete the guard rather than keep feeding it.
+ */
+const LOCAL_FD_BUILD_ALLOWLIST: ReadonlyMap<string, string> = new Map([
+	[
+		'nodes/project-node.ts::projectedKeyFds',
+		'candidate key FDs, each then folded through `addFd` in the loop immediately below',
+	],
+	[
+		'analysis/check-extraction.ts::fds',
+		'`extractCheckConstraints` returns a candidate list; `reference.ts` folds it through `addFd`',
+	],
+	[
+		'analysis/assertion-hoist-cache.ts::fds',
+		'`getAssertionHoistedConstraints` returns a candidate list; `reference.ts` folds it through `addFd`',
+	],
+]);
+
+describe('OPT-046 static guard: addFd is the only FD accumulation path', () => {
+	// FDs are accumulated through `addFd` / `mergeFds`, which apply subsumption and
+	// enforce MAX_FDS_PER_NODE. Pushing straight onto the array skips both, and shows
+	// up as a missing key or an over-long FD list rather than a crash. Scan the two
+	// directories that build node FD sets and flag any `.push(` onto an FD-named
+	// receiver that is not a known local candidate build. `util/fd-utils.ts` is
+	// excluded: it *is* the sanctioned accumulation path.
+	const plannerDir = join(dirname(fileURLToPath(import.meta.url)), '../../src/planner');
+	const scanRoots = ['nodes', 'analysis'];
+
+	function scanPushes(): FdPush[] {
+		return scanRoots.flatMap(root =>
+			tsFilesUnder(join(plannerDir, root)).flatMap(file =>
+				findFdPushes(relPosix(plannerDir, file), readCode(file)),
+			),
+		);
+	}
+
+	it('no FD list is accumulated by a bare .push()', () => {
+		const pushes = scanPushes();
+		// Self-check: the known local builds must still be found, or the scanner has
+		// silently stopped matching and the guard would pass vacuously.
+		expect(pushes.length, 'scanner found the known FD pushes').to.be.greaterThan(0);
+
+		const offenders = pushes.filter(p => !LOCAL_FD_BUILD_ALLOWLIST.has(p.key)).map(p => p.where);
+		expect(
+			offenders,
+			`FD lists accumulated without addFd/mergeFds:\n${offenders.join('\n')}`,
+		).to.be.empty;
+	});
+
+	it('the allowlist has no stale entries', () => {
+		const seen = new Set(scanPushes().map(p => p.key));
+		for (const key of LOCAL_FD_BUILD_ALLOWLIST.keys()) {
+			expect(seen.has(key), `allowlisted FD push \`${key}\` no longer exists — drop it`).to.equal(true);
+		}
+	});
+
+	it('flags a hand-written violation and ignores non-FD receivers', () => {
+		const code = stripComments(`
+			function computePhysical(source) {
+				const fds = [...source.fds];
+				fds.push({ determinants: [0], dependents: [1], kind: 'unique' });
+				equivPairs.push([0, 1]);
+				constantBindings.push({ col: 2 });
+				return { fds };
+			}
+		`);
+		const found = findFdPushes('nodes/fake-node.ts', code);
+		expect(found.map(f => f.key)).to.deep.equal(['nodes/fake-node.ts::fds']);
+		expect(found[0].where).to.match(/^nodes\/fake-node\.ts:4 — fds\.push\($/);
 	});
 });

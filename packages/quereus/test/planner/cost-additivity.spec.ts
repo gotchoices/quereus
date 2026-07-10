@@ -1,8 +1,9 @@
 import { expect } from 'chai';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { Database } from '../../src/core/database.js';
+import { readCode } from '../util/source-scan.js';
 import { PlanNode, isRelationalNode, type RelationalPlanNode } from '../../src/planner/nodes/plan-node.js';
 import { CTENode } from '../../src/planner/nodes/cte-node.js';
 import { RecursiveCTENode } from '../../src/planner/nodes/recursive-cte-node.js';
@@ -163,12 +164,6 @@ describe('Cost model: static convention guard (self-cost-only)', () => {
 	// guard keys on code, not on the "flows in via getTotalCost()" doc comments.
 	const nodesDir = join(dirname(fileURLToPath(import.meta.url)), '../../src/planner/nodes');
 
-	function stripComments(src: string): string {
-		return src
-			.replace(/\/\*[\s\S]*?\*\//g, '') // block comments
-			.replace(/\/\/[^\n]*/g, ''); // line comments
-	}
-
 	it('no node constructor folds child getTotalCost()/estimatedCost into its own self-cost', () => {
 		const files = readdirSync(nodesDir).filter((f) => f.endsWith('.ts'));
 		const offenders: string[] = [];
@@ -178,7 +173,7 @@ describe('Cost model: static convention guard (self-cost-only)', () => {
 			// field — it is the framework, not a node whose constructor folds costs.
 			if (file === 'plan-node.ts') continue;
 
-			const code = stripComments(readFileSync(join(nodesDir, file), 'utf8'));
+			const code = readCode(join(nodesDir, file));
 
 			if (code.includes('getTotalCost(')) {
 				offenders.push(`${file}: references getTotalCost() in code (self-cost must exclude children)`);

@@ -49,6 +49,7 @@ self-guarding: `validateSideEffectMode` raises `QuereusError(INTERNAL)` at regis
 - code: `packages/quereus/src/planner/framework/characteristics.ts` — `subtreeHasSideEffects`
 - code: `packages/quereus/src/planner/rules/predicate/rule-empty-relation-folding.ts`
 - guard: `packages/quereus/test/optimizer/side-effect-audit.spec.ts` — `Side-effect audit: rules must refuse on impure subtrees`
+- guard: `packages/quereus/test/optimizer/side-effect-audit.spec.ts` — `OPT-002 static guard: every 'aware' rule consults a side-effect signal`
 - doc: [Optimizer § The two declarations](optimizer.md#the-two-declarations)
 
 A rule that moves, duplicates, drops, or merges a subtree it has not separately proven pure
@@ -58,8 +59,12 @@ subtree carries a write. Usually that signal is `PlanNodeCharacteristics.hasSide
 (`physical.readonly` **and** deterministic), which is strictly stronger. `'safe'` is the
 counter-claim that the transform's structural shape preserves side effects by itself. One
 `'aware'` rule, `cte-optimization`, consults nothing: it wraps the subtree in a run-once
-`CacheNode`, which preserves the write. The guard covers the fold rules only; the declaration
-is not machine-checked against a rule's body.
+`CacheNode`, which preserves the write. The behavioural guard covers the fold rules only. A
+static guard closes the rest: it reads `optimizer.ts`, resolves every `'aware'` rule's `fn:`
+to its source file, and fails if that file names none of `hasSideEffects`,
+`subtreeHasSideEffects`, `isConcurrencySafe`, `isFunctional`, `physical.readonly`.
+`cte-optimization` is allowlisted there with its reason. The check is textual: it proves a
+rule *mentions* a signal, not that it acts on it correctly.
 
 ### OPT-004 — A custom-`execute` pass argues its own soundness
 
@@ -339,7 +344,7 @@ the marker.
 
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `addFd`
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `MAX_FDS_PER_NODE`
-- guard: none — no mechanical check distinguishes a hand-rolled `Array.push` onto an FD list from a legitimate local array build; a violation shows up as a missing key or an over-long FD list, not a crash.
+- guard: `packages/quereus/test/optimizer/fd-propagation.spec.ts` — `OPT-046 static guard: addFd is the only FD accumulation path`
 - doc: [Functional Dependencies § Helper surface](optimizer-fd.md#helper-surface)
 
 FDs are accumulated through `addFd` / `mergeFds`, never by pushing onto the array. `addFd`
@@ -348,7 +353,11 @@ subset of the newcomer's is dropped; a newcomer already subsumed is skipped) and
 `MAX_FDS_PER_NODE = 64`. Cap eviction keeps FDs whose determinants lie inside a caller-supplied
 `keyHints` set first, and within each partition prefers `'unique'` over `'determination'` —
 evicting a uniqueness witness is sound but causes downstream under-claims. Truncations log on
-`quereus:planner:fd`.
+`quereus:planner:fd`. The guard scans `planner/nodes/**` and `planner/analysis/**` for a
+`.push(` onto an FD-named receiver, with a short allowlist for local candidate lists that are
+handed to `addFd` by their consumer. It keys on receiver names, so it is a smoke alarm rather
+than a proof; if the allowlist ever needs to grow past a handful of entries, delete the guard
+rather than maintain it.
 
 ### OPT-048 — Dependency facts index output columns
 
@@ -384,14 +393,17 @@ resolved at plan time exactly as the runtime resolves it, through the shared hel
 
 - code: `packages/quereus/src/planner/nodes/plan-node.ts` — `ConstraintProvenance`
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `fdsEqual`
-- guard: none — a rule branching on `source` still typechecks and still passes its own tests; the damage is that a fact's optimizer meaning starts depending on where it came from.
+- guard: `packages/quereus/test/optimizer/assertion-as-premise.spec.ts` — `OPT-052 static guard: provenance is informational`
 - doc: [Functional Dependencies § Assertion-derived premises](optimizer-fd.md#assertion-derived-premises)
 
 An FD, constant binding, or domain constraint may carry a `source` tag recording where it came
 from (`'declared-check'`, `{ kind: 'assertion', name }`, …). No rule branches on it. The dedup
 helpers compare structural fields only and ignore it, so when a declared CHECK and a hoisted
 assertion produce structurally identical facts, whichever merged first survives. The tag
-exists for diagnostics and for explaining a plan, not for driving one.
+exists for diagnostics and for explaining a plan, not for driving one. The guard scans
+`planner/rules/**` for the identifier `ConstraintProvenance` — not for `.source` reads, since
+`node.source` is a plan node's child pointer that rules read constantly — on the reasoning
+that a rule cannot do anything useful with the tag without naming its type.
 
 ### OPT-054 — All-columns key-ness lives on `isSet`
 
