@@ -3388,4 +3388,177 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			await mdb.close();
 		});
 	});
+
+	describe('overlay indexes and UNIQUE constraints scoped to live rows', () => {
+		// Regression: a tombstone (a deletion marker: the deleted row's PK, NULL in every
+		// other column) was enforced by the overlay's own UNIQUE structures as if it were a
+		// live row. Invisible whenever a UNIQUE structure covered a non-PK column (its
+		// tombstone value is NULL, and SQL treats NULLs as distinct) — the fix narrows every
+		// copied index/UNIQUE constraint in the overlay schema to `<tombstone> = 0` so it
+		// only ever sees live rows.
+		let db: Database;
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			db = new Database();
+			const memoryModule = new MemoryTableModule();
+			isolatedModule = new IsolationModule({
+				underlying: memoryModule,
+			});
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		afterEach(async () => {
+			await db.close();
+		});
+
+		it('delete-then-reinsert under a PK-covered UNIQUE index commits the reinserted row', async () => {
+			await db.exec(`create table t (a integer, b integer, primary key (a, b)) using isolated`);
+			await db.exec(`create unique index t_a_ux on t (a)`);
+			await db.exec(`insert into t values (1, 1)`);
+
+			await db.exec('begin');
+			await db.exec('delete from t where a = 1 and b = 1');
+			await db.exec('insert into t values (1, 2)');
+			await db.exec('commit');
+
+			const rows = await asyncIterableToArray(db.eval('select a, b from t'));
+			expect(rows.map(r => [r.a, r.b])).to.deep.equal([[1, 2]]);
+		});
+
+		it('create unique index inside a transaction over a fully tombstoned table commits empty', async () => {
+			await db.exec(`create table t (a integer, b integer, primary key (a, b)) using isolated`);
+			await db.exec(`insert into t values (1, 1)`);
+			await db.exec(`insert into t values (1, 2)`);
+
+			await db.exec('begin');
+			await db.exec('delete from t');
+			// Pre-fix: rebuilding the overlay for the new index enforced uniqueness over the
+			// two tombstones just staged (both carry a = 1) and raised INTERNAL.
+			await db.exec('create unique index t_a_ux on t (a)');
+			await db.exec('commit');
+
+			const rows = await asyncIterableToArray(db.eval('select * from t'));
+			expect(rows.length).to.equal(0);
+		});
+
+		it('pins the already-working non-PK UNIQUE column case (tombstone key is NULL)', async () => {
+			await db.exec(`create table t (a integer primary key, b integer) using isolated`);
+			await db.exec(`create unique index t_b_ux on t (b)`);
+			await db.exec(`insert into t values (1, 1)`);
+
+			await db.exec('begin');
+			await db.exec('delete from t where a = 1');
+			await db.exec('insert into t values (2, 1)');
+			await db.exec('commit');
+
+			const rows = await asyncIterableToArray(db.eval('select a, b from t'));
+			expect(rows.map(r => [r.a, r.b])).to.deep.equal([[2, 1]]);
+		});
+
+		it('a pre-existing partial UNIQUE index still lets out-of-scope rows collide and still rejects in-scope duplicates', async () => {
+			await db.exec(`create table t (id integer primary key, a integer, b integer) using isolated`);
+			await db.exec(`create unique index t_a_ux on t (a) where b > 0`);
+
+			// Both outside the predicate's scope (b <= 0) — the duplicate 'a' escapes enforcement.
+			await db.exec(`insert into t values (1, 5, -1)`);
+			await db.exec(`insert into t values (2, 5, -1)`);
+			const outOfScope = await asyncIterableToArray(db.eval('select id from t where a = 5 order by id'));
+			expect(outOfScope.map(r => r.id)).to.deep.equal([1, 2]);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (3, 7, 1)`);
+			let err: unknown;
+			try {
+				await db.exec(`insert into t values (4, 7, 1)`);
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'an in-scope duplicate staged inside the transaction must still be rejected').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			await db.exec('rollback');
+		});
+
+		it('a table-level UNIQUE(...) over PK columns commits a delete-then-reinsert of the same key', async () => {
+			await db.exec(`create table t (a integer, b integer, primary key (a, b), unique (a, b)) using isolated`);
+			await db.exec(`insert into t values (1, 1)`);
+
+			await db.exec('begin');
+			await db.exec('delete from t where a = 1 and b = 1');
+			await db.exec('insert into t values (1, 2)');
+			await db.exec('commit');
+
+			const rows = await asyncIterableToArray(db.eval('select a, b from t'));
+			expect(rows.map(r => [r.a, r.b])).to.deep.equal([[1, 2]]);
+		});
+
+		it('still rejects two live overlay rows colliding on a UNIQUE index', async () => {
+			await db.exec(`create table t (id integer primary key, a integer) using isolated`);
+			await db.exec(`create unique index t_a_ux on t (a)`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 5)`);
+			let err: unknown;
+			try {
+				await db.exec(`insert into t values (2, 5)`);
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'narrowing to live rows must not disable enforcement within the overlay').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			await db.exec('rollback');
+		});
+
+		it('still rejects two live overlay rows colliding on a table-level UNIQUE(...)', async () => {
+			await db.exec(`create table t (id integer primary key, a integer, unique (a)) using isolated`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 5)`);
+			let err: unknown;
+			try {
+				await db.exec(`insert into t values (2, 5)`);
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'narrowing to live rows must not disable enforcement within the overlay').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			await db.exec('rollback');
+		});
+
+		it('reusing a tombstoned PK inside the transaction overwrites it rather than raising or resurrecting the old row', async () => {
+			await db.exec(`create table t (id integer primary key, name text) using isolated`);
+			await db.exec(`insert into t values (1, 'Alice')`);
+
+			await db.exec('begin');
+			await db.exec(`delete from t where id = 1`);
+			await db.exec(`insert into t values (1, 'Bob')`);
+
+			const midTxn = await asyncIterableToArray(db.eval('select id, name from t'));
+			expect(midTxn.map(r => [r.id, r.name])).to.deep.equal([[1, 'Bob']]);
+
+			await db.exec('commit');
+
+			const committed = await asyncIterableToArray(db.eval('select id, name from t'));
+			expect(committed.map(r => [r.id, r.name])).to.deep.equal([[1, 'Bob']]);
+		});
+
+		it('a merged secondary-index scan shows neither a staged delete nor a stale pre-update value', async () => {
+			await db.exec(`create table t (id integer primary key, cat text, val text) using isolated`);
+			await db.exec(`create index t_cat_ix on t (cat)`);
+			await db.exec(`insert into t values (1, 'x', 'old1')`);
+			await db.exec(`insert into t values (2, 'x', 'old2')`);
+			await db.exec(`insert into t values (3, 'x', 'old3')`);
+
+			await db.exec('begin');
+			await db.exec(`delete from t where id = 1`);
+			await db.exec(`update t set val = 'new2' where id = 2`);
+
+			const rows = await asyncIterableToArray(
+				db.eval(`select id, val from t where cat = 'x' order by id`)
+			);
+			expect(rows.map(r => [r.id, r.val])).to.deep.equal([[2, 'new2'], [3, 'old3']]);
+
+			await db.exec('commit');
+		});
+	});
 });

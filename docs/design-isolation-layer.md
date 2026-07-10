@@ -461,10 +461,22 @@ The overlay table must have the same indexes as the underlying table so that:
 The isolation layer creates an overlay table with:
 - Same columns as underlying table
 - Same primary key
-- Same secondary indexes
+- Same secondary indexes and UNIQUE constraints, each narrowed to live rows (below)
 - Additional tombstone marker column
 
 This is handled automatically when the isolation layer creates the overlay table instance.
+
+A tombstone carries its row's primary key and `NULL` in every other column, so it is not a
+row a UNIQUE structure should ever judge. Every copied secondary index and every copied
+UNIQUE constraint therefore gets `<tombstone column> = 0` AND-ed onto whatever partial
+predicate it already carried (`createOverlaySchema` in `isolation-module.ts`), scoping it to
+live overlay rows only. Without this, a UNIQUE structure whose columns are entirely inside
+the primary key would see two tombstones — or a tombstone and a live row — sharing a PK as
+colliding duplicates, since tombstones carry real PK values. (A UNIQUE structure over an
+ordinary, non-PK column never showed this: a tombstone's value there is `NULL`, and SQL
+treats `NULL`s as distinct.) The overlay's own **primary-key** uniqueness is deliberately
+*not* narrowed — it must keep covering tombstones so a re-insert at a tombstoned PK is
+detected and converted into an overwrite rather than a fresh insert.
 
 ### Index Scan Merge
 
