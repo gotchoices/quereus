@@ -76,7 +76,7 @@ test/
 └── util/                     # Test utilities
 ```
 
-Key relationships: each PlanNode in `planner/nodes/` has a matching emitter in `runtime/emit/`. Optimizer rules in `planner/rules/` are registered in `planner/optimizer.ts` (via `this.passManager.addRuleToPass(...)`). Tests go in `test/logic/*.sqllogic` (SQL logic tests) or `test/plan/` (plan shape tests).
+Key relationships: each PlanNode in `planner/nodes/` has a matching emitter in `runtime/emit/`. Optimizer rules in `planner/rules/` are registered in `planner/optimizer.ts` (as ordered entries in the `RULE_MANIFEST` array — array order is execution order). Tests go in `test/logic/*.sqllogic` (SQL logic tests) or `test/plan/` (plan shape tests).
 
 ## Common Implementation Patterns
 
@@ -89,7 +89,7 @@ Key relationships: each PlanNode in `planner/nodes/` has a matching emitter in `
 
 **Adding an optimizer rule:**
 1. `planner/rules/<category>/rule-my-rule.ts` (copy an existing rule in the same category)
-2. Register in `planner/optimizer.ts` (`this.passManager.addRuleToPass(...)`)
+2. Add an entry to `RULE_MANIFEST` in `planner/optimizer.ts` at the position that gives the ordering you need (array order = execution order)
 3. Cost constants go in `planner/cost/index.ts`
 
 **Adding a built-in function:**

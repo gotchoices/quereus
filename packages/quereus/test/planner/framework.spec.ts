@@ -145,9 +145,8 @@ function makeRule(
 	id: string,
 	nodeType: PlanNodeType,
 	fn: (node: PlanNode, ctx: OptContext) => PlanNode | null,
-	priority?: number,
 ): RuleHandle {
-	return { id, nodeType, phase: 'rewrite', fn, priority, sideEffectMode: 'safe' };
+	return { id, nodeType, phase: 'rewrite', fn, sideEffectMode: 'safe' };
 }
 
 // ---------------------------------------------------------------------------

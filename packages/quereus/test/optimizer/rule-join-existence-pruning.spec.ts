@@ -386,8 +386,8 @@ describe('ruleJoinExistencePruning', () => {
 	// the unused flag yields a flag-free LEFT join, and the aggregate variant of
 	// join-elimination now eliminates FK→PK left/right joins — so pruning under an
 	// aggregate CASCADES to join elimination (zero join ops), not merely to physical
-	// join selection. The prune (priority 22) and the eliminate (priority 26) fire in
-	// the same `applyRules` pass.
+	// join selection. The prune (join-existence-pruning-aggregate) and the eliminate
+	// (join-elimination-aggregate) fire in the same `applyRules` pass.
 	describe('aggregate-anchored pruning', () => {
 		it('an unused flag under count(*) is pruned, cascading to FK→PK join elimination (zero join ops)', async () => {
 			await setupFkOrders();

@@ -415,8 +415,9 @@ All plan nodes extend the base `PlanNode` class and implement category-specific 
 Rules live in `src/planner/rules/`, one directory per optimization family
 (`access`, `aggregate`, `cache`, `distinct`, `join`, `predicate`, `retrieve`, `sort`,
 `subquery`, `parallel`), and are registered to passes in `src/planner/optimizer.ts`.
-That file is the single source of truth for which rule runs in which pass, at what
-priority, under which `sideEffectMode`. The prose catalog — what each rule matches, its
+That file is the single source of truth for which rule runs in which pass, in what
+order (the `RULE_MANIFEST` array order, which IS the execution order), under which
+`sideEffectMode`. The prose catalog — what each rule matches, its
 guards, and its soundness argument — is
 [Optimizer Rules § Optimization Rules](optimizer-rules.md#optimization-rules).
 
@@ -563,16 +564,19 @@ export function ruleMyOptimization(
 }
 ```
 
-2. **Register Rule** in optimizer:
+2. **Register Rule** by adding an entry to `RULE_MANIFEST` in optimizer:
 ```typescript
-// src/planner/optimizer.ts, inside registerRulesToPasses()
-this.passManager.addRuleToPass(PassId.Structural, {
+// src/planner/optimizer.ts — add an entry to RULE_MANIFEST at the position
+// that gives the ordering you want. Array order IS execution order within a
+// pass; place the entry before/after the rules it must run before/after.
+{
+  pass: PassId.Structural,
   id: 'MyRule',
-  nodeType: PlanNodeType.Target,
+  nodeType: PlanNodeType.Target, // or an array to fan `fn` across several types
   phase: 'rewrite',
   fn: ruleMyOptimization,
   sideEffectMode: 'safe', // or 'aware' — see § Audit discipline below
-});
+}
 ```
 
 3. **Add Tests** with golden plans:
@@ -664,7 +668,7 @@ to propagate `readonly=false`.
 | `retrieve/` (grow-retrieve, projection-pruning) | mixed | Grow slides into read-only Retrieve (safe); pruning drops scalar projections (aware). |
 | `access/`, `sort/`, `aggregate/`, `window/`, `distinct/` | mostly safe | Replace logical with physical nodes / annotate in place. |
 
-The full per-rule annotation lives at each `addRuleToPass(...)` call in
+The full per-rule annotation lives on each entry in `RULE_MANIFEST` in
 `src/planner/optimizer.ts`. Treat that file as the single source of truth
 for the audit.
 

@@ -26,7 +26,7 @@
  * The output schema of an anti-join is its left side (SEMI/ANTI take left
  * columns only — see `buildJoinAttributes`), so we hand `EmptyRelationNode`
  * L's attribute IDs and RelationType directly. The const-fold pass
- * (Structural priority 27) then cascades that emptiness up through Filter /
+ * (in the Structural pass, alongside the empty-relation folds) then cascades that emptiness up through Filter /
  * Project / Sort / LimitOffset / Distinct / inner-or-cross-or-semi joins.
  */
 

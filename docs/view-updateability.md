@@ -227,7 +227,7 @@ fanout / elimination rules bail on it) so the appended flag column is never
 dropped by a physical rewrite — the limitation (existence joins forgo hash/merge
 selection, and a flag-bearing join cannot be eliminated) applies only **while the
 flag is demanded**. An **unused** flag — one no ancestor reads — is removed by the
-demand-gated existence-pruning rule (Structural / priority 22), which has two
+demand-gated existence-pruning rule (Structural), which has two
 anchors: `join-existence-pruning` on the nearest enclosing Project, and
 `join-existence-pruning-aggregate` on an enclosing Aggregate (for a flag-bearing
 join under a `count(*)` / `group by` with no Project). Either anchor walks the
@@ -243,8 +243,8 @@ is what carries a view's write-side flag reference).
 A **probe-only** flag — one demanded *solely* as a top-level boolean test in a
 `where` clause (`where <flag>` / `where not <flag>`) and nowhere else — is the
 demand-SHAPE complement of the unused case: the demand-PRESENCE gate retains it
-(it *is* read), but the `semijoin-existence-recovery` rule (Structural / priority
-23) recognizes that the only use is an existence probe and rewrites the
+(it *is* read), but the `semijoin-existence-recovery` rule (Structural)
+recognizes that the only use is an existence probe and rewrites the
 `left join … exists right as` to the equivalent **semi** (`where flag`) or
 **anti** (`where not flag`) join — re-opening hash/merge selection and the FK
 IND-folding cascade the live flag otherwise forfeits. This is **write-safe by the

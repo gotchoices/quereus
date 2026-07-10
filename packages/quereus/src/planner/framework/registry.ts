@@ -55,8 +55,6 @@ export interface RuleHandle {
 	phase: RulePhase;
 	/** Rule implementation function */
 	fn: RuleFn;
-	/** Optional priority (lower numbers run first) */
-	priority?: number;
 	/**
 	 * Side-effect awareness declaration — see {@link SideEffectMode}. Required:
 	 * registration fails when omitted, so every rule author has to make an

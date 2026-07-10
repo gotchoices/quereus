@@ -99,7 +99,7 @@
  *
  * So correctness-of-optimization no longer leans on "registered after so semi wins"
  * — the gates are provably non-overlapping, and either registration order yields
- * the same fixpoint (semi then inner at priority 23 is now merely conventional).
+ * the same fixpoint (semi then inner, their relative registration order, is now merely conventional).
  * The negative-probe + right-col case stays a `left` join: an anti row has the right
  * side all-NULL, so an inner join would be wrong (guarded by `polarity === 'semi'`).
  * Registered BEFORE `join-elimination` / the IND folders so the recovered inner join

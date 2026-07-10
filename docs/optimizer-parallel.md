@@ -10,7 +10,7 @@ fire on a side-effect-bearing branch; see
 
 ## Async gather UNION ALL
 
-`rule-async-gather-union-all.ts` (PostOptimization pass priority 17) folds a chain of `SetOperationNode(op='unionAll')` into one N-ary `AsyncGatherNode({ kind: 'unionAll' })` that drives the branches concurrently via the runtime's `ParallelDriver` (see `docs/runtime.md` § AsyncGatherNode). The rule walks the entire tree of unionAll-`SetOperationNode`s (any shape — left-deep, right-deep, balanced) plus any unionAll `AsyncGatherNode`s the rule has already produced on inner sub-chains, flattening them into a single child list.
+`rule-async-gather-union-all.ts` (PostOptimization pass) folds a chain of `SetOperationNode(op='unionAll')` into one N-ary `AsyncGatherNode({ kind: 'unionAll' })` that drives the branches concurrently via the runtime's `ParallelDriver` (see `docs/runtime.md` § AsyncGatherNode). The rule walks the entire tree of unionAll-`SetOperationNode`s (any shape — left-deep, right-deep, balanced) plus any unionAll `AsyncGatherNode`s the rule has already produced on inner sub-chains, flattening them into a single child list.
 
 **Two gates must clear** for the rewrite to fire:
 
@@ -18,7 +18,7 @@ fire on a side-effect-bearing branch; see
 
 2. **`max(expectedLatencyMs across children) ≥ tuning.parallel.gatherThresholdMs`** — the slowest child must clear the threshold. `expectedLatencyMs` is 0 by default for all in-process / memory-vtab paths (only remote-vtab plugins populate non-zero values via `VirtualTableModule.expectedLatencyMs`), so the rule is **inert by design in local-only configurations**. The default threshold is 25 ms (matches the synthetic high-latency vtab fixture in `test/optimizer/parallel-async-gather.spec.ts`); any positive value satisfies the no-rewrite-on-local invariant the `test/plan/` golden sweep depends on.
 
-**Pass placement.** The rule runs in `PassId.PostOptimization` at priority 17, **after** physical-pass selection has finalized `expectedLatencyMs` / `concurrencySafe` on the leaves (so the gates have real values to read) and **before** `materialization-advisory` at priority 30 (so any cache the advisory introduces sits *inside* each gather branch — preserving the parallel-drive intent of overlapping high-latency I/O with branch-local compute).
+**Pass placement.** The rule runs in `PassId.PostOptimization`, **after** physical-pass selection has finalized `expectedLatencyMs` / `concurrencySafe` on the leaves (so the gates have real values to read) and **before** `materialization-advisory` (so any cache the advisory introduces sits *inside* each gather branch — preserving the parallel-drive intent of overlapping high-latency I/O with branch-local compute).
 
 **Attribute IDs.** The gather node inherits the outermost `SetOperationNode`'s attributes via `preserveAttributeIds`. `SetOperationNode.buildAttributes` mirrors the leftmost child's attributes verbatim, so downstream consumers (including `ORDER BY x` references) continue to resolve unchanged across the rewrite.
 
@@ -36,7 +36,7 @@ fire on a side-effect-bearing branch; see
 
 ## Async gather ZIP BY KEY
 
-`rule-async-gather-zip-by-key.ts` (PostOptimization pass priority 17) generalizes the UNION ALL fold to the `zipByKey` combinator. It recognizes a `ProjectNode` over a chain of binary full-outer `JoinNode`s that all equate the **same** key column set across every participating relation, and folds the whole shape into one N-ary `AsyncGatherNode({ kind: 'zipByKey', branchKeyAttrs, outputKeyAttrs })` (a symmetric N-way hash-merge — see `docs/runtime.md` § AsyncGatherNode). Binary `FULL JOIN` has **no runtime lowering of its own**, so this rewrite is its only execution path; a recognized full-outer-on-shared-key query that fails any gate simply stays a `JoinNode(full)` and errors at emit (`FULL JOIN is not supported`), exactly as before the rule existed.
+`rule-async-gather-zip-by-key.ts` (PostOptimization pass) generalizes the UNION ALL fold to the `zipByKey` combinator. It recognizes a `ProjectNode` over a chain of binary full-outer `JoinNode`s that all equate the **same** key column set across every participating relation, and folds the whole shape into one N-ary `AsyncGatherNode({ kind: 'zipByKey', branchKeyAttrs, outputKeyAttrs })` (a symmetric N-way hash-merge — see `docs/runtime.md` § AsyncGatherNode). Binary `FULL JOIN` has **no runtime lowering of its own**, so this rewrite is its only execution path; a recognized full-outer-on-shared-key query that fails any gate simply stays a `JoinNode(full)` and errors at emit (`FULL JOIN is not supported`), exactly as before the rule existed.
 
 **Recognized shape.** The natural spelling
 
@@ -66,7 +66,7 @@ builds as `Project[ coalesce(a.k,b.k,c.k) as k, a.av, b.bv, c.cv ]` over a left-
 
 ## Eager-prefetch probe wrap
 
-`rule-eager-prefetch-probe.ts` (PostOptimization pass priority 15) wraps the probe (`left`) input of a physical hash join (`BloomJoinNode`, `PlanNodeType.HashJoin`) in an `EagerPrefetchNode` when the build (`right`) side advertises high first-row latency. Note the `BloomJoinNode` convention: **`left` is the probe (streamed) side** and `right` is the build (materialized) side — opposite of the textbook ordering. The buffered prefetch pump then pipelines probe-side reads with the parent emit's per-row work.
+`rule-eager-prefetch-probe.ts` (PostOptimization pass) wraps the probe (`left`) input of a physical hash join (`BloomJoinNode`, `PlanNodeType.HashJoin`) in an `EagerPrefetchNode` when the build (`right`) side advertises high first-row latency. Note the `BloomJoinNode` convention: **`left` is the probe (streamed) side** and `right` is the build (materialized) side — opposite of the textbook ordering. The buffered prefetch pump then pipelines probe-side reads with the parent emit's per-row work.
 
 **Cost gate.** `node.right.physical.expectedLatencyMs ≥ tuning.parallel.prefetchProbeThresholdMs`. Like the fan-out and gather rules, `expectedLatencyMs` is 0 on every in-process / memory-vtab leaf, so the rule is **inert by design on local-only plans** (the `test/plan/` golden sweep is unaffected). The gate is on the build side specifically: if `left` were the slow one the consumer above the join takes that latency hit regardless, so prefetching it would not change first-row time meaningfully.
 
@@ -74,7 +74,7 @@ builds as `Project[ coalesce(a.k,b.k,c.k) as k, a.av, b.bv, c.cv ]` over a left-
 
 **Skip predicates.** The wrap is suppressed when the probe is already pump-driven or pre-materialized: `left` is an `EagerPrefetchNode` (idempotence), a `Cache` (pre-materialized — a prefetch over a cache buys nothing), or an `AsyncGather` (already drives its branches concurrently). Pure-`nodeType` checks; no capability detector.
 
-**Pass placement.** Priority 15 in PostOptimization — after `mutating-subquery-cache` (10) and `asof-strategy-select` (11, finalizes leaf physical properties incl. `expectedLatencyMs`), and before `cte-optimization` (20) and `materialization-advisory` (30, so the advisory sees the prefetch-wrapped tree and does not re-wrap the probe in a Cache).
+**Pass placement.** Runs in PostOptimization — after `mutating-subquery-cache` and `asof-strategy-select` (finalizes leaf physical properties incl. `expectedLatencyMs`), and before `cte-optimization` and `materialization-advisory` (so the advisory sees the prefetch-wrapped tree and does not re-wrap the probe in a Cache).
 
 **Tuning knobs** (`OptimizerTuning.parallel`): `prefetchProbeThresholdMs` (default 25 — shares the synthetic high-latency vtab fixture value) and `prefetchBufferSize` (default 64 — mirrors the `EagerPrefetchNode` constructor default).
 

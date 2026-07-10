@@ -20,7 +20,7 @@
  *     per column so an in-scope contradiction on column `a` still fires
  *     even if an unrelated LIKE on column `b` is present.
  *
- * Registered at Structural pass priority 27 — runs alongside the empty-
+ * Registered in the Structural pass — runs alongside the empty-
  * relation-folding rules so any `Filter(_, false)` produced by other rules
  * has already been collapsed.
  */

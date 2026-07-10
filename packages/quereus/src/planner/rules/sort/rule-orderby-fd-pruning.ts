@@ -45,7 +45,7 @@
  * members, so the trailing key is a no-op tiebreaker.
  *
  * Ordering with other rules: this is a Structural-pass rule. It must run
- * before `monotonic-limit-pushdown` (PostOptimization priority 8) so single-
+ * before `monotonic-limit-pushdown` (PostOptimization pass) so single-
  * key reductions can enable the pushdown. That ordering is automatic since
  * Structural runs before PostOptimization.
  */

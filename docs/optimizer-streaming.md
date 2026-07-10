@@ -96,13 +96,13 @@ and the existing nested-loop lateral path executes unchanged.
 - the sort direction disagrees with the predicate (e.g. `q.K <= t.K` with `order by q.K asc`),
 - the left is not monotonic on the match attribute.
 
-The rule runs in the Structural pass at priority 5 — before
-`predicate-pushdown` (priority 20) — so the lateral's `FilterNode` carrying
+The rule runs in the Structural pass — before
+`predicate-pushdown` — so the lateral's `FilterNode` carrying
 the asof predicate is intact when matching.
 
 ### Strategy selection (hash → merge)
 
-`rule-asof-strategy-select` runs in the PostOptimization pass at priority 11,
+`rule-asof-strategy-select` runs in the PostOptimization pass,
 after `monotonic-range-access` has finalized the leaves' `physical.ordering` /
 `monotonicOn` advertisements. It is a predicate-driven rewrite (no cost-side
 search) that promotes `AsofScanNode.strategy` from `'hash'` to `'merge'` when:
@@ -164,7 +164,7 @@ When the precondition is unmet the rule does not fire and the existing `LimitOff
 
 **Composes with `ruleOrderByFdPruning`**: a multi-key `ORDER BY` (the last bail condition) frequently arises from `ORDER BY pk, name` shapes where the trailing keys are functionally determined by the PK. The Structural-pass `ruleOrderByFdPruning` ([rule catalog](optimizer-rules.md#optimization-rules), under Sort) reduces such sorts to single-key form, which then satisfies this rule's `Sort`-shape precondition. Structural runs before PostOptimization, so the ordering is automatic.
 
-The rule runs in the PostOptimization pass at priority 8 (after `join-physical-selection`, before `mutating-subquery-cache`) — late enough that `select-access-path` has produced the physical leaf with its capabilities, early enough to interact with downstream cache and materialization rules.
+The rule runs in the PostOptimization pass (after `join-physical-selection`, before `mutating-subquery-cache`) — late enough that `select-access-path` has produced the physical leaf with its capabilities, early enough to interact with downstream cache and materialization rules.
 
 The rule id `monotonic-limit-pushdown` can be disabled via `tuning.disabledRules`.
 
@@ -204,7 +204,7 @@ The defensive `monotonicOn` drop, by contrast, is load-bearing: it is the safety
 
 ### Registration
 
-The rule is registered in the PostOptimization pass at priority 9, on each of the four targeted node types: `IndexScan`, `IndexSeek`, `SeqScan` (annotation pass), and `Filter` (defensive drop). Its rule ids are `monotonic-range-access-IndexScan`, `monotonic-range-access-IndexSeek`, `monotonic-range-access-SeqScan`, and `monotonic-range-access-filter`, all individually disable-able via `tuning.disabledRules`.
+The rule is registered in the PostOptimization pass, on each of the four targeted node types: `IndexScan`, `IndexSeek`, `SeqScan` (annotation pass), and `Filter` (defensive drop). Its rule ids are `monotonic-range-access-IndexScan`, `monotonic-range-access-IndexSeek`, `monotonic-range-access-SeqScan`, and `monotonic-range-access-filter`, all individually disable-able via `tuning.disabledRules`.
 
 ## Monotonic streaming-window recognition
 
@@ -222,6 +222,6 @@ Window functions over a stream that already arrives in `[PARTITION BY..., ORDER 
 
 **Output invariant**: a streaming `WindowNode` preserves the source's `monotonicOn` unchanged (the streaming runtime is row-pass-through, no sort intervenes). Downstream rules that key off `physical.monotonicOn` — `monotonic-limit-pushdown`, `monotonic-merge-join`, `monotonic-range-access` — compose naturally above streaming windows.
 
-The rule runs in the PostOptimization pass at priority 6 (after `monotonic-merge-join@4` so child joins have already become MergeJoins and propagated their `monotonicOn`; before `monotonic-limit-pushdown@8`, though they don't directly interact since they target different node types). Its rule id `monotonic-window` is disable-able via `tuning.disabledRules`.
+The rule runs in the PostOptimization pass (after `monotonic-merge-join` so child joins have already become MergeJoins and propagated their `monotonicOn`; before `monotonic-limit-pushdown`, though they don't directly interact since they target different node types). Its rule id `monotonic-window` is disable-able via `tuning.disabledRules`.
 
 When the rule no-ops, the existing buffered emitter runs unchanged.

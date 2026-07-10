@@ -9,7 +9,7 @@
  *
  * **Why a post-pass, not a formation-time decision.** `rule-fanout-lookup-join`
  * forms the node in `PassId.Structural`; this rule runs in `PassId.Post-
- * Optimization` (priority 16, in the `eager-prefetch-probe` / `async-gather`
+ * Optimization` (in the `eager-prefetch-probe` / `async-gather`
  * neighborhood) after physical-pass selection has finalized leaf
  * `expectedLatencyMs` / `estimatedRows` / `concurrencySafe`. Matching the
  * already-built `FanOutLookupJoinNode` keeps the batched decision a single,

@@ -5,7 +5,7 @@ This directory contains the core framework components for the Titan optimizer Ph
 ## Components
 
 ### Registry (`registry.ts`)
-- **RuleHandle**: Structured rule registration with ID, node type, phase, and priority
+- **RuleHandle**: Structured rule registration with ID, node type, and phase
 - **Loop Detection**: `hasRuleBeenApplied` / `markRuleApplied` prevent infinite rule application using per-node visited-rule tracking (consulted by `PassManager`). Records transforming applications only, inherited across a transform's re-mint. A rule that *declines* is tracked ephemerally per node id inside `PassManager.applyPassRules` so it is not re-run on the same unchanged node every fixpoint iteration; that decline suppression is dropped the moment the node is transformed (the plan piece changed), so no plan output changes
 - **`validateSideEffectMode`**: Rejects any rule handle missing its `sideEffectMode` declaration
 
@@ -31,16 +31,19 @@ This directory contains the core framework components for the Titan optimizer Ph
 ## Architecture Integration
 
 ### Rule Registration
+Rules are declared as ordered entries in `RULE_MANIFEST` (`src/planner/optimizer.ts`).
+`registerRulesToPasses()` walks the manifest in array order and registers each entry
+with its pass — so **array order is execution order** (there is no numeric priority).
 ```typescript
-// src/planner/optimizer.ts, inside registerRulesToPasses()
-this.passManager.addRuleToPass(PassId.Physical, {
+// src/planner/optimizer.ts — an entry in RULE_MANIFEST
+{
+  pass: PassId.Physical,
   id: 'Aggregate→StreamAggregate',
   nodeType: PlanNodeType.Aggregate,
   phase: 'impl',
   fn: ruleAggregateStreaming,
   sideEffectMode: 'safe', // see docs/optimizer.md § Audit discipline
-  priority: 10,
-});
+}
 ```
 
 ### Rule Implementation

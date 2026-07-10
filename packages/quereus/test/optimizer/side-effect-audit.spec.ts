@@ -239,21 +239,50 @@ function parseImportMap(code: string): Map<string, string> {
 	return map;
 }
 
-/** Argument text of each `fnName(...)` call in `code`, matched by paren balance. */
-function extractCallArgs(code: string, fnName: string): string[] {
+/**
+ * Text of the `RULE_MANIFEST` array literal (between its `[` and matching `]`),
+ * or the whole `code` when no such array is present (synthetic fixtures below
+ * pass bare entry lists). Rules are registered from this manifest in `optimizer.ts`,
+ * so the guard reads the manifest rather than individual `addRuleToPass` calls.
+ */
+function manifestRegion(code: string): string {
+	const m = /RULE_MANIFEST\b[^=]*=\s*(?:readonly\s+)?\[/.exec(code);
+	if (!m) return code;
+	const open = m.index + m[0].length - 1; // index of the array's `[`
+	let depth = 0;
+	for (let j = open; j < code.length; j++) {
+		if (code[j] === '[') depth++;
+		else if (code[j] === ']' && --depth === 0) return code.slice(open + 1, j);
+	}
+	throw new Error('unbalanced RULE_MANIFEST array');
+}
+
+/**
+ * Each manifest entry object-literal `{...}` in `code`. Manifest entries contain
+ * no nested object literals, so we return every innermost brace block that names
+ * an `id:` field — this skips the array's own brackets and any array-valued
+ * `nodeType`, and ignores non-entry braces (e.g. import bindings).
+ *
+ * NOTE: assumes `RULE_MANIFEST` entries stay flat (no nested `{...}`). If an entry
+ * ever gains an inline object literal (e.g. an options bag), the innermost-brace
+ * scan would return the inner block instead of the entry — extend this to track
+ * the entry's outer brace rather than the innermost one.
+ */
+function extractRuleEntries(code: string): string[] {
+	const region = manifestRegion(code);
 	const out: string[] = [];
-	const needle = `${fnName}(`;
-	let i = code.indexOf(needle);
-	while (i !== -1) {
+	for (let i = 0; i < region.length; i++) {
+		if (region[i] !== '{') continue;
 		let depth = 0;
-		let j = i + needle.length - 1;
-		for (; j < code.length; j++) {
-			if (code[j] === '(') depth++;
-			else if (code[j] === ')' && --depth === 0) break;
+		let nested = false;
+		let j = i;
+		for (; j < region.length; j++) {
+			if (region[j] === '{') { depth++; if (depth > 1) nested = true; }
+			else if (region[j] === '}' && --depth === 0) break;
 		}
-		if (j >= code.length) throw new Error(`unbalanced ${fnName}( at offset ${i}`);
-		out.push(code.slice(i + needle.length, j));
-		i = code.indexOf(needle, j + 1);
+		const body = region.slice(i + 1, j);
+		if (!nested && /\bid:/.test(body)) out.push(body);
+		i = j;
 	}
 	return out;
 }
@@ -264,14 +293,14 @@ interface RuleRegistration {
 	readonly mode: string;
 }
 
-/** Every `addRuleToPass` registration in a comment-stripped `optimizer.ts`. */
+/** Every rule registration (one per manifest entry) in a comment-stripped `optimizer.ts`. */
 function parseRuleRegistrations(code: string): RuleRegistration[] {
-	return extractCallArgs(code, 'addRuleToPass').map((arg, n) => {
-		const id = /\bid:\s*(['"`])([^'"`]*)\1/.exec(arg)?.[2];
-		const fn = /\bfn:\s*(\w+)/.exec(arg)?.[1];
-		const mode = /\bsideEffectMode:\s*'(\w+)'/.exec(arg)?.[1];
+	return extractRuleEntries(code).map((entry, n) => {
+		const id = /\bid:\s*(['"`])([^'"`]*)\1/.exec(entry)?.[2];
+		const fn = /\bfn:\s*(\w+)/.exec(entry)?.[1];
+		const mode = /\bsideEffectMode:\s*'(\w+)'/.exec(entry)?.[1];
 		if (!id || !fn || !mode) {
-			throw new Error(`addRuleToPass call #${n} is missing id/fn/sideEffectMode — the guard cannot audit it`);
+			throw new Error(`rule manifest entry #${n} is missing id/fn/sideEffectMode — the guard cannot audit it`);
 		}
 		return { id, fn, mode };
 	});
@@ -369,9 +398,11 @@ describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal
 		const { awareIds, unguarded } = auditAwareRules(code, ruleSourceReader(code));
 
 		// Self-check: if the parser silently matched nothing, the guard would pass
-		// vacuously. Every `sideEffectMode:` in the file must be one we parsed.
-		const declared = code.match(/\bsideEffectMode:/g)?.length ?? 0;
-		expect(parseRuleRegistrations(code).length, 'parsed every addRuleToPass registration').to.equal(declared);
+		// vacuously. Every `sideEffectMode:` in the manifest must be one we parsed
+		// (scoped to the manifest region so the `RuleManifestEntry` type declaration
+		// and the registration loop's own `sideEffectMode:` don't inflate the count).
+		const declared = manifestRegion(code).match(/\bsideEffectMode:/g)?.length ?? 0;
+		expect(parseRuleRegistrations(code).length, 'parsed every manifest registration').to.equal(declared);
 		expect(awareIds.length, "found the 'aware' rules").to.be.greaterThan(20);
 
 		const offenders = unguarded
@@ -398,25 +429,30 @@ describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal
 		const optimizer = stripComments(`
 			import { ruleGoodRule } from './rules/fake/rule-good.js';
 			import { ruleBadRule } from './rules/fake/rule-bad.js';
-			this.passManager.addRuleToPass(PassId.Structural, {
-				id: 'good-rule',
-				nodeType: PlanNodeType.Join,
-				fn: ruleGoodRule,
-				sideEffectMode: 'aware',
-			});
-			this.passManager.addRuleToPass(PassId.Structural, {
-				id: 'bad-rule',
-				nodeType: PlanNodeType.Join,
-				fn: ruleBadRule,
-				// mentions subtreeHasSideEffects only in a comment
-				sideEffectMode: 'aware',
-			});
-			this.passManager.addRuleToPass(PassId.Structural, {
-				id: 'safe-rule',
-				nodeType: PlanNodeType.Join,
-				fn: ruleBadRule,
-				sideEffectMode: 'safe',
-			});
+			const RULE_MANIFEST = [
+				{
+					pass: PassId.Structural,
+					id: 'good-rule',
+					nodeType: PlanNodeType.Join,
+					fn: ruleGoodRule,
+					sideEffectMode: 'aware',
+				},
+				{
+					pass: PassId.Structural,
+					id: 'bad-rule',
+					nodeType: PlanNodeType.Join,
+					fn: ruleBadRule,
+					// mentions subtreeHasSideEffects only in a comment
+					sideEffectMode: 'aware',
+				},
+				{
+					pass: PassId.Structural,
+					id: 'safe-rule',
+					nodeType: PlanNodeType.Join,
+					fn: ruleBadRule,
+					sideEffectMode: 'safe',
+				},
+			];
 		`);
 		const sources: Record<string, string> = {
 			ruleGoodRule: 'if (PlanNodeCharacteristics.subtreeHasSideEffects(node)) return null;',
@@ -432,11 +468,14 @@ describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal
 
 	it('reports an aware rule whose function cannot be resolved to a file', () => {
 		const optimizer = stripComments(`
-			this.passManager.addRuleToPass(PassId.Structural, {
-				id: 'ghost-rule',
-				fn: ruleGhost,
-				sideEffectMode: 'aware',
-			});
+			const RULE_MANIFEST = [
+				{
+					pass: PassId.Structural,
+					id: 'ghost-rule',
+					fn: ruleGhost,
+					sideEffectMode: 'aware',
+				},
+			];
 		`);
 		const { unguarded } = auditAwareRules(optimizer, () => undefined);
 		expect(unguarded[0].id).to.equal('ghost-rule');
@@ -447,11 +486,14 @@ describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal
 	it('does not let the allowlist excuse a rule the audit could not read', () => {
 		const allowlisted = [...NO_SIGNAL_ALLOWLIST.keys()][0];
 		const optimizer = stripComments(`
-			this.passManager.addRuleToPass(PassId.Structural, {
-				id: '${allowlisted}',
-				fn: ruleVanished,
-				sideEffectMode: 'aware',
-			});
+			const RULE_MANIFEST = [
+				{
+					pass: PassId.Structural,
+					id: '${allowlisted}',
+					fn: ruleVanished,
+					sideEffectMode: 'aware',
+				},
+			];
 		`);
 		const { unguarded } = auditAwareRules(optimizer, () => undefined);
 		expect(unguarded.filter(u => !isExcused(u)).map(u => u.id)).to.deep.equal([allowlisted]);
@@ -459,10 +501,13 @@ describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal
 
 	it('rejects a registration that omits sideEffectMode rather than skipping it', () => {
 		const optimizer = stripComments(`
-			this.passManager.addRuleToPass(PassId.Structural, {
-				id: 'unannotated',
-				fn: ruleUnannotated,
-			});
+			const RULE_MANIFEST = [
+				{
+					pass: PassId.Structural,
+					id: 'unannotated',
+					fn: ruleUnannotated,
+				},
+			];
 		`);
 		expect(() => parseRuleRegistrations(optimizer)).to.throw(/missing id\/fn\/sideEffectMode/);
 	});

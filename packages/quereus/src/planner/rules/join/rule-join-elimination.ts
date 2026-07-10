@@ -319,7 +319,7 @@ export function rebuildChain(chain: ReadonlyArray<ChainEntry>, bottom: Relationa
  * dependency on the non-preserved side — eliminating the join out from under the
  * flag would be unsound. (The inner-only gate used to make this guard implicit,
  * since flags only exist on outer joins.) The `join-existence-pruning-aggregate`
- * rule (priority 22) strips *undemanded* flags before this rule (priority 26)
+ * rule strips *undemanded* flags before this rule
  * sees the node, so all-undemanded → flag gone → eliminate; any demanded → flag
  * retained → guard abstains.
  *

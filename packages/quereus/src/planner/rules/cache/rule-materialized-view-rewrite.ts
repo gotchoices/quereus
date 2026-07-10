@@ -14,8 +14,8 @@
  *     select customer_id, amt from sales where amt > 0 and customer_id = 7;
  *     --   → scan recent, residual filter (customer_id = 7), residual project
  *
- * **Placement.** Logical→logical, in the Structural `rewrite` pass, at a priority
- * *below* `grow-retrieve` / `predicate-pushdown` so the fragment is still the
+ * **Placement.** Logical→logical, in the Structural `rewrite` pass, registered
+ * before `grow-retrieve` / `predicate-pushdown` so the fragment is still the
  * pristine `Project(Filter?(Retrieve(TableReference)))` when the matcher reads its
  * WHERE off the live plan (see `query-rewrite-matcher.ts` § pristine-fragment
  * requirement). The substituted maintained-table `TableReference` then flows

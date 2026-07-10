@@ -365,7 +365,7 @@ describe('ruleJoinElimination', () => {
 
 		it('eliminates the join under count(*) once an undemanded existence flag is pruned (cascade)', async () => {
 			await setupCustomersOrders();
-			// The flag is unreferenced: join-existence-pruning-aggregate (priority 22)
+			// The flag is unreferenced: join-existence-pruning-aggregate
 			// strips it, then this rule eliminates the flag-free LEFT join — both in one
 			// applyRules pass. (Also covered in the existence-pruning spec.)
 			const q =
