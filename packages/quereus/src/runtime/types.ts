@@ -3,7 +3,6 @@ import type { Database } from "../core/database.js";
 import type { Statement } from "../core/statement.js";
 import type { RowDescriptor, TableDescriptor, TableGetter } from "../planner/nodes/plan-node.js";
 import type { Scheduler } from "./scheduler.js";
-import type { EmissionContext } from "./emission-context.js";
 import type { VirtualTableConnection } from "../vtab/connection.js";
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { RowContextMap } from './context-helpers.js';
@@ -67,8 +66,6 @@ export type Instruction = {
 	note?: string;
 	/** Optional sub-programs used to execute this instruction - this is here for tracing purposes */
 	programs?: Scheduler[];
-	/** Optional emission context for schema validation */
-	emissionContext?: EmissionContext;
 	/** Optional runtime statistics collected during execution */
 	runtimeStats?: InstructionRuntimeStats;
 };

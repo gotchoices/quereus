@@ -183,6 +183,29 @@ describe('Prepared statement setup amortization', () => {
 		}
 	});
 
+	it('re-fires an impure IN-subquery DML on every execution of a prepared statement', async () => {
+		// Same shape as the scalar-subquery regression, for the IN(impure) memo branch:
+		// the memo is on the RuntimeContext, so it resets per execution and the inner
+		// INSERT fires again on the second run rather than replaying run 1's answer.
+		await db.exec('create table log_i (v integer);');
+
+		const stmt = db.prepare('select (? in (insert into log_i values (?) returning v)) as hit');
+		try {
+			stmt.bindAll([11, 11]);
+			const run1 = await collectRows(stmt.all());
+			void expect(run1).to.deep.equal([{ hit: true }]);
+			void expect(await collectRows(db.eval('select count(*) as c from log_i'))).to.deep.equal([{ c: 1 }]);
+
+			stmt.bindAll([22, 22]);
+			const run2 = await collectRows(stmt.all());
+			void expect(run2).to.deep.equal([{ hit: true }]);
+			// Second execution must insert again — not replay run 1's memoized membership.
+			void expect(await collectRows(db.eval('select v from log_i order by v'))).to.deep.equal([{ v: 11 }, { v: 22 }]);
+		} finally {
+			await stmt.finalize();
+		}
+	});
+
 	it('keeps the run-once-per-execution fence for a per-row EXISTS DML across executions', async () => {
 		await db.exec('create table outer_t (o integer);');
 		await db.exec('insert into outer_t values (1), (2), (3), (4), (5);');

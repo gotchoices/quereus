@@ -397,6 +397,11 @@ export class Scheduler {
 				// Reset (not create-if-absent): a cached scheduler is reused across
 				// executions, so stats must be zeroed each run to report per-execution
 				// numbers rather than accumulating across runs.
+				// NOTE: a sub-program scheduler (emitCall) reruns once per outer row in a
+				// correlated re-eval, so its stats reset per invocation, not per execution —
+				// its onComplete debug log reports the last invocation, not a cumulative sum.
+				// Fine today (debug telemetry only); revisit if sub-program metrics ever feed
+				// a decision that needs the per-execution total.
 				for (const instruction of this.instructions) {
 					if (instruction.runtimeStats) {
 						instruction.runtimeStats.in = 0;
