@@ -1364,10 +1364,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	//
 	// NOTE: `orderPreserving` is stated against UTF-8 memcmp of the normalized forms, and the
 	// built-ins hold it for every WELL-FORMED string. It is unachievable for unpaired
-	// surrogates, which have no UTF-8 encoding at all (`TextEncoder` folds each to U+FFFD) —
-	// see `bug-store-lone-surrogate-key-collision`. A custom collation that compares with JS
-	// `<`/`>` orders by UTF-16 code unit and must NOT claim the assertion; use
-	// {@link import('../util/comparison.js').compareCodePoints}.
+	// surrogates, which have no UTF-8 encoding at all (`TextEncoder` folds each to U+FFFD);
+	// the persistent store therefore REFUSES to key them (`quereus-store`'s `encodeText`
+	// raises), so no value a store-backed table can hold falls outside the assertion. Memory
+	// tables still accept them, which is why comparators must stay total there. A custom
+	// collation that compares with JS `<`/`>` orders by UTF-16 code unit and must NOT claim
+	// the assertion; use {@link import('../util/comparison.js').compareCodePoints}.
 	registerCollation(
 		name: string,
 		func: CollationFunction,

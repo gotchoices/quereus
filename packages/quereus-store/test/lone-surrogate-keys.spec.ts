@@ -138,6 +138,14 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			await rejects(db, `insert or replace into s values ('${LONE_HIGH}', 'one')`);
 		});
 
+		it('rejects a delete keyed on a lone surrogate rather than deleting an unrelated row', async () => {
+			// The delete's seek bound encodes exactly as the insert's key did. Unguarded,
+			// `delete from s where k = '\uD801'` would have removed the `\uD800` row.
+			await db.exec(`insert into s values ('a', 'one')`);
+			await rejects(db, `delete from s where k = '${LONE_HIGH}'`);
+			expect(await column(db, `select k from s`, 'k'), 'the row is untouched').to.deep.equal(['a']);
+		});
+
 		it('still accepts a well-formed astral key', async () => {
 			await db.exec(`insert into s values ('${ASTRAL}', 'astral')`);
 			expect((await db.get(`select v from s where k = '${ASTRAL}'`))?.v).to.equal('astral');

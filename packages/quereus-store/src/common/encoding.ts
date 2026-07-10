@@ -322,6 +322,11 @@ function findUnpairedSurrogate(value: string): number {
  * normalizer that slices a string can itself split a surrogate pair. The reported offset
  * is therefore into the normalizer's output; for BINARY (identity) and for the
  * case-folding built-ins it is the caller's own offset.
+ *
+ * NOTE: a store written BEFORE this guard existed may hold rows whose text key was folded
+ * to U+FFFD. They still scan (decoding to `'�'`), but no lone-surrogate literal can
+ * address them any more — the encode raises first. If pre-guard stores ever have to be
+ * opened, a one-time migration must rewrite or reject those rows; nothing detects them today.
  */
 function assertEncodableText(sortValue: string): void {
   const at = findUnpairedSurrogate(sortValue);

@@ -601,9 +601,18 @@ the basic multilingual plane. They compare by Unicode code point (`compareCodePo
 would sort a surrogate pair below `U+E000`–`U+FFFF` even though its UTF-8 encoding sorts
 above. A custom collation that compares with `<` / `>` must therefore **not** claim
 `orderPreserving`. The one case no comparator can satisfy is an **unpaired surrogate**,
-which has no UTF-8 encoding at all (`TextEncoder` folds each to `U+FFFD`), so the store's
-text keys are not injective over them — tracked by
-`bug-store-lone-surrogate-key-collision`.
+which has no UTF-8 encoding at all (`TextEncoder` folds each to `U+FFFD`, so all 2048 of
+them would share one key). The store closes that gap from the other side: `encodeText`
+**refuses** a text value carrying an unpaired surrogate rather than encoding it, naming the
+offending code unit and offset. This is the one deliberate divergence between a memory table
+(accepts the value — the comparators stay total) and a store-backed table (raises at encode
+time), and it is what makes the built-ins' `orderPreserving` stamp true over every value a
+store-backed table can hold. Object/JSON keys need no such guard: their bytes come from
+`JSON.stringify`, which escapes a lone surrogate to ASCII.
+
+Identifiers are **not** yet guarded — a quoted table name carrying an unpaired surrogate
+still goes straight through `TextEncoder` into the catalog key. See
+`backlog/bug-store-catalog-key-lone-surrogate-identifier-collision`.
 
 Note also that a text-capable but non-textual primary-key column (`any`, `json`, a date/time
 type) is keyed under `BINARY`, not under the table key collation `K` — matching the `BINARY`
