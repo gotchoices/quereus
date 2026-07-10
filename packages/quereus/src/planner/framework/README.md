@@ -47,10 +47,18 @@ with its pass — so **array order is execution order** (there is no numeric pri
 ```
 
 ### Rule Implementation
+A rule leads with the discrimination check that matches its intent. When it targets a
+**specific class**, that check is `instanceof` — type-sound, natively narrowing, and the
+dominant idiom. When it targets **any node with a capability** (any join kind, any aggregate
+kind), use the `CapabilityDetectors` guard instead. See
+[docs/optimizer-conventions.md § Node discrimination](../../../../../docs/optimizer-conventions.md#node-discrimination-three-questions-three-mechanisms)
+for the full standard (`instanceof` vs capability brands vs `nodeType` vs physical
+characteristics).
 ```typescript
 import type { RuleFn } from '../framework/registry.js';
 
 const ruleAggregateStreaming: RuleFn = (node, optimizer) => {
+  // This rule needs AggregateNode's specific API → instanceof (concrete class identity).
   if (!(node instanceof AggregateNode)) return null;
   
   const context = optimizer.getContext();
