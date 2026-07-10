@@ -364,6 +364,43 @@ export function renameColumnInCheckExpression(
 	return state.changed;
 }
 
+/**
+ * Rewrite the renamed column inside every partial-index predicate of `indexes`,
+ * in place. A predicate resolves unqualified refs against the indexed table
+ * itself — the same implicit seed a CHECK expression uses — so
+ * {@link renameColumnInCheckExpression} is the correct entry point here, not
+ * {@link renameColumnInAst}.
+ *
+ * The predicate `Expression` is shared by reference between the catalog's
+ * `TableSchema`, any module-local copy of it, and — for a unique partial index —
+ * the `derivedFromIndex` UNIQUE constraint that carries the same predicate.
+ * Rewriting in place keeps all of them in step; cloning would strand the derived
+ * constraint on the old AST.
+ *
+ * Idempotent: once rewritten, nothing names `oldColName` any more, so a second
+ * call with the same pair returns false without touching the AST.
+ *
+ * The parameter is structurally typed rather than `IndexSchema[]` so this module
+ * stays free of catalog imports; `IndexSchema` satisfies it.
+ */
+export function renameColumnInIndexPredicates(
+	indexes: ReadonlyArray<{ readonly predicate?: AST.Expression }> | undefined,
+	tableName: string,
+	oldColName: string,
+	newColName: string,
+	defaultSchemaName: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	let changed = false;
+	for (const idx of indexes ?? []) {
+		if (!idx.predicate) continue;
+		const rewrote = renameColumnInCheckExpression(
+			idx.predicate, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource);
+		if (rewrote) changed = true;
+	}
+	return changed;
+}
+
 interface ColumnRewriteState {
 	tableName: string;
 	oldCol: string;

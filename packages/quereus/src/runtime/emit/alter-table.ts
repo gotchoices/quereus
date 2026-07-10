@@ -10,7 +10,7 @@ import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
 import { validateForeignKeyOverExistingRows, validateForeignKeyCollations, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
-import type { ColumnDef, QueryExpr } from '../../parser/ast.js';
+import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { MemoryTableModule } from '../../vtab/memory/module.js';
 import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression } from '../../schema/rename-rewriter.js';
@@ -660,6 +660,46 @@ async function validateNotNullBackfill(
 	}
 }
 
+/**
+ * Whether a partial-index predicate names `columnName` as a column of the indexed
+ * table. Depth-blind walk over the predicate's object graph: a predicate may only
+ * reference the indexed table's own columns — `compilePredicate` rejects
+ * schema-qualified refs and subqueries — so an unqualified ref, or one qualified by
+ * the table name, is a hit and no scope tracking applies. `identifier` nodes are
+ * matched alongside `column` nodes because the parser emits either shape for a bare
+ * name depending on context.
+ *
+ * NOTE: depth-blind. If partial-index predicates ever admit subqueries, an inner
+ * unqualified ref to a like-named column of another table would false-positively
+ * block a legal DROP COLUMN; this walk would then need the scope stack the rename
+ * rewriters carry.
+ */
+function predicateReferencesColumn(expr: Expression, tableName: string, columnName: string): boolean {
+	const colLower = columnName.toLowerCase();
+	const tableLower = tableName.toLowerCase();
+	let found = false;
+	const visit = (v: unknown): void => {
+		if (found || v === null || typeof v !== 'object') return;
+		if (Array.isArray(v)) {
+			v.forEach(visit);
+			return;
+		}
+		const n = v as Record<string, unknown>;
+		if ((n.type === 'column' || n.type === 'identifier')
+			&& typeof n.name === 'string' && n.name.toLowerCase() === colLower
+			&& (n.table === undefined || (typeof n.table === 'string' && n.table.toLowerCase() === tableLower))) {
+			found = true;
+			return;
+		}
+		for (const key of Object.keys(n)) {
+			if (key === 'loc') continue;
+			visit(n[key]);
+		}
+	};
+	visit(expr);
+	return found;
+}
+
 async function runDropColumn(
 	rctx: RuntimeContext,
 	tableSchema: TableSchema,
@@ -692,6 +732,19 @@ async function runDropColumn(
 					StatusCode.CONSTRAINT,
 				);
 			}
+		}
+	}
+
+	// Validate: can't drop a column named by a partial index's WHERE predicate — the
+	// index would be left with a predicate that cannot compile. A column used only as
+	// an index KEY column is fine: the module narrows the index and drops it outright
+	// when no key columns survive.
+	for (const idx of tableSchema.indexes ?? []) {
+		if (idx.predicate && predicateReferencesColumn(idx.predicate, tableSchema.name, columnName)) {
+			throw new QuereusError(
+				`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by the WHERE clause of partial index '${idx.name}'`,
+				StatusCode.CONSTRAINT,
+			);
 		}
 	}
 
@@ -1692,6 +1745,22 @@ function rewriteTableForColumnRename(
 	// table, the same implicit seed CHECK expressions use. As with checks, the
 	// AST is mutated in place, so the derived UNIQUE constraint of a unique
 	// partial index (sharing the predicate by reference) is rewritten with it.
+	//
+	// This pass is the only predicate rewrite for the schema-only fallback branch of
+	// `runRenameColumn` (a module with no `alterTable` hook), and for a hook module
+	// that does not rewrite predicates itself — the store module, which carries the
+	// predicate AST forward untouched and compiles it lazily at the next write.
+	//
+	// The memory module DOES rewrite, in `MemoryTableManager.renameColumn`: it must,
+	// so it can rebuild its live index structures against the new column list before
+	// returning. The rewrite is idempotent, so this pass then finds nothing naming
+	// `oldCol`, `rewrote` is false, and the table is not needlessly re-registered.
+	//
+	// NOTE: the store persists its table DDL bundle from inside its `alterTable` hook,
+	// while the predicate still names the old column, and relies on this pass firing a
+	// `table_modified` event afterwards to re-persist the corrected bundle. If this
+	// pass ever stops rewriting predicates for hook modules, that stale DDL becomes
+	// permanent.
 	const newIndexes = (table.indexes ?? []).map(idx => {
 		const rewrote = isRenamedTable
 			? renameColumnInCheckExpression(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)

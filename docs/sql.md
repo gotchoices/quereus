@@ -1382,6 +1382,8 @@ ALTER TABLE table_name RENAME COLUMN old_col TO new_col;
 
 Renames a column. Data is preserved. Fails if the new name conflicts with an existing column or the old name doesn't exist. As with `RENAME TABLE`, references in CHECK expressions, FOREIGN KEY `referencedColumnNames`, partial-index `WHERE` predicates (unqualified and table-qualified refs on the renamed table, resolved against the indexed table the same way an implicit CHECK seed is; the derived UNIQUE constraint of a unique partial index shares the rewritten AST), view bodies, view/MV `with defaults` clauses (stored inside the body select; the clause's target names a base column of the view's FROM table — usually projected away — and rewrites via the same scope-aware synthetic-probe path a `with inverse` target uses, so a clause-only rewrite still fires the modified event; expr subqueries rewrite scope-aware — see [view-updateability.md § View defaults](view-updateability.md#view-defaults)), and materialized-view bodies (a bare passthrough projection's exposed output name follows the rename, carried onto the backing table in place — see [mv-schema-change.md § Rename propagation](mv-schema-change.md#rename-propagation-mv--faster-view)) are propagated. Inside dependent SELECTs the rewrite follows scope: unqualified column references resolve when the renamed table (or a CTE that re-exposes the renamed column under the same name) is in the unaliased FROM scope; qualified references resolve via the alias map. A CTE re-exposes the renamed column when it has no explicit column list (`with c as ...` not `with c(x) as ...`) and at least one result column is a passthrough of the renamed column (an unaliased `select k`, `t.k`, or `select *` from the renamed table).
 
+A partial index on the renamed table survives as a **live structure**, not just a catalog entry: the module rewrites the predicate as part of the rename, before rebuilding its index structures against the new column list. If the rewrite or the rebuild fails, the whole `RENAME COLUMN` fails and both the table and the stored predicate are left untouched — a rename never silently loses an index the catalog still advertises.
+
 **ADD COLUMN**
 
 ```sql
@@ -1406,6 +1408,7 @@ Removes a column from the table and all its data. Restrictions:
 
 - Cannot drop a PRIMARY KEY column.
 - Cannot drop the last remaining column.
+- Cannot drop a column named by a **partial index's `WHERE` clause** — the index would be left with a predicate it cannot evaluate. Drop the index first. (A column used only as an index *key* column is fine: the index is narrowed to its surviving key columns, and dropped outright when none survive.)
 
 Any UNIQUE constraint over the dropped column is removed with it — a single-column UNIQUE outright, and a **multi-column** UNIQUE in full (a UNIQUE missing one of its columns is a different, stronger constraint, not a silently-narrowed one). The auto-built covering index backing such a constraint is torn down at the same time, leaving no orphan in `index_info`. A UNIQUE whose columns do **not** include the dropped column survives, with its column indices shifted over the removed slot. (SQLite rejects dropping a column that participates in a UNIQUE; Quereus permits it and drops the constraint.)
 

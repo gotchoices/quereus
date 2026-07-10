@@ -142,6 +142,12 @@ export class BaseLayer implements Layer {
 		this.clearExistingSecondaryIndexes();
 
 		if (!this.hasSecondaryIndexes()) {
+			// Drop the structures outright rather than leaving them emptied: an index the
+			// schema no longer declares (DROP INDEX, or DROP COLUMN taking the last key
+			// column of the table's only index) would otherwise linger in the map and be
+			// maintained on every write to the base. `replaceSecondaryIndexes` does the
+			// same clear on the non-empty path.
+			this.secondaryIndexes.clear();
 			return;
 		}
 
@@ -221,20 +227,11 @@ export class BaseLayer implements Layer {
 	/**
 	 * Constructs (does not populate) a `MemoryIndex` per declared index.
 	 *
-	 * A construction failure is logged and the index is dropped from the rebuilt map.
-	 * That is NOT benign, and this catch is not a design choice worth keeping — see
-	 * `bug-rename-column-drops-partial-index`. `ALTER TABLE … RENAME COLUMN` calls
-	 * `handleColumnRename()` (⇒ this rebuild) *before* `propagateColumnRename` has
-	 * rewritten the partial-index predicate ASTs, so a partial index whose `WHERE`
-	 * names the renamed column throws `compilePredicate`'s "unknown column" here.
-	 * Removing the catch turns that into a failed `RENAME COLUMN`; keeping it turns
-	 * it into a silently missing index (the catalog still advertises it, and a scan
-	 * that picks it later raises `Secondary index '<name>' not found`).
-	 *
-	 * An unregistered collation now also throws from `createMemoryIndex`. It cannot
-	 * reach here today — an index naming one could never have been created, and the
-	 * per-database registry has no `unregisterCollation` — but if it ever does, it
-	 * lands in the same silent-drop hole.
+	 * A construction failure propagates: the caller's schema change fails rather than
+	 * silently returning a map missing an index the catalog still advertises (which
+	 * surfaces much later as `Secondary index '<name>' not found` when a scan picks
+	 * it by name). Callers that change the column list must therefore hand this a
+	 * schema whose partial-index predicates already name the surviving columns.
 	 *
 	 * Duplicate-key tolerance — the one thing the non-strict rebuild is legitimately
 	 * lenient about — lives in {@link populateSecondaryIndexes}, not here.
@@ -243,13 +240,7 @@ export class BaseLayer implements Layer {
 		const newIndexes = new Map<string, MemoryIndex>();
 
 		for (const indexSchema of this.tableSchema.indexes!) {
-			try {
-				const memoryIndex = this.createMemoryIndex(indexSchema);
-				newIndexes.set(indexSchema.name, memoryIndex);
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			} catch (e: any) {
-				logger.error('Create Index', this.tableSchema.name, e, { indexName: indexSchema.name });
-			}
+			newIndexes.set(indexSchema.name, this.createMemoryIndex(indexSchema));
 		}
 
 		return newIndexes;

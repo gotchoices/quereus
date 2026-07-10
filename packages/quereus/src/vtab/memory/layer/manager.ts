@@ -26,6 +26,7 @@ import type { VTableEventEmitter } from '../../events.js';
 import { inferType } from '../../../types/registry.js';
 import type { Expression } from '../../../parser/ast.js';
 import { compilePredicate } from '../utils/predicate.js';
+import { renameColumnInIndexPredicates, type ResolveColumnInSource } from '../../../schema/rename-rewriter.js';
 import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
@@ -1895,6 +1896,10 @@ export class MemoryTableManager {
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
 		const originalManagerSchema = this.tableSchema;
+		const schemaManager = this.db.schemaManager;
+		const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
+			schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
+		let predicatesRewritten = false;
 		try {
 			await this.ensureSchemaChangeSafety();
 			const oldNameLower = oldName.toLowerCase();
@@ -1927,6 +1932,25 @@ export class MemoryTableManager {
 				indexes: Object.freeze(updatedIndexes),
 			});
 
+			// Rewrite partial-index predicates into the new column name BEFORE the
+			// rebuild that `handleColumnRename()` triggers: `createSecondaryIndexes`
+			// compiles each predicate against the new column list, so a `WHERE` still
+			// naming the old column cannot build.
+			//
+			// The window is narrow. `ensureSchemaChangeSafety()` above consolidates the
+			// transaction layers into the base and rebuilds every secondary index against
+			// the OLD column list — an already-rewritten predicate would break that. So
+			// the rewrite belongs here and nowhere earlier (in particular, not before the
+			// engine calls `module.alterTable`).
+			//
+			// In place, so the catalog's `TableSchema` and a unique partial index's derived
+			// UNIQUE constraint — which share the `Expression` by reference — follow along.
+			// `propagateColumnRename` re-runs the same rewrite once the engine regains
+			// control and finds nothing left to do.
+			predicatesRewritten = renameColumnInIndexPredicates(
+				finalNewTableSchema.indexes, this._tableName, oldName, newColumnName,
+				this.schemaName, resolveColumnInSource);
+
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			await this.baseLayer.handleColumnRename();
 			this.tableSchema = finalNewTableSchema;
@@ -1944,6 +1968,14 @@ export class MemoryTableManager {
 
 			logger.operation('Rename Column', this._tableName, { oldName, newName: newColumnName });
 		} catch (e: unknown) {
+			// The predicate ASTs are shared with the catalog's TableSchema, so restoring
+			// `originalManagerSchema` does not undo the rewrite — run it in reverse. The
+			// flag keeps a failure raised *before* the rewrite from un-renaming anything.
+			if (predicatesRewritten) {
+				renameColumnInIndexPredicates(
+					originalManagerSchema.indexes, this._tableName, newColumnDefAst.name, oldName,
+					this.schemaName, resolveColumnInSource);
+			}
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.tableSchema = originalManagerSchema;
 			this.initializePrimaryKeyFunctions();
