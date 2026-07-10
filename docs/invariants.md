@@ -49,7 +49,6 @@ self-guarding: `validateSideEffectMode` raises `QuereusError(INTERNAL)` at regis
 - code: `packages/quereus/src/planner/framework/characteristics.ts` — `subtreeHasSideEffects`
 - code: `packages/quereus/src/planner/rules/predicate/rule-empty-relation-folding.ts`
 - guard: `packages/quereus/test/optimizer/side-effect-audit.spec.ts` — `Side-effect audit: rules must refuse on impure subtrees`
-- guard: `packages/quereus/test/optimizer/side-effect-audit.spec.ts` — `OPT-002 static guard: every 'aware' rule consults a side-effect signal`
 - doc: [Optimizer § The two declarations](optimizer.md#the-two-declarations)
 
 A rule that moves, duplicates, drops, or merges a subtree it has not separately proven pure
@@ -59,12 +58,20 @@ subtree carries a write. Usually that signal is `PlanNodeCharacteristics.hasSide
 (`physical.readonly` **and** deterministic), which is strictly stronger. `'safe'` is the
 counter-claim that the transform's structural shape preserves side effects by itself. One
 `'aware'` rule, `cte-optimization`, consults nothing: it wraps the subtree in a run-once
-`CacheNode`, which preserves the write. The behavioural guard covers the fold rules only. A
-static guard closes the rest: it reads `optimizer.ts`, resolves every `'aware'` rule's `fn:`
-to its source file, and fails if that file names none of `hasSideEffects`,
-`subtreeHasSideEffects`, `isConcurrencySafe`, `isFunctional`, `physical.readonly`.
-`cte-optimization` is allowlisted there with its reason. The check is textual: it proves a
-rule *mentions* a signal, not that it acts on it correctly.
+`CacheNode`, which preserves the write.
+
+### OPT-003 — A static guard checks every `'aware'` rule's source for a purity signal
+
+- code: `packages/quereus/src/planner/optimizer.ts`
+- guard: `packages/quereus/test/optimizer/side-effect-audit.spec.ts` — `OPT-003 static guard: every 'aware' rule consults a side-effect signal`
+- doc: [Optimizer § The two declarations](optimizer.md#the-two-declarations)
+
+OPT-002's behavioural guard covers the fold rules only; this static guard closes the rest.
+It reads `optimizer.ts`, resolves every `'aware'` rule's `fn:` to its source file, and fails
+if that file names none of `hasSideEffects`, `subtreeHasSideEffects`, `isConcurrencySafe`,
+`isFunctional`, `physical.readonly`. `cte-optimization` is allowlisted there with its
+reason. The check is textual: it proves a rule *mentions* a signal, not that it acts on it
+correctly.
 
 ### OPT-004 — A custom-`execute` pass argues its own soundness
 
@@ -343,22 +350,30 @@ the marker.
 ### OPT-046 — `addFd` is the only FD accumulation path
 
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `addFd`
-- code: `packages/quereus/src/planner/util/fd-utils.ts` — `MAX_FDS_PER_NODE`
 - guard: `packages/quereus/test/optimizer/fd-propagation.spec.ts` — `OPT-046 static guard: addFd is the only FD accumulation path`
 - doc: [Functional Dependencies § Helper surface](optimizer-fd.md#helper-surface)
 
-FDs are accumulated through `addFd` / `mergeFds`, never by pushing onto the array. `addFd`
-performs subsumption (an existing same-determinant, same-guard FD whose dependents are a
-subset of the newcomer's is dropped; a newcomer already subsumed is skipped) and enforces
-`MAX_FDS_PER_NODE = 64`. Cap eviction keeps FDs whose determinants lie inside a caller-supplied
-`keyHints` set first, and within each partition prefers `'unique'` over `'determination'` —
-evicting a uniqueness witness is sound but causes downstream under-claims. Truncations log on
-`quereus:planner:fd`. The guard scans `planner/**` — all but `util/fd-utils.ts`, which *is* the
-sanctioned path — for a `.push(` onto an FD-named receiver, with a short allowlist for local
-candidate lists that are handed to `addFd` (or to an FD reasoning helper) by their consumer.
-It keys on receiver names, so it is a smoke alarm rather
-than a proof; if the allowlist ever needs to grow past a handful of entries, delete the guard
-rather than maintain it.
+FDs are accumulated through `addFd` / `mergeFds`, never by pushing onto the array — pushing
+directly skips both subsumption and cap enforcement. The guard scans `planner/**` — all but
+`util/fd-utils.ts`, which *is* the sanctioned path — for a `.push(` onto an FD-named
+receiver, with a short allowlist for local candidate lists that are handed to `addFd` (or to
+an FD reasoning helper) by their consumer. It keys on receiver names, so it is a smoke alarm
+rather than a proof; if the allowlist ever needs to grow past a handful of entries, delete
+the guard rather than maintain it.
+
+### OPT-047 — `addFd` deduplicates by subsumption and evicts by key/kind preference
+
+- code: `packages/quereus/src/planner/util/fd-utils.ts` — `addFd`
+- code: `packages/quereus/src/planner/util/fd-utils.ts` — `MAX_FDS_PER_NODE`
+- guard: none — no behavioural test exercises the subsumption or cap-eviction ordering directly; a wrong preference silently drops a uniqueness witness rather than crashing.
+- doc: [Functional Dependencies § Helper surface](optimizer-fd.md#helper-surface)
+
+`addFd` performs subsumption before appending: an existing same-determinant, same-guard FD
+whose dependents are a subset of the newcomer's is dropped, and a newcomer already subsumed
+by an existing FD is skipped. It also enforces `MAX_FDS_PER_NODE = 64`; cap eviction keeps
+FDs whose determinants lie inside a caller-supplied `keyHints` set first, and within each
+partition prefers `'unique'` over `'determination'` — evicting a uniqueness witness is sound
+but causes downstream under-claims. Truncations log on `quereus:planner:fd`.
 
 ### OPT-048 — Dependency facts index output columns
 

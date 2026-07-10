@@ -220,7 +220,7 @@ describe('subtreeHasSideEffects helper', () => {
 });
 
 // ---------------------------------------------------------------------------
-// OPT-002 static guard
+// OPT-003 static guard
 // ---------------------------------------------------------------------------
 
 /** Local name -> module specifier, for the `import { ... } from '...'` lines of a module. */
@@ -338,7 +338,7 @@ function isExcused(u: Unguarded): boolean {
 	return u.kind === 'no-signal' && NO_SIGNAL_ALLOWLIST.has(u.id);
 }
 
-describe("OPT-002 static guard: every 'aware' rule consults a side-effect signal", () => {
+describe("OPT-003 static guard: every 'aware' rule consults a side-effect signal", () => {
 	// A rule that moves, drops, duplicates, or merges a subtree declares
 	// `sideEffectMode: 'aware'` and must ask whether that subtree carries a write
 	// before touching it. Registration (OPT-001) checks that the declaration exists;
