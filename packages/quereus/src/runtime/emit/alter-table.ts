@@ -194,9 +194,19 @@ async function runRenameTable(
 		await module.renameTable(rctx.db, tableSchema.schemaName, oldName, newName);
 	}
 
+	// The renamed table's own definition can name itself: a self-referencing FK's
+	// `referencedTable`, a table-qualified CHECK expression, a table-qualified
+	// partial-index predicate. Rewrite those BEFORE the catalog swap and the notify
+	// below, so no listener ever observes — or persists — a schema pointing at the
+	// vanished old name. `propagateTableRename` runs the same rewrite over every
+	// table in the catalog, but only after the notify; it is idempotent, so this
+	// call simply makes that pass a no-op for this one table.
+	const renamedTableSchema = rewriteTableForTableRename(
+		updatedTableSchema, tableSchema.schemaName.toLowerCase(), oldName, newName);
+
 	// Remove old, add new in the catalog
 	schema.removeTable(oldName);
-	schema.addTable(updatedTableSchema);
+	schema.addTable(renamedTableSchema);
 
 	// Snapshot which MVs are stale BEFORE this statement's first schema-change
 	// notify: the MV propagation below restores staleness set by this very
@@ -210,7 +220,7 @@ async function runRenameTable(
 		schemaName: tableSchema.schemaName,
 		objectName: newName,
 		oldObject: tableSchema,
-		newObject: updatedTableSchema,
+		newObject: renamedTableSchema,
 	});
 
 	// Propagate the rename into dependent objects (CHECK / FK / partial-index
@@ -223,9 +233,9 @@ async function runRenameTable(
 	// re-key: the row-time plan is keyed by `schema.name`, so release the old key
 	// and re-register under the new one, then move the persisted MV catalog entry
 	// (`materialized_view_removed` old name → `materialized_view_added` new name).
-	if (isMaintainedTable(updatedTableSchema)) {
+	if (isMaintainedTable(renamedTableSchema)) {
 		rctx.db.unregisterMaterializedView(tableSchema.schemaName, oldName);
-		rctx.db.registerMaterializedView(updatedTableSchema);
+		rctx.db.registerMaterializedView(renamedTableSchema);
 		const notifier = rctx.db.schemaManager.getChangeNotifier();
 		notifier.notifyChange({
 			type: 'materialized_view_removed',
@@ -237,7 +247,7 @@ async function runRenameTable(
 			type: 'materialized_view_added',
 			schemaName: tableSchema.schemaName,
 			objectName: newName,
-			newObject: updatedTableSchema,
+			newObject: renamedTableSchema,
 		});
 	}
 
@@ -1756,9 +1766,10 @@ function rewriteTableForColumnRename(
 	// The memory and store modules both DO rewrite, from inside their own hook, because
 	// each must act on the predicate before this pass regains control: the memory module
 	// rebuilds its live index structures against the new column list, and the store
-	// module persists its DDL bundle. Both use the same idempotent
-	// `renameColumnInIndexPredicates`, so this pass then finds nothing naming `oldCol`,
-	// `rewrote` is false, and the table is not needlessly re-registered.
+	// module persists its DDL bundle (which is also why the store rewrites the CHECK
+	// expressions above, via `renameColumnInCheckConstraints`). Both use the same
+	// idempotent `renameColumnInIndexPredicates`, so this pass then finds nothing naming
+	// `oldCol`, `rewrote` is false, and the table is not needlessly re-registered.
 	const newIndexes = (table.indexes ?? []).map(idx => {
 		const rewrote = isRenamedTable
 			? renameColumnInCheckExpression(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)

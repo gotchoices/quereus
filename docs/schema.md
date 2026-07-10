@@ -328,16 +328,23 @@ path carries the indexes for free —
   constraint's `exposedIndexTags`) with no index-specific plumbing.
 - Structural ALTERs that reindex columns already re-persist the table, so the
   bundle's index lines track the reindexed columns.
-- `RENAME TABLE` / `RENAME COLUMN` rewrite any partial-index `WHERE` predicate
-  **before** writing the bundle, from inside the module's own hook. The engine's
-  rename propagation runs only after the hook returns, so a module that persisted
-  first would durably write a predicate naming the pre-rename table or column, and
-  would depend on the follow-up `table_modified` event to correct it — leaving a
-  window in which a crash strands an un-rehydratable bundle on disk. Because the
-  rewrite is idempotent and mutates the predicate AST in place (shared by reference
-  with the catalog schema and with a unique partial index's derived `UNIQUE`
-  constraint), the later propagation pass finds nothing to change and its event
-  compare-skips.
+- `RENAME TABLE` / `RENAME COLUMN` rewrite every self-naming part of the table's own
+  definition — partial-index `WHERE` predicates, `CHECK` expressions, and a
+  self-referencing foreign key's target — **before** writing the bundle, from inside
+  the module's own hook. The engine's rename propagation runs only after the hook
+  returns, so a module that persisted first would durably write a definition naming
+  the pre-rename table or column, and would depend on the follow-up `table_modified`
+  event to correct it — leaving a window in which a crash strands an un-rehydratable
+  bundle on disk. The expression rewrites are idempotent and mutate the AST in place
+  (shared by reference with the catalog schema and with a unique partial index's
+  derived `UNIQUE` constraint), so the later propagation pass finds nothing to change
+  and its event compare-skips; the foreign-key retarget is a copy, since it touches a
+  name field rather than an AST.
+- `RENAME TABLE` also rewrites the renamed table's own definition **inside the engine**,
+  before the catalog swap and the `table_modified` notify (`runRenameTable`), not only
+  in the propagation pass afterwards. Otherwise the store's catalog listener, firing on
+  that notify, re-persists a bundle whose self-FK still points at the vanished old name
+  — a second durable stale write the module's hook cannot prevent.
 
 **Reattach, not rebuild.** The physical index KV store survives a logical close,
 so rehydrate does **not** scan rows to rebuild it. After the import loop,

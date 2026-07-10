@@ -18,6 +18,7 @@ import type {
 	DatabaseInternal,
 	TableSchema,
 	TableIndexSchema,
+	ForeignKeyConstraintSchema,
 	UniqueConstraintSchema,
 	VirtualTableModule,
 	BaseModuleConfig,
@@ -37,7 +38,7 @@ import type {
 	BackingHost,
 	LensDeploymentSnapshot,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeRowKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeRowKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
 import type { CompiledPredicate, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
@@ -1397,38 +1398,47 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					columns: Object.freeze(updatedColumns),
 					columnIndexMap: buildColumnIndexMap(updatedColumns),
 					indexes: Object.freeze(updatedIndexes),
+					// A self-referencing FK names the renamed column in `referencedColumnNames`
+					// and is persisted by name; the engine rewrites it only in the post-hook
+					// pass. Pure copy — no rollback needed, this schema is only adopted on the
+					// success path.
+					foreignKeys: renameColumnInSelfForeignKeys(
+						oldSchema.foreignKeys, schemaName, tableName, change.oldName, change.newName),
 				};
 
-				// A partial index's WHERE clause still names the OLD column: the engine's
-				// `propagateColumnRename` pass runs only after this hook returns. Persisting
-				// now would durably write a bundle whose predicate names a column the table
-				// no longer has, and only the later propagation's `table_modified` event
-				// would correct it — a crash in between leaves the catalog un-rehydratable.
-				// So rewrite first, in place: the predicate `Expression` is shared by
-				// reference with the catalog's `TableSchema` and with a unique partial
-				// index's `derivedFromIndex` UNIQUE constraint, so one rewrite covers all
-				// of them and makes the later propagation pass a no-op.
+				// A partial index's WHERE clause and a CHECK constraint's expression both
+				// still name the OLD column: the engine's `propagateColumnRename` pass runs
+				// only after this hook returns. Persisting now would durably write a bundle
+				// naming a column the table no longer has, and only the later propagation's
+				// `table_modified` event would correct it — a crash in between leaves the
+				// catalog un-rehydratable. So rewrite first, in place: each `Expression` is
+				// shared by reference with the catalog's `TableSchema` and, for a unique
+				// partial index, with the `derivedFromIndex` UNIQUE constraint, so one
+				// rewrite covers all holders and makes the later propagation pass a no-op.
 				//
-				// The rewrite is the first statement in the `try`, and it walks the indexes
-				// one at a time, so a throw anywhere — including partway through the walk
-				// itself — must reverse it: restoring `oldSchema` cannot, since the ASTs are
-				// shared. Reversing is a no-op when no predicate names the new column, and
-				// the engine has already rejected a rename onto an existing column name, so
-				// the reverse pass cannot collide with a predicate that legitimately named it.
+				// The rewrites are the first statements in the `try`, and each walks its
+				// collection one item at a time, so a throw anywhere — including partway
+				// through a walk — must reverse them: restoring `oldSchema` cannot, since the
+				// ASTs are shared. Reversing is a no-op wherever nothing names the new column,
+				// and the engine has already rejected a rename onto an existing column name,
+				// so the reverse pass cannot collide with an expression that legitimately
+				// named it.
 				const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
 					db.schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
-				try {
+				const rewriteColumn = (from: string, to: string): void => {
 					renameColumnInIndexPredicates(
-						updatedIndexes, tableName, change.oldName, change.newName,
-						schemaName, resolveColumnInSource);
+						updatedIndexes, tableName, from, to, schemaName, resolveColumnInSource);
+					renameColumnInCheckConstraints(
+						oldSchema.checkConstraints, tableName, from, to, schemaName, resolveColumnInSource);
+				};
+				try {
+					rewriteColumn(change.oldName, change.newName);
 
 					// Rename is schema-only — no row migration needed
 					table.updateSchema(updatedSchema);
 					await this.saveTableDDL(updatedSchema);
 				} catch (e) {
-					renameColumnInIndexPredicates(
-						updatedIndexes, tableName, change.newName, change.oldName,
-						schemaName, resolveColumnInSource);
+					rewriteColumn(change.newName, change.oldName);
 					throw e;
 				}
 
@@ -1915,30 +1925,42 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// so a crash mid-rename leaves the table discoverable under at least one
 		// name rather than neither.
 		if (currentSchema) {
-			const renamedSchema: TableSchema = { ...currentSchema, name: newName };
-			// A partial index's WHERE clause can carry a table-qualified self-reference
-			// (`where t.b > 0`) still naming the OLD table: `propagateTableRename` runs
-			// only after this hook returns, so — exactly as in the `renameColumn` arm of
-			// `alterTable` — persisting now would durably write a stale qualifier that
-			// only the later propagation event corrects. Rewrite first, in place (the
-			// predicate `Expression` is shared with the catalog `TableSchema` and with a
-			// unique partial index's derived UNIQUE constraint), which also makes that
-			// later pass a no-op. A throw anywhere in the `try` — including partway
-			// through the walk — reverses the rewrite; reversing is a no-op when nothing
-			// names `newName`. The physical stores have already moved by this point, so
-			// the reverse restores only the AST, not the on-disk layout.
+			const renamedSchema: TableSchema = {
+				...currentSchema,
+				name: newName,
+				// A self-referencing FK is persisted as `references <oldName>(...)`; after
+				// `removeTableDDL` below, that names a table no longer in the catalog. Pure
+				// copy — no rollback needed, `renamedSchema` is local to the write.
+				foreignKeys: retargetSelfForeignKeys(currentSchema.foreignKeys, schemaName, oldName, newName),
+			};
+			// A partial index's WHERE clause and a CHECK constraint's expression can each
+			// carry a table-qualified self-reference (`where t.b > 0`) still naming the OLD
+			// table: `propagateTableRename` runs only after this hook returns, so — exactly
+			// as in the `renameColumn` arm of `alterTable` — persisting now would durably
+			// write a stale qualifier that only the later propagation event corrects.
+			// Rewrite first, in place (each `Expression` is shared with the catalog
+			// `TableSchema` and, for a unique partial index, with its derived UNIQUE
+			// constraint), which also makes that later pass a no-op for these fields. A
+			// throw anywhere in the `try` — including partway through a walk — reverses the
+			// rewrites; reversing is a no-op wherever nothing names `newName`. The physical
+			// stores have already moved by this point, so the reverse restores only the AST,
+			// not the on-disk layout.
 			//
-			// NOTE: the reverse assumes no predicate legitimately named `newName` before
+			// NOTE: the reverse assumes no expression legitimately named `newName` before
 			// the rename. The rename-target guard above makes that true for a real table,
 			// but `compilePredicate` today accepts a qualifier naming a table that does not
 			// exist (see `bug-partial-index-predicate-ignores-table-qualifier`), so a
 			// predicate written `where <newName>.b > 0` would be mis-reversed. Harmless
 			// until that acceptance is tightened; revisit the reverse then.
+			const rewriteTable = (from: string, to: string): void => {
+				renameTableInIndexPredicates(currentSchema.indexes, from, to, schemaName);
+				renameTableInCheckConstraints(currentSchema.checkConstraints, from, to, schemaName);
+			};
 			try {
-				renameTableInIndexPredicates(renamedSchema.indexes, oldName, newName, schemaName);
+				rewriteTable(oldName, newName);
 				await this.saveTableDDL(renamedSchema);
 			} catch (e) {
-				renameTableInIndexPredicates(renamedSchema.indexes, newName, oldName, schemaName);
+				rewriteTable(newName, oldName);
 				throw e;
 			}
 		}
@@ -3211,4 +3233,69 @@ function buildColumnRemap(oldColumnNames: string[], newColumnNames: string[]): n
 		const oldIdx = oldIndexByName.get(name.toLowerCase());
 		return oldIdx !== undefined ? oldIdx : -1;
 	});
+}
+
+/** Whether `fk` points back at the table that owns it. */
+function isSelfForeignKey(
+	fk: ForeignKeyConstraintSchema,
+	schemaLower: string,
+	tableLower: string,
+): boolean {
+	return (fk.referencedSchema ?? schemaLower).toLowerCase() === schemaLower
+		&& fk.referencedTable.toLowerCase() === tableLower;
+}
+
+/**
+ * Retarget a self-referencing foreign key's `referencedTable` across a rename of
+ * the owning table. A pure copy — unlike the CHECK / partial-index rewrites this
+ * touches a name field, not a shared AST, so the caller needs no rollback.
+ * Returns the input array when nothing self-references.
+ */
+function retargetSelfForeignKeys(
+	fks: ReadonlyArray<ForeignKeyConstraintSchema> | undefined,
+	schemaName: string,
+	oldName: string,
+	newName: string,
+): ReadonlyArray<ForeignKeyConstraintSchema> | undefined {
+	if (!fks) return fks;
+	const schemaLower = schemaName.toLowerCase();
+	const oldLower = oldName.toLowerCase();
+	let changed = false;
+	const next = fks.map(fk => {
+		if (!isSelfForeignKey(fk, schemaLower, oldLower)) return fk;
+		changed = true;
+		return { ...fk, referencedTable: newName };
+	});
+	return changed ? Object.freeze(next) : fks;
+}
+
+/**
+ * Rename a column inside a self-referencing foreign key's `referencedColumnNames`
+ * (the names the FK resolves to parent-column indices at enforcement time). Pure
+ * copy, as in {@link retargetSelfForeignKeys}. The child-side `columns` are
+ * indices, unaffected by a rename.
+ */
+function renameColumnInSelfForeignKeys(
+	fks: ReadonlyArray<ForeignKeyConstraintSchema> | undefined,
+	schemaName: string,
+	tableName: string,
+	oldCol: string,
+	newCol: string,
+): ReadonlyArray<ForeignKeyConstraintSchema> | undefined {
+	if (!fks) return fks;
+	const schemaLower = schemaName.toLowerCase();
+	const tableLower = tableName.toLowerCase();
+	const oldColLower = oldCol.toLowerCase();
+	let changed = false;
+	const next = fks.map(fk => {
+		if (!isSelfForeignKey(fk, schemaLower, tableLower)) return fk;
+		if (!fk.referencedColumnNames?.some(n => n.toLowerCase() === oldColLower)) return fk;
+		changed = true;
+		return {
+			...fk,
+			referencedColumnNames: Object.freeze(
+				fk.referencedColumnNames.map(n => n.toLowerCase() === oldColLower ? newCol : n)),
+		};
+	});
+	return changed ? Object.freeze(next) : fks;
 }

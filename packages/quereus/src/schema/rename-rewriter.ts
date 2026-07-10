@@ -259,6 +259,26 @@ function visitTableRename(
 }
 
 /**
+ * Apply an in-place expression rewrite across a schema-object collection,
+ * skipping items whose expression is absent. Returns whether any item changed.
+ *
+ * Backs the four `rename*In{IndexPredicates,CheckConstraints}` entry points
+ * below, which differ only in which field they pluck and which walker they run.
+ */
+function rewriteEach<T>(
+	items: ReadonlyArray<T> | undefined,
+	pick: (item: T) => AST.Expression | undefined,
+	rewrite: (expr: AST.Expression) => boolean,
+): boolean {
+	let changed = false;
+	for (const item of items ?? []) {
+		const expr = pick(item);
+		if (expr && rewrite(expr)) changed = true;
+	}
+	return changed;
+}
+
+/**
  * Rewrite the renamed table inside every partial-index predicate of `indexes`,
  * in place. A predicate may carry a table-qualified self-reference
  * (`create index ix on t (b) where t.b > 0`), which a table rename must follow.
@@ -275,12 +295,27 @@ export function renameTableInIndexPredicates(
 	newName: string,
 	defaultSchemaName: string,
 ): boolean {
-	let changed = false;
-	for (const idx of indexes ?? []) {
-		if (!idx.predicate) continue;
-		if (renameTableInAst(idx.predicate, oldName, newName, defaultSchemaName)) changed = true;
-	}
-	return changed;
+	return rewriteEach(indexes, idx => idx.predicate,
+		expr => renameTableInAst(expr, oldName, newName, defaultSchemaName));
+}
+
+/**
+ * Rewrite the renamed table inside every CHECK constraint expression of `checks`,
+ * in place. A CHECK may carry a table-qualified self-reference (`check (t.b > 0)`)
+ * exactly as a partial-index predicate may, and a table rename must follow it.
+ *
+ * Same sharing and idempotence story as {@link renameTableInIndexPredicates}: the
+ * `expr` is the very AST the catalog's `TableSchema` holds, so one rewrite covers
+ * every holder and a second call with the same pair is a no-op.
+ */
+export function renameTableInCheckConstraints(
+	checks: ReadonlyArray<{ readonly expr: AST.Expression }> | undefined,
+	oldName: string,
+	newName: string,
+	defaultSchemaName: string,
+): boolean {
+	return rewriteEach(checks, cc => cc.expr,
+		expr => renameTableInAst(expr, oldName, newName, defaultSchemaName));
 }
 
 function rewriteIdentifierIfTable(
@@ -416,14 +451,30 @@ export function renameColumnInIndexPredicates(
 	defaultSchemaName: string,
 	resolveColumnInSource?: ResolveColumnInSource,
 ): boolean {
-	let changed = false;
-	for (const idx of indexes ?? []) {
-		if (!idx.predicate) continue;
-		const rewrote = renameColumnInCheckExpression(
-			idx.predicate, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource);
-		if (rewrote) changed = true;
-	}
-	return changed;
+	return rewriteEach(indexes, idx => idx.predicate, expr => renameColumnInCheckExpression(
+		expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource));
+}
+
+/**
+ * Rewrite the renamed column inside every CHECK constraint expression of `checks`
+ * belonging to the renamed table itself, in place. The seeded-scope entry point
+ * applies for the same reason it does for a partial-index predicate: a CHECK
+ * resolves unqualified refs against its owning table.
+ *
+ * Only pass the renamed table's OWN checks — a CHECK on a *different* table that
+ * happens to reference the renamed table needs {@link renameColumnInAst}, whose
+ * walk has no implicit seed.
+ */
+export function renameColumnInCheckConstraints(
+	checks: ReadonlyArray<{ readonly expr: AST.Expression }> | undefined,
+	tableName: string,
+	oldColName: string,
+	newColName: string,
+	defaultSchemaName: string,
+	resolveColumnInSource?: ResolveColumnInSource,
+): boolean {
+	return rewriteEach(checks, cc => cc.expr, expr => renameColumnInCheckExpression(
+		expr, tableName, oldColName, newColName, defaultSchemaName, resolveColumnInSource));
 }
 
 interface ColumnRewriteState {

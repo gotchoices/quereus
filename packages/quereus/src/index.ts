@@ -145,7 +145,7 @@ export type { ImportCatalogOptions } from './schema/manager.js';
 export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewAddedEvent, ViewRemovedEvent } from './schema/change-events.js';
 export { buildColumnIndexMap, columnDefToSchema, resolveNamedConstraintClass, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema } from './schema/table.js';
 export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, validateForeignKeyCollations, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, maintainedTableUniqueViolationError } from './schema/constraint-builder.js';
-export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, NamedConstraintClass } from './schema/table.js';
+export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './schema/table.js';
 // Per-column UNIQUE-enforcement collation resolver — the single source of truth
 // shared by store/isolation re-validators (memory's `checkUniqueViaIndex` is
 // conformance-locked against it rather than importing, see unique-enforcement.ts).
@@ -157,11 +157,15 @@ export { isMaintainedTable } from './schema/derivation.js';
 export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
 export { isHiddenImplicitIndex, exposedImplicitIndexes } from './schema/catalog.js';
 export type { SyntheticExposedIndex } from './schema/catalog.js';
-// Partial-index predicate rewriters. A persisting module must rewrite its predicates
-// from inside its own `alterTable` / `renameTable` hook — the engine's propagation pass
-// runs only after the hook returns, so a module that persists first would durably write
-// a predicate naming the pre-rename column or table.
-export { renameColumnInIndexPredicates, renameTableInIndexPredicates } from './schema/rename-rewriter.js';
+// Rename rewriters for the expression-bearing parts of a table's own definition.
+// A persisting module must rewrite these from inside its own `alterTable` /
+// `renameTable` hook — the engine's propagation pass runs only after the hook
+// returns, so a module that persists first would durably write a definition naming
+// the pre-rename column or table.
+export {
+	renameColumnInIndexPredicates, renameTableInIndexPredicates,
+	renameColumnInCheckConstraints, renameTableInCheckConstraints,
+} from './schema/rename-rewriter.js';
 export type { ResolveColumnInSource } from './schema/rename-rewriter.js';
 // Reserved-tag namespace surface — `@quereus/quereus-store` keys its sync-replication
 // opt-in off SYNC_REPLICATE_TAG (DRY: one literal) and reads it via getReservedTag.
