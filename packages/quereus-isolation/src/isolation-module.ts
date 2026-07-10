@@ -63,12 +63,13 @@ export interface ConnectionOverlayState {
 	overlayTable: VirtualTable;
 	hasChanges: boolean;
 	/**
-	 * Set by a cross-connection ALTER that could not migrate this (foreign)
-	 * overlay to the post-alter column layout. The overlay still holds
-	 * PRE-alter rows, so it is structurally inconsistent with the now-committed
-	 * schema; any data op that would merge or flush it must throw this message.
-	 * Undefined = healthy. Cleared only by discarding the overlay (rollback /
-	 * commit-failure → rollback).
+	 * Set by a cross-connection DDL that left this (foreign) overlay unflushable:
+	 * an ALTER that could not migrate it to the post-alter column layout (the overlay
+	 * still holds PRE-alter rows, structurally inconsistent with the now-committed
+	 * schema), or a DROP TABLE that removed the table it stages rows for. Either way
+	 * any data op that would merge or flush it must throw this message. Undefined =
+	 * healthy. Cleared only by discarding the overlay (rollback / commit-failure →
+	 * rollback).
 	 */
 	poison?: { message: string };
 }
@@ -431,10 +432,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * exposing a shared atomic commit domain (see docs/design-isolation-layer.md
 	 * § "Commit Failure Recovery").
 	 *
-	 * A poisoned overlay (a cross-connection ALTER left its rows in the pre-alter
-	 * layout) aborts the whole commit before any apply — mirroring the per-connection
-	 * `assertOverlayUsable` check, now with the added benefit that no earlier table is
-	 * left committed. The overlay is left intact so the ensuing rollback discards it.
+	 * A poisoned overlay aborts the whole commit before any apply — mirroring the
+	 * per-connection `assertOverlayUsable` check, now with the added benefit that no earlier
+	 * table is left committed. The overlay is left intact so the ensuing rollback discards
+	 * it. Two DDLs poison: a cross-connection ALTER (rows left in the pre-alter layout) and
+	 * a cross-connection DROP TABLE (the table is gone; see {@link destroy}).
 	 *
 	 * Driven once per db-transaction: the first `IsolatedConnection.commit()` in the
 	 * database's commit loop runs this whole flush and clears every overlay, so the
@@ -442,15 +444,17 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * explicit "already flushed" latch is needed, the cleared-overlay state guards
 	 * itself.
 	 *
-	 * **Invariant: every staged overlay resolves to an underlying table here.** The
-	 * table-lifecycle hooks are what keep that true — {@link destroy} drops the
-	 * overlays of a dropped table across every connection, and {@link renameTable}
-	 * re-connects the underlying under the new name whenever it re-keys an overlay
-	 * onto it. A miss is therefore a layer-invariant violation, not a routine
-	 * condition, and is raised as `StatusCode.INTERNAL`: the alternative — dropping
-	 * the staged rows and letting the commit report success — is silent data loss.
-	 * Only a CLEAN overlay (`hasChanges === false`) may miss harmlessly; it staged
-	 * nothing, so it is simply discarded.
+	 * **Invariant: every staged overlay resolves to an underlying table here, or is
+	 * poisoned.** The table-lifecycle hooks are what keep that true — {@link destroy}
+	 * discards or poisons the overlays of a dropped table across every connection, and
+	 * {@link renameTable} re-connects the underlying under the new name whenever it re-keys
+	 * an overlay onto it. The poison check above is the enforcement point: it runs BEFORE
+	 * the `underlyingTables` lookup, so a dropped table's surviving foreign overlay raises
+	 * its poison message rather than the orphan error below. A miss that is neither resolved
+	 * nor poisoned is therefore a layer-invariant violation, not a routine condition, and is
+	 * raised as `StatusCode.INTERNAL`: the alternative — dropping the staged rows and letting
+	 * the commit report success — is silent data loss. Only a CLEAN overlay
+	 * (`hasChanges === false`) may miss harmlessly; it staged nothing, so it is discarded.
 	 */
 	async commitConnectionOverlays(db: Database): Promise<void> {
 		const prefix = `${this.getDbId(db)}:`;
@@ -750,25 +754,43 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Destroys the underlying table and discards every connection's staged state for it.
+	 * Destroys the underlying table, then resolves every connection's staged state for it.
 	 *
 	 * DROP TABLE is not transaction-scoped: the table is gone for *every* connection the
-	 * moment this returns, so any overlay staging writes against it — the dropping
-	 * connection's or another's — can never be flushed. Discarding those rows is the
-	 * correct outcome, but it must happen *because we deliberately dropped them here*,
-	 * not because `commitConnectionOverlays` missed an `underlyingTables` lookup and
-	 * silently skipped the flush. That miss is now an INTERNAL error (see
-	 * {@link commitConnectionOverlays}), so this cleanup is what keeps DROP TABLE legal.
+	 * moment this returns, so no overlay staging writes against it can ever be flushed.
+	 * What differs is who gets told. Per overlay key matching the dropped table (both maps
+	 * are keyed `<dbId>:<schema>.<table>`, so the sweep spans all db ids):
 	 *
-	 * Both maps are keyed `<dbId>:<schema>.<table>`, so the sweep spans all db ids. The
-	 * `preOverlaySavepoints` set is dropped alongside: without this it outlived the table
-	 * for the lifetime of the `Database` (nothing else is keyed to reap it once the table
-	 * is gone).
+	 * - **The dropping connection's own overlay** is discarded silently. It issued the DROP;
+	 *   there is nobody to notify.
+	 * - **A foreign overlay with staged rows** (`hasChanges`) is **poisoned**, not swept.
+	 *   Sweeping it let that connection commit against an empty overlay set and report
+	 *   success after its rows were thrown away — silent cross-connection data loss. Poison
+	 *   makes its next read/write/commit throw `CONSTRAINT` (see
+	 *   {@link IsolatedTable.assertOverlayUsable} and the poison check at the head of
+	 *   {@link commitConnectionOverlays}, which precedes the `underlyingTables` lookup and so
+	 *   raises the poison message rather than the orphan INTERNAL error). An already-poisoned
+	 *   overlay keeps its original message — the first cause is the one worth reporting.
+	 * - **A foreign overlay with no staged rows** is discarded: it staged nothing, so nothing
+	 *   is lost.
 	 *
-	 * Nothing is discarded until the underlying destroy SUCCEEDS. A throwing
+	 * `preOverlaySavepoints` is swept for every matching key whose overlay did NOT survive.
+	 * A surviving poisoned overlay keeps its set: `ensureOverlay` padding still consults it,
+	 * and the owning connection's `onConnectionRollback` reaps it when its failed commit
+	 * rolls back. Without the sweep, an abandoned set outlived the table for the lifetime of
+	 * the `Database` (nothing else is keyed to reap it once the table is gone).
+	 *
+	 * Nothing is discarded or poisoned until the underlying destroy SUCCEEDS. A throwing
 	 * `underlying.destroy` means the table still exists, so every connection's staged
 	 * writes are still flushable and every map entry must survive untouched — the same
 	 * reason {@link renameTable} delegates before mutating its maps.
+	 *
+	 * NOTE: poison rides on the `ConnectionOverlayState`, not on its rows, so a foreign
+	 * connection that later unwinds every staged row past the drop (rollback to a savepoint
+	 * taken after the overlay existed) still fails its commit. Deliberately over-strict —
+	 * the table is gone either way. If a caller ever needs the clean-unwind case to commit,
+	 * re-evaluate the poison on `onConnectionRollbackToSavepoint` rather than special-casing
+	 * here.
 	 */
 	async destroy(
 		db: Database,
@@ -779,12 +801,34 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	): Promise<void> {
 		await this.underlying.destroy(db, pAux, moduleName, schemaName, tableName);
 		this.removeUnderlyingState(schemaName, tableName);
+
+		const ownKey = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		const survivingKeys = new Set<string>();
 		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
+			const state = this.connectionOverlays.get(key)!;
+			if (key !== ownKey && state.hasChanges) {
+				if (!state.poison) {
+					state.poison = { message: this.buildDropPoisonMessage(schemaName, tableName) };
+				}
+				survivingKeys.add(key);
+				continue;
+			}
 			this.connectionOverlays.delete(key);
 		}
 		for (const key of this.connectionScopedKeys(this.preOverlaySavepoints, schemaName, tableName)) {
-			this.preOverlaySavepoints.delete(key);
+			if (!survivingKeys.has(key)) this.preOverlaySavepoints.delete(key);
 		}
+	}
+
+	/**
+	 * Builds the poison message stamped onto a foreign overlay whose table was dropped out
+	 * from under it (see {@link destroy}). Names the schema.table so the owning connection's
+	 * eventual read/write/commit error is self-explanatory. Companion to
+	 * {@link buildAlterPoisonMessage}: both poison sources raise the same
+	 * `StatusCode.CONSTRAINT` and are told apart by their message, not their code.
+	 */
+	private buildDropPoisonMessage(schemaName: string, tableName: string): string {
+		return `Table '${schemaName}.${tableName}' was dropped by another connection while this connection had uncommitted changes staged for it; roll back this transaction.`;
 	}
 
 	/**

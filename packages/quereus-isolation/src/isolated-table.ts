@@ -159,13 +159,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Throws if this connection's overlay was poisoned by a cross-connection ALTER
-	 * (see `IsolationModule.alterTable`). A poisoned overlay still holds rows in the
-	 * PRE-alter column layout, so it can neither be merged into a read nor flushed to
-	 * the now-altered underlying. Called at the data-op chokepoints (write, the merged
-	 * read branch, and the commit flush) — never on the committed-snapshot read path,
-	 * which bypasses the overlay entirely and stays safe. The connection recovers by
-	 * rolling back, which discards the overlay (and its poison).
+	 * Throws if this connection's overlay was poisoned by a cross-connection DDL: an ALTER
+	 * that could not migrate it (see `IsolationModule.alterTable`), leaving its rows in the
+	 * PRE-alter column layout, or a DROP TABLE that removed the table underneath it (see
+	 * `IsolationModule.destroy`). Either way it can neither be merged into a read nor
+	 * flushed. Called at the data-op chokepoints (write, the merged read branch, and the
+	 * commit flush) — never on the committed-snapshot read path, which bypasses the overlay
+	 * entirely and stays safe. The connection recovers by rolling back, which discards the
+	 * overlay (and its poison).
 	 */
 	private assertOverlayUsable(): void {
 		const state = this.getOverlayState();
@@ -399,8 +400,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return this.underlyingTable.query(filterInfo);
 		}
 
-		// Merged branch: a poisoned overlay cannot be merged (its rows are in the
-		// pre-alter layout) — error before touching it.
+		// Merged branch: a poisoned overlay cannot be merged (pre-alter row layout, or the
+		// table itself is gone) — error before touching it.
 		this.assertOverlayUsable();
 
 		// Merge overlay with underlying (with connection ensured)
@@ -848,8 +849,8 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * The overlay is created lazily on first write, using schema from the underlying table.
 	 */
 	async update(args: UpdateArgs): Promise<UpdateResult> {
-		// A poisoned overlay (cross-connection ALTER) cannot accept further writes — its
-		// staged rows are in the pre-alter layout. Error before staging anything.
+		// A poisoned overlay (cross-connection ALTER or DROP TABLE) cannot accept further
+		// writes — it can never be flushed. Error before staging anything.
 		this.assertOverlayUsable();
 
 		// Ensure connection is registered for transaction coordination

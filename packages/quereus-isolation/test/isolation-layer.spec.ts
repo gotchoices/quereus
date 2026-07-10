@@ -1448,24 +1448,134 @@ describe('IsolationModule', () => {
 			expect(preOverlaySavepointKeys()).to.deep.equal([]);
 		});
 
-		it('DROP TABLE discards another connection\'s staged overlay for the same table', async () => {
+		/**
+		 * Stages an overlay for `forDb` against `main.shared` directly, exactly as the
+		 * cross-connection ALTER suite does. What is under test is `destroy()`'s per-key
+		 * decision across db ids, not how a foreign overlay came to exist.
+		 *
+		 * `dirty: true` inserts one live row so `hasChanges` is honest.
+		 */
+		async function stageOverlay(forDb: Database, dirty: boolean): Promise<ConnectionOverlayState> {
+			const underlying = iso.getUnderlyingState('main', 'shared')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(forDb, iso.createOverlaySchema(underlying.tableSchema!));
+			if (dirty) await overlay.update({ operation: 'insert', values: [1, 'from-other', 0] });
+			const state: ConnectionOverlayState = { overlayTable: overlay, hasChanges: dirty };
+			iso.setConnectionOverlay(forDb, 'main', 'shared', state);
+			return state;
+		}
+
+		/**
+		 * The `<dbId>:main.shared` key for `forDb`, recovered by state identity — `getDbId`
+		 * is private, and the key must be captured while the overlay still exists.
+		 */
+		function overlayKeyFor(forDb: Database): string {
+			const state = iso.getConnectionOverlay(forDb, 'main', 'shared')!;
+			const map = (iso as unknown as { connectionOverlays: Map<string, ConnectionOverlayState> }).connectionOverlays;
+			for (const [key, value] of map) {
+				if (value === state) return key;
+			}
+			throw new Error('no overlay key found for the given database');
+		}
+
+		it('DROP TABLE poisons another connection\'s staged overlay instead of discarding it', async () => {
 			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
 
 			// A second Database sharing the module gets its own dbId, hence its own overlay key.
-			// The overlay is injected directly (as the cross-connection ALTER suite does) — the
-			// point under test is the sweep across db ids, not how the foreign overlay arose.
 			const other = new Database();
-			const underlying = iso.getUnderlyingState('main', 'shared')!.underlyingTable;
-			const overlay = await iso.overlayModule.create(other, iso.createOverlaySchema(underlying.tableSchema!));
-			await overlay.update({ operation: 'insert', values: [1, 'from-other', 0] });
-			iso.setConnectionOverlay(other, 'main', 'shared', { overlayTable: overlay, hasChanges: true });
+			const foreign = await stageOverlay(other, true);
 			expect(overlayKeys().length, 'the foreign connection stages an overlay').to.equal(1);
 
 			await db.exec(`drop table shared`);
 
-			// The table is gone for EVERY connection, so its staged writes are gone too. Left in
-			// place, that overlay would trip the new INTERNAL guard at the foreign commit.
-			expect(overlayKeys(), 'destroy() sweeps overlays across all db ids').to.deep.equal([]);
+			// Sweeping the overlay let `other` commit against an empty overlay set and report
+			// success after its staged rows were thrown away. It must survive, poisoned, so the
+			// poison check at the head of commitConnectionOverlays fires before the (now absent)
+			// underlyingTables lookup.
+			expect(overlayKeys().length, 'the foreign overlay survives the drop').to.equal(1);
+			expect(foreign.poison, 'the foreign overlay is poisoned').to.not.be.undefined;
+			expect(foreign.poison!.message).to.contain('main.shared');
+
+			let caught: unknown;
+			try {
+				await iso.commitConnectionOverlays(other);
+			} catch (e) {
+				caught = e;
+			}
+			expect(caught, 'the foreign commit must fail, not silently succeed').to.be.instanceOf(QuereusError);
+			expect((caught as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			expect((caught as QuereusError).message).to.contain('main.shared');
+
+			await other.close();
+		});
+
+		it('DROP TABLE discards a foreign overlay that staged nothing', async () => {
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			const other = new Database();
+			await stageOverlay(other, false);
+			expect(overlayKeys().length).to.equal(1);
+
+			// hasChanges === false: nothing is lost, so there is nothing to report. Poisoning it
+			// would fail a commit that has no staged rows to protect.
+			await db.exec(`drop table shared`);
+			expect(overlayKeys(), 'a clean foreign overlay is swept').to.deep.equal([]);
+
+			await other.close();
+		});
+
+		it('DROP TABLE silently discards the dropping connection\'s own dirty overlay and savepoint set', async () => {
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			const own = await stageOverlay(db, true);
+			iso.getPreOverlaySavepoints(db, 'main', 'shared').add(0);
+			expect(overlayKeys().length).to.equal(1);
+			expect(preOverlaySavepointKeys().length).to.equal(1);
+
+			// The dropping connection asked for the drop; there is nobody to notify.
+			await db.exec(`drop table shared`);
+			expect(overlayKeys(), 'own overlay is discarded').to.deep.equal([]);
+			expect(own.poison, 'own overlay is never poisoned').to.be.undefined;
+			expect(preOverlaySavepointKeys(), 'own savepoint set is reaped').to.deep.equal([]);
+		});
+
+		it('DROP TABLE keeps the savepoint set of a surviving poisoned overlay and reaps every other', async () => {
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			const poisoned = new Database();
+			const clean = new Database();
+			await stageOverlay(poisoned, true);
+			await stageOverlay(clean, false);
+			const poisonedKey = overlayKeyFor(poisoned);
+			iso.getPreOverlaySavepoints(poisoned, 'main', 'shared').add(0);
+			iso.getPreOverlaySavepoints(clean, 'main', 'shared').add(0);
+			iso.getPreOverlaySavepoints(db, 'main', 'shared').add(0);
+			expect(preOverlaySavepointKeys().length).to.equal(3);
+
+			await db.exec(`drop table shared`);
+
+			// `ensureOverlay` padding still consults the surviving overlay's set, and the owning
+			// connection's onConnectionRollback reaps it when its failed commit rolls back.
+			expect(preOverlaySavepointKeys(), 'only the poisoned overlay keeps its set')
+				.to.deep.equal([poisonedKey]);
+
+			await poisoned.close();
+			await clean.close();
+		});
+
+		it('DROP TABLE preserves an already-poisoned foreign overlay\'s original message', async () => {
+			await db.exec(`create table shared (id integer primary key, v text) using isolated`);
+
+			const other = new Database();
+			const foreign = await stageOverlay(other, true);
+			foreign.poison = { message: 'poisoned earlier by an ALTER' };
+
+			await db.exec(`drop table shared`);
+
+			// The first cause is the one worth reporting — the ALTER is why the rows are
+			// unflushable in the first place. (Assert survival too: `foreign` is a live
+			// reference, so a swept overlay would keep its message and pass vacuously.)
+			expect(overlayKeys().length, 'the poisoned overlay survives').to.equal(1);
+			expect(foreign.poison!.message).to.equal('poisoned earlier by an ALTER');
 			await other.close();
 		});
 

@@ -150,12 +150,17 @@ Keying the two maps consistently is necessary but not sufficient — the entries
 still *exist* when `commitConnectionOverlays` crosses between them. The table-lifecycle hooks are
 what keep that true, and each has to do explicit work:
 
-- **`destroy()` (DROP TABLE)** removes the `underlyingTables` entry, so it also deletes the
+- **`destroy()` (DROP TABLE)** removes the `underlyingTables` entry, so it also resolves the
   `connectionOverlays` and `preOverlaySavepoints` entries for that table across **every** db id.
-  DROP TABLE is not transaction-scoped: the table is gone for all connections, so discarding their
-  staged writes is correct — but it must happen because `destroy()` dropped them deliberately, not
-  because a lookup missed later. Without this the single-table case also leaked the overlay (and
-  its savepoint set) for the lifetime of the `Database`.
+  DROP TABLE is not transaction-scoped: the table is gone for all connections, so no overlay
+  against it can ever be flushed. Who gets told differs by overlay. The **dropping connection's
+  own** overlay is discarded silently (it issued the DROP). A **foreign** overlay with staged rows
+  is **poisoned** and kept — sweeping it let that connection commit against an empty overlay set
+  and report success after its rows were discarded, which is silent cross-connection data loss. A
+  **foreign** overlay with no staged rows is discarded; nothing is lost. `preOverlaySavepoints` is
+  swept for every key whose overlay did not survive (without this the single-table case leaked the
+  overlay and its savepoint set for the lifetime of the `Database`); a surviving poisoned overlay
+  keeps its set, which its owner's rollback reaps. See *ALTER / DROP overlay poison* below.
 - **`renameTable()` (ALTER TABLE … RENAME TO)** evicts the cached underlying handle for the old
   name (the underlying module may have closed it — `StoreModule` closes and re-opens stores during
   a rename) and re-keys any staged overlay onto the new name. It must therefore **re-connect** a
@@ -702,10 +707,14 @@ connections racing on the same row, not atomicity within a single connection's o
 **Mitigation:**
 - DDL mutates the shared underlying module directly — it is not transaction-scoped and the underlying auto-commits immediately, so it is not isolated in the same way as DML.
 - Schema changes may have their own transactional semantics.
-- **Open overlays are migrated, not bypassed.** Any per-connection overlay holding staged rows in the *old* column layout would be structurally inconsistent with the post-DDL schema, so `IsolationModule` migrates each affected overlay forward rather than ignoring it. `dropIndex` rebuilds each overlay under the post-drop schema (preserving rows + tombstones); `alterTable` translates every staged row to the new column layout. See *ALTER overlay migration & cross-connection poison* below.
-- **Open overlays are never orphaned.** `destroy` (DROP TABLE) drops every connection's overlay for the table; `renameTable` re-connects an underlying under the new name whenever it re-keys an overlay onto it. See *Invariant: every staged overlay resolves to an underlying table at commit* above — a residual miss on a staged overlay is an `INTERNAL` error, never a silent discard.
+- **Open overlays are migrated, not bypassed.** Any per-connection overlay holding staged rows in the *old* column layout would be structurally inconsistent with the post-DDL schema, so `IsolationModule` migrates each affected overlay forward rather than ignoring it. `dropIndex` rebuilds each overlay under the post-drop schema (preserving rows + tombstones); `alterTable` translates every staged row to the new column layout. See *ALTER / DROP overlay poison* below.
+- **Open overlays are never orphaned, and never silently discarded.** `destroy` (DROP TABLE) discards the dropping connection's own overlay and every clean one, and **poisons** any foreign overlay holding staged rows; `renameTable` re-connects an underlying under the new name whenever it re-keys an overlay onto it. See *Invariant: every staged overlay resolves to an underlying table at commit* above — a residual miss on a staged, un-poisoned overlay is an `INTERNAL` error, never a silent discard.
 
-#### ALTER overlay migration & cross-connection poison
+#### ALTER / DROP overlay poison
+
+A **poisoned** overlay is one a cross-connection DDL left permanently unflushable. `ConnectionOverlayState.poison = { message }` records why. Two DDLs poison — `alterTable` (staged rows stuck in the pre-alter column layout) and `destroy` (the table itself is gone) — and both raise the same `StatusCode.CONSTRAINT`; the **message**, not the code, distinguishes them. The common guarantee: **no connection loses staged writes without being told.**
+
+##### ALTER: migrate, or poison
 
 `alterTable` is the one DDL that can change row shape (ADD/DROP COLUMN), so its overlay handling is the most involved. Because the underlying base auto-commits irreversibly, the blast radius is made **isolation-faithful**: an ALTER never depends on another connection's uncommitted data.
 
@@ -715,9 +724,19 @@ The affected overlays are partitioned into the **issuer's own** (the connection 
 2. **Validate issuer-own first (atomic abort).** The issuer's own overlay is dry-run validated (per-row `NOT NULL` backfill + tombstone-present guard) **before** the irreversible `underlying.alterTable`. Any throw here leaves underlying + catalog + every overlay untouched — the issuer's ALTER fails clean or fully applies. (The issuer staged both the data and the DDL, so rejecting up front is least-surprising and matches the engine's own pre-mutation `validateNotNullBackfill`.)
 3. **Mutate, then per-foreign migrate-or-poison.** After the underlying is altered, the issuer's own overlay migrates normally. Each foreign overlay is then validated individually: a per-row `NOT NULL` (`CONSTRAINT`) failure **poisons** that one overlay (`ConnectionOverlayState.poison = { message }`) and leaves its pre-alter rows in place; a healthy foreign overlay migrates forward. A layer-invariant failure (`INTERNAL`, e.g. a missing tombstone column) is **rethrown** loud for everyone rather than poisoned. Validation is per overlay, so one bad foreign overlay poisons only itself.
 
-**Observing poison.** A poisoned overlay still has `hasChanges === true`, so `IsolatedTable` errors (`QuereusError`, `CONSTRAINT`) at the data-op chokepoints — `update` (before staging), the *merged* branch of `query`, and the commit flush (`flushAndClearOverlay`) — but never on the committed-snapshot (`readCommitted`) read path, which bypasses the overlay and stays usable. This means a poisoned connection fails its next read/write/commit even if it never touches the table again, while a `committed.<table>` reader keeps working.
+##### DROP TABLE: discard, or poison
 
-**Poison lifecycle.** Poison is cleared only by discarding the `ConnectionOverlayState`: a **full rollback** (`onConnectionRollback`) or a rollback to a **pre-overlay savepoint** drops the overlay (and its poison). A rollback to a savepoint taken **after** the overlay existed does *not* replace the state, so poison correctly persists — the schema change is permanent and the overlay's rows are still in the pre-alter layout, so even if the offending row was rolled back the overlay stays structurally inconsistent until the transaction ends.
+`destroy` cannot migrate anything — the table is gone. It decides per overlay key (see the `destroy()` bullet under *Invariant: every staged overlay resolves to an underlying table at commit*): the **dropping connection's own** overlay is discarded silently, a **foreign dirty** overlay is poisoned and kept, a **foreign clean** overlay is discarded. Poisoning a kept overlay is what makes the commit path work unchanged: `commitConnectionOverlays` checks `state.poison` *before* the `underlyingTables` lookup, so the surviving overlay raises its poison message rather than the `INTERNAL` orphan error. An already-poisoned overlay keeps its **original** message — the first cause is the one worth reporting.
+
+The drop poison is deliberately over-strict for a connection that unwinds all its staged rows past the drop and could arguably commit clean: the poison rides on the `ConnectionOverlayState`, not on the rows. The table is gone either way, so failing is the safe answer.
+
+##### Observing poison
+
+A poisoned overlay always has `hasChanges === true`, so `IsolatedTable` errors (`QuereusError`, `CONSTRAINT`) at the data-op chokepoints — `update` (before staging), the *merged* branch of `query`, and the commit flush (`flushAndClearOverlay`) — but never on the committed-snapshot (`readCommitted`) read path, which bypasses the overlay and stays usable. This means a poisoned connection fails its next read/write/commit even if it never touches the table again, while a `committed.<table>` reader keeps working.
+
+##### Poison lifecycle
+
+Poison is cleared only by discarding the `ConnectionOverlayState`: a **full rollback** (`onConnectionRollback`) or a rollback to a **pre-overlay savepoint** drops the overlay (and its poison). A rollback to a savepoint taken **after** the overlay existed does *not* replace the state, so poison correctly persists — the DDL is permanent (pre-alter rows, or a table that no longer exists), so even if the offending row was rolled back the overlay stays unflushable until the transaction ends. Identical for both poison sources.
 
 A poisoned overlay must also never be carried through the layer's other overlay-rebuilding paths, which would copy its layout-mismatched rows and (because the rebuilt state carries no `poison`) silently un-poison a connection that must still roll back. Both such paths therefore **skip** a poisoned overlay, leaving it poisoned: `alterTable` skips it *before* the issuer/foreign split (so even the poisoned connection's own later ALTER does not migrate it), and `dropIndex` skips it in its post-drop rebuild loop. `renameTable` is safe as-is — it re-keys the state object in place, carrying the `poison` field along.
 
