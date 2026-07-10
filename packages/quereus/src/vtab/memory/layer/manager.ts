@@ -2163,6 +2163,13 @@ export class MemoryTableManager {
 			// reach here with re-keyed structures in place is `rebuildPrimaryTreeStrict`'s
 			// PK collision. The primary tree is only swapped on full success, so it is
 			// already the original.
+			//
+			// NOTE: a throw from the pre-pass (or from `setNotNull`'s NULL scan) mutated
+			// nothing, so this rebuild only swaps the base's index trees for fresh,
+			// content-identical ones — an O(rows) cost on a pure rejection. Harmless (a
+			// pending layer keeps reading its orphaned but content-correct copy-on-write
+			// base), but if a rejected ALTER on a large table ever shows up as slow, gate
+			// the rebuild on a "mutation started" flag set just before `updateSchema`.
 			this.baseLayer.updateSchema(originalManagerSchema);
 			this.baseLayer.rebuildAllSecondaryIndexes();
 			this.tableSchema = originalManagerSchema;

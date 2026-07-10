@@ -242,6 +242,12 @@ applied to it, and the case is only correct outside a transaction — see the
 transaction keep enforcing for the rest of it — `adoptSchema` adds and replaces structures, but
 never removes them; see `tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
 
+**Rule 1 assumes the transaction commits.** DDL is not undone by `ROLLBACK` or `ROLLBACK TO
+SAVEPOINT` (see `tickets/backlog/feat-ddl-transaction-capability.md`), but the rows it validated
+against *are*. Rolling back therefore restores rows the surviving index or collation forbids —
+a duplicate the transaction had deleted comes back under a unique index built while it was
+absent. Tracked in `tickets/backlog/bug-rolled-back-rows-violate-surviving-ddl.md`.
+
 ### Where the boundary sits
 
 The base layer's structures are populated from the base primary tree only, never from pending

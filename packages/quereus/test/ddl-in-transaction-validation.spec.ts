@@ -640,6 +640,49 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(collationOf('t', 'v')).to.equal('BINARY');
 			expect(getManager(db, 't').tableSchema.columns[1].collationExplicit).to.equal(true);
 		});
+
+		it('governs a table with no secondary indexes at all', async () => {
+			// `adoptSchema` returns early when the schema carries no indexes; the schema swap
+			// itself is what makes the rest of the transaction — and the committed head —
+			// compare under the new collation.
+			await db.exec(`create table p (id integer primary key, v text)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into p values (1, 'a')`);
+			await db.exec(`alter table p alter column v set collate nocase`);
+
+			expect(await scalar(db, `select count(*) as c from p where v = 'A'`)).to.equal(1);
+			await db.exec(`commit`);
+			expect(await scalar(db, `select count(*) as c from p where v = 'A'`)).to.equal(1);
+		});
+
+		it('re-keys an index that does not mention the altered column without breaking it', async () => {
+			// Every index gets a fresh MemoryIndex and BTree, including ones the collation
+			// change cannot affect — a layer that kept its old one would inherit an orphaned tree.
+			await db.exec(`create table m (id integer primary key, v text, w text)`);
+			await db.exec(`create unique index mv on m (v)`);
+			await db.exec(`create unique index mw on m (w)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into m values (1, 'a', 'x')`);
+			await db.exec(`alter table m alter column v set collate nocase`);
+
+			// `mw` still enforces and still resolves, inside the transaction and after commit.
+			await expectError(
+				() => db.exec(`insert into m values (2, 'b', 'x')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			expect(await scalar(db, `select count(*) as c from m where w = 'x'`)).to.equal(1);
+			await db.exec(`insert into m values (3, 'b', 'y')`);
+			await db.exec(`commit`);
+
+			expect(await rowCount(db, 'm')).to.equal(2);
+			expect(await scalar(db, `select count(*) as c from m where w = 'y'`)).to.equal(1);
+			await expectError(
+				() => db.exec(`insert into m values (4, 'c', 'x')`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+		});
 	});
 
 	describe('other connections', () => {
