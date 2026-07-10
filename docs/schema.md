@@ -375,18 +375,28 @@ secondary-index *column* values. The schema entry points:
 - **A PK column that can hold text but is not `isTextual`** — `any`, `json`, and the
   temporal types `date` / `time` / `datetime` / `timespan` — is keyed under **hard-coded
   `BINARY`**, never under its declared collation and never under K. Each of these logical
-  types supplies its own `compare`, and every one of them ignores the collation argument
-  `createTypedComparator` hands it, comparing under `BINARY_COLLATION` unconditionally;
-  `TEXT_TYPE` supplies no `compare` and so is the only one that reaches the
-  collation-honoring `compareSqlValuesFast`. Keying such a column under anything but BINARY
-  would enforce uniqueness under one collation and compare under another — `'A'` and `'a'`
-  are distinct BINARY values that would collide at one NOCASE key, so a second `insert`
-  would be spuriously rejected and an `insert or replace` would silently destroy the first
-  row. `create table t (k any collate nocase primary key)` is *accepted* (`ANY_TYPE` declares
+  types supplies its own `compare`, and none of them lets the collation argument
+  `createTypedComparator` hands it influence the result; `TEXT_TYPE.compare` is the only one
+  that applies it. Keying such a column under anything but BINARY would enforce uniqueness
+  under one collation and compare under another — `'A'` and `'a'` are distinct BINARY values
+  that would collide at one NOCASE key, so a second `insert` would be spuriously rejected and
+  an `insert or replace` would silently destroy the first row.
+  `create table t (k any collate nocase primary key)` is *accepted* (`ANY_TYPE` declares
   no `supportedCollations`), but the `nocase` is inert: it is honored neither in the key bytes
   nor in the comparison. Its one cost is that `pkOrderPreservingPrefixLength` compares the
   BINARY key collation against the declared NOCASE, finds them unequal, and conservatively
   declines the range seek — an optimization lost, never a row.
+
+- **What the PK-order advertisement is measured against.** A range seek and a
+  `providesOrdering` advertisement claim that memcmp over the key bytes reproduces the order
+  the planner's `Sort` would have produced. `Sort`, like every scalar comparison in the engine,
+  orders under the operand's *collation* (`compareSqlValuesFast`) and never through
+  `logicalType.compare`. So BINARY key bytes are order-faithful for these columns even where
+  the type's own `compare` says otherwise — `TIMESPAN.compare` ranks by `Temporal.Duration`
+  total (`PT90M` < `PT2H`) and `JSON_TYPE.compare` structurally (`{"a":2}` < `{"a":10}`), but
+  neither runs under `order by` or `where`. `MemoryTable` is the exception: its primary-key
+  BTree *is* keyed by `createTypedComparator`, so it advertises an order its own `Sort`
+  disagrees with. That is a memory-module defect, not a contract the store must match.
 
 - **CREATE.** `module.create` applies the store default K to an *implicit*-default text PK
   column (e.g. the engine's BINARY column default becomes NOCASE under K = NOCASE), so an

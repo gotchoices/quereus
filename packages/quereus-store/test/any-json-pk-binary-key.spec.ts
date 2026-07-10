@@ -2,17 +2,19 @@
  * A store PK column whose declared type can hold text but is not `isTextual` — `any`, `json`,
  * and the temporal types — is keyed under hard-coded BINARY.
  *
- * These types supply their own `logicalType.compare`, and every one of them discards the
- * collation argument `createTypedComparator` hands it, comparing under BINARY unconditionally.
- * `TEXT_TYPE` supplies no `compare` and so falls to the collation-honoring
- * `compareSqlValuesFast`. The store used to leave such a member's key collation `undefined`,
+ * These types supply their own `logicalType.compare`, and none of them lets the collation
+ * argument `createTypedComparator` hands it influence the result — `TEXT_TYPE.compare` is the
+ * only one that applies it. The store used to leave such a member's key collation `undefined`,
  * which `encodeValue` reads as "fall back to the table key collation K" (default NOCASE) —
  * enforcing PK uniqueness under NOCASE while the engine compared under BINARY. `'A'` and `'a'`
  * are distinct BINARY values that collided at one NOCASE key, so the second `insert` was
  * rejected and an `insert or replace` silently destroyed the first row.
  *
- * A memory table is the oracle throughout: it compares PK values purely through
- * `createTypedComparator`, which is the behavior the store must reproduce physically.
+ * A memory table is the oracle for UNIQUENESS throughout. It is NOT the oracle for PK ORDER of
+ * a `timespan` column: its primary-key BTree is keyed by `createTypedComparator`, so it
+ * advertises `TIMESPAN.compare`'s duration order while the planner's `Sort` — the order any
+ * advertisement is measured against — compares under the operand's collation. That divergence
+ * is `bug-memory-pk-btree-orders-by-logical-type-compare`, not the store's to reproduce.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
@@ -135,6 +137,20 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			expect((await db.get(`select count(*) as cnt from m`))?.cnt).to.equal(2);
 			expect((await db.get(`select v from t where k = 'A'`))?.v).to.equal('upper');
 		});
+
+		it('re-keys an `any` PK to the same BINARY bytes across `alter column … set collate`', async () => {
+			// `rekeyRows` resolves the key collation through `resolvePkKeyCollations` on both
+			// sides of the ALTER, and an ANY member pins BINARY regardless of what it declares.
+			// So the re-key is a no-op: both case-distinct rows must survive, and neither may
+			// collide at a NOCASE key on the way through.
+			await db.exec(`create table t (k any primary key, v text) using store`);
+			await db.exec(`insert into t values ('A', 'upper'), ('a', 'lower')`);
+
+			expect(await attempt(db, `alter table t alter column k set collate nocase`)).to.be.null;
+			expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(2);
+			expect((await db.get(`select v from t where k = 'A'`))?.v).to.equal('upper');
+			expect((await db.get(`select v from t where k = 'a'`))?.v).to.equal('lower');
+		});
 	});
 
 	describe('the read-side gate that BINARY keying un-declines', () => {
@@ -178,6 +194,27 @@ describe('PK columns that can hold text but are not textual are keyed under BINA
 			expect(await column(db, q, 'j'))
 				.to.deep.equal(await column(db, `select json_quote(j) as j from m order by j`, 'j'));
 			expect(await planOps(db, `select j from t order by j`)).to.not.match(/sort/i);
+		});
+
+		it('advertises the order a `Sort` would produce, not the one `logicalType.compare` defines', async () => {
+			// The advertisement's contract is "these rows arrive in the order the planner's Sort
+			// would have put them", and Sort compares under the operand's COLLATION. It never
+			// consults `logicalType.compare` — so `'PT2H'` precedes `'PT90M'` here, even though
+			// `TIMESPAN.compare` ranks by `Temporal.Duration` total and would say the reverse.
+			// The byte order the store advertises is exactly the order Sort produces.
+			await db.exec(`create table t (d timespan primary key) using store`);
+			await db.exec(`create table sorted (id integer primary key, d timespan) using store`);
+			await db.exec(`insert into t values ('PT2H'), ('PT90M')`);
+			await db.exec(`insert into sorted values (1, 'PT2H'), (2, 'PT90M')`);
+
+			const advertised = await column(db, `select d from t order by d`, 'd');
+			expect(await planOps(db, `select d from t order by d`), 'the advertisement elides the Sort')
+				.to.not.match(/sort/i);
+
+			// `sorted` has an integer PK, so `order by d` must run a real Sort. Same order.
+			expect(await planOps(db, `select d from sorted order by d`)).to.match(/sort/i);
+			expect(advertised).to.deep.equal(await column(db, `select d from sorted order by d`, 'd'));
+			expect(advertised).to.deep.equal(['PT2H', 'PT90M']);
 		});
 	});
 });

@@ -135,14 +135,16 @@ export function resolvePkKeyCollations(
 	return pkDef.map(def => {
 		const col = columns[def.index];
 		if (!col || !columnCanHoldText(col)) return undefined;
-		// A text-capable-but-not-`isTextual` type supplies its own `compare`, and every one of
-		// them (ANY_TYPE, JSON_TYPE, the temporal types) DISCARDS the collation argument
-		// `createTypedComparator` hands it, comparing under BINARY_COLLATION unconditionally.
-		// TEXT_TYPE supplies no `compare` at all, so text alone reaches the collation-honoring
-		// `compareSqlValuesFast`. Keying these members under the column's declared collation
-		// (which `validateCollationForType` accepts for ANY, since its `supportedCollations` is
-		// undefined) or under K would enforce uniqueness under a collation nothing compares
-		// under: `'A'` and `'a'` are distinct BINARY values that collide at one NOCASE key.
+		// A text-capable-but-not-`isTextual` type supplies its own `logicalType.compare`, which
+		// `createTypedComparator` calls WITHOUT letting the collation influence the result:
+		// ANY_TYPE compares under `BINARY_COLLATION`, the temporal types under `BINARY_COLLATION`
+		// or a semantic order, JSON_TYPE structurally. `TEXT_TYPE.compare` is the only one that
+		// applies the collation it is handed. Keying these members under the column's declared
+		// collation (which `validateCollationForType` accepts for ANY, since its
+		// `supportedCollations` is undefined) or under K would enforce uniqueness under a
+		// collation nothing compares under: `'A'` and `'a'` are distinct BINARY values that
+		// collide at one NOCASE key. BINARY is the only key collation that never conflates two
+		// values the comparator calls distinct.
 		if (!col.logicalType.isTextual) return 'BINARY';
 		return (col.collation || fallback).toUpperCase();
 	});
@@ -209,6 +211,15 @@ export function keyOrderMatchesCollation(
  * outright — `tableKeyCollation` is passed only so the exempt branch has a name to ignore.
  * The comparison collation is the column's declared one, which `reconcilePkCollations` has
  * already aligned with the key collation for every *textual* PK member.
+ *
+ * What the advertisement is measured against is the order the planner's `Sort` would have
+ * produced, and `Sort` (like every scalar comparison) orders under the operand's COLLATION via
+ * `compareSqlValuesFast` — never through `logicalType.compare`. So a collation match is the
+ * whole question, even for a member whose type declares a `compare` that orders differently
+ * (`TIMESPAN.compare` ranks by `Temporal.Duration` total, `JSON_TYPE.compare` structurally).
+ * `MemoryTable`, whose primary-key BTree *is* keyed by `createTypedComparator`, advertises the
+ * type's order instead and so disagrees with its own `Sort` — tracked as
+ * `bug-memory-pk-btree-orders-by-logical-type-compare`, not something the store should copy.
  *
  * `0` ⇒ even the leading member is unsafe: no range seek, no PK-order advertisement.
  * A prefix shorter than the PK truncates the ordering advertisement rather than voiding it.
