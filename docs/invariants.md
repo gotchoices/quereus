@@ -365,12 +365,13 @@ the guard rather than maintain it.
 
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `addFd`
 - code: `packages/quereus/src/planner/util/fd-utils.ts` — `MAX_FDS_PER_NODE`
-- guard: none — no behavioural test exercises the subsumption or cap-eviction ordering directly; a wrong preference silently drops a uniqueness witness rather than crashing.
+- guard: `packages/quereus/test/optimizer/fd-propagation.spec.ts` — `OPT-047: addFd dedupes by subsumption and evicts by key/kind preference`
 - doc: [Functional Dependencies § Helper surface](optimizer-fd.md#helper-surface)
 
 `addFd` performs subsumption before appending: an existing same-determinant, same-guard FD
 whose dependents are a subset of the newcomer's is dropped, and a newcomer already subsumed
-by an existing FD is skipped. It also enforces `MAX_FDS_PER_NODE = 64`; cap eviction keeps
+by an existing FD is skipped; a dropped-or-subsumed `'unique'` twin upgrades the survivor's
+kind. It also enforces `MAX_FDS_PER_NODE = 64`; cap eviction keeps
 FDs whose determinants lie inside a caller-supplied `keyHints` set first, and within each
 partition prefers `'unique'` over `'determination'` — evicting a uniqueness witness is sound
 but causes downstream under-claims. Truncations log on `quereus:planner:fd`.

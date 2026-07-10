@@ -388,7 +388,7 @@ Predicates `predicateImpliesGuard` recognizes today: `col = literal` / `col = co
 
 ## Helper surface
 
-> **Invariant:** [OPT-046](invariants.md#opt-046--addfd-is-the-only-fd-accumulation-path)
+> **Invariant:** [OPT-046](invariants.md#opt-046--addfd-is-the-only-fd-accumulation-path), [OPT-047](invariants.md#opt-047--addfd-deduplicates-by-subsumption-and-evicts-by-keykind-preference)
 
 In `planner/util/fd-utils.ts`:
 

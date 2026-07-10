@@ -187,7 +187,7 @@ describe('fd-utils', () => {
 		});
 	});
 
-	describe('addFd / mergeFds', () => {
+	describe('OPT-047: addFd dedupes by subsumption and evicts by key/kind preference', () => {
 		it('dedupes identical FDs', () => {
 			const fds: FunctionalDependency[] = [{ determinants: [1], dependents: [2], kind: 'determination' }];
 			const out = addFd(fds, { determinants: [1], dependents: [2], kind: 'determination' });
@@ -213,6 +213,38 @@ describe('fd-utils', () => {
 			const b: FunctionalDependency[] = [{ determinants: [3], dependents: [4], kind: 'determination' }];
 			const out = mergeFds(a, b);
 			expect(out).to.have.length(2);
+		});
+
+		it('cap eviction keeps FDs whose determinants lie inside a keyHints set, even over a unique', () => {
+			const fds: FunctionalDependency[] = [
+				{ determinants: [1], dependents: [9], kind: 'determination' },
+				{ determinants: [2], dependents: [9], kind: 'unique' },
+			];
+			const out = addFd(fds, { determinants: [3], dependents: [9], kind: 'unique' }, { cap: 1, keyHints: [[1]] });
+			expect(out).to.have.length(1);
+			expect(out[0].determinants).to.deep.equal([1]);
+		});
+
+		it('cap eviction prefers unique over determination within a partition', () => {
+			const fds: FunctionalDependency[] = [
+				{ determinants: [1], dependents: [9], kind: 'determination' },
+				{ determinants: [2], dependents: [9], kind: 'unique' },
+			];
+			const out = addFd(fds, { determinants: [3], dependents: [9], kind: 'determination' }, { cap: 2 });
+			expect(out).to.have.length(2);
+			expect(out[0].kind).to.equal('unique');
+			expect(out[0].determinants).to.deep.equal([2]);
+		});
+
+		it('cap eviction ranks key-hinted determinations ahead of non-hinted uniques', () => {
+			const fds: FunctionalDependency[] = [
+				{ determinants: [2], dependents: [9], kind: 'unique' },
+				{ determinants: [1], dependents: [9], kind: 'determination' },
+			];
+			const out = addFd(fds, { determinants: [3], dependents: [9], kind: 'unique' }, { cap: 2, keyHints: [[1]] });
+			expect(out).to.have.length(2);
+			expect(out[0].determinants).to.deep.equal([1]);
+			expect(out[1].kind).to.equal('unique');
 		});
 	});
 

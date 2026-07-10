@@ -161,7 +161,7 @@ at the producing `Filter`'s `computePhysical`, via `predicateImpliesGuard` + `st
 Crossing a Project / Returning / Aggregate / join boundary, translate via `projectFds` /
 `shiftFds` and their EC / binding / domain / IND mirrors instead of hand-mapping indices.
 
-> **Invariant:** [OPT-046](invariants.md#opt-046--addfd-is-the-only-fd-accumulation-path)
+> **Invariant:** [OPT-046](invariants.md#opt-046--addfd-is-the-only-fd-accumulation-path), [OPT-047](invariants.md#opt-047--addfd-deduplicates-by-subsumption-and-evicts-by-keykind-preference)
 
 Accumulate with `addFd`, not `Array.push`. Pass `{ keyHints }` listing column-index sets known
 to be keys so cap eviction prefers to keep them; truncations log on the `quereus:planner:fd`

@@ -612,7 +612,7 @@ to propagate `readonly=false`.
 
 ### The two declarations
 
-> **Invariant:** [OPT-002](invariants.md#opt-002--an-aware-rule-consults-the-side-effect-signal)
+> **Invariant:** [OPT-002](invariants.md#opt-002--an-aware-rule-consults-the-side-effect-signal), [OPT-003](invariants.md#opt-003--a-static-guard-checks-every-aware-rules-source-for-a-purity-signal)
 
 - `'safe'` — the rule never moves, duplicates, drops, or merges any
   subtree it does not separately verify pure. Annotation-only transforms,
