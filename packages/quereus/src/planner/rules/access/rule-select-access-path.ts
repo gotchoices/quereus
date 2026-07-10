@@ -513,10 +513,10 @@ function selectPhysicalNodeFromPlan(
 				constraint: { iColumn: colIdx, op: IndexConstraintOp.EQ, usable: true },
 				argvIndex: i + 1,
 			}));
-				const fi = makeIndexFilterInfo(
-					filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'multiSeek', inConstraints,
-					new Map([['inCount', String(seekKeys.length)]]),
-				);
+			const fi = makeIndexFilterInfo(
+				filterInfo, tableRef.tableSchema, accessPlan, idxStrName, 'multiSeek', inConstraints,
+				new Map([['inCount', String(seekKeys.length)]]),
+			);
 
 			log('Using index multi-seek on %s (IN with %d values)', physicalIndexName, seekKeys.length);
 			return finishSeek(new IndexSeekNode(
