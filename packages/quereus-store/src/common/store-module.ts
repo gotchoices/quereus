@@ -170,6 +170,17 @@ function equalityRoles(colIdxs: readonly number[]): SeekRole[] {
 }
 
 /**
+ * Result of an {@link StoreModule.alterColumnChange} attribute sub-branch: the rewritten
+ * column schema plus whether the collation BYTES changed (which gates the existing-row
+ * UNIQUE re-validation and the PK physical re-key). A sub-branch returns null instead when
+ * the column is already in the desired state, so the caller returns the schema untouched.
+ */
+interface AlterColumnAttrChange {
+	newCol: ColumnSchema;
+	collationChanged: boolean;
+}
+
+/**
  * Generic store module that works with any KVStoreProvider.
  *
  * Usage:
@@ -1230,9 +1241,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Alters an existing store table's structure (ADD/DROP/RENAME COLUMN).
-	 * Performs eager row migration for ADD and DROP, schema-only update for RENAME.
-	 * Returns the updated TableSchema for the engine to register.
+	 * Alters an existing store table's structure. Resolves the table, captures the
+	 * pre-alter schema, and dispatches to the per-change-type `alter*` helper below;
+	 * the helper does the arm's work (row migration, physical re-key, constraint
+	 * validation, DDL persist) and returns the updated TableSchema for the engine to
+	 * register. The shared preamble (schema subscription, reconnect, not-found throw,
+	 * `defaultNotNull`) lives here so every arm sees the same resolved state.
 	 */
 	async alterTable(
 		db: Database,
@@ -1255,648 +1269,792 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
 
 		switch (change.type) {
-			case 'addColumn': {
-				// Honor the session `default_collation` for an ADD COLUMN that omits an
-				// explicit COLLATE, matching the CREATE path so an ADD-COLUMN-ed text column
-				// gets the same collation a CREATE-d one would. The persisted DDL re-emits an
-				// explicit COLLATE for any non-BINARY collation, so reopen stays stable.
-				const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'));
+			case 'addColumn':
+				return this.alterAddColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
+			case 'dropColumn':
+				return this.alterDropColumn(schemaName, tableName, table, oldSchema, change);
+			case 'renameColumn':
+				return this.alterRenameColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
+			case 'alterPrimaryKey':
+				return this.alterPrimaryKeyChange(db, schemaName, tableName, table, oldSchema, change);
+			case 'addConstraint':
+				return this.alterAddConstraint(db, schemaName, tableName, table, oldSchema, change, rows);
+			case 'dropConstraint':
+				return this.alterDropConstraint(schemaName, tableName, table, oldSchema, change);
+			case 'renameConstraint':
+				return this.alterRenameConstraint(schemaName, tableName, table, oldSchema, change);
+			case 'alterColumn':
+				return this.alterColumnChange(db, schemaName, tableName, table, oldSchema, change, rows);
+		}
+	}
 
-				// Extract default value from column def constraints. Use the shared
-				// `tryFoldLiteral` helper so signed numerics like `-123.0`
-				// (a UnaryExpr in the AST) are recognized — matching the
-				// memory-mode path and the engine-level ALTER validation.
-				let defaultValue: SqlValue = null;
-				const defaultConstraint = change.columnDef.constraints?.find(c => c.type === 'default');
-				if (defaultConstraint?.expr) {
-					const folded = tryFoldLiteral(defaultConstraint.expr);
-					if (folded !== undefined) {
-						defaultValue = folded;
-					}
-				}
+	/**
+	 * ADD COLUMN arm of {@link alterTable}: append the new column, eagerly migrate
+	 * each row (literal or per-row backfill), and persist. Behavior-preserving
+	 * extraction of the former `switch` arm.
+	 */
+	private async alterAddColumn(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'addColumn' }>,
+		defaultNotNull: boolean,
+	): Promise<TableSchema> {
+		// Honor the session `default_collation` for an ADD COLUMN that omits an
+		// explicit COLLATE, matching the CREATE path so an ADD-COLUMN-ed text column
+		// gets the same collation a CREATE-d one would. The persisted DDL re-emits an
+		// explicit COLLATE for any non-BINARY collation, so reopen stays stable.
+		const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'));
 
-				// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
-				// its own value via the engine-supplied evaluator (mirrors the memory path).
-				const backfillEvaluator = change.backfillEvaluator;
-
-				// Refuse NOT NULL without a usable DEFAULT on a non-empty table
-				// (SQLite-compatible). A per-row evaluator IS usable — its NOT NULL is enforced
-				// per row during migration — so it is exempt from this no-default rejection.
-				if (newColSchema.notNull && defaultValue === null && !backfillEvaluator) {
-					if (await table.hasAnyRows()) {
-						throw new QuereusError(
-							`Cannot add NOT NULL column '${newColSchema.name}' to non-empty table `
-								+ `'${schemaName}.${tableName}' without a DEFAULT value`,
-							StatusCode.CONSTRAINT,
-						);
-					}
-				}
-
-				// Build updated schema: append new column
-				const updatedColumns: ReadonlyArray<ColumnSchema> = Object.freeze([...oldSchema.columns, newColSchema]);
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: updatedColumns,
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-				};
-
-				// Extract any column-level CHECK / FK to persist (see the persist block below).
-				// Hoisted above the row migration so a malformed constraint (e.g. a multi-column
-				// FK on a single ADD COLUMN, which `extractColumnLevelForeignKeys` rejects) throws
-				// BEFORE any rows are migrated or the in-memory schema is swapped — validate-before-
-				// mutate, matching the engine's ordering in `runAddColumn`.
-				const newCheckConstraints = extractColumnLevelCheckConstraints(change.columnDef);
-				const newForeignKeys = extractColumnLevelForeignKeys(change.columnDef, schemaName);
-
-				// Physical rewrite ahead: flush the module's buffered writes so `migrateRows`
-				// (a committed-store scan + batch) sees this transaction's rows and re-encodes
-				// them under the new column layout. See {@link ddlCommitPendingOps}. Placed
-				// after every throw-only check above — the NOT NULL rejection reads effectively
-				// (`hasAnyRows`) and `extractColumnLevel*` reads no rows — so a rejected ALTER
-				// leaves the enclosing transaction intact.
-				await this.ddlCommitPendingOps();
-
-				// Migrate rows: append the new column's value — a single literal default, or a
-				// per-row value derived from the existing row when a backfill evaluator is set.
-				const remap = buildColumnRemap(
-					oldSchema.columns.map(c => c.name),
-					updatedColumns.map(c => c.name),
-				);
-				await table.migrateRows(
-					remap,
-					defaultValue,
-					backfillEvaluator
-						? { evaluator: backfillEvaluator, notNull: newColSchema.notNull, columnName: newColSchema.name }
-						: undefined,
-				);
-
-				// Update table schema (column-only) and persist DDL.
-				//
-				// The engine's `runAddColumn` re-merges the column-level FK/CHECK extracted
-				// from `columnDef.constraints` into the LIVE in-memory schema AFTER this hook
-				// returns, so the schema handed back to it must stay column-only — returning a
-				// constrained schema would double the constraint in the live SchemaManager (and,
-				// on the next persist, in the DDL). But that engine-side merge is in-memory only:
-				// it never reaches the catalog, so persistence must carry the column-level
-				// CHECK/FK itself or they vanish on `rehydrateCatalog`. Build a separate
-				// `persistedSchema` for `saveTableDDL` when (and only when) the column declares
-				// such a constraint; the common path persists `updatedSchema` unchanged. This is
-				// unconditional on the default kind — a per-row (evaluator) DEFAULT extracts the
-				// same AST constraints as a literal one.
-				table.updateSchema(updatedSchema);
-
-				let persistedSchema = updatedSchema;
-				if (newCheckConstraints.length > 0 || newForeignKeys.length > 0) {
-					// The new column is appended last; resolve each FK's child column to its index
-					// (matching how the engine resolves `resolvedForeignKeys` via columnIndexMap).
-					const newColIdx = updatedColumns.length - 1;
-					const resolvedForeignKeys = newForeignKeys.map(fk => ({ ...fk, columns: Object.freeze([newColIdx]) }));
-					persistedSchema = {
-						...updatedSchema,
-						checkConstraints: Object.freeze([...updatedSchema.checkConstraints, ...newCheckConstraints]),
-						foreignKeys: Object.freeze([...(updatedSchema.foreignKeys ?? []), ...resolvedForeignKeys]),
-					};
-				}
-				await this.saveTableDDL(persistedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'dropColumn': {
-				const colNameLower = change.columnName.toLowerCase();
-				const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === colNameLower);
-				if (colIndex === -1) {
-					throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
-				}
-
-				// Build updated schema: remove column and reindex PK/indexes
-				// Filter by original index BEFORE remapping to avoid incorrectly
-				// removing columns that remap to the dropped column's position.
-				const updatedColumns = oldSchema.columns.filter((_, idx) => idx !== colIndex);
-				const updatedPkDef = oldSchema.primaryKeyDefinition
-					.filter(def => def.index !== colIndex)
-					.map(def => ({
-						...def,
-						index: def.index > colIndex ? def.index - 1 : def.index,
-					}));
-				const updatedIndexes = (oldSchema.indexes || [])
-					.map(idx => ({
-						...idx,
-						columns: idx.columns
-							.filter(ic => ic.index !== colIndex)
-							.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index })),
-					}))
-					.filter(idx => idx.columns.length > 0);
-
-				// Prune any UNIQUE constraint over the dropped column, mirroring the index
-				// filtering above. Store-backed UNIQUE is enforced by a full scan over
-				// `uniqueConstraints`, so a stranded constraint whose column index dangles past
-				// the column array would break the next insert's validation (and the persisted
-				// DDL). A UNIQUE that includes the dropped column is removed outright; remaining
-				// constraints have their column indices shifted to track the removed slot. This
-				// also covers the engine's ADD COLUMN + inline-UNIQUE revert, which drops the
-				// just-added (uniquely-constrained) column.
-				const updatedUniqueConstraints = (oldSchema.uniqueConstraints ?? [])
-					.filter(uc => !uc.columns.includes(colIndex))
-					.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
-
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: Object.freeze(updatedColumns),
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-					primaryKeyDefinition: Object.freeze(updatedPkDef),
-					indexes: Object.freeze(updatedIndexes),
-					uniqueConstraints: updatedUniqueConstraints.length > 0
-						? Object.freeze(updatedUniqueConstraints)
-						: undefined,
-				};
-
-				// Physical rewrite ahead — flush buffered writes so `migrateRows` re-encodes
-				// this transaction's rows too. See {@link ddlCommitPendingOps}.
-				await this.ddlCommitPendingOps();
-
-				// Migrate rows: remove the dropped column slot
-				const remap = buildColumnRemap(
-					oldSchema.columns.map(c => c.name),
-					updatedColumns.map(c => c.name),
-				);
-				await table.migrateRows(remap, null);
-
-				// Update table schema and persist DDL
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'renameColumn': {
-				if (!change.newColumnDefAst) {
-					throw new QuereusError('RENAME COLUMN requires a new column definition AST', StatusCode.INTERNAL);
-				}
-
-				const oldNameLower = change.oldName.toLowerCase();
-				const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === oldNameLower);
-				if (colIndex === -1) {
-					throw new QuereusError(`Column '${change.oldName}' not found.`, StatusCode.ERROR);
-				}
-
-				const newColSchema = columnDefToSchema(change.newColumnDefAst, defaultNotNull);
-				const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newColSchema : c);
-				const updatedIndexes = (oldSchema.indexes || []).map(idx => ({
-					...idx,
-					columns: idx.columns.map(ic =>
-						ic.index === colIndex ? { ...ic, name: change.newName } : ic
-					),
-				}));
-
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: Object.freeze(updatedColumns),
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-					indexes: Object.freeze(updatedIndexes),
-					// A self-referencing FK names the renamed column in `referencedColumnNames`
-					// and is persisted by name; the engine rewrites it only in the post-hook
-					// pass. Pure copy — no rollback needed, this schema is only adopted on the
-					// success path.
-					foreignKeys: renameColumnInSelfForeignKeys(
-						oldSchema.foreignKeys, schemaName, tableName, change.oldName, change.newName),
-				};
-
-				// A partial index's WHERE clause and a CHECK constraint's expression both
-				// still name the OLD column: the engine's `propagateColumnRename` pass runs
-				// only after this hook returns. Persisting now would durably write a bundle
-				// naming a column the table no longer has, and only the later propagation's
-				// `table_modified` event would correct it — a crash in between leaves the
-				// catalog un-rehydratable. So rewrite first, in place: each `Expression` is
-				// shared by reference with the catalog's `TableSchema` and, for a unique
-				// partial index, with the `derivedFromIndex` UNIQUE constraint, so one
-				// rewrite covers all holders and makes the later propagation pass a no-op.
-				//
-				// The rewrites are the first statements in the `try`, and each walks its
-				// collection one item at a time, so a throw anywhere — including partway
-				// through a walk — must reverse them: restoring `oldSchema` cannot, since the
-				// ASTs are shared. Reversing is a no-op wherever nothing names the new column,
-				// and the engine has already rejected a rename onto an existing column name,
-				// so the reverse pass cannot collide with an expression that legitimately
-				// named it.
-				const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
-					db.schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
-				const rewriteColumn = (from: string, to: string): void => {
-					renameColumnInIndexPredicates(
-						updatedIndexes, tableName, from, to, schemaName, resolveColumnInSource);
-					renameColumnInCheckConstraints(
-						oldSchema.checkConstraints, tableName, from, to, schemaName, resolveColumnInSource);
-				};
-				try {
-					rewriteColumn(change.oldName, change.newName);
-
-					// Rename is schema-only — no row migration needed
-					table.updateSchema(updatedSchema);
-					await this.saveTableDDL(updatedSchema);
-				} catch (e) {
-					rewriteColumn(change.newName, change.oldName);
-					throw e;
-				}
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'alterPrimaryKey': {
-				const newPkColumns = change.newPkColumns;
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					primaryKeyDefinition: Object.freeze(
-						newPkColumns.map(pk => ({ index: pk.index, desc: pk.desc })),
-					),
-				};
-
-				// Physical re-key ahead — flush buffered writes so every live row is
-				// re-keyed and no stale-schema op replays over the rewritten store.
-				// `rekeyRows`' duplicate-key pass runs against the flushed store, so a
-				// pending insert that collides under the new PK is caught. See
-				// {@link ddlCommitPendingOps} for the transaction consequences.
-				await this.ddlCommitPendingOps();
-
-				// Re-key the data store. Throws CONSTRAINT on duplicates without
-				// mutating the store, giving us all-or-nothing semantics for the
-				// validation phase.
-				await table.rekeyRows(newPkColumns);
-
-				// Secondary index keys embed the PK suffix — clear + rebuild every
-				// index against the now-rekeyed data store.
-				await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
-
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'addConstraint': {
-				const constraint = change.constraint;
-				let updatedSchema: TableSchema;
-
-				if (constraint.type === 'unique') {
-					// Store enforces inline UNIQUE by full-scan over `uniqueConstraints`
-					// (no separate index store), so there is nothing physical to build —
-					// but we must validate the existing rows before persisting.
-					//
-					// No `ddlCommitPendingOps()` here (unlike the row-rewriting arms): this
-					// writes no rows, and the validation scan already reads effectively, so
-					// the transaction survives a CONSTRAINT rejection.
-					const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
-					await this.validateUniqueOverExistingRows(
-						rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
-						oldSchema,
-						uc,
-						db.getKeyNormalizerResolver(),
-					);
-					updatedSchema = {
-						...oldSchema,
-						uniqueConstraints: Object.freeze([...(oldSchema.uniqueConstraints ?? []), uc]),
-					};
-				} else if (constraint.type === 'foreignKey') {
-					const fk = buildForeignKeyConstraintSchema(constraint, oldSchema.columnIndexMap, oldSchema.name, oldSchema.schemaName);
-					updatedSchema = {
-						...oldSchema,
-						foreignKeys: Object.freeze([...(oldSchema.foreignKeys ?? []), fk]),
-					};
-					// Pragma-gated existing-row validation; throws before persistence on an orphan.
-					await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
-				} else if (constraint.type === 'check') {
-					// Schema-only: a CHECK has no physical structure and (matching the
-					// engine's prior in-emitter behavior) no existing-row scan. Routing it
-					// here — rather than catalog-only — keeps the persisted DDL and the
-					// connected-table schema in lock-step so DROP/RENAME CONSTRAINT resolve it.
-					const check = buildCheckConstraintSchema(constraint, oldSchema.checkConstraints.length);
-					updatedSchema = {
-						...oldSchema,
-						checkConstraints: Object.freeze([...oldSchema.checkConstraints, check]),
-					};
-				} else {
-					throw new QuereusError(
-						`Store table ADD CONSTRAINT does not support constraint type '${constraint.type}'`,
-						StatusCode.UNSUPPORTED,
-					);
-				}
-
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'dropConstraint': {
-				// Schema-only catalog rewrite: store-backed UNIQUE enforcement is a
-				// full-scan over `uniqueConstraints` (no separate index store for an
-				// inline UNIQUE), so dropping the constraint stops enforcement with no
-				// physical teardown. A UNIQUE derived from a CREATE UNIQUE INDEX is
-				// rejected upstream (drop the index instead), so we never strand a store.
-				const constraintClass = resolveNamedConstraintClass(oldSchema, change.constraintName);
-				const lower = change.constraintName.toLowerCase();
-				let updatedSchema: TableSchema;
-				if (constraintClass === 'check') {
-					updatedSchema = {
-						...oldSchema,
-						checkConstraints: Object.freeze(oldSchema.checkConstraints.filter(c => c.name?.toLowerCase() !== lower)),
-					};
-				} else if (constraintClass === 'foreignKey') {
-					const remaining = (oldSchema.foreignKeys ?? []).filter(c => c.name?.toLowerCase() !== lower);
-					updatedSchema = { ...oldSchema, foreignKeys: remaining.length > 0 ? Object.freeze(remaining) : undefined };
-				} else {
-					const remaining = (oldSchema.uniqueConstraints ?? []).filter(c => c.name?.toLowerCase() !== lower);
-					updatedSchema = { ...oldSchema, uniqueConstraints: remaining.length > 0 ? Object.freeze(remaining) : undefined };
-				}
-
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'renameConstraint': {
-				const constraintClass = resolveNamedConstraintClass(oldSchema, change.oldName);
-				const oldLower = change.oldName.toLowerCase();
-				let updatedSchema: TableSchema;
-				if (constraintClass === 'check') {
-					updatedSchema = {
-						...oldSchema,
-						checkConstraints: Object.freeze(
-							oldSchema.checkConstraints.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
-						),
-					};
-				} else if (constraintClass === 'foreignKey') {
-					updatedSchema = {
-						...oldSchema,
-						foreignKeys: Object.freeze(
-							oldSchema.foreignKeys!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
-						),
-					};
-				} else {
-					updatedSchema = {
-						...oldSchema,
-						uniqueConstraints: Object.freeze(
-							oldSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
-						),
-					};
-				}
-
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
-			}
-
-			case 'alterColumn': {
-				const colNameLower = change.columnName.toLowerCase();
-				const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === colNameLower);
-				if (colIndex === -1) {
-					throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
-				}
-				const oldCol = oldSchema.columns[colIndex];
-				let newCol: ColumnSchema = oldCol;
-				// A collation change needs existing-row UNIQUE re-validation below
-				// (non-PK, Option A); the other attribute changes do not.
-				let collationChanged = false;
-
-				// Pull exactly one of the three attributes from the change.
-				if (change.setNotNull !== undefined) {
-					if (change.setNotNull === true && !oldCol.notNull) {
-						// Backfill NULLs from a literal DEFAULT, or throw.
-						let defaultLiteral: SqlValue | undefined;
-						const expr = oldCol.defaultValue;
-						if (expr && (expr as { type?: string }).type === 'literal') {
-							defaultLiteral = (expr as { value?: SqlValue }).value ?? null;
-						}
-						// Reads effectively, so a row this transaction inserted with a NULL is
-						// seen — it is backfilled (or rejects the ALTER) like any other row.
-						const nullCount = await table.rowsWithNullAtIndex(colIndex);
-						if (nullCount > 0) {
-							if (defaultLiteral === undefined || defaultLiteral === null) {
-								// Throw-only, and before the DDL-commit below: the transaction survives.
-								throw new QuereusError(
-									`column ${change.columnName} contains NULL values`,
-									StatusCode.CONSTRAINT,
-								);
-							}
-							const fill = defaultLiteral;
-							// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex`
-							// backfills this transaction's NULL rows too (the probe above saw
-							// them; a committed-store rewrite cannot). See {@link ddlCommitPendingOps}.
-							await this.ddlCommitPendingOps();
-							await table.mapRowsAtIndex(colIndex, (v) => v === null ? fill : v);
-						}
-						newCol = { ...oldCol, notNull: true };
-					} else if (change.setNotNull === false && oldCol.notNull) {
-						if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-							throw new QuereusError(
-								`Cannot DROP NOT NULL on PRIMARY KEY column '${change.columnName}'`,
-								StatusCode.CONSTRAINT,
-							);
-						}
-						newCol = { ...oldCol, notNull: false };
-					} else {
-						return oldSchema; // already in desired state
-					}
-				} else if (change.setDataType !== undefined) {
-					const newLogicalType = inferType(change.setDataType);
-					if (newLogicalType.physicalType !== oldCol.logicalType.physicalType) {
-						// Physical conversion required — walk every row and attempt parse.
-						const convert = (v: SqlValue): SqlValue => {
-							try {
-								return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
-							} catch {
-								throw new QuereusError(
-									`Cannot convert value in '${change.columnName}' to ${change.setDataType}`,
-									StatusCode.MISMATCH,
-								);
-							}
-						};
-						// Throw-only pass over the LIVE rows first, so an unconvertible value
-						// this transaction inserted rejects the ALTER with the transaction still
-						// intact. The rewrite below reads only committed rows.
-						for await (const value of table.iterateEffectiveValuesAtIndex(colIndex)) {
-							if (value !== null) convert(value);
-						}
-						// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex`
-						// converts this transaction's rows too; unflushed, they would replay
-						// under the OLD physical type. See {@link ddlCommitPendingOps}.
-						await this.ddlCommitPendingOps();
-						await table.mapRowsAtIndex(colIndex, (v) => v === null ? v : convert(v));
-					}
-					newCol = { ...oldCol, logicalType: newLogicalType };
-				} else if (change.setDefault !== undefined) {
-					newCol = { ...oldCol, defaultValue: change.setDefault };
-				} else if (change.setCollation !== undefined) {
-					// Per-column collation update. PRIMARY KEY uniqueness/ordering is enforced
-					// PHYSICALLY in the key bytes under a PER-COLUMN key collation
-					// (`StoreTable.pkKeyCollations`), so a PK-column SET COLLATE is honored
-					// natively by physically re-keying the data store + rebuilding every
-					// secondary index under the new collation (the `isPkColumn` block below),
-					// mirroring the memory module's primary re-key. A re-key that would collide
-					// under the new collation throws CONSTRAINT before any mutation. For non-PK
-					// UNIQUE constraints we re-validate existing rows under the new collation
-					// (Option A). Query-layer ORDER BY / `=` / `table_info().collation` pick the
-					// new collation up from the column schema once this updated schema re-registers.
-					const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
-					const nameMatches = normalized === (oldCol.collation || 'BINARY');
-					if (nameMatches && oldCol.collationExplicit) {
-						return oldSchema; // already explicit in the desired collation — no scan, no re-key, no re-persist
-					}
-					// SET COLLATE is a user declaration with the same standing as a
-					// CREATE-time COLLATE clause, so mark the collation explicit (rank 2
-					// in the comparison lattice) regardless of the column's creation
-					// history — including SET COLLATE binary. When only the name matches
-					// but the column was not yet explicit (a defaulted collation, or one
-					// inherited from session default_collation), flip the flag as a
-					// METADATA-ONLY change: the collation bytes are unchanged, so keep
-					// collationChanged false to skip rekeyRows / validateUniqueOverExistingRows
-					// below while still re-registering the schema and re-persisting DDL.
-					// A different name takes the full physical re-key path AND sets the flag.
-					newCol = { ...oldCol, collation: normalized, collationExplicit: true };
-					collationChanged = !nameMatches;
-				} else {
-					throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
-				}
-
-				const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newCol : c);
-				// Mirror the memory module (MemoryTableManager.alterColumn): a per-column
-				// collation change propagates into every index column ordering by this
-				// column, so a `derivedFromIndex` UNIQUE re-keys its enforcement under the
-				// new collation. StoreTable.uniqueEnforcementCollations reads the index's
-				// per-column collation, so without this the index entry would stay stale
-				// and the derived UNIQUE would keep enforcing the OLD collation after the
-				// ALTER. Metadata-only: the store's index KEY bytes use the table-level key
-				// collation K (see buildIndexEntries / updateSecondaryIndexes), so no index
-				// entry re-encode is required for a non-PK column. An index column with an
-				// explicit COLLATE is re-collated too — matching memory, which clobbers it
-				// the same way (no surface preserves a differing index COLLATE across an
-				// ALTER COLUMN SET COLLATE on its column).
-				const updatedIndexes = (collationChanged && oldSchema.indexes)
-					? oldSchema.indexes.map(idx => ({
-						...idx,
-						columns: idx.columns.map(ic =>
-							ic.index === colIndex ? { ...ic, collation: newCol.collation } : ic),
-					}))
-					: oldSchema.indexes;
-				const updatedSchema: TableSchema = {
-					...oldSchema,
-					columns: Object.freeze(updatedColumns),
-					columnIndexMap: buildColumnIndexMap(updatedColumns),
-					indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
-				};
-
-				// SET COLLATE existing-row re-validation (Option A, non-PK UNIQUE): a new
-				// per-column collation can make rows that were distinct under the old
-				// collation collide. Re-scan every UNIQUE constraint covering the altered
-				// column under the NEW collation (`updatedSchema` carries it). The first
-				// collision throws CONSTRAINT BEFORE any mutation/persist, so the table is
-				// left unchanged and writable (matches the ADD CONSTRAINT rollback shape).
-				// The PK is intentionally excluded — it never appears in `uniqueConstraints`;
-				// its physical re-key/re-validation is the `isPkColumn` block below.
-				if (collationChanged) {
-					const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
-						.filter(uc => uc.columns.includes(colIndex));
-					for (const uc of coveringConstraints) {
-						// Fresh generator per constraint — an async generator is single-shot. An
-						// `EffectiveRowSource` is re-callable for exactly this reason.
-						await this.validateUniqueOverExistingRows(
-							rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
-							updatedSchema,
-							uc,
-							db.getKeyNormalizerResolver(),
-						);
-					}
-				}
-
-				// SET COLLATE on a PRIMARY KEY member (Option B physical re-key): re-encode
-				// every data-store key under the column's new key collation, then rebuild every
-				// secondary index (its keys embed the PK suffix). `rekeyRows` validates in a
-				// first pass and throws CONSTRAINT on a collision under the new collation WITHOUT
-				// mutating the store — so a coarser collation that collapses two distinct PKs
-				// (e.g. 'a'/'A' under BINARY→NOCASE) is rejected all-or-nothing, mirroring
-				// ALTER PRIMARY KEY. Runs AFTER the non-PK UNIQUE re-validation above so both
-				// throw-only checks precede the first store mutation. `updatedSchema.columns`
-				// carries the new collation, so the new key bytes follow it.
-				if (collationChanged && oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
-					// Physical re-key ahead — flush buffered writes (see
-					// {@link ddlCommitPendingOps}). Deliberately AFTER the non-PK UNIQUE
-					// re-validation above: that check reads effectively and throws without
-					// needing the flush, so it must keep the transaction alive.
-					//
-					// NOTE: `rekeyRows` detects PK collisions among THIS module's rows only. When a
-					// wrapper module supplied `rows`, its staged rows are not in this store, so a
-					// pending row that collides with a committed one under the new collation is
-					// caught by neither side — the wrapper's overlay enforces the PK among its own
-					// rows, this store among its own. Closing it needs a PK-dedupe pass over `rows`
-					// under the new collation here, before the re-key.
-					await this.ddlCommitPendingOps();
-					await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
-					await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
-				}
-
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
-
-				this.eventEmitter?.emitSchemaChange({
-					type: 'alter',
-					objectType: 'table',
-					schemaName,
-					objectName: tableName,
-				});
-
-				return updatedSchema;
+		// Extract default value from column def constraints. Use the shared
+		// `tryFoldLiteral` helper so signed numerics like `-123.0`
+		// (a UnaryExpr in the AST) are recognized — matching the
+		// memory-mode path and the engine-level ALTER validation.
+		let defaultValue: SqlValue = null;
+		const defaultConstraint = change.columnDef.constraints?.find(c => c.type === 'default');
+		if (defaultConstraint?.expr) {
+			const folded = tryFoldLiteral(defaultConstraint.expr);
+			if (folded !== undefined) {
+				defaultValue = folded;
 			}
 		}
+
+		// A non-foldable DEFAULT (e.g. `new.<col>`) backfills each existing row from
+		// its own value via the engine-supplied evaluator (mirrors the memory path).
+		const backfillEvaluator = change.backfillEvaluator;
+
+		// Refuse NOT NULL without a usable DEFAULT on a non-empty table
+		// (SQLite-compatible). A per-row evaluator IS usable — its NOT NULL is enforced
+		// per row during migration — so it is exempt from this no-default rejection.
+		if (newColSchema.notNull && defaultValue === null && !backfillEvaluator) {
+			if (await table.hasAnyRows()) {
+				throw new QuereusError(
+					`Cannot add NOT NULL column '${newColSchema.name}' to non-empty table `
+						+ `'${schemaName}.${tableName}' without a DEFAULT value`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+
+		// Build updated schema: append new column
+		const updatedColumns: ReadonlyArray<ColumnSchema> = Object.freeze([...oldSchema.columns, newColSchema]);
+		const updatedSchema: TableSchema = {
+			...oldSchema,
+			columns: updatedColumns,
+			columnIndexMap: buildColumnIndexMap(updatedColumns),
+		};
+
+		// Extract any column-level CHECK / FK to persist (see the persist block below).
+		// Hoisted above the row migration so a malformed constraint (e.g. a multi-column
+		// FK on a single ADD COLUMN, which `extractColumnLevelForeignKeys` rejects) throws
+		// BEFORE any rows are migrated or the in-memory schema is swapped — validate-before-
+		// mutate, matching the engine's ordering in `runAddColumn`.
+		const newCheckConstraints = extractColumnLevelCheckConstraints(change.columnDef);
+		const newForeignKeys = extractColumnLevelForeignKeys(change.columnDef, schemaName);
+
+		// Physical rewrite ahead: flush the module's buffered writes so `migrateRows`
+		// (a committed-store scan + batch) sees this transaction's rows and re-encodes
+		// them under the new column layout. See {@link ddlCommitPendingOps}. Placed
+		// after every throw-only check above — the NOT NULL rejection reads effectively
+		// (`hasAnyRows`) and `extractColumnLevel*` reads no rows — so a rejected ALTER
+		// leaves the enclosing transaction intact.
+		await this.ddlCommitPendingOps();
+
+		// Migrate rows: append the new column's value — a single literal default, or a
+		// per-row value derived from the existing row when a backfill evaluator is set.
+		const remap = buildColumnRemap(
+			oldSchema.columns.map(c => c.name),
+			updatedColumns.map(c => c.name),
+		);
+		await table.migrateRows(
+			remap,
+			defaultValue,
+			backfillEvaluator
+				? { evaluator: backfillEvaluator, notNull: newColSchema.notNull, columnName: newColSchema.name }
+				: undefined,
+		);
+
+		// Update table schema (column-only) and persist DDL.
+		//
+		// The engine's `runAddColumn` re-merges the column-level FK/CHECK extracted
+		// from `columnDef.constraints` into the LIVE in-memory schema AFTER this hook
+		// returns, so the schema handed back to it must stay column-only — returning a
+		// constrained schema would double the constraint in the live SchemaManager (and,
+		// on the next persist, in the DDL). But that engine-side merge is in-memory only:
+		// it never reaches the catalog, so persistence must carry the column-level
+		// CHECK/FK itself or they vanish on `rehydrateCatalog`. Build a separate
+		// `persistedSchema` for `saveTableDDL` when (and only when) the column declares
+		// such a constraint; the common path persists `updatedSchema` unchanged. This is
+		// unconditional on the default kind — a per-row (evaluator) DEFAULT extracts the
+		// same AST constraints as a literal one.
+		table.updateSchema(updatedSchema);
+
+		let persistedSchema = updatedSchema;
+		if (newCheckConstraints.length > 0 || newForeignKeys.length > 0) {
+			// The new column is appended last; resolve each FK's child column to its index
+			// (matching how the engine resolves `resolvedForeignKeys` via columnIndexMap).
+			const newColIdx = updatedColumns.length - 1;
+			const resolvedForeignKeys = newForeignKeys.map(fk => ({ ...fk, columns: Object.freeze([newColIdx]) }));
+			persistedSchema = {
+				...updatedSchema,
+				checkConstraints: Object.freeze([...updatedSchema.checkConstraints, ...newCheckConstraints]),
+				foreignKeys: Object.freeze([...(updatedSchema.foreignKeys ?? []), ...resolvedForeignKeys]),
+			};
+		}
+		await this.saveTableDDL(persistedSchema);
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/** DROP COLUMN arm of {@link alterTable}: drop the column slot, reindex PK / indexes /
+	 *  UNIQUE, migrate rows, and persist. Behavior-preserving extraction. */
+	private async alterDropColumn(
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'dropColumn' }>,
+	): Promise<TableSchema> {
+		const colNameLower = change.columnName.toLowerCase();
+		const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === colNameLower);
+		if (colIndex === -1) {
+			throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
+		}
+
+		// Build updated schema: remove column and reindex PK/indexes
+		// Filter by original index BEFORE remapping to avoid incorrectly
+		// removing columns that remap to the dropped column's position.
+		const updatedColumns = oldSchema.columns.filter((_, idx) => idx !== colIndex);
+		const updatedPkDef = oldSchema.primaryKeyDefinition
+			.filter(def => def.index !== colIndex)
+			.map(def => ({
+				...def,
+				index: def.index > colIndex ? def.index - 1 : def.index,
+			}));
+		const updatedIndexes = (oldSchema.indexes || [])
+			.map(idx => ({
+				...idx,
+				columns: idx.columns
+					.filter(ic => ic.index !== colIndex)
+					.map(ic => ({ ...ic, index: ic.index > colIndex ? ic.index - 1 : ic.index })),
+			}))
+			.filter(idx => idx.columns.length > 0);
+
+		// Prune any UNIQUE constraint over the dropped column, mirroring the index
+		// filtering above. Store-backed UNIQUE is enforced by a full scan over
+		// `uniqueConstraints`, so a stranded constraint whose column index dangles past
+		// the column array would break the next insert's validation (and the persisted
+		// DDL). A UNIQUE that includes the dropped column is removed outright; remaining
+		// constraints have their column indices shifted to track the removed slot. This
+		// also covers the engine's ADD COLUMN + inline-UNIQUE revert, which drops the
+		// just-added (uniquely-constrained) column.
+		const updatedUniqueConstraints = (oldSchema.uniqueConstraints ?? [])
+			.filter(uc => !uc.columns.includes(colIndex))
+			.map(uc => ({ ...uc, columns: Object.freeze(uc.columns.map(i => i > colIndex ? i - 1 : i)) }));
+
+		const updatedSchema: TableSchema = {
+			...oldSchema,
+			columns: Object.freeze(updatedColumns),
+			columnIndexMap: buildColumnIndexMap(updatedColumns),
+			primaryKeyDefinition: Object.freeze(updatedPkDef),
+			indexes: Object.freeze(updatedIndexes),
+			uniqueConstraints: updatedUniqueConstraints.length > 0
+				? Object.freeze(updatedUniqueConstraints)
+				: undefined,
+		};
+
+		// Physical rewrite ahead — flush buffered writes so `migrateRows` re-encodes
+		// this transaction's rows too. See {@link ddlCommitPendingOps}.
+		await this.ddlCommitPendingOps();
+
+		// Migrate rows: remove the dropped column slot
+		const remap = buildColumnRemap(
+			oldSchema.columns.map(c => c.name),
+			updatedColumns.map(c => c.name),
+		);
+		await table.migrateRows(remap, null);
+
+		// Update table schema and persist DDL
+		table.updateSchema(updatedSchema);
+		await this.saveTableDDL(updatedSchema);
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/** RENAME COLUMN arm of {@link alterTable}: schema-only rewrite (columns, indexes, self-FK,
+	 *  in-place predicate / CHECK AST rewrite) and persist. Behavior-preserving extraction. */
+	private async alterRenameColumn(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'renameColumn' }>,
+		defaultNotNull: boolean,
+	): Promise<TableSchema> {
+		if (!change.newColumnDefAst) {
+			throw new QuereusError('RENAME COLUMN requires a new column definition AST', StatusCode.INTERNAL);
+		}
+
+		const oldNameLower = change.oldName.toLowerCase();
+		const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === oldNameLower);
+		if (colIndex === -1) {
+			throw new QuereusError(`Column '${change.oldName}' not found.`, StatusCode.ERROR);
+		}
+
+		const newColSchema = columnDefToSchema(change.newColumnDefAst, defaultNotNull);
+		const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newColSchema : c);
+		const updatedIndexes = (oldSchema.indexes || []).map(idx => ({
+			...idx,
+			columns: idx.columns.map(ic =>
+				ic.index === colIndex ? { ...ic, name: change.newName } : ic
+			),
+		}));
+
+		const updatedSchema: TableSchema = {
+			...oldSchema,
+			columns: Object.freeze(updatedColumns),
+			columnIndexMap: buildColumnIndexMap(updatedColumns),
+			indexes: Object.freeze(updatedIndexes),
+			// A self-referencing FK names the renamed column in `referencedColumnNames`
+			// and is persisted by name; the engine rewrites it only in the post-hook
+			// pass. Pure copy — no rollback needed, this schema is only adopted on the
+			// success path.
+			foreignKeys: renameColumnInSelfForeignKeys(
+				oldSchema.foreignKeys, schemaName, tableName, change.oldName, change.newName),
+		};
+
+		// A partial index's WHERE clause and a CHECK constraint's expression both
+		// still name the OLD column: the engine's `propagateColumnRename` pass runs
+		// only after this hook returns. Persisting now would durably write a bundle
+		// naming a column the table no longer has, and only the later propagation's
+		// `table_modified` event would correct it — a crash in between leaves the
+		// catalog un-rehydratable. So rewrite first, in place: each `Expression` is
+		// shared by reference with the catalog's `TableSchema` and, for a unique
+		// partial index, with the `derivedFromIndex` UNIQUE constraint, so one
+		// rewrite covers all holders and makes the later propagation pass a no-op.
+		//
+		// The rewrites are the first statements in the `try`, and each walks its
+		// collection one item at a time, so a throw anywhere — including partway
+		// through a walk — must reverse them: restoring `oldSchema` cannot, since the
+		// ASTs are shared. Reversing is a no-op wherever nothing names the new column,
+		// and the engine has already rejected a rename onto an existing column name,
+		// so the reverse pass cannot collide with an expression that legitimately
+		// named it.
+		const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
+			db.schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
+		const rewriteColumn = (from: string, to: string): void => {
+			renameColumnInIndexPredicates(
+				updatedIndexes, tableName, from, to, schemaName, resolveColumnInSource);
+			renameColumnInCheckConstraints(
+				oldSchema.checkConstraints, tableName, from, to, schemaName, resolveColumnInSource);
+		};
+		try {
+			rewriteColumn(change.oldName, change.newName);
+
+			// Rename is schema-only — no row migration needed
+			table.updateSchema(updatedSchema);
+			await this.saveTableDDL(updatedSchema);
+		} catch (e) {
+			rewriteColumn(change.newName, change.oldName);
+			throw e;
+		}
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/** ALTER PRIMARY KEY arm of {@link alterTable}: physically re-key the data store, rebuild
+	 *  secondary indexes, and persist. Behavior-preserving extraction. */
+	private async alterPrimaryKeyChange(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'alterPrimaryKey' }>,
+	): Promise<TableSchema> {
+		const newPkColumns = change.newPkColumns;
+		const updatedSchema: TableSchema = {
+			...oldSchema,
+			primaryKeyDefinition: Object.freeze(
+				newPkColumns.map(pk => ({ index: pk.index, desc: pk.desc })),
+			),
+		};
+
+		// Physical re-key ahead — flush buffered writes so every live row is
+		// re-keyed and no stale-schema op replays over the rewritten store.
+		// `rekeyRows`' duplicate-key pass runs against the flushed store, so a
+		// pending insert that collides under the new PK is caught. See
+		// {@link ddlCommitPendingOps} for the transaction consequences.
+		await this.ddlCommitPendingOps();
+
+		// Re-key the data store. Throws CONSTRAINT on duplicates without
+		// mutating the store, giving us all-or-nothing semantics for the
+		// validation phase.
+		await table.rekeyRows(newPkColumns);
+
+		// Secondary index keys embed the PK suffix — clear + rebuild every
+		// index against the now-rekeyed data store.
+		await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
+
+		table.updateSchema(updatedSchema);
+		await this.saveTableDDL(updatedSchema);
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/** ADD CONSTRAINT arm of {@link alterTable}: validate existing rows as the constraint kind
+	 *  (UNIQUE / FOREIGN KEY / CHECK) requires, then persist. Behavior-preserving extraction. */
+	private async alterAddConstraint(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'addConstraint' }>,
+		rows?: EffectiveRowSource,
+	): Promise<TableSchema> {
+		const constraint = change.constraint;
+		let updatedSchema: TableSchema;
+
+		if (constraint.type === 'unique') {
+			// Store enforces inline UNIQUE by full-scan over `uniqueConstraints`
+			// (no separate index store), so there is nothing physical to build —
+			// but we must validate the existing rows before persisting.
+			//
+			// No `ddlCommitPendingOps()` here (unlike the row-rewriting arms): this
+			// writes no rows, and the validation scan already reads effectively, so
+			// the transaction survives a CONSTRAINT rejection.
+			const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
+			await this.validateUniqueOverExistingRows(
+				rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
+				oldSchema,
+				uc,
+				db.getKeyNormalizerResolver(),
+			);
+			updatedSchema = {
+				...oldSchema,
+				uniqueConstraints: Object.freeze([...(oldSchema.uniqueConstraints ?? []), uc]),
+			};
+		} else if (constraint.type === 'foreignKey') {
+			const fk = buildForeignKeyConstraintSchema(constraint, oldSchema.columnIndexMap, oldSchema.name, oldSchema.schemaName);
+			updatedSchema = {
+				...oldSchema,
+				foreignKeys: Object.freeze([...(oldSchema.foreignKeys ?? []), fk]),
+			};
+			// Pragma-gated existing-row validation; throws before persistence on an orphan.
+			await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
+		} else if (constraint.type === 'check') {
+			// Schema-only: a CHECK has no physical structure and (matching the
+			// engine's prior in-emitter behavior) no existing-row scan. Routing it
+			// here — rather than catalog-only — keeps the persisted DDL and the
+			// connected-table schema in lock-step so DROP/RENAME CONSTRAINT resolve it.
+			const check = buildCheckConstraintSchema(constraint, oldSchema.checkConstraints.length);
+			updatedSchema = {
+				...oldSchema,
+				checkConstraints: Object.freeze([...oldSchema.checkConstraints, check]),
+			};
+		} else {
+			throw new QuereusError(
+				`Store table ADD CONSTRAINT does not support constraint type '${constraint.type}'`,
+				StatusCode.UNSUPPORTED,
+			);
+		}
+
+		table.updateSchema(updatedSchema);
+		await this.saveTableDDL(updatedSchema);
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/** DROP CONSTRAINT arm of {@link alterTable}: schema-only catalog rewrite dropping a named
+	 *  constraint, then persist. Behavior-preserving extraction. */
+	private async alterDropConstraint(
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'dropConstraint' }>,
+	): Promise<TableSchema> {
+		// Schema-only catalog rewrite: store-backed UNIQUE enforcement is a
+		// full-scan over `uniqueConstraints` (no separate index store for an
+		// inline UNIQUE), so dropping the constraint stops enforcement with no
+		// physical teardown. A UNIQUE derived from a CREATE UNIQUE INDEX is
+		// rejected upstream (drop the index instead), so we never strand a store.
+		const constraintClass = resolveNamedConstraintClass(oldSchema, change.constraintName);
+		const lower = change.constraintName.toLowerCase();
+		let updatedSchema: TableSchema;
+		if (constraintClass === 'check') {
+			updatedSchema = {
+				...oldSchema,
+				checkConstraints: Object.freeze(oldSchema.checkConstraints.filter(c => c.name?.toLowerCase() !== lower)),
+			};
+		} else if (constraintClass === 'foreignKey') {
+			const remaining = (oldSchema.foreignKeys ?? []).filter(c => c.name?.toLowerCase() !== lower);
+			updatedSchema = { ...oldSchema, foreignKeys: remaining.length > 0 ? Object.freeze(remaining) : undefined };
+		} else {
+			const remaining = (oldSchema.uniqueConstraints ?? []).filter(c => c.name?.toLowerCase() !== lower);
+			updatedSchema = { ...oldSchema, uniqueConstraints: remaining.length > 0 ? Object.freeze(remaining) : undefined };
+		}
+
+		table.updateSchema(updatedSchema);
+		await this.saveTableDDL(updatedSchema);
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/** RENAME CONSTRAINT arm of {@link alterTable}: schema-only rename of a named constraint,
+	 *  then persist. Behavior-preserving extraction. */
+	private async alterRenameConstraint(
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'renameConstraint' }>,
+	): Promise<TableSchema> {
+		const constraintClass = resolveNamedConstraintClass(oldSchema, change.oldName);
+		const oldLower = change.oldName.toLowerCase();
+		let updatedSchema: TableSchema;
+		if (constraintClass === 'check') {
+			updatedSchema = {
+				...oldSchema,
+				checkConstraints: Object.freeze(
+					oldSchema.checkConstraints.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
+				),
+			};
+		} else if (constraintClass === 'foreignKey') {
+			updatedSchema = {
+				...oldSchema,
+				foreignKeys: Object.freeze(
+					oldSchema.foreignKeys!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
+				),
+			};
+		} else {
+			updatedSchema = {
+				...oldSchema,
+				uniqueConstraints: Object.freeze(
+					oldSchema.uniqueConstraints!.map(c => (c.name?.toLowerCase() === oldLower ? { ...c, name: change.newName } : c)),
+				),
+			};
+		}
+
+		table.updateSchema(updatedSchema);
+		await this.saveTableDDL(updatedSchema);
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/** ALTER COLUMN arm of {@link alterTable}: change one attribute (NOT NULL / data type /
+	 *  default / collation), running the physical re-key + existing-row re-validation the
+	 *  collation / PK paths require, then persist. Behavior-preserving extraction. */
+	private async alterColumnChange(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
+		rows?: EffectiveRowSource,
+	): Promise<TableSchema> {
+		const colNameLower = change.columnName.toLowerCase();
+		const colIndex = oldSchema.columns.findIndex(c => c.name.toLowerCase() === colNameLower);
+		if (colIndex === -1) {
+			throw new QuereusError(`Column '${change.columnName}' not found.`, StatusCode.ERROR);
+		}
+		const oldCol = oldSchema.columns[colIndex];
+		// Pull exactly one attribute from the change. Each sub-helper returns the new
+		// column schema plus whether the collation bytes changed (`collationChanged` gates
+		// the existing-row UNIQUE re-validation and PK re-key below), or null when the column
+		// is already in the desired state — preserving the pre-refactor early exits
+		// (SET NOT NULL no-op, SET COLLATE already-explicit) that leave the table and any
+		// open transaction untouched.
+		let attr: AlterColumnAttrChange | null;
+		if (change.setNotNull !== undefined) {
+			attr = await this.alterColumnSetNotNull(table, oldSchema, oldCol, colIndex, change);
+		} else if (change.setDataType !== undefined) {
+			attr = await this.alterColumnSetDataType(table, oldCol, colIndex, change);
+		} else if (change.setDefault !== undefined) {
+			attr = { newCol: { ...oldCol, defaultValue: change.setDefault }, collationChanged: false };
+		} else if (change.setCollation !== undefined) {
+			attr = this.alterColumnSetCollation(oldCol, change);
+		} else {
+			throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
+		}
+		if (attr === null) {
+			return oldSchema;
+		}
+		const { newCol, collationChanged } = attr;
+
+		const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newCol : c);
+		// Mirror the memory module (MemoryTableManager.alterColumn): a per-column
+		// collation change propagates into every index column ordering by this
+		// column, so a `derivedFromIndex` UNIQUE re-keys its enforcement under the
+		// new collation. StoreTable.uniqueEnforcementCollations reads the index's
+		// per-column collation, so without this the index entry would stay stale
+		// and the derived UNIQUE would keep enforcing the OLD collation after the
+		// ALTER. Metadata-only: the store's index KEY bytes use the table-level key
+		// collation K (see buildIndexEntries / updateSecondaryIndexes), so no index
+		// entry re-encode is required for a non-PK column. An index column with an
+		// explicit COLLATE is re-collated too — matching memory, which clobbers it
+		// the same way (no surface preserves a differing index COLLATE across an
+		// ALTER COLUMN SET COLLATE on its column).
+		const updatedIndexes = (collationChanged && oldSchema.indexes)
+			? oldSchema.indexes.map(idx => ({
+				...idx,
+				columns: idx.columns.map(ic =>
+					ic.index === colIndex ? { ...ic, collation: newCol.collation } : ic),
+			}))
+			: oldSchema.indexes;
+		const updatedSchema: TableSchema = {
+			...oldSchema,
+			columns: Object.freeze(updatedColumns),
+			columnIndexMap: buildColumnIndexMap(updatedColumns),
+			indexes: updatedIndexes ? Object.freeze(updatedIndexes) : updatedIndexes,
+		};
+
+		// SET COLLATE existing-row re-validation (Option A, non-PK UNIQUE): a new
+		// per-column collation can make rows that were distinct under the old
+		// collation collide. Re-scan every UNIQUE constraint covering the altered
+		// column under the NEW collation (`updatedSchema` carries it). The first
+		// collision throws CONSTRAINT BEFORE any mutation/persist, so the table is
+		// left unchanged and writable (matches the ADD CONSTRAINT rollback shape).
+		// The PK is intentionally excluded — it never appears in `uniqueConstraints`;
+		// its physical re-key/re-validation is the `isPkColumn` block below.
+		if (collationChanged) {
+			const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
+				.filter(uc => uc.columns.includes(colIndex));
+			for (const uc of coveringConstraints) {
+				// Fresh generator per constraint — an async generator is single-shot. An
+				// `EffectiveRowSource` is re-callable for exactly this reason.
+				await this.validateUniqueOverExistingRows(
+					rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
+					updatedSchema,
+					uc,
+					db.getKeyNormalizerResolver(),
+				);
+			}
+		}
+
+		// SET COLLATE on a PRIMARY KEY member (Option B physical re-key): re-encode
+		// every data-store key under the column's new key collation, then rebuild every
+		// secondary index (its keys embed the PK suffix). `rekeyRows` validates in a
+		// first pass and throws CONSTRAINT on a collision under the new collation WITHOUT
+		// mutating the store — so a coarser collation that collapses two distinct PKs
+		// (e.g. 'a'/'A' under BINARY→NOCASE) is rejected all-or-nothing, mirroring
+		// ALTER PRIMARY KEY. Runs AFTER the non-PK UNIQUE re-validation above so both
+		// throw-only checks precede the first store mutation. `updatedSchema.columns`
+		// carries the new collation, so the new key bytes follow it.
+		if (collationChanged && oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+			// Physical re-key ahead — flush buffered writes (see
+			// {@link ddlCommitPendingOps}). Deliberately AFTER the non-PK UNIQUE
+			// re-validation above: that check reads effectively and throws without
+			// needing the flush, so it must keep the transaction alive.
+			//
+			// NOTE: `rekeyRows` detects PK collisions among THIS module's rows only. When a
+			// wrapper module supplied `rows`, its staged rows are not in this store, so a
+			// pending row that collides with a committed one under the new collation is
+			// caught by neither side — the wrapper's overlay enforces the PK among its own
+			// rows, this store among its own. Closing it needs a PK-dedupe pass over `rows`
+			// under the new collation here, before the re-key.
+			await this.ddlCommitPendingOps();
+			await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
+			await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
+		}
+
+		table.updateSchema(updatedSchema);
+		await this.saveTableDDL(updatedSchema);
+
+		this.eventEmitter?.emitSchemaChange({
+			type: 'alter',
+			objectType: 'table',
+			schemaName,
+			objectName: tableName,
+		});
+
+		return updatedSchema;
+	}
+
+	/**
+	 * SET NOT NULL / DROP NOT NULL sub-branch of {@link alterColumnChange}. Returns the
+	 * new column schema, or null when the column is already in the desired nullability
+	 * (the pre-refactor `return oldSchema` no-op). The NULL-backfill probe and rewrite
+	 * order (throw-only probe before {@link ddlCommitPendingOps}) is unchanged.
+	 */
+	private async alterColumnSetNotNull(
+		table: StoreTable,
+		oldSchema: TableSchema,
+		oldCol: ColumnSchema,
+		colIndex: number,
+		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
+	): Promise<AlterColumnAttrChange | null> {
+		let newCol: ColumnSchema;
+		if (change.setNotNull === true && !oldCol.notNull) {
+			// Backfill NULLs from a literal DEFAULT, or throw.
+			let defaultLiteral: SqlValue | undefined;
+			const expr = oldCol.defaultValue;
+			if (expr && (expr as { type?: string }).type === 'literal') {
+				defaultLiteral = (expr as { value?: SqlValue }).value ?? null;
+			}
+			// Reads effectively, so a row this transaction inserted with a NULL is
+			// seen — it is backfilled (or rejects the ALTER) like any other row.
+			const nullCount = await table.rowsWithNullAtIndex(colIndex);
+			if (nullCount > 0) {
+				if (defaultLiteral === undefined || defaultLiteral === null) {
+					// Throw-only, and before the DDL-commit below: the transaction survives.
+					throw new QuereusError(
+						`column ${change.columnName} contains NULL values`,
+						StatusCode.CONSTRAINT,
+					);
+				}
+				const fill = defaultLiteral;
+				// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex`
+				// backfills this transaction's NULL rows too (the probe above saw
+				// them; a committed-store rewrite cannot). See {@link ddlCommitPendingOps}.
+				await this.ddlCommitPendingOps();
+				await table.mapRowsAtIndex(colIndex, (v) => v === null ? fill : v);
+			}
+			newCol = { ...oldCol, notNull: true };
+		} else if (change.setNotNull === false && oldCol.notNull) {
+			if (oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+				throw new QuereusError(
+					`Cannot DROP NOT NULL on PRIMARY KEY column '${change.columnName}'`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+			newCol = { ...oldCol, notNull: false };
+		} else {
+			return null; // already in desired state
+		}
+		return { newCol, collationChanged: false };
+	}
+
+	/**
+	 * SET DATA TYPE sub-branch of {@link alterColumnChange}. Returns the retyped column
+	 * schema. When the physical type changes, a throw-only convert pass over the live
+	 * rows precedes {@link ddlCommitPendingOps} and the rewrite — order unchanged.
+	 */
+	private async alterColumnSetDataType(
+		table: StoreTable,
+		oldCol: ColumnSchema,
+		colIndex: number,
+		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
+	): Promise<AlterColumnAttrChange> {
+		const newLogicalType = inferType(change.setDataType!);
+		if (newLogicalType.physicalType !== oldCol.logicalType.physicalType) {
+			// Physical conversion required — walk every row and attempt parse.
+			const convert = (v: SqlValue): SqlValue => {
+				try {
+					return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
+				} catch {
+					throw new QuereusError(
+						`Cannot convert value in '${change.columnName}' to ${change.setDataType}`,
+						StatusCode.MISMATCH,
+					);
+				}
+			};
+			// Throw-only pass over the LIVE rows first, so an unconvertible value
+			// this transaction inserted rejects the ALTER with the transaction still
+			// intact. The rewrite below reads only committed rows.
+			for await (const value of table.iterateEffectiveValuesAtIndex(colIndex)) {
+				if (value !== null) convert(value);
+			}
+			// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex`
+			// converts this transaction's rows too; unflushed, they would replay
+			// under the OLD physical type. See {@link ddlCommitPendingOps}.
+			await this.ddlCommitPendingOps();
+			await table.mapRowsAtIndex(colIndex, (v) => v === null ? v : convert(v));
+		}
+		return { newCol: { ...oldCol, logicalType: newLogicalType }, collationChanged: false };
+	}
+
+	/**
+	 * SET COLLATE sub-branch of {@link alterColumnChange}. Returns the recollated column
+	 * schema with `collationChanged` set when the collation bytes actually change (a bare
+	 * metadata flip keeps it false), or null when the column is already explicit in the
+	 * desired collation (the pre-refactor `return oldSchema` no-op). Synchronous — no
+	 * row scan happens here; the caller runs the re-validation / re-key the flag gates.
+	 */
+	private alterColumnSetCollation(
+		oldCol: ColumnSchema,
+		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
+	): AlterColumnAttrChange | null {
+		// Per-column collation update. PRIMARY KEY uniqueness/ordering is enforced
+		// PHYSICALLY in the key bytes under a PER-COLUMN key collation
+		// (`StoreTable.pkKeyCollations`), so a PK-column SET COLLATE is honored
+		// natively by physically re-keying the data store + rebuilding every
+		// secondary index under the new collation (the `isPkColumn` block below),
+		// mirroring the memory module's primary re-key. A re-key that would collide
+		// under the new collation throws CONSTRAINT before any mutation. For non-PK
+		// UNIQUE constraints we re-validate existing rows under the new collation
+		// (Option A). Query-layer ORDER BY / `=` / `table_info().collation` pick the
+		// new collation up from the column schema once this updated schema re-registers.
+		const normalized = validateCollationForType(change.setCollation!, oldCol.logicalType, change.columnName);
+		const nameMatches = normalized === (oldCol.collation || 'BINARY');
+		if (nameMatches && oldCol.collationExplicit) {
+			return null; // already explicit in the desired collation — no scan, no re-key, no re-persist
+		}
+		// SET COLLATE is a user declaration with the same standing as a
+		// CREATE-time COLLATE clause, so mark the collation explicit (rank 2
+		// in the comparison lattice) regardless of the column's creation
+		// history — including SET COLLATE binary. When only the name matches
+		// but the column was not yet explicit (a defaulted collation, or one
+		// inherited from session default_collation), flip the flag as a
+		// METADATA-ONLY change: the collation bytes are unchanged, so keep
+		// collationChanged false to skip rekeyRows / validateUniqueOverExistingRows
+		// below while still re-registering the schema and re-persisting DDL.
+		// A different name takes the full physical re-key path AND sets the flag.
+		return { newCol: { ...oldCol, collation: normalized, collationExplicit: true }, collationChanged: !nameMatches };
 	}
 
 	/**
