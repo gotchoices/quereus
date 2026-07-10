@@ -35,9 +35,11 @@ const HAS_HIGH_SURROGATE = /[\uD800-\uDBFF]/;
  * the ranks; equal-prefix strings fall back to shorter-first.
  *
  * Unpaired surrogates have no UTF-8 encoding (`TextEncoder` maps each to U+FFFD), so no
- * comparator can be order-preserving over them — see
- * `bug-store-lone-surrogate-key-collision`. This function is still total and
- * deterministic for them; it simply cannot match the store's bytes.
+ * comparator can be order-preserving over them. The persistent store therefore REFUSES
+ * to key them (`quereus-store`'s `encodeText` raises), which is what keeps the built-ins'
+ * `orderPreserving` stamp true over every value a store-backed table can hold. This
+ * function stays total and deterministic for them — memory tables accept them — it simply
+ * has no store bytes to agree with.
  */
 export function compareCodePoints(a: string, b: string): number {
 	if (a === b) return 0;

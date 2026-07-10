@@ -198,6 +198,102 @@ describe('Key Encoding', () => {
       }
     });
 
+    describe('unpaired surrogates', () => {
+      // `TextEncoder` folds every unpaired surrogate to U+FFFD, so all 2048 of them would
+      // encode to the same three bytes — two distinct text values sharing one key. The
+      // encoder refuses them instead. See `encodeText` / `assertEncodableText`.
+      const LONE_HIGH = '\uD800';
+      const LONE_HIGH_2 = '\uD801';
+      const LONE_LOW = '\uDC00';
+      /** U+10000 — a WELL-FORMED pair; the same two code-unit ranges, legally paired. */
+      const ASTRAL = '\u{10000}';
+
+      it('proves the collision the guard exists to prevent', () => {
+        // Not a claim about encodeValue — a claim about TextEncoder, the reason for the
+        // guard. If this ever stops holding, the guard can be reconsidered.
+        const enc = new TextEncoder();
+        expect(Array.from(enc.encode(LONE_HIGH))).to.deep.equal([0xef, 0xbf, 0xbd]);
+        expect(Array.from(enc.encode(LONE_HIGH_2))).to.deep.equal([0xef, 0xbf, 0xbd]);
+      });
+
+      it('throws rather than encoding two distinct lone surrogates to equal bytes', () => {
+        for (const s of [LONE_HIGH, LONE_HIGH_2, LONE_LOW]) {
+          expect(() => encodeValue(s, { collation: 'BINARY' }), JSON.stringify(s))
+            .to.throw(/unpaired surrogate/i);
+        }
+      });
+
+      it('names the offending code unit and offset', () => {
+        expect(() => encodeValue(`ab${LONE_LOW}`, { collation: 'BINARY' }))
+          .to.throw(/U\+DC00 at offset 2/);
+      });
+
+      it('throws for a lone surrogate anywhere in the string', () => {
+        const cases = [LONE_HIGH, `${LONE_HIGH}x`, `x${LONE_HIGH}`, `${ASTRAL}${LONE_HIGH}`,
+          `${LONE_LOW}${ASTRAL}`, `${LONE_LOW}${LONE_HIGH}`]; // low-then-high is NOT a pair
+        for (const s of cases) {
+          expect(() => encodeValue(s, { collation: 'BINARY' }), JSON.stringify(s))
+            .to.throw(/unpaired surrogate/i);
+        }
+      });
+
+      it('throws under every built-in collation, not just BINARY', () => {
+        for (const collation of ['BINARY', 'NOCASE', 'RTRIM']) {
+          expect(() => encodeValue(LONE_HIGH, { collation }), collation)
+            .to.throw(/unpaired surrogate/i);
+        }
+      });
+
+      it('throws from a composite key when any component carries one', () => {
+        expect(() => encodeCompositeKey([1n, LONE_HIGH], { collation: 'BINARY' }))
+          .to.throw(/unpaired surrogate/i);
+      });
+
+      it('says persistent storage cannot hold the value, and memory tables can', () => {
+        expect(() => encodeValue(LONE_HIGH, { collation: 'BINARY' }))
+          .to.throw(/persistent storage/i);
+        expect(() => encodeValue(LONE_HIGH, { collation: 'BINARY' }))
+          .to.throw(/in-memory tables accept the value/i);
+      });
+
+      it('guards the NORMALIZED string, so a slicing custom normalizer cannot smuggle one in', () => {
+        // The normalizer's output is what gets encoded. A normalizer that cuts through a
+        // surrogate pair produces a lone half out of a perfectly well-formed input.
+        const firstUnit: KeyNormalizerResolver = (name) =>
+          name === 'FIRSTUNIT' ? (s) => s.slice(0, 1) : BUILTIN_KEY_NORMALIZER_RESOLVER(name);
+        expect(() => encodeValue(ASTRAL, { collation: 'FIRSTUNIT', normalizers: firstUnit }))
+          .to.throw(/unpaired surrogate/i);
+      });
+
+      it('round-trips a well-formed astral character untouched', () => {
+        for (const s of [ASTRAL, '\u{10FFFF}', '\u{1F600}', `x${ASTRAL}y`]) {
+          const encoded = encodeValue(s, { collation: 'BINARY' });
+          expect(decodeValue(encoded, 0, { collation: 'BINARY' }).value).to.equal(s);
+        }
+      });
+
+      it('keeps distinct astral characters at distinct, code-point-ordered keys', () => {
+        // U+FFFD itself is a legal character; it must not be confusable with a rejected
+        // lone surrogate, and it sorts BELOW every astral character (EF BF BD < F0 …).
+        const values = ['�', '\u{10000}', '\u{1F600}', '\u{10FFFF}'];
+        const encoded = values.map(v => encodeValue(v, { collation: 'BINARY' }));
+        for (let i = 0; i < encoded.length - 1; i++) {
+          expect(compareBytes(encoded[i], encoded[i + 1])).to.be.lessThan(
+            0, `${JSON.stringify(values[i])} should sort before ${JSON.stringify(values[i + 1])}`);
+        }
+      });
+
+      it('accepts a lone surrogate inside a JSON value — JSON.stringify escapes it', () => {
+        // `encodeObject` encodes `JSON.stringify`'s output, which is well-formed (ES2019):
+        // a lone surrogate becomes the seven ASCII characters `\ud800`. So the bytes stay
+        // injective without a guard, and the value survives the round trip.
+        const a = encodeValue([LONE_HIGH] as unknown as SqlValue);
+        const b = encodeValue([LONE_HIGH_2] as unknown as SqlValue);
+        expect(compareBytes(a, b)).to.not.equal(0);
+        expect(decodeValue(a).value).to.deep.equal([LONE_HIGH]);
+      });
+    });
+
     describe('JSON object canonical key encoding', () => {
       it('encodes reorder-equal objects to identical bytes', () => {
         // {a:1,b:2} and {b:2,a:1} compare equal (deepCompareJson sorts keys), so

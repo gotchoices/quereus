@@ -17,8 +17,10 @@ import {
 //
 // UNPAIRED surrogates ('\uD800' with no low surrogate after it) are deliberately absent:
 // they have no UTF-8 encoding — `TextEncoder` folds every one of them to U+FFFD — so no
-// comparator can make the `orderPreserving` assertion hold, and the store's text keys are
-// not injective over them. Tracked by `bug-store-lone-surrogate-key-collision`.
+// comparator can make the `orderPreserving` assertion hold over them. The store closes the
+// gap from the other side: `encodeText` REJECTS a text value carrying one, so no value a
+// store-backed table can hold falls outside this corpus's guarantee. Memory tables still
+// accept them, which is why the comparators must stay total there.
 const CORPUS: readonly string[] = [
 	'', 'a', 'A', 'aa', 'ab', 'b', 'B',
 	'Hello', 'hello', 'HELLO', 'heLLo',

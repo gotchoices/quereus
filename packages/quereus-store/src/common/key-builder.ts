@@ -128,6 +128,12 @@ export function buildIndexKey(
 /**
  * Build a catalog key for DDL storage.
  * Format: {schema}.{table}
+ *
+ * NOTE: identifier keys go straight through `TextEncoder`, which folds an unpaired
+ * surrogate to U+FFFD — so two tables whose quoted names differ only in a lone surrogate
+ * share one catalog key and clobber each other's DDL. TEXT *values* are guarded against
+ * this (`encodeText` raises); identifiers are not. Tracked by
+ * `bug-store-catalog-key-lone-surrogate-identifier-collision`.
  */
 export function buildCatalogKey(schemaName: string, tableName: string): Uint8Array {
 	return encoder.encode(`${schemaName}.${tableName}`.toLowerCase());

@@ -17,6 +17,16 @@
  *   resolved through `EncodeOptions.normalizers`, which callers holding a `Database`
  *   must set to `db.getKeyNormalizerResolver()` so key bytes and value comparisons
  *   agree on which strings are the same value.
+ *
+ * Unpaired surrogates:
+ *   A TEXT value holding an unpaired surrogate (a half of a surrogate pair with no
+ *   matching other half) is REJECTED here rather than encoded — see
+ *   {@link findUnpairedSurrogate}. It is a legal JS string and a legal in-memory
+ *   Quereus text value, but it is not valid Unicode and no UTF-8 byte sequence encodes
+ *   it, so it has no faithful key bytes. This is the one deliberate behavioural
+ *   divergence between a memory table (accepts the value) and a store-backed table
+ *   (raises at encode time). The alternative — `TextEncoder`'s silent fold to U+FFFD —
+ *   maps all 2048 lone surrogates onto one key, merging distinct rows.
  */
 
 import type { SqlValue, JsonSqlValue, KeyNormalizerResolver } from '@quereus/quereus';
@@ -267,6 +277,66 @@ function writeEscapedWithTerminator(typeTag: number, bytes: Uint8Array): Uint8Ar
 }
 
 /**
+ * Any surrogate code unit, paired or not. A cheap pre-test for
+ * {@link findUnpairedSurrogate}: virtually every real string fails it on V8's compiled-
+ * regex path, so the per-code-unit pairing scan never runs.
+ */
+const HAS_SURROGATE = /[\uD800-\uDFFF]/;
+
+/**
+ * Offset of the first UNPAIRED surrogate code unit in `value`, or -1 when every surrogate
+ * it holds is the high half of a well-formed high+low pair (an astral character) or the
+ * low half of one.
+ *
+ * A JS string is a sequence of 16-bit code units, not of Unicode characters. A character
+ * above U+FFFF is a surrogate PAIR: a high unit (U+D800–U+DBFF) followed by a low unit
+ * (U+DC00–U+DFFF). A surrogate with no matching partner is legal in a JS string but is
+ * not valid Unicode — it denotes no character, and no UTF-8 byte sequence encodes it.
+ */
+function findUnpairedSurrogate(value: string): number {
+  if (!HAS_SURROGATE.test(value)) return -1;
+  for (let i = 0; i < value.length; i++) {
+    const unit = value.charCodeAt(i);
+    if (unit < 0xD800 || unit > 0xDFFF) continue;
+    // A low surrogate reached here was not consumed as the tail of a pair below, so
+    // nothing precedes it — unpaired.
+    if (unit >= 0xDC00) return i;
+    // High surrogate: well-formed only when a low surrogate follows.
+    const next = i + 1 < value.length ? value.charCodeAt(i + 1) : 0;
+    if (next < 0xDC00 || next > 0xDFFF) return i;
+    i++; // Skip the pair's low half.
+  }
+  return -1;
+}
+
+/**
+ * Raise on a string the store cannot key faithfully.
+ *
+ * `TextEncoder` replaces EVERY unpaired surrogate with U+FFFD (bytes `EF BF BD`), so all
+ * 2048 of them would encode to the same three bytes: two distinct text values would share
+ * one primary-key / index-key byte string, producing a spurious `UNIQUE` violation or —
+ * worse — an upsert that overwrites an unrelated row. Refusing the value is the only
+ * answer that never merges rows.
+ *
+ * Runs on the NORMALIZED string, which is what actually gets encoded: a custom key
+ * normalizer that slices a string can itself split a surrogate pair. The reported offset
+ * is therefore into the normalizer's output; for BINARY (identity) and for the
+ * case-folding built-ins it is the caller's own offset.
+ */
+function assertEncodableText(sortValue: string): void {
+  const at = findUnpairedSurrogate(sortValue);
+  if (at < 0) return;
+  const codeUnit = sortValue.charCodeAt(at).toString(16).toUpperCase().padStart(4, '0');
+  throw new QuereusError(
+    `cannot store a text value containing an unpaired surrogate (U+${codeUnit} at offset ${at}): ` +
+    `persistent storage keys text by its UTF-8 bytes, and no UTF-8 sequence encodes a lone ` +
+    `surrogate — every one of them would collide on U+FFFD, merging distinct rows. ` +
+    `In-memory tables accept the value.`,
+    StatusCode.ERROR,
+  );
+}
+
+/**
  * Encode text with collation support.
  * Uses null-termination with escape sequences for embedded nulls.
  *
@@ -274,9 +344,14 @@ function writeEscapedWithTerminator(typeTag: number, bytes: Uint8Array): Uint8Ar
  * cannot key (unregistered, or comparator-only). There is deliberately no fallback:
  * silently keying under a different collation's normalizer is exactly how two values
  * the database's comparator calls equal end up at two distinct primary keys.
+ *
+ * Raises on an unpaired surrogate — see {@link assertEncodableText}. This is the point
+ * at which a store-backed table diverges from a memory table, and it is deliberate: the
+ * only alternative encoding of a lone surrogate collides distinct values onto one key.
  */
 function encodeText(value: string, collation: string, normalizers: KeyNormalizerResolver): Uint8Array {
   const sortValue = normalizers(collation)(value);
+  assertEncodableText(sortValue);
 
   // Encode as UTF-8
   const utf8 = new TextEncoder().encode(sortValue);
@@ -305,6 +380,13 @@ function encodeBlob(value: Uint8Array): Uint8Array {
  * nothing in the row path decodes an object key (rows are serialized separately, and
  * `decodeCompositeKey` has no `src/` caller). If an object-valued key ever has to be
  * decoded, normalize the leaves before canonicalization rather than the string after.
+ *
+ * NOTE: no unpaired-surrogate guard here, unlike `encodeText`. `canonicalJsonString` ends
+ * in `JSON.stringify`, which is well-formed (ES2019): it escapes every lone surrogate to
+ * the seven ASCII characters `\ud800`, so the canonical string is always valid Unicode and
+ * its UTF-8 bytes stay injective. If the canonicalizer ever stops routing through
+ * `JSON.stringify` (or gains a `rawJSON` passthrough), that escaping is lost and this must
+ * call `assertEncodableText` too.
  */
 function encodeObject(jsonString: string, collation: string, normalizers: KeyNormalizerResolver): Uint8Array {
   const sortValue = normalizers(collation)(jsonString);

@@ -20,8 +20,9 @@
  * `IndexSeek` / still elides its `Sort`: a future regression that fixed the rows by silently
  * retracting the stamp would pass the row checks alone.
  *
- * Unpaired surrogates are out of scope — they have no UTF-8 encoding at all, so no comparator
- * can be order-preserving over them. See `bug-store-lone-surrogate-key-collision`.
+ * Unpaired surrogates are out of scope here — they have no UTF-8 encoding at all, so no
+ * comparator can be order-preserving over them. The store refuses to key them instead; see
+ * `lone-surrogate-keys.spec.ts`.
  */
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
