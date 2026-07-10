@@ -661,22 +661,26 @@ async function validateNotNullBackfill(
 }
 
 /**
- * Whether a partial-index predicate names `columnName` as a column of the indexed
- * table. Depth-blind walk over the predicate's object graph: a predicate may only
- * reference the indexed table's own columns — `compilePredicate` rejects
- * schema-qualified refs and subqueries — so an unqualified ref, or one qualified by
- * the table name, is a hit and no scope tracking applies. `identifier` nodes are
- * matched alongside `column` nodes because the parser emits either shape for a bare
- * name depending on context.
+ * Whether a partial-index predicate names `columnName`. Depth-blind walk over the
+ * predicate's object graph, matching `column` / `identifier` nodes by name alone —
+ * the parser emits either shape for a bare name depending on context.
  *
- * NOTE: depth-blind. If partial-index predicates ever admit subqueries, an inner
- * unqualified ref to a like-named column of another table would false-positively
- * block a legal DROP COLUMN; this walk would then need the scope stack the rename
- * rewriters carry.
+ * The table qualifier is deliberately IGNORED, because `compilePredicate` ignores it
+ * too: it binds every ref by bare name against the indexed table's column list, so
+ * `where zzz.active = 1` compiles into a read of `active` exactly as `where active = 1`
+ * does. Matching on the qualifier here would let `drop column active` past this check
+ * and leave the module to fail on the rebuild with a raw "unknown column" — the very
+ * thing this check exists to prevent. (That `create index` accepts a foreign qualifier
+ * at all is a separate defect; see `bug-partial-index-predicate-ignores-table-qualifier`.)
+ *
+ * NOTE: depth-blind. `compilePredicate` rejects subqueries, so every ref in a live
+ * predicate binds to the indexed table. If partial-index predicates ever admit
+ * subqueries, an inner ref to a like-named column of another table would
+ * false-positively block a legal DROP COLUMN; this walk would then need the scope
+ * stack the rename rewriters carry.
  */
-function predicateReferencesColumn(expr: Expression, tableName: string, columnName: string): boolean {
+function predicateReferencesColumn(expr: Expression, columnName: string): boolean {
 	const colLower = columnName.toLowerCase();
-	const tableLower = tableName.toLowerCase();
 	let found = false;
 	const visit = (v: unknown): void => {
 		if (found || v === null || typeof v !== 'object') return;
@@ -686,8 +690,7 @@ function predicateReferencesColumn(expr: Expression, tableName: string, columnNa
 		}
 		const n = v as Record<string, unknown>;
 		if ((n.type === 'column' || n.type === 'identifier')
-			&& typeof n.name === 'string' && n.name.toLowerCase() === colLower
-			&& (n.table === undefined || (typeof n.table === 'string' && n.table.toLowerCase() === tableLower))) {
+			&& typeof n.name === 'string' && n.name.toLowerCase() === colLower) {
 			found = true;
 			return;
 		}
@@ -740,7 +743,7 @@ async function runDropColumn(
 	// an index KEY column is fine: the module narrows the index and drops it outright
 	// when no key columns survive.
 	for (const idx of tableSchema.indexes ?? []) {
-		if (idx.predicate && predicateReferencesColumn(idx.predicate, tableSchema.name, columnName)) {
+		if (idx.predicate && predicateReferencesColumn(idx.predicate, columnName)) {
 			throw new QuereusError(
 				`Cannot drop column '${columnName}' from '${tableSchema.name}': it is referenced by the WHERE clause of partial index '${idx.name}'`,
 				StatusCode.CONSTRAINT,

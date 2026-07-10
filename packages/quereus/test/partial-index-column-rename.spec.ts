@@ -119,6 +119,49 @@ describe('partial index across column rename/drop', () => {
 		expect(all[0].n).to.equal(3);
 	});
 
+	it('keeps a table-qualified, case-varied predicate live across RENAME COLUMN', async () => {
+		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
+		await db.exec(`create index ix on t (name) where t.ACTIVE = 1`);
+		await db.exec(`insert into t values (1, 'a', 1), (2, 'b', 0)`);
+
+		await db.exec(`alter table t rename column active to is_active`);
+
+		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal(['ix']);
+		expect(baseLayerOf(module, 't').secondaryIndexes.get('ix')!.size).to.equal(1);
+		expect(predicateText(db, 't', 'ix').toLowerCase()).to.contain('is_active');
+	});
+
+	it('leaves a partial index on an unrelated column alone across RENAME COLUMN', async () => {
+		await db.exec(`create table t (id integer primary key, name text, active integer, flag integer) using testmem`);
+		await db.exec(`create index ix_active on t (name) where active = 1`);
+		await db.exec(`create index ix_flag on t (name) where flag = 1`);
+		await db.exec(`insert into t values (1, 'a', 1, 1)`);
+
+		await db.exec(`alter table t rename column active to is_active`);
+
+		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal(['ix_active', 'ix_flag']);
+		expect(predicateText(db, 't', 'ix_active').toLowerCase()).to.contain('is_active');
+		expect(predicateText(db, 't', 'ix_flag').toLowerCase()).to.contain('flag');
+		expect(predicateText(db, 't', 'ix_flag').toLowerCase()).to.not.contain('is_active');
+	});
+
+	it('keeps a partial index live across a RENAME COLUMN inside an open transaction', async () => {
+		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
+		await db.exec(`create index ix on t (name) where active = 1`);
+		await db.exec(`insert into t values (1, 'a', 1)`);
+
+		// The uncommitted insert forces `ensureSchemaChangeSafety` to consolidate a live
+		// transaction layer into the base — the rebuild that must still see the OLD column.
+		await db.exec(`begin`);
+		await db.exec(`insert into t values (2, 'b', 1)`);
+		await db.exec(`alter table t rename column active to is_active`);
+		await db.exec(`commit`);
+
+		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal(['ix']);
+		const scoped = await rows(db, `select name from t where is_active = 1 order by name`);
+		expect(scoped.map(r => r.name)).to.deep.equal(['a', 'b']);
+	});
+
 	it('rejects DROP COLUMN of a column named by a partial-index predicate', async () => {
 		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
 		await db.exec(`create index ix on t (name) where active = 1`);
@@ -134,6 +177,38 @@ describe('partial index across column rename/drop', () => {
 
 		// The index is untouched by the rejected drop.
 		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal(['ix']);
+	});
+
+	it('rejects DROP COLUMN when the predicate names the column through a foreign qualifier', async () => {
+		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
+		// `compilePredicate` ignores the table qualifier and binds `active` by bare name,
+		// so this index reads `t.active` despite naming `zzz`. The DROP COLUMN pre-check
+		// must see the reference the same way, or the drop reaches the module and dies
+		// there with a raw "unknown column".
+		await db.exec(`create index ix on t (name) where zzz.active = 1`);
+
+		let message = '';
+		try {
+			await db.exec(`alter table t drop column active`);
+		} catch (e) {
+			message = (e as Error).message;
+		}
+		expect(message).to.contain(`Cannot drop column 'active'`);
+		expect(message).to.contain(`partial index 'ix'`);
+		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal(['ix']);
+	});
+
+	it('allows DROP COLUMN once the partial index naming it is dropped', async () => {
+		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
+		await db.exec(`create index ix on t (name) where active = 1`);
+		await db.exec(`insert into t values (1, 'a', 1)`);
+
+		await db.exec(`drop index ix`);
+		await db.exec(`alter table t drop column active`);
+
+		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal([]);
+		const all = await rows(db, `select name from t`);
+		expect(all.map(r => r.name)).to.deep.equal(['a']);
 	});
 
 	it('still allows DROP COLUMN of a column used only as an index key column', async () => {

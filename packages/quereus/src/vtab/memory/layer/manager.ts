@@ -1947,7 +1947,13 @@ export class MemoryTableManager {
 			// UNIQUE constraint — which share the `Expression` by reference — follow along.
 			// `propagateColumnRename` re-runs the same rewrite once the engine regains
 			// control and finds nothing left to do.
-			predicatesRewritten = renameColumnInIndexPredicates(
+			// Armed BEFORE the call, not from its return value: the rewrite walks the
+			// indexes one at a time, so a throw partway through would otherwise leave the
+			// already-rewritten predicates renamed with the flag still false. The reverse
+			// pass is a no-op when nothing names `newColumnName`, so arming it eagerly
+			// costs nothing when the rewrite finds no predicate to touch.
+			predicatesRewritten = true;
+			renameColumnInIndexPredicates(
 				finalNewTableSchema.indexes, this._tableName, oldName, newColumnName,
 				this.schemaName, resolveColumnInSource);
 
