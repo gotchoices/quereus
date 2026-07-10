@@ -1204,6 +1204,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 *
 	 * Subsequent `commit()` calls on the same coordinator are no-ops
 	 * (`inTransaction` is cleared), which keeps the enclosing transaction safe.
+	 * The savepoint stack is cleared too, so a later `ROLLBACK TO` / `RELEASE` that
+	 * the engine still broadcasts warns and degrades rather than throwing — see
+	 * `TransactionCoordinator.rollbackToSavepoint`, which mirrors the memory
+	 * module's identical posture.
 	 */
 	private async ddlCommitPendingOps(): Promise<void> {
 		if (this.moduleCoordinator?.isInTransaction()) {
@@ -1698,15 +1702,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 						if (expr && (expr as { type?: string }).type === 'literal') {
 							defaultLiteral = (expr as { value?: SqlValue }).value ?? null;
 						}
+						// Reads effectively, so a row this transaction inserted with a NULL is
+						// seen — it is backfilled (or rejects the ALTER) like any other row.
 						const nullCount = await table.rowsWithNullAtIndex(colIndex);
 						if (nullCount > 0) {
 							if (defaultLiteral === undefined || defaultLiteral === null) {
+								// Throw-only, and before the DDL-commit below: the transaction survives.
 								throw new QuereusError(
 									`column ${change.columnName} contains NULL values`,
 									StatusCode.CONSTRAINT,
 								);
 							}
 							const fill = defaultLiteral;
+							// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex`
+							// backfills this transaction's NULL rows too (the probe above saw
+							// them; a committed-store rewrite cannot). See {@link ddlCommitPendingOps}.
+							await this.ddlCommitPendingOps();
 							await table.mapRowsAtIndex(colIndex, (v) => v === null ? fill : v);
 						}
 						newCol = { ...oldCol, notNull: true };
@@ -1725,8 +1736,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					const newLogicalType = inferType(change.setDataType);
 					if (newLogicalType.physicalType !== oldCol.logicalType.physicalType) {
 						// Physical conversion required — walk every row and attempt parse.
-						await table.mapRowsAtIndex(colIndex, (v) => {
-							if (v === null) return v;
+						const convert = (v: SqlValue): SqlValue => {
 							try {
 								return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
 							} catch {
@@ -1735,7 +1745,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 									StatusCode.MISMATCH,
 								);
 							}
-						});
+						};
+						// Throw-only pass over the LIVE rows first, so an unconvertible value
+						// this transaction inserted rejects the ALTER with the transaction still
+						// intact. The rewrite below reads only committed rows.
+						for await (const value of table.iterateEffectiveValuesAtIndex(colIndex)) {
+							if (value !== null) convert(value);
+						}
+						// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex`
+						// converts this transaction's rows too; unflushed, they would replay
+						// under the OLD physical type. See {@link ddlCommitPendingOps}.
+						await this.ddlCommitPendingOps();
+						await table.mapRowsAtIndex(colIndex, (v) => v === null ? v : convert(v));
 					}
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				} else if (change.setDefault !== undefined) {

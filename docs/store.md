@@ -396,10 +396,14 @@ The statements with this behavior:
 - `ALTER TABLE ... ADD COLUMN` / `DROP COLUMN` (every stored row is re-encoded to the new column layout)
 - `ALTER TABLE ... ALTER PRIMARY KEY` (every data key, and every secondary-index key, is re-encoded)
 - `ALTER TABLE ... ALTER COLUMN <pk-member> SET COLLATE` (same re-key, driven by the column's new key collation)
+- `ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE`, when the new type has a different physical representation (every row's value is re-parsed and re-stored)
+- `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL`, when existing rows hold NULL and a literal `DEFAULT` backfills them
 
-Validation that can reject the statement without inspecting buffered rows runs *before* the commit, so a rejected statement leaves the transaction intact. Validation that must see buffered rows — the duplicate-key pass of a re-key, for instance — necessarily runs after it, so its `CONSTRAINT` error arrives with the enclosing transaction already committed. Storage is still left untouched in that case; only the transaction is gone.
+Validation that can reject the statement runs *before* the commit wherever possible, reading the buffered-plus-committed view so it sees this transaction's own rows: the NULL probe of `SET NOT NULL`, the convertibility probe of `SET DATA TYPE`, the `NOT NULL`-without-`DEFAULT` probe of `ADD COLUMN`, and the non-PK UNIQUE re-validation of `SET COLLATE` all leave the transaction intact when they reject. Validation that cannot be separated from the rewrite runs after the commit, so its error arrives with the enclosing transaction already committed. Storage is still left untouched in that case; only the transaction is gone. Two checks are in this category: the duplicate-key pass of a re-key (it must consider buffered rows *while* computing the new keys), and the `NOT NULL` check on a value produced by an `ADD COLUMN` backfill expression (it runs per row, as the rows are rewritten).
 
-DDL that writes no rows does **not** commit: `ADD CONSTRAINT`, `RENAME COLUMN`, `SET DEFAULT`, `SET COLLATE` on a non-PK column, and `CREATE INDEX` (which builds from the buffered-plus-committed view) all stay inside the open transaction.
+Savepoints opened before such a statement go away with the transaction. A later `ROLLBACK TO` or `RELEASE` naming one of them warns and proceeds — everything committed by the DDL stays committed — rather than raising. This mirrors the memory module.
+
+DDL that writes no rows does **not** commit: `ADD CONSTRAINT`, `RENAME COLUMN`, `SET DEFAULT`, `SET COLLATE` on a non-PK column, `SET DATA TYPE` within one physical representation, `DROP NOT NULL`, and `CREATE INDEX` (which builds from the buffered-plus-committed view) all stay inside the open transaction.
 
 ### Multi-Table Atomicity
 

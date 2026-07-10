@@ -428,23 +428,42 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
-	 * Scan every row, checking whether the column at `colIndex` ever holds NULL.
+	 * Yield the LIVE value of `colIndex` for every row — the open transaction's
+	 * pending overlay over the committed store. For throw-only ALTER COLUMN probes
+	 * that must run BEFORE the arm's DDL-commit (see `StoreModule.ddlCommitPendingOps`):
+	 * they have to see rows this transaction wrote, because those rows are rewritten
+	 * too, and a rejection here must leave the transaction intact.
+	 */
+	async *iterateEffectiveValuesAtIndex(colIndex: number): AsyncIterable<SqlValue> {
+		for await (const entry of this.iterateEffectiveEntries(buildFullScanBounds())) {
+			yield deserializeRow(entry.value)[colIndex];
+		}
+	}
+
+	/**
+	 * Count the LIVE rows whose column at `colIndex` holds NULL (see
+	 * {@link iterateEffectiveValuesAtIndex} for why this reads effectively).
 	 * Used by ALTER COLUMN SET NOT NULL to decide whether the tightening is safe.
 	 */
 	async rowsWithNullAtIndex(colIndex: number): Promise<number> {
-		const store = await this.ensureStore();
-		const bounds = buildFullScanBounds();
 		let count = 0;
-		for await (const entry of store.iterate(bounds)) {
-			const row = deserializeRow(entry.value);
-			if (row[colIndex] === null) count++;
+		for await (const value of this.iterateEffectiveValuesAtIndex(colIndex)) {
+			if (value === null) count++;
 		}
 		return count;
 	}
 
 	/**
 	 * Apply a per-row mapping function to every stored row, in place (re-writing
-	 * the same key). The mapper may throw QuereusError — propagated to the caller.
+	 * the same key). The mapper may throw QuereusError — propagated to the caller;
+	 * the batch is written only after every row maps, so a throw leaves the store
+	 * untouched.
+	 *
+	 * NOTE: reads and writes the COMMITTED store, outside the coordinator. Sound
+	 * only because every caller calls `StoreModule.ddlCommitPendingOps` first, so
+	 * "committed" is "everything live". A caller that skips that flush would leave
+	 * its transaction's pending rows unmapped, and they would replay unconverted
+	 * over the rewritten store at commit.
 	 */
 	async mapRowsAtIndex(
 		colIndex: number,

@@ -325,8 +325,9 @@ export class TransactionCoordinator {
    * Depth-addressed and idempotent under repeated same-target calls (setting
    * `length = targetDepth` twice is a no-op the second time). When the target
    * depth exceeds the current stack size (e.g. after a store DDL-commit —
-   * `replaceContents`/`renameTable` — cleared the stack while the engine still
-   * broadcasts the savepoint), warns and returns without padding the array.
+   * `replaceContents`, or `StoreModule.ddlCommitPendingOps` for `renameTable` and
+   * the row-rewriting `ALTER TABLE` arms — cleared the stack while the engine
+   * still broadcasts the savepoint), warns and returns without padding the array.
    * Mirrors `vtab/memory/layer/connection.ts` `releaseSavepoint`.
    */
   releaseSavepoint(targetDepth: number): void {
@@ -350,9 +351,11 @@ export class TransactionCoordinator {
    * Depth-addressed and idempotent under repeated same-target calls: re-slicing
    * `pendingOps`/`pendingEvents` back to the snapshot indices and rebuilding the
    * index is stable when nothing was queued in between. When the target depth is
-   * out of range (e.g. after a store DDL-commit — `replaceContents`/`renameTable`
-   * — cleared the stack while the engine still broadcasts the savepoint), warns
-   * and returns rather than throwing. Degrades to DDL-commits semantics: the
+   * out of range (e.g. after a store DDL-commit — `replaceContents`, or
+   * `StoreModule.ddlCommitPendingOps` for `renameTable` and the row-rewriting
+   * `ALTER TABLE` arms — cleared the stack while the engine still broadcasts the
+   * savepoint), warns and returns rather than throwing. Degrades to DDL-commit
+   * semantics: the
    * committed DDL and everything before it stays committed. Mirrors
    * `vtab/memory/layer/connection.ts` `rollbackToSavepoint`.
    */

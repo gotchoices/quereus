@@ -1,8 +1,9 @@
 /**
  * Row-rewriting ALTER TABLE vs. the module's buffered writes.
  *
- * `ADD COLUMN`, `DROP COLUMN`, `ALTER PRIMARY KEY`, and `SET COLLATE` on a PK
- * member all rewrite the stored rows in place, reading and writing the committed
+ * `ADD COLUMN`, `DROP COLUMN`, `ALTER PRIMARY KEY`, `SET COLLATE` on a PK member,
+ * `SET DATA TYPE` across physical representations, and a backfilling `SET NOT NULL`
+ * all rewrite the stored rows in place, reading and writing the committed
  * store directly. The transaction coordinator's buffered ops are `(keyBytes,
  * valueBytes)` pairs encoded under the PRE-ALTER schema, so replaying them over a
  * rewritten store corrupts, loses, or misfiles the rows. Each arm therefore
@@ -256,6 +257,109 @@ describe('Store ALTER TABLE with pending transaction ops', () => {
 		});
 	});
 
+	describe('ALTER COLUMN ... SET NOT NULL', () => {
+		it('backfills a NULL written earlier in the same transaction', async () => {
+			await db.exec(`create table t (a integer primary key, c integer null default 9) using store`);
+			await db.exec(`insert into t values (1, null)`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, null)`);
+			await db.exec(`alter table t alter column c set not null`);
+			await db.exec(`commit`);
+
+			// Without the DDL-commit, row 2's buffered NULL replays over the backfilled
+			// store and lands a NULL in a NOT NULL column.
+			expect(await asyncIterableToArray(db.eval(`select a, c from t order by a`)))
+				.to.deep.equal([{ a: 1, c: 9 }, { a: 2, c: 9 }]);
+		});
+
+		it('rejects a NULL written earlier in the same transaction when there is no default', async () => {
+			await db.exec(`create table t (a integer primary key, c integer null) using store`);
+			await db.exec(`insert into t values (1, 5)`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, null)`);
+			// The NULL probe reads effectively, so it sees the pending row and throws
+			// BEFORE the DDL-commit — the transaction stays alive and rolls back.
+			try {
+				await db.exec(`alter table t alter column c set not null`);
+				expect.fail('expected a CONSTRAINT error');
+			} catch (e) {
+				expect(String(e)).to.match(/contains NULL values/i);
+			}
+			await db.exec(`rollback`);
+
+			expect(await asyncIterableToArray(db.eval(`select a, c from t`)))
+				.to.deep.equal([{ a: 1, c: 5 }]);
+		});
+
+		it('honors a pending delete of the only NULL row', async () => {
+			await db.exec(`create table t (a integer primary key, c integer null) using store`);
+			await db.exec(`insert into t values (1, 5), (2, null)`);
+
+			await db.exec(`begin`);
+			await db.exec(`delete from t where a = 2`);
+			// No live NULL remains, so the tightening needs no backfill — and therefore
+			// never DDL-commits. The delete is still an ordinary buffered op at commit.
+			await db.exec(`alter table t alter column c set not null`);
+			await db.exec(`commit`);
+
+			expect(await asyncIterableToArray(db.eval(`select a, c from t`)))
+				.to.deep.equal([{ a: 1, c: 5 }]);
+		});
+	});
+
+	describe('ALTER COLUMN ... SET DATA TYPE', () => {
+		it('converts a value written earlier in the same transaction', async () => {
+			await db.exec(`create table t (a integer primary key, c text) using store`);
+			await db.exec(`insert into t values (1, '5')`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, '7')`);
+			await db.exec(`alter table t alter column c set data type integer`);
+			await db.exec(`commit`);
+
+			// Without the DDL-commit, row 2's buffered bytes replay with `c` still a
+			// TEXT '7' — the column's physical type is no longer uniform.
+			const rows = await asyncIterableToArray(db.eval(`select a, c from t order by a`));
+			expect(rows).to.deep.equal([{ a: 1, c: 5 }, { a: 2, c: 7 }]);
+			expect(rows.map(r => typeof (r as { c: unknown }).c)).to.deep.equal(['number', 'number']);
+		});
+
+		it('rejects an unconvertible value written earlier in the same transaction', async () => {
+			await db.exec(`create table t (a integer primary key, c text) using store`);
+			await db.exec(`insert into t values (1, '5')`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, 'nope')`);
+			// The convertibility probe reads effectively and throws before the
+			// DDL-commit, so the transaction survives and rolls back.
+			try {
+				await db.exec(`alter table t alter column c set data type integer`);
+				expect.fail('expected a MISMATCH error');
+			} catch (e) {
+				expect(String(e)).to.match(/Cannot convert value/i);
+			}
+			await db.exec(`rollback`);
+
+			expect(await asyncIterableToArray(db.eval(`select a, c from t`)))
+				.to.deep.equal([{ a: 1, c: '5' }]);
+		});
+
+		it('honors a pending delete of the only unconvertible row', async () => {
+			await db.exec(`create table t (a integer primary key, c text) using store`);
+			await db.exec(`insert into t values (1, '5'), (2, 'nope')`);
+
+			await db.exec(`begin`);
+			await db.exec(`delete from t where a = 2`);
+			await db.exec(`alter table t alter column c set data type integer`);
+			await db.exec(`commit`);
+
+			expect(await asyncIterableToArray(db.eval(`select a, c from t`)))
+				.to.deep.equal([{ a: 1, c: 5 }]);
+		});
+	});
+
 	describe('DDL-commit posture', () => {
 		// Each rewriting arm flushes the module-wide transaction before touching
 		// storage, so a later `rollback` cannot restore the pre-ALTER rows. These
@@ -264,6 +368,7 @@ describe('Store ALTER TABLE with pending transaction ops', () => {
 			{ name: 'ADD COLUMN', ddl: `alter table t add column w integer default 7` },
 			{ name: 'DROP COLUMN', ddl: `alter table t drop column c` },
 			{ name: 'ALTER PRIMARY KEY', ddl: `alter table t alter primary key (b)` },
+			{ name: 'SET DATA TYPE', ddl: `alter table t alter column b set data type text` },
 		];
 
 		for (const arm of arms) {
@@ -279,6 +384,30 @@ describe('Store ALTER TABLE with pending transaction ops', () => {
 					.to.deep.equal([{ a: 1 }]);
 			});
 		}
+
+		it('SET NOT NULL commits pending ops when it backfills; a later rollback does not restore them', async () => {
+			await db.exec(`create table t (a integer primary key, c integer null default 9) using store`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`alter table t alter column c set not null`);
+			await db.exec(`rollback`);
+
+			expect(await asyncIterableToArray(db.eval(`select a, c from t`)))
+				.to.deep.equal([{ a: 1, c: 9 }]);
+		});
+
+		it('SET NOT NULL stays inside the transaction when no live row is NULL', async () => {
+			await db.exec(`create table t (a integer primary key, c integer null) using store`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 5)`);
+			// Nothing to backfill, so nothing is rewritten and nothing is flushed.
+			await db.exec(`alter table t alter column c set not null`);
+			await db.exec(`rollback`);
+
+			expect(await asyncIterableToArray(db.eval(`select a from t`))).to.deep.equal([]);
+		});
 
 		it('commits a sibling table\'s pending ops too (the coordinator is module-wide)', async () => {
 			await db.exec(`create table t (a integer primary key, b integer) using store`);
