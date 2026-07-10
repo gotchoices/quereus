@@ -54,12 +54,19 @@ export class TransactionLayer implements Layer {
 	 * ordered those nodes with.
 	 */
 	public readonly collationResolver: CollationResolver;
-	private readonly tableSchemaAtCreation: TableSchema; // Schema when this layer was started
+	/**
+	 * Schema when this layer was started. Replaced only by {@link adoptSchema}, when
+	 * additive index/constraint DDL runs inside this layer's own transaction — the
+	 * primary key definition and column set are identical across that swap, so
+	 * {@link pkFunctions} and the primary tree stay valid.
+	 */
+	private tableSchemaAtCreation: TableSchema;
 
 	/**
-	 * Built once from {@link tableSchemaAtCreation} (which never changes for a layer),
-	 * so the primary tree, every inherited secondary index, and every scan share one
-	 * comparator/encoder set — and one pass of collation resolution.
+	 * Built once from {@link tableSchemaAtCreation}'s primary key definition (which
+	 * never changes for a layer), so the primary tree, every inherited secondary index,
+	 * and every scan share one comparator/encoder set — and one pass of collation
+	 * resolution.
 	 */
 	private readonly pkFunctions: PrimaryKeyFunctions;
 
@@ -140,6 +147,81 @@ export class TransactionLayer implements Layer {
 				parentSecondaryTree || undefined // Use parent's secondary index tree as base
 			);
 			this.secondaryIndexes.set(indexSchema.name, memoryIndex);
+		}
+	}
+
+	/**
+	 * Adopts an ADDITIVE schema change (a new index and/or a new UNIQUE constraint)
+	 * that was applied to the table while THIS layer's transaction is still open, so
+	 * the rest of that transaction reads and enforces the new structure.
+	 *
+	 * Without it, a layer created before the DDL keeps its creation-time schema: it has
+	 * neither the new `IndexSchema` (so an index scan raises "Secondary index not
+	 * found") nor the derived `uniqueConstraints` entry (so `checkUniqueConstraints`
+	 * silently skips it and a colliding insert is accepted).
+	 *
+	 * The caller MUST apply this to a whole parent chain oldest-first: each layer builds
+	 * its new `MemoryIndex` over its parent's tree for that index, so the parent's must
+	 * already exist. Only the layer's OWN writes are re-indexed — everything below is
+	 * inherited copy-on-write, exactly as `initializeSecondaryIndexes` does at
+	 * construction.
+	 *
+	 * Restricted to additive index/constraint DDL: a column or primary-key change would
+	 * invalidate {@link pkFunctions} and the primary tree, and is not reachable here
+	 * (`ensureSchemaChangeSafety` raises BUSY when any connection holds a pending layer,
+	 * except the DDL issuer's, and only `createIndex` / `addUniqueConstraint` call this).
+	 */
+	public adoptSchema(newSchema: TableSchema): void {
+		this.tableSchemaAtCreation = newSchema;
+		if (!newSchema.indexes) return;
+
+		for (const indexSchema of newSchema.indexes) {
+			if (this.secondaryIndexes.has(indexSchema.name)) continue;
+
+			const parentSecondaryTree = this.parentLayer.getSecondaryIndexTree?.(indexSchema.name);
+			const memoryIndex = new MemoryIndex(
+				indexSchema,
+				newSchema.columns,
+				this.collationResolver,
+				this.pkFunctions.compare,
+				this.pkFunctions.encode,
+				parentSecondaryTree || undefined,
+			);
+			this.reindexOwnWrites(memoryIndex);
+			this.secondaryIndexes.set(indexSchema.name, memoryIndex);
+		}
+	}
+
+	/**
+	 * Brings a newly-inherited `MemoryIndex` (built over the parent's tree, which
+	 * already covers the parent chain's effective rows) up to date with this layer's own
+	 * writes: for each primary key this layer touched, drop the parent's entry and add
+	 * this layer's effective row, if any. Both operations copy-on-write into this
+	 * layer's tree, leaving the parent's entries untouched.
+	 *
+	 * Driven by {@link ownWrites} (deduplicated by primary key — the log is an ordered
+	 * list that may touch one key repeatedly) rather than a full scan, so the cost is
+	 * proportional to the transaction's writes, not the table's size.
+	 */
+	private reindexOwnWrites(index: MemoryIndex): void {
+		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
+		const seen = new Set<string>();
+
+		for (const write of this.ownWrites) {
+			const encoded = this.pkFunctions.encode(write.primaryKey);
+			if (seen.has(encoded)) continue;
+			seen.add(encoded);
+
+			const parentRow = parentPrimaryTree?.get(write.primaryKey);
+			if (parentRow !== undefined && index.rowMatchesPredicate(parentRow)) {
+				index.removeEntry(index.keyFromRow(parentRow), write.primaryKey);
+			}
+			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
+			// undefined when the layer deleted the key, the layer's own row otherwise.
+			const ownRow = this.primaryModifications.get(write.primaryKey);
+			if (ownRow !== undefined && index.rowMatchesPredicate(ownRow)) {
+				index.addEntry(index.keyFromRow(ownRow), write.primaryKey);
+			}
 		}
 	}
 

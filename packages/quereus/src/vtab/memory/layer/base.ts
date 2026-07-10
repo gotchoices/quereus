@@ -14,6 +14,64 @@ import type { CollationResolver } from '../../../types/logical-type.js';
 let baseLayerCounter = 0;
 const logger = createMemoryTableLoggers('layer:base');
 
+/** Every row of a primary BTree, ascending by primary key. */
+export function* iteratePrimaryRows(tree: BTree<BTreeKeyForPrimary, Row>): Iterable<Row> {
+	for (const path of tree.ascending(tree.first())) {
+		yield tree.at(path)!;
+	}
+}
+
+/**
+ * Inserts every in-scope row of `rows` into the (freshly-created, empty-or-inherited)
+ * `index`, honoring its partial-WHERE predicate — rows for which the predicate is not
+ * TRUE are skipped.
+ *
+ * With `enforceUnique`, raises a CONSTRAINT error on the first duplicate index key
+ * among in-scope rows; the caller is expected to discard `index` and roll back any
+ * schema change. Duplicate detection runs through the index's own collation-aware
+ * comparator (its BTree keys by `compareKeys`), so a value set unique under BINARY but
+ * colliding under e.g. NOCASE surfaces here — a raw value signature would miss it.
+ * SQL UNIQUE allows multiple NULLs, so a key with any NULL value never counts as a
+ * duplicate. `hasAnyPrimaryKey` is O(1) (Map size) so the build stays O(N) —
+ * `getPrimaryKeys` would sort the bucket on every row.
+ *
+ * Parameterizing on a row iterable (rather than reading a fixed tree) is what lets
+ * `MemoryTableManager` validate a not-yet-built index against the DDL-issuing
+ * connection's EFFECTIVE rows — the committed base overlaid with its open
+ * transaction's pending writes — while the base index itself is still populated from
+ * committed rows only. See `docs/memory-table.md` § DDL and transactions.
+ */
+export function populateIndexFromRows(
+	rows: Iterable<Row>,
+	index: MemoryIndex,
+	primaryKeyFromRow: (row: Row) => BTreeKeyForPrimary,
+	enforceUnique: boolean,
+	tableName: string,
+	columns: ReadonlyArray<ColumnSchema>,
+): void {
+	for (const row of rows) {
+		if (!index.rowMatchesPredicate(row)) continue;
+
+		const indexKey = index.keyFromRow(row);
+		const primaryKey = primaryKeyFromRow(row);
+
+		if (enforceUnique) {
+			const hasNull = index.specColumns.some(c => row[c.index] === null);
+			if (!hasNull && index.hasAnyPrimaryKey(indexKey)) {
+				const colNames = index.specColumns
+					.map(c => columns[c.index]?.name ?? String(c.index))
+					.join(', ');
+				throw new QuereusError(
+					`UNIQUE constraint failed: ${tableName} (${colNames})`,
+					StatusCode.CONSTRAINT,
+				);
+			}
+		}
+
+		index.addEntry(indexKey, primaryKey);
+	}
+}
+
 export class BaseLayer implements Layer {
 	private readonly layerId: number;
 	public tableSchema: TableSchema;
@@ -346,54 +404,52 @@ export class BaseLayer implements Layer {
 		await this.rebuildAllSecondaryIndexes();
 	}
 
+	/**
+	 * Builds and populates a new secondary index over the COMMITTED rows.
+	 *
+	 * No duplicate check: uniqueness for `CREATE UNIQUE INDEX` / `ADD CONSTRAINT …
+	 * UNIQUE` is validated by `MemoryTableManager` against the DDL-issuing
+	 * connection's EFFECTIVE rows before this runs, and the base's rows are not a
+	 * subset of those — a duplicate the open transaction has DELETED still sits in
+	 * the base primary tree. Checking here would reject that legal build. The base
+	 * index is a lookup structure, never an enforcement one: `checkUniqueViaIndex`
+	 * re-validates every candidate entry against the live effective row, so an entry
+	 * for a row the transaction removed can never manufacture a conflict. See
+	 * `docs/memory-table.md` § DDL and transactions.
+	 */
 	async addIndexToBase(indexSchema: IndexSchema): Promise<void> {
 		logger.operation('Add Index', this.tableSchema.name, {
 			indexName: indexSchema.name
 		});
 
 		const newMemoryIndex = this.createMemoryIndex(indexSchema);
-		this.populateNewIndex(newMemoryIndex, indexSchema);
+		populateIndexFromRows(
+			iteratePrimaryRows(this.primaryTree),
+			newMemoryIndex,
+			this.primaryKeyFunctions.extractFromRow,
+			false,
+			this.tableSchema.name,
+			this.tableSchema.columns,
+		);
 		this.secondaryIndexes.set(indexSchema.name, newMemoryIndex);
 	}
 
 	/**
-	 * Populates a freshly-created secondary index from the primary tree,
-	 * honoring the index's partial-WHERE predicate (rows for which the
-	 * predicate is not TRUE are skipped). For UNIQUE indexes, raises a
-	 * CONSTRAINT error on the first duplicate index key among in-scope rows;
-	 * the caller is expected to roll back the schema change in that case.
+	 * Populates a freshly-created secondary index from the primary tree. Used by the
+	 * strict rebuild, where a re-keyed UNIQUE structure (e.g. `ALTER COLUMN … SET
+	 * COLLATE`) must reject a collision the new collation introduces — the base tree
+	 * IS the authoritative row set there, since `ensureSchemaChangeSafety` has drained
+	 * every committed layer into it and no connection may hold pending writes.
 	 */
 	private populateNewIndex(newIndex: MemoryIndex, indexSchema: IndexSchema): void {
-		for (const path of this.primaryTree.ascending(this.primaryTree.first())) {
-			const currentRow = this.primaryTree.at(path)!;
-			if (!newIndex.rowMatchesPredicate(currentRow)) continue;
-
-			const indexKey = newIndex.keyFromRow(currentRow);
-			const primaryKey = this.primaryKeyFunctions.extractFromRow(currentRow);
-
-			if (this.indexEnforcesUnique(indexSchema)) {
-				const cols = newIndex.specColumns.map(c => currentRow[c.index]);
-				// SQL UNIQUE allows multiple NULLs: skip dup detection if any key value is NULL.
-				const hasNull = cols.some(v => v === null);
-				// Detect duplicates through the index's own collation-aware comparator
-				// (its BTree keys by compareKeys), so a value set unique under BINARY but
-				// colliding under e.g. NOCASE surfaces here — a raw value signature would
-				// miss it. A non-empty key means a prior in-scope row already inserted it.
-				// hasAnyPrimaryKey is O(1) (Map size) so the ascending build stays O(N) —
-				// getPrimaryKeys would sort the bucket on every row.
-				if (!hasNull && newIndex.hasAnyPrimaryKey(indexKey)) {
-					const colNames = newIndex.specColumns
-						.map(c => this.tableSchema.columns[c.index]?.name ?? String(c.index))
-						.join(', ');
-					throw new QuereusError(
-						`UNIQUE constraint failed: ${this.tableSchema.name} (${colNames})`,
-						StatusCode.CONSTRAINT,
-					);
-				}
-			}
-
-			newIndex.addEntry(indexKey, primaryKey);
-		}
+		populateIndexFromRows(
+			iteratePrimaryRows(this.primaryTree),
+			newIndex,
+			this.primaryKeyFunctions.extractFromRow,
+			this.indexEnforcesUnique(indexSchema),
+			this.tableSchema.name,
+			this.tableSchema.columns,
+		);
 	}
 
 	/**

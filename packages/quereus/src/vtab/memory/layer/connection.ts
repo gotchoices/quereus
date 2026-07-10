@@ -212,4 +212,20 @@ export class MemoryTableConnection {
 	public clearSavepoints(): void {
 		this.savepointStack = [];
 	}
+
+	/**
+	 * True when this connection holds uncommitted writes for its table — either in a
+	 * pending layer, or (after an eager savepoint swapped it into `readLayer`) in an
+	 * immutable savepoint snapshot.
+	 *
+	 * `MemoryTableManager.ensureSchemaChangeSafety` uses this twice: it refuses a schema
+	 * change while a connection OTHER than the DDL issuer has open work (those rows are
+	 * invisible to the DDL's transaction, so a new constraint cannot be validated against
+	 * them), and it leaves the DDL issuer's own read view alone rather than re-pointing it
+	 * at the base layer.
+	 */
+	public hasOpenWork(): boolean {
+		return this.pendingTransactionLayer !== null
+			|| this.savepointStack.some(entry => entry.snapshot !== null);
+	}
 }

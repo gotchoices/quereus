@@ -3,7 +3,7 @@ import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildC
 import { type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
-import { BaseLayer } from './base.js';
+import { BaseLayer, iteratePrimaryRows, populateIndexFromRows } from './base.js';
 import { TransactionLayer, type OwnWrite } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
@@ -26,7 +26,7 @@ import type { VTableEventEmitter } from '../../events.js';
 import { inferType } from '../../../types/registry.js';
 import type { Expression } from '../../../parser/ast.js';
 import { compilePredicate } from '../utils/predicate.js';
-import type { MemoryIndex } from '../index.js';
+import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
 
@@ -1174,7 +1174,7 @@ export class MemoryTableManager {
 		targetLayer: TransactionLayer,
 		schema: TableSchema,
 		uc: UniqueConstraintSchema,
-		index: import('../index.js').MemoryIndex,
+		index: MemoryIndex,
 		newRowData: Row,
 		newPrimaryKey: BTreeKeyForPrimary,
 		onConflict: ConflictResolution,
@@ -2170,6 +2170,14 @@ export class MemoryTableManager {
 				}
 			}
 
+			// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows — a
+			// duplicate the transaction inserted but has not committed must reject the build,
+			// and one it has deleted must not. A throw here leaves schema, base layer and
+			// index map exactly as they were.
+			if (newIndexSchemaEntry.unique) {
+				this.validateUniqueOverEffectiveRows(newIndexSchemaEntry, this.tableSchema);
+			}
+
 			const updatedIndexes = Object.freeze([...(this.tableSchema.indexes || []), newIndexSchemaEntry]);
 			let updatedUniqueConstraints = this.tableSchema.uniqueConstraints;
 			if (newIndexSchemaEntry.unique) {
@@ -2194,6 +2202,9 @@ export class MemoryTableManager {
 			await this.baseLayer.addIndexToBase(newIndexSchemaEntry);
 
 			this.tableSchema = finalNewTableSchema;
+			// The DDL transaction's own layers froze their schema at creation; hand them the
+			// new one so the rest of the transaction scans and enforces the new index.
+			this.adoptSchemaOnOpenLayers(finalNewTableSchema);
 
 			// Emit schema change event
 			this.eventEmitter?.emitSchemaChange?.({
@@ -2205,7 +2216,16 @@ export class MemoryTableManager {
 
 			logger.operation('Create Index', this._tableName, { indexName });
 		} catch (e: unknown) {
+			// Restore the prior schema, and drop the index if `addIndexToBase` already landed
+			// it — otherwise the base layer's index map would advertise a structure the schema
+			// no longer declares. Guarded on the ORIGINAL schema so the "index already exists"
+			// arm never tears down the pre-existing index of the same name.
 			this.baseLayer.updateSchema(originalManagerSchema);
+			const name = newIndexSchemaEntry.name;
+			const preexisting = originalManagerSchema.indexes?.some(i => i.name.toLowerCase() === name.toLowerCase()) ?? false;
+			if (!preexisting && this.baseLayer.getSecondaryIndex(name)) {
+				await this.baseLayer.dropIndexFromBase(name);
+			}
 			this.tableSchema = originalManagerSchema;
 			logger.error('Create Index', this._tableName, e);
 			throw e;
@@ -2531,6 +2551,8 @@ export class MemoryTableManager {
 		);
 
 		if (matchingUniqueIndex) {
+			// No validation pass: the reused index is UNIQUE, so its own derived constraint
+			// has already rejected every colliding row — committed and pending alike.
 			const newSchema: TableSchema = Object.freeze({
 				...this.tableSchema,
 				uniqueConstraints: appendedUcs,
@@ -2542,6 +2564,9 @@ export class MemoryTableManager {
 				uc.name ?? matchingUniqueIndex.name,
 				{ indexName: matchingUniqueIndex.name, origin: 'implicit-from-unique-constraint' },
 			);
+			// This arm skips addIndexToBase, but the open transaction's layers still need the
+			// new `uniqueConstraints` entry or they will not enforce it.
+			this.adoptSchemaOnOpenLayers(newSchema);
 			return;
 		}
 
@@ -2556,15 +2581,19 @@ export class MemoryTableManager {
 			predicate: uc.predicate,
 		};
 
+		// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows (throws
+		// CONSTRAINT on the first in-scope duplicate). The covering index carries no
+		// `unique: true` flag, so `addIndexToBase` would not check it anyway — and must
+		// not: it populates from committed rows, which may still hold a duplicate this
+		// transaction has deleted.
+		this.validateUniqueOverEffectiveRows(indexSchema, this.tableSchema);
+
 		const newSchema: TableSchema = Object.freeze({
 			...this.tableSchema,
 			uniqueConstraints: appendedUcs,
 			indexes: Object.freeze([...existingIndexes, indexSchema]),
 		});
 
-		// Swap the schema FIRST so `addIndexToBase` → `indexEnforcesUnique` sees the
-		// new constraint and rejects duplicates, then populate (throws CONSTRAINT on
-		// the first in-scope duplicate). A throw rolls back via the catch in addConstraint.
 		this.baseLayer.updateSchema(newSchema);
 		await this.baseLayer.addIndexToBase(indexSchema);
 		this.tableSchema = newSchema;
@@ -2573,6 +2602,7 @@ export class MemoryTableManager {
 			uc.name ?? indexName,
 			{ indexName, origin: 'implicit-from-unique-constraint' },
 		);
+		this.adoptSchemaOnOpenLayers(newSchema);
 	}
 
 	/**
@@ -2635,10 +2665,27 @@ export class MemoryTableManager {
 			}
 		}
 
+		// Consolidation drains COMMITTED layers into the base; a connection's own
+		// UNCOMMITTED writes are untouched by it. Those rows are invisible to the DDL's
+		// transaction, so a row-validating schema change cannot be checked against them,
+		// and the sibling's layers cannot be re-pointed at the new schema. Only the
+		// DDL-issuing connection may hold open work — everyone else must land first.
+		const ddlConnection = this.ddlConnection();
+		for (const connection of this.knownConnections()) {
+			if (connection === ddlConnection || !connection.hasOpenWork()) continue;
+			throw new QuereusError(
+				`Cannot perform schema change on table ${this._tableName} while another connection has uncommitted changes. Commit/rollback active transactions and retry.`,
+				StatusCode.BUSY
+			);
+		}
+
 		// After ensuring we're at the base layer, update all connections to read from the base layer
-		// This is necessary because connections might still be reading from promoted/collapsed layers
+		// This is necessary because connections might still be reading from promoted/collapsed layers.
+		// The DDL issuer's own open transaction is exempt: its read view is a pending layer or an
+		// eager savepoint snapshot holding its uncommitted rows, and re-pointing it at the base
+		// would silently drop them from every later read in that transaction.
 		for (const connection of this.connections.values()) {
-			if (connection.readLayer !== this.baseLayer) {
+			if (connection.readLayer !== this.baseLayer && !connection.hasOpenWork()) {
 				logger.debugLog(`[Schema Safety] Updating connection ${connection.connectionId} to read from base layer`);
 				connection.readLayer = this.baseLayer;
 			}
@@ -2666,15 +2713,125 @@ export class MemoryTableManager {
 	 * the Database registry but not in the manager's map.
 	 */
 	private repointRegisteredConnections(): void {
+		for (const mc of this.registeredConnections()) {
+			if (mc.hasOpenWork()) continue;
+			if (mc.readLayer === this.baseLayer) continue;
+			logger.debugLog(`[Schema Safety] Re-pointing registered connection ${mc.connectionId} to base layer`);
+			mc.readLayer = this.baseLayer;
+		}
+	}
+
+	/** Every Database-registered {@link MemoryTableConnection} backed by this manager. */
+	private *registeredConnections(): Iterable<MemoryTableConnection> {
 		const qualifiedName = `${this.schemaName}.${this._tableName}`;
 		for (const c of this.db.getConnectionsForTable(qualifiedName)) {
 			if (!(c instanceof MemoryVirtualTableConnection)) continue;
 			const mc = c.getMemoryConnection();
 			if (mc.tableManager !== this) continue;
-			if (mc.pendingTransactionLayer !== null) continue;
-			if (mc.readLayer === this.baseLayer) continue;
-			logger.debugLog(`[Schema Safety] Re-pointing registered connection ${mc.connectionId} to base layer`);
-			mc.readLayer = this.baseLayer;
+			yield mc;
+		}
+	}
+
+	/**
+	 * Every connection this manager can see: the ones still attached to {@link connections}
+	 * (including unregistered committed-snapshot readers) plus the Database-registered ones,
+	 * which may have been detached from the map by a post-autocommit disconnect.
+	 */
+	private *knownConnections(): Iterable<MemoryTableConnection> {
+		const seen = new Set<MemoryTableConnection>();
+		for (const mc of this.connections.values()) {
+			seen.add(mc);
+			yield mc;
+		}
+		for (const mc of this.registeredConnections()) {
+			if (seen.has(mc)) continue;
+			seen.add(mc);
+			yield mc;
+		}
+	}
+
+	/**
+	 * The connection through which the current DDL statement's transaction runs, if any.
+	 *
+	 * A statement reaches a memory table through the single Database-registered connection
+	 * for it (`MemoryTable.ensureConnection` and `getVTableConnection` both reuse the first
+	 * one), so that connection's view IS this statement's transaction. In autocommit with
+	 * no prior scan there is no connection at all, and the committed base is the whole story.
+	 *
+	 * NOTE: takes the FIRST registered connection, matching how both reuse sites pick one.
+	 * If the registry ever holds more than one connection per (table, transaction), this
+	 * picks arbitrarily — validate against the writer instead, and treat the rest as
+	 * siblings.
+	 */
+	private ddlConnection(): MemoryTableConnection | undefined {
+		for (const mc of this.registeredConnections()) return mc;
+		return undefined;
+	}
+
+	/**
+	 * The rows a `select` issued by the DDL statement's own transaction would see: the
+	 * committed base overlaid with that connection's uncommitted writes. Degenerates to the
+	 * base primary tree when no connection holds open work.
+	 *
+	 * `pendingTransactionLayer ?? readLayer` is exactly the layer `MemoryTable.query` scans,
+	 * and each layer's primary BTree is copy-on-write over its parent's, so one ascending
+	 * walk yields the merged view (pending inserts/updates present, pending deletes absent).
+	 */
+	private effectiveDdlRows(): Iterable<Row> {
+		const connection = this.ddlConnection();
+		const layer: Layer = connection
+			? (connection.pendingTransactionLayer ?? connection.readLayer)
+			: this.baseLayer;
+		return iteratePrimaryRows(layer.getModificationTree('primary') ?? this.baseLayer.primaryTree);
+	}
+
+	/**
+	 * Rejects an index/constraint whose uniqueness the DDL transaction's own effective rows
+	 * already violate, BEFORE anything is mutated. Builds a throwaway {@link MemoryIndex} —
+	 * the collation-aware, partial-predicate-aware key comparator — over those rows and lets
+	 * {@link populateIndexFromRows} raise CONSTRAINT on the first duplicate.
+	 */
+	private validateUniqueOverEffectiveRows(indexSchema: IndexSchema, schema: TableSchema): void {
+		const probe = new MemoryIndex(
+			indexSchema,
+			schema.columns,
+			this.collationResolver,
+			this.primaryKeyFunctions.compare,
+			this.primaryKeyFunctions.encode,
+		);
+		populateIndexFromRows(
+			this.effectiveDdlRows(),
+			probe,
+			this.primaryKeyFunctions.extractFromRow,
+			true,
+			this._tableName,
+			schema.columns,
+		);
+	}
+
+	/**
+	 * Propagates an additive schema change (new index and/or new UNIQUE constraint) into
+	 * every {@link TransactionLayer} the DDL connection's open transaction still reads
+	 * through — its pending layer and every savepoint snapshot below it, which are exactly
+	 * the transaction layers on the view layer's parent chain above the base.
+	 *
+	 * Without this the transaction would keep enforcing (and scanning) its creation-time
+	 * schema for the rest of its life, and a `rollback to savepoint` would restore a
+	 * stale-schema layer. Rebasing would achieve the same but invalidate those snapshots.
+	 * Applied oldest-first: {@link TransactionLayer.adoptSchema} inherits its parent's tree
+	 * for the new index.
+	 */
+	private adoptSchemaOnOpenLayers(newSchema: TableSchema): void {
+		const connection = this.ddlConnection();
+		if (!connection) return;
+
+		const view = connection.pendingTransactionLayer ?? connection.readLayer;
+		const chain: TransactionLayer[] = [];
+		for (let cur: Layer | null = view; cur && cur !== this.baseLayer; cur = cur.getParent()) {
+			if (cur instanceof TransactionLayer) chain.push(cur);
+		}
+		for (let i = chain.length - 1; i >= 0; i--) {
+			chain[i].adoptSchema(newSchema);
 		}
 	}
 

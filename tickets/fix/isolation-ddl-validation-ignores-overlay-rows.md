@@ -65,3 +65,16 @@ the isolation overlay, not in the backend's own pending state.
   into cross-connection constraint checking.
 - Repro harness: `packages/quereus-store/test/isolated-store.spec.ts` already wires a
   store module behind the isolation layer.
+
+## A ready-made acceptance test is already in the tree
+
+`packages/quereus/test/logic/10.1.2-ddl-in-transaction.sqllogic` covers exactly this
+behavior end-to-end and passes on the memory backend. It is currently listed in
+`MEMORY_ONLY_FILES` in `packages/quereus/test/logic.spec.ts` **solely** because store mode
+runs the store module behind the isolation layer, which still has this bug. Every section
+of the file fails there today — both the validation half (the DDL is accepted over
+colliding overlay rows) and the enforcement half (a later colliding insert in the same
+transaction is accepted).
+
+Delete that `MEMORY_ONLY_FILES` entry as part of this ticket and make
+`yarn workspace @quereus/quereus test:store` pass with it enabled.

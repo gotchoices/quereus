@@ -527,6 +527,26 @@ interface VirtualTable {
 
 See [runtime.md](runtime.md) for transaction semantics.
 
+### DDL inside an open transaction
+
+`createIndex` and the row-validating `alterTable` arms (`ADD CONSTRAINT ... UNIQUE`,
+`ALTER COLUMN ... SET COLLATE`) can be invoked while the calling connection has uncommitted
+writes. Two obligations follow, and both bundled modules meet them:
+
+*   **Validate against the effective rows**, not the committed ones — the rows a `SELECT` on
+    that connection would return. Scanning committed rows alone lets a duplicate the
+    transaction just inserted slip past the check and land under a constraint that forbids it.
+*   **Enforce the new constraint for the rest of that transaction.** A module that snapshots
+    the table schema per transaction must refresh that snapshot, or the statement after the
+    DDL is checked against a schema that does not yet know the constraint exists.
+
+Neither module makes DDL itself transactional: the catalog entry and any physical structure
+are written outside the transaction coordinator, so a `ROLLBACK` discards the rows but leaves
+the index behind. That is safe only because both re-validate an index entry against the live
+row before returning or acting on it. See [memory-table.md](memory-table.md) § DDL and
+transactions for the full statement of the boundary and what a fully-cooperating module would
+do instead.
+
 ### Connection Registration
 
 For modules that need to participate in the database's transaction coordination (e.g., receiving `commit()` and `rollback()` calls when the database commits or rolls back), you must register connections with the database.

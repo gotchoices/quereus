@@ -195,6 +195,62 @@ await db.exec("alter table users rename column created_at to registration_date")
 *   **Automatic Cleanup:** Unused layers are automatically garbage collected when no longer referenced
 *   **Base Clearing:** The `clearBase()` operation makes layers independent, reducing memory overhead
 
+## DDL and transactions
+
+`CREATE INDEX` / `CREATE UNIQUE INDEX` / `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` may run
+inside an open transaction. Two rules define what that means.
+
+**1. Row-validating DDL sees exactly what a `SELECT` in the same transaction sees.**
+`MemoryTableManager` validates a new UNIQUE index or constraint against the DDL connection's
+*effective* rows — the committed base overlaid with that connection's uncommitted writes,
+i.e. the layer `pendingTransactionLayer ?? readLayer`. A duplicate the transaction inserted
+but has not committed raises `UNIQUE constraint failed`; a duplicate it has *deleted* does
+not block the build. Validation runs before anything is mutated, so a rejection leaves the
+schema, the base layer and the index map untouched.
+
+**2. The constraint is enforced for the remainder of that transaction.** A `TransactionLayer`
+freezes its schema at construction, so a layer created before the DDL would otherwise carry
+neither the new `IndexSchema` (an index scan raises "Secondary index not found") nor the
+derived `uniqueConstraints` entry (a colliding insert is silently accepted).
+`TransactionLayer.adoptSchema` hands the new schema to the pending layer and to every
+savepoint snapshot beneath it, building each layer's new `MemoryIndex` over its parent's and
+re-indexing only that layer's own writes. Rebasing would achieve the same, but it would
+invalidate the savepoint snapshots a `ROLLBACK TO SAVEPOINT` must restore.
+
+**Only the DDL-issuing connection may hold uncommitted writes.** A sibling connection's
+pending rows are invisible to the DDL's transaction, so a new constraint cannot be validated
+against them, and its layers cannot be re-pointed at the new schema. `ensureSchemaChangeSafety`
+raises `BUSY` in that case, the same posture as the pre-existing "older transaction versions
+are in use" branch.
+
+### Where the boundary sits
+
+The base layer's structures always contain **exactly the committed rows**: the new index is
+populated from the base primary tree only, never from pending rows, so one connection's
+uncommitted rows never surface in another's index scans. Two consequences follow.
+
+*   The base index can transiently hold an entry for a row the DDL transaction has deleted
+    (case 1 above). That is harmless: a secondary index here is a *lookup* structure, not an
+    enforcement one — `checkUniqueViaIndex` re-validates every candidate entry against the
+    live effective row and drops it when the row is gone or no longer carries the colliding
+    values, so a stale entry can never manufacture a conflict or a result.
+*   **DDL does not roll back.** The catalog entry (`SchemaManager`) and the base index BTree
+    are written immediately, outside the transaction coordinator, so a `ROLLBACK` after a
+    successful `CREATE INDEX` discards the rows but leaves the index and its derived UNIQUE
+    constraint in place. This is safe for the same reason: every reader re-validates an index
+    entry against the live row. It is nonetheless a real departure from SQL semantics.
+
+A module that fully cooperated with the transaction coordinator would instead stage the
+catalog entry and the new structure alongside the transaction's row writes and publish or
+discard both atomically at commit/rollback. Quereus does not yet expose a capability flag
+distinguishing the two, so callers cannot currently ask a module whether its DDL is
+transactional; see `tickets/backlog/feat-ddl-transaction-capability.md`. Modules that degrade
+here should document it, as this section does.
+
+The store module (`packages/quereus-store`) reaches the same two rules by a different route
+(it validates over `StoreTable.iterateEffectiveEntries` and its index store is likewise
+written outside the coordinator). See `docs/module-authoring.md` § Transaction Support.
+
 ## **Current Limitations:**
 
 *   **Constraint Enforcement:** `UNIQUE` (both primary key and secondary), `NOT NULL`, `CHECK`, and `FOREIGN KEY` constraints are enforced at the engine level. Secondary `UNIQUE` constraints auto-create backing indexes for O(log n) enforcement; NULL values in UNIQUE columns are allowed per SQL standard. `DEFAULT` values are applied during DML operations. FK enforcement is on by default (`pragma foreign_keys = on`); FKs require explicit action clauses (e.g. `ON DELETE CASCADE`) to be enforced — the default action is `IGNORE`.
