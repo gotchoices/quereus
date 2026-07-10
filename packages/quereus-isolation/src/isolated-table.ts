@@ -1,5 +1,5 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, logicalTypeCanHoldText, retargetFilterInfoIndex, PRIMARY_INDEX_NAME } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, logicalTypeCanHoldText, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, validateAndParse } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -814,6 +814,25 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		return schema.primaryKeyDefinition.map(pkDef => pkDef.index);
 	}
 
+	/**
+	 * Coerce each cell to its declared column logical type before PK extraction and
+	 * conflict detection — the same step StoreTable.coerceRow / MemoryTableManager.performInsert
+	 * run. Without it, an ON CONFLICT insert whose proposed key is a different storage class than
+	 * the stored key (TEXT '1' into an INTEGER key holding 1) probes the underlying with the
+	 * un-coerced key, misses the committed row, and stages the proposed row instead of updating
+	 * the existing one (bug-store-isolation-upsert-affinity-coerced-pk).
+	 */
+	private coerceRow(row: Row): Row {
+		const cols = this.tableSchema!.columns;
+		if (row.length > cols.length) {
+			throw new QuereusError(
+				`Too many values for ${this.schemaName}.${this.tableName}: expected ${cols.length}, got ${row.length}`,
+				StatusCode.ERROR,
+			);
+		}
+		return row.map((v, i) => validateAndParse(v, cols[i].logicalType, cols[i].name)) as Row;
+	}
+
 	// ==================== Write Operations ====================
 
 	/**
@@ -839,6 +858,18 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		const { operation, values, oldKeyValues } = args;
 		const tombstoneIndex = this.getTombstoneColumnIndex(overlay);
 
+		// Coerced only for PK extraction / merged-view conflict detection below — NOT
+		// for the overlay write. The overlay (a memory-module table) always re-coerces
+		// every cell on its own insert/update unconditionally, so writing the coerced
+		// row through would coerce twice. That is a no-op for most logical types, but
+		// JSON's `parse` is not idempotent for a JSON-string scalar (`'"hello"'` parses
+		// to the native JS string `"hello"`; re-parsing that bare string as JSON throws,
+		// since it lacks its own quotes) — double coercion would break any JSON column.
+		// Detection instead needs the coerced form: probing the overlay/underlying by an
+		// un-coerced PK (e.g. TEXT '1' against a stored INTEGER 1) misses the existing
+		// row entirely (bug-store-isolation-upsert-affinity-coerced-pk).
+		const coercedValues = values ? this.coerceRow(values) : values;
+
 		// Resolve the effective PK-level action once so the wrapped overlay vtab
 		// agrees with the overlay's decision. Per-UC defaults are applied inside
 		// checkMergedUniqueConstraints, since each UC may declare its own action.
@@ -850,7 +881,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		switch (operation) {
 			case 'insert': {
 				const pkIndices = this.getPrimaryKeyIndices();
-				const pk = values ? pkIndices.map(i => values[i]) : undefined;
+				const pk = coercedValues ? pkIndices.map(i => coercedValues[i]) : undefined;
 				// Secondary-UNIQUE REPLACE evictions surfaced via `evictedRows`.
 				const evicted: Row[] = [];
 
@@ -869,7 +900,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						// yielding an opaque INTERNAL error at commit or silent corruption.
 						// selfPks = [pk] excludes this row's own PK from conflict detection.
 						const ucResult = await this.checkMergedUniqueConstraints(
-							overlay, values!, [pk], tombstoneIndex, args.onConflict, evicted);
+							overlay, coercedValues!, [pk], tombstoneIndex, args.onConflict, evicted);
 						if (ucResult !== null) return ucResult;
 
 						const overlayRow = [...(values ?? []), 0];
@@ -907,7 +938,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						replacedUnderlyingRow = pkOutcome.replacedUnderlyingRow;
 
 						// Check non-PK UNIQUE constraints against merged view
-						const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, [pk], tombstoneIndex, args.onConflict, evicted);
+						const ucResult = await this.checkMergedUniqueConstraints(overlay, coercedValues!, [pk], tombstoneIndex, args.onConflict, evicted);
 						if (ucResult !== null) return ucResult;
 					}
 				}
@@ -929,7 +960,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				// 3. Both (previous update) - update the overlay row
 
 				const pkIndices = this.getPrimaryKeyIndices();
-				const targetPK = oldKeyValues ?? (values ? pkIndices.map(i => values[i]) : undefined);
+				const targetPK = oldKeyValues ?? (coercedValues ? pkIndices.map(i => coercedValues[i]) : undefined);
 
 				if (!targetPK || !values) {
 					throw new Error('UPDATE requires oldKeyValues or values with primary key');
@@ -941,7 +972,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 				const evicted: Row[] = [];
 
 				if (existingOverlayRow) {
-					const newPK = pkIndices.map(i => values![i]);
+					const newPK = pkIndices.map(i => coercedValues![i]);
 					const pkChanged = !this.keysEqual(targetPK, newPK);
 
 					if (pkChanged) {
@@ -951,7 +982,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						const pkOutcome = await this.checkMergedPKConflict(overlay, newPK, tombstoneIndex, args.onConflict);
 						if (pkOutcome.terminating) return pkOutcome.terminating;
 
-						const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, [targetPK, newPK], tombstoneIndex, args.onConflict, evicted);
+						const ucResult = await this.checkMergedUniqueConstraints(overlay, coercedValues!, [targetPK, newPK], tombstoneIndex, args.onConflict, evicted);
 						if (ucResult !== null) return ucResult;
 
 						// Remove existing overlay row then insert a tombstone so the underlying
@@ -976,7 +1007,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					return this.stripTombstoneFromResult(result, tombstoneIndex);
 				} else {
 					// Insert new overlay row (shadows underlying) — check underlying conflicts first
-					const newPK = pkIndices.map(i => values![i]);
+					const newPK = pkIndices.map(i => coercedValues![i]);
 					const pkChanged = !this.keysEqual(targetPK, newPK);
 
 					let replacedUnderlyingRow: Row | undefined;
@@ -987,7 +1018,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					}
 
 					const selfPks: SqlValue[][] = pkChanged ? [targetPK, newPK] : [targetPK];
-					const ucResult = await this.checkMergedUniqueConstraints(overlay, values!, selfPks, tombstoneIndex, args.onConflict, evicted);
+					const ucResult = await this.checkMergedUniqueConstraints(overlay, coercedValues!, selfPks, tombstoneIndex, args.onConflict, evicted);
 					if (ucResult !== null) return ucResult;
 
 					// For PK-change updates, tombstone the old PK so the underlying row is deleted at flush
@@ -1010,7 +1041,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			case 'delete': {
 				// For deletes, insert a tombstone into overlay
 				const pkIndices = this.getPrimaryKeyIndices();
-				const targetPK = oldKeyValues ?? (values ? pkIndices.map(i => values[i]) : undefined);
+				const targetPK = oldKeyValues ?? (coercedValues ? pkIndices.map(i => coercedValues[i]) : undefined);
 
 				if (!targetPK) {
 					throw new Error('DELETE requires oldKeyValues or values with primary key');

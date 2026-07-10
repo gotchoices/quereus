@@ -5,13 +5,12 @@
 -- proposed value before comparing, so the conflict routes to the UPSERT arm
 -- instead of aborting. Ticket bug-upsert-conflict-target-collation-match.
 --
--- MEMORY-ONLY (excluded from store mode in logic.spec.ts MEMORY_ONLY_FILES).
--- This corner is correct on the memory and plain-store backends, but the
--- ISOLATION overlay (createIsolatedStoreModule, the store-mode harness) has a
--- separate defect: a cross-storage-class proposed PK value leaves the proposed
--- row staged in the overlay, so the existing row is wrongly replaced (DO NOTHING
--- keeps the proposed value; DO UPDATE loses its update). That is NOT this
--- engine-side fix — it is tracked by fix/bug-store-isolation-upsert-affinity-coerced-pk.
+-- Runs in BOTH memory and store mode. The isolation overlay
+-- (createIsolatedStoreModule, the store-mode harness) coerces the proposed row
+-- to the declared column types before probing for a conflict, same as the
+-- plain store and in-memory engine (bug-store-isolation-upsert-affinity-coerced-pk),
+-- so a cross-storage-class proposed PK value (e.g. TEXT '1' into an INTEGER key
+-- holding 1) matches the stored key instead of shadowing it with a fresh row.
 -- The collation-variant (same-storage-class) corners of this fix run in BOTH
 -- modes in the sibling file 47.3-upsert-conflict-target-collation.sqllogic.
 
