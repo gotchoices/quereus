@@ -193,6 +193,10 @@ class StrictRowContextMap extends RowContextMap {
 			// `desc` is a strictly-newer live context for this attr. If it resolves the
 			// same value the read is not observably wrong regardless of which wins — only
 			// a differing value is the silent wrong-row this harness exists to catch.
+			// NOTE: `===` is reference equality for blobs (Uint8Array), so two distinct
+			// blob objects with identical bytes at a shared column would false-positive
+			// here (test-mode only, never observed in the suite). If it ever trips, swap
+			// this shared-column check for a value-aware SQL comparison (compareSqlValues).
 			if (row[col] === winnerVal) continue;
 			throw contextShadowError(attributeId, columnName, winnerDesc, desc, this.installer, rctx);
 		}
