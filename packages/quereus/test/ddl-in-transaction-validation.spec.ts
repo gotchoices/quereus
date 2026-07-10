@@ -360,6 +360,37 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(await rowCount(db, 't')).to.equal(0);
 		});
 
+		it('DDL after a RELEASED eager savepoint does not lose the pre-savepoint rows', async () => {
+			// `release` pops the savepoint entry but leaves its snapshot installed as
+			// `readLayer`, still holding uncommitted rows. `hasOpenWork` must keep reporting
+			// them, or the schema change re-points the read view at the base and drops row 1.
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`release s`);
+			await db.exec(`create index ix on t (v)`);
+			await db.exec(`commit`);
+
+			expect(await rowCount(db, 't')).to.equal(1);
+		});
+
+		it('create unique index sees a duplicate held only in a RELEASED savepoint snapshot', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a'), (2, 'a')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`release s`);
+
+			await expectError(
+				() => db.exec(`create unique index ix on t (v)`),
+				StatusCode.CONSTRAINT,
+				/UNIQUE constraint failed/i,
+			);
+			await db.exec(`rollback`);
+			expect(await rowCount(db, 't')).to.equal(0);
+		});
+
 		it('after rollback to savepoint the adopted schema still enforces the new constraint', async () => {
 			await db.exec(`create table t (id integer primary key, v text)`);
 			await db.exec(`begin`);

@@ -223,6 +223,13 @@ against them, and its layers cannot be re-pointed at the new schema. `ensureSche
 raises `BUSY` in that case, the same posture as the pre-existing "older transaction versions
 are in use" branch.
 
+Both rules are scoped to the index/constraint-building DDL named above. `ALTER TABLE ... ALTER
+COLUMN ... SET COLLATE` re-validates uniqueness by rebuilding the base layer's secondary indexes,
+which read committed rows only, so it still misses the issuing transaction's pending rows; see
+`tickets/fix/bug-memory-alter-collate-ignores-pending-rows.md`. `DROP INDEX` / `DROP CONSTRAINT`
+inside a transaction likewise keep enforcing for the rest of it — `adoptSchema` adds structures
+and never removes them; see `tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
+
 ### Where the boundary sits
 
 The base layer's structures always contain **exactly the committed rows**: the new index is

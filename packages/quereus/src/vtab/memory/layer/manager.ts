@@ -2827,6 +2827,13 @@ export class MemoryTableManager {
 
 		const view = connection.pendingTransactionLayer ?? connection.readLayer;
 		const chain: TransactionLayer[] = [];
+		// NOTE: the walk takes every TransactionLayer below the view, which normally means the
+		// pending layer and its savepoint snapshots. A committed layer already drained into the
+		// base by `ensureSchemaChangeSafety` can also sit in the chain (the pending layer forked
+		// from it before consolidation); adopting it is a harmless no-op because its rows are
+		// already in the base's new index. That stops being true if `adoptSchema` ever removes
+		// structures or stops being idempotent — it cannot skip committed layers, since a
+		// savepoint snapshot is `markCommitted()` too.
 		for (let cur: Layer | null = view; cur && cur !== this.baseLayer; cur = cur.getParent()) {
 			if (cur instanceof TransactionLayer) chain.push(cur);
 		}
