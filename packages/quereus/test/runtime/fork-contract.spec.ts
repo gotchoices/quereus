@@ -48,6 +48,10 @@ const EXPECTED_FORK_POLICY = {
 	signal: 'shared-frozen',
 	contextTracker: 'shared-sink',
 	planStack: 'shared-sink',
+	// Once-per-execution memo for impure subqueries: shared by reference so the
+	// run-once contract spans branches (matching the pre-cache single-closure memo).
+	// Mutation across branches is the impure-subquery contract's responsibility.
+	executionMemo: 'shared-cooperative',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
@@ -178,6 +182,7 @@ describe('Fork contract (test harness)', () => {
 			parent.contextTracker = {} as unknown as RuntimeContext['contextTracker'];
 			parent.planStack = [];
 			parent.signal = new AbortController().signal;
+			parent.executionMemo = new Map();
 
 			const [fork] = driver.fork(parent, 1);
 

@@ -151,32 +151,22 @@ export function emitCallFromPlan(plan: PlanNode, emissionCtx: EmissionContext): 
 }
 
 /**
- * Creates an instruction that validates its schema dependencies before execution.
- * This should be used for instructions that captured schema objects during emission.
+ * Builds an instruction for an emitter that captured schema objects during emission.
+ *
+ * Schema validation is NOT wrapped here: it is hoisted to once per execution in
+ * `Statement._iterateRowsRawInternal`, which calls
+ * `EmissionContext.validateCapturedSchemaObjects()` once before the scheduler runs.
+ * A single emission context is shared by every capturing instruction, so one central
+ * call covers them all — instead of O(#capturing-instructions × snapshot-size) per run
+ * (worse inside an un-cached nested-loop-join inner, which re-fired per outer row).
+ *
+ * The signature and the six call sites are retained so those emitters stay untouched.
  */
 export function createValidatedInstruction(
 	params: Instruction[],
 	run: InstructionRun,
-	emissionCtx: EmissionContext,
+	_emissionCtx: EmissionContext,
 	note?: string
 ): Instruction {
-	// Only add validation if we actually captured schema objects
-	if (emissionCtx.getCapturedObjectCount() === 0) {
-		return { params, run, note };
-	}
-
-	// Wrap the run function to validate schema before execution
-	const validatedRun: InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => {
-		// Validate schema objects are still available
-		emissionCtx.validateCapturedSchemaObjects();
-		// If validation passes, run the original instruction
-		return run(ctx, ...args);
-	};
-
-	return {
-		params,
-		run: validatedRun,
-		note: note ? `validated(${note})` : 'validated',
-		emissionContext: emissionCtx
-	};
+	return { params, run, note };
 }

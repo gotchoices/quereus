@@ -46,6 +46,16 @@ export type RuntimeContext = {
 	contextTracker?: ContextTracker;
 	/** Stack of currently executing plan nodes (only when tracing enabled) */
 	planStack?: PlanNode[];
+	/**
+	 * Per-execution memo for instructions that must fire exactly once per statement
+	 * execution — the impure (DML-bearing) scalar/`IN`/`EXISTS` subquery emitters
+	 * store their drained result here, keyed by a unique symbol minted at emit time.
+	 * Because a fresh RuntimeContext is built for each execution while the instruction
+	 * tree is cached and reused, tying the memo to the context (not the emit-time
+	 * closure) makes it reset between prepared-statement runs — so a re-executed
+	 * statement re-drives its inner DML, rather than replaying the first run's result.
+	 */
+	executionMemo?: Map<symbol, { value: SqlValue }>;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;

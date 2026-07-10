@@ -40,6 +40,14 @@ export class Statement {
 	private boundArgs: Record<number | string, SqlValue> = {};
 	private plan: BlockNode | null = null;
 	private emissionContext: EmissionContext | null = null;
+	/**
+	 * Cached scheduler for the emitted instruction tree. Emit + schedule are
+	 * value-independent (emitters see only `(plan, EmissionContext)`, never bound
+	 * params), so this is built once and reused across executions. Its lifetime is
+	 * exactly the emission context's: nulled in lockstep with `this.emissionContext`
+	 * at every invalidation site, and rebuilt lazily in `_iterateRowsRawInternal`.
+	 */
+	private scheduler: Scheduler | null = null;
 	private needsCompile = true;
 	private columnDefCache = new Cached<DeepReadonly<ColumnDef>[]>(() => this.getColumnDefs());
 	private schemaChangeUnsubscriber: (() => void) | null = null;
@@ -116,6 +124,7 @@ export class Statement {
 			this.astBatchIndex++;
 			this.plan = null;
 			this.emissionContext = null;
+			this.scheduler = null;
 			this.needsCompile = true;
 			this.columnDefCache.clear();
 			this.parameterTypes = undefined;
@@ -210,6 +219,7 @@ export class Statement {
 						this.needsCompile = true;
 						this.plan = null;
 						this.emissionContext = null;
+						this.scheduler = null;
 						this.columnDefCache.clear();
 					}
 				});
@@ -323,8 +333,20 @@ export class Statement {
 			if (!blockPlanNode.statements.length) return;
 
 			const emissionContext = this.getEmissionContext();
-			const rootInstruction = emitPlanNode(blockPlanNode, emissionContext);
-			const scheduler = new Scheduler(rootInstruction);
+			// Emit + schedule once and reuse across executions — the instruction tree is
+			// value-independent (bound params resolve from ctx.params at run time, not at
+			// emit time), and its validity is exactly the emission context's, which is
+			// nulled together with `this.scheduler` on any schema-dependency change.
+			// NOTE: the emission context (and thus this scheduler) is cached, so toggling
+			// the `trace_plan_stack` db option mid-life is ignored until the plan is
+			// recompiled — the tracing wrap is baked at emit time. Pre-existing behavior,
+			// unchanged here; caching the scheduler does not regress it (per-run tracer
+			// wrapping lives in the scheduler hooks, not baked). Recompile to pick up a toggle.
+			if (!this.scheduler) {
+				const rootInstruction = emitPlanNode(blockPlanNode, emissionContext);
+				this.scheduler = new Scheduler(rootInstruction);
+			}
+			const scheduler = this.scheduler;
 			const tracer = runtimeOverrides?.tracer ?? this.db.getInstructionTracer();
 			const enableMetrics = runtimeOverrides?.enableMetrics ?? Boolean(this.db.getOption('runtime_metrics'));
 			const signal = runtimeOverrides?.signal;
@@ -338,6 +360,14 @@ export class Statement {
 				enableMetrics,
 				signal,
 			};
+
+			// Validate captured schema objects once per execution — hoisted out of every
+			// capturing instruction's run (see createValidatedInstruction). Runs after any
+			// schema-change listener would have fired; a defensive existence check for a
+			// schema change racing execution setup. Skip when nothing was captured.
+			if (emissionContext.getCapturedObjectCount() > 0) {
+				emissionContext.validateCapturedSchemaObjects();
+			}
 
 			const results = await scheduler.run(runtimeCtx);
 			if (results) {
@@ -470,6 +500,7 @@ export class Statement {
 		this.boundArgs = {};
 		this.plan = null;
 		this.emissionContext = null;
+		this.scheduler = null;
 		this.columnDefCache.clear();
 		this.astBatchIndex = -1;
 

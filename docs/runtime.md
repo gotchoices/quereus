@@ -1380,9 +1380,11 @@ an impure-path implementation that applies two contracts:
   per-row scan would re-invoke the scalar subquery's `run` function once per
   outer row. The emitter memoizes the materialized result and the
   scalar/`EXISTS`/`IN` answer on first call, and replays the memoized answer
-  on subsequent calls without re-driving the iterator. Closure state is
-  per-emission and `Statement` re-emits per execution, so the memoization
-  resets between prepared-statement runs.
+  on subsequent calls without re-driving the iterator. The memo lives on the
+  per-execution `RuntimeContext` (`ctx.executionMemo`, keyed by a symbol minted
+  at emit time), not in the emit-time closure — so a `Statement` that caches and
+  reuses its instruction tree across executions still resets the memo between
+  prepared-statement runs, re-driving the inner DML once per run.
 
 Both contracts are gated by `physical.readonly === false` on the inner — pure
 subqueries take the unchanged short-circuit fast path. See

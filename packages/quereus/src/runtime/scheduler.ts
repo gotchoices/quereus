@@ -394,8 +394,16 @@ export class Scheduler {
 	private metricsHooks(): RunHooks {
 		return {
 			onStart: () => {
+				// Reset (not create-if-absent): a cached scheduler is reused across
+				// executions, so stats must be zeroed each run to report per-execution
+				// numbers rather than accumulating across runs.
 				for (const instruction of this.instructions) {
-					if (!instruction.runtimeStats) {
+					if (instruction.runtimeStats) {
+						instruction.runtimeStats.in = 0;
+						instruction.runtimeStats.out = 0;
+						instruction.runtimeStats.elapsedNs = 0n;
+						instruction.runtimeStats.executions = 0;
+					} else {
 						instruction.runtimeStats = {
 							in: 0,
 							out: 0,

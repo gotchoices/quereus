@@ -12,6 +12,21 @@ import { ConstantNode } from '../../planner/nodes/plan-node.js';
 import { PlanNodeCharacteristics } from '../../planner/framework/characteristics.js';
 import { effectiveInCollation } from '../../planner/analysis/comparison-collation.js';
 
+/**
+ * Once-per-execution memo for impure (DML-bearing) subquery inners. The cell
+ * lives on the {@link RuntimeContext} — rebuilt for every statement execution —
+ * keyed by a symbol minted per emit site. This is what makes the "run-once per
+ * execution" contract hold when the instruction tree is cached and reused across
+ * prepared-statement runs: the emit-time closure persists, but the memo does not.
+ */
+function readExecutionMemo(rctx: RuntimeContext, key: symbol): { value: SqlValue } | undefined {
+	return rctx.executionMemo?.get(key);
+}
+
+function writeExecutionMemo(rctx: RuntimeContext, key: symbol, value: SqlValue): void {
+	(rctx.executionMemo ??= new Map<symbol, { value: SqlValue }>()).set(key, { value });
+}
+
 export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContext): Instruction {
 	const isImpure = PlanNodeCharacteristics.subtreeHasSideEffects(plan.subquery);
 
@@ -19,12 +34,13 @@ export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContex
 		// Impure inner (DML w/ RETURNING in scalar position):
 		// - Fully drain the iterator so every write happens, not just the first.
 		// - Memoize across re-evaluations (correlated outer, per-row scan) so
-		//   the DML fires exactly once per statement execution. Closure state
-		//   is per-emission and the Statement re-emits per execution, so this
-		//   resets between prepared-statement runs.
-		let memoized: { value: SqlValue } | null = null;
+		//   the DML fires exactly once per statement execution. The memo lives on
+		//   the RuntimeContext (rebuilt each execution), so it resets between
+		//   prepared-statement runs even though this instruction tree is cached.
+		const memoKey = Symbol('SCALAR_SUBQUERY(impure)');
 
-		async function runImpure(_rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
+		async function runImpure(rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
+			const memoized = readExecutionMemo(rctx, memoKey);
 			if (memoized) return memoized.value;
 
 			let result: SqlValue = null;
@@ -41,7 +57,7 @@ export function emitScalarSubquery(plan: ScalarSubqueryNode, ctx: EmissionContex
 				// Continue iterating to drive every write, even past the first row.
 			}
 
-			memoized = { value: result };
+			writeExecutionMemo(rctx, memoKey, result);
 			return result;
 		}
 
@@ -94,10 +110,12 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 
 		if (isImpure) {
 			// Impure inner: fully drain (no short-circuit on match) so every
-			// write fires, and memoize so re-evaluation does not re-drive the DML.
-			let memoized: { value: SqlValue } | null = null;
+			// write fires, and memoize (once per execution, on the RuntimeContext)
+			// so re-evaluation does not re-drive the DML.
+			const memoKey = Symbol('IN(impure)');
 
-			async function runImpure(_rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
+			async function runImpure(rctx: RuntimeContext, input: AsyncIterable<Row>, condition: SqlValue): Promise<SqlValue> {
+				const memoized = readExecutionMemo(rctx, memoKey);
 				if (memoized) return memoized.value;
 
 				let matched = false;
@@ -125,7 +143,7 @@ export function emitIn(plan: InNode, ctx: EmissionContext): Instruction {
 					result = hasNull ? null : false;
 				}
 
-				memoized = { value: result };
+				writeExecutionMemo(rctx, memoKey, result);
 				return result;
 			}
 
@@ -283,10 +301,12 @@ export function emitExists(plan: ExistsNode, ctx: EmissionContext): Instruction 
 
 	if (isImpure) {
 		// Impure inner: fully drain (no short-circuit) so every write fires,
-		// and memoize so re-evaluation does not re-drive the DML.
-		let memoized: { value: SqlValue } | null = null;
+		// and memoize (once per execution, on the RuntimeContext) so re-evaluation
+		// does not re-drive the DML.
+		const memoKey = Symbol('EXISTS(impure)');
 
-		async function runImpure(_rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
+		async function runImpure(rctx: RuntimeContext, input: AsyncIterable<Row>): Promise<SqlValue> {
+			const memoized = readExecutionMemo(rctx, memoKey);
 			if (memoized) return memoized.value;
 
 			let any = false;
@@ -296,7 +316,7 @@ export function emitExists(plan: ExistsNode, ctx: EmissionContext): Instruction 
 			}
 
 			const result: SqlValue = any;
-			memoized = { value: result };
+			writeExecutionMemo(rctx, memoKey, result);
 			return result;
 		}
 

@@ -53,11 +53,18 @@ export class ParallelDriver {
 	 *   parent's entries — set/delete in one fork do not leak to siblings or parent;
 	 * - **shared** references to read-mostly state: `db`, `stmt`, `params`,
 	 *   `enableMetrics`, `mutationOrdinal`, `signal`, `tracer`, `activeConnection`,
-	 *   `contextTracker`, `planStack`. (`signal` is shared so every branch honors the
-	 *   same cooperative cancellation — the table-scan leaf reads `rctx.signal`.)
-	 *   (`mutationOrdinal` is a per-row INSERT/envelope
+	 *   `contextTracker`, `planStack`, `executionMemo`. (`signal` is shared so every
+	 *   branch honors the same cooperative cancellation — the table-scan leaf reads
+	 *   `rctx.signal`.) (`mutationOrdinal` is a per-row INSERT/envelope
 	 *   scalar set+restored synchronously by the sequential insert path, never mutated
 	 *   inside a parallel fork, so each child snapshots the parent value.)
+	 *   (`executionMemo` is the once-per-execution memo for impure subqueries; shared
+	 *   by reference so the run-once contract spans branches, matching the pre-cache
+	 *   single-closure memo. NOTE: it is lazily created on first impure-subquery run,
+	 *   so if a future parallelized query drives an impure subquery inside a fork, the
+	 *   memo must be eagerly created on the parent *before* fork() — otherwise each
+	 *   branch lazily makes its own and the inner DML fires once per branch. Dormant
+	 *   today: ParallelDriver has no query consumers.)
 	 *
 	 * The parent is treated as immutable for the lifetime of the forks.
 	 */
@@ -93,6 +100,7 @@ export class ParallelDriver {
 				signal: rctx.signal,
 				contextTracker: rctx.contextTracker,
 				planStack: rctx.planStack,
+				executionMemo: rctx.executionMemo,
 			};
 			if (strict) {
 				markForkOf(childTableContexts, rctx.tableContexts);
