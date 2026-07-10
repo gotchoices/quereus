@@ -386,6 +386,21 @@ The store module integrates with Quereus's transaction coordinator to provide mu
 4. **Transaction Commit**: Quereus calls `commit()` on connections; the coordinator writes the batch atomically
 5. **Transaction Rollback**: The coordinator discards the pending batch; no changes are persisted
 
+### DDL that implicitly commits
+
+Some DDL rewrites or relocates storage directly, bypassing the coordinator's buffer. Such a statement first **commits the module-wide transaction** — every buffered write, for *every* table the coordinator holds, not just the altered one — and only then touches storage. After it runs there is nothing left to roll back: a subsequent `ROLLBACK` will not restore the pre-DDL rows.
+
+The statements with this behavior:
+
+- `ALTER TABLE ... RENAME TO` (the physical stores move)
+- `ALTER TABLE ... ADD COLUMN` / `DROP COLUMN` (every stored row is re-encoded to the new column layout)
+- `ALTER TABLE ... ALTER PRIMARY KEY` (every data key, and every secondary-index key, is re-encoded)
+- `ALTER TABLE ... ALTER COLUMN <pk-member> SET COLLATE` (same re-key, driven by the column's new key collation)
+
+Validation that can reject the statement without inspecting buffered rows runs *before* the commit, so a rejected statement leaves the transaction intact. Validation that must see buffered rows — the duplicate-key pass of a re-key, for instance — necessarily runs after it, so its `CONSTRAINT` error arrives with the enclosing transaction already committed. Storage is still left untouched in that case; only the transaction is gone.
+
+DDL that writes no rows does **not** commit: `ADD CONSTRAINT`, `RENAME COLUMN`, `SET DEFAULT`, `SET COLLATE` on a non-PK column, and `CREATE INDEX` (which builds from the buffered-plus-committed view) all stay inside the open transaction.
+
 ### Multi-Table Atomicity
 
 Since all tables in a LevelDB module share the same underlying database (tables are distinguished by key prefixes), a single `WriteBatch` can atomically commit changes across all tables:

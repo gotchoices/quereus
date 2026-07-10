@@ -1079,6 +1079,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * post-ALTER schema (its `primaryKeyDefinition` + column collations drive the new
 	 * PK-suffix encoding via {@link buildIndexEntries}). `normalizers` is the owning
 	 * connection's `db.getKeyNormalizerResolver()` — see {@link buildIndexEntries}.
+	 *
+	 * NOTE: reads the data store committed-only and writes the index stores outside the
+	 * coordinator. Sound only because both callers (the two re-key arms) call
+	 * {@link ddlCommitPendingOps} first, so "committed" is "everything live". A caller
+	 * that skips that flush would rebuild an index missing its transaction's pending rows.
 	 */
 	private async rebuildSecondaryIndexes(
 		schemaName: string,
@@ -1173,6 +1178,40 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Flush the module's buffered writes before a DDL operation that physically
+	 * rewrites or relocates storage.
+	 *
+	 * Such a DDL cannot honor the coordinator's buffer: pending ops are
+	 * `(keyBytes, valueBytes, store)` triples computed at DML time under the
+	 * PRE-DDL schema, and every physical rewrite (`StoreTable.rekeyRows` /
+	 * `migrateRows`, the provider's directory move) reads and writes the COMMITTED
+	 * store directly. Replaying stale-schema ops over the rewritten store on the
+	 * eventual commit corrupts, loses, or misfiles those rows. So an `ALTER TABLE`
+	 * that touches storage is effectively DDL-committing on a store-backed table:
+	 * flush NOW, before the first physical read, so the rewrite sees every live row
+	 * and there is nothing left to replay afterwards.
+	 *
+	 * Consequences, both deliberate:
+	 * - The coordinator is module-wide, so this commits the WHOLE module
+	 *   transaction — every table's pending ops, not just the altered/renamed
+	 *   table's — in one all-or-nothing batch. An ALTER cannot half-commit some
+	 *   sibling tables.
+	 * - Validation running AFTER this point (e.g. `rekeyRows`' duplicate-key pass,
+	 *   which must see pending rows because a pending insert can itself be the
+	 *   duplicate) throws with the enclosing transaction already flushed. The store
+	 *   stays unmutated — only the transaction is gone. Validation that does NOT
+	 *   need pending rows belongs before the call, so the transaction survives it.
+	 *
+	 * Subsequent `commit()` calls on the same coordinator are no-ops
+	 * (`inTransaction` is cleared), which keeps the enclosing transaction safe.
+	 */
+	private async ddlCommitPendingOps(): Promise<void> {
+		if (this.moduleCoordinator?.isInTransaction()) {
+			await this.moduleCoordinator.commit();
+		}
+	}
+
+	/**
 	 * Alters an existing store table's structure (ADD/DROP/RENAME COLUMN).
 	 * Performs eager row migration for ADD and DROP, schema-only update for RENAME.
 	 * Returns the updated TableSchema for the engine to register.
@@ -1249,6 +1288,14 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				// mutate, matching the engine's ordering in `runAddColumn`.
 				const newCheckConstraints = extractColumnLevelCheckConstraints(change.columnDef);
 				const newForeignKeys = extractColumnLevelForeignKeys(change.columnDef, schemaName);
+
+				// Physical rewrite ahead: flush the module's buffered writes so `migrateRows`
+				// (a committed-store scan + batch) sees this transaction's rows and re-encodes
+				// them under the new column layout. See {@link ddlCommitPendingOps}. Placed
+				// after every throw-only check above — the NOT NULL rejection reads effectively
+				// (`hasAnyRows`) and `extractColumnLevel*` reads no rows — so a rejected ALTER
+				// leaves the enclosing transaction intact.
+				await this.ddlCommitPendingOps();
 
 				// Migrate rows: append the new column's value — a single literal default, or a
 				// per-row value derived from the existing row when a backfill evaluator is set.
@@ -1351,6 +1398,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 						? Object.freeze(updatedUniqueConstraints)
 						: undefined,
 				};
+
+				// Physical rewrite ahead — flush buffered writes so `migrateRows` re-encodes
+				// this transaction's rows too. See {@link ddlCommitPendingOps}.
+				await this.ddlCommitPendingOps();
 
 				// Migrate rows: remove the dropped column slot
 				const remap = buildColumnRemap(
@@ -1461,6 +1512,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					),
 				};
 
+				// Physical re-key ahead — flush buffered writes so every live row is
+				// re-keyed and no stale-schema op replays over the rewritten store.
+				// `rekeyRows`' duplicate-key pass runs against the flushed store, so a
+				// pending insert that collides under the new PK is caught. See
+				// {@link ddlCommitPendingOps} for the transaction consequences.
+				await this.ddlCommitPendingOps();
+
 				// Re-key the data store. Throws CONSTRAINT on duplicates without
 				// mutating the store, giving us all-or-nothing semantics for the
 				// validation phase.
@@ -1491,6 +1549,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// Store enforces inline UNIQUE by full-scan over `uniqueConstraints`
 					// (no separate index store), so there is nothing physical to build —
 					// but we must validate the existing rows before persisting.
+					//
+					// No `ddlCommitPendingOps()` here (unlike the row-rewriting arms): this
+					// writes no rows, and the validation scan already reads effectively, so
+					// the transaction survives a CONSTRAINT rejection.
 					const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
 					await this.validateUniqueOverExistingRows(
 						table.iterateEffectiveEntries(buildFullScanBounds()),
@@ -1769,6 +1831,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				// throw-only checks precede the first store mutation. `updatedSchema.columns`
 				// carries the new collation, so the new key bytes follow it.
 				if (collationChanged && oldSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+					// Physical re-key ahead — flush buffered writes (see
+					// {@link ddlCommitPendingOps}). Deliberately AFTER the non-PK UNIQUE
+					// re-validation above: that check reads effectively and throws without
+					// needing the flush, so it must keep the transaction alive.
+					await this.ddlCommitPendingOps();
 					await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
 					await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
 				}
@@ -1856,20 +1923,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			);
 		}
 
-		// ALTER TABLE is effectively DDL-committing on a store-backed table:
-		// once we move the on-disk directory, prior buffered writes can no
-		// longer be rolled back through the coordinator. Flush any pending
-		// ops NOW, before the old store's handle is closed. Subsequent
-		// commit() calls on the same coordinator are no-ops (inTransaction
-		// is cleared), which keeps the enclosing transaction safe.
-		//
-		// The coordinator is module-wide, so this DDL-commits the WHOLE module
-		// transaction — every table's pending ops, not just the renamed table's —
-		// in one all-or-nothing batch. That is the correct, consistent posture
-		// for a store DDL-commit: an ALTER cannot half-commit some sibling tables.
-		if (this.moduleCoordinator?.isInTransaction()) {
-			await this.moduleCoordinator.commit();
-		}
+		// Flush buffered writes before the old store's handle is closed: once the
+		// on-disk directory moves, prior buffered ops address stores that no longer
+		// exist under those names. See {@link ddlCommitPendingOps}.
+		await this.ddlCommitPendingOps();
 
 		// Hard-dispose the evicted handle: flush any lazy stats it was buffering AND
 		// deregister its coordinator stats-callback pair (the renamed instance is

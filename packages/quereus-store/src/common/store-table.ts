@@ -409,12 +409,19 @@ export class StoreTable extends VirtualTable {
 	}
 
 	/**
-	 * Returns true if the table has at least one stored row. Stops after the first hit.
+	 * Returns true if the table has at least one LIVE row — the open transaction's
+	 * pending overlay over the committed store. Stops after the first hit.
+	 *
+	 * Effective (not committed-only) because its one caller, `ADD COLUMN`'s NOT
+	 * NULL-without-DEFAULT rejection, must see rows the same transaction inserted:
+	 * they are migrated too (the arm DDL-commits before `migrateRows`), and a
+	 * committed-only probe would wave them through only to give them a NULL in a
+	 * NOT NULL column. Conversely, a pending delete of the last row makes the table
+	 * legitimately empty. Reading effectively keeps the check throw-only and
+	 * BEFORE the DDL-commit, so a rejection leaves the transaction intact.
 	 */
 	async hasAnyRows(): Promise<boolean> {
-		const store = await this.ensureStore();
-		const bounds = buildFullScanBounds();
-		for await (const _entry of store.iterate(bounds)) {
+		for await (const _entry of this.iterateEffectiveEntries(buildFullScanBounds())) {
 			return true;
 		}
 		return false;
