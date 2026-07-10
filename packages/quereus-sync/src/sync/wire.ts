@@ -14,7 +14,8 @@
  *   sides emit and handle);
  * - `PROTOCOL_VERSION`, stamped into the handshake so peers can detect drift.
  *
- * This module imports ONLY from `protocol.ts`, the clock, the metadata codec, and
+ * This module imports ONLY from within `@quereus/sync` (`protocol.ts`, the clock,
+ * the metadata codec, `manager.ts` for the `SnapshotCheckpoint` type) and
  * `@quereus/quereus`. It must NOT import from `@quereus/sync-client` or
  * `@quereus/sync-coordinator` — both depend on `@quereus/sync`, so importing the
  * other way would create a cycle.

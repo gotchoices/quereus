@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-10T23:04:32.234Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\3-sync-protocol-shared-module.review.2026-07-10T23-04-32-234Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Review the new shared network-message-format module that the sync client and server will both use, so the two copies can no longer drift.
 prereq:
 files:
