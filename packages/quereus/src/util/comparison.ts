@@ -9,42 +9,99 @@ import { QuereusError } from '../common/errors.js';
 export type { CollationFunction };
 
 /**
+ * True when the string holds a high surrogate (U+D800–U+DBFF) — the only code units
+ * for which JS `<`/`>` disagrees with code-point order. Everything else compares the
+ * same either way, so a string that fails this test can take the native fast path.
+ */
+const HAS_HIGH_SURROGATE = /[\uD800-\uDBFF]/;
+
+/**
+ * Compare two strings by Unicode code point — the order a `memcmp` of their UTF-8
+ * encodings produces, and the order SQLite's BINARY collation produces.
+ *
+ * JS `<`/`>` compares UTF-16 CODE UNITS, which differs above U+FFFF: an astral
+ * character is a surrogate pair whose leading unit lies in U+D800–U+DBFF, so `<` sorts
+ * it below every U+E000–U+FFFF character, while its UTF-8 encoding (`F0…`) sorts above
+ * theirs (`EE…`, `EF…`). The persistent store physically orders text keys by `memcmp`
+ * of their UTF-8 bytes, so a comparator stamped `orderPreserving` must agree with the
+ * code-point order, not the code-unit order.
+ *
+ * The scan needs no surrogate-pair decoding. At the FIRST differing code unit of two
+ * well-formed strings, either both units are low surrogates (U+DC00–U+DFFF) or neither
+ * is: a low surrogate at index `i` implies a matching high surrogate at `i-1`, which the
+ * shared prefix forces onto the other string, which therefore also carries a low
+ * surrogate at `i`. So the verdict is decided by ranking each unit with high surrogates
+ * lifted above U+FFFF (`u + 0x2800`, injective over the code-unit range) and comparing
+ * the ranks; equal-prefix strings fall back to shorter-first.
+ *
+ * Unpaired surrogates have no UTF-8 encoding (`TextEncoder` maps each to U+FFFD), so no
+ * comparator can be order-preserving over them — see
+ * `bug-store-lone-surrogate-key-collision`. This function is still total and
+ * deterministic for them; it simply cannot match the store's bytes.
+ */
+export function compareCodePoints(a: string, b: string): number {
+	if (a === b) return 0;
+	// No high surrogate on either side ⇒ code-unit order IS code-point order, so keep V8's
+	// native string compare rather than a per-unit JS loop. BINARY is the engine's hottest
+	// comparator and the guard keeps its cost flat: dropping the fast path and always
+	// scanning measured ~6x slower on keys with a long common prefix, where the native
+	// compare memcmps but the JS loop pays per code unit.
+	if (!HAS_HIGH_SURROGATE.test(a) && !HAS_HIGH_SURROGATE.test(b)) {
+		return a < b ? -1 : 1;
+	}
+	return compareCodePointsBounded(a, a.length, b, b.length);
+}
+
+/**
+ * {@link compareCodePoints} restricted to the code-unit prefixes `a[0..lenA)` and
+ * `b[0..lenB)`. RTRIM uses this to compare the untrimmed strings up to their trimmed
+ * lengths without materializing the trimmed copies. Callers must not cut a bound
+ * through a surrogate pair (an ASCII-space trim never can).
+ */
+function compareCodePointsBounded(a: string, lenA: number, b: string, lenB: number): number {
+	const minLen = lenA < lenB ? lenA : lenB;
+	for (let i = 0; i < minLen; i++) {
+		const unitA = a.charCodeAt(i);
+		const unitB = b.charCodeAt(i);
+		if (unitA !== unitB) {
+			const rankA = unitA >= 0xD800 && unitA <= 0xDBFF ? unitA + 0x2800 : unitA;
+			const rankB = unitB >= 0xD800 && unitB <= 0xDBFF ? unitB + 0x2800 : unitB;
+			return rankA < rankB ? -1 : 1;
+		}
+	}
+	return lenA < lenB ? -1 : lenA > lenB ? 1 : 0;
+}
+
+/**
  * Binary (default) collation function.
- * Performs standard lexicographical comparison of strings.
+ * Orders strings by Unicode code point — see {@link compareCodePoints}.
  */
 export const BINARY_COLLATION: CollationFunction = (a, b) => {
-	return a < b ? -1 : a > b ? 1 : 0;
+	return compareCodePoints(a, b);
 };
 
 /**
  * Case-insensitive collation function.
- * Compares strings after converting them to lowercase.
+ * Compares strings by code point after converting them to lowercase.
+ * `toLowerCase()` maps surrogate pairs correctly (U+10400 → U+10428), so the lowercased
+ * forms are the same strings the key normalizer encodes.
  */
 export const NOCASE_COLLATION: CollationFunction = (a, b) => {
-	const lowerA = a.toLowerCase();
-	const lowerB = b.toLowerCase();
-	return lowerA < lowerB ? -1 : lowerA > lowerB ? 1 : 0;
+	return compareCodePoints(a.toLowerCase(), b.toLowerCase());
 };
 
 /**
  * Right-trim collation function.
- * Compares strings after removing trailing spaces.
+ * Compares strings by code point after removing trailing ASCII spaces.
  */
 export const RTRIM_COLLATION: CollationFunction = (a, b) => {
 	let lenA = a.length;
 	let lenB = b.length;
 
-	while (lenA > 0 && a[lenA - 1] === ' ') lenA--;
-	while (lenB > 0 && b[lenB - 1] === ' ') lenB--;
+	while (lenA > 0 && a.charCodeAt(lenA - 1) === 0x20) lenA--;
+	while (lenB > 0 && b.charCodeAt(lenB - 1) === 0x20) lenB--;
 
-	const minLen = Math.min(lenA, lenB);
-	for (let i = 0; i < minLen; i++) {
-		if (a[i] !== b[i]) {
-			return a[i] < b[i] ? -1 : 1;
-		}
-	}
-
-	return lenA - lenB;
+	return compareCodePointsBounded(a, lenA, b, lenB);
 };
 
 /**
@@ -209,10 +266,13 @@ function compareSameType(a: SqlValue, b: SqlValue, storageClass: StorageClass, c
 			return blobA.length < blobB.length ? -1 : blobA.length > blobB.length ? 1 : 0;
 		}
 		case StorageClass.OBJECT: {
-			// Compare JSON objects by their canonical stringified representation.
+			// Compare JSON objects by their canonical stringified representation, by code
+			// point — the store's `encodeObject` writes that same canonical string as UTF-8,
+			// so this must be the memcmp order of those bytes (an `any` primary key keys
+			// under BINARY and advertises byte order).
 			const strA = objectCanonicalString(a as object);
 			const strB = objectCanonicalString(b as object);
-			return strA < strB ? -1 : strA > strB ? 1 : 0;
+			return compareCodePoints(strA, strB);
 		}
 		default: {
 			return 0;

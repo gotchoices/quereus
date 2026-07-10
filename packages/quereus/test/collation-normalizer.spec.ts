@@ -10,13 +10,27 @@ import {
 
 // Conformance corpus shared with the cellstore-side conformance test —
 // mixed-case ASCII, Unicode case-fold, ASCII vs other whitespace, etc.
+//
+// The astral (> U+FFFF) entries and their U+E000–U+FFFF neighbours are exactly the pairs
+// on which UTF-16 code-unit order and UTF-8 byte order disagree. The built-ins compare by
+// code point, so both probes below hold for them.
+//
+// UNPAIRED surrogates ('\uD800' with no low surrogate after it) are deliberately absent:
+// they have no UTF-8 encoding — `TextEncoder` folds every one of them to U+FFFD — so no
+// comparator can make the `orderPreserving` assertion hold, and the store's text keys are
+// not injective over them. Tracked by `bug-store-lone-surrogate-key-collision`.
 const CORPUS: readonly string[] = [
 	'', 'a', 'A', 'aa', 'ab', 'b', 'B',
 	'Hello', 'hello', 'HELLO', 'heLLo',
-	'élise', 'ÉLISE', 'É', 'é', 'ß', 'SS',
-	'日本語', '中文',
-	'foo', 'foo ', 'foo  ', 'foo\t', 'foo\t ', 'foo \t', 'foo​',
-	'a b', 'a\tb', 'a b',
+	'\u00E9lise', '\u00C9LISE', '\u00C9', '\u00E9', '\u00DF', 'SS',
+	'\u65E5\u672C\u8A9E', '\u4E2D\u6587',
+	'foo', 'foo ', 'foo  ', 'foo\t', 'foo\t ', 'foo \t', 'foo\u200B',
+	'a b', 'a\tb', 'a\u00A0b',
+	// Astral characters, plus the U+E000–U+FFFF neighbours JS `<` wrongly sorts above them.
+	// U+10400/U+10428 are the Deseret case pair — astral text under NOCASE must still fold.
+	'\u{1F600}', '\u{10000}', '\u{10FFFF}', '\u{10400}', '\u{10428}',
+	'\uD7FF', '\uE000', '\uF900', '\uFF21', '\uFF41', '\uFFFD',
+	'x\u{1F600}', '\u{1F600}x', '\u{1F600}\u{1F600}', '\uFF21\u{1F600}', '\u{1F600} ',
 ];
 
 type Cmp = (a: string, b: string) => number;
@@ -173,10 +187,10 @@ describe('Collation key normalizers', () => {
 		};
 
 		// The assertion the built-ins claim, checked against the same corpus the equality
-		// probe uses. CORPUS is free of astral-plane characters, and the assertion does NOT
-		// hold for them: the comparators order by UTF-16 code unit, the key bytes by UTF-8.
-		// Adding an astral character here should make this test fail — see the NOTE on
-		// `Database.registerCollation` and `fix/bug-store-astral-text-keys-mis-order`.
+		// probe uses. It covers astral-plane characters, which is where a comparator using
+		// JS `<`/`>` (UTF-16 code-unit order) parts ways with the key bytes (UTF-8): reverting
+		// any built-in to `<`/`>` fails this test. See `compareCodePoints` and the NOTE on
+		// `Database.registerCollation`.
 		it('holds for each built-in comparator over the corpus', () => {
 			const builtins: ReadonlyArray<[string, (s: string) => string, Cmp]> = [
 				['BINARY', BUILTIN_NORMALIZERS.BINARY, BINARY_COLLATION],

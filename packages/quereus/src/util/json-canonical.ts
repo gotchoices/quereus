@@ -11,9 +11,10 @@
  *
  * Bare `JSON.stringify` breaks this: it emits keys in insertion order, so two
  * reorder-equal objects stringify differently. {@link canonicalJsonString}
- * fixes that by recursively sorting object keys (ascending, matching
- * `deepCompareJson`'s `Object.keys(obj).sort()`) while leaving arrays in
- * positional order.
+ * fixes that by recursively sorting object keys while leaving arrays in
+ * positional order. Only the *equality* classes have to line up with
+ * `deepCompareJson`, and any deterministic key sort delivers that: two objects
+ * with the same key set sort into the same sequence under any total order.
  *
  * This canonical form is used ONLY to derive keys — never as the value's stored
  * or displayed string (display/storage stay insertion-order via
@@ -33,6 +34,12 @@ function canonicalize(value: JSONValue): JSONValue {
 	if (Array.isArray(value)) return value.map(canonicalize);
 	const obj = value as Record<string, JSONValue>;
 	const sorted: Record<string, JSONValue> = {};
+	// NOTE: default (UTF-16 code-unit) sort, deliberately NOT `compareCodePoints`. This
+	// order needs only DETERMINISM — it fixes which key comes first inside the derived
+	// key, and both the encoder and the OBJECT-class comparison string run through this
+	// same function, so they agree by construction. Switching to code-point order would
+	// rewrite the stored key bytes of every persisted object whose keys contain astral
+	// characters, for no gain.
 	for (const key of Object.keys(obj).sort()) {
 		sorted[key] = canonicalize(obj[key]);
 	}

@@ -74,6 +74,10 @@ export {
 	BINARY_COLLATION,
 	NOCASE_COLLATION,
 	RTRIM_COLLATION,
+	// The primitive the built-ins compare with: Unicode code-point order, which is the
+	// memcmp order of the UTF-8 key bytes a persistent store writes. A custom collation
+	// claiming `orderPreserving: true` must compare with this, not with JS `<`/`>`.
+	compareCodePoints,
 	builtinCollationResolver,
 	normalizeCollationName,
 	resolveCollationFunctions,

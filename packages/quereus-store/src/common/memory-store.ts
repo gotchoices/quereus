@@ -21,6 +21,12 @@ function keyToHex(key: Uint8Array): string {
 
 /**
  * Compare two hex strings lexicographically.
+ *
+ * NOTE: `localeCompare` is ICU collation, which only coincides with the `memcmp` of the
+ * underlying key bytes because `keyToHex`'s alphabet is `[0-9a-f]` — every locale ranks
+ * digits before letters and both ascending. Widening that alphabet (upper-case hex, base64,
+ * any non-ASCII) would silently mis-order this store, and it is the oracle the whole store
+ * test suite compares against. Use a code-unit/byte compare if the encoding ever changes.
  */
 function compareHex(a: string, b: string): number {
   return a.localeCompare(b);

@@ -1,6 +1,7 @@
 import { PhysicalType, type LogicalType, compareNulls } from './logical-type.js';
 import { safeJsonParse } from '../func/builtins/json-helpers.js';
 import type { JSONValue } from '../common/json-types.js';
+import { compareCodePoints } from '../util/comparison.js';
 
 /**
  * JSON type - stores JSON values as native JS objects/arrays/primitives.
@@ -63,7 +64,7 @@ export const JSON_TYPE: LogicalType = {
 		if (parsedA === null || parsedB === null) {
 			const strA = typeof a === 'string' ? a : JSON.stringify(a);
 			const strB = typeof b === 'string' ? b : JSON.stringify(b);
-			return strA < strB ? -1 : strA > strB ? 1 : 0;
+			return compareCodePoints(strA, strB);
 		}
 
 		return deepCompareJson(parsedA, parsedB);
@@ -90,6 +91,9 @@ function jsonTypeOrder(v: JSONValue): number {
 /**
  * Deep comparison of JSON values.
  * Returns -1, 0, or 1 for ordering.
+ *
+ * String leaves and object keys order by Unicode code point ({@link compareCodePoints}),
+ * matching `compareSameType`'s OBJECT-class branch and the store's UTF-8 key bytes.
  */
 function deepCompareJson(a: JSONValue, b: JSONValue): number {
 	if (a === b) return 0;
@@ -100,7 +104,11 @@ function deepCompareJson(a: JSONValue, b: JSONValue): number {
 
 	if (a === null) return 0;
 
-	if (typeof a === 'boolean' || typeof a === 'number' || typeof a === 'string') {
+	if (typeof a === 'string') {
+		return compareCodePoints(a, b as string);
+	}
+
+	if (typeof a === 'boolean' || typeof a === 'number') {
 		return a < (b as typeof a) ? -1 : a > (b as typeof a) ? 1 : 0;
 	}
 
@@ -116,13 +124,17 @@ function deepCompareJson(a: JSONValue, b: JSONValue): number {
 	if (typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b)) {
 		const objA = a as Record<string, JSONValue>;
 		const objB = b as Record<string, JSONValue>;
-		const keysA = Object.keys(objA).sort();
-		const keysB = Object.keys(objB).sort();
+		// Sort with the SAME comparator the key sequences are then compared under —
+		// sorting by code unit and comparing by code point would not be a total order.
+		// Equality is unaffected by the choice: two objects with the same key set sort
+		// into the same sequence either way.
+		const keysA = Object.keys(objA).sort(compareCodePoints);
+		const keysB = Object.keys(objB).sort(compareCodePoints);
 
 		const minKeys = Math.min(keysA.length, keysB.length);
 		for (let i = 0; i < minKeys; i++) {
-			if (keysA[i] < keysB[i]) return -1;
-			if (keysA[i] > keysB[i]) return 1;
+			const keyCmp = compareCodePoints(keysA[i], keysB[i]);
+			if (keyCmp !== 0) return keyCmp;
 		}
 		if (keysA.length !== keysB.length) return keysA.length < keysB.length ? -1 : 1;
 

@@ -399,16 +399,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private registerDefaultCollations(): void {
 		// Register the built-in collations into per-instance registry, paired
 		// with their key normalizers so they can back compound indexes. Stamped
-		// `replicable: true` — the built-ins are pure JS string operations (`<`/`>`,
-		// locale-independent `toLowerCase()`, ASCII-space trim), so they are
+		// `replicable: true` — the built-ins are pure JS string operations (a code-point
+		// scan, locale-independent `toLowerCase()`, ASCII-space trim), so they are
 		// bit-identical across peers' JS engines, exactly parallel to why built-in
 		// functions auto-qualify (see registerBuiltinFunctions). This is the single
 		// seam that *knows* a collation is a builtin.
 		//
-		// Also stamped `orderPreserving: true`: each built-in comparator compares its
-		// operands' NORMALIZED forms with `<`/`>` (BINARY's normalizer is the identity,
-		// NOCASE's is `toLowerCase()`, RTRIM's an ASCII-space right-trim), which is the
-		// same order a memcmp of those normalized forms produces — see
+		// Also stamped `orderPreserving: true`: each built-in comparator orders its
+		// operands' NORMALIZED forms by Unicode CODE POINT (BINARY's normalizer is the
+		// identity, NOCASE's is `toLowerCase()`, RTRIM's an ASCII-space right-trim), and
+		// code-point order IS the order a memcmp of those forms' UTF-8 bytes produces —
+		// see {@link import('../util/comparison.js').compareCodePoints} and
 		// {@link _isCollationOrderPreserving}.
 		this.collations.set('BINARY', { comparator: BINARY_COLLATION, normalizer: BUILTIN_NORMALIZERS.BINARY, replicable: true, orderPreserving: true });
 		this.collations.set('NOCASE', { comparator: NOCASE_COLLATION, normalizer: BUILTIN_NORMALIZERS.NOCASE, replicable: true, orderPreserving: true });
@@ -1361,15 +1362,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	// dependency `EmissionContext` records only drives an existence check before
 	// execution (`validateCapturedSchemaObjects`), which warns — it does not invalidate.
 	//
-	// NOTE: `orderPreserving` is stated against UTF-8 memcmp of the normalized forms, but the
-	// three built-in comparators use JS `<`/`>`, which is UTF-16 CODE-UNIT order. The two
-	// disagree for astral-plane characters: a surrogate pair (0xD800–0xDFFF) sorts below
-	// U+E000–U+FFFF in UTF-16 and above them in UTF-8. So the assertion the built-ins carry is
-	// FALSE for such text, and a store range seek drops rows / an elided Sort emits byte order,
-	// even under BINARY. Pre-existing and orthogonal to the assertion itself; reproduced and
-	// tracked by `fix/bug-store-astral-text-keys-mis-order`. The likely fix is a code-point-order
-	// comparator for the built-ins (and a matching caveat for custom ones), not a weaker
-	// assertion here.
+	// NOTE: `orderPreserving` is stated against UTF-8 memcmp of the normalized forms, and the
+	// built-ins hold it for every WELL-FORMED string. It is unachievable for unpaired
+	// surrogates, which have no UTF-8 encoding at all (`TextEncoder` folds each to U+FFFD) —
+	// see `bug-store-lone-surrogate-key-collision`. A custom collation that compares with JS
+	// `<`/`>` orders by UTF-16 code unit and must NOT claim the assertion; use
+	// {@link import('../util/comparison.js').compareCodePoints}.
 	registerCollation(
 		name: string,
 		func: CollationFunction,
