@@ -1750,20 +1750,15 @@ function rewriteTableForColumnRename(
 	// partial index (sharing the predicate by reference) is rewritten with it.
 	//
 	// This pass is the only predicate rewrite for the schema-only fallback branch of
-	// `runRenameColumn` (a module with no `alterTable` hook), and for a hook module
-	// that does not rewrite predicates itself — the store module, which carries the
-	// predicate AST forward untouched and compiles it lazily at the next write.
+	// `runRenameColumn` (a module with no `alterTable` hook), and for any hook module
+	// that does not rewrite predicates itself.
 	//
-	// The memory module DOES rewrite, in `MemoryTableManager.renameColumn`: it must,
-	// so it can rebuild its live index structures against the new column list before
-	// returning. The rewrite is idempotent, so this pass then finds nothing naming
-	// `oldCol`, `rewrote` is false, and the table is not needlessly re-registered.
-	//
-	// NOTE: the store persists its table DDL bundle from inside its `alterTable` hook,
-	// while the predicate still names the old column, and relies on this pass firing a
-	// `table_modified` event afterwards to re-persist the corrected bundle. If this
-	// pass ever stops rewriting predicates for hook modules, that stale DDL becomes
-	// permanent.
+	// The memory and store modules both DO rewrite, from inside their own hook, because
+	// each must act on the predicate before this pass regains control: the memory module
+	// rebuilds its live index structures against the new column list, and the store
+	// module persists its DDL bundle. Both use the same idempotent
+	// `renameColumnInIndexPredicates`, so this pass then finds nothing naming `oldCol`,
+	// `rewrote` is false, and the table is not needlessly re-registered.
 	const newIndexes = (table.indexes ?? []).map(idx => {
 		const rewrote = isRenamedTable
 			? renameColumnInCheckExpression(idx.predicate, tableName, oldCol, newCol, renamedSchemaLower, resolveColumnInSource)

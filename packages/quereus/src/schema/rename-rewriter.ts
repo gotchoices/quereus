@@ -258,6 +258,31 @@ function visitTableRename(
 	}
 }
 
+/**
+ * Rewrite the renamed table inside every partial-index predicate of `indexes`,
+ * in place. A predicate may carry a table-qualified self-reference
+ * (`create index ix on t (b) where t.b > 0`), which a table rename must follow.
+ *
+ * Sharing and idempotence work exactly as in {@link renameColumnInIndexPredicates}:
+ * the predicate `Expression` is shared by reference with the catalog's
+ * `TableSchema` and with a unique partial index's `derivedFromIndex` UNIQUE
+ * constraint, so one in-place rewrite covers all of them, and a second call with
+ * the same pair finds nothing naming `oldName` and returns false.
+ */
+export function renameTableInIndexPredicates(
+	indexes: ReadonlyArray<{ readonly predicate?: AST.Expression }> | undefined,
+	oldName: string,
+	newName: string,
+	defaultSchemaName: string,
+): boolean {
+	let changed = false;
+	for (const idx of indexes ?? []) {
+		if (!idx.predicate) continue;
+		if (renameTableInAst(idx.predicate, oldName, newName, defaultSchemaName)) changed = true;
+	}
+	return changed;
+}
+
 function rewriteIdentifierIfTable(
 	id: AST.IdentifierExpr | undefined,
 	oldName: string,

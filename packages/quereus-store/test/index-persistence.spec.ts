@@ -135,6 +135,25 @@ describe('StoreModule secondary-index persistence', () => {
 		return raw ? new TextDecoder().decode(raw) : undefined;
 	}
 
+	/**
+	 * Record the DDL of every value durably written to the catalog store from now on.
+	 *
+	 * Asserting only on the FINAL catalog entry cannot see a bundle that was written
+	 * stale and corrected a moment later by the async `table_modified` listener — yet
+	 * a crash in that window leaves the stale bundle on disk forever. These tests
+	 * therefore assert on the whole write sequence, not just its last element.
+	 */
+	async function traceCatalogWrites(): Promise<string[]> {
+		const catalog = await provider.getCatalogStore();
+		const writes: string[] = [];
+		const originalPut = catalog.put.bind(catalog);
+		catalog.put = async (key, value, options?) => {
+			writes.push(new TextDecoder().decode(value));
+			await originalPut(key, value, options);
+		};
+		return writes;
+	}
+
 	it('plain CREATE INDEX survives reopen; backing store reattaches and DML maintains it', async () => {
 		const { db, mod } = open();
 		await db.exec(`create table t (id integer primary key, b integer) using store`);
@@ -470,6 +489,71 @@ describe('StoreModule secondary-index persistence', () => {
 		await db2.exec(`insert into t values (3, 5)`);
 		await db2.exec(`insert into t values (4, -7)`);
 		expect(indexStoreSize('t', 'ix_b'), 'in-scope insert indexed, out-of-scope excluded').to.equal(2);
+	});
+
+	it('RENAME COLUMN never durably writes a partial-index predicate naming the old column', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_b on t (b) where b > 0`);
+		const writes = await traceCatalogWrites();
+
+		await db.exec(`alter table t rename column b to c`);
+		await mod.whenCatalogPersisted();
+
+		expect(writes.length, 'the rename persisted at least one bundle').to.be.greaterThan(0);
+		for (const ddl of writes) {
+			expect(ddl, 'no bundle written during the rename names the old column').to.not.match(/where\s+b\s*>\s*0/i);
+		}
+		// The hook now persists the final bundle itself, so the propagation pass's
+		// `table_modified` event finds an identical entry and compare-skips it.
+		expect(writes.length, 'exactly one effective catalog write').to.equal(1);
+	});
+
+	it('RENAME TABLE never durably writes a partial-index predicate naming the old table', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer) using store`);
+		await db.exec(`create index ix_b on t (b) where t.b > 0`);
+		const writes = await traceCatalogWrites();
+
+		await db.exec(`alter table t rename to t2`);
+		await mod.whenCatalogPersisted();
+
+		expect(writes.length, 'the rename persisted at least one bundle').to.be.greaterThan(0);
+		for (const ddl of writes) {
+			expect(ddl, 'no bundle written during the rename names the old table').to.not.match(/where\s+t\.b/i);
+		}
+	});
+
+	it('RENAME COLUMN under a UNIQUE partial index: uniqueness still enforced in scope after reopen', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table t (id integer primary key, b integer, g integer) using store`);
+		await db.exec(`create unique index ux_g on t (g) where b > 0`);
+		// Out-of-scope rows may duplicate `g` freely.
+		await db.exec(`insert into t values (1, 10, 100), (2, -1, 100)`);
+		const writes = await traceCatalogWrites();
+
+		await db.exec(`alter table t rename column b to c`);
+		await mod.whenCatalogPersisted();
+		for (const ddl of writes) {
+			expect(ddl, 'no bundle written during the rename names the old column').to.not.match(/where\s+b\s*>\s*0/i);
+		}
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen(); // asserts zero rehydration errors
+
+		// The derived UNIQUE constraint rehydrated with the renamed predicate: an
+		// in-scope duplicate is rejected, an out-of-scope duplicate is not.
+		let rejected = false;
+		try {
+			await db2.exec(`insert into t values (3, 5, 100)`);
+		} catch (e) {
+			rejected = true;
+			expect(String(e)).to.match(/constraint/i);
+		}
+		expect(rejected, 'in-scope duplicate g rejected after reopen').to.be.true;
+
+		await db2.exec(`insert into t values (4, -3, 100)`);
+		expect(indexStoreSize('t', 'ux_g'), 'only in-scope rows are indexed').to.equal(1);
 	});
 
 	it('ALTER INDEX SET / ADD / DROP TAGS round-trip via index_info after reopen', async () => {

@@ -328,6 +328,16 @@ path carries the indexes for free —
   constraint's `exposedIndexTags`) with no index-specific plumbing.
 - Structural ALTERs that reindex columns already re-persist the table, so the
   bundle's index lines track the reindexed columns.
+- `RENAME TABLE` / `RENAME COLUMN` rewrite any partial-index `WHERE` predicate
+  **before** writing the bundle, from inside the module's own hook. The engine's
+  rename propagation runs only after the hook returns, so a module that persisted
+  first would durably write a predicate naming the pre-rename table or column, and
+  would depend on the follow-up `table_modified` event to correct it — leaving a
+  window in which a crash strands an un-rehydratable bundle on disk. Because the
+  rewrite is idempotent and mutates the predicate AST in place (shared by reference
+  with the catalog schema and with a unique partial index's derived `UNIQUE`
+  constraint), the later propagation pass finds nothing to change and its event
+  compare-skips.
 
 **Reattach, not rebuild.** The physical index KV store survives a logical close,
 so rehydrate does **not** scan rows to rebuild it. After the import loop,

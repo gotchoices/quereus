@@ -157,6 +157,12 @@ export { isMaintainedTable } from './schema/derivation.js';
 export { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL } from './schema/ddl-generator.js';
 export { isHiddenImplicitIndex, exposedImplicitIndexes } from './schema/catalog.js';
 export type { SyntheticExposedIndex } from './schema/catalog.js';
+// Partial-index predicate rewriters. A persisting module must rewrite its predicates
+// from inside its own `alterTable` / `renameTable` hook — the engine's propagation pass
+// runs only after the hook returns, so a module that persists first would durably write
+// a predicate naming the pre-rename column or table.
+export { renameColumnInIndexPredicates, renameTableInIndexPredicates } from './schema/rename-rewriter.js';
+export type { ResolveColumnInSource } from './schema/rename-rewriter.js';
 // Reserved-tag namespace surface — `@quereus/quereus-store` keys its sync-replication
 // opt-in off SYNC_REPLICATE_TAG (DRY: one literal) and reads it via getReservedTag.
 // `@quereus/sync` keys its per-table eviction override off SYNC_EVICT_TAG.

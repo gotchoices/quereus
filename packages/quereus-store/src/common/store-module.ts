@@ -37,8 +37,8 @@ import type {
 	BackingHost,
 	LensDeploymentSnapshot,
 } from '@quereus/quereus';
-import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeRowKey, isMaintainedTable } from '@quereus/quereus';
-import type { CompiledPredicate, KeyNormalizerResolver } from '@quereus/quereus';
+import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeRowKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates } from '@quereus/quereus';
+import type { CompiledPredicate, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
@@ -1399,9 +1399,38 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					indexes: Object.freeze(updatedIndexes),
 				};
 
-				// Rename is schema-only — no row migration needed
-				table.updateSchema(updatedSchema);
-				await this.saveTableDDL(updatedSchema);
+				// A partial index's WHERE clause still names the OLD column: the engine's
+				// `propagateColumnRename` pass runs only after this hook returns. Persisting
+				// now would durably write a bundle whose predicate names a column the table
+				// no longer has, and only the later propagation's `table_modified` event
+				// would correct it — a crash in between leaves the catalog un-rehydratable.
+				// So rewrite first, in place: the predicate `Expression` is shared by
+				// reference with the catalog's `TableSchema` and with a unique partial
+				// index's `derivedFromIndex` UNIQUE constraint, so one rewrite covers all
+				// of them and makes the later propagation pass a no-op.
+				//
+				// The rewrite is the first statement in the `try`, and it walks the indexes
+				// one at a time, so a throw anywhere — including partway through the walk
+				// itself — must reverse it: restoring `oldSchema` cannot, since the ASTs are
+				// shared. Reversing is a no-op when no predicate names the new column, and
+				// the engine has already rejected a rename onto an existing column name, so
+				// the reverse pass cannot collide with a predicate that legitimately named it.
+				const resolveColumnInSource: ResolveColumnInSource = (s, t, col) =>
+					db.schemaManager.getSchema(s)?.getTable(t)?.columnIndexMap.has(col.toLowerCase()) ?? false;
+				try {
+					renameColumnInIndexPredicates(
+						updatedIndexes, tableName, change.oldName, change.newName,
+						schemaName, resolveColumnInSource);
+
+					// Rename is schema-only — no row migration needed
+					table.updateSchema(updatedSchema);
+					await this.saveTableDDL(updatedSchema);
+				} catch (e) {
+					renameColumnInIndexPredicates(
+						updatedIndexes, tableName, change.newName, change.oldName,
+						schemaName, resolveColumnInSource);
+					throw e;
+				}
 
 				this.eventEmitter?.emitSchemaChange({
 					type: 'alter',
@@ -1887,7 +1916,31 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// name rather than neither.
 		if (currentSchema) {
 			const renamedSchema: TableSchema = { ...currentSchema, name: newName };
-			await this.saveTableDDL(renamedSchema);
+			// A partial index's WHERE clause can carry a table-qualified self-reference
+			// (`where t.b > 0`) still naming the OLD table: `propagateTableRename` runs
+			// only after this hook returns, so — exactly as in the `renameColumn` arm of
+			// `alterTable` — persisting now would durably write a stale qualifier that
+			// only the later propagation event corrects. Rewrite first, in place (the
+			// predicate `Expression` is shared with the catalog `TableSchema` and with a
+			// unique partial index's derived UNIQUE constraint), which also makes that
+			// later pass a no-op. A throw anywhere in the `try` — including partway
+			// through the walk — reverses the rewrite; reversing is a no-op when nothing
+			// names `newName`. The physical stores have already moved by this point, so
+			// the reverse restores only the AST, not the on-disk layout.
+			//
+			// NOTE: the reverse assumes no predicate legitimately named `newName` before
+			// the rename. The rename-target guard above makes that true for a real table,
+			// but `compilePredicate` today accepts a qualifier naming a table that does not
+			// exist (see `bug-partial-index-predicate-ignores-table-qualifier`), so a
+			// predicate written `where <newName>.b > 0` would be mis-reversed. Harmless
+			// until that acceptance is tightened; revisit the reverse then.
+			try {
+				renameTableInIndexPredicates(renamedSchema.indexes, oldName, newName, schemaName);
+				await this.saveTableDDL(renamedSchema);
+			} catch (e) {
+				renameTableInIndexPredicates(renamedSchema.indexes, newName, oldName, schemaName);
+				throw e;
+			}
 		}
 		await this.removeTableDDL(schemaName, oldName);
 
