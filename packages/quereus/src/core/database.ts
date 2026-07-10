@@ -1361,14 +1361,15 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	// dependency `EmissionContext` records only drives an existence check before
 	// execution (`validateCapturedSchemaObjects`), which warns — it does not invalidate.
 	//
-	// NOTE: `orderPreserving` is stated against UTF-8 memcmp of the normalized forms,
-	// but the three built-in comparators use JS `<`/`>`, which is UTF-16 CODE-UNIT order.
-	// The two disagree for astral-plane characters: a surrogate pair (0xD800–0xDFFF) sorts
-	// below U+E000–U+FFFF in UTF-16 and above them in UTF-8. So a store range seek over
-	// text mixing an astral character with a U+E000–U+FFFF character can still mis-window,
-	// even under BINARY. Pre-existing and orthogonal to the assertion; if it ever bites,
-	// the fix is a code-point-order comparator for the built-ins (and a matching caveat
-	// for custom ones), not a weaker assertion here.
+	// NOTE: `orderPreserving` is stated against UTF-8 memcmp of the normalized forms, but the
+	// three built-in comparators use JS `<`/`>`, which is UTF-16 CODE-UNIT order. The two
+	// disagree for astral-plane characters: a surrogate pair (0xD800–0xDFFF) sorts below
+	// U+E000–U+FFFF in UTF-16 and above them in UTF-8. So the assertion the built-ins carry is
+	// FALSE for such text, and a store range seek drops rows / an elided Sort emits byte order,
+	// even under BINARY. Pre-existing and orthogonal to the assertion itself; reproduced and
+	// tracked by `fix/bug-store-astral-text-keys-mis-order`. The likely fix is a code-point-order
+	// comparator for the built-ins (and a matching caveat for custom ones), not a weaker
+	// assertion here.
 	registerCollation(
 		name: string,
 		func: CollationFunction,

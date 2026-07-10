@@ -128,13 +128,17 @@ export function resolvePkKeyCollations(
 ): (string | undefined)[] {
 	return pkDef.map(def => {
 		const col = columns[def.index];
-		// NOTE: `isTextual`, not {@link columnCanHoldText} — deliberate. A JSON PK column
-		// can hold text but cannot declare a collation (`JSON_TYPE.supportedCollations`
-		// is empty), so it stays BINARY-keyed *and* BINARY-compared, consistently with
-		// `reconcilePkCollations` and the engine's own comparison. If JSON (or another
-		// non-`isTextual` type that can hold text) ever gains a non-empty
-		// `supportedCollations`, this must switch to `columnCanHoldText` or the key bytes
-		// will diverge from the enforced comparison.
+		// NOTE: `isTextual`, not {@link columnCanHoldText} — deliberate, and lossy. A JSON
+		// or ANY PK column can hold text but cannot declare a collation
+		// (`JSON_TYPE.supportedCollations` is empty), so `reconcilePkCollations` leaves it
+		// alone and the engine compares it under BINARY — yet `undefined` here makes
+		// `encodeKey` key it under the TABLE collation K (default NOCASE), not BINARY. Key
+		// bytes therefore already diverge from the enforced comparison for such a column:
+		// `'A'` and `'a'` are distinct BINARY values that collide at one NOCASE key. Tracked
+		// by `fix/bug-store-any-json-pk-keyed-under-table-collation`; until it lands,
+		// {@link pkOrderPreservingPrefixLength} declines every range seek and PK-order
+		// advertisement on such a member (it tests K against the column's BINARY comparison
+		// collation and finds them unequal).
 		if (!col || !col.logicalType.isTextual) return undefined;
 		return (col.collation || fallback).toUpperCase();
 	});

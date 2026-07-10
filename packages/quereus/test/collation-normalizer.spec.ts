@@ -173,8 +173,10 @@ describe('Collation key normalizers', () => {
 		};
 
 		// The assertion the built-ins claim, checked against the same corpus the equality
-		// probe uses. (CORPUS is deliberately free of astral-plane characters — see the
-		// UTF-16-vs-UTF-8 NOTE on `Database.registerCollation`.)
+		// probe uses. CORPUS is free of astral-plane characters, and the assertion does NOT
+		// hold for them: the comparators order by UTF-16 code unit, the key bytes by UTF-8.
+		// Adding an astral character here should make this test fail — see the NOTE on
+		// `Database.registerCollation` and `fix/bug-store-astral-text-keys-mis-order`.
 		it('holds for each built-in comparator over the corpus', () => {
 			const builtins: ReadonlyArray<[string, (s: string) => string, Cmp]> = [
 				['BINARY', BUILTIN_NORMALIZERS.BINARY, BINARY_COLLATION],

@@ -555,9 +555,9 @@ type can carry text without declaring a collation of its own.
 
 | Collation | Key normalizer | Ordering Support |
 |-----------|----------------|------------------|
-| **NOCASE** | `s => s.toLowerCase()` | Full (default) |
-| **BINARY** | identity | Full |
-| **RTRIM** | strips trailing ASCII space (`0x20`) only | Full |
+| **NOCASE** | `s => s.toLowerCase()` | Full (default) † |
+| **BINARY** | identity | Full † |
+| **RTRIM** | strips trailing ASCII space (`0x20`) only | Full † |
 | **Custom** | whatever `registerCollation` supplied | Point/equality always; range and PK order only with `{ orderPreserving: true }` |
 
 The default collation is **NOCASE**, matching Quereus's case-insensitive comparison semantics.
@@ -594,6 +594,19 @@ on a plain (BINARY) text column of a default-`K` (NOCASE) store table gets equal
 but scans for ranges; declare the column `collate nocase` to keep the range seek.
 `backlog/debt-store-index-keys-use-column-collation` would restore it properly by encoding
 index-column bytes under `C`.
+
+† The three built-ins' assertion is **not** actually true for text outside the basic
+multilingual plane. Their comparators use JavaScript `<` / `>`, i.e. UTF-16 code-unit order,
+while the key bytes are UTF-8: a surrogate pair sorts below `U+E000`–`U+FFFF` in the former
+and above it in the latter. So a range seek or an elided Sort over text mixing an emoji with,
+say, a fullwidth Latin letter can drop a row or emit the wrong order — with no custom
+collation involved. Pre-existing and orthogonal to the assertion; tracked by
+`fix/bug-store-astral-text-keys-mis-order`.
+
+Note also that `any` and `json` primary-key columns are keyed under the table key collation
+`K` while the engine compares them under `BINARY`. Their range seeks and PK-order
+advertisement are declined for that reason, and their uniqueness is enforced under `K` —
+tracked by `fix/bug-store-any-json-pk-keyed-under-table-collation`.
 
 ## Package Structure
 

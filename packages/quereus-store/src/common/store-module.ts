@@ -2099,8 +2099,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const estimatedRows = request.estimatedRows ?? 1000;
 		// Table key collation K (default NOCASE). Any K reaching here has a key normalizer:
 		// `StoreTable`'s constructor rejects one that cannot key, and a name we cannot resolve
-		// to a table falls back to the built-in NOCASE.
-		const tableKeyCollation = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation ?? 'NOCASE').toUpperCase();
+		// to a table falls back to the built-in NOCASE. `||`, not `??`, so an empty-string
+		// `config.collation` reads as the default here exactly as it does in
+		// `StoreTable.encodeOptions` — the two must agree or `analyzePKAccess` would decline a
+		// window `computeBestAccessPlan` already marked handled.
+		const tableKeyCollation = (this.getTable(tableInfo.schemaName, tableInfo.name)?.getConfig().collation || 'NOCASE').toUpperCase();
 
 		// Check for primary key equality constraints. Count DISTINCT pinned PK columns:
 		// counting raw '=' filters would read `a = 1 and a = 2` on a composite PK (a, b)
@@ -2181,6 +2184,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// Otherwise remember the first cost-only advertisement as a fallback.
 			if (!costOnlyFallback) costOnlyFallback = plan;
 		}
+		// NOTE: a cost-only plan carries no PK-order advertisement even though the store still
+		// iterates in PK key order for it (`StoreTable.query` full-scans). The range gate makes
+		// this arm fire more often — an index range on a BINARY text column of a default-K table
+		// now lands here — so `... where v > 'x' order by <pk>` picks up a Sort it did not need.
+		// If that shows up as slow, merge `buildPkOrderingAdvertisement(...)` into this return.
 		if (costOnlyFallback) return costOnlyFallback;
 
 		// Fallback to full scan. The store iterates rows in PK key order

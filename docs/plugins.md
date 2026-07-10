@@ -1481,6 +1481,12 @@ raises while rehydrating the catalog (`create table` from the stored DDL), namin
 collation, rather than silently reading rows under a key layout it cannot reproduce.
 Call `db.registerCollation(...)` before the first statement that touches the store.
 
+A store collation should also declare whether its normalizer preserves **order**, not merely
+equality — `db.registerCollation(name, cmp, { normalizer, orderPreserving: true })`. Without
+that assertion the store still answers every query correctly, but falls back to a full scan
+where it could have seeked a byte range, and keeps a Sort it could have elided. See
+[store.md § Order preservation](./store.md#order-preservation).
+
 ### Built-in Collations
 
 ```typescript
@@ -1494,7 +1500,9 @@ const RTRIM_COLLATION: CollationFunction;     // Right-trim before comparison
 db.registerCollation(
   name: string,
   func: CollationFunction,
-  optionsOrNormalizer?: ((s: string) => string) | { normalizer?: (s: string) => string; replicable?: boolean },
+  optionsOrNormalizer?:
+    | ((s: string) => string)
+    | { normalizer?: (s: string) => string; replicable?: boolean; orderPreserving?: boolean },
 ): void;
 
 // Resolve a name to its function. Throws `no such collation sequence: <name>` if unregistered.

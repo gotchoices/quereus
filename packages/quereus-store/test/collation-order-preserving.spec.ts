@@ -238,6 +238,35 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			expect(await planOps(db, q), 'the PK seek must be declined').to.not.match(SEEK);
 		});
 
+		it('truncates — rather than voids — the PK-order advertisement when a LATER member is unsafe', async () => {
+			// PK (id integer, v any): `id` passes the predicate (non-text key bytes), `v` fails
+			// (keyed under K = NOCASE, compared under BINARY). The advertisement must shrink to
+			// the leading member, not vanish: `order by id` keeps its elided Sort, `order by
+			// id, v` gets one back, and the leading-column range seek survives.
+			const ddl = (t: string, using: string) =>
+				`create table ${t} (id integer, v any, w text, primary key (id, v)) ${using}`;
+			await db.exec(ddl('t', 'using store'));
+			await db.exec(ddl('m', ''));
+			for (const t of ['t', 'm']) {
+				await db.exec(`insert into ${t} values (2, 'aa', 'x'), (1, 'B', 'y'), (1, 'aa', 'z')`);
+			}
+
+			expect(await planOps(db, `select id from t order by id`), 'leading member is safe')
+				.to.not.match(/sort/i);
+			expect(await column(db, `select id from t order by id`, 'id')).to.deep.equal([1, 1, 2]);
+
+			// Within id = 1 the store emits byte order ('aa' keys as 'aa', 'B' as 'b'), while
+			// BINARY orders 'B' (0x42) before 'aa' (0x61…). The Sort must survive to fix that.
+			expect(await planOps(db, `select v from t order by id, v`), 'the unsafe member needs its Sort')
+				.to.match(/sort/i);
+			expect(await column(db, `select v from t order by id, v`, 'v'))
+				.to.deep.equal(await column(db, `select v from m order by id, v`, 'v'));
+
+			const q = `select w from t where id > 1`;
+			expect(await planOps(db, q), 'a range on the safe leading member still seeks').to.match(SEEK);
+			expect(await column(db, q, 'w')).to.deep.equal(['x']);
+		});
+
 		it('declines the index RANGE seek when K is merely coarser, and still returns every row', async () => {
 			// K = NOCASE, C = BINARY. 'K' (U+212A KELVIN SIGN) is > 'z' under BINARY, but its
 			// index bytes are `toLowerCase('K') = 'k'`, which sorts BEFORE 'z' — a K-window at

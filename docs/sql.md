@@ -2558,14 +2558,21 @@ collation you intend to group by. A key whose declared type can never hold text 
 collate mycoll`) buckets by value under any collation, so it needs no normalizer and does not
 raise.
 
-**Physical key bytes.** The store encodes each text key into a sort-preserving byte string by
-running the value through the collation's key normalizer, resolved against the same connection
-registry (`db.getKeyNormalizerResolver()`). So a custom (or overridden) collation governs the
+**Physical key bytes.** The store encodes each text key into a byte string by running the value
+through the collation's key normalizer, resolved against the same connection registry
+(`db.getKeyNormalizerResolver()`). So a custom (or overridden) collation governs the
 physical key layout as well as comparison, and a primary-key `UNIQUE` check that goes through the
 key sees exactly the collisions the comparator does. A collation with no normalizer cannot key a
 persisted structure: naming it on a store table's text `PRIMARY KEY` column — or as the table key
 collation `K` (`using store(collation = '…')`) on a table that encodes text under it — is rejected
 at `CREATE TABLE`.
+
+Those key bytes are only *sort*-preserving when the normalizer preserves order, which
+`registerCollation` does not require — it promises only that a normalizer partitions strings the
+way the comparator calls them equal. A collation asserts the stronger property with
+`{ orderPreserving: true }`; without it the store declines the optimizations that equate byte
+order with collation order (range seeks, elided sorts) and full-scans instead. Results are
+identical either way. See [store.md § Order preservation](./store.md#order-preservation).
 
 A **column**'s `COLLATE` clause is presently restricted to the collations its logical type
 declares support for — `BINARY`/`NOCASE`/`RTRIM` for TEXT — so a custom collation cannot yet be
