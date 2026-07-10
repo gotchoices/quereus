@@ -2,7 +2,7 @@ import type { JoinNode } from '../../planner/nodes/join-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
-import type { Row, OutputValue, MaybePromise } from '../../common/types.js';
+import type { Row, SubProgram, MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { compareSqlValuesFast, BINARY_COLLATION } from '../../util/comparison.js';
@@ -15,8 +15,8 @@ import { resolveMaybe } from '../async-util.js';
 
 const log = createLogger('runtime:emit:join');
 
+/** Narrower than {@link SubProgram}: the right sub-program always yields a cursor. */
 type RightCallback = (ctx: RuntimeContext) => AsyncIterable<Row>;
-type ConditionCallback = (ctx: RuntimeContext) => OutputValue;
 
 /**
  * Emits a nested loop join instruction. Handles every join type the optimizer
@@ -79,16 +79,16 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 	//
 	// The ON-condition sub-program is a param only when `plan.condition` is set, so
 	// `run` is called with two or three args. Declared as a trailing rest tuple
-	// rather than an optional param: `condition?: ConditionCallback` would type as
-	// `ConditionCallback | undefined`, and `undefined` is not a `RuntimeValue`, so
+	// rather than an optional param: `condition?: SubProgram` would type as
+	// `SubProgram | undefined`, and `undefined` is not a `RuntimeValue`, so
 	// the signature would not conform to `InstructionRun` (see `asRun`).
 	async function* run(
 		rctx: RuntimeContext,
 		leftSource: AsyncIterable<Row>,
 		rightCallback: RightCallback,
-		...condition: ConditionCallback[]
+		...condition: SubProgram[]
 	): AsyncIterable<Row> {
-		const conditionCallback: ConditionCallback | undefined = condition[0];
+		const conditionCallback: SubProgram | undefined = condition[0];
 
 		const joinType = plan.joinType;
 		const isSemiOrAnti = joinType === 'semi' || joinType === 'anti';

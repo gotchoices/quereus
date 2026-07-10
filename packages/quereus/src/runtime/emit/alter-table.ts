@@ -1,11 +1,11 @@
 import type { AlterTableNode, AddColumnBackfill, AddColumnCheck } from '../../planner/nodes/alter-table-node.js';
-import type { Instruction, RuntimeContext, OutputValue } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { createRowSlot } from '../context-helpers.js';
 import { QuereusError } from '../../common/errors.js';
-import { type SqlValue, type Row, StatusCode } from '../../common/types.js';
+import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, RowConstraintSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, validateCollationForType } from '../../schema/table.js';
@@ -31,7 +31,6 @@ import { isMaintainedTable } from '../../schema/derivation.js';
 const log = createLogger('runtime:emit:alter-table');
 
 /** A scheduled sub-program resolved to a callback the emitter invokes per row. */
-type Callback = (ctx: RuntimeContext) => OutputValue;
 
 function qualifyTableName(schemaName: string | undefined, tableName: string): string {
 	const prefix = (schemaName && schemaName.toLowerCase() !== 'main')
@@ -90,8 +89,8 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 				return runRenameColumn(rctx, tableSchema, schema, action.oldName, action.newName);
 			case 'addColumn': {
 				// Slot order set in `params`: backfill callback first (if any), then check callbacks.
-				const backfillCb = backfill ? (args[0] as Callback) : undefined;
-				const checkCbs = (args.slice(backfill ? 1 : 0) as Callback[]);
+				const backfillCb = backfill ? (args[0] as SubProgram) : undefined;
+				const checkCbs = (args.slice(backfill ? 1 : 0) as SubProgram[]);
 				return runAddColumn(rctx, tableSchema, schema, action.column, backfill, backfillCb, checks, checkCbs);
 			}
 			case 'dropColumn':
@@ -326,9 +325,9 @@ async function runAddColumn(
 	schema: import('../../schema/schema.js').Schema,
 	columnDef: ColumnDef,
 	backfill?: AddColumnBackfill,
-	backfillCb?: Callback,
+	backfillCb?: SubProgram,
 	checks?: AddColumnCheck,
-	checkCbs?: ReadonlyArray<Callback>,
+	checkCbs?: ReadonlyArray<SubProgram>,
 ): Promise<SqlValue> {
 	// Validate column doesn't already exist
 	if (tableSchema.columnIndexMap.has(columnDef.name.toLowerCase())) {

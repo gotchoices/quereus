@@ -2,7 +2,7 @@ import type { MergeJoinNode } from '../../planner/nodes/merge-join-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitCallFromPlan, emitPlanNode } from '../emitters.js';
-import type { Row, OutputValue } from '../../common/types.js';
+import type { Row, SubProgram } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
@@ -13,8 +13,6 @@ import { effectiveCollationOfTypes } from '../../planner/analysis/comparison-col
 import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:merge-join');
-
-type ResidualCallback = (ctx: RuntimeContext) => OutputValue;
 
 /**
  * Compare two rows on the equi-join key columns.
@@ -87,16 +85,16 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 
 	// The residual sub-program is a param only when `plan.residualCondition` is set,
 	// so `run` is called with two or three args. Declared as a trailing rest tuple
-	// rather than an optional param: `residual?: ResidualCallback` would type as
-	// `ResidualCallback | undefined`, and `undefined` is not a `RuntimeValue`, so the
+	// rather than an optional param: `residual?: SubProgram` would type as
+	// `SubProgram | undefined`, and `undefined` is not a `RuntimeValue`, so the
 	// signature would not conform to `InstructionRun` (see `asRun`).
 	async function* run(
 		rctx: RuntimeContext,
 		leftSource: AsyncIterable<Row>,
 		rightSource: AsyncIterable<Row>,
-		...residual: ResidualCallback[]
+		...residual: SubProgram[]
 	): AsyncIterable<Row> {
-		const residualCallback: ResidualCallback | undefined = residual[0];
+		const residualCallback: SubProgram | undefined = residual[0];
 
 		log('Starting %s merge join: %d equi-pairs', plan.joinType.toUpperCase(), plan.equiPairs.length);
 

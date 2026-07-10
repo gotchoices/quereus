@@ -136,17 +136,35 @@ SELECT l.id AS lid, r.id AS rid FROM bj_res_l l JOIN bj_res_r r ON l.k = r.k AND
 → [{"lid":1,"rid":10},{"lid":3,"rid":30}]
 
 -- LEFT: a left row whose every equi candidate fails the residual is unmatched, not dropped
+SELECT 1 AS ok FROM query_plan('SELECT * FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
 SELECT l.id AS lid, r.id AS rid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t ORDER BY lid, rid;
 → [{"lid":1,"rid":10},{"lid":2,"rid":null},{"lid":3,"rid":30},{"lid":4,"rid":null}]
 
--- SEMI: residual gates the match bit
-SELECT l.id AS lid FROM bj_res_l l WHERE EXISTS (SELECT 1 FROM bj_res_r r WHERE r.k = l.k AND l.s < r.t) ORDER BY lid;
+-- SEMI: residual gates the match bit. Spelled as an existence flag rather than a
+-- correlated `exists (select ...)`: the subquery form plans as EXISTS over an index
+-- seek and never reaches a join at all, so it would give the residual param no
+-- coverage (see 08.2-existence-flag-semijoin-recovery.sqllogic for the rewrite).
+SELECT 1 AS ok FROM query_plan('SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE h')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
+SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE h ORDER BY lid;
 → [{"lid":1},{"lid":3}]
 
 -- ANTI: complement of the semi result
-SELECT l.id AS lid FROM bj_res_l l WHERE NOT EXISTS (SELECT 1 FROM bj_res_r r WHERE r.k = l.k AND l.s < r.t) ORDER BY lid;
+SELECT 1 AS ok FROM query_plan('SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE NOT h')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
+SELECT l.id AS lid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t EXISTS RIGHT AS h WHERE NOT h ORDER BY lid;
 → [{"lid":2},{"lid":4}]
 
+-- NOTE: no residual case here forces build/probe side-swap (the swap only fires for
+-- inner joins whose left side is the larger one, and the cost model decides). If a
+-- swap-related residual bug ever surfaces, add a case that pins the swap.
 DROP TABLE bj_res_l;
 DROP TABLE bj_res_r;
 

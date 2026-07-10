@@ -28,10 +28,18 @@ export type SqlValue = string | number | bigint | boolean | Uint8Array | JsonSql
 export type Row = SqlValue[];
 
 /**
- * Represents a value that can be expected as an input in the runtime environment.
- * This type can be a scalar value, or an async iterable of rows (cursor).
+ * A sub-program handed to an instruction as one of its params: invoke it to run the
+ * child program against the current runtime context. Emitters that receive one
+ * conditionally must declare it as a trailing rest tuple, not an optional param —
+ * see `asRun` in `runtime/types.ts`.
  */
-export type RuntimeValue = SqlValue | Row | AsyncIterable<Row> | ((ctx: RuntimeContext) => OutputValue)
+export type SubProgram = (ctx: RuntimeContext) => OutputValue;
+
+/**
+ * Represents a value that can be expected as an input in the runtime environment.
+ * This type can be a scalar value, an async iterable of rows (cursor), or a sub-program.
+ */
+export type RuntimeValue = SqlValue | Row | AsyncIterable<Row> | SubProgram
 
 /** Represents a value that can be output from an instruction or program. */
 export type OutputValue = MaybePromise<RuntimeValue>;

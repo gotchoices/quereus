@@ -2,14 +2,13 @@ import type { ViewMutationNode } from '../../planner/nodes/view-mutation-node.js
 import { isRelationalNode } from '../../planner/nodes/plan-node.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
-import type { RuntimeValue, OutputValue, Row, SqlValue } from '../../common/types.js';
+import type { RuntimeValue, OutputValue, Row, SqlValue, SubProgram } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
 import { isAsyncIterable } from '../utils.js';
 import { createRowSlot } from '../context-helpers.js';
 import type { RowDescriptor, TableDescriptor } from '../../planner/nodes/plan-node.js';
 
-type Callback = (ctx: RuntimeContext) => OutputValue;
 
 /**
  * Emit a view-/MV-mediated mutation.
@@ -132,7 +131,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 
 	async function drainBaseOps(rctx: RuntimeContext, baseCbs: RuntimeValue[]): Promise<void> {
 		for (const cb of baseCbs) {
-			const result = (cb as Callback)(rctx);
+			const result = (cb as SubProgram)(rctx);
 			const resolved = result instanceof Promise ? await result : result;
 			// A Sink-topped base op resolves to null; defensively drain a relational
 			// result so its writes fire before the next op.
@@ -154,8 +153,8 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 
 	async function materializeEnvelope(
 		rctx: RuntimeContext,
-		sourceCb: Callback,
-		keyDefaultCb: Callback | undefined,
+		sourceCb: SubProgram,
+		keyDefaultCb: SubProgram | undefined,
 		keyDefaultRowDescriptor: RowDescriptor | undefined,
 	): Promise<Row[]> {
 		const rows: Row[] = [];
@@ -236,7 +235,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		const setDescriptors: TableDescriptor[] = [];
 		try {
 			for (const { descriptor: capDescriptor, idx } of orderedCaptureIdxs) {
-				const captureRows = await collectRows((args[idx] as Callback)(rctx));
+				const captureRows = await collectRows((args[idx] as SubProgram)(rctx));
 				rctx.tableContexts.set(capDescriptor, () => arrayIterable(captureRows));
 				setDescriptors.push(capDescriptor);
 			}
@@ -251,7 +250,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 	async function runBody(rctx: RuntimeContext, args: RuntimeValue[], baseCbs: RuntimeValue[]): Promise<RuntimeValue> {
 		// (1) Multi-source RETURNING via a separate re-query of the view.
 		if (returningIdx >= 0) {
-			const returningCb = args[returningIdx] as Callback;
+			const returningCb = args[returningIdx] as SubProgram;
 			if (returningTiming === 'pre') {
 				// delete: capture the to-be-deleted view rows before the base ops fire.
 				const rows = await collectRows(returningCb(rctx));
@@ -272,7 +271,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		if (relationalBaseIdx >= 0) {
 			let resultRows: Row[] = [];
 			for (let i = 0; i < baseCbs.length; i++) {
-				const rows = await collectRows((baseCbs[i] as Callback)(rctx));
+				const rows = await collectRows((baseCbs[i] as SubProgram)(rctx));
 				if (i === relationalBaseIdx) resultRows = rows;
 			}
 			return arrayIterable(resultRows);
@@ -287,8 +286,8 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 			return null;
 		}
 
-		const sourceCb = args[envSourceIdx] as Callback;
-		const keyDefaultCb = hasKeyDefault ? (args[keyDefaultIdx] as Callback) : undefined;
+		const sourceCb = args[envSourceIdx] as SubProgram;
+		const keyDefaultCb = hasKeyDefault ? (args[keyDefaultIdx] as SubProgram) : undefined;
 		const rows = await materializeEnvelope(rctx, sourceCb, keyDefaultCb, envelope?.keyDefaultRowDescriptor);
 		rctx.tableContexts.set(descriptor, () => arrayIterable(rows));
 		try {

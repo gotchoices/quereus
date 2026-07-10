@@ -82,12 +82,20 @@ export type Instruction = {
  * still checked: every declared arg must be a {@link RuntimeValue} and the return
  * must be an {@link OutputValue}. Only the arity/contravariance mismatch is
  * waived. Two consequences for `run` authors:
- * - An **optional** param (`cb?: Callback`) types as `Callback | undefined`, and
+ * - An **optional** param (`cb?: SubProgram`) types as `SubProgram | undefined`, and
  *   `undefined` is not a `RuntimeValue` — a `run` whose trailing params are
- *   conditionally emitted must declare them as a rest tuple (`...cb: Callback[]`),
+ *   conditionally emitted must declare them as a rest tuple (`...cb: SubProgram[]`),
  *   which is also the truthful description of its call sites.
  * - `Promise<OutputValue>` is a promise-of-a-promise and is *not* an `OutputValue`.
  *   An `async` `run` returns `Promise<RuntimeValue>`.
+ *
+ * NOTE: the per-arg checking is only as strong as `TArgs` inferring a real tuple. A
+ * `run` declared `(ctx, ...args: RuntimeValue[])` infers `TArgs = RuntimeValue[]` — the
+ * constraint itself — so that emit site is accepted unchecked. That is intentional for
+ * the genuinely variadic emitters (`emit/block.ts`, `emit/view-mutation.ts`), but it is
+ * also the escape hatch a future author reaches for to silence one of the two errors
+ * above. If you widen a `run`'s params to shut up `tsc`, you have opted that emitter
+ * out of checking, not fixed it.
  */
 export function asRun<TArgs extends RuntimeValue[]>(
 	run: (ctx: RuntimeContext, ...args: TArgs) => OutputValue

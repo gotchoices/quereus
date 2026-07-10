@@ -3,7 +3,7 @@ import type { Instruction, RuntimeContext, InstructionRun, OutputValue } from '.
 import { asRun } from '../types.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
 import { QuereusError, ConstraintError, FailConflictError, RollbackConflictError, throwIfAborted } from '../../common/errors.js';
-import { StatusCode, type Row, type SqlValue, isConstraintViolation } from '../../common/types.js';
+import { StatusCode, type Row, type SqlValue, type SubProgram, isConstraintViolation } from '../../common/types.js';
 import { getVTable, disconnectVTable } from '../utils.js';
 import { ConflictResolution } from '../../common/constants.js';
 import type { EmissionContext } from '../emission-context.js';
@@ -352,8 +352,6 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		return undefined;
 	}
 
-	// Type for UPSERT evaluator callback (resolved by scheduler)
-	type UpsertEvaluator = (ctx: RuntimeContext) => OutputValue;
 
 	/**
 	 * Execute the DO UPDATE path for an UPSERT clause.
@@ -366,7 +364,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		existingRow: Row,
 		proposedRow: Row,
 		contextRow: Row | undefined,
-		upsertEvaluators: UpsertEvaluator[]
+		upsertEvaluators: SubProgram[]
 	): Promise<{ updatedRow: Row; flatRow: Row } | undefined> {
 		// Check WHERE condition if present
 		if (clause.whereIndex >= 0 && clause.newRowDescriptor && clause.existingRowDescriptor) {
@@ -604,7 +602,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 	): AsyncIterable<Row> {
 		// Split evaluators: first numContextEvaluators are context, rest are upsert
 		const contextEvaluators = allEvaluators.slice(0, numContextEvaluators);
-		const upsertEvaluators = allEvaluators.slice(numContextEvaluators) as UpsertEvaluator[];
+		const upsertEvaluators = allEvaluators.slice(numContextEvaluators) as SubProgram[];
 
 		// Ensure we're in a transaction before any mutations (lazy/JIT transaction start)
 		await ctx.db._ensureTransaction();
@@ -677,7 +675,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		flatRow: Row,
 		contextRow: Row | undefined,
 		runtimeUpsertClauses: RuntimeUpsertClause[] | undefined,
-		upsertEvaluators: UpsertEvaluator[],
+		upsertEvaluators: SubProgram[],
 		backingConnCache: BackingConnectionCache,
 		deferredRebuilds: Set<string>,
 	): Promise<Row | undefined> {

@@ -296,7 +296,7 @@ Wrap `run` in `asRun(...)`: a `run` with specific parameters (`SqlValue`,
 (`src/runtime/types.ts`) is the single audited home for that cast;
 `createValidatedInstruction(...)` takes it too. It checks params are
 `RuntimeValue`s and the return an `OutputValue`: an `async` `run` returns
-`Promise<RuntimeValue>`, and a sometimes-emitted callback param is a rest tuple,
+`Promise<RuntimeValue>`, and a sometimes-emitted `SubProgram` param is a rest tuple,
 not optional (`emit/bloom-join.ts`).
 
 ### 2. Register the Emitter
