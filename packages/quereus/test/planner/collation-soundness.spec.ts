@@ -85,6 +85,16 @@ describe('Collation soundness of plan-time equality facts', () => {
 			// would be the out-of-scope discharge this ticket fixed.
 			expect(keysOf(root).some(k => k.length === 1 && k[0] === 0), 'guard key {x} claimed out of scope').to.equal(false);
 		});
+
+		it('5: a NOCASE pin on a JSON column makes no ≤1-row claim', async () => {
+			await db.exec('create table tj (j json, x integer, primary key (j, x)) using memory');
+			await db.exec(`insert into tj values ('"Bob"',1), ('"bob"',1)`);
+			const q = `select * from tj where j = cast('"bob"' as json) collate nocase and x = 1`;
+			const root = rootOf(db, q);
+			expect((await collect(db, q)).length).to.equal(2);
+			expect(isAtMostOneRow(root), 'false ≤1-row claim on JSON column').to.equal(false);
+			expect(keysOf(root).some(k => k.length === 0), 'empty key claimed').to.equal(false);
+		});
 	});
 
 	describe('sound controls (must keep working)', () => {

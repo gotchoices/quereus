@@ -288,14 +288,14 @@ export function operandCollation(node: ScalarPlanNode): string {
 }
 
 /**
- * True when a logical type can never produce a text value at runtime. `ANY`
- * validates every value (it can hold text), so it is treated as potentially
- * textual despite carrying no `isTextual` marker. An absent type is unknown —
- * potentially textual.
+ * True when a logical type can never produce a text value at runtime. The
+ * negation of {@link logicalTypeCanHoldText}'s physical-representation
+ * allow-list — `JSON` (physical `OBJECT`) and `NULL_TYPE` (physical `NULL`,
+ * which covers `ANY` too) are potentially textual, not exempt. An absent type
+ * is unknown — potentially textual.
  */
 function isNonTextualLogicalType(lt: LogicalType | undefined): boolean {
-	if (lt === undefined) return false;
-	return lt.isTextual !== true && lt.physicalType !== PhysicalType.TEXT && lt.name !== 'ANY';
+	return !logicalTypeCanHoldText(lt);
 }
 
 /**
@@ -310,10 +310,6 @@ function isStaticallyNonTextual(node: ScalarPlanNode): boolean {
  * Physical representations that provably never hold a JS string. `OBJECT` is absent on
  * purpose: `JSON_TYPE.parse` passes a JSON scalar string straight through, so a `JSON`
  * value can be the ordinary string `Bob`. So is `NULL` (`ANY`'s representation).
- *
- * NOTE: deliberately stricter than {@link isNonTextualLogicalType} above, which exempts
- * `JSON` and is the subject of `bug-json-columns-classified-as-non-textual`. The two
- * collapse into one predicate once that ticket lands.
  */
 const NEVER_TEXT_PHYSICAL_TYPES: ReadonlySet<PhysicalType> = new Set([
 	PhysicalType.INTEGER,
