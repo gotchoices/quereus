@@ -1,5 +1,4 @@
 import type { RuntimeContext } from './types.js';
-import { RowContextMap } from './context-helpers.js';
 import {
 	createStrictRowContextMap,
 	wrapTableContextsStrict,
@@ -47,7 +46,7 @@ export class ParallelDriver {
 	 * Fork `rctx` into `n` independent child views.
 	 *
 	 * Each child receives:
-	 * - an **independent** {@link RowContextMap} seeded with a snapshot of the parent's
+	 * - an **independent** `RowContextMap` seeded with a snapshot of the parent's
 	 *   entries — writes (e.g. via `createRowSlot`) in one fork do not leak to siblings
 	 *   or to the parent;
 	 * - an **independent** `tableContexts` map seeded with a shallow snapshot of the
@@ -69,10 +68,13 @@ export class ParallelDriver {
 		const strict = strictForkEnabled();
 		const forks: RuntimeContext[] = new Array(n);
 		for (let i = 0; i < n; i++) {
-			// Fresh per-fork maps. Under strict mode the maps are wrapped so they
-			// can themselves serve as parents for sub-forks; the seed loop runs
-			// before any sub-fork is active, so the wrapper's guard passes naturally.
-			const childContext = strict ? createStrictRowContextMap() : new RowContextMap();
+			// Fresh per-fork maps. `createStrictRowContextMap()` returns the strict
+			// subclass when *either* strict flag is on (so context-strict forks are
+			// checkable too) and a vanilla map otherwise. Under fork-strict the map
+			// can itself parent sub-forks; the seed loop runs before any sub-fork is
+			// active, so the wrapper's guard passes naturally. The seed set()s also
+			// initialize the context-strict epoch/winner tables for a post-fork read.
+			const childContext = createStrictRowContextMap();
 			for (const [desc, getter] of rctx.context.entries()) {
 				childContext.set(desc, getter);
 			}

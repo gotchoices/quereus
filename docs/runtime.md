@@ -415,6 +415,13 @@ There are two tools, picked by which side must win at the moment of the next pul
   `rightSlot.reactivate()` before yielding the matched / null-padded row, so
   downstream reads the matched row rather than the right scan's look-ahead cursor.
 
+The **operator-shadows-child** direction (tear-down-before-pull) is checked at
+runtime by the off-by-default `QUEREUS_CONTEXT_STRICT` harness — see § Strict
+context-shadow test mode below. The mirror **child-shadows-operator** direction is
+deliberately *not* checked (recency can't distinguish a forgotten `reactivate()`
+from a correct newest write); that gap is tracked in the backlog ticket
+`debt-context-shadow-reactivate-direction`.
+
 ## Scheduler Execution Model
 
 The Scheduler executes instructions in dependency order:
@@ -1486,6 +1493,16 @@ Because of this, the parallel-track recognition rules in the optimizer (`AsyncGa
 Set `QUEREUS_FORK_STRICT=1` (or run `yarn test:fork-strict` from `packages/quereus`, which the root `yarn check` gate also runs) to enable a Node-only proxy/subclass that wraps every `RuntimeContext.tableContexts` and `RuntimeContext.context` constructed at the five production sites (`Statement`, `Database._executeSingleStatement`, `DatabaseAssertions.executeResidualPerTuple`, `DeferredConstraintQueue.runDeferredRows`, `const-evaluator`) plus every fork's own maps. The wrapper throws a `strict-fork: parent context mutated ...` error if any `set` / `delete` / `clear` is invoked on a parent map while one of its forks is currently being driven by `ParallelDriver.drive()`.
 
 State is tracked per parent map (not globally) so concurrent unrelated drivers don't interfere and forks may freely mutate their own (fresh) maps. When the env flag is unset every helper is a no-op pass-through — production paths see vanilla `new RowContextMap()` / `new Map()`.
+
+### Strict context-shadow test mode
+
+Set `QUEREUS_CONTEXT_STRICT=1` (or run `yarn test:context-strict` from `packages/quereus`, which the root `yarn check` gate also runs alongside `test:fork-strict`) to enable an off-by-default runtime assertion that catches the **operator-shadows-child** stale-shadow described in § Invariant: source-attr contexts and child pulls — a whole class of silent wrong-row bugs where a streaming operator leaves a row context built from its source's attribute IDs winning the `attributeIndex` while a child sets a newer row for the same IDs.
+
+**What it asserts.** The strict `RowContextMap` subclass (in `runtime/strict-fork.ts`, shared with the fork-strict harness and constructed through the same `createStrictRowContextMap()` factory) maintains a monotonic clock, a per-descriptor `lastTouchEpoch` bumped on both `set()` and each `slot.set(row)` (via `noteRowSet`), and a per-attribute `winnerByAttr` map kept in lockstep with `attributeIndex`. `resolveAttribute` calls `assertNoShadow` under the flag: for the attribute being read, if a *different* live context carries the same attr with a strictly-newer epoch **and a differing value at the resolved column**, it throws a `QuereusError(INTERNAL)` whose message begins `context-strict:` and points back here. The value comparison is deliberate — a wider projection (e.g. a nested-loop join output `[...left, ...right]`) legitimately re-carries a source attribute in a newer row object that agrees on the shared column, which is not an observable wrong-row.
+
+**What it deliberately does not assert.** The mirror **child-shadows-operator** direction (an operator that forgets `reactivate()` before yielding, letting a child cursor's genuinely-newer look-ahead `set` win) is out of scope: recency alone cannot distinguish that wrong-but-newest state from a correct newest write. Catching it needs per-operator declared intent (provenance threading), tracked in the backlog ticket `debt-context-shadow-reactivate-direction`.
+
+**Cost & gating.** Zero-cost when off: a module-level `CONTEXT_STRICT` boolean (read once from the env in `runtime/strict-flags.ts`) guards the single leading `if (CONTEXT_STRICT) rctx.context.assertNoShadow?.(...)` in `resolveAttribute` and the per-row `noteRowSet?` bump in `createRowSlot`; the base `RowContextMap` carries no epoch side-tables and `createStrictRowContextMap()` returns a vanilla map when both strict flags are off. The per-read check is O(live contexts carrying the attr) — small in practice; if a pathological plan makes strict-mode CI slow, index the per-attr candidate list instead of scanning all live entries (noted as a tripwire at the call site). Diagnostics name the attribute + column, the stale index winner and the shadowing context (by their best-effort installer labels, threaded incrementally through `createRowSlot` / `withRowContext` / the direct-`set` aggregate/window emitters; absent labels degrade to the descriptor's attribute-ID list), and the reading operator from `planStack` top when tracing is on.
 
 ### EagerPrefetchNode (first ParallelDriver.fork consumer)
 

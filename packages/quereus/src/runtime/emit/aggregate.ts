@@ -19,6 +19,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { AggValue } from '../../func/registration.js';
+import type { ContextInstaller } from '../context-helpers.js';
 
 export const ctxLog = createLogger('runtime:context');
 
@@ -76,6 +77,10 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 		const sourceRelationAttributes = isRelationalNode(sourceRelation) ? sourceRelation.getAttributes() : sourceAttributes;
 		ctxLog('Source relation attributes: %O', sourceRelationAttributes.map((attr) => `${attr.name}(#${attr.id})`));
 	}
+
+	// Best-effort installer label for QUEREUS_CONTEXT_STRICT diagnostics (identifies
+	// this operator on the direct context.set()s below; detection ignores it).
+	const installer: ContextInstaller = { nodeType: plan.nodeType, id: plan.id };
 
 	// Create output row descriptor for the StreamAggregate's output
 	const outputRowDescriptor = buildRowDescriptor(plan.getAttributes());
@@ -234,7 +239,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 				lastSourceRow = row;
 
 				// Set the current row in the runtime context for Filter and aggregate evaluation
-				ctx.context.set(scanRowDescriptor, () => row);
+				ctx.context.set(scanRowDescriptor, () => row, installer);
 				logContextPush(scanRowDescriptor, 'scan-row', sourceAttributes);
 
 				try {
@@ -301,10 +306,10 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 			// Set up combined context for the result row (includes both output and source attributes)
 			if (lastSourceRow) {
-				ctx.context.set(scanRowDescriptor, () => lastSourceRow);
+				ctx.context.set(scanRowDescriptor, () => lastSourceRow, installer);
 				logContextPush(scanRowDescriptor, 'aggregate-rep-row');
 			}
-			ctx.context.set(combinedRowDescriptor, () => fullRow);
+			ctx.context.set(combinedRowDescriptor, () => fullRow, installer);
 			logContextPush(combinedRowDescriptor, 'aggregate-full-row');
 			try {
 				yield aggregateRow;
@@ -330,7 +335,7 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 			// Process all rows
 			for await (const row of sourceRows) {
 				// Set the current row in the runtime context for Filter and GROUP BY evaluation
-				ctx.context.set(scanRowDescriptor, () => row);
+				ctx.context.set(scanRowDescriptor, () => row, installer);
 				logContextPush(scanRowDescriptor, 'scan-row', sourceAttributes);
 
 				try {
@@ -391,18 +396,18 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 						// Set up context with the PREVIOUS group's representative row (not the current row)
 						if (previousGroupSourceRow) {
-							ctx.context.set(scanRowDescriptor, () => previousGroupSourceRow);
+							ctx.context.set(scanRowDescriptor, () => previousGroupSourceRow, installer);
 							logContextPush(scanRowDescriptor, 'group-rep-row');
 						}
-						ctx.context.set(combinedRowDescriptor, () => fullRow);
+						ctx.context.set(combinedRowDescriptor, () => fullRow, installer);
 						logContextPush(combinedRowDescriptor, 'output-row-groupby');
 						if (previousGroupSourceRow) {
 							// Use the previous group's representative row for HAVING evaluation
 							// Use separate descriptors to avoid conflicts with source row processing
-							ctx.context.set(groupSourceRowDescriptor, () => previousGroupSourceRow!);
+							ctx.context.set(groupSourceRowDescriptor, () => previousGroupSourceRow!, installer);
 							logContextPush(groupSourceRowDescriptor, 'source-row-groupby', sourceAttributes);
 							if (sourceRelation !== plan.source) {
-								ctx.context.set(groupSourceRelationRowDescriptor, () => previousGroupSourceRow!);
+								ctx.context.set(groupSourceRelationRowDescriptor, () => previousGroupSourceRow!, installer);
 								logContextPush(groupSourceRelationRowDescriptor, 'source-relation-row-groupby');
 							}
 						}
@@ -525,18 +530,18 @@ export function emitStreamAggregate(plan: StreamAggregateNode, ctx: EmissionCont
 
 				// Set up context for final group with correct source row
 				if (currentSourceRow) {
-					ctx.context.set(scanRowDescriptor, () => currentSourceRow);
+					ctx.context.set(scanRowDescriptor, () => currentSourceRow, installer);
 					logContextPush(scanRowDescriptor, 'final-group-rep-row');
 				}
-				ctx.context.set(combinedRowDescriptor, () => fullRow);
+				ctx.context.set(combinedRowDescriptor, () => fullRow, installer);
 				logContextPush(combinedRowDescriptor, 'final-output-row');
 				if (currentSourceRow) {
 					// Use the final group's representative row for HAVING evaluation
 					// Use separate descriptors to avoid conflicts with source row processing
-					ctx.context.set(groupSourceRowDescriptor, () => currentSourceRow!);
+					ctx.context.set(groupSourceRowDescriptor, () => currentSourceRow!, installer);
 					logContextPush(groupSourceRowDescriptor, 'final-source-row', sourceAttributes);
 					if (sourceRelation !== plan.source) {
-						ctx.context.set(groupSourceRelationRowDescriptor, () => currentSourceRow!);
+						ctx.context.set(groupSourceRelationRowDescriptor, () => currentSourceRow!, installer);
 						logContextPush(groupSourceRelationRowDescriptor, 'final-source-relation-row');
 					}
 				}

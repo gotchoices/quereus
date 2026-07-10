@@ -15,7 +15,7 @@ import { createLogger } from '../../common/logger.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
 import { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import type * as AST from '../../parser/ast.js';
-import { createRowSlot, type RowSlot } from '../context-helpers.js';
+import { createRowSlot, type RowSlot, type ContextInstaller } from '../context-helpers.js';
 import { tryExtractNumericLiteral } from '../../util/ast-literal.js';
 
 const log = createLogger('runtime:emit:window');
@@ -94,7 +94,9 @@ export function emitWindow(plan: WindowNode, ctx: EmissionContext): Instruction 
 		}
 
 		// Single source slot shared across all partition/sort/ranking/aggregate operations
-		const sourceSlot = createRowSlot(rctx, sourceRowDescriptor);
+		// Best-effort installer label for QUEREUS_CONTEXT_STRICT diagnostics (detection ignores it).
+		const installer: ContextInstaller = { nodeType: plan.nodeType, id: plan.id };
+		const sourceSlot = createRowSlot(rctx, sourceRowDescriptor, installer);
 		try {
 			if (plan.streaming) {
 				// Streaming fast path: source already arrives in
@@ -987,6 +989,8 @@ async function* runStreaming(
 	const myRef = { current: undefined as Row | undefined };
 	const myGetter = () => myRef.current!;
 	let myRegistered = false;
+	// Best-effort installer label for QUEREUS_CONTEXT_STRICT diagnostics (detection ignores it).
+	const installer: ContextInstaller = { nodeType: plan.nodeType, id: plan.id };
 
 	const promote = (row: Row): void => {
 		myRef.current = row;
@@ -997,7 +1001,7 @@ async function* runStreaming(
 		if (myRegistered) {
 			rctx.context.delete(myDesc);
 		}
-		rctx.context.set(myDesc, myGetter);
+		rctx.context.set(myDesc, myGetter, installer);
 		myRegistered = true;
 	};
 

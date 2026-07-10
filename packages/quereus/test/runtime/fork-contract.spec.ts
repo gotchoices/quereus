@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, posix, relative, sep } from 'node:path';
 import { ParallelDriver } from '../../src/runtime/parallel-driver.js';
-import { createRowSlot } from '../../src/runtime/context-helpers.js';
+import { createRowSlot, resolveAttribute } from '../../src/runtime/context-helpers.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../../src/runtime/strict-fork.js';
 import type { RuntimeContext } from '../../src/runtime/types.js';
 import type { RowDescriptor } from '../../src/planner/nodes/plan-node.js';
@@ -387,6 +387,125 @@ describe('Fork contract (test harness)', () => {
 					parent.tableContexts.set({} as never, () => undefined as never);
 				}).to.not.throw();
 			})();
+		});
+	});
+
+	describe('context-strict mode (QUEREUS_CONTEXT_STRICT)', () => {
+		const contextStrict = process.env.QUEREUS_CONTEXT_STRICT === '1' || process.env.QUEREUS_CONTEXT_STRICT === 'true';
+		const forkStrict = process.env.QUEREUS_FORK_STRICT === '1' || process.env.QUEREUS_FORK_STRICT === 'true';
+
+		it('createStrictRowContextMap returns a plain RowContextMap (no shadow hooks) when both strict flags are off', function () {
+			if (contextStrict || forkStrict) {
+				this.skip();
+				return;
+			}
+			const map = createStrictRowContextMap();
+			expect(map.assertNoShadow, 'base map must not carry the shadow hook when flags are off').to.equal(undefined);
+			expect(map.noteRowSet, 'base map must not carry noteRowSet when flags are off').to.equal(undefined);
+		});
+
+		it('throws context-strict on a deliberate stale-shadow (operator wins index, child sets a newer row)', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 700;
+			// Two distinct descriptors over the SAME attribute id (operator + child both
+			// project source attr 700 at column 0).
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set([111] as unknown as Row);
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set([222] as unknown as Row);
+
+			// Operator re-wins the attribute index for its stale row (as if it re-set its
+			// source-attr context) but then FORGETS to release it before the child advances.
+			opSlot.reactivate();
+			childSlot.set([333] as unknown as Row); // child's genuinely-newer row, index NOT reclaimed
+
+			// A read here would silently resolve to the operator's stale 111 instead of 333.
+			expect(() => resolveAttribute(rctx, attrId, 'x')).to.throw(/context-strict:/);
+		});
+
+		it('does NOT throw for correct tear-down (operator deletes its context before the child advances)', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 710;
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set([1] as unknown as Row);
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set([2] as unknown as Row);
+
+			// Correct discipline: operator releases its source-attr context (tear-down)
+			// BEFORE the child produces its next row. The index winner rebuilds to the child.
+			opSlot.close();
+			childSlot.set([3] as unknown as Row);
+
+			expect(() => resolveAttribute(rctx, attrId, 'y')).to.not.throw();
+			expect(resolveAttribute(rctx, attrId, 'y'), 'read resolves to the child current row').to.equal(3);
+		});
+
+		it('does NOT throw for correct reactivate (operator re-wins the index and stays newest)', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 720;
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set([10] as unknown as Row);
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set([20] as unknown as Row); // child's look-ahead cursor
+
+			// Correct reactivate-before-yield: operator re-wins the index AND is now newest.
+			opSlot.reactivate();
+
+			expect(() => resolveAttribute(rctx, attrId, 'z')).to.not.throw();
+			expect(resolveAttribute(rctx, attrId, 'z'), 'read resolves to the operator row').to.equal(10);
+		});
+
+		it('does NOT throw when two live descriptors share an attr but hold the SAME row object', function () {
+			if (!contextStrict) {
+				this.skip();
+				return;
+			}
+			const rctx = makeRuntimeContext();
+			const attrId = 730;
+			const opDesc: RowDescriptor = [];
+			opDesc[attrId] = 0;
+			const childDesc: RowDescriptor = [];
+			childDesc[attrId] = 0;
+
+			const sharedRow = [42] as unknown as Row;
+			const childSlot = createRowSlot(rctx, childDesc, 'child-scan');
+			childSlot.set(sharedRow);
+			const opSlot = createRowSlot(rctx, opDesc, 'operator');
+			opSlot.set(sharedRow); // operator wins the index (set last), holds the same peeked row
+
+			// Child re-touches the same object, bumping its epoch above the winner —
+			// but the row object is identical (asof-style left slot mirroring the peek).
+			childSlot.set(sharedRow);
+
+			// No observable wrong-row: both descriptors resolve to the identical array.
+			expect(() => resolveAttribute(rctx, attrId, 'w')).to.not.throw();
 		});
 	});
 });

@@ -21,6 +21,7 @@ import { createTypedComparator } from '../../util/comparison.js';
 import { hashKeyCollationName } from '../../planner/analysis/comparison-collation.js';
 import type { LogicalType } from '../../types/logical-type.js';
 import { cloneInitialValue, findSourceRelation, ctxLog } from './aggregate.js';
+import type { ContextInstaller } from '../context-helpers.js';
 
 interface GroupState {
 	groupValues: SqlValue[];
@@ -40,6 +41,10 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 		: groupSourceRowDescriptor;
 
 	ctxLog('HashAggregate setup: source=%s, sourceRelation=%s', plan.source.nodeType, sourceRelation.nodeType);
+
+	// Best-effort installer label for QUEREUS_CONTEXT_STRICT diagnostics (identifies
+	// this operator on the direct context.set()s below; detection ignores it).
+	const installer: ContextInstaller = { nodeType: plan.nodeType, id: plan.id };
 
 	const outputRowDescriptor = buildRowDescriptor(plan.getAttributes());
 	const scanRowDescriptor = buildRowDescriptor(sourceAttributes);
@@ -174,7 +179,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 			for await (const row of sourceRows) {
 				lastSourceRow = row;
-				ctx.context.set(scanRowDescriptor, () => row);
+				ctx.context.set(scanRowDescriptor, () => row, installer);
 				logContextPush(scanRowDescriptor, 'scan-row', sourceAttributes);
 
 				try {
@@ -228,10 +233,10 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 			const fullRow = lastSourceRow ? [...aggregateRow, ...lastSourceRow] : aggregateRow;
 
 			if (lastSourceRow) {
-				ctx.context.set(scanRowDescriptor, () => lastSourceRow);
+				ctx.context.set(scanRowDescriptor, () => lastSourceRow, installer);
 				logContextPush(scanRowDescriptor, 'aggregate-rep-row');
 			}
-			ctx.context.set(combinedRowDescriptor, () => fullRow);
+			ctx.context.set(combinedRowDescriptor, () => fullRow, installer);
 			logContextPush(combinedRowDescriptor, 'aggregate-full-row');
 			try {
 				yield aggregateRow;
@@ -251,7 +256,7 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 
 		// Build phase: iterate all source rows
 		for await (const row of sourceRows) {
-			ctx.context.set(scanRowDescriptor, () => row);
+			ctx.context.set(scanRowDescriptor, () => row, installer);
 			logContextPush(scanRowDescriptor, 'scan-row', sourceAttributes);
 
 			try {
@@ -334,14 +339,14 @@ export function emitHashAggregate(plan: HashAggregateNode, ctx: EmissionContext)
 			// Set up combined context (output + representative source row) for HAVING
 			const fullRow = [...aggregateRow, ...group.representativeSourceRow];
 
-			ctx.context.set(scanRowDescriptor, () => group.representativeSourceRow);
+			ctx.context.set(scanRowDescriptor, () => group.representativeSourceRow, installer);
 			logContextPush(scanRowDescriptor, 'group-rep-row');
-			ctx.context.set(combinedRowDescriptor, () => fullRow);
+			ctx.context.set(combinedRowDescriptor, () => fullRow, installer);
 			logContextPush(combinedRowDescriptor, 'output-row-groupby');
-			ctx.context.set(groupSourceRowDescriptor, () => group.representativeSourceRow);
+			ctx.context.set(groupSourceRowDescriptor, () => group.representativeSourceRow, installer);
 			logContextPush(groupSourceRowDescriptor, 'source-row-groupby', sourceAttributes);
 			if (sourceRelation !== plan.source) {
-				ctx.context.set(groupSourceRelationRowDescriptor, () => group.representativeSourceRow);
+				ctx.context.set(groupSourceRelationRowDescriptor, () => group.representativeSourceRow, installer);
 				logContextPush(groupSourceRelationRowDescriptor, 'source-relation-row-groupby');
 			}
 

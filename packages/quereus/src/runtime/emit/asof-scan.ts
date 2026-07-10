@@ -172,8 +172,8 @@ function emitAsofScanHash(plan: AsofScanNode, ctx: EmissionContext): Instruction
 		log('Starting %s asof scan [hash]: direction=%s, %d partition keys, strict=%s',
 			plan.outer ? 'LEFT' : 'INNER', direction, plan.partitionAttrs.length, strict);
 
-		const leftSlot = createRowSlot(rctx, leftRowDescriptor);
-		const rightSlot = createRowSlot(rctx, rightRowDescriptor);
+		const leftSlot = createRowSlot(rctx, leftRowDescriptor, `AsofScan#${plan.id}:left`);
+		const rightSlot = createRowSlot(rctx, rightRowDescriptor, `AsofScan#${plan.id}:right`);
 
 		try {
 			// Bucket right rows by partition key. Right rows with NULL match are dropped;
@@ -378,8 +378,8 @@ function emitAsofScanMerge(plan: AsofScanNode, ctx: EmissionContext): Instructio
 		log('Starting %s asof scan [merge]: direction=%s, %d partition keys, strict=%s',
 			plan.outer ? 'LEFT' : 'INNER', direction, partitionLen, strict);
 
-		const leftSlot = createRowSlot(rctx, leftRowDescriptor);
-		const rightSlot = createRowSlot(rctx, rightRowDescriptor);
+		const leftSlot = createRowSlot(rctx, leftRowDescriptor, `AsofScan#${plan.id}:left`);
+		const rightSlot = createRowSlot(rctx, rightRowDescriptor, `AsofScan#${plan.id}:right`);
 
 		const leftIter = peekableAsyncIterator(leftSource);
 		const rightIter = peekableAsyncIterator(rightSource);

@@ -27,6 +27,9 @@ while (i < args.length) {
 		case '--fork-strict':
 			env.QUEREUS_FORK_STRICT = '1';
 			break;
+		case '--context-strict':
+			env.QUEREUS_CONTEXT_STRICT = '1';
+			break;
 		case '--show-plan':
 			env.QUEREUS_TEST_SHOW_PLAN = 'true';
 			break;
