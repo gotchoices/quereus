@@ -643,17 +643,54 @@ For each declared non-PK UNIQUE constraint:
   TRUE — the row is outside the index's scope and contributes nothing to
   uniqueness. Predicate compilation is memoized per `UniqueConstraintSchema`
   identity via a `WeakMap`, so the hot write path doesn't recompile.
-- Scan the underlying table for a row matching on all constrained columns,
-  excluding the writer's own PK(s) and any PK currently tombstoned in the
-  overlay. When a non-tombstone overlay entry supersedes a scanned committed
-  row, the constrained columns **and** the partial predicate are evaluated
-  against the *merged* (overlay) row — not the stale underlying value — so a
-  candidate moved off the value earlier in the same txn no longer counts as a
-  conflict (and one moved *onto* the value correctly does). For partial UNIQUE,
-  candidates whose merged row does not satisfy the predicate are also skipped.
+- Search the **merged view** — this connection's overlay superimposed on the
+  underlying committed rows — for a row matching on all constrained columns,
+  excluding the writer's own PK(s). The merged view splits cleanly along the
+  overlay boundary, and each half is searched the way it is cheap to search:
+
+  ```
+  merged view  =  (overlay rows)  ∪  (underlying rows with no overlay entry)
+  ```
+
+  - **Phase 1 — scan the overlay** (`findOverlayUniqueConflict`). The overlay is
+    the transaction's write set: small and already in memory. Skip tombstones and
+    the writer's own PK(s); a matching live overlay row IS the merged row (its
+    overlay value — not any stale underlying value — is what the merged view holds
+    for that PK), so a candidate moved off the value earlier in the same txn no
+    longer counts, and one moved *onto* it correctly does.
+  - **Phase 2 — seek the underlying** (`findUnderlyingUniqueConflict`). Look up
+    underlying rows matching the constrained columns, skipping the writer's own
+    PK(s) **and** any PK the overlay already owns (Phase 1's territory, whatever
+    the underlying still says). The lookup is an **index seek** when
+    `canSeekForConstraint` allows it (below), else the pre-existing full scan;
+    either way the per-column match still runs, so a module that ignores the index
+    hint and returns extra rows stays correct. `getOverlayRow` now fires only for
+    the candidates the seek returned, not once per underlying row.
+
+  Both phases run the same matcher (`rowMatchesUniqueConstraint`) so they compare
+  identically, and — for a partial UNIQUE — evaluate the predicate against the
+  merged row. Together they cover the merged view exactly once with no row visited
+  twice. Phase 1 runs first, so when the constraint was *already* violated an
+  overlay-side conflict is reported in preference to an underlying one; under a
+  satisfied constraint at most one conflicting row exists, so this tie-break only
+  changes *which* row is named in that pre-violated case.
 - ABORT returns the constraint result; IGNORE no-ops; REPLACE writes a
-  tombstone for the conflicting underlying PK so the row is evicted at flush,
-  then continues.
+  tombstone for the conflicting PK so the row is evicted at flush, then continues.
+  The evicted row is surfaced in the same user-facing schema shape whether it came
+  from Phase 1 (an overlay row) or Phase 2 (an underlying row).
+
+**When Phase 2 may seek (`canSeekForConstraint`).** Only when the constraint was
+synthesized from a `CREATE UNIQUE INDEX` (`derivedFromIndex` names a live entry in
+`tableSchema.indexes`) AND every key column's effective enforcement collation is
+BINARY. The BINARY gate is load-bearing, not an optimisation choice: the store's
+physical index key bytes come from a separate encoder registry that does **not**
+consult the database's collation registry
+(`backlog/debt-store-index-keys-use-column-collation`). Seeking a `NOCASE` index for
+`'B@X'` would physically miss a committed `'b@x'` that the full scan catches, turning
+a performance fix into a lost UNIQUE violation. A table-level `unique(a, b)` (no
+backing index) or any non-BINARY-collated index falls back to the full scan. Widen
+the gate to per-column enforcement collations generally only once that encoder defect
+is fixed.
 
 An INSERT that reuses a PK tombstoned earlier in the same transaction (reviving
 the tombstone into a live row) runs this same merged UNIQUE check before the
@@ -671,10 +708,12 @@ PK that has a tombstone in the overlay.
 
 ### Trade-offs
 
-- Non-PK UNIQUE checks currently do an O(n) scan of the underlying for each
-  write. The overlay's own UNIQUE constraint enforcement covers overlay-only
-  conflicts; the merged-view scan only fills the underlying-only gap. Index-
-  based lookup is a future optimisation.
+- Non-PK UNIQUE checks over an index-derived, BINARY-collated constraint seek the
+  backing index (O(log n) + overlay scan) rather than scanning the underlying; a
+  table-level `unique(...)` with no backing index, or a non-BINARY-collated one,
+  still does the O(n) full scan (see `canSeekForConstraint`). The overlay's own
+  UNIQUE enforcement covers overlay-only conflicts; the merged-view search fills the
+  underlying-only gap. Phase 1 always scans the (small) overlay in full.
 - Same-PK REPLACE returns null instead of carrying the replaced row back to
   the DML executor, so FK CASCADE side-effects do not fire for replacements
   resolved through the isolation layer (tracked separately).

@@ -1,4 +1,4 @@
-import type { FilterInfo, IndexDescriptor, SqlValue } from '@quereus/quereus';
+import type { FilterInfo, IndexDescriptor, SqlValue, TableIndexSchema } from '@quereus/quereus';
 import { PRIMARY_INDEX_NAME, makeFullScanFilterInfo, makeIndexEqSeekFilterInfo } from '@quereus/quereus';
 
 /**
@@ -26,4 +26,29 @@ export function makePkPointLookupFilter(pkIndices: number[], pk: SqlValue[]): Fi
 		unique: true,
 	};
 	return makeIndexEqSeekFilterInfo(index, pkIndices, pk);
+}
+
+/**
+ * Creates a FilterInfo for an equality seek over a secondary `index`, binding each of
+ * the index's key columns to `newRow`'s value for that column. Produces an O(log n)
+ * index lookup for the isolation layer's UNIQUE-conflict check instead of a full scan.
+ *
+ * The seek values are read in INDEX-KEY order (`index.columns[i].index`), which need
+ * not match the UNIQUE constraint's `columns` order — so read off the index, never
+ * assume the two arrays agree.
+ *
+ * The built `constraints` carry an EQ per key column, so a module that ignores the
+ * `idxStr` index hint still applies the equalities as a residual filter rather than
+ * returning the whole table.
+ */
+export function makeSecondaryIndexEqSeekFilter(index: TableIndexSchema, newRow: readonly SqlValue[]): FilterInfo {
+	const descriptor: IndexDescriptor = {
+		name: index.name,
+		role: 'secondary',
+		keyColumns: index.columns.map(c => ({ columnIndex: c.index, desc: !!c.desc, collation: c.collation })),
+		unique: true,
+	};
+	const seekColumnIndexes = index.columns.map(c => c.index);
+	const values = seekColumnIndexes.map(i => newRow[i]);
+	return makeIndexEqSeekFilterInfo(descriptor, seekColumnIndexes, values);
 }

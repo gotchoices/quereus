@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode, primaryKeyDescriptor } from '@quereus/quereus';
+import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
 import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
@@ -3821,5 +3821,254 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			const rows = await asyncIterableToArray(db.eval('select id, a from t order by id'));
 			expect(rows.map(r => [r.id, r.a])).to.deep.equal([[1, 6], [2, 5]]);
 		});
+	});
+});
+
+// ===========================================================================
+// Two-phase merged UNIQUE check (index seek).
+//
+// A non-PK UNIQUE check runs against the MERGED view — the underlying committed
+// rows with this connection's uncommitted overlay superimposed. The check splits
+// that view into two disjoint halves: Phase 1 scans the small in-memory overlay,
+// Phase 2 seeks (or, when it may not seek, full-scans) the large underlying,
+// skipping any PK the overlay already owns. Phase 2 seeks only an index-derived
+// UNIQUE whose enforcement collation is BINARY (the store's index key bytes ignore
+// the collation registry, so a NOCASE seek would miss committed case-variants).
+// ===========================================================================
+describe('IsolationModule — two-phase merged UNIQUE check (index seek)', () => {
+	let db: Database;
+	let iso: IsolationModule;
+
+	beforeEach(() => {
+		db = new Database();
+		iso = new IsolationModule({ underlying: new MemoryTableModule() });
+		db.registerModule('isolated', iso);
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	async function expectConstraint(sql: string): Promise<void> {
+		let err: unknown;
+		try { await db.exec(sql); } catch (e) { err = e; }
+		expect(err, `expected UNIQUE violation from: ${sql}`).to.be.instanceOf(QuereusError);
+		expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+	}
+
+	async function connect(table: string): Promise<IsolatedTable> {
+		return await iso.connect(db, undefined, 'isolated', 'main', table, {} as BaseModuleConfig) as IsolatedTable;
+	}
+
+	// Each merged-view scenario must hold identically whether the UNIQUE is a bare
+	// table-level constraint (no backing index ⇒ Phase 2 full-scans) or index-derived
+	// (Phase 2 seeks `ux`). Parameterise over both so the seek arm and the scan arm are
+	// each proven correct on every scenario.
+	const variants = [
+		{
+			label: 'table-level unique(email), no backing index (Phase 2 full-scans)',
+			create: async () => {
+				await db.exec(`create table t (id integer primary key, email text, unique(email)) using isolated`);
+			},
+		},
+		{
+			label: 'create unique index ux on t(email) (Phase 2 seeks)',
+			create: async () => {
+				await db.exec(`create table t (id integer primary key, email text) using isolated`);
+				await db.exec(`create unique index ux on t(email)`);
+			},
+		},
+	];
+
+	for (const variant of variants) {
+		describe(variant.label, () => {
+			beforeEach(async () => { await variant.create(); });
+
+			it('overlay-side conflict: a value staged onto #7 this txn still collides (Phase 1)', async () => {
+				await db.exec(`insert into t values (7, 'a@x')`);          // committed
+				await db.exec('begin');
+				await db.exec(`update t set email = 'b@x' where id = 7`);   // overlay: #7 now 'b@x'
+				// A naive seek of the UNDERLYING for 'b@x' finds nothing — it still holds 'a@x'
+				// at #7. The merged view holds 'b@x' at #7, and Phase 1's overlay scan catches it.
+				await expectConstraint(`insert into t values (8, 'b@x')`);
+				await db.exec('rollback');
+			});
+
+			it('overlay-side resolution: a value the underlying still shows for #7 is free once #7 moved off it (Phase 2 skips overlaid PK)', async () => {
+				await db.exec(`insert into t values (7, 'a@x')`);          // committed
+				await db.exec('begin');
+				await db.exec(`update t set email = 'z@x' where id = 7`);   // overlay: #7 now 'z@x'
+				// Underlying still shows 'a@x' at #7, but #7 has an overlay entry, so Phase 2
+				// skips it — 'a@x' is free in the merged view.
+				await db.exec(`insert into t values (8, 'a@x')`);
+				await db.exec('commit');
+				const rows = await asyncIterableToArray(db.eval(`select id, email from t order by id`));
+				expect(rows.map(r => [r.id, r.email])).to.deep.equal([[7, 'z@x'], [8, 'a@x']]);
+			});
+
+			it('tombstoned conflict: a deleted #7 releases its value (Phase 1 skips tombstone, Phase 2 skips overlaid PK)', async () => {
+				await db.exec(`insert into t values (7, 'a@x')`);          // committed
+				await db.exec('begin');
+				await db.exec(`delete from t where id = 7`);                // overlay tombstone at #7
+				await db.exec(`insert into t values (8, 'a@x')`);           // must NOT conflict
+				await db.exec('commit');
+				const rows = await asyncIterableToArray(db.eval(`select id, email from t order by id`));
+				expect(rows.map(r => [r.id, r.email])).to.deep.equal([[8, 'a@x']]);
+			});
+
+			it('tombstone revival: reviving #7 into a committed value still collides (selfPks honored in both phases)', async () => {
+				await db.exec(`insert into t values (7, 'a@x')`);          // committed
+				await db.exec(`insert into t values (9, 'y@x')`);          // committed
+				await db.exec('begin');
+				await db.exec(`delete from t where id = 7`);                // tombstone #7
+				// Revive #7 (selfPks = [[7]]) with the value committed at #9 → conflict with #9.
+				// Phase 1 skips the #7 tombstone; Phase 2 finds #9 (not in selfPks, no overlay entry).
+				await expectConstraint(`insert into t values (7, 'y@x')`);
+				await db.exec('rollback');
+			});
+		});
+	}
+
+	it('collate nocase declines the seek and still catches a case-only committed collision', async () => {
+		await db.exec(`create table t (id integer primary key, email text) using isolated`);
+		await db.exec(`create unique index ux on t(email collate nocase)`);
+		await db.exec(`insert into t values (1, 'b@x')`);   // committed
+		await db.exec('begin');
+		// 'B@X' == 'b@x' under NOCASE. The BINARY-only seek gate declines to seek `ux`
+		// (its enforcement collation is NOCASE), so Phase 2 full-scans and the NOCASE
+		// comparator catches the committed 'b@x'. A NOCASE seek would physically miss it.
+		await expectConstraint(`insert into t values (2, 'B@X')`);
+		await db.exec('rollback');
+	});
+
+	it('composite index-derived UNIQUE seeks with values in index-key order, not column order', async () => {
+		await db.exec(`create table t (id integer primary key, a integer, b text) using isolated`);
+		await db.exec(`create unique index ux on t(b, a)`);   // index key order (b, a)
+		await db.exec(`insert into t values (1, 10, 'x')`);   // committed (a=10, b='x')
+		await db.exec('begin');
+		// Same (a, b) must conflict — the seek binds b='x' then a=10 in index-key order.
+		await expectConstraint(`insert into t values (2, 10, 'x')`);
+		// Differing in either composite column does not.
+		await db.exec(`insert into t values (3, 10, 'y')`);
+		await db.exec('commit');
+		const rows = await asyncIterableToArray(db.eval(`select id from t order by id`));
+		expect(rows.map(r => r.id)).to.deep.equal([1, 3]);
+	});
+
+	it('a NULL constrained value builds no seek and never conflicts (SQL NULLs are distinct)', async () => {
+		await db.exec(`create table t (id integer primary key, email text null) using isolated`);
+		await db.exec(`create unique index ux on t(email)`);
+		await db.exec(`insert into t values (1, null)`);   // committed
+		await db.exec('begin');
+		// The outer guard skips the UNIQUE check when a constrained column is NULL, so no
+		// seek is built for a NULL key — two NULL rows coexist.
+		await db.exec(`insert into t values (2, null)`);
+		await db.exec('commit');
+		const rows = await asyncIterableToArray(db.eval(`select id from t order by id`));
+		expect(rows.map(r => r.id)).to.deep.equal([1, 2]);
+	});
+
+	it('OR REPLACE eviction reports the same evictedRows shape for overlay-side and underlying-side conflicts', async () => {
+		await db.exec(`create table u (id integer primary key, email text, unique(email)) using isolated`);
+		await db.exec(`insert into u values (1, 'a@x')`);   // committed, lives only in underlying
+		await db.exec(`create table o (id integer primary key, email text, unique(email)) using isolated`);
+		await db.exec(`insert into o values (1, 'a@x')`);
+
+		// Underlying-side: Phase 2 finds #1 in the underlying and REPLACE-evicts it.
+		const tu = await connect('u');
+		const uRes = await tu.update({ operation: 'insert', values: [2, 'a@x'], onConflict: ConflictResolution.REPLACE });
+
+		// Overlay-side: move #1 onto 'c@x' in the overlay, then REPLACE-insert a colliding
+		// 'c@x' — Phase 1 finds the overlay row and evicts it.
+		const to = await connect('o');
+		await to.update({ operation: 'update', values: [1, 'c@x'], oldKeyValues: [1] });
+		const oRes = await to.update({ operation: 'insert', values: [2, 'c@x'], onConflict: ConflictResolution.REPLACE });
+
+		expect(uRes.status).to.equal('ok');
+		expect(oRes.status).to.equal('ok');
+		const uEv = (uRes as { evictedRows?: Row[] }).evictedRows ?? [];
+		const oEv = (oRes as { evictedRows?: Row[] }).evictedRows ?? [];
+		// Each surfaces exactly one evicted row, in user-facing [id, email] schema shape
+		// (length 2 — no stray trailing tombstone column) regardless of which phase found it.
+		expect(uEv.map(r => [...r])).to.deep.equal([[1, 'a@x']]);
+		expect(oEv.map(r => [...r])).to.deep.equal([[1, 'c@x']]);
+		expect(uEv[0].length).to.equal(2);
+		expect(oEv[0].length).to.equal(2);
+	});
+
+	it('OR REPLACE across two UNIQUE constraints: the first eviction tombstones a row the second must not re-report', async () => {
+		await db.exec(`create table t (id integer primary key, a integer, b integer, unique(a), unique(b)) using isolated`);
+		await db.exec(`insert into t values (1, 5, 5)`);   // collides with the new row on BOTH a and b
+
+		const t1 = await connect('t');
+		// unique(a) REPLACE-evicts #1 and tombstones it in the overlay. unique(b)'s Phase 1
+		// then sees that tombstone and must skip it — #1 is evicted once, not once per constraint.
+		const res = await t1.update({ operation: 'insert', values: [2, 5, 5], onConflict: ConflictResolution.REPLACE });
+		expect(res.status).to.equal('ok');
+		const ev = (res as { evictedRows?: Row[] }).evictedRows ?? [];
+		expect(ev.map(r => [...r])).to.deep.equal([[1, 5, 5]]);
+	});
+
+	it('the binary index seek visits O(matches) underlying rows; the nocase fallback scans the whole table', async () => {
+		type UnderlyingTable = Awaited<ReturnType<MemoryTableModule['create']>>;
+		// Counts every row the underlying yields from query(). The overlay is served by a
+		// SEPARATE (default) MemoryTableModule, so Phase 1's overlay scan is not counted —
+		// only the underlying PK lookup and Phase 2's seek/scan are.
+		class CountingMemoryModule extends MemoryTableModule {
+			rowsYielded = 0;
+			private wrap(table: UnderlyingTable): UnderlyingTable {
+				const self = this;
+				return new Proxy(table, {
+					get(target, prop) {
+						if (prop === 'query') {
+							return async function* (filterInfo: FilterInfo) {
+								for await (const row of target.query!(filterInfo)) {
+									self.rowsYielded++;
+									yield row;
+								}
+							};
+						}
+						const value = Reflect.get(target, prop, target);
+						return typeof value === 'function' ? value.bind(target) : value;
+					},
+				});
+			}
+			override async create(...args: Parameters<MemoryTableModule['create']>): Promise<UnderlyingTable> {
+				return this.wrap(await super.create(...args));
+			}
+			override async connect(...args: Parameters<MemoryTableModule['connect']>): Promise<UnderlyingTable> {
+				return this.wrap(await super.connect(...args));
+			}
+		}
+
+		const counting = new CountingMemoryModule();
+		const cdb = new Database();
+		const ciso = new IsolationModule({ underlying: counting });
+		cdb.registerModule('isolated', ciso);
+		try {
+			// --- Seek arm: BINARY index-derived UNIQUE over 100 committed rows. ---
+			await cdb.exec(`create table seek_t (id integer primary key, email text) using isolated`);
+			await cdb.exec(`create unique index ux on seek_t(email)`);
+			for (let i = 0; i < 100; i++) await cdb.exec(`insert into seek_t values (${i}, 'e${i}@x')`);
+
+			const ts = await ciso.connect(cdb, undefined, 'isolated', 'main', 'seek_t', {} as BaseModuleConfig) as IsolatedTable;
+			counting.rowsYielded = 0;
+			await ts.update({ operation: 'insert', values: [1000, 'fresh@x'] });   // no collision
+			const seekCount = counting.rowsYielded;
+			expect(seekCount, `binary index seek must not walk the whole table (yielded ${seekCount} of 100)`).to.be.at.most(5);
+
+			// --- Scan arm: identical shape but the index is NOCASE, so the seek is declined. ---
+			await cdb.exec(`create table scan_t (id integer primary key, email text) using isolated`);
+			await cdb.exec(`create unique index ux2 on scan_t(email collate nocase)`);
+			for (let i = 0; i < 100; i++) await cdb.exec(`insert into scan_t values (${i}, 'f${i}@x')`);
+
+			const tc = await ciso.connect(cdb, undefined, 'isolated', 'main', 'scan_t', {} as BaseModuleConfig) as IsolatedTable;
+			counting.rowsYielded = 0;
+			await tc.update({ operation: 'insert', values: [1000, 'fresh2@x'] });   // no collision
+			const scanCount = counting.rowsYielded;
+			expect(scanCount, `nocase constraint must decline the seek and full-scan (yielded ${scanCount})`).to.be.at.least(100);
+		} finally {
+			await cdb.close();
+		}
 	});
 });

@@ -1,11 +1,11 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey, logicalTypeCanHoldText, retargetFilterInfoIndex, PRIMARY_INDEX_NAME } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, logicalTypeCanHoldText, retargetFilterInfoIndex, PRIMARY_INDEX_NAME } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
 import type { MergeEntry, MergeConfig } from './merge-types.js';
-import { makeFullScanFilterInfo, makePkPointLookupFilter } from './filter-info.js';
+import { makeFullScanFilterInfo, makePkPointLookupFilter, makeSecondaryIndexEqSeekFilter } from './filter-info.js';
 
 /** Returned when the schema has not been populated yet; never mutated. */
 const EMPTY_PK_KEY_SHAPE: { functions: CollationFunction[]; directions: boolean[] } = { functions: [], directions: [] };
@@ -1284,9 +1284,25 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	}
 
 	/**
-	 * Scans the underlying table for a row conflicting with newRow on `uc.columns`,
-	 * excluding selfPks and rows tombstoned in the overlay. For partial UNIQUE,
-	 * candidates whose row does not satisfy the predicate are skipped.
+	 * Finds a row conflicting with `newRow` on `uc.columns` across the MERGED view —
+	 * this connection's overlay superimposed on the underlying committed rows —
+	 * excluding `selfPks`. For partial UNIQUE, candidates outside the predicate's scope
+	 * are skipped.
+	 *
+	 * The merged view splits cleanly into two disjoint halves, each searched the way it
+	 * is cheap to search:
+	 *
+	 *     merged view  =  (overlay rows)  ∪  (underlying rows with no overlay entry)
+	 *
+	 * Phase 1 scans the small in-memory overlay; Phase 2 seeks/scans the large
+	 * underlying, skipping any candidate whose PK the overlay already owns (Phase 1's
+	 * territory, whatever the underlying still says). Together they cover the merged
+	 * view exactly once with no row visited twice.
+	 *
+	 * Phase 1 runs first, so when the constraint was ALREADY violated an overlay-side
+	 * conflict is reported in preference to an underlying one. Under a satisfied
+	 * constraint at most one conflicting row can exist, so this tie-break only changes
+	 * WHICH row is named in that pre-violated case.
 	 */
 	private async findMergedUniqueConflict(
 		overlay: VirtualTable,
@@ -1296,45 +1312,144 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		selfPks: SqlValue[][],
 		tombstoneIndex: number,
 	): Promise<{ pk: SqlValue[]; row: Row } | null> {
-		if (!this.underlyingTable.query) return null;
-		const pkIndices = this.getPrimaryKeyIndices();
-		const constrainedCols = uc.columns;
 		// One comparison collation per constrained column — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation.
-		// Resolved once, above the candidate scan.
+		// Resolved once, above both candidate scans; both phases compare identically.
 		const collations = resolveUniqueEnforcementCollations(this.tableSchema!, uc, this.collationResolver);
 
-		for await (const underlyingRow of this.underlyingTable.query(this.createFullScanFilterInfo())) {
+		const overlayConflict = await this.findOverlayUniqueConflict(overlay, predicate, newRow, selfPks, tombstoneIndex, uc.columns, collations);
+		if (overlayConflict) return overlayConflict;
+
+		return this.findUnderlyingUniqueConflict(overlay, uc, predicate, newRow, selfPks, tombstoneIndex, collations);
+	}
+
+	/**
+	 * Phase 1 — scan the overlay (this connection's uncommitted write set, small and
+	 * in-memory) for a live row conflicting with `newRow`. Tombstones and `selfPks` are
+	 * skipped; a matching live overlay row IS the merged row (stripped of the trailing
+	 * tombstone column), and its overlay value — not any stale underlying value — is
+	 * what the merged view holds for that PK
+	 * (isolation-merged-unique-stale-underlying-false-positive).
+	 */
+	private async findOverlayUniqueConflict(
+		overlay: VirtualTable,
+		predicate: CompiledPredicate | undefined,
+		newRow: Row,
+		selfPks: SqlValue[][],
+		tombstoneIndex: number,
+		constrainedCols: ReadonlyArray<number>,
+		collations: CollationFunction[],
+	): Promise<{ pk: SqlValue[]; row: Row } | null> {
+		if (!overlay.query) return null;
+		const pkIndices = this.getPrimaryKeyIndices();
+
+		for await (const overlayRow of overlay.query(this.createFullScanFilterInfo())) {
+			if (overlayRow[tombstoneIndex] === 1) continue; // deletion marker — not a live row
+			const pk = pkIndices.map(i => overlayRow[i]);
+			if (selfPks.some(self => this.keysEqual(pk, self))) continue;
+
+			const mergedRow = overlayRow.slice(0, tombstoneIndex) as Row;
+			if (this.rowMatchesUniqueConstraint(mergedRow, newRow, constrainedCols, collations, predicate)) {
+				return { pk, row: mergedRow };
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Phase 2 — find an underlying committed row conflicting with `newRow`, skipping
+	 * `selfPks` and any PK the overlay already owns (Phase 1's territory). The lookup is
+	 * an index seek when {@link canSeekForConstraint} allows it, else the full scan —
+	 * either way the per-column match runs, so a module that ignores the index hint and
+	 * returns extra rows stays correct. `getOverlayRow` fires only for the candidates the
+	 * seek actually returned, so it no longer costs one lookup per underlying row.
+	 */
+	private async findUnderlyingUniqueConflict(
+		overlay: VirtualTable,
+		uc: UniqueConstraintSchema,
+		predicate: CompiledPredicate | undefined,
+		newRow: Row,
+		selfPks: SqlValue[][],
+		tombstoneIndex: number,
+		collations: CollationFunction[],
+	): Promise<{ pk: SqlValue[]; row: Row } | null> {
+		if (!this.underlyingTable.query) return null;
+		const pkIndices = this.getPrimaryKeyIndices();
+
+		const seekIndex = this.canSeekForConstraint(uc);
+		const filterInfo = seekIndex
+			? makeSecondaryIndexEqSeekFilter(seekIndex, newRow)
+			: this.createFullScanFilterInfo();
+
+		for await (const underlyingRow of this.underlyingTable.query(filterInfo)) {
 			const pk = pkIndices.map(i => underlyingRow[i]);
 			if (selfPks.some(self => this.keysEqual(pk, self))) continue;
 
+			// A PK with any overlay entry (live OR tombstone) belongs to Phase 1, which
+			// evaluated the overlay's value for it. Skip here whatever the underlying holds.
 			const overlayRow = await this.getOverlayRow(overlay, pk);
-			if (overlayRow && overlayRow[tombstoneIndex] === 1) continue;
+			if (overlayRow) continue;
 
-			// When a non-tombstone overlay entry supersedes this committed row, the
-			// row's current merged-view value is the overlay's — not the stale
-			// underlying value. Evaluate the UNIQUE columns (and any partial
-			// predicate) against the merged row so a candidate that was moved off
-			// the value earlier in this txn no longer counts as a conflict
-			// (isolation-merged-unique-stale-underlying-false-positive). The overlay
-			// row carries the appended tombstone column; strip it back to schema shape.
-			const mergedRow: Row = overlayRow ? (overlayRow.slice(0, tombstoneIndex) as Row) : underlyingRow;
-
-			const matches = constrainedCols.every((idx, i) => {
-				if (newRow[idx] === null || mergedRow[idx] === null) return false;
-				// Compare under each column's enforcement collation (the index's
-				// per-column COLLATE for an index-derived UNIQUE, else the declared
-				// column collation), so a UNIQUE over a collated column is enforced
-				// against committed rows through the isolation merge path
-				// (unique-constraint-honors-column-collation / store-index-derived-unique).
-				return compareSqlValuesFast(newRow[idx], mergedRow[idx], collations[i]) === 0;
-			});
-			if (!matches) continue;
-			// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
-			if (predicate && predicate.evaluate(mergedRow) !== true) continue;
-			return { pk, row: mergedRow };
+			if (this.rowMatchesUniqueConstraint(underlyingRow, newRow, uc.columns, collations, predicate)) {
+				return { pk, row: underlyingRow };
+			}
 		}
 		return null;
+	}
+
+	/**
+	 * True-match test shared by both merged-check phases so they compare identically:
+	 * `candidate` matches `newRow` on every constrained column under that column's
+	 * enforcement collation (NULLs never match), and — for a partial UNIQUE — the
+	 * predicate holds for `candidate`.
+	 *
+	 * The per-column collation (the index's per-column COLLATE for an index-derived
+	 * UNIQUE, else the declared column collation) enforces a UNIQUE over a collated
+	 * column against merged rows through the isolation path
+	 * (unique-constraint-honors-column-collation / store-index-derived-unique).
+	 */
+	private rowMatchesUniqueConstraint(
+		candidate: Row,
+		newRow: Row,
+		constrainedCols: ReadonlyArray<number>,
+		collations: CollationFunction[],
+		predicate: CompiledPredicate | undefined,
+	): boolean {
+		const matches = constrainedCols.every((idx, i) => {
+			if (newRow[idx] === null || candidate[idx] === null) return false;
+			return compareSqlValuesFast(newRow[idx], candidate[idx], collations[i]) === 0;
+		});
+		if (!matches) return false;
+		// Partial UNIQUE: candidate must also be in the predicate's scope to conflict.
+		if (predicate && predicate.evaluate(candidate) !== true) return false;
+		return true;
+	}
+
+	/**
+	 * The secondary index Phase 2 may seek for `uc`, or null to fall back to a full scan.
+	 *
+	 * Seek only when the constraint was synthesized from a `CREATE UNIQUE INDEX`
+	 * (`derivedFromIndex` names a live entry in `tableSchema.indexes`) AND every key
+	 * column's effective enforcement collation is BINARY.
+	 *
+	 * NOTE: the BINARY gate is load-bearing, not an optimisation choice. The store's
+	 * physical index key bytes come from a separate encoder registry that does NOT
+	 * consult the database's collation registry
+	 * (backlog/debt-store-index-keys-use-column-collation, see the comment at
+	 * getPkKeyShape above). Seeking a NOCASE index for 'B@X' would miss the committed
+	 * 'b@x' that the full scan catches, turning this perf fix into a LOST UNIQUE
+	 * violation. Widen this gate (to per-column enforcement collations generally) only
+	 * once that encoder defect is fixed.
+	 */
+	private canSeekForConstraint(uc: UniqueConstraintSchema): IndexSchema | null {
+		if (!uc.derivedFromIndex) return null;
+		const index = this.tableSchema?.indexes?.find(i => i.name === uc.derivedFromIndex);
+		if (!index) return null; // DROP INDEX may have retired it before a stale UC object is retired
+		// Enforcement collation per constrained column, positionally aligned with the
+		// index key columns (appendIndexToTableSchema guarantees the alignment).
+		const enforcement = uniqueEnforcementCollations(this.tableSchema!, uc);
+		const allBinary = enforcement.every(c => normalizeCollationName(c ?? 'BINARY') === 'BINARY');
+		return allBinary ? index : null;
 	}
 
 	/**
