@@ -14,6 +14,8 @@ import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:merge-join');
 
+type ResidualCallback = (ctx: RuntimeContext) => OutputValue;
+
 /**
  * Compare two rows on the equi-join key columns.
  * Returns < 0 if left < right, 0 if equal, > 0 if left > right.
@@ -83,12 +85,19 @@ export function emitMergeJoin(plan: MergeJoinNode, ctx: EmissionContext): Instru
 
 	const rightColCount = rightAttributes.length;
 
+	// The residual sub-program is a param only when `plan.residualCondition` is set,
+	// so `run` is called with two or three args. Declared as a trailing rest tuple
+	// rather than an optional param: `residual?: ResidualCallback` would type as
+	// `ResidualCallback | undefined`, and `undefined` is not a `RuntimeValue`, so the
+	// signature would not conform to `InstructionRun` (see `asRun`).
 	async function* run(
 		rctx: RuntimeContext,
 		leftSource: AsyncIterable<Row>,
 		rightSource: AsyncIterable<Row>,
-		residualCallback?: (ctx: RuntimeContext) => OutputValue
+		...residual: ResidualCallback[]
 	): AsyncIterable<Row> {
+		const residualCallback: ResidualCallback | undefined = residual[0];
+
 		log('Starting %s merge join: %d equi-pairs', plan.joinType.toUpperCase(), plan.equiPairs.length);
 
 		const isSemiOrAnti = plan.joinType === 'semi' || plan.joinType === 'anti';

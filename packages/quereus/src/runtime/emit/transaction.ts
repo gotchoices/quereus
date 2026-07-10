@@ -11,7 +11,7 @@ const log = createLogger('runtime:emit:transaction');
 
 export function emitTransaction(plan: TransactionNode, _ctx: EmissionContext): Instruction {
 	// Select the operation function at emit time
-	let run: (ctx: RuntimeContext) => Promise<SqlValue | undefined>;
+	let run: (ctx: RuntimeContext) => Promise<SqlValue>;
 	let note: string;
 
 	switch (plan.operation) {

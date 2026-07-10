@@ -71,20 +71,27 @@ export type Instruction = {
  * A specific `run` is *not* structurally assignable to `InstructionRun`. The
  * scheduler holds instructions generically and calls `run(ctx, ...args)` with
  * every arg widened to `RuntimeValue`, so a function that declares narrower
- * params (`SqlValue`, `AsyncIterable<Row>`, a fixed arity, an optional callback)
- * is rejected by parameter contravariance under `strictFunctionTypes` — exactly
- * as it would be if a caller passed more, fewer, or differently-typed args. Each
- * emitter therefore has to assert the conversion. This helper is the single
- * audited home for that assertion: emit sites write `run: asRun(run)` and the
- * only `as`-to-`InstructionRun` in the runtime lives here.
+ * params (`SqlValue`, `AsyncIterable<Row>`, a fixed arity) is rejected by
+ * parameter contravariance under `strictFunctionTypes` — exactly as it would be
+ * if a caller passed more, fewer, or differently-typed args. Each emitter
+ * therefore has to assert the conversion. This helper is the single audited home
+ * for that assertion: emit sites write `run: asRun(run)` and the only
+ * `as`-to-`InstructionRun` in the runtime lives here.
  *
- * The parameter is deliberately loose — first arg is the runtime context, the
- * rest and the return are unconstrained — because the ~80 `run` functions span
- * every arity and return shape (`SqlValue`, `AsyncIterable<Row>`,
- * `Promise<RuntimeValue>`, void-ish DDL). `never[]` accepts any argument list
- * without widening to `any`; the body performs the one unchecked cast.
+ * `TArgs` is inferred from the `run`'s own parameter tuple, so each emit site is
+ * still checked: every declared arg must be a {@link RuntimeValue} and the return
+ * must be an {@link OutputValue}. Only the arity/contravariance mismatch is
+ * waived. Two consequences for `run` authors:
+ * - An **optional** param (`cb?: Callback`) types as `Callback | undefined`, and
+ *   `undefined` is not a `RuntimeValue` — a `run` whose trailing params are
+ *   conditionally emitted must declare them as a rest tuple (`...cb: Callback[]`),
+ *   which is also the truthful description of its call sites.
+ * - `Promise<OutputValue>` is a promise-of-a-promise and is *not* an `OutputValue`.
+ *   An `async` `run` returns `Promise<RuntimeValue>`.
  */
-export function asRun(run: (ctx: RuntimeContext, ...args: never[]) => unknown): InstructionRun {
+export function asRun<TArgs extends RuntimeValue[]>(
+	run: (ctx: RuntimeContext, ...args: TArgs) => OutputValue
+): InstructionRun {
 	return run as unknown as InstructionRun;
 }
 

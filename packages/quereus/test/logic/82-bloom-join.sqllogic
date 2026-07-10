@@ -118,6 +118,38 @@ SELECT l.id, r.id FROM bj_mix_l l JOIN bj_mix_r r ON l.name = r.name ORDER BY l.
 DROP TABLE bj_mix_l;
 DROP TABLE bj_mix_r;
 
+-- Residual condition: an equi conjunct (k) picks the bloom path, and the
+-- cross-side non-equi conjunct (l.s < r.t) stays behind as the residual, which the
+-- probe loop evaluates per candidate pair. Exercises the residual sub-program
+-- param, which is only present when the ON clause has a non-equi conjunct.
+CREATE TABLE bj_res_l (id INTEGER PRIMARY KEY, k INTEGER, s TEXT);
+CREATE TABLE bj_res_r (id INTEGER PRIMARY KEY, k INTEGER, t TEXT);
+INSERT INTO bj_res_l VALUES (1, 1, 'm'), (2, 1, 'z'), (3, 2, 'a'), (4, 3, 'q');
+INSERT INTO bj_res_r VALUES (10, 1, 'p'), (20, 1, 'b'), (30, 2, 'c'), (40, 9, 'x');
+
+SELECT 1 AS ok FROM query_plan('SELECT * FROM bj_res_l l JOIN bj_res_r r ON l.k = r.k AND l.s < r.t')
+WHERE properties LIKE '%bloom%' LIMIT 1;
+→ [{"ok":1}]
+
+-- Inner: only pairs whose residual holds survive
+SELECT l.id AS lid, r.id AS rid FROM bj_res_l l JOIN bj_res_r r ON l.k = r.k AND l.s < r.t ORDER BY lid, rid;
+→ [{"lid":1,"rid":10},{"lid":3,"rid":30}]
+
+-- LEFT: a left row whose every equi candidate fails the residual is unmatched, not dropped
+SELECT l.id AS lid, r.id AS rid FROM bj_res_l l LEFT JOIN bj_res_r r ON l.k = r.k AND l.s < r.t ORDER BY lid, rid;
+→ [{"lid":1,"rid":10},{"lid":2,"rid":null},{"lid":3,"rid":30},{"lid":4,"rid":null}]
+
+-- SEMI: residual gates the match bit
+SELECT l.id AS lid FROM bj_res_l l WHERE EXISTS (SELECT 1 FROM bj_res_r r WHERE r.k = l.k AND l.s < r.t) ORDER BY lid;
+→ [{"lid":1},{"lid":3}]
+
+-- ANTI: complement of the semi result
+SELECT l.id AS lid FROM bj_res_l l WHERE NOT EXISTS (SELECT 1 FROM bj_res_r r WHERE r.k = l.k AND l.s < r.t) ORDER BY lid;
+→ [{"lid":2},{"lid":4}]
+
+DROP TABLE bj_res_l;
+DROP TABLE bj_res_r;
+
 -- Cleanup
 DROP TABLE bj_left;
 DROP TABLE bj_right;

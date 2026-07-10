@@ -199,7 +199,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		return rows;
 	}
 
-	async function run(rctx: RuntimeContext, ...args: RuntimeValue[]): Promise<OutputValue> {
+	async function run(rctx: RuntimeContext, ...args: RuntimeValue[]): Promise<RuntimeValue> {
 		const baseCbs = args.slice(0, baseOpCount);
 
 		// Identity captures (multi-source UPDATE / multi-side DELETE fan-out, and the
@@ -248,7 +248,7 @@ export function emitViewMutation(plan: ViewMutationNode, ctx: EmissionContext): 
 		}
 	}
 
-	async function runBody(rctx: RuntimeContext, args: RuntimeValue[], baseCbs: RuntimeValue[]): Promise<OutputValue> {
+	async function runBody(rctx: RuntimeContext, args: RuntimeValue[], baseCbs: RuntimeValue[]): Promise<RuntimeValue> {
 		// (1) Multi-source RETURNING via a separate re-query of the view.
 		if (returningIdx >= 0) {
 			const returningCb = args[returningIdx] as Callback;

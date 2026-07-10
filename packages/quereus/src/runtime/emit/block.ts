@@ -2,7 +2,7 @@ import type { BlockNode } from '../../planner/nodes/block.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
 import { emitPlanNode } from '../emitters.js';
-import type { RuntimeValue, OutputValue } from '../../common/types.js';
+import type { RuntimeValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { PlanNodeType } from '../../planner/nodes/plan-node-type.js';
 
@@ -17,7 +17,7 @@ export function emitBlock(plan: BlockNode, ctx: EmissionContext): Instruction {
 		return true;
 	});
 
-	async function run(ctx: RuntimeContext, ...args: RuntimeValue[]): Promise<OutputValue> {
+	async function run(ctx: RuntimeContext, ...args: RuntimeValue[]): Promise<RuntimeValue> {
 		return valueIndex === -1 ? null : args[valueIndex];
 	}
 

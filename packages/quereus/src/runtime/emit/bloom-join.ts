@@ -13,6 +13,8 @@ import { joinOutputRow } from './join-output.js';
 
 const log = createLogger('runtime:emit:bloom-join');
 
+type ResidualCallback = (ctx: RuntimeContext) => OutputValue;
+
 /**
  * Emits a bloom (hash) join instruction.
  *
@@ -55,12 +57,19 @@ export function emitBloomJoin(plan: BloomJoinNode, ctx: EmissionContext): Instru
 
 	const rightColCount = rightAttributes.length;
 
+	// The residual sub-program is a param only when `plan.residualCondition` is set,
+	// so `run` is called with two or three args. Declared as a trailing rest tuple
+	// rather than an optional param: `residual?: ResidualCallback` would type as
+	// `ResidualCallback | undefined`, and `undefined` is not a `RuntimeValue`, so the
+	// signature would not conform to `InstructionRun` (see `asRun`).
 	async function* run(
 		rctx: RuntimeContext,
 		leftSource: AsyncIterable<Row>,
 		rightSource: AsyncIterable<Row>,
-		residualCallback?: (ctx: RuntimeContext) => OutputValue
+		...residual: ResidualCallback[]
 	): AsyncIterable<Row> {
+		const residualCallback: ResidualCallback | undefined = residual[0];
+
 		log('Starting %s hash join: %d equi-pairs, %d left attrs, %d right attrs',
 			plan.joinType.toUpperCase(), plan.equiPairs.length, leftAttributes.length, rightAttributes.length);
 

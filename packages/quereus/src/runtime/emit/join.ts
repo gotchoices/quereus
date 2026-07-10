@@ -15,6 +15,9 @@ import { resolveMaybe } from '../async-util.js';
 
 const log = createLogger('runtime:emit:join');
 
+type RightCallback = (ctx: RuntimeContext) => AsyncIterable<Row>;
+type ConditionCallback = (ctx: RuntimeContext) => OutputValue;
+
 /**
  * Emits a nested loop join instruction. Handles every join type the optimizer
  * leaves as a logical {@link JoinNode}: inner / left / cross / semi / anti drive
@@ -73,7 +76,20 @@ export function emitLoopJoin(plan: JoinNode, ctx: EmissionContext): Instruction 
 	// NOTE: for left/inner/semi/anti the rightSource must be re-startable (optimizer
 	// facilitates through a cache node). The right/full driver iterates each side
 	// exactly once, so it has *weaker* restartability requirements.
-	async function* run(rctx: RuntimeContext, leftSource: AsyncIterable<Row>, rightCallback: (ctx: RuntimeContext) => AsyncIterable<Row>, conditionCallback?: (ctx: RuntimeContext) => OutputValue): AsyncIterable<Row> {
+	//
+	// The ON-condition sub-program is a param only when `plan.condition` is set, so
+	// `run` is called with two or three args. Declared as a trailing rest tuple
+	// rather than an optional param: `condition?: ConditionCallback` would type as
+	// `ConditionCallback | undefined`, and `undefined` is not a `RuntimeValue`, so
+	// the signature would not conform to `InstructionRun` (see `asRun`).
+	async function* run(
+		rctx: RuntimeContext,
+		leftSource: AsyncIterable<Row>,
+		rightCallback: RightCallback,
+		...condition: ConditionCallback[]
+	): AsyncIterable<Row> {
+		const conditionCallback: ConditionCallback | undefined = condition[0];
+
 		const joinType = plan.joinType;
 		const isSemiOrAnti = joinType === 'semi' || joinType === 'anti';
 		const isRightOrFull = joinType === 'right' || joinType === 'full';

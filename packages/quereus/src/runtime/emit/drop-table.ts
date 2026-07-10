@@ -19,7 +19,7 @@ export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instru
 		throw new QuereusError(`DROP for object type '${stmt.objectType}' is not supported by emitDropTable.`, StatusCode.UNSUPPORTED);
 	}
 
-	async function run(rctx: RuntimeContext): Promise<SqlValue | undefined> {
+	async function run(rctx: RuntimeContext): Promise<SqlValue> {
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 

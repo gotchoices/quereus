@@ -290,13 +290,14 @@ export function emitMyOperation(plan: MyOperationNode, ctx: EmissionContext): In
 }
 ```
 
-Wrap the `run` function in `asRun(...)`. A `run` that declares specific
-parameters (`SqlValue`, `AsyncIterable<Row>`, a fixed arity) is not structurally
-assignable to the general `InstructionRun` the scheduler drives — parameter
-contravariance under `strictFunctionTypes` rejects it. `asRun` is the single
-audited home for that unavoidable cast (`src/runtime/types.ts`), so emit sites
-stay cast-free. Emitters that build through `createValidatedInstruction(...)`
-pass `asRun(run)` as the run argument the same way.
+Wrap `run` in `asRun(...)`: a `run` with specific parameters (`SqlValue`,
+`AsyncIterable<Row>`, fixed arity) is not assignable to `InstructionRun` —
+`strictFunctionTypes` parameter contravariance rejects it. `asRun`
+(`src/runtime/types.ts`) is the single audited home for that cast;
+`createValidatedInstruction(...)` takes it too. It checks params are
+`RuntimeValue`s and the return an `OutputValue`: an `async` `run` returns
+`Promise<RuntimeValue>`, and a sometimes-emitted callback param is a rest tuple,
+not optional (`emit/bloom-join.ts`).
 
 ### 2. Register the Emitter
 
