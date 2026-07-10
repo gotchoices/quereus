@@ -194,8 +194,8 @@ export function createStoreAdapter(options: SyncStoreAdapterOptions): ApplyToSto
     // Apply data changes per table; the resolved StoreTable owns key
     // encoding, store resolution, and secondary-index maintenance.
     const changesByTable = groupChangesByTable(dataChanges);
-    for (const [tableKey, tableChanges] of changesByTable) {
-      const [schemaName, tableName] = tableKey.split('.');
+    for (const [, tableChanges] of changesByTable) {
+      const { schema: schemaName, table: tableName } = tableChanges[0];
       try {
         const table = storeModule.getTableForExternalWrite(db, schemaName, tableName);
         if (!table) {

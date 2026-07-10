@@ -40,7 +40,8 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	// Collect all column versions, grouped by table and row
 	type RowVersions = Map<string, ColumnVersion>;
 	type TableRows = Map<string, RowVersions>;
-	const tableData = new Map<string, TableRows>();
+	type TableEntry = { schema: string; table: string; rows: TableRows };
+	const tableData = new Map<string, TableEntry>();
 
 	const cvBounds = buildAllColumnVersionsScanBounds();
 	for await (const entry of ctx.kv.iterate(cvBounds)) {
@@ -52,9 +53,9 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 		const rowKey = encodePK(parsed.pk);
 
 		if (!tableData.has(tableKey)) {
-			tableData.set(tableKey, new Map());
+			tableData.set(tableKey, { schema: parsed.schema, table: parsed.table, rows: new Map() });
 		}
-		const tableRows = tableData.get(tableKey)!;
+		const tableRows = tableData.get(tableKey)!.rows;
 
 		if (!tableRows.has(rowKey)) {
 			tableRows.set(rowKey, new Map());
@@ -65,8 +66,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 
 	// Build table snapshots
 	const tables: TableSnapshot[] = [];
-	for (const [tableKey, rows] of tableData) {
-		const [schema, table] = tableKey.split('.');
+	for (const { schema, table, rows } of tableData.values()) {
 		const columnVersions = new Map<string, { hlc: HLC; value: SqlValue }>();
 		const rowsArray: Row[] = [];
 

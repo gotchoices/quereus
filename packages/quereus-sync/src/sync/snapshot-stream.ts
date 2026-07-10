@@ -89,11 +89,11 @@ async function* streamSnapshotChunks(
 	const completedSet = completedTables ?? new Set<string>();
 
 	// Count tables and migrations for header
-	const tableKeys = new Set<string>();
+	const tableKeys = new Map<string, { schema: string; table: string }>();
 	const cvBounds = buildAllColumnVersionsScanBounds();
 	for await (const entry of ctx.kv.iterate(cvBounds)) {
 		const parsed = parseColumnVersionKey(entry.key);
-		if (parsed) tableKeys.add(`${parsed.schema}.${parsed.table}`);
+		if (parsed) tableKeys.set(`${parsed.schema}.${parsed.table}`, { schema: parsed.schema, table: parsed.table });
 	}
 
 	let migrationCount = 0;
@@ -115,10 +115,9 @@ async function* streamSnapshotChunks(
 
 	// Stream each table, skipping completed ones
 	let totalEntries = initialEntryCount ?? 0;
-	for (const tableKey of tableKeys) {
+	for (const [tableKey, { schema, table }] of tableKeys) {
 		if (completedSet.has(tableKey)) continue;
 
-		const [schema, table] = tableKey.split('.');
 		const tableCvBounds = buildTableColumnVersionScanBounds(schema, table);
 
 		// Yield table start (entry count filled in at table-end)
@@ -295,15 +294,24 @@ export async function* resumeSnapshotStream(
 /**
  * Parse the accumulated `schema.table` completed-table keys into the
  * `{ schema, table }` records the `bootstrapFinalize` coarse watch notification
- * consumes. Mirrors the `tableKey.split('.')` convention used throughout this
- * module.
+ * consumes.
+ *
+ * NOTE: `completedTables` is a flat string, persisted verbatim into
+ * `SnapshotCheckpoint.completedTables` — on a resumed transfer the original
+ * `chunk.schema`/`chunk.table` pair for an earlier-session table is gone, so
+ * there is no already-known pair to carry forward here (unlike the other
+ * `tableKey`-grouping sites in this module). Splitting on the FIRST dot only
+ * correctly recovers a dotted TABLE name; a dotted SCHEMA name is an accepted
+ * edge case (schema names are effectively never dotted) — same tradeoff as
+ * `buildDataStoreName` in `@quereus/store`'s key-builder.ts.
  */
 function parseBootstrapTables(
 	completedTables: ReadonlyArray<string>,
 ): Array<{ schema: string; table: string }> {
 	return completedTables.map((key) => {
-		const [schema, table] = key.split('.');
-		return { schema, table };
+		const dot = key.indexOf('.');
+		if (dot === -1) return { schema: key, table: '' };
+		return { schema: key.slice(0, dot), table: key.slice(dot + 1) };
 	});
 }
 
