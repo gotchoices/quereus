@@ -113,7 +113,8 @@ never more than one banner in the window below the H1.
 
 Contributor and process docs — this one, `architecture.md`, `invariants.md`, `releasing.md`,
 the design notes — carry no banner and are listed under `untiered` in `docs/.stability.json`.
-Every `docs/*.md` appears in one list or the other.
+Every `docs/*.md` appears in one list or the other, except the frozen review artifacts
+(`review.md`, `review.html`), which every doc check skips.
 
 ## The size ratchet
 

@@ -89,7 +89,7 @@ report the user-visible symptom, not the internal detail.
 | Change-scope introspection and `Database.watch` | Beta | [change-scope.md](change-scope.md), [usage.md](usage.md) § Change-scope (section banner) |
 | Database event hooks — `onDataChange`, `onSchemaChange` | Beta | [schema.md](schema.md) |
 | `SchemaManager` API and DDL generation | Beta | [schema.md](schema.md) |
-| Persistent store — `@quereus/store` and the LevelDB / IndexedDB / React-Native-LevelDB / NativeScript-SQLite plugins. Its on-disk key encoding is **not** frozen. | Beta | [store.md](store.md) |
+| Persistent store — `@quereus/store` and the LevelDB / IndexedDB / React-Native-LevelDB / NativeScript-SQLite plugins. Its on-disk key encoding is **not** frozen, carries no format-version marker, and has no in-place upgrade tooling today: a format change would be published with a documented migration procedure, not applied for you. | Beta | [store.md](store.md) |
 | Isolation layer — `@quereus/isolation` | Beta | [store.md](store.md#isolation-gap), [design-isolation-layer.md](design-isolation-layer.md) |
 | Tooling — `quoomb-cli`, `quoomb-web`, the VS Code extension | Beta | [usage.md](usage.md) |
 | Lenses and layered schemas | Experimental | [lens.md](lens.md) |
