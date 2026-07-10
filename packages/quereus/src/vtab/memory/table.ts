@@ -1,5 +1,5 @@
 import { VirtualTable } from '../table.js';
-import type { AnyVirtualTableModule, SchemaChangeInfo } from '../module.js';
+import type { AnyVirtualTableModule, EffectiveRowSource, SchemaChangeInfo } from '../module.js';
 import type { Database } from '../../core/database.js';
 import type { Row, SqlValue, CompareFn, UpdateResult } from '../../common/types.js';
 import { type IndexSchema, type TableSchema } from '../../schema/table.js';
@@ -398,9 +398,9 @@ export class MemoryTable extends VirtualTable {
 	}
 
 	// --- Index DDL methods delegate to the manager ---
-	async createIndex(indexSchema: IndexSchema): Promise<void> {
+	async createIndex(indexSchema: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
 		logger.operation('Create Index', this.tableName, { indexName: indexSchema.name });
-		await this.manager.createIndex(indexSchema);
+		await this.manager.createIndex(indexSchema, undefined, rows);
 		this.tableSchema = this.manager.tableSchema; // Refresh local schema ref
 	}
 

@@ -39,6 +39,23 @@ export interface BaseModuleConfig {
 export type VtabConcurrencyMode = 'serial' | 'reentrant-reads' | 'fully-reentrant';
 
 /**
+ * The rows the DDL-issuing connection can currently SEE — committed rows merged with that
+ * connection's own uncommitted writes.
+ *
+ * Supplied only by a wrapper module (today: the isolation layer) that holds those pending rows
+ * outside the target module, where the target module cannot reach them. When present, the target
+ * module MUST use this stream for every row-CONTENT judgement it makes (UNIQUE duplicate
+ * detection, collation-rekey collision detection) and MUST NOT reject the DDL over a duplicate
+ * that exists only in its own committed data. Physical structures are still built from the
+ * module's own rows — an index entry with no live row behind it is harmless, because every
+ * reader resolves an entry back to its live row and drops it if the row is gone.
+ *
+ * Re-callable: each call returns a fresh stream (a single ALTER may validate more than once).
+ * Omitted by the engine's own emitters, which leaves each module on its own effective stream.
+ */
+export type EffectiveRowSource = () => AsyncIterable<Row>;
+
+/**
  * Assessment result from a module's supports() method indicating
  * whether it can execute a plan subtree and at what cost.
  */
@@ -234,13 +251,16 @@ export interface VirtualTableModule<
 	 * @param schemaName The name of the database schema
 	 * @param tableName The name of the virtual table
 	 * @param indexSchema The schema definition for the index being created
+	 * @param rows Optional {@link EffectiveRowSource}. When supplied, the UNIQUE duplicate
+	 *   check MUST run over this stream instead of the module's own rows.
 	 * @throws QuereusError on failure
 	 */
 	createIndex?(
 		db: Database,
 		schemaName: string,
 		tableName: string,
-		indexSchema: IndexSchema
+		indexSchema: IndexSchema,
+		rows?: EffectiveRowSource,
 	): Promise<void>;
 
 	/**
@@ -386,12 +406,17 @@ export interface VirtualTableModule<
 	 *
 	 * If not implemented, the engine rejects data-affecting ALTER operations
 	 * (`renameColumn` degrades to an engine-side schema-only rename instead).
+	 *
+	 * `rows` is an optional {@link EffectiveRowSource}. When supplied, the row-validating
+	 * arms (`addConstraint … unique`, `alterColumn … set collate`) MUST judge that stream
+	 * rather than the module's own rows.
 	 */
 	alterTable?(
 		db: Database,
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
+		rows?: EffectiveRowSource,
 	): Promise<TableSchema>;
 
 	/**

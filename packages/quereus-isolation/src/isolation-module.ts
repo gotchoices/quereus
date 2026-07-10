@@ -1,9 +1,10 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost } from '@quereus/quereus';
-import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, SqlValue, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, UpdateResult } from '@quereus/quereus';
+import { MemoryTableModule, PhysicalType, QuereusError, StatusCode, tryFoldLiteral, columnDefToSchema, isConstraintViolation } from '@quereus/quereus';
 import type { IsolationModuleConfig } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
 import { applyOverlayToUnderlying } from './flush.js';
 import { makeFullScanFilterInfo } from './filter-info.js';
+import { iterateEffectiveRows, makePkKeySerializer } from './overlay-rows.js';
 
 let overlayIdCounter = 0;
 
@@ -833,6 +834,87 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Inserts one staged row into a freshly built overlay, raising on anything but success.
+	 *
+	 * `MemoryTable.update` RETURNS a `constraint` status rather than throwing it. Every overlay
+	 * rebuild loop ignored that return, so a row the new schema forbids was dropped on the floor
+	 * and the transaction committed without it — silent data loss, reachable today by
+	 * `alter table … add constraint … unique` over pending duplicate rows. Convert it into a
+	 * throw; {@link adoptRebuiltOverlay} decides whether that means INTERNAL (the issuer, whose
+	 * rows the DDL's own validation pass already accepted) or poison (a foreign connection,
+	 * which must roll back).
+	 */
+	private async insertIntoRebuiltOverlay(
+		newOverlayTable: VirtualTable,
+		values: SqlValue[],
+		tableName: string,
+	): Promise<void> {
+		// No `onConflict` is passed, so the overlay's memory module cannot answer `ignore`;
+		// `UpdateResult` is then exactly `ok | constraint`.
+		const result: UpdateResult = await newOverlayTable.update({ operation: 'insert', values, preCoerced: true });
+		if (isConstraintViolation(result)) {
+			throw new QuereusError(
+				`Overlay rebuild on '${tableName}' hit a ${result.constraint} constraint: ${result.message ?? 'no message'}`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+	}
+
+	/**
+	 * Runs one overlay's rebuild and installs the result, routing a CONSTRAINT failure by who
+	 * owns the overlay:
+	 *
+	 * - **The DDL-issuing connection.** Unreachable: the row source handed to the underlying
+	 *   (see {@link issuerEffectiveRows}) judged a superset of exactly these rows and accepted
+	 *   them, so a rejection here means validation and migration have drifted. Raise INTERNAL —
+	 *   loudly, because the alternative is the silent row loss this guard exists to end.
+	 * - **A foreign connection.** Reachable and legitimate: its staged rows may violate a
+	 *   constraint another connection just declared. Poison that overlay and leave it
+	 *   unmigrated, so its owner errors on its next read/write/commit and rolls back. The
+	 *   issuer's DDL proceeds. Mirrors the tier-3 NOT NULL handling in {@link alterTable}.
+	 *
+	 * A rebuild that throws leaves the OLD overlay installed either way — the new table is
+	 * simply discarded.
+	 */
+	private async adoptRebuiltOverlay(
+		key: string,
+		oldState: ConnectionOverlayState,
+		isIssuer: boolean,
+		schemaName: string,
+		tableName: string,
+		ddlDescription: string,
+		rebuild: () => Promise<ConnectionOverlayState>,
+	): Promise<void> {
+		try {
+			this.connectionOverlays.set(key, await rebuild());
+		} catch (e) {
+			if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
+			if (isIssuer) {
+				throw new QuereusError(
+					`Isolation layer: rebuilding the issuing connection's overlay for '${schemaName}.${tableName}' after `
+					+ `${ddlDescription} raised: ${e.message}. That DDL's validation pass already judged a superset of these `
+					+ `rows and accepted them, so validation and migration have drifted.`,
+					StatusCode.INTERNAL,
+					e,
+				);
+			}
+			oldState.poison = { message: this.buildRebuildPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
+		}
+	}
+
+	/**
+	 * Builds the poison message stamped onto a foreign overlay whose staged rows cannot be
+	 * migrated under a constraint another connection's DDL just declared (see
+	 * {@link adoptRebuiltOverlay}). Companion to {@link buildAlterPoisonMessage}, which covers
+	 * the `addColumn` NOT NULL backfill rejected before the underlying is touched; this one
+	 * covers a UNIQUE (or any other) violation raised by the rebuild itself.
+	 */
+	private buildRebuildPoisonMessage(schemaName: string, tableName: string, ddlDescription: string, cause: string): string {
+		return `Another connection's ${ddlDescription} on '${schemaName}.${tableName}' declared a constraint this connection's `
+			+ `uncommitted rows violate (${cause}); roll back this transaction.`;
+	}
+
+	/**
 	 * Builds the poison message stamped onto a foreign overlay whose table was dropped out
 	 * from under it (see {@link destroy}). Names the schema.table so the owning connection's
 	 * eventual read/write/commit error is self-explanatory. Companion to
@@ -858,28 +940,131 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Creates an index on the underlying table.
+	 * The rows the connection owning `overlayState` can SEE — the underlying's committed rows
+	 * merged with that overlay's staged writes. Re-callable, as `EffectiveRowSource` requires.
 	 *
-	 * Note: Indexes on per-connection overlays are created lazily when the
-	 * overlay is created, by copying from the underlying table's schema.
+	 * This is the seam the whole fix turns on: the underlying module validates row-content DDL
+	 * (UNIQUE duplicate detection, collation-rekey collisions) against its OWN rows, which under
+	 * isolation are the committed rows only. The transaction's pending rows live here, in the
+	 * overlay, where the underlying cannot reach them — so we hand them down.
 	 *
-	 * We use the stored table instance's createIndex() rather than the module-level
-	 * method so that the MemoryTable's local tableSchema property stays in sync.
-	 * That property is what ensureOverlay() reads when building the overlay schema.
+	 * NOTE: each call re-materializes the overlay and re-scans the underlying. `alter column …
+	 * set collate` calls once per UNIQUE constraint covering the altered column, so a table with
+	 * many such constraints pays that many scans. If it ever shows up as slow, materialize the
+	 * overlay's PK map once per DDL and share it across the calls.
+	 */
+	private effectiveRowsFor(
+		db: Database,
+		underlyingTable: VirtualTable,
+		overlayState: ConnectionOverlayState,
+	): EffectiveRowSource {
+		const schema = underlyingTable.tableSchema;
+		if (!schema) {
+			throw new QuereusError('Isolation layer: underlying table has no schema', StatusCode.INTERNAL);
+		}
+		const pkIndices = schema.primaryKeyDefinition.map(pkDef => pkDef.index);
+		const pkKeyOf = makePkKeySerializer(db, schema);
+		const overlayTable = overlayState.overlayTable;
+		return () => iterateEffectiveRows(underlyingTable, overlayTable, this.tombstoneColumn, pkIndices, pkKeyOf);
+	}
+
+	/**
+	 * The row source to hand a row-validating DDL on behalf of the connection issuing it, or
+	 * undefined when that connection has nothing staged and the underlying's own rows already
+	 * ARE its effective rows.
+	 *
+	 * **Only the issuing connection's overlay feeds validation.** A foreign connection's
+	 * overlay may hold rows that collide with the new constraint; that is its problem when it
+	 * commits, exactly as an ordinary concurrent duplicate insert would be. A poisoned issuer
+	 * overlay is likewise skipped — its rows are structurally stale, and the connection can
+	 * only recover by rolling back.
+	 */
+	private issuerEffectiveRows(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		underlyingTable: VirtualTable,
+	): EffectiveRowSource | undefined {
+		const overlayState = this.getConnectionOverlay(db, schemaName, tableName);
+		if (!overlayState || overlayState.poison || !overlayState.hasChanges) return undefined;
+		return this.effectiveRowsFor(db, underlyingTable, overlayState);
+	}
+
+	/**
+	 * Creates an index on the underlying table, then rebuilds every per-connection overlay so
+	 * the new index (and, for a UNIQUE index, the constraint derived from it) is enforced for
+	 * the rest of each open transaction.
+	 *
+	 * Two things the underlying cannot do for itself:
+	 *
+	 * 1. **Judge the right rows.** The issuing connection's pending rows are in its overlay,
+	 *    invisible to the underlying, so a duplicate it staged would slip past the build and a
+	 *    duplicate it deleted would spuriously reject it. {@link issuerEffectiveRows} supplies
+	 *    the merged view; the underlying builds its physical structure from its own committed
+	 *    rows, which is sound because every reader resolves an index entry back to its live row.
+	 * 2. **Enforce the new constraint.** An overlay built before the index knows nothing of it,
+	 *    and `IsolatedTable.findMergedUniqueConflict` only scans the underlying — so a pending
+	 *    row colliding with another pending row is nobody's job until the overlay itself carries
+	 *    the index. Hence the rebuild, which is also what gives a merged secondary-index scan
+	 *    later in the transaction an overlay that can serve it.
+	 *
+	 * We use the stored table instance's createIndex() rather than the module-level method so
+	 * that the MemoryTable's local tableSchema property stays in sync. That property is what
+	 * ensureOverlay() reads when building the overlay schema.
 	 */
 	async createIndex(
 		db: Database,
 		schemaName: string,
 		tableName: string,
-		indexSchema: IndexSchema
+		indexSchema: IndexSchema,
+		rows?: EffectiveRowSource,
 	): Promise<void> {
 		const state = this.getUnderlyingState(schemaName, tableName);
+		// An outer wrapper's row source, if any, already names the effective rows; otherwise
+		// build our own from the issuing connection's overlay.
+		const rowSource = rows ?? (state ? this.issuerEffectiveRows(db, schemaName, tableName, state.underlyingTable) : undefined);
+
 		if (state?.underlyingTable.createIndex) {
 			// Instance-level createIndex keeps MemoryTable.tableSchema fresh
-			await state.underlyingTable.createIndex(indexSchema);
+			await state.underlyingTable.createIndex(indexSchema, rowSource);
 		} else if (this.underlying.createIndex) {
-			await this.underlying.createIndex(db, schemaName, tableName, indexSchema);
+			await this.underlying.createIndex(db, schemaName, tableName, indexSchema, rowSource);
+		} else {
+			return; // underlying does not support indexes; nothing was created, nothing to rebuild
 		}
+		if (!state) return;
+
+		const updatedSchema = this.assertIndexPresent(state.underlyingTable, schemaName, tableName, indexSchema.name);
+		await this.rebuildOverlaysForIndexChange(db, schemaName, tableName, updatedSchema, `create index '${indexSchema.name}'`);
+	}
+
+	/**
+	 * Reads back the underlying table instance's post-`createIndex` schema, asserting it now
+	 * carries the new index.
+	 *
+	 * Both bundled underlyings refresh the instance's cached `tableSchema` (memory through
+	 * `MemoryTable.createIndex`, the store through `StoreTable.updateSchema`), and the overlay
+	 * rebuild below copies its index/constraint set from it. A third-party underlying that
+	 * refreshed only its module-level schema would silently rebuild overlays under the PRE-index
+	 * schema, re-opening the very hole this method exists to close — so assert rather than assume.
+	 */
+	private assertIndexPresent(
+		underlyingTable: VirtualTable,
+		schemaName: string,
+		tableName: string,
+		indexName: string,
+	): TableSchema {
+		const updatedSchema = underlyingTable.tableSchema;
+		const present = updatedSchema?.indexes?.some(idx => idx.name.toLowerCase() === indexName.toLowerCase());
+		if (!updatedSchema || !present) {
+			throw new QuereusError(
+				`Isolation layer: underlying table '${schemaName}.${tableName}' did not refresh its cached tableSchema after `
+				+ `creating index '${indexName}'. The per-connection overlays cannot adopt an index the underlying does not `
+				+ `report; the underlying module must refresh VirtualTable.tableSchema in createIndex.`,
+				StatusCode.INTERNAL,
+			);
+		}
+		return updatedSchema;
 	}
 
 	/**
@@ -922,24 +1107,50 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const updatedSchema = state?.underlyingTable.tableSchema;
 		if (!updatedSchema) return;
 
+		await this.rebuildOverlaysForIndexChange(db, schemaName, tableName, updatedSchema, `drop index '${indexName}'`);
+	}
+
+	/**
+	 * Rebuilds every non-poisoned per-connection overlay of one table under a schema whose
+	 * index / constraint set just changed (CREATE INDEX or DROP INDEX). Shared because the two
+	 * directions differ only in which structures the new schema carries — the column layout is
+	 * identical either way, so staged rows copy verbatim.
+	 *
+	 * A poisoned overlay (from a cross-connection ALTER, or a DROP TABLE) holds rows in the
+	 * pre-alter column layout, narrower/wider than `updatedSchema`. Rebuilding it would copy
+	 * layout-mismatched rows AND drop the poison flag (the new state carries none), silently
+	 * un-poisoning a connection that must still roll back. Leave it as-is.
+	 */
+	private async rebuildOverlaysForIndexChange(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		updatedSchema: TableSchema,
+		ddlDescription: string,
+	): Promise<void> {
+		const ownKey = this.makeConnectionOverlayKey(db, schemaName, tableName);
 		for (const key of this.connectionScopedKeys(this.connectionOverlays, schemaName, tableName)) {
 			const overlayState = this.connectionOverlays.get(key)!;
-			// A poisoned overlay (cross-connection ALTER) holds rows in the pre-alter column
-			// layout, narrower/wider than `updatedSchema`. Rebuilding it here would copy
-			// layout-mismatched rows AND drop the poison flag (the new state carries none),
-			// silently un-poisoning a connection that must still roll back. Leave it as-is.
 			if (overlayState.poison) continue;
-			const newState = await this.migrateOverlayForDropIndex(db, overlayState, updatedSchema);
-			this.connectionOverlays.set(key, newState);
+			await this.adoptRebuiltOverlay(
+				key,
+				overlayState,
+				key === ownKey,
+				schemaName,
+				tableName,
+				ddlDescription,
+				() => this.rebuildOverlayForIndexChange(db, overlayState, updatedSchema),
+			);
 		}
 	}
 
 	/**
-	 * Rebuilds an overlay table under the post-drop-index schema, preserving
-	 * staged rows (including tombstones). Column layout is unchanged by
-	 * DROP INDEX, so rows can be copied verbatim.
+	 * Rebuilds an overlay table under a post-CREATE/DROP-INDEX schema, preserving staged rows
+	 * (including tombstones). Column layout is unchanged by either, so rows copy verbatim — but
+	 * the new overlay's index/constraint set is not, so an insert here can legitimately raise
+	 * UNIQUE (a foreign connection staged two rows the new index forbids).
 	 */
-	private async migrateOverlayForDropIndex(
+	private async rebuildOverlayForIndexChange(
 		db: Database,
 		oldState: ConnectionOverlayState,
 		updatedSchema: TableSchema,
@@ -951,7 +1162,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		if (oldState.hasChanges && oldOverlay.query) {
 			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
-				await newOverlayTable.update({ operation: 'insert', values: oldRow as SqlValue[], preCoerced: true });
+				await this.insertIntoRebuiltOverlay(newOverlayTable, oldRow as SqlValue[], updatedSchema.name);
 			}
 		}
 
@@ -979,12 +1190,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * ALTER either fails clean or fully applies — base/catalog can no longer diverge.
 	 * This mirrors the engine's pre-mutation `validateNotNullBackfill` in
 	 * `runtime/emit/alter-table.ts`.
+	 *
+	 * **Row-content validation.** The row-validating arms (`add constraint … unique`,
+	 * `alter column … set collate`) judge the ISSUING connection's effective rows, not the
+	 * underlying's committed ones — see {@link issuerEffectiveRows}. The underlying runs that
+	 * check before it mutates anything, so the atomic-abort guarantee above still holds.
 	 */
 	async alterTable(
 		db: Database,
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
+		rows?: EffectiveRowSource,
 	): Promise<TableSchema> {
 		if (!this.underlying.alterTable) {
 			throw new QuereusError(
@@ -1045,7 +1262,17 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			await this.validateOverlayMigration(ownEntry[1], addColumnCtx);
 		}
 
-		const updated = await this.underlying.alterTable(db, schemaName, tableName, change);
+		const underlyingState = this.getUnderlyingState(schemaName, tableName);
+
+		// Hand the underlying the issuer's effective rows so its own row-content checks
+		// (`add constraint … unique`, `alter column … set collate`) see the transaction's
+		// pending rows and skip the ones it has deleted. An outer wrapper's source wins if
+		// one was supplied.
+		const rowSource = rows ?? (underlyingState
+			? this.issuerEffectiveRows(db, schemaName, tableName, underlyingState.underlyingTable)
+			: undefined);
+
+		const updated = await this.underlying.alterTable(db, schemaName, tableName, change, rowSource);
 
 		// The cached underlying VirtualTable's `tableSchema` is a construction-time
 		// snapshot (e.g. MemoryTable.tableSchema); module-level alterTable rotates the
@@ -1053,22 +1280,28 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// freshly-connected IsolatedTable's merged-view UNIQUE check (which reads
 		// this.tableSchema.uniqueConstraints / per-column collation) sees the post-alter
 		// constraint set. Mirrors the implicit instance refresh dropIndex already gets.
-		const underlyingState = this.getUnderlyingState(schemaName, tableName);
 		if (underlyingState) underlyingState.underlyingTable.tableSchema = updated;
 
+		const ddlDescription = `alter table (${change.type})`;
+
 		// Migrate the issuer's own overlay (already validated above). Its NOT NULL /
-		// tombstone throw sites are unreachable after pre-validation.
+		// tombstone throw sites are unreachable after pre-validation; so is a UNIQUE
+		// rejection, which `rowSource` already judged — {@link adoptRebuiltOverlay} raises
+		// INTERNAL if one fires anyway rather than dropping the row.
 		if (ownEntry) {
-			const newState = await this.migrateOverlayForAlter(db, ownEntry[1], updated, change, dropColumnIdx, addColumnCtx);
-			this.connectionOverlays.set(ownEntry[0], newState);
+			await this.adoptRebuiltOverlay(
+				ownEntry[0], ownEntry[1], true, schemaName, tableName, ddlDescription,
+				() => this.migrateOverlayForAlter(db, ownEntry![1], updated, change, dropColumnIdx, addColumnCtx),
+			);
 		}
 
 		// Tier 3: per FOREIGN overlay, validate then migrate — but a per-row NOT NULL
 		// (CONSTRAINT) failure poisons that one overlay instead of aborting the issuer's
-		// ALTER. An INTERNAL failure (e.g. missing tombstone column) is a layer-invariant
-		// violation, not a data condition, so it rethrows loud for everyone. Validation
-		// runs per overlay, so one bad foreign overlay poisons only itself; healthy peers
-		// still migrate.
+		// ALTER, as does a UNIQUE the migration itself raises (its staged rows may violate a
+		// constraint the issuer just declared). An INTERNAL failure (e.g. missing tombstone
+		// column) is a layer-invariant violation, not a data condition, so it rethrows loud
+		// for everyone. Both phases run per overlay, so one bad foreign overlay poisons only
+		// itself; healthy peers still migrate.
 		for (const [key, oldState] of foreign) {
 			try {
 				await this.validateOverlayMigration(oldState, addColumnCtx);
@@ -1079,8 +1312,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				}
 				throw e;
 			}
-			const newState = await this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx);
-			this.connectionOverlays.set(key, newState);
+			await this.adoptRebuiltOverlay(
+				key, oldState, false, schemaName, tableName, ddlDescription,
+				() => this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx),
+			);
 		}
 
 		return updated;
@@ -1241,6 +1476,10 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	/**
 	 * Rebuilds an overlay table under the post-alter schema, translating each
 	 * staged row to the new column layout.
+	 *
+	 * A row the post-alter schema's constraints reject throws CONSTRAINT out of
+	 * {@link insertIntoRebuiltOverlay} rather than being silently discarded; the caller
+	 * ({@link adoptRebuiltOverlay}) maps that to INTERNAL or poison.
 	 */
 	private async migrateOverlayForAlter(
 		db: Database,
@@ -1270,7 +1509,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
 					: undefined;
 				const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue);
-				await newOverlayTable.update({ operation: 'insert', values: newRow, preCoerced: true });
+				await this.insertIntoRebuiltOverlay(newOverlayTable, newRow, updatedSchema.name);
 			}
 		}
 

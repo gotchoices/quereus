@@ -26,6 +26,7 @@ import type {
 	BestAccessPlanResult,
 	PredicateConstraint,
 	OrderingSpec,
+	Row,
 	SqlValue,
 	ModuleCapabilities,
 	SchemaChangeInfo,
@@ -39,7 +40,7 @@ import type {
 	LensDeploymentSnapshot,
 } from '@quereus/quereus';
 import { AccessPlanBuilder, QuereusError, StatusCode, buildColumnIndexMap, columnDefToSchema, compilePredicate, inferType, tryFoldLiteral, validateAndParse, buildAdvertisementsFromTags, resolveNamedConstraintClass, validateCollationForType, buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, appendIndexToTableSchema, logicalTypeCanHoldText, serializeRowKey, isMaintainedTable, renameColumnInIndexPredicates, renameTableInIndexPredicates, renameColumnInCheckConstraints, renameTableInCheckConstraints } from '@quereus/quereus';
-import type { CompiledPredicate, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
+import type { CompiledPredicate, EffectiveRowSource, KeyNormalizer, KeyNormalizerResolver, ResolveColumnInSource } from '@quereus/quereus';
 
 import type { KVEntry, KVStore, KVStoreProvider } from './kv-store.js';
 import type { StoreEventEmitter } from './events.js';
@@ -795,12 +796,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 
 	/**
 	 * Creates an index on a store-backed table.
+	 *
+	 * `rows` — an {@link EffectiveRowSource} supplied by a wrapper module (the isolation
+	 * layer) — replaces this module's own rows as the set the UNIQUE duplicate check judges.
+	 * When present the check runs UP FRONT, before `getIndexStore` opens the index-store
+	 * directory, so a rejection leaves no directory behind; and `buildIndexEntries` then
+	 * populates the physical index from this module's own (committed) rows with its in-pass
+	 * dup check disabled. Those two row sets legitimately differ — the wrapper's transaction
+	 * may have deleted a committed duplicate — and an index entry with no live row behind it
+	 * is harmless (see the entry-resolution note in `buildIndexEntries`).
 	 */
 	async createIndex(
 		db: Database,
 		schemaName: string,
 		tableName: string,
-		indexSchema: TableIndexSchema
+		indexSchema: TableIndexSchema,
+		rows?: EffectiveRowSource,
 	): Promise<void> {
 		const table = this.getOrReconnectTable(db, schemaName, tableName);
 
@@ -826,6 +837,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			`index store of new index '${indexSchema.name}' on table '${schemaName}.${tableName}'`,
 		);
 
+		const tableSchema = table.getSchema();
+		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
+
+		// Wrapper-supplied rows are the judged set. Validate BEFORE `getIndexStore` so a
+		// rejection leaves no index-store directory behind, and disable the in-pass dup
+		// check below (which would judge this module's committed rows instead).
+		if (rows && indexSchema.unique) {
+			await this.validateUniqueIndexOverRows(rows(), tableSchema, indexSchema, db.getKeyNormalizerResolver());
+		}
+
 		// Create the index store
 		const indexStore = await this.provider.getIndexStore(schemaName, tableName, indexSchema.name);
 
@@ -838,8 +859,6 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// silently ACCEPTED. Entries written here for rows that a subsequent ROLLBACK
 		// discards are harmless: both readers resolve each entry to its live row and
 		// drop it when the row is gone or no longer matches (see `scanIndex`).
-		const tableSchema = table.getSchema();
-		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
 		await this.buildIndexEntries(
 			table.iterateEffectiveEntries(buildFullScanBounds()),
 			indexStore,
@@ -847,6 +866,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			indexSchema,
 			keyCollation,
 			db.getKeyNormalizerResolver(),
+			rows !== undefined,
 		);
 
 		// Refresh the connected table's cached schema so subsequent DML
@@ -970,7 +990,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * predicates and SQL NULL semantics: multiple NULLs are allowed) and throws
 	 * CONSTRAINT before any entries are written. Mirrors the memory module's
 	 * populateNewIndex so `CREATE UNIQUE INDEX` over duplicated data fails
-	 * atomically.
+	 * atomically. `skipDuplicateCheck` suppresses it: `createIndex` sets it when a
+	 * wrapper module supplied the rows to judge, having already validated them (see
+	 * {@link validateUniqueIndexOverRows}). Judging `dataEntries` too would reject a
+	 * committed duplicate the wrapper's transaction has already deleted.
 	 *
 	 * `normalizers` MUST be the owning connection's `db.getKeyNormalizerResolver()` —
 	 * the same resolver `StoreTable.encodeOptions` carries. A rebuild that resolved
@@ -984,6 +1007,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		indexSchema: TableIndexSchema,
 		keyCollation: string,
 		normalizers: KeyNormalizerResolver,
+		skipDuplicateCheck = false,
 	): Promise<void> {
 		// Index COLUMN values use the table-level key collation K; the PK SUFFIX uses
 		// each PK column's own key collation, so the suffix bytes match the data-store
@@ -996,24 +1020,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const predicate: CompiledPredicate | undefined = indexSchema.predicate
 			? compilePredicate(indexSchema.predicate, tableSchema.columns)
 			: undefined;
-		const seen: Set<string> | undefined = indexSchema.unique ? new Set() : undefined;
+		const seen: Set<string> | undefined = (indexSchema.unique && !skipDuplicateCheck) ? new Set() : undefined;
 
-		// Per-column normalizers for the in-pass UNIQUE dup check, drawing each
-		// column's collation from the index column (if it carries one) else the
-		// underlying table column — so the dedup signature honors a per-column
-		// collation registered on this connection, matching write-time enforcement.
-		// A column whose declared type can never hold text takes the identity
-		// normalizer regardless of its collation (`serializeRowKey` normalizes only
-		// string values), so a comparator-only collation named on an integer column
-		// is not rejected here when the engine's own hash sites would accept it.
 		const indexColIndices = indexSchema.columns.map(col => col.index);
 		const indexNormalizers = seen
-			? indexSchema.columns.map(col => {
-				const column = tableSchema.columns[col.index];
-				return normalizers(logicalTypeCanHoldText(column.logicalType)
-					? (col.collation ?? column.collation)
-					: undefined);
-			})
+			? indexDedupeNormalizers(tableSchema, indexSchema, normalizers)
 			: undefined;
 
 		const batch = indexStore.batch();
@@ -1113,22 +1124,22 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
-	 * Validates the rows in `entries` against a UNIQUE constraint, throwing
-	 * `CONSTRAINT` on the first duplicate before any schema mutation. Used by
-	 * `ADD CONSTRAINT UNIQUE` (validate against the current collation) and by
-	 * `SET COLLATE` (pass an `updatedSchema` whose altered column carries the
-	 * NEW collation, so the dedup is performed under it). Mirrors the duplicate
-	 * detection in {@link buildIndexEntries}: a `seen` Set keyed on a per-column
-	 * collation-aware signature of the constrained values, with SQL NULL semantics
-	 * (a row with any NULL constrained value never counts as a duplicate) and the
-	 * partial `predicate` honored.
+	 * Validates `rows` against a UNIQUE constraint, throwing `CONSTRAINT` on the first
+	 * duplicate before any schema mutation. Used by `ADD CONSTRAINT UNIQUE` (validate
+	 * against the current collation) and by `SET COLLATE` (pass an `updatedSchema` whose
+	 * altered column carries the NEW collation, so the dedup is performed under it).
+	 * Mirrors the duplicate detection in {@link buildIndexEntries}: a `seen` Set keyed on
+	 * a per-column collation-aware signature of the constrained values, with SQL NULL
+	 * semantics (a row with any NULL constrained value never counts as a duplicate) and
+	 * the partial `predicate` honored.
 	 *
-	 * `entries` MUST be the table's EFFECTIVE stream (committed rows merged with
-	 * the open transaction's own pending puts/deletes — see
-	 * `StoreTable.iterateEffectiveEntries`), mirroring `buildIndexEntries`'s
-	 * identical parameterization. A committed-only stream would let a duplicate
-	 * inserted earlier in the same transaction slip past validation and land in
-	 * the table once the transaction commits.
+	 * `rows` MUST be the rows the DDL-issuing connection can SEE. Ordinarily that is this
+	 * table's EFFECTIVE stream (committed rows merged with the open transaction's own
+	 * pending puts/deletes — `StoreTable.iterateEffectiveEntries`, adapted by
+	 * {@link rowsFromEntries}); when a wrapper module holds the pending rows outside this
+	 * module it hands them down as an `EffectiveRowSource` instead. Either way, a
+	 * committed-only stream would let a duplicate inserted earlier in the same transaction
+	 * slip past validation and land in the table once the transaction commits.
 	 *
 	 * No index store is written — store UNIQUE enforcement is a full-scan over
 	 * `uniqueConstraints` at write time. The signature is built by
@@ -1141,40 +1152,43 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * identity normalizer and so never raise.
 	 */
 	private async validateUniqueOverExistingRows(
-		entries: AsyncIterable<KVEntry>,
+		rows: AsyncIterable<Row>,
 		tableSchema: TableSchema,
 		uc: UniqueConstraintSchema,
 		keyNormalizers: KeyNormalizerResolver,
 	): Promise<void> {
-		const predicate: CompiledPredicate | undefined = uc.predicate
-			? compilePredicate(uc.predicate, tableSchema.columns)
-			: undefined;
-		const normalizers = uc.columns.map(idx => {
-			const column = tableSchema.columns[idx];
-			return keyNormalizers(logicalTypeCanHoldText(column.logicalType) ? column.collation : undefined);
-		});
-		const seen = new Set<string>();
+		await assertNoDuplicateRows(
+			rows,
+			tableSchema,
+			uc.columns,
+			uc.columns.map(idx => {
+				const column = tableSchema.columns[idx];
+				return keyNormalizers(logicalTypeCanHoldText(column.logicalType) ? column.collation : undefined);
+			}),
+			uc.predicate ? compilePredicate(uc.predicate, tableSchema.columns) : undefined,
+		);
+	}
 
-		for await (const entry of entries) {
-			const row = deserializeRow(entry.value);
-
-			// Partial constraint: only rows the predicate unambiguously accepts count.
-			if (predicate && predicate.evaluate(row) !== true) continue;
-
-			// serializeRowKey returns null when any constrained column is NULL —
-			// SQL UNIQUE allows multiple NULLs, so those rows never collide.
-			const keySig = serializeRowKey(row, uc.columns, normalizers);
-			if (keySig === null) continue;
-
-			if (seen.has(keySig)) {
-				const colNames = uc.columns.map(i => tableSchema.columns[i]?.name ?? String(i)).join(', ');
-				throw new QuereusError(
-					`UNIQUE constraint failed: ${tableSchema.name} (${colNames})`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-			seen.add(keySig);
-		}
+	/**
+	 * Index-shaped twin of {@link validateUniqueOverExistingRows}, used by
+	 * {@link createIndex} when a wrapper module supplies the rows to judge. Dedupes on the
+	 * index's own columns under the index column's COLLATE (falling back to the table
+	 * column's), so it enforces exactly what `buildIndexEntries`' suppressed in-pass check
+	 * would have — over the wrapper's rows instead of this module's committed ones.
+	 */
+	private async validateUniqueIndexOverRows(
+		rows: AsyncIterable<Row>,
+		tableSchema: TableSchema,
+		indexSchema: TableIndexSchema,
+		keyNormalizers: KeyNormalizerResolver,
+	): Promise<void> {
+		await assertNoDuplicateRows(
+			rows,
+			tableSchema,
+			indexSchema.columns.map(col => col.index),
+			indexDedupeNormalizers(tableSchema, indexSchema, keyNormalizers),
+			indexSchema.predicate ? compilePredicate(indexSchema.predicate, tableSchema.columns) : undefined,
+		);
 	}
 
 	/**
@@ -1225,6 +1239,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		schemaName: string,
 		tableName: string,
 		change: SchemaChangeInfo,
+		rows?: EffectiveRowSource,
 	): Promise<TableSchema> {
 		this.ensureSchemaSubscription(db);
 		const table = this.getOrReconnectTable(db, schemaName, tableName);
@@ -1559,7 +1574,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// the transaction survives a CONSTRAINT rejection.
 					const uc = buildUniqueConstraintSchema(constraint, oldSchema.columnIndexMap);
 					await this.validateUniqueOverExistingRows(
-						table.iterateEffectiveEntries(buildFullScanBounds()),
+						rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
 						oldSchema,
 						uc,
 						db.getKeyNormalizerResolver(),
@@ -1832,9 +1847,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					const coveringConstraints = (updatedSchema.uniqueConstraints ?? [])
 						.filter(uc => uc.columns.includes(colIndex));
 					for (const uc of coveringConstraints) {
-						// Fresh generator per constraint — an async generator is single-shot.
+						// Fresh generator per constraint — an async generator is single-shot. An
+						// `EffectiveRowSource` is re-callable for exactly this reason.
 						await this.validateUniqueOverExistingRows(
-							table.iterateEffectiveEntries(buildFullScanBounds()),
+							rows ? rows() : rowsFromEntries(table.iterateEffectiveEntries(buildFullScanBounds())),
 							updatedSchema,
 							uc,
 							db.getKeyNormalizerResolver(),
@@ -1856,6 +1872,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					// {@link ddlCommitPendingOps}). Deliberately AFTER the non-PK UNIQUE
 					// re-validation above: that check reads effectively and throws without
 					// needing the flush, so it must keep the transaction alive.
+					//
+					// NOTE: `rekeyRows` detects PK collisions among THIS module's rows only. When a
+					// wrapper module supplied `rows`, its staged rows are not in this store, so a
+					// pending row that collides with a committed one under the new collation is
+					// caught by neither side — the wrapper's overlay enforces the PK among its own
+					// rows, this store among its own. Closing it needs a PK-dedupe pass over `rows`
+					// under the new collation here, before the re-key.
 					await this.ddlCommitPendingOps();
 					await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
 					await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
@@ -3287,6 +3310,70 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	getTable(schemaName: string, tableName: string): StoreTable | undefined {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		return this.tables.get(tableKey);
+	}
+}
+
+/** Adapts a raw KV entry stream into the row stream the uniqueness validators consume. */
+async function* rowsFromEntries(entries: AsyncIterable<KVEntry>): AsyncIterable<Row> {
+	for await (const entry of entries) {
+		yield deserializeRow(entry.value);
+	}
+}
+
+/**
+ * Per-column key normalizers for a UNIQUE INDEX dedupe signature, drawing each column's
+ * collation from the index column (if it carries one) else the underlying table column —
+ * so the signature honors a per-column collation registered on this connection, matching
+ * write-time enforcement.
+ *
+ * A column whose declared type can never hold text takes the identity normalizer regardless
+ * of its collation (`serializeRowKey` normalizes only string values), so a comparator-only
+ * collation named on an integer column is not rejected here when the engine's own hash sites
+ * would accept it.
+ */
+function indexDedupeNormalizers(
+	tableSchema: TableSchema,
+	indexSchema: TableIndexSchema,
+	keyNormalizers: KeyNormalizerResolver,
+): KeyNormalizer[] {
+	return indexSchema.columns.map(col => {
+		const column = tableSchema.columns[col.index];
+		return keyNormalizers(logicalTypeCanHoldText(column.logicalType)
+			? (col.collation ?? column.collation)
+			: undefined);
+	});
+}
+
+/**
+ * Throws CONSTRAINT on the first pair of `rows` that share a signature over `columnIndices`.
+ *
+ * SQL NULL semantics: `serializeRowKey` returns null when any constrained column is NULL, and
+ * such rows never collide. A partial `predicate` restricts the judged set to rows it accepts
+ * unambiguously. Shared by {@link StoreModule.validateUniqueOverExistingRows} (constraint
+ * columns) and {@link StoreModule.validateUniqueIndexOverRows} (index columns).
+ */
+async function assertNoDuplicateRows(
+	rows: AsyncIterable<Row>,
+	tableSchema: TableSchema,
+	columnIndices: readonly number[],
+	normalizers: readonly KeyNormalizer[],
+	predicate: CompiledPredicate | undefined,
+): Promise<void> {
+	const seen = new Set<string>();
+	for await (const row of rows) {
+		if (predicate && predicate.evaluate(row) !== true) continue;
+
+		const keySig = serializeRowKey(row, columnIndices, normalizers);
+		if (keySig === null) continue;
+
+		if (seen.has(keySig)) {
+			const colNames = columnIndices.map(i => tableSchema.columns[i]?.name ?? String(i)).join(', ');
+			throw new QuereusError(
+				`UNIQUE constraint failed: ${tableSchema.name} (${colNames})`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+		seen.add(keySig);
 	}
 }
 

@@ -30,7 +30,7 @@ export { MemoryTableModule } from './vtab/memory/module.js';
 export type { IndexInfo, IndexConstraint, IndexConstraintUsage, IndexOrderBy } from './vtab/index-info.js';
 export { IndexScanFlags } from './vtab/index-info.js';
 export type { FilterInfo } from './vtab/filter-info.js';
-export type { BaseModuleConfig, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
+export type { BaseModuleConfig, EffectiveRowSource, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
 export { getModuleConcurrencyMode, acquireConnectionLock } from './vtab/concurrency.js';
 
 // Virtual Table Event Hooks
@@ -220,7 +220,7 @@ export { Latches } from './util/latches.js';
 // UNIQUE re-validation that honors a per-column collation). `BUILTIN_NORMALIZERS`
 // backs a store's default key-normalizer resolver for callers that hold no Database;
 // any caller that DOES hold one must resolve through `db.getKeyNormalizerResolver()`.
-export { BUILTIN_NORMALIZERS, serializeRowKey } from './util/key-serializer.js';
+export { BUILTIN_NORMALIZERS, serializeRowKey, serializeKeyNullGrouping } from './util/key-serializer.js';
 
 // Whether a column's declared type can ever hold text, and therefore whether a key
 // built over it needs a key normalizer at all. Out-of-package hash-key sites (the

@@ -1,4 +1,4 @@
-import type { AnyVirtualTableModule, SchemaChangeInfo } from './module.js';
+import type { AnyVirtualTableModule, EffectiveRowSource, SchemaChangeInfo } from './module.js';
 import type { Database } from '../core/database.js';
 import type { TableSchema } from '../schema/table.js';
 import type { MaybePromise, Row, SqlValue, CompareFn, UpdateResult } from '../common/types.js';
@@ -215,8 +215,11 @@ export abstract class VirtualTable {
 	/**
 	 * Creates a secondary index on the virtual table
 	 * @param indexInfo The index definition
+	 * @param rows Optional {@link EffectiveRowSource} — the rows the DDL-issuing connection
+	 *   can see, supplied by a wrapper module that holds pending rows this table cannot
+	 *   reach. When present, the UNIQUE duplicate check MUST judge this stream.
 	 */
-	createIndex?(indexInfo: IndexSchema): Promise<void>;
+	createIndex?(indexInfo: IndexSchema, rows?: EffectiveRowSource): Promise<void>;
 
 	/**
 	 * Drops a secondary index from the virtual table

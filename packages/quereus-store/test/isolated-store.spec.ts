@@ -743,6 +743,97 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	/**
+	 * Row-validating DDL (`CREATE UNIQUE INDEX`, `ALTER TABLE … ADD CONSTRAINT … UNIQUE`)
+	 * must judge the rows the ISSUING connection can see — its own uncommitted writes
+	 * included — not the underlying store's committed rows. The end-to-end behavior is
+	 * covered by `test/logic/10.1.2-ddl-in-transaction.sqllogic`, which runs against both
+	 * backends; what only a white-box test can see is that a REJECTED DDL leaves the
+	 * overlay's staged rows intact.
+	 *
+	 * The bug these pin: the overlay rebuild ignored `MemoryTable.update`'s returned
+	 * `{ status: 'constraint' }`, so an accepted `ADD CONSTRAINT … UNIQUE` re-inserted the
+	 * first staged row, got a constraint back for the second, dropped it on the floor, and
+	 * committed a transaction missing a row. A test that only asserts the DDL raised cannot
+	 * tell that path from a correct one.
+	 */
+	describe('row-validating DDL over an open transaction', () => {
+		beforeEach(async () => {
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+			await db.exec(`CREATE TABLE ddl_tx (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+		});
+
+		async function expectUniqueRejection(sql: string): Promise<void> {
+			try {
+				await db.exec(sql);
+			} catch (e) {
+				expect((e as Error).message).to.match(/UNIQUE constraint failed/);
+				return;
+			}
+			throw new Error(`expected [${sql}] to be rejected`);
+		}
+
+		it('ADD CONSTRAINT UNIQUE rejected over pending duplicates loses no staged row', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);
+
+			await expectUniqueRejection(`ALTER TABLE ddl_tx ADD CONSTRAINT ddl_tx_u UNIQUE (v)`);
+
+			// The rejected ALTER must leave the overlay exactly as it found it. Before the fix,
+			// the migration silently discarded row 2 and this returned only row 1.
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM ddl_tx ORDER BY id`));
+			expect(rows, 'both staged rows survive the rejected ALTER').to.deep.equal([
+				{ id: 1, v: 'a' },
+				{ id: 2, v: 'a' },
+			]);
+
+			// The transaction is still usable, and committing it lands both rows.
+			await db.exec('COMMIT');
+			const committed = await asyncIterableToArray(db.eval(`SELECT id, v FROM committed.ddl_tx ORDER BY id`));
+			expect(committed).to.deep.equal([{ id: 1, v: 'a' }, { id: 2, v: 'a' }]);
+		});
+
+		it('CREATE UNIQUE INDEX rejected over pending duplicates loses no staged row', async () => {
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);
+
+			await expectUniqueRejection(`CREATE UNIQUE INDEX ddl_tx_ix ON ddl_tx (v)`);
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM ddl_tx ORDER BY id`));
+			expect(rows, 'both staged rows survive the rejected CREATE INDEX').to.deep.equal([
+				{ id: 1, v: 'a' },
+				{ id: 2, v: 'a' },
+			]);
+			await db.exec('ROLLBACK');
+		});
+
+		it('accepted CREATE UNIQUE INDEX rebuilds the overlay and preserves its rows and tombstones', async () => {
+			await db.exec(`INSERT INTO ddl_tx VALUES (1, 'a')`);
+			await db.exec(`INSERT INTO ddl_tx VALUES (2, 'a')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`DELETE FROM ddl_tx WHERE id = 2`);      // stages a tombstone
+			await db.exec(`INSERT INTO ddl_tx VALUES (3, 'b')`);   // stages a live row
+
+			// The committed duplicate is gone from this transaction's view, so the build is legal.
+			await db.exec(`CREATE UNIQUE INDEX ddl_tx_ix ON ddl_tx (v)`);
+
+			// Both staged entries survived the rebuild: the tombstone still hides row 2, and the
+			// live row 3 is still there.
+			const rows = await asyncIterableToArray(db.eval(`SELECT id, v FROM ddl_tx ORDER BY id`));
+			expect(rows).to.deep.equal([{ id: 1, v: 'a' }, { id: 3, v: 'b' }]);
+
+			// And the rebuilt overlay now enforces the new index against a further pending write.
+			await expectUniqueRejection(`INSERT INTO ddl_tx VALUES (4, 'b')`);
+
+			await db.exec('COMMIT');
+			const committed = await asyncIterableToArray(db.eval(`SELECT id, v FROM committed.ddl_tx ORDER BY id`));
+			expect(committed).to.deep.equal([{ id: 1, v: 'a' }, { id: 3, v: 'b' }]);
+		});
+	});
+
 	describe('cross-layer UNIQUE / PK conflict detection', () => {
 		let isolatedModule: ReturnType<typeof createIsolatedStoreModule>;
 

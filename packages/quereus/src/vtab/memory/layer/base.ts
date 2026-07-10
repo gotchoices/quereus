@@ -50,26 +50,58 @@ export function populateIndexFromRows(
 	columns: ReadonlyArray<ColumnSchema>,
 ): void {
 	for (const row of rows) {
-		if (!index.rowMatchesPredicate(row)) continue;
-
-		const indexKey = index.keyFromRow(row);
-		const primaryKey = primaryKeyFromRow(row);
-
-		if (enforceUnique) {
-			const hasNull = index.specColumns.some(c => row[c.index] === null);
-			if (!hasNull && index.hasAnyPrimaryKey(indexKey)) {
-				const colNames = index.specColumns
-					.map(c => columns[c.index]?.name ?? String(c.index))
-					.join(', ');
-				throw new QuereusError(
-					`UNIQUE constraint failed: ${tableName} (${colNames})`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-		}
-
-		index.addEntry(indexKey, primaryKey);
+		addRowToIndex(row, index, primaryKeyFromRow, enforceUnique, tableName, columns);
 	}
+}
+
+/**
+ * Async-stream twin of {@link populateIndexFromRows}, sharing its per-row body.
+ *
+ * Needed because an {@link EffectiveRowSource} — the merged view a wrapper module (the
+ * isolation layer) hands down for row-validating DDL — is an `AsyncIterable`, while the
+ * memory module's own effective rows are a synchronous BTree walk.
+ */
+export async function populateIndexFromRowsAsync(
+	rows: AsyncIterable<Row>,
+	index: MemoryIndex,
+	primaryKeyFromRow: (row: Row) => BTreeKeyForPrimary,
+	enforceUnique: boolean,
+	tableName: string,
+	columns: ReadonlyArray<ColumnSchema>,
+): Promise<void> {
+	for await (const row of rows) {
+		addRowToIndex(row, index, primaryKeyFromRow, enforceUnique, tableName, columns);
+	}
+}
+
+/** One row's worth of {@link populateIndexFromRows}; see its docstring for the semantics. */
+function addRowToIndex(
+	row: Row,
+	index: MemoryIndex,
+	primaryKeyFromRow: (row: Row) => BTreeKeyForPrimary,
+	enforceUnique: boolean,
+	tableName: string,
+	columns: ReadonlyArray<ColumnSchema>,
+): void {
+	if (!index.rowMatchesPredicate(row)) return;
+
+	const indexKey = index.keyFromRow(row);
+	const primaryKey = primaryKeyFromRow(row);
+
+	if (enforceUnique) {
+		const hasNull = index.specColumns.some(c => row[c.index] === null);
+		if (!hasNull && index.hasAnyPrimaryKey(indexKey)) {
+			const colNames = index.specColumns
+				.map(c => columns[c.index]?.name ?? String(c.index))
+				.join(', ');
+			throw new QuereusError(
+				`UNIQUE constraint failed: ${tableName} (${colNames})`,
+				StatusCode.CONSTRAINT,
+			);
+		}
+	}
+
+	index.addEntry(indexKey, primaryKey);
 }
 
 export class BaseLayer implements Layer {

@@ -3,7 +3,7 @@ import { type TableSchema, type IndexSchema, type UniqueConstraintSchema, buildC
 import { type BTreeKeyForPrimary } from '../types.js';
 import { BTree } from 'inheritree';
 import { StatusCode, type SqlValue, type Row, type UpdateResult } from '../../../common/types.js';
-import { BaseLayer, iteratePrimaryRows, populateIndexFromRows } from './base.js';
+import { BaseLayer, iteratePrimaryRows, populateIndexFromRows, populateIndexFromRowsAsync } from './base.js';
 import { TransactionLayer, type OwnWrite } from './transaction.js';
 import type { Layer } from './interface.js';
 import { MemoryTableConnection } from './connection.js';
@@ -30,6 +30,7 @@ import { renameColumnInIndexPredicates, type ResolveColumnInSource } from '../..
 import { MemoryIndex } from '../index.js';
 import type { MaintainedTableSchema } from '../../../schema/derivation.js';
 import type { MaintenanceOp, BackingRowChange } from '../../backing-host.js';
+import type { EffectiveRowSource } from '../../module.js';
 
 let tableManagerCounter = 0;
 const logger = createMemoryTableLoggers('layer:manager');
@@ -2003,7 +2004,7 @@ export class MemoryTableManager {
 		setDataType?: string;
 		setDefault?: Expression | null;
 		setCollation?: string;
-	}): Promise<void> {
+	}, rows?: EffectiveRowSource): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -2156,7 +2157,15 @@ export class MemoryTableManager {
 			// the chain, base included, may hold a collision. That is what lets every step below
 			// succeed unconditionally, and what `TransactionLayer.rekeyPrimaryKey` relies on.
 			if (collationChanged) {
-				this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex);
+				await this.validateRekeyedUniqueStructures(finalNewTableSchema, colIndex, rows);
+				// NOTE: `validateRekeyedPrimaryKey` deliberately ignores `rows`. It asserts that no
+				// LAYER of this manager's own chain holds a PK collision under the new comparator —
+				// a physical property of the structures it is about to re-key, which a wrapper's
+				// merged row stream cannot speak to. A wrapper's staged rows live in the wrapper's
+				// own overlay, which enforces the PK itself, so the pair "one staged row + one
+				// committed row that collide only under the new collation" is checked by neither
+				// side. Rejecting it here would need the wrapper to expose its overlay's PK set, not
+				// just its merged rows.
 				if (pkColumnRekeyed) this.validateRekeyedPrimaryKey(finalNewTableSchema);
 			}
 
@@ -2229,7 +2238,7 @@ export class MemoryTableManager {
 		}
 	}
 
-	async createIndex(newIndexSchemaEntry: IndexSchema, ifNotExistsFromAst?: boolean): Promise<void> {
+	async createIndex(newIndexSchemaEntry: IndexSchema, ifNotExistsFromAst?: boolean, rows?: EffectiveRowSource): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -2257,7 +2266,7 @@ export class MemoryTableManager {
 			// and one it has deleted must not. A throw here leaves schema, base layer and
 			// index map exactly as they were.
 			if (newIndexSchemaEntry.unique) {
-				this.validateUniqueOverEffectiveRows(newIndexSchemaEntry, this.tableSchema);
+				await this.validateUniqueOverEffectiveRows(newIndexSchemaEntry, this.tableSchema, rows);
 			}
 
 			const updatedIndexes = Object.freeze([...(this.tableSchema.indexes || []), newIndexSchemaEntry]);
@@ -2542,7 +2551,7 @@ export class MemoryTableManager {
 	 *   keeps an engine-side fallback in `runtime/emit/add-constraint.ts` only for
 	 *   modules that omit `alterTable` — which cannot DROP/RENAME a constraint anyway.)
 	 */
-	async addConstraint(constraint: ASTTableConstraint): Promise<void> {
+	async addConstraint(constraint: ASTTableConstraint, rows?: EffectiveRowSource): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
 		const lockKey = `MemoryTable.SchemaChange:${this.schemaName}.${this._tableName}`;
 		const release = await this.db.latches.acquire(lockKey);
@@ -2551,7 +2560,7 @@ export class MemoryTableManager {
 			await this.ensureSchemaChangeSafety();
 
 			if (constraint.type === 'unique') {
-				await this.addUniqueConstraint(constraint);
+				await this.addUniqueConstraint(constraint, rows);
 			} else if (constraint.type === 'foreignKey') {
 				await this.addForeignKeyConstraint(constraint);
 			} else if (constraint.type === 'check') {
@@ -2609,7 +2618,7 @@ export class MemoryTableManager {
 	 * unless an existing *unique* index already covers the exact columns — in which
 	 * case the data is already validated and we only register the covering structure.
 	 */
-	private async addUniqueConstraint(constraint: ASTTableConstraint): Promise<void> {
+	private async addUniqueConstraint(constraint: ASTTableConstraint, rows?: EffectiveRowSource): Promise<void> {
 		const uc = buildUniqueConstraintSchema(constraint, this.tableSchema.columnIndexMap);
 		const columns = this.tableSchema.columns;
 		const existingIndexes = this.tableSchema.indexes ?? [];
@@ -2668,7 +2677,7 @@ export class MemoryTableManager {
 		// `unique: true` flag, so `addIndexToBase` would not check it anyway — and must
 		// not: it populates from committed rows, which may still hold a duplicate this
 		// transaction has deleted.
-		this.validateUniqueOverEffectiveRows(indexSchema, this.tableSchema);
+		await this.validateUniqueOverEffectiveRows(indexSchema, this.tableSchema, rows);
 
 		const newSchema: TableSchema = Object.freeze({
 			...this.tableSchema,
@@ -2872,8 +2881,17 @@ export class MemoryTableManager {
 	 * already violate, BEFORE anything is mutated. Builds a throwaway {@link MemoryIndex} —
 	 * the collation-aware, partial-predicate-aware key comparator — over those rows and lets
 	 * {@link populateIndexFromRows} raise CONSTRAINT on the first duplicate.
+	 *
+	 * `rows` overrides {@link effectiveDdlRows}. A wrapper module (the isolation layer) holds
+	 * the transaction's pending rows outside this manager, so only it can name the rows the
+	 * issuing connection actually sees; when it supplies them, they are the judged set and this
+	 * manager's own committed rows are ignored. See `vtab/module.ts` {@link EffectiveRowSource}.
 	 */
-	private validateUniqueOverEffectiveRows(indexSchema: IndexSchema, schema: TableSchema): void {
+	private async validateUniqueOverEffectiveRows(
+		indexSchema: IndexSchema,
+		schema: TableSchema,
+		rows?: EffectiveRowSource,
+	): Promise<void> {
 		const probe = new MemoryIndex(
 			indexSchema,
 			schema.columns,
@@ -2881,6 +2899,17 @@ export class MemoryTableManager {
 			this.primaryKeyFunctions.compare,
 			this.primaryKeyFunctions.encode,
 		);
+		if (rows) {
+			await populateIndexFromRowsAsync(
+				rows(),
+				probe,
+				this.primaryKeyFunctions.extractFromRow,
+				true,
+				this._tableName,
+				schema.columns,
+			);
+			return;
+		}
 		populateIndexFromRows(
 			this.effectiveDdlRows(),
 			probe,
@@ -2906,7 +2935,11 @@ export class MemoryTableManager {
 	 * here. The auto-index always exists alongside, so the structure is still validated — but if
 	 * an MV-only covering shape ever becomes reachable, this walk must follow it.
 	 */
-	private validateRekeyedUniqueStructures(newSchema: TableSchema, alteredColumnIndex: number): void {
+	private async validateRekeyedUniqueStructures(
+		newSchema: TableSchema,
+		alteredColumnIndex: number,
+		rows?: EffectiveRowSource,
+	): Promise<void> {
 		// NOTE: the probe index carries the manager's PRE-change `primaryKeyFunctions` (the new
 		// ones cannot exist before the schema swaps). Only the probe's per-entry PK bookkeeping
 		// uses them, and every effective row already has a distinct PK under the old encoder, so
@@ -2915,7 +2948,8 @@ export class MemoryTableManager {
 		for (const indexSchema of newSchema.indexes ?? []) {
 			if (!indexSchema.columns.some(c => c.index === alteredColumnIndex)) continue;
 			if (!indexEnforcesUnique(newSchema, indexSchema)) continue;
-			this.validateUniqueOverEffectiveRows(indexSchema, newSchema);
+			// `rows` is re-callable, so each structure gets a fresh stream.
+			await this.validateUniqueOverEffectiveRows(indexSchema, newSchema, rows);
 		}
 	}
 

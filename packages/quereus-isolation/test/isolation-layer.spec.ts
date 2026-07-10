@@ -1909,7 +1909,7 @@ describe('IsolationModule', () => {
 		});
 	});
 
-	describe('ALTER TABLE ADD COLUMN cross-connection poison semantics', () => {
+	describe('row-validating DDL cross-connection poison semantics', () => {
 		// The hybrid (B) blast radius: an ALTER no longer aborts because of ANOTHER
 		// connection's uncommitted, un-backfillable overlay. The issuer's own
 		// un-backfillable overlay still aborts atomically (unchanged); a foreign one is
@@ -2103,6 +2103,43 @@ describe('IsolationModule', () => {
 			const rc = await asyncIterableToArray(tableBRC.query(fullScan()));
 			expect(rc.length, 'read-committed reader returns underlying rows without throwing').to.equal(1);
 			expect(rc[0][2]).to.equal(5);
+		});
+
+		/**
+		 * `CREATE UNIQUE INDEX` by one connection over rows another connection has staged.
+		 *
+		 * The issuer's own rows are judged before the index is built (see
+		 * `IsolationModule.issuerEffectiveRows`), but a FOREIGN overlay is not — its rows are
+		 * that connection's problem, exactly as a concurrent duplicate insert would be. What
+		 * must not happen is the overlay rebuild quietly dropping the row it cannot re-insert:
+		 * `MemoryTable.update` RETURNS `{status:'constraint'}` rather than throwing, and the
+		 * rebuild loop used to ignore it. The foreign connection would then commit a
+		 * transaction missing a row it believed it had written.
+		 */
+		it('poisons a foreign overlay whose staged rows violate a newly created UNIQUE index', async () => {
+			await injectOverlay(dbB, [[10, 7], [11, 7]]); // B stages two rows that collide on x
+
+			await iso.createIndex(dbA, 'main', 't', {
+				name: 't_x_ux',
+				columns: [{ index: 1 }],
+				unique: true,
+			});
+
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'B overlay must be poisoned, not silently truncated').to.not.be.undefined;
+			expect(bState.poison!.message).to.match(/UNIQUE constraint failed/);
+			expect(bState.poison!.message).to.match(/roll back this transaction/i);
+
+			// The poisoned overlay keeps BOTH staged rows — the rebuild that rejected the second
+			// one was discarded whole, never installed with a row missing.
+			const bRows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
+			expect(bRows.map(r => r[0]), 'no staged row was dropped').to.deep.equal([10, 11]);
+
+			// And B's commit fails rather than reporting success over the lost row.
+			let commitErr: unknown;
+			try { await iso.commitConnectionOverlays(dbB); } catch (e) { commitErr = e; }
+			expect(commitErr, 'poisoned overlay must abort the commit').to.be.instanceOf(QuereusError);
+			expect((commitErr as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
 		});
 
 		it("rejects atomically when the issuer's own overlay cannot backfill", async () => {

@@ -1,6 +1,6 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult } from '@quereus/quereus';
 import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, serializeRowKey, logicalTypeCanHoldText } from '@quereus/quereus';
-import type { KeyNormalizerResolver } from '@quereus/quereus';
+import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
 import { mergeStreams, createMergeEntry, createTombstone } from './merge-iterator.js';
@@ -1488,19 +1488,23 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		this.isolationModule.clearConnectionOverlay(this.db, this.schemaName, this.tableName);
 	}
 
-	async createIndex(indexInfo: IndexSchema): Promise<void> {
-		await this.underlyingTable.createIndex?.(indexInfo);
-		// Update schema reference
+	/**
+	 * Index DDL delegates to the module rather than driving the underlying and the overlay
+	 * directly. The module owns the full protocol — validating against the issuing
+	 * connection's effective rows, then REBUILDING every affected overlay under the new
+	 * schema — and a bare `underlying.createIndex()` + `overlay.createIndex()` pair silently
+	 * skips both halves. The engine only ever reaches the module-level hook, so these
+	 * instance methods exist for a module that wraps `IsolationModule` in turn; routing them
+	 * through the module keeps that path on the same protocol.
+	 */
+	async createIndex(indexInfo: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
+		await this.isolationModule.createIndex(this.db, this.schemaName, this.tableName, indexInfo, rows);
 		this.tableSchema = this.underlyingTable.tableSchema;
-		// If overlay exists, add index to it too
-		await this.overlayTable?.createIndex?.(indexInfo);
 	}
 
 	async dropIndex(indexName: string): Promise<void> {
-		await this.underlyingTable.dropIndex?.(indexName);
-		// Update schema reference
+		await this.isolationModule.dropIndex(this.db, this.schemaName, this.tableName, indexName);
 		this.tableSchema = this.underlyingTable.tableSchema;
-		await this.overlayTable?.dropIndex?.(indexName);
 	}
 
 	// ==================== Internal Helpers ====================

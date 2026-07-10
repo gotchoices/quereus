@@ -214,6 +214,17 @@ by the altered column (`indexEnforcesUnique` — the index's own `unique` flag, 
 the auto-built covering structure for a declared UNIQUE constraint). The probe index is built
 under the *new* per-column collations, so it compares exactly as the rebuilt structure will.
 
+When the table is wrapped by a module that stages the transaction's writes *outside* this
+manager — the isolation layer, whose per-connection overlay this manager cannot see — those
+writes never reach `pendingTransactionLayer`, so the manager's own effective rows degenerate to
+the committed base. The wrapper therefore supplies the rows to judge through the optional
+`EffectiveRowSource` parameter on `createIndex` / `alterTable`, and every validation site above
+prefers it over `effectiveDdlRows()`. See [module-authoring.md](module-authoring.md) § "When the
+pending rows live outside your module". One check deliberately ignores it:
+`validateRekeyedPrimaryKey` asserts that no *layer of this manager's own chain* holds a PK
+collision under the new comparator, which is a property of the structures it is about to re-key,
+not of the wrapper's merged rows.
+
 **2. The rule is enforced for the remainder of that transaction, and after it commits.** A
 `TransactionLayer` freezes its schema at construction, so a layer created before the DDL would
 otherwise carry neither the new `IndexSchema` (an index scan raises "Secondary index not found")

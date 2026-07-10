@@ -547,6 +547,57 @@ row before returning or acting on it. See [memory-table.md](memory-table.md) § 
 transactions for the full statement of the boundary and what a fully-cooperating module would
 do instead.
 
+#### When the pending rows live outside your module: `EffectiveRowSource`
+
+A module cannot always reach the transaction's uncommitted rows. Under the isolation layer
+(`@quereus/isolation`) each connection's writes are staged in a private in-memory *overlay*;
+the wrapped module holds only committed rows and cannot see the overlay at all. Its own
+"effective rows" are therefore the committed rows, and the first obligation above becomes
+impossible to meet unaided.
+
+The optional last parameter of `createIndex` and `alterTable` closes that gap:
+
+```ts
+/** Re-callable; each call returns a fresh stream. */
+export type EffectiveRowSource = () => AsyncIterable<Row>;
+
+createIndex?(db, schemaName, tableName, indexSchema, rows?: EffectiveRowSource): Promise<void>;
+alterTable?(db, schemaName, tableName, change, rows?: EffectiveRowSource): Promise<TableSchema>;
+createIndex?(indexSchema, rows?: EffectiveRowSource): Promise<void>;   // VirtualTable, instance level
+```
+
+**Who supplies it.** Only a wrapper module that holds the issuing connection's pending rows
+outside the target module. The engine's own emitters (`CREATE INDEX`, `ALTER TABLE`) pass
+nothing, so an unwrapped module keeps validating its own effective rows exactly as before. The
+isolation layer supplies its issuing connection's merged view: committed rows, minus the ones
+that connection's overlay tombstones, superseded by the ones it rewrote, plus the ones it
+added. A *foreign* connection's overlay never contributes — its staged duplicates are its own
+problem at commit time, exactly as a concurrent duplicate insert would be.
+
+**What the receiver must do with it.** When `rows` is present it is the ONLY set the module may
+judge row CONTENT against:
+
+*   Every row-content check — UNIQUE duplicate detection, collation-rekey collision detection —
+    reads this stream.
+*   The module MUST NOT reject the DDL over a duplicate that exists only in its own committed
+    data. That duplicate may be a row the issuing transaction has already deleted; rejecting it
+    is a false positive the caller cannot work around.
+*   Physical structures are still built from the module's OWN rows. Building an index over
+    committed rows while validating over the merged view is deliberate and sound: an index entry
+    with no live row behind it is harmless, because every reader resolves an entry back to its
+    live row and drops it when the row is gone. Both bundled modules document this at the build
+    site (`BaseLayer.addIndexToBase`, `StoreModule.buildIndexEntries`).
+*   Validate BEFORE creating any physical artifact, so a rejection leaves nothing behind.
+
+`rows` is re-callable because a single `ALTER` may validate more than once (one pass per UNIQUE
+constraint covering the altered column). Row order is unspecified — every consumer is a
+set-shaped check.
+
+Not covered: a PRIMARY KEY collision introduced by `ALTER COLUMN ... SET COLLATE` on a PK
+member. The wrapper's staged rows are re-keyed inside the wrapper's own overlay and the
+module's inside its own store, so a pending row that collides with a committed one under the
+new collation is checked by neither. Both re-key sites carry a `NOTE:` to that effect.
+
 ### Connection Registration
 
 For modules that need to participate in the database's transaction coordination (e.g., receiving `commit()` and `rollback()` calls when the database commits or rolls back), you must register connections with the database.

@@ -3,7 +3,7 @@ import { StatusCode, type Row } from '../../common/types.js';
 import type { Database } from '../../core/database.js';
 import { type TableSchema, type IndexSchema, IndexColumnSchema } from '../../schema/table.js';
 import { MemoryTable } from './table.js';
-import type { VirtualTableModule, SchemaChangeInfo } from '../module.js';
+import type { VirtualTableModule, SchemaChangeInfo, EffectiveRowSource } from '../module.js';
 import { MemoryTableManager } from './layer/manager.js';
 import type { BackingHost, BackingScanRequest, MaintenanceOp, BackingRowChange } from '../backing-host.js';
 import type { VirtualTableConnection } from '../connection.js';
@@ -927,7 +927,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	/**
 	 * Alters an existing memory table's structure (ADD/DROP/RENAME COLUMN).
 	 */
-	async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo): Promise<TableSchema> {
+	async alterTable(db: Database, schemaName: string, tableName: string, change: SchemaChangeInfo, rows?: EffectiveRowSource): Promise<TableSchema> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const manager = this.tables.get(tableKey);
 
@@ -954,7 +954,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 					StatusCode.UNSUPPORTED,
 				);
 			case 'addConstraint':
-				await manager.addConstraint(change.constraint);
+				await manager.addConstraint(change.constraint, rows);
 				break;
 			case 'dropConstraint':
 				await manager.dropConstraint(change.constraintName);
@@ -969,7 +969,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 					setDataType: change.setDataType,
 					setDefault: change.setDefault,
 					setCollation: change.setCollation,
-				});
+				}, rows);
 				break;
 		}
 
@@ -979,7 +979,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 	/**
 	 * Creates an index on a memory table
 	 */
-	async createIndex(db: Database, schemaName: string, tableName: string, indexSchema: IndexSchema): Promise<void> {
+	async createIndex(db: Database, schemaName: string, tableName: string, indexSchema: IndexSchema, rows?: EffectiveRowSource): Promise<void> {
 		const tableKey = `${schemaName}.${tableName}`.toLowerCase();
 		const manager = this.tables.get(tableKey);
 
@@ -988,7 +988,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		}
 
 		// Delegate to the manager to create the index
-		await manager.createIndex(indexSchema);
+		await manager.createIndex(indexSchema, undefined, rows);
 
 		logger.operation('Create Index', indexSchema.name, {
 			table: tableName,

@@ -1,6 +1,7 @@
-import type { Row, SqlValue, UpdateResult, RowOp, VirtualTable } from '@quereus/quereus';
+import type { SqlValue, UpdateResult, RowOp, VirtualTable } from '@quereus/quereus';
 import { QuereusError, StatusCode, isConstraintViolation } from '@quereus/quereus';
-import { makeFullScanFilterInfo, makePkPointLookupFilter } from './filter-info.js';
+import { makePkPointLookupFilter } from './filter-info.js';
+import { collectOverlayEntries } from './overlay-rows.js';
 
 /**
  * Applies every staged overlay row to the underlying table WITHOUT committing.
@@ -37,15 +38,6 @@ export async function applyOverlayToUnderlying(
 		return;
 	}
 
-	const overlaySchema = overlayTable.tableSchema;
-	if (!overlaySchema) {
-		throw new QuereusError('Overlay table has no schema', StatusCode.INTERNAL);
-	}
-	const tombstoneIndex = overlaySchema.columnIndexMap.get(tombstoneColumn.toLowerCase());
-	if (tombstoneIndex === undefined) {
-		throw new QuereusError(`Tombstone column '${tombstoneColumn}' not found in overlay schema`, StatusCode.INTERNAL);
-	}
-
 	const underlyingSchema = underlyingTable.tableSchema;
 	if (!underlyingSchema) {
 		throw new QuereusError('Underlying table has no schema', StatusCode.INTERNAL);
@@ -54,13 +46,7 @@ export async function applyOverlayToUnderlying(
 	const tableName = underlyingSchema.name;
 
 	// Collect all overlay entries first.
-	const overlayEntries: { isTombstone: boolean; pk: SqlValue[]; dataRow: Row }[] = [];
-	for await (const overlayRow of overlayTable.query(makeFullScanFilterInfo())) {
-		const isTombstone = overlayRow[tombstoneIndex] === 1;
-		const pk = pkIndices.map(i => overlayRow[i]);
-		const dataRow = overlayRow.slice(0, tombstoneIndex);
-		overlayEntries.push({ isTombstone, pk, dataRow });
-	}
+	const overlayEntries = await collectOverlayEntries(overlayTable, tombstoneColumn, pkIndices);
 
 	// Begin the underlying transaction (idempotent for a shared-coordinator store)
 	// before applying — and unconditionally, so the coordinator's applied-table set
