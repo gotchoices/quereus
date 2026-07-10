@@ -11,7 +11,8 @@ import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { Cached } from '../util/cached.js';
-import { isAsyncIterable } from '../runtime/utils.js';
+import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
+import type { VirtualTable } from '../vtab/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
@@ -328,6 +329,13 @@ export class Statement {
 		this.validateParameterTypes();
 
 		this.busy = true;
+		// Per-execution cache of connected inner-scan vtab instances (see
+		// runtime/emit/scan.ts). Declared out here so the teardown `finally` can
+		// disconnect every instance exactly once on all exit paths (normal completion,
+		// break, error, abort). `runtimeCtx` is likewise hoisted so `finally` can reach
+		// it after the try body assigns it.
+		const scanConnections = new Map<symbol, VirtualTable>();
+		let runtimeCtx: RuntimeContext | undefined;
 		try {
 			const blockPlanNode = this.compile();
 			if (!blockPlanNode.statements.length) return;
@@ -350,7 +358,7 @@ export class Statement {
 			const tracer = runtimeOverrides?.tracer ?? this.db.getInstructionTracer();
 			const enableMetrics = runtimeOverrides?.enableMetrics ?? Boolean(this.db.getOption('runtime_metrics'));
 			const signal = runtimeOverrides?.signal;
-			const runtimeCtx: RuntimeContext = {
+			runtimeCtx = {
 				db: this.db,
 				stmt: this,
 				params: this.boundArgs,
@@ -359,6 +367,7 @@ export class Statement {
 				tracer,
 				enableMetrics,
 				signal,
+				scanConnections,
 			};
 
 			// Validate captured schema objects once per execution — hoisted out of every
@@ -386,6 +395,18 @@ export class Statement {
 			const message = e instanceof Error ? e.message : String(e);
 			throw new QuereusError(`Execution error: ${message}`, StatusCode.ERROR, e instanceof Error ? e : undefined);
 		} finally {
+			// Disconnect every inner-scan instance connected during this execution,
+			// exactly once. This `finally` runs after the consumer finishes draining
+			// (normal completion, `break`, error, or abort — the async generator's
+			// teardown), so the cached instances stay live for the whole streaming
+			// window and are released here. `runtimeCtx` is undefined only on the
+			// no-statements early return, where the map is empty anyway.
+			if (runtimeCtx) {
+				for (const vtab of scanConnections.values()) {
+					await disconnectVTable(runtimeCtx, vtab);
+				}
+			}
+			scanConnections.clear();
 			this.busy = false;
 		}
 	}

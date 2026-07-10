@@ -55,6 +55,14 @@ export function emitSeqScan(
 	// Capture the module info key for runtime retrieval
 	const moduleKey = `vtab_module:${schema.vtabModuleName}`;
 
+	// Stable per-scan-node key for the per-execution connection cache
+	// (RuntimeContext.scanConnections). Minted once here in the emitter closure, so
+	// it is identical across every re-scan of THIS scan site within one execution
+	// (the instruction tree is cached and reused), yet distinct from every other
+	// scan site — a self-join's two scans over the same table get different keys and
+	// therefore isolated instances. Mirrors the executionMemo symbol pattern.
+	const scanConnectionKey = Symbol(`scan:${plan.nodeType}(${schema.name})`);
+
 	async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
 		// Use the captured module info instead of doing a fresh lookup
 		const capturedModuleInfo = ctx.getCapturedSchemaObject<{ module: AnyVirtualTableModule, auxData?: unknown }>(moduleKey);
@@ -67,29 +75,43 @@ export function emitSeqScan(
 			throw new QuereusError(`Virtual table module '${schema.vtabModuleName}' does not implement connect`, StatusCode.MISUSE);
 		}
 
+		// Reuse a per-execution connected instance when one exists for this scan site
+		// (NLJ inner re-scan). On a cache miss connect once and store it; the teardown
+		// in statement.ts disconnects each cached instance exactly once. When no cache
+		// is present (transient/analysis RuntimeContexts), fall back to owning the
+		// lifecycle: connect here and disconnect in this generator's finally.
+		const connectionCache = runtimeCtx.scanConnections;
+		const cachedInstance = connectionCache?.get(scanConnectionKey);
+		// True only when this invocation must disconnect the instance itself (no cache
+		// to defer teardown to). A reused (cached) instance is never owned here.
+		let ownsInstance = false;
 		let vtabInstance: VirtualTable;
-		try {
-			const options: BaseModuleConfig = {
-				...(schema.vtabArgs ?? {}),
-				...(source.readCommitted ? { _readCommitted: true } : {})
-			};
-			vtabInstance = await module.connect(
-				runtimeCtx.db,
-				capturedModuleInfo.auxData,
-				schema.vtabModuleName,
-				schema.schemaName,
-				schema.name,
-				options
-			);
-		} catch (e: unknown) {
-			const message = e instanceof Error ? e.message : String(e);
-			throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
-		}
+		if (cachedInstance) {
+			vtabInstance = cachedInstance;
+		} else {
+			try {
+				const options: BaseModuleConfig = {
+					...(schema.vtabArgs ?? {}),
+					...(source.readCommitted ? { _readCommitted: true } : {})
+				};
+				vtabInstance = await module.connect(
+					runtimeCtx.db,
+					capturedModuleInfo.auxData,
+					schema.vtabModuleName,
+					schema.schemaName,
+					schema.name,
+					options
+				);
+			} catch (e: unknown) {
+				const message = e instanceof Error ? e.message : String(e);
+				throw new QuereusError(`Module '${schema.vtabModuleName}' connect failed for table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
+			}
 
-		if (typeof vtabInstance.query !== 'function') {
-			// Fallback or error if query is not available. For now, throwing an error.
-			// Later, we could implement the open/filter/next loop here as a fallback.
-			throw new QuereusError(`Virtual table '${schema.name}' does not support query.`, StatusCode.UNSUPPORTED);
+			if (connectionCache) {
+				connectionCache.set(scanConnectionKey, vtabInstance);
+			} else {
+				ownsInstance = true;
+			}
 		}
 
 		const rowSlot = createRowSlot(runtimeCtx, rowDescriptor);
@@ -101,6 +123,13 @@ export function emitSeqScan(
 
 			if (filterInfoOverride) {
 				effectiveFilterInfo = await filterInfoOverride(effectiveFilterInfo, runtimeCtx, dynamicArgs);
+			}
+
+			if (typeof vtabInstance.query !== 'function') {
+				// Fallback or error if query is not available. For now, throwing an error.
+				// Later, we could implement the open/filter/next loop here as a fallback.
+				// Checked inside the try so an owned (un-cached) instance still disconnects.
+				throw new QuereusError(`Virtual table '${schema.name}' does not support query.`, StatusCode.UNSUPPORTED);
 			}
 
 			const asyncRowIterable = vtabInstance.query(effectiveFilterInfo);
@@ -122,9 +151,14 @@ export function emitSeqScan(
 			const message = e instanceof Error ? e.message : String(e);
 			throw new QuereusError(`Error during query on table '${schema.name}': ${message}`, e instanceof QuereusError ? e.code : StatusCode.ERROR, e instanceof Error ? e : undefined);
 		} finally {
+			// The row slot is per-invocation and must close on every pass.
 			rowSlot.close();
-			// Properly disconnect the VirtualTable instance
-			await disconnectVTable(runtimeCtx, vtabInstance);
+			// Disconnect only when this invocation owns the instance (no per-execution
+			// cache to defer teardown to). A cached instance stays live across re-scans
+			// and is released once at statement teardown, not here.
+			if (ownsInstance) {
+				await disconnectVTable(runtimeCtx, vtabInstance);
+			}
 		}
 	}
 

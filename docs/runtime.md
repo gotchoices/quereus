@@ -1397,6 +1397,43 @@ run-once fence cannot rescue (views compose, the cache lives at one emission
 site, and a downstream consumer would observe stale state). The check is
 permanent, not pending.
 
+### Inner-scan connection reuse
+
+A nested-loop join whose inner (right) side is **not** wrapped in a cache node
+re-scans the inner relation once per outer row (`runtime/emit/join.ts`
+`driveFromLeft`). Each re-scan re-invokes the inner sub-program, including its
+scan leaf (`emitSeqScan`, `runtime/emit/scan.ts`). Rather than
+`module.connect(...)` + `disconnect(...)` the inner virtual table on every
+re-scan (one connect/disconnect per outer row), the scan leaf connects the
+instance **once per scan-site per execution** and reuses it across every
+re-scan:
+
+- The connected instances live in a per-execution cache on the
+  `RuntimeContext` (`ctx.scanConnections`, a `Map<symbol, VirtualTable>`),
+  keyed by a stable symbol minted in each `emitSeqScan` closure — so the key is
+  identical across re-scans of one scan site but distinct from every other
+  site. A self-join's two scan sites over one table therefore get **distinct**
+  instances and never share a cursor (its single consumer drains each inner
+  cursor sequentially before the next outer row, so one instance is never
+  concurrently self-live).
+- The scan leaf no longer disconnects in its `finally` (it still closes the
+  per-invocation row slot each pass). Teardown happens once, in
+  `Statement._iterateRowsRawInternal`'s `finally`, which disconnects every
+  cached instance exactly once on all exit paths (completion, `break`, error,
+  abort) after the consumer finishes draining.
+- The cache lives on the per-execution `RuntimeContext`, so it resets between
+  prepared-statement runs — a re-executed statement reconnects afresh.
+- **Fallback:** the transient/analysis `RuntimeContext`s that don't set
+  `scanConnections` (e.g. `Database._executeSingleStatement`, const-evaluation)
+  make the scan leaf own the lifecycle: connect and disconnect per invocation,
+  as before. Correct, just no reuse.
+
+Reuse is visibility-neutral for the memory vtab, which reads live-at-`query()`
+state (a reused instance's later `query()` observes the same state a fresh
+connect would). The read scan connects `module.connect` directly and never
+registers a `VirtualTableConnection`, so this is independent of the
+`adoptConnection` / connection-registration path.
+
 ## Query Optimizer Integration
 
 The Quereus optimizer transforms logical plan nodes into physical execution plans between the builder and runtime phases. This section covers the key aspects relevant to runtime emitter development.
@@ -1477,6 +1514,8 @@ Three invariants govern what code may do with a `RuntimeContext` once it has bee
 | `enableMetrics` | `shared-frozen` | Boolean flag. |
 | `contextTracker` | `shared-sink` | Diagnostics sink. |
 | `planStack` | `shared-sink` | Tracing-only stack. |
+| `executionMemo` | `shared-cooperative` | Once-per-execution impure-subquery memo; shared so the run-once contract spans branches. |
+| `scanConnections` | `shared-cooperative` | Once-per-execution inner-scan connection cache; shared so statement teardown disconnects every branch's instances exactly once. |
 
 Adding a new field to `RuntimeContext` requires adding it to `EXPECTED_FORK_POLICY` in `fork-contract.spec.ts` with a declared policy — the test fails compile otherwise.
 

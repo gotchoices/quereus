@@ -52,6 +52,10 @@ const EXPECTED_FORK_POLICY = {
 	// run-once contract spans branches (matching the pre-cache single-closure memo).
 	// Mutation across branches is the impure-subquery contract's responsibility.
 	executionMemo: 'shared-cooperative',
+	// Once-per-execution inner-scan connection cache: shared by reference so the
+	// statement teardown disconnects every instance connected across branches exactly
+	// once. Mutation across branches is the scan lifecycle's responsibility.
+	scanConnections: 'shared-cooperative',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
@@ -183,6 +187,7 @@ describe('Fork contract (test harness)', () => {
 			parent.planStack = [];
 			parent.signal = new AbortController().signal;
 			parent.executionMemo = new Map();
+			parent.scanConnections = new Map();
 
 			const [fork] = driver.fork(parent, 1);
 

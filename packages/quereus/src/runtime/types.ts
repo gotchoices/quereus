@@ -4,6 +4,7 @@ import type { Statement } from "../core/statement.js";
 import type { RowDescriptor, TableDescriptor, TableGetter } from "../planner/nodes/plan-node.js";
 import type { Scheduler } from "./scheduler.js";
 import type { VirtualTableConnection } from "../vtab/connection.js";
+import type { VirtualTable } from "../vtab/table.js";
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { RowContextMap } from './context-helpers.js';
 
@@ -55,6 +56,23 @@ export type RuntimeContext = {
 	 * statement re-drives its inner DML, rather than replaying the first run's result.
 	 */
 	executionMemo?: Map<symbol, { value: SqlValue }>;
+	/**
+	 * Per-execution cache of connected inner-scan virtual-table instances, keyed by
+	 * a stable per-scan-node symbol minted in the {@link emitSeqScan} closure. A
+	 * nested-loop join re-scans its (un-cached) inner relation once per outer row;
+	 * without this, each re-scan would `module.connect(...)` + `disconnect(...)` the
+	 * inner table afresh. The scan connects once per scan-site per execution, reuses
+	 * the instance across every re-scan, and statement teardown disconnects each
+	 * cached instance exactly once (see core/statement.ts `_iterateRowsRawInternal`).
+	 *
+	 * Keyed by scan-node identity (not table name) so a self-join's two scan sites
+	 * over one table get distinct instances and never share a cursor — the re-scans
+	 * of one site are sequential (the NLJ drains each inner cursor before the next
+	 * outer row), so a single instance is never concurrently self-live. Absent on the
+	 * transient/analysis RuntimeContexts that don't set it — the scan then falls back
+	 * to connect-and-disconnect per invocation (correct, just no reuse).
+	 */
+	scanConnections?: Map<symbol, VirtualTable>;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;

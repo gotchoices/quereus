@@ -65,6 +65,13 @@ export class ParallelDriver {
 	 *   memo must be eagerly created on the parent *before* fork() — otherwise each
 	 *   branch lazily makes its own and the inner DML fires once per branch. Dormant
 	 *   today: ParallelDriver has no query consumers.)
+	 *   (`scanConnections` is the once-per-execution inner-scan connection cache; shared
+	 *   by reference so the statement teardown disconnects every instance connected
+	 *   across branches exactly once. NOTE: two forks scanning the SAME scan node would
+	 *   share one cached vtab instance and thus issue concurrent `query()` calls on it —
+	 *   only safe for a module whose `concurrencyMode` permits it. Dormant today:
+	 *   ParallelDriver has no query consumers, and the sequential NLJ re-scan this cache
+	 *   was built for is never concurrently self-live.)
 	 *
 	 * The parent is treated as immutable for the lifetime of the forks.
 	 */
@@ -101,6 +108,7 @@ export class ParallelDriver {
 				contextTracker: rctx.contextTracker,
 				planStack: rctx.planStack,
 				executionMemo: rctx.executionMemo,
+				scanConnections: rctx.scanConnections,
 			};
 			if (strict) {
 				markForkOf(childTableContexts, rctx.tableContexts);
