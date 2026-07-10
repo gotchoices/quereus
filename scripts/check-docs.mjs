@@ -468,7 +468,7 @@ function readBudget() {
 	if (!existsSync(BUDGET_PATH)) {
 		throw new Error(`missing ${repoPath(BUDGET_PATH)} — the size ratchet has no data`);
 	}
-	return JSON.parse(readFileSync(BUDGET_PATH, 'utf8'));
+	return JSON.parse(readText(BUDGET_PATH));
 }
 
 function measureDocs() {
@@ -552,6 +552,12 @@ function updateRatchet(force) {
 // The one legal banner form. Anchored, and deliberately not forgiving: a banner one character
 // off is a banner that gets copy-pasted wrong forever. The dash is an em dash (U+2014), matching
 // the `code:` / `guard:` line style of the invariant register.
+//
+// NOTE: the link target is the literal `stability.md#tiers`, which only resolves from a doc
+// sitting directly in `docs/`. Every doc does today (`docs/images/` holds no markdown). The
+// first `docs/<subdir>/x.md` that wants a tier will need `../stability.md#tiers`, which this
+// regex rejects — accept both forms then, rather than letting Check A resolve the link the
+// banner check has already forced to be wrong.
 const BANNER = /^>\s+\*\*Stability:\s+(\w+)\*\*\s+—\s+see \[Stability Tiers\]\(stability\.md#tiers\)\.$/;
 
 // Anything a reader would call a banner. Matching this but not BANNER is a malformed banner,
@@ -565,7 +571,7 @@ function parseBanner(line) {
 }
 
 /** Every banner in `content`, fences already stripped, with 1-based line numbers. */
-function banners(strippedContent, fail, doc) {
+function banners(strippedContent, doc, fail) {
 	const found = [];
 	strippedContent.split('\n').forEach((line, index) => {
 		const parsed = parseBanner(line);
@@ -613,11 +619,28 @@ function definedTiers(content) {
 	return tiers;
 }
 
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * `docs/.stability.json`, shape-checked. Read through `readText` like every other file: a BOM
+ * or a CRLF line ending in a hand-edited JSON file must not turn into an opaque `JSON.parse`
+ * error. (JSON forbids a raw newline inside a string, so normalizing them is a no-op on values.)
+ *
+ * The shape guard buys a message instead of a `TypeError` stack when a key goes missing — this
+ * file is hand-edited, and deleting the last `untiered` doc is an easy way to delete the array.
+ */
 function readStability() {
 	if (!existsSync(STABILITY_PATH)) {
 		throw new Error(`missing ${repoPath(STABILITY_PATH)} — the stability map has no data`);
 	}
-	return JSON.parse(readFileSync(STABILITY_PATH, 'utf8'));
+	const stability = JSON.parse(readText(STABILITY_PATH));
+	const shape = [['tiers', Array.isArray], ['untiered', Array.isArray], ['docs', isObject]];
+	for (const [key, wellShaped] of shape) {
+		if (!wellShaped(stability[key])) {
+			throw new Error(`${repoPath(STABILITY_PATH)}: '${key}' is missing or is not ${key === 'docs' ? 'an object' : 'an array'}`);
+		}
+	}
+	return stability;
 }
 
 /** Rule 1: the two sources of tier names must agree as a set, so a rename fails loudly. */
@@ -699,7 +722,7 @@ function checkStability(fail) {
 		// Fences first: `doc-conventions.md` and `stability.md` both show the banner form as an
 		// illustration. Without this, `stability.md` fails rule 4 against its own example.
 		const content = stripFences(readText(resolve(ROOT, doc)));
-		const found = banners(content, fail, doc);
+		const found = banners(content, doc, fail);
 
 		if (untiered.has(doc)) {
 			// Rule 4. Untiered docs never take the "missing banner" branch — the whole file is scanned,
@@ -772,6 +795,56 @@ function selfTest(fail) {
 	const window = headerWindow(`# Doc\n\n${banner}\n\n## Section\n\n${banner}\n`.split('\n'));
 	if (!window.has(3) || window.has(7)) fail(`scripts/check-docs.mjs: the header window no longer ends at the first subsequent heading`);
 	if (headerWindow(['no h1 here']) !== null) fail(`scripts/check-docs.mjs: headerWindow must report a missing H1 as null`);
+
+	stabilitySelfTest(fail);
+}
+
+/** Run something that reports through a `fail` callback; return the messages it produced, in order. */
+function collectFailures(run) {
+	const messages = [];
+	run((message) => messages.push(message));
+	return messages;
+}
+
+function expectFailures(actual, expected, what, fail) {
+	const matches = actual.length === expected.length && expected.every((needle, i) => actual[i].includes(needle));
+	if (!matches) fail(`scripts/check-docs.mjs: ${what}: expected failures matching ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+}
+
+/**
+ * Check D's rules, against injected inputs rather than the real `docs/` tree. `checkClassification`
+ * and `checkTieredDoc` already take everything they need as arguments, so `checkStability` is the
+ * only part of the check that touches the filesystem — and the only part left uncovered.
+ */
+function stabilitySelfTest(fail) {
+	// Only `###` under `## Tiers` is a tier: not a deeper heading, and not one under a later `##`.
+	const tiersDoc = ['# Stability Tiers', '## What a tier measures', '### Not a tier', '## Tiers', '### Stable', '#### Not a tier either', '### Beta', '## Assignment', '### Nor this'].join('\n');
+	const defined = definedTiers(tiersDoc);
+	if (defined.join(',') !== 'Stable,Beta') fail(`scripts/check-docs.mjs: definedTiers read '${defined.join(',')}' from a doc defining Stable and Beta`);
+
+	expectFailures(
+		collectFailures((f) => checkClassification(
+			{ docs: { 'docs/a.md': 'Stable', 'docs/both.md': 'Beta', 'docs/gone.md': 'Beta' }, untiered: ['docs/b.md', 'docs/both.md', 'docs/review.md'] },
+			new Set(['docs/a.md', 'docs/b.md', 'docs/both.md', 'docs/new.md']),
+			f,
+		)),
+		[`'docs/both.md' is classified twice`, `entry 'docs/gone.md' names a file that does not exist`, `entry 'docs/review.md' is a frozen review artifact`, `docs/new.md: not classified`],
+		'checkClassification',
+		fail,
+	);
+
+	const vocabulary = new Set(['Stable', 'Beta']);
+	const header = new Set([2, 3]);
+	const at = (tier, line) => ({ tier, line });
+	const tiered = (found, window) => collectFailures((f) => checkTieredDoc('docs/d.md', 'Beta', found, window, vocabulary, f));
+
+	expectFailures(tiered([], null), [`has no '#' heading`], 'a tiered doc with no H1', fail);
+	expectFailures(tiered([], header), [`carries no stability banner under its H1`], 'a tiered doc with no header banner', fail);
+	expectFailures(tiered([at('Beta', 2), at('Beta', 3)], header), [`a second stability banner in the header window`], 'a doc declaring its tier twice', fail);
+	expectFailures(tiered([at('Stable', 2)], header), [`banner says 'Stable' but docs/.stability.json records 'Beta'`], 'a banner disagreeing with the map', fail);
+	expectFailures(tiered([at('Beta', 2), at('Nonsense', 9)], header), [`section banner names tier 'Nonsense'`], 'a section banner naming an undefined tier', fail);
+	// A section banner disagreeing with the doc's tier is the whole point of a section banner.
+	expectFailures(tiered([at('Beta', 2), at('Stable', 9)], header), [], 'a well-formed section override', fail);
 }
 
 // ---------------------------------------------------------------------------

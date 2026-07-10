@@ -1,8 +1,9 @@
 # Documentation Conventions
 
-How to write and maintain the design docs under `docs/`. Two mechanical gates back this
-document: `yarn docs:check` (`scripts/check-docs.mjs`) fails the build on a broken link and
-on a doc that has grown past its recorded size.
+How to write and maintain the design docs under `docs/`. `yarn docs:check`
+(`scripts/check-docs.mjs`) mechanically backs this document: it fails the build on a broken
+link or dead anchor, on a malformed invariant block, on a doc that has grown past its
+recorded size, and on a doc whose stability tier is unclassified or misdeclared.
 
 The problem this exists to prevent: two docs reached 38,000 and 28,500 words. At that size
 nobody re-reads a doc against the code, so it drifts, and a doc that has drifted is worse
