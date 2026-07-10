@@ -102,14 +102,20 @@ function resolvePkDefaultConflict(schema: TableSchema): ConflictResolution | und
 /**
  * Resolve the per-column KEY collation for each primary-key column.
  *
- * The store encodes PRIMARY KEY uniqueness/ordering PHYSICALLY in the key bytes,
- * so each text PK column's key must be encoded under that column's declared
- * collation. Returns one entry per PK member, in `pkDef` order:
- *   - text member → its declared `collation` (normalized upper-case), or
+ * The store encodes PRIMARY KEY uniqueness/ordering PHYSICALLY in the key bytes, so each
+ * text-capable PK column's key must be encoded under the collation the engine actually
+ * COMPARES that column under. Returns one entry per PK member, in `pkDef` order:
+ *   - `isTextual` member (`text`) → its declared `collation` (normalized upper-case), or
  *     `fallback` (the table key collation K) when the column carries none.
- *   - non-text member → `undefined`: collation is meaningless for
+ *   - text-capable but not `isTextual` member — `any`, `json`, and the temporal types
+ *     (`date` / `time` / `datetime` / `timespan`) → hard-coded `'BINARY'`, see below.
+ *   - never-text member → `undefined`: collation is meaningless for
  *     integer/real/blob keys (they encode type-natively), so the encoder ignores
  *     it and the data/index key bytes are identical regardless.
+ *
+ * Note that `undefined` does NOT mean "encode type-natively" to `encodeValue` — it means
+ * "fall back to `options.collation`", the table key collation K. Only a never-text column
+ * may be left `undefined`, because only it never reaches the collation branch.
  *
  * Every name returned here is encoded through the key-normalizer resolver carried
  * in `EncodeOptions.normalizers` (`db.getKeyNormalizerResolver()`), so a collation
@@ -128,18 +134,16 @@ export function resolvePkKeyCollations(
 ): (string | undefined)[] {
 	return pkDef.map(def => {
 		const col = columns[def.index];
-		// NOTE: `isTextual`, not {@link columnCanHoldText} — deliberate, and lossy. A JSON
-		// or ANY PK column can hold text but cannot declare a collation
-		// (`JSON_TYPE.supportedCollations` is empty), so `reconcilePkCollations` leaves it
-		// alone and the engine compares it under BINARY — yet `undefined` here makes
-		// `encodeKey` key it under the TABLE collation K (default NOCASE), not BINARY. Key
-		// bytes therefore already diverge from the enforced comparison for such a column:
-		// `'A'` and `'a'` are distinct BINARY values that collide at one NOCASE key. Tracked
-		// by `fix/bug-store-any-json-pk-keyed-under-table-collation`; until it lands,
-		// {@link pkOrderPreservingPrefixLength} declines every range seek and PK-order
-		// advertisement on such a member (it tests K against the column's BINARY comparison
-		// collation and finds them unequal).
-		if (!col || !col.logicalType.isTextual) return undefined;
+		if (!col || !columnCanHoldText(col)) return undefined;
+		// A text-capable-but-not-`isTextual` type supplies its own `compare`, and every one of
+		// them (ANY_TYPE, JSON_TYPE, the temporal types) DISCARDS the collation argument
+		// `createTypedComparator` hands it, comparing under BINARY_COLLATION unconditionally.
+		// TEXT_TYPE supplies no `compare` at all, so text alone reaches the collation-honoring
+		// `compareSqlValuesFast`. Keying these members under the column's declared collation
+		// (which `validateCollationForType` accepts for ANY, since its `supportedCollations` is
+		// undefined) or under K would enforce uniqueness under a collation nothing compares
+		// under: `'A'` and `'a'` are distinct BINARY values that collide at one NOCASE key.
+		if (!col.logicalType.isTextual) return 'BINARY';
 		return (col.collation || fallback).toUpperCase();
 	});
 }
@@ -201,12 +205,10 @@ export function keyOrderMatchesCollation(
  * declared collation's comparator order, per {@link keyOrderMatchesCollation}.
  *
  * `pkKeyCollations` is {@link resolvePkKeyCollations}' output for this table; an `undefined`
- * entry means the encoder falls back to the table key collation `tableKeyCollation`
- * (see `encodeKey`), so that is the key collation to test. The comparison collation is the
- * column's declared one — which `reconcilePkCollations` has already aligned with the key
- * collation for every *textual* PK member, so the mismatch clause only bites on a
- * text-capable-but-not-textual member (`any`, `json`), whose bytes are normalized under the
- * table key collation while the engine compares it under BINARY.
+ * entry belongs to a never-text member, which {@link keyOrderMatchesCollation} exempts
+ * outright — `tableKeyCollation` is passed only so the exempt branch has a name to ignore.
+ * The comparison collation is the column's declared one, which `reconcilePkCollations` has
+ * already aligned with the key collation for every *textual* PK member.
  *
  * `0` ⇒ even the leading member is unsafe: no range seek, no PK-order advertisement.
  * A prefix shorter than the PK truncates the ordering advertisement rather than voiding it.
@@ -222,6 +224,13 @@ export function pkOrderPreservingPrefixLength(
 	while (n < pk.length) {
 		const col = schema.columns[pk[n].index];
 		const keyCollation = pkKeyCollations[n] ?? tableKeyCollation;
+		// NOTE: an explicit `k any collate nocase` PK declines its seek here — the key
+		// collation is BINARY (what ANY_TYPE.compare actually uses) while `col.collation` is
+		// the declared-but-ignored NOCASE, so the two sides differ and the gate closes. Both
+		// sides genuinely compare under BINARY, so the decline is conservative: it costs the
+		// seek, never a row. If that declaration ever shows up in practice, resolve the
+		// comparison collation the way `resolvePkKeyCollations` resolves the key collation
+		// rather than widening the gate.
 		if (!keyOrderMatchesCollation(db, col, keyCollation, col?.collation ?? 'BINARY')) break;
 		n++;
 	}
@@ -394,9 +403,7 @@ export class StoreTable extends VirtualTable {
 	 * Checked over exactly the collations the key encoding actually uses:
 	 *   - every defined `pkKeyCollations` entry (text-capable PK columns);
 	 *   - the table key collation K, but only when it is reachable — a secondary index
-	 *     encodes a TEXT-CAPABLE index column's bytes under K (`buildIndexKey`), and a PK
-	 *     member that {@link resolvePkKeyCollations} left `undefined` yet whose declared
-	 *     type can still hold a string (ANY / JSON) falls back to K inside `encodeValue`.
+	 *     encodes a TEXT-CAPABLE index column's bytes under K (`buildIndexKey`).
 	 *
 	 * So neither a table with an integer PK and no secondary index, nor one whose every
 	 * index column is type-natively keyed, is made unopenable by a K it never encodes with.
@@ -416,9 +423,7 @@ export class StoreTable extends VirtualTable {
 		}
 		const indexKeysText = (schema.indexes ?? []).some(index =>
 			index.columns.some(col => columnCanHoldText(schema.columns[col.index])));
-		const pkFallsBackToTableKeyCollation = schema.primaryKeyDefinition.some((def, i) =>
-			pkKeyCollations[i] === undefined && columnCanHoldText(schema.columns[def.index]));
-		if (indexKeysText || pkFallsBackToTableKeyCollation) {
+		if (indexKeysText) {
 			names.add((this.encodeOptions.collation ?? 'NOCASE').toUpperCase());
 		}
 

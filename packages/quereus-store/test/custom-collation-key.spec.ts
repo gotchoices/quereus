@@ -287,13 +287,17 @@ describe('Store key bytes under a database-registered collation', () => {
 		await comparatorOnly.close();
 	});
 
-	it('rejects an ANY-typed PK column when the table key collation K cannot key', async () => {
-		// `resolvePkKeyCollations` leaves an ANY/JSON member `undefined` (no `isTextual`
-		// marker), so `encodeValue` falls back to K for it — K must therefore be keyable.
+	it('leaves an ANY-typed PK column unaffected by a table key collation K that cannot key', async () => {
+		// `resolvePkKeyCollations` keys an ANY/JSON member under hard-coded BINARY, never K,
+		// because `ANY_TYPE.compare` ignores whatever collation it is handed. So a
+		// comparator-only K is never encoded with, and the two BINARY-distinct rows both land.
 		db.registerCollation('NOCASE', noSpace);
-		const err = await attempt(db, `create table t (k any primary key, v text) using store`);
-		expect(err, 'expected CREATE TABLE to reject the unusable K behind an ANY PK').to.not.be.null;
-		expect(err!.message).to.match(/cannot key a persisted structure/i);
+		expect(await attempt(db, `create table t (k any primary key, v text) using store`)).to.be.null;
+		await db.exec(`insert into t values ('A', 'upper'), ('a', 'lower')`);
+
+		expect((await db.get(`select count(*) as cnt from t`))?.cnt).to.equal(2);
+		expect((await db.get(`select v from t where k = 'A'`))?.v).to.equal('upper');
+		expect((await db.get(`select v from t where k = 'a'`))?.v).to.equal('lower');
 	});
 
 	it('keeps BINARY and NOCASE key bytes byte-identical to the retired encoders', () => {

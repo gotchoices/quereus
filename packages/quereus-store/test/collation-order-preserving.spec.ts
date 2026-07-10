@@ -226,25 +226,29 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 			expect(await planOps(db, q)).to.match(SEEK);
 		});
 
-		it('declines the PK RANGE seek on an `any` PK, whose bytes key under K but compare under BINARY', async () => {
-			// `resolvePkKeyCollations` leaves an ANY member undefined (it carries no `isTextual`
-			// marker), so its key bytes fall back to K = NOCASE while the engine compares it
-			// under BINARY. 'B' (0x42) < 'aa' (0x61…) by BINARY, but keys as 'b' (0x62) > 'aa'.
+		it('keeps the PK RANGE seek on an `any` PK, whose bytes now key under BINARY', async () => {
+			// `resolvePkKeyCollations` keys an ANY member under hard-coded BINARY — the collation
+			// `ANY_TYPE.compare` actually uses — rather than falling back to K = NOCASE. Key
+			// bytes and comparison agree, so the byte window is sound: 'B' (0x42) < 'aa' (0x61…)
+			// both ways. The encoder's type tags also order NULL < NUMERIC < TEXT < BLOB < OBJECT,
+			// matching the engine's storage-class order.
 			await db.exec(`create table t (k any primary key, v text) using store`);
 			await db.exec(`insert into t values ('aa', 'one'), ('B', 'two')`);
 
 			const q = `select v from t where k > 'B'`;
 			expect(await column(db, q, 'v')).to.deep.equal(['one']);
-			expect(await planOps(db, q), 'the PK seek must be declined').to.not.match(SEEK);
+			expect(await planOps(db, q), 'the PK seek must be kept').to.match(SEEK);
 		});
 
 		it('truncates — rather than voids — the PK-order advertisement when a LATER member is unsafe', async () => {
-			// PK (id integer, v any): `id` passes the predicate (non-text key bytes), `v` fails
-			// (keyed under K = NOCASE, compared under BINARY). The advertisement must shrink to
-			// the leading member, not vanish: `order by id` keeps its elided Sort, `order by
-			// id, v` gets one back, and the leading-column range seek survives.
+			// PK (id integer, v text collate nocase) under the order-inverting NOCASE: `id`
+			// passes the predicate (non-text key bytes), `v` fails (its normalizer preserves
+			// equality but not order). The advertisement must shrink to the leading member, not
+			// vanish: `order by id` keeps its elided Sort, `order by id, v` gets one back, and
+			// the leading-column range seek survives.
+			db.registerCollation('NOCASE', lengthFirst, { normalizer: lower });
 			const ddl = (t: string, using: string) =>
-				`create table ${t} (id integer, v any, w text, primary key (id, v)) ${using}`;
+				`create table ${t} (id integer, v text collate nocase, w text, primary key (id, v)) ${using}`;
 			await db.exec(ddl('t', 'using store'));
 			await db.exec(ddl('m', ''));
 			for (const t of ['t', 'm']) {
@@ -255,8 +259,8 @@ describe('Store range seeks and PK-order advertisements under a non-order-preser
 				.to.not.match(/sort/i);
 			expect(await column(db, `select id from t order by id`, 'id')).to.deep.equal([1, 1, 2]);
 
-			// Within id = 1 the store emits byte order ('aa' keys as 'aa', 'B' as 'b'), while
-			// BINARY orders 'B' (0x42) before 'aa' (0x61…). The Sort must survive to fix that.
+			// Within id = 1 the store emits byte order ('aa' keys as 'aa', 'B' as 'b'), while the
+			// comparator puts the shorter 'B' first. The Sort must survive to fix that.
 			expect(await planOps(db, `select v from t order by id, v`), 'the unsafe member needs its Sort')
 				.to.match(/sort/i);
 			expect(await column(db, `select v from t order by id, v`, 'v'))

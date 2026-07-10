@@ -368,9 +368,25 @@ protocol here.
 encoders). So **any** declared PK collation is honored natively: `x text collate binary
 primary key` is keyed under BINARY, `collate nocase` under NOCASE, etc., reaching parity
 with the memory module. The table-level key collation K (`config.collation`, one of
-`BINARY` / `NOCASE`, default `NOCASE`) is now only a **default** for an undecorated text
-PK column, plus the collation used for secondary-index *column* values. The schema entry
-points:
+`BINARY` / `NOCASE`, default `NOCASE`) is only a **default** for an undecorated PK column
+whose logical type is `isTextual` (i.e. `text`), plus the collation used for
+secondary-index *column* values. The schema entry points:
+
+- **A PK column that can hold text but is not `isTextual`** — `any`, `json`, and the
+  temporal types `date` / `time` / `datetime` / `timespan` — is keyed under **hard-coded
+  `BINARY`**, never under its declared collation and never under K. Each of these logical
+  types supplies its own `compare`, and every one of them ignores the collation argument
+  `createTypedComparator` hands it, comparing under `BINARY_COLLATION` unconditionally;
+  `TEXT_TYPE` supplies no `compare` and so is the only one that reaches the
+  collation-honoring `compareSqlValuesFast`. Keying such a column under anything but BINARY
+  would enforce uniqueness under one collation and compare under another — `'A'` and `'a'`
+  are distinct BINARY values that would collide at one NOCASE key, so a second `insert`
+  would be spuriously rejected and an `insert or replace` would silently destroy the first
+  row. `create table t (k any collate nocase primary key)` is *accepted* (`ANY_TYPE` declares
+  no `supportedCollations`), but the `nocase` is inert: it is honored neither in the key bytes
+  nor in the comparison. Its one cost is that `pkOrderPreservingPrefixLength` compares the
+  BINARY key collation against the declared NOCASE, finds them unequal, and conservatively
+  declines the range seek — an optimization lost, never a row.
 
 - **CREATE.** `module.create` applies the store default K to an *implicit*-default text PK
   column (e.g. the engine's BINARY column default becomes NOCASE under K = NOCASE), so an
@@ -410,6 +426,14 @@ points:
   under BINARY but colliding under NOCASE) throws `CONSTRAINT` in the validation pass
   **without mutating the store** — all-or-nothing, mirroring `ALTER PRIMARY KEY`. A target
   equal to the column's current collation is a schema-only no-op (no re-key).
+
+**No migration for pre-BINARY-keyed non-textual PKs.** The store carries no on-disk format
+version stamp, and pinning `any` / `json` / temporal PK columns to BINARY changed their
+physical key bytes wherever K was not already `BINARY` (K defaults to `NOCASE`). A persisted
+store written *before* that change, containing a primary key of type `any`, `json`, `date`,
+`time`, `datetime`, or `timespan`, is **not supported**: reopening it looks for rows under key
+bytes that were never written. Such a store must be recreated. There is deliberately no
+rebuild-on-open path.
 
 See [`docs/sql.md` § ALTER COLUMN](sql.md#27-alter-table-statement) for the
 full SET COLLATE contract, including the non-PK UNIQUE re-validation. Physical key bytes
