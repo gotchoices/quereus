@@ -134,6 +134,23 @@ export class MemoryTable extends VirtualTable {
 		this.connection = memoryConnection;
 	}
 
+	/**
+	 * Adopts an already-registered connection offered by the runtime, reusing it instead of
+	 * opening a fresh one. Rejects connections created by another module (instanceof guard)
+	 * and connections whose manager no longer matches this instance (a stale connection from
+	 * a dropped-then-recreated table). Ownership stays with the registry; safe to call twice.
+	 */
+	adoptConnection(connection: VirtualTableConnection): void {
+		if (!(connection instanceof MemoryVirtualTableConnection)) return;
+		const existingMemConn = connection.getMemoryConnection();
+		if (existingMemConn.tableManager === this.manager) {
+			this.setConnection(existingMemConn);
+			logger.debugLog(`Adopted existing connection into VirtualTable for table ${this.tableName}`);
+		} else {
+			logger.debugLog(`Skipped stale connection adoption for table ${this.tableName} (manager mismatch)`);
+		}
+	}
+
 	/** Creates a new VirtualTableConnection for transaction support */
 	createConnection(): VirtualTableConnection {
 		const memoryConnection = this.manager.connect();

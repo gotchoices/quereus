@@ -5,8 +5,6 @@ import type { VirtualTable } from '../vtab/table.js';
 import type { RuntimeContext } from './types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import { createLogger } from '../common/logger.js';
-import type { MemoryVirtualTableConnection } from '../vtab/memory/connection.js';
-import type { MemoryTable } from '../vtab/memory/table.js';
 import type { RowDescriptor, Attribute } from '../planner/nodes/plan-node.js';
 
 const log = createLogger('runtime:utils');
@@ -132,23 +130,16 @@ export async function getVTable(ctx: RuntimeContext, tableSchema: TableSchema): 
 	// Pass the full tableSchema to connect() so modules can use the primaryKeyDefinition
 	const vtabInstance = await module.connect(ctx.db, moduleInfo.auxData, tableSchema.vtabModuleName, tableSchema.schemaName, tableSchema.name, vtabArgs, tableSchema);
 
-	// If we have an active connection for this table, inject it into the VirtualTable
-	// Only inject if the connection's manager matches the new table's manager
-	// (a stale connection from a dropped-then-recreated table must not be reused)
+	// If a connection for this table is already registered, offer it to the fresh instance
+	// via the module-neutral adoptConnection hook. The module owns the accept/reject
+	// decision (subtype + backing-state match); the runtime knows nothing about any module.
 	const qualifiedName = `${tableSchema.schemaName}.${tableSchema.name}`;
 	const existingConnections = ctx.db.getConnectionsForTable(qualifiedName);
-	if (existingConnections.length > 0 && tableSchema.vtabModuleName === 'memory') {
-		const memoryConnection = existingConnections[0] as MemoryVirtualTableConnection;
-		const memoryTable = vtabInstance as MemoryTable;
-		if (memoryConnection.getMemoryConnection && memoryTable.setConnection) {
-			const existingMemConn = memoryConnection.getMemoryConnection();
-			if (existingMemConn.tableManager === memoryTable.manager) {
-				memoryTable.setConnection(existingMemConn);
-				log(`Injected existing connection into VirtualTable for table ${qualifiedName}`);
-			} else {
-				log(`Skipped stale connection injection for table ${qualifiedName} (manager mismatch)`);
-			}
-		}
+	if (existingConnections.length > 0) {
+		// NOTE: getVTable adopts existingConnections[0]; if covering-connection semantics ever
+		// matter here (cf. isCovering in connection.ts / DeferredConstraintQueue), prefer the
+		// covering connection.
+		await vtabInstance.adoptConnection?.(existingConnections[0]);
 	}
 
 	return vtabInstance;

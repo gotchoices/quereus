@@ -162,6 +162,24 @@ export abstract class VirtualTable {
 	getConnection?(): VirtualTableConnection | undefined;
 
 	/**
+	 * (Optional) Offered an existing, already-registered connection for this table so the
+	 * instance can reuse it instead of opening its own. The runtime calls this on a freshly
+	 * connected instance when a connection for the same qualified table name is already
+	 * registered; it passes the registered VirtualTableConnection and ignores the result.
+	 *
+	 * The module decides whether to adopt: it should downcast to its own connection type,
+	 * reject connections it did not create (instanceof / brand check) and connections whose
+	 * backing state no longer matches this instance (e.g. a stale connection from a
+	 * dropped-then-recreated table), and silently do nothing when it declines.
+	 *
+	 * Ownership is NOT transferred: the adopted connection remains owned by the database
+	 * connection registry that registered it. Adopting it must not make this instance
+	 * responsible for closing it beyond the module's existing disconnect contract. The hook
+	 * must be safe to call more than once on the same instance.
+	 */
+	adoptConnection?(connection: VirtualTableConnection): MaybePromise<void>;
+
+	/**
 	 * Begins a transaction on this virtual table
 	 */
 	begin?(): Promise<void>;

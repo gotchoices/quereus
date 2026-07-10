@@ -717,6 +717,29 @@ private async ensureConnection(): Promise<MyConnection> {
 }
 ```
 
+**Adopting a runtime-offered connection (`adoptConnection`):**
+
+The reuse pattern above is *pull*: your `ensureConnection` looks the registry up when it happens to run. The runtime also *pushes* — when it materializes a fresh `VirtualTable` instance for a table that already has a registered connection, it offers that connection to the instance via the optional `adoptConnection` hook on `VirtualTable`, so the new instance reuses the in-flight connection (and its uncommitted transaction state) instead of opening a rival one:
+
+```typescript
+adoptConnection(connection: VirtualTableConnection): void {
+  // Reject connections another module registered under the same qualified name.
+  if (!(connection instanceof MyConnection)) return;
+  // Reject a stale connection whose backing state no longer matches this instance
+  // (e.g. a dropped-then-recreated table); adopt only when the state matches.
+  if (connection.backingStore !== this.store) return;
+  this.connection = connection;
+}
+```
+
+Contract:
+
+- **The module owns the accept/reject decision.** The runtime knows nothing about your connection type — it hands you the registered `VirtualTableConnection` and ignores the return value. Downcast with `instanceof` (or a brand check) and reject connections you did not create, plus connections whose backing state no longer matches this instance. Silently do nothing when you decline.
+- **Ownership is not transferred.** The adopted connection stays owned by the database connection registry that registered it. Adopting it must not make this instance responsible for closing it beyond your module's existing `disconnect` contract.
+- **It must be idempotent.** Calling `adoptConnection` more than once on the same instance must be safe (re-setting the same connection).
+
+Implement the hook when a table's uncommitted state lives on the connection and a second instance of the same table within one statement must see it. Modules whose per-instance state is self-contained can omit it — a module without the hook behaves exactly as before (the runtime's optional-chain call is a no-op).
+
 **When to use connection registration:**
 
 - Your module maintains state that must be committed or rolled back with transactions
