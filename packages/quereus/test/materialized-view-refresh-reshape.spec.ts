@@ -229,11 +229,10 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 				// (the divergence the OLD mid-loop throw left behind).
 				expect(reshaped.columns.map(c => c.name)).to.deep.equal(['id', 'v', 'w']);
 				// The deferred retype applied to the schema (v narrowed to INTEGER). NOTE:
-				// `set data type` is a metadata-only logical-type change in this engine — it
-				// validates convertibility but does not rewrite the stored representation, so
-				// the value rides as the body produced it (the source `t.v` is likewise the
-				// text '5' under its INTEGER logical type). The point is it reconciled the
-				// FRESH body, not the discarded 'abc'.
+				// `set data type` physically converts the stored value to the new logical type
+				// (source `t.v` itself is likewise a genuine integer 5, not text '5', after its
+				// own `set data type`). The point here is it reconciled the FRESH body, not the
+				// discarded 'abc'.
 				expect(reshaped.columns[1].logicalType.name.toUpperCase(), 'v retyped to INTEGER').to.equal('INTEGER');
 				// read(MV) == evaluate(body): the maintained snapshot matches a fresh body
 				// eval (so the value is the re-derived '5', never the stale 'abc').

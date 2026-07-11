@@ -389,10 +389,12 @@ describe('Maintained-table refresh re-validation', () => {
 		// declared logical type, and runs while the catalog column still carries the OLD type
 		// (the `retype` op applies AFTER this commit). So a CHECK whose truth FLIPS under the
 		// affinity change passes validation, commits, and is then retyped into a violating
-		// state. This engine's `set data type` is **metadata-only** — it validates
-		// convertibility but does NOT rewrite the stored value — so the flip is driven by the
-		// column's affinity, not by any value rewrite (a physical convert would scrub the value
-		// at scan time and close the corner). Commit-first ordering and attach-path parity
+		// state. `set data type` DOES physically rewrite the stored value (same PK, converted
+		// value written in place) — but the retype-during-reshape is a raw backing rewrite, not
+		// a revalidating write, so the CHECK is never re-run against the converted value. The
+		// corner is therefore NOT closed by the physical rewrite: only the stored representation
+		// changes (`typeof(v)` now tracks the new type); the violation itself still survives.
+		// Commit-first ordering and attach-path parity
 		// block a clean fix, exactly as for the recollate sibling. See docs/materialized-views.md
 		// § REFRESH MATERIALIZED VIEW "Known limitation — type-sensitive CHECK on the reshape arm".
 
@@ -431,16 +433,16 @@ describe('Maintained-table refresh re-validation', () => {
 			// the behavior we would want if the limitation were closed.)
 			await db.exec('refresh materialized view mt');
 			expect(vType('mt'), 'v retyped to INTEGER ⇒ reshape arm + retype ran').to.equal('INTEGER');
-			// Metadata-only retype: the stored value is NOT rewritten (typeof stays 'text'). This is
-			// the crux that makes the flip affinity-driven rather than value-driven — a physical
-			// convert would scrub '10' at scan time and the scan would catch it (the corner would
-			// close itself). Pinned so that regression is visible here.
+			// The retype physically rewrites the stored value ('10' text -> 10 integer). This is
+			// NOT the crux, though: the retype-during-reshape only rewrites the value in place —
+			// it does not re-run the CHECK, so the corner stays open despite the value now
+			// being genuinely converted. Pinned so that regression is visible here.
 			expect(await readAll(`select v, typeof(v) as t from mt`),
-				'value rides as the body produced it; only the column logical type flipped')
-				.to.deep.equal([{ v: '10', t: 'text' }]);
+				'the retype physically converted the value; the CHECK was not re-run against it')
+				.to.deep.equal([{ v: 10, t: 'integer' }]);
 			expect(await readAll('select id, v from mt order by id'),
 				'limitation: the row that violates the CHECK under the FINAL INTEGER affinity survives')
-				.to.deep.equal([{ id: 1, v: '10' }]);
+				.to.deep.equal([{ id: 1, v: 10 }]);
 			// Re-evaluated under the final INTEGER column, the committed row violates its own CHECK.
 			expect(await readAll(`select (v < '9') as lt from mt`),
 				'limitation: v < 9 is now numeric-false on the committed row')
@@ -482,14 +484,14 @@ describe('Maintained-table refresh re-validation', () => {
 			await db.exec(`alter table src alter column v set data type integer`);
 			await db.exec('refresh materialized view mt');
 			expect(await readAll('select id, v from mt order by id'), 'limitation row committed')
-				.to.deep.equal([{ id: 1, v: '10' }]);
+				.to.deep.equal([{ id: 1, v: 10 }]);
 
 			// A value-identical source touch produces NO derived-row delta, so the maintenance
 			// manager suppresses the backing op and runs no row-time validation — the frozen
 			// violator is left exactly as-is (not corrected, not re-rejected).
 			await db.exec(`update src set v = v where id = 1`);
 			expect(await readAll('select id, v from mt order by id'), 'no-delta touch leaves it frozen')
-				.to.deep.equal([{ id: 1, v: '10' }]);
+				.to.deep.equal([{ id: 1, v: 10 }]);
 
 			// A GENUINE delta that re-derives an offending value (distinct from 10 so a real
 			// derived-row change is produced, but 11 < '9' is still false under INTEGER) runs
@@ -499,14 +501,14 @@ describe('Maintained-table refresh re-validation', () => {
 				`row derived into maintained table 'main.mt'`);
 			// …and the rejected write rolls back, leaving the already-committed row unchanged.
 			expect(await readAll('select id, v from mt order by id'), 'rejected update rolls back; row frozen')
-				.to.deep.equal([{ id: 1, v: '10' }]);
+				.to.deep.equal([{ id: 1, v: 10 }]);
 
 			// A brand-new source row deriving an offending value is likewise rejected under
 			// INTEGER (the row-time validator, not the pre-retype bulk scan, sees it).
 			await expectError(`insert into src values (2, 20)`,
 				`row derived into maintained table 'main.mt'`);
 			expect(await readAll('select id, v from mt order by id'), 'fresh offending row rejected; original frozen')
-				.to.deep.equal([{ id: 1, v: '10' }]);
+				.to.deep.equal([{ id: 1, v: 10 }]);
 		});
 	});
 

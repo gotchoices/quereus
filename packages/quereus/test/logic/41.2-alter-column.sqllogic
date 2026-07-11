@@ -93,3 +93,39 @@ alter table t_pk alter column id drop not null;
 -- error: PRIMARY KEY
 
 drop table t_pk;
+
+-- ===================================
+-- 7. SET DATA TYPE text -> integer converts existing rows in place
+-- (values must be physically rewritten, not left as text, and an
+-- index on the column must find rows by the new numeric value)
+-- ===================================
+
+create table t_conv (id integer primary key, v text);
+create index t_conv_v on t_conv (v);
+insert into t_conv values (1, '10'), (2, '9');
+alter table t_conv alter column v set data type integer;
+
+select id, v, typeof(v) from t_conv order by id;
+→ [{"id": 1, "v": 10, "typeof(v)": "integer"}, {"id": 2, "v": 9, "typeof(v)": "integer"}]
+
+select id from t_conv where v = 9;
+→ [{"id": 2}]
+
+drop table t_conv;
+
+-- ===================================
+-- 8. SET NOT NULL backfills existing NULL rows from the column default
+-- (no NULL may survive in the column after the ALTER succeeds)
+-- ===================================
+
+create table t_backfill (id integer primary key, v integer null default 7);
+insert into t_backfill values (1, null), (2, null), (3, 5);
+alter table t_backfill alter column v set not null;
+
+select id, v from t_backfill order by id;
+→ [{"id": 1, "v": 7}, {"id": 2, "v": 7}, {"id": 3, "v": 5}]
+
+select count(*) as n from t_backfill where v is null;
+→ [{"n": 0}]
+
+drop table t_backfill;

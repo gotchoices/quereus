@@ -2024,6 +2024,10 @@ export class MemoryTableManager {
 			// A collation change re-keys any PK / UNIQUE / index that orders by this
 			// column, so it needs the structure re-sort + uniqueness re-validation below.
 			let collationChanged = false;
+			// Set when SET DATA TYPE conversion or SET NOT NULL backfill physically rewrites
+			// stored row values (same PK, new value) — secondary indexes must be rebuilt so
+			// index-backed lookups see the new values, not the ones they were built from.
+			let valuesRewritten = false;
 
 			if (change.setCollation !== undefined) {
 				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
@@ -2068,10 +2072,11 @@ export class MemoryTableManager {
 						// Backfill NULLs with the default literal.
 						for (const row of nullRows) {
 							const newRow: Row = row.map((v, i) => i === colIndex ? defaultLiteral! : v) as Row;
-							// replace in-place: same PK, mutate row array. BTree keys by PK extraction,
-							// so overwriting the value at the same key is sufficient.
-							tree.insert(newRow);
+							// replace in-place: same PK, new value. `insert` no-ops on an existing key,
+							// so this must be `upsert`, which overwrites the entry in place.
+							tree.upsert(newRow);
 						}
+						valuesRewritten = true;
 					}
 
 					newCol = { ...oldCol, notNull: true };
@@ -2112,7 +2117,9 @@ export class MemoryTableManager {
 							);
 						}
 						const newRow: Row = row.map((v, i) => i === colIndex ? newVal : v) as Row;
-						tree.insert(newRow);
+						// `insert` no-ops on an existing key; `upsert` overwrites the entry in place.
+						tree.upsert(newRow);
+						valuesRewritten = true;
 					}
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				}
@@ -2184,6 +2191,11 @@ export class MemoryTableManager {
 					basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
 					this.baseLayer.rebuildPrimaryTreeStrict();
 				}
+			} else if (valuesRewritten) {
+				// SET DATA TYPE conversion / SET NOT NULL backfill wrote new column values in
+				// place, so any secondary index on this column still holds keys extracted from
+				// the OLD values until rebuilt.
+				this.baseLayer.rebuildAllSecondaryIndexes();
 			}
 
 			this.tableSchema = finalNewTableSchema;
