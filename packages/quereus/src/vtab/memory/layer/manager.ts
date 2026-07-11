@@ -2024,10 +2024,15 @@ export class MemoryTableManager {
 			// A collation change re-keys any PK / UNIQUE / index that orders by this
 			// column, so it needs the structure re-sort + uniqueness re-validation below.
 			let collationChanged = false;
-			// Set when SET DATA TYPE conversion or SET NOT NULL backfill physically rewrites
-			// stored row values (same PK, new value) — secondary indexes must be rebuilt so
-			// index-backed lookups see the new values, not the ones they were built from.
+			// Set when SET NOT NULL backfill physically rewrites stored row values in place (same
+			// PK, new value) — secondary indexes must be rebuilt so index-backed lookups see the
+			// new values, not the ones they were built from. (SET DATA TYPE takes the separate
+			// `typeConvert` path below, which REPLACES the base tree rather than mutating it.)
 			let valuesRewritten = false;
+			// Set to the value-conversion function when SET DATA TYPE physically retypes the
+			// column. Drives both the base-tree replacement and the transaction-layer conversion
+			// after `updateSchema` (see the rebuild section and convertColumnOnOpenLayers).
+			let typeConvert: ((v: SqlValue) => SqlValue) | null = null;
 
 			if (change.setCollation !== undefined) {
 				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
@@ -2097,34 +2102,54 @@ export class MemoryTableManager {
 				if (newLogicalType.physicalType === oldCol.logicalType.physicalType) {
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				} else {
-					// Physical conversion required. Convert EVERY row up front — a conversion
-					// failure must throw before any row is written, or a partial rewrite would
-					// survive the catch below (which only restores the primary tree on the
-					// collation-rekey path, not here) and leave rows physically converted under
-					// the reverted old-type schema.
-					const tree = this.baseLayer.primaryTree;
-					const convertedRows: Row[] = [];
-					for (const path of tree.ascending(tree.first())) {
-						const row = tree.at(path)!;
-						const oldVal = row[colIndex];
-						if (oldVal === null) continue;
-						let newVal: SqlValue;
+					// Retyping a PRIMARY KEY column changes the physical key bytes. The in-place
+					// base rewrite below cannot re-key the primary tree (an upsert of a row whose
+					// PK value changed physical type lands at a NEW key, orphaning the old entry),
+					// and the transaction-layer conversion deliberately leaves every layer's primary
+					// tree keyed as-is. Reject rather than corrupt it — the type-change analogue of
+					// the SET COLLATE primary-key carve-out (`alter-collate-pk-in-transaction`).
+					if (this.tableSchema.primaryKeyDefinition.some(def => def.index === colIndex)) {
+						throw new QuereusError(
+							`Cannot change the data type of primary key column '${change.columnName}' of table '${this._tableName}'.`,
+							StatusCode.CONSTRAINT,
+						);
+					}
+
+					const convert = (v: SqlValue): SqlValue => {
 						try {
-							newVal = validateAndParse(oldVal, newLogicalType, change.columnName) as SqlValue;
+							return validateAndParse(v, newLogicalType, change.columnName) as SqlValue;
 						} catch {
 							throw new QuereusError(
 								`Cannot convert value in '${change.columnName}' to ${change.setDataType}`,
 								StatusCode.MISMATCH,
 							);
 						}
-						convertedRows.push(row.map((v, i) => i === colIndex ? newVal : v) as Row);
+					};
+
+					// Validate BEFORE any mutation, over the DDL transaction's EFFECTIVE rows
+					// (committed rows overlaid with this transaction's own pending writes): an
+					// unconvertible value the transaction can SEE rejects the ALTER, and one only in
+					// a row it has DELETED does not block it. A throw here leaves the schema, the base
+					// and the transaction untouched. `rows` is the wrapper-supplied effective set (the
+					// isolation overlay); when absent, `effectiveDdlRows()` is the layered view.
+					if (rows) {
+						for await (const row of rows()) {
+							const val = row[colIndex];
+							if (val !== null) convert(val as SqlValue);
+						}
+					} else {
+						for (const row of this.effectiveDdlRows()) {
+							const val = row[colIndex];
+							if (val !== null) convert(val as SqlValue);
+						}
 					}
-					// All conversions succeeded — now mutate. `insert` no-ops on an existing key;
-					// `upsert` overwrites the entry in place (same PK, new value).
-					for (const newRow of convertedRows) {
-						tree.upsert(newRow);
-					}
-					if (convertedRows.length > 0) valuesRewritten = true;
+
+					// The base rows are converted below, AFTER `updateSchema`, by REPLACING the base
+					// primary tree with a fresh one (see the `typeConvert` branch) — never by an
+					// in-place mutation, which inheritree forbids while the open transaction's layers
+					// derive from that tree (`MutatedBaseError`). `typeConvert` drives both the base
+					// replacement and the transaction-layer conversion.
+					typeConvert = convert;
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				}
 			} else if (change.setDefault !== undefined) {
@@ -2195,10 +2220,24 @@ export class MemoryTableManager {
 					basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
 					this.baseLayer.rebuildPrimaryTreeStrict();
 				}
+			} else if (typeConvert) {
+				// SET DATA TYPE: convert the committed base rows and REPLACE the primary tree with a
+				// fresh one holding them (not an in-place upsert — inheritree forbids mutating a base
+				// while the open transaction's layers derive from it). `rebuildPrimaryTreeFromRows`
+				// also rebuilds every secondary index from the converted rows. The old tree is saved
+				// for the catch's rollback, exactly as the PK-rekey path does.
+				//
+				// A base value that fails to convert is kept as-is: validation over the effective view
+				// already rejected any unconvertible value the transaction can SEE, so a surviving one
+				// is shadowed by a pending delete/overwrite and is never read back (a ROLLBACK
+				// re-exposes it under the new type — DDL is not undone by rollback, the known behavior
+				// of `feat-ddl-transaction-capability`).
+				const convertedBaseRows = this.convertBaseRows(colIndex, typeConvert);
+				basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
+				this.baseLayer.rebuildPrimaryTreeFromRows(convertedBaseRows);
 			} else if (valuesRewritten) {
-				// SET DATA TYPE conversion / SET NOT NULL backfill wrote new column values in
-				// place, so any secondary index on this column still holds keys extracted from
-				// the OLD values until rebuilt.
+				// SET NOT NULL backfill wrote new column values in place, so any secondary index on
+				// this column still holds keys extracted from the OLD values until rebuilt.
 				// NOTE: rebuilds EVERY secondary index, not only those covering the altered
 				// column; if a wide-index table ever shows this as slow, filter to indexes whose
 				// columns include colIndex. Mirrors the collationChanged path's unconditional rebuild.
@@ -2221,6 +2260,12 @@ export class MemoryTableManager {
 			// definition). Outside a transaction there are no open layers and both are no-ops.
 			if (collationChanged) {
 				this.adoptSchemaOnOpenLayers(finalNewTableSchema, pkColumnRekeyed);
+			} else if (typeConvert) {
+				// SET DATA TYPE converted the base above; the DDL transaction's own open layers
+				// still froze the old schema and hold their own-written rows under the old physical
+				// type. Swap the schema and convert those values so the rest of the transaction —
+				// and the committed head at commit — read the new type. No-op in autocommit.
+				this.convertColumnOnOpenLayers(finalNewTableSchema, colIndex, typeConvert);
 			}
 
 			this.eventEmitter?.emitSchemaChange?.({
@@ -2896,6 +2941,35 @@ export class MemoryTableManager {
 	}
 
 	/**
+	 * The committed base rows for `alter column … set data type`, with the value at `colIndex`
+	 * run through `convert`. NULLs pass through untouched. A value that fails to convert is kept
+	 * as-is: the manager validated every value in the effective VIEW before calling, so a base
+	 * value that fails here is one a pending delete/overwrite shadows and no reader can see. The
+	 * result is a fresh full row list for {@link BaseLayer.rebuildPrimaryTreeFromRows} — the base
+	 * primary tree is REPLACED, never mutated in place (inheritree forbids mutating a tree the
+	 * open transaction's layers derive from).
+	 */
+	private convertBaseRows(colIndex: number, convert: (v: SqlValue) => SqlValue): Row[] {
+		const out: Row[] = [];
+		for (const row of iteratePrimaryRows(this.baseLayer.primaryTree)) {
+			const oldVal = row[colIndex];
+			if (oldVal === null) {
+				out.push(row);
+				continue;
+			}
+			let newVal: SqlValue;
+			try {
+				newVal = convert(oldVal as SqlValue);
+			} catch {
+				out.push(row); // shadowed unconvertible value — keep as-is
+				continue;
+			}
+			out.push(row.map((v, i) => i === colIndex ? newVal : v) as Row);
+		}
+		return out;
+	}
+
+	/**
 	 * Rejects an index/constraint whose uniqueness the DDL transaction's own effective rows
 	 * already violate, BEFORE anything is mutated. Builds a throwaway {@link MemoryIndex} —
 	 * the collation-aware, partial-predicate-aware key comparator — over those rows and lets
@@ -3078,25 +3152,53 @@ export class MemoryTableManager {
 	 * primary key column.
 	 */
 	private adoptSchemaOnOpenLayers(newSchema: TableSchema, rekeyPrimary = false): void {
+		for (const layer of this.openTransactionLayersOldestFirst()) {
+			if (rekeyPrimary) layer.rekeyPrimaryKey(newSchema);
+			else layer.adoptSchema(newSchema);
+		}
+	}
+
+	/**
+	 * Converts the retyped column's own-written values in every open transaction layer, after
+	 * `alter column … set data type` has converted the base. Runs oldest-first so each layer's
+	 * copy-on-write base inherits its parent's already-converted rows and only the layer's OWN
+	 * writes are rewritten (see {@link TransactionLayer.convertColumn}). No-op in autocommit.
+	 *
+	 * PRIMARY-KEY columns never reach here — a physical retype of a key column is rejected before
+	 * any mutation — so the primary tree's keys are stable and no re-key is needed.
+	 */
+	private convertColumnOnOpenLayers(newSchema: TableSchema, colIndex: number, convert: (v: SqlValue) => SqlValue): void {
+		for (const layer of this.openTransactionLayersOldestFirst()) {
+			layer.convertColumn(colIndex, convert, newSchema);
+		}
+	}
+
+	/**
+	 * The DDL connection's open {@link TransactionLayer}s, oldest-first, base excluded — its
+	 * pending layer and every savepoint snapshot below it, the layers on the view's parent chain
+	 * above the base. Empty in autocommit (no connection, or the view IS the base).
+	 *
+	 * Both schema adoption ({@link adoptSchemaOnOpenLayers}) and value conversion
+	 * ({@link convertColumnOnOpenLayers}) MUST apply oldest-first: each layer rebuilds its
+	 * structures over its parent's, so the parent's must already be the new/converted ones.
+	 *
+	 * NOTE: the walk takes every TransactionLayer below the view, which normally means the pending
+	 * layer and its savepoint snapshots. A committed layer already drained into the base by
+	 * `ensureSchemaChangeSafety` can also sit in the chain (the pending layer forked from it before
+	 * consolidation); it still shadows the base with its OWN unadapted rows while it remains the
+	 * view's copy-on-write base, so it must be adapted too — it cannot be skipped, since a savepoint
+	 * snapshot is `markCommitted()` as well. Both callers' per-layer work is idempotent and additive.
+	 */
+	private openTransactionLayersOldestFirst(): TransactionLayer[] {
 		const connection = this.ddlConnection();
-		if (!connection) return;
+		if (!connection) return [];
 
 		const view = connection.pendingTransactionLayer ?? connection.readLayer;
 		const chain: TransactionLayer[] = [];
-		// NOTE: the walk takes every TransactionLayer below the view, which normally means the
-		// pending layer and its savepoint snapshots. A committed layer already drained into the
-		// base by `ensureSchemaChangeSafety` can also sit in the chain (the pending layer forked
-		// from it before consolidation); adopting it is a harmless no-op because its rows are
-		// already in the base's new index. That stops being true if `adoptSchema` ever removes
-		// structures or stops being idempotent — it cannot skip committed layers, since a
-		// savepoint snapshot is `markCommitted()` too.
 		for (let cur: Layer | null = view; cur && cur !== this.baseLayer; cur = cur.getParent()) {
 			if (cur instanceof TransactionLayer) chain.push(cur);
 		}
-		for (let i = chain.length - 1; i >= 0; i--) {
-			if (rekeyPrimary) chain[i].rekeyPrimaryKey(newSchema);
-			else chain[i].adoptSchema(newSchema);
-		}
+		return chain.reverse();
 	}
 
 	/** Consolidates all transaction data into the base layer for schema changes */

@@ -991,6 +991,182 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 		});
 	});
 
+	describe('alter column … set data type converts the transaction\'s own rows', () => {
+		/** First column of every row, in query order. */
+		const values = async (sql: string): Promise<SqlValue[]> => {
+			const out: SqlValue[] = [];
+			for await (const row of db.eval(sql)) out.push(Object.values(row)[0]);
+			return out;
+		};
+
+		it('rejects an unconvertible value the transaction inserted, leaving it usable', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'notanumber')`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set data type integer`),
+				StatusCode.MISMATCH,
+				/Cannot convert value/i,
+			);
+
+			// The rejection mutated nothing: the value is still text and the transaction is usable.
+			expect(await scalar(db, `select typeof(v) from t where id = 1`)).to.equal('text');
+			await db.exec(`insert into t values (2, 'x')`);
+			expect(await rowCount(db, 't')).to.equal(2);
+			await db.exec(`rollback`);
+			expect(await rowCount(db, 't')).to.equal(0);
+		});
+
+		it('a pending unconvertible value rejects even when every committed row converts', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, '42')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, 'notanumber')`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set data type integer`),
+				StatusCode.MISMATCH,
+				/Cannot convert value/i,
+			);
+
+			// Nothing was converted — the committed row is still text, before and after rollback.
+			expect(await scalar(db, `select typeof(v) from t where id = 1`)).to.equal('text');
+			await db.exec(`rollback`);
+			expect(await scalar(db, `select typeof(v) from t where id = 1`)).to.equal('text');
+		});
+
+		it('converts committed and pending rows, in the transaction and after commit', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, '42')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, '7')`);
+			await db.exec(`alter table t alter column v set data type integer`);
+
+			// Both the committed and the pending row read back converted inside the transaction.
+			expect(await values(`select typeof(v) from t order by id`)).to.deep.equal(['integer', 'integer']);
+			expect(await values(`select v from t order by id`)).to.deep.equal([42, 7]);
+			await db.exec(`commit`);
+			// …and survive the commit.
+			expect(await values(`select typeof(v) from t order by id`)).to.deep.equal(['integer', 'integer']);
+			expect(await values(`select v from t order by id`)).to.deep.equal([42, 7]);
+		});
+
+		it('accepts the change when the only unconvertible value is in a pending-deleted row', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, 'notanumber'), (2, '5')`);
+			await db.exec(`begin`);
+			await db.exec(`delete from t where id = 1`);
+			// Effective view holds only '5'; the deleted 'notanumber' must not block the change.
+			await db.exec(`alter table t alter column v set data type integer`);
+
+			expect(await values(`select v from t`)).to.deep.equal([5]);
+			expect(await scalar(db, `select typeof(v) from t where id = 2`)).to.equal('integer');
+			await db.exec(`commit`);
+			expect(await values(`select v from t`)).to.deep.equal([5]);
+			expect(await rowCount(db, 't')).to.equal(1);
+		});
+
+		it('coerces a later insert in the same transaction to the new type', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, '1')`);
+			await db.exec(`alter table t alter column v set data type integer`);
+			// The rest of the transaction sees the new type — a text literal is coerced to integer.
+			await db.exec(`insert into t values (2, '2')`);
+
+			expect(await values(`select typeof(v) from t order by id`)).to.deep.equal(['integer', 'integer']);
+			await db.exec(`commit`);
+			expect(await values(`select typeof(v) from t order by id`)).to.deep.equal(['integer', 'integer']);
+		});
+
+		it('a secondary index on the column resolves rows by the converted value after commit', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`create index tv on t (v)`);
+			await db.exec(`insert into t values (1, '10')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, '9')`);
+			await db.exec(`alter table t alter column v set data type integer`);
+
+			// The index finds both the committed and the pending row under their NUMERIC keys —
+			// text '9' would sort after '10', integer 9 before 10.
+			expect(await values(`select id from t where v = 9`)).to.deep.equal([2]);
+			expect(await values(`select id from t where v = 10`)).to.deep.equal([1]);
+			await db.exec(`commit`);
+			expect(await values(`select id from t where v = 9`)).to.deep.equal([2]);
+			expect(await values(`select id from t where v = 10`)).to.deep.equal([1]);
+		});
+
+		it('converts own rows written before AND after a savepoint', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, '1')`);
+			await db.exec(`savepoint s`);
+			await db.exec(`insert into t values (2, '2')`);
+			await db.exec(`alter table t alter column v set data type integer`);
+
+			// Rows sit in two different transaction layers; both are converted oldest-first.
+			expect(await values(`select v from t order by id`)).to.deep.equal([1, 2]);
+			expect(await values(`select typeof(v) from t order by id`)).to.deep.equal(['integer', 'integer']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t order by id`)).to.deep.equal([1, 2]);
+			expect(await values(`select typeof(v) from t order by id`)).to.deep.equal(['integer', 'integer']);
+		});
+
+		it('after rollback the converted committed rows keep the new type (DDL is not undone)', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, '10')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, '20')`);
+			await db.exec(`alter table t alter column v set data type integer`);
+			await db.exec(`rollback`);
+
+			// The pending row is gone; the committed row stays, converted; the type survives —
+			// DDL is not undone by ROLLBACK (see feat-ddl-transaction-capability).
+			expect(await rowCount(db, 't')).to.equal(1);
+			expect(await scalar(db, `select typeof(v) from t where id = 1`)).to.equal('integer');
+			expect(await values(`select v from t`)).to.deep.equal([10]);
+		});
+
+		it('rejects retyping a primary key column inside a transaction', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, 'b')`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column id set data type text`),
+				StatusCode.CONSTRAINT,
+				/primary key column/i,
+			);
+			await db.exec(`rollback`);
+		});
+
+		it('rejects retyping a primary key column in autocommit too', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`insert into t values (1, 'a')`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column id set data type text`),
+				StatusCode.CONSTRAINT,
+				/primary key column/i,
+			);
+			// The table is untouched and usable.
+			expect(await scalar(db, `select typeof(id) from t where id = 1`)).to.equal('integer');
+		});
+
+		it('set default in a transaction is honored by in-transaction and post-commit inserts (verified non-bug)', async () => {
+			await db.exec(`create table t (id integer primary key, v text)`);
+			await db.exec(`begin`);
+			await db.exec(`alter table t alter column v set default 'new'`);
+			await db.exec(`insert into t (id) values (1)`);
+			expect(await scalar(db, `select v from t where id = 1`)).to.equal('new');
+			await db.exec(`commit`);
+			await db.exec(`insert into t (id) values (2)`);
+			expect(await scalar(db, `select v from t where id = 2`)).to.equal('new');
+		});
+	});
+
 	describe('other connections', () => {
 		it('raises BUSY when a sibling connection holds uncommitted writes', async () => {
 			await db.exec(`create table t (id integer primary key, v text)`);

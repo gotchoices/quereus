@@ -200,8 +200,8 @@ await db.exec("alter table users rename column created_at to registration_date")
 ## DDL and transactions
 
 `CREATE INDEX` / `CREATE UNIQUE INDEX` / `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` /
-`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` may run inside an open transaction. Three rules
-define what that means.
+`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` / `ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE`
+may run inside an open transaction. Three rules define what that means.
 
 **1. Row-validating DDL sees exactly what a `SELECT` in the same transaction sees.**
 `MemoryTableManager` validates against the DDL connection's *effective* rows — the committed
@@ -250,6 +250,22 @@ are in use" branch.
 One carve-out remains: `DROP INDEX` / `DROP CONSTRAINT` inside a transaction keep enforcing for
 the rest of it — `adoptSchema` adds and replaces structures, but never removes them; see
 `tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
+
+**`SET DATA TYPE` validates and rewrites values, not just structures.** When the new type has a
+different physical type, `MemoryTableManager.alterColumn` first runs a throw-only conversion pass
+over the effective rows (rule 1): a value the transaction can see that will not convert rejects the
+`ALTER` with `MISMATCH`, and one only in a row it has deleted does not block it. It then converts
+the committed base rows in place and, for the open transaction, hands each layer to
+`TransactionLayer.convertColumn` oldest-first (paralleling `adoptSchema`, but rewriting the stored
+value at the column index rather than re-pointing an index). Like `rekeyPrimaryKey`, `convertColumn`
+collapses the layer's own-write log to its net effect per key, carrying the *converted* value, so the
+commit-time rebase replays converted rows. A base or own-write value that fails to convert here is
+left untouched: the effective-view pass already accepted every value the transaction can read, so an
+unconvertible one is necessarily shadowed by a delete or a later write and is never read back. The
+result matches the store backend, whose `alterColumnSetDataType` flushes buffered writes before the
+physical rewrite. Retyping a **primary-key** column is rejected outright (`CONSTRAINT`): the physical
+key bytes would change, which the in-place base rewrite cannot re-key — the type-change analogue of
+the SET COLLATE primary-key carve-out.
 
 **3. A collation change on a PRIMARY KEY column obeys a stricter rule, because the primary tree
 is a map.** A secondary index is a multi-map and tolerates two primary keys under one index key,

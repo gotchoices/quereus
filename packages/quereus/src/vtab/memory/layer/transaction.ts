@@ -1,7 +1,7 @@
 import { BTree } from 'inheritree';
 import type { TableSchema } from '../../../schema/table.js';
 import { MemoryIndex } from '../index.js';
-import type { Row } from '../../../common/types.js';
+import type { Row, SqlValue } from '../../../common/types.js';
 import type { BTreeKeyForPrimary, BTreeKeyForIndex, MemoryIndexEntry } from '../types.js';
 import type { Layer, PkExtractorsAndComparators } from './interface.js';
 import { createLogger } from '../../../common/logger.js';
@@ -297,6 +297,106 @@ export class TransactionLayer implements Layer {
 		// Every secondary index's key encoding and PK bookkeeping derive from `pkFunctions`,
 		// and each inherits the parent's freshly-rebuilt tree — so all of them are rebuilt,
 		// including ones the altered column does not appear in.
+		this.secondaryIndexes = new Map();
+		this.initializeSecondaryIndexes();
+		for (const index of this.secondaryIndexes.values()) {
+			this.reindexOwnWrites(index);
+		}
+	}
+
+	/**
+	 * Adopts an `alter column … set data type` conversion applied while THIS layer's transaction
+	 * is still open: swaps in the retyped schema and rewrites the CONVERTED value into every
+	 * own-written row at `colIndex`, so the rest of the transaction — and, at commit, the committed
+	 * head — read the new physical value instead of the raw one the transaction wrote.
+	 *
+	 * NON-primary-key column only. `MemoryTableManager.alterColumn` rejects a physical retype of a
+	 * key column before any mutation, so the primary key encoding is unchanged: {@link pkFunctions}
+	 * and the primary tree keep their keys, and only the value at `colIndex` moves. (Contrast
+	 * {@link rekeyPrimaryKey}, which must rebuild the tree because the keys themselves change.)
+	 *
+	 * Like {@link adoptSchema} / {@link rekeyPrimaryKey}, the caller MUST apply this oldest-first
+	 * (base already converted): the layer's copy-on-write base inherits the parent's already-converted
+	 * rows, so only this layer's OWN writes are rewritten here.
+	 *
+	 * `ownWrites` is collapsed to its net per-key effect (as {@link rekeyPrimaryKey} does) so an
+	 * intermediate value a later write overwrote never reaches `convert`, and the rewritten log —
+	 * carrying converted values — is what the rebase (`MemoryTableManager.rebaseLayerOntoHead`) and
+	 * any later `create index` ({@link reindexOwnWrites}) replay.
+	 *
+	 * A value that fails to convert is left as-is (not an error): the manager validated every value
+	 * in the effective VIEW before calling, so an unconvertible own value here is one a higher layer
+	 * has shadowed — it is never read through this layer, and re-converting it would double-fault a
+	 * value the transaction cannot see. It matches the base rewrite's same-reasoned skip.
+	 */
+	public convertColumn(colIndex: number, convert: (v: SqlValue) => SqlValue, newSchema: TableSchema): void {
+		const preTree = this.primaryModifications;
+		this.tableSchemaAtCreation = newSchema;
+
+		// The parent's primary tree has been REPLACED by the conversion (base rebuilt from fresh
+		// rows, or a parent layer already converted oldest-first), so this layer's own tree — which
+		// derived from the OLD one — must be rebuilt over the parent's NEW tree, exactly as
+		// rekeyPrimaryKey does. The PK is unchanged (a key-column retype is rejected upstream), so
+		// pkFunctions and the keys stay; only the value at colIndex moves.
+		const { extractFromRow, compare } = this.pkFunctions;
+		const parentPrimaryTree = this.parentLayer.getModificationTree('primary');
+		const rebuilt = new BTree<BTreeKeyForPrimary, Row>(
+			(value: Row): BTreeKeyForPrimary => extractFromRow(value),
+			compare,
+			{ base: parentPrimaryTree || undefined },
+		);
+
+		// Net per-key effect of this layer's own writes, read out of the pre-conversion tree. The PK
+		// is unchanged, so a key is either finally-deleted or finally-upserted, never both — no key
+		// can collapse onto another (unlike rekeyPrimaryKey).
+		const seen = new Set<string>();
+		const survivingDeletions: BTreeKeyForPrimary[] = [];
+		const upserts: Row[] = [];
+		for (const write of this.ownWrites) {
+			const encoded = this.pkFunctions.encode(write.primaryKey);
+			if (seen.has(encoded)) continue;
+			seen.add(encoded);
+
+			// `get` traverses the inheritance chain, so this is the layer's EFFECTIVE row:
+			// undefined when the layer deleted the key, the layer's own row otherwise.
+			const effectiveRow = preTree.get(write.primaryKey);
+			if (effectiveRow === undefined) {
+				survivingDeletions.push(write.primaryKey);
+				continue;
+			}
+			const oldVal = effectiveRow[colIndex];
+			let newRow = effectiveRow;
+			if (oldVal !== null) {
+				try {
+					const newVal = convert(oldVal);
+					newRow = effectiveRow.map((v, i) => i === colIndex ? newVal : v) as Row;
+				} catch {
+					// Shadowed unconvertible own value — leave as-is (see method doc).
+				}
+			}
+			upserts.push(newRow);
+		}
+
+		for (const primaryKey of survivingDeletions) {
+			const path = rebuilt.find(primaryKey);
+			if (path.on) rebuilt.deleteAt(path);
+		}
+		for (const row of upserts) {
+			rebuilt.upsert(row);
+		}
+		this.primaryModifications = rebuilt;
+
+		this.ownWrites.length = 0;
+		for (const primaryKey of survivingDeletions) {
+			this.ownWrites.push({ type: 'delete', primaryKey });
+		}
+		for (const row of upserts) {
+			this.ownWrites.push({ type: 'upsert', primaryKey: extractFromRow(row), newRow: row });
+		}
+
+		// Any secondary index on the column holds keys extracted from the OLD value. Rebuild every
+		// index over the parent's freshly-converted trees (matching the base's unconditional rebuild),
+		// then re-file this layer's own converted writes.
 		this.secondaryIndexes = new Map();
 		this.initializeSecondaryIndexes();
 		for (const index of this.secondaryIndexes.values()) {
