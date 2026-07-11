@@ -1229,6 +1229,37 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			expect(await rowCount(db, 't')).to.equal(1);
 		});
 
+		it('rejects when a pending UPDATE turns a committed non-null into NULL', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`begin`);
+			// Not an insert or a delete — an in-place overwrite of a committed value to NULL. The
+			// effective view must reflect the pending NULL, not the committed 'a'.
+			await db.exec(`update t set v = null where id = 1`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set not null`),
+				StatusCode.CONSTRAINT,
+				/contains NULL/i,
+			);
+			await db.exec(`rollback`);
+			expect(notNullOf('t', 'v')).to.equal(false);
+		});
+
+		it('accepts when a pending UPDATE clears the only committed NULL', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`begin`);
+			// The committed NULL is overwritten to a value before the tighten — the effective view
+			// holds no NULL, so the ALTER must be accepted.
+			await db.exec(`update t set v = 'a' where id = 1`);
+			await db.exec(`alter table t alter column v set not null`);
+			await db.exec(`commit`);
+
+			expect(notNullOf('t', 'v')).to.equal(true);
+			expect(await values(`select v from t`)).to.deep.equal(['a']);
+		});
+
 		it('backfills a pending NULL from a literal DEFAULT, leaving non-null rows untouched', async () => {
 			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
 			await db.exec(`begin`);

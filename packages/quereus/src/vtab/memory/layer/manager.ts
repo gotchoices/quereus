@@ -2234,6 +2234,9 @@ export class MemoryTableManager {
 				// `rebuildPrimaryTreeFromRows` also rebuilds every secondary index from the converted
 				// rows, so index-backed lookups see the new values. The old tree is saved for the
 				// catch's rollback, exactly as the PK-rekey path does.
+				// NOTE: rebuilds EVERY secondary index, not only those covering the altered column;
+				// if a wide-index table ever shows this as slow, filter to indexes whose columns
+				// include colIndex. Mirrors the collationChanged path's unconditional rebuild.
 				//
 				// SET DATA TYPE: a base value that fails to convert is kept as-is — validation over
 				// the effective view already rejected any unconvertible value the transaction can SEE,
