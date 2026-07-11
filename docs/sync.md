@@ -879,9 +879,9 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 │                                                                            │
 │  CLIENT                                            SERVER                  │
 │    │                                                  │                    │
-│    │─── { type: "handshake", siteId, token?, protocolVersion } ──►│        │
+│    │─── { type: "handshake", …, protocolVersion } ───►│                    │
 │    │                                                  │                    │
-│    │◄── { type: "handshake_ack", serverSiteId, protocolVersion } ─│        │
+│    │◄─ { type: "handshake_ack", …, protocolVersion } ─│                    │
 │    │                                                  │                    │
 │    │──────── { type: "get_changes", sinceHLC? } ─────►│                    │
 │    │                                                  │                    │

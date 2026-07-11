@@ -96,6 +96,20 @@ describe('wire protocol', () => {
     expect(restored).to.deep.equal(h);
   });
 
+  // Boundary values for the fixed-width counter (Uint16) and wallTime (Uint64)
+  // fields — these exercise the packing edges the generic case above misses.
+  const hlcBoundaries: Array<[string, HLC]> = [
+    ['counter 0', hlc(1000, 0)],
+    ['max counter (65535)', hlc(1000, 65535)],
+    ['wallTime 0', hlc(0, 5)],
+    ['large wallTime', hlc(8640000000000, 5)],
+  ];
+  for (const [name, h] of hlcBoundaries) {
+    it(`round-trips an HLC through transport encoding at ${name}`, () => {
+      expect(deserializeHLCFromTransport(serializeHLCForTransport(h))).to.deep.equal(h);
+    });
+  }
+
   // ==========================================================================
   // ChangeSet codec
   // ==========================================================================
