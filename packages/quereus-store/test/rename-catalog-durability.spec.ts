@@ -19,7 +19,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
+import { Database, asyncIterableToArray } from '@quereus/quereus';
 import { StoreModule, InMemoryKVStore, type KVStoreProvider } from '../src/index.js';
 
 /** Persistent in-memory provider: logical close is a no-op, so data survives closeAll(). */
@@ -257,5 +257,45 @@ describe('StoreModule rename catalog durability', () => {
 		// After reopen the FK enforces against parent2 (which holds the row moved into it).
 		expect(await violates(db2, `insert into child values (2, 99)`), 'FK enforced against parent2 after reopen').to.be.true;
 		await db2.exec(`insert into child values (3, 1)`);
+	});
+
+	it('RENAME TABLE re-persists a dependent VIEW body before deleting the renamed table', async () => {
+		// A view body is a *different* dependent kind than the FK case above: the engine's
+		// propagation fires `view_modified`, which the store persists via `saveViewDDL`
+		// (reserved `\x00view\x00` key prefix) — a distinct enqueued function from a table's
+		// `persistCatalogIfChanged`. Both ride the same FIFO `persistQueue`, so the same
+		// ordering invariant must hold: the view's corrective rewrite (naming `parent2`) is
+		// durable BEFORE the old `parent` entry is deleted.
+		const { db, mod } = open();
+		await db.exec(`create table parent (id integer primary key) using store`);
+		await db.exec(`create view v as select id from parent`);
+		// A view entry persists eagerly on create (view_added); a row forces parent's own
+		// (lazy) table entry to disk so there is an old entry to delete during the rename.
+		await db.exec(`insert into parent values (1)`);
+		await mod.whenCatalogPersisted();
+
+		const ops = await traceCatalogOps();
+
+		await db.exec(`alter table parent rename to parent2`);
+		await mod.whenCatalogPersisted();
+
+		const viewPut = ops.findIndex(o => o.op === 'put' && o.key.includes('main.v'));
+		const parentDelete = ops.findIndex(o => o.op === 'delete' && o.key === 'main.parent');
+		expect(viewPut, `view body was re-persisted during the rename (ops: ${JSON.stringify(ops)})`).to.be.greaterThan(-1);
+		expect(parentDelete, 'old parent catalog entry was deleted').to.be.greaterThan(-1);
+		expect(ops[viewPut].ddl, 'view body names parent2').to.match(/parent2/i);
+		// `\bparent\b` matches a bare `parent` token but not `parent2` (the trailing digit is
+		// a word char, so there is no word boundary after the `t`) — robust to DDL quoting.
+		expect(ops[viewPut].ddl, 'view body no longer names the vanished parent').to.not.match(/\bparent\b/i);
+
+		// The ordering invariant: view rewrite durable BEFORE the old parent entry is deleted.
+		expect(viewPut, 'view rewrite persisted before the parent delete').to.be.lessThan(parentDelete);
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen(); // asserts zero rehydration errors — view resolves against parent2
+
+		// After reopen the view reads through parent2 (which holds the row moved into it).
+		const viewRows = await asyncIterableToArray(db2.eval(`select id from v`));
+		expect(viewRows, 'view over renamed table returns the moved row after reopen').to.have.lengthOf(1);
 	});
 });
