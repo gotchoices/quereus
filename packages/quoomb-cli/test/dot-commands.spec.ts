@@ -43,6 +43,15 @@ describe('DotCommands smoke', () => {
 		expect(output).toContain('label');
 	});
 
+	it('dumps all table DDL without the built-in function signatures', async () => {
+		await db.exec('create table qux (id integer primary key, note text)');
+		await dotCommands.showSchema();
+		const output = logSpy.mock.calls.flat().join('\n');
+		expect(output).toContain('qux');
+		// schema() emits a row per built-in function; `.schema` must exclude them.
+		expect(output).not.toContain('FUNCTION');
+	});
+
 	it('imports a CSV file, inferring column types and preserving row values', async () => {
 		const dir = await mkdtemp(join(tmpdir(), 'quoomb-cli-import-'));
 		const csvPath = join(dir, 'people.csv');

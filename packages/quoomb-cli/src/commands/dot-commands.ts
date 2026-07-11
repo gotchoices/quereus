@@ -115,9 +115,12 @@ Examples:
       if (!tableName) {
         // Show all schemas
         const results = [];
+        // schema() also emits a row per built-in function (sql = its signature);
+        // `.schema` is a DDL dump (tables/views/indexes, like sqlite's .schema),
+        // so exclude functions or the output is drowned in FUNCTION lines.
         for await (const row of this.db.eval(`
           SELECT sql FROM schema()
-          WHERE sql IS NOT NULL
+          WHERE sql IS NOT NULL AND type <> 'function'
           ORDER BY name
         `)) {
           results.push(row);
