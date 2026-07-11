@@ -67,6 +67,17 @@ export interface ConnectionOverlayState {
 	overlayTable: VirtualTable;
 	hasChanges: boolean;
 	/**
+	 * The `Database` this overlay was created against — carried so
+	 * {@link IsolationModule.releaseOverlayTable} can free the overlay's staging
+	 * table on ANY discard path, including {@link IsolationModule.destroy} and
+	 * {@link IsolationModule.closeAll}, which sweep overlays across multiple db ids
+	 * and so have no single ambient `db` to hand the overlay module's `destroy`.
+	 * Set at every real creation site (`ensureOverlay`, the two rebuild builders);
+	 * the default `MemoryTableModule` overlay ignores it, but a host-injected
+	 * `config.overlay` keyed per-db needs the overlay's OWN db, not the sweeper's.
+	 */
+	db: Database;
+	/**
 	 * Set by a cross-connection DDL that left this (foreign) overlay unflushable:
 	 * an ALTER that could not migrate it to the post-alter column layout (the overlay
 	 * still holds PRE-alter rows, structurally inconsistent with the now-committed
@@ -358,11 +369,45 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Removes the overlay state for a specific connection and table.
-	 * Called after commit/rollback to clean up.
+	 * Frees the in-memory staging (overlay) table backing `state` by calling the overlay
+	 * module's `destroy`, so its manager entry (and the rows it holds) is removed from the
+	 * overlay module's table registry rather than leaking there for the life of the
+	 * `Database`. This is the single sink every overlay-discard path funnels through —
+	 * without it, `MemoryTableModule.tables` accumulates one dead `_overlay_<table>_<id>`
+	 * entry per writing transaction (and one more per rebuild), unbounded.
+	 *
+	 * `MemoryTableManager.destroy` rolls back the overlay's own pending layer and clears its
+	 * connections; a later db-side teardown of the (now-detached) `MemoryVirtualTableConnection`
+	 * is tolerated by `MemoryTableManager.disconnect` (`!connection` → no-op), so destroying
+	 * here mid-commit/rollback does not throw when the connection is torn down afterwards.
+	 *
+	 * Defensive on a missing schema: real overlays always carry one (`createOverlaySchema`),
+	 * so a schemaless state can only be a malformed/test-fabricated one — skip rather than throw.
 	 */
-	clearConnectionOverlay(db: Database, schemaName: string, tableName: string): void {
+	private async releaseOverlayTable(state: ConnectionOverlayState): Promise<void> {
+		const overlaySchema = state.overlayTable.tableSchema;
+		if (!overlaySchema) return;
+		await this.overlayModule.destroy(
+			state.db,
+			undefined,
+			overlaySchema.vtabModuleName,
+			overlaySchema.schemaName,
+			overlaySchema.name,
+		);
+	}
+
+	/**
+	 * Removes the overlay state for a specific connection and table, first releasing its
+	 * staging table so it does not leak (see {@link releaseOverlayTable}). Async because the
+	 * release drives the overlay module's `destroy`; all callers (`clearOverlay`, `alterSchema`)
+	 * are already async and `await` it. Called on the rollback / alter-schema / rollback-to-
+	 * pre-overlay-savepoint discard paths.
+	 */
+	async clearConnectionOverlay(db: Database, schemaName: string, tableName: string): Promise<void> {
 		const key = this.makeConnectionOverlayKey(db, schemaName, tableName);
+		const state = this.connectionOverlays.get(key);
+		if (!state) return;
+		await this.releaseOverlayTable(state);
 		this.connectionOverlays.delete(key);
 	}
 
@@ -528,10 +573,13 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// IsolatedConnection.commit()s in the loop find no overlay and no-op. Pre-overlay
 		// savepoint sets are cleared per table by each connection's onConnectionCommit
 		// (which also covers a table that has savepoints but never got an overlay).
-		for (const { key } of entries) {
+		for (const { key, state } of entries) {
+			await this.releaseOverlayTable(state);
 			this.connectionOverlays.delete(key);
 		}
 		for (const key of orphanedCleanKeys) {
+			const state = this.connectionOverlays.get(key);
+			if (state) await this.releaseOverlayTable(state);
 			this.connectionOverlays.delete(key);
 		}
 	}
@@ -829,6 +877,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 				survivingKeys.add(key);
 				continue;
 			}
+			// Own overlay, or a foreign CLEAN one — abandoned here, so free its staging table.
+			// A surviving poisoned foreign overlay is intentionally NOT released: it stays
+			// installed and is freed later when its owning connection rolls back (which routes
+			// through clearConnectionOverlay → releaseOverlayTable).
+			await this.releaseOverlayTable(state);
 			this.connectionOverlays.delete(key);
 		}
 		for (const key of this.connectionScopedKeys(this.preOverlaySavepoints, schemaName, tableName)) {
@@ -888,8 +941,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		ddlDescription: string,
 		rebuild: () => Promise<ConnectionOverlayState>,
 	): Promise<void> {
+		let rebuilt: ConnectionOverlayState;
 		try {
-			this.connectionOverlays.set(key, await rebuild());
+			rebuilt = await rebuild();
 		} catch (e) {
 			if (!(e instanceof QuereusError) || e.code !== StatusCode.CONSTRAINT) throw e;
 			if (isIssuer) {
@@ -901,8 +955,16 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					e,
 				);
 			}
+			// Poisoned: the OLD overlay stays installed under `key` (unmigrated, unreleased) so
+			// its owner errors and rolls back — do NOT release it here.
 			oldState.poison = { message: this.buildRebuildPoisonMessage(schemaName, tableName, ddlDescription, e.message) };
+			return;
 		}
+		// Rebuild succeeded: the NEW overlay replaces the OLD one under `key`, so the OLD
+		// staging table is abandoned — free it (leak sink). The builders already freed a
+		// HALF-built new overlay on their own throw path, so nothing is double-released.
+		this.connectionOverlays.set(key, rebuilt);
+		await this.releaseOverlayTable(oldState);
 	}
 
 	/**
@@ -933,6 +995,13 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Also clears connection overlay state.
 	 */
 	async closeAll(): Promise<void> {
+		// Free every overlay's staging table before dropping the map. The default
+		// MemoryTableModule overlay is discarded with this wrapper, but a host-injected
+		// SHARED config.overlay would otherwise retain one dead entry per open overlay —
+		// each state carries its own db so the release targets the right one.
+		for (const state of this.connectionOverlays.values()) {
+			await this.releaseOverlayTable(state);
+		}
 		this.connectionOverlays.clear();
 		this.preOverlaySavepoints.clear();
 		this.underlyingTables.clear();
@@ -1162,14 +1231,23 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		const newOverlaySchema = this.createOverlaySchema(updatedSchema);
 		const newOverlayTable = await this.overlayModule.create(db, newOverlaySchema);
+		const newState: ConnectionOverlayState = { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges, db };
 
-		if (oldState.hasChanges && oldOverlay.query) {
-			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
-				await this.insertIntoRebuiltOverlay(newOverlayTable, oldRow as SqlValue[], updatedSchema.name);
+		try {
+			if (oldState.hasChanges && oldOverlay.query) {
+				for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
+					await this.insertIntoRebuiltOverlay(newOverlayTable, oldRow as SqlValue[], updatedSchema.name);
+				}
 			}
+		} catch (e) {
+			// A mid-copy throw (e.g. a UNIQUE the new index forbids) abandons this freshly
+			// built overlay: adoptRebuiltOverlay keeps the OLD overlay installed on its throw
+			// path and never sees this handle, so free it here or it leaks.
+			await this.releaseOverlayTable(newState);
+			throw e;
 		}
 
-		return { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges };
+		return newState;
 	}
 
 	/**
@@ -1497,26 +1575,35 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		const newOverlaySchema = this.createOverlaySchema(updatedSchema);
 		const newOverlayTable = await this.overlayModule.create(db, newOverlaySchema);
+		const newState: ConnectionOverlayState = { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges, db };
 
-		if (oldState.hasChanges && oldOverlaySchema && oldOverlay.query) {
-			const oldTombstoneIdx = oldOverlaySchema.columnIndexMap.get(this.tombstoneColumn.toLowerCase());
-			if (oldTombstoneIdx === undefined) {
-				throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
+		try {
+			if (oldState.hasChanges && oldOverlaySchema && oldOverlay.query) {
+				const oldTombstoneIdx = oldOverlaySchema.columnIndexMap.get(this.tombstoneColumn.toLowerCase());
+				if (oldTombstoneIdx === undefined) {
+					throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
+				}
+				// `addColumnCtx` (folded literal default, the per-row evaluator, and the new
+				// column's NOT NULL flag) was precomputed once per ALTER by the caller and already
+				// dry-run validated against these same staged rows; undefined for non-addColumn
+				// change types, which append nothing to staged rows.
+				for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
+					const addColumnValue = addColumnCtx
+						? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
+						: undefined;
+					const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue);
+					await this.insertIntoRebuiltOverlay(newOverlayTable, newRow, updatedSchema.name);
+				}
 			}
-			// `addColumnCtx` (folded literal default, the per-row evaluator, and the new
-			// column's NOT NULL flag) was precomputed once per ALTER by the caller and already
-			// dry-run validated against these same staged rows; undefined for non-addColumn
-			// change types, which append nothing to staged rows.
-			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
-				const addColumnValue = addColumnCtx
-					? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
-					: undefined;
-				const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue);
-				await this.insertIntoRebuiltOverlay(newOverlayTable, newRow, updatedSchema.name);
-			}
+		} catch (e) {
+			// Any throw after create abandons this freshly built overlay (adoptRebuiltOverlay
+			// keeps the OLD one installed on its throw path and never holds this handle), so
+			// free it here or it leaks.
+			await this.releaseOverlayTable(newState);
+			throw e;
 		}
 
-		return { overlayTable: newOverlayTable, hasChanges: oldState.hasChanges };
+		return newState;
 	}
 
 	/**

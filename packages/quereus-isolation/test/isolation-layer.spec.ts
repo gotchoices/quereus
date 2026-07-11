@@ -459,7 +459,7 @@ describe('IsolationModule', () => {
 				db, isolatedModule.createOverlaySchema(underlying.tableSchema!));
 			// Overlay rows carry a trailing tombstone column (0 = live).
 			await overlay.update({ operation: 'insert', values: [BIG, 'beta', 0] });
-			isolatedModule.setConnectionOverlay(db, 'main', 'big', { overlayTable: overlay, hasChanges: true });
+			isolatedModule.setConnectionOverlay(db, 'main', 'big', { overlayTable: overlay, hasChanges: true, db });
 
 			// Secondary-index scan hitting the committed row. The merge builds a modified-PK
 			// set over the overlay (which now holds a bigint PK); pre-fix that build throws
@@ -1492,7 +1492,7 @@ describe('IsolationModule', () => {
 			const underlying = iso.getUnderlyingState('main', table)!.underlyingTable;
 			const overlay = await iso.overlayModule.create(forDb, iso.createOverlaySchema(underlying.tableSchema!));
 			if (dirty) await overlay.update({ operation: 'insert', values: [1, 'from-other', 0] });
-			const state: ConnectionOverlayState = { overlayTable: overlay, hasChanges: dirty };
+			const state: ConnectionOverlayState = { overlayTable: overlay, hasChanges: dirty, db: forDb };
 			iso.setConnectionOverlay(forDb, 'main', table, state);
 			return state;
 		}
@@ -1716,7 +1716,7 @@ describe('IsolationModule', () => {
 			// rows and reporting a successful commit is the failure mode under test.
 			const overlay = await iso.overlayModule.create(db, iso.createOverlaySchema(underlying.tableSchema!));
 			await overlay.update({ operation: 'insert', values: [1, 'staged', 0] }); // trailing 0 = live
-			iso.setConnectionOverlay(db, 'main', 'ghost', { overlayTable: overlay, hasChanges: true });
+			iso.setConnectionOverlay(db, 'main', 'ghost', { overlayTable: overlay, hasChanges: true, db });
 
 			let caught: unknown;
 			try {
@@ -1734,7 +1734,7 @@ describe('IsolationModule', () => {
 			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
 
 			const overlay = await iso.overlayModule.create(db, iso.createOverlaySchema(underlying.tableSchema!));
-			iso.setConnectionOverlay(db, 'main', 'ghost', { overlayTable: overlay, hasChanges: false });
+			iso.setConnectionOverlay(db, 'main', 'ghost', { overlayTable: overlay, hasChanges: false, db });
 
 			// Staged nothing, so nothing is lost. It also never reached the apply set, so the
 			// clear-loop had to be taught about it explicitly or it would leak.
@@ -2059,7 +2059,7 @@ describe('IsolationModule', () => {
 			for (const r of rows) {
 				await overlay.update({ operation: 'insert', values: [...r, 0] }); // trailing 0 = live (not tombstone)
 			}
-			iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges: true });
+			iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges: true, db: forDb });
 		}
 
 		function overlayState(forDb: Database): ConnectionOverlayState | undefined {
@@ -2775,7 +2775,7 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			await overlay.update({ operation: 'insert', values: [4, 'd', 0] }); // staged insert
 			await overlay.update({ operation: 'insert', values: [2, null, 1] }); // staged tombstone (id=2)
 			await overlay.update({ operation: 'insert', values: [3, 'C', 0] }); // staged update (id=3)
-			iso.setConnectionOverlay(db, 'main', 't', { overlayTable: overlay, hasChanges: true });
+			iso.setConnectionOverlay(db, 'main', 't', { overlayTable: overlay, hasChanges: true, db });
 			return iso;
 		}
 
@@ -2980,7 +2980,7 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
 			const overlay = await iso.overlayModule.create(db, iso.createOverlaySchema(underlying.tableSchema!));
 			await overlay.update({ operation: 'insert', values: [3, 'c', 0] });
-			iso.setConnectionOverlay(db, 'main', 't', { overlayTable: overlay, hasChanges: true });
+			iso.setConnectionOverlay(db, 'main', 't', { overlayTable: overlay, hasChanges: true, db });
 
 			let err: unknown;
 			try { await asyncIterableToArray((await connectReader(iso)).query(noAccessPath)); } catch (e) { err = e; }
@@ -3206,7 +3206,7 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			await overlay.update({ operation: 'insert', values: [4, 'd', 0] });
 			await overlay.update({ operation: 'insert', values: [2, null, 1] });
 			await overlay.update({ operation: 'insert', values: [3, 'C', 0] });
-			iso.setConnectionOverlay(adb, 'main', 't', { overlayTable: overlay, hasChanges: true });
+			iso.setConnectionOverlay(adb, 'main', 't', { overlayTable: overlay, hasChanges: true, db: adb });
 
 			// A secondary full-scan FilterInfo naming _primary_extra (role: secondary).
 			const schema = underlying.tableSchema!;
@@ -4158,7 +4158,7 @@ describe('IsolationModule — cross-connection isolation (read-your-own-writes; 
 		for (const r of rows) {
 			await overlay.update({ operation: 'insert', values: [...r, 0] }); // trailing 0 = live (not tombstone)
 		}
-		iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges: true });
+		iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges: true, db: forDb });
 	}
 
 	async function reader(forDb: Database): Promise<IsolatedTable> {
@@ -4225,5 +4225,159 @@ describe('IsolationModule — cross-connection isolation (read-your-own-writes; 
 		// A second commit finds nothing staged and must neither throw nor double-apply.
 		await iso.commitConnectionOverlays(dbA);
 		expect(await readAll(dbA)).to.deep.equal([[1, 'base'], [30, 'x']]);
+	});
+});
+
+describe('IsolationModule — overlay staging tables are released (no leak)', () => {
+	// Regression for bug-isolation-overlay-tables-never-released: every path that abandons a
+	// per-connection overlay MUST free the overlay's staging table from the overlay module's
+	// registry, or MemoryTableModule.tables grows one dead `_overlay_<table>_<id>` entry per
+	// writing transaction (and one more per rebuild), unbounded. The overlay module holds ONLY
+	// overlays — the base table lives in the SEPARATE underlying module — so its table count
+	// returns to a baseline of 0 after every completed cycle. That is the assertion that pins
+	// the whole class of bug.
+	let db: Database;
+	let iso: IsolationModule;
+	let overlayTables: Map<string, unknown>;
+
+	beforeEach(async () => {
+		db = new Database();
+		iso = new IsolationModule({ underlying: new MemoryTableModule() });
+		db.registerModule('isolated', iso);
+		overlayTables = (iso.overlayModule as unknown as { tables: Map<string, unknown> }).tables;
+		await db.exec('create table t (id integer primary key, v text) using isolated');
+		expect(overlayTables.size, 'baseline: no overlays before any write').to.equal(0);
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	it('write + commit releases the overlay', async () => {
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		expect(overlayTables.size, 'overlay staged inside the transaction').to.equal(1);
+		await db.exec('commit');
+		expect(overlayTables.size, 'overlay freed after commit').to.equal(0);
+	});
+
+	it('write + rollback releases the overlay', async () => {
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		expect(overlayTables.size).to.equal(1);
+		await db.exec('rollback');
+		expect(overlayTables.size, 'overlay freed after rollback').to.equal(0);
+	});
+
+	it('write + create index (overlay rebuild) + commit leaves no overlay', async () => {
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec('create index t_v on t(v)');
+		expect(overlayTables.size, 'rebuild swaps a fresh overlay in and frees the old').to.equal(1);
+		await db.exec('commit');
+		expect(overlayTables.size).to.equal(0);
+	});
+
+	it('write + drop index (overlay rebuild) + commit leaves no overlay', async () => {
+		await db.exec('create index t_v on t(v)');
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec('drop index t_v');
+		expect(overlayTables.size).to.equal(1);
+		await db.exec('commit');
+		expect(overlayTables.size).to.equal(0);
+	});
+
+	it('write + alter table add column + commit leaves no overlay', async () => {
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec("alter table t add column w text default 'x'");
+		expect(overlayTables.size).to.equal(1);
+		await db.exec('commit');
+		expect(overlayTables.size).to.equal(0);
+	});
+
+	it("write + drop table releases the dropping connection's overlay", async () => {
+		await db.exec('begin');
+		await db.exec("insert into t values (1, 'a')");
+		expect(overlayTables.size).to.equal(1);
+		await db.exec('drop table t');
+		expect(overlayTables.size, "destroy frees the dropping connection's own overlay").to.equal(0);
+		await db.exec('commit');
+		expect(overlayTables.size).to.equal(0);
+	});
+
+	// The teardown-ordering corner the ticket flags: when a savepoint pre-dates the overlay,
+	// ensureOverlay registers the overlay's OWN MemoryVirtualTableConnection directly with the
+	// database. Freeing (destroying) the overlay at commit/rollback while that connection is
+	// still registered must not throw when the db later tears the connection down — these two
+	// cycles exercise that path AND assert the overlay is still freed.
+	it('pre-overlay savepoint + commit tears down cleanly and frees the overlay', async () => {
+		await db.exec('begin');
+		await db.exec('select * from t');               // register the IsolatedConnection (no overlay yet)
+		await db.exec('savepoint sp1');                 // savepoint pre-dates the overlay
+		await db.exec("insert into t values (1, 'a')"); // ensureOverlay registers the overlay's own connection
+		expect(overlayTables.size).to.equal(1);
+		await db.exec('commit');
+		expect(overlayTables.size, 'overlay freed after a savepoint-involving commit').to.equal(0);
+	});
+
+	it('pre-overlay savepoint + rollback tears down cleanly and frees the overlay', async () => {
+		await db.exec('begin');
+		await db.exec('select * from t');
+		await db.exec('savepoint sp1');
+		await db.exec("insert into t values (1, 'a')");
+		expect(overlayTables.size).to.equal(1);
+		await db.exec('rollback');
+		expect(overlayTables.size, 'overlay freed after a savepoint-involving rollback').to.equal(0);
+	});
+});
+
+describe('IsolationModule — a rebuild-poisoned overlay is freed on rollback (no leak)', () => {
+	// The rebuild-FAILURE corner of the leak: when CREATE UNIQUE INDEX rebuilds a FOREIGN
+	// connection's overlay whose staged rows violate the new constraint, the half-built new
+	// overlay must be freed (the builder's own catch) and the OLD overlay is kept, poisoned,
+	// for its owner to roll back — at which point IT is freed too. Two Database instances share
+	// one IsolationModule so each is a distinct connection (the module keys overlays by db id).
+	let iso: IsolationModule;
+	let overlayTables: Map<string, unknown>;
+	let dbA: Database; // issues the UNIQUE index
+	let dbB: Database; // foreign connection whose duplicate rows get poisoned
+
+	beforeEach(async () => {
+		iso = new IsolationModule({ underlying: new MemoryTableModule() });
+		overlayTables = (iso.overlayModule as unknown as { tables: Map<string, unknown> }).tables;
+		dbA = new Database();
+		dbB = new Database();
+		dbA.registerModule('isolated', iso);
+		await dbA.exec('create table t (id integer primary key, x integer) using isolated');
+		await dbA.exec('insert into t values (5, 5)'); // committed, unique-safe baseline
+		expect(overlayTables.size, 'baseline').to.equal(0);
+	});
+
+	afterEach(async () => {
+		await dbA.close();
+		await dbB.close();
+	});
+
+	it('frees the half-built rebuild overlay on failure and the poisoned overlay on rollback', async () => {
+		// dbB stages two rows sharing x = 7 — legal now, before any UNIQUE index on x exists.
+		const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+		const overlay = await iso.overlayModule.create(dbB, iso.createOverlaySchema(underlying.tableSchema!));
+		await overlay.update({ operation: 'insert', values: [10, 7, 0] }); // trailing 0 = live
+		await overlay.update({ operation: 'insert', values: [11, 7, 0] });
+		iso.setConnectionOverlay(dbB, 'main', 't', { overlayTable: overlay, hasChanges: true, db: dbB });
+		expect(overlayTables.size, 'dbB overlay staged').to.equal(1);
+
+		// dbA declares UNIQUE(x). Rebuilding dbB's overlay hits the duplicate: the half-built new
+		// overlay is discarded and dbB's OLD overlay is poisoned (kept, unmigrated). A leaked
+		// half-built table would make the count 2.
+		await dbA.exec('create unique index ux on t(x)');
+		expect(overlayTables.size, 'poisoned overlay kept; half-built rebuild freed').to.equal(1);
+		expect(iso.getConnectionOverlay(dbB, 'main', 't')!.poison, 'dbB overlay is poisoned').to.not.be.undefined;
+
+		// dbB rolls back — routed through clearConnectionOverlay — freeing its poisoned overlay.
+		await iso.clearConnectionOverlay(dbB, 'main', 't');
+		expect(overlayTables.size, 'poisoned overlay freed on rollback').to.equal(0);
 	});
 });

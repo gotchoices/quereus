@@ -228,10 +228,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			await (this.db as DatabaseInternal).registerConnection(preAlignedConn);
 		}
 
-		// Store in connection-scoped storage
+		// Store in connection-scoped storage. `db` rides along so the module can free this
+		// overlay's staging table on any discard path (see IsolationModule.releaseOverlayTable).
 		const state: ConnectionOverlayState = {
 			overlayTable,
 			hasChanges: false,
+			db: this.db,
 		};
 		this.isolationModule.setConnectionOverlay(this.db, this.schemaName, this.tableName, state);
 
@@ -1567,17 +1569,18 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 
 	async rollback(): Promise<void> {
 		await this.underlyingTable.rollback?.();
-		this.clearOverlay();
+		await this.clearOverlay();
 	}
 
 	/**
-	 * Discards the connection-scoped overlay entirely.
-	 * The overlay table is per-connection and ephemeral, so simply removing
-	 * the reference allows GC to reclaim it. A fresh overlay will be created
+	 * Discards the connection-scoped overlay entirely. The module frees the overlay's
+	 * staging table (see IsolationModule.clearConnectionOverlay → releaseOverlayTable) rather
+	 * than merely dropping the reference — the overlay module's registry pins the manager, so
+	 * a bare reference-drop leaked it for the life of the Database. A fresh overlay is created
 	 * lazily via ensureOverlay() on the next write.
 	 */
-	private clearOverlay(): void {
-		this.isolationModule.clearConnectionOverlay(this.db, this.schemaName, this.tableName);
+	private async clearOverlay(): Promise<void> {
+		await this.isolationModule.clearConnectionOverlay(this.db, this.schemaName, this.tableName);
 	}
 
 	// ==================== Savepoints ====================
@@ -1613,7 +1616,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// Update our schema reference
 		this.tableSchema = this.underlyingTable.tableSchema;
 		// Clear any existing overlay - it will be recreated with new schema on next write
-		this.isolationModule.clearConnectionOverlay(this.db, this.schemaName, this.tableName);
+		await this.isolationModule.clearConnectionOverlay(this.db, this.schemaName, this.tableName);
 	}
 
 	/**
@@ -1694,7 +1697,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 * Clears overlay without flushing.
 	 */
 	async onConnectionRollback(): Promise<void> {
-		this.clearOverlay();
+		await this.clearOverlay();
 		this.isolationModule.clearPreOverlaySavepoints(this.db, this.schemaName, this.tableName);
 	}
 
@@ -1735,7 +1738,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	async onConnectionRollbackToSavepoint(index: number): Promise<void> {
 		if (this.savepointsBeforeOverlay.has(index)) {
 			// Rolling back to before the overlay existed — discard all overlay changes
-			this.clearOverlay();
+			await this.clearOverlay();
 			// Remove savepoints above the target (they're implicitly gone)
 			for (const depth of [...this.savepointsBeforeOverlay]) {
 				if (depth > index) {
