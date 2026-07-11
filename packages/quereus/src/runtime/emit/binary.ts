@@ -347,14 +347,14 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 	// Normalize operator to uppercase for case-insensitive matching
 	const operator = plan.expression.operator.toUpperCase();
 
-	// Eager three-valued-logic combine. Kept verbatim for XOR (both operands
-	// always required) and for AND/OR whose right operand is cheap (no subquery),
-	// which stay on the zero-overhead two-param path.
-	function run(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
-		// SQL three-valued logic. Coerce non-NULL operands to a boolean using
-		// SQL truthiness (isTruthy) rather than JS truthiness so that values like
-		// blobs and non-numeric strings agree with how FilterNode/CASE/NOT treat
-		// them — otherwise `<blob> AND true` and a bare `<blob>` predicate diverge.
+	// SQL three-valued-logic combine — single source of truth shared by the eager
+	// `run` and the deferred `runShortCircuit` path, so the two cannot diverge (the
+	// parity tests in test/and-or-short-circuit.spec.ts guard exactly this). Coerce
+	// non-NULL operands to a boolean using SQL truthiness (isTruthy) rather than JS
+	// truthiness so that values like blobs and non-numeric strings agree with how
+	// FilterNode/CASE/NOT treat them — otherwise `<blob> AND true` and a bare
+	// `<blob>` predicate diverge.
+	function combineLogical(v1: SqlValue, v2: SqlValue): SqlValue {
 		const b1 = v1 === null ? null : isTruthy(v1);
 		const b2 = v2 === null ? null : isTruthy(v2);
 		switch (operator) {
@@ -383,6 +383,12 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 		}
 	}
 
+	// Eager two-param combine. Used for XOR (both operands always required) and for
+	// AND/OR whose right operand is cheap (no subquery) — the zero-overhead path.
+	function run(_ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
+		return combineLogical(v1, v2);
+	}
+
 	const leftExpr = emitPlanNode(plan.left, ctx);
 
 	// Short-circuit deferral: for AND/OR whose right operand contains a subquery
@@ -402,29 +408,27 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 	if ((operator === 'AND' || operator === 'OR') && containsSubquery(plan.right)) {
 		const rightCall = emitCallFromPlan(plan.right, ctx);
 
-		async function runShortCircuit(
+		function runShortCircuit(
 			ctx: RuntimeContext,
 			v1: SqlValue,
 			rightFn: (ctx: RuntimeContext) => MaybePromise<SqlValue>
-		): Promise<SqlValue> {
-			// Identical SQL truthiness (isTruthy) and 3VL combine as the eager `run`
-			// above — the only difference is that the right operand is fetched lazily
-			// and only when the left does not already decide the result.
+		): MaybePromise<SqlValue> {
+			// Left decides — the right operand is never fetched (`false AND x` → false;
+			// `true OR x` → true). Same SQL truthiness as the eager path.
 			const b1 = v1 === null ? null : isTruthy(v1);
-			if (operator === 'AND' && b1 === false) return false; // left decides
-			if (operator === 'OR' && b1 === true) return true;    // left decides
+			if (operator === 'AND' && b1 === false) return false;
+			if (operator === 'OR' && b1 === true) return true;
 
-			const v2 = await rightFn(ctx);
-			const b2 = v2 === null ? null : isTruthy(v2);
-			if (operator === 'AND') {
-				if (b1 === false || b2 === false) return false;
-				if (b1 === null || b2 === null) return null;
-				return true;
-			}
-			// OR
-			if (b1 === true || b2 === true) return true;
-			if (b1 === null || b2 === null) return null;
-			return false;
+			// Otherwise fetch the deferred right and combine with the shared 3VL
+			// (combineLogical) — byte-identical to the eager path. Stay synchronous
+			// when the right sub-program resolves synchronously; only take the
+			// microtask hop on a genuinely async subquery (see docs/runtime.md
+			// "Avoid a per-row microtask hop on the synchronous fast path"). A
+			// left-decides row returned above, so it never pays an async tick.
+			const raw = rightFn(ctx);
+			return raw instanceof Promise
+				? raw.then(v2 => combineLogical(v1, v2))
+				: combineLogical(v1, raw);
 		}
 
 		return {
