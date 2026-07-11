@@ -290,6 +290,8 @@ interface StatsProvider {
 
 The default provider is `CatalogStatsProvider`, which reads real statistics from `TableSchema.statistics` (populated by `ANALYZE` or `VirtualTable.getStatistics()`) and falls back to `NaiveStatsProvider` heuristics when unavailable. When catalog statistics include equi-height histograms, range and equality selectivity estimates use histogram interpolation rather than uniform assumptions.
 
+**Filter row estimates.** `FilterNode.estimatedRows` derives from `context.stats.selectivity(table, predicate)`, stamped onto the node by the `rule-filter-selectivity` Physical-pass rule (node accessors carry no `OptContext`, so the estimate is computed by a context-holding rule and cached on an optional `FilterNode.selectivity` field). The flat `DEFAULT_FILTER_SELECTIVITY` (0.5) is only a last-resort default — used before that rule runs (e.g. Structural-pass cost comparisons), when the source is a join / multi-table shape (`extractTableSchema` returns undefined), or when the provider declines. A provably ≤1-row filter (equality conjuncts covering a unique key) still forces `estimatedRows = 1` in `computePhysical`, overriding any stats fraction. Conjunction / join selectivity is not yet decomposed — an `AND` predicate falls back to the coarse `NaiveStatsProvider` per-node heuristic (parked in backlog `feat-conjunction-and-join-selectivity`).
+
 ### Physical Properties System
 
 Physical properties are automatically computed and cached for each plan node using a bottom-up inheritance model:

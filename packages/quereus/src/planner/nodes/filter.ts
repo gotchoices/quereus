@@ -13,6 +13,12 @@ import { deriveFilterAttributeDefaults } from '../analysis/update-lineage.js';
 import { filterCost } from '../cost/index.js';
 
 /**
+ * Last-resort selectivity used by {@link FilterNode.estimatedRows} when no
+ * stats-derived estimate has been stamped (see `rule-filter-selectivity`).
+ */
+export const DEFAULT_FILTER_SELECTIVITY = 0.5;
+
+/**
  * Represents a filter operation (WHERE clause).
  * It takes an input relation and a predicate expression,
  * and outputs rows for which the predicate is true.
@@ -26,7 +32,12 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		scope: Scope,
 		public readonly source: RelationalPlanNode,
 		public readonly predicate: ScalarPlanNode,
-		estimatedCostOverride?: number
+		estimatedCostOverride?: number,
+		// Stats-derived selectivity in [0,1], stamped by `rule-filter-selectivity`
+		// during the Physical pass. Undefined until that rule runs (or when the
+		// source table can't be identified / the provider declines) — see
+		// `estimatedRows`, which falls back to DEFAULT_FILTER_SELECTIVITY.
+		public readonly selectivity?: number,
 	) {
 		// Self-cost only: both children — source AND predicate (getChildren() is
 		// [source, predicate]) — flow in via getTotalCost(). Self is the per-row
@@ -59,21 +70,41 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 	}
 
 	get estimatedRows(): number | undefined {
-		// This is a rough estimate. A more sophisticated planner would use selectivity estimates.
-		// For now, assume a selectivity of 0.5 if source has rows, otherwise 0.
-		// TODO: Use selectivity estimates
+		// Selectivity is stamped by `rule-filter-selectivity` (Physical pass), which
+		// consults the stats provider (histogram / 1-over-ndv / null-fraction, with a
+		// NaiveStatsProvider per-nodeType fallback).
+		// NOTE: DEFAULT_FILTER_SELECTIVITY (0.5) is the LAST-RESORT default, used only
+		// before that rule runs (e.g. Structural-pass cost comparisons) or when the
+		// source table can't be identified / the provider declines — it is NOT the
+		// real heuristic path, which lives in the stats provider.
 		const sourceRows = this.source.estimatedRows;
 		if (sourceRows === undefined) return undefined;
-		return sourceRows > 0 ? Math.max(1, Math.floor(sourceRows * 0.5)) : 0;
+		const sel = this.selectivity ?? DEFAULT_FILTER_SELECTIVITY;
+		// selectivity 0 (provider says nothing matches) floors to 1, matching the
+		// empty-source path's min-1 convention — never negative / NaN.
+		return sourceRows > 0 ? Math.max(1, Math.floor(sourceRows * sel)) : 0;
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
 		const sourcePhysical = childrenPhysical[0];
 		const srcRows = sourcePhysical?.estimatedRows;
 		const est = this.estimatedRows;
-		let rows = (typeof srcRows === 'number' && typeof est === 'number')
-			? Math.min(srcRows, est)
-			: (srcRows ?? est);
+		// Apply the stamped selectivity to the PHYSICAL source cardinality. The
+		// logical `estimatedRows` getter multiplies `this.source.estimatedRows`, but a
+		// physical access-node source (IndexScan/IndexSeek) exposes no logical row
+		// count, so the getter yields undefined and the selectivity stamped by
+		// `rule-filter-selectivity` would be lost after the Retrieve→access-node
+		// conversion. computePhysical holds the real physical source cardinality, so
+		// apply selectivity here when stamped (matching the getter's min-1 / 0-empty
+		// floor); fall back to the logical estimate (min against source) when unstamped.
+		let rows: number | undefined;
+		if (typeof srcRows === 'number' && this.selectivity !== undefined) {
+			rows = srcRows > 0 ? Math.max(1, Math.floor(srcRows * this.selectivity)) : 0;
+		} else if (typeof srcRows === 'number' && typeof est === 'number') {
+			rows = Math.min(srcRows, est);
+		} else {
+			rows = srcRows ?? est;
+		}
 
 		const sourceAttrs = this.source.getAttributes();
 		const attrIdToIndex = this.source.getAttributeIndex();
@@ -209,16 +240,30 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			quereusError('FilterNode: second child must be a ScalarPlanNode', StatusCode.INTERNAL);
 		}
 
-		// Return same instance if nothing changed
+		// Return same instance if nothing changed (this fast-path also preserves
+		// `selectivity` for free — the common source-and-predicate-unchanged case).
 		if (newSource === this.source && newPredicate === this.predicate) {
 			return this;
 		}
+
+		// The stamped selectivity is predicate-specific: carry it through ONLY when
+		// the predicate is unchanged; drop it (undefined → recompute default until
+		// re-stamped) when the predicate changes.
+		// NOTE (tripwire): a carried selectivity was computed against THIS source's
+		// table. If a later pass ever re-sources a stamped Filter (same predicate,
+		// different source), the carried estimate goes slightly stale. In practice the
+		// Physical pass is the last rule-bearing pass over Filters, so nothing
+		// re-sources a stamped one. If that ever changes, also drop selectivity when
+		// `newSource !== this.source`.
+		const preservedSelectivity = newPredicate === this.predicate ? this.selectivity : undefined;
 
 		// Create new instance preserving attributes (filter preserves source attributes)
 		return new FilterNode(
 			this.scope,
 			newSource as RelationalPlanNode,
-			newPredicate as ScalarPlanNode
+			newPredicate as ScalarPlanNode,
+			undefined,
+			preservedSelectivity,
 		);
 	}
 
@@ -237,6 +282,8 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 			return this;
 		}
 
+		// Predicate changed → do NOT carry `selectivity` (it was predicate-specific);
+		// leave it undefined so rule-filter-selectivity re-derives against the new one.
 		return new FilterNode(this.scope, this.source, newPredicate);
 	}
 

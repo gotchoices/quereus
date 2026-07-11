@@ -29,6 +29,7 @@ import { ruleAggregatePredicatePushdown } from './rules/predicate/rule-aggregate
 import { ruleFilterMerge } from './rules/predicate/rule-filter-merge.js';
 import { rulePredicateInferenceEquivalence } from './rules/predicate/rule-predicate-inference-equivalence.js';
 import { ruleSargableRangeRewrite } from './rules/predicate/rule-sargable-range-rewrite.js';
+import { ruleFilterSelectivity } from './rules/predicate/rule-filter-selectivity.js';
 import { ruleJoinKeyInference } from './rules/join/rule-join-key-inference.js';
 import { ruleJoinGreedyCommute } from './rules/join/rule-join-greedy-commute.js';
 import { ruleJoinElimination, ruleJoinEliminationUnderAggregate } from './rules/join/rule-join-elimination.js';
@@ -696,6 +697,18 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		fn: ruleSelectAccessPath,
 		// Replaces a logical Retrieve with a physical access node over the
 		// same TableReference — read-only by construction.
+		sideEffectMode: 'safe',
+	},
+
+	{
+		pass: PassId.Physical,
+		id: 'filter-selectivity',
+		nodeType: PlanNodeType.Filter,
+		phase: 'impl',
+		fn: ruleFilterSelectivity,
+		// Annotation-only: reads stats and rebuilds the identical Filter (same
+		// scope, source, predicate, same output attribute ids) with only an added
+		// row estimate — no side-effect reordering.
 		sideEffectMode: 'safe',
 	},
 
