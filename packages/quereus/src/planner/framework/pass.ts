@@ -592,6 +592,13 @@ export class PassManager {
 
 				const result = rule.fn(currentNode, context);
 				if (result && result !== currentNode) {
+					// NOTE: a rule is not re-offered its own output. marking the old node id
+					// applied and then inheriting that applied-rule set onto the new node id
+					// means `hasRuleBeenApplied` short-circuits `rule.id` on `result` too, so
+					// the fixpoint loop above never re-invokes this rule on the node it just
+					// produced. A rule that needs a fixpoint over its own rewrites (e.g. merging
+					// an arbitrarily deep stack of nested nodes) must loop internally rather than
+					// rely on the engine to re-offer it — see rule-filter-merge for the pattern.
 					markRuleApplied(currentNode.id, rule.id, context);
 					this.inheritVisitedRules(currentNode.id, result.id, context);
 					state.rulesFired++;

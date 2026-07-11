@@ -22,7 +22,6 @@ function createTestContext(db: Database, overrides?: Partial<OptContext>): OptCo
 		stats: {} as StatsProvider,
 		tuning: { ...DEFAULT_TUNING, ...(overrides?.tuning ?? {}) },
 		phase: 'rewrite',
-		context: new Map(),
 		diagnostics: {},
 		db,
 		visitedRules: new Map(),

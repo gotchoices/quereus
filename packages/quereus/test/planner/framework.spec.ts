@@ -132,7 +132,6 @@ function makeContext(overrides: Partial<OptimizerTuning> = {}): OptContext {
 		stats: {} as any,
 		tuning,
 		phase: 'rewrite',
-		context: new Map(),
 		diagnostics: {},
 		db: {} as any,
 		visitedRules: new Map(),

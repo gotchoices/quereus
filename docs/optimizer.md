@@ -594,6 +594,7 @@ SELECT * FROM users WHERE active = true;
 - Always preserve attribute IDs
 - **Use characteristics-based patterns**: Prefer `CapabilityDetectors` over `instanceof` checks for robust, extensible rules
 - Include comprehensive tests
+- **A rule is never re-offered its own output.** When a rule fires, `PassManager.applyPassRules` (`framework/pass.ts`) marks the rule applied on the node it consumed and inherits that applied-rule set onto the node the rule produced, so the same rule will not fire again on its own result during the fixpoint loop. A rule that needs to converge over its *own* rewrites (e.g. collapsing an arbitrarily deep stack of the same node type) must loop internally rather than lean on the engine to re-invoke it — see `rule-filter-merge` (`planner/rules/predicate/rule-filter-merge.ts`), which absorbs a whole chain of nested `Filter` nodes in one call for exactly this reason.
 
 **Property Computation**
 - Implement `computePhysical()` to override physical properties for new node types
@@ -922,18 +923,9 @@ The architecture supports multi-pass optimization strategies via:
 
 ### Context Lifecycle
 
-Contexts can be derived and specialized for different optimization scenarios:
-
-```typescript
-class OptimizationContext {
-  // Create context for different optimization phase
-  withPhase(phase: 'rewrite' | 'impl'): OptimizationContext {
-    const newContext = new OptimizationContext(/* ... */);
-    this.copyTrackingState(newContext); // Preserve learned optimizations
-    return newContext;
-  }
-}
-```
+Today there is exactly one `OptimizationContext` per optimization session (`Optimizer.optimize` /
+`optimizeForAnalysis` each call `createOptContext` once via `framework/context.ts`); it is not
+derived or specialized mid-session — see "Multi-Pass (Future)" above for the planned direction.
 
 Per-traversal depth is tracked by the pass framework itself rather than on the
 context — see "Pass Framework" above for the input-scaled budget

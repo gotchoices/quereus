@@ -18,9 +18,8 @@ This directory contains the core framework components for the Titan optimizer Ph
 
 ### Context (`context.ts`)
 - **OptContext**: Unified interface combining optimizer, stats provider, and tuning
-- **Depth Tracking**: Prevents infinite recursion in optimization rules
+- **Rule Visitation Tracking**: `visitedRules` / `optimizedNodes` prevent infinite rule re-application (see `hasRuleBeenApplied` / `markRuleApplied` in `registry.ts`)
 - **Phase Management**: Supports 'rewrite' (logical→logical) and 'impl' (logical→physical) phases
-- **Context Data**: Key-value store for rule communication and state
 
 ### Physical Utilities (`physical-utils.ts`)
 - **Property Inference**: Utilities for combining and propagating physical properties
@@ -57,13 +56,12 @@ characteristics).
 ```typescript
 import type { RuleFn } from '../framework/registry.js';
 
-const ruleAggregateStreaming: RuleFn = (node, optimizer) => {
+const ruleAggregateStreaming: RuleFn = (node, context) => {
   // This rule needs AggregateNode's specific API → instanceof (concrete class identity).
   if (!(node instanceof AggregateNode)) return null;
-  
-  const context = optimizer.getContext();
-  const stats = optimizer.getStats();
-  
+
+  const stats = context.stats;
+
   // Rule logic here...
   return transformedNode;
 };
