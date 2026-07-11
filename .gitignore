@@ -30,3 +30,5 @@ coverage/
 .stryker-tmp/
 packages/quereus/reports/mutation/
 packages/quereus/.stryker-tmp/
+packages/shared-ui/tsconfig.tsbuildinfo
+.pnp.*
