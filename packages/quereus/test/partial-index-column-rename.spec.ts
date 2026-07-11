@@ -131,6 +131,30 @@ describe('partial index across column rename/drop', () => {
 		expect(predicateText(db, 't', 'ix').toLowerCase()).to.contain('is_active');
 	});
 
+	it('keeps a self-qualified partial index live across a table RENAME and a following rebuild', async () => {
+		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
+		await db.exec(`create index ix on t (name) where t.active = 1`);
+		await db.exec(`insert into t values (1, 'a', 1), (2, 'b', 0), (3, 'c', 1)`);
+
+		// Renaming the table rewrites the predicate's self-qualifier (`t.active` →
+		// `t2.active`) in place. Before create-time rejection existed, `compilePredicate`
+		// ignored the qualifier, so a stale `t.active` would have been harmless; now a
+		// qualifier that failed to follow the rename would name a foreign table and throw
+		// on the next rebuild. This asserts the rename keeps the qualifier self-consistent.
+		await db.exec(`alter table t rename to t2`);
+		// A column rename forces `ensureSchemaChangeSafety` to consolidate + rebuild the
+		// secondary index against the new table name — the recompile that would throw on a
+		// stale qualifier.
+		await db.exec(`alter table t2 rename column active to is_active`);
+
+		expect([...baseLayerOf(module, 't2').secondaryIndexes.keys()]).to.deep.equal(['ix']);
+		const pred = predicateText(db, 't2', 'ix').toLowerCase();
+		expect(pred).to.contain('t2');
+		expect(pred).to.contain('is_active');
+		const scoped = await rows(db, `select name from t2 where is_active = 1 order by name`);
+		expect(scoped.map(r => r.name)).to.deep.equal(['a', 'c']);
+	});
+
 	it('leaves a partial index on an unrelated column alone across RENAME COLUMN', async () => {
 		await db.exec(`create table t (id integer primary key, name text, active integer, flag integer) using testmem`);
 		await db.exec(`create index ix_active on t (name) where active = 1`);

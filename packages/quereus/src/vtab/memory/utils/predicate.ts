@@ -104,6 +104,10 @@ function compileExpression(
 			// one is rejected: without this the qualifier is dropped and the ref binds by
 			// bare name, so `where zzz.active` and `where active` compile identically.
 			// Only `ColumnExpr` carries a `table` field (an `identifier` never does).
+			// NOTE: a persisted store DB written by pre-fix code may already hold such a
+			// foreign-qualified predicate; recompiling it now throws (on rebuild/first
+			// maintenance) where it previously bound by bare name. Only matters if a legacy
+			// DB with an already-wrong index is reopened; no migration is attempted.
 			if (ref.type === 'column' && ref.table && tableName !== undefined
 				&& ref.table.toLowerCase() !== tableName.toLowerCase()) {
 				throw new QuereusError(
