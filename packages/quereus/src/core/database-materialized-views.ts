@@ -53,6 +53,7 @@ import type { TableSchema, UniqueConstraintSchema } from '../schema/table.js';
 import { coveringMvHonorsIndexCollation } from '../schema/unique-enforcement.js';
 import type { Database } from './database.js';
 import type { MaintenanceCollisionEvent } from './database-events.js';
+import { splitBaseKey } from '../util/qualified-name.js';
 import {
 	mvKey,
 	planSourceBases,
@@ -975,7 +976,7 @@ export class MaterializedViewManager {
 		// structure is never linked to one — defensively skip if reached.
 		if (plan.kind !== 'inverse-projection') return [];
 
-		const [srcSchemaName, srcTableName] = plan.sourceBase.split('.');
+		const [srcSchemaName, srcTableName] = splitBaseKey(plan.sourceBase);
 		const sourceSchema = this.ctx._findTable(srcTableName, srcSchemaName);
 		if (!sourceSchema) return [];
 

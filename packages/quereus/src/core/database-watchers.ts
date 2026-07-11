@@ -28,6 +28,7 @@ import type {
 } from '../planner/analysis/change-scope.js';
 import type { Database } from './database.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
+import { splitBaseKey } from '../util/qualified-name.js';
 
 const log = createLogger('core:watchers');
 const warnLog = log.extend('warn');
@@ -78,7 +79,7 @@ export class WatcherManager {
 			getChangedBaseTables: () => ctx.getChangedBaseTables(),
 			getChangedTuples: (base, cols, pk) => ctx.getChangedTuples(base, cols, pk),
 			getRowCount: (base) => {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = ctx._findTable(tableName, schemaName);
 				return table?.estimatedRows;
 			},

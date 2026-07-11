@@ -25,6 +25,7 @@ import { buildBlock } from "../../planner/building/block.js";
 import { resolveBaseSite } from "../../planner/analysis/update-lineage.js";
 import type { LensSlot } from "../../schema/lens.js";
 import { createLogger } from "../../common/logger.js";
+import { splitBaseKey } from "../../util/qualified-name.js";
 
 const log = createLogger('func:builtins:explain');
 
@@ -1027,7 +1028,7 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			const base = `${relationKey.split('#')[0]}`;
 			let prepared: string | null = null;
 			if (base) {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = db._findTable(tableName, schemaName);
 				if (table) {
 					if (cls === 'row') {

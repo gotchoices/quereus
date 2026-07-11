@@ -30,6 +30,7 @@ import { injectKeyFilter } from '../planner/analysis/key-filter.js';
 import { DeltaExecutor, type DeltaApplyInput, type DeltaExecutorContext, type DeltaSubscription } from '../runtime/delta-executor.js';
 import type { Database } from './database.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
+import { splitBaseKey } from '../util/qualified-name.js';
 
 const log = createLogger('core:assertions');
 
@@ -145,7 +146,7 @@ export class AssertionEvaluator {
 			getChangedBaseTables: () => ctx.getChangedBaseTables(),
 			getChangedTuples: (base, cols, pk) => ctx.getChangedTuples(base, cols, pk),
 			getRowCount: (base) => {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = ctx._findTable(tableName, schemaName);
 				return table?.estimatedRows;
 			},
@@ -299,7 +300,7 @@ export class AssertionEvaluator {
 		for (const base of bindings.relationToBase.values()) {
 			baseTablesInPlan.add(base);
 			if (!pkIndicesByBase.has(base)) {
-				const [schemaName, tableName] = base.split('.');
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = this.ctx._findTable(tableName, schemaName);
 				if (table) {
 					pkIndicesByBase.set(base, table.primaryKeyDefinition.map(d => d.index));
