@@ -2195,6 +2195,7 @@ __metadata:
     "@quereus/quereus": "workspace:^"
     "@quereus/store": "workspace:^"
     "@quereus/sync": "workspace:^"
+    "@quereus/sync-client": "workspace:^"
     "@types/debug": "npm:^4.1.13"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.9.3"
