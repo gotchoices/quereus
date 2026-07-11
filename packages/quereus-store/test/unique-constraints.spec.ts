@@ -1174,3 +1174,82 @@ describe('StoreTable implicit unique index — reopen', () => {
 		expect(rows).to.deep.equal([{ id: 1, email: 'a@x' }, { id: 3, email: 'b@x' }]);
 	});
 });
+
+// DROP / RENAME TABLE must reclaim / relocate the hidden `_uc_*` store alongside the
+// data + explicit-index stores — it is materialized only in the enforcement schema, so a
+// teardown/rename that reads the engine-facing `.indexes` would strand it (DROP) or leave
+// the renamed table seeking a fresh EMPTY one and accepting a duplicate (RENAME). Needs a
+// provider that actually implements `renameTableStores` / `deleteTableStores` (the module's
+// physical relocation no-ops without them).
+describe('StoreTable implicit unique index — DROP / RENAME TABLE store lifecycle', () => {
+	function createRelocatingProvider(): KVStoreProvider & { storeKeys(): string[] } {
+		const stores = new Map<string, InMemoryKVStore>();
+		const get = (k: string): InMemoryKVStore => {
+			let s = stores.get(k);
+			if (!s) { s = new InMemoryKVStore(); stores.set(k, s); }
+			return s;
+		};
+		return {
+			async getStore(s, t) { return get(`${s}.${t}`); },
+			async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
+			async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
+			async getCatalogStore() { return get('__catalog__'); },
+			async closeStore() {},
+			async closeIndexStore() {},
+			async closeAll() { for (const s of stores.values()) await s.close(); stores.clear(); },
+			async renameTableStores(s, oldN, newN, indexNames) {
+				const move = (from: string, to: string): void => {
+					const st = stores.get(from);
+					if (st) { stores.delete(from); stores.set(to, st); }
+				};
+				move(`${s}.${oldN}`, `${s}.${newN}`);
+				for (const i of indexNames) move(`${s}.${oldN}_idx_${i}`, `${s}.${newN}_idx_${i}`);
+			},
+			async deleteIndexStore(s, t, i) { stores.delete(`${s}.${t}_idx_${i}`); },
+			async deleteTableStores(s, t, indexNames) {
+				stores.delete(`${s}.${t}`);
+				for (const i of indexNames) stores.delete(`${s}.${t}_idx_${i}`);
+			},
+			// Only the physical index stores (`..._idx_...`) — the marker the leak asserts on.
+			storeKeys() { return [...stores.keys()]; },
+		};
+	}
+
+	let db: Database;
+	let provider: ReturnType<typeof createRelocatingProvider>;
+	beforeEach(() => {
+		db = new Database();
+		provider = createRelocatingProvider();
+		db.registerModule('store', new StoreModule(provider));
+	});
+	afterEach(async () => { await provider.closeAll(); });
+
+	async function rejects(sql: string): Promise<void> {
+		let err: Error | null = null;
+		try { await db.exec(sql); } catch (e) { err = e as Error; }
+		expect(err, `expected "${sql}" to be rejected`).to.not.be.null;
+		expect(err!.message).to.match(/UNIQUE constraint failed/i);
+	}
+
+	it('RENAME TABLE relocates the implicit `_uc_*` store and keeps enforcing', async () => {
+		await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE) USING store`);
+		await db.exec(`INSERT INTO t VALUES (1, 'a')`);
+		await db.exec(`ALTER TABLE t RENAME TO t2`);
+		// The implicit `_uc_v` store must have moved to the new name — else this seeks an
+		// empty store and silently accepts the duplicate of the pre-rename row.
+		await rejects(`INSERT INTO t2 VALUES (2, 'a')`);
+		await db.exec(`INSERT INTO t2 VALUES (3, 'b')`);
+		expect(await collect(db, `SELECT count(*) AS n FROM t2`)).to.deep.equal([{ n: 2 }]);
+		// No orphan `_uc_*` store left under the OLD table name.
+		expect(provider.storeKeys().filter(k => k.includes('t_idx__uc_')), 'no orphan `_uc_*` under old name')
+			.to.deep.equal([]);
+	});
+
+	it('DROP TABLE reclaims the implicit `_uc_*` store', async () => {
+		await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE) USING store`);
+		await db.exec(`INSERT INTO t VALUES (1, 'a')`);
+		await db.exec(`DROP TABLE t`);
+		expect(provider.storeKeys().filter(k => k.includes('_uc_')), 'no orphan `_uc_*` store after DROP TABLE')
+			.to.deep.equal([]);
+	});
+});

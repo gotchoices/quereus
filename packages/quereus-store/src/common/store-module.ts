@@ -753,7 +753,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const table = this.tables.get(tableKey);
 		const currentSchema: TableSchema | undefined =
 			table?.getSchema() ?? db.schemaManager.getTable(schemaName, tableName);
-		const indexNames = (currentSchema?.indexes ?? []).map(i => i.name);
+		// Materialized index list, so the hidden `_uc_*` stores backing plain UNIQUEs are
+		// torn down too — the engine-facing `.indexes` omits them and would leak them.
+		const indexNames = this.materializedIndexNames(table, currentSchema);
 
 		await this.tearDownTableStorage(schemaName, tableName, indexNames);
 
@@ -1519,6 +1521,24 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
 			);
 		}
+	}
+
+	/**
+	 * The physical index-store names a table owns for DROP / RENAME TABLE to relocate
+	 * or reclaim: the MATERIALIZED index set — every explicit `CREATE INDEX` PLUS the
+	 * hidden `_uc_*` realizing each plain UNIQUE. Reading only `getSchema().indexes`
+	 * (the engine-facing schema, which carries no `_uc_*`) would strand a `_uc_*` store
+	 * on disk after DROP TABLE, and — worse — after RENAME TABLE leave the renamed
+	 * table seeking a freshly-created EMPTY `_uc_*` store, silently accepting a
+	 * duplicate of a pre-rename row. Prefers the cached StoreTable's own materialized
+	 * schema; falls back to materializing the schema-manager copy when the instance is
+	 * already gone.
+	 */
+	private materializedIndexNames(table: StoreTable | undefined, fallback: TableSchema | undefined): string[] {
+		const schema = table
+			? table.getMaterializedSchema()
+			: (fallback ? withImplicitUniqueIndexes(fallback) : undefined);
+		return (schema?.indexes ?? []).map(i => i.name);
 	}
 
 	/** Close + delete the physical store of an implicit UNIQUE index. Mirrors `dropIndex`. */
@@ -2390,7 +2410,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Authoritative index list (exact store names): the provider relocates
 		// exactly these index stores instead of prefix-scanning `{oldName}_idx_`,
 		// which would also catch a sibling table named `{oldName}_idx_<x>`.
-		const indexNames = (currentSchema?.indexes ?? []).map(i => i.name);
+		// MATERIALIZED, so the hidden `_uc_*` store realizing a plain UNIQUE moves with
+		// the table — otherwise the renamed table seeks a fresh EMPTY `_uc_*` and silently
+		// accepts a duplicate of a pre-rename row. `currentSchema` itself stays
+		// non-materialized: the catalog DDL rewritten below must carry no `_uc_*`.
+		const indexNames = this.materializedIndexNames(existing, currentSchema);
 
 		// Reject when ANY physical name the rename introduces — the new data store
 		// AND each relocated index store `{schema}.{newName}_idx_{x}` — already
