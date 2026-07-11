@@ -1,11 +1,15 @@
 /**
- * Row-validating DDL (`create unique index`, `alter table … add constraint … unique`,
- * `alter table … alter column … set collate`) must see the rows the issuing transaction
- * wrote but has not yet committed, and the rule it declares must stay enforced for the
- * rest of that transaction — and after it commits.
+ * Row-validating / row-rewriting DDL (`create unique index`, `alter table … add constraint …
+ * unique`, `alter table … alter column … set collate`, `… set data type`, `… set not null`) must
+ * see the rows the issuing transaction wrote but has not yet committed, and the rule it declares
+ * must stay enforced for the rest of that transaction — and after it commits.
  *
- * Memory-only: the store backend reaches the same rules by a different route, and its
- * isolation overlay does not yet honor them (`isolation-ddl-validation-ignores-overlay-rows`).
+ * Memory-only: the store backend reaches the same rules by a different route. Its isolation overlay
+ * originally did NOT honor them; the UNIQUE analogue is closed by
+ * `isolation-ddl-validation-ignores-overlay-rows`, and `set not null` (reject + DEFAULT backfill,
+ * issuer + foreign overlay) by `bug-set-not-null-ignores-uncommitted-rows`. The store + isolation
+ * paths for those are covered by their own specs (see packages/quereus-isolation/test).
+ * `set data type` behind the isolation overlay remains an open gap (deferred).
  *
  * See docs/memory-table.md § DDL and transactions.
  */
@@ -1164,6 +1168,172 @@ describe('row-validating DDL inside an open transaction (memory backend)', () =>
 			await db.exec(`commit`);
 			await db.exec(`insert into t (id) values (2)`);
 			expect(await scalar(db, `select v from t where id = 2`)).to.equal('new');
+		});
+	});
+
+	describe('alter column … set not null sees the transaction\'s own rows', () => {
+		/** First column of every row, in query order. */
+		const values = async (sql: string): Promise<SqlValue[]> => {
+			const out: SqlValue[] = [];
+			for await (const row of db.eval(sql)) out.push(Object.values(row)[0]);
+			return out;
+		};
+
+		const notNullOf = (table: string, column: string): boolean =>
+			getManager(db, table).tableSchema.columns.find(c => c.name === column)?.notNull ?? false;
+
+		it('rejects a NULL that only exists in the pending layer', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, null)`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set not null`),
+				StatusCode.CONSTRAINT,
+				/contains NULL/i,
+			);
+
+			// The rejection mutated nothing: still nullable, transaction still usable.
+			expect(notNullOf('t', 'v')).to.equal(false);
+			await db.exec(`insert into t values (2, 'x')`);
+			expect(await rowCount(db, 't')).to.equal(2);
+			await db.exec(`rollback`);
+			expect(await rowCount(db, 't')).to.equal(0);
+		});
+
+		it('a pending NULL rejects even when every committed row is non-null', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, null)`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set not null`),
+				StatusCode.CONSTRAINT,
+				/contains NULL/i,
+			);
+			await db.exec(`rollback`);
+			expect(notNullOf('t', 'v')).to.equal(false);
+		});
+
+		it('accepts the change when the only NULL is in a pending-deleted row', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`insert into t values (1, null), (2, 'a')`);
+			await db.exec(`begin`);
+			await db.exec(`delete from t where id = 1`);
+			// Effective view holds only 'a'; the deleted NULL must not block the change.
+			await db.exec(`alter table t alter column v set not null`);
+			await db.exec(`commit`);
+
+			expect(notNullOf('t', 'v')).to.equal(true);
+			expect(await rowCount(db, 't')).to.equal(1);
+		});
+
+		it('backfills a pending NULL from a literal DEFAULT, leaving non-null rows untouched', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, null), (2, 'keep')`);
+			await db.exec(`alter table t alter column v set not null`);
+
+			// The pending NULL is backfilled; the non-null pending row is untouched — inside the
+			// transaction and after commit.
+			expect(await values(`select v from t order by id`)).to.deep.equal(['filled', 'keep']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t order by id`)).to.deep.equal(['filled', 'keep']);
+			expect(notNullOf('t', 'v')).to.equal(true);
+		});
+
+		it('backfills committed AND pending NULLs from a literal DEFAULT', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, null)`);
+			await db.exec(`alter table t alter column v set not null`);
+
+			expect(await values(`select v from t order by id`)).to.deep.equal(['filled', 'filled']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t order by id`)).to.deep.equal(['filled', 'filled']);
+		});
+
+		it('governs the rest of the transaction — a later NULL insert is rejected', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`alter table t alter column v set not null`);
+
+			await expectError(
+				() => db.exec(`insert into t values (2, null)`),
+				StatusCode.CONSTRAINT,
+				/NOT NULL constraint failed/i,
+			);
+			await db.exec(`insert into t values (3, 'b')`);
+			await db.exec(`commit`);
+			expect(await rowCount(db, 't')).to.equal(2);
+		});
+
+		it('backfills own rows written before AND after a savepoint', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`savepoint s`);
+			await db.exec(`insert into t values (2, null)`);
+			await db.exec(`alter table t alter column v set not null`);
+
+			// Rows sit in two different transaction layers; both are backfilled oldest-first.
+			expect(await values(`select v from t order by id`)).to.deep.equal(['filled', 'filled']);
+			await db.exec(`commit`);
+			expect(await values(`select v from t order by id`)).to.deep.equal(['filled', 'filled']);
+		});
+
+		it('rejects a NULL held only in an eager savepoint snapshot (no usable default)', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`savepoint s`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set not null`),
+				StatusCode.CONSTRAINT,
+				/contains NULL/i,
+			);
+			await db.exec(`rollback`);
+			expect(await rowCount(db, 't')).to.equal(0);
+		});
+
+		it('rejects a committed NULL in autocommit, leaving the table usable', async () => {
+			await db.exec(`create table t (id integer primary key, v text null)`);
+			await db.exec(`insert into t values (1, null)`);
+
+			await expectError(
+				() => db.exec(`alter table t alter column v set not null`),
+				StatusCode.CONSTRAINT,
+				/contains NULL/i,
+			);
+			expect(notNullOf('t', 'v')).to.equal(false);
+			expect(await rowCount(db, 't')).to.equal(1);
+		});
+
+		it('backfills a committed NULL in autocommit from a literal DEFAULT', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`alter table t alter column v set not null`);
+
+			expect(await values(`select v from t`)).to.deep.equal(['filled']);
+			expect(notNullOf('t', 'v')).to.equal(true);
+		});
+
+		it('a secondary index on the column resolves the backfilled value after commit', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled')`);
+			await db.exec(`create index tv on t (v)`);
+			await db.exec(`insert into t values (1, null)`);
+			await db.exec(`begin`);
+			await db.exec(`insert into t values (2, null)`);
+			await db.exec(`alter table t alter column v set not null`);
+
+			// The rewritten base + open-layer rows must be re-indexed under the backfilled value.
+			expect(await values(`select id from t where v = 'filled' order by id`)).to.deep.equal([1, 2]);
+			await db.exec(`commit`);
+			expect(await values(`select id from t where v = 'filled' order by id`)).to.deep.equal([1, 2]);
 		});
 	});
 

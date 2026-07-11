@@ -200,8 +200,9 @@ await db.exec("alter table users rename column created_at to registration_date")
 ## DDL and transactions
 
 `CREATE INDEX` / `CREATE UNIQUE INDEX` / `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` /
-`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` / `ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE`
-may run inside an open transaction. Three rules define what that means.
+`ALTER TABLE ... ALTER COLUMN ... SET COLLATE` / `ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE` /
+`ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` may run inside an open transaction. Three rules
+define what that means.
 
 **1. Row-validating DDL sees exactly what a `SELECT` in the same transaction sees.**
 `MemoryTableManager` validates against the DDL connection's *effective* rows — the committed
@@ -268,6 +269,20 @@ result matches the store backend, whose `alterColumnSetDataType` flushes buffere
 physical rewrite. Retyping a **primary-key** column is rejected outright (`CONSTRAINT`): the physical
 key bytes would change, which the in-place base rewrite cannot re-key — the type-change analogue of
 the SET COLLATE primary-key carve-out.
+
+**`SET NOT NULL` validates over the effective view and backfills through the same machinery.**
+Tightening a column to `NOT NULL` scans the effective rows (rule 1) for a NULL the transaction can
+see: a committed-or-pending NULL rejects the `ALTER` with `CONSTRAINT`, and one only in a row the
+transaction has deleted does not block it. When the column has a usable literal `DEFAULT`, those
+NULLs are *backfilled* instead of rejected — and this runs through the identical seam `SET DATA TYPE`
+uses (`convertBaseRows` replaces the base primary tree, `convertColumn` rewrites each open layer's
+own-writes oldest-first), with the value map `null → DEFAULT` and the `convertNulls` flag set so NULLs
+flow through the converter instead of passing untouched. Routing backfill through the base-replacement
+path (rather than an in-place `upsert`) is what lets it fill the transaction's own pending NULL rows —
+which live in the pending layer, not the base — and avoids mutating a base the open layers derive from
+(`MutatedBaseError`). The key bytes never change, so no primary-key re-key is involved. This matches
+the store backend, whose `alterColumnSetNotNull` flushes buffered writes before its `mapRowsAtIndex`
+backfill.
 
 **3. A collation change on a PRIMARY KEY column obeys a stricter rule, because the primary tree
 is a map.** A secondary index is a multi-map and tolerates two primary keys under one index key,

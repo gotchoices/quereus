@@ -2306,6 +2306,73 @@ describe('IsolationModule', () => {
 			expect(bState.poison!.message).to.equal(poisonMsg);
 			expect(bState.overlayTable, 'poisoned overlay not rebuilt').to.equal(staleOverlay);
 		});
+
+		// ── ALTER COLUMN … SET NOT NULL over staged overlay rows. Same tier structure as the
+		// addColumn NOT-NULL path: the issuer's own un-backfillable overlay aborts atomically,
+		// a foreign one with no usable DEFAULT is poisoned, and one with a usable DEFAULT is
+		// backfilled forward. The committed baseline row (5, 5) is non-null, so the underlying's
+		// own scan always passes — only staged overlay NULLs drive the outcome.
+
+		/** Tighten the (nullable) `x` column to NOT NULL. */
+		function setNotNullX(): SchemaChangeInfo {
+			return { type: 'alterColumn', columnName: 'x', setNotNull: true };
+		}
+
+		/** notNull flag of `x` on the live underlying manager schema (not the stale instance field). */
+		function underlyingXNotNull(): boolean {
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable as unknown as {
+				getSchema(): TableSchema | undefined;
+			};
+			return underlying.getSchema()!.columns.find(c => c.name === 'x')?.notNull ?? false;
+		}
+
+		it('SET NOT NULL applies and poisons a foreign overlay whose staged NULL cannot backfill', async () => {
+			await injectOverlay(dbB, [[10, null]]); // B stages a NULL at x; no usable DEFAULT
+
+			const updated = await iso.alterTable(dbA, 'main', 't', setNotNullX());
+
+			// The ALTER applied: x is NOT NULL in the returned schema and on the live underlying.
+			expect(updated.columns.find(c => c.name === 'x')?.notNull, 'returned schema tightened x').to.equal(true);
+			expect(underlyingXNotNull(), 'underlying x tightened').to.equal(true);
+
+			// B's overlay is poisoned (left in place, not migrated), with a self-explanatory message.
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'B overlay must be poisoned').to.not.be.undefined;
+			expect(bState.poison!.message).to.match(/NOT NULL/i);
+			expect(bState.poison!.message).to.match(/roll back this transaction/i);
+		});
+
+		it('SET NOT NULL rejects atomically when the issuer-own overlay holds an un-backfillable NULL', async () => {
+			await injectOverlay(dbA, [[1, null]]); // A itself stages the un-backfillable NULL
+
+			let err: unknown;
+			try { await iso.alterTable(dbA, 'main', 't', setNotNullX()); } catch (e) { err = e; }
+			expect(err, 'issuer-own un-backfillable overlay must abort the ALTER').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+
+			// Atomic: the shared underlying is untouched (x still nullable), and A's overlay is
+			// rejected up front, never poisoned.
+			expect(underlyingXNotNull(), 'underlying untouched after atomic rejection').to.equal(false);
+			const aState = overlayState(dbA)!;
+			expect(aState.poison, 'issuer-own overlay is rejected, never poisoned').to.be.undefined;
+			expect(aState.hasChanges).to.equal(true);
+		});
+
+		it('SET NOT NULL backfills a foreign overlay\'s staged NULL when a literal DEFAULT exists', async () => {
+			// Give x a literal DEFAULT first, so the tightening backfills the staged NULL instead
+			// of rejecting it. The overlay is injected AFTER, so its schema carries the DEFAULT.
+			await iso.alterTable(dbA, 'main', 't', { type: 'alterColumn', columnName: 'x', setDefault: { type: 'literal', value: 0 } });
+			await injectOverlay(dbB, [[10, null]]); // B stages a NULL at x
+
+			const updated = await iso.alterTable(dbA, 'main', 't', setNotNullX());
+			expect(updated.columns.find(c => c.name === 'x')?.notNull, 'x tightened').to.equal(true);
+
+			// B's overlay is migrated forward (NOT poisoned); its staged NULL is backfilled to 0.
+			const bState = overlayState(dbB)!;
+			expect(bState.poison, 'foreign overlay with a usable DEFAULT is backfilled, not poisoned').to.be.undefined;
+			const bRows = await asyncIterableToArray(bState.overlayTable.query!(fullScan()));
+			expect(bRows.map(r => [r[0], r[1]]), 'staged NULL backfilled to the DEFAULT').to.deep.equal([[10, 0]]);
+		});
 	});
 
 	describe('capability forwarding', () => {

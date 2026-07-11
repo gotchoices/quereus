@@ -374,4 +374,35 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 
 		await db.exec('rollback');
 	});
+
+	it('does NOT turn a SET NOT NULL reject into a silent success for an overlay-only NULL (no default)', async () => {
+		await db.exec(`create table t (id integer primary key, v text null) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, null)`); // overlay-only NULL; committed table is empty
+		// SET NOT NULL with no usable default against a (merged) NULL-holding table must reject, not
+		// silently succeed — the staged overlay row would otherwise carry a NULL in a NOT NULL column.
+		const err = await attemptAlter(db, `alter table t alter column v set not null`);
+		expect(err, 'SET NOT NULL must reject even when the NULL is overlay-only').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
+		const info = await columnInfo(db, 'v');
+		expect(info?.notnull, 'nullability unchanged after the rejected ALTER').to.equal(0);
+
+		await db.exec('rollback');
+	});
+
+	it('honored SET NOT NULL backfills a staged overlay NULL from a literal DEFAULT', async () => {
+		await db.exec(`create table t (id integer primary key, v text null default 'filled') using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, null)`); // overlay-only NULL
+		await db.exec(`alter table t alter column v set not null`);
+
+		const row = await db.get(`select v from t where id = 1`);
+		expect(row?.v, 'staged NULL backfilled to the DEFAULT').to.equal('filled');
+		await db.exec('commit');
+
+		const after = await db.get(`select v from t where id = 1`);
+		expect(after?.v, 'backfill persists past commit').to.equal('filled');
+		const info = await columnInfo(db, 'v');
+		expect(info?.notnull, 'column tightened to NOT NULL').to.equal(1);
+	});
 });

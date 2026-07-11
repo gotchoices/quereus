@@ -2024,15 +2024,16 @@ export class MemoryTableManager {
 			// A collation change re-keys any PK / UNIQUE / index that orders by this
 			// column, so it needs the structure re-sort + uniqueness re-validation below.
 			let collationChanged = false;
-			// Set when SET NOT NULL backfill physically rewrites stored row values in place (same
-			// PK, new value) — secondary indexes must be rebuilt so index-backed lookups see the
-			// new values, not the ones they were built from. (SET DATA TYPE takes the separate
-			// `typeConvert` path below, which REPLACES the base tree rather than mutating it.)
-			let valuesRewritten = false;
-			// Set to the value-conversion function when SET DATA TYPE physically retypes the
-			// column. Drives both the base-tree replacement and the transaction-layer conversion
-			// after `updateSchema` (see the rebuild section and convertColumnOnOpenLayers).
-			let typeConvert: ((v: SqlValue) => SqlValue) | null = null;
+			// Set to the per-value conversion function when a physical value rewrite is needed:
+			// SET DATA TYPE (retype every value) or SET NOT NULL backfill (map null → DEFAULT).
+			// Both REPLACE the base primary tree with a freshly-built one (never an in-place
+			// mutation, which inheritree forbids while the open transaction's layers derive from
+			// it) and convert the transaction's own-written rows in every open layer, after
+			// `updateSchema` (see the rebuild section and convertColumnOnOpenLayers).
+			let valueConvert: ((v: SqlValue) => SqlValue) | null = null;
+			// SET NOT NULL backfill also routes NULL values through `valueConvert`; SET DATA TYPE
+			// leaves nulls untouched. Selects the null-including path in convertBaseRows/convertColumn.
+			let convertNulls = false;
 
 			if (change.setCollation !== undefined) {
 				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
@@ -2053,35 +2054,41 @@ export class MemoryTableManager {
 				collationChanged = !nameMatches;
 			} else if (change.setNotNull !== undefined) {
 				if (change.setNotNull === true && !oldCol.notNull) {
-					// Tightening: scan for NULLs. If DEFAULT present, backfill first.
+					// Tightening: scan the DDL transaction's EFFECTIVE rows for NULLs — committed rows
+					// overlaid with this transaction's own pending writes — exactly as the setDataType
+					// arm does. A pending NULL the transaction can SEE rejects the ALTER; one only in a
+					// row it has DELETED does not block it. `rows` is the wrapper-supplied effective set
+					// (the isolation overlay); when absent, effectiveDdlRows() is the layered view.
 					const defaultExpr = oldCol.defaultValue;
-					let defaultLiteral: SqlValue | undefined;
-					if (defaultExpr) {
-						defaultLiteral = tryFoldLiteral(defaultExpr);
+					const defaultLiteral = defaultExpr ? tryFoldLiteral(defaultExpr) : undefined;
+
+					let anyNull = false;
+					if (rows) {
+						for await (const row of rows()) {
+							if (row[colIndex] === null) { anyNull = true; break; }
+						}
+					} else {
+						for (const row of this.effectiveDdlRows()) {
+							if (row[colIndex] === null) { anyNull = true; break; }
+						}
 					}
 
-					const tree = this.baseLayer.primaryTree;
-					const nullRows: Row[] = [];
-					for (const path of tree.ascending(tree.first())) {
-						const row = tree.at(path)!;
-						if (row[colIndex] === null) nullRows.push(row);
-					}
-
-					if (nullRows.length > 0) {
+					if (anyNull) {
 						if (defaultLiteral === undefined || defaultLiteral === null) {
 							throw new QuereusError(
 								`column ${change.columnName} contains NULL values`,
 								StatusCode.CONSTRAINT,
 							);
 						}
-						// Backfill NULLs with the default literal.
-						for (const row of nullRows) {
-							const newRow: Row = row.map((v, i) => i === colIndex ? defaultLiteral! : v) as Row;
-							// replace in-place: same PK, new value. `insert` no-ops on an existing key,
-							// so this must be `upsert`, which overwrites the entry in place.
-							tree.upsert(newRow);
-						}
-						valuesRewritten = true;
+						// Backfill: map null → the folded DEFAULT literal, routed through the SAME
+						// base-replacement + open-layer conversion machinery setDataType uses — no
+						// logical-type change, no PK re-key, no in-place base mutation. The old in-place
+						// `tree.upsert` backfill could not fill the transaction's pending rows (they live
+						// in the pending layer, not the base) and mutated a base the open layers derive
+						// from — both fixed by the unified path.
+						const literal = defaultLiteral;
+						valueConvert = (v: SqlValue) => (v === null ? literal : v);
+						convertNulls = true;
 					}
 
 					newCol = { ...oldCol, notNull: true };
@@ -2145,11 +2152,11 @@ export class MemoryTableManager {
 					}
 
 					// The base rows are converted below, AFTER `updateSchema`, by REPLACING the base
-					// primary tree with a fresh one (see the `typeConvert` branch) — never by an
+					// primary tree with a fresh one (see the `valueConvert` branch) — never by an
 					// in-place mutation, which inheritree forbids while the open transaction's layers
-					// derive from that tree (`MutatedBaseError`). `typeConvert` drives both the base
+					// derive from that tree (`MutatedBaseError`). `valueConvert` drives both the base
 					// replacement and the transaction-layer conversion.
-					typeConvert = convert;
+					valueConvert = convert;
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				}
 			} else if (change.setDefault !== undefined) {
@@ -2220,28 +2227,23 @@ export class MemoryTableManager {
 					basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
 					this.baseLayer.rebuildPrimaryTreeStrict();
 				}
-			} else if (typeConvert) {
-				// SET DATA TYPE: convert the committed base rows and REPLACE the primary tree with a
-				// fresh one holding them (not an in-place upsert — inheritree forbids mutating a base
-				// while the open transaction's layers derive from it). `rebuildPrimaryTreeFromRows`
-				// also rebuilds every secondary index from the converted rows. The old tree is saved
-				// for the catch's rollback, exactly as the PK-rekey path does.
+			} else if (valueConvert) {
+				// SET DATA TYPE / SET NOT NULL backfill: convert the committed base rows and REPLACE
+				// the primary tree with a fresh one holding them (not an in-place upsert — inheritree
+				// forbids mutating a base while the open transaction's layers derive from it).
+				// `rebuildPrimaryTreeFromRows` also rebuilds every secondary index from the converted
+				// rows, so index-backed lookups see the new values. The old tree is saved for the
+				// catch's rollback, exactly as the PK-rekey path does.
 				//
-				// A base value that fails to convert is kept as-is: validation over the effective view
-				// already rejected any unconvertible value the transaction can SEE, so a surviving one
-				// is shadowed by a pending delete/overwrite and is never read back (a ROLLBACK
-				// re-exposes it under the new type — DDL is not undone by rollback, the known behavior
-				// of `feat-ddl-transaction-capability`).
-				const convertedBaseRows = this.convertBaseRows(colIndex, typeConvert);
+				// SET DATA TYPE: a base value that fails to convert is kept as-is — validation over
+				// the effective view already rejected any unconvertible value the transaction can SEE,
+				// so a surviving one is shadowed by a pending delete/overwrite and is never read back
+				// (a ROLLBACK re-exposes it under the new type — DDL is not undone by rollback, the
+				// known behavior of `feat-ddl-transaction-capability`).
+				// SET NOT NULL (`convertNulls`): null base values are mapped to the DEFAULT literal.
+				const convertedBaseRows = this.convertBaseRows(colIndex, valueConvert, convertNulls);
 				basePrimaryTreeBeforeRekey = this.baseLayer.primaryTree;
 				this.baseLayer.rebuildPrimaryTreeFromRows(convertedBaseRows);
-			} else if (valuesRewritten) {
-				// SET NOT NULL backfill wrote new column values in place, so any secondary index on
-				// this column still holds keys extracted from the OLD values until rebuilt.
-				// NOTE: rebuilds EVERY secondary index, not only those covering the altered
-				// column; if a wide-index table ever shows this as slow, filter to indexes whose
-				// columns include colIndex. Mirrors the collationChanged path's unconditional rebuild.
-				this.baseLayer.rebuildAllSecondaryIndexes();
 			}
 
 			this.tableSchema = finalNewTableSchema;
@@ -2260,12 +2262,14 @@ export class MemoryTableManager {
 			// definition). Outside a transaction there are no open layers and both are no-ops.
 			if (collationChanged) {
 				this.adoptSchemaOnOpenLayers(finalNewTableSchema, pkColumnRekeyed);
-			} else if (typeConvert) {
-				// SET DATA TYPE converted the base above; the DDL transaction's own open layers
-				// still froze the old schema and hold their own-written rows under the old physical
-				// type. Swap the schema and convert those values so the rest of the transaction —
-				// and the committed head at commit — read the new type. No-op in autocommit.
-				this.convertColumnOnOpenLayers(finalNewTableSchema, colIndex, typeConvert);
+			} else if (valueConvert) {
+				// SET DATA TYPE / SET NOT NULL backfill converted the base above; the DDL
+				// transaction's own open layers still froze the old schema and hold their own-written
+				// rows unconverted. Swap the schema and convert those values so the rest of the
+				// transaction — and the committed head at commit — read the new value. For SET NOT
+				// NULL this fills the transaction's OWN pending NULL rows (which live in the pending
+				// layer, never reached by the old in-place base upsert). No-op in autocommit.
+				this.convertColumnOnOpenLayers(finalNewTableSchema, colIndex, valueConvert, convertNulls);
 			}
 
 			this.eventEmitter?.emitSchemaChange?.({
@@ -2948,19 +2952,20 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * The committed base rows for `alter column … set data type`, with the value at `colIndex`
-	 * run through `convert`. NULLs pass through untouched. A value that fails to convert is kept
-	 * as-is: the manager validated every value in the effective VIEW before calling, so a base
-	 * value that fails here is one a pending delete/overwrite shadows and no reader can see. The
-	 * result is a fresh full row list for {@link BaseLayer.rebuildPrimaryTreeFromRows} — the base
-	 * primary tree is REPLACED, never mutated in place (inheritree forbids mutating a tree the
-	 * open transaction's layers derive from).
+	 * The committed base rows for `alter column … set data type` / `set not null` backfill, with the
+	 * value at `colIndex` run through `convert`. NULLs pass through untouched UNLESS `convertNulls` is
+	 * set (the SET NOT NULL backfill maps null → DEFAULT). A value that fails to convert is kept as-is:
+	 * the manager validated every value in the effective VIEW before calling, so a base value that
+	 * fails here is one a pending delete/overwrite shadows and no reader can see. The result is a fresh
+	 * full row list for {@link BaseLayer.rebuildPrimaryTreeFromRows} — the base primary tree is
+	 * REPLACED, never mutated in place (inheritree forbids mutating a tree the open transaction's
+	 * layers derive from).
 	 */
-	private convertBaseRows(colIndex: number, convert: (v: SqlValue) => SqlValue): Row[] {
+	private convertBaseRows(colIndex: number, convert: (v: SqlValue) => SqlValue, convertNulls = false): Row[] {
 		const out: Row[] = [];
 		for (const row of iteratePrimaryRows(this.baseLayer.primaryTree)) {
 			const oldVal = row[colIndex];
-			if (oldVal === null) {
+			if (oldVal === null && !convertNulls) {
 				out.push(row);
 				continue;
 			}
@@ -3167,17 +3172,20 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Converts the retyped column's own-written values in every open transaction layer, after
-	 * `alter column … set data type` has converted the base. Runs oldest-first so each layer's
-	 * copy-on-write base inherits its parent's already-converted rows and only the layer's OWN
-	 * writes are rewritten (see {@link TransactionLayer.convertColumn}). No-op in autocommit.
+	 * Converts the altered column's own-written values in every open transaction layer, after
+	 * `alter column … set data type` / `set not null` backfill has converted the base. Runs
+	 * oldest-first so each layer's copy-on-write base inherits its parent's already-converted rows
+	 * and only the layer's OWN writes are rewritten (see {@link TransactionLayer.convertColumn}).
+	 * `convertNulls` routes null own-values through `convert` (the SET NOT NULL null → DEFAULT map);
+	 * SET DATA TYPE leaves them untouched. No-op in autocommit.
 	 *
 	 * PRIMARY-KEY columns never reach here — a physical retype of a key column is rejected before
-	 * any mutation — so the primary tree's keys are stable and no re-key is needed.
+	 * any mutation, and SET NOT NULL leaves the key bytes unchanged — so the primary tree's keys are
+	 * stable and no re-key is needed.
 	 */
-	private convertColumnOnOpenLayers(newSchema: TableSchema, colIndex: number, convert: (v: SqlValue) => SqlValue): void {
+	private convertColumnOnOpenLayers(newSchema: TableSchema, colIndex: number, convert: (v: SqlValue) => SqlValue, convertNulls = false): void {
 		for (const layer of this.openTransactionLayersOldestFirst()) {
-			layer.convertColumn(colIndex, convert, newSchema);
+			layer.convertColumn(colIndex, convert, newSchema, convertNulls);
 		}
 	}
 

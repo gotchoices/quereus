@@ -108,6 +108,30 @@ interface AddColumnBackfillContext {
 }
 
 /**
+ * Per-ALTER constants for an `alter column … set not null` overlay migration (see
+ * `deriveSetNotNullBackfill`). Precomputed once so the per-row translate/validate loops only
+ * branch on tombstone / has-default. Present only for a NOT NULL *tightening* (`setNotNull: true`)
+ * with staged overlays to migrate.
+ *
+ * NOTE: `alter column … set data type` has the SAME overlay gap — its issuer/foreign overlay
+ * rows are not converted here (the underlying's rowSource covers only committed rows). A later
+ * ticket closing that would hook a parallel `SetDataTypeBackfillContext` through this exact
+ * derive → validate → translate seam. See `alter-column-set-data-type-sees-transaction-rows.md`.
+ */
+interface SetNotNullBackfillContext {
+	/** Zero-based index of the now-NOT-NULL column in the overlay's data columns. */
+	colIndex: number;
+	/** The folded literal DEFAULT used to backfill staged NULLs; meaningful only when `hasDefault`. */
+	foldedDefault: SqlValue;
+	/** Whether a usable literal DEFAULT exists — backfill when true, reject the staged NULL when false. */
+	hasDefault: boolean;
+	/** Column name, for the CONSTRAINT / poison message. */
+	colName: string;
+	/** Owning table name, for the poison message. */
+	tableName: string;
+}
+
+/**
  * A module wrapper that adds transaction isolation to any underlying module.
  *
  * The isolation layer intercepts reads and writes:
@@ -1335,12 +1359,18 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// same context drives the post-mutation migration.
 		const addColumnCtx = this.deriveAddColumnBackfill(change, db, tableName);
 
+		// Build the setNotNull backfill context (undefined unless this is a NOT NULL tightening
+		// with overlays to migrate). The now-NOT-NULL column's index and folded DEFAULT are read
+		// from a to-be-migrated overlay's PRE-alter schema — the same layout every migrated overlay
+		// shares, and the same source `dropColumnIdx` uses above.
+		const setNotNullCtx = this.deriveSetNotNullBackfill(change, toMigrate, tableName);
+
 		// Tier 2: validate the ISSUER's own overlay BEFORE mutating the shared underlying.
 		// Any throw here (CONSTRAINT backfill or INTERNAL tombstone guard) propagates while
 		// underlying + catalog + every overlay are still untouched — the companion ticket's
 		// atomic-abort guarantee, preserved unchanged for the issuer.
 		if (ownEntry) {
-			await this.validateOverlayMigration(ownEntry[1], addColumnCtx);
+			await this.validateOverlayMigration(ownEntry[1], addColumnCtx, setNotNullCtx);
 		}
 
 		const underlyingState = this.getUnderlyingState(schemaName, tableName);
@@ -1372,7 +1402,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		if (ownEntry) {
 			await this.adoptRebuiltOverlay(
 				ownEntry[0], ownEntry[1], true, schemaName, tableName, ddlDescription,
-				() => this.migrateOverlayForAlter(db, ownEntry![1], updated, change, dropColumnIdx, addColumnCtx),
+				() => this.migrateOverlayForAlter(db, ownEntry![1], updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx),
 			);
 		}
 
@@ -1385,7 +1415,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// itself; healthy peers still migrate.
 		for (const [key, oldState] of foreign) {
 			try {
-				await this.validateOverlayMigration(oldState, addColumnCtx);
+				await this.validateOverlayMigration(oldState, addColumnCtx, setNotNullCtx);
 			} catch (e) {
 				if (e instanceof QuereusError && e.code === StatusCode.CONSTRAINT) {
 					oldState.poison = { message: this.buildAlterPoisonMessage(schemaName, tableName, change) };
@@ -1395,7 +1425,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			}
 			await this.adoptRebuiltOverlay(
 				key, oldState, false, schemaName, tableName, ddlDescription,
-				() => this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx),
+				() => this.migrateOverlayForAlter(db, oldState, updated, change, dropColumnIdx, addColumnCtx, setNotNullCtx),
 			);
 		}
 
@@ -1406,13 +1436,19 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * Builds the poison message stamped onto a foreign overlay whose backfill could not
 	 * satisfy a cross-connection ALTER (see {@link alterTable} tier 3). Names the
 	 * schema.table and the offending column so the owning connection's eventual
-	 * read/write/commit error is self-explanatory. Poison only arises on the addColumn
-	 * NOT NULL path, so the column name is taken from the addColumn change; other change
-	 * types never reach here but are handled defensively.
+	 * read/write/commit error is self-explanatory. Poison arises on the addColumn NOT NULL
+	 * path (a new NOT-NULL column with no usable default) and the `set not null` tightening
+	 * path (a staged NULL with no usable default); other change types never reach here but
+	 * are handled defensively.
 	 */
 	private buildAlterPoisonMessage(schemaName: string, tableName: string, change: SchemaChangeInfo): string {
-		const col = change.type === 'addColumn' ? change.columnDef.name : '<column>';
-		return `ALTER on '${schemaName}.${tableName}' added column '${col}' (NOT NULL) that this connection's uncommitted row cannot satisfy; roll back this transaction.`;
+		if (change.type === 'addColumn') {
+			return `ALTER on '${schemaName}.${tableName}' added column '${change.columnDef.name}' (NOT NULL) that this connection's uncommitted row cannot satisfy; roll back this transaction.`;
+		}
+		if (change.type === 'alterColumn') {
+			return `ALTER on '${schemaName}.${tableName}' tightened column '${change.columnName}' to NOT NULL, which this connection's uncommitted row violates; roll back this transaction.`;
+		}
+		return `ALTER on '${schemaName}.${tableName}' cannot migrate this connection's uncommitted rows; roll back this transaction.`;
 	}
 
 	/**
@@ -1586,6 +1622,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		change: SchemaChangeInfo,
 		dropColumnIdx: number | undefined,
 		addColumnCtx: AddColumnBackfillContext | undefined,
+		setNotNullCtx: SetNotNullBackfillContext | undefined,
 	): Promise<ConnectionOverlayState> {
 		const oldOverlay = oldState.overlayTable;
 		const oldOverlaySchema = oldOverlay.tableSchema;
@@ -1608,7 +1645,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					const addColumnValue = addColumnCtx
 						? await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx)
 						: undefined;
-					const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue);
+					const newRow = this.translateOverlayRow(oldRow, oldTombstoneIdx, change, dropColumnIdx, addColumnValue, setNotNullCtx);
 					await this.insertIntoRebuiltOverlay(newOverlayTable, newRow, updatedSchema.name);
 				}
 			}
@@ -1664,6 +1701,44 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Precomputes the per-ALTER constants an `alter column … set not null` overlay migration needs:
+	 * the now-NOT-NULL column's index and the folded literal DEFAULT (with `hasDefault` gating
+	 * backfill vs reject). Returns undefined unless this is a NOT NULL *tightening*
+	 * (`setNotNull: true`) with at least one overlay to migrate — a DROP NOT NULL loosens and
+	 * needs no staged-row work, and with no overlays there is nothing to backfill or reject.
+	 *
+	 * `change` for `set not null` carries no default expression, so the DEFAULT is read from the
+	 * column's PRE-alter schema (via a to-be-migrated overlay — the same source `dropColumnIdx`
+	 * uses, and the same layout every migrated overlay shares). Folded exactly as
+	 * {@link deriveAddColumnBackfill} folds its DEFAULT, so backfill and reject decisions here
+	 * cannot drift from what the underlying enforces over its committed rows.
+	 */
+	private deriveSetNotNullBackfill(
+		change: SchemaChangeInfo,
+		toMigrate: [string, ConnectionOverlayState][],
+		tableName: string,
+	): SetNotNullBackfillContext | undefined {
+		if (change.type !== 'alterColumn' || change.setNotNull !== true) return undefined;
+		if (toMigrate.length === 0) return undefined;
+		const overlaySchema = toMigrate[0][1].overlayTable.tableSchema;
+		if (!overlaySchema) return undefined;
+		const colIndex = overlaySchema.columnIndexMap.get(change.columnName.toLowerCase());
+		if (colIndex === undefined) return undefined;
+		const defaultExpr = overlaySchema.columns[colIndex]?.defaultValue;
+		// tryFoldLiteral returns undefined for a non-foldable expr and null for one that folds to
+		// NULL; both mean "no usable literal default" — the staged NULL must reject, not backfill.
+		const folded = defaultExpr ? tryFoldLiteral(defaultExpr) : undefined;
+		const hasDefault = folded !== undefined && folded !== null;
+		return {
+			colIndex,
+			foldedDefault: hasDefault ? folded : null,
+			hasDefault,
+			colName: change.columnName,
+			tableName,
+		};
+	}
+
+	/**
 	 * Dry-runs an overlay's ALTER migration-fallible work without mutating anything,
 	 * so the caller can run it for every affected overlay BEFORE the irreversible
 	 * `underlying.alterTable` (see {@link alterTable}). It exercises the EXACT code
@@ -1677,12 +1752,20 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 *   rows short-circuit to `null` (the evaluator never runs), and a NOT-NULL-violating
 	 *   evaluated row throws CONSTRAINT here, atomically. Computed values are discarded.
 	 *
-	 * Non-addColumn changes (`addColumnCtx === undefined`) only run the tombstone guard;
-	 * their row translation appends/removes nothing fallible on data grounds.
+	 * For `set not null` with NO usable DEFAULT (`setNotNullCtx.hasDefault === false`), a staged
+	 * non-tombstone NULL at the now-NOT-NULL column throws CONSTRAINT here — for the issuer this
+	 * aborts atomically before the underlying mutates; for a foreign overlay the caller maps it to
+	 * poison. With a usable DEFAULT the staged NULLs are backfilled by {@link translateOverlayRow},
+	 * so nothing is rejected here.
+	 *
+	 * Non-addColumn / non-tightening changes (`addColumnCtx === undefined` and no reject-mode
+	 * `setNotNullCtx`) only run the tombstone guard; their row translation appends/removes nothing
+	 * fallible on data grounds.
 	 */
 	private async validateOverlayMigration(
 		oldState: ConnectionOverlayState,
 		addColumnCtx: AddColumnBackfillContext | undefined,
+		setNotNullCtx: SetNotNullBackfillContext | undefined,
 	): Promise<void> {
 		const oldOverlay = oldState.overlayTable;
 		const oldOverlaySchema = oldOverlay.tableSchema;
@@ -1695,10 +1778,26 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			throw new QuereusError(`Tombstone column '${this.tombstoneColumn}' missing from overlay schema`, StatusCode.INTERNAL);
 		}
 
-		if (!addColumnCtx) return;
-		for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
-			// Discard the result — this is validation only. A NOT NULL violation throws here.
-			await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx);
+		if (addColumnCtx) {
+			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
+				// Discard the result — this is validation only. A NOT NULL violation throws here.
+				await this.computeAddColumnValue(addColumnCtx, oldRow, oldTombstoneIdx);
+			}
+			return;
+		}
+
+		// SET NOT NULL with no usable DEFAULT: reject a staged NULL the migration could not fill.
+		// (With a DEFAULT there is nothing to reject — translateOverlayRow backfills instead.)
+		if (setNotNullCtx && !setNotNullCtx.hasDefault) {
+			for await (const oldRow of oldOverlay.query(makeFullScanFilterInfo())) {
+				if (oldRow[oldTombstoneIdx] === 1) continue; // tombstone: placeholder NULLs, not a row
+				if (oldRow[setNotNullCtx.colIndex] === null) {
+					throw new QuereusError(
+						`column ${setNotNullCtx.colName} contains NULL values`,
+						StatusCode.CONSTRAINT,
+					);
+				}
+			}
 		}
 	}
 
@@ -1742,6 +1841,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * `addColumnValue` is the per-row value the caller computed for an `addColumn`
 	 * (via {@link computeAddColumnValue}); it is `undefined` for every other change
 	 * type. Keeping the (async) backfill in the caller's loop lets this stay synchronous.
+	 *
+	 * `setNotNullCtx` (present only for a `set not null` tightening WITH a usable DEFAULT) maps a
+	 * staged NULL at the now-NOT-NULL column to that DEFAULT — filling the issuer's own pending
+	 * rows, which the underlying's committed-row backfill never touches. Reject-mode contexts (no
+	 * DEFAULT) never reach here: {@link validateOverlayMigration} aborts/poisons first.
 	 */
 	private translateOverlayRow(
 		oldRow: Row,
@@ -1749,6 +1853,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		change: SchemaChangeInfo,
 		dropColumnIdx: number | undefined,
 		addColumnValue: SqlValue | undefined,
+		setNotNullCtx: SetNotNullBackfillContext | undefined,
 	): SqlValue[] {
 		const tombstoneValue = oldRow[oldTombstoneIdx] as SqlValue;
 		const data = Array.from(oldRow.slice(0, oldTombstoneIdx)) as SqlValue[];
@@ -1765,8 +1870,17 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 					? [...data.slice(0, dropColumnIdx), ...data.slice(dropColumnIdx + 1)]
 					: data;
 				break;
-			case 'renameColumn':
 			case 'alterColumn':
+				// SET NOT NULL backfill (WITH a usable DEFAULT): fill a staged NULL at the
+				// now-NOT-NULL column. Tombstones carry placeholder NULLs never read, so leave them.
+				// Every other alterColumn attribute (and the no-DEFAULT reject case) leaves data as-is.
+				// NOTE: SET DATA TYPE also alters existing values but is NOT converted here — its
+				// overlay gap is deferred (see SetNotNullBackfillContext doc).
+				newData = (setNotNullCtx && tombstoneValue !== 1)
+					? data.map((v, i) => (i === setNotNullCtx.colIndex && v === null ? setNotNullCtx.foldedDefault : v))
+					: data;
+				break;
+			case 'renameColumn':
 			case 'alterPrimaryKey':
 			case 'addConstraint':
 			case 'dropConstraint':

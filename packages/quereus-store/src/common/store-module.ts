@@ -1828,7 +1828,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// open transaction untouched.
 		let attr: AlterColumnAttrChange | null;
 		if (change.setNotNull !== undefined) {
-			attr = await this.alterColumnSetNotNull(table, oldSchema, oldCol, colIndex, change);
+			attr = await this.alterColumnSetNotNull(table, oldSchema, oldCol, colIndex, change, rows);
 		} else if (change.setDataType !== undefined) {
 			attr = await this.alterColumnSetDataType(table, oldCol, colIndex, change);
 		} else if (change.setDefault !== undefined) {
@@ -1949,6 +1949,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * new column schema, or null when the column is already in the desired nullability
 	 * (the pre-refactor `return oldSchema` no-op). The NULL-backfill probe and rewrite
 	 * order (throw-only probe before {@link ddlCommitPendingOps}) is unchanged.
+	 *
+	 * `rows` is the wrapper-supplied effective row source (the isolation overlay). When present,
+	 * the reject-vs-backfill decision scans it instead of `table.rowsWithNullAtIndex`: behind the
+	 * isolation layer the issuer's pending inserts live in the wrapper's overlay, not this store,
+	 * so the store's own count would miss them and wrongly accept the ALTER. The committed-store
+	 * `mapRowsAtIndex` backfill is unchanged — the overlay-resident pending rows are the isolation
+	 * layer's job (its overlay migration), this store only owns its committed rows.
 	 */
 	private async alterColumnSetNotNull(
 		table: StoreTable,
@@ -1956,6 +1963,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		oldCol: ColumnSchema,
 		colIndex: number,
 		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
+		rows?: EffectiveRowSource,
 	): Promise<AlterColumnAttrChange | null> {
 		let newCol: ColumnSchema;
 		let valuesRewritten = false;
@@ -1966,10 +1974,20 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			if (expr && (expr as { type?: string }).type === 'literal') {
 				defaultLiteral = (expr as { value?: SqlValue }).value ?? null;
 			}
-			// Reads effectively, so a row this transaction inserted with a NULL is
-			// seen — it is backfilled (or rejects the ALTER) like any other row.
-			const nullCount = await table.rowsWithNullAtIndex(colIndex);
-			if (nullCount > 0) {
+			// Decide reject-vs-backfill over the DDL transaction's EFFECTIVE rows. `rows()` (the
+			// isolation overlay) sees the issuer's pending inserts; `rowsWithNullAtIndex` (run
+			// directly, no wrapper) sees the store's own effective rows. Either way a NULL the
+			// transaction can see is backfilled, or rejects the ALTER, like any other row.
+			let anyNull: boolean;
+			if (rows) {
+				anyNull = false;
+				for await (const row of rows()) {
+					if (row[colIndex] === null) { anyNull = true; break; }
+				}
+			} else {
+				anyNull = (await table.rowsWithNullAtIndex(colIndex)) > 0;
+			}
+			if (anyNull) {
 				if (defaultLiteral === undefined || defaultLiteral === null) {
 					// Throw-only, and before the DDL-commit below: the transaction survives.
 					throw new QuereusError(
@@ -1978,9 +1996,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 					);
 				}
 				const fill = defaultLiteral;
-				// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex`
-				// backfills this transaction's NULL rows too (the probe above saw
-				// them; a committed-store rewrite cannot). See {@link ddlCommitPendingOps}.
+				// Physical rewrite ahead — flush buffered writes so `mapRowsAtIndex` backfills this
+				// store's own NULL rows. Run directly, that also fills the transaction's rows (the
+				// probe saw them). Behind isolation the issuer's overlay-resident NULL rows are
+				// filled by the isolation layer's overlay migration, not here — this store never
+				// holds them. See {@link ddlCommitPendingOps}.
 				await this.ddlCommitPendingOps();
 				await table.mapRowsAtIndex(colIndex, (v) => v === null ? fill : v);
 				valuesRewritten = true;

@@ -376,6 +376,60 @@ describe('Isolated Store Module', () => {
 		});
 	});
 
+	/**
+	 * `ALTER COLUMN … SET NOT NULL` over rows staged in the isolation overlay, with the STORE as
+	 * the underlying. The reject-vs-backfill decision has to consult the isolation-supplied
+	 * effective rows, not just the committed store — a pending NULL lives in the overlay, so the
+	 * store's own `rowsWithNullAtIndex` count would miss it and wrongly accept the ALTER
+	 * (bug-set-not-null-ignores-uncommitted-rows). Drives engine → isolation → store end-to-end.
+	 */
+	describe('mid-transaction SET NOT NULL over staged overlay rows', () => {
+		beforeEach(() => {
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+		});
+
+		it('rejects a NULL that only exists in the overlay (no usable DEFAULT), leaving the txn usable', async () => {
+			await db.exec(`create table t (id integer primary key, v text null) using store`);
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, null)`); // staged in the overlay, not the store
+
+			let err: unknown;
+			try { await db.exec(`alter table t alter column v set not null`); } catch (e) { err = e; }
+			expect(err, 'an overlay-only NULL must reject the tighten').to.not.be.undefined;
+			expect(String(err)).to.match(/contains NULL values/i);
+
+			// The transaction survives the rejection and keeps working; rollback leaves nothing.
+			await db.exec(`insert into t values (2, 'x')`);
+			await db.exec('rollback');
+			expect(await asyncIterableToArray(db.eval(`select id, v from t`))).to.deep.equal([]);
+		});
+
+		it('backfills an overlay NULL from a literal DEFAULT, leaving non-null rows untouched', async () => {
+			await db.exec(`create table t (id integer primary key, v text null default 'filled') using store`);
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, null), (2, 'keep')`);
+			await db.exec(`alter table t alter column v set not null`);
+			await db.exec('commit');
+
+			// `committed.*` bypasses the overlay: only what actually reached the store, backfilled.
+			expect(await asyncIterableToArray(db.eval(`select id, v from committed.t order by id`)))
+				.to.deep.equal([{ id: 1, v: 'filled' }, { id: 2, v: 'keep' }]);
+		});
+
+		it('rejects a committed store NULL seen through the overlay', async () => {
+			await db.exec(`create table t (id integer primary key, v text null) using store`);
+			await db.exec(`insert into t values (1, null)`); // committed to the store
+			await db.exec('begin');
+			await db.exec(`insert into t values (2, 'x')`);  // pending, non-null
+
+			let err: unknown;
+			try { await db.exec(`alter table t alter column v set not null`); } catch (e) { err = e; }
+			expect(err, 'a committed NULL still blocks the tighten').to.not.be.undefined;
+			expect(String(err)).to.match(/contains NULL values/i);
+			await db.exec('rollback');
+		});
+	});
+
 	// Regression for `store-range-seek-collation-bounds` on the MERGED query path:
 	// with the store advertising `honorsCollatedRangeBounds`, a collation-matched
 	// NOCASE PK range is pushed down with NO residual Filter, so inside a

@@ -324,15 +324,18 @@ export class TransactionLayer implements Layer {
 	}
 
 	/**
-	 * Adopts an `alter column … set data type` conversion applied while THIS layer's transaction
-	 * is still open: swaps in the retyped schema and rewrites the CONVERTED value into every
-	 * own-written row at `colIndex`, so the rest of the transaction — and, at commit, the committed
-	 * head — read the new physical value instead of the raw one the transaction wrote.
+	 * Adopts an `alter column … set data type` / `set not null` backfill conversion applied while
+	 * THIS layer's transaction is still open: swaps in the new schema and rewrites the CONVERTED value
+	 * into every own-written row at `colIndex`, so the rest of the transaction — and, at commit, the
+	 * committed head — read the new value instead of the raw one the transaction wrote. This is what
+	 * fills the transaction's OWN pending NULL rows for SET NOT NULL backfill, which live in this
+	 * layer, not the base.
 	 *
-	 * NON-primary-key column only. `MemoryTableManager.alterColumn` rejects a physical retype of a
-	 * key column before any mutation, so the primary key encoding is unchanged: {@link pkFunctions}
-	 * and the primary tree keep their keys, and only the value at `colIndex` moves. (Contrast
-	 * {@link rekeyPrimaryKey}, which must rebuild the tree because the keys themselves change.)
+	 * NON-primary-key column, or a key column whose bytes are unchanged. `MemoryTableManager.alterColumn`
+	 * rejects a physical retype of a key column before any mutation, and SET NOT NULL leaves the key
+	 * bytes intact, so the primary key encoding is unchanged: {@link pkFunctions} and the primary tree
+	 * keep their keys, and only the value at `colIndex` moves. (Contrast {@link rekeyPrimaryKey}, which
+	 * must rebuild the tree because the keys themselves change.)
 	 *
 	 * Like {@link adoptSchema} / {@link rekeyPrimaryKey}, the caller MUST apply this oldest-first
 	 * (base already converted): the layer's copy-on-write base inherits the parent's already-converted
@@ -343,12 +346,13 @@ export class TransactionLayer implements Layer {
 	 * carrying converted values — is what the rebase (`MemoryTableManager.rebaseLayerOntoHead`) and
 	 * any later `create index` ({@link reindexOwnWrites}) replay.
 	 *
-	 * A value that fails to convert is left as-is (not an error): the manager validated every value
-	 * in the effective VIEW before calling, so an unconvertible own value here is one a higher layer
-	 * has shadowed — it is never read through this layer, and re-converting it would double-fault a
-	 * value the transaction cannot see. It matches the base rewrite's same-reasoned skip.
+	 * NULL own-values pass through untouched UNLESS `convertNulls` is set (the SET NOT NULL backfill
+	 * maps null → DEFAULT). A value that fails to convert is left as-is (not an error): the manager
+	 * validated every value in the effective VIEW before calling, so an unconvertible own value here is
+	 * one a higher layer has shadowed — it is never read through this layer, and re-converting it would
+	 * double-fault a value the transaction cannot see. It matches the base rewrite's same-reasoned skip.
 	 */
-	public convertColumn(colIndex: number, convert: (v: SqlValue) => SqlValue, newSchema: TableSchema): void {
+	public convertColumn(colIndex: number, convert: (v: SqlValue) => SqlValue, newSchema: TableSchema, convertNulls = false): void {
 		const preTree = this.primaryModifications;
 		this.tableSchemaAtCreation = newSchema;
 
@@ -385,7 +389,7 @@ export class TransactionLayer implements Layer {
 			}
 			const oldVal = effectiveRow[colIndex];
 			let newRow = effectiveRow;
-			if (oldVal !== null) {
+			if (oldVal !== null || convertNulls) {
 				try {
 					const newVal = convert(oldVal);
 					newRow = effectiveRow.map((v, i) => i === colIndex ? newVal : v) as Row;
