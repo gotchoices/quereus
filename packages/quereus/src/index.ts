@@ -256,7 +256,7 @@ export { BUILTIN_NORMALIZERS, serializeRowKey, serializeKeyNullGrouping } from '
 // isolation overlay's modified-PK set) must gate on this exactly as the engine's own
 // emitters do via `hashKeyCollationName`, or a comparator-only collation named on a
 // non-text primary-key column raises where the engine would not.
-export { logicalTypeCanHoldText } from './planner/analysis/comparison-collation.js';
+export { logicalTypeCanHoldText, pkKeyCollationName } from './planner/analysis/comparison-collation.js';
 
 // Canonical JSON key form (recursive object-key sort) — used by store modules to
 // derive persisted byte keys that agree with the in-memory JSON comparator, so

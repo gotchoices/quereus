@@ -1,5 +1,5 @@
 import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, logicalTypeCanHoldText, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, validateAndParse } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, validateAndParse } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -455,20 +455,23 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// collation-aware encoder — NOT JSON.stringify, which throws on a bigint PK
 		// value and ignores collation (a NOCASE PK rewritten 'abc' -> 'ABC' would fail
 		// to shadow the underlying 'abc', surfacing both rows). One normalizer per PK
-		// column, drawn from that column's declared collation via the connection's own
-		// resolver, so equal keys under the PK collation encode to identical strings —
-		// matching getComparePK/keysEqual and agreeing with `db.registerCollation`.
+		// column, drawn from `pkKeyCollationName` (the same decision `resolvePkKeyCollations`
+		// makes for the store's on-disk PK encoding) via the connection's own resolver, so
+		// equal keys under the PK collation encode to identical strings — matching
+		// getComparePK/keysEqual and agreeing with `db.registerCollation`.
 		//
 		// A PK column whose declared type can never hold text takes the identity
 		// normalizer regardless of its collation: `serializeRowKey` normalizes only
 		// string values, so the collation cannot affect how such a key buckets. Asking
 		// the resolver for it would reject `n integer collate mycoll` under a
 		// comparator-only collation, which the engine's own hash sites accept (they gate
-		// through `hashKeyCollationName`, the same predicate).
+		// through `hashKeyCollationName`, the same predicate). A text-capable-but-not-
+		// `isTextual` column (`any`, `json`, the temporal types) is keyed under `'BINARY'`
+		// regardless of its declared collation, since PK equality compares those types
+		// through `logicalType.compare`, which ignores collation entirely.
 		const pkNormalizers = pkIndices.map(i => {
 			const column = this.tableSchema!.columns[i];
-			return this.keyNormalizerResolver(
-				logicalTypeCanHoldText(column.logicalType) ? column.collation : undefined);
+			return this.keyNormalizerResolver(pkKeyCollationName(column));
 		});
 
 		// Step 1: Collect all PKs modified in overlay (full scan)

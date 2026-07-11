@@ -334,6 +334,34 @@ export function logicalTypeCanHoldText(logicalType: LogicalType | undefined): bo
 	return !NEVER_TEXT_PHYSICAL_TYPES.has(logicalType.physicalType);
 }
 
+/**
+ * The collation a PK-EQUALITY key normalizer must resolve under for one primary-key
+ * column, or `undefined` when the column can never hold text (a key normalizer only
+ * ever touches string values, so collation is moot there).
+ *
+ * A text-capable-but-not-`isTextual` column — `any`, `json`, the temporal types — gets
+ * hard-coded `'BINARY'` regardless of its declared collation: PK equality compares
+ * through `logicalType.compare` (`createTypedComparator`), which ignores the collation
+ * it is handed for every one of those types (ANY and the temporals compare under
+ * BINARY_COLLATION; JSON structurally). Keying such a column under its declared
+ * collation — say `k any collate nocase` — would bucket `'A'` and `'a'` together even
+ * though the comparator that actually orders/equates primary keys treats them as
+ * distinct, silently merging two rows into one.
+ *
+ * Only `isTextual` columns (`text`) apply their own declared collation, since
+ * `TEXT_TYPE.compare` is the one comparator that honors it.
+ *
+ * Mirrors {@link resolvePkKeyCollations} in `quereus-store`, which makes the identical
+ * decision for the store's on-disk PK key encoding; the isolation overlay's modified-PK
+ * set (`quereus-isolation`) is the other caller, keying overlay rows the same way.
+ */
+export function pkKeyCollationName(
+	column: { logicalType: LogicalType; collation?: string } | undefined
+): string | undefined {
+	if (!column || !logicalTypeCanHoldText(column.logicalType)) return undefined;
+	return column.logicalType.isTextual ? column.collation : 'BINARY';
+}
+
 /** True when a value of this type could be a text string at runtime. Absent type ⇒ unknown ⇒ yes. */
 function typeCanHoldText(t: ScalarType): boolean {
 	return logicalTypeCanHoldText(t.logicalType);

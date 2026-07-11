@@ -27,6 +27,7 @@ import {
 	maintainedTableUniqueViolationError,
 	uniqueEnforcementCollations,
 	logicalTypeCanHoldText,
+	pkKeyCollationName,
 	type Database,
 	type DatabaseInternal,
 	type CollationFunction,
@@ -135,19 +136,12 @@ export function resolvePkKeyCollations(
 ): (string | undefined)[] {
 	return pkDef.map(def => {
 		const col = columns[def.index];
-		if (!col || !columnCanHoldText(col)) return undefined;
-		// A text-capable-but-not-`isTextual` type supplies its own `logicalType.compare`, which
-		// `createTypedComparator` calls WITHOUT letting the collation influence the result:
-		// ANY_TYPE compares under `BINARY_COLLATION`, the temporal types under `BINARY_COLLATION`
-		// or a semantic order, JSON_TYPE structurally. `TEXT_TYPE.compare` is the only one that
-		// applies the collation it is handed. Keying these members under the column's declared
-		// collation (which `validateCollationForType` accepts for ANY, since its
-		// `supportedCollations` is undefined) or under K would enforce uniqueness under a
-		// collation nothing compares under: `'A'` and `'a'` are distinct BINARY values that
-		// collide at one NOCASE key. BINARY is the only key collation that never conflates two
-		// values the comparator calls distinct.
-		if (!col.logicalType.isTextual) return 'BINARY';
-		return (col.collation || fallback).toUpperCase();
+		// Delegates the isTextual/text-capable/never-text branch to the engine's
+		// `pkKeyCollationName` — the same decision `quereus-isolation`'s modified-PK set
+		// makes for its own key normalizers, so the two can never drift apart again. Only
+		// the fallback-to-K and uppercase-normalization are store-specific.
+		const name = pkKeyCollationName(col);
+		return name === undefined ? undefined : (name || fallback).toUpperCase();
 	});
 }
 

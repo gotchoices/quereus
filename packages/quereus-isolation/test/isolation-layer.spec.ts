@@ -503,6 +503,39 @@ describe('IsolationModule', () => {
 			await db.exec('ROLLBACK');
 		});
 
+		it('keeps case-distinct `any`-typed PK rows separate under a declared (inert) NOCASE', async () => {
+			await db.exec(`
+				CREATE TABLE t (
+					k ANY COLLATE NOCASE PRIMARY KEY,
+					v TEXT
+				) USING isolated
+			`);
+			await db.exec(`CREATE INDEX idx_v ON t(v)`);
+
+			// Two committed rows whose PKs differ only in case — genuinely distinct under
+			// ANY_TYPE.compare, which always compares BINARY regardless of the declared
+			// (and inert) NOCASE collation.
+			await db.exec(`INSERT INTO t VALUES ('A', 'upper')`);
+			await db.exec(`INSERT INTO t VALUES ('a', 'lower')`);
+
+			await db.exec('BEGIN');
+			// Modify one of the pair via a secondary-index-driven scan (idx_v), which builds
+			// its modified-PK set through the collation-aware key normalizer. Pre-fix, that
+			// normalizer keys 'A' and 'a' under NOCASE and treats them as the same PK, so
+			// the untouched 'a' row is wrongly excluded from the merge.
+			await db.exec(`UPDATE t SET v = 'changed' WHERE k = 'A'`);
+
+			const changed = await asyncIterableToArray(db.eval(`SELECT k, v FROM t WHERE v = 'changed'`));
+			expect(changed.length).to.equal(1);
+			expect(changed[0].k).to.equal('A');
+
+			const untouched = await asyncIterableToArray(db.eval(`SELECT k, v FROM t WHERE v = 'lower'`));
+			expect(untouched.length).to.equal(1);
+			expect(untouched[0].k).to.equal('a');
+
+			await db.exec('ROLLBACK');
+		});
+
 		it('enforces a non-PK UNIQUE when an insert revives a tombstoned PK in the same txn', async () => {
 			await db.exec(`
 				CREATE TABLE t (
