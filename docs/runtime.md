@@ -1761,6 +1761,31 @@ caller then `await`s just reintroduces the hop. `instanceof Promise` is the righ
 value. Genuinely-async sub-programs (e.g. a correlated scalar subquery) still work — they
 take the promise branch.
 
+#### Short-circuiting operators reuse this pattern
+
+`CASE` (`runtime/emit/case.ts`) and `AND`/`OR` (`runtime/emit/binary.ts`) both emit
+their deferrable operands as on-demand callbacks (`emitCallFromPlan`) and invoke only
+the branches SQL semantics require. Each `run` returns `MaybePromise<SqlValue>` and
+stays fully synchronous whenever the invoked callbacks resolve synchronously — the
+`instanceof Promise` branch above is taken only for a genuinely async branch (e.g. a
+scalar-subquery operand). Two consequences worth pinning:
+
+- **`CASE` always short-circuits — no cost gate.** SQL evaluates `WHEN` clauses
+  left-to-right, stops at the first match, and evaluates *only* the selected result.
+  So every `WHEN`/`THEN`/`ELSE` is deferred unconditionally (the simple-`CASE` base
+  expr stays an eager param, evaluated once). This is a **behavior change**: a branch
+  that would throw, divide by zero, or run a subquery no longer executes unless
+  selected — `select case when 1=1 then 'ok' else throwing_udf() end` now returns
+  `'ok'` where it previously raised. `AND`/`OR`, by contrast, defer only a
+  subquery-bearing right operand (perf, not correctness — see `emitLogicalOp`).
+- **The synchronous return matters beyond perf.** The materialized-view row-time
+  projection gate (`compileSourceRowEvaluator` in
+  `database-materialized-views-analysis.ts`) rejects a `Promise` result for a gated
+  single-row scalar. A `CASE` in a covering-structure body qualifies for that gate, so
+  its `run` must return a concrete value synchronously — declaring the `run` `async`
+  (forcing every result into a `Promise`) would break maintenance of any view whose
+  body contains a `CASE`.
+
 ### Common pitfalls checklist
 
 - **Scope resolution.** Most column-reference errors are scope issues: a scope missing

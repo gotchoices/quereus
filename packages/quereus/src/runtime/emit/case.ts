@@ -1,88 +1,113 @@
 import type { CaseExprNode } from '../../planner/nodes/scalar.js';
 import type { Instruction, RuntimeContext } from '../types.js';
 import { asRun } from '../types.js';
-import { emitPlanNode } from '../emitters.js';
-import { type SqlValue } from '../../common/types.js';
+import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
+import { type SqlValue, type MaybePromise } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { compareSqlValues } from '../../util/comparison.js';
 import { isTruthy } from '../../util/comparison.js';
 
+/** On-demand branch callback — evaluates its sub-expression only when invoked. */
+type BranchFn = (ctx: RuntimeContext) => MaybePromise<SqlValue>;
+
 export function emitCaseExpr(plan: CaseExprNode, ctx: EmissionContext): Instruction {
-	// Simple CASE: CASE base_expr WHEN value1 THEN result1 WHEN value2 THEN result2 ... END
-	function runSimpleCase(
-		runtimeCtx: RuntimeContext,
-		...args: SqlValue[]
-	): SqlValue {
-		let argIndex = 0;
-		const baseValue = args[argIndex++];
+	// CASE must ALWAYS short-circuit: SQL evaluates WHEN clauses left-to-right,
+	// stops at the first match, and evaluates ONLY the selected result. An
+	// unmatched THEN/ELSE (or a later WHEN after an earlier one matched) must
+	// never run — otherwise a branch that would throw/divide-by-zero/run a
+	// subquery raises an error it was never supposed to. So every WHEN/THEN/ELSE
+	// is emitted as an on-demand callback (emitCallFromPlan) and invoked lazily.
+	// Unlike AND/OR (binary.ts), there is no cost/subquery gate: correctness, not
+	// perf, forces the deferral, so it is unconditional. The base expr of a simple
+	// CASE stays an eager param — it is always needed and evaluated exactly once.
+	//
+	// The run stays SYNCHRONOUS whenever every invoked branch callback resolves
+	// synchronously (the common case, and the one the materialized-view row-time
+	// gate in database-materialized-views-analysis.ts requires): a Promise is
+	// only produced when a selected/consulted branch is genuinely async (e.g. a
+	// scalar subquery). This mirrors the AND/OR short-circuit's sync fast path —
+	// declaring the run `async` would force every CASE result into a Promise and
+	// break that gate.
+	const clauseCount = plan.whenThenClauses.length;
 
-		// Evaluate WHEN/THEN clauses
-		for (const _clause of plan.whenThenClauses) {
-			const whenValue = args[argIndex++];
-			const thenValue = args[argIndex++];
-
-			const conditionMet = baseValue !== null && whenValue !== null &&
-				compareSqlValues(baseValue as SqlValue, whenValue) === 0;
-
-			if (conditionMet) {
-				return thenValue;
-			}
-		}
-
-		// No WHEN clause matched, return ELSE value or NULL
-		if (plan.elseExpr) {
-			return args[argIndex]; // ELSE value
-		} else {
-			return null; // No ELSE clause, return NULL
-		}
-	}
-
-	// Searched CASE: CASE WHEN condition1 THEN result1 WHEN condition2 THEN result2 ... END
+	// Searched CASE: CASE WHEN c1 THEN r1 ... ELSE e END
+	// args layout: [when0, then0, when1, then1, ..., else?]
 	function runSearchedCase(
 		runtimeCtx: RuntimeContext,
-		...args: SqlValue[]
-	): SqlValue {
-		let argIndex = 0;
+		...args: BranchFn[]
+	): MaybePromise<SqlValue> {
+		const noMatch = (): MaybePromise<SqlValue> =>
+			plan.elseExpr ? args[clauseCount * 2](runtimeCtx) : null;
 
-		// Evaluate WHEN/THEN clauses
-		for (const _clause of plan.whenThenClauses) {
-			const whenValue = args[argIndex++];
-			const thenValue = args[argIndex++];
-
-			if (isTruthy(whenValue)) {
-				return thenValue;
+		const step = (i: number): MaybePromise<SqlValue> => {
+			if (i >= clauseCount) return noMatch();
+			const whenFn = args[i * 2];
+			const thenFn = args[i * 2 + 1];
+			const w = whenFn(runtimeCtx);
+			// Evaluate ONLY this THEN on a match; otherwise recurse to the next clause.
+			// Later clauses are never touched once one matches.
+			if (w instanceof Promise) {
+				return w.then(wv => (isTruthy(wv) ? thenFn(runtimeCtx) : step(i + 1)));
 			}
-		}
+			return isTruthy(w) ? thenFn(runtimeCtx) : step(i + 1);
+		};
 
-		// No WHEN clause matched, return ELSE value or NULL
-		if (plan.elseExpr) {
-			return args[argIndex]; // ELSE value
-		} else {
-			return null; // No ELSE clause, return NULL
-		}
+		return step(0);
 	}
 
-	// Emit instructions for all sub-expressions
+	// Simple CASE: CASE base WHEN v1 THEN r1 ... ELSE e END
+	// args layout: [base, when0, then0, when1, then1, ..., else?]
+	function runSimpleCase(
+		runtimeCtx: RuntimeContext,
+		...args: [SqlValue, ...BranchFn[]]
+	): MaybePromise<SqlValue> {
+		const baseValue = args[0] as SqlValue;
+		const branch = (idx: number): BranchFn => args[idx] as BranchFn;
+
+		// NULL base never matches any WHEN — falls through to ELSE/NULL.
+		const matches = (whenValue: SqlValue): boolean =>
+			baseValue !== null && whenValue !== null &&
+			compareSqlValues(baseValue, whenValue) === 0;
+
+		const noMatch = (): MaybePromise<SqlValue> =>
+			plan.elseExpr ? branch(1 + clauseCount * 2)(runtimeCtx) : null;
+
+		const step = (i: number): MaybePromise<SqlValue> => {
+			if (i >= clauseCount) return noMatch();
+			const whenFn = branch(1 + i * 2);
+			const thenFn = branch(1 + i * 2 + 1);
+			const w = whenFn(runtimeCtx);
+			if (w instanceof Promise) {
+				return w.then(wv => (matches(wv) ? thenFn(runtimeCtx) : step(i + 1)));
+			}
+			return matches(w) ? thenFn(runtimeCtx) : step(i + 1);
+		};
+
+		return step(0);
+	}
+
+	// Emit instructions for all sub-expressions. Base stays eager; every
+	// WHEN/THEN/ELSE becomes an on-demand callback so unmatched branches never run.
 	const paramInstructions: Instruction[] = [];
 
 	if (plan.baseExpr) {
 		paramInstructions.push(emitPlanNode(plan.baseExpr, ctx));
 	}
 
-	// TODO: consider making all of these calls for short-circuiting
-
 	for (const clause of plan.whenThenClauses) {
-		paramInstructions.push(emitPlanNode(clause.when, ctx));
-		paramInstructions.push(emitPlanNode(clause.then, ctx));
+		paramInstructions.push(emitCallFromPlan(clause.when, ctx));
+		paramInstructions.push(emitCallFromPlan(clause.then, ctx));
 	}
 
 	if (plan.elseExpr) {
-		paramInstructions.push(emitPlanNode(plan.elseExpr, ctx));
+		paramInstructions.push(emitCallFromPlan(plan.elseExpr, ctx));
 	}
 
+	// asRun each branch independently — their arg tuples differ (simple CASE
+	// leads with an eager base value), so a union would not infer cleanly.
 	return {
 		params: paramInstructions,
-		run: asRun(plan.baseExpr ? runSimpleCase : runSearchedCase),
-		note: `case(${plan.whenThenClauses.length} when clauses${plan.elseExpr ? ', else' : ''})`
+		run: plan.baseExpr ? asRun(runSimpleCase) : asRun(runSearchedCase),
+		note: `case(short-circuit, ${clauseCount} when clauses${plan.elseExpr ? ', else' : ''})`
 	};
 }

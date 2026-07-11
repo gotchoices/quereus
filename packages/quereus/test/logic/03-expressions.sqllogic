@@ -64,6 +64,23 @@ SELECT CASE i WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM expr_t O
 SELECT CASE WHEN n > 0 THEN 'pos' WHEN n < 0 THEN 'neg' ELSE 'zero' END FROM expr_t ORDER BY i;
 → [{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"pos"},{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"neg"},{"case when n > 0 then 'pos' when n < 0 then 'neg' else 'zero' end":"zero"}]
 
+-- CASE short-circuit semantics (only the selected branch is evaluated)
+-- Simple CASE, no ELSE, no match → NULL
+SELECT CASE i WHEN 99 THEN 'x' END FROM expr_t WHERE i = 1;
+→ [{"case i when 99 then 'x' end":null}]
+-- Searched CASE, no ELSE, no match → NULL
+SELECT CASE WHEN i = 99 THEN 'x' END FROM expr_t WHERE i = 1;
+→ [{"case when i = 99 then 'x' end":null}]
+-- Simple CASE with NULL base never matches any WHEN → falls to ELSE
+SELECT CASE null WHEN 1 THEN 'a' ELSE 'else' END AS r;
+→ [{"r":"else"}]
+-- Simple CASE with NULL WHEN value never matches → falls to ELSE
+SELECT CASE 1 WHEN null THEN 'a' ELSE 'else' END AS r;
+→ [{"r":"else"}]
+-- First match wins: later WHEN clauses are not consulted
+SELECT CASE WHEN 1 = 1 THEN 'first' WHEN 1 = 1 THEN 'second' END AS r;
+→ [{"r":"first"}]
+
 -- CAST expressions
 SELECT cast(i as TEXT), cast(n as INTEGER), cast(t as REAL) FROM expr_t WHERE i = 1;
 → [{"cast(i as text)":"1","cast(n as integer)":10,"cast(t as real)":0}]
