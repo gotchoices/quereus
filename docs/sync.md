@@ -1597,181 +1597,23 @@ const syncManager = new SyncManagerImpl(metadataKvStore, storeEvents, applyToSto
 // 4. Emits events with remote=true to prevent re-recording CRDT metadata
 ```
 
-## Implementation Status
+## Current limitations
 
-### Completed
+The sync engine core is complete: HLC clocks, column-level LWW conflict resolution,
+tombstones, transaction-grouped change extraction, streaming snapshots, schema
+synchronization, reactive hooks, the LevelDB/IndexedDB store adapters, and the
+[`@quereus/sync-client`](../packages/quereus-sync-client/) WebSocket client.
 
-#### Phase 1: Core Infrastructure ✅
-- [x] Create package structure (`quereus-sync`)
-- [x] Implement HLC (Hybrid Logical Clock)
-  - [x] `clock/hlc.ts` - HLC type, comparison, tick, receive
-  - [x] `clock/site.ts` - Site ID generation and persistence
-- [x] Implement CRDT metadata storage
-  - [x] `metadata/keys.ts` - Key builders for sync metadata
-  - [x] `metadata/column-version.ts` - Column version tracking
-  - [x] `metadata/tombstones.ts` - Deletion tracking with TTL
-  - [x] `metadata/peer-state.ts` - Peer sync state tracking
-  - [x] `metadata/schema-migration.ts` - Schema change tracking
+Known gaps, tracked in [`docs/todo.md` § Sync Engine Remaining Work](todo.md#sync-engine-remaining-work):
 
-#### Phase 2: Sync Protocol ✅
-- [x] Define protocol types (`sync/protocol.ts`)
-- [x] Implement SyncManager interface (`sync/manager.ts`)
-- [x] Implement SyncManagerImpl (`sync/sync-manager-impl.ts`)
-  - [x] `applyChanges()` - Apply with LWW conflict resolution
-  - [x] `canDeltaSync()` - TTL check for delta vs snapshot
-  - [x] `updatePeerSyncState()` / `getPeerSyncState()` - Track peer sync progress (received watermark)
-  - [x] `updatePeerSentState()` / `getPeerSentState()` - Persist sent watermark for restart resume
-
-#### Phase 3: Event Integration ✅
-- [x] Subscribe to `StoreEventEmitter` for data change events
-- [x] Record column versions on insert/update
-- [x] Record tombstones on deletion
-
-#### Phase 4: Schema Sync ✅
-- [x] `SchemaMigrationStore` - Track DDL changes with HLC
-- [x] First-writer-wins conflict resolution for schema changes
-
-#### Phase 5: Reactive Hooks ✅
-- [x] Implement `SyncEventEmitter`
-  - [x] `onRemoteChange` - Remote changes applied
-  - [x] `onLocalChange` - Local changes pending
-  - [x] `onSyncStateChange` - Connection state
-  - [x] `onConflictResolved` - Conflict outcomes
-
-#### Phase 6: Testing ✅
-- [x] Unit tests for HLC
-- [x] Unit tests for Site ID
-- [x] Unit tests for ColumnVersionStore
-- [x] Unit tests for TombstoneStore
-- [x] Integration tests for SyncManager
-
-#### Phase 7: Change Extraction ✅
-- [x] `getChangesSince()` - Extract delta changes from metadata storage
-- [x] `getSnapshot()` - Full snapshot for initial/recovery sync
-- [x] `applySnapshot()` - Full state replacement
-- [x] `pruneTombstones()` - Clean up expired tombstones
-
-#### Phase 8: Streaming Snapshots ✅
-- [x] `getSnapshotStream()` - Memory-efficient chunked snapshot streaming
-- [x] `applySnapshotStream()` - Apply streamed snapshots with progress tracking
-- [x] `getSnapshotCheckpoint()` / `resumeSnapshotStream()` - Resumable transfers
-- [x] HLC-indexed change log for efficient delta queries
-
-#### Phase 9: Remote Change Application ✅
-- [x] `remote?: boolean` flag exists on both `DataChangeEvent` and `SchemaChangeEvent`
-- [x] `handleDataChange()` skips events with `remote === true`
-- [x] `handleSchemaChange()` skips events with `remote === true`
-- [x] `applyToStore` callback mechanism for applying remote changes
-  - [x] `ApplyToStoreCallback` type with `{ remote: true }` option
-  - [x] `DataChangeToApply` / `SchemaChangeToApply` types for callback parameters
-  - [x] Store implementations can emit events with `remote: true` flag
-- [x] Reactive events fire exactly once (UI receives from Store, SyncManager ignores remote events)
-- [x] Unit tests for `applyToStore` callback behavior
-
-#### Phase 10: Store Integration ✅
-- [x] Implement `createStoreAdapter()` - unified adapter for LevelDB and IndexedDB
-- [x] Handle UPSERT semantics (column changes may be insert or update)
-- [x] Handle row deletions by primary key
-- [x] Execute DDL for schema changes with `remote: true`
-- [x] Emit data change events with `remote: true` to prevent re-recording CRDT metadata
-
-#### Phase 11: Schema Sync Refinement ✅
-- [x] Implement column-level schema version storage (`SchemaVersionStore`)
-- [x] Track schema elements with HLCs: `sv:{schema}.{table}:{column}` pattern
-- [x] Implement "most destructive wins" conflict resolution
-  - [x] `getDestructiveness()` - rank schema version types
-  - [x] `getOperationDestructiveness()` - rank schema change operations
-  - [x] `shouldApplySchemaChangeByOperation()` - compare changes with destructiveness hierarchy
-- [x] Schema conflict tests (destructiveness ranking, LWW for same level)
-
-#### Phase 12: Integration Testing ✅
-- [x] E2E test: two replicas with bidirectional sync
-- [x] Multi-replica conflict scenarios (concurrent writes to same column)
-- [x] LWW conflict resolution tests
-- [x] Delete-update conflict handling tests
-- [x] Full snapshot sync between replicas
-
-### Remaining Work
-
-#### Transactional Integrity (Short-term)
-- [x] Fix write order in `applyChanges`: write data first, then CRDT metadata; abort with no metadata on any whole-batch throw or per-change `ApplyToStoreResult.errors` (see [Transactional Integrity During Sync](#transactional-integrity-during-sync))
-- [ ] Use `WriteBatch` for per-table atomicity when applying remote changes
-- [ ] Consider using `TransactionCoordinator` in store adapter for batched writes
-
-#### Single-Database Architecture (Store Phase 7) ✓
-- [x] Migrate IndexedDB to single database with multiple object stores (`UnifiedIndexedDBModule`)
-- [x] Place sync metadata in same database as data tables (`__catalog__` object store)
-- [x] Leverage native IDB transactions for cross-table atomicity (`MultiStoreWriteBatch`)
-- [ ] Update sync store adapter to use `UnifiedIndexedDBModule` for atomic sync writes
-
-#### Store Isolation (Longer-term - Store Phase 8)
-- [ ] Implement isolation in Store module using memory vtab's TransactionLayer pattern
-- [ ] Leverage Store isolation for sync to get true ACID semantics (see [Future: Store Isolation](#store-isolation-store-phase-8---future))
-
-#### Advanced Testing
-- [ ] Tombstone TTL expiration and fallback to snapshot
-- [ ] Large dataset streaming snapshot tests
-- [ ] Network interruption / resume tests
-- [ ] Integration tests with IndexedDB (browser environment)
-- [ ] Crash recovery tests (verify idempotent re-apply after partial sync)
-
-#### Documentation & Examples
-- [ ] Example: WebSocket sync transport
-- [ ] Example: HTTP polling sync transport
-- [ ] Example: Implementing `applyToStore` callback
-- [ ] Performance benchmarks
-
-#### Reusable Sync Client Package (`@quereus/sync-client`) ✅
-
-The WebSocket sync client is now available as a standalone package: [`@quereus/sync-client`](../packages/quereus-sync-client/).
-
-**Features:**
-- [x] WebSocket connection and handshake (`handshake` → `handshake_ack`)
-- [x] Message dispatch (`changes` advances the received watermark; `push_changes` applies without advancing it; `apply_result`, `error`, `pong`)
-- [x] ChangeSet serialization/deserialization (HLC, siteId encoding)
-- [x] Local change debouncing (configurable, default 50ms)
-- [x] Delta sync optimization (`lastSentHLC`, `pendingSentHLC` tracking)
-- [x] Peer sync state tracking (`peerSyncState[serverSiteId]`)
-- [x] Reconnection with exponential backoff (1s → 60s max)
-- [x] Connection state machine (disconnected → connecting → syncing → synced)
-- [x] Framework-agnostic design (no React/Svelte/Worker dependencies)
-
-**`SyncClient` API:**
-```typescript
-import { SyncClient } from '@quereus/sync-client';
-
-const client = new SyncClient({
-  syncManager,
-  syncEvents,                        // Local change listener
-  onStatusChange: (status) => {},    // Connection state updates
-  onRemoteChanges: (result, sets) => {}, // Applied remote changes
-  onError: (error) => {},            // Error handling
-  autoReconnect: true,               // Default: true
-  reconnectDelayMs: 1000,            // Default: 1000
-  maxReconnectDelayMs: 60000,        // Default: 60000
-  localChangeDebounceMs: 50,         // Default: 50
-});
-
-await client.connect('wss://server/sync/ws', token);
-// ... changes sync automatically ...
-await client.disconnect();
-```
-
-**Completed:**
-- [x] Create `packages/quereus-sync-client` package
-- [x] Implement `SyncClient` class with WebSocket protocol
-- [x] Extract serialization helpers
-- [x] Add reconnection state machine with exponential backoff
-- [x] Add delta sync tracking (peer sync state, sent HLC tracking)
-- [x] Add local change listener with debouncing
-- [x] Update `quoomb-web` worker to use `SyncClient`
-- [x] Framework-agnostic design (no React/Svelte/Worker dependencies)
-
-**Nice-to-have (future):**
-- [ ] HTTP polling fallback for environments without WebSocket
-- [ ] Connection quality metrics (latency, reconnect count)
-
----
+- **Per-table write atomicity** — remote changes are written data-first / metadata-second and
+  abort with no metadata on any error (see [Transactional Integrity During Sync](#transactional-integrity-during-sync)),
+  but do not yet use `WriteBatch` for per-table atomicity.
+- **Isolation** — readers may observe partially-applied state mid-sync; true ACID isolation
+  awaits Store-level support (see [Future: Store Isolation](#store-isolation-store-phase-8---future)).
+- **Transports** — only the WebSocket client ships; HTTP-polling fallback is future work.
+- **Test coverage** — tombstone-TTL fallback, large-dataset streaming, network-resume, and
+  crash-recovery scenarios are not yet exercised.
 
 ## Schema Seed: App Provider as Sync Peer
 

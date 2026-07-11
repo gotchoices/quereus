@@ -1722,42 +1722,26 @@ const comparator = createTypedComparator(exprType.logicalType, collationFunc);
 
 ## Debugging and Common Pitfalls
 
-Based on real implementation experiences, here are key concepts and common mistakes to avoid when developing runtime emitters.
+Hard-won lessons for runtime emitter authors. Most reduce to *use the canonical
+context and scheduler helpers* — the sections above are the reference; this is the
+checklist.
 
-### Scheduler-Centric Execution Model
+### Never call instructions directly
 
-**❌ NEVER call instructions directly:**
-```typescript
-// WRONG - bypasses scheduler
-const result = await conditionInstruction.run(rctx, ...args);
-if (result) {
-    // This breaks the execution model
-}
-```
+Route every sub-program through its scheduler callback, never a direct
+`instruction.run(...)` — direct calls bypass dependency resolution and can race. See
+[Scheduler Execution Model](#scheduler-execution-model) and
+[Key Points for Emitter Authors](#key-points-for-emitter-authors).
 
-**✅ ALWAYS use scheduler callbacks:**
-```typescript
-// CORRECT - scheduler handles execution and dependency resolution.
-// resolveMaybe keeps the synchronous case hop-free (see the note below).
-if (conditionCallback) {
-    const met = resolveMaybe(conditionCallback(rctx), (r) => !!r);
-    conditionMet = met instanceof Promise ? await met : met;
-}
-```
+### Avoid a per-row microtask hop on the synchronous fast path
 
-**Why this matters:**
-- The scheduler manages instruction dependencies and execution order
-- Direct calls bypass dependency resolution and can cause race conditions
-- Callbacks ensure proper context setup and error handling
-
-**Avoid a per-row microtask hop on the synchronous fast path.** A scalar
-sub-program (filter predicate, projected column, join condition, order/partition
-key, constraint check) runs through a sub-scheduler that completes
-*synchronously* and returns a concrete value whenever no instruction in it is
-itself async — the overwhelmingly common case. But `await value` still schedules
-a microtask even when `value` is not a thenable (`await x` ≡
-`await Promise.resolve(x)`), so a per-row/per-column `await callback(rctx)` pays
-that tick N times for nothing. Branch on `instanceof Promise` instead:
+A scalar sub-program (filter predicate, projected column, join condition,
+order/partition key, constraint check) runs through a sub-scheduler that completes
+*synchronously* and returns a concrete value whenever no instruction in it is itself
+async — the overwhelmingly common case. But `await value` still schedules a microtask
+even when `value` is not a thenable (`await x` ≡ `await Promise.resolve(x)`), so a
+per-row/per-column `await callback(rctx)` pays that tick N times for nothing. Branch on
+`instanceof Promise` instead:
 
 ```typescript
 // Pure-extraction site — value consumed as-is:
@@ -1770,155 +1754,26 @@ const decision = resolveMaybe(predicate(rctx), (r) => isTruthy(r));
 if (decision instanceof Promise ? await decision : decision) { /* ... */ }
 ```
 
-The `await` must stay *lexical* at the extraction point — a value-returning
-helper the caller then `await`s just reintroduces the hop. `instanceof Promise`
-is the right test (not a duck-typed `.then` check): the scheduler itself decides
-async transitions with `instanceof Promise`, so instructions only ever return a
-native `Promise` or a concrete value. Genuinely-async sub-programs (e.g. a
-correlated scalar subquery) still work — they take the promise branch.
+The `await` must stay *lexical* at the extraction point — a value-returning helper the
+caller then `await`s just reintroduces the hop. `instanceof Promise` is the right test
+(not a duck-typed `.then` check): the scheduler itself decides async transitions with
+`instanceof Promise`, so instructions only ever return a native `Promise` or a concrete
+value. Genuinely-async sub-programs (e.g. a correlated scalar subquery) still work — they
+take the promise branch.
 
-### Scope Resolution Debugging
+### Common pitfalls checklist
 
-When debugging column resolution issues, understand the scope hierarchy:
-
-**Scope Resolution Order:**
-1. `MultiScope` checks child scopes in order (first match wins)
-2. `AliasedScope` handles qualified references (`table.column`)
-3. `RegisteredScope` contains actual column-to-attribute mappings
-
-**Common scope resolution bugs:**
-- **Missing scope in MultiScope**: Check that all relevant scopes are included
-- **Wrong scope order**: Earlier scopes shadow later ones - order matters
-- **Projection scope issues**: After `ProjectNode`, ensure both projection outputs AND original qualified columns are accessible
-
-**Debugging pattern:**
-```typescript
-// Add targeted debugging for specific symbols
-if (symbolKey === 'problematic.column') {
-    console.log('Scope resolution for', symbolKey, 'in', this.scopes.length, 'scopes');
-}
-```
-
-### Context Lifecycle Management
-
-**Context Setup Pattern:**
-```typescript
-// Always use context helpers for row context
-// Pattern 1: Streaming with row slot
-const slot = createRowSlot(rctx, rowDescriptor);
-try {
-    for await (const row of rows) {
-        slot.set(row);
-        const result = await processRow(row, rctx);
-        yield result;
-    }
-} finally {
-    slot.close();
-}
-
-// Pattern 2: One-off async evaluation
-const result = await withAsyncRowContext(rctx, rowDescriptor, () => row, async () => {
-    // Async processing with automatic cleanup
-    return await processRow(row, rctx);
-});
-
-// Pattern 3: One-off synchronous evaluation
-const slot = createRowSlot(rctx, rowDescriptor);
-try {
-    for await (const row of rows) {
-        slot.set(row);
-        yield processRow(row, rctx);
-    }
-} finally {
-    slot.close();  // CRITICAL: Always clean up
-}
-```
-
-**Common context bugs:**
-- **Forgetting cleanup**: Memory leaks and stale context references
-- **Wrong row descriptor**: Attribute IDs don't match actual row structure  
-- **Context timing**: Setting up context too late or cleaning up too early
-
-### Debugging Techniques
-
-**Effective debugging approaches:**
-
-1. **Start with scope resolution:** Most column reference errors are scope issues
-2. **Check context timing:** Verify context is available when column references execute  
-3. **Use targeted logging:** Debug specific symbols rather than everything
-4. **Verify row descriptors:** Ensure attribute IDs match actual row structure
-5. **Test instruction isolation:** Verify emitters work independently before integration
-
-**Debugging environment variables:**
-```bash
-# Context lifecycle and column resolution
-DEBUG=quereus:runtime:context* yarn test
-
-# Specific operation tracing
-DEBUG=quereus:runtime:emit:join yarn test
-
-# Full runtime tracing (verbose)
-DEBUG=quereus:runtime* yarn test
-```
-
-### Context Helper Functions
-
-Quereus provides helper functions in `src/runtime/context-helpers.ts` to simplify context operations and ensure consistent behavior:
-
-**`createRowSlot(rctx, descriptor)`**
-- Creates a mutable slot for efficient streaming operations
-- Installs context once, updates by reference (no Map mutations per row)
-- Used by all high-frequency streaming emitters: scan, join, filter, project, distinct
-- Must call `close()` to clean up
-
-**`resolveAttribute(rctx, attributeId, columnName?)`**
-- Looks up an attribute ID in the current context via O(1) attribute index
-- Falls back to linear scan newest → oldest when the indexed slot isn't populated yet
-- Throws descriptive error if not found
-
-**`withRowContext(rctx, descriptor, rowGetter, fn)`**
-- Executes a function with a row context
-- Executes a **synchronous** function with a row context
-- Ensures proper cleanup in finally block
-- Use for synchronous expression evaluation
-
-**`withAsyncRowContext(rctx, descriptor, rowGetter, fn)`**
-- Executes an **async** function with a row context  
-- Ensures proper cleanup in finally block
-- Use for async operations (e.g., constraint checks)
-
-**Example usage:**
-```typescript
-import { createRowSlot, withRowContext, withAsyncRowContext, resolveAttribute } from '../context-helpers.js';
-
-// Pattern 1: Streaming with row slot
-async function* run(rctx: RuntimeContext, rows: AsyncIterable<Row>): AsyncIterable<Row> {
-	const slot = createRowSlot(rctx, rowDescriptor);
-	try {
-		for await (const row of rows) {
-			slot.set(row);
-			const value = someExpression(rctx); // Column refs auto-resolve
-			yield processRow(row, value);
-		}
-	} finally {
-		slot.close();
-	}
-}
-
-// Pattern 2: Synchronous expression evaluation
-function evaluateSync(rctx: RuntimeContext, row: Row): SqlValue {
-	return withRowContext(rctx, rowDescriptor, () => row, () => {
-		// Synchronous expression evaluation
-		return someExpression(rctx);
-	});
-}
-
-// Pattern 4: Async operation with context
-async function evaluateAsync(rctx: RuntimeContext, row: Row): Promise<SqlValue> {
-	return await withAsyncRowContext(rctx, rowDescriptor, () => row, async () => {
-		// Async operation (e.g., constraint check)
-		return await someAsyncOperation(rctx);
-	});
-}
-```
-
+- **Scope resolution.** Most column-reference errors are scope issues: a scope missing
+  from its `MultiScope`, a wrong scope order (earlier scopes shadow later ones), or
+  projection outputs and original qualified columns both needing to stay reachable after a
+  `ProjectNode`. See [Column Reference Resolution](#column-reference-resolution).
+- **Context lifecycle.** Manage row context only through the helpers in
+  `src/runtime/context-helpers.ts` — `createRowSlot` for streaming, `withRowContext` /
+  `withAsyncRowContext` for one-off evaluation (see
+  [Row Context Management](#row-context-management)) — and always `close()` a slot in a
+  `finally`; never call `rctx.context.set/delete` directly. Typical bugs: forgotten
+  cleanup (stale context), a row descriptor whose attribute IDs do not match the row, or
+  context set up too late / torn down too early.
+- **Tracing.** Diagnose context and resolution problems with the
+  `DEBUG=quereus:runtime:context*` environment variables — see
+  [Context Debugging and Tracing](#context-debugging-and-tracing).

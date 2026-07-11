@@ -419,3 +419,26 @@ dependency and make the adopt fast path portable to any backend. It requires rew
 [`mv-backing-host.md` § Cross-module atomicity](mv-backing-host.md#cross-module-atomicity).
 
 - [ ] Fold the stale-set write into the source DDL's atomic batch
+
+## Sync Engine Remaining Work
+
+Core sync is complete (see [`sync.md`](sync.md)); these are refinements and coverage gaps.
+
+**Transactional integrity**
+- [ ] Use `WriteBatch` for per-table atomicity when applying remote changes
+- [ ] Consider `TransactionCoordinator` in the store adapter for batched writes
+- [ ] Update the sync store adapter to use `UnifiedIndexedDBModule` for atomic sync writes
+- [ ] Leverage Store-level isolation (memory vtab's `TransactionLayer` pattern) for true ACID sync semantics
+
+**Testing**
+- [ ] Tombstone TTL expiration and fallback to snapshot
+- [ ] Large-dataset streaming-snapshot tests
+- [ ] Network interruption / resume tests
+- [ ] IndexedDB integration tests (browser environment)
+- [ ] Crash-recovery tests (idempotent re-apply after partial sync)
+
+**Transports & examples**
+- [ ] Example transports: WebSocket, HTTP polling, `applyToStore` callback
+- [ ] Performance benchmarks
+- [ ] HTTP-polling fallback for environments without WebSocket
+- [ ] Connection-quality metrics (latency, reconnect count)
