@@ -4072,3 +4072,146 @@ describe('IsolationModule — two-phase merged UNIQUE check (index seek)', () =>
 		}
 	});
 });
+
+describe('IsolationModule — cross-connection isolation (read-your-own-writes; not snapshot isolation)', () => {
+	// Multiple Database instances share ONE IsolationModule, so each connection gets a
+	// distinct dbId while all share the same committed underlying (the MemoryTableModule
+	// instance holds the base data). Only dbA carries the SQL schema; a foreign connection
+	// (dbB) exists purely as a connection identity that owns its own per-connection overlay
+	// and reads the shared base via iso.connect(dbB, ...). This is the white-box pattern the
+	// row-validating-DDL poison suite establishes; here it is used to pin the plain
+	// cross-connection READ contract and the write-write COMMIT resolution.
+	//
+	// The asserted contract is AGENTS.md's "read-your-own-writes; not snapshot isolation":
+	//   - a connection sees its own uncommitted overlay;
+	//   - a sibling connection does not, until commit;
+	//   - two connections writing the same key resolve LAST-WRITER-WINS at commit time —
+	//     the flush decides insert-vs-update by whether the PK already exists underlying, so
+	//     the later committer overwrites the earlier one. There is no write-write conflict
+	//     detection.
+	//
+	// NOTE: the IndexedDB plugin's settings help text advertises "snapshot isolation" — that
+	// documented-vs-implemented divergence is tracked by the review's strategic rec #3. If it
+	// resolves toward snapshot isolation, the write-write expectation here (last-writer-wins,
+	// no abort) is exactly what would need to flip to first-committer-wins / abort. Until
+	// then AGENTS.md is authoritative and these assert last-writer-wins.
+	let iso: IsolationModule;
+	let dbA: Database;
+	let dbB: Database;
+
+	beforeEach(async () => {
+		iso = new IsolationModule({ underlying: new MemoryTableModule() });
+		dbA = new Database();
+		dbB = new Database();
+		dbA.registerModule('isolated', iso);
+		// Only dbA builds the shared underlying (columns: id, who) and seeds the committed base.
+		await dbA.exec('create table t (id integer primary key, who text) using isolated');
+		await dbA.exec("insert into t values (1, 'base')");
+	});
+
+	afterEach(async () => {
+		await dbA.close();
+		await dbB.close();
+	});
+
+	/** Primary-key full-scan FilterInfo (idxStr === null ⇒ accessPath merges by PK). */
+	function fullScan(): FilterInfo {
+		return {
+			idxNum: 0,
+			idxStr: null,
+			constraints: [],
+			args: [],
+			accessPath: { kind: 'fullScan' },
+			indexInfoOutput: {
+				nConstraint: 0,
+				aConstraint: [],
+				nOrderBy: 0,
+				aOrderBy: [],
+				colUsed: 0n,
+				aConstraintUsage: [],
+				idxNum: 0,
+				idxStr: null,
+				orderByConsumed: false,
+				estimatedCost: 1000000,
+				estimatedRows: 1000000n,
+				idxFlags: 0,
+			},
+		};
+	}
+
+	/** Stages live inserts (rows = [id, who][]) as `forDb`'s per-connection overlay. */
+	async function stageInserts(forDb: Database, rows: SqlValue[][]): Promise<void> {
+		const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+		const overlay = await iso.overlayModule.create(forDb, iso.createOverlaySchema(underlying.tableSchema!));
+		for (const r of rows) {
+			await overlay.update({ operation: 'insert', values: [...r, 0] }); // trailing 0 = live (not tombstone)
+		}
+		iso.setConnectionOverlay(forDb, 'main', 't', { overlayTable: overlay, hasChanges: true });
+	}
+
+	async function reader(forDb: Database): Promise<IsolatedTable> {
+		return await iso.connect(forDb, undefined, 'isolated', 'main', 't', {} as BaseModuleConfig) as IsolatedTable;
+	}
+
+	/** The connection's merged view as sorted [id, who] tuples. */
+	async function readAll(forDb: Database): Promise<SqlValue[][]> {
+		const rows = await asyncIterableToArray((await reader(forDb)).query(fullScan()));
+		return rows.map(r => [r[0], r[1]] as SqlValue[]).sort((x, y) => Number(x[0]) - Number(y[0]));
+	}
+
+	it('a connection reads its own uncommitted writes; a sibling does not, until commit', async () => {
+		await stageInserts(dbA, [[20, 'onlyA']]); // dbA stages an insert; dbB stages nothing.
+
+		// Read-your-own-writes: dbA sees its staged row merged over the committed base.
+		expect(await readAll(dbA)).to.deep.equal([[1, 'base'], [20, 'onlyA']]);
+		// Isolation: dbB (a sibling connection) sees ONLY the committed base — not dbA's overlay.
+		expect(await readAll(dbB)).to.deep.equal([[1, 'base']]);
+
+		await iso.commitConnectionOverlays(dbA);
+
+		// After commit dbA's write is durable, so the sibling now sees it.
+		expect(await readAll(dbB)).to.deep.equal([[1, 'base'], [20, 'onlyA']]);
+	});
+
+	it('write-write on the same key resolves last-writer-wins at commit time', async () => {
+		await stageInserts(dbA, [[10, 'A']]);
+		await stageInserts(dbB, [[10, 'B']]);
+
+		// In-flight, each connection reads its own staged value for the shared key.
+		expect(await readAll(dbA)).to.deep.equal([[1, 'base'], [10, 'A']]);
+		expect(await readAll(dbB)).to.deep.equal([[1, 'base'], [10, 'B']]);
+
+		// dbA commits first: key 10 does not yet exist underlying ⇒ flushed as an insert (='A').
+		await iso.commitConnectionOverlays(dbA);
+		// dbB still reads its OWN staged 'B' over the now-committed 'A' (read-your-own-writes).
+		expect(await readAll(dbB)).to.deep.equal([[1, 'base'], [10, 'B']]);
+
+		// dbB commits second: key 10 now exists underlying ⇒ flushed as an update, overwriting
+		// dbA's value. No conflict error — last writer wins.
+		await iso.commitConnectionOverlays(dbB);
+		expect(await readAll(dbA)).to.deep.equal([[1, 'base'], [10, 'B']]);
+	});
+
+	it('reverse commit order flips the winner, confirming order — not a fixed precedence — decides', async () => {
+		await stageInserts(dbA, [[10, 'A']]);
+		await stageInserts(dbB, [[10, 'B']]);
+
+		// Same overlays, opposite commit order: dbB first, dbA second ⇒ dbA (last) wins.
+		await iso.commitConnectionOverlays(dbB);
+		await iso.commitConnectionOverlays(dbA);
+		expect(await readAll(dbB)).to.deep.equal([[1, 'base'], [10, 'A']]);
+	});
+
+	it('a committed overlay is cleared and a redundant re-commit is a well-defined no-op', async () => {
+		await stageInserts(dbA, [[30, 'x']]);
+		expect(iso.getConnectionOverlay(dbA, 'main', 't')).to.exist;
+
+		await iso.commitConnectionOverlays(dbA);
+		// The overlay is discarded once flushed — no stale staged state can bleed forward.
+		expect(iso.getConnectionOverlay(dbA, 'main', 't')).to.be.undefined;
+
+		// A second commit finds nothing staged and must neither throw nor double-apply.
+		await iso.commitConnectionOverlays(dbA);
+		expect(await readAll(dbA)).to.deep.equal([[1, 'base'], [30, 'x']]);
+	});
+});
