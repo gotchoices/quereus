@@ -1,12 +1,13 @@
 import { StatusCode } from "../../common/types.js";
 import { quereusError } from "../../common/errors.js";
-import type { SqlValue } from "../../common/types.js";
+import type { SqlValue, MaybePromise } from "../../common/types.js";
 import type { Instruction, RuntimeContext } from "../types.js";
 import { asRun } from "../types.js";
 import type { BinaryOpNode } from "../../planner/nodes/scalar.js";
 import { LiteralNode } from "../../planner/nodes/scalar.js";
-import type { ScalarPlanNode } from "../../planner/nodes/plan-node.js";
-import { emitPlanNode } from "../emitters.js";
+import type { ScalarPlanNode, PlanNode } from "../../planner/nodes/plan-node.js";
+import { isRelationalNode } from "../../planner/nodes/plan-node.js";
+import { emitPlanNode, emitCallFromPlan } from "../emitters.js";
 import { compareSqlValuesFast, isTruthy } from "../../util/comparison.js";
 import type { CollationFunction } from "../../util/comparison.js";
 import { coerceToNumberForArithmetic } from "../../util/coercion.js";
@@ -322,10 +323,33 @@ export function emitConcatOp(plan: BinaryOpNode, ctx: EmissionContext): Instruct
 	};
 }
 
+/**
+ * True iff `node`'s subtree contains a relational descendant — i.e. a subquery
+ * (scalar-subquery / IN-subquery / EXISTS), each of which exposes its relational
+ * child via `getChildren()`. Pure scalar operands (column refs, literals,
+ * arithmetic, direct function calls) have no relational descendant.
+ *
+ * Cheap emit-time walk used by {@link emitLogicalOp} to decide whether an AND/OR
+ * right operand is worth deferring behind a short-circuit callback. Mirrors
+ * `conjunctHasSubquery` in planner/analysis/query-rewrite-matcher.ts.
+ */
+function containsSubquery(node: ScalarPlanNode): boolean {
+	for (const child of node.getChildren()) {
+		if (isRelationalNode(child as PlanNode)) return true;
+		// Only scalar children reach here (relational ones returned above), so the
+		// recursive cast to ScalarPlanNode is sound.
+		if (containsSubquery(child as ScalarPlanNode)) return true;
+	}
+	return false;
+}
+
 export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruction {
 	// Normalize operator to uppercase for case-insensitive matching
 	const operator = plan.expression.operator.toUpperCase();
 
+	// Eager three-valued-logic combine. Kept verbatim for XOR (both operands
+	// always required) and for AND/OR whose right operand is cheap (no subquery),
+	// which stay on the zero-overhead two-param path.
 	function run(ctx: RuntimeContext, v1: SqlValue, v2: SqlValue): SqlValue {
 		// SQL three-valued logic. Coerce non-NULL operands to a boolean using
 		// SQL truthiness (isTruthy) rather than JS truthiness so that values like
@@ -360,6 +384,56 @@ export function emitLogicalOp(plan: BinaryOpNode, ctx: EmissionContext): Instruc
 	}
 
 	const leftExpr = emitPlanNode(plan.left, ctx);
+
+	// Short-circuit deferral: for AND/OR whose right operand contains a subquery
+	// (a scalar/IN/EXISTS subquery — a relational descendant), emit the right
+	// operand as an on-demand callback and evaluate it lazily, only when the left
+	// operand does not already decide the result (`false AND x` → false;
+	// `true OR x` → true). This stops an expensive/side-effecting subquery from
+	// running on every row for nothing. Left stays eager — it is always needed
+	// and always evaluated first, so operand order is unchanged.
+	//
+	// NOTE: only a *subquery* right operand defers. A non-subquery expensive
+	// scalar operand (deeply nested arithmetic, or a volatile/slow UDF called
+	// directly rather than inside a subquery) is still evaluated eagerly. Such
+	// operands are rare and the dominant expensive case in SQL is the subquery;
+	// if a non-subquery volatile/expensive scalar operand ever shows up hot,
+	// extend this gate with a cost or volatility check.
+	if ((operator === 'AND' || operator === 'OR') && containsSubquery(plan.right)) {
+		const rightCall = emitCallFromPlan(plan.right, ctx);
+
+		async function runShortCircuit(
+			ctx: RuntimeContext,
+			v1: SqlValue,
+			rightFn: (ctx: RuntimeContext) => MaybePromise<SqlValue>
+		): Promise<SqlValue> {
+			// Identical SQL truthiness (isTruthy) and 3VL combine as the eager `run`
+			// above — the only difference is that the right operand is fetched lazily
+			// and only when the left does not already decide the result.
+			const b1 = v1 === null ? null : isTruthy(v1);
+			if (operator === 'AND' && b1 === false) return false; // left decides
+			if (operator === 'OR' && b1 === true) return true;    // left decides
+
+			const v2 = await rightFn(ctx);
+			const b2 = v2 === null ? null : isTruthy(v2);
+			if (operator === 'AND') {
+				if (b1 === false || b2 === false) return false;
+				if (b1 === null || b2 === null) return null;
+				return true;
+			}
+			// OR
+			if (b1 === true || b2 === true) return true;
+			if (b1 === null || b2 === null) return null;
+			return false;
+		}
+
+		return {
+			params: [leftExpr, rightCall],
+			run: asRun(runShortCircuit),
+			note: `${plan.expression.operator}(logical short-circuit)`
+		};
+	}
+
 	const rightExpr = emitPlanNode(plan.right, ctx);
 
 	return {
