@@ -265,11 +265,11 @@ A view row exists iff present in the left and absent from the right.
 
 ## Distinct
 
-Lineage passthrough. Mutations apply to all base rows that collapse to the affected view row (consistent with predicate-honest fan-out).
+For a **read**, lineage is passthrough: the plan-walk classifier treats `distinct` as a passthrough operator so lineage still reaches the base table. A **mutation** through a `distinct` body, however, is rejected with a structured `unsupported-distinct` diagnostic ([invariant VU-008](invariants.md#vu-008--a-limit-offset-or-distinct-body-rejects-rather-than-widen)): a duplicate-collapse has no 1:1 base-row lineage, so the write cannot be reproduced as a `where` predicate without widening onto every base row that collapsed to the view row. Fanning out to all such rows is Phase 2 substrate territory; Phase 1 rejects rather than widen.
 
 ## Sort, Limit, Offset
 
-Pure passthrough. `order by` and `limit` do not affect propagation unless the mutation itself carries `order by` / `limit`, in which case they participate in row-identifying-predicate construction.
+`order by` in a view body does not affect mutation propagation (it does not change which rows the body exposes). A body carrying `limit` or `offset`, in contrast, is **rejected** with a structured `unsupported-limit` diagnostic ([invariant VU-008](invariants.md#vu-008--a-limit-offset-or-distinct-body-rejects-rather-than-widen)): a row-count window cannot be reproduced as a `where` predicate, so a mutation would escape the limited window onto base rows the view never exposes. The mutation *statement's own* `order by` / `limit` (e.g. `update v … order by … limit 5`) is a separate thing — it participates in row-identifying-predicate construction rather than being rejected.
 
 ## Common Table Expressions and the CTE-name DML target
 
