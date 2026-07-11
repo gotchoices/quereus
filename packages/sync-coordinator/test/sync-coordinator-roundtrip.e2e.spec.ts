@@ -129,4 +129,30 @@ describe('sync-coordinator WebSocket round-trip (e2e)', () => {
     expect(aRow.note).to.equal('b-twenty');
     expect(Number(aRow.qty)).to.equal(200);
   });
+
+  it('relays update and delete changes A→B (distinct non-insert wire codecs)', async () => {
+    // Insert exercises only the upsert-of-a-fresh-row codec. Update (column
+    // change on an existing row) and delete (tombstone) are separate wire ops;
+    // a codec skew that only bites those would slip past the insert-only tests.
+    await peerA.db.exec(`insert into orders (id, note, qty) values (30, 'v1', 1)`);
+    await waitFor(
+      async () => (await collect(peerB.db, 'select id from orders where id = 30')).length === 1,
+      { label: 'row 30 to arrive on B' },
+    );
+
+    await peerA.db.exec(`update orders set note = 'v2', qty = 9 where id = 30`);
+    await waitFor(
+      async () => {
+        const [r] = await collect(peerB.db, 'select note, qty from orders where id = 30');
+        return r?.note === 'v2' && Number(r?.qty) === 9;
+      },
+      { label: 'update on A to propagate to B' },
+    );
+
+    await peerA.db.exec(`delete from orders where id = 30`);
+    await waitFor(
+      async () => (await collect(peerB.db, 'select id from orders where id = 30')).length === 0,
+      { label: 'delete on A to propagate to B' },
+    );
+  });
 });
