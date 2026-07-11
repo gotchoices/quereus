@@ -146,6 +146,30 @@ declared) cannot be checked — its column types are unknown — so that conflic
 stays caught at first DML; and reload / `importTable` does **not** re-validate, so
 a legacy persisted conflicting FK reloads without error and surfaces only at DML.
 
+**Column `COLLATE` validation (declaration time).** An explicit `COLLATE <name>` on a
+column is validated in `columnDefToSchema` → `validateCollationForType`
+(`schema/table.ts`) against BOTH the column's logical type AND the connection's
+collation registry. `BINARY` is always accepted; a name on the type's supported list
+(TEXT's `BINARY`/`NOCASE`/`RTRIM`) is accepted; any other name is accepted **iff the
+connection has it registered** via `db.registerCollation(...)` (probed with
+`Database.isCollationRegistered`). So a registered custom collation — e.g.
+`create table t (k text collate REVERSE primary key)` after
+`db.registerCollation('REVERSE', …)` — is accepted on any collatable column, while an
+**unregistered** name is rejected for *every* type (including `INTEGER`/`REAL`/`BLOB`,
+which previously slid through and only failed later at comparator build) with
+`Unknown collation '<name>' for type '<type>' …`. Types that declare an *empty*
+supported list (`JSON` and the temporal types) reject every non-`BINARY` name,
+registered or not. Because catalog rehydrate (`importTable`) shares the same
+`buildColumnSchemas` choke point, a persisted column declaring a custom collation
+**re-validates against the registry on reopen**: it reloads cleanly only when the
+embedder re-registers that collation, and otherwise throws `Unknown collation` — the
+same loud, no-silent-fallback failure the key-collation resolver seam produces (see
+docs/types.md § Comparison collation resolution and the store's
+`validateKeyCollations`). Re-register the collation before reopening a database whose
+schema names it. The implicit *default* collation (a column with no `COLLATE` clause)
+is unaffected — it resolves via `resolveDefaultCollation` and never consults the
+registry.
+
 #### `createIndex(stmt): Promise<void>`
 
 Creates a secondary index from a parsed `CreateIndexStmt`:
@@ -412,9 +436,10 @@ secondary-index *column* values. The schema entry points:
   under one collation and compare under another — `'A'` and `'a'` are distinct BINARY values
   that would collide at one NOCASE key, so a second `insert` would be spuriously rejected and
   an `insert or replace` would silently destroy the first row.
-  `create table t (k any collate nocase primary key)` is *accepted* (`ANY_TYPE` declares
-  no `supportedCollations`), but the `nocase` is inert: it is honored neither in the key bytes
-  nor in the comparison. Its one cost is that `pkOrderPreservingPrefixLength` compares the
+  `create table t (k any collate nocase primary key)` is *accepted* (`NOCASE` is a registered
+  built-in, so it passes the registry-aware column-DDL gate on `ANY_TYPE`, which declares no
+  supported-collation list — an *unregistered* name would now be rejected here), but the
+  `nocase` is inert: it is honored neither in the key bytes nor in the comparison. Its one cost is that `pkOrderPreservingPrefixLength` compares the
   BINARY key collation against the declared NOCASE, finds them unequal, and conservatively
   declines the range seek — an optimization lost, never a row.
 

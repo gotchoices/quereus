@@ -968,7 +968,10 @@ async function runAlterColumn(
 	// (same error shape as CREATE TABLE), so an unknown collation is rejected before
 	// any module round-trip / re-sort. The module re-normalizes and applies it.
 	if (action.setCollation !== undefined) {
-		validateCollationForType(action.setCollation, tableSchema.columns[colIndex].logicalType, action.columnName);
+		validateCollationForType(
+			action.setCollation, tableSchema.columns[colIndex].logicalType, action.columnName,
+			(n) => rctx.db.isCollationRegistered(n),
+		);
 	}
 
 	// Route a SET DEFAULT through the same DDL validator CREATE TABLE uses, so the

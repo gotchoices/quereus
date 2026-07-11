@@ -11,9 +11,14 @@
  *    name on a TEXT column, but the comparator must be the database's.
  *  - **a custom-named collation on an index column** (`create index … collate REVERSE`).
  *    `IndexColumnSchema.collation` is not gated by `LogicalType.supportedCollations`,
- *    so a custom name reaches the index comparator. (A *column* declaring
- *    `collate REVERSE` is still rejected at DDL by that gate — see
- *    `feat-ddl-accepts-registered-collations` in the backlog.)
+ *    so a custom name reaches the index comparator.
+ *
+ * Since `feat-ddl-accepts-registered-collations`, a *column* declaring
+ * `collate REVERSE` is ACCEPTED at DDL when REVERSE is registered on the connection
+ * (the type-list gate is now registry-aware); an UNREGISTERED name is rejected for
+ * every column type — including INTEGER/REAL/BLOB, which previously slid through the
+ * gate and only failed later at comparator build. Both are exercised by the
+ * `column DDL accepts a registered collation` describe at the bottom of this file.
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
@@ -266,15 +271,17 @@ describe('memory vtab resolves collations against its own database', () => {
 	});
 
 	describe('unregistered collation', () => {
-		it('raises rather than silently byte-ordering', async () => {
-			// A TEXT column's COLLATE is gated earlier by LogicalType.supportedCollations,
-			// so use a column type that carries no such list: the memory table's PK
-			// comparator construction is then the first thing to see the unknown name.
+		it('rejects an unregistered collation on an INTEGER column at DDL', async () => {
+			// Since feat-ddl-accepts-registered-collations the type-list gate is
+			// registry-aware, so a no-list type (INTEGER) no longer slides an unregistered
+			// name through to the comparator: DDL rejects it up front with the same
+			// `Unknown collation` shape a TEXT column gets, rather than the resolver's later
+			// `no such collation sequence`.
 			const db = new Database();
 			let message = '';
 			try { await db.exec('create table t (k integer collate frobnicate primary key)'); }
 			catch (e) { message = (e as Error).message; }
-			expect(message).to.match(/no such collation sequence: FROBNICATE/i);
+			expect(message).to.match(/Unknown collation/);
 			await db.close();
 		});
 
@@ -287,6 +294,116 @@ describe('memory vtab resolves collations against its own database', () => {
 			catch (e) { message = (e as Error).message; }
 			expect(message).to.match(/Unknown collation/);
 			await db.close();
+		});
+	});
+
+	describe('column DDL accepts a registered collation', () => {
+		it('accepts a registered custom collation on a TEXT PK column and orders by it', async () => {
+			// The headline (enables the deferred assertion from 3.3-memory-vtab-collation-resolver):
+			// REVERSE is registered, so `text collate REVERSE primary key` is now accepted at DDL —
+			// the type-list gate is registry-aware — and the primary BTree orders under the REVERSE
+			// comparator, so a bare read comes back descending.
+			const db = new Database();
+			db.registerCollation('REVERSE', REVERSE);
+			await db.exec('create table t (k text collate REVERSE primary key)');
+			await db.exec("insert into t values ('a'), ('b'), ('c')");
+			expect(await column(db, 'select k from t', 'k')).to.deep.equal(['c', 'b', 'a']);
+			await db.close();
+		});
+
+		it('resolves case / whitespace variants of the registered name identically', async () => {
+			// normalizeCollationName (trim + uppercase) runs both at the DDL gate and in the
+			// registry, so every spelling reaches the same REVERSE comparator. The quoted form
+			// exercises the parser's quote-stripping plus the gate's trim.
+			for (const spell of ['reverse', 'REVERSE', '"  ReVeRsE "']) {
+				const db = new Database();
+				db.registerCollation('REVERSE', REVERSE);
+				await db.exec(`create table t (k text collate ${spell} primary key)`);
+				await db.exec("insert into t values ('a'), ('b'), ('c')");
+				expect(await column(db, 'select k from t', 'k'), `spelling ${spell}`)
+					.to.deep.equal(['c', 'b', 'a']);
+				await db.close();
+			}
+		});
+
+		it('still accepts a registered built-in (NOCASE) on an INTEGER column as a no-op', async () => {
+			// NOCASE is registered, so it passes the registry gate on a no-list type (INTEGER);
+			// it is a harmless no-op on a non-text column. Only UNREGISTERED names flip to reject.
+			const db = new Database();
+			await db.exec('create table t (k integer collate nocase primary key)');
+			await db.exec('insert into t values (3), (1), (2)');
+			expect(await column(db, 'select k from t', 'k')).to.deep.equal([1, 2, 3]);
+			await db.close();
+		});
+
+		it('rejects a registered custom collation on a JSON column (empty-list precedence)', async () => {
+			// JSON carries an EMPTY supportedCollations list, which precedes the registry: no
+			// non-BINARY name is accepted, even one the connection registered.
+			const db = new Database();
+			db.registerCollation('REVERSE', REVERSE);
+			let message = '';
+			try { await db.exec('create table t (id integer primary key, x json collate REVERSE)'); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/Unknown collation/);
+			await db.close();
+		});
+
+		it('accepts COLLATE BINARY on a JSON column (BINARY fast-path)', async () => {
+			// BINARY is always accepted, ahead of the empty-list throw — a strict improvement
+			// over the pre-fix behavior, which rejected even `collate binary` on JSON/temporal.
+			const db = new Database();
+			await db.exec('create table t (id integer primary key, x json collate binary)');
+			await db.exec(`insert into t values (1, '{"a":1}')`);
+			expect(await column(db, 'select count(*) as n from t', 'n')).to.deep.equal([1]);
+			await db.close();
+		});
+
+		it('accepts SET COLLATE to a registered custom collation via ALTER', async () => {
+			const db = new Database();
+			db.registerCollation('REVERSE', REVERSE);
+			await db.exec('create table t (id integer primary key, name text)');
+			await db.exec("insert into t values (1,'a'), (2,'b'), (3,'c')");
+			await db.exec('alter table t alter column name set collate REVERSE');
+
+			// table_info reports the new (normalized) collation …
+			expect(await column(db, "select collation from table_info('t') where name = 'name'", 'collation'))
+				.to.deep.equal(['REVERSE']);
+			// … and ORDER BY name now follows REVERSE (descending).
+			expect(await column(db, 'select name from t order by name', 'name')).to.deep.equal(['c', 'b', 'a']);
+			await db.close();
+		});
+
+		it('rejects SET COLLATE to an unregistered collation via ALTER', async () => {
+			const db = new Database();
+			await db.exec('create table t (id integer primary key, name text)');
+			let message = '';
+			try { await db.exec('alter table t alter column name set collate frobnicate'); }
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/Unknown collation/);
+			await db.close();
+		});
+
+		it('reopens a custom-collation column only when the collation is re-registered', async () => {
+			// Reopen = replay the canonical CREATE DDL on a fresh connection. buildColumnSchemas is
+			// the shared choke point for CREATE and catalog rehydrate (importTable), so replaying the
+			// DDL validates against the registry exactly as a store reopen would: it SUCCEEDS once
+			// REVERSE is re-registered, and THROWS `Unknown collation` when it is not — the same loud
+			// failure the key-collation resolver seam already produces (see docs/schema.md).
+			const ddl = 'create table t (k text collate REVERSE primary key)';
+
+			const reopened = new Database();
+			reopened.registerCollation('REVERSE', REVERSE);
+			await reopened.exec(ddl); // re-registered → reopens cleanly
+			await reopened.exec("insert into t values ('a'), ('b')");
+			expect(await column(reopened, 'select k from t', 'k')).to.deep.equal(['b', 'a']);
+			await reopened.close();
+
+			const notRegistered = new Database();
+			let message = '';
+			try { await notRegistered.exec(ddl); } // no re-registration → loud reject
+			catch (e) { message = (e as Error).message; }
+			expect(message).to.match(/Unknown collation/);
+			await notRegistered.close();
 		});
 	});
 });

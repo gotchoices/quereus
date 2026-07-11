@@ -1421,6 +1421,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/**
+	 * True iff `name` names a collation this connection can resolve — a built-in
+	 * (BINARY/NOCASE/RTRIM) or one registered via {@link registerCollation}. The
+	 * DDL-time counterpart of {@link getCollationResolver} that returns a boolean
+	 * instead of throwing; used to gate an explicit column COLLATE against the
+	 * connection's registry (see `validateCollationForType`). Names are normalized
+	 * (trim + uppercase) here and in {@link _getCollation}, so whitespace / case
+	 * variants resolve identically.
+	 */
+	isCollationRegistered(name: string): boolean {
+		return normalizeCollationName(name) === 'BINARY' || this._getCollation(name) !== undefined;
+	}
+
+	/**
 	 * Registers a custom logical type.
 	 * @param name The name of the type (case-insensitive).
 	 * @param definition The LogicalType implementation.

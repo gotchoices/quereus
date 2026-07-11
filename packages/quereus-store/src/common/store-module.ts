@@ -1415,7 +1415,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// explicit COLLATE, matching the CREATE path so an ADD-COLUMN-ed text column
 		// gets the same collation a CREATE-d one would. The persisted DDL re-emits an
 		// explicit COLLATE for any non-BINARY collation, so reopen stays stable.
-		const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'));
+		const newColSchema = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'), (n) => db.isCollationRegistered(n));
 
 		// Extract default value from column def constraints. Use the shared
 		// `tryFoldLiteral` helper so signed numerics like `-123.0`
@@ -1627,7 +1627,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			throw new QuereusError(`Column '${change.oldName}' not found.`, StatusCode.ERROR);
 		}
 
-		const newColSchema = columnDefToSchema(change.newColumnDefAst, defaultNotNull);
+		const newColSchema = columnDefToSchema(change.newColumnDefAst, defaultNotNull, 'BINARY', (n) => db.isCollationRegistered(n));
 		const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newColSchema : c);
 		const updatedIndexes = (oldSchema.indexes || []).map(idx => ({
 			...idx,
@@ -1936,7 +1936,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		} else if (change.setDefault !== undefined) {
 			attr = { newCol: { ...oldCol, defaultValue: change.setDefault }, collationChanged: false };
 		} else if (change.setCollation !== undefined) {
-			attr = this.alterColumnSetCollation(oldCol, change);
+			attr = this.alterColumnSetCollation(oldCol, change, (n) => db.isCollationRegistered(n));
 		} else {
 			throw new QuereusError('ALTER COLUMN requires an attribute to change', StatusCode.INTERNAL);
 		}
@@ -2173,6 +2173,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	private alterColumnSetCollation(
 		oldCol: ColumnSchema,
 		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
+		isCollationRegistered: (name: string) => boolean,
 	): AlterColumnAttrChange | null {
 		// Per-column collation update. PRIMARY KEY uniqueness/ordering is enforced
 		// PHYSICALLY in the key bytes under a PER-COLUMN key collation
@@ -2184,7 +2185,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// UNIQUE constraints we re-validate existing rows under the new collation
 		// (Option A). Query-layer ORDER BY / `=` / `table_info().collation` pick the
 		// new collation up from the column schema once this updated schema re-registers.
-		const normalized = validateCollationForType(change.setCollation!, oldCol.logicalType, change.columnName);
+		const normalized = validateCollationForType(change.setCollation!, oldCol.logicalType, change.columnName, isCollationRegistered);
 		const nameMatches = normalized === (oldCol.collation || 'BINARY');
 		if (nameMatches && oldCol.collationExplicit) {
 			return null; // already explicit in the desired collation — no scan, no re-key, no re-persist

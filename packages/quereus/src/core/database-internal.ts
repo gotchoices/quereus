@@ -292,4 +292,14 @@ export interface DatabaseInternal {
 	 * assertion it falls back to a full scan plus a comparator-accurate residual filter.
 	 */
 	_isCollationOrderPreserving(name: string): boolean;
+
+	/**
+	 * True iff `name` names a collation this connection can resolve — a built-in
+	 * (BINARY/NOCASE/RTRIM) or one registered via `registerCollation`. The DDL-time
+	 * counterpart of {@link getCollationResolver} that returns a boolean instead of
+	 * throwing; store/isolation modules pass `(n) => this.db.isCollationRegistered(n)`
+	 * into `validateCollationForType` / `columnDefToSchema` to gate an explicit column
+	 * COLLATE against the registry with the same rule the engine uses.
+	 */
+	isCollationRegistered(name: string): boolean;
 }

@@ -1731,7 +1731,7 @@ export class MemoryTableManager {
 			// COLLATE, matching the CREATE path (and the differ's resolved-COLLATE emission) so
 			// an ADD-COLUMN-ed text column gets the same collation a CREATE-d one would.
 			// resolveDefaultCollation falls non-text types back to BINARY automatically.
-			const newColumnSchema = columnDefToSchema(columnDefAst, defaultNotNull, this.db.options.getStringOption('default_collation'));
+			const newColumnSchema = columnDefToSchema(columnDefAst, defaultNotNull, this.db.options.getStringOption('default_collation'), (n) => this.db.isCollationRegistered(n));
 			if (this.tableSchema.columns.some(c => c.name.toLowerCase() === newColumnSchema.name.toLowerCase())) {
 				throw new QuereusError(`Duplicate column name: ${newColumnSchema.name}`, StatusCode.ERROR);
 			}
@@ -1916,7 +1916,7 @@ export class MemoryTableManager {
 			const defaultNullability = this.db.options.getStringOption('default_column_nullability');
 			const defaultNotNull = defaultNullability === 'not_null';
 
-			const newColumnSchemaAtIndex = columnDefToSchema(newColumnDefAst, defaultNotNull);
+			const newColumnSchemaAtIndex = columnDefToSchema(newColumnDefAst, defaultNotNull, 'BINARY', (n) => this.db.isCollationRegistered(n));
 			const updatedCols = this.tableSchema.columns.map((c, i) => i === colIndex ? newColumnSchemaAtIndex : c);
 			const updatedIndexes = (this.tableSchema.indexes || []).map(idx => ({
 				...idx,
@@ -2036,7 +2036,7 @@ export class MemoryTableManager {
 			let convertNulls = false;
 
 			if (change.setCollation !== undefined) {
-				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName);
+				const normalized = validateCollationForType(change.setCollation, oldCol.logicalType, change.columnName, (n) => this.db.isCollationRegistered(n));
 				const nameMatches = normalized === (oldCol.collation || 'BINARY');
 				if (nameMatches && oldCol.collationExplicit) {
 					return; // already explicit in the desired collation — nothing to do

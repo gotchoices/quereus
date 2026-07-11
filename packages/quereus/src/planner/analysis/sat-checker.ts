@@ -227,16 +227,20 @@ function resolveColumnCollations(
  * contract for a comparator the engine is about to *use*, but here it is only a
  * question — "can I reason about this column?" — whose honest answer is `'unknown'`.
  *
- * The name is not guaranteed to be registered: column DDL only validates collation
- * names for types that declare a supported list (TEXT), so `k integer collate
- * frobnicate` reaches the planner unvalidated (see the `feat-ddl-accepts-registered-collations`
- * backlog ticket). Throwing here would fail a query that runs fine today, from an
- * optimizer rule that is supposed to be an optimization. Reachable today via a
- * `CHECK` on such a column, which publishes a `DomainConstraint` naming it:
- *   create table t (id integer primary key, k integer collate frobnicate check (k > 0));
- *   select id from t where id = 1;
- * `resolveColumnCollations` must resolve `k` (a domain mentions it) even though no
- * emitted comparison touches it, so a rethrow here would break that `select`.
+ * NOTE: since `feat-ddl-accepts-registered-collations` landed, column DDL validates
+ * an explicit COLLATE against the connection's registry for EVERY type (not just the
+ * ones with a supported list), so an unregistered name like `k integer collate
+ * frobnicate` is now rejected at CREATE and no longer reaches the planner. This
+ * defensive catch is therefore cheap insurance rather than a currently-reachable
+ * path: it keeps an optimizer rule from throwing should a column ever carry a
+ * collation that resolves at DDL time but not here, or a future path reintroduce an
+ * unvalidated one. Answering `'unknown'` is always safe — the checker only ever
+ * proves `unsat` from resolvable comparisons. A CHECK on a (registered) custom
+ * collation still publishes a `DomainConstraint` naming its column, which
+ * `resolveColumnCollations` resolves cleanly:
+ *   db.registerCollation('MYCOLL', cmp);
+ *   create table t (id integer primary key, k integer collate MYCOLL check (k > 0));
+ *   select id from t where id = 1;   -- plans without a false contradiction
  */
 function tryResolve(resolver: CollationResolver, name: string): CollationFunction | undefined {
 	try {

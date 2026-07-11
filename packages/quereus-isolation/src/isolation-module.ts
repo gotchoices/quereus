@@ -1690,7 +1690,7 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		// ADD COLUMN sites. This site only reads `.notNull`/`.name` off the result (the
 		// underlying materializes the real column), so it does not affect collation here — but
 		// keeping the call signature identical avoids drift and is correct for any future reader.
-		const newColumn = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'));
+		const newColumn = columnDefToSchema(change.columnDef, defaultNotNull, db.options.getStringOption('default_collation'), (n) => db.isCollationRegistered(n));
 		return {
 			foldedDefault,
 			evaluator: change.backfillEvaluator,

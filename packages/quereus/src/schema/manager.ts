@@ -1651,7 +1651,12 @@ export class SchemaManager {
 		pkDefinition: ReadonlyArray<import('./table.js').PrimaryKeyColumnDefinition>;
 		pkDefaultConflict: import('../common/constants.js').ConflictResolution | undefined;
 	} {
-		const preliminaryColumnSchemas: ColumnSchema[] = astColumns.map(colDef => columnDefToSchema(colDef, defaultNotNull, defaultCollation));
+		// Gate an explicit column COLLATE against this connection's collation registry
+		// (accepts a registered custom collation; rejects an unregistered name for every
+		// type). Shared by fresh CREATE and catalog rehydrate (importTable), so a
+		// persisted custom-collation column re-validates on reopen — see docs/schema.md.
+		const isCollationRegistered = (name: string): boolean => this.db.isCollationRegistered(name);
+		const preliminaryColumnSchemas: ColumnSchema[] = astColumns.map(colDef => columnDefToSchema(colDef, defaultNotNull, defaultCollation, isCollationRegistered));
 		const { pkDef: pkDefinition, defaultConflict: pkDefaultConflict, synthesized } = findPKDefinition(preliminaryColumnSchemas, astConstraints);
 
 		const columns = preliminaryColumnSchemas.map((col, idx) => {

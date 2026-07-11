@@ -471,12 +471,18 @@ describe('Predicate contradiction folding (end-to-end)', () => {
 		expect(await results(db, sql)).to.have.lengthOf(1);
 	});
 
-	it('an unregistered collation on an unrelated column does not fail the query', async () => {
-		// Column DDL does not validate collation names on non-TEXT types, and a CHECK on such
-		// a column publishes a DomainConstraint naming it — so the checker must resolve a
-		// collation no emitted comparison ever touches. It answers `unknown` (logs a warning)
-		// instead of letting the resolver's throw escape an optimizer rule.
-		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER COLLATE FROBNICATE CHECK (k > 0))');
+	it('a custom collation on an unrelated column does not fail the query', async () => {
+		// A CHECK on a column with a non-BINARY collation publishes a DomainConstraint naming
+		// that column, so the predicate-contradiction checker must resolve the column's collation
+		// even though no emitted comparison in this query touches it. Since
+		// feat-ddl-accepts-registered-collations, an explicit COLLATE is accepted on ANY column
+		// type only when the collation is registered (an unregistered name is now rejected at
+		// CREATE), so register it first; the checker resolves it cleanly and the query plans
+		// without a false contradiction. (The checker still defensively answers `unknown` for an
+		// unresolvable collation — see sat-checker.ts `tryResolve` — but that branch is no longer
+		// reachable via DDL.)
+		db.registerCollation('MYCOLL', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
+		await db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER COLLATE MYCOLL CHECK (k > 0))');
 		const sql = 'SELECT id FROM t WHERE id = 1';
 		expect(hasOp(await planRows(db, sql), 'EMPTYRELATION')).to.equal(false);
 		expect(await results(db, sql)).to.have.lengthOf(0);

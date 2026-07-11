@@ -175,9 +175,10 @@ describe('IsolatedTable collation resolution', () => {
 
 		it('needs no key normalizer for a PK column whose type can never hold text', async () => {
 			// `serializeRowKey` normalizes only string values, so an INTEGER PK buckets by
-			// value under any collation. INTEGER declares no supported-collation list, so DDL
-			// accepts the name; demanding a normalizer here would reject a valid query that
-			// the engine's own hash sites (`hashKeyCollationName`) accept.
+			// value under any collation. MYCOLL is registered below, so DDL accepts the name on
+			// the INTEGER column (an unregistered name would be rejected at CREATE since
+			// feat-ddl-accepts-registered-collations); demanding a normalizer here would reject a
+			// valid query that the engine's own hash sites (`hashKeyCollationName`) accept.
 			db.registerCollation('MYCOLL', (a, b) => (a < b ? -1 : a > b ? 1 : 0));
 			await db.exec(`create table t (n integer collate MYCOLL primary key, v integer) using isolated`);
 			await db.exec(`create index ix_v on t (v)`);
@@ -224,13 +225,17 @@ describe('IsolatedTable collation resolution', () => {
 	});
 
 	describe('unregistered collation', () => {
-		it('raises rather than falling back to BINARY', async () => {
+		it('is rejected at DDL rather than falling back to BINARY', async () => {
+			// Since feat-ddl-accepts-registered-collations the engine's column-DDL gate is
+			// registry-aware for EVERY type, so an unregistered name on an INTEGER column is
+			// rejected up front with `Unknown collation` — before the isolation module's
+			// resolver would have thrown `no such collation sequence` at comparator build.
 			const err = await attempt(
 				db,
 				`create table t (k integer collate FROBNICATE primary key, v text) using isolated`,
 			);
 			expect(err, 'expected an unresolvable-collation error').to.not.be.null;
-			expect(err!.message).to.match(/no such collation sequence: FROBNICATE/i);
+			expect(err!.message).to.match(/Unknown collation/i);
 		});
 	});
 });

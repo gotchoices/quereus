@@ -180,30 +180,85 @@ export function getPrimaryKeyIndices(pkDef: ReadonlyArray<PrimaryKeyColumnDefini
 }
 
 /**
- * Validates a collation name against a logical type's `supportedCollations` and
- * returns its canonical (normalized) form. Shared by CREATE TABLE column parsing
- * (`columnDefToSchema`) and the runtime `ALTER COLUMN ... SET COLLATE` path so
- * both reject an unsupported collation with the same error shape.
+ * Validates a column's explicit `COLLATE` name against the column's logical type
+ * AND (when supplied) the connection's collation registry, returning the canonical
+ * (normalized) form. Shared by CREATE TABLE column parsing (`columnDefToSchema`),
+ * catalog rehydrate (`importTable`), and the runtime `ALTER COLUMN ... SET COLLATE`
+ * path so all reject an unsupported collation with the same error shape.
+ *
+ * `BINARY` is always accepted (it needs no registration and every type supports it).
+ *
+ * When `isCollationRegistered` is **omitted** the function keeps its legacy
+ * static-list behavior byte-for-byte: a type with a `supportedCollations` list
+ * rejects any name not on it; a type with no list (INTEGER/REAL/BLOB) accepts any
+ * name. This branch preserves every db-less caller (`createBasicSchema`, unit
+ * tests, the view-MV DDL helper), none of which declare an unregistered explicit
+ * collation on a no-list type.
+ *
+ * When `isCollationRegistered` **is** supplied the gate becomes registry-aware:
+ *  - a name on the type's list (TEXT's BINARY/NOCASE/RTRIM) is accepted;
+ *  - a type with an *empty* list (JSON/temporal) rejects every non-BINARY name,
+ *    registered or not (the list precedes the registry);
+ *  - otherwise — TEXT + a name off its list, OR a no-list type — the name is
+ *    accepted iff the connection has it registered, and rejected otherwise. This
+ *    both admits a registered custom collation on TEXT and closes the old hole
+ *    where an unregistered name slid through on INTEGER/REAL/BLOB.
+ *
+ * The error keeps the exact `Unknown collation '<name>' for type '<type>'` prefix
+ * (pinned by sqllogic); only the parenthetical suffix varies by case. The no-list
+ * message must NOT dereference the (undefined) `supportedCollations`.
  *
  * @param collation Collation name as written
  * @param logicalType The column's logical type (carries `supportedCollations`)
  * @param columnName Column name, for the error message
+ * @param isCollationRegistered Optional predicate: does the connection resolve this name?
  * @returns The canonical collation name
- * @throws QuereusError when the type constrains its collations and this one is not among them
+ * @throws QuereusError when the collation is not accepted for the type / registry
  */
 export function validateCollationForType(
 	collation: string,
 	logicalType: LogicalType,
 	columnName: string,
+	isCollationRegistered?: (name: string) => boolean,
 ): string {
 	const normalized = normalizeCollationName(collation);
-	if (logicalType.supportedCollations && !logicalType.supportedCollations.includes(normalized)) {
+	if (normalized === 'BINARY') return 'BINARY';
+
+	const list = logicalType.supportedCollations;
+
+	// Legacy branch: no predicate → static-list behavior, unchanged.
+	if (isCollationRegistered === undefined) {
+		if (list && !list.includes(normalized)) {
+			throw new QuereusError(
+				`Unknown collation '${collation}' for type '${logicalType.name}' on column '${columnName}' (expected one of: ${list.join(', ')})`,
+				StatusCode.ERROR,
+			);
+		}
+		return normalized;
+	}
+
+	// Registry-aware branch.
+	if (list?.includes(normalized)) return normalized;
+
+	if (list && list.length === 0) {
 		throw new QuereusError(
-			`Unknown collation '${collation}' for type '${logicalType.name}' on column '${columnName}' (expected one of: ${logicalType.supportedCollations.join(', ')})`,
+			`Unknown collation '${collation}' for type '${logicalType.name}' on column '${columnName}' (type supports no collation other than BINARY)`,
 			StatusCode.ERROR,
 		);
 	}
-	return normalized;
+
+	if (isCollationRegistered(normalized)) return normalized;
+
+	// A no-list type (INTEGER/REAL/BLOB) has no set of type collations to offer;
+	// TEXT (and any non-empty-list custom type) lists its built-ins plus the
+	// registry option.
+	const suffix = list && list.length > 0
+		? `(expected one of: ${list.join(', ')}, or a registered collation)`
+		: `(not a registered collation)`;
+	throw new QuereusError(
+		`Unknown collation '${collation}' for type '${logicalType.name}' on column '${columnName}' ${suffix}`,
+		StatusCode.ERROR,
+	);
 }
 
 /**
@@ -250,9 +305,18 @@ export function resolveDefaultCollation(logicalType: LogicalType, defaultCollati
  * @param defaultCollation Session `default_collation` applied to columns with no explicit
  *   `COLLATE` clause (resolved via {@link resolveDefaultCollation}). Defaults to `'BINARY'`
  *   (no behavior change); the rehydrate path passes `'BINARY'` so persisted DDL stays canonical.
+ * @param isCollationRegistered Optional predicate forwarded to {@link validateCollationForType}
+ *   for an explicit `COLLATE` clause, so a collation the connection registered is accepted and
+ *   an unregistered one is rejected for every type. Omit (db-less callers) for legacy static-list
+ *   validation.
  * @returns A runtime ColumnSchema object
  */
-export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true, defaultCollation: string = 'BINARY'): ColumnSchema {
+export function columnDefToSchema(
+	def: ColumnDef,
+	defaultNotNull: boolean = true,
+	defaultCollation: string = 'BINARY',
+	isCollationRegistered?: (name: string) => boolean,
+): ColumnSchema {
 	// Infer logical type from the declared type name
 	const logicalType = inferType(def.dataType);
 
@@ -296,7 +360,7 @@ export function columnDefToSchema(def: ColumnDef, defaultNotNull: boolean = true
 				break;
 			case 'collate': {
 				schema.collation = constraint.collation
-					? validateCollationForType(constraint.collation, logicalType, def.name)
+					? validateCollationForType(constraint.collation, logicalType, def.name, isCollationRegistered)
 					: 'BINARY';
 				// Mark the collation as user-declared so modules can tell an explicit
 				// `COLLATE` clause apart from the implicit default (see ColumnSchema).
