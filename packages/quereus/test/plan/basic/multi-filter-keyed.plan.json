@@ -105,7 +105,7 @@
                 "filterInfo": {
                   "estimatedCost": 0.8,
                   "estimatedRows": 1,
-                  "matchedClauses": 0,
+                  "matchedClauses": 1,
                   "usableIndex": "idx=_primary_(0);plan=2"
                 },
                 "indexName": "primary",

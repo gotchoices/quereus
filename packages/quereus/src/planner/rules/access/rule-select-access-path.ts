@@ -88,6 +88,9 @@ function makeIndexFilterInfo(
 		indexInfoOutput: {
 			...base.indexInfoOutput,
 			idxStr,
+			// Reflect the seek's consumed constraints so EXPLAIN's matchedClauses
+			// counts them; `base` is seeded from a full scan and carries none.
+			aConstraintUsage: constraints.map(c => ({ argvIndex: c.argvIndex, omit: true })),
 		},
 	};
 }
