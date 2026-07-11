@@ -896,7 +896,7 @@ for await (const row of db.eval(`
 
 ## Views, Updatable Views, and Materialized Views
 
-For the SQL syntax and semantics see the [SQL Reference §2.8–2.11](sql.md#28-create-view-statement). This section covers the operational/API-level behavior.
+For the SQL syntax and semantics see the [SQL Reference §2.8–2.11](sql-views.md#28-create-view-statement). This section covers the operational/API-level behavior.
 
 **Plain views** re-evaluate their body on every reference. **Updatable views** let you `insert` / `update` / `delete` through a view (or a non-recursive CTE, or a subquery in `from`) — the engine rewrites the DML to the underlying base table(s):
 
@@ -921,7 +921,7 @@ Operational consequences:
 
 - A materialized view is **transactional** — a maintenance failure or a `rollback` reverts source and backing together; there is no asynchronous drift and `refresh materialized view` is not required for currency.
 - `Database.watch` on a materialized view projects to its **source** tables (the backing table is maintained off the change log, so watching it directly would never fire).
-- Only [narrow body shapes](sql.md#210-create-materialized-view-statement) are eligible; an ineligible body is rejected at `create`.
+- Only [narrow body shapes](sql-views.md#210-create-materialized-view-statement) are eligible; an ineligible body is rejected at `create`.
 - A covering materialized view (projecting a UNIQUE constraint's columns, ordered by them) makes that constraint's enforcement O(log n) and conflict-resolution-capable.
 
 These features run against persistent storage backends too — the `.sqllogic` suites for views, materialized views, and lens write-through are exercised under both the in-memory and LevelDB store backends (`yarn test:store`).

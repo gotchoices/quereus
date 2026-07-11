@@ -24,6 +24,13 @@ See `docs/design-isolation-layer.md`
 
 - [ ] Need to update the BNF in sql.md
 
+### Language roadmap (relocated from the SQL reference §11.4)
+
+Quereus is actively developed with plans to add:
+- Advanced window function features (navigation functions, window frames)
+- Enhanced recursive CTE capabilities
+- More query planning enhancements
+
 - [ ] Our constraint system can't enforce a certain class of constraints that require access to the before AND after state of the transaction (e.g. a certain row must have been removed).  Design a system to enable this.  Perhaps we have a new class of constrains that runs a query *before* the transaction changes anything, then makes that result set available to the constraint logic running *after*.
 
 ### UPSERT Implementation (ON CONFLICT DO UPDATE/DO NOTHING)

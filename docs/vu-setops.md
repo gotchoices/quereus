@@ -10,7 +10,7 @@ The vertical (row) analogue of the outer-join existence column: the
 `<setop> exists <branch> as <name>` clause manifests a set operation's **branch
 membership** as a first-class boolean column — reading it tells you which immediate
 operand of the binary combinator the result tuple came from. See
-[`sql.md` § Set-operation membership columns](sql.md#set-operation-membership-columns)
+[`sql.md` § Set-operation membership columns](sql-select.md#set-operation-membership-columns)
 for the grammar. The same two soundness properties as the join existence column hold:
 
 - **Derived at the combinator, not stored.** The flag is computed at the

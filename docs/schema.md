@@ -470,7 +470,7 @@ secondary-index *column* values. The schema entry points:
 The store carries no on-disk format version stamp and no rebuild-on-open path: a store whose
 non-textual PK bytes were written under any collation but BINARY must be recreated.
 
-See [`docs/sql.md` § ALTER COLUMN](sql.md#27-alter-table-statement) for the
+See [`docs/sql.md` § ALTER COLUMN](sql-ddl.md#27-alter-table-statement) for the
 full SET COLLATE contract, including the non-PK UNIQUE re-validation. Physical key bytes
 and existing-row dedup both resolve the collation's key normalizer against the connection's
 registry, so a custom or overridden collation is honored; a comparator-only collation
@@ -610,7 +610,7 @@ db.setSchemaPath(['main', 'extensions', 'plugins']);
 const path = db.getSchemaPath(); // ['main', 'extensions', 'plugins']
 ```
 
-Note the deliberate asymmetry with DDL: unqualified DDL lands objects in the **current schema** (`schemaManager.setCurrentSchema(name)`, API-only), but unqualified read resolution consults only the schema path (default `main`, then `temp`) — never the current schema. An embedder setting a non-`main` current schema should set the schema path to match, or qualify references; see [SQL Reference § Schema Search Path](sql.md) for the user-facing statement of this rule.
+Note the deliberate asymmetry with DDL: unqualified DDL lands objects in the **current schema** (`schemaManager.setCurrentSchema(name)`, API-only), but unqualified read resolution consults only the schema path (default `main`, then `temp`) — never the current schema. An embedder setting a non-`main` current schema should set the schema path to match, or qualify references; see [SQL Reference § Schema Search Path](sql-select.md#211-schema-search-path-with-schema) for the user-facing statement of this rule.
 
 See the [Usage Guide](usage.md) for the consumer-facing declarative schema workflow, schema path resolution order, and `PRAGMA schema_path` syntax.
 
@@ -714,7 +714,7 @@ The `declare schema` / `diff schema` / `apply schema` workflow provides order-in
 
 - `SchemaDiff.maintainedModuleMigrations` — backing-module moves on maintained tables (a declared `using <module>(args)` change on a `materialized view` / `create table … maintained as`). Each is realized as a **destructive drop+recreate** (the DROP rides `tablesToDrop`; the recreate, which re-materializes the body into the new module, rides `tablesToCreate`), minting a new incarnation. Surfaced unconditionally by `diff schema`; **gated** at `apply schema` on `allow_destructive` (see below). See [Materialized Views § Declarative-schema integration](materialized-views.md#declarative-schema-integration).
 
-Destructive changes require explicit acknowledgement. The maintained-table backing-module move is the one case currently **enforced**: `apply schema` aborts (before any DDL runs) unless re-run with `options (allow_destructive = true)`, since the new incarnation changes row identity for a replicated/synced table. See the [SQL Reference](sql.md#20-declarative-schema-optional-order-independent) for the full gating contract, syntax, and examples.
+Destructive changes require explicit acknowledgement. The maintained-table backing-module move is the one case currently **enforced**: `apply schema` aborts (before any DDL runs) unless re-run with `options (allow_destructive = true)`, since the new incarnation changes row identity for a replicated/synced table. See the [SQL Reference](sql-ddl.md#20-declarative-schema-optional-order-independent) for the full gating contract, syntax, and examples.
 
 The equivalence guarantee that direct `create table` / `create view` DDL and the corresponding `declare schema` + `apply schema` body produce indistinguishable catalogs and runtime behaviour is enforced by `test/declarative-equivalence.spec.ts` (curated corpus) plus the `Declarative-schema equivalence (property)` block in `test/property.spec.ts` (`fast-check`-driven dragnet).
 

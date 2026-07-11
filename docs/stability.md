@@ -85,7 +85,7 @@ report the user-visible symptom, not the internal detail.
 | Error types and status codes | Stable | [errors.md](errors.md) |
 | Materialized views | Beta | [materialized-views.md](materialized-views.md), [mv-maintenance.md](mv-maintenance.md), [mv-constraints.md](mv-constraints.md), [mv-ingestion.md](mv-ingestion.md), [mv-schema-change.md](mv-schema-change.md), [mv-backing-host.md](mv-backing-host.md) |
 | View updateability — write-through for views, CTEs, and subqueries-in-`from` | Beta | [view-updateability.md](view-updateability.md) |
-| Declarative schema — `declare schema` / `apply schema` | Beta | [sql.md](sql.md) § 2.0 (section banner) |
+| Declarative schema — `declare schema` / `apply schema` | Beta | [sql-ddl.md](sql-ddl.md) § 2.0 (section banner) |
 | Change-scope introspection and `Database.watch` | Beta | [change-scope.md](change-scope.md), [usage.md](usage.md) § Change-scope (section banner) |
 | Database event hooks — `onDataChange`, `onSchemaChange` | Beta | [schema.md](schema.md) |
 | `SchemaManager` API and DDL generation | Beta | [schema.md](schema.md) |
@@ -126,11 +126,11 @@ migration all sit on it, so a Beta base under a Beta feature and an Experimental
 is coherent; a Stable base would not have been.
 
 **Declarative schema is Beta, not Stable**, even though it is documented inside the
-Stable `sql.md`. It carries a real equivalence harness
+Stable `sql-ddl.md`. It carries a real equivalence harness
 (`test/declarative-equivalence.spec.ts` plus a property suite), but that harness was
 shaped against three found round-trip defects, and the `declare schema` grammar is
 still growing — seeds, imports, versioning, hashing. It takes a section banner inside
-`sql.md` rather than changing that doc's header banner.
+`sql-ddl.md` rather than changing that doc's header banner.
 
 **The functional-dependency framework is Internal, not a user tier**, for the reason
 given under [What a tier measures](#what-a-tier-measures): it has no public surface,

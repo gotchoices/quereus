@@ -108,7 +108,7 @@ The tier word is one of `Stable`, `Beta`, `Experimental`, `Internal`, and must m
 doc's entry in `docs/.stability.json`, which is the machine-readable form of the same map.
 
 A **section** may override its doc's tier by carrying the same banner under that section's
-heading — that is how `declare schema` is marked Beta inside the Stable `sql.md`. The header
+heading — that is how `declare schema` is marked Beta inside the Stable `sql-ddl.md`. The header
 banner states the doc's predominant tier; section banners are the exceptions, and there is
 never more than one banner in the window below the H1.
 

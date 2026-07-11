@@ -126,7 +126,7 @@ Outer joins introduce **null-extended** lineage on the non-preserved side(s). Fo
 The `exists [<side>] as <name>` join clause (Dataphor `include rowexists`) manifests
 an outer join's match-existence as a first-class boolean column — reading it tells
 you whether the non-preserved `side` matched the current row. See
-[`sql.md` § Existence columns](sql.md#existence-columns-on-outer-joins) for the
+[`sql.md` § Existence columns](sql-select.md#existence-columns-on-outer-joins) for the
 grammar. Two properties make the flag sound:
 
 - **Derived at the combinator, not stored.** The flag is the join operator's own
