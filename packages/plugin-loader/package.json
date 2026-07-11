@@ -27,7 +27,7 @@
     "build": "tsc",
     "lint": "echo 'No lint configured'",
     "typecheck": "tsc --noEmit",
-    "//test": "NOTE: no test files yet; --passWithNoTests keeps this package visible to `yarn test`/foreach (not silently skipped) but the green is empty, not earned. Add real vitest specs when plugin-loader gets coverage.",
+    "//test": "NOTE: test/config-channel.spec.ts covers the plugin config channel only; url parsing/validation, npm-spec resolution, and CDN url building are still untested — this is core infrastructure, so that gap is tracked as debt, not shrugged off: see tickets/backlog/debt-plugin-loader-test-coverage.md. --passWithNoTests stays so an empty glob (or a future test-file rename) doesn't fail the build.",
     "test": "vitest run --passWithNoTests"
   },
   "peerDependencies": {

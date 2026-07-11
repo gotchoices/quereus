@@ -24,7 +24,7 @@
     "build": "tsc",
     "dev": "tsc && node dist/bin/quoomb.js",
     "lint": "echo 'No lint configured'",
-    "//test": "NOTE: no test files yet; --passWithNoTests keeps this package visible to `yarn test` (not silently skipped) but the green is empty, not earned.",
+    "//test": "NOTE: test/dot-commands.spec.ts smoke-tests table listing, schema display, CSV import type-inference, and export — the non-trivial logic here. --passWithNoTests stays as a safety net (not because this package is meant to stay test-free) so an empty glob doesn't fail the build.",
     "test": "vitest run --passWithNoTests",
     "prepublish": "npm run build"
   },

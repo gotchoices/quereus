@@ -83,7 +83,7 @@ Examples:
     try {
       const results = [];
       for await (const row of this.db.eval(`
-        SELECT name, type FROM sqlite_schema
+        SELECT name, type FROM schema()
         WHERE type IN ('table', 'view')
         ORDER BY name
       `)) {
@@ -116,7 +116,7 @@ Examples:
         // Show all schemas
         const results = [];
         for await (const row of this.db.eval(`
-          SELECT sql FROM sqlite_schema
+          SELECT sql FROM schema()
           WHERE sql IS NOT NULL
           ORDER BY name
         `)) {
@@ -135,7 +135,7 @@ Examples:
         // Show specific table schema
         const results = [];
         for await (const row of this.db.eval(`
-          SELECT sql FROM sqlite_schema
+          SELECT sql FROM schema()
           WHERE name = ? AND sql IS NOT NULL
         `, [tableName])) {
           results.push(row);
@@ -256,7 +256,7 @@ Examples:
       const placeholders = columnNames.map(() => '?').join(', ');
       const insertSql = `INSERT INTO ${quoteIdentifier(tableName)} (${columnNames.map(c => quoteIdentifier(c)).join(', ')}) VALUES (${placeholders})`;
 
-      const stmt = await this.db.prepare(insertSql);
+      const stmt = this.db.prepare(insertSql);
       let insertCount = 0;
 
       try {
