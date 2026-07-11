@@ -74,8 +74,8 @@ heading slug — an invariant heading's em dash slugifies to a double hyphen, so
 Copy the shape of an existing entry rather than working from a grammar restated here; the
 checker's Check B is the source of truth. It enforces that each entry:
 
-- has a heading `### <AREA>-<NNN> — <title>`, where `<AREA>` is one of `OPT`, `MV`, `RT`,
-  `SCH`, `SYNC`, `LENS`. IDs are unique, and ascend within an area. Gaps are fine — a
+- has a heading `### <AREA>-<NNN> — <title>`, where `<AREA>` is one of `OPT`, `MV`, `VU`,
+  `RT`, `SCH`, `SYNC`, `LENS`. IDs are unique, and ascend within an area. Gaps are fine — a
   retired invariant's number is never reused.
 - carries at least one `code:` line and **exactly one** `guard:` line. `guard: none — <reason>`
   is legal; a bare `guard: none` is not, because the reason is the point.

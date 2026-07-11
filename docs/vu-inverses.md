@@ -6,6 +6,8 @@ How Quereus makes a projected column writable by inverting its scalar transform:
 
 ## Scalar Invertibility
 
+> **Invariant:** [VU-006](invariants.md#vu-006--a-non-invertible-column-is-read-only-unless-an-inverse-is-authored)
+
 Scalar functions and operators expose an **invertibility profile** in their schema registration. The lineage walker consults the profile when threading a transformation through a column reference.
 
 ```typescript

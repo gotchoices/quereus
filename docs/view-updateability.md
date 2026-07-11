@@ -57,6 +57,8 @@ The classical view-update ambiguity (Bancilhon–Spyratos) only arises when one 
 
 ## The Update Site Model
 
+> **Invariant:** [VU-001](invariants.md#vu-001--view-targeted-dml-rewrites-to-base-tables-and-re-plans)
+
 Every relational `PlanNode` carries an `updateLineage` field mapping each output attribute to one of:
 
 - **`base`** — the column traces to a base-table column through a chain of invertible transformations. The chain is recorded so the engine can compose a setter expression on the base column.
@@ -69,6 +71,8 @@ Lineage is computed in a single pass that mirrors the optimizer's physical-prope
 > **Surface authority.** `updateLineage` is computed in `computePhysical`, so it is available on the **logical** operator tree (Project / Filter / Join / TableReference) the substrate walks. It survives optimization through the pass-through boundary nodes (access scans, Retrieve, Alias) but **not** through operators that rewrite structure (physical `HashJoin` / `MergeJoin`, aggregates, set-ops, Sort/Limit/Distinct). EXPLAIN / `query_plan()` therefore shows full lineage for single-source projection-filter shapes and on every TableReference; a join's optimized top node shows degraded (`computed`) lineage. The logical operator tree is authoritative — both the forward FD walk and the backward propagation read it before those structure-rewriting operators apply, which is precisely why a shape the forward walk cannot thread is also one the backward walk cannot consume.
 
 ## Mutation Propagation
+
+> **Invariant:** [VU-002](invariants.md#vu-002--updateable-iff-a-deterministic-decomposition-exists-at-plan-time)
 
 A mutation statement is built like a query: parser → planner → optimizer. After the relation tree is finalized, a **propagation pass** walks the tree from the user-visible top-level relation down to base-table references, emitting a list of base-table operations.
 

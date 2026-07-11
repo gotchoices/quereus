@@ -22,6 +22,11 @@ This is the Bohannon–Pierce–Vaughan move adapted to Quereus's FD-annotated o
 
 ## The three round-trip laws
 
+> **Invariant:** [VU-003](invariants.md#vu-003--putget-a-write-through-a-view-never-escapes-the-view-predicate)
+> · [VU-004](invariants.md#vu-004--getput-reading-a-row-and-writing-it-back-is-a-base-no-op)
+> · [VU-005](invariants.md#vu-005--forward-and-backward-lineage-agree)
+> · [VU-008](invariants.md#vu-008--a-limit-offset-or-distinct-body-rejects-rather-than-widen)
+
 A per-operator round-trip property block (`test/property.spec.ts` § View Round-Trip Laws), sibling to Key Soundness, forces the backward walk to agree with the forward walk over the writable fragment. For a randomly-seeded small base table and a spread of view bodies:
 
 - **PutGet (write-then-read).** Apply a generated mutation through the view, read the view back, and assert the read reflects exactly the mutation's effect on the writable columns — no rows appear/disappear outside the view predicate, computed columns are untouched (a write to one is rejected with `no-inverse`, not silently dropped), and a key the forward walk claims on the view output is the same tuple the backward walk used to bind the base row. This is the law that turns `LIMIT`/`OFFSET`/`DISTINCT` write-widening and the alias-qualifier leak into *property* failures.

@@ -319,7 +319,7 @@ function checkLinks(fail) {
 // Check B — invariant-block format
 // ---------------------------------------------------------------------------
 
-const INVARIANT_HEADING = /^### ((?:OPT|MV|RT|SCH|SYNC|LENS))-(\d{3}) — .+$/;
+const INVARIANT_HEADING = /^### ((?:OPT|MV|VU|RT|SCH|SYNC|LENS))-(\d{3}) — .+$/;
 const META_LINE = /^-\s+(code|guard|doc):\s*(.*)$/;
 const MAX_INVARIANT_BODY_WORDS = 120;
 

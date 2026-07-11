@@ -821,6 +821,122 @@ basis, the derived backing shape, module identity, the body hash (re-derived fro
 persisted DDL), and same-module sourcing — which further requires that a maintained source
 was itself adopted, not refilled.
 
+## VU — View updateability
+
+View updateability reuses the FD / equivalence-class / predicate-normalization machinery in
+the *mutation* direction — lineage parallels FDs, propagation parallels emission. The topic
+docs ([View Updateability](view-updateability.md) and its satellites) carry the exposition;
+these are the claims a single code read can falsify.
+
+### VU-001 — View-targeted DML rewrites to base tables and re-plans
+
+- code: `packages/quereus/src/planner/building/view-mutation-builder.ts` — `buildViewMutation`
+- code: `packages/quereus/src/planner/mutation/single-source.ts` — `rewriteViewInsert`
+- guard: `packages/quereus/test/logic/93.4-view-mutation.sqllogic`
+- doc: [View Updateability § The Update Site Model](view-updateability.md#the-update-site-model)
+
+An `insert` / `update` / `delete` targeting a view, a CTE name, or a subquery-in-`from` is
+rewritten to target the underlying base table(s) and re-planned through the ordinary
+base-table builders, so all their constraint / conflict / FK machinery is reused verbatim.
+There is no view-level updateability flag, no `instead of` trigger, and no `with check
+option`: updateability is a property of the body, decided at plan time. The same substrate
+serves a materialized-view name — routing to the MV's source, with row-time maintenance
+syncing the backing inside the statement.
+
+### VU-002 — Updateable iff a deterministic decomposition exists at plan time
+
+- code: `packages/quereus/src/planner/mutation/propagate.ts` — `classifyViewBody`
+- code: `packages/quereus/src/planner/mutation/mutation-diagnostic.ts` — `raiseMutationDiagnostic`
+- guard: `packages/quereus/test/property.spec.ts` — `View Round-Trip Laws`
+- doc: [View Updateability § Mutation Propagation](view-updateability.md#mutation-propagation)
+
+A relation is updateable exactly when the propagation pass finds a deterministic base-table
+decomposition at plan time. When it cannot, the write raises a structured `MutationDiagnostic`
+(`no-inverse`, `predicate-contradiction`, `recursive-cte`, …) naming the operator and column
+that obstructed propagation — it is never silently dropped and never silently widened onto
+rows the view does not expose. `classifyViewBody` routes the body (single-source /
+multi-source join / decomposition); a shape outside the supported fragment reaches
+`raiseMutationDiagnostic` rather than producing a partial or best-effort write.
+
+### VU-003 — PutGet: a write through a view never escapes the view predicate
+
+- code: `packages/quereus/src/planner/mutation/propagate.ts` — `propagate`
+- guard: `packages/quereus/test/property.spec.ts` — `View Round-Trip Laws`
+- doc: [Round-Trip Laws § The three round-trip laws](vu-roundtrip.md#the-three-round-trip-laws)
+
+Applying a mutation through a view and reading the view back reflects exactly the mutation's
+effect on the writable columns: no base row outside the view's selection predicate appears,
+disappears, or changes, and a write to a computed column is rejected (`no-inverse`), never
+silently dropped. The selection predicate is conjoined into every emitted base operation's
+predicate, so the view is a window the write cannot reach around. A key the forward FD walk
+claims on the view output is the same tuple the backward walk binds the base row by.
+
+### VU-004 — GetPut: reading a row and writing it back is a base no-op
+
+- code: `packages/quereus/src/planner/analysis/update-lineage.ts` — `resolveBaseSite`
+- guard: `packages/quereus/test/property.spec.ts` — `View Round-Trip Laws`
+- doc: [Round-Trip Laws § The three round-trip laws](vu-roundtrip.md#the-three-round-trip-laws)
+
+Reading a row through a view and writing the same values straight back — an `update` keyed on
+the view's identifying predicate that assigns each column its just-read value — leaves the
+base table byte-unchanged. Each writable output column resolves through `resolveBaseSite` to a
+base column (identity, rename, passthrough, or invertible transform), and the write-back lowers
+through that site's inverse, so the round trip composes to the identity on the base value.
+
+### VU-005 — Forward and backward lineage agree
+
+- code: `packages/quereus/src/planner/analysis/update-lineage.ts` — `deriveViewColumns`
+- guard: `packages/quereus/test/property.spec.ts` — `View Round-Trip Laws`
+- doc: [Round-Trip Laws § The three round-trip laws](vu-roundtrip.md#the-three-round-trip-laws)
+
+The backward lineage (`deriveViewColumns`) agrees with the forward FD facts (`keysOf` /
+`isUnique`) for every output column: each `base`-writable column has a forward FD path to that
+base column, and every key the forward walk advertises on the view output is reconstructible by
+the backward identifying predicate. A base primary key that survives projection is advertised
+as a forward key. An operator that advertises a key forward while its backward `put` rule
+threads a different base column is the bug the lineage-agreement law reds.
+
+### VU-006 — A non-invertible column is read-only unless an inverse is authored
+
+- code: `packages/quereus/src/planner/analysis/scalar-invertibility.ts` — `classifyInvertibility`
+- code: `packages/quereus/src/planner/analysis/authored-inverse.ts` — `validateAuthoredInverses`
+- guard: `packages/quereus/test/property.spec.ts` — `View Round-Trip Laws`
+- doc: [Scalar Invertibility § Scalar Invertibility](vu-inverses.md#scalar-invertibility)
+
+A projected column whose scalar transform the invertibility registry classifies `opaque` — a
+computed or generated column — is read-only: a write reds the `no-inverse` diagnostic, never
+silently dropped. `passthrough` and `inverse` transforms stay writable (the write lowers
+through the inverse). The one lift is an authored inverse: a `with inverse (…)` clause on the
+result column upgrades an otherwise-`opaque` column to a writable `base` site carrying
+author-supplied put expressions, validated at build time by `validateAuthoredInverses`.
+
+### VU-007 — A shared key is evaluated once and threaded to every member
+
+- code: `packages/quereus/src/planner/mutation/multi-source.ts` — `analyzeMultiSourceInsert`
+- code: `packages/quereus/src/planner/mutation/decomposition.ts` — `analyzeDecompositionInsert`
+- guard: `packages/quereus/test/property.spec.ts` — `View Round-Trip Laws`
+- doc: [Mutation Context § Shared keys are ordinary defaults](vu-mutation-context.md#shared-keys-are-ordinary-defaults--the-engine-chooses-no-id-policy)
+
+A multi-source join `insert`, or an n-way decomposition `insert`, needs a shared key present in
+no single base table. The engine invents none: it evaluates the anchor key column's declared
+`default` once per produced logical row at the mutation envelope — before any base write — and
+threads that one value into every member's key column through the join-key equivalence class.
+So all members of a row's fan-out agree on identity, the default fires once per row (not once
+per member), and a non-deterministic allocator captured at the envelope replays identically.
+
+### VU-008 — A LIMIT, OFFSET, or DISTINCT body rejects rather than widen
+
+- code: `packages/quereus/src/planner/mutation/single-source.ts` — `analyzeView`
+- guard: `packages/quereus/test/property.spec.ts` — `View Round-Trip Laws`
+- doc: [Round-Trip Laws § The three round-trip laws](vu-roundtrip.md#the-three-round-trip-laws)
+
+A view body carrying `limit`, `offset`, or `distinct` is outside the supported decomposition
+fragment: a row-count window or duplicate collapse cannot be reproduced as a `where` predicate,
+so a mutation through it would touch base rows the view never exposes. `analyzeView` rejects
+such a body with a structured diagnostic (`unsupported-limit` / `unsupported-distinct`) rather
+than silently widening the write onto the collapsed or windowed-away rows. The PutGet law
+(VU-003) guards this: the write-widening regression is now a property failure.
+
 ## RT — Runtime
 
 Reserved.
