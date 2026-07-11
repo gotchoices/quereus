@@ -134,6 +134,33 @@ describe('CASE short-circuit evaluation', () => {
 				{ id: 2, r: -1 },   // flag=0 → ELSE, subquery skipped
 			]);
 		});
+
+		it('an async correlated-subquery WHEN condition drives selection', async () => {
+			// The WHEN itself is a subquery → the branch callback returns a Promise, so
+			// `step` takes the `w instanceof Promise` path. Row id=1 has 2 inner rows
+			// (WHEN true → THEN), id=2 has 1 (WHEN false → fall through to ELSE).
+			const rows = await collect(
+				db,
+				'select id, case when (select count(*) from i where i.oid = o.id) > 1 then \'many\' else \'few\' end as r from o order by id',
+			);
+			expect(rows).to.deep.equal([
+				{ id: 1, r: 'many' },  // count(i where oid=1)=2 → WHEN true
+				{ id: 2, r: 'few' },   // count(i where oid=2)=1 → WHEN false → ELSE
+			]);
+		});
+
+		it('an async WHEN that fails falls through to a later matching WHEN', async () => {
+			// First WHEN is async and false → the promise branch must recurse via
+			// step(i+1) to the second (synchronous) WHEN, which matches.
+			const rows = await collect(
+				db,
+				'select id, case when (select count(*) from i where i.oid = o.id) > 5 then \'lots\' when flag = 0 then \'zero-flag\' else \'other\' end as r from o order by id',
+			);
+			expect(rows).to.deep.equal([
+				{ id: 1, r: 'other' },      // async WHEN false, flag=1 → ELSE
+				{ id: 2, r: 'zero-flag' },  // async WHEN false, flag=0 → 2nd WHEN
+			]);
+		});
 	});
 
 	describe('semantic parity (NULL base / NULL WHEN / no ELSE)', () => {
