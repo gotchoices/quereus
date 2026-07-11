@@ -183,8 +183,7 @@ export class SyncClient {
       this._connectReject = reject;
 
       try {
-        const wsUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url;
-        this.ws = new WebSocket(wsUrl);
+        this.ws = new WebSocket(url);
 
         this.ws.onopen = () => {
           this.reconnectAttempts = 0;

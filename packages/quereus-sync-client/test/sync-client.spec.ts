@@ -377,14 +377,17 @@ describe('SyncClient', () => {
       expect((handshake as { protocolVersion?: number }).protocolVersion).to.equal(PROTOCOL_VERSION);
     });
 
-    it('should include token in URL when provided', async () => {
+    it('should not include token in URL, sending it in the handshake body instead', async () => {
       const { client } = createClient();
       const connectPromise = client.connect('ws://localhost:8080/sync', 'test-db', 'my-token');
       const ws = MockWebSocket.lastInstance!;
-      expect(ws.url).to.include('token=my-token');
+      expect(ws.url).to.not.include('token=my-token');
       ws.simulateOpen();
       simulateHandshakeAck(ws);
       await connectPromise;
+
+      const handshake = ws.getSentMessages().find(m => m.type === 'handshake');
+      expect((handshake as { token?: string })?.token).to.equal('my-token');
     });
 
     it('should reject on WebSocket error during first attempt', async () => {
