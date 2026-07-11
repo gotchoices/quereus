@@ -1806,16 +1806,28 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 		// Use unique ID to avoid conflicts when multiple overlays exist
 		const overlayId = generateOverlayId();
+		const overlayName = `_overlay_${baseSchema.name}_${overlayId}`;
 
 		const liveOnly = this.liveRowPredicate();
 
+		// A partial-index / UNIQUE predicate copied from the base carries a self-qualifier
+		// bound to the base table's name (e.g. `where t.v > 0`). The overlay renames the table
+		// to `overlayName`, so that qualifier now names a DIFFERENT table than the overlay's
+		// MemoryIndex is scoped to — and `compilePredicate` rejects a foreign qualifier at
+		// index-build time (see partial-index-predicate table-qualifier rejection). Rescope the
+		// self-qualifier to the overlay name so it stays a self-reference. A foreign qualifier
+		// cannot occur here: `compilePredicate` already rejected one when the base index/UNIQUE
+		// was created, so every qualifier present is the base name.
+		const rescope = (p: Predicate | undefined): Predicate | undefined =>
+			p ? rescopePredicateQualifier(p, baseSchema.name, overlayName) : undefined;
+
 		return {
 			...baseSchema,
-			name: `_overlay_${baseSchema.name}_${overlayId}`,
+			name: overlayName,
 			columns: newColumns,
 			columnIndexMap: newColumnIndexMap,
-			indexes: baseSchema.indexes?.map(idx => ({ ...idx, predicate: andPredicate(idx.predicate, liveOnly) })),
-			uniqueConstraints: baseSchema.uniqueConstraints?.map(uc => ({ ...uc, predicate: andPredicate(uc.predicate, liveOnly) })),
+			indexes: baseSchema.indexes?.map(idx => ({ ...idx, predicate: andPredicate(rescope(idx.predicate), liveOnly) })),
+			uniqueConstraints: baseSchema.uniqueConstraints?.map(uc => ({ ...uc, predicate: andPredicate(rescope(uc.predicate), liveOnly) })),
 		};
 	}
 
@@ -1840,4 +1852,28 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 function andPredicate(base: Predicate | undefined, extra: Predicate): Predicate {
 	return base ? { type: 'binary', operator: 'AND', left: base, right: extra } : extra;
+}
+
+/**
+ * Deep-clone `pred`, rewriting every column reference whose `table` qualifier names
+ * `fromName` (case-insensitive) to `toName`. Depth-blind structural walk — a `column`
+ * node is identified by `type === 'column'`; every other node is cloned verbatim. Used
+ * to re-anchor a base table's partial-predicate self-qualifier onto the renamed overlay
+ * table (see {@link IsolationModule.createOverlaySchema}).
+ */
+function rescopePredicateQualifier(pred: Predicate, fromName: string, toName: string): Predicate {
+	const fromLower = fromName.toLowerCase();
+	const clone = (v: unknown): unknown => {
+		if (v === null || typeof v !== 'object') return v;
+		if (Array.isArray(v)) return v.map(clone);
+		const out: Record<string, unknown> = {};
+		for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+			out[k] = clone(val);
+		}
+		if (out.type === 'column' && typeof out.table === 'string' && out.table.toLowerCase() === fromLower) {
+			out.table = toName;
+		}
+		return out;
+	};
+	return clone(pred) as Predicate;
 }

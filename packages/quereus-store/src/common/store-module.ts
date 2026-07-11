@@ -174,10 +174,17 @@ function equalityRoles(colIdxs: readonly number[]): SeekRole[] {
  * column schema plus whether the collation BYTES changed (which gates the existing-row
  * UNIQUE re-validation and the PK physical re-key). A sub-branch returns null instead when
  * the column is already in the desired state, so the caller returns the schema untouched.
+ *
+ * `valuesRewritten` is set when the sub-branch physically rewrote stored column values in
+ * place (same PK, new value) via {@link StoreTable.mapRowsAtIndex} — SET DATA TYPE's physical
+ * conversion or SET NOT NULL's DEFAULT backfill. Secondary index KEY bytes encode the indexed
+ * column VALUES, so any index covering the column still points at the OLD value bytes until
+ * rebuilt; the caller rebuilds every secondary index when this is set.
  */
 interface AlterColumnAttrChange {
 	newCol: ColumnSchema;
 	collationChanged: boolean;
+	valuesRewritten?: boolean;
 }
 
 /**
@@ -1834,7 +1841,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		if (attr === null) {
 			return oldSchema;
 		}
-		const { newCol, collationChanged } = attr;
+		const { newCol, collationChanged, valuesRewritten } = attr;
 
 		const updatedColumns = oldSchema.columns.map((c, i) => i === colIndex ? newCol : c);
 		// Mirror the memory module (MemoryTableManager.alterColumn): a per-column
@@ -1912,6 +1919,18 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
 		}
 
+		// SET DATA TYPE physical conversion / SET NOT NULL DEFAULT backfill rewrote stored
+		// column values in place (same PK, new value) via mapRowsAtIndex. Secondary index KEY
+		// bytes encode the indexed column VALUES, so any index covering this column still points
+		// at the OLD value bytes until rebuilt — an index-backed lookup for the new value finds
+		// nothing (mirrors the memory module's `valuesRewritten` rebuild in MemoryTableManager.
+		// alterColumn). The sub-helper already ran ddlCommitPendingOps before its rewrite, so the
+		// committed data store rebuildSecondaryIndexes reads is "everything live". Mutually
+		// exclusive with the collation re-key above (distinct attributes), so no double rebuild.
+		if (valuesRewritten) {
+			await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
+		}
+
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
 
@@ -1939,6 +1958,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
 	): Promise<AlterColumnAttrChange | null> {
 		let newCol: ColumnSchema;
+		let valuesRewritten = false;
 		if (change.setNotNull === true && !oldCol.notNull) {
 			// Backfill NULLs from a literal DEFAULT, or throw.
 			let defaultLiteral: SqlValue | undefined;
@@ -1963,6 +1983,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				// them; a committed-store rewrite cannot). See {@link ddlCommitPendingOps}.
 				await this.ddlCommitPendingOps();
 				await table.mapRowsAtIndex(colIndex, (v) => v === null ? fill : v);
+				valuesRewritten = true;
 			}
 			newCol = { ...oldCol, notNull: true };
 		} else if (change.setNotNull === false && oldCol.notNull) {
@@ -1976,7 +1997,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		} else {
 			return null; // already in desired state
 		}
-		return { newCol, collationChanged: false };
+		return { newCol, collationChanged: false, valuesRewritten };
 	}
 
 	/**
@@ -1991,6 +2012,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		change: Extract<SchemaChangeInfo, { type: 'alterColumn' }>,
 	): Promise<AlterColumnAttrChange> {
 		const newLogicalType = inferType(change.setDataType!);
+		let valuesRewritten = false;
 		if (newLogicalType.physicalType !== oldCol.logicalType.physicalType) {
 			// Physical conversion required — walk every row and attempt parse.
 			const convert = (v: SqlValue): SqlValue => {
@@ -2014,8 +2036,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// under the OLD physical type. See {@link ddlCommitPendingOps}.
 			await this.ddlCommitPendingOps();
 			await table.mapRowsAtIndex(colIndex, (v) => v === null ? v : convert(v));
+			valuesRewritten = true;
 		}
-		return { newCol: { ...oldCol, logicalType: newLogicalType }, collationChanged: false };
+		return { newCol: { ...oldCol, logicalType: newLogicalType }, collationChanged: false, valuesRewritten };
 	}
 
 	/**
