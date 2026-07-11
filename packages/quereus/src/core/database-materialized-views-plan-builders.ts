@@ -353,6 +353,14 @@ export function buildInverseProjectionPlan(
 	// Partial WHERE must be evaluable on a single source row (no subqueries /
 	// cross-row references). `compilePredicate` throws on unsupported forms; an
 	// unsupported WHERE shape falls to the floor.
+	//
+	// No owning-table name is passed (lenient qualifier handling), deliberately: the
+	// view body may reference the source through a FROM alias, not the source table's
+	// own name, so validating against `sourceSchema.name` would wrongly reject a legal
+	// aliased body — and this site FLOORS to full-rebuild on any throw rather than
+	// erroring, turning a false rejection into a silent maintenance regression.
+	// NOTE: to make MV WHERE strict, thread the alias set from the view's FROM into
+	// this builder (not currently available here) and validate against it.
 	let predicate: CompiledPredicate | undefined;
 	const bodyWhere = mv.derivation.selectAst.type === 'select' ? mv.derivation.selectAst.where : undefined;
 	if (bodyWhere) {

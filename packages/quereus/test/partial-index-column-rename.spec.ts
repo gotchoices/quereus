@@ -179,23 +179,61 @@ describe('partial index across column rename/drop', () => {
 		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal(['ix']);
 	});
 
-	it('rejects DROP COLUMN when the predicate names the column through a foreign qualifier', async () => {
+	it('rejects CREATE INDEX whose predicate names a foreign table qualifier', async () => {
 		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
-		// `compilePredicate` ignores the table qualifier and binds `active` by bare name,
-		// so this index reads `t.active` despite naming `zzz`. The DROP COLUMN pre-check
-		// must see the reference the same way, or the drop reaches the module and dies
-		// there with a raw "unknown column".
-		await db.exec(`create index ix on t (name) where zzz.active = 1`);
 
+		// `where zzz.active = 1` names table `zzz`, not `t`. Ignoring the qualifier and
+		// binding `active` by bare name would compile this to the same index as
+		// `where active = 1`, so two statements that read differently would collide. It is
+		// rejected at create time instead.
 		let message = '';
 		try {
-			await db.exec(`alter table t drop column active`);
+			await db.exec(`create index ix on t (name) where zzz.active = 1`);
 		} catch (e) {
 			message = (e as Error).message;
 		}
-		expect(message).to.contain(`Cannot drop column 'active'`);
-		expect(message).to.contain(`partial index 'ix'`);
+		expect(message).to.contain(`zzz.active`);
+		expect(message.toLowerCase()).to.contain(`different table`);
+
+		// The rejected statement created no index.
+		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal([]);
+	});
+
+	it('accepts a self-qualified partial-index predicate and filters rows by it', async () => {
+		await db.exec(`create table t (id integer primary key, name text, active integer) using testmem`);
+		// A qualifier naming the owning table itself is legal — it compiles rather than
+		// throwing.
+		await db.exec(`create index ix on t (name) where t.active = 1`);
+		await db.exec(`insert into t values (1, 'a', 1), (2, 'b', 0), (3, 'c', 1)`);
+
+		// The index is registered and scopes exactly as a bare `where active = 1` would:
+		// two of the three rows qualify.
 		expect([...baseLayerOf(module, 't').secondaryIndexes.keys()]).to.deep.equal(['ix']);
+		const scoped = await rows(db, `select name from t where active = 1 order by name`);
+		expect(scoped.map(r => r.name)).to.deep.equal(['a', 'c']);
+	});
+
+	it('scopes a case-insensitive self-qualified UNIQUE partial index by its predicate', async () => {
+		await db.exec(`create table u (id integer primary key, name text, active integer) using testmem`);
+		// Both the qualifier (`U`) and the column (`ACTIVE`) differ in case from the
+		// declared identifiers; the self-qualifier match is case-insensitive.
+		await db.exec(`create unique index ux on u (name) where U.ACTIVE = 1`);
+		await db.exec(`insert into u values (1, 'a', 1), (2, 'a', 0)`);
+
+		// A duplicate name INSIDE the predicate's scope is rejected — proving the compiled
+		// predicate scopes enforcement through the live DML path.
+		let threw: unknown;
+		try {
+			await db.exec(`insert into u values (3, 'a', 1)`);
+		} catch (e) {
+			threw = e;
+		}
+		expect(threw, 'duplicate inside the self-qualified partial scope must be rejected').to.exist;
+
+		// Outside the scope: still allowed.
+		await db.exec(`insert into u values (4, 'a', 0)`);
+		const all = await rows(db, `select count(*) as n from u`);
+		expect(all[0].n).to.equal(3);
 	});
 
 	it('allows DROP COLUMN once the partial index naming it is dropped', async () => {

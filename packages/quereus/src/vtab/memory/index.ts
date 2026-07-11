@@ -67,6 +67,7 @@ export class MemoryIndex {
 		collationResolver: CollationResolver,
 		primaryKeyComparator: (a: BTreeKeyForPrimary, b: BTreeKeyForPrimary) => number,
 		encode: (pk: BTreeKeyForPrimary) => string,
+		tableName: string,
 		baseInheritreeTable?: BTree<BTreeKeyForIndex, MemoryIndexEntry>,
 	) {
 		this.name = spec.name;
@@ -82,7 +83,7 @@ export class MemoryIndex {
 		this.keyFromRow = keyFunctions.keyFromRow;
 		this.compareKeys = keyFunctions.compareKeys;
 
-		this.predicate = spec.predicate ? compilePredicate(spec.predicate, allTableColumnsSchema) : undefined;
+		this.predicate = spec.predicate ? compilePredicate(spec.predicate, allTableColumnsSchema, tableName) : undefined;
 
 		this.data = this.createBTree(baseInheritreeTable);
 	}

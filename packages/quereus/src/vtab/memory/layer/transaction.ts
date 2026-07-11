@@ -145,6 +145,7 @@ export class TransactionLayer implements Layer {
 				this.collationResolver,
 				pkFunctions.compare,
 				pkFunctions.encode,
+				schema.name,
 				parentSecondaryTree || undefined // Use parent's secondary index tree as base
 			);
 			this.secondaryIndexes.set(indexSchema.name, memoryIndex);
@@ -208,6 +209,7 @@ export class TransactionLayer implements Layer {
 				this.collationResolver,
 				this.pkFunctions.compare,
 				this.pkFunctions.encode,
+				newSchema.name,
 				parentSecondaryTree || undefined,
 			);
 			this.reindexOwnWrites(memoryIndex);

@@ -49,7 +49,7 @@ function makeSchema(columns: ColumnSchema[], primaryKeyDefinition: PrimaryKeyCol
 /** A single-column secondary index (on column 0) whose entries hold PKs compared/encoded for `pkDefinition`. */
 function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[]): MemoryIndex {
 	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition), testBuiltinCollationResolver);
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode);
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode, 'test');
 }
 
 /**
@@ -62,7 +62,7 @@ function makeIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefini
  */
 function makeChildIndex(columns: ColumnSchema[], pkDefinition: PrimaryKeyColumnDefinition[], base: MemoryIndex): MemoryIndex {
 	const pk = createPrimaryKeyFunctions(makeSchema(columns, pkDefinition), testBuiltinCollationResolver);
-	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode, base.data);
+	return new MemoryIndex({ name: 'idx', columns: [{ index: 0 }] }, columns, testBuiltinCollationResolver, pk.compare, pk.encode, 'test', base.data);
 }
 
 describe('MemoryIndex primaryKeys value-identity', () => {

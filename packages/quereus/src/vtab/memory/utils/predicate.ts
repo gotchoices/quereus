@@ -43,16 +43,25 @@ type Evaluator = (row: Row) => SqlValue;
  * Throws QuereusError on unsupported expression forms or unknown column
  * references so failures surface at index-creation time rather than producing
  * wrong runtime answers.
+ *
+ * When `tableName` is supplied, a `table`-qualified reference naming any OTHER
+ * table (`where zzz.active = 1` on table `t`) is rejected here too — otherwise
+ * the qualifier is ignored and the ref binds by bare name, so two statements
+ * that read differently would compile to the same index. A self-qualifier
+ * (`where t.active = 1`, case-insensitive) is accepted. Callers that do not yet
+ * know their owning table name pass `undefined` and keep the lenient
+ * ignore-the-qualifier behaviour.
  */
 export function compilePredicate(
 	expr: Expression,
 	columns: ReadonlyArray<ColumnSchema>,
+	tableName?: string,
 ): CompiledPredicate {
 	const columnIndexMap = new Map<string, number>();
 	columns.forEach((col, idx) => columnIndexMap.set(col.name.toLowerCase(), idx));
 
 	const referencedColumns = new Set<number>();
-	const evaluator = compileExpression(expr, columnIndexMap, referencedColumns);
+	const evaluator = compileExpression(expr, columnIndexMap, referencedColumns, tableName);
 
 	const evaluate = (row: Row): boolean | null => predicateTruthy(evaluator(row));
 
@@ -63,6 +72,7 @@ function compileExpression(
 	expr: Expression,
 	columnIndexMap: ReadonlyMap<string, number>,
 	referencedColumns: Set<number>,
+	tableName: string | undefined,
 ): Evaluator {
 	switch (expr.type) {
 		case 'literal': {
@@ -90,6 +100,18 @@ function compileExpression(
 					StatusCode.ERROR,
 				);
 			}
+			// A `table`-qualified ref (`zzz.active`) naming a table other than the owning
+			// one is rejected: without this the qualifier is dropped and the ref binds by
+			// bare name, so `where zzz.active` and `where active` compile identically.
+			// Only `ColumnExpr` carries a `table` field (an `identifier` never does).
+			if (ref.type === 'column' && ref.table && tableName !== undefined
+				&& ref.table.toLowerCase() !== tableName.toLowerCase()) {
+				throw new QuereusError(
+					`Partial-index predicate cannot reference column '${ref.table}.${ref.name}' `
+						+ `of a different table (predicate is scoped to '${tableName}')`,
+					StatusCode.ERROR,
+				);
+			}
 			const colIdx = columnIndexMap.get(ref.name.toLowerCase());
 			if (colIdx === undefined) {
 				throw new QuereusError(
@@ -101,11 +123,11 @@ function compileExpression(
 			return (row: Row) => row[colIdx];
 		}
 		case 'unary':
-			return compileUnary(expr, columnIndexMap, referencedColumns);
+			return compileUnary(expr, columnIndexMap, referencedColumns, tableName);
 		case 'binary':
-			return compileBinary(expr, columnIndexMap, referencedColumns);
+			return compileBinary(expr, columnIndexMap, referencedColumns, tableName);
 		case 'in':
-			return compileIn(expr, columnIndexMap, referencedColumns);
+			return compileIn(expr, columnIndexMap, referencedColumns, tableName);
 		default:
 			throw new QuereusError(
 				`Unsupported expression in partial-index predicate: ${expr.type}`,
@@ -118,6 +140,7 @@ function compileIn(
 	expr: Extract<Expression, { type: 'in' }>,
 	columnIndexMap: ReadonlyMap<string, number>,
 	referencedColumns: Set<number>,
+	tableName: string | undefined,
 ): Evaluator {
 	if (expr.subquery) {
 		throw new QuereusError(
@@ -129,8 +152,8 @@ function compileIn(
 		// `col IN ()` is always false (SQLite semantics).
 		return () => false;
 	}
-	const inputEval = compileExpression(expr.expr, columnIndexMap, referencedColumns);
-	const valueEvals = expr.values.map(v => compileExpression(v, columnIndexMap, referencedColumns));
+	const inputEval = compileExpression(expr.expr, columnIndexMap, referencedColumns, tableName);
+	const valueEvals = expr.values.map(v => compileExpression(v, columnIndexMap, referencedColumns, tableName));
 	return (row) => {
 		const a = inputEval(row);
 		if (a === null) return null;
@@ -149,9 +172,10 @@ function compileUnary(
 	expr: Extract<Expression, { type: 'unary' }>,
 	columnIndexMap: ReadonlyMap<string, number>,
 	referencedColumns: Set<number>,
+	tableName: string | undefined,
 ): Evaluator {
 	const op = expr.operator.toUpperCase();
-	const operand = compileExpression(expr.expr, columnIndexMap, referencedColumns);
+	const operand = compileExpression(expr.expr, columnIndexMap, referencedColumns, tableName);
 
 	switch (op) {
 		case 'IS NULL':
@@ -212,10 +236,11 @@ function compileBinary(
 	expr: Extract<Expression, { type: 'binary' }>,
 	columnIndexMap: ReadonlyMap<string, number>,
 	referencedColumns: Set<number>,
+	tableName: string | undefined,
 ): Evaluator {
 	const op = expr.operator.toUpperCase();
-	const left = compileExpression(expr.left, columnIndexMap, referencedColumns);
-	const right = compileExpression(expr.right, columnIndexMap, referencedColumns);
+	const left = compileExpression(expr.left, columnIndexMap, referencedColumns, tableName);
+	const right = compileExpression(expr.right, columnIndexMap, referencedColumns, tableName);
 
 	switch (op) {
 		case 'AND':

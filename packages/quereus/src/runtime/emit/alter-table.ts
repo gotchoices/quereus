@@ -675,13 +675,12 @@ async function validateNotNullBackfill(
  * predicate's object graph, matching `column` / `identifier` nodes by name alone —
  * the parser emits either shape for a bare name depending on context.
  *
- * The table qualifier is deliberately IGNORED, because `compilePredicate` ignores it
- * too: it binds every ref by bare name against the indexed table's column list, so
- * `where zzz.active = 1` compiles into a read of `active` exactly as `where active = 1`
- * does. Matching on the qualifier here would let `drop column active` past this check
- * and leave the module to fail on the rebuild with a raw "unknown column" — the very
- * thing this check exists to prevent. (That `create index` accepts a foreign qualifier
- * at all is a separate defect; see `bug-partial-index-predicate-ignores-table-qualifier`.)
+ * The table qualifier is IGNORED — matching by bare name alone — which is now moot
+ * rather than a deliberate mismatch: `compilePredicate` rejects a foreign `table`
+ * qualifier at create time (a self-qualifier binds to the indexed table), so no LIVE
+ * predicate can carry one. Every ref this walk sees therefore names the indexed table's
+ * own column, and matching on bare name is exactly right. Making the walk
+ * qualifier-aware would only guard a case that can no longer occur.
  *
  * NOTE: depth-blind. `compilePredicate` rejects subqueries, so every ref in a live
  * predicate binds to the indexed table. If partial-index predicates ever admit

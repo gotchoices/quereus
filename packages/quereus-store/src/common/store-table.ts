@@ -1858,7 +1858,7 @@ export class StoreTable extends VirtualTable {
 		if (!uc.predicate) return undefined;
 		let compiled = this.predicateCache.get(uc);
 		if (!compiled) {
-			compiled = compilePredicate(uc.predicate, this.tableSchema!.columns);
+			compiled = compilePredicate(uc.predicate, this.tableSchema!.columns, this.tableSchema!.name);
 			this.predicateCache.set(uc, compiled);
 		}
 		return compiled;
@@ -1873,7 +1873,7 @@ export class StoreTable extends VirtualTable {
 		if (!index.predicate) return undefined;
 		let compiled = this.indexPredicateCache.get(index);
 		if (!compiled) {
-			compiled = compilePredicate(index.predicate, this.tableSchema!.columns);
+			compiled = compilePredicate(index.predicate, this.tableSchema!.columns, this.tableSchema!.name);
 			this.indexPredicateCache.set(index, compiled);
 		}
 		return compiled;

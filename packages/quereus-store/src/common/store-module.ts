@@ -1029,7 +1029,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const indexDirections = indexSchema.columns.map(col => !!col.desc);
 
 		const predicate: CompiledPredicate | undefined = indexSchema.predicate
-			? compilePredicate(indexSchema.predicate, tableSchema.columns)
+			? compilePredicate(indexSchema.predicate, tableSchema.columns, tableSchema.name)
 			: undefined;
 		const seen: Set<string> | undefined = (indexSchema.unique && !skipDuplicateCheck) ? new Set() : undefined;
 
@@ -1176,7 +1176,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				const column = tableSchema.columns[idx];
 				return keyNormalizers(logicalTypeCanHoldText(column.logicalType) ? column.collation : undefined);
 			}),
-			uc.predicate ? compilePredicate(uc.predicate, tableSchema.columns) : undefined,
+			uc.predicate ? compilePredicate(uc.predicate, tableSchema.columns, tableSchema.name) : undefined,
 		);
 	}
 
@@ -1198,7 +1198,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			tableSchema,
 			indexSchema.columns.map(col => col.index),
 			indexDedupeNormalizers(tableSchema, indexSchema, keyNormalizers),
-			indexSchema.predicate ? compilePredicate(indexSchema.predicate, tableSchema.columns) : undefined,
+			indexSchema.predicate ? compilePredicate(indexSchema.predicate, tableSchema.columns, tableSchema.name) : undefined,
 		);
 	}
 
@@ -2207,10 +2207,11 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			//
 			// NOTE: the reverse assumes no expression legitimately named `newName` before
 			// the rename. The rename-target guard above makes that true for a real table,
-			// but `compilePredicate` today accepts a qualifier naming a table that does not
-			// exist (see `bug-partial-index-predicate-ignores-table-qualifier`), so a
-			// predicate written `where <newName>.b > 0` would be mis-reversed. Harmless
-			// until that acceptance is tightened; revisit the reverse then.
+			// and `compilePredicate` now rejects a foreign `table` qualifier at create time,
+			// so a live partial-index predicate can only carry a self-qualifier (`where
+			// <thisTable>.b > 0`) or a bare reference — never `where <newName>.b > 0` for a
+			// different table. The mis-reversal path is therefore unreachable for a live
+			// predicate.
 			const rewriteTable = (from: string, to: string): void => {
 				renameTableInIndexPredicates(currentSchema.indexes, from, to, schemaName);
 				renameTableInCheckConstraints(currentSchema.checkConstraints, from, to, schemaName);

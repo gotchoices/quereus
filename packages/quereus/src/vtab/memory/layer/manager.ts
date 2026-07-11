@@ -1014,7 +1014,7 @@ export class MemoryTableManager {
 				// which columns can transition the row across the predicate's scope.
 				const referenced = covering?.kind === 'memory-index'
 					? covering.index.predicate?.referencedColumns
-					: compilePredicate(uc.predicate, schema.columns).referencedColumns;
+					: compilePredicate(uc.predicate, schema.columns, schema.name).referencedColumns;
 				if (referenced) {
 					for (const colIdx of referenced) {
 						if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
@@ -1080,7 +1080,7 @@ export class MemoryTableManager {
 		}
 		if (covering?.kind === 'materialized-view'
 			&& uc.predicate
-			&& compilePredicate(uc.predicate, schema.columns).evaluate(newRowData) !== true) {
+			&& compilePredicate(uc.predicate, schema.columns, schema.name).evaluate(newRowData) !== true) {
 			return null;
 		}
 
@@ -1344,7 +1344,7 @@ export class MemoryTableManager {
 		// Compile partial-UNIQUE predicate ad-hoc (cold path: an auto-index normally
 		// services this check, so this branch fires only for pathological schemas).
 		const predicate = uc.predicate
-			? compilePredicate(uc.predicate, schema.columns)
+			? compilePredicate(uc.predicate, schema.columns, schema.name)
 			: undefined;
 
 		// One resolve per column, not per scanned row.
@@ -2998,6 +2998,7 @@ export class MemoryTableManager {
 			this.collationResolver,
 			this.primaryKeyFunctions.compare,
 			this.primaryKeyFunctions.encode,
+			schema.name,
 		);
 		if (rows) {
 			await populateIndexFromRowsAsync(

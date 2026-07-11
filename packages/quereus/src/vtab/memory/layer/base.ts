@@ -151,6 +151,7 @@ export class BaseLayer implements Layer {
 			this.collationResolver,
 			this.primaryKeyFunctions.compare,
 			this.primaryKeyFunctions.encode,
+			this.tableSchema.name,
 		);
 	}
 

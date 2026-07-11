@@ -364,6 +364,7 @@ describe('Performance sentinels', function () {
 				testBuiltinCollationResolver,
 				pk.compare,
 				pk.encode,
+				schema.name,
 			);
 
 			const N = 250_000;
