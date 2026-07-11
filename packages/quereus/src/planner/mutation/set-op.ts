@@ -22,7 +22,7 @@ import { unwrapPassthroughSubquery } from '../util/set-op-wrapper.js';
 
 /**
  * Set-operation membership-column write decomposition — the **first set-op view
- * writability** in the engine (docs/view-updateability.md § Set Operations).
+ * writability** in the engine (docs/vu-operators.md § Set Operations).
  *
  * The read half (`set-op-membership-read`) reifies a binary set operation's branch
  * provenance as first-class `existence`-sited boolean columns and, per row, computes

@@ -6,8 +6,8 @@ import type * as AST from '../../parser/ast.js';
 /**
  * The predicate-honest complement of a view body — what a write through the view
  * holds *fixed*, i.e. the part of the base state the view does not expose. Per
- * `docs/view-updateability.md` § The predicate-honest complement, the
- * § Philosophy fan-out makes this *determined* (no Bancilhon–Spyratos choice),
+ * `docs/vu-roundtrip.md` § The predicate-honest complement, the
+ * `docs/view-updateability.md` § Philosophy fan-out makes this *determined* (no Bancilhon–Spyratos choice),
  * so it is a first-class derived object computed off the backward walk:
  *
  * - `hiddenColumns` — base columns present in the base relation(s) but absent

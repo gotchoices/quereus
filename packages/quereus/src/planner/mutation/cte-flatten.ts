@@ -5,7 +5,7 @@ import { combineAnd } from './single-source.js';
 import { raiseMutationDiagnostic, type MutationDiagnosticReason } from './mutation-diagnostic.js';
 
 /**
- * Multi-level CTE-body flattener (`docs/view-updateability.md` § Common Table
+ * Multi-level CTE-body flattener (`docs/vu-operators.md` § Common Table
  * Expressions — multi-level CTE body).
  *
  * A CTE-name (or inline-subquery) DML target whose body is a single-source

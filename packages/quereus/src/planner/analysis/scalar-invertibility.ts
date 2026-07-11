@@ -5,7 +5,7 @@ import type * as AST from '../../parser/ast.js';
 
 /**
  * Invertibility profile of a scalar transformation on an update path, per
- * `docs/view-updateability.md` § Scalar Invertibility.
+ * `docs/vu-inverses.md` § Scalar Invertibility.
  *
  * - `passthrough` — the named argument is returned with a non-data-altering
  *   transformation; lineage threads through `arg` as if the call were absent
@@ -103,7 +103,7 @@ function classifyArithmetic(node: BinaryOpNode): { columnChild: ScalarPlanNode; 
 
 /**
  * Classify a scalar plan node's invertibility on the update path against the
- * law-gated registry (`docs/view-updateability.md` § Scalar Invertibility):
+ * law-gated registry (`docs/vu-inverses.md` § Scalar Invertibility):
  *
  * - a column reference (with or without an alias) → `passthrough` (identity / rename),
  * - `collate(x, _)` → `passthrough` (collation does not alter the stored value),

@@ -914,7 +914,7 @@ export class Parser {
 				}
 
 				// Optional trailing `with inverse (col = expr, …)` — authored
-				// write-back expressions (docs/view-updateability.md § Authored inverses)
+				// write-back expressions (docs/vu-inverses.md § Authored inverses)
 				const inverse = this.parseInverseClause();
 
 				columns.push({ type: 'column', expr, alias, inverse });

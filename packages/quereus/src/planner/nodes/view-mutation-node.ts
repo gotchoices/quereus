@@ -11,7 +11,7 @@ export type ReturningTiming = 'pre' | 'post';
 
 /**
  * The up-front base-PK identity capture side input for a multi-source **update** or
- * multi-side **delete** fan-out (docs/view-updateability.md § Inner Join, § `returning`
+ * multi-side **delete** fan-out (docs/vu-operators.md § Inner Join; docs/view-updateability.md § `returning`
  * Clauses).
  *
  * `source` selects each affected view row's base-PK identities (one capture column per
@@ -53,7 +53,7 @@ export interface IdentityCapture {
  * write has fired yet). The single evaluated value is threaded into every base insert
  * of that row via the equivalence class, so the branches cannot diverge. The engine
  * itself mints nothing — the basis author declares the policy in the column default
- * (`docs/view-updateability.md` § Mutation Context). Absent ⇒ the shared key is
+ * (`docs/vu-mutation-context.md` § Mutation Context). Absent ⇒ the shared key is
  * directly supplied (no appended column).
  *
  * A `keyDefault` may itself read a supplied sibling via `new.<col>` (e.g.

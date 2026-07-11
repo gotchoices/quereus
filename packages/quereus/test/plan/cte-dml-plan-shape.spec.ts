@@ -13,8 +13,8 @@ import { serializePlanForGolden } from './_helpers.js';
  *   - an **inline subquery** (`update (select …) as v …`).
  *
  * For a single-source projection-and-filter body each lowers to the SAME wrapped
- * base-op subtree under a `ViewMutationNode` (docs/view-updateability.md § Common
- * Table Expressions, § Round-Trip Laws). `test/logic/93.4-view-mutation.sqllogic`
+ * base-op subtree under a `ViewMutationNode` (docs/vu-operators.md § Common
+ * Table Expressions, docs/vu-roundtrip.md § Round-Trip Laws). `test/logic/93.4-view-mutation.sqllogic`
  * already pins this as observable base-table STATE parity; this spec pins the
  * stronger **structural** claim: the `ViewMutationNode` subtrees are byte-identical
  * once per-plan id offsets are canonicalized away.

@@ -16,7 +16,7 @@ import { StatusCode, type OutputValue, type SqlValue } from '../../common/types.
  * so a basis author can compose a high-water-mark surrogate allocator entirely in
  * SQL — e.g. `default (coalesce((select max(rid) from anchor_tbl), 0) + mutation_ordinal())`
  * — which reconstructs the old zero-config `integer-auto` surrogate as ordinary
- * declared-default SQL (docs/view-updateability.md § Mutation Context,
+ * declared-default SQL (docs/vu-mutation-context.md § Mutation Context,
  * docs/architecture.md § Sequential ID Generation).
  *
  * **Deterministic** (it depends only on the captured per-row ordinal, not on a

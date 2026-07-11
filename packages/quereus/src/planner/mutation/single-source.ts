@@ -95,7 +95,7 @@ export interface MutableViewLike {
 	/**
 	 * True for an ephemeral **CTE-name** target (resolved by `resolveCteTarget`); an
 	 * inline FROM-subquery target (`resolveSubqueryTarget`) leaves it undefined. Gates the
-	 * user-predicate self-read eager-capture path (docs/view-updateability.md § Common
+	 * user-predicate self-read eager-capture path (docs/vu-operators.md § Common
 	 * Table Expressions — self-reference): a CTE name can appear unqualified in the user
 	 * `where`/`set`/`returning` and self-read the target, resolving against an eager
 	 * snapshot of the body; an inline subquery's alias does not (its predicate names the
@@ -161,7 +161,7 @@ interface FilterConstant {
  * (`test/property.spec.ts`); INSERT and UPDATE both read this richer site map instead.
  *
  * An **`authored`** site (`with inverse (col = expr, …)` on the result column —
- * docs/view-updateability.md § Authored inverses) is writable AND insertable: the
+ * docs/vu-inverses.md § Authored inverses) is writable AND insertable: the
  * write fans out through the authored put expressions (one base assignment / VALUES
  * cell per put), with each `new.<output-col>` reference resolved through
  * {@link AuthoredWritableSite.newRefIndex} — the assigned/supplied view value for
@@ -322,7 +322,7 @@ function makeBaseQualifyScope(baseTable: TableSchema, qualifierName: string = ba
 // introduces (`in (select note from src)` where `src.note` exists) nor touches a
 // base-alias-qualified reference. A reference it cannot prove correlated (an
 // unresolvable subquery source) is rejected loudly rather than mis-bound silently.
-// See `docs/view-updateability.md` § Selection.
+// See `docs/vu-operators.md` § Selection.
 
 /**
  * The {@link ScopeContext} for the view-column → base-term descent. A reference is
@@ -375,7 +375,7 @@ function makeViewScope(
 				// `select t.id from t` over the eager capture — `t.id` is the capture's own
 				// column, not an outer correlation; leave it local (innermost-scope SQL
 				// rules) so it binds to the captured snapshot rather than a de-correlated
-				// `__vm_self`-qualified base term (docs/view-updateability.md § Common Table
+				// `__vm_self`-qualified base term (docs/vu-operators.md § Common Table
 				// Expressions — self-reference). Other ScopeContext implementers never reach
 				// this branch with an aliased self-read (no own-name to shadow).
 				if (aliasShadowed.has(lcQual)) return undefined;
@@ -622,7 +622,7 @@ function analyzeView(ctx: PlanningContext, view: MutableViewLike): ViewAnalysis 
 
 /**
  * Build the eager **CTE self-read capture** for a CTE-name DML target whose user
- * clauses self-read the target name (docs/view-updateability.md § Common Table
+ * clauses self-read the target name (docs/vu-operators.md § Common Table
  * Expressions — self-reference). The capture is the FULL body relation — every view
  * column, **unfiltered** (the self-read `from t` is the whole relation, exactly a
  * materialized CTE) — projected over the body planned under `ctx` (the **target-
@@ -851,7 +851,7 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
 	// An AUTHORED (`with inverse`) column is the exception that supplies exactly that
 	// hook: it IS insertable — its puts are evaluated per VALUES row below — so the
 	// insertability gate is lifted for authored sites only (registry-`inverse` columns
-	// stay non-insertable; docs/view-updateability.md § Authored inverses).
+	// stay non-insertable; docs/vu-inverses.md § Authored inverses).
 	const insertableBaseColumn = (name: string): string | undefined => {
 		const site = analysis.writableSites.get(name.toLowerCase());
 		return site?.kind === 'base' && site.inverse === undefined ? site.baseColumn : undefined;
@@ -925,7 +925,7 @@ export function rewriteViewInsert(ctx: PlanningContext, stmt: AST.InsertStmt, vi
  * Collect the appended omitted-insert defaults shared by both INSERT lowerings:
  * constant-FD selection pins first, then the body's `with defaults (…)` clause
  * entries — each only for a base column the insert left unsupplied
- * (docs/view-updateability.md § Projection step 5, § View defaults).
+ * (docs/vu-operators.md § Projection step 5, docs/vu-inverses.md § View defaults).
  * `suppliedBaseColumns` are the base columns the insert targets directly
  * (verbatim targets AND authored put targets — an authored target takes the
  * inverse-computed value ahead of any default for that column: it is a supplied
@@ -972,7 +972,7 @@ function collectAppendedDefaults(
 
 /**
  * The INSERT lowering when ≥1 target view column carries an authored inverse
- * (docs/view-updateability.md § Authored inverses). Per VALUES row, each authored
+ * (docs/vu-inverses.md § Authored inverses). Per VALUES row, each authored
  * column contributes one cell per put: the authored expression with `new.<x>`
  * bound to the supplied (post-view-defaulting) row values — the row's cell when
  * `x` is a target column, the appended default expression when `x`'s base column
@@ -1188,7 +1188,7 @@ export function rewriteViewUpdate(ctx: PlanningContext, stmt: AST.UpdateStmt, vi
 		// view column's name otherwise — still in VIEW terms — then the standard
 		// view→base lowering maps everything to base terms (the forward read image
 		// for the non-assigned columns). The result is a plain base-table `set` per
-		// target riding the existing spine (docs/view-updateability.md § Authored
+		// target riding the existing spine (docs/vu-inverses.md § Authored
 		// inverses).
 		if (site?.kind === 'authored') {
 			return site.puts.map(put => {

@@ -1952,7 +1952,7 @@ export class SchemaManager {
 		// reference — only top-level (depth-0) columns are. This is what lets a DEFAULT
 		// author a self-referencing allocator like
 		// `coalesce((select max(rid) from t), 0) + mutation_ordinal()` (the
-		// shared-key-via-default surrogate recipe — docs/view-updateability.md
+		// shared-key-via-default surrogate recipe — docs/vu-mutation-context.md
 		// § Mutation Context). Parameters stay rejected at any depth.
 		let subqueryDepth = 0;
 		const isQueryBoundary = (node: AST.AstNode): boolean =>

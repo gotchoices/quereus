@@ -24,7 +24,7 @@ export interface Projection {
 	 * Build-time-validated `with inverse (col = expr, …)` metadata (authored
 	 * write-back puts). `deriveProjectUpdateLineage` upgrades a projection carrying
 	 * this to a writable `authored` UpdateSite — overriding any registry-inferred
-	 * site (authored wins; docs/view-updateability.md § Authored inverses). Inert
+	 * site (authored wins; docs/vu-inverses.md § Authored inverses). Inert
 	 * on the read path.
 	 */
 	authoredInverse?: AuthoredInverseMeta;

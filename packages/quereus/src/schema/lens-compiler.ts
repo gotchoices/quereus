@@ -1230,7 +1230,7 @@ function compileOverrideBody(
 	// Coverage map: lowercased output-column name -> the expression producing it,
 	// plus the override column's `with inverse` clause when authored — carried per
 	// covered column into the composed body so the write path consumes it there
-	// (docs/view-updateability.md § Authored inverses; a gap-filled column never
+	// (docs/vu-inverses.md § Authored inverses; a gap-filled column never
 	// has one).
 	const coverage = new Map<string, { expr: AST.Expression; inverse?: ReadonlyArray<AST.ResultColumnInverse> }>();
 	let hasStar = false;

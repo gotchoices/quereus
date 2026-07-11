@@ -223,7 +223,7 @@ export function propagate(
 	 * A CTE-name DML target's `ctxSelfRead` (the body context with the target name
 	 * re-added to `cteNodes`, resolving to the eager self-read capture), threaded into
 	 * the single-source UPDATE/DELETE rewrite so a user-clause self-read `from t`
-	 * resolves to the frozen capture (docs/view-updateability.md § Common Table
+	 * resolves to the frozen capture (docs/vu-operators.md § Common Table
 	 * Expressions — self-reference). Ignored for insert and for the join / decomposition
 	 * / set-op paths (none of which take the single-source self-read capture path). The
 	 * BODY is still analysed under `ctx` (target-excluded), so its own `from base`

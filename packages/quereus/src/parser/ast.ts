@@ -192,7 +192,7 @@ export interface SelectStmt extends AstNode {
 	 * consumes it (a bare top-level select, a VALUES view body); the view INSERT
 	 * write-through rewrite and `view_info`'s insertability derivation pull it
 	 * from the stored body AST. See {@link ViewInsertDefault} and
-	 * docs/view-updateability.md § View defaults.
+	 * docs/vu-inverses.md § View defaults.
 	 */
 	defaults?: ReadonlyArray<ViewInsertDefault>;
 }
@@ -519,7 +519,7 @@ export interface ReleaseStmt extends AstNode {
  * authored write-back expression computing a FROM-source base column from the
  * written view row (referenced via `new.<output-col>`). Inert metadata until the
  * view write path consumes it; shape mirrors {@link ViewInsertDefault}.
- * See docs/view-updateability.md § Authored inverses.
+ * See docs/vu-inverses.md § Authored inverses.
  */
 export interface ResultColumnInverse {
 	column: string;

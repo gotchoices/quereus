@@ -3,7 +3,7 @@ import type { PlanningContext } from '../planning-context.js';
 
 /**
  * The one scope-aware column-substitution primitive the view-mutation backward
- * path shares (`docs/view-updateability.md` § Selection).
+ * path shares (`docs/vu-operators.md` § Selection).
  *
  * Three callers used to each carry a near-parallel copy of "rewrite column
  * references X→Y in an expression / query, scope-aware (shadowing, taint, deep
@@ -142,7 +142,7 @@ export function cloneExpr(expr: AST.Expression): AST.Expression {
 
 /**
  * Substitute every `new.<name>`-qualified column reference in an authored
- * inverse expression (docs/view-updateability.md § Authored inverses) — at any
+ * inverse expression (docs/vu-inverses.md § Authored inverses) — at any
  * depth, including inside subquery operands (a `new.` ref correlates to the
  * written view row wherever it appears; `new` is a reserved qualifier no FROM
  * source legitimately shadows). The replacement is cloned by `transformExpr`,
@@ -422,7 +422,7 @@ function tableSourceColumnNames(ctx: PlanningContext, src: AST.TableSource): Set
 	// SHADOWS (a clean local source) rather than tainting the scope. This is what lets a
 	// CTE-name DML target's user-predicate self-read (`from t`) over its eager capture
 	// resolve `t`'s bare columns as local instead of rejecting them as
-	// unprovable-correlation (docs/view-updateability.md § Common Table Expressions). A
+	// unprovable-correlation (docs/vu-operators.md § Common Table Expressions). A
 	// schema object of the same name was already resolved above, so this only fires for a
 	// genuine context-backed name. `buildFrom` resolves such a name the same way (its own
 	// `cteNodes` lookup), so the static shadow set matches the plan-time binding.

@@ -10,7 +10,7 @@ import type { MutableViewLike } from './single-source.js';
 
 /**
  * The **one** plan-node backward-walk consumer the multi-source join walk and the
- * decomposition fan-out share (docs/view-updateability.md § Round-Trip Laws and the
+ * decomposition fan-out share (docs/vu-roundtrip.md § Round-Trip Laws and the
  * Derived Backward Walk). It plans a view body **once** and reads the
  * `PhysicalProperties.updateLineage` the forward pass already threaded, routing
  * each output column back to its owning base relation — instead of each caller
@@ -66,7 +66,7 @@ export interface BackwardColumn {
 	 * `baseColumn` stay undefined so no verbatim-value consumer silently admits it).
 	 * Each put names its owning base relation by `TableReferenceNode` id; `newRefIndex`
 	 * maps `new.<name>` references to output column indexes
-	 * (docs/view-updateability.md § Authored inverses).
+	 * (docs/vu-inverses.md § Authored inverses).
 	 */
 	readonly authored?: {
 		readonly puts: ReadonlyArray<{ readonly table: number; readonly baseColumn: string; readonly expr: AST.Expression }>;

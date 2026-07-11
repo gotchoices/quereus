@@ -98,7 +98,7 @@ export function deriveViewColumns(
 // These helpers are invoked from each operator's `computePhysical` and READ the
 // forward annotation that pass already produced (the node's own `fds` /
 // `constantBindings`, the children's `updateLineage`). They never re-derive a
-// parallel FD/EC walk — see `docs/view-updateability.md` § Round-Trip Laws and
+// parallel FD/EC walk — see `docs/vu-roundtrip.md` § Round-Trip Laws and
 // the Derived Backward Walk. The result is the `PhysicalProperties.updateLineage`
 // / `attributeDefaults` surface the view-mutation orchestrator consumes.
 // ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ export function deriveProjectUpdateLineage(
 		// entirely (the clause is total per column — never composed with inferred
 		// steps). An unroutable target (computed / inverse / null-extended child site)
 		// degrades the column to `computed` — the author took over, so the inferred
-		// put never applies (docs/view-updateability.md § Authored inverses).
+		// put never applies (docs/vu-inverses.md § Authored inverses).
 		if (proj.authoredInverse) {
 			const authored = childLineage ? deriveAuthoredSite(proj.authoredInverse, childLineage) : undefined;
 			lineage.set(outId, authored ?? { kind: 'computed', expr: proj.node.expression });
@@ -384,7 +384,7 @@ export function identityBaseColumn(site: UpdateSite | undefined): string | undef
  * above it: the former multi-source-local identity-or-inverse reader (which
  * discarded the table on null-extension) and the single-source identity-only
  * {@link identityBaseColumn}. One reader, consumed by single-source, the
- * multi-source join walk, and the decomposition fan-out (docs/view-updateability.md
+ * multi-source join walk, and the decomposition fan-out (docs/vu-roundtrip.md
  * § Round-Trip Laws and the Derived Backward Walk).
  *
  * - `base` → `{ table, baseColumn, writable: true, nullExtended: false, inverse?, domain? }`.

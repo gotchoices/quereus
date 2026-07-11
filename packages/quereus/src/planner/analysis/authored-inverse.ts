@@ -6,7 +6,7 @@ import type { Attribute, AuthoredInverseAssignment, AuthoredInverseMeta, Relatio
 
 /**
  * Build-time validation of the `with inverse (col = expr, …)` result-column
- * clause (docs/view-updateability.md § Authored inverses). Position-independent:
+ * clause (docs/vu-inverses.md § Authored inverses). Position-independent:
  * it runs wherever a select carrying the clause is planned — top-level query,
  * view body, CTE, subquery-in-FROM — so a typo fails loud even when the relation
  * is never a write target. Four rules:

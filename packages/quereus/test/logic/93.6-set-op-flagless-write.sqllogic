@@ -3,7 +3,7 @@
 -- a flag-less `union all` of literal-discriminator legs (`'red' as kind`) is writable via a
 -- plan-time σ + literal-discriminator branch oracle (`checkSatisfiability`). The literal
 -- discriminators are READ-ONLY; the plain base columns round-trip through the branch spine.
--- See docs/view-updateability.md § Set Operations and docs/sql.md.
+-- See docs/vu-operators.md § Set Operations and docs/sql.md.
 
 -- ===================================================================
 -- Schema: a 4-leg flag-less union all. `kind` (red/large) and `src` (A/B) are literal
@@ -587,7 +587,7 @@ select id, x from ne1 order by id;
 -- supplied value that provably violates it makes the leg `unsat` ⇒ skipped (no phantom base
 -- row). A literal discriminator (`bucket`) keeps the body writable; INSERTs OMIT it so the
 -- range σ — not the discriminator — drives the routing decision. See
--- docs/view-updateability.md § Set Operations.
+-- docs/vu-operators.md § Set Operations.
 -- ===================================================================
 create table rlo (id integer primary key, x integer);
 create table rhi (id integer primary key, x integer);
@@ -711,7 +711,7 @@ select id, x from oth order by id;
 -- is served by the shipped flag-less write path, with no bespoke writable-membership build needed.
 -- (Fresh `pca`/`pcb` fixtures: the same two-axis grid as `U`/`U4`, self-contained so the matrix
 -- assertions do not depend on the mutated state of the views above.) See
--- docs/view-updateability.md § Set Operations.
+-- docs/vu-operators.md § Set Operations.
 -- ===================================================================
 create table pca (id integer primary key, x integer, color text null, size text null);
 create table pcb (id integer primary key, x integer, color text null, size text null);

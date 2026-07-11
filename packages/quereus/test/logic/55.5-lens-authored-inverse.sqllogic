@@ -1,5 +1,5 @@
 -- Authored inverses at the lens boundary (docs/lens.md § Computed and
--- Generated Columns; docs/view-updateability.md § Authored inverses;
+-- Generated Columns; docs/vu-inverses.md § Authored inverses;
 -- ticket `authored-inverse-lens-prover`).
 --
 -- Covers the prover's law treatment for `with inverse` columns through the full

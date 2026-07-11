@@ -571,7 +571,7 @@ interface RoundTripAnalysis {
  * behaviour, the mutation-time and key-reconstructibility nets still govern. The
  * body is planned **logically** ({@link planLogicalBody}, not `ctx.root`) so the
  * Project/Filter/TableReference operator tree threading `updateLineage` survives.
- * See `docs/lens.md` § Round-trip and `docs/view-updateability.md`
+ * See `docs/lens.md` § Round-trip and `docs/vu-roundtrip.md`
  * § The predicate-honest complement.
  */
 function analyzeRoundTrip(ctx: ProveContext): RoundTripAnalysis {
@@ -1002,7 +1002,7 @@ function domainEntailedBy(domain: AST.Expression, residual: AST.Expression | und
 // ---------------------------------------------------------------------------
 // Authored inverses (`with inverse`) — PutGet by enumeration, GetPut advisory.
 // See docs/lens.md § Computed and Generated Columns (authored inverses) and
-// docs/view-updateability.md § Authored inverses (law treatment).
+// docs/vu-inverses.md § Authored inverses (law treatment).
 // ---------------------------------------------------------------------------
 
 /** The authored put payload off a resolved {@link ResolvedBaseSite}. */

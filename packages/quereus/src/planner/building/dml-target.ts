@@ -178,7 +178,7 @@ function ctesBefore(withClause: AST.WithClause, cte: AST.CommonTableExpr): AST.C
  *  - A user-clause self-read of the target name (`… where id in (select id from t)`)
  *    does NOT resolve the CTE here — the self-capture path (`ctxSelfRead`) re-adds the
  *    target name for that, leaving this context Halloween-safe.
- * See docs/view-updateability.md § CTEs and Subqueries.
+ * See docs/vu-operators.md § Common Table Expressions.
  */
 export function contextForCteTarget(
 	ctx: PlanningContext,
@@ -204,7 +204,7 @@ export function contextForCteTarget(
  * `targetName` — a FROM source named `targetName` (unqualified) appears in any subquery
  * reachable from the `where`, an assignment value, or a RETURNING expression. This is
  * the gate the view-mutation builder uses to build the eager self-read capture + split
- * planning context (docs/view-updateability.md § Common Table Expressions —
+ * planning context (docs/vu-operators.md § Common Table Expressions —
  * self-reference): the body is planned target-EXCLUDED (so a same-named base FROM reaches
  * the real table), while the user clause's self-read resolves `t` against a materialized
  * snapshot of the body — a Halloween-safe positive write. Absent a self-read this returns

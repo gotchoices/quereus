@@ -25,8 +25,8 @@ import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
 
 /**
  * Multi-source view-mediated DML decomposition — the **key-preserving join**
- * acceptance case of the view-mutation substrate (docs/view-updateability.md
- * § Per-Operator Semantics — Inner Join, § Outer Joins, § Multi-Base-Table Mutations).
+ * acceptance case of the view-mutation substrate (docs/vu-operators.md
+ * § Inner Join, § Outer Joins; docs/view-updateability.md § Multi-Base-Table Mutations).
  *
  * Scope: a view body that is an **n-way (≥2) equi-join** of base tables — `inner`,
  * `left`, or `full` — including composite-PK sides and **self-joins** (one base table
@@ -107,8 +107,8 @@ import { requireValidatedNewRefIndex } from '../analysis/authored-inverse.js';
  * k.k<side>_<j> = <side>.<pk<j>> …)`) instead of a live re-query of the join body, so
  * the first op cannot empty the join — or rewrite a predicate column — out from under
  * a later op's identifying subquery (a mutation-order-independent identity). The same
- * capture backs the UPDATE RETURNING re-query (docs/view-updateability.md § Inner Join,
- * § `returning`).
+ * capture backs the UPDATE RETURNING re-query (docs/vu-operators.md § Inner Join,
+ * docs/view-updateability.md § `returning`).
  *
  * The capture relation carries one column **per side per PK column**, named
  * `k<sideIndex>_<pkColumnOrdinal>` ({@link keyColumnName}) — so a composite-PK side
@@ -211,7 +211,7 @@ interface OutColumn {
 	 * ({@link sideIndex} / {@link baseColumn} stay undefined: there is no single
 	 * verbatim base column). `newRefIndex` maps a put's `new.<name>` references to
 	 * output column indexes of this analysis's `outColumns`
-	 * (docs/view-updateability.md § Authored inverses).
+	 * (docs/vu-inverses.md § Authored inverses).
 	 */
 	readonly authored?: {
 		readonly puts: ReadonlyArray<{ readonly sideIndex: number; readonly baseColumn: string; readonly expr: AST.Expression }>;
@@ -429,7 +429,7 @@ export interface MsInsertSide {
  * the anchor key column's declared `default` (`keyDefault`). Each side reads its
  * values back out of that one materialized envelope, so the default is evaluated
  * exactly once per row and the value threads across both base inserts via the
- * equivalence class (docs/view-updateability.md § Mutation Context).
+ * equivalence class (docs/vu-mutation-context.md § Mutation Context).
  */
 export interface MsInsertAnalysis {
 	readonly suppliedColumns: readonly { readonly name: string; readonly type: ScalarType }[];
@@ -523,7 +523,7 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 		// Evaluating an authored (`with inverse`) column's puts through the multi-source
 		// shared-surrogate envelope is deferred (the envelope projects supplied columns
 		// verbatim per side; per-row put evaluation over it is a follow-up — recorded in
-		// docs/view-updateability.md § Authored inverses). Name the deferral precisely
+		// docs/vu-inverses.md § Authored inverses). Name the deferral precisely
 		// rather than letting it fall into the generic non-insertable reject below.
 		if (out?.authored) {
 			raiseMutationDiagnostic({
@@ -617,7 +617,7 @@ export function analyzeMultiSourceInsert(ctx: PlanningContext, view: MutableView
 	// join-key base column) or sourced from the anchor key column's declared `default`,
 	// evaluated once per row at the envelope and EC-threaded into the active sides. The
 	// engine mints nothing of its own — the basis author declares the policy
-	// (docs/view-updateability.md § Mutation Context).
+	// (docs/vu-mutation-context.md § Mutation Context).
 	const suppliedKeys = supplied.filter(s => s.isKey);
 	if (suppliedKeys.length > 1) {
 		raiseMutationDiagnostic({
@@ -1480,7 +1480,7 @@ function guardTopLevelScope(expr: AST.Expression, analysis: JoinViewAnalysis, vi
  * rewritten value (`select <alias> from __vmupd_keys k where <ownerPk = capture>`) reads
  * it correlated by the owning side's PK. Because the capture materializes **before** any
  * base op fires, the read-back value is the **pre-mutation** partner value — robust to a
- * both-sides update that also rewrites it (docs/view-updateability.md § Inner Join).
+ * both-sides update that also rewrites it (docs/vu-operators.md § Inner Join).
  */
 export interface CrossSourceValue {
 	readonly alias: string;
@@ -1733,7 +1733,7 @@ export function decomposeUpdate(ctx: PlanningContext, view: MutableViewLike, ana
 		// column's name otherwise — still in VIEW terms — then the standard lowering
 		// maps everything onto the put's side (the forward read image for non-assigned
 		// columns; a cross-side read rides the same captured-read machinery as a
-		// cross-source SET value). docs/view-updateability.md § Authored inverses.
+		// cross-source SET value). docs/vu-inverses.md § Authored inverses.
 		if (out.authored) {
 			const authored = out.authored;
 			// The assigned VALUE's top-level references must name view columns (parity
@@ -2083,7 +2083,7 @@ function buildCapturedKeyPredicate(view: MutableViewLike, side: JoinSide, sideIn
 
 /**
  * The up-front base-PK identity capture for a multi-source (n-way inner-join) UPDATE or
- * multi-side DELETE fan-out (docs/view-updateability.md § Inner Join, § `returning`).
+ * multi-side DELETE fan-out (docs/vu-operators.md § Inner Join; docs/view-updateability.md § `returning`).
  * Built ONCE and shared between the per-side base ops' identifying subqueries and (for
  * an UPDATE with RETURNING) the RETURNING re-query.
  *
@@ -2665,8 +2665,8 @@ function substituteViewColumns(
 /**
  * The {@link ScopeContext} that side-alias-qualifies a substituted base-term
  * lineage expression at injection time — the multi-source analog of the
- * single-source `makeBaseQualifyScope` (docs/view-updateability.md § Inner Join,
- * cross-source `set`). A bare, non-shadowed leaf is resolved by **unique column
+ * single-source `makeBaseQualifyScope` (docs/vu-operators.md § Inner Join,
+ * docs/view-updateability.md cross-source `set`). A bare, non-shadowed leaf is resolved by **unique column
  * ownership** across the join sides ({@link resolveColumnSide}, the exact rule
  * join-condition operands use) and qualified with the owning side's **alias** —
  * never the table name, so a self-join's distinct aliases stay distinct. A name

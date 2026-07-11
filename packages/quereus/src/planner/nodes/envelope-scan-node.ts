@@ -16,7 +16,7 @@ import { Cached } from '../../util/cached.js';
  * op of one view insert shares the same `rctx`, they all read the SAME envelope
  * rows: the shared surrogate is generated exactly once per produced logical row
  * and threaded identically across the fan-out, so the branches cannot diverge
- * (docs/view-updateability.md § Mutation Context).
+ * (docs/vu-mutation-context.md § Mutation Context).
  *
  * It is a leaf — its rows come from the context, not a child subtree — so
  * `withChildren` (inherited) returns `this`, preserving the {@link descriptor}

@@ -67,7 +67,7 @@ select * from RV order by user_id;
 -- reads back bp = 9. An `opaque` computed column (`substr(s,1,1)` — string functions
 -- carry no inverse profile) stays read-only, and the inverse column is NOT insertable
 -- (an UPDATE-only claim). This matches the static column_info/view_info
--- is_updatable='YES'. See docs/view-updateability.md § Scalar Invertibility.
+-- is_updatable='YES'. See docs/vu-inverses.md § Scalar Invertibility.
 -- ===================================
 
 create table iv_t (id integer primary key, b integer null, s text);
@@ -171,7 +171,7 @@ update cfl_jv set note = 'x', note2 = 'y' where cid = 10;
 -- ALSO admits a passthrough column (stored verbatim) — aligning the single-source spine up to
 -- the multi-source contract. An `opaque` computed column (`b || '!'` — concat carries no
 -- inverse profile) stays read-only AND non-insertable. This matches the static
--- column_info/view_info is_updatable='YES'. See docs/view-updateability.md § Scalar Invertibility.
+-- column_info/view_info is_updatable='YES'. See docs/vu-inverses.md § Scalar Invertibility.
 -- ===================================
 
 create table pt_t (id integer primary key, b text null, n integer null);
@@ -365,7 +365,7 @@ select * from evt order by id;
 -- The body is a two-table inner equi-join; writes route per owning base side via
 -- a subquery over the join body (the row-identifying predicate). The owning side
 -- can be the table whose PK the projection hides (ms_parent below).
--- See docs/view-updateability.md § Inner Join, § Multi-Base-Table Mutations.
+-- See docs/vu-operators.md § Inner Join, docs/view-updateability.md § Multi-Base-Table Mutations.
 -- ===================================
 
 create table ms_parent (pid integer primary key, label text);
@@ -730,7 +730,7 @@ select pid, pv from ax_parent order by pid;
 -- (qualifier-driven); a bare leaf reaching it is only ever a user-authored
 -- local/unknown name. The qualified analogues above (ax_jv_x, ax_xscpk_v, xs1n_v,
 -- xs1u_v, mj_v) all still hold.
--- See docs/view-updateability.md § Inner Join, cross-source `set`.
+-- See docs/vu-operators.md § Inner Join, docs/view-updateability.md cross-source `set`.
 -- ========================================================================
 
 -- (uq-1) headline: partner column `pv` projected UNQUALIFIED, read cross-source into the
@@ -1019,7 +1019,7 @@ update uq16_v set cval = pc where cid = 1;
 -- the qualifier strip. The converse of uq-9 (a BARE user name colliding with a partner base
 -- column — handled by the injection-pass column-name shadowing): here the collision is on an
 -- alias QUALIFIER, handled by the strip's alias-shadow descent (transformAliasScopedExpr).
--- See docs/view-updateability.md § Inner Join, cross-source `set`.
+-- See docs/vu-operators.md § Inner Join, docs/view-updateability.md cross-source `set`.
 -- ========================================================================
 
 -- (uq-17) PARTNER-alias collision (headline): the view exposes `pv` off side `p`; an
@@ -1273,7 +1273,7 @@ select yid from ax_y order by yid;
 -- up-front captured key set, so the first side's delete cannot empty the join out
 -- from under the second side's identifying subquery. The inner join hides unmatched
 -- base rows on either side, which the fan-out must leave untouched.
--- See docs/view-updateability.md § Inner Join — Deletes.
+-- See docs/vu-operators.md § Inner Join — Deletes.
 -- ===================================
 
 -- --- (fo-a) unmatched base rows on either side survive the fan-out ---
@@ -1408,7 +1408,7 @@ select yid from ps_y order by yid;
 -- order can satisfy under immediate enforcement + the transitive RESTRICT pre-walk
 -- (runtime/foreign-key-actions.ts). Seeded like (fo-b): nullable FK columns +
 -- back-fill updates so the mutual FK can be established under enforcement.
--- See docs/view-updateability.md § Inner Join — Deletes.
+-- See docs/vu-operators.md § Inner Join — Deletes.
 -- ===================================
 
 -- --- (fo-g) restrict+cascade mutual FK -> structured diagnostic (the headline) ---
@@ -1534,7 +1534,7 @@ select aid, bid from j_jv order by aid;
 -- the reject no longer fires; the planner falls back to the fixed [0,1] fan-out and
 -- defers to the runtime RESTRICT pre-check, which (FK columns NULL ⇒ MATCH SIMPLE: no
 -- referencing row) finds nothing and lets the delete succeed. This is the over-rejection
--- repro from the ticket. See docs/view-updateability.md § Inner Join — Deletes.
+-- repro from the ticket. See docs/vu-operators.md § Inner Join — Deletes.
 create table k_a (aid integer primary key, lbl text, bref integer null,
     foreign key (bref) references k_b(bid) on delete restrict);
 create table k_b (bid integer primary key, lbl text, aref integer null,
@@ -1559,7 +1559,7 @@ select bid from k_b order by bid;
 -- here), the deferred [0,1] fan-out's per-base-op parent-side FK check raises the raw
 -- FK-constraint error instead. A non-correlated join trades the actionable plan-time
 -- diagnostic for the raw FK error when the data happens to reference.
--- See docs/view-updateability.md § Inner Join — Deletes.
+-- See docs/vu-operators.md § Inner Join — Deletes.
 create table l_a (aid integer primary key, lbl text, bref integer null,
     foreign key (bref) references l_b(bid) on delete restrict);
 create table l_b (bid integer primary key, lbl text, aref integer null,
@@ -1589,7 +1589,7 @@ select bid, aref from l_b order by bid;
 -- correlates edge B (m_b.aref -> m_a.aid). So `joinCorrelatesMutualFk` still proves a
 -- mutual FK edge correlated and the plan-time `mutual-fk-restrict-delete` reject fires
 -- — the actionable diagnostic, not the deferred raw FK error. This pins the WHERE-fold
--- branch of the gate. See docs/view-updateability.md § Inner Join — Deletes.
+-- branch of the gate. See docs/vu-operators.md § Inner Join — Deletes.
 create table m_a (aid integer primary key, lbl text, bref integer null,
     foreign key (bref) references m_b(bid) on delete restrict);
 create table m_b (bid integer primary key, lbl text, aref integer null,
@@ -1619,7 +1619,7 @@ select bid, aref from m_b order by bid;
 -- *routing* is no longer a tag either — predicates rule, and a per-row writable
 -- presence/existence column states a non-default side explicitly. Every retired
 -- `quereus.update.*` key is now an `unknown-reserved-tag` error. See
--- docs/view-updateability.md § View with defaults.
+-- docs/vu-inverses.md § View defaults.
 -- ===================================
 
 -- --- the retired statement-level default_for tag is unknown at the dml-stmt site ---
@@ -1786,7 +1786,7 @@ select * from sst order by id;
 -- of a user predicate (or assigned value) are descended into and rewritten to
 -- their base-term lineage — scope-aware, so a subquery-local same-named column is
 -- left alone and an unresolvable source is rejected, not silently mis-bound.
--- See docs/view-updateability.md § Selection.
+-- See docs/vu-operators.md § Selection.
 -- ===================================
 
 -- --- (a) the repro: a correlated view-column ref inside EXISTS, over a base table
@@ -2139,7 +2139,7 @@ select id, lbl from ir_t order by id;
 -- 1-based ordinal) and threaded into both base inserts via the equivalence class
 -- (so the branches agree on identity). The engine itself mints nothing — the
 -- basis author declares the policy. Sides are written FK-parent-before-FK-child.
--- See docs/view-updateability.md § Inner Join (Inserts), § Mutation Context.
+-- See docs/vu-operators.md § Inner Join (Inserts), docs/vu-mutation-context.md § Mutation Context.
 -- ===================================
 
 -- --- (a) the worked example: two base tables sharing a surrogate `rid` the view
@@ -2554,7 +2554,7 @@ update rjoin3 set quantity = 9 where id = 999 returning id, quantity;
 -- Top-level view-column scope (the encapsulation guard). A `where` / `set` /
 -- `returning` reference must name a column the VIEW exposes; a base-only column the
 -- view projects away must NOT silently resolve against the underlying base table.
--- See docs/view-updateability.md § Selection (Top-level view-column scope).
+-- See docs/vu-operators.md § Selection (Top-level view-column scope).
 -- ===================================
 
 create table t3 (id integer primary key, shown text not null, secret text);
@@ -2772,7 +2772,7 @@ update ojrv set cv = 99 where cc in (1, 3) returning cc, cv, pv;
 -- non-preserved partner (`min` read-back / `group by` join key), so a shared-partner write
 -- applies ONCE: a matched fan-out no longer errors `Scalar subquery returned more than one
 -- row`, and a materialization fan-out no longer double-inserts the partner PK
--- (view-write-outer-join-nonpreserved-fanout-update). See docs/view-updateability.md § Outer Joins.
+-- (view-write-outer-join-nonpreserved-fanout-update). See docs/vu-operators.md § Outer Joins.
 -- ===================================
 pragma foreign_keys = false;
 create table fof_parent (pp integer primary key, pv integer null);
@@ -3199,7 +3199,7 @@ select lx, rid, rx from rsjv order by rid;
 -- projection-and-filter CTE body produces a byte-identical base-op plan to the equivalent
 -- named view, so the observable base-table state matches. No grammar change — a CTE name
 -- already parses as a bare identifier; this is pure resolution + routing.
--- See docs/view-updateability.md § Common Table Expressions and the CTE-name DML target.
+-- See docs/vu-operators.md § Common Table Expressions and the CTE-name DML target.
 -- ===================================
 
 create table cte_base (id integer primary key, color text);
@@ -3330,7 +3330,7 @@ update vdist set color='z';
 -- collapsing the chain into one CTE body. The flattener does pure syntactic substitution +
 -- filter conjunction; all lineage/inverse reasoning stays in the planner that re-plans the
 -- flat body. A non-updateable INTERMEDIATE rejects with that intermediate's body-shape reason.
--- See docs/view-updateability.md § Common Table Expressions — multi-level CTE body.
+-- See docs/vu-operators.md § Common Table Expressions — multi-level CTE body.
 -- ===================================
 
 -- 2-level positive UPDATE write-through — `t` reads `a` reads base `ml`; the write lands on ml.
@@ -3585,7 +3585,7 @@ with s as (select id from so union select id from so) delete from s where id=1;
 -- target-EXCLUDED (so a same-named base FROM reaches the real table — the load-bearing
 -- shadow case), while the user `where`/`set`/`returning` self-read resolves `t` to the
 -- frozen snapshot. Mirrors the inline-subquery Halloween behavior (isq_hw / isq_hwk).
--- See docs/view-updateability.md § Common Table Expressions — self-reference.
+-- See docs/vu-operators.md § Common Table Expressions — self-reference.
 -- ===================================
 
 -- Bare self-read — `from t` resolves to the captured snapshot; every captured row
@@ -3819,7 +3819,7 @@ select * from ectx order by id;
 -- projection-and-filter body produces a byte-identical base-op plan to the equivalent
 -- named view. The user `where`/`set` reference the body's columns via the mandatory
 -- alias (`v.col`) or the bare form. inline-subquery INSERT is deliberately rejected.
--- See docs/view-updateability.md § Inline subquery DML target.
+-- See docs/vu-operators.md § Inline subquery DML target.
 -- ===================================
 
 create table isq_base (id integer primary key, color text);
@@ -4013,7 +4013,7 @@ with a as (select g, sum(v) as s from isq_agg2 group by g)
 -- inline-subquery INSERT is rejected — so the CTE name is the only derived target that fires
 -- defaults). A body-shape reject (aggregate / set-op / SELECT-source-needing-append) fires
 -- regardless of the clause — `with defaults` never rescues a non-updateable body.
--- See docs/view-updateability.md § View defaults.
+-- See docs/vu-inverses.md § View defaults.
 -- ===================================
 
 -- (1) CTE-name INSERT: an omitted column is filled by the body's `with defaults` through the

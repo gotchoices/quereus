@@ -75,7 +75,7 @@ export function buildDeleteStmt(
   // target). Resolved BEFORE the CTE / schema dispatch — the synthetic `table.name` (=
   // the user alias) must not be re-resolved as a same-named CTE / schema object. The
   // statement's CTEs stay in scope (no own-name to shadow out). See
-  // docs/view-updateability.md § CTEs and Subqueries.
+  // docs/vu-operators.md § Common Table Expressions.
   const subqueryTarget = resolveSubqueryTarget(contextWithCTEs, stmt);
   if (subqueryTarget) {
     return buildViewMutation(contextWithCTEs, subqueryTarget, { op: 'delete', stmt });
@@ -85,7 +85,7 @@ export function buildDeleteStmt(
   // the ephemeral view-like substrate, SHADOWING any same-named schema table/view/MV
   // (matching read-side FROM shadowing). Resolved ahead of the schema dispatch; a
   // recursive target is rejected here with the structured `recursive-cte` reason.
-  // See docs/view-updateability.md § CTEs and Subqueries.
+  // See docs/vu-operators.md § Common Table Expressions.
   const cteTarget = resolveCteTarget(contextWithCTEs, stmt.table, stmt.withClause);
   if (cteTarget) {
     return buildViewMutation(contextForCteTarget(contextWithCTEs, stmt.withClause!, cteTarget.name), cteTarget, { op: 'delete', stmt });

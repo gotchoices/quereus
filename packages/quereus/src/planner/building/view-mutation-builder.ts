@@ -126,7 +126,7 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// Multi-source inner-join UPDATE / DELETE: plan the join body ONCE here and thread
 	// the single analysis through decomposition, the identity capture, and the
 	// RETURNING re-query — so no consumer re-plans the body via AST (the retired
-	// double-plan; docs/view-updateability.md § Round-Trip Laws and the Derived
+	// double-plan; docs/vu-roundtrip.md § Round-Trip Laws and the Derived
 	// Backward Walk). A decomposition-backed logical table (a `primary-storage`
 	// advertisement) is NOT this case — it routes to `propagate`'s advertisement
 	// fan-out (`decomposition.ts`); a single-source body routes to the spine.
@@ -153,7 +153,7 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 	// Arbitrary optional-columnar values a decomposition UPDATE lowers to a captured read-back
 	// accumulate here, then thread into the decomposition key capture (the dual of `sourceValues`).
 	const capturedValues: CapturedDecompValue[] = [];
-	// CTE-name DML target self-read (docs/view-updateability.md § Common Table Expressions
+	// CTE-name DML target self-read (docs/vu-operators.md § Common Table Expressions
 	// — self-reference). When the user `where` / `set` / `returning` self-reads the target
 	// CTE name (`with t as (…) update t … where id in (select id from t)`), build a SPLIT
 	// planning context: the body is planned target-EXCLUDED under `ctx` (so a same-named
@@ -218,7 +218,7 @@ export function buildViewMutation(ctx: PlanningContext, view: MutableViewLike, r
 			...lensSetLevelConstraints(ctx, view),
 			...lensParentSideForeignKeyConstraints(ctx, view, RowOpFlag.UPDATE),
 		];
-	// Multi-source identity capture (docs/view-updateability.md § Inner Join): an
+	// Multi-source identity capture (docs/vu-operators.md § Inner Join): an
 	// UPDATE that assigns BOTH base sides (⇒ more than one base op) — or carries
 	// RETURNING — and a lenient DELETE fanned out to BOTH candidate sides (⇒ more than
 	// one base op) capture each affected view row's base-PK identities ONCE up-front,
@@ -340,7 +340,7 @@ function buildIdentityCapture(
 
 /**
  * The `ctxSelfRead` for a CTE-name DML target whose user clauses self-read the target
- * name (docs/view-updateability.md § Common Table Expressions — self-reference): the
+ * name (docs/vu-operators.md § Common Table Expressions — self-reference): the
  * target-EXCLUDED body context (`ctx`) with the target name **re-added** to `cteNodes`,
  * resolving to a context-backed key relation over the eager self-read capture. The
  * {@link withKeyCapture} analog, keyed under the CTE name (`cteName`) rather than
@@ -498,7 +498,7 @@ function rejectLensSetLevelConflictResolution(ctx: PlanningContext, view: Mutabl
 }
 
 /**
- * Build the set-operation write substrate (docs/view-updateability.md § Set Operations) —
+ * Build the set-operation write substrate (docs/vu-operators.md § Set Operations) —
  * the shared core for BOTH set-op view writabilities, parameterized by `writeFn`: the
  * `exists`-membership decomposition ({@link buildSetOpWrite}) or the flag-less
  * predicate-honest one ({@link buildFlaglessSetOpWrite}).
@@ -587,7 +587,7 @@ function buildNoOpMutationSink(ctx: PlanningContext, op: string): PlanNode {
 
 /**
  * Build the shared-surrogate envelope substrate for a multi-source inner-join
- * INSERT (docs/view-updateability.md § Inner Join — Inserts, § Mutation Context).
+ * INSERT (docs/vu-operators.md § Inner Join — Inserts, docs/vu-mutation-context.md § Mutation Context).
  *
  * The decomposition (`analyzeMultiSourceInsert`) yields the per-side base inserts
  * plus the envelope shape. We build:
@@ -690,7 +690,7 @@ function buildMultiSourceInsert(ctx: PlanningContext, view: MutableViewLike, stm
 /**
  * Build the shared-surrogate envelope substrate for an INSERT through a
  * decomposition-backed logical table (docs/lens.md § The Default Mapper,
- * docs/view-updateability.md § Mutation Context). The dual of
+ * docs/vu-mutation-context.md § Mutation Context). The dual of
  * `buildMultiSourceInsert`, generalized from two FK-ordered sides to an n-way,
  * anchor-first member fan-out with optional / EAV members.
  *

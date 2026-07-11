@@ -123,7 +123,7 @@ export interface SharedKey {
 	 * column is also a logical column. It is not a generation policy: the engine no
 	 * longer invents a key. Both kinds source the threaded value from ordinary
 	 * column-default / supplied-value machinery and propagate it across the fan-out
-	 * via the equivalence class (`docs/view-updateability.md` § Mutation Context):
+	 * via the equivalence class (`docs/vu-mutation-context.md` § Mutation Context):
 	 * - `surrogate`: a substrate-managed key distinct from any logical column. The
 	 *   value comes from the **anchor's shared-key column `default`**, evaluated once
 	 *   per produced row at the envelope (evaluate-once-and-thread). A basis author

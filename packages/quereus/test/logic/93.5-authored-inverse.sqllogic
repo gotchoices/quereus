@@ -1,5 +1,5 @@
 -- Authored inverses (`with inverse (col = expr, …)`) — write-through consumption
--- (docs/view-updateability.md § Authored inverses). The clause supplies authored
+-- (docs/vu-inverses.md § Authored inverses). The clause supplies authored
 -- put expressions computing base columns from the written view row (`new.<col>`
 -- refs), upgrading a computed (registry-opaque) column to writable + insertable.
 -- Parser/AST round-trip is pinned by the parser ticket; this file pins the

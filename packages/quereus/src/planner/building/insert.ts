@@ -533,8 +533,8 @@ export function buildInsertStmt(
 	// table / view / MV (matching read-side FROM shadowing). Resolve it ahead of the
 	// schema dispatch below; a recursive target is rejected here with the structured
 	// `recursive-cte` reason. The statement's CTEs are threaded into the planning
-	// context so a sibling-CTE read in the source resolves. See docs/view-updateability.md
-	// § CTEs and Subqueries.
+	// context so a sibling-CTE read in the source resolves. See docs/vu-operators.md
+	// § Common Table Expressions.
 	const cteTarget = resolveCteTarget(contextWithSchemaPath, stmt.table, stmt.withClause);
 	if (cteTarget) {
 		const { contextWithCTEs } = buildWithContext(contextWithSchemaPath, stmt);

@@ -4243,7 +4243,7 @@ describe('Property-Based Tests', () => {
 	// `building/view-mutation.ts`) in lock-step with those forward FD facts, over
 	// the single-source projection-and-filter shape the backward walk admits today.
 	//
-	// Three laws, per docs/view-updateability.md § "Round-Trip Laws and the
+	// Three laws, per docs/vu-roundtrip.md § "Round-Trip Laws and the
 	// Derived Backward Walk":
 	//   - PutGet  — a mutation through the view never escapes the view predicate;
 	//               computed columns are read-only (rejected, not silently dropped).

@@ -33,7 +33,7 @@ export interface ViewSchema {
  * stored inside the body select AST ({@link AST.SelectStmt.defaults}). Only a
  * SELECT body carries it; a VALUES (or other) body has none. Consumed by the
  * insert write-through rewrite (step 5 of the insert-defaulting precedence chain
- * — docs/view-updateability.md § View defaults) and by `view_info`'s
+ * — docs/vu-inverses.md § View defaults) and by `view_info`'s
  * insertability derivation.
  */
 export function bodyDefaults(body: AST.QueryExpr): ReadonlyArray<AST.ViewInsertDefault> | undefined {

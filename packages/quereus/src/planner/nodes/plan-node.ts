@@ -278,7 +278,7 @@ export type DomainConstraint =
  *   clause: author-supplied put expressions computing base columns from the
  *   written view row (`new.<output-col>` refs). Writable AND insertable;
  *   overrides any registry-inferred site (authored wins —
- *   docs/view-updateability.md § Authored inverses).
+ *   docs/vu-inverses.md § Authored inverses).
  */
 export type UpdateSite =
 	| {

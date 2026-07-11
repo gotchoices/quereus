@@ -394,7 +394,7 @@ describe('Reserved tag registry', () => {
 
 	describe('the retired quereus.update.default_for key is unknown everywhere', () => {
 		// The first-class `with defaults (col = expr, …)` view clause replaced the
-		// tag (docs/view-updateability.md § View with defaults). Like the routing
+		// tag (docs/vu-inverses.md § View defaults). Like the routing
 		// keys before it, a stray occurrence is the standard hard unknown-reserved-tag
 		// error at every site — including its former homes (view-ddl / dml-stmt).
 		const SITES: TagSite[] = ['view-ddl', 'dml-stmt', 'logical-table', 'physical-table'];

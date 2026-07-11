@@ -36,7 +36,7 @@ export type RuntimeContext = {
 	 * The 1-based ordinal of the row currently being produced within the active
 	 * INSERT / mutation-context evaluation, or undefined outside one. Exposed to
 	 * the `mutation_ordinal()` builtin so a column `default` can author a per-row
-	 * surrogate (the shared-key-via-default case — docs/view-updateability.md
+	 * surrogate (the shared-key-via-default case — docs/vu-mutation-context.md
 	 * § Mutation Context). Set per row by the INSERT DML executor and by the
 	 * shared-surrogate envelope (`runtime/emit/view-mutation.ts`), and saved/
 	 * restored around each scope so it never leaks past the statement.
