@@ -11,6 +11,8 @@ import {
   decodeValue,
   decodeCompositeKey,
   BUILTIN_KEY_NORMALIZER_RESOLVER,
+  assertNoUnpairedSurrogate,
+  findUnpairedSurrogate,
 } from '../src/common/encoding.js';
 
 describe('Key Encoding', () => {
@@ -201,7 +203,7 @@ describe('Key Encoding', () => {
     describe('unpaired surrogates', () => {
       // `TextEncoder` folds every unpaired surrogate to U+FFFD, so all 2048 of them would
       // encode to the same three bytes — two distinct text values sharing one key. The
-      // encoder refuses them instead. See `encodeText` / `assertEncodableText`.
+      // encoder refuses them instead. See `encodeText` / `assertNoUnpairedSurrogate`.
       const LONE_HIGH = '\uD800';
       const LONE_HIGH_2 = '\uD801';
       const LONE_LOW = '\uDC00';
@@ -291,6 +293,46 @@ describe('Key Encoding', () => {
         const b = encodeValue([LONE_HIGH_2] as unknown as SqlValue);
         expect(compareBytes(a, b)).to.not.equal(0);
         expect(decodeValue(a).value).to.deep.equal([LONE_HIGH]);
+      });
+    });
+
+    describe('assertNoUnpairedSurrogate / findUnpairedSurrogate (shared, exported guard)', () => {
+      // encodeText's own unpaired-surrogate coverage lives in the describe block above;
+      // these tests exercise the exported guard directly — the same one `key-builder.ts`
+      // and `store-module.ts` call for identifiers and persisted DDL text.
+      const LONE_HIGH = '\uD800';
+      const LONE_LOW = '\uDC00';
+      const ASTRAL = '\u{10000}';
+
+      it('findUnpairedSurrogate returns -1 for a clean string', () => {
+        expect(findUnpairedSurrogate('')).to.equal(-1);
+        expect(findUnpairedSurrogate('hello')).to.equal(-1);
+        expect(findUnpairedSurrogate(ASTRAL)).to.equal(-1);
+      });
+
+      it('findUnpairedSurrogate returns the offset of the first unpaired surrogate', () => {
+        expect(findUnpairedSurrogate(LONE_HIGH)).to.equal(0);
+        expect(findUnpairedSurrogate(`ab${LONE_LOW}`)).to.equal(2);
+        expect(findUnpairedSurrogate(`${ASTRAL}${LONE_HIGH}`)).to.equal(2);
+      });
+
+      it('assertNoUnpairedSurrogate accepts a clean string', () => {
+        expect(() => assertNoUnpairedSurrogate('hello', 'a text value')).to.not.throw();
+        expect(() => assertNoUnpairedSurrogate(ASTRAL, 'a text value')).to.not.throw();
+      });
+
+      it('assertNoUnpairedSurrogate raises on an unpaired surrogate', () => {
+        expect(() => assertNoUnpairedSurrogate(LONE_HIGH, 'a text value')).to.throw(/unpaired surrogate/i);
+      });
+
+      it('names the offending code unit and offset', () => {
+        expect(() => assertNoUnpairedSurrogate(`ab${LONE_LOW}`, 'a text value'))
+          .to.throw(/U\+DC00 at offset 2/);
+      });
+
+      it('interpolates the caller-supplied description into the message', () => {
+        expect(() => assertNoUnpairedSurrogate(LONE_HIGH, 'the identifier "x"'))
+          .to.throw(/cannot store the identifier "x" containing an unpaired surrogate/);
       });
     });
 

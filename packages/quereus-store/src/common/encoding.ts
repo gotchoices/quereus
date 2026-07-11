@@ -293,7 +293,7 @@ const HAS_SURROGATE = /[\uD800-\uDFFF]/;
  * (U+DC00–U+DFFF). A surrogate with no matching partner is legal in a JS string but is
  * not valid Unicode — it denotes no character, and no UTF-8 byte sequence encodes it.
  */
-function findUnpairedSurrogate(value: string): number {
+export function findUnpairedSurrogate(value: string): number {
   if (!HAS_SURROGATE.test(value)) return -1;
   for (let i = 0; i < value.length; i++) {
     const unit = value.charCodeAt(i);
@@ -310,30 +310,32 @@ function findUnpairedSurrogate(value: string): number {
 }
 
 /**
- * Raise on a string the store cannot key faithfully.
+ * Raise on a string the store cannot key (or persist as schema text) faithfully.
  *
  * `TextEncoder` replaces EVERY unpaired surrogate with U+FFFD (bytes `EF BF BD`), so all
  * 2048 of them would encode to the same three bytes: two distinct text values would share
- * one primary-key / index-key byte string, producing a spurious `UNIQUE` violation or —
- * worse — an upsert that overwrites an unrelated row. Refusing the value is the only
- * answer that never merges rows.
+ * one primary-key / index-key byte string (producing a spurious `UNIQUE` violation or —
+ * worse — an upsert that overwrites an unrelated row), and two distinct identifiers or DDL
+ * texts would share one catalog key or be silently mangled on write. Refusing the value is
+ * the only answer that never merges rows or corrupts persisted text.
  *
- * Runs on the NORMALIZED string, which is what actually gets encoded: a custom key
- * normalizer that slices a string can itself split a surrogate pair. The reported offset
- * is therefore into the normalizer's output; for BINARY (identity) and for the
- * case-folding built-ins it is the caller's own offset.
+ * Runs on whatever string is ABOUT to be encoded — for a TEXT value that is the normalized
+ * string (a custom key normalizer that slices a string can itself split a surrogate pair,
+ * so the reported offset is into the normalizer's output; for BINARY and the case-folding
+ * built-ins it is the caller's own offset). `describe` names what's being validated, so the
+ * message reads naturally for a TEXT value, an identifier, or a block of persisted DDL text.
  *
  * NOTE: a store written BEFORE this guard existed may hold rows whose text key was folded
  * to U+FFFD. They still scan (decoding to `'�'`), but no lone-surrogate literal can
  * address them any more — the encode raises first. If pre-guard stores ever have to be
  * opened, a one-time migration must rewrite or reject those rows; nothing detects them today.
  */
-function assertEncodableText(sortValue: string): void {
-  const at = findUnpairedSurrogate(sortValue);
+export function assertNoUnpairedSurrogate(value: string, describe: string): void {
+  const at = findUnpairedSurrogate(value);
   if (at < 0) return;
-  const codeUnit = sortValue.charCodeAt(at).toString(16).toUpperCase().padStart(4, '0');
+  const codeUnit = value.charCodeAt(at).toString(16).toUpperCase().padStart(4, '0');
   throw new QuereusError(
-    `cannot store a text value containing an unpaired surrogate (U+${codeUnit} at offset ${at}): ` +
+    `cannot store ${describe} containing an unpaired surrogate (U+${codeUnit} at offset ${at}): ` +
     `persistent storage keys text by its UTF-8 bytes, and no UTF-8 sequence encodes a lone ` +
     `surrogate — every one of them would collide on U+FFFD, merging distinct rows. ` +
     `In-memory tables accept the value.`,
@@ -350,13 +352,13 @@ function assertEncodableText(sortValue: string): void {
  * silently keying under a different collation's normalizer is exactly how two values
  * the database's comparator calls equal end up at two distinct primary keys.
  *
- * Raises on an unpaired surrogate — see {@link assertEncodableText}. This is the point
+ * Raises on an unpaired surrogate — see {@link assertNoUnpairedSurrogate}. This is the point
  * at which a store-backed table diverges from a memory table, and it is deliberate: the
  * only alternative encoding of a lone surrogate collides distinct values onto one key.
  */
 function encodeText(value: string, collation: string, normalizers: KeyNormalizerResolver): Uint8Array {
   const sortValue = normalizers(collation)(value);
-  assertEncodableText(sortValue);
+  assertNoUnpairedSurrogate(sortValue, 'a text value');
 
   // Encode as UTF-8
   const utf8 = new TextEncoder().encode(sortValue);
@@ -391,7 +393,7 @@ function encodeBlob(value: Uint8Array): Uint8Array {
  * the seven ASCII characters `\ud800`, so the canonical string is always valid Unicode and
  * its UTF-8 bytes stay injective. If the canonicalizer ever stops routing through
  * `JSON.stringify` (or gains a `rawJSON` passthrough), that escaping is lost and this must
- * call `assertEncodableText` too.
+ * call `assertNoUnpairedSurrogate` too.
  */
 function encodeObject(jsonString: string, collation: string, normalizers: KeyNormalizerResolver): Uint8Array {
   const sortValue = normalizers(collation)(jsonString);

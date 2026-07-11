@@ -622,9 +622,14 @@ time), and it is what makes the built-ins' `orderPreserving` stamp true over eve
 store-backed table can hold. Object/JSON keys need no such guard: their bytes come from
 `JSON.stringify`, which escapes a lone surrogate to ASCII.
 
-Identifiers are **not** yet guarded — a quoted table name carrying an unpaired surrogate
-still goes straight through `TextEncoder` into the catalog key. See
-`backlog/bug-store-catalog-key-lone-surrogate-identifier-collision`.
+Identifiers are guarded the same way. `buildCatalogKey`, `buildViewCatalogKey`,
+`buildMaterializedViewCatalogKey`, and `buildStatsKey` (`key-builder.ts`) all raise before
+encoding a schema/table/view name carrying an unpaired surrogate, and the full persisted DDL
+text (`saveTableDDL` and the other catalog-write sites in `store-module.ts`) is guarded too —
+a lone surrogate in a quoted column name or a `default`/`check` string literal is caught even
+when the table's own name is clean. `@quereus/sync`'s metadata key builders
+(`buildColumnVersionKey`, `buildTombstoneKey`, etc. in `metadata/keys.ts`) apply the same
+guard to their schema/table/column identifier arguments, importing it from `@quereus/store`.
 
 Note also that a text-capable but non-textual primary-key column (`any`, `json`, a date/time
 type) is keyed under `BINARY`, not under the table key collation `K` — matching the `BINARY`

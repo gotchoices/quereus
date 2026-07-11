@@ -15,7 +15,7 @@
  */
 
 import type { SqlValue } from '@quereus/quereus';
-import { encodeCompositeKey, type EncodeOptions } from './encoding.js';
+import { encodeCompositeKey, assertNoUnpairedSurrogate, type EncodeOptions } from './encoding.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -72,10 +72,24 @@ export function buildStatsStoreName(schemaName: string, tableName: string): stri
 }
 
 /**
+ * Raise when any identifier in `names` carries an unpaired surrogate — such an identifier
+ * has no faithful UTF-8 key bytes, so encoding it straight through `TextEncoder` would fold
+ * it to U+FFFD and collide with every other identifier differing only in that respect. See
+ * {@link assertNoUnpairedSurrogate}. Shared by every catalog-key builder below so the guard
+ * reads identically regardless of which kind of catalog object is being keyed.
+ */
+function assertKeyableIdentifiers(...names: string[]): void {
+	for (const name of names) {
+		assertNoUnpairedSurrogate(name, `the identifier "${name}"`);
+	}
+}
+
+/**
  * Build a stats key for use in the unified __stats__ store.
  * Format: {schema}.{table}
  */
 export function buildStatsKey(schemaName: string, tableName: string): Uint8Array {
+	assertKeyableIdentifiers(schemaName, tableName);
 	return encoder.encode(`${schemaName}.${tableName}`.toLowerCase());
 }
 
@@ -129,13 +143,12 @@ export function buildIndexKey(
  * Build a catalog key for DDL storage.
  * Format: {schema}.{table}
  *
- * NOTE: identifier keys go straight through `TextEncoder`, which folds an unpaired
- * surrogate to U+FFFD — so two tables whose quoted names differ only in a lone surrogate
- * share one catalog key and clobber each other's DDL. TEXT *values* are guarded against
- * this (`encodeText` raises); identifiers are not. Tracked by
- * `bug-store-catalog-key-lone-surrogate-identifier-collision`.
+ * Guarded by {@link assertKeyableIdentifiers}: an unpaired surrogate in either identifier
+ * has no faithful UTF-8 key bytes, so two tables whose quoted names differ only in a lone
+ * surrogate would otherwise fold to the same catalog key and clobber each other's DDL.
  */
 export function buildCatalogKey(schemaName: string, tableName: string): Uint8Array {
+	assertKeyableIdentifiers(schemaName, tableName);
 	return encoder.encode(`${schemaName}.${tableName}`.toLowerCase());
 }
 
@@ -173,6 +186,7 @@ export type CatalogEntryKind = 'table' | 'view' | 'materializedView' | 'meta';
  * same-named table entry).
  */
 export function buildViewCatalogKey(schemaName: string, viewName: string): Uint8Array {
+	assertKeyableIdentifiers(schemaName, viewName);
 	return encoder.encode(`${VIEW_KEY_PREFIX}${`${schemaName}.${viewName}`.toLowerCase()}`);
 }
 
@@ -182,6 +196,7 @@ export function buildViewCatalogKey(schemaName: string, viewName: string): Uint8
  * same-named table entry).
  */
 export function buildMaterializedViewCatalogKey(schemaName: string, mvName: string): Uint8Array {
+	assertKeyableIdentifiers(schemaName, mvName);
 	return encoder.encode(`${MVIEW_KEY_PREFIX}${`${schemaName}.${mvName}`.toLowerCase()}`);
 }
 

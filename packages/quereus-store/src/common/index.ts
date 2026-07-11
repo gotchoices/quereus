@@ -23,6 +23,8 @@ export {
   decodeValue,
   decodeCompositeKey,
   BUILTIN_KEY_NORMALIZER_RESOLVER,
+  assertNoUnpairedSurrogate,
+  findUnpairedSurrogate,
   type EncodeOptions,
 } from './encoding.js';
 

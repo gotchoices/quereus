@@ -65,6 +65,7 @@ import {
 	STALE_MVS_META_NAME,
 	classifyCatalogKey,
 } from './key-builder.js';
+import { assertNoUnpairedSurrogate } from './encoding.js';
 import { deserializeRow } from './serialization.js';
 import { generateTableDDL, generateIndexDDL, generateViewDDL, generateMaintainedTableDDL, generateIndexTagsDDL, isHiddenImplicitIndex, exposedImplicitIndexes } from '@quereus/quereus';
 
@@ -2806,13 +2807,26 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/**
+	 * Encode a bundle of persisted schema text (DDL) for the catalog store.
+	 *
+	 * Guards the FULL text, not just the object's name: a lone surrogate anywhere in it — a
+	 * quoted column name, a `default '…'` string literal, a `check` constraint's string
+	 * constant — would otherwise fold to U+FFFD under `TextEncoder` and read back as
+	 * different schema text than what was created. This does not rely on the catalog-key
+	 * builders' identifier guard having already caught it; it catches it independently.
+	 */
+	private encodeCatalogDDL(ddl: string): Uint8Array {
+		assertNoUnpairedSurrogate(ddl, 'persisted schema text');
+		return new TextEncoder().encode(ddl);
+	}
+
+	/**
 	 * Save table DDL (bundled with its secondary index DDL) to the catalog store.
 	 */
 	async saveTableDDL(tableSchema: TableSchema): Promise<void> {
 		const ddl = this.buildCatalogEntry(tableSchema);
 		const catalogKey = buildCatalogKey(tableSchema.schemaName, tableSchema.name);
-		const encoder = new TextEncoder();
-		const encodedDDL = encoder.encode(ddl);
+		const encodedDDL = this.encodeCatalogDDL(ddl);
 
 		const catalogStore = await this.provider.getCatalogStore();
 		await catalogStore.put(catalogKey, encodedDDL);
@@ -3180,7 +3194,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const catalogStore = await this.provider.getCatalogStore();
 		const existing = await catalogStore.get(key);
 		if (existing !== undefined && new TextDecoder().decode(existing) === newDDL) return;
-		await catalogStore.put(key, new TextEncoder().encode(newDDL));
+		await catalogStore.put(key, this.encodeCatalogDDL(newDDL));
 	}
 
 	/**
@@ -3484,7 +3498,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const existingDDL = new TextDecoder().decode(existing);
 		if (existingDDL === newDDL) return; // identical — no redundant write
 
-		await catalogStore.put(key, new TextEncoder().encode(newDDL));
+		await catalogStore.put(key, this.encodeCatalogDDL(newDDL));
 	}
 
 	/**

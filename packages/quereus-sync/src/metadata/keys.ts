@@ -16,6 +16,7 @@
  */
 
 import type { SqlValue } from '@quereus/quereus';
+import { assertNoUnpairedSurrogate } from '@quereus/store';
 import { type SiteId, siteIdToBase64, siteIdFromBase64 } from '../clock/site.js';
 import type { HLC } from '../clock/hlc.js';
 
@@ -38,6 +39,20 @@ export const SYNC_KEY_PREFIX = {
 
 /** Separator between key components. */
 const SEPARATOR = ':';
+
+/**
+ * Raise when any of `names` (schema/table/column identifiers) carries an unpaired
+ * surrogate — such an identifier has no faithful UTF-8 key bytes, so building a key from it
+ * would otherwise fold to U+FFFD and collide with a different identifier under the same
+ * mistake. The `pk`/`hlc`/`entryType` key components are exempt: `encodePK` routes through
+ * `JSON.stringify`, which already escapes a lone surrogate to ASCII, and `hlc`/`entryType`
+ * never carry user text.
+ */
+function assertKeyableIdentifiers(...names: string[]): void {
+  for (const name of names) {
+    assertNoUnpairedSurrogate(name, `the identifier "${name}"`);
+  }
+}
 
 /**
  * Encode a primary key as a string for use in metadata keys.
@@ -64,6 +79,7 @@ export function buildColumnVersionKey(
   pk: SqlValue[],
   column: string
 ): Uint8Array {
+  assertKeyableIdentifiers(schemaName, tableName, column);
   const key = `cv:${schemaName}.${tableName}${SEPARATOR}${encodePK(pk)}${SEPARATOR}${column}`;
   return encoder.encode(key);
 }
@@ -77,6 +93,7 @@ export function buildTombstoneKey(
   tableName: string,
   pk: SqlValue[]
 ): Uint8Array {
+  assertKeyableIdentifiers(schemaName, tableName);
   const key = `tb:${schemaName}.${tableName}${SEPARATOR}${encodePK(pk)}`;
   return encoder.encode(key);
 }
@@ -130,6 +147,7 @@ export function buildSchemaMigrationKey(
   tableName: string,
   version: number
 ): Uint8Array {
+  assertKeyableIdentifiers(schemaName, tableName);
   return encoder.encode(`sm:${schemaName}.${tableName}${SEPARATOR}${version.toString().padStart(10, '0')}`);
 }
 
@@ -392,6 +410,7 @@ export function buildChangeLogKey(
   pk: SqlValue[],
   column?: string
 ): Uint8Array {
+  assertKeyableIdentifiers(schemaName, tableName, ...(column !== undefined ? [column] : []));
   const hlcBytes = serializeHLCForKey(hlc);
   const typeByte = entryType === 'column' ? 0x01 : 0x02;
   const suffix = column
@@ -533,6 +552,7 @@ export function buildQuarantineKey(
   pk: SqlValue[],
   column?: string
 ): Uint8Array {
+  assertKeyableIdentifiers(schemaName, tableName, ...(column !== undefined ? [column] : []));
   const prefixBytes = encoder.encode(`qt:${schemaName}.${tableName}${SEPARATOR}`);
   const hlcBytes = serializeHLCForKey(hlc);
   const typeByte = entryType === 'column' ? 0x01 : 0x02;
@@ -585,6 +605,7 @@ export function buildQuarantineScanBounds(
  * is written and iterated but never parsed back.
  */
 export function buildBasisLifecycleKey(schemaName: string, tableName: string): Uint8Array {
+  assertKeyableIdentifiers(schemaName, tableName);
   return encoder.encode(`bl:${schemaName.toLowerCase()}.${tableName.toLowerCase()}`);
 }
 

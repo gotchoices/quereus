@@ -12,6 +12,8 @@ import {
 	buildDataKey,
 	buildIndexKey,
 	buildCatalogKey,
+	buildViewCatalogKey,
+	buildMaterializedViewCatalogKey,
 	buildFullScanBounds,
 	buildIndexPrefixBounds,
 	buildPkPrefixBounds,
@@ -66,6 +68,10 @@ describe('key-builder', () => {
 		it('returns UTF-8 encoded lowercase schema.table', () => {
 			const key = buildStatsKey('Main', 'Users');
 			expect(key).to.deep.equal(encoder.encode('main.users'));
+		});
+
+		it('rejects a table name carrying an unpaired surrogate', () => {
+			expect(() => buildStatsKey('main', '\uD800')).to.throw(/unpaired surrogate/i);
 		});
 	});
 
@@ -142,6 +148,34 @@ describe('key-builder', () => {
 		it('returns UTF-8 encoded lowercase schema.table', () => {
 			const key = buildCatalogKey('Main', 'Users');
 			expect(key).to.deep.equal(encoder.encode('main.users'));
+		});
+
+		it('rejects a table name carrying an unpaired surrogate', () => {
+			expect(() => buildCatalogKey('main', '\uD800')).to.throw(/unpaired surrogate/i);
+		});
+
+		it('rejects a schema name carrying an unpaired surrogate', () => {
+			expect(() => buildCatalogKey('\uD800', 'users')).to.throw(/unpaired surrogate/i);
+		});
+
+		it('two names differing only in a lone surrogate no longer collide — the second throws instead', () => {
+			// Pre-fix, both `buildCatalogKey('main', '\uD800')` and `buildCatalogKey('main', '\uD801')`
+			// encoded to the identical UTF-8 bytes (U+FFFD folding), so the second CREATE TABLE's
+			// catalog write silently clobbered the first. Both now throw instead of colliding.
+			expect(() => buildCatalogKey('main', '\uD800')).to.throw(/unpaired surrogate/i);
+			expect(() => buildCatalogKey('main', '\uD801')).to.throw(/unpaired surrogate/i);
+		});
+	});
+
+	describe('buildViewCatalogKey', () => {
+		it('rejects a view name carrying an unpaired surrogate', () => {
+			expect(() => buildViewCatalogKey('main', '\uD800')).to.throw(/unpaired surrogate/i);
+		});
+	});
+
+	describe('buildMaterializedViewCatalogKey', () => {
+		it('rejects a materialized-view name carrying an unpaired surrogate', () => {
+			expect(() => buildMaterializedViewCatalogKey('main', '\uD800')).to.throw(/unpaired surrogate/i);
 		});
 	});
 

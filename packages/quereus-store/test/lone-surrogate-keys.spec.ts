@@ -215,4 +215,54 @@ describe('Lone surrogates are refused by the store and accepted in memory', () =
 			expect(await column(db, `select v from s order by k`, 'v')).to.have.lengthOf(2);
 		});
 	});
+
+	describe('an identifier or persisted DDL text carrying a lone surrogate', () => {
+		// Companion to the value-side guard above: `buildCatalogKey` folded an unpaired
+		// surrogate in a TABLE NAME to U+FFFD exactly like `encodeText` did for a value —
+		// so two tables whose quoted names differed only in a lone surrogate shared one
+		// catalog key, and the second table's DDL write silently clobbered the first's on
+		// reopen (`bug-store-catalog-key-lone-surrogate-identifier-collision`). DDL text is
+		// persisted lazily, on first access to the table's underlying store (see
+		// `StoreTable.initializeStore`), so the rejection surfaces on the first INSERT/SELECT
+		// against the table, not at `CREATE TABLE` itself.
+
+		it('rejects persisting DDL for a table named with a lone surrogate, on first data access', async () => {
+			await db.exec(`create table "${LONE_HIGH}" (k integer primary key) using store`);
+			await rejects(db, `insert into "${LONE_HIGH}" values (1)`);
+			// Nothing was silently written under a folded U+FFFD key.
+			const mod = new StoreModule(provider);
+			expect((await mod.loadAllDDL())).to.deep.equal([]);
+		});
+
+		it('rejects both of two tables whose names differ only in a lone surrogate, never colliding', async () => {
+			// Pre-fix this was the invisible half of the bug: the SECOND create's lazy DDL
+			// save would silently overwrite the FIRST's catalog entry. Now both are refused
+			// outright — the identifier is invalid, independent of whether another table
+			// happens to share its folded bytes.
+			await db.exec(`create table "${LONE_HIGH}" (k integer primary key) using store`);
+			await db.exec(`create table "${LONE_HIGH_2}" (k integer primary key) using store`);
+			await rejects(db, `insert into "${LONE_HIGH}" values (1)`);
+			await rejects(db, `insert into "${LONE_HIGH_2}" values (2)`);
+		});
+
+		it('rejects a schema.table pair persisted via CREATE INDEX (a direct, non-lazy save path)', async () => {
+			await db.exec(`create table "${LONE_HIGH}" (id integer primary key, v integer) using store`);
+			await rejects(db, `create index ix on "${LONE_HIGH}" (v)`);
+		});
+
+		it('rejects a column name carrying a lone surrogate, not just the table name', async () => {
+			// The DDL-text guard fires on the FULL persisted text, so a quoted column name
+			// is caught even though the table's own name is clean.
+			await db.exec(`create table t (id integer primary key, "${LONE_HIGH}" text) using store`);
+			await rejects(db, `insert into t (id, "${LONE_HIGH}") values (1, 'x')`);
+		});
+
+		it('rejects a DEFAULT string literal carrying a lone surrogate', async () => {
+			// Neither the table name nor any identifier is at fault here — a column
+			// DEFAULT's string constant is reconstructed verbatim into the persisted DDL,
+			// so it must be guarded too (not just the catalog-key identifiers).
+			await db.exec(`create table t2 (id integer primary key, v text default '${LONE_HIGH}') using store`);
+			await rejects(db, `insert into t2 (id) values (1)`);
+		});
+	});
 });

@@ -16,6 +16,7 @@ import {
   buildChangeLogKey,
   parseChangeLogKey,
   buildChangeLogScanBoundsAfter,
+  buildColumnVersionKey,
 } from '../../src/metadata/keys.js';
 
 const siteA = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -157,6 +158,20 @@ describe('change-log key encoding', () => {
       expect(compareBytes(earlierKey, gte)).to.be.lessThan(0);
     });
 
+    it('rejects a table name carrying an unpaired surrogate rather than folding it to U+FFFD', () => {
+      // Mirrors @quereus/store's catalog-key guard (bug-store-catalog-key-lone-surrogate-
+      // identifier-collision): `TextEncoder` folds an unpaired surrogate to U+FFFD, so two
+      // distinct table names differing only in a lone surrogate would otherwise share one
+      // change-log key prefix. `buildChangeLogKey` guards the schema/table/column identifier
+      // arguments via `assertNoUnpairedSurrogate` (imported from `@quereus/store`) before
+      // building the key.
+      const hlc = createHLC(1000n, 1, siteA, 0);
+      expect(() => buildChangeLogKey(hlc, 'column', 'main', '\uD800', [1], 'c'))
+        .to.throw(/unpaired surrogate/i);
+      expect(() => buildChangeLogKey(hlc, 'column', 'main', 't', [1], '\uD800'))
+        .to.throw(/unpaired surrogate/i);
+    });
+
     it('should carry from opSeq into siteId when opSeq is at max (0xFFFFFFFF)', () => {
       // The generic last-byte increment must roll all four opSeq bytes to 0 and
       // carry into the low byte of siteId — there is no opSeq beyond max, so the
@@ -178,6 +193,18 @@ describe('change-log key encoding', () => {
       // The boundary fact (max opSeq) is therefore excluded by the scan.
       const boundaryKey = buildChangeLogKey(since, 'column', 'main', 't', [1], 'c');
       expect(compareBytes(boundaryKey, gte)).to.be.lessThan(0);
+    });
+  });
+
+  describe('buildColumnVersionKey', () => {
+    it('rejects a schema, table, or column name carrying an unpaired surrogate', () => {
+      expect(() => buildColumnVersionKey('\uD800', 't', [1], 'c')).to.throw(/unpaired surrogate/i);
+      expect(() => buildColumnVersionKey('main', '\uD800', [1], 'c')).to.throw(/unpaired surrogate/i);
+      expect(() => buildColumnVersionKey('main', 't', [1], '\uD800')).to.throw(/unpaired surrogate/i);
+    });
+
+    it('still builds a key for a clean identifier', () => {
+      expect(() => buildColumnVersionKey('main', 't', [1], 'c')).to.not.throw();
     });
   });
 });
