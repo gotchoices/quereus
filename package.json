@@ -5,10 +5,11 @@
   "packageManager": "yarn@4.12.0",
   "description": "Quereus monorepo - Pure TypeScript SQL engine with CRDT sync. No WASM, no native bindings.",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "packages/tools/*"
   ],
   "scripts": {
-    "clean": "rimraf -g 'packages/*/dist' 'packages/*/*.tsbuildinfo' 'tsconfig.build.tsbuildinfo' 'packages/quereus-vscode/client/out' 'packages/quereus-vscode/server/dist' 'packages/quereus-vscode/*/*.tsbuildinfo'",
+    "clean": "rimraf -g 'packages/*/dist' 'packages/*/*.tsbuildinfo' 'tsconfig.build.tsbuildinfo' 'packages/quereus-vscode/client/out' 'packages/quereus-vscode/server/dist' 'packages/quereus-vscode/*/*.tsbuildinfo' 'packages/tools/*/dist' 'packages/tools/*/*.tsbuildinfo'",
     "bump": "bumpp --recursive",
     "gh-release": "node scripts/gh-release.js",
     "docs:check": "node scripts/check-docs.mjs",
@@ -43,6 +44,7 @@
     "build:sync-client": "cd packages/quereus-sync-client && yarn build",
     "build:plugins": "cd packages/sample-plugins && yarn build",
     "build:vscode": "cd packages/quereus-vscode && yarn build",
+    "build:planviz": "cd packages/tools/planviz && yarn build",
     "build:sync-coordinator": "cd packages/sync-coordinator && yarn build",
     "build:ui": "cd packages/shared-ui && yarn build",
     "preview:web": "cd packages/quoomb-web && yarn preview",
@@ -59,8 +61,9 @@
     "pub:plugin-ns": "node scripts/publish-package.js quereus-plugin-nativescript-sqlite",
     "pub:ui": "node scripts/publish-package.js shared-ui",
     "pub:cli": "node scripts/publish-package.js quoomb-cli",
+    "pub:planviz": "node scripts/publish-package.js tools/planviz",
     "//pub": "NOTE: this publish order is still hand-maintained and is NO LONGER kept in lockstep with the build order — `build` now derives its order from tsconfig references (tsc -b), so adding/reordering a package updates the build automatically but NOT this chain. Keep this list in dependency order (a package must publish after everything it depends on) by hand; if you add a package to tsconfig.build.json, add its pub:* step here too.",
-    "pub": "yarn pub:quereus && yarn pub:loader && yarn pub:isolation && yarn pub:store && yarn pub:plugin-indexeddb && yarn pub:plugin-leveldb && yarn pub:plugin-rn && yarn pub:plugin-ns && yarn pub:sync && yarn pub:sync-client && yarn pub:sync-coordinator && yarn pub:ui && yarn pub:cli"
+    "pub": "yarn pub:quereus && yarn pub:loader && yarn pub:isolation && yarn pub:store && yarn pub:plugin-indexeddb && yarn pub:plugin-leveldb && yarn pub:plugin-rn && yarn pub:plugin-ns && yarn pub:sync && yarn pub:sync-client && yarn pub:sync-coordinator && yarn pub:ui && yarn pub:cli && yarn pub:planviz"
   },
   "devDependencies": {
     "bumpp": "^11.1.0",

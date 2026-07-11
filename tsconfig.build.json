@@ -19,6 +19,7 @@
 		{ "path": "packages/quereus-plugin-react-native-leveldb" },
 		{ "path": "packages/quereus-plugin-nativescript-sqlite" },
 		{ "path": "packages/sample-plugins" },
-		{ "path": "packages/quoomb-cli" }
+		{ "path": "packages/quoomb-cli" },
+		{ "path": "packages/tools/planviz" }
 	]
 }
