@@ -578,10 +578,26 @@ export class StoreTable extends VirtualTable {
 	/**
 	 * Re-key every stored row under a new primary-key definition.
 	 *
-	 * Two-pass: the first pass reads every row and computes the new data keys,
-	 * tracking duplicates. On collision we throw `CONSTRAINT` without touching
-	 * the store. The second pass batches deletes of displaced old keys and puts
-	 * of new (key, row) pairs. Rows whose new key matches the old key are no-ops.
+	 * Two-pass, signatures-only pass 1: the first pass computes each row's new data
+	 * key and retains only a `Set` of key SIGNATURES (hex of the key bytes) to detect
+	 * collisions — two distinct old keys collapsing to one new key under a coarser
+	 * collation or a narrower PK. On collision we throw `CONSTRAINT` without touching
+	 * the store. The second pass RE-SCANS the same committed store, recomputes each
+	 * new key, and batches deletes of displaced old keys + puts of new (key, row)
+	 * pairs into ONE atomic batch. Rows whose new key matches the old key are no-ops.
+	 *
+	 * Holding signatures instead of whole rows halves peak memory: the prior design
+	 * retained the entire table in a map AND again in the batch. The re-scan trades
+	 * O(rows) CPU (a second iterate + newKey recompute) for not buffering the table
+	 * twice. Pass 1 and pass 2 iterate the SAME bounds over the SAME committed store
+	 * and see identical rows: nothing writes between them — we are single-threaded
+	 * within the ALTER, outside the coordinator, and every caller ran
+	 * `StoreModule.ddlCommitPendingOps` first so "committed" is "everything live".
+	 *
+	 * The final single `batch.write()` is the ONLY thing making the re-key
+	 * all-or-nothing — do not chunk-flush it. Its residual peak (the batch still holds
+	 * every changed row) is irreducible without breaking atomicity; tracked separately
+	 * in `debt-store-atomic-batch-bounded-memory`.
 	 *
 	 * Only the data store is rewritten — secondary indexes are rebuilt by the
 	 * caller (the keys embed the PK suffix, so they must be rebuilt whenever
@@ -604,33 +620,45 @@ export class StoreTable extends VirtualTable {
 		const store = await this.ensureStore();
 		const bounds = buildFullScanBounds();
 
-		interface Pending { newKey: Uint8Array; oldKey: Uint8Array; row: Row; }
-		const pending = new Map<string, Pending>();
-
 		const newPkDirections = newPkDef.map(pk => !!pk.desc);
 		const newPkCollations = resolvePkKeyCollations(
 			newPkDef,
 			newColumns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
+		// Both passes key rows through this one helper, so a collision judged in pass 1
+		// is byte-identical to the key pass 2 writes.
+		const computeNewKey = (row: Row): Uint8Array =>
+			buildDataKey(newPkDef.map(pk => row[pk.index]), this.encodeOptions, newPkDirections, newPkCollations);
+
+		// Pass 1 — collision detection only. Hold one hex signature per new key, never
+		// the row or old key. On a repeat, reject before any write; the store is
+		// untouched on rejection.
+		const seen = new Set<string>();
 		for await (const entry of store.iterate(bounds)) {
-			const row = deserializeRow(entry.value);
-			const newPkValues = newPkDef.map(pk => row[pk.index]);
-			const newKey = buildDataKey(newPkValues, this.encodeOptions, newPkDirections, newPkCollations);
-			const hex = bytesToHex(newKey);
-			if (pending.has(hex)) {
+			const hex = bytesToHex(computeNewKey(deserializeRow(entry.value)));
+			if (seen.has(hex)) {
 				throw new QuereusError(
 					`UNIQUE constraint failed: duplicate primary key on rekey of '${this.schemaName}.${this.tableName}'`,
 					StatusCode.CONSTRAINT,
 				);
 			}
-			pending.set(hex, { newKey, oldKey: entry.key, row });
+			seen.add(hex);
 		}
 
+		// Pass 2 — re-scan and build the single atomic batch. Recompute each new key and
+		// only rewrite rows whose key actually moves (`newKey !== oldKey`).
 		const batch = store.batch();
-		for (const { newKey, oldKey, row } of pending.values()) {
-			if (!bytesEqual(oldKey, newKey)) {
-				batch.delete(oldKey);
+		for await (const entry of store.iterate(bounds)) {
+			const row = deserializeRow(entry.value);
+			const newKey = computeNewKey(row);
+			if (!bytesEqual(entry.key, newKey)) {
+				batch.delete(entry.key);
+				// NOTE: the row VALUE is unchanged, so `serializeRow(row)` reproduces
+				// `entry.value` byte-for-byte. We re-serialize rather than reuse
+				// `entry.value` to avoid retaining an iterator-owned buffer in the batch.
+				// If re-key CPU ever shows up hot, reuse `entry.value` where the backend
+				// guarantees the buffer is not reused across iteration.
 				batch.put(newKey, serializeRow(row));
 			}
 		}

@@ -583,6 +583,90 @@ describe('Store ALTER TABLE', () => {
 			const rows = await asyncIterableToArray(db.eval('select * from t_pk order by code'));
 			expect(rows).to.have.lengthOf(3);
 		});
+
+		it('leaves EVERY row at its original key when a re-key collides (no partial re-key)', async () => {
+			// The signatures-only pass 1 must reject the whole re-key before pass 2 writes
+			// anything: a collision on ONE new key cannot leave OTHER rows already moved to
+			// their new keys. Assert the full ordered row set is byte-for-byte what it was.
+			await db.exec(`
+				CREATE TABLE t_pk (
+					id INTEGER PRIMARY KEY,
+					category INTEGER NOT NULL,
+					name TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO t_pk VALUES
+				(1, 10, 'a'), (2, 20, 'b'), (3, 20, 'c'), (4, 30, 'd'), (5, 40, 'e')`);
+
+			const before = await asyncIterableToArray(db.eval('select * from t_pk order by id'));
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`ALTER TABLE t_pk ALTER PRIMARY KEY (category)`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(caught, 'the colliding re-key must throw').to.be.instanceOf(Error);
+
+			// Still keyed by the ORIGINAL PK (id) with every row unchanged — nothing re-keyed.
+			const after = await asyncIterableToArray(db.eval('select * from t_pk order by id'));
+			expect(after).to.deep.equal(before);
+			// And the pre-ALTER point lookup on id still resolves (proves keys untouched).
+			expect(await db.get('select category, name from t_pk where id = 3'))
+				.to.deep.equal({ category: 20, name: 'c' });
+		});
+	});
+
+	describe('ALTER COLUMN SET COLLATE on a PK member (physical re-key)', () => {
+		it('rejects all-or-nothing when the coarser collation collapses two distinct PKs', async () => {
+			// Two BINARY-distinct text PKs ('A' vs 'a') collide under NOCASE. The re-key
+			// must reject before any write and leave both rows present under the old BINARY
+			// keys — the same all-or-nothing guarantee as ALTER PRIMARY KEY.
+			await db.exec(`
+				CREATE TABLE t_col (
+					k TEXT COLLATE BINARY PRIMARY KEY,
+					v TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO t_col VALUES ('A', 'upper'), ('a', 'lower')`);
+
+			const before = await asyncIterableToArray(db.eval(`select k, v from t_col order by k`));
+
+			let caught: unknown = null;
+			try {
+				await db.exec(`ALTER TABLE t_col ALTER COLUMN k SET COLLATE NOCASE`);
+			} catch (e) {
+				caught = e;
+			}
+			expect(caught, 'the colliding SET COLLATE must throw').to.be.instanceOf(Error);
+
+			// Both case-distinct rows survive, unchanged.
+			expect(await db.get('select count(*) as cnt from t_col')).to.deep.equal({ cnt: 2 });
+			const after = await asyncIterableToArray(db.eval(`select k, v from t_col order by k`));
+			expect(after).to.deep.equal(before);
+			expect((await db.get(`select v from t_col where k = 'A'`))?.v).to.equal('upper');
+			expect((await db.get(`select v from t_col where k = 'a'`))?.v).to.equal('lower');
+		});
+
+		it('re-keys every row under the new collation when there is no collision', async () => {
+			// No two keys collapse, so the re-key succeeds: every row present under the new
+			// NOCASE key bytes, none lost or duplicated.
+			await db.exec(`
+				CREATE TABLE t_col (
+					k TEXT COLLATE BINARY PRIMARY KEY,
+					v TEXT
+				) USING store
+			`);
+			await db.exec(`INSERT INTO t_col VALUES ('Alpha', '1'), ('Beta', '2'), ('Gamma', '3')`);
+
+			await db.exec(`ALTER TABLE t_col ALTER COLUMN k SET COLLATE NOCASE`);
+
+			expect(await db.get('select count(*) as cnt from t_col')).to.deep.equal({ cnt: 3 });
+			// Case-insensitive lookup now resolves under the new collation.
+			expect((await db.get(`select v from t_col where k = 'beta'`))?.v).to.equal('2');
+			const rows = await asyncIterableToArray(db.eval(`select k, v from t_col order by k`));
+			expect(rows).to.have.lengthOf(3);
+		});
 	});
 
 	describe('DDL persistence', () => {
