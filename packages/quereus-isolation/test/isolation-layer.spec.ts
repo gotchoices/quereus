@@ -4114,30 +4114,9 @@ describe('IsolationModule — cross-connection isolation (read-your-own-writes; 
 		await dbB.close();
 	});
 
-	/** Primary-key full-scan FilterInfo (idxStr === null ⇒ accessPath merges by PK). */
-	function fullScan(): FilterInfo {
-		return {
-			idxNum: 0,
-			idxStr: null,
-			constraints: [],
-			args: [],
-			accessPath: { kind: 'fullScan' },
-			indexInfoOutput: {
-				nConstraint: 0,
-				aConstraint: [],
-				nOrderBy: 0,
-				aOrderBy: [],
-				colUsed: 0n,
-				aConstraintUsage: [],
-				idxNum: 0,
-				idxStr: null,
-				orderByConsumed: false,
-				estimatedCost: 1000000,
-				estimatedRows: 1000000n,
-				idxFlags: 0,
-			},
-		};
-	}
+	// Primary-key full-scan (idxStr === null ⇒ accessPath merges by PK). Use the engine's
+	// shared builder so this scan can't drift from the real planner access path.
+	const fullScan = makeFullScanFilterInfo;
 
 	/** Stages live inserts (rows = [id, who][]) as `forDb`'s per-connection overlay. */
 	async function stageInserts(forDb: Database, rows: SqlValue[][]): Promise<void> {

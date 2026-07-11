@@ -5,7 +5,7 @@ LevelDB storage plugin for Quereus on React Native. Provides fast, persistent st
 ## Features
 
 - **Fast**: LevelDB offers excellent read/write performance, significantly faster than AsyncStorage
-- **Transaction isolation**: Read-your-own-writes and snapshot isolation by default
+- **Transaction isolation**: Read-committed + read-your-own-writes by default (no write-write conflict detection; not snapshot isolation)
 - **Synchronous API**: Uses rn-leveldb's synchronous, blocking APIs
 - **Binary data**: Full support for binary keys and values via ArrayBuffers
 - **Sorted keys**: Efficient range queries with ordered iteration

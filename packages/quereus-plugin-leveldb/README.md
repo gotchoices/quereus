@@ -5,7 +5,7 @@ LevelDB storage plugin for Quereus. Provides persistent storage for Node.js envi
 ## Features
 
 - **Fast**: LevelDB offers excellent read/write performance for key-value workloads
-- **Transaction isolation**: Read-your-own-writes and snapshot isolation by default
+- **Transaction isolation**: Read-committed + read-your-own-writes by default (no write-write conflict detection; not snapshot isolation)
 - **Sorted keys**: Efficient range queries with ordered iteration
 - **Crash-safe commits**: A whole transaction's data + secondary-index writes commit in one atomic, durable LevelDB batch (see [Storage layout](#storage-layout))
 - **Compression**: Built-in Snappy compression for reduced disk usage
@@ -155,7 +155,7 @@ await provider.closeAll();                   // closes the shared root
 | `createIfMissing` | boolean | `true` | Create the database if it doesn't exist |
 | `syncCommits` | boolean | `true` | `fsync` each transaction commit so it survives power loss (slower commits when on) |
 | `moduleName` | string | `'store'` | Name to register the virtual table module under |
-| `isolation` | boolean | `true` | Wrap with the isolation layer (read-your-own-writes, snapshot isolation) |
+| `isolation` | boolean | `true` | Wrap with the isolation layer (read-committed + read-your-own-writes; no write-write conflict detection, not snapshot isolation) |
 
 ### LevelDBStore Options (standalone `open`)
 
