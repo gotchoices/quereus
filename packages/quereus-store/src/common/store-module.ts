@@ -47,7 +47,7 @@ import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreConnection } from './store-connection.js';
 import { StoreBackingHost } from './backing-host.js';
-import { StoreTable, resolvePkKeyCollations, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, type StoreTableConfig, type StoreTableModule } from './store-table.js';
+import { StoreTable, resolvePkKeyCollations, columnCanHoldText, keyOrderMatchesCollation, pkOrderPreservingPrefixLength, withImplicitUniqueIndexes, implicitUniqueIndexName, type StoreTableConfig, type StoreTableModule } from './store-table.js';
 import {
 	buildCatalogKey,
 	buildCatalogScanBounds,
@@ -131,6 +131,23 @@ export interface StoreModuleConfig extends BaseModuleConfig {
  * memory; override per store with `using store (max_batch_bytes = …)`.
  */
 const DEFAULT_MAX_BATCH_BYTES = 8 * 1024 * 1024; // 8 MiB
+
+/**
+ * Map of `lowercased implicit index name → actual name` for every NON-DERIVED
+ * UNIQUE constraint of `schema` — the set of `_uc_*` stores that SHOULD exist for
+ * that constraint set. Derived from `uniqueConstraints` (not `.indexes`), so it is
+ * correct whether or not `schema` is materialized; the diff of two such maps drives
+ * {@link StoreModule.reconcileImplicitUniqueIndexStores}.
+ */
+function implicitUniqueIndexNameMap(schema: TableSchema): Map<string, string> {
+	const map = new Map<string, string>();
+	for (const uc of schema.uniqueConstraints ?? []) {
+		if (uc.derivedFromIndex) continue;
+		const name = implicitUniqueIndexName(schema, uc);
+		map.set(name.toLowerCase(), name);
+	}
+	return map;
+}
 
 /**
  * Resolve the index-build batch byte budget from a `max_batch_bytes` module arg.
@@ -1374,26 +1391,148 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			);
 		}
 
+		// The engine-facing schema carries no `_uc_*` (the store keeps the materialized
+		// enforcement copy internal), so the arms build `updatedSchema` off a clean schema
+		// exactly as before this feature; `table.updateSchema` recomputes the enforcement
+		// copy, and {@link reconcileImplicitUniqueIndexStores} (below) moves the physical
+		// stores for any constraint-set change.
 		const oldSchema = table.getSchema();
 		const defaultNotNull = db.options.getStringOption('default_column_nullability') === 'not_null';
 
+		let updated: TableSchema;
 		switch (change.type) {
 			case 'addColumn':
-				return this.alterAddColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
+				updated = await this.alterAddColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
+				break;
 			case 'dropColumn':
-				return this.alterDropColumn(schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterDropColumn(schemaName, tableName, table, oldSchema, change);
+				break;
 			case 'renameColumn':
-				return this.alterRenameColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
+				updated = await this.alterRenameColumn(db, schemaName, tableName, table, oldSchema, change, defaultNotNull);
+				break;
 			case 'alterPrimaryKey':
-				return this.alterPrimaryKeyChange(db, schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterPrimaryKeyChange(db, schemaName, tableName, table, oldSchema, change);
+				break;
 			case 'addConstraint':
-				return this.alterAddConstraint(db, schemaName, tableName, table, oldSchema, change, rows);
+				updated = await this.alterAddConstraint(db, schemaName, tableName, table, oldSchema, change, rows);
+				break;
 			case 'dropConstraint':
-				return this.alterDropConstraint(schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterDropConstraint(schemaName, tableName, table, oldSchema, change);
+				break;
 			case 'renameConstraint':
-				return this.alterRenameConstraint(schemaName, tableName, table, oldSchema, change);
+				updated = await this.alterRenameConstraint(schemaName, tableName, table, oldSchema, change);
+				break;
 			case 'alterColumn':
-				return this.alterColumnChange(db, schemaName, tableName, table, oldSchema, change, rows);
+				updated = await this.alterColumnChange(db, schemaName, tableName, table, oldSchema, change, rows);
+				break;
+			default: {
+				const _exhaustive: never = change;
+				void _exhaustive;
+				throw new QuereusError(`Unhandled ALTER TABLE change type '${(change as SchemaChangeInfo).type}'`, StatusCode.INTERNAL);
+			}
+		}
+
+		// Move the physical `_uc_*` index stores to match the post-ALTER constraint set:
+		// the SCHEMA entries were re-materialized by the arm's `table.updateSchema`, but a
+		// newly-added constraint's store must be BUILT and a dropped/renamed one's TORN
+		// DOWN. `oldSchema` carries the pre-ALTER `uniqueConstraints`; `table.getSchema()`
+		// the post-ALTER set. A no-op when the implicit-index name set is unchanged (the
+		// common case, incl. PK/collation/type ALTERs whose physical re-encode is already
+		// handled by `rebuildSecondaryIndexes`).
+		await this.reconcileImplicitUniqueIndexStores(db, schemaName, tableName, table, oldSchema);
+		return updated;
+	}
+
+	/**
+	 * Build / tear down the physical index stores backing implicit UNIQUE indexes
+	 * (`_uc_*`) after an ALTER, by diffing the implicit-index NAMES of the old vs new
+	 * constraint sets:
+	 *   - a name newly PRESENT (ADD CONSTRAINT UNIQUE, or the target half of a
+	 *     RENAME CONSTRAINT / rename of an unnamed UC's column) has its physical store
+	 *     populated from this module's effective rows;
+	 *   - a name newly ABSENT (DROP CONSTRAINT UNIQUE, or the source half of a rename)
+	 *     has its store torn down, so a later re-ADD does not reopen stale entries.
+	 *
+	 * The SCHEMA entry itself is materialized/removed by `withImplicitUniqueIndexes`
+	 * on the arm's `table.updateSchema`; only the physical store needs this. Runs after
+	 * every ALTER but is a no-op whenever the implicit-index name set is unchanged
+	 * (incl. PK / collation / data-type ALTERs, whose same-name physical re-encode is
+	 * already done by {@link rebuildSecondaryIndexes}).
+	 *
+	 * `oldSchema` carries the pre-ALTER `uniqueConstraints` (its `.indexes` may be
+	 * de-materialized — the diff reads `uniqueConstraints`, not `.indexes`).
+	 *
+	 * NOTE: the build populates from THIS module's own effective rows (committed + this
+	 * transaction's pending), never a wrapper's — mirroring `createIndex`. Under the
+	 * isolation layer the wrapper's rows are what ADD CONSTRAINT's validation judged;
+	 * the physical index legitimately fills from this module's committed rows and an
+	 * entry with no live row behind it is harmless (both readers resolve to the live
+	 * row). Duplicates were already rejected by `validateUniqueOverExistingRows` (ADD)
+	 * or cannot exist (RENAME leaves data unchanged), so the in-pass check is skipped.
+	 */
+	private async reconcileImplicitUniqueIndexStores(
+		db: Database,
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		oldSchema: TableSchema,
+	): Promise<void> {
+		// Diff the constraint sets by implicit-index NAME (derived from `uniqueConstraints`,
+		// so the engine-facing schemas work directly); resolve the index SHAPE to build from
+		// the materialized enforcement schema.
+		const newSchema = table.getSchema();
+		const newMaterialized = table.getMaterializedSchema();
+		const oldNames = implicitUniqueIndexNameMap(oldSchema);
+		const newNames = implicitUniqueIndexNameMap(newSchema);
+
+		// Tear down each store whose implicit index no longer exists.
+		for (const [lower, name] of oldNames) {
+			if (!newNames.has(lower)) {
+				await this.tearDownImplicitUniqueIndexStore(schemaName, tableName, table, name);
+			}
+		}
+
+		// Build each newly-materialized implicit index's store from effective rows.
+		for (const [lower, name] of newNames) {
+			if (oldNames.has(lower)) continue;
+			const indexSchema = (newMaterialized.indexes ?? []).find(ix => ix.name === name);
+			if (!indexSchema) continue; // defensive — name is derived from the same UC set
+			// NOTE: no `assertStoreNameFree` here (unlike explicit `createIndex`): the name
+			// is engine-derived and deterministic, and the lazy first-write build path in
+			// `updateSecondaryIndexes` does not assert either — keep the two consistent.
+			// NOTE: no teardown-on-failure wrapper (unlike `createIndex`): an IO error mid-build
+			// leaves a partial `_uc_*` store while the constraint schema is already committed, so
+			// enforcement could under-report until the store is rebuilt. Tolerated because the
+			// build has no in-pass dup check (skipDuplicateCheck below) so the only failure is a
+			// genuine IO error — the same non-atomicity `rebuildSecondaryIndexes` documents; a
+			// re-run / reopen rebuilds. Add a try/catch teardown if this ever bites.
+			const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
+			const indexStore = await this.provider.getIndexStore(schemaName, tableName, name);
+			await this.buildIndexEntries(
+				table.iterateEffectiveEntries(buildFullScanBounds()),
+				indexStore,
+				newSchema,
+				indexSchema,
+				keyCollation,
+				db.getKeyNormalizerResolver(),
+				true, // dup rejection already owned by the arm (ADD validates; RENAME is data-preserving)
+				table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
+			);
+		}
+	}
+
+	/** Close + delete the physical store of an implicit UNIQUE index. Mirrors `dropIndex`. */
+	private async tearDownImplicitUniqueIndexStore(
+		schemaName: string,
+		tableName: string,
+		table: StoreTable,
+		indexName: string,
+	): Promise<void> {
+		await table.releaseIndexStore(indexName);
+		if (this.provider.deleteIndexStore) {
+			await this.provider.deleteIndexStore(schemaName, tableName, indexName);
+		} else {
+			await this.provider.closeIndexStore(schemaName, tableName, indexName);
 		}
 	}
 
@@ -1726,8 +1865,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		await table.rekeyRows(newPkColumns);
 
 		// Secondary index keys embed the PK suffix — clear + rebuild every
-		// index against the now-rekeyed data store.
-		await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
+		// index against the now-rekeyed data store. Rebuild the MATERIALIZED index list
+		// so each implicit `_uc_*` PK suffix is re-encoded too (`updatedSchema` is built
+		// off the de-materialized `oldSchema`, so it carries no `_uc_*` on its own).
+		await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver());
 
 		table.updateSchema(updatedSchema);
 		await this.saveTableDDL(updatedSchema);
@@ -1757,9 +1898,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		let updatedSchema: TableSchema;
 
 		if (constraint.type === 'unique') {
-			// Store enforces inline UNIQUE by full-scan over `uniqueConstraints`
-			// (no separate index store), so there is nothing physical to build —
-			// but we must validate the existing rows before persisting.
+			// Validate the existing rows against the new UNIQUE before persisting. The
+			// implicit `_uc_*` index that backs enforcement is materialized into the
+			// StoreTable schema by `table.updateSchema` below, and its PHYSICAL store is
+			// built by `reconcileImplicitUniqueIndexStores` after this arm returns — the
+			// validation here runs first, so a CONSTRAINT rejection never leaves a store
+			// behind.
 			//
 			// No `ddlCommitPendingOps()` here (unlike the row-rewriting arms): this
 			// writes no rows, and the validation scan already reads effectively, so
@@ -1822,11 +1966,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		oldSchema: TableSchema,
 		change: Extract<SchemaChangeInfo, { type: 'dropConstraint' }>,
 	): Promise<TableSchema> {
-		// Schema-only catalog rewrite: store-backed UNIQUE enforcement is a
-		// full-scan over `uniqueConstraints` (no separate index store for an
-		// inline UNIQUE), so dropping the constraint stops enforcement with no
-		// physical teardown. A UNIQUE derived from a CREATE UNIQUE INDEX is
-		// rejected upstream (drop the index instead), so we never strand a store.
+		// Schema-only catalog rewrite. Dropping a UNIQUE removes it from
+		// `uniqueConstraints`, so `table.updateSchema` below de-materializes its implicit
+		// `_uc_*` index and `reconcileImplicitUniqueIndexStores` (after this arm returns)
+		// tears down the now-orphaned physical store — without which a later re-ADD would
+		// reopen stale entries. A UNIQUE derived from a CREATE UNIQUE INDEX is rejected
+		// upstream (drop the index instead), and has no `_uc_*` anyway.
 		const constraintClass = resolveNamedConstraintClass(oldSchema, change.constraintName);
 		const lower = change.constraintName.toLowerCase();
 		let updatedSchema: TableSchema;
@@ -1857,7 +2002,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	}
 
 	/** RENAME CONSTRAINT arm of {@link alterTable}: schema-only rename of a named constraint,
-	 *  then persist. Behavior-preserving extraction. */
+	 *  then persist. A renamed named-UNIQUE changes its implicit `_uc_*` index name, so
+	 *  `reconcileImplicitUniqueIndexStores` (run after this arm) MOVES the physical store —
+	 *  tears down the old-named store and rebuilds the new-named one from effective rows. */
 	private async alterRenameConstraint(
 		schemaName: string,
 		tableName: string,
@@ -2018,7 +2165,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// under the new collation here, before the re-key.
 			await this.ddlCommitPendingOps();
 			await table.rekeyRows(oldSchema.primaryKeyDefinition, updatedSchema.columns);
-			await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
+			// Materialize so the implicit `_uc_*` PK suffix is re-encoded under the new
+			// key collation too (`updatedSchema` carries none on its own).
+			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver());
 		}
 
 		// SET DATA TYPE physical conversion / SET NOT NULL DEFAULT backfill rewrote stored
@@ -2029,8 +2178,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// alterColumn). The sub-helper already ran ddlCommitPendingOps before its rewrite, so the
 		// committed data store rebuildSecondaryIndexes reads is "everything live". Mutually
 		// exclusive with the collation re-key above (distinct attributes), so no double rebuild.
+		// Materialize so an implicit `_uc_*` over the rewritten column is rebuilt against the
+		// new value bytes too.
 		if (valuesRewritten) {
-			await this.rebuildSecondaryIndexes(schemaName, tableName, table, updatedSchema, db.getKeyNormalizerResolver());
+			await this.rebuildSecondaryIndexes(schemaName, tableName, table, withImplicitUniqueIndexes(updatedSchema), db.getKeyNormalizerResolver());
 		}
 
 		table.updateSchema(updatedSchema);
@@ -2895,6 +3046,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	 * the compare-write in `persistCatalogIfChanged` relies on.
 	 */
 	private buildCatalogEntry(tableSchema: TableSchema): string {
+		// `tableSchema` is always the engine-facing schema (no `_uc_*`; the store keeps the
+		// materialized enforcement copy internal), so hidden implicit indexes reach here
+		// only through the `uniqueConstraints`-driven `isHiddenImplicitIndex` /
+		// `exposedImplicitIndexes` paths — never as a materialized `CREATE INDEX`.
 		const parts: string[] = [generateTableDDL(tableSchema)];
 		for (const idx of tableSchema.indexes ?? []) {
 			if (isHiddenImplicitIndex(tableSchema, idx.name)) continue;

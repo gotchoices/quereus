@@ -3,8 +3,9 @@ description: When someone declares both a UNIQUE column and a separate plain ind
 prereq: feat-store-implicit-unique-index
 files:
   - packages/quereus-store/src/common/store-table.ts   # withImplicitUniqueIndexes (materialization helper)
-  - packages/quereus-store/src/common/store-module.ts   # createIndex / dropIndex (reuse-transition reconciliation)
+  - packages/quereus-store/src/common/store-module.ts   # createIndex / dropIndex (reuse-transition reconciliation); reconcileImplicitUniqueIndexStores
   - packages/quereus/src/vtab/memory/layer/manager.ts   # indexCollationsMatchDeclared — the reuse gate to mirror
+  - packages/quereus-store/test/unique-constraints.spec.ts   # "materialization & coexistence › an explicit index and the implicit index coexist" asserts BOTH are maintained today — flip it to assert a single index
 ----
 
 # Store: reuse an existing explicit index instead of a duplicate implicit UNIQUE index

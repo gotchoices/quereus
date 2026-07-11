@@ -243,6 +243,68 @@ export function pkOrderPreservingPrefixLength(
 	return n;
 }
 
+/**
+ * Deterministic name of the implicit covering index materialized for a
+ * NON-DERIVED UNIQUE constraint `uc`: the constraint's own name when it has one,
+ * else the auto-name `_uc_<colNames>`. This MUST equal the engine's
+ * `catalog.ts` `implicitIndexName`, so a name that ever reaches the catalog
+ * bundle generator is recognized as hidden / exposed-implicit rather than a user
+ * index.
+ */
+export function implicitUniqueIndexName(schema: TableSchema, uc: UniqueConstraintSchema): string {
+	return uc.name ?? `_uc_${uc.columns.map(i => schema.columns[i]?.name ?? String(i)).join('_')}`;
+}
+
+/**
+ * Return `schema` with a synthetic secondary index materialized into
+ * `schema.indexes` for every NON-DERIVED UNIQUE constraint that lacks one — the
+ * store analogue of `MemoryTableManager.ensureUniqueConstraintIndexes`.
+ *
+ * This is what lets a plain column- or table-level `UNIQUE` be enforced by a
+ * bounded index point-seek ({@link StoreTable.findUniqueConflictViaIndex})
+ * instead of an O(rows) full scan: DML maintenance
+ * ({@link StoreTable.updateSecondaryIndexes}) and the UNIQUE check both iterate
+ * `schema.indexes`, so once the `_uc_*` entry is present the physical index is
+ * maintained and seeked with no new code path.
+ *
+ * The result is held ONLY in {@link StoreTable.materializedSchema} (the
+ * enforcement copy), never in the engine-facing `tableSchema` the store returns
+ * from `getSchema()` / registers with the engine. So the read-query planner and
+ * the catalog bundle never see `_uc_*` (it is fully derived on open from
+ * `uniqueConstraints`); like the memory backend, a plain UNIQUE gets no read-side
+ * plan from `_uc_*`, only enforcement / maintenance.
+ *
+ * Idempotent — a name already present is left untouched — and returns a frozen
+ * schema (or the input unchanged when there is nothing to add). A
+ * `derivedFromIndex` UC is skipped (its `CREATE UNIQUE INDEX` is already in
+ * `schema.indexes`). A partial UNIQUE's synthetic index carries the SAME
+ * `uc.predicate` object reference, which
+ * {@link StoreTable.findIndexForUniqueConstraint} matches on identity.
+ */
+export function withImplicitUniqueIndexes(schema: TableSchema): TableSchema {
+	const ucs = schema.uniqueConstraints;
+	if (!ucs || ucs.length === 0) return schema;
+
+	const existing = schema.indexes ?? [];
+	const present = new Set(existing.map(idx => idx.name.toLowerCase()));
+	const additions: TableIndexSchema[] = [];
+	for (const uc of ucs) {
+		if (uc.derivedFromIndex) continue;
+		const name = implicitUniqueIndexName(schema, uc);
+		if (present.has(name.toLowerCase())) continue;
+		present.add(name.toLowerCase());
+		additions.push({
+			name,
+			columns: uc.columns.map(idx => ({ index: idx, collation: schema.columns[idx]?.collation })),
+			// SAME reference as `uc.predicate` (undefined for a full UNIQUE) — load-bearing:
+			// findIndexForUniqueConstraint admits a partial `_uc_*` by `ix.predicate === uc.predicate`.
+			predicate: uc.predicate,
+		});
+	}
+	if (additions.length === 0) return schema;
+	return Object.freeze({ ...schema, indexes: Object.freeze([...existing, ...additions]) });
+}
+
 /** A UNIQUE conflict: the offending row and the primary key it lives at. */
 type UniqueConflict = { pk: SqlValue[]; row: Row };
 
@@ -373,6 +435,22 @@ export class StoreTable extends VirtualTable {
 	// for secondary-index maintenance rather than UNIQUE enforcement.
 	private readonly indexPredicateCache: WeakMap<TableIndexSchema, CompiledPredicate> = new WeakMap();
 
+	/**
+	 * {@link tableSchema} with a hidden `_uc_*` secondary index materialized per
+	 * non-derived UNIQUE constraint (see {@link withImplicitUniqueIndexes}) — the
+	 * schema that drives UNIQUE ENFORCEMENT ({@link findIndexForUniqueConstraint})
+	 * and physical index MAINTENANCE ({@link updateSecondaryIndexes}).
+	 *
+	 * Deliberately SEPARATE from the engine-facing {@link tableSchema}: the engine
+	 * reads `tableInstance.tableSchema` at CREATE (`SchemaManager.finalizeCreatedTableSchema`)
+	 * and the read-query planner reads the registered schema, and NEITHER may see
+	 * `_uc_*` (mirrors the memory backend keeping its materialized schema
+	 * manager-local; a plain UNIQUE gets no read-side plan from `_uc_*`, only
+	 * enforcement). Recomputed alongside `tableSchema` in the constructor and
+	 * {@link updateSchema}.
+	 */
+	private materializedSchema: TableSchema;
+
 	constructor(
 		db: Database,
 		storeModule: StoreTableModule,
@@ -384,7 +462,12 @@ export class StoreTable extends VirtualTable {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		super(db, storeModule as unknown as VirtualTableModule<any, any>, tableSchema.schemaName, tableSchema.name);
 		this.storeModule = storeModule;
+		// The engine-facing schema stays NON-materialized (the engine registers it and the
+		// read-query planner reads it — neither may see `_uc_*`); the hidden `_uc_*`
+		// per-UNIQUE index that lets plain UNIQUE enforce via a point-seek lives only in
+		// {@link materializedSchema}.
 		this.tableSchema = tableSchema;
+		this.materializedSchema = withImplicitUniqueIndexes(tableSchema);
 		this.config = config;
 		this.eventEmitter = eventEmitter;
 		this.collationResolver = db.getCollationResolver();
@@ -398,7 +481,9 @@ export class StoreTable extends VirtualTable {
 			tableSchema.columns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
-		this.validateKeyCollations(tableSchema, this.pkKeyCollations);
+		// Validate the MATERIALIZED schema, so a `_uc_*` over a text column that needs the
+		// table key collation K is rejected up front just like an explicit index would be.
+		this.validateKeyCollations(this.materializedSchema, this.pkKeyCollations);
 		this.ddlSaved = isConnected;
 	}
 
@@ -458,9 +543,19 @@ export class StoreTable extends VirtualTable {
 		return this.config;
 	}
 
-	/** Get the table schema. */
+	/** Get the table schema (engine-facing, WITHOUT the hidden `_uc_*` indexes). */
 	getSchema(): TableSchema {
 		return this.tableSchema!;
+	}
+
+	/**
+	 * Get the enforcement schema — {@link getSchema} plus the hidden `_uc_*`
+	 * index materialized per non-derived UNIQUE. Used by the module to resolve the
+	 * physical index store to build/tear down during ALTER; never registered with
+	 * the engine.
+	 */
+	getMaterializedSchema(): TableSchema {
+		return this.materializedSchema;
 	}
 
 	/**
@@ -470,13 +565,18 @@ export class StoreTable extends VirtualTable {
 	 * rejection leaves this table on its previous, consistent schema.
 	 */
 	updateSchema(newSchema: TableSchema): void {
+		// `newSchema` is the engine-facing (non-materialized) schema; recompute the
+		// enforcement copy alongside it. Validate the MATERIALIZED copy so a `_uc_*` over a
+		// text column that needs the table key collation K is caught before adoption.
+		const materialized = withImplicitUniqueIndexes(newSchema);
 		const pkKeyCollations = resolvePkKeyCollations(
 			newSchema.primaryKeyDefinition,
 			newSchema.columns,
 			this.encodeOptions.collation ?? 'NOCASE',
 		);
-		this.validateKeyCollations(newSchema, pkKeyCollations);
+		this.validateKeyCollations(materialized, pkKeyCollations);
 		this.tableSchema = newSchema;
+		this.materializedSchema = materialized;
 		this.pkDirections = newSchema.primaryKeyDefinition.map(pk => !!pk.desc);
 		this.pkKeyCollations = pkKeyCollations;
 	}
@@ -1818,8 +1918,9 @@ export class StoreTable extends VirtualTable {
 		oldPk: SqlValue[],
 		newPk: SqlValue[] = oldPk,
 	): Promise<void> {
-		const schema = this.tableSchema!;
-		const indexes = schema.indexes || [];
+		// Maintain the MATERIALIZED index set: the hidden `_uc_*` per-UNIQUE index must be
+		// kept in step with DML so the enforcement seek finds every live row.
+		const indexes = this.materializedSchema.indexes || [];
 
 		for (const index of indexes) {
 			const indexStore = await this.ensureIndexStore(index.name);
@@ -2051,20 +2152,24 @@ export class StoreTable extends VirtualTable {
 	 * The `schema.indexes` entry whose physical index store can serve `uc`'s
 	 * conflict search as a point seek, or undefined when none can.
 	 *
-	 * The store materializes an index store ONLY for an explicit `CREATE INDEX` /
-	 * `CREATE UNIQUE INDEX` — a plain column- or table-level `UNIQUE` gets a
-	 * `uniqueConstraints` entry but no backing store (unlike the memory backend,
-	 * which auto-builds an implicit `_uc_*` covering index). So a UC is
-	 * index-servable only when:
+	 * Every non-derived UNIQUE now carries a materialized implicit index
+	 * (`_uc_*`, see {@link withImplicitUniqueIndexes}), so — like the memory
+	 * backend — a plain column- or table-level `UNIQUE` is index-servable, not
+	 * only an explicit `CREATE INDEX`. A UC is index-servable when:
 	 *
 	 *  - it is index-derived (`derivedFromIndex`, from `CREATE UNIQUE INDEX`) and
 	 *    its named index is still present — the index's partial predicate then
 	 *    equals the constraint's by construction (`appendIndexToTableSchema`); or
-	 *  - some FULL (non-partial) index's columns equal `uc.columns` positionally.
-	 *    A partial index cannot serve a non-derived UC: it physically omits its
-	 *    out-of-scope rows, so a seek would MISS a conflict among them. The index
-	 *    need not be UNIQUE — a plain index over the constrained columns still
-	 *    holds every row and narrows the candidate set.
+	 *  - some index's columns equal `uc.columns` positionally AND whose predicate
+	 *    is the SAME object as `uc.predicate` (reference identity — the implicit
+	 *    materializer sets it that way). For a FULL UNIQUE that is
+	 *    `undefined === undefined`, which also admits any user full index over the
+	 *    same columns. For a PARTIAL `unique(...) where p` it admits only the
+	 *    co-scoped `_uc_*` (which holds exactly the in-scope rows); an arbitrary
+	 *    user partial index with a DIFFERENT predicate object stays conservative
+	 *    (declined → full scan), because it physically omits rows the constraint
+	 *    still covers. The serving index need not be UNIQUE — a plain index over
+	 *    the constrained columns still holds every in-scope row.
 	 *
 	 * Collation guard (see {@link indexSeekHonorsEnforcementCollation}) may still
 	 * reject the found index, which routes the check back to the full scan.
@@ -2077,12 +2182,14 @@ export class StoreTable extends VirtualTable {
 		// memoize the (uc → index | undefined) resolution in a WeakMap keyed on the
 		// frozen UniqueConstraintSchema, as `predicateCache` above does — a CREATE/DROP
 		// INDEX yields fresh constraint objects, so such a cache invalidates itself.
-		const indexes = this.tableSchema?.indexes;
+		// Reads the MATERIALIZED index set so the hidden `_uc_*` realizing a plain UNIQUE
+		// is visible (the engine-facing `tableSchema` carries only explicit/derived indexes).
+		const indexes = this.materializedSchema.indexes;
 		if (!indexes || indexes.length === 0) return undefined;
 
 		const index = uc.derivedFromIndex
 			? indexes.find(ix => ix.name === uc.derivedFromIndex)
-			: indexes.find(ix => !ix.predicate
+			: indexes.find(ix => ix.predicate === uc.predicate
 				&& ix.columns.length === uc.columns.length
 				&& ix.columns.every((c, i) => c.index === uc.columns[i]));
 		if (!index) return undefined;

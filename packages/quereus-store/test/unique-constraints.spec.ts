@@ -18,6 +18,7 @@ async function collect(db: Database, sql: string): Promise<Record<string, SqlVal
 import {
 	StoreModule,
 	InMemoryKVStore,
+	buildCatalogKey,
 	type IterateOptions,
 	type KVEntry,
 	type KVStoreProvider,
@@ -883,7 +884,11 @@ describe('StoreTable UNIQUE constraints', () => {
 		describe('scaling', () => {
 			const ROWS = 100;
 
-			it('an index-backed UNIQUE never full-scans the data store; a bare UNIQUE does', async () => {
+			it('a plain UNIQUE now seeks its implicit index — never full-scans the data store', async () => {
+				// Before implicit-unique-index materialization the bare `UNIQUE (v)` full-scanned
+				// every prior row (Θ(ROWS²/2) data-store yields); now it is backed by a hidden
+				// `_uc_v` index and resolves each candidate by a data-store `get`, so it iterates
+				// the data store ZERO times — parity with an explicit `CREATE UNIQUE INDEX`.
 				const counting = createCountingProvider();
 				const cdb = new Database();
 				cdb.registerModule('store', new StoreModule(counting));
@@ -897,12 +902,17 @@ describe('StoreTable UNIQUE constraints', () => {
 						await cdb.exec(`INSERT INTO idxd VALUES (${i}, ${i})`);
 					}
 
-					// The bare UNIQUE re-scans every prior row: Θ(ROWS²/2) entries.
-					expect(counting.dataEntriesScanned('bare')).to.be.greaterThan(ROWS * 10);
-					// The index-backed UNIQUE resolves each candidate by data-store `get`,
-					// never by iterating the data store.
+					// Both the implicit `_uc_v` and the explicit `idxd_v` resolve each candidate
+					// by data-store `get`, never by iterating the data store.
+					expect(counting.dataEntriesScanned('bare')).to.equal(0);
 					expect(counting.dataEntriesScanned('idxd')).to.equal(0);
 
+					// And a duplicate is still rejected through the implicit index.
+					let rejected = false;
+					try { await cdb.exec(`INSERT INTO bare VALUES (${ROWS}, 0)`); } catch { rejected = true; }
+					expect(rejected, 'implicit-index UNIQUE still rejects a duplicate').to.be.true;
+
+					expect(await collect(cdb, `SELECT count(*) AS n FROM bare`)).to.deep.equal([{ n: ROWS }]);
 					expect(await collect(cdb, `SELECT count(*) AS n FROM idxd`)).to.deep.equal([{ n: ROWS }]);
 				} finally {
 					await cdb.close();
@@ -981,5 +991,186 @@ describe('StoreTable UNIQUE constraints', () => {
 			await db.exec(`commit`);
 			expect(await collect(db, `SELECT count(*) AS n FROM ac4`)).to.deep.equal([{ n: 1 }]);
 		});
+	});
+
+	// A plain (non-derived) UNIQUE is now backed by a materialized hidden `_uc_*` index,
+	// held only in StoreTable's enforcement schema — never registered with the engine nor
+	// persisted as a CREATE INDEX. These pin the physical-store lifecycle and the
+	// engine-invisibility of that index.
+	describe('implicit unique index — materialization & coexistence', () => {
+		async function rejects(sql: string): Promise<void> {
+			let err: Error | null = null;
+			try { await db.exec(sql); } catch (e) { err = e as Error; }
+			expect(err, `expected "${sql}" to be rejected`).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+		}
+
+		/** Decode the persisted catalog bundle for main.<table>. */
+		async function readCatalogEntry(tableName: string): Promise<string> {
+			const catalog = await provider.getCatalogStore();
+			const bytes = await catalog.get(buildCatalogKey('main', tableName));
+			expect(bytes, `catalog entry for ${tableName} present`).to.not.be.undefined;
+			return new TextDecoder().decode(bytes!);
+		}
+
+		it('does not persist a CREATE INDEX for the implicit `_uc_*` (derive-on-open)', async () => {
+			await db.exec(`CREATE TABLE d1 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await db.exec(`INSERT INTO d1 VALUES (1, 'a@x')`); // lazy DDL persist
+			const bundle = await readCatalogEntry('d1');
+			expect(bundle, 'no implicit index CREATE INDEX line').to.not.match(/create index/i);
+			expect(bundle, 'no `_uc_` name leaked into the bundle').to.not.match(/_uc_/i);
+		});
+
+		it('keeps the implicit `_uc_*` out of the engine-registered schema', async () => {
+			await db.exec(`CREATE TABLE d2 (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			const registered = db.schemaManager.findTable('d2')!;
+			expect((registered.indexes ?? []).map(i => i.name), 'engine schema shows no _uc_*').to.deep.equal([]);
+		});
+
+		it('an explicit index and the implicit index coexist; dropping the explicit one still enforces', async () => {
+			await db.exec(`CREATE TABLE co (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+			await db.exec(`CREATE INDEX co_email ON co (email)`);
+			await db.exec(`INSERT INTO co VALUES (1, 'a@x')`);
+			// Both maintained; the UNIQUE still rejects a duplicate.
+			await rejects(`INSERT INTO co VALUES (2, 'a@x')`);
+			// Drop the explicit index — the implicit `_uc_email` keeps enforcing.
+			await db.exec(`DROP INDEX co_email`);
+			await rejects(`INSERT INTO co VALUES (3, 'a@x')`);
+			await db.exec(`INSERT INTO co VALUES (4, 'b@x')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM co`)).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('multiple NULLs coexist under the implicit index; a non-NULL duplicate is rejected', async () => {
+			await db.exec(`CREATE TABLE mn (id INTEGER PRIMARY KEY, email TEXT NULL UNIQUE) USING store`);
+			await db.exec(`INSERT INTO mn VALUES (1, null), (2, null), (3, 'x')`);
+			await rejects(`INSERT INTO mn VALUES (4, 'x')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM mn`)).to.deep.equal([{ n: 3 }]);
+		});
+
+		it('the implicit index honors the collation guard: K=BINARY over C=NOCASE still rejects the dup', async () => {
+			// Table key collation K = BINARY, column enforcement collation C = NOCASE. The seek
+			// under K would UNDER-fetch a NOCASE-equal/BINARY-distinct duplicate, so the guard
+			// degrades the implicit-index check to the full scan — which still rejects it.
+			await db.exec(`CREATE TABLE gk (id INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, UNIQUE (b)) USING store(collation = 'BINARY')`);
+			await db.exec(`INSERT INTO gk VALUES (1, 'Bob')`);
+			await rejects(`INSERT INTO gk VALUES (2, 'BOB')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM gk`)).to.deep.equal([{ n: 1 }]);
+			await db.exec(`INSERT INTO gk VALUES (3, 'Carol')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM gk`)).to.deep.equal([{ n: 2 }]);
+		});
+	});
+
+	// The physical `_uc_*` store must be BUILT when a UNIQUE is added, TORN DOWN when it
+	// is dropped, and MOVED when it (or its unnamed column) is renamed — else a stale
+	// store would accept phantom duplicates or an empty one would miss real ones.
+	describe('implicit unique index — physical store lifecycle', () => {
+		async function rejects(sql: string): Promise<void> {
+			let err: Error | null = null;
+			try { await db.exec(sql); } catch (e) { err = e as Error; }
+			expect(err, `expected "${sql}" to be rejected`).to.not.be.null;
+			expect(err!.message).to.match(/UNIQUE constraint failed/i);
+		}
+
+		it('ADD then DROP then re-ADD the same UNIQUE does not resurrect stale entries', async () => {
+			await db.exec(`CREATE TABLE lc (id INTEGER PRIMARY KEY, v TEXT) USING store`);
+			await db.exec(`INSERT INTO lc VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE lc ADD CONSTRAINT u UNIQUE (v)`);
+			await rejects(`INSERT INTO lc VALUES (2, 'a')`);
+			// Drop the constraint → tear down the physical `_uc_*` store.
+			await db.exec(`ALTER TABLE lc DROP CONSTRAINT u`);
+			await db.exec(`INSERT INTO lc VALUES (2, 'a')`); // now allowed
+			// Delete one dup so re-ADD's existing-row validation passes, then re-ADD.
+			await db.exec(`DELETE FROM lc WHERE id = 2`);
+			await db.exec(`ALTER TABLE lc ADD CONSTRAINT u2 UNIQUE (v)`);
+			// The re-ADD built a FRESH store — a duplicate of the surviving row is rejected,
+			// and no phantom entry for the deleted id=2 lingers.
+			await rejects(`INSERT INTO lc VALUES (3, 'a')`);
+			await db.exec(`INSERT INTO lc VALUES (4, 'b')`);
+			expect(await collect(db, `SELECT id, v FROM lc ORDER BY id`)).to.deep.equal([
+				{ id: 1, v: 'a' }, { id: 4, v: 'b' },
+			]);
+		});
+
+		it('RENAME CONSTRAINT of a named UNIQUE moves the physical store and keeps enforcing', async () => {
+			await db.exec(`CREATE TABLE rn (id INTEGER PRIMARY KEY, v TEXT, CONSTRAINT u UNIQUE (v)) USING store`);
+			await db.exec(`INSERT INTO rn VALUES (1, 'a')`);
+			await db.exec(`ALTER TABLE rn RENAME CONSTRAINT u TO u2`);
+			// Enforcement now seeks `_uc_*` under the NEW name (u2); the old-named store was
+			// torn down and the new one rebuilt from the existing rows.
+			await rejects(`INSERT INTO rn VALUES (2, 'a')`);
+			await db.exec(`INSERT INTO rn VALUES (3, 'b')`);
+			expect(await collect(db, `SELECT count(*) AS n FROM rn`)).to.deep.equal([{ n: 2 }]);
+		});
+
+		it('bulk INSERT under ADD-CONSTRAINT UNIQUE never full-scans (builds + seeks the index)', async () => {
+			const counting = createCountingProvider();
+			const cdb = new Database();
+			cdb.registerModule('store', new StoreModule(counting));
+			try {
+				await cdb.exec(`CREATE TABLE ba (id INTEGER PRIMARY KEY, v INTEGER) USING store`);
+				await cdb.exec(`INSERT INTO ba VALUES (0, 0)`);
+				await cdb.exec(`ALTER TABLE ba ADD CONSTRAINT u UNIQUE (v)`);
+				const baseline = counting.dataEntriesScanned('ba'); // the build's one scan
+				for (let i = 1; i < 60; i++) await cdb.exec(`INSERT INTO ba VALUES (${i}, ${i})`);
+				// The post-ADD inserts seek the built `_uc_*`, never re-iterate the data store.
+				expect(counting.dataEntriesScanned('ba') - baseline).to.equal(0);
+			} finally {
+				await cdb.close();
+				await counting.closeAll();
+			}
+		});
+	});
+});
+
+// Close → reopen must keep enforcing: the physical `_uc_*` store persists on disk under
+// its deterministic name, and reconstructing the StoreTable re-materializes the schema
+// entry. Uses a persistent provider whose logical close is a no-op (mirrors real disk).
+describe('StoreTable implicit unique index — reopen', () => {
+	function createPersistentProvider(): KVStoreProvider & { _hardClose: () => void } {
+		const stores = new Map<string, InMemoryKVStore>();
+		const get = (key: string): InMemoryKVStore => {
+			let s = stores.get(key);
+			if (!s) { s = new InMemoryKVStore(); stores.set(key, s); }
+			return s;
+		};
+		return {
+			async getStore(s, t) { return get(`${s}.${t}`); },
+			async getIndexStore(s, t, i) { return get(`${s}.${t}_idx_${i}`); },
+			async getStatsStore(s, t) { return get(`${s}.${t}.__stats__`); },
+			async getCatalogStore() { return get('__catalog__'); },
+			async closeStore() { /* durable: survives logical close */ },
+			async closeIndexStore() { /* durable */ },
+			async closeAll() { /* durable */ },
+			_hardClose() { for (const s of stores.values()) void s.close(); stores.clear(); },
+		};
+	}
+
+	let provider: ReturnType<typeof createPersistentProvider>;
+	beforeEach(() => { provider = createPersistentProvider(); });
+	afterEach(() => { provider._hardClose(); });
+
+	it('reopen keeps enforcing a plain UNIQUE against a pre-close row', async () => {
+		const db1 = new Database();
+		const mod1 = new StoreModule(provider);
+		db1.registerModule('store', mod1);
+		await db1.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE) USING store`);
+		await db1.exec(`INSERT INTO t VALUES (1, 'a@x')`);
+		await mod1.closeAll();
+
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const result = await mod2.rehydrateCatalog(db2);
+		expect(result.errors, 're-parsed catalog DDL parses cleanly').to.have.lengthOf(0);
+
+		// A duplicate of the pre-close row is rejected through the re-materialized index.
+		let rejected = false;
+		try { await db2.exec(`INSERT INTO t VALUES (2, 'a@x')`); } catch { rejected = true; }
+		expect(rejected, 'duplicate rejected after reopen').to.be.true;
+		// A fresh value still inserts.
+		await db2.exec(`INSERT INTO t VALUES (3, 'b@x')`);
+		const rows: Record<string, SqlValue>[] = [];
+		for await (const r of db2.eval(`SELECT id, email FROM t ORDER BY id`)) rows.push(r);
+		expect(rows).to.deep.equal([{ id: 1, email: 'a@x' }, { id: 3, email: 'b@x' }]);
 	});
 });
