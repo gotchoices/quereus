@@ -251,6 +251,14 @@ async function runRenameTable(
 		});
 	}
 
+	// Second rename phase. `propagateTableRename` above rewrote every dependent object
+	// that named `oldName` and (for a persistent module) enqueued their corrective catalog
+	// writes. Signal the module to finalize: it may now drop any old-name catalog state,
+	// but only once those dependent writes are durable — so no on-disk catalog set ever
+	// names a vanished table. A module whose `renameTable` already did all its work (or
+	// that keeps no per-name catalog) simply omits the hook.
+	await module.finalizeRename?.(rctx.db, tableSchema.schemaName, oldName, newName);
+
 	log('Renamed table %s.%s to %s', tableSchema.schemaName, oldName, newName);
 	return null;
 }

@@ -438,6 +438,26 @@ export interface VirtualTableModule<
 	): Promise<void>;
 
 	/**
+	 * Optional second phase of RENAME TABLE, called by the engine at the END of
+	 * ALTER TABLE ... RENAME TO — AFTER the engine has propagated the rename into every
+	 * dependent object (rewriting CHECK / FK / partial-index predicates in OTHER tables,
+	 * plus view and materialized-view bodies) and fired their schema-change events.
+	 *
+	 * A module that persists its catalog by table name uses this to drop any now-superseded
+	 * OLD-name catalog state, but only once those dependent rewrites are durable. Splitting
+	 * the old-name removal out of {@link renameTable} (which runs BEFORE propagation) keeps
+	 * the durable catalog from ever holding a dependent that names a table already deleted:
+	 * a crash in that gap would otherwise strand an un-rehydratable set. Modules that keep no
+	 * per-name persistent catalog can omit this hook.
+	 */
+	finalizeRename?(
+		db: Database,
+		schemaName: string,
+		oldName: string,
+		newName: string,
+	): Promise<void>;
+
+	/**
 	 * Optional. Called once by APPLY SCHEMA before the migration-DDL loop runs,
 	 * iff there are migration statements to execute. The module may use this to
 	 * open an in-memory overlay/batch that subsequent create/destroy/alter

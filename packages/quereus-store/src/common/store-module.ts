@@ -2247,7 +2247,15 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				throw e;
 			}
 		}
-		await this.removeTableDDL(schemaName, oldName);
+
+		// NOTE: the OLD name's catalog entry is deliberately NOT removed here. Deleting it
+		// synchronously would drop `oldName` from the catalog BEFORE the engine's post-hook
+		// `propagateTableRename` has rewritten — let alone persisted — the OTHER tables /
+		// views / MVs that still name `oldName` (a cross-schema FK, a CHECK expression, a
+		// dependent view/MV body). A crash in that gap would strand a durable catalog set
+		// naming a vanished table, which reopens as a healthy-looking database whose
+		// dependents cannot be written to. The removal is deferred to `finalizeRename`,
+		// which the engine calls AFTER propagation has made the dependents durable.
 
 		// Migrate the stats entry (unified __stats__ store, keyed by schema.table).
 		// The entry is RE-KEYED, not physically moved with the directory: a unified
@@ -2286,6 +2294,38 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			schemaName,
 			objectName: newName,
 		});
+	}
+
+	/**
+	 * Second phase of a two-phase RENAME TABLE (see {@link renameTable}). The engine calls
+	 * this at the END of ALTER TABLE ... RENAME TO — AFTER its `propagateTableRename` has
+	 * rewritten every dependent object that named `oldName` and enqueued their corrective
+	 * catalog writes onto {@link persistQueue}. `renameTable` deliberately left `oldName`'s
+	 * catalog entry in place; here we drain those dependent writes to durability and only
+	 * THEN drop the old entry. During the window both entries coexist on disk, so every
+	 * dependent resolves against one of them and every intermediate catalog set rehydrates
+	 * into a working database.
+	 *
+	 * The old-entry delete rides `persistQueue` behind the dependents' already-enqueued
+	 * writes (FIFO), so it can only run after them, and the drain below awaits the whole
+	 * chain. Errors are swallowed+logged (the {@link enqueuePersist} contract): a failed
+	 * delete leaves the old entry present — a visible, droppable orphan, strictly safer
+	 * than a dependent stranded against a vanished table.
+	 *
+	 * NOTE: full cross-table atomicity — bundling this old-entry delete together with every
+	 * dependent rewrite into one `provider.beginAtomicBatch` commit — would eliminate even
+	 * the transient two-entry window (and the physical-move orphan `renameTableStores`
+	 * leaves), but only on atomic providers, and the dependent set is known only to the
+	 * engine post-propagate. That is the atomic-provider hardening path; out of scope here.
+	 */
+	async finalizeRename(
+		_db: Database,
+		schemaName: string,
+		oldName: string,
+		_newName: string,
+	): Promise<void> {
+		this.enqueuePersist(() => this.removeTableDDL(schemaName, oldName));
+		await this.whenCatalogPersisted();
 	}
 
 	/**

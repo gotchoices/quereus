@@ -111,6 +111,30 @@ describe('StoreModule rename catalog durability', () => {
 		return writes;
 	}
 
+	/**
+	 * Record every durable catalog op — `put` AND `delete` — in order, decoding each key
+	 * to its `{schema}.{table}` string (and, for puts, the written DDL). Ordering, not
+	 * just the final contents, is the invariant for the multi-table rename: the bug leaves
+	 * the final on-disk state correct but sequences the renamed table's delete BEFORE the
+	 * dependent's corrective rewrite, so a crash in between strands the dependent.
+	 */
+	async function traceCatalogOps(): Promise<Array<{ op: 'put' | 'delete'; key: string; ddl: string }>> {
+		const catalog = await provider.getCatalogStore();
+		const ops: Array<{ op: 'put' | 'delete'; key: string; ddl: string }> = [];
+		const decoder = new TextDecoder();
+		const originalPut = catalog.put.bind(catalog);
+		const originalDelete = catalog.delete.bind(catalog);
+		catalog.put = async (key, value, options?) => {
+			ops.push({ op: 'put', key: decoder.decode(key), ddl: decoder.decode(value) });
+			await originalPut(key, value, options);
+		};
+		catalog.delete = async (key, options?) => {
+			ops.push({ op: 'delete', key: decoder.decode(key), ddl: '' });
+			await originalDelete(key, options);
+		};
+		return ops;
+	}
+
 	/** Assert no durable write matched `stale`, and that exactly `expected` writes happened. */
 	function expectCleanWrites(writes: readonly string[], stale: RegExp, expected: number): void {
 		for (const ddl of writes) {
@@ -182,5 +206,56 @@ describe('StoreModule rename catalog durability', () => {
 		await db2.exec(`insert into t2 values (1, null, 5)`);
 		expect(await violates(db2, `insert into t2 values (2, 99, 5)`), 'self-FK still enforced after reopen').to.be.true;
 		await db2.exec(`insert into t2 values (3, 1, 5)`);
+	});
+
+	it('RENAME TABLE re-persists a dependent table before deleting the renamed table', async () => {
+		const { db, mod } = open();
+		await db.exec(`create table parent (id integer primary key) using store`);
+		await db.exec(`create table child (
+			id integer primary key,
+			p integer null,
+			foreign key (p) references parent(id)
+		) using store`);
+		// Force BOTH tables' DDL onto disk before tracing: a store table with no rows has
+		// no catalog entry, so the dependent's corrective rewrite would early-return
+		// (nothing to supersede) and the ordering bug could not bite. A row triggers the
+		// lazy first-access saveTableDDL.
+		await db.exec(`insert into parent values (1)`);
+		await db.exec(`insert into child values (1, 1)`);
+		await mod.whenCatalogPersisted();
+
+		const ops = await traceCatalogOps();
+
+		await db.exec(`alter table parent rename to parent2`);
+		await mod.whenCatalogPersisted();
+
+		// During the window the only `child` write is the corrective one: it must name
+		// `parent2`, never the vanished `parent`.
+		const childPut = ops.findIndex(o => o.op === 'put' && o.key === 'main.child');
+		const parentDelete = ops.findIndex(o => o.op === 'delete' && o.key === 'main.parent');
+		expect(childPut, `child was re-persisted during the rename (ops: ${JSON.stringify(ops)})`).to.be.greaterThan(-1);
+		expect(parentDelete, 'old parent catalog entry was deleted').to.be.greaterThan(-1);
+		expect(ops[childPut].ddl, 'child rewrite names parent2').to.match(/parent2/i);
+		expect(ops[childPut].ddl, 'child rewrite no longer names the vanished parent')
+			.to.not.match(/references\s+(?:main\.)?parent\s*\(/i);
+
+		// The ordering invariant: child's corrective rewrite is durable BEFORE parent's
+		// old entry is deleted, so no durable catalog set names a table that does not exist.
+		expect(childPut, 'child rewrite persisted before the parent delete').to.be.lessThan(parentDelete);
+
+		// Belt-and-suspenders: no durable write during the rename names the vanished parent.
+		for (const o of ops) {
+			if (o.op === 'put') {
+				expect(o.ddl, `no catalog write during the rename names the vanished 'parent' (${o.key})`)
+					.to.not.match(/references\s+(?:main\.)?parent\s*\(/i);
+			}
+		}
+
+		await mod.closeAll();
+		const { db: db2 } = await reopen(); // asserts zero rehydration errors
+
+		// After reopen the FK enforces against parent2 (which holds the row moved into it).
+		expect(await violates(db2, `insert into child values (2, 99)`), 'FK enforced against parent2 after reopen').to.be.true;
+		await db2.exec(`insert into child values (3, 1)`);
 	});
 });

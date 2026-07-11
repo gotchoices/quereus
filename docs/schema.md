@@ -346,6 +346,19 @@ path carries the indexes for free —
   the store's catalog listener, firing on that notify, re-persists a bundle whose self-FK
   still points at the vanished old name — a second durable stale write the module's hook
   cannot prevent.
+- `RENAME TABLE` corrects **other** objects too — a cross-schema FK, a `CHECK` expression,
+  a view or materialized-view body that names the renamed table — and those live in *other*
+  catalog entries the module's single-table hook cannot know about. The engine rewrites them
+  in its post-hook propagation (`propagateTableRename`), which enqueues their corrective
+  catalog writes. To keep a crash from stranding a dependent that names a table that no longer
+  exists, the rename is **two-phase** at the module boundary: `module.renameTable` writes the
+  new entry and moves physical storage but leaves the **old** name's catalog entry in place;
+  the engine then calls `module.finalizeRename` at the end of `runRenameTable`, after
+  propagation, and the store drains the dependents' writes to durability **before** deleting
+  the old entry. During the window both old and new entries coexist on disk, so every
+  intermediate catalog set rehydrates into a working database. This narrows the guarantee to
+  *"no durable catalog set ever names a vanished table"* — short of full cross-table atomicity
+  (see best-effort residue below).
 
 **Reattach, not rebuild.** The physical index KV store survives a logical close,
 so rehydrate does **not** scan rows to rebuild it. After the import loop,
@@ -362,6 +375,24 @@ contract: if the catalog write fails after a `CREATE INDEX` built the physical
 index store, the in-memory schema has the index but the catalog does not, so on
 reopen the index is missing and its store is orphaned. There is no two-phase
 protocol here.
+
+The `RENAME TABLE` `finalizeRename` protocol (above) orders the *catalog* writes but
+does not make the whole rename atomic. Two accepted residues remain, both strictly safer
+than the "child cannot be written to" failure they replace, and neither occurs on a clean
+(crash-free) rename:
+
+- **Physical-move orphan.** `renameTableStores` *moves* (not copies) the old table's data
+  store into the new name inside `renameTable`, while the old catalog entry is still present.
+  A crash in the window followed by reopen rehydrates the old name as an **empty** table
+  (a fresh store is minted on connect) — a visible, droppable orphan.
+- **Old-entry delete failure.** The deferred old-entry delete is best-effort (logged, not
+  fatal); a failure leaves both entries on disk — again a droppable orphan, not a stranded
+  dependent.
+
+Full cross-table atomicity (bundling the old-entry delete and every dependent rewrite into
+one `provider.beginAtomicBatch` commit) would remove even these, but only on atomic providers
+and with a larger engine↔module change; it is a possible future hardening, not the current
+guarantee.
 
 **Per-column PK key collation.** The store enforces PRIMARY KEY uniqueness/ordering
 *physically* in the key bytes, encoding each PK column under its own declared collation

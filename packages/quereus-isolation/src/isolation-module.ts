@@ -1488,6 +1488,23 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Forward the engine's post-propagation rename finalize to the underlying (see
+	 * {@link renameTable} for the two-phase split). The underlying (e.g. `StoreModule`)
+	 * uses it to drop the old name's catalog entry only after the cross-table rewrites
+	 * `propagateTableRename` enqueued are durable. `IsolationModule` owns no persistent
+	 * catalog of its own and already evicted every old-name state in `renameTable`, so
+	 * it simply delegates.
+	 */
+	async finalizeRename(
+		db: Database,
+		schemaName: string,
+		oldName: string,
+		newName: string,
+	): Promise<void> {
+		await this.underlying.finalizeRename?.(db, schemaName, oldName, newName);
+	}
+
+	/**
 	 * Connects a fresh underlying table under the post-rename name and records it in
 	 * `underlyingTables`, restoring the "every staged overlay resolves to an underlying"
 	 * invariant that {@link renameTable}'s eviction would otherwise break.
