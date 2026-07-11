@@ -61,7 +61,7 @@ sample-plugins/            # Example plugins
 Task workflow in `tickets/` folder (see `tickets/AGENTS.md`).
 
 ## Build & Test
-- `yarn build` runs sequential thru all packages
+- `yarn build` compiles all library packages via `tsc -b tsconfig.build.json` (project references — dependency-ordered, incremental, skips unchanged), then builds the 3 bundled apps (shared-ui, vscode, quoomb-web)
 - `yarn test` runs all workspace tests — **default for agents**; fast, memory-backed vtab
 - `yarn test:store` re-runs `packages/quereus` logic tests vs LevelDB store module (slower; exercises store path for ALTER, constraints, transactions, etc.)
 - `yarn test:full` runs both — **only for store-specific diagnosis or release prep**
