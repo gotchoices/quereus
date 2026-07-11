@@ -647,7 +647,12 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Convert options to Record<string, SqlValue> for vtabArgs
 		const vtabArgs: Record<string, SqlValue> = {};
 		if (options?.collation !== undefined) vtabArgs.collation = options.collation;
-		if (options?.maxBatchBytes !== undefined) vtabArgs.max_batch_bytes = options.maxBatchBytes;
+		// `options` is the raw DDL arg record (snake_case keys), so read `max_batch_bytes`,
+		// not the parsed `maxBatchBytes` field — the latter is never populated here, which
+		// silently dropped a configured budget across reopen. `?? maxBatchBytes` still honors
+		// a caller that hands in an already-parsed config.
+		const rawMaxBatchBytes = options?.max_batch_bytes ?? options?.maxBatchBytes;
+		if (rawMaxBatchBytes !== undefined) vtabArgs.max_batch_bytes = rawMaxBatchBytes as SqlValue;
 
 		// Resolve the table schema:
 		// 1. Use importedTableSchema if provided (from catalog import or runtime)

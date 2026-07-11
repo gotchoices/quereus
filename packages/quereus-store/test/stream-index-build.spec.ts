@@ -345,4 +345,43 @@ describe('StoreModule bounded-memory index builds', () => {
 		expect(trace.nonEmptyFlushes, 'default budget fits the tiny build in one flush').to.equal(1);
 		expect(await rows(db, `select id from t where b = 20`)).to.deep.equal([{ id: 2 }]);
 	});
+
+	it('a configured max_batch_bytes survives close → reopen (rebuild after reopen still chunks)', async () => {
+		// Regression: `connect` reads the raw `max_batch_bytes` DDL arg, not the parsed
+		// `maxBatchBytes` field, so a configured budget is not silently reset to the
+		// default when a table is rehydrated. Proven behaviorally: after reopen an ALTER
+		// SET COLLATE re-key drives `rebuildSecondaryIndexes`, which must still chunk over
+		// the tiny persisted budget (many flushes) rather than fall back to one 8 MiB batch.
+		const N = 40;
+		provider = createProvider();
+		const dbA = open(provider);
+		await dbA.exec(`create table t (k text collate binary primary key, v integer) using store (max_batch_bytes = 48)`);
+		await dbA.exec(`create index ix_v on t (v)`);
+		for (let i = 0; i < N; i++) {
+			await dbA.exec(`insert into t values ('K${i}', ${i})`);
+		}
+		expect(indexStoreSize(provider, 't', 'ix_v'), 'one index entry per row pre-reopen').to.equal(N);
+
+		// Reopen: a brand-new db + module rehydrate the same provider's catalog. No
+		// closeAll needed — the provider's stores are durable (no-op close).
+		const db2 = new Database();
+		const mod2 = new StoreModule(provider);
+		db2.registerModule('store', mod2);
+		const rehydrate = await mod2.rehydrateCatalog(db2);
+		expect(rehydrate.errors, 're-parsed catalog bundle parses cleanly').to.have.lengthOf(0);
+
+		// Reset the ix_v trace in place so the assertion counts only the post-reopen rebuild.
+		const trace = provider.indexTraces.get('ix_v')!;
+		trace.totalFlushes = 0;
+		trace.nonEmptyFlushes = 0;
+		trace.totalPuts = 0;
+
+		await db2.exec(`alter table t alter column k set collate nocase`);
+
+		expect(indexStoreSize(provider, 't', 'ix_v'), 'index entry count preserved across reopen + re-key').to.equal(N);
+		// The persisted tiny budget forced multiple chunks; a lost budget would fall back to
+		// the 8 MiB default and flush the whole rebuild in one batch.
+		expect(trace.nonEmptyFlushes, 'persisted budget still chunks the rebuild after reopen').to.be.greaterThan(1);
+		expect(trace.totalPuts, 'rebuild re-put every row after reopen').to.equal(N);
+	});
 });

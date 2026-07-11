@@ -538,6 +538,18 @@ db.setDefaultModule('leveldb', { path: './data' });
 // Then users simply: CREATE TABLE t (...)
 ```
 
+Module options (all optional, passed in the `USING` clause and persisted in the
+table's DDL, so they survive close → reopen):
+
+- `collation` — table key collation `K` for text keys (`BINARY` | `NOCASE`, default `NOCASE`).
+- `max_batch_bytes` — serialized-key byte budget for a single **index-build** write
+  batch. `CREATE INDEX` (and the `ALTER`-driven index rebuild) flushes and starts a
+  fresh batch once accumulated key bytes cross this, so building an index on a table
+  larger than memory never buffers the whole index at once. Default 8 MiB; a missing
+  or non-positive value clamps to the default (a zero budget must never *disable*
+  flushing). Bounds the write batch only — the UNIQUE-build dedup set is not bounded
+  by it.
+
 ## Schema Migration
 
 Uses lazy migration: rows missing new columns return NULL or the declared default on read. No eager rewriting of existing data.
