@@ -42,7 +42,11 @@ export class InMemoryKVStore implements KVStore {
 
   async get(key: Uint8Array): Promise<Uint8Array | undefined> {
     this.checkOpen();
-    return this.data.get(keyToHex(key))?.value;
+    // Return a COPY, not the internal buffer: a caller that mutates the read value
+    // must not corrupt stored data. LevelDB/IndexedDB hand back a fresh buffer per
+    // read (deserialize / structured-clone); the in-memory store copies to match.
+    const stored = this.data.get(keyToHex(key))?.value;
+    return stored === undefined ? undefined : new Uint8Array(stored);
   }
 
   // `_options` is accepted to satisfy the KVStore signature; an in-memory store
@@ -106,7 +110,12 @@ export class InMemoryKVStore implements KVStore {
       // Check limit
       if (limit !== undefined && count >= limit) break;
 
-      yield { key, value };
+      // Yield COPIES so a consumer mutating a yielded key/value cannot corrupt the
+      // store's internal buffers — same independent-buffer read contract as get().
+      // NOTE: allocates two buffers per yielded entry; if a hot full-scan path over a
+      // large in-memory store shows up as slow, hand out views and instead copy only
+      // at the mutation boundary.
+      yield { key: new Uint8Array(key), value: new Uint8Array(value) };
       count++;
     }
   }

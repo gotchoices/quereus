@@ -34,126 +34,10 @@ describe('IndexedDBStore', () => {
     });
   });
 
-  describe('Basic operations', () => {
-    it('should put and get a value', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value = new Uint8Array([4, 5, 6]);
-
-      await store.put(key, value);
-      const result = await store.get(key);
-
-      expect(result).to.deep.equal(value);
-    });
-
-    it('should return undefined for non-existent key', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const result = await store.get(key);
-      expect(result).to.be.undefined;
-    });
-
-    it('should delete a key', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value = new Uint8Array([4, 5, 6]);
-
-      await store.put(key, value);
-      await store.delete(key);
-      const result = await store.get(key);
-
-      expect(result).to.be.undefined;
-    });
-
-    it('should check if key exists with has()', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value = new Uint8Array([4, 5, 6]);
-
-      expect(await store.has(key)).to.be.false;
-      await store.put(key, value);
-      expect(await store.has(key)).to.be.true;
-    });
-
-    it('should honor the WriteOptions sync hint (durability: strict) defensively', async () => {
-      // `sync: true` asks for `durability: 'strict'`. fake-indexeddb may or may not
-      // accept the options bag; either way put/delete must persist correctly — the
-      // store falls back to a plain transaction (whose oncomplete await is already
-      // durable) if the engine rejects the third argument.
-      const key = new Uint8Array([7, 8, 9]);
-      const value = new Uint8Array([10, 11, 12]);
-
-      await store.put(key, value, { sync: true });
-      expect(await store.get(key)).to.deep.equal(value);
-
-      await store.delete(key, { sync: true });
-      expect(await store.get(key)).to.be.undefined;
-    });
-
-    it('should overwrite existing values', async () => {
-      const key = new Uint8Array([1, 2, 3]);
-      const value1 = new Uint8Array([4, 5, 6]);
-      const value2 = new Uint8Array([7, 8, 9]);
-
-      await store.put(key, value1);
-      await store.put(key, value2);
-      const result = await store.get(key);
-
-      expect(result).to.deep.equal(value2);
-    });
-  });
-
-  describe('Iteration', () => {
-    beforeEach(async () => {
-      await store.put(new Uint8Array([1]), new Uint8Array([10]));
-      await store.put(new Uint8Array([2]), new Uint8Array([20]));
-      await store.put(new Uint8Array([3]), new Uint8Array([30]));
-      await store.put(new Uint8Array([4]), new Uint8Array([40]));
-      await store.put(new Uint8Array([5]), new Uint8Array([50]));
-    });
-
-    it('should iterate all entries in order', async () => {
-      const entries: Array<{ key: Uint8Array; value: Uint8Array }> = [];
-      for await (const entry of store.iterate({})) {
-        entries.push(entry);
-      }
-
-      expect(entries).to.have.length(5);
-      expect(entries[0].key).to.deep.equal(new Uint8Array([1]));
-      expect(entries[4].key).to.deep.equal(new Uint8Array([5]));
-    });
-
-    it('should iterate with gte bound', async () => {
-      const entries: Array<{ key: Uint8Array; value: Uint8Array }> = [];
-      for await (const entry of store.iterate({ gte: new Uint8Array([3]) })) {
-        entries.push(entry);
-      }
-
-      expect(entries).to.have.length(3);
-      expect(entries[0].key).to.deep.equal(new Uint8Array([3]));
-    });
-
-    it('should iterate in reverse', async () => {
-      const entries: Array<{ key: Uint8Array; value: Uint8Array }> = [];
-      for await (const entry of store.iterate({ reverse: true })) {
-        entries.push(entry);
-      }
-
-      expect(entries).to.have.length(5);
-      expect(entries[0].key).to.deep.equal(new Uint8Array([5]));
-      expect(entries[4].key).to.deep.equal(new Uint8Array([1]));
-    });
-  });
-
+  // Point ops, iteration & ordering, and basic batch put/delete are covered for this
+  // backend by the shared KVStore conformance suite (see conformance.spec.ts). This
+  // file keeps only IndexedDB-SPECIFIC behavior with no cross-backend analogue.
   describe('Batch operations', () => {
-    it('should execute batch put operations', async () => {
-      const batch = store.batch();
-      batch.put(new Uint8Array([1]), new Uint8Array([10]));
-      batch.put(new Uint8Array([2]), new Uint8Array([20]));
-      batch.put(new Uint8Array([3]), new Uint8Array([30]));
-      await batch.write();
-
-      expect(await store.get(new Uint8Array([1]))).to.deep.equal(new Uint8Array([10]));
-      expect(await store.get(new Uint8Array([2]))).to.deep.equal(new Uint8Array([20]));
-      expect(await store.get(new Uint8Array([3]))).to.deep.equal(new Uint8Array([30]));
-    });
-
     it('should complete write batch during a concurrent version upgrade', async () => {
       // This exercises the race condition: ensureObjectStore triggers a version
       // upgrade that closes this.db and sets it to null.  Before the fix,
@@ -190,107 +74,13 @@ describe('IndexedDBStore', () => {
     });
   });
 
-  describe('Iteration across batch boundaries (streaming)', () => {
-    // store.ts pages iteration in 256-entry batches; use more than one batch worth
-    // so the resume-across-batches path is exercised.
-    const COUNT = 306;
-    const enc = (n: number) => new Uint8Array([(n >> 8) & 0xff, n & 0xff]);
-    const dec = (k: Uint8Array) => (k[0] << 8) | k[1];
-
-    beforeEach(async () => {
-      const b = store.batch();
-      for (let i = 0; i < COUNT; i++) {
-        b.put(enc(i), new Uint8Array([i & 0xff]));
-      }
-      await b.write();
-    });
-
-    it('streams every entry in order across batch boundaries, tolerating consumer awaits', async () => {
-      const keys: number[] = [];
-      for await (const entry of store.iterate({})) {
-        // Await an unrelated store op mid-iteration. A naive single-cursor iterate
-        // would let its readonly tx auto-commit here and throw TransactionInactiveError
-        // on the next cursor.continue(); the per-batch tx design tolerates it.
-        await store.get(enc(0));
-        keys.push(dec(entry.key));
-      }
-      expect(keys).to.have.length(COUNT);
-      // Strictly ascending across the boundary — no gaps, no repeats.
-      for (let i = 0; i < COUNT; i++) {
-        expect(keys[i]).to.equal(i);
-      }
-    });
-
-    it('honors reverse across the batch boundary', async () => {
-      const keys: number[] = [];
-      for await (const entry of store.iterate({ reverse: true })) {
-        keys.push(dec(entry.key));
-      }
-      expect(keys).to.have.length(COUNT);
-      for (let i = 0; i < COUNT; i++) {
-        expect(keys[i]).to.equal(COUNT - 1 - i);
-      }
-    });
-
-    it('honors a limit that spans the batch boundary', async () => {
-      const limit = 300; // > one 256-entry batch
-      const keys: number[] = [];
-      for await (const entry of store.iterate({ limit })) {
-        keys.push(dec(entry.key));
-      }
-      expect(keys).to.have.length(limit);
-      expect(keys[0]).to.equal(0);
-      expect(keys[limit - 1]).to.equal(limit - 1);
-    });
-
-    it('handles an inclusive upper bound landing on an exact batch boundary', async () => {
-      // Range [0..255] is exactly 256 = one BATCH, and its max key equals the
-      // inclusive `lte` bound. The resume edge then collapses to an empty range;
-      // the store must treat that as exhausted, not throw DataError on IDBKeyRange.
-      const keys: number[] = [];
-      for await (const entry of store.iterate({ lte: enc(255) })) {
-        keys.push(dec(entry.key));
-      }
-      expect(keys).to.have.length(256);
-      expect(keys[0]).to.equal(0);
-      expect(keys[255]).to.equal(255);
-    });
-
-    it('handles an inclusive lower bound landing on an exact reverse batch boundary', async () => {
-      // Reverse mirror: range [50..305] is exactly 256, its min key equals the
-      // inclusive `gte` bound, and reverse iteration resumes on the upper edge.
-      const keys: number[] = [];
-      for await (const entry of store.iterate({ gte: enc(50), reverse: true })) {
-        keys.push(dec(entry.key));
-      }
-      expect(keys).to.have.length(256);
-      expect(keys[0]).to.equal(305);
-      expect(keys[255]).to.equal(50);
-    });
-  });
-
+  // The streaming/batch-boundary iteration behavior (mid-iteration consumer awaits,
+  // reverse across the boundary, limit spanning it, and the collapsed-range DataError
+  // regression on inclusive bounds landing on a 256-entry multiple) is now asserted
+  // for this backend by the shared conformance suite's Tier 3 (conformance.spec.ts).
+  // MultiStoreWriteBatch is IndexedDB-specific (not the KVStore.batch surface), so its
+  // reuse test stays here.
   describe('Batch reuse after commit', () => {
-    it('does not re-apply a committed IndexedDBWriteBatch on reuse', async () => {
-      const k1 = new Uint8Array([1]);
-      const v1 = new Uint8Array([11]);
-      const k2 = new Uint8Array([2]);
-      const v2 = new Uint8Array([22]);
-
-      const b = store.batch();
-      b.put(k1, v1);
-      await b.write();
-      expect(await store.get(k1)).to.deep.equal(v1);
-
-      // Remove k1 out-of-band, then reuse the same batch handle for a second write.
-      await store.delete(k1);
-      b.put(k2, v2);
-      await b.write();
-
-      // If write() had not cleared ops, the second commit would resurrect k1.
-      expect(await store.get(k1)).to.be.undefined;
-      expect(await store.get(k2)).to.deep.equal(v2);
-    });
-
     it('does not re-apply a committed MultiStoreWriteBatch on reuse', async () => {
       const manager = store.getManager();
       const k1 = new Uint8Array([3]);

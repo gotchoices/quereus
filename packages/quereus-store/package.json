@@ -30,6 +30,17 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
+    },
+    "./testing": {
+      "types": "./dist/src/testing/kv-conformance.d.ts",
+      "import": "./dist/src/testing/kv-conformance.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "testing": [
+        "./dist/src/testing/kv-conformance.d.ts"
+      ]
     }
   },
   "scripts": {
