@@ -106,7 +106,7 @@
                   "estimatedCost": 0.8,
                   "estimatedRows": 1,
                   "matchedClauses": 0,
-                  "usableIndex": "fullscan"
+                  "usableIndex": "idx=_primary_(0);plan=2"
                 },
                 "indexName": "primary",
                 "isRange": false,

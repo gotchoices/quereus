@@ -79,11 +79,16 @@ function makeIndexFilterInfo(
 	constraints: ReadonlyArray<{ constraint: IndexConstraint; argvIndex: number }>,
 	params?: ReadonlyMap<string, string>,
 ): FilterInfo {
+	const idxStr = encodeIdxStr(makeIdxStrSpec(indexName, plan, params));
 	return {
 		...base,
 		constraints,
-		idxStr: encodeIdxStr(makeIdxStrSpec(indexName, plan, params)),
+		idxStr,
 		accessPath: buildIndexAccessPath(tableSchema, accessPlan, indexName, plan),
+		indexInfoOutput: {
+			...base.indexInfoOutput,
+			idxStr,
+		},
 	};
 }
 
