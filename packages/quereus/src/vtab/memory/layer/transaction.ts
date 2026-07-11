@@ -56,10 +56,10 @@ export class TransactionLayer implements Layer {
 	public readonly collationResolver: CollationResolver;
 	/**
 	 * Schema when this layer was started. Replaced when DDL runs inside this layer's own
-	 * transaction: by {@link adoptSchema} for additive index/constraint DDL and for a
-	 * secondary-index re-key from `alter column … set collate`, and by
-	 * {@link rekeyPrimaryKey} when that collate change lands on a primary-key column.
-	 * The column set is identical across every such swap.
+	 * transaction: by {@link adoptSchema} for additive index/constraint DDL, a secondary-index
+	 * re-key from `alter column … set collate`, and index/constraint removal (`drop index` /
+	 * `drop constraint`), and by {@link rekeyPrimaryKey} when that collate change lands on a
+	 * primary-key column. The column set is identical across every such swap.
 	 */
 	private tableSchemaAtCreation: TableSchema;
 
@@ -154,7 +154,7 @@ export class TransactionLayer implements Layer {
 	/**
 	 * Adopts a schema change that was applied to the table while THIS layer's transaction
 	 * is still open, so the rest of that transaction reads and enforces the new structures.
-	 * Two kinds of change reach here:
+	 * Three kinds of change reach here:
 	 *
 	 *  - **Additive** (`create index` / `create unique index` / `add constraint … unique`):
 	 *    a name absent from {@link secondaryIndexes} is built and added. Without it, a layer
@@ -168,6 +168,14 @@ export class TransactionLayer implements Layer {
 	 *    `MemoryIndex` would go on comparing under the old collation over an orphaned tree —
 	 *    and, once it becomes the committed head at commit, would shadow the base's rebuilt
 	 *    structures entirely.
+	 *  - **Removal** (`drop index` / `drop constraint`): an index whose name the new schema no
+	 *    longer declares is DROPPED from {@link secondaryIndexes}. Without it the layer keeps the
+	 *    derived `uniqueConstraints` entry in its frozen schema and goes on enforcing a constraint
+	 *    that no longer exists, and an index scan can still reach the orphaned tree via
+	 *    {@link getSecondaryIndexTree}. An empty/undefined `newSchema.indexes` drops all of them.
+	 *    Like the additive side, a removal is NOT undone by `rollback to savepoint`: every layer in
+	 *    the chain adopts it, so the restored snapshot has the index dropped too (DDL is not
+	 *    transactional here — see `feat-ddl-transaction-capability`).
 	 *
 	 * An index is considered unchanged only when the NEW schema's `IndexSchema` is the very
 	 * object the old schema carried. Every DDL path that re-keys rebuilds those objects, and
@@ -186,9 +194,9 @@ export class TransactionLayer implements Layer {
 	public adoptSchema(newSchema: TableSchema): void {
 		const oldSchema = this.tableSchemaAtCreation;
 		this.tableSchemaAtCreation = newSchema;
-		if (!newSchema.indexes) return;
 
-		for (const indexSchema of newSchema.indexes) {
+		// Additive + re-key: add an index the layer lacks, replace one the new schema rebuilt.
+		for (const indexSchema of newSchema.indexes ?? []) {
 			const held = this.secondaryIndexes.get(indexSchema.name);
 			const previous = oldSchema.indexes?.find(ix => ix.name === indexSchema.name);
 			if (held && previous === indexSchema) continue;
@@ -204,6 +212,15 @@ export class TransactionLayer implements Layer {
 			);
 			this.reindexOwnWrites(memoryIndex);
 			this.secondaryIndexes.set(indexSchema.name, memoryIndex);
+		}
+
+		// Removal (`drop index` / `drop constraint`): drop every held index the new schema no
+		// longer declares (empty/undefined `newSchema.indexes` drops all). Enforcement stops the
+		// moment the frozen schema loses the derived `uniqueConstraints` entry; dropping the
+		// orphaned `MemoryIndex` additionally keeps an index scan from reaching it.
+		const declared = new Set((newSchema.indexes ?? []).map(ix => ix.name));
+		for (const name of [...this.secondaryIndexes.keys()]) {
+			if (!declared.has(name)) this.secondaryIndexes.delete(name);
 		}
 	}
 

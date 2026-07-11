@@ -247,9 +247,11 @@ against them, and its layers cannot be re-pointed at the new schema. `ensureSche
 raises `BUSY` in that case, the same posture as the pre-existing "older transaction versions
 are in use" branch.
 
-One carve-out remains: `DROP INDEX` / `DROP CONSTRAINT` inside a transaction keep enforcing for
-the rest of it — `adoptSchema` adds and replaces structures, but never removes them; see
-`tickets/backlog/bug-drop-index-in-transaction-still-enforced.md`.
+`adoptSchema` also **removes** a structure a `DROP INDEX` / `DROP CONSTRAINT` deleted — dropping
+the layer's now-orphaned `MemoryIndex` and, with it, the derived `uniqueConstraints` entry the
+frozen schema was still enforcing — alongside its add/replace behavior. Like the additive side,
+that removal is not undone by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` (DDL is not transactional here;
+`feat-ddl-transaction-capability`) — after `rollback to savepoint`, the dropped index stays dropped.
 
 **`SET DATA TYPE` validates and rewrites values, not just structures.** When the new type has a
 different physical type, `MemoryTableManager.alterColumn` first runs a throw-only conversion pass

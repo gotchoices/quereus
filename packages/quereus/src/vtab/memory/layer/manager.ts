@@ -2421,6 +2421,9 @@ export class MemoryTableManager {
 			this.baseLayer.updateSchema(finalNewTableSchema);
 			await this.baseLayer.dropIndexFromBase(indexName);
 			this.tableSchema = finalNewTableSchema;
+			// The DDL transaction's own layers froze their schema at creation; hand them the new
+			// one so the rest of the transaction stops enforcing (and scanning) the dropped index.
+			this.adoptSchemaOnOpenLayers(finalNewTableSchema);
 
 			// Emit schema change event
 			this.eventEmitter?.emitSchemaChange?.({
@@ -2495,6 +2498,10 @@ export class MemoryTableManager {
 			if (droppedIndexName) await this.baseLayer.dropIndexFromBase(droppedIndexName);
 			this.tableSchema = newSchema;
 			this.initializePrimaryKeyFunctions();
+			// Hand the new schema to the DDL transaction's own frozen layers so a dropped UNIQUE
+			// stops enforcing for the rest of it; harmless for CHECK/FK (they re-freeze an
+			// equivalent schema, holding no per-layer structure).
+			this.adoptSchemaOnOpenLayers(newSchema);
 
 			this.eventEmitter?.emitSchemaChange?.({
 				type: 'alter',

@@ -38,6 +38,7 @@ const USE_STORE_MODULE = process.env.QUEREUS_TEST_STORE === 'true' || process.en
 // Files that are explicitly memory-module-specific and should be skipped in store mode
 const MEMORY_ONLY_FILES = new Set([
   '05-vtab_memory.sqllogic',  // Explicitly tests memory table indexing behavior
+  '10.1.3.1-ddl-drop-savepoint-memory.sqllogic',  // Pins memory's DDL-not-transactional quirk: DROP INDEX is not undone by `rollback to savepoint`. Store implements savepoint/DDL differently (feat-ddl-transaction-capability)
   '10.2.2-default-collation-memory.sqllogic',  // Asserts the memory-side BINARY default for an undecorated text PK; the store applies NOCASE (see docs/schema.md §"Per-column PK key collation")
   // '40-constraints.sqllogic' was excluded here; now fixed by IsolatedConnection.isCovering tiebreak
   // '41-foreign-keys.sqllogic' was excluded here; now fixed by IsolatedTable surfacing replacedRow for OR REPLACE store-side displacements
