@@ -38,6 +38,11 @@
 		"docs/types.md": "Stable",
 		"docs/usage.md": "Stable",
 		"docs/view-updateability.md": "Beta",
+		"docs/vu-inverses.md": "Beta",
+		"docs/vu-mutation-context.md": "Beta",
+		"docs/vu-operators.md": "Beta",
+		"docs/vu-roundtrip.md": "Beta",
+		"docs/vu-setops.md": "Beta",
 		"docs/window-functions.md": "Stable"
 	},
 	"untiered": [
