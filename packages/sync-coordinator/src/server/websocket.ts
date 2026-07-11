@@ -9,60 +9,22 @@ import {
   siteIdFromBase64,
   siteIdToBase64,
   deserializeHLC,
+  PROTOCOL_VERSION,
   type HLC,
   type ChangeSet,
-  type SnapshotCheckpoint,
+  type ClientMessage,
+  type HandshakeMessage,
+  type GetChangesMessage,
+  type ApplyChangesMessage,
+  type ResumeSnapshotMessage,
 } from '@quereus/sync';
 import type { CoordinatorService } from '../service/coordinator-service.js';
 import type { ClientIdentity, ClientSession } from '../service/types.js';
 import { wsLog, serializeChangeSet, deserializeChangeSet, serializeSnapshotChunk } from '../common/index.js';
 
-// ============================================================================
-// Message Types
-// ============================================================================
-
-interface HandshakeMessage {
-  type: 'handshake';
-  /** Database ID for multi-tenant routing (e.g., 'a1-s42') */
-  databaseId: string;
-  /** Client's site ID (base64 encoded) */
-  siteId: string;
-  token?: string;
-}
-
-interface GetChangesMessage {
-  type: 'get_changes';
-  sinceHLC?: string; // base64 encoded
-}
-
-interface ApplyChangesMessage {
-  type: 'apply_changes';
-  changes: unknown[];
-  /** Correlation id, reflected back verbatim on the apply_result. Optional:
-   *  a peer-relay push carries none. The server keeps no state — it only echoes. */
-  requestId?: string;
-}
-
-interface GetSnapshotMessage {
-  type: 'get_snapshot';
-}
-
-interface ResumeSnapshotMessage {
-  type: 'resume_snapshot';
-  checkpoint: SnapshotCheckpoint;
-}
-
-interface PingMessage {
-  type: 'ping';
-}
-
-type ClientMessage =
-  | HandshakeMessage
-  | GetChangesMessage
-  | ApplyChangesMessage
-  | GetSnapshotMessage
-  | ResumeSnapshotMessage
-  | PingMessage;
+// The ClientMessage union and its per-message interfaces are the shared wire
+// definitions from @quereus/sync (`sync/wire.ts`), the single source of truth
+// this coordinator and the sync client both speak.
 
 // ============================================================================
 // WebSocket Handler
@@ -146,6 +108,24 @@ export function registerWebSocket(
 
     // Handler functions
     async function handleHandshake(msg: HandshakeMessage) {
+      // Wire-version gate — checked FIRST, before the session guard and before
+      // authenticating, so a peer on an incompatible protocol is rejected
+      // without touching the store. Strict integer equality; an absent version
+      // (a pre-versioning client) counts as a mismatch — that drift is exactly
+      // what this guards against, so it is not silently accepted.
+      if (msg.protocolVersion !== PROTOCOL_VERSION) {
+        const clientPart = msg.protocolVersion === undefined
+          ? 'client sent none (pre-versioning client)'
+          : `client speaks v${msg.protocolVersion}`;
+        sendError(
+          'PROTOCOL_VERSION_MISMATCH',
+          `Sync protocol version mismatch: server speaks v${PROTOCOL_VERSION}, ${clientPart}`,
+          true,
+        );
+        socket.close(4003, 'Protocol version mismatch');
+        return;
+      }
+
       if (session) {
         sendError('ALREADY_AUTHENTICATED', 'Already authenticated', true);
         return;
@@ -185,6 +165,8 @@ export function registerWebSocket(
           databaseId: msg.databaseId,
           serverSiteId: siteIdToBase64(serverSiteId),
           connectionId: session.connectionId,
+          // Echo the version so the client can run the same check in reverse.
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         wsLog('Handshake complete: %s (db: %s)', session.connectionId.slice(0, 8), msg.databaseId);

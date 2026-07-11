@@ -17,6 +17,7 @@ import {
   type ApplyResult,
   type SnapshotChunk,
   type SnapshotCheckpoint,
+  type SerializedChangeSet,
   siteIdFromBase64,
   siteIdEquals,
   siteIdToBase64,
@@ -747,7 +748,7 @@ export class CoordinatorService {
 
       for (const key of batchKeys) {
         const batch = await this.s3BatchStore.downloadBatch(key);
-        const changes = (batch.changes as unknown[]).map(c => deserializeChangeSet(c));
+        const changes = (batch.changes as SerializedChangeSet[]).map(c => deserializeChangeSet(c));
         await syncManager.applyChanges(changes);
       }
 

@@ -206,15 +206,24 @@ WebSocket connections provide real-time bidirectional sync.
 ### Connection Handshake
 
 1. Client connects to `/sync/ws`
-2. Client sends `{ type: "handshake", siteId: "...", token?: "..." }`
-3. Server authenticates and responds `{ type: "handshake_ack", serverSiteId: "..." }`
+2. Client sends `{ type: "handshake", siteId: "...", token?: "...", protocolVersion: <int> }`
+3. Server checks `protocolVersion` **before authenticating**. If it is absent or
+   not equal to the server's `PROTOCOL_VERSION`, the server replies
+   `{ type: "error", code: "PROTOCOL_VERSION_MISMATCH", fatal: true }` and closes
+   the socket with code `4003` — the store is never touched. Otherwise it
+   authenticates and responds
+   `{ type: "handshake_ack", serverSiteId: "...", protocolVersion: <int> }`.
 4. Connection is established; client is added to session registry
+
+The version check is **strict integer equality**: a peer that predates versioning
+(sends no `protocolVersion`) is treated as incompatible, not silently accepted.
+See [`sync.md` § Protocol version](sync.md) for the rationale.
 
 ### Message Types
 
 **Client → Server:**
 ```typescript
-| { type: "handshake"; siteId: string; token?: string }
+| { type: "handshake"; siteId: string; token?: string; protocolVersion: number }
 | { type: "get_changes"; sinceHLC?: HLC }
 | { type: "apply_changes"; changes: ChangeSet[] }
 | { type: "get_snapshot" }
@@ -224,13 +233,13 @@ WebSocket connections provide real-time bidirectional sync.
 
 **Server → Client:**
 ```typescript
-| { type: "handshake_ack"; serverSiteId: string }
+| { type: "handshake_ack"; serverSiteId: string; protocolVersion: number }
 | { type: "changes"; changeSets: ChangeSet[] }
 | { type: "apply_result"; result: ApplyResult }
 | { type: "snapshot_chunk"; chunk: SnapshotChunk }
 | { type: "snapshot_complete" }                        // Signals successful end of snapshot stream
 | { type: "push_changes"; changeSets: ChangeSet[] }   // Server pushes new changes
-| { type: "error"; code: string; message: string }
+| { type: "error"; code: string; message: string; fatal?: boolean }
 | { type: "pong" }
 ```
 

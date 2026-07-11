@@ -12,10 +12,12 @@ export {
   configLog,
 } from './logger.js';
 
+// Wire codec now lives in @quereus/sync (single source of truth shared with the
+// client). Re-exported here so callers keep importing it via ../common/index.js.
 export {
   serializeChangeSet,
   deserializeChangeSet,
   serializeSnapshotChunk,
   deserializeSnapshotChunk,
-} from './serialization.js';
+} from '@quereus/sync';
 

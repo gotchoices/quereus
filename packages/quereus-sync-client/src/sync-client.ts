@@ -14,27 +14,24 @@ import {
   siteIdFromBase64,
   maxHLC,
   compareHLC,
+  serializeChangeSet,
+  deserializeChangeSet,
+  serializeHLCForTransport,
+  deserializeHLCFromTransport,
+  PROTOCOL_VERSION,
   type SyncManager,
   type SyncEventEmitter,
   type HLC,
   type SiteId,
+  type ClientMessage,
+  type SerializedChangeSet,
 } from '@quereus/sync';
 
 import type {
   SyncClientOptions,
   SyncStatus,
   SyncEvent,
-  ClientMessage,
-  ServerMessage,
-  SerializedChangeSet,
 } from './types.js';
-
-import {
-  serializeChangeSet,
-  deserializeChangeSet,
-  serializeHLCForTransport,
-  deserializeHLCFromTransport,
-} from './serialization.js';
 
 // Default configuration values
 const DEFAULT_RECONNECT_DELAY_MS = 1000;
@@ -366,7 +363,36 @@ export class SyncClient {
     // off status === 'error').
   }
 
-  private async handleHandshakeAck(message: { serverSiteId?: string; connectionId?: string }): Promise<void> {
+  private async handleHandshakeAck(
+    message: { serverSiteId?: string; connectionId?: string; protocolVersion?: number }
+  ): Promise<void> {
+    // Wire-version gate. A coordinator on a different protocol version — or one
+    // predating versioning, so the ack carries none — would silently
+    // misinterpret us. Treat any mismatch (strict equality; absent counts as
+    // mismatch) as fatal: stop reconnecting, surface a lasting error, and reject
+    // the pending connect(). Reuses the same stop-reconnect path as a fatal
+    // server error, so auto-reconnect does not resume.
+    if (message.protocolVersion !== PROTOCOL_VERSION) {
+      const serverPart = message.protocolVersion === undefined
+        ? 'server sent none (pre-versioning coordinator)'
+        : `server speaks v${message.protocolVersion}`;
+      const errMsg = `Sync protocol version mismatch: client speaks v${PROTOCOL_VERSION}, ${serverPart}`;
+      this.stopReconnect = true;
+      this.setStatus({ status: 'error', message: errMsg });
+      this.emitSyncEvent('error', errMsg);
+      this.options.onError?.(new Error(errMsg));
+      this.settleConnect(new Error(errMsg));
+      // Drop the incompatible socket. Detach first so its deferred onclose can't
+      // fire back into the client (scheduleReconnect is already guarded by
+      // stopReconnect, but we don't want the disconnected-status churn either).
+      if (this.ws) {
+        this.detachSocketHandlers(this.ws);
+        this.ws.close();
+        this.ws = null;
+      }
+      return;
+    }
+
     if (message.serverSiteId) {
       this.serverSiteId = siteIdFromBase64(message.serverSiteId);
     }
@@ -528,6 +554,9 @@ export class SyncClient {
       databaseId,
       siteId: siteIdToBase64(siteId),
       token,
+      // Stamp the wire version so the coordinator can reject a drifted client
+      // before authenticating. See handleHandshakeAck for the reverse check.
+      protocolVersion: PROTOCOL_VERSION,
     });
   }
 

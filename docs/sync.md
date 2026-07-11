@@ -879,9 +879,9 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 │                                                                            │
 │  CLIENT                                            SERVER                  │
 │    │                                                  │                    │
-│    │──────── { type: "handshake", siteId, token? } ──►│                    │
+│    │─── { type: "handshake", siteId, token?, protocolVersion } ──►│        │
 │    │                                                  │                    │
-│    │◄─────── { type: "handshake_ack", serverSiteId } ─│                    │
+│    │◄── { type: "handshake_ack", serverSiteId, protocolVersion } ─│        │
 │    │                                                  │                    │
 │    │──────── { type: "get_changes", sinceHLC? } ─────►│                    │
 │    │                                                  │                    │
@@ -905,7 +905,7 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 
 | Type | Purpose | Payload |
 |------|---------|---------|
-| `handshake` | Authenticate and establish session | `{ siteId, token? }` |
+| `handshake` | Authenticate and establish session | `{ siteId, token?, protocolVersion }` |
 | `get_changes` | Request changes since an HLC | `{ sinceHLC? }` (base64) |
 | `apply_changes` | Push local changes to server | `{ changes: ChangeSet[], requestId? }` |
 | `get_snapshot` | Request full snapshot | (none) |
@@ -915,7 +915,7 @@ The WebSocket protocol provides real-time bidirectional synchronization. This is
 
 | Type | Purpose | Payload |
 |------|---------|---------|
-| `handshake_ack` | Confirm authentication | `{ serverSiteId, connectionId }` |
+| `handshake_ack` | Confirm authentication | `{ serverSiteId, connectionId, protocolVersion }` |
 | `changes` | Ordered response to `get_changes` (gap-free; **advances** received watermark) | `{ changeSets: ChangeSet[] }` |
 | `push_changes` | Fire-and-forget broadcast from another client (applied, but **never** advances the received watermark) | `{ changeSets: ChangeSet[] }` |
 | `apply_result` | Confirm changes applied | `{ requestId?, applied, skipped, conflicts }` |
@@ -933,6 +933,30 @@ redelivered across a reconnect) inert, rather than crediting the wrong batch and
 mis-advancing the watermark. Pushes with no watermark to promote (a peer-relay
 `apply_changes`) omit the id; the server then echoes none, and the client leaves
 its watermark untouched.
+
+#### Protocol version
+
+The `handshake` and `handshake_ack` both carry `protocolVersion` — the integer
+`PROTOCOL_VERSION` exported from `@quereus/sync` (`sync/wire.ts`), the single wire
+definition the client and coordinator share. The check is **strict integer
+equality**, run at connect time:
+
+- The coordinator reads the client's `protocolVersion` **before authenticating**.
+  If it is absent or `!== PROTOCOL_VERSION`, it replies
+  `{ type: "error", code: "PROTOCOL_VERSION_MISMATCH", fatal: true }` and closes
+  the socket (code `4003`) without touching the store.
+- The coordinator echoes its own `protocolVersion` in `handshake_ack`. The client
+  checks it in `handleHandshakeAck`; on mismatch (or absence — an old
+  coordinator) it sets a lasting `error` status and stops reconnecting, the same
+  fatal path a `fatal: true` server error takes.
+
+A peer that predates versioning sends no `protocolVersion`; that is treated as a
+mismatch, not silently accepted — silent drift is exactly what this guards
+against. Because all sync packages are lockstep-versioned in this monorepo,
+`PROTOCOL_VERSION` is bumped on any breaking change to a message shape or the
+codec, and there is no min/max range negotiation. If rolling upgrades across
+mixed versions ever become a real requirement, `PROTOCOL_VERSION`'s doc comment
+in `wire.ts` describes the range-negotiation upgrade path.
 
 #### Connection Lifecycle
 

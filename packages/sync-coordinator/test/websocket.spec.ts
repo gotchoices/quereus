@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import WebSocket from 'ws';
+import { PROTOCOL_VERSION } from '@quereus/sync';
 import { createCoordinatorServer, loadConfig, type CoordinatorServer } from '../src/index.js';
 
 // Test database ID in <org_id>:<type>_<id> format
@@ -82,12 +83,53 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
-        }) as { type: string; databaseId: string; serverSiteId: string; connectionId: string };
+          protocolVersion: PROTOCOL_VERSION,
+        }) as { type: string; databaseId: string; serverSiteId: string; connectionId: string; protocolVersion: number };
 
         expect(response.type).to.equal('handshake_ack');
         expect(response.databaseId).to.equal(TEST_DATABASE_ID);
         expect(response.serverSiteId).to.be.a('string');
         expect(response.connectionId).to.be.a('string');
+        // The ack echoes the server's wire version for the client's reverse check.
+        expect(response.protocolVersion).to.equal(PROTOCOL_VERSION);
+      } finally {
+        ws.close();
+      }
+    });
+
+    it('should reject a handshake whose protocolVersion mismatches (fatal, closes socket)', async () => {
+      const ws = await connectWs();
+      try {
+        const closed = new Promise<number>((resolve) => ws.on('close', (code) => resolve(code)));
+        const response = await sendAndReceive(ws, {
+          type: 'handshake',
+          databaseId: TEST_DATABASE_ID,
+          siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION + 1,
+        }) as { type: string; code: string; fatal: boolean };
+
+        expect(response.type).to.equal('error');
+        expect(response.code).to.equal('PROTOCOL_VERSION_MISMATCH');
+        expect(response.fatal).to.be.true;
+        // The coordinator also closes the socket on a version mismatch.
+        expect(await closed).to.equal(4003);
+      } finally {
+        ws.close();
+      }
+    });
+
+    it('should reject a handshake with no protocolVersion (pre-versioning client)', async () => {
+      const ws = await connectWs();
+      try {
+        const response = await sendAndReceive(ws, {
+          type: 'handshake',
+          databaseId: TEST_DATABASE_ID,
+          siteId: TEST_SITE_ID_1,
+        }) as { type: string; code: string; fatal: boolean };
+
+        expect(response.type).to.equal('error');
+        expect(response.code).to.equal('PROTOCOL_VERSION_MISMATCH');
+        expect(response.fatal).to.be.true;
       } finally {
         ws.close();
       }
@@ -99,6 +141,7 @@ describe('WebSocket Handler', () => {
         const response = await sendAndReceive(ws, {
           type: 'handshake',
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         }) as { type: string; code: string; fatal: boolean };
 
         expect(response.type).to.equal('error');
@@ -115,6 +158,7 @@ describe('WebSocket Handler', () => {
         const response = await sendAndReceive(ws, {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
+          protocolVersion: PROTOCOL_VERSION,
         }) as { type: string; code: string; fatal: boolean };
 
         expect(response.type).to.equal('error');
@@ -135,6 +179,7 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         const response = await sendAndReceive(ws, {
@@ -170,6 +215,7 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         const response = await sendAndReceive(ws, {
@@ -193,6 +239,7 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         // Second handshake on same connection
@@ -200,6 +247,7 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         }) as { type: string; code: string; fatal: boolean };
 
         expect(response.type).to.equal('error');
@@ -220,6 +268,7 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         const response = await sendAndReceive(ws, {
@@ -259,6 +308,7 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         const response = await sendAndReceive(ws, {
@@ -296,6 +346,7 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         // Collect all snapshot messages until snapshot_complete
@@ -362,11 +413,13 @@ describe('WebSocket Handler', () => {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_1,
+          protocolVersion: PROTOCOL_VERSION,
         });
         await sendAndReceive(ws2, {
           type: 'handshake',
           databaseId: TEST_DATABASE_ID,
           siteId: TEST_SITE_ID_2,
+          protocolVersion: PROTOCOL_VERSION,
         });
 
         // Check status

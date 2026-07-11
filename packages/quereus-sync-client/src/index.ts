@@ -27,17 +27,17 @@
  */
 
 export { SyncClient } from './sync-client.js';
+
+// The wire codec and message/Serialized types now live in @quereus/sync (the
+// single source of truth shared with the coordinator). Re-export them here so the
+// client's public API is unchanged for existing consumers.
 export {
   serializeChangeSet,
   deserializeChangeSet,
   serializeHLCForTransport,
   deserializeHLCFromTransport,
-} from './serialization.js';
+} from '@quereus/sync';
 export type {
-  SyncStatus,
-  SyncEvent,
-  SyncEventType,
-  SyncClientOptions,
   SerializedChangeSet,
   SerializedChange,
   SerializedSchemaMigration,
@@ -55,5 +55,13 @@ export type {
   PingMessage,
   PongMessage,
   ErrorMessage,
+} from '@quereus/sync';
+
+// Client-only types (not part of the wire) stay local.
+export type {
+  SyncStatus,
+  SyncEvent,
+  SyncEventType,
+  SyncClientOptions,
 } from './types.js';
 

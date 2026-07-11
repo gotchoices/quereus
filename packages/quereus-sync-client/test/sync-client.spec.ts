@@ -1,10 +1,13 @@
 import { expect } from 'chai';
 import { SyncClient } from '../src/sync-client.js';
-import type { SyncStatus, SyncEvent, ClientMessage } from '../src/types.js';
+import type { SyncStatus, SyncEvent } from '../src/types.js';
 import {
   generateSiteId,
   siteIdToBase64,
   SyncEventEmitterImpl,
+  serializeChangeSet,
+  serializeHLCForTransport,
+  PROTOCOL_VERSION,
   type SyncManager,
   type HLC,
   type ChangeSet,
@@ -15,9 +18,9 @@ import {
   type SnapshotProgress,
   type SiteId,
   type BasisTableLifecycleRecord,
+  type ClientMessage,
 } from '@quereus/sync';
 import type { Database, LensDeploymentSnapshot } from '@quereus/quereus';
-import { serializeChangeSet, serializeHLCForTransport } from '../src/serialization.js';
 
 // ============================================================================
 // Mock WebSocket
@@ -259,6 +262,7 @@ function simulateHandshakeAck(ws: MockWebSocket): void {
     type: 'handshake_ack',
     serverSiteId: siteIdToBase64(generateSiteId()),
     connectionId: 'conn-123',
+    protocolVersion: PROTOCOL_VERSION,
   });
 }
 
@@ -277,6 +281,7 @@ async function connectAndHandshake(
     type: 'handshake_ack',
     serverSiteId: siteIdToBase64(sId),
     connectionId: 'conn-123',
+    protocolVersion: PROTOCOL_VERSION,
   });
 
   await connectPromise;
@@ -368,6 +373,8 @@ describe('SyncClient', () => {
       expect(handshake).to.exist;
       expect(handshake!.databaseId).to.equal('test-db');
       expect(handshake!.siteId).to.equal(siteIdToBase64(syncManager.getSiteId()));
+      // The client stamps its wire version so the coordinator can gate on it.
+      expect((handshake as { protocolVersion?: number }).protocolVersion).to.equal(PROTOCOL_VERSION);
     });
 
     it('should include token in URL when provided', async () => {
@@ -885,6 +892,78 @@ describe('SyncClient', () => {
       const instanceCount = MockWebSocket.instances.length;
       // Fire the dead socket's onclose — it must be detached and a no-op.
       ws1.simulateClose();
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.equal(instanceCount);
+    });
+  });
+
+  // ==========================================================================
+  // Protocol version handshake
+  // ==========================================================================
+
+  describe('protocol version handshake', () => {
+    it('proceeds normally when the ack version matches', async () => {
+      const { client } = createClient({ syncManager: new MockSyncManager() });
+      const ws = await connectAndHandshake(client);
+
+      expect(client.isConnected).to.be.true;
+      expect((client as any).stopReconnect).to.be.false;
+      // Reached the post-ack flow (requested changes from the server).
+      const getChanges = ws.getSentMessages().find(m => m.type === 'get_changes');
+      expect(getChanges).to.exist;
+    });
+
+    it('rejects a handshake_ack whose protocolVersion mismatches (fatal, no reconnect)', async () => {
+      const { client, errors } = createClient({ autoReconnect: true });
+      const connectPromise = client.connect('ws://localhost:8080/sync', 'test-db');
+      const ws = MockWebSocket.lastInstance!;
+      ws.simulateOpen();
+      ws.simulateMessage({
+        type: 'handshake_ack',
+        serverSiteId: siteIdToBase64(generateSiteId()),
+        connectionId: 'conn-123',
+        protocolVersion: PROTOCOL_VERSION + 1,
+      });
+
+      // connect() rejects with a version-mismatch error.
+      let rejected: Error | null = null;
+      try { await connectPromise; } catch (e) { rejected = e as Error; }
+      expect(rejected, 'connect() should reject on version mismatch').to.not.be.null;
+      expect(rejected!.message).to.match(/protocol version mismatch/i);
+
+      // Fatal: lasting error status + stop-reconnect, but NOT a manual disconnect.
+      expect(client.status.status).to.equal('error');
+      expect((client as any).stopReconnect).to.be.true;
+      expect((client as any).intentionalDisconnect).to.be.false;
+      expect(errors.some(e => /protocol version mismatch/i.test(e.message))).to.be.true;
+
+      // Auto-reconnect must not resume, even after the socket closes.
+      const instanceCount = MockWebSocket.instances.length;
+      ws.simulateClose();
+      await new Promise(r => setTimeout(r, 200));
+      expect(MockWebSocket.instances.length).to.equal(instanceCount);
+    });
+
+    it('rejects a handshake_ack with no protocolVersion (pre-versioning coordinator)', async () => {
+      const { client } = createClient({ autoReconnect: true });
+      const connectPromise = client.connect('ws://localhost:8080/sync', 'test-db');
+      const ws = MockWebSocket.lastInstance!;
+      ws.simulateOpen();
+      // Old coordinator: the ack carries no protocolVersion at all.
+      ws.simulateMessage({
+        type: 'handshake_ack',
+        serverSiteId: siteIdToBase64(generateSiteId()),
+        connectionId: 'conn-123',
+      });
+
+      let rejected: Error | null = null;
+      try { await connectPromise; } catch (e) { rejected = e as Error; }
+      expect(rejected, 'connect() should reject when the ack has no version').to.not.be.null;
+      expect((client as any).stopReconnect).to.be.true;
+      expect(client.status.status).to.equal('error');
+
+      const instanceCount = MockWebSocket.instances.length;
+      ws.simulateClose();
       await new Promise(r => setTimeout(r, 200));
       expect(MockWebSocket.instances.length).to.equal(instanceCount);
     });
