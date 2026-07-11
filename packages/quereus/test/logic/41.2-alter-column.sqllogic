@@ -129,3 +129,23 @@ select count(*) as n from t_backfill where v is null;
 → [{"n": 0}]
 
 drop table t_backfill;
+
+-- ===================================
+-- 9. SET DATA TYPE conversion failure leaves ALL rows untouched
+-- (a row that converts must NOT be rewritten if a LATER row fails to
+-- convert — the ALTER is all-or-nothing, not partial)
+-- ===================================
+
+create table t_partial (id integer primary key, v text);
+insert into t_partial values (1, '10'), (2, 'abc');
+-- run
+
+alter table t_partial alter column v set data type integer;
+-- error: Cannot convert value
+
+-- Row 1 ('10') converted fine but row 2 ('abc') failed; neither may be
+-- rewritten. Both stay as their original text values under the unchanged type.
+select id, v, typeof(v) from t_partial order by id;
+→ [{"id": 1, "v": "10", "typeof(v)": "text"}, {"id": 2, "v": "abc", "typeof(v)": "text"}]
+
+drop table t_partial;

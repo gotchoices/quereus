@@ -2097,14 +2097,15 @@ export class MemoryTableManager {
 				if (newLogicalType.physicalType === oldCol.logicalType.physicalType) {
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				} else {
-					// Physical conversion required. Iterate rows and convert.
+					// Physical conversion required. Convert EVERY row up front — a conversion
+					// failure must throw before any row is written, or a partial rewrite would
+					// survive the catch below (which only restores the primary tree on the
+					// collation-rekey path, not here) and leave rows physically converted under
+					// the reverted old-type schema.
 					const tree = this.baseLayer.primaryTree;
-					const toConvert: Array<{ path: ReturnType<typeof tree.first>, row: Row }> = [];
+					const convertedRows: Row[] = [];
 					for (const path of tree.ascending(tree.first())) {
 						const row = tree.at(path)!;
-						toConvert.push({ path, row });
-					}
-					for (const { row } of toConvert) {
 						const oldVal = row[colIndex];
 						if (oldVal === null) continue;
 						let newVal: SqlValue;
@@ -2116,11 +2117,14 @@ export class MemoryTableManager {
 								StatusCode.MISMATCH,
 							);
 						}
-						const newRow: Row = row.map((v, i) => i === colIndex ? newVal : v) as Row;
-						// `insert` no-ops on an existing key; `upsert` overwrites the entry in place.
-						tree.upsert(newRow);
-						valuesRewritten = true;
+						convertedRows.push(row.map((v, i) => i === colIndex ? newVal : v) as Row);
 					}
+					// All conversions succeeded — now mutate. `insert` no-ops on an existing key;
+					// `upsert` overwrites the entry in place (same PK, new value).
+					for (const newRow of convertedRows) {
+						tree.upsert(newRow);
+					}
+					if (convertedRows.length > 0) valuesRewritten = true;
 					newCol = { ...oldCol, logicalType: newLogicalType };
 				}
 			} else if (change.setDefault !== undefined) {
@@ -2195,6 +2199,9 @@ export class MemoryTableManager {
 				// SET DATA TYPE conversion / SET NOT NULL backfill wrote new column values in
 				// place, so any secondary index on this column still holds keys extracted from
 				// the OLD values until rebuilt.
+				// NOTE: rebuilds EVERY secondary index, not only those covering the altered
+				// column; if a wide-index table ever shows this as slow, filter to indexes whose
+				// columns include colIndex. Mirrors the collationChanged path's unconditional rebuild.
 				this.baseLayer.rebuildAllSecondaryIndexes();
 			}
 
