@@ -110,8 +110,43 @@ export type LensDeploymentListener = (
 export interface StoreModuleConfig extends BaseModuleConfig {
 	/** Collation for text keys. Default: 'NOCASE'. */
 	collation?: 'BINARY' | 'NOCASE';
+	/**
+	 * Serialized-byte budget for a single index-build write batch (see
+	 * {@link StoreModule.buildIndexEntries}). Set from the `max_batch_bytes`
+	 * module arg; a missing / non-positive value falls back to
+	 * {@link DEFAULT_MAX_BATCH_BYTES}. Module-wide, not per-index.
+	 */
+	maxBatchBytes?: number;
 	/** Additional platform-specific options. */
 	[key: string]: unknown;
+}
+
+/**
+ * Default serialized-byte budget for a single index-build write batch. Bounds
+ * heap directly: {@link StoreModule.buildIndexEntries} flushes and starts a fresh
+ * batch whenever the accumulated key bytes cross this, so a table larger than
+ * memory never buffers its whole index in one batch. A byte budget (rather than a
+ * fixed entry count) is used because index entries vary in size, so bytes bound
+ * memory more tightly. 8 MiB trades a modest number of extra flushes against peak
+ * memory; override per store with `using store (max_batch_bytes = …)`.
+ */
+const DEFAULT_MAX_BATCH_BYTES = 8 * 1024 * 1024; // 8 MiB
+
+/**
+ * Resolve the index-build batch byte budget from a `max_batch_bytes` module arg.
+ * A missing, non-numeric, or non-positive value falls back to
+ * {@link DEFAULT_MAX_BATCH_BYTES} — a zero or negative budget must NEVER disable
+ * flushing, which would restore the unbounded single-batch behavior this guards
+ * against.
+ */
+function resolveMaxBatchBytes(raw: SqlValue | undefined): number {
+	let n: number;
+	if (typeof raw === 'number') n = raw;
+	else if (typeof raw === 'bigint') n = Number(raw);
+	else if (typeof raw === 'string' && raw.trim() !== '') n = Number(raw);
+	else return DEFAULT_MAX_BATCH_BYTES;
+	if (!Number.isFinite(n) || n <= 0) return DEFAULT_MAX_BATCH_BYTES;
+	return Math.floor(n);
 }
 
 /**
@@ -612,6 +647,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// Convert options to Record<string, SqlValue> for vtabArgs
 		const vtabArgs: Record<string, SqlValue> = {};
 		if (options?.collation !== undefined) vtabArgs.collation = options.collation;
+		if (options?.maxBatchBytes !== undefined) vtabArgs.max_batch_bytes = options.maxBatchBytes;
 
 		// Resolve the table schema:
 		// 1. Use importedTableSchema if provided (from catalog import or runtime)
@@ -878,15 +914,41 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		// silently ACCEPTED. Entries written here for rows that a subsequent ROLLBACK
 		// discards are harmless: both readers resolve each entry to its live row and
 		// drop it when the row is gone or no longer matches (see `scanIndex`).
-		await this.buildIndexEntries(
-			table.iterateEffectiveEntries(buildFullScanBounds()),
-			indexStore,
-			tableSchema,
-			indexSchema,
-			keyCollation,
-			db.getKeyNormalizerResolver(),
-			rows !== undefined,
-		);
+		//
+		// The store is FRESHLY created above, so any build failure — a UNIQUE violation,
+		// an IO error, or a mid-stream flush failure now that the build is chunked — must
+		// tear the whole store down. Nothing else reclaims it: SchemaManager.createIndex
+		// wraps the error but does no teardown, so without this a rejected build leaks a
+		// partial/empty index-store directory. Mirrors dropIndex's teardown.
+		try {
+			await this.buildIndexEntries(
+				table.iterateEffectiveEntries(buildFullScanBounds()),
+				indexStore,
+				tableSchema,
+				indexSchema,
+				keyCollation,
+				db.getKeyNormalizerResolver(),
+				rows !== undefined,
+				table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES,
+			);
+		} catch (buildError) {
+			// Best-effort teardown: guard it against its own throw so a teardown failure
+			// never masks the original build error the caller must see.
+			try {
+				await table.releaseIndexStore(indexSchema.name);
+				if (this.provider.deleteIndexStore) {
+					await this.provider.deleteIndexStore(schemaName, tableName, indexSchema.name);
+				} else {
+					await this.provider.closeIndexStore(schemaName, tableName, indexSchema.name);
+				}
+			} catch (teardownError) {
+				console.warn(
+					`[StoreModule] failed to tear down index store '${indexSchema.name}' on `
+						+ `table '${schemaName}.${tableName}' after a failed CREATE INDEX: ${String(teardownError)}`,
+				);
+			}
+			throw buildError;
+		}
 
 		// Refresh the connected table's cached schema so subsequent DML
 		// maintains the new index (the engine's schema registry is updated
@@ -1027,6 +1089,7 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		keyCollation: string,
 		normalizers: KeyNormalizerResolver,
 		skipDuplicateCheck = false,
+		maxBatchBytes: number = DEFAULT_MAX_BATCH_BYTES,
 	): Promise<void> {
 		// Index COLUMN values use the table-level key collation K; the PK SUFFIX uses
 		// each PK column's own key collation, so the suffix bytes match the data-store
@@ -1039,6 +1102,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 		const predicate: CompiledPredicate | undefined = indexSchema.predicate
 			? compilePredicate(indexSchema.predicate, tableSchema.columns, tableSchema.name)
 			: undefined;
+		// NOTE: `seen` holds one signature per DISTINCT indexed key for the WHOLE build and
+		// is NOT bounded by the maxBatchBytes chunking below (that bounds only the write
+		// batch). A very large UNIQUE index still spikes memory on this set. Bounding it
+		// needs a sort- or store-probe-based dedup (a separate design), not a batch knob.
 		const seen: Set<string> | undefined = (indexSchema.unique && !skipDuplicateCheck) ? new Set() : undefined;
 
 		const indexColIndices = indexSchema.columns.map(col => col.index);
@@ -1046,7 +1113,10 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			? indexDedupeNormalizers(tableSchema, indexSchema, normalizers)
 			: undefined;
 
-		const batch = indexStore.batch();
+		let batch = indexStore.batch();
+		// Serialized key bytes accumulated in the CURRENT batch. Flushed and reset once it
+		// crosses maxBatchBytes so a table larger than memory never buffers its whole index.
+		let batchBytes = 0;
 
 		for await (const entry of dataEntries) {
 			const row = deserializeRow(entry.value);
@@ -1094,8 +1164,24 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			// byte-matches the data store's key for this row.
 			const dataKey = buildDataKey(pkValues, encodeOptions, pkDirections, pkCollations);
 			batch.put(indexKey, dataKey);
+
+			// Bound heap: once the accumulated serialized key bytes cross the budget, flush
+			// the batch and start a fresh one. Both callers ITERATE the data store and WRITE
+			// the index store — different stores — so a mid-stream flush never mutates the
+			// stream being read, and this is safe on every provider. A mid-stream flush
+			// failure in `createIndex` is torn down by its try/catch (the whole fresh index
+			// store is deleted); in `rebuildSecondaryIndexes` it leaves a partial-but-
+			// recoverable index (re-run the rebuild — clear + rebuild is idempotent).
+			batchBytes += indexKey.length + dataKey.length;
+			if (batchBytes >= maxBatchBytes) {
+				await batch.write();
+				batch = indexStore.batch();
+				batchBytes = 0;
+			}
 		}
 
+		// Final flush of the residual. May be empty (an empty table, or a build whose last
+		// row exactly hit the budget and flushed) — providers accept an empty write.
 		await batch.write();
 	}
 
@@ -1124,8 +1210,16 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	): Promise<void> {
 		const keyCollation = (table.getConfig().collation || 'NOCASE').toUpperCase();
 		const dataStore = await this.getStore(schemaName, tableName, table.getConfig());
+		const maxBatchBytes = table.getConfig().maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES;
 		for (const indexSchema of schema.indexes ?? []) {
 			const indexStore = await this.getIndexStore(schemaName, tableName, indexSchema.name);
+			// NOTE: this clear pass buffers EVERY existing index key into one batch. It holds
+			// only KEYS (no values), so its peak is far below the value-bearing build pass and
+			// is left unbounded for now. Chunking it is harder than the build: it deletes from
+			// the SAME store it iterates, so a mid-iteration flush risks iterate-while-mutate
+			// semantics that differ per provider (LevelDB snapshots its iterator; IndexedDB may
+			// not). If the index key set ever dominates memory, chunk this with a snapshot-safe
+			// re-seek, not a naive mid-iteration flush.
 			const clearBatch = indexStore.batch();
 			for await (const entry of indexStore.iterate(buildFullScanBounds())) {
 				clearBatch.delete(entry.key);
@@ -1138,6 +1232,8 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 				indexSchema,
 				keyCollation,
 				normalizers,
+				false,
+				maxBatchBytes,
 			);
 		}
 	}
@@ -3203,6 +3299,9 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 	private parseConfig(args: Record<string, SqlValue> | undefined): StoreModuleConfig {
 		return {
 			collation: (args?.collation as 'BINARY' | 'NOCASE') || 'NOCASE',
+			// Index-build batch budget; malformed / non-positive clamps to the default
+			// so a bad arg can never disable the bounded-memory flush (see resolveMaxBatchBytes).
+			maxBatchBytes: resolveMaxBatchBytes(args?.max_batch_bytes),
 		};
 	}
 

@@ -260,6 +260,12 @@ const INDEX_UNUSABLE = Symbol('store.uniqueIndexUnusable');
 export interface StoreTableConfig {
 	/** Collation for text keys. Default: 'NOCASE'. */
 	collation?: 'BINARY' | 'NOCASE';
+	/**
+	 * Serialized-byte budget for a single index-build write batch (see
+	 * `StoreModule.buildIndexEntries`). Parsed from the `max_batch_bytes` module
+	 * arg; undefined falls back to the module default.
+	 */
+	maxBatchBytes?: number;
 	/** Additional platform-specific options. */
 	[key: string]: unknown;
 }
