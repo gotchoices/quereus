@@ -498,7 +498,7 @@ function rejectLensSetLevelConflictResolution(ctx: PlanningContext, view: Mutabl
 }
 
 /**
- * Build the set-operation write substrate (docs/vu-operators.md § Set Operations) —
+ * Build the set-operation write substrate (docs/vu-setops.md § Set-operation membership writes) —
  * the shared core for BOTH set-op view writabilities, parameterized by `writeFn`: the
  * `exists`-membership decomposition ({@link buildSetOpWrite}) or the flag-less
  * predicate-honest one ({@link buildFlaglessSetOpWrite}).
