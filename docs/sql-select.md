@@ -117,7 +117,7 @@ select_expr:
 - `order by`: Sorts the result set
 - `limit/offset`: Restricts the number of rows returned
 - `union`/`intersect`/`except`/`diff`: Set operations combining two result sets
-- `with schema`: Specifies an ordered search path for resolving unqualified table names (see section 2.1.1)
+- `with schema`: Specifies an ordered search path for resolving unqualified table names (see [§2.1.1 Schema Search Path](#211-schema-search-path-with-schema))
 - `with defaults`: Trailing clause binding the whole query expression; declares per-column omitted-insert defaults for updatable-view write-through (see [Insert defaults](#insert-defaults-with-defaults) below)
 
 **Set operations:**

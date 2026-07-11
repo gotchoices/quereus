@@ -36,8 +36,8 @@ assignment:
 - `values`: A list of value sets to insert
 - `select_statement`: A select query whose results are inserted
 - `upsert_clause`: Specifies how to handle conflicts with fine-grained control (see UPSERT below)
-- `with context`: Provides table-level parameters for defaults and constraints (see section 2.6.2)
-- `with schema`: Specifies schema search path for resolving table names (see section 2.1.1)
+- `with context`: Provides table-level parameters for defaults and constraints (see [§2.6.2 Mutation Context](sql-ddl.md#262-mutation-context-table-level-parameters))
+- `with schema`: Specifies schema search path for resolving table names (see [§2.1.1 Schema Search Path](sql-select.md#211-schema-search-path-with-schema))
 - `returning`: Returns specified expressions from the inserted rows. `*` (or `table.*`) expands to every table column in declaration order, projecting the NEW (inserted) image; named expressions support the NEW qualifier
 
 ### Conflict Resolution (OR clause)
@@ -228,8 +228,8 @@ The update statement modifies existing rows in a table. The target may also be a
 - `table_name`: Table to be updated
 - `set`: Column assignments with new values
 - `where`: Optional condition to specify which rows to update
-- `with context`: Provides table-level parameters for defaults and constraints (see section 2.6.2)
-- `with schema`: Specifies schema search path for resolving table names (see section 2.1.1)
+- `with context`: Provides table-level parameters for defaults and constraints (see [§2.6.2 Mutation Context](sql-ddl.md#262-mutation-context-table-level-parameters))
+- `with schema`: Specifies schema search path for resolving table names (see [§2.1.1 Schema Search Path](sql-select.md#211-schema-search-path-with-schema))
 - `returning`: Returns specified expressions from the updated rows. `*` (or `table.*`) expands to every table column in declaration order, projecting the NEW (updated) image by default; named expressions support the OLD and NEW qualifiers
 
 **Examples:**
@@ -308,8 +308,8 @@ delete from table_name
 - `with clause`: Common Table Expressions for use in the delete
 - `table_name`: Table to delete from
 - `where`: Optional condition to specify which rows to delete
-- `with context`: Provides table-level parameters for defaults and constraints (see section 2.6.2)
-- `with schema`: Specifies schema search path for resolving table names (see section 2.1.1)
+- `with context`: Provides table-level parameters for defaults and constraints (see [§2.6.2 Mutation Context](sql-ddl.md#262-mutation-context-table-level-parameters))
+- `with schema`: Specifies schema search path for resolving table names (see [§2.1.1 Schema Search Path](sql-select.md#211-schema-search-path-with-schema))
 - `returning`: Returns specified expressions from the deleted rows. `*` (or `table.*`) expands to every table column in declaration order, projecting the OLD (deleted) image; named expressions support the OLD qualifier
 
 **Examples:**
