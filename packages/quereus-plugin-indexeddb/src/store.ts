@@ -18,6 +18,17 @@ function toKey(key: Uint8Array): ArrayBuffer {
   return copy;
 }
 
+/**
+ * Copy an IDB-returned ArrayBuffer into an independent `Uint8Array`. `new
+ * Uint8Array(arrayBuffer)` only *views* the buffer — a consumer mutating a yielded
+ * key/value would then reach back into whatever the buffer aliases (the stored record
+ * under some IDB engines). Slicing hands out a private copy, satisfying the KVStore
+ * read-buffer contract regardless of what the engine's cursor exposes.
+ */
+function toBytes(buf: ArrayBuffer): Uint8Array {
+  return new Uint8Array(buf).slice();
+}
+
 /** Max entries read per iterate batch — bounds memory to one batch, not the whole range. */
 const BATCH = 256;
 
@@ -206,12 +217,16 @@ export class IndexedDBStore implements KVStore {
       const effUpper = reverse && resumeKey !== undefined ? { key: resumeKey, open: true } : upper;
 
       const batch = await this.readBatch(effLower, effUpper, direction, want);
+      // Capture the resume boundary BEFORE yielding: entries are handed to the consumer
+      // by reference, and a consumer that mutates a yielded key must not perturb where
+      // the next batch resumes from.
+      const nextResumeKey = batch.length > 0 ? toKey(batch[batch.length - 1].key) : undefined;
       for (const entry of batch) {
         yield entry;
       }
       if (remaining !== undefined) remaining -= batch.length;
       if (batch.length < want) return; // range exhausted before filling the batch
-      resumeKey = toKey(batch[batch.length - 1].key);
+      resumeKey = nextResumeKey;
     }
   }
 
@@ -240,8 +255,8 @@ export class IndexedDBStore implements KVStore {
         const cursor = request.result;
         if (cursor && entries.length < want) {
           entries.push({
-            key: new Uint8Array(cursor.key as ArrayBuffer),
-            value: new Uint8Array(cursor.value as ArrayBuffer),
+            key: toBytes(cursor.key as ArrayBuffer),
+            value: toBytes(cursor.value as ArrayBuffer),
           });
           cursor.continue();
         } else {

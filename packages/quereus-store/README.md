@@ -151,6 +151,27 @@ const module = new StoreModule(provider);
 db.registerModule('store', module);
 ```
 
+**Validate a new backend against the shared conformance suite.** `@quereus/store/testing`
+exports `runKVStoreConformance(name, makeBackend)` — one parameterized battery of
+behavioral tests written against the `KVStore` contract (point ops, ordering, range
+iteration, streaming across page boundaries, batch semantics, optional persistence, and
+cross-backend encoded-key ordering). Wire a tiny lifecycle adapter and run it under Mocha
+so any drift from the contract fails a test:
+
+```typescript
+import { runKVStoreConformance } from '@quereus/store/testing';
+
+runKVStoreConformance('MyCustomStore', () => ({
+  open: async () => new MyCustomStore(/* ... */),
+  // Omit `reopen` for a non-persistent backend; supply it (reopen the SAME keyspace
+  // without wiping) to also exercise the persistence tier.
+  teardown: async () => { /* close handles, remove backing storage */ },
+}));
+```
+
+See `test/kv-conformance.spec.ts` (in-memory), and the LevelDB / IndexedDB plugins'
+`test/conformance.spec.ts` for worked adapters.
+
 ## KVStore Interface
 
 The `KVStore` interface is the foundation for all storage backends:

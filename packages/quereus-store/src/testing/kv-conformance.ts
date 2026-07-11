@@ -298,6 +298,20 @@ export function runKVStoreConformance(name: string, makeBackend: () => KVBackend
 				assert.deepStrictEqual(await keysOf(store, { reverse: true, limit: 2 }), [b(5), b(4)]);
 			});
 
+			it('yields COPIES: mutating a yielded key/value cannot corrupt the store', async () => {
+				// Iteration's read-buffer contract mirrors get() — a consumer scribbling on a
+				// yielded entry must not reach the store's internal buffers. (Regression guard
+				// for the in-memory backend, which once yielded its internal buffers directly;
+				// LevelDB/IndexedDB hand back fresh buffers per read.)
+				await seed1to5(store);
+				for await (const entry of store.iterate()) {
+					entry.key[0] = 0x99;
+					entry.value[0] = 0x99;
+				}
+				assert.deepStrictEqual(await keysOf(store), [b(1), b(2), b(3), b(4), b(5)]);
+				assertBytes(await store.get(b(3)), b(30), 'a value read after mutating an iterated entry must be intact');
+			});
+
 			it('approximateCount(range) equals the actual count over that range', async () => {
 				await seed1to5(store);
 				assert.strictEqual(await store.approximateCount(), 5);
