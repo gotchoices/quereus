@@ -32,6 +32,16 @@ export function isExplicitTransactionOpen(db: Database): boolean {
 }
 
 /**
+ * Whether the strict DDL-transaction policy is in effect. Cheap option read;
+ * emitters that must do extra work to resolve the owning module (e.g. the
+ * `drop index` schema scan) guard that work behind this so the default
+ * `'permissive'` path stays free.
+ */
+export function isDdlPolicyStrict(db: Database): boolean {
+	return db.options.getStringOption('ddl_transaction_policy') === 'strict';
+}
+
+/**
  * Strict-mode gate for module-dispatching DDL. Under `ddl_transaction_policy =
  * 'strict'`, a schema change that dispatches to a module DDL surface while an
  * explicit transaction is open is refused with a sited error UNLESS the owning
@@ -56,7 +66,7 @@ export function assertDdlTransactionPolicy(
 	moduleName: string | undefined,
 	statementLabel: string,
 ): void {
-	if (db.options.getStringOption('ddl_transaction_policy') !== 'strict') return;
+	if (!isDdlPolicyStrict(db)) return;
 	if (!isExplicitTransactionOpen(db)) return;
 
 	const tier = resolveDdlTransactionality(module);
