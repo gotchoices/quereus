@@ -1568,6 +1568,18 @@ function backingCollationMatches(a: ColumnSchema, b: ColumnSchema): boolean {
 	return (a.collation ?? 'BINARY') === (b.collation ?? 'BINARY');
 }
 
+/** Whether `columnNameLower` (already lowercased) names a column of `table`'s
+ *  *physical* primary key ({@link TableSchema.primaryKeyDefinition} — which for an
+ *  MV backing includes any ordering-seeded columns, {@link computeBackingPrimaryKey}).
+ *  A physical-PK column is NOT NULL by definition: `MemoryTableManager.alterColumn`
+ *  refuses to DROP NOT NULL on one, so the refresh reshape must never try to loosen
+ *  its NOT NULL — see the two callers below. */
+function isPhysicalPkColumn(table: TableSchema, columnNameLower: string): boolean {
+	return table.primaryKeyDefinition.some(
+		def => table.columns[def.index]?.name.toLowerCase() === columnNameLower,
+	);
+}
+
 /** Names the first structural difference between the live backing and the derived
  *  shape (null when structurally identical) — the diagnostic half of
  *  {@link backingShapeMatchesStructurally}. Deliberately **positional** (column i
@@ -1586,7 +1598,21 @@ function describeBackingShapeMismatch(current: TableSchema, shape: BackingShape)
 			return `column ${i} type ${a.logicalType.name} → ${b.logicalType.name}`;
 		}
 		if (!backingNotNullMatches(a, b)) {
-			return `column ${i} not-null ${a.notNull === true} → ${b.notNull === true}`;
+			// A physical-PK column stays NOT NULL in the backing regardless of the
+			// re-derived logical nullability (a PK column cannot hold NULL — the memory
+			// manager refuses to DROP NOT NULL on it), so a NOT-NULL→nullable *loosening*
+			// of a PK column is NOT a shape difference. Masking it lets refresh keep the
+			// data-only rebuild path instead of emitting a doomed `loosenNotNull` op. Tight
+			// on purpose: only a loosening (`current` NOT NULL, derived nullable) of a
+			// current physical-PK column; a tighten, or any non-PK column, stays a real diff.
+			// NOTE: this pairs with the ordering-seeded physical PK (computeBackingPrimaryKey,
+			// ~line 236); the covering ticket that replaces ordering-seeding with a
+			// materialized index removes the need for this mask.
+			const looseningPkColumn = a.notNull === true && b.notNull !== true
+				&& isPhysicalPkColumn(current, a.name.toLowerCase());
+			if (!looseningPkColumn) {
+				return `column ${i} not-null ${a.notNull === true} → ${b.notNull === true}`;
+			}
 		}
 		if (!backingCollationMatches(a, b)) {
 			return `column ${i} collation ${a.collation ?? 'BINARY'} → ${b.collation ?? 'BINARY'}`;
@@ -2092,7 +2118,16 @@ function classifyBackingReshape(current: TableSchema, shape: BackingShape): Resh
 		if (!backingCollationMatches(from, to)) postReconcileOps.push({ kind: 'recollate', name, collation: to.collation ?? 'BINARY' });
 		if (!backingNotNullMatches(from, to)) {
 			if (to.notNull === true) postReconcileOps.push({ kind: 'tightenNotNull', name });
-			else loosens.push({ kind: 'loosenNotNull', name });
+			// A physical-PK column cannot hold NULL, so the backing keeps it NOT NULL and
+			// the memory manager refuses to DROP NOT NULL on it: skip the doomed
+			// `loosenNotNull` op for a physical-PK column of `current` (matched by its
+			// pre-rename name). Reached only when reshape is entered for SOME OTHER genuine
+			// shape change coexisting with a PK-column loosening in the same refresh;
+			// touch point #1 masks the loosening-only case before reshape. See the NOTE at
+			// describeBackingShapeMismatch / computeBackingPrimaryKey (~line 236).
+			else if (!isPhysicalPkColumn(current, from.name.toLowerCase())) {
+				loosens.push({ kind: 'loosenNotNull', name });
+			}
 		}
 	};
 

@@ -272,6 +272,57 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 				await db.close();
 			}
 		});
+
+		it('a source DROP NOT NULL on an ordering-seeded backing PK column refreshes without dropping the backing PK NOT NULL', async () => {
+			// Regression for `mv-reshape-loosens-not-null-on-ordering-seeded-backing-pk`.
+			// `order by x` seeds x into the physical PK ([x, id]); x starts NOT NULL (source
+			// x is NOT NULL). A source DROP NOT NULL loosens the DERIVED x to nullable, but a
+			// physical-PK column stays NOT NULL in the backing — the old code emitted a
+			// `loosenNotNull` op, which the memory manager refuses on a PK column
+			// ("Cannot DROP NOT NULL on PRIMARY KEY column 'x'"). The fix masks that PK-column
+			// loosening so refresh takes the data-only rebuild path and keeps x NOT NULL.
+			const db = new Database();
+			try {
+				await db.exec('create table par (id integer primary key, x integer not null)');
+				await db.exec('insert into par values (1, 5)');
+				await db.exec('create materialized view par_ix as select id, x from par order by x');
+
+				// Physical PK seeded from `order by x`: [x (index 1), id (index 0)], x NOT NULL.
+				const pkBefore = db.schemaManager.getTable('main', 'par_ix')!;
+				expect(pkBefore.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
+				expect(pkBefore.columns[1].notNull, 'backing x starts NOT NULL').to.equal(true);
+
+				// Source x → nullable. The backing's x is a physical-PK column, so the memory
+				// manager could not have dropped its NOT NULL (the alter would have thrown);
+				// the backing keeps x NOT NULL while the RE-DERIVED body shape now reports x
+				// nullable — the exact skew that makes the next refresh want to loosen a PK col.
+				await db.exec('alter table par alter column x drop not null');
+				expect(db.schemaManager.getTable('main', 'par_ix')!.columns[1].notNull,
+					'backing x still NOT NULL after the source drop-not-null').to.equal(true);
+
+				// A further source insert; refresh must end with both rows either way.
+				await db.exec('insert into par (id, x) values (2, 8)');
+
+				// The OLD code threw "Cannot DROP NOT NULL on PRIMARY KEY column 'x'" here.
+				await db.exec('refresh materialized view par_ix');
+
+				const after = db.schemaManager.getTable('main', 'par_ix')!;
+				// Backing keeps x NOT NULL and the seeded [x, id] PK (a PK column cannot hold NULL).
+				expect(after.columns[1].notNull, 'backing x stays NOT NULL (physical PK)').to.equal(true);
+				expect(after.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
+				// The re-derived body (both rows) is materialized.
+				expect(await readObjectsSorted(db, 'select id, x from par_ix'))
+					.to.deep.equal(['{"id":1,"x":5}', '{"id":2,"x":8}']);
+
+				// Row-time maintenance re-attached against the refreshed backing: a post-refresh
+				// insert is still maintained in.
+				await db.exec('insert into par (id, x) values (3, 12)');
+				expect(await readObjectsSorted(db, 'select id, x from par_ix'))
+					.to.deep.equal(['{"id":1,"x":5}', '{"id":2,"x":8}', '{"id":3,"x":12}']);
+			} finally {
+				await db.close();
+			}
+		});
 	});
 
 	describe('inexpressible → sited error', () => {
