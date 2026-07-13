@@ -810,9 +810,13 @@ function assertRefreshRowsAreSet(
  * backing when its source loosens (it is not physical-PK-pinned), so by the time this
  * runs a legitimately-loosened non-PK column already reads nullable. A physical-PK column
  * declared *nullable* (the permitted create-time nullable-source-ordering case) is not
- * guarded — it self-consistently stores NULL. No-op when no backing column is both NOT
- * NULL and physical-PK, or no row holds a NULL there — the common case pays one PK-set
- * build and returns.
+ * guarded — it self-consistently stores NULL. Early-returns only when no backing column
+ * is both NOT NULL and physical-PK; that set is otherwise non-empty for nearly every MV
+ * (the logical-key PK column is normally the NOT-NULL source PK), so the common case
+ * scans every row over the guarded set. Cheap here — the rows are already materialized on
+ * the full-rebuild path — but this same shape is NOT cheap on the row-time hot path, which
+ * needs a precomputed nullable-source skew flag instead (see
+ * `fix/bug-mv-rowtime-null-into-notnull-seeded-pk`).
  */
 function assertNoNullInNotNullSeededPk(
 	backing: TableSchema,
