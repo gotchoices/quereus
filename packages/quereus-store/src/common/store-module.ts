@@ -351,6 +351,13 @@ export class StoreModule implements VirtualTableModule<StoreTable, StoreModuleCo
 			persistent: true,
 			secondaryIndexes: true,
 			rangeScans: true,
+			// Worst-case summary across this module's DDL. The row-rewriting ALTER arms
+			// and renameTable call ddlCommitPendingOps(), which commits the WHOLE module
+			// transaction (schema change + every buffered write) at DDL time — a later
+			// rollback undoes nothing. Non-committing DDL (create index, add constraint,
+			// schema-only arms) is merely non-transactional, but the declared value is
+			// the worst case. See docs/store.md § "DDL that implicitly commits".
+			ddlTransactionality: 'auto-commit',
 		};
 	}
 

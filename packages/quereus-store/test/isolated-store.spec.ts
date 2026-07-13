@@ -173,6 +173,8 @@ describe('Isolated Store Module', () => {
 			expect(caps.persistent).to.be.true;
 			expect(caps.secondaryIndexes).to.be.true;
 			expect(caps.rangeScans).to.be.true;
+			// Worst-case DDL summary: the store force-commits on row-rewriting DDL.
+			expect(caps.ddlTransactionality).to.equal('auto-commit');
 		});
 
 		it('isolated store module reports isolation enabled', () => {
@@ -181,6 +183,10 @@ describe('Isolated Store Module', () => {
 			expect(caps.isolation).to.be.true;
 			expect(caps.savepoints).to.be.true;
 			expect(caps.persistent).to.be.true;
+			// The isolation wrapper forwards the underlying store's tier verbatim
+			// (never upgrades) — the overlay's DML would be left behind by an
+			// underlying DDL-commit, so the pessimistic value is the honest one.
+			expect(caps.ddlTransactionality).to.equal('auto-commit');
 		});
 	});
 

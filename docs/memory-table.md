@@ -251,8 +251,16 @@ are in use" branch.
 `adoptSchema` also **removes** a structure a `DROP INDEX` / `DROP CONSTRAINT` deleted — dropping
 the layer's now-orphaned `MemoryIndex` and, with it, the derived `uniqueConstraints` entry the
 frozen schema was still enforcing — alongside its add/replace behavior. Like the additive side,
-that removal is not undone by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` (DDL is not transactional here;
-`feat-ddl-transaction-capability`) — after `rollback to savepoint`, the dropped index stays dropped.
+that removal is not undone by `ROLLBACK` / `ROLLBACK TO SAVEPOINT` — after `rollback to savepoint`,
+the dropped index stays dropped.
+
+**Declared contract: `ddlTransactionality: 'non-transactional'`.** The memory module declares this
+tier in `getCapabilities()` (see [module-authoring.md § DDL transactionality tiers](module-authoring.md#ddl-transactionality-tiers)):
+a schema change escapes the enclosing transaction (it survives `rollback`), but buffered DML still
+rolls back normally. Callers that want a hard guarantee against this can set the
+`ddl_transaction_policy = 'strict'` pragma, which refuses module-dispatching DDL inside an explicit
+transaction on any module that is not `transactional` (memory is not). The default `'permissive'`
+policy leaves the behavior above unchanged.
 
 **`SET DATA TYPE` validates and rewrites values, not just structures.** When the new type has a
 different physical type, `MemoryTableManager.alterColumn` first runs a throw-only conversion pass

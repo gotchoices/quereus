@@ -22,6 +22,12 @@ import {
 
 export function emitCreateMaterializedView(plan: CreateMaterializedViewNode, _ctx: EmissionContext): Instruction {
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
+		// NOTE: not covered by the ddl_transaction_policy=strict gate. The MV backing is a
+		// module (memory/store) table whose creation escapes rollback like any other DDL, but
+		// feat-ddl-transaction-capability scoped the gate to the plain CREATE/DROP TABLE/INDEX
+		// + ALTER emitters; the dedicated materialized-view verbs were left out. If strict must
+		// also refuse MV DDL inside a transaction, gate here (and in drop/refresh below) — see
+		// backlog debt-strict-ddl-gate-materialized-views.
 		await rctx.db._ensureTransaction();
 		const db = rctx.db;
 		const sm = db.schemaManager;

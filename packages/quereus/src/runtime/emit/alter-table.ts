@@ -18,6 +18,7 @@ import type { Schema } from '../../schema/schema.js';
 import type { Database } from '../../core/database.js';
 import { tryFoldLiteral } from '../../parser/utils.js';
 import { isTruthy } from '../../util/comparison.js';
+import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import {
 	snapshotStaleMaterializedViews,
 	propagateTableRenameToMaterializedViews,
@@ -57,6 +58,16 @@ export function emitAlterTable(plan: AlterTableNode, ctx: EmissionContext): Inst
 	];
 
 	async function run(rctx: RuntimeContext, ...args: unknown[]): Promise<SqlValue> {
+		// Strict-policy gate (see ddl-transaction-policy.ts). Every ALTER arm changes a
+		// module table's schema in a way that escapes rollback on a non-transactional
+		// module — including the catalog-only tag/rename arms and the engine-side
+		// schema-only renameColumn fallback — so gate uniformly here, before any
+		// dispatch or catalog mutation.
+		assertDdlTransactionPolicy(
+			rctx.db, requireVtabModule(tableSchema), tableSchema.vtabModuleName,
+			`ALTER TABLE ${tableSchema.name} (${action.type})`,
+		);
+
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 

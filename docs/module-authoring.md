@@ -420,7 +420,7 @@ treat it as the reference for "what happens if my module doesn't do X".
 | --- | --- | --- |
 | **Method presence** | `supports` / `executePlan`, `getBestAccessPlan`, `getMappingAdvertisements`, `getBackingHost`, `createIndex` / `dropIndex`, `alterTable`, `renameTable`, `finalizeRename`, `beginSchemaBatch` / `endSchemaBatch`, `notifyLensDeployment` | yes, per call site (varies) |
 | **Static field** | `concurrencyMode`, `expectedLatencyMs` | yes, before dispatch (the clean model) |
-| **`getCapabilities()` flag** | `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators` (live); `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` (informational) | only the first two |
+| **`getCapabilities()` flag** | `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators`, `ddlTransactionality` (live); `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` (informational) | only the first three |
 
 The static-field model (`concurrencyMode`, see [Concurrency Mode](#3-concurrency-mode-parallel-runtime) above) is the clean exemplar: a defaulted, queryable value the engine reads *before* it dispatches, to choose its path. The [recommended pattern](#recommended-capability-negotiation-pattern) generalizes toward it.
 
@@ -452,9 +452,57 @@ Each surface below is tagged by how its **unsupported path** behaves:
 | `expectedLatencyMs` | static field | engine-side fallback (`0`) | 0 | 0 | forwards underlying | via store |
 | `getCapabilities().delegatesNotNullBackfill` | flag (live) | engine-side gate (ADD COLUMN skips `validateNotNullBackfill`) | off | off | inherits underlying | off |
 | `getCapabilities().permitsGrandfatheredCheckViolators` | flag (live) | engine-side gate (`getTrustedCheckExtraction` returns the empty extraction, so `TableReferenceNode` skips the CHECK lift and the lens prover refuses the table's CHECK-derived enum domains) | off | off | inherits underlying | off |
+| `getCapabilities().ddlTransactionality` | flag (live) | engine-side gate (`ddl_transaction_policy = strict` refuses module-dispatching DDL inside an explicit transaction unless the tier is `transactional`; default `permissive` never consults it — see [DDL transactionality tiers](#ddl-transactionality-tiers)) | `non-transactional` | `auto-commit` | **forwards underlying verbatim, never upgrades** | via store |
 | `getCapabilities().{isolation,savepoints,persistent,secondaryIndexes,rangeScans}` | flag (informational) | **never consulted by engine** — asserted only in tests; isolation augments `isolation` / `savepoints` but nothing reads them | varies | varies | augments | varies |
 
 > **Isolation wrapper asymmetry is intentional.** `IsolationModule` forwards the isolation-transparent hooks (`getBestAccessPlan`, `getMappingAdvertisements`, the batch + lens lifecycle hooks, `renameTable`, `finalizeRename`, `alterTable`) but **suppresses** `supports` (so the overlay always sees every row to merge), computes a conservative `concurrencyMode` (the weaker of the underlying and overlay modes, capped at `reentrant-reads` because its own write path is never fully-reentrant), and forwards the underlying's `expectedLatencyMs`. See the **Transparent hook forwarding** paragraph in [`packages/quereus-isolation/README.md`](../packages/quereus-isolation/README.md) for the full rationale — do not restate it divergently here.
+
+### DDL transactionality tiers
+
+`getCapabilities().ddlTransactionality` declares how a module's DDL (schema-change)
+statements behave with respect to the enclosing transaction. It is a single
+**worst-case summary** across every DDL statement the module can execute — per-statement
+detail belongs in the backend docs, not the flag. Three tiers, in severity order:
+
+- **`transactional`** — the reference semantics. A schema change is part of the enclosing
+  transaction: the catalog entry and physical structures (index trees, migrated rows,
+  moved storage) are buffered with the transaction, visible to later statements inside it,
+  made durable atomically with the DML at commit, and discarded whole on `rollback` /
+  `rollback to savepoint`. **No built-in module reaches this tier today** — it needs a
+  transaction-scoped catalog, which `SchemaManager` does not have (tracked by the backlog
+  ticket `feat-transactional-ddl-native-backends`).
+- **`non-transactional`** — the schema change escapes the transaction (it survives
+  `rollback`) but buffered DML still rolls back normally. This is the **memory** module,
+  and the store's non-committing DDL statements (`create index`, `add constraint`,
+  schema-only arms).
+- **`auto-commit`** — executing certain DDL commits the module's buffered transaction at
+  DDL time: the schema change **and every buffered write** become durable immediately, and
+  a later `rollback` undoes nothing. This is the **store** module (its row-rewriting ALTER
+  arms and `renameTable` flush pending ops); because a module declares its worst case, the
+  store declares `auto-commit` even though much of its DDL is only non-transactional.
+
+**Default when absent: `non-transactional`.** A module must EXPLICITLY claim
+`transactional`; defaulting to the clean semantics would let every existing module
+silently over-promise.
+
+**The gate.** The `ddl_transaction_policy` option / pragma governs enforcement:
+
+- `permissive` (default) — today's behavior, unchanged; the flag is not consulted.
+- `strict` — a statement that dispatches to a module DDL surface (`create table … using`,
+  `drop table`, `create index`, `drop index`, any `alter table` arm, `rename table`) while
+  an **explicit** transaction is open on a module whose tier is not `transactional` raises
+  a sited `QuereusError` before any dispatch or catalog mutation. The transaction stays
+  open and usable. Autocommit-mode DDL (the normal case) is never gated — only an explicit
+  `BEGIN` trips it.
+
+Engine-only schema objects (`create view`, `create assertion`, `declare schema`) are out
+of the gate's scope: they touch no module, and the engine's own schema is transient by
+design (see [architecture.md § Transient Schema](architecture.md)).
+
+The isolation wrapper **forwards the underlying's declared tier verbatim and never
+upgrades it**: the overlay stages DML outside the underlying module, so an underlying
+DDL-commit flushes only module-side ops — forwarding the pessimistic underlying value is
+the honest choice.
 
 ### `alterTable` sub-arms — the fine-grained mandate layer
 
@@ -486,7 +534,7 @@ These are the rules new modules and new contract points should follow. They gene
 
 2. **Any contract point where the engine assumes a behavior must be declared and consulted before dispatch.** `concurrencyMode` is the template: a defaulted, queryable value the engine reads to choose its path. Generalize toward this, not toward more presence bits.
 
-3. **`getCapabilities()` is the single home for binding capability gates.** The five informational flags — `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` — are **advisory / non-binding**: the engine does not consult them, so toggling them changes nothing about engine behavior (they are asserted only in tests, and isolation augments `isolation` / `savepoints` for its own bookkeeping). Do not be misled into treating them as gates. (Their removal / relocation is a separate code ticket; the distinction is documented here, not yet acted on.)
+3. **`getCapabilities()` is the single home for binding capability gates.** Three flags are **live gates** the engine consults before/at dispatch — `delegatesNotNullBackfill`, `permitsGrandfatheredCheckViolators`, and `ddlTransactionality` (see [DDL transactionality tiers](#ddl-transactionality-tiers)) — and this is where new binding gates belong. The five informational flags — `isolation`, `savepoints`, `persistent`, `secondaryIndexes`, `rangeScans` — are **advisory / non-binding**: the engine does not consult them, so toggling them changes nothing about engine behavior (they are asserted only in tests, and isolation augments `isolation` / `savepoints` for its own bookkeeping). Do not be misled into treating them as gates, and do not grow that advisory set. (Their removal / relocation is a separate code ticket; the distinction is documented here, not yet acted on.)
 
 4. **Hard contract — no silent divergence.** A module that cannot honor an invoked `alterTable` arm MUST throw `QuereusError(StatusCode.UNSUPPORTED)` with a sited message — **never silently no-op**. The engine maps `UNSUPPORTED` to a defined fallback (generic rebuild, schema-only, or engine-side logical enforcement) or surfaces it as a clean user error. This promotes the existing `alterPrimaryKey` protocol to a universal rule.
 

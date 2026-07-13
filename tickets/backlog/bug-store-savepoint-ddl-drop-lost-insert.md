@@ -59,17 +59,22 @@ Observed: `Row count mismatch. Expected 2, got 1`. Asserting `-- error: UNIQUE c
 the second insert instead fails with `Expected error … but SQL block executed successfully` — i.e.
 the insert neither errors nor lands.
 
-## Why it is filed here (backlog, not fix/)
+## Expected behavior (semantics now decided)
 
-This sits inside transactional-DDL semantics, which are not yet defined — whether `rollback to
-savepoint` should undo a `drop index` at all is the open question owned by
-`feat-ddl-transaction-capability`. A principled fix likely has to decide that first: if store
-restores the dropped index on rollback, the second insert should raise `UNIQUE constraint failed`;
-if it keeps the index dropped (memory's posture), the row should be inserted and kept. Either
-resolution is correct — the current "success + silent drop" is the one outcome that is not. It is a
-real, reproducible defect (not a tripwire), but it needs the transactional-DDL decision before a
-clean fix, so it waits in backlog rather than jumping the queue as active fix work. If store data
-integrity is judged higher priority than the DDL-semantics decision, promote it to `fix/`.
+The transactional-DDL question this fix was waiting on is settled:
+`feat-ddl-transaction-capability` placed the store on the `'auto-commit'` tier — DDL is not
+part of the transaction, and `rollback to savepoint` does **not** restore a dropped index.
+(Restoring it is the future `feat-transactional-ddl-native-backends` tier, not this bug.)
+
+So the correct outcome for the reproduction is memory's posture: the index stays dropped, the
+second `insert` succeeds, and row (2,'a') is present both mid-transaction and after `commit`.
+The current "success + silent drop" is data loss and is the defect to fix. Likely suspect: the
+isolation layer / store savepoint machinery holding a stale reference to the dropped index's
+overlay or unique-enforcement state after the savepoint rollback, so the write lands in a
+structure that no longer feeds reads or persistence.
+
+This is now unblocked and promotable to `fix/` whenever prioritized — nothing further to
+decide first.
 
 ## Scope note
 

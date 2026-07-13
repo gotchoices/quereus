@@ -300,6 +300,19 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			}
 		});
 
+		this.options.registerOption('ddl_transaction_policy', {
+			type: 'string',
+			defaultValue: 'permissive',
+			description: 'Whether module-dispatching DDL (CREATE/DROP TABLE/INDEX, ALTER TABLE) is allowed inside an explicit transaction: "permissive" (default; schema changes may escape the transaction, as today) or "strict" (refuse such DDL inside a transaction unless the module declares ddlTransactionality=transactional).',
+			onChange: (event) => {
+				const value = event.newValue as string;
+				if (value !== 'permissive' && value !== 'strict') {
+					throw new QuereusError(`Invalid ddl_transaction_policy value: ${value}. Must be "permissive" or "strict"`, StatusCode.ERROR);
+				}
+				log('DDL transaction policy changed to: %s', value);
+			}
+		});
+
 		this.options.registerOption('default_collation', {
 			type: 'string',
 			defaultValue: 'BINARY',

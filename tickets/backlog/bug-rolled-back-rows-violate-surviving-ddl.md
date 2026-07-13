@@ -13,8 +13,10 @@ difficulty: hard
 ## What happens
 
 Schema changes in Quereus are not part of the surrounding transaction: a `rollback` does not
-undo a `create index` or an `alter table`. (Whether that *should* be the contract is the open
-question in `feat-ddl-transaction-capability`.)
+undo a `create index` or an `alter table`. That *is* now the decided contract for the memory
+backend — `feat-ddl-transaction-capability` settled it as the `'non-transactional'` tier, and
+raising memory to the fully-transactional tier is the separate backlog ticket
+`feat-transactional-ddl-native-backends`.
 
 Separately — and correctly, per `docs/memory-table.md` § DDL and transactions — a schema change
 that has to inspect existing rows now inspects the rows *the issuing transaction can see*: the
@@ -71,14 +73,22 @@ because from the engine's point of view the constraint was already validated.
 
 ## What a fix has to decide
 
-There is no obviously-right answer, which is why this is filed rather than fixed:
+The semantics question is settled (`feat-ddl-transaction-capability`): memory stays on the
+`'non-transactional'` tier for now, so "make the schema change roll back too" is **not** this
+bug's fix — that is `feat-transactional-ddl-native-backends`, a separate, much larger effort.
+Within the settled contract, two candidate fixes remain:
 
-- Make the schema change part of the transaction, so a rollback undoes it too. This is the
-  `feat-ddl-transaction-capability` decision, and would resolve this bug as a side effect.
-- Or: re-validate the affected structures at commit time (and at `rollback to savepoint`),
-  paying an extra scan for a rare statement shape.
+- **Recommended:** re-validate the affected structures at `rollback to savepoint` (and at
+  whole-transaction `rollback`) when row-validating DDL ran inside the transaction, paying an
+  extra scan for a rare statement shape. Accepts every legal case; the only cost lands on the
+  transaction that actually created the hazard.
 - Or: refuse row-validating DDL when the issuing transaction has uncommitted *deletes* on the
   table — the narrowest rule that closes the hole, at the cost of rejecting a legal case.
+
+An interim mitigation already exists: `pragma ddl_transaction_policy = 'strict'` (from
+`feat-ddl-transaction-capability`) refuses the DDL inside the transaction outright, which
+closes this hole for applications that opt in — but the default remains permissive, so the
+bug still needs a fix.
 
 Whichever is chosen, `docs/memory-table.md` § DDL and transactions needs updating; it currently
 carries a paragraph pointing here.

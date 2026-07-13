@@ -8,6 +8,7 @@ import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import { opsToMask, requireVtabModule } from '../../schema/table.js';
 import { buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
+import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 
 const log = createLogger('runtime:emit:add-constraint');
 
@@ -15,6 +16,14 @@ export function emitAddConstraint(plan: AddConstraintNode, _ctx: EmissionContext
 	const tableSchema = plan.table.tableSchema;
 
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
+		// Strict-policy gate (see ddl-transaction-policy.ts). ALTER TABLE ADD CONSTRAINT
+		// is its own node but is a module-dispatching ALTER arm all the same, so gate it
+		// before any dispatch or catalog mutation.
+		assertDdlTransactionPolicy(
+			rctx.db, requireVtabModule(tableSchema), tableSchema.vtabModuleName,
+			`ALTER TABLE ${tableSchema.name} ADD CONSTRAINT`,
+		);
+
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start).
 		await rctx.db._ensureTransaction();
 

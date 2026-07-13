@@ -5,6 +5,8 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { dropMaintainedTable } from './materialized-view.js';
+import { requireVtabModule } from '../../schema/table.js';
+import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 
 export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instruction {
 	const schemaManager = ctx.db.schemaManager;
@@ -20,6 +22,17 @@ export function emitDropTable(plan: DropTableNode, ctx: EmissionContext): Instru
 	}
 
 	async function run(rctx: RuntimeContext): Promise<SqlValue> {
+		// Strict-policy gate (see ddl-transaction-policy.ts). Consult the target
+		// table's module tier; if the table doesn't exist, skip the gate and let
+		// SchemaManager.dropTable handle IF EXISTS / not-found.
+		const target = rctx.db.schemaManager.getTable(targetSchemaName, objectName);
+		if (target) {
+			assertDdlTransactionPolicy(
+				rctx.db, requireVtabModule(target), target.vtabModuleName,
+				`DROP TABLE ${objectName}`,
+			);
+		}
+
 		// Ensure we're in a transaction before DDL (lazy/JIT transaction start)
 		await rctx.db._ensureTransaction();
 

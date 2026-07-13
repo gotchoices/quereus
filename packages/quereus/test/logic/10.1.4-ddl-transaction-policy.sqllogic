@@ -1,0 +1,166 @@
+-- DDL transaction policy: the `ddl_transaction_policy` pragma and its strict gate.
+--
+-- `permissive` (the default) leaves DDL-in-transaction behavior exactly as it was.
+-- `strict` refuses a module-dispatching DDL statement (CREATE/DROP TABLE/INDEX,
+-- ALTER TABLE) while an explicit transaction is open, because on memory and store
+-- the schema change would escape the transaction (survive rollback). The refusal
+-- fires before any dispatch or catalog mutation, so the open transaction stays
+-- fully usable afterward.
+--
+-- Runs against every backend (memory, store). Neither declares
+-- ddlTransactionality='transactional', so strict refuses on both; the permissive
+-- sections must behave identically on both. Each statement is its own block so an
+-- expected failure is attributed to exactly one statement.
+
+-- ===================================
+-- 1. Permissive default: DDL inside a transaction is allowed (unchanged behavior)
+-- ===================================
+
+create table perm_t (id integer primary key, v text);
+-- run
+begin;
+-- run
+insert into perm_t values (1, 'a');
+-- run
+create index perm_ix on perm_t (v);
+-- run
+insert into perm_t values (2, 'b');
+-- run
+commit;
+-- run
+
+select count(*) as cnt from perm_t;
+→ [{ "cnt": 2 }]
+
+drop index perm_ix;
+-- run
+
+-- ===================================
+-- 2. strict: create index inside begin is refused; the transaction survives
+-- ===================================
+
+pragma ddl_transaction_policy = 'strict';
+-- run
+
+create table strict_t (id integer primary key, v text);
+-- run
+insert into strict_t values (1, 'a');
+-- run
+begin;
+-- run
+insert into strict_t values (2, 'b');
+-- run
+create index strict_ix on strict_t (v);
+-- error: ddl_transaction_policy = strict
+
+-- The refusal left the transaction open and usable: insert again and commit.
+insert into strict_t values (3, 'c');
+-- run
+commit;
+-- run
+
+-- Both buffered rows landed and the index was never created.
+select count(*) as cnt from strict_t;
+→ [{ "cnt": 3 }]
+
+-- ===================================
+-- 3. strict: the same statement is allowed OUTSIDE a transaction (autocommit)
+-- ===================================
+
+create index strict_ix on strict_t (v);
+-- run
+drop index strict_ix;
+-- run
+
+-- ===================================
+-- 4. strict: alter table ... add constraint is refused inside begin
+-- ===================================
+
+begin;
+-- run
+alter table strict_t add constraint strict_u unique (v);
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+-- ===================================
+-- 5. strict: drop index is refused inside begin (index still present after)
+-- ===================================
+
+create index strict_ix2 on strict_t (v);
+-- run
+begin;
+-- run
+drop index strict_ix2;
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+drop index strict_ix2;
+-- run
+
+-- ===================================
+-- 6. strict: create table is refused inside begin
+-- ===================================
+
+begin;
+-- run
+create table strict_t2 (id integer primary key);
+-- error: ddl_transaction_policy = strict
+rollback;
+-- run
+
+-- The refused create table left nothing behind; base data intact.
+select count(*) as cnt from strict_t;
+→ [{ "cnt": 3 }]
+
+-- ===================================
+-- 6b. strict: a refusal inside a savepoint leaves the savepoint usable
+-- ===================================
+
+create table sp_t (id integer primary key, v text);
+-- run
+insert into sp_t values (1, 'a');
+-- run
+begin;
+-- run
+savepoint sp1;
+-- run
+insert into sp_t values (2, 'b');
+-- run
+create index sp_ix on sp_t (v);
+-- error: ddl_transaction_policy = strict
+
+-- The savepoint is still usable: roll back to it (undoing row 2), continue, commit.
+rollback to savepoint sp1;
+-- run
+insert into sp_t values (3, 'c');
+-- run
+commit;
+-- run
+
+select id from sp_t order by id;
+→ [{ "id": 1 }, { "id": 3 }]
+
+drop table sp_t;
+-- run
+
+-- ===================================
+-- 7. Reset to permissive; DDL inside a transaction works again
+-- ===================================
+
+pragma ddl_transaction_policy = 'permissive';
+-- run
+
+begin;
+-- run
+create table perm_again (id integer primary key);
+-- run
+commit;
+-- run
+
+drop table perm_again;
+-- run
+drop table strict_t;
+-- run
+drop table perm_t;
+-- run

@@ -182,6 +182,10 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			persistent: false,
 			secondaryIndexes: true,
 			rangeScans: true,
+			// Schema changes here escape the transaction (they survive rollback), but
+			// buffered DML still rolls back normally — the SchemaManager catalog is not
+			// transaction-scoped. See docs/memory-table.md § "DDL and transactions".
+			ddlTransactionality: 'non-transactional',
 		};
 	}
 

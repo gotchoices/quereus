@@ -673,6 +673,13 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 
 	/**
 	 * Returns capabilities combining underlying module with isolation guarantees.
+	 *
+	 * `ddlTransactionality` is forwarded verbatim through the spread — the wrapper
+	 * NEVER upgrades it. The overlay stages DML outside the underlying module, so an
+	 * underlying DDL-commit flushes only module-side ops, leaving overlay writes
+	 * behind (the `bug-store-savepoint-ddl-drop-lost-insert` asymmetry). Forwarding
+	 * the underlying's (pessimistic) value is the honest choice; only `isolation` /
+	 * `savepoints` are augmented, since the wrapper genuinely adds those.
 	 */
 	getCapabilities(): ModuleCapabilities {
 		const underlyingCaps = this.underlying.getCapabilities?.() ?? {};

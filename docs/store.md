@@ -407,6 +407,8 @@ Savepoints opened before such a statement go away with the transaction. A later 
 
 DDL that writes no rows does **not** commit: `ADD CONSTRAINT`, `RENAME COLUMN`, `SET DEFAULT`, `SET COLLATE` on a non-PK column, `SET DATA TYPE` within one physical representation, `DROP NOT NULL`, and `CREATE INDEX` (which builds from the buffered-plus-committed view) all stay inside the open transaction.
 
+**Declared contract: `ddlTransactionality: 'auto-commit'`.** The store module declares this tier in `getCapabilities()` (see [module-authoring.md § DDL transactionality tiers](module-authoring.md#ddl-transactionality-tiers)). The flag is a single **worst-case summary**: because the committing statements above force-commit the buffered transaction (schema change *and* every pending write), the store declares `auto-commit` even though the no-row DDL in the previous paragraph is merely `non-transactional`. A caller that wants a hard guarantee against either surprise can set `ddl_transaction_policy = 'strict'`, which refuses module-dispatching DDL inside an explicit transaction on any non-`transactional` module (the store is not `transactional`). The default `'permissive'` policy leaves the behavior above unchanged.
+
 ### Multi-Table Atomicity
 
 Since all tables in a LevelDB module share the same underlying database (tables are distinguished by key prefixes), a single `WriteBatch` can atomically commit changes across all tables:
