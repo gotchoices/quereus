@@ -323,6 +323,43 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 				await db.close();
 			}
 		});
+
+		it('a PK-column DROP NOT NULL coexisting with a genuine reshape skips the loosen op (classifyBackingReshape guard)', async () => {
+			// Exercises the SECOND fix site (classifyBackingReshape.recordAttrShift): reshape
+			// is entered for a genuine shape change (a trailing column appears in the select*
+			// output) while, in the same refresh, the ordering-seeded PK column x also loosens.
+			// The guard must skip the doomed `loosenNotNull` on x while still applying the real
+			// reshape (add b) — the loosening-only fast-path mask (site #1) does NOT fire here.
+			const db = new Database();
+			try {
+				await db.exec('create table par (id integer primary key, x integer not null)');
+				await db.exec('insert into par values (1, 5)');
+				await db.exec('create materialized view par_ix as select * from par order by x');
+
+				const before = db.schemaManager.getTable('main', 'par_ix')!;
+				expect(before.columns.map(c => c.name)).to.deep.equal(['id', 'x']);
+				expect(before.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
+
+				// Two source alters before the refresh: a genuine reshape (trailing add reaches
+				// the select* body) AND a DROP NOT NULL on the seeded-PK column x.
+				await db.exec('alter table par add column b integer default 0');
+				await db.exec('alter table par alter column x drop not null');
+				await db.exec('insert into par (id, x, b) values (2, 8, 7)');
+
+				// OLD code: reshape emitted `loosenNotNull` on x → "Cannot DROP NOT NULL on
+				// PRIMARY KEY column 'x'". The guard skips it, so the reshape (add b) lands.
+				await db.exec('refresh materialized view par_ix');
+
+				const after = db.schemaManager.getTable('main', 'par_ix')!;
+				expect(after.columns.map(c => c.name)).to.deep.equal(['id', 'x', 'b']);
+				expect(after.columns[1].notNull, 'backing x stays NOT NULL (physical PK)').to.equal(true);
+				expect(after.primaryKeyDefinition.map(d => d.index)).to.deep.equal([1, 0]);
+				expect(await readObjectsSorted(db, 'select id, x, b from par_ix'))
+					.to.deep.equal(['{"id":1,"x":5,"b":0}', '{"id":2,"x":8,"b":7}']);
+			} finally {
+				await db.close();
+			}
+		});
 	});
 
 	describe('inexpressible → sited error', () => {
