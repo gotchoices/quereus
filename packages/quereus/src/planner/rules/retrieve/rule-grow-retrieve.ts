@@ -38,8 +38,7 @@ import { PlanNodeType as _PlanNodeType } from '../../nodes/plan-node-type.js';
 import { LiteralNode, BinaryOpNode } from '../../nodes/scalar.js';
 import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
 import type * as AST from '../../../parser/ast.js';
-import { ExistsNode, InNode } from '../../nodes/subquery.js';
-import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
+import { ExistsNode, InNode, ScalarSubqueryNode } from '../../nodes/subquery.js';
 import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
@@ -151,15 +150,20 @@ export function ruleGrowRetrieve(node: PlanNode, context: OptContext): PlanNode 
 		newPipeline = candidatePipeline as RelationalPlanNode;
 	}
 
-	// If index-style with a residual predicate that contains correlated subqueries,
-	// keep the residual above the Retrieve as a FilterNode so structural rules
-	// (e.g., subquery decorrelation) can still process it. Clear the residual from
-	// the context to avoid double-application in select-access-path.
+	// If index-style with a residual predicate that contains ANY subquery, keep the
+	// residual above the Retrieve as a FilterNode so the bottom-up physical pass still
+	// covers the subquery's own plan tree (and structural rules like subquery
+	// decorrelation can process it). Burying it in moduleCtx.residualPredicate leaves
+	// the subquery's inner Retrieve outside the region select-access-path visits, so it
+	// stays unphysicalized and emitRetrieve throws. Correlation is irrelevant: a
+	// self-contained IN (SELECT …)/EXISTS/scalar subquery carries an inner Retrieve just
+	// the same. Clear the residual from the context to avoid double-application in
+	// select-access-path. See tickets/complete/grow-retrieve-noncorrelated-subquery-residual.
 	let moduleCtx = assessment.ctx;
 	let residualAbove: ScalarPlanNode | undefined;
 
 	if (isIndexStyleContext(moduleCtx) && moduleCtx.residualPredicate
-		&& predicateContainsCorrelatedSubquery(moduleCtx.residualPredicate)) {
+		&& predicateContainsSubquery(moduleCtx.residualPredicate)) {
 		residualAbove = moduleCtx.residualPredicate;
 		moduleCtx = { ...moduleCtx, residualPredicate: undefined };
 	}
@@ -602,18 +606,22 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 }
 
 /**
- * Check if a scalar expression tree contains any correlated EXISTS or IN subqueries.
- * These need to remain in the plan tree for subquery decorrelation to process them.
+ * Check if a scalar expression tree contains ANY subquery — a scalar subquery,
+ * an `EXISTS (…)`, or an `IN (SELECT …)`. Each carries an inner relational plan
+ * (with its own RetrieveNode) that must stay in the region the bottom-up physical
+ * pass covers, whether or not it is correlated. Correlation is deliberately NOT
+ * consulted: a self-contained subquery buries an unphysicalized Retrieve just the
+ * same as a correlated one.
  */
-function predicateContainsCorrelatedSubquery(expr: PlanNode): boolean {
-	if (expr instanceof ExistsNode) {
-		return isCorrelatedSubquery(expr.subquery);
+function predicateContainsSubquery(expr: PlanNode): boolean {
+	if (expr instanceof ExistsNode || expr instanceof ScalarSubqueryNode) {
+		return true;
 	}
 	if (expr instanceof InNode && expr.source) {
-		return isCorrelatedSubquery(expr.source);
+		return true;
 	}
 	for (const child of expr.getChildren()) {
-		if (predicateContainsCorrelatedSubquery(child)) {
+		if (predicateContainsSubquery(child)) {
 			return true;
 		}
 	}

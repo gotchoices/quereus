@@ -46,6 +46,7 @@ RetrieveNode
 - **Grow-retrieve rule**: When sliding `Retrieve` upward over a `Filter` (index-style fallback):
   - The rule mirrors the pushdown behavior: only supported fragments of the enveloped node are placed beneath `Retrieve` as a new `Filter`. The residual remains above.
   - Bindings are collected from the added fragment and merged into `Retrieve.bindings`.
+  - **Subquery-bearing residual carve-out**: the index-style residual is normally stashed on `moduleCtx.residualPredicate` and rebuilt into a `Filter` by `rule-select-access-path`. But a residual that contains ANY subquery (`IN (SELECT …)`, `EXISTS`, or a scalar subquery) is instead kept above the grown `Retrieve` as a real `FilterNode` at grow time. A stashed subquery would carry its own inner `Retrieve` outside the plan tree the bottom-up physical pass walks, leaving it unphysicalized (it surfaces as the missing-emitter error in the physicalization invariant below). Correlation is irrelevant — a self-contained subquery buries an inner `Retrieve` just the same as a correlated one.
 
 This policy ensures the `Retrieve` pipeline is always a precise description of what the module/index can handle; unsupported parts never enter the boundary.
 
