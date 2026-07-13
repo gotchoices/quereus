@@ -495,12 +495,17 @@ detected and converted into an overwrite rather than a fresh insert.
 
 When scanning via secondary index:
 
-1. Execute index scan on overlay table → returns overlay rows matching index predicate
-2. Execute index scan on underlying table → returns committed rows matching predicate
-3. Merge by primary key:
-   - Overlay tombstone for PK → skip underlying row
-   - Overlay row for PK → emit overlay row, skip underlying
-   - No overlay entry → emit underlying row
+1. Full-scan the overlay ONCE. Collect the set of PKs it modified (tombstones included) and,
+   for each live (non-tombstone) row, keep it only if it satisfies the query's pushed
+   constraints — the isolation layer re-applies that window itself (`buildConstraintMatcher`),
+   because the overlay is never asked to resolve the scan's index name. That name may be one
+   the underlying minted per plan (e.g. lamina's `_compound_v_0`), which no overlay declares.
+2. Sort the kept overlay rows by the scan's `(indexKey…, pk…)` sort key — the full scan emits
+   PK order, so the merge cannot rely on the overlay's emission order.
+3. Execute the index scan on the underlying table → committed rows in sort-key order.
+4. Merge the two sorted streams by sort key:
+   - Underlying row whose PK is in the modified set → skip (overlay shadows it)
+   - Otherwise interleave overlay and underlying rows by sort key
 
 The set of PKs modified in the overlay (used to exclude shadowed underlying rows)
 is keyed with the engine's canonical `serializeRowKey` encoder — one string

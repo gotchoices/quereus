@@ -3540,6 +3540,49 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			// interleave between the underlying's 'e' and 'a'.
 			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[5, 'e'], [3, 'd'], [4, 'aa'], [1, 'a']]);
 		});
+
+		it('multi-range OR window over the synthetic name: overlay rows are filtered per range, not conjunctively', async () => {
+			// buildMultiRangeWindowMatcher decodes the OR-of-ranges from the idxStr rangeOps
+			// params (the constraint entries are positional GE placeholders for this plan).
+			// A naive conjunctive read of those placeholders would drop EVERY valid row; this
+			// pins the OR semantics for the one plan kind where getting it wrong loses data.
+			const { table, vIdx } = await stage(
+				"insert into t values (1,'a'),(2,'e')",   // both committed rows sit inside a range
+				[
+					[3, 'b', 0],   // staged insert inside range 1 ['a','b']
+					[4, 'c', 0],   // staged insert BETWEEN the ranges — must be dropped
+					[5, 'f', 0],   // staged insert inside range 2 ['e','f']
+				],
+			);
+
+			// v in ['a','b'] OR v in ['e','f']. rangeOps encodes ge:le per range; args are
+			// (lower, upper) per range in the planner's emission order.
+			const base = makeFullScanFilterInfo();
+			const idxStr = `idx=${SYNTH}(0);plan=6;rangeCount=2;rangeOps=ge:le,ge:le`;
+			const args: SqlValue[] = ['a', 'b', 'e', 'f'];
+			const filter: FilterInfo = {
+				...base,
+				idxStr,
+				constraints: args.map((_v, i) => ({
+					constraint: { iColumn: vIdx, op: IndexConstraintOp.GE, usable: true },
+					argvIndex: i + 1,
+				})),
+				args,
+				accessPath: {
+					kind: 'index',
+					plan: 'multiRangeSeek',
+					index: { name: SYNTH, role: 'secondary', keyColumns: [{ columnIndex: vIdx, desc: false }], unique: false },
+				},
+				indexInfoOutput: { ...base.indexInfoOutput, idxStr },
+			};
+
+			const rows = await asyncIterableToArray(table.query!(filter));
+
+			// (4,'c') dropped by the OR window; the rest merge in (v, pk) order. The
+			// underlying does not itself range-filter here, so it is seeded only with
+			// in-window committed rows.
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[1, 'a'], [3, 'b'], [2, 'e'], [5, 'f']]);
+		});
 	});
 
 	describe('schema-qualified tableName (underlying-advertised)', () => {
