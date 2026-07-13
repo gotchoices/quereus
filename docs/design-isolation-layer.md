@@ -294,9 +294,13 @@ This is analogous to LSM-tree merge or 3-way merge in version control.
 1. Execute query against overlay first
 2. Execute same query against underlying module
 3. Merge results using primary key ordering
-4. For index scans: consult overlay's secondary index for its live rows' index keys, and its
-   primary-key scan for the set of PKs the overlay modified (tombstones included) so the
-   underlying's shadowed rows are dropped from the merge
+4. For secondary-index scans: one full scan of the overlay collects both the set of PKs the
+   overlay modified (tombstones included, so the underlying's shadowed rows drop from the
+   merge) and the overlay's live rows. The isolation layer itself re-applies the query's
+   pushed constraints to those rows and sorts them by the scan's (indexKey, PK) key before
+   merging — the overlay is never asked to resolve the scan's index name, because an
+   underlying module may drive the scan under an index it minted per plan (e.g. lamina's
+   `_compound_v_0`), a name no table schema (and therefore no overlay) declares
 
 ### Write Operations
 
@@ -454,9 +458,16 @@ Uses the secondary index. If the overlay only tracks by primary key:
 2. Underlying returns row with `id = 5`
 3. But overlay might have deleted id=5, or updated its email to something else!
 
-The overlay table must have the same indexes as the underlying table so that:
-- Index scans on overlay find pending inserts/updates by index key
-- Merge can correctly combine overlay and underlying index scan results
+The merge handles this by excluding every PK the overlay touched from the underlying's
+stream and contributing the overlay's live rows instead (filtered to the query's window and
+sorted by the scan's sort key — see *Read Operations* above; the merged read deliberately
+never queries the overlay by the scan's index name, which may be a name the underlying
+minted per plan). The overlay still copies the underlying's secondary indexes and UNIQUE
+constraints so that:
+- The overlay's own module natively enforces the table's UNIQUE constraints on staged rows
+  (narrowed to live rows, below)
+- Mid-transaction index DDL can validate and rebuild overlays under the same schema shape
+  as the underlying
 
 ### Overlay Table Schema
 

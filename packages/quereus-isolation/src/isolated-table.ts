@@ -1,5 +1,5 @@
-import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, validateAndParse } from '@quereus/quereus';
+import type { CollationFunction, CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, resolveCollationFunctions, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, normalizeCollationName, serializeRowKey, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, validateAndParse, IndexConstraintOp, decodeIdxStr } from '@quereus/quereus';
 import type { EffectiveRowSource, KeyNormalizerResolver } from '@quereus/quereus';
 import type { IsolationModule, ConnectionOverlayState } from './isolation-module.js';
 import { IsolatedConnection, type IsolatedTableCallback } from './isolated-connection.js';
@@ -15,7 +15,7 @@ const EMPTY_PK_KEY_SHAPE: { functions: CollationFunction[]; directions: boolean[
  */
 type IndexScanInfo =
 	| { type: 'primary' }
-	| { type: 'secondary'; indexName: string; columnIndices: number[] };
+	| { type: 'secondary'; indexName: string; columnIndices: number[]; keyColumns: readonly IndexKeyColumn[] };
 
 /**
  * A table wrapper that provides transaction isolation via an overlay.
@@ -435,10 +435,19 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 	 *
 	 * Instead of position-based merging (which fails when overlay entries have
 	 * different index key values than the underlying rows they shadow), this:
-	 * 1. Collects all PKs modified in the overlay (full scan)
-	 * 2. Queries underlying via secondary index, excluding modified PKs
-	 * 3. Queries overlay via secondary index for non-tombstone data rows
-	 * 4. Merges the two disjoint, sorted streams by sort key
+	 * 1. Full-scans the overlay ONCE, collecting all modified PKs and the non-tombstone
+	 *    data rows that fall inside the query's constraint window
+	 * 2. Sorts the collected overlay rows by the scan's (indexKey, PK) sort key
+	 * 3. Queries underlying via secondary index, excluding modified PKs, and merges the
+	 *    sorted overlay rows in by sort key
+	 *
+	 * The overlay is deliberately never asked to resolve the query's index name. The
+	 * underlying module may drive this scan under an index it minted itself (lamina
+	 * mints `_column_<id>_`, `_compound_<name>_`, `_nd_<name>_`, `_intersect_<ids>_`
+	 * per plan) — a name no table schema, and therefore no overlay, declares — so
+	 * re-issuing the index-named FilterInfo against the overlay would throw
+	 * "Secondary index not found". The isolation layer filters and sorts the overlay
+	 * delta itself instead.
 	 */
 	private async *mergedSecondaryIndexQuery(
 		overlay: VirtualTable,
@@ -476,27 +485,40 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return this.keyNormalizerResolver(pkKeyCollationName(column));
 		});
 
-		// Step 1: Collect all PKs modified in overlay (full scan)
+		// Step 1: one full overlay scan collects the modified PKs AND the in-window
+		// non-tombstone data rows. The window filter is applied here, unconditionally —
+		// whether the engine adds a residual Filter above the isolation scan depends on
+		// the underlying's handledFilters, which the isolation layer does not control.
+		// NOTE: full-scans the overlay on every merged secondary read. Fine while an
+		// overlay holds a single transaction's writes (small); if isolation-write volume
+		// ever makes overlays large and this shows up hot, retarget to an overlay index
+		// with the same key columns when one exists, keeping this full scan as the
+		// fallback for underlying-minted index names no overlay index matches.
+		const matchesWindow = this.buildConstraintMatcher(filterInfo);
 		const modifiedPKs = new Set<string>();
+		const overlayRows: Row[] = [];
 		for await (const row of overlay.query(this.createFullScanFilterInfo())) {
 			// `!` is safe: PK columns are NOT NULL, so serializeRowKey never returns
 			// null here; both sides use the same encoder so they stay consistent.
 			modifiedPKs.add(serializeRowKey(row, pkIndices, pkNormalizers)!);
-		}
-
-		// Step 2: Query overlay via secondary index for non-tombstone data rows
-		const overlayFilterInfo = this.adaptFilterInfoForOverlay(filterInfo);
-		const overlayRows: Row[] = [];
-		for await (const row of overlay.query(overlayFilterInfo)) {
 			if (row[tombstoneIndex] !== 1) {
-				overlayRows.push(row.slice(0, tombstoneIndex));
+				const dataRow = row.slice(0, tombstoneIndex);
+				if (matchesWindow(dataRow)) {
+					overlayRows.push(dataRow);
+				}
 			}
 		}
 
-		// Step 3: Query underlying via secondary index, filter out modified PKs
+		// Step 2: sort the collected overlay rows by the merge's sort key. The full scan
+		// emits in PK order, and the step-3 merge walks overlayRows expecting
+		// (indexKey, PK) order — sorting here decouples merge correctness from whatever
+		// order the overlay happens to emit.
 		const mergeConfig = this.buildMergeConfig(indexInfo);
 		const compareSortKey = mergeConfig.compareSortKey ?? mergeConfig.comparePK;
 		const extractSortKey = mergeConfig.extractSortKey ?? mergeConfig.extractPK;
+		overlayRows.sort((a, b) => compareSortKey(extractSortKey(a), extractSortKey(b)));
+
+		// Step 3: query underlying via secondary index, filter out modified PKs
 
 		// Merge two sorted, disjoint streams
 		let oi = 0;
@@ -560,6 +582,7 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						type: 'secondary',
 						indexName: path.index.name,
 						columnIndices: path.index.keyColumns.map(c => c.columnIndex),
+						keyColumns: path.index.keyColumns,
 					};
 			case 'unresolvedIndex':
 				throw new QuereusError(
@@ -597,6 +620,160 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return retargetFilterInfoIndex(filterInfo, PRIMARY_INDEX_NAME);
 		}
 		return filterInfo;
+	}
+
+	/**
+	 * Builds the window predicate for the overlay side of a merged secondary-index read.
+	 *
+	 * The overlay is full-scanned there (it cannot resolve an underlying-minted index
+	 * name), so every staged row surfaces — including rows outside the query's window.
+	 * This predicate re-applies the pushed constraints that the underlying's index seek
+	 * enforces on its own stream.
+	 *
+	 * Interpretation follows the plan kind:
+	 * - `scan` pushes no window — everything matches.
+	 * - `eqSeek` / `rangeSeek` / `prefixRangeSeek` / `multiSeek` carry one genuine
+	 *   (column, op, value) triple per constraint entry. Per-column EQ values form an
+	 *   IN set — the planner encodes an IN multi-seek as one EQ constraint per seek
+	 *   value on the same column, and a composite IN as its full per-column
+	 *   cross-product — so EQ matches when the row equals ANY of the column's values,
+	 *   while range bounds all AND together.
+	 * - `multiRangeSeek` constraint entries are positional placeholders (every arg is
+	 *   stamped GE); the real OR-of-ranges lives in the idxStr `rangeOps` parameters,
+	 *   decoded by {@link buildMultiRangeWindowMatcher}.
+	 *
+	 * Comparisons run under the index key column's collation (falling back to the table
+	 * column's, then BINARY) with seek semantics for NULL: a NULL operand or a NULL row
+	 * value never matches, mirroring what an index seek returns. Operators the matcher
+	 * does not interpret (LIKE, MATCH, ...) are ignored — that can only let through
+	 * rows a residual Filter above still removes, never drop rows.
+	 */
+	private buildConstraintMatcher(filterInfo: FilterInfo): (row: Row) => boolean {
+		const path = filterInfo.accessPath;
+		// Only 'index' paths reach the merged secondary read (resolveScanIndex gates on
+		// the access path first); an ordering-only walk pushes no window.
+		if (path?.kind !== 'index' || path.plan === 'scan') {
+			return () => true;
+		}
+		if (path.plan === 'multiRangeSeek') {
+			return this.buildMultiRangeWindowMatcher(filterInfo, path.index);
+		}
+
+		interface ColumnWindow {
+			collation: CollationFunction;
+			eqValues: SqlValue[];
+			ranges: { op: IndexConstraintOp; value: SqlValue }[];
+		}
+		const windows = new Map<number, ColumnWindow>();
+		const windowFor = (columnIndex: number): ColumnWindow => {
+			let window = windows.get(columnIndex);
+			if (!window) {
+				window = { collation: this.constraintCollation(columnIndex, path.index), eqValues: [], ranges: [] };
+				windows.set(columnIndex, window);
+			}
+			return window;
+		};
+
+		for (const { constraint, argvIndex } of filterInfo.constraints) {
+			if (argvIndex <= 0) continue;
+			const value = filterInfo.args[argvIndex - 1];
+			switch (constraint.op) {
+				case IndexConstraintOp.EQ:
+					windowFor(constraint.iColumn).eqValues.push(value);
+					break;
+				case IndexConstraintOp.GT:
+				case IndexConstraintOp.GE:
+				case IndexConstraintOp.LT:
+				case IndexConstraintOp.LE:
+					windowFor(constraint.iColumn).ranges.push({ op: constraint.op, value });
+					break;
+				default:
+					break; // uninterpreted op — see doc comment
+			}
+		}
+
+		if (windows.size === 0) return () => true;
+		const entries = [...windows.entries()];
+
+		return (row: Row): boolean => {
+			for (const [columnIndex, window] of entries) {
+				const rowValue = row[columnIndex];
+				if (rowValue === null) return false;
+				if (window.eqValues.length > 0
+					&& !window.eqValues.some(v => v !== null && compareSqlValuesFast(rowValue, v, window.collation) === 0)) {
+					return false;
+				}
+				for (const { op, value } of window.ranges) {
+					if (value === null || !satisfiesBound(compareSqlValuesFast(rowValue, value, window.collation), op)) {
+						return false;
+					}
+				}
+			}
+			return true;
+		};
+	}
+
+	/**
+	 * Window matcher for a `multiRangeSeek` — an OR of ranges over the index's leading
+	 * key column. The FilterInfo's constraint entries are positional placeholders for
+	 * this plan kind, so the ranges are decoded from the idxStr `rangeCount`/`rangeOps`
+	 * parameters exactly as the memory module's scan-plan builder does.
+	 */
+	private buildMultiRangeWindowMatcher(filterInfo: FilterInfo, index: IndexDescriptor): (row: Row) => boolean {
+		const keyColumn = index.keyColumns[0];
+		const spec = decodeIdxStr(filterInfo.idxStr);
+		if (!keyColumn || !spec) return () => true;
+
+		interface Bound { strict: boolean; value: SqlValue }
+		const rangeCount = parseInt(spec.params.get('rangeCount') ?? '0', 10);
+		const rangeOpsList = (spec.params.get('rangeOps') ?? '').split(',');
+		const { args } = filterInfo;
+		const ranges: { lower?: Bound; upper?: Bound }[] = [];
+		let argIdx = 0;
+		for (let i = 0; i < rangeCount; i++) {
+			const range: { lower?: Bound; upper?: Bound } = {};
+			for (const op of (rangeOpsList[i] ?? '').split(':')) {
+				if (op === 'gt' || op === 'ge') {
+					range.lower = { strict: op === 'gt', value: args[argIdx++] };
+				} else if (op === 'lt' || op === 'le') {
+					range.upper = { strict: op === 'lt', value: args[argIdx++] };
+				}
+			}
+			ranges.push(range);
+		}
+		if (ranges.length === 0) return () => true;
+
+		const columnIndex = keyColumn.columnIndex;
+		const collation = this.constraintCollation(columnIndex, index);
+		return (row: Row): boolean => {
+			const rowValue = row[columnIndex];
+			if (rowValue === null) return false;
+			return ranges.some(({ lower, upper }) => {
+				if (lower) {
+					if (lower.value === null) return false;
+					const cmp = compareSqlValuesFast(rowValue, lower.value, collation);
+					if (lower.strict ? cmp <= 0 : cmp < 0) return false;
+				}
+				if (upper) {
+					if (upper.value === null) return false;
+					const cmp = compareSqlValuesFast(rowValue, upper.value, collation);
+					if (upper.strict ? cmp >= 0 : cmp > 0) return false;
+				}
+				return true;
+			});
+		};
+	}
+
+	/**
+	 * Comparison collation for a window-matcher column: the index key column's declared
+	 * collation when the column is part of the scanned index (the seek's own window
+	 * follows the index collation), else the table column's declared collation, else
+	 * BINARY.
+	 */
+	private constraintCollation(columnIndex: number, index: IndexDescriptor): CollationFunction {
+		const name = index.keyColumns.find(kc => kc.columnIndex === columnIndex)?.collation
+			?? this.tableSchema?.columns[columnIndex]?.collation;
+		return name ? this.collationResolver(name) : BINARY_COLLATION;
 	}
 
 	/**
@@ -683,8 +860,13 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			return [...indexKey, ...pk];
 		};
 
-		// Try to use the underlying table's per-column index comparators if available
-		const indexComparators = this.underlyingTable.getIndexComparator?.(indexInfo.indexName);
+		// Prefer the underlying table's per-column index comparators; when it exposes
+		// none for this index (always the case for a module-minted synthetic name),
+		// derive them from the descriptor's key columns so a DESC or collated key
+		// column still merges in the underlying's emission order rather than a
+		// BINARY-ascending guess.
+		const indexComparators = this.underlyingTable.getIndexComparator?.(indexInfo.indexName)
+			?? this.buildDescriptorComparators(indexInfo.keyColumns);
 		const compareSortKey = this.buildCompareSortKey(indexColIndices.length, comparePK, indexComparators);
 
 		return {
@@ -766,6 +948,23 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			}
 			return 0;
 		};
+	}
+
+	/**
+	 * Per-column comparators derived from an index descriptor's key columns — the
+	 * fallback when the underlying exposes no `getIndexComparator` for the index
+	 * (always the case for a module-minted synthetic name). Honors each key column's
+	 * declared direction and collation so the merge walks the underlying's emission
+	 * order.
+	 */
+	private buildDescriptorComparators(keyColumns: readonly IndexKeyColumn[]): ((a: SqlValue, b: SqlValue) => number)[] {
+		return keyColumns.map(kc => {
+			const collation = kc.collation ? this.collationResolver(kc.collation) : BINARY_COLLATION;
+			return (a: SqlValue, b: SqlValue) => {
+				const cmp = compareSqlValuesFast(a, b, collation);
+				return kc.desc ? -cmp : cmp;
+			};
+		});
 	}
 
 	/**
@@ -1747,6 +1946,17 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			}
 		}
 		// If overlay's registered connection has this savepoint, it handles rollback
+	}
+}
+
+/** True when a comparator result `cmp` (row value vs bound value) satisfies the range op. */
+function satisfiesBound(cmp: number, op: IndexConstraintOp): boolean {
+	switch (op) {
+		case IndexConstraintOp.GT: return cmp > 0;
+		case IndexConstraintOp.GE: return cmp >= 0;
+		case IndexConstraintOp.LT: return cmp < 0;
+		case IndexConstraintOp.LE: return cmp <= 0;
+		default: return true;
 	}
 }
 

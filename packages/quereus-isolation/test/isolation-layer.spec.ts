@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { Database, MemoryTableModule, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
-import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs } from '@quereus/quereus';
+import { Database, MemoryTableModule, VirtualTable, AccessPlanBuilder, IndexConstraintOp, asyncIterableToArray, getModuleConcurrencyMode, QuereusError, StatusCode, primaryKeyDescriptor, ConflictResolution } from '@quereus/quereus';
+import type { VtabConcurrencyMode, FilterInfo, VirtualTableModule, BaseModuleConfig, DatabaseInternal, Row, SqlValue, VirtualTableConnection, SchemaChangeInfo, TableSchema, BestAccessPlanRequest, BestAccessPlanResult, UpdateArgs, UpdateResult, IndexDescriptor } from '@quereus/quereus';
 import { IsolationModule, IsolatedTable } from '../src/index.js';
 import type { ConnectionOverlayState } from '../src/index.js';
 import { makeFullScanFilterInfo } from '../src/filter-info.js';
@@ -3331,6 +3331,214 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			const rb = await asyncIterableToArray(adb.eval('select id, v from b order by id'));
 			expect(ra.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'a1']]);
 			expect(rb.map((r: any) => [r.id, r.v])).to.deep.equal([[1, 'b1']]);
+		});
+	});
+
+	describe('underlying-minted secondary index names (synthetic scan shapes)', () => {
+		// An underlying module may drive a secondary scan under an index name it minted
+		// itself (lamina mints `_column_<id>_`, `_compound_<name>_`, `_nd_<name>_`,
+		// `_intersect_<ids>_` per plan) — a name no table schema declares, so the overlay's
+		// private scratch table can never resolve it. The merged secondary read must
+		// full-scan + window-filter + sort the overlay delta itself instead of re-issuing
+		// the index-named FilterInfo against the overlay, which threw
+		// "Secondary index '_compound_v_0' not found".
+		const SYNTH = '_compound_v_0';
+
+		/** Underlying table whose secondary scan shape is the synthetic index: emits rows
+		 *  in `v` order (descending when the module says so) and applies pushed EQ
+		 *  constraints, like a real module would. */
+		class SynthUnderlyingTable extends VirtualTable {
+			private readonly mod: SynthUnderlyingModule;
+			private readonly key: string;
+
+			constructor(db: Database, module: SynthUnderlyingModule, schema: TableSchema) {
+				super(db, module, schema.schemaName, schema.name);
+				this.tableSchema = schema;
+				this.mod = module;
+				this.key = `${schema.schemaName}.${schema.name}`.toLowerCase();
+				if (!this.mod.store.has(this.key)) this.mod.store.set(this.key, []);
+			}
+
+			async disconnect(): Promise<void> { /* no-op */ }
+
+			async update(args: UpdateArgs): Promise<UpdateResult> {
+				if (args.operation === 'insert' && args.values) {
+					const rows = this.mod.store.get(this.key)!;
+					rows.push([...args.values] as Row);
+					rows.sort((a, b) => Number(a[0]) - Number(b[0]));
+					return { status: 'ok', row: args.values };
+				}
+				return { status: 'ok' };
+			}
+
+			async *query(filterInfo: FilterInfo): AsyncIterable<Row> {
+				const rows = [...(this.mod.store.get(this.key) ?? [])];
+				const dir = this.mod.desc ? -1 : 1;
+				rows.sort((a, b) => dir * (String(a[1]) < String(b[1]) ? -1 : String(a[1]) > String(b[1]) ? 1 : 0));
+				for (const row of rows) {
+					const inWindow = filterInfo.constraints.every(({ constraint, argvIndex }) =>
+						argvIndex <= 0
+						|| constraint.op !== IndexConstraintOp.EQ
+						|| row[constraint.iColumn] === filterInfo.args[argvIndex - 1]);
+					if (inWindow) yield row as Row;
+				}
+			}
+		}
+
+		/** Module that advertises every plan under the synthetic secondary index name,
+		 *  supplying the matching descriptor (the contract a module owes the engine when
+		 *  it names an index the table schema cannot resolve). */
+		class SynthUnderlyingModule implements VirtualTableModule<SynthUnderlyingTable, BaseModuleConfig> {
+			readonly store = new Map<string, Row[]>();
+
+			constructor(readonly desc = false) {}
+
+			async create(cdb: Database, schema: TableSchema): Promise<SynthUnderlyingTable> {
+				return new SynthUnderlyingTable(cdb, this, schema);
+			}
+
+			async connect(
+				cdb: Database,
+				_pAux: unknown,
+				_moduleName: string,
+				schemaName: string,
+				tableName: string,
+				_options: BaseModuleConfig,
+				importedTableSchema?: TableSchema,
+			): Promise<SynthUnderlyingTable> {
+				if (!importedTableSchema) {
+					throw new Error(`Table ${schemaName}.${tableName} connected without a schema`);
+				}
+				return new SynthUnderlyingTable(cdb, this, importedTableSchema);
+			}
+
+			async destroy(): Promise<void> { /* store is per-instance */ }
+
+			getBestAccessPlan(_cdb: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
+				const vIdx = tableInfo.columnIndexMap.get('v')!;
+				const descriptor: IndexDescriptor = {
+					name: SYNTH,
+					role: 'secondary',
+					keyColumns: [{ columnIndex: vIdx, desc: this.desc }],
+					unique: false,
+				};
+				return AccessPlanBuilder.fullScan(request.estimatedRows ?? 100)
+					.setHandledFilters(new Array(request.filters.length).fill(false))
+					.setIndexName(SYNTH)
+					.setIndexDescriptor(descriptor)
+					.setExplanation('SynthUnderlyingModule walk under a minted secondary index name')
+					.build();
+			}
+		}
+
+		/** FilterInfo shaped the way the engine builds one for a scan the underlying chose
+		 *  to drive under the synthetic index: idxStr names SYNTH, accessPath carries the
+		 *  module-supplied descriptor. */
+		function synthFilter(vIdx: number, constraints: FilterInfo['constraints'] = [], args: SqlValue[] = [], desc = false): FilterInfo {
+			const idxStr = `idx=${SYNTH}(0);plan=2`;
+			const base = makeFullScanFilterInfo();
+			return {
+				...base,
+				idxStr,
+				constraints,
+				args,
+				accessPath: {
+					kind: 'index',
+					plan: 'eqSeek',
+					index: { name: SYNTH, role: 'secondary', keyColumns: [{ columnIndex: vIdx, desc }], unique: false },
+				},
+				indexInfoOutput: { ...base.indexInfoOutput, idxStr },
+			};
+		}
+
+		let ndb: Database | undefined;
+
+		afterEach(async () => { await ndb?.close(); ndb = undefined; });
+
+		/** Builds a fresh Database + IsolationModule over a synthetic-index underlying,
+		 *  seeds committed rows, stages `overlayRows` (tombstone column included) into a
+		 *  live dirty overlay, and returns the connected IsolatedTable plus the `v`
+		 *  column index. */
+		async function stage(committedInsert: string, overlayRows: Row[], desc = false): Promise<{ table: IsolatedTable; vIdx: number }> {
+			ndb = new Database();
+			const iso = new IsolationModule({ underlying: new SynthUnderlyingModule(desc) });
+			ndb.registerModule('isolated', iso);
+			await ndb.exec('create table t (id integer primary key, v text) using isolated');
+			await ndb.exec(committedInsert); // autocommit → flushed to the underlying
+
+			const underlying = iso.getUnderlyingState('main', 't')!.underlyingTable;
+			const overlay = await iso.overlayModule.create(ndb, iso.createOverlaySchema(underlying.tableSchema!));
+			for (const row of overlayRows) {
+				await overlay.update({ operation: 'insert', values: row });
+			}
+			iso.setConnectionOverlay(ndb, 'main', 't', { overlayTable: overlay, hasChanges: true, db: ndb });
+
+			const vIdx = underlying.tableSchema!.columnIndexMap.get('v')!;
+			const table = await iso.connect(ndb, undefined, 'isolated', 'main', 't', {} as unknown as BaseModuleConfig) as IsolatedTable;
+			return { table, vIdx };
+		}
+
+		it('merged read over the synthetic name yields the full row set in index order (was: Secondary index not found)', async () => {
+			const { table, vIdx } = await stage(
+				"insert into t values (1,'a'),(2,'b'),(3,'c'),(5,'e')",
+				[
+					[4, 'aa', 0],   // staged insert
+					[2, null, 1],   // staged delete of id=2 (tombstone)
+					[3, 'd', 0],    // staged update of id=3, moving its index key past 'c'
+				],
+			);
+
+			const rows = await asyncIterableToArray(table.query!(synthFilter(vIdx)));
+
+			// Merged view in (v, pk) order. The overlay's full scan emits PK order
+			// (tombstone 2, then 3-'d', then 4-'aa'); only the isolation layer's explicit
+			// sort interleaves 'aa'(4) before 'd'(3) between the underlying's 'a' and 'e'.
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[1, 'a'], [4, 'aa'], [3, 'd'], [5, 'e']]);
+		});
+
+		it('equality window over the synthetic name: the isolation layer filters out-of-window overlay rows', async () => {
+			const { table, vIdx } = await stage(
+				"insert into t values (1,'a'),(2,'b'),(3,'c')",
+				[
+					[4, 'b', 0],  // staged insert inside the v='b' window
+					[5, 'z', 0],  // staged insert outside it — must not surface
+				],
+			);
+
+			const filter = synthFilter(
+				vIdx,
+				[{ constraint: { iColumn: vIdx, op: IndexConstraintOp.EQ, usable: true }, argvIndex: 1 }],
+				['b'],
+			);
+			const rows = await asyncIterableToArray(table.query!(filter));
+
+			// The underlying applies the EQ itself and contributes (2,'b'); the overlay's
+			// (4,'b') joins it in (v, pk) order. (5,'z') is dropped by the isolation
+			// layer's own window filter — this direct query() call has no residual Filter
+			// node above it to catch it.
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[2, 'b'], [4, 'b']]);
+		});
+
+		it('a synthetic index with a DESC key column merges in the underlying descending emission order', async () => {
+			// The overlay cannot resolve the synthetic name, and the underlying exposes no
+			// getIndexComparator for it either — the merge comparator must come from the
+			// descriptor's key columns (desc: true here), or the overlay rows would be
+			// interleaved ascending against a descending underlying stream.
+			const { table, vIdx } = await stage(
+				"insert into t values (1,'a'),(2,'b'),(3,'c'),(5,'e')",
+				[
+					[4, 'aa', 0],   // staged insert
+					[2, null, 1],   // staged delete of id=2
+					[3, 'd', 0],    // staged update of id=3
+				],
+				true,
+			);
+
+			const rows = await asyncIterableToArray(table.query!(synthFilter(vIdx, [], [], true)));
+
+			// Descending (v) order: 'e'(5), 'd'(3), 'aa'(4), 'a'(1) — both overlay rows
+			// interleave between the underlying's 'e' and 'a'.
+			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[5, 'e'], [3, 'd'], [4, 'aa'], [1, 'a']]);
 		});
 	});
 
