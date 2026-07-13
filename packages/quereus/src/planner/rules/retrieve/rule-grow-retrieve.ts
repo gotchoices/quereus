@@ -38,7 +38,6 @@ import { PlanNodeType as _PlanNodeType } from '../../nodes/plan-node-type.js';
 import { LiteralNode, BinaryOpNode } from '../../nodes/scalar.js';
 import { collectBindingsInPlan } from '../../analysis/binding-collector.js';
 import type * as AST from '../../../parser/ast.js';
-import { ExistsNode, InNode, ScalarSubqueryNode } from '../../nodes/subquery.js';
 import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-style-context.js';
 
 const log = createLogger('optimizer:rule:grow-retrieve');
@@ -606,22 +605,19 @@ function trySortAbsorbViaIndexOrdering(sort: SortNode, context: OptContext): Pla
 }
 
 /**
- * Check if a scalar expression tree contains ANY subquery — a scalar subquery,
- * an `EXISTS (…)`, or an `IN (SELECT …)`. Each carries an inner relational plan
- * (with its own RetrieveNode) that must stay in the region the bottom-up physical
- * pass covers, whether or not it is correlated. Correlation is deliberately NOT
- * consulted: a self-contained subquery buries an unphysicalized Retrieve just the
- * same as a correlated one.
+ * Check whether a scalar residual predicate embeds ANY subquery. Every subquery
+ * node (`IN (SELECT …)`, `EXISTS`, scalar subquery, and any future ANY/ALL/row
+ * variant) hangs a RelationalPlanNode — with its own RetrieveNode — beneath a scalar
+ * predicate, so "contains a relational descendant" is exactly "contains a subquery".
+ * Detecting it structurally rather than by node class keeps this robust as new
+ * subquery node types are added. Such a residual must stay in the region the
+ * bottom-up physical pass covers, whether or not the subquery is correlated: a
+ * self-contained subquery buries an unphysicalized Retrieve just the same as a
+ * correlated one.
  */
 function predicateContainsSubquery(expr: PlanNode): boolean {
-	if (expr instanceof ExistsNode || expr instanceof ScalarSubqueryNode) {
-		return true;
-	}
-	if (expr instanceof InNode && expr.source) {
-		return true;
-	}
 	for (const child of expr.getChildren()) {
-		if (predicateContainsSubquery(child)) {
+		if (isRelationalNode(child) || predicateContainsSubquery(child)) {
 			return true;
 		}
 	}

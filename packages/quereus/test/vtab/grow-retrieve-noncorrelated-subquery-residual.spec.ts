@@ -62,6 +62,13 @@ describe('grow-retrieve: non-correlated subquery residual stays physicalizable',
 		expect(await ids('select id from entity where id = 40 and id = (select max(val) from other) order by id'))
 			.to.deep.equal([40]));
 
+	// NOT IN (subquery) lowers to a NOT-wrapped InNode; the walker still finds the
+	// buried inner Retrieve structurally (any relational descendant), so the residual
+	// stays above the grown Retrieve.
+	it('keeps a non-correlated NOT IN (subquery) residual above the grown Retrieve', async () =>
+		expect(await ids('select id from entity where id = 10 and id not in (select val from other) order by id'))
+			.to.deep.equal([10]));
+
 	it('still returns the plain IN (subquery) (no extra conjunct) correctly', async () =>
 		expect(await ids('select id from entity where id in (select val from other) order by id'))
 			.to.deep.equal([20, 40]));
