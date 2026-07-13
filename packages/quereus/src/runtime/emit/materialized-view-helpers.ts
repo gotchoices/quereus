@@ -59,6 +59,35 @@ export function materializedViewNotASetError(schemaName: string, viewName: strin
 	);
 }
 
+/**
+ * Purpose-built diagnostic for a refresh that would store a NULL into a backing column
+ * the schema declares NOT NULL *and* that is a physical-PK member. This is the exact
+ * reachable contradiction: the view's `order by <col>` seeded the column into the
+ * backing's **physical** primary key ({@link computeBackingPrimaryKey}), which keeps it
+ * declared NOT NULL even after the source column loosened to nullable — a physical-PK
+ * column cannot drop NOT NULL (`MemoryTableManager.alterColumn` refuses it, and the
+ * refresh reshape masks the doomed loosen — see {@link isPhysicalPkColumn}). Once the
+ * source column becomes nullable and the recomputed body yields a NULL row, storing it
+ * would leave the backing schema declaring NOT NULL while holding a NULL — a silent
+ * contradiction. Refresh raises this instead, naming the column, the cause, and the
+ * remedy.
+ *
+ * NOTE: narrow loud-error guard, not the full fix. The lasting resolution stops
+ * ordering-seeding the physical PK (expressing body order as a materialized secondary
+ * index) — backlog `debt-mv-ordering-seed-to-materialized-index`. Until it lands the MV
+ * cannot be refreshed while a source NULL persists in the seeded column.
+ */
+export function nullInNotNullSeededPkError(schemaName: string, viewName: string, columnName: string): QuereusError {
+	return new QuereusError(
+		`refresh of materialized view '${schemaName}.${viewName}' would store NULL in column '${columnName}', `
+			+ `which the backing declares NOT NULL because the view's \`order by\` seeded it into the physical `
+			+ `primary key; the source column became nullable and now produces a NULL row. Recreate the view `
+			+ `without \`order by ${columnName}\` (or excluding ${columnName} from the ordering) to allow `
+			+ `nullable values in it.`,
+		StatusCode.CONSTRAINT,
+	);
+}
+
 /** Backing-table column/PK/ordering shape derived from the optimized body relation. */
 export interface BackingShape {
 	columns: ColumnSchema[];
@@ -773,6 +802,39 @@ function assertRefreshRowsAreSet(
 }
 
 /**
+ * Refresh guard: reject a rebuild that would store a NULL into a backing column the
+ * schema declares NOT NULL *and* that is a physical-PK member — the precise reachable
+ * contradiction (a NOT-NULL column pinned into the PK by an `order by` seed whose source
+ * loosened to nullable). Throws {@link nullInNotNullSeededPkError} naming the first
+ * offending column. A non-PK NOT-NULL column is not at risk: refresh loosens it in the
+ * backing when its source loosens (it is not physical-PK-pinned), so by the time this
+ * runs a legitimately-loosened non-PK column already reads nullable. A physical-PK column
+ * declared *nullable* (the permitted create-time nullable-source-ordering case) is not
+ * guarded — it self-consistently stores NULL. No-op when no backing column is both NOT
+ * NULL and physical-PK, or no row holds a NULL there — the common case pays one PK-set
+ * build and returns.
+ */
+function assertNoNullInNotNullSeededPk(
+	backing: TableSchema,
+	rows: readonly Row[],
+	schemaName: string,
+	name: string,
+): void {
+	const pkIndices = new Set(backing.primaryKeyDefinition.map(d => d.index));
+	const guarded = backing.columns
+		.map((col, index) => ({ col, index }))
+		.filter(({ col, index }) => col.notNull === true && pkIndices.has(index));
+	if (guarded.length === 0) return;
+	for (const row of rows) {
+		for (const { col, index } of guarded) {
+			if (row[index] === null || row[index] === undefined) {
+				throw nullInNotNullSeededPkError(schemaName, name, col.name);
+			}
+		}
+	}
+}
+
+/**
  * Resolve (or lazily create + register) the table's backing connection for the
  * current transaction — the same discipline as the maintenance manager's
  * `getBackingConnection`, so the reconcile's pending writes ride the
@@ -1459,6 +1521,19 @@ export async function rebuildBacking(db: Database, mv: MaintainedTableSchema): P
 		);
 	}
 	const host = resolveBackingHost(db, backing);
+
+	// Loud-error guard (covers BOTH branches below — neither validates column NOT NULL):
+	// a backing column declared NOT NULL that is also a physical-PK member cannot legally
+	// hold the recomputed NULL a nullable source now produces. The ordering-seeded physical
+	// PK (computeBackingPrimaryKey) pins such a column NOT NULL even after its source column
+	// dropped NOT NULL — the memory manager refuses to loosen a PK column and the reshape
+	// masks the doomed loosen — so at this point the only still-NOT-NULL columns that can
+	// carry source-nullable data are the physical-PK ones. Storing the NULL would make the
+	// backing schema declare NOT NULL while holding a NULL; reject it before either swap.
+	// NOTE: narrow loud guard until `debt-mv-ordering-seed-to-materialized-index` replaces
+	// ordering-seeding with a materialized index. While a source NULL persists in the seeded
+	// column the MV stays un-refreshable (drop + recreate the view without `order by <col>`).
+	assertNoNullInNotNullSeededPk(backing, rows, mv.schemaName, mv.name);
 
 	if (!isMaintainedTable(backing) || !hasApplicableConstraints(db, backing)) {
 		// Fast path: nothing declared to validate (every MV-sugar backing, and a
