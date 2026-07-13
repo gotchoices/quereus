@@ -662,6 +662,60 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 				}
 			});
 
+			it('a maintained UPDATE that sets the seeded PK column to NULL throws CONSTRAINT and leaves the backing intact', async () => {
+				const db = new Database();
+				try {
+					await db.exec('create table par (id integer primary key, x integer not null)');
+					await db.exec('insert into par values (1, 5)');
+					await db.exec('create materialized view par_ix as select id, x from par order by x');
+					await db.exec('alter table par alter column x drop not null');
+
+					// The UPDATE re-keys the backing row (x is the leading PK member), so the guard
+					// sees an insert-image with x = NULL — the same rejection as the INSERT vector.
+					let err: Error | undefined;
+					try {
+						await db.exec('update par set x = null where id = 1');
+					} catch (e) { err = e as Error; }
+					expect(err, 'the maintained NULL update must throw').to.not.be.undefined;
+					expect((err as { code?: number }).code, 'CONSTRAINT status').to.equal(StatusCode.CONSTRAINT);
+					expect(err!.message).to.match(/would store NULL in column 'x'/);
+					// Nothing committed: both backing and source still hold {1,5}.
+					expect(await readObjectsSorted(db, 'select id, x from par_ix')).to.deep.equal(['{"id":1,"x":5}']);
+					expect(await readObjectsSorted(db, 'select id, x from par')).to.deep.equal(['{"id":1,"x":5}']);
+				} finally {
+					await db.close();
+				}
+			});
+
+			it('a full-rebuild-floor MV guards the same skew at the deferred-flush boundary', async () => {
+				const db = new Database();
+				try {
+					await db.exec('create table par (id integer primary key, x integer not null)');
+					await db.exec('insert into par values (1, 5)');
+					// A `union` body falls to the full-rebuild floor (no bounded-delta shape), so its
+					// row-time maintenance is DEFERRED and drained by `flushDeferredRebuilds` — a
+					// distinct guard call site from the per-row `maintainRowTime` arm the tests above
+					// exercise. `order by x` still seeds x into the physical PK.
+					await db.exec('create materialized view par_ix as select id, x from par union select id, x from par order by x');
+					expect(db.schemaManager.getTable('main', 'par_ix')!.primaryKeyDefinition.map(d => d.index))
+						.to.deep.equal([1, 0]);
+					await db.exec('alter table par alter column x drop not null');
+
+					let err: Error | undefined;
+					try {
+						await db.exec('insert into par (id, x) values (2, null)');
+					} catch (e) { err = e as Error; }
+					expect(err, 'the deferred-flush rebuild must throw on the NULL').to.not.be.undefined;
+					expect((err as { code?: number }).code, 'CONSTRAINT status').to.equal(StatusCode.CONSTRAINT);
+					expect(err!.message).to.match(/would store NULL in column 'x'/);
+					// Nothing committed on either side.
+					expect(await readObjectsSorted(db, 'select id, x from par_ix')).to.deep.equal(['{"id":1,"x":5}']);
+					expect(await readObjectsSorted(db, 'select id, x from par')).to.deep.equal(['{"id":1,"x":5}']);
+				} finally {
+					await db.close();
+				}
+			});
+
 			it('a nullable-at-create ordering-seeded PK column keeps accepting NULL maintained inserts (not over-rejected)', async () => {
 				const db = new Database();
 				try {
