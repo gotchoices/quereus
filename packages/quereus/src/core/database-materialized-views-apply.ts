@@ -15,7 +15,7 @@ import { Scheduler } from '../runtime/scheduler.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { isAsyncIterable } from '../runtime/utils.js';
 import type { RuntimeContext } from '../runtime/types.js';
-import { resolveBackingHost } from '../runtime/emit/materialized-view-helpers.js';
+import { resolveBackingHost, nullInNotNullSeededPkError } from '../runtime/emit/materialized-view-helpers.js';
 import { assertTransitiveRestrictsForParentMutation, executeForeignKeyActionsAndLens } from '../runtime/foreign-key-actions.js';
 import { validateDerivedRowImage, type DerivedRowConstraintValidator } from './derived-row-validator.js';
 import { buildPrimaryKeyFromValues } from '../vtab/memory/utils/primary-key.js';
@@ -146,6 +146,42 @@ export async function validateDerivedChanges(
 	for (const change of changes) {
 		if (change.op === 'delete') continue;
 		await validateDerivedRowImage(ctx as unknown as Database, validator, change.newRow, connectionId);
+	}
+}
+
+/**
+ * Row-time guard: reject a maintenance write that would store a NULL into a backing column
+ * the schema declares NOT NULL *and* that is a physical-PK member whose re-derived body
+ * output turned nullable — the row-time analogue of the refresh-path
+ * `assertNoNullInNotNullSeededPk` (runtime/emit/materialized-view-helpers.ts). Row-time
+ * maintenance is the PRIMARY silent-corruption vector: it fires at the source
+ * insert/update, before any refresh, so without this guard a NULL lands in a
+ * declared-NOT-NULL PK column with no error.
+ *
+ * The offending skew (a NOT-NULL ordering-seeded PK column over a loosened source) is
+ * precomputed once at plan build into {@link MaintenancePlanCommon.nullGuardColumns}
+ * (`undefined` for nearly every MV — the zero-overhead gate), so the common path pays a
+ * single boolean check per maintained write and only the rare skewed MV scans its guarded
+ * columns per change. A `delete` writes no image and is skipped. The throw unwinds the source
+ * statement with nothing committed — the backing write rides the pending layer, discarded on
+ * a throw before commit, exactly like {@link validateDerivedChanges}. Called BEFORE the
+ * MV-over-MV cascade so a NULL row never reaches a consumer. See
+ * fix/bug-mv-rowtime-null-into-notnull-seeded-pk.
+ */
+export function assertNoNullInNotNullSeededPkRowTime(
+	plan: MaintenancePlan,
+	changes: readonly BackingRowChange[],
+): void {
+	const guard = plan.nullGuardColumns;
+	if (!guard) return;
+	for (const change of changes) {
+		if (change.op === 'delete') continue; // a delete writes no image
+		for (const g of guard) {
+			const v = change.newRow[g.index];
+			if (v === null || v === undefined) {
+				throw nullInNotNullSeededPkError(plan.mv.schemaName, plan.mv.name, g.name);
+			}
+		}
 	}
 }
 

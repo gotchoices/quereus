@@ -75,6 +75,7 @@ import {
 	applyPrefixDelete,
 	runScheduler,
 	validateDerivedChanges,
+	assertNoNullInNotNullSeededPkRowTime,
 	enforceParentSideReferentialActions,
 	backingHost,
 	getBackingConnection,
@@ -630,6 +631,10 @@ export class MaterializedViewManager {
 			// independently of the cascade below; it neither consumes nor reorders the
 			// backing changes routed onward.
 			this.detectAndReportCoarseningCollisions(plan, backingChanges);
+			// Reject a NULL stored into a NOT-NULL ordering-seeded physical-PK backing
+			// column whose source loosened — BEFORE the cascade, so the corruption never
+			// reaches a consumer. No-op (`undefined`) unless this MV carries the skew.
+			assertNoNullInNotNullSeededPkRowTime(plan, backingChanges);
 			// Declared CHECK / child-side FK over the rows this delta wrote — BEFORE
 			// cascading, so a consumer never consumes an invalid producer row. Every
 			// row already in the backing was validated when it entered (the bulk
@@ -701,6 +706,10 @@ export class MaterializedViewManager {
 				// floor's collation-keyed `replace-all` realizes the same LWW merge as the
 				// bounded-delta arms (observe-only; gated on `coarseningWatch`).
 				this.detectAndReportCoarseningCollisions(plan, backingChanges);
+				// NOT-NULL ordering-seeded PK guard over the rebuild diff — the
+				// full-rebuild-floor analogue of the per-row guard in {@link maintainRowTime}.
+				// No-op (`undefined`) unless this MV carries the skew.
+				assertNoNullInNotNullSeededPkRowTime(plan, backingChanges);
 				// Validate the rebuild diff's written images at the flush boundary —
 				// the full-rebuild analogue of the per-row validation in
 				// {@link maintainRowTime} (deferred-rebuild semantics preserved: a bulk

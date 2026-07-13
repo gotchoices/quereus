@@ -182,6 +182,19 @@ export interface MaintenancePlanCommon {
 	 *  {@link MaterializedViewManager.detectAndReportCoarseningCollisions} from both
 	 *  the bounded-delta and full-rebuild maintenance arms. */
 	coarseningWatch?: ReadonlyArray<CoarseningWatchColumn>;
+	/** Backing columns that are BOTH declared NOT NULL AND physical-PK members AND whose
+	 *  re-derived body output column is nullable — the exact reachable "NOT-NULL
+	 *  ordering-seeded PK over a loosened source" skew. Present ONLY when non-empty (the
+	 *  zero-overhead gate: nearly every MV carries `undefined` and pays a single boolean
+	 *  check per maintained write — the NOT-NULL/physical-PK set alone is non-empty for
+	 *  almost every MV, so the discriminator is the body-nullability term). Precomputed once
+	 *  at plan build ({@link MaterializedViewManager.buildMaintenancePlan}). Read by the
+	 *  row-time guard in {@link MaterializedViewManager.maintainRowTime} /
+	 *  {@link MaterializedViewManager.flushDeferredRebuilds}. The refresh path has its own
+	 *  materialized-row equivalent (`assertNoNullInNotNullSeededPk` in
+	 *  runtime/emit/materialized-view-helpers.ts). See
+	 *  fix/bug-mv-rowtime-null-into-notnull-seeded-pk. */
+	nullGuardColumns?: ReadonlyArray<{ readonly index: number; readonly name: string }>;
 }
 
 export interface InverseProjectionPlan extends MaintenancePlanCommon {

@@ -497,20 +497,25 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 		// (computeBackingPrimaryKey), which pins that column NOT NULL even after its
 		// source column drops NOT NULL — a physical-PK column cannot lose NOT NULL, and
 		// the refresh reshape masks the doomed loosen. Once the source column becomes
-		// nullable and produces a NULL row, a rebuild that stored it would leave the
-		// backing schema declaring NOT NULL while holding a NULL. `rebuildBacking` guards
-		// against that (nullInNotNullSeededPkError), covering both the data-only fast path
-		// and the reshape arm.
+		// nullable and produces a NULL row, storing it would leave the backing schema
+		// declaring NOT NULL while holding a NULL. BOTH maintenance vectors now guard
+		// against that with the same `nullInNotNullSeededPkError`:
+		//  - the REFRESH rebuild (`rebuildBacking` → assertNoNullInNotNullSeededPk),
+		//    covered by the reshape-arm test below;
+		//  - the ROW-TIME write-through (the PRIMARY vector — a plain projection MV is NOT
+		//    marked stale by `alter … drop not null`, so its row-time plan stays attached and
+		//    a NULL source insert reaches the backing FIRST, before any refresh). That vector
+		//    is guarded by `assertNoNullInNotNullSeededPkRowTime`
+		//    (database-materialized-views-apply.ts) and covered by the `row-time maintenance`
+		//    describe below (fix/bug-mv-rowtime-null-into-notnull-seeded-pk).
 		//
-		// IMPORTANT SCOPE NOTE: this guard covers the REFRESH rebuild only. On a plain
-		// projection MV, `alter … drop not null` does NOT mark the MV stale (the body
-		// recompiles live), so its row-time maintenance stays attached and stores the NULL
-		// into the backing at the source INSERT — BEFORE any refresh. That row-time vector
-		// is the primary silent-corruption path and is tracked separately in
-		// fix/bug-mv-rowtime-null-into-notnull-seeded-pk; the refresh guard here does not
-		// close it. See the first test's inline note.
+		// Because row-time now rejects the NULL at the source INSERT, a non-stale MV's
+		// backing can no longer reach a NULL-in-seeded-PK state via DML — the refresh
+		// fast-path guard is retained as defense-in-depth (catalog import / future bypass)
+		// but is unreachable through the insert-then-refresh recipe; the reshape-arm test
+		// exercises the shared rebuild guard instead.
 
-		it('refresh throws a CONSTRAINT error naming the seeded PK column when the body holds a NULL there (fast path)', async () => {
+		it('the primary (row-time) vector rejects the NULL at the source INSERT, and a subsequent refresh over the clean backing succeeds', async () => {
 			const db = new Database();
 			try {
 				await db.exec('create table par (id integer primary key, x integer not null)');
@@ -521,20 +526,22 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 					.to.deep.equal([1, 0]);
 
 				await db.exec('alter table par alter column x drop not null');
-				// NOTE: par_ix is NOT stale after the drop-not-null (the projection body
-				// recompiles live), so this NULL insert IS maintained into the backing by
-				// ROW-TIME maintenance right here — the primary vector, tracked in
-				// fix/bug-mv-rowtime-null-into-notnull-seeded-pk. This test pins only that a
-				// subsequent REFRESH does not silently (re)store the NULL: it must throw.
-				await db.exec('insert into par (id, x) values (2, null)');
-
+				// par_ix is NOT stale after the drop-not-null (the projection body recompiles
+				// live), so this NULL insert would be maintained straight into the backing's
+				// NOT-NULL PK column — the row-time guard rejects it here instead.
 				let err: Error | undefined;
-				try { await db.exec('refresh materialized view par_ix'); } catch (e) { err = e as Error; }
-				expect(err, 'refresh must throw on a NULL in the NOT-NULL seeded PK column').to.not.be.undefined;
+				try { await db.exec('insert into par (id, x) values (2, null)'); } catch (e) { err = e as Error; }
+				expect(err, 'the maintained NULL insert must throw').to.not.be.undefined;
 				expect((err as { code?: number }).code, 'CONSTRAINT status').to.equal(StatusCode.CONSTRAINT);
 				expect(err!.message).to.match(/would store NULL in column 'x'/);
-				// The backing still declares x NOT NULL (the guard did not loosen it).
+				// The backing still declares x NOT NULL and holds only the pre-insert row.
 				expect(db.schemaManager.getTable('main', 'par_ix')!.columns[1].notNull).to.equal(true);
+				expect(await readObjectsSorted(db, 'select id, x from par_ix')).to.deep.equal(['{"id":1,"x":5}']);
+
+				// The backing never reached a NULL state, so a refresh does NOT falsely reject:
+				// the fast-path guard has nothing to catch.
+				await db.exec('refresh materialized view par_ix');
+				expect(await readObjectsSorted(db, 'select id, x from par_ix')).to.deep.equal(['{"id":1,"x":5}']);
 			} finally {
 				await db.close();
 			}
@@ -599,6 +606,82 @@ describe('materialized view refresh — identity-preserving reshape', () => {
 			} finally {
 				await db.close();
 			}
+		});
+
+		// Row-time maintenance is the PRIMARY vector: `alter … drop not null` recompiles the
+		// projection body live (does NOT mark the MV stale), so the very next source INSERT is
+		// write-through-maintained into the backing — BEFORE any refresh. These pin that the
+		// row-time path now rejects the NULL loudly (matching the refresh guard) instead of
+		// silently storing it. Tracked in fix/bug-mv-rowtime-null-into-notnull-seeded-pk.
+		describe('row-time maintenance (the primary vector — fires at the source INSERT)', () => {
+			it('a maintained NULL insert into a NOT-NULL ordering-seeded PK column throws CONSTRAINT and leaves the backing intact', async () => {
+				const db = new Database();
+				try {
+					await db.exec('create table par (id integer primary key, x integer not null)');
+					await db.exec('insert into par values (1, 5)');
+					await db.exec('create materialized view par_ix as select id, x from par order by x');
+					// Physical PK seeded from `order by x`: [x (index 1), id (index 0)], x NOT NULL.
+					expect(db.schemaManager.getTable('main', 'par_ix')!.primaryKeyDefinition.map(d => d.index))
+						.to.deep.equal([1, 0]);
+
+					// Source x → nullable; par_ix is NOT marked stale (the body recompiles live),
+					// so its row-time plan stays attached and the next NULL insert would maintain
+					// {2, NULL} straight into the backing's NOT-NULL PK column.
+					await db.exec('alter table par alter column x drop not null');
+
+					let err: Error | undefined;
+					try {
+						await db.exec('insert into par (id, x) values (2, null)');
+					} catch (e) { err = e as Error; }
+					expect(err, 'the maintained NULL insert must throw').to.not.be.undefined;
+					expect((err as { code?: number }).code, 'CONSTRAINT status').to.equal(StatusCode.CONSTRAINT);
+					expect(err!.message, 'names column x and the MV').to.match(/would store NULL in column 'x'/);
+					expect(err!.message).to.match(/par_ix/);
+					// Nothing committed: par_ix still holds only {1,5}, and the source insert rolled back.
+					expect(await readObjectsSorted(db, 'select id, x from par_ix')).to.deep.equal(['{"id":1,"x":5}']);
+					expect(await readObjectsSorted(db, 'select id, x from par')).to.deep.equal(['{"id":1,"x":5}']);
+				} finally {
+					await db.close();
+				}
+			});
+
+			it('after DROP NOT NULL, a non-NULL maintained insert still succeeds (the guard fires only on an actual NULL)', async () => {
+				const db = new Database();
+				try {
+					await db.exec('create table par (id integer primary key, x integer not null)');
+					await db.exec('insert into par values (1, 5)');
+					await db.exec('create materialized view par_ix as select id, x from par order by x');
+					await db.exec('alter table par alter column x drop not null');
+
+					// A non-NULL value in the loosened column maintains through cleanly.
+					await db.exec('insert into par (id, x) values (2, 7)');
+					expect(await readObjectsSorted(db, 'select id, x from par_ix'))
+						.to.deep.equal(['{"id":1,"x":5}', '{"id":2,"x":7}']);
+				} finally {
+					await db.close();
+				}
+			});
+
+			it('a nullable-at-create ordering-seeded PK column keeps accepting NULL maintained inserts (not over-rejected)', async () => {
+				const db = new Database();
+				try {
+					// x is nullable at create time (explicit `null` — a bare `integer` is NOT NULL
+					// in Quereus) → the seeded PK column is declared nullable (notNull !== true),
+					// so it is never guarded: it self-consistently stores NULL.
+					await db.exec('create table par (id integer primary key, x integer null)');
+					await db.exec('insert into par values (1, 5)');
+					await db.exec('create materialized view par_ix as select id, x from par order by x');
+					expect(db.schemaManager.getTable('main', 'par_ix')!.columns[1].notNull, 'backing x nullable')
+						.to.equal(false);
+
+					// A NULL maintained insert must succeed — the guard's notNull===true gate excludes it.
+					await db.exec('insert into par (id, x) values (2, null)');
+					expect(await readObjectsSorted(db, 'select id, x from par_ix'))
+						.to.deep.equal(['{"id":1,"x":5}', '{"id":2,"x":null}']);
+				} finally {
+					await db.close();
+				}
+			});
 		});
 	});
 

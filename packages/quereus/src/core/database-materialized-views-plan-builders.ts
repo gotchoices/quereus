@@ -173,7 +173,54 @@ export function buildMaintenancePlan(ctx: MaterializedViewManagerContext, mv: Ma
 
 	// Try a bounded-delta arm; a shape that fits none falls through to the floor.
 	const boundedDelta = tryBuildBoundedDeltaArm(ctx, mv, analyzed);
-	return boundedDelta ?? buildFullRebuildPlan(ctx, mv, analyzed);
+	const plan = boundedDelta ?? buildFullRebuildPlan(ctx, mv, analyzed);
+	// Precompute the NOT-NULL ordering-seeded PK skew guard once, here at plan build —
+	// which `alter … drop not null` re-runs (it recompiles the row-time plan live), so the
+	// guarded set is recomputed at exactly the moment the skew can appear. Gated to
+	// non-empty so the field stays `undefined` (zero per-write cost) for the common case.
+	const guarded = computeNullGuardColumns(mv, analyzed);
+	plan.nullGuardColumns = guarded.length > 0 ? guarded : undefined;
+	return plan;
+}
+
+/**
+ * Backing columns that would silently store a NULL into a declared-NOT-NULL physical-PK
+ * column if the source loosened — the reachable "NOT-NULL ordering-seeded PK over a
+ * loosened source" skew, precomputed for the row-time guard
+ * ({@link MaterializedViewManager.maintainRowTime}). A backing column `i` is guarded when
+ * it is (1) declared NOT NULL, (2) a physical-PK member, AND (3) its re-derived body output
+ * column `i` is now nullable. Backing column `i` corresponds 1:1 to body output column `i`
+ * (`deriveBackingShape` builds the backing column list positionally from the body's output),
+ * and `deriveBackingShape`'s own `notNull = type.nullable === false` derivation means the
+ * body-nullability term agrees with the backing declaration by construction.
+ *
+ * The body-nullability term (3) is the real discriminator: the NOT-NULL/physical-PK set
+ * alone is non-empty for almost every MV (the logical-key PK column is normally the NOT-NULL
+ * source PK), so guarding on (1)+(2) only would scan essentially every maintained write.
+ * (3) is true only for the rare loosened-source skew, so the returned set — hence
+ * `plan.nullGuardColumns` — is empty (the field stays `undefined`) for the common case. A
+ * physical-PK column declared *nullable* (a nullable-source ordering column) fails (1) and is
+ * never guarded — it self-consistently stores NULL and must keep working.
+ */
+function computeNullGuardColumns(
+	mv: MaintainedTableSchema,
+	analyzed: BlockNode,
+): Array<{ readonly index: number; readonly name: string }> {
+	const root = rootRelationalNode(analyzed);
+	if (!root) return [];
+	const bodyColumns = root.getType().columns;
+	const pkIndices = new Set(mv.primaryKeyDefinition.map(d => d.index));
+	const guarded: Array<{ readonly index: number; readonly name: string }> = [];
+	for (let i = 0; i < mv.columns.length; i++) {
+		const col = mv.columns[i];
+		if (col.notNull !== true) continue;          // nullable-declared PK column stays permitted
+		if (!pkIndices.has(i)) continue;             // physical-PK member only
+		const bodyCol = bodyColumns[i];
+		if (bodyCol && bodyCol.type.nullable !== false) { // body now yields nullable
+			guarded.push({ index: i, name: col.name });
+		}
+	}
+	return guarded;
 }
 
 /**

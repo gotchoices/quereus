@@ -69,17 +69,20 @@ export function materializedViewNotASetError(schemaName: string, viewName: strin
  * refresh reshape masks the doomed loosen — see {@link isPhysicalPkColumn}). Once the
  * source column becomes nullable and the recomputed body yields a NULL row, storing it
  * would leave the backing schema declaring NOT NULL while holding a NULL — a silent
- * contradiction. Refresh raises this instead, naming the column, the cause, and the
- * remedy.
+ * contradiction. Both maintenance vectors raise this instead, naming the column, the cause,
+ * and the remedy: the **refresh** rebuild (`rebuildBacking` → {@link assertNoNullInNotNullSeededPk})
+ * and the **row-time** write-through (the primary vector — `assertNoNullInNotNullSeededPkRowTime`
+ * in database-materialized-views-apply.ts, gated on the precomputed `plan.nullGuardColumns`).
+ * The message is worded vector-neutrally ("maintaining …") so it reads correctly from both.
  *
  * NOTE: narrow loud-error guard, not the full fix. The lasting resolution stops
  * ordering-seeding the physical PK (expressing body order as a materialized secondary
  * index) — backlog `debt-mv-ordering-seed-to-materialized-index`. Until it lands the MV
- * cannot be refreshed while a source NULL persists in the seeded column.
+ * rejects (rather than silently stores) a source NULL in the seeded column.
  */
 export function nullInNotNullSeededPkError(schemaName: string, viewName: string, columnName: string): QuereusError {
 	return new QuereusError(
-		`refresh of materialized view '${schemaName}.${viewName}' would store NULL in column '${columnName}', `
+		`maintaining materialized view '${schemaName}.${viewName}' would store NULL in column '${columnName}', `
 			+ `which the backing declares NOT NULL because the view's \`order by\` seeded it into the physical `
 			+ `primary key; the source column became nullable and now produces a NULL row. Recreate the view `
 			+ `without \`order by ${columnName}\` (or excluding ${columnName} from the ordering) to allow `
