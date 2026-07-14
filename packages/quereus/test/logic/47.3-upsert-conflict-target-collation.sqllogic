@@ -9,6 +9,9 @@
 -- memory-only file 47.4-upsert-conflict-target-affinity.sqllogic — it exposes a
 -- separate isolation-layer defect under the store backend (see that file's header
 -- and fix/bug-store-isolation-upsert-affinity-coerced-pk).
+-- The index-derived-collation scenario (UNIQUE via a standalone `create unique
+-- index` with a per-column COLLATE) lives in the sibling file
+-- 47.3.1-upsert-conflict-index-derived-collation.sqllogic.
 
 -- ===================================
 -- 1. NOCASE single-column UNIQUE — DO UPDATE runs on a case-variant conflict.
@@ -98,23 +101,7 @@ select a, b, note from comp_coll order by b;
 drop table comp_coll;
 
 -- ===================================
--- 6. Index-derived UNIQUE with a per-column COLLATE on a BINARY column.
---    The enforcement collation is the INDEX's NOCASE, not the column's declared
---    BINARY — so 'HELLO' matches stored 'Hello'.
--- ===================================
-
-create table idx_coll (id integer primary key, tag text);
-create unique index idx_tag_nc on idx_coll (tag collate nocase);
-insert into idx_coll values (1, 'Hello');
-
-insert into idx_coll values (2, 'HELLO') on conflict (tag) do update set tag = 'seen';
-select id, tag from idx_coll order by id;
-→ [{"id":1,"tag":"seen"}]
-
-drop table idx_coll;
-
--- ===================================
--- 7. WHERE guard on DO UPDATE combined with a collation-variant conflict. The
+-- 6. WHERE guard on DO UPDATE combined with a collation-variant conflict. The
 --    conflict is matched (NOCASE case-variant) so no new row inserts and no
 --    UNIQUE abort, but the WHERE guard governs whether the update runs — a
 --    false guard skips (DO NOTHING equivalent), a true guard updates.
@@ -136,7 +123,7 @@ select id, name, hits from wg order by id;
 drop table wg;
 
 -- ===================================
--- 8. Multi-row INSERT mixing a collation-variant conflict row with clean rows
+-- 7. Multi-row INSERT mixing a collation-variant conflict row with clean rows
 --    under a single statement — the variant row routes to DO UPDATE, the clean
 --    rows insert, none abort.
 -- ===================================
