@@ -39,16 +39,30 @@ export interface IndexDescriptor {
 	readonly keyColumns: readonly IndexKeyColumn[];
 	/** true ⇒ a walk of this index yields at most one row per distinct key. */
 	readonly unique: boolean;
+	/**
+	 * true ⇒ the SCAN walks this index in REVERSE of its declared `keyColumns`
+	 * order (an `ORDER BY … DESC` over an ascending index). Absent/false ⇒ forward.
+	 *
+	 * This is the one place scan DIRECTION is modelled structurally, so an
+	 * emission-order consumer (the isolation overlay's merged read) can walk the
+	 * reversed stream correctly. A module whose `idxStr` already encodes direction
+	 * (the in-memory vtab's `ordCons=DESC`) need not set it; a module that carries
+	 * direction only in an opaque per-plan index name (lamina) MUST, or the overlay
+	 * merges a reversed underlying stream against a forward comparator.
+	 */
+	readonly reverse?: boolean;
 }
 
 /**
  * Which seek/scan strategy the planner chose over an {@link IndexDescriptor}.
  * One-to-one with the `plan=N` codes carried in `idxStr`.
  *
- * Scan DIRECTION is deliberately not modelled here. The `plan=1` / `plan=4`
- * descending codes and the `ordCons=DESC` parameter are recognised by the
- * in-memory vtab's scan-plan builder but are emitted by nothing in this repo;
- * direction stays in `idxStr` rather than becoming a field no producer sets.
+ * Scan DIRECTION is not part of the plan KIND. For the in-memory vtab it rides
+ * `idxStr` (the `plan=1` / `plan=4` descending codes and the `ordCons=DESC`
+ * parameter its scan-plan builder recognises). A module that carries direction
+ * only in an opaque per-plan index name (lamina) instead sets
+ * {@link IndexDescriptor.reverse} so an emission-order consumer can still learn
+ * the scan is reversed.
  */
 export type IndexPlanKind =
 	| 'scan'             // plan=0 — ordered walk, no bounds

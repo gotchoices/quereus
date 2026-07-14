@@ -213,12 +213,21 @@ interface IndexDescriptor {
   role: 'primary' | 'secondary';
   keyColumns: readonly { columnIndex: number; desc: boolean; collation?: string }[]; // FULL key, in index order
   unique: boolean;
+  reverse?: boolean;            // true ⇒ the scan walks this index in reverse of keyColumns order
 }
 ```
 
 `role` is authoritative, not `name`: a descriptor with `role: 'primary'` **is** the primary
 key however it is named. `validateAccessPlan` rejects a descriptor whose `name` disagrees with
 the plan's index name.
+
+Scan **direction** matters to the same order-sensitive consumers: a module whose `idxStr` already
+encodes direction (the in-memory vtab's `ordCons=DESC` convention) needs nothing extra, but a
+module that carries direction only in an opaque per-plan index name — minting a distinct name per
+scan direction rather than writing a direction marker anywhere text-visible — **must** set
+`reverse: true` on the descriptor for a reversed scan. Otherwise an emission-order consumer (the
+isolation overlay's merged read) has no way to learn the underlying stream is reversed and merges
+it against a forward comparator, scrambling row order.
 
 A module that aliases an index name **without** supplying a matching `indexDescriptor` has its
 access path recorded as `{ kind: 'unresolvedIndex' }` (and the engine logs a warning). Order-

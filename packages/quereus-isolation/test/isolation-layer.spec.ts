@@ -3541,6 +3541,200 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(rows.map(r => [r[0], r[1]])).to.deep.equal([[5, 'e'], [3, 'd'], [4, 'aa'], [1, 'a']]);
 		});
 
+		describe('compound (multi-column) synthetic index — IndexDescriptor.reverse', () => {
+			// Twin of the single-column DESC case above, but the descriptor's `keyColumns`
+			// carries TWO entries and the reversal is signalled via `IndexDescriptor.reverse`
+			// (the bit `resolveScanIndex`/`buildMergeConfig` actually consult — the case above
+			// exercises the older, unrelated `keyColumns[i].desc` per-column declared
+			// direction). Pins bug-isolation-overlay-desc-order-secondary-read's fix
+			// (`buildMergeConfig`'s `compareSortKey` negation) for a descriptor whose key is
+			// more than one column wide: the whole (indexKey1, indexKey2, PK) tuple must
+			// reverse together, not just the leading key column.
+			const SYNTH2 = '_compound_v1_v2_0';
+
+			class SynthCompoundTable extends VirtualTable {
+				private readonly mod: SynthCompoundModule;
+				private readonly key: string;
+
+				constructor(db: Database, module: SynthCompoundModule, schema: TableSchema) {
+					super(db, module, schema.schemaName, schema.name);
+					this.tableSchema = schema;
+					this.mod = module;
+					this.key = `${schema.schemaName}.${schema.name}`.toLowerCase();
+					if (!this.mod.store.has(this.key)) this.mod.store.set(this.key, []);
+				}
+
+				async disconnect(): Promise<void> { /* no-op */ }
+
+				async update(args: UpdateArgs): Promise<UpdateResult> {
+					if (args.operation === 'insert' && args.values) {
+						const rows = this.mod.store.get(this.key)!;
+						rows.push([...args.values] as Row);
+						rows.sort((a, b) => Number(a[0]) - Number(b[0]));
+						return { status: 'ok', row: args.values };
+					}
+					return { status: 'ok' };
+				}
+
+				async *query(filterInfo: FilterInfo): AsyncIterable<Row> {
+					const rows = [...(this.mod.store.get(this.key) ?? [])];
+					const dir = this.mod.reverse ? -1 : 1;
+					// Sort by (v1, v2, id) — the FULL declared key plus the PK tie-break — then
+					// flip the whole comparison when the module says the scan runs reversed,
+					// exactly like a real reversed index walk would.
+					rows.sort((a, b) => {
+						const cmp = dir * (String(a[1]).localeCompare(String(b[1])) || String(a[2]).localeCompare(String(b[2])));
+						if (cmp !== 0) return cmp;
+						return dir * (Number(a[0]) - Number(b[0]));
+					});
+					for (const row of rows) {
+						const inWindow = filterInfo.constraints.every(({ constraint, argvIndex }) =>
+							argvIndex <= 0
+							|| constraint.op !== IndexConstraintOp.EQ
+							|| row[constraint.iColumn] === filterInfo.args[argvIndex - 1]);
+						if (inWindow) yield row as Row;
+					}
+				}
+			}
+
+			class SynthCompoundModule implements VirtualTableModule<SynthCompoundTable, BaseModuleConfig> {
+				readonly store = new Map<string, Row[]>();
+
+				constructor(readonly reverse = false) {}
+
+				async create(cdb: Database, schema: TableSchema): Promise<SynthCompoundTable> {
+					return new SynthCompoundTable(cdb, this, schema);
+				}
+
+				async connect(
+					cdb: Database,
+					_pAux: unknown,
+					_moduleName: string,
+					schemaName: string,
+					tableName: string,
+					_options: BaseModuleConfig,
+					importedTableSchema?: TableSchema,
+				): Promise<SynthCompoundTable> {
+					if (!importedTableSchema) {
+						throw new Error(`Table ${schemaName}.${tableName} connected without a schema`);
+					}
+					return new SynthCompoundTable(cdb, this, importedTableSchema);
+				}
+
+				async destroy(): Promise<void> { /* store is per-instance */ }
+
+				getBestAccessPlan(_cdb: Database, tableInfo: TableSchema, request: BestAccessPlanRequest): BestAccessPlanResult {
+					const v1Idx = tableInfo.columnIndexMap.get('v1')!;
+					const v2Idx = tableInfo.columnIndexMap.get('v2')!;
+					const descriptor: IndexDescriptor = {
+						name: SYNTH2,
+						role: 'secondary',
+						keyColumns: [
+							{ columnIndex: v1Idx, desc: false },
+							{ columnIndex: v2Idx, desc: false },
+						],
+						unique: false,
+						reverse: this.reverse,
+					};
+					return AccessPlanBuilder.fullScan(request.estimatedRows ?? 100)
+						.setHandledFilters(new Array(request.filters.length).fill(false))
+						.setIndexName(SYNTH2)
+						.setIndexDescriptor(descriptor)
+						.setExplanation('SynthCompoundModule walk under a minted compound secondary index name')
+						.build();
+				}
+			}
+
+			function synthFilter2(v1Idx: number, v2Idx: number, reverse = false): FilterInfo {
+				const idxStr = `idx=${SYNTH2}(0,1);plan=0`;
+				const base = makeFullScanFilterInfo();
+				return {
+					...base,
+					idxStr,
+					accessPath: {
+						kind: 'index',
+						plan: 'scan',
+						index: {
+							name: SYNTH2,
+							role: 'secondary',
+							keyColumns: [
+								{ columnIndex: v1Idx, desc: false },
+								{ columnIndex: v2Idx, desc: false },
+							],
+							unique: false,
+							reverse,
+						},
+					},
+					indexInfoOutput: { ...base.indexInfoOutput, idxStr },
+				};
+			}
+
+			let cdb: Database | undefined;
+
+			afterEach(async () => { await cdb?.close(); cdb = undefined; });
+
+			async function stageCompound(committedInsert: string, overlayRows: Row[], reverse = false): Promise<{ table: IsolatedTable; v1Idx: number; v2Idx: number }> {
+				cdb = new Database();
+				const iso = new IsolationModule({ underlying: new SynthCompoundModule(reverse) });
+				cdb.registerModule('isolated', iso);
+				await cdb.exec('create table t2 (id integer primary key, v1 text, v2 text) using isolated');
+				await cdb.exec(committedInsert); // autocommit → flushed to the underlying
+
+				const underlying = iso.getUnderlyingState('main', 't2')!.underlyingTable;
+				const overlay = await iso.overlayModule.create(cdb, iso.createOverlaySchema(underlying.tableSchema!));
+				for (const row of overlayRows) {
+					await overlay.update({ operation: 'insert', values: row });
+				}
+				iso.setConnectionOverlay(cdb, 'main', 't2', { overlayTable: overlay, hasChanges: true, db: cdb });
+
+				const v1Idx = underlying.tableSchema!.columnIndexMap.get('v1')!;
+				const v2Idx = underlying.tableSchema!.columnIndexMap.get('v2')!;
+				const table = await iso.connect(cdb, undefined, 'isolated', 'main', 't2', {} as unknown as BaseModuleConfig) as IsolatedTable;
+				return { table, v1Idx, v2Idx };
+			}
+
+			it('reverse:true negates the WHOLE (v1, v2, PK) tuple, not just the leading key column', async () => {
+				const { table, v1Idx, v2Idx } = await stageCompound(
+					"insert into t2 values (1,'g','10'),(2,'g','20'),(3,'g','30')",
+					[
+						[4, 'g', '15', 0],   // staged insert
+						[5, 'g', '25', 0],   // staged insert
+						[3, 'g', '05', 0],   // staged update of id=3: v2 30 -> 05
+					],
+					true,
+				);
+
+				const rows = await asyncIterableToArray(table.query!(synthFilter2(v1Idx, v2Idx, true)));
+
+				// Descending (v1, v2): every row shares v1='g', so this also pins the
+				// trailing-key-column ordering, not merely the leading column.
+				expect(rows.map(r => [r[0], r[2]])).to.deep.equal([
+					['5', '25'], ['2', '20'], ['4', '15'], ['1', '10'], ['3', '05'],
+				].map(([id, v2]) => [Number(id), v2]));
+			});
+
+			it('reverse:true reverses the PK tie-break within an equal-(v1,v2) group', async () => {
+				const { table, v1Idx, v2Idx } = await stageCompound(
+					"insert into t2 values (1,'g','same'),(2,'g','same'),(10,'g','zed')",
+					[
+						[3, 'g', 'same', 0],
+						[4, 'g', 'same', 0],
+					],
+					true,
+				);
+
+				const rows = await asyncIterableToArray(table.query!(synthFilter2(v1Idx, v2Idx, true)));
+
+				// desc by (v1, v2): 'zed' first, then every 'same' with PK descending
+				// (staged 4, 3 interleaved above committed 2, 1) — a fix that only flipped
+				// the leading key-column comparator (leaving the PK tail ascending) would
+				// scramble this group.
+				expect(rows.map(r => [r[0], r[2]])).to.deep.equal([
+					[10, 'zed'], [4, 'same'], [3, 'same'], [2, 'same'], [1, 'same'],
+				]);
+			});
+		});
+
 		it('multi-range OR window over the synthetic name: overlay rows are filtered per range, not conjunctively', async () => {
 			// buildMultiRangeWindowMatcher decodes the OR-of-ranges from the idxStr rangeOps
 			// params (the constraint entries are positional GE placeholders for this plan).

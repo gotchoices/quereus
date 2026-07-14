@@ -15,7 +15,7 @@ const EMPTY_PK_KEY_SHAPE: { functions: CollationFunction[]; directions: boolean[
  */
 type IndexScanInfo =
 	| { type: 'primary' }
-	| { type: 'secondary'; indexName: string; columnIndices: number[]; keyColumns: readonly IndexKeyColumn[] };
+	| { type: 'secondary'; indexName: string; columnIndices: number[]; keyColumns: readonly IndexKeyColumn[]; reverse: boolean };
 
 /**
  * A table wrapper that provides transaction isolation via an overlay.
@@ -583,6 +583,10 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						indexName: path.index.name,
 						columnIndices: path.index.keyColumns.map(c => c.columnIndex),
 						keyColumns: path.index.keyColumns,
+						// A reversed scan (ORDER BY … DESC) emits the underlying stream in
+						// reverse of the descriptor's declared key order; the merge must walk
+						// its sort key reversed to interleave overlay rows correctly.
+						reverse: path.index.reverse === true,
 					};
 			case 'unresolvedIndex':
 				throw new QuereusError(
@@ -867,7 +871,15 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		// BINARY-ascending guess.
 		const indexComparators = this.underlyingTable.getIndexComparator?.(indexInfo.indexName)
 			?? this.buildDescriptorComparators(indexInfo.keyColumns);
-		const compareSortKey = this.buildCompareSortKey(indexColIndices.length, comparePK, indexComparators);
+		const forwardCompareSortKey = this.buildCompareSortKey(indexColIndices.length, comparePK, indexComparators);
+		// A reversed scan emits the whole (indexKey, PK) sort key in reverse — including
+		// the PK tie-break within an equal index-key group — so negate the entire
+		// comparator. That makes the step-2 overlay sort descend and the step-3 merge's
+		// `compareSortKey(oKey, uKey) <= 0` walk yield overlay rows while they sort at or
+		// before the underlying row under the reversed order.
+		const compareSortKey = indexInfo.reverse
+			? (a: SqlValue[], b: SqlValue[]) => -forwardCompareSortKey(a, b)
+			: forwardCompareSortKey;
 
 		return {
 			extractPK,
