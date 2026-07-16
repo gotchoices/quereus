@@ -64,6 +64,24 @@
  * remote-latency fan-out path keeps first claim on the branches it is tuned
  * for; the tiny-outer/huge-inner cost tradeoff is tracked in
  * `backlog/feat-decorrelation-cost-model`.
+ *
+ * TWO MATCH SITES share the identical per-subquery rewrite (`decorrelateOne`):
+ *   - `ruleScalarAggDecorrelation` — subqueries in a ProjectNode's projection
+ *     expressions; the join stack lands between the Project and its source.
+ *   - `ruleScalarAggDecorrelationAggregate` — subqueries inside an
+ *     AggregateNode's aggregate-argument (and group-by) expressions; the join
+ *     stack lands BELOW the aggregate, between it and its source. Cardinality
+ *     safety: the grouped subtree's GROUP BY keys are a unique key on its
+ *     output, so the LEFT join matches at most one row per source row — the
+ *     aggregate's input row count and multiplicity are preserved exactly, and
+ *     every existing group-by/aggregate reference resolves unchanged by
+ *     attribute id (left-side attributes stay visible through the join).
+ *
+ * NESTED subqueries converge level by level: the Structural pass is top-down
+ * with rules firing BEFORE descent, so the grouped aggregate built by one
+ * level's rewrite (whose aggregate argument carries the next level's subquery,
+ * outer references already remapped to the enclosing inner columns) is itself
+ * visited later in the same pass, where the Aggregate-site rule fires on it.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -104,11 +122,62 @@ export function ruleScalarAggDecorrelation(node: PlanNode, _context: OptContext)
 
 	// Collect candidate subqueries across all projection expression trees
 	// (bare and wrapped), deduplicated by node identity.
+	const candidates = collectCandidates(node.projections.map(p => p.node));
+	if (candidates.length === 0) return null;
+
+	const rewrite = decorrelateAll(candidates, node.source);
+	if (!rewrite) return null;
+
+	log('Decorrelated %d scalar-aggregate subquery(ies) into grouped left join(s)', rewrite.replacements.size);
+	return rebuildProject(node, rewrite.source, rewrite.replacements);
+}
+
+/**
+ * Aggregate-argument match site: the same rewrite for subqueries embedded in
+ * an AggregateNode's aggregate-argument (or group-by) expressions — the shape
+ * a nested aggregate subquery takes after the Project-site rewrite of its
+ * enclosing level (the enclosing rewrite's outer-reference remap makes a
+ * two-level correlation local to the new grouped aggregate's source). The join
+ * stack lands below the aggregate; see the module header for cardinality
+ * safety and multi-level convergence.
+ *
+ * NOTE: this site can also fire on an aggregate INSIDE a still-correlated
+ * subquery (e.g. when the enclosing level's remap bailed but the nested
+ * correlation is local). That is correct but the grouped subtree then
+ * re-executes per outer row — whether it beats the per-inner-row correlated
+ * plan is data-dependent; if a workload regresses here, gate this site on the
+ * enclosing subtree being decorrelated (part of
+ * `backlog/feat-decorrelation-cost-model`).
+ */
+export function ruleScalarAggDecorrelationAggregate(node: PlanNode, _context: OptContext): PlanNode | null {
+	if (!(node instanceof AggregateNode)) return null;
+
+	// Both aggregate arguments and group-by expressions are scalar trees
+	// evaluated per source row, so substitution is uniform across them.
+	const candidates = collectCandidates([
+		...node.groupBy,
+		...node.aggregates.map(a => a.expression),
+	]);
+	if (candidates.length === 0) return null;
+
+	const rewrite = decorrelateAll(candidates, node.source);
+	if (!rewrite) return null;
+
+	log('Decorrelated %d scalar-aggregate subquery(ies) below an enclosing aggregate', rewrite.replacements.size);
+	return rebuildAggregate(node, rewrite.source, rewrite.replacements);
+}
+
+/**
+ * Collect candidate `ScalarSubqueryNode`s across a list of scalar expression
+ * trees (bare and wrapped), deduplicated by node identity, in deterministic
+ * expression-order pre-order.
+ */
+function collectCandidates(exprs: readonly ScalarPlanNode[]): ScalarSubqueryNode[] {
 	const candidates: ScalarSubqueryNode[] = [];
 	const seen = new Set<ScalarSubqueryNode>();
-	for (const proj of node.projections) {
+	for (const expr of exprs) {
 		const found: ScalarSubqueryNode[] = [];
-		collectScalarSubqueries(proj.node, found);
+		collectScalarSubqueries(expr, found);
 		for (const cand of found) {
 			if (!seen.has(cand)) {
 				seen.add(cand);
@@ -116,15 +185,22 @@ export function ruleScalarAggDecorrelation(node: PlanNode, _context: OptContext)
 			}
 		}
 	}
-	if (candidates.length === 0) return null;
+	return candidates;
+}
 
-	const outer = node.source;
+/**
+ * Decorrelate every recognizable candidate against `outer`. Each recognized
+ * subquery becomes its own LEFT JOIN, stacked left-deep on the outer in
+ * deterministic (collection-order) sequence. The outer's attributes stay
+ * visible through every stacked left join, so later subqueries' correlations
+ * still resolve. Returns null when no candidate is recognized.
+ */
+function decorrelateAll(
+	candidates: readonly ScalarSubqueryNode[],
+	outer: RelationalPlanNode,
+): { source: RelationalPlanNode; replacements: Map<ScalarSubqueryNode, ScalarPlanNode> } | null {
 	const outerAttrIds = new Set(outer.getAttributes().map(a => a.id));
 
-	// Each recognized subquery becomes its own LEFT JOIN, stacked left-deep on
-	// the outer in deterministic (projection-order) sequence. The outer's
-	// attributes stay visible through every stacked left join, so later
-	// subqueries' correlations still resolve.
 	let currentSource: RelationalPlanNode = outer;
 	const replacements = new Map<ScalarSubqueryNode, ScalarPlanNode>();
 
@@ -136,9 +212,7 @@ export function ruleScalarAggDecorrelation(node: PlanNode, _context: OptContext)
 	}
 
 	if (replacements.size === 0) return null;
-
-	log('Decorrelated %d scalar-aggregate subquery(ies) into grouped left join(s)', replacements.size);
-	return rebuildProject(node, currentSource, replacements);
+	return { source: currentSource, replacements };
 }
 
 /**
@@ -452,5 +526,32 @@ function rebuildProject(
 		undefined,
 		attributes,
 		project.preserveInputColumns,
+	);
+}
+
+/**
+ * Rebuild the enclosing aggregate over the join-stacked source, substituting
+ * each decorrelated `ScalarSubqueryNode` in its group-by / aggregate-argument
+ * expressions while preserving the aggregate's output attribute ids (so
+ * group-by references, HAVING filters, and everything above resolve
+ * unchanged). The inserted LEFT joins each match at most one row per source
+ * row (the grouped subtree's GROUP BY keys are a unique key on its output),
+ * so group contents — row count and multiplicity — are preserved exactly.
+ */
+function rebuildAggregate(
+	agg: AggregateNode,
+	newSource: RelationalPlanNode,
+	replacements: ReadonlyMap<ScalarSubqueryNode, ScalarPlanNode>,
+): AggregateNode {
+	return new AggregateNode(
+		agg.scope,
+		newSource,
+		agg.groupBy.map(expr => substituteSubqueries(expr, replacements)),
+		agg.aggregates.map(a => ({
+			expression: substituteSubqueries(a.expression, replacements),
+			alias: a.alias,
+		})),
+		undefined,
+		agg.getAttributes(),
 	);
 }

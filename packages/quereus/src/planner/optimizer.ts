@@ -56,7 +56,7 @@ import { ruleCteOptimization } from './rules/cache/rule-cte-optimization.js';
 import { ruleMutatingSubqueryCache } from './rules/cache/rule-mutating-subquery-cache.js';
 import { ruleInSubqueryCache } from './rules/cache/rule-in-subquery-cache.js';
 import { ruleSubqueryDecorrelation } from './rules/subquery/rule-subquery-decorrelation.js';
-import { ruleScalarAggDecorrelation } from './rules/subquery/rule-scalar-agg-decorrelation.js';
+import { ruleScalarAggDecorrelation, ruleScalarAggDecorrelationAggregate } from './rules/subquery/rule-scalar-agg-decorrelation.js';
 import { ruleAntiJoinFkEmpty } from './rules/subquery/rule-anti-join-fk-empty.js';
 import { ruleSemiJoinFkTrivial } from './rules/subquery/rule-semi-join-fk-trivial.js';
 import {
@@ -556,6 +556,24 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		fn: ruleScalarAggDecorrelation,
 		// Changes the inner subquery subtree's execution count (per outer row →
 		// once) — refuses when the inner subtree carries a write.
+		sideEffectMode: 'aware',
+	},
+
+	// Aggregate-argument match site for the same rewrite: a scalar-aggregate
+	// subquery nested inside an aggregate argument (the shape a two-level
+	// nested subquery takes after the Project-site rewrite fires on its
+	// enclosing level) is decorrelated into a grouped LEFT JOIN placed BELOW
+	// the enclosing aggregate. The structural pass is top-down with rules
+	// firing before descent, so multi-level nesting converges level by level
+	// within a single pass.
+	{
+		pass: PassId.Structural,
+		id: 'scalar-agg-decorrelation-aggregate',
+		nodeType: PlanNodeType.Aggregate,
+		phase: 'rewrite',
+		fn: ruleScalarAggDecorrelationAggregate,
+		// Same execution-count change as the Project-site entry — refuses when
+		// the inner subtree carries a write.
 		sideEffectMode: 'aware',
 	},
 
