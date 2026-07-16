@@ -119,16 +119,16 @@ describe('Plan shape: scalar-aggregate subquery decorrelation', () => {
 
 	it('refuses a DML-bearing subquery (per-row firing is observable)', async () => {
 		await db.exec("CREATE TABLE sink (id INTEGER PRIMARY KEY, pid INTEGER) USING memory");
-		const q = "SELECT p.id, (INSERT INTO sink (id, pid) SELECT p.id, p.id WHERE p.id = 1 RETURNING count(*)) AS n FROM p";
-		// Whether or not this exact DML-in-scalar shape plans, it must never be
-		// decorrelated. Planning failures are acceptable (shape not supported);
-		// a successful plan must retain the ScalarSubquery.
-		try {
-			const types = await planNodeTypes(db, q);
-			expect(types).to.include('ScalarSubquery');
-		} catch {
-			// Shape not plannable — nothing to decorrelate.
-		}
+		// A correlated `count(*)` over an `INSERT ... RETURNING` — a
+		// scalar-aggregate candidate whose inner subtree has a side effect. The
+		// side-effect gate must refuse it (decorrelation would change the write's
+		// per-row firing count), so its ScalarSubquery must survive.
+		const q = `SELECT p.id,
+			(SELECT count(*) FROM (INSERT INTO sink (id, pid) SELECT c.id, c.pid FROM c WHERE c.pid = p.id RETURNING id) r) AS n
+		FROM p`;
+		// Planning only — query_plan() never fires the INSERT.
+		const types = await planNodeTypes(db, q);
+		expect(types, 'DML-bearing subquery must stay correlated').to.include('ScalarSubquery');
 	});
 });
 
@@ -288,25 +288,25 @@ describe('Plan shape: nested scalar-aggregate subquery decorrelation (aggregate 
 
 	it('a DML-bearing subquery blocks only its own rewrite, not a pure sibling', async () => {
 		await db.exec("CREATE TABLE sink (id INTEGER PRIMARY KEY, entry_id INTEGER) USING memory");
-		// The DML-bearing branch must stay correlated at EVERY level — even the
-		// enclosing level's rewrite would change the write's firing count. The
-		// pure sibling subquery still decorrelates.
-		const q = `SELECT e.id,
-			(SELECT json_group_array((INSERT INTO sink (id, entry_id) SELECT lei.item_id, lei.entry_id WHERE lei.entry_id = 1 RETURNING count(*)))
-			FROM lei WHERE lei.entry_id = e.id) AS j,
-			(SELECT count(*) FROM lei WHERE lei.entry_id = e.id) AS n
-		FROM e`;
-		// Whether or not this DML-in-scalar shape plans, the write-bearing branch
-		// must never be decorrelated (per-row firing is observable).
-		try {
-			const rows = await planRows(db, q);
-			expect(rows.map(r => r.node_type)).to.include('ScalarSubquery');
-			const groupedAgg = rows.some(r =>
-				(r.node_type === 'HashAggregate' || r.node_type === 'StreamAggregate')
-				&& r.detail.includes('GROUP BY'));
-			expect(groupedAgg, 'pure sibling still decorrelates').to.equal(true);
-		} catch {
-			// Shape not plannable — nothing to decorrelate.
-		}
+		// Two scalar-aggregate subqueries in one outer aggregate argument: the
+		// first is a `count(*)` over an `INSERT ... RETURNING` (side-effecting
+		// inner subtree), the second a pure `count(*)`. The side-effect gate in
+		// `decorrelateOne` must refuse the DML branch (per-row firing is
+		// observable) while the pure sibling still decorrelates.
+		const q = `SELECT lei.entry_id, json_group_array(
+			(SELECT count(*) FROM (INSERT INTO sink (id, entry_id) SELECT qv.item_id, qv.entry_id FROM qv WHERE qv.item_id = lei.item_id RETURNING id) r)
+			+ (SELECT count(*) FROM qv WHERE qv.item_id = lei.item_id)) AS j
+		FROM lei GROUP BY lei.entry_id ORDER BY lei.entry_id`;
+		// Planning only — query_plan() never fires the INSERT.
+		const rows = await planRows(db, q);
+		// The DML branch keeps its correlated ScalarSubquery plan.
+		expect(rows.map(r => r.node_type), 'DML branch must stay correlated').to.include('ScalarSubquery');
+		// The pure sibling decorrelates into its own grouped LEFT join below the
+		// outer aggregate — so at least two grouped aggregates exist (the outer
+		// user GROUP BY plus the decorrelated sibling).
+		const groupedAggs = rows.filter(r =>
+			(r.node_type === 'HashAggregate' || r.node_type === 'StreamAggregate')
+			&& r.detail.includes('GROUP BY'));
+		expect(groupedAggs.length, 'pure sibling still decorrelates').to.be.greaterThanOrEqual(2);
 	});
 });
