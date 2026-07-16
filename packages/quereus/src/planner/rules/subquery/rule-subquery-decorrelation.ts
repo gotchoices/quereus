@@ -31,6 +31,7 @@ import { ColumnReferenceNode } from '../../nodes/reference.js';
 import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
 import { PlanNodeType } from '../../nodes/plan-node-type.js';
 import { splitConjuncts, combineConjuncts } from '../../analysis/predicate-conjuncts.js';
+import { isEquiCorrelation, collectDefinedAttrIds, referencesAnyAttr } from '../../analysis/equi-correlation.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 
 const log = createLogger('optimizer:rule:subquery-decorrelation');
@@ -76,40 +77,6 @@ function identifyCandidate(node: ScalarPlanNode): DecorrelationCandidate | null 
 	}
 
 	return null;
-}
-
-/**
- * Collect attribute IDs defined by a relational subtree.
- */
-function collectDefinedAttrIds(node: PlanNode): Set<number> {
-	const ids = new Set<number>();
-	function walk(n: PlanNode): void {
-		if (isRelationalNode(n)) {
-			for (const attr of n.getAttributes()) {
-				ids.add(attr.id);
-			}
-		}
-		for (const child of n.getChildren()) {
-			walk(child);
-		}
-	}
-	walk(node);
-	return ids;
-}
-
-/**
- * Returns true if the plan tree contains any column reference to an
- * attribute id in `attrIds`. Used to detect leftover correlation in
- * residual inner-only predicates (which may include nested subqueries).
- */
-function referencesAnyAttr(node: PlanNode, attrIds: Set<number>): boolean {
-	if (node instanceof ColumnReferenceNode && attrIds.has(node.attributeId)) {
-		return true;
-	}
-	for (const child of node.getChildren()) {
-		if (referencesAnyAttr(child, attrIds)) return true;
-	}
-	return false;
 }
 
 /**
@@ -185,26 +152,6 @@ function extractExistsCorrelation(
 	const residualInnerFilter = combineConjuncts(innerOnlyConjuncts);
 
 	return { innerSource, correlationCondition, residualInnerFilter };
-}
-
-/**
- * Check if a scalar node is a simple equi-join between outer and inner attributes.
- * Matches: outer.col = inner.col (or inner.col = outer.col)
- */
-function isEquiCorrelation(
-	node: ScalarPlanNode,
-	outerAttrIds: Set<number>,
-	innerAttrIds: Set<number>
-): boolean {
-	if (!(node instanceof BinaryOpNode)) return false;
-	if (node.expression.operator !== '=') return false;
-	if (!(node.left instanceof ColumnReferenceNode) || !(node.right instanceof ColumnReferenceNode)) return false;
-
-	const leftId = node.left.attributeId;
-	const rightId = node.right.attributeId;
-
-	return (outerAttrIds.has(leftId) && innerAttrIds.has(rightId)) ||
-		   (outerAttrIds.has(rightId) && innerAttrIds.has(leftId));
 }
 
 /**

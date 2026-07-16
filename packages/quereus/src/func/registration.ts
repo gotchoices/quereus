@@ -76,6 +76,19 @@ interface TableValuedFuncOptions {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type AggValue = any;
 
+/** Clone an aggregate initial value so each group gets an independent accumulator. */
+export function cloneInitialValue(initialValue: unknown): AggValue {
+	if (typeof initialValue === 'function') {
+		return initialValue();
+	} else if (Array.isArray(initialValue)) {
+		return [...initialValue] as AggValue;
+	} else if (initialValue && typeof initialValue === 'object') {
+		return { ...initialValue } as AggValue;
+	} else {
+		return initialValue as AggValue;
+	}
+}
+
 /**
  * Configuration options for aggregate functions
  */

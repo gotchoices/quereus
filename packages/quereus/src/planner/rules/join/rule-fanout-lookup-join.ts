@@ -77,6 +77,7 @@ import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { checkFkPkAlignment, extractTableSchema } from '../../util/key-utils.js';
 import { lookupCoveringFK, isRowPreservingPathToTable } from '../../util/ind-utils.js';
 import { collectExternalReferences } from '../../cache/correlation-detector.js';
+import { collectScalarSubqueries, substituteSubqueries } from '../../analysis/scalar-subqueries.js';
 import { CapabilityDetectors, PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { isAndOfColumnEqualities } from './rule-join-elimination.js';
 import { FanOutLookupJoinNode, isCrossBranchMode, isLeftBranchMode, type FanOutBranchSpec, type FanOutBranchMode } from '../../nodes/fanout-lookup-join-node.js';
@@ -362,61 +363,6 @@ export function ruleFanOutLookupJoin(node: PlanNode, context: OptContext): PlanN
 /** Minimal synthetic AST.ColumnExpr for a rewritten projection column ref. */
 function columnExprFor(name: string): AST.ColumnExpr {
 	return { type: 'column', name };
-}
-
-/**
- * Collect every `ScalarSubqueryNode` reachable in a projection's scalar
- * expression tree, in deterministic pre-order. A recognized subquery is a leaf
- * for this walk: we push it and do NOT descend into its relational body, so a
- * subquery nested *inside* another subquery's correlation predicate remains part
- * of its enclosing branch child rather than being clustered as its own branch.
- * (The relational body is filtered out by the `typeClass === 'scalar'` guard
- * regardless, but stopping early keeps the intent explicit.)
- */
-function collectScalarSubqueries(expr: ScalarPlanNode, out: ScalarSubqueryNode[]): void {
-	if (expr instanceof ScalarSubqueryNode) {
-		out.push(expr);
-		return;
-	}
-	for (const child of expr.getChildren()) {
-		if (child.getType().typeClass === 'scalar') {
-			collectScalarSubqueries(child as ScalarPlanNode, out);
-		}
-	}
-}
-
-/**
- * Rebuild a projection's scalar expression with each recognized
- * `ScalarSubqueryNode` replaced by its `ColumnReferenceNode` into the fan-out's
- * wide row, leaving the wrapping expression (`coalesce(<colref>, 0)`) intact.
- * For a bare-subquery projection the root itself is in the map and is returned
- * directly; for a wrapped subquery the tree is rebuilt via `withChildren` with
- * only the matched inner node substituted. Returns the input unchanged when no
- * descendant is a recognized subquery.
- */
-function substituteSubqueries(
-	expr: ScalarPlanNode,
-	replacements: ReadonlyMap<ScalarSubqueryNode, ColumnReferenceNode>,
-): ScalarPlanNode {
-	if (expr instanceof ScalarSubqueryNode) {
-		return replacements.get(expr) ?? expr;
-	}
-	const children = expr.getChildren();
-	if (children.length === 0) return expr;
-
-	const newChildren: PlanNode[] = [];
-	let changed = false;
-	for (const child of children) {
-		if (child.getType().typeClass === 'scalar') {
-			const replaced = substituteSubqueries(child as ScalarPlanNode, replacements);
-			newChildren.push(replaced);
-			if (replaced !== child) changed = true;
-		} else {
-			newChildren.push(child);
-		}
-	}
-	if (!changed) return expr;
-	return expr.withChildren(newChildren) as ScalarPlanNode;
 }
 
 /**

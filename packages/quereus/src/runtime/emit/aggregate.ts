@@ -18,23 +18,16 @@ import { coerceForAggregate } from '../../util/coercion.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { buildRowDescriptor } from '../../util/row-descriptor.js';
-import { AggValue } from '../../func/registration.js';
+import { AggValue, cloneInitialValue } from '../../func/registration.js';
 import type { ContextInstaller } from '../context-helpers.js';
 
 export const ctxLog = createLogger('runtime:context');
 
-/** Clone an aggregate initial value so each group gets an independent accumulator. */
-export function cloneInitialValue(initialValue: unknown): AggValue {
-	if (typeof initialValue === 'function') {
-		return initialValue();
-	} else if (Array.isArray(initialValue)) {
-		return [...initialValue] as AggValue;
-	} else if (initialValue && typeof initialValue === 'object') {
-		return { ...initialValue } as AggValue;
-	} else {
-		return initialValue as AggValue;
-	}
-}
+// Re-exported for the emitters that import it from here (hash-aggregate);
+// the implementation lives with `AggValue` in func/registration.ts so the
+// planner (scalar-agg decorrelation's plan-time empty-value computation) can
+// share the exact runtime cloning path without a planner→runtime import.
+export { cloneInitialValue };
 
 /**
  * Find the source relation node that column references should use as their context key.
