@@ -120,8 +120,15 @@ export function ruleNestedLoopRightCache(node: PlanNode, context: OptContext): P
 	// Driver gate: only the left-driven join types re-scan the right side.
 	// `right` / `full` buffer the left side once and scan the right side once
 	// (`emitLoopJoin.driveFromRight`), so caching their right side is pure waste.
-	// Semi/anti still benefit: they early-`break` on first match but re-open the
-	// right pipeline per left row, so a replay buffer saves the reopen+scan.
+	// NOTE: inner/left/cross fully drain the right per left row, so the run-once
+	// cache (streamWithCache only retains its buffer once a consumer drains the
+	// source to completion — see shared-cache.ts) fills on the first left row and
+	// replays thereafter. Semi/anti `break` on the first match (emitLoopJoin
+	// driveFromLeft), so a matched left row abandons the partial buffer and the
+	// next row re-scans; their buffer only lands after the first *unmatched* left
+	// row drains the right in full. Caching them is still never a regression
+	// (same reopen count until the buffer fills, a win after), just data-dependent
+	// rather than the guaranteed replay inner/cross/left get.
 	if (node.joinType === 'right' || node.joinType === 'full') {
 		return null;
 	}
