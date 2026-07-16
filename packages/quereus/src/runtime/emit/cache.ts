@@ -14,11 +14,15 @@ import { isLoggingEnabled } from '../../common/logger.js';
  * ```typescript
  * import { streamWithCache, createCacheState } from '../cache/shared-cache.js';
  *
- * // In your emitter:
- * const cacheState = createCacheState();
+ * // In your emitter closure — mint a stable per-emit-site key, NOT the CacheState:
+ * const cacheKey = Symbol(`nlj-inner:${plan.id}`);
  * const config = { threshold: 10000, strategy: 'memory', name: 'NLJ-inner' };
  *
- * // In your run function:
+ * // In your run function — get-or-create the state on the per-execution context so
+ * // it resets between prepared-statement runs (never build CacheState at emit time —
+ * // the closure outlives one execution and would replay stale rows). See emitCache below.
+ * const states = (rctx.cacheStates ??= new Map<symbol, CacheState>());
+ * const cacheState = states.get(cacheKey) ?? states.set(cacheKey, createCacheState()).get(cacheKey)!;
  * yield* streamWithCache(sourceIterable, config, cacheState);
  * ```
  */
