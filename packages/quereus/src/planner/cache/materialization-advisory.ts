@@ -107,13 +107,15 @@ export class MaterializationAdvisory {
 			};
 		}
 
-		// Rule 4: Single-parent nodes that don't appear in loops typically don't benefit from caching
-		if (stats.parentCount <= 1 && !stats.appearsInLoop) {
+		// Rule 4: Single-parent nodes typically don't benefit from caching.
+		// (Loop-context caching for nested-loop join right sides is handled
+		// separately by rule-nested-loop-right-cache during physical optimization.)
+		if (stats.parentCount <= 1) {
 			return {
 				shouldCache: false,
 				strategy: 'memory',
 				threshold: 0,
-				reason: 'Single parent, not in loop'
+				reason: 'Single parent'
 			};
 		}
 
@@ -127,29 +129,6 @@ export class MaterializationAdvisory {
 				strategy,
 				threshold,
 				reason: `Multiple parents (${stats.parentCount})`
-			};
-		}
-
-		// Rule 6: Nodes in loop contexts benefit from caching even with single parent
-		if (stats.appearsInLoop) {
-			// Check if the estimated size is reasonable for caching
-			if (stats.estimatedRows > this.tuning.join.maxRightRowsForCaching) {
-				return {
-					shouldCache: false,
-					strategy: 'memory',
-					threshold: 0,
-					reason: `In loop but too large (${stats.estimatedRows} rows)`
-				};
-			}
-
-			const strategy = this.selectStrategy(stats.estimatedRows);
-			const threshold = this.calculateThreshold(stats.estimatedRows, strategy);
-
-			return {
-				shouldCache: true,
-				strategy,
-				threshold,
-				reason: 'Appears in loop context'
 			};
 		}
 

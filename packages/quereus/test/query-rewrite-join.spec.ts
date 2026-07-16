@@ -36,6 +36,11 @@ const JOIN_SHAPE_RULES = new Set<string>([
 	'predicate-inference-equivalence',
 	'select-access-path',
 	'join-physical-selection',
+	// Wraps a surviving nested-loop join's right side in a CacheNode; would
+	// otherwise insert Cache(P) between the Join and its lookup table, hiding
+	// the pristine Join(T, P) shape the matcher reads. (In production the MV
+	// matcher runs in the Structural pass, before this PostOptimization rule.)
+	'nested-loop-right-cache',
 	'monotonic-merge-join',
 	'join-elimination',
 	...[

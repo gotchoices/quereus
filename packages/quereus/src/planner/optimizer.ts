@@ -54,6 +54,7 @@ import { ruleMonotonicWindow } from './rules/window/rule-monotonic-window.js';
 // Constraint rules removed - now handled in builders for correctness
 import { ruleCteOptimization } from './rules/cache/rule-cte-optimization.js';
 import { ruleMutatingSubqueryCache } from './rules/cache/rule-mutating-subquery-cache.js';
+import { ruleNestedLoopRightCache } from './rules/cache/rule-nested-loop-right-cache.js';
 import { ruleInSubqueryCache } from './rules/cache/rule-in-subquery-cache.js';
 import { ruleSubqueryDecorrelation } from './rules/subquery/rule-subquery-decorrelation.js';
 import { ruleScalarAggDecorrelation, ruleScalarAggDecorrelationAggregate } from './rules/subquery/rule-scalar-agg-decorrelation.js';
@@ -893,6 +894,25 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		fn: ruleMutatingSubqueryCache,
 		// Specifically *targets* side-effect-bearing right sides and wraps
 		// them in a run-once CacheNode — the canonical aware rule.
+		sideEffectMode: 'aware',
+	},
+
+	// Cache the pure right side of a surviving nested-loop JoinNode. Runs
+	// immediately after mutating-subquery-cache so that a side-effect-bearing
+	// right side is already wrapped (and this rule's already-cached gate skips
+	// it) — the two rules partition the space: mutating handles impure right
+	// sides, this one handles pure ones. By PostOptimization every equi-join is
+	// already a hash/merge, so any logical JoinNode reaching here is a nested
+	// loop whose left-driven types re-open the right pipeline per left row.
+	{
+		pass: PassId.PostOptimization,
+		id: 'nested-loop-right-cache',
+		nodeType: PlanNodeType.Join,
+		phase: 'rewrite',
+		fn: ruleNestedLoopRightCache,
+		// Only fires on side-effect-free right sides (purity gate), but declares
+		// 'aware' to match the sibling cache rules and stay correct if the gate
+		// is ever relaxed.
 		sideEffectMode: 'aware',
 	},
 

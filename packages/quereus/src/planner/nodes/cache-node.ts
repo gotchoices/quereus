@@ -1,5 +1,5 @@
 import { PlanNodeType } from './plan-node-type.js';
-import { PlanNode, type RelationalPlanNode, type UnaryRelationalNode, type Attribute, isRelationalNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type UnaryRelationalNode, type Attribute, type PhysicalProperties, isRelationalNode } from './plan-node.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { StatusCode } from '../../common/types.js';
@@ -50,6 +50,35 @@ export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCap
 
 	getRelations(): readonly [RelationalPlanNode] {
 		return [this.source];
+	}
+
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const sourcePhysical = childrenPhysical[0];
+		// A cache is a pure materialization pass-through: it buffers the source on
+		// first iteration and replays it in the SAME order, preserving every
+		// relational characteristic. Attribute ids are unchanged, so — exactly like
+		// AliasNode — FDs, equivalence classes, constant bindings, domain
+		// constraints, INDs, backward update-lineage, ordering, and monotonicOn all
+		// carry through. Without this, wrapping a relation in a Cache would silently
+		// drop its keys/FDs and disable downstream key-based optimizations (DISTINCT
+		// elimination, join-key coverage, ≤1-row detection).
+		//
+		// `accessCapabilities` / `rangeBoundedOn` are deliberately NOT propagated:
+		// they describe the physical *leaf iterator* (ordinal seek, asof-right), and
+		// the cache's replay iterator is not that leaf — matching the pass-through
+		// contract documented on those fields.
+		return {
+			estimatedRows: this.source.estimatedRows,
+			ordering: sourcePhysical?.ordering,
+			monotonicOn: sourcePhysical?.monotonicOn,
+			fds: sourcePhysical?.fds,
+			equivClasses: sourcePhysical?.equivClasses,
+			constantBindings: sourcePhysical?.constantBindings,
+			domainConstraints: sourcePhysical?.domainConstraints,
+			inds: sourcePhysical?.inds,
+			updateLineage: sourcePhysical?.updateLineage,
+			attributeDefaults: sourcePhysical?.attributeDefaults,
+		};
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {
