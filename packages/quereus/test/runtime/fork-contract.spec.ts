@@ -56,6 +56,11 @@ const EXPECTED_FORK_POLICY = {
 	// statement teardown disconnects every instance connected across branches exactly
 	// once. Mutation across branches is the scan lifecycle's responsibility.
 	scanConnections: 'shared-cooperative',
+	// Once-per-execution CacheNode row-cache map: shared by reference so a cache
+	// materialized in one branch is visible to a sibling branch re-driving the same
+	// cache site within the same execution. Mutation across branches is the
+	// CacheNode emitter's responsibility.
+	cacheStates: 'shared-cooperative',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
@@ -188,6 +193,7 @@ describe('Fork contract (test harness)', () => {
 			parent.signal = new AbortController().signal;
 			parent.executionMemo = new Map();
 			parent.scanConnections = new Map();
+			parent.cacheStates = new Map();
 
 			const [fork] = driver.fork(parent, 1);
 

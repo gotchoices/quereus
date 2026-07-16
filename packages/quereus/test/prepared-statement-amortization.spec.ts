@@ -227,4 +227,40 @@ describe('Prepared statement setup amortization', () => {
 			await stmt.finalize();
 		}
 	});
+
+	// Guards the CacheNode counterpart of the executionMemo regression above: the
+	// uncorrelated `IN (subquery)` rule injects a CacheNode so the subquery's rows
+	// materialize once per execution instead of once per outer row. That materialized
+	// row state used to live in the emit-time closure (createCacheState() called at
+	// emit time), which persists across executions once the instruction tree is
+	// cached — so a re-executed statement replayed run 1's cached rows even after the
+	// source table changed. The fix moves the cache state onto the per-execution
+	// RuntimeContext, keyed by a stable per-emit-site symbol.
+	it('re-drives an uncorrelated IN-subquery cache with fresh data on every execution of a prepared statement', async () => {
+		await db.exec('create table t1 (a integer primary key);');
+		await db.exec('insert into t1 values (1), (2), (3);');
+		await db.exec('create table t2 (b integer primary key);');
+		await db.exec('insert into t2 values (2);');
+
+		// Outer row a=1 has no match, forcing a full drain of the IN subquery so the
+		// cache actually completes (shared-cache.ts only saves on full iteration) —
+		// keep this property so the regression exercises the completed-cache path.
+		const stmt = db.prepare('select a from t1 where a in (select b from t2) order by a');
+		try {
+			const run1 = await collectRows(stmt.all());
+			void expect(run1).to.deep.equal([{ a: 2 }]);
+			const schedulerAfterRun1 = internals(stmt).scheduler;
+			void expect(schedulerAfterRun1).to.not.equal(null, 'scheduler cached after first run');
+
+			await db.exec('insert into t2 values (3);');
+
+			const run2 = await collectRows(stmt.all());
+			void expect(run2).to.deep.equal([{ a: 2 }, { a: 3 }]);
+			// Same cached scheduler reused — the fix works with a cached instruction
+			// tree, not by accidentally forcing a recompile.
+			void expect(internals(stmt).scheduler).to.equal(schedulerAfterRun1, 'scheduler reused across executions');
+		} finally {
+			await stmt.finalize();
+		}
+	});
 });

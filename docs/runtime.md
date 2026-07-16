@@ -1434,6 +1434,22 @@ connect would). The read scan connects `module.connect` directly and never
 registers a `VirtualTableConnection`, so this is independent of the
 `adoptConnection` / connection-registration path.
 
+### CacheNode row-cache lifetime
+
+`emitCache` (`src/runtime/emit/cache.ts`) materializes its source's rows on
+first iteration and replays them on later re-iterations within the same
+execution — used for uncorrelated `IN (subquery)` (`rule-in-subquery-cache`),
+CTE materialization (`rule-cte-optimization`), and mutating-subquery caching
+(`rule-mutating-subquery-cache`). The materialized `CacheState` (from
+`src/runtime/cache/shared-cache.ts`) lives on the per-execution
+`RuntimeContext` (`ctx.cacheStates`, a `Map<symbol, CacheState>`), keyed by a
+symbol minted in the `emitCache` closure — the same pattern as
+`executionMemo` and `scanConnections` above. Because the instruction tree
+(and the closure that minted the key) is cached and reused across a prepared
+statement's executions, tying the cache to the context rather than the
+closure resets it between runs: a re-executed statement re-drives its cached
+source and observes current data instead of replaying the first run's rows.
+
 ## Query Optimizer Integration
 
 The Quereus optimizer transforms logical plan nodes into physical execution plans between the builder and runtime phases. This section covers the key aspects relevant to runtime emitter development.
@@ -1516,6 +1532,7 @@ Three invariants govern what code may do with a `RuntimeContext` once it has bee
 | `planStack` | `shared-sink` | Tracing-only stack. |
 | `executionMemo` | `shared-cooperative` | Once-per-execution impure-subquery memo; shared so the run-once contract spans branches. |
 | `scanConnections` | `shared-cooperative` | Once-per-execution inner-scan connection cache; shared so statement teardown disconnects every branch's instances exactly once. |
+| `cacheStates` | `shared-cooperative` | Once-per-execution `CacheNode` row-cache map; shared so a cache materialized in one branch is visible to a sibling branch re-driving the same cache site. |
 
 Adding a new field to `RuntimeContext` requires adding it to `EXPECTED_FORK_POLICY` in `fork-contract.spec.ts` with a declared policy — the test fails compile otherwise.
 

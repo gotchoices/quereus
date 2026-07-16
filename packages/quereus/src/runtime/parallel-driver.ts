@@ -53,7 +53,8 @@ export class ParallelDriver {
 	 *   parent's entries — set/delete in one fork do not leak to siblings or parent;
 	 * - **shared** references to read-mostly state: `db`, `stmt`, `params`,
 	 *   `enableMetrics`, `mutationOrdinal`, `signal`, `tracer`, `activeConnection`,
-	 *   `contextTracker`, `planStack`, `executionMemo`. (`signal` is shared so every
+	 *   `contextTracker`, `planStack`, `executionMemo`, `scanConnections`, `cacheStates`.
+	 *   (`signal` is shared so every
 	 *   branch honors the same cooperative cancellation — the table-scan leaf reads
 	 *   `rctx.signal`.) (`mutationOrdinal` is a per-row INSERT/envelope
 	 *   scalar set+restored synchronously by the sequential insert path, never mutated
@@ -72,6 +73,11 @@ export class ParallelDriver {
 	 *   only safe for a module whose `concurrencyMode` permits it. Dormant today:
 	 *   ParallelDriver has no query consumers, and the sequential NLJ re-scan this cache
 	 *   was built for is never concurrently self-live.)
+	 *   (`cacheStates` is the once-per-execution CacheNode row-cache map; shared by
+	 *   reference so a cache materialized in one branch is visible to another branch
+	 *   that re-drives the same cache site within the same execution, matching the
+	 *   pre-fork single-closure cache. Dormant today: ParallelDriver has no query
+	 *   consumers.)
 	 *
 	 * The parent is treated as immutable for the lifetime of the forks.
 	 */
@@ -109,6 +115,7 @@ export class ParallelDriver {
 				planStack: rctx.planStack,
 				executionMemo: rctx.executionMemo,
 				scanConnections: rctx.scanConnections,
+				cacheStates: rctx.cacheStates,
 			};
 			if (strict) {
 				markForkOf(childTableContexts, rctx.tableContexts);

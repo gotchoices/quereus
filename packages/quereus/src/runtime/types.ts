@@ -7,6 +7,7 @@ import type { VirtualTableConnection } from "../vtab/connection.js";
 import type { VirtualTable } from "../vtab/table.js";
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { RowContextMap } from './context-helpers.js';
+import type { CacheState } from './cache/shared-cache.js';
 
 // Re-export types from common/types.js for convenience
 export type { OutputValue };
@@ -73,6 +74,20 @@ export type RuntimeContext = {
 	 * to connect-and-disconnect per invocation (correct, just no reuse).
 	 */
 	scanConnections?: Map<symbol, VirtualTable>;
+	/**
+	 * Per-execution materialized-row cache state for {@link emitCache}, keyed by a
+	 * stable symbol minted in that emitter's closure. A fresh RuntimeContext is
+	 * built for each execution while the instruction tree (and the emitter closure
+	 * that mints the key) is cached and reused on the prepared Statement, so tying
+	 * the cache to the context — not the closure — makes it reset between
+	 * prepared-statement runs: a re-executed statement re-drives its cached source
+	 * and observes current data instead of replaying the first run's rows. Within
+	 * one execution, the same key still resolves to the same {@link CacheState},
+	 * so the cache materializes once and replays across re-scans (e.g. per-outer-row
+	 * `IN`-subquery evaluation). Mirrors the {@link executionMemo}/{@link scanConnections}
+	 * pattern.
+	 */
+	cacheStates?: Map<symbol, CacheState>;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;

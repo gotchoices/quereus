@@ -4,7 +4,7 @@ import { asRun } from '../types.js';
 import type { Row } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitCallFromPlan } from '../emitters.js';
-import { streamWithCache, createCacheState, type SharedCacheConfig } from '../cache/shared-cache.js';
+import { streamWithCache, createCacheState, type CacheState, type SharedCacheConfig } from '../cache/shared-cache.js';
 import { buffered, traced } from '../async-util.js';
 import { isLoggingEnabled } from '../../common/logger.js';
 
@@ -30,15 +30,29 @@ import { isLoggingEnabled } from '../../common/logger.js';
  * Now uses the shared cache utility to avoid code duplication.
  */
 export function emitCache(plan: CacheNode, ctx: EmissionContext): Instruction {
-	// Create cache state using shared utility
-	const cacheState = createCacheState();
 	const config: SharedCacheConfig = {
 		threshold: plan.threshold,
 		strategy: plan.strategy,
 		name: `CacheNode-${plan.id}`
 	};
 
+	// Stable per-emit-site key for the per-execution cache state
+	// (RuntimeContext.cacheStates). Minted once here in the emitter closure, so it
+	// is identical across every re-drive of THIS cache within one execution (the
+	// instruction tree is cached and reused on the prepared Statement), yet a fresh
+	// RuntimeContext per execution means a re-executed statement gets a fresh
+	// CacheState and re-drives its source instead of replaying stale rows. Mirrors
+	// the executionMemo/scanConnections symbol pattern.
+	const cacheKey = Symbol(`cache:${plan.id}`);
+
 	async function* run(rctx: RuntimeContext, sourceCallback: (innerCtx: RuntimeContext) => AsyncIterable<Row>): AsyncIterable<Row> {
+		const cacheStates = (rctx.cacheStates ??= new Map<symbol, CacheState>());
+		let cacheState = cacheStates.get(cacheKey);
+		if (!cacheState) {
+			cacheState = createCacheState();
+			cacheStates.set(cacheKey, cacheState);
+		}
+
 		let sourceIterable = sourceCallback(rctx);
 
 		// Optional: Add buffering for large threshold caches to improve performance
