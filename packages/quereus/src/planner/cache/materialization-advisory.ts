@@ -4,9 +4,10 @@
  */
 
 import { createLogger } from '../../common/logger.js';
-import { isRelationalNode, type PlanNode, type RelationalPlanNode } from '../nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type RelationalPlanNode, type ScalarPlanNode, type TableDescriptor } from '../nodes/plan-node.js';
 import { CacheNode, type CacheStrategy } from '../nodes/cache-node.js';
 import { CTENode } from '../nodes/cte-node.js';
+import { RecursiveCTENode } from '../nodes/recursive-cte-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import type { OptimizerTuning } from '../optimizer-tuning.js';
 import { ReferenceGraphBuilder, type RefStats } from './reference-graph.js';
@@ -47,13 +48,52 @@ export class MaterializationAdvisory {
 		// CTE materialize-mark rewrite and the CacheNode recommendations below)
 		const refGraph = this.referenceBuilder.buildReferenceGraph(root);
 
+		// Count references to each recursive CTE by its working-table descriptor.
+		// A multi-referenced recursive CTE is DUPLICATED into distinct
+		// RecursiveCTENode instances by earlier passes (each copy then has
+		// parentCount 1), but every copy preserves the one `tableDescriptor`
+		// identity — so summing parent counts per descriptor recovers the true
+		// reference count. A single-reference recursive CTE is never duplicated
+		// (one CTEReference parent, one path), so its descriptor sums to 1.
+		const recursiveRefsByDescriptor = new Map<TableDescriptor, number>();
+		for (const [node, stats] of refGraph) {
+			if (node instanceof RecursiveCTENode) {
+				recursiveRefsByDescriptor.set(
+					node.tableDescriptor,
+					(recursiveRefsByDescriptor.get(node.tableDescriptor) ?? 0) + stats.parentCount
+				);
+			}
+		}
+
 		// Mark multi-referenced / MATERIALIZED-hinted CTEs for shared
 		// materialization at emission. Memoized by node identity so a CTENode
 		// shared by several CTEReferenceNode parents is rewritten ONCE and the
 		// parents keep pointing at the same marked instance — emitCTE keys its
-		// per-execution buffer on that shared node's plan id.
+		// per-execution buffer on that shared node's plan id. (Recursive CTEs use
+		// the descriptor count above instead — see markCTEMaterialization.)
 		const markMemo = new Map<PlanNode, PlanNode>();
-		const markedRoot = this.markCTEMaterialization(root, refGraph, markMemo);
+		const markedRoot = this.markCTEMaterialization(root, refGraph, recursiveRefsByDescriptor, markMemo);
+
+		// Nodes inside any recursive CTE's recursive-case subtree must NEVER be
+		// cached. The recursive case is re-evaluated on every semi-naïve iteration
+		// against the changing working table (delta), so a CacheNode there would
+		// freeze it to the first iteration's rows — dropping rows (UNION DISTINCT
+		// terminates early) or looping forever (UNION ALL). This bites specifically
+		// when a recursive CTE is referenced 2+ times: earlier passes duplicate it
+		// into distinct instances that SHARE one recursive-case subtree, inflating
+		// that subtree's parent count to ≥2 and otherwise tripping the multi-parent
+		// cache rule. (Single-reference recursive CTEs never share their recursive
+		// case, so this set is empty for them.)
+		// NOTE: conservative — excludes EVERY node in a recursive-case subtree,
+		// including a subquery that never reads the working table (safe to cache).
+		// If an expensive working-table-independent subquery inside a recursive case
+		// ever shows up as slow, narrow this to only working-table-dependent nodes.
+		const noCacheNodes = new Set<PlanNode>();
+		for (const [node] of refGraph) {
+			if (node instanceof RecursiveCTENode) {
+				this.collectSubtree(node.recursiveCaseQuery, noCacheNodes);
+			}
+		}
 
 		// Build recommendations. Keys are re-mapped through the mark memo so a
 		// recommendation lands on the (possibly rewritten) node instance that is
@@ -63,6 +103,10 @@ export class MaterializationAdvisory {
 		for (const [node, stats] of refGraph) {
 			// Only consider relational nodes for caching
 			if (!isRelationalNode(node)) {
+				continue;
+			}
+
+			if (noCacheNodes.has(node)) {
 				continue;
 			}
 
@@ -85,11 +129,15 @@ export class MaterializationAdvisory {
 	}
 
 	/**
-	 * Decide whether a CTE must be materialized once per statement execution.
-	 * Recursive CTEs are excluded (they run through the working-table machinery,
-	 * not emitCTE); an explicit NOT MATERIALIZED hint is honored (the user opted
-	 * into re-execution per reference); otherwise an explicit MATERIALIZED hint
-	 * or two-plus references trips the mark.
+	 * Decide whether a non-recursive {@link CTENode} must be materialized once per
+	 * statement execution. An explicit NOT MATERIALIZED hint is honored (the user
+	 * opted into re-execution per reference); otherwise an explicit MATERIALIZED
+	 * hint or two-plus references trips the mark.
+	 *
+	 * Recursive CTEs ({@link RecursiveCTENode}) do NOT flow through here — they run
+	 * through the working-table machinery (emitRecursiveCTE), not emitCTE, and are
+	 * marked by a dedicated branch in {@link markCTEMaterialization} that gates
+	 * purely on reference count (the hint is deliberately ignored — see there).
 	 */
 	private shouldMaterializeCTE(node: CTENode, stats: RefStats | undefined): boolean {
 		if (node.isRecursive) return false;
@@ -98,18 +146,24 @@ export class MaterializationAdvisory {
 	}
 
 	/**
-	 * Top-down memoized rewrite that sets `CTENode.materialize` where
-	 * {@link shouldMaterializeCTE} says so.
+	 * Top-down memoized rewrite that sets the `materialize` flag on CTE nodes:
+	 * on a non-recursive {@link CTENode} where {@link shouldMaterializeCTE} says so,
+	 * and on a {@link RecursiveCTENode} whose working-table descriptor is referenced
+	 * two-plus times (`recursiveRefsByDescriptor`).
 	 *
-	 * The memo (keyed by node identity) is what keeps a shared CTENode shared:
-	 * the plain {@link transformChildren} walk is NOT memoized, so routing this
-	 * mark through it would rebuild the CTENode once per referencing parent —
-	 * two distinct marked instances with different plan ids, and the runtime's
-	 * per-execution buffer key would never match across references.
+	 * The memo (keyed by node identity) keeps a shared CTENode shared: the plain
+	 * {@link transformChildren} walk is NOT memoized, so routing this mark through it
+	 * would rebuild the CTENode once per referencing parent — two distinct marked
+	 * instances with different plan ids, and emitCTE's per-execution buffer key
+	 * would never match across references. (Recursive CTEs are already duplicated
+	 * per parent by earlier passes; emitRecursiveCTE keys its buffer on the shared
+	 * `tableDescriptor` instead of the plan id, so the mark just needs to land on
+	 * every copy — which the descriptor count guarantees.)
 	 */
 	private markCTEMaterialization(
 		node: PlanNode,
 		refGraph: Map<PlanNode, RefStats>,
+		recursiveRefsByDescriptor: Map<TableDescriptor, number>,
 		memo: Map<PlanNode, PlanNode>
 	): PlanNode {
 		const cached = memo.get(node);
@@ -118,7 +172,7 @@ export class MaterializationAdvisory {
 		}
 
 		const children = node.getChildren();
-		const newChildren = children.map(child => this.markCTEMaterialization(child, refGraph, memo));
+		const newChildren = children.map(child => this.markCTEMaterialization(child, refGraph, recursiveRefsByDescriptor, memo));
 		const childrenChanged = newChildren.some((child, idx) => child !== children[idx]);
 
 		let result: PlanNode;
@@ -134,6 +188,41 @@ export class MaterializationAdvisory {
 				true
 			);
 			log('Marked CTE %s for shared materialization', node.cteName);
+		} else if (node instanceof RecursiveCTENode && !node.materialize && (recursiveRefsByDescriptor.get(node.tableDescriptor) ?? 0) >= 2) {
+			// Multi-referenced recursive CTE: drive the recursion once per execution
+			// into a shared buffer that every reference replays (emitRecursiveCTE),
+			// instead of each reference driving its own semi-naïve loop. Two
+			// interleaved drives share one working-table `tableDescriptor` and clobber
+			// each other's delta — the double-reference runaway this fixes.
+			//
+			// Gated on the DESCRIPTOR reference count, not this node's parentCount:
+			// earlier passes duplicate the shared node per reference (each copy then
+			// has parentCount 1), so per-node counting would miss it. The
+			// materializationHint is deliberately ignored — honoring NOT MATERIALIZED
+			// on a multi-referenced recursive CTE would re-introduce exactly that
+			// runaway, so correctness beats the hint here. `tableDescriptor` identity
+			// is preserved so the InternalRecursiveCTERefNode in the recursive case
+			// still resolves the same working table AND every duplicate keys the same
+			// shared buffer.
+			const [newBase, newRecursive, ...rest] = newChildren;
+			let restIdx = 0;
+			const newLimit = node.limitExpr ? rest[restIdx++] as ScalarPlanNode : undefined;
+			const newOffset = node.offsetExpr ? rest[restIdx++] as ScalarPlanNode : undefined;
+			result = new RecursiveCTENode(
+				node.scope,
+				node.cteName,
+				node.columns,
+				newBase as RelationalPlanNode,
+				newRecursive as RelationalPlanNode,
+				node.isUnionAll,
+				node.materializationHint,
+				node.maxRecursion,
+				node.tableDescriptor,
+				newLimit,
+				newOffset,
+				true
+			);
+			log('Marked recursive CTE %s for shared buffering (%d references)', node.cteName, recursiveRefsByDescriptor.get(node.tableDescriptor) ?? 0);
 		} else if (childrenChanged) {
 			result = node.withChildren(newChildren);
 		} else {
@@ -142,6 +231,20 @@ export class MaterializationAdvisory {
 
 		memo.set(node, result);
 		return result;
+	}
+
+	/**
+	 * Collect a node and every descendant (via `getChildren()`) into `out`.
+	 * `out` doubles as the visited set, so a shared subtree is walked once.
+	 */
+	private collectSubtree(node: PlanNode, out: Set<PlanNode>): void {
+		if (out.has(node)) {
+			return;
+		}
+		out.add(node);
+		for (const child of node.getChildren()) {
+			this.collectSubtree(child, out);
+		}
 	}
 
 	/**
@@ -191,18 +294,18 @@ export class MaterializationAdvisory {
 			};
 		}
 
-		// Rule 5a: CTEs never take a CacheNode wrap. A multi-referenced (or
-		// MATERIALIZED-hinted) CTE is handled by the CTENode.materialize mark
-		// (see markCTEMaterialization) — emitCTE buffers it once per execution.
-		// A CacheNode wrap here could never land anyway: CTEReferenceNode.
-		// withChildren rejects a non-CTE child, so transformChildren silently
-		// dropped the wrap.
-		if (node.nodeType === PlanNodeType.CTE) {
+		// Rule 5a: CTE and recursive-CTE nodes never take a CacheNode wrap. A
+		// multi-referenced (or MATERIALIZED-hinted) CTE is handled by the
+		// CTENode/RecursiveCTENode.materialize mark (see markCTEMaterialization) —
+		// emitCTE / emitRecursiveCTE buffer it once per execution. A CacheNode wrap
+		// here could never land anyway: CTEReferenceNode.withChildren rejects a
+		// non-CTE child, so transformChildren silently dropped the wrap.
+		if (node.nodeType === PlanNodeType.CTE || node.nodeType === PlanNodeType.RecursiveCTE) {
 			return {
 				shouldCache: false,
 				strategy: 'memory',
 				threshold: 0,
-				reason: 'CTE — shared materialization handled by CTENode.materialize mark'
+				reason: 'CTE — shared materialization handled by the materialize mark'
 			};
 		}
 

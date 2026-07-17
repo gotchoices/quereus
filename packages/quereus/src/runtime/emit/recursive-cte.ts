@@ -19,7 +19,11 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 	const hasLimit = !!plan.limitExpr;
 	const hasOffset = !!plan.offsetExpr;
 
-	async function* run(
+	// Drive the recursion once: base case, then the semi-naïve iterative loop,
+	// through the global LIMIT/OFFSET gate. This is the streaming body; the run
+	// wrapper either yields it directly (single-reference) or buffers it once and
+	// replays per reference (multi-reference — see `plan.materialize`).
+	async function* driveRecursion(
 		rctx: RuntimeContext,
 		baseCaseResult: AsyncIterable<Row>,
 		recursiveCaseCallback: (ctx: RuntimeContext) => AsyncIterable<Row>,
@@ -144,6 +148,68 @@ export function emitRecursiveCTE(plan: RecursiveCTENode, ctx: EmissionContext): 
 		}
 
 		log('Recursive CTE %s completed after %d iterations (semi-naive algorithm)', plan.cteName, iterationCount);
+	}
+
+	async function* run(
+		rctx: RuntimeContext,
+		baseCaseResult: AsyncIterable<Row>,
+		recursiveCaseCallback: (ctx: RuntimeContext) => AsyncIterable<Row>,
+		...rest: Array<(ctx: RuntimeContext) => MaybePromise<SqlValue>>
+	): AsyncIterable<Row> {
+		if (!plan.materialize) {
+			// Streaming path: single-reference recursive CTE. Each reference drives
+			// its own recursion, and streaming lets an outer LIMIT cut an unbounded
+			// recursion off before the iteration guard trips. Only ONE reference
+			// exists, so its drive owns the shared working-table `tableDescriptor`
+			// uncontended.
+			yield* driveRecursion(rctx, baseCaseResult, recursiveCaseCallback, ...rest);
+			return;
+		}
+
+		// Shared-buffer path: multi-referenced recursive CTE. Two interleaved
+		// streaming drives would clobber each other's delta on the shared
+		// `tableDescriptor` (the double-reference runaway). Instead drive the
+		// recursion exactly once per statement execution into a buffer keyed by that
+		// SAME `tableDescriptor`. Earlier optimizer passes duplicate a multi-
+		// referenced recursive CTE into distinct RecursiveCTENode instances (distinct
+		// plan ids), but every copy preserves the one tableDescriptor identity, so it
+		// — not plan.id — is what the references agree on. Mirrors emitCTE's
+		// shared-materialization idiom (which keys by plan id, since its references
+		// DO share one CTENode instance).
+		const buffers = (rctx.cteMaterializations ??= new Map<string | typeof tableDescriptor, Promise<Row[]>>());
+		let bufferPromise = buffers.get(tableDescriptor);
+		if (!bufferPromise) {
+			// First reference to run owns the single drive. Create and store the
+			// promise SYNCHRONOUSLY (before any await) so a second reference
+			// interleaving under a nested-loop join finds it and awaits instead of
+			// starting its own drive on the shared `tableDescriptor`. The drive runs
+			// detached so it drains independently of how the join pulls — the owner
+			// reference can't yield row 1 until the drive finishes, and the drive
+			// doesn't depend on downstream pulls, which is what breaks the deadlock.
+			// NOTE: like emitCTE, an abandoned drive (every consumer torn down early)
+			// still runs to completion in the background; bounded by the recursion's
+			// row count and its maxRecursion guard.
+			bufferPromise = (async () => {
+				const rows: Row[] = [];
+				for await (const row of driveRecursion(rctx, baseCaseResult, recursiveCaseCallback, ...rest)) {
+					rows.push([...row] as Row);
+				}
+				return rows;
+			})();
+			// Pre-attach a no-op rejection handler: if the drive fails after every
+			// awaiting reference has detached, the stored promise would otherwise
+			// surface an unhandled rejection. Still-awaiting references observe the
+			// rejection through their own await.
+			bufferPromise.catch(() => { /* observed by awaiting references */ });
+			buffers.set(tableDescriptor, bufferPromise);
+		}
+
+		const rows = await bufferPromise;
+		for (const row of rows) {
+			// Copy per consumer so a downstream mutator cannot corrupt another
+			// reference's (or a replay's) view of the buffer.
+			yield [...row] as Row;
+		}
 	}
 
 	// Emit both base case and recursive case instructions

@@ -89,17 +89,26 @@ export type RuntimeContext = {
 	 */
 	cacheStates?: Map<symbol, CacheState>;
 	/**
-	 * Per-execution CTE materialization buffers for {@link emitCTE}, keyed by the
-	 * shared CTENode's plan id. A CTE marked `materialize` (multi-referenced, or
-	 * MATERIALIZED-hinted) buffers its rows exactly once per statement execution:
-	 * the first reference to run stores the buffer promise synchronously and
-	 * drives the source; every other reference awaits that same promise and never
-	 * touches its own (separately-emitted) source subtree. Keyed by plan id — all
-	 * references share one CTENode instance, so their emitCTE closures agree on
-	 * the key. A fresh RuntimeContext per execution resets the map between
+	 * Per-execution CTE materialization buffers, keyed by whatever stable identity
+	 * the emitter shares across the CTE's references, buffering the CTE's rows
+	 * exactly once per statement execution: the first reference to run stores the
+	 * buffer promise synchronously and drives the source; every other reference
+	 * awaits that same promise and never touches its own (separately-emitted)
+	 * source subtree. A fresh RuntimeContext per execution resets the map between
 	 * prepared-statement runs (no stale replay). Mirrors {@link cacheStates}.
+	 *
+	 * Two key kinds coexist here (their key spaces never collide — string vs
+	 * object):
+	 * - {@link emitCTE} keys by the shared CTENode's plan id (a string); all
+	 *   non-recursive references share one CTENode instance, so their closures
+	 *   agree on the key.
+	 * - {@link emitRecursiveCTE} keys by the shared `TableDescriptor` object. A
+	 *   multi-referenced recursive CTE is DUPLICATED into distinct RecursiveCTENode
+	 *   instances by earlier optimizer passes (distinct plan ids), but every copy
+	 *   preserves the one `tableDescriptor` identity through `withChildren`, so the
+	 *   descriptor — not the plan id — is what the copies agree on.
 	 */
-	cteMaterializations?: Map<string, Promise<Row[]>>;
+	cteMaterializations?: Map<string | TableDescriptor, Promise<Row[]>>;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;

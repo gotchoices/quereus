@@ -1463,7 +1463,9 @@ execution**, matching standard SQL `MATERIALIZED` semantics:
   instance — so each reference's `emitCTE` closure agrees on the buffer key,
   the CTENode's plan id.
 - The buffer lives on the per-execution `RuntimeContext`
-  (`ctx.cteMaterializations`, a `Map<string, Promise<Row[]>>`). The first
+  (`ctx.cteMaterializations`, a `Map<string | TableDescriptor, Promise<Row[]>>` —
+  non-recursive CTEs key by plan-id string, recursive CTEs by descriptor object;
+  the two key spaces never collide). The first
   reference to run stores the buffer *promise* synchronously (before any
   `await`), then drives its source to completion; a second reference that
   interleaves — e.g. the two sides of a nested-loop self-join — finds the
@@ -1477,8 +1479,32 @@ execution**, matching standard SQL `MATERIALIZED` semantics:
 
 Un-marked CTEs (single reference without a `MATERIALIZED` hint, or an explicit
 `NOT MATERIALIZED`) keep the pure streaming path — early exit such as `LIMIT`
-never drains the source. Recursive CTEs never take this path; they run through
-the working-table machinery (`emitRecursiveCTE`).
+never drains the source.
+
+**Recursive CTEs** run through the working-table machinery (`emitRecursiveCTE`),
+not `emitCTE`, but follow the same buffer-once-replay pattern when referenced
+2+ times:
+
+- A **single-reference** recursive CTE stays on the streaming path (each drive
+  emits its own semi-naïve loop). Streaming is required so an outer `LIMIT` can
+  cut an unbounded recursion off before the iteration guard trips.
+- A **multi-referenced** recursive CTE (e.g. joined to itself) is marked
+  `materialize` on its `RecursiveCTENode` and buffered once per execution. Two
+  interleaved streaming drives would clobber each other's delta on the shared
+  working-table `tableDescriptor` — the recursion never terminates and trips the
+  10 000-iteration guard. So the first reference to run drives the recursion to
+  completion inside a detached async IIFE (draining independently of how the join
+  pulls, which breaks the nested-loop deadlock) into a buffer keyed by the
+  `tableDescriptor`; every reference replays it. The mark **ignores** the
+  `MATERIALIZED` / `NOT MATERIALIZED` hint — honoring `NOT MATERIALIZED` here
+  would re-introduce the runaway, so correctness wins.
+- The buffer key is the `tableDescriptor`, **not** the plan id, because earlier
+  optimizer passes duplicate a multi-referenced recursive CTE into distinct
+  `RecursiveCTENode` instances (distinct plan ids) that all preserve the one
+  `tableDescriptor`. The advisory marks every copy (it sums parent counts per
+  descriptor) and additionally forbids caching anything inside a recursive-case
+  subtree — a `CacheNode` there would freeze the semi-naïve delta to the first
+  iteration's rows. See `docs/optimizer.md` § Materialization Advisory.
 
 ## Query Optimizer Integration
 

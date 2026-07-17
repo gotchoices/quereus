@@ -29,7 +29,18 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		public readonly maxRecursion?: number,
 		tableDescriptor?: TableDescriptor,
 		public readonly limitExpr?: ScalarPlanNode,
-		public readonly offsetExpr?: ScalarPlanNode
+		public readonly offsetExpr?: ScalarPlanNode,
+		/**
+		 * Resolved materialization decision for emission, set by the
+		 * materialization-advisory pass: when true, emitRecursiveCTE drives the
+		 * recursion once per statement execution into a shared buffer that every
+		 * reference replays (multi-referenced recursive CTEs — gated purely on
+		 * reference count, ignoring the materialization hint; see
+		 * MaterializationAdvisory.shouldMaterializeCTE). When false, each reference
+		 * streams its own drive (single-reference: keeps early-exit under an outer
+		 * LIMIT working).
+		 */
+		public readonly materialize: boolean = false
 	) {
 		// Self-cost only: the base and recursive cases are both in getChildren(),
 		// so their subtree costs flow in once via getTotalCost(). Self is the fixed
@@ -152,7 +163,8 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 			this.maxRecursion,
 			this.tableDescriptor,
 			newLimitExpr,
-			newOffsetExpr
+			newOffsetExpr,
+			this.materialize
 		);
 
 		return newNode;
@@ -163,7 +175,8 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		const columnsText = this.columns ? `(${this.columns.join(', ')})` : '';
 		const unionText = this.isUnionAll ? 'UNION ALL' : 'UNION';
 		const materializationText = this.materializationHint ? ` ${this.materializationHint.toUpperCase()}` : '';
-		return `${recursiveText}CTE ${this.cteName}${columnsText} [${unionText}]${materializationText}`;
+		const bufferedText = this.materialize ? ' [buffered]' : '';
+		return `${recursiveText}CTE ${this.cteName}${columnsText} [${unionText}]${materializationText}${bufferedText}`;
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {
@@ -172,6 +185,7 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 			columns: this.columns,
 			isUnionAll: this.isUnionAll,
 			materializationHint: this.materializationHint,
+			materialize: this.materialize,
 			isRecursive: true,
 			maxRecursion: this.maxRecursion,
 			baseCaseType: this.baseCaseQuery.getType(),

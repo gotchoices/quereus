@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { CTENode } from '../../src/planner/nodes/cte-node.js';
+import { RecursiveCTENode } from '../../src/planner/nodes/recursive-cte-node.js';
 import { CTEReferenceNode } from '../../src/planner/nodes/cte-reference-node.js';
 import { planOps, allRows } from './_helpers.js';
 
@@ -159,15 +160,15 @@ describe('Plan shape: CTE materialization', () => {
 			expect(results.map(r => r.x)).to.deep.equal([1, 2, 3, 4, 5]);
 		});
 
-		it('never marks a recursive CTE for shared materialization, even when referenced twice', () => {
+		it('marks both references of a twice-referenced recursive CTE for shared buffering', () => {
 			// Recursive CTEs run through the working-table machinery
-			// (RecursiveCTENode → emitRecursiveCTE), not emitCTE — the shared
-			// per-execution buffer mark must not touch them.
-			// NOTE: executing this double-reference query currently fails with
-			// "exceeded maximum iteration limit" — a pre-existing defect present
-			// before shared CTE materialization landed; see the fix ticket
-			// bug-recursive-cte-double-reference-runaway. Once fixed, extend this
-			// test to assert the query's results as well.
+			// (RecursiveCTENode → emitRecursiveCTE), not emitCTE. Earlier optimizer
+			// passes DUPLICATE a multi-referenced recursive CTE into distinct
+			// RecursiveCTENode instances (unlike the non-recursive path, where one
+			// CTENode stays shared), but every copy preserves the one working-table
+			// `tableDescriptor`. The runtime buffer is keyed by that descriptor, so
+			// both copies must be marked `materialize` and must share the descriptor —
+			// otherwise each re-drives the recursion and re-opens the runaway.
 			const plan = db.getPlan(`
 				WITH RECURSIVE cnt(x) AS (
 					SELECT 1
@@ -179,10 +180,95 @@ describe('Plan shape: CTE materialization', () => {
 			`);
 			const refs = collectCTERefs(plan);
 			expect(refs).to.have.lengthOf(2, 'expected two references to the recursive CTE');
-			for (const ref of refs) {
-				expect(ref.source, 'recursive CTE must not be rewritten into a marked CTENode')
-					.to.not.be.instanceOf(CTENode);
-			}
+			const s0 = refs[0].source;
+			const s1 = refs[1].source;
+			// Stays a RecursiveCTENode — never rewritten into a (non-recursive) CTENode.
+			expect(s0, 'ref 0 source is a RecursiveCTENode').to.be.instanceOf(RecursiveCTENode);
+			expect(s1, 'ref 1 source is a RecursiveCTENode').to.be.instanceOf(RecursiveCTENode);
+			expect(s0).to.not.be.instanceOf(CTENode);
+			expect((s0 as RecursiveCTENode).materialize, 'ref 0 must be marked materialize').to.equal(true);
+			expect((s1 as RecursiveCTENode).materialize, 'ref 1 must be marked materialize').to.equal(true);
+			// The shared buffer key: both copies must carry the SAME tableDescriptor.
+			expect((s0 as RecursiveCTENode).tableDescriptor, 'both copies share one working-table descriptor')
+				.to.equal((s1 as RecursiveCTENode).tableDescriptor);
+		});
+
+		it('produces correct results for a twice-referenced (self-joined) recursive CTE', async () => {
+			// The regression: this previously errored with "exceeded maximum
+			// iteration limit" because two interleaved streaming drives clobbered
+			// each other's delta on the shared working table.
+			const results = await allRows<{ ax: number; bx: number }>(db, `
+				WITH RECURSIVE cnt(x) AS (
+					SELECT 1
+					UNION ALL
+					SELECT x + 1 FROM cnt WHERE x < 3
+				)
+				SELECT a.x AS ax, b.x AS bx
+				FROM cnt a JOIN cnt b ON a.x = b.x
+				ORDER BY a.x
+			`);
+			expect(results).to.deep.equal([
+				{ ax: 1, bx: 1 },
+				{ ax: 2, bx: 2 },
+				{ ax: 3, bx: 3 },
+			]);
+		});
+
+		it('buffers a UNION DISTINCT twice-referenced recursive CTE correctly', async () => {
+			const results = await allRows<{ ax: number; bx: number }>(db, `
+				WITH RECURSIVE cnt(x) AS (
+					SELECT 1
+					UNION
+					SELECT x + 1 FROM cnt WHERE x < 3
+				)
+				SELECT a.x AS ax, b.x AS bx
+				FROM cnt a JOIN cnt b ON a.x = b.x
+				ORDER BY a.x
+			`);
+			expect(results).to.deep.equal([
+				{ ax: 1, bx: 1 },
+				{ ax: 2, bx: 2 },
+				{ ax: 3, bx: 3 },
+			]);
+		});
+
+		it('buffers a thrice-referenced recursive CTE (replay beyond two consumers)', async () => {
+			const results = await allRows<{ ax: number; bx: number; cx: number }>(db, `
+				WITH RECURSIVE cnt(x) AS (
+					SELECT 1
+					UNION ALL
+					SELECT x + 1 FROM cnt WHERE x < 3
+				)
+				SELECT a.x AS ax, b.x AS bx, c.x AS cx
+				FROM cnt a JOIN cnt b ON a.x = b.x JOIN cnt c ON a.x = c.x
+				ORDER BY a.x
+			`);
+			expect(results).to.deep.equal([
+				{ ax: 1, bx: 1, cx: 1 },
+				{ ax: 2, bx: 2, cx: 2 },
+				{ ax: 3, bx: 3, cx: 3 },
+			]);
+		});
+
+		it('keeps single-reference recursion streaming: unbounded CTE under an outer LIMIT', async () => {
+			// Regression guard for the streaming path. An unbounded recursion must
+			// terminate under an outer LIMIT (the stream is cut before the iteration
+			// guard trips) — buffering it would drive to the guard and error. The
+			// single-reference node must therefore stay UNmarked.
+			const plan = db.getPlan(`
+				WITH RECURSIVE nums(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM nums)
+				SELECT x FROM nums LIMIT 5
+			`);
+			const refs = collectCTERefs(plan);
+			expect(refs).to.have.lengthOf(1, 'expected a single reference');
+			expect((refs[0].source as RecursiveCTENode).materialize,
+				'single-reference recursive CTE keeps the streaming path').to.equal(false);
+
+			const results = await allRows<{ x: number }>(db, `
+				WITH RECURSIVE nums(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM nums)
+				SELECT x FROM nums LIMIT 5
+			`);
+			expect(results.map(r => r.x)).to.deep.equal([1, 2, 3, 4, 5]);
 		});
 	});
 });
