@@ -56,6 +56,7 @@ import { ruleCteOptimization } from './rules/cache/rule-cte-optimization.js';
 import { ruleMutatingSubqueryCache } from './rules/cache/rule-mutating-subquery-cache.js';
 import { ruleNestedLoopRightCache } from './rules/cache/rule-nested-loop-right-cache.js';
 import { ruleInSubqueryCache } from './rules/cache/rule-in-subquery-cache.js';
+import { ruleScalarSubqueryCache } from './rules/cache/rule-scalar-subquery-cache.js';
 import { ruleSubqueryDecorrelation } from './rules/subquery/rule-subquery-decorrelation.js';
 import { ruleScalarAggDecorrelation, ruleScalarAggDecorrelationAggregate } from './rules/subquery/rule-scalar-agg-decorrelation.js';
 import { ruleAntiJoinFkEmpty } from './rules/subquery/rule-anti-join-fk-empty.js';
@@ -1031,6 +1032,17 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		phase: 'rewrite',
 		fn: ruleInSubqueryCache,
 		// Already gates on `isFunctional(source)` (deterministic + read-only).
+		sideEffectMode: 'aware',
+	},
+
+	// Scalar-subquery caching: wrap uncorrelated scalar subquery inners in CacheNode.
+	{
+		pass: PassId.PostOptimization,
+		id: 'scalar-subquery-cache',
+		nodeType: PlanNodeType.ScalarSubquery,
+		phase: 'rewrite',
+		fn: ruleScalarSubqueryCache,
+		// Gates on isFunctional(inner) (deterministic + read-only).
 		sideEffectMode: 'aware',
 	},
 
