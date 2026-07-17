@@ -455,3 +455,104 @@ describe('Plan shape: scalar-aggregate subquery decorrelation (filter site)', ()
 		expect(types, 'DML-bearing subquery must stay correlated').to.include('ScalarSubquery');
 	});
 });
+
+/**
+ * Plan-shape + equivalence assertions for `scalar-agg-decorrelation-sort`: the
+ * Sort (ORDER BY) anchor. A correlated scalar-aggregate subquery in a sort key
+ * becomes a grouped aggregate under a LEFT join (materialized as a physical
+ * hash/merge join), with a pass-through Project restoring the Sort's original
+ * output shape (a SortNode publishes its source's attributes verbatim, so the
+ * join's appended columns must not leak upward).
+ */
+describe('Plan shape: scalar-aggregate subquery decorrelation (sort site)', () => {
+	let db: Database;
+	let baselineDb: Database;
+
+	const setup = async (target: Database) => {
+		await target.exec("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER NULL, grp TEXT) USING memory");
+		await target.exec("CREATE TABLE c (id INTEGER PRIMARY KEY, fk INTEGER NULL, amount INTEGER NULL) USING memory");
+		await target.exec("INSERT INTO o VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'c'), (4, 10, 'd')");
+		await target.exec("INSERT INTO c VALUES (1, 10, 5), (2, 10, 7), (3, 20, NULL)");
+	};
+
+	beforeEach(async () => {
+		db = new Database();
+		await setup(db);
+		// Baseline keeps both the Project and Sort anchors disabled — the
+		// correlated per-row plan whose results the rewrite must reproduce.
+		baselineDb = new Database();
+		baselineDb.optimizer.updateTuning({
+			...DEFAULT_TUNING,
+			disabledRules: new Set(['scalar-agg-decorrelation', 'scalar-agg-decorrelation-sort']),
+		});
+		await setup(baselineDb);
+	});
+
+	afterEach(async () => {
+		await db.close();
+		await baselineDb.close();
+	});
+
+	it('rewrites an ORDER BY subquery into a grouped aggregate under a physical LEFT join', async () => {
+		const q = "SELECT o.id FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'sort-key subquery must be dissolved').to.not.include('ScalarSubquery');
+
+		const rows = await planRows(db, q);
+		const agg = rows.find(r =>
+			(r.node_type === 'HashAggregate' || r.node_type === 'StreamAggregate')
+			&& r.detail.includes('GROUP BY'));
+		expect(agg, 'grouped physical aggregate expected').to.not.equal(undefined);
+
+		const ops = await planOps(db, q);
+		expect(
+			ops.some(op => op === 'HASHJOIN' || op === 'MERGEJOIN'),
+			`expected hash/merge join in [${ops.join(', ')}]`,
+		).to.equal(true);
+
+		// The materialized join is a LEFT join (a no-match outer row must survive
+		// carrying the empty-input value), and the grouped aggregate sits under it.
+		const join = rows.find(r => r.node_type === 'HashJoin' || r.node_type === 'MergeJoin');
+		expect(join, 'physical join expected').to.not.equal(undefined);
+		expect(join!.detail, 'must be a LEFT join').to.include('LEFT');
+		expect(isDescendantOf(rows, agg!.id, join!.id)).to.equal(true);
+
+		const decorrelated = await allRows(db, q);
+		const baseline = await allRows(baselineDb, q);
+		// count(c.fk=o.k): o3→0, o2→1, o1/o4→2 (id tiebreak).
+		expect(baseline).to.deep.equal([{ id: 3 }, { id: 2 }, { id: 1 }, { id: 4 }]);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
+
+	it('keeps the Sort output shape invariant (no leaked join columns), even with no enclosing Project', async () => {
+		// `SELECT *` over a bare top-level Sort: the pass-through cap must restore
+		// exactly o's columns, so the join's appended grouped columns do not leak.
+		const q = "SELECT * FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'sort-key subquery must be dissolved').to.not.include('ScalarSubquery');
+
+		const decorrelated = await allRows<Record<string, unknown>>(db, q);
+		// Output columns are exactly o's (id, k, grp) — no leaked join columns.
+		expect(Object.keys(decorrelated[0])).to.deep.equal(['id', 'k', 'grp']);
+		const baseline = await allRows<Record<string, unknown>>(baselineDb, q);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
+
+	it('leaves a non-equi ORDER BY correlation on the correlated path', async () => {
+		const q = "SELECT o.id FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk < o.k), o.id";
+		const types = await planNodeTypes(db, q);
+		expect(types).to.include('ScalarSubquery');
+	});
+
+	it('decorrelates the same subquery in both the SELECT list and the ORDER BY', async () => {
+		const q = "SELECT o.id, (SELECT count(*) FROM c WHERE c.fk = o.k) AS n FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'both anchors dissolve their subquery').to.not.include('ScalarSubquery');
+		const decorrelated = await allRows(db, q);
+		const baseline = await allRows(baselineDb, q);
+		expect(baseline).to.deep.equal([
+			{ id: 3, n: 0 }, { id: 2, n: 1 }, { id: 1, n: 2 }, { id: 4, n: 2 },
+		]);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
+});

@@ -65,7 +65,7 @@
  * for; the tiny-outer/huge-inner cost tradeoff is tracked in
  * `backlog/feat-decorrelation-cost-model`.
  *
- * THREE MATCH SITES share the identical per-subquery rewrite (`decorrelateOne`):
+ * FOUR MATCH SITES share the identical per-subquery rewrite (`decorrelateOne`):
  *   - `ruleScalarAggDecorrelation` — subqueries in a ProjectNode's projection
  *     expressions; the join stack lands between the Project and its source.
  *   - `ruleScalarAggDecorrelationAggregate` — subqueries inside an
@@ -89,6 +89,18 @@
  *     Filter's original attributes; the outer columns keep their original indices
  *     (the LEFT join places the outer on the left), so that projection's column
  *     references — and everything above — resolve unchanged.
+ *   - `ruleScalarAggDecorrelationSort` — subqueries in a SortNode's sort-key
+ *     expressions (`order by (select count(*) from c where c.fk = o.k)`); the
+ *     join stack lands BELOW the Sort so the sort key can read the grouped
+ *     value column. A SortNode publishes its source's attributes VERBATIM (it
+ *     never consumes/hides columns the way a Project does), so the LEFT join's
+ *     appended grouped-aggregate columns would otherwise leak upward and change
+ *     the row shape every ancestor (a capping Project, a view body, a compound
+ *     arm, LIMIT/OFFSET) sees. Like the Filter site, the rule caps its result
+ *     with the same bare pass-through Project (`capToAttributes`) that
+ *     re-exposes exactly the Sort's original attributes; the outer columns keep
+ *     their original indices (the LEFT join places the outer on the left), so
+ *     that projection — and everything above — resolves unchanged.
  *
  * NESTED subqueries converge level by level: the Structural pass is top-down
  * with rules firing BEFORE descent, so the grouped aggregate built by one
@@ -108,6 +120,7 @@ import { FunctionFlags } from '../../../common/constants.js';
 import { ProjectNode } from '../../nodes/project-node.js';
 import { AliasNode } from '../../nodes/alias-node.js';
 import { FilterNode } from '../../nodes/filter.js';
+import { SortNode, type SortKey } from '../../nodes/sort.js';
 import { AggregateNode } from '../../nodes/aggregate-node.js';
 import { JoinNode } from '../../nodes/join-node.js';
 import { ScalarSubqueryNode } from '../../nodes/subquery.js';
@@ -201,7 +214,7 @@ export function ruleScalarAggDecorrelationAggregate(node: PlanNode, _context: Op
  *
  * The rewritten Filter's source gains the grouped join's columns; a FilterNode
  * publishes its source's attributes verbatim, so the result is capped with a bare
- * pass-through Project (see `capToFilterAttributes`) that re-exposes exactly the
+ * pass-through Project (see `capToAttributes`) that re-exposes exactly the
  * original Filter attributes — without it the extra columns leak to the query
  * output whenever the Filter is not already under a projection (the common HAVING
  * shape, where the SELECT list is fused into the Aggregate below the filter).
@@ -225,23 +238,64 @@ export function ruleScalarAggDecorrelationFilter(node: PlanNode, _context: OptCo
 		rewrite.source,
 		substituteSubqueries(node.predicate, rewrite.replacements),
 	);
-	return capToFilterAttributes(node.scope, decorrelatedFilter, filterAttrs);
+	return capToAttributes(node.scope, decorrelatedFilter, filterAttrs);
+}
+
+/**
+ * Sort match site: a correlated scalar-aggregate subquery in a SortNode's
+ * sort-key expression — `order by (select count(*) from c where c.fk = o.k)`.
+ * The join stack lands BELOW the Sort (so the sort key can read the grouped
+ * value column), and each recognized subquery reference in the keys is
+ * substituted with the guarded value read; direction/nulls are copied verbatim.
+ *
+ * A SortNode publishes its source's attributes verbatim, so the LEFT join's
+ * appended columns would leak upward and change the row shape every ancestor
+ * sees. The result is therefore capped with the same bare pass-through Project
+ * as the Filter site (`capToAttributes`), re-exposing exactly the Sort's
+ * original attributes — invariant output shape regardless of whether an
+ * enclosing Project exists (view body / compound arm / bare top-level Sort).
+ *
+ * Ordering is stable: the substituted value is byte-identical to the scalar the
+ * subquery would return (same empty-input replacement as the other sites), and
+ * the LEFT join matches at most one row per outer row (unique group keys), so
+ * row count, multiplicity, and per-row sort-key values are all unchanged.
+ */
+export function ruleScalarAggDecorrelationSort(node: PlanNode, _context: OptContext): PlanNode | null {
+	if (!(node instanceof SortNode)) return null;
+
+	const candidates = collectCandidates(node.sortKeys.map(k => k.expression));
+	if (candidates.length === 0) return null;
+
+	// Original Sort attributes (= its source's) — the signature the cap restores.
+	const sortAttrs = node.getAttributes();
+
+	const rewrite = decorrelateAll(candidates, node.source);
+	if (!rewrite) return null;
+
+	log('Decorrelated %d scalar-aggregate subquery(ies) in an ORDER BY key into grouped left join(s)', rewrite.replacements.size);
+	const newKeys: SortKey[] = node.sortKeys.map(k => ({
+		expression: substituteSubqueries(k.expression, rewrite.replacements),
+		direction: k.direction,
+		nulls: k.nulls,
+	}));
+	const decorrelatedSort = new SortNode(node.scope, rewrite.source, newKeys);
+	return capToAttributes(node.scope, decorrelatedSort, sortAttrs);
 }
 
 /**
  * Wrap `source` in a bare pass-through Project that re-exposes exactly
- * `filterAttrs` (the decorrelated Filter's original output signature), discarding
- * the grouped LEFT join's appended columns. The outer columns sit at indices
- * `0..filterAttrs.length-1` of the join output (LEFT join places the outer on the
- * left), so each projection is a plain column reference at its original index and
- * every id is preserved — consumers above resolve unchanged.
+ * `origAttrs` (the decorrelated Filter's or Sort's original output signature),
+ * discarding the grouped LEFT join's appended columns. The outer columns sit at
+ * indices `0..origAttrs.length-1` of the join output (LEFT join places the outer
+ * on the left), so each projection is a plain column reference at its original
+ * index and every id is preserved — consumers above resolve unchanged.
  */
-function capToFilterAttributes(
+function capToAttributes(
 	scope: Scope,
 	source: RelationalPlanNode,
-	filterAttrs: readonly Attribute[],
+	origAttrs: readonly Attribute[],
 ): ProjectNode {
-	const projections = filterAttrs.map((attr, index) => ({
+	const projections = origAttrs.map((attr, index) => ({
 		node: new ColumnReferenceNode(
 			scope,
 			{ type: 'column', name: attr.name },
@@ -252,15 +306,15 @@ function capToFilterAttributes(
 		attributeId: attr.id,
 	}));
 	// preserveInputColumns: false — output is exactly the projected columns, and
-	// predefinedAttributes pins the ids/types to the original Filter signature.
-	// NOTE: for a WHERE filter already under a SELECT Project this cap is a
-	// redundant pass-through (the outer Project would re-cap anyway); it is NOT
-	// eliminated because its Filter source carries MORE attributes, so no
+	// predefinedAttributes pins the ids/types to the original signature.
+	// NOTE: for a WHERE filter / ORDER BY already under a SELECT Project this cap
+	// is a redundant pass-through (the outer Project would re-cap anyway); it is
+	// NOT eliminated because its source carries MORE attributes, so no
 	// trivial-project rule sees it as an identity. Harmless (one extra Project
 	// node, correct output). If this shows up in plan-shape noise or profiling,
 	// skip the cap when `node`'s consumer is already a Project that outputs a
-	// subset of `filterAttrs`.
-	return new ProjectNode(scope, source, projections, undefined, [...filterAttrs], false);
+	// subset of `origAttrs`.
+	return new ProjectNode(scope, source, projections, undefined, [...origAttrs], false);
 }
 
 /**

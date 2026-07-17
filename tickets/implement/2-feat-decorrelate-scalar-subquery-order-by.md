@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-17T03:48:58.649Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\2-feat-decorrelate-scalar-subquery-order-by.implement.2026-07-17T03-48-58-649Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ----
 description: A correlated "value" subquery used in an ORDER BY expression (e.g. `order by (select count(*) from c where c.fk = o.k)`) still re-runs the inner query once per row; rewrite it to the same grouped join, but strip the join's extra columns so the sort's output row shape is unchanged.
 prereq: feat-decorrelate-scalar-subquery-where-having

@@ -129,4 +129,37 @@ describe('correlated scalar-aggregate decorrelation: scan count', () => {
 			db.optimizer.updateTuning(before);
 		}
 	});
+
+	// The Sort anchor (`scalar-agg-decorrelation-sort`): the same scalar-agg
+	// subquery used in an ORDER BY key must also collapse to one child scan.
+	const ORDER_SQL = "select p.id from p order by (select count(*) from c where c.pid = p.id), p.id";
+	// counts: p1→2, p2→1, p3→3, p4→0. Ascending, id tiebreak.
+	const ORDER_EXPECTED = [{ id: 4 }, { id: 2 }, { id: 1 }, { id: 3 }];
+
+	it('scans the child once for an ORDER BY scalar-agg subquery (sort anchor)', async () => {
+		module.scanCounts.clear();
+		const rows = await allRows<{ id: number }>(ORDER_SQL);
+		expect(rows).to.deep.equal(ORDER_EXPECTED);
+		expect(module.scanCounts.get('c'),
+			'sort-anchor decorrelation must scan the child table once, not once per outer row'
+		).to.equal(1);
+	});
+
+	it('scans the child once per outer row for the ORDER BY subquery when disabled (N+1 observed)', async () => {
+		const before = db.optimizer.tuning;
+		db.optimizer.updateTuning({
+			...before,
+			disabledRules: new Set(['scalar-agg-decorrelation-sort']),
+		});
+		try {
+			module.scanCounts.clear();
+			const rows = await allRows<{ id: number }>(ORDER_SQL);
+			expect(rows).to.deep.equal(ORDER_EXPECTED);
+			expect(module.scanCounts.get('c'),
+				'without the sort anchor the correlated ORDER BY subquery re-scans c once per outer row'
+			).to.equal(N);
+		} finally {
+			db.optimizer.updateTuning(before);
+		}
+	});
 });

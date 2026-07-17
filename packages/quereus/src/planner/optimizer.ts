@@ -58,7 +58,7 @@ import { ruleNestedLoopRightCache } from './rules/cache/rule-nested-loop-right-c
 import { ruleInSubqueryCache } from './rules/cache/rule-in-subquery-cache.js';
 import { ruleScalarSubqueryCache } from './rules/cache/rule-scalar-subquery-cache.js';
 import { ruleSubqueryDecorrelation } from './rules/subquery/rule-subquery-decorrelation.js';
-import { ruleScalarAggDecorrelation, ruleScalarAggDecorrelationAggregate, ruleScalarAggDecorrelationFilter } from './rules/subquery/rule-scalar-agg-decorrelation.js';
+import { ruleScalarAggDecorrelation, ruleScalarAggDecorrelationAggregate, ruleScalarAggDecorrelationFilter, ruleScalarAggDecorrelationSort } from './rules/subquery/rule-scalar-agg-decorrelation.js';
 import { ruleAntiJoinFkEmpty } from './rules/subquery/rule-anti-join-fk-empty.js';
 import { ruleSemiJoinFkTrivial } from './rules/subquery/rule-semi-join-fk-trivial.js';
 import {
@@ -599,6 +599,27 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		fn: ruleScalarAggDecorrelationAggregate,
 		// Same execution-count change as the Project-site entry — refuses when
 		// the inner subtree carries a write.
+		sideEffectMode: 'aware',
+	},
+
+	// Sort (ORDER BY) match site for the same rewrite: a correlated
+	// scalar-aggregate subquery in a sort-key expression —
+	// `order by (select count(*) from c where c.fk = o.k)` — is rewritten to a
+	// grouped LEFT JOIN placed BELOW the Sort (so the key can read the value
+	// column), then capped with a bare pass-through Project that restores the
+	// Sort's original output shape (a SortNode publishes its source's attributes
+	// verbatim, so the join's appended columns would otherwise leak upward). Sort
+	// is not otherwise a decorrelation anchor, so there is no registration-order
+	// coupling with the Filter/Project/Aggregate sites — placed adjacent for
+	// locality.
+	{
+		pass: PassId.Structural,
+		id: 'scalar-agg-decorrelation-sort',
+		nodeType: PlanNodeType.Sort,
+		phase: 'rewrite',
+		fn: ruleScalarAggDecorrelationSort,
+		// Changes the inner subquery subtree's execution count (per outer row →
+		// once) — refuses when the inner subtree carries a write.
 		sideEffectMode: 'aware',
 	},
 
