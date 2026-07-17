@@ -70,6 +70,11 @@ export function ruleInSubqueryCache(node: PlanNode, context: OptContext): PlanNo
 		context.tuning.cte.maxCacheThreshold
 	);
 
+	// NOTE: eager drains the whole subquery on the first eval, so a low-cardinality
+	// outer relation (e.g. one row, or an early LIMIT) pays the full drain and loses
+	// IN's first-match early-exit. Harmless for small sources; if large-source +
+	// low-outer-cardinality IN-subqueries show up as slow, gate eager (or the whole
+	// rule) on estimated outer cardinality.
 	const cachedSource = new CacheNode(
 		source.scope,
 		source,
