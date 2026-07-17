@@ -8,7 +8,7 @@ This list reflects the current and upcoming work for Quereus. Completed items an
 - 🔄 **Phase 1.5 - Access Path Selection**: Seek/range scan infrastructure and optimization rules
 
 ### Upcoming Optimizer Work
-- 📋 **Subquery Optimization**: Transform correlated subqueries to joins
+- 📋 **Subquery Optimization**: Transform the *remaining* correlated subquery shapes to joins. Already shipped: correlated `EXISTS`/`IN` → semi/anti join (`subquery-decorrelation`) and correlated scalar-*aggregate* subqueries → grouped LEFT join (`scalar-agg-decorrelation` / `-aggregate`). Still uncovered: correlated *non-aggregate* scalar subqueries (e.g. `... ORDER BY ... LIMIT 1`), and non-equi correlations (`c.pid < p.id`).
 - 📋 **Advanced Statistics**: VTab-supplied or ANALYZE-based statistics
 - ✅ **Join Algorithms**: Bloom joins and merge joins
 - 📋 **Aggregate Pushdown**: Push aggregations below joins when semantically valid
@@ -336,6 +336,9 @@ The logical type system enables significant runtime performance improvements by 
 
 Correlated and lateral joins plan as `JoinNode` today; the nested-loop emitter re-executes
 the right subtree per outer row and a right-side `RetrieveNode` is re-assessed each time.
+(One shape is no longer among these: a correlated scalar-*aggregate* subquery is now
+decorrelated into a grouped LEFT join by `scalar-agg-decorrelation`, so it never reaches the
+per-row emitter — this proposal is scoped to the still-correlated shapes.)
 The proposal replaces that with an explicit `Apply(left, right, predicate, outer)` node —
 "execute `right` once per row of `left`, with correlation context threaded through" —
 mapping `CROSS`/`INNER`/`LEFT JOIN` onto the same shape and eliminating the per-join-type
