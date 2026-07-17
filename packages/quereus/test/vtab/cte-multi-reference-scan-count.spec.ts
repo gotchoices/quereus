@@ -2,6 +2,54 @@ import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import type { Statement } from '../../src/core/statement.js';
 import { CountingMemoryModule } from './_counting-memory-module.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import type { MemoryTable } from '../../src/vtab/memory/table.js';
+import type { MemoryTableConfig } from '../../src/vtab/memory/types.js';
+import type { TableSchema } from '../../src/schema/table.js';
+import type { FilterInfo } from '../../src/vtab/filter-info.js';
+import type { Row } from '../../src/common/types.js';
+import { QuereusError } from '../../src/common/errors.js';
+import { StatusCode } from '../../src/common/types.js';
+
+/**
+ * MemoryTableModule whose scans yield every real row and then throw — but only
+ * once `armed` is set. Arming after the seed INSERTs keeps table setup working
+ * and confines the failure to the CTE's source drive at eval time, so a test can
+ * assert emitCTE surfaces a source error through the shared materialization
+ * buffer (and does not leak an unhandled rejection from the detached drive).
+ */
+class ThrowingMemoryModule extends MemoryTableModule {
+	armed = false;
+
+	private wrap(table: MemoryTable): MemoryTable {
+		const isArmed = () => this.armed;
+		const original = table.query.bind(table);
+		table.query = (filterInfo: FilterInfo): AsyncIterable<Row> => {
+			const source = original(filterInfo);
+			return (async function* () {
+				for await (const row of source) yield row;
+				if (isArmed()) throw new QuereusError('boom during CTE source drive', StatusCode.INTERNAL);
+			})();
+		};
+		return table;
+	}
+
+	override async create(db: Database, tableSchema: TableSchema): Promise<MemoryTable> {
+		return this.wrap(await super.create(db, tableSchema));
+	}
+
+	override async connect(
+		db: Database,
+		pAux: unknown,
+		moduleName: string,
+		schemaName: string,
+		tableName: string,
+		options: MemoryTableConfig,
+		tableSchema?: TableSchema,
+	): Promise<MemoryTable> {
+		return this.wrap(await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema));
+	}
+}
 
 /**
  * Runtime execution-count checks for shared CTE materialization.
@@ -100,5 +148,30 @@ describe('CTE shared materialization: scan count', () => {
 		} finally {
 			await stmt.finalize();
 		}
+	});
+
+	it('propagates a source error from the shared materialization drive', async () => {
+		// A 2-reference (materialized) CTE whose source throws mid-drive must
+		// surface the error to the consumer — not silently yield an empty buffer —
+		// and the detached drive's rejection must be observed (no unhandled
+		// rejection). Exercises emitCTE's pre-attached .catch + await propagation.
+		const tdb = new Database();
+		const tmod = new ThrowingMemoryModule();
+		tdb.registerModule('throwmem', tmod);
+		await tdb.exec("CREATE TABLE boom (id INTEGER PRIMARY KEY, val INTEGER) USING throwmem()");
+		await tdb.exec("INSERT INTO boom VALUES (1, 10), (2, 20)");
+		tmod.armed = true;
+
+		let caught: unknown;
+		try {
+			for await (const _ of tdb.eval(`
+				WITH cte AS (SELECT id, val FROM boom)
+				SELECT c1.id, c2.val FROM cte c1 JOIN cte c2 ON c1.id = c2.id
+			`)) { void _; }
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught, 'source error must propagate through the shared buffer').to.be.instanceOf(QuereusError);
+		await tdb.close();
 	});
 });
