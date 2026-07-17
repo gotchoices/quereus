@@ -24,6 +24,14 @@ export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCap
 		public readonly source: RelationalPlanNode,
 		public readonly strategy: CacheStrategy = 'memory',
 		public readonly threshold: number = 10000,  // Rows before switching to pass-through
+		/**
+		 * Eager build mode: fully drain + commit the buffer on the first evaluation
+		 * before yielding any row, so a short-circuiting consumer above the cache
+		 * (e.g. IN's first-match early-exit) cannot abort the build. Defaults to the
+		 * streaming-first behaviour that CTE / nested-loop-right / mutating-subquery
+		 * caches rely on for first-row latency.
+		 */
+		public readonly eager: boolean = false,
 		estimatedCostOverride?: number
 	) {
 		super(scope, estimatedCostOverride);
@@ -99,11 +107,13 @@ export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCap
 		}
 
 		// Create new instance preserving attributes (cache preserves source attributes exactly)
+		// Thread `eager` through so an optimizer rebuild doesn't silently drop it to false.
 		return new CacheNode(
 			this.scope,
 			newSource as RelationalPlanNode,
 			this.strategy,
-			this.threshold
+			this.threshold,
+			this.eager
 		);
 	}
 
@@ -120,13 +130,14 @@ export class CacheNode extends PlanNode implements UnaryRelationalNode, CacheCap
 	}
 
 	override toString(): string {
-		return `CACHE (${this.strategy}, threshold=${this.threshold})`;
+		return `CACHE (${this.strategy}, threshold=${this.threshold}${this.eager ? ', eager' : ''})`;
 	}
 
 	override getLogicalAttributes(): Record<string, unknown> {
 		return {
 			strategy: this.strategy,
 			threshold: this.threshold,
+			eager: this.eager,
 			sourceNodeType: this.source.nodeType
 		};
 	}

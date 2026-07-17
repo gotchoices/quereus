@@ -37,7 +37,8 @@ export function emitCache(plan: CacheNode, ctx: EmissionContext): Instruction {
 	const config: SharedCacheConfig = {
 		threshold: plan.threshold,
 		strategy: plan.strategy,
-		name: `CacheNode-${plan.id}`
+		name: `CacheNode-${plan.id}`,
+		eager: plan.eager
 	};
 
 	// Stable per-emit-site key for the per-execution cache state

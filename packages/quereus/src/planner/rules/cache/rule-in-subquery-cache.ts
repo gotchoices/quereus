@@ -12,6 +12,13 @@
  *
  * Benefits: Materializes the subquery result once and replays from cache on subsequent
  * evaluations, reducing O(N * K) CTE/subquery evaluations to O(K + N * K_cached)
+ *
+ * The CacheNode is built in EAGER mode: emitIn's pure streaming consumer returns on
+ * the first matching row, which would abort a streaming-first cache mid-build and leave
+ * it uncommitted (so every outer row re-opens the source). Eager mode drains + commits
+ * the buffer on the first evaluation before yielding any row, so IN's first-match
+ * short-circuit cannot defeat the cache. Safe here because the rule already gates on
+ * uncorrelated + functional, so the materialized set is identical across outer rows.
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -67,7 +74,8 @@ export function ruleInSubqueryCache(node: PlanNode, context: OptContext): PlanNo
 		source.scope,
 		source,
 		'memory',
-		cacheThreshold
+		cacheThreshold,
+		true  // eager: defeat IN's first-match short-circuit that would abort a streaming build
 	);
 
 	return new InNode(

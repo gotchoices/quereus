@@ -1450,6 +1450,23 @@ statement's executions, tying the cache to the context rather than the
 closure resets it between runs: a re-executed statement re-drives its cached
 source and observes current data instead of replaying the first run's rows.
 
+**Eager vs. streaming-first build.** `streamWithCache` has two build modes,
+selected by `CacheNode.eager`. The default *streaming-first* mode yields each
+source row as it arrives and only commits `cachedResult` after the source
+drains to completion — great first-row latency, but a consumer that
+short-circuits (breaks on an early row) aborts the generator before the drain
+finishes, so the buffer is never committed and the next evaluation re-opens the
+source. That defeats caching for `IN (subquery)`, whose `emitIn` returns on the
+first matching row (`src/runtime/emit/subquery.ts`): while outer rows keep
+matching early, the source is re-opened per outer row. So `rule-in-subquery-cache`
+sets `eager: true`, which drains the source fully and commits the buffer
+**before** yielding any row — the first-match short-circuit can no longer abort
+the build, and every later outer row replays from cache (source opened once). If
+the eager drain exceeds the cache threshold it abandons and streams the
+remainder through (memory bound wins; later evals stream fresh). CTE,
+nested-loop-right, and mutating-subquery caches keep `eager` defaulted `false`
+for their first-row latency.
+
 ### Shared CTE materialization (multi-reference CTEs)
 
 A non-recursive CTE referenced more than once (or hinted `MATERIALIZED`) is

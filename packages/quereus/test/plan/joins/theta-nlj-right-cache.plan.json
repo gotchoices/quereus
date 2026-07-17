@@ -491,6 +491,7 @@
               ],
               "detail": "CACHE (memory, threshold=1000)",
               "logical": {
+                "eager": false,
                 "sourceNodeType": "Alias",
                 "strategy": "memory",
                 "threshold": 1000
