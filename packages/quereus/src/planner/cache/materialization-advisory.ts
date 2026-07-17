@@ -4,7 +4,7 @@
  */
 
 import { createLogger } from '../../common/logger.js';
-import { isRelationalNode, type PlanNode, type RelationalPlanNode, type ScalarPlanNode, type TableDescriptor } from '../nodes/plan-node.js';
+import { isRelationalNode, type PlanNode, type RelationalPlanNode, type TableDescriptor } from '../nodes/plan-node.js';
 import { CacheNode, type CacheStrategy } from '../nodes/cache-node.js';
 import { CTENode } from '../nodes/cte-node.js';
 import { RecursiveCTENode } from '../nodes/recursive-cte-node.js';
@@ -82,8 +82,10 @@ export class MaterializationAdvisory {
 		// when a recursive CTE is referenced 2+ times: earlier passes duplicate it
 		// into distinct instances that SHARE one recursive-case subtree, inflating
 		// that subtree's parent count to ≥2 and otherwise tripping the multi-parent
-		// cache rule. (Single-reference recursive CTEs never share their recursive
-		// case, so this set is empty for them.)
+		// cache rule. Collected for EVERY recursive CTE (not only multi-referenced
+		// ones): a single-reference recursive case never trips the multi-parent rule
+		// so excluding it is normally a no-op, but the exclusion is uniform because
+		// caching a working-table-dependent node is wrong regardless of ref count.
 		// NOTE: conservative — excludes EVERY node in a recursive-case subtree,
 		// including a subquery that never reads the working table (safe to cache).
 		// If an expensive working-table-independent subquery inside a recursive case
@@ -204,24 +206,8 @@ export class MaterializationAdvisory {
 			// is preserved so the InternalRecursiveCTERefNode in the recursive case
 			// still resolves the same working table AND every duplicate keys the same
 			// shared buffer.
-			const [newBase, newRecursive, ...rest] = newChildren;
-			let restIdx = 0;
-			const newLimit = node.limitExpr ? rest[restIdx++] as ScalarPlanNode : undefined;
-			const newOffset = node.offsetExpr ? rest[restIdx++] as ScalarPlanNode : undefined;
-			result = new RecursiveCTENode(
-				node.scope,
-				node.cteName,
-				node.columns,
-				newBase as RelationalPlanNode,
-				newRecursive as RelationalPlanNode,
-				node.isUnionAll,
-				node.materializationHint,
-				node.maxRecursion,
-				node.tableDescriptor,
-				newLimit,
-				newOffset,
-				true
-			);
+			const withMarkedChildren = (childrenChanged ? node.withChildren(newChildren) : node) as RecursiveCTENode;
+			result = withMarkedChildren.withMaterialize(true);
 			log('Marked recursive CTE %s for shared buffering (%d references)', node.cteName, recursiveRefsByDescriptor.get(node.tableDescriptor) ?? 0);
 		} else if (childrenChanged) {
 			result = node.withChildren(newChildren);

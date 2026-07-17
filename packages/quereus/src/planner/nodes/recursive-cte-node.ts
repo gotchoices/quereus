@@ -170,6 +170,32 @@ export class RecursiveCTENode extends PlanNode implements CTEPlanNode, CTEScopeN
 		return newNode;
 	}
 
+	/**
+	 * Clone with a flipped `materialize` decision, preserving every other field
+	 * (crucially the `tableDescriptor` identity and the recursive case). Lets the
+	 * materialization-advisory pass set the flag without hand-copying the full
+	 * constructor argument list (which `withChildren` already owns).
+	 */
+	withMaterialize(materialize: boolean): RecursiveCTENode {
+		if (this.materialize === materialize) {
+			return this;
+		}
+		return new RecursiveCTENode(
+			this.scope,
+			this.cteName,
+			this.columns,
+			this.baseCaseQuery,
+			this.recursiveCaseQuery,
+			this.isUnionAll,
+			this.materializationHint,
+			this.maxRecursion,
+			this.tableDescriptor,
+			this.limitExpr,
+			this.offsetExpr,
+			materialize
+		);
+	}
+
 	override toString(): string {
 		const recursiveText = 'RECURSIVE ';
 		const columnsText = this.columns ? `(${this.columns.join(', ')})` : '';
