@@ -62,6 +62,37 @@ describe('scalar-subquery cache: scan count', () => {
 		).to.equal(1);
 	});
 
+	it('caches once for an uncorrelated scalar subquery in the projection list', async () => {
+		// The rule fires on node type, not on clause position: a scalar subquery in
+		// SELECT / ORDER BY / HAVING must cache identically to the WHERE case. This
+		// guards against the win being WHERE-specific.
+		await db.exec("INSERT INTO probe VALUES (1, 10), (2, 20), (3, 30)");
+
+		module.scanCounts.clear();
+		const rows = await allRows<{ id: number; m: number }>(
+			'select id, (select max(k) from counting) as m from probe order by id'
+		);
+		expect(rows).to.deep.equal([
+			{ id: 1, m: 3 }, { id: 2, m: 3 }, { id: 3, m: 3 },
+		]);
+		expect(module.scanCounts.get('counting'),
+			'a projection-position scalar subquery must build the cache once and replay'
+		).to.equal(1);
+	});
+
+	it('caches once for an uncorrelated scalar subquery in the ORDER BY clause', async () => {
+		await db.exec("INSERT INTO probe VALUES (1, 10), (2, 20), (3, 30)");
+
+		module.scanCounts.clear();
+		const rows = await allRows<{ id: number }>(
+			'select id from probe order by (select max(k) from counting), id'
+		);
+		expect(rows).to.deep.equal([{ id: 1 }, { id: 2 }, { id: 3 }]);
+		expect(module.scanCounts.get('counting'),
+			'an ORDER-BY-position scalar subquery must build the cache once and replay'
+		).to.equal(1);
+	});
+
 	it('re-scans per outer row for a correlated subquery (cache gate holds)', async () => {
 		// The inner references probe.id, so it is correlated: its result genuinely
 		// differs per outer row and must NOT be cached. Assert the scan count stays
