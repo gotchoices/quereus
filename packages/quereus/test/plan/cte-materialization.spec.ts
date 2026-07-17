@@ -1,6 +1,23 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
+import { PlanNode } from '../../src/planner/nodes/plan-node.js';
+import { CTENode } from '../../src/planner/nodes/cte-node.js';
+import { CTEReferenceNode } from '../../src/planner/nodes/cte-reference-node.js';
 import { planOps, allRows } from './_helpers.js';
+
+/** Collect every CTEReferenceNode in an optimized plan tree (deduped by identity). */
+function collectCTERefs(root: PlanNode): CTEReferenceNode[] {
+	const out: CTEReferenceNode[] = [];
+	const seen = new Set<PlanNode>();
+	const walk = (node: PlanNode): void => {
+		if (seen.has(node)) return;
+		seen.add(node);
+		if (node instanceof CTEReferenceNode) out.push(node);
+		for (const child of node.getChildren()) walk(child);
+	};
+	walk(root);
+	return out;
+}
 
 describe('Plan shape: CTE materialization', () => {
 	let db: Database;
@@ -67,6 +84,52 @@ describe('Plan shape: CTE materialization', () => {
 		});
 	});
 
+	describe('materialize mark (shared per-execution buffer)', () => {
+		it('marks a 2-reference CTE materialize and keeps one shared CTENode instance', () => {
+			const plan = db.getPlan(`
+				WITH cte AS (SELECT id, val FROM items)
+				SELECT c1.id, c2.val
+				FROM cte c1 JOIN cte c2 ON c1.id = c2.id
+			`);
+			const refs = collectCTERefs(plan);
+			expect(refs).to.have.lengthOf(2, 'expected two CTE references');
+			// The runtime buffer is keyed by the CTENode's plan id — if the two
+			// references ever diverge onto distinct instances, the key no longer
+			// matches and the CTE silently re-executes per reference.
+			expect(refs[0].source, 'both references must share ONE CTENode instance').to.equal(refs[1].source);
+			expect(refs[0].source).to.be.instanceOf(CTENode);
+			expect((refs[0].source as CTENode).materialize, 'multi-reference CTE must be marked materialize').to.equal(true);
+		});
+
+		it('does not mark a single-reference un-hinted CTE', () => {
+			const plan = db.getPlan('WITH cte AS (SELECT id, val FROM items) SELECT * FROM cte');
+			const refs = collectCTERefs(plan);
+			expect(refs).to.have.lengthOf(1);
+			expect((refs[0].source as CTENode).materialize, 'single-ref CTE keeps the streaming path').to.equal(false);
+		});
+
+		it('marks an explicitly MATERIALIZED single-reference CTE', () => {
+			const plan = db.getPlan('WITH cte AS MATERIALIZED (SELECT id, val FROM items) SELECT * FROM cte');
+			const refs = collectCTERefs(plan);
+			expect(refs).to.have.lengthOf(1);
+			expect((refs[0].source as CTENode).materialize, 'MATERIALIZED hint forces the mark').to.equal(true);
+		});
+
+		it('honors NOT MATERIALIZED on a 2-reference CTE', () => {
+			const plan = db.getPlan(`
+				WITH cte AS NOT MATERIALIZED (SELECT id, val FROM items)
+				SELECT c1.id, c2.val
+				FROM cte c1 JOIN cte c2 ON c1.id = c2.id
+			`);
+			const refs = collectCTERefs(plan);
+			expect(refs).to.have.lengthOf(2);
+			for (const ref of refs) {
+				expect((ref.source as CTENode).materialize,
+					'explicit NOT MATERIALIZED opts out of the shared buffer').to.equal(false);
+			}
+		});
+	});
+
 	describe('recursive CTE structure', () => {
 		it('produces a RECURSIVECTE plan node', async () => {
 			const q = `
@@ -94,6 +157,32 @@ describe('Plan shape: CTE materialization', () => {
 			`;
 			const results = await allRows<{ x: number }>(db, q);
 			expect(results.map(r => r.x)).to.deep.equal([1, 2, 3, 4, 5]);
+		});
+
+		it('never marks a recursive CTE for shared materialization, even when referenced twice', () => {
+			// Recursive CTEs run through the working-table machinery
+			// (RecursiveCTENode → emitRecursiveCTE), not emitCTE — the shared
+			// per-execution buffer mark must not touch them.
+			// NOTE: executing this double-reference query currently fails with
+			// "exceeded maximum iteration limit" — a pre-existing defect present
+			// before shared CTE materialization landed; see the fix ticket
+			// bug-recursive-cte-double-reference-runaway. Once fixed, extend this
+			// test to assert the query's results as well.
+			const plan = db.getPlan(`
+				WITH RECURSIVE cnt(x) AS (
+					SELECT 1
+					UNION ALL
+					SELECT x + 1 FROM cnt WHERE x < 3
+				)
+				SELECT a.x AS ax, b.x AS bx
+				FROM cnt a JOIN cnt b ON a.x = b.x
+			`);
+			const refs = collectCTERefs(plan);
+			expect(refs).to.have.lengthOf(2, 'expected two references to the recursive CTE');
+			for (const ref of refs) {
+				expect(ref.source, 'recursive CTE must not be rewritten into a marked CTENode')
+					.to.not.be.instanceOf(CTENode);
+			}
 		});
 	});
 });

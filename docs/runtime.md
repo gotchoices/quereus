@@ -1450,6 +1450,36 @@ statement's executions, tying the cache to the context rather than the
 closure resets it between runs: a re-executed statement re-drives its cached
 source and observes current data instead of replaying the first run's rows.
 
+### Shared CTE materialization (multi-reference CTEs)
+
+A non-recursive CTE referenced more than once (or hinted `MATERIALIZED`) is
+marked `materialize` by the optimizer's materialization-advisory pass (see
+`docs/optimizer.md` § Materialization Advisory). `emitCTE`
+(`src/runtime/emit/cte.ts`) then evaluates the CTE **exactly once per statement
+execution**, matching standard SQL `MATERIALIZED` semantics:
+
+- Every `CTEReferenceNode` emits its own copy of the CTE's source subtree
+  (`emitPlanNode` has no memoization), but all references share one `CTENode`
+  instance — so each reference's `emitCTE` closure agrees on the buffer key,
+  the CTENode's plan id.
+- The buffer lives on the per-execution `RuntimeContext`
+  (`ctx.cteMaterializations`, a `Map<string, Promise<Row[]>>`). The first
+  reference to run stores the buffer *promise* synchronously (before any
+  `await`), then drives its source to completion; a second reference that
+  interleaves — e.g. the two sides of a nested-loop self-join — finds the
+  promise and awaits it instead of driving its own source subtree, which is
+  therefore never iterated. This holds regardless of how references interleave,
+  where a first-drain row cache (`CacheNode`) would still double-drive.
+- Rows are copied on buffer-in and on yield so a downstream mutator cannot
+  corrupt another reference's (or a later replay's) view.
+- Per-execution lifetime gives the same staleness guarantee as `cacheStates`:
+  a re-executed prepared statement re-materializes and observes current data.
+
+Un-marked CTEs (single reference without a `MATERIALIZED` hint, or an explicit
+`NOT MATERIALIZED`) keep the pure streaming path — early exit such as `LIMIT`
+never drains the source. Recursive CTEs never take this path; they run through
+the working-table machinery (`emitRecursiveCTE`).
+
 ## Query Optimizer Integration
 
 The Quereus optimizer transforms logical plan nodes into physical execution plans between the builder and runtime phases. This section covers the key aspects relevant to runtime emitter development.
@@ -1533,6 +1563,7 @@ Three invariants govern what code may do with a `RuntimeContext` once it has bee
 | `executionMemo` | `shared-cooperative` | Once-per-execution impure-subquery memo; shared so the run-once contract spans branches. |
 | `scanConnections` | `shared-cooperative` | Once-per-execution inner-scan connection cache; shared so statement teardown disconnects every branch's instances exactly once. |
 | `cacheStates` | `shared-cooperative` | Once-per-execution `CacheNode` row-cache map; shared so a cache materialized in one branch is visible to a sibling branch re-driving the same cache site. |
+| `cteMaterializations` | `shared-cooperative` | Once-per-execution shared CTE buffer map; shared so a CTE materialized in one branch replays in a sibling branch instead of re-driving the source. |
 
 Adding a new field to `RuntimeContext` requires adding it to `EXPECTED_FORK_POLICY` in `fork-contract.spec.ts` with a declared policy — the test fails compile otherwise.
 

@@ -53,7 +53,8 @@ export class ParallelDriver {
 	 *   parent's entries — set/delete in one fork do not leak to siblings or parent;
 	 * - **shared** references to read-mostly state: `db`, `stmt`, `params`,
 	 *   `enableMetrics`, `mutationOrdinal`, `signal`, `tracer`, `activeConnection`,
-	 *   `contextTracker`, `planStack`, `executionMemo`, `scanConnections`, `cacheStates`.
+	 *   `contextTracker`, `planStack`, `executionMemo`, `scanConnections`, `cacheStates`,
+	 *   `cteMaterializations`.
 	 *   (`signal` is shared so every
 	 *   branch honors the same cooperative cancellation — the table-scan leaf reads
 	 *   `rctx.signal`.) (`mutationOrdinal` is a per-row INSERT/envelope
@@ -78,6 +79,13 @@ export class ParallelDriver {
 	 *   that re-drives the same cache site within the same execution, matching the
 	 *   pre-fork single-closure cache. Dormant today: ParallelDriver has no query
 	 *   consumers.)
+	 *   (`cteMaterializations` is the once-per-execution shared CTE buffer map;
+	 *   shared by reference so a CTE materialized in one branch replays in a sibling
+	 *   branch instead of re-driving the source. Same lazy-creation caveat as
+	 *   `executionMemo`: it is created on first materialized-CTE run, so a future
+	 *   parallelized query driving CTE references inside forks must eagerly create
+	 *   the map on the parent before fork(). Dormant today: ParallelDriver has no
+	 *   query consumers.)
 	 *
 	 * The parent is treated as immutable for the lifetime of the forks.
 	 */
@@ -116,6 +124,7 @@ export class ParallelDriver {
 				executionMemo: rctx.executionMemo,
 				scanConnections: rctx.scanConnections,
 				cacheStates: rctx.cacheStates,
+				cteMaterializations: rctx.cteMaterializations,
 			};
 			if (strict) {
 				markForkOf(childTableContexts, rctx.tableContexts);

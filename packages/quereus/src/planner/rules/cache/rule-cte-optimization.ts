@@ -54,6 +54,13 @@ export function ruleCteOptimization(node: PlanNode, context: OptContext): PlanNo
 			context.tuning.cte.maxCacheThreshold
 		);
 
+		// NOTE: when the materialization-advisory pass later marks this CTE
+		// materialize (multi-referenced or MATERIALIZED hint), this inner
+		// CacheNode double-buffers: emitCTE buffers the rows per execution AND
+		// this cache buffers them again, driven only by the single first
+		// reference. Correct but a wasted buffer — if it shows up in memory
+		// profiles, drop the CTE-specific wrap here (needs its own test pass;
+		// it also changes single-reference CTE caching behavior).
 		const cachedSource = new CacheNode(
 			source.scope,
 			source,
@@ -68,7 +75,8 @@ export function ruleCteOptimization(node: PlanNode, context: OptContext): PlanNo
 			cteNode.columns,
 			cachedSource,
 			cteNode.materializationHint,
-			cteNode.isRecursive
+			cteNode.isRecursive,
+			node instanceof CTENode ? node.materialize : false
 		);
 
 		log('Created CTE with caching');

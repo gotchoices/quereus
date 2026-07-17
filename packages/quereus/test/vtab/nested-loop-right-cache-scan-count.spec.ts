@@ -1,11 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
-import type { MemoryTable } from '../../src/vtab/memory/table.js';
-import type { TableSchema } from '../../src/schema/table.js';
-import type { MemoryTableConfig } from '../../src/vtab/memory/types.js';
-import type { FilterInfo } from '../../src/vtab/filter-info.js';
-import type { Row } from '../../src/common/types.js';
+import { CountingMemoryModule } from './_counting-memory-module.js';
 
 /**
  * Runtime scan-count check for rule-nested-loop-right-cache.
@@ -16,41 +11,11 @@ import type { Row } from '../../src/common/types.js';
  * injects, the right side materializes on the first left row and every
  * subsequent left row replays the buffer → exactly one `query()` per table.
  *
- * This module counts `query()` opens on every MemoryTable it hands out. The
- * assertion is robust to join-order choice: after the rule fires NO table is
- * scanned more than once, whichever side the optimizer picks as the driver.
+ * The counting module tallies `query()` opens on every MemoryTable it hands
+ * out. The assertion is robust to join-order choice: after the rule fires NO
+ * table is scanned more than once, whichever side the optimizer picks as the
+ * driver.
  */
-class CountingMemoryModule extends MemoryTableModule {
-	/** query() open count, keyed by lowercased table name. */
-	readonly scanCounts = new Map<string, number>();
-
-	private instrument(table: MemoryTable): MemoryTable {
-		const counts = this.scanCounts;
-		const key = table.tableName.toLowerCase();
-		const original = table.query.bind(table);
-		table.query = (filterInfo: FilterInfo): AsyncIterable<Row> => {
-			counts.set(key, (counts.get(key) ?? 0) + 1);
-			return original(filterInfo);
-		};
-		return table;
-	}
-
-	override async create(db: Database, tableSchema: TableSchema): Promise<MemoryTable> {
-		return this.instrument(await super.create(db, tableSchema));
-	}
-
-	override async connect(
-		db: Database,
-		pAux: unknown,
-		moduleName: string,
-		schemaName: string,
-		tableName: string,
-		options: MemoryTableConfig,
-		tableSchema?: TableSchema,
-	): Promise<MemoryTable> {
-		return this.instrument(await super.connect(db, pAux, moduleName, schemaName, tableName, options, tableSchema));
-	}
-}
 
 describe('nested-loop right-side cache: scan count', () => {
 	let db: Database;

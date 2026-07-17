@@ -88,6 +88,18 @@ export type RuntimeContext = {
 	 * pattern.
 	 */
 	cacheStates?: Map<symbol, CacheState>;
+	/**
+	 * Per-execution CTE materialization buffers for {@link emitCTE}, keyed by the
+	 * shared CTENode's plan id. A CTE marked `materialize` (multi-referenced, or
+	 * MATERIALIZED-hinted) buffers its rows exactly once per statement execution:
+	 * the first reference to run stores the buffer promise synchronously and
+	 * drives the source; every other reference awaits that same promise and never
+	 * touches its own (separately-emitted) source subtree. Keyed by plan id — all
+	 * references share one CTENode instance, so their emitCTE closures agree on
+	 * the key. A fresh RuntimeContext per execution resets the map between
+	 * prepared-statement runs (no stale replay). Mirrors {@link cacheStates}.
+	 */
+	cteMaterializations?: Map<string, Promise<Row[]>>;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;

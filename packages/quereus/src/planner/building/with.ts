@@ -131,20 +131,16 @@ export function buildCommonTableExpr(
 		}
 	}
 
-	// Determine materialization strategy
-	let materializationHint = cte.materializationHint;
-	if (!materializationHint) {
-		// Default strategy: materialize if CTE is likely to be reused
-		// For now, we'll default to not materialized for simplicity
-		materializationHint = 'not_materialized';
-	}
-
+	// Preserve the user's explicit hint (or its absence). An unhinted CTE stays
+	// `undefined` so the materialization-advisory pass may still decide to
+	// materialize it when it is referenced more than once; a synthesized
+	// 'not_materialized' default would read as an explicit user opt-out there.
 	return new CTENode(
 		ctx.scope,
 		cte.name,
 		cte.columns,
 		query,
-		materializationHint,
+		cte.materializationHint,
 		isRecursive
 	);
 }

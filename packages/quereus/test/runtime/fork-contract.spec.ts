@@ -61,6 +61,11 @@ const EXPECTED_FORK_POLICY = {
 	// cache site within the same execution. Mutation across branches is the
 	// CacheNode emitter's responsibility.
 	cacheStates: 'shared-cooperative',
+	// Once-per-execution shared CTE materialization buffer map: shared by reference
+	// so a CTE buffered in one branch replays in a sibling branch instead of
+	// re-driving the source. Mutation across branches is the emitCTE contract's
+	// responsibility.
+	cteMaterializations: 'shared-cooperative',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
@@ -194,6 +199,7 @@ describe('Fork contract (test harness)', () => {
 			parent.executionMemo = new Map();
 			parent.scanConnections = new Map();
 			parent.cacheStates = new Map();
+			parent.cteMaterializations = new Map();
 
 			const [fork] = driver.fork(parent, 1);
 

@@ -6,6 +6,7 @@
 import { createLogger } from '../../common/logger.js';
 import { isRelationalNode, type PlanNode, type RelationalPlanNode } from '../nodes/plan-node.js';
 import { CacheNode, type CacheStrategy } from '../nodes/cache-node.js';
+import { CTENode } from '../nodes/cte-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import type { OptimizerTuning } from '../optimizer-tuning.js';
 import { ReferenceGraphBuilder, type RefStats } from './reference-graph.js';
@@ -42,10 +43,21 @@ export class MaterializationAdvisory {
 	 * Returns the transformed tree or the original if no caching was added
 	 */
 	analyzeAndTransform(root: PlanNode): PlanNode {
-		// Build reference graph
+		// Build reference graph (exactly once per optimize — shared by both the
+		// CTE materialize-mark rewrite and the CacheNode recommendations below)
 		const refGraph = this.referenceBuilder.buildReferenceGraph(root);
 
-		// Build recommendations
+		// Mark multi-referenced / MATERIALIZED-hinted CTEs for shared
+		// materialization at emission. Memoized by node identity so a CTENode
+		// shared by several CTEReferenceNode parents is rewritten ONCE and the
+		// parents keep pointing at the same marked instance — emitCTE keys its
+		// per-execution buffer on that shared node's plan id.
+		const markMemo = new Map<PlanNode, PlanNode>();
+		const markedRoot = this.markCTEMaterialization(root, refGraph, markMemo);
+
+		// Build recommendations. Keys are re-mapped through the mark memo so a
+		// recommendation lands on the (possibly rewritten) node instance that is
+		// actually present in the marked tree.
 		const recommendations = new Map<PlanNode, CacheRecommendation>();
 
 		for (const [node, stats] of refGraph) {
@@ -56,20 +68,80 @@ export class MaterializationAdvisory {
 
 			const recommendation = this.adviseCaching(node, stats);
 			if (recommendation.shouldCache) {
-				recommendations.set(node, recommendation);
+				recommendations.set(markMemo.get(node) ?? node, recommendation);
 				log('Recommending cache for %s: %s', node.nodeType, recommendation.reason);
 			}
 		}
 
 		if (recommendations.size === 0) {
 			log('No caching opportunities identified');
-			return root;
+			return markedRoot;
 		}
 
 		log('Found %d caching opportunities', recommendations.size);
 
 		// Transform the tree by wrapping recommended nodes with CacheNode
-		return this.transformTree(root, recommendations);
+		return this.transformTree(markedRoot, recommendations);
+	}
+
+	/**
+	 * Decide whether a CTE must be materialized once per statement execution.
+	 * Recursive CTEs are excluded (they run through the working-table machinery,
+	 * not emitCTE); an explicit NOT MATERIALIZED hint is honored (the user opted
+	 * into re-execution per reference); otherwise an explicit MATERIALIZED hint
+	 * or two-plus references trips the mark.
+	 */
+	private shouldMaterializeCTE(node: CTENode, stats: RefStats | undefined): boolean {
+		if (node.isRecursive) return false;
+		if (node.materializationHint === 'not_materialized') return false;
+		return node.materializationHint === 'materialized' || (stats?.parentCount ?? 0) >= 2;
+	}
+
+	/**
+	 * Top-down memoized rewrite that sets `CTENode.materialize` where
+	 * {@link shouldMaterializeCTE} says so.
+	 *
+	 * The memo (keyed by node identity) is what keeps a shared CTENode shared:
+	 * the plain {@link transformChildren} walk is NOT memoized, so routing this
+	 * mark through it would rebuild the CTENode once per referencing parent —
+	 * two distinct marked instances with different plan ids, and the runtime's
+	 * per-execution buffer key would never match across references.
+	 */
+	private markCTEMaterialization(
+		node: PlanNode,
+		refGraph: Map<PlanNode, RefStats>,
+		memo: Map<PlanNode, PlanNode>
+	): PlanNode {
+		const cached = memo.get(node);
+		if (cached) {
+			return cached;
+		}
+
+		const children = node.getChildren();
+		const newChildren = children.map(child => this.markCTEMaterialization(child, refGraph, memo));
+		const childrenChanged = newChildren.some((child, idx) => child !== children[idx]);
+
+		let result: PlanNode;
+		if (node instanceof CTENode && !node.materialize && this.shouldMaterializeCTE(node, refGraph.get(node))) {
+			const newSource = (childrenChanged ? newChildren[0] : node.source) as RelationalPlanNode;
+			result = new CTENode(
+				node.scope,
+				node.cteName,
+				node.columns,
+				newSource,
+				node.materializationHint,
+				node.isRecursive,
+				true
+			);
+			log('Marked CTE %s for shared materialization', node.cteName);
+		} else if (childrenChanged) {
+			result = node.withChildren(newChildren);
+		} else {
+			result = node;
+		}
+
+		memo.set(node, result);
+		return result;
 	}
 
 	/**
@@ -116,6 +188,21 @@ export class MaterializationAdvisory {
 				strategy: 'memory',
 				threshold: 0,
 				reason: 'Single parent'
+			};
+		}
+
+		// Rule 5a: CTEs never take a CacheNode wrap. A multi-referenced (or
+		// MATERIALIZED-hinted) CTE is handled by the CTENode.materialize mark
+		// (see markCTEMaterialization) — emitCTE buffers it once per execution.
+		// A CacheNode wrap here could never land anyway: CTEReferenceNode.
+		// withChildren rejects a non-CTE child, so transformChildren silently
+		// dropped the wrap.
+		if (node.nodeType === PlanNodeType.CTE) {
+			return {
+				shouldCache: false,
+				strategy: 'memory',
+				threshold: 0,
+				reason: 'CTE — shared materialization handled by CTENode.materialize mark'
 			};
 		}
 

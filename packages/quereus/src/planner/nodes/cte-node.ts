@@ -50,7 +50,14 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 		public readonly columns: string[] | undefined,
 		public readonly source: RelationalPlanNode,
 		public readonly materializationHint: 'materialized' | 'not_materialized' | undefined,
-		public readonly isRecursive: boolean = false
+		public readonly isRecursive: boolean = false,
+		/**
+		 * Resolved materialization decision for emission, set by the
+		 * materialization-advisory pass: when true, emitCTE buffers this CTE's
+		 * rows once per statement execution and every reference reads that one
+		 * shared buffer (multi-referenced or MATERIALIZED-hinted CTEs).
+		 */
+		public readonly materialize: boolean = false
 	) {
 		// Self-cost only: the source flows in via getChildren(). Self is the CTE
 		// materialization overhead.
@@ -126,7 +133,8 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 			this.columns,
 			newSource as RelationalPlanNode,
 			this.materializationHint,
-			this.isRecursive
+			this.isRecursive,
+			this.materialize
 		);
 	}
 
@@ -147,6 +155,7 @@ export class CTENode extends PlanNode implements CTEPlanNode, CTEScopeNode, CTEC
 			columns: this.columns,
 			materializationHint: this.materializationHint,
 			isRecursive: this.isRecursive,
+			materialize: this.materialize,
 			queryType: this.getType()
 		};
 	}
