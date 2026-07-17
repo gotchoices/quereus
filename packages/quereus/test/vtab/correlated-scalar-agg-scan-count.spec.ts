@@ -96,4 +96,37 @@ describe('correlated scalar-aggregate decorrelation: scan count', () => {
 			db.optimizer.updateTuning(before);
 		}
 	});
+
+	// The Filter anchor (`scalar-agg-decorrelation-filter`): the same scalar-agg
+	// subquery used in a WHERE comparison must also collapse to one child scan.
+	const WHERE_SQL = "select p.id from p where (select count(*) from c where c.pid = p.id) > 0 order by p.id";
+	// p.id 4 has no matching `c` rows → count 0 → excluded by `> 0`.
+	const WHERE_EXPECTED = [{ id: 1 }, { id: 2 }, { id: 3 }];
+
+	it('scans the child once for a WHERE-clause scalar-agg subquery (filter anchor)', async () => {
+		module.scanCounts.clear();
+		const rows = await allRows<{ id: number }>(WHERE_SQL);
+		expect(rows).to.deep.equal(WHERE_EXPECTED);
+		expect(module.scanCounts.get('c'),
+			'filter-anchor decorrelation must scan the child table once, not once per outer row'
+		).to.equal(1);
+	});
+
+	it('scans the child once per outer row for the WHERE subquery when disabled (N+1 observed)', async () => {
+		const before = db.optimizer.tuning;
+		db.optimizer.updateTuning({
+			...before,
+			disabledRules: new Set(['scalar-agg-decorrelation-filter']),
+		});
+		try {
+			module.scanCounts.clear();
+			const rows = await allRows<{ id: number }>(WHERE_SQL);
+			expect(rows).to.deep.equal(WHERE_EXPECTED);
+			expect(module.scanCounts.get('c'),
+				'without the filter anchor the correlated WHERE subquery re-scans c once per outer row'
+			).to.equal(N);
+		} finally {
+			db.optimizer.updateTuning(before);
+		}
+	});
 });

@@ -8,7 +8,7 @@ This list reflects the current and upcoming work for Quereus. Completed items an
 - 🔄 **Phase 1.5 - Access Path Selection**: Seek/range scan infrastructure and optimization rules
 
 ### Upcoming Optimizer Work
-- 📋 **Subquery Optimization**: Transform the *remaining* correlated subquery shapes to joins. Already shipped: correlated `EXISTS`/`IN` → semi/anti join (`subquery-decorrelation`) and correlated scalar-*aggregate* subqueries → grouped LEFT join (`scalar-agg-decorrelation` / `-aggregate`). Still uncovered: correlated *non-aggregate* scalar subqueries (e.g. `... ORDER BY ... LIMIT 1`), and non-equi correlations (`c.pid < p.id`).
+- 📋 **Subquery Optimization**: Transform the *remaining* correlated subquery shapes to joins. Already shipped: correlated `EXISTS`/`IN` → semi/anti join (`subquery-decorrelation`) and correlated scalar-*aggregate* subqueries → grouped LEFT join, in the SELECT list (`scalar-agg-decorrelation`), inside an enclosing aggregate's arguments (`-aggregate`), and in WHERE/HAVING filter predicates (`-filter`). Still uncovered: correlated *non-aggregate* scalar subqueries (e.g. `... ORDER BY ... LIMIT 1`), and non-equi correlations (`c.pid < p.id`).
 - 📋 **Advanced Statistics**: VTab-supplied or ANALYZE-based statistics
 - ✅ **Join Algorithms**: Bloom joins and merge joins
 - 📋 **Aggregate Pushdown**: Push aggregations below joins when semantically valid

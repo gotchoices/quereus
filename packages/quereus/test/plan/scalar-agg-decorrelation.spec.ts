@@ -310,3 +310,148 @@ describe('Plan shape: nested scalar-aggregate subquery decorrelation (aggregate 
 		expect(groupedAggs.length, 'pure sibling still decorrelates').to.be.greaterThanOrEqual(2);
 	});
 });
+
+/**
+ * Plan-shape + equivalence assertions for `scalar-agg-decorrelation-filter`: the
+ * Filter anchor (WHERE and HAVING). A correlated scalar-aggregate subquery in a
+ * filter predicate becomes a grouped aggregate under a LEFT join (materialized as
+ * a physical hash/merge join), the inner scanned once; the rejected shapes keep
+ * their correlated ScalarSubquery plan.
+ */
+describe('Plan shape: scalar-aggregate subquery decorrelation (filter site)', () => {
+	let db: Database;
+	let baselineDb: Database;
+
+	const setup = async (target: Database) => {
+		await target.exec("CREATE TABLE o (id INTEGER PRIMARY KEY, k INTEGER NULL, total INTEGER NULL) USING memory");
+		await target.exec("CREATE TABLE c (id INTEGER PRIMARY KEY, fk INTEGER NULL, amount INTEGER NULL) USING memory");
+		await target.exec("INSERT INTO o VALUES (1, 10, 8), (2, 20, 3), (3, 30, 100), (4, NULL, -5), (5, 40, 20)");
+		await target.exec("INSERT INTO c VALUES (1, 10, 5), (2, 10, 7), (3, 20, 4), (4, 20, 8), (5, 40, 1)");
+		await target.exec("CREATE TABLE ord (id INTEGER PRIMARY KEY, k INTEGER NULL, amt INTEGER) USING memory");
+		await target.exec("CREATE TABLE lim (id INTEGER PRIMARY KEY, gk INTEGER NULL, cap INTEGER) USING memory");
+		await target.exec("INSERT INTO ord VALUES (1,10,5),(2,10,7),(3,20,4),(4,20,2),(5,30,9)");
+		await target.exec("INSERT INTO lim VALUES (1,10,3),(2,10,6),(3,20,10)");
+	};
+
+	beforeEach(async () => {
+		db = new Database();
+		await setup(db);
+		// Baseline keeps the Filter anchor disabled — the correlated per-row plan
+		// whose results the rewrite must reproduce byte-identically.
+		baselineDb = new Database();
+		baselineDb.optimizer.updateTuning({
+			...DEFAULT_TUNING,
+			disabledRules: new Set(['scalar-agg-decorrelation-filter']),
+		});
+		await setup(baselineDb);
+	});
+
+	afterEach(async () => {
+		await db.close();
+		await baselineDb.close();
+	});
+
+	it('rewrites a WHERE comparison into a grouped aggregate under a physical LEFT join', async () => {
+		const q = "SELECT o.id FROM o WHERE o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k)";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'subquery must be dissolved').to.not.include('ScalarSubquery');
+
+		const rows = await planRows(db, q);
+		const agg = rows.find(r =>
+			(r.node_type === 'HashAggregate' || r.node_type === 'StreamAggregate')
+			&& r.detail.includes('GROUP BY'));
+		expect(agg, 'grouped physical aggregate expected').to.not.equal(undefined);
+
+		const ops = await planOps(db, q);
+		expect(
+			ops.some(op => op === 'HASHJOIN' || op === 'MERGEJOIN'),
+			`expected hash/merge join in [${ops.join(', ')}]`,
+		).to.equal(true);
+
+		// The materialized join is a LEFT join (a no-match outer row must survive
+		// carrying the empty-input value), and the grouped aggregate sits under it.
+		const join = rows.find(r => r.node_type === 'HashJoin' || r.node_type === 'MergeJoin');
+		expect(join, 'physical join expected').to.not.equal(undefined);
+		expect(join!.detail, 'must be a LEFT join').to.include('LEFT');
+		expect(isDescendantOf(rows, agg!.id, join!.id)).to.equal(true);
+
+		const decorrelated = await allRows(db, q + ' ORDER BY o.id');
+		const baseline = await allRows(baselineDb, q + ' ORDER BY o.id');
+		expect(baseline).to.deep.equal([{ id: 1 }, { id: 5 }]);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
+
+	it('rewrites a HAVING comparison (Filter over Aggregate) into a grouped left join', async () => {
+		const q = "SELECT ord.k, sum(ord.amt) AS s FROM ord GROUP BY ord.k HAVING sum(ord.amt) > (SELECT min(lim.cap) FROM lim WHERE lim.gk = ord.k)";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'HAVING subquery must be dissolved').to.not.include('ScalarSubquery');
+
+		const ops = await planOps(db, q);
+		expect(
+			ops.some(op => op === 'HASHJOIN' || op === 'MERGEJOIN'),
+			`expected hash/merge join in [${ops.join(', ')}]`,
+		).to.equal(true);
+
+		const decorrelated = await allRows(db, q + ' ORDER BY ord.k');
+		const baseline = await allRows(baselineDb, q + ' ORDER BY ord.k');
+		expect(baseline).to.deep.equal([{ k: 10, s: 12 }]);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
+
+	it('decorrelates a subquery inside a disjunction (multiplicity preserved)', async () => {
+		const q = "SELECT o.id FROM o WHERE o.total < 0 OR o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k)";
+		const types = await planNodeTypes(db, q);
+		expect(types).to.not.include('ScalarSubquery');
+		const decorrelated = await allRows(db, q + ' ORDER BY o.id');
+		const baseline = await allRows(baselineDb, q + ' ORDER BY o.id');
+		expect(baseline).to.deep.equal([{ id: 1 }, { id: 4 }, { id: 5 }]);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
+
+	it('stacks one join per subquery for two scalar-agg subqueries in one predicate', async () => {
+		const q = "SELECT o.id FROM o WHERE o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k) AND (SELECT count(*) FROM c WHERE c.fk = o.k) >= 2";
+		const types = await planNodeTypes(db, q);
+		expect(types).to.not.include('ScalarSubquery');
+		const joins = types.filter(t => t === 'HashJoin' || t === 'MergeJoin' || t === 'Join');
+		expect(joins.length, 'one join per decorrelated subquery').to.be.greaterThanOrEqual(2);
+		const decorrelated = await allRows(db, q + ' ORDER BY o.id');
+		expect(decorrelated).to.deep.equal([{ id: 1 }]);
+	});
+
+	it('fires alongside EXISTS decorrelation in the same WHERE (both rules)', async () => {
+		const q = "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM c WHERE c.fk = o.k) AND o.total > (SELECT avg(c.amount) FROM c WHERE c.fk = o.k)";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'scalar-agg subquery dissolved').to.not.include('ScalarSubquery');
+		// EXISTS became a semi-join; the scalar-agg became a left join.
+		const rows = await planRows(db, q);
+		expect(rows.some(r => r.detail.includes('SEMI')), 'EXISTS semi-join expected').to.equal(true);
+		expect(rows.some(r => r.detail.includes('LEFT')), 'scalar-agg left join expected').to.equal(true);
+		const decorrelated = await allRows(db, q + ' ORDER BY o.id');
+		const baseline = await allRows(baselineDb, q + ' ORDER BY o.id');
+		expect(baseline).to.deep.equal([{ id: 1 }, { id: 5 }]);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
+
+	it('leaves a non-equi correlation on the correlated path', async () => {
+		const q = "SELECT o.id FROM o WHERE o.total > (SELECT avg(c.amount) FROM c WHERE c.fk < o.k)";
+		const types = await planNodeTypes(db, q);
+		expect(types).to.include('ScalarSubquery');
+	});
+
+	it('leaves a non-aggregate LIMIT 1 subquery on the correlated path', async () => {
+		const q = "SELECT o.id FROM o WHERE o.total > (SELECT c.amount FROM c WHERE c.fk = o.k ORDER BY c.amount LIMIT 1)";
+		const types = await planNodeTypes(db, q);
+		expect(types).to.include('ScalarSubquery');
+	});
+
+	it('refuses a DML-bearing subquery (per-row firing is observable)', async () => {
+		await db.exec("CREATE TABLE sink (id INTEGER PRIMARY KEY, fk INTEGER) USING memory");
+		// A correlated `count(*)` over an `INSERT ... RETURNING` in the WHERE — the
+		// side-effect gate must refuse it so its per-row firing is preserved.
+		const q = `SELECT o.id FROM o
+			WHERE o.total > (SELECT count(*) FROM (INSERT INTO sink (id, fk) SELECT c.id, c.fk FROM c WHERE c.fk = o.k RETURNING id) r)`;
+		// Planning only — query_plan() never fires the INSERT.
+		const types = await planNodeTypes(db, q);
+		expect(types, 'DML-bearing subquery must stay correlated').to.include('ScalarSubquery');
+	});
+});

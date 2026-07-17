@@ -65,7 +65,7 @@
  * for; the tiny-outer/huge-inner cost tradeoff is tracked in
  * `backlog/feat-decorrelation-cost-model`.
  *
- * TWO MATCH SITES share the identical per-subquery rewrite (`decorrelateOne`):
+ * THREE MATCH SITES share the identical per-subquery rewrite (`decorrelateOne`):
  *   - `ruleScalarAggDecorrelation` — subqueries in a ProjectNode's projection
  *     expressions; the join stack lands between the Project and its source.
  *   - `ruleScalarAggDecorrelationAggregate` — subqueries inside an
@@ -76,6 +76,19 @@
  *     aggregate's input row count and multiplicity are preserved exactly, and
  *     every existing group-by/aggregate reference resolves unchanged by
  *     attribute id (left-side attributes stay visible through the join).
+ *   - `ruleScalarAggDecorrelationFilter` — subqueries anywhere in a FilterNode's
+ *     predicate (WHERE, and HAVING — a HAVING clause plans as a FilterNode whose
+ *     source is an AggregateNode); the join stack lands between the Filter and
+ *     its source, and the subquery reference in the predicate is substituted with
+ *     the guarded value read. A FilterNode publishes its source's attributes
+ *     verbatim, so the LEFT join's appended grouped-aggregate columns would leak
+ *     to whatever consumes the filter — and a HAVING filter is frequently the
+ *     query's output node itself (the SELECT projection is fused into the
+ *     Aggregate below it, leaving no capping Project). The rule therefore caps its
+ *     own result with a bare pass-through Project that re-exposes exactly the
+ *     Filter's original attributes; the outer columns keep their original indices
+ *     (the LEFT join places the outer on the left), so that projection's column
+ *     references — and everything above — resolve unchanged.
  *
  * NESTED subqueries converge level by level: the Structural pass is top-down
  * with rules firing BEFORE descent, so the grouped aggregate built by one
@@ -88,6 +101,7 @@ import { createLogger } from '../../../common/logger.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode, Attribute } from '../../nodes/plan-node.js';
 import { isRelationalNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
+import type { Scope } from '../../scopes/scope.js';
 import type { ScalarType } from '../../../common/datatype.js';
 import type { SqlValue } from '../../../common/types.js';
 import { FunctionFlags } from '../../../common/constants.js';
@@ -165,6 +179,88 @@ export function ruleScalarAggDecorrelationAggregate(node: PlanNode, _context: Op
 
 	log('Decorrelated %d scalar-aggregate subquery(ies) below an enclosing aggregate', rewrite.replacements.size);
 	return rebuildAggregate(node, rewrite.source, rewrite.replacements);
+}
+
+/**
+ * Filter match site (WHERE and HAVING): the same rewrite for a correlated
+ * scalar-aggregate subquery used anywhere in a FilterNode's predicate —
+ * `where o.total > (select avg(c.amount) from c where c.fk = o.k)`. The join
+ * stack lands between the Filter and its source, and the subquery reference in
+ * the predicate is substituted with the guarded value read; the result is
+ * `Filter[pred'](LeftJoin(outer, groupedAgg))`.
+ *
+ * HAVING needs no special-casing: `... group by o.k having sum(o.v) > (select …)`
+ * plans as a FilterNode whose source is an AggregateNode, so the aggregate's
+ * group-key / aggregate-result attributes are exactly the outer attributes the
+ * subquery correlates to — `decorrelateAll` treats the AggregateNode as the outer
+ * like any other relation.
+ *
+ * The LEFT join is load-bearing (an outer row with no inner match survives
+ * carrying the aggregate's empty-input value, which the replacement reproduces
+ * byte-for-byte), so three-valued predicate logic is preserved with no new code.
+ *
+ * The rewritten Filter's source gains the grouped join's columns; a FilterNode
+ * publishes its source's attributes verbatim, so the result is capped with a bare
+ * pass-through Project (see `capToFilterAttributes`) that re-exposes exactly the
+ * original Filter attributes — without it the extra columns leak to the query
+ * output whenever the Filter is not already under a projection (the common HAVING
+ * shape, where the SELECT list is fused into the Aggregate below the filter).
+ */
+export function ruleScalarAggDecorrelationFilter(node: PlanNode, _context: OptContext): PlanNode | null {
+	if (!(node instanceof FilterNode)) return null;
+
+	// The predicate is a single scalar tree; collect every scalar-agg subquery in it.
+	const candidates = collectCandidates([node.predicate]);
+	if (candidates.length === 0) return null;
+
+	// Original Filter attributes (= its source's) — the signature the cap restores.
+	const filterAttrs = node.getAttributes();
+
+	const rewrite = decorrelateAll(candidates, node.source);
+	if (!rewrite) return null;
+
+	log('Decorrelated %d scalar-aggregate subquery(ies) in a filter predicate into grouped left join(s)', rewrite.replacements.size);
+	const decorrelatedFilter = new FilterNode(
+		node.scope,
+		rewrite.source,
+		substituteSubqueries(node.predicate, rewrite.replacements),
+	);
+	return capToFilterAttributes(node.scope, decorrelatedFilter, filterAttrs);
+}
+
+/**
+ * Wrap `source` in a bare pass-through Project that re-exposes exactly
+ * `filterAttrs` (the decorrelated Filter's original output signature), discarding
+ * the grouped LEFT join's appended columns. The outer columns sit at indices
+ * `0..filterAttrs.length-1` of the join output (LEFT join places the outer on the
+ * left), so each projection is a plain column reference at its original index and
+ * every id is preserved — consumers above resolve unchanged.
+ */
+function capToFilterAttributes(
+	scope: Scope,
+	source: RelationalPlanNode,
+	filterAttrs: readonly Attribute[],
+): ProjectNode {
+	const projections = filterAttrs.map((attr, index) => ({
+		node: new ColumnReferenceNode(
+			scope,
+			{ type: 'column', name: attr.name },
+			attr.type,
+			attr.id,
+			index,
+		),
+		attributeId: attr.id,
+	}));
+	// preserveInputColumns: false — output is exactly the projected columns, and
+	// predefinedAttributes pins the ids/types to the original Filter signature.
+	// NOTE: for a WHERE filter already under a SELECT Project this cap is a
+	// redundant pass-through (the outer Project would re-cap anyway); it is NOT
+	// eliminated because its Filter source carries MORE attributes, so no
+	// trivial-project rule sees it as an identity. Harmless (one extra Project
+	// node, correct output). If this shows up in plan-shape noise or profiling,
+	// skip the cap when `node`'s consumer is already a Project that outputs a
+	// subset of `filterAttrs`.
+	return new ProjectNode(scope, source, projections, undefined, [...filterAttrs], false);
 }
 
 /**
