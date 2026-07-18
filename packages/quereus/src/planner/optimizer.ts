@@ -57,7 +57,7 @@ import { ruleMutatingSubqueryCache } from './rules/cache/rule-mutating-subquery-
 import { ruleNestedLoopRightCache } from './rules/cache/rule-nested-loop-right-cache.js';
 import { ruleInSubqueryCache } from './rules/cache/rule-in-subquery-cache.js';
 import { ruleScalarSubqueryCache } from './rules/cache/rule-scalar-subquery-cache.js';
-import { ruleSubqueryDecorrelation } from './rules/subquery/rule-subquery-decorrelation.js';
+import { ruleSubqueryDecorrelation, ruleExistsInSelectDecorrelation } from './rules/subquery/rule-subquery-decorrelation.js';
 import { ruleScalarAggDecorrelation, ruleScalarAggDecorrelationAggregate, ruleScalarAggDecorrelationFilter, ruleScalarAggDecorrelationSort } from './rules/subquery/rule-scalar-agg-decorrelation.js';
 import { ruleAntiJoinFkEmpty } from './rules/subquery/rule-anti-join-fk-empty.js';
 import { ruleSemiJoinFkTrivial } from './rules/subquery/rule-semi-join-fk-trivial.js';
@@ -618,6 +618,26 @@ const RULE_MANIFEST: readonly RuleManifestEntry[] = [
 		nodeType: PlanNodeType.Sort,
 		phase: 'rewrite',
 		fn: ruleScalarAggDecorrelationSort,
+		// Changes the inner subquery subtree's execution count (per outer row →
+		// once) — refuses when the inner subtree carries a write.
+		sideEffectMode: 'aware',
+	},
+
+	// SELECT-list match site for EXISTS/IN decorrelation: a correlated EXISTS /
+	// NOT EXISTS / IN in a ProjectNode's expressions becomes a LEFT join carrying
+	// an `exists right as` match flag, with the subquery node replaced by a flag
+	// column reference (every outer row survives — a semi/anti join cannot express
+	// this). Registered adjacent to its decorrelation siblings; ordering relative
+	// to the earlier-registered Project-typed flag rules (join-existence-pruning,
+	// the recovery rules) is not load-bearing — the per-node applyRules fixpoint
+	// re-offers every rule whenever a transform mints a new node, so they see the
+	// flag-bearing Project produced here in the same loop.
+	{
+		pass: PassId.Structural,
+		id: 'exists-in-select-decorrelation',
+		nodeType: PlanNodeType.Project,
+		phase: 'rewrite',
+		fn: ruleExistsInSelectDecorrelation,
 		// Changes the inner subquery subtree's execution count (per outer row →
 		// once) — refuses when the inner subtree carries a write.
 		sideEffectMode: 'aware',

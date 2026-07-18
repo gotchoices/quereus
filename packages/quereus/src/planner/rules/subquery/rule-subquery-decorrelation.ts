@@ -16,19 +16,30 @@
  * - Correlation predicate is a simple equi-join condition (col = col across inner/outer)
  *
  * NOT IN is deferred due to NULL semantics complexity.
+ *
+ * A SECOND ANCHOR (`ruleExistsInSelectDecorrelation`, ProjectNode) handles the
+ * same subqueries appearing in a SELECT list, where a semi/anti join cannot be
+ * used (every outer row must survive, with the match reported as a column).
+ * Each recognized subquery becomes a LEFT join carrying an `exists right as`
+ * match flag (`ExistenceColumnSpec`), and the subquery node in the projection
+ * is replaced by a reference to the flag column. See the section header further
+ * down for the fan-out and IN NULL-semantics gates.
  */
 
 import { createLogger } from '../../../common/logger.js';
-import type { PlanNode, ScalarPlanNode, RelationalPlanNode } from '../../nodes/plan-node.js';
-import { isRelationalNode } from '../../nodes/plan-node.js';
+import type { ScalarPlanNode, RelationalPlanNode, Attribute } from '../../nodes/plan-node.js';
+import { isRelationalNode, PlanNode } from '../../nodes/plan-node.js';
 import type { OptContext } from '../../framework/context.js';
 import { FilterNode } from '../../nodes/filter.js';
 import { JoinNode, type JoinType } from '../../nodes/join-node.js';
+import { EXISTENCE_FLAG_TYPE } from '../../nodes/join-utils.js';
+import { ProjectNode } from '../../nodes/project-node.js';
+import { DistinctNode } from '../../nodes/distinct-node.js';
 import { ExistsNode, InNode } from '../../nodes/subquery.js';
 import { UnaryOpNode } from '../../nodes/scalar.js';
 import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
-import { isCorrelatedSubquery } from '../../cache/correlation-detector.js';
+import { isCorrelatedSubquery, collectExternalReferences } from '../../cache/correlation-detector.js';
 import { PlanNodeType } from '../../nodes/plan-node-type.js';
 import { splitConjuncts, combineConjuncts } from '../../analysis/predicate-conjuncts.js';
 import { isEquiCorrelation, collectDefinedAttrIds, referencesAnyAttr } from '../../analysis/equi-correlation.js';
@@ -340,4 +351,258 @@ export function ruleSubqueryDecorrelation(node: PlanNode, _context: OptContext):
 	}
 
 	return joinNode;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * SELECT-list EXISTS / IN decorrelation (existence-flag left join)
+ *
+ * `select o.id, exists(select 1 from c where c.fk = o.k) as f from o` cannot
+ * become a semi join (that would drop non-matching outer rows); instead each
+ * recognized correlated EXISTS / IN in a ProjectNode's expressions becomes a
+ * LEFT join carrying an `exists right as` match flag (`ExistenceColumnSpec`),
+ * and the subquery node is replaced by a reference to the flag column:
+ *
+ *   Project[ o.id, <flag ref> AS f ]
+ *     LeftJoin[ c.fk = o.k ] exists right as <flag>
+ *       o
+ *       Distinct(Project[key cols](Filter(residual, c)))
+ *
+ * Fan-out: `emitLoopJoin` drives the flag join as a plain left join, so K
+ * matching inner rows would duplicate the outer row K times. EXISTS only cares
+ * about presence, so the inner side is collapsed to at most one row per
+ * correlation key: an attribute-id-preserving projection onto the key columns
+ * under a DISTINCT. (`distinct-elimination` drops the DISTINCT again when the
+ * key is already unique, and `nested-loop-right-cache` materializes the — now
+ * uncorrelated — right side once.)
+ *
+ * NOT EXISTS / NOT IN need no special casing: the rewrite fires on the inner
+ * ExistsNode/InNode and the enclosing NOT survives over the two-valued flag.
+ *
+ * IN NULL semantics: a projected `x IN S` is three-valued — it yields NULL
+ * (not FALSE) when there is no match but x is NULL or S contains a NULL. The
+ * flag is a clean two-valued boolean, so the rewrite is exact only when both
+ * comparison sides are statically non-nullable; otherwise bail (the per-row
+ * path keeps the NULL/unknown result). This also makes an enclosing NOT — the
+ * NOT IN form — exact. EXISTS is two-valued and needs no such gate.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+export function ruleExistsInSelectDecorrelation(node: PlanNode, _context: OptContext): PlanNode | null {
+	if (!(node instanceof ProjectNode)) return null;
+
+	const candidates = collectProjectionCandidates(node.projections.map(p => p.node));
+	if (candidates.length === 0) return null;
+
+	const outer = node.source;
+	const outerAttrIds = new Set(outer.getAttributes().map(a => a.id));
+
+	// One existence-flag LEFT join per recognized subquery, stacked left-deep in
+	// collection order (the outer's attributes stay visible through every join,
+	// so later candidates' correlations still resolve).
+	let currentSource: RelationalPlanNode = outer;
+	const replacements = new Map<ScalarPlanNode, ScalarPlanNode>();
+	for (const cand of candidates) {
+		const rewrite = decorrelateExistsInProjection(cand, outerAttrIds, currentSource);
+		if (!rewrite) continue;
+		currentSource = rewrite.join;
+		replacements.set(cand, rewrite.flagRef);
+	}
+	if (replacements.size === 0) return null;
+
+	log('Decorrelated %d SELECT-list EXISTS/IN subquery(ies) into existence-flag left join(s)', replacements.size);
+
+	// Rebuild the projection over the join stack, preserving output attribute
+	// ids so consumers above resolve unchanged (mirrors the scalar-agg rule's
+	// rebuildProject). preserveInputColumns is threaded verbatim.
+	const attributes = node.getAttributes();
+	const newProjections = node.projections.map((p, i) => ({
+		node: substituteInScalar(p.node, replacements),
+		alias: p.alias,
+		attributeId: attributes[i].id,
+	}));
+	return new ProjectNode(node.scope, currentSource, newProjections, undefined, attributes, node.preserveInputColumns);
+}
+
+/**
+ * Collect correlated-decorrelation candidates (ExistsNode, or subquery-variant
+ * InNode) across the projection expression trees, deduplicated by identity in
+ * deterministic pre-order. A recognized node is a leaf for this walk — its
+ * relational body is not descended (a nested subquery inside it stays part of
+ * its branch).
+ */
+function collectProjectionCandidates(exprs: readonly ScalarPlanNode[]): Array<ExistsNode | InNode> {
+	const out: Array<ExistsNode | InNode> = [];
+	const seen = new Set<ScalarPlanNode>();
+	const walk = (expr: ScalarPlanNode): void => {
+		if (expr instanceof ExistsNode || (expr instanceof InNode && expr.source && !expr.values)) {
+			if (!seen.has(expr)) {
+				seen.add(expr);
+				out.push(expr);
+			}
+			return;
+		}
+		for (const child of expr.getChildren()) {
+			if (child.getType().typeClass === 'scalar') {
+				walk(child as ScalarPlanNode);
+			}
+		}
+	};
+	for (const expr of exprs) walk(expr);
+	return out;
+}
+
+/**
+ * Rebuild a scalar expression with each mapped node replaced by its substitute,
+ * leaving wrappers (NOT, CASE, arithmetic) intact. Relational children (the
+ * subquery bodies themselves) are never descended.
+ */
+function substituteInScalar(
+	expr: ScalarPlanNode,
+	replacements: ReadonlyMap<ScalarPlanNode, ScalarPlanNode>,
+): ScalarPlanNode {
+	const direct = replacements.get(expr);
+	if (direct) return direct;
+
+	const children = expr.getChildren();
+	if (children.length === 0) return expr;
+
+	const newChildren: PlanNode[] = [];
+	let changed = false;
+	for (const child of children) {
+		if (child.getType().typeClass === 'scalar') {
+			const replaced = substituteInScalar(child as ScalarPlanNode, replacements);
+			newChildren.push(replaced);
+			if (replaced !== child) changed = true;
+		} else {
+			newChildren.push(child);
+		}
+	}
+	if (!changed) return expr;
+	return expr.withChildren(newChildren) as ScalarPlanNode;
+}
+
+/** Visit every ColumnReferenceNode in a scalar expression tree (scalar children only). */
+function visitColumnRefs(node: ScalarPlanNode, visit: (ref: ColumnReferenceNode) => void): void {
+	if (node instanceof ColumnReferenceNode) {
+		visit(node);
+		return;
+	}
+	for (const child of node.getChildren()) {
+		if (child.getType().typeClass === 'scalar') {
+			visitColumnRefs(child as ScalarPlanNode, visit);
+		}
+	}
+}
+
+/**
+ * Attempt to decorrelate one SELECT-list EXISTS/IN subquery into an
+ * existence-flag LEFT join over `leftSource`. Returns null (leaving the
+ * subquery on the per-row path) when any recognition or safety gate fails.
+ * Never mutates the original tree.
+ */
+function decorrelateExistsInProjection(
+	cand: ExistsNode | InNode,
+	outerAttrIds: Set<number>,
+	leftSource: RelationalPlanNode,
+): { join: JoinNode; flagRef: ColumnReferenceNode } | null {
+	const subqueryRoot = cand instanceof ExistsNode ? cand.subquery : cand.source;
+	if (!subqueryRoot) return null;
+
+	// Correlated, and every external reference resolves to the immediate outer —
+	// deeper correlation cannot be captured by a join against `leftSource`.
+	const external = collectExternalReferences(subqueryRoot);
+	if (external.size === 0) return null;
+	for (const id of external) {
+		if (!outerAttrIds.has(id)) return null;
+	}
+
+	// Per-row firing of a side-effecting inner is contractually observable.
+	if (PlanNodeCharacteristics.subtreeHasSideEffects(subqueryRoot)) return null;
+
+	// IN three-valued-logic gate: both comparison sides must be non-nullable for
+	// the two-valued flag to be exact (see the section header).
+	if (cand instanceof InNode) {
+		if (!(cand.condition instanceof ColumnReferenceNode)) return null;
+		if (cand.condition.getType().nullable) return null;
+		const innerAttrs = subqueryRoot.getAttributes();
+		if (innerAttrs.length === 0 || innerAttrs[0].type.nullable) return null;
+	}
+
+	const extraction = cand instanceof ExistsNode
+		? extractExistsCorrelation(cand.subquery, outerAttrIds)
+		: extractInCorrelation(cand, outerAttrIds);
+	if (!extraction) return null;
+	const { innerSource, correlationCondition, residualInnerFilter } = extraction;
+
+	const filteredInner: RelationalPlanNode = residualInnerFilter
+		? new FilterNode(innerSource.scope, innerSource, residualInnerFilter)
+		: innerSource;
+
+	// Inner-side correlation key columns: every non-outer column the join
+	// condition references. Each must be a top-level column of the inner source;
+	// an id the source does not expose (a deep-projected column, or an IN whose
+	// first column is computed and so carries a fresh attribute id) cannot be
+	// re-exposed by the key projection — bail.
+	const innerAttrByIdx = new Map(filteredInner.getAttributes().map((a, i) => [a.id, { attr: a, index: i }]));
+	const keyIds: number[] = [];
+	const seenKeys = new Set<number>();
+	visitColumnRefs(correlationCondition, ref => {
+		if (!outerAttrIds.has(ref.attributeId) && !seenKeys.has(ref.attributeId)) {
+			seenKeys.add(ref.attributeId);
+			keyIds.push(ref.attributeId);
+		}
+	});
+	if (keyIds.length === 0) return null;
+
+	const keyAttrs: Attribute[] = [];
+	const keyProjections: Array<{ node: ScalarPlanNode; attributeId: number }> = [];
+	for (const id of keyIds) {
+		const found = innerAttrByIdx.get(id);
+		if (!found) return null;
+		keyAttrs.push(found.attr);
+		keyProjections.push({
+			node: new ColumnReferenceNode(
+				innerSource.scope,
+				{ type: 'column', name: found.attr.name },
+				found.attr.type,
+				found.attr.id,
+				found.index,
+			),
+			attributeId: found.attr.id,
+		});
+	}
+
+	// Collapse the inner side to at most one row per correlation key (the
+	// fan-out guard — see the section header). The key projection preserves the
+	// correlation attribute ids, so the extracted condition serves verbatim as
+	// the join condition.
+	const keyProject = new ProjectNode(innerSource.scope, filteredInner, keyProjections, undefined, keyAttrs, false);
+	const distinctRight = new DistinctNode(innerSource.scope, keyProject);
+
+	// Correctness backstop: the built right side must be fully decorrelated (an
+	// outer reference outside the extracted conjuncts would re-correlate it).
+	if (collectExternalReferences(distinctRight).size !== 0) return null;
+
+	const flagAttrId = PlanNode.nextAttrId();
+	const flagName = `__exists_${flagAttrId}`;
+	const join = new JoinNode(
+		cand.scope,
+		leftSource,
+		distinctRight,
+		'left',
+		correlationCondition,
+		undefined,
+		[{ attrId: flagAttrId, name: flagName, side: 'right' }],
+	);
+	// The flag column sits after both sides in the join's output.
+	const flagRef = new ColumnReferenceNode(
+		cand.scope,
+		{ type: 'column', name: flagName },
+		EXISTENCE_FLAG_TYPE,
+		flagAttrId,
+		leftSource.getAttributes().length + keyAttrs.length,
+	);
+
+	log('Decorrelated SELECT-list %s subquery into existence-flag LEFT JOIN on %d key(s)',
+		cand instanceof ExistsNode ? 'EXISTS' : 'IN', keyAttrs.length);
+	return { join, flagRef };
 }
