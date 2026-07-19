@@ -23,19 +23,29 @@ the memory vtab), plus one `applyMaintenance` round-trip per row. 1000 rows x 2 
 scheduler invocations to produce 112 backing rows. On a store-backed vtab each invocation adds
 awaited storage reads/writes, which is why the reporter saw ~2.9 ms/row/MV.
 
-The code and docs already anticipate this fix:
+The code already anticipates this fix — every seam below was verified in source (do not trust
+`docs/todo.md` alone; it has not been maintained, though its "Statement-level op-coalescing"
+entry was confirmed accurate against code):
 
 - `applyForwardResidual` doc comment: "Batching/dedup across a whole statement is an
   affordability optimization deferred with the statement-flush boundary."
-- `docs/todo.md` § "Statement-level op-coalescing for the incremental arms" is exactly this item.
 - `MaintenancePlanCommon.sourceStats` is retained "so the DML boundary can re-cost residual vs.
   rebuild against the actual changeCardinality".
-- `shouldDegradeToRebuild` (`planner/cost/index.ts` ~line 370) is the dormant per-statement
-  demotion test; every residual plan already carries a dormant `degradeToRebuild: boolean`.
+- `shouldDegradeToRebuild` (`planner/cost/index.ts:377`) is the dormant per-statement demotion
+  test (`maintenanceCost('residual-recompute', k, stats) > maintenanceCost('full-rebuild', k,
+  stats)` — pass the statement's distinct affected-key count as `k`); every residual plan
+  already carries a dormant `degradeToRebuild: boolean`.
 - The full-rebuild floor is **already** deferred to a once-per-statement flush
   (`deferredRebuilds` set in `dml-executor.ts` -> `_flushDeferredRebuilds`), including the OR
-  FAIL drain path and the worklist-rounds MV-over-MV cascade. This ticket extends that exact
+  FAIL drain path (dml-executor.ts ~620-645) and the worklist-rounds MV-over-MV cascade
+  (`assertFlushRounds`, `database-materialized-views.ts:743`). This ticket extends that exact
   pattern to the residual arms.
+- `lookupCoveringConflicts` (`database-materialized-views.ts:986`) hard-returns `[]` for any
+  non-`'inverse-projection'` plan kind — the enforcement-visibility soundness of deferring the
+  residual arms rests on this line, verified, not on documentation.
+- `ingestExternalRowChanges` (`database-external-changes.ts:168-236`) already creates one
+  `BackingConnectionCache` + one deferred-rebuild set per batch and flushes at the batch
+  boundary — the residual key batch slots into the same lifecycle.
 
 ## Design
 
@@ -157,6 +167,9 @@ TODO
   full-rebuild diff for that statement when cheaper
 - Unify cascade drain with `flushDeferredRebuilds` worklist rounds
 - Keep `'inverse-projection'` per-row-immediate; verify covering-UNIQUE intra-statement test
+- Extend `findRowTimeCoveringStructure` (database-materialized-views.ts ~908) to decline every
+  non-`'inverse-projection'` plan from synchronous covering probes, not just `'full-rebuild'` —
+  defense-in-depth parity now that residual backings also lag mid-statement
 - Wire `ingestExternalRowChanges` to batch across its change array
 - Preserve derived-row validation + coarsening telemetry at flush
 - Update docs: mv-maintenance.md, invariants.md MV-003, todo.md, materialized-views.md
