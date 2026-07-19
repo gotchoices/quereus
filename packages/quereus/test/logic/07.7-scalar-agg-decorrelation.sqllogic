@@ -152,14 +152,20 @@ SELECT p.id, (SELECT count(*) FROM c WHERE c.pid = p.id) AS n FROM p ORDER BY (S
 SELECT p.id FROM p WHERE p.k IS NOT NULL ORDER BY p.k, (SELECT count(*) FROM c WHERE c.pid = p.id), p.id;
 → [{"id":4},{"id":1},{"id":2}]
 
--- NOTE: an ORDER BY over a GROUP BY aggregate query (`… group by p.k order by
--- (select count(*) from d where d.k = p.k)`) cannot be pinned here yet: an
--- aggregate scalar subquery in that ORDER BY currently mis-resolves its inner
--- count() to the OUTER aggregate's output alias and throws "Scalar subquery
--- returned more than one row" — a pre-existing planner scope-leak bug that also
--- reproduces with an uncorrelated subquery and with all decorrelation disabled,
--- so it is independent of this rule. Tracked in
--- fix/order-by-aggregate-subquery-scope-leak; re-add a case here when it lands.
+-- ORDER BY an aggregate scalar subquery over a GROUP BY query. The subquery's
+-- own count() must resolve as its OWN aggregate, not fingerprint-match the outer
+-- query's count() and bind to its output alias (the scope-leak fixed by
+-- fix/order-by-aggregate-subquery-scope-leak — a nested SELECT no longer inherits
+-- the enclosing query's aggregate context).
+-- Correlated form: order groups by children-per-key. d.k matches: k=10→2, k=20→1,
+-- k=null→0 (null = null is never true), so null sorts first, then 20, then 10.
+SELECT p.k, count(*) AS cnt FROM p GROUP BY p.k ORDER BY (SELECT count(*) FROM d WHERE d.k = p.k), p.k;
+→ [{"k":null,"cnt":1},{"k":20,"cnt":1},{"k":10,"cnt":2}]
+
+-- Uncorrelated form (also broke before the fix): the subquery is a constant 4 for
+-- every group, so the sort collapses to the p.k tiebreak (NULLs first on ASC).
+SELECT p.k, count(*) AS cnt FROM p GROUP BY p.k ORDER BY (SELECT count(*) FROM d), p.k;
+→ [{"k":null,"cnt":1},{"k":10,"cnt":2},{"k":20,"cnt":1}]
 
 -- Stripping projection: p.k is not selected, so the correlation column is absent
 -- from the Sort's source and the subquery stays correlated — still correct (the

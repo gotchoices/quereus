@@ -103,10 +103,25 @@ export function buildSelectStmt(
 
 	let input: RelationalPlanNode = fromTables[0];
 
-	// Plan WHERE clause
+	// Plan WHERE clause. An enclosing aggregate query's `aggregates` context is
+	// still visible here so a correlated outer-aggregate reference in a subquery's
+	// WHERE (e.g. `… where lim.cap = sum(ord.amt)`, sum from the outer GROUP BY)
+	// resolves to that outer aggregate's output column.
 	if (stmt.where) {
 		const whereExpression = buildExpression(selectContext, stmt.where);
 		input = new FilterNode(selectScope, input, whereExpression);
+	}
+
+	// From here on this SELECT collects and resolves its OWN aggregates. Drop any
+	// enclosing query's aggregate context so a nested aggregate this level
+	// introduces — e.g. `(select count(*) from c)` in the ORDER BY of a GROUP BY
+	// query — is not fingerprint-matched against an outer aggregate in
+	// buildFunctionCall and bound to the outer output alias (which degenerates the
+	// subquery into a multi-row column read: "Scalar subquery returned more than
+	// one row"). This level repopulates `aggregates` for its own HAVING/ORDER BY
+	// once buildAggregatePhase has built them. (fix/order-by-aggregate-subquery-scope-leak)
+	if (selectContext.aggregates) {
+		selectContext = { ...selectContext, aggregates: undefined };
 	}
 
 	// Build projections based on the SELECT list
