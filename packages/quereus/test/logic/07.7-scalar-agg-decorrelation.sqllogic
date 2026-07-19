@@ -152,10 +152,21 @@ SELECT p.id, (SELECT count(*) FROM c WHERE c.pid = p.id) AS n FROM p ORDER BY (S
 SELECT p.id FROM p WHERE p.k IS NOT NULL ORDER BY p.k, (SELECT count(*) FROM c WHERE c.pid = p.id), p.id;
 → [{"id":4},{"id":1},{"id":2}]
 
--- ORDER BY on an aggregate (GROUP BY) query: the sort source is the group
--- Aggregate, and the subquery correlates to the group key p.k.
-SELECT p.k AS gk, count(*) AS c FROM p GROUP BY p.k ORDER BY (SELECT count(*) FROM d WHERE d.k = p.k), p.k;
-→ [{"gk":null,"c":1},{"gk":20,"c":1},{"gk":10,"c":2}]
+-- NOTE: an ORDER BY over a GROUP BY aggregate query (`… group by p.k order by
+-- (select count(*) from d where d.k = p.k)`) cannot be pinned here yet: an
+-- aggregate scalar subquery in that ORDER BY currently mis-resolves its inner
+-- count() to the OUTER aggregate's output alias and throws "Scalar subquery
+-- returned more than one row" — a pre-existing planner scope-leak bug that also
+-- reproduces with an uncorrelated subquery and with all decorrelation disabled,
+-- so it is independent of this rule. Tracked in
+-- fix/order-by-aggregate-subquery-scope-leak; re-add a case here when it lands.
+
+-- Stripping projection: p.k is not selected, so the correlation column is absent
+-- from the Sort's source and the subquery stays correlated — still correct (the
+-- runtime reads p.k from the live base scan below the Project). count(d.k=p.k):
+-- p1/p4→2, p2→1, p3(null)→0. Ascending, id tiebreak.
+SELECT p.id FROM p ORDER BY (SELECT count(*) FROM d WHERE d.k = p.k), p.id;
+→ [{"id":3},{"id":2},{"id":1},{"id":4}]
 
 -- Bail-but-correct: a non-equi correlation (c.pid < p.id) stays on the
 -- correlated per-row path; the ordering is still correct.

@@ -102,6 +102,19 @@
  *     their original indices (the LEFT join places the outer on the left), so
  *     that projection — and everything above — resolves unchanged.
  *
+ *     SCOPE: like every site, `decorrelateOne` requires the correlation columns
+ *     to be attributes of the Sort's OWN source. That holds for identity
+ *     projections (`select o.* … order by (select … where c.fk = o.k)`) and
+ *     for any query that also selects the correlation column. When the SELECT
+ *     list projects the correlation column AWAY (`select o.id from o order by
+ *     (select … where c.fk = o.k)`), the Sort sits above a stripping Project
+ *     whose output no longer carries `o.k`, so the rule BAILS and the subquery
+ *     stays correlated — still correct, because the runtime resolves `o.k` from
+ *     the still-live base-scan row context below the Project; it is merely not
+ *     decorrelated. Threading the grouped value column up through a stripping
+ *     Project is tracked in
+ *     `backlog/feat-decorrelate-order-by-subquery-nonselected-column`.
+ *
  * NESTED subqueries converge level by level: the Structural pass is top-down
  * with rules firing BEFORE descent, so the grouped aggregate built by one
  * level's rewrite (whose aggregate argument carries the next level's subquery,
@@ -266,6 +279,12 @@ export function ruleScalarAggDecorrelationSort(node: PlanNode, _context: OptCont
 	const candidates = collectCandidates(node.sortKeys.map(k => k.expression));
 	if (candidates.length === 0) return null;
 
+	// NOTE: decorrelateAll requires the correlation columns to be in this Sort's
+	// OWN source. A `select o.id from o order by (select … where c.fk = o.k)`
+	// puts the Sort above a Project that stripped o.k, so decorrelateOne bails and
+	// the subquery stays correlated (still correct — the runtime reads o.k from the
+	// live base-scan context below the Project). Pushing the join through a
+	// stripping Project is backlog/feat-decorrelate-order-by-subquery-nonselected-column.
 	// Original Sort attributes (= its source's) — the signature the cap restores.
 	const sortAttrs = node.getAttributes();
 

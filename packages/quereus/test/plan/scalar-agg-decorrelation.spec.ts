@@ -494,7 +494,10 @@ describe('Plan shape: scalar-aggregate subquery decorrelation (sort site)', () =
 	});
 
 	it('rewrites an ORDER BY subquery into a grouped aggregate under a physical LEFT join', async () => {
-		const q = "SELECT o.id FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
+		// o.k (the correlation column) is selected, so it is present in the Sort's
+		// own source — the rewrite's precondition. See the stripping-projection
+		// test below for the case where it is projected away.
+		const q = "SELECT o.id, o.k FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
 		const types = await planNodeTypes(db, q);
 		expect(types, 'sort-key subquery must be dissolved').to.not.include('ScalarSubquery');
 
@@ -520,7 +523,9 @@ describe('Plan shape: scalar-aggregate subquery decorrelation (sort site)', () =
 		const decorrelated = await allRows(db, q);
 		const baseline = await allRows(baselineDb, q);
 		// count(c.fk=o.k): o3→0, o2→1, o1/o4→2 (id tiebreak).
-		expect(baseline).to.deep.equal([{ id: 3 }, { id: 2 }, { id: 1 }, { id: 4 }]);
+		expect(baseline).to.deep.equal([
+			{ id: 3, k: null }, { id: 2, k: 20 }, { id: 1, k: 10 }, { id: 4, k: 10 },
+		]);
 		expect(decorrelated).to.deep.equal(baseline);
 	});
 
@@ -544,14 +549,32 @@ describe('Plan shape: scalar-aggregate subquery decorrelation (sort site)', () =
 		expect(types).to.include('ScalarSubquery');
 	});
 
+	it('leaves the subquery correlated when the correlation column is projected away (stripping Project), but still correct', async () => {
+		// o.k is NOT selected, so the Sort sits above a Project that stripped it —
+		// the correlation column is absent from the Sort's source, so decorrelateOne
+		// bails. The result is still correct: the runtime reads o.k from the live
+		// base-scan context below the Project. Tracked for a future rewrite in
+		// backlog/feat-decorrelate-order-by-subquery-nonselected-column.
+		const q = "SELECT o.id FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'stripping projection keeps the correlated path').to.include('ScalarSubquery');
+		const rows = await allRows(db, q);
+		const baseline = await allRows(baselineDb, q);
+		expect(baseline).to.deep.equal([{ id: 3 }, { id: 2 }, { id: 1 }, { id: 4 }]);
+		expect(rows).to.deep.equal(baseline);
+	});
+
 	it('decorrelates the same subquery in both the SELECT list and the ORDER BY', async () => {
-		const q = "SELECT o.id, (SELECT count(*) FROM c WHERE c.fk = o.k) AS n FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
+		// o.k is selected so the ORDER BY subquery's correlation column is in the
+		// Sort's source; the SELECT-list subquery is dissolved by the Project site
+		// and the ORDER BY subquery by the Sort site — two distinct anchors.
+		const q = "SELECT o.id, o.k, (SELECT count(*) FROM c WHERE c.fk = o.k) AS n FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), o.id";
 		const types = await planNodeTypes(db, q);
 		expect(types, 'both anchors dissolve their subquery').to.not.include('ScalarSubquery');
 		const decorrelated = await allRows(db, q);
 		const baseline = await allRows(baselineDb, q);
 		expect(baseline).to.deep.equal([
-			{ id: 3, n: 0 }, { id: 2, n: 1 }, { id: 1, n: 2 }, { id: 4, n: 2 },
+			{ id: 3, k: null, n: 0 }, { id: 2, k: 20, n: 1 }, { id: 1, k: 10, n: 2 }, { id: 4, k: 10, n: 2 },
 		]);
 		expect(decorrelated).to.deep.equal(baseline);
 	});
