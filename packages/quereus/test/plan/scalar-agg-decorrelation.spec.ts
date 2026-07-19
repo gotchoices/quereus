@@ -578,4 +578,31 @@ describe('Plan shape: scalar-aggregate subquery decorrelation (sort site)', () =
 		]);
 		expect(decorrelated).to.deep.equal(baseline);
 	});
+
+	it('decorrelates two distinct correlated subqueries in one ORDER BY (stacked joins)', async () => {
+		// Two different aggregates (count then sum) on the same correlation column:
+		// decorrelateAll stacks a second LEFT join on the first, and each
+		// replacement's value-column index is computed against its own left source,
+		// so both sort keys read the correct grouped column. o.k is selected to keep
+		// the correlation column in the Sort's source.
+		const q = "SELECT o.id, o.k FROM o ORDER BY (SELECT count(*) FROM c WHERE c.fk = o.k), (SELECT sum(c.amount) FROM c WHERE c.fk = o.k), o.id";
+		const types = await planNodeTypes(db, q);
+		expect(types, 'both ORDER BY subqueries must be dissolved').to.not.include('ScalarSubquery');
+
+		// Two grouped aggregates, one per subquery, both under LEFT joins.
+		const rows = await planRows(db, q);
+		const aggs = rows.filter(r =>
+			(r.node_type === 'HashAggregate' || r.node_type === 'StreamAggregate')
+			&& r.detail.includes('GROUP BY'));
+		expect(aggs.length, 'one grouped aggregate per decorrelated subquery').to.equal(2);
+
+		const decorrelated = await allRows(db, q);
+		const baseline = await allRows(baselineDb, q);
+		// count(c.fk=o.k): o3→0, o2→1, o1/o4→2. sum(c.amount) breaks the o1/o4 tie:
+		// both k=10 so both sum=12 → falls through to the o.id tiebreak.
+		expect(baseline).to.deep.equal([
+			{ id: 3, k: null }, { id: 2, k: 20 }, { id: 1, k: 10 }, { id: 4, k: 10 },
+		]);
+		expect(decorrelated).to.deep.equal(baseline);
+	});
 });
