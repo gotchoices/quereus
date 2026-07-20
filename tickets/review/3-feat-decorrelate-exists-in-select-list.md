@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-19T04:59:52.406Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\3-feat-decorrelate-exists-in-select-list.review.2026-07-19T04-59-52-406Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ----
 description: Correlated EXISTS and IN subqueries in a SELECT list used to re-run the inner query once per outer row; they are now rewritten to a single left join that computes a match-flag column, keeping every outer row. Review the new optimizer rule, its NULL-semantics and fan-out gates, and the test coverage.
 prereq: feat-decorrelate-scalar-subquery-order-by
