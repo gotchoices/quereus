@@ -61,14 +61,18 @@ under this cut).
 
 Mechanism, mirroring the existing full-rebuild deferral:
 
-1. **Accumulate.** Alongside the per-statement `BackingConnectionCache` and `deferredRebuilds`
-   set, the DML generator owns a per-statement batch: per residual-arm MV, a map of affected
-   binding keys (deduped on canonical key values — `canonKeyValues` — exactly the dedup
-   `applyForwardResidual` already does within one change, extended across the statement's
-   changes). `maintainRowTime` on a residual plan records the affected key(s) (OLD ∪ NEW per
-   change, per the existing tables in `docs/mv-maintenance.md`) instead of running the residual.
-   The reverse (lookup-side) join-residual keys accumulate under their own binding so the flush
-   runs the correct residual variant per key.
+1. **Accumulate — and consolidate.** The generator currently threads two parallel
+   per-statement structures (`BackingConnectionCache`, `deferredRebuilds: Set<string>`) through
+   every maintenance call; this ticket would add a third. Do not: introduce a single
+   per-statement `MaintenanceBatch` object owning all three — the connection cache, the
+   deferred-rebuild set, and the new per-MV affected-key maps — threaded as ONE parameter with
+   one lifecycle and one flush entry point, replacing the existing `(cache, deferred)` pairs in
+   `dml-executor.ts` and `database-external-changes.ts`. Keys dedup on canonical key values
+   (`canonKeyValues` — the dedup `applyForwardResidual` already does within one change,
+   extended across the statement's changes). `maintainRowTime` on a residual plan records the
+   affected key(s) (OLD ∪ NEW per change, per the existing tables in `docs/mv-maintenance.md`)
+   instead of running the residual. The reverse (lookup-side) join-residual keys accumulate
+   under their own binding so the flush runs the correct residual variant per key.
 2. **Flush.** At the existing end-of-statement flush site (inside the statement-atomicity
    savepoint; also on the OR FAIL throw path, mirroring `deferredRebuilds`), drain the batch:
    per MV, run the residual once per distinct affected key against live post-statement state and
@@ -159,8 +163,10 @@ the enforcement rationale carries over verbatim); `docs/todo.md` § Statement-le
   `applyMaintenance` batching).
 
 TODO
-- Add per-statement residual key batch alongside `deferredRebuilds` in dml-executor; thread
-  through `maintainRowTime` for the three residual arms
+- Introduce per-statement `MaintenanceBatch` (connection cache + deferred-rebuild set +
+  residual key maps) as one threaded parameter; migrate dml-executor and
+  database-external-changes off the `(cache, deferred)` pairs; thread through
+  `maintainRowTime` for the three residual arms
 - Flush at the existing end-of-statement site (success, error-with-savepoint, OR FAIL drain);
   batch ops per `applyMaintenance` call
 - Wire `shouldDegradeToRebuild` at flush using actual distinct-key count; run `'replace-all'`

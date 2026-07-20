@@ -1,71 +1,109 @@
-description: Make aggregate materialized views maintainable by pure arithmetic on the stored group row (add/subtract the changed value) instead of re-reading the group's source rows, so maintenance cost stops growing with group size.
+description: Let aggregate functions declare their algebraic structure (how to combine and retract values) once on the function schema, then use those declarations to maintain aggregate materialized views by pure arithmetic on the stored group row — no re-reading of source rows, and user-defined aggregates participate for free.
 prereq: mv-maintenance-statement-batching
-files: packages/quereus/src/core/database-materialized-views-plans.ts, packages/quereus/src/core/database-materialized-views-plan-builders.ts, packages/quereus/src/core/database-materialized-views-apply.ts, packages/quereus/src/planner/cost/index.ts, docs/mv-maintenance.md
+files: packages/quereus/src/schema/function.ts, packages/quereus/src/func/builtins/aggregate.ts, packages/quereus/src/planner/analysis/query-rewrite-matcher.ts, packages/quereus/src/core/database-materialized-views-plans.ts, packages/quereus/src/core/database-materialized-views-plan-builders.ts, packages/quereus/src/core/database-materialized-views-apply.ts, packages/quereus/src/planner/cost/index.ts, docs/mv-maintenance.md
 ----
 ## Motivation
 
-Today a single-source aggregate MV (`select g…, sum(x), count(*) … group by g…`) is maintained
-by the `'residual-recompute'` arm: every change to a group re-runs a key-filtered re-execution
-of the body — a scheduler invocation plus a rescan of the group's source rows. Correct, but
-cost per change is O(group size) plus ~1 ms fixed scheduler overhead per invocation (measured
-on the memory vtab; the driver of the bulk-load slowdown fixed at statement granularity by
-`mv-maintenance-statement-batching`). For decomposable aggregates none of that is necessary:
-an insert of `(g, x)` can update the stored group row arithmetically — `sum += x`, `n += 1` —
-with **zero source reads**. This is the standard incremental-view-maintenance delta algebra,
-and `docs/todo.md` § "Bounded-delta arms for floor-covered shapes" already names it
-("Delta-arithmetic aggregate arm (`sum`/`count`), with a rescan-on-retraction fallback for
-`min`/`max`") — verified absent from code: the five wired plan kinds are `inverse-projection`,
-`residual-recompute`, `prefix-delete`, `join-residual`, `full-rebuild`.
+A single-source aggregate MV (`select g…, sum(x), count(*) … group by g…`) is maintained by
+the `'residual-recompute'` arm: every change to a group re-runs a key-filtered re-execution of
+the body — a scheduler invocation plus a rescan of the group's source rows, O(group size) per
+change. For algebraically well-behaved aggregates none of that is necessary: an insert of
+`(g, x)` can update the stored group row arithmetically — `sum += x`, `n += 1` — with zero
+source reads. This is standard incremental-view-maintenance delta algebra.
 
-The recombination algebra already exists once in the engine: the read-side aggregate-rollup
-matcher (docs/materialized-views.md § Aggregate rollup) carries the per-aggregate
-decomposability allowlist (`sum` recombines by sum, `count` by summed counts with the
-zero-rows coalesce, `avg` from stored sum+count, `min`/`max` by min/max of partials; anything
-`distinct` is not decomposable). The delta arm is the write-side dual of the same table and
-should share its vocabulary.
+## Design principle: declare the algebra once, on the function schema
 
-## Specification
+The engine currently knows which aggregates are decomposable in exactly one place — and it is
+the wrong place: a hardcoded name-keyed allowlist inside the read-side rollup matcher
+(`query-rewrite-matcher.ts` — the literal union `'sum' | 'count' | 'min' | 'max' | 'avg'` and
+its recombination recipes). A write-side delta arm must NOT introduce a second copy. Instead,
+follow the established advertisement pattern (`TableValuedFunctionSchema.relationalAdvertisement`):
+add an optional algebraic declaration to `AggregateFunctionSchema` (`schema/function.ts`),
+alongside the existing `stepFunction`/`finalizeFunction`/`initialValue` fold:
 
-A new bounded-delta strategy (or a fast path inside the residual arm) for single-source
-aggregate bodies whose aggregate list is entirely delta-maintainable:
+```ts
+/** Optional algebraic structure over the accumulator. Absent field = property not held. */
+algebra?: {
+	/** Commutative, associative combine of two accumulators (semigroup with the
+	 *  existing initialValue as identity). Enables partial aggregation: rollup,
+	 *  sharded/parallel aggregation, delta insert-tightening. */
+	merge?: (a: AggValue, b: AggValue) => AggValue;
+	/** Inverse of stepFunction (abelian group). Enables retraction — full delta
+	 *  maintenance under insert/update/delete. */
+	inverse?: AggregateReducer;
+}
+```
 
-- **insert** of source row in group K: if K's backing row exists, apply per-aggregate delta
-  (`sum(x) += x` with SQL NULL semantics — a NULL x contributes nothing; `count(*) += 1`;
-  `count(x) += (x is not null)`); else insert a fresh group row seeded from the single row.
-- **delete**: inverse deltas; when the maintained `count(*)` reaches 0, delete the group's
-  backing row (matches the residual arm's emptied-group point delete).
-- **update**: delta out of the OLD group, delta into the NEW group (same row when the group
-  key is unchanged).
-- **`avg`**: maintain from sum + count partials. Requires both to be available — either the
-  body already stores them, or the plan maintains hidden partial columns; design decision at
-  plan time (the read-side rollup solved the same question by requiring stored partials).
-- **`min`/`max`**: an inserted value only tightens (compare-and-store, no rescan). A
-  retraction (delete/update removing the current extremum) cannot be answered from the stored
-  scalar — fall back to the existing key-filtered residual recompute *for that group only*.
-- **Not delta-maintainable** (any `distinct` aggregate, `group_concat`, UDAFs without an
-  inverse): the body keeps the residual-recompute arm as today. Mixed bodies where only some
-  aggregates are delta-able may still delta the able ones and rescan only on the fallback
-  triggers, or simply disqualify — cost gate decides.
+Every behavior then **derives generically** — no per-function branches anywhere downstream:
+
+- `inverse` present (sum, count, total, bit-xor…): full delta maintenance — fold the
+  statement's changes into a per-group accumulator delta, apply with one read-modify-write per
+  affected group. A group whose maintained `count(*)` reaches 0 maps to the point delete.
+- `merge` only (min, max, bit_or/and, bool_or/and): inserts tighten the stored value via
+  `merge`; a retraction that could relax it falls back to the existing key-filtered residual
+  recompute *for that group only*. min/max are not special cases — "no inverse ⇒ rescan on
+  retraction" is the general rule and their behavior falls out of it.
+- neither (any `distinct` aggregate, `group_concat`, UDAFs that declare nothing): the body
+  keeps `'residual-recompute'` exactly as today. Exclusion is structural, never a name list.
+- User-defined aggregates that declare `algebra` participate in all of the above with zero
+  engine changes — the point of the seam.
+
+Consumers to unify on the declarations (this is a requirement, not an aside):
+
+1. **Write-side delta arm** (this ticket's core).
+2. **Read-side rollup matcher** — retarget `query-rewrite-matcher.ts` onto the same
+   declarations and delete the hardcoded allowlist/kind union. One source of truth; UDAF
+   rollup falls out for free. (`count`'s zero-rows `coalesce` wrapper derives from
+   `finalizeFunction(initialValue)`, the same trick `rule-scalar-agg-decorrelation.ts` already
+   uses generically.)
+3. Future, not this ticket: sharded/parallel aggregation and sliding window frames read
+   `merge`/`inverse` from the same field.
+
+## `avg`: eliminate the special case rather than generalize it
+
+`avg` is special-cased on the read side (recombine as `sum(sumCol)/sum(countCol)`, requires
+stored partials) and would need hidden partial columns on the write side. Prefer evaluating a
+**plan-time canonicalization `avg(x) → sum(x) / count(x)`** (standard in other engines): if
+sound for Quereus typing (`/` is already real division, matching native `avg`; NULL-over-empty
+falls out as NULL/0 ⇒ NULL), avg vanishes from the algebra entirely and both existing special
+cases are deleted. If canonicalization is rejected (typing or plan-shape cost), fall back to
+requiring the body to store the partials (the read-side rollup's existing stance) — but do not
+add hidden-column plumbing.
+
+## Fit with the maintenance substrate
+
+The five maintenance arms are whole-body shape matchers; a possible future unification is a
+compositional per-operator delta substrate (the "unified maintenance substrate" direction,
+which would also fold in the assertion `DeltaExecutor`). This ticket must stay
+substrate-independent: all aggregate-specific knowledge lives in the schema declarations; the
+arm (whether implemented as a sixth `kind` or a fast path inside `'residual-recompute'` —
+prefer the latter if it avoids another plan interface) is a thin generic consumer that a
+future substrate retargets without touching the declarations. Do not bake function names,
+kind unions, or recombination recipes into planner/runtime code anywhere.
 
 Interaction with `mv-maintenance-statement-batching` (prereq): deltas accumulate per (MV,
-group key) in the per-statement batch and apply as one read-modify-write per affected group at
-the statement flush — the accumulation is a fold over the statement's changes, so bulk-load
-maintenance cost becomes O(affected groups) per statement with no source rescans at all.
-The statement-batching ticket's degrade-to-rebuild gate stays as the escape for
-statements touching nearly all groups, though with deltas this arm should usually win.
+group key) in the per-statement `MaintenanceBatch` and apply as one read-modify-write per
+affected group at the statement flush. Bulk-load maintenance becomes O(affected groups) per
+statement with no source rescans; the statement-batching degrade-to-rebuild gate remains the
+escape hatch, though delta should usually win.
 
-Correctness constraints:
+## Correctness constraints
 
-- Reads-own-writes and lockstep commit/rollback semantics identical to the other bounded-delta
-  arms (same backing connection, same savepoint behavior).
-- Numeric fidelity: repeated float add/subtract drifts where a rescan would not — decide
-  policy (e.g. integer/bigint sums are exact; float sums may need a periodic or threshold-based
-  recompute, or accept drift consistent with SQL sum semantics). Must be settled at plan
-  stage, not left to the implementer.
-- The maintenance-equivalence property harness (`test/incremental/maintenance-equivalence.spec.ts`)
-  is the oracle; the delta arm must pass it unchanged, including rollback and NULL zoos.
-- Value-identical no-op suppression contract (MV-016) still applies: a delta that lands on the
-  same stored value must report nothing.
+- Reads-own-writes and lockstep commit/rollback identical to the other bounded-delta arms
+  (same backing connection, same savepoint behavior).
+- Numeric fidelity: repeated float add/subtract drifts where a rescan would not. Policy must
+  be settled at plan stage — e.g. integer/bigint accumulators delta exactly; float `sum`
+  either accepts drift consistent with SQL sum semantics or declines `inverse` (declaring
+  `merge` only, degrading gracefully to tighten+rescan). The declaration seam makes this a
+  per-function choice, not an engine branch.
+- NULL semantics derive from the existing fold: `step`/`inverse` see the same argument NULLs,
+  `count(x)` vs `count(*)` differ only in their step/inverse pair.
+- Oracle: `test/incremental/maintenance-equivalence.spec.ts` must pass unchanged, including
+  rollback and NULL zoos; extend its shape zoo with merge-only (min/max retraction) and
+  UDAF-declared-algebra cases.
+- Value-identical no-op suppression (MV-016) still applies: a delta landing on the same stored
+  value reports nothing.
 
-Cost gate: extend `maintenanceCost` with the delta strategy (per-change O(1), fallback-rescan
-probability for min/max) so the backward gate picks delta > residual > rebuild per body shape.
+Cost gate: extend `maintenanceCost` with the delta strategy (O(1) per change; expected
+rescan probability for merge-only aggregates) so the backward gate picks
+delta > residual > rebuild per body shape.
