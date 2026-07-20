@@ -75,13 +75,21 @@ const SHAPES: readonly BodyShape[] = [
 	{ label: 'expression column + partial WHERE (predicate-scope transitions)', body: 'select id, a, a * b as ab from src where k > 5' },
 ];
 
-/** One random source mutation. Key-changing updates rewrite the PK itself; collisions
- *  are tolerated (see {@link applyMutation}). */
+/** One random source mutation — single-row (point) statements plus MULTI-ROW statements
+ *  (multi-value insert, predicate update/delete matching several rows), so the property
+ *  exercises the per-statement deferred-maintenance flush (residual key batch dedup,
+ *  full-rebuild deferral) and not only the degenerate one-key statement. Key-changing
+ *  updates rewrite the PK itself; collisions are tolerated (see {@link applyMutation} —
+ *  a colliding MULTI-row statement additionally exercises statement-atomic revert of a
+ *  partially-applied batch). */
 type Mutation =
 	| { readonly kind: 'insert'; readonly id: number; readonly a: number; readonly b: number; readonly k: number }
 	| { readonly kind: 'update'; readonly id: number; readonly a: number; readonly b: number; readonly k: number }
 	| { readonly kind: 'updateKey'; readonly oldId: number; readonly newId: number; readonly a: number; readonly b: number; readonly k: number }
-	| { readonly kind: 'delete'; readonly id: number };
+	| { readonly kind: 'delete'; readonly id: number }
+	| { readonly kind: 'multiInsert'; readonly rows: readonly { readonly id: number; readonly a: number; readonly b: number; readonly k: number }[] }
+	| { readonly kind: 'updateWhere'; readonly a: number; readonly k: number; readonly kMatch: number }
+	| { readonly kind: 'deleteWhere'; readonly kMatch: number };
 
 // A small id space (so inserts/key-changes collide and predicate transitions recur)
 // and a `k` range straddling the `k > 5` boundary.
@@ -93,6 +101,17 @@ const mutationArb: fc.Arbitrary<Mutation> = fc.oneof(
 	fc.record({ kind: fc.constant('update' as const), id: idArb, a: valArb, b: valArb, k: valArb }),
 	fc.record({ kind: fc.constant('updateKey' as const), oldId: idArb, newId: idArb, a: valArb, b: valArb, k: valArb }),
 	fc.record({ kind: fc.constant('delete' as const), id: idArb }),
+	// Multi-value insert: several rows in ONE statement (intra-statement id duplicates and
+	// collisions with existing rows abort and revert the whole statement — tolerated).
+	fc.record({
+		kind: fc.constant('multiInsert' as const),
+		rows: fc.array(fc.record({ id: idArb, a: valArb, b: valArb, k: valArb }), { minLength: 2, maxLength: 4 }),
+	}),
+	// Predicate (multi-row) update: rewrites `a` AND the group column `k` for every row
+	// matching `k = kMatch` — several groups' keys move in one statement.
+	fc.record({ kind: fc.constant('updateWhere' as const), a: valArb, k: valArb, kMatch: valArb }),
+	// Predicate (multi-row) delete: removes every row of one `k` group in one statement.
+	fc.record({ kind: fc.constant('deleteWhere' as const), kMatch: valArb }),
 );
 
 function sqlFor(m: Mutation): string {
@@ -101,6 +120,9 @@ function sqlFor(m: Mutation): string {
 		case 'update': return `update src set a = ${m.a}, b = ${m.b}, k = ${m.k} where id = ${m.id}`;
 		case 'updateKey': return `update src set id = ${m.newId}, a = ${m.a}, b = ${m.b}, k = ${m.k} where id = ${m.oldId}`;
 		case 'delete': return `delete from src where id = ${m.id}`;
+		case 'multiInsert': return `insert into src (id, a, b, k) values ${m.rows.map(r => `(${r.id}, ${r.a}, ${r.b}, ${r.k})`).join(', ')}`;
+		case 'updateWhere': return `update src set a = ${m.a}, k = ${m.k} where k = ${m.kMatch}`;
+		case 'deleteWhere': return `delete from src where k = ${m.kMatch}`;
 	}
 }
 
@@ -1898,9 +1920,12 @@ describe('Materialized-view maintenance equivalence (full-rebuild floor, OR FAIL
  * Value-identical (no-op) maintenance write suppression (`mv-noop-upsert-suppression`):
  * a source write whose recomputed backing image is value-identical to the existing
  * effective backing row produces **zero effective `BackingRowChange`s** — no backing op,
- * no cascade — in every bounded-delta arm. Instrumented by wrapping the manager's
- * `applyMaintenancePlan` dispatch: its return value is exactly what drives the
- * MV-over-MV cascade, so these assertions pin what a consumer MV would observe.
+ * no cascade — in every bounded-delta arm. Instrumented by wrapping the manager's two
+ * apply seams: the per-row `applyMaintenancePlan` dispatch (the inverse-projection arm,
+ * still per-row-immediate) and the end-of-statement `applyResidualBatch` flush (the
+ * residual arms, whose accumulated statement keys recompute once at flush). Either
+ * seam's return value is exactly what drives the MV-over-MV cascade, so these
+ * assertions pin what a consumer MV would observe.
  * Regression cases pin that real changes, key-changing updates, emptied groups/fan-outs,
  * and predicate-scope transitions still report — the suppression never skips a real
  * change (the equivalence property suites above are the exhaustive oracle for that).
@@ -1909,18 +1934,22 @@ describe('Materialized-view maintenance no-op write suppression', () => {
 	interface AppliedRecord { mv: string; kind: string; changes: Array<{ op: string }> }
 	interface DispatchingManager {
 		applyMaintenancePlan(plan: { kind: string; mv: { name: string } }, ...rest: unknown[]): Promise<Array<{ op: string }>>;
+		applyResidualBatch(plan: { kind: string; mv: { name: string } }, ...rest: unknown[]): Promise<Array<{ op: string }>>;
 	}
 
-	/** Record every applyMaintenancePlan invocation: plan kind, MV name, effective changes. */
+	/** Record every apply-seam invocation (per-row dispatch + residual statement flush):
+	 *  plan kind, MV name, effective changes. */
 	function instrument(db: Database): AppliedRecord[] {
 		const records: AppliedRecord[] = [];
 		const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as DispatchingManager;
-		const orig = mgr.applyMaintenancePlan.bind(mgr);
-		mgr.applyMaintenancePlan = async (plan, ...rest) => {
-			const changes = await orig(plan, ...rest);
-			records.push({ mv: plan.mv.name, kind: plan.kind, changes });
-			return changes;
-		};
+		for (const seam of ['applyMaintenancePlan', 'applyResidualBatch'] as const) {
+			const orig = mgr[seam].bind(mgr);
+			mgr[seam] = async (plan, ...rest) => {
+				const changes = await orig(plan, ...rest);
+				records.push({ mv: plan.mv.name, kind: plan.kind, changes });
+				return changes;
+			};
+		}
 		return records;
 	}
 
@@ -2262,5 +2291,216 @@ describe('Materialized-view maintenance equivalence — negative self-test (a wr
 		try { await assertEquivalent(db, 'select id, b from src', 'sabotage'); }
 		catch (e) { caught = e; }
 		expect(caught, 'the equivalence check must red on a mismatched oracle').to.not.be.undefined;
+	});
+});
+
+/* ─────────────── residual arms — per-statement key batching + flush ─────────────── */
+
+/**
+ * The statement batching this ticket adds for the residual arms
+ * (`'residual-recompute'` / `'prefix-delete'` / `'join-residual'`): affected binding keys
+ * accumulate (deduped) across the statement's row loop and each distinct key's residual
+ * runs ONCE at the end-of-statement flush (`applyResidualBatch`), instead of once per
+ * touching source row. These pin the observable consequences — one flush per statement
+ * with statement-wide key dedup, no per-row dispatch for residual arms, unchanged
+ * between-statement visibility inside a transaction, the per-statement
+ * degrade-to-rebuild demotion (and its stateless revert), the OR FAIL error-path drain,
+ * and a mixed-arm MV-over-MV chain converging in one statement flush. The equivalence
+ * property suites above (now with multi-row mutation statements) are the exhaustive
+ * correctness oracle; these are the mechanism pins.
+ */
+describe('Materialized-view maintenance statement batching (residual arms)', () => {
+	interface ResidualEntryLike { forward: Map<string, unknown>; lookup: Map<string, unknown>; prefix: Map<string, unknown> }
+	interface SeamRecord { seam: string; mv: string; kind: string; distinctKeys: number; changes: Array<{ op: string }> }
+	interface BatchSeamManager {
+		applyMaintenancePlan(plan: { kind: string; mv: { name: string } }, ...rest: unknown[]): Promise<Array<{ op: string }>>;
+		applyResidualBatch(plan: { kind: string; mv: { name: string } }, entry: ResidualEntryLike, ...rest: unknown[]): Promise<Array<{ op: string }>>;
+		applyReplaceAll(plan: { kind: string; mv: { name: string } }, ...rest: unknown[]): Promise<Array<{ op: string }>>;
+		rowTime: Map<string, { kind: string; sourceStats: { tableRows: number; forwardBodyCost: number; fallbackRatio?: number } }>;
+	}
+
+	function seamManager(db: Database): BatchSeamManager {
+		return (db as unknown as ManagerHandle).materializedViewManager as unknown as BatchSeamManager;
+	}
+
+	/** Record every apply-seam invocation with the MV, plan kind, and (for the residual
+	 *  flush) the batch's distinct-key count. */
+	function instrumentSeams(db: Database): SeamRecord[] {
+		const records: SeamRecord[] = [];
+		const mgr = seamManager(db);
+		const origDispatch = mgr.applyMaintenancePlan.bind(mgr);
+		mgr.applyMaintenancePlan = async (plan, ...rest) => {
+			const changes = await origDispatch(plan, ...rest);
+			records.push({ seam: 'dispatch', mv: plan.mv.name, kind: plan.kind, distinctKeys: 1, changes });
+			return changes;
+		};
+		const origBatch = mgr.applyResidualBatch.bind(mgr);
+		mgr.applyResidualBatch = async (plan, entry, ...rest) => {
+			const distinctKeys = entry.forward.size + entry.lookup.size + entry.prefix.size;
+			const changes = await origBatch(plan, entry, ...rest);
+			records.push({ seam: 'residual-flush', mv: plan.mv.name, kind: plan.kind, distinctKeys, changes });
+			return changes;
+		};
+		const origReplace = mgr.applyReplaceAll.bind(mgr);
+		mgr.applyReplaceAll = async (plan, ...rest) => {
+			const changes = await origReplace(plan, ...rest);
+			records.push({ seam: 'replace-all', mv: plan.mv.name, kind: plan.kind, distinctKeys: 0, changes });
+			return changes;
+		};
+		return records;
+	}
+
+	/** Read a body LIVE (read-side MV rewrite disabled), as an order-insensitive multiset —
+	 *  the multi-MV analogue of {@link assertEquivalent}'s oracle read. */
+	async function readOracle(db: Database, body: string): Promise<string[]> {
+		const prev = db.optimizer.tuning;
+		db.optimizer.updateTuning({ ...prev, disabledRules: new Set([...(prev.disabledRules ?? []), 'materialized-view-rewrite']) });
+		try {
+			return await readMultiset(db, body);
+		} finally {
+			db.optimizer.updateTuning(prev);
+		}
+	}
+
+	describe('aggregate (residual-recompute) arm', () => {
+		let db: Database;
+		const body = 'select k, count(*) as c, sum(a) as s from src group by k';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+			await db.exec('insert into src (id, a, b, k) values (1, 1, 0, 1), (2, 2, 0, 2)');
+			await db.exec(`create materialized view mv as ${body}`);
+			expect(registeredPlanKind(db, 'mv')).to.equal('residual-recompute');
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('a multi-row statement flushes ONCE with statement-wide key dedup (no per-row dispatch)', async () => {
+			const records = instrumentSeams(db);
+			// 6 rows, 2 distinct groups (k=1, k=2), one statement.
+			await db.exec('insert into src (id, a, b, k) values (10, 1, 0, 1), (11, 2, 0, 1), (12, 3, 0, 1), (13, 4, 0, 2), (14, 5, 0, 2), (15, 6, 0, 2)');
+			const flushes = records.filter(r => r.mv === 'mv' && r.seam === 'residual-flush');
+			expect(flushes.length, 'exactly one residual flush for the statement').to.equal(1);
+			expect(flushes[0].distinctKeys, '6 touching rows dedup to 2 distinct group keys').to.equal(2);
+			expect(records.filter(r => r.mv === 'mv' && r.seam === 'dispatch'), 'no per-row dispatch for a residual arm').to.deep.equal([]);
+			await assertEquivalent(db, body, 'after batched multi-row insert');
+		});
+
+		it('between-statement reads inside a transaction see maintained state; rollback reverts', async () => {
+			await db.exec('begin');
+			try {
+				await db.exec('insert into src (id, a, b, k) values (10, 5, 0, 1), (11, 7, 0, 3)');
+				// The statement flush already ran — a same-transaction read between
+				// statements must see the maintained state (the MV is contractually
+				// indistinguishable from the plain view).
+				await assertEquivalent(db, body, 'between statements, same transaction');
+				await db.exec('delete from src where k = 1');
+				await assertEquivalent(db, body, 'after second statement, same transaction');
+			} finally {
+				await db.exec('rollback');
+			}
+			await assertEquivalent(db, body, 'post-rollback');
+		});
+
+		it('OR FAIL: the error-path drain still flushes the surviving rows into the backing', async () => {
+			let caught: unknown;
+			try {
+				// Row (20) succeeds, row (1) collides with the seeded PK — OR FAIL keeps
+				// the surviving row and aborts the statement.
+				await db.exec('insert or fail into src (id, a, b, k) values (20, 9, 0, 7), (1, 1, 0, 1)');
+			} catch (e) { caught = e; }
+			expect(caught, 'the duplicate PK must abort the statement').to.not.be.undefined;
+			// The k=7 group from the surviving row must be maintained (flushed on the
+			// throw path), or read(MV) would lag evaluate(body) mid-transaction.
+			await assertEquivalent(db, body, 'after OR FAIL abort with surviving rows');
+		});
+
+		it('OR IGNORE / OR REPLACE multi-row statements stay equivalent', async () => {
+			await db.exec('insert or ignore into src (id, a, b, k) values (30, 1, 0, 4), (1, 9, 9, 9), (31, 2, 0, 4)');
+			await assertEquivalent(db, body, 'after OR IGNORE with an intra-statement collision');
+			await db.exec('insert or replace into src (id, a, b, k) values (1, 8, 0, 5), (32, 3, 0, 5)');
+			await assertEquivalent(db, body, 'after OR REPLACE moving a row across groups');
+		});
+	});
+
+	describe('per-statement degrade-to-rebuild demotion', () => {
+		let db: Database;
+		const body = 'select k, count(*) as c, sum(a) as s from src group by k';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+			await db.exec('insert into src (id, a, b, k) values (1, 1, 0, 1), (2, 2, 0, 2)');
+			await db.exec(`create materialized view mv as ${body}`);
+			// Pin the demotion crossover deterministically (independent of the stats
+			// provider's heuristics): no distinct-groups estimate ⇒ the no-stats path
+			// costs each residual run at forwardBodyCost × fallbackRatio = 0.5, so a
+			// statement with k ≥ 3 distinct keys (cost > 1 = forwardBodyCost) demotes
+			// to one whole-body rebuild and k ≤ 2 stays on per-key residuals.
+			const plan = seamManager(db).rowTime.get('main.mv');
+			expect(plan, 'registered plan').to.exist;
+			plan!.sourceStats = { tableRows: 10, forwardBodyCost: 1, fallbackRatio: 0.5 };
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('a statement over the crossover runs one replace-all rebuild; a later small statement reverts', async () => {
+			const records = instrumentSeams(db);
+			// 2 distinct keys — under the crossover: per-key residuals, no replace-all.
+			await db.exec('insert into src (id, a, b, k) values (10, 1, 0, 1), (11, 1, 0, 2)');
+			expect(records.filter(r => r.seam === 'replace-all'), 'k=2 stays on per-key residuals').to.deep.equal([]);
+			await assertEquivalent(db, body, 'under the crossover');
+
+			// 4 distinct keys — over the crossover: the flush demotes to ONE whole-body
+			// replace-all diff for this statement.
+			await db.exec('insert into src (id, a, b, k) values (20, 1, 0, 3), (21, 1, 0, 4), (22, 1, 0, 5), (23, 1, 0, 6)');
+			const replaceAll = records.filter(r => r.seam === 'replace-all' && r.mv === 'mv');
+			expect(replaceAll.length, 'k=4 demotes to exactly one rebuild').to.equal(1);
+			await assertEquivalent(db, body, 'after degraded (replace-all) statement');
+
+			// Stateless: the NEXT low-cardinality statement is back on per-key residuals.
+			await db.exec('insert into src (id, a, b, k) values (30, 1, 0, 1)');
+			expect(records.filter(r => r.seam === 'replace-all' && r.mv === 'mv').length, 'no further rebuilds').to.equal(1);
+			await assertEquivalent(db, body, 'after post-degrade single-row statement');
+		});
+	});
+
+	describe('mixed-arm MV-over-MV chain in one statement', () => {
+		let db: Database;
+		const mv1Body = 'select k, count(*) as c, sum(a) as s from src group by k';
+		// Oracles are expressed over src directly, so the read-side rewrite disable in
+		// readOracle keeps them independent of every backing under test.
+		const mv2Oracle = `select k, c from (${mv1Body})`;
+		const mv3Oracle = `select c, count(*) as n from (${mv1Body}) group by c`;
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table src (id integer primary key, a integer, b integer, k integer)');
+			await db.exec('insert into src (id, a, b, k) values (1, 1, 0, 1), (2, 2, 0, 1), (3, 3, 0, 2)');
+			await db.exec(`create materialized view mv1 as ${mv1Body}`);
+			await db.exec('create materialized view mv2 as select k, c from mv1');
+			await db.exec('create materialized view mv3 as select c, count(*) as n from mv1 group by c');
+			expect(registeredPlanKind(db, 'mv1'), 'producer is residual').to.equal('residual-recompute');
+			expect(registeredPlanKind(db, 'mv2'), 'consumer mv2 is inverse-projection').to.equal('inverse-projection');
+			expect(registeredPlanKind(db, 'mv3'), 'consumer mv3 is residual (residual-over-residual)').to.equal('residual-recompute');
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('one multi-row statement converges the whole chain at the flush', async () => {
+			const records = instrumentSeams(db);
+			await db.exec('insert into src (id, a, b, k) values (10, 4, 0, 1), (11, 5, 0, 2), (12, 6, 0, 3)');
+			// Producer and residual consumer each flushed exactly once (worklist rounds).
+			expect(records.filter(r => r.mv === 'mv1' && r.seam === 'residual-flush').length, 'mv1 flushed once').to.equal(1);
+			expect(records.filter(r => r.mv === 'mv3' && r.seam === 'residual-flush').length, 'mv3 flushed once').to.equal(1);
+			expect(await readMultiset(db, 'select * from mv1')).to.deep.equal(await readOracle(db, mv1Body));
+			expect(await readMultiset(db, 'select * from mv2')).to.deep.equal(await readOracle(db, mv2Oracle));
+			expect(await readMultiset(db, 'select * from mv3')).to.deep.equal(await readOracle(db, mv3Oracle));
+		});
+
+		it('a multi-row DELETE emptying groups converges the chain (emptied-key deletes cascade)', async () => {
+			await db.exec('delete from src where k = 1');
+			expect(await readMultiset(db, 'select * from mv1')).to.deep.equal(await readOracle(db, mv1Body));
+			expect(await readMultiset(db, 'select * from mv2')).to.deep.equal(await readOracle(db, mv2Oracle));
+			expect(await readMultiset(db, 'select * from mv3')).to.deep.equal(await readOracle(db, mv3Oracle));
+		});
 	});
 });

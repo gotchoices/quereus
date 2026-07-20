@@ -6,7 +6,7 @@
  * resolvers, derived-row and parent-side referential enforcement, and the small key-compare
  * helpers they share. Extracted from database-materialized-views.ts as free functions over
  * {@link MaterializedViewManagerContext}; the manager's orchestration methods
- * (`maintainRowTime`, `flushDeferredRebuilds`, `lookupCoveringConflicts`) call in.
+ * (`maintainRowTime`, `flushDeferredMaintenance`, `lookupCoveringConflicts`) call in.
  */
 
 import { QuereusError } from '../common/errors.js';
@@ -33,9 +33,40 @@ import type {
 	ForwardResidualPlan,
 	JoinResidualPlan,
 	PrefixDeletePlan,
+	ResidualMaintenancePlan,
+	ForwardResidualKey,
+	PrefixDeleteKey,
+	ResidualKeyBatch,
+	ResidualKeyBatchEntry,
 	BackingConnectionCache,
 	BackingPkColumn,
 } from './database-materialized-views-plans.js';
+
+/**
+ * Resolve a plan's backing table to its {@link BackingHost} + coordinated
+ * {@link VirtualTableConnection} — the two handles every apply path writes through.
+ * Shared by the per-row appliers, the batched residual flush, and the full-rebuild
+ * `'replace-all'` diff; throws INTERNAL when the backing table has vanished (an MV in a
+ * broken state).
+ */
+export async function resolveBackingApplyTarget(
+	ctx: MaterializedViewManagerContext,
+	// Structural (not the MaintenancePlan union) so the shared ForwardResidualPlan
+	// subset the join arm reuses resolves through it too.
+	plan: Pick<MaintenancePlan, 'mv' | 'backingSchema' | 'backingTableName'>,
+	cache?: BackingConnectionCache,
+): Promise<{ host: BackingHost; connection: VirtualTableConnection }> {
+	const backing = ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
+	if (!backing) {
+		throw new QuereusError(
+			`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
+			StatusCode.INTERNAL,
+		);
+	}
+	const host = backingHost(ctx, backing);
+	const connection = await getBackingConnection(ctx, host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+	return { host, connection };
+}
 
 /**
  * Compute an `'inverse-projection'` plan's per-row backing delta, apply it, and
@@ -103,15 +134,7 @@ export async function applyInverseProjection(
 	}
 	if (ops.length === 0) return [];
 
-	const backing = ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
-	if (!backing) {
-		throw new QuereusError(
-			`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
-			StatusCode.INTERNAL,
-		);
-	}
-	const host = backingHost(ctx, backing);
-	const connection = await getBackingConnection(ctx, host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+	const { host, connection } = await resolveBackingApplyTarget(ctx, plan, cache);
 	return host.applyMaintenance(connection, ops);
 }
 
@@ -358,11 +381,12 @@ export async function runScheduler(ctx: MaterializedViewManagerContext, schedule
  * joined row per key) arms — both bind on the forward driving source via
  * {@link ForwardResidualPlan}; the only difference is the binding (group vs PK).
  *
- * Per-row recompute is correct without per-statement batching: every change to a key
- * triggers a full recompute of that key's slice from live (reads-own-writes) state, so
- * the last change to touch a key writes the authoritative backing row. Batching/dedup
- * across a whole statement is an affordability optimization deferred with the
- * statement-flush boundary (see the ticket handoff).
+ * This is the **cold** (no statement batch in scope) inline path. A statement-batched
+ * caller instead accumulates the same deduped keys via
+ * {@link collectForwardResidualKeys} and recomputes each distinct key once at the
+ * end-of-statement flush ({@link computeForwardResidualOps}) — sound for the same
+ * last-write-wins reason: every recompute reads live (reads-own-writes) state, so
+ * running it once at flush produces exactly what the last per-row run would have.
  */
 export async function applyForwardResidual(
 	ctx: MaterializedViewManagerContext,
@@ -370,15 +394,32 @@ export async function applyForwardResidual(
 	change: BackingRowChange,
 	cache?: BackingConnectionCache,
 ): Promise<BackingRowChange[]> {
-	// Distinct affected keys (OLD ∪ NEW), deduped on the backing-key values: a
-	// non-key-changing update recomputes the group once; a key-changing update
-	// recomputes both the old and the new group.
-	const affected = new Map<string, { keyTuple: SqlValue[]; keyVals: SqlValue[]; deleteKey: BTreeKeyForPrimary }>();
+	const affected = new Map<string, ForwardResidualKey>();
+	collectForwardResidualKeys(plan, change, affected);
+	const ops = await computeForwardResidualOps(ctx, plan, affected.values());
+	if (ops.length === 0) return [];
+
+	const { host, connection } = await resolveBackingApplyTarget(ctx, plan, cache);
+	return host.applyMaintenance(connection, ops);
+}
+
+/**
+ * Derive one changed source row's affected forward binding key(s) (OLD ∪ NEW) and add
+ * them to `into`, deduped on the canonical backing-key values: a non-key-changing update
+ * recomputes the group once; a key-changing update recomputes both the old and the new
+ * group. `into` may span a whole statement (the per-statement {@link ResidualKeyBatch})
+ * or a single change (the cold inline path) — the dedup is identical either way.
+ */
+export function collectForwardResidualKeys(
+	plan: ForwardResidualPlan,
+	change: BackingRowChange,
+	into: Map<string, ForwardResidualKey>,
+): void {
 	const addFrom = (row: Row): void => {
 		const keyVals = plan.backingPkSourceCols.map(sc => row[sc]);
 		const dedupKey = canonKeyValues(keyVals);
-		if (affected.has(dedupKey)) return;
-		affected.set(dedupKey, {
+		if (into.has(dedupKey)) return;
+		into.set(dedupKey, {
 			keyTuple: plan.bindColumns.map(c => row[c]),
 			keyVals,
 			deleteKey: buildPrimaryKeyFromValues(keyVals, plan.backingPkDefinition),
@@ -387,9 +428,21 @@ export async function applyForwardResidual(
 	if (change.op === 'insert') addFrom(change.newRow);
 	else if (change.op === 'delete') addFrom(change.oldRow);
 	else { addFrom(change.oldRow); addFrom(change.newRow); }
+}
 
+/**
+ * Run the forward key-filtered residual once per affected key and build the keyed-diff
+ * ops: upsert the recomputed slice, or point-delete an emptied key. Pure op computation —
+ * the caller owns connection resolution and the single {@link BackingHost.applyMaintenance}
+ * call, so a statement flush can batch many keys' ops into one host call.
+ */
+export async function computeForwardResidualOps(
+	ctx: MaterializedViewManagerContext,
+	plan: ForwardResidualPlan,
+	keys: Iterable<ForwardResidualKey>,
+): Promise<MaintenanceOp[]> {
 	const ops: MaintenanceOp[] = [];
-	for (const { keyTuple, keyVals, deleteKey } of affected.values()) {
+	for (const { keyTuple, keyVals, deleteKey } of keys) {
 		const recomputed = await runResidual(ctx, plan.residualScheduler, plan.bindParamPrefix, keyTuple);
 		// Keep only the recomputed rows whose backing key equals the affected key.
 		// The residual for key K must only contribute K's slice; any other row is
@@ -413,18 +466,7 @@ export async function applyForwardResidual(
 			for (const row of slice) ops.push({ kind: 'upsert', row });
 		}
 	}
-	if (ops.length === 0) return [];
-
-	const backing = ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
-	if (!backing) {
-		throw new QuereusError(
-			`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
-			StatusCode.INTERNAL,
-		);
-	}
-	const host = backingHost(ctx, backing);
-	const connection = await getBackingConnection(ctx, host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
-	return host.applyMaintenance(connection, ops);
+	return ops;
 }
 
 /**
@@ -497,8 +539,10 @@ export async function applyJoinResidual(
  *
  * A `T`-side membership change (insert/delete/FK-move) is the *forward* path's job and fires
  * its own maintenance. Returns the effective {@link BackingRowChange}(s) for the MV-over-MV
- * cascade. Per-row recompute is correct without batching for the same
- * last-write-wins-against-live-state reason as {@link applyForwardResidual}.
+ * cascade. This is the cold inline path; a statement-batched caller accumulates via
+ * {@link collectLookupResidualKeys} and recomputes at flush ({@link computeLookupResidualOps})
+ * — sound for the same last-write-wins-against-live-state reason as
+ * {@link applyForwardResidual}.
  */
 export async function applyLookupResidual(
 	ctx: MaterializedViewManagerContext,
@@ -506,19 +550,49 @@ export async function applyLookupResidual(
 	change: BackingRowChange,
 	cache?: BackingConnectionCache,
 ): Promise<BackingRowChange[]> {
-	// Distinct affected lookup keys (OLD ∪ NEW), deduped on `P`'s PK values.
 	const affected = new Map<string, SqlValue[]>();
+	collectLookupResidualKeys(plan, change, affected);
+	const ops = await computeLookupResidualOps(ctx, plan, affected.values());
+	if (ops.length === 0) return [];
+
+	const { host, connection } = await resolveBackingApplyTarget(ctx, plan, cache);
+	return host.applyMaintenance(connection, ops);
+}
+
+/**
+ * Derive one changed lookup-side (`P`) row's affected lookup key(s) (OLD ∪ NEW) and add
+ * them to `into`, deduped on `P`'s canonical PK values. The statement-batch counterpart
+ * of the derivation inside {@link applyLookupResidual}.
+ */
+export function collectLookupResidualKeys(
+	plan: JoinResidualPlan,
+	change: BackingRowChange,
+	into: Map<string, SqlValue[]>,
+): void {
 	const addFrom = (row: Row): void => {
 		const keyTuple = plan.lookupBindColumns.map(c => row[c]);
 		const dedupKey = canonKeyValues(keyTuple);
-		if (!affected.has(dedupKey)) affected.set(dedupKey, keyTuple);
+		if (!into.has(dedupKey)) into.set(dedupKey, keyTuple);
 	};
 	if (change.op === 'insert') addFrom(change.newRow);
 	else if (change.op === 'delete') addFrom(change.oldRow);
 	else { addFrom(change.oldRow); addFrom(change.newRow); }
+}
 
+/**
+ * Run the lookup-keyed residual variant once per affected `P` key and build the ops —
+ * the delete-capable membership diff when the plan carries
+ * `lookupMembershipResidualScheduler`, upsert-only otherwise (see
+ * {@link applyLookupResidual} for the soundness argument). Pure op computation; the
+ * caller owns connection resolution and the single applyMaintenance call.
+ */
+export async function computeLookupResidualOps(
+	ctx: MaterializedViewManagerContext,
+	plan: JoinResidualPlan,
+	keys: Iterable<SqlValue[]>,
+): Promise<MaintenanceOp[]> {
 	const ops: MaintenanceOp[] = [];
-	for (const keyTuple of affected.values()) {
+	for (const keyTuple of keys) {
 		const recomputed = await runResidual(ctx, plan.lookupResidualScheduler, plan.lookupBindParamPrefix, keyTuple);
 		// Delete-capable (P-referencing WHERE): keyed diff of the membership residual
 		// (WHERE stripped) against the in-scope recompute — delete ONLY the membership
@@ -540,18 +614,7 @@ export async function applyLookupResidual(
 		// unchanged ones (an in-scope refresh that changed nothing reports nothing).
 		for (const row of recomputed) ops.push({ kind: 'upsert', row });
 	}
-	if (ops.length === 0) return [];
-
-	const backing = ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
-	if (!backing) {
-		throw new QuereusError(
-			`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
-			StatusCode.INTERNAL,
-		);
-	}
-	const host = backingHost(ctx, backing);
-	const connection = await getBackingConnection(ctx, host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
-	return host.applyMaintenance(connection, ops);
+	return ops;
 }
 
 /**
@@ -583,10 +646,11 @@ export async function applyLookupResidual(
  *
  * Structurally the same as {@link applyForwardResidual}, differing only in the
  * **prefix-slice** diff (one base row owns N backing rows sharing the prefix) and the
- * **N-row** residual. Per-row recompute is correct without per-statement batching: the
- * residual reads live (reads-own-writes) state, so the last write to a base key produces
- * the authoritative slice. (Statement-level dedup of distinct base keys is the same
- * affordability optimization deferred for the aggregate arm.)
+ * **N-row** residual. This is the cold inline path; a statement-batched caller
+ * accumulates the same deduped base keys via {@link collectPrefixDeleteKeys} and diffs
+ * each distinct key once at flush ({@link computePrefixDeleteOps}) — sound because the
+ * residual and the effective-slice read both see live (reads-own-writes) state, so the
+ * flush-time diff is exactly what the last per-row diff would have produced.
  */
 export async function applyPrefixDelete(
 	ctx: MaterializedViewManagerContext,
@@ -594,36 +658,58 @@ export async function applyPrefixDelete(
 	change: BackingRowChange,
 	cache?: BackingConnectionCache,
 ): Promise<BackingRowChange[]> {
-	// Distinct affected base keys (OLD ∪ NEW), deduped on the base-PK values. `keyTuple`
-	// binds the residual (`pk{i}`); `prefix` is the slice's leading-PK equality key (the
-	// base-PK values in backing-PK order — identical here since the base PK leads the
-	// backing PK, but kept distinct for clarity).
-	const affected = new Map<string, { keyTuple: SqlValue[]; prefix: SqlValue[] }>();
-	const addFrom = (row: Row): void => {
-		const keyTuple = plan.bindColumns.map(c => row[c]);
-		const dedupKey = canonKeyValues(keyTuple);
-		if (affected.has(dedupKey)) return;
-		affected.set(dedupKey, { keyTuple, prefix: plan.backingPrefixSourceCols.map(sc => row[sc]) });
-	};
-	if (change.op === 'insert') addFrom(change.newRow);
-	else if (change.op === 'delete') addFrom(change.oldRow);
-	else { addFrom(change.oldRow); addFrom(change.newRow); }
+	const affected = new Map<string, PrefixDeleteKey>();
+	collectPrefixDeleteKeys(plan, change, affected);
 
 	// Resolved up front (unlike the point-op arms): the keyed diff reads the existing
 	// effective slice before any op exists. The former wholesale arm always emitted ops,
 	// so this resolves no more connections than it did.
-	const backing = ctx.schemaManager.getTable(plan.backingSchema, plan.backingTableName);
-	if (!backing) {
-		throw new QuereusError(
-			`Internal error: backing table '${plan.backingTableName}' for materialized view '${plan.mv.name}' not found`,
-			StatusCode.INTERNAL,
-		);
-	}
-	const host = backingHost(ctx, backing);
-	const connection = await getBackingConnection(ctx, host, `${plan.backingSchema}.${plan.backingTableName}`, cache);
+	const { host, connection } = await resolveBackingApplyTarget(ctx, plan, cache);
+	const ops = await computePrefixDeleteOps(ctx, plan, affected.values(), host, connection);
+	if (ops.length === 0) return [];
+	return host.applyMaintenance(connection, ops);
+}
 
+/**
+ * Derive one changed base row's affected base key(s) (OLD ∪ NEW) and add them to
+ * `into`, deduped on the canonical base-PK values. `keyTuple` binds the residual
+ * (`pk{i}`); `prefix` is the slice's leading-PK equality key (the base-PK values in
+ * backing-PK order — identical here since the base PK leads the backing PK, but kept
+ * distinct for clarity). The statement-batch counterpart of the derivation inside
+ * {@link applyPrefixDelete}.
+ */
+export function collectPrefixDeleteKeys(
+	plan: PrefixDeletePlan,
+	change: BackingRowChange,
+	into: Map<string, PrefixDeleteKey>,
+): void {
+	const addFrom = (row: Row): void => {
+		const keyTuple = plan.bindColumns.map(c => row[c]);
+		const dedupKey = canonKeyValues(keyTuple);
+		if (into.has(dedupKey)) return;
+		into.set(dedupKey, { keyTuple, prefix: plan.backingPrefixSourceCols.map(sc => row[sc]) });
+	};
+	if (change.op === 'insert') addFrom(change.newRow);
+	else if (change.op === 'delete') addFrom(change.oldRow);
+	else { addFrom(change.oldRow); addFrom(change.newRow); }
+}
+
+/**
+ * Per affected base key: run the fan-out residual, read the existing effective slice for
+ * the base prefix, and build the keyed-diff ops (delete disappeared keys, upsert the
+ * recomputed rows). Pure op computation over the supplied host/connection; the caller
+ * owns the single applyMaintenance call, so a statement flush batches many base keys'
+ * ops into one host call.
+ */
+export async function computePrefixDeleteOps(
+	ctx: MaterializedViewManagerContext,
+	plan: PrefixDeletePlan,
+	keys: Iterable<PrefixDeleteKey>,
+	host: BackingHost,
+	connection: VirtualTableConnection,
+): Promise<MaintenanceOp[]> {
 	const ops: MaintenanceOp[] = [];
-	for (const { keyTuple, prefix } of affected.values()) {
+	for (const { keyTuple, prefix } of keys) {
 		const recomputed = await runResidual(ctx, plan.residualScheduler, plan.bindParamPrefix, keyTuple);
 		// The residual for base key K filters T to K, so every row it returns shares K's
 		// base-PK prefix; the prefix-match guard is a defensive soundness net (mirrors
@@ -649,8 +735,7 @@ export async function applyPrefixDelete(
 		}
 		for (const row of slice) ops.push({ kind: 'upsert', row });
 	}
-	if (ops.length === 0) return [];
-	return host.applyMaintenance(connection, ops);
+	return ops;
 }
 
 /**
@@ -681,4 +766,67 @@ export function residualRowMatchesBasePrefix(plan: PrefixDeletePlan, row: Row, p
 		if (compareSqlValuesFast(row[d.index], prefixVals[i], d.collationFn) !== 0) return false;
 	}
 	return true;
+}
+
+/**
+ * Accumulate one source change's affected binding key(s) for a residual-arm plan into
+ * the per-statement {@link ResidualKeyBatch}, deduped across the whole statement —
+ * the deferred-accumulate counterpart of the cold per-row appliers above. Which
+ * variant map receives the keys follows the plan kind; a `'join-residual'` change
+ * routes on **which source changed** (forward for the driving `T`, lookup for `P`),
+ * exactly as {@link applyJoinResidual} dispatches. `planKey` is the MV key
+ * (lowercased `schema.name`) the manager indexes the plan under.
+ */
+export function accumulateResidualKeys(
+	plan: ResidualMaintenancePlan,
+	change: BackingRowChange,
+	changedBase: string,
+	batch: ResidualKeyBatch,
+	planKey: string,
+): void {
+	let entry = batch.get(planKey);
+	if (!entry) {
+		entry = { forward: new Map(), lookup: new Map(), prefix: new Map() };
+		batch.set(planKey, entry);
+	}
+	switch (plan.kind) {
+		case 'residual-recompute':
+			collectForwardResidualKeys(plan, change, entry.forward);
+			break;
+		case 'prefix-delete':
+			collectPrefixDeleteKeys(plan, change, entry.prefix);
+			break;
+		case 'join-residual': {
+			if (changedBase === plan.sourceBase) collectForwardResidualKeys(plan, change, entry.forward);
+			else collectLookupResidualKeys(plan, change, entry.lookup);
+			break;
+		}
+	}
+}
+
+/**
+ * Compute the flush-time ops for one residual-arm MV's accumulated statement keys: run
+ * the appropriate residual variant once per distinct key against live post-statement
+ * state and concatenate the keyed-diff ops. Distinct keys touch disjoint backing slices
+ * — except a `'join-residual'` statement that accumulated both forward and lookup keys,
+ * where an overlapping backing row is recomputed twice from the SAME live state, so the
+ * duplicate upsert is value-identical and the host suppresses it. The caller owns the
+ * single {@link BackingHost.applyMaintenance} call over the combined array — one host
+ * round-trip per (MV, flush round) instead of one per source row.
+ */
+export async function computeResidualBatchOps(
+	ctx: MaterializedViewManagerContext,
+	plan: ResidualMaintenancePlan,
+	entry: ResidualKeyBatchEntry,
+	host: BackingHost,
+	connection: VirtualTableConnection,
+): Promise<MaintenanceOp[]> {
+	if (plan.kind === 'prefix-delete') {
+		return computePrefixDeleteOps(ctx, plan, entry.prefix.values(), host, connection);
+	}
+	const ops = await computeForwardResidualOps(ctx, plan, entry.forward.values());
+	if (plan.kind === 'join-residual' && entry.lookup.size > 0) {
+		ops.push(...await computeLookupResidualOps(ctx, plan, entry.lookup.values()));
+	}
+	return ops;
 }

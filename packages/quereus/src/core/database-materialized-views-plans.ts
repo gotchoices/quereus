@@ -14,6 +14,7 @@ import type { SchemaManager } from '../schema/manager.js';
 import type { SqlValue, Row } from '../common/types.js';
 import type { CollationFunction, CollationResolver } from '../types/logical-type.js';
 import type { PrimaryKeyColumnDefinition } from '../schema/table.js';
+import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
 import type { MaintenanceSourceStats, MaintenanceStrategy } from '../planner/cost/index.js';
@@ -62,11 +63,15 @@ export interface MaterializedViewManagerContext {
  * ({@link MaterializedViewManager.buildMaintenancePlan}) produces four bounded-delta arms:
  * `'inverse-projection'` (the covering-index shape), `'residual-recompute'` (single-source
  * aggregates), `'prefix-delete'` (single-source lateral-TVF fan-out), and `'join-residual'`
- * (the provably-1:1 inner join) — each applied **per source row, immediately**. The
- * `'full-rebuild'` floor (the always-correct convergence point for bodies no bounded-delta
- * arm fits) is the fall-through the builder routes to whenever no bounded-delta arm matches;
- * it is the one **deferred** arm — marked dirty per row and rebuilt once per statement at
- * {@link MaterializedViewManager.flushDeferredRebuilds}.
+ * (the provably-1:1 inner join). Only `'inverse-projection'` is applied **per source row,
+ * immediately** — its backing is read mid-statement by covering-UNIQUE enforcement, and its
+ * delta is a cheap pure projection. The three **residual** arms accumulate their affected
+ * binding keys into the per-statement {@link ResidualKeyBatch} (deduped across the
+ * statement's changes) and recompute once per distinct key at the end-of-statement flush.
+ * The `'full-rebuild'` floor (the always-correct convergence point for bodies no
+ * bounded-delta arm fits) is likewise deferred — marked dirty per row and rebuilt once per
+ * statement. Both deferred kinds drain at
+ * {@link MaterializedViewManager.flushDeferredMaintenance}.
  */
 export type MaintenancePlan =
 	| InverseProjectionPlan
@@ -90,9 +95,32 @@ export interface BackingPkColumn extends PrimaryKeyColumnDefinition {
 }
 
 /**
+ * The three **residual** (key-filtered recompute) arms — every {@link MaintenancePlan}
+ * kind except `'inverse-projection'` and `'full-rebuild'`. These are the arms the
+ * per-statement {@link ResidualKeyBatch} defers: their affected binding keys accumulate
+ * (deduped) during the statement's row loop and each distinct key's residual runs once
+ * at the end-of-statement flush ({@link MaterializedViewManager.flushDeferredMaintenance}).
+ */
+export type ResidualMaintenancePlan = ResidualRecomputePlan | PrefixDeletePlan | JoinResidualPlan;
+
+/**
+ * Fields shared by the three residual arms. `fullRebuildScheduler` is the per-statement
+ * **degrade-to-rebuild escape**: when the statement's distinct affected-key count makes
+ * k residual runs cost more than one whole-body rebuild (`shouldDegradeToRebuild` against
+ * {@link MaintenancePlanCommon.sourceStats}), the flush runs this scheduler to completion
+ * and applies a single `'replace-all'` diff instead — the stored `chosenStrategy` is
+ * unchanged, so a later low-cardinality statement naturally reverts to per-key residuals.
+ * Compiled once at registration ({@link buildMaintenancePlan}) exactly like the floor's
+ * own `bodyScheduler`; optional defensively (an absent scheduler just skips the demotion).
+ */
+export interface ResidualArmCommon {
+	fullRebuildScheduler?: Scheduler;
+}
+
+/**
  * Structural subset of the fields the forward (driving-source) residual-recompute
  * apply path reads — shared by the aggregate {@link ResidualRecomputePlan} and the
- * 1:1-join {@link JoinResidualPlan} so both drive {@link MaterializedViewManager.applyForwardResidual}
+ * 1:1-join {@link JoinResidualPlan} so both drive {@link applyForwardResidual}
  * unchanged. For an aggregate the forward key is the group key (`'gk'`); for a join
  * it is the driving table `T`'s PK (`'pk'`).
  */
@@ -150,9 +178,10 @@ export interface CoarseningWatchColumn {
 /**
  * Common identity + cost-gate fields shared by every {@link MaintenancePlan} arm.
  * `chosenStrategy` / `sourceStats` are set once by the create-time cost gate
- * ({@link MaterializedViewManager.buildMaintenancePlan}, via `selectMaintenanceStrategy`)
- * and are not re-evaluated per write, except for the residual → rebuild demotion
- * (`shouldDegradeToRebuild`; dormant until the residual arm is reachable).
+ * ({@link buildMaintenancePlan}, via `selectMaintenanceStrategy`) and are not
+ * re-evaluated per write, except for the per-statement residual → rebuild demotion
+ * (`shouldDegradeToRebuild` against the statement's actual distinct-key count, at
+ * the end-of-statement flush).
  */
 export interface MaintenancePlanCommon {
 	/** The MV this plan maintains. */
@@ -190,7 +219,7 @@ export interface MaintenancePlanCommon {
 	 *  almost every MV, so the discriminator is the body-nullability term). Precomputed once
 	 *  at plan build ({@link MaterializedViewManager.buildMaintenancePlan}). Read by the
 	 *  row-time guard in {@link MaterializedViewManager.maintainRowTime} /
-	 *  {@link MaterializedViewManager.flushDeferredRebuilds}. The refresh path has its own
+	 *  {@link MaterializedViewManager.flushDeferredMaintenance}. The refresh path has its own
 	 *  materialized-row equivalent (`assertNoNullInNotNullSeededPk` in
 	 *  runtime/emit/materialized-view-helpers.ts). See
 	 *  fix/bug-mv-rowtime-null-into-notnull-seeded-pk. */
@@ -226,7 +255,7 @@ export interface InverseProjectionPlan extends MaintenancePlanCommon {
  * Reachability: `buildMaintenancePlan` routes a body here whenever no bounded-delta arm
  * fits ({@link MaterializedViewManager.tryBuildBoundedDeltaArm} returns `null`). It is the
  * one **deferred** arm — marked dirty per source row and rebuilt exactly once at the
- * end-of-statement flush ({@link MaterializedViewManager.flushDeferredRebuilds}), so a bulk
+ * end-of-statement flush ({@link MaterializedViewManager.flushDeferredMaintenance}), so a bulk
  * write is O(body) not O(rows × body). See `docs/mv-maintenance.md` § Full-rebuild floor.
  */
 export interface FullRebuildPlan extends MaintenancePlanCommon {
@@ -265,14 +294,12 @@ export interface FullRebuildPlan extends MaintenancePlanCommon {
  * directly from the body's shape — for an aggregate, the bare GROUP BY columns; NOT
  * via `extractBindings`, whose `'group'` classification additionally requires the group
  * key to cover a source unique key and so reports `'global'` for the common
- * `group by <non-key>` body). `degradeToRebuild` is the cost gate's full-rebuild escape
- * flag — dormant in v1 (the per-row recompute is correct without batching, and the
- * full-rebuild arm is unwired).
+ * `group by <non-key>` body). The per-statement rebuild demotion rides
+ * {@link ResidualArmCommon.fullRebuildScheduler}.
  */
-export interface ResidualRecomputePlan extends MaintenancePlanCommon {
+export interface ResidualRecomputePlan extends MaintenancePlanCommon, ResidualArmCommon {
 	readonly kind: 'residual-recompute';
 	binding: BindingMode;
-	degradeToRebuild: boolean;
 	/** Cached scheduler for the key-filtered residual (the body with `injectKeyFilter`
 	 *  applied on `T`). Re-run per affected key tuple, bound through the live transaction. */
 	residualScheduler: Scheduler;
@@ -313,14 +340,13 @@ export interface ResidualRecomputePlan extends MaintenancePlanCommon {
  *
  * `chosenStrategy` is `'residual-recompute'` (the shared key-filtered re-execution cost
  * shape — the fan-out factor is unknown at create); `kind` is `'prefix-delete'` (the
- * apply-arm dispatcher). `degradeToRebuild` is dormant (as in the aggregate arm).
+ * apply-arm dispatcher).
  */
-export interface PrefixDeletePlan extends MaintenancePlanCommon {
+export interface PrefixDeletePlan extends MaintenancePlanCommon, ResidualArmCommon {
 	readonly kind: 'prefix-delete';
 	/** Substrate parity (the base-PK 'row' binding); unread by the apply path, which uses
 	 *  `bindColumns` / `backingPrefixSourceCols`. */
 	binding: BindingMode;
-	degradeToRebuild: boolean;
 	/** Cached scheduler for the base-PK-keyed residual (the body with `injectKeyFilter`
 	 *  applied on `T`, `'pk'` prefix). Re-run per affected base key; fans out to N rows. */
 	residualScheduler: Scheduler;
@@ -382,11 +408,10 @@ export interface PrefixDeletePlan extends MaintenancePlanCommon {
  * full-rebuild floor. See `docs/incremental-maintenance.md` § join-residual and the soundness
  * note in {@link MaterializedViewManager.applyLookupResidual}.
  */
-export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidualPlan {
+export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidualPlan, ResidualArmCommon {
 	readonly kind: 'join-residual';
 	/** Substrate parity: the driving `T`'s `'row'`/PK binding. */
 	binding: BindingMode;
-	degradeToRebuild: boolean;
 	bindParamPrefix: 'pk';
 	/** Lowercased `schema.table` of the lookup source `P` (distinct from `sourceBase` = `T`). */
 	lookupBase: string;
@@ -416,16 +441,71 @@ export interface JoinResidualPlan extends MaintenancePlanCommon, ForwardResidual
  * (statement, backing) instead of once per source row. This amortizes the dominant
  * per-row overhead of a bulk `insert`/`update`/`delete` over a covered table.
  *
- * It is purely a resolution cache: each **bounded-delta** arm's per-row ops are still
+ * It is purely a resolution cache: the `'inverse-projection'` arm's per-row ops are still
  * applied **immediately** to the cached connection's pending transaction layer, so a later
  * same-statement row's enforcement scan (`lookupCoveringConflicts`) still observes every
- * earlier row's backing write. The one exception is the **full-rebuild** arm, which the DML
- * boundary defers to a single end-of-statement {@link MaterializedViewManager.flushDeferredRebuilds}
- * (tracked in a separate per-statement dirty set, not this cache) — sound because a
- * full-rebuild MV is never a covering structure, so no enforcement scan depends on its
- * per-row visibility. See `docs/mv-maintenance.md` § Synchronous, transactional,
- * per-statement. Because the cache is scoped to one generator run, the connection it holds
- * cannot be torn down mid-statement; the cold enforcement/eviction paths that omit the cache
- * re-resolve the *same* connection deterministically, so reads-own-writes is unaffected.
+ * earlier row's backing write. The **residual** arms and the **full-rebuild** floor are
+ * instead deferred to a single end-of-statement
+ * {@link MaterializedViewManager.flushDeferredMaintenance} (tracked in the per-statement
+ * {@link ResidualKeyBatch} / dirty set, not this cache) — sound because only an
+ * inverse-projection MV can serve as a covering structure, so no enforcement scan depends
+ * on a deferred arm's per-row visibility. See `docs/mv-maintenance.md` § Synchronous,
+ * transactional, per-statement. Because the cache is scoped to one generator run, the
+ * connection it holds cannot be torn down mid-statement; the cold enforcement/eviction
+ * paths that omit the cache re-resolve the *same* connection deterministically, so
+ * reads-own-writes is unaffected.
  */
 export type BackingConnectionCache = Map<string, VirtualTableConnection>;
+
+/**
+ * One deduped **forward** (driving-source) affected binding key, as
+ * `applyForwardResidual` derives it from a changed source row: `keyTuple` binds the
+ * key-filtered residual's parameters, `keyVals` are the backing-PK values (in
+ * `backingPkDefinition` order) the recomputed slice is matched on, and `deleteKey` is the
+ * prebuilt point-delete key for an emptied slice. Deduped on `canonKeyValues(keyVals)`.
+ */
+export interface ForwardResidualKey {
+	keyTuple: SqlValue[];
+	keyVals: SqlValue[];
+	deleteKey: BTreeKeyForPrimary;
+}
+
+/**
+ * One deduped affected **base** key of a `'prefix-delete'` fan-out plan: `keyTuple` binds
+ * the base-PK-keyed residual, `prefix` is the slice's leading-backing-PK equality key.
+ * Deduped on `canonKeyValues(keyTuple)`.
+ */
+export interface PrefixDeleteKey {
+	keyTuple: SqlValue[];
+	prefix: SqlValue[];
+}
+
+/**
+ * The per-statement key accumulation for one residual-arm MV — which distinct binding
+ * keys this statement's source changes affected, per residual variant. `forward` holds
+ * driving-source keys (`'residual-recompute'` group keys; `'join-residual'` `T`-PK keys),
+ * `lookup` holds a `'join-residual'` plan's lookup-side (`P`-PK) keys (which run the
+ * reverse residual variant at flush), and `prefix` holds a `'prefix-delete'` plan's base
+ * keys. Exactly one map is populated for the single-variant arms; a `'join-residual'` MV
+ * may accumulate `forward` and `lookup` in one statement (e.g. an FK cascade writing both
+ * sides). Each map is keyed on the canonical key bytes (`canonKeyValues`) — the same
+ * dedup the per-row appliers do within one change, extended across the whole statement.
+ */
+export interface ResidualKeyBatchEntry {
+	forward: Map<string, ForwardResidualKey>;
+	lookup: Map<string, SqlValue[]>;
+	prefix: Map<string, PrefixDeleteKey>;
+}
+
+/**
+ * Per-statement deferred-residual key batch, keyed by MV key (lowercased
+ * `schema.name`). Created once per DML generator run alongside the
+ * {@link BackingConnectionCache} and the deferred full-rebuild set; the residual arms
+ * accumulate their affected keys here during the row loop
+ * ({@link MaterializedViewManager.maintainRowTime}) and each MV's distinct keys are
+ * recomputed exactly once at the end-of-statement
+ * {@link MaterializedViewManager.flushDeferredMaintenance}. Owned by the statement:
+ * discarded with the statement-savepoint unwind on failure, never carried across
+ * statements.
+ */
+export type ResidualKeyBatch = Map<string, ResidualKeyBatchEntry>;

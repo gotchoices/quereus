@@ -26,6 +26,7 @@ import { renameTableInAst, renameColumnInAst } from '../../schema/rename-rewrite
 import type { ResolveColumnInSource } from '../../schema/rename-rewriter.js';
 import { createLogger } from '../../common/logger.js';
 import type { BackingHost, BackingRowChange } from '../../vtab/backing-host.js';
+import type { ResidualKeyBatch } from '../../core/database-materialized-views.js';
 import type { VirtualTableConnection } from '../../vtab/connection.js';
 import type { SchemaChangeInfo } from '../../vtab/module.js';
 import { compareSqlValuesFast, resolveCollationFunctions } from '../../util/comparison.js';
@@ -1323,15 +1324,16 @@ export async function attachMaintainedDerivation(
 	// Cascade the GENUINE reconcile changes to consumer maintained tables: the
 	// reconcile wrote this table through the privileged surface, so the DML
 	// boundary never saw the writes. Identical content produced zero changes and
-	// therefore zero dispatch. Full-rebuild consumers defer + drain once,
-	// mirroring the statement flush.
+	// therefore zero dispatch. Full-rebuild and residual-arm consumers defer +
+	// drain once, mirroring the statement flush.
 	if (changes.length > 0) {
 		const base = `${schemaName}.${name}`;
 		const deferred = new Set<string>();
+		const residualBatch: ResidualKeyBatch = new Map();
 		for (const change of changes) {
-			await db._maintainRowTimeCoveringStructures(base, change, undefined, deferred);
+			await db._maintainRowTimeCoveringStructures(base, change, undefined, deferred, residualBatch);
 		}
-		await db._flushDeferredRebuilds(deferred);
+		await db._flushDeferredMaintenance(deferred, residualBatch);
 	}
 
 	sm.getChangeNotifier().notifyChange(priorMaintained

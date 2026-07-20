@@ -62,7 +62,7 @@ import { ingestExternalRowChangeBatch } from './database-external-changes.js';
 import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
 import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
-import { MaterializedViewManager, type BackingConnectionCache } from './database-materialized-views.js';
+import { MaterializedViewManager, type BackingConnectionCache, type ResidualKeyBatch } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
 import { tryGetEventEmitter } from '../vtab/events.js';
@@ -2432,32 +2432,37 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  OUTSIDE a statement uses the batch-amortized {@link ingestExternalRowChanges}
 	 *  seam instead).
 	 *
-	 *  `deferred` is the optional per-statement deferred-rebuild set: a `'full-rebuild'`
-	 *  plan is marked dirty in it (no per-row apply) and drained once at the
-	 *  end-of-statement {@link _flushDeferredRebuilds}. The DML generator owns it; cold
-	 *  callers omit it (and never name a full-rebuild MV, which is never a covering
-	 *  structure — so an inline rebuild is at worst a safe, unreached fallback). */
+	 *  `deferred` is the optional per-statement deferred-rebuild set (a `'full-rebuild'`
+	 *  plan is marked dirty in it, no per-row apply) and `residualBatch` the optional
+	 *  per-statement residual key batch (the residual arms accumulate their deduped
+	 *  affected binding keys into it, no per-row recompute); both drain once at the
+	 *  end-of-statement {@link _flushDeferredMaintenance}. The DML generator owns them;
+	 *  cold callers omit them (and only ever name inverse-projection MVs — the one
+	 *  per-row-immediate arm — so the inline per-change fallback is at worst a safe,
+	 *  unamortized apply). */
 	public async _maintainRowTimeCoveringStructures(
 		sourceBase: string,
 		change: BackingRowChange,
 		cache?: BackingConnectionCache,
 		deferred?: Set<string>,
+		residualBatch?: ResidualKeyBatch,
 	): Promise<void> {
-		await this.materializedViewManager.maintainRowTime(sourceBase, change, cache, deferred);
+		await this.materializedViewManager.maintainRowTime(sourceBase, change, cache, deferred, residualBatch);
 	}
 
-	/** @internal Drain the per-statement deferred full-rebuild set at the
-	 *  end-of-statement boundary: rebuild every dirtied full-rebuild covering MV exactly
-	 *  once and cascade each rebuild's delta onward (MV-over-MV). The DML generator calls
-	 *  this after the row loop and before releasing the statement-atomicity savepoint, so
-	 *  a failed rebuild rolls the whole statement back. `cache` is the same per-statement
-	 *  {@link BackingConnectionCache} the row loop used. See
-	 *  `database-materialized-views.ts` § flushDeferredRebuilds. */
-	public async _flushDeferredRebuilds(
+	/** @internal Drain the per-statement deferred maintenance at the end-of-statement
+	 *  boundary: recompute every accumulated residual key once per distinct key, rebuild
+	 *  every dirtied full-rebuild covering MV exactly once, and cascade each delta onward
+	 *  (MV-over-MV). The DML generator calls this after the row loop and before releasing
+	 *  the statement-atomicity savepoint, so a failed recompute/rebuild rolls the whole
+	 *  statement back. `cache` is the same per-statement {@link BackingConnectionCache}
+	 *  the row loop used. See `database-materialized-views.ts` § flushDeferredMaintenance. */
+	public async _flushDeferredMaintenance(
 		deferred: Set<string>,
+		residualBatch: ResidualKeyBatch,
 		cache?: BackingConnectionCache,
 	): Promise<void> {
-		await this.materializedViewManager.flushDeferredRebuilds(deferred, cache);
+		await this.materializedViewManager.flushDeferredMaintenance(deferred, residualBatch, cache);
 	}
 
 	/** @internal Resolve the linked, `row-time`, enforcement-ready covering MV for a

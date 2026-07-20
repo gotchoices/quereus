@@ -49,9 +49,9 @@ describe('Maintained-table attach/detach verbs', () => {
 	async function captureDispatch(fn: () => Promise<void>): Promise<BackingRowChange[]> {
 		const dispatched: BackingRowChange[] = [];
 		const orig = db._maintainRowTimeCoveringStructures.bind(db);
-		db._maintainRowTimeCoveringStructures = async (base, change, cache, deferred) => {
+		db._maintainRowTimeCoveringStructures = async (base, change, cache, deferred, residualBatch) => {
 			dispatched.push(change);
-			return orig(base, change, cache, deferred);
+			return orig(base, change, cache, deferred, residualBatch);
 		};
 		try {
 			await fn();

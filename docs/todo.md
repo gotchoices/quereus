@@ -371,18 +371,16 @@ coverage:
 - [ ] By-prefix fanning-join arm — the natural next consumer of the `'prefix-delete'` machinery
 - [ ] A possible **unified maintenance substrate** folding the row-time arms and the post-commit `DeltaExecutor` binding kernel under one abstraction; the arms above would retarget onto it if it lands
 
-**Statement-level op-coalescing for the incremental arms.** The bounded-delta arms apply per
-row; their per-statement batching caches connection resolution only, never buffering ops. A
-true op-buffering flush (with the cost gate's `degradeToRebuild`) would require
-`lookupCoveringConflicts` to union the not-yet-flushed buffer, or to flush before every
-enforcement read — otherwise it breaks the enforcement-visibility invariant in
-[`mv-maintenance.md` § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement).
-The full-rebuild floor is *already* deferred to a once-per-statement flush; this item is the
-analogous flush for the incremental arms, and is harder for exactly that reason.
-
-- [ ] Op-buffering flush for the bounded-delta arms
-- [ ] Union the buffer into `lookupCoveringConflicts` (or flush before each enforcement read)
-- [ ] Wire the cost gate's `degradeToRebuild`
+**Statement-level op-coalescing for the incremental arms — LANDED** (the
+`mv-maintenance-statement-batching` ticket). The three residual arms now accumulate their
+affected binding keys per statement and recompute once per distinct key at the
+end-of-statement flush, with the per-statement `shouldDegradeToRebuild` demotion wired
+(see [`mv-maintenance.md` § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)).
+The once-feared `lookupCoveringConflicts` buffer-unioning turned out never to be needed:
+`'inverse-projection'` — the only arm enforcement ever reads — stays per-row-immediate, so
+the deferral cut avoids the hazard entirely. No coalescing remains open for
+`'inverse-projection'` itself (its per-row delta is a cheap pure projection, and its
+per-row visibility is load-bearing for enforcement).
 
 **Bag (multiplicity-keyed) materialization.** A body with no provable unique key — and no
 [coarsened lineage key](materialized-views.md#coarsened-backing-keys) — is rejected at create

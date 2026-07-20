@@ -376,5 +376,54 @@ describe('Performance sentinels', function () {
 			expect(elapsed).to.be.below(2000, `250k out-of-order PK adds took ${elapsed.toFixed(1)} ms`);
 		});
 	});
+
+	// ------------------------------------ Materialized-view maintenance batching
+	// Regression sentinel for the per-statement residual key batch
+	// (mv-maintenance-statement-batching): before it, aggregate-view maintenance ran a
+	// fresh key-filtered residual per SOURCE ROW per MV, making this workload ~25× a
+	// plain bulk insert (~2 s here); with statement batching it sits ~3×. The RATIO
+	// bound (not absolute time) keeps the sentinel stable across CI hardware; 12× gives
+	// ~4× headroom over the batched cost while still tripping well below the per-row
+	// regression class.
+	describe('Materialized-view bulk-insert maintenance (statement batching)', function () {
+		this.timeout(120_000);
+
+		it('bulk insert with two aggregate MVs stays within 12× a plain bulk insert', async () => {
+			const N = 1000, ACCOUNTS = 40, PERIODS = 24, BATCH = 100;
+			const mkRows = (offset: number) => Array.from({ length: BATCH }, (_, j) => {
+				const i = offset + j;
+				return `(${i}, ${i % ACCOUNTS}, ${i % PERIODS}, ${(i * 7) % 100})`;
+			}).join(', ');
+
+			async function run(withMvs: boolean): Promise<number> {
+				const db = new Database();
+				await db.exec('create table entries (id integer primary key, account integer, period integer, amount integer)');
+				if (withMvs) {
+					await db.exec('create materialized view acct_totals as select account, count(*) as n, sum(amount) as total from entries group by account');
+					await db.exec('create materialized view bucket_totals as select account, period, sum(amount) as total from entries group by account, period');
+				}
+				const elapsed = await timeMs(async () => {
+					await db.exec('begin');
+					for (let i = 0; i < N; i += BATCH) {
+						await db.exec(`insert into entries (id, account, period, amount) values ${mkRows(i)}`);
+					}
+					await db.exec('commit');
+				});
+				// Sanity: the maintained aggregates actually reflect the load.
+				if (withMvs) {
+					for await (const row of db.eval('select sum(n) as loaded from acct_totals')) {
+						expect(Number((row as { loaded: unknown }).loaded)).to.equal(N);
+					}
+				}
+				await db.close();
+				return elapsed;
+			}
+
+			const plain = await run(false);
+			const withMvs = await run(true);
+			expect(withMvs).to.be.below(Math.max(plain, 10) * 12,
+				`bulk insert with 2 aggregate MVs took ${withMvs.toFixed(1)} ms vs ${plain.toFixed(1)} ms plain (ratio ${(withMvs / plain).toFixed(1)}×)`);
+		});
+	});
 });
 

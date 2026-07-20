@@ -11,8 +11,8 @@
  * changes, inside the coordinated transaction. The batch is the external
  * analogue of one DML statement: it mirrors `runWithStatementSavepoints` and
  * the DML generators' per-statement amortization (one
- * {@link BackingConnectionCache}, one deferred full-rebuild set, one
- * savepoint-broadcast scope per batch). See
+ * {@link BackingConnectionCache}, one deferred full-rebuild set, one residual
+ * key batch, one savepoint-broadcast scope per batch). See
  * `docs/mv-ingestion.md` § External row-change ingestion for the full
  * contract (facet semantics, trust boundary, transaction & visibility rules).
  */
@@ -22,7 +22,7 @@ import { StatusCode } from '../common/types.js';
 import type { Row } from '../common/types.js';
 import type { TableSchema } from '../schema/table.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
-import type { BackingConnectionCache } from './database-materialized-views.js';
+import type { BackingConnectionCache, ResidualKeyBatch } from './database-materialized-views.js';
 import type { Database } from './database.js';
 import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalChangesResult } from './database-internal.js';
 import type { AssertionViolation } from './database-assertions.js';
@@ -164,9 +164,11 @@ export async function ingestExternalRowChangeBatch(
 
 			// Per-batch amortization, exactly as one DML statement amortizes
 			// per-row maintenance: one backing-connection resolution per backing,
-			// one rebuild per full-rebuild MV per batch.
+			// one rebuild per full-rebuild MV per batch, one residual recompute
+			// per distinct affected key per residual-arm MV per batch.
 			const cache: BackingConnectionCache = new Map();
 			const deferred = new Set<string>();
+			const residualBatch: ResidualKeyBatch = new Map();
 			const tableMemo = new Map<string, TableSchema>();
 
 			for (const item of changes) {
@@ -190,7 +192,7 @@ export async function ingestExternalRowChangeBatch(
 				}
 
 				if (maintainMaterializedViews && db._hasRowTimeCoveringStructures(tableKey)) {
-					await db._maintainRowTimeCoveringStructures(tableKey, change, cache, deferred);
+					await db._maintainRowTimeCoveringStructures(tableKey, change, cache, deferred, residualBatch);
 				}
 
 				// Parent-side FK actions: update/delete only (inserts have no
@@ -229,11 +231,12 @@ export async function ingestExternalRowChangeBatch(
 				}
 			}
 
-			// Batch boundary: drain the deferred full-rebuild set AFTER every
-			// change has been applied (each rebuild reads the whole batch) and
-			// BEFORE the savepoint release (a failed rebuild unwinds the batch).
-			if (deferred.size > 0) {
-				await db._flushDeferredRebuilds(deferred, cache);
+			// Batch boundary: drain the deferred maintenance (residual key batch +
+			// full-rebuild set) AFTER every change has been applied (each
+			// recompute/rebuild reads the whole batch) and BEFORE the savepoint
+			// release (a failed flush unwinds the batch).
+			if (deferred.size > 0 || residualBatch.size > 0) {
+				await db._flushDeferredMaintenance(deferred, residualBatch, cache);
 			}
 			await db._releaseSavepointBroadcast(savepointName);
 		} catch (e) {

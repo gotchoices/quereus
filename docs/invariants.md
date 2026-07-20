@@ -498,34 +498,45 @@ post-commit window, no asynchronous drift, and therefore no divergence-detection
 self-heal machinery anywhere in the subsystem. A maintenance failure fails the source
 statement.
 
-### MV-003 — Bounded-delta maintenance applies per row, immediately
+### MV-003 — Inverse-projection maintenance applies per row, immediately
 
 - code: `packages/quereus/src/core/database-materialized-views-plans.ts` — `BackingConnectionCache`
 - code: `packages/quereus/src/core/database-materialized-views.ts` — `findRowTimeCoveringStructure`
 - guard: `packages/quereus/test/covering-structure.spec.ts` — `a bare-DDL covering MV is row-time and is used for enforcement`
 - doc: [Materialized-View Maintenance § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)
 
-The per-statement `BackingConnectionCache` amortizes *connection resolution* only. Each
-source row's backing ops are applied immediately, never buffered for an end-of-statement
-flush. This is load-bearing rather than incidental: covering-UNIQUE enforcement runs inside
-the source table's `update()` and scans the backing, so a later row of the same statement
-must observe an earlier row's backing write (`insert into t values (1,'a'),(2,'a')` over a
-covering `unique(x)` detects the duplicate). A coalescing write buffer would break
-enforcement unless the conflict probe also read the buffer.
+The per-statement `BackingConnectionCache` amortizes *connection resolution* only for the
+`'inverse-projection'` arm: each source row's backing ops are applied immediately, never
+buffered for an end-of-statement flush. This is load-bearing rather than incidental:
+covering-UNIQUE enforcement runs inside the source table's `update()` and scans the
+backing, so a later row of the same statement must observe an earlier row's backing write
+(`insert into t values (1,'a'),(2,'a')` over a covering `unique(x)` detects the
+duplicate). A coalescing write buffer would break enforcement unless the conflict probe
+also read the buffer. Every other arm — the residual arms and the full-rebuild floor —
+defers to the end-of-statement flush (MV-004), which is sound precisely because only an
+inverse-projection MV can serve as a covering structure: `findRowTimeCoveringStructure`
+declines every other plan kind, so no enforcement read ever consults a deferred backing.
 
-### MV-004 — Full-rebuild is the one deferred arm, and never a covering structure
+### MV-004 — The residual arms and full-rebuild defer per statement, and are never covering structures
 
-- code: `packages/quereus/src/core/database-materialized-views.ts` — `flushDeferredRebuilds`
+- code: `packages/quereus/src/core/database-materialized-views.ts` — `flushDeferredMaintenance`
 - code: `packages/quereus/src/core/database-materialized-views.ts` — `assertFlushRounds`
 - guard: `packages/quereus/test/incremental/maintenance-equivalence.spec.ts` — `read(MV) == evaluate(body) across random t/p mutations, in-txn and after rollback`
-- doc: [Materialized-View Maintenance § Full-rebuild floor](mv-maintenance.md#full-rebuild-floor)
+- guard: `packages/quereus/test/incremental/maintenance-equivalence.spec.ts` — `a multi-row statement flushes ONCE with statement-wide key dedup (no per-row dispatch)`
+- doc: [Materialized-View Maintenance § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)
 
-Running the floor per source row would cost O(rows × body), so a full-rebuild plan is
-dirtied per row and rebuilt once per statement, inside the statement-atomicity savepoint
-(and on the `OR FAIL` throw path, which has no such savepoint). This does not weaken
-MV-003, because a full-rebuild backing is never read mid-statement: the conflict probe
-consults only `'inverse-projection'` backings, which stay per-row-immediate. The flush is a
-worklist over the producer→consumer DAG, bounded by the registered row-time view count.
+Running the floor per source row would cost O(rows × body), and a residual arm one
+key-filtered scheduler run per touching row; so a full-rebuild plan is dirtied per row and
+rebuilt once per statement, and a residual plan's affected binding keys accumulate
+(deduped) and recompute once per distinct key at the same flush — inside the
+statement-atomicity savepoint (and on the `OR FAIL` throw path, which has no such
+savepoint). Recompute-from-live-state is last-write-wins, so the flush-time recompute
+equals the last per-row recompute. This does not weaken MV-003, because a deferred backing
+is never read mid-statement: the conflict probe consults only `'inverse-projection'`
+backings, which stay per-row-immediate. The flush is a worklist over the
+producer→consumer DAG, bounded by the registered row-time view count; before running
+per-key residuals it re-costs the statement (`shouldDegradeToRebuild`) and demotes to one
+whole-body `'replace-all'` rebuild when k residual runs cost more.
 
 ### MV-005 — An MV-over-MV cascade completes in the originating transaction
 

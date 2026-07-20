@@ -173,6 +173,18 @@ export function buildMaintenancePlan(ctx: MaterializedViewManagerContext, mv: Ma
 
 	// Try a bounded-delta arm; a shape that fits none falls through to the floor.
 	const boundedDelta = tryBuildBoundedDeltaArm(ctx, mv, analyzed);
+	// A residual arm additionally carries the whole-body scheduler — the per-statement
+	// degrade-to-rebuild escape: when a statement's distinct affected-key count makes k
+	// residual runs cost more than one rebuild (`shouldDegradeToRebuild`), the flush runs
+	// this and applies a single `'replace-all'` diff instead. Compiled here (not per arm
+	// builder) so the three residual arms share one compilation site; inverse-projection
+	// never degrades (always the cheapest arm) and the floor has its own bodyScheduler.
+	// NOTE: adds one whole-body optimize+emit per residual-MV (re)registration; if
+	// registration latency ever matters (e.g. bulk catalog import), compile this lazily
+	// on the first degrade instead.
+	if (boundedDelta && boundedDelta.kind !== 'inverse-projection' && boundedDelta.kind !== 'full-rebuild') {
+		boundedDelta.fullRebuildScheduler = compileWholeBodyScheduler(ctx, analyzed);
+	}
 	const plan = boundedDelta ?? buildFullRebuildPlan(ctx, mv, analyzed);
 	// Precompute the NOT-NULL ordering-seeded PK skew guard once, here at plan build —
 	// which `alter … drop not null` re-runs (it recompiles the row-time plan live), so the
@@ -579,7 +591,6 @@ export function buildAggregateResidualPlan(
 		chosenStrategy,
 		sourceStats,
 		binding: { kind: 'group', groupColumns: [...groupColumns] },
-		degradeToRebuild: false,
 		residualScheduler,
 		bindParamPrefix: 'gk',
 		bindColumns: groupColumns,
@@ -769,7 +780,6 @@ export function buildJoinResidualPlan(
 		chosenStrategy,
 		sourceStats,
 		binding: { kind: 'row', keyColumns: [...tPkCols] },
-		degradeToRebuild: false,
 		residualScheduler: forwardResidual,
 		bindParamPrefix: 'pk',
 		bindColumns: tPkCols,
@@ -988,6 +998,21 @@ export function compileResidual(
 }
 
 /**
+ * Compile the WHOLE optimized body (no key filter, read-side rewrite suppressed) into a
+ * reusable {@link Scheduler} — the residual arms' per-statement degrade-to-rebuild
+ * escape ({@link ResidualArmCommon.fullRebuildScheduler}). Mirrors the floor's own
+ * `bodyScheduler` compilation in {@link buildFullRebuildPlan}: run to completion against
+ * live mid-transaction source state, its rows feed a single `'replace-all'` keyed diff.
+ */
+function compileWholeBodyScheduler(ctx: MaterializedViewManagerContext, analyzed: BlockNode): Scheduler {
+	const db = ctx as unknown as Database;
+	const optimized = db.schemaManager.withSuppressedMaterializedViewRewrite(
+		() => ctx.optimizer.optimize(analyzed, db) as BlockNode,
+	);
+	return new Scheduler(emitPlanNode(optimized, new EmissionContext(db)));
+}
+
+/**
  * Build a `'prefix-delete'` plan for a single-source lateral-TVF fan-out body
  * (`select T.pk…, …, f.* from T cross join lateral tvf(<args over T>) f`), or return
  * `null` on a shape mismatch (the caller falls through to the full-rebuild floor). The
@@ -1159,7 +1184,6 @@ export function buildLateralTvfPrefixDeletePlan(
 		chosenStrategy,
 		sourceStats,
 		binding: { kind: 'row', keyColumns: [...sourcePkCols] },
-		degradeToRebuild: false,
 		residualScheduler,
 		bindParamPrefix: 'pk',
 		bindColumns: sourcePkCols,
