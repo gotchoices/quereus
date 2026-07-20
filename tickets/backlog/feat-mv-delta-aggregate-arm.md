@@ -22,31 +22,83 @@ add an optional algebraic declaration to `AggregateFunctionSchema` (`schema/func
 alongside the existing `stepFunction`/`finalizeFunction`/`initialValue` fold:
 
 ```ts
-/** Optional algebraic structure over the accumulator. Absent field = property not held. */
+/** Optional algebraic structure over the accumulator. Absent field = property not held.
+ *  Algebra functions are peers of stepFunction: they see the same accumulator
+ *  representation and the same comparison/collation context step sees. */
 algebra?: {
-	/** Commutative, associative combine of two accumulators (semigroup with the
-	 *  existing initialValue as identity). Enables partial aggregation: rollup,
-	 *  sharded/parallel aggregation, delta insert-tightening. */
-	merge?: (a: AggValue, b: AggValue) => AggValue;
-	/** Inverse of stepFunction (abelian group). Enables retraction — full delta
-	 *  maintenance under insert/update/delete. */
-	inverse?: AggregateReducer;
+	/** Commutative, associative combine of two accumulators, with (a clone of)
+	 *  initialValue as identity — a commutative monoid. Enables partial
+	 *  aggregation: rollup, sharded/parallel aggregation, delta insert-tightening. */
+	merge: (a: AggValue, b: AggValue) => AggValue;
+	/** Group inverse: merge(a, negate(a)) ≡ identity — lifts the monoid to an
+	 *  abelian group. Enables retraction (delete/update), i.e. full delta
+	 *  maintenance. Retracting one source row x is merge(acc, negate(step(identity, x))). */
+	negate?: (a: AggValue) => AggValue;
+	/** Section of finalizeFunction: reconstruct a working accumulator from the
+	 *  STORED output value. Required for backing-delta maintenance because the
+	 *  backing row holds finalized values, not accumulators. Omit when finalize
+	 *  is identity-like (count); trivial for sum (stored v → {sum: v}, NULL → null);
+	 *  IMPOSSIBLE for avg (the quotient forgets the count) — which is precisely
+	 *  what makes avg non-delta-maintainable as a stored column (see `decompose`). */
+	decode?: (stored: SqlValue) => AggValue;
+	/** Rewrite recipe onto sibling partial aggregates: this aggregate's value is
+	 *  a scalar expression over other (algebra-complete) aggregates — e.g.
+	 *  avg(x) ≡ sum(x) / count(x). Lets a stored column be maintained by
+	 *  delta-maintaining its partials when they are ALSO stored in the same body,
+	 *  and lets the read-side rollup recombine it. */
+	decompose?: AggregateDecomposition;
 }
 ```
 
-Every behavior then **derives generically** — no per-function branches anywhere downstream:
+**Laws** (the UDAF author's contract — see verification below):
 
-- `inverse` present (sum, count, total, bit-xor…): full delta maintenance — fold the
-  statement's changes into a per-group accumulator delta, apply with one read-modify-write per
-  affected group. A group whose maintained `count(*)` reaches 0 maps to the point delete.
-- `merge` only (min, max, bit_or/and, bool_or/and): inserts tighten the stored value via
-  `merge`; a retraction that could relax it falls back to the existing key-filtered residual
-  recompute *for that group only*. min/max are not special cases — "no inverse ⇒ rescan on
-  retraction" is the general rule and their behavior falls out of it.
-- neither (any `distinct` aggregate, `group_concat`, UDAFs that declare nothing): the body
-  keeps `'residual-recompute'` exactly as today. Exclusion is structural, never a name list.
-- User-defined aggregates that declare `algebra` participate in all of the above with zero
-  engine changes — the point of the seam.
+1. `merge` associative + commutative; `merge(a, identity) ≡ a`.
+2. Step/merge coherence: `step(a, x) ≡ merge(a, step(identity, x))` — every row's
+   contribution is expressible as a mergeable singleton, so per-statement deltas fold.
+3. `merge(a, negate(a)) ≡ identity`, hence retract∘insert of the same row is a no-op.
+4. Decode is observational: `finalize(merge(decode(finalize(a)), b)) ≡ finalize(merge(a, b))` —
+   a stored value round-trips to an accumulator that behaves identically under further merges.
+   (Not bijectivity: sum's decode maps stored 5 to `{sum: 5}` even if the true accumulator saw
+   NULLs — sound because NULL contributions are merge-identity for sum.)
+
+Every behavior then **derives generically** — no per-function branches anywhere downstream.
+A stored aggregate column is:
+
+- **delta-maintainable** ⇔ (`negate` ∧ decodable) — sum, count, total, bit-xor, any UDAF over
+  an abelian group. Fold the statement's changes per group; one read-modify-write per affected
+  group at flush.
+- **tighten-only** ⇔ (`merge` ∧ no `negate`) — min, max, bit_or/and, bool_or/and. Inserts
+  merge in; a retraction that could relax the stored value falls back to the key-filtered
+  residual recompute *for that group only*. min/max are not special cases — this is the
+  general no-inverse rule.
+- **decomposition-maintained** ⇔ (`decompose` ∧ every partial present as a sibling stored
+  column ∧ each partial delta-maintainable) — delta-maintain the partials, re-evaluate the
+  combine expression per affected group at flush. This is the general form of the avg
+  treatment; a UDAF like geometric mean declares `decompose` onto sum-of-logs + count.
+- **neither** (any `distinct` aggregate, order-sensitive `group_concat`, UDAFs declaring
+  nothing): the body keeps `'residual-recompute'` exactly as today. Exclusion is structural,
+  never a name list. An author whose accumulator cannot round-trip through the stored value
+  and has no decomposition can still get delta maintenance **compositionally**: store the
+  encoded accumulator as the MV column (finalize = identity from the engine's view) and
+  finalize in a plain view over the MV — no engine machinery, just the layering the engine
+  already provides.
+
+**Group emptiness needs multiplicity.** A retraction that empties a group must emit the point
+delete, but `sum = NULL` does not distinguish "no rows" from "all-NULL rows". Structural
+resolution ladder, no special cases: (a) the body stores a column whose algebra proves
+multiplicity (a `count(*)`-shaped column — detected by algebra, not by name) → use it;
+(b) otherwise this MV keeps the residual arm for deletes/updates (inserts may still delta);
+(c) the general fix is the Z-set / hidden-multiplicity backing already sketched in
+`docs/todo.md` § Bag materialization — that ticket, if it lands, removes case (b) entirely
+and is the natural convergence point.
+
+**Law verification (trust, then check).** The engine cannot prove user-declared laws, so:
+export a `fast-check`-based law harness (validate an `AggregateFunctionSchema.algebra` against
+generated inputs — laws 1-4 above) as a testing utility plugin authors run against their own
+functions; run it over every builtin in CI; and extend the maintenance-equivalence oracle with
+a test-registered UDAF that declares algebra (plus a negative twin with a deliberately broken
+law, pinning that the harness catches it). The equivalence harness remains the end-to-end
+net: a violated law surfaces as `read(MV) != evaluate(body)`.
 
 Consumers to unify on the declarations (this is a requirement, not an aside):
 
@@ -57,18 +109,20 @@ Consumers to unify on the declarations (this is a requirement, not an aside):
    `finalizeFunction(initialValue)`, the same trick `rule-scalar-agg-decorrelation.ts` already
    uses generically.)
 3. Future, not this ticket: sharded/parallel aggregation and sliding window frames read
-   `merge`/`inverse` from the same field.
+   `merge`/`negate` from the same field.
 
-## `avg`: eliminate the special case rather than generalize it
+## `avg` is just the first `decompose` client
 
-`avg` is special-cased on the read side (recombine as `sum(sumCol)/sum(countCol)`, requires
-stored partials) and would need hidden partial columns on the write side. Prefer evaluating a
-**plan-time canonicalization `avg(x) → sum(x) / count(x)`** (standard in other engines): if
-sound for Quereus typing (`/` is already real division, matching native `avg`; NULL-over-empty
-falls out as NULL/0 ⇒ NULL), avg vanishes from the algebra entirely and both existing special
-cases are deleted. If canonicalization is rejected (typing or plan-shape cost), fall back to
-requiring the body to store the partials (the read-side rollup's existing stance) — but do not
-add hidden-column plumbing.
+`avg` is currently special-cased on the read side (recombine as `sum(sumCol)/sum(countCol)`,
+requires stored partials). Under this design it is nothing special: its builtin declares
+`decompose` onto `sum(x)` / `count(x)` with combine `s / c` (Quereus `/` is already real
+division, matching native `avg`; NULL/0 over the empty group ⇒ NULL), and both the write-side
+delta arm and the read-side rollup consume that declaration through the same generic
+decomposition path any UDAF uses. A separate plan-time canonicalization `avg(x) →
+sum(x)/count(x)` remains worth evaluating as an engine-wide simplification, but is no longer
+load-bearing for this ticket. No hidden-column plumbing in either case: a decomposed column is
+maintainable only when its partials are stored as sibling columns; otherwise that MV keeps the
+residual arm — structural, honest, and visible to the user in the body they wrote.
 
 ## Fit with the maintenance substrate
 
@@ -93,11 +147,13 @@ escape hatch, though delta should usually win.
   (same backing connection, same savepoint behavior).
 - Numeric fidelity: repeated float add/subtract drifts where a rescan would not. Policy must
   be settled at plan stage — e.g. integer/bigint accumulators delta exactly; float `sum`
-  either accepts drift consistent with SQL sum semantics or declines `inverse` (declaring
+  either accepts drift consistent with SQL sum semantics or declines `negate` (declaring
   `merge` only, degrading gracefully to tighten+rescan). The declaration seam makes this a
   per-function choice, not an engine branch.
-- NULL semantics derive from the existing fold: `step`/`inverse` see the same argument NULLs,
-  `count(x)` vs `count(*)` differ only in their step/inverse pair.
+- NULL semantics derive from the existing fold: `step` and the negate-of-singleton retraction
+  see the same argument NULLs; `count(x)` vs `count(*)` differ only in their step functions.
+  Law 4's observational form is what makes NULL-blind decodes sound (sum's decode need not
+  know how many NULLs the true accumulator ignored).
 - Oracle: `test/incremental/maintenance-equivalence.spec.ts` must pass unchanged, including
   rollback and NULL zoos; extend its shape zoo with merge-only (min/max retraction) and
   UDAF-declared-algebra cases.
