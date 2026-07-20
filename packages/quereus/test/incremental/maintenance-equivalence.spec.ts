@@ -2503,4 +2503,46 @@ describe('Materialized-view maintenance statement batching (residual arms)', () 
 			expect(await readMultiset(db, 'select * from mv3')).to.deep.equal(await readOracle(db, mv3Oracle));
 		});
 	});
+
+	// The 1:1 inner-join arm accumulates forward (`T`-PK) and lookup (`P`-PK) keys under
+	// separate batch maps; the property suite drives it a key-at-a-time, so these pin the
+	// genuinely-multi-key batch — several distinct keys of ONE variant accumulated in a
+	// single multi-row statement flushing exactly once.
+	describe('join-residual arm — multi-key statement batch', () => {
+		let db: Database;
+		const body = 'select t.id, t.fk, p.name from t join p on t.fk = p.id';
+
+		beforeEach(async () => {
+			db = new Database();
+			await db.exec('create table p (id integer primary key, name text)');
+			await db.exec('create table t (id integer primary key, fk integer not null references p(id))');
+			await db.exec("insert into p (id, name) values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')");
+			// Two t rows per p so a per-p recompute touches >1 backing row.
+			await db.exec('insert into t (id, fk) values (1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 3)');
+			await db.exec(`create materialized view mv as ${body}`);
+			expect(registeredPlanKind(db, 'mv'), 'join arm').to.equal('join-residual');
+		});
+		afterEach(async () => { await db.close(); });
+
+		it('a multi-row lookup-side (p) update flushes ONCE over several distinct P keys', async () => {
+			const records = instrumentSeams(db);
+			// One statement rewriting three distinct p rows → three distinct lookup keys.
+			await db.exec("update p set name = name || '!' where id <= 3");
+			const flushes = records.filter(r => r.mv === 'mv' && r.seam === 'residual-flush');
+			expect(flushes.length, 'exactly one flush for the statement').to.equal(1);
+			expect(flushes[0].distinctKeys, 'three distinct P keys deduped in one batch').to.equal(3);
+			expect(records.filter(r => r.mv === 'mv' && r.seam === 'dispatch'), 'no per-row dispatch').to.deep.equal([]);
+			await assertEquivalent(db, body, 'after multi-key lookup-side batch');
+		});
+
+		it('a multi-row forward-side (t) FK-move flushes ONCE over several distinct T keys', async () => {
+			const records = instrumentSeams(db);
+			// One statement moving both fk=1 rows (ids 1,2) to fk=4 → two forward keys.
+			await db.exec('update t set fk = 4 where fk = 1');
+			const flushes = records.filter(r => r.mv === 'mv' && r.seam === 'residual-flush');
+			expect(flushes.length, 'exactly one flush for the statement').to.equal(1);
+			expect(flushes[0].distinctKeys, 'two distinct T keys deduped in one batch').to.equal(2);
+			await assertEquivalent(db, body, 'after multi-key forward-side batch');
+		});
+	});
 });
