@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-20T14:27:34.450Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\feat-mv-delta-aggregate-arm.plan.2026-07-20T14-27-34-450Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Let aggregate functions declare their algebraic structure (how to combine and retract values) once on the function schema, then use those declarations to maintain aggregate materialized views by pure arithmetic on the stored group row — no re-reading of source rows, and user-defined aggregates participate for free.
 prereq: mv-maintenance-statement-batching
 files: packages/quereus/src/schema/function.ts, packages/quereus/src/func/builtins/aggregate.ts, packages/quereus/src/planner/analysis/query-rewrite-matcher.ts, packages/quereus/src/core/database-materialized-views-plans.ts, packages/quereus/src/core/database-materialized-views-plan-builders.ts, packages/quereus/src/core/database-materialized-views-apply.ts, packages/quereus/src/planner/cost/index.ts, docs/mv-maintenance.md
