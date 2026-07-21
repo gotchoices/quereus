@@ -247,6 +247,10 @@ function* scanLayerResolved(
 			if (plan.lowerBound) compositeStart.push(plan.lowerBound.value);
 			// Mirror the primary branch: a non-composite index stores SCALAR keys, so
 			// a single-element prefix must seek with the scalar (see above).
+			// NOTE: latent mirror — no consumer today emits a single-column secondary-index
+			// equalityPrefix seek (single-column equality goes through `equalityKey`), so
+			// this branch has no direct test. If one ever does, add a targeted prefix-scan
+			// test; the primary branch is exercised by every delta-aggregate flush.
 			startKey = {
 				value: (!isComposite && compositeStart.length === 1
 					? compositeStart[0]
