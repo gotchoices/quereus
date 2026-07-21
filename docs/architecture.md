@@ -183,7 +183,7 @@ Being deterministic, it needs no `nondeterministic_schema` opt-out (a `max()` su
 
 ## Optimizer
 
-Quereus features a sophisticated rule-based query optimizer that transforms logical plans into efficient physical execution plans. The optimizer uses a single plan node hierarchy with logical-to-physical transformation, generic tree rewriting infrastructure, and comprehensive optimization rules including constant folding, intelligent caching, streaming aggregation, bloom (hash) join selection for equi-joins, and correlated subquery decorrelation (EXISTS/IN → semi/anti joins).
+Quereus features a sophisticated rule-based query optimizer that transforms logical plans into efficient physical execution plans. The optimizer uses a single plan node hierarchy with logical-to-physical transformation, generic tree rewriting infrastructure, and comprehensive optimization rules including constant folding, intelligent caching, streaming aggregation, bloom (hash) join selection for equi-joins, and correlated subquery decorrelation (EXISTS/IN in a WHERE clause → semi/anti joins; EXISTS/IN or scalar aggregates in a SELECT list → existence-flag / grouped left joins).
 
 See the [Optimizer Documentation](optimizer.md) for architecture details, [Functional Dependency Tracking](optimizer-fd.md) for the FD / EC / inclusion-dependency surface, and [Optimizer Conventions](optimizer-conventions.md) for development guidelines.
 

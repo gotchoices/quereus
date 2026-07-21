@@ -428,6 +428,11 @@ export function ruleExistsInSelectDecorrelation(node: PlanNode, _context: OptCon
  * deterministic pre-order. A recognized node is a leaf for this walk — its
  * relational body is not descended (a nested subquery inside it stays part of
  * its branch).
+ *
+ * NOTE: dedup is by node identity only. Two *distinct* nodes with identical SQL
+ * (`exists(...) as a, exists(...) as b` over the same body) each build their own
+ * flag join; if such repeated correlated subqueries in one projection ever show
+ * up as a cost, dedup by structural equality here to share a single join.
  */
 function collectProjectionCandidates(exprs: readonly ScalarPlanNode[]): Array<ExistsNode | InNode> {
 	const out: Array<ExistsNode | InNode> = [];
