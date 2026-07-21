@@ -3030,6 +3030,69 @@ describe('Materialized-view maintenance equivalence (tighten class: min/max)', (
 	});
 });
 
+/** min/max over NON-integer argument domains (TEXT, REAL). The tighten branch has NO
+ *  exact-value-domain gate (`merge` is idempotent selection, not accumulating arithmetic, so no
+ *  drift), so these ARE delta-eligible — an interaction the integer-only suites above never touch.
+ *  Correctness rests on maintenance and the live oracle using the SAME comparison: the min/max
+ *  builtins compare with `BINARY_COLLATION` in both `step` and `merge`, and the oracle re-runs the
+ *  same builtin, so the two agree byte-for-byte regardless of the column's declared collation
+ *  (min/max's fixed-BINARY compare vs a declared column collation is a pre-existing builtin
+ *  question — see docs/mv-maintenance.md § Tighten-only columns — not introduced by this path). */
+describe('Materialized-view maintenance equivalence (tighten class: min/max over TEXT / REAL)', () => {
+	let db: Database;
+
+	afterEach(async () => { await db.close(); });
+
+	it('TEXT min/max: inserts tighten, delete of the BINARY extreme re-derives the next-best', async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, k integer, a text)');
+		await db.exec(`create materialized view mv as select k, count(*) as c, min(a) as mn, max(a) as mx from t group by k`);
+		const body = 'select k, count(*) as c, min(a) as mn, max(a) as mx from t group by k';
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.chosenStrategy, 'TEXT min/max is delta-eligible (no exact-domain gate)').to.equal('delta-aggregate');
+		expect(plan.delta!.hasTighten, 'flagged tighten').to.equal(true);
+		// BINARY order: 'Apple' < 'Cherry' < 'apple' (uppercase precedes lowercase in code-point order).
+		await db.exec(`insert into t (id, k, a) values (1, 1, 'Cherry'), (2, 1, 'apple'), (3, 1, 'Apple')`);
+		await assertEquivalent(db, body, 'after inserts');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'min Apple, max apple')
+			.to.deep.equal([canonRow(['Apple', 'apple'])]);
+		await db.exec(`delete from t where id = 2`); // removes 'apple', the BINARY max
+		await assertEquivalent(db, body, 'delete of the max re-derives next-best');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'max relaxes to Cherry')
+			.to.deep.equal([canonRow(['Apple', 'Cherry'])]);
+	});
+
+	it('TEXT min/max under a NOCASE-declared column: maintenance still equals the live oracle', async () => {
+		db = new Database();
+		// Column declares `collate nocase`, but min/max compare BINARY in both maintenance and the
+		// live oracle, so the MV and a fresh evaluation still agree — the equivalence this path must
+		// preserve. (Whether min() SHOULD honor the column collation is orthogonal and pre-existing.)
+		await db.exec('create table t (id integer primary key, k integer, a text collate nocase)');
+		const body = 'select k, min(a) as mn, max(a) as mx, count(*) as c from t group by k';
+		await db.exec(`create materialized view mv as ${body}`);
+		await db.exec(`insert into t (id, k, a) values (1, 1, 'banana'), (2, 1, 'Apple'), (3, 1, 'cherry')`);
+		await assertEquivalent(db, body, 'nocase column, binary min/max');
+		await db.exec(`delete from t where id = 2`); // deletes the BINARY min 'Apple'
+		await assertEquivalent(db, body, 'nocase column after extreme delete');
+	});
+
+	it('REAL min/max: byte-exact selection under inserts and an extreme delete', async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, k integer, a real)');
+		const body = 'select k, count(*) as c, min(a) as mn, max(a) as mx from t group by k';
+		await db.exec(`create materialized view mv as ${body}`);
+		expect(registeredDeltaPlan(db, 'mv').chosenStrategy, 'REAL min/max delta-eligible').to.equal('delta-aggregate');
+		await db.exec(`insert into t (id, k, a) values (1, 1, 3.5), (2, 1, 1.25), (3, 1, 7.75)`);
+		await assertEquivalent(db, body, 'REAL inserts');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'min 1.25, max 7.75')
+			.to.deep.equal([canonRow([1.25, 7.75])]);
+		await db.exec(`delete from t where id = 3`); // removes 7.75, the max
+		await assertEquivalent(db, body, 'REAL delete of the max');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'max relaxes to 3.5')
+			.to.deep.equal([canonRow([1.25, 3.5])]);
+	});
+});
+
 /** A UDAF join-semilattice (`bit_or(a)` — `merge`, `decode`, no `negate`) delta-maintained by
  *  the SAME tighten arm min/max use — proving the class is declaration-driven, not a builtin
  *  allow-list. Inserts OR the new bits into the stored value; a retraction re-derives the group
