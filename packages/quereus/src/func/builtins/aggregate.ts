@@ -63,6 +63,9 @@ export const sumFunc = createAggregateFunction(
 			// witness for "non-empty" (finalize only distinguishes zero from non-zero
 			// count), not the true contribution count, which the quotient-free stored
 			// sum cannot recover.
+			// NOTE: type-trusts its input — a non-numeric stored value poisons the
+			// accumulator. Sound while the only caller is the delta arm reading back a
+			// value this same aggregate wrote; validate here when feat-mv-agg-delta-arm lands.
 			decode: (stored: SqlValue): SumAccumulator =>
 				stored === null ? null : { sum: stored as number | bigint, count: 1 },
 		},
