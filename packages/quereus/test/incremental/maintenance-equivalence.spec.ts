@@ -2722,6 +2722,22 @@ describe('Materialized-view maintenance equivalence (decompose class: avg via st
 		await assertEquivalent(db, body, 'after avg change');
 		expect(await readMultiset(db, 'select av from mv where k = 1'), 'avg((10+6)/2) = 8').to.deep.equal([canonRow([8])]);
 	});
+
+	// Guards the two-pass partial binding: the decompose column may project BEFORE the
+	// partials it names, so resolution cannot happen inline in the first column pass. A
+	// single-pass regression would fail to bind avg here and drop the whole MV to residual.
+	// Reuses the `mv` name so the hardwired `assertEquivalent` oracle reads this view.
+	it('avg projected BEFORE its stored partials is still delta-maintained and equivalent', async () => {
+		await db.exec('drop materialized view mv');
+		const preBody = 'select k, avg(a) as av, sum(a) as s, count(*) as c from t group by k';
+		await db.exec(`create materialized view mv as ${preBody}`);
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.chosenStrategy, 'partial-before ordering still resolves').to.equal('delta-aggregate');
+		expect(plan.delta!.decomposeColumns.length, 'avg bound despite projecting first').to.equal(1);
+		await db.exec('insert into t (id, k, a) values (20, 1, 8)'); // k=1 avg (4+6+8)/3 = 6
+		await assertEquivalent(db, preBody, 'avg-first after insert');
+		expect(await readMultiset(db, 'select av from mv where k = 1'), 'avg = 6').to.deep.equal([canonRow([6])]);
+	});
 });
 
 /** avg over a NULLABLE arg with `count(a)` stored explicitly (the NULL-excluding divisor, not

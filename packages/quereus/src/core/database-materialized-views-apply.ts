@@ -974,6 +974,12 @@ export async function computeDeltaAggregateOps(
 		// is non-empty here (multiplicity > 0), so a fully-emptied group is deleted above
 		// before combine could divide by zero; a non-empty all-NULL group finalizes count(x)
 		// = 0 and combine yields NULL, matching native avg.
+		// NOTE: byte-exactness vs a live re-fold holds while a group's integer sum stays
+		// ≤ 2^53. `avg`'s live finalize accumulates its own sum as a float, whereas this
+		// recombine reads the exact (bigint-capable) stored `sum` partial; the two round
+		// differently only once a group sum exceeds the double safe-integer range. If that
+		// regime ever becomes reachable, avg's finalize would need bigint accumulation (a
+		// change in aggregate.ts), not a change here.
 		for (const dc of d.decomposeColumns) {
 			row[dc.backingCol] = dc.combine(dc.partialIndices.map(pi => finals[pi]));
 		}
