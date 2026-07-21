@@ -221,14 +221,16 @@ export function chooseCheapest<T>(options: Array<{ cost: number; option: T }>): 
 
 /**
  * The maintenance strategies the incremental substrate **costs** — a subset of
- * `MaintenancePlan['kind']` in core/database-materialized-views.ts. The arms the cost
- * model does not distinguish (`'prefix-delete'`, `'join-residual'`) record the strategy
- * they are costed as (`'residual-recompute'`) in their `chosenStrategy`. Each arm builder
- * calls {@link selectMaintenanceStrategy} with its own singleton sound set and rejects any
- * other answer as INTERNAL, so the gate can never hand back a strategy no arm implements
- * (docs/invariants.md MV-007).
+ * `MaintenancePlan['kind']` in core/database-materialized-views.ts, plus
+ * `'delta-aggregate'`: the arithmetic fast path INSIDE the `'residual-recompute'` arm
+ * (the plan kind stays `'residual-recompute'`; the apply path routes on the plan's
+ * `delta` descriptor). The arms the cost model does not distinguish (`'prefix-delete'`,
+ * `'join-residual'`) record the strategy they are costed as (`'residual-recompute'`) in
+ * their `chosenStrategy`. Each arm builder calls {@link selectMaintenanceStrategy} with
+ * its own sound set and rejects any answer outside it as INTERNAL, so the gate can never
+ * hand back a strategy no arm implements (docs/invariants.md MV-007).
  */
-export type MaintenanceStrategy = 'inverse-projection' | 'residual-recompute' | 'full-rebuild';
+export type MaintenanceStrategy = 'inverse-projection' | 'residual-recompute' | 'delta-aggregate' | 'full-rebuild';
 
 /**
  * Default source row count above which a per-write `'full-rebuild'` is pathological under
@@ -285,6 +287,15 @@ export interface MaintenanceSourceStats {
  *    group. With stats, costed against rows-per-group (tableRows / distinctGroupsEstimate);
  *    with no stats, falls back to the legacy `deltaPerRowFallbackRatio` heuristic so
  *    behaviour is unchanged on the no-stats path.
+ *  - `'delta-aggregate'`: O(1) arithmetic per changed row plus one read-modify-write of
+ *    the stored group row per affected group — no source read, no residual re-execution.
+ *    Modeled as an index seek + reprojection per change (the same shape as
+ *    inverse-projection), CAPPED at half the residual per-group cost: per affected
+ *    group the delta does strictly less work than the residual (one point RMW vs a
+ *    key-filtered body re-execution over that group's source rows), so it must cost
+ *    strictly below `'residual-recompute'` for every stats input — including a
+ *    small/empty source at create time, where the residual's no-stats fallback
+ *    (`forwardBodyCost × ratio`) shrinks below any fixed constant.
  *  - `'full-rebuild'`: re-evaluate the whole body once — the always-correct floor,
  *    independent of changeCardinality.
  */
@@ -296,6 +307,11 @@ export function maintenanceCost(
 	switch (strategy) {
 		case 'inverse-projection':
 			return changeCardinality * (COST_CONSTANTS.INDEX_SEEK_PER_ROW + COST_CONSTANTS.PROJECT_PER_ROW);
+		case 'delta-aggregate':
+			return changeCardinality * Math.min(
+				COST_CONSTANTS.INDEX_SEEK_PER_ROW + COST_CONSTANTS.PROJECT_PER_ROW,
+				residualCostPerGroup(stats) * 0.5,
+			);
 		case 'residual-recompute':
 			return changeCardinality * residualCostPerGroup(stats);
 		case 'full-rebuild':

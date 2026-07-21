@@ -147,6 +147,19 @@ export function assertAggregateAlgebraLaws(
 		}), { numRuns }));
 	}
 
+	// Law 4b (decodeExact only): decode stays observational under RETRACTIONS —
+	// merging a negated accumulator through the decoded value agrees with merging it
+	// through the original. A witness decode (sum: the stored value forgets the true
+	// contribution count) fails this for a partial retraction, which is exactly why it
+	// must not declare `decodeExact`.
+	if (decode && algebra.decodeExact && negate) {
+		check('decode-exact-retraction', () => fc.assert(fc.property(valuesArb, valuesArb, (xs, ys) => {
+			const viaStore = algebra.merge(decode(schema.finalizeFunction(fold(schema, xs))), negate(fold(schema, ys)));
+			const direct = algebra.merge(fold(schema, xs), negate(fold(schema, ys)));
+			return accEquivalent(schema, viaStore, direct);
+		}), { numRuns }));
+	}
+
 	// Law 5: decompose — combining the partials' finalized values reproduces this
 	// aggregate's finalize over the same input rows.
 	const decompose = algebra.decompose;

@@ -2425,7 +2425,11 @@ describe('Materialized-view maintenance statement batching (residual arms)', () 
 
 	describe('per-statement degrade-to-rebuild demotion', () => {
 		let db: Database;
-		const body = 'select k, count(*) as c, sum(a) as s from src group by k';
+		// `min(b)` keeps this body OFF the delta-aggregate fast path (min declares no
+		// negate), so the plan stays a plain residual and the demotion crossover under
+		// test remains reachable — a delta-eligible body bypasses it by design (see the
+		// bypass pin below).
+		const body = 'select k, count(*) as c, sum(a) as s, min(b) as mn from src group by k';
 
 		beforeEach(async () => {
 			db = new Database();
@@ -2461,6 +2465,25 @@ describe('Materialized-view maintenance statement batching (residual arms)', () 
 			await db.exec('insert into src (id, a, b, k) values (30, 1, 0, 1)');
 			expect(records.filter(r => r.seam === 'replace-all' && r.mv === 'mv').length, 'no further rebuilds').to.equal(1);
 			await assertEquivalent(db, body, 'after post-degrade single-row statement');
+		});
+
+		it('a delta-aggregate body BYPASSES the demotion — no replace-all even over the crossover', async () => {
+			// Same crossover-pinned stats, but a delta-eligible body (count + integer
+			// sum, no min): the flush maintains each group by arithmetic RMW, which is
+			// already O(affected groups) with no residual runs, so the residual↔rebuild
+			// crossover never applies.
+			const deltaBody = 'select k, count(*) as c, sum(a) as s from src group by k';
+			await db.exec(`create materialized view mv_delta as ${deltaBody}`);
+			const plan = seamManager(db).rowTime.get('main.mv_delta');
+			expect(plan, 'registered delta plan').to.exist;
+			expect((plan as { chosenStrategy?: string }).chosenStrategy, 'cost gate chose the delta strategy').to.equal('delta-aggregate');
+			plan!.sourceStats = { tableRows: 10, forwardBodyCost: 1, fallbackRatio: 0.5 };
+			const records = instrumentSeams(db);
+			await db.exec('insert into src (id, a, b, k) values (20, 1, 0, 3), (21, 1, 0, 4), (22, 1, 0, 5), (23, 1, 0, 6)');
+			expect(records.filter(r => r.seam === 'replace-all' && r.mv === 'mv_delta'), 'no demotion on the delta path').to.deep.equal([]);
+			// assertEquivalent reads the fixed name `mv`; compare mv_delta inline.
+			expect(await readMultiset(db, 'select * from mv_delta'), 'delta path over the crossover')
+				.to.deep.equal(await readGroundTruth(db, deltaBody));
 		});
 	});
 

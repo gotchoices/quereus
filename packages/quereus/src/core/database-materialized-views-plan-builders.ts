@@ -9,8 +9,11 @@
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import { BlockNode } from '../planner/nodes/block.js';
-import { type RowDescriptor } from '../planner/nodes/plan-node.js';
+import { type PlanNode, type RowDescriptor, type ScalarPlanNode } from '../planner/nodes/plan-node.js';
 import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
+import { AggregateFunctionCallNode } from '../planner/nodes/aggregate-function.js';
+import { isAggregateFunctionSchema } from '../schema/function.js';
+import { PhysicalType } from '../types/logical-type.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { emitPlanNode } from '../runtime/emitters.js';
 import { EmissionContext } from '../runtime/emission-context.js';
@@ -41,6 +44,7 @@ import {
 	findNonReplicableCollation,
 	findNonDeterministic,
 	normalizeCollation,
+	isBinaryCollation,
 	findAggregate,
 	containsNodeType,
 	containsAnyJoin,
@@ -67,6 +71,8 @@ import type {
 	FullRebuildPlan,
 	BackingProjector,
 	BackingPkColumn,
+	DeltaAggregateColumn,
+	DeltaAggregateDescriptor,
 } from './database-materialized-views-plans.js';
 import type { CollationResolver } from '../types/logical-type.js';
 import { BINARY_COLLATION } from '../util/comparison.js';
@@ -565,17 +571,30 @@ export function buildAggregateResidualPlan(
 	const residualScheduler = compileResidual(ctx, analyzed, relKey, groupColumns, 'gk');
 	if (!residualScheduler) return null; // could not parameterize the residual → floor
 
+	// Delta-aggregate fast path: build the descriptor when EVERY stored aggregate
+	// column is delta-maintainable by its declared algebra (see the builder below).
+	// `undefined` on any gate failure — the arm then stays a plain residual, unchanged.
+	const delta = buildDeltaAggregateDescriptor(
+		mv, analyzed, tableRef, groupColumns, backingPkDefinition, backingPkSourceCols,
+		rootAttrs, sourceAttrToCol, producingByAttrId,
+	);
+
 	// ── Cost gate ──
 	// The residual is the structurally-sound incremental arm for an aggregate body;
 	// 'full-rebuild' is the always-correct floor for shapes where the residual is NOT
-	// sound, so (as with inverse-projection) it is not a competitor here. We still
-	// record the chosen strategy + cost inputs for parity with the substrate.
-	const soundStrategies: MaintenanceStrategy[] = ['residual-recompute'];
+	// sound, so (as with inverse-projection) it is not a competitor here. When the delta
+	// descriptor built, 'delta-aggregate' joins the sound set — an O(1)-per-change
+	// arithmetic RMW, strictly cheaper than the per-group residual under the cost model,
+	// so the argmin picks it. The descriptor is attached only when the gate chose it
+	// (cost-strategy decoupling: `kind` stays 'residual-recompute' either way).
+	const soundStrategies: MaintenanceStrategy[] = delta
+		? ['delta-aggregate', 'residual-recompute']
+		: ['residual-recompute'];
 	const hasPredicate = mv.derivation.selectAst.type === 'select' && mv.derivation.selectAst.where !== undefined;
 	const sourceStats = estimateMaintenanceStats(ctx, tableRef.tableSchema, backing.columns.length, hasPredicate);
 	const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 	const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
-	if (chosenStrategy !== 'residual-recompute') {
+	if (!soundStrategies.includes(chosenStrategy)) {
 		throw new QuereusError(
 			`Internal error: cost gate selected unwired strategy '${chosenStrategy}' for materialized view '${mv.name}'`,
 			StatusCode.INTERNAL,
@@ -596,7 +615,193 @@ export function buildAggregateResidualPlan(
 		bindColumns: groupColumns,
 		backingPkDefinition,
 		backingPkSourceCols,
+		delta: chosenStrategy === 'delta-aggregate' ? delta : undefined,
 	};
+}
+
+/**
+ * Build the {@link DeltaAggregateDescriptor} for a single-source aggregate body, or
+ * return `undefined` when any column fails the delta eligibility gate (the arm then
+ * stays a plain residual — a gate failure is never an error). Function-generic by
+ * construction: every judgment reads the aggregate call node's registry-resolved
+ * schema and its DECLARED {@link AggregateAlgebra} — never an aggregate-name list.
+ *
+ * The gate, per stored backing column:
+ *  - a **group-key passthrough** column must resolve (transitively) to a GROUP BY
+ *    source column that also backs a backing-PK position (so its flush value is the
+ *    group key itself);
+ *  - an **aggregate** column must be a plain call (`agg(x)` / `agg()` — no DISTINCT,
+ *    FILTER, ORDER BY, multi-arg) whose declared algebra has `merge` + `negate` +
+ *    `decode`, with a **bare source column** argument (the delta steps the raw value);
+ *  - **exact value domain**: the aggregate's declared return type is INTEGER-physical
+ *    (count-shaped — exact regardless of argument), OR its argument column's static
+ *    type is INTEGER-physical (integer sum). A REAL/NUMERIC/TEXT sum drifts under
+ *    repeated add/subtract and would diverge byte-exactly from the live re-evaluation
+ *    the oracle compares against — such a column disqualifies the whole MV (residual);
+ *  - any other column shape (a constant, an expression over the group key, …) fails.
+ *
+ * Whole-body requirements:
+ *  - **no post-aggregate filter** (HAVING, or an outer WHERE over the aggregate
+ *    output): such a filter breaks the arithmetic invariant "stored row == the
+ *    group's full accumulator" — a filtered-out group has contributions but no
+ *    stored row, so a later delta would rebuild it from the identity and understate
+ *    the aggregate. The residual re-evaluates the filter per group and stays exact;
+ *  - a **count(*) multiplicity witness** — a zero-arg delta-maintainable column with
+ *    `decodeExact` (its stored value must reconstruct exactly, since it decides group
+ *    emptiness under retraction). Without it, emptiness cannot be told from an
+ *    all-NULL sum;
+ *  - **BINARY collations** on every backing-PK (group key) column: the flush's stored-
+ *    row read is the host's `scanEffective` equality-prefix seek, whose prefix compare
+ *    is binary (scan-layer.ts). Unlike the prefix-delete arm there is no source-PK
+ *    uniqueness collapsing collation classes to one byte form here, so a non-BINARY
+ *    group key could miss a collation-equal / byte-different stored row — residual
+ *    instead;
+ *  - a body WHERE (if any) must compile to a single-source-row predicate
+ *    (`compilePredicate`) so per-row contributions can be scoped exactly.
+ *
+ * Per-column `retractionSafe` (see {@link DeltaAggregateColumn}) is recorded rather
+ * than gated: a not-retraction-safe descriptor still serves the bulk-insert fast path,
+ * and the flush re-derives only the retracted groups through the residual.
+ */
+export function buildDeltaAggregateDescriptor(
+	mv: MaintainedTableSchema,
+	analyzed: BlockNode,
+	tableRef: TableReferenceNode,
+	groupColumns: readonly number[],
+	backingPkDefinition: ReadonlyArray<BackingPkColumn>,
+	backingPkSourceCols: readonly number[],
+	rootAttrs: ReadonlyArray<{ id: number } | undefined>,
+	sourceAttrToCol: Map<number, number>,
+	producingByAttrId: Map<number, ScalarPlanNode>,
+): DeltaAggregateDescriptor | undefined {
+	const sourceSchema = tableRef.tableSchema;
+	const groupColumnSet = new Set(groupColumns);
+
+	// Post-aggregate filter gate: a Filter whose subtree contains the aggregate is a
+	// HAVING (or an outer WHERE over the aggregate output). It breaks the arithmetic
+	// invariant "stored row == the group's full accumulator" — a filtered-out group has
+	// contributions but no stored row, so a later delta would rebuild it from the
+	// identity and understate the aggregate. (The body WHERE sits BELOW the aggregate —
+	// its Filter subtree contains no aggregate node — and stays delta-eligible via the
+	// compiled scope predicate below.)
+	if (hasFilterAboveAggregate(analyzed)) return undefined;
+
+	// Binary-collation gate on the backing PK (the flush's binary equality-prefix read).
+	for (const d of backingPkDefinition) {
+		if (!isBinaryCollation(d.collation)) return undefined;
+	}
+
+	// Body WHERE → single-row scope predicate (contributions outside it are dropped,
+	// mirroring the residual's own WHERE). An uncompilable WHERE shape → residual.
+	let predicate: CompiledPredicate | undefined;
+	const bodyWhere = mv.derivation.selectAst.type === 'select' ? mv.derivation.selectAst.where : undefined;
+	if (bodyWhere) {
+		try {
+			predicate = compilePredicate(bodyWhere, sourceSchema.columns);
+		} catch {
+			return undefined;
+		}
+	}
+
+	// Chase an output attr's producing chain to its terminal (non-ColumnReference)
+	// expression — the aggregate call node for an aggregate output column.
+	const resolveTerminalProducing = (attrId: number): ScalarPlanNode | undefined => {
+		const seen = new Set<number>();
+		let cur = attrId;
+		while (!seen.has(cur)) {
+			seen.add(cur);
+			const expr = producingByAttrId.get(cur);
+			if (expr instanceof ColumnReferenceNode) { cur = expr.attributeId; continue; }
+			return expr;
+		}
+		return undefined;
+	};
+
+	const aggColumns: DeltaAggregateColumn[] = [];
+	const groupOut: Array<{ readonly backingCol: number; readonly pkPos: number }> = [];
+	for (let outCol = 0; outCol < rootAttrs.length; outCol++) {
+		const attr = rootAttrs[outCol];
+		if (!attr) return undefined;
+		const sourceCol = resolveTransitiveSourceCol(attr.id, sourceAttrToCol, producingByAttrId);
+		if (sourceCol !== undefined) {
+			// Group-key passthrough: its flush value is the group key at the matching
+			// backing-PK position (covers duplicate projections of a group column).
+			if (!groupColumnSet.has(sourceCol)) return undefined;
+			const pkPos = backingPkSourceCols.indexOf(sourceCol);
+			if (pkPos < 0) return undefined;
+			groupOut.push({ backingCol: outCol, pkPos });
+			continue;
+		}
+		const producing = resolveTerminalProducing(attr.id);
+		if (!(producing instanceof AggregateFunctionCallNode)) return undefined;
+		// Plain call only: DISTINCT folds duplicates (delta cannot), FILTER/ORDER BY
+		// change the contribution set, multi-arg has no single raw value to step.
+		if (producing.isDistinct || producing.filter || (producing.orderBy && producing.orderBy.length > 0)) return undefined;
+		if (producing.args.length > 1) return undefined;
+		const schema = producing.functionSchema;
+		if (!isAggregateFunctionSchema(schema)) return undefined;
+		const algebra = schema.algebra;
+		// Delta-maintainable: merge + negate (retraction) + decode (the backing stores
+		// finalized values, not accumulators).
+		if (!algebra?.negate || !algebra.decode) return undefined;
+		let argSourceCol: number | undefined;
+		if (producing.args.length === 1) {
+			const arg = producing.args[0];
+			if (!(arg instanceof ColumnReferenceNode)) return undefined; // bare column args only
+			argSourceCol = resolveTransitiveSourceCol(arg.attributeId, sourceAttrToCol, producingByAttrId);
+			if (argSourceCol === undefined) return undefined;
+		}
+		// Exact numeric domain: an INTEGER-physical declared result (count-shaped — the
+		// accumulator never holds a float) or an INTEGER-physical argument column
+		// (integer sum). Anything else may drift under repeated add/subtract.
+		// NOTE: if a REAL-domain sum ever needs the fast path, it needs compensated
+		// (Kahan) accumulation or a periodic-rescan discipline — a design change, not a
+		// relaxation of this gate.
+		const resultExact = schema.returnType.logicalType.physicalType === PhysicalType.INTEGER;
+		const argExact = argSourceCol !== undefined
+			&& sourceSchema.columns[argSourceCol]?.logicalType.physicalType === PhysicalType.INTEGER;
+		if (!resultExact && !argExact) return undefined;
+		const retractionSafe = algebra.decodeExact === true
+			|| (argSourceCol !== undefined && sourceSchema.columns[argSourceCol]?.notNull === true);
+		aggColumns.push({
+			backingCol: outCol,
+			schema,
+			algebra,
+			argSourceCol,
+			isMultiplicity: producing.args.length === 0,
+			retractionSafe,
+		});
+	}
+
+	// Multiplicity witness: a zero-arg delta-maintainable column whose decode is exact
+	// (its merged value decides group emptiness, so the reconstruction must survive
+	// retraction). Structural — not name-based.
+	const multiplicityIndex = aggColumns.findIndex(c => c.isMultiplicity && c.algebra.decodeExact === true);
+	if (multiplicityIndex < 0) return undefined;
+	if (aggColumns.length === 0) return undefined; // defensive — findAggregate implies ≥1
+
+	return {
+		aggColumns,
+		groupColumns: groupOut,
+		multiplicityIndex,
+		backingColumnCount: rootAttrs.length,
+		retractionSafe: aggColumns.every(c => c.retractionSafe),
+		predicate,
+	};
+}
+
+/**
+ * True when any Filter node's subtree contains an aggregate node — i.e. the plan
+ * filters the AGGREGATE OUTPUT (HAVING, or an outer WHERE over a grouped subquery).
+ * The body WHERE is the complement case: its Filter sits below the aggregate, so its
+ * subtree contains none. Used by {@link buildDeltaAggregateDescriptor}'s gate.
+ */
+function hasFilterAboveAggregate(node: PlanNode): boolean {
+	if (node.nodeType === PlanNodeType.Filter && findAggregate(node) !== undefined) return true;
+	for (const child of node.getChildren()) {
+		if (hasFilterAboveAggregate(child as unknown as PlanNode)) return true;
+	}
+	return false;
 }
 
 /**

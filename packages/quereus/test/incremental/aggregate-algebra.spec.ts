@@ -83,6 +83,22 @@ describe('Aggregate algebra declarations', () => {
 			expect(maxFunc.algebra?.decode?.(null), 'max.decode(NULL)').to.equal(null);
 		});
 
+		it('count declares decodeExact (full inverse); sum does NOT (witness decode)', () => {
+			expect(countStarFunc.algebra?.decodeExact, 'count(*).decodeExact').to.equal(true);
+			expect(countXFunc.algebra?.decodeExact, 'count(x).decodeExact').to.equal(true);
+			expect(sumFunc.algebra?.decodeExact, 'sum.decodeExact').to.equal(undefined);
+		});
+
+		it("sum's decode witness is ABSORBING: a decoded accumulator survives a finite retraction", () => {
+			// The delta arm's NOT-NULL-argument retraction path depends on this: a
+			// finite count witness (e.g. 1) would collapse to 0 on the first retraction
+			// and finalize a spurious NULL while contributions remain.
+			const algebra = sumFunc.algebra!;
+			const decoded = algebra.decode!(12);
+			const retractOne = algebra.negate!(sumFunc.stepFunction(null, 5));
+			expect(sumFunc.finalizeFunction(algebra.merge(decoded, retractOne)), 'stored 12 minus one 5-contribution').to.equal(7);
+		});
+
 		it('non-incremental builtins declare no algebra', () => {
 			for (const f of [totalFunc, groupConcatFuncRev, varPopFunc, varSampFunc, stdDevPopFunc, stdDevSampFunc]) {
 				expect(f.algebra, `${f.name}.algebra`).to.equal(undefined);
@@ -109,6 +125,19 @@ describe('Aggregate algebra declarations', () => {
 				algebra: { ...sumAlgebra, decode: (_stored: SqlValue): AggValue => ({ sum: 1, count: 1 }) },
 			};
 			expect(() => assertAggregateAlgebraLaws(broken, sumDomain)).to.throw(/decode-observational/);
+		});
+
+		it('falsely declaring decodeExact on sum fails the decode-exact-retraction law', () => {
+			// Sum's decode is a WITNESS (the stored value forgets the true contribution
+			// count), so a partial retraction through it is not observational — the 4b
+			// law exists precisely to keep such a declaration honest.
+			const sumAlgebra = sumFunc.algebra;
+			if (!sumAlgebra) throw new Error('sum must declare algebra');
+			const broken: AggregateFunctionSchema = {
+				...sumFunc,
+				algebra: { ...sumAlgebra, decodeExact: true },
+			};
+			expect(() => assertAggregateAlgebraLaws(broken, sumDomain)).to.throw(/decode-exact-retraction/);
 		});
 	});
 });

@@ -20,6 +20,7 @@ import { withAsyncRowContext } from '../context-helpers.js';
 import type { RowDescriptor } from '../../planner/nodes/plan-node.js';
 import { executeForeignKeyActionsAndLens, assertTransitiveRestrictsForParentMutation } from '../foreign-key-actions.js';
 import type { BackingConnectionCache, ResidualKeyBatch } from '../../core/database-materialized-views.js';
+import { poisonResidualDeltaAccumulations } from '../../core/database-materialized-views-apply.js';
 import type { BackingRowChange } from '../../vtab/backing-host.js';
 
 /**
@@ -611,6 +612,14 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						if (savepointName) {
 							await ctx.db._rollbackAndReleaseSavepointBroadcast(savepointName);
 							savepointName = undefined;
+							// The savepoint reverted the failing row's source/backing writes,
+							// but the residual batch's JS-side DELTA accumulations cannot be
+							// unwound and may carry the reverted row's contribution. The
+							// residual KEYS stay valid (a reverted key recomputes from live
+							// state to a value-identical row, which the host suppresses), so
+							// drop only the delta fast path — the FAIL-mode flush below then
+							// routes those entries through the plain residual.
+							poisonResidualDeltaAccumulations(residualBatch);
 						}
 						// Translate plain constraint violations to FAIL/ROLLBACK error
 						// subclasses so the iterator-level cleanup picks the right

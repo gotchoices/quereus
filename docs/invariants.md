@@ -583,6 +583,13 @@ with the body. The one exception where cost becomes a *rejection* rather than a 
 is the size threshold in MV-006, which fires only when full-rebuild is the sole sound
 strategy.
 
+Soundness membership itself is *declaration-driven*, never name-driven: the
+`'delta-aggregate'` strategy joins the sound set exactly when every stored aggregate
+column's **declared algebra** (`AggregateFunctionSchema.algebra` — merge/negate/decode,
+plus the exact-domain and multiplicity-witness structural checks) qualifies. The engine
+never consults a builtin-aggregate name list, so a UDAF declaring a lawful algebra gets
+the fast path and a builtin without one does not.
+
 ### MV-008 — The replicable-derivation gate is host-conditional and not locally waivable
 
 - code: `packages/quereus/src/vtab/backing-host.ts` — `requiresReplicableDerivations`

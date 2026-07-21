@@ -133,7 +133,16 @@ function* scanLayerResolved(
 		if (plan.equalityPrefix) {
 			const compositeStart = [...plan.equalityPrefix];
 			if (plan.lowerBound) compositeStart.push(plan.lowerBound.value);
-			startKey = { value: compositeStart as BTreeKeyForPrimary };
+			// A non-composite PK stores SCALAR keys: an array-shaped seek key would
+			// position PAST the scalar match (the comparator orders the wrapped form
+			// after its scalar), silently skipping the row a full-PK-length prefix
+			// (the delta-aggregate point read) targets. Unwrap the single-element
+			// prefix to the scalar; composite trees keep the array form.
+			startKey = {
+				value: (!isComposite && compositeStart.length === 1
+					? compositeStart[0]
+					: compositeStart) as BTreeKeyForPrimary,
+			};
 		} else {
 			// Composite PKs store array-shaped keys; wrap the scalar leading-column
 			// bound in a single-element array so the comparator's prefix handling
@@ -236,7 +245,13 @@ function* scanLayerResolved(
 		if (plan.equalityPrefix) {
 			const compositeStart = [...plan.equalityPrefix];
 			if (plan.lowerBound) compositeStart.push(plan.lowerBound.value);
-			startKey = { value: compositeStart as BTreeKeyForIndex };
+			// Mirror the primary branch: a non-composite index stores SCALAR keys, so
+			// a single-element prefix must seek with the scalar (see above).
+			startKey = {
+				value: (!isComposite && compositeStart.length === 1
+					? compositeStart[0]
+					: compositeStart) as BTreeKeyForIndex,
+			};
 		} else {
 			const seekBound = seekFromUpper ? plan.upperBound : plan.lowerBound;
 			if (seekBound) {

@@ -18,6 +18,8 @@ import type { BTreeKeyForPrimary } from '../vtab/memory/types.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { BindingMode } from '../planner/analysis/binding-extractor.js';
 import type { MaintenanceSourceStats, MaintenanceStrategy } from '../planner/cost/index.js';
+import type { AggregateAlgebra, AggregateFunctionSchema } from '../schema/function.js';
+import type { AggValue } from '../func/registration.js';
 import type { DerivedRowConstraintValidator } from './derived-row-validator.js';
 import type { MaintainedTableSchema } from '../schema/derivation.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
@@ -300,6 +302,19 @@ export interface FullRebuildPlan extends MaintenancePlanCommon {
 export interface ResidualRecomputePlan extends MaintenancePlanCommon, ResidualArmCommon {
 	readonly kind: 'residual-recompute';
 	binding: BindingMode;
+	/** Delta-aggregate fast path descriptor — present iff EVERY stored aggregate column
+	 *  passed the create-time delta eligibility gate ({@link buildDeltaAggregateDescriptor}
+	 *  in database-materialized-views-plan-builders.ts). When present, the statement
+	 *  accumulation folds per-column accumulator deltas alongside the residual keys and
+	 *  the flush maintains each affected group by pure arithmetic on the stored backing
+	 *  row (`merge` on insert, `merge(negate(…))` on delete) with zero source reads —
+	 *  falling back to the residual per group only where the declared algebra cannot
+	 *  prove a retraction observational (see {@link DeltaAggregateColumn.retractionSafe}).
+	 *  Absent ⇒ the arm behaves exactly as before (key-filtered residual re-execution).
+	 *  The plan `kind` stays `'residual-recompute'` either way; `chosenStrategy` records
+	 *  `'delta-aggregate'` when the descriptor is active (cost-strategy decoupling, the
+	 *  same pattern as `'prefix-delete'`). */
+	delta?: DeltaAggregateDescriptor;
 	/** Cached scheduler for the key-filtered residual (the body with `injectKeyFilter`
 	 *  applied on `T`). Re-run per affected key tuple, bound through the live transaction. */
 	residualScheduler: Scheduler;
@@ -481,6 +496,81 @@ export interface PrefixDeleteKey {
 }
 
 /**
+ * One stored aggregate output column of a delta-maintained aggregate MV, resolved once
+ * at plan build from the aggregate call node's registry-resolved function schema. The
+ * engine consumes ONLY the declared {@link AggregateAlgebra} plus the schema's
+ * step/finalize/initialValue — never an aggregate-name list (docs/invariants.md).
+ */
+export interface DeltaAggregateColumn {
+	/** Backing column index (= body output column index) this aggregate lands at. */
+	readonly backingCol: number;
+	/** The registry-resolved aggregate schema — carries step/finalize/initialValue. */
+	readonly schema: AggregateFunctionSchema;
+	/** `schema.algebra`, narrowed: the gate requires `merge`, `negate`, and `decode`. */
+	readonly algebra: AggregateAlgebra;
+	/** Source column feeding `step()`; `undefined` for a zero-arg (count(*)-shaped) call. */
+	readonly argSourceCol: number | undefined;
+	/** True iff this is the zero-arg multiplicity witness (count(*)): its finalized value
+	 *  counts the group's rows, so 0 ⇔ the group emptied (delete the backing row). */
+	readonly isMultiplicity: boolean;
+	/** True when a RETRACTION may be applied through `decode` of the stored value:
+	 *  either the algebra declares `decodeExact` (decode is a full inverse), or the
+	 *  argument column is declared NOT NULL — then every surviving row contributes, so
+	 *  the true contribution count equals the multiplicity and stays positive while the
+	 *  backing row exists (sum's absorbing decode witness never spuriously empties).
+	 *  A group that accumulated a retraction while ANY column is not retraction-safe is
+	 *  re-derived by the residual at flush instead of trusting the arithmetic. */
+	readonly retractionSafe: boolean;
+}
+
+/**
+ * Create-time descriptor for the delta-aggregate fast path inside a
+ * `'residual-recompute'` plan — see {@link ResidualRecomputePlan.delta}. Built by
+ * `buildDeltaAggregateDescriptor` only when every stored column qualifies; any gate
+ * failure leaves the plan on the plain residual (never an error).
+ */
+export interface DeltaAggregateDescriptor {
+	/** The stored aggregate output columns, one per aggregate the body projects. */
+	readonly aggColumns: readonly DeltaAggregateColumn[];
+	/** Non-aggregate (group-key passthrough) backing columns: each copies the group's
+	 *  backing-PK value at position `pkPos` (in `backingPkDefinition` order) into
+	 *  backing column `backingCol` — covers a group column projected outside the PK
+	 *  (e.g. a duplicate projection of a group column). */
+	readonly groupColumns: ReadonlyArray<{ readonly backingCol: number; readonly pkPos: number }>;
+	/** Index into {@link aggColumns} of the count(*) multiplicity witness. */
+	readonly multiplicityIndex: number;
+	/** Total backing column count (the upsert row width). */
+	readonly backingColumnCount: number;
+	/** True iff every {@link DeltaAggregateColumn.retractionSafe}; when false, a group
+	 *  whose statement delta contains any retraction falls back to the residual. */
+	readonly retractionSafe: boolean;
+	/** Compiled single-source-row body WHERE; a row whose predicate is not
+	 *  unambiguously TRUE contributes nothing (mirrors the inverse-projection arm).
+	 *  Absent ⇒ every row is in scope. */
+	readonly predicate?: CompiledPredicate;
+}
+
+/**
+ * Per-group accumulated statement delta for a delta-aggregate MV — the value side of
+ * {@link ResidualKeyBatchEntry.delta}, keyed (like `forward`) on
+ * `canonKeyValues(keyVals)` so the two maps pair up at flush.
+ */
+export interface DeltaGroupState {
+	/** Backing-PK (group key) values, in `backingPkDefinition` order. */
+	readonly keyVals: SqlValue[];
+	/** Prebuilt point-delete key for an emptied group. */
+	readonly deleteKey: BTreeKeyForPrimary;
+	/** Net accumulator delta per aggregate column (descriptor `aggColumns` order),
+	 *  folded across the statement: `merge`d `step` contributions for inserts,
+	 *  `merge`d `negate(step(…))` contributions for deletes. */
+	readonly accs: AggValue[];
+	/** True once any retraction (delete / update-old-image) contributed — the flush
+	 *  falls back to the residual for this group when the descriptor is not
+	 *  retraction-safe and a stored row exists. */
+	retracted: boolean;
+}
+
+/**
  * The per-statement key accumulation for one residual-arm MV — which distinct binding
  * keys this statement's source changes affected, per residual variant. `forward` holds
  * driving-source keys (`'residual-recompute'` group keys; `'join-residual'` `T`-PK keys),
@@ -495,6 +585,18 @@ export interface ResidualKeyBatchEntry {
 	forward: Map<string, ForwardResidualKey>;
 	lookup: Map<string, SqlValue[]>;
 	prefix: Map<string, PrefixDeleteKey>;
+	/** Delta-aggregate accumulation, keyed like `forward` on the canonical group-key
+	 *  bytes. Populated ONLY alongside `forward` (the residual keys are always
+	 *  accumulated too), so dropping it — {@link deltaPoisoned} — degrades the flush to
+	 *  the plain residual with zero information loss. */
+	delta?: Map<string, DeltaGroupState>;
+	/** Set when a per-row savepoint revert (OR FAIL) invalidated the accumulated
+	 *  deltas: the savepoint undid the failing row's source/backing writes, but a JS
+	 *  accumulation cannot be unwound, so the net deltas may include a reverted row's
+	 *  contribution. The residual keys stay valid (a reverted key recomputes to a
+	 *  value-identical row, suppressed), so the flush routes through them instead.
+	 *  See `poisonResidualDeltaAccumulations`. */
+	deltaPoisoned?: boolean;
 }
 
 /**

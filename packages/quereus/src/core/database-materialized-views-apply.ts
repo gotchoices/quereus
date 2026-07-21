@@ -26,6 +26,7 @@ import { compareSqlValuesFast, rowsValueIdentical } from '../util/comparison.js'
 import type { TableSchema } from '../schema/table.js';
 import type { Database } from './database.js';
 import { canonKeyValues } from './database-materialized-views-analysis.js';
+import { cloneInitialValue, type AggValue } from '../func/registration.js';
 import type {
 	MaterializedViewManagerContext,
 	MaintenancePlan,
@@ -34,12 +35,14 @@ import type {
 	JoinResidualPlan,
 	PrefixDeletePlan,
 	ResidualMaintenancePlan,
+	ResidualRecomputePlan,
 	ForwardResidualKey,
 	PrefixDeleteKey,
 	ResidualKeyBatch,
 	ResidualKeyBatchEntry,
 	BackingConnectionCache,
 	BackingPkColumn,
+	DeltaGroupState,
 } from './database-materialized-views-plans.js';
 
 /**
@@ -791,7 +794,13 @@ export function accumulateResidualKeys(
 	}
 	switch (plan.kind) {
 		case 'residual-recompute':
+			// Residual keys FIRST, always — they are the delta path's per-group fallback
+			// (retraction-unsafe groups, poisoned accumulations), so the delta map is
+			// strictly an optimization layered on top, never the only record.
 			collectForwardResidualKeys(plan, change, entry.forward);
+			if (plan.delta && !entry.deltaPoisoned) {
+				accumulateDeltaAggregates(plan, change, entry);
+			}
 			break;
 		case 'prefix-delete':
 			collectPrefixDeleteKeys(plan, change, entry.prefix);
@@ -829,4 +838,158 @@ export async function computeResidualBatchOps(
 		ops.push(...await computeLookupResidualOps(ctx, plan, entry.lookup.values()));
 	}
 	return ops;
+}
+
+/**
+ * Fold one source change's per-column aggregate contributions into the statement's
+ * delta accumulation ({@link ResidualKeyBatchEntry.delta}) — the delta-aggregate
+ * counterpart of {@link collectForwardResidualKeys}, called right after it (the
+ * residual keys remain the fallback record). Per contributing row image:
+ * `step(identity, row[arg])` (zero-arg → `step(identity)`) is the row's contribution;
+ * an insert `merge`s it in, a delete `merge`s its `negate`, an update retracts the OLD
+ * image into its group and inserts the NEW into its (possibly different) group. A row
+ * whose body-WHERE predicate is not unambiguously TRUE contributes nothing — but the
+ * raw column value (including NULL) IS fed to `step`, never pre-filtered: NULL-handling
+ * is the aggregate's own (law 2), and the row still counts toward the zero-arg
+ * multiplicity witness.
+ */
+export function accumulateDeltaAggregates(
+	plan: ResidualRecomputePlan,
+	change: BackingRowChange,
+	entry: ResidualKeyBatchEntry,
+): void {
+	const d = plan.delta;
+	if (!d) return;
+	const delta = entry.delta ?? (entry.delta = new Map<string, DeltaGroupState>());
+	const contribute = (row: Row, retract: boolean): void => {
+		if (d.predicate && d.predicate.evaluate(row) !== true) return; // out of body scope
+		const keyVals = plan.backingPkSourceCols.map(sc => row[sc]);
+		const dedupKey = canonKeyValues(keyVals);
+		let g = delta.get(dedupKey);
+		if (!g) {
+			g = {
+				keyVals,
+				deleteKey: buildPrimaryKeyFromValues(keyVals, plan.backingPkDefinition),
+				accs: d.aggColumns.map(c => cloneInitialValue(c.schema.initialValue)),
+				retracted: false,
+			};
+			delta.set(dedupKey, g);
+		}
+		if (retract) g.retracted = true;
+		for (let i = 0; i < d.aggColumns.length; i++) {
+			const c = d.aggColumns[i];
+			let contrib: AggValue = c.argSourceCol === undefined
+				? c.schema.stepFunction(cloneInitialValue(c.schema.initialValue))
+				: c.schema.stepFunction(cloneInitialValue(c.schema.initialValue), row[c.argSourceCol]);
+			if (retract) contrib = c.algebra.negate!(contrib);
+			g.accs[i] = c.algebra.merge(g.accs[i], contrib);
+		}
+	};
+	if (change.op === 'insert') contribute(change.newRow, false);
+	else if (change.op === 'delete') contribute(change.oldRow, true);
+	else { contribute(change.oldRow, true); contribute(change.newRow, false); }
+}
+
+/**
+ * Flush-time op computation for a delta-aggregate MV's accumulated statement deltas —
+ * the arithmetic read-modify-write that replaces the per-group residual re-execution.
+ * Per affected group:
+ *  1. read the group's current EFFECTIVE backing row by its full PK (the host's
+ *     `scanEffective` equality-prefix point read — pending over committed, so a group
+ *     written by an earlier statement of this transaction folds correctly);
+ *  2. per aggregate column: base = stored ? `decode(stored[col])` : a fresh identity
+ *     accumulator; finalized = `finalize(merge(base, delta))`;
+ *  3. the multiplicity witness finalizing to 0 ⇔ the group emptied → `delete-key`
+ *     (skipped when no row was stored); otherwise upsert the rebuilt row (group-key
+ *     values + finalized aggregates) — the host's value-identical skip suppresses a
+ *     net-identity delta (MV-016).
+ *
+ * **Retraction fallback.** A group that accumulated a retraction while the descriptor
+ * is not retraction-safe (some column's decode is only an insert-observational witness
+ * and its argument column is nullable — the stored value cannot prove the true
+ * contribution count survives the retraction) is NOT computed arithmetically when a
+ * stored row exists: its residual key (always accumulated alongside, same canonical
+ * map key) re-derives the group from live source state instead. A group with no stored
+ * row needs no fallback — its delta is the exact fold of this statement's net
+ * contributions.
+ *
+ * Zero source reads, no residual execution on the arithmetic path — this is why the
+ * delta path also BYPASSES the per-statement degrade-to-rebuild crossover (it is
+ * already O(affected groups)).
+ */
+export async function computeDeltaAggregateOps(
+	ctx: MaterializedViewManagerContext,
+	plan: ResidualRecomputePlan,
+	entry: ResidualKeyBatchEntry,
+	host: BackingHost,
+	connection: VirtualTableConnection,
+): Promise<MaintenanceOp[]> {
+	const d = plan.delta;
+	if (!d || !entry.delta) return [];
+	const ops: MaintenanceOp[] = [];
+	const residualFallbackKeys: ForwardResidualKey[] = [];
+	for (const [dedupKey, g] of entry.delta) {
+		// Effective point read: the full-PK equality prefix selects at most one row
+		// (BINARY collations on every PK column are a descriptor gate, so the binary
+		// prefix compare in the host's scan is exact).
+		let stored: Row | undefined;
+		for await (const row of host.scanEffective(connection, { equalityPrefix: [...g.keyVals] })) {
+			stored = row;
+			break;
+		}
+		if (stored && g.retracted && !d.retractionSafe) {
+			const fk = entry.forward.get(dedupKey);
+			if (!fk) {
+				// Impossible: accumulateResidualKeys collects the forward key for every
+				// change before the delta contribution, over the same canonical key.
+				throw new QuereusError(
+					`Internal error: delta-aggregate group of materialized view '${plan.mv.name}' has no forward residual key`,
+					StatusCode.INTERNAL,
+				);
+			}
+			residualFallbackKeys.push(fk);
+			continue;
+		}
+		const finals: SqlValue[] = new Array(d.aggColumns.length);
+		for (let i = 0; i < d.aggColumns.length; i++) {
+			const c = d.aggColumns[i];
+			const base: AggValue = stored
+				? c.algebra.decode!(stored[c.backingCol])
+				: cloneInitialValue(c.schema.initialValue);
+			finals[i] = c.schema.finalizeFunction(c.algebra.merge(base, g.accs[i]));
+		}
+		const mult = finals[d.multiplicityIndex];
+		if (mult === 0 || mult === 0n) {
+			// Group emptied. The delete is emitted only when a row is stored (a group
+			// created and emptied within one statement writes nothing).
+			if (stored) ops.push({ kind: 'delete-key', key: g.deleteKey });
+			continue;
+		}
+		const row: Row = new Array(d.backingColumnCount).fill(null);
+		for (const gc of d.groupColumns) row[gc.backingCol] = g.keyVals[gc.pkPos];
+		for (let i = 0; i < d.aggColumns.length; i++) row[d.aggColumns[i].backingCol] = finals[i];
+		ops.push({ kind: 'upsert', row });
+	}
+	if (residualFallbackKeys.length > 0) {
+		ops.push(...await computeForwardResidualOps(ctx, plan, residualFallbackKeys));
+	}
+	return ops;
+}
+
+/**
+ * Invalidate every accumulated delta in the per-statement batch — called by the DML
+ * executor when an OR FAIL per-row savepoint ROLLS BACK: the savepoint undoes the
+ * failing row's source (and backing) writes, but the JS-side accumulation cannot be
+ * unwound, so the folded deltas may carry the reverted row's contribution. The residual
+ * keys are unaffected (a reverted key's recompute reads surviving live state and is
+ * value-identical → suppressed), so poisoning simply drops the fast path: the flush in
+ * the executor's catch routes those entries through the plain residual. One-way for the
+ * statement — `deltaPoisoned` also stops later (cascade-driven) delta re-accumulation
+ * into the same entry from mixing with an already-flushed-around state.
+ */
+export function poisonResidualDeltaAccumulations(batch: ResidualKeyBatch): void {
+	for (const entry of batch.values()) {
+		entry.delta = undefined;
+		entry.deltaPoisoned = true;
+	}
 }

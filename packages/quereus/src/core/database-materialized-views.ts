@@ -80,6 +80,7 @@ import {
 	applyPrefixDelete,
 	accumulateResidualKeys,
 	computeResidualBatchOps,
+	computeDeltaAggregateOps,
 	resolveBackingApplyTarget,
 	runScheduler,
 	validateDerivedChanges,
@@ -776,6 +777,21 @@ export class MaterializedViewManager {
 	): Promise<BackingRowChange[]> {
 		const distinctKeys = entry.forward.size + entry.lookup.size + entry.prefix.size;
 		if (distinctKeys === 0) return [];
+		// Delta-aggregate fast path: an eligible aggregate MV's accumulated per-group
+		// deltas are applied by arithmetic read-modify-write on the stored group rows
+		// (computeDeltaAggregateOps) — zero source reads. It BYPASSES the
+		// degrade-to-rebuild crossover below: that crossover trades k residual
+		// re-executions against one whole-body rebuild, and the delta path already
+		// costs O(affected groups) with no residual runs, so the rebuild can never win.
+		// A poisoned accumulation (OR FAIL per-row revert — see
+		// poisonResidualDeltaAccumulations) has `delta` dropped and falls through to
+		// the plain residual over the always-accumulated forward keys.
+		if (plan.kind === 'residual-recompute' && plan.delta && entry.delta && !entry.deltaPoisoned) {
+			const { host, connection } = await resolveBackingApplyTarget(this.ctx, plan, cache);
+			const ops = await computeDeltaAggregateOps(this.ctx, plan, entry, host, connection);
+			if (ops.length === 0) return [];
+			return host.applyMaintenance(connection, ops);
+		}
 		if (plan.fullRebuildScheduler && shouldDegradeToRebuild(distinctKeys, plan.sourceStats)) {
 			return this.applyReplaceAll(plan, plan.fullRebuildScheduler, cache);
 		}

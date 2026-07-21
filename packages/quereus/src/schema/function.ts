@@ -63,7 +63,10 @@ export type AggregateFinalizer<T = any> = (accumulator: T) => SqlValue;
  * 2. Step/merge coherence: `step(a, x) ≡ merge(a, step(identity, x))`.
  * 3. `merge(a, negate(a)) ≡ identity`.
  * 4. Decode is observational: `finalize(merge(decode(finalize(a)), b)) ≡
- *    finalize(merge(a, b))`.
+ *    finalize(merge(a, b))` for `b` built from *inserted* rows. When
+ *    `decodeExact` is declared, the same identity must additionally hold for
+ *    `b` containing retractions (`negate`d contributions) — decode fully
+ *    reconstructs the accumulator, not just an insert-observational witness.
  * 5. `finalize(a) ≡ decompose.combine([finalize(p) …])` over the partial
  *    accumulators induced by the same input rows.
  */
@@ -81,6 +84,16 @@ export interface AggregateAlgebra {
 	 *  accumulator). IMPOSSIBLE for avg (the quotient forgets the count → declare
 	 *  `decompose` instead). */
 	decode?: (stored: SqlValue) => AggValue;
+	/** True when `decode` is a FULL inverse of finalize: `decode(finalize(a)) ≡ a`
+	 *  for every reachable accumulator, so a decoded accumulator stays observational
+	 *  under RETRACTIONS too (law 4's stronger form). Declarable when the stored value
+	 *  loses nothing (count → the stored int IS the accumulator). Absent ⇒ decode is
+	 *  only an insert-observational witness (sum → the stored sum forgets how many
+	 *  non-NULL rows contributed): the write-side delta arm must then prove the true
+	 *  contribution count stays positive (e.g. a NOT NULL argument column plus the
+	 *  count(*) multiplicity witness) before applying a retraction through decode,
+	 *  and otherwise re-derives the group from live source state. */
+	decodeExact?: boolean;
 	/** This aggregate's value is a scalar expression over OTHER (algebra-complete)
 	 *  sibling aggregates — e.g. avg(x) ≡ sum(x)/count(x). Lets a stored column be
 	 *  maintained by delta-maintaining its partials, and lets the read-side rollup

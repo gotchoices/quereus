@@ -31,6 +31,7 @@ export const countStarFunc = createAggregateFunction(
 			negate: (a: number): number => -a,
 			// finalize is identity — the stored count IS the accumulator
 			decode: (stored: SqlValue): number => Number(stored),
+			decodeExact: true,
 		},
 	},
 	(acc: number): number => acc + 1,
@@ -59,15 +60,20 @@ export const sumFunc = createAggregateFunction(
 			},
 			negate: (a: SumAccumulator): SumAccumulator => a === null ? null : { sum: -a.sum, count: -a.count },
 			// Stored NULL (empty group) decodes to the empty accumulator, never a
-			// wrapped NULL. A stored value decodes with count 1 — an observational
-			// witness for "non-empty" (finalize only distinguishes zero from non-zero
-			// count), not the true contribution count, which the quotient-free stored
-			// sum cannot recover.
+			// wrapped NULL. A stored value decodes with an ABSORBING count witness
+			// (Infinity): the stored sum cannot recover the true non-NULL contribution
+			// count, so the witness must (a) be non-zero (the group is non-empty) and
+			// (b) STAY non-zero under any finite retraction — a finite witness (e.g. 1)
+			// would collapse to 0 on the first retraction and finalize a spurious NULL
+			// while contributions remain. This is deliberately NOT `decodeExact`: the
+			// delta arm may retract through this decode only when it can prove the true
+			// count stays positive (NOT NULL argument + multiplicity witness), and
+			// otherwise re-derives the group from live source state.
 			// NOTE: type-trusts its input — a non-numeric stored value poisons the
 			// accumulator. Sound while the only caller is the delta arm reading back a
-			// value this same aggregate wrote; validate here when feat-mv-agg-delta-arm lands.
+			// value this same aggregate wrote.
 			decode: (stored: SqlValue): SumAccumulator =>
-				stored === null ? null : { sum: stored as number | bigint, count: 1 },
+				stored === null ? null : { sum: stored as number | bigint, count: Number.POSITIVE_INFINITY },
 		},
 	},
 	(acc: SumAccumulator, value: SqlValue): SumAccumulator => {
@@ -233,6 +239,7 @@ export const countXFunc = createAggregateFunction(
 			negate: (a: number): number => -a,
 			// finalize is identity — the stored count IS the accumulator
 			decode: (stored: SqlValue): number => Number(stored),
+			decodeExact: true,
 		},
 	},
 	(acc: number, value: SqlValue): number => {
