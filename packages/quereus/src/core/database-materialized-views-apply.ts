@@ -968,6 +968,15 @@ export async function computeDeltaAggregateOps(
 		const row: Row = new Array(d.backingColumnCount).fill(null);
 		for (const gc of d.groupColumns) row[gc.backingCol] = g.keyVals[gc.pkPos];
 		for (let i = 0; i < d.aggColumns.length; i++) row[d.aggColumns[i].backingCol] = finals[i];
+		// Decomposition-maintained columns (the avg class): derived from the finalized
+		// partials, never accumulated. `combine` reproduces the aggregate's own finalize —
+		// incl. the empty-group / divide-by-zero case (avg → count 0/NULL ⇒ NULL). The group
+		// is non-empty here (multiplicity > 0), so a fully-emptied group is deleted above
+		// before combine could divide by zero; a non-empty all-NULL group finalizes count(x)
+		// = 0 and combine yields NULL, matching native avg.
+		for (const dc of d.decomposeColumns) {
+			row[dc.backingCol] = dc.combine(dc.partialIndices.map(pi => finals[pi]));
+		}
 		ops.push({ kind: 'upsert', row });
 	}
 	if (residualFallbackKeys.length > 0) {

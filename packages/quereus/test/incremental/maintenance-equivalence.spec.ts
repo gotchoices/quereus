@@ -8,6 +8,9 @@ import type * as AST from '../../src/parser/ast.js';
 import { buildFullRebuildPlan } from '../../src/core/database-materialized-views-plan-builders.js';
 import type { MaintainedTableSchema } from '../../src/schema/derivation.js';
 import type { BlockNode } from '../../src/planner/nodes/block.js';
+import { createAggregateFunction } from '../../src/func/registration.js';
+import type { AggregateFunctionSchema } from '../../src/schema/function.js';
+import { INTEGER_TYPE } from '../../src/types/builtin-types.js';
 
 /**
  * Maintenance-equivalence property harness — the correctness oracle for row-time
@@ -2567,5 +2570,318 @@ describe('Materialized-view maintenance statement batching (residual arms)', () 
 			expect(flushes[0].distinctKeys, 'two distinct T keys deduped in one batch').to.equal(2);
 			await assertEquivalent(db, body, 'after multi-key forward-side batch');
 		});
+	});
+});
+
+/* ══════════ decomposition-maintained aggregate class (avg + a UDAF) — feat-mv-agg-delta-decompose ══════════
+ *
+ * A stored aggregate column whose value is a scalar formula over sibling partial aggregates
+ * (`AggregateAlgebra.decompose`) — `avg(x) ≡ sum(x)/count(x)`, and any UDAF declaring
+ * `decompose` — is delta-maintained by delta-maintaining its partials and re-evaluating
+ * `combine` per group at flush, but ONLY when every partial is ALSO stored as a sibling
+ * column of the same MV body and is itself delta-maintainable. `avg` is the first client of
+ * this class, not a special case. The equivalence oracle re-runs the same body live (avg /
+ * the UDAF included), so incremental maintenance and live evaluation must agree byte-exactly
+ * mid-transaction and after rollback; white-box checks pin that the delta strategy (not the
+ * residual) is actually chosen and that a decompose column was recorded.
+ */
+
+/** The registered row-time plan for `main.<name>`, loosely typed to inspect the delta
+ *  descriptor (`chosenStrategy` + the decompose-column list the decompose class populates). */
+interface DeltaPlanLike {
+	readonly kind: string;
+	readonly chosenStrategy?: string;
+	readonly delta?: { readonly decomposeColumns: readonly unknown[]; readonly aggColumns: readonly unknown[] };
+}
+function registeredDeltaPlan(db: Database, name: string): DeltaPlanLike {
+	const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as { rowTime: Map<string, DeltaPlanLike> };
+	const plan = mgr.rowTime.get(`main.${name}`.toLowerCase());
+	expect(plan, `${name} plan registered`).to.exist;
+	return plan!;
+}
+
+/** A non-avg `decompose` UDAF proving the class is function-generic: `wsum(x) ≡ sum(x) +
+ *  count(x)`, composed from the same `sum` / `count` partials avg names. Deliberately an
+ *  INTEGER-exact linear combination (not a true geometric mean) so the incremental
+ *  reconstruction stays byte-identical to a fresh live fold — a float geomean over `sum(log x)`
+ *  drifts under re-association and would spuriously red the byte-exact oracle (see the
+ *  handoff). Declares `merge` + `negate` + `decompose` but NO `decode` — exactly avg's shape:
+ *  it is maintained through its partials, never accumulated directly. */
+function makeWsumAggregate(): AggregateFunctionSchema {
+	type Acc = { sum: number; count: number } | null;
+	return createAggregateFunction(
+		{
+			name: 'wsum', numArgs: 1, initialValue: null,
+			returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true },
+			algebra: {
+				merge: (x: Acc, y: Acc): Acc =>
+					x === null ? y : y === null ? x : { sum: x.sum + y.sum, count: x.count + y.count },
+				negate: (x: Acc): Acc => x === null ? null : { sum: -x.sum, count: -x.count },
+				decompose: {
+					partials: [{ func: 'sum', arg: 'same-arg' }, { func: 'count', arg: 'same-arg' }],
+					// sum(x) + count(x); empty / all-NULL group (count 0) ⇒ NULL — reproduces finalize.
+					combine: (vals: readonly SqlValue[]): SqlValue => {
+						const [sumV, countV] = vals;
+						if (countV === null || countV === undefined || Number(countV) === 0) return null;
+						return Number(sumV) + Number(countV);
+					},
+				},
+			},
+		},
+		(acc: Acc, value: SqlValue): Acc => {
+			if (value === null) return acc;
+			const n = Number(value);
+			if (Number.isNaN(n)) return acc;
+			return { sum: (acc?.sum ?? 0) + n, count: (acc?.count ?? 0) + 1 };
+		},
+		(acc: Acc): SqlValue => (acc === null || acc.count === 0) ? null : acc.sum + acc.count,
+	);
+}
+
+/* Shared mutation generator over `t (id pk, k, a NOT NULL)` — inserts / non-key updates /
+ * group-key + arg updates / key-changing updates / deletes, plus multi-row statements
+ * (multi-insert, predicate update/delete) so the per-statement flush and its statement-wide
+ * dedup are exercised. Reused by the avg-NOT-NULL and UDAF suites (both retraction-safe:
+ * a NOT-NULL integer arg + the count(*) witness keep deletes on the arithmetic path). */
+type DecMutation =
+	| { readonly kind: 'insert'; readonly id: number; readonly k: number; readonly a: number }
+	| { readonly kind: 'update'; readonly id: number; readonly k: number; readonly a: number }
+	| { readonly kind: 'updateKey'; readonly oldId: number; readonly newId: number; readonly k: number; readonly a: number }
+	| { readonly kind: 'delete'; readonly id: number }
+	| { readonly kind: 'multiInsert'; readonly rows: readonly { readonly id: number; readonly k: number; readonly a: number }[] }
+	| { readonly kind: 'updateWhere'; readonly a: number; readonly k: number; readonly kMatch: number }
+	| { readonly kind: 'deleteWhere'; readonly kMatch: number };
+
+const decIdArb = fc.integer({ min: 1, max: 6 });
+const decKArb = fc.integer({ min: 1, max: 4 });
+const decAArb = fc.integer({ min: 0, max: 9 });
+const decMutationArb: fc.Arbitrary<DecMutation> = fc.oneof(
+	fc.record({ kind: fc.constant('insert' as const), id: decIdArb, k: decKArb, a: decAArb }),
+	fc.record({ kind: fc.constant('update' as const), id: decIdArb, k: decKArb, a: decAArb }),
+	fc.record({ kind: fc.constant('updateKey' as const), oldId: decIdArb, newId: decIdArb, k: decKArb, a: decAArb }),
+	fc.record({ kind: fc.constant('delete' as const), id: decIdArb }),
+	fc.record({ kind: fc.constant('multiInsert' as const), rows: fc.array(fc.record({ id: decIdArb, k: decKArb, a: decAArb }), { minLength: 2, maxLength: 4 }) }),
+	fc.record({ kind: fc.constant('updateWhere' as const), a: decAArb, k: decKArb, kMatch: decKArb }),
+	fc.record({ kind: fc.constant('deleteWhere' as const), kMatch: decKArb }),
+);
+const decSqlFor = (m: DecMutation): string => {
+	switch (m.kind) {
+		case 'insert': return `insert into t (id, k, a) values (${m.id}, ${m.k}, ${m.a})`;
+		case 'update': return `update t set k = ${m.k}, a = ${m.a} where id = ${m.id}`;
+		case 'updateKey': return `update t set id = ${m.newId}, k = ${m.k}, a = ${m.a} where id = ${m.oldId}`;
+		case 'delete': return `delete from t where id = ${m.id}`;
+		case 'multiInsert': return `insert into t (id, k, a) values ${m.rows.map(r => `(${r.id}, ${r.k}, ${r.a})`).join(', ')}`;
+		case 'updateWhere': return `update t set a = ${m.a}, k = ${m.k} where k = ${m.kMatch}`;
+		case 'deleteWhere': return `delete from t where k = ${m.kMatch}`;
+	}
+};
+
+/** avg delta-maintained via its stored `sum(a)` + `count(*)` partials. `a` is NOT NULL, so
+ *  `count(*)` qualifies as avg's `count(x)` divisor (the write-side mirror of the read-side
+ *  `feat-mv-agg-rollup-retarget` relaxation), and integer so `sum(a)` passes the exact-domain
+ *  gate and stays retraction-safe — deletes maintain avg by arithmetic, not the residual. */
+describe('Materialized-view maintenance equivalence (decompose class: avg via stored sum + count)', () => {
+	let db: Database;
+	const body = 'select k, count(*) as c, sum(a) as s, avg(a) as av from t group by k';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, k integer, a integer not null)');
+		await db.exec('insert into t (id, k, a) values (1, 1, 4), (2, 1, 6), (3, 2, 5)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('is delta-maintained (chosenStrategy delta-aggregate; avg recorded as one decompose column)', () => {
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.kind, 'aggregate residual arm').to.equal('residual-recompute');
+		expect(plan.chosenStrategy, 'delta strategy chosen (partials stored)').to.equal('delta-aggregate');
+		expect(plan.delta, 'delta descriptor present').to.exist;
+		expect(plan.delta!.decomposeColumns.length, 'avg is the one decompose column').to.equal(1);
+	});
+
+	it('read(MV) == evaluate(body) across random mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(decMutationArb, { minLength: 1, maxLength: 10 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, decSqlFor(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 50 });
+	});
+
+	it('a real avg change reports the decompose column re-derived in place', async () => {
+		await db.exec('update t set a = 10 where id = 1'); // k=1 group avg (4+6)/2=5 → (10+6)/2=8
+		await assertEquivalent(db, body, 'after avg change');
+		expect(await readMultiset(db, 'select av from mv where k = 1'), 'avg((10+6)/2) = 8').to.deep.equal([canonRow([8])]);
+	});
+});
+
+/** avg over a NULLABLE arg with `count(a)` stored explicitly (the NULL-excluding divisor, not
+ *  the count(*) fallback). `sum(a)` over a nullable column is NOT retraction-safe, so a delete
+ *  against a stored group falls back to the residual — still exact, exercised here. Pins the
+ *  two load-bearing edges the ticket calls out: an emptied group (deleted via the multiplicity
+ *  witness) and a non-empty all-NULL-arg group (count(*)>0, count(x)=0, avg = NULL). */
+describe('Materialized-view maintenance equivalence (decompose class: avg over nullable arg, count(x) stored)', () => {
+	let db: Database;
+	const body = 'select k, count(*) as c, count(a) as ca, sum(a) as s, avg(a) as av from t group by k';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, k integer, a integer null)');
+		await db.exec('insert into t (id, k, a) values (1, 1, 4), (2, 1, 6)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('is delta-maintained with count(x) as the avg divisor', () => {
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.chosenStrategy).to.equal('delta-aggregate');
+		expect(plan.delta!.decomposeColumns.length).to.equal(1);
+	});
+
+	it('a group of only NULL-arg rows finalizes avg NULL (count(*)>0, count(x)=0)', async () => {
+		// New group k=3, both rows NULL `a`: multiplicity count(*) = 2 (>0, not emptied), but
+		// count(a) = 0, so avg combine([sum=NULL, count=0]) yields NULL — native avg semantics.
+		await db.exec('insert into t (id, k, a) values (10, 3, null), (11, 3, null)');
+		await assertEquivalent(db, body, 'all-NULL group avg NULL');
+		expect(await readMultiset(db, 'select c, ca, av from mv where k = 3'), 'count(*)=2, count(a)=0, avg NULL')
+			.to.deep.equal([canonRow([2, 0, null])]);
+	});
+
+	it('emptying a group to zero rows deletes its backing row', async () => {
+		await db.exec('delete from t where k = 1'); // removes ids 1,2 — the only k=1 rows
+		await assertEquivalent(db, body, 'emptied group');
+		expect((await readMultiset(db, 'select k from mv where k = 1')).length, 'k=1 group gone').to.equal(0);
+	});
+
+	it('read(MV) == evaluate(body) across random mutations incl. NULL args, in-txn and after rollback', async () => {
+		const aOrNull = fc.option(fc.integer({ min: 0, max: 9 }), { nil: null });
+		const aLit = (v: number | null): string => v === null ? 'null' : `${v}`;
+		type NMut =
+			| { readonly kind: 'insert'; readonly id: number; readonly k: number; readonly a: number | null }
+			| { readonly kind: 'update'; readonly id: number; readonly k: number; readonly a: number | null }
+			| { readonly kind: 'delete'; readonly id: number }
+			| { readonly kind: 'deleteWhere'; readonly kMatch: number };
+		const nArb: fc.Arbitrary<NMut> = fc.oneof(
+			fc.record({ kind: fc.constant('insert' as const), id: decIdArb, k: decKArb, a: aOrNull }),
+			fc.record({ kind: fc.constant('update' as const), id: decIdArb, k: decKArb, a: aOrNull }),
+			fc.record({ kind: fc.constant('delete' as const), id: decIdArb }),
+			fc.record({ kind: fc.constant('deleteWhere' as const), kMatch: decKArb }),
+		);
+		const nSql = (m: NMut): string => {
+			switch (m.kind) {
+				case 'insert': return `insert into t (id, k, a) values (${m.id}, ${m.k}, ${aLit(m.a)})`;
+				case 'update': return `update t set k = ${m.k}, a = ${aLit(m.a)} where id = ${m.id}`;
+				case 'delete': return `delete from t where id = ${m.id}`;
+				case 'deleteWhere': return `delete from t where k = ${m.kMatch}`;
+			}
+		};
+		await fc.assert(fc.asyncProperty(
+			fc.array(nArb, { minLength: 1, maxLength: 12 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, nSql(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 60 });
+	});
+});
+
+/** The two "not delta-maintainable → residual" edges: a body WITHOUT the partials avg names,
+ *  and avg over a REAL column (its `sum` partial fails the integer-domain gate). Both must stay
+ *  correct via the residual — the equivalence oracle covers them — just not incrementally. */
+describe('Materialized-view maintenance (decompose class: not delta-maintainable falls to residual)', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, k integer, a integer not null, r real not null)');
+		await db.exec('insert into t (id, k, a, r) values (1, 1, 4, 1.5), (2, 1, 6, 2.5), (3, 2, 5, 3.5)');
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('avg WITHOUT its stored partials stays on the residual (equivalent, not delta)', async () => {
+		const body = 'select k, avg(a) as av from t group by k';
+		await db.exec(`create materialized view mv as ${body}`);
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.kind, 'aggregate residual arm').to.equal('residual-recompute');
+		expect(plan.chosenStrategy, 'no delta: no stored partials and no count(*) witness').to.not.equal('delta-aggregate');
+		expect(plan.delta, 'delta descriptor absent').to.equal(undefined);
+		await assertEquivalent(db, body, 'avg-only baseline');
+		await db.exec('begin');
+		try {
+			await db.exec('insert into t (id, k, a, r) values (10, 1, 8, 9.0), (11, 3, 2, 1.0)');
+			await db.exec('delete from t where id = 3');
+			await assertEquivalent(db, body, 'avg-only in-txn');
+		} finally {
+			await db.exec('rollback');
+		}
+		await assertEquivalent(db, body, 'avg-only post-rollback');
+	});
+
+	it('avg over a REAL column falls to residual (its sum partial fails the integer-domain gate)', async () => {
+		const body = 'select k, count(*) as c, sum(r) as s, avg(r) as av from t group by k';
+		await db.exec(`create materialized view mv as ${body}`);
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.kind, 'aggregate residual arm').to.equal('residual-recompute');
+		expect(plan.chosenStrategy, 'REAL sum fails the exact-domain gate → whole MV residual').to.not.equal('delta-aggregate');
+		await assertEquivalent(db, body, 'avg-over-real baseline');
+		await db.exec('insert into t (id, k, a, r) values (10, 1, 1, 4.25)');
+		await assertEquivalent(db, body, 'avg-over-real after insert');
+	});
+});
+
+/** A non-avg `decompose` UDAF (`wsum(x) ≡ sum(x) + count(x)`) delta-maintained from its stored
+ *  `sum(a)` + `count(*)` partials — proving the decompose class is function-generic (avg is
+ *  merely its first client). The UDAF's `combine` and its own `finalize` agree, and both are
+ *  INTEGER-exact so incremental maintenance stays byte-identical to the live fold. */
+describe('Materialized-view maintenance equivalence (decompose class: a UDAF decomposition)', () => {
+	let db: Database;
+	const body = 'select k, count(*) as c, sum(a) as s, wsum(a) as w from t group by k';
+
+	beforeEach(async () => {
+		db = new Database();
+		db.registerFunction(makeWsumAggregate());
+		await db.exec('create table t (id integer primary key, k integer, a integer not null)');
+		await db.exec('insert into t (id, k, a) values (1, 1, 4), (2, 1, 6), (3, 2, 5)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('a non-avg UDAF decomposition is delta-maintained from its stored partials', () => {
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.chosenStrategy, 'delta strategy chosen for the UDAF decomposition').to.equal('delta-aggregate');
+		expect(plan.delta!.decomposeColumns.length, 'wsum is the one decompose column').to.equal(1);
+	});
+
+	it('read(MV) == evaluate(body) across random mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(decMutationArb, { minLength: 1, maxLength: 10 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, decSqlFor(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 50 });
 	});
 });

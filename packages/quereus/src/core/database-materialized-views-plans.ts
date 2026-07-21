@@ -524,14 +524,45 @@ export interface DeltaAggregateColumn {
 }
 
 /**
+ * The **decomposition-maintained** class of stored aggregate column (the `avg` class):
+ * a column whose value is a scalar `combine` over sibling partial aggregates that are
+ * THEMSELVES stored, delta-maintained columns of the same MV body — `avg(x) ≡
+ * sum(x)/count(x)`, and any UDAF declaring {@link AggregateAlgebra.decompose}. It carries
+ * NO independent accumulator (it is derived): at flush its value is
+ * `combine([finalized(partial) …])` over its partials' freshly finalized values. Resolved
+ * once at plan build (`buildDeltaAggregateDescriptor` — the create-time gate that binds
+ * each partial to a stored sibling) and evaluated per affected group at flush
+ * ({@link computeDeltaAggregateOps}). `avg` is the first client, not a special case.
+ */
+export interface DeltaDecomposeColumn {
+	/** Backing column index (= body output column index) this decomposed aggregate lands at. */
+	readonly backingCol: number;
+	/** Index into {@link DeltaAggregateDescriptor.aggColumns} of each partial, in
+	 *  `decompose.partials` order — the finalized partial values `combine` consumes. Two
+	 *  decompose columns sharing a partial name the same index (the partial is maintained
+	 *  once, read by both). */
+	readonly partialIndices: readonly number[];
+	/** `algebra.decompose.combine`: builds this column's finalized value from its partials'
+	 *  finalized values, in `partialIndices` order. Reproduces the aggregate's own finalize
+	 *  incl. the empty-group / divide-by-zero case (avg → count 0/NULL ⇒ NULL). */
+	readonly combine: (partialValues: readonly SqlValue[]) => SqlValue;
+}
+
+/**
  * Create-time descriptor for the delta-aggregate fast path inside a
  * `'residual-recompute'` plan — see {@link ResidualRecomputePlan.delta}. Built by
  * `buildDeltaAggregateDescriptor` only when every stored column qualifies; any gate
  * failure leaves the plan on the plain residual (never an error).
  */
 export interface DeltaAggregateDescriptor {
-	/** The stored aggregate output columns, one per aggregate the body projects. */
+	/** The stored, independently-accumulated aggregate output columns (one per delta-
+	 *  maintainable aggregate the body projects). A {@link DeltaDecomposeColumn}'s partials
+	 *  are entries here; the decompose column itself is not (it accumulates nothing). */
 	readonly aggColumns: readonly DeltaAggregateColumn[];
+	/** Decomposition-maintained columns (the `avg` class): each derived at flush from its
+	 *  sibling stored partials via `combine`, contributing no independent accumulation.
+	 *  Empty for a body with no decompose column. See {@link DeltaDecomposeColumn}. */
+	readonly decomposeColumns: readonly DeltaDecomposeColumn[];
 	/** Non-aggregate (group-key passthrough) backing columns: each copies the group's
 	 *  backing-PK value at position `pkPos` (in `backingPkDefinition` order) into
 	 *  backing column `backingCol` — covers a group column projected outside the PK

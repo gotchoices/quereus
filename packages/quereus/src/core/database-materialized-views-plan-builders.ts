@@ -13,6 +13,7 @@ import { type PlanNode, type RowDescriptor, type ScalarPlanNode } from '../plann
 import { ColumnReferenceNode, TableReferenceNode } from '../planner/nodes/reference.js';
 import { AggregateFunctionCallNode } from '../planner/nodes/aggregate-function.js';
 import { isAggregateFunctionSchema } from '../schema/function.js';
+import type { AggregateDecomposition } from '../schema/function.js';
 import { PhysicalType } from '../types/logical-type.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { emitPlanNode } from '../runtime/emitters.js';
@@ -73,6 +74,7 @@ import type {
 	BackingPkColumn,
 	DeltaAggregateColumn,
 	DeltaAggregateDescriptor,
+	DeltaDecomposeColumn,
 } from './database-materialized-views-plans.js';
 import type { CollationResolver } from '../types/logical-type.js';
 import { BINARY_COLLATION } from '../util/comparison.js';
@@ -630,14 +632,23 @@ export function buildAggregateResidualPlan(
  *  - a **group-key passthrough** column must resolve (transitively) to a GROUP BY
  *    source column that also backs a backing-PK position (so its flush value is the
  *    group key itself);
- *  - an **aggregate** column must be a plain call (`agg(x)` / `agg()` — no DISTINCT,
- *    FILTER, ORDER BY, multi-arg) whose declared algebra has `merge` + `negate` +
- *    `decode`, with a **bare source column** argument (the delta steps the raw value);
+ *  - a directly **delta-maintainable aggregate** column must be a plain call (`agg(x)` /
+ *    `agg()` — no DISTINCT, FILTER, ORDER BY, multi-arg) whose declared algebra has
+ *    `merge` + `negate` + `decode`, with a **bare source column** argument (the delta
+ *    steps the raw value);
  *  - **exact value domain**: the aggregate's declared return type is INTEGER-physical
  *    (count-shaped — exact regardless of argument), OR its argument column's static
  *    type is INTEGER-physical (integer sum). A REAL/NUMERIC/TEXT sum drifts under
  *    repeated add/subtract and would diverge byte-exactly from the live re-evaluation
  *    the oracle compares against — such a column disqualifies the whole MV (residual);
+ *  - a **decomposition-maintained** column (the avg class) — a plain call whose algebra
+ *    declares `decompose` (a scalar formula over sibling partials, e.g. avg ≡ sum/count)
+ *    but is not itself directly maintainable — is admitted only when EVERY partial it
+ *    names ({@link resolveDecomposePartial}) is also stored as a sibling column of this
+ *    same body and is itself delta-maintainable. It carries no independent accumulation;
+ *    at flush its value is `combine([finalized(partial) …])`. If any partial is missing
+ *    or not delta-maintainable the whole MV falls to residual (avg is the first client of
+ *    this class, not a special case);
  *  - any other column shape (a constant, an expression over the group key, …) fails.
  *
  * Whole-body requirements:
@@ -719,6 +730,10 @@ export function buildDeltaAggregateDescriptor(
 
 	const aggColumns: DeltaAggregateColumn[] = [];
 	const groupOut: Array<{ readonly backingCol: number; readonly pkPos: number }> = [];
+	// Decomposition-maintained columns (the avg class), collected raw here and bound to
+	// their sibling stored partials in a second pass below — the partials may project
+	// before OR after the decompose column, so they cannot be resolved inline.
+	const pendingDecompose: Array<{ readonly backingCol: number; readonly argSourceCol: number | undefined; readonly decomposition: AggregateDecomposition }> = [];
 	for (let outCol = 0; outCol < rootAttrs.length; outCol++) {
 		const attr = rootAttrs[outCol];
 		if (!attr) return undefined;
@@ -741,9 +756,8 @@ export function buildDeltaAggregateDescriptor(
 		const schema = producing.functionSchema;
 		if (!isAggregateFunctionSchema(schema)) return undefined;
 		const algebra = schema.algebra;
-		// Delta-maintainable: merge + negate (retraction) + decode (the backing stores
-		// finalized values, not accumulators).
-		if (!algebra?.negate || !algebra.decode) return undefined;
+		// A bare source column argument (both classes below step / decompose over the raw
+		// value); a zero-arg (count(*)-shaped) call carries none.
 		let argSourceCol: number | undefined;
 		if (producing.args.length === 1) {
 			const arg = producing.args[0];
@@ -751,43 +765,113 @@ export function buildDeltaAggregateDescriptor(
 			argSourceCol = resolveTransitiveSourceCol(arg.attributeId, sourceAttrToCol, producingByAttrId);
 			if (argSourceCol === undefined) return undefined;
 		}
-		// Exact numeric domain: an INTEGER-physical declared result (count-shaped — the
-		// accumulator never holds a float) or an INTEGER-physical argument column
-		// (integer sum). Anything else may drift under repeated add/subtract.
-		// NOTE: if a REAL-domain sum ever needs the fast path, it needs compensated
-		// (Kahan) accumulation or a periodic-rescan discipline — a design change, not a
-		// relaxation of this gate.
-		const resultExact = schema.returnType.logicalType.physicalType === PhysicalType.INTEGER;
-		const argExact = argSourceCol !== undefined
-			&& sourceSchema.columns[argSourceCol]?.logicalType.physicalType === PhysicalType.INTEGER;
-		if (!resultExact && !argExact) return undefined;
-		const retractionSafe = algebra.decodeExact === true
-			|| (argSourceCol !== undefined && sourceSchema.columns[argSourceCol]?.notNull === true);
-		aggColumns.push({
-			backingCol: outCol,
-			schema,
-			algebra,
-			argSourceCol,
-			isMultiplicity: producing.args.length === 0,
-			retractionSafe,
-		});
+		// Class routing — declaration-driven, never an aggregate-name list:
+		//  - **directly delta-maintainable** (`merge` + `negate` (retraction) + `decode` —
+		//    the backing stores finalized values, not accumulators): accumulate it as an
+		//    ordinary partial;
+		//  - else a **decomposition-maintained** column whose value is a formula over
+		//    sibling partials (`algebra.decompose`, e.g. avg ≡ sum/count) — deferred to the
+		//    pass below that binds each partial to a stored sibling; it accumulates nothing;
+		//  - anything else disqualifies the whole MV → residual.
+		if (algebra?.negate && algebra.decode) {
+			// Exact numeric domain: an INTEGER-physical declared result (count-shaped — the
+			// accumulator never holds a float) or an INTEGER-physical argument column
+			// (integer sum). Anything else may drift under repeated add/subtract.
+			// NOTE: if a REAL-domain sum ever needs the fast path, it needs compensated
+			// (Kahan) accumulation or a periodic-rescan discipline — a design change, not a
+			// relaxation of this gate.
+			const resultExact = schema.returnType.logicalType.physicalType === PhysicalType.INTEGER;
+			const argExact = argSourceCol !== undefined
+				&& sourceSchema.columns[argSourceCol]?.logicalType.physicalType === PhysicalType.INTEGER;
+			if (!resultExact && !argExact) return undefined;
+			const retractionSafe = algebra.decodeExact === true
+				|| (argSourceCol !== undefined && sourceSchema.columns[argSourceCol]?.notNull === true);
+			aggColumns.push({
+				backingCol: outCol,
+				schema,
+				algebra,
+				argSourceCol,
+				isMultiplicity: producing.args.length === 0,
+				retractionSafe,
+			});
+			continue;
+		}
+		if (algebra?.decompose) {
+			pendingDecompose.push({ backingCol: outCol, argSourceCol, decomposition: algebra.decompose });
+			continue;
+		}
+		return undefined; // neither directly maintainable nor decomposable → residual
 	}
 
 	// Multiplicity witness: a zero-arg delta-maintainable column whose decode is exact
 	// (its merged value decides group emptiness, so the reconstruction must survive
-	// retraction). Structural — not name-based.
+	// retraction). Structural — not name-based. A decompose column is never the witness
+	// (it accumulates nothing — the requirement is a real stored count(*)).
 	const multiplicityIndex = aggColumns.findIndex(c => c.isMultiplicity && c.algebra.decodeExact === true);
 	if (multiplicityIndex < 0) return undefined;
 	if (aggColumns.length === 0) return undefined; // defensive — findAggregate implies ≥1
 
+	// Bind each decomposition column's partials to sibling STORED, delta-maintained columns
+	// (every `aggColumns` entry already passed the accumulator gate, so it is itself delta-
+	// maintainable). A partial that maps to no such sibling disqualifies the whole MV →
+	// residual (honest and visible: the user wrote a body without the partials the formula
+	// names). The decompose column's `combine` recomputes exactly per group at flush.
+	const decomposeColumns: DeltaDecomposeColumn[] = [];
+	for (const pd of pendingDecompose) {
+		const partialIndices: number[] = [];
+		for (const p of pd.decomposition.partials) {
+			const idx = resolveDecomposePartial(p, pd.argSourceCol, aggColumns, sourceSchema);
+			if (idx === undefined) return undefined;
+			partialIndices.push(idx);
+		}
+		decomposeColumns.push({ backingCol: pd.backingCol, partialIndices, combine: pd.decomposition.combine });
+	}
+
 	return {
 		aggColumns,
+		decomposeColumns,
 		groupColumns: groupOut,
 		multiplicityIndex,
 		backingColumnCount: rootAttrs.length,
 		retractionSafe: aggColumns.every(c => c.retractionSafe),
 		predicate,
 	};
+}
+
+/**
+ * Resolve one {@link AggregateDecomposition} partial (e.g. avg's `sum` / `count`) to the
+ * index of a sibling stored, delta-maintainable aggregate column — an `aggColumns` entry
+ * matching the partial's function name and argument. Returns `undefined` when no such
+ * sibling is stored (the decompose column is then not maintainable → the MV falls to the
+ * residual). The write-side twin of `query-rewrite-matcher.resolveMergeablePartial`.
+ *
+ * `'same-arg'` targets a sibling over the decompose column's own argument (`f(thisArg)`);
+ * `'star'` targets a zero-arg (`count(*)`-shaped) sibling. The **count(*) fallback** mirrors
+ * the read-side relaxation from `feat-mv-agg-rollup-retarget`: a stored `count(*)` substitutes
+ * for a `count(x)` divisor only when `x` is declared **NOT NULL** — then `count(*)` excludes
+ * the same (zero) NULLs `count(x)` would, so the recombine stays exact.
+ */
+function resolveDecomposePartial(
+	p: { readonly func: string; readonly arg: 'same-arg' | 'star' },
+	ownerArgSourceCol: number | undefined,
+	aggColumns: readonly DeltaAggregateColumn[],
+	sourceSchema: TableSchema,
+): number | undefined {
+	// NOTE: a partial resolves only to an `aggColumns` entry, which already passed the
+	// accumulator gate — a BARE source column argument plus the INTEGER-exact-domain check.
+	// That is what keeps the decomposed value byte-exact: a partial like `sum(log x)` (a
+	// non-bare, float-producing argument) can never be a stored delta-maintainable sibling,
+	// so a true geometric mean is NOT delta-decomposable and correctly falls to the residual.
+	const targetArg = p.arg === 'star' ? undefined : ownerArgSourceCol;
+	const funcName = p.func.toLowerCase();
+	const find = (name: string, argCol: number | undefined): number =>
+		aggColumns.findIndex(c => c.schema.name.toLowerCase() === name && c.argSourceCol === argCol);
+	let idx = find(funcName, targetArg);
+	if (idx < 0 && funcName === 'count' && targetArg !== undefined
+		&& sourceSchema.columns[targetArg]?.notNull === true) {
+		idx = find('count', undefined); // count(*) qualifies as the count(x) divisor when x is NOT NULL
+	}
+	return idx < 0 ? undefined : idx;
 }
 
 /**
