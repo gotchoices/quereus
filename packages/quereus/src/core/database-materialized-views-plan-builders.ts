@@ -83,6 +83,13 @@ import { BINARY_COLLATION } from '../util/comparison.js';
  *  optimizer's naive default). Only feeds the create-time maintenance cost gate. */
 const DEFAULT_SOURCE_ROWS = 1000;
 
+/** Create-time estimate of the fraction of changes to a **tighten-only** (min/max) delta
+ *  aggregate that retract (a delete / update-old-image) and so re-derive their group from
+ *  the key-filtered residual instead of pure arithmetic. Feeds the `'delta-aggregate'` cost
+ *  blend ({@link maintenanceCost}); kept well below 1 so an insert-dominated body still
+ *  prefers the delta arm, yet non-zero so a tighten body costs more than a pure-group one. */
+const DELTA_TIGHTEN_FALLBACK_RATIO = 0.25;
+
 /**
  * Snapshot a backing table's physical primary key as the maintenance plans consume it: the
  * declared `(index, desc, collation)` triple plus the collation comparator that name resolves
@@ -594,6 +601,12 @@ export function buildAggregateResidualPlan(
 		: ['residual-recompute'];
 	const hasPredicate = mv.derivation.selectAst.type === 'select' && mv.derivation.selectAst.where !== undefined;
 	const sourceStats = estimateMaintenanceStats(ctx, tableRef.tableSchema, backing.columns.length, hasPredicate);
+	// A tighten-only (min/max) column re-derives a retracted group from the residual, so the
+	// delta arm's cost is no longer pure arithmetic — feed the create-time expected-rescan
+	// fraction into the `'delta-aggregate'` cost blend (maintenanceCost). A tighten body then
+	// costs strictly more than a pure-group body but, for this insert-dominated estimate, still
+	// below the always-residual arm, so the argmin keeps the delta arm.
+	if (delta?.hasTighten) sourceStats.deltaTightenFallbackRatio = DELTA_TIGHTEN_FALLBACK_RATIO;
 	const estimatedChangeCardinality = Math.max(1, sourceStats.tableRows * 0.01);
 	const chosenStrategy = selectMaintenanceStrategy(soundStrategies, estimatedChangeCardinality, sourceStats);
 	if (!soundStrategies.includes(chosenStrategy)) {
@@ -641,6 +654,13 @@ export function buildAggregateResidualPlan(
  *    type is INTEGER-physical (integer sum). A REAL/NUMERIC/TEXT sum drifts under
  *    repeated add/subtract and would diverge byte-exactly from the live re-evaluation
  *    the oracle compares against — such a column disqualifies the whole MV (residual);
+ *  - a **tighten-only** column (min/max, and any UDAF whose merge is a join-semilattice
+ *    like `bit_or`/`bool_or`) — a plain call declaring `merge` + `decode` but NO `negate`
+ *    — is admitted with `deltaClass: 'tighten'`. It needs no exact-value-domain gate
+ *    (merge is idempotent selection, not accumulating arithmetic → no drift) and is never
+ *    retraction-safe: an insert `merge`s the new value in cheaply, but a retracted group
+ *    re-derives wholesale from the residual (via the descriptor's `hasTighten`) rather
+ *    than trusting the arithmetic;
  *  - a **decomposition-maintained** column (the avg class) — a plain call whose algebra
  *    declares `decompose` (a scalar formula over sibling partials, e.g. avg ≡ sum/count)
  *    but is not itself directly maintainable — is admitted only when EVERY partial it
@@ -790,9 +810,32 @@ export function buildDeltaAggregateDescriptor(
 				backingCol: outCol,
 				schema,
 				algebra,
+				deltaClass: 'group',
 				argSourceCol,
 				isMultiplicity: producing.args.length === 0,
 				retractionSafe,
+			});
+			continue;
+		}
+		// Tighten-only (join-semilattice): `merge` + `decode` but NO `negate` — min/max, and
+		// any UDAF whose merge is idempotent selection (bit_or/bool_or). An insert `merge`s the
+		// new value in cheaply (min/max tighten toward the new extreme); a retraction cannot be
+		// undone arithmetically, so a retracted group falls back to the residual
+		// (retractionSafe:false, and the descriptor's hasTighten routes the whole group there
+		// whether or not a row is stored). NO exact-numeric-domain gate: merge is idempotent
+		// selection, not accumulating arithmetic, so there is no float drift to guard — a tighten
+		// column over any comparable domain (REAL/TEXT included) stays byte-exact vs the live
+		// re-evaluation. A negate+decode column that failed the exact-domain gate above already
+		// returned undefined, so only a decode-without-negate aggregate reaches here.
+		if (algebra?.decode && !algebra.negate) {
+			aggColumns.push({
+				backingCol: outCol,
+				schema,
+				algebra,
+				deltaClass: 'tighten',
+				argSourceCol,
+				isMultiplicity: producing.args.length === 0,
+				retractionSafe: false,
 			});
 			continue;
 		}
@@ -800,7 +843,7 @@ export function buildDeltaAggregateDescriptor(
 			pendingDecompose.push({ backingCol: outCol, argSourceCol, decomposition: algebra.decompose });
 			continue;
 		}
-		return undefined; // neither directly maintainable nor decomposable → residual
+		return undefined; // neither directly maintainable, tighten-only, nor decomposable → residual
 	}
 
 	// Multiplicity witness: a zero-arg delta-maintainable column whose decode is exact
@@ -834,6 +877,7 @@ export function buildDeltaAggregateDescriptor(
 		multiplicityIndex,
 		backingColumnCount: rootAttrs.length,
 		retractionSafe: aggColumns.every(c => c.retractionSafe),
+		hasTighten: aggColumns.some(c => c.deltaClass === 'tighten'),
 		predicate,
 	};
 }

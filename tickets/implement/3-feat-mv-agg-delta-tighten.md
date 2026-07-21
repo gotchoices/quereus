@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-21T07:30:52.894Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\3-feat-mv-agg-delta-tighten.implement.2026-07-21T07-30-52-894Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Extend arithmetic maintenance of aggregate materialized views to min and max — grow the stored value cheaply on insert, and only fall back to a full re-scan of the affected group when a delete could lower it.
 prereq: feat-mv-agg-delta-arm
 files: packages/quereus/src/core/database-materialized-views-plans.ts, packages/quereus/src/core/database-materialized-views-plan-builders.ts, packages/quereus/src/core/database-materialized-views-apply.ts, packages/quereus/test/incremental/maintenance-equivalence.spec.ts, docs/mv-maintenance.md

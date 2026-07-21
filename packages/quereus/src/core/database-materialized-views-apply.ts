@@ -878,6 +878,12 @@ export function accumulateDeltaAggregates(
 		if (retract) g.retracted = true;
 		for (let i = 0; i < d.aggColumns.length; i++) {
 			const c = d.aggColumns[i];
+			// A tighten-only column (min/max — merge, no negate) cannot retract arithmetically.
+			// `g.retracted` was set above, so a retracted group with a tighten column re-derives
+			// wholesale from the residual at flush (descriptor.hasTighten) and this accumulator is
+			// discarded — so skip the retraction contribution entirely (there is no negate to
+			// apply). Its INSERT contributions still fold via merge on the non-retract path below.
+			if (retract && c.deltaClass === 'tighten') continue;
 			let contrib: AggValue = c.argSourceCol === undefined
 				? c.schema.stepFunction(cloneInitialValue(c.schema.initialValue))
 				: c.schema.stepFunction(cloneInitialValue(c.schema.initialValue), row[c.argSourceCol]);
@@ -904,14 +910,20 @@ export function accumulateDeltaAggregates(
  *     values + finalized aggregates) — the host's value-identical skip suppresses a
  *     net-identity delta (MV-016).
  *
- * **Retraction fallback.** A group that accumulated a retraction while the descriptor
- * is not retraction-safe (some column's decode is only an insert-observational witness
- * and its argument column is nullable — the stored value cannot prove the true
- * contribution count survives the retraction) is NOT computed arithmetically when a
- * stored row exists: its residual key (always accumulated alongside, same canonical
- * map key) re-derives the group from live source state instead. A group with no stored
- * row needs no fallback — its delta is the exact fold of this statement's net
- * contributions.
+ * **Retraction fallback.** A group that accumulated a retraction re-derives from its
+ * residual key (always accumulated alongside, same canonical map key) instead of the
+ * arithmetic, in two cases:
+ *  - the descriptor has a **tighten** column (min/max — merge, no negate): a retraction
+ *    cannot be undone by merge, so the whole group re-derives from live source state
+ *    **whether or not a row is stored** (an intra-statement delete of the extreme poisons
+ *    even a from-identity net-fold). The residual recomputes every column of the row
+ *    (count/sum included), so a mixed group+tighten row is maintained by ONE path — no
+ *    double-maintenance;
+ *  - otherwise the descriptor is not retraction-safe (an abelian column whose decode is
+ *    only an insert-observational witness — a nullable-argument sum) AND a stored row
+ *    exists: the stored value cannot prove the true contribution count survives the
+ *    retraction, so decoding it is unsound. A group with no stored row needs no fallback
+ *    here — a pure abelian net-fold from identity is exact.
  *
  * Zero source reads, no residual execution on the arithmetic path — this is why the
  * delta path also BYPASSES the per-statement degrade-to-rebuild crossover (it is
@@ -937,7 +949,14 @@ export async function computeDeltaAggregateOps(
 			stored = row;
 			break;
 		}
-		if (stored && g.retracted && !d.retractionSafe) {
+		// Residual fallback for a group whose arithmetic cannot be trusted under retraction:
+		//  - a **tighten** column (min/max) can never retract arithmetically — a retracted
+		//    group re-derives from live state whether or not a row is stored (an intra-statement
+		//    delete of the extreme cannot be undone by merge, even from a fresh identity);
+		//  - otherwise a not-retraction-safe abelian column (a sum whose decode forgets the true
+		//    contribution count) only needs the residual when a stored row must be decoded — its
+		//    no-stored net-fold stays exact, so that case keeps the pure arithmetic path.
+		if (g.retracted && (d.hasTighten || (stored && !d.retractionSafe))) {
 			const fk = entry.forward.get(dedupKey);
 			if (!fk) {
 				// Impossible: accumulateResidualKeys collects the forward key for every

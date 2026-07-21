@@ -271,6 +271,12 @@ export interface MaintenanceSourceStats {
 	forwardBodyCost: number;
 	/** No-stats fallback multiplier; the gate supplies tuning.deltaPerRowFallbackRatio. */
 	fallbackRatio?: number;
+	/** Expected fraction of changes to a **tighten-only** (min/max) delta-aggregate body
+	 *  that retract and so fall back to the key-filtered residual for their group. Set at
+	 *  create only for a `'delta-aggregate'` body carrying a tighten column (min/max, or a
+	 *  join-semilattice UDAF — `merge`, no `negate`); blended into the delta cost by
+	 *  {@link maintenanceCost}. Absent/0 ⇒ pure-group body, delta cost unchanged. */
+	deltaTightenFallbackRatio?: number;
 }
 
 /**
@@ -295,7 +301,11 @@ export interface MaintenanceSourceStats {
  *    key-filtered body re-execution over that group's source rows), so it must cost
  *    strictly below `'residual-recompute'` for every stats input — including a
  *    small/empty source at create time, where the residual's no-stats fallback
- *    (`forwardBodyCost × ratio`) shrinks below any fixed constant.
+ *    (`forwardBodyCost × ratio`) shrinks below any fixed constant. A body carrying a
+ *    **tighten-only** (min/max) column blends in `deltaTightenFallbackRatio` — the expected
+ *    fraction of retracting changes that re-derive their group from the full residual — so
+ *    it costs strictly more than a pure-group body but, for the small create-time estimate,
+ *    still below the always-residual arm.
  *  - `'full-rebuild'`: re-evaluate the whole body once — the always-correct floor,
  *    independent of changeCardinality.
  */
@@ -307,11 +317,22 @@ export function maintenanceCost(
 	switch (strategy) {
 		case 'inverse-projection':
 			return changeCardinality * (COST_CONSTANTS.INDEX_SEEK_PER_ROW + COST_CONSTANTS.PROJECT_PER_ROW);
-		case 'delta-aggregate':
-			return changeCardinality * Math.min(
+		case 'delta-aggregate': {
+			// Pure-group delta cost: an index seek + reprojection per change, capped at half the
+			// residual per-group cost (delta does strictly less work than the residual per group).
+			const deltaPerGroup = Math.min(
 				COST_CONSTANTS.INDEX_SEEK_PER_ROW + COST_CONSTANTS.PROJECT_PER_ROW,
 				residualCostPerGroup(stats) * 0.5,
 			);
+			// A tighten-only (min/max) column re-derives the fraction `f` of changes that retract
+			// from the FULL residual. Blend: `(1-f)·deltaPerGroup + f·residualPerGroup`. Pure-group
+			// bodies (f = 0) reduce to exactly `deltaPerGroup` — unchanged. `f` is a create-time
+			// estimate (small), so a tighten body costs more than a pure-group one yet stays below
+			// the always-residual arm; only a (currently unmeasurable) retraction-heavy `f` would
+			// legitimately tip the argmin to plain residual.
+			const f = stats.deltaTightenFallbackRatio ?? 0;
+			return changeCardinality * ((1 - f) * deltaPerGroup + f * residualCostPerGroup(stats));
+		}
 		case 'residual-recompute':
 			return changeCardinality * residualCostPerGroup(stats);
 		case 'full-rebuild':

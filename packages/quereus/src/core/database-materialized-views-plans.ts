@@ -506,8 +506,19 @@ export interface DeltaAggregateColumn {
 	readonly backingCol: number;
 	/** The registry-resolved aggregate schema — carries step/finalize/initialValue. */
 	readonly schema: AggregateFunctionSchema;
-	/** `schema.algebra`, narrowed: the gate requires `merge`, `negate`, and `decode`. */
+	/** `schema.algebra`, narrowed: `merge` + `decode` always; `negate` for a `'group'`
+	 *  column (absent for a `'tighten'` column). */
 	readonly algebra: AggregateAlgebra;
+	/** Delta maintenance class this column belongs to:
+	 *  - `'group'`: an abelian-group aggregate (count/sum — `merge` + `negate` + `decode`).
+	 *    Inserts and deletes both fold arithmetically (`merge` / `merge(negate(…))`).
+	 *  - `'tighten'`: a join-semilattice aggregate (min/max, `bit_or`/`bool_or` — `merge`,
+	 *    `decode`, but **no** `negate`). An insert `merge`s the new value in cheaply
+	 *    (min/max tighten toward the new extreme); a retraction cannot be undone
+	 *    arithmetically, so a retracted group falls back to the residual (its
+	 *    {@link retractionSafe} is always false, and {@link DeltaAggregateDescriptor.hasTighten}
+	 *    routes the whole group to the residual whether or not a row is stored). */
+	readonly deltaClass: 'group' | 'tighten';
 	/** Source column feeding `step()`; `undefined` for a zero-arg (count(*)-shaped) call. */
 	readonly argSourceCol: number | undefined;
 	/** True iff this is the zero-arg multiplicity witness (count(*)): its finalized value
@@ -519,7 +530,8 @@ export interface DeltaAggregateColumn {
 	 *  the true contribution count equals the multiplicity and stays positive while the
 	 *  backing row exists (sum's absorbing decode witness never spuriously empties).
 	 *  A group that accumulated a retraction while ANY column is not retraction-safe is
-	 *  re-derived by the residual at flush instead of trusting the arithmetic. */
+	 *  re-derived by the residual at flush instead of trusting the arithmetic. A
+	 *  `'tighten'` column is never retraction-safe. */
 	readonly retractionSafe: boolean;
 }
 
@@ -575,6 +587,12 @@ export interface DeltaAggregateDescriptor {
 	/** True iff every {@link DeltaAggregateColumn.retractionSafe}; when false, a group
 	 *  whose statement delta contains any retraction falls back to the residual. */
 	readonly retractionSafe: boolean;
+	/** True iff any {@link DeltaAggregateColumn} is `'tighten'` (min/max — `merge`, no
+	 *  `negate`). Such a column cannot retract arithmetically, so a group that accumulated
+	 *  ANY retraction re-derives from the residual whether or not a row is stored (unlike a
+	 *  merely not-retraction-safe abelian column, whose no-stored net-fold stays exact). A
+	 *  purely group-column descriptor (`false`) never takes the tighten fallback branch. */
+	readonly hasTighten: boolean;
 	/** Compiled single-source-row body WHERE; a row whose predicate is not
 	 *  unambiguously TRUE contributes nothing (mirrors the inverse-projection arm).
 	 *  Absent ⇒ every row is in scope. */
