@@ -45,10 +45,12 @@ import { AggregateNode } from '../../nodes/aggregate-node.js';
 import { AggregateFunctionCallNode } from '../../nodes/aggregate-function.js';
 import { ScalarFunctionCallNode } from '../../nodes/function.js';
 import { TableReferenceNode, ColumnReferenceNode } from '../../nodes/reference.js';
-import { BinaryOpNode, LiteralNode } from '../../nodes/scalar.js';
+import { BinaryOpNode } from '../../nodes/scalar.js';
 import { requireVtabModule } from '../../../schema/table.js';
-import { isAggregateFunctionSchema, isScalarFunctionSchema } from '../../../schema/function.js';
+import { isAggregateFunctionSchema } from '../../../schema/function.js';
+import { createAggregateFunction, createScalarFunction, type AggValue } from '../../../func/registration.js';
 import { FunctionFlags } from '../../../common/constants.js';
+import type { SqlValue } from '../../../common/types.js';
 import { seqScanCost, filterCost, projectCost, aggregateCost, hashJoinCost } from '../../cost/index.js';
 import {
 	analyzeQueryFragment,
@@ -59,7 +61,9 @@ import {
 	matchJoinFragmentToMv,
 	type RewriteMatch,
 	type AggregateRecipe,
+	type MergeReagg,
 	type DeterminismProbe,
+	type AggregateResolver,
 } from '../../analysis/query-rewrite-matcher.js';
 import type { MaintainedTableSchema, TableDerivation } from '../../../schema/derivation.js';
 import type * as AST from '../../../parser/ast.js';
@@ -184,11 +188,18 @@ function rewriteAggregate(
 	const shape = frag.shape;
 	const baseQualified = `${shape.baseTable.schemaName}.${shape.baseTable.name}`.toLowerCase();
 
+	// Resolve a fragment/partial aggregate's schema (its declared algebra) by (name, argc)
+	// off the live function registry — the source of truth for rollup decomposability.
+	const resolveAggregate: AggregateResolver = (name, argc) => {
+		const fn = sm.findFunction(name, argc) ?? sm.findFunction(name, -1);
+		return fn && isAggregateFunctionSchema(fn) ? fn : undefined;
+	};
+
 	const matches: RewriteMatch[] = [];
 	for (const mv of mvs) {
 		if (mv.derivation.sourceTables.length !== 1 || mv.derivation.sourceTables[0] !== baseQualified) continue;
 		const backing = sm.getTable(mv.schemaName, mv.name);
-		const res = matchAggregateFragmentToMv(shape, mv, backing, isDeterministic);
+		const res = matchAggregateFragmentToMv(shape, mv, backing, isDeterministic, resolveAggregate);
 		if (res.match) matches.push(res.match);
 	}
 	if (matches.length === 0) return null;
@@ -586,7 +597,6 @@ function exprOf(node: ScalarPlanNode): AST.Expression {
  */
 function buildRollupReplacement(aggNode: AggregateNode, match: RewriteMatch, context: OptContext): PlanNode | null {
 	const scope = aggNode.scope;
-	const sm = context.db.schemaManager;
 	const rollup = match.rollup!;
 
 	const built = buildBackingSource(scope, match, context);
@@ -596,17 +606,15 @@ function buildRollupReplacement(aggNode: AggregateNode, match: RewriteMatch, con
 	// Re-aggregate GROUP BY: a ColumnReference onto each backing group-key column.
 	const groupBy = rollup.groupKeyBackingCols.map(bc => colRefOnto(scope, backingAttrs[bc], bc));
 
-	// Flattened primitive recombine aggregates; `primIdx[ri]` holds the indices (into
-	// this list) recipe `ri` consumes (avg consumes two `sum`s, others one).
+	// Flattened re-aggregations; `primIdx[ri]` holds the indices (into this list) recipe
+	// `ri` consumes — a `compose` recipe consumes one per partial (avg → 2), a `merge` one.
 	const primitives: { expression: ScalarPlanNode; alias: string }[] = [];
 	const primIdx: number[][] = [];
 	for (const recipe of rollup.aggregates) {
 		const idxs: number[] = [];
-		for (const prim of primitiveAggsFor(recipe)) {
-			const agg = buildReaggAggregate(scope, sm, prim.fn, backingAttrs[prim.backingCol], prim.backingCol);
-			if (!agg) return null;
+		for (const reagg of mergeReaggsFor(recipe)) {
 			idxs.push(primitives.length);
-			primitives.push(agg);
+			primitives.push(buildReaggAggregate(scope, reagg, backingAttrs));
 		}
 		primIdx.push(idxs);
 	}
@@ -624,69 +632,76 @@ function buildRollupReplacement(aggNode: AggregateNode, match: RewriteMatch, con
 	for (let ri = 0; ri < rollup.aggregates.length; ri++) {
 		const recipe = rollup.aggregates[ri];
 		const primRefs = primIdx[ri].map(k => colRefOnto(scope, reaggAttrs[groupCount + k], groupCount + k));
-		const node = buildRecipeOutput(scope, sm, recipe, primRefs);
-		if (!node) return null;
-		projections.push({ node, alias: recipe.outAttr.name, attributeId: recipe.outAttr.id });
+		projections.push({ node: buildRecipeOutput(scope, recipe, primRefs), alias: recipe.outAttr.name, attributeId: recipe.outAttr.id });
 	}
 
 	const fragAttrs = aggNode.getAttributes();
 	return new ProjectNode(scope, reagg, projections, undefined, fragAttrs as Attribute[], false);
 }
 
-/** The primitive re-aggregations a recipe consumes: `count` recombines via `sum`;
- *  `avg` via two `sum`s (over the stored sum and count); the rest are 1:1. */
-function primitiveAggsFor(recipe: AggregateRecipe): ReadonlyArray<{ fn: string; backingCol: number }> {
+/** The stored-partial re-aggregations a recipe consumes: a `merge` recipe folds its one
+ *  stored partial; a `compose` recipe folds each of its decomposition partials; a
+ *  `passthrough` (exact-key) never reaches the rollup builder. */
+function mergeReaggsFor(recipe: AggregateRecipe): readonly MergeReagg[] {
 	switch (recipe.kind) {
-		case 'sum': return [{ fn: 'sum', backingCol: recipe.backingCols[0] }];
-		case 'min': return [{ fn: 'min', backingCol: recipe.backingCols[0] }];
-		case 'max': return [{ fn: 'max', backingCol: recipe.backingCols[0] }];
-		case 'count': return [{ fn: 'sum', backingCol: recipe.backingCols[0] }];
-		case 'avg': return [{ fn: 'sum', backingCol: recipe.backingCols[0] }, { fn: 'sum', backingCol: recipe.backingCols[1] }];
-		default: { const _exhaustive: never = recipe.kind; void _exhaustive; return []; }
+		case 'merge': return [recipe.reagg];
+		case 'compose': return recipe.partials;
+		case 'passthrough': return [];
 	}
-}
-
-/** Build a re-aggregation `fn(backingCol)` (a non-distinct `sum`/`min`/`max`). */
-function buildReaggAggregate(
-	scope: Scope,
-	sm: OptContext['db']['schemaManager'],
-	fn: string,
-	backingAttr: Attribute,
-	backingCol: number,
-): { expression: ScalarPlanNode; alias: string } | undefined {
-	const schema = sm.findFunction(fn, 1);
-	if (!schema || !isAggregateFunctionSchema(schema)) return undefined;
-	const colRef = colRefOnto(scope, backingAttr, backingCol);
-	const fnExpr: AST.FunctionExpr = { type: 'function', name: fn, args: [colRef.expression], distinct: false };
-	const inferred = schema.inferReturnType ? schema.inferReturnType([backingAttr.type.logicalType]) : schema.returnType;
-	const node = new AggregateFunctionCallNode(scope, fnExpr, fn, schema, [colRef], false, undefined, undefined, inferred);
-	return { expression: node, alias: `${fn}(${backingAttr.name})` };
 }
 
 /**
- * Recombine a recipe's re-aggregated primitive(s) into the fragment's output scalar:
- *  - `sum`/`min`/`max` — passthrough of the single primitive.
- *  - `count` — `coalesce(sum, 0)`: the re-aggregated `sum` is NULL only over zero
- *    backing rows (the empty global group), where `count` must be 0, not NULL.
- *  - `avg` — `sum / count` (Quereus `/` is real division; NULL/0 over zero rows ⇒ NULL).
+ * Build the re-aggregation of one stored partial, generically from the stored
+ * aggregate's declared algebra: a synthetic aggregate that folds each stored (finalized)
+ * partial through the aggregate's own `merge ∘ decode`, then its own `finalize`. This
+ * reconstructs `f(x)` over the rolled-up groups for ANY directly-mergeable aggregate —
+ * `sum`←sum, `count`←sum-of-counts, `min`/`max`←tightening, and any UDAF declaring
+ * `merge` + `decode` — with no aggregate-name switch. The empty-group value falls out of
+ * `finalize(identity)` (count→0, sum/min/max→NULL), so no coalesce is emitted.
+ */
+function buildReaggAggregate(
+	scope: Scope,
+	reagg: MergeReagg,
+	backingAttrs: readonly Attribute[],
+): { expression: ScalarPlanNode; alias: string } {
+	const { schema, backingCol } = reagg;
+	const backingAttr = backingAttrs[backingCol];
+	const colRef = colRefOnto(scope, backingAttr, backingCol);
+	// The matcher admits this recipe only when merge + decode are declared.
+	const merge = schema.algebra!.merge;
+	const decode = schema.algebra!.decode!;
+	const reaggSchema = createAggregateFunction(
+		{ name: schema.name, numArgs: 1, initialValue: schema.initialValue, returnType: schema.returnType, deterministic: true },
+		(acc: AggValue, v: SqlValue): AggValue => merge(acc, decode(v)),
+		schema.finalizeFunction,
+	);
+	const fnExpr: AST.FunctionExpr = { type: 'function', name: schema.name, args: [colRef.expression], distinct: false };
+	const inferred = schema.inferReturnType ? schema.inferReturnType([backingAttr.type.logicalType]) : schema.returnType;
+	const node = new AggregateFunctionCallNode(scope, fnExpr, schema.name, reaggSchema, [colRef], false, undefined, undefined, inferred);
+	return { expression: node, alias: `${schema.name}(${backingAttr.name})` };
+}
+
+/**
+ * Recombine a recipe's re-aggregated partial(s) into the fragment's output scalar:
+ *  - `merge` — passthrough of the single re-aggregated partial.
+ *  - `compose` — apply the aggregate's declared `decompose.combine` over the partials,
+ *    wrapped as a synthetic scalar function so the JS combine runs per output row (avg's
+ *    `sum/count` with its NULL/0 guard lives inside `combine`, so it falls out here).
  */
 function buildRecipeOutput(
 	scope: Scope,
-	sm: OptContext['db']['schemaManager'],
 	recipe: AggregateRecipe,
 	primRefs: readonly ColumnReferenceNode[],
-): ScalarPlanNode | undefined {
-	if (recipe.kind === 'avg') {
-		const ast: AST.BinaryExpr = { type: 'binary', operator: '/', left: primRefs[0].expression, right: primRefs[1].expression };
-		return new BinaryOpNode(scope, ast, primRefs[0], primRefs[1]);
+): ScalarPlanNode {
+	if (recipe.kind === 'compose') {
+		const combine = recipe.combine;
+		const combineSchema = createScalarFunction(
+			{ name: 'agg_combine', numArgs: primRefs.length, returnType: recipe.outAttr.type, deterministic: true },
+			(...args: SqlValue[]): SqlValue => combine(args),
+		);
+		const fnExpr: AST.FunctionExpr = { type: 'function', name: 'agg_combine', args: primRefs.map(r => r.expression) };
+		return new ScalarFunctionCallNode(scope, fnExpr, combineSchema, [...primRefs], recipe.outAttr.type);
 	}
-	if (recipe.kind === 'count') {
-		const schema = sm.findFunction('coalesce', 2) ?? sm.findFunction('coalesce', -1);
-		if (!schema || !isScalarFunctionSchema(schema)) return undefined;
-		const zero = new LiteralNode(scope, { type: 'literal', value: 0 } as AST.LiteralExpr);
-		const ast: AST.FunctionExpr = { type: 'function', name: 'coalesce', args: [primRefs[0].expression, zero.expression] };
-		return new ScalarFunctionCallNode(scope, ast, schema, [primRefs[0], zero]);
-	}
-	// sum / min / max — passthrough of the single re-aggregated partial.
+	// merge — passthrough of the single re-aggregated partial.
 	return primRefs[0];
 }

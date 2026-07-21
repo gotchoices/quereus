@@ -121,7 +121,7 @@ When **every** stored aggregate column is delta-maintainable by its **declared a
 
 > Float-exact tripwire: the INTEGER-domain gate is what keeps the arithmetic byte-exact. If a REAL-domain sum ever needs the fast path, it needs compensated (Kahan) accumulation or a periodic rescan discipline — a design change, not a gate relaxation.
 
-The **read-side rollup retarget** (ticket `feat-mv-agg-rollup-retarget`) is the other planned consumer of the algebra declarations — it recombines stored aggregate MVs at coarser grain; `min`/`max` tighten-only maintenance (`feat-mv-agg-delta-tighten`) and `avg` decomposition (`feat-mv-agg-delta-decompose`) extend this descriptor.
+The **read-side rollup** (`recipeForRollup`, see [materialized-views.md § Aggregate rollup](materialized-views.md#aggregate-rollup-indexed-view-matching)) is the other consumer of the algebra declarations — it recombines stored aggregate MVs at coarser grain, decided entirely by each aggregate's declared `merge`/`decode`/`decompose` rather than a builtin-name list, so a UDAF that declares algebra rolls up for free. `min`/`max` tighten-only maintenance (`feat-mv-agg-delta-tighten`) and `avg` decomposition (`feat-mv-agg-delta-decompose`) extend this descriptor.
 
 ### `'prefix-delete'` (single-source lateral-TVF fan-out shape)
 

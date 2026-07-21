@@ -12,13 +12,28 @@ import { Database } from '../src/core/database.js';
 import { DEFAULT_TUNING } from '../src/planner/optimizer.js';
 import { PlanNodeType } from '../src/planner/nodes/plan-node-type.js';
 import type { RelationalPlanNode } from '../src/planner/nodes/plan-node.js';
+import type { SqlValue } from '../src/common/types.js';
+import { serializePlanTree } from '../src/planner/debug.js';
+import { createAggregateFunction } from '../src/func/registration.js';
+import { isAggregateFunctionSchema } from '../src/schema/function.js';
+import { INTEGER_TYPE } from '../src/types/builtin-types.js';
 import {
 	matchAggregateMaterializedViewRewrite,
 	type RewriteResult,
 	type DeterminismProbe,
+	type AggregateResolver,
 } from '../src/planner/analysis/query-rewrite-matcher.js';
 
 const ALL_DETERMINISTIC: DeterminismProbe = () => true;
+
+/** Resolve an aggregate's schema by (name, argc) off the live registry — the same probe
+ *  the rule threads into the matcher, so the unit tests exercise the real algebra source. */
+function aggResolver(db: Database): AggregateResolver {
+	return (name, argc) => {
+		const fn = db.schemaManager.findFunction(name, argc) ?? db.schemaManager.findFunction(name, -1);
+		return fn && isAggregateFunctionSchema(fn) ? fn : undefined;
+	};
+}
 
 /** Rules that would either rewrite the fragment, lower the logical Aggregate to a
  *  physical Stream/Hash node, simplify/reposition the GROUP BY, or move the WHERE —
@@ -64,7 +79,7 @@ function matchAgg(db: Database, sql: string, mvName: string, isDet: DeterminismP
 	const mv = db.schemaManager.getMaintainedTable('main', mvName)!;
 	// The maintained table IS its own backing in the unified model.
 	const backing = db.schemaManager.getTable('main', mv.name);
-	return matchAggregateMaterializedViewRewrite(root, mv, backing, isDet);
+	return matchAggregateMaterializedViewRewrite(root, mv, backing, isDet, aggResolver(db));
 }
 
 const SALES = [
@@ -125,7 +140,10 @@ describe('aggregate-rollup matcher — rollup (superset key)', () => {
 			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
 			expect(res.match!.rollup!.exact).to.equal(false);
 			expect(res.match!.rollup!.aggregates).to.have.lengthOf(1);
-			expect(res.match!.rollup!.aggregates[0].kind).to.equal('sum');
+			const recipe = res.match!.rollup!.aggregates[0];
+			expect(recipe.kind).to.equal('merge');
+			// sum re-aggregates its own stored partial via its declared merge/decode.
+			if (recipe.kind === 'merge') expect(recipe.reagg.schema.name).to.equal('sum');
 		} finally {
 			await db.close();
 		}
@@ -136,7 +154,11 @@ describe('aggregate-rollup matcher — rollup (superset key)', () => {
 		try {
 			const res = matchAgg(db, 'select d, count(*) from sales group by d', 'byregion');
 			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
-			expect(res.match!.rollup!.aggregates[0].kind).to.equal('count');
+			const recipe = res.match!.rollup!.aggregates[0];
+			expect(recipe.kind).to.equal('merge');
+			// count re-aggregates its stored count partial via count's declared merge/decode
+			// (a sum-of-counts); the empty-group 0 comes from finalize(identity), not a coalesce.
+			if (recipe.kind === 'merge') expect(recipe.reagg.schema.name).to.equal('count');
 		} finally {
 			await db.close();
 		}
@@ -148,9 +170,12 @@ describe('aggregate-rollup matcher — rollup (superset key)', () => {
 			const res = matchAgg(db, 'select d, avg(amt) from sales group by d', 'byregion');
 			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
 			const recipe = res.match!.rollup!.aggregates[0];
-			expect(recipe.kind).to.equal('avg');
-			// avg consumes two backing columns: stored sum(amt) and stored count(amt).
-			expect(recipe.backingCols).to.have.lengthOf(2);
+			expect(recipe.kind).to.equal('compose');
+			// avg composes from two stored partials: sum(amt) and count(amt).
+			if (recipe.kind === 'compose') {
+				expect(recipe.partials).to.have.lengthOf(2);
+				expect(recipe.partials.map(p => p.schema.name)).to.deep.equal(['sum', 'count']);
+			}
 		} finally {
 			await db.close();
 		}
@@ -177,7 +202,10 @@ describe('aggregate-rollup matcher — rollup (superset key)', () => {
 		try {
 			const res = matchAgg(db, 'select k, avg(r) from t group by k', 'mv');
 			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
-			expect(res.match!.rollup!.aggregates[0].kind).to.equal('avg');
+			const recipe = res.match!.rollup!.aggregates[0];
+			expect(recipe.kind).to.equal('compose');
+			// The count partial falls back to the stored count(*) — sound because `r` is NOT NULL.
+			if (recipe.kind === 'compose') expect(recipe.partials.map(p => p.schema.name)).to.deep.equal(['sum', 'count']);
 		} finally {
 			await db.close();
 		}
@@ -267,7 +295,9 @@ describe('aggregate-rollup matcher — per-reason negatives', () => {
 			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
 			expect(res.match!.rollup!.exact).to.equal(false);
 			expect(res.match!.residualConjuncts).to.have.lengthOf(1);
-			expect(res.match!.rollup!.aggregates[0].kind).to.equal('sum');
+			const recipe = res.match!.rollup!.aggregates[0];
+			expect(recipe.kind).to.equal('merge');
+			if (recipe.kind === 'merge') expect(recipe.reagg.schema.name).to.equal('sum');
 		} finally {
 			await db.close();
 		}
@@ -307,6 +337,86 @@ describe('aggregate-rollup matcher — per-reason negatives', () => {
 			const res = matchAgg(db, 'select d, sum(amt) from sales group by d', 'byregion');
 			expect(res.match).to.be.undefined;
 			expect(reason(res)).to.equal('no-candidate');
+		} finally {
+			await db.close();
+		}
+	});
+});
+
+/* ── User-defined aggregate rollup (the retarget's headline win) ────────────────
+ * The rollup matcher is driven by declared `AggregateAlgebra`, not a builtin-name
+ * list — so a UDAF that declares algebra rolls up through an MV for free. `bit_xor`
+ * is an abelian-group integer aggregate (xor is its own inverse) declaring
+ * `merge` + `decode`, so it takes the directly-mergeable path exactly like `sum`. */
+
+/** Register the `bit_xor` UDAF (mirrors the delta-aggregate suite's `xorSchema`). */
+function registerBitXor(db: Database): void {
+	db.registerFunction(createAggregateFunction(
+		{
+			name: 'bit_xor', numArgs: 1, initialValue: 0,
+			returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+			algebra: {
+				merge: (a: number, b: number): number => a ^ b,
+				negate: (a: number): number => a, // xor is its own inverse
+				decode: (stored: SqlValue): number => Number(stored),
+				decodeExact: true,
+			},
+		},
+		(acc: number, v: SqlValue): number => (v === null ? acc : acc ^ Number(v)),
+		(acc: number): number => acc,
+	));
+}
+
+const XOR_DDL = [
+	'create table ev (id integer primary key, d integer not null, r integer not null, v integer not null)',
+	'create materialized view byreg as select d, r, bit_xor(v) as bx from ev group by d, r',
+];
+
+describe('aggregate-rollup matcher — user-defined aggregate algebra', () => {
+	it('a UDAF declaring algebra rolls up through an MV (directly-mergeable recipe, no name list)', async () => {
+		const db = new Database();
+		registerBitXor(db);
+		for (const stmt of XOR_DDL) await db.exec(stmt);
+		try {
+			const res = matchAgg(db, 'select d, bit_xor(v) from ev group by d', 'byreg');
+			expect(res.match, `matched (${reason(res)})`).to.not.be.undefined;
+			expect(res.match!.rollup!.exact).to.equal(false);
+			const recipe = res.match!.rollup!.aggregates[0];
+			expect(recipe.kind).to.equal('merge');
+			if (recipe.kind === 'merge') expect(recipe.reagg.schema.name).to.equal('bit_xor');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('the rolled-up UDAF executes identically to the base recompute (end-to-end)', async () => {
+		const db = new Database();
+		registerBitXor(db);
+		for (const stmt of XOR_DDL) await db.exec(stmt);
+		try {
+			// (d, r) groups with several rows each so the rollup to {d} folds multiple stored partials.
+			const rows: [number, number, number, number][] = [
+				[1, 1, 10, 5], [2, 1, 10, 6], [3, 1, 20, 7], [4, 2, 20, 3], [5, 2, 30, 9], [6, 2, 30, 9],
+			];
+			for (const [id, d, r, v] of rows) await db.exec(`insert into ev (id, d, r, v) values (${id}, ${d}, ${r}, ${v})`);
+
+			const q = 'select d, bit_xor(v) as x from ev group by d order by d';
+			const read = async (): Promise<string[]> => {
+				const out: string[] = [];
+				for await (const row of db.eval(q)) out.push(JSON.stringify(Object.values(row) as SqlValue[]));
+				return out;
+			};
+
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+			const on = await read();
+			// The rollup must actually fire — else this vacuously compares two base recomputes.
+			expect(serializePlanTree(db.getPlan(q)), 'rollup fired over the UDAF MV').to.contain('"name": "byreg"');
+
+			db.optimizer.updateTuning({ ...DEFAULT_TUNING, disabledRules: new Set(['materialized-view-rewrite']) });
+			const off = await read();
+			db.optimizer.updateTuning(DEFAULT_TUNING);
+
+			expect(on, 'rolled-up UDAF diverged from base recompute').to.deep.equal(off);
 		} finally {
 			await db.close();
 		}

@@ -64,6 +64,8 @@ import { JoinNode } from '../nodes/join-node.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
 import type { MaintainedTableSchema } from '../../schema/derivation.js';
 import type { TableSchema } from '../../schema/table.js';
+import type { AggregateFunctionSchema } from '../../schema/function.js';
+import type { SqlValue } from '../../common/types.js';
 import type * as AST from '../../parser/ast.js';
 import { recognizeConjunctiveClauses, guardClausesEntail } from './partial-unique-extraction.js';
 import { proveOneToOneJoin, pureJoinEquiAttrPairs } from './coverage-prover.js';
@@ -143,25 +145,50 @@ export interface RewriteMatch {
 
 /**
  * How to reconstruct one fragment aggregate from the MV's stored backing columns
- * during a rollup re-aggregation. The recombine is sound only for the
- * decomposable-aggregate allowlist (see {@link matchAggregateFragmentToMv}).
+ * during a rollup re-aggregation. Driven entirely by the aggregate's **declared
+ * algebra** (`merge` / `decode` / `decompose`) — never an aggregate-name list — so any
+ * UDAF that declares algebra rolls up for free (see {@link matchAggregateFragmentToMv}).
+ * Three structural variants:
+ *  - `passthrough` — exact-key: the stored column *is* the answer (no re-aggregate).
+ *  - `merge` — a directly-mergeable aggregate (declares `merge` + `decode`): re-aggregate
+ *    by folding the stored partial through the aggregate's own `merge ∘ decode`, then
+ *    its own `finalize` (see {@link MergeReagg}). The empty-group value falls out of
+ *    `finalize(identity)` (count→0, sum/min/max→NULL) — no name-specific coalesce.
+ *  - `compose` — a decomposable aggregate (declares `decompose`, e.g. `avg`): re-aggregate
+ *    each sibling partial (directly-mergeable), then `combine` their finalized values.
  */
-export interface AggregateRecipe {
+export type AggregateRecipe = {
 	/** The fragment aggregate's output attribute (preserved through the rewrite). */
 	readonly outAttr: Attribute;
-	/**
-	 * The recombine operator over the backing column(s):
-	 *  - `'sum'` — re-aggregate `sum(backingCol)` (reconstructs `sum(x)`).
-	 *  - `'count'` — re-aggregate `coalesce(sum(backingCol), 0)` (reconstructs
-	 *    `count(*)` / `count(x)`; the coalesce restores the count-over-zero-rows = 0
-	 *    semantics a bare `sum` would surface as NULL for the empty global group).
-	 *  - `'min'` / `'max'` — re-aggregate `min`/`max` of the partials.
-	 *  - `'avg'` — `sum(sumBackingCol) / sum(countBackingCol)` (Quereus `/` is real
-	 *    division, matching the native `avg`; NULL/0 over zero rows ⇒ NULL).
-	 */
-	readonly kind: 'sum' | 'count' | 'min' | 'max' | 'avg';
-	/** Backing column(s): `[col]` for sum/count/min/max; `[sumCol, countCol]` for avg. */
-	readonly backingCols: readonly number[];
+} & (
+	| { readonly kind: 'passthrough'; readonly backingCol: number }
+	| { readonly kind: 'merge'; readonly reagg: MergeReagg }
+	| {
+		readonly kind: 'compose';
+		/** The re-aggregations of the decomposition's sibling partials, in `decompose.partials`
+		 *  order (e.g. avg → `[sum(x), count(x)]`). */
+		readonly partials: readonly MergeReagg[];
+		/** The composed aggregate's `decompose.combine` — builds the finalized value from the
+		 *  re-aggregated partials' finalized values, in `partials` order (avg's NULL/0 guard
+		 *  lives inside it, so the empty-group case falls out). */
+		readonly combine: (partialValues: readonly SqlValue[]) => SqlValue;
+	}
+);
+
+/**
+ * A directly-mergeable re-aggregation of one stored partial column: fold the stored
+ * (finalized) partials of the rolled-up subgroups through the aggregate's own
+ * `merge ∘ decode`, then `finalize`. Sound for any aggregate that declares both
+ * `merge` (a commutative monoid over accumulators) and `decode` (reconstruct an
+ * accumulator from a stored finalized value). The rule synthesizes an aggregate
+ * function from this and applies it over {@link backingCol}.
+ */
+export interface MergeReagg {
+	/** Backing column holding the stored partial (`f(x)` / `count(*)`). */
+	readonly backingCol: number;
+	/** The stored aggregate's registered schema — carries `algebra.merge`/`decode`,
+	 *  `finalizeFunction`, `initialValue`, and the return type. */
+	readonly schema: AggregateFunctionSchema;
 }
 
 /** The aggregate-rollup descriptor on a {@link RewriteMatch}. */
@@ -190,6 +217,15 @@ export type RewriteResult =
 
 /** A predicate over the named function is deterministic iff this returns true. */
 export type DeterminismProbe = (fnName: string, argc: number) => boolean;
+
+/**
+ * Resolve an aggregate's registered schema by `(name, argc)` — the source of truth for
+ * an aggregate's declared algebra during rollup recipe construction. Parallels
+ * {@link DeterminismProbe}: threaded from the rule (which holds the live `Database`) so
+ * the analysis module stays free of a direct function-registry import. Returns
+ * `undefined` when `(name, argc)` names no registered aggregate.
+ */
+export type AggregateResolver = (funcName: string, numArgs: number) => AggregateFunctionSchema | undefined;
 
 function fail(reason: RewriteFailureReason): RewriteResult {
 	return { match: undefined, reason };
@@ -422,10 +458,14 @@ export function matchMaterializedViewRewrite(
  *    are the answer: a direct scan + optional residual Filter on group-key columns
  *    + residual Project. Reuses the foundation's `buildReplacement`.
  *  - **Superset-key (rollup)** — query GROUP BY ⊊ MV group key (incl. the empty
- *    global key). Re-aggregate the backing down to the query key. Sound only for the
- *    decomposable-aggregate allowlist: `sum`→`sum`, `count`→`sum`(+coalesce),
- *    `min`/`max`→`min`/`max`, `avg`→`sum(sum)/sum(count)`. `count(distinct)` /
- *    `group_concat` / any DISTINCT / any other aggregate ⇒ forgo (default-deny).
+ *    global key). Re-aggregate the backing down to the query key. Soundness is decided
+ *    by each fragment aggregate's **declared algebra** (`recipeForRollup`), not a
+ *    name list: a directly-mergeable aggregate (`merge` + `decode`) folds its stored
+ *    partial through its own `merge ∘ decode` + `finalize`; a decomposable one
+ *    (`decompose`, e.g. `avg`) recombines its sibling partials via `combine`; anything
+ *    with no usable algebra (`total`, `group_concat`, `var_*`) or any DISTINCT ⇒ forgo
+ *    (default-deny). So `sum`/`count`/`min`/`max`/`avg` and any UDAF declaring algebra
+ *    all roll up through the one declared-algebra path.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** A fragment aggregate recognized as `f([col])` / `count(*)` over the base table. */
@@ -548,6 +588,7 @@ export function matchAggregateFragmentToMv(
 	mv: MaintainedTableSchema,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,
+	resolveAggregate: AggregateResolver,
 ): RewriteResult {
 	const baseTable = shape.baseTable;
 
@@ -627,10 +668,14 @@ export function matchAggregateFragmentToMv(
 	for (const qa of shape.aggregates) {
 		const recipe = exact
 			? recipeForExact(qa, stored.storedAggs)
-			: recipeForRollup(qa, stored.storedAggs, baseTable);
+			: recipeForRollup(qa, stored.storedAggs, baseTable, resolveAggregate);
 		if (!recipe) return fail('aggregate-not-decomposable');
 		recipes.push(recipe);
-		if (exact) outputColumnMap.push({ attrId: qa.outAttr.id, backingCol: recipe.backingCols[0] });
+		// Exact-key answers via `outputColumnMap`; `recipeForExact` only ever returns a
+		// passthrough recipe, so its stored column is the answer.
+		if (exact && recipe.kind === 'passthrough') {
+			outputColumnMap.push({ attrId: qa.outAttr.id, backingCol: recipe.backingCol });
+		}
 	}
 
 	// ---- Predicate alignment (identical containment logic to the foundation), with
@@ -728,10 +773,11 @@ export function matchAggregateMaterializedViewRewrite(
 	mv: MaintainedTableSchema,
 	backing: TableSchema | undefined,
 	isDeterministic: DeterminismProbe,
+	resolveAggregate: AggregateResolver,
 ): RewriteResult {
 	const frag = analyzeAggregateFragment(root);
 	if (!frag.ok) return fail(frag.reason);
-	return matchAggregateFragmentToMv(frag.shape, mv, backing, isDeterministic);
+	return matchAggregateFragmentToMv(frag.shape, mv, backing, isDeterministic, resolveAggregate);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -1169,66 +1215,112 @@ function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean 
 	return true;
 }
 
-/** Decomposable rollup aggregates that re-aggregate as plain `sum`/`min`/`max`. */
-const ROLLUP_SUM_LIKE: ReadonlyMap<string, AggregateRecipe['kind']> = new Map([
-	['sum', 'sum'], ['min', 'min'], ['max', 'max'],
-]);
-
 /**
  * Exact-key recipe: the query aggregate must be *exactly* a stored MV aggregate
  * (same function, same argument column, same DISTINCT flag). The stored value is
  * the answer, so this admits any aggregate — including `count(distinct)` /
- * `group_concat` — as a passthrough. Returns a `sum`-kind passthrough recipe whose
- * `backingCols[0]` is the stored column (the kind is unused for exact-key, which the
- * rule answers via `outputColumnMap`).
+ * `group_concat` — as a passthrough (name-agnostic, no algebra gate). Returns a
+ * `passthrough` recipe naming the stored column (the rule answers exact-key via
+ * `outputColumnMap`).
  */
 function recipeForExact(qa: FragmentAggregate, stored: readonly StoredAggregate[]): AggregateRecipe | undefined {
 	const match = stored.find(sa =>
 		sa.funcName === qa.funcName && sa.argBaseCol === qa.argBaseCol && sa.isDistinct === qa.isDistinct);
 	if (!match) return undefined;
-	return { outAttr: qa.outAttr, kind: 'sum', backingCols: [match.backingCol] };
+	return { outAttr: qa.outAttr, kind: 'passthrough', backingCol: match.backingCol };
 }
 
 /**
- * Rollup recipe: reconstruct `qa` by re-aggregating the MV's stored partials. Only
- * the decomposable allowlist is admitted; a DISTINCT aggregate never composes.
+ * Rollup recipe: reconstruct `qa` by re-aggregating the MV's stored partials, driven
+ * by `qa`'s **declared algebra** resolved from the function registry — no aggregate-name
+ * list. A DISTINCT aggregate never composes (a distinct aggregate is not a plain merge
+ * of partials), so it declines regardless of declared algebra.
+ *
+ *  - **Decompose** (`algebra.decompose`, e.g. `avg`) — recombine the sibling partials
+ *    (each directly-mergeable) via `decompose.combine`. Preferred when present.
+ *  - **Directly mergeable** (`algebra.merge` + `algebra.decode`, e.g. sum/count/min/max
+ *    and any abelian-group UDAF) — re-aggregate the aggregate's own stored partial.
+ *  - Otherwise (no algebra, or `merge` without a `decode` to reconstruct the
+ *    accumulator) ⇒ decline (`total`, `group_concat`, `var_*`, …).
  */
 function recipeForRollup(
 	qa: FragmentAggregate,
 	stored: readonly StoredAggregate[],
 	baseTable: TableSchema,
+	resolveAggregate: AggregateResolver,
 ): AggregateRecipe | undefined {
 	if (qa.isDistinct) return undefined; // count(distinct …) and friends never compose under rollup.
 
-	const sumLike = ROLLUP_SUM_LIKE.get(qa.funcName);
-	if (sumLike) {
-		// sum(x) ← sum(stored sum(x)); min/max(x) ← min/max(stored min/max(x)).
-		const col = findStored(stored, qa.funcName, qa.argBaseCol);
-		return col === undefined ? undefined : { outAttr: qa.outAttr, kind: sumLike, backingCols: [col] };
-	}
+	const schema = resolveAggregate(qa.funcName, aggArgc(qa.argBaseCol));
+	if (!schema) return undefined; // (name, argc) resolves to no registered aggregate ⇒ decline.
+	const algebra = schema.algebra;
+	if (!algebra) return undefined; // no declared algebra ⇒ not decomposable (total / group_concat / var_*).
 
-	if (qa.funcName === 'count') {
-		// count(*) ← sum(stored count(*)); count(x) ← sum(stored count(x)). The 'count'
-		// kind adds the coalesce-to-0 the rule emits (count over zero rows is 0, not NULL).
-		const col = findStored(stored, 'count', qa.argBaseCol);
-		return col === undefined ? undefined : { outAttr: qa.outAttr, kind: 'count', backingCols: [col] };
-	}
-
-	if (qa.funcName === 'avg') {
-		// avg(x) ← sum(stored sum(x)) / sum(stored count). Requires both partials; the
-		// count must exclude the same NULLs `avg` does — a stored `count(x)` always
-		// qualifies, and a stored `count(*)` only when `x` is declared NOT NULL.
-		const sumCol = findStored(stored, 'sum', qa.argBaseCol);
-		if (sumCol === undefined) return undefined;
-		let countCol = findStored(stored, 'count', qa.argBaseCol);
-		if (countCol === undefined && qa.argBaseCol !== undefined && baseTable.columns[qa.argBaseCol]?.notNull === true) {
-			countCol = findStored(stored, 'count', undefined); // count(*) is sound when x is NOT NULL.
+	// Decompose (e.g. avg): recombine the sibling partials named by the decomposition.
+	if (algebra.decompose) {
+		const partials: MergeReagg[] = [];
+		for (const p of algebra.decompose.partials) {
+			const reagg = resolveMergeablePartial(p, qa, stored, baseTable, resolveAggregate);
+			if (!reagg) return undefined; // a partial isn't stored / isn't mergeable ⇒ decline.
+			partials.push(reagg);
 		}
-		if (countCol === undefined) return undefined;
-		return { outAttr: qa.outAttr, kind: 'avg', backingCols: [sumCol, countCol] };
+		return { outAttr: qa.outAttr, kind: 'compose', partials, combine: algebra.decompose.combine };
 	}
 
-	return undefined; // total / group_concat / unknown ⇒ not decomposable.
+	// Directly mergeable: fold the aggregate's own stored partial back together. `merge` is
+	// required of any declared algebra; the extra requirement is `decode`, to reconstruct the
+	// accumulator from the stored (finalized) partial — without it the roll-up cannot be
+	// expressed, so decline (sound: forgoes only a speedup).
+	if (algebra.decode) {
+		const backingCol = findStored(stored, qa.funcName, qa.argBaseCol);
+		if (backingCol === undefined) return undefined;
+		return { outAttr: qa.outAttr, kind: 'merge', reagg: { backingCol, schema } };
+	}
+
+	return undefined; // merge-without-decode or algebra-less ⇒ not decomposable.
+}
+
+/**
+ * Resolve one decomposition partial (e.g. `avg`'s `sum` / `count`) to a directly-mergeable
+ * re-aggregation over a stored MV column. The partial's argument is the fragment
+ * aggregate's argument (`same-arg`) or none (`star`). The partial must itself be
+ * directly-mergeable (declare `merge` + `decode`).
+ *
+ * Preserves the **avg count-partial NULL alignment**: a stored `count(x)` always
+ * qualifies as the divisor, but a stored `count(*)` substitutes only when the argument
+ * column is declared NOT NULL — then `count(*)` excludes the same (zero) NULLs `count(x)`
+ * would, so the recombine stays exact.
+ */
+function resolveMergeablePartial(
+	p: { readonly func: string; readonly arg: 'same-arg' | 'star' },
+	qa: FragmentAggregate,
+	stored: readonly StoredAggregate[],
+	baseTable: TableSchema,
+	resolveAggregate: AggregateResolver,
+): MergeReagg | undefined {
+	const partialArgBaseCol = p.arg === 'star' ? undefined : qa.argBaseCol;
+	let backingCol = findStored(stored, p.func, partialArgBaseCol);
+	let storedArgc = aggArgc(partialArgBaseCol);
+	// count(same-arg) fallback: count(*) counts the same rows as count(x) only when x is
+	// NOT NULL (no NULLs to exclude). Retains the pre-retarget avg relaxation.
+	if (backingCol === undefined && p.func === 'count' && partialArgBaseCol !== undefined
+		&& baseTable.columns[partialArgBaseCol]?.notNull === true) {
+		backingCol = findStored(stored, 'count', undefined);
+		storedArgc = 0;
+	}
+	if (backingCol === undefined) return undefined;
+
+	// The stored partial must itself be directly mergeable. `merge` is implied by any declared
+	// algebra; `decode` is the reconstruct the re-aggregation needs.
+	const schema = resolveAggregate(p.func, storedArgc);
+	if (!schema || !schema.algebra?.decode) return undefined;
+	return { backingCol, schema };
+}
+
+/** The registry argument count of an aggregate call: `0` for `count(*)` (no argument),
+ *  `1` for a single bare-column argument. Matches `getFunctionKey`'s `(name, argc)` key. */
+function aggArgc(argBaseCol: number | undefined): number {
+	return argBaseCol === undefined ? 0 : 1;
 }
 
 /** The backing column of a stored, non-distinct aggregate `f(argBaseCol)`, or undefined. */
