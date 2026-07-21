@@ -897,3 +897,68 @@ The `DeclaredSchemaManager` (accessed via `db.declaredSchemaManager`) stores dec
 | `clearSeedData(schemaName)` | Clears all seed data for a schema |
 
 All name lookups are case-insensitive. The manager is stateful — `declare schema` clears previous seed data then stores the new declaration, so re-declaring replaces earlier state.
+
+## Aggregate Function Algebra
+
+`AggregateFunctionSchema.algebra` (optional) declares the algebraic structure of an aggregate's accumulator — the single place the engine learns how an aggregate's values combine (`merge`), reverse (`negate`), reconstruct from a stored value (`decode`), and rewrite onto sibling partials (`decompose`). It is pure metadata: it never affects function resolution or the `schema()` / `function_info()` listings. An aggregate that declares nothing (the default) is simply maintained by full recompute (the residual/rebuild floor for materialized views) — nothing forces a UDAF to declare algebra.
+
+```ts
+interface AggregateAlgebra {
+	/** Commutative, associative combine of two accumulators; a clone of
+	 *  initialValue is the identity (a commutative monoid). Enables partial
+	 *  aggregation / rollup. */
+	merge: (a: AggValue, b: AggValue) => AggValue;
+	/** Group inverse: merge(a, negate(a)) ≡ identity. Enables retraction.
+	 *  Absent ⇒ tighten-only (inserts can be folded in; deletes force recompute). */
+	negate?: (a: AggValue) => AggValue;
+	/** Reconstruct a working accumulator from the STORED (finalized) output value.
+	 *  Omit when impossible (avg — the quotient forgets the count). */
+	decode?: (stored: SqlValue) => AggValue;
+	/** This aggregate is a scalar expression over sibling partial aggregates —
+	 *  e.g. avg(x) ≡ sum(x)/count(x). */
+	decompose?: AggregateDecomposition;
+}
+
+interface AggregateDecomposition {
+	/** Sibling partials, by function name + argument shape.
+	 *  'same-arg' → f(thisArg); 'star' → count(*)-shaped (no argument).
+	 *  One level deep: each partial must itself be directly algebra-complete. */
+	partials: ReadonlyArray<{ func: string; arg: 'same-arg' | 'star' }>;
+	/** Build the composed *finalized* value from the partials' finalized values,
+	 *  in partials order. Must reproduce this aggregate's finalize exactly,
+	 *  including the empty-group case (avg: count 0/NULL ⇒ NULL). */
+	combine: (partialValues: readonly SqlValue[]) => SqlValue;
+}
+```
+
+Declare via `createAggregateFunction({ ..., algebra: { ... } }, step, finalize)`.
+
+### The author contract (laws)
+
+Algebra functions are peers of `stepFunction`: same accumulator representation, same comparison/collation context, and pure (no mutation of inputs). Absent field = property not held (never "unknown"). The laws, where **equivalence is finalize-then-byte-compare** (two accumulators are equal iff they finalize to the same stored value, under the storage-class-tolerant BINARY comparison — bigint `5n` ≡ number `5`):
+
+1. `merge` is associative and commutative; a clone of `initialValue` is its identity.
+2. Step/merge coherence: `step(a, x) ≡ merge(a, step(identity, x))` — including `x = NULL` (a NULL contribution is merge-identity for NULL-ignoring aggregates).
+3. `merge(a, negate(a)) ≡ identity` — retract∘insert of the same rows is a no-op. Retracting one source row `x` is `merge(acc, negate(step(identity, x)))`.
+4. Decode is observational, not bijective: `finalize(merge(decode(finalize(a)), b)) ≡ finalize(merge(a, b))`. A stored value must round-trip to an accumulator that *behaves* identically under further merges; it need not reconstruct the original accumulator. Decode of a stored SQL NULL must yield the *empty* accumulator, never a wrapped NULL.
+5. Decompose: `finalize(a) ≡ combine([finalize(p) …])` over the partial accumulators induced by the same input rows.
+
+Law 3 has a subtle consequence: an accumulator must be able to *observationally return* to the empty state. A bare running sum cannot — insert 5 then retract 5 leaves `{sum: 0}`, which finalizes to `0`, while the empty group finalizes to `NULL`. The builtin `sum` therefore tracks a contribution count alongside the running sum and finalizes `count === 0` as `NULL`; a UDAF with a NULL-on-empty finalize and a `negate` needs the same pattern.
+
+Validate a declaration with the `fast-check` law harness on the test surface (`test/util/aggregate-algebra-laws.ts`):
+
+```ts
+assertAggregateAlgebraLaws(mySchema, valueArb /* legal argument values, incl. NULL */);
+```
+
+It property-checks laws 1–5 for whichever fields are present and throws naming the violated law. Pick a `valueArb` matching the value-domain the declaration is exact for (integers for sum — float sums drift, which is a value-domain property the write side gates on, not something the declaration can express).
+
+### Builtin declarations
+
+| aggregate | merge | negate | decode | decompose |
+|---|---|---|---|---|
+| `count(*)`, `count(x)` | `a+b` | `-a` | stored int (finalize is identity) | — |
+| `sum(x)` | add (bigint-promoting) | yes | stored v → non-empty accumulator; NULL → empty | — |
+| `min(x)` / `max(x)` | binary-min/max (same BINARY comparison as step) | — (tighten-only) | stored v → accumulator; NULL → empty | — |
+| `avg(x)` | sum+count pairwise | yes | — (quotient forgets the count) | `sum(x)`, `count(x)` → real division; count 0/NULL ⇒ NULL |
+| `total`, `group_concat`, `var_*`, `stddev_*` | — | — | — | — (deliberately residual-only; e.g. total's float running sum drifts under retraction) |

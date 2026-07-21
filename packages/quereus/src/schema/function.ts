@@ -48,6 +48,67 @@ export type AggregateReducer<T = any> = (accumulator: T, ...args: SqlValue[]) =>
 export type AggregateFinalizer<T = any> = (accumulator: T) => SqlValue;
 
 /**
+ * Optional algebraic structure over an aggregate's accumulator. Each field
+ * declares one property the engine may exploit for incremental maintenance of
+ * aggregate materialized views; an absent field means the property is not held
+ * (never "unknown"). Algebra functions are peers of `stepFunction`: they operate
+ * on the same accumulator representation and must use the same
+ * comparison/collation context the step uses. All algebra functions must be
+ * pure — no mutation of their inputs. `AggValue` is the opaque accumulator type.
+ *
+ * The author's contract (verified by the `assertAggregateAlgebraLaws` harness
+ * on the test surface; equivalence is finalize-then-byte-compare):
+ * 1. `merge` is associative and commutative; a clone of `initialValue` is its
+ *    identity.
+ * 2. Step/merge coherence: `step(a, x) ≡ merge(a, step(identity, x))`.
+ * 3. `merge(a, negate(a)) ≡ identity`.
+ * 4. Decode is observational: `finalize(merge(decode(finalize(a)), b)) ≡
+ *    finalize(merge(a, b))`.
+ * 5. `finalize(a) ≡ decompose.combine([finalize(p) …])` over the partial
+ *    accumulators induced by the same input rows.
+ */
+export interface AggregateAlgebra {
+	/** Commutative, associative combine of two accumulators; identity is a clone of
+	 *  initialValue (a commutative monoid). Enables partial aggregation. */
+	merge: (a: AggValue, b: AggValue) => AggValue;
+	/** Group inverse: merge(a, negate(a)) ≡ identity (lifts the monoid to an abelian
+	 *  group). Enables retraction. Retracting one source row x is
+	 *  merge(acc, negate(step(identity, x))). Absent ⇒ tighten-only. */
+	negate?: (a: AggValue) => AggValue;
+	/** Reconstruct a working accumulator from the STORED (finalized) output value.
+	 *  Required for backing-delta maintenance (the backing holds finalized values, not
+	 *  accumulators). Omit when finalize is identity-like (count → stored int IS the
+	 *  accumulator). IMPOSSIBLE for avg (the quotient forgets the count → declare
+	 *  `decompose` instead). */
+	decode?: (stored: SqlValue) => AggValue;
+	/** This aggregate's value is a scalar expression over OTHER (algebra-complete)
+	 *  sibling aggregates — e.g. avg(x) ≡ sum(x)/count(x). Lets a stored column be
+	 *  maintained by delta-maintaining its partials, and lets the read-side rollup
+	 *  recombine it. */
+	decompose?: AggregateDecomposition;
+}
+
+/**
+ * A decomposition of one aggregate onto sibling partial aggregates. Kept one
+ * level deep: every named partial must itself be directly algebra-complete
+ * (a decompose-only partial is out of scope).
+ */
+export interface AggregateDecomposition {
+	/** The partials this aggregate is composed from. Each names a sibling aggregate by
+	 *  function name and how its argument relates to this aggregate's argument. */
+	readonly partials: ReadonlyArray<{
+		/** Sibling aggregate function name (e.g. 'sum', 'count'). */
+		readonly func: string;
+		/** 'same-arg' → f(thisArg); 'star' → count(*)-shaped (no argument). */
+		readonly arg: 'same-arg' | 'star';
+	}>;
+	/** Build the composed *finalized* value from the partials' finalized values, in
+	 *  `partials` order. Must reproduce this aggregate's finalize exactly (incl. the
+	 *  empty-group / divide-by-zero case → e.g. avg NULL/0 ⇒ NULL). */
+	readonly combine: (partialValues: readonly SqlValue[]) => SqlValue;
+}
+
+/**
  * Custom emitter hook for functions that need special emission logic.
  * This allows functions to cache compiled state in the EmissionContext,
  * optimize constant arguments, or perform other emission-time optimizations.
@@ -250,6 +311,13 @@ export interface AggregateFunctionSchema extends BaseFunctionSchema {
 	finalizeFunction: AggregateFinalizer;
 	/** Initial accumulator value for aggregates */
 	initialValue?: AggValue;
+	/**
+	 * Optional algebraic structure over the accumulator. Absent ⇒ no property
+	 * asserted; the aggregate stays residual-only (full recompute) for
+	 * materialized-view maintenance. Metadata only — never consulted during
+	 * function resolution or the `schema()` / `function_info()` listings.
+	 */
+	algebra?: AggregateAlgebra;
 	/**
 	 * Optional type inference function for polymorphic aggregate functions.
 	 * If provided, this function will be called at planning time to determine

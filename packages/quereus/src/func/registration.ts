@@ -1,5 +1,5 @@
 import type { AggregateFinalizer, AggregateReducer, IntegratedTableValuedFunc, ScalarFunc, TableValuedFunc, ScalarFunctionSchema,
-	TableValuedFunctionSchema, AggregateFunctionSchema, TVFAdvertisement } from '../schema/function.js';
+	TableValuedFunctionSchema, AggregateFunctionSchema, AggregateAlgebra, TVFAdvertisement } from '../schema/function.js';
 import { FunctionFlags } from '../common/constants.js';
 import type { ScalarType, RelationType } from '../common/datatype.js';
 import { REAL_TYPE } from '../types/builtin-types.js';
@@ -106,6 +106,9 @@ interface AggregateFuncOptions {
 	replicable?: boolean;
 	/** Initial accumulator value */
 	initialValue?: AggValue;
+	/** Optional algebraic structure over the accumulator (merge/negate/decode/decompose).
+	 *  See {@link import('../schema/function.js').AggregateAlgebra} for the author contract. */
+	algebra?: AggregateAlgebra;
 	/** Return type information */
 	returnType?: ScalarType;
 	/**
@@ -249,6 +252,7 @@ export function createAggregateFunction(
 		stepFunction: stepFunc,
 		finalizeFunction: finalizeFunc,
 		initialValue: options.initialValue,
+		algebra: options.algebra,
 		replicable: options.replicable,
 		inferReturnType: options.inferReturnType,
 		validateArgTypes: options.validateArgTypes

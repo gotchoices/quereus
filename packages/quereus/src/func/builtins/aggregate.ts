@@ -7,17 +7,67 @@ import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js
 const log = createLogger('func:builtins:aggregate');
 const warnLog = log.extend('warn');
 
+/** Add two accumulated numeric values, promoting to BigInt when either side is
+ *  BigInt or the numeric sum would leave the safe-integer range — the same
+ *  promotion the SUM step applies per value. */
+function addWithPromotion(a: number | bigint, b: number | bigint): number | bigint {
+	if (typeof a === 'bigint' || typeof b === 'bigint') {
+		return BigInt(a) + BigInt(b);
+	}
+	const sum = a + b;
+	if (sum > Number.MAX_SAFE_INTEGER || sum < Number.MIN_SAFE_INTEGER) {
+		return BigInt(a) + BigInt(b);
+	}
+	return sum;
+}
+
 // --- count(*) ---
 export const countStarFunc = createAggregateFunction(
-	{ name: 'count', numArgs: 0, initialValue: 0, returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true } },
+	{
+		name: 'count', numArgs: 0, initialValue: 0,
+		returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+		algebra: {
+			merge: (a: number, b: number): number => a + b,
+			negate: (a: number): number => -a,
+			// finalize is identity — the stored count IS the accumulator
+			decode: (stored: SqlValue): number => Number(stored),
+		},
+	},
 	(acc: number): number => acc + 1,
 	(acc: number): number => acc
 );
 
 // --- SUM(X) ---
+// The accumulator tracks the count of counted (non-NULL numeric) contributions
+// alongside the running sum so retraction stays observational: merge(a, negate(a))
+// must finalize to NULL (the empty-group value), which a bare running sum cannot
+// distinguish from contributions that cancel to 0. External behavior is unchanged —
+// a fold that counted nothing still finalizes to NULL, everything else to the sum.
+type SumAccumulator = { sum: number | bigint; count: number } | null;
 export const sumFunc = createAggregateFunction(
-	{ name: 'sum', numArgs: 1, initialValue: null, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true } },
-	(acc: { sum: number | bigint } | null, value: SqlValue): { sum: number | bigint } | null => {
+	{
+		name: 'sum', numArgs: 1, initialValue: null,
+		returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true },
+		// NOTE: declared unconditionally; exactness under retraction is a value-domain
+		// property (floats drift) the function cannot see, so the write-side delta arm
+		// gates on the argument's static type before exploiting negate.
+		algebra: {
+			merge: (a: SumAccumulator, b: SumAccumulator): SumAccumulator => {
+				if (a === null) return b;
+				if (b === null) return a;
+				return { sum: addWithPromotion(a.sum, b.sum), count: a.count + b.count };
+			},
+			negate: (a: SumAccumulator): SumAccumulator => a === null ? null : { sum: -a.sum, count: -a.count },
+			// Stored NULL (empty group) decodes to the empty accumulator, never a
+			// wrapped NULL. A stored value decodes with count 1 — an observational
+			// witness for "non-empty" (finalize only distinguishes zero from non-zero
+			// count), not the true contribution count, which the quotient-free stored
+			// sum cannot recover.
+			decode: (stored: SqlValue): SumAccumulator =>
+				stored === null ? null : { sum: stored as number | bigint, count: 1 },
+		},
+	},
+	(acc: SumAccumulator, value: SqlValue): SumAccumulator => {
 		if (value === null) return acc; // Ignore NULLs
 		const currentSum = acc?.sum ?? 0; // Initialize sum to 0 if null
 		let numValue: number | bigint;
@@ -37,32 +87,45 @@ export const sumFunc = createAggregateFunction(
 				return acc; // Ignore non-numeric types like Uint8Array
 			}
 
-			// Promote to BigInt if either is BigInt or if result might overflow Number
-			if (typeof currentSum === 'bigint' || typeof numValue === 'bigint') {
-				return { sum: BigInt(currentSum) + BigInt(numValue) };
-			} else {
-				// Check potential overflow before adding as numbers
-				const potentialSum = (currentSum as number) + (numValue as number);
-				if (potentialSum > Number.MAX_SAFE_INTEGER || potentialSum < Number.MIN_SAFE_INTEGER) {
-					return { sum: BigInt(currentSum) + BigInt(numValue) };
-				}
-				return { sum: potentialSum };
-			}
+			return { sum: addWithPromotion(currentSum, numValue), count: (acc?.count ?? 0) + 1 };
 		} catch (e) {
 			warnLog("Error during SUM step coercion: %O", e);
 			return acc; // Ignore value if coercion fails
 		}
 	},
-	(acc: { sum: number | bigint } | null): number | bigint | null => {
-		// SQLite returns NULL for SUM of empty set, INTEGER or REAL result
-		return acc?.sum ?? null;
+	(acc: SumAccumulator): number | bigint | null => {
+		// SQLite returns NULL for SUM of empty set, INTEGER or REAL result.
+		// count === 0 (all contributions retracted) is observationally the empty group.
+		if (acc === null || acc.count === 0) return null;
+		return acc.sum;
 	}
 );
 
 // --- AVG(X) ---
 interface AvgAccumulator { sum: number; count: number }
 export const avgFunc = createAggregateFunction(
-	{ name: 'avg', numArgs: 1, initialValue: { sum: 0, count: 0 }, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true } },
+	{
+		name: 'avg', numArgs: 1, initialValue: { sum: 0, count: 0 },
+		returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: true, isReadOnly: true },
+		// No decode — the stored quotient forgets the count and cannot reconstruct
+		// an accumulator. Maintained/rolled up via its decomposition instead.
+		algebra: {
+			merge: (a: AvgAccumulator, b: AvgAccumulator): AvgAccumulator => ({ sum: a.sum + b.sum, count: a.count + b.count }),
+			negate: (a: AvgAccumulator): AvgAccumulator => ({ sum: -a.sum, count: -a.count }),
+			decompose: {
+				partials: [
+					{ func: 'sum', arg: 'same-arg' },
+					{ func: 'count', arg: 'same-arg' },
+				],
+				// Real division, matching native avg; empty group (count 0 / NULL) ⇒ NULL.
+				combine: (partialValues: readonly SqlValue[]): SqlValue => {
+					const [sumV, countV] = partialValues;
+					if (countV === null || countV === undefined || Number(countV) === 0) return null;
+					return Number(sumV) / Number(countV);
+				},
+			},
+		},
+	},
 	(acc: AvgAccumulator, value: SqlValue): AvgAccumulator => {
 		if (value === null) return acc; // Ignore NULLs
 		let numValue = value;
@@ -98,7 +161,18 @@ export const minFunc = createAggregateFunction(
 			logicalType: argTypes[0],
 			nullable: true, // MIN can return NULL if all values are NULL or no rows
 			isReadOnly: true
-		})
+		}),
+		// Tighten-only: merge but no negate (a retracted min cannot be undone locally).
+		// Same BINARY comparison as the step, so merge and step agree byte-for-byte.
+		algebra: {
+			merge: (a: { min: SqlValue } | null, b: { min: SqlValue } | null): { min: SqlValue } | null => {
+				if (a === null) return b;
+				if (b === null) return a;
+				return compareSqlValuesFast(b.min, a.min, BINARY_COLLATION) < 0 ? b : a;
+			},
+			// Stored NULL (empty group) decodes to the empty accumulator.
+			decode: (stored: SqlValue): { min: SqlValue } | null => stored === null ? null : { min: stored },
+		},
 	},
 	(acc: { min: SqlValue } | null, value: SqlValue): { min: SqlValue } | null => {
 		if (value === null) return acc; // Ignore NULLs
@@ -122,7 +196,18 @@ export const maxFunc = createAggregateFunction(
 			logicalType: argTypes[0],
 			nullable: true, // MAX can return NULL if all values are NULL or no rows
 			isReadOnly: true
-		})
+		}),
+		// Tighten-only: merge but no negate (a retracted max cannot be undone locally).
+		// Same BINARY comparison as the step, so merge and step agree byte-for-byte.
+		algebra: {
+			merge: (a: { max: SqlValue } | null, b: { max: SqlValue } | null): { max: SqlValue } | null => {
+				if (a === null) return b;
+				if (b === null) return a;
+				return compareSqlValuesFast(b.max, a.max, BINARY_COLLATION) > 0 ? b : a;
+			},
+			// Stored NULL (empty group) decodes to the empty accumulator.
+			decode: (stored: SqlValue): { max: SqlValue } | null => stored === null ? null : { max: stored },
+		},
 	},
 	(acc: { max: SqlValue } | null, value: SqlValue): { max: SqlValue } | null => {
 		if (value === null) return acc; // Ignore NULLs
@@ -137,7 +222,16 @@ export const maxFunc = createAggregateFunction(
 // --- COUNT(X) ---
 // Counts non-NULL values of X
 export const countXFunc = createAggregateFunction(
-	{ name: 'count', numArgs: 1, initialValue: 0, returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true } },
+	{
+		name: 'count', numArgs: 1, initialValue: 0,
+		returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true },
+		algebra: {
+			merge: (a: number, b: number): number => a + b,
+			negate: (a: number): number => -a,
+			// finalize is identity — the stored count IS the accumulator
+			decode: (stored: SqlValue): number => Number(stored),
+		},
+	},
 	(acc: number, value: SqlValue): number => {
 		if (value === null) return acc; // Do not count NULLs
 		return acc + 1;
@@ -172,6 +266,10 @@ export const groupConcatFuncRev = createAggregateFunction(
 );
 
 // --- TOTAL(X) ---
+// NOTE: deliberately declares no algebra — a float running sum drifts under
+// retraction and would diverge byte-exactly from a fresh live re-sum, which the
+// maintenance-equivalence oracle compares byte-exactly. Residual-only is correct,
+// just not incremental. Same for group_concat / var_* / stddev_* below.
 export const totalFunc = createAggregateFunction(
 	{ name: 'total', numArgs: 1, initialValue: 0.0, returnType: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false, isReadOnly: true } },
 	(acc: number, value: SqlValue): number => {
