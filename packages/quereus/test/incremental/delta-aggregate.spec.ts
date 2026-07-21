@@ -28,7 +28,8 @@ interface DeltaPlanLike {
 	readonly chosenStrategy: string;
 	readonly delta?: {
 		readonly retractionSafe: boolean;
-		readonly aggColumns: readonly { readonly retractionSafe: boolean }[];
+		readonly hasTighten: boolean;
+		readonly aggColumns: readonly { readonly retractionSafe: boolean; readonly deltaClass: string }[];
 		readonly multiplicityIndex: number;
 	};
 }
@@ -173,11 +174,18 @@ describe('Delta-aggregate fast path (arithmetic maintenance inside residual-reco
 			expect(plan.delta!.multiplicityIndex).to.equal(0);
 		});
 
-		it('min/max in the body disqualifies the whole MV (no negate, so residual)', async () => {
-			await db.exec('create materialized view mv as select k, count(*) as c, sum(a) as s, min(b) as mn from src group by k');
+		it('min/max routes through delta via the tighten class (merge, no negate — feat-mv-agg-delta-tighten)', async () => {
+			await db.exec('create materialized view mv as select k, count(*) as c, sum(a) as s, min(b) as mn, max(b) as mx from src group by k');
 			const plan = deltaPlan(db, 'mv')!;
-			expect(plan.chosenStrategy).to.equal('residual-recompute');
-			expect(plan.delta).to.equal(undefined);
+			expect(plan.kind, 'kind stays residual-recompute').to.equal('residual-recompute');
+			expect(plan.chosenStrategy, 'tighten column admits the delta arm').to.equal('delta-aggregate');
+			expect(plan.delta, 'descriptor attached').to.exist;
+			expect(plan.delta!.hasTighten, 'min/max flagged as tighten').to.equal(true);
+			// Whole descriptor is never retraction-safe with a tighten column: a retracted group
+			// re-derives wholesale from the residual (mixed group+tighten row maintained one way).
+			expect(plan.delta!.retractionSafe, 'a tighten column is never retraction-safe').to.equal(false);
+			const classes = plan.delta!.aggColumns.map(c => c.deltaClass).sort();
+			expect(classes, 'count/sum group columns + min/max tighten columns').to.deep.equal(['group', 'group', 'tighten', 'tighten']);
 		});
 
 		it('sum over a NULLABLE integer argument stays delta but NOT retraction-safe', async () => {

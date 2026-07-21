@@ -2428,11 +2428,13 @@ describe('Materialized-view maintenance statement batching (residual arms)', () 
 
 	describe('per-statement degrade-to-rebuild demotion', () => {
 		let db: Database;
-		// `min(b)` keeps this body OFF the delta-aggregate fast path (min declares no
-		// negate), so the plan stays a plain residual and the demotion crossover under
-		// test remains reachable — a delta-eligible body bypasses it by design (see the
-		// bypass pin below).
-		const body = 'select k, count(*) as c, sum(a) as s, min(b) as mn from src group by k';
+		// `group_concat(b)` declares NO algebra at all (no merge/negate/decode/decompose),
+		// so the whole body stays OFF the delta-aggregate fast path on a plain residual and
+		// the demotion crossover under test remains reachable — a delta-eligible body bypasses
+		// it by design (see the bypass pin below). (min/max are no longer a valid "forces
+		// residual" proxy here: since feat-mv-agg-delta-tighten they are delta-maintained by
+		// the tighten arm.) Every insert below writes b=0, so group_concat is order-independent.
+		const body = 'select k, count(*) as c, sum(a) as s, group_concat(b) as g from src group by k';
 
 		beforeEach(async () => {
 			db = new Database();
@@ -2587,11 +2589,16 @@ describe('Materialized-view maintenance statement batching (residual arms)', () 
  */
 
 /** The registered row-time plan for `main.<name>`, loosely typed to inspect the delta
- *  descriptor (`chosenStrategy` + the decompose-column list the decompose class populates). */
+ *  descriptor (`chosenStrategy`, the decompose-column list the decompose class populates,
+ *  and `hasTighten` — set when the body carries a min/max-shaped tighten column). */
 interface DeltaPlanLike {
 	readonly kind: string;
 	readonly chosenStrategy?: string;
-	readonly delta?: { readonly decomposeColumns: readonly unknown[]; readonly aggColumns: readonly unknown[] };
+	readonly delta?: {
+		readonly decomposeColumns: readonly unknown[];
+		readonly aggColumns: readonly { readonly deltaClass: string }[];
+		readonly hasTighten: boolean;
+	};
 }
 function registeredDeltaPlan(db: Database, name: string): DeltaPlanLike {
 	const mgr = (db as unknown as ManagerHandle).materializedViewManager as unknown as { rowTime: Map<string, DeltaPlanLike> };
@@ -2899,5 +2906,180 @@ describe('Materialized-view maintenance equivalence (decompose class: a UDAF dec
 				await assertEquivalent(db, body, 'post-rollback');
 			},
 		), { numRuns: 50 });
+	});
+});
+
+/* ══════════ tighten-only (join-semilattice) aggregate class — min/max + a UDAF — feat-mv-agg-delta-tighten ══════════
+ *
+ * A stored aggregate column declaring `merge` + `decode` but NO `negate` (a join-semilattice,
+ * not an abelian group — `min`/`max`, and any UDAF like `bit_or`/`bool_or`) is delta-maintained
+ * for INSERTS by `merge`ing the new contribution in (min/max tighten toward the new extreme),
+ * but a RETRACTION cannot be undone arithmetically — `merge` cannot recover the next-best after
+ * the current extreme is removed. So a group that accumulates ANY retraction re-derives WHOLESALE
+ * from the key-filtered residual (`DeltaAggregateDescriptor.hasTighten`), whether or not a row is
+ * stored. The count/sum columns of that same recomputed row come from the residual too — one
+ * path per group, never double-maintained. Detection is structural (`merge` present, `negate`
+ * absent), never an aggregate-name list. The equivalence oracle re-runs the same body live, so
+ * maintenance and live evaluation must agree byte-exactly across every mutation and after
+ * rollback; white-box checks pin that the delta strategy is chosen and `hasTighten` is set.
+ */
+
+/** A `bit_or(x)` UDAF proving the tighten class is function-generic (min/max are merely its
+ *  builtins): a bitwise-OR join-semilattice — `merge` is idempotent OR, `decode` reconstructs
+ *  the accumulator from the stored integer, and there is deliberately NO `negate` (a set bit
+ *  cannot be un-set by removing one contributor). INTEGER-exact, so incremental maintenance is
+ *  byte-identical to a fresh live fold; a retraction re-derives its group via the residual. */
+function makeBitOrAggregate(): AggregateFunctionSchema {
+	type Acc = { bits: number } | null;
+	return createAggregateFunction(
+		{
+			name: 'bit_or', numArgs: 1, initialValue: null,
+			returnType: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true },
+			algebra: {
+				// Idempotent, commutative, associative OR; identity is the empty (null) accumulator.
+				merge: (a: Acc, b: Acc): Acc =>
+					a === null ? b : b === null ? a : { bits: a.bits | b.bits },
+				// Stored NULL (empty / all-NULL-arg group) decodes to the empty accumulator.
+				decode: (stored: SqlValue): Acc => stored === null ? null : { bits: Number(stored) },
+				// NO negate: OR has no inverse — a retraction falls back to the residual.
+			},
+		},
+		(acc: Acc, value: SqlValue): Acc => {
+			if (value === null) return acc; // OR ignores NULLs (native bit_or semantics)
+			return { bits: (acc?.bits ?? 0) | Number(value) };
+		},
+		(acc: Acc): SqlValue => acc === null ? null : acc.bits,
+	);
+}
+
+/** min/max delta-maintained by the tighten arm. Inserts tighten the stored extreme via `merge`;
+ *  a delete/update of the (possibly) extreme value re-derives the whole group from the residual.
+ *  `a` is nullable so min/max NULL-skipping is exercised; the count(*) witness governs emptiness. */
+describe('Materialized-view maintenance equivalence (tighten class: min/max)', () => {
+	let db: Database;
+	const body = 'select k, count(*) as c, min(a) as mn, max(a) as mx from t group by k';
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('create table t (id integer primary key, k integer, a integer)');
+		// k=1 group with three distinct values (3,5,7) so an extreme can be deleted and the
+		// residual must recover the next-best; k=2 is a singleton (delete → emptied group).
+		await db.exec('insert into t (id, k, a) values (1, 1, 3), (2, 1, 5), (3, 1, 7), (4, 2, 2)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('is delta-maintained with a tighten column (chosenStrategy delta-aggregate; hasTighten set)', () => {
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.kind, 'aggregate residual arm').to.equal('residual-recompute');
+		expect(plan.chosenStrategy, 'tighten body still prefers the delta arm (insert-dominated cost)').to.equal('delta-aggregate');
+		expect(plan.delta, 'delta descriptor present').to.exist;
+		expect(plan.delta!.hasTighten, 'min/max flagged as tighten').to.equal(true);
+		expect(plan.delta!.aggColumns.some(c => c.deltaClass === 'tighten'), 'a tighten-class column recorded').to.equal(true);
+	});
+
+	it('an insert that beats the extreme tightens min/max arithmetically', async () => {
+		await db.exec('insert into t (id, k, a) values (10, 1, 9)'); // 9 > max 7, > min 3 (no change to min)
+		await assertEquivalent(db, body, 'insert beats max');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'min 3, max tightens to 9')
+			.to.deep.equal([canonRow([3, 9])]);
+	});
+
+	it('an insert that does NOT beat the extreme is a no-op (stored extreme unchanged)', async () => {
+		await db.exec('insert into t (id, k, a) values (10, 1, 5)'); // 3 ≤ 5 ≤ 7 — inside the range
+		await assertEquivalent(db, body, 'insert inside range');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'extremes unchanged (min 3, max 7)')
+			.to.deep.equal([canonRow([3, 7])]);
+	});
+
+	it('deleting the current extreme re-derives the next-best via the residual', async () => {
+		await db.exec('delete from t where id = 3'); // removes a=7, the k=1 max
+		await assertEquivalent(db, body, 'delete of the max');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'max relaxes 7 → 5, min still 3')
+			.to.deep.equal([canonRow([3, 5])]);
+	});
+
+	it('deleting a non-extreme value leaves the extremes intact (conservative fallback, still exact)', async () => {
+		await db.exec('delete from t where id = 2'); // removes a=5, neither min nor max
+		await assertEquivalent(db, body, 'delete of a middle value');
+		expect(await readMultiset(db, 'select mn, mx from mv where k = 1'), 'extremes unchanged (min 3, max 7)')
+			.to.deep.equal([canonRow([3, 7])]);
+	});
+
+	it('emptying a group deletes its backing row (multiplicity governs emptiness on the fallback branch)', async () => {
+		await db.exec('delete from t where k = 2'); // the only k=2 row
+		await assertEquivalent(db, body, 'emptied group');
+		expect((await readMultiset(db, 'select k from mv where k = 2')).length, 'k=2 group gone').to.equal(0);
+	});
+
+	it('read(MV) == evaluate(body) across random mutations (incl. extreme-relaxing deletes), in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(decMutationArb, { minLength: 1, maxLength: 12 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, decSqlFor(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 60 });
+	});
+});
+
+/** A UDAF join-semilattice (`bit_or(a)` — `merge`, `decode`, no `negate`) delta-maintained by
+ *  the SAME tighten arm min/max use — proving the class is declaration-driven, not a builtin
+ *  allow-list. Inserts OR the new bits into the stored value; a retraction re-derives the group
+ *  from the residual (OR has no inverse). Mixed with a plain `sum(a)` (abelian group column) so
+ *  the mixed group+tighten row is exercised — the residual recomputes both on a retraction. */
+describe('Materialized-view maintenance equivalence (tighten class: a UDAF semilattice bit_or)', () => {
+	let db: Database;
+	const body = 'select k, count(*) as c, sum(a) as s, bit_or(a) as bor from t group by k';
+
+	beforeEach(async () => {
+		db = new Database();
+		db.registerFunction(makeBitOrAggregate());
+		await db.exec('create table t (id integer primary key, k integer, a integer not null)');
+		await db.exec('insert into t (id, k, a) values (1, 1, 1), (2, 1, 2), (3, 1, 4), (4, 2, 5)');
+		await db.exec(`create materialized view mv as ${body}`);
+	});
+	afterEach(async () => { await db.close(); });
+
+	it('a UDAF semilattice is delta-maintained by the tighten arm (delta-aggregate; hasTighten set)', () => {
+		const plan = registeredDeltaPlan(db, 'mv');
+		expect(plan.chosenStrategy, 'tighten body prefers the delta arm').to.equal('delta-aggregate');
+		expect(plan.delta!.hasTighten, 'bit_or flagged as tighten (merge, no negate)').to.equal(true);
+	});
+
+	it('an insert ORs new bits into the stored value arithmetically', async () => {
+		await db.exec('insert into t (id, k, a) values (10, 1, 8)'); // k=1 bit_or 1|2|4=7 → 7|8=15
+		await assertEquivalent(db, body, 'insert ORs bits');
+		expect(await readMultiset(db, 'select bor from mv where k = 1'), 'bit_or = 15').to.deep.equal([canonRow([15])]);
+	});
+
+	it('a retraction re-derives bit_or (and its sibling sum) from the residual', async () => {
+		await db.exec('delete from t where id = 3'); // drops a=4 from k=1: bit_or 1|2=3, sum 1+2=3
+		await assertEquivalent(db, body, 'retraction re-derives via residual');
+		expect(await readMultiset(db, 'select s, bor from mv where k = 1'), 'sum 3, bit_or 3').to.deep.equal([canonRow([3, 3])]);
+	});
+
+	it('read(MV) == evaluate(body) across random mutations, in-txn and after rollback', async () => {
+		await fc.assert(fc.asyncProperty(
+			fc.array(decMutationArb, { minLength: 1, maxLength: 12 }),
+			async (mutations) => {
+				await assertEquivalent(db, body, 'baseline');
+				await db.exec('begin');
+				try {
+					for (const m of mutations) await execTolerant(db, decSqlFor(m));
+					await assertEquivalent(db, body, 'in-transaction');
+				} finally {
+					await db.exec('rollback');
+				}
+				await assertEquivalent(db, body, 'post-rollback');
+			},
+		), { numRuns: 60 });
 	});
 });

@@ -956,6 +956,11 @@ export async function computeDeltaAggregateOps(
 		//  - otherwise a not-retraction-safe abelian column (a sum whose decode forgets the true
 		//    contribution count) only needs the residual when a stored row must be decoded — its
 		//    no-stored net-fold stays exact, so that case keeps the pure arithmetic path.
+		// NOTE: the tighten fallback is conservative — ANY retraction rescans the group, even a
+		// delete of a provably-non-extreme value. Correct, not minimal. If min/max MVs ever show
+		// this rescan as hot, a secondary-index "is this the current extreme?" probe could keep
+		// non-extreme deletes on the arithmetic path. Not built now (see docs/mv-maintenance.md
+		// § Tighten-only columns).
 		if (g.retracted && (d.hasTighten || (stored && !d.retractionSafe))) {
 			const fk = entry.forward.get(dedupKey);
 			if (!fk) {
