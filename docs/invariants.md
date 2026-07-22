@@ -505,38 +505,33 @@ statement.
 - guard: `packages/quereus/test/covering-structure.spec.ts` — `a bare-DDL covering MV is row-time and is used for enforcement`
 - doc: [Materialized-View Maintenance § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)
 
-The per-statement `BackingConnectionCache` amortizes *connection resolution* only for the
-`'inverse-projection'` arm: each source row's backing ops are applied immediately, never
-buffered for an end-of-statement flush. This is load-bearing rather than incidental:
-covering-UNIQUE enforcement runs inside the source table's `update()` and scans the
-backing, so a later row of the same statement must observe an earlier row's backing write
-(`insert into t values (1,'a'),(2,'a')` over a covering `unique(x)` detects the
-duplicate). A coalescing write buffer would break enforcement unless the conflict probe
-also read the buffer. Every other arm — the residual arms and the full-rebuild floor —
-defers to the end-of-statement flush (MV-004), which is sound precisely because only an
-inverse-projection MV can serve as a covering structure: `findRowTimeCoveringStructure`
-declines every other plan kind, so no enforcement read ever consults a deferred backing.
+The per-statement `BackingConnectionCache` amortizes *connection resolution* only: each
+source row's `'inverse-projection'` backing ops apply immediately, never buffered for an
+end-of-statement flush. This is load-bearing: covering-UNIQUE enforcement runs inside the
+source table's `update()` and scans the backing, so a later row of the same statement
+must observe an earlier row's write (`insert into t values (1,'a'),(2,'a')` over a
+covering `unique(x)` detects the duplicate); a coalescing buffer would break enforcement
+unless the probe also read it. Every other arm defers to the end-of-statement flush
+(MV-004), sound because only an inverse-projection MV can be a covering structure —
+`findRowTimeCoveringStructure` declines every other plan kind, so no enforcement read
+consults a deferred backing.
 
 ### MV-004 — The residual arms and full-rebuild defer per statement, and are never covering structures
 
 - code: `packages/quereus/src/core/database-materialized-views.ts` — `flushDeferredMaintenance`
 - code: `packages/quereus/src/core/database-materialized-views.ts` — `assertFlushRounds`
-- guard: `packages/quereus/test/incremental/maintenance-equivalence.spec.ts` — `read(MV) == evaluate(body) across random t/p mutations, in-txn and after rollback`
 - guard: `packages/quereus/test/incremental/maintenance-equivalence.spec.ts` — `a multi-row statement flushes ONCE with statement-wide key dedup (no per-row dispatch)`
 - doc: [Materialized-View Maintenance § Synchronous, transactional, per-statement](mv-maintenance.md#synchronous-transactional-per-statement)
 
-Running the floor per source row would cost O(rows × body), and a residual arm one
-key-filtered scheduler run per touching row; so a full-rebuild plan is dirtied per row and
-rebuilt once per statement, and a residual plan's affected binding keys accumulate
-(deduped) and recompute once per distinct key at the same flush — inside the
-statement-atomicity savepoint (and on the `OR FAIL` throw path, which has no such
-savepoint). Recompute-from-live-state is last-write-wins, so the flush-time recompute
-equals the last per-row recompute. This does not weaken MV-003, because a deferred backing
-is never read mid-statement: the conflict probe consults only `'inverse-projection'`
-backings, which stay per-row-immediate. The flush is a worklist over the
-producer→consumer DAG, bounded by the registered row-time view count; before running
-per-key residuals it re-costs the statement (`shouldDegradeToRebuild`) and demotes to one
-whole-body `'replace-all'` rebuild when k residual runs cost more.
+Running the floor per source row would cost O(rows × body); so a full-rebuild plan is
+dirtied per row and rebuilt once per statement, and a residual plan's affected binding
+keys accumulate (deduped) and recompute once per distinct key at the same flush — inside
+the statement-atomicity savepoint (and on the `OR FAIL` throw path). Recompute-from-live-state
+is last-write-wins, so the flush-time recompute equals the last per-row recompute. This
+does not weaken MV-003: a deferred backing is never read mid-statement — the conflict
+probe consults only `'inverse-projection'` backings, which stay per-row-immediate. The
+flush is a worklist over the producer→consumer DAG; `shouldDegradeToRebuild` re-costs the
+statement and demotes to one `'replace-all'` rebuild when per-key residuals cost more.
 
 ### MV-005 — An MV-over-MV cascade completes in the originating transaction
 
@@ -577,18 +572,16 @@ unconditional sixth is a breaking change. MV-008 adds host-conditional gates, in
 
 Strategy selection is a backward (maintenance-direction) cost argmin over the body's
 *structurally sound* strategies, and an empty sound set resolves to the floor. So every
-strategy the gate may pick already maintains the body correctly, and a mis-estimated cost
-can only make maintenance slower than necessary — never produce a backing that disagrees
-with the body. The one exception where cost becomes a *rejection* rather than a preference
-is the size threshold in MV-006, which fires only when full-rebuild is the sole sound
-strategy.
+strategy the gate may pick maintains the body correctly, and a mis-estimated cost only
+makes maintenance slower — never a backing that disagrees with the body. The one place
+cost becomes a *rejection* is MV-006's size threshold, firing only when full-rebuild is
+the sole sound strategy.
 
-Soundness membership itself is *declaration-driven*, never name-driven: the
-`'delta-aggregate'` strategy joins the sound set exactly when every stored aggregate
-column's **declared algebra** (`AggregateFunctionSchema.algebra` — merge/negate/decode,
-plus the exact-domain and multiplicity-witness structural checks) qualifies. The engine
-never consults a builtin-aggregate name list, so a UDAF declaring a lawful algebra gets
-the fast path and a builtin without one does not.
+Soundness membership is *declaration-driven*, never name-driven: `'delta-aggregate'`
+joins the sound set exactly when every stored aggregate column's declared algebra
+(`AggregateFunctionSchema.algebra` — merge/negate/decode, plus the exact-domain and
+multiplicity-witness checks) qualifies; no builtin-aggregate name list is consulted — a
+UDAF with a lawful algebra qualifies, a builtin without one does not.
 
 ### MV-008 — The replicable-derivation gate is host-conditional and not locally waivable
 

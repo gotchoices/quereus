@@ -127,11 +127,6 @@ function sourceFiles() {
 /**
  * Blank out fenced code blocks, preserving line count so reported line numbers stay true.
  * Several docs show example markdown; without this the checker reports phantom links.
- *
- * NOTE: inline code spans are *not* blanked, so a link written entirely inside backticks
- * (`` `[text](target.md)` ``) is still extracted and resolved. No doc does that today; if
- * one starts to, blank spans on non-fence lines rather than loosening the link regex —
- * link *text* is often inline code (`[`alter table …`](#anchor)`) and must keep resolving.
  */
 function stripFences(content) {
 	const lines = content.split('\n');
@@ -221,13 +216,21 @@ function anchorsOf(absPath) {
 
 const EXTERNAL = /^(https?:|mailto:|data:|tel:|#!)/;
 
-/** Markdown links `](target)` outside fenced code, with 1-based line numbers. */
+/**
+ * Blank inline code spans so a `](…)`-shaped expression inside backticks (a plan-tree
+ * illustration like `` `Project[keys](Filter(residual, c))` ``) is not extracted as a link.
+ * Each span collapses to a single space, so link *text* that is itself inline code
+ * (`[`alter table …`](#anchor)`) keeps resolving — the `](target)` sits outside the span.
+ */
+const stripInlineCode = (line) => line.replace(/`[^`]*`/g, ' ');
+
+/** Markdown links `](target)` outside fenced code and inline code, with 1-based line numbers. */
 function markdownLinks(content) {
 	const refs = [];
 	stripFences(content)
 		.split('\n')
 		.forEach((line, index) => {
-			for (const match of line.matchAll(/\]\(([^)]+)\)/g)) {
+			for (const match of stripInlineCode(line).matchAll(/\]\(([^)]+)\)/g)) {
 				// `](path "title")` — the target is the first whitespace-delimited token.
 				const target = match[1].trim().split(/\s+/)[0].replace(/^<|>$/g, '');
 				if (!target || EXTERNAL.test(target)) continue;
@@ -783,6 +786,13 @@ function selfTest(fail) {
 	];
 	for (const line of nearMisses) {
 		if (parseBanner(line)) fail(`scripts/check-docs.mjs: the banner regex tolerates a near-miss: ${line}`);
+	}
+
+	// A `](…)`-shaped plan expression inside backticks is not a link; inline code that is only
+	// the link's *text* still resolves. `optimizer-rules.md` relies on both halves of this.
+	const codeSpans = markdownLinks('a `Project[o.id, f](LeftJoin[c.fk = o.k] exists(o))` plan, see [`alter table`](#anchor).');
+	if (codeSpans.length !== 1 || codeSpans[0].target !== '#anchor') {
+		fail(`scripts/check-docs.mjs: inline-code link extraction broke: got ${JSON.stringify(codeSpans)}`);
 	}
 
 	// A banner shown inside a fence is an illustration, not a declaration. `doc-conventions.md`

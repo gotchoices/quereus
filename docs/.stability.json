@@ -2,6 +2,7 @@
 	"note": "Tier assignment per doc. A new docs/*.md must appear in `docs` or `untiered` or the docs gate fails. Definitions and the per-area table live in docs/stability.md.",
 	"tiers": ["Stable", "Beta", "Experimental", "Internal"],
 	"docs": {
+		"docs/aggregate-algebra.md": "Beta",
 		"docs/change-scope.md": "Beta",
 		"docs/coordinator.md": "Experimental",
 		"docs/datetime.md": "Stable",
@@ -29,6 +30,7 @@
 		"docs/optimizer-streaming.md": "Internal",
 		"docs/optimizer.md": "Internal",
 		"docs/plugins.md": "Stable",
+		"docs/runtime-caching.md": "Internal",
 		"docs/runtime.md": "Internal",
 		"docs/schema.md": "Beta",
 		"docs/sql-ddl.md": "Stable",

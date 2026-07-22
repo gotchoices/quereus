@@ -53,6 +53,15 @@ function sortByK(rows: Record<string, SqlValue>[]): Record<string, SqlValue>[] {
 	return [...rows].sort((a, b) => Number(a.k ?? -1) - Number(b.k ?? -1));
 }
 
+// The declined-fold plan below executes an EagerPrefetch (bloom-probe) above the
+// FULL JOIN; a slot-creating ancestor over an eager-start fork is a known
+// strict-fork false positive (see docs/runtime.md § EagerPrefetchNode), so that
+// executed-plan test is skipped under QUEREUS_FORK_STRICT like its siblings in
+// parallel-eager-prefetch-probe.spec.ts.
+const strictFork = typeof process !== 'undefined'
+	&& (process.env?.QUEREUS_FORK_STRICT === '1' || process.env?.QUEREUS_FORK_STRICT === 'true');
+const prefetchExecTest = strictFork ? it.skip : it;
+
 describe('ruleAsyncGatherZipByKey', () => {
 	let db: Database;
 
@@ -372,7 +381,7 @@ describe('ruleAsyncGatherZipByKey', () => {
 		]);
 	});
 
-	it('does NOT fold when a projection subquery references a consumed branch key', async () => {
+	prefetchExecTest('does NOT fold when a projection subquery references a consumed branch key', async () => {
 		// The subquery is correlated to `a.k`, a per-branch key the merge consumes
 		// into the single merged key — it cannot resolve above the gather, so the
 		// `subtreeReferencesKey` guard declines the fold. The chain stays a binary
