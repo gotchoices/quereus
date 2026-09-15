@@ -1,4 +1,5 @@
 import { createLogger } from '../common/logger.js';
+import { ensureAsyncGeneratorCleanupSupported } from '../util/async-generator-support.js';
 import { MisuseError, QuereusError, FailConflictError, RollbackConflictError, throwIfAborted } from '../common/errors.js';
 import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue, type StatementOptions } from '../common/types.js';
 import type { ScalarType } from '../common/datatype.js';
@@ -649,6 +650,12 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * @internal
 	 */
 	async _acquireExecMutex(): Promise<() => void> {
+		// Every statement passes through here, so this is where a host whose async
+		// generators cannot release the mutex on early exit is refused up front.
+		// Sync no-op after the first successful probe, so acquisition order stays
+		// call order.
+		const supportCheck = ensureAsyncGeneratorCleanupSupported();
+		if (supportCheck) await supportCheck;
 		const previousMutex = this.execMutex;
 		let releaseMutex: () => void;
 		this.execMutex = new Promise<void>(resolve => {
@@ -2219,6 +2226,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				}
 			}
 		} finally {
+			// NOTE: the release after this await relies on spec-conformant
+			// return() handling; hosts that drop it are refused by
+			// ensureAsyncGeneratorCleanupSupported() before any statement runs.
 			if (stmt) { await stmt.finalize(); }
 			releaseMutex();
 		}

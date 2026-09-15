@@ -144,6 +144,8 @@ await db.exec(`create table users (id integer primary key, name text) using stor
 - `TextEncoder` / `TextDecoder` (used by store plugins)
 - `Symbol.asyncIterator` (required for async-iterable support; Quereus has a Hermes workaround for AsyncGenerator iterables, but the symbol must exist)
 
+**Babel helpers:** Metro lowers async generators through Babel's `wrapAsyncGenerator` helper. Before `@babel/helpers` / `@babel/runtime` **7.29.2** that helper drops the rest of a `finally` block after its first `await` when iteration stops early (`break` / `return` inside `for await`), which would leave the database's execution lock held forever. Quereus probes for this before the first statement runs and throws an `UNSUPPORTED` error naming the fix; keep both packages at 7.29.2 or later (`yarn up @babel/runtime @babel/helpers`).
+
 ### NativeScript
 
 Use [`@quereus/plugin-nativescript-sqlite`](../quereus-plugin-nativescript-sqlite/) for SQLite-based storage with full transaction isolation. All tables share one SQLite database file:

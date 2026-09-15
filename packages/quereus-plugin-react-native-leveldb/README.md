@@ -72,6 +72,14 @@ React Native apps typically need a few runtime polyfills for Quereus and its plu
 
 **The plugin automatically checks for these polyfills** and throws a clear error message with installation instructions if any are missing.
 
+## Babel Helper Version
+
+Metro compiles async generators through Babel's `wrapAsyncGenerator` helper (from `@babel/helpers`, or `@babel/runtime` under `transform-runtime`). Before **7.29.2** that helper drops everything after the first `await` in a `finally` block when iteration stops early, so an early `break` out of `db.eval(...)` would leave Quereus's execution lock held and hang the next statement. Quereus detects this before running any statement and throws an `UNSUPPORTED` error; the fix is on the app side:
+
+```bash
+yarn up @babel/runtime @babel/helpers   # both >= 7.29.2, then rebuild the bundle
+```
+
 You can use packages like `core-js` or provide your own implementations:
 
 ```bash
