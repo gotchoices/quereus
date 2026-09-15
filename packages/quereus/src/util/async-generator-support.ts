@@ -38,7 +38,7 @@ const UNSUPPORTED_MESSAGE =
 	'This JavaScript environment drops async-generator cleanup after an await in a finally block ' +
 	'when iteration stops early, which would leave Quereus\'s execution lock held forever. ' +
 	'This is a known defect in the Babel wrapAsyncGenerator helper before 7.29.2: ' +
-	'upgrade @babel/helpers and @babel/runtime to >= 7.29.2 (e.g. `yarn up @babel/runtime @babel/helpers`), ' +
+	'upgrade @babel/helpers and @babel/runtime to >= 7.29.2 (e.g. `yarn up \'@babel/runtime@^7.29.2\' \'@babel/helpers@^7.29.2\'`; a bare `yarn up` would jump to Babel 8), ' +
 	'then rebuild the bundle with Metro\'s cache cleared (`--reset-cache`).';
 
 /**
