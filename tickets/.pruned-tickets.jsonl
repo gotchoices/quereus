@@ -326,3 +326,4 @@
 {"slug":"runtime-hoist-aggregate-row-loop-invariants","file":"runtime-hoist-aggregate-row-loop-invariants.md","completedAt":"2026-08-08","commit":"66299e4c48e1a2cb7f83c86c295d0720e152de1f","prunedAt":"2026-09-15T16:19:59.940Z"}
 {"slug":"runtime-scalar-op-emit-time-specialization","file":"runtime-scalar-op-emit-time-specialization.md","completedAt":"2026-08-08","commit":"427b56bcbc4ae08b34a650ae09fe17efea7bd30c","prunedAt":"2026-09-15T16:19:59.940Z"}
 {"slug":"sum-mixed-exact-and-float-accumulation","file":"sum-mixed-exact-and-float-accumulation.md","completedAt":"2026-08-08","commit":"730c651a1c0f24cd7e0f2dde9a3635f865079ff4","prunedAt":"2026-09-15T16:19:59.940Z"}
+{"slug":"bug-isolation-null-pk-shadow-key","file":"1-bug-isolation-null-pk-shadow-key.md","completedAt":"2026-08-16","commit":"23004c174d09a34b5fc0318abd602db27dca3ba3","prunedAt":"2026-09-15T19:13:12.638Z"}
