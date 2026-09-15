@@ -24,6 +24,7 @@ import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { combineAbortSignals } from '../util/abort-signal.js';
+import { ensureAsyncGeneratorCleanupSupported } from '../util/async-generator-support.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
 import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
 import { isObjectClassValue } from '../util/comparison.js';
@@ -582,6 +583,9 @@ export class Statement {
 	 */
 	async *_iterateConcurrent(params?: SqlParameters | SqlValue[], options?: StatementOptions): AsyncGenerator<Row> {
 		throwIfAborted(options?.signal);
+		// This path skips Database._acquireExecMutex, so it refuses unsupported hosts itself.
+		const supportCheck = ensureAsyncGeneratorCleanupSupported();
+		if (supportCheck) await supportCheck;
 		const scope = this.db._beginConcurrentRead();
 		const combined = combineAbortSignals(options?.signal, scope.signal);
 		try {

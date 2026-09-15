@@ -650,18 +650,25 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * @internal
 	 */
 	async _acquireExecMutex(): Promise<() => void> {
-		// Every statement passes through here, so this is where a host whose async
-		// generators cannot release the mutex on early exit is refused up front.
-		// Sync no-op after the first successful probe, so acquisition order stays
-		// call order.
-		const supportCheck = ensureAsyncGeneratorCleanupSupported();
-		if (supportCheck) await supportCheck;
 		const previousMutex = this.execMutex;
 		let releaseMutex: () => void;
 		this.execMutex = new Promise<void>(resolve => {
 			releaseMutex = resolve;
 		});
 		await previousMutex;
+		// Every serialized statement passes through here, so a host whose async
+		// generators cannot release this mutex on early exit is refused before it
+		// holds it. Checked after taking the slot so the one-time probe cannot
+		// reorder waiters; a sync no-op once verified.
+		const supportCheck = ensureAsyncGeneratorCleanupSupported();
+		if (supportCheck) {
+			try {
+				await supportCheck;
+			} catch (e) {
+				releaseMutex!();
+				throw e;
+			}
+		}
 		// Mark the mutex held from acquisition until the returned release runs, so a
 		// re-entrant caller can detect it (see _isExecuting). The wrapper decrements
 		// at most once even if release is invoked more than once.

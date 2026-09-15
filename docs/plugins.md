@@ -1145,6 +1145,8 @@ React Native apps typically need a few runtime polyfills for Quereus and its plu
   - While Hermes has a workaround for AsyncGenerator objects, the `Symbol.asyncIterator` symbol itself must exist
   - Without it, you'll get `ReferenceError: Can't find variable: Symbol` when checking for async iterables
 
+React Native builds also need `@babel/helpers` / `@babel/runtime` **>= 7.29.2**; see *Babel helpers* in the [Quereus README](../packages/quereus/README.md#react-native).
+
 You can use packages like `core-js` or provide your own implementations:
 
 ```bash

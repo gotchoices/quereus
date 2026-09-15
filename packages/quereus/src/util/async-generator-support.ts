@@ -38,25 +38,29 @@ const UNSUPPORTED_MESSAGE =
 	'This JavaScript environment drops async-generator cleanup after an await in a finally block ' +
 	'when iteration stops early, which would leave Quereus\'s execution lock held forever. ' +
 	'This is a known defect in the Babel wrapAsyncGenerator helper before 7.29.2: ' +
-	'upgrade @babel/helpers and @babel/runtime to >= 7.29.2 (e.g. `yarn up @babel/runtime @babel/helpers`) ' +
-	'and rebuild the bundle.';
-
-let verified = false;
-let pending: Promise<void> | undefined;
+	'upgrade @babel/helpers and @babel/runtime to >= 7.29.2 (e.g. `yarn up @babel/runtime @babel/helpers`), ' +
+	'then rebuild the bundle with Metro\'s cache cleared (`--reset-cache`).';
 
 /**
- * Returns `undefined` once the environment has been verified (sync fast path),
- * otherwise a promise that resolves on success or rejects with an
- * `UNSUPPORTED` {@link QuereusError} naming the fix. The verdict is memoized
- * for the life of the process.
+ * Memoizes one run of `probe`. The returned check yields `undefined` once the
+ * probe has passed (sync fast path), otherwise the shared promise that resolves
+ * on success or rejects with an `UNSUPPORTED` {@link QuereusError} naming the
+ * fix. A failed verdict stays rejected: the environment does not change.
  */
-export function ensureAsyncGeneratorCleanupSupported(): Promise<void> | undefined {
-	if (verified) return undefined;
-	if (!pending) {
-		pending = probeAsyncGeneratorCleanup().then(ok => {
-			if (!ok) throw new QuereusError(UNSUPPORTED_MESSAGE, StatusCode.UNSUPPORTED);
-			verified = true;
-		});
-	}
-	return pending;
+export function createAsyncGeneratorCleanupCheck(probe: () => Promise<boolean>): () => Promise<void> | undefined {
+	let verified = false;
+	let pending: Promise<void> | undefined;
+	return () => {
+		if (verified) return undefined;
+		if (!pending) {
+			pending = probe().then(ok => {
+				if (!ok) throw new QuereusError(UNSUPPORTED_MESSAGE, StatusCode.UNSUPPORTED);
+				verified = true;
+			});
+		}
+		return pending;
+	};
 }
+
+/** Process-wide check against the real host; see {@link createAsyncGeneratorCleanupCheck}. */
+export const ensureAsyncGeneratorCleanupSupported = createAsyncGeneratorCleanupCheck(probeAsyncGeneratorCleanup);
