@@ -150,6 +150,22 @@ describe('Schema differ — ALTER COLUMN detection', () => {
 		]);
 	});
 
+	it('does not treat a type alias as a retype (int vs INTEGER, varchar(20) vs TEXT)', () => {
+		const declared = parseDeclaredSchema(
+			`declare schema main { table t (id integer primary key, u int, v varchar(20)); }`
+		);
+		const actual = makeCatalog([
+			catalogTable('t', [
+				{ name: 'id', type: 'INTEGER', notNull: true, primaryKey: true },
+				{ name: 'u', type: 'INTEGER' },
+				{ name: 'v', type: 'TEXT' },
+			], [{ columnName: 'id' }]),
+		]);
+
+		const diff = computeSchemaDiff(declared, actual);
+		expect(diff.tablesToAlter).to.have.length(0);
+	});
+
 	it('populates all three attributes on one column when all differ', () => {
 		const declared = parseDeclaredSchema(
 			`declare schema main { table t (id integer primary key, c real not null default 1); }`

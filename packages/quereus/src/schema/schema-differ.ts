@@ -2710,8 +2710,10 @@ function computeColumnAttributeChange(
 		any = true;
 	}
 
-	// Data type — declared type is a string; compare case-insensitively.
-	if (declared.dataType && declared.dataType.toLowerCase() !== actual.type.toLowerCase()) {
+	// Data type — compare resolved logical types, not the raw spelling, so an alias
+	// (`int` for `INTEGER`, `varchar(20)` for `TEXT`) doesn't churn a spurious retype
+	// against the catalog's canonical `logicalType.name`.
+	if (declared.dataType && inferType(declared.dataType).name.toUpperCase() !== actual.type.toUpperCase()) {
 		change.dataType = declared.dataType;
 		any = true;
 	}
