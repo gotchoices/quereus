@@ -25,7 +25,19 @@ no committed `CHANGELOG.md`; the published GitHub releases are the canonical his
 yarn release
 ```
 
-This first runs `scripts/release-guard.js` — an interactive gate that prints a banner and requires you to type `yes` to confirm `yarn check` passed on this commit (it aborts on a non-interactive terminal). Only then does it run `yarn bump` (interactive version prompt, commits, tags, pushes), `yarn pub` (clean + build + publish each package), and `yarn gh-release`.
+This first runs `scripts/release-guard.js` — an interactive gate that prints a banner and requires you to type `yes` to confirm `yarn check` passed on this commit (it aborts on a non-interactive terminal). Only then does it run `yarn bump` (interactive version prompt, commits, tags, pushes), `yarn pub` (clean + build + publish each package), `yarn await-published` (waits until npm serves every package at its new version — see [When the release is finished](#when-the-release-is-finished)), and `yarn gh-release`.
+
+### When the release is finished
+
+`yarn pub` returns once npm has accepted every publish, but npm starts serving each new version at its own moment, sometimes a minute or more apart. A downstream upgrade run in that gap resolves new versions of some packages beside old versions of others. So `yarn release` runs `yarn await-published` (`scripts/await-published.mjs`) before `yarn gh-release`. It takes the packages to wait for from the `pub` chain in the root `package.json` — the same derivation `scripts/check-docs.mjs` uses (`scripts/published-packages.mjs`), not the workspace list, which also holds public workspaces `pub` does not publish — and asks `npm view <name>@<version>` for each every 5 s until all are served. Its last line is the one to wait for:
+
+```
+all 14 packages published and visible on npm at 4.19.4
+```
+
+**Upgrade downstream repositories only after that line.** The GitHub release is created only after it, too.
+
+If ten minutes pass first (`QUEREUS_PUBLISH_WAIT_SECONDS` changes the deadline), it lists each package still missing, with npm's reason, and exits non-zero, so `yarn gh-release` does not run. npm has already accepted the publish at that point: **do not re-run `yarn release`** (it would bump to yet another version). Once the registry catches up, run `yarn await-published` again, then `yarn gh-release`. The script can be run on its own at any time and reports on the versions currently in the manifests. Its decision logic is tested by `yarn test:scripts` (part of `yarn test`), without the network.
 
 ## Step by Step
 
@@ -54,12 +66,17 @@ yarn bump --release major
 3. Create an annotated tag: `v{version}`
 4. Push the commit and tag to `origin`
 
-### 3. Publish to npm
+### 3. Publish to npm, and wait until npm serves it
 
 ```bash
 # Publish all public packages (clean + build + publish each)
 yarn pub
+
+# Wait until npm serves every one of them at the new version
+yarn await-published
 ```
+
+See [When the release is finished](#when-the-release-is-finished) for what the wait's last line means.
 
 Or publish individually:
 
@@ -97,7 +114,7 @@ Publish prereleases with a dist-tag so they don't become `latest`:
 1. Branch from the release tag: `git checkout -b hotfix/v1.0.1 v1.0.0`
 2. Apply the fix, commit
 3. Bump: `yarn bump --release patch`
-4. Publish: `yarn pub`
+4. Publish: `yarn pub`, then `yarn await-published`
 5. Merge back into `main`
 
 ## Version Alignment
@@ -124,5 +141,6 @@ This is a disclosure rule, not a compatibility promise — sync is Experimental 
 - [ ] Clean working tree
 - [ ] `.release-notes.pending.md` curated (optional — omit for auto-generated notes)
 - [ ] If `PROTOCOL_VERSION` changed, the notes say so and say to upgrade peers together (see *The sync wire version is not the package version*)
-- [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
+- [ ] `yarn release` (or `yarn bump` + `yarn pub` + `yarn await-published` separately), ending with `all N packages published and visible on npm at {version}`
+- [ ] Only then: tell downstream repositories to upgrade
 - [ ] GitHub release created (`yarn gh-release`)

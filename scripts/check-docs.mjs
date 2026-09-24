@@ -45,6 +45,8 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from '
 import { dirname, join, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { publishedPackages } from './published-packages.mjs';
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BUDGET_PATH = join(ROOT, 'docs', '.doc-budget.json');
 const INVARIANTS_PATH = join(ROOT, 'docs', 'invariants.md');
@@ -888,33 +890,6 @@ const ROOT_PACKAGE_PATH = join(ROOT, 'package.json');
 
 /** The classification of a package whose README declares no single tier — today only the engine. */
 const SPANS = Symbol('spans tiers');
-
-/**
- * The package directories `yarn pub` publishes, derived from the root `package.json` rather than
- * restated here. `pub` chains `yarn pub:<step>` calls; each step runs
- * `node scripts/publish-package.js <dir>`, where `<dir>` is relative to `packages/`.
- *
- * Deriving it is the point. The first pass at the package banners hand-listed the packages and
- * silently missed two that publish, which is exactly the drift this check exists to catch.
- */
-function publishedPackages(scripts) {
-	const chain = scripts.pub;
-	if (typeof chain !== 'string') {
-		throw new Error(`package.json: no 'pub' script — cannot derive the list of published packages`);
-	}
-
-	const dirs = [];
-	for (const [, step] of chain.matchAll(/\byarn\s+(pub:[\w:-]+)/g)) {
-		const command = scripts[step];
-		if (typeof command !== 'string') throw new Error(`package.json: 'pub' runs '${step}', which is not a script`);
-
-		const arg = /publish-package\.js\s+(\S+)/.exec(command);
-		if (!arg) throw new Error(`package.json: '${step}' does not call scripts/publish-package.js — cannot tell which package it publishes`);
-		dirs.push(`packages/${arg[1]}`);
-	}
-	if (!dirs.length) throw new Error(`package.json: the 'pub' script chains no 'yarn pub:*' steps`);
-	return dirs;
-}
 
 /** The `docs/stability.md` target a README in `pkgDir` must link — `../../docs/stability.md`, one deeper under `packages/tools/`. */
 const stabilityLinkFrom = (pkgDir) => toPosix(relative(resolve(ROOT, pkgDir), join(ROOT, 'docs', 'stability.md')));
