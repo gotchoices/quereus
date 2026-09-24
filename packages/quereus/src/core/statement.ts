@@ -19,7 +19,7 @@ import type { VirtualTable } from '../vtab/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
-import { boundKeyToParamKey, getParameterTypes } from './param.js';
+import { boundKeyToParamKey, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
@@ -148,19 +148,12 @@ export class Statement {
 			// Explicit parameter types provided — taken as given, never extended.
 			this.parameterTypes = paramsOrTypes;
 		} else if (paramsOrTypes !== undefined) {
-			// Initial parameter values. Values canonicalize as they enter boundArgs (a
-			// safe-range bigint narrows to number, R1 — util/numeric-canonical.ts):
-			// per-bind, not per-row, and shared by all three ingress sites (here, bind,
-			// bindAll).
-			if (Array.isArray(paramsOrTypes)) {
-				paramsOrTypes.forEach((value, index) => {
-					this.boundArgs[index + 1] = canonicalizeSqlValue(value);
-				});
-			} else {
-				for (const [key, value] of Object.entries(paramsOrTypes)) {
-					this.boundArgs[key] = canonicalizeSqlValue(value);
-				}
-			}
+			// Initial parameter values. Keys collapse onto one spelling per parameter and
+			// values canonicalize (a safe-range bigint narrows to number, R1 —
+			// util/numeric-canonical.ts) as they enter boundArgs: per-bind, not per-row,
+			// and shared by every ingress site (here, bind, bindAll, Database.exec,
+			// change-scope's bindParameters).
+			this.boundArgs = normalizeBoundParams(paramsOrTypes, 'prepare');
 			// Types follow from those values NOW, not at the first compile: prepare-time
 			// values are the declaration, so `prepare(sql, [1, 42]).run([2, 3.14])` must
 			// be a type mismatch and not a re-inference. Routed through the shared helper
@@ -402,14 +395,17 @@ export class Statement {
 		if (!isSqlValue(value)) {
 			throw new MisuseError(`bind: invalid value for key '${key}': expected SqlValue, got ${describeSqlValueViolation(value)}`);
 		}
-		if (typeof key === 'number') {
-			if (key < 1) throw new RangeError(`Argument index ${key} out of range (must be >= 1)`);
-			this.boundArgs[key] = canonicalizeSqlValue(value);
-		} else if (typeof key === 'string') {
-			this.boundArgs[key] = canonicalizeSqlValue(value);
-		} else {
+		if (typeof key !== 'number' && typeof key !== 'string') {
 			throw new MisuseError("Invalid argument key type");
 		}
+		// One spelling per parameter, as at every other ingress — ':p'/'$p'/'p' and
+		// '1'/':1'/':01' each collapse to one key. The index range check runs AFTER
+		// normalization so bind(':0') is rejected exactly as bind(0) is.
+		const paramKey = typeof key === 'number' ? key : boundKeyToParamKey(key);
+		if (typeof paramKey === 'number' && paramKey < 1) {
+			throw new RangeError(`Argument index ${key} out of range (must be >= 1)`);
+		}
+		this.boundArgs[paramKey] = canonicalizeSqlValue(value);
 		this.dropStalePlanOnBind();
 		return this;
 	}
@@ -420,29 +416,12 @@ export class Statement {
 	bindAll(args: SqlParameters | SqlValue[]): this {
 		this.validateStatement("bind all parameters for");
 		if (this.busy) throw new MisuseError("Statement busy, reset first");
-		this.boundArgs = {};
-		if (Array.isArray(args)) {
-			// Convert array to object with 1-based numeric keys to match bind() and constructor
-			args.forEach((value, index) => {
-				if (!isSqlValue(value)) {
-					throw new MisuseError(`bindAll: invalid value at index ${index}: expected SqlValue, got ${describeSqlValueViolation(value)}`);
-				}
-				this.boundArgs[index + 1] = canonicalizeSqlValue(value);
-			});
-		} else if (typeof args === 'object' && args !== null) {
-			// Validate every entry before assigning any, so a rejected value leaves
-			// boundArgs empty rather than partially bound.
-			for (const [key, value] of Object.entries(args)) {
-				if (!isSqlValue(value)) {
-					throw new MisuseError(`bindAll: invalid value for key '${key}': expected SqlValue, got ${describeSqlValueViolation(value)}`);
-				}
-			}
-			for (const [key, value] of Object.entries(args)) {
-				this.boundArgs[key] = canonicalizeSqlValue(value);
-			}
-		} else {
+		if (!Array.isArray(args) && (typeof args !== 'object' || args === null)) {
 			throw new MisuseError("Invalid parameters type for bindAll. Use array or object.");
 		}
+		// Normalize first, assign second: a rejected object (bad value, or one parameter
+		// bound under two spellings) leaves the previous bindings untouched.
+		this.boundArgs = normalizeBoundParams(args, 'bindAll');
 		this.dropStalePlanOnBind();
 		return this;
 	}
@@ -1044,11 +1023,11 @@ export class Statement {
 		// silently return no rows. The set is collected structurally at plan time
 		// (JSON-vs-JSON comparisons are excluded), so this never over-fires.
 		for (const key of this.scalarRequiredParams) {
-			// Presence check, not `??`: a parameter legitimately bound to `null` must
-			// use that binding, not fall through to the `:`-prefixed alternate key.
-			const value = typeof key === 'string'
-				? (Object.hasOwn(this.boundArgs, key) ? this.boundArgs[key] : this.boundArgs[`:${key}`])
-				: this.boundArgs[key];
+			// `scalarRequiredParams` keys are plan-side (already bare / numeric) and
+			// boundArgs is normalized to the same keys at ingress, so one lookup finds
+			// the binding whatever spelling the caller used. `undefined` still means
+			// "not bound" — a parameter bound to `null` reads as `null` and is checked.
+			const value = this.boundArgs[key];
 			if (value !== undefined && isObjectClassValue(value)) {
 				throw new QuereusError(
 					`parameter ${typeof key === 'number' ? `?${key}` : `:${key}`} ` +

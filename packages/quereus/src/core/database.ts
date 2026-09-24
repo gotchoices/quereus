@@ -48,13 +48,12 @@ import { DeclaredSchemaManager } from '../schema/declared-schema-manager.js';
 import { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
 import { type LogicalType, type CollationResolver, type KeyNormalizer, type KeyNormalizerResolver } from '../types/logical-type.js';
 import { registerType as registerTypeInRegistry } from '../types/registry.js';
-import { getParameterTypes } from './param.js';
+import { getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { Latches } from '../util/latches.js';
-import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 import {
 	DatabaseEventEmitter,
 	type DatabaseDataChangeEvent,
@@ -918,7 +917,16 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// Pre-flight cancellation: reject before building/optimizing the plan.
 		throwIfAborted(signal);
 
-		const { plan } = this._buildPlan([statementAst], params);
+		// Normalize once, up front: this is the fifth parameter ingress site alongside
+		// the three in Statement and change-scope's bindParameters. It collapses each
+		// parameter onto one key spelling and canonicalizes values (a safe-range bigint
+		// narrows to number, R1 — util/numeric-canonical.ts); without it `db.exec(sql,
+		// [5n])` would carry an uncanonicalized value all the way into a write, and
+		// `db.exec(sql, {':p': 1})` would never resolve `:p`. Done BEFORE _buildPlan so
+		// the plan is typed from the same keys the runtime will look up.
+		const boundArgs = params === undefined ? {} : normalizeBoundParams(params, 'exec');
+
+		const { plan } = this._buildPlan([statementAst], params === undefined ? undefined : boundArgs);
 
 		if (plan.statements.length === 0) return; // No-op for this AST
 
@@ -926,20 +934,6 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const emissionContext = new EmissionContext(this);
 		const rootInstruction = emitPlanNode(optimizedPlan, emissionContext);
 		const scheduler = new Scheduler(rootInstruction);
-
-		// Normalize array params to a record keyed by 1-based index, matching Statement.bindAll —
-		// including its canonicalization: a safe-range bigint narrows to number as it enters the
-		// bound-args map (R1, util/numeric-canonical.ts). This is the fourth parameter ingress
-		// site alongside the three in Statement; without it `db.exec(sql, [5n])` would carry an
-		// uncanonicalized value all the way into a write.
-		const boundArgs: Record<number | string, SqlValue> = {};
-		if (Array.isArray(params)) {
-			params.forEach((value, index) => { boundArgs[index + 1] = canonicalizeSqlValue(value); });
-		} else if (params) {
-			for (const [key, value] of Object.entries(params)) {
-				boundArgs[key] = canonicalizeSqlValue(value);
-			}
-		}
 
 		const scanConnections = new Map<symbol, VirtualTable>();
 		const runtimeCtx: RuntimeContext = {

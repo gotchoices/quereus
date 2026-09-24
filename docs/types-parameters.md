@@ -80,6 +80,15 @@ integer key on one row and a text key on the next.
 `db.eval(sql, params)` and `db.get(sql, params)` both plan with the types of `params`, so every entry
 point answers a cross-type comparison (`where text_col = ?` bound to a number) the same way.
 
+**Which parameter a bound key names.** Everything above is per *parameter*, not per key
+spelling: the examples here write the bare `id` while [Usage](usage.md) writes `:id`, and
+both name one parameter, as do `$id` and — for a positional slot — `1`, `'1'` and `':1'`.
+Keys are normalized where the binding is born, so a parameter's type, its bind-time
+validation and its run-time value all resolve through the same key whichever spelling the
+caller used. The full contract, including why binding two spellings of one parameter in a
+single object is a `MisuseError`, is stated in [Usage](usage.md) under the
+prepared-statement binding methods.
+
 ## Examples
 
 **Option 1: Type inference from initial values**

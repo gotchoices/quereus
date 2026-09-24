@@ -149,6 +149,11 @@ behaviour functions) from a portable shape, call
 `bindParameters(scope, params)` substitutes matching `ParamScopeValue`
 placeholders with literal values and removes the bound indices from
 `unboundParameters` and from `nonDeterministicSources` (kind `'parameter'`).
+It accepts the same parameter key spellings as every other binding surface —
+a named parameter as `:name`, `$name` or `name`, a positional slot as `1`,
+`'1'` or `':1'` — and, like them, rejects an object that binds two spellings
+of one parameter with a `MisuseError`. The contract is stated once in
+[Usage](usage.md) under the prepared-statement binding methods.
 
 `isEmpty(scope)` is true iff `watches`, `nonDeterministicSources` and
 `unboundParameters` are all empty.

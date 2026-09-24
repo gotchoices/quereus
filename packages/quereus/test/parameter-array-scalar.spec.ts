@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
-import { QuereusError } from '../src/common/errors.js';
+import { MisuseError, QuereusError } from '../src/common/errors.js';
 import { StatusCode } from '../src/common/types.js';
 import type { SqlValue } from '../src/common/types.js';
 import { CastNode, LiteralNode } from '../src/planner/nodes/scalar.js';
@@ -251,27 +251,35 @@ describe('Array-valued scalar parameter guard', () => {
 	describe('respects a named parameter legitimately bound to null', () => {
 		// Regression: the scalar-required-param guard resolved the value with
 		// `boundArgs[key] ?? boundArgs[':'+key]`. A bare key bound to `null` fell
-		// through the `??` to the `:`-prefixed alternate, so a real `null` binding was
-		// masked by (and could wrongly adopt) an unrelated `:key` value. The fix uses
-		// a presence check, so a bound `null` is honored.
-		//
-		// Binding both spellings of one name at once also settles which entry the plan is
-		// TYPED from: `getParameterTypes` skips the `:`-prefixed entry when the bare key
-		// is present, matching the guard's precedence. Without that agreement the plan
-		// would be typed JSON from the array alternate while the bound null is validated
-		// against it, and the run would die on an ordinary parameter type check before
-		// the guard was ever reached.
+		// through the `??` to a `:`-prefixed alternate, so a real `null` binding was
+		// masked by (and could wrongly adopt) an unrelated `:key` value. The guard now
+		// reads a single normalized key, so a bound `null` is honored.
 		for (const path of paths) {
-			it(`honors a null bare binding rather than the :-prefixed alternate — ${path.name}`, async () => {
-				// Both keys present: bare `needle` bound to null (a valid scalar), and the
-				// `:needle` alternate bound to an array. The bound null must win — falling
-				// through to the array would wrongly raise the array-valued-scalar mismatch.
-				const rows = await path.run('select * from t where name = :needle', {
-					needle: null,
-					':needle': [1, 2],
-				});
-				// `name = NULL` matches nothing, but crucially raises no error.
+			it(`does not mistake a null binding for an unbound parameter — ${path.name}`, async () => {
+				const rows = await path.run('select * from t where name = :needle', { needle: null });
+				// `name = NULL` matches nothing, but crucially raises no error: the guard
+				// must not confuse a bound null with a missing binding.
 				expect(rows).to.have.length(0);
+			});
+
+			// `needle` and `:needle` used to be two entries naming one parameter, with the
+			// bare key winning by accident (the runtime lookup only ever saw bare keys).
+			// Keys now normalize at ingress, so the object carries one parameter bound
+			// twice — refused rather than silently resolved either way. See
+			// `parameter-key-spellings.spec.ts` for the full rule.
+			it(`rejects an object binding one name under two spellings — ${path.name}`, async () => {
+				let error: Error | undefined;
+				try {
+					await path.run('select * from t where name = :needle', {
+						needle: null,
+						':needle': [1, 2],
+					});
+				} catch (e) {
+					error = e as Error;
+				}
+				expect(error, 'expected the duplicate binding to be rejected').to.exist;
+				expect(error).to.be.instanceof(MisuseError);
+				expect(error!.message).to.match(/bound twice/);
 			});
 		}
 	});

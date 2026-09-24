@@ -21,12 +21,13 @@ export function buildParameterSpec(plan: ParameterReferenceNode): ScalarOpSpec {
 			}
 			return params[key];
 		} else if (typeof identifier === 'string') {
-			// For named parameters like :name.
-			const key = identifier.startsWith(':') ? identifier.substring(1) : identifier;
-			if (!(key in params)) {
-				throw new QuereusError(`Parameter with name '${key}' not found.`, StatusCode.NOTFOUND);
+			// For named parameters like :name. Both sides are already bare: the planner
+			// strips the prefix when it builds `nameOrIndex`, and every bound key passes
+			// through `normalizeBoundParams` on the way into `params`.
+			if (!(identifier in params)) {
+				throw new QuereusError(`Parameter with name '${identifier}' not found.`, StatusCode.NOTFOUND);
 			}
-			return params[key];
+			return params[identifier];
 		} else {
 			// Should not happen given ParameterReferenceNode structure
 			throw new QuereusError('Invalid parameter identifier type.', StatusCode.INTERNAL);

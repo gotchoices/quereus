@@ -15,6 +15,7 @@
  * same shape.
  */
 import type { SqlValue, SqlParameters } from '../../common/types.js';
+import { normalizeBoundParams } from '../../core/param.js';
 import type { CollationSource, ScalarType } from '../../common/datatype.js';
 import { isRelationalNode } from '../nodes/plan-node.js';
 import type { PlanNode, RelationalPlanNode, ScalarPlanNode } from '../nodes/plan-node.js';
@@ -979,23 +980,12 @@ function intersectValues(
 /* --- Parameter binding --------------------------------------------------- */
 
 export function bindParameters(scope: ChangeScope, params: SqlParameters | SqlValue[]): ChangeScope {
-	const lookup = (id: number | string): SqlValue | undefined => {
-		if (Array.isArray(params)) {
-			if (typeof id !== 'number') return undefined;
-			const v = params[id - 1];
-			return v;
-		}
-		if (typeof id === 'number') {
-			return (params as Record<string, SqlValue>)[id];
-		}
-		const key = id.startsWith(':') || id.startsWith('@') || id.startsWith('$')
-			? id.substring(1)
-			: id;
-		const obj = params as Record<string, SqlValue>;
-		if (key in obj) return obj[key];
-		if (id in obj) return obj[id];
-		return undefined;
-	};
+	// A public entry point in its own right (docs/change-scope.md shows callers invoking
+	// it directly), so it normalizes its own input rather than trusting the caller: the
+	// scope's parameter ids are plan-side (bare name or 1-based index) and this puts the
+	// caller's keys in the same spelling, whichever of `:p` / `$p` / `p` they used.
+	const normalized = normalizeBoundParams(params, 'bindParameters');
+	const lookup = (id: number | string): SqlValue | undefined => normalized[id];
 
 	const substituteValue = (v: ScopeValue): ScopeValue => {
 		if (isParamScopeValue(v)) {

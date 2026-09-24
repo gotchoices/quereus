@@ -227,10 +227,15 @@ describe('Parameter Type System', () => {
 			await stmt.finalize();
 		});
 
-		it('announces INTEGER for a `:`-prefixed named key in the bound object', async () => {
+		// Announce AND execute: the announced type used to be right while the run died
+		// with "Parameter with name 'p' not found", because the type map normalized the
+		// key and the runtime lookup did not. Asserting only the announcement is what
+		// hid that gap, so this case keeps both halves.
+		it('announces INTEGER for a `:`-prefixed named key in the bound object, and runs', async () => {
 			const stmt = db.prepare('select :p as v');
 			stmt.bindAll({ ':p': 9 });
 			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			expect(await stmt.get()).to.deep.equal({ v: 9 });
 			await stmt.finalize();
 		});
 	});

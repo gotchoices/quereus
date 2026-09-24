@@ -1,6 +1,8 @@
 import type { ScalarType } from '../common/datatype.js';
-import { type SqlParameters, type SqlValue } from '../common/types.js';
+import { describeSqlValueViolation, isSqlValue, type SqlParameters, type SqlValue } from '../common/types.js';
 import { inferLogicalTypeFromValue } from '../common/type-inference.js';
+import { MisuseError } from '../common/errors.js';
+import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 
 /**
  * Generate type hints for parameters based on their JavaScript values.
@@ -35,11 +37,9 @@ export function getParameterTypes(params: SqlParameters | undefined): Map<string
 				// by its stringified index (`boundArgs[index + 1]`) — normalize it back to a
 				// number so it lines up with the array branch above and with ParameterScope's
 				// own key, rather than silently missing the hint lookup.
-				// One bound object can carry BOTH spellings of a name (':p' and 'p'). The
-				// bind-time value lookup (Statement.validateParameterTypes) gives the BARE
-				// key precedence, so the hint has to come from the same entry — otherwise
-				// the plan is typed from one value and validated against another.
-				if (key.startsWith(':') && Object.hasOwn(params, key.substring(1))) return;
+				// Bound args have already passed through normalizeBoundParams, so the key is
+				// bare; boundKeyToParamKey is idempotent on it and costs nothing, and it keeps
+				// this function correct for any caller that hands it a raw object.
 				results!.set(boundKeyToParamKey(key), getParameterScalarType(value));
 			});
 		}
@@ -48,14 +48,74 @@ export function getParameterTypes(params: SqlParameters | undefined): Map<string
 }
 
 /**
- * The parameter a bound-args entry names. A bound key carries whatever spelling the
- * caller used — `:name`, the bare `name`, or a stringified positional index — while
- * parameter types and `ParameterScope` are keyed by the bare name or the number. One
- * function so the type map and {@link import('./statement.js').Statement}'s
- * stale-plan check cannot drift on what counts as the same parameter.
+ * The parameter a bound-args entry names. A caller may spell a named parameter
+ * `:name`, `$name` or the bare `name` — the parser accepts `:` and `$` as
+ * interchangeable prefixes and keeps only the bare lexeme — and a positional slot
+ * `1`, `'1'`, `':1'` or `':01'`. All of those name one parameter, and this is the
+ * single function that says so.
+ *
+ * `@` is deliberately NOT stripped: the lexer has no `@` token, so `@p` can never
+ * appear in Quereus SQL and normalizing it would promise a binding for a parameter
+ * no statement can reference.
  */
 export function boundKeyToParamKey(key: string): string | number {
-	return normalizeParamKey(key.startsWith(':') ? key.substring(1) : key);
+	const bare = key.startsWith(':') || key.startsWith('$') ? key.substring(1) : key;
+	return normalizeParamKey(bare);
+}
+
+/**
+ * Canonicalizes a caller-supplied parameter object/array into the bound-args record
+ * every downstream reader agrees on: one key per parameter ({@link boundKeyToParamKey}),
+ * one canonical JS form per value ({@link canonicalizeSqlValue}).
+ *
+ * This is the ONLY place a bound key is decided. Normalizing at ingress is what makes
+ * "which spelling names this parameter?" unanswerable-by-divergence downstream: the
+ * runtime value lookup, the parameter type map, bind-time validation and change-scope
+ * substitution all read the same key because only one was ever written.
+ *
+ * Two spellings of one parameter in a single object (`{ p: 1, ':p': 2 }`) is a
+ * {@link MisuseError}, not a silent pick: either entry could be the one the caller
+ * meant, and discarding a value they passed is worse than refusing it. The rule is
+ * per-object — repeated `Statement.bind()` calls to one parameter stay last-wins,
+ * since each call is a separate statement of intent.
+ *
+ * Throws before returning anything, so a caller assigning the result keeps `bindAll`'s
+ * all-or-nothing contract for free.
+ *
+ * @param label the caller-facing operation name, used to prefix rejection messages
+ */
+export function normalizeBoundParams(
+	params: SqlParameters | SqlValue[],
+	label: string,
+): Record<string | number, SqlValue> {
+	const out: Record<string | number, SqlValue> = {};
+	if (Array.isArray(params)) {
+		params.forEach((value, index) => {
+			assertSqlValue(value, `${label}: invalid value at index ${index}`);
+			out[index + 1] = canonicalizeSqlValue(value);
+		});
+		return out;
+	}
+	// Rejection messages name the CALLER's spelling, so validate while iterating the
+	// original entries rather than the normalized record.
+	const spellingOf = new Map<string | number, string>();
+	for (const [key, value] of Object.entries(params)) {
+		assertSqlValue(value, `${label}: invalid value for key '${key}'`);
+		const paramKey = boundKeyToParamKey(key);
+		const previous = spellingOf.get(paramKey);
+		if (previous !== undefined) {
+			throw new MisuseError(`${label}: parameter '${paramKey}' bound twice, as '${previous}' and '${key}'`);
+		}
+		spellingOf.set(paramKey, key);
+		out[paramKey] = canonicalizeSqlValue(value);
+	}
+	return out;
+}
+
+function assertSqlValue(value: SqlValue, context: string): void {
+	if (!isSqlValue(value)) {
+		throw new MisuseError(`${context}: expected SqlValue, got ${describeSqlValueViolation(value)}`);
+	}
 }
 
 /**
