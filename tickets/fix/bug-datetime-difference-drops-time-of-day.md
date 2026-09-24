@@ -48,3 +48,7 @@ own test file `107-temporal-arithmetic-mutation-kills.sqllogic` covers `DATE - D
 Found while planning `temporal-op-table`, which moves the temporal arithmetic rules into a
 single table. That work deliberately preserves this behavior verbatim so the refactor stays
 behavior-neutral; the fix belongs here, on its own, where the answer change is visible.
+
+# Ruling for the mixed forms (garden pass, 2026-09-24)
+
+Promoted from backlog with this default so the fix needs no further decision: a plain DATE on either side of `-` against a DATETIME is read as that date at midnight (Temporal's `PlainDate.toPlainDateTime()` with no time), and the result is the full elapsed duration, same as `DATETIME - DATETIME`. `DATE - DATE` is unchanged. Record the rule in `docs/types.md` alongside the other temporal arithmetic rules, and add `DATETIME - DATETIME` plus both mixed forms to `107-temporal-arithmetic-mutation-kills.sqllogic`. The `temporal-op-table` refactor this ticket mentions has landed (2026-08-08), so the four `-` cases live in `packages/quereus/src/types/temporal-ops.ts`.
