@@ -3,6 +3,11 @@ import { Database } from '../src/core/database.js';
 import { QuereusError } from '../src/common/errors.js';
 import { StatusCode } from '../src/common/types.js';
 import type { SqlValue } from '../src/common/types.js';
+import { CastNode, LiteralNode } from '../src/planner/nodes/scalar.js';
+import { wrapInCast } from '../src/planner/building/coercion.js';
+import { EmptyScope } from '../src/planner/scopes/empty.js';
+import type { Scope } from '../src/planner/scopes/scope.js';
+import type * as AST from '../src/parser/ast.js';
 
 type ResultRow = Record<string, SqlValue>;
 type Params = SqlValue[] | Record<string, SqlValue>;
@@ -128,6 +133,18 @@ describe('Array-valued scalar parameter guard', () => {
 				it('plain object (not array) bound to a scalar comparand', async () => {
 					await expectMismatch('select * from t where id = ?', [{ lo: 1, hi: 2 }]);
 				});
+
+				it('bare textcol = :p, even where JSON coercion could have matched', async () => {
+					// The deliberate pessimism of reading through the coercion cast: on a
+					// typed path `doc = :p` builds as `cast(doc as json) = :p`, which would
+					// have matched row 1. It is rejected anyway so that `db.eval` — which
+					// plans `:p` as ANY, mints no coercion, and genuinely cannot match —
+					// gives the same answer. `cast(doc as json) = :p` is the spelling that
+					// opts into the JSON comparison; see the over-fire group below.
+					await db.exec('create table jt (id integer primary key, doc text) using memory');
+					await db.exec(`insert into jt (id, doc) values (1, '[1,2,3]'), (2, '[4,5]')`);
+					await expectMismatch('select id from jt where doc = :p', { p: [1, 2, 3] });
+				});
 			});
 
 			describe('does not over-fire on legitimate non-scalar uses', () => {
@@ -182,6 +199,55 @@ describe('Array-valued scalar parameter guard', () => {
 			});
 		});
 	}
+
+	describe('db.eval carrying execution options', () => {
+		// Options make `eval` route through `prepare`, so its parameters are typed and
+		// the comparison gets the coercion cast — the third entry point the original
+		// ticket named as silently returning nothing. One case rather than a fourth
+		// `paths` entry: the property that distinguishes an entry point here is only
+		// whether the plan knows the parameter's type, which this shares with
+		// `db.prepare`, so replaying all 17 cases would discriminate nothing.
+		it('throws on id = ? with an array-bound parameter', async () => {
+			let error: Error | undefined;
+			try {
+				for await (const _row of db.eval('select * from t where id = ?', [[1, 2]], { readConcurrency: 'committed' })) {
+					// no rows expected — the bind is rejected before execution
+				}
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error).to.be.instanceof(QuereusError);
+			expect((error as QuereusError).code).to.equal(StatusCode.MISMATCH);
+			expect(error!.message).to.include('scalar comparison');
+		});
+	});
+
+	describe('CastNode.synthetic', () => {
+		// The guard reads this flag to tell a coercion cast the planner minted from a
+		// `cast(x as t)` the user wrote, and nothing re-derives it — so a rebuild that
+		// dropped it would silently disable the guard on every typed path again, with
+		// the end-to-end cases above still passing on the unrebuilt plan.
+		const scope = EmptyScope.instance as unknown as Scope;
+
+		function literal(value: SqlValue): LiteralNode {
+			return new LiteralNode(scope, { type: 'literal', value } as AST.LiteralExpr);
+		}
+
+		it('is false for a user-written cast and true for a coercion cast', () => {
+			const operand = literal(1);
+			const written = new CastNode(scope, { type: 'cast', expr: operand.expression, targetType: 'json' }, operand);
+			expect(written.synthetic).to.equal(false);
+			expect(wrapInCast(scope, operand, 'json').synthetic).to.equal(true);
+		});
+
+		it('survives withChildren, in both states', () => {
+			for (const original of [wrapInCast(scope, literal(1), 'json'), new CastNode(scope, { type: 'cast', expr: literal(1).expression, targetType: 'json' }, literal(1))]) {
+				const rebuilt = original.withChildren([literal(2)]) as CastNode;
+				expect(rebuilt).to.not.equal(original);
+				expect(rebuilt.synthetic).to.equal(original.synthetic);
+			}
+		});
+	});
 
 	describe('respects a named parameter legitimately bound to null', () => {
 		// Regression: the scalar-required-param guard resolved the value with

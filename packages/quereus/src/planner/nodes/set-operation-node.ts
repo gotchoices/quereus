@@ -592,6 +592,10 @@ function castColumns(
     // `CastNode` resolves the target through the registry by name; rule-4 targets
     // are registered types (JSON today), so the name round-trips to the same
     // logical-type instance.
+    // NOTE: deliberately NOT `CastNode.synthetic`. That flag means "minted to
+    // reconcile a *comparison's* operand types" and licenses
+    // `analysis/scalar-param-usage.ts` to read straight through the cast; a
+    // branch-type merge is a different rewrite and must stay opaque to it.
     const castExpr: AST.CastExpr = { type: 'cast', expr: columnExpr, targetType: target.name };
     return { node: new CastNode(scope, castExpr, columnRef), alias: attr.name, attributeId: PlanNode.nextAttrId() };
   });

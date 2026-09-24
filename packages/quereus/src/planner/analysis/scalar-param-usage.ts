@@ -45,6 +45,16 @@ function paramOperand(node: ScalarPlanNode): ParameterReferenceNode | undefined 
  * disable the guard on exactly the binding it exists to reject. A user-written
  * `cast(col as json) = :p` is a deliberate JSON-vs-JSON comparison and stays
  * opaque — hence synthetic-only.
+ *
+ * NOTE: unwrapping leaves the guard's "could never match" premise slightly
+ * pessimistic for a TEXT counterpart. `textcol = :p` with an array-bound `:p`
+ * builds as `cast(textcol as json) = :p` on a type-inferring path, so a row whose
+ * text *is* JSON source for that array would have matched. It is rejected anyway,
+ * so the two entry points agree — `db.eval` plans the parameter as ANY, mints no
+ * coercion, and there the comparison really can never match. `cast(col as json) =
+ * :p` is the spelling that opts into the JSON comparison on both (see
+ * docs/types-parameters.md). Revisit only if the typed and untyped paths stop
+ * needing to agree on this.
  */
 function unwrapSyntheticCasts(node: ScalarPlanNode): ScalarPlanNode {
 	let cur = node;
