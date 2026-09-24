@@ -1,6 +1,8 @@
 import { expect } from 'chai';
 import * as fc from 'fast-check';
+import { Temporal } from 'temporal-polyfill';
 import {
+	hasCalendarUnits,
 	isTemporalKind,
 	runTemporalCase,
 	temporalKindOfType,
@@ -90,25 +92,62 @@ describe('temporal operation table', () => {
 		});
 	});
 
-	// The difference is exactly the gap, so adding it back to the subtrahend must land on the
-	// minuend. Any edit to the table that drops part of the gap (the time of day was once
-	// discarded) breaks this for some pair. Deliberately DATETIME-only: `date + timespan`
-	// truncates a sub-day part, so a DATE subtrahend cannot round-trip.
-	describe('datetime difference round-trip', () => {
+	/**
+	 * The four `-` cases over DATE/DATETIME, pinned as properties rather than points.
+	 *
+	 * The round-trip pins `datetime|datetime` exactly; the midnight equivalence carries that
+	 * strength across to the two mixed arms, which cannot round-trip themselves (`date +
+	 * timespan` truncates a sub-day part, so a DATE subtrahend never lands back on a DATETIME).
+	 */
+	describe('date/datetime difference', () => {
 		const MIN_MS = Date.UTC(2000, 0, 1);
 		const MAX_MS = Date.UTC(2049, 11, 31, 23, 59, 59, 999);
 		const datetimeArb = fc.integer({ min: MIN_MS, max: MAX_MS })
 			.map(ms => new Date(ms).toISOString().slice(0, -1));
+		const dateArb = datetimeArb.map(dtm => dtm.slice(0, 10));
 
+		const difference = (lk: 'date' | 'datetime', rk: 'date' | 'datetime') => temporalOpCase('-', lk, rk)!;
+
+		// The difference is exactly the gap, so adding it back to the subtrahend must land on the
+		// minuend. Any edit to the table that drops part of the gap (the time of day was once
+		// discarded) breaks this for some pair.
 		it('b + (a - b) equals a for any two datetimes', () => {
-			const difference = temporalOpCase('-', 'datetime', 'datetime')!;
 			const shift = temporalOpCase('+', 'datetime', 'timespan')!;
 			fc.assert(fc.property(datetimeArb, datetimeArb, (a, b) => {
-				const gap = runTemporalCase(difference, a, b);
+				const gap = runTemporalCase(difference('datetime', 'datetime'), a, b);
 				const restored = runTemporalCase(shift, b, gap) as string;
 				// Compared as instants: the table renders a whole second without a fraction.
 				expect(Date.parse(`${restored}Z`), `${b} + (${a} - ${b}) = ${restored}`).to.equal(Date.parse(`${a}Z`));
 			}), { numRuns: 500 });
+		});
+
+		// What `docs/types.md` promises about the mixed arms: a DATE operand is that date at
+		// midnight and nothing else — no rounding of the DATETIME side back to whole days.
+		it('a DATE operand reads as exactly that date at midnight, on either side', () => {
+			fc.assert(fc.property(dateArb, datetimeArb, (d, dtm) => {
+				const midnight = `${d}T00:00:00`;
+				expect(runTemporalCase(difference('date', 'datetime'), d, dtm), `${d} - ${dtm}`)
+					.to.equal(runTemporalCase(difference('datetime', 'datetime'), midnight, dtm));
+				expect(runTemporalCase(difference('datetime', 'date'), dtm, d), `${dtm} - ${d}`)
+					.to.equal(runTemporalCase(difference('datetime', 'datetime'), dtm, midnight));
+			}), { numRuns: 200 });
+		});
+
+		// Load-bearing, not cosmetic: `TIMESPAN / TIMESPAN` returns NULL and `TIMESPAN / number`
+		// truncates once a duration carries calendar units, so a difference that ever reported
+		// years or months would silently break division on gaps longer than a year.
+		it('never carries years, months or weeks, however far apart the operands are', () => {
+			const kinds: Array<['date' | 'datetime', 'date' | 'datetime']> = [
+				['date', 'date'], ['date', 'datetime'], ['datetime', 'date'], ['datetime', 'datetime'],
+			];
+			fc.assert(fc.property(datetimeArb, datetimeArb, (a, b) => {
+				for (const [lk, rk] of kinds) {
+					const left = lk === 'date' ? a.slice(0, 10) : a;
+					const right = rk === 'date' ? b.slice(0, 10) : b;
+					const gap = runTemporalCase(difference(lk, rk), left, right) as string;
+					expect(hasCalendarUnits(Temporal.Duration.from(gap)), `${left} - ${right} = ${gap}`).to.equal(false);
+				}
+			}), { numRuns: 200 });
 		});
 	});
 

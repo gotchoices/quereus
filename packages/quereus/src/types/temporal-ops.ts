@@ -203,7 +203,14 @@ function asPlainDateTime(v: SqlValue, kind: 'date' | 'datetime'): Temporal.Plain
  *
  * Both sides are taken at datetime resolution, so `DATE - DATE` (both midnight) gives the same
  * whole-day answer as a date-level difference would. The largest unit stays `day`
- * (`PlainDateTime.since`'s default), so the result never carries years, months or weeks.
+ * (`PlainDateTime.since`'s default), so the result never carries years, months or weeks —
+ * load-bearing, not cosmetic: {@link timespanRatio} and {@link divideTimespanByNumber} both
+ * degrade on calendar units, so a years-or-months result would make `(a - b) / (c - d)` NULL.
+ *
+ * NOTE: `PlainDateTime` is wall-clock, so this is elapsed wall-clock time rather than a
+ * difference of instants. DATETIME values are stored UTC-canonicalized
+ * (`parseDateTimeStringToUtcPlain`), so the two coincide today; if a zoned datetime type ever
+ * lands, this case has to subtract instants instead or it will misreport gaps across a DST shift.
  */
 function dateDifference(lk: 'date' | 'datetime', rk: 'date' | 'datetime'): TemporalOpCase {
 	return {

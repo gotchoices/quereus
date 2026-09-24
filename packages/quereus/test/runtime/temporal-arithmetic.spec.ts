@@ -166,6 +166,12 @@ describe('tryTemporalArithmetic', () => {
 		it('keeps a sub-second gap', () => {
 			expect(tryTemporalArithmetic('-', '2024-01-15T00:00:00.500', '2024-01-15T00:00:00')).to.equal('PT0.5S');
 		});
+		it('keeps a nanosecond gap (the finest resolution a DATETIME string carries)', () => {
+			expect(tryTemporalArithmetic('-', '2024-01-15T00:00:00.000000001', '2024-01-15T00:00:00')).to.equal('PT0.000000001S');
+		});
+		it('a gap over a year stays in days — no years, months or weeks', () => {
+			expect(tryTemporalArithmetic('-', '2025-03-01T10:00:00', '2024-01-15T08:00:00')).to.equal('P411DT2H');
+		});
 	});
 
 	// ---------------------------------------------------------------
