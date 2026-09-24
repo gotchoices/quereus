@@ -9,7 +9,7 @@ import { createTableToString, createViewToString, createMaterializedViewToString
 import type * as AST from '../parser/ast.js';
 import { type SqlValue, StatusCode } from '../common/types.js';
 import { QuereusError } from '../common/errors.js';
-import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL } from './ddl-generator.js';
+import { generateTableDDL, generateIndexDDL, generateMaintainedTableDDL, constraintToCanonicalDDL, indexToCanonicalDDL, schemaConstraintToTableConstraint } from './ddl-generator.js';
 import { applyViewSchemaDefault, applyAssertionSchemaDefault } from './schema-differ.js';
 import { ENGINE_MANAGED_TABLE_TAG } from './reserved-tags.js';
 
@@ -58,7 +58,20 @@ export interface CatalogTable {
 	 * separate (and out of `definition`) so a tag-only change takes `ALTER
 	 * CONSTRAINT … SET TAGS`, not a needless drop+recreate.
 	 */
-	namedConstraints: Array<{ name: string; tags?: Readonly<Record<string, SqlValue>>; definition: string }>;
+	namedConstraints: Array<{
+		name: string;
+		tags?: Readonly<Record<string, SqlValue>>;
+		definition: string;
+		/**
+		 * The full-fidelity lift of the live constraint (`schemaConstraintToTableConstraint`),
+		 * from which the migration planner renders the `ADD constraint …` that undoes a
+		 * `DROP CONSTRAINT`. Kept separate from `definition`, which is canonical and has
+		 * already dropped an FK's deferrability. Optional so hand-built catalogs without
+		 * it simply yield an irreversible undo for that step. A CHECK's `expr` is the live
+		 * schema AST — read-only to consumers, who clone before rewriting.
+		 */
+		bodyAst?: AST.TableConstraint;
+	}>;
 	/**
 	 * Present iff this is a **maintained table** (carries a `derivation` — what
 	 * `create materialized view` / `create table … maintained as` produces). A
@@ -81,6 +94,12 @@ export interface CatalogTable {
 		 * hash re-compare (see `CatalogView.select`). Read-only to consumers.
 		 */
 		select?: AST.QueryExpr;
+		/**
+		 * The recorded explicit output-column list (`derivation.columns`; absent for an
+		 * implicit body). Already folded into `bodyHash`; surfaced so the migration
+		 * planner can render the `set maintained [(cols)] as …` that undoes a detach.
+		 */
+		columns?: ReadonlyArray<string>;
 	};
 }
 
@@ -110,6 +129,14 @@ export interface CatalogView {
 	 * as read-only by every consumer — it is the live schema's AST, not a copy.
 	 */
 	select?: AST.QueryExpr;
+	/**
+	 * The explicit column list of `create view v (a, b) as …`, when one was given.
+	 * Already folded into `definition`; surfaced so the migration planner can render
+	 * the `create view` that undoes a `DROP VIEW` from `select` + this list (the
+	 * `ddl` text is not a reliable source: after a rename propagation `ViewSchema.sql`
+	 * holds only the rewritten body).
+	 */
+	columns?: ReadonlyArray<string>;
 }
 
 /** New field ⇒ new arm in `renderCatalogForComparison` (compiler-enforced; see {@link SchemaCatalog}). */
@@ -322,17 +349,17 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 	const namedConstraints: CatalogTable['namedConstraints'] = [];
 	for (const c of tableSchema.checkConstraints ?? []) {
 		if (c.name && !isAutoConstraintName(c.name)) {
-			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('check', c, tableSchema) });
+			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('check', c, tableSchema), bodyAst: schemaConstraintToTableConstraint('check', c, tableSchema) });
 		}
 	}
 	for (const c of tableSchema.uniqueConstraints ?? []) {
 		if (c.name && !isAutoConstraintName(c.name) && !c.derivedFromIndex) {
-			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('unique', c, tableSchema) });
+			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('unique', c, tableSchema), bodyAst: schemaConstraintToTableConstraint('unique', c, tableSchema) });
 		}
 	}
 	for (const c of tableSchema.foreignKeys ?? []) {
 		if (c.name && !isAutoConstraintName(c.name)) {
-			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('foreignKey', c, tableSchema) });
+			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('foreignKey', c, tableSchema), bodyAst: schemaConstraintToTableConstraint('foreignKey', c, tableSchema) });
 		}
 	}
 
@@ -362,6 +389,7 @@ function maintainedDescriptor(table: MaintainedTableSchema): NonNullable<Catalog
 		backingModuleName: backing.storedModuleName,
 		backingModuleArgs: backing.storedModuleArgs,
 		select: table.derivation.selectAst,
+		columns: table.derivation.columns,
 	};
 }
 
@@ -372,6 +400,7 @@ function viewSchemaToCatalog(viewSchema: ViewSchema): CatalogView {
 		definition: viewDefinitionToCanonicalString(viewSchema.columns, viewSchema.selectAst),
 		tags: viewSchema.tags,
 		select: viewSchema.selectAst,
+		columns: viewSchema.columns,
 	};
 }
 

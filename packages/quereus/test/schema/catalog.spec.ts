@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { collectSchemaCatalog, generateDeclaredDDL } from '../../src/schema/catalog.js';
+import type { CatalogTable } from '../../src/schema/catalog.js';
 import { computeSchemaHash, computeShortSchemaHash } from '../../src/schema/schema-hasher.js';
 import { parse } from '../../src/parser/index.js';
 import type * as AST from '../../src/parser/ast.js';
@@ -352,7 +353,11 @@ describe('Schema Catalog', () => {
 			// (2) Full drop+recreate: the rebuilt schema's canonical constraint set must
 			// match the original. namedConstraints' `definition` is the canonical body
 			// (columns + FK actions + CHECK expr), so equality proves semantic fidelity.
-			const beforeNamed = [...entry.namedConstraints].sort((a, b) => a.name.localeCompare(b.name));
+			// `bodyAst` is projected out: it carries the source positions of whichever
+			// text it was parsed from, which differ between the original statement and
+			// the re-parsed DDL without meaning anything.
+			const withoutBodyAst = (c: CatalogTable['namedConstraints'][number]) => { const { bodyAst: _bodyAst, ...rest } = c; return rest; };
+			const beforeNamed = entry.namedConstraints.map(withoutBodyAst).sort((a, b) => a.name.localeCompare(b.name));
 			await db.exec('DROP TABLE rt_cons');
 			await db.exec(entry.ddl);
 
@@ -364,7 +369,7 @@ describe('Schema Catalog', () => {
 			expect((after.checkConstraints ?? []).map(c => c.name).sort()).to.deep.equal(['_check_status', 'chk_qty']);
 
 			const afterEntry = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'rt_cons')!;
-			const afterNamed = [...afterEntry.namedConstraints].sort((a, b) => a.name.localeCompare(b.name));
+			const afterNamed = afterEntry.namedConstraints.map(withoutBodyAst).sort((a, b) => a.name.localeCompare(b.name));
 			expect(afterNamed).to.deep.equal(beforeNamed);
 		});
 

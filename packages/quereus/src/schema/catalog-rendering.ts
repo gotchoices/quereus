@@ -107,7 +107,10 @@ function renderColumn(c: CatalogTable['columns'][number]): string {
 }
 
 function renderNamedConstraint(c: CatalogTable['namedConstraints'][number]): string {
-	const { name, tags, definition, ...rest } = c;
+	// `bodyAst` omitted: it is the lift `definition` was rendered from (plus the
+	// deferrability `definition` drops, which is not a differ channel), so the
+	// canonical string already decides equality.
+	const { name, tags, definition, bodyAst: _bodyAst, ...rest } = c;
 	assertEveryFieldConsidered(rest);
 	return `constraint ${name} ${definition} tags ${renderTags(tags)}`;
 }
@@ -119,15 +122,17 @@ function renderMaintained(m: NonNullable<CatalogTable['maintained']>): string {
 	// compare). This rendering only ever fires the fast path when every hash
 	// matches, so the AST-tolerant path is unreachable and the hash fully
 	// determines the outcome.
-	const { bodyHash, backingModuleName, backingModuleArgs, select: _select, ...rest } = m;
+	// `columns` omitted: it is folded into `bodyHash` (see `CatalogTable.maintained`).
+	const { bodyHash, backingModuleName, backingModuleArgs, select: _select, columns: _columns, ...rest } = m;
 	assertEveryFieldConsidered(rest);
 	return `body ${bodyHash} module ${backingModuleName ?? '-'} args ${renderTags(backingModuleArgs)}`;
 }
 
 function renderView(v: CatalogView): string {
 	// `select` omitted for the same reason as `CatalogTable.maintained.select`:
-	// the differ consults it only when `definition` already differs.
-	const { name, ddl, definition, tags, select: _select, ...rest } = v;
+	// the differ consults it only when `definition` already differs. `columns` is
+	// folded into `definition`.
+	const { name, ddl, definition, tags, select: _select, columns: _columns, ...rest } = v;
 	assertEveryFieldConsidered(rest);
 	return `view ${name}\n\tddl ${ddl}\n\tdef ${definition}\n\ttags ${renderTags(tags)}`;
 }

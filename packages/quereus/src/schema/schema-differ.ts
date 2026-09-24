@@ -9,7 +9,8 @@ import { createLogger } from '../common/logger.js';
 import { validateReservedTags, type TagDiagnostic } from './reserved-tags.js';
 import { raiseReservedTagDiagnostics } from './reserved-tags-policy.js';
 import { renameColumnInAst, renameColumnInCheckExpression, renameTableInAst, tableReferencedInAst, objectRefKey, singleSchemaObjectRefResolver } from './rename-rewriter.js';
-import type { ResolveColumnInSource } from './rename-rewriter.js';
+import type { ResolveColumnInSource, ResolveObjectRef, TableRenameOpts } from './rename-rewriter.js';
+import { Parser } from '../parser/parser.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
 import { inferType } from '../types/registry.js';
@@ -51,10 +52,43 @@ export interface MigrationCreate {
  * and the text an error names. `ast` is present when the step was built from a
  * statement AST rather than a template string; the apply path executes it directly
  * and falls back to parsing `sql` when it is absent.
+ *
+ * `undo` / `irreversible` are present only when {@link generateMigrationPlan} was
+ * given the pre-apply catalog. They let an executor unwind a partially applied
+ * plan: run the steps that succeeded in reverse, executing each step's `undo`.
+ * Two rules make an undo correct, and every arm of the planner honours both:
+ *
+ * 1. **Spell the target the way the forward step spelled it.** The unwind runs in
+ *    reverse, so when step K's undo runs every step after K has already been taken
+ *    back and the catalog is in the state K left it in. Table renames are the plan's
+ *    first steps, so a later `ALTER TABLE t …` step — and its undo — name the
+ *    post-rename table.
+ * 2. **Forward-apply the renames in force to anything taken from the pre-apply
+ *    catalog.** A restored constraint / view / assertion / derivation body, a column
+ *    default or the old primary key is spelled with pre-rename names in the catalog;
+ *    by rule 1 the renames that precede the step are still in force when its undo
+ *    runs, so they are applied forward to the body before it is emitted (through the
+ *    rewriters the live rename propagation uses, so the two cannot drift).
  */
 export interface MigrationStep {
 	readonly sql: string;
 	readonly ast?: AST.Statement;
+	/**
+	 * DDL that puts the catalog back the way it was before this step ran, in the
+	 * order it must be executed. An empty array means the step changed nothing to
+	 * undo (an `IF EXISTS` drop whose target was already absent). Absent means undo
+	 * was not requested — no pre-apply catalog was passed.
+	 */
+	readonly undo?: readonly string[];
+	/**
+	 * Set instead of `undo` when the step destroys something no DDL can put back —
+	 * `DROP TABLE`, `DROP COLUMN` and `ALTER COLUMN … SET DATA TYPE` discard stored
+	 * values, and restoring the catalog entry without them would be worse than a
+	 * partial apply. Also set when the pre-apply catalog lacks what the restore
+	 * needs. The string is the human-readable reason, used verbatim in the
+	 * executor's diagnostic.
+	 */
+	readonly irreversible?: string;
 }
 
 /**
@@ -2876,10 +2910,14 @@ function orderDropsByFKDependency(
  * AFTER the retype instead — the new type is the one declaring support for it, and
  * setting it on the old type could be rejected (`DATE` → `TEXT COLLATE NOCASE`).
  */
-function comparisonDomainAlters(quotedTable: string, quotedCol: string, change: ColumnAttributeChange): string[] {
+function comparisonDomainAlters(
+	quotedTable: string,
+	quotedCol: string,
+	change: ColumnAttributeChange,
+): Array<{ sql: string; attribute: 'dataType' | 'collation' }> {
 	const prefix = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol}`;
-	const retype = change.dataType !== undefined ? [`${prefix} SET DATA TYPE ${change.dataType}`] : [];
-	const recollate = change.collation !== undefined ? [`${prefix} SET COLLATE ${change.collation}`] : [];
+	const retype = change.dataType !== undefined ? [{ sql: `${prefix} SET DATA TYPE ${change.dataType}`, attribute: 'dataType' as const }] : [];
+	const recollate = change.collation !== undefined ? [{ sql: `${prefix} SET COLLATE ${change.collation}`, attribute: 'collation' as const }] : [];
 	return normalizeCollationName(change.collation ?? 'BINARY') === 'BINARY'
 		? [...recollate, ...retype]
 		: [...retype, ...recollate];
@@ -2905,12 +2943,30 @@ export function generateMigrationDDL(diff: SchemaDiff, schemaName?: string): str
  * them without re-lexing the text this function just produced. The remaining steps
  * are short template-built strings (renames, drops, column/constraint alters,
  * `SET TAGS`) and stay text-only.
+ *
+ * With `actual` — the pre-apply catalog `computeSchemaDiff` was handed — every step
+ * also carries its reversal (`undo` / `irreversible`, see {@link MigrationStep}),
+ * rendered by {@link UndoRenderer} at the step's own push site so a forward
+ * statement and its undo read together. Without it nothing about the undo is
+ * computed: `generateMigrationDDL` never passes a catalog, so `diff schema` output
+ * and cost are untouched.
  */
-export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): MigrationStep[] {
+export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, actual?: SchemaCatalog): MigrationStep[] {
 	const statements: MigrationStep[] = [];
 	const schemaPrefix = (schemaName && schemaName !== 'main') ? `${quoteIdentifier(schemaName)}.` : '';
-	/** Appends a template-built step — text-only, so the apply path parses it as before. */
-	const pushText = (sql: string): void => { statements.push({ sql }); };
+	const undo = actual ? new UndoRenderer(schemaName ?? 'main', schemaPrefix, actual) : undefined;
+	/**
+	 * Appends a template-built step — text-only, so the apply path parses it as
+	 * before. `undoOf` runs only when undo was requested, and renders the reversal
+	 * for the catalog state THIS step runs in (Rule 1 of {@link MigrationStep.undo}).
+	 */
+	const pushText = (sql: string, undoOf: (u: UndoRenderer) => StepUndo): void => {
+		statements.push(undo ? { sql, ...undoOf(undo) } : { sql });
+	};
+	/** Appends a create bucket; each create undoes to the `DROP … IF EXISTS` of what it made. */
+	const pushCreates = (bucket: readonly MigrationCreate[], kind: CreatedObjectKind): void => {
+		for (const create of bucket) statements.push(undo ? { ...create, ...undo.dropCreated(create, kind) } : create);
+	};
 
 	// Renames first — they free old names for subsequent creates and re-target
 	// dependents (handled inside ALTER TABLE ... RENAME by the rename rewriter).
@@ -2922,14 +2978,18 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 	// the table-alter channel (RENAME CONSTRAINT below).
 	for (const r of diff.renames) {
 		if (r.kind === 'table') {
-			pushText(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(r.oldName)} RENAME TO ${quoteIdentifier(r.newName)}`);
+			pushText(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(r.oldName)} RENAME TO ${quoteIdentifier(r.newName)}`,
+				() => ({ undo: [`ALTER TABLE ${schemaPrefix}${quoteIdentifier(r.newName)} RENAME TO ${quoteIdentifier(r.oldName)}`] }));
 		}
 		// Non-table rename ops emit no DDL here — see the note above.
 	}
+	// Every later step runs — and is undone — with the table renames in force, so
+	// from here on the undo renderer reads the pre-apply catalog through them.
+	undo?.tableRenamesLanded(diff.renames);
 
 	// Drop assertions first (they may reference tables)
 	for (const name of diff.assertionsToDrop) {
-		pushText(`DROP ASSERTION IF EXISTS ${schemaPrefix}${quoteIdentifier(name)}`);
+		pushText(`DROP ASSERTION IF EXISTS ${schemaPrefix}${quoteIdentifier(name)}`, u => u.recreateAssertion(name));
 	}
 
 	// Detach maintained tables (`drop maintained`) EARLY — where MV drops ran
@@ -2939,29 +2999,29 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 	// flip's cross-table detach-v2 / attach-v1 pair falls out of this ordering.
 	for (const alter of diff.tablesToAlter) {
 		if (alter.dropMaintained) {
-			pushText(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`);
+			pushText(`ALTER TABLE ${schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`, u => u.reattachAsBefore(alter.tableName));
 		}
 	}
 
 	// Drop items (reverse order)
 	for (const tableName of diff.tablesToDrop) {
-		pushText(`DROP TABLE IF EXISTS ${schemaPrefix}${quoteIdentifier(tableName)}`);
+		pushText(`DROP TABLE IF EXISTS ${schemaPrefix}${quoteIdentifier(tableName)}`, u => u.droppedTable(tableName));
 	}
 
 	for (const viewName of diff.viewsToDrop) {
-		pushText(`DROP VIEW IF EXISTS ${schemaPrefix}${quoteIdentifier(viewName)}`);
+		pushText(`DROP VIEW IF EXISTS ${schemaPrefix}${quoteIdentifier(viewName)}`, u => u.recreateView(viewName));
 	}
 
 	for (const indexName of diff.indexesToDrop) {
-		pushText(`DROP INDEX IF EXISTS ${schemaPrefix}${quoteIdentifier(indexName)}`);
+		pushText(`DROP INDEX IF EXISTS ${schemaPrefix}${quoteIdentifier(indexName)}`, u => u.recreateIndex(indexName));
 	}
 
 	// Create new items. A fresh maintained table rides `tablesToCreate` (rendered
 	// as the `create materialized view` sugar) and re-materializes as part of its
 	// create.
-	statements.push(...diff.tablesToCreate);
-	statements.push(...diff.viewsToCreate);
-	statements.push(...diff.indexesToCreate);
+	pushCreates(diff.tablesToCreate, 'table');
+	pushCreates(diff.viewsToCreate, 'view');
+	pushCreates(diff.indexesToCreate, 'index');
 	// Assertion creates do NOT go here — they run last, after the table alters and
 	// the maintained re-attaches. See the push at the end of this function.
 
@@ -2982,45 +3042,58 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 	for (const alter of diff.tablesToAlter) {
 		const quotedTable = `${schemaPrefix}${quoteIdentifier(alter.tableName)}`;
 		for (const r of alter.columnsToRename) {
-			pushText(`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
+			pushText(`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`,
+				() => ({ undo: [`ALTER TABLE ${quotedTable} RENAME COLUMN ${quoteIdentifier(r.newName)} TO ${quoteIdentifier(r.oldName)}`] }));
+			undo?.columnRenameLanded(alter.tableName, r);
 		}
 		for (const colDef of alter.columnsToAdd) {
-			pushText(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`);
+			pushText(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`, u => u.dropAddedColumn(quotedTable, colDef));
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			const quotedCol = quoteIdentifier(colAlter.columnName);
+			const alterColumn = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol}`;
 			// A default the retype would choke on and this migration replaces anyway is
 			// cleared BEFORE the comparison-domain phase (see `dropStaleDefaultFirst`).
 			if (colAlter.dropStaleDefaultFirst) {
-				pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
+				pushText(`${alterColumn} DROP DEFAULT`, u => u.undoDropDefault(alter.tableName, colAlter.columnName, alterColumn));
 			}
 			// SET DATA TYPE / SET COLLATE lead the per-column phase (both are
 			// comparison-domain changes), before DEFAULT / NOT NULL.
-			for (const s of comparisonDomainAlters(quotedTable, quotedCol, colAlter)) pushText(s);
+			for (const s of comparisonDomainAlters(quotedTable, quotedCol, colAlter)) {
+				pushText(s.sql, u => s.attribute === 'dataType'
+					? u.retypedColumn(alter.tableName, colAlter.columnName)
+					: u.undoSetCollation(alter.tableName, colAlter.columnName, alterColumn));
+			}
 			if (colAlter.defaultValue !== undefined) {
 				if (colAlter.defaultValue === null) {
 					// Already dropped above when it preceded the retype.
 					if (!colAlter.dropStaleDefaultFirst) {
-						pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP DEFAULT`);
+						pushText(`${alterColumn} DROP DEFAULT`, u => u.undoDropDefault(alter.tableName, colAlter.columnName, alterColumn));
 					}
 				} else {
-					pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET DEFAULT ${expressionToString(colAlter.defaultValue)}`);
+					// After `dropStaleDefaultFirst` the column reaches this step with no
+					// default — the stale one was cleared earlier in this phase — so the
+					// reversal is a plain DROP DEFAULT, not the pre-apply default (Rule 1).
+					pushText(`${alterColumn} SET DEFAULT ${expressionToString(colAlter.defaultValue)}`, u => colAlter.dropStaleDefaultFirst
+						? { undo: [`${alterColumn} DROP DEFAULT`] }
+						: u.undoSetDefault(alter.tableName, colAlter.columnName, alterColumn));
 				}
 			}
 			if (colAlter.notNull !== undefined) {
-				pushText(colAlter.notNull
-					? `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} SET NOT NULL`
-					: `ALTER TABLE ${quotedTable} ALTER COLUMN ${quotedCol} DROP NOT NULL`);
+				pushText(colAlter.notNull ? `${alterColumn} SET NOT NULL` : `${alterColumn} DROP NOT NULL`,
+					() => ({ undo: [colAlter.notNull ? `${alterColumn} DROP NOT NULL` : `${alterColumn} SET NOT NULL`] }));
 			}
 		}
 		// Constraint lifecycle: RENAME (free a name) then DROP (remove a stale /
 		// conflicting constraint), both BEFORE re-adds and before the PK change so a
 		// dropped UNIQUE can't strand a PK dependency.
 		for (const r of alter.constraintsToRename ?? []) {
-			pushText(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`);
+			pushText(`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.oldName)} TO ${quoteIdentifier(r.newName)}`,
+				() => ({ undo: [`ALTER TABLE ${quotedTable} RENAME CONSTRAINT ${quoteIdentifier(r.newName)} TO ${quoteIdentifier(r.oldName)}`] }));
+			undo?.constraintRenameLanded(alter.tableName, r);
 		}
 		for (const name of alter.constraintsToDrop ?? []) {
-			pushText(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`);
+			pushText(`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(name)}`, u => u.readdConstraint(alter.tableName, name, quotedTable));
 		}
 		if (alter.primaryKeyChange) {
 			const pkCols = alter.primaryKeyChange.newPkColumns
@@ -3030,16 +3103,16 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 					return s;
 				})
 				.join(', ');
-			pushText(`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${pkCols})`);
+			pushText(`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${pkCols})`, u => u.restorePrimaryKey(alter.tableName, quotedTable));
 		}
 		// ADD CONSTRAINT after the PK change (a new UNIQUE / FK may align with the new
 		// key) and after the column adds it may reference. CHECK adds apply in-place;
 		// UNIQUE / FK adds depend on module ADD CONSTRAINT support (see constraintsToAdd).
 		for (const frag of alter.constraintsToAdd ?? []) {
-			pushText(`ALTER TABLE ${quotedTable} ADD ${frag}`);
+			pushText(`ALTER TABLE ${quotedTable} ADD ${frag}`, u => u.dropAddedConstraint(quotedTable, frag));
 		}
 		for (const colName of alter.columnsToDrop) {
-			pushText(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`);
+			pushText(`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(colName)}`, u => u.droppedColumn(alter.tableName, colName));
 		}
 		// Tags phase — last, so a SET TAGS lands on the post-structural column /
 		// constraint set (a tag set emitted alongside a RENAME COLUMN targets the
@@ -3050,14 +3123,16 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 			// TABLE handler rejects a tag action on a maintained table). See
 			// `TableAlterDiff.maintainedTags`.
 			const tagVerb = alter.maintainedTags ? 'ALTER MATERIALIZED VIEW' : 'ALTER TABLE';
-			pushText(`${tagVerb} ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`);
+			pushText(`${tagVerb} ${quotedTable} SET TAGS ${tagsBodyToString(alter.tableTagsChange)}`, u => u.restoreTableTags(alter.tableName, `${tagVerb} ${quotedTable}`));
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			if (colAlter.tags === undefined) continue;
-			pushText(`ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(colAlter.columnName)} SET TAGS ${tagsBodyToString(colAlter.tags)}`);
+			const alterColumn = `ALTER TABLE ${quotedTable} ALTER COLUMN ${quoteIdentifier(colAlter.columnName)}`;
+			pushText(`${alterColumn} SET TAGS ${tagsBodyToString(colAlter.tags)}`, u => u.restoreColumnTags(alter.tableName, colAlter.columnName, alterColumn));
 		}
 		for (const ctc of alter.constraintTagsChanges ?? []) {
-			pushText(`ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)} SET TAGS ${tagsBodyToString(ctc.tags)}`);
+			const alterConstraint = `ALTER TABLE ${quotedTable} ALTER CONSTRAINT ${quoteIdentifier(ctc.constraintName)}`;
+			pushText(`${alterConstraint} SET TAGS ${tagsBodyToString(ctc.tags)}`, u => u.restoreConstraintTags(alter.tableName, ctc.constraintName, alterConstraint));
 		}
 	}
 
@@ -3085,7 +3160,8 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 				select: alter.setMaintained.select,
 			},
 		};
-		statements.push({ sql: astToString(stmt), ast: stmt });
+		const step: MigrationStep = { sql: astToString(stmt), ast: stmt };
+		statements.push(undo ? { ...step, ...undo.undoSetMaintained(alter, schemaPrefix) } : step);
 	}
 
 	// Assertion creates LAST — after every table alter and maintained re-attach, so
@@ -3095,7 +3171,7 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 	// create ran in the create block, before `ADD COLUMN`. Nothing in a migration
 	// depends on an assertion existing, so last is strictly safer. Assertion DROPs
 	// stay first (see the top of this function).
-	statements.push(...diff.assertionsToCreate);
+	pushCreates(diff.assertionsToCreate, 'assertion');
 
 	// In-place tag changes on views / indexes. These are leaf metadata writes (no
 	// dependency ordering vs the table-alter block). The `?? []` keeps
@@ -3104,13 +3180,471 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string): Mi
 	// table's tag-only change rides the table-alter block above (`SET TAGS`), not a
 	// separate bucket.
 	for (const vtc of diff.viewTagsChanges ?? []) {
-		pushText(`ALTER VIEW ${schemaPrefix}${quoteIdentifier(vtc.name)} SET TAGS ${tagsBodyToString(vtc.tags)}`);
+		const alterView = `ALTER VIEW ${schemaPrefix}${quoteIdentifier(vtc.name)}`;
+		pushText(`${alterView} SET TAGS ${tagsBodyToString(vtc.tags)}`, u => u.restoreViewTags(vtc.name, alterView));
 	}
 	for (const itc of diff.indexTagsChanges ?? []) {
-		pushText(`ALTER INDEX ${schemaPrefix}${quoteIdentifier(itc.name)} SET TAGS ${tagsBodyToString(itc.tags)}`);
+		const alterIndex = `ALTER INDEX ${schemaPrefix}${quoteIdentifier(itc.name)}`;
+		pushText(`${alterIndex} SET TAGS ${tagsBodyToString(itc.tags)}`, u => u.restoreIndexTags(itc.name, alterIndex));
 	}
 
 	return statements;
 }
 
+/** The reversal half of a {@link MigrationStep}: the statements that undo it, or why none can. */
+type StepUndo = { readonly undo: readonly string[] } | { readonly irreversible: string };
 
+/** A step that changed nothing, so nothing has to be put back. */
+const NOTHING_TO_UNDO: StepUndo = { undo: [] };
+
+/** What a create-bucket step makes; its undo names the matching `DROP`. */
+type CreatedObjectKind = 'table' | 'view' | 'index' | 'assertion';
+
+/** Case-insensitive identifier equality — how the catalog and the rename walkers compare names. */
+const sameName = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
+/** A rename of something inside a table, remembered with the table's CURRENT (post-table-rename) spelling. */
+interface InTableRename extends ColumnRenameOp {
+	table: string;
+}
+
+/**
+ * Renders each migration step's undo from the pre-apply catalog. The two rules
+ * {@link MigrationStep.undo} states are what every arm below honours:
+ *
+ * **Rule 1 — spell the target the way the forward step did.** The unwind runs in
+ * reverse, so when a step's undo runs every later step has already been taken back
+ * and the catalog is in the state the step itself left behind. The plan is pushed in
+ * execution order and this renderer is told about each rename as its step lands
+ * (`tableRenamesLanded`, `columnRenameLanded`, `constraintRenameLanded`), so every
+ * catalog lookup goes through exactly the renames in force at that step — a later
+ * `ALTER TABLE t …` step's undo names the post-rename `t`, and finds the pre-apply
+ * table under its old name.
+ *
+ * **Rule 2 — forward-apply the renames in force to anything taken from the catalog.**
+ * A restored constraint / view / assertion / derivation body, a column default and
+ * the old primary key are spelled with pre-rename names in the catalog; by Rule 1
+ * those renames are still in force when the undo runs, so {@link replayRenames}
+ * applies them forward — through the same `renameTableInAst` /
+ * `renameColumnInAst` / `renameColumnInCheckExpression` walkers the live rename
+ * propagation uses — before the body is emitted. This is the differ's
+ * rename-reconciled comparison (`reconciledDeclaredBody`) pointed the other way.
+ * Only renames whose steps PRECEDE this one count: a view dropped before the
+ * column-rename phase is restored with the old column names, because by the time
+ * its undo runs the column rename has already been reversed.
+ *
+ * Two policies keep the plan generator total over hand-built inputs:
+ *   - a target the pre-apply catalog does not mention undoes to nothing — the
+ *     forward step either is a no-op (`IF EXISTS`) or fails before changing anything;
+ *   - a catalog entry that lacks what its restore needs (no body AST, DDL that does
+ *     not parse) is reported as `irreversible` with the reason, never thrown.
+ *
+ * NOTE: the undo is rendered eagerly for every step at plan time, so once the apply
+ * path passes its catalog every apply pays it; the only non-trivial per-step cost is
+ * one small parse on the fragment arms (dropped index, added column / constraint).
+ * If plan generation ever shows up in profiles, render lazily on the failure path.
+ */
+class UndoRenderer {
+	private readonly tables = new Map<string, CatalogTable>();
+	private readonly views = new Map<string, CatalogView>();
+	private readonly indexes = new Map<string, CatalogIndex>();
+	private readonly assertions = new Map<string, CatalogAssertion>();
+	private readonly resolveRef: ResolveObjectRef;
+	private tableRenames: ReadonlyArray<RenameOp> = [];
+	private readonly columnRenames: InTableRename[] = [];
+	private readonly constraintRenames: InTableRename[] = [];
+	/** How many of `columnRenames` the current body replay has applied so far — see `resolveColumnNow`. */
+	private replayed = 0;
+
+	constructor(
+		private readonly schemaName: string,
+		private readonly schemaPrefix: string,
+		actual: SchemaCatalog,
+	) {
+		for (const t of actual.tables ?? []) this.tables.set(t.name.toLowerCase(), t);
+		for (const v of actual.views ?? []) this.views.set(v.name.toLowerCase(), v);
+		// NOTE: an index name is unique per table, not per schema, and the plan's
+		// `DROP INDEX` names it bare — so the first entry wins here, as it does there.
+		// If `indexesToDrop` ever carries the owning table, key this map by both.
+		for (const i of actual.indexes ?? []) if (!this.indexes.has(i.name.toLowerCase())) this.indexes.set(i.name.toLowerCase(), i);
+		for (const a of actual.assertions ?? []) this.assertions.set(a.name.toLowerCase(), a);
+		this.resolveRef = singleSchemaObjectRefResolver(schemaName);
+	}
+
+	// --- Rename bookkeeping (Rule 1) ---
+
+	tableRenamesLanded(renames: ReadonlyArray<RenameOp>): void {
+		this.tableRenames = renames.filter(r => r.kind === 'table');
+	}
+
+	columnRenameLanded(table: string, r: ColumnRenameOp): void {
+		this.columnRenames.push({ table, oldName: r.oldName, newName: r.newName });
+	}
+
+	constraintRenameLanded(table: string, r: ColumnRenameOp): void {
+		this.constraintRenames.push({ table, oldName: r.oldName, newName: r.newName });
+	}
+
+	// --- Arms ---
+
+	dropCreated(create: MigrationCreate, kind: CreatedObjectKind): StepUndo {
+		const name = createdObjectName(create.ast, kind);
+		if (name === undefined) return this.cannotUndo(create.sql, `its statement is not a create ${kind}`);
+		const verb = { table: 'DROP TABLE', view: 'DROP VIEW', index: 'DROP INDEX', assertion: 'DROP ASSERTION' }[kind];
+		return { undo: [`${verb} IF EXISTS ${this.schemaPrefix}${quoteIdentifier(name)}`] };
+	}
+
+	droppedTable(actualName: string): StepUndo {
+		if (!this.tables.has(actualName.toLowerCase())) return NOTHING_TO_UNDO;
+		return { irreversible: `dropping table "${actualName}" also discards its rows, and no statement can bring them back` };
+	}
+
+	droppedColumn(table: string, column: string): StepUndo {
+		if (!this.columnNow(table, column)) return NOTHING_TO_UNDO;
+		return { irreversible: `dropping column "${column}" from table "${table}" discards the values stored in it, and no statement can bring them back` };
+	}
+
+	retypedColumn(table: string, column: string): StepUndo {
+		if (!this.columnNow(table, column)) return NOTHING_TO_UNDO;
+		return { irreversible: `changing the type of column "${column}" in table "${table}" converts the values stored in it, and a conversion can lose information that no statement can bring back` };
+	}
+
+	recreateAssertion(name: string): StepUndo {
+		const assertion = this.assertions.get(name.toLowerCase());
+		if (!assertion) return NOTHING_TO_UNDO;
+		if (!assertion.check) return this.cannotUndo(`DROP ASSERTION ${name}`, 'the pre-apply catalog carries no CHECK body for it');
+		const check = cloneExpr(assertion.check);
+		this.replayRenames(check, undefined, {});
+		const stmt: AST.CreateAssertionStmt = { type: 'createAssertion', name: { type: 'identifier', name: assertion.name }, check };
+		return { undo: [createAssertionToString(applyAssertionSchemaDefault(stmt, this.schemaName))] };
+	}
+
+	recreateView(name: string): StepUndo {
+		const view = this.views.get(name.toLowerCase());
+		if (!view) return NOTHING_TO_UNDO;
+		if (!view.select) return this.cannotUndo(`DROP VIEW ${name}`, 'the pre-apply catalog carries no body for it');
+		const select = cloneQueryExpr(view.select);
+		this.replayRenames(select, undefined, {});
+		const stmt: AST.CreateViewStmt = {
+			type: 'createView',
+			view: { type: 'identifier', name: view.name },
+			ifNotExists: false,
+			columns: view.columns ? [...view.columns] : undefined,
+			select,
+			tags: view.tags ? { ...view.tags } : undefined,
+		};
+		return { undo: [createViewToString(applyViewSchemaDefault(stmt, this.schemaName))] };
+	}
+
+	recreateIndex(name: string): StepUndo {
+		const index = this.indexes.get(name.toLowerCase());
+		if (!index) return NOTHING_TO_UNDO;
+		// The catalog carries no structured index shape, only `generateIndexDDL`'s
+		// text — re-parsed here with the real parser rather than sliced.
+		const parsed = parseStatement(index.ddl);
+		if (!parsed.ok) return this.cannotUndo(`DROP INDEX ${name}`, `its recorded DDL does not parse (${parsed.reason})`);
+		if (parsed.stmt.type !== 'createIndex') return this.cannotUndo(`DROP INDEX ${name}`, 'its recorded DDL is not a create index statement');
+		const recreate: AST.CreateIndexStmt = {
+			...parsed.stmt,
+			ifNotExists: false,
+			index: { type: 'identifier', name: index.name },
+			table: { type: 'identifier', name: this.tableNameNow(index.tableName) },
+		};
+		if (recreate.where) this.replayRenames(recreate.where, undefined, { schemaAuthoredBody: true });
+		return { undo: [createIndexToString(applyIndexDefaults(recreate, this.schemaName))] };
+	}
+
+	/** Undo of `DROP MAINTAINED`: the derivation the table carried before the apply. */
+	reattachAsBefore(table: string): StepUndo {
+		const actual = this.tableNow(table);
+		if (!actual?.maintained) return NOTHING_TO_UNDO;
+		return this.setMaintainedFrom(actual, table);
+	}
+
+	/**
+	 * Undo of `SET MAINTAINED`. The table is plain at this step when it never was
+	 * maintained OR when this same plan detached it earlier (the reshape leg:
+	 * `drop maintained` → column ops → re-attach); either way the attach undoes to
+	 * a detach, and the earlier detach's own undo restores the original derivation.
+	 * A same-shape re-attach (no detach) replaced the derivation in place, so its
+	 * undo re-attaches the pre-apply one.
+	 */
+	undoSetMaintained(alter: TableAlterDiff, schemaPrefix: string): StepUndo {
+		const actual = this.tableNow(alter.tableName);
+		if (!actual) return NOTHING_TO_UNDO;
+		if (!actual.maintained || alter.dropMaintained) {
+			return { undo: [`ALTER TABLE ${schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`] };
+		}
+		return this.setMaintainedFrom(actual, alter.tableName);
+	}
+
+	readdConstraint(table: string, name: string, quotedTable: string): StepUndo {
+		// `constraintsToDrop` carries pre-apply names (a renamed constraint is never
+		// also dropped), so the lookup is direct rather than through the renames.
+		const constraint = this.tableNow(table)?.namedConstraints?.find(c => sameName(c.name, name));
+		if (!constraint) return NOTHING_TO_UNDO;
+		if (!constraint.bodyAst) return this.cannotUndo(`DROP CONSTRAINT ${name}`, 'the pre-apply catalog carries no body for it');
+		const body = this.forwardRenamedConstraint(constraint.bodyAst, table);
+		const fragment = tableConstraintsToString([{ ...body, name: constraint.name, tags: constraint.tags ? { ...constraint.tags } : undefined }]);
+		return { undo: [`ALTER TABLE ${quotedTable} ADD ${fragment}`] };
+	}
+
+	restorePrimaryKey(table: string, quotedTable: string): StepUndo {
+		const actual = this.tableNow(table);
+		if (!actual) return NOTHING_TO_UNDO;
+		if (actual.primaryKey.length === 0) return this.cannotUndo(`ALTER PRIMARY KEY on ${table}`, 'the pre-apply catalog records no primary key for it');
+		const cols = actual.primaryKey
+			.map(pk => quoteIdentifier(this.columnNameNow(table, pk.columnName)) + (pk.desc ? ' desc' : ''))
+			.join(', ');
+		return { undo: [`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${cols})`] };
+	}
+
+	dropAddedColumn(quotedTable: string, colDef: string): StepUndo {
+		const parsed = parseStatement(`alter table "x" add column ${colDef}`);
+		if (!parsed.ok) return this.cannotUndo(`ADD COLUMN ${colDef}`, `the column definition does not parse (${parsed.reason})`);
+		const action = parsed.stmt.type === 'alterTable' ? parsed.stmt.action : undefined;
+		if (action?.type !== 'addColumn') return this.cannotUndo(`ADD COLUMN ${colDef}`, 'the column definition does not parse as one');
+		return { undo: [`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(action.column.name)}`] };
+	}
+
+	dropAddedConstraint(quotedTable: string, fragment: string): StepUndo {
+		const parsed = parseStatement(`alter table "x" add ${fragment}`);
+		if (!parsed.ok) return this.cannotUndo(`ADD ${fragment}`, `the constraint fragment does not parse (${parsed.reason})`);
+		const action = parsed.stmt.type === 'alterTable' ? parsed.stmt.action : undefined;
+		if (action?.type !== 'addConstraint') return this.cannotUndo(`ADD ${fragment}`, 'the fragment does not parse as a constraint');
+		if (!action.constraint.name) return this.cannotUndo(`ADD ${fragment}`, 'the constraint has no name to drop it by');
+		return { undo: [`ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(action.constraint.name)}`] };
+	}
+
+	/** Undo of `DROP DEFAULT`: put the pre-apply default back, or nothing when there was none. */
+	undoDropDefault(table: string, column: string, alterColumn: string): StepUndo {
+		const prior = this.priorDefaultText(table, column);
+		return { undo: prior ? [`${alterColumn} SET DEFAULT ${prior}`] : [] };
+	}
+
+	/** Undo of `SET DEFAULT e`: the pre-apply default, or `DROP DEFAULT` when the column had none. */
+	undoSetDefault(table: string, column: string, alterColumn: string): StepUndo {
+		const prior = this.priorDefaultText(table, column);
+		if (prior === undefined) return NOTHING_TO_UNDO;
+		return { undo: [prior === null ? `${alterColumn} DROP DEFAULT` : `${alterColumn} SET DEFAULT ${prior}`] };
+	}
+
+	undoSetCollation(table: string, column: string, alterColumn: string): StepUndo {
+		const actual = this.columnNow(table, column);
+		if (!actual) return NOTHING_TO_UNDO;
+		return { undo: [`${alterColumn} SET COLLATE ${actual.collation || 'BINARY'}`] };
+	}
+
+	restoreTableTags(table: string, alterTable: string): StepUndo {
+		const actual = this.tableNow(table);
+		return actual ? restoreTags(alterTable, actual.tags) : NOTHING_TO_UNDO;
+	}
+
+	restoreColumnTags(table: string, column: string, alterColumn: string): StepUndo {
+		const actual = this.columnNow(table, column);
+		return actual ? restoreTags(alterColumn, actual.tags) : NOTHING_TO_UNDO;
+	}
+
+	restoreConstraintTags(table: string, constraint: string, alterConstraint: string): StepUndo {
+		const actual = this.constraintNow(table, constraint);
+		return actual ? restoreTags(alterConstraint, actual.tags) : NOTHING_TO_UNDO;
+	}
+
+	restoreViewTags(view: string, alterView: string): StepUndo {
+		const actual = this.views.get(view.toLowerCase());
+		return actual ? restoreTags(alterView, actual.tags) : NOTHING_TO_UNDO;
+	}
+
+	restoreIndexTags(index: string, alterIndex: string): StepUndo {
+		const actual = this.indexes.get(index.toLowerCase());
+		return actual ? restoreTags(alterIndex, actual.tags) : NOTHING_TO_UNDO;
+	}
+
+	// --- Catalog lookups through the renames in force (Rule 1) ---
+
+	/** The pre-apply table a CURRENT table name denotes. */
+	private tableNow(currentName: string): CatalogTable | undefined {
+		const renamed = this.tableRenames.find(r => sameName(r.newName, currentName));
+		return this.tables.get((renamed?.oldName ?? currentName).toLowerCase());
+	}
+
+	/** The current spelling of a pre-apply table name. */
+	private tableNameNow(actualName: string): string {
+		return this.tableRenames.find(r => sameName(r.oldName, actualName))?.newName ?? actualName;
+	}
+
+	/** The pre-apply column a CURRENT column name denotes (both names as spelled now). */
+	private columnNow(currentTable: string, currentColumn: string): CatalogTable['columns'][number] | undefined {
+		const table = this.tableNow(currentTable);
+		if (!table) return undefined;
+		const renamed = this.columnRenames.find(r => sameName(r.table, currentTable) && sameName(r.newName, currentColumn));
+		const actualName = renamed?.oldName ?? currentColumn;
+		return table.columns.find(c => sameName(c.name, actualName));
+	}
+
+	/** The current spelling of a pre-apply column name. */
+	private columnNameNow(currentTable: string, actualColumn: string): string {
+		return this.columnRenames.find(r => sameName(r.table, currentTable) && sameName(r.oldName, actualColumn))?.newName ?? actualColumn;
+	}
+
+	private constraintNow(currentTable: string, currentName: string): CatalogTable['namedConstraints'][number] | undefined {
+		const table = this.tableNow(currentTable);
+		if (!table) return undefined;
+		const renamed = this.constraintRenames.find(r => sameName(r.table, currentTable) && sameName(r.newName, currentName));
+		const actualName = renamed?.oldName ?? currentName;
+		return table.namedConstraints?.find(c => sameName(c.name, actualName));
+	}
+
+	// --- Catalog-sourced bodies with the renames in force applied forward (Rule 2) ---
+
+	private setMaintainedFrom(actual: CatalogTable, table: string): StepUndo {
+		const maintained = actual.maintained!;
+		if (!maintained.select) return this.cannotUndo(`the derivation of ${table}`, 'the pre-apply catalog carries no body for it');
+		const select = cloneQueryExpr(maintained.select);
+		this.replayRenames(select, undefined, {});
+		const stmt: AST.AlterTableStmt = {
+			type: 'alterTable',
+			table: this.schemaName !== 'main'
+				? { type: 'identifier', name: table, schema: this.schemaName }
+				: { type: 'identifier', name: table },
+			action: { type: 'setMaintained', columns: maintained.columns, select },
+		};
+		return { undo: [astToString(stmt)] };
+	}
+
+	/** The pre-apply DEFAULT of a column, rendered: `null` when it had none, `undefined` when the column is unknown. */
+	private priorDefaultText(table: string, column: string): string | null | undefined {
+		const actual = this.columnNow(table, column);
+		if (!actual) return undefined;
+		if (!actual.defaultValue) return null;
+		const expr = cloneExpr(actual.defaultValue);
+		this.replayRenames(expr, table, { rowImageContext: true, schemaAuthoredBody: true });
+		return expressionToString(expr);
+	}
+
+	/**
+	 * A clone of a pre-apply constraint body with the renames in force applied
+	 * forward — the inverse of `reconciledDeclaredBody`, arm for arm: a CHECK's
+	 * expression through the walkers (owning-table column renames seeded, other
+	 * tables' by scope); a UNIQUE's column list; an FK's local list, its parent's
+	 * column list under the parent's CURRENT name, then the parent name itself.
+	 */
+	private forwardRenamedConstraint(tc: AST.TableConstraint, owner: string): AST.TableConstraint {
+		switch (tc.type) {
+			case 'check': {
+				const clone: AST.TableConstraint = { ...tc, expr: tc.expr ? cloneExpr(tc.expr) : undefined };
+				if (clone.expr) this.replayRenames(clone.expr, owner, { rowImageContext: true, schemaAuthoredBody: true });
+				return clone;
+			}
+			case 'unique': {
+				const clone: AST.TableConstraint = { ...tc, columns: tc.columns?.map(c => ({ ...c })) };
+				this.forwardRenameColumnList(clone.columns, owner);
+				return clone;
+			}
+			case 'foreignKey': {
+				const clone: AST.TableConstraint = {
+					...tc,
+					columns: tc.columns?.map(c => ({ ...c })),
+					foreignKey: tc.foreignKey
+						? { ...tc.foreignKey, columns: tc.foreignKey.columns ? [...tc.foreignKey.columns] : undefined }
+						: tc.foreignKey,
+				};
+				this.forwardRenameColumnList(clone.columns, owner);
+				const fk = clone.foreignKey;
+				// Renames are within-schema, so a cross-schema parent is left alone.
+				if (fk && (!fk.schema || sameName(fk.schema, this.schemaName))) {
+					const parentNow = this.tableNameNow(fk.table);
+					if (fk.columns) {
+						for (let i = 0; i < fk.columns.length; i++) fk.columns[i] = this.columnNameNow(parentNow, fk.columns[i]);
+					}
+					fk.table = parentNow;
+				}
+				return clone;
+			}
+			default:
+				return tc;
+		}
+	}
+
+	private forwardRenameColumnList(columns: Array<{ name: string; direction?: 'asc' | 'desc' }> | undefined, table: string): void {
+		for (const col of columns ?? []) col.name = this.columnNameNow(table, col.name);
+	}
+
+	/**
+	 * Applies the renames in force to a body in place, in plan order: every table
+	 * rename first (they are the plan's first steps), then each column rename as its
+	 * step landed. Each call goes through the walker the live propagation uses for
+	 * that body kind: a body OWNED by a table (a CHECK, a column default — `owner`
+	 * set) takes the owning table's renames through the seeded CHECK walker in
+	 * `'own'` row-image mode and other tables' renames through the plain scope walk
+	 * in `'foreign'` mode; a free body (a view, assertion or derivation body, an
+	 * index predicate) takes every rename through the plain walk in `'none'` mode.
+	 * `tableOpts` is the body kind's `renameTableInAst` options, exactly as the
+	 * matching `renameTableIn*` helper passes them.
+	 */
+	private replayRenames(node: AST.AstNode, owner: string | undefined, tableOpts: TableRenameOpts): void {
+		for (const r of this.tableRenames) {
+			renameTableInAst(node, {
+				oldName: r.oldName, newName: r.newName, schemaName: this.schemaName,
+				resolve: this.resolveRef, resolveAfter: this.resolveRef,
+			}, tableOpts);
+		}
+		for (this.replayed = 0; this.replayed < this.columnRenames.length; this.replayed++) {
+			const r = this.columnRenames[this.replayed];
+			const targetKey = objectRefKey(this.schemaName, r.table);
+			if (owner !== undefined && sameName(r.table, owner)) {
+				renameColumnInCheckExpression(node, owner, r.oldName, r.newName, this.resolveRef, targetKey, 'own', this.resolveColumnNow);
+			} else {
+				renameColumnInAst(node, r.table, r.oldName, r.newName, this.resolveRef, targetKey, owner !== undefined ? 'foreign' : 'none', this.resolveColumnNow);
+			}
+		}
+	}
+
+	/**
+	 * Column-existence resolver for the scope-aware walks in {@link replayRenames}:
+	 * "does this FROM source expose this column?" answered against the pre-apply
+	 * catalog with the renames replayed SO FAR applied — the world the matching live
+	 * rename statement ran in. Cross-schema sources and views answer false, as the
+	 * differ's declared-side resolver does (conservative: worst case a ref that
+	 * would have bound to an inner source is rewritten too).
+	 */
+	private readonly resolveColumnNow: ResolveColumnInSource = (schema, table, column) => {
+		if (schema !== this.schemaName.toLowerCase()) return false;
+		const actual = this.tableNow(table);
+		if (!actual) return false;
+		const applied = this.columnRenames.slice(0, this.replayed).filter(r => sameName(r.table, table));
+		return actual.columns.some(c => sameName(applied.find(r => sameName(r.oldName, c.name))?.newName ?? c.name, column));
+	};
+
+	private cannotUndo(what: string, why: string): StepUndo {
+		warnLog(`No undo for migration step ${what}: ${why}`);
+		return { irreversible: `${what} cannot be undone: ${why}` };
+	}
+}
+
+/** `<prefix> SET TAGS (<pre-apply tags>)`; an absent or empty set restores "no tags" as the explicit clear form. */
+function restoreTags(prefix: string, tags: Readonly<Record<string, SqlValue>> | undefined): StepUndo {
+	return { undo: [`${prefix} SET TAGS ${tagsBodyToString(tags ? { ...tags } : undefined)}`] };
+}
+
+/** The name a create statement gives the object it makes, when it is a create of `kind`. */
+function createdObjectName(ast: AST.Statement | undefined, kind: CreatedObjectKind): string | undefined {
+	if (!ast) return undefined;
+	switch (ast.type) {
+		case 'createTable': return kind === 'table' ? ast.table.name : undefined;
+		case 'createMaterializedView': return kind === 'table' ? ast.view.name : undefined;
+		case 'createView': return kind === 'view' ? ast.view.name : undefined;
+		case 'createIndex': return kind === 'index' ? ast.index.name : undefined;
+		case 'createAssertion': return kind === 'assertion' ? ast.name.name : undefined;
+		default: return undefined;
+	}
+}
+
+/** A parse that reports failure as data: the undo renderer must stay total over hand-built input. */
+function parseStatement(sql: string): { ok: true; stmt: AST.Statement } | { ok: false; reason: string } {
+	try {
+		return { ok: true, stmt: new Parser().parse(sql) };
+	} catch (e) {
+		return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+	}
+}

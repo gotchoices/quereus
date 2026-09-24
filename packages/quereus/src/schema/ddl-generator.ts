@@ -369,8 +369,14 @@ export function constraintToCanonicalDDL(
  * and `canonicalForeignKeyClause` drops the deferrable clause), so carrying these
  * fields here does NOT change `constraintToCanonicalDDL` output — only the
  * persistence path benefits.
+ *
+ * Exported for the schema catalog (`CatalogTable.namedConstraints[].bodyAst`): the
+ * migration planner restores a dropped constraint from this lift, and needs the
+ * full-fidelity form — the canonical `definition` has already lost deferrability.
+ * A CHECK's `expr` is the LIVE schema AST, not a copy; consumers clone before
+ * rewriting it.
  */
-function schemaConstraintToTableConstraint(
+export function schemaConstraintToTableConstraint(
 	kind: NamedConstraintClass,
 	constraint: RowConstraintSchema | UniqueConstraintSchema | ForeignKeyConstraintSchema,
 	tableSchema: TableSchema,
