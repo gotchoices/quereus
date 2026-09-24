@@ -594,10 +594,19 @@ async function runBatchedMigrationLoop(
 ): Promise<void> {
 	const startedModules = await beginSchemaBatchAll(db, schemaName);
 	let failure: MigrationFailure | undefined;
+	// `runStepsWithUndoJournal` reports every step and undo failure as data, so `loopError`
+	// is normally `failure?.error`. The catch is for a throw it did not anticipate: the
+	// batch must still end with SOME error, or a module would commit an overlay whose
+	// migration is propagating as failed.
+	let loopError: unknown;
 	try {
 		failure = await runStepsWithUndoJournal(db, schemaName, migrationStatements, restore.preApplyFingerprint);
+		loopError = failure?.error;
+	} catch (e) {
+		loopError = e;
+		throw e;
 	} finally {
-		await endSchemaBatchAll(startedModules, db, schemaName, failure?.error);
+		await endSchemaBatchAll(startedModules, db, schemaName, loopError);
 	}
 	if (!failure) return;
 	if (failure.notRestored === undefined) {

@@ -382,6 +382,31 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 						.to.deep.equal([{ id: 1 }, { id: 2 }]);
 				});
 
+				it('a restored failure inside a savepoint that is then released still announces nothing', async () => {
+					// The apply's events sit in the savepoint layer, not the base batch; the
+					// discard walks every layer by stamp, and RELEASE then merges an emptied layer.
+					await db.exec(`
+						declare schema main {
+							${FAILING_T}
+							table n1 {
+								id INTEGER PRIMARY KEY
+							}
+						}
+					`);
+					events.length = 0;
+
+					await db.exec('begin');
+					await db.exec('savepoint s');
+					await db.exec("insert into t values (2, 'b')");
+					await rejection(db.exec('apply schema main'));
+					await db.exec('release s');
+					await db.exec('commit');
+
+					expect(events.map(shape)).to.deep.equal([]);
+					expect(await rows(db, 'select id from t order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+					await rejection(rows(db, 'select * from n1'));
+				});
+
 				it('an unrestorable failure keeps the events of the steps that landed', async () => {
 					await db.exec('create table old (id integer primary key)');
 					await db.exec(`
@@ -422,6 +447,40 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 				});
 			});
 		}
+	});
+
+	it('an applied-state snapshot an earlier apply recorded survives a restored failure', async () => {
+		// The snapshot is a claim that the catalog matched a declaration; a restore that
+		// returns the catalog to that state leaves the claim true, so it is neither cleared
+		// nor left lying (see docs/schema.md § Applied-state snapshot).
+		const SETTLED = `
+			declare schema main {
+				table t {
+					id INTEGER PRIMARY KEY,
+					v TEXT NULL
+				}
+			}`;
+		await db.exec(TABLE_T);
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec(SETTLED);
+		await db.exec('apply schema main');
+		const snapshot = db.declaredSchemaManager.getAppliedSnapshot('main');
+		expect(snapshot, 'an empty plan records the snapshot').to.exist;
+
+		await db.exec(`
+			declare schema main {
+				${FAILING_T}
+				table n1 {
+					id INTEGER PRIMARY KEY
+				}
+			}
+		`);
+		await rejection(db.exec('apply schema main'));
+
+		expect(db.declaredSchemaManager.getAppliedSnapshot('main')).to.deep.equal(snapshot);
+		expect(snapshot!.catalogRendering, 'the snapshot still describes the live catalog').to.equal(fingerprint(db));
+		await db.exec(SETTLED);
+		expect(await planOf(db)).to.deep.equal([]);
 	});
 
 	it('under ddl_transaction_policy = strict the refused forward step is unwound like any other failure', async () => {

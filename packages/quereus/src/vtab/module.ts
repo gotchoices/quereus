@@ -570,15 +570,21 @@ export interface VirtualTableModule<
 	 * aborted the migration loop). On error, the module should discard the
 	 * in-flight overlay; on success, it commits.
 	 *
-	 * On failure the engine has ALREADY unwound the migration inside the batch:
-	 * each landed step's undo DDL ran through this module's ordinary DDL hooks
-	 * before this call, and the catalog is back at its pre-apply state (unless a
-	 * data-destroying step ran, in which case the apply reports itself partially
-	 * migrated). A module that discards its overlay here therefore discards the
-	 * forward and the undo DDL together and rewinds to the pre-apply substrate; a
-	 * module that has no overlay has had both applied for real. Either way the
-	 * substrate agrees with the catalog. See docs/schema.md § Failure and
-	 * restoration.
+	 * On failure the engine has normally ALREADY unwound the migration inside the
+	 * batch: each landed step's undo DDL ran through this module's ordinary DDL
+	 * hooks before this call, and the catalog is back at its pre-apply state. A
+	 * module that discards its overlay here therefore discards the forward and
+	 * the undo DDL together and rewinds to the pre-apply substrate; a module that
+	 * has no overlay has had both applied for real. Either way the substrate
+	 * agrees with the catalog. See docs/schema.md § Failure and restoration.
+	 *
+	 * NOTE: the exception is an UNRESTORABLE failure (a data-destroying step ran,
+	 * so no unwind happened and the catalog keeps the steps that landed). A module
+	 * that discards its overlay then rewinds a substrate the catalog still
+	 * describes as migrated. No built-in module discards (the store module has no
+	 * batch hooks), so nothing observes this today; if one ever does, it should
+	 * commit rather than discard on an error whose message says "partially
+	 * migrated", or the engine should pass the verdict here explicitly.
 	 *
 	 * Errors thrown from `endSchemaBatch` itself are logged and rethrown only
 	 * if no prior loop error exists — if a loop error is being propagated, the
