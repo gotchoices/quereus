@@ -31,13 +31,19 @@ import type { RuntimeContext } from '../types.js';
  * announcing, it cannot reintroduce the class. Check it against the DDL block of
  * `runtime/register.ts`.
  *
- * **The declarative statements (`apply schema` and friends) deliberately do NOT open one.**
- * `emitApplySchema` generates migration DDL and runs each generated statement through
- * `db._execWithinTransaction`. A failure on statement 5 leaves statements 1–4 *applied* —
- * there is no catalog rollback, and inside an explicit transaction the user may still commit.
- * Those four really happened and must stay announced; a scope around the whole apply would
- * retract them. The per-statement rule gives the right answer there for free: each generated
- * sub-statement runs its own emitter, so each opens and spends its own scope.
+ * **`apply schema` takes the mark itself and retracts CONDITIONALLY, so it cannot use this
+ * helper.** `emitApplySchema` runs each generated migration statement through
+ * `db._execWithinTransaction` under an undo journal (`runBatchedMigrationLoop` in
+ * `schema-declarative.ts`). When a step fails and the journal restores the catalog to its
+ * pre-apply state, the apply discards everything batched since its own
+ * `beginSchemaEventScope()` mark — nothing happened, so nothing is announced, exactly what
+ * this helper would do. But a migration is unrestorable once a data-destroying step (`DROP
+ * TABLE`, `DROP COLUMN`, `SET DATA TYPE`) has run, or if an undo statement itself fails; the
+ * steps that landed then really happened, inside an explicit transaction the user may still
+ * commit, and a replicating peer must hear about them — so on that verdict the apply keeps
+ * its events. A helper that always retracts on throw cannot express "only when restored".
+ * The per-statement rule still holds inside: each generated sub-statement runs its own
+ * emitter, so each opens and spends its own scope, and the failing one retracts its own.
  *
  * ## Call shape
  *
@@ -53,7 +59,7 @@ import type { RuntimeContext } from '../types.js';
  * would swallow earlier statements' committed writes.
  *
  * NOTE: retraction is the right answer only while a failed statement's catalog change does not
- * OUTLIVE the failure — the same condition the `apply schema` carve-out above turns on. It
+ * OUTLIVE the failure — the same condition `apply schema`'s conditional retraction turns on. It
  * holds today by placement: every engine auto emit sits at the tail of its catalog mutation
  * (`SchemaManager.createTable` / `createIndex` / `dropIndex` / `dropTable` / `createBackingTable`),
  * and the only post-emit work any DDL emitter still does — `dropMaintainedTable`'s
@@ -62,11 +68,12 @@ import type { RuntimeContext } from '../types.js';
  * landed and can throw, this scope would un-announce a change the catalog kept; that arm needs
  * the carve-out treatment (its own inner scope, or no scope), not a wider one.
  *
- * NOTE: nothing nests these scopes today (`apply schema` is unwrapped, and the one ALTER arm
- * that runs nested SQL — the ALTER PRIMARY KEY shadow rebuild — does it under
- * `withPublicEventsSuppressed`, so it batches no events at all). If an arm ever did nest one,
- * the outer failure would retract the inner statement's events too, which is the wanted
- * reading: the outer statement unwound, so everything it did announces nothing.
+ * The one nesting today is `apply schema`: its own mark encloses the scope of every generated
+ * sub-statement (forward steps and undo statements alike). A restored apply's outer discard
+ * retracts the inner statements' events too, which is the wanted reading: the outer statement
+ * unwound, so everything it did — including the undo DDL that put things back — announces
+ * nothing. The one ALTER arm that runs nested SQL, the ALTER PRIMARY KEY shadow rebuild, does
+ * it under `withPublicEventsSuppressed`, so it batches no events at all and nests nothing.
  */
 export async function withStatementScopedSchemaEvents<T>(
 	rctx: RuntimeContext,

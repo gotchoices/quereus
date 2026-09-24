@@ -18,17 +18,19 @@ import type { MemoryTable } from '../src/vtab/memory/table.js';
 interface BeginCall { schemaName: string; }
 interface EndCall { schemaName: string; error?: unknown; }
 interface CreateCall { tableName: string; batchActiveAtCall: boolean; }
+interface DestroyCall { tableName: string; batchActiveAtCall: boolean; }
 
 /**
- * MemoryTableModule extension that records begin/end/create calls and
- * exposes a `batchActive` flag that `create` consults at call time. Used
- * to validate the visibility contract: per-table callbacks during the
- * loop see the active batch.
+ * MemoryTableModule extension that records begin/end/create/destroy calls and
+ * exposes a `batchActive` flag that `create` / `destroy` consult at call time.
+ * Used to validate the visibility contract: per-table callbacks during the
+ * loop — including the undo DDL a failed loop runs — see the active batch.
  */
 class RecordingMemoryModule extends MemoryTableModule {
 	beginCalls: BeginCall[] = [];
 	endCalls: EndCall[] = [];
 	createCalls: CreateCall[] = [];
+	destroyCalls: DestroyCall[] = [];
 	batchActive = false;
 	/** When set, the named table's create call throws to simulate a per-DDL failure. */
 	failOnCreateTable?: string;
@@ -59,6 +61,11 @@ class RecordingMemoryModule extends MemoryTableModule {
 			throw new Error(`forced create failure for ${tableSchema.name}`);
 		}
 		return super.create(db, tableSchema);
+	}
+
+	override async destroy(db: DatabaseType, pAux: unknown, moduleName: string, schemaName: string, tableName: string): Promise<void> {
+		this.destroyCalls.push({ tableName, batchActiveAtCall: this.batchActive });
+		return super.destroy(db, pAux, moduleName, schemaName, tableName);
 	}
 }
 
@@ -181,8 +188,15 @@ describe('APPLY SCHEMA batch hooks', () => {
 
 		expect(recording.beginCalls).to.have.lengthOf(1);
 		expect(recording.endCalls).to.have.lengthOf(1);
-		expect(recording.endCalls[0].error, 'end should receive the loop error').to.exist;
+		expect(recording.endCalls[0].error, 'end should receive the loop error').to.equal(caught);
 		expect(recording.batchActive, 'batch should be cleared on error').to.be.false;
+
+		// The unwind ran INSIDE the batch, before end fired: the undo of `create table users`
+		// (`DROP TABLE IF EXISTS users`) reached the module while the batch was still active,
+		// so a module that discards its overlay on error discards the forward and the undo
+		// DDL together, and one that applies for real has had both applied.
+		expect(recording.destroyCalls).to.deep.equal([{ tableName: 'users', batchActiveAtCall: true }]);
+		expect(db.schemaManager.getTable('main', 'users'), 'the catalog is back at its pre-apply state').to.be.undefined;
 	});
 
 	it('idempotency fast-path: no DDL → no begin/end fired', async () => {

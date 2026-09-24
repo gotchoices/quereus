@@ -20,8 +20,10 @@
  *    default, which announces from *inside* `module.create` / `module.destroy` — before the
  *    statement is over, so it is the path that cannot get the success-path-only rule for free.
  *
- * `apply schema` is deliberately NOT scoped, and its own `it` at the bottom pins why: a
- * partially-applied migration keeps the events of the statements that landed.
+ * `apply schema` takes its own mark and retracts CONDITIONALLY (see `emitApplySchema`), and the
+ * two `it`s at the bottom pin both verdicts: a migration the undo journal restored announces
+ * nothing at all, while one an irreversible step made unrestorable keeps the events of the
+ * statements that landed. `test/apply-schema-restore.spec.ts` covers the rest of that contract.
  */
 
 import assert from 'node:assert/strict';
@@ -300,10 +302,9 @@ for (const backend of BACKENDS) {
 			});
 		});
 
-		// The case that forbids scoping the whole statement: `apply schema` is deliberately
-		// unwrapped, so a migration that fails part-way keeps the events of the statements that
-		// really landed. Each generated sub-statement carries its own scope instead.
-		it('a partially-applied schema keeps the events of the statements that landed', async () => {
+		// `apply schema` cannot use the per-statement helper because its retraction is
+		// conditional on the verdict of its undo journal. Two cases pin the two verdicts.
+		it('a migration the undo journal restored announces nothing, and leaves nothing behind', async () => {
 			await db.exec('create table t (id integer primary key, v text null)');
 			await db.exec("insert into t values (1, 'a')");
 			await db.exec(`
@@ -321,16 +322,49 @@ for (const backend of BACKENDS) {
 			events.length = 0;
 
 			// The differ generates `create table n1 …` then `ALTER TABLE t ADD COLUMN w INTEGER
-			// not null`, and the ALTER fails over t's existing row.
+			// not null`; the ALTER fails over t's existing row, and the journal drops n1 again.
 			await db.exec('begin');
 			await db.exec("insert into t values (2, 'b')");
 			await assert.rejects(() => db.exec('apply schema main'), /NOT NULL constraint failed/);
 			await db.exec('commit');
 
-			// The create really happened — `n1` exists and is usable — so it stays announced;
-			// only the failing ALTER retracted its own.
-			assert.deepEqual(events.map(shape), ['create/table/n1']);
+			// Neither the create nor the undo's drop is announced: as far as any subscriber can
+			// tell, the apply never ran. The sibling insert committed, so this is retraction.
+			assert.deepEqual(events.map(shape), []);
+			await assert.rejects(() => collect(db, 'select id from n1'));
+			assert.deepEqual(await collect(db, 'select id from t order by id'), [{ id: 1 }, { id: 2 }]);
+		});
+
+		it('a migration a DROP TABLE made unrestorable keeps the events of the statements that landed', async () => {
+			await db.exec('create table gone (id integer primary key)');
+			await db.exec('create table t (id integer primary key, v text null)');
+			await db.exec("insert into t values (1, 'a')");
+			await db.exec(`
+				declare schema main {
+					table t {
+						id INTEGER PRIMARY KEY,
+						v TEXT NULL,
+						w INTEGER NOT NULL
+					}
+					table n1 {
+						id INTEGER PRIMARY KEY
+					}
+				}
+			`);
+			events.length = 0;
+
+			// Drops first (`DROP TABLE IF EXISTS gone` — irreversible, so the journal is
+			// poisoned), then the create, then the failing ALTER.
+			await db.exec('begin');
+			await db.exec("insert into t values (2, 'b')");
+			await assert.rejects(() => db.exec('apply schema main'), /partially migrated and could not be restored/);
+			await db.exec('commit');
+
+			// The drop and the create really happened and cannot be taken back, so they stay
+			// announced; only the failing ALTER retracted its own.
+			assert.deepEqual(events.map(shape), ['drop/table/gone', 'create/table/n1']);
 			assert.deepEqual(await collect(db, 'select id from n1'), []);
+			await assert.rejects(() => collect(db, 'select id from gone'));
 		});
 	});
 }

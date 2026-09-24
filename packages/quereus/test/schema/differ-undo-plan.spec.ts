@@ -16,7 +16,7 @@ import { Parser } from '../../src/parser/parser.js';
 import { computeSchemaDiff, generateMigrationDDL, generateMigrationPlan } from '../../src/schema/schema-differ.js';
 import type { SchemaDiff, MigrationStep, MigrationCreate } from '../../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../../src/schema/catalog.js';
-import { renderCatalogForComparison } from '../../src/schema/catalog-rendering.js';
+import { renderCatalogForRestoreCheck } from '../../src/schema/catalog-rendering.js';
 import type { SchemaCatalog, CatalogTable, CatalogView } from '../../src/schema/catalog.js';
 import type * as AST from '../../src/parser/ast.js';
 import { viewDefinitionToCanonicalString } from '../../src/emit/ast-stringify.js';
@@ -61,15 +61,13 @@ function expectIrreversible(plan: MigrationStep[], prefix: string, reason: RegEx
 }
 
 /**
- * The catalog rendering with every view's `ddl` blanked. `ViewSchema.sql` holds the
- * original `create view` text until a rename propagation overwrites it with the
- * rewritten body alone, so after a table-rename round trip that one field differs
- * while the view itself is identical (recorded on ticket
- * apply-schema-rollback-journal, whose restore check compares this rendering).
+ * The rendering `apply schema` verifies a restore against — the comparison rendering
+ * minus the table / view `ddl` text, which records storage order and text history the
+ * differ does not consider (see `renderCatalogForRestoreCheck`). The round trips below
+ * are the executor's own check run by hand.
  */
 function fingerprint(db: Database): string {
-	const catalog = collectSchemaCatalog(db, 'main');
-	return renderCatalogForComparison({ ...catalog, views: catalog.views.map(v => ({ ...v, ddl: '' })) });
+	return renderCatalogForRestoreCheck(collectSchemaCatalog(db, 'main'));
 }
 
 /** Runs the plan forward, then every undo in reverse, and requires the catalog to be back where it started. */

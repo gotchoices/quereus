@@ -2575,12 +2575,13 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 		}
 	});
 
-	it('a CHECK body change that TIGHTENS against a violating row is refused — and the drop has already happened', async function () {
+	it('a CHECK body change that TIGHTENS against a violating row is refused — and the old constraint is restored', async function () {
 		// The re-add is an ordinary ADD CONSTRAINT … CHECK, so it validates the existing
-		// rows and refuses with CONSTRAINT. The two statements are separate and the memory
-		// backend has no DDL rollback, so the guarantee is "apply aborts + data survives",
-		// not "old constraint restored": after the refusal the table carries NO CHECK
-		// (docs/sql-alter.md § ADD / DROP / RENAME CONSTRAINT, docs/schema.md atomicity caveat).
+		// rows and refuses with CONSTRAINT. The DROP that preceded it has already run, but
+		// `apply schema` unwinds a failed plan through its undo journal, so the old body is
+		// re-added and the table ends up exactly as the apply found it — old constraint
+		// present AND enforced (docs/schema.md § Failure and restoration;
+		// docs/sql-alter.md § ADD / DROP / RENAME CONSTRAINT).
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -2606,12 +2607,18 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 			const rows: Array<Record<string, unknown>> = [];
 			for await (const r of db.eval('select id, qty from t order by id')) rows.push(r);
 			expect(rows).to.deep.equal([{ id: 1, qty: 5 }]);
-			// … but the old CHECK is already gone (non-atomic DROP + ADD on the memory backend),
-			// so the re-diff still wants to add the new body.
+			// … and the old CHECK is back — in the catalog and enforced — so the re-diff
+			// wants the same DROP + ADD pair again, not a bare add onto an unconstrained table.
 			const names: unknown[] = [];
 			for await (const r of db.eval(`select name from check_constraint_info('t')`)) names.push(r.name);
-			expect(names, 'old CHECK dropped, new one refused').to.deep.equal([]);
-			expect(diffOf(db).tablesToAlter[0]?.constraintsToAdd?.length, 're-apply would re-attempt the add').to.equal(1);
+			expect(names, 'old CHECK restored').to.deep.equal(['chk_qty']);
+			let rejected = false;
+			try { await db.exec('insert into t values (2, -1)'); } catch { rejected = true; }
+			expect(rejected, 'the restored CHECK still rejects qty <= 0').to.be.true;
+			await db.exec('insert into t values (2, 7)');
+			const alter = diffOf(db).tablesToAlter[0];
+			expect(alter?.constraintsToDrop, 're-apply would drop the restored old body').to.deep.equal(['chk_qty']);
+			expect(alter?.constraintsToAdd?.length, 're-apply would re-attempt the add').to.equal(1);
 		} finally {
 			await db.close();
 		}

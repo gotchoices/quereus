@@ -570,6 +570,16 @@ export interface VirtualTableModule<
 	 * aborted the migration loop). On error, the module should discard the
 	 * in-flight overlay; on success, it commits.
 	 *
+	 * On failure the engine has ALREADY unwound the migration inside the batch:
+	 * each landed step's undo DDL ran through this module's ordinary DDL hooks
+	 * before this call, and the catalog is back at its pre-apply state (unless a
+	 * data-destroying step ran, in which case the apply reports itself partially
+	 * migrated). A module that discards its overlay here therefore discards the
+	 * forward and the undo DDL together and rewinds to the pre-apply substrate; a
+	 * module that has no overlay has had both applied for real. Either way the
+	 * substrate agrees with the catalog. See docs/schema.md § Failure and
+	 * restoration.
+	 *
 	 * Errors thrown from `endSchemaBatch` itself are logged and rethrown only
 	 * if no prior loop error exists — if a loop error is being propagated, the
 	 * end-batch failure is logged and swallowed so the original cause survives.

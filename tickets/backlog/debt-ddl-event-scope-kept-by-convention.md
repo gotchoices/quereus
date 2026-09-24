@@ -61,13 +61,19 @@ blunt assertion would fire on correct behavior.
 
 ## The carve-out any solution must keep
 
-Applying a declarative schema (`apply schema`) deliberately does **not** get a whole-statement
-scope. It runs each generated migration statement as an ordinary statement, and a failure on
-the Nth leaves 1..N-1 genuinely applied with no rollback — those must stay announced. Each
-generated statement carries its own scope instead. Whatever replaces the convention has to
-express "this one is deliberately excluded" as clearly as the current comment does, and the
-existing regression test for it (`packages/quereus/test/ddl-schema-event-atomicity.spec.ts`,
-the partially-applied-migration case) must keep passing unchanged.
+Applying a declarative schema (`apply schema`) takes its own event mark and retracts
+**conditionally**, so it cannot use the whole-statement helper. It runs each generated
+migration statement as an ordinary statement under an undo journal (see `docs/schema.md`
+§ Failure and restoration): when a step fails and the journal restores the catalog, the whole
+apply announces nothing — the same outcome the helper would give. But once a data-destroying
+step (`DROP TABLE`, `DROP COLUMN`, `SET DATA TYPE`) has run the apply cannot be taken back, and
+a later failure leaves the steps that landed genuinely applied — those must stay announced.
+Each generated statement still carries its own inner scope. Whatever replaces the convention
+has to express "this one decides for itself, after the fact" as clearly as the current comment
+does, and the existing regression tests for both verdicts
+(`packages/quereus/test/ddl-schema-event-atomicity.spec.ts`, the two `apply schema` cases at
+the bottom, and the schema-events section of `test/apply-schema-restore.spec.ts`) must keep
+passing unchanged.
 
 ## Related
 

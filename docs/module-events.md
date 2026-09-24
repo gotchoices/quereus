@@ -232,11 +232,14 @@ its schema events in its own queue and emits them at commit is past the scope by
 must drop a failed statement's own events itself — the same division of responsibility as the
 row-image contract above.
 
-**Carve-out: a partially-applied migration keeps what landed.** A declarative `apply schema`
-is not scoped as one unit — it runs each generated migration statement through the ordinary
-statement path, and a failure on the Nth leaves statements 1..N-1 applied with no catalog
-rollback. Those really happened, so their events stay; each generated sub-statement carries
-its own scope, so only the failing one retracts.
+**Carve-out: an *unrestorable* migration keeps what landed.** A declarative `apply schema`
+runs each generated migration statement through the ordinary statement path under an undo
+journal. When a step fails and the journal restores the catalog, the whole apply announces
+nothing — the undo DDL's events included. But once a data-destroying step (`DROP TABLE`,
+`DROP COLUMN`, `SET DATA TYPE`) has run the apply cannot be taken back, and a later failure
+leaves the schema partially migrated: those steps really happened, so their events stay, and
+only the failing statement retracts its own. See [Schema § Failure and
+restoration](schema.md#failure-and-restoration).
 
 ### For Modules without Native Events
 

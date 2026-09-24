@@ -749,17 +749,19 @@ export class DatabaseEventEmitter {
 	discardSchemaEventsSince(watermark: number): number {
 		if (!this.isBatching) return 0;
 
-		// NOTE: splices per matching event, so a scope covering N events costs O(N × batch
-		// size). One ALTER statement batches at most a handful (its module announces once),
-		// so this is nothing today. If a scope ever spans many schema events — a batched DDL
-		// arm, a whole failed migration — partition each store into a kept array instead.
+		// One linear pass per store, compacting IN PLACE: the store arrays are shared with
+		// the savepoint-layer bookkeeping, so they must keep their identity. A scope can
+		// now span a whole failed `apply schema` (every forward step's event plus every
+		// undo's), so the per-event splice this used to do would have gone quadratic
+		// exactly on the path that batches the most.
 		let discarded = 0;
 		for (const store of this.allSchemaEventStores()) {
-			for (let i = store.length - 1; i >= 0; i--) {
-				if (store[i].seq < watermark) continue;
-				store.splice(i, 1);
-				discarded++;
+			let kept = 0;
+			for (const pending of store) {
+				if (pending.seq < watermark) store[kept++] = pending;
+				else discarded++;
 			}
+			store.length = kept;
 		}
 
 		if (discarded > 0) {

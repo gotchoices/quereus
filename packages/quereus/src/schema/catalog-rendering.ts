@@ -53,6 +53,39 @@ export function renderCatalogForComparison(catalog: SchemaCatalog): string {
 }
 
 /**
+ * The rendering `apply schema` compares after unwinding a failed migration, to
+ * verify the catalog is back where the apply found it (see
+ * `runtime/emit/schema-declarative.ts` § `runBatchedMigrationLoop`).
+ *
+ * Identical to {@link renderCatalogForComparison} except that a table's and a
+ * view's `ddl` text is left out. Those two texts record things the differ does
+ * not treat as part of the schema, and an undo that restores the catalog exactly
+ * as the differ sees it can still change them:
+ *
+ *  - a table's DDL lists constraints in *storage* order, and `ADD CONSTRAINT`
+ *    appends — so `DROP CONSTRAINT a` + re-add on a table with constraints
+ *    `[a, b]` comes back as `[b, a]` (the structured `namedConstraints` below are
+ *    sorted, because the differ keys them by name);
+ *  - a view's DDL is `ViewSchema.sql`, which `create view` stores verbatim and the
+ *    rename propagation (`runtime/emit/alter-table.ts`) overwrites with the
+ *    rewritten body alone, so a rename and its reverse leave the field spelled
+ *    differently from the original statement.
+ *
+ * Everything an undo statement can touch — columns and their attributes, the
+ * primary key, tags, named constraints, the maintained derivation, the object
+ * set itself — is in the structured fields, so the check loses nothing an undo
+ * arm could get wrong. Index and assertion `ddl` are rendered from structured
+ * state and order-free, so they stay in.
+ */
+export function renderCatalogForRestoreCheck(catalog: SchemaCatalog): string {
+	return renderCatalogForComparison({
+		...catalog,
+		tables: catalog.tables.map(t => ({ ...t, ddl: '' })),
+		views: catalog.views.map(v => ({ ...v, ddl: '' })),
+	});
+}
+
+/**
  * Compile error if a catalog interface grows a field this renderer does not
  * consider. The rest object of an exhaustive destructure is `{}`, which is
  * assignable to `Record<string, never>`; one left-over field of any other type

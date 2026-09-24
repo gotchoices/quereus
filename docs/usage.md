@@ -528,10 +528,12 @@ The engine scopes each DDL statement's schema events and retracts them as the er
 propagates, so both cases announce nothing. Like every other event, delivery of a successful
 statement's event is batched to commit and dropped on rollback.
 
-One deliberate exception: a declarative `apply schema` runs its generated migration DDL as
-ordinary statements, and a migration that fails part-way leaves the statements before the
-failure **applied**. Those really happened, so they stay announced; only the statement that
-failed retracts its own. See § [Declarative Schema Workflow](#declarative-schema-workflow).
+A declarative `apply schema` runs its generated migration DDL as ordinary statements under an
+undo journal, so a migration that fails part-way is normally unwound and announces nothing at
+all. The one exception is a migration a data-destroying step (`DROP TABLE`, `DROP COLUMN`,
+`SET DATA TYPE`) made unrestorable: the statements before the failure stay **applied** and
+announced, and only the statement that failed retracts its own. See
+[Schema § Failure and restoration](schema.md#failure-and-restoration).
 
 #### What each `ALTER TABLE` arm reports
 
@@ -576,7 +578,8 @@ Both are catalog-only and no backend announces them.
 
 A declarative `apply schema` runs its generated migration DDL through the ordinary statement
 path, so each `alter table` the differ generates reports exactly as if you had typed it —
-alongside the `create` / `drop` events the same apply already raised.
+alongside the `create` / `drop` events the same apply already raised. A failed apply that was
+restored retracts all of them (see above).
 
 `ALTER TABLE … ALTER PRIMARY KEY` on a backend that cannot re-key in place reports its one
 `alter`/`table` event like any other backend, but stays silent about the engine-internal rebuild

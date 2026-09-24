@@ -1,0 +1,192 @@
+-- Declarative schema: a migration that fails partway is unwound, so the catalog is back where
+-- the apply found it. Tightening a named constraint whose new body the existing rows violate
+-- is the motivating case: the plan is DROP CONSTRAINT + ADD CONSTRAINT, the re-add fails its
+-- existing-row validation, and the undo journal re-adds the OLD constraint — which must not
+-- only be back in the catalog but still be enforced. Runs on both backends
+-- (see docs/schema.md § Failure and restoration; the executor is runBatchedMigrationLoop).
+
+-- ===================================
+-- 1. CHECK tightened against a violating row
+-- ===================================
+
+create table t_ck (id integer primary key, v integer, constraint ck_v check (v > 0));
+insert into t_ck values (1, 5);
+
+declare schema main {
+	table t_ck {
+		id integer primary key,
+		v integer,
+		constraint ck_v check (v > 10)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t_ck DROP CONSTRAINT ck_v"}, {"ddl": "ALTER TABLE t_ck ADD constraint ck_v check (v > 10)"}]
+
+-- The re-add fails over the row v = 5; the DROP that preceded it is undone.
+apply schema main;
+-- error: ck_v
+
+-- The row is untouched, the old rule is back, and it is still enforced.
+select v from t_ck;
+→ [{"v": 5}]
+
+insert into t_ck values (2, -1);
+-- error: CHECK constraint failed
+
+insert into t_ck values (2, 7);
+
+-- run
+
+-- Re-diffing produces the original plan again: nothing about the failure was cached.
+diff schema main;
+→ [{"ddl": "ALTER TABLE t_ck DROP CONSTRAINT ck_v"}, {"ddl": "ALTER TABLE t_ck ADD constraint ck_v check (v > 10)"}]
+
+drop table t_ck;
+
+-- ===================================
+-- 2. UNIQUE tightened against duplicate rows
+-- ===================================
+
+create table t_uq (id integer primary key, a integer, b integer, constraint uq_ab unique (a, b));
+insert into t_uq values (1, 1, 1), (2, 1, 2);
+
+declare schema main {
+	table t_uq {
+		id integer primary key,
+		a integer,
+		b integer,
+		constraint uq_ab unique (a)
+	}
+}
+
+-- run
+
+apply schema main;
+-- error: uq_ab
+
+-- The old two-column rule is back: a duplicate (a, b) is refused, a duplicate a alone is not.
+insert into t_uq values (3, 1, 1);
+-- error: UNIQUE constraint failed
+
+insert into t_uq values (3, 1, 3);
+
+-- run
+
+select count(*) as n from t_uq;
+→ [{"n": 3}]
+
+drop table t_uq;
+
+-- ===================================
+-- 3. FOREIGN KEY re-targeted at a column the child rows do not match
+-- ===================================
+
+create table p (id integer primary key, alt integer, constraint uq_alt unique (alt));
+insert into p values (1, 100);
+create table c (id integer primary key, pid integer, constraint fk_p foreign key (pid) references p(id));
+insert into c values (1, 1);
+
+declare schema main {
+	table p {
+		id integer primary key,
+		alt integer,
+		constraint uq_alt unique (alt)
+	}
+	table c {
+		id integer primary key,
+		pid integer,
+		constraint fk_p foreign key (pid) references p(alt)
+	}
+}
+
+-- run
+
+-- pid = 1 is a p.id, not a p.alt, so the re-add fails and the old reference is restored.
+apply schema main;
+-- error: fk_p
+
+insert into c values (2, 999);
+-- error: constraint failed: fk_p
+
+insert into c values (2, 1);
+
+-- run
+
+select count(*) as n from c;
+→ [{"n": 2}]
+
+drop table c;
+drop table p;
+
+-- ===================================
+-- 4. A multi-step plan: the steps that landed before the failure are taken back
+-- ===================================
+
+create table t (id integer primary key, v text null);
+insert into t values (1, 'a');
+
+declare schema main {
+	table t {
+		id integer primary key,
+		v text null,
+		w integer not null
+	}
+	table n1 {
+		id integer primary key
+	}
+}
+
+-- run
+
+-- create table n1 lands, then ALTER TABLE t ADD COLUMN w fails over the existing row.
+diff schema main;
+→ [{"ddl": "create table n1 (id integer primary key)"}, {"ddl": "ALTER TABLE t ADD COLUMN w integer not null"}]
+
+apply schema main;
+-- error: NOT NULL constraint failed
+
+-- n1 is gone again and t has no w.
+select * from n1;
+-- error: not found
+
+select * from t;
+→ [{"id": 1, "v": "a"}]
+
+diff schema main;
+→ [{"ddl": "create table n1 (id integer primary key)"}, {"ddl": "ALTER TABLE t ADD COLUMN w integer not null"}]
+
+-- ===================================
+-- 5. The same failure inside an explicit transaction: savepoint-like
+-- ===================================
+
+begin;
+insert into t values (2, 'b');
+apply schema main;
+-- error: NOT NULL constraint failed
+
+-- The transaction is still open and usable after the restored failure.
+insert into t values (3, 'c');
+commit;
+
+-- run
+
+select id from t order by id;
+→ [{"id": 1}, {"id": 2}, {"id": 3}]
+
+select * from n1;
+-- error: not found
+
+-- Once the violating rows are gone the same declaration applies cleanly.
+delete from t;
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+drop table n1;
+drop table t;
