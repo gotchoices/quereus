@@ -12,7 +12,7 @@
 import { createLogger } from '../common/logger.js';
 import type { Row, SqlValue } from '../common/types.js';
 import { encodeKeyTuple, decodeKeyTuple } from '../util/key-tuple-codec.js';
-import { QuereusError } from '../common/errors.js';
+import { QuereusError, TransactionActiveError } from '../common/errors.js';
 import { StatusCode } from '../common/types.js';
 import type { VirtualTableConnection } from '../vtab/connection.js';
 import type { DatabaseEventEmitter } from './database-events.js';
@@ -206,7 +206,7 @@ export class TransactionManager {
 					this.clearChangeLog();
 					return;
 				}
-				throw new QuereusError('Cannot begin transaction: already in a transaction', StatusCode.ERROR);
+				throw new TransactionActiveError('Cannot begin transaction: a transaction is already active');
 			}
 			// Implicit while already in a transaction - no-op
 			return;

@@ -1,7 +1,7 @@
 import { createLogger } from '../common/logger.js';
 import { ensureAsyncGeneratorCleanupSupported } from '../util/async-generator-support.js';
-import { MisuseError, QuereusError, FailConflictError, RollbackConflictError, throwIfAborted } from '../common/errors.js';
-import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue, type StatementOptions } from '../common/types.js';
+import { MisuseError, QuereusError, FailConflictError, RollbackConflictError, TransactionActiveError, throwIfAborted } from '../common/errors.js';
+import { StatusCode, type SqlParameters, type SqlValue, type Row, type OutputValue, type StatementOptions, type ExecOptions } from '../common/types.js';
 import type { ScalarType } from '../common/datatype.js';
 import type { AnyVirtualTableModule } from '../vtab/module.js';
 import { Statement } from './statement.js';
@@ -124,6 +124,33 @@ function parseSchemaPath(pathString: string): string[] | undefined {
 	if (!pathString) return undefined;
 	const parts = pathString.split(',').map(s => s.trim()).filter(s => s.length > 0);
 	return parts.length > 0 ? parts : undefined;
+}
+
+/**
+ * Refuses a batch that spells its own transaction control, for `exec`'s
+ * `transaction: true` mode. A `COMMIT` mid-batch would end the batch's
+ * transaction, leave the remaining statements running in autocommit, and make
+ * the closing commit a silent no-op - atomicity lost with no error raised.
+ * `SAVEPOINT` / `RELEASE` / `ROLLBACK TO <savepoint>` nest inside the batch's
+ * transaction and cannot end it, so they stay allowed.
+ */
+function assertNoTransactionControl(batch: readonly AST.Statement[]): void {
+	for (const statement of batch) {
+		const keyword = transactionControlKeyword(statement);
+		if (keyword) {
+			throw new MisuseError(`exec with { transaction: true } cannot contain ${keyword}: the option already runs the whole batch as one transaction`);
+		}
+	}
+}
+
+/** The transaction-ending keyword a statement spells, or undefined if it spells none. */
+function transactionControlKeyword(statement: AST.Statement): string | undefined {
+	switch (statement.type) {
+		case 'begin': return 'BEGIN';
+		case 'commit': return 'COMMIT';
+		case 'rollback': return statement.savepoint === undefined ? 'ROLLBACK' : undefined;
+		default: return undefined;
+	}
 }
 
 /**
@@ -1011,15 +1038,27 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * row-returning query pays for the full scan and sees any error it raises,
 	 * but never sees the rows themselves; use `get`/`eval` to consume them.
 	 *
+	 * `options.transaction` opts the whole batch into ONE explicit transaction,
+	 * begun and committed under a single hold of the execution mutex — the
+	 * supported way to make a multi-statement batch atomic. Hand-rolling it as
+	 * `begin` / … / `commit` is not equivalent on a `Database` more than one
+	 * caller shares: those are separate mutex acquisitions, so another caller's
+	 * statement can land inside the transaction and be rolled back with it. Under
+	 * the option the SQL itself may not spell `begin`, `commit`, or a bare
+	 * `rollback` (`MisuseError`); savepoint statements nest inside the batch's
+	 * transaction and stay allowed.
+	 *
 	 * @param sql The SQL string(s) to execute.
 	 * @param params Optional parameters to bind.
 	 * @param options Optional execution options (e.g. an `AbortSignal` for
 	 *   cooperative cancellation — checked before each statement and at row
-	 *   boundaries during execution).
+	 *   boundaries during execution; `transaction` for an atomic batch).
 	 * @returns A Promise resolving when execution completes.
-	 * @throws QuereusError on failure (an `AbortError` if the signal fired).
+	 * @throws QuereusError on failure (an `AbortError` if the signal fired, a
+	 *   `TransactionActiveError` if `transaction` is set and a transaction is
+	 *   already open).
 	 */
-	async exec(sql: string, params?: SqlParameters, options?: StatementOptions): Promise<void> {
+	async exec(sql: string, params?: SqlParameters, options?: ExecOptions): Promise<void> {
 		this.checkOpen();
 		log('Executing SQL block: %s', sql);
 
@@ -1030,27 +1069,90 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const batch = this._parseSql(sql);
 		if (batch.length === 0) return;
 
-		await this._withMutex(async () => {
-			// Per-statement implicit-transaction scope: matches SQLite autocommit
-			// semantics so a later statement's failure (e.g. OR ABORT) does NOT
-			// roll back prior statements that already successfully committed.
-			// The `isImplicitTransaction()` gate skips this for statements
-			// running inside an explicit `BEGIN…COMMIT` block, including
-			// statements that follow a mid-batch `BEGIN`.
+		if (options?.transaction) {
+			// Refused before the mutex is taken, so a rejected batch leaves the
+			// database indistinguishable from never having been called.
+			assertNoTransactionControl(batch);
+			await this._withMutex(() => this._execBatchAsTransaction(batch, params, signal));
+			return;
+		}
+
+		await this._withMutex(() => this._execBatchAutocommit(batch, params, signal));
+	}
+
+	/**
+	 * Runs each statement in its own implicit-transaction scope: matches SQLite
+	 * autocommit semantics so a later statement's failure (e.g. OR ABORT) does NOT
+	 * roll back prior statements that already successfully committed. The
+	 * `isImplicitTransaction()` gate skips this for statements running inside an
+	 * explicit `BEGIN…COMMIT` block, including statements that follow a mid-batch
+	 * `BEGIN`. Caller holds the execution mutex.
+	 */
+	private async _execBatchAutocommit(batch: AST.Statement[], params?: SqlParameters, signal?: AbortSignal): Promise<void> {
+		for (const statementAst of batch) {
+			try {
+				await this._executeSingleStatement(statementAst, params, signal);
+				if (this.transactionManager.isImplicitTransaction()) {
+					await this._commitTransaction();
+				}
+			} catch (err) {
+				if (this.transactionManager.isImplicitTransaction()) {
+					await this._rollbackTransaction();
+				}
+				throw err;
+			}
+		}
+	}
+
+	/**
+	 * Runs the whole batch as one explicit transaction, with no per-statement
+	 * commit. Caller holds the execution mutex for the entire call — including the
+	 * rollback — so no other caller's statement can run inside the transaction and
+	 * none is ever rolled back by it.
+	 */
+	private async _execBatchAsTransaction(batch: AST.Statement[], params?: SqlParameters, signal?: AbortSignal): Promise<void> {
+		if (this.transactionManager.isInTransaction()) {
+			// Unconditional, including when the open transaction is one this same
+			// caller began: the batch cannot tell whose it is, and must never commit
+			// or roll back a transaction it does not own.
+			throw new TransactionActiveError('Cannot run an atomic exec batch: a transaction is already active');
+		}
+
+		await this._beginTransaction('explicit');
+		try {
 			for (const statementAst of batch) {
+				await this._executeSingleStatement(statementAst, params, signal);
+			}
+			// An abort that landed during the last statement's tail must roll the
+			// batch back, not commit it.
+			throwIfAborted(signal);
+			if (!this.transactionManager.isInTransaction()) {
+				// Unreachable while assertNoTransactionControl refuses the statements that
+				// could end the transaction; it exists so a future path that force-commits
+				// mid-batch fails loudly instead of letting _commitTransaction() no-op and
+				// report a success that was not atomic.
+				throw new QuereusError('Atomic exec batch lost its transaction mid-flight', StatusCode.INTERNAL);
+			}
+			await this._commitTransaction();
+		} catch (err) {
+			// Guarded: commitTransaction already rolls every connection back and clears
+			// its own state when a deferred constraint or global assertion fails, so an
+			// unguarded rollback here would be a second one.
+			if (this.transactionManager.isInTransaction()) {
 				try {
-					await this._executeSingleStatement(statementAst, params, signal);
-					if (this.transactionManager.isImplicitTransaction()) {
-						await this._commitTransaction();
+					await this._rollbackTransaction();
+				} catch (rollbackErr) {
+					// A failed rollback is the more urgent signal — the state is now
+					// unknown — so it propagates, carrying the original failure rather
+					// than either being swallowed.
+					if (rollbackErr instanceof Error && rollbackErr.cause === undefined) {
+						rollbackErr.cause = err;
 					}
-				} catch (err) {
-					if (this.transactionManager.isImplicitTransaction()) {
-						await this._rollbackTransaction();
-					}
-					throw err;
+					throw rollbackErr;
 				}
 			}
-		});
+			throw err;
+		}
 	}
 
 	/**
@@ -1311,41 +1413,58 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/**
 	 * Begins a transaction.
+	 *
+	 * The already-active check runs INSIDE the execution mutex, because
+	 * `isInTransaction()` is also true while another caller's autocommit statement
+	 * is mid-flight (every write opens an implicit transaction for its duration).
+	 * Checked outside, this call would refuse a database that is about to be free;
+	 * checked inside, it queues behind that statement and succeeds. The same
+	 * reasoning applies to {@link commit} and {@link rollback}.
+	 *
+	 * Routes straight to the internal transaction methods rather than
+	 * `exec("BEGIN TRANSACTION")`: the emitter in `runtime/emit/transaction.ts`
+	 * makes exactly these calls and nothing else, so this is equivalent and skips
+	 * parsing, planning, optimizing and emitting a three-word statement.
+	 *
+	 * @throws TransactionActiveError if a transaction is already active once the
+	 *   mutex is granted.
 	 */
 	async beginTransaction(): Promise<void> {
 		this.checkOpen();
-
-		if (this.transactionManager.isInTransaction()) {
-			throw new QuereusError("Transaction already active", StatusCode.ERROR);
-		}
-
-		await this.exec("BEGIN TRANSACTION");
+		await this._withMutex(async () => {
+			if (this.transactionManager.isInTransaction()) {
+				throw new TransactionActiveError('Cannot begin transaction: a transaction is already active');
+			}
+			await this._beginTransaction('explicit');
+		});
 	}
 
 	/**
-	 * Commits the current transaction.
+	 * Commits the current transaction. See {@link beginTransaction} for why the
+	 * state check runs under the mutex.
 	 */
 	async commit(): Promise<void> {
 		this.checkOpen();
-
-		if (!this.transactionManager.isInTransaction()) {
-			throw new QuereusError("No transaction active", StatusCode.ERROR);
-		}
-
-		await this.exec("COMMIT");
+		await this._withMutex(async () => {
+			if (!this.transactionManager.isInTransaction()) {
+				throw new QuereusError("No transaction active", StatusCode.ERROR);
+			}
+			await this._commitTransaction();
+		});
 	}
 
 	/**
-	 * Rolls back the current transaction.
+	 * Rolls back the current transaction. See {@link beginTransaction} for why the
+	 * state check runs under the mutex.
 	 */
 	async rollback(): Promise<void> {
 		this.checkOpen();
-
-		if (!this.transactionManager.isInTransaction()) {
-			throw new QuereusError("No transaction active", StatusCode.ERROR);
-		}
-
-		await this.exec("ROLLBACK");
+		await this._withMutex(async () => {
+			if (!this.transactionManager.isInTransaction()) {
+				throw new QuereusError("No transaction active", StatusCode.ERROR);
+			}
+			await this._rollbackTransaction();
+		});
 	}
 
 	/**

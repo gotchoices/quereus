@@ -98,6 +98,19 @@ export interface StatementOptions {
 	readConcurrency?: 'serialized' | 'committed';
 }
 
+/** Options accepted by {@link Database.exec}. Extends {@link StatementOptions}; `readConcurrency` is ignored here as it always has been. */
+export interface ExecOptions extends StatementOptions {
+	/**
+	 * Run the entire batch as one explicit transaction, begun and committed
+	 * under a single hold of the execution mutex. On any failure the
+	 * transaction is rolled back BEFORE the mutex is released and the original
+	 * error is rethrown, so no other caller's statement ever runs inside it.
+	 * Refuses with a `TransactionActiveError` if any transaction is already
+	 * open when the batch acquires the mutex.
+	 */
+	transaction?: boolean;
+}
+
 /**
  * Standard status/error codes that significantly match SQLite.
  * Used for error handling and determining operation results.

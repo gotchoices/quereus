@@ -26,6 +26,8 @@ begin;
 begin transaction;
 ```
 
+> **On a `Database` shared by more than one caller, hand-rolled `begin` / … / `commit` across separate `db.exec()` calls is not indivisible.** Each call takes the engine's execution mutex separately, so another caller's statement can be granted it in between and run inside your transaction — and be rolled back with it. Use `db.exec(sql, params, { transaction: true })`, which runs the whole batch as one transaction under a single mutex hold; see [Atomic Batches](usage.md#atomic-batches). Under that option the SQL itself may not spell `begin` / `commit` / bare `rollback`.
+
 ### 8.2 COMMIT Transaction
 
 Saves all changes made during the current transaction.
@@ -40,6 +42,8 @@ commit [transaction]
 -- Commit the current transaction
 commit;
 ```
+
+> A `commit` issued as its own `db.exec()` call ends whatever transaction is open when its turn at the mutex comes — which, on a shared `Database`, need not be the one the caller opened. See the note under [8.1](#81-begin-transaction) and [Atomic Batches](usage.md#atomic-batches).
 
 ### 8.3 ROLLBACK Transaction
 

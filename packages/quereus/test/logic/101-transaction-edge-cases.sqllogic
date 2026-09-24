@@ -33,7 +33,7 @@ COMMIT;
 -- Second BEGIN while already in transaction
 BEGIN;
 BEGIN;
--- error: already in a transaction
+-- error: a transaction is already active
 
 ROLLBACK;
 -- run

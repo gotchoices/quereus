@@ -146,6 +146,21 @@ export class MisuseError extends QuereusError {
 }
 
 /**
+ * A transaction is already open on this Database, so the requested operation —
+ * beginning a transaction, or running an `exec` batch with `transaction: true` —
+ * cannot proceed. Distinct from a plain QuereusError so a caller can positively
+ * recognise "someone else owns a transaction here" and back off, rather than
+ * matching message text. Carries StatusCode.BUSY.
+ */
+export class TransactionActiveError extends QuereusError {
+	constructor(message: string = 'Cannot begin transaction: a transaction is already active', cause?: Error) {
+		super(message, StatusCode.BUSY, cause);
+		this.name = 'TransactionActiveError';
+		Object.setPrototypeOf(this, TransactionActiveError.prototype);
+	}
+}
+
+/**
  * Helper function to throw a QuereusError with optional location information from AST nodes
  * @param message Error message
  * @param code Status code (defaults to ERROR)

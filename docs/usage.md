@@ -273,7 +273,7 @@ await db.exec(`
   insert into users (name) values ('User 4');
 `);
 // If the second statement fails, the first stays committed.
-// Wrap the batch in begin/commit for all-or-nothing.
+// Pass `{ transaction: true }` for all-or-nothing — see Atomic Batches below.
 
 // On error, implicit transactions automatically rollback
 try {
@@ -283,6 +283,31 @@ try {
   // Second exec() was automatically rolled back
 }
 ```
+
+#### Atomic Batches
+
+`db.exec(sql, params, { transaction: true })` runs the whole batch as ONE explicit transaction, begun and committed under a single hold of the execution mutex. It is the supported way to make a multi-statement batch all-or-nothing:
+
+```typescript
+// Either both rows land, or neither does.
+await db.exec(
+  `insert into users (id, name) values (:id, :name);
+   insert into audit (actor) values (:name);`,
+  { id: 7, name: 'User 6' },
+  { transaction: true },
+);
+```
+
+On any failure — a statement error, a constraint that only fails at commit, or an aborted signal — the transaction is rolled back **before** the mutex is released, and the original error is rethrown. Because the whole batch is one transaction, `onTransactionCommit` fires exactly once for it (and not at all for a failed batch), where a plain multi-statement `exec` fires once per statement.
+
+Two rules follow from running under one mutex hold:
+
+- The batch's SQL may not contain `begin`, `commit`, or a bare `rollback` — those are refused with a `MisuseError` before anything runs, because a `commit` mid-batch would end the transaction, leave the remaining statements in autocommit, and make the closing commit a silent no-op. `savepoint`, `release`, and `rollback to <savepoint>` nest inside the batch's transaction and stay allowed.
+- If any transaction is already open when the batch acquires the mutex — another caller's, or one this caller began itself — the batch refuses with a `TransactionActiveError` (`StatusCode.BUSY`) and touches nothing. It cannot tell whose transaction it is, so it must never commit or roll back one it does not own.
+
+**Why hand-rolling it is not equivalent.** `await db.exec('begin')` … `await db.exec('commit')` across separate `exec` calls takes the execution mutex once *per call*. On a `Database` that more than one caller shares, another caller's statement can be granted the mutex between them — it then runs inside your transaction, and its writes are discarded when you roll back. Worse, if a statement in the middle throws, your `begin` is left open when the mutex is released, and the next queued caller runs inside a transaction it knows nothing about. One `exec` with `{ transaction: true }` closes that window; a single caller on a `Database` nobody else touches is unaffected either way.
+
+DDL inside an atomic batch is only as atomic as the backing module allows, exactly as it is inside a `BEGIN` — `pragma ddl_transaction_policy = 'strict'` already refuses DDL whose module does not declare full transactionality.
 
 #### Explicit Transactions
 
@@ -675,7 +700,7 @@ const user = await db.get("select * from users where id = ?", [1]);
 A high-level async generator for executing a query and iterating over its results. Handles statement preparation, parameter binding, and automatic finalization. Accepts an optional `{ signal }` for cooperative cancellation (see [Cancelling an In-Flight Query](#cancelling-an-in-flight-query-abortsignal)).
 
 ### `db.beginTransaction()`, `db.commit()`, `db.rollback()`
-Standard transaction control methods.
+Standard transaction control methods. Each queues behind any statement already running and takes its decision when its turn comes: `beginTransaction()` throws `TransactionActiveError` only if a transaction is genuinely open at that point (it does **not** refuse merely because another caller's autocommit write is in flight, which also reads as "in a transaction" while it lasts), and `commit()` / `rollback()` throw `No transaction active` when nothing is open by then, rather than silently doing nothing. To make a group of statements indivisible, prefer [`db.exec(..., { transaction: true })`](#atomic-batches) over `beginTransaction()` + `exec` + `commit` on a `Database` other callers share.
 
 ### `db.getTable(schemaName: string | undefined, tableName: string): Table | undefined`
 Returns a public handle to a table for inspection and per-table event subscription, or `undefined` if the table does not exist or its owning module is not registered. The handle exposes `schemaName`, `tableName`, `schema`, `moduleName`, and `getEventEmitter()`. See the [Event System / Per-Table Subscription](#per-table-subscription-via-dbgettable) section for details and lifecycle caveats.
