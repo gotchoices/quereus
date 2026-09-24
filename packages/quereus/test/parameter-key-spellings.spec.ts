@@ -344,4 +344,49 @@ describe('Parameter key spellings', () => {
 			});
 		}
 	});
+	/**
+	 * A parameter name is caller text, so it can collide with an `Object.prototype`
+	 * member. Bound args used to be a plain `{}`, which answers `:toString` with an
+	 * inherited function: `select :toString` returned a JS function as a SQL value
+	 * instead of reporting the parameter unbound.
+	 */
+	describe('parameters named after Object.prototype members', () => {
+		for (const name of ['toString', 'constructor', 'valueOf', 'hasOwnProperty'] as const) {
+			it(`reports :${name} unbound when nothing was bound`, async () => {
+				let error: Error | undefined;
+				try {
+					await db.get(`select :${name} as v`);
+				} catch (e) {
+					error = e as Error;
+				}
+				expect(error, `expected the unbound :${name} to be reported`).to.exist;
+				expect(error!.message).to.include(`Parameter with name '${name}' not found`);
+			});
+
+			it(`resolves :${name} when it IS bound`, async () => {
+				expect(await db.get(`select :${name} as v`, { [`:${name}`]: VALUE })).to.deep.equal({ v: VALUE });
+			});
+		}
+
+		it('reports an unbound prototype-named parameter through db.exec too', async () => {
+			let error: Error | undefined;
+			try {
+				await db.exec('insert into probe (id, v) values (1, :toString)', { other: VALUE });
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, 'expected the unbound :toString to be reported').to.exist;
+			expect(error!.message).to.include(`Parameter with name 'toString' not found`);
+		});
+
+		it('leaves a prototype-named parameter in unboundParameters for getChangeScope', async () => {
+			const stmt = db.prepare('select * from probe where id = :toString');
+			try {
+				expect(stmt.getChangeScope({}).unboundParameters).to.deep.equal(['toString']);
+				expect(stmt.getChangeScope({ ':toString': VALUE }).unboundParameters).to.deep.equal([]);
+			} finally {
+				await stmt.finalize();
+			}
+		});
+	});
 });

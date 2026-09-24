@@ -15,16 +15,20 @@ export function buildParameterSpec(plan: ParameterReferenceNode): ScalarOpSpec {
 		if (typeof identifier === 'number') {
 			// For ? (anonymous) parameters, identifier is a 1-based index.
 			// boundArgs stores numeric keys directly (e.g., { 1: value, 2: value }).
-			const key = identifier;
-			if (!(key in params)) {
+			if (!Object.hasOwn(params, identifier)) {
 				throw new QuereusError(`Parameter index ${identifier} is out of bounds.`, StatusCode.RANGE);
 			}
-			return params[key];
+			return params[identifier];
 		} else if (typeof identifier === 'string') {
 			// For named parameters like :name. Both sides are already bare: the planner
 			// strips the prefix when it builds `nameOrIndex`, and every bound key passes
 			// through `normalizeBoundParams` on the way into `params`.
-			if (!(identifier in params)) {
+			//
+			// `hasOwn`, not `in`: the name comes from user SQL, and a run site that builds
+			// its RuntimeContext by hand still passes a plain `{}` (const-evaluator,
+			// deferred-constraint-queue, ...), where `'toString' in params` is true and
+			// would hand the query an inherited function instead of reporting it unbound.
+			if (!Object.hasOwn(params, identifier)) {
 				throw new QuereusError(`Parameter with name '${identifier}' not found.`, StatusCode.NOTFOUND);
 			}
 			return params[identifier];

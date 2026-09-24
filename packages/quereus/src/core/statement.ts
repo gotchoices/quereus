@@ -19,7 +19,7 @@ import type { VirtualTable } from '../vtab/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
-import { boundKeyToParamKey, getParameterTypes, normalizeBoundParams } from './param.js';
+import { boundKeyToParamKey, emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
@@ -51,7 +51,7 @@ export class Statement {
 	private astBatchIndex: number = -1;
 	private finalized = false;
 	private busy = false;
-	private boundArgs: Record<number | string, SqlValue> = {};
+	private boundArgs: Record<number | string, SqlValue> = emptyBoundParams();
 	private plan: BlockNode | null = null;
 	private emissionContext: EmissionContext | null = null;
 	/**
@@ -774,7 +774,7 @@ export class Statement {
 	clearBindings(): this {
 		this.validateStatement("clear bindings for");
 		if (this.busy) throw new MisuseError("Statement busy, reset first");
-		this.boundArgs = {};
+		this.boundArgs = emptyBoundParams();
 		// Don't set needsCompile - parameter types are preserved
 		return this;
 	}
@@ -786,7 +786,7 @@ export class Statement {
 		if (this.finalized) return;
 		this.finalized = true;
 		this.busy = false;
-		this.boundArgs = {};
+		this.boundArgs = emptyBoundParams();
 		this.plan = null;
 		this.emissionContext = null;
 		this.scheduler = null;

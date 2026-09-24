@@ -886,4 +886,27 @@ describe('Parser', () => {
 			expect(parse(out)).to.have.property('type', 'drop');
 		});
 	});
+	// The lexer classifies identifiers with `KEYWORDS[text.toLowerCase()]`. While
+	// KEYWORDS was a plain object literal that inherited from `Object.prototype`,
+	// the two identifiers whose lowercase form names a prototype member came back
+	// as functions instead of `undefined`, so they were rejected as non-identifiers.
+	describe('identifiers that collide with Object.prototype members', () => {
+		for (const name of ['constructor', '__proto__'] as const) {
+			it(`accepts '${name}' as a column name`, () => {
+				const stmt = parse(`select ${name} from t`) as SelectStmt;
+				const col = stmt.columns[0];
+				expect(col.type).to.equal('column');
+			});
+
+			it(`accepts '${name}' as a parameter name`, () => {
+				const expr = parseExpr(`:${name}`);
+				expect(expr.type).to.equal('parameter');
+				expect(expr).to.have.property('name', name);
+			});
+
+			it(`accepts '${name}' in a column definition`, () => {
+				expect(() => parse(`create table t (id integer primary key, ${name} integer)`)).to.not.throw();
+			});
+		}
+	});
 });

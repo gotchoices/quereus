@@ -32,14 +32,11 @@ export function getParameterTypes(params: SqlParameters | undefined): Map<string
 			});
 		} else {
 			Object.entries(params).forEach(([key, value]) => {
-				// For named params like ':name', ParameterScope expects 'name' as key for hints.
-				// A positional param bound after prepare (bind/bindAll) lands here too, keyed
-				// by its stringified index (`boundArgs[index + 1]`) — normalize it back to a
-				// number so it lines up with the array branch above and with ParameterScope's
-				// own key, rather than silently missing the hint lookup.
-				// Bound args have already passed through normalizeBoundParams, so the key is
-				// bare; boundKeyToParamKey is idempotent on it and costs nothing, and it keeps
-				// this function correct for any caller that hands it a raw object.
+				// ParameterScope keys hints by the bare name, or by the 1-based index for a
+				// positional slot — which arrives here stringified (`boundArgs[index + 1]`)
+				// and has to become a number again or the hint lookup silently misses.
+				// Bound args are already normalized and boundKeyToParamKey is idempotent on
+				// them; running it anyway keeps this correct for a caller passing a raw object.
 				results!.set(boundKeyToParamKey(key), getParameterScalarType(value));
 			});
 		}
@@ -88,7 +85,7 @@ export function normalizeBoundParams(
 	params: SqlParameters | SqlValue[],
 	label: string,
 ): Record<string | number, SqlValue> {
-	const out: Record<string | number, SqlValue> = {};
+	const out = emptyBoundParams();
 	if (Array.isArray(params)) {
 		params.forEach((value, index) => {
 			assertSqlValue(value, `${label}: invalid value at index ${index}`);
@@ -110,6 +107,20 @@ export function normalizeBoundParams(
 		out[paramKey] = canonicalizeSqlValue(value);
 	}
 	return out;
+}
+
+/**
+ * An empty bound-args record, and the only shape one should ever start from.
+ *
+ * Null-prototype on purpose: bound args are looked up BY NAME with keys that come
+ * from user SQL, so a plain `{}` answers `:toString`, `:constructor`, `:valueOf`
+ * and friends with an inherited function instead of reporting the parameter
+ * unbound — `select :toString` returned a JS function as a SQL value rather than
+ * raising. Dropping the prototype makes that whole class unrepresentable at the
+ * source instead of asking every reader to remember `Object.hasOwn`.
+ */
+export function emptyBoundParams(): Record<string | number, SqlValue> {
+	return Object.create(null) as Record<string | number, SqlValue>;
 }
 
 function assertSqlValue(value: SqlValue, context: string): void {

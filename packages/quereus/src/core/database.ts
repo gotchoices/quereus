@@ -48,7 +48,7 @@ import { DeclaredSchemaManager } from '../schema/declared-schema-manager.js';
 import { DeferredConstraintQueue } from '../runtime/deferred-constraint-queue.js';
 import { type LogicalType, type CollationResolver, type KeyNormalizer, type KeyNormalizerResolver } from '../types/logical-type.js';
 import { registerType as registerTypeInRegistry } from '../types/registry.js';
-import { getParameterTypes, normalizeBoundParams } from './param.js';
+import { emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
@@ -924,7 +924,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		// [5n])` would carry an uncanonicalized value all the way into a write, and
 		// `db.exec(sql, {':p': 1})` would never resolve `:p`. Done BEFORE _buildPlan so
 		// the plan is typed from the same keys the runtime will look up.
-		const boundArgs = params === undefined ? {} : normalizeBoundParams(params, 'exec');
+		const boundArgs = params === undefined ? emptyBoundParams() : normalizeBoundParams(params, 'exec');
 
 		const { plan } = this._buildPlan([statementAst], params === undefined ? undefined : boundArgs);
 

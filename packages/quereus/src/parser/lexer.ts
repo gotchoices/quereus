@@ -190,8 +190,14 @@ export interface Token {
 	endOffset: number;
 }
 
-// Reserved keywords mapping
-export const KEYWORDS: Record<string, TokenType> = {
+// Reserved keywords mapping.
+//
+// Null-prototype: the lexer looks this up with arbitrary identifier text
+// (`KEYWORDS[text] || IDENTIFIER`), so an inherited member classifies a perfectly
+// legal identifier as a keyword — `constructor` and `__proto__` both lowercase
+// onto `Object.prototype` members, and `create table t (constructor integer)`
+// failed to parse because of it.
+export const KEYWORDS: Record<string, TokenType> = Object.assign(Object.create(null) as Record<string, TokenType>, {
 	'select': TokenType.SELECT,
 	'from': TokenType.FROM,
 	'where': TokenType.WHERE,
@@ -310,7 +316,7 @@ export const KEYWORDS: Record<string, TokenType> = {
 	// to avoid breaking schema() function calls and column names like 'version', 'seed'
 	'apply': TokenType.APPLY,
 	'explain': TokenType.EXPLAIN,
-};
+});
 
 /**
  * Reserved words that the lexer tokenizes specially but which SQL still permits as
