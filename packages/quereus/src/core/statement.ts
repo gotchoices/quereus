@@ -73,8 +73,19 @@ export class Statement {
 	private needsCompile = true;
 	private columnDefCache = new Cached<DeepReadonly<ColumnDef>[]>(() => this.getColumnDefs());
 	private schemaChangeUnsubscriber: (() => void) | null = null;
-	/** Parameter types established at prepare time (either explicit or inferred from initial values) */
+	/**
+	 * Parameter types established from the first binding source — explicit hints or
+	 * values at `prepare()`, otherwise the first `bind`/`bindAll`/execution-time
+	 * parameters. Undefined until then; see {@link establishParameterTypes}.
+	 */
 	private parameterTypes: Map<string | number, ScalarType> | undefined = undefined;
+	/**
+	 * True when the cached plan was built before any parameter type was established,
+	 * so every parameter in it announces ANY. Such a plan is provisional: the first
+	 * binding discards it ({@link dropProvisionalPlanOnBind}) so the next compile can
+	 * plan against the bound values' real types.
+	 */
+	private planTypesProvisional = false;
 	/**
 	 * Parameter names/indices used directly as a comparand in a scalar comparison
 	 * (`= <> < <= > >=` / `IN` / `BETWEEN`) against a non-object scalar operand.
@@ -168,12 +179,9 @@ export class Statement {
 		if (this.busy) throw new MisuseError("Statement busy, reset or complete current iteration first.");
 		if (this.astBatchIndex < this.astBatch.length - 1) {
 			this.astBatchIndex++;
-			this.plan = null;
-			this.emissionContext = null;
-			this.scheduler = null;
-			this.needsCompile = true;
-			this.columnDefCache.clear();
+			this.invalidatePlan();
 			this.parameterTypes = undefined;
+			this.planTypesProvisional = false;
 			return true;
 		} else {
 			return false;
@@ -188,6 +196,63 @@ export class Statement {
 		return astToString(this.getAstStatement());
 	}
 
+	/**
+	 * Drops the compiled plan and everything derived from it, so the next
+	 * {@link compile} rebuilds. THE one invalidation set — every caller that
+	 * invalidates (schema change, statement advance, first bind onto a provisional
+	 * plan) goes through here so none can forget a member and leave, say, a stale
+	 * scheduler emitted from a discarded plan.
+	 */
+	private invalidatePlan(): void {
+		this.needsCompile = true;
+		this.plan = null;
+		this.emissionContext = null;
+		this.scheduler = null;
+		this.columnDefCache.clear();
+	}
+
+	/**
+	 * The parameter types to plan with. Establishes them, once, from the first
+	 * binding source that has any: explicit hints or values handed to `prepare()`
+	 * (the constructor sets them directly), otherwise the values bound since.
+	 *
+	 * Returns undefined while NOTHING is bound. That case must not be recorded as an
+	 * established-but-empty map: an empty map is indistinguishable from "typed, and
+	 * there are none", and recording it would freeze every parameter at ANY even
+	 * after values arrive.
+	 */
+	private establishParameterTypes(): Map<string | number, ScalarType> | undefined {
+		if (this.parameterTypes === undefined) {
+			const inferred = getParameterTypes(this.boundArgs);
+			if (inferred && inferred.size > 0) this.parameterTypes = inferred;
+		}
+		return this.parameterTypes;
+	}
+
+	/**
+	 * Called after every bind: a plan built with no established types announced every
+	 * parameter as ANY, so once a value arrives that plan no longer describes the
+	 * query that will run. Discard it and let the next compile establish real types.
+	 *
+	 * Costs at most one extra compile per statement — the flag clears as soon as
+	 * types are established, and a statement prepared with values or hints never sets
+	 * it in the first place.
+	 *
+	 * NOTE: `all(params)` / `get(params)` on a statement prepared WITHOUT values read
+	 * `getColumnNames()` (which compiles, provisionally) before handing `params` down,
+	 * so they pay that extra compile on their first execution. Harmless: a result
+	 * column's name and the column count come from the projection, not from parameter
+	 * types, so the names read off the provisional plan are the final ones. If the
+	 * extra compile ever shows up in a profile, bind at those call sites before reading
+	 * names and pass `undefined` downstream, as {@link Database.get} already does.
+	 */
+	private dropProvisionalPlanOnBind(): void {
+		if (!this.planTypesProvisional) return;
+		if (Object.keys(this.boundArgs).length === 0) return;
+		this.planTypesProvisional = false;
+		this.invalidatePlan();
+	}
+
 	/** @internal Plans the current AST statement */
 	public compile(): BlockNode {
 		if (this.plan && !this.needsCompile) return this.plan;
@@ -200,24 +265,18 @@ export class Statement {
 		try {
 			const currentAst = this.getAstStatement();
 
-			// On first compilation, establish the parameter types
-			// Use explicit types if provided, otherwise infer from bound args
-			// NOTE: this freezes on the FIRST compile, and empty bound args yield an empty
-			// (but established) map — so compiling before any bind (getColumnDefs()/isQuery()
-			// on a freshly prepared statement) permanently leaves every parameter at the
-			// default TEXT type, while binding first types them from the values. The
-			// execution paths bind before compiling, so this only shows through pre-bind
-			// introspection. Deliberate: re-inferring per bind would recompile the plan on
-			// every execution and defeat validateParameterTypes' frozen-type check. Revisit
-			// (invalidate the plan on a type-changing bind) if pre-bind introspection ever
-			// needs to agree with the executed plan.
-			if (this.parameterTypes === undefined) {
-				// Infer types from current bound args
-				this.parameterTypes = getParameterTypes(this.boundArgs);
-			}
+			// Types are established from the first binding SOURCE, never from emptiness:
+			// compiling with nothing bound leaves them undefined and marks the plan
+			// provisional rather than freezing an empty (but established) map, which would
+			// pin every parameter at ANY for the statement's whole life. Once established
+			// they never change again — that frozen-type contract is what
+			// validateParameterTypes checks, and what lets repeated executions reuse one
+			// plan.
+			const parameterTypes = this.establishParameterTypes();
+			this.planTypesProvisional = parameterTypes === undefined;
 
 			// Pass parameter types directly to planning
-			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], this.parameterTypes, this._schemaPathOverride);
+			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], parameterTypes, this._schemaPathOverride);
 			// Collect array-valued-scalar-param guard targets from the LOGICAL plan,
 			// before the access-path optimizer folds `col = ?` comparisons into index
 			// seeks (which erases the comparison node). See validateParameterTypes.
@@ -271,11 +330,7 @@ export class Statement {
 
 					if (affectedDependency) {
 						log('Schema change invalidated plan for statement: %s %s', event.type, event.objectName);
-						this.needsCompile = true;
-						this.plan = null;
-						this.emissionContext = null;
-						this.scheduler = null;
-						this.columnDefCache.clear();
+						this.invalidatePlan();
 					}
 				});
 			}
@@ -321,6 +376,7 @@ export class Statement {
 		} else {
 			throw new MisuseError("Invalid argument key type");
 		}
+		this.dropProvisionalPlanOnBind();
 		return this;
 	}
 
@@ -353,6 +409,7 @@ export class Statement {
 		} else {
 			throw new MisuseError("Invalid parameters type for bindAll. Use array or object.");
 		}
+		this.dropProvisionalPlanOnBind();
 		return this;
 	}
 
@@ -1044,10 +1101,7 @@ export class Statement {
 	 */
 	private getAnalysisPlan(): BlockNode {
 		const currentAst = this.getAstStatement();
-		if (this.parameterTypes === undefined) {
-			this.parameterTypes = getParameterTypes(this.boundArgs);
-		}
-		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.parameterTypes, this._schemaPathOverride);
+		const { plan: rawPlan } = this.db._buildPlan([currentAst], this.establishParameterTypes(), this._schemaPathOverride);
 		return this.db.optimizer.optimizeForAnalysis(rawPlan, this.db) as BlockNode;
 	}
 

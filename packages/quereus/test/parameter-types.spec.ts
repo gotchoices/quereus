@@ -253,6 +253,143 @@ describe('Parameter Type System', () => {
 		});
 	});
 
+	describe('Parameter types are established from the first binding source', () => {
+		it('announces ANY before the first bind and the bound type after', async () => {
+			const stmt = db.prepare('select ? as v');
+			// Nothing is bound yet, so there is no type to announce — and this compile
+			// must NOT freeze that emptiness as the established answer.
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('ANY');
+			stmt.bindAll([9]);
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			await stmt.finalize();
+		});
+
+		it('keeps the first established type frozen across later binds', async () => {
+			const stmt = db.prepare('select ? as v');
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('ANY');
+			stmt.bindAll([9]);
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			// Established once, established for good: a REAL value is now a mismatch,
+			// not a re-inference.
+			stmt.bindAll([3.14]);
+			expect(stmt.getColumnDefs()[0].type.logicalType.name).to.equal('INTEGER');
+			let error: Error | undefined;
+			try {
+				await stmt.get();
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, 'expected a frozen-type mismatch').to.exist;
+			expect(error!.message).to.include('Parameter type mismatch');
+			await stmt.finalize();
+		});
+	});
+
+	describe('Cross-type parameter comparison agrees across entry points', () => {
+		// A statement compiled before its first bind plans every parameter as ANY, so no
+		// comparison-site coercion is minted and a cross-type comparison silently matches
+		// nothing. Every entry point that introspects (getColumnNames/getColumnDefs) before
+		// binding used to land there, while the ones that bind at prepare() did not — two
+		// eval() calls differing only in readConcurrency disagreed. This is the test for the
+		// whole class: one query, every entry point, same rows.
+		type Reader = (sql: string, params: SqlValue[]) => Promise<ResultRow[]>;
+
+		const drain = async (rows: AsyncIterable<ResultRow>): Promise<ResultRow[]> => {
+			const out: ResultRow[] = [];
+			for await (const row of rows) out.push(row);
+			return out;
+		};
+
+		const readers: ReadonlyArray<{ name: string; read: Reader }> = [
+			{ name: 'db.eval', read: (sql, params) => drain(db.eval(sql, params)) },
+			{
+				name: "db.eval readConcurrency: 'committed'",
+				read: (sql, params) => drain(db.eval(sql, params, { readConcurrency: 'committed' })),
+			},
+			{
+				// The batch's last statement is run by a Statement built inside _evalGenerator,
+				// which is a second compile-before-bind site.
+				name: 'db.eval over a multi-statement batch',
+				read: (sql, params) => drain(db.eval(`select 1 as ignored; ${sql}`, params)),
+			},
+			{
+				name: 'db.get',
+				read: async (sql, params) => {
+					const row = await db.get(sql, params);
+					return row ? [row] : [];
+				},
+			},
+			{
+				name: 'db.prepare(sql, params).all()',
+				read: async (sql, params) => {
+					const stmt = db.prepare(sql, params);
+					try {
+						return await drain(stmt.all());
+					} finally {
+						await stmt.finalize();
+					}
+				},
+			},
+			{
+				name: 'db.prepare(sql).all(params)',
+				read: async (sql, params) => {
+					const stmt = db.prepare(sql);
+					try {
+						return await drain(stmt.all(params));
+					} finally {
+						await stmt.finalize();
+					}
+				},
+			},
+			{
+				name: 'db.prepare(sql).get(params)',
+				read: async (sql, params) => {
+					const stmt = db.prepare(sql);
+					try {
+						const row = await stmt.get(params);
+						return row ? [row] : [];
+					} finally {
+						await stmt.finalize();
+					}
+				},
+			},
+			{
+				name: 'db.prepare(sql).bindAll(params).all()',
+				read: async (sql, params) => {
+					const stmt = db.prepare(sql);
+					try {
+						stmt.bindAll(params);
+						return await drain(stmt.all());
+					} finally {
+						await stmt.finalize();
+					}
+				},
+			},
+		];
+
+		const cases: ReadonlyArray<{ name: string; sql: string; params: SqlValue[] }> = [
+			{ name: 'integer parameter against a TEXT column', sql: 'select k from t where v = ?', params: [5] },
+			{ name: 'text parameter against an INTEGER column', sql: 'select k from u where n = ?', params: ['5'] },
+		];
+
+		beforeEach(async () => {
+			await db.exec('create table t (k integer primary key, v text)');
+			await db.exec("insert into t values (1, '5')");
+			await db.exec('create table u (k integer primary key, n integer)');
+			await db.exec('insert into u values (1, 5)');
+		});
+
+		for (const { name, sql, params } of cases) {
+			it(`returns the matching row through every entry point — ${name}`, async () => {
+				for (const reader of readers) {
+					const rows = await reader.read(sql, params);
+					expect(rows, `${reader.name}: ${sql} bound to ${JSON.stringify(params)}`)
+						.to.deep.equal([{ k: 1 }]);
+				}
+			});
+		}
+	});
+
 	describe('Named Parameters with Type Inference', () => {
 		beforeEach(async () => {
 			await db.exec(`

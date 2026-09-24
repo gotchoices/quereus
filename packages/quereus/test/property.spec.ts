@@ -287,6 +287,13 @@ describe('Property-Based Tests', () => {
 
 	// --- 2. Numeric Affinity ---
 	describe('Numeric Affinity', () => {
+		/** A numeric operand for coercion purposes; BOOLEAN is neither numeric nor textual. */
+		const isNumericOperand = (v: SqlValue): boolean => typeof v === 'number' || typeof v === 'bigint';
+
+		/** True for the one pairing the comparison-site coercion rewrites: numeric vs textual. */
+		const coercesAtComparison = (a: SqlValue, b: SqlValue): boolean =>
+			(isNumericOperand(a) && typeof b === 'string') || (typeof a === 'string' && isNumericOperand(b));
+
 		// Define an arbitrary that generates values representable as NULL, INTEGER, REAL, or TEXT that might look numeric
 		const sqlValueArbitrary = fc.oneof(
 			fc.constant(null),
@@ -349,10 +356,15 @@ describe('Property-Based Tests', () => {
 					expect(orderedValues).to.include(actualB);
 				}
 
-				// For non-NULL values, also test SQL boolean comparisons
-				// SELECT ? = ? uses storage class ordering (no column affinity coercion)
-				// NULL < INTEGER/REAL < TEXT < BLOB
-				if (actualA !== null && actualB !== null) {
+				// For non-NULL values, also test SQL boolean comparisons.
+				// `select ? = ?` ranks by storage class (NULL < INTEGER/REAL < TEXT < BLOB)
+				// EXCEPT where the engine's comparison-site coercion applies — a numeric
+				// operand against a textual one converts the text side (see
+				// src/types/comparison-coercion.ts), so `'!' = 0` is true. Those pairs are
+				// pinned by the dedicated coercion test below, against the literal spelling
+				// of the same comparison; here they would just re-encode the storage-class
+				// answer the coercion rule deliberately overrides.
+				if (actualA !== null && actualB !== null && !coercesAtComparison(actualA, actualB)) {
 					const expectedComparison = compareSqlValues(actualA, actualB);
 
 					let dbComparison: number;
@@ -385,6 +397,26 @@ describe('Property-Based Tests', () => {
 					);
 				}
 			}), { numRuns: 200 }); // Increase runs for more diverse value pairs
+		});
+
+		it('coerces a textual parameter against a numeric one, exactly as the literal spelling does', async () => {
+			// The counterpart to the exclusion above. A parameterised comparison is planned
+			// from the bound values' types, so `select ? = ?` now takes the same
+			// comparison-site coercion as the literal `select '5' = 5` — text converts to
+			// NUMERIC, and text that names no number converts to 0. The literal spelling is
+			// the oracle: the two must not disagree about one comparison.
+			const pairs: ReadonlyArray<[string, number]> = [
+				['5', 5],       // same value, different spelling
+				['!', 0],       // unparseable text converts to 0 (lenient cast)
+				['1e3', 1000],  // NUMERIC parses the whole spelling, not a digit prefix
+				['5', 6],       // plainly unequal
+				['1.5', 1],     // must not read as the integer prefix 1
+			];
+			for (const [text, num] of pairs) {
+				const literal = await db.get(`select ('${text}' = ${num}) as eq, ('${text}' < ${num}) as lt`);
+				const parameterised = await db.get('select (? = ?) as eq, (? < ?) as lt', [text, num, text, num]);
+				expect(parameterised, `('${text}', ${num})`).to.deep.equal(literal);
+			}
 		});
 	});
 

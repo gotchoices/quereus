@@ -846,10 +846,11 @@ stmt.bindAll({ ":id": 1, ":name": "John" }); // Named
 ```
 
 Parameter types are inferred from the values bound (or supplied to `db.prepare(sql, params)`)
-and are frozen at the statement's first compilation — later binds must stay type-compatible
-or they are rejected. Inspecting a freshly prepared statement before binding anything (e.g.
-`stmt.getColumnDefs()`) compiles it with no values to infer from, leaving its parameters at
-the default `TEXT` type; bind first if you need the announced types to reflect the values.
+and are frozen once established — later binds must stay type-compatible or they are rejected.
+Inspecting a freshly prepared statement before binding anything (e.g. `stmt.getColumnDefs()`)
+compiles it with no values to infer from, so its parameters announce `ANY`; that plan is
+provisional and is rebuilt on the first bind, after which the announced types reflect the
+bound values. See [Parameter Types](types-parameters.md).
 
 #### `stmt.reset(): Promise<void>`
 

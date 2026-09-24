@@ -4,9 +4,9 @@
 
 How a statement's parameters get their types — inferred from the values passed to `prepare()`
 or declared explicitly — and what is checked when those parameters are bound on each
-execution. Types are established at prepare time and validated on every execution, which buys
-type safety without giving up a user-friendly API for JavaScript developers. A satellite of
-[Quereus Type System](types.md).
+execution. Types are established from the **first binding source** and validated on every
+execution, which buys type safety without giving up a user-friendly API for JavaScript
+developers. A satellite of [Quereus Type System](types.md).
 
 ## Two Ways to Specify Parameter Types
 
@@ -40,7 +40,9 @@ the caller never passed. The single mapping lives in `inferLogicalTypeFromValue`
 A parameter with neither a bound value nor an explicit hint at plan time announces **ANY**,
 not a guess: `ANY` imposes no representation constraint, its `parse` is pass-through, and it
 is never identical to a declared column type, so every consumer converts. (It announced TEXT
-before, which made `select ? as v` report TEXT while yielding whatever was bound.)
+before, which made `select ? as v` report TEXT while yielding whatever was bound.) That is the
+*provisional* answer for an unbound statement — introspecting one and then binding re-announces
+the bound value's type, because the provisional plan is discarded on the first bind.
 
 **Note**: Strings are always inferred as TEXT type. Plain objects and arrays are inferred as JSON type. To use date/time types, either:
 - Use conversion functions in your query: `date(:param)`, `time(:param)`, `datetime(:param)`
@@ -48,12 +50,23 @@ before, which made `select ? as v` report TEXT while yielding whatever was bound
 
 ## Type Resolution and Validation
 
-Parameter types are established during the **planning phase** and validated on each execution:
+Parameter types are established from the first source that supplies one, and validated on each execution:
 
-1. **At prepare time**: Types are inferred from initial values or set via explicit parameter types
-2. **At execution time**: Parameter values are validated against the established types
-3. **No recompilation**: Prepared statements are NOT recompiled when parameter values change (only when types would change)
-4. **Type safety**: Attempting to execute with incompatible types throws an error
+1. **From the first binding source**: explicit hints or values handed to `prepare()`; otherwise the
+   first `bind()` / `bindAll()` / execution-time parameters (`stmt.all(params)`, `stmt.get(params)`,
+   `db.eval(sql, params)`). "Nothing bound yet" is never mistaken for "typed, and there are none".
+2. **Established once, then frozen**: later bindings are validated against those types, never
+   re-inferred. A statement prepared with values or hints is compiled exactly once.
+3. **At most one extra compile**: a statement compiled *before* its first bind — which happens when a
+   caller introspects (`getColumnNames()`, `getColumnDefs()`, `isQuery()`, `getPlanShape()`) first —
+   plans provisionally with every parameter at ANY, and that provisional plan is discarded on the
+   first bind so the executed plan sees the real types.
+4. **At execution time**: Parameter values are validated against the established types
+5. **No recompilation on value change**: Prepared statements are NOT recompiled when parameter values change
+6. **Type safety**: Attempting to execute with incompatible types throws an error
+
+`db.eval(sql, params)` and `db.get(sql, params)` both plan with the types of `params`, so every entry
+point answers a cross-type comparison (`where text_col = ?` bound to a number) the same way.
 
 ## Examples
 
@@ -142,7 +155,7 @@ Parameter type validation ensures type safety across executions:
 - **Canonical form at bind**: A bound value is canonicalized as it is stored (see [Physical representation](types.md#physical-representation)) — a `bigint` inside the safe-integer range narrows to `number`, so `stmt.bind(1, 5n)` is used, stored, and returned as `5`
 - **No implicit conversion**: Physical type mismatches are rejected with clear error messages
 - **Explicit conversion**: Use conversion functions like `integer()`, `real()`, `text()`, `date()`, etc. in your SQL to convert between types
-- **Array/object scalar guard**: A parameter used directly (through `CAST`s) as a comparand in a scalar comparison (`= <> < <= > >=`, `IN`, `BETWEEN`) against a non-object scalar operand may not be bound to a JS array or plain object. The OBJECT storage class sorts above every scalar, so such a binding could never match — instead of silently returning no rows it throws `StatusCode.MISMATCH` at bind time (e.g. `where id = ?` with `[[1, 2]]`). JSON-vs-JSON comparisons (`jsoncol = :p`, and an explicit `cast(col as json) = :p`), function arguments (`json_array_length(?)`), projections (`select ? as v`), and storing into a JSON column are never flagged. Collected by `src/planner/analysis/scalar-param-usage.ts` from the logical plan. The counterpart's type is read *through* the coercion casts the planner mints for a comparison (`id = ?` with a JSON-typed `?` is built as `cast(id as json) = ?`) — without that the guard would see an OBJECT counterpart and go silent on every path that types its parameters; user-written casts stay opaque, so a deliberate JSON comparison is still allowed. One consequence: comparing a **text** column to an array-bound parameter (`textcol = :p`) is rejected even though the [JSON coercion](types.md#special-types) would have made it match a row whose text is that array's JSON source — `db.eval` plans the parameter as ANY, mints no coercion, and there it truly cannot match, so both entry points reject it. Write `cast(textcol as json) = :p` to opt into the JSON comparison.
+- **Array/object scalar guard**: A parameter used directly (through `CAST`s) as a comparand in a scalar comparison (`= <> < <= > >=`, `IN`, `BETWEEN`) against a non-object scalar operand may not be bound to a JS array or plain object. The OBJECT storage class sorts above every scalar, so such a binding could never match — instead of silently returning no rows it throws `StatusCode.MISMATCH` at bind time (e.g. `where id = ?` with `[[1, 2]]`). JSON-vs-JSON comparisons (`jsoncol = :p`, and an explicit `cast(col as json) = :p`), function arguments (`json_array_length(?)`), projections (`select ? as v`), and storing into a JSON column are never flagged. Collected by `src/planner/analysis/scalar-param-usage.ts` from the logical plan. The counterpart's type is read *through* the coercion casts the planner mints for a comparison (`id = ?` with a JSON-typed `?` is built as `cast(id as json) = ?`) — without that the guard would see an OBJECT counterpart and go silent on every path that types its parameters; user-written casts stay opaque, so a deliberate JSON comparison is still allowed. One consequence: comparing a **text** column to an array-bound parameter (`textcol = :p`) is rejected even though the [JSON coercion](types.md#special-types) would have made it match a row whose text is that array's JSON source — the guard reads through the minted `cast(textcol as json)` to the column's own TEXT type and fires. Write `cast(textcol as json) = :p` to opt into the JSON comparison.
 
 **Examples of physical type compatibility:**
 - INTEGER physical type accepts: `number` (integer), `bigint`
@@ -166,7 +179,7 @@ The parameter type system provides significant performance benefits:
 **Key files:**
 - `src/core/database.ts` - `prepare()` accepts parameter values or explicit types; `_buildPlan()` passes parameter types to planning
 - `src/core/statement.ts` - Statement class manages parameter types and validation
-- `src/core/param.ts` - `getParameterTypes()` infers types from parameter values
+- `src/core/param.ts` - `getParameterTypes()` infers types from parameter values (a bare `name` key takes precedence over the `:name` spelling of the same parameter, matching the bind-time value lookup)
 - `src/types/logical-type.ts` - `getPhysicalType()` determines physical type from JavaScript values; `physicalTypeName()` provides human-readable names
 - `src/planner/scopes/param.ts` - `ParameterScope` receives parameter types directly and uses them during planning
 

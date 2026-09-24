@@ -2203,7 +2203,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		let stmt: Statement | null = null;
 
 		try {
-			stmt = this.prepare(sql);
+			// Prepare WITH the parameters so the plan is typed from their values, not
+			// from emptiness: `getColumnNames()` below compiles, and a statement compiled
+			// before its first bind plans every parameter as ANY (see
+			// Statement.establishParameterTypes).
+			stmt = this.prepare(sql, params);
 
 			if (stmt.astBatch.length === 0) {
 				return;
@@ -2216,19 +2220,23 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 					await this._executeSingleStatement(stmt.astBatch[i], params, signal);
 				}
 
-				const lastStmt = new Statement(this, [stmt.astBatch[stmt.astBatch.length - 1]]);
+				const lastStmt = new Statement(this, [stmt.astBatch[stmt.astBatch.length - 1]], 0, params);
 				this.statements.add(lastStmt);
 				try {
+					// Params were already bound (and their types inferred) by the constructor;
+					// don't re-pass them or _iterateRowsRaw would rebind + re-validate every
+					// value. Same reasoning as Database.get.
 					const names = lastStmt.getColumnNames();
-					for await (const row of lastStmt._iterateRowsRaw(params, signal)) {
+					for await (const row of lastStmt._iterateRowsRaw(undefined, signal)) {
 						yield rowToObject(row, names);
 					}
 				} finally {
 					await lastStmt.finalize();
 				}
 			} else {
+				// Params were already bound by prepare() above — see Database.get.
 				const names = stmt.getColumnNames();
-				for await (const row of stmt._iterateRowsRaw(params, signal)) {
+				for await (const row of stmt._iterateRowsRaw(undefined, signal)) {
 					yield rowToObject(row, names);
 				}
 			}

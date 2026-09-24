@@ -48,13 +48,13 @@ function paramOperand(node: ScalarPlanNode): ParameterReferenceNode | undefined 
  *
  * NOTE: unwrapping leaves the guard's "could never match" premise slightly
  * pessimistic for a TEXT counterpart. `textcol = :p` with an array-bound `:p`
- * builds as `cast(textcol as json) = :p` on a type-inferring path, so a row whose
- * text *is* JSON source for that array would have matched. It is rejected anyway,
- * so the two entry points agree — `db.eval` plans the parameter as ANY, mints no
- * coercion, and there the comparison really can never match. `cast(col as json) =
- * :p` is the spelling that opts into the JSON comparison on both (see
- * docs/types-parameters.md). Revisit only if the typed and untyped paths stop
- * needing to agree on this.
+ * builds as `cast(textcol as json) = :p`, so a row whose text *is* JSON source for
+ * that array would have matched. It is rejected anyway: which coercion the planner
+ * mints is a detail of reconciling operand types, and letting it decide whether an
+ * array-bound scalar comparand is an error would make the diagnostic depend on the
+ * counterpart's declared type. `cast(col as json) = :p` is the spelling that opts
+ * into the JSON comparison (see docs/types-parameters.md). Revisit if a bare
+ * `textcol = :p` against JSON-source text ever needs to match.
  */
 function unwrapSyntheticCasts(node: ScalarPlanNode): ScalarPlanNode {
 	let cur = node;

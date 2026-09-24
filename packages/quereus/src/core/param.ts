@@ -35,7 +35,13 @@ export function getParameterTypes(params: SqlParameters | undefined): Map<string
 				// by its stringified index (`boundArgs[index + 1]`) — normalize it back to a
 				// number so it lines up with the array branch above and with ParameterScope's
 				// own key, rather than silently missing the hint lookup.
-				const name = key.startsWith(':') ? key.substring(1) : key;
+				const prefixed = key.startsWith(':');
+				const name = prefixed ? key.substring(1) : key;
+				// One bound object can carry BOTH spellings of a name (':p' and 'p'). The
+				// bind-time value lookup (Statement.validateParameterTypes) gives the BARE
+				// key precedence, so the hint has to come from the same entry — otherwise
+				// the plan is typed from one value and validated against another.
+				if (prefixed && Object.hasOwn(params, name)) return;
 				results!.set(normalizeParamKey(name), getParameterScalarType(value));
 			});
 		}

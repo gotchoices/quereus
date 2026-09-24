@@ -60,20 +60,19 @@ describe('Array-valued scalar parameter guard', () => {
 	}
 
 	/**
-	 * The two ways a query reaches the planner, differing in whether the plan knows
-	 * the parameter's type. `db.eval` plans before binding, so its parameters stay
-	 * ANY; every `prepare`-based path (`db.get`, `db.prepare(...).all()`, an eval
-	 * carrying execution options) infers the type from the bound value, and a
-	 * JSON-typed parameter makes the planner wrap the *scalar* side of the
-	 * comparison in a coercion cast — `id = ?` builds as `cast(id as json) = ?`.
-	 * The guard used to read that cast's type, conclude the counterpart was not
-	 * scalar, and go silent on exactly the typed paths (ticket
+	 * The two ways a query reaches the planner. Both now plan from the bound values'
+	 * types (`db.eval` passes its parameters to `prepare` — see
+	 * `docs/types-parameters.md`), and a JSON-typed parameter makes the planner wrap
+	 * the *scalar* side of the comparison in a coercion cast: `id = ?` builds as
+	 * `cast(id as json) = ?`. The guard used to read that cast's type, conclude the
+	 * counterpart was not scalar, and go silent (ticket
 	 * `array-param-guard-defeated-by-coercion-cast`), so every case below runs on
-	 * both.
+	 * both entry points — they exercise different Statement lifecycles even though
+	 * they now agree on parameter typing.
 	 */
 	const paths: readonly { readonly name: string; readonly run: (sql: string, params?: Params) => Promise<ResultRow[]> }[] = [
-		{ name: 'db.eval (untyped parameters)', run: (sql, params) => collect(sql, params) },
-		{ name: 'db.prepare (typed parameters)', run: (sql, params) => collectPrepared(sql, params) },
+		{ name: 'db.eval', run: (sql, params) => collect(sql, params) },
+		{ name: 'db.prepare', run: (sql, params) => collectPrepared(sql, params) },
 	];
 
 	for (const path of paths) {
@@ -135,12 +134,13 @@ describe('Array-valued scalar parameter guard', () => {
 				});
 
 				it('bare textcol = :p, even where JSON coercion could have matched', async () => {
-					// The deliberate pessimism of reading through the coercion cast: on a
-					// typed path `doc = :p` builds as `cast(doc as json) = :p`, which would
-					// have matched row 1. It is rejected anyway so that `db.eval` — which
-					// plans `:p` as ANY, mints no coercion, and genuinely cannot match —
-					// gives the same answer. `cast(doc as json) = :p` is the spelling that
-					// opts into the JSON comparison; see the over-fire group below.
+					// The deliberate pessimism of reading through the coercion cast: `doc = :p`
+					// builds as `cast(doc as json) = :p`, which would have matched row 1. The
+					// guard looks THROUGH that minted cast to the column's own TEXT type and
+					// rejects anyway, so an array bound to a scalar comparand reads the same
+					// however the planner happened to reconcile the operands.
+					// `cast(doc as json) = :p` is the spelling that opts into the JSON
+					// comparison; see the over-fire group below.
 					await db.exec('create table jt (id integer primary key, doc text) using memory');
 					await db.exec(`insert into jt (id, doc) values (1, '[1,2,3]'), (2, '[4,5]')`);
 					await expectMismatch('select id from jt where doc = :p', { p: [1, 2, 3] });
@@ -201,12 +201,11 @@ describe('Array-valued scalar parameter guard', () => {
 	}
 
 	describe('db.eval carrying execution options', () => {
-		// Options make `eval` route through `prepare`, so its parameters are typed and
-		// the comparison gets the coercion cast — the third entry point the original
-		// ticket named as silently returning nothing. One case rather than a fourth
-		// `paths` entry: the property that distinguishes an entry point here is only
-		// whether the plan knows the parameter's type, which this shares with
-		// `db.prepare`, so replaying all 17 cases would discriminate nothing.
+		// The committed-read route is a third entry point with its own Statement
+		// lifecycle (`_evalRoutedGenerator`), and the original ticket named it as
+		// silently returning nothing. One case rather than a third `paths` entry: it
+		// reaches the same typed plan as `db.prepare`, so replaying all 17 cases would
+		// discriminate nothing.
 		it('throws on id = ? with an array-bound parameter', async () => {
 			let error: Error | undefined;
 			try {
@@ -256,21 +255,24 @@ describe('Array-valued scalar parameter guard', () => {
 		// masked by (and could wrongly adopt) an unrelated `:key` value. The fix uses
 		// a presence check, so a bound `null` is honored.
 		//
-		// Eval-only by design: this binds both spellings of one name at once, and the
-		// typed paths infer that parameter's *type* from the same map, where the array
-		// alternate wins and the bound null then fails an ordinary parameter type check
-		// before the guard is reached. That collision is about type inference over a
-		// double-spelled key, not about this guard.
-		it('honors a null bare binding rather than the :-prefixed alternate', async () => {
-			// Both keys present: bare `needle` bound to null (a valid scalar), and the
-			// `:needle` alternate bound to an array. The bound null must win — falling
-			// through to the array would wrongly raise the array-valued-scalar mismatch.
-			const rows = await collect('select * from t where name = :needle', {
-				needle: null,
-				':needle': [1, 2],
+		// Binding both spellings of one name at once also settles which entry the plan is
+		// TYPED from: `getParameterTypes` skips the `:`-prefixed entry when the bare key
+		// is present, matching the guard's precedence. Without that agreement the plan
+		// would be typed JSON from the array alternate while the bound null is validated
+		// against it, and the run would die on an ordinary parameter type check before
+		// the guard was ever reached.
+		for (const path of paths) {
+			it(`honors a null bare binding rather than the :-prefixed alternate — ${path.name}`, async () => {
+				// Both keys present: bare `needle` bound to null (a valid scalar), and the
+				// `:needle` alternate bound to an array. The bound null must win — falling
+				// through to the array would wrongly raise the array-valued-scalar mismatch.
+				const rows = await path.run('select * from t where name = :needle', {
+					needle: null,
+					':needle': [1, 2],
+				});
+				// `name = NULL` matches nothing, but crucially raises no error.
+				expect(rows).to.have.length(0);
 			});
-			// `name = NULL` matches nothing, but crucially raises no error.
-			expect(rows).to.have.length(0);
-		});
+		}
 	});
 });
