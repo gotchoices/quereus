@@ -733,9 +733,8 @@ describe('alter table replication', () => {
 
 		it('a foreign key the batch satisfies applies on the FIRST round', async () => {
 			// The second row-validating `addConstraint` arm: the receiver's row is an
-			// orphan until the batch's own update re-points it. (The `check` arm is
-			// classified alongside these two but the engine does not scan existing rows
-			// for it today — see `bug-add-check-constraint-skips-existing-rows`.)
+			// orphan until the batch's own update re-points it. (The `check` arm scans
+			// too, engine-side, and is classified alongside these two.)
 			await localWrite(a, 'create table parent (pid integer primary key) using store');
 			await localWrite(a, 'alter table orders add column pid integer null');
 			await localWrite(a, 'insert into parent (pid) values (1)');

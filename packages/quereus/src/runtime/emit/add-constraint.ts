@@ -8,7 +8,7 @@ import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import type { Schema } from '../../schema/schema.js';
 import { assertConstraintNameFree, collectTableConstraintNames, requireVtabModule, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
-import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
+import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, validateChecksOverExistingRows, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
@@ -101,6 +101,10 @@ async function runAddCheckEngineSide(
 		tableSchema.checkConstraints.length,
 		collectTableConstraintNames(tableSchema),
 	);
+
+	// Existing rows must already satisfy the CHECK — BEFORE `schema.addTable` below, for
+	// the reason spelled out on `rejectCheckViolatedByExistingRows`.
+	await rejectCheckViolatedByExistingRows(rctx, tableSchema, constraintSchema);
 
 	const updatedConstraints = [...tableSchema.checkConstraints, constraintSchema];
 	const updatedTableSchema: TableSchema = {
@@ -230,6 +234,21 @@ async function runAddConstraintViaModule(
 		assertUniqueConstraintIndexNameFree(tableSchema, constraint.name, columnNames, operation);
 	}
 
+	// A CHECK is validated against the existing rows HERE, engine-side and pre-dispatch,
+	// rather than by each module: the UNIQUE and FOREIGN KEY arms of the memory and store
+	// modules each scan, but their CHECK arms were schema-only — two modules, one omission
+	// each, and any third-party module inherits the same trap. Same pre-dispatch reasoning
+	// as the FK and UNIQUE guards above (nothing is mutated yet, so a rejection needs no
+	// unwind and persists nothing), plus one more that is load-bearing — see
+	// `rejectCheckViolatedByExistingRows`.
+	if (constraint.type === 'check') {
+		await rejectCheckViolatedByExistingRows(
+			rctx,
+			tableSchema,
+			buildCheckConstraintSchema(constraint, tableSchema.checkConstraints.length, collectTableConstraintNames(tableSchema)),
+		);
+	}
+
 	// `ddl` marks this call as the statement's own action — unlike the per-inline-constraint
 	// installs `runAddColumn` makes through the same arm, which pass none and stay silent.
 	const updatedTableSchema = await module.alterTable(
@@ -259,4 +278,37 @@ async function runAddConstraintViaModule(
 		constraint.type, constraint.name || 'unnamed', tableSchema.schemaName, tableSchema.name);
 
 	return null;
+}
+
+/**
+ * Rejects `ADD CONSTRAINT … CHECK` when a row already in the table violates it — with
+ * `CONSTRAINT`, leaving the catalog, the module's cached schema and any persistence
+ * exactly as they were. Shared by both arms above.
+ *
+ * MUST run before the constraint is declared anywhere the planner can see it — ahead of
+ * `module.alterTable` (which updates the module's cached schema) and of `schema.addTable`
+ * (the catalog swap). The optimizer trusts a declared CHECK as a proven fact about every
+ * stored row and lifts it into domain constraints, so `ruleFilterContradiction` would fold
+ * the validation scan's own `where not (<expr>)` to nothing and the scan would pass
+ * vacuously — trusting the very thing it is testing. That lift is also WHY the validation
+ * exists: without it a violating row does not merely sit there contradicting the schema,
+ * it disappears from every query that asks for it (`select … where n <= 0` folds to
+ * empty under a lifted `check (n > 0)`). `runAddColumn` documents the identical discipline
+ * for its inline CHECKs (`alter-table.ts`, the column-only schema registration).
+ *
+ * `permitsGrandfatheredCheckViolators` is the opt-out: a module declaring it promises
+ * exactly the accepting behavior this guard removes, and in exchange the optimizer
+ * suppresses the CHECK lift for its tables, so the two halves of that contract stay
+ * consistent — same shape as `delegatesNotNullBackfill` gating `validateNotNullBackfill`.
+ * The scan itself (`new.` resolution, `old.` conjunct screen, operation-mask filter) is
+ * the one every existing-row CHECK path shares.
+ */
+async function rejectCheckViolatedByExistingRows(
+	rctx: RuntimeContext,
+	tableSchema: TableSchema,
+	check: RowConstraintSchema,
+): Promise<void> {
+	const module = requireVtabModule(tableSchema);
+	if (module.getCapabilities?.().permitsGrandfatheredCheckViolators === true) return;
+	await validateChecksOverExistingRows(rctx.db, tableSchema, [check]);
 }

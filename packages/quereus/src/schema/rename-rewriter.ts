@@ -6,11 +6,11 @@
  * table-qualified self-references (a CHECK's or a GENERATED ALWAYS AS body's)
  * so the row-context scope it is compiled against can resolve them.
  *
- * The three walkers live in `rename/`, split along their seams — table
+ * The walkers live in `rename/`, split along their seams — table
  * rename (`rename/table-rename.ts`), column rename
- * (`rename/column-rename.ts`), self-qualifier strip
- * (`rename/self-qualifier-strip.ts`) — over the shared vocabulary in
- * `rename/shared.ts`. This module re-exports the public surface so callers
+ * (`rename/column-rename.ts`), self-qualifier strip and its own-row
+ * requalifying twin (`rename/self-qualifier-strip.ts`) — over the shared
+ * vocabulary in `rename/shared.ts`. This module re-exports the public surface so callers
  * keep one import path.
  */
 
@@ -37,4 +37,4 @@ export {
 	bodyExposesRenamedColumn,
 	bodyPublishesColumnNamed,
 } from './rename/column-rename.js';
-export { stripSelfQualifierInSchemaExpression } from './rename/self-qualifier-strip.js';
+export { stripSelfQualifierInSchemaExpression, requalifyOwnRowRefsInSchemaExpression } from './rename/self-qualifier-strip.js';

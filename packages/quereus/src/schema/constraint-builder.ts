@@ -17,7 +17,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
-import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, disambiguateAutoConstraintName } from './table.js';
+import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, disambiguateAutoConstraintName, RowOpFlag } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -25,6 +25,9 @@ import { quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import { createLogger } from '../common/logger.js';
 import { columnSchemaToScalarType } from '../planner/type-utils.js';
 import { resolveComparisonCollation } from '../planner/analysis/comparison-collation.js';
+import { containsOldRowImageRef } from '../planner/analysis/check-extraction.js';
+import { cloneExpr } from '../planner/mutation/scope-transform.js';
+import { requalifyOwnRowRefsInSchemaExpression } from './rename-rewriter.js';
 
 const log = createLogger('schema:constraint-builder');
 
@@ -357,22 +360,99 @@ export function maintainedTableUniqueViolationError(
 }
 
 /**
+ * The alias the existing-row CHECK scan gives the scanned table, and the qualifier
+ * every own-row reference in the CHECK is rewritten to
+ * ({@link requalifyOwnRowRefsInSchemaExpression}). Spelled so that no FROM source a
+ * user could write inside a CHECK subquery rebinds it.
+ */
+const STORED_ROW_ALIAS = '__quereus_stored_row__';
+
+/** Top-level AND-conjuncts of `expr`, the same split the optimizer's `walkConjunction` makes. */
+function topLevelConjuncts(expr: AST.Expression): AST.Expression[] {
+	const out: AST.Expression[] = [];
+	const stack: AST.Expression[] = [expr];
+	while (stack.length > 0) {
+		const cur = stack.pop()!;
+		if (cur.type === 'binary' && (cur as AST.BinaryExpr).operator === 'AND') {
+			const b = cur as AST.BinaryExpr;
+			// Right first so `out` keeps source order.
+			stack.push(b.right, b.left);
+			continue;
+		}
+		out.push(cur);
+	}
+	return out;
+}
+
+/**
+ * The part of a CHECK that every STORED row of `tableSchema` must satisfy, rendered
+ * so it plans over `from <table> as STORED_ROW_ALIAS` — or `undefined` when nothing
+ * in the CHECK can be judged from a row sitting still.
+ *
+ * This is the validation-side twin of the optimizer's row-invariant lift
+ * (`planner/analysis/check-extraction.ts`), and the two must not drift in either
+ * direction: the optimizer trusts a declared CHECK as a fact about every stored row
+ * and folds contradicting predicates away (`ruleFilterContradiction`), so whatever
+ * it lifts MUST have been validated by the scan this feeds — validate less and rows
+ * silently vanish from query results; validate more and legal statements start
+ * failing. Hence the same per-top-level-AND-conjunct split, and the optimizer's own
+ * screens:
+ *
+ *   - a conjunct referencing `old.<col>` is a transition constraint over the PREVIOUS
+ *     row image (`check (old.a is null or a >= old.a)`); it says nothing about a row
+ *     sitting still and the optimizer refuses to lift it — dropped, via the very
+ *     predicate the optimizer uses ({@link containsOldRowImageRef}). Its `old.`-free
+ *     siblings are kept: under SQL ternary logic `C1 AND C2` is FALSE whenever `C2`
+ *     is, so each such conjunct holds over stored rows on its own.
+ *   - `new.<col>` IS the stored row (the optimizer lifts it), so it is requalified to
+ *     the scan alias rather than left for the planner to reject as `new.<col> isn't a
+ *     column`; a self-qualified `<table>.<col>` gets the same treatment.
+ *
+ * Returns fresh AST (the stored constraint is never mutated).
+ */
+export function storedRowPredicate(check: RowConstraintSchema, tableSchema: TableSchema): AST.Expression | undefined {
+	const kept: AST.Expression[] = [];
+	for (const conjunct of topLevelConjuncts(check.expr)) {
+		if (containsOldRowImageRef(conjunct)) continue;
+		const clone = cloneExpr(conjunct);
+		requalifyOwnRowRefsInSchemaExpression(clone, tableSchema.name, tableSchema.schemaName, STORED_ROW_ALIAS);
+		kept.push(clone);
+	}
+	if (kept.length === 0) return undefined;
+	return kept.reduce((acc, next): AST.Expression => {
+		const conjunction: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc, right: next };
+		return conjunction;
+	});
+}
+
+/**
  * Validates a table's EXISTING (effective, pending-over-committed) rows against
- * each CHECK in `checks`, throwing on the first violating row. The table-wide
- * sibling of the ADD-COLUMN backfill scan (`validateBackfillAgainstChecks` in
- * `runtime/emit/alter-table.ts`): one `select 1 from <t> where not (<expr>)
- * limit 1` scan per CHECK, so the NULL-pass rule falls out of SQL semantics
- * (`not NULL` is NULL — the row is not a violation). A subquery-bearing CHECK
- * is just SQL here; the scan reads final pending state.
+ * each CHECK in `checks`, throwing on the first violating row. One shared scan
+ * for every path that installs a CHECK over rows that already exist —
+ * `ALTER TABLE … ADD CONSTRAINT … CHECK` and its engine-side fallback
+ * (`runtime/emit/add-constraint.ts`), `ALTER TABLE … ADD COLUMN … CHECK`
+ * (`validateBackfillAgainstChecks` in `runtime/emit/alter-table.ts`) and the
+ * maintained-table derivation (`runtime/emit/materialized-view-helpers.ts`) — so
+ * the `new.` / `old.` / operation-mask rules below are decided once. One
+ * `select 1 from <t> as <alias> where not (<stored-row predicate>) limit 1` scan per
+ * CHECK, so the NULL-pass rule falls out of SQL semantics (`not NULL` is NULL — the
+ * row is not a violation). A subquery-bearing CHECK is just SQL here; the scan
+ * reads final pending state through the ordinary read path, so rows the issuing
+ * transaction has staged but not committed count as present.
+ *
+ * Skipped outright: a CHECK whose operation mask covers neither INSERT nor UPDATE
+ * (a `check on delete (…)` constrains no stored row image), and a CHECK whose
+ * every conjunct is a transition constraint (see {@link storedRowPredicate} for
+ * why that set exactly matches what the optimizer trusts).
  *
  * CAUTION — declared-constraint folding: the optimizer trusts a DECLARED CHECK
  * as a proven domain invariant, so if the LIVE catalog entry for `tableSchema`
- * still declares the CHECK being validated, `ruleFilterContradiction` folds the
+ * already declares the CHECK being validated, `ruleFilterContradiction` folds the
  * `where not (<expr>)` scan to EmptyRelation and the validation vacuously
- * passes. Callers must scan against a live record that does NOT declare the
- * constraints under validation (see the stripped-schema swap in
- * `runtime/emit/materialized-view-helpers.ts`, mirroring the ADD COLUMN
- * intermediate-schema discipline).
+ * passes — it trusts the very thing it is testing. Callers must scan while the
+ * live record does NOT declare the constraints under validation: the ALTER
+ * paths run this before the catalog swap, the maintained-table path swaps in a
+ * constraint-stripped record first.
  */
 export async function validateChecksOverExistingRows(
 	db: Database,
@@ -382,8 +462,12 @@ export async function validateChecksOverExistingRows(
 ): Promise<void> {
 	const tableRef = qualifyRelation(tableSchema.schemaName, tableSchema.name);
 	for (const check of checks) {
+		if ((check.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) === 0) continue;
+		const predicate = storedRowPredicate(check, tableSchema);
+		if (!predicate) continue;
 		const exprSql = expressionToString(check.expr);
-		const sql = `select 1 from ${tableRef} where not (${exprSql}) limit 1`;
+		const sql = `select 1 from ${tableRef} as ${quoteIdentifier(STORED_ROW_ALIAS)} `
+			+ `where not (${expressionToString(predicate)}) limit 1`;
 		log('CHECK existing-row validation for %s.%s: %s', tableSchema.schemaName, tableSchema.name, sql);
 		const stmt = db.prepare(sql);
 		// The CHECK is SCHEMA-AUTHORED, so a bare relation name inside it means the OWNING

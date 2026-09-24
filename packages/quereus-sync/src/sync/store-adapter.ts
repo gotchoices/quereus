@@ -691,12 +691,9 @@ function parseMigrationDDL(ddl: string): {
  * existing rows without changing how those rows are stored or addressed:
  *
  * - `alter column … set not null` (`drop not null` loosens, so it stays early)
- * - `add constraint` — the `unique` and foreign-key forms scan existing rows and
- *   throw on a violation. The `check` form is classified with them even though the
- *   engine does not scan for it today (both backends append the constraint
- *   schema-only — see `bug-add-check-constraint-skips-existing-rows`): deferring a
- *   statement that inspects nothing is harmless, and it is the right position for
- *   the arm the moment that gap is closed.
+ * - `add constraint` — all three forms scan existing rows and throw on a
+ *   violation: the module scans for `unique` and foreign-key, the engine scans for
+ *   `check` before dispatching to the module.
  * - a UNIQUE `add_index` — verified to throw `UNIQUE constraint failed` against
  *   pre-existing duplicates, the same failure mode as `set not null`. A NON-unique
  *   index create inspects nothing, so it stays early.

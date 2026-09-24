@@ -134,9 +134,13 @@ export function extractCheckConstraints(
  *    `shouldCheckConstraint(constraint, operation)` (constraint-builder.ts),
  *    so e.g. a `check on insert (...)` never runs on UPDATE and an UPDATE can
  *    legally store a violating row. DELETE membership is irrelevant — a
- *    delete adds no row image. ALTER ADD CHECK backfill validation plus the
- *    `permitsGrandfatheredCheckViolators` consumer gate cover the
- *    pre-existing-rows path for qualifying checks.
+ *    delete adds no row image. Pre-existing rows are covered by the one
+ *    existing-row CHECK scan every installing path shares
+ *    (`validateChecksOverExistingRows`, schema/constraint-builder.ts — ADD
+ *    CONSTRAINT, ADD COLUMN, maintained tables) plus the
+ *    `permitsGrandfatheredCheckViolators` consumer gate. That scan applies the
+ *    screens of THIS gate (mask, per-conjunct `old.`, `new.` reading), so it
+ *    validates at least what is lifted here; change one, change the other.
  *
  * 2. Not deferred. A deferred check is enforced at commit, so
  *    same-transaction reads can observe violating rows. No SQL today can set
@@ -175,8 +179,12 @@ function isRowInvariantCheck(check: RowConstraintSchema): boolean {
  * entire conjunct it appears in. Conservative edge: a table literally named
  * `old` using self-qualified `old.col` refs also matches — sound, since the
  * enforcement scope keys `old.<col>` to the OLD image there too.
+ *
+ * Exported for the existing-row CHECK scan (`storedRowPredicate` in
+ * `schema/constraint-builder.ts`), which screens conjuncts with THIS predicate so
+ * the set it validates can never be narrower than the set lifted here.
  */
-function containsOldRowImageRef(expr: AST.Expression): boolean {
+export function containsOldRowImageRef(expr: AST.Expression): boolean {
 	for (const node of walkAstNodes(expr)) {
 		if (node.type === 'column' && (node as AST.ColumnExpr).table?.toLowerCase() === 'old') {
 			return true;

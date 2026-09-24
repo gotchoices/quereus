@@ -270,7 +270,7 @@ without changing how those rows are stored or addressed.
 | migration | why it validates |
 |---|---|
 | `alter column … set not null` | rejects if any existing row is NULL (`drop not null` loosens, so it stays early) |
-| `add constraint` | the `unique` and foreign-key forms scan existing rows and reject a violation. The `check` form is classified with them although the engine appends it schema-only today (`bug-add-check-constraint-skips-existing-rows`) — deferring a statement that inspects nothing is harmless and is the right position once that gap closes |
+| `add constraint` | all three forms — `unique`, foreign-key and `check` — scan existing rows and reject a violation (the `check` scan is the engine's, run before the module is dispatched to) |
 | a **unique** `create index` | rejects on pre-existing duplicates, exactly like `set not null` (a non-unique index inspects nothing, so it stays early) |
 
 Everything else runs **before** the rows, because the batch's rows may need the new shape

@@ -237,9 +237,11 @@ that answer in the catalog verbatim, so a constraint merged only into the engine
 catalog copy is dropped on the floor by the next one — silently, with bad data
 accepted afterwards. Consequences of routing through the module:
 
-- Existing-row validation is the module's (`addConstraint` re-validates for UNIQUE
-  and FK; CHECK is a schema-only append there, which is why the engine keeps the
-  literal-default CHECK scan above). The memory and store modules both call the
+- Existing-row validation is the module's for UNIQUE and FK (`addConstraint`
+  re-validates both); for CHECK it is the engine's, run before the module is
+  dispatched to — the literal-default CHECK scan above and `ADD CONSTRAINT … CHECK`
+  share one helper, `validateChecksOverExistingRows`, so the module's CHECK arm is
+  a schema append. The memory and store modules both call the
   shared `validateForeignKeyOverExistingRows`, so the ADD COLUMN and ADD CONSTRAINT
   paths cannot drift. FK validation is MATCH SIMPLE (a fully-non-NULL backfilled
   value with no matching parent aborts; NULL satisfies) and pragma-gated (`pragma

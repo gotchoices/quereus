@@ -6,16 +6,20 @@
  * supports it, so the module-cached schema stays in lock-step with the catalog
  * (a later DROP/RENAME CONSTRAINT resolves the class against it). CHECK keeps an
  * engine-side fallback (`runtime/emit/add-constraint.ts`) only for modules that
- * omit `alterTable`. The built-in `MemoryTableModule` implements all three: UNIQUE /
- * FOREIGN KEY re-validate the existing rows and fail atomically with `CONSTRAINT`
- * (no schema mutation) when the current data violates the new constraint; CHECK is
- * a schema-only append, enforced going forward at write time.
+ * omit `alterTable`. All three classes re-validate the existing rows and fail
+ * atomically with `CONSTRAINT` (no schema mutation) when the current data violates the
+ * new constraint: the built-in `MemoryTableModule` scans for UNIQUE / FOREIGN KEY, and
+ * the engine scans for CHECK pre-dispatch on every module (the second describe below).
  */
 
 import { expect } from 'chai';
-import { Database } from '../src/index.js';
+import { Database, MemoryTableModule } from '../src/index.js';
+import type { ModuleCapabilities } from '../src/index.js';
+import type { SqlValue } from '../src/common/types.js';
 import { QuereusError } from '../src/common/errors.js';
 import { StatusCode } from '../src/common/types.js';
+import { validateChecksOverExistingRows } from '../src/schema/constraint-builder.js';
+import { makeNoAlterModule } from './no-alter-module.js';
 
 async function expectThrows(fn: () => Promise<unknown>): Promise<QuereusError> {
 	let caught: unknown;
@@ -39,7 +43,7 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 		await db.close();
 	});
 
-	it('CHECK constraint succeeds (schema-only append, enforced forward)', async () => {
+	it('CHECK constraint on an empty table succeeds and is enforced forward', async () => {
 		await db.exec('create table t (id integer primary key, v integer)');
 		await db.exec('alter table t add constraint pos_v check (v > 0)');
 		// Forward enforcement still works.
@@ -350,5 +354,271 @@ describe('ALTER TABLE ADD CONSTRAINT', () => {
 			expect(t.columns.map(c => c.name)).to.deep.equal(['id', 'a', 'b']);
 			expect(t.checkConstraints.map(c => c.name)).to.have.members(['ck', 'ck_b']);
 		});
+	});
+});
+
+// ── Existing-row validation for ADD CONSTRAINT … CHECK ──────────────────────────
+//
+// The engine validates a newly added CHECK against the rows already in the table,
+// pre-dispatch and for every module (`rejectCheckViolatedByExistingRows` in
+// runtime/emit/add-constraint.ts). This is a WRONG-RESULT guard, not tidiness: the
+// optimizer treats a declared CHECK as a proven fact about every stored row and folds
+// contradicting predicates away, so a grandfathered violator would vanish from
+// `select … where n <= 0` while still being stored. Whatever the optimizer lifts must
+// therefore have been validated — the `new.` / `old.` / operation-mask cases below are
+// exactly the optimizer's own screens (planner/analysis/check-extraction.ts), mirrored.
+
+/** Memory module that grandfathers CHECK violators — the documented opt-out. */
+class GrandfatheringMemoryModule extends MemoryTableModule {
+	override getCapabilities(): ModuleCapabilities {
+		return { ...super.getCapabilities(), permitsGrandfatheredCheckViolators: true };
+	}
+}
+
+describe('ALTER TABLE ADD CONSTRAINT … CHECK validates existing rows', () => {
+	let db: Database;
+
+	beforeEach(() => {
+		db = new Database();
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	async function rows(sql: string): Promise<Record<string, SqlValue>[]> {
+		const out: Record<string, SqlValue>[] = [];
+		for await (const r of db.eval(sql)) out.push(r);
+		return out;
+	}
+
+	async function expectRejected(sql: string, namePattern: RegExp): Promise<QuereusError> {
+		const err = await expectThrows(() => db.exec(sql));
+		expect(err.code, err.message).to.equal(StatusCode.CONSTRAINT);
+		expect(err.message).to.match(/CHECK constraint failed/);
+		expect(err.message).to.match(namePattern);
+		return err;
+	}
+
+	/** The table carries no CHECK — in the catalog, in the module's cached schema, and behaviorally. */
+	async function expectNoCheckInstalled(violatingInsert: string): Promise<void> {
+		expect(await rows(`select name from check_constraint_info('t')`), 'catalog carries no CHECK').to.deep.equal([]);
+		expect(db.schemaManager.getTable('main', 't')!.checkConstraints, 'live schema carries no CHECK').to.deep.equal([]);
+		await db.exec(violatingInsert); // nothing enforces forward
+	}
+
+	it('rejects with CONSTRAINT when an existing row violates the CHECK, leaving the table untouched', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5), (2, 7)');
+		await expectRejected('alter table t add constraint c check (n > 0)', /\bc\b/);
+		await expectNoCheckInstalled('insert into t values (3, -1)');
+		expect(await rows('select id from t where n <= 0 order by id')).to.deep.equal([{ id: 1 }, { id: 3 }]);
+	});
+
+	it('accepts when every existing row conforms, then enforces forward', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, 5), (2, 7)');
+		await db.exec('alter table t add constraint c check (n > 0)');
+		expect(await rows(`select name from check_constraint_info('t')`)).to.deep.equal([{ name: 'c' }]);
+		await expectRejected('insert into t values (3, -1)', /\bc\b/);
+	});
+
+	it('a NULL in the checked column is not a violation (NULL passes a CHECK)', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, null), (2, 7)');
+		await db.exec('alter table t add constraint c check (n > 0)');
+		await expectRejected('insert into t values (3, 0)', /\bc\b/);
+	});
+
+	it('an unnamed CHECK reports its minted name', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5)');
+		await expectRejected('alter table t add check (n > 0)', /check_0/);
+		await expectNoCheckInstalled('insert into t values (2, -1)');
+	});
+
+	it('rows the issuing transaction has inserted but not yet committed count as present', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('begin');
+		await db.exec('insert into t values (1, -5)');
+		await expectRejected('alter table t add constraint c check (n > 0)', /\bc\b/);
+		expect((await rows('select count(*) as k from t'))[0].k, 'the staged row survives the rejected ALTER').to.equal(1);
+		await db.exec('rollback');
+	});
+
+	it('the wrong-result probe: a query contradicting a freshly added CHECK still agrees with select *', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5), (2, 7)');
+		expect(await rows('select id from t where n <= 0')).to.deep.equal([{ id: 1 }]);
+		await expectRejected('alter table t add constraint c check (n > 0)', /\bc\b/);
+		// The violator did not vanish: the contradicting query still finds it.
+		expect(await rows('select id from t where n <= 0')).to.deep.equal([{ id: 1 }]);
+
+		// Once the table conforms the CHECK installs, and the folded query must agree with
+		// the unfolded one — that agreement is the property the optimizer's lift depends on.
+		await db.exec('delete from t where id = 1');
+		await db.exec('alter table t add constraint c check (n > 0)');
+		const all = await rows('select id, n from t');
+		const folded = await rows('select id, n from t where n <= 0');
+		expect(folded).to.deep.equal(all.filter(r => (r.n as number) <= 0));
+	});
+
+	it('self-fold pin: the validation must run before the CHECK is declared anywhere the planner can see it', async () => {
+		// `n > 0` is a shape the optimizer lifts into a range domain, so a declared
+		// `check (n > 0)` folds `where not (n > 0)` — the validation scan's own predicate —
+		// to EmptyRelation. If the pre-dispatch call in add-constraint.ts ever moves after
+		// `module.alterTable` / `schema.addTable`, the scan trusts the very thing it is
+		// testing, passes vacuously, and the rejection below stops happening.
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5)');
+		await expectRejected('alter table t add constraint c check (n > 0)', /\bc\b/);
+
+		// And the trap is real, not hypothetical: the SAME scan over the SAME violating row
+		// passes vacuously once the CHECK is declared in the live catalog. (Direct call so
+		// the emitter's ordering is not what makes it pass.) If this half ever starts
+		// throwing, the fold no longer applies and the pin above is moot — say so.
+		await db.exec('create table tpl (id integer primary key, n integer null, constraint c check (n > 0))');
+		const parsedCheck = db.schemaManager.getTable('main', 'tpl')!.checkConstraints[0];
+		const live = db.schemaManager.getTable('main', 't')!;
+		const declared = { ...live, checkConstraints: Object.freeze([parsedCheck]) };
+		db.schemaManager.getSchemaOrFail('main').addTable(declared);
+		try {
+			await validateChecksOverExistingRows(db, declared, declared.checkConstraints);
+		} finally {
+			db.schemaManager.getSchemaOrFail('main').addTable(live);
+		}
+		// Reached without throwing: the fold swallowed the scan. Prove the row is still there.
+		expect((await rows('select count(*) as k from t where n <= 0'))[0].k).to.equal(1);
+	});
+
+	// ── new. / old. row-image qualifiers (docs/sql-ddl.md § 2.6) ────────────────
+
+	it('check (new.<col> …) is validated like the unqualified spelling', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5)');
+		await expectRejected('alter table t add constraint c check (new.n > 0)', /\bc\b/);
+		await expectNoCheckInstalled('insert into t values (2, -1)');
+
+		await db.exec('delete from t');
+		await db.exec('insert into t values (1, 5)');
+		await db.exec('alter table t add constraint c check (new.n > 0)');
+		await expectRejected('insert into t values (2, -1)', /\bc\b/);
+	});
+
+	it('a conjunct referencing old.<col> is a transition constraint: not validated, and never blocks the statement', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5)');
+		// Nothing about a row sitting still can be judged here; the ALTER succeeds …
+		await db.exec('alter table t add constraint c check (old.n is null or n >= old.n)');
+		expect(await rows(`select name from check_constraint_info('t')`)).to.deep.equal([{ name: 'c' }]);
+		// … and the transition rule is enforced on the next write.
+		await expectRejected('update t set n = -6 where id = 1', /\bc\b/);
+		await db.exec('update t set n = 0 where id = 1');
+	});
+
+	it("a mixed CHECK validates its old.-free conjuncts and skips only the transition one", async () => {
+		// The optimizer screens `old.` PER TOP-LEVEL AND-CONJUNCT and still lifts the
+		// `status` domain, so skipping the whole CHECK here would leave the hole open.
+		await db.exec('create table t (id integer primary key, status text null)');
+		await db.exec("insert into t values (1, 'z')");
+		await expectRejected("alter table t add constraint c check ((old.id is null or id = old.id) and status in ('a', 'i'))", /\bc\b/);
+		await expectNoCheckInstalled("insert into t values (2, 'q')");
+
+		await db.exec('delete from t');
+		await db.exec("insert into t values (1, 'a')");
+		await db.exec("alter table t add constraint c check ((old.id is null or id = old.id) and status in ('a', 'i'))");
+		await expectRejected("insert into t values (2, 'q')", /\bc\b/);
+	});
+
+	it('an old.<col> ref inside a non-AND conjunct kills that whole conjunct, like the lift', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5)');
+		// The OR is one conjunct; `old.n` anywhere inside it disqualifies it entirely.
+		await db.exec('alter table t add constraint c check (n > 0 or old.n is not null)');
+		expect(await rows(`select name from check_constraint_info('t')`)).to.deep.equal([{ name: 'c' }]);
+	});
+
+	it('a DELETE-only CHECK constrains no stored row and is not validated', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5)');
+		await db.exec('alter table t add constraint c check on delete (n > 0)');
+		expect(await rows(`select name from check_constraint_info('t')`)).to.deep.equal([{ name: 'c' }]);
+	});
+
+	it('a self-qualified reference (t.n) is validated', async () => {
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, -5)');
+		await expectRejected('alter table t add constraint c check (t.n > 0)', /\bc\b/);
+	});
+
+	it('a new.<col> correlated from inside a subquery is validated against the stored row', async () => {
+		await db.exec('create table lim (k integer primary key, cap integer)');
+		await db.exec('insert into lim values (1, 10)');
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, 50)');
+		await expectRejected('alter table t add constraint c check (exists (select 1 from lim where lim.cap >= new.n))', /\bc\b/);
+		await db.exec('update t set n = 5 where id = 1');
+		await db.exec('alter table t add constraint c check (exists (select 1 from lim where lim.cap >= new.n))');
+		await expectRejected('insert into t values (2, 50)', /\bc\b/);
+	});
+
+	it('a new.<col> inside a subquery over the owning table itself still means the stored row', async () => {
+		// The inner unaliased `from t` rebinds `t`, so `t.n` / `t.id` bind inside; `new.n` /
+		// `new.id` requalify to the scan alias and correlate to the OUTER stored row —
+		// the same reading enforcement gives them.
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, 5), (2, 5)');
+		const noTwin = 'check (not exists (select 1 from t where t.n = new.n and t.id <> new.id))';
+		await expectRejected(`alter table t add constraint c ${noTwin}`, /\bc\b/);
+		await db.exec('update t set n = 6 where id = 2');
+		await db.exec(`alter table t add constraint c ${noTwin}`);
+		await expectRejected('insert into t values (3, 6)', /\bc\b/);
+	});
+
+	it('a subquery over a real table named "new" is left alone (new is not a reserved word)', async () => {
+		await db.exec('create table "new" (id integer primary key, v integer)');
+		await db.exec('insert into "new" values (1, 10)');
+		await db.exec('create table t (id integer primary key, n integer null)');
+		await db.exec('insert into t values (1, 50)');
+		await expectRejected('alter table t add constraint c check (n < (select max("new".v) from "new"))', /\bc\b/);
+		await db.exec('update t set n = 5 where id = 1');
+		await db.exec('alter table t add constraint c check (n < (select max("new".v) from "new"))');
+		await expectRejected('insert into t values (2, 50)', /\bc\b/);
+	});
+
+	// ── The two arms and the opt-out ──────────────────────────────────────────────
+
+	it('the engine-side fallback (module without alterTable) validates too', async () => {
+		db.registerModule('noalter', makeNoAlterModule());
+		await db.exec('create table t (id integer primary key, n integer null) using noalter');
+		await db.exec('insert into t values (1, -5)');
+		await expectRejected('alter table t add constraint c check (n > 0)', /\bc\b/);
+		await expectNoCheckInstalled('insert into t values (2, -1)');
+	});
+
+	it('a module declaring permitsGrandfatheredCheckViolators keeps the accepting behavior', async () => {
+		db.registerModule('gfmem', new GrandfatheringMemoryModule());
+		await db.exec('create table t (id integer primary key, n integer null) using gfmem');
+		await db.exec('insert into t values (1, -5)');
+		await db.exec('alter table t add constraint c check (n > 0)');
+		expect(await rows(`select name from check_constraint_info('t')`)).to.deep.equal([{ name: 'c' }]);
+		// The other half of that contract: the optimizer does not lift the CHECK for this
+		// module, so the grandfathered violator is still found.
+		expect(await rows('select id from t where n <= 0')).to.deep.equal([{ id: 1 }]);
+		await expectRejected('insert into t values (2, -1)', /\bc\b/);
+	});
+
+	// ── The ADD COLUMN sibling (same scan) ────────────────────────────────────────
+
+	it('ADD COLUMN … check (new.<col> …) is validated as a constraint, not rejected as an unknown column', async () => {
+		await db.exec('create table t (id integer primary key)');
+		await db.exec('insert into t values (1)');
+		const err = await expectThrows(() => db.exec('alter table t add column v integer default -1 check (new.v > 0)'));
+		expect(err.code, err.message).to.equal(StatusCode.CONSTRAINT);
+		expect(err.message).to.match(/_check_v.*backfilled rows/);
+		expect((await rows(`select name from table_info('t')`)).map(r => r.name), 'column not added').to.deep.equal(['id']);
+
+		await db.exec('alter table t add column v integer default 1 check (new.v > 0)');
+		await expectRejected('insert into t values (2, 0)', /_check_v/);
 	});
 });

@@ -9,10 +9,10 @@ import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../comm
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, collectTableConstraintNames, collectDeclaredConstraintNames } from '../../schema/table.js';
-import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints } from '../../schema/constraint-builder.js';
+import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateChecksOverExistingRows } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
-import { quoteIdentifier, expressionToString, astToString } from '../../emit/ast-stringify.js';
+import { quoteIdentifier, astToString } from '../../emit/ast-stringify.js';
 import { renameTableInAst, renameColumnInAst, renameColumnInCheckExpression, renameColumnInColumnExpressions, renameTableInCheckConstraints, renameTableInIndexPredicates, renameTableInColumnExpressions, objectRefKey } from '../../schema/rename-rewriter.js';
 import type { ResolveColumnInSource, ResolveObjectRef, TableRenameTarget } from '../../schema/rename-rewriter.js';
 import { snapshotObjectRefResolvers, tableRenameTargetsFor, type ObjectRefResolvers } from '../../schema/object-ref-resolver.js';
@@ -1105,20 +1105,26 @@ async function remapEventsForRevertedAddColumn(
 }
 
 /**
- * Runs each new CHECK against the (already-backfilled) existing rows. Relies on the
- * just-registered column-only schema so SQL can resolve the new column while the CHECK
- * itself is not yet declared — declaring it first would let `ruleFilterContradiction`
- * fold this scan's own `not (<check_expr>)` to EmptyRelation. Any row matching
- * `not (<check_expr>)` is a violation and aborts the ALTER.
+ * Runs each new inline CHECK against the (already-backfilled) existing rows, through
+ * the one existing-row CHECK scan every ALTER path shares
+ * (`validateChecksOverExistingRows`, `schema/constraint-builder.ts` — which is where
+ * `new.<col>` resolution, the `old.` screen and the operation-mask filter live). Relies
+ * on the just-registered column-only schema so SQL can resolve the new column while the
+ * CHECK itself is not yet declared — declaring it first would let
+ * `ruleFilterContradiction` fold this scan's own `not (<check_expr>)` to EmptyRelation.
+ * Any row matching `not (<check_expr>)` is a violation and aborts the ALTER.
+ *
+ * Each constraint is built with the same builder and taken-name set the module uses
+ * when it installs it, so the name a violation reports is the one the catalog would
+ * have carried.
  */
 async function validateBackfillAgainstChecks(
 	rctx: RuntimeContext,
 	columnOnlySchema: TableSchema,
 	newCheckConstraints: ReadonlyArray<AST.TableConstraint>,
 ): Promise<void> {
-	const qualifiedTable = qualifyTableName(columnOnlySchema.schemaName, columnOnlySchema.name);
-
-	for (const cc of newCheckConstraints) {
+	const takenNames = collectTableConstraintNames(columnOnlySchema);
+	const checks = newCheckConstraints.map((cc, i) => {
 		// `extractColumnLevelCheckConstraints` skips an expression-less CHECK, so this
 		// cannot fire — but silently skipping a constraint we were asked to validate
 		// would admit a violating row, so say so loudly rather than `continue`.
@@ -1128,31 +1134,13 @@ async function validateBackfillAgainstChecks(
 				StatusCode.INTERNAL,
 			);
 		}
-		const checkSql = expressionToString(cc.expr);
-		const sql = `select 1 from ${qualifiedTable} where not (${checkSql}) limit 1`;
-		const stmt = rctx.db.prepare(sql);
-		// The CHECK is SCHEMA-AUTHORED: it belongs to the altered table's own DDL, so a
-		// bare relation name inside it means the ALTERED table's schema — not the session
-		// path this freshly-prepared validation statement would otherwise inherit. Owning
-		// schema ONLY, matching `schemaAuthoredContext` (planner/building/schema-authored-context.ts),
-		// which decides the same thing for every CHECK the DML builders compile.
-		stmt._schemaPathOverride = [columnOnlySchema.schemaName];
-		try {
-			let violated = false;
-			for await (const _row of stmt._iterateRowsRaw()) {
-				violated = true;
-				break;
-			}
-			if (violated) {
-				throw new QuereusError(
-					`CHECK constraint ${cc.name ? `'${cc.name}' ` : ''}violated by backfilled rows in ALTER TABLE ADD COLUMN on '${columnOnlySchema.name}'`,
-					StatusCode.CONSTRAINT,
-				);
-			}
-		} finally {
-			await stmt.finalize();
-		}
-	}
+		return buildCheckConstraintSchema(cc, columnOnlySchema.checkConstraints.length + i, takenNames);
+	});
+	await validateChecksOverExistingRows(rctx.db, columnOnlySchema, checks, (check) =>
+		new QuereusError(
+			`CHECK constraint '${check.name}' violated by backfilled rows in ALTER TABLE ADD COLUMN on '${columnOnlySchema.name}'`,
+			StatusCode.CONSTRAINT,
+		));
 }
 
 /**

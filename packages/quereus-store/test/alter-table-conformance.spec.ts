@@ -20,13 +20,15 @@
  * Store backing: the in-memory KV provider from `alter-table.spec.ts`, so this
  * stays in the fast `yarn test` lane (no LevelDB).
  *
- * NOTE on the ADD CHECK cell: `ALTER TABLE ADD CONSTRAINT … CHECK` now routes
- * through the store's `addConstraint` (a schema-only append + DDL persist), the
- * same path UNIQUE / FK take — so the module-cached schema stays in lock-step with
- * the catalog and a later DROP/RENAME CONSTRAINT resolves it. (An engine-side
- * fallback in runtime/emit/add-constraint.ts covers only modules that omit
- * `alterTable`; the store implements it.) Honored in-session for the store exactly
- * as for memory. The store's own `addConstraint` UNSUPPORTED branch is reachable
+ * NOTE on the ADD CHECK cell: `ALTER TABLE ADD CONSTRAINT … CHECK` routes through
+ * the store's `addConstraint` (a schema append + DDL persist), the same path
+ * UNIQUE / FK take — so the module-cached schema stays in lock-step with the
+ * catalog and a later DROP/RENAME CONSTRAINT resolves it. The existing-row
+ * validation is the ENGINE's, run before the module is dispatched to
+ * (runtime/emit/add-constraint.ts), so a violating row rejects before anything
+ * persists — the tightening suite at the bottom pins that for the store. (An
+ * engine-side append fallback covers only modules that omit `alterTable`; the store
+ * implements it.) The store's own `addConstraint` UNSUPPORTED branch is reachable
  * only by a constraint type the module does not handle (today: none beyond
  * CHECK/UNIQUE/FK).
  */
@@ -218,8 +220,10 @@ const ARMS: Arm[] = [
 		},
 	},
 	{
-		// Routes through the store's addConstraint (schema-only append + DDL persist);
-		// honored for store in-session exactly as for memory. See the file header note.
+		// Routes through the store's addConstraint (schema append + DDL persist) after the
+		// engine's existing-row scan has passed; honored for store in-session exactly as
+		// for memory. Seeded conforming — the violating case is in the tightening suite
+		// below. See the file header note.
 		label: 'addConstraint CHECK',
 		seed: [`create table t (id integer primary key, v integer) using store`, `insert into t values (1, 5), (2, 9)`],
 		alter: `alter table t add constraint pos check (v > 0)`,
@@ -574,4 +578,110 @@ describe('ALTER conformance matrix — store module', () => {
 	// collation throws CONSTRAINT all-or-nothing. The store keys the PK per-column
 	// (`StoreTable.pkKeyCollations`), so it honors any PK collation natively — there is
 	// no longer a fixed-table-collation `UNSUPPORTED` reject.
+});
+
+// ── Tightening DDL must judge the rows already there ─────────────────────────
+//
+// Every DDL form that TIGHTENS what a table admits has to scan the existing rows and
+// reject with CONSTRAINT when one already violates the new rule. Grandfathering the
+// violator is not merely untidy: the optimizer treats a declared CHECK as a proven fact
+// about every stored row and folds contradicting predicates away, so a grandfathered
+// violator silently vanishes from query results (packages/quereus/test/
+// alter-add-constraint.spec.ts has the wrong-result probe). The CHECK arm once fell out
+// of step with its siblings and nothing was watching the set — this table watches it. A
+// new tightening form belongs here the day it lands.
+
+interface TighteningCase {
+	label: string;
+	/** Ends with the violating row(s) in place. */
+	seed: (using: string) => string[];
+	alter: string;
+	/** A write the tightened rule would refuse; must still succeed after the refused ALTER — proof nothing installed. */
+	stillAllowed: string;
+	/** Read-back proving the catalog is unchanged. */
+	unchanged: (db: Database) => Promise<void>;
+}
+
+const TIGHTENING_CASES: TighteningCase[] = [
+	{
+		label: 'alter column … set not null against a NULL',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, null), (2, 2)`],
+		alter: `alter table t alter column v set not null`,
+		stillAllowed: `insert into t values (3, null)`,
+		unchanged: async db => { expect((await columnInfo(db, 'v'))?.notnull, 'still nullable').to.equal(0); },
+	},
+	{
+		label: 'add constraint … unique against duplicates',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 7), (2, 7)`],
+		alter: `alter table t add constraint u unique (v)`,
+		stillAllowed: `insert into t values (3, 7)`,
+		unchanged: async db => { expect(await rows(db, `select name from unique_constraint_info('t')`), 'no UNIQUE declared').to.deep.equal([]); },
+	},
+	{
+		label: 'add constraint … check against a violating row',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, -5), (2, 7)`],
+		alter: `alter table t add constraint c check (v > 0)`,
+		stillAllowed: `insert into t values (3, -1)`,
+		unchanged: async db => { expect(await rows(db, `select name from check_constraint_info('t')`), 'no CHECK declared').to.deep.equal([]); },
+	},
+	{
+		label: 'add constraint … foreign key against an orphan',
+		seed: u => [
+			`create table p (pid integer primary key)${u}`,
+			`insert into p values (1)`,
+			`create table t (id integer primary key, pa integer null)${u}`,
+			`insert into t values (1, 99)`,
+		],
+		alter: `alter table t add constraint fk foreign key (pa) references p(pid)`,
+		stillAllowed: `insert into t values (2, 98)`,
+		unchanged: async db => { expect(await rows(db, `select name from foreign_key_info('t')`), 'no FK declared').to.deep.equal([]); },
+	},
+	{
+		label: 'create unique index against duplicates',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 7), (2, 7)`],
+		alter: `create unique index ux on t (v)`,
+		stillAllowed: `insert into t values (3, 7)`,
+		unchanged: async db => { expect(await rows(db, `select index_name from index_info('t')`), 'no index declared').to.deep.equal([]); },
+	},
+	{
+		label: 'add column … not null with no usable default against a non-empty table',
+		seed: u => [`create table t (id integer primary key, v integer null)${u}`, `insert into t values (1, 7)`],
+		alter: `alter table t add column req text not null`,
+		// Two values fit only the two-column table: had the column landed, this would fail on arity or NOT NULL.
+		stillAllowed: `insert into t values (2, 8)`,
+		unchanged: async db => { expect(await columnNames(db), 'column not added').to.not.include('req'); },
+	},
+];
+
+async function runTightening(db: Database, c: TighteningCase, using: string): Promise<void> {
+	for (const stmt of c.seed(using)) await db.exec(stmt);
+	const before = (await rows(db, `select count(*) as n from t`))[0].n;
+	const err = await attemptAlter(db, c.alter);
+	expect(err, `${c.label}: a tightening DDL against a violating row must reject — grandfathering the violator makes the schema lie about the data`).to.be.instanceOf(QuereusError);
+	expect(err!.code, `${c.label}: reject code was ${err!.code} (${err!.message})`).to.equal(StatusCode.CONSTRAINT);
+	await c.unchanged(db);
+	expect((await rows(db, `select count(*) as n from t`))[0].n, `${c.label}: rows untouched`).to.equal(before);
+	await db.exec(c.stillAllowed);
+}
+
+describe('Tightening DDL rejects rows that already violate it — store module', () => {
+	let db: Database;
+	let provider: KVStoreProvider;
+
+	beforeEach(() => {
+		db = new Database();
+		provider = createInMemoryProvider();
+		db.registerModule('store', new StoreModule(provider));
+	});
+
+	afterEach(async () => {
+		await db.close();
+		await provider.closeAll();
+	});
+
+	for (const c of TIGHTENING_CASES) {
+		it(c.label, async () => {
+			await runTightening(db, c, ' using store');
+		});
+	}
 });

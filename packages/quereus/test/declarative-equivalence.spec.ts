@@ -27,6 +27,7 @@
 import { expect } from 'chai';
 import { Database } from '../src/core/database.js';
 import { StatusCode, type SqlValue } from '../src/common/types.js';
+import { QuereusError } from '../src/common/errors.js';
 import { computeSchemaHash } from '../src/schema/schema-hasher.js';
 import { computeSchemaDiff, generateMigrationDDL } from '../src/schema/schema-differ.js';
 import { collectSchemaCatalog } from '../src/schema/catalog.js';
@@ -2530,10 +2531,9 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 	}
 
 	it('a CHECK body change converges via drop+add, is idempotent, and enforces the new predicate', async function () {
-		// NOTE: CHECK `ADD CONSTRAINT` applies in place and does NOT re-validate
-		// existing rows (a pre-existing limitation of the CHECK add path — UNIQUE / FK
-		// re-validate, CHECK does not). So a CHECK body change is forward-enforcing
-		// only; existing rows that violate the new predicate are not re-checked.
+		// The re-add re-validates the existing rows like any ADD CONSTRAINT … CHECK
+		// (the seeded row satisfies both bodies here; the tightening-fails case is the
+		// next test).
 		const db = new Database();
 		try {
 			await db.exec(`declare schema main {
@@ -2570,6 +2570,48 @@ describe('declarative-equivalence: named-constraint body change (drop+recreate)'
 
 			// Idempotent: re-diff produces no constraint churn (canonical fragments match).
 			expect(diffOf(db).tablesToAlter, 'idempotent re-apply produces no alter').to.deep.equal([]);
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('a CHECK body change that TIGHTENS against a violating row is refused — and the drop has already happened', async function () {
+		// The re-add is an ordinary ADD CONSTRAINT … CHECK, so it validates the existing
+		// rows and refuses with CONSTRAINT. The two statements are separate and the memory
+		// backend has no DDL rollback, so the guarantee is "apply aborts + data survives",
+		// not "old constraint restored": after the refusal the table carries NO CHECK
+		// (docs/sql-alter.md § ADD / DROP / RENAME CONSTRAINT, docs/schema.md atomicity caveat).
+		const db = new Database();
+		try {
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk_qty check (qty > 0) }
+			}`);
+			await db.exec('apply schema main');
+			await db.exec('insert into t values (1, 5)');
+
+			// Tighten: qty > 0 → qty > 10. The stored row (5) satisfies the old body only.
+			await db.exec(`declare schema main {
+				table t { id INTEGER PRIMARY KEY, qty INTEGER, constraint chk_qty check (qty > 10) }
+			}`);
+			let err: unknown;
+			try { await db.exec('apply schema main'); } catch (e) { err = e; }
+			// `apply schema` wraps the failing statement (`Failed to execute DDL: … Error: …`,
+			// StatusCode.ERROR); the CONSTRAINT diagnosis rides inside.
+			expect(err, 'apply refused').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.ERROR);
+			expect((err as QuereusError).message).to.match(/Failed to execute DDL: alter table/i);
+			expect((err as QuereusError).message).to.match(/CHECK constraint failed: chk_qty/);
+
+			// Data survives …
+			const rows: Array<Record<string, unknown>> = [];
+			for await (const r of db.eval('select id, qty from t order by id')) rows.push(r);
+			expect(rows).to.deep.equal([{ id: 1, qty: 5 }]);
+			// … but the old CHECK is already gone (non-atomic DROP + ADD on the memory backend),
+			// so the re-diff still wants to add the new body.
+			const names: unknown[] = [];
+			for await (const r of db.eval(`select name from check_constraint_info('t')`)) names.push(r.name);
+			expect(names, 'old CHECK dropped, new one refused').to.deep.equal([]);
+			expect(diffOf(db).tablesToAlter[0]?.constraintsToAdd?.length, 're-apply would re-attempt the add').to.equal(1);
 		} finally {
 			await db.close();
 		}

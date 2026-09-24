@@ -599,10 +599,13 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 			// Pragma-gated existing-row validation; throws before persistence on an orphan.
 			await validateForeignKeyOverExistingRows(db, updatedSchema, fk);
 		} else if (constraint.type === 'check') {
-			// Schema-only: a CHECK has no physical structure and (matching the
-			// engine's prior in-emitter behavior) no existing-row scan. Routing it
-			// here — rather than catalog-only — keeps the persisted DDL and the
-			// connected-table schema in lock-step so DROP/RENAME CONSTRAINT resolve it.
+			// Schema-only HERE: a CHECK has no physical structure, and the existing-row
+			// scan is the engine's, run pre-dispatch for every module
+			// (`rejectCheckViolatedByExistingRows` in the engine's
+			// `runtime/emit/add-constraint.ts`) — so the rows are known to conform by
+			// now and nothing persists on a rejection. Routing it here — rather than
+			// catalog-only — keeps the persisted DDL and the connected-table schema in
+			// lock-step so DROP/RENAME CONSTRAINT resolve it.
 			const check = buildCheckConstraintSchema(
 				constraint,
 				oldSchema.checkConstraints.length,

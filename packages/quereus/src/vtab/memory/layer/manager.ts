@@ -3024,12 +3024,14 @@ export class MemoryTableManager {
 	 *   predicate + per-column collation honored, NULLs distinct).
 	 * - FOREIGN KEY appends the constraint and runs the pragma-gated existing-row
 	 *   validation (engine-side enforcement needs no physical structure).
-	 * - CHECK appends the constraint (no physical structure, no existing-row scan —
-	 *   matching the engine's prior in-emitter behavior); it routes here, rather than
-	 *   being applied catalog-only, so the module-cached schema stays in lock-step
-	 *   with the catalog and a later `DROP/RENAME CONSTRAINT` resolves it. (The engine
-	 *   keeps an engine-side fallback in `runtime/emit/add-constraint.ts` only for
-	 *   modules that omit `alterTable` — which cannot DROP/RENAME a constraint anyway.)
+	 * - CHECK appends the constraint (no physical structure; the existing-row scan is
+	 *   the ENGINE's, run pre-dispatch for every module — see
+	 *   `rejectCheckViolatedByExistingRows` in `runtime/emit/add-constraint.ts`); it
+	 *   routes here, rather than being applied catalog-only, so the module-cached
+	 *   schema stays in lock-step with the catalog and a later `DROP/RENAME CONSTRAINT`
+	 *   resolves it. (The engine keeps an engine-side append fallback in the same file
+	 *   only for modules that omit `alterTable` — which cannot DROP/RENAME a constraint
+	 *   anyway.)
 	 */
 	async addConstraint(constraint: ASTTableConstraint, rows?: EffectiveRowSource): Promise<void> {
 		if (this.isReadOnly) throw new QuereusError(`Table '${this._tableName}' is read-only`, StatusCode.READONLY);
@@ -3068,11 +3070,13 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * CHECK arm of {@link addConstraint}. Schema-only: a CHECK has no covering
-	 * structure and (matching the engine's prior in-emitter behavior) no existing-row
-	 * validation, so this just appends the constraint to the cached schema. Enforcement
-	 * is engine-side at INSERT/UPDATE plan time. Runs under the same latch / rollback
-	 * scaffolding as the other arms (via {@link addConstraint}).
+	 * CHECK arm of {@link addConstraint}. Schema-only HERE: a CHECK has no covering
+	 * structure, and the existing-row validation is not the module's job — the engine
+	 * runs it pre-dispatch for every module (`rejectCheckViolatedByExistingRows` in
+	 * `runtime/emit/add-constraint.ts`), so by the time this arm runs the rows are known
+	 * to conform and this just appends the constraint to the cached schema. Forward
+	 * enforcement is engine-side at INSERT/UPDATE plan time. Runs under the same latch /
+	 * rollback scaffolding as the other arms (via {@link addConstraint}).
 	 */
 	private addCheckConstraint(constraint: ASTTableConstraint): void {
 		const check = buildCheckConstraintSchema(

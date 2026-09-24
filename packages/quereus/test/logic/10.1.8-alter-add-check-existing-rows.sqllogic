@@ -1,0 +1,109 @@
+-- ALTER TABLE … ADD CONSTRAINT … CHECK validates the rows already in the table.
+--
+-- The store leg matters as much as the memory leg: the validation is the ENGINE's,
+-- run before the module is dispatched to (runtime/emit/add-constraint.ts), so both
+-- backends must answer identically and a rejected ADD must persist nothing (the
+-- store's addConstraint arm saves the table's DDL). Companion to the per-package
+-- conformance legs' tightening suites and to test/alter-add-constraint.spec.ts
+-- (memory; the full `new.` / `old.` / opt-out matrix).
+--
+-- Why this is a wrong-result guard and not tidiness: the optimizer treats a declared
+-- CHECK as a proven fact about every stored row and folds contradicting predicates
+-- away, so a grandfathered violator would vanish from `where n <= 0` while still
+-- being stored. Section 2 states the property that fold depends on.
+
+-- ===================================================================
+-- 1. A violating row rejects; the table is untouched; nothing enforces forward.
+-- ===================================================================
+
+create table AcV (id integer primary key, n integer null);
+insert into AcV values (1, -5), (2, 7);
+
+alter table AcV add constraint c_pos check (n > 0);
+-- error: CHECK constraint failed: c_pos
+
+select count(*) as k from check_constraint_info('AcV');
+→ [{"k":0}]
+
+insert into AcV values (3, -1);
+select id from AcV where n <= 0 order by id;
+→ [{"id":1},{"id":3}]
+
+-- ===================================================================
+-- 2. Once the table conforms the same ADD succeeds and enforces forward — and a
+--    query contradicting the CHECK agrees with the stored rows.
+-- ===================================================================
+
+delete from AcV where n <= 0;
+alter table AcV add constraint c_pos check (n > 0);
+select name from check_constraint_info('AcV');
+→ [{"name":"c_pos"}]
+
+insert into AcV values (4, 0);
+-- error: CHECK constraint failed: c_pos
+
+select count(*) as k from AcV where n <= 0;
+→ [{"k":0}]
+
+-- ===================================================================
+-- 3. NULL passes a CHECK, so a NULL row is not a violation.
+-- ===================================================================
+
+create table AcN (id integer primary key, n integer null);
+insert into AcN values (1, null);
+alter table AcN add constraint c check (n > 0);
+select name from check_constraint_info('AcN');
+→ [{"name":"c"}]
+
+-- ===================================================================
+-- 4. `new.<col>` names the stored row and is validated like the bare spelling; a
+--    conjunct referencing `old.<col>` is a transition rule about the previous row
+--    image — it cannot be judged from a row sitting still, so it is skipped without
+--    blocking the statement, while its `old.`-free siblings are still validated.
+-- ===================================================================
+
+create table AcQ (id integer primary key, n integer null, status text null);
+insert into AcQ values (1, -5, 'z');
+
+alter table AcQ add constraint c_new check (new.n > 0);
+-- error: CHECK constraint failed: c_new
+
+alter table AcQ add constraint c_old check (old.n is null or n >= old.n);
+select name from check_constraint_info('AcQ');
+→ [{"name":"c_old"}]
+
+alter table AcQ add constraint c_mix check ((old.id is null or id = old.id) and status in ('a', 'i'));
+-- error: CHECK constraint failed: c_mix
+
+update AcQ set status = 'a' where id = 1;
+alter table AcQ add constraint c_mix check ((old.id is null or id = old.id) and status in ('a', 'i'));
+select name from check_constraint_info('AcQ') order by name;
+→ [{"name":"c_mix"},{"name":"c_old"}]
+
+-- ===================================================================
+-- 5. A DELETE-only CHECK constrains no stored row image and is not validated.
+-- ===================================================================
+
+create table AcD (id integer primary key, n integer null);
+insert into AcD values (1, -5);
+alter table AcD add constraint c_del check on delete (n > 0);
+select name from check_constraint_info('AcD');
+→ [{"name":"c_del"}]
+
+-- ===================================================================
+-- 6. The ADD COLUMN sibling shares the scan: an inline `check (new.<col> …)` is a
+--    constraint rejection, not an unknown-column error, and the column is not added.
+-- ===================================================================
+
+create table AcC (id integer primary key);
+insert into AcC values (1);
+
+alter table AcC add column v integer default -1 check (new.v > 0);
+-- error: CHECK constraint '_check_v' violated by backfilled rows
+
+select name from table_info('AcC');
+→ [{"name":"id"}]
+
+alter table AcC add column v integer default 1 check (new.v > 0);
+insert into AcC values (2, 0);
+-- error: CHECK constraint failed: _check_v
