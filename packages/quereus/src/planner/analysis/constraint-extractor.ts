@@ -962,6 +962,13 @@ function isOrExpression(expr: ScalarPlanNode): boolean {
  *
  * Classification-only callers that *retain* the wrapper use
  * {@link unwrapCastForBindingKind} instead.
+ *
+ * NOTE: the plan-build coercion casts both of these comments reason about now
+ * carry a `synthetic` marker (`CastNode.synthetic`, set by
+ * `planner/building/coercion.ts` `wrapInCast`). This pair deliberately keeps
+ * re-deriving types instead — value-preserving vs converting is the property it
+ * needs, and a user-written cast can be just as no-op. Revisit only if a caller
+ * turns up that must tell planner-minted casts from user-written ones.
  */
 function unwrapCast(node: ScalarPlanNode): ScalarPlanNode {
 	let cur = node;

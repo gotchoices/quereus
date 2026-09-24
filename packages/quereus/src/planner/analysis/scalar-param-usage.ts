@@ -37,9 +37,24 @@ function paramOperand(node: ScalarPlanNode): ParameterReferenceNode | undefined 
 	return cur instanceof ParameterReferenceNode ? cur : undefined;
 }
 
+/**
+ * Look through the synthetic casts `insertCrossTypeCoercion` mints to reconcile a
+ * comparison's operand types, so the counterpart's own type is read rather than
+ * the type the coercion imposed on it. `id = ?` with a JSON-typed `?` is built as
+ * `cast(id as json) = ?`; reading the cast would report the counterpart OBJECT and
+ * disable the guard on exactly the binding it exists to reject. A user-written
+ * `cast(col as json) = :p` is a deliberate JSON-vs-JSON comparison and stays
+ * opaque — hence synthetic-only.
+ */
+function unwrapSyntheticCasts(node: ScalarPlanNode): ScalarPlanNode {
+	let cur = node;
+	while (cur instanceof CastNode && cur.synthetic) cur = cur.operand;
+	return cur;
+}
+
 /** A comparison counterpart that is statically a non-object scalar value. */
 function isScalarCounterpart(node: ScalarPlanNode): boolean {
-	return isScalarPhysical(node.getType().logicalType.physicalType);
+	return isScalarPhysical(unwrapSyntheticCasts(node).getType().logicalType.physicalType);
 }
 
 /**
@@ -66,9 +81,12 @@ function consider(operand: ScalarPlanNode, counterparts: ScalarPlanNode[], out: 
  *
  * Must walk the *logical* plan: a `col = ?` predicate is still a `BinaryOpNode`
  * there (the access-path optimizer later folds it into an index seek, erasing
- * the comparison node). The JSON-vs-JSON case is excluded via the
- * counterpart-type check, so this never over-fires on a legitimate query
- * (`jsoncol = :p` with a JSON-bound `:p` stays allowed).
+ * the comparison node). The JSON-vs-JSON case is excluded via the *unwrapped*
+ * counterpart type — the counterpart's own type, read through any synthetic
+ * coercion cast (see {@link unwrapSyntheticCasts}) — so this neither over-fires
+ * on a legitimate query (`jsoncol = :p` with a JSON-bound `:p` stays allowed)
+ * nor goes silent when the plan knows the parameter is JSON-typed and coerces
+ * the scalar side up to match it.
  */
 export function collectScalarRequiredParams(plan: PlanNode): Set<string | number> {
 	const out = new Set<string | number>();

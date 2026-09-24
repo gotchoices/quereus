@@ -106,5 +106,5 @@ export function wrapInCast(
 		expr: operand.expression,
 		targetType,
 	};
-	return new CastNode(scope, syntheticExpr, operand);
+	return new CastNode(scope, syntheticExpr, operand, true);
 }

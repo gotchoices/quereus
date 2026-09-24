@@ -730,6 +730,15 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 		public readonly scope: Scope,
 		public readonly expression: AST.CastExpr,
 		public readonly operand: ScalarPlanNode,
+		/**
+		 * True when the planner minted this cast itself to reconcile a comparison's
+		 * operand types (`planner/building/coercion.ts` `wrapInCast`) rather than the
+		 * user writing `cast(x as t)` in SQL. Analyses that need the operand's own
+		 * type — not the type the coercion imposed on it — look through a synthetic
+		 * cast and must not look through a user-written one, which is a deliberate
+		 * conversion with its own meaning.
+		 */
+		public readonly synthetic: boolean = false,
 	) {
 		super(scope, 0.02); // Slightly higher cost for type conversion
 		this.cachedType = new Cached(this.generateType);
@@ -780,7 +789,8 @@ export class CastNode extends PlanNode implements UnaryScalarNode {
 		return new CastNode(
 			this.scope,
 			this.expression,
-			newOperand as ScalarPlanNode
+			newOperand as ScalarPlanNode,
+			this.synthetic
 		);
 	}
 
