@@ -4,9 +4,9 @@
 
 How a statement's parameters get their types — inferred from the values passed to `prepare()`
 or declared explicitly — and what is checked when those parameters are bound on each
-execution. Types are established from the **first binding source** and validated on every
-execution, which buys type safety without giving up a user-friendly API for JavaScript
-developers. A satellite of [Quereus Type System](types.md).
+execution. Each parameter's type is established by the **first value bound to it** and
+validated on every execution, which buys type safety without giving up a user-friendly API
+for JavaScript developers. A satellite of [Quereus Type System](types.md).
 
 ## Two Ways to Specify Parameter Types
 
@@ -40,9 +40,10 @@ the caller never passed. The single mapping lives in `inferLogicalTypeFromValue`
 A parameter with neither a bound value nor an explicit hint at plan time announces **ANY**,
 not a guess: `ANY` imposes no representation constraint, its `parse` is pass-through, and it
 is never identical to a declared column type, so every consumer converts. (It announced TEXT
-before, which made `select ? as v` report TEXT while yielding whatever was bound.) That is the
-*provisional* answer for an unbound statement — introspecting one and then binding re-announces
-the bound value's type, because the provisional plan is discarded on the first bind.
+before, which made `select ? as v` report TEXT while yielding whatever was bound.) For a
+parameter that simply has no value *yet*, ANY is a provisional answer: introspecting the
+statement and then binding re-announces the bound value's type, because a plan that had no
+type for a parameter is discarded when one is bound.
 
 **Note**: Strings are always inferred as TEXT type. Plain objects and arrays are inferred as JSON type. To use date/time types, either:
 - Use conversion functions in your query: `date(:param)`, `time(:param)`, `datetime(:param)`
@@ -50,20 +51,31 @@ the bound value's type, because the provisional plan is discarded on the first b
 
 ## Type Resolution and Validation
 
-Parameter types are established from the first source that supplies one, and validated on each execution:
+Parameter types are established per parameter, by the first value bound to it, and validated on each execution:
 
-1. **From the first binding source**: explicit hints or values handed to `prepare()`; otherwise the
-   first `bind()` / `bindAll()` / execution-time parameters (`stmt.all(params)`, `stmt.get(params)`,
-   `db.eval(sql, params)`). "Nothing bound yet" is never mistaken for "typed, and there are none".
-2. **Established once, then frozen**: later bindings are validated against those types, never
-   re-inferred. A statement prepared with values or hints is compiled exactly once.
-3. **At most one extra compile**: a statement compiled *before* its first bind — which happens when a
-   caller introspects (`getColumnNames()`, `getColumnDefs()`, `isQuery()`, `getPlanShape()`) first —
-   plans provisionally with every parameter at ANY, and that provisional plan is discarded on the
-   first bind so the executed plan sees the real types.
+1. **From that parameter's first bound value**: values handed to `prepare()`, or the first
+   `bind()` / `bindAll()` / execution-time parameters (`stmt.all(params)`, `stmt.get(params)`,
+   `db.eval(sql, params)`). "Nothing bound yet" is never mistaken for "typed, and there are
+   none" — so `db.prepare(sql, [])`, the shape a `params = []` default argument produces,
+   types nothing and leaves every parameter open.
+2. **Established once, then frozen**: later bindings of the *same* parameter are validated
+   against its type, never re-inferred. A statement whose parameters are all bound before it
+   plans is compiled exactly once.
+3. **At most one extra compile per late-typed parameter**: a plan built while a parameter had
+   no type — because nothing was bound yet, or only some parameters were — is discarded when
+   that parameter is first bound, so the executed plan sees its real type. This is what a
+   caller who introspects (`getColumnNames()`, `getColumnDefs()`, `isQuery()`,
+   `getPlanShape()`, `getChangeScope()`) before binding pays.
 4. **At execution time**: Parameter values are validated against the established types
 5. **No recompilation on value change**: Prepared statements are NOT recompiled when parameter values change
 6. **Type safety**: Attempting to execute with incompatible types throws an error
+
+An **explicit hint map** (option 2 below) is the exception to all of the above: it is closed,
+not extended. A parameter the map does not name stays ANY however it is later bound, and bound
+values are not validated against it. That is a deliberate surface — the internal foreign-key
+statement cache (`core/internal-statement-cache.ts`) prepares with an *empty* map to get an
+affinity-neutral plan with no bind-time validation, so one cached probe can be rebound to an
+integer key on one row and a text key on the next.
 
 `db.eval(sql, params)` and `db.get(sql, params)` both plan with the types of `params`, so every entry
 point answers a cross-type comparison (`where text_col = ?` bound to a number) the same way.

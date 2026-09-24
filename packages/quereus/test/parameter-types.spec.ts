@@ -285,6 +285,68 @@ describe('Parameter Type System', () => {
 		});
 	});
 
+	describe('A parameter first bound after the plan was built still gets its type', () => {
+		// The plan a statement caches announces the parameter types known when it was
+		// built. Binding a value for a parameter that plan had NO type for has to discard
+		// it, or that parameter stays ANY for the statement's whole life and a cross-type
+		// comparison against it silently matches nothing.
+		beforeEach(async () => {
+			await db.exec('create table w (k integer primary key, a text, b text)');
+			await db.exec("insert into w values (1, '5', '7')");
+		});
+
+		it('types a second parameter bound after an introspecting compile', async () => {
+			const stmt = db.prepare('select k from w where a = :x and b = :y');
+			stmt.bind('x', 5);
+			// Compiles with only :x typed — :y is ANY in this plan.
+			expect(stmt.getColumnDefs().map(c => c.name)).to.deep.equal(['k']);
+			stmt.bind('y', 7);
+			const rows: ResultRow[] = [];
+			for await (const row of stmt.all()) rows.push(row);
+			expect(rows).to.deep.equal([{ k: 1 }]);
+			await stmt.finalize();
+		});
+
+		it('types a parameter bound after preparing with an empty parameter collection', async () => {
+			for (const empty of [[], {}] as ReadonlyArray<SqlValue[] | Record<string, SqlValue>>) {
+				const stmt = db.prepare('select ? as v', empty);
+				stmt.bindAll([9]);
+				expect(stmt.getColumnDefs()[0].type.logicalType.name, JSON.stringify(empty)).to.equal('INTEGER');
+				await stmt.finalize();
+			}
+		});
+
+		it('leaves an already-typed parameter frozen while typing a newly bound one', async () => {
+			const stmt = db.prepare('select :x as x, :y as y');
+			stmt.bind('x', 9);
+			expect(stmt.getColumnDefs().map(c => c.type.logicalType.name)).to.deep.equal(['INTEGER', 'ANY']);
+			stmt.bind('y', 'text');
+			expect(stmt.getColumnDefs().map(c => c.type.logicalType.name)).to.deep.equal(['INTEGER', 'TEXT']);
+			// :x keeps the type its first value established, so a REAL is still a mismatch.
+			stmt.bind('x', 3.14);
+			let error: Error | undefined;
+			try {
+				await stmt.get();
+			} catch (e) {
+				error = e as Error;
+			}
+			expect(error, 'expected a frozen-type mismatch on :x').to.exist;
+			expect(error!.message).to.include('Parameter type mismatch');
+			await stmt.finalize();
+		});
+
+		it('does not poison the executed plan when getChangeScope() runs before any bind', async () => {
+			// getChangeScope() plans through getAnalysisPlan(), a second compile-before-bind
+			// site that shares establishParameterTypes with compile().
+			const stmt = db.prepare('select k from w where a = ?');
+			expect(stmt.getChangeScope()).to.exist;
+			const rows: ResultRow[] = [];
+			for await (const row of stmt.all([5])) rows.push(row);
+			expect(rows).to.deep.equal([{ k: 1 }]);
+			await stmt.finalize();
+		});
+	});
+
 	describe('Cross-type parameter comparison agrees across entry points', () => {
 		// A statement compiled before its first bind plans every parameter as ANY, so no
 		// comparison-site coercion is minted and a cross-type comparison silently matches
@@ -348,6 +410,20 @@ describe('Parameter Type System', () => {
 					try {
 						const row = await stmt.get(params);
 						return row ? [row] : [];
+					} finally {
+						await stmt.finalize();
+					}
+				},
+			},
+			{
+				// An empty parameter collection at prepare() supplies no type for anything,
+				// which must read as "nothing typed yet" and not as "typed, and there are
+				// none" — the wrapper spelling `run(sql, params = [])` lands here.
+				name: 'db.prepare(sql, []).all(params)',
+				read: async (sql, params) => {
+					const stmt = db.prepare(sql, []);
+					try {
+						return await drain(stmt.all(params));
 					} finally {
 						await stmt.finalize();
 					}

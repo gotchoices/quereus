@@ -35,18 +35,27 @@ export function getParameterTypes(params: SqlParameters | undefined): Map<string
 				// by its stringified index (`boundArgs[index + 1]`) — normalize it back to a
 				// number so it lines up with the array branch above and with ParameterScope's
 				// own key, rather than silently missing the hint lookup.
-				const prefixed = key.startsWith(':');
-				const name = prefixed ? key.substring(1) : key;
 				// One bound object can carry BOTH spellings of a name (':p' and 'p'). The
 				// bind-time value lookup (Statement.validateParameterTypes) gives the BARE
 				// key precedence, so the hint has to come from the same entry — otherwise
 				// the plan is typed from one value and validated against another.
-				if (prefixed && Object.hasOwn(params, name)) return;
-				results!.set(normalizeParamKey(name), getParameterScalarType(value));
+				if (key.startsWith(':') && Object.hasOwn(params, key.substring(1))) return;
+				results!.set(boundKeyToParamKey(key), getParameterScalarType(value));
 			});
 		}
 	}
 	return results;
+}
+
+/**
+ * The parameter a bound-args entry names. A bound key carries whatever spelling the
+ * caller used — `:name`, the bare `name`, or a stringified positional index — while
+ * parameter types and `ParameterScope` are keyed by the bare name or the number. One
+ * function so the type map and {@link import('./statement.js').Statement}'s
+ * stale-plan check cannot drift on what counts as the same parameter.
+ */
+export function boundKeyToParamKey(key: string): string | number {
+	return normalizeParamKey(key.startsWith(':') ? key.substring(1) : key);
 }
 
 /**

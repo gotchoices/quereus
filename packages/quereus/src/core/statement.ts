@@ -19,7 +19,7 @@ import type { VirtualTable } from '../vtab/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
-import { getParameterTypes } from './param.js';
+import { boundKeyToParamKey, getParameterTypes } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
 import { wrapAsyncIterator } from '../util/async-iterator.js';
@@ -74,18 +74,22 @@ export class Statement {
 	private columnDefCache = new Cached<DeepReadonly<ColumnDef>[]>(() => this.getColumnDefs());
 	private schemaChangeUnsubscriber: (() => void) | null = null;
 	/**
-	 * Parameter types established from the first binding source — explicit hints or
-	 * values at `prepare()`, otherwise the first `bind`/`bindAll`/execution-time
-	 * parameters. Undefined until then; see {@link establishParameterTypes}.
+	 * Types of the parameters that have one: the explicit hints handed to `prepare()`,
+	 * or — when the caller supplied values instead — the type each parameter's FIRST
+	 * bound value implied. Undefined while no parameter has a type at all; see
+	 * {@link establishParameterTypes} for why that is not the same as an empty map.
 	 */
 	private parameterTypes: Map<string | number, ScalarType> | undefined = undefined;
 	/**
-	 * True when the cached plan was built before any parameter type was established,
-	 * so every parameter in it announces ANY. Such a plan is provisional: the first
-	 * binding discards it ({@link dropProvisionalPlanOnBind}) so the next compile can
-	 * plan against the bound values' real types.
+	 * True when {@link parameterTypes} came from an explicit hint map handed to
+	 * `prepare()`. Such a map is CLOSED: a parameter it does not name stays ANY
+	 * however it is later bound, and nothing is validated against it. That is a
+	 * deliberate surface, not an oversight — `InternalStatementCache` prepares its FK
+	 * probes with an EMPTY map precisely to get an affinity-neutral plan and no
+	 * bind-time validation, so one cached statement can be rebound to an integer key
+	 * on one row and a text key on the next.
 	 */
-	private planTypesProvisional = false;
+	private readonly parameterTypesDeclared: boolean;
 	/**
 	 * Parameter names/indices used directly as a comparand in a scalar comparison
 	 * (`= <> < <= > >=` / `IN` / `BETWEEN`) against a non-object scalar operand.
@@ -139,17 +143,15 @@ export class Statement {
 		}
 
 		// Handle explicit parameter types or initial values
+		this.parameterTypesDeclared = paramsOrTypes instanceof Map;
 		if (paramsOrTypes instanceof Map) {
-			// Explicit parameter types provided
+			// Explicit parameter types provided — taken as given, never extended.
 			this.parameterTypes = paramsOrTypes;
 		} else if (paramsOrTypes !== undefined) {
-			// Initial parameter values - infer types and bind them
-			this.parameterTypes = getParameterTypes(paramsOrTypes);
-			// Also bind the initial values. Values canonicalize as they enter boundArgs
-			// (a safe-range bigint narrows to number, R1 — util/numeric-canonical.ts):
-			// per-bind, not per-row, and shared by all three ingress sites (here,
-			// bind, bindAll). Type inference above saw the raw values, but it maps a
-			// safe-range bigint and its number form to INTEGER alike, so no drift.
+			// Initial parameter values. Values canonicalize as they enter boundArgs (a
+			// safe-range bigint narrows to number, R1 — util/numeric-canonical.ts):
+			// per-bind, not per-row, and shared by all three ingress sites (here, bind,
+			// bindAll).
 			if (Array.isArray(paramsOrTypes)) {
 				paramsOrTypes.forEach((value, index) => {
 					this.boundArgs[index + 1] = canonicalizeSqlValue(value);
@@ -159,6 +161,13 @@ export class Statement {
 					this.boundArgs[key] = canonicalizeSqlValue(value);
 				}
 			}
+			// Types follow from those values NOW, not at the first compile: prepare-time
+			// values are the declaration, so `prepare(sql, [1, 42]).run([2, 3.14])` must
+			// be a type mismatch and not a re-inference. Routed through the shared helper
+			// so the "no values is not an empty type map" rule holds here too — inferring
+			// inline is what let `prepare(sql, [])` freeze an established-but-EMPTY map
+			// and pin every later-bound parameter at ANY.
+			this.establishParameterTypes();
 		}
 
 		if (this.astBatch.length === 0 && initialAstIndex === 0) {
@@ -180,8 +189,9 @@ export class Statement {
 		if (this.astBatchIndex < this.astBatch.length - 1) {
 			this.astBatchIndex++;
 			this.invalidatePlan();
-			this.parameterTypes = undefined;
-			this.planTypesProvisional = false;
+			// Inferred types described the statement just left behind; a caller's explicit
+			// hint map was given for the whole prepared text and stays in force.
+			if (!this.parameterTypesDeclared) this.parameterTypes = undefined;
 			return true;
 		} else {
 			return false;
@@ -212,44 +222,69 @@ export class Statement {
 	}
 
 	/**
-	 * The parameter types to plan with. Establishes them, once, from the first
-	 * binding source that has any: explicit hints or values handed to `prepare()`
-	 * (the constructor sets them directly), otherwise the values bound since.
+	 * The parameter types to plan with, covering every parameter that has a bound
+	 * value by the time this runs.
 	 *
-	 * Returns undefined while NOTHING is bound. That case must not be recorded as an
-	 * established-but-empty map: an empty map is indistinguishable from "typed, and
-	 * there are none", and recording it would freeze every parameter at ANY even
+	 * Each parameter's type is established ONCE — by the first value ever bound to it
+	 * — and is never re-inferred afterwards. That frozen contract is what
+	 * {@link validateParameterTypes} checks and what lets repeated executions reuse one
+	 * plan. Extending the map is not re-inferring: a parameter with no type yet has
+	 * never been planned against anything, so taking its first value's type contradicts
+	 * nothing already announced.
+	 *
+	 * Explicit hints short-circuit all of this — see {@link parameterTypesDeclared}.
+	 *
+	 * Returns undefined while NO parameter has a type. That state must not be recorded
+	 * as an established-but-empty map: an empty map is indistinguishable from "typed,
+	 * and there are none", and recording it would pin every parameter at ANY even
 	 * after values arrive.
 	 */
 	private establishParameterTypes(): Map<string | number, ScalarType> | undefined {
+		if (this.parameterTypesDeclared) return this.parameterTypes;
+		const inferred = getParameterTypes(this.boundArgs);
+		if (!inferred || inferred.size === 0) return this.parameterTypes;
 		if (this.parameterTypes === undefined) {
-			const inferred = getParameterTypes(this.boundArgs);
-			if (inferred && inferred.size > 0) this.parameterTypes = inferred;
+			this.parameterTypes = inferred;
+		} else {
+			for (const [key, type] of inferred) {
+				if (!this.parameterTypes.has(key)) this.parameterTypes.set(key, type);
+			}
 		}
 		return this.parameterTypes;
 	}
 
+	/** True when some bound value belongs to a parameter that has no type yet. */
+	private hasUntypedBinding(): boolean {
+		for (const key of Object.keys(this.boundArgs)) {
+			if (!this.parameterTypes?.has(boundKeyToParamKey(key))) return true;
+		}
+		return false;
+	}
+
 	/**
-	 * Called after every bind: a plan built with no established types announced every
-	 * parameter as ANY, so once a value arrives that plan no longer describes the
-	 * query that will run. Discard it and let the next compile establish real types.
+	 * Called after every bind. A cached plan announces the parameter types that were
+	 * established when it was built, so a bind that gives a value to a parameter that
+	 * plan had NO type for — one compiled before any bind, or compiled while only some
+	 * of the parameters were bound — no longer describes the query that will run.
+	 * Discard it; the next compile plans against the newly available types.
 	 *
-	 * Costs at most one extra compile per statement — the flag clears as soon as
-	 * types are established, and a statement prepared with values or hints never sets
-	 * it in the first place.
+	 * Costs at most one extra compile per parameter first bound after a compile, and
+	 * none at all for a statement that binds before it plans.
 	 *
 	 * NOTE: `all(params)` / `get(params)` on a statement prepared WITHOUT values read
-	 * `getColumnNames()` (which compiles, provisionally) before handing `params` down,
-	 * so they pay that extra compile on their first execution. Harmless: a result
-	 * column's name and the column count come from the projection, not from parameter
-	 * types, so the names read off the provisional plan are the final ones. If the
-	 * extra compile ever shows up in a profile, bind at those call sites before reading
-	 * names and pass `undefined` downstream, as {@link Database.get} already does.
+	 * `getColumnNames()` (which compiles) before handing `params` down, so they pay
+	 * that extra compile on their first execution; `readConcurrency: 'committed'` adds
+	 * {@link tryRouteConcurrent}'s compile ahead of it. Harmless: a result column's
+	 * name and the column count come from the projection, and committed-read
+	 * eligibility from the node kinds in the tree, so neither reads parameter types.
+	 * If the extra compile ever shows up in a profile, bind at those call sites before
+	 * reading names and pass `undefined` downstream, as {@link Database.get} already
+	 * does.
 	 */
-	private dropProvisionalPlanOnBind(): void {
-		if (!this.planTypesProvisional) return;
-		if (Object.keys(this.boundArgs).length === 0) return;
-		this.planTypesProvisional = false;
+	private dropStalePlanOnBind(): void {
+		// A declared hint map never grows, so no bind can make the cached plan stale.
+		if (!this.plan || this.parameterTypesDeclared) return;
+		if (!this.hasUntypedBinding()) return;
 		this.invalidatePlan();
 	}
 
@@ -265,15 +300,14 @@ export class Statement {
 		try {
 			const currentAst = this.getAstStatement();
 
-			// Types are established from the first binding SOURCE, never from emptiness:
-			// compiling with nothing bound leaves them undefined and marks the plan
-			// provisional rather than freezing an empty (but established) map, which would
-			// pin every parameter at ANY for the statement's whole life. Once established
-			// they never change again — that frozen-type contract is what
-			// validateParameterTypes checks, and what lets repeated executions reuse one
-			// plan.
+			// Types come from the values bound so far, never from emptiness: compiling
+			// with nothing bound leaves them undefined rather than freezing an empty (but
+			// established) map, which would pin every parameter at ANY for the statement's
+			// whole life. A parameter that already has a type keeps it — that frozen
+			// contract is what validateParameterTypes checks, and what lets repeated
+			// executions reuse one plan — while one bound for the FIRST time after this
+			// plan was built has already invalidated it (see dropStalePlanOnBind).
 			const parameterTypes = this.establishParameterTypes();
-			this.planTypesProvisional = parameterTypes === undefined;
 
 			// Pass parameter types directly to planning
 			const { plan: rawPlan, schemaDependencies: dependencies } = this.db._buildPlan([currentAst], parameterTypes, this._schemaPathOverride);
@@ -376,7 +410,7 @@ export class Statement {
 		} else {
 			throw new MisuseError("Invalid argument key type");
 		}
-		this.dropProvisionalPlanOnBind();
+		this.dropStalePlanOnBind();
 		return this;
 	}
 
@@ -409,7 +443,7 @@ export class Statement {
 		} else {
 			throw new MisuseError("Invalid parameters type for bindAll. Use array or object.");
 		}
-		this.dropProvisionalPlanOnBind();
+		this.dropStalePlanOnBind();
 		return this;
 	}
 
