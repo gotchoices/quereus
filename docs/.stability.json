@@ -66,6 +66,7 @@
 		"docs/types-ordering.md": "Stable",
 		"docs/types-parameters.md": "Stable",
 		"docs/types.md": "Stable",
+		"docs/usage-types.md": "Stable",
 		"docs/usage.md": "Stable",
 		"docs/view-persistence.md": "Beta",
 		"docs/view-updateability.md": "Beta",
