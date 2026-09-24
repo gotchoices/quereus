@@ -206,7 +206,7 @@ export class TransactionManager {
 					this.clearChangeLog();
 					return;
 				}
-				throw new TransactionActiveError('Cannot begin transaction: a transaction is already active');
+				throw new TransactionActiveError();
 			}
 			// Implicit while already in a transaction - no-op
 			return;
@@ -338,25 +338,32 @@ export class TransactionManager {
 
 		debugLog(`Rolling back ${this.transactionSource} transaction.`);
 
-		// Rollback all active connections
-		const connections = this.ctx.getAllConnections();
-		const rollbackPromises = connections.map(async (connection) => {
-			try {
-				await connection.rollback();
-			} catch (error) {
-				errorLog(`Error rolling back transaction on connection ${connection.connectionId}: %O`, error);
-			}
-		});
+		// The state reset runs in a `finally` so a rollback that throws still leaves
+		// the manager in autocommit, matching commitTransaction. Without it, a throw
+		// here would release the execution mutex with `inTransaction` still true and
+		// the next queued caller would run inside a transaction nobody owns — the
+		// exact stranding an atomic `exec` batch exists to prevent.
+		try {
+			// Rollback all active connections
+			const connections = this.ctx.getAllConnections();
+			const rollbackPromises = connections.map(async (connection) => {
+				try {
+					await connection.rollback();
+				} catch (error) {
+					errorLog(`Error rolling back transaction on connection ${connection.connectionId}: %O`, error);
+				}
+			});
 
-		await Promise.allSettled(rollbackPromises);
+			await Promise.allSettled(rollbackPromises);
 
-		// Discard batched events on rollback
-		this.ctx.getEventEmitter().discardBatch();
-
-		this.inTransaction = false;
-		this.isAutocommit = true;
-		this.transactionSource = null;
-		this.clearChangeLog();
+			// Discard batched events on rollback
+			this.ctx.getEventEmitter().discardBatch();
+		} finally {
+			this.inTransaction = false;
+			this.isAutocommit = true;
+			this.transactionSource = null;
+			this.clearChangeLog();
+		}
 	}
 
 	/**

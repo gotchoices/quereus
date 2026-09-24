@@ -444,6 +444,43 @@ describe('Transaction API', () => {
 			void expect(db.getAutocommit()).to.be.true;
 		});
 
+		it('rolls the whole batch back when OR ROLLBACK ends the transaction from inside a statement', async () => {
+			// The one failure shape that ends the batch's transaction BEFORE the batch's
+			// own catch runs: `_finalizeImplicitTransaction` honours OR ROLLBACK by rolling
+			// back whatever transaction is active, explicit ones included. The catch must
+			// notice it is no longer in a transaction and not roll back a second time.
+			const err = await rejection(db.exec(
+				"insert into t values (3, 'c'); insert or rollback into t values (1, 'duplicate');",
+				undefined,
+				{ transaction: true },
+			));
+
+			void expect(err).to.be.instanceOf(QuereusError);
+			void expect(db.getAutocommit()).to.be.true;
+			void expect(await idsInT()).to.deep.equal([1, 2]);
+
+			// And the database is immediately reusable — nothing was stranded.
+			await db.exec("insert into t values (5, 'e')", undefined, { transaction: true });
+			void expect(await idsInT()).to.deep.equal([1, 2, 5]);
+		});
+
+		it('accepts savepoint + release inside the batch and still commits everything', async () => {
+			// RELEASE of the outermost savepoint merges layers; unlike SQL's standalone
+			// RELEASE-commits-the-transaction reading, it must NOT end the batch's
+			// transaction, so the statements after it still ride the closing commit.
+			await db.exec(
+				`savepoint sp1;
+				 insert into t values (3, 'c');
+				 release sp1;
+				 insert into t values (4, 'd');`,
+				undefined,
+				{ transaction: true },
+			);
+
+			void expect(db.getAutocommit()).to.be.true;
+			void expect(await idsInT()).to.deep.equal([1, 2, 3, 4]);
+		});
+
 		it('rolls the batch back when the signal aborts mid-batch', async () => {
 			const controller = new AbortController();
 			db.createScalarFunction('trip_abort', { numArgs: 0 }, () => {

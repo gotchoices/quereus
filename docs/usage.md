@@ -309,6 +309,8 @@ Two rules follow from running under one mutex hold:
 
 DDL inside an atomic batch is only as atomic as the backing module allows, exactly as it is inside a `BEGIN` — `pragma ddl_transaction_policy = 'strict'` already refuses DDL whose module does not declare full transactionality.
 
+One availability cost to weigh against a plain batch: the option opens an *explicit* transaction, and a concurrent `readConcurrency: 'committed'` read is only eligible for the [mutex-free path](sql-txn.md#86-concurrent-committed-reads) while no explicit transaction is open. So for the batch's duration such reads fall back to the serialized path and queue behind it, where under a plain multi-statement `exec` (whose per-statement transactions are implicit) they would have run concurrently. Correctness is unaffected either way; only read latency is.
+
 #### Explicit Transactions
 
 For fine-grained control, use explicit transaction commands:

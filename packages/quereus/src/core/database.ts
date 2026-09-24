@@ -1142,9 +1142,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				try {
 					await this._rollbackTransaction();
 				} catch (rollbackErr) {
-					// A failed rollback is the more urgent signal — the state is now
-					// unknown — so it propagates, carrying the original failure rather
-					// than either being swallowed.
+					// A failed rollback is the more urgent signal — some connection's state
+					// is now unknown — so it propagates, carrying the original failure
+					// rather than either being swallowed. The engine-side transaction
+					// state is not in doubt: TransactionManager.rollbackTransaction resets
+					// it in a `finally`, so the mutex is never released mid-transaction.
 					if (rollbackErr instanceof Error && rollbackErr.cause === undefined) {
 						rollbackErr.cause = err;
 					}
@@ -1426,6 +1428,13 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * makes exactly these calls and nothing else, so this is equivalent and skips
 	 * parsing, planning, optimizing and emitting a three-word statement.
 	 *
+	 * NOTE: bypassing the planner also bypasses per-statement instrumentation —
+	 * these three methods emit no instruction trace and no `runtime_stats` row,
+	 * where SQL `begin`/`commit`/`rollback` still do. Nothing consumes that today;
+	 * if a tracing consumer ever needs the JS API to appear in a trace, route these
+	 * back through `_executeSingleStatement` on a pre-parsed AST rather than
+	 * re-parsing text.
+	 *
 	 * @throws TransactionActiveError if a transaction is already active once the
 	 *   mutex is granted.
 	 */
@@ -1433,7 +1442,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.checkOpen();
 		await this._withMutex(async () => {
 			if (this.transactionManager.isInTransaction()) {
-				throw new TransactionActiveError('Cannot begin transaction: a transaction is already active');
+				throw new TransactionActiveError();
 			}
 			await this._beginTransaction('explicit');
 		});
