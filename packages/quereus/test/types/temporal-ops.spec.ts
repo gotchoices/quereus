@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import * as fc from 'fast-check';
 import {
 	isTemporalKind,
 	runTemporalCase,
@@ -86,6 +87,28 @@ describe('temporal operation table', () => {
 			for (const [operator, left, right] of unsupported) {
 				expect(temporalOpCase(operator, left, right), `${operator}|${left}|${right}`).to.equal(undefined);
 			}
+		});
+	});
+
+	// The difference is exactly the gap, so adding it back to the subtrahend must land on the
+	// minuend. Any edit to the table that drops part of the gap (the time of day was once
+	// discarded) breaks this for some pair. Deliberately DATETIME-only: `date + timespan`
+	// truncates a sub-day part, so a DATE subtrahend cannot round-trip.
+	describe('datetime difference round-trip', () => {
+		const MIN_MS = Date.UTC(2000, 0, 1);
+		const MAX_MS = Date.UTC(2049, 11, 31, 23, 59, 59, 999);
+		const datetimeArb = fc.integer({ min: MIN_MS, max: MAX_MS })
+			.map(ms => new Date(ms).toISOString().slice(0, -1));
+
+		it('b + (a - b) equals a for any two datetimes', () => {
+			const difference = temporalOpCase('-', 'datetime', 'datetime')!;
+			const shift = temporalOpCase('+', 'datetime', 'timespan')!;
+			fc.assert(fc.property(datetimeArb, datetimeArb, (a, b) => {
+				const gap = runTemporalCase(difference, a, b);
+				const restored = runTemporalCase(shift, b, gap) as string;
+				// Compared as instants: the table renders a whole second without a fraction.
+				expect(Date.parse(`${restored}Z`), `${b} + (${a} - ${b}) = ${restored}`).to.equal(Date.parse(`${a}Z`));
+			}), { numRuns: 500 });
 		});
 	});
 

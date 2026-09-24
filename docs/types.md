@@ -523,9 +523,12 @@ Anything absent — `%` on any pair, `DATE + DATE`, `DATE * number`, `TIME - DAT
 `DATE - number` — raises `Unsupported temporal operation` when a row is evaluated.
 Notes on the edges:
 
-- A `DATE`/`DATETIME` difference collapses both sides to a calendar date first, so
-  `datetime('2024-01-20T10:00:00') - datetime('2024-01-15T08:00:00')` is `P5D`, not
-  `P5DT2H`. Tracked as `bug-datetime-difference-drops-time-of-day`.
+- A `DATE`/`DATETIME` difference is the full elapsed gap, days plus time of day:
+  `datetime('2024-01-20T10:00:00') - datetime('2024-01-15T08:00:00')` is `P5DT2H`. A `DATE`
+  facing a `DATETIME` is read as that date at midnight, so
+  `datetime('2024-01-25T10:00:00') - date('2024-01-15')` is `P10DT10H`. The result never
+  carries years, months or weeks (the largest unit is the day), so it stays comparable and
+  divisible. For the calendar-day count, subtract `date(a) - date(b)`.
 - `TIMESPAN / 0` and a ratio involving calendar units (years/months/weeks, which have no
   fixed length without a reference date) both return NULL rather than raising.
 - The `number` side must be a JS `number`; a value past 2^53 arrives as a `bigint` and is

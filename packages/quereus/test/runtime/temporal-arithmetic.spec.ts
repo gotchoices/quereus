@@ -145,27 +145,41 @@ describe('tryTemporalArithmetic', () => {
 	});
 
 	// ---------------------------------------------------------------
-	// DATETIME - DATETIME → TIMESPAN (via date subtraction)
+	// DATETIME - DATETIME → TIMESPAN (the full elapsed gap)
 	// ---------------------------------------------------------------
 	describe('datetime - datetime', () => {
 		it('same datetime yields zero', () => {
 			expect(tryTemporalArithmetic('-', '2024-01-15T12:00:00', '2024-01-15T12:00:00')).to.equal('PT0S');
 		});
 		it('later - earlier yields positive', () => {
-			// Date-level subtraction (time component is stripped to date)
 			expect(tryTemporalArithmetic('-', '2024-01-25T00:00:00', '2024-01-15T00:00:00')).to.equal('P10D');
+		});
+		it('keeps the time-of-day remainder', () => {
+			expect(tryTemporalArithmetic('-', '2024-01-20T10:00:00', '2024-01-15T08:00:00')).to.equal('P5DT2H');
+		});
+		it('earlier - later keeps the remainder, negated', () => {
+			expect(tryTemporalArithmetic('-', '2024-01-15T08:00:00', '2024-01-20T10:00:00')).to.equal('-P5DT2H');
+		});
+		it('a gap under a day that crosses midnight is hours, not a calendar day', () => {
+			expect(tryTemporalArithmetic('-', '2024-01-16T01:00:00', '2024-01-15T23:00:00')).to.equal('PT2H');
+		});
+		it('keeps a sub-second gap', () => {
+			expect(tryTemporalArithmetic('-', '2024-01-15T00:00:00.500', '2024-01-15T00:00:00')).to.equal('PT0.5S');
 		});
 	});
 
 	// ---------------------------------------------------------------
-	// DATE - DATETIME and DATETIME - DATE (mixed)
+	// DATE - DATETIME and DATETIME - DATE (mixed): a DATE reads as that date at midnight
 	// ---------------------------------------------------------------
 	describe('mixed date/datetime subtraction', () => {
 		it('date - datetime', () => {
-			expect(tryTemporalArithmetic('-', '2024-01-25', '2024-01-15T10:00:00')).to.equal('P10D');
+			expect(tryTemporalArithmetic('-', '2024-01-25', '2024-01-15T10:00:00')).to.equal('P9DT14H');
 		});
 		it('datetime - date', () => {
-			expect(tryTemporalArithmetic('-', '2024-01-25T10:00:00', '2024-01-15')).to.equal('P10D');
+			expect(tryTemporalArithmetic('-', '2024-01-25T10:00:00', '2024-01-15')).to.equal('P10DT10H');
+		});
+		it('date - date stays whole days', () => {
+			expect(tryTemporalArithmetic('-', '2024-01-25', '2024-01-15')).to.equal('P10D');
 		});
 	});
 

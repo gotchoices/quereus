@@ -191,25 +191,24 @@ export function divideDuration(d: Temporal.Duration, divisor: number): Temporal.
 	});
 }
 
-/** A DATE or DATETIME operand as a PlainDate. */
-function asPlainDate(v: SqlValue, kind: 'date' | 'datetime'): Temporal.PlainDate {
+/** A DATE or DATETIME operand as a PlainDateTime; a DATE is read as that date at midnight. */
+function asPlainDateTime(v: SqlValue, kind: 'date' | 'datetime'): Temporal.PlainDateTime {
 	return kind === 'datetime'
-		? Temporal.PlainDateTime.from(v as string).toPlainDate()
-		: Temporal.PlainDate.from(v as string);
+		? Temporal.PlainDateTime.from(v as string)
+		: Temporal.PlainDate.from(v as string).toPlainDateTime();
 }
 
 /**
- * DATE/DATETIME − DATE/DATETIME → TIMESPAN.
+ * DATE/DATETIME − DATE/DATETIME → TIMESPAN, the full elapsed gap (days plus time of day).
  *
- * NOTE: both sides collapse to a PlainDate first, so the time of day is dropped —
- * `datetime('2024-01-20T10:00:00') - datetime('2024-01-15T08:00:00')` is `'P5D'`, not
- * `'P5DT2H'`. Preserved verbatim from the cascade this table replaces; the fix is
- * tracked separately as `bug-datetime-difference-drops-time-of-day`.
+ * Both sides are taken at datetime resolution, so `DATE - DATE` (both midnight) gives the same
+ * whole-day answer as a date-level difference would. The largest unit stays `day`
+ * (`PlainDateTime.since`'s default), so the result never carries years, months or weeks.
  */
 function dateDifference(lk: 'date' | 'datetime', rk: 'date' | 'datetime'): TemporalOpCase {
 	return {
 		resultType: TIMESPAN_TYPE,
-		apply: (v1, v2) => asPlainDate(v1, lk).since(asPlainDate(v2, rk)).toString(),
+		apply: (v1, v2) => asPlainDateTime(v1, lk).since(asPlainDateTime(v2, rk)).toString(),
 	};
 }
 

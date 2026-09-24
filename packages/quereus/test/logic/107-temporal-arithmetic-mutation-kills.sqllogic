@@ -129,10 +129,14 @@ SELECT datetime('2024-01-25T00:00:00') - datetime('2024-01-15T00:00:00') as resu
 -- Mixed DATE/DATETIME subtraction
 -- ============================================================
 
+-- A DATE facing a DATETIME is read as that date at midnight
 SELECT date('2024-01-25') - datetime('2024-01-15T10:00:00') as result;
-→ [{"result":"P10D"}]
+→ [{"result":"P9DT14H"}]
 
 SELECT datetime('2024-01-25T10:00:00') - date('2024-01-15') as result;
+→ [{"result":"P10DT10H"}]
+
+SELECT date('2024-01-25') - date('2024-01-15') as result;
 → [{"result":"P10D"}]
 
 -- ============================================================
@@ -397,15 +401,26 @@ SELECT t - t as result FROM ts_int;
 DROP TABLE ts_int;
 
 -- ============================================================
--- DATETIME - DATETIME drops the time of day
+-- DATETIME - DATETIME keeps the time of day
 --
--- Both sides collapse to a PlainDate before the difference is taken, so a
--- 2-hour remainder disappears. Locked here as preserved-as-found behavior; the
--- fix is tracked as `bug-datetime-difference-drops-time-of-day`.
+-- The difference is the full elapsed gap — days plus the time-of-day remainder —
+-- never whole calendar days. The largest unit stays `day`.
 -- ============================================================
 
 SELECT datetime('2024-01-20T10:00:00') - datetime('2024-01-15T08:00:00') as result;
-→ [{"result":"P5D"}]
+→ [{"result":"P5DT2H"}]
+
+-- Negative mirror
+SELECT datetime('2024-01-15T08:00:00') - datetime('2024-01-20T10:00:00') as result;
+→ [{"result":"-P5DT2H"}]
+
+-- Under a day apart but across midnight: two hours, not a calendar day
+SELECT datetime('2024-01-16T01:00:00') - datetime('2024-01-15T23:00:00') as result;
+→ [{"result":"PT2H"}]
+
+-- Sub-second gap
+SELECT datetime('2024-01-15T00:00:00.500') - datetime('2024-01-15T00:00:00') as result;
+→ [{"result":"PT0.5S"}]
 
 -- ============================================================
 -- TIMESPAN comparisons (semantic, not lexicographic)
@@ -652,10 +667,9 @@ SELECT sp2 + dt AS r FROM arms2;
 SELECT tm - tm2 AS r FROM arms2;
 → [{"r":"PT2H30M"}]
 
--- the three mixed DATE/DATETIME differences (all collapse to whole days — see the
--- NOTE on dateDifference in types/temporal-ops.ts)
+-- the three mixed DATE/DATETIME differences, each the full elapsed gap (a DATE reads as midnight)
 SELECT dtm - dtm2 AS a, dtm - dt AS b, dt - dtm2 AS c FROM arms2;
-→ [{"a":"P10D","b":"P5D","c":"P5D"}]
+→ [{"a":"P10DT2H15M","b":"P5DT8H15M","c":"P4DT18H"}]
 
 -- TIMESPAN ± TIMESPAN
 SELECT sp + sp2 AS a, sp - sp2 AS b FROM arms2;
