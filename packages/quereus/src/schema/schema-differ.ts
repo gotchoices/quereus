@@ -3161,7 +3161,7 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 			},
 		};
 		const step: MigrationStep = { sql: astToString(stmt), ast: stmt };
-		statements.push(undo ? { ...step, ...undo.undoSetMaintained(alter, schemaPrefix) } : step);
+		statements.push(undo ? { ...step, ...undo.undoSetMaintained(alter) } : step);
 	}
 
 	// Assertion creates LAST — after every table alter and maintained re-attach, so
@@ -3202,6 +3202,17 @@ type CreatedObjectKind = 'table' | 'view' | 'index' | 'assertion';
 
 /** Case-insensitive identifier equality — how the catalog and the rename walkers compare names. */
 const sameName = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
+/**
+ * The pre-apply spelling of a name as spelled NOW, given the renames in force:
+ * the old name when a rename landed on it, the name itself when none touched it,
+ * and `undefined` when a rename vacated it — nothing pre-apply answers to it any more.
+ */
+function preRenameName(renames: ReadonlyArray<ColumnRenameOp>, currentName: string): string | undefined {
+	const landed = renames.find(r => sameName(r.newName, currentName));
+	if (landed) return landed.oldName;
+	return renames.some(r => sameName(r.oldName, currentName)) ? undefined : currentName;
+}
 
 /** A rename of something inside a table, remembered with the table's CURRENT (post-table-rename) spelling. */
 interface InTableRename extends ColumnRenameOp {
@@ -3253,8 +3264,6 @@ class UndoRenderer {
 	private tableRenames: ReadonlyArray<RenameOp> = [];
 	private readonly columnRenames: InTableRename[] = [];
 	private readonly constraintRenames: InTableRename[] = [];
-	/** How many of `columnRenames` the current body replay has applied so far — see `resolveColumnNow`. */
-	private replayed = 0;
 
 	constructor(
 		private readonly schemaName: string,
@@ -3356,9 +3365,9 @@ class UndoRenderer {
 
 	/** Undo of `DROP MAINTAINED`: the derivation the table carried before the apply. */
 	reattachAsBefore(table: string): StepUndo {
-		const actual = this.tableNow(table);
-		if (!actual?.maintained) return NOTHING_TO_UNDO;
-		return this.setMaintainedFrom(actual, table);
+		const maintained = this.tableNow(table)?.maintained;
+		if (!maintained) return NOTHING_TO_UNDO;
+		return this.setMaintainedFrom(maintained, table);
 	}
 
 	/**
@@ -3369,13 +3378,13 @@ class UndoRenderer {
 	 * A same-shape re-attach (no detach) replaced the derivation in place, so its
 	 * undo re-attaches the pre-apply one.
 	 */
-	undoSetMaintained(alter: TableAlterDiff, schemaPrefix: string): StepUndo {
+	undoSetMaintained(alter: TableAlterDiff): StepUndo {
 		const actual = this.tableNow(alter.tableName);
 		if (!actual) return NOTHING_TO_UNDO;
 		if (!actual.maintained || alter.dropMaintained) {
-			return { undo: [`ALTER TABLE ${schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`] };
+			return { undo: [`ALTER TABLE ${this.schemaPrefix}${quoteIdentifier(alter.tableName)} DROP MAINTAINED`] };
 		}
-		return this.setMaintainedFrom(actual, alter.tableName);
+		return this.setMaintainedFrom(actual.maintained, alter.tableName);
 	}
 
 	readdConstraint(table: string, name: string, quotedTable: string): StepUndo {
@@ -3462,10 +3471,14 @@ class UndoRenderer {
 
 	// --- Catalog lookups through the renames in force (Rule 1) ---
 
-	/** The pre-apply table a CURRENT table name denotes. */
+	/**
+	 * The pre-apply table a CURRENT table name denotes. A name a rename in force
+	 * vacated (and nothing was renamed onto) denotes no pre-apply table: whatever
+	 * sits under it now, this plan created.
+	 */
 	private tableNow(currentName: string): CatalogTable | undefined {
-		const renamed = this.tableRenames.find(r => sameName(r.newName, currentName));
-		return this.tables.get((renamed?.oldName ?? currentName).toLowerCase());
+		const actualName = preRenameName(this.tableRenames, currentName);
+		return actualName === undefined ? undefined : this.tables.get(actualName.toLowerCase());
 	}
 
 	/** The current spelling of a pre-apply table name. */
@@ -3473,13 +3486,12 @@ class UndoRenderer {
 		return this.tableRenames.find(r => sameName(r.oldName, actualName))?.newName ?? actualName;
 	}
 
-	/** The pre-apply column a CURRENT column name denotes (both names as spelled now). */
+	/** The pre-apply column a CURRENT column name denotes (both names as spelled now); see `tableNow` for a vacated name. */
 	private columnNow(currentTable: string, currentColumn: string): CatalogTable['columns'][number] | undefined {
 		const table = this.tableNow(currentTable);
 		if (!table) return undefined;
-		const renamed = this.columnRenames.find(r => sameName(r.table, currentTable) && sameName(r.newName, currentColumn));
-		const actualName = renamed?.oldName ?? currentColumn;
-		return table.columns.find(c => sameName(c.name, actualName));
+		const actualName = preRenameName(this.columnRenames.filter(r => sameName(r.table, currentTable)), currentColumn);
+		return actualName === undefined ? undefined : table.columns.find(c => sameName(c.name, actualName));
 	}
 
 	/** The current spelling of a pre-apply column name. */
@@ -3490,15 +3502,13 @@ class UndoRenderer {
 	private constraintNow(currentTable: string, currentName: string): CatalogTable['namedConstraints'][number] | undefined {
 		const table = this.tableNow(currentTable);
 		if (!table) return undefined;
-		const renamed = this.constraintRenames.find(r => sameName(r.table, currentTable) && sameName(r.newName, currentName));
-		const actualName = renamed?.oldName ?? currentName;
-		return table.namedConstraints?.find(c => sameName(c.name, actualName));
+		const actualName = preRenameName(this.constraintRenames.filter(r => sameName(r.table, currentTable)), currentName);
+		return actualName === undefined ? undefined : table.namedConstraints?.find(c => sameName(c.name, actualName));
 	}
 
 	// --- Catalog-sourced bodies with the renames in force applied forward (Rule 2) ---
 
-	private setMaintainedFrom(actual: CatalogTable, table: string): StepUndo {
-		const maintained = actual.maintained!;
+	private setMaintainedFrom(maintained: NonNullable<CatalogTable['maintained']>, table: string): StepUndo {
 		if (!maintained.select) return this.cannotUndo(`the derivation of ${table}`, 'the pre-apply catalog carries no body for it');
 		const select = cloneQueryExpr(maintained.select);
 		this.replayRenames(select, undefined, {});
@@ -3589,32 +3599,35 @@ class UndoRenderer {
 				resolve: this.resolveRef, resolveAfter: this.resolveRef,
 			}, tableOpts);
 		}
-		for (this.replayed = 0; this.replayed < this.columnRenames.length; this.replayed++) {
-			const r = this.columnRenames[this.replayed];
+		this.columnRenames.forEach((r, replayedSoFar) => {
 			const targetKey = objectRefKey(this.schemaName, r.table);
+			const resolveColumn = this.columnResolverAfter(replayedSoFar);
 			if (owner !== undefined && sameName(r.table, owner)) {
-				renameColumnInCheckExpression(node, owner, r.oldName, r.newName, this.resolveRef, targetKey, 'own', this.resolveColumnNow);
+				renameColumnInCheckExpression(node, owner, r.oldName, r.newName, this.resolveRef, targetKey, 'own', resolveColumn);
 			} else {
-				renameColumnInAst(node, r.table, r.oldName, r.newName, this.resolveRef, targetKey, owner !== undefined ? 'foreign' : 'none', this.resolveColumnNow);
+				renameColumnInAst(node, r.table, r.oldName, r.newName, this.resolveRef, targetKey, owner !== undefined ? 'foreign' : 'none', resolveColumn);
 			}
-		}
+		});
 	}
 
 	/**
 	 * Column-existence resolver for the scope-aware walks in {@link replayRenames}:
 	 * "does this FROM source expose this column?" answered against the pre-apply
-	 * catalog with the renames replayed SO FAR applied — the world the matching live
-	 * rename statement ran in. Cross-schema sources and views answer false, as the
-	 * differ's declared-side resolver does (conservative: worst case a ref that
-	 * would have bound to an inner source is rewritten too).
+	 * catalog with the first `applied` column renames in force — the world the
+	 * matching live rename statement ran in. Cross-schema sources and views answer
+	 * false, as the differ's declared-side resolver does (conservative: worst case a
+	 * ref that would have bound to an inner source is rewritten too).
 	 */
-	private readonly resolveColumnNow: ResolveColumnInSource = (schema, table, column) => {
-		if (schema !== this.schemaName.toLowerCase()) return false;
-		const actual = this.tableNow(table);
-		if (!actual) return false;
-		const applied = this.columnRenames.slice(0, this.replayed).filter(r => sameName(r.table, table));
-		return actual.columns.some(c => sameName(applied.find(r => sameName(r.oldName, c.name))?.newName ?? c.name, column));
-	};
+	private columnResolverAfter(applied: number): ResolveColumnInSource {
+		const inForce = this.columnRenames.slice(0, applied);
+		return (schema, table, column) => {
+			if (schema !== this.schemaName.toLowerCase()) return false;
+			const actual = this.tableNow(table);
+			if (!actual) return false;
+			const onTable = inForce.filter(r => sameName(r.table, table));
+			return actual.columns.some(c => sameName(onTable.find(r => sameName(r.oldName, c.name))?.newName ?? c.name, column));
+		};
+	}
 
 	private cannotUndo(what: string, why: string): StepUndo {
 		warnLog(`No undo for migration step ${what}: ${why}`);

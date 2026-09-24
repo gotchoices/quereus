@@ -419,6 +419,22 @@ describe('generateMigrationPlan undo', () => {
 			expectUndo(plan, 'DROP VIEW IF EXISTS v', ['create view v as select qty from t']);
 		});
 
+		it('a CHECK whose subquery reads ANOTHER table follows that table\'s column rename when it precedes the drop', async () => {
+			const db = await databaseWith([
+				'create table p (id integer primary key, flag integer)',
+				'create table t (id integer primary key, pid integer, constraint ck check ((select count(*) from p where p.flag = 1) >= 0))',
+			]);
+			const plan = planFor(db, `
+				table p { id integer primary key, active integer with tags ("quereus.previous_name" = 'flag') }
+				table t { id integer primary key, pid integer }
+			`);
+			expect(plan.map(s => s.sql)).to.deep.equal([
+				'ALTER TABLE p RENAME COLUMN flag TO active',
+				'ALTER TABLE t DROP CONSTRAINT ck',
+			]);
+			expectUndo(plan, 'ALTER TABLE t DROP CONSTRAINT ck', ['ALTER TABLE t ADD constraint ck check on insert, update ((select count(*) from p where p.active = 1) >= 0)']);
+		});
+
 		it('a CHECK with a qualified self-reference follows the table rename, then the column rename', async () => {
 			const db = await databaseWith(['create table a (id integer primary key, qty integer, constraint ck check (a.qty > 0))']);
 			const plan = planFor(db, `table b { id integer primary key, cap integer with tags ("quereus.previous_name" = 'qty') } with tags ("quereus.previous_name" = 'a')`);
@@ -435,6 +451,14 @@ describe('generateMigrationPlan undo', () => {
 		it('a column rename with a CHECK over it dropped (Rule 2)', () => expectRoundTrip(
 			['create table t (id integer primary key, qty integer, constraint ck_qty check (qty > 0))'],
 			`table t { id integer primary key, cap integer with tags ("quereus.previous_name" = 'qty') }`));
+
+		it('another table\'s column rename with a cross-table CHECK subquery dropped (the non-owning walk)', () => expectRoundTrip([
+			'create table p (id integer primary key, flag integer)',
+			'create table t (id integer primary key, pid integer, constraint ck check ((select count(*) from p where p.flag = 1) >= 0))',
+		], `
+			table p { id integer primary key, active integer with tags ("quereus.previous_name" = 'flag') }
+			table t { id integer primary key, pid integer }
+		`));
 
 		it('a table rename with its dependent view, assertion and index dropped', () => expectRoundTrip([
 			'create table a (id integer primary key, qty integer)',
@@ -531,6 +555,59 @@ describe('generateMigrationPlan undo', () => {
 			const plan = generateMigrationPlan(diff, 'main', actual);
 			expectIrreversible(plan, 'DROP INDEX IF EXISTS ix', /DROP INDEX ix cannot be undone: its recorded DDL does not parse/);
 			expectIrreversible(plan, 'ALTER TABLE t DROP CONSTRAINT ck', /DROP CONSTRAINT ck cannot be undone: the pre-apply catalog carries no body/);
+		});
+
+		it('a view or a derivation without a body AST is reported irreversible with the reason, not thrown', () => {
+			const maintained: CatalogTable = {
+				name: 'm', ddl: '',
+				columns: [{ name: 'id', type: 'integer', notNull: true, primaryKey: true, defaultValue: null, collation: 'BINARY' }],
+				primaryKey: [{ columnName: 'id', desc: false }],
+				referencedTables: [],
+				namedConstraints: [],
+				maintained: { bodyHash: 'h' }, // no select
+			};
+			const actual: SchemaCatalog = {
+				...emptyCatalog(),
+				tables: [maintained],
+				views: [{ name: 'v', ddl: '', definition: 'select 1' }], // no select
+			};
+			const diff: SchemaDiff = {
+				...makeEmptySchemaDiff(),
+				viewsToDrop: ['v'],
+				tablesToAlter: [{ tableName: 'm', columnsToAdd: [], columnsToDrop: [], columnsToAlter: [], columnsToRename: [], dropMaintained: true }],
+			};
+			const plan = generateMigrationPlan(diff, 'main', actual);
+			expectIrreversible(plan, 'DROP VIEW IF EXISTS v', /DROP VIEW v cannot be undone: the pre-apply catalog carries no body/);
+			expectIrreversible(plan, 'ALTER TABLE m DROP MAINTAINED', /the derivation of m cannot be undone: the pre-apply catalog carries no body/);
+		});
+
+		it('a name a rename in force vacated denotes no pre-apply object: whatever now sits there, this plan created', () => {
+			// `a` is renamed to `b`, and a fresh `a` is created in the same plan. A tag edit
+			// on the NEW `a` must not restore the OLD `a`'s tags (that table is now `b`), and
+			// the same holds for a column name vacated by a column rename.
+			const old: CatalogTable = {
+				name: 'a', ddl: '', tags: { owner: 'old' },
+				columns: [
+					{ name: 'id', type: 'integer', notNull: true, primaryKey: true, defaultValue: null, collation: 'BINARY' },
+					{ name: 'x', type: 'integer', notNull: false, primaryKey: false, defaultValue: null, collation: 'BINARY', tags: { pii: 'yes' } },
+				],
+				primaryKey: [{ columnName: 'id', desc: false }],
+				referencedTables: [],
+				namedConstraints: [],
+			};
+			const diff: SchemaDiff = {
+				...makeEmptySchemaDiff(),
+				renames: [{ kind: 'table', oldName: 'a', newName: 'b' }],
+				tablesToCreate: [migrationCreate('create table a (id integer primary key)')],
+				tablesToAlter: [
+					{ tableName: 'a', columnsToAdd: [], columnsToDrop: [], columnsToAlter: [], columnsToRename: [], tableTagsChange: { owner: 'new' } },
+					{ tableName: 'b', columnsToAdd: [], columnsToDrop: [], columnsToAlter: [{ columnName: 'x', tags: { pii: 'no' } }], columnsToRename: [{ oldName: 'x', newName: 'y' }] },
+				],
+			};
+			const plan = generateMigrationPlan(diff, 'main', { ...emptyCatalog(), tables: [old] });
+			expectUndo(plan, `ALTER TABLE a SET TAGS (owner = 'new')`, []);
+			// `b.x` after `RENAME COLUMN x TO y` is a vacated name, not the pre-apply `x`.
+			expectUndo(plan, `ALTER TABLE b ALTER COLUMN x SET TAGS (pii = 'no')`, []);
 		});
 	});
 

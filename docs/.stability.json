@@ -44,6 +44,7 @@
 		"docs/runtime-work-counters.md": "Internal",
 		"docs/runtime.md": "Internal",
 		"docs/schema-rename-detection.md": "Beta",
+		"docs/schema-undo-plan.md": "Beta",
 		"docs/schema.md": "Beta",
 		"docs/sql-alter.md": "Stable",
 		"docs/sql-constraints.md": "Stable",
