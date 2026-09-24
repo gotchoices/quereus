@@ -9,7 +9,7 @@ import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../comm
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
 import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, collectTableConstraintNames, collectDeclaredConstraintNames } from '../../schema/table.js';
-import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateChecksOverExistingRows } from '../../schema/constraint-builder.js';
+import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateRowInvariantChecksOverExistingRows } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
 import { quoteIdentifier, astToString } from '../../emit/ast-stringify.js';
@@ -1107,8 +1107,9 @@ async function remapEventsForRevertedAddColumn(
 /**
  * Runs each new inline CHECK against the (already-backfilled) existing rows, through
  * the one existing-row CHECK scan every ALTER path shares
- * (`validateChecksOverExistingRows`, `schema/constraint-builder.ts` — which is where
- * `new.<col>` resolution, the `old.` screen and the operation-mask filter live). Relies
+ * (`validateRowInvariantChecksOverExistingRows`, `schema/constraint-builder.ts` — which
+ * is where `new.<col>` resolution, the `old.` screen and the ALTER-side row-invariant
+ * operation-mask gate live). Relies
  * on the just-registered column-only schema so SQL can resolve the new column while the
  * CHECK itself is not yet declared — declaring it first would let
  * `ruleFilterContradiction` fold this scan's own `not (<check_expr>)` to EmptyRelation.
@@ -1136,7 +1137,7 @@ async function validateBackfillAgainstChecks(
 		}
 		return buildCheckConstraintSchema(cc, columnOnlySchema.checkConstraints.length + i, takenNames);
 	});
-	await validateChecksOverExistingRows(rctx.db, columnOnlySchema, checks, (check) =>
+	await validateRowInvariantChecksOverExistingRows(rctx.db, columnOnlySchema, checks, (check) =>
 		new QuereusError(
 			`CHECK constraint '${check.name}' violated by backfilled rows in ALTER TABLE ADD COLUMN on '${columnOnlySchema.name}'`,
 			StatusCode.CONSTRAINT,

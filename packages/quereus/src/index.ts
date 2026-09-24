@@ -217,7 +217,7 @@ export type { SchemaChangeEvent, SchemaChangeListener, TableModifiedEvent, ViewA
 // names on an ALTER path — a parallel implementation is exactly the drift the differential
 // tests exist to catch.
 export { buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, disambiguateAutoConstraintName, resolveNamedConstraintClass, namedConstraintExists, validateCollationForType, resolveDefaultCollation, appendIndexToTableSchema, shiftSchemaIndicesForDrop, rekeySchemaPrimaryKey } from './schema/table.js';
-export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateChecksOverExistingRows, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
+export { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateChecksOverExistingRows, validateRowInvariantChecksOverExistingRows, validateForeignKeyOverExistingRows, validateForeignKeyCollations, maintainedTableUniqueViolationError, formatKeyValue } from './schema/constraint-builder.js';
 export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, NamedConstraintClass } from './schema/table.js';
 // Per-column UNIQUE-enforcement collation resolver, plus the per-column comparators
 // built from it — the single source of truth shared by store/isolation re-validators

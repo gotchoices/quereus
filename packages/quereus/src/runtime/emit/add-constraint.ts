@@ -8,7 +8,7 @@ import { createLogger } from '../../common/logger.js';
 import type { RowConstraintSchema, TableSchema } from '../../schema/table.js';
 import type { Schema } from '../../schema/schema.js';
 import { assertConstraintNameFree, collectTableConstraintNames, requireVtabModule, resolveReferencedColumnsForEnforcement } from '../../schema/table.js';
-import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, validateChecksOverExistingRows, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
+import { buildCheckConstraintSchema, buildForeignKeyConstraintSchema, validateRowInvariantChecksOverExistingRows, validateForeignKeyCollations } from '../../schema/constraint-builder.js';
 import { assertUniqueConstraintIndexNameFree, assertUniqueConstraintNotDuplicated } from '../../schema/catalog.js';
 import { assertDdlTransactionPolicy } from './ddl-transaction-policy.js';
 import { emitAlterSchemaEvent } from './alter-schema-event.js';
@@ -300,8 +300,9 @@ async function runAddConstraintViaModule(
  * exactly the accepting behavior this guard removes, and in exchange the optimizer
  * suppresses the CHECK lift for its tables, so the two halves of that contract stay
  * consistent — same shape as `delegatesNotNullBackfill` gating `validateNotNullBackfill`.
- * The scan itself (`new.` resolution, `old.` conjunct screen, operation-mask filter) is
- * the one every existing-row CHECK path shares.
+ * The scan itself (`new.` resolution, `old.` conjunct screen) is the one every
+ * existing-row CHECK path shares; the row-invariant (operation-mask) gate in front of
+ * it is the ALTER paths' — see `validateRowInvariantChecksOverExistingRows`.
  */
 async function rejectCheckViolatedByExistingRows(
 	rctx: RuntimeContext,
@@ -310,5 +311,5 @@ async function rejectCheckViolatedByExistingRows(
 ): Promise<void> {
 	const module = requireVtabModule(tableSchema);
 	if (module.getCapabilities?.().permitsGrandfatheredCheckViolators === true) return;
-	await validateChecksOverExistingRows(rctx.db, tableSchema, [check]);
+	await validateRowInvariantChecksOverExistingRows(rctx.db, tableSchema, [check]);
 }

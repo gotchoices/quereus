@@ -538,6 +538,10 @@ async function runBatchedMigrationLoop(
 			} catch (e) {
 				log('Migration failed for DDL: %s', ddl);
 				const errorMessage = e instanceof Error ? e.message : String(e);
+				// NOTE: every failed step surfaces as ERROR; the step's own code (e.g. CONSTRAINT
+				// when the data violates a tightened rule) is only on `cause` and inside the
+				// message. If a caller ever needs to key on "data violates the new schema" vs.
+				// "the migration is broken", propagate the inner code instead of flattening it.
 				throw new QuereusError(
 					`Failed to execute DDL: ${ddl}\nError: ${errorMessage}`,
 					StatusCode.ERROR,

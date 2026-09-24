@@ -140,7 +140,7 @@ export function extractCheckConstraints(
  *    CONSTRAINT, ADD COLUMN, maintained tables) plus the
  *    `permitsGrandfatheredCheckViolators` consumer gate. That scan applies the
  *    screens of THIS gate (mask, per-conjunct `old.`, `new.` reading), so it
- *    validates at least what is lifted here; change one, change the other.
+ *    validates exactly what is lifted here; change one, change the other.
  *
  * 2. Not deferred. A deferred check is enforced at commit, so
  *    same-transaction reads can observe violating rows. No SQL today can set
@@ -162,8 +162,14 @@ export function extractCheckConstraints(
  * `new.<col>` stays allowed: NEW is the stored row image, so NEW-qualified
  * references are same-row (see `columnIndexFromExpr`, whose bare-name
  * resolution deliberately tolerates the qualifier).
+ *
+ * Exported for the ALTER-side existing-row CHECK scan
+ * (`validateRowInvariantChecksOverExistingRows` in `schema/constraint-builder.ts`),
+ * which validates a CHECK iff THIS says it is a row invariant — a partial-mask check (`on insert`, `on update`) lets a row be
+ * legally stored in violation of it, so existing rows owe it nothing and the
+ * optimizer lifts nothing from it.
  */
-function isRowInvariantCheck(check: RowConstraintSchema): boolean {
+export function isRowInvariantCheck(check: RowConstraintSchema): boolean {
 	const requiredOps = RowOpFlag.INSERT | RowOpFlag.UPDATE;
 	if ((check.operations & requiredOps) !== requiredOps) return false;
 	return !(check.deferrable || check.initiallyDeferred);

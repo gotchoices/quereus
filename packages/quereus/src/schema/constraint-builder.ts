@@ -17,7 +17,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
-import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, disambiguateAutoConstraintName, RowOpFlag } from './table.js';
+import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, disambiguateAutoConstraintName } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -25,7 +25,7 @@ import { quoteIdentifier, expressionToString } from '../emit/ast-stringify.js';
 import { createLogger } from '../common/logger.js';
 import { columnSchemaToScalarType } from '../planner/type-utils.js';
 import { resolveComparisonCollation } from '../planner/analysis/comparison-collation.js';
-import { containsOldRowImageRef } from '../planner/analysis/check-extraction.js';
+import { containsOldRowImageRef, isRowInvariantCheck } from '../planner/analysis/check-extraction.js';
 import { cloneExpr } from '../planner/mutation/scope-transform.js';
 import { requalifyOwnRowRefsInSchemaExpression } from './rename-rewriter.js';
 
@@ -440,10 +440,16 @@ export function storedRowPredicate(check: RowConstraintSchema, tableSchema: Tabl
  * reads final pending state through the ordinary read path, so rows the issuing
  * transaction has staged but not committed count as present.
  *
- * Skipped outright: a CHECK whose operation mask covers neither INSERT nor UPDATE
- * (a `check on delete (…)` constrains no stored row image), and a CHECK whose
- * every conjunct is a transition constraint (see {@link storedRowPredicate} for
- * why that set exactly matches what the optimizer trusts).
+ * The operation-mask policy is the CALLER's, not this scan's: which stored rows
+ * owe a partial-mask CHECK (`check on insert (…)`, `check on update (…)`) anything
+ * depends on how the rows got there. The ALTER paths hand rows stored under any
+ * path and so validate only row invariants
+ * ({@link validateRowInvariantChecksOverExistingRows}); the maintained-table
+ * derivation validates every derived image against any insert-or-update CHECK
+ * (its op-mask collapse, `docs/mv-constraints.md`) and filters accordingly before
+ * calling here. The one screen intrinsic to the scan is the `old.` one: a stored
+ * row has no previous image whoever asks, so a CHECK whose every conjunct is a
+ * transition constraint is skipped (see {@link storedRowPredicate}).
  *
  * CAUTION — declared-constraint folding: the optimizer trusts a DECLARED CHECK
  * as a proven domain invariant, so if the LIVE catalog entry for `tableSchema`
@@ -462,7 +468,6 @@ export async function validateChecksOverExistingRows(
 ): Promise<void> {
 	const tableRef = qualifyRelation(tableSchema.schemaName, tableSchema.name);
 	for (const check of checks) {
-		if ((check.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) === 0) continue;
 		const predicate = storedRowPredicate(check, tableSchema);
 		if (!predicate) continue;
 		const exprSql = expressionToString(check.expr);
@@ -487,6 +492,26 @@ export async function validateChecksOverExistingRows(
 			await stmt.finalize();
 		}
 	}
+}
+
+/**
+ * {@link validateChecksOverExistingRows} restricted to the CHECKs that are row
+ * invariants by the optimizer's own gate ({@link isRowInvariantCheck}) — the
+ * ALTER-path entry point (`ADD CONSTRAINT … CHECK`, `ADD COLUMN … CHECK`). The
+ * rows an ALTER meets were stored under every write path, and a partial-mask
+ * CHECK lets a row be legally stored in violation of it (inserted under an
+ * update-only one, updated under an insert-only one), so those rows owe it
+ * nothing — and the optimizer lifts nothing from it, so accepting leaves no
+ * wrong-result risk open. Gating on the same predicate the lift uses is what
+ * makes the validated set exactly the lifted set; change one, change the other.
+ */
+export async function validateRowInvariantChecksOverExistingRows(
+	db: Database,
+	tableSchema: TableSchema,
+	checks: ReadonlyArray<RowConstraintSchema>,
+	onViolation?: (check: RowConstraintSchema, exprSql: string) => QuereusError,
+): Promise<void> {
+	await validateChecksOverExistingRows(db, tableSchema, checks.filter(isRowInvariantCheck), onViolation);
 }
 
 /**

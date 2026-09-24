@@ -81,14 +81,22 @@ select name from check_constraint_info('AcQ') order by name;
 → [{"name":"c_mix"},{"name":"c_old"}]
 
 -- ===================================================================
--- 5. A DELETE-only CHECK constrains no stored row image and is not validated.
+-- 5. A partial-mask CHECK is not a row invariant — a row can legally be stored in
+--    violation of it (inserted under an update-only one, updated under an
+--    insert-only one, anything under a delete-only one) — so existing rows owe it
+--    nothing, it is not validated, and the optimizer lifts nothing from it: the
+--    violator stays visible to the contradicting query.
 -- ===================================================================
 
 create table AcD (id integer primary key, n integer null);
 insert into AcD values (1, -5);
 alter table AcD add constraint c_del check on delete (n > 0);
-select name from check_constraint_info('AcD');
-→ [{"name":"c_del"}]
+alter table AcD add constraint c_ins check on insert (n > 0);
+alter table AcD add constraint c_upd check on update (n > 0);
+select name from check_constraint_info('AcD') order by name;
+→ [{"name":"c_del"},{"name":"c_ins"},{"name":"c_upd"}]
+select id from AcD where n <= 0;
+→ [{"id":1}]
 
 -- ===================================================================
 -- 6. The ADD COLUMN sibling shares the scan: an inline `check (new.<col> …)` is a

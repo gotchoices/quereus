@@ -1079,10 +1079,11 @@ function hasApplicableConstraints(db: Database, mt: TableSchema): boolean {
  * The scan is a plain table read of the backing (a maintained table resolves
  * through the ORDINARY table path in `building/select.ts` — never a
  * re-derivation), observing the pending reconcile writes through the registered
- * attach connection (reads-own-writes). An `old.`/`new.`-qualified CHECK —
- * which this SQL scan could not resolve — was already rejected at registration
- * (`buildDerivedRowValidator`), which runs before this validation on every
- * create/attach path.
+ * attach connection (reads-own-writes). An `old.`/`new.`-qualified CHECK was
+ * already rejected at registration (`buildDerivedRowValidator`), which runs
+ * before this validation on every create/attach path — the scan itself would now
+ * cope (it requalifies `new.` and screens `old.` conjuncts), but a derived row
+ * has no OLD image, so the registration rule stands on its own.
  *
  * Declared-constraint folding: the optimizer trusts a declared CHECK / FK as a
  * proven invariant (`ruleFilterContradiction` / `ruleAntiJoinFkEmpty`), and —
@@ -1107,6 +1108,10 @@ async function validateDeclaredConstraintsOverContents(
 	mt: MaintainedTableSchema,
 	validationColumns?: readonly ColumnSchema[],
 ): Promise<void> {
+	// Op-mask collapse (docs/mv-constraints.md): a derived image is validated against
+	// any insert-OR-update CHECK — deliberately wider than the ALTER paths' row-invariant
+	// gate (`validateRowInvariantChecksOverExistingRows`), which is why this caller
+	// filters itself and takes the raw scan.
 	const applicableChecks = mt.checkConstraints.filter(
 		c => (c.operations & (RowOpFlag.INSERT | RowOpFlag.UPDATE)) !== 0);
 	const fks = mt.foreignKeys ?? [];

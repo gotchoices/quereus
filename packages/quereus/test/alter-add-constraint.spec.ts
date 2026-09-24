@@ -545,6 +545,20 @@ describe('ALTER TABLE ADD CONSTRAINT … CHECK validates existing rows', () => {
 		expect(await rows(`select name from check_constraint_info('t')`)).to.deep.equal([{ name: 'c' }]);
 	});
 
+	for (const mask of ['insert', 'update']) {
+		it(`a ${mask.toUpperCase()}-only CHECK is not a row invariant and is not validated`, async () => {
+			await db.exec('create table t (id integer primary key, n integer null)');
+			await db.exec('insert into t values (1, -5)');
+			// A row may legally be stored in violation of a partial-mask CHECK (inserted
+			// under an update-only one, updated under an insert-only one), so existing rows
+			// owe it nothing — and the optimizer lifts nothing from it, so no wrong-result
+			// risk is left open by accepting. Same gate as the lift: `isRowInvariantCheck`.
+			await db.exec(`alter table t add constraint c check on ${mask} (n > 0)`);
+			expect(await rows(`select name from check_constraint_info('t')`)).to.deep.equal([{ name: 'c' }]);
+			expect(await rows('select id from t where n <= 0')).to.deep.equal([{ id: 1 }]);
+		});
+	}
+
 	it('a self-qualified reference (t.n) is validated', async () => {
 		await db.exec('create table t (id integer primary key, n integer null)');
 		await db.exec('insert into t values (1, -5)');

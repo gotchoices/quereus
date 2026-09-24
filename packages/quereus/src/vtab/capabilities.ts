@@ -94,8 +94,11 @@ export interface ModuleCapabilities {
 	 * with the CHECK — sound under the third-manifesto reading where CHECKs
 	 * are gate-on-add.
 	 *
-	 * When true, that lift is skipped for declared CHECKs on this table: the
-	 * CHECK is still enforced at write time (the engine's CHECK enforcer is
+	 * When true, the engine's own existing-row scan on `ALTER TABLE … ADD
+	 * CONSTRAINT … CHECK` (`rejectCheckViolatedByExistingRows`,
+	 * `runtime/emit/add-constraint.ts`) is skipped — that is what lets the
+	 * violator be grandfathered — and in exchange the lift is skipped for declared
+	 * CHECKs on this table: the CHECK is still enforced at write time (the engine's CHECK enforcer is
 	 * unchanged) but the planner can no longer prove `count(*) where v <= 0`
 	 * folds to `0` from `CHECK (v > 0)` alone, because a grandfathered violator
 	 * might satisfy the WHERE. Native modules (memory, store) leave this off,

@@ -503,6 +503,21 @@ describe('ALTER over staged overlay rows (isolation layer)', () => {
 		await db.exec('rollback');
 	});
 
+	it('does NOT turn an ADD CONSTRAINT CHECK reject into a silent success for an overlay-only violator', async () => {
+		await db.exec(`create table t (id integer primary key, n integer null) using isolated`);
+		await db.exec('begin');
+		await db.exec(`insert into t values (1, -5)`); // overlay-only violator; committed table is empty
+		// The engine's pre-dispatch CHECK scan is an ordinary `select`, so it reads the issuer's
+		// overlay merged with committed rows and must see the staged violator.
+		const err = await attemptAlter(db, `alter table t add constraint c check (n > 0)`);
+		expect(err, 'ADD CHECK must reject even when the violator is overlay-only').to.be.instanceOf(QuereusError);
+		expect(err!.code).to.equal(StatusCode.CONSTRAINT);
+		expect(await rows(db, `select name from check_constraint_info('t')`), 'no CHECK installed').to.deep.equal([]);
+		expect(await rows(db, 'select id from t where n <= 0'), 'staged row survives and stays visible').to.deep.equal([{ id: 1 }]);
+
+		await db.exec('rollback');
+	});
+
 	// The value-rewriting arms (`SET DATA TYPE`, `SET NOT NULL` backfill) re-validate UNIQUE over
 	// the CONVERTED rows. Under the wrapper that stream is the issuer's merged async view, so
 	// these are the only tests that drive the memory manager's async mapping arm (`mapRowsAsync`
