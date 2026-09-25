@@ -1,6 +1,6 @@
 {
   "name": "@quereus/planviz",
-  "version": "4.19.4",
+  "version": "4.20.0",
   "description": "Visual query plan inspection tool for Quereus",
   "publisher": "Got Choices Foundation",
   "repository": {
