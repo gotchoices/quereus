@@ -29,15 +29,19 @@ This first runs `scripts/release-guard.js` — an interactive gate that prints a
 
 ### When the release is finished
 
-`yarn pub` returns once npm has accepted every publish, but npm starts serving each new version at its own moment, sometimes a minute or more apart. A downstream upgrade run in that gap resolves new versions of some packages beside old versions of others. So `yarn release` runs `yarn await-published` (`scripts/await-published.mjs`) before `yarn gh-release`. It takes the packages to wait for from the `pub` chain in the root `package.json` — the same derivation `scripts/check-docs.mjs` uses (`scripts/published-packages.mjs`), not the workspace list, which also holds public workspaces `pub` does not publish — and asks `npm view <name>@<version>` for each every 5 s until all are served. Its last line is the one to wait for:
+`yarn pub` returns once npm has accepted every publish, but npm starts serving each new version at its own moment, sometimes a minute or more apart. A downstream upgrade run in that gap resolves new versions of some packages beside old versions of others. So `yarn release` runs `yarn await-published` (`scripts/await-published.mjs`) before `yarn gh-release`. It takes the packages to wait for from the `pub` chain in the root `package.json` — the same derivation `scripts/check-docs.mjs` uses (`scripts/published-packages.mjs`), not the workspace list, which also holds public workspaces `pub` does not publish — and asks npm about each every 5 s until all are served.
+
+"Served" means two things, checked in order. `npm view <name>@<version>` must list the version, and the version's tarball — the file `npm install` downloads, at the `dist.tarball` URL npm gives — must answer a `HEAD` request with 200. The registry makes the tarball available separately from the version listing, and later: for sereus 1.8.0 every version was listed while three tarballs still answered 404 several minutes afterwards, so an install run on the listing alone would have failed.
+
+The script's last line is the one to wait for:
 
 ```
 all 14 packages published and visible on npm at 4.19.4
 ```
 
-**Upgrade downstream repositories only after that line.** The GitHub release is created only after it, too.
+**Upgrade downstream repositories only after that line.** Before it, an upgrade can resolve a mix of versions, or fail to download one. The GitHub release is created only after it, too.
 
-If ten minutes pass first (`QUEREUS_PUBLISH_WAIT_SECONDS` changes the deadline), it lists each package still missing, with npm's reason, and exits non-zero, so `yarn gh-release` does not run. npm has already accepted the publish at that point: **do not re-run `yarn release`** (it would bump to yet another version). Once the registry catches up, run `yarn await-published` again, then `yarn gh-release`. The script can be run on its own at any time and reports on the versions currently in the manifests. Its decision logic is tested by `yarn test:scripts` (part of `yarn test`), without the network.
+If ten minutes pass first (`QUEREUS_PUBLISH_WAIT_SECONDS` changes the deadline), it lists each package still missing, with the reason — not listed yet, listed but its tarball not downloadable yet, or the error npm or the tarball request reported — and exits non-zero, so `yarn gh-release` does not run. npm has already accepted the publish at that point: **do not re-run `yarn release`** (it would bump to yet another version). Once the registry catches up, run `yarn await-published` again, then `yarn gh-release`. The script can be run on its own at any time and reports on the versions currently in the manifests. Its decision logic is tested by `yarn test:scripts` (part of `yarn test`), without the network.
 
 ## Step by Step
 

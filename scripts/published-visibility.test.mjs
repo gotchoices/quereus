@@ -3,8 +3,8 @@
  * built-in test runner (`yarn test:scripts`, part of `yarn test`). The wait itself —
  * `scripts/await-published.mjs`, which runs npm and sets the exit code — is not imported here.
  *
- * No test touches the network: the `npm view` outputs below are copied from real runs against the
- * public registry, and the registry question the wait asks is injected. The one test that reads the
+ * No test touches the network: the `npm view` outputs below follow the shapes real runs against the
+ * public registry print, and the registry question the wait asks is injected. The one test that reads the
  * repository's own manifests reads only local files. `publishedPackages` itself is pinned by
  * `scripts/check-docs.mjs`'s self-test.
  */
@@ -15,8 +15,10 @@ import { readFileSync } from 'node:fs';
 import { publishedPackages } from './published-packages.mjs';
 import {
 	NOT_YET_VISIBLE,
+	TARBALL_NOT_YET_DOWNLOADABLE,
 	expectedPackages,
 	npmViewCommand,
+	readTarballAnswer,
 	readViewAnswer,
 	waitForVisibility
 } from './published-visibility.mjs';
@@ -61,14 +63,35 @@ describe('npmViewCommand', () => {
 describe('readViewAnswer', () => {
 	const E404 = JSON.stringify({ error: { code: 'E404', summary: 'No match found for version 4.19.4' } }, null, 2);
 
-	it('counts the version echoed back as visible', () => {
-		assert.deepEqual(readViewAnswer({ status: 0, stdout: '"4.19.4"\n', stderr: '' }, ENGINE), { visible: true });
+	it('reads the version echoed back as listed, with the URL of its tarball', () => {
+		const tarball = 'https://registry.npmjs.org/@quereus/quereus/-/quereus-4.19.4.tgz';
+		const listing = JSON.stringify({ version: '4.19.4', 'dist.tarball': tarball }, null, 2);
+
+		assert.deepEqual(readViewAnswer({ status: 0, stdout: `${listing}\n`, stderr: '' }, ENGINE), { listed: true, tarball });
+	});
+
+	it('does not count the version as listed while npm names no tarball for it', () => {
+		// npm prints a lone field's value bare, so a listing without dist.tarball is just the version.
+		const answer = readViewAnswer({ status: 0, stdout: '"4.19.4"\n', stderr: '' }, ENGINE);
+
+		assert.equal(answer.listed, false);
+		assert.match(answer.reason, /dist\.tarball/);
+	});
+
+	it('does not count a tarball URL that would not reach the registry', () => {
+		// fetch answers a data: URL with 200 without asking anyone.
+		const listing = JSON.stringify({ version: '4.19.4', 'dist.tarball': 'data:,x' });
+
+		const answer = readViewAnswer({ status: 0, stdout: listing, stderr: '' }, ENGINE);
+
+		assert.equal(answer.listed, false);
+		assert.match(answer.reason, /not an http\(s\) URL/);
 	});
 
 	it('counts both ways npm says a version is not there as not yet visible', () => {
 		// Current npm: exit 1 with an E404 object. Older npm: exit 0 and no output.
-		assert.deepEqual(readViewAnswer({ status: 1, stdout: E404, stderr: 'npm error code E404' }, ENGINE), { visible: false, reason: NOT_YET_VISIBLE });
-		assert.deepEqual(readViewAnswer({ status: 0, stdout: '', stderr: '' }, ENGINE), { visible: false, reason: NOT_YET_VISIBLE });
+		assert.deepEqual(readViewAnswer({ status: 1, stdout: E404, stderr: 'npm error code E404' }, ENGINE), { listed: false, reason: NOT_YET_VISIBLE });
+		assert.deepEqual(readViewAnswer({ status: 0, stdout: '', stderr: '' }, ENGINE), { listed: false, reason: NOT_YET_VISIBLE });
 	});
 
 	it('keeps npm\'s own summary for any other failure', () => {
@@ -76,13 +99,23 @@ describe('readViewAnswer', () => {
 
 		const answer = readViewAnswer({ status: 1, stdout: refused, stderr: '' }, ENGINE);
 
-		assert.equal(answer.visible, false);
+		assert.equal(answer.listed, false);
 		assert.match(answer.reason, /^npm view failed with ECONNREFUSED: FetchError/);
 	});
 
 	it('throws on an answer to some other question rather than reading past it', () => {
-		assert.throws(() => readViewAnswer({ status: 0, stdout: '"4.19.3"', stderr: '' }, ENGINE), /does not understand/);
+		const other = JSON.stringify({ version: '4.19.3', 'dist.tarball': 'https://registry.npmjs.org/@quereus/quereus/-/quereus-4.19.3.tgz' });
+
+		assert.throws(() => readViewAnswer({ status: 0, stdout: other, stderr: '' }, ENGINE), /does not understand/);
 		assert.throws(() => readViewAnswer({ status: 0, stdout: 'npm notice New major version', stderr: '' }, ENGINE), /not JSON/);
+	});
+});
+
+describe('readTarballAnswer', () => {
+	it('counts a listed version as published only once its tarball answers 200', () => {
+		assert.deepEqual(readTarballAnswer(200), { visible: true });
+		assert.deepEqual(readTarballAnswer(404), { visible: false, reason: TARBALL_NOT_YET_DOWNLOADABLE });
+		assert.deepEqual(readTarballAnswer(503), { visible: false, reason: 'tarball answered HTTP 503' });
 	});
 });
 
@@ -90,7 +123,7 @@ describe('readViewAnswer', () => {
  * A wait over a fake clock: `sleep` advances it, and `probe` answers from `script` — for each package,
  * one answer per round in which it is asked, repeating the last.
  *
- * @param {Record<string, import('./published-visibility.mjs').ViewAnswer[]>} script
+ * @param {Record<string, import('./published-visibility.mjs').Visibility[]>} script
  * @param {{ timeoutMs?: number, intervalMs?: number }} [options]
  */
 async function scriptedWait(script, { timeoutMs = 60_000, intervalMs = 5_000 } = {}) {
