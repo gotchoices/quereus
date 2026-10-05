@@ -1235,6 +1235,14 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 								existingRow: existingRow.slice(0, tombstoneIndex) as Row,
 							};
 						}
+						// A PK REPLACE still owes every secondary UNIQUE its own action against
+						// the merged view: the overlay's memory module only sees overlay rows,
+						// and the flush writes trusted (no store-side re-check).
+						if (effective === ConflictResolution.REPLACE) {
+							const ucResult = await this.checkMergedUniqueConstraints(
+								overlay, coercedValues!, [pk], tombstoneIndex, args.onConflict, evicted);
+							if (ucResult !== null) return ucResult;
+						}
 					}
 
 					if (!existingRow) {

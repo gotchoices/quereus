@@ -1,0 +1,217 @@
+-- A write that collides on the PRIMARY KEY and resolves it by REPLACE must still
+-- enforce every other UNIQUE constraint, each under its own conflict action
+-- (statement OR > per-constraint default > ABORT). Expected results confirmed
+-- against SQLite. Previously the memory table wrote the row and returned on the
+-- PK-REPLACE branch, leaving a secondary UNIQUE column duplicated.
+
+-- ===================================
+-- A. INSERT OR REPLACE — PK and secondary UNIQUE conflicts both resolved by deletion
+-- ===================================
+
+create table pr_a (id integer primary key, v text unique);
+create table pr_a_child (id integer primary key, parent_id integer references pr_a(id) on delete cascade);
+insert into pr_a values (1, 'a'), (2, 'b');
+insert into pr_a_child values (20, 2);
+
+insert or replace into pr_a values (1, 'b');
+
+select * from pr_a order by id;
+→ [{"id":1,"v":"b"}]
+
+-- The row evicted on the secondary UNIQUE (id=2) runs the full delete pipeline.
+select * from pr_a_child;
+→ []
+
+drop table pr_a_child;
+drop table pr_a;
+
+-- ===================================
+-- B. PK-level REPLACE; UNIQUE keeps its own default (ABORT) → error
+-- ===================================
+
+create table pr_b (id integer primary key on conflict replace, v text unique);
+insert into pr_b values (1, 'a'), (2, 'b');
+
+insert into pr_b values (1, 'b');
+-- error: UNIQUE constraint failed
+
+select * from pr_b order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table pr_b;
+
+-- ===================================
+-- C. Key-changing UPDATE under PK-level REPLACE, UNIQUE default ABORT → error, table unchanged
+-- ===================================
+
+create table pr_c (id integer primary key on conflict replace, v text unique);
+insert into pr_c values (1, 'a'), (2, 'b'), (3, 'c');
+
+update pr_c set id = 1, v = 'b' where id = 3;
+-- error: UNIQUE constraint failed
+
+select * from pr_c order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"},{"id":3,"v":"c"}]
+
+drop table pr_c;
+
+-- ===================================
+-- D. Key-changing UPDATE, both constraints REPLACE
+-- ===================================
+
+create table pr_d (id integer primary key on conflict replace, v text unique on conflict replace);
+insert into pr_d values (1, 'a'), (2, 'b'), (3, 'c');
+
+update pr_d set id = 1, v = 'b' where id = 3;
+
+select * from pr_d order by id;
+→ [{"id":1,"v":"b"}]
+
+drop table pr_d;
+
+-- ===================================
+-- E. INSERT, both constraints REPLACE
+-- ===================================
+
+create table pr_e (id integer primary key on conflict replace, v text unique on conflict replace);
+insert into pr_e values (1, 'a'), (2, 'b');
+
+insert into pr_e values (1, 'b');
+
+select * from pr_e order by id;
+→ [{"id":1,"v":"b"}]
+
+drop table pr_e;
+
+-- ===================================
+-- F. PK-level REPLACE, UNIQUE IGNORE — the secondary IGNORE skips the whole insert
+-- ===================================
+
+create table pr_f (id integer primary key on conflict replace, v text unique on conflict ignore);
+insert into pr_f values (1, 'a'), (2, 'b');
+
+insert into pr_f values (1, 'b');
+
+select * from pr_f order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table pr_f;
+
+-- ===================================
+-- G. PK REPLACE whose new value equals the replaced row's own value — no self-conflict
+-- ===================================
+
+create table pr_g (id integer primary key on conflict replace, v text unique, w text);
+insert into pr_g values (1, 'a', 'x'), (2, 'b', 'y');
+
+insert into pr_g values (1, 'a', 'z');
+
+select * from pr_g order by id;
+→ [{"id":1,"v":"a","w":"z"},{"id":2,"v":"b","w":"y"}]
+
+drop table pr_g;
+
+-- ===================================
+-- H. Same as A inside an explicit transaction, rows written earlier in that transaction
+-- ===================================
+
+create table pr_h (id integer primary key, v text unique);
+insert into pr_h values (1, 'a');
+
+begin;
+insert into pr_h values (2, 'b');
+insert or replace into pr_h values (1, 'b');
+select * from pr_h order by id;
+→ [{"id":1,"v":"b"}]
+commit;
+
+select * from pr_h order by id;
+→ [{"id":1,"v":"b"}]
+
+drop table pr_h;
+
+-- ===================================
+-- I. Row at the replaced PK written earlier in the transaction; the secondary
+--    UNIQUE conflict is a committed row
+-- ===================================
+
+create table pr_i (id integer primary key, v text unique);
+insert into pr_i values (2, 'b');
+
+begin;
+insert into pr_i values (1, 'a');
+insert or replace into pr_i values (1, 'b');
+select * from pr_i order by id;
+→ [{"id":1,"v":"b"}]
+commit;
+
+select * from pr_i order by id;
+→ [{"id":1,"v":"b"}]
+
+drop table pr_i;
+
+-- ===================================
+-- J. PK-level REPLACE, UNIQUE default ABORT, every row written in the transaction
+-- ===================================
+
+create table pr_j (id integer primary key on conflict replace, v text unique);
+
+begin;
+insert into pr_j values (1, 'a'), (2, 'b');
+insert into pr_j values (1, 'b');
+-- error: UNIQUE constraint failed
+select * from pr_j order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+commit;
+
+select * from pr_j order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table pr_j;
+
+-- ===================================
+-- K. PK-level REPLACE, UNIQUE default ABORT; row at the replaced PK written in the
+--    transaction, the secondary conflict is a committed row
+-- ===================================
+
+create table pr_k (id integer primary key on conflict replace, v text unique);
+insert into pr_k values (2, 'b');
+
+begin;
+insert into pr_k values (1, 'a');
+insert into pr_k values (1, 'b');
+-- error: UNIQUE constraint failed
+commit;
+
+select * from pr_k order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table pr_k;
+
+-- ===================================
+-- L. Key-changing UPDATE inside a transaction over rows written in that transaction
+-- ===================================
+
+create table pr_l (id integer primary key on conflict replace, v text unique);
+create table pr_l2 (id integer primary key on conflict replace, v text unique on conflict replace);
+
+begin;
+insert into pr_l values (1, 'a'), (2, 'b'), (3, 'c');
+update pr_l set id = 1, v = 'b' where id = 3;
+-- error: UNIQUE constraint failed
+select * from pr_l order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"},{"id":3,"v":"c"}]
+
+insert into pr_l2 values (1, 'a'), (2, 'b'), (3, 'c');
+update pr_l2 set id = 1, v = 'b' where id = 3;
+select * from pr_l2 order by id;
+→ [{"id":1,"v":"b"}]
+commit;
+
+select * from pr_l order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"},{"id":3,"v":"c"}]
+select * from pr_l2 order by id;
+→ [{"id":1,"v":"b"}]
+
+drop table pr_l2;
+drop table pr_l;

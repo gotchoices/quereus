@@ -659,6 +659,52 @@ describe('IsolationModule', () => {
 			const b = await db.get(`SELECT * FROM t WHERE id = 2`);
 			expect(b?.u).to.equal('y');
 		});
+
+		it('OR REPLACE over a PK staged in the same txn also evicts a committed UNIQUE-colliding row', async () => {
+			await db.exec(`
+				CREATE TABLE t (
+					id INTEGER PRIMARY KEY,
+					u TEXT UNIQUE
+				) USING isolated
+			`);
+			await db.exec(`INSERT INTO t VALUES (2, 'y')`);
+
+			await db.exec('BEGIN');
+			// pk=1 lives only in the overlay; B (pk=2, u='y') only in the underlying. The
+			// overlay's own memory module sees only overlay rows, so the merged UNIQUE check
+			// must run on this live-overlay-row REPLACE path or B survives as a duplicate.
+			await db.exec(`INSERT INTO t VALUES (1, 'x')`);
+			await db.exec(`INSERT OR REPLACE INTO t VALUES (1, 'y')`);
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM t ORDER BY id`));
+			expect(rows.map(r => [r.id, r.u])).to.deep.equal([[1, 'y']]);
+		});
+
+		it('a PK-level ON CONFLICT REPLACE over a PK staged in the same txn still honors a plain UNIQUE', async () => {
+			await db.exec(`
+				CREATE TABLE t (
+					id INTEGER PRIMARY KEY ON CONFLICT REPLACE,
+					u TEXT UNIQUE
+				) USING isolated
+			`);
+			await db.exec(`INSERT INTO t VALUES (2, 'y')`);
+
+			await db.exec('BEGIN');
+			await db.exec(`INSERT INTO t VALUES (1, 'x')`);
+			let err: unknown;
+			try {
+				await db.exec(`INSERT INTO t VALUES (1, 'y')`);
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'the UNIQUE keeps its own ABORT action under a PK REPLACE').to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+			await db.exec('COMMIT');
+
+			const rows = await asyncIterableToArray(db.eval(`SELECT * FROM t ORDER BY id`));
+			expect(rows.map(r => [r.id, r.u])).to.deep.equal([[1, 'x'], [2, 'y']]);
+		});
 	});
 
 	describe('per-connection isolation', () => {

@@ -205,10 +205,10 @@ export type ConstraintType = 'unique' | 'check' | 'not_null' | 'foreign_key';
  *
  * Both fields are optional and additive: a module that reports neither behaves
  * exactly as a module would have before they existed. `replacedRow` and
- * `evictedRows` are independent and may both be present in principle (today's
- * memory/store INSERT paths short-circuit on a PK collision before the secondary
- * UNIQUE check, so they do not co-occur there — but the executor handles both
- * cleanly regardless).
+ * `evictedRows` are independent and co-occur when a PK-collision REPLACE also
+ * resolves a secondary UNIQUE conflict by REPLACE (the memory and store backends
+ * run every secondary UNIQUE check under its own action after a PK REPLACE, as
+ * SQLite does); the executor handles both on one result.
  */
 export type UpdateResult =
 	| { status: 'ok'; row?: Row; replacedRow?: Row; evictedRows?: readonly Row[] }

@@ -1105,6 +1105,14 @@ pipeline still runs uniformly (`internal-eviction-reporting`):
   and covering-MV backing maintenance — uniformly across the memory, store, and
   isolation substrates, none of which re-drive the pipeline themselves.
 
+The two channels co-occur: a PK-collision REPLACE does not exempt the write from the
+table's other UNIQUE constraints. Each substrate still checks every secondary UNIQUE
+under its own action (statement OR > constraint default > ABORT) — so
+`insert or replace` into `(id pk, v unique)` can displace the row at its PK
+(`replacedRow`) *and* evict another row holding the same `v` (`evictedRows`), while a
+PK-level `on conflict replace` with a plain `unique` column fails with the UNIQUE error,
+as in SQLite.
+
 `processEvictions` enforces FK `RESTRICT` / `NO ACTION` for the eviction's would-be
 delete alongside the FK *actions* (`CASCADE` / `SET NULL` / `SET DEFAULT`). The substrate
 has already physically removed the evicted row inside `vtab.update()`, so there is no

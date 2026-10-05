@@ -92,6 +92,17 @@ interface AlterColumnUndo {
 	basePrimaryTree: BTree<BTreeKeyForPrimary, Row> | null;
 }
 
+/**
+ * The primary-key slots a writing row owns, which its own UNIQUE check must never
+ * report as conflicts: `key` — where the row lands; `vacated` — on a key-changing
+ * UPDATE, the slot it leaves (that row is the writer itself, still in place while
+ * the check runs).
+ */
+interface UniqueCheckSelf {
+	readonly key: BTreeKeyForPrimary;
+	readonly vacated?: BTreeKeyForPrimary;
+}
+
 /** A copy of `items` with `value` inserted at `at` (`at === items.length` ⇒ append). */
 function insertValueAt<T>(items: ReadonlyArray<T>, at: number, value: T): T[] {
 	const out = items.slice();
@@ -1062,21 +1073,10 @@ export class MemoryTableManager {
 		const existingRow = this.lookupEffectiveRow(primaryKey, targetLayer);
 
 		if (existingRow !== null) {
-			// Resolve PK-conflict action: statement OR > per-constraint default > ABORT.
-			const pkAction = onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
-			if (pkAction === ConflictResolution.IGNORE) {
-				return { status: 'ok', row: undefined };
-			}
-			if (pkAction === ConflictResolution.REPLACE) {
-				targetLayer.recordUpsert(primaryKey, newRowData, existingRow);
-				return { status: 'ok', row: newRowData, replacedRow: existingRow };
-			}
-			return {
-				status: 'constraint',
-				constraint: 'unique',
-				message: `UNIQUE constraint failed: ${this._tableName} PK.`,
-				existingRow: existingRow
-			};
+			const pkOutcome = this.resolvePkConflict(schema, onConflict, existingRow, `UNIQUE constraint failed: ${this._tableName} PK.`);
+			if (pkOutcome) return pkOutcome;
+			// REPLACE: the row at this PK is overwritten below, after the secondary
+			// UNIQUE check (which excludes this PK, so it cannot self-conflict).
 		}
 
 		// Check UNIQUE constraints against secondary indexes. Secondary-UNIQUE
@@ -1084,11 +1084,37 @@ export class MemoryTableManager {
 		// surfaced via `evictedRows` so the DML executor runs the full delete
 		// pipeline (change-tracking, row-time MV maintenance, FK cascade, events).
 		const evicted: Row[] = [];
-		const ucResult = await this.checkUniqueConstraints(targetLayer, schema, newRowData, primaryKey, onConflict, evicted);
+		const ucResult = await this.checkUniqueConstraints(targetLayer, schema, newRowData, { key: primaryKey }, onConflict, evicted);
 		if (ucResult) return ucResult;
 
-		targetLayer.recordUpsert(primaryKey, newRowData, null);
-		return { status: 'ok', row: newRowData, evictedRows: evicted.length > 0 ? evicted : undefined };
+		targetLayer.recordUpsert(primaryKey, newRowData, existingRow);
+		return {
+			status: 'ok',
+			row: newRowData,
+			replacedRow: existingRow ?? undefined,
+			evictedRows: evicted.length > 0 ? evicted : undefined,
+		};
+	}
+
+	/**
+	 * Resolves a primary-key collision with `existingRow` under the effective
+	 * action (statement OR > per-constraint default > ABORT). Returns the
+	 * terminating result for IGNORE / ABORT-family actions, or null for REPLACE —
+	 * the caller then proceeds to the secondary UNIQUE check and the write, and
+	 * reports `existingRow` as `replacedRow`.
+	 */
+	private resolvePkConflict(
+		schema: TableSchema,
+		onConflict: ConflictResolution | undefined,
+		existingRow: Row,
+		message: string
+	): UpdateResult | null {
+		const pkAction = onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
+		if (pkAction === ConflictResolution.REPLACE) return null;
+		if (pkAction === ConflictResolution.IGNORE) {
+			return { status: 'ok', row: undefined };
+		}
+		return { status: 'constraint', constraint: 'unique', message, existingRow };
 	}
 
 	private async performUpdate(
@@ -1130,7 +1156,7 @@ export class MemoryTableManager {
 			// surface them via `evictedRows` for the executor's delete pipeline.
 			const evicted: Row[] = [];
 			if (this.uniqueColumnsChanged(schema, oldRowData, newRowData)) {
-				const ucResult = await this.checkUniqueConstraints(targetLayer, schema, newRowData, targetPrimaryKey, onConflict, evicted);
+				const ucResult = await this.checkUniqueConstraints(targetLayer, schema, newRowData, { key: targetPrimaryKey }, onConflict, evicted);
 				if (ucResult) return ucResult;
 			}
 			targetLayer.recordUpsert(targetPrimaryKey, newRowData, oldRowData);
@@ -1150,41 +1176,34 @@ export class MemoryTableManager {
 		const existingRowAtNewKey = this.lookupEffectiveRow(newPrimaryKey, targetLayer);
 
 		if (existingRowAtNewKey !== null) {
-			const pkAction = onConflict ?? resolvePkDefaultConflict(schema) ?? ConflictResolution.ABORT;
-			if (pkAction === ConflictResolution.IGNORE) {
-				return { status: 'ok', row: undefined };
-			}
-			if (pkAction === ConflictResolution.REPLACE) {
-				// Evict the row currently at the new PK, then move the updated row.
-				targetLayer.recordDelete(newPrimaryKey, existingRowAtNewKey);
-				targetLayer.recordDelete(oldPrimaryKey, oldRowData);
-				targetLayer.recordUpsert(newPrimaryKey, newRowData, null);
-				return { status: 'ok', row: newRowData, replacedRow: existingRowAtNewKey };
-			}
-			// Return constraint violation with existing row
-			return {
-				status: 'constraint',
-				constraint: 'unique',
-				message: `UNIQUE constraint failed on new PK for ${this._tableName}.`,
-				existingRow: existingRowAtNewKey
-			};
+			const pkOutcome = this.resolvePkConflict(schema, onConflict, existingRowAtNewKey, `UNIQUE constraint failed on new PK for ${this._tableName}.`);
+			if (pkOutcome) return pkOutcome;
+			// REPLACE: the row at the new PK is evicted below, once the secondary
+			// UNIQUE check passes.
 		}
 
-		// Delete old row first, then check UNIQUE constraints at the new position.
-		// A secondary-UNIQUE REPLACE at the new position evicts conflicting row(s)
-		// at other PKs; surface them via `evictedRows` for the executor pipeline.
-		targetLayer.recordDelete(oldPrimaryKey, oldRowData);
-
+		// Check UNIQUE constraints before touching either slot. Both the old and the
+		// new PK are the moving row's own (the old row leaves, any row at the new PK
+		// is displaced), so neither can conflict. A secondary-UNIQUE REPLACE evicts
+		// conflicting row(s) at other PKs; surface them via `evictedRows` for the
+		// executor pipeline.
 		const evicted: Row[] = [];
-		const ucResult = await this.checkUniqueConstraints(targetLayer, schema, newRowData, newPrimaryKey, onConflict, evicted);
-		if (ucResult) {
-			// Rollback the delete if constraint check fails
-			targetLayer.recordUpsert(oldPrimaryKey, oldRowData, null);
-			return ucResult;
-		}
+		const ucResult = await this.checkUniqueConstraints(targetLayer, schema, newRowData, { key: newPrimaryKey, vacated: oldPrimaryKey }, onConflict, evicted);
+		if (ucResult) return ucResult;
 
+		// Journal order evict-delete, move-delete, move-insert is the data-change
+		// event contract (docs/usage.md § Subscribing to Data Changes).
+		if (existingRowAtNewKey !== null) {
+			targetLayer.recordDelete(newPrimaryKey, existingRowAtNewKey);
+		}
+		targetLayer.recordDelete(oldPrimaryKey, oldRowData);
 		targetLayer.recordUpsert(newPrimaryKey, newRowData, null);
-		return { status: 'ok', row: newRowData, evictedRows: evicted.length > 0 ? evicted : undefined };
+		return {
+			status: 'ok',
+			row: newRowData,
+			replacedRow: existingRowAtNewKey ?? undefined,
+			evictedRows: evicted.length > 0 ? evicted : undefined,
+		};
 	}
 
 	private async performDelete(
@@ -1250,12 +1269,13 @@ export class MemoryTableManager {
 	 * For REPLACE conflicts, the conflicting rows are deleted from the layer and
 	 * pushed onto `evicted` so the DML executor can run the full delete pipeline
 	 * (change-tracking, row-time MV maintenance, FK cascade, auto-events) for each.
+	 * Rows at the `self` slots are never conflicts (see {@link UniqueCheckSelf}).
 	 */
 	private async checkUniqueConstraints(
 		targetLayer: TransactionLayer,
 		schema: TableSchema,
 		newRowData: Row,
-		newPrimaryKey: BTreeKeyForPrimary,
+		self: UniqueCheckSelf,
 		onConflict: ConflictResolution | undefined,
 		evicted: Row[]
 	): Promise<UpdateResult | null> {
@@ -1263,7 +1283,7 @@ export class MemoryTableManager {
 
 		for (const uc of schema.uniqueConstraints) {
 			const result = await this.checkSingleUniqueConstraint(
-				targetLayer, schema, uc, newRowData, newPrimaryKey, onConflict, evicted
+				targetLayer, schema, uc, newRowData, self, onConflict, evicted
 			);
 			if (result) return result;
 		}
@@ -1276,7 +1296,7 @@ export class MemoryTableManager {
 		schema: TableSchema,
 		uc: UniqueConstraintSchema,
 		newRowData: Row,
-		newPrimaryKey: BTreeKeyForPrimary,
+		self: UniqueCheckSelf,
 		onConflict: ConflictResolution | undefined,
 		evicted: Row[],
 		allowMvCovering = true
@@ -1309,9 +1329,9 @@ export class MemoryTableManager {
 		if (covering) {
 			switch (covering.kind) {
 				case 'memory-index':
-					return this.checkUniqueViaIndex(targetLayer, schema, uc, covering.index, newRowData, newPrimaryKey, effective, evicted);
+					return this.checkUniqueViaIndex(targetLayer, schema, uc, covering.index, newRowData, self, effective, evicted);
 				case 'materialized-view':
-					return this.checkUniqueViaMaterializedView(targetLayer, schema, uc, covering.view, newRowData, newPrimaryKey, effective, evicted);
+					return this.checkUniqueViaMaterializedView(targetLayer, schema, uc, covering.view, newRowData, self, effective, evicted);
 				default: {
 					const exhaustive: never = covering;
 					throw new QuereusError(`Unknown covering structure: ${JSON.stringify(exhaustive)}`, StatusCode.INTERNAL);
@@ -1320,7 +1340,7 @@ export class MemoryTableManager {
 		}
 
 		// Fallback: scan primary tree
-		return this.checkUniqueByScanning(targetLayer, schema, uc, newRowData, newPrimaryKey, effective, evicted);
+		return this.checkUniqueByScanning(targetLayer, schema, uc, newRowData, self, effective, evicted);
 	}
 
 	/**
@@ -1417,7 +1437,7 @@ export class MemoryTableManager {
 		uc: UniqueConstraintSchema,
 		index: MemoryIndex,
 		newRowData: Row,
-		newPrimaryKey: BTreeKeyForPrimary,
+		self: UniqueCheckSelf,
 		onConflict: ConflictResolution,
 		evicted: Row[]
 	): UpdateResult | null {
@@ -1436,7 +1456,7 @@ export class MemoryTableManager {
 		const compares = uniqueEnforcementComparators(schema.columns, uc.columns, enforcementCollations);
 
 		for (const existingPK of existingPKs) {
-			if (this.comparePrimaryKeys(newPrimaryKey, existingPK) === 0) continue;
+			if (this.isSelfKey(self, existingPK)) continue;
 
 			// Validate the candidate against the live effective row before acting —
 			// the same stale-candidate discipline as checkUniqueViaMaterializedView.
@@ -1508,7 +1528,7 @@ export class MemoryTableManager {
 	 * rather than a secondary BTree). The backing scan yields candidate conflicting
 	 * source PKs; each is *validated against the live source row* before acting, since
 	 * a backing entry can lag a source row deleted/updated internally within the same
-	 * statement (e.g. the PK-changing-UPDATE delete below, or a prior REPLACE eviction)
+	 * statement (e.g. a prior REPLACE eviction or key-changing UPDATE)
 	 * — the row-time hook only fires for DML-executor row writes, not these internal
 	 * mutations. A candidate whose source row is gone or no longer matches the UC is
 	 * stale and skipped, so a false conflict is never raised.
@@ -1527,7 +1547,7 @@ export class MemoryTableManager {
 		uc: UniqueConstraintSchema,
 		mv: MaintainedTableSchema,
 		newRowData: Row,
-		newPrimaryKey: BTreeKeyForPrimary,
+		self: UniqueCheckSelf,
 		onConflict: ConflictResolution,
 		evicted: Row[]
 	): Promise<UpdateResult | null> {
@@ -1537,7 +1557,7 @@ export class MemoryTableManager {
 		// A wrong shape here only WIDENS the candidate set (the row fails its own
 		// self-exclusion), and the loop below re-excludes self through the real PK
 		// comparator — which is why no query result can observe this line.
-		const newSourcePk = keyParts(newPrimaryKey, primaryKeyArity(schema) !== 1) as SqlValue[];
+		const newSourcePk = keyParts(self.key, primaryKeyArity(schema) !== 1) as SqlValue[];
 		const conflicts = await this.db._lookupCoveringConflicts(mv, uc, newRowData, newSourcePk);
 		// Re-validate under each column's enforcement collation — the index's per-column
 		// COLLATE for an index-derived UNIQUE, else the declared column collation
@@ -1557,7 +1577,7 @@ export class MemoryTableManager {
 
 		for (const conflict of conflicts) {
 			const existingPK = buildPrimaryKeyFromValues(conflict.pk, schema.primaryKeyDefinition);
-			if (this.comparePrimaryKeys(newPrimaryKey, existingPK) === 0) continue;
+			if (this.isSelfKey(self, existingPK)) continue;
 
 			// Validate against the live source row: skip stale backing candidates.
 			const conflictingRow = this.lookupEffectiveRow(existingPK, targetLayer);
@@ -1585,12 +1605,17 @@ export class MemoryTableManager {
 		return null;
 	}
 
+	private isSelfKey(self: UniqueCheckSelf, pk: BTreeKeyForPrimary): boolean {
+		return this.comparePrimaryKeys(self.key, pk) === 0
+			|| (self.vacated !== undefined && this.comparePrimaryKeys(self.vacated, pk) === 0);
+	}
+
 	private checkUniqueByScanning(
 		targetLayer: TransactionLayer,
 		schema: TableSchema,
 		uc: UniqueConstraintSchema,
 		newRowData: Row,
-		newPrimaryKey: BTreeKeyForPrimary,
+		self: UniqueCheckSelf,
 		onConflict: ConflictResolution,
 		evicted: Row[]
 	): UpdateResult | null {
@@ -1620,7 +1645,7 @@ export class MemoryTableManager {
 		for (const path of primaryTree.ascending(primaryTree.first())) {
 			const existingRow = primaryTree.at(path)!;
 			const existingPK = this.primaryKeyFromRow(existingRow);
-			if (this.comparePrimaryKeys(newPrimaryKey, existingPK) === 0) continue;
+			if (this.isSelfKey(self, existingPK)) continue;
 
 			if (predicate && predicate.evaluate(existingRow) !== true) continue;
 
@@ -1950,10 +1975,10 @@ export class MemoryTableManager {
 		const noEvict: Row[] = [];
 		for (const change of changes) {
 			if (change.op === 'delete') continue;
-			const newPrimaryKey = this.primaryKeyFromRow(change.newRow);
+			const self: UniqueCheckSelf = { key: this.primaryKeyFromRow(change.newRow) };
 			for (const uc of ucs) {
 				const result = await this.checkSingleUniqueConstraint(
-					layer, schema, uc, change.newRow, newPrimaryKey,
+					layer, schema, uc, change.newRow, self,
 					ConflictResolution.ABORT, noEvict, /*allowMvCovering*/ false,
 				);
 				if (result) {
