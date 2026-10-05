@@ -105,7 +105,7 @@ function sortedRenderings<T>(items: readonly T[], render: (item: T) => string): 
 }
 
 function renderTable(t: CatalogTable): string {
-	const { name, ddl, columns, primaryKey, referencedTables, tags, namedConstraints, maintained, ...rest } = t;
+	const { name, ddl, columns, primaryKey, referencedTables, tags, namedConstraints, unnamedConstraints, maintained, ...rest } = t;
 	assertEveryFieldConsidered(rest);
 	return [
 		`table ${name}`,
@@ -121,6 +121,8 @@ function renderTable(t: CatalogTable): string {
 		`\ttags ${renderTags(tags)}`,
 		// Sorted: the differ keys named constraints by name, so their order carries no meaning.
 		...sortedRenderings(namedConstraints, renderNamedConstraint).map(s => `\t${s}`),
+		// Sorted: the differ matches unnamed constraints as a body multiset.
+		...sortedRenderings(unnamedConstraints, renderUnnamedConstraint).map(s => `\t${s}`),
 		`\tmaintained ${maintained ? renderMaintained(maintained) : '-'}`,
 	].join('\n');
 }
@@ -146,6 +148,17 @@ function renderNamedConstraint(c: CatalogTable['namedConstraints'][number]): str
 	const { name, tags, definition, bodyAst: _bodyAst, ...rest } = c;
 	assertEveryFieldConsidered(rest);
 	return `constraint ${name} ${definition} tags ${renderTags(tags)}`;
+}
+
+function renderUnnamedConstraint(c: CatalogTable['unnamedConstraints'][number]): string {
+	// `name` omitted: an unnamed constraint's identity is its body, and the stored
+	// auto-name only decides how a DROP is spelled — inert on an empty diff. `bodyAst`
+	// omitted as for `renderNamedConstraint`. `tags` are not a differ channel for an
+	// unnamed constraint but are kept, so the restore check still sees an undo that
+	// re-adds one without them; on the fast path that only costs a full reconcile.
+	const { kind, name: _name, tags, definition, bodyAst: _bodyAst, ...rest } = c;
+	assertEveryFieldConsidered(rest);
+	return `unnamed ${kind} ${definition} tags ${renderTags(tags)}`;
 }
 
 function renderMaintained(m: NonNullable<CatalogTable['maintained']>): string {

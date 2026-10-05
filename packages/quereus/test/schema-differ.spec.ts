@@ -31,6 +31,7 @@ function catalogTable(name: string, pkColumn: string): CatalogTable {
 		primaryKey: [{ columnName: pkColumn, desc: false }],
 		referencedTables: [],
 		namedConstraints: [],
+		unnamedConstraints: [],
 	};
 }
 
@@ -50,6 +51,7 @@ function catalogTableWithColumns(name: string, columns: Array<{ name: string; pr
 		primaryKey: columns.filter(c => c.primaryKey).map(c => ({ columnName: c.name, desc: false })),
 		referencedTables: [],
 		namedConstraints: [],
+		unnamedConstraints: [],
 	};
 }
 
@@ -106,6 +108,7 @@ function catalogMaintainedTable(sql: string, columns: Array<{ name: string; prim
 		primaryKey: columns.filter(c => c.primaryKey).map(c => ({ columnName: c.name, desc: false })),
 		referencedTables: [],
 		namedConstraints: [],
+		unnamedConstraints: [],
 		maintained: { bodyHash: computeBodyHash(viewDefinitionToCanonicalString(mv.columns, mv.select)), select: mv.select },
 	};
 }

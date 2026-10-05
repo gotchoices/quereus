@@ -3,7 +3,7 @@ files:
   - packages/quereus/src/schema/manager.ts                   # 3,633 lines (`wc -l`, 2026-08-10)
   - packages/quereus/src/vtab/memory/layer/manager.ts        # 3,589 lines
   - packages/quereus/src/runtime/emit/materialized-view-helpers.ts   # 3,442 lines (`wc -l`, 2026-08-23; 3,404 on 2026-08-17, 3,107 earlier) — +~300 from the backing-module schema-normalization hook, +38 from the maintained-table mutation-context guard
-  - packages/quereus/src/schema/schema-differ.ts             # 3,663 lines (`wc -l`, 2026-09-24; 3,013 on 2026-08-07, 2,725 when this ticket was filed) (spec: 1,186)
+  - packages/quereus/src/schema/schema-differ.ts             # 3,872 lines (`wc -l`, 2026-10-04; 3,663 on 2026-09-24; 3,013 on 2026-08-07, 2,725 when this ticket was filed) (spec: 1,186)
   - packages/quereus/src/runtime/emit/alter-table.ts         # 2,733 lines (`wc -l`, 2026-09-01; 2,650 on 2026-08-23, 2,419 when this ticket was filed) — +83 since, from the ALTER PRIMARY KEY shadow rebuild rendering through the canonical DDL writer (index re-creation, the second capability precondition, the drop-guard suppression scope and their NOTEs)
   - packages/quereus-isolation/src/isolated-table.ts         # 2,077 lines
   - packages/quereus-isolation/src/isolation-module.ts       # 1,825 lines
@@ -103,6 +103,8 @@ sequencing `computeSchemaDiff`, and the ordering-sensitive `generateMigrationDDL
 whole in its own file. The spec splits the same way.
 
 Re-measured with `wc -l` on 2026-09-24 while reviewing the migration-plan undo ticket: 3,663 lines (the undo work added ~480). The addition is one self-contained class, `UndoRenderer`, plus its four module-level helpers at the very bottom of the file (from the `StepUndo` type to the end), and it is the cleanest first cut: it reads the pre-apply catalog and the rename walkers, and touches the rest of the differ only through the three `apply*` schema-default helpers (`applyViewSchemaDefault` and `applyAssertionSchemaDefault` are exported; `applyIndexDefaults` is not) and the `RenameOp` / `ColumnRenameOp` / `TableAlterDiff` / `MigrationCreate` types, so a `schema/migration-undo.ts` needs only those imports (mind the value-import cycle with `schema-differ.ts` — move `applyIndexDefaults` alongside `applyViewSchemaDefault`, or into a small `schema-defaults.ts`, rather than importing it back). The unit spec for it is already its own file (`test/schema/differ-undo-plan.spec.ts`).
+
+Re-measured with `wc -l` on 2026-10-04 after the unnamed-constraint lifecycle landed (ticket `declarative-differ-ignores-unnamed-constraint-additions`): 3,872 lines (+209). That addition is also self-contained — `diffUnnamedConstraints` and its four helpers (`prunedByColumnDrop`, `countActualChecks`, `constraintNamesAtAddTime`, `mintUnnamedConstraintName`), sitting just before `resolveColumnRenames` — and would move naturally with a per-object-kind "table constraints" module alongside `collectDeclaredConstraints` / `reconciledDeclaredBody`.
 
 ### `packages/quereus/src/runtime/emit/alter-table.ts` — 2,419 lines
 

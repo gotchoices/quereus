@@ -539,6 +539,7 @@ describe('generateMigrationPlan undo', () => {
 				primaryKey: [{ columnName: 'id', desc: false }],
 				referencedTables: [],
 				namedConstraints: [{ name: 'ck', definition: 'check (id > 0)' }], // no bodyAst
+				unnamedConstraints: [],
 			};
 			const actual: SchemaCatalog = {
 				...emptyCatalog(),
@@ -562,6 +563,7 @@ describe('generateMigrationPlan undo', () => {
 				primaryKey: [{ columnName: 'id', desc: false }],
 				referencedTables: [],
 				namedConstraints: [],
+				unnamedConstraints: [],
 				maintained: { bodyHash: 'h' }, // no select
 			};
 			const actual: SchemaCatalog = {
@@ -592,6 +594,7 @@ describe('generateMigrationPlan undo', () => {
 				primaryKey: [{ columnName: 'id', desc: false }],
 				referencedTables: [],
 				namedConstraints: [],
+				unnamedConstraints: [],
 			};
 			const diff: SchemaDiff = {
 				...makeEmptySchemaDiff(),

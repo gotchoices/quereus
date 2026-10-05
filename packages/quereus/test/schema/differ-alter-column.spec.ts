@@ -58,6 +58,7 @@ function catalogTable(
 		primaryKey: primaryKey.map(pk => ({ columnName: pk.columnName, desc: pk.desc ?? false })),
 		referencedTables: [],
 		namedConstraints: [],
+		unnamedConstraints: [],
 	};
 }
 

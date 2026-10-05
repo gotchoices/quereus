@@ -23,7 +23,7 @@ The planner tracks the renames in force as it pushes the plan (`UndoRenderer` in
 | `RENAME COLUMN a TO b` / `RENAME CONSTRAINT a TO b` | the reverse rename |
 | `ADD COLUMN c …` / `ADD constraint c …` | `DROP COLUMN c` / `DROP CONSTRAINT c` (the name parsed from the fragment) |
 | `DROP DEFAULT` / `SET DEFAULT e` / `SET COLLATE x` / `SET NOT NULL` / `DROP NOT NULL` | restore the catalog's default (or `DROP DEFAULT` when there was none — and after a `dropStaleDefaultFirst` clear, the column reaches `SET DEFAULT` with no default, so that undo is `DROP DEFAULT`), collation, or the opposite nullability |
-| `DROP CONSTRAINT c` | `ADD constraint c <body> [with tags]` from the catalog's full-fidelity constraint lift (`namedConstraints[].bodyAst` — deferrability survives; the canonical `definition` has dropped it) |
+| `DROP CONSTRAINT c` | `ADD constraint c <body> [with tags]` from the catalog's full-fidelity constraint lift (`namedConstraints[].bodyAst`, or `unnamedConstraints[].bodyAst` for an unnamed constraint dropped by its stored auto-name, which the re-add restores — deferrability survives; the canonical `definition` has dropped it) |
 | `ALTER PRIMARY KEY (new)` | `ALTER PRIMARY KEY (old)` from the catalog's `primaryKey`, column names spelled through the renames in force |
 | any `SET TAGS` (table, column, constraint, view, index; either verb) | the same verb with the catalog's tag set; the empty set restores "no tags" |
 | `SET MAINTAINED … AS <new>` | the prior `set maintained … as <old>` when the table was maintained at that step; `DROP MAINTAINED` when it was plain — including the re-attach reshape leg, where this same plan detached it earlier, so the pair composes back to the original derivation |

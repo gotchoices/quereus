@@ -126,6 +126,31 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 			expect(await rows(db, 'select id from t order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
 		});
 
+		it('unnamed CHECK: the old rule is back under its stored auto-name', async () => {
+			// An unnamed constraint is matched by body, so a body edit is a DROP of the stored
+			// `_check_v` + an ADD; the DROP's undo must find it among the unnamed constraints.
+			await db.exec('create table t (id integer primary key, v integer check (v > 0))');
+			await db.exec('insert into t values (1, 5)');
+			await db.exec(`
+				declare schema main {
+					table t { id INTEGER PRIMARY KEY, v INTEGER check (v > 10) }
+				}
+			`);
+			expect(await planOf(db)).to.deep.equal([
+				'ALTER TABLE t DROP CONSTRAINT _check_v',
+				'ALTER TABLE t ADD constraint _check_v check (v > 10)',
+			]);
+			const before = restoreFingerprint(db);
+
+			const err = await rejection(db.exec('apply schema main'));
+			expect(err.message, 'a verified restore rethrows the step error unchanged').to.not.match(/could not be restored/);
+
+			expect(restoreFingerprint(db)).to.equal(before);
+			const t = collectSchemaCatalog(db, 'main').tables.find(x => x.name === 't')!;
+			expect(t.unnamedConstraints.map(c => `${c.name} ${c.definition}`)).to.deep.equal(['_check_v check (v > 0)']);
+			await rejection(db.exec('insert into t values (2, -1)'));
+		});
+
 		it('UNIQUE: the old column set is back and still enforced', async () => {
 			await db.exec('create table u (id integer primary key, a integer, b integer, c integer, constraint uq_ab unique (a, b), constraint uq_c unique (c))');
 			await db.exec('insert into u values (1, 1, 1, 10), (2, 1, 2, 20)');

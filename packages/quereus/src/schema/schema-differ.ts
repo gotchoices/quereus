@@ -14,7 +14,7 @@ import { Parser } from '../parser/parser.js';
 import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.js';
 import { normalizeCollationName } from '../util/comparison.js';
 import { inferType } from '../types/registry.js';
-import { resolveDefaultCollation } from './table.js';
+import { resolveDefaultCollation, disambiguateAutoConstraintName } from './table.js';
 
 const log = createLogger('schema:differ');
 const warnLog = log.extend('warn');
@@ -1842,16 +1842,11 @@ function columnReconciledIndexStmt(
 }
 
 /**
- * A declared user-named table constraint, normalized for lifecycle detection.
- * `ddl` is the full constraint fragment (`constraint <name> check (...)` with
- * tags) consumed by `ALTER TABLE … ADD <fragment>`. `definition` is the canonical
- * body fragment (name + tags excluded) compared against the actual catalog's
- * `definition` to detect a name-unchanged-but-body-changed constraint.
+ * The body of a declared table constraint, as the body comparison reads it.
+ * `definition` is the canonical body fragment (name + tags excluded) compared
+ * against the actual catalog's `definition`.
  */
-interface DeclaredNamedConstraint {
-	name: string;
-	tags?: Readonly<Record<string, SqlValue>>;
-	ddl: string;
+interface DeclaredConstraintBody {
 	definition: string;
 	/**
 	 * The lifted table-level constraint AST `definition` was rendered from. Kept so
@@ -1864,11 +1859,38 @@ interface DeclaredNamedConstraint {
 }
 
 /**
- * Converts a column-level constraint carrying a name into the equivalent
- * table-level {@link AST.TableConstraint}, so it can be stringified into an
- * `ADD CONSTRAINT` fragment and diffed by name alongside table-level constraints.
- * Returns undefined for constraint kinds that are not lifecycle-managed named
- * constraints (NOT NULL / NULL / DEFAULT / COLLATE / GENERATED / PRIMARY KEY).
+ * A declared user-named table constraint, normalized for lifecycle detection.
+ * `ddl` is the full constraint fragment (`constraint <name> check (...)` with
+ * tags) consumed by `ALTER TABLE … ADD <fragment>`. Its `definition` is compared
+ * against the name-matched actual's to detect a name-unchanged-but-body-changed
+ * constraint.
+ */
+interface DeclaredNamedConstraint extends DeclaredConstraintBody {
+	name: string;
+	tags?: Readonly<Record<string, SqlValue>>;
+	ddl: string;
+}
+
+/**
+ * A declared CHECK / UNIQUE / FOREIGN KEY with no user-addressable name — none
+ * written, or a reserved `_`-prefixed one (the catalog's `unnamedConstraints`
+ * side of the same split). Identified by its body alone; see
+ * {@link diffUnnamedConstraints}.
+ */
+interface DeclaredUnnamedConstraint extends DeclaredConstraintBody {
+	/** The `_`-prefixed name the declaration wrote, if any. */
+	name?: string;
+	/** Owning column of a column-level clause — a CHECK there is named `_check_<column>`, as CREATE TABLE names it. */
+	column?: string;
+}
+
+/**
+ * Converts a column-level constraint into the equivalent table-level
+ * {@link AST.TableConstraint}, so it can be stringified into an `ADD CONSTRAINT`
+ * fragment and diffed (by name, or by body when unnamed) alongside table-level
+ * constraints. Returns undefined for constraint kinds that are not
+ * lifecycle-managed table constraints (NOT NULL / NULL / DEFAULT / COLLATE /
+ * GENERATED / PRIMARY KEY).
  */
 function columnConstraintToTableConstraint(columnName: string, cc: AST.ColumnConstraint): AST.TableConstraint | undefined {
 	switch (cc.type) {
@@ -1886,12 +1908,17 @@ function columnConstraintToTableConstraint(columnName: string, cc: AST.ColumnCon
 }
 
 /**
- * Gathers declared *user-named* CHECK / UNIQUE / FOREIGN KEY constraints from a
- * declared table — both table-level and column-level (carrying an explicit name)
- * — keyed by lowercased name. PRIMARY KEY is excluded (handled by
- * `primaryKeyChange`); engine-synthesized `_`-prefixed names are excluded to stay
- * symmetric with the catalog's `namedConstraints`. On a name collision the first
+ * Gathers a declared table's CHECK / UNIQUE / FOREIGN KEY constraints — both
+ * table-level and column-level — split the way the catalog splits them:
+ * *user-named* ones keyed by lowercased name, and the rest (no name, or a
+ * reserved `_`-prefixed one) as a list in declaration order. PRIMARY KEY is
+ * excluded (handled by `primaryKeyChange`). On a user-name collision the first
  * wins (a duplicate user constraint name is a separate validation concern).
+ *
+ * A column-level clause on a column `isAddedColumn` reports is skipped: `ADD
+ * COLUMN` renders the column's clauses inline (`columnDefToString`), so collecting
+ * it here would ADD the constraint a second time. A TABLE-level constraint over a
+ * new column is not carried by `ADD COLUMN` and is collected as usual.
  *
  * `schemaName` is the schema this table is being diffed under (the differ runs
  * per schema — it is the CHILD schema for any FK declared here). It is threaded
@@ -1900,27 +1927,34 @@ function columnConstraintToTableConstraint(columnName: string, cc: AST.ColumnCon
  * {@link constraintBodyToCanonicalString}); a genuine cross-schema parent stays a
  * body-change channel.
  */
-function collectDeclaredNamedConstraints(declaredTable: AST.DeclaredTable, schemaName: string): Map<string, DeclaredNamedConstraint> {
-	const out = new Map<string, DeclaredNamedConstraint>();
-	const add = (name: string | undefined, tags: Readonly<Record<string, SqlValue>> | undefined, tc: AST.TableConstraint): void => {
-		if (!name) return;
-		const lower = name.toLowerCase();
-		if (lower.startsWith('_')) return;
-		if (out.has(lower)) return;
-		out.set(lower, { name, tags, ddl: tableConstraintsToString([tc]), definition: constraintBodyToCanonicalString(tc, schemaName), bodyAst: tc });
+function collectDeclaredConstraints(
+	declaredTable: AST.DeclaredTable,
+	schemaName: string,
+	isAddedColumn: (lowerName: string) => boolean,
+): { named: Map<string, DeclaredNamedConstraint>; unnamed: DeclaredUnnamedConstraint[] } {
+	const named = new Map<string, DeclaredNamedConstraint>();
+	const unnamed: DeclaredUnnamedConstraint[] = [];
+	const add = (tc: AST.TableConstraint, column?: string): void => {
+		const definition = constraintBodyToCanonicalString(tc, schemaName);
+		if (!tc.name || tc.name.startsWith('_')) {
+			unnamed.push({ name: tc.name, column, definition, bodyAst: tc });
+			return;
+		}
+		const lower = tc.name.toLowerCase();
+		if (named.has(lower)) return;
+		named.set(lower, { name: tc.name, tags: tc.tags, ddl: tableConstraintsToString([tc]), definition, bodyAst: tc });
 	};
 	for (const c of declaredTable.tableStmt.constraints ?? []) {
-		if (c.type === 'primaryKey') continue;
-		add(c.name, c.tags, c);
+		if (c.type !== 'primaryKey') add(c);
 	}
 	for (const col of declaredTable.tableStmt.columns) {
+		if (isAddedColumn(col.name.toLowerCase())) continue;
 		for (const cc of col.constraints ?? []) {
-			if (!cc.name) continue;
 			const tc = columnConstraintToTableConstraint(col.name, cc);
-			if (tc) add(cc.name, cc.tags, tc);
+			if (tc) add(tc, col.name);
 		}
 	}
-	return out;
+	return { named, unnamed };
 }
 
 /**
@@ -2004,7 +2038,7 @@ function inverseRenameStringColumns(
  *             table name back to its old form.
  */
 function reconciledDeclaredBody(
-	d: DeclaredNamedConstraint,
+	d: DeclaredConstraintBody,
 	colRenames: ReadonlyArray<ColumnRenameOp>,
 	tableRenames: ReadonlyArray<RenameOp>,
 	tableName: string,
@@ -2121,6 +2155,161 @@ function reconciledDeclaredBody(
 		default:
 			return d.definition;
 	}
+}
+
+type CatalogUnnamedConstraint = CatalogTable['unnamedConstraints'][number];
+
+interface UnnamedConstraintDiffContext {
+	/** Declared (post-rename) table name — spelled into minted FK names, as CREATE TABLE spells them. */
+	tableName: string;
+	/** Schema the table is diffed under, for messages. */
+	schemaName: string;
+	/** A declared body as the actual catalog spells it: the in-diff renames inverse-applied (identity without renames). */
+	reconcile: (d: DeclaredUnnamedConstraint) => string;
+	/** Lowercased names of the declared user-named constraints — all present once the named lifecycle has run. */
+	declaredNames: Iterable<string>;
+	/** Names the named lifecycle drops (before any ADD), freeing them for a mint. */
+	namedDrops: readonly string[];
+	/** Declared names of the columns this diff adds. */
+	addedColumns: readonly string[];
+	/** Lowercased names of the columns this diff drops. */
+	droppedColumns: ReadonlySet<string>;
+	/** Throw on an unmatched actual constraint no statement can drop; false when the alter diff will be discarded. */
+	refuseUndroppable: boolean;
+}
+
+/**
+ * Constraint lifecycle for CHECK / UNIQUE / FOREIGN KEY constraints with no
+ * user-addressable name (see `CatalogTable.unnamedConstraints`). With no name to
+ * key on, identity is the canonical body: declared and actual are matched as a
+ * multiset — each declared constraint consumes one actual with the same
+ * (rename-reconciled) body, so two identical unnamed CHECKs are two entries.
+ *
+ *   - declared, unmatched → ADD under a minted reserved name (see
+ *     {@link mintUnnamedConstraintName}), so the result is unnamed-class on the
+ *     next diff and droppable by name;
+ *   - actual, unmatched   → DROP by its stored auto-name. One stored with no name
+ *     (a CREATE-time table-level CHECK, any UNIQUE added unnamed) has no statement
+ *     that removes it: skipped when a dropped column takes it along (DROP COLUMN
+ *     prunes a UNIQUE / FK over the column), otherwise refused here — the
+ *     alternative is the silent no-op that leaves an upgraded database enforcing a
+ *     rule a fresh one does not.
+ *
+ * NOTE: tags on an unnamed constraint are not diffed — with no name there is
+ * nothing for `ALTER CONSTRAINT … SET TAGS` to address. A tag-only edit to an
+ * unnamed constraint is a no-op; name the constraint to manage its tags.
+ */
+function diffUnnamedConstraints(
+	declared: ReadonlyArray<DeclaredUnnamedConstraint>,
+	actualTable: CatalogTable,
+	ctx: UnnamedConstraintDiffContext,
+): { adds: string[]; drops: string[] } {
+	const unmatchedActual = [...(actualTable.unnamedConstraints ?? [])];
+	const unmatchedDeclared: DeclaredUnnamedConstraint[] = [];
+	for (const d of declared) {
+		const body = ctx.reconcile(d);
+		// Among same-body actuals, keep the one with no stored name: of a pair, it is
+		// the one no DROP can reach, so leaving the other unmatched stays droppable.
+		let at = unmatchedActual.findIndex(a => a.definition === body && a.name === undefined);
+		if (at < 0) at = unmatchedActual.findIndex(a => a.definition === body);
+		if (at >= 0) unmatchedActual.splice(at, 1);
+		else unmatchedDeclared.push(d);
+	}
+
+	const drops: string[] = [];
+	const undroppable: CatalogUnnamedConstraint[] = [];
+	for (const a of unmatchedActual) {
+		if (a.name !== undefined) drops.push(a.name);
+		else if (!prunedByColumnDrop(a, ctx.droppedColumns)) undroppable.push(a);
+	}
+	if (undroppable.length > 0 && ctx.refuseUndroppable) {
+		throw new QuereusError(
+			`Cannot drop unnamed constraint ${undroppable.map(a => `'${a.definition}'`).join(', ')} from table '${ctx.schemaName}.${actualTable.name}': `
+				+ `it is no longer declared, but it was created without a name, so no statement can drop it. `
+				+ `Keep declaring it, or rebuild the table; name constraints (constraint <name> …) to keep them droppable.`,
+			StatusCode.ERROR,
+		);
+	}
+
+	const taken = constraintNamesAtAddTime(actualTable, ctx, drops);
+	const checkOrdinal = countActualChecks(actualTable);
+	const adds = unmatchedDeclared.map(d =>
+		tableConstraintsToString([{ ...d.bodyAst, name: mintUnnamedConstraintName(d, ctx.tableName, checkOrdinal, taken) }]));
+	return { adds, drops };
+}
+
+/** True when DROP COLUMN removes `a` on its own: it prunes a UNIQUE / FK over a dropped column (a CHECK instead blocks the drop). */
+function prunedByColumnDrop(a: CatalogUnnamedConstraint, droppedColumns: ReadonlySet<string>): boolean {
+	return a.kind !== 'check' && (a.bodyAst?.columns ?? []).some(c => droppedColumns.has(c.name.toLowerCase()));
+}
+
+/** CHECKs on the actual table — where an unnamed table-level CHECK's `_check_<n>` ordinal starts. */
+function countActualChecks(actualTable: CatalogTable): number {
+	return (actualTable.namedConstraints ?? []).filter(c => c.bodyAst?.type === 'check').length
+		+ (actualTable.unnamedConstraints ?? []).filter(c => c.kind === 'check').length;
+}
+
+/**
+ * The lowercased constraint names a minted name must avoid at the point the
+ * `ADD CONSTRAINT` steps run (after every DROP / RENAME CONSTRAINT and ADD COLUMN
+ * of the table — see the phase order in `generateMigrationPlan`): the live names
+ * minus the dropped ones, plus every declared user name (each exists by then),
+ * plus — over-approximated — what `ADD COLUMN` mints for an inline clause on a new
+ * column. An unnamed UNIQUE's backing-structure name (`_uc_<cols>`) is included:
+ * a UNIQUE added under the same name would collide with that structure.
+ */
+function constraintNamesAtAddTime(actualTable: CatalogTable, ctx: UnnamedConstraintDiffContext, unnamedDrops: readonly string[]): Set<string> {
+	const taken = new Set<string>();
+	for (const c of actualTable.namedConstraints ?? []) taken.add(c.name.toLowerCase());
+	for (const c of actualTable.unnamedConstraints ?? []) {
+		if (c.name !== undefined) taken.add(c.name.toLowerCase());
+		else if (c.kind === 'unique') taken.add(uniqueBackingName(c.bodyAst?.columns ?? []).toLowerCase());
+	}
+	for (const name of [...ctx.namedDrops, ...unnamedDrops]) taken.delete(name.toLowerCase());
+	for (const name of ctx.declaredNames) taken.add(name);
+	for (const col of ctx.addedColumns) {
+		taken.add(`_check_${col}`.toLowerCase());
+		taken.add(`_fk_${ctx.tableName}_${col}`.toLowerCase());
+		taken.add(uniqueBackingName([{ name: col }]).toLowerCase());
+	}
+	return taken;
+}
+
+/** The structure name an unnamed UNIQUE over `columns` is backed by (`implicitIndexNameForColumns` in catalog.ts). */
+function uniqueBackingName(columns: ReadonlyArray<{ name: string }>): string {
+	return `_uc_${columns.map(c => c.name).join('_')}`;
+}
+
+/**
+ * The reserved `_`-prefixed name an unnamed constraint is ADDed under — reserved so
+ * the result stays in the unnamed class (body-matched, stable on re-diff), named so
+ * it can be dropped and its ADD undone. Each spells what the engine itself names
+ * the constraint where it names one:
+ *   - the `_`-name the declaration wrote, if any;
+ *   - column-level CHECK → `_check_<column>` (CREATE TABLE's mint);
+ *   - table-level CHECK  → `_check_<n>`, `n` from the table's CHECK count, bumped
+ *     until free (the `_check_<index>` label an unnamed CHECK's violation reports;
+ *     each mint registers in `taken`, so the next one bumps past it).
+ *     NOT left unnamed: `ALTER … ADD` would mint a user-class `check_<n>`, which
+ *     the next diff would drop and re-add forever;
+ *   - FOREIGN KEY → `_fk_<table>_<cols>` (both engine paths' mint);
+ *   - UNIQUE      → `_uc_<cols>` (the backing-structure name both paths use).
+ * Then disambiguated (`_<N>` suffix) against — and registered into — `taken`.
+ */
+function mintUnnamedConstraintName(d: DeclaredUnnamedConstraint, tableName: string, checkOrdinal: number, taken: Set<string>): string {
+	const tc = d.bodyAst;
+	if (d.name === undefined && tc.type === 'check' && d.column === undefined) {
+		let n = checkOrdinal;
+		while (taken.has(`_check_${n}`)) n++;
+		taken.add(`_check_${n}`);
+		return `_check_${n}`;
+	}
+	const columns = tc.columns ?? [];
+	const base = d.name
+		?? (tc.type === 'check' ? `_check_${d.column}`
+			: tc.type === 'foreignKey' ? `_fk_${tableName}_${columns.map(c => c.name).join('_')}`
+			: uniqueBackingName(columns));
+	return disambiguateAutoConstraintName(base, taken);
 }
 
 /**
@@ -2268,10 +2457,11 @@ function computeTableAlterDiff(
 	// `constraints` list AND column-level constraints carrying an explicit name
 	// (e.g. `qty int constraint chk_qty check (qty > 0)`) — the actual catalog's
 	// `namedConstraints` already merges both. PRIMARY KEY constraints are excluded
-	// (PK changes flow through `primaryKeyChange`); auto-prefixed (`_`) names are
-	// excluded to stay symmetric with the catalog (see catalog.ts) so an unnamed
-	// declared constraint never churns add/drop against its synthesized actual name.
-	const declaredNamedConstraints = collectDeclaredNamedConstraints(declaredTable, schemaName);
+	// (PK changes flow through `primaryKeyChange`). Unnamed and auto-prefixed (`_`)
+	// ones are matched by body instead, after the named lifecycle below (see
+	// `diffUnnamedConstraints`), mirroring the catalog's named / unnamed split.
+	const declaredConstraints = collectDeclaredConstraints(declaredTable, schemaName, lower => !colRenames.pairs.has(lower));
+	const declaredNamedConstraints = declaredConstraints.named;
 	const actualNamedConstraints = new Map<string, CatalogTable['namedConstraints'][number]>();
 	for (const c of actualTable.namedConstraints ?? []) {
 		actualNamedConstraints.set(c.name.toLowerCase(), c);
@@ -2351,6 +2541,22 @@ function computeTableAlterDiff(
 			pureDropCount++;
 		}
 	}
+
+	// Unnamed constraints are not rename candidates, so they stay out of the
+	// require-hint counts.
+	const unnamed = diffUnnamedConstraints(declaredConstraints.unnamed, actualTable, {
+		tableName: declaredTable.tableStmt.table.name,
+		schemaName,
+		reconcile: d => reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn),
+		declaredNames: declaredNamedConstraints.keys(),
+		namedDrops: constraintsToDrop,
+		addedColumns: declaredTable.tableStmt.columns.filter(c => !colRenames.pairs.has(c.name.toLowerCase())).map(c => c.name),
+		droppedColumns: new Set(diff.columnsToDrop.map(c => c.toLowerCase())),
+		// A backing-module move recreates the table, so its alter diff is discarded.
+		refuseUndroppable: !diff.maintainedModuleMigration,
+	});
+	constraintsToDrop.push(...unnamed.drops);
+	constraintsToAdd.push(...unnamed.adds);
 
 	if (constraintsToAdd.length > 0) diff.constraintsToAdd = constraintsToAdd;
 	if (constraintsToDrop.length > 0) diff.constraintsToDrop = constraintsToDrop;
@@ -3389,8 +3595,11 @@ class UndoRenderer {
 
 	readdConstraint(table: string, name: string, quotedTable: string): StepUndo {
 		// `constraintsToDrop` carries pre-apply names (a renamed constraint is never
-		// also dropped), so the lookup is direct rather than through the renames.
-		const constraint = this.tableNow(table)?.namedConstraints?.find(c => sameName(c.name, name));
+		// also dropped), so the lookup is direct rather than through the renames. An
+		// unnamed constraint is dropped by its stored auto-name, and re-added under it.
+		const actual = this.tableNow(table);
+		const constraint = actual?.namedConstraints?.find(c => sameName(c.name, name))
+			?? actual?.unnamedConstraints?.find(c => c.name !== undefined && sameName(c.name, name));
 		if (!constraint) return NOTHING_TO_UNDO;
 		if (!constraint.bodyAst) return this.cannotUndo(`DROP CONSTRAINT ${name}`, 'the pre-apply catalog carries no body for it');
 		const body = this.forwardRenamedConstraint(constraint.bodyAst, table);

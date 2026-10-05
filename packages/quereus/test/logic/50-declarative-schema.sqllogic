@@ -2110,3 +2110,366 @@ apply schema main options (allow_destructive = true, rename_policy = 'deny');
 -- run
 
 drop table opt_probe;
+
+-- ===================================================================
+-- Unnamed CHECK / UNIQUE / FOREIGN KEY constraints are diffed by body
+-- (ticket declarative-differ-ignores-unnamed-constraint-additions). The
+-- differ used to key constraints only by name, so adding or removing an
+-- unnamed one produced an empty diff and an upgraded database never
+-- gained (or lost) the rule a fresh create at the new version has. An
+-- added one lands under a reserved `_`-prefixed name (so it stays
+-- body-matched and is droppable); a CREATE-time one stored with no name
+-- cannot be dropped by any statement, so its removal is refused.
+-- ===================================================================
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t { id integer primary key, a integer null, b integer null }
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+insert into uc_p values (5);
+insert into uc_t values (1, 5, 5);
+
+-- Table-level unnamed CHECK: ADD under `_check_<n>`, enforced, converged.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t { id integer primary key, a integer null, b integer null, check (a > 0) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_t ADD constraint _check_0 check (a > 0)"}]
+
+apply schema main;
+
+-- run
+
+insert into uc_t values (2, -1, null);
+-- error: CHECK constraint failed
+
+diff schema main;
+→ []
+
+-- The same rule spelled column-level has the same body — not a change.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t { id integer primary key, a integer null check (a > 0), b integer null }
+}
+
+-- run
+
+diff schema main;
+→ []
+
+-- Table- and column-level unnamed UNIQUE, and an unnamed FOREIGN KEY.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t {
+		id integer primary key,
+		a integer null check (a > 0),
+		b integer null unique,
+		unique (a),
+		foreign key (b) references uc_p(id)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_t ADD constraint _uc_a unique (a)"}, {"ddl": "ALTER TABLE uc_t ADD constraint _fk_uc_t_b foreign key (b) references uc_p(id)"}, {"ddl": "ALTER TABLE uc_t ADD constraint _uc_b unique (b)"}]
+
+apply schema main;
+
+-- run
+
+insert into uc_t values (3, 5, null);
+-- error: UNIQUE constraint failed
+
+insert into uc_t values (4, 6, 5);
+-- error: UNIQUE constraint failed
+
+insert into uc_t values (5, 7, 99);
+-- error: _fk_uc_t_b
+
+diff schema main;
+→ []
+
+-- Removal: every upgrade-added constraint carries its reserved name, so all drop.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t { id integer primary key, a integer null, b integer null }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_t DROP CONSTRAINT _check_0"}, {"ddl": "ALTER TABLE uc_t DROP CONSTRAINT _uc_a"}, {"ddl": "ALTER TABLE uc_t DROP CONSTRAINT _uc_b"}, {"ddl": "ALTER TABLE uc_t DROP CONSTRAINT _fk_uc_t_b"}]
+
+apply schema main;
+
+-- run
+
+insert into uc_t values (6, -1, 99);
+insert into uc_t values (7, 5, 99);
+
+diff schema main;
+→ []
+
+-- A named constraint on a column the diff adds rides the ADD COLUMN inline
+-- only (it used to be ADDed a second time, failing the apply).
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t { id integer primary key, a integer null, b integer null, c integer null constraint cpos check (c > 0) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_t ADD COLUMN c integer null constraint cpos check (c > 0)"}]
+
+apply schema main;
+
+-- run
+
+insert into uc_t values (8, null, null, -1);
+-- error: CHECK constraint failed: cpos
+
+diff schema main;
+→ []
+
+-- Same for an unnamed one; the engine names it `_check_d`, as CREATE TABLE does.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t { id integer primary key, a integer null, b integer null, c integer null constraint cpos check (c > 0), d integer null check (d > 0) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_t ADD COLUMN d integer null check (d > 0)"}]
+
+apply schema main;
+
+-- run
+
+insert into uc_t values (9, null, null, null, -1);
+-- error: CHECK constraint failed: _check_d
+
+diff schema main;
+→ []
+
+-- An unnamed column-level CHECK's body change: drop + re-add under the same name.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_t { id integer primary key, a integer null, b integer null, c integer null constraint cpos check (c > 0), d integer null check (d > 1) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_t DROP CONSTRAINT _check_d"}, {"ddl": "ALTER TABLE uc_t ADD constraint _check_d check (d > 1)"}]
+
+apply schema main;
+
+-- run
+
+insert into uc_t values (10, null, null, null, 1);
+-- error: CHECK constraint failed: _check_d
+
+diff schema main;
+→ []
+
+drop table uc_t;
+drop table uc_p;
+
+-- Created fresh: a column-level unnamed CHECK / FK is stored under its
+-- auto-name and drops; a table-level CHECK and any UNIQUE are stored with
+-- no name, so dropping one from the declaration is refused, not ignored.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_f {
+		id integer primary key,
+		a integer null check (a < 100),
+		b integer null references uc_p(id),
+		check (a > 0),
+		unique (a)
+	}
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_f { id integer primary key, a integer null, b integer null, check (a > 0), unique (a) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_f DROP CONSTRAINT _check_a"}, {"ddl": "ALTER TABLE uc_f DROP CONSTRAINT _fk_uc_f_b"}]
+
+apply schema main;
+
+-- run
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_f { id integer primary key, a integer null, b integer null, unique (a) }
+}
+
+-- run
+
+diff schema main;
+-- error: Cannot drop unnamed constraint 'check (a > 0)' from table 'main.uc_f'
+
+apply schema main;
+-- error: created without a name, so no statement can drop it
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_f { id integer primary key, a integer null, b integer null, check (a > 0) }
+}
+
+-- run
+
+diff schema main;
+-- error: Cannot drop unnamed constraint 'unique (a)' from table 'main.uc_f'
+
+-- Still declaring both: converged.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_f { id integer primary key, a integer null, b integer null, check (a > 0), unique (a) }
+}
+
+-- run
+
+diff schema main;
+→ []
+
+drop table uc_f;
+
+-- A dropped column takes its unnamed UNIQUE with it (DROP COLUMN prunes a
+-- UNIQUE over the column), so that removal is not refused.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_g { id integer primary key, a integer null, b integer null, unique (a) }
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_g { id integer primary key, b integer null }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_g DROP COLUMN a"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+drop table uc_g;
+
+-- Identical unnamed CHECKs are a multiset: a third one is exactly one ADD.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_d { id integer primary key, a integer null, check (a > 0), check (a > 0) }
+}
+
+-- run
+
+apply schema main;
+
+-- run
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_d { id integer primary key, a integer null, check (a > 0), check (a > 0), check (a > 0) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_d ADD constraint _check_2 check (a > 0)"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+-- Taking one away drops the named one, keeping the two no DROP can reach.
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_d { id integer primary key, a integer null, check (a > 0), check (a > 0) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_d DROP CONSTRAINT _check_2"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+drop table uc_d;
+
+-- A column rename the unnamed constraints reference is a rename only: the
+-- bodies are matched with the rename inverse-applied, so nothing churns.
+create table uc_r (id integer primary key, amount integer null, pid integer null, check (amount > 0), unique (amount), foreign key (pid) references uc_p(id));
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_r {
+		id integer primary key,
+		qty integer null with tags ("quereus.previous_name" = 'amount'),
+		parent_id integer null with tags ("quereus.previous_name" = 'pid'),
+		check (qty > 0),
+		unique (qty),
+		foreign key (parent_id) references uc_p(id)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_r RENAME COLUMN amount TO qty"}, {"ddl": "ALTER TABLE uc_r RENAME COLUMN pid TO parent_id"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+insert into uc_r values (1, -1, null);
+-- error: CHECK constraint failed
+
+drop table uc_r;
+drop table uc_p;

@@ -1,5 +1,5 @@
 import type { Database } from '../core/database.js';
-import type { TableSchema, IndexSchema, IndexColumnSchema, UniqueConstraintSchema } from './table.js';
+import type { TableSchema, IndexSchema, IndexColumnSchema, UniqueConstraintSchema, NamedConstraintClass, RowConstraintSchema, ForeignKeyConstraintSchema } from './table.js';
 import { forEachDeclaredConstraintName } from './table.js';
 import type { ViewSchema } from './view.js';
 import { normalizeBackingModule } from './view.js';
@@ -51,7 +51,8 @@ export interface CatalogTable {
 	tags?: Readonly<Record<string, SqlValue>>;
 	/**
 	 * Named constraints (CHECK / UNIQUE / FOREIGN KEY) carrying their tags and a
-	 * canonical body fragment. Constraints without a user-supplied name are excluded.
+	 * canonical body fragment. Constraints without a user-supplied name are excluded
+	 * (they are in {@link CatalogTable.unnamedConstraints}).
 	 * `definition` is the order/format-stable body DDL (name + tags excluded) the
 	 * differ compares against a declared constraint's body to detect a
 	 * name-unchanged-but-body-changed constraint (→ drop+recreate). Tags are kept
@@ -70,6 +71,24 @@ export interface CatalogTable {
 		 * it simply yield an irreversible undo for that step. A CHECK's `expr` is the live
 		 * schema AST — read-only to consumers, who clone before rewriting.
 		 */
+		bodyAst?: AST.TableConstraint;
+	}>;
+	/**
+	 * The CHECK / UNIQUE / FOREIGN KEY constraints `namedConstraints` leaves out:
+	 * no stored name, or an engine-synthesized `_`-prefixed one (see
+	 * `isAutoConstraintName`). Such a constraint has no name a declaration can
+	 * address, so the differ identifies it by its canonical body instead — matched
+	 * as a multiset against the declared unnamed constraints. `name` is the stored
+	 * auto-name when there is one: what `DROP CONSTRAINT` (and its undo re-add) needs.
+	 * Absent ⇒ no statement can drop it. `definition` / `bodyAst` / `tags` as for
+	 * `namedConstraints`. UNIQUE constraints synthesized from a `CREATE UNIQUE
+	 * INDEX` (`derivedFromIndex`) are excluded here too — they are indexes.
+	 */
+	unnamedConstraints: Array<{
+		kind: NamedConstraintClass;
+		name?: string;
+		tags?: Readonly<Record<string, SqlValue>>;
+		definition: string;
 		bodyAst?: AST.TableConstraint;
 	}>;
 	/**
@@ -196,10 +215,11 @@ export interface CatalogAssertion {
  * The schema extractors auto-name unnamed column/table constraints with a
  * reserved `_`-leading prefix (`_check_<col>`, `_fk_<table>_<cols>`,
  * `_uc_<cols>`); such names are deterministic from structure but are NOT stable
- * identity a declarative schema can reference, so they are excluded from the
+ * identity a declarative schema can reference, so they are kept out of the
  * catalog's user-addressable `namedConstraints` (which drives differ
- * add/drop/rename lifecycle). A user who explicitly names a constraint `_x`
- * forfeits declarative lifecycle management of it — an acceptable corner.
+ * add/drop/rename lifecycle) and listed in `unnamedConstraints`, which the differ
+ * matches by body. A user who explicitly names a constraint `_x` gets it treated
+ * as unnamed — matched by body, not by the name — an acceptable corner.
  */
 function isAutoConstraintName(name: string): boolean {
 	return name.startsWith('_');
@@ -335,33 +355,7 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		referencedTables.push(refName);
 	}
 
-	// Surface *user-addressable* named constraints with their tags so the differ
-	// can detect renames / drops / adds of named CHECK / UNIQUE / FOREIGN KEY
-	// constraints. Excluded:
-	//   - engine-synthesized names (the `_check_*` / `_fk_*` / `_uc_*` auto-names
-	//     the extractors assign to unnamed column/table constraints) — these are
-	//     not stable identity a user can reference declaratively, and surfacing
-	//     them would churn add/drop on every diff against a declaration that only
-	//     carries explicit names (see `isAutoConstraintName`);
-	//   - UNIQUE constraints synthesized from a `CREATE UNIQUE INDEX`
-	//     (`derivedFromIndex`) — those are managed as indexes (the differ's
-	//     index buckets), not as table constraints.
-	const namedConstraints: CatalogTable['namedConstraints'] = [];
-	for (const c of tableSchema.checkConstraints ?? []) {
-		if (c.name && !isAutoConstraintName(c.name)) {
-			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('check', c, tableSchema), bodyAst: schemaConstraintToTableConstraint('check', c, tableSchema) });
-		}
-	}
-	for (const c of tableSchema.uniqueConstraints ?? []) {
-		if (c.name && !isAutoConstraintName(c.name) && !c.derivedFromIndex) {
-			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('unique', c, tableSchema), bodyAst: schemaConstraintToTableConstraint('unique', c, tableSchema) });
-		}
-	}
-	for (const c of tableSchema.foreignKeys ?? []) {
-		if (c.name && !isAutoConstraintName(c.name)) {
-			namedConstraints.push({ name: c.name, tags: c.tags, definition: constraintToCanonicalDDL('foreignKey', c, tableSchema), bodyAst: schemaConstraintToTableConstraint('foreignKey', c, tableSchema) });
-		}
-	}
+	const { namedConstraints, unnamedConstraints } = catalogConstraints(tableSchema);
 
 	return {
 		name: tableSchema.name,
@@ -371,8 +365,39 @@ function tableSchemaToCatalog(tableSchema: TableSchema, db: Database): CatalogTa
 		referencedTables,
 		tags: tableSchema.tags,
 		namedConstraints,
+		unnamedConstraints,
 		...(maintainedTable ? { maintained: maintainedDescriptor(maintainedTable) } : {}),
 	};
+}
+
+/**
+ * Splits a table's CHECK / UNIQUE / FOREIGN KEY constraints into the
+ * *user-addressable* named ones (diffed by name: rename / drop / add / body
+ * change) and the rest (diffed by body — see `CatalogTable.unnamedConstraints`).
+ * An engine-synthesized `_check_*` / `_fk_*` / `_uc_*` auto-name is not identity
+ * a declaration can reference (see `isAutoConstraintName`), so it lands in the
+ * unnamed list with its stored name kept for DROP. UNIQUE constraints synthesized
+ * from a `CREATE UNIQUE INDEX` (`derivedFromIndex`) are in neither list — they are
+ * managed as indexes (the differ's index buckets), not as table constraints.
+ */
+function catalogConstraints(tableSchema: TableSchema): Pick<CatalogTable, 'namedConstraints' | 'unnamedConstraints'> {
+	const namedConstraints: CatalogTable['namedConstraints'] = [];
+	const unnamedConstraints: CatalogTable['unnamedConstraints'] = [];
+	const add = (kind: NamedConstraintClass, c: RowConstraintSchema | UniqueConstraintSchema | ForeignKeyConstraintSchema): void => {
+		const definition = constraintToCanonicalDDL(kind, c, tableSchema);
+		const bodyAst = schemaConstraintToTableConstraint(kind, c, tableSchema);
+		if (c.name && !isAutoConstraintName(c.name)) {
+			namedConstraints.push({ name: c.name, tags: c.tags, definition, bodyAst });
+		} else {
+			unnamedConstraints.push({ kind, name: c.name, tags: c.tags, definition, bodyAst });
+		}
+	};
+	for (const c of tableSchema.checkConstraints ?? []) add('check', c);
+	for (const c of tableSchema.uniqueConstraints ?? []) {
+		if (!c.derivedFromIndex) add('unique', c);
+	}
+	for (const c of tableSchema.foreignKeys ?? []) add('foreignKey', c);
+	return { namedConstraints, unnamedConstraints };
 }
 
 /**

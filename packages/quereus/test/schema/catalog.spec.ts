@@ -371,6 +371,12 @@ describe('Schema Catalog', () => {
 			const afterEntry = collectSchemaCatalog(db, 'main').tables.find(t => t.name === 'rt_cons')!;
 			const afterNamed = afterEntry.namedConstraints.map(withoutBodyAst).sort((a, b) => a.name.localeCompare(b.name));
 			expect(afterNamed).to.deep.equal(beforeNamed);
+			// The auto-named column check is body-diffed, so it rides `unnamedConstraints`
+			// — under the same stored name and body after the roundtrip.
+			const unnamedOf = (t: CatalogTable) => t.unnamedConstraints.map(c => `${c.kind} ${c.name} ${c.definition}`);
+			expect(unnamedOf(afterEntry)).to.deep.equal(unnamedOf(entry));
+			expect(unnamedOf(entry)).to.have.length(1);
+			expect(unnamedOf(entry)[0]).to.match(/^check _check_status /);
 		});
 
 		it('honors default_column_nullability for emission and survives a roundtrip', async () => {
