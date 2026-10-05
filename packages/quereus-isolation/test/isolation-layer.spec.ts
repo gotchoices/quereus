@@ -810,6 +810,37 @@ describe('IsolationModule', () => {
 			expect(evicted.map(r => [...r])).to.deep.equal([[2, 'b']]);
 		});
 
+		// SQL pins `update or …` closed, so a statement-level OR reaches update() only via the API.
+		it('a statement-level OR overrides the UNIQUE default in both directions', async () => {
+			await db.exec(`create table t (id integer primary key, v text unique, w text unique on conflict replace) using isolated`);
+			await db.exec(`insert into t values (2, 'b', 'y')`);
+
+			const table = await isolatedModule.connect(db, undefined, 'isolated', 'main', 't', {} as BaseModuleConfig) as IsolatedTable;
+			await table.update({ operation: 'insert', values: [1, 'a', 'x'] });
+			const ignored = await table.update({ operation: 'update', values: [1, 'b', 'x'], oldKeyValues: [1], onConflict: ConflictResolution.IGNORE });
+			expect(ignored).to.deep.equal({ status: 'ok', row: undefined });
+			const aborted = await table.update({ operation: 'update', values: [1, 'a', 'y'], oldKeyValues: [1], onConflict: ConflictResolution.ABORT });
+			expect(aborted.status).to.equal('constraint');
+			const replaced = await table.update({ operation: 'update', values: [1, 'b', 'x'], oldKeyValues: [1], onConflict: ConflictResolution.REPLACE });
+			expect(replaced.status).to.equal('ok');
+			const evicted = (replaced as { evictedRows?: Row[] }).evictedRows ?? [];
+			expect(evicted.map(r => [...r])).to.deep.equal([[2, 'b', 'y']]);
+		});
+
+		// Ungated, the overlay's own UNIQUE would catch this collision — but under the PK-folded
+		// REPLACE, silently evicting row 2 instead of raising the plain UNIQUE's ABORT.
+		it('an update reviving a PK tombstoned in the txn is checked even when its values are unchanged', async () => {
+			await db.exec(`create table t (id integer primary key on conflict replace, v text unique) using isolated`);
+
+			const table = await isolatedModule.connect(db, undefined, 'isolated', 'main', 't', {} as BaseModuleConfig) as IsolatedTable;
+			await table.update({ operation: 'insert', values: [1, 'a'] });
+			await table.update({ operation: 'delete', values: undefined, oldKeyValues: [1] });
+			await table.update({ operation: 'insert', values: [2, 'a'] });
+			const res = await table.update({ operation: 'update', values: [1, 'a'], oldKeyValues: [1] });
+
+			expect(res.status).to.equal('constraint');
+		});
+
 		it('an update touching no UNIQUE-relevant column still succeeds', async () => {
 			await db.exec(`create table t (id integer primary key, v text unique, w text) using isolated`);
 			await db.exec(`insert into t values (2, 'b', 'x')`);

@@ -1317,8 +1317,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 					// UNIQUE-relevant column owes the merged check first, under the
 					// statement's own OR (each UC then falls back to its own default) — never
 					// the PK-folded `argsForOverlay.onConflict`. Gated because the merged
-					// check scans the whole overlay per UC.
-					if (this.uniqueColumnsChanged(existingOverlayRow.slice(0, tombstoneIndex), coercedValues!)) {
+					// check scans the whole overlay per UC. A tombstoned target is never
+					// gated: the write revives it, and its stale values (a deleted overlay
+					// row keeps them) may since have been claimed by another row.
+					const reviving = existingOverlayRow[tombstoneIndex] === 1;
+					if (reviving || this.uniqueColumnsChanged(existingOverlayRow.slice(0, tombstoneIndex), coercedValues!)) {
 						const ucResult = await this.checkMergedUniqueConstraints(overlay, coercedValues!, [targetPK], tombstoneIndex, args.onConflict, evicted);
 						if (ucResult !== null) return ucResult;
 					}

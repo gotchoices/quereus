@@ -848,7 +848,9 @@ overlay. That last arm is gated on `uniqueColumnsChanged` (the engine's shared
 same-PK UPDATE gate — memory and store use the same function): it runs only when
 a UNIQUE column, or a column a partial UNIQUE's predicate references, changed,
 because the check scans the whole overlay per constraint and an ungated bulk
-UPDATE of a non-UNIQUE column over N staged rows would cost O(N²).
+UPDATE of a non-UNIQUE column over N staged rows would cost O(N²). A target that
+is a tombstone is never gated: the write revives it, and the stale values a
+deleted overlay row keeps may since have been claimed by another row.
 
 The check always receives the **statement's** OR clause, so each constraint
 resolves statement OR > its own `on conflict` default > ABORT. It never receives
