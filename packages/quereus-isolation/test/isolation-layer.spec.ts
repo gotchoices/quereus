@@ -707,6 +707,139 @@ describe('IsolationModule', () => {
 		});
 	});
 
+	// A same-PK UPDATE of a row already staged in the overlay used to write the overlay
+	// directly: the overlay's memory module never sees committed rows (so a collision with
+	// one reached the trusted flush), and it was handed the PK's ON CONFLICT action as if it
+	// were the statement's, applying it to every secondary UNIQUE.
+	describe('same-PK UPDATE of a row staged in the same txn runs the merged UNIQUE check', () => {
+		let isolatedModule: IsolationModule;
+
+		beforeEach(() => {
+			isolatedModule = new IsolationModule({ underlying: new MemoryTableModule() });
+			db.registerModule('isolated', isolatedModule);
+		});
+
+		async function expectConstraint(sql: string): Promise<void> {
+			let err: unknown;
+			try { await db.exec(sql); } catch (e) { err = e; }
+			expect(err, `expected UNIQUE violation from: ${sql}`).to.be.instanceOf(QuereusError);
+			expect((err as QuereusError).code).to.equal(StatusCode.CONSTRAINT);
+		}
+
+		async function rowsOf(table: string): Promise<SqlValue[][]> {
+			const rows = await asyncIterableToArray(db.eval(`select * from ${table} order by id`));
+			return rows.map(r => Object.values(r));
+		}
+
+		it('a collision with a committed row raises UNIQUE instead of failing the flush', async () => {
+			await db.exec(`create table t (id integer primary key, v text unique) using isolated`);
+			await db.exec(`insert into t values (2, 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 'a')`);
+			await expectConstraint(`update t set v = 'b' where id = 1`);
+			await db.exec('commit');
+
+			expect(await rowsOf('t')).to.deep.equal([[1, 'a'], [2, 'b']]);
+		});
+
+		it('a PK-level ON CONFLICT REPLACE does not leak onto a plain UNIQUE', async () => {
+			await db.exec(`create table t (id integer primary key on conflict replace, v text unique) using isolated`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 'a'), (2, 'b')`);
+			await expectConstraint(`update t set v = 'b' where id = 1`);
+			await db.exec('commit');
+
+			expect(await rowsOf('t')).to.deep.equal([[1, 'a'], [2, 'b']]);
+		});
+
+		it('a UNIQUE ON CONFLICT IGNORE skips the update rather than losing the staged row at flush', async () => {
+			await db.exec(`create table t (id integer primary key, v text unique on conflict ignore) using isolated`);
+			await db.exec(`insert into t values (2, 'b')`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`update t set v = 'b' where id = 1`);
+			expect(await rowsOf('t')).to.deep.equal([[1, 'a'], [2, 'b']]);
+			await db.exec('commit');
+
+			expect(await rowsOf('t')).to.deep.equal([[1, 'a'], [2, 'b']]);
+		});
+
+		it('a UNIQUE ON CONFLICT REPLACE evicts the committed row through the delete pipeline (FK cascade)', async () => {
+			await db.exec(`create table t (id integer primary key, v text unique on conflict replace) using isolated`);
+			await db.exec(`create table c (id integer primary key, pid integer references t(id) on delete cascade) using isolated`);
+			await db.exec(`insert into t values (2, 'b')`);
+			await db.exec(`insert into c values (20, 2)`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 'a')`);
+			await db.exec(`update t set v = 'b' where id = 1`);
+			expect(await rowsOf('t')).to.deep.equal([[1, 'b']]);
+			expect(await rowsOf('c'), 'the evicted parent cascades to its child').to.deep.equal([]);
+			await db.exec('commit');
+
+			expect(await rowsOf('t')).to.deep.equal([[1, 'b']]);
+			expect(await rowsOf('c')).to.deep.equal([]);
+		});
+
+		it('reports the REPLACE-evicted committed row via evictedRows', async () => {
+			await db.exec(`create table t (id integer primary key, v text unique on conflict replace) using isolated`);
+			await db.exec(`insert into t values (2, 'b')`);
+
+			const table = await isolatedModule.connect(db, undefined, 'isolated', 'main', 't', {} as BaseModuleConfig) as IsolatedTable;
+			await table.update({ operation: 'insert', values: [1, 'a'] });
+			const res = await table.update({ operation: 'update', values: [1, 'b'], oldKeyValues: [1] });
+
+			expect(res.status).to.equal('ok');
+			const evicted = (res as { evictedRows?: Row[] }).evictedRows ?? [];
+			expect(evicted.map(r => [...r])).to.deep.equal([[2, 'b']]);
+		});
+
+		it('a REPLACE onto a row also staged in the txn evicts it exactly once', async () => {
+			await db.exec(`create table t (id integer primary key, v text unique on conflict replace) using isolated`);
+
+			const table = await isolatedModule.connect(db, undefined, 'isolated', 'main', 't', {} as BaseModuleConfig) as IsolatedTable;
+			await table.update({ operation: 'insert', values: [1, 'a'] });
+			await table.update({ operation: 'insert', values: [2, 'b'] });
+			const res = await table.update({ operation: 'update', values: [1, 'b'], oldKeyValues: [1] });
+
+			expect(res.status).to.equal('ok');
+			const evicted = (res as { evictedRows?: Row[] }).evictedRows ?? [];
+			expect(evicted.map(r => [...r])).to.deep.equal([[2, 'b']]);
+		});
+
+		it('an update touching no UNIQUE-relevant column still succeeds', async () => {
+			await db.exec(`create table t (id integer primary key, v text unique, w text) using isolated`);
+			await db.exec(`insert into t values (2, 'b', 'x')`);
+
+			await db.exec('begin');
+			await db.exec(`insert into t values (1, 'a', 'x')`);
+			await db.exec(`update t set w = 'y' where id = 1`);
+			// Rewriting a UNIQUE column to its own value is not a self-conflict either.
+			await db.exec(`update t set v = 'a' where id = 1`);
+			await db.exec('commit');
+
+			expect(await rowsOf('t')).to.deep.equal([[1, 'a', 'y'], [2, 'b', 'x']]);
+		});
+
+		it('a partial UNIQUE catches a predicate-only change moving the row into scope onto a committed duplicate', async () => {
+			await db.exec(`create table t (id integer primary key, v text, active integer) using isolated`);
+			await db.exec(`create unique index ux on t(v) where active = 1`);
+			await db.exec(`insert into t values (2, 'b', 1)`);
+
+			await db.exec('begin');
+			// Out of the partial index's scope, so the duplicate 'b' is admitted…
+			await db.exec(`insert into t values (1, 'b', 0)`);
+			// …until only the predicate column changes and brings it into scope.
+			await expectConstraint(`update t set active = 1 where id = 1`);
+			await db.exec('commit');
+
+			expect(await rowsOf('t')).to.deep.equal([[1, 'b', 0], [2, 'b', 1]]);
+		});
+	});
+
 	describe('per-connection isolation', () => {
 		it('separate SQL statements share the same overlay within a transaction', async () => {
 			// This test verifies the fix for the original architecture flaw where

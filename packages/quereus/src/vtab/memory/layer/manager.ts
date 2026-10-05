@@ -13,9 +13,9 @@ import { QuereusError } from '../../../common/errors.js';
 import { ConflictResolution } from '../../../common/constants.js';
 import type { ColumnDef as ASTColumnDef, TableConstraint as ASTTableConstraint } from '../../../parser/ast.js';
 import { buildUniqueConstraintSchema, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, validateForeignKeyOverExistingRows, maintainedTableUniqueViolationError, formatKeyValue } from '../../../schema/constraint-builder.js';
-import { indexEnforcesUnique, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
+import { indexEnforcesUnique, uniqueColumnsChanged as sharedUniqueColumnsChanged, uniqueEnforcementCollations, uniqueEnforcementComparators } from '../../../schema/unique-enforcement.js';
 import { generateIndexDDL, generateDropIndexDDL } from '../../../schema/ddl-generator.js';
-import { compareSqlValues, rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
+import { rowsValueIdentical, normalizeCollationName } from '../../../util/comparison.js';
 import type { CollationResolver } from '../../../types/logical-type.js';
 import type { ScanPlan } from './scan-plan.js';
 import type { ColumnSchema } from '../../../schema/column.js';
@@ -1227,40 +1227,18 @@ export class MemoryTableManager {
 	}
 
 	/**
-	 * Returns true if any column covered by a UNIQUE constraint changed between
-	 * old and new rows, or if any column referenced by a partial-UNIQUE predicate
-	 * changed (which may transition the row into or out of the predicate's scope).
-	 *
-	 * NOTE: the per-column test is byte-level `compareSqlValues`, not the enforcement
-	 * comparator, so it OVER-triggers for a semantic-ordering column: rewriting a
-	 * TIMESPAN 'PT1H' to 'PT60M' reports "changed" and re-runs the UNIQUE check, which
-	 * then excludes the row's own primary key and passes. Correct — this only gates
-	 * whether to re-check — just not minimal. If UPDATE-heavy workloads over
-	 * semantic-ordering UNIQUE columns ever show the redundant re-check as hot, route
-	 * this through `uniqueEnforcementComparators` too.
+	 * Same-PK UPDATE gate over the shared {@link sharedUniqueColumnsChanged} (see its
+	 * NOTE on byte-level over-triggering). A partial constraint's referenced columns
+	 * come from its covering index's compiled predicate when one is on hand; for an
+	 * MV-covered (or uncovered) constraint the predicate is compiled ad hoc.
 	 */
 	private uniqueColumnsChanged(schema: TableSchema, oldRow: Row, newRow: Row): boolean {
-		if (!schema.uniqueConstraints) return false;
-		for (const uc of schema.uniqueConstraints) {
-			for (const colIdx of uc.columns) {
-				if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
-			}
-			if (uc.predicate) {
-				const covering = this.findIndexForConstraint(this._currentCommittedLayer, uc);
-				// For an index the compiled predicate is already on hand; for an MV-covered
-				// (or uncovered) constraint, compile the partial predicate ad hoc to learn
-				// which columns can transition the row across the predicate's scope.
-				const referenced = covering?.kind === 'memory-index'
-					? covering.index.predicate?.referencedColumns
-					: compilePredicate(uc.predicate, schema.columns, schema.name).referencedColumns;
-				if (referenced) {
-					for (const colIdx of referenced) {
-						if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
-					}
-				}
-			}
-		}
-		return false;
+		return sharedUniqueColumnsChanged(schema.uniqueConstraints, oldRow, newRow, uc => {
+			const covering = this.findIndexForConstraint(this._currentCommittedLayer, uc);
+			return covering?.kind === 'memory-index'
+				? covering.index.predicate?.referencedColumns
+				: compilePredicate(uc.predicate!, schema.columns, schema.name).referencedColumns;
+		});
 	}
 
 	/**

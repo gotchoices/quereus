@@ -12,9 +12,9 @@
 
 import {
 	ConflictResolution,
-	compareSqlValues,
 	resolveUniqueEnforcementCollations,
 	uniqueEnforcementComparators,
+	uniqueColumnsChanged,
 	compilePredicate,
 	maintainedTableUniqueViolationError,
 	uniqueEnforcementCollations,
@@ -223,28 +223,12 @@ export abstract class StoreTableConstraints extends StoreTableScan {
 	}
 
 	/**
-	 * Returns true if any column covered by a UNIQUE constraint differs between
-	 * oldRow and newRow, or — for partial UNIQUE — any column referenced by the
-	 * partial predicate differs (which can transition the row across the
-	 * predicate scope and re-trigger the uniqueness check).
+	 * Same-PK UPDATE gate: true when a UNIQUE-covered column, or a column a partial
+	 * UNIQUE's predicate references, differs between oldRow and newRow. See the
+	 * engine's shared `uniqueColumnsChanged`.
 	 */
 	protected uniqueColumnsChanged(oldRow: Row, newRow: Row): boolean {
-		const ucs = this.tableSchema?.uniqueConstraints;
-		if (!ucs || ucs.length === 0) return false;
-		for (const uc of ucs) {
-			for (const colIdx of uc.columns) {
-				if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
-			}
-			if (uc.predicate) {
-				const compiled = this.compileFor(uc);
-				if (compiled) {
-					for (const colIdx of compiled.referencedColumns) {
-						if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
-					}
-				}
-			}
-		}
-		return false;
+		return uniqueColumnsChanged(this.tableSchema?.uniqueConstraints, oldRow, newRow, uc => this.compileFor(uc)?.referencedColumns);
 	}
 
 	/**

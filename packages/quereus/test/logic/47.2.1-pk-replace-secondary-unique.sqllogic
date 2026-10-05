@@ -286,3 +286,89 @@ select * from pr_o_child order by id;
 
 drop table pr_o_child;
 drop table pr_o;
+
+-- ===================================
+-- P. Same-PK UPDATE of a row written earlier in the transaction onto a committed
+--    row's UNIQUE value — UNIQUE default ABORT → error, nothing reaches the commit
+-- ===================================
+
+create table pr_p (id integer primary key, v text unique);
+insert into pr_p values (2, 'b');
+
+begin;
+insert into pr_p values (1, 'a');
+update pr_p set v = 'b' where id = 1;
+-- error: UNIQUE constraint failed
+select * from pr_p order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+commit;
+
+select * from pr_p order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table pr_p;
+
+-- ===================================
+-- Q. Same-PK UPDATE under a PK-level REPLACE, rows written in the transaction — the
+--    PK's action does not apply to the UNIQUE, which keeps its default ABORT
+-- ===================================
+
+create table pr_q (id integer primary key on conflict replace, v text unique);
+
+begin;
+insert into pr_q values (1, 'a'), (2, 'b');
+update pr_q set v = 'b' where id = 1;
+-- error: UNIQUE constraint failed
+commit;
+
+select * from pr_q order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table pr_q;
+
+-- ===================================
+-- R. Same-PK UPDATE, UNIQUE IGNORE, conflict with a committed row — the update is
+--    skipped and the row written in the transaction survives the commit
+-- ===================================
+
+create table pr_r (id integer primary key, v text unique on conflict ignore);
+insert into pr_r values (2, 'b');
+
+begin;
+insert into pr_r values (1, 'a');
+update pr_r set v = 'b' where id = 1;
+select * from pr_r order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+commit;
+
+select * from pr_r order by id;
+→ [{"id":1,"v":"a"},{"id":2,"v":"b"}]
+
+drop table pr_r;
+
+-- ===================================
+-- S. Same-PK UPDATE, UNIQUE REPLACE, conflict with a committed row — the committed
+--    row is evicted through the full delete pipeline (its child cascades)
+-- ===================================
+
+create table pr_s (id integer primary key, v text unique on conflict replace);
+create table pr_s_child (id integer primary key, parent_id integer references pr_s(id) on delete cascade);
+insert into pr_s values (2, 'b');
+insert into pr_s_child values (20, 2);
+
+begin;
+insert into pr_s values (1, 'a');
+update pr_s set v = 'b' where id = 1;
+select * from pr_s order by id;
+→ [{"id":1,"v":"b"}]
+select * from pr_s_child;
+→ []
+commit;
+
+select * from pr_s order by id;
+→ [{"id":1,"v":"b"}]
+select * from pr_s_child;
+→ []
+
+drop table pr_s_child;
+drop table pr_s;

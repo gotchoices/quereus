@@ -1,5 +1,5 @@
 import type { CollationResolver, Database, DatabaseInternal, MaybePromise, Row, SqlValue, TableIndexSchema as IndexSchema, FilterInfo, SchemaChangeInfo, TableSchema, TableStatistics, UniqueConstraintSchema, CompiledPredicate, UpdateArgs, VirtualTableConnection, UpdateResult, AccessPath, IndexDescriptor, IndexKeyColumn } from '@quereus/quereus';
-import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, normalizeCollationName, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering } from '@quereus/quereus';
+import { VirtualTable, compareSqlValues, compareSqlValuesFast, BINARY_COLLATION, isUpdateOk, ConflictResolution, compilePredicate, QuereusError, StatusCode, resolveUniqueEnforcementCollations, uniqueEnforcementCollations, uniqueEnforcementComparators, uniqueColumnsChanged, normalizeCollationName, pkKeyCollationName, retargetFilterInfoIndex, PRIMARY_INDEX_NAME, coerceRowToSchema, IndexConstraintOp, decodeIdxStr, createTypedComparator, hasSemanticOrdering } from '@quereus/quereus';
 import type { EffectiveRowSource } from '@quereus/quereus';
 import type { IsolationModule } from './isolation-module.js';
 import type { ConnectionOverlayState } from './isolation-types.js';
@@ -1312,13 +1312,26 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 						return this.attachEvicted(this.attachReplacedUnderlying(stripped, pkOutcome.replacedUnderlyingRow), evicted, tombstoneIndex);
 					}
 
-					// Same PK — update the overlay row in place
+					// Same PK — update the overlay row in place. The overlay's memory module
+					// only sees overlay rows and the flush writes trusted, so a changed
+					// UNIQUE-relevant column owes the merged check first, under the
+					// statement's own OR (each UC then falls back to its own default) — never
+					// the PK-folded `argsForOverlay.onConflict`. Gated because the merged
+					// check scans the whole overlay per UC.
+					if (this.uniqueColumnsChanged(existingOverlayRow.slice(0, tombstoneIndex), coercedValues!)) {
+						const ucResult = await this.checkMergedUniqueConstraints(overlay, coercedValues!, [targetPK], tombstoneIndex, args.onConflict, evicted);
+						if (ucResult !== null) return ucResult;
+					}
+					// The PK-folded action handed to the overlay is now inert: a same-PK
+					// update cannot conflict on the PK, and the merged check above has
+					// already cleared (or REPLACE-tombstoned) every live UNIQUE conflict.
 					const result = await overlay.update({
 						...argsForOverlay,
 						values: overlayRow,
 						oldKeyValues: targetPK,
 					});
-					return this.stripTombstoneFromResult(result, tombstoneIndex);
+					const stripped = this.stripTombstoneFromResult(result, tombstoneIndex);
+					return this.attachEvicted(stripped, evicted, tombstoneIndex);
 				} else {
 					// Insert new overlay row (shadows underlying) — check underlying conflicts first
 					const newPK = pkIndices.map(i => coercedValues![i]);
@@ -1512,6 +1525,11 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 			this.predicateCache.set(uc, compiled);
 		}
 		return compiled;
+	}
+
+	/** Same-PK UPDATE gate — the engine's shared `uniqueColumnsChanged`, fed the memoized predicates. */
+	private uniqueColumnsChanged(oldRow: Row, newRow: Row): boolean {
+		return uniqueColumnsChanged(this.tableSchema!.uniqueConstraints, oldRow, newRow, uc => this.compileFor(uc)?.referencedColumns);
 	}
 
 	/**

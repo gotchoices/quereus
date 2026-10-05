@@ -222,8 +222,9 @@ export type { TableSchema, IndexSchema as TableIndexSchema, UniqueConstraintSche
 // Per-column UNIQUE-enforcement collation resolver, plus the per-column comparators
 // built from it — the single source of truth shared by store/isolation re-validators
 // (memory's `checkUniqueViaIndex` is conformance-locked against the collation resolver
-// rather than importing it, but does share the comparators; see unique-enforcement.ts).
-export { uniqueEnforcementCollations, resolveUniqueEnforcementCollations, uniqueEnforcementComparators } from './schema/unique-enforcement.js';
+// rather than importing it, but does share the comparators; see unique-enforcement.ts),
+// and the same-PK UPDATE gate all three backends use to skip an untouched UNIQUE check.
+export { uniqueEnforcementCollations, resolveUniqueEnforcementCollations, uniqueEnforcementComparators, uniqueColumnsChanged } from './schema/unique-enforcement.js';
 export type { ColumnSchema } from './schema/column.js';
 export type { ViewSchema } from './schema/view.js';
 export type { TableDerivation, MaintainedTableSchema } from './schema/derivation.js';

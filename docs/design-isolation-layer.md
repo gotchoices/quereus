@@ -834,11 +834,29 @@ Equality is all the seek needs — order preservation is a range concern and no 
 built here (`makeSecondaryIndexEqSeekFilter` emits one EQ per key column), so a custom
 equality-only collation is fine.
 
-An INSERT that reuses a PK tombstoned earlier in the same transaction (reviving
-the tombstone into a live row) runs this same merged UNIQUE check before the
-overlay write — otherwise a revived row colliding on a non-PK UNIQUE would be
-missed here and later flushed with `trustedWrite` (the store skips its own
-re-check), producing an opaque INTERNAL error at commit or silent corruption.
+**Every overlay write arm runs this check before writing the overlay.** The
+overlay's own memory module sees only overlay rows, and the commit flush writes
+the underlying with `trustedWrite` (the underlying skips its own UNIQUE
+re-check), so an arm that skipped the merged check would let a collision with a
+committed row reach the flush — an opaque INTERNAL error at commit, a duplicate
+stored, or (under a UNIQUE `on conflict ignore`) the staged row silently dropped
+by the underlying. The arms are: a plain INSERT; an INSERT reviving a PK
+tombstoned earlier in the transaction; a PK-REPLACE INSERT over a live overlay
+row; a PK-changing UPDATE (of an overlay or an underlying row); a same-PK UPDATE
+of an underlying-only row; and a same-PK UPDATE of a row already live in the
+overlay. That last arm is gated on `uniqueColumnsChanged` (the engine's shared
+same-PK UPDATE gate — memory and store use the same function): it runs only when
+a UNIQUE column, or a column a partial UNIQUE's predicate references, changed,
+because the check scans the whole overlay per constraint and an ungated bulk
+UPDATE of a non-UNIQUE column over N staged rows would cost O(N²).
+
+The check always receives the **statement's** OR clause, so each constraint
+resolves statement OR > its own `on conflict` default > ABORT. It never receives
+the PK-folded action `update()` hands the overlay write (`args.onConflict ??`
+the PK's default): that action is for the PK alone, and passing it would let a
+`primary key on conflict replace` silently delete a row colliding on a plain
+UNIQUE. Once the merged check has passed or REPLACE-tombstoned every live
+conflict, the PK-folded action the overlay sees is inert for secondary UNIQUEs.
 
 ### Tombstones for Evicted Rows
 

@@ -43,9 +43,9 @@
  *    index-collation-correct) enforces instead.
  */
 
-import { collationRefines, compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, resolveCollationFunctions } from '../util/comparison.js';
+import { collationRefines, compareSqlValues, compareSqlValuesFast, createTypedComparator, hasSemanticOrdering, resolveCollationFunctions } from '../util/comparison.js';
 import type { CollationFunction, CollationResolver } from '../types/logical-type.js';
-import type { SqlValue } from '../common/types.js';
+import type { Row, SqlValue } from '../common/types.js';
 import type { ColumnSchema } from './column.js';
 import type { IndexSchema, TableSchema, UniqueConstraintSchema } from './table.js';
 
@@ -147,6 +147,50 @@ export function uniqueEnforcementComparators(
 		if (hasSemanticOrdering(logicalType)) return createTypedComparator(logicalType, collations[i]);
 		return (a: SqlValue, b: SqlValue) => compareSqlValuesFast(a, b, collations[i]);
 	});
+}
+
+/**
+ * Same-primary-key UPDATE gate: true if any column covered by a UNIQUE constraint
+ * changed between `oldRow` and `newRow`, or — for a partial UNIQUE — any column its
+ * predicate references changed (which can move the row into or out of the
+ * predicate's scope). False means no UNIQUE constraint can newly conflict, so the
+ * caller may skip its UNIQUE check. Shared by memory, store and the isolation
+ * overlay so the three backends gate identically.
+ *
+ * `predicateColumns` supplies a partial constraint's referenced columns; each
+ * backend already holds (or memoizes) a compiled predicate, so the lookup is
+ * delegated rather than recompiled here. Only called for constraints that carry a
+ * predicate.
+ *
+ * NOTE: the per-column test is byte-level `compareSqlValues`, not the enforcement
+ * comparator, so it OVER-triggers for a semantic-ordering column: rewriting a
+ * TIMESPAN 'PT1H' to 'PT60M' reports "changed" and re-runs the UNIQUE check, which
+ * then excludes the row's own primary key and passes. Correct — this only gates
+ * whether to re-check — just not minimal. If UPDATE-heavy workloads over
+ * semantic-ordering UNIQUE columns ever show the redundant re-check as hot, route
+ * this through `uniqueEnforcementComparators` too.
+ */
+export function uniqueColumnsChanged(
+	uniqueConstraints: ReadonlyArray<UniqueConstraintSchema> | undefined,
+	oldRow: Row,
+	newRow: Row,
+	predicateColumns: (uc: UniqueConstraintSchema) => Iterable<number> | undefined,
+): boolean {
+	if (!uniqueConstraints) return false;
+	for (const uc of uniqueConstraints) {
+		if (anyColumnChanged(uc.columns, oldRow, newRow)) return true;
+		if (!uc.predicate) continue;
+		const referenced = predicateColumns(uc);
+		if (referenced && anyColumnChanged(referenced, oldRow, newRow)) return true;
+	}
+	return false;
+}
+
+function anyColumnChanged(columns: Iterable<number>, oldRow: Row, newRow: Row): boolean {
+	for (const colIdx of columns) {
+		if (compareSqlValues(oldRow[colIdx], newRow[colIdx]) !== 0) return true;
+	}
+	return false;
 }
 
 /**
