@@ -12,6 +12,13 @@ files:
   - docs/schema-undo-plan.md
 repro: verified
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-05T04:42:10.092Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\declarative-differ-ignores-unnamed-constraint-additions.implement.2026-10-05T04-42-10-090Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # Declarative differ ignores unnamed constraints
 
