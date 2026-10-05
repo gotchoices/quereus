@@ -1,8 +1,11 @@
 -- A write that collides on the PRIMARY KEY and resolves it by REPLACE must still
 -- enforce every other UNIQUE constraint, each under its own conflict action
--- (statement OR > per-constraint default > ABORT). Expected results confirmed
--- against SQLite. Previously the memory table wrote the row and returned on the
--- PK-REPLACE branch, leaving a secondary UNIQUE column duplicated.
+-- (statement OR > per-constraint default > ABORT). Expected results match
+-- SQLite except cases G and M2, which pin a deliberate divergence (see
+-- docs/sql-dml.md § Conflict Resolution): the row displaced at the PK counts as
+-- already gone, so its UNIQUE values are free for the new row. Previously the
+-- memory table wrote the row and returned on the PK-REPLACE branch, leaving a
+-- secondary UNIQUE column duplicated.
 
 -- ===================================
 -- A. INSERT OR REPLACE — PK and secondary UNIQUE conflicts both resolved by deletion
@@ -99,6 +102,7 @@ drop table pr_f;
 
 -- ===================================
 -- G. PK REPLACE whose new value equals the replaced row's own value — no self-conflict
+--    (SQLite reports a UNIQUE error here: it checks v against the not-yet-displaced row)
 -- ===================================
 
 create table pr_g (id integer primary key on conflict replace, v text unique, w text);
@@ -215,3 +219,70 @@ select * from pr_l2 order by id;
 
 drop table pr_l2;
 drop table pr_l;
+
+-- ===================================
+-- M. Key-changing UPDATE onto an occupied PK; the moving row keeps its own UNIQUE
+--    value — neither the slot it vacates nor the displaced row may self-conflict
+-- ===================================
+
+create table pr_m (id integer primary key on conflict replace, v text unique);
+insert into pr_m values (1, 'a'), (2, 'b'), (3, 'c');
+
+update pr_m set id = 1 where id = 3;
+
+select * from pr_m order by id;
+→ [{"id":1,"v":"c"},{"id":2,"v":"b"}]
+
+-- M2. The displaced row's own UNIQUE value is free for the mover to take
+--     (SQLite reports a UNIQUE error here, as in G).
+update pr_m set id = 2, v = 'b' where id = 1;
+
+select * from pr_m order by id;
+→ [{"id":2,"v":"b"}]
+
+drop table pr_m;
+
+-- ===================================
+-- N. Composite primary key — PK REPLACE plus secondary UNIQUE, insert and key-changing update
+-- ===================================
+
+create table pr_n (a integer, b integer, v text unique on conflict replace, primary key (a, b) on conflict replace);
+insert into pr_n values (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z');
+
+insert or replace into pr_n values (1, 1, 'y');
+
+select * from pr_n order by a, b;
+→ [{"a":1,"b":1,"v":"y"},{"a":2,"b":1,"v":"z"}]
+
+update pr_n set b = 1, a = 1 where a = 2 and b = 1;
+
+select * from pr_n order by a, b;
+→ [{"a":1,"b":1,"v":"z"}]
+
+update pr_n set a = 3 where a = 1 and b = 1;
+
+select * from pr_n order by a, b;
+→ [{"a":3,"b":1,"v":"z"}]
+
+drop table pr_n;
+
+-- ===================================
+-- O. Both channels on one write: the PK-replaced row and the UNIQUE-evicted row
+--    each cascade to their own children
+-- ===================================
+
+create table pr_o (id integer primary key, v text unique);
+create table pr_o_child (id integer primary key, parent_id integer references pr_o(id) on delete cascade);
+insert into pr_o values (1, 'a'), (2, 'b'), (3, 'c');
+insert into pr_o_child values (10, 1), (20, 2), (30, 3);
+
+insert or replace into pr_o values (1, 'b');
+
+select * from pr_o order by id;
+→ [{"id":1,"v":"b"},{"id":3,"v":"c"}]
+
+select * from pr_o_child order by id;
+→ [{"id":30,"parent_id":3}]
+
+drop table pr_o_child;
+drop table pr_o;

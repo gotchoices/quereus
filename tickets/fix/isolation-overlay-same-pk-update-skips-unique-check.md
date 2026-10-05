@@ -1,4 +1,4 @@
-description: Inside a transaction on a store-backed (persistent) table, changing a UNIQUE column on a row that was itself written earlier in the same transaction is never checked against already-committed rows, so the commit can save two rows with the same "unique" value.
+description: Inside a transaction on a store-backed (persistent) table, changing a UNIQUE column on a row that was itself written earlier in the same transaction is never checked against already-committed rows, so the commit can save two rows with the same "unique" value; and when the primary key declares its own conflict action, that action is wrongly applied to the UNIQUE column too, silently deleting a row instead of reporting an error.
 architecture: docs/runtime.md
 files:
   - packages/quereus-isolation/src/isolated-table.ts                 # update arm, existing overlay row, same PK (~L1315 "Same PK — update the overlay row in place"); sibling arms run checkMergedUniqueConstraints
@@ -33,6 +33,21 @@ select * from x order by id;          -- store mode: both rows, both v = 'b'
 ```
 
 Memory mode raises `UNIQUE constraint failed: x (v)` on the update, as SQLite does. Store mode accepts the update and the commit stores the duplicate.
+
+### Second arm, same site: the PK's default action leaks onto the secondary UNIQUE
+
+Found in review of `memory-vtab-pk-replace-skips-unique-check`. The same arm hands the overlay `argsForOverlay`, whose `onConflict` is the **primary key's** `on conflict` default folded in as if it were the statement's OR clause. The overlay's memory module then applies that action to every secondary UNIQUE too — so a conflict between two overlay-only rows is resolved by the PK's action instead of the UNIQUE's own. Verified with a scratch isolation spec (memory underlying, `USING isolated`):
+
+```sql
+create table t (id integer primary key on conflict replace, v text unique);
+begin;
+insert into t values (1, 'a'), (2, 'b');
+update t set v = 'b' where id = 1;   -- expected: UNIQUE constraint failed (v has default ABORT)
+commit;
+select * from t order by id;          -- isolation: [{"id":1,"v":"b"}] — row 2 silently deleted, no error
+```
+
+Memory mode and SQLite raise the UNIQUE error. Running the merged check (with the original `args.onConflict`) before the overlay write fixes this arm as well, because it rejects the conflict before the overlay sees it — the same reason the sibling arms are unaffected.
 
 ## Expected behaviour
 

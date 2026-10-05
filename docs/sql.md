@@ -239,6 +239,7 @@ While Quereus supports similar SQL syntax, it has evolved into a distinct system
 | **JSON Functions** | Extensive support with native JSON type | Available as extension |
 | **Indexes** | Depends on VTab module | Full support |
 | **BLOB I/O** | Basic support | Advanced support |
+| **PK `REPLACE` vs. secondary UNIQUE** | Row displaced at the PK is treated as gone; new row may reuse its UNIQUE values ([details](sql-dml.md#conflict-resolution-or-clause)) | Reports a UNIQUE error against the about-to-be-displaced row unless that constraint's action is also `REPLACE` |
 | **`OR <action>` modifier** | `INSERT OR <action>` only; UPDATE/DELETE deliberately omitted (use schema-level `ON CONFLICT` or rewrite) | `INSERT/UPDATE/DELETE OR <action>` (SQLite-specific extension) |
 
 #### 11.2.4 Syntax Extensions
