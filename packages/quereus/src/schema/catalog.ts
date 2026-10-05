@@ -576,8 +576,8 @@ function uniqueConstraintColumnNames(
 /**
  * The same name rule as {@link implicitIndexName}, expressed over column *names*
  * rather than a resolved {@link UniqueConstraintSchema}. Declaration-time callers
- * (`ALTER TABLE … ADD CONSTRAINT`, `ADD COLUMN … unique`) hold only the statement's
- * column names — an `ADD COLUMN`'s column does not even exist on the table yet — so
+ * (`ALTER TABLE … ADD CONSTRAINT`, `ADD COLUMN … unique`, the declarative differ's
+ * mint for an unnamed UNIQUE) hold only column names — an `ADD COLUMN`'s column does not even exist on the table yet — so
  * they cannot go through the schema-resolved form.
  *
  * Keep this the ONLY spelling of the `_uc_<cols>` rule in this package. Three
@@ -586,7 +586,7 @@ function uniqueConstraintColumnNames(
  * `quereus-isolation`'s `installOverlayUniqueConstraint` (which names the overlay's
  * narrowed unique index by the same rule so DROP / RENAME CONSTRAINT forwards resolve).
  */
-function implicitIndexNameForColumns(constraintName: string | undefined, columnNames: ReadonlyArray<string>): string {
+export function implicitIndexNameForColumns(constraintName: string | undefined, columnNames: ReadonlyArray<string>): string {
 	return constraintName ?? `_uc_${columnNames.join('_')}`;
 }
 

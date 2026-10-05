@@ -2472,4 +2472,79 @@ insert into uc_r values (1, -1, null);
 -- error: CHECK constraint failed
 
 drop table uc_r;
+
+-- Renaming the parent table an unnamed FK references is the table rename
+-- only: the FK body is matched with the parent rename inverse-applied.
+create table uc_k (id integer primary key, pid integer null references uc_p(id));
+
+declare schema main {
+	table uc_p2 { id integer primary key } with tags ("quereus.previous_name" = 'uc_p')
+	table uc_k { id integer primary key, pid integer null references uc_p2(id) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_p RENAME TO uc_p2"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+drop table uc_k;
+alter table uc_p2 rename to uc_p;
+
+-- A declared reserved `_` name is unnamed-class: ADDed under that name, then
+-- matched by body (so dropping the name from the declaration is no change),
+-- and a body edit drops it and ADDs the new body under a fresh `_check_<n>`.
+create table uc_x (id integer primary key, a integer null);
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_x { id integer primary key, a integer null, constraint _pos check (a > 0) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_x ADD constraint _pos check (a > 0)"}]
+
+apply schema main;
+
+-- run
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_x { id integer primary key, a integer null, check (a > 0) }
+}
+
+-- run
+
+diff schema main;
+→ []
+
+declare schema main {
+	table uc_p { id integer primary key }
+	table uc_x { id integer primary key, a integer null, check (a > 1) }
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE uc_x DROP CONSTRAINT _pos"}, {"ddl": "ALTER TABLE uc_x ADD constraint _check_1 check (a > 1)"}]
+
+apply schema main;
+
+-- run
+
+diff schema main;
+→ []
+
+insert into uc_x values (1, 1);
+-- error: CHECK constraint failed: _check_1
+
+drop table uc_x;
 drop table uc_p;

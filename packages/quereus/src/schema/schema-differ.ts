@@ -1,4 +1,4 @@
-import type { SchemaCatalog, CatalogTable, CatalogView, CatalogIndex, CatalogAssertion } from './catalog.js';
+import { implicitIndexNameForColumns, type SchemaCatalog, type CatalogTable, type CatalogView, type CatalogIndex, type CatalogAssertion } from './catalog.js';
 import type * as AST from '../parser/ast.js';
 import type { SqlValue } from '../common/types.js';
 import { createTableToString, createViewToString, createMaterializedViewToString, createIndexToString, createAssertionToString, columnDefToString, quoteIdentifier, expressionToString, tagsBodyToString, tableConstraintsToString, constraintBodyToCanonicalString, createIndexBodyToCanonicalString, indexedColumnBareName, viewDefinitionToCanonicalString, astToString } from '../emit/ast-stringify.js';
@@ -2167,7 +2167,7 @@ interface UnnamedConstraintDiffContext {
 	/** A declared body as the actual catalog spells it: the in-diff renames inverse-applied (identity without renames). */
 	reconcile: (d: DeclaredUnnamedConstraint) => string;
 	/** Lowercased names of the declared user-named constraints — all present once the named lifecycle has run. */
-	declaredNames: Iterable<string>;
+	declaredNames: readonly string[];
 	/** Names the named lifecycle drops (before any ADD), freeing them for a mint. */
 	namedDrops: readonly string[];
 	/** Declared names of the columns this diff adds. */
@@ -2257,6 +2257,12 @@ function countActualChecks(actualTable: CatalogTable): number {
  * plus — over-approximated — what `ADD COLUMN` mints for an inline clause on a new
  * column. An unnamed UNIQUE's backing-structure name (`_uc_<cols>`) is included:
  * a UNIQUE added under the same name would collide with that structure.
+ *
+ * NOTE: that backing name is derived from the PRE-rename column names, but a RENAME
+ * COLUMN in the same diff moves it to `_uc_<new cols>` before the ADDs run. A mint can
+ * only hit the moved name through a `_`-joined spelling clash (`unique (a_b)` beside a
+ * renamed `unique (a, b)`), and the engine refuses that ADD loudly; if it ever bites,
+ * derive the name over the post-rename columns.
  */
 function constraintNamesAtAddTime(actualTable: CatalogTable, ctx: UnnamedConstraintDiffContext, unnamedDrops: readonly string[]): Set<string> {
 	const taken = new Set<string>();
@@ -2275,9 +2281,9 @@ function constraintNamesAtAddTime(actualTable: CatalogTable, ctx: UnnamedConstra
 	return taken;
 }
 
-/** The structure name an unnamed UNIQUE over `columns` is backed by (`implicitIndexNameForColumns` in catalog.ts). */
+/** The structure name an unnamed UNIQUE over `columns` is backed by. */
 function uniqueBackingName(columns: ReadonlyArray<{ name: string }>): string {
-	return `_uc_${columns.map(c => c.name).join('_')}`;
+	return implicitIndexNameForColumns(undefined, columns.map(c => c.name));
 }
 
 /**
@@ -2548,7 +2554,7 @@ function computeTableAlterDiff(
 		tableName: declaredTable.tableStmt.table.name,
 		schemaName,
 		reconcile: d => reconciledDeclaredBody(d, diff.columnsToRename, tableRenames, actualTable.name, schemaName, columnRenamesByTable, resolveDeclaredColumn),
-		declaredNames: declaredNamedConstraints.keys(),
+		declaredNames: [...declaredNamedConstraints.keys()],
 		namedDrops: constraintsToDrop,
 		addedColumns: declaredTable.tableStmt.columns.filter(c => !colRenames.pairs.has(c.name.toLowerCase())).map(c => c.name),
 		droppedColumns: new Set(diff.columnsToDrop.map(c => c.toLowerCase())),
