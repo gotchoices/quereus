@@ -72,7 +72,21 @@ declares what it needs and each harness declares once what its backend has.
 
 **This section is the format spec, and the format is the cross-repo contract** — downstream harnesses
 reimplement the ~10-line parse against it. Quereus's own implementation is `test/logic-capabilities.ts`
-(quereus does not publish its test tree; `package.json` `files` excludes `dist/test`).
+(not published — the npm package ships the corpus and this README, not the harness or compiled tests).
+
+**Locating the corpus from the npm package.** `@quereus/quereus` ships `test/logic/*.sqllogic` and
+`test/README.md` in its tarball, so a consumer runs the corpus that matches the engine version it
+installed. The `exports` map exposes `./package.json` for exactly this: resolve it, take its directory,
+and read `test/logic` from there.
+
+```ts
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+const corpusDir = join(dirname(createRequire(import.meta.url).resolve('@quereus/quereus/package.json')), 'test', 'logic');
+```
+
+No other path under `test/` is exported or guaranteed to ship. A pattern export such as
+`./test/logic/*` was rejected because it resolves single files but cannot be listed.
 
 Grammar — the directive lives in the file's **leading comment block**, before the first line that is
 neither blank nor a `--` comment:

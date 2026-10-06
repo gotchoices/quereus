@@ -4,6 +4,9 @@
 
 import { describe, it } from 'mocha';
 import { expect } from 'chai';
+import { createRequire } from 'node:module';
+import { readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import * as quereus from '../src/index.js';
 import {
 	// Comparison functions
@@ -186,3 +189,13 @@ describe('Public API Exports', () => {
 	});
 });
 
+// Downstream harnesses locate the shipped .sqllogic corpus by resolving this
+// subpath; an exports map without it blocks every path into the package.
+describe('Package exports map', () => {
+	it('resolves @quereus/quereus/package.json and finds the logic corpus beside it', () => {
+		const packageJson = createRequire(import.meta.url).resolve('@quereus/quereus/package.json');
+		const corpus = readdirSync(join(dirname(packageJson), 'test', 'logic'))
+			.filter(name => name.endsWith('.sqllogic'));
+		expect(corpus).to.not.be.empty;
+	});
+});

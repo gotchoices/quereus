@@ -34,9 +34,12 @@
   "files": [
     "dist",
     "!dist/test",
-    "!**/*.tsbuildinfo"
+    "!**/*.tsbuildinfo",
+    "test/logic/*.sqllogic",
+    "test/README.md"
   ],
   "exports": {
+    "./package.json": "./package.json",
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
