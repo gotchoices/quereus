@@ -255,3 +255,5 @@ and the per-area assignment.
 ## Testing
 
 Tests live in `test/*.spec.ts`, driven by Mocha with ts-node/esm. Run with `yarn test`. Quereus uses SQL logic tests (primary), property-based tests, performance sentinels, unit tests, and a benchmark suite — see [Architecture — Testing Strategy](../../docs/architecture.md#testing-strategy) for details.
+
+The SQL logic corpus (`test/logic/*.sqllogic`) ships in the npm package so other storage backends can run the version-matched suite against themselves — see [Consuming the corpus from the npm package](test/README.md#consuming-the-corpus-from-the-npm-package).

@@ -72,21 +72,8 @@ declares what it needs and each harness declares once what its backend has.
 
 **This section is the format spec, and the format is the cross-repo contract** — downstream harnesses
 reimplement the ~10-line parse against it. Quereus's own implementation is `test/logic-capabilities.ts`
-(not published — the npm package ships the corpus and this README, not the harness or compiled tests).
-
-**Locating the corpus from the npm package.** `@quereus/quereus` ships `test/logic/*.sqllogic` and
-`test/README.md` in its tarball, so a consumer runs the corpus that matches the engine version it
-installed. The `exports` map exposes `./package.json` for exactly this: resolve it, take its directory,
-and read `test/logic` from there.
-
-```ts
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
-const corpusDir = join(dirname(createRequire(import.meta.url).resolve('@quereus/quereus/package.json')), 'test', 'logic');
-```
-
-No other path under `test/` is exported or guaranteed to ship. A pattern export such as
-`./test/logic/*` was rejected because it resolves single files but cannot be listed.
+(not published — the npm package ships the corpus and this README, not the harness or compiled tests;
+see [Consuming the corpus from the npm package](#consuming-the-corpus-from-the-npm-package)).
 
 Grammar — the directive lives in the file's **leading comment block**, before the first line that is
 neither blank nor a `--` comment:
@@ -143,6 +130,21 @@ by "a feature a backend would realistically choose to omit wholesale"; do **not*
 Both of quereus's backends ship standalone index DDL, so the mechanism produces **zero local skips** today.
 That is expected — the payoff is downstream. A file skipping locally means the capability sets or the
 directive are wrong.
+
+### Consuming the corpus from the npm package
+
+`@quereus/quereus` ships `test/logic/*.sqllogic` and `test/README.md` in its tarball, so a consumer
+runs the corpus that matches the engine version it installed. The `exports` map exposes `./package.json` for exactly this: resolve it, take its directory,
+and read `test/logic` from there.
+
+```ts
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+const corpusDir = join(dirname(createRequire(import.meta.url).resolve('@quereus/quereus/package.json')), 'test', 'logic');
+```
+
+No other path under `test/` is exported or guaranteed to ship. A pattern export such as
+`./test/logic/*` was rejected because it resolves single files but cannot be listed.
 
 ## Test philosophy
 
