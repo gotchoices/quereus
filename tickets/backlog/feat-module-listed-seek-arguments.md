@@ -12,7 +12,7 @@ tradeoffs: The only module that needs it today is lamina's multi-dimensional (nD
 
 # Module-listed seek arguments
 
-Filed from the lamina board (`feat-late-bound-nd-scan-seek-keys`, plan stage); lamina is the module that needs it. Lamina-side consumer: `debt-nd-scan-engine-dispatch` on the lamina board.
+Filed from the lamina board (`feat-late-bound-nd-scan-seek-keys`, plan stage); lamina is the module that needs it. Lamina-side consumers on the lamina board: `debt-nd-scan-engine-dispatch` fixes the dispatch problems below without this contract (an nD plan advertises one dimension as its seek column and is withheld when it would be sequential-scanned), so literal-bound nD plans do not need it; `feat-late-bound-nd-scan-bounds-after-quereus-bump` (placeholder bounds) waits on it.
 
 ## What a module can express today
 
@@ -72,7 +72,7 @@ Rules:
 
 ## What happens if we do nothing
 
-Lamina's nD index stays limited to literal bounds, and a lamina-only workaround has to advertise one dimension as a seek column and mirror the engine's per-column picker, so that one dimension at most can take placeholders. The workaround is described in the lamina ticket; it is strictly narrower and adds engine-mirroring code there.
+Lamina's nD index stays limited to literal bounds. Lamina routes literal-bound nD plans to the index by advertising one dimension as a seek column and mirroring the engine's per-column picker (`debt-nd-scan-engine-dispatch`); that route could carry placeholders on one dimension at most, and lamina chose not to.
 
 ## Reversibility
 
