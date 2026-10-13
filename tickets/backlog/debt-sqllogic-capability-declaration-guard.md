@@ -94,3 +94,18 @@ weighing what coverage that costs downstream.
 
 Inventing new capability tokens. The vocabulary is deliberately closed and adding to it is its
 own decision, documented in `test/README.md`.
+
+## Additional arm: `50-declarative-schema` (from lamina board: `sqllogic-create-index-sl7-corpus-fallout`)
+
+A fourth file has the same defect, and the line-anchored grep above cannot see it, because its index DDL is written as **members of a `declare schema` block** rather than as standalone statements. `apply schema` lowers those members to `create index` / `create unique index` / `drop index`, so a backend without `standalone-index-ddl` dies at the apply:
+
+| Section | Lines | What it does |
+|---|---|---|
+| Steps 38–46 | 418–475 | `index idx_products_name …` / `index idx_products_category …` declared, diffed, applied, then one removed (`DROP INDEX IF EXISTS`) |
+| "Declarative `unique index`" | 950–981 | `unique index ix_T_email …` / `unique index ix_T_a_b …` declared, diffed, applied |
+
+The corpus already treats this form as needing the capability: `50.2.1-declare-schema-index-renames.sqllogic` uses only declarative `index` members and declares `-- requires-capability: standalone-index-ddl`. So `50-declarative-schema` is the `03.6` / `15.1` case — a large file about something else (the declarative-schema lifecycle) with two index sections inside — and the answer is the same: move those two sections into a capability-declaring sibling (e.g. `50.0.1-declarative-schema-indexes.sqllogic`, or into `50.2.1`) rather than annotating the whole file.
+
+Lamina (which deliberately has no standalone index DDL) hits this today: the file stops at the step-40 `apply schema main;`, so everything after line 418 — including the unrelated rename, assertion, and view sections — goes unexercised there. The same is true of `15.1` (stops at line 414) and `11.3` (stops at line 15).
+
+For the guard: detection should also cover `index` / `unique index` members inside `declare schema` blocks. Note `51-lens-foundation.sqllogic` line 56 has one inside a `declare logical schema` block whose apply is *expected* to error (`index 'ix' is not allowed in logical schema`) — that one needs no capability, so a naive member match would false-positive on it.
