@@ -406,3 +406,5 @@
 {"slug":"ask-the-backend-before-guessing-its-size","file":"5.5-ask-the-backend-before-guessing-its-size.md","completedAt":"2026-09-03","commit":"29ff10cbc4e91b0c1fe204d312685a2619dbf240","prunedAt":"2026-10-05T04:35:41.272Z"}
 {"slug":"bug-sync-stale-create-migration-conflicts-after-alter","file":"bug-sync-stale-create-migration-conflicts-after-alter.md","completedAt":"2026-09-03","commit":"4eb83e4f91d109e45e459ae0b6a3692431a0ecf5","prunedAt":"2026-10-05T04:35:41.272Z"}
 {"slug":"feat-sort-absorb-blind-to-limit","file":"feat-sort-absorb-blind-to-limit.md","completedAt":"2026-09-02","commit":"b777bbbbd35988ab9c2b3eba1c17189c58a0a491","prunedAt":"2026-10-05T04:35:41.272Z"}
+{"slug":"bug-differ-treats-type-alias-as-retype","file":"bug-differ-treats-type-alias-as-retype.md","completedAt":"2026-09-17","commit":"561195502e99b047b66e9daec044342a4324e766","prunedAt":"2026-10-18T17:05:34.504Z"}
+{"slug":"eval-early-exit-leaks-exec-mutex-under-babel","file":"eval-early-exit-leaks-exec-mutex-under-babel.md","completedAt":"2026-09-15","commit":"82e8de004c198be8d8033b8a174bb18d1efcb1e2","prunedAt":"2026-10-18T17:05:34.504Z"}
