@@ -72,6 +72,51 @@ describe('apply schema: index creates run after the table-alter block', () => {
 		expect(await rows(db, 'diff schema main')).to.deep.equal([]);
 	});
 
+	it('a hinted index rename with a partial predicate and collate over a renamed column names the new column', async () => {
+		await db.exec('declare schema main { table t { id integer primary key, oldc text null } index t_old on t (oldc) where oldc is not null }');
+		await db.exec('apply schema main');
+		await db.exec("insert into t (id, oldc) values (1, 'A'), (2, null)");
+
+		await db.exec(`declare schema main {
+			table t { id integer primary key, newc text null with tags ("quereus.previous_name" = 'oldc'), b text null }
+			index t_new on t (newc collate nocase) where newc is not null with tags ("quereus.previous_name" = 't_old')
+			index t_b on t (b) where b is not null
+		}`);
+		const plan = (await rows(db, 'diff schema main')).map(r => String(r.ddl));
+		const at = (re: RegExp): number => plan.findIndex(s => re.test(s));
+		expect(at(/RENAME COLUMN/i)).to.be.lessThan(at(/index "?t_new"?/i));
+		expect(at(/ADD COLUMN/i)).to.be.lessThan(at(/index "?t_b"?/i));
+		expect(plan[at(/create index "?t_new"?/i)]).to.match(/newc/i).and.not.match(/oldc/i);
+		await db.exec('apply schema main');
+
+		expect(indexNames(db, 't').sort()).to.deep.equal(['t_b', 't_new']);
+		expect(await rows(db, "select id from t where newc = 'a' collate nocase")).to.deep.equal([{ id: 1 }]);
+		expect(await rows(db, 'diff schema main')).to.deep.equal([]);
+	});
+
+	it('indexes a column added to a maintained table in the reshape round (after the re-attach)', async () => {
+		await db.exec(`declare schema main {
+			table src { id integer primary key, v integer, w integer null }
+			table m { id integer primary key, v integer } maintained as select id, v from src
+		}`);
+		await db.exec('apply schema main');
+		await db.exec('insert into src (id, v, w) values (1, 10, 100)');
+
+		await db.exec(`declare schema main {
+			table src { id integer primary key, v integer, w integer null }
+			table m { id integer primary key, v integer, w integer null } maintained as select id, v, w from src
+			index m_w on m (w)
+		}`);
+		const plan = (await rows(db, 'diff schema main')).map(r => String(r.ddl));
+		const at = (re: RegExp): number => plan.findIndex(s => re.test(s));
+		expect(at(/set maintained/i)).to.be.lessThan(at(/create index m_w/i));
+		await db.exec('apply schema main');
+
+		// Read the live table, not the catalog: the catalog omits every index on a maintained table (see backlog bug-declared-index-on-maintained-table-never-converges).
+		expect(db.schemaManager.getTable('main', 'm')?.indexes?.map(i => i.name)).to.deep.equal(['m_w']);
+		expect(await rows(db, 'select id from m where w = 100')).to.deep.equal([{ id: 1 }]);
+	});
+
 	it('a version that drops an index together with its column still applies', async () => {
 		await db.exec('declare schema main { table t { id integer primary key, b text null } index t_b on t (b) }');
 		await db.exec('apply schema main');

@@ -491,6 +491,12 @@ describe('generateMigrationPlan undo', () => {
 				'table src { id integer primary key, v integer, w integer } table m { id integer primary key, v integer, w integer } maintained as select id, v, w from src');
 		});
 
+		it('a column add and a column rename, each indexed in the same round (index creates follow the alter block)', () => expectRoundTrip(
+			['create table t (id integer primary key, oldc text null)', 'create index t_old on t (oldc) where oldc is not null'],
+			`table t { id integer primary key, newc text null with tags ("quereus.previous_name" = 'oldc'), b text null }
+			index t_new on t (newc collate nocase) where newc is not null with tags ("quereus.previous_name" = 't_old')
+			index t_b on t (b) where b > 'a'`));
+
 		it('creates of every kind', () => expectRoundTrip(['create table src (id integer primary key, v integer)'], `
 			table src { id integer primary key, v integer }
 			table fresh { id integer primary key, name text }

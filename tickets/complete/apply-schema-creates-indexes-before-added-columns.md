@@ -1,10 +1,10 @@
-description: A schema change that adds (or renames) a column and an index on it in the same "apply schema" used to fail because the migration plan created the index first; index creates now run after the table-alter block. Needs a review pass.
+description: A schema change that adds (or renames) a column and an index on it in the same "apply schema" used to fail because the migration plan created the index first; index creates now run after the table-alter block. Reviewed.
 architecture: docs/schema.md#migration-order
 files: packages/quereus/src/schema/schema-differ.ts (`generateMigrationPlan` end of function; `computeSchemaDiff` index loop ~850-895), packages/quereus/test/apply-schema-index-order.spec.ts, packages/quereus/test/schema-differ.spec.ts, packages/quereus/test/schema/differ-undo-plan.spec.ts, packages/quereus/test/index-ddl-roundtrip.spec.ts, packages/quereus/test/logic/50.2.1-declare-schema-index-renames.sqllogic, docs/schema.md, docs/schema-rename-detection.md
 difficulty: easy
 ----
 
-# Review: apply schema now creates indexes after the table-alter block
+# Complete: apply schema now creates indexes after the table-alter block
 
 ## What changed (landed in the fix stage, verified in implement)
 
@@ -33,3 +33,14 @@ Now:
 - Index on a maintained table / materialized view target created in the same round as the table (the maintained re-attach now precedes index creates) — covered only incidentally by the existing suite (`covering-structure.spec.ts`, `declarative-equivalence.spec.ts` pass).
 - Undo plan: the create-index step still undoes to `DROP INDEX IF EXISTS`; its position in the plan moved later, and the executed-undo roundtrip tests in `differ-undo-plan.spec.ts` pass, but there is no case that mixes a column add with an index create and executes the undo.
 - No tripwires parked.
+
+## Review findings
+
+- **Diff read (`schema-differ.ts`)**: the move of `pushCreates(diff.indexesToCreate, 'index')` to after the maintained re-attaches is correct; nothing in the alter block (constraint adds, PK change, FK adds) depends on a new index existing, and `DROP INDEX` stays early. Removing `columnReconciledIndexStmt` left no dead imports (`indexedColumnBareName`, `cloneExpr`, `renameColumnInCheckExpression`, `singleSchemaObjectRefResolver` are all still used by `declaredIndexCanonicalBody` and the view/constraint reconcilers). The undo order got better too: undo now drops the new index before dropping the added column.
+- **Gap: partial + collate indexes over a renamed column**: tested now. Added a case to `apply-schema-index-order.spec.ts` (hinted index rename, `newc collate nocase`, `where newc is not null`, plus a partial index over an added column): the recreate names `newc` (no `oldc`), the plan orders the column ops before the index creates, the apply works, and re-diff is empty. No other code assumed pre-rename names in index DDL.
+- **Gap: executed undo mixing a column add/rename with index creates**: tested now. Added a round-trip case in `differ-undo-plan.spec.ts` (column rename + add, renamed partial/collate index, new partial index). It passes.
+- **Gap: index on a maintained table in the reshape round**: tested now. The index create runs after `set maintained as` and works. This turned up a **real defect that already existed (reproduced)**: the catalog leaves out every index on a maintained table, so a declared index there never converges and a second `apply schema` fails. Filed `backlog/bug-declared-index-on-maintained-table-never-converges.md`. The new test reads the live table's indexes for that reason.
+- **Docs**: `docs/schema.md` § Migration Order step 5 and `docs/schema-rename-detection.md` match the code; no other doc mentions the old order.
+- **Hygiene / types / resource cleanup**: no issues. The change is a relocated call plus a deleted helper, and the comments explain the reason, not the code.
+- **Tripwires**: none parked; no conditional concerns found.
+- **Validation**: `yarn lint` (packages/quereus) exit 0; `yarn test` 10773 passing, 25 pending, 0 failing. `yarn test:store` not re-run in review; the review only added memory-backed mocha cases and changed no source.
