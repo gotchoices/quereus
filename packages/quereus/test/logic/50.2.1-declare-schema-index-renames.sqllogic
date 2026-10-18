@@ -170,3 +170,41 @@ diff schema main;
 drop view trv_new;
 drop index tri_new;
 drop table src_new;
+
+-- Index creates run after the table-alter block, so one round can add a column
+-- and index it (the create used to run before ADD COLUMN and failed with
+-- "Column not found").
+
+create table aci_t (id integer primary key);
+insert into aci_t values (1);
+
+declare schema main {
+	table aci_t {
+		id integer primary key,
+		b text null
+	}
+
+	index aci_b on aci_t (b)
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE aci_t ADD COLUMN b text null"}, {"ddl": "create index aci_b on aci_t (b)"}]
+
+apply schema main;
+
+-- run
+
+select name, tbl_name from schema() where type = 'index';
+→ [{"name": "aci_b", "tbl_name": "aci_t"}]
+
+insert into aci_t values (2, 'x');
+select id from aci_t where b = 'x';
+→ [{"id": 2}]
+
+diff schema main;
+→ []
+
+drop index aci_b;
+drop table aci_t;
