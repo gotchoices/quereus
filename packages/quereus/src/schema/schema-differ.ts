@@ -839,9 +839,9 @@ export function computeSchemaDiff(
 	// `kind: 'index'` rename op is metadata only (no ALTER INDEX … RENAME TO
 	// primitive), so the convergence DDL must come from these buckets; the
 	// rebuild cost on a pure rename is the documented tradeoff. A body-UNCHANGED
-	// hinted rename renders the recreate with the in-diff COLUMN renames
-	// inverse-applied while keeping declared TABLE names (see
-	// `columnReconciledIndexStmt`); the recreate carries the declared tags, so the
+	// hinted rename recreates under the declared name verbatim (index creates run
+	// after the table-alter block, so post-rename column names resolve); the
+	// recreate carries the declared tags, so the
 	// in-place SET TAGS branch below never double-emits (renames `continue` past
 	// it). A pure name match whose body is unchanged but tags drifted still takes
 	// the in-place `ALTER INDEX … SET TAGS`.
@@ -883,11 +883,11 @@ export function computeSchemaDiff(
 			continue;
 		}
 		if (matchedActual.name.toLowerCase() !== name) {
-			// Hinted rename, body unchanged → drop(old) + recreate(declared),
-			// rendered with in-diff column renames inverse-applied (NEW→OLD).
+			// Hinted rename, body unchanged → drop(old) + recreate(declared). The
+			// create runs after the table-alter block, so it names the declared
+			// (post-rename) columns as written — no inverse reconciliation.
 			diff.indexesToDrop.push(matchedActual.name);
-			const reconciledStmt = columnReconciledIndexStmt(declaredIndex.indexStmt, indexColRenames, columnRenamesByTable, targetSchemaName);
-			diff.indexesToCreate.push(indexCreate(applyIndexDefaults(reconciledStmt, targetSchemaName)));
+			diff.indexesToCreate.push(indexCreate(applyIndexDefaults(declaredIndex.indexStmt, targetSchemaName)));
 			indexRecreates++;
 			continue;
 		}
@@ -1776,69 +1776,6 @@ function columnReconciledViewStmt(
 	// The reconciled body carries any trailing `with defaults (…)` clause inline.
 	const reconciledSelect = inverseRenamedViewParts(stmt.select, [], columnRenamesByTable, schemaName, resolveDeclaredColumn);
 	return { ...stmt, select: reconciledSelect };
-}
-
-/**
- * Declared {@link AST.CreateIndexStmt} with the in-diff COLUMN renames
- * inverse-applied (NEW→OLD); table references untouched. The index analogue of
- * {@link columnReconciledViewStmt}, rendering the recreate DDL of a
- * hinted-RENAME-matched index whose body is otherwise unchanged. Indexed-column
- * bare names map NEW→OLD via the index table's own renames (both indexed-column
- * forms — plain and the parser's collate-folded `col COLLATE x`). The partial
- * WHERE predicate reuses the walk shape of {@link declaredIndexCanonicalBody}
- * minus its inverse table pass: the own table's renames via the
- * CHECK-expression entry point seeded with the DECLARED table name (qualifiers
- * still carry it — no table pass pre-normalized them), other tables' renames
- * via the plain scope-aware walk (a cross-table predicate reference is
- * unreachable today — the memory backend rejects it at create time — kept for
- * symmetry with the canonical-body reconciler). After the create, the live
- * column-rename propagation rewrites the indexed columns and predicate, so a
- * re-diff converges. Identity when the diff carries no column renames.
- */
-function columnReconciledIndexStmt(
-	stmt: AST.CreateIndexStmt,
-	/** The index's own table's in-diff column renames. */
-	colRenames: ReadonlyArray<ColumnRenameOp>,
-	/** Declared (new) table name (lowercased) → that table's column renames. */
-	columnRenamesByTable: ReadonlyMap<string, ColumnRenameOp[]>,
-	schemaName: string,
-): AST.CreateIndexStmt {
-	if (columnRenamesByTable.size === 0) return stmt;
-
-	const columns: AST.IndexedColumn[] = stmt.columns.map(col => {
-		const bareName = indexedColumnBareName(col);
-		if (!bareName) return col;
-		const rename = colRenames.find(r => r.newName.toLowerCase() === bareName.toLowerCase());
-		if (!rename) return col;
-		if (col.name) return { ...col, name: rename.oldName };
-		// Collate-folded form: the bare name lives on col.expr.expr.name.
-		const collate = col.expr as AST.CollateExpr;
-		const inner = collate.expr as AST.ColumnExpr;
-		return { ...col, expr: { ...collate, expr: { ...inner, name: rename.oldName } } };
-	});
-
-	let where = stmt.where;
-	if (where) {
-		const clone = cloneExpr(where);
-		const resolveRef = singleSchemaObjectRefResolver(schemaName);
-		for (const r of colRenames) {
-			// 'none' on both predicate arms below, mirroring the forward rewrite:
-			// no written-row context in an index predicate.
-			renameColumnInCheckExpression(clone, stmt.table.name, r.newName, r.oldName,
-				resolveRef, objectRefKey(schemaName, stmt.table.name), 'none');
-		}
-		const ownTableLower = stmt.table.name.toLowerCase();
-		for (const [declaredTableName, renames] of columnRenamesByTable) {
-			if (declaredTableName === ownTableLower) continue;
-			for (const r of renames) {
-				renameColumnInAst(clone, declaredTableName, r.newName, r.oldName,
-					resolveRef, objectRefKey(schemaName, declaredTableName), 'none');
-			}
-		}
-		where = clone;
-	}
-
-	return { ...stmt, columns, where };
 }
 
 /**
@@ -3233,9 +3170,8 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	// create.
 	pushCreates(diff.tablesToCreate, 'table');
 	pushCreates(diff.viewsToCreate, 'view');
-	pushCreates(diff.indexesToCreate, 'index');
-	// Assertion creates do NOT go here — they run last, after the table alters and
-	// the maintained re-attaches. See the push at the end of this function.
+	// Index and assertion creates do NOT go here — they run last, after the table
+	// alters and the maintained re-attaches. See the pushes at the end of this function.
 
 	// Alter existing tables.
 	// Phase order within one table:
@@ -3383,6 +3319,14 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 	// create ran in the create block, before `ADD COLUMN`. Nothing in a migration
 	// depends on an assertion existing, so last is strictly safer. Assertion DROPs
 	// stay first (see the top of this function).
+	//
+	// Index creates ride here for the same reason: `CREATE INDEX` resolves its
+	// columns against the live table, so an index over a column this plan adds
+	// (`ADD COLUMN`) or renames (`RENAME COLUMN`, declared under the new name) must
+	// run after the alter block. Nothing in the alter block depends on a new index
+	// existing, and `DROP INDEX` stays early so a version that removes an index
+	// together with its column still works.
+	pushCreates(diff.indexesToCreate, 'index');
 	pushCreates(diff.assertionsToCreate, 'assertion');
 
 	// In-place tag changes on views / indexes. These are leaf metadata writes (no

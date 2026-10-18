@@ -66,10 +66,9 @@ declare schema main {
 
 -- run
 
--- The recreate names the OLD column (RENAME COLUMN runs after creates); the
--- propagation rewrites the fresh index's columns.
+-- The recreate names the NEW column (index creates run after RENAME COLUMN).
 diff schema main;
-→ [{"ddl": "DROP INDEX IF EXISTS irc_old"}, {"ddl": "create index irc_new on irc_t (amount) with tags (\"quereus.previous_name\" = 'irc_old')"}, {"ddl": "ALTER TABLE irc_t RENAME COLUMN amount TO qty"}]
+→ [{"ddl": "DROP INDEX IF EXISTS irc_old"}, {"ddl": "ALTER TABLE irc_t RENAME COLUMN amount TO qty"}, {"ddl": "create index irc_new on irc_t (qty) with tags (\"quereus.previous_name\" = 'irc_old')"}]
 
 apply schema main;
 

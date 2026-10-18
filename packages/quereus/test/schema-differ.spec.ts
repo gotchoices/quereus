@@ -1257,12 +1257,13 @@ describe('generateMigrationPlan / generateMigrationDDL parity', () => {
 	it('every create step carries the AST its DDL was rendered from', () => {
 		const plan = generateMigrationPlan(everyBucketDiff(), 'main');
 		const withAst = plan.filter(s => s.ast !== undefined);
-		// The four create buckets (1 each) + the `set maintained as` re-attach.
+		// The four create buckets (1 each) + the `set maintained as` re-attach. Index and
+		// assertion creates run after the alter block and the re-attach.
 		expect(withAst.map(s => s.sql), 'AST-carrying steps').to.deep.equal([
 			'create table fresh (id integer primary key, name text)',
 			'create view fresh_v as select id from fresh',
-			'create index idx_fresh on fresh (name)',
 			'alter table new_t set maintained (b) as select id from fresh',
+			'create index idx_fresh on fresh (name)',
 			'create assertion a1 check (not exists (select 1 from fresh where id < 0))',
 		]);
 	});

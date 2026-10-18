@@ -214,7 +214,7 @@ describe('apply schema restores the catalog when a migration fails partway', () 
 		beforeEach(async () => {
 			await db.exec(TABLE_T);
 			await db.exec("insert into t values (1, 'a')");
-			// create table n1, create index ix_v, then the failing ALTER TABLE t ADD COLUMN.
+			// create table n1, the failing ALTER TABLE t ADD COLUMN, then (never reached) create index ix_v.
 			await db.exec(`
 				declare schema main {
 					${FAILING_T}

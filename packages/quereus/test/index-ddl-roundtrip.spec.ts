@@ -1157,39 +1157,35 @@ describe('CREATE INDEX DDL round-trip: declarative differ stability', () => {
 		}
 	});
 
-	it('a renamed index over a concurrently-renamed column recreates under the OLD column name', async () => {
+	it('a renamed index over a concurrently-renamed column recreates under the NEW column name', async () => {
 		// The index is matched via its own previous_name hint (ix_old → ix_new) AND its
 		// referenced column is renamed (email → email_addr). The body reconcile still
 		// applies on the rename-matched index (no body drift), but the `kind: 'index'`
 		// rename op is metadata only — the convergence DDL is the hinted-rename
-		// drop+recreate, rendered with the in-diff column rename inverse-applied
-		// (creates precede RENAME COLUMN in migration order; the live propagation
-		// rewrites the fresh index afterwards).
+		// drop+recreate, rendered under the declared (post-rename) column
+		// names (index creates follow the RENAME COLUMN in migration order).
 		const base = `table t { id INTEGER PRIMARY KEY, email TEXT }\nindex ix_old on t (email)`;
 		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email') }\nindex ix_new on t (email_addr) with tags ("quereus.previous_name" = 'ix_old')`;
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'drop targets the actual (old) index name').to.deep.equal(['ix_old']);
 		expect(diff.indexesToCreate, 'one recreate under the declared name').to.have.length(1);
-		expect(diff.indexesToCreate[0].sql, 'recreate names the OLD column (RENAME COLUMN has not run yet)').to.match(/\(email\)/i);
-		expect(diff.indexesToCreate[0].sql, 'recreate does not name the NEW column').to.not.match(/email_addr/i);
+		expect(diff.indexesToCreate[0].sql, 'recreate names the NEW column (RENAME COLUMN has already run)').to.match(/\(email_addr\)/i);
 		expect(diff.renames, 'index rename op still recorded (metadata)').to.deep.include({ kind: 'index', oldName: 'ix_old', newName: 'ix_new' });
 		expect(diff.tablesToAlter[0].columnsToRename).to.deep.equal([{ oldName: 'email', newName: 'email_addr' }]);
 	});
 
-	it('a renamed PARTIAL index over collate-folded + predicate-referenced renamed columns recreates fully reconciled', async () => {
-		// The columnReconciledIndexStmt paths the plain re-pin above does not reach:
-		// an indexed column in the parser's collate-folded form (bare name on
-		// col.expr.expr.name, not col.name) and a partial WHERE predicate referencing
-		// a second renamed column (own-table seeded CHECK-expression walk). Both must
-		// render under the OLD names — RENAME COLUMN has not run at create time.
+	it('a renamed PARTIAL index over collate-folded + predicate-referenced renamed columns recreates under the declared names', async () => {
+		// The paths the plain re-pin above does not reach: an indexed column in the
+		// parser's collate-folded form and a partial WHERE predicate referencing a
+		// second renamed column. Both render under the NEW names — index creates run
+		// after RENAME COLUMN.
 		const base = `table t { id INTEGER PRIMARY KEY, email TEXT, active INTEGER }\nindex ix_old on t (email collate nocase) where active = 1`;
 		const mod = `table t { id INTEGER PRIMARY KEY, email_addr TEXT with tags ("quereus.previous_name" = 'email'), is_active INTEGER with tags ("quereus.previous_name" = 'active') }\nindex ix_new on t (email_addr collate nocase) where is_active = 1 with tags ("quereus.previous_name" = 'ix_old')`;
 		const diff = await diffIndexEdit(base, mod);
 		expect(diff.indexesToDrop, 'drop targets the actual (old) index name').to.deep.equal(['ix_old']);
 		expect(diff.indexesToCreate, 'one recreate under the declared name').to.have.length(1);
-		expect(diff.indexesToCreate[0].sql, 'collate-folded indexed column maps back to the OLD name').to.match(/email collate nocase/i);
-		expect(diff.indexesToCreate[0].sql, 'WHERE predicate names the OLD column').to.match(/where active = 1/i);
-		expect(diff.indexesToCreate[0].sql, 'no NEW names leak into the recreate').to.not.match(/email_addr|is_active/i);
+		expect(diff.indexesToCreate[0].sql, 'collate-folded indexed column keeps the NEW name').to.match(/email_addr collate nocase/i);
+		expect(diff.indexesToCreate[0].sql, 'WHERE predicate names the NEW column').to.match(/where is_active = 1/i);
 	});
 
 	it('a table rename with stable columns does not churn the index body', async () => {
