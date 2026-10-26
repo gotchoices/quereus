@@ -396,6 +396,31 @@ createScalarFunction(
   value. Fixing it is a one-word registration change.
 - A function supplying a `customEmitter` is never fused and is unaffected either way.
 
+#### Fresh scalar functions
+
+A function that returns a unique value on every call — a random id generator — can say so
+with `fresh: true`:
+
+```typescript
+createScalarFunction(
+  { name: 'stamp_id', numArgs: 0, fresh: true, returnType: TEXT_RETURN },
+  () => crypto.randomUUID()
+);
+```
+
+- **The promise:** every call returns a value unique with at least 128 bits of entropy,
+  *regardless of its arguments*. The engine does not verify it.
+- It sets `FunctionFlags.FRESH` and clears `DETERMINISTIC` — a fresh function is
+  non-deterministic by definition. `fresh: true` together with `deterministic: true` is a
+  contradiction and throws a `MisuseError` at registration. `db.createScalarFunction`
+  accepts the same option.
+- What it buys: the write-provenance analysis labels a value from a fresh call `fresh`
+  rather than `volatile`, telling a host that the value cannot collide with another
+  writer's (see [Change-scope § Written-value provenance](change-scope.md#written-value-provenance)).
+- No builtin carries the flag. `randomblob(n)` is unique only for `n ≥ 16`, which depends
+  on its argument, so the analysis applies a named rule instead: a literal `n ≥ 16` is
+  fresh, anything else is volatile. `random()` (64 bits) is never fresh.
+
 ### Table-Valued Functions
 
 Return multiple rows. The implementation is an **async generator** (its declared type is `(...args) => MaybePromise<AsyncIterable<Row>>`), and each row it yields is an **array of values in declared column order** — not an object keyed by column name:

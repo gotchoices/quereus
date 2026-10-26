@@ -25,6 +25,7 @@ import { SequenceNode } from '../nodes/sequence-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import { FunctionFlags } from '../../common/constants.js';
 import { extractBindings, type BindingMode } from './binding-extractor.js';
+import { classifyNonDetFunction } from './non-det-functions.js';
 import { relationKeyOf } from './relation-key.js';
 import { extractConstraintsForTable } from './constraint-extractor.js';
 import { planTimeLiteralValue } from './predicate-shape.js';
@@ -189,14 +190,6 @@ export interface WatchEvent {
 export type WatchHandler = (event: WatchEvent) => void | Promise<void>;
 
 /* --- Constants ----------------------------------------------------------- */
-
-const KNOWN_TIME_FUNCS = new Set([
-	'now', 'current_timestamp', 'current_time', 'current_date',
-	'date', 'time', 'datetime', 'julianday',
-	'epoch_s', 'epoch_ms', 'epoch_s_frac',
-	'strftime',
-]);
-const KNOWN_RANDOM_FUNCS = new Set(['random', 'randomblob']);
 
 const DML_NODE_TYPES = new Set<PlanNodeType>([
 	PlanNodeType.Update,
@@ -470,16 +463,7 @@ function collectNonDeterminism(
 	function visit(node: PlanNode): void {
 		if (node instanceof ScalarFunctionCallNode) {
 			const isDet = (node.functionSchema.flags & FunctionFlags.DETERMINISTIC) !== 0;
-			if (!isDet) {
-				const name = node.functionSchema.name.toLowerCase();
-				if (KNOWN_TIME_FUNCS.has(name)) {
-					out.push({ kind: 'time' });
-				} else if (KNOWN_RANDOM_FUNCS.has(name)) {
-					out.push({ kind: 'random' });
-				} else {
-					out.push({ kind: 'volatileUdf', name });
-				}
-			}
+			if (!isDet) out.push(classifyNonDetFunction(node.functionSchema.name));
 		}
 		if (node instanceof ParameterReferenceNode) {
 			const id = node.nameOrIndex;

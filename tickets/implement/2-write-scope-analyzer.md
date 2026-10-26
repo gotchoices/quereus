@@ -141,6 +141,8 @@ This placement is what lets the module-hook ticket serve the same object to a mo
 
 New `docs/write-scope.md` (Beta banner per `docs/stability.md`): the use case, the contract above with one worked example per operation, the conservative-by-construction rule (undecodable selection → `global`, undescribable value → `other`, unknown constraint reach → `cross-row`), the fresh-source rule and the `randomblob` special case, the self-independence definition and why it is not `idempotent`, the memo placement and the "analysis runs on the built logical shape" tradeoff, and known imprecisions. Cross-link from `docs/change-scope.md` (a short "Writes" paragraph pointing over), `docs/usage.md` next to the change-scope paragraph, `docs/architecture.md` beside its change-scope bullet, and the docs index in `packages/quereus/README.md`.
 
+The provenance rules (the six kinds, the rank join, the fresh-wrapper allowlist, the `randomblob` rule, context variables as inputs) already live in `docs/change-scope.md` § Written-value provenance, written by `write-scope-provenance` while there was no write-scope doc. Move that section into `docs/write-scope.md` and leave the "Writes" pointer in its place; `docs/plugins.md` § Fresh scalar functions and the header of `value-provenance.ts` link to it and need re-pointing.
+
 ## Tests
 
 One spec, `test/optimizer/write-scope-analyzer.spec.ts`, driven through `db.prepare(sql).getWriteScope()` (the public surface), with the cases named above. Each case asserts the fields that case is about, not the whole object, so a later refinement of an unrelated field does not break every case.

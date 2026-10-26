@@ -1585,7 +1585,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 * Registers a user-defined scalar function.
 	 *
 	 * @param name The name of the SQL function.
-	 * @param options Configuration: { numArgs: number, deterministic?: boolean, flags?: number }.
+	 * @param options Configuration: { numArgs: number, deterministic?: boolean, fresh?: boolean, flags?: number }.
+	 *   `fresh: true` declares every call unique with at least 128 bits of entropy (see
+	 *   `FunctionFlags.FRESH`); combining it with `deterministic: true` throws a MisuseError.
 	 * @param func The JavaScript function implementation.
 	 */
 	createScalarFunction(
@@ -1594,6 +1596,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			numArgs: number;
 			deterministic?: boolean;
 			replicable?: boolean;
+			fresh?: boolean;
 			flags?: number;
 			hidden?: boolean;
 		},
@@ -1605,7 +1608,10 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const flags = options.flags ?? baseFlags;
 
 		const schema = createScalarFunction(
-			{ name, numArgs: options.numArgs, flags, replicable: options.replicable, hidden: options.hidden },
+			{
+				name, numArgs: options.numArgs, flags, deterministic: options.deterministic, fresh: options.fresh,
+				replicable: options.replicable, hidden: options.hidden,
+			},
 			func
 		);
 

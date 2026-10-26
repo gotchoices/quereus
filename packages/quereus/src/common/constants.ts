@@ -7,6 +7,13 @@ export enum FunctionFlags {
 	DETERMINISTIC = 0x000000800,
 	DIRECTONLY = 0x000080000,
 	INNOCUOUS = 0x000200000,
+	/**
+	 * Every call returns a value unique with at least 128 bits of entropy, regardless of
+	 * arguments (a random id generator). A registrant's promise the engine does not verify;
+	 * never combined with DETERMINISTIC. Read by the written-value provenance classifier
+	 * (`planner/analysis/value-provenance.ts`).
+	 */
+	FRESH = 0x000400000,
 	// Add others if needed (SUBTYPE, etc.)
 }
 

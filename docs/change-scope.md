@@ -330,6 +330,59 @@ describes more.
   Even when the MV's body keys on a source PK or group key, the projected scope
   does not yet narrow to those rows/groups — sound but coarse.
 
+## Written-value provenance
+
+A change scope describes what a statement *reads*. The groundwork for describing what
+a write statement *writes* is an internal classifier
+(`planner/analysis/value-provenance.ts`, no public API yet) that labels every value a
+write produces with where it comes from. The question each label answers for a host
+predicting conflicts between queued writes: *could a second writer, acting on newer
+state, make this value collide or go stale?*
+
+| Kind | Meaning | Example |
+| --- | --- | --- |
+| `literal` | A constant. Carries `value` when the expression is a single literal (as written, before conversion to the column's declared type). | `values (1)` |
+| `input` | A deterministic function of bound parameters and mutation-context variables. Lists the `parameters` and `contexts` read. | `set x = :p` |
+| `fresh` | Unique per call with at least 128 bits of entropy. Names the fresh `function`. | `default (randomblob(16))` |
+| `volatile` | Depends on a clock, a non-fresh random source, or a volatile UDF. Lists the `sources` (the `NonDetSource` shape above). | `random()` |
+| `self` | Depends on the target row's own previous values. Lists the `columns` read. | `set n = n + 1` |
+| `other` | Depends on other rows, or on anything the classifier cannot describe. | `set x = (select max(x) from t)` |
+
+Written columns: an INSERT reports every table column in schema order — supplied values,
+literal and expression defaults, and generated columns alike. An UPDATE reports each
+assignment in order, including generated-column recomputes; an upsert's `do update` arm
+reports its assignments, where `new.<col>` reads resolve to the insert row's provenance
+and bare column reads are `self`.
+
+How a compound expression is classified:
+
+- **Rank join.** An operator or deterministic function takes the highest kind among its
+  operands, in the order `literal < input < fresh < volatile < self < other`, unioning
+  that kind's detail lists. A computed constant keeps no `value`. Multi-row `values` join
+  each column across rows the same way (two equal literals keep their `value`).
+- **Fresh survives only injective wrappers.** A function of a unique value is unique only
+  when the function is injective, so a `fresh` operand stays `fresh` only under `hex`,
+  `lower`, `upper`, `cast`, or `||` against a literal, and only when it is the wrapper's
+  sole non-literal operand: `hex(randomblob(16))` is `fresh`; `substr(randomblob(16), 1, 4)`,
+  `randomblob(16) || :p` and `abs(stamp_id())` are `other`. Multi-row `values` keep a
+  column `fresh` only when every row calls the same fresh function.
+- **Fresh sources.** A function registered with `fresh: true` (see
+  [Plugins § Fresh scalar functions](plugins.md#fresh-scalar-functions)). No builtin is
+  flagged; instead one named rule: `randomblob(n)` with a literal integer `n ≥ 16` is
+  `fresh`, any other `randomblob` call is `volatile` with source `random`. `random()`
+  (64 bits) is never fresh.
+- **Context variables are inputs.** A read of a `with context` variable is `input` with
+  that variable in `contexts`, whatever the statement's definition of it — the variable is
+  evaluated once per statement, so a host that needs to know whether the definition was
+  itself volatile classifies the definition from the statement text.
+- **Planner conversions are transparent.** The write-path type conversion the insert
+  builder wraps around produced cells, and `collate`, do not change the label.
+- **Conservative fallback.** A column of an INSERT … SELECT source, a join side, a CTE,
+  a subquery, or an attribute the classifier cannot resolve is `other`; it never throws.
+  The walk follows only the projection chain the insert builder stacks over `values` or
+  the SELECT's top projection, so a SELECT ending in `order by` / `limit` classifies all
+  its columns `other`.
+
 ## Watcher
 
 `Database.watch(scope, handler)` registers a post-commit callback

@@ -22,6 +22,10 @@ interface ScalarFuncOptions {
 	/** Whether the function is REPLICABLE — bit-identical across peers/platforms/app
 	 *  versions (stronger than deterministic). See {@link import('../schema/function.js').BaseFunctionSchema.replicable}. */
 	replicable?: boolean;
+	/** Every call returns a unique value with at least 128 bits of entropy, regardless of
+	 *  arguments (a random id generator). Sets {@link FunctionFlags.FRESH} and clears
+	 *  DETERMINISTIC; contradicts `deterministic: true`, which is rejected. */
+	fresh?: boolean;
 	/** The implementation may return a Promise. Omitting it declares the function
 	 *  synchronous, which lets the engine fuse its calls into a direct closure. Only
 	 *  needed for a promise-returning function that is not declared `async` (an `async`
@@ -364,6 +368,16 @@ export function normalizeFunctionSchema<T extends FunctionSchema>(schema: T): T 
 	}
 }
 
+/** Resolve a scalar function's flags: explicit `flags`, else UTF8 plus DETERMINISTIC unless opted out; `fresh` then sets FRESH and clears DETERMINISTIC. */
+function scalarFunctionFlags(options: ScalarFuncOptions): FunctionFlags {
+	const flags = options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0));
+	if (!options.fresh) return flags;
+	if (options.deterministic === true) {
+		throw new MisuseError(`Function '${options.name}/${options.numArgs}': 'fresh' and 'deterministic' contradict — a fresh function returns a different value on every call`);
+	}
+	return (flags | FunctionFlags.FRESH) & ~FunctionFlags.DETERMINISTIC;
+}
+
 /**
  * Creates a function schema for a scalar SQL function.
  * This is the primary way to register scalar functions in Quereus.
@@ -378,7 +392,7 @@ export function createScalarFunction(options: ScalarFuncOptions, jsFunc: ScalarF
 	return normalizeFunctionSchema({
 		name: options.name,
 		numArgs: options.numArgs,
-		flags: options.flags ?? (FunctionFlags.UTF8 | (options.deterministic !== false ? FunctionFlags.DETERMINISTIC : 0)),
+		flags: scalarFunctionFlags(options),
 		returnType: options.returnType ?? UNKNOWN_SCALAR_RETURN,
 		implementation: jsFunc,
 		replicable: options.replicable,

@@ -1340,6 +1340,10 @@ db.createScalarFunction("reverse", { numArgs: 1, deterministic: true },
 const result = await db.prepare("select reverse(name) from users").all();
 ```
 
+- **`deterministic`** — same arguments, same result (default `false` here); lets the planner fold and cache calls.
+- **`replicable`** — bit-identical across peers, platforms, and app versions (stronger than deterministic). Consulted by the materialized-view gate when a backing host declares `requiresReplicableDerivations`.
+- **`fresh`** — every call returns a unique value with at least 128 bits of entropy, regardless of arguments (a random id generator). Contradicts `deterministic: true`, which throws. See [Plugins § Fresh scalar functions](plugins.md#fresh-scalar-functions).
+
 `db.createScalarFunction` takes a **synchronous** implementation. An asynchronous one —
 or any implementation that returns a Promise — is registered by building the schema with
 `createScalarFunction` from `@quereus/quereus` and passing it to `db.registerFunction`;

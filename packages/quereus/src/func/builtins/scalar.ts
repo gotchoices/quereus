@@ -256,6 +256,9 @@ export const randomFunc = createScalarFunction(
 );
 
 // --- randomblob(N) ---
+// Not flagged FRESH: uniqueness depends on N. The written-value provenance classifier
+// (planner/analysis/value-provenance.ts) instead treats a call with a literal N ≥ 16 as
+// fresh, which relies on every returned byte being independently random.
 export const randomblobFunc = createScalarFunction(
 	{ name: 'randomblob', numArgs: 1, deterministic: false, returnType: BLOB_RETURN },
 	(nVal: SqlValue): SqlValue => {
