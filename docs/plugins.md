@@ -417,6 +417,10 @@ createScalarFunction(
 - What it buys: the write-provenance analysis labels a value from a fresh call `fresh`
   rather than `volatile`, telling a host that the value cannot collide with another
   writer's (see [Change-scope § Written-value provenance](change-scope.md#written-value-provenance)).
+- Declare the `returnType`, especially for a blob-returning function. Decoding a blob to
+  text is lossy, so a `fresh` blob stays `fresh` only under `hex` (not `||`, `lower`,
+  `upper`, `cast(... as text)`, or a write to a `text` column). An untyped function's
+  result is trusted not to be a blob.
 - No builtin carries the flag. `randomblob(n)` is unique only for `n ≥ 16`, which depends
   on its argument, so the analysis applies a named rule instead: a literal `n ≥ 16` is
   fresh, anything else is volatile. `random()` (64 bits) is never fresh.

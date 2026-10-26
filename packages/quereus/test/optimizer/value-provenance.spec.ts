@@ -57,9 +57,10 @@ const isExecutor = (n: PlanNode): n is DmlExecutorNode => n instanceof DmlExecut
 function writtenColumns(db: Database, sql: string): WrittenColumn[] {
 	const plan = builtPlan(db, sql);
 	if (/^\s*update\b/i.test(sql)) return classifyUpdateColumns(findNode(plan, isUpdate));
-	const insertColumns = classifyInsertColumns(findNode(plan, isInsert));
+	const insert = findNode(plan, isInsert);
+	const insertColumns = classifyInsertColumns(insert);
 	const clauses = findNode(plan, isExecutor).upsertClauses;
-	return clauses ? classifyUpsertUpdateColumns(clauses[0], insertColumns) : insertColumns;
+	return clauses ? classifyUpsertUpdateColumns(clauses[0], insert.table.tableSchema, insertColumns) : insertColumns;
 }
 
 const input = (parameters: Array<number | string>, contexts: string[] = []): ValueProvenance =>
@@ -77,6 +78,11 @@ const CASES: ReadonlyArray<ProvenanceCase> = [
 		name: 'literal and parameter cells',
 		sql: `insert into t (id, v) values (1, :p)`,
 		expected: { id: { kind: 'literal', value: 1 }, v: input(['p']) },
+	},
+	{
+		name: 'the write conversion: a literal reports its stored form, a fresh blob decoded into a text column is other',
+		sql: `insert into t (id, v) values ('7', randomblob(16))`,
+		expected: { id: { kind: 'literal', value: 7 }, v: { kind: 'other' } },
 	},
 	{
 		name: 'multi-row VALUES joins per column: distinct literals drop the value, literal with input is input',
@@ -109,6 +115,11 @@ const CASES: ReadonlyArray<ProvenanceCase> = [
 		expected: { k: { kind: 'fresh', function: 'randomblob' } },
 	},
 	{
+		name: 'cast keeps a fresh blob fresh only when lossless: to blob yes, to text no',
+		sql: `insert into r (id, k, j) values (1, cast(randomblob(16) as text), cast(randomblob(16) as blob))`,
+		expected: { k: { kind: 'other' }, j: { kind: 'fresh', function: 'randomblob' } },
+	},
+	{
 		name: 'a non-injective function of a fresh value is other',
 		sql: `insert into r (id, k) values (1, substr(randomblob(16), 1, 4))`,
 		expected: { k: { kind: 'other' } },
@@ -137,6 +148,11 @@ const CASES: ReadonlyArray<ProvenanceCase> = [
 		name: 'set x = :p is input',
 		sql: `update t set v = :p where id = 1`,
 		expected: { v: input(['p']) },
+	},
+	{
+		name: 'UPDATE assignments go through the same write conversion as inserted cells',
+		sql: `update t set id = '8', v = randomblob(16) where id = 1`,
+		expected: { id: { kind: 'literal', value: 8 }, v: { kind: 'other' } },
 	},
 	{
 		name: 'set from a subquery over other rows is other',

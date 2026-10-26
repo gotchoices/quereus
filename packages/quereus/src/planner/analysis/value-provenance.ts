@@ -13,6 +13,10 @@
  */
 import type { SqlValue } from '../../common/types.js';
 import { FunctionFlags } from '../../common/constants.js';
+import { createLogger } from '../../common/logger.js';
+import { PhysicalType, type LogicalType } from '../../types/logical-type.js';
+import { ANY_TYPE, BLOB_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
+import { buildCellCoercion } from '../../types/validation.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import type { RelationalPlanNode, RowDescriptor, ScalarPlanNode, Attribute } from '../nodes/plan-node.js';
 import type { ColumnReferenceNode, ParameterReferenceNode } from '../nodes/reference.js';
@@ -24,13 +28,17 @@ import type { ValuesNode } from '../nodes/values-node.js';
 import type { InsertNode } from '../nodes/insert-node.js';
 import type { UpdateNode } from '../nodes/update-node.js';
 import type { UpsertClausePlan } from '../nodes/dml-executor-node.js';
+import type { ColumnSchema } from '../../schema/column.js';
+import type { TableSchema } from '../../schema/table.js';
 import type { NonDetSource } from './change-scope.js';
 import { classifyNonDetFunction } from './non-det-functions.js';
 import { planTimeLiteralValue } from './predicate-shape.js';
 import { sqlValueIdentical } from '../../util/comparison.js';
 
+const log = createLogger('planner:analysis:value-provenance');
+
 export type ValueProvenance =
-	/** A constant. `value` is present when the expression is a single literal — reported as written in the statement, before conversion to the column's declared type; absent when several literals were joined (multi-row VALUES) or the constant is computed from literals. */
+	/** A constant. `value` is present when the expression is a single literal — reported as the write stores it, after conversion to the column's declared type (`'1'` into an integer column is `1`); absent when several different literals were joined (multi-row VALUES), the constant is computed from literals, or the conversion rejects the literal. */
 	| { readonly kind: 'literal'; readonly value?: SqlValue }
 	/** A deterministic function of statement inputs and literals: bound parameters and/or mutation-context variables (`with context`). */
 	| { readonly kind: 'input'; readonly parameters: ReadonlyArray<number | string>; readonly contexts: ReadonlyArray<string> }
@@ -70,8 +78,12 @@ export interface ProvenanceEnv {
  * Operators that keep a `fresh` operand fresh: injective over the values a fresh source
  * produces, so a unique input stays unique. Holds only when the fresh operand is the
  * operator's single non-literal operand (`||` qualifies only against a literal).
- * `WriteCoercion` and `Collate` are not listed because the classifier looks through them
- * entirely (see {@link classifyExpression}).
+ *
+ * Only `hex` is injective over a blob. The others render a blob operand as text first,
+ * and that decode is non-fatal — invalid UTF-8 collapses to U+FFFD (`util/value-text.ts`)
+ * — so over a statically blob-typed fresh operand they yield `other`. A `cast`, and the
+ * planner's write coercion (otherwise looked through, like `collate`), keep `fresh` only
+ * across a lossless conversion: see {@link conversionKeepsFresh}.
  *
  * NOTE: `lower` / `upper` are injective only over single-case text — they are listed for
  * the common `lower(hex(randomblob(16)))` id spelling. Revisit when a module needs another
@@ -79,6 +91,8 @@ export interface ProvenanceEnv {
  */
 export const FRESH_PRESERVING_WRAPPERS = {
 	functions: new Set(['hex', 'lower', 'upper']),
+	/** The subset of `functions` injective over a blob operand too. */
+	blobSafeFunctions: new Set(['hex']),
 	nodeTypes: new Set<PlanNodeType>([PlanNodeType.Cast]),
 	binaryOperators: new Set(['||']),
 } as const;
@@ -112,10 +126,7 @@ export function classifyExpression(expr: ScalarPlanNode, env: ProvenanceEnv): Va
 		case PlanNodeType.ScalarFunctionCall:
 			return classifyFunctionCall(expr as ScalarFunctionCallNode, env);
 		case PlanNodeType.WriteCoercion:
-			// The planner's conversion of a produced cell to its column's declared type —
-			// the insert builder wraps nearly every cell in one. It does not change which
-			// value is written, so a literal keeps its `value` through it.
-			return classifyExpression((expr as WriteCoercionNode).operand, env);
+			return classifyWriteCoercion(expr as WriteCoercionNode, env);
 		case PlanNodeType.Collate:
 			// Identity on the value: only the comparison collation changes.
 			return classifyExpression((expr as CollateNode).operand, env);
@@ -125,6 +136,63 @@ export function classifyExpression(expr: ScalarPlanNode, env: ProvenanceEnv): Va
 			// ScalarSubquery / Exists read other rows; anything else is undescribable.
 			return OPERATOR_NODE_TYPES.has(expr.nodeType) ? classifyOperator(expr, env) : OTHER;
 	}
+}
+
+/**
+ * The planner's conversion of an inserted cell to its column's declared type. The insert
+ * builder wraps nearly every cell in one, so it is not an operator (that would strip
+ * `value` from almost every inserted literal).
+ */
+function classifyWriteCoercion(node: WriteCoercionNode, env: ProvenanceEnv): ValueProvenance {
+	const operand = classifyExpression(node.operand, env);
+	return afterWriteConversion(operand, node.operand.getType().logicalType, node.targetType.logicalType, node.columnName);
+}
+
+/**
+ * `provenance` of a value of static type `from` once the write converts it to a column of
+ * declared type `to` (`buildCellCoercion` — the insert path's write coercion and the
+ * UPDATE / DO UPDATE assignment conversion alike): a literal's `value` becomes its stored
+ * form, and a fresh value stays fresh only across a lossless conversion.
+ */
+function afterWriteConversion(provenance: ValueProvenance, from: LogicalType, to: LogicalType, columnName: string): ValueProvenance {
+	switch (provenance.kind) {
+		case 'fresh':
+			return conversionKeepsFresh(from, to) ? provenance : OTHER;
+		case 'literal':
+			return provenance.value === undefined ? provenance : writtenLiteral(provenance.value, from, to, columnName);
+		default:
+			return provenance;
+	}
+}
+
+function writtenLiteral(value: SqlValue, from: LogicalType, to: LogicalType, columnName: string): ValueProvenance {
+	const coerce = buildCellCoercion(from, to, columnName);
+	if (!coerce) return { kind: 'literal', value };
+	try {
+		return { kind: 'literal', value: coerce(value) };
+	} catch (e) {
+		// The write raises this same mismatch when the statement runs; until then there is
+		// no stored value to report.
+		log('literal for column %s does not convert to its declared type: %s', columnName, e instanceof Error ? e.message : String(e));
+		return { kind: 'literal' };
+	}
+}
+
+/**
+ * Whether converting a fresh value of static type `from` to `to` keeps it unique. Identity
+ * and text→blob (UTF-8 encoding) do; blob→text decodes non-fatally, and a numeric,
+ * temporal or JSON parse normalizes, so neither does. A source of unknown type (`ANY` —
+ * e.g. a function registered without a return type) is trusted on the registrant's promise.
+ *
+ * NOTE: so an untyped fresh function returning a blob, written to a text column, stays
+ * `fresh` although the decode is lossy. Revisit if `fresh: true` comes to require a
+ * declared return type.
+ */
+function conversionKeepsFresh(from: LogicalType, to: LogicalType): boolean {
+	if (from === to || from === ANY_TYPE || to === ANY_TYPE) return true;
+	if (to === TEXT_TYPE) return from.physicalType === PhysicalType.TEXT;
+	if (to === BLOB_TYPE) return from.physicalType === PhysicalType.TEXT || from.physicalType === PhysicalType.BLOB;
+	return false;
 }
 
 function classifyColumnReference(ref: ColumnReferenceNode, env: ProvenanceEnv): ValueProvenance {
@@ -161,17 +229,25 @@ function isFreshRandomblobLength(operands: ReadonlyArray<ScalarPlanNode>): boole
 function classifyOperator(expr: ScalarPlanNode, env: ProvenanceEnv): ValueProvenance {
 	const children = expr.getChildren() as ReadonlyArray<ScalarPlanNode>;
 	const operands = children.map(child => classifyExpression(child, env));
-	return combineOperands(operands, isFreshPreservingWrapper(expr));
+	const freshIndex = operands.findIndex(p => p.kind === 'fresh');
+	return combineOperands(operands, freshIndex >= 0 && wrapperKeepsFresh(expr, children[freshIndex]));
 }
 
-function isFreshPreservingWrapper(expr: ScalarPlanNode): boolean {
+/** Whether `expr` is a fresh-preserving wrapper over its operand `freshOperand`. */
+function wrapperKeepsFresh(expr: ScalarPlanNode, freshOperand: ScalarPlanNode): boolean {
+	const operandType = freshOperand.getType().logicalType;
+	const isBlob = operandType.physicalType === PhysicalType.BLOB;
 	switch (expr.nodeType) {
-		case PlanNodeType.ScalarFunctionCall:
-			return FRESH_PRESERVING_WRAPPERS.functions.has((expr as ScalarFunctionCallNode).functionSchema.name.toLowerCase());
+		case PlanNodeType.ScalarFunctionCall: {
+			const name = (expr as ScalarFunctionCallNode).functionSchema.name.toLowerCase();
+			return FRESH_PRESERVING_WRAPPERS.functions.has(name)
+				&& (!isBlob || FRESH_PRESERVING_WRAPPERS.blobSafeFunctions.has(name));
+		}
 		case PlanNodeType.BinaryOp:
-			return FRESH_PRESERVING_WRAPPERS.binaryOperators.has((expr as BinaryOpNode).expression.operator);
+			return !isBlob && FRESH_PRESERVING_WRAPPERS.binaryOperators.has((expr as BinaryOpNode).expression.operator);
 		default:
-			return FRESH_PRESERVING_WRAPPERS.nodeTypes.has(expr.nodeType);
+			return FRESH_PRESERVING_WRAPPERS.nodeTypes.has(expr.nodeType)
+				&& conversionKeepsFresh(operandType, expr.getType().logicalType);
 	}
 }
 
@@ -334,19 +410,28 @@ function descriptorColumns(descriptor: RowDescriptor | undefined, columnNames: R
  * assigned resolves to that assignment's provenance instead.
  */
 function classifyAssignments(
-	assignments: ReadonlyArray<{ readonly column: string; readonly value: ScalarPlanNode; readonly isGenerated: boolean }>,
+	assignments: ReadonlyArray<Assignment>,
 	baseEnv: ProvenanceEnv,
 	selfAttributeColumns: ReadonlyMap<number, string>,
 ): WrittenColumn[] {
 	const written: WrittenColumn[] = [];
 	const assigned = new Map<string, ValueProvenance>();
-	for (const { column, value, isGenerated } of assignments) {
+	for (const { target, value, isGenerated } of assignments) {
+		const column = target.name.toLowerCase();
 		const env = isGenerated ? postAssignmentEnv(baseEnv, selfAttributeColumns, assigned) : baseEnv;
-		const provenance = classifyExpression(value, env);
+		// Assignments carry no write-coercion node; the executor converts each value to
+		// the column's declared type before storing it (and before a generated column reads it).
+		const provenance = afterWriteConversion(classifyExpression(value, env), value.getType().logicalType, target.logicalType, target.name);
 		assigned.set(column, provenance);
 		written.push({ column, provenance });
 	}
 	return written;
+}
+
+interface Assignment {
+	readonly target: ColumnSchema;
+	readonly value: ScalarPlanNode;
+	readonly isGenerated: boolean;
 }
 
 function postAssignmentEnv(
@@ -377,7 +462,7 @@ export function classifyInsertColumns(node: InsertNode): WrittenColumn[] {
 
 /** One entry per assignment (user SETs, then generated recomputes), in assignment order. */
 export function classifyUpdateColumns(node: UpdateNode): WrittenColumn[] {
-	const columns = node.table.tableSchema.columns;
+	const { columns, columnIndexMap } = node.table.tableSchema;
 	// SET and WHERE bind to the source relation's attributes — the target row's previous values.
 	const selfAttributeColumns = new Map<number, string>();
 	node.source.getAttributes().forEach((attr, i) => {
@@ -385,25 +470,25 @@ export function classifyUpdateColumns(node: UpdateNode): WrittenColumn[] {
 	});
 	const attributes = contextBindings(node.contextAttributes);
 	for (const [attrId, column] of selfAttributeColumns) attributes.set(attrId, { kind: 'self', column });
-	const assignments = node.assignments.map(a => ({
-		column: a.targetColumn.name.toLowerCase(),
-		value: a.value,
-		isGenerated: a.isGenerated === true,
-	}));
+	const assignments = node.assignments.flatMap(a => {
+		const target = columns[columnIndexMap.get(a.targetColumn.name.toLowerCase()) ?? -1] as ColumnSchema | undefined;
+		return target ? [{ target, value: a.value, isGenerated: a.isGenerated === true }] : [];
+	});
 	return classifyAssignments(assignments, { attributes }, selfAttributeColumns);
 }
 
 /**
- * The DO UPDATE arm's assignments (empty for DO NOTHING). `insertColumns` is the
- * statement's {@link classifyInsertColumns} result — schema-ordered, so it also names
- * each column index. NEW references resolve to it; existing-row references are `self`.
+ * The DO UPDATE arm's assignments (empty for DO NOTHING) on `table`, the statement's
+ * target. `insertColumns` is the statement's {@link classifyInsertColumns} result: NEW
+ * references resolve to it; existing-row references are `self`.
  */
 export function classifyUpsertUpdateColumns(
 	clause: UpsertClausePlan,
+	table: TableSchema,
 	insertColumns: ReadonlyArray<WrittenColumn>,
 ): WrittenColumn[] {
 	if (clause.action !== 'update' || !clause.assignments) return [];
-	const columnNames = insertColumns.map(c => c.column);
+	const columnNames = table.columns.map(c => c.name.toLowerCase());
 	const selfAttributeColumns = descriptorColumns(clause.existingRowDescriptor, columnNames);
 	const attributes = new Map<number, AttributeBinding>();
 	for (const [attrId, column] of descriptorColumns(clause.newRowDescriptor, columnNames)) {
@@ -415,10 +500,9 @@ export function classifyUpsertUpdateColumns(
 		newColumns: new Map(insertColumns.map(c => [c.column, c.provenance])),
 	};
 	const generated = new Set(clause.generatedAssignmentColumns ?? []);
-	const assignments = [...clause.assignments].map(([colIdx, value]) => ({
-		column: columnNames[colIdx] ?? String(colIdx),
-		value,
-		isGenerated: generated.has(colIdx),
-	}));
+	const assignments = [...clause.assignments].flatMap(([colIdx, value]) => {
+		const target = table.columns[colIdx] as ColumnSchema | undefined;
+		return target ? [{ target, value, isGenerated: generated.has(colIdx) }] : [];
+	});
 	return classifyAssignments(assignments, env, selfAttributeColumns);
 }

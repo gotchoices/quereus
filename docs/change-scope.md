@@ -341,7 +341,7 @@ state, make this value collide or go stale?*
 
 | Kind | Meaning | Example |
 | --- | --- | --- |
-| `literal` | A constant. Carries `value` when the expression is a single literal (as written, before conversion to the column's declared type). | `values (1)` |
+| `literal` | A constant. Carries `value` when the expression is a single literal — as stored, after conversion to the column's declared type (`'1'` into an integer column is `1`). | `values (1)` |
 | `input` | A deterministic function of bound parameters and mutation-context variables. Lists the `parameters` and `contexts` read. | `set x = :p` |
 | `fresh` | Unique per call with at least 128 bits of entropy. Names the fresh `function`. | `default (randomblob(16))` |
 | `volatile` | Depends on a clock, a non-fresh random source, or a volatile UDF. Lists the `sources` (the `NonDetSource` shape above). | `random()` |
@@ -364,8 +364,11 @@ How a compound expression is classified:
   when the function is injective, so a `fresh` operand stays `fresh` only under `hex`,
   `lower`, `upper`, `cast`, or `||` against a literal, and only when it is the wrapper's
   sole non-literal operand: `hex(randomblob(16))` is `fresh`; `substr(randomblob(16), 1, 4)`,
-  `randomblob(16) || :p` and `abs(stamp_id())` are `other`. Multi-row `values` keep a
-  column `fresh` only when every row calls the same fresh function.
+  `randomblob(16) || :p` and `abs(stamp_id())` are `other`. Only `hex` is injective over a
+  blob: the others first render a blob as text, a non-fatal UTF-8 decode that collapses
+  invalid bytes to U+FFFD, so `randomblob(16) || 'x'` and `cast(randomblob(16) as text)`
+  are `other` (a fresh function declared without a return type is trusted). Multi-row
+  `values` keep a column `fresh` only when every row calls the same fresh function.
 - **Fresh sources.** A function registered with `fresh: true` (see
   [Plugins § Fresh scalar functions](plugins.md#fresh-scalar-functions)). No builtin is
   flagged; instead one named rule: `randomblob(n)` with a literal integer `n ≥ 16` is
@@ -375,8 +378,12 @@ How a compound expression is classified:
   that variable in `contexts`, whatever the statement's definition of it — the variable is
   evaluated once per statement, so a host that needs to know whether the definition was
   itself volatile classifies the definition from the statement text.
-- **Planner conversions are transparent.** The write-path type conversion the insert
-  builder wraps around produced cells, and `collate`, do not change the label.
+- **The write conversion keeps the label.** Converting a written value (an inserted cell or
+  an assigned one) to its column's declared type does not change its kind, except that a
+  `fresh` value becomes `other` when the conversion is lossy (anything but identity, a
+  conversion from or to an untyped value, or text to blob) — a fresh blob written to a
+  `text` column, for one. A literal reports the converted `value`, or none when the
+  conversion rejects it. `collate` never changes the label.
 - **Conservative fallback.** A column of an INSERT … SELECT source, a join side, a CTE,
   a subquery, or an attribute the classifier cannot resolve is `other`; it never throws.
   The walk follows only the projection chain the insert builder stacks over `values` or
