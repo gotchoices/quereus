@@ -1054,6 +1054,32 @@ on that table as if the whole table changed. It is coarse by design
 (table-granular, no key narrowing); see the *External / out-of-band
 changes* section of [change-scope.md](change-scope.md).
 
+## Write-scope introspection
+
+> **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
+
+`Statement.getWriteScope(params?)` is the write-side counterpart: for an
+INSERT, UPDATE or DELETE it returns a JSON-serializable `WriteScope` describing
+which rows the statement targets and how it chose them, where each written
+value comes from (a literal, a parameter, a fresh id, a clock, the row's own
+previous value, other rows), what else it reads, which constraints could reject
+it, and whether re-applying it to its own result would change anything. A
+statement with no write returns empty `writes`. Bound parameters resolve the
+selection's placeholders the same way `getChangeScope` resolves a watch's. See
+[Write-scope Documentation](write-scope.md) for the contract.
+
+```typescript
+import { bindWriteParameters, serializeWriteScope } from '@quereus/quereus';
+
+const stmt = db.prepare('update orders set total = total + :delta where id = :id');
+const scope = stmt.getWriteScope();
+scope.writes[0].selection;        // { kind: 'rows', key: ['id'], values: [[<param id>]] }
+scope.writes[0].columns;          // [{ column: 'total', provenance: { kind: 'self', columns: ['total'] } }]
+scope.writes[0].selfIndependent;  // false — the new total depends on the old one
+const bound = bindWriteParameters(scope, { id: 7, delta: 1 });
+JSON.stringify(serializeWriteScope(bound));
+```
+
 ## Virtual Tables
 
 One of Quereus's key features is its support for virtual tables, which allow you to expose any data source as a SQL table.

@@ -456,6 +456,25 @@ export {
 	scalarTypeFromPortable,
 } from './planner/analysis/change-scope.js';
 
+// Write-scope introspection
+export type {
+	WriteScope,
+	TableWrite,
+	WriteDisposition,
+	UpsertClause,
+	TargetSelection,
+	WriteConstraint,
+	WrittenColumn,
+	ValueProvenance,
+	SerializedWriteScope,
+	SerializedTableWrite,
+} from './planner/analysis/write-scope.js';
+export {
+	bindWriteParameters,
+	serializeWriteScope,
+	deserializeWriteScope,
+} from './planner/analysis/write-scope.js';
+
 // Debug and development utilities
 export { serializePlanTree, formatPlanTree, formatPlanSummary, serializePlanTreeWithOptions } from './planner/debug.js';
 export type { PlanDisplayOptions } from './planner/debug.js';

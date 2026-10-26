@@ -17,6 +17,7 @@ import { ReturningNode, type ReturningProjection } from '../nodes/returning-node
 import { expandReturningStar } from './returning-star.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
+import { WriteSiteAnalysis } from '../analysis/write-site-analysis.js';
 import { buildConstraintChecks } from './constraint-builder.js';
 import { columnSchemaToScalarType } from '../type-utils.js';
 import { buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
@@ -267,7 +268,15 @@ export function buildDeleteStmt(
     contextAttributes.length > 0 ? contextAttributes : undefined,
     contextDescriptor,
     undefined, // upsertClauses — DELETE has none
-    lensRouted
+    lensRouted,
+    undefined, // upsertUpdateValidation — INSERT only
+    new WriteSiteAnalysis({
+      check: constraintCheckNode,
+      table: tableReference,
+      operation: 'delete',
+      onConflict: undefined,
+      upsertClauses: undefined,
+    })
   );
 
   const resultNode: RelationalPlanNode = dmlExecutorNode;

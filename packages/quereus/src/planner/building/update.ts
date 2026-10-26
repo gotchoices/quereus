@@ -2,6 +2,7 @@ import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { UpdateNode, type UpdateAssignment } from '../nodes/update-node.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
+import { WriteSiteAnalysis } from '../analysis/write-site-analysis.js';
 import { buildTableReference } from './table.js';
 import { buildExpression } from './expression.js';
 import { PlanNode, type RelationalPlanNode, type ScalarPlanNode, type RowDescriptor } from '../nodes/plan-node.js';
@@ -10,7 +11,7 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import { RegisteredScope } from '../scopes/registered.js';
 import { AliasedScope } from '../scopes/aliased.js';
-import { ColumnReferenceNode } from '../nodes/reference.js';
+import { ColumnReferenceNode, type TableReferenceNode } from '../nodes/reference.js';
 import { SinkNode } from '../nodes/sink-node.js';
 import { ConstraintCheckNode } from '../nodes/constraint-check-node.js';
 import { RowOpFlag, type RowConstraintSchema } from '../../schema/table.js';
@@ -423,7 +424,9 @@ export function buildUpdateStmt(
       contextAttributes.length > 0 ? contextAttributes : undefined,
       contextDescriptor,
       undefined, // upsertClauses — UPDATE has none
-      lensRouted
+      lensRouted,
+      undefined, // upsertUpdateValidation — INSERT only
+      updateWriteSite(constraintCheckNode, tableReference)
     );
 
     // Return the RETURNING results from the executed update
@@ -472,8 +475,15 @@ export function buildUpdateStmt(
     contextAttributes.length > 0 ? contextAttributes : undefined,
     contextDescriptor,
     undefined, // upsertClauses — UPDATE has none
-    lensRouted
+    lensRouted,
+    undefined, // upsertUpdateValidation — INSERT only
+    updateWriteSite(constraintCheckNode, tableReference)
   );
 
   return new SinkNode(updateCtx.scope, updateExecutorNode, 'update');
+}
+
+/** The write-scope memo for an UPDATE site, from the same values the executor takes. */
+function updateWriteSite(check: ConstraintCheckNode, table: TableReferenceNode): WriteSiteAnalysis {
+  return new WriteSiteAnalysis({ check, table, operation: 'update', onConflict: undefined, upsertClauses: undefined });
 }

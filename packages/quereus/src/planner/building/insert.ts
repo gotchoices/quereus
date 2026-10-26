@@ -30,6 +30,7 @@ import { expandReturningStar } from './returning-star.js';
 import { ProjectNode, type Projection } from '../nodes/project-node.js';
 import { buildOldNewRowDescriptors } from '../../util/row-descriptor.js';
 import { DmlExecutorNode, type UpsertClausePlan, type UpsertUpdateValidation } from '../nodes/dml-executor-node.js';
+import { WriteSiteAnalysis } from '../analysis/write-site-analysis.js';
 import { buildConstraintChecks, buildNotNullDefaults } from './constraint-builder.js';
 import { buildChildSideFKChecks, buildParentSideFKChecks, getBatchableRestrictFks } from './foreign-key-builder.js';
 import { schemaAuthoredContext } from './schema-authored-context.js';
@@ -1068,7 +1069,14 @@ export function buildInsertStmt(
 		contextDescriptor,
 		upsertClausePlans,
 		lensRouted,
-		upsertUpdateValidation
+		upsertUpdateValidation,
+		new WriteSiteAnalysis({
+			check: constraintCheckNode,
+			table: tableReference,
+			operation: 'insert',
+			onConflict: stmt.onConflict,
+			upsertClauses: upsertClausePlans,
+		})
 	);
 
 	const resultNode: RelationalPlanNode = dmlExecutorNode;

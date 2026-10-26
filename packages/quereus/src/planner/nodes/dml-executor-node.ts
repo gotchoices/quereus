@@ -7,6 +7,7 @@ import type { RelationType } from '../../common/datatype.js';
 import type { ConflictResolution } from '../../common/constants.js';
 import { RowOp } from '../../common/types.js';
 import type { ConstraintCheck, NotNullDefaultPlan } from './constraint-check-node.js';
+import type { WriteSiteAnalysis } from '../analysis/write-site-analysis.js';
 
 /**
  * Represents a planned UPSERT clause for INSERT operations.
@@ -120,6 +121,14 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
      * least one `update`-action clause.
      */
     public readonly upsertUpdateValidation?: UpsertUpdateValidation,
+    /**
+     * Memo of this write site's `WriteScope` analysis over the LOGICAL shape the
+     * builder captured (the constraint-check node and the DML prep node under it),
+     * which physical optimization replaces. Carried through `withChildren` so every
+     * optimized copy of the node shares the one analysis. See
+     * `analysis/write-site-analysis.ts`.
+     */
+    public readonly writeSite?: WriteSiteAnalysis,
   ) {
     super(scope);
   }
@@ -247,7 +256,8 @@ export class DmlExecutorNode extends PlanNode implements RelationalPlanNode {
       this.contextDescriptor,
       newUpsertClauses,
       this.lensRouted,
-      newValidation
+      newValidation,
+      this.writeSite
     );
   }
 

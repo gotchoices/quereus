@@ -5,7 +5,7 @@
  *
  * The question each class answers for a conflict predictor: could a second writer,
  * acting on newer state, make this value collide or go stale? See
- * docs/change-scope.md § Written-value provenance.
+ * docs/write-scope.md § Written-value provenance.
  *
  * Runs over the logical plan the DML builders produce (before optimization), so the
  * attribute ids it resolves are the builder's. Anything it cannot describe classifies

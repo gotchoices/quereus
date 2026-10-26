@@ -416,7 +416,7 @@ createScalarFunction(
   accepts the same option.
 - What it buys: the write-provenance analysis labels a value from a fresh call `fresh`
   rather than `volatile`, telling a host that the value cannot collide with another
-  writer's (see [Change-scope § Written-value provenance](change-scope.md#written-value-provenance)).
+  writer's (see [Write-scope § Written-value provenance](write-scope.md#written-value-provenance)).
 - Declare the `returnType`, especially for a blob-returning function. Decoding a blob to
   text is lossy, so a `fresh` blob stays `fresh` only under `hex` (not `||`, `lower`,
   `upper`, `cast(... as text)`, or a write to a `text` column). An untyped function's

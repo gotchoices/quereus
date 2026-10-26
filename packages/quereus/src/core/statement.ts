@@ -26,6 +26,7 @@ import { wrapAsyncIterator } from '../util/async-iterator.js';
 import { combineAbortSignals } from '../util/abort-signal.js';
 import { ensureAsyncGeneratorCleanupSupported } from '../util/async-generator-support.js';
 import { analyzeChangeScope, type ChangeScope } from '../planner/analysis/change-scope.js';
+import { analyzeWriteScope, bindWriteParameters, type WriteScope } from '../planner/analysis/write-scope.js';
 import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-usage.js';
 import { isObjectClassValue } from '../util/comparison.js';
 import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
@@ -1106,9 +1107,27 @@ export class Statement {
 	}
 
 	/**
+	 * Describes the statement's writes — one entry per write site: which rows
+	 * it targets and how it chose them, where each written value comes from,
+	 * what else it reads, which constraints could reject it, and whether
+	 * re-applying it to its own result would change anything. A statement
+	 * with no write site returns empty `writes`. Bound parameters (`params`,
+	 * or those already bound to the statement) are substituted into the
+	 * selection and read placeholders; the rest surface under
+	 * `unboundParameters`. See docs/write-scope.md.
+	 */
+	getWriteScope(params?: SqlParameters | SqlValue[]): WriteScope {
+		this.validateStatement("get write scope for");
+		const plan = this.getAnalysisPlan();
+		const effectiveParams = params ?? (Object.keys(this.boundArgs).length > 0 ? this.boundArgs : undefined);
+		const scope = analyzeWriteScope(plan, this.db);
+		return effectiveParams !== undefined ? bindWriteParameters(scope, effectiveParams) : scope;
+	}
+
+	/**
 	 * @internal Build (or re-build) a pre-physical analysis plan for the
-	 * current AST statement. Analysis-only callers (change-scope, future
-	 * binding-aware tools) need a plan whose TableReferenceNodes still
+	 * current AST statement. Analysis-only callers (change-scope, write-scope,
+	 * future binding-aware tools) need a plan whose TableReferenceNodes still
 	 * sit in plain logical structure, not wrapped by physical access
 	 * operators. This path is independent of the execution plan cache.
 	 */

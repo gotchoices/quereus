@@ -234,52 +234,32 @@ export function analyzeChangeScope(
 	},
 ): ChangeScope {
 	const dmlWithoutReturning = isDmlWithoutReturning(plan);
-	const { perRelation } = extractBindings(plan as RelationalPlanNode);
 
-	const tableRefs = collectTableRefs(plan);
-
-	const columnsByRelKey = collectColumnReads(plan, tableRefs);
-	const nonDetSources: NonDetSource[] = [];
-	const unboundParams = new Set<number | string>();
-	collectNonDeterminism(plan, nonDetSources, unboundParams, perRelation);
-
-	const watches: TableWatch[] = [];
 	// Source-union scopes for any incremental-MV backing references encountered;
 	// folded into the result below so they union/dedup against direct reads of
 	// the same source table.
 	const mvSourceScopes: ChangeScope[] = [];
-	if (!dmlWithoutReturning) {
-		for (const ref of tableRefs) {
-			const relKey = relationKeyOf(ref);
-			const mode = perRelation.get(relKey);
-			if (!mode) continue;
+	const resolveMv = options?.resolveMaterializedViewSource;
+	// An MV's backing table is row-time maintained from its sources. Replace the
+	// backing-table watch with the MV's source-union scope so a watcher fires on
+	// a SOURCE mutation. Widening, not a prerequisite: maintenance records its
+	// realized backing deltas into the change log, so a direct backing watch
+	// would fire too (see MaterializedViewSourceResolver).
+	const projectMaintainedTable = (_ref: TableReferenceNode, watch: TableWatch): TableWatch | undefined => {
+		const mvScope = resolveMv?.(watch.table);
+		if (!mvScope) return watch;
+		mvSourceScopes.push(mvScope);
+		return undefined;
+	};
 
-			const schemaName = ref.tableSchema.schemaName.toLowerCase();
-			const tableName = ref.tableSchema.name.toLowerCase();
-			const table: QualifiedName = { schema: schemaName, table: tableName };
-
-			// An MV's backing table is row-time maintained from its sources. Replace the
-			// backing-table watch with the MV's source-union scope so a watcher fires on
-			// a SOURCE mutation. Widening, not a prerequisite: maintenance records its
-			// realized backing deltas into the change log, so a direct backing watch
-			// would fire too (see MaterializedViewSourceResolver).
-			const mvScope = options?.resolveMaterializedViewSource?.(table);
-			if (mvScope) {
-				mvSourceScopes.push(mvScope);
-				continue;
-			}
-
-			const colIndices = columnsByRelKey.get(relKey);
-			const columns: ReadonlySet<string> | 'all' = buildColumnSet(ref, colIndices);
-			const scope = buildScopeForMode(plan as RelationalPlanNode, ref, relKey, mode, unboundParams);
-			watches.push({ table, columns, scope });
-		}
-	}
+	const reads = analyzeReads(plan, dmlWithoutReturning ? {} : { refineWatch: projectMaintainedTable });
 
 	let scope: ChangeScope = {
-		watches: normalizeWatches(watches),
-		nonDeterministicSources: normalizeNonDet(nonDetSources),
-		unboundParameters: sortedDedupParamIndices(unboundParams),
+		// A write without RETURNING serves no rows, so there is nothing to watch; its
+		// parameters still count (see isDmlWithoutReturning).
+		watches: dmlWithoutReturning ? [] : reads.watches,
+		nonDeterministicSources: reads.nonDeterministicSources,
+		unboundParameters: reads.unboundParameters,
 	};
 
 	for (const mvScope of mvSourceScopes) {
@@ -291,6 +271,72 @@ export function analyzeChangeScope(
 	}
 
 	return scope;
+}
+
+/** The read side of a plan: one watch per table reference, plus the inputs state alone cannot predict. */
+export interface ReadAnalysis {
+	readonly watches: ReadonlyArray<TableWatch>;
+	readonly nonDeterministicSources: ReadonlyArray<NonDetSource>;
+	readonly unboundParameters: ReadonlyArray<number | string>;
+}
+
+export interface AnalyzeReadsOptions {
+	/**
+	 * Follow `getRelations()` as well as `getChildren()` when collecting table
+	 * references, so a DML node's write target — held outside its children — is
+	 * reported (see `docs/change-scope.md` § DML write-target propagation). Default
+	 * true. Write-scope turns it off: the target of the write it describes is not a read.
+	 */
+	readonly followRelations?: boolean;
+	/**
+	 * Pin a table's columns to `'all'` when an output relation forwards the table's
+	 * whole attribute set (`select *`). Default true. Write-scope turns it off: a write
+	 * serves no rows to a caller, and the DML prep nodes forward their target's
+	 * attributes without reading them.
+	 */
+	readonly wholeRowOutputs?: boolean;
+	/** Adjust the watch built for one table reference, or drop it by returning `undefined`. */
+	readonly refineWatch?: (ref: TableReferenceNode, watch: TableWatch) => TableWatch | undefined;
+}
+
+/**
+ * The one plan walker behind both {@link analyzeChangeScope} (which adds the
+ * DML-without-RETURNING gate and the maintained-table projection) and write-scope
+ * (which reads a write site's inputs through it). Walks `root` as given — no
+ * optimizer pass is run here.
+ */
+export function analyzeReads(root: PlanNode, options: AnalyzeReadsOptions = {}): ReadAnalysis {
+	const { perRelation } = extractBindings(root as RelationalPlanNode);
+	const tableRefs = collectTableRefs(root, options.followRelations ?? true);
+	const columnsByRelKey = collectColumnReads(root, tableRefs, options.wholeRowOutputs ?? true);
+	const nonDetSources: NonDetSource[] = [];
+	const unboundParams = new Set<number | string>();
+	collectNonDeterminism(root, nonDetSources, unboundParams, perRelation);
+
+	const watches: TableWatch[] = [];
+	for (const ref of tableRefs) {
+		const relKey = relationKeyOf(ref);
+		const mode = perRelation.get(relKey);
+		if (!mode) continue;
+		const built: TableWatch = {
+			table: qualifiedNameOf(ref.tableSchema),
+			columns: buildColumnSet(ref, columnsByRelKey.get(relKey)),
+			scope: buildScopeForMode(root as RelationalPlanNode, ref, relKey, mode, unboundParams),
+		};
+		const watch = options.refineWatch ? options.refineWatch(ref, built) : built;
+		if (watch) watches.push(watch);
+	}
+
+	return {
+		watches: normalizeWatches(watches),
+		nonDeterministicSources: normalizeNonDet(nonDetSources),
+		unboundParameters: sortedDedupParamIndices(unboundParams),
+	};
+}
+
+/** The lowercased qualified name a scope reports a table under. */
+export function qualifiedNameOf(schema: { readonly schemaName: string; readonly name: string }): QualifiedName {
+	return { schema: schema.schemaName.toLowerCase(), table: schema.name.toLowerCase() };
 }
 
 /**
@@ -345,7 +391,7 @@ function isDmlWithoutReturning(plan: PlanNode): boolean {
  * `extractBindings`, so the relation-key *label* must stay the shared one
  * (`relationKeyOf`).
  */
-function collectTableRefs(plan: PlanNode): TableReferenceNode[] {
+function collectTableRefs(plan: PlanNode, followRelations: boolean): TableReferenceNode[] {
 	const out: TableReferenceNode[] = [];
 	const seen = new Set<TableReferenceNode>();
 	const visited = new Set<PlanNode>();
@@ -364,7 +410,9 @@ function collectTableRefs(plan: PlanNode): TableReferenceNode[] {
 		// too so a FROM-position DML's write target is captured in the outer
 		// statement's ChangeScope. See `docs/change-scope.md` § DML write-target
 		// propagation.
-		for (const r of node.getRelations()) walk(r as unknown as PlanNode);
+		if (followRelations) {
+			for (const r of node.getRelations()) walk(r as unknown as PlanNode);
+		}
 	}
 	walk(plan);
 	return out;
@@ -377,7 +425,11 @@ function collectTableRefs(plan: PlanNode): TableReferenceNode[] {
  * the plan serves the table's whole row to its output (a `select *` /
  * non-enumerable star — see below).
  */
-function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNode[]): Map<string, Set<number> | 'all'> {
+function collectColumnReads(
+	plan: PlanNode,
+	tableRefs: readonly TableReferenceNode[],
+	wholeRowOutputs: boolean,
+): Map<string, Set<number> | 'all'> {
 	const result = new Map<string, Set<number> | 'all'>();
 	const attrToRelKeyAndIdx = new Map<number, { relKey: string; colIdx: number }>();
 	const refByRelKey = new Map<string, TableReferenceNode>();
@@ -405,6 +457,7 @@ function collectColumnReads(plan: PlanNode, tableRefs: readonly TableReferenceNo
 		for (const c of node.getChildren()) visit(c as unknown as PlanNode);
 	}
 	visit(plan);
+	if (!wholeRowOutputs) return result;
 
 	// `select *` (and any unresolved/whole-row star projection) is elided by the
 	// planner to a passthrough that forwards the base table's OWN attribute ids
@@ -527,7 +580,12 @@ function buildColumnSet(ref: TableReferenceNode, indices: Set<number> | 'all' | 
 	return names;
 }
 
-function buildScopeForMode(
+/**
+ * Translate one table reference's binding mode into a watch scope, decoding the
+ * key values from the plan's equality predicates. Exported for write-scope, which
+ * describes a write's target-row selection in the same vocabulary.
+ */
+export function buildScopeForMode(
 	plan: RelationalPlanNode,
 	ref: TableReferenceNode,
 	relKey: string,
@@ -572,7 +630,7 @@ function buildScopeForMode(
  * RHS into a `ScopeValue` (literal or `param` placeholder). Returns one
  * tuple per row-binding values combination present in the constraints.
  */
-function extractRowKeyValues(
+export function extractRowKeyValues(
 	plan: RelationalPlanNode,
 	relKey: string,
 	keyColumns: readonly number[],
@@ -634,7 +692,7 @@ function extractRowKeyValues(
 	return sortAndDedupTuples(tuples);
 }
 
-function scopeValueFromExpr(expr: ScalarPlanNode, unboundParams: Set<number | string>): ScopeValue | undefined {
+export function scopeValueFromExpr(expr: ScalarPlanNode, unboundParams: Set<number | string>): ScopeValue | undefined {
 	const inner = expr.nodeType === PlanNodeType.Cast
 		? (expr as unknown as { operand: ScalarPlanNode }).operand
 		: expr;
@@ -738,7 +796,7 @@ function compareScopeValues(a: ScopeValue, b: ScopeValue): number {
 	return compareSqlValues(a as SqlValue, b as SqlValue);
 }
 
-function normalizeNonDet(sources: NonDetSource[]): NonDetSource[] {
+export function normalizeNonDet(sources: ReadonlyArray<NonDetSource>): NonDetSource[] {
 	const seen = new Map<string, NonDetSource>();
 	for (const s of sources) {
 		const k = nonDetKey(s);
@@ -756,7 +814,7 @@ function nonDetKey(s: NonDetSource): string {
 	}
 }
 
-function sortedDedupParamIndices(set: Set<number | string>): ReadonlyArray<number | string> {
+export function sortedDedupParamIndices(set: ReadonlySet<number | string>): ReadonlyArray<number | string> {
 	const arr = [...set];
 	arr.sort((a, b) => {
 		const aIsNum = typeof a === 'number';
@@ -1036,7 +1094,8 @@ type SerializedScopeValue =
 	| { v: SqlValue }
 	| { p: number | string; t: PortableScalarType };
 
-interface SerializedTableWatch {
+/** On-wire form of a {@link TableWatch}: the column set becomes a sorted array. */
+export interface SerializedTableWatch {
 	table: QualifiedName;
 	columns: string[] | 'all';
 	scope: SerializedWatchScope;
@@ -1050,13 +1109,17 @@ export interface SerializedChangeScope {
 
 export function serializeChangeScope(scope: ChangeScope): SerializedChangeScope {
 	return {
-		watches: scope.watches.map(w => ({
-			table: { schema: w.table.schema, table: w.table.table },
-			columns: w.columns === 'all' ? 'all' : [...w.columns].sort(),
-			scope: serializeScope(w.scope),
-		})),
+		watches: scope.watches.map(serializeTableWatch),
 		nonDeterministicSources: [...scope.nonDeterministicSources],
 		unboundParameters: [...scope.unboundParameters],
+	};
+}
+
+export function serializeTableWatch(w: TableWatch): SerializedTableWatch {
+	return {
+		table: { schema: w.table.schema, table: w.table.table },
+		columns: w.columns === 'all' ? 'all' : [...w.columns].sort(),
+		scope: serializeScope(w.scope),
 	};
 }
 
@@ -1086,13 +1149,17 @@ function serializeScopeValue(v: ScopeValue): SerializedScopeValue {
 
 export function deserializeChangeScope(obj: SerializedChangeScope): ChangeScope {
 	return {
-		watches: obj.watches.map(w => ({
-			table: { schema: w.table.schema, table: w.table.table },
-			columns: w.columns === 'all' ? 'all' : new Set<string>(w.columns),
-			scope: deserializeScope(w.scope),
-		})),
+		watches: obj.watches.map(deserializeTableWatch),
 		nonDeterministicSources: [...obj.nonDeterministicSources],
 		unboundParameters: [...obj.unboundParameters],
+	};
+}
+
+export function deserializeTableWatch(w: SerializedTableWatch): TableWatch {
+	return {
+		table: { schema: w.table.schema, table: w.table.table },
+		columns: w.columns === 'all' ? 'all' : new Set<string>(w.columns),
+		scope: deserializeScope(w.scope),
 	};
 }
 
