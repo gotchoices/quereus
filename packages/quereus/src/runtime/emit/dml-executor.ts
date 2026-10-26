@@ -10,6 +10,7 @@ import type { EmissionContext } from '../emission-context.js';
 import { extractOldRowFromFlat, extractNewRowFromFlat } from '../../util/row-descriptor.js';
 import { buildInsertStatement, buildUpdateStatement, buildDeleteStatement } from '../../util/mutation-statement.js';
 import type { UpdateArgs, VirtualTable } from '../../vtab/table.js';
+import { bindTableWrite, type TableWrite } from '../../planner/analysis/write-scope.js';
 import type { TableSchema } from '../../schema/table.js';
 import { isMaintainedTable } from '../../schema/derivation.js';
 import { hasNativeEventSupport } from '../../util/event-support.js';
@@ -381,6 +382,24 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		if (counters) counters.tableCounters(counterKeyLower).updateCalls++;
 	}
 
+	/**
+	 * The `UpdateArgs.writeScope` for one execution: this write site's memoized analysis
+	 * with the execution's parameters bound, or `undefined` unless the target table opted in
+	 * (`wantWriteScope`). Resolved once per execution; every row of it shares the object.
+	 *
+	 * NOTE: an FK cascade child write (physical or lens — both run under the cascade
+	 * re-entry flag) is a nested statement with a write site of its own, but it is a
+	 * consequence of the user's statement, not a statement the host issued, so it carries no
+	 * scope; the module can still tell it apart via `db._isFkCascadeReentry()`. Revisit if a
+	 * module that queues cascaded writes offline needs them described — dropping this check
+	 * hands it the synthesized `delete from child where fk = ?` shape, parameters bound.
+	 */
+	function resolveWriteScope(rctx: RuntimeContext, vtab: VirtualTable): TableWrite | undefined {
+		if (!vtab.wantWriteScope || !plan.writeSite || rctx.db._isFkCascadeReentry()) return undefined;
+		const write = plan.writeSite.analyze(rctx.db).writes[0];
+		return write ? bindTableWrite(write, rctx.params) : undefined;
+	}
+
 	// QUEREUS_REPR_STRICT seam: the row about to be handed to `vtab.update`, checked
 	// against the declared column types AFTER the DML pipeline's coercion pass. This is
 	// the failure mode with the longest fuse — a non-canonical value that gets PERSISTED.
@@ -720,7 +739,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		existingRow: Row,
 		proposedRow: Row,
 		contextRow: Row | undefined,
-		upsertEvaluators: SubProgram[]
+		upsertEvaluators: SubProgram[],
+		writeScope: TableWrite | undefined,
 	): Promise<{ updatedRow: Row; flatRow: Row } | undefined> {
 		// Check WHERE condition if present
 		if (clause.whereIndex >= 0 && clause.newRowDescriptor && clause.existingRowDescriptor) {
@@ -833,7 +853,9 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			onConflict: ConflictResolution.ABORT,
 			preCoerced: true,
 			mutationStatement: vtab.wantStatements ?
-				buildUpdateStatement(tableSchema, updatedRow, keyValues, contextRow) : undefined
+				buildUpdateStatement(tableSchema, updatedRow, keyValues, contextRow) : undefined,
+			// The arm is part of the INSERT's own write: its `disposition.clauses` describe it.
+			writeScope,
 		};
 
 		if (REPR_STRICT) assertRowConforms(updatedRow, reprColumnTypes!, reprWhere, reprColumnNames);
@@ -1067,6 +1089,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const vtab = await getVTable(ctx, tableSchema);
 		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
+		const writeScope = resolveWriteScope(ctx, vtab);
 
 		// Per-statement backing-connection cache: resolve each covering MV's backing
 		// connection once for the whole statement rather than once per source row.
@@ -1087,7 +1110,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		yield* runWithStatementSavepoints(
 			ctx, vtab, stampMutationOrdinal(ctx, rows), isFailMode,
 			(flatRow) => processInsertRow(
-				ctx, vtab, needsAutoEvents, flatRow, contextRow, runtimeUpsertClauses, upsertEvaluators, backingConnCache, deferredRebuilds, residualBatch,
+				ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, runtimeUpsertClauses, upsertEvaluators, backingConnCache, deferredRebuilds, residualBatch,
 			),
 			deferredRebuilds, residualBatch, backingConnCache,
 		);
@@ -1185,6 +1208,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		needsAutoEvents: boolean,
 		flatRow: Row,
 		contextRow: Row | undefined,
+		writeScope: TableWrite | undefined,
 		runtimeUpsertClauses: RuntimeUpsertClause[] | undefined,
 		upsertEvaluators: SubProgram[],
 		backingConnCache: BackingConnectionCache,
@@ -1211,7 +1235,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// (emitInsert / constraint-check DEFAULT substitution), so the storage
 			// layer must not convert again — JSON conversion is not repeatable.
 			preCoerced: true,
-			mutationStatement
+			mutationStatement,
+			writeScope,
 		};
 
 		if (REPR_STRICT) assertRowConforms(newRow, reprColumnTypes!, reprWhere, reprColumnNames);
@@ -1227,7 +1252,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 						return undefined;
 					}
 					const updateResult = await executeUpsertUpdate(
-						ctx, vtab, matchingClause, result.existingRow, newRow, contextRow, upsertEvaluators,
+						ctx, vtab, matchingClause, result.existingRow, newRow, contextRow, upsertEvaluators, writeScope,
 					);
 					if (!updateResult) return undefined;
 
@@ -1347,6 +1372,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const vtab = await getVTable(ctx, tableSchema);
 		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
+		const writeScope = resolveWriteScope(ctx, vtab);
 
 		// Per-statement backing-connection cache + deferred full-rebuild set + residual
 		// key batch (see runInsert).
@@ -1377,7 +1403,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const sourceRows = await resolveDmlSourceRows(ctx, vtab, tableSchema, rows);
 		yield* runWithStatementSavepoints(
 			ctx, vtab, sourceRows, isFailMode,
-			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
+			(flatRow) => processUpdateRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
 			deferredRebuilds, residualBatch, backingConnCache,
 			fkRestrictBatch ? () => flushParentRestrictBatch(ctx.db, tableSchema, 'update', fkRestrictBatch) : undefined,
 		);
@@ -1397,6 +1423,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		needsAutoEvents: boolean,
 		flatRow: Row,
 		contextRow: Row | undefined,
+		writeScope: TableWrite | undefined,
 		backingConnCache: BackingConnectionCache,
 		deferredRebuilds: Set<string>,
 		residualBatch: ResidualKeyBatch,
@@ -1449,7 +1476,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			// columns by static type, unassigned columns are stored values) — the
 			// storage layer must not convert again.
 			preCoerced: true,
-			mutationStatement
+			mutationStatement,
+			writeScope,
 		};
 
 		if (REPR_STRICT) assertRowConforms(newRow, reprColumnTypes!, reprWhere, reprColumnNames);
@@ -1535,6 +1563,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const vtab = await getVTable(ctx, tableSchema);
 		const needsAutoEvents = ctx.db._needsDataEvents() && !moduleHasNativeDataEvents(ctx, tableSchema);
 		const contextRow = await evaluateContextRow(ctx, contextEvaluators);
+		const writeScope = resolveWriteScope(ctx, vtab);
 
 		// Per-statement backing-connection cache + deferred full-rebuild set + residual
 		// key batch (see runInsert).
@@ -1558,7 +1587,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		const sourceRows = await resolveDmlSourceRows(ctx, vtab, tableSchema, rows);
 		yield* runWithStatementSavepoints(
 			ctx, vtab, sourceRows, isFailMode,
-			(flatRow) => processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
+			(flatRow) => processDeleteRow(ctx, vtab, needsAutoEvents, flatRow, contextRow, writeScope, backingConnCache, deferredRebuilds, residualBatch, fkRestrictBatch),
 			deferredRebuilds, residualBatch, backingConnCache,
 			fkRestrictBatch ? () => flushParentRestrictBatch(ctx.db, tableSchema, 'delete', fkRestrictBatch) : undefined,
 		);
@@ -1578,6 +1607,7 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 		needsAutoEvents: boolean,
 		flatRow: Row,
 		contextRow: Row | undefined,
+		writeScope: TableWrite | undefined,
 		backingConnCache: BackingConnectionCache,
 		deferredRebuilds: Set<string>,
 		residualBatch: ResidualKeyBatch,
@@ -1614,7 +1644,8 @@ export function emitDmlExecutor(plan: DmlExecutorNode, ctx: EmissionContext): In
 			onConflict: plan.onConflict ?? ConflictResolution.ABORT,
 			// The key cells come from the scanned OLD row — already stored form.
 			preCoerced: true,
-			mutationStatement
+			mutationStatement,
+			writeScope,
 		};
 
 		countUpdateCall(ctx);

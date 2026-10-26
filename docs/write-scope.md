@@ -194,6 +194,46 @@ const wire = JSON.stringify(serializeWriteScope(scope));
 const back = deserializeWriteScope(JSON.parse(wire));   // deep-equals scope
 ```
 
+## Module hook
+
+A virtual-table module can receive its write's description with every row it is asked to write, so a module that queues writes can decide at staging time whether another writer could make the queued write fail. The table opts in with `wantWriteScope = true`; each `update()` call for the statement's own write then carries `UpdateArgs.writeScope`, the write site's `TableWrite`:
+
+- **Bound.** The execution's parameters are substituted into `selection` and `reads` (`bindTableWrite`, the per-write half of `bindWriteParameters`), so the module sees literal key values — on a prepared statement and on `db.exec` alike.
+- **Shared.** One object per execution, the same reference for every row; read-only. The upsert DO UPDATE arm receives the INSERT's object, whose `disposition.clauses` describe the arm.
+- **Cheap when unused.** Unset, the engine runs no analysis. Set, the write site's memo (see [Where the analysis runs](#where-the-analysis-runs)) is analyzed on first use and reused by every later execution of the prepared plan; binding runs once per execution. The memo freezes the `foreign_keys` option at first use, as the plan freezes its own FK checks at build — recompile to pick up a toggle.
+- **The statement's own writes only.** FK cascade child writes — the engine's nested `delete` / `update` against a child table, physical or through a lens — carry no `writeScope`. A write through a view or to a maintained table is described as the base-table write it becomes.
+- **Behind `@quereus/isolation`** the opt-in is mirrored from the underlying table, but the description reaches only the overlay's staging write, not the underlying module at commit.
+
+An example decision — an INSERT keyed by a `fresh` value cannot collide on replay; one keyed by an `input` value may:
+
+```typescript
+class OfflineQueueTable extends VirtualTable {
+  wantWriteScope = true;
+
+  async update(args: UpdateArgs): Promise<UpdateResult> {
+    this.queue.push({ args, mayFail: mayFailOnReplay(args.writeScope) });
+    return this.storage.update(args);
+  }
+}
+
+/** Could another writer make this queued write fail when it is replayed? */
+function mayFailOnReplay(write: TableWrite | undefined): boolean {
+  if (!write) return true;                          // undescribed: assume the worst
+  if (write.operation !== 'insert') return true;    // targets rows another writer can change
+  return write.constraints.some(c => c.locality === 'cross-row' && !keyedByFresh(write, c));
+}
+
+/** A key that includes a fresh (unique-per-call) value cannot collide with anyone's row. */
+function keyedByFresh(write: TableWrite, c: WriteConstraint): boolean {
+  return (c.kind === 'primary-key' || c.kind === 'unique')
+    && c.columns.some(col => write.columns.find(w => w.column === col)?.provenance.kind === 'fresh');
+}
+```
+
+So an INSERT whose key is `fresh` (`default (randomblob(16))`) into a table with no natural unique key and no foreign key cannot fail on replay, while an INSERT whose unique column is `input` — a value the host supplied as a parameter — may collide with another writer's row. The contract lists every key constraint as `cross-row` and leaves the provenance reasoning to the module.
+
+Module authors: see also [module-authoring.md § Write scope](module-authoring.md#write-scope).
+
 ## Known imprecisions
 
 Sound and conservative: never less than what the write may do, sometimes more.

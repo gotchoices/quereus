@@ -1283,6 +1283,19 @@ auto-event path produces both for it.
 Both are what lets a listener retire a row's old identity without knowing which columns form
 the key — see [usage § Subscribing to Data Changes](usage.md#subscribing-to-data-changes).
 
+## Write scope
+
+A module that queues writes for later — an offline store, a sync client — can opt in with `wantWriteScope = true` to receive, with each row it is asked to write, `UpdateArgs.writeScope`: the [write-scope](write-scope.md) `TableWrite` of the statement write that row belongs to (how it chose its target rows, where each written value comes from, which constraints could reject it), so it can decide at staging time whether another writer could make the queued write fail on replay.
+
+- **Opt-in.** Unset, the engine runs no analysis and `writeScope` is absent.
+- **Parameters are bound** — on a prepared statement and on `db.exec` alike — so `selection.values` holds literal keys.
+- **One object per execution.** Every row receives the same reference; treat it as read-only. An upsert's DO UPDATE arm receives the INSERT's object.
+- **Only the statement's own writes.** An FK cascade child write carries none (`db._isFkCascadeReentry()` identifies one); REPLACE displacement happens inside the module with no `update()` call.
+- **Independent of `mutationStatement`**; a module may take either or both.
+- **Behind `@quereus/isolation`** the opt-in is mirrored from the underlying table, but the description reaches only the overlay, not the underlying `update()` at commit.
+
+The full contract and an example decision are in [write-scope.md § Module hook](write-scope.md#module-hook).
+
 ## See Also
 
 - [Database-Level Event System](module-events.md) - Data and schema change events

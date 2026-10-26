@@ -18,3 +18,7 @@ If the underlying table opts in to either description, the overlay retains the d
 
 - Retain per row (simple, memory proportional to staged rows) or per statement with a per-row index (cheaper when one statement stages many rows).
 - Whether a row updated twice in one transaction should carry the last statement's description or both.
+
+## State after write-scope-module-hook
+
+`IsolatedTable`'s constructor now mirrors `wantStatements` and `wantWriteScope` from the underlying table, so the executor already computes both descriptions for a wrapped table and they arrive in `IsolatedTable.update`'s `args`; only retention per staged row and forwarding in `flush.ts` remain.

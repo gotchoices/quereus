@@ -10,6 +10,7 @@ import type { VirtualTableConnection } from './connection.js';
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { VTableEventEmitter } from './events.js';
 import type { TableStatistics } from '../planner/stats/catalog-stats.js';
+import type { TableWrite } from '../planner/analysis/write-scope.js';
 
 /**
  * Arguments passed to VirtualTable.update() method.
@@ -32,6 +33,14 @@ export interface UpdateArgs {
 	onConflict?: ConflictResolution;
 	/** Optional: Deterministic SQL statement that reproduces this mutation (if logMutations is enabled) */
 	mutationStatement?: string;
+	/**
+	 * Optional: the description of the statement write this row belongs to — set only when
+	 * the table opts in via {@link VirtualTable.wantWriteScope}. Its parameters are bound to
+	 * this execution's values. The SAME object is handed to every row of one execution:
+	 * treat it as read-only shared data. Absent on writes the engine issues as consequences
+	 * of a statement (FK cascade child writes). See docs/write-scope.md § Module hook.
+	 */
+	writeScope?: TableWrite;
 	/**
 	 * If true, `values` (and any key cells in `oldKeyValues`) are already coerced
 	 * to the table's declared column logical types, and the vtab may skip its own
@@ -92,6 +101,14 @@ export abstract class VirtualTable {
 	 * This enables replication, audit logging, and change data capture.
 	 */
 	public wantStatements?: boolean;
+
+	/**
+	 * When true, the update() method receives a `writeScope` describing the statement
+	 * write the row belongs to — how it chose its rows, where each value comes from, which
+	 * constraints could reject it — so a module that queues writes can decide at staging
+	 * time whether another writer could make the queued write fail.
+	 */
+	public wantWriteScope?: boolean;
 
 	constructor(db: Database, module: AnyVirtualTableModule, schemaName: string, tableName: string) {
 		this.db = db;

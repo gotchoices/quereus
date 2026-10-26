@@ -2806,8 +2806,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	 *  legitimately have both semantics in play). Returns the prior value so the
 	 *  caller restores it in a `finally` — nesting-safe: an inner cascade restores
 	 *  to the outer's `true`, the outermost to `false`, and a thrown cascade cannot
-	 *  latch the flag on. Nothing inside Quereus reads it; it exposes the signal the
-	 *  host consumes. */
+	 *  latch the flag on. Inside Quereus only the DML executor reads it, to withhold
+	 *  `UpdateArgs.writeScope` from cascade child writes; otherwise it exposes the
+	 *  signal the host consumes. */
 	public _setFkCascadeReentry(value: boolean): boolean {
 		const prior = this._fkCascadeReentry;
 		this._fkCascadeReentry = value;

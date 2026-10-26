@@ -184,7 +184,12 @@ export function bindWriteParameters(scope: WriteScope, params: SqlParameters | S
 	};
 }
 
-function bindTableWrite(write: TableWrite, params: SqlParameters | SqlValue[]): TableWrite {
+/**
+ * Substitute bound parameters into one write's selection and read watches. The DML
+ * executor applies it per execution to the write it hands an opted-in module
+ * (`UpdateArgs.writeScope`).
+ */
+export function bindTableWrite(write: TableWrite, params: SqlParameters | SqlValue[]): TableWrite {
 	const reads = bindParameters({ watches: write.reads, nonDeterministicSources: [], unboundParameters: [] }, params).watches;
 	return { ...write, reads, selection: bindSelection(write.selection, write.table, params) };
 }

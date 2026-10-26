@@ -159,6 +159,12 @@ export class IsolatedTable extends VirtualTable implements IsolatedTableCallback
 		this.collationResolver = db.getCollationResolver();
 		// Schema comes from underlying - may be populated lazily by the underlying module
 		this.tableSchema = underlyingTable.tableSchema;
+		// The executor reads these opt-ins off the table it writes to — this wrapper — so
+		// mirror the underlying module's. Both descriptions then reach the overlay write
+		// (`update` spreads `args`) but not the underlying `update()` at flush, which builds
+		// fresh args; see tickets/backlog/feat-isolation-forwards-write-scope-at-flush.md.
+		this.wantStatements = underlyingTable.wantStatements;
+		this.wantWriteScope = underlyingTable.wantWriteScope;
 		// Statistics delegation — present iff the underlying implements it (see the fields).
 		const reportStats = underlyingTable.getStatistics;
 		if (reportStats) this.getStatistics = () => this.hasChanges ? undefined : reportStats.call(underlyingTable);

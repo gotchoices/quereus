@@ -75,7 +75,8 @@
 		"docs/vu-operators.md": "Beta",
 		"docs/vu-roundtrip.md": "Beta",
 		"docs/vu-setops.md": "Beta",
-		"docs/window-functions.md": "Stable"
+		"docs/window-functions.md": "Stable",
+		"docs/write-scope.md": "Beta"
 	},
 	"untiered": [
 		"docs/architecture.md",

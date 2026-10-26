@@ -71,10 +71,13 @@ export interface WriteSiteInputs {
  *
  * NOTE: the cached result freezes catalog facts read through `db` at first
  * `analyze` — the `foreign_keys` option, the inbound-FK index, the assertion
- * list. A fresh memo per `getWriteScope()` call never sees them change; a reader
- * of the memo on a long-lived execution plan (the module hook) must make sure
- * the plan is rebuilt when they do (schema changes already invalidate the
- * statement; an option toggle does not).
+ * list. A fresh memo per `getWriteScope()` call never sees them change. The
+ * module hook (`UpdateArgs.writeScope`, emit/dml-executor.ts) reads one memo
+ * across every execution of a prepared plan: a schema change invalidates the
+ * statement and so the memo; a `foreign_keys` toggle does not, but the DML
+ * builders bake that option into the plan's own FK checks too, so the
+ * description is no staler than the enforcement it describes until recompile.
+ * Revisit if `foreign_keys` ever invalidates prepared plans on change.
  */
 export class WriteSiteAnalysis {
 	private cached?: WriteScope;
