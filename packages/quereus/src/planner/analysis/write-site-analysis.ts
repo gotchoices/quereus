@@ -68,6 +68,13 @@ export interface WriteSiteInputs {
  * NOTE: `Statement.getWriteScope()` builds a fresh analysis plan, and so a fresh
  * memo, on every call — consistent with `getChangeScope()`, and not hot. Revisit
  * with per-statement caching if a host calls it per execution.
+ *
+ * NOTE: the cached result freezes catalog facts read through `db` at first
+ * `analyze` — the `foreign_keys` option, the inbound-FK index, the assertion
+ * list. A fresh memo per `getWriteScope()` call never sees them change; a reader
+ * of the memo on a long-lived execution plan (the module hook) must make sure
+ * the plan is rebuilt when they do (schema changes already invalidate the
+ * statement; an option toggle does not).
  */
 export class WriteSiteAnalysis {
 	private cached?: WriteScope;
@@ -82,6 +89,11 @@ export class WriteSiteAnalysis {
 }
 
 const NONE: TargetSelection = { kind: 'none' };
+
+/** The lowercased name a scope reports a column under. */
+function columnName(tableSchema: TableSchema, index: number): string {
+	return tableSchema.columns[index].name.toLowerCase();
+}
 const GLOBAL: TargetSelection = { kind: 'global' };
 
 function analyzeWriteSite(inputs: WriteSiteInputs, db: Database): WriteScope {
@@ -145,7 +157,7 @@ function writtenColumns(operation: RowOp, dml: RelationalPlanNode, tableSchema: 
 function describeUpsertClause(clause: UpsertClausePlan, tableSchema: TableSchema, insertColumns: ReadonlyArray<WrittenColumn>): UpsertClause {
 	return {
 		target: clause.conflictTargetIndices
-			? clause.conflictTargetIndices.map(i => tableSchema.columns[i].name.toLowerCase())
+			? clause.conflictTargetIndices.map(i => columnName(tableSchema, i))
 			: 'primary-key',
 		action: clause.action,
 		columns: classifyUpsertUpdateColumns(clause, tableSchema, insertColumns),
@@ -254,14 +266,14 @@ function writeConstraints(
 	out.push(...checkConstraints(checks));
 	if (db.options.getBooleanOption('foreign_keys')) {
 		if (operation !== 'delete') out.push(...childForeignKeys(tableSchema, touches));
-		if (operation !== 'insert') out.push(...parentForeignKeys(tableSchema, db, touches));
+		if (operation !== 'insert') out.push(...parentForeignKeys(operation, tableSchema, db, touches));
 	}
 	out.push(...assertionConstraints(tableSchema, db));
 	return out;
 }
 
 function keyConstraints(tableSchema: TableSchema, touches: (columns: ReadonlyArray<string>) => boolean): WriteConstraint[] {
-	const name = (i: number): string => tableSchema.columns[i].name.toLowerCase();
+	const name = (i: number): string => columnName(tableSchema, i);
 	const out: WriteConstraint[] = [];
 	const pk = tableSchema.primaryKeyDefinition.map(d => name(d.index));
 	if (touches(pk)) out.push({ kind: 'primary-key', columns: pk, locality: 'cross-row', timing: 'immediate' });
@@ -302,7 +314,7 @@ function checkConstraints(checks: ReadonlyArray<ConstraintCheck>): WriteConstrai
 function childForeignKeys(tableSchema: TableSchema, touches: (columns: ReadonlyArray<string>) => boolean): WriteConstraint[] {
 	const out: WriteConstraint[] = [];
 	for (const fk of tableSchema.foreignKeys ?? []) {
-		const columns = fk.columns.map(i => tableSchema.columns[i].name.toLowerCase());
+		const columns = fk.columns.map(i => columnName(tableSchema, i));
 		if (!touches(columns)) continue;
 		out.push({
 			...(fk.name !== undefined ? { name: fk.name } : {}),
@@ -320,15 +332,22 @@ function childForeignKeys(tableSchema: TableSchema, touches: (columns: ReadonlyA
  * FKs declared on other tables that reference this one, whatever their action: a
  * RESTRICT rejects the write when children exist, and a cascading action lands it
  * differently depending on which children exist — both are "other rows can affect
- * it". A RESTRICT is checked within the statement; the engine treats the others as
- * deferrable.
+ * it". Only the action for THIS operation counts (`on delete` for a DELETE,
+ * `on update` for an UPDATE — the same split `getBatchableRestrictFks` and
+ * `buildParentSideFKChecks` make): a RESTRICT is checked within the statement; the
+ * engine treats the others as deferrable.
  */
-function parentForeignKeys(tableSchema: TableSchema, db: Database, touches: (columns: ReadonlyArray<string>) => boolean): WriteConstraint[] {
+function parentForeignKeys(
+	operation: 'update' | 'delete',
+	tableSchema: TableSchema,
+	db: Database,
+	touches: (columns: ReadonlyArray<string>) => boolean,
+): WriteConstraint[] {
 	const out: WriteConstraint[] = [];
 	for (const { childTable, fk } of db.schemaManager.getReferencingForeignKeys(tableSchema.schemaName, tableSchema.name)) {
 		const columns = referencedColumnNames(fk, tableSchema, childTable);
 		if (!touches(columns)) continue;
-		const restrict = fk.onDelete === 'restrict' && fk.onUpdate === 'restrict';
+		const restrict = (operation === 'delete' ? fk.onDelete : fk.onUpdate) === 'restrict';
 		out.push({
 			...(fk.name !== undefined ? { name: fk.name } : {}),
 			kind: 'foreign-key-parent',
@@ -343,7 +362,7 @@ function parentForeignKeys(tableSchema: TableSchema, db: Database, touches: (col
 
 function referencedColumnNames(fk: ForeignKeyConstraintSchema, parent: TableSchema, child: TableSchema): string[] {
 	try {
-		return resolveReferencedColumns(fk, parent).map(i => parent.columns[i].name.toLowerCase());
+		return resolveReferencedColumns(fk, parent).map(i => columnName(parent, i));
 	} catch (e) {
 		// A malformed FK is refused when the write runs; until then its reach is unknown.
 		log('FK from %s to %s does not resolve on the parent: %s', child.name, parent.name, e instanceof Error ? e.message : String(e));
@@ -351,7 +370,16 @@ function referencedColumnNames(fk: ForeignKeyConstraintSchema, parent: TableSche
 	}
 }
 
-/** Every assertion, in any schema, whose body depends on the target table. Always commit-time, always over other rows. */
+/**
+ * Every assertion, in any schema, whose body depends on the target table. Always
+ * commit-time, always over other rows.
+ *
+ * NOTE: `dependentTables` is recorded once at CREATE ASSERTION and is informational
+ * (see its doc in schema/assertion.ts): it goes stale when a view in the body is
+ * redefined over different tables, so this list can then miss or over-list an
+ * assertion. If a host needs it live, re-derive it on schema change as that doc
+ * describes rather than planning every assertion body here.
+ */
 function assertionConstraints(tableSchema: TableSchema, db: Database): WriteConstraint[] {
 	const base = relationBaseName(tableSchema);
 	const out: WriteConstraint[] = [];

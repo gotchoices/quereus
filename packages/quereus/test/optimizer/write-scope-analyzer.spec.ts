@@ -201,6 +201,14 @@ describe('Statement.getWriteScope', () => {
 			]);
 		});
 
+		it('an inbound FK is timed by its action for the operation at hand', async () => {
+			await db.exec(`create table mp (id integer primary key) using memory;
+				create table mc (id integer primary key, pid integer references mp(id) on delete restrict on update cascade) using memory`);
+			const timing = (sql: string) => constraintsOf(onlyWrite(scopeFor(db, sql)), 'foreign-key-parent').map(c => c.timing);
+			expect(timing('delete from mp where id = 1'), 'on delete restrict').to.deep.equal(['immediate']);
+			expect(timing('update mp set id = 2 where id = 1'), 'on update cascade').to.deep.equal(['deferred']);
+		});
+
 		it('a plain CHECK is row/immediate; one with a subquery is cross-row/deferred and reads its table', () => {
 			const write = onlyWrite(scopeFor(db, 'insert into chk (id, n, m) values (1, 2, 3)'));
 			const checks = constraintsOf(write, 'check').map(c => ({ locality: c.locality, timing: c.timing }));

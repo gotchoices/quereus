@@ -43,7 +43,9 @@ export interface IntegrityAssertionSchema {
    * It can therefore go stale where the body's plan shape depends on something
    * other than the table names in its text (a view in the body redefined over
    * different tables is the reachable case). Harmless while nothing but
-   * introspection reads it; the day a consumer needs it to be live, re-derive it
+   * introspection reads it (`assertion_info()`, and the `assertion` entries of a
+   * `WriteScope` — see planner/analysis/write-site-analysis.ts); the day a
+   * consumer needs it to be live, re-derive it
    * on the schema-change events the evaluator already invalidates its cache on
    * rather than adding another remap.
    */

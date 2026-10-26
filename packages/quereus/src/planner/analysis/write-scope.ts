@@ -17,6 +17,7 @@ import type { SqlParameters, SqlValue } from '../../common/types.js';
 import type { Database } from '../../core/database.js';
 import type { PlanNode } from '../nodes/plan-node.js';
 import { DmlExecutorNode } from '../nodes/dml-executor-node.js';
+import type { WriteSiteAnalysis } from './write-site-analysis.js';
 import {
 	bindParameters,
 	deserializeTableWatch,
@@ -136,8 +137,8 @@ export function analyzeWriteScope(plan: PlanNode, db: Database): WriteScope {
 }
 
 /** Every write site in a plan, in plan order, through the memo its builder attached. */
-function collectWriteSites(plan: PlanNode): Array<{ analyze(db: Database): WriteScope }> {
-	const sites: Array<{ analyze(db: Database): WriteScope }> = [];
+function collectWriteSites(plan: PlanNode): WriteSiteAnalysis[] {
+	const sites: WriteSiteAnalysis[] = [];
 	const visited = new Set<PlanNode>();
 	function walk(node: PlanNode): void {
 		if (visited.has(node)) return;
