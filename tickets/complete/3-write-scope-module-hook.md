@@ -1,0 +1,36 @@
+description: A virtual-table module can now opt in to receive, with every row it is asked to write, a description of the statement performing the write — so a module that queues writes can tell at staging time whether another writer could make the queued write fail.
+prereq: write-scope-analyzer
+architecture: docs/change-scope.md
+files: packages/quereus/src/vtab/table.ts, packages/quereus/src/runtime/emit/dml-executor.ts, packages/quereus/src/planner/analysis/write-scope.ts, packages/quereus/src/planner/analysis/write-site-analysis.ts, packages/quereus/src/core/database.ts, packages/quereus-isolation/src/isolated-table.ts, packages/quereus/test/vtab/write-scope-hook.spec.ts, docs/write-scope.md, docs/module-authoring.md, docs/architecture.md, docs/stability.md, docs/.stability.json, tickets/backlog/feat-isolation-forwards-write-scope-at-flush.md
+----
+
+Third of three write-scope tickets. The analyzer ticket gave every `DmlExecutorNode` a memoized `WriteSiteAnalysis`; this one hands that site's `TableWrite` to a module that asks for it. Implementation landed in `ticket(implement): write-scope-module-hook`.
+
+## What shipped
+
+- **Surface (`vtab/table.ts`).** `VirtualTable.wantWriteScope?: boolean` (beside `wantStatements`) and `UpdateArgs.writeScope?: TableWrite`.
+- **Binder (`write-scope.ts`).** `bindTableWrite(write, params)` exported (module-internal; not on the package `index.ts` — a module receives the scope already bound). `bindWriteParameters` delegates to it.
+- **Executor (`emit/dml-executor.ts`).** `resolveWriteScope(rctx, vtab)` runs once per execution in `runInsert` / `runUpdate` / `runDelete`: `undefined` unless the table opted in, the node has a `writeSite`, and the write is not an FK cascade child; otherwise the memo's write with `rctx.params` bound. Threaded as a parameter into all four `vtab.update` sites (insert, update, delete, upsert DO UPDATE arm — the arm gets the INSERT's object).
+- **Cascade suppression.** FK cascade child writes (physical and lens, both under `withFkCascadeReentry`) carry no scope; checked via `db._isFkCascadeReentry()`. `NOTE:` with revisit condition on `resolveWriteScope`.
+- **Isolation.** `IsolatedTable` mirrors `wantStatements` and `wantWriteScope` from the underlying table; both reach the overlay write but not the underlying module at flush — parked in backlog `feat-isolation-forwards-write-scope-at-flush`.
+- **Memo freeze NOTE** in `write-site-analysis.ts` rewritten: `foreign_keys` toggles don't invalidate plans, but the plan's own FK checks are baked the same way, so the description is no staler than its enforcement.
+- **Docs.** `docs/write-scope.md § Module hook` (contract + example decision function), `docs/module-authoring.md § Write scope` (hub section), stability table row and `.stability.json` tier for `write-scope.md`.
+- **Tests.** `test/vtab/write-scope-hook.spec.ts` — six cases at the module boundary: opt-out, shared object across rows, prepared-statement binding, `db.exec` binding, upsert arm sharing, cascade withholding.
+
+## Review findings
+
+Read the implement diff first, then the handoff; read every touched file plus `foreign-key-actions.ts`, `isolated-table.ts`/`flush.ts` update paths, `change-scope.ts` `bindParameters`, `core/param.ts` callers, and the docs that mention write scope.
+
+- **Correctness — all four `vtab.update` sites covered.** Grepped the executor: exactly two `vtab.update!` calls (insert-row and upsert arm) plus the update/delete row paths through the same args shape; each carries `writeScope`. No other engine-issued write path goes through the executor with a scope except nested statements (below). Nothing found.
+- **Correctness — parameter binding cannot throw mid-write.** `bindTableWrite` → `bindParameters` → `normalizeBoundParams` can raise `MisuseError` on double-spelled keys, but `rctx.params` was already normalized by the same function at `prepare` / `bindAll` / `exec`, so re-normalizing is idempotent. A re-executed prepared statement re-binds per execution, so no stale values. Nothing found.
+- **Correctness — cascade flag timing.** Parent's scope is resolved before its row loop (flag false); child's at its own execution start (flag true, set around the whole nested `run`). Save/restore nesting is handled by `withFkCascadeReentry`. Nothing found; the existing concurrency `NOTE:` on that wrapper already covers the only way this could go wrong.
+- **Other nested engine statements.** `apply schema` seed-data inserts (`runtime/emit/schema-declarative.ts`) run as nested statements outside the cascade flag, so an opted-in table gets them described as the plain inserts they are. That's accurate rather than wrong (they are real writes with a real description), so no change. Noted here only.
+- **Isolation mirroring is a construction-time snapshot.** An underlying table that flips `wantWriteScope` after the wrapper is built won't be seen. A getter isn't an option because the base class declares the field (with class-field semantics the own property would shadow a subclass accessor). No module sets it lazily today, so I left it alone. Nothing filed.
+- **Memo analysed lazily at first opted-in run.** If `foreign_keys` is toggled between prepare and the first run, the description and the plan's FK checks can disagree. The rewritten `NOTE:` in `write-site-analysis.ts` already names the revisit condition, so no new work.
+- **Design call — cascade suppression vs. self-description.** The ticket asked for suppression, and the alternative is one deleted condition, named in the site `NOTE:`. Accepted as specified.
+- **Docs.** The doc example in `write-scope.md` was checked against the real types (`WriteConstraint.kind/columns/locality`, `WrittenColumn.column/provenance`, `update(): Promise<UpdateResult>`), and it type-matches. `docs/architecture.md`'s write-scope bullet didn't mention the hook; **fixed** with one clause. README, usage.md and change-scope.md describe only `getWriteScope()`, which is still accurate. `module-authoring.md` is now 106 words from its 12000-word cap; `yarn docs:check` warns about this itself, so the gate is the tripwire and nothing was filed.
+- **Source hygiene.** `dml-executor.ts` grew from 1671 to 1702 lines (`wc -l`). The per-row processors gained one more positional parameter (`processInsertRow` now takes 11). This matches the existing style, and +31 lines is not enough to justify a split ticket, so I left it.
+- **Tests.** All six cases pin distinct contract points at the module boundary, which no other layer covers. The `db.exec` and prepared cases go through different entry paths, so they are not duplicates. The cascade case was mutation-checked by the implementer. None cut, none added. The isolation mirroring is two assignments (wiring) with no test, which is the right call.
+- **Type safety / error handling / resource cleanup.** No `any`, and the result is `undefined` when the memo is absent. Nothing is held across executions except the plan-lifetime memo. Nothing found.
+
+Validation: `yarn workspace @quereus/quereus run lint` passes; `yarn docs:check` passes (cap warnings only); the spec passes; `yarn test` (all workspaces) passes — 10818 quereus specs, 439 isolation, rest green. `yarn test:store` not run.
