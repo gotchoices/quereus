@@ -85,6 +85,11 @@ const CASES: ReadonlyArray<ProvenanceCase> = [
 		expected: { id: { kind: 'literal', value: 7 }, v: { kind: 'other' } },
 	},
 	{
+		name: 'a fresh blob into a text column is other even when no column needs a planned coercion; hex of it stays fresh',
+		sql: `insert into tt (id, body) values (randomblob(16), hex(randomblob(16)))`,
+		expected: { id: { kind: 'other' }, body: { kind: 'fresh', function: 'randomblob' } },
+	},
+	{
 		name: 'multi-row VALUES joins per column: distinct literals drop the value, literal with input is input',
 		sql: `insert into t (id, v) values (1, 'a'), (2, :p)`,
 		expected: { id: { kind: 'literal' }, v: input(['p']) },
@@ -185,6 +190,7 @@ describe('written-value provenance', () => {
 		db.createScalarFunction('stamp_id', { numArgs: 0, fresh: true }, () => crypto.randomUUID());
 		await db.exec(`
 			create table t (id integer primary key, v text, n integer) using memory;
+			create table tt (id text primary key, body text) using memory;
 			create table t3 (id integer primary key, v text, w text) using memory;
 			create table s (x integer primary key) using memory;
 			create table ids (id blob primary key default (randomblob(16)), v text) using memory;

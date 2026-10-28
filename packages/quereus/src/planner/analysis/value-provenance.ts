@@ -456,7 +456,15 @@ export function classifyInsertColumns(node: InsertNode): WrittenColumn[] {
 	const sourceAttributes = node.source.getAttributes();
 	return node.table.tableSchema.columns.map((col, i) => {
 		const attr = sourceAttributes[i] as Attribute | undefined;
-		return { column: col.name.toLowerCase(), provenance: (attr && provenances.get(attr.id)) ?? OTHER };
+		const provenance = attr && provenances.get(attr.id);
+		// emitInsert converts each cell from its source attribute's static type to the
+		// column's declared type, whether or not the builder planned a WriteCoercionNode
+		// (a source already in table shape gets none). Behind a planned coercion the
+		// attribute already carries the declared type, so this is the identity there.
+		return {
+			column: col.name.toLowerCase(),
+			provenance: provenance ? afterWriteConversion(provenance, attr.type.logicalType, col.logicalType, col.name) : OTHER,
+		};
 	});
 }
 
