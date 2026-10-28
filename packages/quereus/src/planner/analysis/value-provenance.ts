@@ -461,7 +461,8 @@ export function classifyInsertColumns(node: InsertNode): WrittenColumn[] {
 		// emitInsert converts each cell from its source attribute's static type to the
 		// column's declared type, whether or not the builder planned a WriteCoercionNode
 		// (a source already in table shape gets none). Behind a planned coercion the
-		// attribute already carries the declared type, so this is the identity there.
+		// attribute already carries the declared type, so a fresh label passes unchanged
+		// and a literal's converted value passes buildCellCoercion's identity guard as-is.
 		return {
 			column: col.name.toLowerCase(),
 			provenance: provenance ? afterWriteConversion(provenance, attr.type.logicalType, col.logicalType, col.name) : OTHER,
