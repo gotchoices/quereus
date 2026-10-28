@@ -141,7 +141,8 @@ export function classifyExpression(expr: ScalarPlanNode, env: ProvenanceEnv): Va
 /**
  * The planner's conversion of an inserted cell to its column's declared type. The insert
  * builder wraps nearly every cell in one, so it is not an operator (that would strip
- * `value` from almost every inserted literal).
+ * `value` from almost every inserted literal). A source already in table shape gets no
+ * wrap; `classifyInsertColumns` applies the same conversion rule for that path.
  */
 function classifyWriteCoercion(node: WriteCoercionNode, env: ProvenanceEnv): ValueProvenance {
 	const operand = classifyExpression(node.operand, env);
