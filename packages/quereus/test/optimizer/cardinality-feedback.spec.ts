@@ -136,6 +136,9 @@ describe('Cardinality feedback overlay', () => {
 			expect(unobserved).to.not.have.property('IndexSeek');
 
 			db._cardinalityFeedback.record(table('big'), 20_000);
+			// The plan flip below is driven by the scan's estimate alone; this pins the
+			// other reader of the seam, so an unwired provider cannot pass.
+			expect(db.optimizer.getStats().tableRows(table('big'))).to.equal(20_000);
 
 			const observed = planNodeTypes();
 			expect(observed).to.include.keys('Join', 'IndexSeek');
