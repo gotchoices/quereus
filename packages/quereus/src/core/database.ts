@@ -40,6 +40,7 @@ import type { DebugOptions } from '../planner/planning-context.js';
 import { EmissionContext } from '../runtime/emission-context.js';
 import { Optimizer, DEFAULT_TUNING } from '../planner/optimizer.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
+import { CatalogStatsProvider } from '../planner/stats/catalog-stats.js';
 import { registerBuiltinWindowFunctions } from '../func/builtins/builtin-window-functions.js';
 import { DatabaseOptionsManager } from './database-options.js';
 import { MAINTENANCE_REBUILD_ROW_THRESHOLD } from '../planner/cost/index.js';
@@ -70,6 +71,7 @@ import type { ExternalRowChange, IngestExternalChangesOptions, IngestExternalCha
 import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViolation } from './database-assertions.js';
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { AutoAnalyzeManager, type AutoAnalyzeManagerContext } from './database-auto-analyze.js';
+import { CardinalityFeedbackManager } from './database-cardinality-feedback.js';
 import { MaterializedViewManager, type BackingConnectionCache, type RegisterMaterializedViewOptions, type ResidualKeyBatch } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
@@ -207,6 +209,8 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private readonly materializedViewManager: MaterializedViewManager;
 	/** Committed-mutation drift tracking that decides when statistics are stale */
 	private readonly autoAnalyzeManager: AutoAnalyzeManager;
+	/** Observed row-count overlay — exact table sizes seen during execution */
+	private readonly cardinalityFeedbackManager: CardinalityFeedbackManager;
 	/** Per-database collation registry — comparator + optional key normalizer +
 	 *  optional REPLICABLE and ORDER-PRESERVING assertions. The normalizer is required
 	 *  for index participation; comparator-only collations may still be used in ORDER BY
@@ -264,8 +268,14 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		registerEmitters();
 
-		// Initialize optimizer with default tuning
-		this.optimizer = new Optimizer(DEFAULT_TUNING);
+		// The overlay is constructed before the optimizer so the stats provider and
+		// `TableReferenceNode` (via `SchemaManager.getObservedRowCounts`) read one object.
+		this.cardinalityFeedbackManager = new CardinalityFeedbackManager({
+			schemaManager: this.schemaManager,
+			getTuning: () => this.optimizer.tuning,
+			onShift: key => log('Observed row count for %s shifted', key),
+		});
+		this.optimizer = new Optimizer(DEFAULT_TUNING, new CatalogStatsProvider(undefined, this.cardinalityFeedbackManager));
 
 		// Initialize transaction manager and assertion evaluator
 		this.transactionManager = new TransactionManager(this);
@@ -1523,6 +1533,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		// Clean up auto-analyze bookkeeping (unsubscribe schema listener, clear counters)
 		this.autoAnalyzeManager.dispose();
+
+		// Drop observed row counts (unsubscribe schema listener)
+		this.cardinalityFeedbackManager.dispose();
 
 		// Clear schemas, ensuring VTabs are potentially disconnected
 		// This will also call destroy on VTabs via SchemaManager.clearAll -> schema.clearTables -> schemaManager.dropTable
@@ -2864,6 +2877,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal Auto-analyze staleness bookkeeping and background refresh scheduler. */
 	public get _autoAnalyze(): AutoAnalyzeManager {
 		return this.autoAnalyzeManager;
+	}
+
+	/** @internal The observed row-count overlay the planner consults before the catalog. */
+	public get _cardinalityFeedback(): CardinalityFeedbackManager {
+		return this.cardinalityFeedbackManager;
 	}
 
 	/**

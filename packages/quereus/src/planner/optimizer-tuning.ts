@@ -221,6 +221,29 @@ export interface OptimizerTuning {
 		 */
 		readonly maxCrossProduct: number;
 	};
+
+	/**
+	 * Cardinality feedback: exact table sizes observed during execution, kept in the
+	 * per-database overlay (`core/database-cardinality-feedback.ts`). See
+	 * docs/progressive-optimizer.md §3.4 for the record/shift policy.
+	 */
+	readonly cardinalityFeedback: {
+		/**
+		 * An observation is recorded only when the observed count or the count
+		 * planning would use without it exceeds this. Below it every plan finishes
+		 * fast, so small tables keep the numbers they plan with today.
+		 */
+		readonly minRows: number;
+		/**
+		 * A recorded count "shifts" — resets the entry's baseline and notifies
+		 * re-planning — when `(max(n, baseline) + 1) / (min(n, baseline) + 1)`
+		 * reaches this factor. Hysteresis: counts wobbling within it never disturb
+		 * a cached plan, while steady growth shifts once it has accumulated.
+		 */
+		readonly shiftFactor: number;
+		/** Maximum tables held in the overlay; least-recently-used evicted beyond it. */
+		readonly maxTables: number;
+	};
 }
 
 /**
@@ -304,5 +327,10 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 		// unknown estimates count as exceeding it. Bounds the per-outer-row
 		// product replay the node materializes.
 		maxCrossProduct: 1_000_000,
-	}
+	},
+	cardinalityFeedback: {
+		minRows: 1000,
+		shiftFactor: 10,
+		maxTables: 512,
+	},
 };

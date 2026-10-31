@@ -44,15 +44,15 @@ import { type IndexStyleContext, isIndexStyleContext } from '../shared/index-sty
 const log = createLogger('optimizer:rule:grow-retrieve');
 
 /**
- * The row count for a `BestAccessPlanRequest`: the catalog's measured count, or
- * `undefined` when nothing has measured it. Never a fabricated number.
+ * The row count for a `BestAccessPlanRequest`: the measured count, or `undefined` when
+ * nothing has measured it. Never a fabricated number.
  *
- * `TableReferenceNode.estimatedRows` is `catalogRowCount(tableSchema)` — populated only
- * by `ANALYZE` (or a module reporting statistics), where a real `0` means "measured,
- * empty" and `undefined` means "nobody knows".
+ * `TableReferenceNode.estimatedRows` is `plannedRowCount(tableSchema, …)` — an exact
+ * count observed during execution, else `ANALYZE`'s (or a module's reported statistics),
+ * where a real `0` means "measured, empty" and `undefined` means "nobody knows".
  *
  * `context.stats.tableRows()` is deliberately NOT consulted here. `CatalogStatsProvider`
- * reads that same `catalogRowCount` and, finding nothing, falls back to
+ * reads that same `plannedRowCount` and, finding nothing, falls back to
  * `NaiveStatsProvider`'s fixed 1000 — so routing through it would hand the module a
  * made-up size indistinguishable from a real 1000-row `ANALYZE` result, and lock out
  * every module that can size itself better (`quereus-store` keeps a live row count).

@@ -4,7 +4,7 @@ This document describes how Quereus improves plans from what execution reveals, 
 
 Quereus targets deployments where table storage may sit behind a network — a distributed hash table, a remote store — so every read is expensive and a full scan run only to collect statistics is often unaffordable. The optimizer must produce good plans with zero collected statistics, and improve them using numbers that *essential* execution produces anyway. Statistics are hints that improve a good plan, never prerequisites without which the plan is bad.
 
-**Status.** Sections 1, 2 and 4–6 describe settled design and current code. Section 3, *cardinality feedback*, is the refreshed design for work that has not landed yet; it is being built by the `cardinality-feedback-*` tickets (`tickets/implement/`), each of which updates this document as it lands.
+**Status.** Sections 1, 2 and 4–6 describe settled design and current code. Section 3, *cardinality feedback*, is being built by the `cardinality-feedback-*` tickets (`tickets/implement/`), each of which updates this document as it lands. Landed: the overlay, the one row-count seam and the record/shift policy (3.2–3.4). Nothing records into the overlay yet — scan observation (3.1) and publication (3.5) are next — and a shift is only debug-logged until re-planning (3.6) lands. The rest of section 3 is design.
 
 ---
 
@@ -26,9 +26,9 @@ Quereus targets deployments where table storage may sit behind a network — a d
 The feedback design in section 3 builds on these existing pieces; none of them is new work.
 
 - **Plan cache per statement.** A prepared `Statement` keeps its optimized plan, emission context and scheduler, and drops all three together in `Statement.invalidatePlan()` (`core/statement.ts`). Hard invalidation is a schema-change listener registered in `Statement.compile()` over the dependencies the builder recorded (`BuildTimeDependencyTracker`, `planner/planning-context.ts`); a schema event naming one of them invalidates the plan, which is rebuilt from the retained AST on next use. `db.get` / `db.eval` / `db.exec` prepare (or plan) afresh on every call.
-- **Catalog statistics.** `CatalogStatsProvider` (`planner/stats/catalog-stats.ts`) reads `TableSchema.statistics` — row count, per-column distinct and null counts, min/max, equi-height histograms, collected by `ANALYZE` — and falls back to `NaiveStatsProvider` (1000 rows, flat selectivities). Base-table row counts go through one seam, `catalogRowCount` (`planner/stats/table-cardinality.ts`), read by both `TableReferenceNode.estimatedRows` and `CatalogStatsProvider.tableRows`, so scan cardinality and selectivity denominators cannot disagree. See [Optimizer Cost and Statistics](optimizer-costing.md#statistics-abstraction).
+- **Catalog statistics.** `CatalogStatsProvider` (`planner/stats/catalog-stats.ts`) reads `TableSchema.statistics` — row count, per-column distinct and null counts, min/max, equi-height histograms, collected by `ANALYZE` — and falls back to `NaiveStatsProvider` (1000 rows, flat selectivities). Base-table row counts go through one seam, `plannedRowCount` (`planner/stats/table-cardinality.ts`), read by both `TableReferenceNode.estimatedRows` and `CatalogStatsProvider.tableRows`, so scan cardinality and selectivity denominators cannot disagree; it consults the observed row-count overlay (3.2) before the catalog. See [Optimizer Cost and Statistics](optimizer-costing.md#statistics-abstraction).
 - **Auto-analyze.** `AutoAnalyzeManager` (`core/database-auto-analyze.ts`, on by default) counts rows changed by committed transactions and, past `max(500, 20%)` of the known size, runs `ANALYZE` for that table in the background — skipping tables above `auto_analyze_row_limit` (100,000). `ANALYZE` swaps the table's `TableSchema` and fires `table_modified`, which invalidates every cached plan reading that table. So local tables that this session writes already get fresh catalog statistics without anyone typing `ANALYZE`.
-- **Module access-path sizing.** `rule-select-access-path` hands the catalog row count to `getBestAccessPlan` as `request.estimatedRows` (`undefined` when unknown); a module that knows its own size may substitute it there, as `StoreModule` does from its running count. Nothing calls `VirtualTable.getStatistics()` during planning.
+- **Module access-path sizing.** `rule-select-access-path` hands the planned row count to `getBestAccessPlan` as `request.estimatedRows` (`undefined` when unknown); a module that knows its own size may substitute it there, as `StoreModule` does from its running count. Nothing calls `VirtualTable.getStatistics()` during planning.
 - **Work counters (diagnostic only).** With `runtime_metrics` on, each execution feeds a `WorkCounterCollector` (`runtime/work-counters.ts`): per-instruction executions and rows, per-table `query()` calls and rows scanned, keyed by structural program address. Metrics mode wraps every streaming output in a counting generator and times every instruction, which is why it is a debugging and benchmarking instrument and not the feedback channel. See [Runtime Work Counters](runtime-work-counters.md).
 
 The gap these leave: a table this session has not written — opened from storage with data and no saved statistics, served by a remote module, larger than the auto-analyze limit, or in a session with `auto_analyze` off — is planned at the 1000-row default (or at an `ANALYZE` snapshot that has since drifted) for as long as the session lives, even after a query has read every one of its rows.
@@ -65,12 +65,12 @@ A `Database` owns one overlay (`CardinalityFeedbackManager`, `core/database-card
 
 ### 3.3 Precedence: one row count per plan
 
-The row-count seam becomes `plannedRowCount(table, observed)` (`planner/stats/table-cardinality.ts`): the overlay's count when it has a valid entry, else `catalogRowCount(table)`, else `undefined` (unknown — callers keep applying their own defaults). Both readers of the old seam switch to it, so the "cannot disagree" guarantee carries over:
+The row-count seam is `plannedRowCount(table, observed)` (`planner/stats/table-cardinality.ts`): the overlay's count when it has a valid entry, else `catalogRowCount(table)`, else `undefined` (unknown — callers keep applying their own defaults). Both planner readers call it, so scan cardinality and selectivity denominators cannot disagree ([OPT-062](invariants.md#opt-062--one-base-table-row-count-per-plan)):
 
 - `TableReferenceNode` computes its estimate **once, at construction**, from the overlay reachable through its `SchemaManager`. Plan nodes are immutable, so a node built before an observation keeps the number its plan was costed with.
 - `CatalogStatsProvider.tableRows` consults the same overlay, injected when the `Database` constructs its `Optimizer`. Building and optimizing happen in one synchronous `compile()`, so the overlay cannot change between the node's snapshot and the provider's read.
 
-Only the row count is overridden. Per-column distinct counts, null counts and histograms — selectivity *fractions* — still come from the catalog, and with no catalog statistics the naive selectivities still apply. The overlay value also becomes `request.estimatedRows` for `getBestAccessPlan`, because the access path must be priced against the same size as the plan around it. A self-sizing module (`StoreModule`) honors a supplied hint over its own running count, so between full scans it now prices against the last observed size rather than its live one — accepted for one-size-per-plan consistency; when a module's live size reaches the planner (`feat-planner-asks-the-backend-how-big-a-table-is`), it should outrank the overlay.
+Only the row count is overridden. Per-column distinct counts, null counts and histograms — selectivity *fractions* — still come from the catalog, and with no catalog statistics the naive selectivities still apply. The overlay value is also `request.estimatedRows` for `getBestAccessPlan`, because the access path must be priced against the same size as the plan around it. A self-sizing module (`StoreModule`) honors a supplied hint over its own running count, so between full scans it prices against the last observed size rather than its live one — accepted for one-size-per-plan consistency; when a module's live size reaches the planner (`feat-planner-asks-the-backend-how-big-a-table-is`), it should outrank the overlay.
 
 The other `catalogRowCount` callers — assertion and watcher delta sizing, the lens prover's cardinality band, auto-analyze's staleness arithmetic — stay catalog-only.
 
@@ -78,6 +78,7 @@ The other `catalogRowCount` callers — assertion and watcher delta sizing, the 
 
 For an observed count `n` of table `T`, let `before` be what planning would use right now: the overlay entry, else the catalog count, else `tuning.defaultRowEstimate` (1000). Let `spread(a, b) = (max(a, b) + 1) / (min(a, b) + 1)`.
 
+- **Ignore** an observation made under a `TableSchema` that is no longer the catalog's current object for its name — it describes nothing current.
 - **Record** only when `max(before, n) > cardinalityFeedback.minRows` (default 1000). Below that size every plan finishes fast, so a tiny table keeps the numbers it plans with today — which is also what keeps the SQL logic test corpus (largest generated table: 200 rows) from changing plans.
 - A recorded count always replaces `rows`, so the next compile of any statement uses the freshest exact count.
 - **Shift** when `spread(n, baselineRows) ≥ cardinalityFeedback.shiftFactor` (default 10). A new entry's baseline is `before`; a shift resets the baseline to `n` and notifies the re-planning machinery (3.6). Measuring against the baseline rather than the previous count means steady growth in small steps still shifts once it has accumulated to 10×, while a count wobbling within 10× of the baseline never disturbs a cached plan.
@@ -150,11 +151,11 @@ A shift for `T` walks the `Database`'s live statements and marks those whose cur
 
 | File | Role |
 |---|---|
-| `src/planner/stats/table-cardinality.ts` | The base-table row-count seam (`catalogRowCount`, and `plannedRowCount` once feedback lands) |
+| `src/planner/stats/table-cardinality.ts` | The base-table row-count seam (`plannedRowCount`, over `catalogRowCount`) |
 | `src/planner/stats/catalog-stats.ts` | `CatalogStatsProvider` — catalog statistics, naive fallback |
 | `src/planner/nodes/reference.ts` | `TableReferenceNode.estimatedRows` — every scan's base cardinality |
 | `src/core/database-auto-analyze.ts` | Committed-change staleness and background `ANALYZE` |
-| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, publication policy, shift detection (planned) |
+| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, record policy, shift detection (publication: planned) |
 | `src/runtime/emit/scan.ts` | The scan leaf, where complete enumerations are observed |
 | `src/runtime/work-counters.ts` | Diagnostic work counters (not the feedback channel) |
 | `src/core/statement.ts` | Plan cache, `invalidatePlan()`, schema-change invalidation |

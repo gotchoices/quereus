@@ -596,6 +596,23 @@ covered by construction rather than by remembering to call it. Violating it fail
 as "No row context found for column …"; see the rule-families link for the OR-collapse case
 that motivated it.
 
+### OPT-062 — One base-table row count per plan
+
+- code: `packages/quereus/src/planner/stats/table-cardinality.ts` — `plannedRowCount`
+- code: `packages/quereus/src/planner/nodes/reference.ts` — `TableReferenceNode`
+- code: `packages/quereus/src/planner/stats/catalog-stats.ts` — `CatalogStatsProvider`
+- guard: `packages/quereus/test/optimizer/cardinality-feedback.spec.ts` — `an observed size reaches the plan: the join flips from hash to a primary-key seek`
+- doc: [Optimizer Cost and Statistics § Statistics Abstraction](optimizer-costing.md#statistics-abstraction)
+
+Every planner reading of a base table's row count — `TableReferenceNode.estimatedRows`
+(scan cardinality and the `BestAccessPlanRequest.estimatedRows` hint) and
+`CatalogStatsProvider.tableRows` (selectivity denominators, materialized-view sizing) — goes
+through `plannedRowCount` with the owning database's one observed row-count overlay, so
+within one compile they answer the same number for the same `TableSchema`. The node reads it
+once, at construction, never afterwards; a provider built without that overlay (or a node
+built without its `SchemaManager`) reads the catalog alone and may disagree with plans that
+saw an observation.
+
 ## MV — Materialized views
 
 The read-side rewrite and the coverage prover are optimizer concerns, not MV ones: a view no

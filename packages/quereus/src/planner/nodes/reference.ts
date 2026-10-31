@@ -11,7 +11,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { Scope } from '../scopes/scope.js';
 import type * as AST from '../../parser/ast.js';
 import { columnSchemaToScalarType, relationTypeFromTableSchema } from '../type-utils.js';
-import { catalogRowCount } from '../stats/table-cardinality.js';
+import { plannedRowCount } from '../stats/table-cardinality.js';
 import { Cached } from '../../util/cached.js';
 import type { FunctionSchema } from '../../schema/function.js';
 import { isTableValuedFunctionSchema } from '../../schema/function.js';
@@ -32,6 +32,13 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 
 	private typeCache: Cached<RelationType>;
 	private attributesCache: Cached<Attribute[]>;
+	/**
+	 * Snapshot of the planned row count, taken at construction. Plan nodes are
+	 * immutable (OPT-008): a node built before a cardinality observation keeps the
+	 * number its plan was costed with, and the stats provider read in the same
+	 * synchronous compile sees the same overlay state.
+	 */
+	private readonly plannedRows: number | undefined;
 
 	constructor(
 		scope: Scope,
@@ -52,6 +59,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		public readonly schemaManager?: SchemaManager,
 	) {
 		super(scope, estimatedCostOverride ?? 1);
+		this.plannedRows = plannedRowCount(tableSchema, schemaManager?.getObservedRowCounts());
 		this.typeCache = new Cached(() => relationTypeFromTableSchema(tableSchema));
 		this.attributesCache = new Cached(() => {
 			// Create attributes from table schema columns
@@ -89,7 +97,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 	}
 
 	get estimatedRows(): number | undefined {
-		return catalogRowCount(this.tableSchema);
+		return this.plannedRows;
 	}
 
 	computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
