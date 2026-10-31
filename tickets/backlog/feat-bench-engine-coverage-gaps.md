@@ -68,3 +68,11 @@ streaming aggregation, fan-out join clustering) is the highest-value target, bec
 regression mode is not "the code got slower" but "the fast path stopped being chosen" -
 which is exactly what a twin-comparison ratio guard detects and a lone absolute timing
 does not.
+
+# Arm: the planner suite does not time planning (found during the `adaptive-query-optimization` refresh)
+
+`bench/suites/planner.bench.mjs` times `db.prepare(sql)` followed by `stmt.finalize()`. `Database.prepare` only parses — `Statement` defers planning to the first compile — so the four "planner" timings measure parsing and statement construction, not planning. Measured on one machine against the suite's own `join-plan` SQL and schema: the suite's `fn` costs about 92 µs; the same with `stmt.compile()` added costs about 3.8 ms. `docs/benchmarking.md` describes the suite as "AST to optimized plan", and the "Plan cache and prepared-statement reuse" item above assumes it "times planning from scratch"; neither holds. Only the untimed `counters()` pass (`snapshotPlanShape`) actually compiles.
+
+Fix shape: make each `fn` compile (`stmt.compile()`, `stmt.getPlanShape()`, or `db.getPlan(sql)`), keeping `counters()` as is. Plan-shape counters are unchanged, so `bench/reference/planner.json` needs no re-accept; only local timing baselines jump.
+
+Menu item to add: **cardinality feedback re-plan** — once `cardinality-feedback-replan` lands, a twin pair (the same join over a large never-analyzed table, with `cardinality_feedback` on and off) under a ratio guard would catch "the feedback stopped correcting the plan" from a single run. The deterministic plan-shape test in that ticket is the contract; the guard is optional extra coverage.

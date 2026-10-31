@@ -161,5 +161,4 @@ The context-scoped design enables sophisticated optimization strategies:
 
 **Progressive Optimization** (see [progressive-optimizer.md](./progressive-optimizer.md)):
 - Contexts can carry different statistics or cost models
-- Tier 2 re-optimization re-runs physical selection with runtime stats overlay
-- Runtime cardinality feedback updates stats between executions
+- Cardinality feedback re-plans a cached statement in full, with a fresh context, when an observed table size invalidates the one its plan was costed with — it never resumes a partially optimized plan

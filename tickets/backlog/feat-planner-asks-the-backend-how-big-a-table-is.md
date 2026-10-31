@@ -79,3 +79,10 @@ Open questions a design pass has to settle:
   before it asks a backend for an *access plan*, which lets the store size its own access
   paths. This ticket is the remaining half: the planner's **own** cost model — join
   algorithm choice, cache sizing — still reads only the catalog.
+
+## Interaction with cardinality feedback (added during the `adaptive-query-optimization` refresh)
+
+The `cardinality-feedback-*` tickets (`tickets/implement/`, design in `docs/progressive-optimizer.md` §3) change the seam this ticket targets: `catalogRowCount` gives way to `plannedRowCount(table, observed)`, which prefers an exact row count observed during execution (a complete scan of the table, valid only for the `TableSchema` object it was observed under) over the catalog's `ANALYZE` number. Two consequences for this ticket:
+
+- **Precedence.** A module's cheap live count is fresher than both an observation and an `ANALYZE` snapshot, so when it lands it should rank first: module live count, then observed count, then catalog, then the default. Until then, the overlay value is passed to `getBestAccessPlan` as `request.estimatedRows`, which `StoreModule` honors over its own running count — an accepted tradeoff recorded at `plannedRowCount`.
+- **"Where the call goes" gets a new option.** Instead of calling `getStatistics()` during planning (synchronous seam vs. possibly-asynchronous call), the engine could ask a module for its size at execution time — when a scan has already connected to the table — and publish the answer into the same overlay, so the *next* plan uses it. That keeps planning free of I/O and reuses the overlay's invalidation (a size shift re-plans dependent cached statements).

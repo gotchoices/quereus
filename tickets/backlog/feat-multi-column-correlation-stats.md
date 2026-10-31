@@ -48,4 +48,5 @@ Roughly in increasing order of cost:
 ## Related
 
 Follows `feat-conjunction-selectivity` and `feat-join-filter-selectivity`. Part of the broader
-`adaptive-query-optimization` direction.
+progressive-optimization direction (`docs/progressive-optimizer.md`); observed combined
+selectivities would overlap it — see `feat-cardinality-feedback-beyond-table-size`.

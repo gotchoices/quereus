@@ -24,8 +24,8 @@ Two defects:
    should tolerate results *larger* than the estimate (e.g. `estimatedRows * 2`).
    `estimatedRows * 0.1` means a result only has to reach 10% of its own accurate
    estimate to abandon — with perfect statistics the cache still fails. Better stats
-   (including the planned adaptive-optimizer feedback loop,
-   `tickets/backlog/known/2-adaptive-query-optimization.md`) make no difference.
+   (including the planned cardinality-feedback loop,
+   `docs/progressive-optimizer.md` §3) make no difference.
 
 2. **Abandonment is a silent complexity cliff.** Past the threshold, behavior flips
    from O(K) once to O(N×K) — for store-backed tables that is N remote scans. The
