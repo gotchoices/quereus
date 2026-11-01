@@ -91,6 +91,8 @@ An observation describes the rows its scan could see, which inside a transaction
 - an execution that ends with no transaction open publishes immediately;
 - otherwise its observations are held until the transaction ends. On commit — in the same post-commit window auto-analyze reads the change log — held observations are applied, **except** for tables the transaction itself changed, whose mid-transaction counts may no longer hold. A rollback, a `rollback to savepoint`, or a failed commit discards everything held.
 
+**Interim:** holding is not built yet (`cardinality-feedback-commit-scoped-publication`). Today `CardinalityFeedbackManager.publish` discards observations from an execution that ends with a transaction open — every statement inside an explicit transaction, and every writing statement in autocommit mode, whose implicit transaction is still open when the run site publishes. Publication runs in the run site's `finally`, after the execution's scan connections are disconnected; it is bookkeeping, so a failure is logged at warn and never fails the statement.
+
 ### 3.6 Re-planning cached statements
 
 A shift for `T` walks the `Database`'s live statements and marks those whose current plan depends on `T` (the table dependencies `compile()` already collects). A marked statement re-plans at the start of its next execution by calling `Statement.invalidatePlan()` — the same full rebuild from the retained AST a schema change triggers. A running execution is never disturbed; the mark waits for the next one.
@@ -155,8 +157,9 @@ A shift for `T` walks the `Database`'s live statements and marks those whose cur
 | `src/planner/stats/catalog-stats.ts` | `CatalogStatsProvider` — catalog statistics, naive fallback |
 | `src/planner/nodes/reference.ts` | `TableReferenceNode.estimatedRows` — every scan's base cardinality |
 | `src/core/database-auto-analyze.ts` | Committed-change staleness and background `ANALYZE` |
-| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, record policy, shift detection (publication: planned) |
-| `src/runtime/emit/scan.ts` | The scan leaf, where complete enumerations are observed |
+| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, record policy, shift detection, publication (`publish`) |
+| `src/runtime/emit/scan.ts` | The scan leaf, where complete enumerations are observed (`enumeratesWholeTable`) |
+| `src/runtime/cardinality-observations.ts` | Per-execution observation sink on the `RuntimeContext` |
 | `src/runtime/work-counters.ts` | Diagnostic work counters (not the feedback channel) |
 | `src/core/statement.ts` | Plan cache, `invalidatePlan()`, schema-change invalidation |
 | `src/planner/optimizer-tuning.ts` | `defaultRowEstimate`, and the `cardinalityFeedback` knobs once they land |

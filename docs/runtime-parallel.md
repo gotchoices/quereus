@@ -43,6 +43,7 @@ Three invariants govern what code may do with a `RuntimeContext` once it has bee
 | `cteMaterializations` | `shared-cooperative` | Once-per-execution shared CTE buffer map; shared so a CTE materialized in one branch replays in a sibling branch instead of re-driving the source. |
 | `inSetProbes` | `shared-cooperative` | Once-per-execution uncorrelated `IN`-subquery lookup-set map; shared so a set materialized in one branch is visible to a sibling re-driving the same `IN` site. |
 | `workCounters` | `shared-sink` | Per-execution work-counter collector ([Runtime Work Counters](runtime-work-counters.md)); shared by reference so a forked branch's counts roll up with no merge step. |
+| `cardinalityObservations` | `shared-sink` | Per-execution cardinality-feedback sink ([Progressive Optimizer § 3.1](progressive-optimizer.md#31-what-is-observed)); shared by reference so a full scan completed in a forked branch reports into the parent's sink, published once at execution end. |
 
 Adding a new field to `RuntimeContext` requires adding it to `EXPECTED_FORK_POLICY` in `fork-contract.spec.ts` with a declared policy — the test fails compile otherwise.
 
