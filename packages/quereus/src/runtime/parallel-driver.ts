@@ -100,6 +100,9 @@ export class ParallelDriver {
 	 *   forked branch roll up into the parent's snapshot with no merge step. It is a
 	 *   plain object field, not one of the two strict-fork-wrapped maps, so
 	 *   incrementing it from a fork never trips the strict-fork parent-mutation guard.)
+	 *   (`cardinalityObservations` is the per-execution cardinality-feedback sink; shared
+	 *   by reference for the same reason as `workCounters` — a full scan completed inside
+	 *   a forked branch reports into the parent's sink, published once at execution end.)
 	 *
 	 * The parent is treated as immutable for the lifetime of the forks.
 	 */
@@ -146,6 +149,7 @@ export class ParallelDriver {
 				cteMaterializations: rctx.cteMaterializations,
 				inSetProbes: rctx.inSetProbes,
 				workCounters: rctx.workCounters,
+				cardinalityObservations: rctx.cardinalityObservations,
 			};
 			if (strict) {
 				markForkOf(childTableContexts, rctx.tableContexts);

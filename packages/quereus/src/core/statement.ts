@@ -10,6 +10,7 @@ import { emitPlanNode } from '../runtime/emitters.js';
 import { Scheduler } from '../runtime/scheduler.js';
 import type { InstructionTracer, RuntimeContext } from '../runtime/types.js';
 import { WorkCounterCollector, computePlanShape, type PlanShape, type WorkCounterSnapshot } from '../runtime/work-counters.js';
+import type { CardinalityObservations } from '../runtime/cardinality-observations.js';
 import { createStrictRowContextMap, wrapTableContextsStrict } from '../runtime/strict-fork.js';
 import { REPR_STRICT } from '../runtime/strict-flags.js';
 import { assertRowConforms, type DeclaredType } from '../runtime/strict-representation.js';
@@ -470,6 +471,7 @@ export class Statement {
 		// it after the try body assigns it.
 		const scanConnections = new Map<symbol, VirtualTable>();
 		let runtimeCtx: RuntimeContext | undefined;
+		let cardinalityObservations: CardinalityObservations | undefined;
 		try {
 			// Drop the previous execution's counters up front, so every early exit
 			// below (empty block, compile throw) leaves `getWorkCounters()` reporting
@@ -503,6 +505,7 @@ export class Statement {
 			if (collector) {
 				this.workCounters = { collector, planShape: computePlanShape(blockPlanNode) };
 			}
+			cardinalityObservations = this.db._beginCardinalityObservations();
 			runtimeCtx = {
 				db: this.db,
 				stmt: this,
@@ -515,6 +518,7 @@ export class Statement {
 				scanConnections,
 				readCommitted: runtimeOverrides?.readCommitted,
 				workCounters: collector,
+				cardinalityObservations,
 			};
 
 			// Validate captured schema objects once per execution — hoisted out of every
@@ -554,6 +558,7 @@ export class Statement {
 				}
 			}
 			scanConnections.clear();
+			this.db._publishCardinalityObservations(cardinalityObservations, runtimeOverrides?.readCommitted ?? false);
 			this.busy = false;
 		}
 	}

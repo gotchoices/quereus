@@ -46,6 +46,7 @@ describe('Cardinality feedback overlay', () => {
 			overlay = new CardinalityFeedbackManager({
 				schemaManager: db.schemaManager,
 				getTuning: () => tuning,
+				getAutocommit: () => true,
 				onShift: key => shifts.push(key),
 			});
 		});

@@ -11,6 +11,7 @@ import type { CacheState } from './cache/shared-cache.js';
 import type { BTree } from 'inheritree';
 import type { PlanNodeType } from '../planner/nodes/plan-node-type.js';
 import type { WorkCounterCollector } from './work-counters.js';
+import type { CardinalityObservations } from './cardinality-observations.js';
 
 // Re-export types from common/types.js for convenience
 export type { OutputValue };
@@ -149,6 +150,16 @@ export type RuntimeContext = {
 	 * into the parent snapshot with no merge step (see parallel-driver.ts).
 	 */
 	workCounters?: WorkCounterCollector;
+	/**
+	 * Per-execution sink for complete base-table enumerations (cardinality feedback,
+	 * docs/progressive-optimizer.md §3.1); present only when the `cardinality_feedback`
+	 * option is on AND the execution site built one (`Statement._iterateRowsRawInternal`,
+	 * `Database._executeSingleStatement`). The internal run sites (deferred constraints,
+	 * assertions, materialized-view apply, `ANALYZE`) leave it undefined, so their scans
+	 * observe nothing. Independent of {@link workCounters}. Fork policy `shared-sink`:
+	 * forks report into the parent's sink by reference (see parallel-driver.ts).
+	 */
+	cardinalityObservations?: CardinalityObservations;
 };
 
 export type InstructionRun = (ctx: RuntimeContext, ...args: RuntimeValue[]) => OutputValue;

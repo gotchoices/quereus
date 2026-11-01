@@ -83,6 +83,9 @@ const EXPECTED_FORK_POLICY = {
 	// tracer/planStack) so counts from a forked branch roll up into the parent's
 	// snapshot with no merge step.
 	workCounters: 'shared-sink',
+	// Per-execution cardinality-feedback sink: write-only like workCounters, so a full
+	// scan completed in a forked branch reports into the parent's sink.
+	cardinalityObservations: 'shared-sink',
 } as const satisfies Record<keyof RuntimeContext, ForkPolicy>;
 
 /**
@@ -221,6 +224,7 @@ describe('Fork contract (test harness)', () => {
 			parent.cteMaterializations = new Map();
 			parent.inSetProbes = new Map();
 			parent.workCounters = {} as unknown as RuntimeContext['workCounters'];
+			parent.cardinalityObservations = {} as unknown as RuntimeContext['cardinalityObservations'];
 
 			const [fork] = driver.fork(parent, 1);
 

@@ -12,12 +12,16 @@
  * re-create) silences it, and a schema-change listener evicts it. The identity
  * check is the correctness guard; the listener is memory hygiene.
  *
+ * Execution feeds it through {@link CardinalityFeedbackManager.publish}, which admits
+ * only counts of committed state.
+ *
  * Nothing here is persisted: a new `Database` starts empty. See
- * docs/progressive-optimizer.md §3.2–3.4.
+ * docs/progressive-optimizer.md §3.2–3.5.
  */
 
 import { createLogger } from '../common/logger.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
+import type { CardinalityObservations } from '../runtime/cardinality-observations.js';
 import { catalogRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import type { TableSchema } from '../schema/table.js';
@@ -31,6 +35,8 @@ export interface CardinalityFeedbackManagerContext {
 	readonly schemaManager: Database['schemaManager'];
 	/** Read on every record, so `Database.updateOptimizerTuning` takes effect immediately. */
 	getTuning(): OptimizerTuning;
+	/** True when no transaction (explicit or implicit) is open. */
+	getAutocommit(): boolean;
 	/**
 	 * A recorded count moved at least `cardinalityFeedback.shiftFactor` away from the
 	 * entry's baseline: plans costed against the old number may be wrong. `key` is the
@@ -126,6 +132,25 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		entry.baselineRows = rows;
 		entry.shifts++;
 		this.ctx.onShift(key);
+	}
+
+	/**
+	 * Offer one finished execution's observations (docs/progressive-optimizer.md §3.5).
+	 * A count taken inside an open transaction may include that transaction's uncommitted
+	 * writes, so only a committed read (`readCommitted`) or an execution that ended with no
+	 * transaction open is recorded.
+	 */
+	publish(observations: CardinalityObservations, options: { readCommitted: boolean }): void {
+		if (!options.readCommitted && !this.ctx.getAutocommit()) {
+			// NOTE: interim — includes every writing statement in autocommit mode, whose
+			// implicit transaction is still open here. `cardinality-feedback-commit-scoped-publication`
+			// holds these until commit instead.
+			debugLog('Discarded observations made inside an open transaction');
+			return;
+		}
+		for (const [table, rows] of observations.entries()) {
+			this.record(table, rows);
+		}
 	}
 
 	/** Forget every observation; later compiles read the catalog only. */

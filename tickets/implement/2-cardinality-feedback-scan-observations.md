@@ -4,6 +4,13 @@ architecture: docs/progressive-optimizer.md#31-what-is-observed
 files: packages/quereus/src/runtime/emit/scan.ts, packages/quereus/src/runtime/cardinality-observations.ts (new), packages/quereus/src/runtime/types.ts, packages/quereus/src/runtime/parallel-driver.ts, packages/quereus/src/core/statement.ts, packages/quereus/src/core/database.ts, packages/quereus/src/core/database-cardinality-feedback.ts, packages/quereus/test/runtime/fork-contract.spec.ts, packages/quereus/test/runtime/cardinality-observations.spec.ts (new), docs/progressive-optimizer.md, docs/runtime-parallel.md
 difficulty: medium
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-11-01T01:16:16.639Z (agent: claude)
+  Log file: C:\projects\quereus\tickets\.logs\2-cardinality-feedback-scan-observations.implement.2026-11-01T01-16-16-639Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # Observe complete table enumerations at the scan leaf
 

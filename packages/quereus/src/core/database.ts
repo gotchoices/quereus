@@ -72,6 +72,7 @@ import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViola
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { AutoAnalyzeManager, type AutoAnalyzeManagerContext } from './database-auto-analyze.js';
 import { CardinalityFeedbackManager } from './database-cardinality-feedback.js';
+import { CardinalityObservations } from '../runtime/cardinality-observations.js';
 import { MaterializedViewManager, type BackingConnectionCache, type RegisterMaterializedViewOptions, type ResidualKeyBatch } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
@@ -80,6 +81,7 @@ import { Table } from './table-handle.js';
 
 const log = createLogger('core:database');
 const errorLog = log.extend('error');
+const warnLog = log.extend('warn');
 
 /** Result from _buildPlan containing both the plan tree and its schema dependencies. */
 export interface BuildPlanResult {
@@ -273,6 +275,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.cardinalityFeedbackManager = new CardinalityFeedbackManager({
 			schemaManager: this.schemaManager,
 			getTuning: () => this.optimizer.tuning,
+			getAutocommit: () => this.transactionManager.getAutocommit(),
 			onShift: key => log('Observed row count for %s shifted', key),
 		});
 		this.optimizer = new Optimizer(DEFAULT_TUNING, new CatalogStatsProvider(undefined, this.cardinalityFeedbackManager));
@@ -508,6 +511,20 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				'statistics were last collected for it, so stale statistics can be detected and refreshed. ' +
 				'When off, no counting happens at all — turning it back on mid-session resumes from whatever ' +
 				'each table\'s count already was, without reconstructing the mutations missed while it was off.',
+		});
+
+		// Default off until `cardinality-feedback-on-by-default` measures it on. The gate is the
+		// per-execution sink's presence, so a toggle takes effect at the next execution even
+		// for a statement whose emitted plan is cached.
+		this.options.registerOption('cardinality_feedback', {
+			type: 'boolean',
+			defaultValue: false,
+			description: 'Remember the exact row count of any table a query happens to read in full, and plan ' +
+				'later statements against it in place of a default or outdated statistics. Turning it off ' +
+				'forgets every remembered count.',
+			onChange: (event) => {
+				if (!event.newValue) this.cardinalityFeedbackManager.clear();
+			},
 		});
 
 		this.options.registerOption('auto_analyze_min_mutations', {
@@ -973,6 +990,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		const scheduler = new Scheduler(rootInstruction);
 
 		const scanConnections = new Map<symbol, VirtualTable>();
+		const cardinalityObservations = this._beginCardinalityObservations();
 		const runtimeCtx: RuntimeContext = {
 			db: this,
 			stmt: undefined,
@@ -983,6 +1001,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			enableMetrics: this.options.getBooleanOption('runtime_stats'),
 			signal,
 			scanConnections,
+			cardinalityObservations,
 		};
 
 		try {
@@ -1000,6 +1019,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			for (const vtab of scanConnections.values()) {
 				await disconnectVTable(runtimeCtx, vtab);
 			}
+			this._publishCardinalityObservations(cardinalityObservations, false);
 		}
 	}
 
@@ -2882,6 +2902,25 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal The observed row-count overlay the planner consults before the catalog. */
 	public get _cardinalityFeedback(): CardinalityFeedbackManager {
 		return this.cardinalityFeedbackManager;
+	}
+
+	/** @internal A fresh per-execution observation sink, or `undefined` when `cardinality_feedback` is off. */
+	public _beginCardinalityObservations(): CardinalityObservations | undefined {
+		return this.options.getBooleanOption('cardinality_feedback') ? new CardinalityObservations() : undefined;
+	}
+
+	/**
+	 * @internal Hand one finished execution's observations to the overlay. Call after the
+	 * execution's scans are torn down. Bookkeeping: a failure is logged, never thrown into
+	 * the statement it describes.
+	 */
+	public _publishCardinalityObservations(observations: CardinalityObservations | undefined, readCommitted: boolean): void {
+		if (!observations || observations.isEmpty) return;
+		try {
+			this.cardinalityFeedbackManager.publish(observations, { readCommitted });
+		} catch (e) {
+			warnLog('Cardinality feedback publication failed: %O', e);
+		}
 	}
 
 	/**

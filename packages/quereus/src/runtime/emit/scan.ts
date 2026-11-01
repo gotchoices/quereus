@@ -81,6 +81,11 @@ export function emitSeqScan(
 		? `module '${schema.vtabModuleName}' query() row for ${schema.schemaName}.${schema.name}`
 		: '';
 
+	// Cardinality feedback (docs/progressive-optimizer.md §3.1): decided once here, so a
+	// non-qualifying site never even reads the sink. An override can stamp a limit/offset
+	// or a seek at run time, so any override disqualifies the site.
+	const observesWholeTable = !filterInfoOverride && enumeratesWholeTable(plan);
+
 	async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
 		// Use the captured module info instead of doing a fresh lookup
 		const capturedModuleInfo = ctx.getCapturedSchemaObject<{ module: AnyVirtualTableModule, auxData?: unknown }>(moduleKey);
@@ -196,6 +201,10 @@ export function emitSeqScan(
 					? emittedQualifiedNameLower
 					: `${schema.schemaName}.${effectiveName}`.toLowerCase());
 			if (tableCounters) tableCounters.queryCalls++;
+			const observations = observesWholeTable ? runtimeCtx.cardinalityObservations : undefined;
+			// Unconditional on purpose: one local increment is cheaper per row than testing
+			// `observations`, and the count is only read after a completed loop.
+			let rowsYielded = 0;
 			throwIfAborted(runtimeCtx.signal);
 			for await (const row of asyncRowIterable) {
 				// Cooperative cancellation checkpoint: a request-timeout (or any
@@ -215,9 +224,14 @@ export function emitSeqScan(
 				// In the loop body, never the `finally` — cancellation and error unwinding
 				// must not depend on, or be perturbed by, counting.
 				if (tableCounters) tableCounters.rowsScanned++;
+				rowsYielded++;
 				rowSlot.set(row);
 				yield row;
 			}
+			// Reached only on natural exhaustion — an early `return()` (LIMIT above, `get()`,
+			// EXISTS), an abort or an error never gets here, and a partial count is not a
+			// table size. Never move this into `finally`.
+			observations?.observe(schema, rowsYielded);
 		} catch (e: unknown) {
 			// Preserve cancellation identity — don't re-wrap it as a generic query error.
 			// A representation violation is likewise rethrown verbatim: re-wrapping it
@@ -251,4 +265,18 @@ export function emitSeqScan(
 		ctx,
 		`${plan.nodeType}(${schema.name})`
 	);
+}
+
+/**
+ * Whether one complete pass of this scan site enumerates every row of its table: no
+ * seek, no constraint, no pushed limit/offset, and either no index or the primary one.
+ * A secondary-index walk is excluded — a partial index yields only the rows its
+ * predicate admits. A hand-built `FilterInfo` with no `accessPath` never qualifies.
+ */
+function enumeratesWholeTable(plan: SeqScanNode | IndexScanNode | IndexSeekNode): boolean {
+	if (plan instanceof IndexSeekNode) return false;
+	const { constraints, limit, offset, accessPath } = plan.filterInfo;
+	if (constraints.length > 0 || limit !== undefined || offset !== undefined) return false;
+	if (accessPath?.kind === 'fullScan') return true;
+	return accessPath?.kind === 'index' && accessPath.index.role === 'primary' && accessPath.plan === 'scan';
 }
