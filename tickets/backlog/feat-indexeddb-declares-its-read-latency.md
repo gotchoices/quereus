@@ -1,5 +1,5 @@
 description: The browser storage backend (IndexedDB) still tells the query planner it is as fast as in-memory storage, because until now there was no honest way to describe its costs; once the planner can price per-row delays, measure the backend in a real browser and declare its numbers — and decide whether the fixed 25-millisecond switches for parallel lookups should become cost-based for backends this fast.
-prereq: store-provider-declares-per-row-latency
+prereq: store-providers-adopt-cost-presets
 files: packages/quereus-plugin-indexeddb/src/provider.ts, packages/quereus-plugin-indexeddb/bench/README.md, packages/quereus-plugin-indexeddb/bench/arms.mjs, packages/quereus/src/planner/optimizer-tuning.ts, packages/quereus/src/planner/rules/join/rule-fanout-batched-outer.ts, docs/optimizer-costing.md
 tradeoffs: The measurement needs a real browser run by a person (the plugin's bench is a manual harness, and fake-indexeddb timings are meaningless), the numbers are device-dependent, and a wrong declaration changes plans for every IndexedDB user — so a maintainer may prefer to keep declaring nothing until a reporter shows a plan the honest numbers would fix.
 ----
@@ -26,3 +26,7 @@ With the cost-unit conversion those translate to roughly 300–2,300 cost units 
 ## The separate decision: the 25 ms gates
 
 `batchedOuterThresholdMs`, `gatherThresholdMs` and `prefetchProbeThresholdMs` all default to 25 ms (`optimizer-tuning.ts`) — chosen against a synthetic high-latency test fixture. IndexedDB's honest first-row latency clears none of them, so batched index-nested-loop seeks, parallel gathers and prefetch probes never fire on it, even though overlapping its requests is exactly what they are for (the #30 reporter expected batching to engage). Options: keep fixed gates and let a host lower them; make the gates cost-based (fire when the modelled latency saving exceeds the modelled overhead, both in cost units); or derive a per-backend threshold. This is a design decision in its own right — a fixed gate also keeps the parallel machinery away from in-process backends whose latency is noise — and should be stated explicitly, not folded into the declaration.
+
+## Scope note added by the `module-cost-profile-and-presets` plan pass (2026-11-01)
+
+The declaration half of this ticket is being absorbed: `store-providers-adopt-cost-presets` has the IndexedDB provider declare the `browserIdb` cost preset (first-row about 1 ms, per-row about 0.01 ms — a category grounded in the bench tables above, spread with the measured `pointRead` / `seekPositioning` ratios). What stays open here is (1) a real-browser re-measurement of first-row and per-row latency to confirm or override the category, and (2) the 25 ms gates decision in the section above, which the plan pass deliberately left as is.

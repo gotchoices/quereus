@@ -91,3 +91,7 @@ Once it lands, LevelDB can declare its measured numbers, and
 - `debt-leveldb-cost-profile-measurement` — the open decision this blocks.
 - `feat-store-multiseek-coverage-gaps` — a different multi-seek concern (which column
   *types* the multi-seek refuses); unrelated to cost.
+
+## Note from the `module-cost-profile-and-presets` plan pass (2026-11-01)
+
+The engine-level `ModuleCostProfile` carries latencies only (first-row and per-row milliseconds); `pointRead` and `seekPositioning` stay store-only knobs on `KVCostProfile` (which now extends the engine profile), because the engine has no consumer for them — a custom module prices its seeks through its access-plan cost. This ticket's split is therefore unaffected by that work and remains the thing that unblocks LevelDB's ratio declaration.
