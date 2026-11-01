@@ -1,7 +1,8 @@
 /**
  * Cardinality feedback, execution half: a scan that reads its whole table reports the
- * exact count, and only a committed, complete enumeration reaches the overlay — one made
- * inside a transaction waits for its commit (docs/progressive-optimizer.md §3.1, §3.5).
+ * exact count, a scan that reads part of it reports a floor, and only observations of
+ * committed state reach the overlay — one made inside a transaction waits for its commit
+ * (docs/progressive-optimizer.md §3.1, §3.5).
  *
  * `big` is 20,000 rows and never analyzed, so every observation clears the overlay's
  * record floor; an absent entry therefore means "not observed", never "too small".
@@ -33,6 +34,10 @@ describe('Cardinality feedback scan observations', () => {
 		return db._cardinalityFeedback.snapshot().find(entry => entry.tableName === 'big')?.rows;
 	}
 
+	function lowerBoundBig(): number | undefined {
+		return db._cardinalityFeedback.snapshot().find(entry => entry.tableName === 'big')?.atLeast;
+	}
+
 	it('records the exact size of a table read in full', async () => {
 		await drain('select * from big');
 		expect(observedBig()).to.equal(20_000);
@@ -41,6 +46,18 @@ describe('Cardinality feedback scan observations', () => {
 	it('records nothing when a LIMIT stops the scan early', async () => {
 		await drain('select * from big limit 10');
 		expect(observedBig()).to.equal(undefined);
+	});
+
+	it('records the rows a LIMIT let through as a floor, not a count', async () => {
+		await drain('select * from big limit 5000');
+		expect(lowerBoundBig()).to.be.at.least(5000);
+		expect(observedBig()).to.equal(undefined);
+	});
+
+	it('records the rows a secondary-index range seek yielded as a floor', async () => {
+		await db.exec('create index big_v on big (v)');
+		await drain('select * from big where v between 1 and 6000');
+		expect(lowerBoundBig()).to.equal(6000);
 	});
 
 	it('records nothing for a primary-key point seek', async () => {

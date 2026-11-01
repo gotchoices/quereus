@@ -671,14 +671,15 @@ One row per remembered table whose schema is still current, ordered by schema th
 |---|---|---|
 | `schema_name` | TEXT | Schema of the table |
 | `table_name` | TEXT | Table name |
-| `observed_rows` | INTEGER | Exact row count seen by the latest complete read; later plans use this |
+| `observed_rows` | INTEGER? | Exact row count seen by the latest complete read; later plans use this. Null when the table is known only from below |
+| `lower_bound_rows` | INTEGER? | Floor proven by a partial read (a `LIMIT`ed scan, one index range) since the latest complete read; later plans use at least this. Null when none |
 | `catalog_rows` | INTEGER? | Row count from the table's statistics (`ANALYZE`); null when never analyzed |
 | `baseline_rows` | INTEGER | Count the next shift is measured against: the estimate before the first observation, or the count at the last shift |
-| `observations` | INTEGER | Complete reads recorded |
-| `shifts` | INTEGER | Times the count moved far enough from the baseline to re-plan statements that read the table |
+| `observations` | INTEGER | Complete and partial reads recorded |
+| `shifts` | INTEGER | Times the count or floor moved far enough from the baseline to re-plan statements that read the table |
 
 ```sql
-select table_name, observed_rows, catalog_rows from cardinality_feedback();
+select table_name, observed_rows, lower_bound_rows, catalog_rows from cardinality_feedback();
 ```
 
 ---

@@ -16,7 +16,7 @@ Quereus targets deployments where table storage may sit behind a network — a d
 | **Never block on optimization** | Planning performs no I/O: it reads the in-memory catalog and asks modules for synchronous access-plan quotes. Feedback only ever changes the *next* plan. |
 | **Learn from essential execution** | Observations piggyback on work a query already does. Nothing issues a query, a scan or a module call just to learn something. |
 | **No new pipeline breakers** | Instrumentation is a counter in a loop that already touches every row. It never buffers, reorders or materializes rows. |
-| **Converge, don't thrash** | A plan changes only on consequential, verified evidence: a complete count, far enough from what the plan assumed, with hysteresis and a per-statement cooldown. |
+| **Converge, don't thrash** | A plan changes only on consequential, verified evidence: a complete count or a proven floor, far enough from what the plan assumed, with hysteresis and a per-statement cooldown. |
 | **Session-scoped, bounded state** | Observations live in memory per `Database`, capped and evicted, and are never persisted; durable statistics remain `ANALYZE`'s job. |
 
 ---
@@ -37,19 +37,29 @@ The gap these leave: a table this session has not written and whose module repor
 
 ## 3. Cardinality feedback
 
-When a query happens to read an entire table, the engine now knows that table's exact size for free. Cardinality feedback records that count, lets later plans use it in place of a default or an outdated `ANALYZE` snapshot, and re-plans cached statements whose plans were costed against a number that turned out to be far off.
+When a query happens to read an entire table, the engine now knows that table's exact size for free; when it reads only part of one — stopped by a `LIMIT`, or walking one index range — it knows a floor under that size. Cardinality feedback records both, lets later plans use them in place of a default or an outdated `ANALYZE` snapshot, and re-plans cached statements whose plans were costed against a number that turned out to be far off.
 
 Measured on the in-memory backend (one machine, a 20,000-row table `big` and a 300-row table `mid`, never analyzed): `select m.x, b.w from mid m join big b on b.id = m.big_id where m.x = 1` plans as a hash join over a full scan of `big` and runs in 16.6 ms. With only `big`'s row count known — no column statistics — the same statement plans as a nested-loop join seeking `big` by primary key and runs in 1.76 ms. The full scan in the first plan is exactly the observation that produces the second.
 
 ### 3.1 What is observed
 
-One observation kind: the **exact row count of a base table**, taken at the scan leaf (`emitSeqScan`, `runtime/emit/scan.ts` — the one door for `SeqScan`, `IndexScan` and `IndexSeek`). A scan site qualifies when, decided at emit time:
+Two observation kinds, both taken per scan *invocation* at the scan leaf (`emitSeqScan`, `runtime/emit/scan.ts` — the one door for `SeqScan`, `IndexScan` and `IndexSeek`):
 
-- it is a `SeqScanNode` or `IndexScanNode` (never an `IndexSeekNode`);
-- its `FilterInfo` carries no constraints, no `limit` / `offset`, and the emitter received no runtime `FilterInfo` override (an `OrdinalSlice` pushdown);
-- its access path is `fullScan`, or the **primary** index (`role: 'primary'`) walked with plan `scan`. A secondary index walk is excluded — a partial index enumerates only the rows its predicate admits.
+- the **exact row count** of a base table, from an invocation that enumerated all of it;
+- a **lower bound** — "this table holds at least N rows" — from an invocation that read part of it: N rows yielded by a walk that visits each row at most once prove that at least N exist. In the remote deployments this design targets, full scans are what a good plan avoids, so most reads are of this kind; a floor is enough to stop planning a table already shown to be large at the 1000-row default.
 
-and the invocation's row loop then ran to **natural exhaustion**. A scan stopped early — by a `LIMIT` above it, `Statement.get()` taking one row, an `EXISTS` short-circuit, an abort or an error — observes nothing, because a partial count is not a table size. Re-scans (a nested-loop inner) and self-joins observe the same table repeatedly; the last count wins within one execution.
+Which kinds a site can observe is decided once, at emit time. A site emitted with a runtime `FilterInfo` override (the key-set semi join's seek, an `OrdinalSlice` limit/offset pushdown) observes nothing: the override reshapes the read at run time. Otherwise:
+
+- **Exact count** — a `SeqScanNode` or `IndexScanNode` (never an `IndexSeekNode`) whose `FilterInfo` carries no constraints and no `limit` / `offset`, and whose access path is `fullScan` or the **primary** index (`role: 'primary'`) walked with plan `scan` (`enumeratesWholeTable`). A secondary index walk is excluded — a partial index enumerates only the rows its predicate admits.
+- **Lower bound** — any site whose access path walks **one window**: `fullScan`, or an index plan `scan`, `eqSeek`, `rangeSeek` or `prefixRangeSeek` (`IndexPlanKind`, `vtab/index-descriptor.ts`), primary or secondary, partial index included, with or without pushed constraints (`walksOneWindow`). `multiSeek` and `multiRangeSeek` are excluded: an `IN` list or overlapping `OR` ranges can yield one row twice. Every exact-count site is also a lower-bound site.
+
+A hand-built `FilterInfo` with no `accessPath` qualifies for neither. What a qualifying invocation records depends on how it ended:
+
+- **natural exhaustion** at an exact-count site records the exact count;
+- natural exhaustion at any other site, or the consumer's **early `return()`** at any site (a `LIMIT` above it, `Statement.get()` taking one row, an `EXISTS` short-circuit), records the rows it yielded as a lower bound — a partial count is not a table size, only a floor under one;
+- an **error** or an **abort** (thrown in the loop, or the signal found aborted when the invocation ends) records nothing.
+
+The recording sits in the scan's `finally`, behind two locals (`completed`, `threw`), so the per-row loop carries only the yield counter it already had. Re-scans (a nested-loop inner, a seek per outer row) and self-joins observe the same table repeatedly: within one execution the last exact count wins, a lower bound is the largest single invocation's — never a sum, since two invocations' rows may overlap — and an exact count for a table supersedes any bound for it. The sink drops a bound at or below `cardinalityFeedback.minRows` (captured when the sink is created) before touching its map, since the record policy (3.4) would refuse it anyway; that covers every primary-key point seek and every `get()`.
 
 Per-execution observations collect in a sink on the `RuntimeContext` (fork policy `shared-sink`, like `workCounters`, so forked parallel branches report into the parent's sink), created only when the `cardinality_feedback` option is on. The run sites that create it are `Statement._iterateRowsRawInternal` and `Database._executeSingleStatement`. The hand-built contexts — deferred row constraints, assertion delta plans, materialized-view analysis and apply, constant folding — do not, exactly as they carry no work counters. Internal work that runs SQL through a prepared `Statement` (assertion violation queries, foreign-key actions, constraint checks on `ALTER`, a materialized view's initial fill, auto-analyze's `analyze`) does get a sink, and publication's transaction rule (3.5) governs it like any other execution; what runs inside a transaction (commit-time assertions, actions of a writing statement) is held with that transaction, and what runs outside one read committed state.
 
@@ -57,7 +67,7 @@ Intermediate cardinalities — filter output, join output, sort or aggregate inp
 
 ### 3.2 The observed row-count overlay
 
-A `Database` owns one overlay (`CardinalityFeedbackManager`, `core/database-cardinality-feedback.ts`): a map from lowercased `<schema>.<table>` — the key convention the change log and work counters already use — to `{ rows, baselineRows, observations, shifts }` plus the `TableSchema` object the count was observed under.
+A `Database` owns one overlay (`CardinalityFeedbackManager`, `core/database-cardinality-feedback.ts`): a map from lowercased `<schema>.<table>` — the key convention the change log and work counters already use — to `{ rows?, atLeast?, baselineRows, observations, shifts }` plus the `TableSchema` object the observations were made under. `rows` is the latest exact count and `atLeast` the largest floor recorded since it; either may be absent (a table known only from below has no `rows`), and recording an exact count clears `atLeast`. `observations` counts both kinds.
 
 - **Validity is schema identity.** An entry answers only for the exact `TableSchema` object it was observed against. Any schema swap — `ANALYZE` (manual or automatic), `ALTER TABLE`, drop and re-create — makes the entry inert, and a `table_modified` / `table_removed` listener evicts it. So an entry that answers is always newer than the catalog statistics on the schema it names.
 - **Bounded.** At most `cardinalityFeedback.maxTables` entries (default 512), least-recently-used evicted. Eviction silently reverts that table to catalog or default numbers at its next compile; no plan is invalidated for it.
@@ -72,6 +82,8 @@ The row-count seam is `plannedRowCount(table, sources)` (`planner/stats/table-ca
 3. an **approximate** module count — below the overlay because an estimate can be off by more than the 10× shift factor and only a complete scan's observation can correct it; above the catalog because it describes the table now, while an `ANALYZE` snapshot (rare and expensive in the remote deployments this targets) may be arbitrarily old;
 4. `catalogRowCount(table)`;
 5. `undefined` (unknown — callers keep applying their own defaults).
+
+The overlay's floor then raises whatever answered from 2–4 — `max(atLeast, …)` — and answers alone when none of them did; it was recorded only above what planning used at the time (3.4), so it never makes a table look smaller. It never raises an exact module count: that count is current, and a floor describes committed state at some earlier moment, so it cannot legitimately exceed it.
 
 The module is asked first, so an exactly-sized table never touches the overlay (whose reads refresh its recency). Its answer is a hint: a throw or a malformed answer (`rows` not a non-negative integer) is logged at debug level and treated as a decline. The hook's contract — memory only, constant time; `rows` is what a read issued now by this database would see, the module's own buffered transaction writes included; `exact` only for a count maintained on every write — is on its doc comment in `vtab/module.ts`.
 
@@ -93,17 +105,27 @@ For an observed count `n` of table `T`, let `before` be what planning would use 
 - A recorded count always replaces `rows`, so the next compile of any statement uses the freshest exact count.
 - **Shift** when `spread(n, baselineRows) ≥ cardinalityFeedback.shiftFactor` (default 10). A new entry's baseline is `before`; a shift resets the baseline to `n` and notifies the re-planning machinery (3.6). Measuring against the baseline rather than the previous count means steady growth in small steps still shifts once it has accumulated to 10×, while a count wobbling within 10× of the baseline never disturbs a cached plan.
 
+A lower bound `b` (`recordAtLeast`) is weighed against the same `before`, which includes any floor already held:
+
+- **Record** only when `b > before` and `b > minRows`, as `atLeast = max(atLeast, b)`. So a floor never lowers an estimate, and one below the default never makes an unknown table look smaller than it plans at today.
+- A later exact count clears `atLeast` — it is the newer, complete fact — and may lower the entry as any count does.
+- **Shift** exactly as a count does: when `spread(b, baselineRows) ≥ shiftFactor`, reset the baseline to `b` and notify. Floors only ever raise, so on their own they cannot oscillate.
+
+So `select * from big limit 10` over a never-analyzed 20,000-row table records nothing (10 is below the default), while `limit 5000` records a floor of 5,000 and the next compile plans `big` at no less.
+
 ### 3.5 Publication and transactions
 
 An observation describes the rows its scan could see, which inside a transaction includes that transaction's own uncommitted writes. Only committed state may reach the overlay:
 
 - an execution with `readCommitted` (the mutex-free committed-read path) publishes immediately — it read committed state by construction;
 - an execution that ends with no transaction open publishes immediately;
-- otherwise — every statement inside an explicit transaction, and every writing statement in autocommit mode, whose implicit transaction is still open when the run site publishes — its observations are held (`CardinalityFeedbackManager.publish`), last count per table winning, until the transaction ends. A transaction holds at most one count per distinct table it observed.
+- otherwise — every statement inside an explicit transaction, and every writing statement in autocommit mode, whose implicit transaction is still open when the run site publishes — its observations are held (`CardinalityFeedbackManager.publish`), last count and largest floor per table winning, until the transaction ends. A transaction holds at most one count and one floor per distinct table it observed.
 
 On commit — in the same post-commit window auto-analyze reads the change log (`Database.recordCommittedChangeCounts`, which builds the change log's per-table counts at most once for both consumers, and not at all when nothing is held and auto-analyze is off) — held observations are applied (`onCommitted`), **except** for tables the transaction itself wrote: such a count was taken mid-transaction, possibly before later writes in the same transaction, and the change log cannot say which came first. "Wrote" includes a table whose writes cancelled out (an insert then a delete of the same key) and one an `update` merely rewrote; reads outside such transactions re-observe them. So `insert into t2 select * from big` records `big` at its commit, while `delete from big` records nothing.
 
 A rollback (including an `OR ROLLBACK` conflict), a failed commit (a deferred constraint or assertion violation, a connection commit error), or a `rollback to savepoint` discards everything held (`onRolledBack`, through `TransactionManagerContext.transactionRolledBack`) — for a savepoint, including observations made before it; precision is not worth tracking per savepoint. A rollback that runs *during* an execution also discards that execution's own observations, which are not yet held: a failing statement inside an explicit transaction rolls back its statement savepoint before its run site publishes, and a scan it completed may have counted its own undone writes. Each execution's sink is stamped with the overlay's rollback count when it is created (`beginObservations`); `publish` discards a non-`readCommitted` sink whose stamp no longer matches. An `OR FAIL` conflict commits the rows before it, but it undoes the failing row through a per-row savepoint, so what was held is discarded too. Turning `cardinality_feedback` off, or closing the `Database`, discards held observations with the rest of the overlay.
+
+Lower bounds follow every rule here exactly as counts do: held beside the count, applied at commit except for tables the transaction wrote, and discarded by any rollback — the sink's rollback stamp covers them too. Wherever observations are applied, a table's exact count is recorded before its floor, so a floor the count already covers is ignored.
 
 Publication runs in the run site's `finally`, after the execution's scan connections are disconnected. It and both transaction hooks are bookkeeping: a failure is logged and never fails the statement, the commit or the rollback.
 
@@ -133,6 +155,7 @@ Both triggers share the pacing:
 - **Determinism.** Feedback is on by default, so a statement's plan can depend on what the same `Database` executed before it — in practice only through a table larger than `minRows` whose observed size is 10× off what planning assumed (3.4). `pragma cardinality_feedback = false` clears the overlay and stops observation, so every later compile reads module counts and the catalog only; plans already cached keep their shape until their next recompile. The option does not gate module-reported counts, nor the drift re-plan they drive (3.6): those are the backend's own statistic — data-dependent like `ANALYZE` and like the store's access-path sizing before them — not learned from history. A host or test that needs reproducible plans — plan snapshots, plan-shape assertions over large tables — sets it before running anything. (QuickPick's wall-clock bound, `bug-join-order-depends-on-wall-clock`, is a separate source of plan variation.)
 - **DDL decisions that read sizes.** The materialized-view strategy cost gate and its create-time size reject read `CatalogStatsProvider.tableRows`, so an observed size can now decide them — the same history dependence auto-analyze already introduces by refreshing the catalog in the background. A module count decides them too: a full-rebuild-only view body over a never-analyzed store table holding more than `materialized_view_rebuild_row_threshold` (10,000) rows is rejected at create, where it used to read the 1000-row default.
 - **Module counts in cached plans.** A prepared statement keeps the module count it compiled with until that count drifts `shiftFactor` from it, and re-plans at the next execution start after it does (3.6). A complete scan cannot do this for a module-sized table: `before` is the live count (3.4), so the scan agrees with it and shifts nothing. Drift inside the 10× band keeps the cached plan, as an observation inside the band does.
+- **Stale floor.** A floor outlives the rows that proved it: a table that shrinks after a lower bound keeps the floor until an exact count or a schema change replaces it. The error is an over-estimate, the direction that favors seeks over scans. A floor never plans an exactly module-sized table: it cannot exceed the live count when recorded (`before` is that count), and `plannedRowCount` never consults the overlay while the module answers.
 - **Measured zero.** An observed empty table is recorded as `0` when its previous estimate was large, and is treated exactly like an analyzed zero: reported as 0, priced as one row by every site that turns a row count into a cost ([Optimizer costing § Base-table row estimates](optimizer-costing.md#statistics-abstraction)).
 - **Concurrency.** JavaScript runs each publication to completion, and `compile()` is synchronous, so no plan can observe a half-applied update. Observations from concurrent committed reads and from the writer's commit may race for the same table; the later publication wins, and both describe committed state. The later one is not always the newer state: a committed read that started before a commit and finished after it publishes the pre-commit count over a fresher one. That count is one the table really had, and the next complete scan replaces it; if stale counts from long concurrent reads ever matter, tag each observation with the commit it read and refuse older ones.
 - **Benchmark gate.** `yarn bench:gate` compares exact work counters. A workload over a large never-analyzed table can re-plan after its first execution and change its counters; such a reference is re-baselined with a stated reason. Turning the default on changed none: every SQL benchmark table holds at most 10,000 rows, and `spread(10000, 1000)` is just under 10, so those tables are recorded but never shift a plan.
@@ -140,13 +163,14 @@ Both triggers share the pacing:
 ### 3.8 Overhead budget and how it is verified
 
 - **Feedback off:** per row, at most one increment of a generator-local counter in the scan loop — no property read, no allocation; per scan invocation, one property read of the sink. The `work-counter-scan-overhead-measurement` precedent measured a per-row branch of this size inside the noise floor of every execution benchmark.
-- **Feedback on:** additionally one map write per completed qualifying scan, one publication per execution (proportional to the tables it observed), and on a shift one walk over live statements. Shifts are rare by construction (3.4).
+- **Feedback on:** additionally one map write per completed exact-count scan; per invocation of a lower-bound site, one comparison against the sink's record floor, and a map read and write only for a bound above it; one publication per execution (proportional to the tables it observed); and on a shift one walk over live statements. Shifts are rare by construction (3.4).
+- **Lower bounds, measured:** `yarn bench --filter full-scan`, `--filter join` and `--filter correlated` (the nested-loop re-scan path, one bound check per inner invocation), before and after in one tree with feedback on (the default): every row inside its noise floor and every work-counter set identical. `full-scan-10k` read +9.1% inside a ±25.1% floor on the first after-run and −3.8% on a re-run.
 - **Reported-size drift check (3.6):** per compile, one `plannedRowCount` per `table` dependency whose module implements `getRowCount`; per execution start, one more per kept table, and nothing for tables without the hook. Measured over an isolation-wrapped in-memory store table of 10,000 rows: 0.27 µs to capture and 0.19 µs to check, beside 3.9 ms for the one-shot indexed `select` they rode on. `yarn bench --filter @store-mem` before and after: work counters identical on all 19 rows; the after-run flagged two rows a few points past their noise floors, and re-measured alone both read no change.
 - **Verification:** the `yarn bench` execution suite before and after each change, compared with `--baseline` against a run of the pre-change build ([Benchmarking § Measuring one commit's cost](benchmarking.md#measuring-one-commits-cost)), must show no gated regression, with the scan-heavy rows (`full-scan-10k`, `filtered-scan-index-10k`, `join-1kx1k`, `correlated-subquery`, `hand-batched-peer-count`) inside their noise floor — once for the scan observation (feedback off) and again when the default turned on. The second run, flip alone against its parent build: 27 rows no change, 1 improved, 0 regressed, `join-1kx1k` unstable in both runs (not gated), every scan-heavy row inside its noise floor, and all 30 work-counter sets identical. Re-plan cost is bounded by the cooldown rather than benchmarked: one extra compile per shift per statement, measured at 0.8–2 ms for simple statements and about 9 ms for a four-way join on the machine above.
 
 ### 3.9 Diagnostics and the escape hatch
 
-- `cardinality_feedback()` (table-valued, non-deterministic) lists the valid overlay entries, one row per table ordered by schema then table: observed rows, catalog rows, baseline, observation and shift counts (columns in `docs/functions.md`). It reads the overlay when it executes, so one prepared call sees later observations; with the option off it returns no rows.
+- `cardinality_feedback()` (table-valued, non-deterministic) lists the valid overlay entries, one row per table ordered by schema then table: observed (exact) rows, lower-bound rows, catalog rows, baseline, observation and shift counts (columns in `docs/functions.md`). It reads the overlay when it executes, so one prepared call sees later observations; with the option off it returns no rows.
 - `Statement.getPlanShape()` shows a statement's current plan, so a feedback re-plan is visible as a change in node types — between the shift and the next execution it still shows the cached plan.
 - The `core:cardinality-feedback` log names each shift (table, old baseline, new count) and each feedback re-plan (statement SQL prefix); `core:cardinality-feedback:debug` adds every record, drop and discard, and each reported-size drift (table, planned count, current count).
 - `cardinality_feedback` (boolean database option) is the master switch; turning it off clears the overlay.
@@ -170,7 +194,6 @@ Both triggers share the pacing:
 
 Queued, in this order (tickets in `tickets/implement/`, `fix/` and `plan/`; each section above changes only when its ticket lands):
 
-- **Lower bounds from partial reads** — a `LIMIT`ed scan or a single-window seek that yielded N rows proves the table holds at least N; the overlay keeps the floor, which only ever raises an estimate: `cardinality-feedback-lower-bounds`.
 - **Unknown sizes default consistently** — with no statistics, join selection prices an unknown side at 100 rows and ignores reductions above it, so a filtered or single-row side joined to an indexed table full-scans that table: `unknown-size-join-scans-instead-of-seeking` (fix stage).
 - **Rows per key from executed seeks** — the first slice beyond table size: `cardinality-feedback-rows-per-key` (plan stage).
 
@@ -192,8 +215,8 @@ Still deferred:
 | `src/planner/stats/catalog-stats.ts` | `CatalogStatsProvider` — catalog statistics, naive fallback |
 | `src/planner/nodes/reference.ts` | `TableReferenceNode.estimatedRows` — every scan's base cardinality |
 | `src/core/database-auto-analyze.ts` | Committed-change staleness and background `ANALYZE` |
-| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, record policy, shift detection, publication (`publish`) and commit-scoped holding (`onCommitted`, `onRolledBack`); the per-statement re-plan cooldown (`FeedbackReplanState`); the module-reported sizes a cached plan was costed with (`ReportedSizeSnapshot`) |
-| `src/runtime/emit/scan.ts` | The scan leaf, where complete enumerations are observed (`enumeratesWholeTable`) |
+| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, record policy for counts (`record`) and floors (`recordAtLeast`), shift detection, publication (`publish`) and commit-scoped holding (`onCommitted`, `onRolledBack`); the per-statement re-plan cooldown (`FeedbackReplanState`); the module-reported sizes a cached plan was costed with (`ReportedSizeSnapshot`) |
+| `src/runtime/emit/scan.ts` | The scan leaf, where complete enumerations (`enumeratesWholeTable`) and one-window partial reads (`walksOneWindow`) are observed |
 | `src/runtime/cardinality-observations.ts` | Per-execution observation sink on the `RuntimeContext` |
 | `src/runtime/work-counters.ts` | Diagnostic work counters (not the feedback channel) |
 | `src/core/statement.ts` | Plan cache, `invalidatePlan()`, schema-change invalidation, feedback re-plan marking (`_noteCardinalityShift`, and the reported-size drift check at execution start) |

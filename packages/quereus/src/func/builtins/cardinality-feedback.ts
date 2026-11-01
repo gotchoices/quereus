@@ -32,7 +32,8 @@ export const cardinalityFeedbackFunc = createIntegratedTableValuedFunction(
 			columns: [
 				{ name: 'schema_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'table_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
-				{ name: 'observed_rows', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'observed_rows', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'lower_bound_rows', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'catalog_rows', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: true, isReadOnly: true }, generated: true },
 				{ name: 'baseline_rows', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
 				{ name: 'observations', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
@@ -51,7 +52,8 @@ export const cardinalityFeedbackFunc = createIntegratedTableValuedFunction(
 			yield [
 				entry.schemaName,
 				entry.tableName,
-				entry.rows,
+				entry.rows ?? null,
+				entry.atLeast ?? null,
 				entry.catalogRows ?? null,
 				entry.baselineRows,
 				entry.observations,

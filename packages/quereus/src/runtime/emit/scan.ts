@@ -4,6 +4,7 @@ import { AbortError, QuereusError, throwIfAborted } from "../../common/errors.js
 import type { VirtualTable } from "../../vtab/table.js";
 import type { BaseModuleConfig, AnyVirtualTableModule } from "../../vtab/module.js";
 import type { FilterInfo } from "../../vtab/filter-info.js";
+import { accessPathPlan } from "../../vtab/index-descriptor.js";
 import type { Instruction, RuntimeContext } from "../types.js";
 import { asRun } from "../types.js";
 import type { EmissionContext } from "../emission-context.js";
@@ -83,8 +84,10 @@ export function emitSeqScan(
 
 	// Cardinality feedback (docs/progressive-optimizer.md §3.1): decided once here, so a
 	// non-qualifying site never even reads the sink. An override can stamp a limit/offset
-	// or a seek at run time, so any override disqualifies the site.
+	// or a seek at run time, so any override disqualifies the site. A whole-table site
+	// also walks one window, so it bounds the table when stopped early.
 	const observesWholeTable = !filterInfoOverride && enumeratesWholeTable(plan);
+	const observesLowerBound = !filterInfoOverride && walksOneWindow(plan);
 
 	async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
 		// Use the captured module info instead of doing a fresh lookup
@@ -154,6 +157,12 @@ export function emitSeqScan(
 		}
 
 		const rowSlot = createRowSlot(runtimeCtx, rowDescriptor);
+		const observations = observesLowerBound ? runtimeCtx.cardinalityObservations : undefined;
+		// Unconditional on purpose: one local increment is cheaper per row than testing
+		// `observations`, and the count is only read once the invocation ends.
+		let rowsYielded = 0;
+		let completed = false;
+		let threw = false;
 		try {
 			// If this is an IndexSeek with dynamic seek keys, populate args from params
 			let effectiveFilterInfo: FilterInfo = (plan instanceof IndexSeekNode && dynamicArgs && dynamicArgs.length > 0)
@@ -201,10 +210,6 @@ export function emitSeqScan(
 					? emittedQualifiedNameLower
 					: `${schema.schemaName}.${effectiveName}`.toLowerCase());
 			if (tableCounters) tableCounters.queryCalls++;
-			const observations = observesWholeTable ? runtimeCtx.cardinalityObservations : undefined;
-			// Unconditional on purpose: one local increment is cheaper per row than testing
-			// `observations`, and the count is only read after a completed loop.
-			let rowsYielded = 0;
 			throwIfAborted(runtimeCtx.signal);
 			for await (const row of asyncRowIterable) {
 				// Cooperative cancellation checkpoint: a request-timeout (or any
@@ -230,9 +235,10 @@ export function emitSeqScan(
 			}
 			// Reached only on natural exhaustion — an early `return()` (LIMIT above, `get()`,
 			// EXISTS), an abort or an error never gets here, and a partial count is not a
-			// table size. Never move this into `finally`.
-			observations?.observe(schema, rowsYielded);
+			// table size, only a floor under one.
+			completed = true;
 		} catch (e: unknown) {
+			threw = true;
 			// Preserve cancellation identity — don't re-wrap it as a generic query error.
 			// A representation violation is likewise rethrown verbatim: re-wrapping it
 			// would bury the seam/column/type detail its message exists to carry.
@@ -242,6 +248,13 @@ export function emitSeqScan(
 		} finally {
 			// The row slot is per-invocation and must close on every pass.
 			rowSlot.close();
+			// Here rather than in the loop, so the per-row path is untouched. An abort noticed
+			// downstream ends this invocation with a `return()`, not a throw, so the signal is
+			// read too: an aborted or failed invocation records nothing.
+			if (observations && !threw && !runtimeCtx.signal?.aborted) {
+				if (completed && observesWholeTable) observations.observe(schema, rowsYielded);
+				else observations.observeAtLeast(schema, rowsYielded);
+			}
 			// Disconnect only when this invocation owns the instance (no per-execution
 			// cache to defer teardown to). A cached instance stays live across re-scans
 			// and is released once at statement teardown, not here.
@@ -279,4 +292,18 @@ function enumeratesWholeTable(plan: SeqScanNode | IndexScanNode | IndexSeekNode)
 	if (constraints.length > 0 || limit !== undefined || offset !== undefined) return false;
 	if (accessPath?.kind === 'fullScan') return true;
 	return accessPath?.kind === 'index' && accessPath.index.role === 'primary' && accessPath.plan === 'scan';
+}
+
+/**
+ * Whether one pass of this scan site visits each row of its table at most once — a full
+ * scan, or one window of any index (partial ones included), constrained or not — so the
+ * rows one invocation yields bound the table's size from below. A multi-seek is excluded:
+ * an `IN` list or overlapping `OR` ranges can yield a row twice. A hand-built
+ * `FilterInfo` with no `accessPath` never qualifies.
+ */
+function walksOneWindow(plan: SeqScanNode | IndexScanNode | IndexSeekNode): boolean {
+	const { accessPath } = plan.filterInfo;
+	if (accessPath?.kind === 'fullScan') return true;
+	const kind = accessPathPlan(accessPath);
+	return kind === 'scan' || kind === 'eqSeek' || kind === 'rangeSeek' || kind === 'prefixRangeSeek';
 }

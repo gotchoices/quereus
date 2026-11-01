@@ -13,6 +13,8 @@ import { Database } from '../../src/core/database.js';
 import type { Statement } from '../../src/core/statement.js';
 import { CardinalityFeedbackManager, FeedbackReplanState } from '../../src/core/database-cardinality-feedback.js';
 import { DEFAULT_TUNING, type OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
+import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
+import { databaseRowCountSources } from '../../src/planner/stats/table-cardinality.js';
 import type { TableSchema } from '../../src/schema/table.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import type { ModuleRowCount } from '../../src/vtab/module.js';
@@ -75,16 +77,16 @@ describe('Cardinality feedback overlay', () => {
 
 			// Both the 1000-row default and the observation are at the floor.
 			overlay.record(t, 1000);
-			expect(overlay.observedRows(t)).to.equal(undefined);
+			expect(overlay.observedRows(t)?.rows).to.equal(undefined);
 
 			// Baseline is the default (1000): 20x.
 			overlay.record(t, 20_000);
-			expect(overlay.observedRows(t)).to.equal(20_000);
+			expect(overlay.observedRows(t)?.rows).to.equal(20_000);
 			expect(shifts).to.deep.equal(['main.t']);
 
 			// 2.5x from baseline 20,000: recorded silently.
 			overlay.record(t, 50_000);
-			expect(overlay.observedRows(t)).to.equal(50_000);
+			expect(overlay.observedRows(t)?.rows).to.equal(50_000);
 			expect(shifts).to.have.length(1);
 
 			// 12.5x from baseline 20,000 (not from the previous 50,000).
@@ -92,12 +94,42 @@ describe('Cardinality feedback overlay', () => {
 			expect(shifts).to.have.length(2);
 
 			overlay.record(t, 0);
-			expect(overlay.observedRows(t)).to.equal(0);
+			expect(overlay.observedRows(t)?.rows).to.equal(0);
 			expect(shifts).to.have.length(3);
 
 			expect(overlay.snapshot()).to.deep.equal([{
-				schemaName: 'main', tableName: 't', rows: 0, catalogRows: undefined,
+				schemaName: 'main', tableName: 't', rows: 0, atLeast: undefined, catalogRows: undefined,
 				baselineRows: 0, observations: 4, shifts: 3,
+			}]);
+		});
+
+		it('records a floor only above the current estimate, raising it until an exact count clears it', () => {
+			const t = table('t');
+			const stats = new CatalogStatsProvider(undefined, databaseRowCountSources(db, overlay));
+
+			// Not above the 1000-row default the table plans at today.
+			overlay.recordAtLeast(t, 1000);
+			expect(overlay.snapshot()).to.deep.equal([]);
+
+			// Raises the unknown table; 5x from the baseline (the default) is no shift.
+			overlay.recordAtLeast(t, 5000);
+			expect(stats.tableRows(t)).to.equal(5000);
+			overlay.recordAtLeast(t, 3000);
+			expect(stats.tableRows(t)).to.equal(5000);
+			expect(shifts).to.deep.equal([]);
+
+			// The newer, complete count supersedes the floor, even below it; a floor it covers is ignored.
+			overlay.record(t, 4000);
+			overlay.recordAtLeast(t, 4000);
+			expect(stats.tableRows(t)).to.equal(4000);
+
+			// 40x from the baseline: shifts, and raises the exact count it exceeds.
+			overlay.recordAtLeast(t, 40_000);
+			expect(stats.tableRows(t)).to.equal(40_000);
+			expect(shifts).to.deep.equal(['main.t']);
+			expect(overlay.snapshot()).to.deep.equal([{
+				schemaName: 'main', tableName: 't', rows: 4000, atLeast: 40_000, catalogRows: undefined,
+				baselineRows: 40_000, observations: 3, shifts: 1,
 			}]);
 		});
 
@@ -108,10 +140,10 @@ describe('Cardinality feedback overlay', () => {
 			await db.exec('analyze t');
 			const analyzed = table('t');
 			expect(analyzed).to.not.equal(original);
-			expect(overlay.observedRows(analyzed)).to.equal(undefined);
+			expect(overlay.observedRows(analyzed)?.rows).to.equal(undefined);
 
 			overlay.record(original, 50_000);
-			expect(overlay.observedRows(original)).to.equal(undefined);
+			expect(overlay.observedRows(original)?.rows).to.equal(undefined);
 			expect(overlay.snapshot()).to.deep.equal([]);
 		});
 
@@ -124,9 +156,9 @@ describe('Cardinality feedback overlay', () => {
 
 			overlay.record(table('w'), 20_000);
 
-			expect(overlay.observedRows(table('u'))).to.equal(undefined);
-			expect(overlay.observedRows(table('t'))).to.equal(20_000);
-			expect(overlay.observedRows(table('w'))).to.equal(20_000);
+			expect(overlay.observedRows(table('u'))?.rows).to.equal(undefined);
+			expect(overlay.observedRows(table('t'))?.rows).to.equal(20_000);
+			expect(overlay.observedRows(table('w'))?.rows).to.equal(20_000);
 			expect(shifts).to.deep.equal(['main.w']);
 		});
 	});

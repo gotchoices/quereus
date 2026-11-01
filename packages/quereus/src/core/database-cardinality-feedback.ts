@@ -13,8 +13,11 @@
  * re-create) silences it, and a schema-change listener evicts it. The identity
  * check is the correctness guard; the listener is memory hygiene.
  *
+ * An entry holds an exact count from a complete read, a floor ("at least N rows") from a
+ * partial one, or both; a floor only ever raises an estimate, and an exact count clears it.
+ *
  * Execution feeds it through {@link CardinalityFeedbackManager.publish}, which admits
- * only counts of committed state: a count taken inside a transaction is held until
+ * only observations of committed state: one made inside a transaction is held until
  * that transaction commits ({@link CardinalityFeedbackManager.onCommitted}) and
  * dropped if it rolls back ({@link CardinalityFeedbackManager.onRolledBack}).
  *
@@ -30,7 +33,7 @@
 import { createLogger } from '../common/logger.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
 import { CardinalityObservations } from '../runtime/cardinality-observations.js';
-import { catalogRowCount, moduleReportsRowCount, plannedRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
+import { catalogRowCount, moduleReportsRowCount, plannedRowCount, type ObservedRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import type { TableSchema } from '../schema/table.js';
@@ -57,22 +60,32 @@ export interface CardinalityFeedbackManagerContext {
 	onShift(key: string): void;
 }
 
-interface ObservedEntry {
+interface ObservedEntry extends ObservedRowCount {
 	/** The schema object the count was observed under; the entry answers for no other. */
 	readonly schema: TableSchema;
-	/** Latest recorded exact row count. */
-	rows: number;
+	/** Latest recorded exact row count; undefined while the table is known only from below. */
+	rows: number | undefined;
+	/** Largest floor recorded since the last exact count, which clears it. */
+	atLeast: number | undefined;
 	/** The count shifts are measured against: the pre-entry estimate, or the count at the last shift. */
 	baselineRows: number;
 	observations: number;
 	shifts: number;
 }
 
+/** Observations held for the open transaction's commit, per table. */
+interface HeldObservation {
+	readonly table: TableSchema;
+	rows: number | undefined;
+	atLeast: number | undefined;
+}
+
 /** By-value view of one valid entry, for tests and diagnostics. */
 export interface ObservedRowCountSnapshot {
 	readonly schemaName: string;
 	readonly tableName: string;
-	readonly rows: number;
+	readonly rows: number | undefined;
+	readonly atLeast: number | undefined;
 	/** What the catalog (`ANALYZE`) says for the same table; `undefined` when never analyzed. */
 	readonly catalogRows: number | undefined;
 	readonly baselineRows: number;
@@ -95,6 +108,10 @@ export function overlayTableKey(schemaName: string, tableName: string): string {
 
 function tableKey(table: TableSchema): string {
 	return overlayTableKey(table.schemaName, table.name);
+}
+
+function newEntry(schema: TableSchema, baselineRows: number): ObservedEntry {
+	return { schema, rows: undefined, atLeast: undefined, baselineRows, observations: 0, shifts: 0 };
 }
 
 /** Cap on the cooldown's doubling: re-plans past the seventh wait `64 × replanCooldown` executions. */
@@ -216,10 +233,10 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	private readonly entries = new Map<string, ObservedEntry>();
 	/**
 	 * Observations made inside the open transaction, held until it ends; same key as
-	 * `entries`, last count per table wins. Bounded by the distinct tables one
-	 * transaction observes.
+	 * `entries`, last count and largest floor per table win. Bounded by the distinct
+	 * tables one transaction observes.
 	 */
-	private readonly pending = new Map<string, { readonly table: TableSchema; readonly rows: number }>();
+	private readonly pending = new Map<string, HeldObservation>();
 	/** {@link onRolledBack} calls so far; each execution's sink records it at start. */
 	private rollbacks = 0;
 	private unsubscribeSchemaChanges: (() => void) | null = null;
@@ -228,56 +245,59 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		this.subscribeToSchemaChanges();
 	}
 
-	observedRows(table: TableSchema): number | undefined {
+	observedRows(table: TableSchema): ObservedRowCount | undefined {
 		const key = tableKey(table);
 		const entry = this.entries.get(key);
 		if (!entry || entry.schema !== table) return undefined;
 		this.touch(key, entry);
-		return entry.rows;
+		return entry;
 	}
 
 	/**
 	 * Offer one exact row count of `table`, observed by a complete enumeration of
 	 * committed state. Applies the record policy (docs/progressive-optimizer.md §3.4):
 	 * ignored when the schema object is superseded or when both the observation and the
-	 * current estimate are small; otherwise recorded, and reported through `onShift`
-	 * when it has moved `shiftFactor` from the entry's baseline.
-	 *
-	 * The current estimate is what planning would use right now — this entry ranked with
-	 * the module's count and the catalog's — so an exactly module-sized table compares
-	 * against the module and a scan agreeing with it shifts nothing.
+	 * current estimate are small; otherwise recorded — clearing any floor, which the newer
+	 * complete count supersedes — and reported through `onShift` when it has moved
+	 * `shiftFactor` from the entry's baseline.
 	 */
 	record(table: TableSchema, rows: number): void {
-		if (this.ctx.schemaManager.findTable(table.name, table.schemaName) !== table) {
-			debugLog('Ignored %d rows for %s.%s: observed under a superseded schema', rows, table.schemaName, table.name);
-			return;
-		}
-		const tuning = this.ctx.getTuning();
-		const policy = tuning.cardinalityFeedback;
+		if (this.isSuperseded(table, rows)) return;
+		const policy = this.ctx.getTuning().cardinalityFeedback;
 		const key = tableKey(table);
 		const existing = this.validEntry(key, table);
 		// NOTE: an exactly module-sized table still records an entry, which `plannedRowCount`
 		// never reads while the module answers — one LRU slot each; if `maxTables` pressure
 		// ever matters, skip recording when the module's count is exact.
-		const before = plannedRowCount(table, {
-			observedRows: () => existing?.rows,
-			reportedRows: t => this.ctx.reportedRows(t),
-		}) ?? tuning.defaultRowEstimate;
+		const before = this.plannedBefore(table, existing);
 		if (Math.max(before, rows) <= policy.minRows) return;
 
-		const entry = existing ?? { schema: table, rows, baselineRows: before, observations: 0, shifts: 0 };
+		const entry = this.upsert(key, existing ?? newEntry(table, before));
 		entry.rows = rows;
-		entry.observations++;
-		this.touch(key, entry);
-		this.evictBeyond(policy.maxTables);
+		entry.atLeast = undefined;
+		debugLog('Recorded %d rows for %s (was %d, baseline %d)', rows, key, before, entry.baselineRows);
+		this.shiftIfMoved(key, entry, rows);
+	}
 
-		const shifted = rowCountSpread(rows, entry.baselineRows) >= policy.shiftFactor;
-		debugLog('Recorded %d rows for %s (was %d, baseline %d)%s', rows, key, before, entry.baselineRows, shifted ? ' — shift' : '');
-		if (!shifted) return;
-		log('Shift on %s: baseline %d -> %d rows', key, entry.baselineRows, rows);
-		entry.baselineRows = rows;
-		entry.shifts++;
-		this.ctx.onShift(key);
+	/**
+	 * Offer one floor for `table`: a read of committed state yielded `rows` distinct rows of
+	 * it, so it holds at least that many (docs/progressive-optimizer.md §3.4). Recorded only
+	 * when it exceeds both what planning would use now and `minRows`, so a floor never
+	 * lowers an estimate and never makes an unknown table look smaller than the default it
+	 * plans at today. Shifts like a count; floors only raise, so they cannot oscillate.
+	 */
+	recordAtLeast(table: TableSchema, rows: number): void {
+		if (this.isSuperseded(table, rows)) return;
+		const policy = this.ctx.getTuning().cardinalityFeedback;
+		const key = tableKey(table);
+		const existing = this.validEntry(key, table);
+		const before = this.plannedBefore(table, existing);
+		if (rows <= before || rows <= policy.minRows) return;
+
+		const entry = this.upsert(key, existing ?? newEntry(table, before));
+		entry.atLeast = Math.max(entry.atLeast ?? 0, rows);
+		debugLog('Recorded at least %d rows for %s (was %d, baseline %d)', rows, key, before, entry.baselineRows);
+		this.shiftIfMoved(key, entry, rows);
 	}
 
 	/**
@@ -297,21 +317,22 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		} else if (this.ctx.getAutocommit()) {
 			this.recordAll(observations);
 		} else {
-			for (const [table, rows] of observations.entries()) {
-				this.pending.set(tableKey(table), { table, rows });
-			}
+			this.holdAll(observations);
 		}
 	}
 
-	/** A fresh per-execution sink, stamped so {@link publish} can tell whether a rollback ran under it. */
+	/**
+	 * A fresh per-execution sink, stamped so {@link publish} can tell whether a rollback ran
+	 * under it, and carrying the record floor so it can drop floors that could never record.
+	 */
 	beginObservations(): CardinalityObservations {
-		return new CardinalityObservations(this.rollbacks);
+		return new CardinalityObservations(this.rollbacks, this.ctx.getTuning().cardinalityFeedback.minRows);
 	}
 
 	/**
 	 * The open transaction committed: record what it held, except tables it wrote.
-	 * Such a count was taken mid-transaction, possibly before later writes in the same
-	 * transaction, and the change log cannot say which came first. `changedCounts` is
+	 * Such an observation was made mid-transaction, possibly before later writes in the
+	 * same transaction, and the change log cannot say which came first. `changedCounts` is
 	 * the change log keyed like `entries` — every table the transaction wrote, even one
 	 * whose writes cancelled out — and is not built when nothing is held.
 	 */
@@ -322,12 +343,12 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		if (this.pending.size === 0) return;
 		try {
 			const changed = changedCounts();
-			for (const [key, { table, rows }] of this.pending) {
+			for (const [key, held] of this.pending) {
 				if (changed.has(key)) {
-					debugLog('Dropped %d rows for %s: the committing transaction wrote it', rows, key);
+					debugLog('Dropped observations of %s: the committing transaction wrote it', key);
 					continue;
 				}
-				this.record(table, rows);
+				this.recordHeld(held);
 			}
 		} finally {
 			this.pending.clear();
@@ -356,6 +377,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 				schemaName: schema.schemaName,
 				tableName: schema.name,
 				rows: entry.rows,
+				atLeast: entry.atLeast,
 				catalogRows: catalogRowCount(schema),
 				baselineRows: entry.baselineRows,
 				observations: entry.observations,
@@ -385,10 +407,75 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		});
 	}
 
+	/** Exact counts first: a floor at or below the count just recorded is then ignored. */
 	private recordAll(observations: CardinalityObservations): void {
 		for (const [table, rows] of observations.entries()) {
 			this.record(table, rows);
 		}
+		for (const [table, rows] of observations.lowerBounds()) {
+			this.recordAtLeast(table, rows);
+		}
+	}
+
+	private holdAll(observations: CardinalityObservations): void {
+		for (const [table, rows] of observations.entries()) {
+			this.held(table).rows = rows;
+		}
+		for (const [table, rows] of observations.lowerBounds()) {
+			const held = this.held(table);
+			held.atLeast = Math.max(held.atLeast ?? 0, rows);
+		}
+	}
+
+	/** What is held for `table`; anything held under an older schema object for its name is superseded. */
+	private held(table: TableSchema): HeldObservation {
+		const key = tableKey(table);
+		const existing = this.pending.get(key);
+		if (existing?.table === table) return existing;
+		const fresh: HeldObservation = { table, rows: undefined, atLeast: undefined };
+		this.pending.set(key, fresh);
+		return fresh;
+	}
+
+	/** As {@link recordAll}: the count first, so a floor it already covers is ignored. */
+	private recordHeld({ table, rows, atLeast }: HeldObservation): void {
+		if (rows !== undefined) this.record(table, rows);
+		if (atLeast !== undefined) this.recordAtLeast(table, atLeast);
+	}
+
+	private isSuperseded(table: TableSchema, rows: number): boolean {
+		if (this.ctx.schemaManager.findTable(table.name, table.schemaName) === table) return false;
+		debugLog('Ignored %d rows for %s.%s: observed under a superseded schema', rows, table.schemaName, table.name);
+		return true;
+	}
+
+	/**
+	 * What planning would use for `table` right now — `existing` ranked with the module's
+	 * count and the catalog's (§3.3), else the default — so an exactly module-sized table
+	 * compares against the module and a scan agreeing with it shifts nothing.
+	 */
+	private plannedBefore(table: TableSchema, existing: ObservedEntry | undefined): number {
+		return plannedRowCount(table, {
+			observedRows: () => existing,
+			reportedRows: t => this.ctx.reportedRows(t),
+		}) ?? this.ctx.getTuning().defaultRowEstimate;
+	}
+
+	/** Counts one recorded observation on `entry`, makes it the most recent, and enforces the cap. */
+	private upsert(key: string, entry: ObservedEntry): ObservedEntry {
+		entry.observations++;
+		this.touch(key, entry);
+		this.evictBeyond(this.ctx.getTuning().cardinalityFeedback.maxTables);
+		return entry;
+	}
+
+	/** Reports a shift through `onShift` when `rows` has moved `shiftFactor` from the entry's baseline. */
+	private shiftIfMoved(key: string, entry: ObservedEntry, rows: number): void {
+		if (rowCountSpread(rows, entry.baselineRows) < this.ctx.getTuning().cardinalityFeedback.shiftFactor) return;
+		log('Shift on %s: baseline %d -> %d rows', key, entry.baselineRows, rows);
+		entry.baselineRows = rows;
+		entry.shifts++;
+		this.ctx.onShift(key);
 	}
 
 	/** The entry under `key` if it was observed against `table`; a stale one is replaced on record. */

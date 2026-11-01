@@ -36,13 +36,21 @@ import { createLogger } from '../../common/logger.js';
 
 const debugLog = createLogger('optimizer:stats:row-count').extend('debug');
 
+/** What execution has shown of one table's size: an exact count, a floor, or both. */
+export interface ObservedRowCount {
+	/** Exact row count from the latest complete read; absent when the table is known only from below. */
+	readonly rows?: number;
+	/** The table holds at least this many rows, proven by a read of part of it. */
+	readonly atLeast?: number;
+}
+
 /**
- * Exact table sizes observed during execution. Answers only for the `TableSchema`
- * object the count was observed against, so any schema swap (`ANALYZE`, `ALTER`,
- * drop and re-create) silences an entry.
+ * Table sizes observed during execution. Answers only for the `TableSchema` object the
+ * observation was made against, so any schema swap (`ANALYZE`, `ALTER`, drop and
+ * re-create) silences an entry.
  */
 export interface ObservedRowCounts {
-	observedRows(table: TableSchema): number | undefined;
+	observedRows(table: TableSchema): ObservedRowCount | undefined;
 }
 
 /**
@@ -117,6 +125,11 @@ export function reportedRowCount(db: Database, table: TableSchema): ModuleRowCou
  * 4. the catalog (`ANALYZE`) count;
  * 5. `undefined` (unknown).
  *
+ * The overlay's floor then raises whatever answered from 2–4, and answers alone when
+ * nothing did (it was recorded only above the default). It never raises an exact module
+ * count: that is current, and a floor describes committed state at some earlier moment,
+ * so it cannot legitimately exceed it.
+ *
  * The module is asked first so an exactly-sized table never touches the overlay, whose
  * reads refresh its recency. Only the row count is overridden; column statistics are
  * untouched.
@@ -128,5 +141,11 @@ export function reportedRowCount(db: Database, table: TableSchema): ModuleRowCou
 export function plannedRowCount(table: TableSchema, sources: RowCountSources | undefined): number | undefined {
 	const reported = sources?.reportedRows(table);
 	if (reported?.exact) return reported.rows;
-	return sources?.observedRows(table) ?? reported?.rows ?? catalogRowCount(table);
+	const observed = sources?.observedRows(table);
+	return raiseToFloor(observed?.rows ?? reported?.rows ?? catalogRowCount(table), observed?.atLeast);
+}
+
+function raiseToFloor(rows: number | undefined, floor: number | undefined): number | undefined {
+	if (floor === undefined) return rows;
+	return rows === undefined ? floor : Math.max(rows, floor);
 }
