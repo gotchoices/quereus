@@ -1,7 +1,7 @@
 description: Replace the two loose latency numbers a storage module can declare with one optional cost profile and a set of named presets (memory, local disk, browser storage, network, distributed), so a module author picks the category of storage they sit on instead of hand-tuning each number, and the engine, the store framework and the isolation wrapper all read the same shape.
 prereq: shared-high-latency-test-fixture
 files: packages/quereus/src/vtab/cost-profile.ts (new), packages/quereus/src/vtab/module.ts, packages/quereus/src/index.ts, packages/quereus/src/schema/manager.ts, packages/quereus/src/planner/nodes/reference.ts, packages/quereus/src/planner/nodes/plan-node.ts, packages/quereus/src/planner/cost/index.ts, packages/quereus/src/planner/optimizer-tuning.ts, packages/quereus/src/planner/rules/join/rule-join-physical-selection.ts, packages/quereus/src/planner/rules/join/index-nested-loop.ts, packages/quereus/src/planner/rules/join/rule-fanout-batched-outer.ts, packages/quereus/src/planner/rules/cache/rule-nested-loop-right-cache.ts, packages/quereus/test/optimizer/high-latency-fixture.ts, packages/quereus/test/vtab/cost-profile.spec.ts (new), packages/quereus-isolation/src/isolation-module.ts, packages/quereus-isolation/test/isolation-layer.spec.ts, packages/quereus-store/src/common/cost-profile.ts, packages/quereus-store/src/common/kv-store.ts, packages/quereus-store/src/common/store-module-base.ts, packages/quereus-store/src/testing/memory-provider.ts, packages/quereus-store/test/expected-latency-plan.spec.ts, docs/optimizer-costing.md, docs/module-capabilities.md, docs/module-authoring.md, docs/optimizer-parallel.md, docs/optimizer-joins.md, docs/runtime-parallel.md, packages/quereus-store/README.md, packages/quereus-isolation/README.md
-difficulty: hard
+difficulty: medium
 ----
 <!-- resume-note -->
 RESUME: A prior agent run on this ticket did not complete.
@@ -9,6 +9,7 @@ RESUME: A prior agent run on this ticket did not complete.
   Log file: C:\projects\quereus\tickets\.logs\2-module-cost-profile-and-presets.implement.2026-11-01T19-11-25-866Z.log
 Read the log to see what was done. Resume where it left off.
 If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+Gardener note: both prior attempts produced no output at all (killed by the 10-minute idle limit before the first tool call) — no partial work exists. Difficulty lowered from hard to medium so the implement stage runs on Opus/xhigh instead of Fable/xhigh, which appears to think silently past the idle limit on a ticket this size. Start by emitting short progress notes; keep any single silent step well under 10 minutes; run benchmarks in the background.
 <!-- /resume-note -->
 
 # Module cost profile with named presets
