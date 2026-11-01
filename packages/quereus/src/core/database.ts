@@ -41,6 +41,7 @@ import { EmissionContext } from '../runtime/emission-context.js';
 import { Optimizer, DEFAULT_TUNING } from '../planner/optimizer.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
 import { CatalogStatsProvider } from '../planner/stats/catalog-stats.js';
+import { databaseRowCountSources, type RowCountSources } from '../planner/stats/table-cardinality.js';
 import { registerBuiltinWindowFunctions } from '../func/builtins/builtin-window-functions.js';
 import { DatabaseOptionsManager } from './database-options.js';
 import { MAINTENANCE_REBUILD_ROW_THRESHOLD } from '../planner/cost/index.js';
@@ -213,6 +214,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	private readonly autoAnalyzeManager: AutoAnalyzeManager;
 	/** Observed row-count overlay — exact table sizes seen during execution */
 	private readonly cardinalityFeedbackManager: CardinalityFeedbackManager;
+	private readonly rowCountSources: RowCountSources;
 	/** Per-database collation registry — comparator + optional key normalizer +
 	 *  optional REPLICABLE and ORDER-PRESERVING assertions. The normalizer is required
 	 *  for index participation; comparator-only collations may still be used in ORDER BY
@@ -270,15 +272,17 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 		registerEmitters();
 
-		// The overlay is constructed before the optimizer so the stats provider and
-		// `TableReferenceNode` (via `SchemaManager.getObservedRowCounts`) read one object.
+		// The row-count sources are constructed before the optimizer so the stats provider
+		// and `TableReferenceNode` (via `SchemaManager.getRowCountSources`) read one object.
 		this.cardinalityFeedbackManager = new CardinalityFeedbackManager({
 			schemaManager: this.schemaManager,
 			getTuning: () => this.optimizer.tuning,
 			getAutocommit: () => this.transactionManager.getAutocommit(),
+			reportedRows: table => this.rowCountSources.reportedRows(table),
 			onShift: key => this.noteCardinalityShift(key),
 		});
-		this.optimizer = new Optimizer(DEFAULT_TUNING, new CatalogStatsProvider(undefined, this.cardinalityFeedbackManager));
+		this.rowCountSources = databaseRowCountSources(this, this.cardinalityFeedbackManager);
+		this.optimizer = new Optimizer(DEFAULT_TUNING, new CatalogStatsProvider(undefined, this.rowCountSources));
 
 		// Initialize transaction manager and assertion evaluator
 		this.transactionManager = new TransactionManager(this);
@@ -2914,6 +2918,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal The observed row-count overlay the planner consults before the catalog. */
 	public get _cardinalityFeedback(): CardinalityFeedbackManager {
 		return this.cardinalityFeedbackManager;
+	}
+
+	/** @internal Every source the planner ranks for a base table's size (`plannedRowCount`). */
+	public get _rowCountSources(): RowCountSources {
+		return this.rowCountSources;
 	}
 
 	/** Tells every live prepared statement that `key`'s observed size shifted; each decides whether its plan reads it. */

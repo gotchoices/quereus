@@ -17,7 +17,7 @@ import { Database } from '../../src/core/database.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import { IndexSeekNode } from '../../src/planner/nodes/table-access-nodes.js';
-import { hasSingletonFd } from '../../src/planner/util/fd-utils.js';
+import { hasSingletonFd, keysOf } from '../../src/planner/util/fd-utils.js';
 
 function walk(node: PlanNode, fn: (n: PlanNode) => void): void {
 	fn(node);
@@ -133,6 +133,25 @@ describe('index seek row estimates', () => {
 			.to.equal(false);
 		expect(seek!.physical?.estimatedRows).to.equal(3);
 		expect(await actualRows(db, 'select * from big where id in (1, 2, 3)')).to.equal(3);
+	});
+
+	it('does not claim at-most-one-row for a correlated primary-key seek', async () => {
+		// The inner seek of a nested-loop join returns at most one row per OUTER row. As
+		// `∅ → all columns` it reached the join, collapsed the join's key to the empty key,
+		// and a materialized view over the join rejected its second row as a duplicate.
+		await db.exec('create table probe (id integer primary key, big_id integer)');
+		try {
+			await db.exec('insert into probe values (1, 1), (2, 2)');
+			const plan = db.getPlan('select p.id, b.s from probe p join big b on b.id = p.big_id');
+			const seek = findSeek(plan);
+			expect(seek?.source.tableSchema.name, 'expected a correlated seek into `big`').to.equal('big');
+
+			const colCount = seek!.getType().columns.length;
+			expect(hasSingletonFd(seek!.physical?.fds, colCount, true)).to.equal(false);
+			expect(keysOf(plan.getRelations()[0]!)).to.not.deep.include([]);
+		} finally {
+			await db.exec('drop table probe');
+		}
 	});
 
 	it('leaves an un-analyzed table planning as it did before', async () => {

@@ -3,7 +3,8 @@
  *
  * One per `Database`. The planner reads it through `plannedRowCount`
  * (`planner/stats/table-cardinality.ts`), where an answering entry outranks the
- * catalog's `ANALYZE` count. This module owns the record policy — which
+ * catalog's `ANALYZE` count and a module's approximate count, but not a module's
+ * exact one. This module owns the record policy — which
  * observations are worth keeping, and when one has moved far enough from what
  * plans were costed against to call it a *shift* — and the entries' lifetime.
  *
@@ -27,10 +28,11 @@
 import { createLogger } from '../common/logger.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
 import { CardinalityObservations } from '../runtime/cardinality-observations.js';
-import { catalogRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
+import { catalogRowCount, plannedRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import type { TableSchema } from '../schema/table.js';
 import type { Database } from './database.js';
+import type { ModuleRowCount } from '../vtab/module.js';
 
 const log = createLogger('core:cardinality-feedback');
 const debugLog = log.extend('debug');
@@ -42,6 +44,8 @@ export interface CardinalityFeedbackManagerContext {
 	getTuning(): OptimizerTuning;
 	/** True when no transaction (explicit or implicit) is open. */
 	getAutocommit(): boolean;
+	/** The table's module's own count (`RowCountSources.reportedRows`), ranked with this overlay's entry. */
+	reportedRows(table: TableSchema): ModuleRowCount | undefined;
 	/**
 	 * A recorded count moved at least `cardinalityFeedback.shiftFactor` away from the
 	 * entry's baseline: plans costed against the old number may be wrong. `key` is the
@@ -169,6 +173,10 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * ignored when the schema object is superseded or when both the observation and the
 	 * current estimate are small; otherwise recorded, and reported through `onShift`
 	 * when it has moved `shiftFactor` from the entry's baseline.
+	 *
+	 * The current estimate is what planning would use right now — this entry ranked with
+	 * the module's count and the catalog's — so an exactly module-sized table compares
+	 * against the module and a scan agreeing with it shifts nothing.
 	 */
 	record(table: TableSchema, rows: number): void {
 		if (this.ctx.schemaManager.findTable(table.name, table.schemaName) !== table) {
@@ -179,7 +187,13 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		const policy = tuning.cardinalityFeedback;
 		const key = tableKey(table);
 		const existing = this.validEntry(key, table);
-		const before = existing?.rows ?? catalogRowCount(table) ?? tuning.defaultRowEstimate;
+		// NOTE: an exactly module-sized table still records an entry, which `plannedRowCount`
+		// never reads while the module answers — one LRU slot each; if `maxTables` pressure
+		// ever matters, skip recording when the module's count is exact.
+		const before = plannedRowCount(table, {
+			observedRows: () => existing?.rows,
+			reportedRows: t => this.ctx.reportedRows(t),
+		}) ?? tuning.defaultRowEstimate;
 		if (Math.max(before, rows) <= policy.minRows) return;
 
 		const entry = existing ?? { schema: table, rows, baselineRows: before, observations: 0, shifts: 0 };

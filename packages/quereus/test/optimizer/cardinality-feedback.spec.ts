@@ -1,8 +1,8 @@
 /**
  * Cardinality feedback, planner half: the observed row-count overlay's record/shift
- * policy (docs/progressive-optimizer.md §3.4), its precedence over the catalog at the
- * one base-table row-count seam (`plannedRowCount`, §3.3), and re-planning prepared
- * statements on a shift (§3.6).
+ * policy (docs/progressive-optimizer.md §3.4), its precedence against module-reported
+ * and catalog counts at the one base-table row-count seam (`plannedRowCount`, §3.3), and
+ * re-planning prepared statements on a shift (§3.6).
  *
  * The policy tests construct their own `CardinalityFeedbackManager` over the database's
  * schema manager so they can watch `onShift` directly and vary the tuning per test.
@@ -14,6 +14,17 @@ import type { Statement } from '../../src/core/statement.js';
 import { CardinalityFeedbackManager, FeedbackReplanState } from '../../src/core/database-cardinality-feedback.js';
 import { DEFAULT_TUNING, type OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
 import type { TableSchema } from '../../src/schema/table.js';
+import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import type { ModuleRowCount } from '../../src/vtab/module.js';
+
+/** A memory module whose planner row count is whatever the test last set. */
+class ReportingMemoryModule extends MemoryTableModule {
+	answer: ModuleRowCount | undefined;
+
+	getRowCount(): ModuleRowCount | undefined {
+		return this.answer;
+	}
+}
 
 describe('Cardinality feedback overlay', () => {
 	const joinSql = 'select m.x, b.w from mid m join big b on b.id = m.big_id where m.x = 1';
@@ -50,6 +61,7 @@ describe('Cardinality feedback overlay', () => {
 				schemaManager: db.schemaManager,
 				getTuning: () => tuning,
 				getAutocommit: () => true,
+				reportedRows: () => undefined,
 				onShift: key => shifts.push(key),
 			});
 		});
@@ -149,6 +161,28 @@ describe('Cardinality feedback overlay', () => {
 			const observed = planNodeTypes();
 			expect(observed).to.include.keys('Join', 'IndexSeek');
 			expect(observed).to.not.have.property('HashJoin');
+		});
+
+		it('ranks exact module count, observed, approximate module count, catalog, then default', async () => {
+			const module = new ReportingMemoryModule();
+			db.registerModule('reporting', module);
+			await db.exec('create table s (id integer primary key) using reporting');
+			await db.exec('create table u (id integer primary key) using reporting');
+			await db.exec('insert into s values (1), (2), (3), (4), (5)');
+			await db.exec('analyze s');
+			const s = table('s');
+			db._cardinalityFeedback.record(s, 20_000);
+			const tableRows = (t: TableSchema) => db.optimizer.getStats().tableRows(t);
+
+			module.answer = { rows: 7, exact: true };
+			expect(tableRows(s), 'exact module count beats the overlay').to.equal(7);
+			module.answer = { rows: 9, exact: false };
+			expect(tableRows(s), 'overlay beats an approximate module count').to.equal(20_000);
+			db._cardinalityFeedback.clear();
+			expect(tableRows(s), 'approximate module count beats the catalog').to.equal(9);
+			module.answer = undefined;
+			expect(tableRows(s), 'a declining module falls through to the catalog').to.equal(5);
+			expect(tableRows(table('u')), 'nothing known: the naive default').to.equal(1000);
 		});
 	});
 

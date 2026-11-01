@@ -28,7 +28,7 @@ import { SchemaChangeNotifier } from './change-events.js';
 import { checkDeterministic } from '../planner/validation/determinism-validator.js';
 import { buildExpression } from '../planner/building/expression.js';
 import type { PlanningContext } from '../planner/planning-context.js';
-import type { ObservedRowCounts } from '../planner/stats/table-cardinality.js';
+import type { RowCountSources } from '../planner/stats/table-cardinality.js';
 import { BuildTimeDependencyTracker } from '../planner/planning-context.js';
 import { GlobalScope } from '../planner/scopes/global.js';
 import { ParameterScope } from '../planner/scopes/param.js';
@@ -554,12 +554,12 @@ export class SchemaManager {
 	}
 
 	/**
-	 * The owning database's observed row-count overlay, read by `TableReferenceNode`
-	 * at construction. Read lazily (not captured), so construction order inside the
-	 * `Database` constructor does not matter.
+	 * The owning database's row-count sources (module counts and the observed overlay),
+	 * read by `TableReferenceNode` at construction. Read lazily (not captured), so
+	 * construction order inside the `Database` constructor does not matter.
 	 */
-	getObservedRowCounts(): ObservedRowCounts | undefined {
-		return this.db._cardinalityFeedback;
+	getRowCountSources(): RowCountSources | undefined {
+		return this.db._rowCountSources;
 	}
 
 	/**

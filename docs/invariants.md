@@ -607,11 +607,12 @@ that motivated it.
 Every planner reading of a base table's row count — `TableReferenceNode.estimatedRows`
 (scan cardinality and the `BestAccessPlanRequest.estimatedRows` hint) and
 `CatalogStatsProvider.tableRows` (selectivity denominators, materialized-view sizing) — goes
-through `plannedRowCount` with the owning database's one observed row-count overlay, so
-within one compile they answer the same number for the same `TableSchema`. The node reads it
-once, at construction, never afterwards; a provider built without that overlay (or a node
-built without its `SchemaManager`) reads the catalog alone and may disagree with plans that
-saw an observation.
+through `plannedRowCount` with the owning database's one set of row-count sources (its
+tables' modules' `getRowCount` and its observed row-count overlay), so within one compile
+they answer the same number for the same `TableSchema`. The node reads it once, at
+construction, never afterwards; a provider built without those sources (or a node built
+without its `SchemaManager`) reads the catalog alone and may disagree with plans that saw a
+module count or an observation.
 
 ## MV — Materialized views
 

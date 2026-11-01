@@ -39,6 +39,7 @@ import type {
 	LensDeploymentSnapshot,
 	MappingAdvertisement,
 	ModuleCapabilities,
+	ModuleRowCount,
 	Schema,
 	SqlValue,
 	TableSchema,
@@ -70,11 +71,11 @@ import { reconcilePkCollations } from './store-module-schema-rewrite.js';
  * `request` with the table's own size filled into `estimatedRows` when the planner
  * supplied none — otherwise `request` unchanged.
  *
- * The planner's hint comes only from `ANALYZE`-collected statistics, so a
- * never-analyzed table arrives as `undefined` and every cost in
- * `computeBestAccessPlan` would be computed against its fixed 1000-row placeholder,
- * whatever the table actually holds. This module maintains a running row count as it
- * writes ({@link StoreTable.getKnownRowCount}), so it can answer for itself.
+ * A backstop now: the planner asks {@link StoreModule.getRowCount} for this same count
+ * before it plans, so a request normally arrives already carrying it. This fires only for
+ * a request that arrives without it — a wrapper module that forwards `getBestAccessPlan`
+ * but not `getRowCount`, or a request built without the table's planned size. When the
+ * hook declines (no count in memory), there is no live count to substitute either.
  *
  * ONE exception, and only one: a hint of `0` that this module's own count contradicts.
  * `0` normally means "analyzed, and empty" and is honored like any other measurement — but
@@ -733,6 +734,17 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 				db, tableInfo, sizeRequestFromLiveCount(request, table), tableKeyCollation, this.costProfile),
 			honorsCollatedRangeBounds: true,
 		};
+	}
+
+	/**
+	 * The planner's row-count hook: the running count the write paths maintain
+	 * ({@link StoreTable.getKnownRowCount}, which includes this transaction's buffered
+	 * delta — the same number {@link sizeRequestFromLiveCount} prices access paths with),
+	 * reported as exact. Declines when the table holds no count in memory yet.
+	 */
+	getRowCount(_db: Database, table: TableSchema): ModuleRowCount | undefined {
+		const rows = this.getTable(table.schemaName, table.name)?.getKnownRowCount();
+		return rows === undefined ? undefined : { rows, exact: true };
 	}
 
 	/**

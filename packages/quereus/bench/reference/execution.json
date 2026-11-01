@@ -2,11 +2,11 @@
 	"suite": "execution",
 	"accepted": {
 		"by": "Nathan Allan <nate@digithought.com>",
-		"commit": "a8999c107",
-		"date": "2026-08-20T02:59:19.630Z",
+		"commit": "db93b1891",
+		"date": "2026-11-01T08:59:19.081Z",
 		"node": "v24.2.0",
 		"platform": "win32",
-		"reason": "initial reference set (bench-gate-reference ticket)"
+		"reason": "feat-planner-asks-the-backend-how-big-a-table-is: store tables are sized from the module's live row count at plan time, so join-1kx1k@store-mem plans its sides in a different order; same rows scanned and sought"
 	},
 	"benchmarks": {
 		"correlated-subquery": {
@@ -1411,22 +1411,22 @@
 							"executions": 1,
 							"in": 0,
 							"key": "r#0",
+							"nodeType": "IndexScan",
+							"out": 1000
+						},
+						{
+							"executions": 1,
+							"in": 0,
+							"key": "r#1",
 							"nodeType": "Literal",
 							"out": 1
 						},
 						{
 							"executions": 1,
 							"in": 1,
-							"key": "r#1",
+							"key": "r#2",
 							"nodeType": "IndexSeek",
 							"out": 100
-						},
-						{
-							"executions": 1,
-							"in": 0,
-							"key": "r#2",
-							"nodeType": "IndexScan",
-							"out": 1000
 						},
 						{
 							"executions": 1,

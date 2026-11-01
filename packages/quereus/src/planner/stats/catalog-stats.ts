@@ -3,8 +3,8 @@
  *
  * Reads real statistics from TableSchema.statistics (populated by ANALYZE or VTab)
  * and falls back to NaiveStatsProvider heuristics when unavailable. Table row
- * counts additionally consult the observed row-count overlay first (see
- * `plannedRowCount`); column statistics never do.
+ * counts additionally consult the table's module and the observed row-count overlay
+ * (see `plannedRowCount`); column statistics never do.
  */
 
 import type { SqlValue } from '../../common/types.js';
@@ -13,7 +13,7 @@ import type { TableSchema } from '../../schema/table.js';
 import type { ColumnStatsResolver, StatsProvider } from './index.js';
 import { NaiveStatsProvider } from './index.js';
 import { createLogger } from '../../common/logger.js';
-import { plannedRowCount, type ObservedRowCounts } from './table-cardinality.js';
+import { plannedRowCount, type RowCountSources } from './table-cardinality.js';
 import { selectivityFromHistogram } from './histogram.js';
 import { combineConjunctive, combineDisjunctive } from './selectivity-combine.js';
 import { splitConjuncts, splitDisjuncts } from '../analysis/predicate-conjuncts.js';
@@ -132,18 +132,18 @@ export class CatalogStatsProvider implements StatsProvider {
 	private readonly fallback: NaiveStatsProvider;
 
 	/**
-	 * @param observed The owning database's observed row-count overlay. Must be the
-	 *   same overlay `TableReferenceNode` reads through its `SchemaManager`, or scan
-	 *   cardinality and selectivity denominators disagree.
+	 * @param sources The owning database's row-count sources. Must be the same object
+	 *   `TableReferenceNode` reads through its `SchemaManager`, or scan cardinality and
+	 *   selectivity denominators disagree.
 	 */
-	constructor(fallback?: NaiveStatsProvider, private readonly observed?: ObservedRowCounts) {
+	constructor(fallback?: NaiveStatsProvider, private readonly sources?: RowCountSources) {
 		this.fallback = fallback ?? new NaiveStatsProvider();
 	}
 
 	tableRows(table: TableSchema): number | undefined {
-		const rows = plannedRowCount(table, this.observed);
+		const rows = plannedRowCount(table, this.sources);
 		if (rows === undefined) return this.fallback.tableRows(table);
-		log('Table %s: rowCount=%d (source: observed or catalog)', table.name, rows);
+		log('Table %s: rowCount=%d (source: module, observed or catalog)', table.name, rows);
 		return rows;
 	}
 

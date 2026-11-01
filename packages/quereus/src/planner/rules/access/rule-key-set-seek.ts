@@ -612,18 +612,15 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		// estimate is read because the logical `estimatedRows` getter reads
 		// `undefined` through a physical access node.
 		//
-		// NOTE: this gate has never declined on either shipped backend, and still does not.
-		// The key source is reached through an `IndexScan`/`SeqScan`, and those relay
-		// `this.source.estimatedRows` — the CATALOG count, `undefined` until `ANALYZE` —
-		// where their sibling `IndexSeekNode` relays the module's own
-		// `filterInfo.indexInfoOutput.estimatedRows`. So a store table's live row count
-		// prices the module's plan and is then discarded one level up, and `undefined`
-		// arrives here. Measured: a 3000-row key source against a 200-row target
-		// advertising `breakEvenKeys: 343` — nearly 9× over — still proceeds. Tracked as an
-		// arm on `debt-row-estimate-relay-has-no-guard`; pinned as OBSERVED (not desired)
-		// behavior by `packages/quereus-store/test/live-row-count-plans.spec.ts`, which is
-		// what will report the change when that relay is fixed. The gate itself is correct
-		// and exists for modules that report real cardinality.
+		// NOTE: the key source is reached through an `IndexScan`/`SeqScan`, which relay
+		// `this.source.estimatedRows` — the planned count (`plannedRowCount`): a module's
+		// exact count when it reports one (`quereus-store` does), else the overlay or
+		// `ANALYZE`, else `undefined`. A never-analyzed memory-backed key source therefore
+		// still arrives here as `undefined` and proceeds; whether a scan should relay the
+		// module's `accessPlan.rows` instead is the arm on
+		// `debt-row-estimate-relay-has-no-guard`. The 3000-row store key source in
+		// `packages/quereus-store/test/live-row-count-plans.spec.ts` does not exercise this
+		// gate: that query reaches the rule as a hash semi join.
 		const keyRows = node.right.physical.estimatedRows;
 		if (keyRows !== undefined && keyRows > Math.min(pushdown.maxKeys, pushdown.breakEvenKeys)) {
 			log('decline: key source estimate %d exceeds the seek threshold min(%d, %d)',

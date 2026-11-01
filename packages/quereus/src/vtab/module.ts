@@ -14,6 +14,20 @@ import type { LensDeploymentSnapshot } from '../schema/lens.js';
 import type { Row, SqlValue } from '../common/types.js';
 
 /**
+ * A module's own answer to "how many rows does this table hold right now?" — see
+ * {@link VirtualTableModule.getRowCount}.
+ */
+export interface ModuleRowCount {
+	/** Rows a read issued now by the asking database would see; a non-negative integer. */
+	readonly rows: number;
+	/**
+	 * True only for a count the module maintains on every write path. Anything sampled,
+	 * cached from elsewhere, or otherwise estimated is `false`.
+	 */
+	readonly exact: boolean;
+}
+
+/**
  * Base interface for module-specific configuration passed to create/connect.
  * Modules should define their own interface extending this if they need options.
  */
@@ -325,6 +339,32 @@ export interface VirtualTableModule<
 		tableInfo: TableSchema,
 		request: BestAccessPlanRequest
 	): BestAccessPlanResult;
+
+	/**
+	 * The table's current row count, asked by the planner while it plans — so a module
+	 * that already keeps a count can size its tables without `ANALYZE`. Module-level, like
+	 * {@link getBestAccessPlan}, because planning holds no connected table instance.
+	 *
+	 * Contract:
+	 * - answer only from memory, in constant time, or return `undefined` (decline) — never
+	 *   start I/O; planning is synchronous and performs none;
+	 * - `rows` is the count a read issued now by `db` would see — a module that buffers its
+	 *   own transaction's writes includes them;
+	 * - `exact: true` only for a count maintained on every write path (see {@link ModuleRowCount});
+	 * - a hint: correctness never depends on it. A throw or a malformed answer is logged
+	 *   and treated as a decline.
+	 *
+	 * An exact count outranks the observed row-count overlay and the `ANALYZE` count; an
+	 * approximate one outranks only the `ANALYZE` count (`plannedRowCount` in
+	 * `planner/stats/table-cardinality.ts`). Only the row count is overridden — column
+	 * statistics still come from the catalog. Not consulted by {@link VirtualTable.getStatistics},
+	 * which needs a connected instance and may be asynchronous.
+	 *
+	 * @param db The database planning the query
+	 * @param table The schema of the table being planned
+	 * @returns The count, or `undefined` when the module has none in memory
+	 */
+	getRowCount?(db: Database, table: TableSchema): ModuleRowCount | undefined;
 
 	/**
 	 * Destroys the underlying persistent representation of the virtual table.

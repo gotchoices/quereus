@@ -530,11 +530,11 @@ function computeFilterAccessPlan(
 	tableKeyCollation: string,
 	costProfile: ResolvedCostProfile,
 ): BestAccessPlanResult {
-	// NOTE: last-resort default only. Every planner site now sends `undefined` for an
-	// un-analyzed table rather than substituting 1000 of its own, and `StoreModule`
-	// fills that gap from the table's live row count before this function runs
-	// (`sizeRequestFromLiveCount`). Reaching this constant means neither the catalog nor
-	// the live count could answer — a table this module has no handle for.
+	// NOTE: last-resort default only. The planner sizes the request from
+	// `StoreModule.getRowCount` (the live count) before the overlay or catalog, and sends
+	// `undefined` only when nothing could answer; `sizeRequestFromLiveCount` backstops a
+	// request that arrives without the live count. Reaching this constant means neither
+	// the catalog nor the live count could answer — a table this module has no handle for.
 	const estimatedRows = request.estimatedRows ?? 1000;
 
 	// Whether ANY pushed filter is a runtime-valued set. Detected once, on the REQUEST:

@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, CatalogObjectKind, ViewSchema } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, CatalogObjectKind, ViewSchema, ModuleRowCount } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { ConnectionOverlayState, IsolationModuleConfig, Predicate, UnderlyingTableState } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -187,6 +187,15 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 */
 	normalizeCreateSchema?: (tableSchema: TableSchema) => TableSchema;
 
+	/**
+	 * Planner row-count forward (see {@link VirtualTableModule.getRowCount}) — assigned only
+	 * when the underlying implements it, mirroring presence like the seams above. A plain
+	 * delegate: this connection's overlay rows (uncommitted inserts and tombstones) are not
+	 * netted in, because that would need a scan and the count is only a hint. It still
+	 * reports the underlying's `exact` flag — exact for what the underlying holds.
+	 */
+	getRowCount?: (db: Database, table: TableSchema) => ModuleRowCount | undefined;
+
 	constructor(config: IsolationModuleConfig) {
 		this.underlying = config.underlying;
 		this.overlayModule = config.overlay ?? new MemoryTableModule();
@@ -201,6 +210,11 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 		const underlyingNormalize = this.underlying.normalizeCreateSchema;
 		if (underlyingNormalize) {
 			this.normalizeCreateSchema = (tableSchema) => underlyingNormalize.call(this.underlying, tableSchema);
+		}
+
+		const underlyingGetRowCount = this.underlying.getRowCount;
+		if (underlyingGetRowCount) {
+			this.getRowCount = (db, table) => underlyingGetRowCount.call(this.underlying, db, table);
 		}
 
 		const underlyingCreateBacking = this.underlying.createBacking;

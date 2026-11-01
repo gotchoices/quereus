@@ -47,9 +47,10 @@ const log = createLogger('optimizer:rule:grow-retrieve');
  * The row count for a `BestAccessPlanRequest`: the measured count, or `undefined` when
  * nothing has measured it. Never a fabricated number.
  *
- * `TableReferenceNode.estimatedRows` is `plannedRowCount(tableSchema, …)` — an exact
- * count observed during execution, else `ANALYZE`'s (or a module's reported statistics),
- * where a real `0` means "measured, empty" and `undefined` means "nobody knows".
+ * `TableReferenceNode.estimatedRows` is `plannedRowCount(tableSchema, …)` — the module's
+ * own count (`VirtualTableModule.getRowCount`), an exact count observed during execution,
+ * or `ANALYZE`'s, ranked there — where a real `0` means "measured, empty" and `undefined`
+ * means "nobody knows".
  *
  * `context.stats.tableRows()` is deliberately NOT consulted here. `CatalogStatsProvider`
  * reads that same `plannedRowCount` and, finding nothing, falls back to

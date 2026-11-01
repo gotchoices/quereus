@@ -561,9 +561,10 @@ export class IndexSeekNode extends TableAccessNode {
 			// exactly ONCE. A multi-seek (`where id in (1, 2, 3)`) supplies one tuple per
 			// IN member — three seek keys against a one-column key — so a `>=` test passed
 			// for it and the node both reported one row and stamped `∅ → all columns`,
-			// which asserts the relation holds at most one row. Nothing leans on that FD
-			// today, but its consumers (uniqueness proofs, DISTINCT elision, sort elision)
-			// are exactly the rewrites that would silently drop rows if one ever did.
+			// which asserts the relation holds at most one row. Its consumers (key
+			// derivation via `keysOf` — a materialized view's backing key — uniqueness
+			// proofs, DISTINCT elision, sort elision) are exactly the rewrites that
+			// mis-key or silently drop rows on a false claim.
 			//
 			// A composite-key multi-seek that happens to reduce to a single tuple is
 			// declined here too (its `plan` is still `multiSeek`); that costs an
@@ -572,8 +573,16 @@ export class IndexSeekNode extends TableAccessNode {
 			// read above, already says 1 for a whole-PK point seek and 3 for the IN.
 			const isMultiSeek = accessPathPlan(this.filterInfo.accessPath) === 'multiSeek';
 			if (pk.length > 0 && this.seekKeys.length === pk.length && !isMultiSeek) {
-				// Full PK equality seek — at most one row. Encode via the singleton
-				// FD `∅ → all_cols`.
+				// Full PK equality seek — at most one row per evaluation of its keys. A
+				// correlated seek (the inner side of a nested-loop join, keyed on the outer
+				// row) is at most one row per OUTER row, so it must not stamp the singleton:
+				// at the join that FD says the whole result holds one row, which collapsed
+				// the join's key to the empty key (a materialized view over it was keyed on
+				// nothing and rejected its second row as a duplicate).
+				if (this.seekKeys.some(key => collectColumnRefAttributeIds(key).length > 0)) {
+					return { ...base, estimatedRows: 1 } as Partial<PhysicalProperties>;
+				}
+				// Encode via the singleton FD `∅ → all_cols`.
 				const colCount = this.source.getType().columns.length;
 				const fds = addSingletonFd(base.fds ?? [], colCount);
 				return { ...base, estimatedRows: 1, fds } as Partial<PhysicalProperties>;

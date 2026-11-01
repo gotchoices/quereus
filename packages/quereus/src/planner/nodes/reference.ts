@@ -34,9 +34,9 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 	private attributesCache: Cached<Attribute[]>;
 	/**
 	 * Snapshot of the planned row count, taken at construction. Plan nodes are
-	 * immutable (OPT-008): a node built before a cardinality observation keeps the
-	 * number its plan was costed with, and the stats provider read in the same
-	 * synchronous compile sees the same overlay state.
+	 * immutable (OPT-008): a node built before a cardinality observation or a write
+	 * keeps the number its plan was costed with, and the stats provider read in the
+	 * same synchronous compile sees the same module and overlay state.
 	 */
 	private readonly plannedRows: number | undefined;
 
@@ -59,7 +59,7 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		public readonly schemaManager?: SchemaManager,
 	) {
 		super(scope, estimatedCostOverride ?? 1);
-		this.plannedRows = plannedRowCount(tableSchema, schemaManager?.getObservedRowCounts());
+		this.plannedRows = plannedRowCount(tableSchema, schemaManager?.getRowCountSources());
 		this.typeCache = new Cached(() => relationTypeFromTableSchema(tableSchema));
 		this.attributesCache = new Cached(() => {
 			// Create attributes from table schema columns

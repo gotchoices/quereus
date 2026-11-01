@@ -11,9 +11,10 @@
  *      answering the SIZE in O(1) with no per-column statistics.
  *   2. `ANALYZE` must not get WORSE for supplying it: a size-only report still leaves
  *      the scan to collect per-column distinct counts / null counts / min-max.
- *   3. `StoreModule.getBestAccessPlan` prices against the live count when the planner
- *      has no `ANALYZE` snapshot to hand it — the never-analyzed case, which is every
- *      store table until someone runs `ANALYZE`.
+ *   3. `StoreModule.getBestAccessPlan` prices against the live count when a request
+ *      arrives with no size. A backstop now: the planner asks `StoreModule.getRowCount`
+ *      for the same count before it plans (`live-row-count-plans.spec.ts`), so through a
+ *      real query the request already carries it.
  *
  * Plus the latent defect seam 3 exposes: the persisted count used to be discarded by
  * the first write after a reopen (`trackMutation` seeded a missing cache with 0).

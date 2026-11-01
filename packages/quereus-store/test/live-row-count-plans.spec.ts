@@ -1,27 +1,23 @@
 /**
  * A never-analyzed store table is planned against the size it actually is.
  *
- * `store-row-count-to-planner` taught `StoreModule` to fill an absent
- * `request.estimatedRows` from its own maintained row count
- * (`sizeRequestFromLiveCount`), and `store-row-count-to-planner.spec.ts` pins that
- * function by calling `getBestAccessPlan` directly. It could never fire through a real
- * query, though: `rule-grow-retrieve` sent `… || context.stats.tableRows(schema) || 1000`,
- * so the request always carried a number and the module returned early every time.
+ * The planner asks the module for its count while it plans (`StoreModule.getRowCount`,
+ * ranked first at `plannedRowCount` because the store maintains it on every write), so the
+ * live count is the base-table size the WHOLE plan is costed with — join selection, cache
+ * admission and sort costs as well as the access path — and it arrives at
+ * `getBestAccessPlan` as `request.estimatedRows`. `sizeRequestFromLiveCount`, which used to
+ * fill the gap inside the module, is a backstop a real query no longer reaches; its unit
+ * pins live in `store-row-count-to-planner.spec.ts`.
  *
- * Every planner site now sends `undefined` for a table nobody has analyzed. This file
- * drives that end to end — through `db.eval`, not through a hand-built request — and pins
- * what it does and does not change.
+ * This file drives it end to end — through `db.eval`, not through a hand-built request:
  *
- * The engine half of the contract (which spelling each site sends, and that a measured `0`
- * survives) lives in `packages/quereus/test/optimizer/access-plan-request-row-count.spec.ts`.
- * What is store-specific, and lives here:
- *
- *  - the live count actually reaches the module through a real query, so two un-analyzed
- *    tables of different sizes no longer price identically;
+ *  - the live count reaches the module through a real query, so two un-analyzed tables of
+ *    different sizes no longer price identically;
  *  - the count includes the open transaction's buffered writes, so a statement reading what
  *    its own transaction just wrote is costed against the size it will really see;
- *  - `ANALYZE` still wins over the live count, because the rest of the plan was costed from
- *    the same catalog snapshot.
+ *  - the live count outranks an `ANALYZE` snapshot, which is older by construction;
+ *  - join selection sees it: an un-analyzed isolated-store join picks the plan `ANALYZE`
+ *    used to be needed for.
  *
  * **What this does NOT change, deliberately: which plan an un-analyzed range query gets.**
  * See the `plan shape` block — the seek-versus-scan veto is scale-invariant while the
@@ -37,7 +33,7 @@ import type {
 	SqlValue,
 	TableSchema,
 } from '@quereus/quereus';
-import { StoreModule, InMemoryKVStore, type KVCostProfile, type KVStoreProvider } from '../src/index.js';
+import { StoreModule, InMemoryKVStore, createIsolatedStoreModule, type KVCostProfile, type KVStoreProvider } from '../src/index.js';
 
 /**
  * The cost profile measured for IndexedDB (`store-backend-cost-profile`): a random point
@@ -69,9 +65,9 @@ function createInMemoryProvider(costProfile?: KVCostProfile): KVStoreProvider {
 /** What the planner asked, and what the module answered, for one `getBestAccessPlan` call. */
 interface Exchange {
 	readonly table: string;
-	/** `request.estimatedRows` — `undefined` is "nobody measured this table". */
+	/** `request.estimatedRows` — the size the planner costed the table at. */
 	readonly asked: number | undefined;
-	/** `result.rows` — after `sizeRequestFromLiveCount` had its chance. */
+	/** `result.rows` — the module's answer for the arm it chose. */
 	readonly answered: number | undefined;
 }
 
@@ -138,8 +134,8 @@ describe('a store table is planned against its live row count', () => {
 		return leaf!;
 	};
 
-	describe('the request reaches the module as unknown, and the module fills it in', () => {
-		it('answers a never-analyzed table with its real size, not the 1000-row placeholder', async () => {
+	describe("the planner sizes the request from the module's own count", () => {
+		it('plans a never-analyzed table at its real size, not the 1000-row placeholder', async () => {
 			await seed('t', 137);
 			mod.reset();
 
@@ -148,10 +144,9 @@ describe('a store table is planned against its live row count', () => {
 			const seen = mod.forTable('t');
 			expect(seen, 'the planner asked the module').to.not.be.empty;
 			for (const e of seen) {
-				expect(e.asked, 'a never-analyzed table arrives as unknown').to.be.undefined;
+				expect(e.asked, 'the planner sends the live count').to.equal(137);
 			}
-			// `sizeRequestFromLiveCount` supplied 137, so every arm the module advertises is a
-			// fraction of 137. Under the old fabricated 1000 the same arms answered fractions
+			// Sized at 137, every arm the module advertises is a fraction of 137. Under the old fabricated 1000 the same arms answered fractions
 			// of 1000 — the range arm alone would claim 300 rows out of a 137-row table.
 			const answered = seen.map(e => e.answered ?? 0);
 			expect(Math.max(...answered), 'no arm claims more rows than the table holds').to.be.at.most(137);
@@ -191,8 +186,8 @@ describe('a store table is planned against its live row count', () => {
 			// A whole-table read, so the module's answer is the size it was handed, undiluted.
 			await rows(`select id from t`);
 			const inTransaction = mod.forTable('t');
-			expect(inTransaction.map(e => e.asked), 'still un-analyzed, so still unknown')
-				.to.deep.equal(inTransaction.map(() => undefined));
+			expect(inTransaction.map(e => e.asked), 'the planner sends the buffered count too')
+				.to.deep.equal(inTransaction.map(() => 100));
 			expect(inTransaction.map(e => e.answered),
 				'5 committed + 95 buffered = 100').to.include(100);
 
@@ -203,10 +198,10 @@ describe('a store table is planned against its live row count', () => {
 				'the rolled-back rows are gone from the estimate too').to.include(5);
 		});
 
-		it('defers to ANALYZE, which wins over the live count', async () => {
-			// The engine-wide rule: join ordering, cache thresholds and sort costs all read the
-			// same catalog snapshot, so an access path priced from a different figure would
-			// disagree with the plan around it. The live count fills a GAP; it never overrides.
+		it('outranks a stale ANALYZE snapshot', async () => {
+			// A count maintained on every write is the truth now; the snapshot is older by
+			// construction. Every planner reader goes through the same seam, so the access
+			// path and the plan around it still agree on one size.
 			await seed('t', 137);
 			await db.exec('analyze t');
 			await db.exec(`insert into t values (9001, 9001), (9002, 9002)`);
@@ -215,8 +210,32 @@ describe('a store table is planned against its live row count', () => {
 			await rows(`select id from t where n > 50`);
 
 			const seen = mod.forTable('t');
-			expect(seen.map(e => e.asked), 'the ANALYZE snapshot, stale by two rows and still authoritative')
-				.to.deep.equal(seen.map(() => 137));
+			expect(seen.map(e => e.asked), 'the live count, not the snapshot stale by two rows')
+				.to.deep.equal(seen.map(() => 139));
+		});
+	});
+
+	describe('join selection', () => {
+		it('plans an un-analyzed isolated-store join the way ANALYZE used to be needed for', async () => {
+			// Join selection reads the planned size, not the access path's. Before the planner
+			// asked the module, `big` read as unknown here and the join hashed a full scan of it.
+			await db.close();
+			db = new Database();
+			db.registerModule('store', createIsolatedStoreModule({ provider: createInMemoryProvider() }));
+			await db.exec('create table big (id integer primary key, v integer, w integer) using store');
+			await db.exec('create table mid (id integer primary key, big_id integer, x integer) using store');
+			await db.exec('insert into big select value, value, value from generate_series(1, 20000)');
+			await db.exec('insert into mid select value, value * 61, value % 10 from generate_series(1, 300)');
+			const q = 'select m.x, b.w from mid m join big b on b.id = m.big_id where m.x = 1';
+
+			const ops = (await asyncIterableToArray(db.eval(
+				`select json_group_array(op) as ops from query_plan(?)`, [q])))[0].ops as string;
+			expect(ops).to.contain('INDEXSEEK').and.not.contain('HASHJOIN');
+			const sorted = async () => (await rows(q)).map(r => r.w as number).sort((a, b) => a - b);
+			const unanalyzed = await sorted();
+
+			await db.exec('analyze');
+			expect(await sorted()).to.have.lengthOf(30).and.deep.equal(unanalyzed);
 		});
 	});
 
@@ -284,25 +303,19 @@ describe('a store table is planned against its live row count', () => {
 		});
 	});
 
-	describe('the key-set semi join merge gate', () => {
+	describe('the key-set semi join rewrite', () => {
 		/**
-		 * `rule-key-set-seek` declines its rewrite when the key source's PHYSICAL row estimate
-		 * exceeds the number of keys the runtime would seek with. It has never declined, and it
-		 * still does not — but for a different reason than before, and one worth recording.
+		 * Not a pin on `rule-key-set-seek`'s merge-arm size gate, though it was written as one.
+		 * Measured both with the module's count withheld (the planner before
+		 * `StoreModule.getRowCount`) and with it: this query reaches the rule as a HASH semi
+		 * join, and the size gate guards only the merge arm, so the rewrite fires either way
+		 * and the gate never ran. The scan nodes do relay the live count now
+		 * (`TableReferenceNode.estimatedRows` carries it), so a merge-arm key source over a
+		 * store table would reach the gate sized.
 		 *
-		 * Measured here: a 3000-row key source against a 200-row target with an advertised
-		 * `breakEvenKeys` of 343, i.e. an estimate almost 9× over the threshold. The rewrite
-		 * still fires, because the gate reads `node.right.physical.estimatedRows` and
-		 * `IndexScanNode.computePhysical` relays `this.source.estimatedRows` — the CATALOG
-		 * count, `undefined` on an un-analyzed table — rather than the module's own answer the
-		 * way its sibling `IndexSeekNode` does. The live count this ticket unlocks reaches the
-		 * module and is discarded again at the physical boundary. Filed as an arm on
-		 * `debt-row-estimate-relay-has-no-guard`.
-		 *
-		 * Pinned as the observed behavior, not as desired behavior: when that relay is fixed,
-		 * this test is the one that will say so, and the answer must not move either way.
+		 * Kept for the row set: whichever way it is planned, the answer must not move.
 		 */
-		it('still proceeds on an un-analyzed key source, and returns the right rows', async () => {
+		it('proceeds on an un-analyzed key source, and returns the right rows', async () => {
 			await db.exec(`create table big (pk integer primary key, v integer, w integer) using store`);
 			await db.exec(`create index ix_v on big (v)`);
 			await db.exec(`create table ksrc (id integer primary key, k integer null) using store`);
@@ -313,12 +326,12 @@ describe('a store table is planned against its live row count', () => {
 			await db.exec('commit');
 
 			// No `order by`: an absorbed Sort over a SECONDARY-index target makes
-			// `rule-key-set-seek` decline for an unrelated reason, which would mask the gate.
-			// Rows are collected unordered and sorted here instead.
+			// `rule-key-set-seek` decline for an unrelated reason. Rows are collected unordered
+			// and sorted here instead.
 			const q = `select pk from big where v in (select k from ksrc)`;
 			const ops = (await asyncIterableToArray(db.eval(
 				`select json_group_array(op) as ops from query_plan(?)`, [q])))[0].ops as string;
-			expect(ops, 'the rewrite fires: the gate saw no usable estimate to decline on')
+			expect(ops, 'the rewrite fires, through the hash arm')
 				.to.contain('KEYSETSEMIJOIN');
 
 			// Whichever way it is planned, every row of `big` matches a key in `ksrc`.
