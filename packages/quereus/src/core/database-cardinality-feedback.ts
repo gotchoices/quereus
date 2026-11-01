@@ -169,6 +169,10 @@ export class ReportedSizeSnapshot {
 	 * `getRowCount` are left out: overlay shifts and schema changes already cover them.
 	 */
 	static capture(db: Database, dependencies: readonly SchemaDependency[]): ReportedSizeSnapshot {
+		// NOTE: write targets are kept too (dependencies do not record read vs write), so a
+		// prepared `insert` driving a bulk load re-plans at each 10× of its target, paced by
+		// the cooldown; if those re-plans ever show up in a profile, record dependency roles
+		// in the builder and keep only read tables here.
 		const sizes: PlannedTableSize[] = [];
 		for (const dep of dependencies) {
 			if (dep.type !== 'table' || !dep.schemaName) continue;
