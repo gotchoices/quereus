@@ -14,6 +14,10 @@ import { DEFAULT_TUNING } from '../../src/planner/optimizer-tuning.js';
  * First-row latency of the fixtures. `batchedOuterThresholdMs`,
  * `gatherThresholdMs` and `prefetchProbeThresholdMs` share one default, so
  * sitting exactly at it clears all three `>=` gates.
+ *
+ * NOTE: `join-latency-cost.spec.ts` hand-computes costs from 25 ms (25,000 units);
+ * if the gather default moves, those worked comparisons shift with it — pin
+ * this to a literal or re-derive them.
  */
 export const HIGH_LATENCY_MS = DEFAULT_TUNING.parallel.gatherThresholdMs;
 

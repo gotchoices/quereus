@@ -16,7 +16,7 @@ fire on a side-effect-bearing branch; see
 
 1. **`concurrencySafe` AND across children** — every flattened child must declare `physical.concurrencySafe === true`. Any non-safe branch (mutating subplan, holding a non-reentrant cursor, sitting over a `'serial'` module without a per-branch connection) poisons the rewrite; leave the chain as sequential `SetOperationNode`s. This mirrors the `SetOperationNode` ➜ `AsyncGatherNode` physical-property contract: both drop ordering / FDs / ECs / constant bindings / domain constraints for `unionAll`, but the gather node additionally requires concurrent execution to be safe across all children.
 
-2. **`max(expectedLatencyMs across children) ≥ tuning.parallel.gatherThresholdMs`** — the slowest child must clear the threshold. `expectedLatencyMs` is 0 by default for all in-process / memory-vtab paths (only remote-vtab plugins populate non-zero values via `VirtualTableModule.expectedLatencyMs`), so the rule is **inert by design in local-only configurations**. The default threshold is 25 ms (matches the synthetic high-latency vtab fixture in `test/optimizer/parallel-async-gather.spec.ts`); any positive value satisfies the no-rewrite-on-local invariant the `test/plan/` golden sweep depends on.
+2. **`max(expectedLatencyMs across children) ≥ tuning.parallel.gatherThresholdMs`** — the slowest child must clear the threshold. `expectedLatencyMs` is 0 by default for all in-process / memory-vtab paths (only remote-vtab plugins populate non-zero values via `VirtualTableModule.expectedLatencyMs`), so the rule is **inert by design in local-only configurations**. The default threshold is 25 ms (matches the synthetic high-latency vtab fixture in `test/optimizer/high-latency-fixture.ts`); any positive value satisfies the no-rewrite-on-local invariant the `test/plan/` golden sweep depends on.
 
 **Pass placement.** The rule runs in `PassId.PostOptimization`, **after** physical-pass selection has finalized `expectedLatencyMs` / `concurrencySafe` on the leaves (so the gates have real values to read) and **before** `materialization-advisory` (so any cache the advisory introduces sits *inside* each gather branch — preserving the parallel-drive intent of overlapping high-latency I/O with branch-local compute).
 
@@ -76,7 +76,7 @@ builds as `Project[ coalesce(a.k,b.k,c.k) as k, a.av, b.bv, c.cv ]` over a left-
 
 **Pass placement.** Runs in PostOptimization — after `mutating-subquery-cache` and `asof-strategy-select` (finalizes leaf physical properties incl. `expectedLatencyMs`), and before `materialization-advisory` (so the advisory sees the prefetch-wrapped tree and does not re-wrap the probe in a Cache).
 
-**Tuning knobs** (`OptimizerTuning.parallel`): `prefetchProbeThresholdMs` (default 25 — shares the synthetic high-latency vtab fixture value) and `prefetchBufferSize` (default 64 — mirrors the `EagerPrefetchNode` constructor default).
+**Tuning knobs** (`OptimizerTuning.parallel`): `prefetchProbeThresholdMs` (default 25 — shares the synthetic high-latency vtab fixture value, `test/optimizer/high-latency-fixture.ts`) and `prefetchBufferSize` (default 64 — mirrors the `EagerPrefetchNode` constructor default).
 
 **Out of scope (follow-on backlog).** A broad cost-driven gate independent of remoteness; merge / nested-loop / asof join shapes; wrapping the build side (consumed once linearly, no benefit); and wrapping arbitrary high-latency subtrees.
 
