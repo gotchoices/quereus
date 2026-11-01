@@ -36,7 +36,7 @@
 import { describe, it, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, asyncIterableToArray, serializePlanTree } from '@quereus/quereus';
-import { StoreModule, resolveExpectedLatencyMs, type KVStoreProvider } from '../src/index.js';
+import { StoreModule, createIsolatedStoreModule, resolveExpectedLatencyMs, type KVStoreProvider } from '../src/index.js';
 import { createInMemoryProvider } from '../src/testing/index.js';
 
 /** Above every 25 ms latency gate in `optimizer-tuning.ts`, and nothing more than that. */
@@ -188,6 +188,54 @@ describe('provider-declared first-row latency', () => {
 			const expected = [{ id: 1, w: 5 }, { id: 2, w: 7 }];
 			expect(await asyncIterableToArray(batched.eval(SQL)), 'batched fan-out').to.deep.equal(expected);
 			expect(await asyncIterableToArray(serial.eval(SQL)), 'serial index-nested-loop').to.deep.equal(expected);
+		});
+	});
+
+	/**
+	 * The per-row hint (`KVStoreProvider.expectedRowLatencyMs`) takes the same path, through
+	 * the isolation wrapper's forwarding getter. 50-row memory outer `po` against a 5,000-row
+	 * isolated-store inner `pi`, keyed on `pi`'s primary key, at 30 ms first-row latency
+	 * (30,000 units at `latencyCostPerMs` 1000; `po` is in-process, so its drain is 0):
+	 *
+	 *   first-row only:   hash  = 0.8×50 + 0.4×5,000 + 30 ms             =    32,040
+	 *                     INL   = 50 × (1.0 + 0.5 + 0.3 + 30,000)         = 1,500,090  → hash
+	 *   plus 1 ms/row:    hash  = 2,040 + (30 + 5,000×1) ms               = 5,032,040
+	 *                     INL   = 50 × (1.8 + (30 + 1×1) × 1,000)         = 1,550,090  → INL
+	 *
+	 * Fifty seeks lose to one open on first-row latency alone; pricing the 5,000 rows hash
+	 * drains is what hands the seek plan the win. The 50-row outer sits below the default
+	 * `batchedOuterMinRows` (256), so no batched fan-out competes.
+	 */
+	describe('per-row latency reaching the planner', () => {
+		const opened: Database[] = [];
+		const SQL = 'select po.id, pi.v from po join pi on pi.id = po.k';
+
+		async function planWith(rowLatencyMs?: number): Promise<Database> {
+			const base = providerDeclaring(HIGH_LATENCY_MS);
+			const provider = rowLatencyMs === undefined ? base : { ...base, expectedRowLatencyMs: rowLatencyMs };
+			const db = new Database();
+			opened.push(db);
+			db.registerModule('store', createIsolatedStoreModule({ provider }));
+			await db.exec('create table po (id integer primary key, k integer)');
+			await db.exec('insert into po select value, value * 7 % 5000 + 1 from generate_series(1, 50)');
+			await db.exec('create table pi (id integer primary key, v integer) using store');
+			await db.exec('insert into pi select value, value from generate_series(1, 5000)');
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+			return db;
+		}
+
+		afterEach(async () => {
+			for (const db of opened.splice(0)) await db.close();
+		});
+
+		it('seeks with a declared per-row latency, hashes without one', async () => {
+			// An index-nested-loop serializes as a `Join` whose inner is an `IndexSeek`.
+			const perRow = await planWith(1);
+			expect(nodesOfType(perRow, SQL, 'IndexSeek'), 'per-row latency → seek').to.have.lengthOf(1);
+			expect(nodesOfType(perRow, SQL, 'HashJoin')).to.have.lengthOf(0);
+			const firstRowOnly = await planWith();
+			expect(nodesOfType(firstRowOnly, SQL, 'HashJoin'), 'first-row only → hash').to.have.lengthOf(1);
+			expect(nodesOfType(firstRowOnly, SQL, 'IndexSeek')).to.have.lengthOf(0);
 		});
 	});
 });

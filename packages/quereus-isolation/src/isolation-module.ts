@@ -300,6 +300,16 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
+	 * Forwards the underlying module's per-row-latency planner hint, for the same
+	 * reasons and in the same shape as {@link expectedLatencyMs}: only the
+	 * underlying contributes (the overlay is in-memory), `0` when undeclared, and a
+	 * live getter because an out-of-tree module may learn its value at connect time.
+	 */
+	get expectedRowLatencyMs(): number {
+		return this.underlying.expectedRowLatencyMs ?? 0;
+	}
+
+	/**
 	 * Mirrors the underlying module's committed-snapshot promise. The wrapper adds no
 	 * tearing window of its own: a `_readCommitted` connect opens a DEDICATED underlying
 	 * handle (see {@link connect}) and `IsolatedTable.query`'s fast path delegates

@@ -150,6 +150,19 @@ in-tree providers (React Native LevelDB, NativeScript SQLite) are unmeasured in-
 backends and declare nothing here for the same reason LevelDB's does. The surface exists
 for the case it was built for: a key-value backend reached over a network.
 
+**Backend per-row latency.** Beside the first-row figure a provider may declare
+`expectedRowLatencyMs` — the wall-clock milliseconds each row **after the first** takes to
+arrive in a sequential iterate (the full-scan rate, which is what a backend author can time
+directly). `StoreModule` resolves it the same way (once, at construction; omitted means `0`;
+negative or non-finite falls back to `0` with a warning) and surfaces it as its
+`VirtualTableModule.expectedRowLatencyMs`. The planner then prices a full read as
+`expectedLatencyMs + rowsRead × expectedRowLatencyMs` and a seek as
+`expectedLatencyMs + rowsPerSeek × expectedRowLatencyMs`, which is what lets a seek plan beat
+a hash join that would drain a large remote table (see `docs/optimizer-joins.md`, § Storage
+latency). The two hints are independent — declare either or both — and the same
+declare-only-measured rule applies; no in-tree provider declares one, for the reasons
+recorded at the LevelDB and IndexedDB providers.
+
 **`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column
 (`where v in (1, 2, 3)`, including parameter-bound lists) is served from the index as one
 deduplicated, key-ordered point seek per distinct list value, instead of a full scan with

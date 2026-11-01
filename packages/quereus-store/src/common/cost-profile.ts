@@ -1,8 +1,9 @@
 /**
  * What a storage backend's basic read operations cost, declared by the provider and
- * consumed by store access planning (`store-module-access-plan.ts`) — plus the one other
- * provider-declared planner input resolved the same way, {@link resolveExpectedLatencyMs}
- * (first-row latency, wall-clock rather than a ratio; see its doc comment).
+ * consumed by store access planning (`store-module-access-plan.ts`) — plus the two other
+ * provider-declared planner inputs resolved the same way, through
+ * {@link resolveExpectedLatencyMs} (first-row and per-row latency, wall-clock rather than a
+ * ratio; see its doc comment).
  *
  * The store framework already lets a provider declare things about itself that the
  * layers above must adapt to — `beginAtomicBatch`, `readCommittedSnapshot`,
@@ -146,9 +147,13 @@ export function resolveCostProfile(profile: KVCostProfile | undefined): Resolved
 	};
 }
 
+/** The provider-declared latency fields {@link resolveExpectedLatencyMs} resolves. */
+export type LatencyField = 'expectedLatencyMs' | 'expectedRowLatencyMs';
+
 /**
- * A provider's declared first-row latency ({@link KVStoreProvider.expectedLatencyMs}), or
- * `0` when it declares none or declares something unusable.
+ * A provider's declared latency — first-row ({@link KVStoreProvider.expectedLatencyMs}) or
+ * per-row ({@link KVStoreProvider.expectedRowLatencyMs}), named by `field` for the warning —
+ * or `0` when it declares none or declares something unusable.
  *
  * Lives beside the cost profile because both are provider-declared planner inputs resolved
  * once at module construction, but it is NOT part of {@link KVCostProfile} and does not
@@ -161,11 +166,14 @@ export function resolveCostProfile(profile: KVCostProfile | undefined): Resolved
  * valid latency, so only NEGATIVE and non-finite values are rejected here, where a cost
  * field also rejects `0`.
  */
-export function resolveExpectedLatencyMs(declared: number | undefined): number {
+export function resolveExpectedLatencyMs(
+	declared: number | undefined,
+	field: LatencyField = 'expectedLatencyMs',
+): number {
 	if (declared === undefined) return 0;
 	if (!Number.isFinite(declared) || declared < 0) {
 		console.warn(
-			`[StoreModule] provider declares an unusable expectedLatencyMs (${declared}); falling back to 0`,
+			`[StoreModule] provider declares an unusable ${field} (${declared}); falling back to 0`,
 		);
 		return 0;
 	}

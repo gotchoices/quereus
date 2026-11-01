@@ -105,9 +105,10 @@ export class IndexedDBProvider implements KVStoreProvider {
 	 */
 	readonly costProfile: KVCostProfile = { pointRead: 3.0, seekPositioning: 5.0 };
 
-	// NOTE: no `expectedLatencyMs` declared, deliberately — and like the `costProfile` above
-	// that is a MEASURED decision, not the absence of one. The provider therefore resolves to
-	// the 0 default, i.e. the planner treats this backend as in-process for latency purposes.
+	// NOTE: neither `expectedLatencyMs` nor `expectedRowLatencyMs` declared, deliberately — and
+	// like the `costProfile` above that is a MEASURED decision, not the absence of one. The
+	// provider therefore resolves both to the 0 default, i.e. the planner treats this backend
+	// as in-process for latency purposes.
 	//
 	// `bench/README.md` (Chromium 151 / Windows 11, 200-byte rows, medians) has the numbers:
 	// the smallest whole round trip in the harness — arm B, 20 rows resolved in 1 request — is
@@ -132,9 +133,8 @@ export class IndexedDBProvider implements KVStoreProvider {
 	//    still a net-negative skew (it reaches the per-seek charge and nothing else).
 	//
 	// REVISIT in `backlog/feat-indexeddb-declares-its-read-latency`: re-measure both hints
-	// in a real browser, declare `expectedLatencyMs` and `expectedRowLatencyMs` together (the
-	// store provider surface for the per-row one lands with
-	// `store-provider-declares-per-row-latency`), and settle whether the 25 ms gates should
+	// in a real browser, declare `expectedLatencyMs` and `expectedRowLatencyMs` together, and
+	// settle whether the 25 ms gates should
 	// become cost-based for a sub-millisecond backend. As with the cost profile above,
 	// DELIBERATELY NO DECIMALS QUOTED: the bench README holds the tables, this comment holds
 	// the decision.

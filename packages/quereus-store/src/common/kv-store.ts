@@ -358,6 +358,23 @@ export interface KVStoreProvider {
 	readonly expectedLatencyMs?: number;
 
 	/**
+	 * Per-row latency, in MILLISECONDS, of a sequential iterate over one of this backend's
+	 * stores — the wall-clock each row AFTER the first takes to arrive (the full-scan rate,
+	 * which is what a backend author can measure directly). Omitted means 0: once the first
+	 * row is in hand the rest arrive at in-process speed, which is right for a backend that
+	 * pages a whole scan into memory in one request and wrong for one that answers a page or
+	 * a row per request.
+	 *
+	 * Surfaced by `StoreModule` as its `VirtualTableModule.expectedRowLatencyMs`; the
+	 * planner prices a side's full read as `expectedLatencyMs + rowsRead × expectedRowLatencyMs`
+	 * and a seek as `expectedLatencyMs + rowsPerSeek × expectedRowLatencyMs`. Independent of
+	 * {@link expectedLatencyMs} — a provider may declare either or both. Wall-clock and
+	 * validated exactly like it (finite and `>= 0`, else 0 with a warning); declare only
+	 * MEASURED numbers.
+	 */
+	readonly expectedRowLatencyMs?: number;
+
+	/**
 	 * Get or create a KVStore for a table's row data.
 	 * Store name: {schema}.{table}
 	 * @param schemaName - The schema name (e.g., 'main')

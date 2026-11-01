@@ -250,12 +250,21 @@ export abstract class StoreModuleBase {
 	 */
 	readonly expectedLatencyMs: number;
 
+	/**
+	 * This module's `VirtualTableModule.expectedRowLatencyMs` — the per-row latency the
+	 * backend declares ({@link KVStoreProvider.expectedRowLatencyMs}), or `0` when it declares
+	 * none. Resolved once at construction, and a concrete `0` rather than `undefined`, for the
+	 * same reasons as {@link expectedLatencyMs}.
+	 */
+	readonly expectedRowLatencyMs: number;
+
 	constructor(provider: KVStoreProvider, eventEmitter?: StoreEventEmitter) {
 		this.provider = provider;
 		this.eventEmitter = eventEmitter;
 		this.atomicProvider = typeof provider.beginAtomicBatch === 'function';
 		this.costProfile = resolveCostProfile(provider.costProfile);
 		this.expectedLatencyMs = resolveExpectedLatencyMs(provider.expectedLatencyMs);
+		this.expectedRowLatencyMs = resolveExpectedLatencyMs(provider.expectedRowLatencyMs, 'expectedRowLatencyMs');
 	}
 
 	/**
