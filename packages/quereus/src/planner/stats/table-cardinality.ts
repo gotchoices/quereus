@@ -76,6 +76,11 @@ export function databaseRowCountSources(db: Database, observed: ObservedRowCount
 	};
 }
 
+/** True when `table`'s registered module implements `VirtualTableModule.getRowCount`, whether or not it answers now. */
+export function moduleReportsRowCount(db: Database, table: TableSchema): boolean {
+	return db.schemaManager.getModule(table.vtabModuleName)?.module.getRowCount !== undefined;
+}
+
 /**
  * Asks `table`'s registered module for its count (`VirtualTableModule.getRowCount`).
  * A hint, so a module without the hook, a throw, or a malformed answer (`rows` not a

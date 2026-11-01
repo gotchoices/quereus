@@ -2,7 +2,7 @@
  * Cardinality feedback, planner half: the observed row-count overlay's record/shift
  * policy (docs/progressive-optimizer.md §3.4), its precedence against module-reported
  * and catalog counts at the one base-table row-count seam (`plannedRowCount`, §3.3), and
- * re-planning prepared statements on a shift (§3.6).
+ * re-planning prepared statements on a shift or a module-reported size drift (§3.6).
  *
  * The policy tests construct their own `CardinalityFeedbackManager` over the database's
  * schema manager so they can watch `onShift` directly and vary the tuning per test.
@@ -212,6 +212,42 @@ describe('Cardinality feedback overlay', () => {
 				const replanned = stmt.getPlanShape().nodeTypes;
 				expect(replanned).to.include.keys('Join', 'IndexSeek');
 				expect(replanned).to.not.have.property('HashJoin');
+			} finally {
+				await stmt.finalize();
+			}
+		});
+
+		it('re-plans when a module-reported size drifts 10x from the one the plan was costed with', async () => {
+			const module = new ReportingMemoryModule();
+			db.registerModule('reporting', module);
+			await db.exec('create table big (id integer primary key, v integer, w integer) using reporting');
+			await db.exec('create table mid (id integer primary key, big_id integer, x integer)');
+			await db.exec('insert into big select value, value, value from generate_series(1, 200)');
+			await db.exec('insert into mid select value, value % 200 + 1, value % 5 from generate_series(1, 300)');
+			// With a cooldown of one every drift re-plans at once, so a plan that survives saw none.
+			const tuning = db.optimizer.tuning;
+			db.optimizer.updateTuning({ ...tuning, cardinalityFeedback: { ...tuning.cardinalityFeedback, replanCooldown: 1 } });
+			module.answer = { rows: 50, exact: true };
+
+			const stmt = db.prepare(joinSql);
+			try {
+				const initial = stmt.getPlanShape().nodeTypes;
+				expect(initial).to.include.keys('HashJoin');
+				expect(initial).to.not.have.property('IndexSeek');
+				const first = await joinedWs(stmt);
+				expect(first).to.have.length(60);
+
+				module.answer = { rows: 20_000, exact: true };
+				expect(await joinedWs(stmt)).to.deep.equal(first);
+				const replanned = stmt.getPlanShape().nodeTypes;
+				expect(replanned).to.include.keys('Join', 'IndexSeek');
+				expect(replanned).to.not.have.property('HashJoin');
+
+				// 1.5x from the 20,000 the new plan was costed with, not 600x from the first 50.
+				const plan = stmt.compile();
+				module.answer = { rows: 30_000, exact: true };
+				expect(await joinedWs(stmt)).to.deep.equal(first);
+				expect(stmt.compile()).to.equal(plan);
 			} finally {
 				await stmt.finalize();
 			}

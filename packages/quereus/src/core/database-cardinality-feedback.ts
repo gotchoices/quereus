@@ -19,7 +19,9 @@
  * dropped if it rolls back ({@link CardinalityFeedbackManager.onRolledBack}).
  *
  * A shift reaches prepared statements through `onShift`; each statement paces its
- * re-plans with a {@link FeedbackReplanState}.
+ * re-plans with a {@link FeedbackReplanState}. A module-reported size, which moves with
+ * no observation at all, is re-checked by each statement at execution start against the
+ * size its plan was costed with ({@link ReportedSizeSnapshot}).
  *
  * Nothing here is persisted: a new `Database` starts empty. See
  * docs/progressive-optimizer.md §3.2–3.6.
@@ -28,7 +30,8 @@
 import { createLogger } from '../common/logger.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
 import { CardinalityObservations } from '../runtime/cardinality-observations.js';
-import { catalogRowCount, plannedRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
+import { catalogRowCount, moduleReportsRowCount, plannedRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
+import type { SchemaDependency } from '../planner/planning-context.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import type { TableSchema } from '../schema/table.js';
 import type { Database } from './database.js';
@@ -136,6 +139,68 @@ export class FeedbackReplanState {
 	private requiredExecutions(cooldown: number): number {
 		return cooldown * 2 ** Math.min(this.replans - 1, MAX_COOLDOWN_DOUBLINGS);
 	}
+}
+
+/** A table a compiled plan was sized with by its module, and the row count the plan was costed with. */
+interface PlannedTableSize {
+	readonly table: TableSchema;
+	readonly rows: number;
+}
+
+/**
+ * The planned sizes, as of one compile, of the tables the plan reads whose module reports
+ * its own count (docs/progressive-optimizer.md §3.6). Such a count moves on every write
+ * with no event the planner hears, and a plan that no longer reads the table in full
+ * never produces an observation, so nothing else notices that a table planned at 10 rows
+ * now holds a million. A prepared statement compares its snapshot with the current
+ * planned sizes at each execution start and treats a drift like an overlay shift.
+ *
+ * Planned sizes, not raw module answers, are compared, so an approximate count the
+ * overlay outranks drifts only when what planning would use drifts.
+ */
+export class ReportedSizeSnapshot {
+	static readonly empty = new ReportedSizeSnapshot([]);
+
+	private constructor(private readonly sizes: readonly PlannedTableSize[]) {}
+
+	/**
+	 * Called right after a compile, in the same synchronous turn, so each size is the one
+	 * the plan's table references were costed with. Tables whose module has no
+	 * `getRowCount` are left out: overlay shifts and schema changes already cover them.
+	 */
+	static capture(db: Database, dependencies: readonly SchemaDependency[]): ReportedSizeSnapshot {
+		const sizes: PlannedTableSize[] = [];
+		for (const dep of dependencies) {
+			if (dep.type !== 'table' || !dep.schemaName) continue;
+			const table = db.schemaManager.findTable(dep.objectName, dep.schemaName);
+			if (table && moduleReportsRowCount(db, table)) sizes.push({ table, rows: currentPlannedRows(db, table) });
+		}
+		return sizes.length > 0 ? new ReportedSizeSnapshot(sizes) : ReportedSizeSnapshot.empty;
+	}
+
+	/**
+	 * True when some table's planned size has moved `shiftFactor` from the captured one
+	 * with the larger side above `minRows` — the overlay's shift rule (§3.4). A table whose
+	 * catalog object was replaced is skipped: that schema change already dropped the plan.
+	 */
+	drifted(db: Database): boolean {
+		if (this.sizes.length === 0) return false;
+		const { shiftFactor, minRows } = db.optimizer.tuning.cardinalityFeedback;
+		for (const { table, rows } of this.sizes) {
+			if (db.schemaManager.findTable(table.name, table.schemaName) !== table) continue;
+			const now = currentPlannedRows(db, table);
+			if (Math.max(now, rows) > minRows && rowCountSpread(now, rows) >= shiftFactor) {
+				debugLog('Reported size drift on %s: planned %d, now %d rows', tableKey(table), rows, now);
+				return true;
+			}
+		}
+		return false;
+	}
+}
+
+/** What planning would size `table` at now; an unknown size reads as `defaultRowEstimate`, as in the overlay's record policy. */
+function currentPlannedRows(db: Database, table: TableSchema): number {
+	return plannedRowCount(table, db._rowCountSources) ?? db.optimizer.tuning.defaultRowEstimate;
 }
 
 export class CardinalityFeedbackManager implements ObservedRowCounts {

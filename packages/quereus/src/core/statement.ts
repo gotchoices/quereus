@@ -32,7 +32,7 @@ import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-us
 import { isObjectClassValue } from '../util/comparison.js';
 import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 import { astToString } from '../emit/ast-stringify.js';
-import { FeedbackReplanState, overlayTableKey } from './database-cardinality-feedback.js';
+import { FeedbackReplanState, ReportedSizeSnapshot, overlayTableKey } from './database-cardinality-feedback.js';
 
 const log = createLogger('core:statement');
 const feedbackLog = createLogger('core:cardinality-feedback');
@@ -92,6 +92,8 @@ export class Statement {
 	 * matched against cardinality-feedback shifts in {@link _noteCardinalityShift}.
 	 */
 	private planTableKeys: ReadonlySet<string> = new Set();
+	/** Module-reported sizes the cached plan was costed with; re-checked in {@link dropPlanOnShift}. */
+	private reportedSizes = ReportedSizeSnapshot.empty;
 	// NOTE: one cooldown per Statement, shared by every statement of a multi-statement
 	// batch, so a re-plan of one batch member delays the next member's; if batches ever
 	// lean on prompt feedback re-plans, reset this on nextStatement().
@@ -235,6 +237,7 @@ export class Statement {
 		this.emissionContext = null;
 		this.scheduler = null;
 		this.columnDefCache.clear();
+		this.reportedSizes = ReportedSizeSnapshot.empty;
 		this.feedbackReplan.onPlanDropped();
 	}
 
@@ -247,8 +250,12 @@ export class Statement {
 		if (this.plan && this.planTableKeys.has(key)) this.feedbackReplan.markShift();
 	}
 
-	/** Drops a shift-marked plan when the statement's re-plan cooldown allows it. */
+	/**
+	 * Drops a plan marked by an overlay shift, or whose module-reported sizes drifted since
+	 * it compiled, when the statement's re-plan cooldown allows it.
+	 */
 	private dropPlanOnShift(): void {
+		if (this.reportedSizes.drifted(this.db)) this.feedbackReplan.markShift();
 		if (!this.feedbackReplan.onExecutionStart(this.db.optimizer.tuning.cardinalityFeedback.replanCooldown)) return;
 		feedbackLog('Re-plan for statement: %s', this.getBlockSql().substring(0, 100));
 		this.invalidatePlan();
@@ -350,6 +357,7 @@ export class Statement {
 			this.scalarRequiredParams = collectScalarRequiredParams(rawPlan);
 			plan = this.db.optimizer.optimize(rawPlan, this.db) as BlockNode;
 			this.planTableKeys = tableDependencyKeys(dependencies);
+			this.reportedSizes = ReportedSizeSnapshot.capture(this.db, dependencies.getDependencies());
 
 			// Always drop the previous listener before (re)compiling, even when the new
 			// plan has no dependencies — otherwise a zero-dependency recompile leaks the
