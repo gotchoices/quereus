@@ -137,18 +137,21 @@ export interface OptimizerTuning {
 	 * Parallel-execution rule tuning. Consumed by `rule-fanout-lookup-join`
 	 * (the FK→PK fan-out recognition rule), `rule-async-gather-union-all`
 	 * (the UNION ALL gather recognition rule), and `rule-async-gather-zip-by-key`
-	 * (the full-outer-on-shared-key zip gather recognition rule). All values are
-	 * unitless cost comparators except `concurrency`, which is a row-time branch
-	 * cap.
+	 * (the full-outer-on-shared-key zip gather recognition rule). The
+	 * `*ThresholdMs` gates and `branchSetupCost` are wall-clock milliseconds,
+	 * compared against a subtree's raw `expectedLatencyMs` declaration — never
+	 * through `latencyCostPerMs`; `concurrency` and its siblings are counts.
 	 */
 	readonly parallel: {
 		/** Don't form a fan-out / gather below this branch count. Default 2. */
 		readonly minBranches: number;
 		/**
-		 * Per-branch fixed overhead, charged against the latency win. Anchored
-		 * against `COST_CONSTANTS.NL_JOIN_PER_OUTER_ROW`; the value only matters
-		 * relative to `expectedLatencyMs`, so the unit is "ms-equivalent cost".
-		 * Default 1.0.
+		 * Per-branch fixed overhead in wall-clock milliseconds, charged against
+		 * the latency win: the fan-out gate fires when
+		 * `(N − cap) × expectedLatencyMs > N × branchSetupCost`, milliseconds on
+		 * both sides. Not a cost-unit figure — one engine cost unit is about a
+		 * microsecond under `latencyCostPerMs`, so anchoring this to a cost
+		 * constant would be off a thousandfold. Default 1.0.
 		 */
 		readonly branchSetupCost: number;
 		/** Static cap on in-flight branches per outer row. Default 8. */
@@ -320,8 +323,9 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 	},
 	parallel: {
 		minBranches: 2,
-		// 1.0 ≈ COST_CONSTANTS.NL_JOIN_PER_OUTER_ROW; this is "ms-equivalent" because
-		// it is compared directly against `expectedLatencyMs * (N - cap)` savings.
+		// Milliseconds: compared directly against `expectedLatencyMs * (N - cap)`
+		// savings, so a branch fork is assumed to cost about a millisecond of
+		// wall-clock. Not measured; the gate is order-of-magnitude only.
 		branchSetupCost: 1.0,
 		concurrency: 8,
 		// Global in-flight budget for batched-outer fan-out lookup joins, shared
