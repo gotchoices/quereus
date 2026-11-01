@@ -14,17 +14,13 @@
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import type { SqlValue } from '../../src/common/types.js';
 
 interface PlanRow {
 	node_type: string;
 	op: string;
 	detail: string;
-}
-
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
 }
 
 async function planRows(db: Database, sql: string): Promise<PlanRow[]> {

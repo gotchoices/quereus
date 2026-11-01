@@ -9,7 +9,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { PhysicalProperties } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
@@ -1191,16 +1191,12 @@ describe('single-table selectivity matches columns by identity, not by name', ()
  * `SetOperationNode` with an `AsyncGatherNode` that keeps the first branch's
  * attribute ids verbatim. The rule's cost gate needs `expectedLatencyMs` above
  * `tuning.parallel.gatherThresholdMs`, which memory-vtab leaves never reach — hence
- * the synthetic module below, mirroring `parallel-async-gather.spec.ts`.
+ * the shared `HighLatencyMemoryModule` fixture.
  *
  * `filter-selectivity-restamp` runs in that same pass, so without recognising the
  * gather, `collectColumnOrigins` would descend into the branches and credit a union
  * output column to the first branch's base table.
  */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
-}
-
 describe('set-operation attribution survives the async-gather rewrite', () => {
 	let db: Database;
 	/** Distinct count ANALYZE recorded for `o.cat` — the number that must NOT be stamped. */

@@ -21,6 +21,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import type { VtabConcurrencyMode } from '../../src/vtab/module.js';
 import type { SqlValue } from '../../src/common/types.js';
 import type { PlanNode, ScalarPlanNode } from '../../src/planner/nodes/plan-node.js';
@@ -41,11 +42,6 @@ import { EmptyScope } from '../../src/planner/scopes/empty.js';
 import type { Scope } from '../../src/planner/scopes/scope.js';
 import type { ScalarType } from '../../src/common/datatype.js';
 import { TEXT_TYPE } from '../../src/types/builtin-types.js';
-
-/** The synthetic remote-vtab stand-in used by every parallel/latency optimizer spec. */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
-}
 
 /** High latency AND `'serial'` concurrency: the branch must be lock-wrapped, not refused. */
 function makeSerialHighLatencyModule(): MemoryTableModule {

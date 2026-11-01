@@ -17,6 +17,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import type { VtabConcurrencyMode } from '../../src/vtab/module.js';
 import type { SqlValue } from '../../src/common/types.js';
 
@@ -26,10 +27,6 @@ interface PlanRow {
 	detail: string;
 	properties: string | null;
 	physical: string | null;
-}
-
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
 }
 
 /**

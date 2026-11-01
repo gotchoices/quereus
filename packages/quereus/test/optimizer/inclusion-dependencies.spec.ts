@@ -20,7 +20,7 @@ import {
 	type RelationalPlanNode,
 } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import type { ColumnSchema } from '../../src/schema/column.js';
 import type { ForeignKeyConstraintSchema, PrimaryKeyColumnDefinition, TableSchema } from '../../src/schema/table.js';
 import { buildColumnIndexMap } from '../../src/schema/table.js';
@@ -427,11 +427,6 @@ describe('IND seeding + propagation (end-to-end)', () => {
 // so the outer relation's seeded INDs (here orders→cust/prod/region) must
 // survive on the fan-out output — a regression guard for the fold path.
 describe('IND propagation through FanOutLookupJoin', () => {
-	/** Memory module with non-zero latency so the fan-out cost gate has a win. */
-	class HighLatencyMemoryModule extends MemoryTableModule {
-		readonly expectedLatencyMs = 25;
-	}
-
 	let db: Database;
 
 	beforeEach(async () => {

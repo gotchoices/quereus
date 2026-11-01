@@ -11,7 +11,7 @@
 import { describe, it, beforeEach, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { PlanNodeType } from '../../src/planner/nodes/plan-node-type.js';
 import {
@@ -143,14 +143,6 @@ describe('gatherRowsFrom (unit)', () => {
 		expect(gatherRowsFrom('crossProduct', [undefined, 5])).to.be.undefined;
 	});
 });
-
-/**
- * Memory-backed module declaring a non-zero `expectedLatencyMs` so
- * `ruleAsyncGatherUnionAll` fires (mirrors `parallel-async-gather.spec.ts`).
- */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
-}
 
 describe('row estimates survive set operations and writes', () => {
 	let db: Database;

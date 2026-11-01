@@ -24,7 +24,7 @@
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import { PlanNodeCharacteristics } from '../../src/planner/framework/characteristics.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import type { SqlValue } from '../../src/common/types.js';
@@ -35,16 +35,6 @@ interface PlanRow {
 	detail: string;
 	properties: string | null;
 	physical: string | null;
-}
-
-/**
- * Memory-backed module that declares a non-zero `expectedLatencyMs`. Used so
- * the gather / prefetch cost gates have a real latency to compare against
- * the default thresholds — without it the rules are inert by design and the
- * negative tests would pass vacuously.
- */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
 }
 
 async function planRows(db: Database, sql: string): Promise<PlanRow[]> {

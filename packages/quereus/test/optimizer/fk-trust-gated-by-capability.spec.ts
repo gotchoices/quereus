@@ -22,6 +22,7 @@
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HIGH_LATENCY_MS, HighLatencyMemoryModule } from './high-latency-fixture.js';
 import { TableReferenceNode } from '../../src/planner/nodes/reference.js';
 import { GlobalScope } from '../../src/planner/scopes/global.js';
 import type { ModuleCapabilities } from '../../src/vtab/capabilities.js';
@@ -57,12 +58,7 @@ class OrphanMemoryModule extends MemoryTableModule {
 
 /** Orphan-permitting AND high-latency — for the fan-out clustering tests. */
 class HighLatencyOrphanMemoryModule extends OrphanMemoryModule {
-	readonly expectedLatencyMs = 25;
-}
-
-/** Plain high-latency control (mirrors parallel-fanout.spec.ts). */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
+	readonly expectedLatencyMs = HIGH_LATENCY_MS;
 }
 
 describe('FK trust gated by permitsOrphanedForeignKeyRows', () => {

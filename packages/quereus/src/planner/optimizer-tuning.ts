@@ -184,8 +184,8 @@ export interface OptimizerTuning {
 		 * outer mode. Like `gatherThresholdMs` / `prefetchProbeThresholdMs`,
 		 * any positive value keeps the rule inert on memory-vtab plans (their leaves
 		 * declare `expectedLatencyMs = 0`), so the golden-plan sweep is unaffected.
-		 * Default 25 ms — matches the synthetic high-latency vtab fixture the other
-		 * parallel rules use.
+		 * Default 25 ms — the first-row latency of the test fixture the other
+		 * parallel rules use (`test/optimizer/high-latency-fixture.ts`).
 		 */
 		readonly batchedOuterThresholdMs: number;
 		/**
@@ -343,7 +343,7 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 		// per-row contexts.
 		maxOuterReadAhead: 64,
 		// ≥ this many ms on the slowest branch flips a fan-out to batched outer
-		// mode. 25 ms matches the synthetic high-latency vtab fixture; memory-vtab
+		// mode. 25 ms is the test fixture's first-row latency; memory-vtab
 		// plans declare 0 ms so the rule stays inert on local-only plans.
 		batchedOuterThresholdMs: 25,
 		// ≥ this many estimated outer rows required before batched is worthwhile;
@@ -351,7 +351,7 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 		// fixtures resolve to 0 and never flip.
 		batchedOuterMinRows: 256,
 		// ≥ this many ms on the slowest child of a unionAll chain triggers the
-		// parallel gather. 25 ms matches the synthetic high-latency vtab fixture;
+		// parallel gather. 25 ms is the test fixture's first-row latency;
 		// memory-vtab plans declare 0 ms so they never cross this gate.
 		gatherThresholdMs: 25,
 		// ≥ this many ms on a hash join's build (right) side triggers wrapping

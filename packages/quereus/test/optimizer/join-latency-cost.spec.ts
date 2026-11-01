@@ -30,7 +30,7 @@
 
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule, PerRowLatencyMemoryModule } from './high-latency-fixture.js';
 import type { PlanNode } from '../../src/planner/nodes/plan-node.js';
 import { JoinNode } from '../../src/planner/nodes/join-node.js';
 import { BloomJoinNode } from '../../src/planner/nodes/bloom-join-node.js';
@@ -39,17 +39,6 @@ import { IndexSeekNode } from '../../src/planner/nodes/table-access-nodes.js';
 import { CacheNode } from '../../src/planner/nodes/cache-node.js';
 import { ColumnReferenceNode } from '../../src/planner/nodes/reference.js';
 import { EagerPrefetchNode } from '../../src/planner/nodes/eager-prefetch-node.js';
-
-/** The synthetic remote-vtab stand-in used by every parallel/latency optimizer spec. */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
-}
-
-/** The same first-row delay plus a per-row rate: storage that answers one row per request. */
-class PerRowLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
-	readonly expectedRowLatencyMs = 1;
-}
 
 function collectNodes<T extends PlanNode>(root: PlanNode, predicate: (n: PlanNode) => n is T): T[] {
 	const found: T[] = [];

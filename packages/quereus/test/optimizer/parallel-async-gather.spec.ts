@@ -8,7 +8,7 @@
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import { DEFAULT_TUNING } from '../../src/planner/optimizer.js';
 import type { SqlValue } from '../../src/common/types.js';
 
@@ -18,15 +18,6 @@ interface PlanRow {
 	detail: string;
 	properties: string | null;
 	physical: string | null;
-}
-
-/**
- * Memory-backed module that declares a non-zero `expectedLatencyMs`. Tables
- * registered with this module surface as branches whose physical properties
- * meet the gather threshold. Mirrors the helper in `parallel-fanout.spec.ts`.
- */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
 }
 
 async function planRows(db: Database, sql: string): Promise<PlanRow[]> {

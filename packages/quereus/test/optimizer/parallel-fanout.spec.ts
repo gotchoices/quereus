@@ -11,7 +11,7 @@
  */
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { MemoryTableModule } from '../../src/vtab/memory/module.js';
+import { HighLatencyMemoryModule } from './high-latency-fixture.js';
 import type { SqlValue } from '../../src/common/types.js';
 
 interface PlanRow {
@@ -20,15 +20,6 @@ interface PlanRow {
 	detail: string;
 	properties: string | null;
 	physical: string | null;
-}
-
-/**
- * Memory-backed module that declares a non-zero `expectedLatencyMs`. Used as
- * the lookup table type in multi-branch scenarios so the fan-out cost gate has
- * a real savings number to compare against `branchSetupCost`.
- */
-class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = 25;
 }
 
 async function planRows(db: Database, sql: string): Promise<PlanRow[]> {
