@@ -50,3 +50,7 @@ golden plan sweep depends on ties resolving the way they do now. The debug line
 should derive from the same list rather than from a hand-kept parallel array.
 
 No plan should change. This is a shape change only.
+
+## Arm added 2026-11-01 (adaptive-optimizer batch)
+
+Three queued tickets edit this function's charge expressions: `feat-per-row-latency-cost-for-remote-scans` (per-row drain charges, cost-unit conversion), `bug-measured-empty-table-costed-as-thousand-rows` (side-row reads: unknown vs measured zero), and `unknown-size-join-scans-instead-of-seeking` (one helper for every side-row read). Do this refactor after them; "no plan should change" is then measured against the tree they leave. The prereq above (`feat-index-nested-loop-batched-seeks`) has landed.

@@ -4,7 +4,7 @@ This document describes how Quereus improves plans from what execution reveals, 
 
 Quereus targets deployments where table storage may sit behind a network — a distributed hash table, a remote store — so every read is expensive and a full scan run only to collect statistics is often unaffordable. The optimizer must produce good plans with zero collected statistics, and improve them using numbers that *essential* execution produces anyway. Statistics are hints that improve a good plan, never prerequisites without which the plan is bad.
 
-**Status.** Every section describes settled design and current code. Section 3, *cardinality feedback*, is complete and on by default (the `cardinality_feedback` option); section 5 lists what is deliberately left for later.
+**Status.** Every section describes settled design and current code. Section 3, *cardinality feedback*, is complete and on by default (the `cardinality_feedback` option); section 5 lists the work queued next and what is deliberately left for later.
 
 ---
 
@@ -70,7 +70,7 @@ The row-count seam is `plannedRowCount(table, observed)` (`planner/stats/table-c
 - `TableReferenceNode` computes its estimate **once, at construction**, from the overlay reachable through its `SchemaManager`. Plan nodes are immutable, so a node built before an observation keeps the number its plan was costed with.
 - `CatalogStatsProvider.tableRows` consults the same overlay, injected when the `Database` constructs its `Optimizer`. Building and optimizing happen in one synchronous `compile()`, so the overlay cannot change between the node's snapshot and the provider's read.
 
-Only the row count is overridden. Per-column distinct counts, null counts and histograms — selectivity *fractions* — still come from the catalog, and with no catalog statistics the naive selectivities still apply. The overlay value is also `request.estimatedRows` for `getBestAccessPlan`, because the access path must be priced against the same size as the plan around it. A self-sizing module (`StoreModule`) honors a supplied hint over its own running count, so between full scans it prices against the last observed size rather than its live one — accepted for one-size-per-plan consistency; when a module's live size reaches the planner (`feat-planner-asks-the-backend-how-big-a-table-is`), it should outrank the overlay.
+Only the row count is overridden. Per-column distinct counts, null counts and histograms — selectivity *fractions* — still come from the catalog, and with no catalog statistics the naive selectivities still apply. The overlay value is also `request.estimatedRows` for `getBestAccessPlan`, because the access path must be priced against the same size as the plan around it. A self-sizing module (`StoreModule`) honors a supplied hint over its own running count, so between full scans it prices against the last observed size rather than its live one — accepted for one-size-per-plan consistency until a module's own count reaches the planner (queued, section 5): an exact module count will outrank the overlay, an approximate one will rank below it.
 
 The other `catalogRowCount` callers — assertion and watcher delta sizing, the lens prover's cardinality band, auto-analyze's staleness arithmetic — stay catalog-only.
 
@@ -147,10 +147,21 @@ A shift for `T` walks the `Database`'s live statements (`Database.noteCardinalit
 
 ## 5. Deferred work
 
-- **Feedback beyond table size** — predicate selectivity (filter input/output, seek output) and join output cardinality, which need predicate keys stable across re-plans and a channel to modules that estimate pushed-down predicates themselves: `feat-cardinality-feedback-beyond-table-size`.
+Queued, in this order (tickets in `tickets/implement/`, `fix/` and `plan/`; each section above changes only when its ticket lands):
+
+- **Remote reads priced per row** — a module declares a per-row read latency beside its first-row one, every join candidate pays for the rows it pulls, and declared milliseconds convert to cost units at a measured rate instead of one-for-one: `feat-per-row-latency-cost-for-remote-scans`, then `store-provider-declares-per-row-latency`.
+- **Module-reported table sizes** — a synchronous, I/O-free `getRowCount` hook read through `plannedRowCount`; an exact count outranks the overlay, an approximate one ranks below it and above the catalog; cached statements re-plan when a reported count drifts 10×: `feat-planner-asks-the-backend-how-big-a-table-is`, then `replan-when-a-reported-row-count-drifts`.
+- **Measured zero honored** — the `|| 1000` / `|| 100` reads stop turning a measured empty table into an unknown one; cost consumers floor it at one row: `bug-measured-empty-table-costed-as-thousand-rows`.
+- **Lower bounds from partial reads** — a `LIMIT`ed scan or a single-window seek that yielded N rows proves the table holds at least N; the overlay keeps the floor, which only ever raises an estimate: `cardinality-feedback-lower-bounds`.
+- **Unknown sizes default consistently** — with no statistics, join selection prices an unknown side at 100 rows and ignores reductions above it, so a filtered or single-row side joined to an indexed table full-scans that table: `unknown-size-join-scans-instead-of-seeking` (fix stage).
+- **Rows per key from executed seeks** — the first slice beyond table size: `cardinality-feedback-rows-per-key` (plan stage).
+
+Still deferred:
+
+- **Feedback beyond table size**, remainder — filter selectivity on unindexed columns, ranges and join output cardinality: `feat-cardinality-feedback-beyond-table-size`.
 - **Mid-execution adaptation** — reacting at a pipeline breaker whose input count diverges from the plan, before the downstream operators run: `feat-mid-execution-plan-adaptation`.
 - **Plan reuse across one-shot statements** — the compile-cost lever the Tier 0 idea was reaching for: `feat-reuse-plans-across-one-shot-statements`.
-- **Module-reported live sizes** — a module that can size itself cheaply should outrank the overlay: `feat-planner-asks-the-backend-how-big-a-table-is`.
+- **IndexedDB's read latency** — measuring and declaring it once per-row pricing exists, and whether the 25 ms parallel gates should become cost-based for sub-millisecond backends: `feat-indexeddb-declares-its-read-latency`.
 
 ---
 

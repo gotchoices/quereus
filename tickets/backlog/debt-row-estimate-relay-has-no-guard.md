@@ -104,3 +104,7 @@ Whether the fix is "publish `filterInfo.indexInfoOutput.estimatedRows` from the 
 too" or "prefer the catalog count and fall back to the module's" is the design question,
 not settled here — but the two sibling nodes disagreeing is not defensible either way, and
 the guard test this ticket proposes would have caught the disagreement.
+
+## Arm added 2026-11-01 (adaptive-optimizer batch)
+
+`feat-planner-asks-the-backend-how-big-a-table-is` (`tickets/implement/2-…`) puts a module's exact row count into `plannedRowCount`, so `TableReferenceNode.estimatedRows` — what `SeqScanNode` and `IndexScanNode` relay — carries the store's live count. For store tables the scan nodes then publish the module's number and the key-set merge gate pinned in `live-row-count-plans.spec.ts` sees the 3,000-row key source; that ticket updates the pin. The sibling disagreement remains only for modules without the hook (the memory backend), which narrows the design question above to: should a scan relay `accessPlan.rows` when the planner has no number at all?

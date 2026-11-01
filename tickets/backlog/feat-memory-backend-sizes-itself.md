@@ -77,3 +77,9 @@ against the size it will really see. Decide whether the memory backend should ma
 (it would need to reach the connection's pending layer, which `getBestAccessPlan` does not
 have in hand today) or whether the committed count is good enough — and say which, in the
 implementation.
+
+## Arm added 2026-11-01 (adaptive-optimizer batch)
+
+Two queued tickets change this one's ground. `feat-planner-asks-the-backend-how-big-a-table-is` (`tickets/implement/2-…`) adds `VirtualTableModule.getRowCount(db, table)` — a synchronous, I/O-free count the planner reads through `plannedRowCount`, so a module's size reaches join selection, cache admission and sort costing, not only its own access path. This ticket should now be implemented through that hook rather than by substituting inside `getBestAccessPlan`: `MemoryTableModule.getRowCount` answering from `getBaseLayerStats()`. The hook's contract (the count a read issued now would see; `exact: true` only for a count maintained on every write path) also answers "one thing to settle first" above: the committed base count excludes the connection's pending layer, so either reach that layer or report the committed count and say why it is acceptable.
+
+`bug-measured-empty-table-costed-as-thousand-rows` (`tickets/implement/3-…`) changes the measured-zero arm of the same `request.estimatedRows || 1000` line (a measured 0 becomes a one-row floor); the unknown arm and its 1000 default stay for this ticket.

@@ -66,3 +66,7 @@ places to find, in two packages.
 Worth considering when this is done: export the threshold-related constant
 itself alongside the shared fake, so a spec in another package can say "just
 above the threshold" rather than writing `30` and hoping.
+
+## Arm added 2026-11-01 (adaptive-optimizer batch)
+
+`feat-per-row-latency-cost-for-remote-scans` (`tickets/implement/1-…`) converts declared milliseconds into cost units (`tuning.latencyCostPerMs`, default 1000) and adds a second hint, `expectedRowLatencyMs`. It re-derives the expectations in these specs but deliberately leaves the shared-fixture refactor to this ticket. When this lands, the shared fake should expose both hints, and the wall-clock thresholds it sits above are unchanged by that work (they still read milliseconds).

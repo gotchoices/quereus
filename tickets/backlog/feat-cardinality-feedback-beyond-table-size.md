@@ -1,31 +1,32 @@
-description: Once the planner learns real table sizes from running queries, the next step is learning how many rows each filter and join actually keeps — which is what most plan choices really hinge on, but is much harder to remember reliably from one plan to the next.
-prereq: cardinality-feedback-replan
-files: packages/quereus/src/core/database-cardinality-feedback.ts, packages/quereus/src/runtime/emit/filter.ts, packages/quereus/src/runtime/emit/scan.ts, packages/quereus/src/runtime/emit/bloom-join.ts, packages/quereus/src/planner/stats/catalog-stats.ts, packages/quereus/src/planner/stats/conjunct-selectivity.ts, packages/quereus/src/planner/util/column-origins.ts, packages/quereus/src/planner/analysis/expression-fingerprint.ts, packages/quereus/src/vtab/best-access-plan.ts, docs/progressive-optimizer.md, docs/optimizer-costing.md
-tradeoffs: Selectivity depends on the parameter values and on correlations the observation cannot see, so a remembered fraction can be confidently wrong for the next binding; and predicates pushed into a storage module are estimated by the module itself, so using observed fractions means a new module-facing contract or the engine and module disagreeing about the same rows.
+description: Once the planner learns real table sizes and per-key lookup counts from running queries, the remaining step is learning how many rows filters on unindexed columns, range conditions and joins actually keep — what most plan choices hinge on, and much harder to remember reliably from one plan to the next.
+prereq: cardinality-feedback-rows-per-key
+files: packages/quereus/src/core/database-cardinality-feedback.ts, packages/quereus/src/runtime/emit/filter.ts, packages/quereus/src/runtime/emit/scan.ts, packages/quereus/src/runtime/emit/bloom-join.ts, packages/quereus/src/planner/stats/catalog-stats.ts, packages/quereus/src/planner/stats/conjunct-selectivity.ts, packages/quereus/src/planner/util/column-origins.ts, packages/quereus/src/vtab/best-access-plan.ts, docs/progressive-optimizer.md, docs/optimizer-costing.md
+tradeoffs: Selectivity depends on parameter values and on correlations an observation cannot see, so a remembered fraction can be confidently wrong for the next binding; filter and join observations must be keyed so they survive re-planning, and predicates pushed into a storage module are estimated by the module, so using observed fractions there means a new module-facing contract or the engine and module disagreeing about the same rows.
 ----
 
-# Feedback for predicate selectivity and join output
+# Feedback for filter selectivity, ranges and join output
 
-## Where this starts from
+## Where this starts from (refreshed 2026-11-01)
 
-The `cardinality-feedback-*` chain (see `docs/progressive-optimizer.md` §3) teaches the planner one fact from execution: the exact size of a table some query read in full. That fixes the "every un-analyzed table is 1000 rows" problem, but most plan choices hinge on a different number — how many of those rows a predicate keeps, and how many rows a join produces. Today those come from catalog column statistics when `ANALYZE` ran, and from flat guesses (`NaiveStatsProvider`: 0.1 for any comparison, 0.3 default) when it did not. A table nobody can afford to analyze — the remote/DHT case this design targets — never gets better than the guesses.
+Landed in v4.22.0 (`docs/progressive-optimizer.md` §3): the exact size of a base table read in full, recorded in a per-database overlay, with re-planning of cached statements on a 10× shift. Queued in order (`tickets/implement/`, `fix/`, `plan/`): module-reported table sizes, lower bounds from partial reads (`cardinality-feedback-lower-bounds`), and the first slice beyond table size — rows matched per key by executed equality seeks (`cardinality-feedback-rows-per-key`, plan stage). That slice settles three of the design questions below for equality seeks, and its decisions are the precedent for what remains:
 
-## What to learn
+- **Key**: the `TableSchema` object plus the base-column set — no attribute ids, no literals, no node ids.
+- **Parameter sensitivity**: one running mean per key, the uniform assumption `ANALYZE` statistics already make.
+- **Pushed predicates**: the engine overrides its own consumers of the estimate (the seek's relayed row count, the index-nested-loop's rows per seek) and leaves modules' costing unchanged.
 
-- **Single-table predicate selectivity:** for a `Filter` directly over one base table's rows, input rows vs output rows; for a seek or constrained scan, rows returned vs the table's (observed or catalog) size.
-- **Join output cardinality:** rows out of a join vs the product of its inputs, for an equi-join between two base relations.
+## What remains
 
-Candidate observation sites are the operators that already touch every row (filter output, hash-join build, scan/seek output). The old design's table of "free" instrumentation points (sort input, hash-join build side, hash-aggregate input and group count, filter output, scan output) is the menu; sort and aggregate input counts are intermediate cardinalities whose meaning depends entirely on the plan around them, and are probably not worth keying.
+- **Equality filters on unindexed columns.** A `Filter` directly over a full scan of one base table, predicate a conjunction of `column = value` on base columns: input vs output rows give a fraction for that column set. Needs the filter's input to be the whole table (a qualifying scan below it) and a key from column origins (`collectColumnOrigins`, as `conjunct-selectivity.ts` does for estimation). Consumers: `CatalogStatsProvider` selectivity when no catalog statistics cover the columns — and the multi-relation statistics gate (`statsOnlySelectivity`) must decide whether an observed fraction counts as "real statistics".
+- **Range selectivity.** `column > value` fractions depend on the value far more than equality does; one mean per column is not a usable estimate. Needs either value-bucketed memory (an observed histogram) or a decision that ranges stay on the naive estimate.
+- **Join output cardinality.** Rows out of an equi-join between two base relations against the product of its inputs — keyed by the two tables and the joined column sets. Intermediate cardinalities whose meaning depends on the plan around them (sort input, aggregate input) stay out of scope (§3.1).
+- **Correlation.** An observed combined fraction for `a = 1 and b = 2` captures the correlation `feat-multi-column-correlation-stats` wants `ANALYZE` to collect; decide whether observation subsumes it for observed predicate shapes.
 
-## Problems a design has to settle
+## Problems a design still has to settle
 
-- **A key that survives re-planning.** `fingerprintExpression` (`planner/analysis/expression-fingerprint.ts`) cannot be reused as is: it keys columns by attribute id (fresh on every build), embeds literal values, and falls back to node ids for subqueries. A usable key needs base-table columns resolved by origin (`collectColumnOrigins`, as `conjunct-selectivity.ts` already does for estimation) plus a normalization of literals and parameters to placeholders — and a decision about which literal values stay in the key.
-- **Parameter sensitivity.** `status = ?` keeps 90% of rows for one value and 0.1% for another. One remembered fraction per key averages them (pg_stat-style); per-value memory is unbounded; neither is obviously right. Decide, and decide how a plan built for one binding treats the next.
-- **Pushed-down predicates.** A predicate a module accepts is estimated by the module (`getBestAccessPlan` → `rows`), from `tableInfo.statistics` — and `docs/optimizer-costing.md` makes it a rule that the module's `rows` equals what the engine's provider would say for the same predicate. Observed fractions break that unless the module can see them: extend `BestAccessPlanRequest` with observed selectivities, or have modules consult the overlay through the same provider surface.
-- **Smoothing and staleness.** One observation can be an outlier; data drifts. Running average, decay, or last-value; and when an entry expires.
-- **Interaction with column statistics.** When both exist, which wins and when (the table-size overlay's rule — newest exact count wins, a fresh `ANALYZE` voids observations — does not transfer directly, because a fraction observed for one binding is not exact for another).
-- **Correlation.** An observed combined selectivity for `a = 1 and b = 2` captures the correlation that `feat-multi-column-correlation-stats` wants to collect by `ANALYZE`; decide whether this subsumes it for observed predicate shapes.
+- **Smoothing and staleness** for fractions: running mean, decay, or last value, and when an entry expires.
+- **Interaction with column statistics**: when both exist, which wins (the table-size rule — newest exact count wins, a fresh `ANALYZE` voids observations — does not transfer to a fraction observed under some bindings and not others).
+- **Overhead**: a filter-side observation adds a counter to a loop that already touches every row, but the eligibility test (is this filter directly over a whole-table scan, are its conjuncts base-column equalities) must be decided at emit time, never per row.
 
 ## Who benefits
 
-The work parked elsewhere that the old adaptive-optimizer ticket tied to feedback: `or-to-union-rewriting` (whether N index seeks plus de-duplication beats one scan is a selectivity question), `aggregate-pushdown` (pushing aggregation below a join pays only when the join barely reduces rows), `covering-indexes` (index-only access vs fetch overhead) — all in `tickets/backlog/known/`.
+The parked work the old adaptive-optimizer ticket tied to feedback: `or-to-union-rewriting` (whether N index seeks plus de-duplication beats one scan is a selectivity question), `aggregate-pushdown` (pushing aggregation below a join pays only when the join barely reduces rows), `covering-indexes` (index-only access against fetch overhead) — all in `tickets/backlog/known/`.
