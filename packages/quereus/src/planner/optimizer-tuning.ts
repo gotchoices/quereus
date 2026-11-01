@@ -243,6 +243,13 @@ export interface OptimizerTuning {
 		readonly shiftFactor: number;
 		/** Maximum tables held in the overlay; least-recently-used evicted beyond it. */
 		readonly maxTables: number;
+		/**
+		 * A prepared statement's first feedback re-plan is immediate; re-plan `k + 1`
+		 * waits until it has executed `replanCooldown × 2^min(k − 1, 6)` times since
+		 * re-plan `k`, so a table oscillating across `shiftFactor` cannot make a
+		 * statement re-plan on every execution.
+		 */
+		readonly replanCooldown: number;
 	};
 }
 
@@ -332,5 +339,6 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 		minRows: 1000,
 		shiftFactor: 10,
 		maxTables: 512,
+		replanCooldown: 8,
 	},
 };

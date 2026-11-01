@@ -17,8 +17,11 @@
  * that transaction commits ({@link CardinalityFeedbackManager.onCommitted}) and
  * dropped if it rolls back ({@link CardinalityFeedbackManager.onRolledBack}).
  *
+ * A shift reaches prepared statements through `onShift`; each statement paces its
+ * re-plans with a {@link FeedbackReplanState}.
+ *
  * Nothing here is persisted: a new `Database` starts empty. See
- * docs/progressive-optimizer.md §3.2–3.5.
+ * docs/progressive-optimizer.md §3.2–3.6.
  */
 
 import { createLogger } from '../common/logger.js';
@@ -80,6 +83,50 @@ function rowCountSpread(a: number, b: number): number {
 
 function tableKey(table: TableSchema): string {
 	return `${table.schemaName}.${table.name}`.toLowerCase();
+}
+
+/** Cap on the cooldown's doubling: re-plans past the seventh wait `64 × replanCooldown` executions. */
+const MAX_COOLDOWN_DOUBLINGS = 6;
+
+/**
+ * One prepared statement's feedback re-plan cooldown (docs/progressive-optimizer.md §3.6).
+ * A shift marks the cached plan; the mark is acted on at an execution start, never
+ * mid-execution. The first feedback re-plan is immediate; re-plan `k + 1` waits until the
+ * statement has executed `cooldown × 2^min(k − 1, 6)` times since re-plan `k` — a mark
+ * arriving sooner stays pending until then.
+ */
+export class FeedbackReplanState {
+	private marked = false;
+	/** Feedback re-plans so far. */
+	private replans = 0;
+	/** Executions started since the last feedback re-plan, the re-planning one included. */
+	private executionsSinceReplan = 0;
+
+	/** A table the cached plan reads shifted. */
+	markShift(): void {
+		this.marked = true;
+	}
+
+	/** The cached plan was dropped for any reason; whatever compiles next reads the current overlay. */
+	onPlanDropped(): void {
+		this.marked = false;
+	}
+
+	/** Counts one execution; true when the marked plan must be dropped before it runs. */
+	onExecutionStart(cooldown: number): boolean {
+		const due = this.marked && (this.replans === 0 || this.executionsSinceReplan >= this.requiredExecutions(cooldown));
+		if (due) {
+			this.marked = false;
+			this.replans++;
+			this.executionsSinceReplan = 0;
+		}
+		this.executionsSinceReplan++;
+		return due;
+	}
+
+	private requiredExecutions(cooldown: number): number {
+		return cooldown * 2 ** Math.min(this.replans - 1, MAX_COOLDOWN_DOUBLINGS);
+	}
 }
 
 export class CardinalityFeedbackManager implements ObservedRowCounts {

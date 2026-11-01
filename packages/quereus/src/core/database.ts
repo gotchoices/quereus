@@ -276,7 +276,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 			schemaManager: this.schemaManager,
 			getTuning: () => this.optimizer.tuning,
 			getAutocommit: () => this.transactionManager.getAutocommit(),
-			onShift: key => log('Observed row count for %s shifted', key),
+			onShift: key => this.noteCardinalityShift(key),
 		});
 		this.optimizer = new Optimizer(DEFAULT_TUNING, new CatalogStatsProvider(undefined, this.cardinalityFeedbackManager));
 
@@ -2915,6 +2915,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	/** @internal The observed row-count overlay the planner consults before the catalog. */
 	public get _cardinalityFeedback(): CardinalityFeedbackManager {
 		return this.cardinalityFeedbackManager;
+	}
+
+	/** Tells every live prepared statement that `key`'s observed size shifted; each decides whether its plan reads it. */
+	private noteCardinalityShift(key: string): void {
+		for (const stmt of this.statements) stmt._noteCardinalityShift(key);
 	}
 
 	/** @internal A fresh per-execution observation sink, or `undefined` when `cardinality_feedback` is off. */

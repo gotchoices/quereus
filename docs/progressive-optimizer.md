@@ -4,7 +4,7 @@ This document describes how Quereus improves plans from what execution reveals, 
 
 Quereus targets deployments where table storage may sit behind a network — a distributed hash table, a remote store — so every read is expensive and a full scan run only to collect statistics is often unaffordable. The optimizer must produce good plans with zero collected statistics, and improve them using numbers that *essential* execution produces anyway. Statistics are hints that improve a good plan, never prerequisites without which the plan is bad.
 
-**Status.** Sections 1, 2 and 4–6 describe settled design and current code. Section 3, *cardinality feedback*, is being built by the `cardinality-feedback-*` tickets (`tickets/implement/`), each of which updates this document as it lands. Landed: scan observation, the overlay, the one row-count seam, the record/shift policy and publication (3.1–3.5). A shift is only debug-logged until re-planning (3.6) lands. The rest of section 3 is design.
+**Status.** Sections 1, 2 and 4–6 describe settled design and current code. Section 3, *cardinality feedback*, is being built by the `cardinality-feedback-*` tickets (`tickets/implement/`), each of which updates this document as it lands. Landed: scan observation, the overlay, the one row-count seam, the record/shift policy, publication and re-planning of cached statements (3.1–3.6). The rest of section 3 is design.
 
 ---
 
@@ -99,11 +99,11 @@ Publication runs in the run site's `finally`, after the execution's scan connect
 
 ### 3.6 Re-planning cached statements
 
-A shift for `T` walks the `Database`'s live statements and marks those whose current plan depends on `T` (the table dependencies `compile()` already collects). A marked statement re-plans at the start of its next execution by calling `Statement.invalidatePlan()` — the same full rebuild from the retained AST a schema change triggers. A running execution is never disturbed; the mark waits for the next one.
+A shift for `T` walks the `Database`'s live statements (`Database.noteCardinalityShift`) and marks those whose current plan reads `T` (`Statement._noteCardinalityShift`). Each compile keeps the lowercased `<schema>.<table>` of every `table` dependency the builder recorded; view and lens bodies build in the reading statement's planning context, so a plan over a view carries its base tables. A marked statement re-plans at the start of its next execution by calling `Statement.invalidatePlan()` — the same full rebuild from the retained AST a schema change triggers, with the statement's established parameter types. A running execution is never disturbed; the mark waits for the next one.
 
 - The **first** feedback re-plan of a statement is immediate: the point is that the second execution already runs the corrected plan.
-- Later feedback re-plans of the same statement wait until it has executed at least `cardinalityFeedback.replanCooldown × 2^(k−1)` times since the previous one (default cooldown 8; `k` = feedback re-plans so far, multiplier capped at 64). A table oscillating across 10× — a queue filled and drained — re-plans each dependent statement O(log executions) times rather than on every execution.
-- Any other compile (schema change, first bind of an untyped parameter) clears the mark, since the new plan reads the current overlay anyway.
+- Later feedback re-plans of the same statement wait until it has executed at least `cardinalityFeedback.replanCooldown × 2^(k−1)` times since the previous one, counting the execution that re-planned (default cooldown 8; `k` = feedback re-plans so far, multiplier capped at 64). A mark arriving sooner stays pending and fires at the first execution start past the cooldown. A table oscillating across 10× — a queue filled and drained — re-plans each dependent statement O(log executions) times rather than on every execution. The arithmetic is `FeedbackReplanState` (`core/database-cardinality-feedback.ts`), one per statement.
+- A plan dropped for any other reason (schema change, first bind of an untyped parameter, advancing to the next statement of a batch) clears the mark, since the plan compiled next reads the current overlay anyway; it does not count as a feedback re-plan.
 - One-shot calls (`db.get`, `db.eval`, `db.exec`) compile on every call and always read the current overlay; they need no marking.
 - Plans cached outside `Statement` — materialized-view maintenance plans, assertion and watcher delta plans — are not feedback-invalidated; they re-plan on schema change only.
 
@@ -126,7 +126,7 @@ A shift for `T` walks the `Database`'s live statements and marks those whose cur
 ### 3.9 Diagnostics and the escape hatch
 
 - `cardinality_feedback()` (table-valued) lists the overlay: table, observed rows, catalog rows, baseline, observation and shift counts.
-- `Statement.getPlanShape()` shows a statement's current plan, so a feedback re-plan is visible as a change in node types; the `core:cardinality-feedback` debug log names each shift and each re-plan.
+- `Statement.getPlanShape()` shows a statement's current plan, so a feedback re-plan is visible as a change in node types — between the shift and the next execution it still shows the cached plan. The `core:cardinality-feedback:debug` log names each shift, and the `core:statement` log each re-plan.
 - `cardinality_feedback` (boolean database option) is the master switch.
 
 ---
@@ -161,9 +161,9 @@ A shift for `T` walks the `Database`'s live statements and marks those whose cur
 | `src/planner/stats/catalog-stats.ts` | `CatalogStatsProvider` — catalog statistics, naive fallback |
 | `src/planner/nodes/reference.ts` | `TableReferenceNode.estimatedRows` — every scan's base cardinality |
 | `src/core/database-auto-analyze.ts` | Committed-change staleness and background `ANALYZE` |
-| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, record policy, shift detection, publication (`publish`) and commit-scoped holding (`onCommitted`, `onRolledBack`) |
+| `src/core/database-cardinality-feedback.ts` | The observed row-count overlay, record policy, shift detection, publication (`publish`) and commit-scoped holding (`onCommitted`, `onRolledBack`); the per-statement re-plan cooldown (`FeedbackReplanState`) |
 | `src/runtime/emit/scan.ts` | The scan leaf, where complete enumerations are observed (`enumeratesWholeTable`) |
 | `src/runtime/cardinality-observations.ts` | Per-execution observation sink on the `RuntimeContext` |
 | `src/runtime/work-counters.ts` | Diagnostic work counters (not the feedback channel) |
-| `src/core/statement.ts` | Plan cache, `invalidatePlan()`, schema-change invalidation |
-| `src/planner/optimizer-tuning.ts` | `defaultRowEstimate`, and the `cardinalityFeedback` knobs once they land |
+| `src/core/statement.ts` | Plan cache, `invalidatePlan()`, schema-change invalidation, feedback re-plan marking (`_noteCardinalityShift`) |
+| `src/planner/optimizer-tuning.ts` | `defaultRowEstimate`, and the `cardinalityFeedback` knobs (`minRows`, `shiftFactor`, `maxTables`, `replanCooldown`) |

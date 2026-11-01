@@ -19,7 +19,7 @@ import { isAsyncIterable, disconnectVTable } from '../runtime/utils.js';
 import type { VirtualTable } from '../vtab/table.js';
 import { generateInstructionProgram, serializePlanTree } from '../planner/debug.js';
 import { EmissionContext } from '../runtime/emission-context.js';
-import type { SchemaDependency } from '../planner/planning-context.js';
+import type { BuildTimeDependencyTracker, SchemaDependency } from '../planner/planning-context.js';
 import { boundKeyToParamKey, emptyBoundParams, getParameterTypes, normalizeBoundParams } from './param.js';
 import { rowToObject } from './utils.js';
 import { getPhysicalType, physicalTypeName, PhysicalType } from '../types/logical-type.js';
@@ -32,6 +32,7 @@ import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-us
 import { isObjectClassValue } from '../util/comparison.js';
 import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 import { astToString } from '../emit/ast-stringify.js';
+import { FeedbackReplanState } from './database-cardinality-feedback.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
@@ -42,6 +43,15 @@ const errorLog = log.extend('error');
  * path. See {@link Statement._iterateWithSignal} for why statement egress is that case.
  */
 const NO_DECLARED_TYPES: readonly (DeclaredType | undefined)[] = [];
+
+/** Lowercased `schema.table` of every table a plan read — the cardinality-feedback overlay's key. */
+function tableDependencyKeys(dependencies: BuildTimeDependencyTracker): ReadonlySet<string> {
+	const keys = new Set<string>();
+	for (const dep of dependencies.getDependencies()) {
+		if (dep.type === 'table') keys.add(`${dep.schemaName}.${dep.objectName}`.toLowerCase());
+	}
+	return keys;
+}
 
 /**
  * Represents a prepared SQL statement.
@@ -75,6 +85,13 @@ export class Statement {
 	private needsCompile = true;
 	private columnDefCache = new Cached<DeepReadonly<ColumnDef>[]>(() => this.getColumnDefs());
 	private schemaChangeUnsubscriber: (() => void) | null = null;
+	/**
+	 * Overlay keys of every table the cached plan reads, view and lens bodies included
+	 * (they build in this statement's planning context). Recomputed on each compile and
+	 * matched against cardinality-feedback shifts in {@link _noteCardinalityShift}.
+	 */
+	private planTableKeys: ReadonlySet<string> = new Set();
+	private readonly feedbackReplan = new FeedbackReplanState();
 	/**
 	 * Types of the parameters that have one: the explicit hints handed to `prepare()`,
 	 * or — when the caller supplied values instead — the type each parameter's FIRST
@@ -205,8 +222,8 @@ export class Statement {
 	 * Drops the compiled plan and everything derived from it, so the next
 	 * {@link compile} rebuilds. THE one invalidation set — every caller that
 	 * invalidates (schema change, statement advance, first bind onto a provisional
-	 * plan) goes through here so none can forget a member and leave, say, a stale
-	 * scheduler emitted from a discarded plan.
+	 * plan, cardinality-feedback re-plan) goes through here so none can forget a
+	 * member and leave, say, a stale scheduler emitted from a discarded plan.
 	 */
 	private invalidatePlan(): void {
 		this.needsCompile = true;
@@ -214,6 +231,23 @@ export class Statement {
 		this.emissionContext = null;
 		this.scheduler = null;
 		this.columnDefCache.clear();
+		this.feedbackReplan.onPlanDropped();
+	}
+
+	/**
+	 * @internal The observed size of `key` (lowercased `schema.table`) shifted. Only marks
+	 * a cached plan that reads it; the plan is dropped at an execution start the cooldown
+	 * allows ({@link dropPlanOnShift}), so a running execution is never disturbed.
+	 */
+	_noteCardinalityShift(key: string): void {
+		if (this.plan && this.planTableKeys.has(key)) this.feedbackReplan.markShift();
+	}
+
+	/** Drops a shift-marked plan when the statement's re-plan cooldown allows it. */
+	private dropPlanOnShift(): void {
+		if (!this.feedbackReplan.onExecutionStart(this.db.optimizer.tuning.cardinalityFeedback.replanCooldown)) return;
+		log('Cardinality feedback re-plan for statement: %s', this.getBlockSql().substring(0, 100));
+		this.invalidatePlan();
 	}
 
 	/**
@@ -311,6 +345,7 @@ export class Statement {
 			// seeks (which erases the comparison node). See validateParameterTypes.
 			this.scalarRequiredParams = collectScalarRequiredParams(rawPlan);
 			plan = this.db.optimizer.optimize(rawPlan, this.db) as BlockNode;
+			this.planTableKeys = tableDependencyKeys(dependencies);
 
 			// Always drop the previous listener before (re)compiling, even when the new
 			// plan has no dependencies — otherwise a zero-dependency recompile leaks the
@@ -477,6 +512,7 @@ export class Statement {
 			// below (empty block, compile throw) leaves `getWorkCounters()` reporting
 			// nothing rather than the execution before last.
 			this.workCounters = null;
+			this.dropPlanOnShift();
 			const blockPlanNode = this.compile();
 			if (!blockPlanNode.statements.length) return;
 

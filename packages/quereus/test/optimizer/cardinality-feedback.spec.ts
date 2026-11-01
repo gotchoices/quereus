@@ -1,7 +1,8 @@
 /**
  * Cardinality feedback, planner half: the observed row-count overlay's record/shift
- * policy (docs/progressive-optimizer.md §3.4), and its precedence over the catalog at
- * the one base-table row-count seam (`plannedRowCount`, §3.3).
+ * policy (docs/progressive-optimizer.md §3.4), its precedence over the catalog at the
+ * one base-table row-count seam (`plannedRowCount`, §3.3), and re-planning prepared
+ * statements on a shift (§3.6).
  *
  * The policy tests construct their own `CardinalityFeedbackManager` over the database's
  * schema manager so they can watch `onShift` directly and vary the tuning per test.
@@ -9,11 +10,13 @@
 
 import { expect } from 'chai';
 import { Database } from '../../src/core/database.js';
-import { CardinalityFeedbackManager } from '../../src/core/database-cardinality-feedback.js';
+import type { Statement } from '../../src/core/statement.js';
+import { CardinalityFeedbackManager, FeedbackReplanState } from '../../src/core/database-cardinality-feedback.js';
 import { DEFAULT_TUNING, type OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
 import type { TableSchema } from '../../src/schema/table.js';
 
 describe('Cardinality feedback overlay', () => {
+	const joinSql = 'select m.x, b.w from mid m join big b on b.id = m.big_id where m.x = 1';
 	let db: Database;
 
 	beforeEach(() => {
@@ -116,11 +119,14 @@ describe('Cardinality feedback overlay', () => {
 		});
 	});
 
-	describe('precedence', () => {
-		const sql = 'select m.x, b.w from mid m join big b on b.id = m.big_id where m.x = 1';
+	async function createJoinTables(): Promise<void> {
+		await db.exec('create table big (id integer primary key, v integer, w integer)');
+		await db.exec('create table mid (id integer primary key, big_id integer, x integer)');
+	}
 
+	describe('precedence', () => {
 		function planNodeTypes(): Record<string, number> {
-			const stmt = db.prepare(sql);
+			const stmt = db.prepare(joinSql);
 			try {
 				return stmt.getPlanShape().nodeTypes;
 			} finally {
@@ -129,8 +135,7 @@ describe('Cardinality feedback overlay', () => {
 		}
 
 		it('an observed size reaches the plan: the join flips from hash to a primary-key seek', async () => {
-			await db.exec('create table big (id integer primary key, v integer, w integer)');
-			await db.exec('create table mid (id integer primary key, big_id integer, x integer)');
+			await createJoinTables();
 
 			const unobserved = planNodeTypes();
 			expect(unobserved).to.include.keys('HashJoin', 'IndexScan');
@@ -144,6 +149,64 @@ describe('Cardinality feedback overlay', () => {
 			const observed = planNodeTypes();
 			expect(observed).to.include.keys('Join', 'IndexSeek');
 			expect(observed).to.not.have.property('HashJoin');
+		});
+	});
+
+	describe('re-planning prepared statements', () => {
+		async function joinedWs(stmt: Statement): Promise<number[]> {
+			const ws: number[] = [];
+			for await (const row of stmt.all()) ws.push(row.w as number);
+			return ws.sort((a, b) => a - b);
+		}
+
+		it('re-plans at the execution after the one whose scan shifted a table it reads', async () => {
+			await db.exec('pragma cardinality_feedback = true');
+			await createJoinTables();
+			await db.exec('insert into big select value, value, value from generate_series(1, 20000)');
+			await db.exec('insert into mid select value, (value * 7) % 20000 + 1, value % 5 from generate_series(1, 300)');
+
+			const stmt = db.prepare(joinSql);
+			try {
+				expect(stmt.getPlanShape().nodeTypes).to.include.keys('HashJoin', 'IndexScan');
+				const first = await joinedWs(stmt);
+				expect(first).to.have.length(60);
+
+				// The shift only marked the cached plan; it is dropped when the next run starts.
+				expect(stmt.getPlanShape().nodeTypes).to.include.keys('HashJoin');
+				expect(await joinedWs(stmt)).to.deep.equal(first);
+
+				const replanned = stmt.getPlanShape().nodeTypes;
+				expect(replanned).to.include.keys('Join', 'IndexSeek');
+				expect(replanned).to.not.have.property('HashJoin');
+			} finally {
+				await stmt.finalize();
+			}
+		});
+
+		it('paces re-plans: the first immediate, then 8, 16, ... executions apart, capped at 64x', () => {
+			const cooldown = 8;
+			const state = new FeedbackReplanState();
+			/** Marks a shift right away and counts execution starts until one drops the plan. */
+			function executionsToReplan(): number {
+				state.markShift();
+				let executions = 1;
+				while (!state.onExecutionStart(cooldown)) executions++;
+				return executions;
+			}
+
+			expect(state.onExecutionStart(cooldown), 'unmarked').to.equal(false);
+			// Each mark arrives right after the previous re-plan and waits out the cooldown.
+			expect(Array.from({ length: 9 }, executionsToReplan)).to.deep.equal([1, 8, 16, 32, 64, 128, 256, 512, 512]);
+
+			// A mark arriving once the cooldown has already passed fires at once.
+			for (let i = 0; i < 600; i++) expect(state.onExecutionStart(cooldown)).to.equal(false);
+			expect(executionsToReplan()).to.equal(1);
+
+			// Dropping the plan for another reason (schema change, rebind) consumes the mark.
+			for (let i = 0; i < 600; i++) state.onExecutionStart(cooldown);
+			state.markShift();
+			state.onPlanDropped();
+			expect(state.onExecutionStart(cooldown)).to.equal(false);
 		});
 	});
 });
