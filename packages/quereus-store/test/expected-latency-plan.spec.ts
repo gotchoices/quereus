@@ -1,15 +1,13 @@
 /**
- * A provider-declared first-row latency (`KVStoreProvider.expectedLatencyMs`) has to reach
- * the query planner.
+ * A provider-declared latency (`KVStoreProvider.costProfile.firstRowLatencyMs` and
+ * `.perRowLatencyMs`) has to reach the query planner.
  *
- * The engine has always had one number a storage module can use to say "I am slow to answer"
- * — `VirtualTableModule.expectedLatencyMs`, defined as FIRST-ROW latency: how long an
- * iterator opened over one of the module's tables takes to hand back its first row.
- * `StoreModule` never declared it and `KVStoreProvider` had no field a backend could declare
- * it THROUGH, so a provider over a network-backed key-value store — exactly the case the
- * planner's latency machinery exists for — could not tell the planner anything at all.
+ * The engine reads a module's latency off `VirtualTableModule.costProfile`. `StoreModule`
+ * surfaces its provider's resolved profile there, so a provider over a network-backed
+ * key-value store — exactly the case the planner's latency machinery exists for — can tell
+ * the planner it is slow to answer.
  *
- * Three properties are pinned here:
+ * Two properties are pinned here:
  *
  *  1. **A provider that declares nothing resolves to `0`,** which is observably identical to
  *     omitting the hint. Every other spec in this package runs on such a provider, so drift
@@ -18,12 +16,12 @@
  *     the join below becomes the batched one-branch fan-out when the provider declares 30 ms
  *     and stays the serial index-nested-loop when it declares nothing. Asserting both
  *     directions is what makes this a regression guard rather than a snapshot.
- *  3. **A malformed third-party declaration degrades to `0`, loudly** — same discipline as
- *     `resolveCostProfile` (see `cost-profile.spec.ts`), with one deliberate difference:
- *     `0` is a VALID latency, so only negative and non-finite values are rejected.
+ *
+ * How a malformed declaration resolves is the engine's rule (`resolveModuleCostProfile`,
+ * pinned in the engine's `test/vtab/cost-profile.spec.ts`), not this package's.
  *
  * The 30 ms is frankly synthetic and no in-tree backend declares anything (see the store
- * README, § Backend first-row latency). It is chosen to clear the planner's latency gates, all of
+ * README, § Backend cost profile). It is chosen to clear the planner's latency gates, all of
  * which sit at 25 ms — `tuning.parallel.batchedOuterThresholdMs` and neighbours. Fixing a
  * real backend's number is a separate question this test deliberately does not depend on.
  *
@@ -36,22 +34,24 @@
 import { describe, it, afterEach } from 'mocha';
 import { expect } from 'chai';
 import { Database, asyncIterableToArray, serializePlanTree } from '@quereus/quereus';
-import { StoreModule, createIsolatedStoreModule, resolveExpectedLatencyMs, type KVStoreProvider } from '../src/index.js';
+import { StoreModule, createIsolatedStoreModule, type KVStoreProvider } from '../src/index.js';
 import { createInMemoryProvider } from '../src/testing/index.js';
 
 /** Above every 25 ms latency gate in `optimizer-tuning.ts`, and nothing more than that. */
 const HIGH_LATENCY_MS = 30;
 
 /**
- * An in-memory provider declaring `expectedLatencyMs` (or nothing, when omitted).
- *
- * Spread rather than assigned, so the "declares nothing" provider has NO such property at
- * all — the shape a pre-latency third-party provider has, and the one `resolveExpectedLatencyMs`
- * routes down its default path.
+ * An in-memory provider whose cost profile declares a first-row latency (and optionally a
+ * per-row one), or no `costProfile` at all when `firstRowLatencyMs` is omitted — the shape
+ * a pre-profile third-party provider has, and the one `resolveCostProfile` routes down its
+ * parity path.
  */
-function providerDeclaring(latencyMs?: number): KVStoreProvider {
-	const base = createInMemoryProvider();
-	return { ...base, ...(latencyMs === undefined ? {} : { expectedLatencyMs: latencyMs }) };
+function providerDeclaring(firstRowLatencyMs?: number, perRowLatencyMs?: number): KVStoreProvider {
+	if (firstRowLatencyMs === undefined) return createInMemoryProvider();
+	const costProfile = perRowLatencyMs === undefined
+		? { firstRowLatencyMs }
+		: { firstRowLatencyMs, perRowLatencyMs };
+	return createInMemoryProvider({ costProfile });
 }
 
 /** One node of the tree `serializePlanTree` emits — only the fields these assertions read. */
@@ -86,30 +86,11 @@ function nodesOfType(db: Database, sql: string, nodeType: string): PlanNodeInfo[
 describe('provider-declared first-row latency', () => {
 	describe('resolution', () => {
 		it('takes a declared value through to the module', () => {
-			expect(new StoreModule(providerDeclaring(HIGH_LATENCY_MS)).expectedLatencyMs).to.equal(HIGH_LATENCY_MS);
+			expect(new StoreModule(providerDeclaring(HIGH_LATENCY_MS)).costProfile.firstRowLatencyMs).to.equal(HIGH_LATENCY_MS);
 		});
 
 		it('resolves an undeclared provider to 0', () => {
-			expect(new StoreModule(providerDeclaring()).expectedLatencyMs).to.equal(0);
-		});
-
-		it('accepts a declared 0 — unlike a cost field, 0 is a valid latency', () => {
-			expect(resolveExpectedLatencyMs(0)).to.equal(0);
-		});
-
-		it('degrades a negative or non-finite declaration to 0, with a warning', () => {
-			const warnings: string[] = [];
-			const realWarn = console.warn;
-			console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
-			try {
-				expect(new StoreModule(providerDeclaring(-1)).expectedLatencyMs).to.equal(0);
-				expect(new StoreModule(providerDeclaring(Number.NaN)).expectedLatencyMs).to.equal(0);
-				expect(new StoreModule(providerDeclaring(Number.POSITIVE_INFINITY)).expectedLatencyMs).to.equal(0);
-			} finally {
-				console.warn = realWarn;
-			}
-			expect(warnings, 'each bad declaration warned once, at construction').to.have.lengthOf(3);
-			for (const w of warnings) expect(w).to.contain('expectedLatencyMs');
+			expect(new StoreModule(providerDeclaring()).costProfile.firstRowLatencyMs).to.equal(0);
 		});
 	});
 
@@ -192,7 +173,7 @@ describe('provider-declared first-row latency', () => {
 	});
 
 	/**
-	 * The per-row hint (`KVStoreProvider.expectedRowLatencyMs`) takes the same path, through
+	 * The per-row hint (`costProfile.perRowLatencyMs`) takes the same path, through
 	 * the isolation wrapper's forwarding getter. 50-row memory outer `po` against a 5,000-row
 	 * isolated-store inner `pi`, keyed on `pi`'s primary key, at 30 ms first-row latency
 	 * (30,000 units at `latencyCostPerMs` 1000; `po` is in-process, so its drain is 0):
@@ -211,8 +192,7 @@ describe('provider-declared first-row latency', () => {
 		const SQL = 'select po.id, pi.v from po join pi on pi.id = po.k';
 
 		async function planWith(rowLatencyMs?: number): Promise<Database> {
-			const base = providerDeclaring(HIGH_LATENCY_MS);
-			const provider = rowLatencyMs === undefined ? base : { ...base, expectedRowLatencyMs: rowLatencyMs };
+			const provider = providerDeclaring(HIGH_LATENCY_MS, rowLatencyMs);
 			const db = new Database();
 			opened.push(db);
 			db.registerModule('store', createIsolatedStoreModule({ provider }));

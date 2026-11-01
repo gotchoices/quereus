@@ -90,8 +90,10 @@ export interface OptimizerTuning {
 	readonly deltaPerRowFallbackRatio: number;
 
 	/**
-	 * Engine cost units charged per millisecond of declared storage latency —
-	 * first-row (`expectedLatencyMs`) or per-row (`expectedRowLatencyMs`) alike.
+	 * Engine cost units charged per millisecond of declared storage latency — a
+	 * module cost profile's first-row (`firstRowLatencyMs`) or per-row
+	 * (`perRowLatencyMs`) field alike, as lifted onto a subtree's
+	 * `expectedLatencyMs` / `expectedRowLatencyMs`.
 	 * One engine cost unit is one in-process sequentially scanned row
 	 * (`COST_CONSTANTS.SEQ_SCAN_PER_ROW = 1.0`), so this is the number of rows the
 	 * engine scans in a millisecond. Applied by `latencyCost` (cost/index.ts)

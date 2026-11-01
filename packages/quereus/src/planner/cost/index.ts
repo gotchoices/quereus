@@ -156,8 +156,9 @@ export function nestedLoopJoinCost(outerRows: number, innerRows: number): number
 /**
  * Declared storage latency, in milliseconds, converted to engine cost units at
  * `tuning.latencyCostPerMs` — the ONE place the conversion is spelled. Every
- * rule that adds a module's `expectedLatencyMs` / `expectedRowLatencyMs` to
- * engine work goes through here; the formulas in this file take the converted
+ * rule that adds a declared latency (a module's `costProfile`, lifted onto a
+ * subtree's `expectedLatencyMs` / `expectedRowLatencyMs`) to engine work goes
+ * through here; the formulas in this file take the converted
  * value and stay in cost units. The wall-clock gates (`parallel.*ThresholdMs`,
  * the fan-out savings gate) compare milliseconds with milliseconds and do not.
  */
@@ -184,8 +185,9 @@ export function latencyCost(
  * (default 1000 — about a thousand rows scan per millisecond on the reference
  * machine). Callers convert through `latencyCost` before calling; this function
  * never sees milliseconds. The `tuning.parallel.*ThresholdMs` gates keep
- * reading the raw millisecond declarations, so a module must declare its real
- * measured latency and never a value inflated to look large on this scale.
+ * reading the raw millisecond declarations, so a module must declare the preset
+ * for its real storage category (or a measured latency) and never a value
+ * inflated to look large on this scale.
  */
 export function indexNestedLoopJoinCost(
 	outerRows: number, rowsPerSeek: number, perSeekLatencyCost = 0,

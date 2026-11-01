@@ -101,22 +101,48 @@ rewrites, and answering it with a scan would switch that feature off.
 **Backend cost profile.** How expensive those reads actually are depends on the backend: a
 point read is nearly free on LevelDB (in-process, block-cached) and is a separate request
 across an IPC boundary on IndexedDB. A provider can therefore declare a `costProfile`
-(`KVCostProfile`, in `src/common/cost-profile.ts`), whose unit is **one row read
-sequentially during a full scan = 1.0**:
+(`KVCostProfile`, in `src/common/cost-profile.ts`) with two halves:
+
+- **Latencies, in wall-clock milliseconds** — the engine's own `ModuleCostProfile`, which
+  `KVCostProfile` extends: `firstRowLatencyMs` (how long an iterator opened over one of its
+  stores takes to hand back its **first** row) and `perRowLatencyMs` (each row after the
+  first in a sequential iterate — the full-scan rate, which a backend author can time
+  directly). Start from the engine's `COST_PRESETS` entry for the backend's category —
+  `memory`, `localDisk`, `browserIdb`, `network`, `distributed`; the numbers and their
+  sources are in `docs/optimizer-costing.md` § Module cost profile — and spread it to
+  override what you have measured: `costProfile: { ...COST_PRESETS.localDisk, pointRead: 2 }`.
+- **Ratios**, store-only, whose unit is **one row read sequentially during a full scan = 1.0**:
 
 | knob | what it prices | parity default | declared by IndexedDB |
 |---|---|---|---|
+| `firstRowLatencyMs` | ms before an opened iterator yields its first row | 0 | — |
+| `perRowLatencyMs` | ms per further row in a sequential iterate | 0 | — |
 | `pointRead` | resolving one secondary-index entry to the row it names | 1.0 | 3.0 |
 | `seekPositioning` | one key of a multi-seek — positioning the window *and* reading its row | 0.5 | 5.0 |
 
-Both fields are optional and an omitted field takes its parity default, which reproduces the
-module's pre-profile constants exactly — **a provider that declares nothing plans exactly as
-it always did.** A field declared non-finite or non-positive falls back to its parity value
-with a warning rather than breaking planning. Only LevelDB's numbers are unmeasured (it
-declares nothing, deliberately); IndexedDB's come from the benchmark in
-`packages/quereus-plugin-indexeddb/bench/README.md`. The profile is expressed as a *ratio*,
-not milliseconds, because these costs are request-latency dominated — a slower device scales
-the seek path and the scan baseline together.
+Every field is optional and an omitted field takes its parity default — zero latency and the
+module's pre-profile ratio constants — so **a provider that declares nothing plans exactly as
+it always did.** `StoreModule` resolves the profile once at construction and exposes the
+result as its `VirtualTableModule.costProfile`. The engine planner lifts the two latencies
+onto the table leaf and propagates them upward as `max(children)`: that is what lets the
+batched-seek, gather and prefetch rules amortize a slow backend's per-open latency, and what
+prices a full read as `firstRowLatencyMs + rowsRead × perRowLatencyMs` and a seek as
+`firstRowLatencyMs + rowsPerSeek × perRowLatencyMs` (see `docs/optimizer-joins.md`, § Storage
+latency). The ratios price only the store's own access planner. A ratio declared non-finite
+or non-positive falls back to its parity value with a warning; a latency declared negative or
+non-finite falls back to `0` with a warning — `0` **is** a valid latency, by the engine's
+`resolveModuleCostProfile`.
+
+The ratios are ratios, not milliseconds, because these costs are request-latency dominated —
+a slower device scales the seek path and the scan baseline together. The latencies are
+wall-clock because the rules gating on them compare against literal millisecond thresholds
+(25 ms today), so a device-relative number would mean nothing to them; declare the category
+preset rather than invent a precise number. IndexedDB's ratios come from the benchmark in
+`packages/quereus-plugin-indexeddb/bench/README.md`; LevelDB declares no ratios, deliberately.
+**No in-tree provider declares a latency yet** — LevelDB's and IndexedDB's decisions, with
+their revisit conditions, are recorded as `NOTE:` comments at those two providers, and the
+other two in-tree providers (React Native LevelDB, NativeScript SQLite) are in-process
+backends that declare nothing for the same reason LevelDB does.
 
 `seekPositioning` is the knob that moves plan choice today: it is what the engine's key-set
 rewrite reads when it interpolates the key count at which a seek overtakes the plan it would
@@ -127,41 +153,6 @@ other — but **the seek-vs-scan comparison above is deliberately still priced a
 arm-disabling rather than arm-tuning: past `pointRead` 2.83 the range arm would be switched
 off for every query on every table, off a guess no measurement can resolve. When real
 per-column statistics replace the guess, the comparison will use the declared cost instead.
-
-**Backend first-row latency.** Separately from the cost ratios above, a provider may declare
-`expectedLatencyMs` — how long an iterator opened over one of its stores takes to hand back
-its **first** row. `StoreModule` resolves it once at construction and surfaces it as its
-`VirtualTableModule.expectedLatencyMs`, which the planner lifts onto the table leaf and
-propagates upward as `max(children)`; it is what lets the batched-seek, gather and prefetch
-rules amortize a slow backend's per-open latency across concurrent work. Omitted (the
-default) means `0` — in-process — and a negative or non-finite declaration falls back to `0`
-with a warning. Note `0` **is** a valid declaration here, unlike a cost field, where `0` is
-unusable.
-
-Unlike the cost profile this is **wall-clock milliseconds, not a ratio**, because the rules
-gating on it compare against literal millisecond thresholds (25 ms today). That makes the
-declare-only-measured rule sharper, not softer: a device-relative guess means nothing to a
-wall-clock gate. **No in-tree provider declares one** — LevelDB's has never been measured,
-and IndexedDB's has been measured and deliberately left undeclared (its round trips are far
-below every 25 ms gate, and the one shared cost formula reading the field charges the *seek*
-plan rather than the *scan*, which is backwards on that backend). Both decisions, with their
-revisit conditions, are recorded as `NOTE:` comments at those two providers; the other two
-in-tree providers (React Native LevelDB, NativeScript SQLite) are unmeasured in-process
-backends and declare nothing here for the same reason LevelDB's does. The surface exists
-for the case it was built for: a key-value backend reached over a network.
-
-**Backend per-row latency.** Beside the first-row figure a provider may declare
-`expectedRowLatencyMs` — the wall-clock milliseconds each row **after the first** takes to
-arrive in a sequential iterate (the full-scan rate, which is what a backend author can time
-directly). `StoreModule` resolves it the same way (once, at construction; omitted means `0`;
-negative or non-finite falls back to `0` with a warning) and surfaces it as its
-`VirtualTableModule.expectedRowLatencyMs`. The planner then prices a full read as
-`expectedLatencyMs + rowsRead × expectedRowLatencyMs` and a seek as
-`expectedLatencyMs + rowsPerSeek × expectedRowLatencyMs`, which is what lets a seek plan beat
-a hash join that would drain a large remote table (see `docs/optimizer-joins.md`, § Storage
-latency). The two hints are independent — declare either or both — and the same
-declare-only-measured rule applies; no in-tree provider declares one, for the reasons
-recorded at the LevelDB and IndexedDB providers.
 
 **`IN`-list index seeks ("multi-seek").** An `IN`-list on an indexed column
 (`where v in (1, 2, 3)`, including parameter-bound lists) is served from the index as one

@@ -691,6 +691,10 @@ Modules should communicate:
 
 These properties enable the optimizer to make better decisions about join order, aggregation strategy, and materialization.
 
+### Declaring a cost profile
+
+Storage slower than memory declares `costProfile`: spread the `COST_PRESETS` entry for its category and override only measured fields — `{ ...COST_PRESETS.network, perRowLatencyMs: 0.02 }`. A plan-choice hint; results never depend on it. Presets, sources, paging backends: [Optimizer Costing § Module cost profile](optimizer-costing.md#module-cost-profile).
+
 ### Binding Capture
 
 When predicates are pushed into the `Retrieve` pipeline, parameters and correlated column references are captured:

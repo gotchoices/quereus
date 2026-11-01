@@ -33,8 +33,8 @@
  * forms.
  *
  * Cost gate is anchored on `physical.expectedLatencyMs` — populated 0 for
- * in-process / memory-vtab paths, non-zero for remote vtabs whose access plan
- * declares per-call latency. As a consequence, with no remote-vtab plugin in
+ * in-process / memory-vtab paths, non-zero for remote vtabs whose cost profile
+ * declares a first-row latency. As a consequence, with no remote-vtab plugin in
  * tree the rule is inert by design (memory-vtab golden plans don't change).
  *
  * Join-spine branch eligibility mirrors `ruleJoinElimination`:

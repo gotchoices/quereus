@@ -58,7 +58,7 @@ class OrphanMemoryModule extends MemoryTableModule {
 
 /** Orphan-permitting AND high-latency — for the fan-out clustering tests. */
 class HighLatencyOrphanMemoryModule extends OrphanMemoryModule {
-	readonly expectedLatencyMs = HIGH_LATENCY_MS;
+	readonly costProfile = { firstRowLatencyMs: HIGH_LATENCY_MS };
 }
 
 describe('FK trust gated by permitsOrphanedForeignKeyRows', () => {

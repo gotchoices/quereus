@@ -6,6 +6,7 @@ import type { TableSchema, IndexSchema } from '../schema/table.js'; // Add impor
 import type { BestAccessPlanRequest, BestAccessPlanResult } from './best-access-plan.js';
 import type { PlanNode } from '../planner/nodes/plan-node.js';
 import type { ModuleCapabilities } from './capabilities.js';
+import type { ModuleCostProfile } from './cost-profile.js';
 import type { MappingAdvertisement } from './mapping-advertisement.js';
 import type { BackingHost } from './backing-host.js';
 import type { Schema } from '../schema/schema.js';
@@ -139,33 +140,22 @@ export interface VirtualTableModule<
 	readonly concurrencyMode?: VtabConcurrencyMode;
 
 	/**
-	 * Optional hint: expected first-row latency in milliseconds for an iterator
-	 * opened against tables of this module. Local in-process modules omit this
-	 * (treated as 0). Remote / network-backed modules should declare a non-zero
-	 * value so the parallel fan-out rule can amortize per-branch latency across
-	 * concurrent branches.
+	 * Optional hint: what reading this module's tables costs — first-row and
+	 * per-row wall-clock latency (see {@link ModuleCostProfile}). Omit (every
+	 * field reads as 0) for in-process storage.
 	 *
-	 * Read by `TableReferenceNode.computePhysical` and propagated through the
-	 * subtree via the standard `expectedLatencyMs` max-merge. Consumers must
-	 * treat the value as a heuristic; correctness must never depend on it.
-	 */
-	readonly expectedLatencyMs?: number;
-
-	/**
-	 * Optional hint: wall-clock milliseconds per row an iterator over this
-	 * module's tables yields AFTER the first, in a sequential read — the
-	 * full-scan rate, which is what a module author can measure directly. Omit
-	 * (treated as 0) when rows arrive at in-process speed once the first is in
-	 * hand; a backend that answers one page or one row per request declares its
-	 * measured per-row figure so the planner prices a full read by the rows it
-	 * pulls instead of as one first-row delay. Declare only measured numbers.
+	 * Pick the `COST_PRESETS` entry for the category of storage the module sits
+	 * on — memory, local disk, browser storage, network, distributed — and spread
+	 * it to override a field you have measured:
+	 * `readonly costProfile = { ...COST_PRESETS.network, perRowLatencyMs: 0.02 }`.
+	 * Presets are categories, not measurements; never invent a precise number.
 	 *
-	 * Read by `TableReferenceNode.computePhysical` (finite positive values
-	 * only) and propagated upward as `max(children)`, like `expectedLatencyMs`.
-	 * Converted to engine cost units at `tuning.latencyCostPerMs`. A heuristic;
+	 * Resolved by `resolveModuleCostProfile` (a negative or non-finite field reads
+	 * as 0, with one warning at registration) and lifted onto the leaf's physical
+	 * properties by `TableReferenceNode.computePhysical`. A heuristic only;
 	 * correctness must never depend on it.
 	 */
-	readonly expectedRowLatencyMs?: number;
+	readonly costProfile?: ModuleCostProfile;
 
 	/**
 	 * Declares whether a `query()` iterator opened against a table of this module

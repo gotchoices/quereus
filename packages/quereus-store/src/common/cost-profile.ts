@@ -1,9 +1,10 @@
+import { resolveModuleCostProfile, type ModuleCostProfile } from '@quereus/quereus';
+
 /**
- * What a storage backend's basic read operations cost, declared by the provider and
- * consumed by store access planning (`store-module-access-plan.ts`) — plus the two other
- * provider-declared planner inputs resolved the same way, through
- * {@link resolveExpectedLatencyMs} (first-row and per-row latency, wall-clock rather than a
- * ratio; see its doc comment).
+ * What a storage backend's basic read operations cost, declared by the provider. Two
+ * halves with two consumers: the inherited engine {@link ModuleCostProfile} latencies
+ * (wall-clock milliseconds, read by the engine planner off the registered module) and the
+ * store-only ratios below (read by store access planning, `store-module-access-plan.ts`).
  *
  * The store framework already lets a provider declare things about itself that the
  * layers above must adapt to — `beginAtomicBatch`, `readCommittedSnapshot`,
@@ -14,15 +15,18 @@
  */
 
 /**
- * What one storage backend's basic operations cost, RELATIVE to reading one row
- * sequentially during a full scan (which is 1.0 by definition — the unit
- * `AccessPlanBuilder.fullScan` charges per row).
+ * What one storage backend's basic operations cost. The two inherited
+ * {@link ModuleCostProfile} fields (`firstRowLatencyMs`, `perRowLatencyMs`) are wall-clock
+ * milliseconds — start from the engine's `COST_PRESETS` entry for the backend's category.
+ * The two declared here are RELATIVE to reading one row sequentially during a full scan
+ * (which is 1.0 by definition — the unit `AccessPlanBuilder.fullScan` charges per row),
+ * and price the store's generic access planner only; the engine has no consumer for them.
  *
  * Every field is optional; an omitted field takes the parity default
  * ({@link PARITY_COST_PROFILE}), which reproduces the module's pre-profile constants
  * exactly. A provider that declares nothing plans byte-identically to before.
  *
- * A ratio rather than milliseconds, deliberately: these numbers are request-latency
+ * The ratios are ratios rather than milliseconds, deliberately: these numbers are request-latency
  * dominated, so a slower device scales both the seek path AND the scan baseline
  * together and the ratio survives. A wall-clock declaration would be wrong on every
  * device but the one it was measured on.
@@ -37,7 +41,7 @@
  * reads pricing very differently from data rows, add `entryRead` here AND give
  * `AccessPlanBuilder` a per-row-entry hook — do not restate its formula in this package.
  */
-export interface KVCostProfile {
+export interface KVCostProfile extends ModuleCostProfile {
 	/**
 	 * Resolving ONE secondary-index entry to the row it names — a random point read of
 	 * the data store, batched through `getMany` (`StoreTableScan` pages at
@@ -116,7 +120,7 @@ export function estimateSortCost(rows: number): number {
 
 /**
  * The module's pre-profile constants, and the default for any backend that declares
- * nothing. `pointRead: 1.0` says a resolved row costs about what a sequentially-iterated
+ * nothing. Zero latency (in-process, the engine's `COST_PRESETS.memory`); `pointRead: 1.0` says a resolved row costs about what a sequentially-iterated
  * row costs (true for an in-process, block-cached backend, where the index path simply
  * pays the row read ON TOP OF the entry read); `seekPositioning: 0.5` says positioning
  * one seek key costs half a sequentially scanned row.
@@ -127,11 +131,18 @@ export function estimateSortCost(rows: number): number {
 // Frozen because {@link resolveCostProfile} returns this very object (not a copy) for the
 // undeclared case, so every parity-backend module in the process shares one instance — and
 // it is a public export, reachable from JS that the interface's `readonly` cannot stop.
-export const PARITY_COST_PROFILE: ResolvedCostProfile = Object.freeze({ pointRead: 1.0, seekPositioning: 0.5 });
+export const PARITY_COST_PROFILE: ResolvedCostProfile = Object.freeze({
+	firstRowLatencyMs: 0,
+	perRowLatencyMs: 0,
+	pointRead: 1.0,
+	seekPositioning: 0.5,
+});
 
 /**
  * Fill in the parity defaults for whatever a provider left undeclared, replacing any
- * non-finite or non-positive field with its parity value.
+ * non-finite or non-positive ratio with its parity value. The two latencies resolve by the
+ * engine's own rule (`resolveModuleCostProfile`): `0` is a valid latency, so only a
+ * negative or non-finite one falls back (to 0).
  *
  * `costProfile` is an optional member of a PUBLIC interface, so a third-party provider
  * can declare anything at all. A bad declaration must not break planning (hence the
@@ -142,46 +153,17 @@ export const PARITY_COST_PROFILE: ResolvedCostProfile = Object.freeze({ pointRea
 export function resolveCostProfile(profile: KVCostProfile | undefined): ResolvedCostProfile {
 	if (!profile) return PARITY_COST_PROFILE;
 	return {
+		...resolveModuleCostProfile(profile, message => console.warn(`[StoreModule] provider ${message}`)),
 		pointRead: resolveCostField(profile.pointRead, 'pointRead'),
 		seekPositioning: resolveCostField(profile.seekPositioning, 'seekPositioning'),
 	};
 }
 
-/** The provider-declared latency fields {@link resolveExpectedLatencyMs} resolves. */
-export type LatencyField = 'expectedLatencyMs' | 'expectedRowLatencyMs';
-
-/**
- * A provider's declared latency — first-row ({@link KVStoreProvider.expectedLatencyMs}) or
- * per-row ({@link KVStoreProvider.expectedRowLatencyMs}), named by `field` for the warning —
- * or `0` when it declares none or declares something unusable.
- *
- * Lives beside the cost profile because both are provider-declared planner inputs resolved
- * once at module construction, but it is NOT part of {@link KVCostProfile} and does not
- * share its unit: the profile is a RATIO against one sequentially scanned row, this is
- * wall-clock milliseconds.
- *
- * Same public-interface reasoning as {@link resolveCostField} — a third-party provider can
- * declare anything, so a bad value must neither break planning (hence the fallback rather
- * than a throw) nor pass silently (hence the warning). One difference: `0` is a perfectly
- * valid latency, so only NEGATIVE and non-finite values are rejected here, where a cost
- * field also rejects `0`.
- */
-export function resolveExpectedLatencyMs(
-	declared: number | undefined,
-	field: LatencyField = 'expectedLatencyMs',
-): number {
-	if (declared === undefined) return 0;
-	if (!Number.isFinite(declared) || declared < 0) {
-		console.warn(
-			`[StoreModule] provider declares an unusable ${field} (${declared}); falling back to 0`,
-		);
-		return 0;
-	}
-	return declared;
-}
+/** The store-only ratio fields of a {@link KVCostProfile}. */
+type CostRatioField = Exclude<keyof KVCostProfile, keyof ModuleCostProfile>;
 
 /** One field's declared value, or its parity default when absent or unusable. */
-function resolveCostField(declared: number | undefined, field: keyof ResolvedCostProfile): number {
+function resolveCostField(declared: number | undefined, field: CostRatioField): number {
 	const parity = PARITY_COST_PROFILE[field];
 	if (declared === undefined) return parity;
 	if (!Number.isFinite(declared) || declared <= 0) {

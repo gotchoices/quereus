@@ -60,6 +60,8 @@ export {
 	planCodeFromKind,
 } from './vtab/idx-str.js';
 export type { BaseModuleConfig, CatalogObjectKind, EffectiveRowSource, ModuleRowCount, SchemaChangeInfo, VtabConcurrencyMode } from './vtab/module.js';
+export { COST_PRESETS, resolveModuleCostProfile } from './vtab/cost-profile.js';
+export type { ModuleCostProfile, ResolvedModuleCostProfile } from './vtab/cost-profile.js';
 export { getModuleConcurrencyMode, getModuleReadCommittedSnapshot, acquireConnectionLock } from './vtab/concurrency.js';
 
 // Module-author test support. Ships in the package deliberately — an out-of-tree

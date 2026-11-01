@@ -583,9 +583,11 @@ export interface PhysicalProperties {
    * on it for correctness (only as a fan-out savings hint).
    *
    * Propagation: unary/multi-input nodes inherit the max of children. Leaves
-   * declare their own value via `computePhysical`. Remote-vtab leaves should
-   * source this from their access plan; the in-tree default is 0 and the
-   * fan-out cost gate is intentionally inert until a remote plugin populates it.
+   * declare their own value via `computePhysical` — a table reference lifts its
+   * module's declared `costProfile.firstRowLatencyMs`. This property is the
+   * subtree's derived ESTIMATE; the module's DECLARATION is its cost profile.
+   * The in-tree default is 0 and the fan-out cost gate is intentionally inert
+   * until a module declares a profile that clears it.
    */
   expectedLatencyMs?: number;
 
@@ -597,7 +599,7 @@ export interface PhysicalProperties {
    * as `expectedLatencyMs + rowsRead × expectedRowLatencyMs`; a hint only.
    *
    * Propagation: max of children, like `expectedLatencyMs`. Leaves lift the
-   * module's `expectedRowLatencyMs` in `computePhysical`.
+   * module's declared `costProfile.perRowLatencyMs` in `computePhysical`.
    */
   expectedRowLatencyMs?: number;
 

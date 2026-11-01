@@ -320,59 +320,30 @@ export interface KVStoreOptions {
 // signatures to take the built name.
 export interface KVStoreProvider {
 	/**
-	 * How expensive this backend's basic read operations are, relative to reading one row
-	 * sequentially during a full scan. Omitted (and every omitted field within it) means
-	 * the parity defaults, which reproduce the module's pre-profile cost constants exactly
-	 * — so a provider that declares nothing plans byte-identically to before.
+	 * What this backend's reads cost: first-row and per-row latency in wall-clock
+	 * milliseconds (inherited from the engine's `ModuleCostProfile`), plus the store-only
+	 * ratios of a point read and a seek key against one sequentially scanned row. Omitted
+	 * (and every omitted field within it) means the parity defaults — zero latency and the
+	 * module's pre-profile ratio constants — so a provider that declares nothing plans
+	 * byte-identically to before.
+	 *
+	 * Surfaced by `StoreModule` as its resolved `VirtualTableModule.costProfile`; the engine
+	 * planner lifts the two latencies onto the table leaf's physical properties and
+	 * propagates them upward as `max(children)`, while the ratios price the store's own
+	 * access planner. A HEURISTIC — no answer depends on it, only plan choice.
 	 *
 	 * Declared on the PROVIDER rather than on a store because a cost profile is a property
 	 * of the BACKEND, one provider is the per-backend singleton, and `StoreModuleBase`
 	 * already holds the provider without having to open anything.
 	 *
-	 * Declare only MEASURED numbers. An unmeasured guess here is worse than the parity
-	 * default: it changes advertised costs for every query on the backend. See
-	 * {@link KVCostProfile}.
+	 * Declare the engine's `COST_PRESETS` entry for the category of backend you are
+	 * (`{ ...COST_PRESETS.localDisk }`), override with MEASURED numbers where you have them,
+	 * and never invent a precise number: the latencies feed literal millisecond gates
+	 * (`tuning.parallel.*ThresholdMs`, 25 ms today), and an unmeasured ratio changes
+	 * advertised costs for every query on the backend. See {@link KVCostProfile} and the
+	 * store README § Backend cost profile.
 	 */
 	readonly costProfile?: KVCostProfile;
-
-	/**
-	 * First-row latency, in MILLISECONDS, of an iterator opened over one of this backend's
-	 * stores — how long the first row takes to arrive, not the per-row cost of the rest.
-	 * Omitted means 0, which is what an in-process backend should leave it at.
-	 *
-	 * Surfaced by `StoreModule` as its `VirtualTableModule.expectedLatencyMs`, which the
-	 * planner lifts onto the table leaf's physical properties and propagates upward as
-	 * `max(children)`. It is a HEURISTIC — no answer depends on it, only plan choice.
-	 *
-	 * Declared on the PROVIDER for the same reason {@link costProfile} is: latency is a
-	 * property of the BACKEND, one provider is the per-backend singleton, and
-	 * `StoreModuleBase` already holds the provider without opening anything.
-	 *
-	 * Unlike {@link costProfile} this is wall-clock, NOT a ratio — the planner's gates on it
-	 * are literal millisecond thresholds (`tuning.parallel.batchedOuterThresholdMs` and
-	 * neighbours, all 25 ms today), so a device-relative number would not mean anything to
-	 * them. That makes an unmeasured guess worse here than the 0 default; declare only
-	 * MEASURED numbers, and see the store README (§ Backend first-row latency) for why no
-	 * in-tree provider declares one.
-	 */
-	readonly expectedLatencyMs?: number;
-
-	/**
-	 * Per-row latency, in MILLISECONDS, of a sequential iterate over one of this backend's
-	 * stores — the wall-clock each row AFTER the first takes to arrive (the full-scan rate,
-	 * which is what a backend author can measure directly). Omitted means 0: once the first
-	 * row is in hand the rest arrive at in-process speed, which is right for a backend that
-	 * pages a whole scan into memory in one request and wrong for one that answers a page or
-	 * a row per request.
-	 *
-	 * Surfaced by `StoreModule` as its `VirtualTableModule.expectedRowLatencyMs`; the
-	 * planner prices a side's full read as `expectedLatencyMs + rowsRead × expectedRowLatencyMs`
-	 * and a seek as `expectedLatencyMs + rowsPerSeek × expectedRowLatencyMs`. Independent of
-	 * {@link expectedLatencyMs} — a provider may declare either or both. Wall-clock and
-	 * validated exactly like it (finite and `>= 0`, else 0 with a warning); declare only
-	 * MEASURED numbers.
-	 */
-	readonly expectedRowLatencyMs?: number;
 
 	/**
 	 * Get or create a KVStore for a table's row data.

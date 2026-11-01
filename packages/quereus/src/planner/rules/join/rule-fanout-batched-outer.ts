@@ -134,10 +134,10 @@ export function toBatchedOuter(
 
 	// Latency gate: the slowest branch must clear the threshold. Inert on
 	// memory-vtab plans (expectedLatencyMs = 0 throughout).
-	// NOTE: reads the first-row hint only. A module declaring a per-row latency
-	// (`expectedRowLatencyMs`) with no first-row one never gets a batched seek,
-	// although batching would amortize its per-seek round trip just the same;
-	// no in-tree or known module declares that shape. If one does, gate on the
+	// NOTE: reads the first-row hint only. A module whose cost profile declares a
+	// per-row latency (`perRowLatencyMs`) with no first-row one never gets a
+	// batched seek, although batching would amortize its per-seek round trip just
+	// the same; no in-tree module or `COST_PRESETS` entry has that shape. If one does, gate on the
 	// per-seek drain (`firstRowMs + rowsPerSeek × rowMs`) instead.
 	let maxLatency = 0;
 	for (const b of node.branches) {

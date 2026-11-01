@@ -4679,7 +4679,7 @@ describe('IsolationModule', () => {
 });
 
 // ===========================================================================
-// concurrencyMode / expectedLatencyMs forwarding + ensureConnection reentrancy
+// concurrencyMode / costProfile forwarding + ensureConnection reentrancy
 //
 // IsolationModule forwards the underlying module's plan-level hints so a host
 // wrapping a reentrant module (e.g. Lamina over a Memory overlay) keeps the
@@ -4691,20 +4691,20 @@ describe('IsolationModule', () => {
 describe('IsolationModule concurrency + latency forwarding', () => {
 	/**
 	 * Minimal module stub exposing only the two forwarded hints. The forwarding
-	 * getters read just `concurrencyMode` / `expectedLatencyMs`; no create/connect
+	 * getters read just `concurrencyMode` / `costProfile`; no create/connect
 	 * is exercised for the getter-level assertions.
 	 */
-	function modeStub(concurrencyMode?: VtabConcurrencyMode, expectedLatencyMs?: number): VirtualTableModule<any, any> {
+	function modeStub(concurrencyMode?: VtabConcurrencyMode, firstRowLatencyMs?: number): VirtualTableModule<any, any> {
 		const m: Record<string, unknown> = {};
 		if (concurrencyMode !== undefined) m.concurrencyMode = concurrencyMode;
-		if (expectedLatencyMs !== undefined) m.expectedLatencyMs = expectedLatencyMs;
+		if (firstRowLatencyMs !== undefined) m.costProfile = { firstRowLatencyMs };
 		return m as unknown as VirtualTableModule<any, any>;
 	}
 
 	/** Functional memory module declaring a non-zero latency hint
 	 *  (reentrant-reads inherited from MemoryTableModule). */
 	class HighLatencyMemoryModule extends MemoryTableModule {
-		readonly expectedLatencyMs = 25;
+		readonly costProfile = { firstRowLatencyMs: 25 };
 	}
 
 	describe('forwarding (getter-level)', () => {
@@ -4736,19 +4736,19 @@ describe('IsolationModule concurrency + latency forwarding', () => {
 			expect(getModuleConcurrencyMode(iso)).to.equal('serial');
 		});
 
-		it('expectedLatencyMs absent on underlying → 0 (no hint)', () => {
+		it('costProfile absent on underlying → empty profile (no hint)', () => {
 			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads') });
-			expect(iso.expectedLatencyMs).to.equal(0);
+			expect(iso.costProfile).to.deep.equal({});
 		});
 
-		it('expectedLatencyMs forwarded from underlying (25)', () => {
+		it('costProfile forwarded from underlying (25)', () => {
 			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads', 25) });
-			expect(iso.expectedLatencyMs).to.equal(25);
+			expect(iso.costProfile.firstRowLatencyMs).to.equal(25);
 		});
 
-		it('expectedLatencyMs comes from the underlying, never the overlay', () => {
+		it('costProfile comes from the underlying, never the overlay', () => {
 			const iso = new IsolationModule({ underlying: modeStub('reentrant-reads', 25), overlay: modeStub('reentrant-reads', 999) });
-			expect(iso.expectedLatencyMs).to.equal(25);
+			expect(iso.costProfile.firstRowLatencyMs).to.equal(25);
 		});
 	});
 

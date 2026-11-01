@@ -14,7 +14,7 @@
  * Cost gate: anchored on `node.right.physical.expectedLatencyMs`, the same
  * field consumed by `rule-fanout-lookup-join` and `rule-async-gather-union-all`.
  * That field is 0 on every in-process / memory-vtab leaf and non-zero only
- * when a remote vtab plugin declares `expectedLatencyMs` at a leaf. As a
+ * when a remote vtab's cost profile declares a first-row latency. As a
  * consequence the rule is **inert by design on memory-vtab plans**, preserving
  * the local-only golden-plan invariant the parallel rules already lock. We gate
  * on the build side specifically: if `left` were the slow one the consumer

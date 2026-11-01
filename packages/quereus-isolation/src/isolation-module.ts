@@ -1,4 +1,4 @@
-import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, CatalogObjectKind, ViewSchema, ModuleRowCount } from '@quereus/quereus';
+import type { Database, VirtualTableModule, BaseModuleConfig, TableSchema, TableIndexSchema as IndexSchema, ModuleCapabilities, VirtualTable, BestAccessPlanRequest, BestAccessPlanResult, SchemaChangeInfo, Row, Schema, MappingAdvertisement, LensDeploymentSnapshot, VtabConcurrencyMode, VirtualTableConnection, BackingHost, EffectiveRowSource, CatalogObjectKind, ViewSchema, ModuleRowCount, ModuleCostProfile } from '@quereus/quereus';
 import { MemoryTableModule, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
 import type { ConnectionOverlayState, IsolationModuleConfig, Predicate, UnderlyingTableState } from './isolation-types.js';
 import { IsolatedTable } from './isolated-table.js';
@@ -284,9 +284,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * `'reentrant-reads'`: `IsolationModule`'s write path is never reentrant.
 	 *
 	 * A live getter (not a construction-time snapshot): the underlying's mode is
-	 * a static module property today, but mirroring `expectedLatencyMs` — whose
-	 * value is learned lazily at connect time — keeps both forwards reading live
-	 * each plan. Always returns a concrete value (never `undefined`), satisfying
+	 * a static module property today, but mirroring `costProfile` — whose value
+	 * an out-of-tree module may learn lazily at connect time — keeps both
+	 * forwards reading live each plan. Always returns a concrete value (never `undefined`), satisfying
 	 * the optional `concurrencyMode?` under `exactOptionalPropertyTypes`.
 	 */
 	get concurrencyMode(): VtabConcurrencyMode {
@@ -296,31 +296,20 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	}
 
 	/**
-	 * Forwards the underlying module's first-row-latency planner hint so a cold
-	 * `NodeFsProvider` / OPFS install's scan node carries the latency estimate
-	 * through the wrapper (read by `TableReferenceNode.computePhysical`, which
-	 * only lifts the value when `> 0`). The overlay is an in-memory staging table
-	 * with no meaningful latency, so only the underlying contributes.
+	 * Forwards the underlying module's cost profile so a wrapped slow backend's
+	 * scan node carries its latency estimate through the wrapper (read by
+	 * `TableReferenceNode.computePhysical`). The overlay is an in-memory staging
+	 * table with no meaningful latency, so only the underlying contributes; a
+	 * nested wrapper forwards by recursion.
 	 *
-	 * Returns `0` (never `undefined`) when the underlying declares none — `0` is
-	 * observably identical to omitting the hint, and a concrete value satisfies
-	 * the optional `expectedLatencyMs?` under `exactOptionalPropertyTypes`. A
-	 * getter, not a stored field: `LaminaModule.expectedLatencyMs` is itself a
-	 * getter whose value is learned lazily at connect time, so a construction-time
-	 * snapshot would capture a stale `0`.
+	 * Returns an empty profile (never `undefined`) when the underlying declares
+	 * none — observably identical to omitting it, and a concrete value satisfies
+	 * the optional `costProfile?` under `exactOptionalPropertyTypes`. A live
+	 * getter, not a stored field: an out-of-tree module may learn its profile
+	 * lazily at connect time, so a construction-time snapshot could go stale.
 	 */
-	get expectedLatencyMs(): number {
-		return this.underlying.expectedLatencyMs ?? 0;
-	}
-
-	/**
-	 * Forwards the underlying module's per-row-latency planner hint, for the same
-	 * reasons and in the same shape as {@link expectedLatencyMs}: only the
-	 * underlying contributes (the overlay is in-memory), `0` when undeclared, and a
-	 * live getter because an out-of-tree module may learn its value at connect time.
-	 */
-	get expectedRowLatencyMs(): number {
-		return this.underlying.expectedRowLatencyMs ?? 0;
+	get costProfile(): ModuleCostProfile {
+		return this.underlying.costProfile ?? {};
 	}
 
 	/**

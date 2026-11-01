@@ -7,6 +7,7 @@ import type { FunctionSchema } from './function.js';
 import { quereusError, QuereusError, RelationNotFoundError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type { AnyVirtualTableModule, BaseModuleConfig } from '../vtab/module.js';
+import { resolveModuleCostProfile } from '../vtab/cost-profile.js';
 import type { VirtualTable } from '../vtab/table.js';
 import type { ColumnSchema } from './column.js';
 import { foldDefaultToType } from '../types/validation.js';
@@ -356,6 +357,9 @@ export class SchemaManager {
 		if (this.modules.has(lowerName)) {
 			warnLog(`Replacing existing virtual table module: %s`, lowerName);
 		}
+		// Resolved here only to report a bad declaration once, naming the module;
+		// the planner re-resolves silently on every plan.
+		resolveModuleCostProfile(module.costProfile, message => warnLog('Module %s: %s', lowerName, message));
 		this.modules.set(lowerName, { module, auxData });
 		log(`Registered VTab module: %s`, lowerName);
 	}

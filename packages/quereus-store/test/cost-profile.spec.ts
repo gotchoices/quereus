@@ -172,9 +172,12 @@ const PLAN_CASES: ReadonlyArray<{ name: string; filters: PredicateConstraint[] }
 
 describe('store backend cost profile (store-backend-cost-profile)', () => {
 	describe('resolveCostProfile', () => {
+		/** The latency half every resolved profile carries when none is declared. */
+		const NO_LATENCY = { firstRowLatencyMs: 0, perRowLatencyMs: 0 };
+
 		it('an absent profile is the parity profile', () => {
-			expect(resolveCostProfile(undefined)).to.deep.equal({ pointRead: 1.0, seekPositioning: 0.5 });
-			expect(PARITY_COST_PROFILE).to.deep.equal({ pointRead: 1.0, seekPositioning: 0.5 });
+			expect(resolveCostProfile(undefined)).to.deep.equal({ ...NO_LATENCY, pointRead: 1.0, seekPositioning: 0.5 });
+			expect(PARITY_COST_PROFILE).to.deep.equal({ ...NO_LATENCY, pointRead: 1.0, seekPositioning: 0.5 });
 		});
 
 		it('an empty declaration takes both parity defaults', () => {
@@ -182,8 +185,8 @@ describe('store backend cost profile (store-backend-cost-profile)', () => {
 		});
 
 		it('a partial declaration keeps the parity default for the omitted field', () => {
-			expect(resolveCostProfile({ pointRead: 3 })).to.deep.equal({ pointRead: 3, seekPositioning: 0.5 });
-			expect(resolveCostProfile({ seekPositioning: 5 })).to.deep.equal({ pointRead: 1.0, seekPositioning: 5 });
+			expect(resolveCostProfile({ pointRead: 3 })).to.deep.equal({ ...NO_LATENCY, pointRead: 3, seekPositioning: 0.5 });
+			expect(resolveCostProfile({ seekPositioning: 5 })).to.deep.equal({ ...NO_LATENCY, pointRead: 1.0, seekPositioning: 5 });
 		});
 
 		describe('malformed declarations fall back PER FIELD, and say so', () => {
@@ -210,7 +213,7 @@ describe('store backend cost profile (store-backend-cost-profile)', () => {
 			for (const [label, bad] of cases) {
 				it(`a ${label} pointRead falls back, leaving a declared seekPositioning intact`, () => {
 					const resolved = resolveCostProfile({ ...bad, seekPositioning: 4 });
-					expect(resolved).to.deep.equal({ pointRead: PARITY_COST_PROFILE.pointRead, seekPositioning: 4 });
+					expect(resolved).to.deep.equal({ ...NO_LATENCY, pointRead: PARITY_COST_PROFILE.pointRead, seekPositioning: 4 });
 					expect(warnings, 'the bad field is not accepted silently').to.have.lengthOf(1);
 					expect(warnings[0]).to.contain('pointRead');
 				});
@@ -218,7 +221,7 @@ describe('store backend cost profile (store-backend-cost-profile)', () => {
 
 			it('a zero seekPositioning falls back, leaving a declared pointRead intact', () => {
 				const resolved = resolveCostProfile({ pointRead: 3, seekPositioning: 0 });
-				expect(resolved).to.deep.equal({ pointRead: 3, seekPositioning: PARITY_COST_PROFILE.seekPositioning });
+				expect(resolved).to.deep.equal({ ...NO_LATENCY, pointRead: 3, seekPositioning: PARITY_COST_PROFILE.seekPositioning });
 				expect(warnings).to.have.lengthOf(1);
 				expect(warnings[0]).to.contain('seekPositioning');
 			});

@@ -12,7 +12,7 @@
 import type { BaseModuleConfig, Database, LensDeploymentSnapshot, SqlValue, TableSchema } from '@quereus/quereus';
 import { QuereusError, StatusCode } from '@quereus/quereus';
 import type { KVStore, KVStoreProvider } from './kv-store.js';
-import { resolveCostProfile, resolveExpectedLatencyMs, type ResolvedCostProfile } from './cost-profile.js';
+import { resolveCostProfile, type ResolvedCostProfile } from './cost-profile.js';
 import type { StoreEventEmitter } from './events.js';
 import { TransactionCoordinator } from './transaction.js';
 import { StoreTable } from './store-table.js';
@@ -220,51 +220,26 @@ export abstract class StoreModuleBase {
 	protected readonly atomicProvider: boolean;
 
 	/**
-	 * What this provider's backend declares its basic reads to cost, relative to one
-	 * sequentially scanned row ({@link KVStoreProvider.costProfile}), with the parity
-	 * defaults filled in for whatever it left undeclared.
+	 * What this provider's backend declares its reads to cost
+	 * ({@link KVStoreProvider.costProfile}), with the parity defaults filled in for whatever
+	 * it left undeclared. PUBLIC because it IS the `VirtualTableModule.costProfile` field: a
+	 * superset of the engine's `ModuleCostProfile`, so `TableReferenceNode.computePhysical`
+	 * reads the two latencies straight off the registered module, while
+	 * `StoreModule.getBestAccessPlan` → `computeBestAccessPlan` reads the two ratios.
 	 *
 	 * Resolved once at construction for the same reason {@link atomicProvider} is: a
 	 * profile is a property of the BACKEND and so is fixed for the provider's lifetime,
-	 * and the consumer (`StoreModule.getBestAccessPlan` → `computeBestAccessPlan`) runs
-	 * per planned query. Resolving here also means a malformed third-party declaration
-	 * warns once at module construction rather than once per planned statement.
+	 * and both consumers run per planned query. Resolving here also means a malformed
+	 * third-party declaration warns once at module construction rather than once per
+	 * planned statement.
 	 */
-	protected readonly costProfile: ResolvedCostProfile;
-
-	/**
-	 * This module's `VirtualTableModule.expectedLatencyMs` — the first-row latency the
-	 * backend declares ({@link KVStoreProvider.expectedLatencyMs}), or `0` when it declares
-	 * none. PUBLIC because it IS the interface field: `TableReferenceNode.computePhysical`
-	 * reads it off the registered module.
-	 *
-	 * Resolved once at construction for the same reasons {@link costProfile} is — latency is
-	 * a property of the BACKEND and so fixed for the provider's lifetime, the consumer (the
-	 * planner) runs per planned query, and a malformed third-party declaration warns once at
-	 * module construction rather than once per planned statement.
-	 *
-	 * A concrete `0` rather than `undefined` when nothing is declared, matching
-	 * `IsolationModule.expectedLatencyMs`: `0` is observably identical to omitting the hint
-	 * (the leaf only lifts values `> 0`), and a concrete number satisfies the optional
-	 * `expectedLatencyMs?` under `exactOptionalPropertyTypes`.
-	 */
-	readonly expectedLatencyMs: number;
-
-	/**
-	 * This module's `VirtualTableModule.expectedRowLatencyMs` — the per-row latency the
-	 * backend declares ({@link KVStoreProvider.expectedRowLatencyMs}), or `0` when it declares
-	 * none. Resolved once at construction, and a concrete `0` rather than `undefined`, for the
-	 * same reasons as {@link expectedLatencyMs}.
-	 */
-	readonly expectedRowLatencyMs: number;
+	readonly costProfile: ResolvedCostProfile;
 
 	constructor(provider: KVStoreProvider, eventEmitter?: StoreEventEmitter) {
 		this.provider = provider;
 		this.eventEmitter = eventEmitter;
 		this.atomicProvider = typeof provider.beginAtomicBatch === 'function';
 		this.costProfile = resolveCostProfile(provider.costProfile);
-		this.expectedLatencyMs = resolveExpectedLatencyMs(provider.expectedLatencyMs);
-		this.expectedRowLatencyMs = resolveExpectedLatencyMs(provider.expectedRowLatencyMs, 'expectedRowLatencyMs');
 	}
 
 	/**

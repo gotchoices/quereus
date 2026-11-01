@@ -20,6 +20,7 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { getModuleConcurrencyMode } from '../../vtab/concurrency.js';
+import { resolveModuleCostProfile } from '../../vtab/cost-profile.js';
 import type { ColumnBindingProvider } from '../framework/characteristics.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
 import type { ColumnReferenceCapable } from '../framework/characteristics.js';
@@ -249,20 +250,14 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		// concurrent calls. The base PlanNode `physical` getter ANDs children's
 		// `concurrencySafe` automatically; here we set the leaf value.
 		out.concurrencySafe = getModuleConcurrencyMode(this.vtabModule) !== 'serial';
-		// expectedLatencyMs: pick up the module's declared hint. Local in-process
-		// modules omit it (0). Remote modules declare a non-zero value so the
-		// parallel fan-out rule can amortize per-branch latency. With no remote
-		// plugin in tree this stays 0 and the cost gate is inert by design.
-		// Both hints lift only finite positive values: a negative, NaN or
-		// Infinity declaration reads as 0 rather than poisoning a cost sum.
-		const moduleLatency = this.vtabModule.expectedLatencyMs;
-		if (typeof moduleLatency === 'number' && Number.isFinite(moduleLatency) && moduleLatency > 0) {
-			out.expectedLatencyMs = moduleLatency;
-		}
-		const moduleRowLatency = this.vtabModule.expectedRowLatencyMs;
-		if (typeof moduleRowLatency === 'number' && Number.isFinite(moduleRowLatency) && moduleRowLatency > 0) {
-			out.expectedRowLatencyMs = moduleRowLatency;
-		}
+		// The one place the module's DECLARATION (its cost profile) meets the
+		// subtree ESTIMATE (`expectedLatencyMs` / `expectedRowLatencyMs`, max of
+		// children above this leaf). In-process modules declare nothing (0), which
+		// leaves the latency-gated rules inert by design. Each key is set only when
+		// positive, so a memory leaf omits it — the plan goldens depend on that.
+		const profile = resolveModuleCostProfile(this.vtabModule.costProfile);
+		if (profile.firstRowLatencyMs > 0) out.expectedLatencyMs = profile.firstRowLatencyMs;
+		if (profile.perRowLatencyMs > 0) out.expectedRowLatencyMs = profile.perRowLatencyMs;
 		return out;
 	}
 

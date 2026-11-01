@@ -6,7 +6,7 @@
  * against a high-latency module overlap across outer rows.
  *
  * Two cost surfaces gate the candidate, both inert on memory-vtab plans:
- *   - the inner module's `expectedLatencyMs` (non-zero only via the synthetic
+ *   - the inner's `expectedLatencyMs` (non-zero only via the synthetic
  *     `HighLatencyMemoryModule`), read by `toBatchedOuter`'s latency gate and
  *     by the price itself, and
  *   - the outer's `physical.estimatedRows`, gated by

@@ -41,9 +41,11 @@ import { InMemoryKVStore } from '../common/memory-store.js';
 /** Options accepted by {@link createInMemoryProvider}. */
 export interface InMemoryProviderOptions {
 	/**
-	 * Forwarded verbatim as the provider's declared `costProfile`. Omitted (the default)
-	 * means the returned provider has no `costProfile` property at all — see the class doc
-	 * comment above for why that shape matters to `resolveCostProfile`'s parity path.
+	 * Forwarded verbatim as the provider's declared `costProfile` — latencies and ratios
+	 * alike, so a spec can stand this in-memory backend in for a slow one (e.g.
+	 * `{ firstRowLatencyMs: 25 }`). Omitted (the default) means the returned provider has no
+	 * `costProfile` property at all — see the class doc comment above for why that shape
+	 * matters to `resolveCostProfile`'s parity path.
 	 */
 	readonly costProfile?: KVCostProfile;
 }

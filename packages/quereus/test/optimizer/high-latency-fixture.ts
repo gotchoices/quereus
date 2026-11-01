@@ -23,11 +23,10 @@ export const HIGH_LATENCY_MS = DEFAULT_TUNING.parallel.gatherThresholdMs;
 
 /** Memory-backed table type that declares a slow first row. */
 export class HighLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = HIGH_LATENCY_MS;
+	readonly costProfile = { firstRowLatencyMs: HIGH_LATENCY_MS };
 }
 
 /** The same first-row delay plus a per-row rate: storage that answers one row per request. */
 export class PerRowLatencyMemoryModule extends MemoryTableModule {
-	readonly expectedLatencyMs = HIGH_LATENCY_MS;
-	readonly expectedRowLatencyMs = 1;
+	readonly costProfile = { firstRowLatencyMs: HIGH_LATENCY_MS, perRowLatencyMs: 1 };
 }

@@ -105,8 +105,9 @@ export class IndexedDBProvider implements KVStoreProvider {
 	 */
 	readonly costProfile: KVCostProfile = { pointRead: 3.0, seekPositioning: 5.0 };
 
-	// NOTE: neither `expectedLatencyMs` nor `expectedRowLatencyMs` declared, deliberately — and
-	// like the `costProfile` above that is a MEASURED decision, not the absence of one. The
+	// NOTE: neither `firstRowLatencyMs` nor `perRowLatencyMs` declared in the `costProfile`
+	// above, deliberately — and like its ratios that is a MEASURED decision, not the absence
+	// of one. The
 	// provider therefore resolves both to the 0 default, i.e. the planner treats this backend
 	// as in-process for latency purposes.
 	//
@@ -123,7 +124,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 	//    This backend's real latency clears none of them, so declaring it would not make
 	//    batched seeks, gathers or prefetch probes fire.
 	//  - THE NUMBERS HAVE NOT BEEN RE-MEASURED FOR THE PER-ROW MODEL. The planner now prices
-	//    a side's full read as `expectedLatencyMs + rowsRead × expectedRowLatencyMs`, each
+	//    a side's full read as `firstRowLatencyMs + rowsRead × perRowLatencyMs`, each
 	//    millisecond worth `tuning.latencyCostPerMs` (default 1000) engine cost units, so an
 	//    honest IndexedDB declaration would for the first time price its seeks and its paged
 	//    scans in the right proportion to engine work. But the bench's arms were designed to
@@ -133,7 +134,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 	//    still a net-negative skew (it reaches the per-seek charge and nothing else).
 	//
 	// REVISIT in `backlog/feat-indexeddb-declares-its-read-latency`: re-measure both hints
-	// in a real browser, declare `expectedLatencyMs` and `expectedRowLatencyMs` together, and
+	// in a real browser, declare `firstRowLatencyMs` and `perRowLatencyMs` together, and
 	// settle whether the 25 ms gates should become cost-based for a sub-millisecond backend.
 	// As with the cost profile above, DELIBERATELY NO DECIMALS QUOTED: the bench README holds
 	// the tables, this comment holds the decision.
