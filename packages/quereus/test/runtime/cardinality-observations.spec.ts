@@ -84,8 +84,9 @@ describe('Cardinality feedback scan observations', () => {
 		expect(rowsPerKeyBig()).to.deep.equal([]);
 	});
 
-	// Read through the diagnostic function, so its column mapping is pinned here too; the
-	// baseline is the 10% of 20,000 the seek's plan was priced with.
+	// Read through the diagnostic function, so its column mapping is pinned here too. The
+	// seek's plan was priced at 10% of 20,000, so the one sample shifts and the mean is the
+	// baseline afterwards.
 	it('records the rows an exhausted equality seek through a non-unique index yielded as one rows-per-key sample', async () => {
 		await indexKAndLearnSize();
 		await drain('select * from big where k = 7');
@@ -93,7 +94,7 @@ describe('Cardinality feedback scan observations', () => {
 		for await (const row of db.eval('select * from cardinality_feedback_keys()')) keyRows.push(row);
 		expect(keyRows).to.deep.equal([{
 			schema_name: 'main', table_name: 'big', key_columns: 'k', rows_per_key: 4, samples: 1,
-			baseline_rows_per_key: 2000, shifts: 0,
+			baseline_rows_per_key: 4, shifts: 1,
 		}]);
 	});
 
@@ -123,15 +124,16 @@ describe('Cardinality feedback scan observations', () => {
 
 	// The full scan is held with the seeks and recorded first at commit, so it opens the
 	// table-size gate for the two samples held behind it, summed across executions. The
-	// seeks were planned while `big` still plans at the 1000-row default, so the baseline
-	// is the 100 rows per key those plans were priced with, not the 2000 a known size gives.
+	// seeks were planned while `big` still plans at the 1000-row default, so the batch's
+	// baseline is the 100 rows per key those plans were priced with (not the 2000 a known
+	// size gives); 4 against it is one shift.
 	it('holds rows-per-key samples made inside a transaction until it commits, behind the same count', async () => {
 		await db.exec('create index big_k on big (k)');
 		await db.exec('begin; select * from big; select * from big where k = 7; select * from big where k = 5000;');
 		expect(rowsPerKeyBig()).to.deep.equal([]);
 		await db.exec('commit');
 		expect(rowsPerKeyBig()).to.deep.equal([
-			{ keyColumns: ['k'], rowsPerKey: 4, samples: 2, baselineRowsPerKey: 100, shifts: 0 },
+			{ keyColumns: ['k'], rowsPerKey: 4, samples: 2, baselineRowsPerKey: 4, shifts: 1 },
 		]);
 	});
 

@@ -1,8 +1,9 @@
 /**
  * Cardinality feedback, planner half: the observed row-count overlay's record/shift
  * policy (docs/progressive-optimizer.md §3.4), its precedence against module-reported
- * and catalog counts at the one base-table row-count seam (`plannedRowCount`, §3.3), and
- * re-planning prepared statements on a shift or a module-reported size drift (§3.6).
+ * and catalog counts at the one base-table row-count seam (`plannedRowCount`, §3.3), the
+ * rows-per-key override's precedence against catalog statistics (`plannedRowsPerKey`),
+ * and re-planning prepared statements on a shift or a module-reported size drift (§3.6).
  *
  * The policy tests construct their own `CardinalityFeedbackManager` over the database's
  * schema manager so they can watch `onShift` directly and vary the tuning per test.
@@ -14,7 +15,7 @@ import type { Statement } from '../../src/core/statement.js';
 import { CardinalityFeedbackManager, FeedbackReplanState } from '../../src/core/database-cardinality-feedback.js';
 import { DEFAULT_TUNING, type OptimizerTuning } from '../../src/planner/optimizer-tuning.js';
 import { CatalogStatsProvider } from '../../src/planner/stats/catalog-stats.js';
-import { databaseRowCountSources } from '../../src/planner/stats/table-cardinality.js';
+import { databaseRowCountSources, plannedRowsPerKey } from '../../src/planner/stats/table-cardinality.js';
 import type { TableSchema } from '../../src/schema/table.js';
 import { MemoryTableModule } from '../../src/vtab/memory/module.js';
 import type { ModuleRowCount } from '../../src/vtab/module.js';
@@ -48,6 +49,11 @@ describe('Cardinality feedback overlay', () => {
 		const found = db.schemaManager.findTable(name, 'main');
 		if (!found) throw new Error(`table ${name} not found`);
 		return found;
+	}
+
+	/** The emit-time spec of a seek on `columns`, planned at `plannedRowsPerKey` rows per key. */
+	function spec(columns: number[], plannedRowsPerKey = 2000) {
+		return { columns, key: columns.join(','), plannedRowsPerKey };
 	}
 
 	describe('record policy', () => {
@@ -149,16 +155,11 @@ describe('Cardinality feedback overlay', () => {
 			expect(overlay.snapshot()).to.deep.equal([]);
 		});
 
-		/** The emit-time spec of a seek on `columns`, planned at `plannedRowsPerKey` rows per key. */
-		function spec(columns: number[], plannedRowsPerKey = 2000) {
-			return { columns, key: columns.join(','), plannedRowsPerKey };
-		}
-
 		function rowsPerKey(t: TableSchema) {
 			return overlay.snapshot().find(entry => entry.tableName === t.name)?.perKey ?? [];
 		}
 
-		it('records rows per key only for a table planned above minRows, with the planned rows per key as baseline', () => {
+		it('records rows per key only for a table planned above minRows, shifting on a 10x move of the mean from the planned baseline', () => {
 			const t = table('t');
 
 			// `t` plans at the 1000-row default: nothing is learned about its keys.
@@ -166,11 +167,21 @@ describe('Cardinality feedback overlay', () => {
 			expect(overlay.snapshot()).to.deep.equal([]);
 
 			overlay.record(t, 20_000);
+			shifts.length = 0;
+			// 4 against the 2000 the plan priced the seek at: a shift, and the mean is the new baseline.
 			overlay.recordRowsPerKey(t, spec([0]), 40, 10);
 			expect(rowsPerKey(t)).to.deep.equal([
-				{ keyColumns: ['id'], rowsPerKey: 4, samples: 10, baselineRowsPerKey: 2000, shifts: 0 },
+				{ keyColumns: ['id'], rowsPerKey: 4, samples: 10, baselineRowsPerKey: 4, shifts: 1 },
 			]);
+			expect(shifts).to.deep.equal(['main.t']);
 			expect(overlay.snapshot()[0].observations).to.equal(2);
+			expect(overlay.observedRowsPerKey(t, [0])).to.equal(4);
+
+			// Mean 7 against baseline 4: within 10x, recorded silently.
+			overlay.recordRowsPerKey(t, spec([0], 4), 100, 10);
+			expect(rowsPerKey(t)[0]).to.include({ rowsPerKey: 7, baselineRowsPerKey: 4, shifts: 1 });
+			expect(shifts).to.have.length(1);
+			expect(overlay.observedRowsPerKey(t, [1]), 'another column set').to.equal(undefined);
 		});
 
 		it('tracks the exact running mean up to 32 samples, then weighs each sample 1/32, and a window-sized batch replaces it', () => {
@@ -236,9 +247,21 @@ describe('Cardinality feedback overlay', () => {
 		await db.exec('create table mid (id integer primary key, big_id integer, x integer)');
 	}
 
+	// A non-unique index on a foreign key: without statistics the module prices a seek at
+	// 10% of `child` per key, which with `child` known at 8,000 rows makes the index-nested-loop
+	// candidate dearer than hashing the whole table; four rows per key makes it the winner.
+	const parentChildSql = "select p.name, c.note from parent p join child c on c.parent_id = p.id where p.name = 'p7'";
+	const CHILD_PARENT_ID = 1;
+
+	async function createParentChild(): Promise<void> {
+		await db.exec('create table parent (id integer primary key, name text)');
+		await db.exec('create table child (id integer primary key, parent_id integer, note text)');
+		await db.exec('create index child_parent on child (parent_id)');
+	}
+
 	describe('precedence', () => {
-		function planNodeTypes(): Record<string, number> {
-			const stmt = db.prepare(joinSql);
+		function planNodeTypes(sql = joinSql): Record<string, number> {
+			const stmt = db.prepare(sql);
 			try {
 				return stmt.getPlanShape().nodeTypes;
 			} finally {
@@ -261,6 +284,42 @@ describe('Cardinality feedback overlay', () => {
 			const observed = planNodeTypes();
 			expect(observed).to.include.keys('Join', 'IndexSeek');
 			expect(observed).to.not.have.property('HashJoin');
+		});
+
+		it('an observed rows per key reaches the seek and the join candidate unless the catalog covers the column set', async () => {
+			await createParentChild();
+			const overlay = db._cardinalityFeedback;
+			overlay.record(table('child'), 8000);
+			const unobserved = planNodeTypes(parentChildSql);
+			expect(unobserved).to.include.keys('HashJoin');
+			expect(unobserved).to.not.have.property('IndexSeek');
+
+			overlay.recordRowsPerKey(table('child'), spec([CHILD_PARENT_ID], 800), 40, 10);
+			expect(plannedRowsPerKey(table('child'), [CHILD_PARENT_ID], db._rowCountSources)).to.equal(4);
+			const observed = planNodeTypes(parentChildSql);
+			expect(observed).to.include.keys('Join', 'IndexSeek');
+			expect(observed).to.not.have.property('HashJoin');
+
+			// Statistics covering `parent_id`: the catalog wins even over an entry recorded
+			// against the analyzed schema, and the module's statistics-backed estimate stands.
+			await db.exec("insert into child select value, (value - 1) % 2000 + 1, 'n' || value from generate_series(1, 8000)");
+			await db.exec('analyze child');
+			overlay.recordRowsPerKey(table('child'), spec([CHILD_PARENT_ID], 800), 40, 10);
+			expect(overlay.observedRowsPerKey(table('child'), [CHILD_PARENT_ID])).to.equal(4);
+			expect(plannedRowsPerKey(table('child'), [CHILD_PARENT_ID], db._rowCountSources)).to.equal(undefined);
+
+			// Statistics covering only some columns of a composite set (a column added since
+			// the last ANALYZE): coverage fails wholesale and the observation answers, as both
+			// modules' fallback does. The memory backend drops statistics on ALTER, so the
+			// partly-covered schema is a by-value copy with one column's entry removed.
+			const analyzed = table('child');
+			const partial = new Map(analyzed.statistics!.columnStats);
+			partial.delete('note');
+			const partlyCovered: TableSchema = { ...analyzed, statistics: { ...analyzed.statistics!, columnStats: partial } };
+			const note = analyzed.columns.findIndex(c => c.name === 'note');
+			const sources = { ...db._rowCountSources, observedRowsPerKey: () => 2.4 };
+			expect(plannedRowsPerKey(partlyCovered, [CHILD_PARENT_ID, note], sources)).to.equal(2);
+			expect(plannedRowsPerKey(partlyCovered, [CHILD_PARENT_ID], sources)).to.equal(undefined);
 		});
 
 		it('ranks exact module count, observed, approximate module count, catalog, then default', async () => {
@@ -308,6 +367,50 @@ describe('Cardinality feedback overlay', () => {
 				// The shift only marked the cached plan; it is dropped when the next run starts.
 				expect(stmt.getPlanShape().nodeTypes).to.include.keys('HashJoin');
 				expect(await joinedWs(stmt)).to.deep.equal(first);
+
+				const replanned = stmt.getPlanShape().nodeTypes;
+				expect(replanned).to.include.keys('Join', 'IndexSeek');
+				expect(replanned).to.not.have.property('HashJoin');
+			} finally {
+				await stmt.finalize();
+			}
+		});
+
+		it('re-plans at the execution after one-shot seeks shifted the rows per key of a table it reads', async () => {
+			await db.exec('pragma cardinality_feedback = true');
+			await createParentChild();
+			await db.exec("insert into parent select value, 'p' || value from generate_series(1, 2000)");
+			await db.exec("insert into child select value, (value - 1) % 2000 + 1, 'n' || value from generate_series(1, 8000)");
+			async function notes(stmt: Statement): Promise<string[]> {
+				const out: string[] = [];
+				for await (const row of stmt.all()) out.push(row.note as string);
+				return out.sort();
+			}
+
+			const stmt = db.prepare(parentChildSql);
+			try {
+				expect(stmt.getPlanShape().nodeTypes).to.include.keys('HashJoin');
+				// Scans both tables in full: `child` is recorded at 8,000 — under 10x of the
+				// default, so no count shift — which opens its rows-per-key gate.
+				const first = await notes(stmt);
+				expect(first).to.have.length(4);
+
+				// Each one-shot seek yields the parent's four children; the first sample (4
+				// against the 800 its plan priced the seek at) shifts, the rest agree with the mean.
+				for (const parentId of [1, 2, 3]) {
+					let rows = 0;
+					for await (const _row of db.eval('select note from child where parent_id = ?', [parentId])) rows++;
+					expect(rows).to.equal(4);
+				}
+				const [child] = db._cardinalityFeedback.snapshot().filter(entry => entry.tableName === 'child');
+				expect(child.shifts, 'no count shift').to.equal(0);
+				expect(child.perKey).to.deep.equal([
+					{ keyColumns: ['parent_id'], rowsPerKey: 4, samples: 3, baselineRowsPerKey: 4, shifts: 1 },
+				]);
+
+				// The shift only marked the cached plan; it is dropped when the next run starts.
+				expect(stmt.getPlanShape().nodeTypes).to.include.keys('HashJoin');
+				expect(await notes(stmt)).to.deep.equal(first);
 
 				const replanned = stmt.getPlanShape().nodeTypes;
 				expect(replanned).to.include.keys('Join', 'IndexSeek');

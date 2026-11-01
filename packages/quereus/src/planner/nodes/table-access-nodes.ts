@@ -9,7 +9,8 @@ import { TableReferenceNode } from './reference.js';
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
 import { Cached } from '../../util/cached.js';
-import type { FilterInfo } from '../../vtab/filter-info.js';
+import { equalitySeekKeyColumns, type FilterInfo } from '../../vtab/filter-info.js';
+import { plannedRowsPerKey } from '../stats/table-cardinality.js';
 import type { ScalarPlanNode } from './plan-node.js';
 import type { TableAccessCapable } from '../framework/characteristics.js';
 import { addSingletonFd } from '../util/fd-utils.js';
@@ -424,6 +425,20 @@ export function assertSeekKeysRowIndependent(
 export class IndexSeekNode extends TableAccessNode {
 	override readonly nodeType = PlanNodeType.IndexSeek;
 
+	/**
+	 * The rows per key the observed overlay holds for this seek's equality column set
+	 * (`plannedRowsPerKey`, docs/progressive-optimizer.md §3.3), snapshotted at
+	 * construction exactly as `TableReferenceNode.plannedRows` is, so clones through
+	 * `withChildren` / `withProvenance` re-derive the same number within one synchronous
+	 * compile. Undefined when the seek is not a single-key equality seek through a
+	 * non-unique index (`equalitySeekKeyColumns`), when the catalog's statistics cover the
+	 * set, when nothing has been observed, or when the node was built without a schema
+	 * manager (planner unit tests). Relayed as `estimatedRows`; the module's own
+	 * `filterInfo.indexInfoOutput.estimatedRows` is left as the module stated it, since the
+	 * join rules compare that in the module's currency.
+	 */
+	public readonly plannedRowsPerKey: number | undefined;
+
 	constructor(
 		scope: Scope,
 		source: TableReferenceNode,
@@ -480,6 +495,10 @@ export class IndexSeekNode extends TableAccessNode {
 	) {
 		super(scope, source, filterInfo, estimatedCostOverride);
 		assertSeekKeysRowIndependent(source, seekKeys, indexName);
+		const keyColumns = equalitySeekKeyColumns(filterInfo);
+		this.plannedRowsPerKey = keyColumns === undefined
+			? undefined
+			: plannedRowsPerKey(source.tableSchema, keyColumns, source.schemaManager?.getRowCountSources());
 	}
 
 	getAccessMethod(): 'index-seek' {
@@ -527,11 +546,13 @@ export class IndexSeekNode extends TableAccessNode {
 		}
 		const base = {
 			ordering: this.providesOrdering,
-			// The module's own row estimate for the access plan it chose, threaded here
-			// by `rule-select-access-path.selectPhysicalNode`. It is the only number that
-			// tracks what this particular seek matches; the constant that used to sit
-			// here made every non-PK seek advertise the same cardinality whatever it
-			// returned, and every cost decision above the seek reads this.
+			// The observed rows per key when the overlay answered for this seek's column set
+			// (snapshotted at construction), else the module's own row estimate for the
+			// access plan it chose, threaded here by `rule-select-access-path.
+			// selectPhysicalNode`. The module's number is the only one that tracks what this
+			// particular seek matches; the constant that used to sit here made every non-PK
+			// seek advertise the same cardinality whatever it returned, and every cost
+			// decision above the seek reads this.
 			//
 			// NOTE: "the module supplied no estimate" is not distinguishable at this
 			// point, by design. The rule builds this field as `accessPlan.rows ?? 1000`,
@@ -542,7 +563,7 @@ export class IndexSeekNode extends TableAccessNode {
 			// `undefined` (the catalog layer's spelling, see
 			// `planner/stats/table-cardinality.ts`), change it there — do not invent a
 			// second convention here.
-			estimatedRows: Number(this.filterInfo.indexInfoOutput.estimatedRows),
+			estimatedRows: this.plannedRowsPerKey ?? Number(this.filterInfo.indexInfoOutput.estimatedRows),
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,
 			constantBindings: sourcePhysical?.constantBindings,
@@ -605,7 +626,9 @@ export class IndexSeekNode extends TableAccessNode {
 			indexName: this.indexName,
 			seekKeys: this.seekKeys.map(key => key.toString()),
 			isRange: this.isRange,
-			providesOrdering: this.providesOrdering
+			providesOrdering: this.providesOrdering,
+			// Only when it answered, so plans over unobserved tables keep their shape in snapshots.
+			...(this.plannedRowsPerKey !== undefined ? { observedRowsPerKey: this.plannedRowsPerKey } : {}),
 		};
 	}
 

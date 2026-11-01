@@ -20,10 +20,21 @@ import type { TableSchema } from '../schema/table.js';
 export interface RowsPerKeySpec {
 	/** Sorted, de-duplicated base-column indexes of the seek's equality constraints. */
 	readonly columns: readonly number[];
-	/** `columns.join(',')` — the overlay's key for the column set within a table. */
+	/** {@link columnSetKey} of `columns` — the overlay's key for the column set within a table. */
 	readonly key: string;
-	/** The module's `estimatedRows` for this seek — what the plan used; a new entry's baseline. */
+	/**
+	 * The rows per key the plan priced this seek at — the overlay's observed mean when
+	 * one answered at plan time, else the module's `estimatedRows`; a new entry's baseline.
+	 */
 	readonly plannedRowsPerKey: number;
+}
+
+/**
+ * The overlay's key for an equality column set within one table. Shared by the scan
+ * leaf's spec and the planner's reader so the two cannot spell one set two ways.
+ */
+export function columnSetKey(columns: readonly number[]): string {
+	return columns.join(',');
 }
 
 /** Samples of one column set's rows per key, summed within one execution. */

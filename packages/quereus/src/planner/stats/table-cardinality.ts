@@ -12,6 +12,13 @@
  * {@link RowCountSources}, so scan cardinality and the stats-provider estimate cannot
  * drift apart within one plan.
  *
+ * The same sources carry the overlay's observed rows per key of an equality seek,
+ * read through {@link plannedRowsPerKey} by `IndexSeekNode` (what the seek advertises)
+ * and the index-nested-loop candidate (what one seek costs). That reader overrides only
+ * the engine's own consumers of a module's `rows` estimate; the module's cost, its
+ * `rows` and its access-path choice stay in the module's currency
+ * (docs/optimizer-costing.md § Where a module's own SELECTIVITY fits).
+ *
  * There are exactly two spellings: `undefined` means "nobody knows" and a number —
  * including a real 0 — means "measured". `undefined` must stay `undefined` here:
  * callers apply their own fallback (e.g. NaiveStatsProvider's default of 1000), and
@@ -67,18 +74,35 @@ export function catalogRowCount(table: TableSchema): number | undefined {
 }
 
 /**
- * Everything {@link plannedRowCount} ranks besides the catalog. One per `Database`
- * ({@link databaseRowCountSources}), shared by every planner reader.
+ * Rows per key observed during execution for equality seeks through non-unique indexes,
+ * per table and equality column set (docs/progressive-optimizer.md §3.1). Same validity
+ * rule as {@link ObservedRowCounts}: an entry answers only for the `TableSchema` object it
+ * was observed against.
  */
-export interface RowCountSources extends ObservedRowCounts {
+export interface ObservedKeyCardinalities {
+	/**
+	 * The running mean of rows one key of `columns` matched on `table`, or undefined when
+	 * nothing is held for that set. `columns` are sorted, de-duplicated base-column indexes
+	 * — the spelling `equalitySeekKeyColumns` (`vtab/filter-info.ts`) produces.
+	 */
+	observedRowsPerKey(table: TableSchema, columns: readonly number[]): number | undefined;
+}
+
+/**
+ * Everything {@link plannedRowCount} and {@link plannedRowsPerKey} rank besides the
+ * catalog. One per `Database` ({@link databaseRowCountSources}), shared by every planner
+ * reader.
+ */
+export interface RowCountSources extends ObservedRowCounts, ObservedKeyCardinalities {
 	/** The table's module's own count — {@link reportedRowCount}. */
 	reportedRows(table: TableSchema): ModuleRowCount | undefined;
 }
 
 /** The database's row-count sources: its observed overlay, and its tables' modules. */
-export function databaseRowCountSources(db: Database, observed: ObservedRowCounts): RowCountSources {
+export function databaseRowCountSources(db: Database, observed: ObservedRowCounts & ObservedKeyCardinalities): RowCountSources {
 	return {
 		observedRows: table => observed.observedRows(table),
+		observedRowsPerKey: (table, columns) => observed.observedRowsPerKey(table, columns),
 		reportedRows: table => reportedRowCount(db, table),
 	};
 }
@@ -148,4 +172,45 @@ export function plannedRowCount(table: TableSchema, sources: RowCountSources | u
 function raiseToFloor(rows: number | undefined, floor: number | undefined): number | undefined {
 	if (floor === undefined) return rows;
 	return rows === undefined ? floor : Math.max(rows, floor);
+}
+
+/**
+ * The rows per key the planner prices a single-key equality seek on `columns` at, or
+ * `undefined` to leave the module's own estimate standing (docs/progressive-optimizer.md
+ * §3.3):
+ *
+ * 1. when the catalog's statistics cover the column set — `table.statistics` with a
+ *    positive `rowCount` and a `columnStats` entry for every column — the catalog wins and
+ *    nothing is overridden: the module's statistics-backed estimate is the engine's own
+ *    `estimateLeaf` arithmetic over the same numbers, and the count rule (newest exact
+ *    wins) does not transfer to a mean sampled under some bindings and not others.
+ *    Coverage is all-or-nothing, the rule both shipped modules apply before mixing a
+ *    measured factor with a shape constant;
+ * 2. otherwise the overlay's mean for the set, rounded and floored at one row — the
+ *    module's `Math.max(1, …)` floor, so a key that matched nothing so far does not price a
+ *    seek at nothing;
+ * 3. otherwise `undefined`.
+ *
+ * NOTE: catalog-wins is a first rule, not a measured one; an `ANALYZE` snapshot can be
+ * older than the mean. Reconsider only against a measured case where the stale catalog
+ * loses a plan the mean would have won.
+ */
+export function plannedRowsPerKey(
+	table: TableSchema,
+	columns: readonly number[],
+	sources: RowCountSources | undefined,
+): number | undefined {
+	if (sources === undefined || catalogCoversColumns(table, columns)) return undefined;
+	const mean = sources.observedRowsPerKey(table, columns);
+	return mean === undefined ? undefined : Math.max(1, Math.round(mean));
+}
+
+/** True when the catalog holds a usable row count and column statistics for every column in `columns`. */
+function catalogCoversColumns(table: TableSchema, columns: readonly number[]): boolean {
+	const stats = table.statistics;
+	if (!stats || stats.rowCount <= 0) return false;
+	return columns.every(i => {
+		const name = table.columns[i]?.name;
+		return name !== undefined && stats.columnStats.has(name.toLowerCase());
+	});
 }

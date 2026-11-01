@@ -4,9 +4,10 @@
  * One per `Database`. The planner reads it through `plannedRowCount`
  * (`planner/stats/table-cardinality.ts`), where an answering entry outranks the
  * catalog's `ANALYZE` count and a module's approximate count, but not a module's
- * exact one. This module owns the record policy — which
- * observations are worth keeping, and when one has moved far enough from what
- * plans were costed against to call it a *shift* — and the entries' lifetime.
+ * exact one, and through `plannedRowsPerKey`, where an entry's rows per key answers
+ * unless the catalog's statistics cover the column set. This module owns the record
+ * policy — which observations are worth keeping, and when one has moved far enough
+ * from what plans were costed against to call it a *shift* — and the entries' lifetime.
  *
  * Validity is schema identity: an entry answers only for the exact `TableSchema`
  * object it was observed under. Any swap (`ANALYZE`, `ALTER TABLE`, drop and
@@ -34,8 +35,11 @@
 
 import { createLogger } from '../common/logger.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
-import { CardinalityObservations, type RowsPerKeySamples, type RowsPerKeySpec } from '../runtime/cardinality-observations.js';
-import { catalogRowCount, moduleReportsRowCount, plannedRowCount, type ObservedRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
+import { CardinalityObservations, columnSetKey, type RowsPerKeySamples, type RowsPerKeySpec } from '../runtime/cardinality-observations.js';
+import {
+	catalogRowCount, moduleReportsRowCount, plannedRowCount,
+	type ObservedKeyCardinalities, type ObservedRowCount, type ObservedRowCounts,
+} from '../planner/stats/table-cardinality.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import type { TableSchema } from '../schema/table.js';
@@ -55,9 +59,10 @@ export interface CardinalityFeedbackManagerContext {
 	/** The table's module's own count (`RowCountSources.reportedRows`), ranked with this overlay's entry. */
 	reportedRows(table: TableSchema): ModuleRowCount | undefined;
 	/**
-	 * A recorded count moved at least `cardinalityFeedback.shiftFactor` away from the
-	 * entry's baseline: plans costed against the old number may be wrong. `key` is the
-	 * lowercased `schema.table`.
+	 * A recorded count, floor or rows-per-key mean moved at least
+	 * `cardinalityFeedback.shiftFactor` away from its baseline: plans costed against the
+	 * old number may be wrong. `key` is the lowercased `schema.table` — one key for every
+	 * kind, so a per-key shift re-plans every statement reading the table, seeking or not.
 	 */
 	onShift(key: string): void;
 }
@@ -74,9 +79,8 @@ interface PerKeyEntry {
 	mean: number;
 	/** Samples folded into `mean` so far. */
 	samples: number;
-	/** The estimate planning used before the first record (the module's), or the mean at the last shift. */
+	/** The rows per key planning priced the seek at before the first record, or the mean at the last shift. */
 	baseline: number;
-	// NOTE: stays 0 here; `cardinality-feedback-rows-per-key` adds shift detection on a record.
 	shifts: number;
 }
 
@@ -284,7 +288,7 @@ function currentPlannedRows(db: Database, table: TableSchema): number {
 	return plannedRowCount(table, db._rowCountSources) ?? db.optimizer.tuning.defaultRowEstimate;
 }
 
-export class CardinalityFeedbackManager implements ObservedRowCounts {
+export class CardinalityFeedbackManager implements ObservedRowCounts, ObservedKeyCardinalities {
 	/**
 	 * Lowercased `schema.table` → entry, the change-log / work-counter key convention.
 	 * `Map` insertion order doubles as recency: a hit or a record re-inserts, so the
@@ -311,6 +315,17 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		if (!entry || entry.schema !== table) return undefined;
 		this.touch(key, entry);
 		return entry;
+	}
+
+	/** The running mean for `columns` on `table`, under the same identity rule as {@link observedRows}; a hit refreshes the table's recency. */
+	observedRowsPerKey(table: TableSchema, columns: readonly number[]): number | undefined {
+		const key = tableKey(table);
+		const entry = this.entries.get(key);
+		if (!entry || entry.schema !== table) return undefined;
+		const keyEntry = entry.perKey.get(columnSetKey(columns));
+		if (!keyEntry) return undefined;
+		this.touch(key, entry);
+		return keyEntry.mean;
 	}
 
 	/**
@@ -372,6 +387,8 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * itself. A new column-set entry's baseline is the rows per key the plan was priced
 	 * with; the table remembers at most `maxKeySetsPerTable` sets, least recently recorded
 	 * evicted. Accepted bias: frequently probed keys weigh more than a uniform sample would.
+	 * Reported through `onShift` under the table's key when the folded mean has moved
+	 * `shiftFactor` from the set's baseline — the count rule, applied to the mean.
 	 */
 	recordRowsPerKey(table: TableSchema, spec: RowsPerKeySpec, sum: number, count: number): void {
 		if (count <= 0 || this.isSuperseded(table)) return;
@@ -397,6 +414,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		}
 		debugLog('Recorded %d rows per key over %d samples for %s (%s) (mean now %d, baseline %d)',
 			batchMean, count, key, spec.key, keyEntry.mean, keyEntry.baseline);
+		this.shiftIfRowsPerKeyMoved(key, spec.key, keyEntry);
 	}
 
 	/**
@@ -580,6 +598,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	private plannedBefore(table: TableSchema, existing: ObservedEntry | undefined): number {
 		return plannedRowCount(table, {
 			observedRows: () => existing,
+			observedRowsPerKey: () => undefined,
 			reportedRows: t => this.ctx.reportedRows(t),
 		}) ?? this.ctx.getTuning().defaultRowEstimate;
 	}
@@ -598,6 +617,22 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		log('Shift on %s: baseline %d -> %d rows', key, entry.baselineRows, rows);
 		entry.baselineRows = rows;
 		entry.shifts++;
+		this.ctx.onShift(key);
+	}
+
+	/**
+	 * Reports a shift through `onShift` when a column set's mean has moved `shiftFactor`
+	 * from its baseline. The table key is reported, not the set: a statement that reads the
+	 * table re-plans and every seek node in it re-snapshots the overlay (§3.6). A set's first
+	 * record cannot shift when its plan was already priced from the mean (the baseline is what
+	 * the plan used); a set re-created after eviction carries the module's estimate again and
+	 * may shift once, landing the same plan.
+	 */
+	private shiftIfRowsPerKeyMoved(key: string, setKey: string, keyEntry: PerKeyEntry): void {
+		if (rowCountSpread(keyEntry.mean, keyEntry.baseline) < this.ctx.getTuning().cardinalityFeedback.shiftFactor) return;
+		log('Shift on %s (%s): rows per key baseline %d -> %d', key, setKey, keyEntry.baseline, keyEntry.mean);
+		keyEntry.baseline = keyEntry.mean;
+		keyEntry.shifts++;
 		this.ctx.onShift(key);
 	}
 

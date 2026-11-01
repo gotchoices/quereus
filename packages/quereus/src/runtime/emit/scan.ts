@@ -5,7 +5,7 @@ import type { VirtualTable } from "../../vtab/table.js";
 import type { BaseModuleConfig, AnyVirtualTableModule } from "../../vtab/module.js";
 import { equalitySeekKeyColumns, type FilterInfo } from "../../vtab/filter-info.js";
 import { accessPathPlan } from "../../vtab/index-descriptor.js";
-import type { RowsPerKeySpec } from "../cardinality-observations.js";
+import { columnSetKey, type RowsPerKeySpec } from "../cardinality-observations.js";
 import type { Instruction, RuntimeContext } from "../types.js";
 import { asRun } from "../types.js";
 import type { EmissionContext } from "../emission-context.js";
@@ -309,7 +309,10 @@ export function emitSeqScan(
 function rowsPerKeySpecOf(plan: IndexSeekNode): RowsPerKeySpec | undefined {
 	const columns = equalitySeekKeyColumns(plan.filterInfo);
 	if (!columns) return undefined;
-	return { columns, key: columns.join(','), plannedRowsPerKey: Number(plan.filterInfo.indexInfoOutput.estimatedRows) };
+	// The baseline is what the plan priced the seek at, so a plan already built from the
+	// observed mean does not shift on agreeing with it.
+	const plannedRowsPerKey = plan.plannedRowsPerKey ?? Number(plan.filterInfo.indexInfoOutput.estimatedRows);
+	return { columns, key: columnSetKey(columns), plannedRowsPerKey };
 }
 
 /**

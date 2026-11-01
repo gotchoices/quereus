@@ -94,7 +94,9 @@ export interface IndexNestedLoopCandidate {
 	/**
 	 * The two inputs `cost` was derived from, so the caller can re-price the same
 	 * seek under a different driver (`batchedIndexNestedLoopJoinCost`) without
-	 * re-probing: the module's row estimate for one seek, and the wall-clock
+	 * re-probing: the rows one seek is priced to return — the overlay's observed rows
+	 * per key when it answered for the seek's column set (`IndexSeekNode.
+	 * plannedRowsPerKey`), else the module's estimate — and the wall-clock
 	 * milliseconds one seek pays at the inner's storage — its first-row latency
 	 * plus `rowsPerSeek` of its per-row latency (0 for every in-process module).
 	 * Milliseconds, not cost units: the caller converts via `latencyCost`.
@@ -748,17 +750,22 @@ export function tryIndexNestedLoop(
 
 	const newLeaf = reapplyDeclinedPushed(rebuiltLeaf, seekPlan, offered);
 	const newInner = rebuildChain(inner, leaf, newLeaf);
-	const rowsPerSeek = seekPlan.rows!;
+	// The join key's column set is exactly the rebuilt seek's equality set, so the one
+	// overlay snapshot the seek took serves its advertised rows and this candidate's
+	// pricing alike (docs/progressive-optimizer.md §3.3). Engine currency only: the
+	// module-currency admission gate in `probeModule` keeps comparing `seekPlan.rows`.
+	const rowsPerSeek = seek.plannedRowsPerKey ?? seekPlan.rows!;
 	// Wall-clock one seek pays at the inner's storage: open the iterator (first-row
-	// latency), then pull the rows the module expects it to return (per-row
-	// latency). Milliseconds here; the formula takes the converted cost.
+	// latency), then pull the rows it is priced to return (per-row latency).
+	// Milliseconds here; the formula takes the converted cost.
 	const perSeekLatencyMs = (inner.physical.expectedLatencyMs ?? 0)
 		+ rowsPerSeek * (inner.physical.expectedRowLatencyMs ?? 0);
 	const cost = indexNestedLoopJoinCost(
 		outerRows, rowsPerSeek, latencyCost(perSeekLatencyMs, context.tuning));
 	const atMostOne = provesAtMostOne(tableSchema, offered.combined);
-	log('candidate: seek %s.%s via %s (%s rows/seek, cost %s for %s outer rows; %d pushed constraint(s) re-offered; at-most-one %s)',
+	log('candidate: seek %s.%s via %s (%s rows/seek%s, cost %s for %s outer rows; %d pushed constraint(s) re-offered; at-most-one %s)',
 		tableSchema.name, seekPlan.seekColumnIndexes!.map(c => tableSchema.columns[c]?.name).join(','),
-		seekPlan.indexName, seekPlan.rows, cost, outerRows, pushed.length, atMostOne ? 'proved' : 'unproved');
+		seekPlan.indexName, rowsPerSeek, seek.plannedRowsPerKey === undefined ? '' : ` observed, module ${seekPlan.rows}`,
+		cost, outerRows, pushed.length, atMostOne ? 'proved' : 'unproved');
 	return { newInner, cost, rowsPerSeek, perSeekLatencyMs, atMostOne };
 }

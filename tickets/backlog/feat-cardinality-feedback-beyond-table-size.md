@@ -8,11 +8,13 @@ tradeoffs: Selectivity depends on parameter values and on correlations an observ
 
 ## Where this starts from (refreshed 2026-11-01)
 
-Landed in v4.22.0 (`docs/progressive-optimizer.md` §3): the exact size of a base table read in full, recorded in a per-database overlay, with re-planning of cached statements on a 10× shift. Queued in order (`tickets/implement/`, `fix/`, `plan/`): module-reported table sizes, lower bounds from partial reads (`cardinality-feedback-lower-bounds`), and the first slice beyond table size — rows matched per key by executed equality seeks (`cardinality-feedback-rows-per-key`, plan stage). That slice settles three of the design questions below for equality seeks, and its decisions are the precedent for what remains:
+Landed (`docs/progressive-optimizer.md` §3): the exact size of a base table read in full, module-reported table sizes, lower bounds from partial reads, and the first slice beyond table size — rows matched per key by executed equality seeks through non-unique indexes (`cardinality-feedback-rows-per-key-observe` records them; `cardinality-feedback-rows-per-key` makes planning read them and re-plans on a shift). All are recorded in a per-database overlay, and cached statements re-plan on a 10× shift of a count, a floor or a per-key mean. The rows-per-key slice settled three of the design questions below for equality seeks, and its decisions as implemented are the precedent for what remains:
 
-- **Key**: the `TableSchema` object plus the base-column set — no attribute ids, no literals, no node ids.
-- **Parameter sensitivity**: one running mean per key, the uniform assumption `ANALYZE` statistics already make.
-- **Pushed predicates**: the engine overrides its own consumers of the estimate (the seek's relayed row count, the index-nested-loop's rows per seek) and leaves modules' costing unchanged.
+- **Key**: the `TableSchema` object plus the sorted base-column set of the seek's equality constraints (`equalitySeekKeyColumns` in `vtab/filter-info.ts` is the one definition of an eligible seek, shared by the scan leaf and the planner) — no attribute ids, no literals, no node ids.
+- **Parameter sensitivity**: one running mean per column set, whatever the key values — the uniform assumption `ANALYZE` statistics already make.
+- **Pushed predicates**: the engine overrides only its own consumers of the estimate (`IndexSeekNode` relays the observed rows per key as its `estimatedRows`; the index-nested-loop candidate prices a seek from it) and leaves the module's cost, `rows` and access-path choice unchanged; catalog statistics covering the column set take precedence over the observation (`plannedRowsPerKey` in `planner/stats/table-cardinality.ts`), so a module reading them stays consistent with the engine.
+
+Engine-side estimates over equality *filters* with no seek (a `Filter` above a scan) were left out of that slice and belong here.
 
 ## What remains
 
