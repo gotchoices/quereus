@@ -191,6 +191,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		const shifted = rowCountSpread(rows, entry.baselineRows) >= policy.shiftFactor;
 		debugLog('Recorded %d rows for %s (was %d, baseline %d)%s', rows, key, before, entry.baselineRows, shifted ? ' — shift' : '');
 		if (!shifted) return;
+		log('Shift on %s: baseline %d -> %d rows', key, entry.baselineRows, rows);
 		entry.baselineRows = rows;
 		entry.shifts++;
 		this.ctx.onShift(key);

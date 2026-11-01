@@ -35,6 +35,7 @@ import { astToString } from '../emit/ast-stringify.js';
 import { FeedbackReplanState, overlayTableKey } from './database-cardinality-feedback.js';
 
 const log = createLogger('core:statement');
+const feedbackLog = createLogger('core:cardinality-feedback');
 const errorLog = log.extend('error');
 
 /**
@@ -249,7 +250,7 @@ export class Statement {
 	/** Drops a shift-marked plan when the statement's re-plan cooldown allows it. */
 	private dropPlanOnShift(): void {
 		if (!this.feedbackReplan.onExecutionStart(this.db.optimizer.tuning.cardinalityFeedback.replanCooldown)) return;
-		log('Cardinality feedback re-plan for statement: %s', this.getBlockSql().substring(0, 100));
+		feedbackLog('Re-plan for statement: %s', this.getBlockSql().substring(0, 100));
 		this.invalidatePlan();
 	}
 

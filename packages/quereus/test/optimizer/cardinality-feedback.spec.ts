@@ -209,4 +209,30 @@ describe('Cardinality feedback overlay', () => {
 			expect(state.onExecutionStart(cooldown)).to.equal(false);
 		});
 	});
+
+	describe('cardinality_feedback()', () => {
+		it('reads the overlay at execution, not plan time: one prepared statement sees a later observation', async () => {
+			await db.exec('pragma cardinality_feedback = true');
+			await createJoinTables();
+			await db.exec('insert into big select value, value, value from generate_series(1, 20000)');
+
+			const stmt = db.prepare('select table_name, observed_rows from cardinality_feedback()');
+			async function rows(): Promise<unknown[]> {
+				const out: unknown[] = [];
+				for await (const row of stmt.all()) out.push(row);
+				return out;
+			}
+			try {
+				expect(await rows()).to.deep.equal([]);
+
+				let scanned = 0;
+				for await (const _row of db.eval('select v from big')) scanned++;
+				expect(scanned).to.equal(20_000);
+
+				expect(await rows()).to.deep.equal([{ table_name: 'big', observed_rows: 20_000 }]);
+			} finally {
+				await stmt.finalize();
+			}
+		});
+	});
 });

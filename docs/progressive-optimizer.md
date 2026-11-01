@@ -125,9 +125,10 @@ A shift for `T` walks the `Database`'s live statements (`Database.noteCardinalit
 
 ### 3.9 Diagnostics and the escape hatch
 
-- `cardinality_feedback()` (table-valued) lists the overlay: table, observed rows, catalog rows, baseline, observation and shift counts.
-- `Statement.getPlanShape()` shows a statement's current plan, so a feedback re-plan is visible as a change in node types — between the shift and the next execution it still shows the cached plan. The `core:cardinality-feedback:debug` log names each shift, and the `core:statement` log each re-plan.
-- `cardinality_feedback` (boolean database option) is the master switch.
+- `cardinality_feedback()` (table-valued, non-deterministic) lists the valid overlay entries, one row per table ordered by schema then table: observed rows, catalog rows, baseline, observation and shift counts (columns in `docs/functions.md`). It reads the overlay when it executes, so one prepared call sees later observations; with the option off it returns no rows.
+- `Statement.getPlanShape()` shows a statement's current plan, so a feedback re-plan is visible as a change in node types — between the shift and the next execution it still shows the cached plan.
+- The `core:cardinality-feedback` log names each shift (table, old baseline, new count) and each feedback re-plan (statement SQL prefix); `core:cardinality-feedback:debug` adds every record, drop and discard.
+- `cardinality_feedback` (boolean database option) is the master switch; turning it off clears the overlay.
 
 ---
 

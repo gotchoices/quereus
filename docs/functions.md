@@ -641,6 +641,7 @@ These table-valued functions provide query introspection and execution tracing. 
 | `execution_trace(sql)` | 1 | Instruction-level trace with timing. Non-deterministic |
 | `row_trace(sql)` | 1 | Row-level data flow trace. Non-deterministic |
 | `explain_assertion(name)` | 1 | Assertion analysis: classification, prepared PK params, violation SQL. `name` may be `'schema.name'` or bare (first match across schemas) |
+| `cardinality_feedback()` | 0 | Table sizes the planner has learned from execution (the `cardinality_feedback` option). Non-deterministic; empty while the option is off |
 
 ```sql
 select id, op, detail from query_plan('select * from users where age > 25');
@@ -661,6 +662,24 @@ every nested sub-program — so the three join on it.
 | `classification` | TEXT | `'row'` if row-specific (PK fully covered), else `'global'` |
 | `prepared_pk_params` | TEXT? | JSON array of parameter names when row-specific |
 | `violation_sql` | TEXT | Stored violation query |
+
+### `cardinality_feedback()` columns
+
+One row per remembered table whose schema is still current, ordered by schema then table. Key: `(schema_name, table_name)`. See `docs/progressive-optimizer.md` §3.
+
+| Column | Type | Description |
+|---|---|---|
+| `schema_name` | TEXT | Schema of the table |
+| `table_name` | TEXT | Table name |
+| `observed_rows` | INTEGER | Exact row count seen by the latest complete read; later plans use this |
+| `catalog_rows` | INTEGER? | Row count from the table's statistics (`ANALYZE`); null when never analyzed |
+| `baseline_rows` | INTEGER | Count the next shift is measured against: the estimate before the first observation, or the count at the last shift |
+| `observations` | INTEGER | Complete reads recorded |
+| `shifts` | INTEGER | Times the count moved far enough from the baseline to re-plan statements that read the table |
+
+```sql
+select table_name, observed_rows, catalog_rows from cardinality_feedback();
+```
 
 ---
 

@@ -27,6 +27,7 @@ import { schemaFunc, tableInfoFunc, functionInfoFunc, foreignKeyInfoFunc,
 	indexInfoFunc, checkConstraintInfoFunc, uniqueConstraintInfoFunc, assertionInfoFunc,
 	viewInfoFunc, columnInfoFunc } from './schema.js';
 import { jsonEachFunc, jsonTreeFunc } from './json-tvf.js';
+import { cardinalityFeedbackFunc } from './cardinality-feedback.js';
 import { INTEGER_FUNC, REAL_FUNC, TEXT_FUNC, BLOB_FUNC, BOOLEAN_FUNC, DATE_FUNC, TIME_FUNC, DATETIME_FUNC, JSON_FUNC, TIMESPAN_FUNC } from './conversion.js';
 import {
 	timespanYearsFunc, timespanMonthsFunc, timespanWeeksFunc, timespanDaysFunc,
@@ -158,6 +159,7 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	effectiveLensFunc,
 	basisBackfillFunc,
 	lensAdvisoriesFunc,
+	cardinalityFeedbackFunc,
 	// Schema introspection functions
 	schemaFunc,
 	tableInfoFunc,
