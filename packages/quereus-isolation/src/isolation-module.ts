@@ -797,11 +797,13 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 			// underlying module's through: it claims no filter and never sets
 			// `provablyEmpty`, which is the safe answer — a fabricated proof would delete a
 			// read that must happen.
+			// A measured 0 is relayed as 0 but priced as one row, the engine-wide rule
+			// (docs/optimizer-costing.md § Base-table row estimates).
 			const rows = request.estimatedRows ?? 1000;
 			return {
 				handledFilters: request.filters.map(() => false),
 				rows,
-				cost: rows,
+				cost: Math.max(1, rows),
 			};
 		}
 		return this.underlying.getBestAccessPlan(db, tableInfo, request);

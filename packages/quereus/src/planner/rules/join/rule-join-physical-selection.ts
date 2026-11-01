@@ -61,7 +61,7 @@ import {
 } from './equi-pair-extractor.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { readsColumnsOf } from '../../cache/correlation-detector.js';
-import { physicalSourceRows } from '../../util/row-estimates.js';
+import { costedRows, physicalSourceRows } from '../../util/row-estimates.js';
 import { tryIndexNestedLoop, type IndexNestedLoopCandidate } from './index-nested-loop.js';
 import { nestedLoopRightOpensOnce } from '../cache/rule-nested-loop-right-cache.js';
 
@@ -105,17 +105,6 @@ const UNKNOWN_SIDE_ROWS = 100;
  */
 function sideRows(side: RelationalPlanNode): number {
 	return costedRows(physicalSourceRows(side.physical, side), UNKNOWN_SIDE_ROWS);
-}
-
-/**
- * A row estimate as this rule prices it: `unknown` stands in for `undefined`
- * (nobody measured), and a measured 0 is floored at one row. A zero is the most
- * fragile measurement there is — any insert since invalidates it by an infinite
- * ratio — and a side priced at nothing would win every comparison it enters.
- * One row keeps an empty side cheap without making it free.
- */
-function costedRows(rows: number | undefined, unknown: number): number {
-	return rows === undefined ? unknown : Math.max(1, rows);
 }
 
 /**

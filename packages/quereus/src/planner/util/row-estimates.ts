@@ -39,6 +39,19 @@ export function physicalSourceRows(
 }
 
 /**
+ * A row estimate as a cost site prices it: `unknown` stands in for `undefined`
+ * (nobody measured), and a measured 0 is floored at one row. A zero is the most
+ * fragile measurement there is — any insert since invalidates it by an infinite
+ * ratio — and a table or join side priced at nothing undercuts every seek and
+ * wins every comparison it enters. One row keeps an empty table cheap without
+ * making it free. Relays keep the 0; only sites turning a count into a cost call
+ * this (docs/optimizer-costing.md § Base-table row estimates).
+ */
+export function costedRows(rows: number | undefined, unknown: number): number {
+	return rows === undefined ? unknown : Math.max(1, rows);
+}
+
+/**
  * An aggregate's output cardinality as a pure function of its source's — shared
  * by every aggregate node's logical `estimatedRows` getter and its
  * `computePhysical` (which feeds it the PHYSICAL source count) so the two cannot

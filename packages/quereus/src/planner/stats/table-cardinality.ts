@@ -23,8 +23,8 @@
  *
  * A real 0 (analyzed or observed empty table) is relayed as 0 everywhere a row count is
  * reported. Sites that turn a count into a COST floor a measured 0 at one row instead
- * (the memory module's table size, join selection's side rows, the store's request
- * sizing): a zero goes stale on the first insert, and a table priced at nothing would
+ * (`costedRows` in `planner/util/row-estimates.ts`; the store's request sizing floors
+ * its own): a zero goes stale on the first insert, and a table priced at nothing would
  * trade its primary-key seeks for scans (docs/optimizer-costing.md § Base-table row
  * estimates).
  */

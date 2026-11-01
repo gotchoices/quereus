@@ -137,3 +137,7 @@ any plan until this ticket lands. The general test this ticket already asks for
 guard; worth adding a second one alongside it — **that QuickPick adopts a
 different order for a join graph where one ordering is genuinely cheaper** — since
 that is the property the whole rule exists to provide and nothing pins it today.
+
+## Arm added 2026-11-01 (review of `bug-measured-empty-table-costed-as-thousand-rows`)
+
+These constructors also read a measured 0 raw: before optimization a `TableReferenceNode` over a table analyzed empty reports 0, so `JoinNode` self-costs `0 × n = 0` (some cost helpers floor on their own — `sortCost` does — most do not). The engine-wide rule is now "relay a measured 0, price it as one row" (docs/optimizer-costing.md § Base-table row estimates), spelled once as `costedRows(rows, unknownDefault)` in `planner/util/row-estimates.ts`. When this ticket moves the self-costs onto the physical count, price through `costedRows` so the per-node defaults (`?? 100`, `?? 1000`, `?? 1`) and the zero floor live in one place. The doc names this class as the rule's one known exception.
