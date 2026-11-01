@@ -52,6 +52,9 @@ export interface TransactionManagerContext {
 	/** Called after a successful commit, before the change log is cleared. The callback
 	 *  materializes per-table committed row counts only if a consumer wants them. */
 	recordCommittedChangeCounts(counts: () => Map<string, number>): void;
+	/** Called when work of the open transaction is undone: a rollback, a failed commit,
+	 *  or a `rollback to savepoint`. Bookkeeping only — errors are logged, never thrown. */
+	transactionRolledBack(): void;
 }
 
 /**
@@ -203,6 +206,11 @@ export class TransactionManager {
 					// Upgrade implicit to explicit
 					debugLog('Upgrading implicit transaction to explicit (BEGIN encountered).');
 					this.transactionSource = 'explicit';
+					// NOTE: held cardinality observations survive the upgrade (same transaction),
+					// but this clear forgets which tables were written before it, so a pre-upgrade
+					// write after an observation would no longer veto that observation at commit.
+					// Unreached today — every implicit transaction ends with its statement — if
+					// BEGIN can ever run inside one that wrote, keep the written-table set here.
 					this.clearChangeLog();
 					return;
 				}
@@ -294,14 +302,15 @@ export class TransactionManager {
 				errorLog('Post-commit watcher dispatch threw: %O', err);
 			}
 
-			// Auto-analyze staleness bookkeeping, same window: the change log is
-			// still alive. The counts map is thunked so it is never materialized
-			// when the feature is off, and the whole call is isolated — a
-			// bookkeeping error must never fail a transaction that has committed.
+			// Commit bookkeeping (auto-analyze staleness, held cardinality
+			// observations), same window: the change log is still alive. The counts
+			// map is thunked so it is never materialized when no consumer wants it,
+			// and the whole call is isolated — a bookkeeping error must never fail a
+			// transaction that has committed.
 			try {
 				this.ctx.recordCommittedChangeCounts(() => this.getChangedRowCounts());
 			} catch (err) {
-				errorLog('Auto-analyze commit bookkeeping threw: %O', err);
+				errorLog('Commit bookkeeping threw: %O', err);
 			}
 
 			// Materialized views are NOT a post-commit consumer: each is row-time
@@ -311,6 +320,7 @@ export class TransactionManager {
 			// On pre-commit assertion failure (or commit error), rollback all connections
 			const conns = this.ctx.getAllConnections();
 			await Promise.allSettled(conns.map(c => c.rollback()));
+			this.notifyRolledBack();
 			throw e;
 		} finally {
 			this.inTransaction = false;
@@ -363,6 +373,16 @@ export class TransactionManager {
 			this.isAutocommit = true;
 			this.transactionSource = null;
 			this.clearChangeLog();
+			this.notifyRolledBack();
+		}
+	}
+
+	/** Tell the context work was undone, isolated like commit bookkeeping. */
+	private notifyRolledBack(): void {
+		try {
+			this.ctx.transactionRolledBack();
+		} catch (err) {
+			errorLog('Rollback bookkeeping threw: %O', err);
 		}
 	}
 
@@ -659,8 +679,10 @@ export class TransactionManager {
 	 * so the whole reading is O(tables × layers) with no scan.
 	 *
 	 * Inherits the change log's coalescing — ten updates to one row count as one,
-	 * and an insert followed by a delete of the same key leaves no entry at all.
-	 * That makes this a *distinct rows touched* measure.
+	 * and an insert followed by a delete of the same key counts zero. That makes
+	 * this a *distinct rows touched* measure. A table written whose changes all
+	 * cancelled out still appears, with count 0: the key set is every table the
+	 * transaction wrote, which held cardinality observations rely on.
 	 *
 	 * Deliberately approximate across layers: the same key changed in two live
 	 * savepoint layers is counted twice. Deduplicating would cost a scan of every
@@ -670,7 +692,6 @@ export class TransactionManager {
 		const result = new Map<string, number>();
 		const collect = (m: ChangeLogLayer): void => {
 			for (const [t, rowMap] of m) {
-				if (rowMap.size === 0) continue;
 				result.set(t, (result.get(t) ?? 0) + rowMap.size);
 			}
 		};
@@ -841,6 +862,7 @@ export class TransactionManager {
 		// Re-create a fresh layer for the preserved savepoint
 		this.beginSavepointLayer();
 
+		this.notifyRolledBack();
 		return index;
 	}
 

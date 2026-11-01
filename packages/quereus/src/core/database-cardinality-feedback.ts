@@ -13,7 +13,9 @@
  * check is the correctness guard; the listener is memory hygiene.
  *
  * Execution feeds it through {@link CardinalityFeedbackManager.publish}, which admits
- * only counts of committed state.
+ * only counts of committed state: a count taken inside a transaction is held until
+ * that transaction commits ({@link CardinalityFeedbackManager.onCommitted}) and
+ * dropped if it rolls back ({@link CardinalityFeedbackManager.onRolledBack}).
  *
  * Nothing here is persisted: a new `Database` starts empty. See
  * docs/progressive-optimizer.md §3.2–3.5.
@@ -87,6 +89,12 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * first key is the least recently used.
 	 */
 	private readonly entries = new Map<string, ObservedEntry>();
+	/**
+	 * Observations made inside the open transaction, held until it ends; same key as
+	 * `entries`, last count per table wins. Bounded by the distinct tables one
+	 * transaction observes.
+	 */
+	private readonly pending = new Map<string, { readonly table: TableSchema; readonly rows: number }>();
 	private unsubscribeSchemaChanges: (() => void) | null = null;
 
 	constructor(private readonly ctx: CardinalityFeedbackManagerContext) {
@@ -136,26 +144,54 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 
 	/**
 	 * Offer one finished execution's observations (docs/progressive-optimizer.md §3.5).
-	 * A count taken inside an open transaction may include that transaction's uncommitted
-	 * writes, so only a committed read (`readCommitted`) or an execution that ended with no
-	 * transaction open is recorded.
+	 * A committed read (`readCommitted`) or an execution that ended with no transaction
+	 * open saw committed state and is recorded now. Anything else may include the open
+	 * transaction's uncommitted writes, so it is held for {@link onCommitted}.
 	 */
 	publish(observations: CardinalityObservations, options: { readCommitted: boolean }): void {
-		if (!options.readCommitted && !this.ctx.getAutocommit()) {
-			// NOTE: interim — includes every writing statement in autocommit mode, whose
-			// implicit transaction is still open here. `cardinality-feedback-commit-scoped-publication`
-			// holds these until commit instead.
-			debugLog('Discarded observations made inside an open transaction');
+		if (options.readCommitted || this.ctx.getAutocommit()) {
+			for (const [table, rows] of observations.entries()) {
+				this.record(table, rows);
+			}
 			return;
 		}
 		for (const [table, rows] of observations.entries()) {
-			this.record(table, rows);
+			this.pending.set(tableKey(table), { table, rows });
 		}
 	}
 
-	/** Forget every observation; later compiles read the catalog only. */
+	/**
+	 * The open transaction committed: record what it held, except tables it wrote.
+	 * Such a count was taken mid-transaction, possibly before later writes in the same
+	 * transaction, and the change log cannot say which came first. `changedCounts` is
+	 * the change log keyed like `entries` — every table the transaction wrote, even one
+	 * whose writes cancelled out — and is not built when nothing is held.
+	 */
+	onCommitted(changedCounts: () => Map<string, number>): void {
+		if (this.pending.size === 0) return;
+		try {
+			const changed = changedCounts();
+			for (const [key, { table, rows }] of this.pending) {
+				if (changed.has(key)) {
+					debugLog('Dropped %d rows for %s: the committing transaction wrote it', rows, key);
+					continue;
+				}
+				this.record(table, rows);
+			}
+		} finally {
+			this.pending.clear();
+		}
+	}
+
+	/** The open transaction, or some of its work, was undone: forget everything held. */
+	onRolledBack(): void {
+		this.pending.clear();
+	}
+
+	/** Forget every observation, held ones included; later compiles read the catalog only. */
 	clear(): void {
 		this.entries.clear();
+		this.pending.clear();
 	}
 
 	/** Valid entries, by value, least recently used first. Does not refresh recency. */
@@ -182,7 +218,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 			this.unsubscribeSchemaChanges();
 			this.unsubscribeSchemaChanges = null;
 		}
-		this.entries.clear();
+		this.clear();
 	}
 
 	private subscribeToSchemaChanges(): void {

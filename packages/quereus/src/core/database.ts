@@ -2887,11 +2887,24 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 	}
 
 	/** @internal Invoked by the TransactionManager in the same post-commit window as
-	 *  {@link runPostCommitWatchers}. `counts` is a thunk so that with `auto_analyze`
-	 *  off no counts map is ever built. */
+	 *  {@link runPostCommitWatchers}. Feeds auto-analyze (when `auto_analyze` is on) and
+	 *  the cardinality-feedback observations the transaction held (always). `counts` is
+	 *  a thunk built at most once, and never when neither consumer needs it. */
 	public recordCommittedChangeCounts(counts: () => Map<string, number>): void {
-		if (!this.options.getBooleanOption('auto_analyze')) return;
-		this.autoAnalyzeManager.recordCommit(counts());
+		let built: Map<string, number> | undefined;
+		const memo = (): Map<string, number> => built ??= counts();
+		try {
+			if (this.options.getBooleanOption('auto_analyze')) this.autoAnalyzeManager.recordCommit(memo());
+		} finally {
+			// Even when auto-analyze throws: held observations must not outlive their transaction.
+			this.cardinalityFeedbackManager.onCommitted(memo);
+		}
+	}
+
+	/** @internal Invoked by the TransactionManager whenever work of the open transaction
+	 *  is undone (rollback, failed commit, `rollback to savepoint`). */
+	public transactionRolledBack(): void {
+		this.cardinalityFeedbackManager.onRolledBack();
 	}
 
 	/** @internal Auto-analyze staleness bookkeeping and background refresh scheduler. */

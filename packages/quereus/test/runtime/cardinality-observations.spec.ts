@@ -1,7 +1,7 @@
 /**
  * Cardinality feedback, execution half: a scan that reads its whole table reports the
- * exact count, and only a committed, complete enumeration reaches the overlay
- * (docs/progressive-optimizer.md §3.1, §3.5).
+ * exact count, and only a committed, complete enumeration reaches the overlay — one made
+ * inside a transaction waits for its commit (docs/progressive-optimizer.md §3.1, §3.5).
  *
  * `big` is 20,000 rows and never analyzed, so every observation clears the overlay's
  * record floor; an absent entry therefore means "not observed", never "too small".
@@ -48,16 +48,37 @@ describe('Cardinality feedback scan observations', () => {
 		expect(observedBig()).to.equal(undefined);
 	});
 
-	it('discards a full scan made inside an open transaction', async () => {
-		await db.exec('begin; select * from big; commit;');
+	it('holds a full scan made inside a transaction until it commits', async () => {
+		await db.exec('begin; select * from big;');
+		expect(observedBig()).to.equal(undefined);
+		await db.exec('commit');
+		expect(observedBig()).to.equal(20_000);
+	});
+
+	// The empty transaction afterwards is a commit that would apply anything still held.
+	it('forgets a full scan made inside a transaction that rolls back', async () => {
+		await db.exec('begin; select * from big; rollback; begin; commit;');
+		expect(observedBig()).to.equal(undefined);
+	});
+
+	// Observed after the delete, so 19,990 happens to be right — but the change log
+	// cannot order the scan against the transaction's writes, so a written table is dropped.
+	it('drops the scan of a table the committing transaction wrote', async () => {
+		await db.exec('begin; delete from big where id <= 10; select * from big; commit;');
 		expect(observedBig()).to.equal(undefined);
 	});
 
 	// The delete's scan completes with 20,000 rows before the implicit transaction
-	// commits an empty table; publishing it would record a size that no longer exists.
-	it('discards a writing statement\'s scan in autocommit mode', async () => {
+	// commits an empty table; recording it would remember a size that no longer exists.
+	it('drops a writing statement\'s scan of its own target', async () => {
 		await db.exec('delete from big');
 		expect(observedBig()).to.equal(undefined);
+	});
+
+	it('records a writing statement\'s scan of another table at its commit', async () => {
+		await db.exec('create table t2 (id integer primary key, v integer)');
+		await db.exec('insert into t2 select * from big');
+		expect(observedBig()).to.equal(20_000);
 	});
 
 	it('records nothing with the option off', async () => {
