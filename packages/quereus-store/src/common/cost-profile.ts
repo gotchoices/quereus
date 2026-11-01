@@ -120,8 +120,8 @@ export function estimateSortCost(rows: number): number {
 
 /**
  * The module's pre-profile constants, and the default for any backend that declares
- * nothing. Zero latency (in-process, the engine's `COST_PRESETS.memory`); `pointRead: 1.0` says a resolved row costs about what a sequentially-iterated
- * row costs (true for an in-process, block-cached backend, where the index path simply
+ * nothing. Zero latency (in-process, the engine's `COST_PRESETS.memory`); `pointRead: 1.0`
+ * says a resolved row costs about what a sequentially-iterated row costs (true for an in-process, block-cached backend, where the index path simply
  * pays the row read ON TOP OF the entry read); `seekPositioning: 0.5` says positioning
  * one seek key costs half a sequentially scanned row.
  *

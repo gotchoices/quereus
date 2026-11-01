@@ -33,20 +33,21 @@ export type ResolvedModuleCostProfile = Required<ModuleCostProfile>;
  * clear them.
  *
  * Each preset is frozen so a module that mutates one fails loudly instead of
- * editing every other module's copy.
+ * editing every other module's copy, and typed as plain numbers (not literals)
+ * so a subclass can redeclare its parent's preset field with another preset.
  */
 export const COST_PRESETS = Object.freeze({
 	/** In-process memory. Identical to declaring nothing. */
-	memory: Object.freeze({ firstRowLatencyMs: 0, perRowLatencyMs: 0 }),
+	memory: Object.freeze<ResolvedModuleCostProfile>({ firstRowLatencyMs: 0, perRowLatencyMs: 0 }),
 	/** A file on local disk read in-process through a block cache (LevelDB, SQLite). */
-	localDisk: Object.freeze({ firstRowLatencyMs: 0.05, perRowLatencyMs: 0.004 }),
+	localDisk: Object.freeze<ResolvedModuleCostProfile>({ firstRowLatencyMs: 0.05, perRowLatencyMs: 0.004 }),
 	/** Browser storage reached across the renderer's IPC boundary (IndexedDB). */
-	browserIdb: Object.freeze({ firstRowLatencyMs: 1, perRowLatencyMs: 0.01 }),
+	browserIdb: Object.freeze<ResolvedModuleCostProfile>({ firstRowLatencyMs: 1, perRowLatencyMs: 0.01 }),
 	/** A service one network round trip away; each request returns a page of rows. */
-	network: Object.freeze({ firstRowLatencyMs: 40, perRowLatencyMs: 0.04 }),
+	network: Object.freeze<ResolvedModuleCostProfile>({ firstRowLatencyMs: 40, perRowLatencyMs: 0.04 }),
 	/** A distributed store where a request may consult several nodes before answering. */
-	distributed: Object.freeze({ firstRowLatencyMs: 100, perRowLatencyMs: 0.2 }),
-} as const satisfies Record<string, ResolvedModuleCostProfile>);
+	distributed: Object.freeze<ResolvedModuleCostProfile>({ firstRowLatencyMs: 100, perRowLatencyMs: 0.2 }),
+});
 
 /**
  * Fill a declared profile in, reading an omitted field as 0 and replacing a

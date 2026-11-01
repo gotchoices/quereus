@@ -124,8 +124,9 @@ function rowsRead(side: RelationalPlanNode, rows: number, tuning: OptimizerTunin
  * Wall-clock milliseconds to open a side and drain it once:
  * `firstRowMs + rowsRead × rowMs`, from the subtree's `expectedLatencyMs` and
  * `expectedRowLatencyMs`. 0 for every in-process side (both default to 0 when
- * the module's cost profile declares nothing). The leaf peel only runs when a per-row latency is actually declared, so
- * the zero-latency hot path does not pay for it.
+ * the module's cost profile declares nothing). The leaf peel only runs when a
+ * per-row latency is actually declared, so the zero-latency hot path does not
+ * pay for it.
  */
 function readMs(side: RelationalPlanNode, rows: number, tuning: OptimizerTuning): number {
 	const firstRowMs = side.physical.expectedLatencyMs ?? 0;

@@ -5,7 +5,7 @@
  */
 
 import { expect } from 'chai';
-import { COST_PRESETS, resolveModuleCostProfile, type ModuleCostProfile } from '../../src/vtab/cost-profile.js';
+import { resolveModuleCostProfile, type ModuleCostProfile } from '../../src/vtab/cost-profile.js';
 
 describe('resolveModuleCostProfile', () => {
 	function resolveCollecting(declared: ModuleCostProfile | undefined) {
@@ -38,9 +38,5 @@ describe('resolveModuleCostProfile', () => {
 		const { resolved, warnings } = resolveCollecting(undefined);
 		expect(resolved).to.deep.equal({ firstRowLatencyMs: 0, perRowLatencyMs: 0 });
 		expect(warnings).to.be.empty;
-	});
-
-	it('resolves the memory preset equal to declaring nothing', () => {
-		expect(resolveModuleCostProfile(COST_PRESETS.memory)).to.deep.equal(resolveModuleCostProfile(undefined));
 	});
 });

@@ -286,8 +286,9 @@ export class IsolationModule implements VirtualTableModule<IsolatedTable, BaseMo
 	 * A live getter (not a construction-time snapshot): the underlying's mode is
 	 * a static module property today, but mirroring `costProfile` — whose value
 	 * an out-of-tree module may learn lazily at connect time — keeps both
-	 * forwards reading live each plan. Always returns a concrete value (never `undefined`), satisfying
-	 * the optional `concurrencyMode?` under `exactOptionalPropertyTypes`.
+	 * forwards reading live each plan. Always returns a concrete value (never
+	 * `undefined`), satisfying the optional `concurrencyMode?` under
+	 * `exactOptionalPropertyTypes`.
 	 */
 	get concurrencyMode(): VtabConcurrencyMode {
 		const underlying = this.underlying.concurrencyMode ?? 'serial';
