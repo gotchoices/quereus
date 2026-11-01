@@ -618,9 +618,9 @@ export function ruleKeySetSeek(node: PlanNode, context: OptContext): PlanNode | 
 		// `ANALYZE`, else `undefined`. A never-analyzed memory-backed key source therefore
 		// still arrives here as `undefined` and proceeds; whether a scan should relay the
 		// module's `accessPlan.rows` instead is the arm on
-		// `debt-row-estimate-relay-has-no-guard`. The 3000-row store key source in
-		// `packages/quereus-store/test/live-row-count-plans.spec.ts` does not exercise this
-		// gate: that query reaches the rule as a hash semi join.
+		// `debt-row-estimate-relay-has-no-guard`. No test exercises this gate with a sized
+		// key source: `where v in (select k from ksrc)` over store tables reaches the rule as
+		// a hash semi join, which this gate does not guard.
 		const keyRows = node.right.physical.estimatedRows;
 		if (keyRows !== undefined && keyRows > Math.min(pushdown.maxKeys, pushdown.breakEvenKeys)) {
 			log('decline: key source estimate %d exceeds the seek threshold min(%d, %d)',

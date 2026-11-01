@@ -1,6 +1,6 @@
 description: When a table has been measured and found empty, several places in the planner still treat it as a table of unknown size and price it as a thousand (or a hundred) rows, so one plan holds two contradictory sizes for the same table and the query-plan diagnostics show made-up row counts.
 architecture: docs/optimizer-costing.md#statistics-abstraction
-files: packages/quereus/src/planner/rules/access/rule-select-access-path.ts, packages/quereus/src/planner/rules/join/rule-join-physical-selection.ts, packages/quereus/src/vtab/memory/module.ts, packages/quereus/src/func/builtins/explain.ts, packages/quereus/src/planner/nodes/table-access-nodes.ts, packages/quereus/src/planner/rules/join/index-nested-loop.ts, packages/quereus/src/planner/stats/table-cardinality.ts, packages/quereus/test/optimizer/access-plan-request-row-count.spec.ts, docs/optimizer-costing.md, docs/progressive-optimizer.md
+files: packages/quereus/src/planner/rules/access/rule-select-access-path.ts, packages/quereus/src/planner/rules/join/rule-join-physical-selection.ts, packages/quereus/src/vtab/memory/module.ts, packages/quereus/src/func/builtins/explain.ts, packages/quereus/src/planner/nodes/table-access-nodes.ts, packages/quereus/src/planner/rules/join/index-nested-loop.ts, packages/quereus/src/planner/stats/table-cardinality.ts, packages/quereus/test/optimizer/access-plan-request-row-count.spec.ts, docs/optimizer-costing.md, docs/progressive-optimizer.md, packages/quereus-store/src/common/store-module.ts
 repro: verified
 ----
 
@@ -56,7 +56,7 @@ Tradeoff accepted: an empty-measured outer now makes a plain nested loop cheap i
 - **Measured zero, one plan, one size.** The access leaf's cost and row estimate agree. Verify: test below.
 - **A module answering `rows: 0` for a seek** is relayed as 0; the index-nested-loop displaced-plan comparison then reads the module's own answer (update the NOTE in `displacedPlan`). Verify: inspection.
 - **`query_plan().est_rows` consumers**: `test/optimizer/keys-propagation.spec.ts` and `test/planner/tvf-physical-properties.spec.ts` read it; quoomb-web reads it with `|| 0`. Verify: those specs; inspection of `packages/quoomb-web/src/worker/quereus.worker.ts`.
-- **The store's floor** (`sizeRequestFromLiveCount`) is untouched. Verify: `yarn workspace @quereus/store test`.
+- **The store is a cost consumer too — arm added by the review of `feat-planner-asks-the-backend-how-big-a-table-is`.** That ticket made the planner send the store its own exact live count, so a store table drained to 0 rows (insert, then delete; never analyzed) now arrives at `getBestAccessPlan` as `estimatedRows: 0` instead of `undefined`. `sizeRequestFromLiveCount` (`quereus-store/src/common/store-module.ts`) honours a supplied 0 verbatim when its live count agrees, so the floor-at-1 it applies to a substituted count never fires, every arm and the scan price at 0, and the seek-versus-scan veto decides on rounding. Verified 2026-11-01 (in-memory provider, plain `StoreModule`): after `insert into t values (1, 1); delete from t`, `select * from t where id = 5` plans as `FILTER (id = 5)` over `INDEX SEEK t USING primary` — the declined push-down rebuilt as seek plus duplicate filter (`bug-declined-push-down-is-rebuilt-as-seek-plus-duplicate-filter`) — while the same query on a one-row table plans a bare `INDEX SEEK`. Before that ticket the request arrived `undefined` and was substituted as 1. The same 0 reached the store before only via `ANALYZE` on an empty table. Apply this ticket's decision there: floor a supplied measured 0 at one row for costing (the `staleEmptySnapshot` exception and the "stays 0" paragraph in `sizeRequestFromLiveCount`'s doc change with it). Verify: a store-side test beside `store-row-count-to-planner.spec.ts`'s zero cases, plus `yarn workspace @quereus/store test`.
 - **Shared lines with other queued tickets**: `feat-per-row-latency-cost-for-remote-scans` edits the latency charges next to join selection's side rows, and `unknown-size-join-scans-instead-of-seeking` will change the unknown default there; keep the side-row read in one place so both compose. Verify: inspection.
 
 ## Tests (only these)
@@ -66,12 +66,15 @@ In `test/optimizer/access-plan-request-row-count.spec.ts`, beside "sends a measu
 - A table analyzed while empty plans `select * from e` with an access leaf whose cost is the one-row price and whose row estimate is 0 — not 1000 for either.
 - The same table, filled with 2,000 rows afterwards (`auto_analyze` off, so the catalog still says 0), plans `select * from e where id = ?` as an `IndexSeek` on the primary key — the stale-zero guard.
 
+In `packages/quereus-store/test/store-row-count-to-planner.spec.ts` (store arm): a supplied `estimatedRows: 0` that the live count agrees with is priced as one row, so a primary-key equality still claims its filter as a seek.
+
 ## TODO
 
 - `createSeqScan`, `selectPhysicalNode`: `??`.
 - Join selection side rows and the memory module's table size: `undefined` → existing default, measured 0 → 1; fix the stale comment in join selection.
 - `explain.ts`: physical estimate, then logical, then `null`.
 - Update the NOTEs that describe the old collapse: `table-cardinality.ts` header, `createSeqScan`'s, `table-access-nodes.ts` ~537, `index-nested-loop.ts` `displacedPlan`.
-- The two tests.
+- The two tests, and the store one.
+- Store arm: floor a supplied measured 0 at 1 in `sizeRequestFromLiveCount`; update its doc comment.
 - Docs: `docs/optimizer-costing.md` ("What a physical seek node reports" names the `|| 1000`) and `docs/progressive-optimizer.md` §3.7 ("Measured zero") and §5 (remove the "Measured zero honored" item).
 - `yarn lint`, `yarn test`, `yarn workspace @quereus/store test`, `yarn bench:gate`, `yarn docs:check`.

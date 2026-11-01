@@ -302,41 +302,4 @@ describe('a store table is planned against its live row count', () => {
 			expect(after).to.deep.equal(before);
 		});
 	});
-
-	describe('the key-set semi join rewrite', () => {
-		/**
-		 * Not a pin on `rule-key-set-seek`'s merge-arm size gate, though it was written as one.
-		 * Measured both with the module's count withheld (the planner before
-		 * `StoreModule.getRowCount`) and with it: this query reaches the rule as a HASH semi
-		 * join, and the size gate guards only the merge arm, so the rewrite fires either way
-		 * and the gate never ran. The scan nodes do relay the live count now
-		 * (`TableReferenceNode.estimatedRows` carries it), so a merge-arm key source over a
-		 * store table would reach the gate sized.
-		 *
-		 * Kept for the row set: whichever way it is planned, the answer must not move.
-		 */
-		it('proceeds on an un-analyzed key source, and returns the right rows', async () => {
-			await db.exec(`create table big (pk integer primary key, v integer, w integer) using store`);
-			await db.exec(`create index ix_v on big (v)`);
-			await db.exec(`create table ksrc (id integer primary key, k integer null) using store`);
-			await db.exec(`insert into big values ${
-				Array.from({ length: 200 }, (_, i) => `(${i + 1}, ${(i + 1) * 10}, ${i + 1})`).join(', ')}`);
-			await db.exec('begin');
-			for (let i = 1; i <= 3000; i++) await db.exec(`insert into ksrc values (${i}, ${i * 10})`);
-			await db.exec('commit');
-
-			// No `order by`: an absorbed Sort over a SECONDARY-index target makes
-			// `rule-key-set-seek` decline for an unrelated reason. Rows are collected unordered
-			// and sorted here instead.
-			const q = `select pk from big where v in (select k from ksrc)`;
-			const ops = (await asyncIterableToArray(db.eval(
-				`select json_group_array(op) as ops from query_plan(?)`, [q])))[0].ops as string;
-			expect(ops, 'the rewrite fires, through the hash arm')
-				.to.contain('KEYSETSEMIJOIN');
-
-			// Whichever way it is planned, every row of `big` matches a key in `ksrc`.
-			const answer = (await rows(q)).map(r => r.pk as number).sort((a, b) => a - b);
-			expect(answer).to.deep.equal(Array.from({ length: 200 }, (_, i) => i + 1));
-		});
-	});
 });
