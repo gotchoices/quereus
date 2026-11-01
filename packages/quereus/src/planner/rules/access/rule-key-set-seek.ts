@@ -119,6 +119,15 @@
  * NOTE: the `orderingLoadBearing` decline is conservative when
  * `seekPreservesTargetOrder` is false — a future enhancement could re-sort the
  * pushed output by the leaf's advertised order.
+ *
+ * NOTE: this rewrite is not a priced candidate in `join-physical-selection` — it
+ * only sees semi joins that already chose hash or merge. A filtered target over a
+ * never-analyzed key source (priced at the 1000-row default) chooses an
+ * index-nested-loop semi join seeking the key source per target row instead, so
+ * this rule never sees it. Fine while key sources are measured or truly larger;
+ * if never-analyzed small key sources under filtered targets show up slow
+ * (one key-source seek per target row on remote storage), price the key-set seek
+ * inside that comparison, as the batched index-nested-loop is.
  */
 
 import { createLogger } from '../../../common/logger.js';

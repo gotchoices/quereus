@@ -462,18 +462,37 @@
                               "size": 3
                             }
                           }
+                        },
+                        {
+                          "children": [],
+                          "detail": "dept_id",
+                          "logical": {
+                            "attributeId": 3,
+                            "column": "dept_id",
+                            "resultType": "INTEGER",
+                            "schema": ""
+                          },
+                          "nodeType": "ColumnReference",
+                          "op": "COLUMNREFERENCE",
+                          "physical": {
+                            "constant": false,
+                            "deterministic": true,
+                            "idempotent": true,
+                            "readonly": true
+                          }
                         }
                       ],
-                      "detail": "INDEX SCAN departments USING _primary_ ORDER BY 0",
+                      "detail": "INDEX SEEK departments USING primary ORDER BY 0",
                       "logical": {
-                        "accessMethod": "index-scan",
+                        "accessMethod": "index-seek",
                         "filterInfo": {
-                          "estimatedCost": 1000,
-                          "estimatedRows": 1000,
-                          "matchedClauses": 0,
-                          "usableIndex": "idx=_primary_(0);plan=0"
+                          "estimatedCost": 0.8,
+                          "estimatedRows": 1,
+                          "matchedClauses": 1,
+                          "usableIndex": "idx=_primary_(0);plan=2"
                         },
-                        "indexName": "_primary_",
+                        "indexName": "primary",
+                        "isRange": false,
                         "providesOrdering": [
                           {
                             "column": 0,
@@ -481,16 +500,17 @@
                           }
                         ],
                         "schema": "main",
+                        "seekKeys": [
+                          "dept_id"
+                        ],
                         "table": "departments"
                       },
-                      "nodeType": "IndexScan",
-                      "op": "INDEXSCAN",
+                      "nodeType": "IndexSeek",
+                      "op": "INDEXSEEK",
                       "physical": {
-                        "accessCapabilities": {
-                          "asofRight": true
-                        },
                         "concurrencySafe": true,
                         "deterministic": true,
+                        "estimatedRows": 1,
                         "expectedLatencyMs": 0,
                         "expectedRowLatencyMs": 0,
                         "fds": [
@@ -506,13 +526,6 @@
                           }
                         ],
                         "idempotent": true,
-                        "monotonicOn": [
-                          {
-                            "attrId": 4,
-                            "direction": "asc",
-                            "strict": true
-                          }
-                        ],
                         "ordering": [
                           {
                             "column": 0,
@@ -561,6 +574,7 @@
                   "physical": {
                     "concurrencySafe": true,
                     "deterministic": true,
+                    "estimatedRows": 1,
                     "expectedLatencyMs": 0,
                     "expectedRowLatencyMs": 0,
                     "fds": [
@@ -576,13 +590,6 @@
                       }
                     ],
                     "idempotent": true,
-                    "monotonicOn": [
-                      {
-                        "attrId": 4,
-                        "direction": "asc",
-                        "strict": true
-                      }
-                    ],
                     "ordering": [
                       {
                         "column": 0,
@@ -620,22 +627,70 @@
                       "size": 3
                     }
                   }
+                },
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "detail": "dept_id",
+                      "logical": {
+                        "attributeId": 3,
+                        "column": "dept_id",
+                        "resultType": "INTEGER"
+                      },
+                      "nodeType": "ColumnReference",
+                      "op": "COLUMNREFERENCE",
+                      "physical": {
+                        "constant": false,
+                        "deterministic": true,
+                        "idempotent": true,
+                        "readonly": true
+                      }
+                    },
+                    {
+                      "children": [],
+                      "detail": "id",
+                      "logical": {
+                        "attributeId": 4,
+                        "column": "id",
+                        "resultType": "INTEGER"
+                      },
+                      "nodeType": "ColumnReference",
+                      "op": "COLUMNREFERENCE",
+                      "physical": {
+                        "constant": false,
+                        "deterministic": true,
+                        "idempotent": true,
+                        "readonly": true
+                      }
+                    }
+                  ],
+                  "detail": "u.dept_id = d.id",
+                  "logical": {
+                    "left": "u.dept_id",
+                    "operator": "=",
+                    "resultType": "BOOLEAN",
+                    "right": "d.id"
+                  },
+                  "nodeType": "BinaryOp",
+                  "op": "BINARYOP",
+                  "physical": {
+                    "concurrencySafe": true,
+                    "deterministic": true,
+                    "expectedLatencyMs": 0,
+                    "expectedRowLatencyMs": 0,
+                    "idempotent": true,
+                    "readonly": true
+                  }
                 }
               ],
-              "detail": "INNER HASH JOIN on [3=4]",
+              "detail": "INNER JOIN ON condition",
               "logical": {
-                "algorithm": "bloom",
-                "equiPairs": [
-                  {
-                    "left": 3,
-                    "right": 4
-                  }
-                ],
-                "hasResidual": false,
+                "hasCondition": true,
                 "joinType": "inner"
               },
-              "nodeType": "HashJoin",
-              "op": "HASHJOIN",
+              "nodeType": "Join",
+              "op": "JOIN",
               "physical": {
                 "concurrencySafe": true,
                 "deterministic": true,
@@ -692,7 +747,68 @@
                   }
                 ],
                 "idempotent": true,
-                "readonly": true
+                "readonly": true,
+                "updateLineage": {
+                  "$map": [
+                    [
+                      "0",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "id"
+                      }
+                    ],
+                    [
+                      "1",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "name"
+                      }
+                    ],
+                    [
+                      "2",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "age"
+                      }
+                    ],
+                    [
+                      "3",
+                      {
+                        "kind": "base",
+                        "table": 4,
+                        "baseColumn": "dept_id"
+                      }
+                    ],
+                    [
+                      "4",
+                      {
+                        "kind": "base",
+                        "table": 7,
+                        "baseColumn": "id"
+                      }
+                    ],
+                    [
+                      "5",
+                      {
+                        "kind": "base",
+                        "table": 7,
+                        "baseColumn": "name"
+                      }
+                    ],
+                    [
+                      "6",
+                      {
+                        "kind": "base",
+                        "table": 7,
+                        "baseColumn": "budget"
+                      }
+                    ]
+                  ],
+                  "size": 7
+                }
               }
             },
             {

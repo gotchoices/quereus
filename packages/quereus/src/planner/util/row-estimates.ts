@@ -52,6 +52,23 @@ export function costedRows(rows: number | undefined, unknown: number): number {
 }
 
 /**
+ * A Filter's output cardinality as a pure function of its source's and a
+ * selectivity — shared by `FilterNode`'s logical `estimatedRows` getter, its
+ * `computePhysical` (which feeds it the PHYSICAL source count), and the join
+ * rule's relative estimate (`planner/util/relative-rows.ts`) so the three cannot
+ * drift. The caller resolves the selectivity (stamped, or the last-resort
+ * `DEFAULT_FILTER_SELECTIVITY`).
+ *
+ * A non-empty source floors at one row — selectivity 0 (the provider says nothing
+ * matches) must not price the Filter at nothing — while a genuinely empty source
+ * stays 0, matching {@link aggregateRowsFrom}'s convention.
+ */
+export function filterRowsFrom(sourceRows: number | undefined, selectivity: number): number | undefined {
+	if (sourceRows === undefined) return undefined;
+	return sourceRows > 0 ? Math.max(1, Math.floor(sourceRows * selectivity)) : 0;
+}
+
+/**
  * An aggregate's output cardinality as a pure function of its source's — shared
  * by every aggregate node's logical `estimatedRows` getter and its
  * `computePhysical` (which feeds it the PHYSICAL source count) so the two cannot

@@ -29,7 +29,9 @@ class ReportingMemoryModule extends MemoryTableModule {
 }
 
 describe('Cardinality feedback overlay', () => {
-	const joinSql = 'select m.x, b.w from mid m join big b on b.id = m.big_id where m.x = 1';
+	// Unfiltered on purpose: with both sides at the no-statistics default the hash join
+	// wins, and only a learned size for `big` makes the primary-key seek cheaper.
+	const joinSql = 'select m.x, b.w from mid m join big b on b.id = m.big_id';
 	let db: Database;
 
 	beforeEach(() => {
@@ -235,7 +237,7 @@ describe('Cardinality feedback overlay', () => {
 			try {
 				expect(stmt.getPlanShape().nodeTypes).to.include.keys('HashJoin', 'IndexScan');
 				const first = await joinedWs(stmt);
-				expect(first).to.have.length(60);
+				expect(first).to.have.length(300);
 
 				// The shift only marked the cached plan; it is dropped when the next run starts.
 				expect(stmt.getPlanShape().nodeTypes).to.include.keys('HashJoin');
@@ -267,7 +269,7 @@ describe('Cardinality feedback overlay', () => {
 				expect(initial).to.include.keys('HashJoin');
 				expect(initial).to.not.have.property('IndexSeek');
 				const first = await joinedWs(stmt);
-				expect(first).to.have.length(60);
+				expect(first).to.have.length(300);
 
 				module.answer = { rows: 20_000, exact: true };
 				expect(await joinedWs(stmt)).to.deep.equal(first);

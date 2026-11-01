@@ -11,6 +11,7 @@ import { normalizePredicate } from '../analysis/predicate-normalizer.js';
 import { addFd, addSingletonFd, closeConstantBindingsOverEcs, extractEqualityFds, mergeConstantBindings, mergeEquivClasses, predicateImpliesGuard, stripGuard } from '../util/fd-utils.js';
 import { deriveFilterAttributeDefaults } from '../analysis/update-lineage.js';
 import { filterCost } from '../cost/index.js';
+import { filterRowsFrom } from '../util/row-estimates.js';
 
 /**
  * Last-resort selectivity used by {@link FilterNode.estimatedRows} when no
@@ -77,12 +78,7 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		// before that rule runs (e.g. Structural-pass cost comparisons) or when the
 		// source table can't be identified / the provider declines — it is NOT the
 		// real heuristic path, which lives in the stats provider.
-		const sourceRows = this.source.estimatedRows;
-		if (sourceRows === undefined) return undefined;
-		const sel = this.selectivity ?? DEFAULT_FILTER_SELECTIVITY;
-		// selectivity 0 (provider says nothing matches) floors to 1, matching the
-		// empty-source path's min-1 convention — never negative / NaN.
-		return sourceRows > 0 ? Math.max(1, Math.floor(sourceRows * sel)) : 0;
+		return filterRowsFrom(this.source.estimatedRows, this.selectivity ?? DEFAULT_FILTER_SELECTIVITY);
 	}
 
 	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
@@ -95,11 +91,11 @@ export class FilterNode extends PlanNode implements UnaryRelationalNode, Predica
 		// count, so the getter yields undefined and the selectivity stamped by
 		// `rule-filter-selectivity` would be lost after the Retrieve→access-node
 		// conversion. computePhysical holds the real physical source cardinality, so
-		// apply selectivity here when stamped (matching the getter's min-1 / 0-empty
-		// floor); fall back to the logical estimate (min against source) when unstamped.
+		// apply selectivity here when stamped (the getter's shared formula); fall back
+		// to the logical estimate (min against source) when unstamped.
 		let rows: number | undefined;
 		if (typeof srcRows === 'number' && this.selectivity !== undefined) {
-			rows = srcRows > 0 ? Math.max(1, Math.floor(srcRows * this.selectivity)) : 0;
+			rows = filterRowsFrom(srcRows, this.selectivity);
 		} else if (typeof srcRows === 'number' && typeof est === 'number') {
 			rows = Math.min(srcRows, est);
 		} else {

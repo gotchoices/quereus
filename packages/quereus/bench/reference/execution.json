@@ -2,11 +2,11 @@
 	"suite": "execution",
 	"accepted": {
 		"by": "Nathan Allan <nate@digithought.com>",
-		"commit": "db93b1891",
-		"date": "2026-11-01T08:59:19.081Z",
+		"commit": "df663de68",
+		"date": "2026-11-01T11:26:19.946Z",
 		"node": "v24.2.0",
 		"platform": "win32",
-		"reason": "feat-planner-asks-the-backend-how-big-a-table-is: store tables are sized from the module's live row count at plan time, so join-1kx1k@store-mem plans its sides in a different order; same rows scanned and sought"
+		"reason": "unknown-size-join-scans-instead-of-seeking: never-analyzed right_t is now priced at the 1000-row no-statistics default instead of a flat 100, so the hash join builds on the filtered left range seek (est. 250, real 100) and probes the 1000-row scan; same instructions and row counts, emission order swapped"
 	},
 	"benchmarks": {
 		"correlated-subquery": {
@@ -1316,22 +1316,22 @@
 						"executions": 1,
 						"in": 0,
 						"key": "r#0",
+						"nodeType": "IndexScan",
+						"out": 1000
+					},
+					{
+						"executions": 1,
+						"in": 0,
+						"key": "r#1",
 						"nodeType": "Literal",
 						"out": 1
 					},
 					{
 						"executions": 1,
 						"in": 1,
-						"key": "r#1",
+						"key": "r#2",
 						"nodeType": "IndexSeek",
 						"out": 100
-					},
-					{
-						"executions": 1,
-						"in": 0,
-						"key": "r#2",
-						"nodeType": "IndexScan",
-						"out": 1000
 					},
 					{
 						"executions": 1,

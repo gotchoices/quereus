@@ -38,10 +38,11 @@ import { nestedLoopJoinCost, hashJoinCost, mergeJoinCost } from '../../cost/inde
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { extractEquiPairs, combineResidual, isMergeReadyOnAllPairs } from './equi-pair-extractor.js';
 import { readsColumnsOf } from '../../cache/correlation-detector.js';
+import { relativeRows } from '../../util/relative-rows.js';
 
 const log = createLogger('optimizer:rule:monotonic-merge-join');
 
-export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): PlanNode | null {
+export function ruleMonotonicMergeJoin(node: PlanNode, context: OptContext): PlanNode | null {
 	if (!(node instanceof JoinNode)) return null;
 
 	// Existence-flag joins must stay the nested-loop JoinNode (see
@@ -130,19 +131,27 @@ export function ruleMonotonicMergeJoin(node: PlanNode, _context: OptContext): Pl
 	const residual = combineResidual(extracted.residual, extras);
 
 	// Cost gate: even with the precondition met, hash or nested-loop may win
-	// on tiny inputs. Don't regress those.
-	const leftRows = node.left.estimatedRows ?? 100;
-	const rightRows = node.right.estimatedRows ?? 100;
+	// on tiny inputs. Don't regress those. Sides are priced the way
+	// `rule-join-physical-selection` prices them (`relativeRows`), so an
+	// unknown side reads the same default in both rules.
+	// NOTE: index-nested-loop is not among the rivals, so when both sides are
+	// monotonic on the key this rule can pre-empt a cheaper per-row seek into an
+	// indexed inner. Fine while `monotonicOn` is rare (the memory module
+	// advertises it only for a named-index walk); revisit if this rule starts
+	// winning over seekable inners — price index-NL here or defer to that rule.
+	const unknownLeafRows = context.tuning.defaultRowEstimate;
+	const leftRows = relativeRows(node.left, unknownLeafRows);
+	const rightRows = relativeRows(node.right, unknownLeafRows);
 	const mergeC = mergeJoinCost(leftRows, rightRows, false, false);
 	const hashC = hashJoinCost(Math.min(leftRows, rightRows), Math.max(leftRows, rightRows));
 	const nlC = nestedLoopJoinCost(leftRows, rightRows);
 	if (Math.min(hashC, nlC) < mergeC) {
-		log('Skipping monotonic-merge: cheaper alternative exists (merge=%.2f, hash=%.2f, nl=%.2f)',
+		log('Skipping monotonic-merge: cheaper alternative exists (merge=%d, hash=%d, nl=%d)',
 			mergeC, hashC, nlC);
 		return null;
 	}
 
-	log('Selecting monotonic merge-join on equi-pair %d=%d (merge=%.2f, hash=%.2f, nl=%.2f)',
+	log('Selecting monotonic merge-join on equi-pair %d=%d (merge=%d, hash=%d, nl=%d)',
 		driving[0].leftAttrId, driving[0].rightAttrId, mergeC, hashC, nlC);
 
 	return new MergeJoinNode(

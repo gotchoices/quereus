@@ -12,7 +12,7 @@ Quereus targets deployments where table storage may sit behind a network — a d
 
 | Principle | Implication |
 |---|---|
-| **Stats are hints, not prerequisites** | Missing statistics degrade to defaults, never to a bad plan shape by construction; an unknown row count is spelled `undefined` and never disguised as a measurement. |
+| **Stats are hints, not prerequisites** | Missing statistics degrade to defaults, never to a bad plan shape by construction; an unknown row count is spelled `undefined` and never disguised as a measurement. Join selection prices an unmeasured side at the one shared default (`tuning.defaultRowEstimate`) narrowed by the filters and joins above it, so a filtered or single-row side joined to an indexed table seeks that table rather than scanning it ([Optimizer Joins](optimizer-joins.md#physical-join-algorithm-selection), *Side row counts*). |
 | **Never block on optimization** | Planning performs no I/O: it reads the in-memory catalog and asks modules for synchronous access-plan quotes. Feedback only ever changes the *next* plan. |
 | **Learn from essential execution** | Observations piggyback on work a query already does. Nothing issues a query, a scan or a module call just to learn something. |
 | **No new pipeline breakers** | Instrumentation is a counter in a loop that already touches every row. It never buffers, reorders or materializes rows. |
@@ -39,7 +39,7 @@ The gap these leave: a table this session has not written and whose module repor
 
 When a query happens to read an entire table, the engine now knows that table's exact size for free; when it reads only part of one — stopped by a `LIMIT`, or walking one index range — it knows a floor under that size. Cardinality feedback records both, lets later plans use them in place of a default or an outdated `ANALYZE` snapshot, and re-plans cached statements whose plans were costed against a number that turned out to be far off.
 
-Measured on the in-memory backend (one machine, a 20,000-row table `big` and a 300-row table `mid`, never analyzed): `select m.x, b.w from mid m join big b on b.id = m.big_id where m.x = 1` plans as a hash join over a full scan of `big` and runs in 16.6 ms. With only `big`'s row count known — no column statistics — the same statement plans as a nested-loop join seeking `big` by primary key and runs in 1.76 ms. The full scan in the first plan is exactly the observation that produces the second.
+Measured on the in-memory backend (one machine, a 20,000-row table `big` and a 300-row table `mid`, never analyzed, median of 11 runs): `select m.x, b.w from mid m join big b on b.id = m.big_id` prices both tables at the 1000-row default, plans as a hash join over a full scan of `big` (hash 1,200 against 1,800 for a seek per `mid` row) and runs in 15.5 ms. With only `big`'s row count known — no column statistics — the same statement plans as a nested-loop join seeking `big` by primary key (1,800 against hash 8,800) and runs in 3.0 ms. The full scan in the first plan is exactly the observation that produces the second.
 
 ### 3.1 What is observed
 
@@ -194,7 +194,6 @@ Both triggers share the pacing:
 
 Queued, in this order (tickets in `tickets/implement/`, `fix/` and `plan/`; each section above changes only when its ticket lands):
 
-- **Unknown sizes default consistently** — with no statistics, join selection prices an unknown side at 100 rows and ignores reductions above it, so a filtered or single-row side joined to an indexed table full-scans that table: `unknown-size-join-scans-instead-of-seeking` (fix stage).
 - **Rows per key from executed seeks** — the first slice beyond table size: `cardinality-feedback-rows-per-key` (plan stage).
 
 Still deferred:

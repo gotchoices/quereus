@@ -170,7 +170,8 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode, 
 		return this.rowsFrom(this.source.estimatedRows);
 	}
 
-	private rowsFrom(sourceRows: number | undefined): number | undefined {
+	/** Output rows from a source count — also read by `planner/util/relative-rows.ts`. */
+	rowsFrom(sourceRows: number | undefined): number | undefined {
 		return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 10);
 	}
 

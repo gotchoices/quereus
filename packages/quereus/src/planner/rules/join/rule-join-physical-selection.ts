@@ -61,7 +61,7 @@ import {
 } from './equi-pair-extractor.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
 import { readsColumnsOf } from '../../cache/correlation-detector.js';
-import { costedRows, physicalSourceRows } from '../../util/row-estimates.js';
+import { relativeRows } from '../../util/relative-rows.js';
 import { tryIndexNestedLoop, type IndexNestedLoopCandidate } from './index-nested-loop.js';
 import { nestedLoopRightOpensOnce } from '../cache/rule-nested-loop-right-cache.js';
 
@@ -91,36 +91,33 @@ function mayMirrorIndexNestedLoop(node: JoinNode): boolean {
 }
 
 /**
- * The ONE place the unknown-side default is spelled, so every term — work and
- * latency alike — moves together when `unknown-size-join-scans-instead-of-seeking`
- * changes it.
+ * Row count this rule plans a side with — every work and latency term reads it.
+ * By PostOptimization both sides are physical access nodes (or wrappers over
+ * them) which declare no logical `estimatedRows` getter — the catalog-derived
+ * count lives in `physical.estimatedRows` (see planner/util/row-estimates.ts).
+ * A side nobody measured is priced relatively (`relativeRows`): the shared
+ * no-statistics default at its unknown leaf, narrowed by the filters and joins
+ * above it, so a filtered unknown side is not mistaken for the whole table and
+ * an unknown table is not mistaken for a small one.
  */
-const UNKNOWN_SIDE_ROWS = 100;
-
-/**
- * Row count this rule plans a side with. By PostOptimization both sides are
- * physical access nodes (or wrappers over them) which declare no logical
- * `estimatedRows` getter — the catalog-derived count lives in
- * `physical.estimatedRows` (see planner/util/row-estimates.ts).
- */
-function sideRows(side: RelationalPlanNode): number {
-	return costedRows(physicalSourceRows(side.physical, side), UNKNOWN_SIDE_ROWS);
+function sideRows(side: RelationalPlanNode, tuning: OptimizerTuning): number {
+	return relativeRows(side, tuning.defaultRowEstimate);
 }
 
 /**
  * Rows a side pulls from storage when drained once. A side that peels to a
  * single access leaf reads that leaf's whole yield — a Filter above a scan
  * still pulls every row the scan returns, so the side's own (filtered) estimate
- * would under-count — hence the leaf's count is the honest figure. A side that
- * does not peel (a join, an aggregate) falls back to its own estimate, which
+ * would under-count — hence the leaf's count is the honest figure (an unknown
+ * leaf at the same default `sideRows` starts from). A side that does not peel
+ * (a join, an aggregate) falls back to its own estimate `rows`, which
  * under-counts rows read beneath a filter or aggregate inside it: a known
- * approximation, stated in docs/optimizer-joins.md. `rows` is the side's
- * `sideRows`, so an unknown leaf count inherits that one default.
+ * approximation, stated in docs/optimizer-joins.md.
  */
-function rowsRead(side: RelationalPlanNode, rows: number): number {
+function rowsRead(side: RelationalPlanNode, rows: number, tuning: OptimizerTuning): number {
 	const leaf = peelToSeekableAccessLeaf(side);
 	if (!leaf) return rows;
-	return costedRows(physicalSourceRows(leaf.physical, leaf), rows);
+	return sideRows(leaf, tuning);
 }
 
 /**
@@ -130,11 +127,11 @@ function rowsRead(side: RelationalPlanNode, rows: number): number {
  * 0). The leaf peel only runs when a per-row latency is actually declared, so
  * the zero-latency hot path does not pay for it.
  */
-function readMs(side: RelationalPlanNode, rows: number): number {
+function readMs(side: RelationalPlanNode, rows: number, tuning: OptimizerTuning): number {
 	const firstRowMs = side.physical.expectedLatencyMs ?? 0;
 	const rowMs = side.physical.expectedRowLatencyMs ?? 0;
 	if (rowMs === 0) return firstRowMs;
-	return firstRowMs + rowsRead(side, rows) * rowMs;
+	return firstRowMs + rowsRead(side, rows, tuning) * rowMs;
 }
 
 /**
@@ -332,8 +329,9 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	}
 
 	// Cost comparison: nested loop vs hash join vs merge join vs index-nested-loop.
-	const leftRows = sideRows(node.left);
-	const rightRows = sideRows(node.right);
+	const tuning = context.tuning;
+	const leftRows = sideRows(node.left, tuning);
+	const rightRows = sideRows(node.right, tuning);
 
 	// Latency accounting, applied uniformly to every candidate below: a candidate
 	// is charged ONE drain of its outer side plus however many drains of its
@@ -343,9 +341,8 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// `tuning.latencyCostPerMs` (`latencyCost`), which happens exactly where a
 	// candidate's total is formed. Charged locally here, not inside the shared
 	// cost functions, which other callers use latency-free.
-	const tuning = context.tuning;
-	const rightReadMs = readMs(node.right, rightRows);
-	const leftReadCost = latencyCost(readMs(node.left, leftRows), tuning);
+	const rightReadMs = readMs(node.right, rightRows, tuning);
+	const leftReadCost = latencyCost(readMs(node.left, leftRows, tuning), tuning);
 	const rightReadCost = latencyCost(rightReadMs, tuning);
 
 	// Plain nested loop: one drain of the left, and one drain of the right per
@@ -391,7 +388,7 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// row, not per scanned row. `condition` is defined — equi pairs were
 	// extracted from it above.
 	const rebuildWithIndexNL = (): PlanNode => {
-		log('Selecting index-nested-loop join (cost=%.2f) for %d outer rows', indexNL!.cost, leftRows);
+		log('Selecting index-nested-loop join (cost=%d) for %d outer rows', indexNL!.cost, leftRows);
 		return node.withChildren([node.left, indexNL!.newInner, node.condition!]);
 	};
 	// The mirrored rebuild is a NEW JoinNode with the children exchanged.
@@ -412,7 +409,7 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// without ORDER BY, which is permitted (hash join already does it).
 	// `existence` is omitted: `mayMirrorIndexNestedLoop` excludes flag joins.
 	const rebuildWithMirroredNL = (): PlanNode => {
-		log('Selecting mirrored index-nested-loop join (cost=%.2f) for %d outer rows (sides exchanged)',
+		log('Selecting mirrored index-nested-loop join (cost=%d) for %d outer rows (sides exchanged)',
 			mirroredNL!.cost, rightRows);
 		return new JoinNode(node.scope, node.right, mirroredNL!.newInner, 'inner',
 			node.condition, node.usingColumns);
@@ -490,8 +487,8 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 
 	// Pick the cheapest physical join algorithm. Every comparison is a strict
 	// `<` in this fixed order, so an exact tie keeps the earlier entry: in
-	// particular two un-analyzed sides (both at the 100-row default) cost the
-	// two index-NL orientations identically, and the un-mirrored one wins — a
+	// particular two un-analyzed sides (both at the no-statistics default) cost
+	// the two index-NL orientations identically, and the un-mirrored one wins — a
 	// plan must not flip its drive side on a coin toss. Each batched candidate
 	// sits directly after its serial counterpart, un-mirrored pair before
 	// mirrored pair: a batched candidate is at most as dear as its serial one

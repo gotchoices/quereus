@@ -596,9 +596,10 @@ describe('index-nested-loop join plan shape', () => {
 		});
 
 		it('keeps the spelled orientation when neither side is analyzed (no coin toss)', async () => {
-			// Both sides at the 100-row default cost the two orientations identically
-			// (each seeks a primary key: 100 × 1.8 = 180) — and hash (120) / merge
-			// beat both, so neither fires and the join keeps its spelled orientation.
+			// Both sides at the 1000-row no-statistics default cost the two orientations
+			// identically (each seeks a primary key: 1000 × 1.8 = 1800) — and hash
+			// (1200) / merge beat both, so neither fires and the join keeps its spelled
+			// orientation.
 			// An exact tie that an index-NL WINS is unreachable under the cost
 			// constants (at equal cardinality n, index-NL ≥ 1.5n while hash is
 			// 1.2n), so the tie-break itself cannot be observed end to end; the
@@ -612,7 +613,7 @@ describe('index-nested-loop join plan shape', () => {
 			const plan = db.getPlan('select ua.v from ua join ub on ub.id = ua.id');
 			expect(correlatedSeekJoins(plan)).to.have.lengthOf(0);
 			expect(collectNodes(plan, isIndexSeek), 'no seek in either direction').to.have.lengthOf(0);
-			// Both primary-key walks are ordered, so merge (60) beats hash here; either
+			// Both primary-key walks are ordered, so merge (600) beats hash here; either
 			// way the physical join's left is the first-named table.
 			const physical = [...collectNodes(plan, isHashJoin), ...collectNodes(plan, isMergeJoin)];
 			expect(physical, 'one physical join').to.have.lengthOf(1);
@@ -881,5 +882,61 @@ describe('index-nested-loop join plan shape', () => {
 		it('an unselective index (100 rows per seek) loses at equal cardinalities', () => {
 			expect(indexNestedLoopJoinCost(100, 100)).to.be.greaterThan(hash(100, 100));
 		});
+	});
+});
+
+describe('index-nested-loop over never-analyzed tables', () => {
+	// With no statistics anywhere, a filtered or single-row outer joined to an
+	// indexed table must still seek that table rather than read all of it: the
+	// unknown table is priced at the shared no-statistics default, and the
+	// outer's filter narrows that default instead of being lost to it.
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		await db.exec('pragma auto_analyze = false');
+		await db.exec('pragma cardinality_feedback = false');
+		await db.exec('create table big (id integer primary key, w integer, k integer)');
+		await db.exec('create index big_k on big(k)');
+		await db.exec('create table mid (id integer primary key, x integer, big_id integer)');
+		await db.exec('create table small (id integer primary key, v integer)');
+		await db.exec('insert into big select value, value % 97, value % 50 from generate_series(1, 2000)');
+		await db.exec('insert into mid select value, value % 20, value * 61 % 2000 + 1 from generate_series(1, 300)');
+		await db.exec('insert into small select value, value from generate_series(1, 10)');
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	/** `big` is only ever reached through a seek: no hash join, no full walk of it. */
+	function expectBigOnlySeeked(plan: PlanNode): void {
+		expect(collectNodes(plan, isHashJoin), 'no hash join').to.have.lengthOf(0);
+		const bigReads = collectNodes(plan, isTableAccess).filter(n => n.tableSchema.name === 'big');
+		expect(bigReads.length, 'big is read').to.be.greaterThan(0);
+		expect(bigReads.every(isIndexSeek), 'every read of big is a seek').to.equal(true);
+	}
+
+	it('seeks a primary-key inner under a filtered outer (inner and left joins)', () => {
+		for (const join of ['join', 'left join']) {
+			const plan = db.getPlan(`select m.x, b.w from mid m ${join} big b on b.id = m.big_id where m.x = 1`);
+			expect(soleSeekOrientation(plan), join).to.deep.equal({ outer: ['mid'], seekOn: 'big' });
+			expectBigOnlySeeked(plan);
+		}
+	});
+
+	it('seeks a primary-key inner when the filter sits below another join', () => {
+		const plan = db.getPlan(
+			'select s.v, m.x, b.w from small s join mid m on m.id = s.v join big b on b.id = m.big_id where s.v = 3');
+		const seekedTables = correlatedSeekJoins(plan)
+			.flatMap(join => collectNodes(join.right, isIndexSeek).map(seek => seek.tableSchema.name));
+		expect(seekedTables).to.include('big');
+		expectBigOnlySeeked(plan);
+	});
+
+	it('seeks a secondary-index inner under a single-row outer', () => {
+		const plan = db.getPlan('select s.v, b.id from small s join big b on b.k = s.v where s.id = 2');
+		expect(soleSeekOrientation(plan)).to.deep.equal({ outer: ['small'], seekOn: 'big' });
+		expectBigOnlySeeked(plan);
 	});
 });

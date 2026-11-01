@@ -142,6 +142,9 @@ describe('index seek row estimates', () => {
 		await db.exec('create table probe (id integer primary key, big_id integer)');
 		try {
 			await db.exec('insert into probe values (1, 1), (2, 2)');
+			// Analyzed so the outer reads as two rows; never analyzed it is priced at the
+			// no-statistics default, where one hash build over `big` beats a seek per row.
+			for await (const _ of db.eval('analyze probe')) { /* consume */ }
 			const plan = db.getPlan('select p.id, b.s from probe p join big b on b.id = p.big_id');
 			const seek = findSeek(plan);
 			expect(seek?.source.tableSchema.name, 'expected a correlated seek into `big`').to.equal('big');

@@ -61,6 +61,11 @@ describe('key-set-seek plan shape', () => {
 		// `v` is secondary-indexed (the seek target); `w` has no index.
 		await db.exec('create table big (pk integer primary key, v integer, w integer)');
 		await db.exec('create index idx_v on big(v)');
+		// The rewrite's premise is a small key source. Measured (empty), `small` prices
+		// at one row; never analyzed it prices at the 1000-row default, and a filtered
+		// `big` then drives an index-nested-loop semi join seeking `small` instead of
+		// the hash semi join this rule rewrites.
+		for await (const _ of db.eval('analyze small')) { /* consume */ }
 	});
 
 	afterEach(async () => {
@@ -738,6 +743,8 @@ describe('key-set-seek plan shape', () => {
 			await pdb.exec('create table big (pk integer primary key, v integer, w integer, s text)');
 			await pdb.exec('create index idx_v on big(v)');
 			await pdb.exec('create index idx_s on big(s)');
+			// A measured-small key source, as in the outer fixture.
+			for await (const _ of pdb.eval('analyze small')) { /* consume */ }
 		});
 
 		afterEach(async () => {

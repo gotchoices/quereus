@@ -293,7 +293,8 @@ export class AggregateNode extends PlanNode implements UnaryRelationalNode, Aggr
     return this.rowsFrom(this.source.estimatedRows);
   }
 
-  private rowsFrom(sourceRows: number | undefined): number | undefined {
+  /** Output rows from a source count — also read by `planner/util/relative-rows.ts`. */
+  rowsFrom(sourceRows: number | undefined): number | undefined {
     // The logical node is deliberately more conservative than its physical
     // counterparts about how much a GROUP BY collapses: 2 rows per group, not 10.
     return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 2);
