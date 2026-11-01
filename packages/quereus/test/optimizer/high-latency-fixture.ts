@@ -1,8 +1,10 @@
 /**
- * Synthetic slow-storage table types for the optimizer specs. No in-tree module
- * reports a non-zero first-row latency, so the latency-gated rules (the parallel
- * gather / zip-by-key / prefetch-probe rewrites, the batched-outer flip, fan-out
- * recognition, and the join latency charges) would stay inert without them.
+ * Synthetic slow-storage table types for the optimizer specs. The engine's
+ * memory module reports no latency, and the in-tree store backends declare only
+ * in-process presets far below the 25 ms gates, so the latency-gated rules (the
+ * parallel gather / zip-by-key / prefetch-probe rewrites, the batched-outer flip,
+ * fan-out recognition) would stay inert without them, and the join latency
+ * charges would go unexercised in this package.
  *
  * Not registered with the `test/plan/` golden sweep — goldens run on plain
  * `MemoryTableModule`.

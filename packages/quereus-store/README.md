@@ -115,8 +115,8 @@ across an IPC boundary on IndexedDB. A provider can therefore declare a `costPro
 
 | knob | what it prices | parity default | declared by IndexedDB |
 |---|---|---|---|
-| `firstRowLatencyMs` | ms before an opened iterator yields its first row | 0 | — |
-| `perRowLatencyMs` | ms per further row in a sequential iterate | 0 | — |
+| `firstRowLatencyMs` | ms before an opened iterator yields its first row | 0 | `browserIdb` preset |
+| `perRowLatencyMs` | ms per further row in a sequential iterate | 0 | `browserIdb` preset |
 | `pointRead` | resolving one secondary-index entry to the row it names | 1.0 | 3.0 |
 | `seekPositioning` | one key of a multi-seek — positioning the window *and* reading its row | 0.5 | 5.0 |
 
@@ -139,10 +139,13 @@ wall-clock because the rules gating on them compare against literal millisecond 
 (25 ms today), so a device-relative number would mean nothing to them; declare the category
 preset rather than invent a precise number. IndexedDB's ratios come from the benchmark in
 `packages/quereus-plugin-indexeddb/bench/README.md`; LevelDB declares no ratios, deliberately.
-**No in-tree provider declares a latency yet** — LevelDB's and IndexedDB's decisions, with
-their revisit conditions, are recorded as `NOTE:` comments at those two providers, and the
-other two in-tree providers (React Native LevelDB, NativeScript SQLite) are in-process
-backends that declare nothing for the same reason LevelDB does.
+**Every in-tree provider declares its latency category:** LevelDB, React Native LevelDB and
+NativeScript SQLite declare `COST_PRESETS.localDisk`; IndexedDB declares
+`COST_PRESETS.browserIdb` spread with its measured ratios. Neither category clears the 25 ms
+gates, so the declarations move join selection and nothing else. The decisions, with their
+revisit conditions, are recorded as `NOTE:` comments at the LevelDB and IndexedDB providers.
+The in-memory test provider (`createInMemoryProvider`, below) declares nothing and plans at
+parity.
 
 `seekPositioning` is the knob that moves plan choice today: it is what the engine's key-set
 rewrite reads when it interpolates the key count at which a seek overtakes the plan it would

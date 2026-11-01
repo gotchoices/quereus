@@ -171,7 +171,8 @@ function estimatePlanCost(plan: RelationalPlanNode): number {
   // in-process. Only `rule-join-physical-selection` prices latency, and only
   // per join. If a remote relation ever needs to be ordered by its latency,
   // add a drain term here (`latencyCost` in cost/index.ts); not done because
-  // no in-tree module declares either hint.
+  // in-tree modules declare at most the in-process presets (`localDisk`,
+  // `browserIdb`), and a database's tables usually share one backend.
   return plan.getTotalCost();
 }
 

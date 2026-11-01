@@ -4,8 +4,10 @@
  * A module's cost profile may declare `firstRowLatencyMs` — how long its
  * tables take to produce the FIRST row of a freshly opened iterator — and
  * `perRowLatencyMs`, the wall-clock per row after that in a sequential read;
- * the leaf lifts them as `expectedLatencyMs` / `expectedRowLatencyMs`. Every
- * in-tree module declares 0 for both; a network-backed one would not. A side's
+ * the leaf lifts them as `expectedLatencyMs` / `expectedRowLatencyMs`. The
+ * memory module declares 0 for both; the in-tree store backends declare the
+ * in-process `localDisk` / `browserIdb` presets; a network-backed one would
+ * declare far more. A side's
  * DRAIN is `readMs = firstRowMs + rowsRead × rowMs`, and the selection rule
  * charges each candidate one drain of its OUTER side plus however many drains
  * of its INNER side it performs:

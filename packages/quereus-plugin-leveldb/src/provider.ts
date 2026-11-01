@@ -22,9 +22,9 @@
 
 import { ClassicLevel, type ChainedBatch } from 'classic-level';
 import type { AbstractSublevel } from 'abstract-level';
-import type { AtomicBatch, KVStore, KVStoreProvider } from '@quereus/store';
+import type { AtomicBatch, KVCostProfile, KVStore, KVStoreProvider } from '@quereus/store';
 import { buildDataStoreName, buildIndexStoreName, CATALOG_STORE_NAME, STATS_STORE_NAME } from '@quereus/store';
-import { QuereusError, StatusCode } from '@quereus/quereus';
+import { COST_PRESETS, QuereusError, StatusCode } from '@quereus/quereus';
 import { LevelDBStore } from './store.js';
 
 /** The shared physical root database. */
@@ -99,12 +99,12 @@ export interface LevelDBProviderOptions {
  * LevelDB implementation of KVStoreProvider over a single shared root with one
  * sublevel per logical store.
  */
-// NOTE: no `costProfile` declared, deliberately — and as of 2026-08-19 that is a MEASURED
-// decision, not the absence of one. This provider takes the store framework's parity
-// defaults (`pointRead: 1.0`, `seekPositioning: 0.5`). `bench/suites/store.bench.mjs`'s
-// `leveldb-read-cost-*` rows measured both knobs at the key-value layer over 200-byte
-// values; the full table, machine and caveats are in this package's README
-// (§ Measured read cost). In short:
+// NOTE: no cost RATIOS (`pointRead`, `seekPositioning`) in the `costProfile`, deliberately —
+// and as of 2026-08-19 that is a MEASURED decision, not the absence of one. This provider
+// takes the store framework's parity defaults (`pointRead: 1.0`, `seekPositioning: 0.5`).
+// `bench/suites/store.bench.mjs`'s `leveldb-read-cost-*` rows measured both knobs at the
+// key-value layer over 200-byte values; the full table, machine and caveats are in this
+// package's README (§ Measured read cost). In short:
 //
 //  - `pointRead` came back NEAR the 1.0 default (around 1.3-1.6), and an OVER-statement of
 //    it besides: the planner's 1.0 unit is a scanned row INCLUDING engine work, while these
@@ -133,15 +133,18 @@ export interface LevelDBProviderOptions {
 // is priced 30x too cheap. The decision itself stays open as
 // backlog/debt-leveldb-cost-profile-measurement.
 //
-// NOTE: no `firstRowLatencyMs` or `perRowLatencyMs` in the cost profile either (so the module
-// resolves both to the 0 default). Unlike the cost profile above, these are UNMEASURED — nothing has ever
-// timed this backend's first-row or per-row latency — so the declare-only-measured rule
-// applies a fortiori. A guess here would be worse than a guessed cost ratio besides: the
-// planner's gates on the first-row field are literal 25 ms wall-clock thresholds, and every
-// millisecond of either hint is priced at `tuning.latencyCostPerMs` (1000 engine cost units)
-// — an in-process block-cached backend is nowhere near those magnitudes, so an invented
-// number could only turn machinery on, or skew join choice, where it should stay off.
+// NOTE: the latency half of the `costProfile` is the engine's `localDisk` CATEGORY, not a
+// number measured for this declaration. The category's bands come from this package's own
+// README table (§ Measured read cost: the single-key windowed iterate for the first row, the
+// sequential iterate for each further row), and the decimals still live in that README, not
+// here. What declaring it buys is join selection — at the default `tuning.latencyCostPerMs`
+// a disk-backed row now costs about 5 engine units where a memory row costs 1. It turns no
+// parallel machinery on: `localDisk` sits far below the 25 ms `tuning.parallel.*ThresholdMs`
+// gates. Revisit only with a multi-run measurement of first-row and per-row latency taken
+// for the purpose; then spread the preset and override (`{ ...COST_PRESETS.localDisk, … }`).
 export class LevelDBProvider implements KVStoreProvider {
+	readonly costProfile: KVCostProfile = COST_PRESETS.localDisk;
+
 	private basePath: string;
 	private createIfMissing: boolean;
 	private syncCommits: boolean;

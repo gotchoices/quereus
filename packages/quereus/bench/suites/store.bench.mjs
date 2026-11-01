@@ -1196,8 +1196,8 @@ const COUNTED_QUERY_BENCHMARKS = [
  * WHY THESE ROWS EXIST. `packages/quereus-store/src/common/cost-profile.ts` lets a
  * provider declare what its basic reads cost RELATIVE to reading one row sequentially
  * during a full scan (1.0 by definition), and the planner prices access paths with those
- * numbers. IndexedDB's come from a real browser benchmark. LevelDB declares nothing, so it
- * takes the framework's parity default — `pointRead: 1.0`, `seekPositioning: 0.5` — never
+ * numbers. IndexedDB's come from a real browser benchmark. LevelDB declares no ratios, so
+ * it takes the framework's parity default — `pointRead: 1.0`, `seekPositioning: 0.5` — never
  * measured. These two rows are that measurement; `backlog/debt-leveldb-cost-profile-measurement`
  * is the ticket that decides what to do with it.
  *

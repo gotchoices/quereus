@@ -21,7 +21,7 @@ import {
 	STATS_STORE_NAME,
 	type CacheOptions,
 } from '@quereus/store';
-import { QuereusError, StatusCode } from '@quereus/quereus';
+import { COST_PRESETS, QuereusError, StatusCode } from '@quereus/quereus';
 import { IndexedDBStore, MultiStoreWriteBatch } from './store.js';
 import { IndexedDBManager } from './manager.js';
 
@@ -103,41 +103,27 @@ export class IndexedDBProvider implements KVStoreProvider {
 	 * cold number is the safe one to plan against; if cache-hit rates ever become
 	 * observable at plan time, revisit this.
 	 */
-	readonly costProfile: KVCostProfile = { pointRead: 3.0, seekPositioning: 5.0 };
+	readonly costProfile: KVCostProfile = { ...COST_PRESETS.browserIdb, pointRead: 3.0, seekPositioning: 5.0 };
 
-	// NOTE: neither `firstRowLatencyMs` nor `perRowLatencyMs` declared in the `costProfile`
-	// above, deliberately — and like its ratios that is a MEASURED decision, not the absence
-	// of one. The
-	// provider therefore resolves both to the 0 default, i.e. the planner treats this backend
-	// as in-process for latency purposes.
+	// NOTE: the ratios above are this provider's own measurement; the latency half of the
+	// `costProfile` is the engine's `browserIdb` CATEGORY, not a number measured for this
+	// declaration. The category is grounded in `bench/README.md` — arm B's one-request round
+	// trip for the first row, arm C's paged full scan for each further row — and
+	// `docs/optimizer-costing.md` § Module cost profile records the bands. At the default
+	// `tuning.latencyCostPerMs` it prices this backend's seeks and paged scans in roughly the
+	// right proportion to engine work, which is what moves join selection.
 	//
-	// `bench/README.md` (Chromium 151 / Windows 11, 200-byte rows, medians) has the numbers:
-	// the smallest whole round trip in the harness — arm B, 20 rows resolved in 1 request — is
-	// 0.4 ms on a 20k-row table and 2.0-2.5 ms at 100k. Subtracting the row payload at the
-	// measured full-scan rate leaves a first-row latency somewhere in the low tenths of a
-	// millisecond to low single milliseconds, depending on table size. Two reasons that
-	// number stays undeclared:
+	// It turns NO parallel machinery on. `batchedOuterThresholdMs`, `gatherThresholdMs` and
+	// `prefetchProbeThresholdMs` all default to 25 ms (`planner/optimizer-tuning.ts`), and the
+	// `browserIdb` first-row latency sits well below that, so batched seeks, gathers and
+	// prefetch probes still never fire here.
 	//
-	//  - EVERY GATE THAT TURNS THE LATENCY MACHINERY ON IS 25 ms. `batchedOuterThresholdMs`,
-	//    `gatherThresholdMs` and `prefetchProbeThresholdMs` all default to 25
-	//    (`planner/optimizer-tuning.ts`), chosen against a synthetic high-latency fixture.
-	//    This backend's real latency clears none of them, so declaring it would not make
-	//    batched seeks, gathers or prefetch probes fire.
-	//  - THE NUMBERS HAVE NOT BEEN RE-MEASURED FOR THE PER-ROW MODEL. The planner now prices
-	//    a side's full read as `firstRowLatencyMs + rowsRead × perRowLatencyMs`, each
-	//    millisecond worth `tuning.latencyCostPerMs` (default 1000) engine cost units, so an
-	//    honest IndexedDB declaration would for the first time price its seeks and its paged
-	//    scans in the right proportion to engine work. But the bench's arms were designed to
-	//    derive a cost RATIO (above), not a cold first-row open or a long sequential
-	//    iterate; declaring numbers back-derived from them would be a guess dressed as a
-	//    measurement. Declaring the first-row figure alone, without the per-row one, is
-	//    still a net-negative skew (it reaches the per-seek charge and nothing else).
-	//
-	// REVISIT in `backlog/feat-indexeddb-declares-its-read-latency`: re-measure both hints
-	// in a real browser, declare `firstRowLatencyMs` and `perRowLatencyMs` together, and
-	// settle whether the 25 ms gates should become cost-based for a sub-millisecond backend.
-	// As with the cost profile above, DELIBERATELY NO DECIMALS QUOTED: the bench README holds
-	// the tables, this comment holds the decision.
+	// REVISIT in `backlog/feat-indexeddb-declares-its-read-latency`, which keeps two items
+	// open: a real-browser re-measurement of first-row and per-row latency (the bench arms
+	// were built to derive the ratios above, not a cold iterator open or a long sequential
+	// iterate) to confirm or override the category, and the decision whether the 25 ms gates
+	// should become cost-based for a sub-millisecond backend. As with the ratios, DELIBERATELY
+	// NO DECIMALS QUOTED: the bench README holds the tables, this comment holds the decision.
 
 	private databaseName: string;
 	private stores = new Map<string, KVStore>();

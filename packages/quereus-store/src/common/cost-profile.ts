@@ -74,7 +74,7 @@ export interface KVCostProfile extends ModuleCostProfile {
 	 * `store-module-access-plan.ts`). LevelDB's 2026-08-19 measurement puts the same two
 	 * shapes roughly an ORDER OF MAGNITUDE apart on that backend — a windowed seek key costs
 	 * about fifteen sequential rows where a batched one costs about one-and-a-half — which is
-	 * why LevelDB declares nothing rather than declaring its measured seek cost. Splitting
+	 * why LevelDB declares no ratios rather than declaring its measured seek cost. Splitting
 	 * this into per-arm terms is
 	 * `backlog/debt-store-seek-positioning-conflates-two-arms`; the numbers are in
 	 * `packages/quereus-plugin-leveldb/README.md` § Measured read cost.

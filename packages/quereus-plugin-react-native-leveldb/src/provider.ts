@@ -25,7 +25,8 @@
  * databases are NOT read here and must be re-created; there is no on-disk migration.
  */
 
-import type { KVStore, KVStoreProvider } from '@quereus/store';
+import type { KVCostProfile, KVStore, KVStoreProvider } from '@quereus/store';
+import { COST_PRESETS } from '@quereus/quereus';
 import { buildDataStoreName, buildIndexStoreName, CATALOG_STORE_NAME, STATS_STORE_NAME } from '@quereus/store';
 import { ReactNativeLevelDBStore, type LevelDBOpenFn, type LevelDBWriteBatchConstructor } from './store.js';
 
@@ -140,6 +141,10 @@ export interface ReactNativeLevelDBProviderOptions {
  * this provides efficient, persistent key-value storage with sorted keys.
  */
 export class ReactNativeLevelDBProvider implements KVStoreProvider {
+	// NOTE: an on-device LevelDB read in-process — the `localDisk` category, never measured on
+	// this backend. The category is the honest claim; a measured override is welcome.
+	readonly costProfile: KVCostProfile = COST_PRESETS.localDisk;
+
 	private openFn: LevelDBOpenFn;
 	private WriteBatch: LevelDBWriteBatchConstructor;
 	private databaseName: string;

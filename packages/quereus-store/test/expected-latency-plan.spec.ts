@@ -20,8 +20,8 @@
  * How a malformed declaration resolves is the engine's rule (`resolveModuleCostProfile`,
  * pinned in the engine's `test/vtab/cost-profile.spec.ts`), not this package's.
  *
- * The 30 ms is frankly synthetic and no in-tree backend declares anything (see the store
- * README, § Backend cost profile). It is chosen to clear the planner's latency gates, all of
+ * The 30 ms is frankly synthetic: the in-tree backends declare only in-process presets, far
+ * below it (see the store README, § Backend cost profile). It is chosen to clear the planner's latency gates, all of
  * which sit at 25 ms — `tuning.parallel.batchedOuterThresholdMs` and neighbours. Fixing a
  * real backend's number is a separate question this test deliberately does not depend on.
  *

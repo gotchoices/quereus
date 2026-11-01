@@ -25,7 +25,8 @@
  * and interleave their rows.
  */
 
-import type { KVStore, KVStoreProvider } from '@quereus/store';
+import type { KVCostProfile, KVStore, KVStoreProvider } from '@quereus/store';
+import { COST_PRESETS } from '@quereus/quereus';
 import { buildDataStoreName, buildIndexStoreName, CATALOG_STORE_NAME, STATS_STORE_NAME } from '@quereus/store';
 import { SQLiteStore, type SQLiteDatabase } from './store.js';
 
@@ -94,6 +95,10 @@ export interface SQLiteProviderOptions {
  * This is more efficient than multiple database files on mobile.
  */
 export class SQLiteProvider implements KVStoreProvider {
+	// NOTE: an on-device SQLite file read in-process — the `localDisk` category, never measured
+	// on this backend. The category is the honest claim; a measured override is welcome.
+	readonly costProfile: KVCostProfile = COST_PRESETS.localDisk;
+
 	private db: SQLiteDatabase;
 	private tablePrefix: string;
 	private stores = new Map<string, SQLiteStore>();

@@ -32,10 +32,12 @@
  * projected latency win covers the per-branch setup overhead, the cluster
  * forms.
  *
- * Cost gate is anchored on `physical.expectedLatencyMs` — populated 0 for
- * in-process / memory-vtab paths, non-zero for remote vtabs whose cost profile
- * declares a first-row latency. As a consequence, with no remote-vtab plugin in
- * tree the rule is inert by design (memory-vtab golden plans don't change).
+ * Cost gate is anchored on `physical.expectedLatencyMs` — 0 for memory-vtab
+ * paths, the declared first-row latency otherwise. The in-tree store backends
+ * declare the in-process presets (`localDisk`, `browserIdb`), whose first-row
+ * latency is at most `tuning.branchSetupCost` (1 ms), and `(N − cap) × L` never
+ * exceeds `N × branchSetupCost` while `L ≤ branchSetupCost`. As a consequence,
+ * with no remote-vtab plugin in tree the rule is inert by design.
  *
  * Join-spine branch eligibility mirrors `ruleJoinElimination`:
  *   - AND-of-column-equalities ON-clause (any residual disqualifies the
@@ -254,9 +256,10 @@ export function ruleFanOutLookupJoin(node: PlanNode, context: OptContext): PlanN
 	const crossLookups = spineBranches.filter(b => isCrossBranchMode(b.mode)).map(b => b.lookup);
 	if (!crossGuardsPass(outerSubtree, crossLookups, tuning)) return null;
 
-	// Cost gate over the COMBINED branch set. `expectedLatencyMs` is populated 0
-	// except on remote-vtab access plans (propagated up through the aggregate
-	// for subquery branches), so this skip keeps the rule inert for local chains.
+	// Cost gate over the COMBINED branch set. `expectedLatencyMs` is 0 on
+	// memory-vtab access plans (propagated up through the aggregate for subquery
+	// branches), so this skip keeps the rule inert for memory chains; an
+	// in-process store preset passes the skip and fails the savings comparison.
 	let maxLatency = 0;
 	for (const b of spineBranches) {
 		const l = b.lookup.physical.expectedLatencyMs ?? 0;

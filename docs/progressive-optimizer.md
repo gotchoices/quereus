@@ -229,7 +229,7 @@ Deferred, each with its backlog ticket (each section above changes only when a t
 - **Feedback beyond table size and rows per key** — filter selectivity on unindexed columns (an equality filter over a scan with no seek included: section 3 overrides only seeks), ranges and join output cardinality: `feat-cardinality-feedback-beyond-table-size`.
 - **Mid-execution adaptation** — reacting at a pipeline breaker whose input count diverges from the plan, before the downstream operators run: `feat-mid-execution-plan-adaptation`.
 - **Plan reuse across one-shot statements** — the compile-cost lever the Tier 0 idea was reaching for: `feat-reuse-plans-across-one-shot-statements`.
-- **IndexedDB's read latency** — measuring and declaring it once per-row pricing exists, and whether the 25 ms parallel gates should become cost-based for sub-millisecond backends: `feat-indexeddb-declares-its-read-latency`.
+- **IndexedDB's read latency** — the provider declares the `browserIdb` category; what remains is a real-browser re-measurement and the decision whether the 25 ms parallel gates should become cost-based for sub-millisecond backends: `feat-indexeddb-declares-its-read-latency`.
 
 ---
 

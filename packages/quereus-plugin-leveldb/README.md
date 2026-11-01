@@ -190,14 +190,15 @@ try {
 }
 ```
 
-## Measured read cost (and why no cost profile is declared)
+## Measured read cost (and why no cost ratios are declared)
 
 A storage backend can tell the query planner what its basic reads cost, relative to
 reading one row sequentially during a full scan (1.0 by definition). The two knobs live in
 [`@quereus/store`'s `cost-profile.ts`](../quereus-store/src/common/cost-profile.ts):
 `pointRead` (resolving one secondary-index entry to its row, batched) and `seekPositioning`
 (the per-key cost of a multi-key seek). IndexedDB declares measured values; **LevelDB
-declares nothing and takes the framework's parity defaults (`pointRead: 1.0`,
+declares only the engine's `localDisk` latency category (whose bands come from the tables
+below) and no ratios, so it takes the framework's parity defaults (`pointRead: 1.0`,
 `seekPositioning: 0.5`).** That was previously an assumption. It has now been measured, and
 this section is the record so nobody has to re-ask.
 
@@ -258,7 +259,7 @@ out to the filesystem — which on a warm machine usually means the OS page cach
 physical disk. A claim of "cold" that is really "block-cache-miss, page-cache-hit" would be
 worse than no claim, so it is not made.
 
-### What the numbers mean, and why nothing is declared
+### What the numbers mean, and why no ratio is declared
 
 **`pointRead` is near parity and stays undeclared.** Around 1.3-1.6 against a default of
 1.0. That gap is also an *over*-statement of the truth: the planner's 1.0 unit is a scanned
