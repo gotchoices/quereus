@@ -785,7 +785,8 @@ describe('index-nested-loop join plan shape', () => {
 				collationsMatch: true,
 				valueDiscriminating: true,
 			}];
-			expect(tryIndexNestedLoop('inner', join.left, join.right, pairs, 4, { db } as unknown as OptContext))
+			expect(tryIndexNestedLoop('inner', join.left, join.right, pairs, 4,
+				{ db, tuning: db.optimizer.tuning } as unknown as OptContext))
 				.to.equal(null);
 		});
 
@@ -811,7 +812,9 @@ describe('index-nested-loop join plan shape', () => {
 					collationsMatch: true,
 					valueDiscriminating: true,
 				}];
-				ctx = { db } as unknown as OptContext;
+				// The candidate's price converts the inner's latency through
+				// `context.tuning.latencyCostPerMs`, so the double carries the tuning.
+				ctx = { db, tuning: db.optimizer.tuning } as unknown as OptContext;
 			});
 
 			const attempt = (inner: RelationalPlanNode) => tryIndexNestedLoop('inner', outer, inner, pairs, 4, ctx);

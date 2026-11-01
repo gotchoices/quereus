@@ -253,9 +253,15 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		// modules omit it (0). Remote modules declare a non-zero value so the
 		// parallel fan-out rule can amortize per-branch latency. With no remote
 		// plugin in tree this stays 0 and the cost gate is inert by design.
+		// Both hints lift only finite positive values: a negative, NaN or
+		// Infinity declaration reads as 0 rather than poisoning a cost sum.
 		const moduleLatency = this.vtabModule.expectedLatencyMs;
-		if (typeof moduleLatency === 'number' && moduleLatency > 0) {
+		if (typeof moduleLatency === 'number' && Number.isFinite(moduleLatency) && moduleLatency > 0) {
 			out.expectedLatencyMs = moduleLatency;
+		}
+		const moduleRowLatency = this.vtabModule.expectedRowLatencyMs;
+		if (typeof moduleRowLatency === 'number' && Number.isFinite(moduleRowLatency) && moduleRowLatency > 0) {
+			out.expectedRowLatencyMs = moduleRowLatency;
 		}
 		return out;
 	}

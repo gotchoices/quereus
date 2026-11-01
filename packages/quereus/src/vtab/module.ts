@@ -138,6 +138,22 @@ export interface VirtualTableModule<
 	readonly expectedLatencyMs?: number;
 
 	/**
+	 * Optional hint: wall-clock milliseconds per row an iterator over this
+	 * module's tables yields AFTER the first, in a sequential read — the
+	 * full-scan rate, which is what a module author can measure directly. Omit
+	 * (treated as 0) when rows arrive at in-process speed once the first is in
+	 * hand; a backend that answers one page or one row per request declares its
+	 * measured per-row figure so the planner prices a full read by the rows it
+	 * pulls instead of as one first-row delay. Declare only measured numbers.
+	 *
+	 * Read by `TableReferenceNode.computePhysical` (finite positive values
+	 * only) and propagated upward as `max(children)`, like `expectedLatencyMs`.
+	 * Converted to engine cost units at `tuning.latencyCostPerMs`. A heuristic;
+	 * correctness must never depend on it.
+	 */
+	readonly expectedRowLatencyMs?: number;
+
+	/**
 	 * Declares whether a `query()` iterator opened against a table of this module
 	 * sees a STABLE snapshot even if `update()` mutates the same table mid-scan —
 	 * i.e. the module is immune to the physical Halloween hazard where a predicate

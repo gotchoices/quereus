@@ -165,6 +165,13 @@ function estimatePlanCost(plan: RelationalPlanNode): number {
   // Use total cost, but apply penalties for cross products (no predicates between recent components)
   // and reward key-covered joins via lower estimatedRows coming from computePhysical.
   // Total cost already accumulates subtree costs; keep it as primary signal.
+  // NOTE: `getTotalCost()` carries no storage latency — neither a leaf's
+  // first-row `expectedLatencyMs` nor its per-row `expectedRowLatencyMs` reaches
+  // a node's self-cost — so a tour is scored as if every relation were
+  // in-process. Only `rule-join-physical-selection` prices latency, and only
+  // per join. If a remote relation ever needs to be ordered by its latency,
+  // add a drain term here (`latencyCost` in cost/index.ts); not done because
+  // no in-tree module declares either hint.
   return plan.getTotalCost();
 }
 

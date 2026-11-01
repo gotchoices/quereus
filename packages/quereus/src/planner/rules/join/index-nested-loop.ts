@@ -74,7 +74,7 @@ import {
 	type SeekableAccessLeafNode,
 } from '../shared/access-leaf.js';
 import { combineResidual } from './equi-pair-extractor.js';
-import { indexNestedLoopJoinCost } from '../../cost/index.js';
+import { indexNestedLoopJoinCost, latencyCost } from '../../cost/index.js';
 import { validateAccessPlan, type BestAccessPlanResult } from '../../../vtab/best-access-plan.js';
 import type { TableSchema } from '../../../schema/table.js';
 import { uniqueEnforcementCollations } from '../../../schema/unique-enforcement.js';
@@ -94,8 +94,10 @@ export interface IndexNestedLoopCandidate {
 	/**
 	 * The two inputs `cost` was derived from, so the caller can re-price the same
 	 * seek under a different driver (`batchedIndexNestedLoopJoinCost`) without
-	 * re-probing: the module's row estimate for one seek, and the inner
-	 * subtree's first-row latency.
+	 * re-probing: the module's row estimate for one seek, and the wall-clock
+	 * milliseconds one seek pays at the inner's storage — its first-row latency
+	 * plus `rowsPerSeek` of its per-row latency (0 for every in-process module).
+	 * Milliseconds, not cost units: the caller converts via `latencyCost`.
 	 */
 	readonly rowsPerSeek: number;
 	readonly perSeekLatencyMs: number;
@@ -748,9 +750,14 @@ export function tryIndexNestedLoop(
 
 	const newLeaf = reapplyDeclinedPushed(rebuiltLeaf, seekPlan, offered);
 	const newInner = rebuildChain(inner, leaf, newLeaf);
-	const perSeekLatencyMs = inner.physical.expectedLatencyMs ?? 0;
 	const rowsPerSeek = seekPlan.rows!;
-	const cost = indexNestedLoopJoinCost(outerRows, rowsPerSeek, perSeekLatencyMs);
+	// Wall-clock one seek pays at the inner's storage: open the iterator (first-row
+	// latency), then pull the rows the module expects it to return (per-row
+	// latency). Milliseconds here; the formula takes the converted cost.
+	const perSeekLatencyMs = (inner.physical.expectedLatencyMs ?? 0)
+		+ rowsPerSeek * (inner.physical.expectedRowLatencyMs ?? 0);
+	const cost = indexNestedLoopJoinCost(
+		outerRows, rowsPerSeek, latencyCost(perSeekLatencyMs, context.tuning));
 	const atMostOne = provesAtMostOne(tableSchema, offered.combined);
 	log('candidate: seek %s.%s via %s (%s rows/seek, cost %s for %s outer rows; %d pushed constraint(s) re-offered; at-most-one %s)',
 		tableSchema.name, seekPlan.seekColumnIndexes!.map(c => tableSchema.columns[c]?.name).join(','),

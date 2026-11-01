@@ -5,6 +5,7 @@
 
 import { quereusError } from "../../common/errors.js";
 import { StatusCode } from "../../common/types.js";
+import type { OptimizerTuning } from "../optimizer-tuning.js";
 
 /**
  * Basic cost constants (in arbitrary "virtual CPU units")
@@ -153,36 +154,47 @@ export function nestedLoopJoinCost(outerRows: number, innerRows: number): number
 }
 
 /**
+ * Declared storage latency, in milliseconds, converted to engine cost units at
+ * `tuning.latencyCostPerMs` — the ONE place the conversion is spelled. Every
+ * rule that adds a module's `expectedLatencyMs` / `expectedRowLatencyMs` to
+ * engine work goes through here; the formulas in this file take the converted
+ * value and stay in cost units. The wall-clock gates (`parallel.*ThresholdMs`,
+ * the fan-out savings gate) compare milliseconds with milliseconds and do not.
+ */
+export function latencyCost(
+	latencyMs: number,
+	tuning: Pick<OptimizerTuning, 'latencyCostPerMs'>,
+): number {
+	return latencyMs * tuning.latencyCostPerMs;
+}
+
+/**
  * Cost for an index-nested-loop join: one index seek into the inner side per
  * outer row. `rowsPerSeek` is the MODULE's estimate for the equality access
  * plan — selectivity authority stays with the module that owns the index rather
  * than being re-derived from engine-side statistics (same discipline as
- * rule-key-set-seek's break-even). `perSeekLatencyMs` is the inner subtree's
- * `physical.expectedLatencyMs` (0 for every in-process vtab), treated as
- * ms-equivalent cost — the same convention as `tuning.parallel.branchSetupCost`.
+ * rule-key-set-seek's break-even). `perSeekLatencyCost` is the storage latency
+ * one seek pays — the inner's first-row latency plus `rowsPerSeek` of its
+ * per-row latency — ALREADY converted to cost units via {@link latencyCost}
+ * (0 for every in-process vtab).
  *
- * NOTE: the field's two consumers read it on incompatible scales, and this one is the
- * ratio side. The `tuning.parallel.*ThresholdMs` gates (all 25 today) read
- * `expectedLatencyMs` as literal wall-clock milliseconds; this formula adds it to cost
- * constants whose unit is `SEQ_SCAN_PER_ROW = 1.0`, i.e. ONE SCANNED ROW. The two readings
- * agree only where a scanned row costs about 1 ms — true of the network-latency backends
- * this machinery was designed for (25-100 ms, where latency swamps engine cost and the
- * ratio stops mattering), and off by roughly two orders of magnitude for a sub-millisecond
- * backend, whose honest declaration is worth tens of cost units on this scale and a
- * fraction of one on the gates' scale. Inert today: every gate sits at 25 ms and no in-tree
- * module declares a sub-millisecond value (the IndexedDB and LevelDB providers both decline
- * to, with their reasons recorded at their `costProfile` sites). Revisit if either changes —
- * and do NOT resolve it by inflating a declaration to the ratio value, which would lie to
- * the wall-clock gates.
+ * NOTE: units. The cost constants here are engine cost units, where 1.0 is one
+ * in-process sequentially scanned row. A module declares its latency in
+ * wall-clock milliseconds, and the two are related by `tuning.latencyCostPerMs`
+ * (default 1000 — about a thousand rows scan per millisecond on the reference
+ * machine). Callers convert through `latencyCost` before calling; this function
+ * never sees milliseconds. The `tuning.parallel.*ThresholdMs` gates keep
+ * reading the raw millisecond declarations, so a module must declare its real
+ * measured latency and never a value inflated to look large on this scale.
  */
 export function indexNestedLoopJoinCost(
-	outerRows: number, rowsPerSeek: number, perSeekLatencyMs = 0,
+	outerRows: number, rowsPerSeek: number, perSeekLatencyCost = 0,
 ): number {
 	return outerRows * (
 		COST_CONSTANTS.NL_JOIN_PER_OUTER_ROW
 		+ COST_CONSTANTS.INDEX_SEEK_BASE
 		+ rowsPerSeek * COST_CONSTANTS.INDEX_SEEK_PER_ROW
-		+ perSeekLatencyMs
+		+ perSeekLatencyCost
 	);
 }
 
@@ -191,7 +203,7 @@ export function indexNestedLoopJoinCost(
  * `FanOutLookupJoinNode` in `batched` outer mode): the engine-side per-row work
  * is unchanged — the engine is single-threaded — and only the storage latency is
  * amortized across the `inFlight` seeks the batched driver keeps open at once.
- * `rowsPerSeek` and `perSeekLatencyMs` mean what they do for
+ * `rowsPerSeek` and `perSeekLatencyCost` mean what they do for
  * {@link indexNestedLoopJoinCost}; at `inFlight <= 1` the two formulas agree.
  *
  * The caller derives `inFlight` as `min(outerBatchConcurrency,
@@ -200,13 +212,13 @@ export function indexNestedLoopJoinCost(
  * half of the same number.
  */
 export function batchedIndexNestedLoopJoinCost(
-	outerRows: number, rowsPerSeek: number, perSeekLatencyMs: number, inFlight: number,
+	outerRows: number, rowsPerSeek: number, perSeekLatencyCost: number, inFlight: number,
 ): number {
 	return outerRows * (
 		COST_CONSTANTS.NL_JOIN_PER_OUTER_ROW
 		+ COST_CONSTANTS.INDEX_SEEK_BASE
 		+ rowsPerSeek * COST_CONSTANTS.INDEX_SEEK_PER_ROW
-		+ perSeekLatencyMs / Math.max(1, inFlight)
+		+ perSeekLatencyCost / Math.max(1, inFlight)
 	);
 }
 

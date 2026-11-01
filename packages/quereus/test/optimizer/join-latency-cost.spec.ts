@@ -1,16 +1,22 @@
 /**
- * Latency symmetry in `rule-join-physical-selection`'s cost comparison.
+ * Latency charges in `rule-join-physical-selection`'s cost comparison.
  *
  * A module may declare `expectedLatencyMs` — how long its tables take to
- * produce the FIRST row of a freshly opened iterator. Every in-tree module
- * declares 0; a network-backed one would not. The selection rule charges each
- * candidate one open of its OUTER side plus however many opens of its INNER
- * side it performs:
+ * produce the FIRST row of a freshly opened iterator — and
+ * `expectedRowLatencyMs`, the wall-clock per row after that in a sequential
+ * read. Every in-tree module declares 0 for both; a network-backed one would
+ * not. A side's DRAIN is `readMs = firstRowMs + rowsRead × rowMs`, and the
+ * selection rule charges each candidate one drain of its OUTER side plus
+ * however many drains of its INNER side it performs:
  *
- *   plain nested loop  += leftLatency + (opensOnce ? rightLatency : leftRows × rightLatency)
- *   hash / merge       += leftLatency + rightLatency
- *   index-nested-loop  += leftLatency          (per-seek right latency already in the formula)
- *   index-NL mirrored  += rightLatency         (per-seek left latency already in the formula)
+ *   plain nested loop  += readMs(left) + (opensOnce ? readMs(right) : leftRows × readMs(right))
+ *   hash / merge       += readMs(left) + readMs(right)
+ *   index-nested-loop  += readMs(left)    (per seek: firstRowMs + rowsPerSeek × rowMs, in the formula)
+ *   index-NL mirrored  += readMs(right)   (the per-seek term keyed on the LEFT side)
+ *
+ * Every millisecond is worth `tuning.latencyCostPerMs` engine cost units
+ * (default 1,000 — about the rows the engine scans in a millisecond), so a
+ * 25 ms first-row latency is 25,000 units against a 1.0-per-row scan.
  *
  * "opensOnce" is `nestedLoopRightOpensOnce` — the right side is already
  * materialized, or `rule-nested-loop-right-cache` (later in the same pass) is
@@ -37,6 +43,12 @@ import { EagerPrefetchNode } from '../../src/planner/nodes/eager-prefetch-node.j
 /** The synthetic remote-vtab stand-in used by every parallel/latency optimizer spec. */
 class HighLatencyMemoryModule extends MemoryTableModule {
 	readonly expectedLatencyMs = 25;
+}
+
+/** The same first-row delay plus a per-row rate: storage that answers one row per request. */
+class PerRowLatencyMemoryModule extends MemoryTableModule {
+	readonly expectedLatencyMs = 25;
+	readonly expectedRowLatencyMs = 1;
 }
 
 function collectNodes<T extends PlanNode>(root: PlanNode, predicate: (n: PlanNode) => n is T): T[] {
@@ -108,11 +120,14 @@ describe('join physical selection: first-row latency charges', () => {
 		// early return compares ONLY the plain nested loop against the
 		// index-nested-loop.
 		//
-		// 100-row outer × 20-row inner, latency 25 on the inner:
-		//   plain NL, inner cacheable  = 100 + 100×20×0.1 + 25            =  325
-		//   plain NL, inner uncached   = 100 + 100×20×0.1 + 100×25        = 2800
-		//   index-NL                   = 100 × (1.0 + 0.5 + 0.3 + 25)     = 2680
-		// so the cacheability of the inner side is what picks the plan.
+		// 100-row outer × 20-row inner, latency 25 ms on the inner, one millisecond
+		// being `latencyCostPerMs` = 1,000 cost units:
+		//   plain NL, inner cacheable  = 100 + 100×20×0.1 + 25,000         =    25,300
+		//   plain NL, inner uncached   = 100 + 100×20×0.1 + 100×25,000     = 2,500,300
+		//   index-NL                   = 100 × (1.0 + 0.5 + 0.3 + 25,000)  = 2,500,180
+		// so the cacheability of the inner side is what picks the plan. (The
+		// uncached loop and the seek plan both pay 100 opens; only the engine
+		// work — 300 against 180 — separates them, at any latency scale.)
 		const EXISTS_SQL =
 			'select sx.id, b_ex from sx left join bx b on b.id = sx.k exists right as b_ex order by sx.id';
 
@@ -139,8 +154,8 @@ describe('join physical selection: first-row latency charges', () => {
 
 		it('keeps the nested loop when the cache rule will collapse the re-opens to one', async () => {
 			// Charging `leftRows × latency` unconditionally would price this plan at
-			// 2800 and hand the win to a 2680 index-NL — a 8.6x worse plan chosen on
-			// a number the cache rule is about to invalidate.
+			// 2,500,300 and hand the win to a 2,500,180 index-NL — a plan 100× worse
+			// on latency chosen on a number the cache rule is about to invalidate.
 			await createTables('hi_lat');
 			const plan = db.getPlan(EXISTS_SQL);
 			expectCachedNestedLoop(plan);
@@ -259,15 +274,16 @@ describe('join physical selection: first-row latency charges', () => {
 		it('a 45-row right side: hash wins at either latency (the right latency cancels)', async () => {
 			// mirror 81 vs hash 76 — hash wins on work alone. Charging the right's
 			// 25 ms to hash but not to the mirror flipped this to the mirror (81 vs
-			// 101); now both carry it and the comparison is latency-independent.
+			// 25,076 at today's scale); now both carry it and the comparison is
+			// latency-independent.
 			expect(await chosenAlgo(45, 'memory'), 'zero latency').to.equal('hash');
 			expect(await chosenAlgo(45, 'hi_lat'), 'latency 25 on the right').to.equal('hash');
 		});
 
 		it('a high-latency LEFT side sinks the mirror: its seeks are what pay that latency', async () => {
 			// The mirror's INNER is the left, so `indexNestedLoopJoinCost` charges it
-			// the left's latency once per seek — 30 × 25 on top of ~54 of work. Hash
-			// opens the left once, for 25. The 30-row shape that the mirror wins
+			// the left's latency once per seek — 30 × 25,000 on top of ~54 of work.
+			// Hash opens the left once, for 25,000. The 30-row shape that the mirror wins
 			// outright with a local left therefore flips to hash the moment the left
 			// is remote, and that is the direction the per-candidate table predicts:
 			// the mirror is the only candidate whose charge scales with the LEFT's
@@ -286,14 +302,14 @@ describe('join physical selection: first-row latency charges', () => {
 		// ordinary shape: a plain inner join where hash IS a candidate and neither
 		// index-NL orientation is (no index on either join column, so no seek), and
 		// the right side is small enough that the O(n·m) loop still beats the hash
-		// build. 2-row left × 40-row right, latency 25 on the right:
+		// build. 2-row left × 40-row right, latency 25 ms (25,000 units) on the right:
 		//   plain NL work = 2 + 2×40×0.1                       = 10
 		//   hash     work = 0.8×2 + 0.4×40                     = 17.6
-		//   plain NL, inner cacheable = 10 + 25                = 35   ← NL keeps it
-		//   plain NL, inner uncached  = 10 + 2×25              = 60
-		//   hash                      = 17.6 + 25              = 42.6 ← hash takes it
-		// Before this change the plain nested loop was charged NO latency at all
-		// while hash was charged the right's, so it won both spellings.
+		//   plain NL, inner cacheable = 10 + 25,000            = 25,010   ← NL keeps it
+		//   plain NL, inner uncached  = 10 + 2×25,000          = 50,010
+		//   hash                      = 17.6 + 25,000          = 25,017.6 ← hash takes it
+		// Before the symmetry fix the plain nested loop was charged NO latency at
+		// all while hash was charged the right's, so it won both spellings.
 		const SQL = 'select so.id as sid, bo.id as bid from so join bo on so.k = bo.k order by sid';
 		const EXPECTED = [{ sid: 1, bid: 1 }, { sid: 2, bid: 2 }];
 
@@ -344,8 +360,8 @@ describe('join physical selection: first-row latency charges', () => {
 			// Also the regression pin for the re-visit: this rule runs again on the
 			// join AFTER the cache rule has wrapped the inner side. Asking plain
 			// cacheability there answers "no" (nothing left to wrap) and re-prices
-			// the loop at 60, so the second visit converted it to a 42.6 hash join
-			// and threw the cache away. Asking the open-count question keeps 35.
+			// the loop at 50,010, so the second visit converted it to a 25,017.6 hash
+			// join and threw the cache away. Asking the open-count question keeps 25,010.
 			await createTables('hi_lat');
 			await expectNestedLoop(true);
 		});
@@ -360,6 +376,60 @@ describe('join physical selection: first-row latency charges', () => {
 			await createTables('memory');
 			await expectNestedLoop(true);
 			await withCachingDisabled(() => expectNestedLoop(false));
+		});
+	});
+
+	describe('per-row read latency', () => {
+		// 50-row outer `po` × 5,000-row inner `pi`, BOTH on the fixture module,
+		// joined on the inner's primary key. One cost unit per scanned row; one
+		// millisecond is `latencyCostPerMs` = 1,000 units. With R = 1 ms per row:
+		//   hash      = 0.8×50 + 0.4×5,000                      =     2,040 work
+		//             + [(25 + 50×1) + (25 + 5,000×1)] ms        = 5,100,000  → 5,102,040
+		//   index-NL  = 50 × (1.0 + 0.5 + 0.3)                   =        90 work
+		//             + (25 + 50×1) ms, the outer's one drain    =    75,000
+		//             + 50 × (25 + 1×1) ms, one drain per seek   = 1,300,000  → 1,375,090
+		//   merge     = (50 + 5,000)×0.3 + sort(50) ≈ 2,079 work + 5,100,000 → 5,102,079
+		//   plain NL  = 50 + 50×5,000×0.1 = 25,050 work + 75,000 + 5,025,000  → 5,125,050
+		// The seek plan wins by pulling 50 inner rows instead of 5,000. There is
+		// no batched candidate: the 50-row outer is under `batchedOuterMinRows`
+		// (256), so the serial correlated seek is what must appear.
+		//
+		// With R = 0 (the control — the plain 25 ms fixture), every drain
+		// collapses to one open: hash = 2,040 + 2×25,000 = 52,040; merge = 2,079 +
+		// 50,000; index-NL = 90 + 25,000 + 50×25,000 = 1,275,090. Two opens beat
+		// fifty seeks, and hash wins — which is why first-row latency alone could
+		// only ever make the seek plan look worse (the IndexedDB provider's NOTE).
+		const SQL = 'select po.id, pi.id as iid from po join pi on pi.id = po.k order by po.id';
+		const EXPECTED = Array.from({ length: 50 }, (_, i) => ({ id: i + 1, iid: ((i + 1) * 7) % 5000 + 1 }));
+
+		async function createTables(module: 'hi_lat' | 'per_row'): Promise<void> {
+			await db.exec(`create table po (id integer primary key, k integer) using ${module}`);
+			await db.exec('insert into po select value, value * 7 % 5000 + 1 from generate_series(1, 50)');
+			await db.exec(`create table pi (id integer primary key, v integer) using ${module}`);
+			await db.exec('insert into pi select value, value from generate_series(1, 5000)');
+			for await (const _ of db.eval('analyze')) { /* consume */ }
+		}
+
+		beforeEach(() => {
+			db.registerModule('per_row', new PerRowLatencyMemoryModule());
+		});
+
+		it('R = 1: the index-nested-loop wins — hash would drain all 5,000 remote rows', async () => {
+			await createTables('per_row');
+			const plan = db.getPlan(SQL);
+			expect(correlatedSeekJoins(plan), 'a serial correlated seek into the inner').to.have.lengthOf(1);
+			expect(collectNodes(plan, isHashJoin), 'no hash join').to.have.lengthOf(0);
+			expect(await drain(db, SQL)).to.deep.equal(EXPECTED);
+		});
+
+		it('R = 0 (control): hash wins — two opens beat fifty seeks', async () => {
+			await createTables('hi_lat');
+			const plan = db.getPlan(SQL);
+			expect(collectNodes(plan, isHashJoin), 'a hash join').to.have.lengthOf(1);
+			expect(correlatedSeekJoins(plan), 'no correlated seek').to.have.lengthOf(0);
+			if (!execTripsStrictFork(plan)) {
+				expect(await drain(db, SQL)).to.deep.equal(EXPECTED);
+			}
 		});
 	});
 });

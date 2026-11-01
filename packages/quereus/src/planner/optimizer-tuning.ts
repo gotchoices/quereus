@@ -89,6 +89,29 @@ export interface OptimizerTuning {
 	 */
 	readonly deltaPerRowFallbackRatio: number;
 
+	/**
+	 * Engine cost units charged per millisecond of declared storage latency —
+	 * first-row (`expectedLatencyMs`) or per-row (`expectedRowLatencyMs`) alike.
+	 * One engine cost unit is one in-process sequentially scanned row
+	 * (`COST_CONSTANTS.SEQ_SCAN_PER_ROW = 1.0`), so this is the number of rows the
+	 * engine scans in a millisecond. Applied by `latencyCost` (cost/index.ts)
+	 * wherever a rule ADDS a declared latency to engine work; the wall-clock gates
+	 * (`parallel.*ThresholdMs`) and the fan-out gate's millisecond-against-
+	 * millisecond comparison read raw milliseconds and never go through it.
+	 *
+	 * Default 1000: measured on the reference machine (`yarn bench`,
+	 * `execution/full-scan-10k` — 10,000 rows in a 7.8–8.1 ms median on the
+	 * memory backend, 12.9 ms on `store-mem`, i.e. roughly 800–1,300 rows per
+	 * millisecond) and rounded DOWN, so a declared delay is slightly
+	 * under-weighted rather than over-weighted. Plans are sensitive to the order
+	 * of magnitude only; a host on very different hardware can set it.
+	 *
+	 * NOTE: deliberately not self-calibrated at startup. Timing a scan inside
+	 * planning would make every plan machine- and load-dependent and every plan
+	 * test nondeterministic; a fixed, documented ratio is the lesser evil.
+	 */
+	readonly latencyCostPerMs: number;
+
 	/** Set of rule IDs to skip during optimization (test/debug use) */
 	readonly disabledRules?: ReadonlySet<string>;
 
@@ -283,6 +306,9 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 		mergeRowThreshold: 10000
 	},
 	deltaPerRowFallbackRatio: 0.5,
+	// Rows the engine scans per millisecond on the reference machine, rounded
+	// down — see the interface doc for the measurement.
+	latencyCostPerMs: 1000,
 	debug: {
 		validatePlan: false // Default to disabled in production
 	},

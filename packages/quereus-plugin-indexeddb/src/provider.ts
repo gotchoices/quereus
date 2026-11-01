@@ -121,20 +121,23 @@ export class IndexedDBProvider implements KVStoreProvider {
 	//    (`planner/optimizer-tuning.ts`), chosen against a synthetic high-latency fixture.
 	//    This backend's real latency clears none of them, so declaring it would not make
 	//    batched seeks, gathers or prefetch probes fire.
-	//  - THE ONE FORMULA IT DOES MOVE, IT MOVES BACKWARDS HERE. `expectedLatencyMs` reaches
-	//    exactly one shared cost function, `indexNestedLoopJoinCost`, which charges it PER
-	//    OUTER ROW to the seek plan. `rule-join-physical-selection` does charge the hash and
-	//    merge candidates too, but only ONE open per side (they each read both inputs once),
-	//    so the asymmetry stands: a positive declaration only makes index-nested-loop look
-	//    worse against hash join — and on IndexedDB the hash join's full scan of the inner
-	//    side is the catastrophic arm (bench arm C), because a scan here is thousands of
-	//    round trips that the cost model prices as one.
+	//  - THE NUMBERS HAVE NOT BEEN RE-MEASURED FOR THE PER-ROW MODEL. The planner now prices
+	//    a side's full read as `expectedLatencyMs + rowsRead × expectedRowLatencyMs`, each
+	//    millisecond worth `tuning.latencyCostPerMs` (default 1000) engine cost units, so an
+	//    honest IndexedDB declaration would for the first time price its seeks and its paged
+	//    scans in the right proportion to engine work. But the bench's arms were designed to
+	//    derive a cost RATIO (above), not a cold first-row open or a long sequential
+	//    iterate; declaring numbers back-derived from them would be a guess dressed as a
+	//    measurement. Declaring the first-row figure alone, without the per-row one, is
+	//    still a net-negative skew (it reaches the per-seek charge and nothing else).
 	//
-	// REVISIT WHEN a scan-side per-row latency exists —
-	// `backlog/feat-per-row-latency-cost-for-remote-scans` — and re-derive both together;
-	// declaring first-row latency alone before then is a net-negative plan skew. As with the
-	// cost profile above, DELIBERATELY NO DECIMALS QUOTED: the bench README holds the tables,
-	// this comment holds the decision.
+	// REVISIT in `backlog/feat-indexeddb-declares-its-read-latency`: re-measure both hints
+	// in a real browser, declare `expectedLatencyMs` and `expectedRowLatencyMs` together (the
+	// store provider surface for the per-row one lands with
+	// `store-provider-declares-per-row-latency`), and settle whether the 25 ms gates should
+	// become cost-based for a sub-millisecond backend. As with the cost profile above,
+	// DELIBERATELY NO DECIMALS QUOTED: the bench README holds the tables, this comment holds
+	// the decision.
 
 	private databaseName: string;
 	private stores = new Map<string, KVStore>();

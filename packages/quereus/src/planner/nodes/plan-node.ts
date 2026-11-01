@@ -590,6 +590,18 @@ export interface PhysicalProperties {
   expectedLatencyMs?: number;
 
   /**
+   * Expected wall-clock milliseconds per row this subtree's iterator yields
+   * after the first, in a sequential read. 0 (default) for in-process paths;
+   * non-zero for a module whose storage answers one page or row per request.
+   * Consumed by `rule-join-physical-selection`, which prices a side's full read
+   * as `expectedLatencyMs + rowsRead × expectedRowLatencyMs`; a hint only.
+   *
+   * Propagation: max of children, like `expectedLatencyMs`. Leaves lift the
+   * module's `expectedRowLatencyMs` in `computePhysical`.
+   */
+  expectedRowLatencyMs?: number;
+
+  /**
    * True when the subtree is safe to execute concurrently with siblings sharing
    * the same vtab connection. Defaults to true for read-only subtrees over
    * modules with `concurrencyMode !== 'serial'`. False when the subtree mutates
@@ -994,6 +1006,12 @@ export abstract class PlanNode {
 				// latency. 0 default for local-only paths.
 				expectedLatencyMs: childrenPhysical.reduce(
 					(acc, child) => Math.max(acc, child.expectedLatencyMs ?? 0),
+					0,
+				),
+				// expectedRowLatencyMs: same max-merge — the slowest child's per-row
+				// rate bounds the subtree's.
+				expectedRowLatencyMs: childrenPhysical.reduce(
+					(acc, child) => Math.max(acc, child.expectedRowLatencyMs ?? 0),
 					0,
 				),
 				// concurrencySafe: AND of children — any non-safe child poisons the

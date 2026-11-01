@@ -50,8 +50,10 @@ import {
 	hashJoinCost,
 	mergeJoinCost,
 	batchedIndexNestedLoopJoinCost,
+	latencyCost,
 } from '../../cost/index.js';
 import { toBatchedOuter } from './rule-fanout-batched-outer.js';
+import { peelToSeekableAccessLeaf } from '../shared/access-leaf.js';
 import {
 	extractEquiPairs,
 	isOrderedOnEquiPairs,
@@ -89,8 +91,56 @@ function mayMirrorIndexNestedLoop(node: JoinNode): boolean {
 }
 
 /**
- * First-row latency the PLAIN nested loop pays for opening its inner (right)
- * side: once if that side is opened once per join — already materialized, or
+ * Row count this rule plans a side with. By PostOptimization both sides are
+ * physical access nodes (or wrappers over them) which declare no logical
+ * `estimatedRows` getter — the catalog-derived count lives in
+ * `physical.estimatedRows` (see planner/util/row-estimates.ts). `||` not `??`:
+ * 0 is the un-analyzed "unknown" sentinel, not "empty" (same collapse
+ * rule-select-access-path applies), so an un-analyzed side costs exactly as it
+ * did under the old logical-getter read (which yielded undefined → 100). The ONE
+ * place the unknown-side default is spelled, so every term — work and latency
+ * alike — moves together when `unknown-size-join-scans-instead-of-seeking`
+ * changes it.
+ */
+const UNKNOWN_SIDE_ROWS = 100;
+function sideRows(side: RelationalPlanNode): number {
+	return physicalSourceRows(side.physical, side) || UNKNOWN_SIDE_ROWS;
+}
+
+/**
+ * Rows a side pulls from storage when drained once. A side that peels to a
+ * single access leaf reads that leaf's whole yield — a Filter above a scan
+ * still pulls every row the scan returns, so the side's own (filtered) estimate
+ * would under-count — hence the leaf's count is the honest figure. A side that
+ * does not peel (a join, an aggregate) falls back to its own estimate, which
+ * under-counts rows read beneath a filter or aggregate inside it: a known
+ * approximation, stated in docs/optimizer-joins.md. `rows` is the side's
+ * `sideRows`, so an unknown leaf count inherits that one default.
+ */
+function rowsRead(side: RelationalPlanNode, rows: number): number {
+	const leaf = peelToSeekableAccessLeaf(side);
+	if (!leaf) return rows;
+	return physicalSourceRows(leaf.physical, leaf) || rows;
+}
+
+/**
+ * Wall-clock milliseconds to open a side and drain it once:
+ * `firstRowMs + rowsRead × rowMs`, from the subtree's `expectedLatencyMs` and
+ * `expectedRowLatencyMs`. 0 for every in-process side (both hints default to
+ * 0). The leaf peel only runs when a per-row latency is actually declared, so
+ * the zero-latency hot path does not pay for it.
+ */
+function readMs(side: RelationalPlanNode, rows: number): number {
+	const firstRowMs = side.physical.expectedLatencyMs ?? 0;
+	const rowMs = side.physical.expectedRowLatencyMs ?? 0;
+	if (rowMs === 0) return firstRowMs;
+	return firstRowMs + rowsRead(side, rows) * rowMs;
+}
+
+/**
+ * Storage latency (milliseconds) the PLAIN nested loop pays for its inner
+ * (right) side, given `innerReadMs` — the wall-clock to open and drain that side
+ * once: once if that side is opened once per join — already materialized, or
  * about to be wrapped in a `CacheNode` by `rule-nested-loop-right-cache` — and
  * otherwise once per outer row, because the emitter re-opens the inner pipeline
  * for every left row.
@@ -126,19 +176,21 @@ function nestedLoopInnerLatency(
 	node: JoinNode,
 	context: OptContext,
 	outerRows: number,
-	innerLatencyMs: number,
+	innerReadMs: number,
 ): number {
 	// Short-circuit before `nestedLoopRightOpensOnce`, whose size gate walks the
 	// whole right subtree: with no latency to charge the answer is 0 either way.
-	// Every in-tree module reports 0, so this keeps the walk off the hot path.
-	if (innerLatencyMs === 0) return 0;
-	return nestedLoopRightOpensOnce(node, context) ? innerLatencyMs : outerRows * innerLatencyMs;
+	// `innerReadMs` is 0 exactly when BOTH of the inner's hints are 0 (`readMs`),
+	// so this tests both. Every in-tree module reports 0 for both, which keeps
+	// the walk off the hot path.
+	if (innerReadMs === 0) return 0;
+	return nestedLoopRightOpensOnce(node, context) ? innerReadMs : outerRows * innerReadMs;
 }
 
 /** A priced one-branch batched fan-out built from an index-nested-loop candidate. */
 interface BatchedIndexNestedLoopCandidate {
 	readonly node: FanOutLookupJoinNode;
-	/** Engine-currency cost INCLUDING the outer side's one open, comparable with the other totals. */
+	/** Engine-currency cost INCLUDING the outer side's one drain, comparable with the other totals. */
 	readonly cost: number;
 }
 
@@ -166,7 +218,9 @@ interface BatchedIndexNestedLoopCandidate {
  * for one branch — `min(outerBatchConcurrency, maxOuterReadAhead)`, the
  * driver's global permit budget bounded by its read-ahead window (mirrors
  * `deriveReadAhead` at `branchCount = 1`; see the coupling comment there) —
- * plus one open of the outer side, the same charge the serial index-NL pays.
+ * plus one drain of the outer side (`outerReadCost`, already in cost units),
+ * the same charge the serial index-NL pays. Only the per-seek latency is
+ * divided by the in-flight count; the outer's drain is charged once.
  *
  * NOTE: a `USING` join that takes this path loses its `JoinNode.usingColumns`
  * label — the fan-out has no equivalent field, and the label only ever fed
@@ -183,15 +237,16 @@ function tryBatchedIndexNestedLoop(
 	joinType: 'inner' | 'left',
 	preserveAttrs: readonly Attribute[] | undefined,
 	outerRows: number,
-	outerLatencyMs: number,
-	tuning: OptimizerTuning['parallel'],
+	outerReadCost: number,
+	tuning: OptimizerTuning,
 ): BatchedIndexNestedLoopCandidate | null {
 	if (!candidate || !candidate.atMostOne) return null;
-	// Outcome-preserving short-circuit, not a restated gate: at zero latency the
-	// batched price equals the serial one (the only term batching divides is the
-	// latency), and a strict `<` after the serial entry can never pick it — so
-	// skip building nodes the comparison could not choose. Every in-tree module
-	// reports 0, which keeps node construction off the golden-sweep hot path.
+	// Outcome-preserving short-circuit, not a restated gate: at zero per-seek
+	// latency the batched price equals the serial one (the only term batching
+	// divides is the latency), and a strict `<` after the serial entry can never
+	// pick it — so skip building nodes the comparison could not choose. Every
+	// in-tree module reports 0, which keeps node construction off the
+	// golden-sweep hot path.
 	if (candidate.perSeekLatencyMs === 0) return null;
 	const inner = candidate.newInner;
 	// `condition` is defined — the caller extracted equi pairs from it.
@@ -202,11 +257,12 @@ function tryBatchedIndexNestedLoop(
 		concurrencySafe: inner.physical.concurrencySafe !== false,
 	};
 	const serial = new FanOutLookupJoinNode(join.scope, outer, [branch], 1, preserveAttrs, 'serial');
-	const batched = toBatchedOuter(serial, tuning);
+	const batched = toBatchedOuter(serial, tuning.parallel);
 	if (!batched) return null;
-	const inFlight = Math.min(tuning.outerBatchConcurrency, tuning.maxOuterReadAhead);
+	const inFlight = Math.min(tuning.parallel.outerBatchConcurrency, tuning.parallel.maxOuterReadAhead);
 	const cost = batchedIndexNestedLoopJoinCost(
-		outerRows, candidate.rowsPerSeek, candidate.perSeekLatencyMs, inFlight) + outerLatencyMs;
+		outerRows, candidate.rowsPerSeek, latencyCost(candidate.perSeekLatencyMs, tuning), inFlight)
+		+ outerReadCost;
 	return { node: batched, cost };
 }
 
@@ -276,31 +332,28 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	}
 
 	// Cost comparison: nested loop vs hash join vs merge join vs index-nested-loop.
-	// Physical relay first: by PostOptimization both sides are physical access
-	// nodes (or wrappers over them) which declare no logical `estimatedRows`
-	// getter — the catalog-derived count lives in `physical.estimatedRows` (see
-	// planner/util/row-estimates.ts). `||` not `??`: 0 is the un-analyzed
-	// "unknown" sentinel, not "empty" (same collapse rule-select-access-path
-	// applies), so an un-analyzed table costs exactly as it did under the old
-	// logical-getter read (which yielded undefined → 100).
-	const leftRows = physicalSourceRows(node.left.physical, node.left) || 100;
-	const rightRows = physicalSourceRows(node.right.physical, node.right) || 100;
+	const leftRows = sideRows(node.left);
+	const rightRows = sideRows(node.right);
 
 	// Latency accounting, applied uniformly to every candidate below: a candidate
-	// is charged ONE open of its outer side plus however many opens of its inner
-	// side it performs. `expectedLatencyMs` is a subtree's first-row latency
-	// (0 for every in-process module), treated as ms-equivalent engine cost.
-	// Charged locally here, not inside the shared cost functions, which other
-	// callers use latency-free.
-	const leftLatencyMs = node.left.physical.expectedLatencyMs ?? 0;
-	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
+	// is charged ONE drain of its outer side plus however many drains of its
+	// inner side it performs, where a drain (`readMs`) is the side's first-row
+	// latency plus the rows it pulls times its per-row latency — 0 for every
+	// in-process module. Milliseconds until converted to engine cost units at
+	// `tuning.latencyCostPerMs` (`latencyCost`), which happens exactly where a
+	// candidate's total is formed. Charged locally here, not inside the shared
+	// cost functions, which other callers use latency-free.
+	const tuning = context.tuning;
+	const rightReadMs = readMs(node.right, rightRows);
+	const leftReadCost = latencyCost(readMs(node.left, leftRows), tuning);
+	const rightReadCost = latencyCost(rightReadMs, tuning);
 
-	// Plain nested loop: one open of the left, and one open of the right per left
-	// row unless the right side is already materialized or the cache rule is
-	// about to make it so.
+	// Plain nested loop: one drain of the left, and one drain of the right per
+	// left row unless the right side is already materialized or the cache rule
+	// is about to make it so.
 	const nlCost = nestedLoopJoinCost(leftRows, rightRows)
-		+ leftLatencyMs
-		+ nestedLoopInnerLatency(node, context, leftRows, rightLatencyMs);
+		+ leftReadCost
+		+ latencyCost(nestedLoopInnerLatency(node, context, leftRows, rightReadMs), tuning);
 
 	// Index-nested-loop candidate: the logical JoinNode survives with its right
 	// leaf replaced by a per-outer-row correlated IndexSeek. Considered BEFORE
@@ -322,13 +375,14 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 			'inner', node.right, node.left, mirrorEquiPairs(extracted.equiPairs), rightRows, context)
 		: null;
 
-	// Each index-nested-loop orientation opens its outer side once; the per-seek
+	// Each index-nested-loop orientation drains its outer side once; the per-seek
 	// charge for its INNER side is already inside `indexNestedLoopJoinCost`
-	// (`tryIndexNestedLoop` feeds it `inner.physical.expectedLatencyMs`, which is
-	// the RIGHT side's for the un-mirrored candidate and the LEFT side's for the
-	// mirror). Absent candidates cost Infinity so they never win a comparison.
-	const indexNLCost = indexNL ? indexNL.cost + leftLatencyMs : Infinity;
-	const mirroredNLCost = mirroredNL ? mirroredNL.cost + rightLatencyMs : Infinity;
+	// (`tryIndexNestedLoop` feeds it the inner's first-row latency plus
+	// `rowsPerSeek` of its per-row latency — the RIGHT side's for the un-mirrored
+	// candidate and the LEFT side's for the mirror). Absent candidates cost
+	// Infinity so they never win a comparison.
+	const indexNLCost = indexNL ? indexNL.cost + leftReadCost : Infinity;
+	const mirroredNLCost = mirroredNL ? mirroredNL.cost + rightReadCost : Infinity;
 
 	// Rebuild with the seek-bearing inner side, KEEPING the ON condition on the
 	// join. It is redundant when the seek is exact, but it is the safety net
@@ -390,10 +444,10 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 	// Infinity, as above.
 	const batchedNL = joinType === 'inner' || joinType === 'left'
 		? tryBatchedIndexNestedLoop(
-			node, node.left, indexNL, joinType, preserveAttrs, leftRows, leftLatencyMs, context.tuning.parallel)
+			node, node.left, indexNL, joinType, preserveAttrs, leftRows, leftReadCost, tuning)
 		: null;
 	const mirroredBatchedNL = tryBatchedIndexNestedLoop(
-		node, node.right, mirroredNL, 'inner', undefined, rightRows, rightLatencyMs, context.tuning.parallel);
+		node, node.right, mirroredNL, 'inner', undefined, rightRows, rightReadCost, tuning);
 	const batchedNLCost = batchedNL ? batchedNL.cost : Infinity;
 	const mirroredBatchedNLCost = mirroredBatchedNL ? mirroredBatchedNL.cost : Infinity;
 
@@ -429,10 +483,10 @@ export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): 
 		? mergeJoinCost(leftRows, rightRows, !leftOrdered, !rightOrdered)
 		: Infinity;
 
-	// Hash and merge each open both sides exactly once (build then probe / merge
-	// two streams), so each is charged one open of each side.
-	const hashTotal = hashCostValue + leftLatencyMs + rightLatencyMs;
-	const mergeTotal = mergeCostValue + leftLatencyMs + rightLatencyMs;
+	// Hash and merge each drain both sides exactly once (build then probe / merge
+	// two streams), so each is charged one drain of each side.
+	const hashTotal = hashCostValue + leftReadCost + rightReadCost;
+	const mergeTotal = mergeCostValue + leftReadCost + rightReadCost;
 
 	// Pick the cheapest physical join algorithm. Every comparison is a strict
 	// `<` in this fixed order, so an exact tie keeps the earlier entry: in

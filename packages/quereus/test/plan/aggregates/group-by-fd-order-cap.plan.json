@@ -109,6 +109,7 @@
                 "concurrencySafe": true,
                 "deterministic": true,
                 "expectedLatencyMs": 0,
+                "expectedRowLatencyMs": 0,
                 "fds": [
                   {
                     "dependents": [
@@ -228,6 +229,7 @@
                 "concurrencySafe": true,
                 "deterministic": true,
                 "expectedLatencyMs": 0,
+                "expectedRowLatencyMs": 0,
                 "idempotent": true,
                 "readonly": true
               }
@@ -275,6 +277,7 @@
             "concurrencySafe": true,
             "deterministic": true,
             "expectedLatencyMs": 0,
+            "expectedRowLatencyMs": 0,
             "fds": [
               {
                 "dependents": [
@@ -374,6 +377,7 @@
         "concurrencySafe": true,
         "deterministic": true,
         "expectedLatencyMs": 0,
+        "expectedRowLatencyMs": 0,
         "fds": [
           {
             "dependents": [
@@ -446,6 +450,7 @@
     "concurrencySafe": true,
     "deterministic": true,
     "expectedLatencyMs": 0,
+    "expectedRowLatencyMs": 0,
     "idempotent": true,
     "readonly": true
   }

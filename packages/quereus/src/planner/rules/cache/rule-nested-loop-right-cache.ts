@@ -178,6 +178,13 @@ export function canCacheNestedLoopRight(node: JoinNode, context: OptContext): bo
 
 	// Size gate (memory safety): materializing an unbounded right side trades I/O
 	// for memory. Respect the existing nested-loop caching threshold.
+	// NOTE: admits on size alone, blind to the right side's storage latency. A
+	// remote inner with a per-row latency (`physical.expectedRowLatencyMs`) makes
+	// each re-open cost a full paged read, so caching it is worth far more than
+	// caching an in-process side of the same size — and the physical-selection
+	// rule already prices that difference (`readMs` per re-open). If a remote
+	// inner just over `maxRightRowsForCaching` ever shows up re-reading per outer
+	// row, let a declared latency raise the row cap here.
 	const estimatedRows = estimateRightRows(right) ?? context.tuning.defaultRowEstimate;
 	if (estimatedRows > context.tuning.join.maxRightRowsForCaching) {
 		log('Right side too large to cache (%d rows > %d), skipping',

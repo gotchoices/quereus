@@ -149,7 +149,7 @@ A shift for `T` walks the `Database`'s live statements (`Database.noteCardinalit
 
 Queued, in this order (tickets in `tickets/implement/`, `fix/` and `plan/`; each section above changes only when its ticket lands):
 
-- **Remote reads priced per row** — a module declares a per-row read latency beside its first-row one, every join candidate pays for the rows it pulls, and declared milliseconds convert to cost units at a measured rate instead of one-for-one: `feat-per-row-latency-cost-for-remote-scans`, then `store-provider-declares-per-row-latency`.
+- **Store providers declare per-row latency** — the engine now prices a join side by the rows it pulls (`VirtualTableModule.expectedRowLatencyMs`, converted at `tuning.latencyCostPerMs`; see `docs/optimizer-costing.md`); the key-value store stack still lacks the field a backend would declare it through: `store-provider-declares-per-row-latency`.
 - **Module-reported table sizes** — a synchronous, I/O-free `getRowCount` hook read through `plannedRowCount`; an exact count outranks the overlay, an approximate one ranks below it and above the catalog; cached statements re-plan when a reported count drifts 10×: `feat-planner-asks-the-backend-how-big-a-table-is`, then `replan-when-a-reported-row-count-drifts`.
 - **Measured zero honored** — the `|| 1000` / `|| 100` reads stop turning a measured empty table into an unknown one; cost consumers floor it at one row: `bug-measured-empty-table-costed-as-thousand-rows`.
 - **Lower bounds from partial reads** — a `LIMIT`ed scan or a single-window seek that yielded N rows proves the table holds at least N; the overlay keeps the floor, which only ever raises an estimate: `cardinality-feedback-lower-bounds`.
