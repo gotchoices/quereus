@@ -69,7 +69,7 @@ import { reconcilePkCollations } from './store-module-schema-rewrite.js';
 
 /**
  * `request` with the table's own size filled into `estimatedRows` when the planner
- * supplied none — otherwise `request` unchanged.
+ * supplied none, and a measured 0 floored at one row — otherwise `request` unchanged.
  *
  * A backstop now: the planner asks {@link StoreModule.getRowCount} for this same count
  * before it plans, so a request normally arrives already carrying it. This fires only for
@@ -77,32 +77,25 @@ import { reconcilePkCollations } from './store-module-schema-rewrite.js';
  * but not `getRowCount`, or a request built without the table's planned size. When the
  * hook declines (no count in memory), there is no live count to substitute either.
  *
- * ONE exception, and only one: a hint of `0` that this module's own count contradicts.
- * `0` normally means "analyzed, and empty" and is honored like any other measurement — but
- * an `ANALYZE` run before the data load leaves that 0 in the catalog while the table fills
- * up behind it, and the module can see the contradiction directly. Honoring the 0 there is
- * not conservative, it is degenerate: every cost derives from the size, so a 2000-row table
- * prices every arm and every scan at zero and the seek-versus-scan comparison decides on
- * rounding. `resolveArmEstimate` already refuses a `rowCount <= 0` snapshot for the same
- * reason (see its comment, which names this exact bootstrap-script case); the size path now
- * refuses it consistently. A hint of 0 that the live count AGREES with is a genuinely empty
- * table and stays 0.
+ * A hint of `0` means "measured, and empty", and is priced as ONE row, never zero — the
+ * engine-wide rule for turning a measured zero into a cost (docs/optimizer-costing.md
+ * § Base-table row estimates). Every cost here derives from the size, so a 0 would price
+ * every arm and the scan at nothing and the seek-versus-scan comparison would decide on
+ * rounding: a primary-key equality on a drained table would decline its push-down. At one
+ * row the seek still beats the scan.
+ *
+ * ONE exception: a hint of `0` that this module's own count contradicts. An `ANALYZE` run
+ * before the data load leaves that 0 in the catalog while the table fills up behind it, and
+ * the module can see the contradiction directly — the live count is substituted, since
+ * even the floored one row would price a 2000-row table's secondary-index arms against a
+ * one-row scan. `resolveArmEstimate` likewise refuses a `rowCount <= 0` snapshot (see its
+ * comment, which names this exact bootstrap-script case).
  *
  * Otherwise a supplied hint WINS: it is the number the rest of the plan was costed with (join
  * ordering, cache thresholds and sort costs all read the same catalog statistics), and
  * a module quietly pricing against a different figure would make the access path
  * disagree with the plan around it. A stale post-`ANALYZE` count therefore stays stale
  * here — engine-wide snapshot semantics, not a separate rule.
- *
- * NOTE: floored at 1, conservatively rather than load-bearingly. `rows: 0` used to be read
- * by `rule-select-access-path` as "this module proved its predicate unsatisfiable", which
- * replaced the whole table access with a static empty relation; a live count is a snapshot
- * taken at PLAN time, so an empty table read after the same statement writes into it — a
- * view update materializing its missing non-preserved-side row — returned nothing. That
- * fold reads the explicit `provablyEmpty` flag now (which this module never sets), so a
- * zero here would be read as the estimate it is. The floor stays because a 0-row estimate
- * still distorts every downstream cost (join ordering, cache admission, sort costing);
- * revisit if a genuine zero estimate ever needs to reach the cost model.
  *
  * NOTE: a prepared `Statement` holds its compiled plan and recompiles only on a schema
  * change, so a long-lived prepared statement keeps the costs derived from the size the
@@ -128,17 +121,16 @@ function sizeRequestFromLiveCount(
 	request: BestAccessPlanRequest,
 	table: StoreTable | undefined,
 ): BestAccessPlanRequest {
+	const supplied = request.estimatedRows;
 	const liveRows = table?.getKnownRowCount();
-	if (liveRows === undefined) return request;
-	const staleEmptySnapshot = request.estimatedRows === 0 && liveRows > 0;
-	if (request.estimatedRows !== undefined && !staleEmptySnapshot) return request;
-	// NOTE: floored at 1, so an un-analyzed table this module knows is empty is substituted
-	// as 1 rather than 0 — every arm and the scan would otherwise price at 0 and the
-	// seek-versus-scan comparison would decide on rounding. Deliberately NOT the same case
-	// as a supplied hint of 0, which is a measurement the module honors verbatim (above).
-	// If an empty table's plan ever needs to be distinguishable from a one-row table's, this
-	// floor is what to remove, and the zero-cost comparison is what to fix first.
-	return { ...request, estimatedRows: Math.max(1, liveRows) };
+	const staleEmptySnapshot = supplied === 0 && liveRows !== undefined && liveRows > 0;
+	const size = supplied === undefined || staleEmptySnapshot ? liveRows : supplied;
+	if (size === undefined) return request;
+	// NOTE: one floor for a supplied 0 and a substituted one alike. If an empty table's plan
+	// ever needs to be distinguishable from a one-row table's, the zero-cost seek-versus-scan
+	// comparison is what to fix before removing it.
+	const sized = Math.max(1, size);
+	return sized === supplied ? request : { ...request, estimatedRows: sized };
 }
 
 /**
@@ -706,7 +698,8 @@ export class StoreModule extends StoreModuleRename implements VirtualTableModule
 	 * needs the connection's collation registry, hence `db` is threaded down.
 	 *
 	 * The request is sized from the table's own maintained row count when the planner
-	 * supplied no estimate — see {@link sizeRequestFromLiveCount}.
+	 * supplied no estimate, and a measured 0 is priced as one row — see
+	 * {@link sizeRequestFromLiveCount}.
 	 */
 	getBestAccessPlan(
 		db: Database,

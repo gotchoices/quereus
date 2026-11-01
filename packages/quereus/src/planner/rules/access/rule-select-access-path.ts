@@ -425,8 +425,9 @@ export function selectPhysicalNode(
 	}
 
 	// Default FilterInfo for the physical nodes. Each index arm below spreads this and
-	// overrides `idxStr` / `accessPath` for the index it chose.
-	const filterInfo: FilterInfo = makeFullScanFilterInfo(accessPlan.cost, accessPlan.rows || 1000);
+	// overrides `idxStr` / `accessPath` for the index it chose. `??`: a module's `rows: 0` is
+	// its estimate and is relayed as one; 1000 stands in only for a module that gave none.
+	const filterInfo: FilterInfo = makeFullScanFilterInfo(accessPlan.cost, accessPlan.rows ?? 1000);
 
 	// Convert OrderingSpec[] to the format expected by physical nodes
 	const providesOrdering = accessPlan.providesOrdering?.map(spec => ({
@@ -1238,12 +1239,10 @@ function selectPhysicalNodeLegacy(
  * Create a sequential scan node
  */
 function createSeqScan(tableRef: TableReferenceNode, filterInfo?: FilterInfo, cost?: number): SeqScanNode {
-	// NOTE: `||`, so an ANALYZEd-empty table (a measured `0`) is costed here as 1000. Unlike
-	// the request-building sites above, this number feeds the engine's own cost model rather
-	// than a module, and `seqScanCost(0)` raises a separate question — what an empty table's
-	// scan should cost — so it was left alone. Tracked as
-	// `bug-measured-empty-table-costed-as-thousand-rows`; don't re-file it.
-	const tableRows = tableRef.estimatedRows || 1000;
+	// `??`: a measured 0 (analyzed or observed empty) is relayed as 0; 1000 stands in only for
+	// a table nobody measured. No one-row floor is needed for the cost: `seqScanCost(0)` is
+	// `SEQ_SCAN_BASE`, never zero, so an empty table's scan still costs something.
+	const tableRows = tableRef.estimatedRows ?? 1000;
 	const scanCost = cost ?? seqScanCost(tableRows);
 
 	// Create default FilterInfo if not provided

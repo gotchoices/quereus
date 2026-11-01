@@ -359,15 +359,13 @@ interface DisplacedPlan {
  * plan WORSE than the seek already in place win. Same baseline rule as
  * rule-key-set-seek's `probeModuleCosts`.
  *
- * NOTE: `estimatedRows` is `makeFullScanFilterInfo`'s `accessPlan.rows || 1000`,
- * so a module that answered its own seek with `rows: 0` or with no estimate at
- * all reads back here as a 1000-row baseline the module never stated — the seek
- * arm would then admit a candidate the cost gate should have declined. A zero is
- * an ordinary estimate now (the EmptyResult fold reads `provablyEmpty`, not
- * `rows`), so nothing upstream intercepts it. Both shipped modules always return
- * a positive estimate for a seek, so this is unreachable today; if a third-party
- * module reports 0 or omits `rows`, carry the module's own answer on the leaf
- * instead of re-deriving it from the FilterInfo.
+ * NOTE: `estimatedRows` is `makeFullScanFilterInfo`'s `accessPlan.rows ?? 1000`,
+ * so a module's `rows: 0` reads back here as its own 0, but a module that gave no
+ * estimate at all reads back as a 1000-row baseline it never stated — the seek
+ * arm would then admit a candidate the cost gate should have declined. Both
+ * shipped modules always return an estimate for a seek, so this is unreachable
+ * today; if a third-party module omits `rows`, carry the module's own answer on
+ * the leaf instead of re-deriving it from the FilterInfo.
  */
 function displacedPlan(
 	leaf: SeekableAccessLeafNode,

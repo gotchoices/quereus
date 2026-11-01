@@ -534,14 +534,14 @@ export class IndexSeekNode extends TableAccessNode {
 			// returned, and every cost decision above the seek reads this.
 			//
 			// NOTE: "the module supplied no estimate" is not distinguishable at this
-			// point, by design. The rule builds this field as `accessPlan.rows || 1000`,
-			// so a missing — or zero — `rows` has already collapsed to 1000 before the
-			// node sees it. That `|| 1000` IS the no-answer fallback. Both shipped
-			// modules always set `rows`, so only a third-party module can reach it.
-			// The catalog layer spells unknown as `undefined` (see
-			// `planner/stats/table-cardinality.ts`); if a module's declined estimate
-			// ever needs the same treatment, switch the rule's `||` to `??` there —
-			// do not invent a second convention here.
+			// point, by design. The rule builds this field as `accessPlan.rows ?? 1000`,
+			// so a missing `rows` has already become 1000 before the node sees it, while
+			// a module's `rows: 0` arrives as 0. That `?? 1000` IS the no-answer
+			// fallback. Both shipped modules always set `rows`, so only a third-party
+			// module can reach it. If a module's declined estimate ever needs to read as
+			// `undefined` (the catalog layer's spelling, see
+			// `planner/stats/table-cardinality.ts`), change it there — do not invent a
+			// second convention here.
 			estimatedRows: Number(this.filterInfo.indexInfoOutput.estimatedRows),
 			fds: sourcePhysical?.fds,
 			equivClasses: sourcePhysical?.equivClasses,

@@ -570,11 +570,15 @@ describe('key-set-seek plan shape', () => {
 			await db.exec('create table entry (id integer primary key, txn_id integer, account_id integer, amount integer)');
 			await db.exec('create index idx_entry_account on entry(account_id)');
 			await db.exec('create index idx_entry_txn on entry(txn_id)');
-			// These tests pin plan SHAPE, and a never-analyzed table's row count is
-			// unknown (`undefined`) — under the unknown-default (1000 rows a side)
-			// physical join selection prefers a scan-based join over the
-			// index-nested-loop these shapes assert. Measure the (empty) tables so
-			// the cost model works from real numbers.
+			// These tests pin plan SHAPE, so the cost model needs real sizes: never
+			// analyzed, a table's row count is unknown and join selection prefers a
+			// scan-based join over the index-nested-loop asserted below; analyzed
+			// EMPTY, every side prices as one row and plain nested loops win. `txn`
+			// is much larger than the ~10 entries account 1 selects, which is what
+			// makes seeking it per entry cheaper than draining it into a hash join.
+			await db.exec(`insert into txn select value, 'd' from generate_series(1, 2000)`);
+			await db.exec(`insert into entry
+				select value, value % 2000 + 1, value % 100, value from generate_series(1, 1000)`);
 			await db.exec('analyze txn');
 			await db.exec('analyze entry');
 		});

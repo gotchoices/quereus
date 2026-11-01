@@ -450,8 +450,10 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 
 		// Get table size estimate for cost calculations. An un-analyzed table
 		// arrives as `undefined` ("nobody knows"); fall back to a reasonable
-		// default to avoid degenerate costs. (`||` also catches an analyzed empty
-		// table — a plan over 0 rows is cheap under any default, so that is fine.)
+		// default to avoid degenerate costs. A measured 0 is priced as one row:
+		// `fullScan(0)` would cost 0, below every seek, so a table measured empty
+		// and filled since (a stale `ANALYZE`) would trade its primary-key seeks for
+		// full scans. At one row a primary-key seek (0.8) still beats a scan (1.0).
 		//
 		// NOTE: this constant is now the SOLE fallback for an un-analyzed table. Every
 		// planner site that builds a `BestAccessPlanRequest` sends `undefined` rather than
@@ -461,7 +463,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// deliberately does not yet, because switching every un-analyzed memory table from
 		// a flat 1000 to its real size re-prices the default backend under the entire test
 		// suite. Tracked as `feat-memory-backend-sizes-itself`; do not "fix" it in passing.
-		const estimatedTableSize = request.estimatedRows || 1000;
+		const estimatedTableSize = request.estimatedRows === undefined ? 1000 : Math.max(1, request.estimatedRows);
 
 		// Find the best access strategy
 		const bestPlan = this.findBestAccessPlan(tableInfo, request, estimatedTableSize);

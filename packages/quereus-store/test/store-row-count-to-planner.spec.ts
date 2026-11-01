@@ -171,6 +171,24 @@ describe('store row count reaches the planner', () => {
 			expect(mod.getBestAccessPlan(db, schema, fullScanRequest(schema)).rows).to.equal(1);
 		});
 
+		it('prices a measured 0 as one row, so a primary-key seek still undercuts the scan', async () => {
+			// Priced as 0, the full scan cost nothing, so the planner's seek-versus-scan
+			// comparison declined the primary-key equality and rebuilt it as a filter.
+			await db.exec(`create table e (id integer primary key, v text) using store`);
+			await db.exec(`insert into e values (1, 'a')`);
+			await db.exec(`delete from e`);
+			const schema = db.schemaManager.findTable('e')!;
+
+			const scan = mod.getBestAccessPlan(db, schema, fullScanRequest(schema, 0));
+			expect(scan).to.deep.equal(mod.getBestAccessPlan(db, schema, fullScanRequest(schema, 1)));
+			const seek = mod.getBestAccessPlan(db, schema, {
+				...fullScanRequest(schema, 0),
+				filters: [{ columnIndex: 0, op: '=', value: 5, usable: true }],
+			});
+			expect(seek.handledFilters).to.deep.equal([true]);
+			expect(seek.cost).to.be.lessThan(scan.cost);
+		});
+
 		it("keeps the planner's own hint when it has one", async () => {
 			await seed(17);
 			const schema = db.schemaManager.findTable('t')!;

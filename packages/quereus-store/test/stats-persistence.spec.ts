@@ -77,11 +77,10 @@ const columnStats = (schema: TableSchema | undefined, name: string): ColumnStati
 /**
  * The cost the planner assigns the TABLE ACCESS — the number per-column statistics move.
  *
- * Deliberately not `est_rows`: neither the root's nor the access node's row estimate can
- * see this. A `BLOCK` root reports a fixed default, and an access node's `est_rows` is the
- * engine's own estimate rather than the module's advertised `rows`, which lives on
- * `filterInfo.indexInfoOutput` and reaches the plan only through the cost. The store's
- * per-predicate estimate (`store-per-predicate-selectivity`) shows up here.
+ * Deliberately not `est_rows`: only a seek's is the module's advertised `rows` (from
+ * `filterInfo.indexInfoOutput`) — a scan's, and the `BLOCK` root's relay of it, is the
+ * table's planned size. The cost reflects the module's answer on every arm.
+ * The store's per-predicate estimate (`store-per-predicate-selectivity`) shows up here.
  */
 async function planAccessCost(db: Database, sql: string): Promise<number> {
 	for await (const row of db.eval(

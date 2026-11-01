@@ -21,13 +21,12 @@
  * afterwards are invisible until the next one (or until a complete scan is observed),
  * unless the module reports its own count.
  *
- * NOTE: a real 0 (analyzed or observed empty table) is distinct from `undefined`,
- * but the `estimatedRows || default` spellings in `rule-select-access-path`,
- * `rule-grow-retrieve` and `IndexSeekNode.computePhysical` collapse the two and
- * substitute their default — so a measured empty table reaches `getBestAccessPlan`
- * as "unknown" (1000) while a SeqScan over it reports 0. Harmless today (any plan
- * over 0 rows is cheap); switch those to `??` if an empty-table plan ever costs out
- * wrong.
+ * A real 0 (analyzed or observed empty table) is relayed as 0 everywhere a row count is
+ * reported. Sites that turn a count into a COST floor a measured 0 at one row instead
+ * (the memory module's table size, join selection's side rows, the store's request
+ * sizing): a zero goes stale on the first insert, and a table priced at nothing would
+ * trade its primary-key seeks for scans (docs/optimizer-costing.md § Base-table row
+ * estimates).
  */
 
 import type { TableSchema } from '../../schema/table.js';

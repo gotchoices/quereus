@@ -23,6 +23,9 @@
  * spellings at the remaining sites collapsed a measured `0` into "unknown" and are now
  * plain relays.
  *
+ * A measured `0` is relayed as 0 but PRICED as one row: a zero goes stale on the first insert,
+ * and a table priced at nothing would trade its primary-key seeks for full scans.
+ *
  * The memory backend keeps its own flat 1000 default and does not (yet) answer from the
  * O(1) size it could read — see `feat-memory-backend-sizes-itself` — so nothing here may
  * change what it plans. `prices two un-analyzed tables of very different sizes identically`
@@ -77,10 +80,10 @@ class RecordingMemoryModule extends MemoryTableModule {
 	}
 }
 
-/** `query_plan()` rows for `sql`, as `{op, detail, est_cost}` records. */
+/** `query_plan()` rows for `sql`, as `{op, detail, est_cost, est_rows}` records. */
 async function planRows(db: Database, sql: string): Promise<Array<Record<string, unknown>>> {
 	const out: Array<Record<string, unknown>> = [];
-	for await (const row of db.eval('select op, detail, est_cost from query_plan(?)', [sql])) {
+	for await (const row of db.eval('select op, detail, est_cost, est_rows from query_plan(?)', [sql])) {
 		out.push(row as unknown as Record<string, unknown>);
 	}
 	return out;
@@ -188,6 +191,41 @@ describe('BestAccessPlanRequest.estimatedRows', () => {
 			const asked = mod.forTable('e');
 			expect(asked, 'the planner asked about the empty table').to.not.be.empty;
 			expect(asked).to.deep.equal(asked.map(() => 0));
+		});
+
+		it('prices a measured-empty table as one row and reports it as 0 — one table, one size', async () => {
+			// The defect: the module's `|| 1000` priced the scan for 1000 rows while the node
+			// relayed the measured 0 as its row estimate, so one plan held two sizes for e.
+			await seed(0, 'e');
+			await seed(1, 'one');
+			await db.exec('analyze e');
+			await db.exec('analyze one');
+
+			const leafOf = async (name: string): Promise<Record<string, unknown>> => {
+				const leaf = (await planRows(db, `select * from ${name}`))
+					.find(r => ['INDEXSCAN', 'SEQSCAN'].includes(String(r.op)));
+				expect(leaf, `a table access for ${name}`).to.not.be.undefined;
+				return leaf!;
+			};
+			const empty = await leafOf('e');
+			const oneRow = await leafOf('one');
+			expect(empty.est_cost, 'the one-row price').to.equal(oneRow.est_cost);
+			expect(empty.est_rows, 'the measured size').to.equal(0);
+		});
+
+		it('still seeks the primary key once a table measured empty has filled up', async () => {
+			// A zero priced as zero would undercut every seek, so a stale `ANALYZE` would turn
+			// this point query into a full scan of 2000 rows. One row keeps the seek cheaper.
+			db.setOption('auto_analyze', false);
+			await seed(0, 'e');
+			await db.exec('analyze e');
+			await db.exec(`insert into e select value, value * 10, 'w' from generate_series(1, 2000)`);
+			expect(db.schemaManager.findTable('e')!.statistics!.rowCount, 'the catalog still says empty').to.equal(0);
+
+			const rows = await planRows(db, 'select * from e where id = ?');
+			const leaf = rows.find(r => String(r.op).includes('SEEK') || String(r.op).includes('SCAN'));
+			expect(leaf?.op).to.equal('INDEXSEEK');
+			expect(String(leaf?.detail)).to.match(/primary/i);
 		});
 
 		it('agrees across every request site in one plan', async () => {

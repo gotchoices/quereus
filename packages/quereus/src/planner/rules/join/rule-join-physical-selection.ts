@@ -91,20 +91,31 @@ function mayMirrorIndexNestedLoop(node: JoinNode): boolean {
 }
 
 /**
- * Row count this rule plans a side with. By PostOptimization both sides are
- * physical access nodes (or wrappers over them) which declare no logical
- * `estimatedRows` getter — the catalog-derived count lives in
- * `physical.estimatedRows` (see planner/util/row-estimates.ts). `||` not `??`:
- * 0 is the un-analyzed "unknown" sentinel, not "empty" (same collapse
- * rule-select-access-path applies), so an un-analyzed side costs exactly as it
- * did under the old logical-getter read (which yielded undefined → 100). The ONE
- * place the unknown-side default is spelled, so every term — work and latency
- * alike — moves together when `unknown-size-join-scans-instead-of-seeking`
+ * The ONE place the unknown-side default is spelled, so every term — work and
+ * latency alike — moves together when `unknown-size-join-scans-instead-of-seeking`
  * changes it.
  */
 const UNKNOWN_SIDE_ROWS = 100;
+
+/**
+ * Row count this rule plans a side with. By PostOptimization both sides are
+ * physical access nodes (or wrappers over them) which declare no logical
+ * `estimatedRows` getter — the catalog-derived count lives in
+ * `physical.estimatedRows` (see planner/util/row-estimates.ts).
+ */
 function sideRows(side: RelationalPlanNode): number {
-	return physicalSourceRows(side.physical, side) || UNKNOWN_SIDE_ROWS;
+	return costedRows(physicalSourceRows(side.physical, side), UNKNOWN_SIDE_ROWS);
+}
+
+/**
+ * A row estimate as this rule prices it: `unknown` stands in for `undefined`
+ * (nobody measured), and a measured 0 is floored at one row. A zero is the most
+ * fragile measurement there is — any insert since invalidates it by an infinite
+ * ratio — and a side priced at nothing would win every comparison it enters.
+ * One row keeps an empty side cheap without making it free.
+ */
+function costedRows(rows: number | undefined, unknown: number): number {
+	return rows === undefined ? unknown : Math.max(1, rows);
 }
 
 /**
@@ -120,7 +131,7 @@ function sideRows(side: RelationalPlanNode): number {
 function rowsRead(side: RelationalPlanNode, rows: number): number {
 	const leaf = peelToSeekableAccessLeaf(side);
 	if (!leaf) return rows;
-	return physicalSourceRows(leaf.physical, leaf) || rows;
+	return costedRows(physicalSourceRows(leaf.physical, leaf), rows);
 }
 
 /**

@@ -140,7 +140,9 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 				let objectName: string | null = null;
 				let alias: string | null = null;
 				const estCost = node.estimatedCost || 1.0;
-				const estRows = (node as RelationalPlanNode).estimatedRows || 10;
+				// Physical first: access nodes carry their count only there. A measured 0 is shown
+				// as 0, and a node nobody could estimate as null rather than a made-up figure.
+				const estRows = node.physical.estimatedRows ?? (node as RelationalPlanNode).estimatedRows ?? null;
 
 				// Use node's toString() method for detail if available
 				if (typeof node.toString === 'function') {
