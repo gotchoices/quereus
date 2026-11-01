@@ -397,6 +397,11 @@ export class CardinalityFeedbackManager implements ObservedRowCounts, ObservedKe
 		const existing = this.validEntry(key, table);
 		const before = this.plannedBefore(table, existing);
 		if (before <= policy.minRows) return;
+		// NOTE: a set the catalog's statistics cover is recorded too, though `plannedRowsPerKey`
+		// never consults it under this schema object (an `ANALYZE` swaps the object before
+		// coverage can change), so under a stale catalog its first record can shift once and
+		// re-plan statements that land the same plan; if that re-plan ever shows in a profile,
+		// skip the record when `catalogCoversColumns` holds.
 
 		const entry = this.upsert(key, existing ?? newEntry(table, before));
 		const batchMean = sum / count;
@@ -598,7 +603,6 @@ export class CardinalityFeedbackManager implements ObservedRowCounts, ObservedKe
 	private plannedBefore(table: TableSchema, existing: ObservedEntry | undefined): number {
 		return plannedRowCount(table, {
 			observedRows: () => existing,
-			observedRowsPerKey: () => undefined,
 			reportedRows: t => this.ctx.reportedRows(t),
 		}) ?? this.ctx.getTuning().defaultRowEstimate;
 	}

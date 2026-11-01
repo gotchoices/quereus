@@ -98,6 +98,9 @@ export interface RowCountSources extends ObservedRowCounts, ObservedKeyCardinali
 	reportedRows(table: TableSchema): ModuleRowCount | undefined;
 }
 
+/** What {@link plannedRowCount} ranks: the overlay's counts and the module's, not the overlay's rows per key. */
+export type RankedRowCountSources = Pick<RowCountSources, 'observedRows' | 'reportedRows'>;
+
 /** The database's row-count sources: its observed overlay, and its tables' modules. */
 export function databaseRowCountSources(db: Database, observed: ObservedRowCounts & ObservedKeyCardinalities): RowCountSources {
 	return {
@@ -162,7 +165,7 @@ export function reportedRowCount(db: Database, table: TableSchema): ModuleRowCou
  * its count prices its access path against the same number the rest of the plan uses —
  * one size per plan.
  */
-export function plannedRowCount(table: TableSchema, sources: RowCountSources | undefined): number | undefined {
+export function plannedRowCount(table: TableSchema, sources: RankedRowCountSources | undefined): number | undefined {
 	const reported = sources?.reportedRows(table);
 	if (reported?.exact) return reported.rows;
 	const observed = sources?.observedRows(table);
