@@ -10,6 +10,7 @@ RESUME: A prior agent run on this ticket did not complete.
   Log file: C:\projects\quereus\tickets\.logs\2-cardinality-feedback-scan-observations.implement.2026-11-01T01-16-16-639Z.log
 Read the log to see what was done. Resume where it left off.
 If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+Gardener note: the first run (log `...implement.2026-10-31T23-16-24-940Z.log`) finished the code (committed in the timeout commit); new specs, lint, `yarn test` and `test:fork-strict` were all green, and the post-change execution benchmark showed 0 regressed rows with the five scan-heavy rows "no change" (a uniform +1–10% drift across nearly every row, likely machine state). It then hung running an interleaved HEAD/change A/B benchmark in a scratch worktree — that run exceeds the runner's 10-minute idle limit. Do NOT repeat the A/B run or any benchmark that runs >5 min in the foreground. Re-verify quickly (build, new specs, lint, `yarn test`), record the benchmark result and the drift observation in the review handoff (the `cardinality-feedback-on-by-default` ticket owns the definitive overhead measurement), and advance to review.
 <!-- /resume-note -->
 
 # Observe complete table enumerations at the scan leaf
