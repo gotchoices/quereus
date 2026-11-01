@@ -52,6 +52,32 @@ export interface FilterInfo {
 	offset?: number;
 }
 
+/**
+ * The base-column indexes a single-key equality seek looks up — sorted, de-duplicated —
+ * or undefined when `filterInfo` is not one. This is the one definition of "a single-key
+ * equality seek" shared by the two readers of rows-per-key feedback
+ * (docs/progressive-optimizer.md §3.1): the scan leaf that counts what such a seek
+ * yields and the planner that later prices it, so neither can drift on what qualifies.
+ *
+ * Qualifies: a resolved index (`accessPath.kind === 'index'` — an `unresolvedIndex`
+ * cannot say whether it is unique) walked with plan `eqSeek` (one key tuple; a
+ * `multiSeek` yields several keys' rows), every constraint an `EQ`, no pushed limit or
+ * offset, and the equality set NOT a unique key: a seek that covers every key column of a
+ * unique index (a whole-primary-key point seek, a unique index seek) yields at most one
+ * row by proof, so there is nothing to learn from it. A prefix of a composite unique
+ * index is not unique and qualifies.
+ */
+export function equalitySeekKeyColumns(filterInfo: FilterInfo): readonly number[] | undefined {
+	const { accessPath, constraints, limit, offset } = filterInfo;
+	if (accessPath?.kind !== 'index' || accessPath.plan !== 'eqSeek') return undefined;
+	if (constraints.length === 0 || limit !== undefined || offset !== undefined) return undefined;
+	if (constraints.some(c => c.constraint.op !== IndexConstraintOp.EQ)) return undefined;
+	const columns = [...new Set(constraints.map(c => c.constraint.iColumn))].sort((a, b) => a - b);
+	const { index } = accessPath;
+	if (index.unique && index.keyColumns.every(key => columns.includes(key.columnIndex))) return undefined;
+	return columns;
+}
+
 /** The `idxStr` sentinel meaning "no index chosen — walk every row". */
 const FULL_SCAN_IDX_STR = 'fullscan';
 

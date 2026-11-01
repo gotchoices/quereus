@@ -101,7 +101,7 @@ describe('Cardinality feedback overlay', () => {
 
 			expect(overlay.snapshot()).to.deep.equal([{
 				schemaName: 'main', tableName: 't', rows: 0, atLeast: undefined, catalogRows: undefined,
-				baselineRows: 0, observations: 4, shifts: 3,
+				baselineRows: 0, observations: 4, shifts: 3, perKey: [],
 			}]);
 		});
 
@@ -131,7 +131,7 @@ describe('Cardinality feedback overlay', () => {
 			expect(shifts).to.deep.equal(['main.t']);
 			expect(overlay.snapshot()).to.deep.equal([{
 				schemaName: 'main', tableName: 't', rows: 4000, atLeast: 40_000, catalogRows: undefined,
-				baselineRows: 40_000, observations: 3, shifts: 1,
+				baselineRows: 40_000, observations: 3, shifts: 1, perKey: [],
 			}]);
 		});
 
@@ -147,6 +147,72 @@ describe('Cardinality feedback overlay', () => {
 			overlay.record(original, 50_000);
 			expect(overlay.observedRows(original)?.rows).to.equal(undefined);
 			expect(overlay.snapshot()).to.deep.equal([]);
+		});
+
+		/** The emit-time spec of a seek on `columns`, planned at `plannedRowsPerKey` rows per key. */
+		function spec(columns: number[], plannedRowsPerKey = 2000) {
+			return { columns, key: columns.join(','), plannedRowsPerKey };
+		}
+
+		function rowsPerKey(t: TableSchema) {
+			return overlay.snapshot().find(entry => entry.tableName === t.name)?.perKey ?? [];
+		}
+
+		it('records rows per key only for a table planned above minRows, with the planned rows per key as baseline', () => {
+			const t = table('t');
+
+			// `t` plans at the 1000-row default: nothing is learned about its keys.
+			overlay.recordRowsPerKey(t, spec([0]), 40, 10);
+			expect(overlay.snapshot()).to.deep.equal([]);
+
+			overlay.record(t, 20_000);
+			overlay.recordRowsPerKey(t, spec([0]), 40, 10);
+			expect(rowsPerKey(t)).to.deep.equal([
+				{ keyColumns: ['id'], rowsPerKey: 4, samples: 10, baselineRowsPerKey: 2000, shifts: 0 },
+			]);
+			expect(overlay.snapshot()[0].observations).to.equal(2);
+		});
+
+		it('tracks the exact running mean up to 32 samples, then weighs each sample 1/32, and a window-sized batch replaces it', () => {
+			const t = table('t');
+			overlay.record(t, 20_000);
+			const mean = () => rowsPerKey(t)[0].rowsPerKey;
+
+			overlay.recordRowsPerKey(t, spec([0]), 40, 10);
+			overlay.recordRowsPerKey(t, spec([0]), 8, 1);
+			expect(mean()).to.be.closeTo((4 * 10 + 8) / 11, 1e-12);
+
+			// 21 more samples reach the window exactly: still the exact mean of all 32.
+			overlay.recordRowsPerKey(t, spec([0]), 2100, 21);
+			expect(mean()).to.be.closeTo((40 + 8 + 2100) / 32, 1e-12);
+			expect(rowsPerKey(t)[0].samples).to.equal(32);
+
+			// Past the window one sample weighs 1/32, whatever the count so far.
+			overlay.recordRowsPerKey(t, spec([0]), 0, 1);
+			expect(mean()).to.be.closeTo((2148 / 32) * (31 / 32), 1e-12);
+
+			// A batch at least the window's size replaces the mean outright.
+			overlay.recordRowsPerKey(t, spec([0]), 700, 100);
+			expect(mean()).to.equal(7);
+			expect(rowsPerKey(t)[0].samples).to.equal(133);
+		});
+
+		it('evicts the least recently recorded column set past maxKeySetsPerTable', async () => {
+			await db.exec('create table keyed (id integer primary key, a integer, b integer, c integer, d integer)');
+			tuning = { ...DEFAULT_TUNING, cardinalityFeedback: { ...DEFAULT_TUNING.cardinalityFeedback, maxKeySetsPerTable: 2 } };
+			const keyed = table('keyed');
+			overlay.record(keyed, 20_000);
+
+			overlay.recordRowsPerKey(keyed, spec([1]), 10, 1);
+			overlay.recordRowsPerKey(keyed, spec([2]), 20, 1);
+			overlay.recordRowsPerKey(keyed, spec([3]), 30, 1);
+			expect(rowsPerKey(keyed).map(entry => entry.keyColumns)).to.deep.equal([['b'], ['c']]);
+
+			// A record refreshes recency: `b` survives and `c` goes.
+			overlay.recordRowsPerKey(keyed, spec([2]), 20, 1);
+			overlay.recordRowsPerKey(keyed, spec([1, 4]), 5, 1);
+			expect(rowsPerKey(keyed).map(entry => entry.keyColumns)).to.deep.equal([['b'], ['a', 'd']]);
+			expect(rowsPerKey(keyed)[0].samples).to.equal(2);
 		});
 
 		it('evicts the least-recently-used table past maxTables, without a shift', () => {

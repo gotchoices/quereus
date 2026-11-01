@@ -642,6 +642,7 @@ These table-valued functions provide query introspection and execution tracing. 
 | `row_trace(sql)` | 1 | Row-level data flow trace. Non-deterministic |
 | `explain_assertion(name)` | 1 | Assertion analysis: classification, prepared PK params, violation SQL. `name` may be `'schema.name'` or bare (first match across schemas) |
 | `cardinality_feedback()` | 0 | Table sizes the planner has learned from execution (the `cardinality_feedback` option). Non-deterministic; empty while the option is off |
+| `cardinality_feedback_keys()` | 0 | Rows per key learned from executed equality seeks through non-unique indexes, per table and column set. Non-deterministic; empty while the option is off |
 
 ```sql
 select id, op, detail from query_plan('select * from users where age > 25');
@@ -675,11 +676,29 @@ One row per remembered table whose schema is still current, ordered by schema th
 | `lower_bound_rows` | INTEGER? | Floor proven by a partial read (a `LIMIT`ed scan, one index range) since the latest complete read; later plans use at least this. Null when none |
 | `catalog_rows` | INTEGER? | Row count from the table's statistics (`ANALYZE`); null when never analyzed |
 | `baseline_rows` | INTEGER | Count the next shift is measured against: the estimate before the first observation, or the count at the last shift |
-| `observations` | INTEGER | Complete and partial reads recorded |
+| `observations` | INTEGER | Complete reads, partial reads and rows-per-key batches recorded |
 | `shifts` | INTEGER | Times the count or floor moved far enough from the baseline to re-plan statements that read the table |
 
 ```sql
 select table_name, observed_rows, lower_bound_rows, catalog_rows from cardinality_feedback();
+```
+
+### `cardinality_feedback_keys()` columns
+
+One row per remembered table and equality column set, ordered by schema, table, then key columns. Key: `(schema_name, table_name, key_columns)`. A set is remembered once a seek on it through a non-unique index ran to exhaustion while the table was planned above 1000 rows. See `docs/progressive-optimizer.md` §3.
+
+| Column | Type | Description |
+|---|---|---|
+| `schema_name` | TEXT | Schema of the table |
+| `table_name` | TEXT | Table name |
+| `key_columns` | TEXT | The seeked column names, comma-separated, in the order of their sorted column indexes |
+| `rows_per_key` | REAL | Running average of the rows one key value matched |
+| `samples` | INTEGER | Exhausted seeks folded into the average |
+| `baseline_rows_per_key` | REAL | Rows per key the plan was priced with before the first sample, or the average at the last shift |
+| `shifts` | INTEGER | Times the average moved far enough from the baseline to re-plan statements that read the table |
+
+```sql
+select table_name, key_columns, rows_per_key, samples from cardinality_feedback_keys();
 ```
 
 ---

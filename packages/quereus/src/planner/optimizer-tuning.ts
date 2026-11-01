@@ -276,6 +276,12 @@ export interface OptimizerTuning {
 		 * statement re-plan on every execution.
 		 */
 		readonly replanCooldown: number;
+		/**
+		 * Maximum equality column sets whose rows per key one table's entry remembers;
+		 * least-recently-recorded evicted beyond it. A table is seldom seeked on more
+		 * than a few distinct key sets (its foreign keys, say), so the default is small.
+		 */
+		readonly maxKeySetsPerTable: number;
 	};
 }
 
@@ -370,5 +376,6 @@ export const DEFAULT_TUNING: OptimizerTuning = {
 		shiftFactor: 10,
 		maxTables: 512,
 		replanCooldown: 8,
+		maxKeySetsPerTable: 4,
 	},
 };

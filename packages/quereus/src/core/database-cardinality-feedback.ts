@@ -15,6 +15,8 @@
  *
  * An entry holds an exact count from a complete read, a floor ("at least N rows") from a
  * partial one, or both; a floor only ever raises an estimate, and an exact count clears it.
+ * Beside them it keeps, per equality column set the table is seeked on through a
+ * non-unique index, a running mean of the rows one key matched ({@link PerKeyEntry}).
  *
  * Execution feeds it through {@link CardinalityFeedbackManager.publish}, which admits
  * only observations of committed state: one made inside a transaction is held until
@@ -32,7 +34,7 @@
 
 import { createLogger } from '../common/logger.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
-import { CardinalityObservations } from '../runtime/cardinality-observations.js';
+import { CardinalityObservations, type RowsPerKeySamples, type RowsPerKeySpec } from '../runtime/cardinality-observations.js';
 import { catalogRowCount, moduleReportsRowCount, plannedRowCount, type ObservedRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
 import type { SchemaDependency } from '../planner/planning-context.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
@@ -60,6 +62,24 @@ export interface CardinalityFeedbackManagerContext {
 	onShift(key: string): void;
 }
 
+/**
+ * Rows per key of one equality column set, learned from exhausted seeks
+ * (docs/progressive-optimizer.md §3.2). One mean per column set, whatever the key
+ * values — the uniform assumption `ANALYZE` statistics make.
+ */
+interface PerKeyEntry {
+	/** Sorted base-column indexes of the equality set. */
+	readonly columns: readonly number[];
+	/** Rows per key, a running average. */
+	mean: number;
+	/** Samples folded into `mean` so far. */
+	samples: number;
+	/** The estimate planning used before the first record (the module's), or the mean at the last shift. */
+	baseline: number;
+	// NOTE: stays 0 here; `cardinality-feedback-rows-per-key` adds shift detection on a record.
+	shifts: number;
+}
+
 interface ObservedEntry extends ObservedRowCount {
 	/** The schema object the count was observed under; the entry answers for no other. */
 	readonly schema: TableSchema;
@@ -69,8 +89,14 @@ interface ObservedEntry extends ObservedRowCount {
 	atLeast: number | undefined;
 	/** The count shifts are measured against: the pre-entry estimate, or the count at the last shift. */
 	baselineRows: number;
+	/** Counts, floors and rows-per-key batches recorded. */
 	observations: number;
 	shifts: number;
+	/**
+	 * Rows per key by column-set key (`RowsPerKeySpec.key`). Insertion order is recency —
+	 * re-inserted on record — bounded by `cardinalityFeedback.maxKeySetsPerTable`.
+	 */
+	readonly perKey: Map<string, PerKeyEntry>;
 }
 
 /** Observations held for the open transaction's commit, per table. */
@@ -78,6 +104,18 @@ interface HeldObservation {
 	readonly table: TableSchema;
 	rows: number | undefined;
 	atLeast: number | undefined;
+	/** Rows-per-key samples summed across the transaction's executions, by column-set key. */
+	readonly perKey: Map<string, RowsPerKeySamples>;
+}
+
+/** By-value view of one column set's rows per key, for tests and diagnostics. */
+export interface ObservedRowsPerKeySnapshot {
+	/** Column names, in the order of their sorted indexes. */
+	readonly keyColumns: readonly string[];
+	readonly rowsPerKey: number;
+	readonly samples: number;
+	readonly baselineRowsPerKey: number;
+	readonly shifts: number;
 }
 
 /** By-value view of one valid entry, for tests and diagnostics. */
@@ -91,7 +129,17 @@ export interface ObservedRowCountSnapshot {
 	readonly baselineRows: number;
 	readonly observations: number;
 	readonly shifts: number;
+	/** Least recently recorded first. */
+	readonly perKey: readonly ObservedRowsPerKeySnapshot[];
 }
+
+/**
+ * Samples a rows-per-key mean tracks exactly before it becomes an exponential average:
+ * up to this many, the mean is the exact running mean of every sample; past it, each
+ * sample weighs 1/32, so a changing distribution is followed rather than averaged away.
+ * A module constant, not a tuning knob — nothing a deployment would turn.
+ */
+const ROWS_PER_KEY_WINDOW = 32;
 
 /**
  * Distance between two counts as a ratio ≥ 1. The `+ 1` on both sides keeps a zero
@@ -111,7 +159,19 @@ function tableKey(table: TableSchema): string {
 }
 
 function newEntry(schema: TableSchema, baselineRows: number): ObservedEntry {
-	return { schema, rows: undefined, atLeast: undefined, baselineRows, observations: 0, shifts: 0 };
+	return { schema, rows: undefined, atLeast: undefined, baselineRows, observations: 0, shifts: 0, perKey: new Map() };
+}
+
+/**
+ * Folds a batch of `count` samples averaging `batchMean` into `entry` (docs/progressive-optimizer.md
+ * §3.4): with `n` samples already held the batch weighs `min(1, count / min(n + count, WINDOW))` —
+ * the exact running mean up to the window, 1/32 per sample past it, and a batch at least the
+ * window's size replaces the mean outright.
+ */
+function foldRowsPerKey(entry: PerKeyEntry, batchMean: number, count: number): void {
+	const weight = Math.min(1, count / Math.min(entry.samples + count, ROWS_PER_KEY_WINDOW));
+	entry.mean += (batchMean - entry.mean) * weight;
+	entry.samples += count;
 }
 
 /** Cap on the cooldown's doubling: re-plans past the seventh wait `64 × replanCooldown` executions. */
@@ -262,7 +322,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * `shiftFactor` from the entry's baseline.
 	 */
 	record(table: TableSchema, rows: number): void {
-		if (this.isSuperseded(table, rows)) return;
+		if (this.isSuperseded(table)) return;
 		const policy = this.ctx.getTuning().cardinalityFeedback;
 		const key = tableKey(table);
 		const existing = this.validEntry(key, table);
@@ -287,7 +347,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * plans at today. Shifts like a count; floors only raise, so they cannot oscillate.
 	 */
 	recordAtLeast(table: TableSchema, rows: number): void {
-		if (this.isSuperseded(table, rows)) return;
+		if (this.isSuperseded(table)) return;
 		const policy = this.ctx.getTuning().cardinalityFeedback;
 		const key = tableKey(table);
 		const existing = this.validEntry(key, table);
@@ -298,6 +358,45 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		entry.atLeast = Math.max(entry.atLeast ?? 0, rows);
 		debugLog('Recorded at least %d rows for %s (was %d, baseline %d)', rows, key, before, entry.baselineRows);
 		this.shiftIfMoved(key, entry, rows);
+	}
+
+	/**
+	 * Offer `count` samples of rows per key for `spec`'s column set on `table`, summing to
+	 * `sum` rows — one sample per exhausted equality seek with non-NULL keys
+	 * (docs/progressive-optimizer.md §3.4). Ignored under a superseded schema, and unless
+	 * the table's planned size exceeds `minRows`: below that every plan finishes fast, and
+	 * the gate keeps small-table plans unchanged exactly as the count gate does. So a table
+	 * of unknown size learns rows per key only once its size is learned (a complete scan,
+	 * a floor, or a module count above the gate); publication applies per-key batches
+	 * after the same execution's counts and floors, so one execution can open the gate for
+	 * itself. A new column-set entry's baseline is the rows per key the plan was priced
+	 * with; the table remembers at most `maxKeySetsPerTable` sets, least recently recorded
+	 * evicted. Accepted bias: frequently probed keys weigh more than a uniform sample would.
+	 */
+	recordRowsPerKey(table: TableSchema, spec: RowsPerKeySpec, sum: number, count: number): void {
+		if (count <= 0 || this.isSuperseded(table)) return;
+		const policy = this.ctx.getTuning().cardinalityFeedback;
+		const key = tableKey(table);
+		const existing = this.validEntry(key, table);
+		const before = this.plannedBefore(table, existing);
+		if (before <= policy.minRows) return;
+
+		const entry = this.upsert(key, existing ?? newEntry(table, before));
+		const batchMean = sum / count;
+		let keyEntry = entry.perKey.get(spec.key);
+		if (keyEntry) {
+			entry.perKey.delete(spec.key);
+			foldRowsPerKey(keyEntry, batchMean, count);
+		} else {
+			keyEntry = { columns: spec.columns, mean: batchMean, samples: count, baseline: spec.plannedRowsPerKey, shifts: 0 };
+		}
+		entry.perKey.set(spec.key, keyEntry);
+		for (const staleKey of entry.perKey.keys()) {
+			if (entry.perKey.size <= policy.maxKeySetsPerTable) break;
+			entry.perKey.delete(staleKey);
+		}
+		debugLog('Recorded %d rows per key over %d samples for %s (%s) (mean now %d, baseline %d)',
+			batchMean, count, key, spec.key, keyEntry.mean, keyEntry.baseline);
 	}
 
 	/**
@@ -382,6 +481,13 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 				baselineRows: entry.baselineRows,
 				observations: entry.observations,
 				shifts: entry.shifts,
+				perKey: [...entry.perKey.values()].map(keyEntry => ({
+					keyColumns: keyEntry.columns.map(i => schema.columns[i].name),
+					rowsPerKey: keyEntry.mean,
+					samples: keyEntry.samples,
+					baselineRowsPerKey: keyEntry.baseline,
+					shifts: keyEntry.shifts,
+				})),
 			});
 		}
 		return out;
@@ -407,13 +513,19 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		});
 	}
 
-	/** Exact counts first: a floor at or below the count just recorded is then ignored. */
+	/**
+	 * Exact counts first: a floor at or below the count just recorded is then ignored.
+	 * Rows per key last, so a count or floor from the same execution can open its table-size gate.
+	 */
 	private recordAll(observations: CardinalityObservations): void {
 		for (const [table, rows] of observations.entries()) {
 			this.record(table, rows);
 		}
 		for (const [table, rows] of observations.lowerBounds()) {
 			this.recordAtLeast(table, rows);
+		}
+		for (const [table, { spec, sum, count }] of observations.rowsPerKey()) {
+			this.recordRowsPerKey(table, spec, sum, count);
 		}
 	}
 
@@ -425,6 +537,16 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 			const held = this.held(table);
 			held.atLeast = Math.max(held.atLeast ?? 0, rows);
 		}
+		for (const [table, { spec, sum, count }] of observations.rowsPerKey()) {
+			const held = this.held(table).perKey;
+			const heldSamples = held.get(spec.key);
+			if (heldSamples) {
+				heldSamples.sum += sum;
+				heldSamples.count += count;
+			} else {
+				held.set(spec.key, { spec, sum, count });
+			}
+		}
 	}
 
 	/** What is held for `table`; anything held under an older schema object for its name is superseded. */
@@ -432,20 +554,21 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 		const key = tableKey(table);
 		const existing = this.pending.get(key);
 		if (existing?.table === table) return existing;
-		const fresh: HeldObservation = { table, rows: undefined, atLeast: undefined };
+		const fresh: HeldObservation = { table, rows: undefined, atLeast: undefined, perKey: new Map() };
 		this.pending.set(key, fresh);
 		return fresh;
 	}
 
-	/** As {@link recordAll}: the count first, so a floor it already covers is ignored. */
-	private recordHeld({ table, rows, atLeast }: HeldObservation): void {
+	/** As {@link recordAll}: the count first, so a floor it already covers is ignored, and rows per key last. */
+	private recordHeld({ table, rows, atLeast, perKey }: HeldObservation): void {
 		if (rows !== undefined) this.record(table, rows);
 		if (atLeast !== undefined) this.recordAtLeast(table, atLeast);
+		for (const { spec, sum, count } of perKey.values()) this.recordRowsPerKey(table, spec, sum, count);
 	}
 
-	private isSuperseded(table: TableSchema, rows: number): boolean {
+	private isSuperseded(table: TableSchema): boolean {
 		if (this.ctx.schemaManager.findTable(table.name, table.schemaName) === table) return false;
-		debugLog('Ignored %d rows for %s.%s: observed under a superseded schema', rows, table.schemaName, table.name);
+		debugLog('Ignored an observation of %s.%s: made under a superseded schema', table.schemaName, table.name);
 		return true;
 	}
 

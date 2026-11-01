@@ -522,9 +522,9 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		this.options.registerOption('cardinality_feedback', {
 			type: 'boolean',
 			defaultValue: true,
-			description: 'Remember the exact row count of any table a query happens to read in full, and plan ' +
-				'later statements against it in place of a default or outdated statistics. Turning it off ' +
-				'forgets every remembered count.',
+			description: 'Remember the exact row count of any table a query happens to read in full, and the ' +
+				'rows per key of equality lookups through non-unique indexes, and plan later statements ' +
+				'against them in place of a default or outdated statistics. Turning it off forgets everything remembered.',
 			onChange: (event) => {
 				if (!event.newValue) this.cardinalityFeedbackManager.clear();
 			},

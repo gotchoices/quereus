@@ -3,8 +3,9 @@ import { SeqScanNode, IndexScanNode, IndexSeekNode } from "../../planner/nodes/t
 import { AbortError, QuereusError, throwIfAborted } from "../../common/errors.js";
 import type { VirtualTable } from "../../vtab/table.js";
 import type { BaseModuleConfig, AnyVirtualTableModule } from "../../vtab/module.js";
-import type { FilterInfo } from "../../vtab/filter-info.js";
+import { equalitySeekKeyColumns, type FilterInfo } from "../../vtab/filter-info.js";
 import { accessPathPlan } from "../../vtab/index-descriptor.js";
+import type { RowsPerKeySpec } from "../cardinality-observations.js";
 import type { Instruction, RuntimeContext } from "../types.js";
 import { asRun } from "../types.js";
 import type { EmissionContext } from "../emission-context.js";
@@ -88,6 +89,13 @@ export function emitSeqScan(
 	// also walks one window, so it bounds the table when stopped early.
 	const observesWholeTable = !filterInfoOverride && enumeratesWholeTable(plan);
 	const observesLowerBound = !filterInfoOverride && walksOneWindow(plan);
+	// A rows-per-key site: a single-key equality seek through a non-unique index (the
+	// helper owns that definition). Its spec — column set, key and the rows per key the
+	// plan was priced with — is built once here, so an invocation composes no string. Every
+	// such site is also a lower-bound site (an `eqSeek` walks one window); the OR below is
+	// so the two tests cannot drift apart silently.
+	const rowsPerKeySpec = !filterInfoOverride && plan instanceof IndexSeekNode ? rowsPerKeySpecOf(plan) : undefined;
+	const observesAnything = observesLowerBound || rowsPerKeySpec !== undefined;
 
 	async function* run(runtimeCtx: RuntimeContext, ...dynamicArgs: SqlValue[]): AsyncIterable<Row> {
 		// Use the captured module info instead of doing a fresh lookup
@@ -157,17 +165,20 @@ export function emitSeqScan(
 		}
 
 		const rowSlot = createRowSlot(runtimeCtx, rowDescriptor);
-		const observations = observesLowerBound ? runtimeCtx.cardinalityObservations : undefined;
+		const observations = observesAnything ? runtimeCtx.cardinalityObservations : undefined;
 		// Unconditional on purpose: one local increment is cheaper per row than testing
 		// `observations`, and the count is only read once the invocation ends.
 		let rowsYielded = 0;
 		let completed = false;
 		let threw = false;
+		// Declared outside the `try` so the `finally` can read the seek arguments an
+		// exhausted rows-per-key invocation ran with.
+		let effectiveFilterInfo: FilterInfo = plan.filterInfo;
 		try {
 			// If this is an IndexSeek with dynamic seek keys, populate args from params
-			let effectiveFilterInfo: FilterInfo = (plan instanceof IndexSeekNode && dynamicArgs && dynamicArgs.length > 0)
-				? { ...plan.filterInfo, args: dynamicArgs }
-				: plan.filterInfo;
+			if (plan instanceof IndexSeekNode && dynamicArgs && dynamicArgs.length > 0) {
+				effectiveFilterInfo = { ...plan.filterInfo, args: dynamicArgs };
+			}
 
 			if (filterInfoOverride) {
 				effectiveFilterInfo = await filterInfoOverride(effectiveFilterInfo, runtimeCtx, dynamicArgs);
@@ -253,7 +264,18 @@ export function emitSeqScan(
 			// read too: an aborted or failed invocation records nothing.
 			if (observations && !threw && !runtimeCtx.signal?.aborted) {
 				if (completed && observesWholeTable) observations.observe(schema, rowsYielded);
-				else observations.observeAtLeast(schema, rowsYielded);
+				else if (observesLowerBound) observations.observeAtLeast(schema, rowsYielded);
+				// One sample of rows per key: only an exhausted seek saw every row of its key,
+				// and a NULL key (`col = NULL`, a correlated key from an outer row holding NULL)
+				// matches nothing by rule, not by distribution — it would drag the mean toward
+				// zero. Zero rows under a non-NULL key is a real sample (a parent with no
+				// children). The count is what the SEEK yields under the index's comparison: a
+				// `COARSER_SAFE` seek over-fetches and the residual `Filter` above trims, but rows
+				// per key under the index's collation is what the seek node relays and what the
+				// join candidate's rows-per-seek means.
+				if (completed && rowsPerKeySpec && !effectiveFilterInfo.args.includes(null)) {
+					observations.observeRowsPerKey(schema, rowsPerKeySpec, rowsYielded);
+				}
 			}
 			// Disconnect only when this invocation owns the instance (no per-execution
 			// cache to defer teardown to). A cached instance stays live across re-scans
@@ -278,6 +300,16 @@ export function emitSeqScan(
 		ctx,
 		`${plan.nodeType}(${schema.name})`
 	);
+}
+
+/**
+ * The rows-per-key spec of a seek site, or undefined when it is not one — eligibility is
+ * `equalitySeekKeyColumns`'s, shared with the planner's reader of the same observations.
+ */
+function rowsPerKeySpecOf(plan: IndexSeekNode): RowsPerKeySpec | undefined {
+	const columns = equalitySeekKeyColumns(plan.filterInfo);
+	if (!columns) return undefined;
+	return { columns, key: columns.join(','), plannedRowsPerKey: Number(plan.filterInfo.indexInfoOutput.estimatedRows) };
 }
 
 /**

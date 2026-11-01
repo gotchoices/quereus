@@ -1,8 +1,8 @@
 import type { Row } from '../../common/types.js';
 import { createIntegratedTableValuedFunction } from '../registration.js';
 import type { Database } from '../../core/database.js';
-import type { ObservedRowCountSnapshot } from '../../core/database-cardinality-feedback.js';
-import { INTEGER_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
+import type { ObservedRowCountSnapshot, ObservedRowsPerKeySnapshot } from '../../core/database-cardinality-feedback.js';
+import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 
 /** Code-unit order, not `localeCompare`: row order must not vary with the host's locale. */
 function compareText(a: string, b: string): number {
@@ -58,6 +58,67 @@ export const cardinalityFeedbackFunc = createIntegratedTableValuedFunction(
 				entry.baselineRows,
 				entry.observations,
 				entry.shifts,
+			];
+		}
+	}
+);
+
+/** One remembered column set, with the table it belongs to, for ordering and output. */
+interface KeyRow {
+	readonly table: ObservedRowCountSnapshot;
+	readonly perKey: ObservedRowsPerKeySnapshot;
+	readonly keyColumns: string;
+}
+
+function byTableThenKey(a: KeyRow, b: KeyRow): number {
+	return byTable(a.table, b.table) || compareText(a.keyColumns, b.keyColumns);
+}
+
+/**
+ * The overlay's rows per key: for each remembered table, the running mean of rows one
+ * key matched per equality column set seeked through a non-unique index
+ * (docs/progressive-optimizer.md §3.9). Same contract as {@link cardinalityFeedbackFunc}.
+ */
+export const cardinalityFeedbackKeysFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'cardinality_feedback_keys',
+		numArgs: 0,
+		deterministic: false,
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'schema_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'table_name', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'key_columns', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'rows_per_key', type: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'samples', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'baseline_rows_per_key', type: { typeClass: 'scalar', logicalType: REAL_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'shifts', type: { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: []
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			keys: [[{ index: 0 }, { index: 1 }, { index: 2 }]],
+		},
+	},
+	async function* (db: Database): AsyncIterable<Row> {
+		const rows: KeyRow[] = [];
+		for (const table of db._cardinalityFeedback.snapshot()) {
+			for (const perKey of table.perKey) rows.push({ table, perKey, keyColumns: perKey.keyColumns.join(',') });
+		}
+		for (const { table, perKey, keyColumns } of rows.sort(byTableThenKey)) {
+			yield [
+				table.schemaName,
+				table.tableName,
+				keyColumns,
+				perKey.rowsPerKey,
+				perKey.samples,
+				perKey.baselineRowsPerKey,
+				perKey.shifts,
 			];
 		}
 	}
