@@ -416,3 +416,4 @@
 {"slug":"bug-colon-prefixed-parameter-bindings-never-resolve","file":"bug-colon-prefixed-parameter-bindings-never-resolve.md","completedAt":"2026-09-24","commit":"c04bae08d42d476666742dafecc449e34a1df460","prunedAt":"2026-10-26T16:26:35.430Z"}
 {"slug":"bug-datetime-difference-drops-time-of-day","file":"bug-datetime-difference-drops-time-of-day.md","completedAt":"2026-09-24","commit":"c387e03b37905cfcdd01dd00199b039f7d5eac16","prunedAt":"2026-10-26T16:26:35.430Z"}
 {"slug":"exec-batch-as-one-transaction","file":"exec-batch-as-one-transaction.md","completedAt":"2026-09-24","commit":"6d0d9a37cb01ab7a3b5d272f9d432ca70f19d66a","prunedAt":"2026-10-26T16:26:35.430Z"}
+{"slug":"await-published-waits-for-downloadable-tarballs","file":"await-published-waits-for-downloadable-tarballs.md","completedAt":"2026-10-01","commit":"007ddc61ea3786628ce7cfad782df1648eee8224","prunedAt":"2026-11-01T03:00:17.343Z"}
