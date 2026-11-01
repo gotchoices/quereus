@@ -4,8 +4,13 @@ import type { Database } from '../../core/database.js';
 import type { ObservedRowCountSnapshot } from '../../core/database-cardinality-feedback.js';
 import { INTEGER_TYPE, TEXT_TYPE } from '../../types/builtin-types.js';
 
+/** Code-unit order, not `localeCompare`: row order must not vary with the host's locale. */
+function compareText(a: string, b: string): number {
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function byTable(a: ObservedRowCountSnapshot, b: ObservedRowCountSnapshot): number {
-	return a.schemaName.localeCompare(b.schemaName) || a.tableName.localeCompare(b.tableName);
+	return compareText(a.schemaName, b.schemaName) || compareText(a.tableName, b.tableName);
 }
 
 /**
