@@ -25,7 +25,7 @@ subsystems that grew large enough to read on their own, live in the topic docume
 | [Constant Folding System](optimizer-const.md) | The three-phase constant-folding algorithm in full. |
 | [Optimizer Visited Tracking](optimizer-visited-tracking.md) | Context-scoped visited tracking: the per-pass traversal cache, DAG handling, rule-application control. |
 | [Optimizer Conventions](optimizer-conventions.md) | House style for writing a rule. |
-| [Progressive Query Optimization](progressive-optimizer.md) | Planning without collected statistics, and cardinality feedback: table sizes (exact counts and proven floors) observed during execution feeding later plans. |
+| [Progressive Query Optimization](progressive-optimizer.md) | Planning without collected statistics, and cardinality feedback: table sizes (exact counts and proven floors) and rows per key of indexed equality lookups, observed during execution and feeding later plans. |
 
 ## Philosophy
 
@@ -791,7 +791,7 @@ one. They all read the `physical.monotonicOn` advertisement. Covered in
 
 ## Future Directions
 
-The overarching optimization strategy is **progressive**: robust defaults that avoid catastrophic plans without any statistics, improved by numbers essential execution already produces — first the exact size of any table a query reads in full and a floor under the size of any table it reads in part (cardinality feedback), which later plans use in place of a default or an outdated `ANALYZE` snapshot. See [Progressive Query Optimization](./progressive-optimizer.md) for the design and what is deferred.
+The overarching optimization strategy is **progressive**: robust defaults that avoid catastrophic plans without any statistics, improved by numbers essential execution already produces — first the exact size of any table a query reads in full, a floor under the size of any table it reads in part, and the rows each indexed equality lookup matched (cardinality feedback), which later plans use in place of a default or an outdated `ANALYZE` snapshot. See [Progressive Query Optimization](./progressive-optimizer.md) for the design and what is deferred.
 
 See `tickets/plan/` for planned optimizer work.
 

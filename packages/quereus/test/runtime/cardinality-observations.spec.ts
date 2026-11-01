@@ -97,6 +97,16 @@ describe('Cardinality feedback scan observations', () => {
 		}]);
 	});
 
+	// With the size known the table-size gate is open, so an absent sample here is the
+	// eligibility rule itself: a whole-key seek of a unique index yields at most one row by
+	// proof, and an IN list is a multi-seek over several keys.
+	it('records no rows-per-key sample for a whole-primary-key seek or an IN-list seek once the size is known', async () => {
+		await indexKAndLearnSize();
+		await drain('select * from big where id = 5');
+		await drain('select * from big where k in (7, 8)');
+		expect(rowsPerKeyBig()).to.deep.equal([]);
+	});
+
 	it('records no rows-per-key sample when a LIMIT stops the seek early', async () => {
 		await indexKAndLearnSize();
 		await drain('select * from big where k = 7 limit 2');
