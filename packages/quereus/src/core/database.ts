@@ -513,12 +513,11 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 				'each table\'s count already was, without reconstructing the mutations missed while it was off.',
 		});
 
-		// Default off until `cardinality-feedback-on-by-default` measures it on. The gate is the
-		// per-execution sink's presence, so a toggle takes effect at the next execution even
-		// for a statement whose emitted plan is cached.
+		// The gate is the per-execution sink's presence, so a toggle takes effect at the next
+		// execution even for a statement whose emitted plan is cached.
 		this.options.registerOption('cardinality_feedback', {
 			type: 'boolean',
-			defaultValue: false,
+			defaultValue: true,
 			description: 'Remember the exact row count of any table a query happens to read in full, and plan ' +
 				'later statements against it in place of a default or outdated statistics. Turning it off ' +
 				'forgets every remembered count.',
