@@ -351,7 +351,7 @@ export function ruleQuickPickJoinEnumeration(node: PlanNode, context: OptContext
   // Always record diagnostics for visibility
   context.diagnostics.quickpick = { tours, bestCost };
   if (bestCost < baselineCost * 0.9) {
-    log('QuickPick replaced join plan (%.2f -> %.2f)', baselineCost, bestCost);
+    log('QuickPick replaced join plan (%d -> %d)', baselineCost, bestCost);
     return bestPlan as unknown as PlanNode;
   }
   return null;

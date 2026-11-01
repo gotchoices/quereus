@@ -82,7 +82,7 @@ export function ruleAggregatePhysical(node: PlanNode, _context: OptContext): Pla
 	const streamCostTotal = sortCost(inputRows) + streamAggregateCost(inputRows, estimatedGroups);
 	const hashCostTotal = hashAggregateCost(inputRows, estimatedGroups);
 
-	log('Cost comparison: sort+stream=%.2f, hash=%.2f (inputRows=%d, groups=%d)',
+	log('Cost comparison: sort+stream=%d, hash=%d (inputRows=%d, groups=%d)',
 		streamCostTotal, hashCostTotal, inputRows, estimatedGroups);
 
 	if (hashCostTotal < streamCostTotal) {

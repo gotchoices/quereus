@@ -40,6 +40,11 @@ export function relativeRows(side: RelationalPlanNode, unknownLeafRows: number):
 	return costedRows(relayedRows(side, unknownLeafRows), unknownLeafRows);
 }
 
+// NOTE: recursive, unlike the iterative `PlanNode.physical` fold — it descends only
+// through nodes with no known count, so depth is bounded by a side's unknown chain,
+// far below the ~30,000 frames that overflow (test/planner/plan-node-traversal.spec.ts).
+// If deep generated plans ever reach join selection with unknown leaves, convert to
+// a worklist walk (`PlanNode.computePostOrder`).
 function relayedRows(node: RelationalPlanNode, unknownLeafRows: number): number {
 	const known = physicalSourceRows(node.physical, node);
 	if (known !== undefined) return known;

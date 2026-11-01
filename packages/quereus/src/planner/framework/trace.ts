@@ -93,7 +93,7 @@ export class PerformanceTraceHook implements TraceHook {
 		const startTime = this.ruleStartTimes.get(key);
 		if (startTime !== undefined) {
 			const duration = performance.now() - startTime;
-			this.perfLog('Rule %s took %.2fms on %s#%s',
+			this.perfLog('Rule %s took %dms on %s#%s',
 				handle.id, duration, before.nodeType, before.id);
 			this.ruleStartTimes.delete(key);
 		}
@@ -107,7 +107,7 @@ export class PerformanceTraceHook implements TraceHook {
 		const startTime = this.phaseStartTimes.get(phase);
 		if (startTime !== undefined) {
 			const duration = performance.now() - startTime;
-			this.perfLog('Phase %s took %.2fms', phase, duration);
+			this.perfLog('Phase %s took %dms', phase, duration);
 			this.phaseStartTimes.delete(phase);
 		}
 	}
