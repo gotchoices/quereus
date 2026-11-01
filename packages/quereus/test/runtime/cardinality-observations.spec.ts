@@ -53,6 +53,13 @@ describe('Cardinality feedback scan observations', () => {
 		expect(observedBig()).to.equal(undefined);
 	});
 
+	// The delete's scan completes with 20,000 rows before the implicit transaction
+	// commits an empty table; publishing it would record a size that no longer exists.
+	it('discards a writing statement\'s scan in autocommit mode', async () => {
+		await db.exec('delete from big');
+		expect(observedBig()).to.equal(undefined);
+	});
+
 	it('records nothing with the option off', async () => {
 		await db.exec('pragma cardinality_feedback = false');
 		await drain('select * from big');

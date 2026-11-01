@@ -154,9 +154,10 @@ export type RuntimeContext = {
 	 * Per-execution sink for complete base-table enumerations (cardinality feedback,
 	 * docs/progressive-optimizer.md §3.1); present only when the `cardinality_feedback`
 	 * option is on AND the execution site built one (`Statement._iterateRowsRawInternal`,
-	 * `Database._executeSingleStatement`). The internal run sites (deferred constraints,
-	 * assertions, materialized-view apply, `ANALYZE`) leave it undefined, so their scans
-	 * observe nothing. Independent of {@link workCounters}. Fork policy `shared-sink`:
+	 * `Database._executeSingleStatement`) — so also internal SQL run through a prepared
+	 * `Statement`, whose observations the publish-time transaction check usually discards.
+	 * Hand-built contexts (deferred constraints, assertion delta plans, materialized-view
+	 * apply) leave it undefined. Independent of {@link workCounters}. Fork policy `shared-sink`:
 	 * forks report into the parent's sink by reference (see parallel-driver.ts).
 	 */
 	cardinalityObservations?: CardinalityObservations;
