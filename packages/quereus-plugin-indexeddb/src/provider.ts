@@ -134,10 +134,9 @@ export class IndexedDBProvider implements KVStoreProvider {
 	//
 	// REVISIT in `backlog/feat-indexeddb-declares-its-read-latency`: re-measure both hints
 	// in a real browser, declare `expectedLatencyMs` and `expectedRowLatencyMs` together, and
-	// settle whether the 25 ms gates should
-	// become cost-based for a sub-millisecond backend. As with the cost profile above,
-	// DELIBERATELY NO DECIMALS QUOTED: the bench README holds the tables, this comment holds
-	// the decision.
+	// settle whether the 25 ms gates should become cost-based for a sub-millisecond backend.
+	// As with the cost profile above, DELIBERATELY NO DECIMALS QUOTED: the bench README holds
+	// the tables, this comment holds the decision.
 
 	private databaseName: string;
 	private stores = new Map<string, KVStore>();
