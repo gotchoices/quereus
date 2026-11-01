@@ -81,8 +81,13 @@ function rowCountSpread(a: number, b: number): number {
 	return (Math.max(a, b) + 1) / (Math.min(a, b) + 1);
 }
 
+/** The overlay's key for a table: lowercased `schema.table`. Shifts are reported under it. */
+export function overlayTableKey(schemaName: string, tableName: string): string {
+	return `${schemaName}.${tableName}`.toLowerCase();
+}
+
 function tableKey(table: TableSchema): string {
-	return `${table.schemaName}.${table.name}`.toLowerCase();
+	return overlayTableKey(table.schemaName, table.name);
 }
 
 /** Cap on the cooldown's doubling: re-plans past the seventh wait `64 × replanCooldown` executions. */

@@ -32,7 +32,7 @@ import { collectScalarRequiredParams } from '../planner/analysis/scalar-param-us
 import { isObjectClassValue } from '../util/comparison.js';
 import { canonicalizeSqlValue } from '../util/numeric-canonical.js';
 import { astToString } from '../emit/ast-stringify.js';
-import { FeedbackReplanState } from './database-cardinality-feedback.js';
+import { FeedbackReplanState, overlayTableKey } from './database-cardinality-feedback.js';
 
 const log = createLogger('core:statement');
 const errorLog = log.extend('error');
@@ -48,7 +48,7 @@ const NO_DECLARED_TYPES: readonly (DeclaredType | undefined)[] = [];
 function tableDependencyKeys(dependencies: BuildTimeDependencyTracker): ReadonlySet<string> {
 	const keys = new Set<string>();
 	for (const dep of dependencies.getDependencies()) {
-		if (dep.type === 'table') keys.add(`${dep.schemaName}.${dep.objectName}`.toLowerCase());
+		if (dep.type === 'table' && dep.schemaName) keys.add(overlayTableKey(dep.schemaName, dep.objectName));
 	}
 	return keys;
 }
@@ -91,6 +91,9 @@ export class Statement {
 	 * matched against cardinality-feedback shifts in {@link _noteCardinalityShift}.
 	 */
 	private planTableKeys: ReadonlySet<string> = new Set();
+	// NOTE: one cooldown per Statement, shared by every statement of a multi-statement
+	// batch, so a re-plan of one batch member delays the next member's; if batches ever
+	// lean on prompt feedback re-plans, reset this on nextStatement().
 	private readonly feedbackReplan = new FeedbackReplanState();
 	/**
 	 * Types of the parameters that have one: the explicit hints handed to `prepare()`,
