@@ -16,7 +16,8 @@
  *
  *   2. **Latency win.** The slowest child's `physical.expectedLatencyMs` must
  *      meet `tuning.parallel.gatherThresholdMs`. `expectedLatencyMs` is 0 on
- *      all in-process / memory-vtab paths, so the rule is inert by design in
+ *      memory-vtab paths and far below the threshold on the in-process store
+ *      presets (`localDisk`, `browserIdb`), so the rule is inert by design in
  *      local-only configurations (the no-rewrite invariant is locked by the
  *      golden-plan sweep).
  *
@@ -77,10 +78,10 @@ export function ruleAsyncGatherUnionAll(node: PlanNode, context: OptContext): Pl
 		}
 	}
 
-	// Gate 2: max-of-children latency must meet the threshold. Memory-vtab /
-	// in-process leaves declare expectedLatencyMs=0, so this skips the
-	// rewrite for purely local plans (the no-rewrite invariant under the
-	// golden-plan sweep).
+	// Gate 2: max-of-children latency must meet the threshold. Memory-vtab
+	// leaves declare expectedLatencyMs=0 and the in-process store presets sit
+	// far below the threshold, so this skips the rewrite for purely local plans
+	// (the no-rewrite invariant under the golden-plan sweep).
 	let maxLatency = 0;
 	for (const child of children) {
 		const l = child.physical.expectedLatencyMs ?? 0;

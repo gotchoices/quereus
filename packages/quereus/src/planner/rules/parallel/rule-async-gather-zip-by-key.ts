@@ -65,9 +65,10 @@
  *     own subtree (lateral dependency) — the parallel driver forks independent
  *     contexts. `isCorrelatedSubquery` on each branch must be false.
  *   - **Latency win.** The slowest branch's `physical.expectedLatencyMs` must
- *     meet `tuning.parallel.gatherThresholdMs`. This is 0 on memory-vtab /
- *     in-process leaves, so the rule is inert by design on local-only plans
- *     (the golden-plan no-rewrite invariant).
+ *     meet `tuning.parallel.gatherThresholdMs`. This is 0 on memory-vtab
+ *     leaves and far below the threshold on the in-process store presets, so
+ *     the rule is inert by design on local-only plans (the golden-plan
+ *     no-rewrite invariant).
  *   - **Key collation agreement.** Every key column at a given key position must
  *     declare the *same* collation across all branches (binary or not). The
  *     runtime comparator derives from branch 0 only, so a disagreement would

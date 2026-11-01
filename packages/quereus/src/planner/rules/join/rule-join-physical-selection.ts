@@ -123,7 +123,7 @@ function rowsRead(side: RelationalPlanNode, rows: number, tuning: OptimizerTunin
 /**
  * Wall-clock milliseconds to open a side and drain it once:
  * `firstRowMs + rowsRead × rowMs`, from the subtree's `expectedLatencyMs` and
- * `expectedRowLatencyMs`. 0 for every in-process side (both default to 0 when
+ * `expectedRowLatencyMs`. 0 for every memory side (both default to 0 when
  * the module's cost profile declares nothing). The leaf peel only runs when a
  * per-row latency is actually declared, so the zero-latency hot path does not
  * pay for it.
@@ -179,8 +179,8 @@ function nestedLoopInnerLatency(
 	// Short-circuit before `nestedLoopRightOpensOnce`, whose size gate walks the
 	// whole right subtree: with no latency to charge the answer is 0 either way.
 	// `innerReadMs` is 0 exactly when BOTH of the inner's hints are 0 (`readMs`),
-	// so this tests both. Every in-tree module reports 0 for both, which keeps
-	// the walk off the hot path.
+	// so this tests both. The memory module reports 0 for both, which keeps the
+	// walk off the golden-sweep hot path; store tables declare a preset and pay it.
 	if (innerReadMs === 0) return 0;
 	return nestedLoopRightOpensOnce(node, context) ? innerReadMs : outerRows * innerReadMs;
 }
@@ -242,9 +242,14 @@ function tryBatchedIndexNestedLoop(
 	// Outcome-preserving short-circuit, not a restated gate: at zero per-seek
 	// latency the batched price equals the serial one (the only term batching
 	// divides is the latency), and a strict `<` after the serial entry can never
-	// pick it — so skip building nodes the comparison could not choose. Every
-	// in-tree module reports 0, which keeps node construction off the
+	// pick it — so skip building nodes the comparison could not choose. The
+	// memory module reports 0, which keeps node construction off the
 	// golden-sweep hot path.
+	// NOTE: the in-tree store presets (`localDisk`, `browserIdb`) pass this skip,
+	// so store tables build the serial node only for `toBatchedOuter`'s 25 ms
+	// latency gate to decline it. Cheap per candidate; if it ever shows in
+	// planning profiles, short-circuit on the inner's first-row latency against
+	// `batchedOuterThresholdMs` here — sourced from that gate, not restated.
 	if (candidate.perSeekLatencyMs === 0) return null;
 	const inner = candidate.newInner;
 	// `condition` is defined — the caller extracted equi pairs from it.

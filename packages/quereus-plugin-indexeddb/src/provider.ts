@@ -51,8 +51,9 @@ export interface IndexedDBProviderOptions {
  */
 export class IndexedDBProvider implements KVStoreProvider {
 	/**
-	 * What this backend's random reads cost, relative to one row read sequentially during
-	 * a full scan (= 1.0). Every point read here is a separate request across the browser's
+	 * The ratio half of this backend's cost profile (the latency half is the `NOTE:` below):
+	 * what its random reads cost, relative to one row read sequentially during a full scan
+	 * (= 1.0). Every point read here is a separate request across the browser's
 	 * IPC boundary, where a scan pages 256 entries per request — so the store's parity
 	 * defaults (1.0 / 0.5), which fit an in-process block-cached backend like LevelDB,
 	 * price an IndexedDB lookup at roughly a third of what it costs.
@@ -94,7 +95,7 @@ export class IndexedDBProvider implements KVStoreProvider {
 	 * on a rounding decision.
 	 *
 	 * Both numbers are request-latency dominated, so a slower device scales the seek path
-	 * and the scan baseline together — which is why the profile is a ratio and not
+	 * and the scan baseline together — which is why these two are ratios and not
 	 * milliseconds.
 	 *
 	 * NOTE: this provider wraps every store in a `CachedKVStore` by default, and the bench

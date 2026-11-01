@@ -252,7 +252,8 @@ export class TableReferenceNode extends PlanNode implements ZeroAryRelationalNod
 		out.concurrencySafe = getModuleConcurrencyMode(this.vtabModule) !== 'serial';
 		// The one place the module's DECLARATION (its cost profile) meets the
 		// subtree ESTIMATE (`expectedLatencyMs` / `expectedRowLatencyMs`, max of
-		// children above this leaf). In-process modules declare nothing (0), which
+		// children above this leaf). The memory module declares nothing (0) and the
+		// in-process store presets sit far below the 25 ms parallel gates, which
 		// leaves the latency-gated rules inert by design. Each key is set only when
 		// positive, so a memory leaf omits it — the plan goldens depend on that.
 		const profile = resolveModuleCostProfile(this.vtabModule.costProfile);
