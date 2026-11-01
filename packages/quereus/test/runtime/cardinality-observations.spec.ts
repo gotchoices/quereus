@@ -61,10 +61,25 @@ describe('Cardinality feedback scan observations', () => {
 		expect(observedBig()).to.equal(undefined);
 	});
 
-	// Observed after the delete, so 19,990 happens to be right — but the change log
-	// cannot order the scan against the transaction's writes, so a written table is dropped.
-	it('drops the scan of a table the committing transaction wrote', async () => {
-		await db.exec('begin; delete from big where id <= 10; select * from big; commit;');
+	// The scan counts 20,001; the delete then cancels the insert in the change log, which
+	// must still name `big` as written or the inflated count would be recorded.
+	it('drops the scan of a table the committing transaction wrote, even net-unchanged', async () => {
+		await db.exec('begin; insert into big values (20001, 0); select * from big; delete from big where id = 20001; commit;');
+		expect(observedBig()).to.equal(undefined);
+	});
+
+	// The statement's correlated scan of `big` completes after four of its inserts; the
+	// fifth row's conflict rolls them back through the statement savepoint, before the
+	// statement's observations are published, and the transaction still commits.
+	it('discards a failed statement\'s scans that saw its rolled-back writes', async () => {
+		await db.exec('create table small (id integer primary key)');
+		await db.exec('insert into small values (1), (2), (3), (4), (5)');
+		await db.exec('begin');
+		await db.exec(`insert into big select case when s.id = 5 then 1 else s.id + 100000 end,
+			(select count(*) from big b where b.v + s.id > s.id) from small s`).then(
+			() => expect.fail('expected a primary-key conflict'),
+			(e: Error) => expect(e.message).to.match(/UNIQUE/));
+		await db.exec('commit');
 		expect(observedBig()).to.equal(undefined);
 	});
 

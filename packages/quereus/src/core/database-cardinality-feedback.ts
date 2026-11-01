@@ -23,7 +23,7 @@
 
 import { createLogger } from '../common/logger.js';
 import type { OptimizerTuning } from '../planner/optimizer-tuning.js';
-import type { CardinalityObservations } from '../runtime/cardinality-observations.js';
+import { CardinalityObservations } from '../runtime/cardinality-observations.js';
 import { catalogRowCount, type ObservedRowCounts } from '../planner/stats/table-cardinality.js';
 import type { SchemaChangeEvent } from '../schema/change-events.js';
 import type { TableSchema } from '../schema/table.js';
@@ -95,6 +95,8 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * transaction observes.
 	 */
 	private readonly pending = new Map<string, { readonly table: TableSchema; readonly rows: number }>();
+	/** {@link onRolledBack} calls so far; each execution's sink records it at start. */
+	private rollbacks = 0;
 	private unsubscribeSchemaChanges: (() => void) | null = null;
 
 	constructor(private readonly ctx: CardinalityFeedbackManagerContext) {
@@ -146,18 +148,28 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * Offer one finished execution's observations (docs/progressive-optimizer.md §3.5).
 	 * A committed read (`readCommitted`) or an execution that ended with no transaction
 	 * open saw committed state and is recorded now. Anything else may include the open
-	 * transaction's uncommitted writes, so it is held for {@link onCommitted}.
+	 * transaction's uncommitted writes, so it is held for {@link onCommitted} — unless a
+	 * rollback ran during the execution (typically a failing statement's own statement
+	 * savepoint, which fires before publication): then a completed scan may have counted
+	 * rows that no longer exist, and the whole execution is discarded.
 	 */
 	publish(observations: CardinalityObservations, options: { readCommitted: boolean }): void {
-		if (options.readCommitted || this.ctx.getAutocommit()) {
+		if (options.readCommitted) {
+			this.recordAll(observations);
+		} else if (observations.rollbacksAtStart !== this.rollbacks) {
+			debugLog('Discarded observations: work was rolled back during the execution');
+		} else if (this.ctx.getAutocommit()) {
+			this.recordAll(observations);
+		} else {
 			for (const [table, rows] of observations.entries()) {
-				this.record(table, rows);
+				this.pending.set(tableKey(table), { table, rows });
 			}
-			return;
 		}
-		for (const [table, rows] of observations.entries()) {
-			this.pending.set(tableKey(table), { table, rows });
-		}
+	}
+
+	/** A fresh per-execution sink, stamped so {@link publish} can tell whether a rollback ran under it. */
+	beginObservations(): CardinalityObservations {
+		return new CardinalityObservations(this.rollbacks);
 	}
 
 	/**
@@ -168,6 +180,9 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	 * whose writes cancelled out — and is not built when nothing is held.
 	 */
 	onCommitted(changedCounts: () => Map<string, number>): void {
+		// NOTE: external-change ingestion with `captureChanges: false` writes rows the change
+		// log never sees, so a count held from before such a batch is applied. Only an estimate
+		// lags; if those batches ever routinely shrink or grow tables, have them veto here too.
 		if (this.pending.size === 0) return;
 		try {
 			const changed = changedCounts();
@@ -186,6 +201,7 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 	/** The open transaction, or some of its work, was undone: forget everything held. */
 	onRolledBack(): void {
 		this.pending.clear();
+		this.rollbacks++;
 	}
 
 	/** Forget every observation, held ones included; later compiles read the catalog only. */
@@ -231,6 +247,12 @@ export class CardinalityFeedbackManager implements ObservedRowCounts {
 				this.entries.delete(tableKey(event.oldObject));
 			}
 		});
+	}
+
+	private recordAll(observations: CardinalityObservations): void {
+		for (const [table, rows] of observations.entries()) {
+			this.record(table, rows);
+		}
 	}
 
 	/** The entry under `key` if it was observed against `table`; a stale one is replaced on record. */

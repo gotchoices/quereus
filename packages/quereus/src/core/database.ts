@@ -72,7 +72,7 @@ import { AssertionEvaluator, type AssertionEvaluatorContext, type AssertionViola
 import { WatcherManager, type WatcherManagerContext } from './database-watchers.js';
 import { AutoAnalyzeManager, type AutoAnalyzeManagerContext } from './database-auto-analyze.js';
 import { CardinalityFeedbackManager } from './database-cardinality-feedback.js';
-import { CardinalityObservations } from '../runtime/cardinality-observations.js';
+import type { CardinalityObservations } from '../runtime/cardinality-observations.js';
 import { MaterializedViewManager, type BackingConnectionCache, type RegisterMaterializedViewOptions, type ResidualKeyBatch } from './database-materialized-views.js';
 import type { BackingRowChange } from '../vtab/backing-host.js';
 import type { ChangeScope, Subscription, WatchHandler } from '../planner/analysis/change-scope.js';
@@ -2919,7 +2919,7 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 
 	/** @internal A fresh per-execution observation sink, or `undefined` when `cardinality_feedback` is off. */
 	public _beginCardinalityObservations(): CardinalityObservations | undefined {
-		return this.options.getBooleanOption('cardinality_feedback') ? new CardinalityObservations() : undefined;
+		return this.options.getBooleanOption('cardinality_feedback') ? this.cardinalityFeedbackManager.beginObservations() : undefined;
 	}
 
 	/**

@@ -19,6 +19,13 @@ export class CardinalityObservations {
 	 */
 	private readonly counts = new Map<TableSchema, number>();
 
+	/**
+	 * @param rollbacksAtStart The overlay's rollback count when the execution began;
+	 * opaque here. If it has moved by publication, work this execution may have seen
+	 * was undone under it (`CardinalityFeedbackManager.publish`).
+	 */
+	constructor(readonly rollbacksAtStart: number) {}
+
 	observe(table: TableSchema, rows: number): void {
 		this.counts.set(table, rows);
 	}
