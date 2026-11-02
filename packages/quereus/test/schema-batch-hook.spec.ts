@@ -40,6 +40,10 @@ class RecordingMemoryModule extends MemoryTableModule {
 	failOnCreateTable?: string;
 	/** When true, `beginSchemaBatch` itself throws (begin-failure path). */
 	failBegin = false;
+	/** When set, only this `beginSchemaBatch` call (1-based) throws after recording. */
+	failBeginOnCall?: number;
+	/** When set, the named table's destroy call throws to simulate a failing undo statement. */
+	failOnDestroyTable?: string;
 	/** When true, every `endSchemaBatch` throws after recording. */
 	failEnd = false;
 	/** When set, only this `endSchemaBatch` call (1-based) throws after recording. */
@@ -49,7 +53,7 @@ class RecordingMemoryModule extends MemoryTableModule {
 
 	async beginSchemaBatch(_db: DatabaseType, schemaName: string): Promise<void> {
 		this.beginCalls.push({ schemaName });
-		if (this.failBegin) {
+		if (this.failBegin || this.failBeginOnCall === this.beginCalls.length) {
 			throw new Error('begin-failure');
 		}
 		this.batchActive = true;
@@ -75,6 +79,9 @@ class RecordingMemoryModule extends MemoryTableModule {
 
 	override async destroy(db: DatabaseType, pAux: unknown, moduleName: string, schemaName: string, tableName: string): Promise<void> {
 		this.destroyCalls.push({ tableName, batchActiveAtCall: this.batchActive });
+		if (this.failOnDestroyTable === tableName) {
+			throw new Error(`forced destroy failure for ${tableName}`);
+		}
 		return super.destroy(db, pAux, moduleName, schemaName, tableName);
 	}
 }
@@ -377,6 +384,55 @@ describe('APPLY SCHEMA batch hooks', () => {
 			expect(db.schemaManager.getTable('main', 'users')).to.be.undefined;
 			expect(err.message).to.match(/^end-failure\n.*partially migrated.*module 'committer' committed the migration/);
 			expect(err.cause).to.equal(refuser.endErrors[0]);
+		});
+
+		it('a failed undo statement outranks a second refusal, and the second batch still ends with no error', async () => {
+			db = new Database();
+			const refuser = new RecordingMemoryModule();
+			const committer = new RecordingMemoryModule();
+			useModule('refuser', refuser);
+			db.registerModule('committer', committer);
+			await db.exec(DECLARE_USERS);
+			refuser.failEnd = true;
+			refuser.failOnDestroyTable = 'users';
+			committer.failEndOnCall = 2;
+
+			const err = await refusedApply();
+
+			expect(err.message).to.match(/^end-failure\n.*partially migrated.*undo statement `.*users.*` failed/);
+			expect(err.cause).to.equal(refuser.endErrors[0]);
+			expect(committer.endCalls.map(c => c.error), 'a committed undo must not be told to discard').to.deep.equal([undefined, undefined]);
+		});
+
+		it('a batch that cannot be reopened runs no undo and reports not restored', async () => {
+			db = new Database();
+			const recording = new RecordingMemoryModule();
+			useModule('recording', recording);
+			await db.exec(DECLARE_USERS);
+			recording.failEnd = true;
+			recording.failBeginOnCall = 2;
+
+			const err = await refusedApply();
+
+			expect(err.message).to.match(/^end-failure\n.*partially migrated.*could not be reopened.*begin-failure/);
+			expect(err.cause).to.equal(recording.endErrors[0]);
+			expect(recording.destroyCalls).to.deep.equal([]);
+			expect(db.schemaManager.getTable('main', 'users')).to.exist;
+		});
+
+		it('a refusal after a failed step is only logged: the step error wins and no second batch opens', async () => {
+			db = new Database();
+			const recording = new RecordingMemoryModule();
+			useModule('recording', recording);
+			await db.exec(DECLARE_USERS);
+			recording.failEnd = true;
+			recording.failOnCreateTable = 'users';
+
+			const err = await refusedApply();
+
+			expect(err.message).to.match(/^Failed to execute DDL/);
+			expect(recording.endCalls.map(c => c.error)).to.deep.equal([err]);
+			expect(recording.beginCalls).to.have.lengthOf(1);
 		});
 	});
 });

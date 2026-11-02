@@ -678,12 +678,16 @@ async function unwindRefusedBatchEnd(
 	preApplyFingerprint: string,
 ): Promise<string | undefined> {
 	if (steps.poisonedBy !== undefined) return describeIrreversible(steps.poisonedBy);
+	// NOTE: an empty journal still opens this batch, so a module that committed and then refuses
+	// the empty batch reads as not restored. If that ever surfaces, return early on an empty journal.
 	let reopened: StartedModule[];
 	try {
 		reopened = await beginSchemaBatchAll(db, schemaName);
 	} catch (e) {
 		return `${NOT_RESTORED}: the module batch could not be reopened for the unwind (${errorText(e)}).`;
 	}
+	// NOTE: no guard for an unexpected throw, unlike the first batch: every fallible call in
+	// `unwindJournal` is inside a `try`. If that stops holding, this batch would stay open.
 	const undoFailure = await unwindJournal(db, schemaName, steps.journal, preApplyFingerprint);
 	const secondRefusals = await endSchemaBatchAll(reopened, db, schemaName, undefined);
 	if (undoFailure !== undefined) return undoFailure;

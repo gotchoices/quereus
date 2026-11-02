@@ -234,7 +234,7 @@ row-image contract above.
 
 **Carve-out: an *unrestorable* migration keeps what landed.** A declarative `apply schema`
 runs each generated migration statement through the ordinary statement path under an undo
-journal. When a step fails and the journal restores the catalog, the whole apply announces
+journal. When a step fails, or a module refuses the final commit, and the journal restores the catalog, the whole apply announces
 nothing — the undo DDL's events included. But once a data-destroying step (`DROP TABLE`,
 `DROP COLUMN`, `SET DATA TYPE`) has run the apply cannot be taken back, and a later failure
 leaves the schema partially migrated: those steps really happened, so their events stay, and

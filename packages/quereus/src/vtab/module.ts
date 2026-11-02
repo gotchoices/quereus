@@ -604,7 +604,8 @@ export interface VirtualTableModule<
 	 * single substrate commit.
 	 *
 	 * Called a second time in the same APPLY SCHEMA when any module refuses the
-	 * first batch's end, to hold the unwind; see {@link endSchemaBatch}.
+	 * first batch's end and the migration can still be undone, to hold the unwind;
+	 * see {@link endSchemaBatch}.
 	 *
 	 * The hook runs inside the engine's exec() mutex hold, so the batch lives
 	 * entirely within one engine-level execution scope.
