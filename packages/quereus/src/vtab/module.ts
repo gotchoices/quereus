@@ -597,11 +597,14 @@ export interface VirtualTableModule<
 	): Promise<void>;
 
 	/**
-	 * Optional. Called once by APPLY SCHEMA before the migration-DDL loop runs,
-	 * iff there are migration statements to execute. The module may use this to
+	 * Optional. Called by APPLY SCHEMA before the migration-DDL loop runs, iff
+	 * there are migration statements to execute. The module may use this to
 	 * open an in-memory overlay/batch that subsequent create/destroy/alter
 	 * callbacks (during the loop) join, so the whole APPLY SCHEMA produces a
 	 * single substrate commit.
+	 *
+	 * Called a second time in the same APPLY SCHEMA when any module refuses the
+	 * first batch's end, to hold the unwind; see {@link endSchemaBatch}.
 	 *
 	 * The hook runs inside the engine's exec() mutex hold, so the batch lives
 	 * entirely within one engine-level execution scope.
@@ -632,9 +635,25 @@ export interface VirtualTableModule<
 	 * commit rather than discard on an error whose message says "partially
 	 * migrated", or the engine should pass the verdict here explicitly.
 	 *
-	 * Errors thrown from `endSchemaBatch` itself are logged and rethrown only
-	 * if no prior loop error exists — if a loop error is being propagated, the
-	 * end-batch failure is logged and swallowed so the original cause survives.
+	 * Throwing refuses the commit, and a refusal must mean nothing from that batch
+	 * reached the store: the engine relies on that when it tolerates a second
+	 * refusal below. The batch is over either way, so be ready for another begin.
+	 * - **With `error` set,** a throw is logged and swallowed, so the original
+	 *   cause survives.
+	 * - **With no `error`,** a throw fails the apply even though every step ran. The
+	 *   engine unwinds it as above, unless a data-destroying step ran, but the first
+	 *   batch is closed by then, so the undo DDL arrives in a second begin/end pair.
+	 *   "Exactly once" therefore holds per begin, not per apply. The module that
+	 *   threw is in that second batch too, and may receive undo DDL for changes its
+	 *   store never received, which it must accept (a drop of something it never
+	 *   built, say).
+	 * - **The second batch always ends with no error,** even if an undo statement
+	 *   failed, so commit what it holds. A second refusal is tolerated from a module
+	 *   that also refused the first commit, since its store still holds the pre-apply
+	 *   state. From a module whose first commit landed, it reports the schema as not
+	 *   restored, since its store then holds the migration under a restored catalog.
+	 *
+	 * See docs/schema-undo-plan.md § A refused commit.
 	 */
 	endSchemaBatch?(db: Database, schemaName: string, error?: unknown): Promise<void>;
 

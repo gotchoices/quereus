@@ -503,7 +503,7 @@ inherits the same requirement: it must be defeated by a change the declared rend
 **Why it is recorded only after a verified-empty plan.** At write time this process has *observed*, via a real diff, that the catalog matches the declaration. Two consequences are features rather than accidents:
 
 - The very first apply on a fresh database migrates, so it records nothing; the *second* apply diffs, finds the plan empty, and records; the third and later are fast. This preserves `apply schema`'s self-healing property — if DDL generation were ever imperfect, a repeat apply still re-diffs rather than being told by a cache that everything is fine.
-- A failed apply (a mid-migration DDL failure, a seed failure) records nothing, so the next apply reconciles in full. A snapshot an *earlier* apply recorded stays valid across a later restored failure, precisely because the restore returns the catalog to the state that snapshot describes (see [Failure and restoration](#failure-and-restoration)).
+- A failed apply (a mid-migration DDL failure, a module refusing the final commit, a seed failure) records nothing, so the next apply reconciles in full. A snapshot an *earlier* apply recorded stays valid across a later restored failure, precisely because the restore returns the catalog to the state that snapshot describes (see [Failure and restoration](#failure-and-restoration)).
 
 A snapshot is a claim about a *pair* of renderings — "these two were once verified equal" — not about a moment in time, so it survives a later re-`declare schema` (a byte-identical redeclaration still renders the same and still hits) and survives an intervening migrating apply (drift makes the compare miss; repairing the drift makes it match again). `removeDeclaredSchema` clears it, since nothing is left to compare against.
 
@@ -588,6 +588,8 @@ Moved to [Undo Plan](schema-undo-plan.md).
 
 A migrating `apply schema` is **all-or-nothing**, with one stated residual. The loop executes the plan under an undo journal; when a step fails, the journal runs in reverse, the catalog is checked against its pre-apply state, and the step's own error is rethrown — the apply either happened or it did not. The residual is a data-destroying step: `DROP TABLE`, `DROP COLUMN` and `ALTER COLUMN … SET DATA TYPE` are the three the planner marks `irreversible`, and once one has run (or is the step that failed) the apply is no longer restorable. A later failure then reports the schema as **partially migrated**, naming the step that cannot be undone, with the original failure as `cause`; the same wrapped error is raised when an undo statement itself fails or the post-unwind catalog does not match.
 
+The guarantee also covers a **refused commit**: a module that throws from `endSchemaBatch` after every step ran fails the apply just as a failing step does. The apply is unwound and the module's own error is rethrown, so a retry re-plans and re-sends the DDL. The same residual applies: if a data-destroying step ran, nothing is unwound and the error reports the schema as partially migrated, with the module's error as `cause`. The catalog is then ahead of a store that refused, so a retry diffs clean and can succeed with nothing written; retrying does not repair it.
+
 The undo is ordinary DDL, so the restore is **tier-independent** (every `ddlTransactionality` tier, nothing new for module authors) and runs inside the module batch before `endSchemaBatch(error)` fires. Inside an explicit transaction a failed apply restores to the pre-apply point and leaves the transaction open — savepoint-like. Under `ddl_transaction_policy = 'strict'` a refused forward step is unwound like any other failure, with no new exposure. A restored failure announces no schema events; an unrestorable one keeps the events of the steps that landed. Outside the guarantee: **seeding** (`with seed` runs after the loop, so a malformed seed row aborts with the migration already applied) and a table's **constraint storage order** (a restored constraint is re-appended; the differ keys constraints by name and is unaffected). Executor detail: [Undo Plan § Restoring a failed apply](schema-undo-plan.md#restoring-a-failed-apply).
 
 ### Rename Detection
@@ -600,7 +602,9 @@ Virtual table modules may opt into a per-`apply schema` batch via the optional `
 
 This lets a storage-backed module fold the whole migration into one substrate commit: open an in-memory overlay in begin, have subsequent `create` / `destroy` / `alterTable` calls join it, then commit (or discard) in end. Modules without the hooks are skipped. The idempotent fast-path (no DDL to run) skips both hooks.
 
-If `beginSchemaBatch` itself throws, already-started modules receive `endSchemaBatch(error)` with the begin failure and the error propagates out of `apply schema`. Errors from `endSchemaBatch` are rethrown only when no prior loop error exists; otherwise they are logged so the original cause survives.
+If `beginSchemaBatch` itself throws, already-started modules receive `endSchemaBatch(error)` with the begin failure and the error propagates out of `apply schema`.
+
+A throw from `endSchemaBatch` depends on what came before it. After a failed step it is logged, so the original cause survives. After a clean loop it is a refused commit, which fails the apply: the engine opens a second begin/end pair and runs the undo DDL inside it, so "exactly once" holds per begin rather than per apply. A refusal must mean nothing from that batch reached the store, and a module that refused may receive undo DDL for changes its store never received, which it must accept. See [Undo Plan § A refused commit](schema-undo-plan.md#a-refused-commit).
 
 ### Seed Data
 

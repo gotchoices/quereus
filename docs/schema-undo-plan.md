@@ -2,7 +2,7 @@
 
 > **Stability: Beta** — see [Stability Tiers](stability.md#tiers).
 
-How the declarative migration planner records, on every step of a plan, the statements that take that step back, the two rules that make an undo correct under renames, and how `apply schema` uses the result to unwind a migration that failed partway ([§ Restoring a failed apply](#restoring-a-failed-apply)). A satellite of [Schema Management](schema.md); the plan ordering it unwinds is described there under [Declarative Schema](schema.md#declarative-schema), and the user-facing guarantee under [Failure and restoration](schema.md#failure-and-restoration).
+How the declarative migration planner records, on every step of a plan, the statements that take that step back, the two rules that make an undo correct under renames, and how `apply schema` uses the result to unwind a migration that failed partway or whose final commit a module refused ([§ Restoring a failed apply](#restoring-a-failed-apply)). A satellite of [Schema Management](schema.md); the plan ordering it unwinds is described there under [Declarative Schema](schema.md#declarative-schema), and the user-facing guarantee under [Failure and restoration](schema.md#failure-and-restoration).
 
 `generateMigrationPlan(diff, schemaName, actual)` — given the same pre-apply `SchemaCatalog` that `computeSchemaDiff` was handed — also records, on every step, how to take that step back: `undo`, the DDL statements (in execution order) that return the catalog to the state the step found it in, or `irreversible`, a user-readable reason why no statement can. An empty `undo` means the step changed nothing (an `IF EXISTS` drop of an object that was already absent). `generateMigrationDDL` never passes a catalog, so `diff schema` output and cost are untouched; without the catalog nothing about the undo is computed. The undo is plain SQL text, not an AST: it only ever runs on an executor's failure path, where re-parsing a handful of short statements costs nothing.
 
@@ -42,5 +42,28 @@ Exactly three steps are irreversible, and they are the data-destroying ones: no 
 4. **The error is thrown.** A verified restore rethrows the step's own `Failed to execute DDL: …` error unchanged and retracts every schema event batched since the apply began. Otherwise the error is wrapped: the original message first, then one of three reasons — *the earlier step `X` cannot be undone (…)* (or *the failing step `X` cannot be undone*, when the irreversible step is the one that failed), *undo statement `Y` failed (…)*, or *after unwinding, the catalog does not match its pre-apply state* — with the original error as `cause`, and the schema events of the landed steps are kept — delivered at commit inside an explicit transaction; in autocommit the failed statement's implicit transaction rolls back and drops them, as it does for any failed DDL statement whose catalog change escaped (see [Usage](usage.md)).
 
 An undo statement that throws stops the unwind where it is: the schema is then in a state neither the user nor the plan asked for, and continuing past a failed undo would only compound it. A failure on the first step has an empty journal and passes its error through untouched. If `beginSchemaBatch` itself throws, no step ran and nothing is unwound. Seeding runs after the loop and is outside the guarantee.
+
+### A refused commit
+
+A module that throws from `endSchemaBatch` after every step ran has refused to commit, so the apply failed even though no step did. `endSchemaBatch` still fires on every other module, and the first refusal in firing order (reverse registration order) becomes the primary error; the rest are logged. Then:
+
+1. **If the journal is poisoned, nothing is unwound.** The error is wrapped with the *earlier step `X` cannot be undone* reason, with the refusal as `cause`, and the schema events are kept.
+2. **Otherwise a second batch opens.** The first batch is closed, so `beginSchemaBatch` fires again on every module, and the journal runs and is verified exactly as for a failed step. A `beginSchemaBatch` that throws here means no undo ran: the reason is *the module batch could not be reopened for the unwind (…)*.
+3. **The second batch always ends with no error, even when an undo statement failed.** A module whose first commit landed has to commit the undo that did run, so its store matches the catalog as far as the unwind got, and an error would tell a discarding module to throw that away.
+4. **The verdict.** An undo failure or a fingerprint mismatch is reported first, and any refusal of the second end is then only logged. Otherwise the second end's refusals are judged by registered module name against the first end's:
+
+   | module's first `endSchemaBatch` | it refuses the second | why |
+   |---|---|---|
+   | threw | tolerated and logged | its store still holds the pre-apply state, which is what the `endSchemaBatch` contract requires a refusal to mean |
+   | succeeded | not restored: *module `x` committed the migration and then refused to commit its undo (…)* | its store holds the forward change under a restored catalog, which the fingerprint check cannot see |
+
+5. **The error is thrown** from the same site as a failed step. A verified restore rethrows the primary error unchanged and retracts the schema events; the next apply re-plans and re-sends the DDL. Otherwise the wrapped error carries the primary error's message, then the reason, with the primary error as `cause` (a thrown value that is not an `Error` contributes only its text) and the events are kept.
+
+A step failure followed by a refused end stays a step failure: the step's error is reported and the refusal is logged.
+
+Two limits are reported rather than solved:
+
+- **A poisoned journal leaves the catalog ahead of the store.** The catalog keeps the forward change while the refusing store may not have it, so a retry diffs clean and can report success with nothing written. Retrying does not repair this; the wrapped error is the signal, and a fresh `Database` over the store is how the catalog is re-read. The `NOTE:` on `endSchemaBatch` describes the same mismatch for an unrestorable step failure.
+- **An undo statement that itself needs the store** can fail if the store is why the commit was refused (a module whose `dropIndex` first builds the table, say). The apply then reports *undo statement `Y` failed (…)*, with no special case.
 
 Why an undo journal rather than transactional DDL: the undo statements are ordinary DDL, so this works identically on every module tier (`transactional`, `non-transactional`, `auto-commit`) and needs nothing new from module authors. On an `auto-commit` module the forward DDL may have force-committed the surrounding transaction; the undo DDL commits the same way, so the end state is still the pre-apply catalog. Raising the built-in backends to the transactional tier is separate work (`feat-transactional-ddl-native-backends`) and would not change the contract described here.

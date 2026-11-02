@@ -215,8 +215,9 @@ export function emitDiffSchema(plan: PlanNode, _ctx: EmissionContext): Instructi
  * checked against its pre-apply rendering, and the step's own error is rethrown. The residual
  * is a step that destroyed data (`DROP TABLE`, `DROP COLUMN`, `ALTER COLUMN … SET DATA TYPE`,
  * marked `irreversible` by the differ): once one has run the apply cannot be taken back, and
- * a later failure reports the schema as partially migrated. See `runBatchedMigrationLoop` and
- * docs/schema.md § Failure and restoration.
+ * a later failure reports the schema as partially migrated. A module refusing the final
+ * `endSchemaBatch` counts as a failure too, and is unwound the same way. See
+ * `runBatchedMigrationLoop` and docs/schema.md § Failure and restoration.
  *
  * Schema events are retracted CONDITIONALLY, which is why this emitter cannot use the plain
  * `withStatementScopedSchemaEvents` helper (see ddl-event-scope.ts) every other DDL emitter
@@ -527,6 +528,25 @@ interface MigrationFailure {
 	readonly notRestored?: string;
 }
 
+/** How the plan's steps ended. The journal survives a clean run because a module can still refuse the batch end. */
+type StepsOutcome =
+	| { readonly clean: false; readonly failure: MigrationFailure }
+	| CleanSteps;
+
+interface CleanSteps {
+	readonly clean: true;
+	/** The `undo` of every step that ran, in execution order. */
+	readonly journal: ReadonlyArray<readonly string[]>;
+	/** The first step that cannot be undone, when one ran: the journal then cannot restore the catalog. */
+	readonly poisonedBy?: MigrationStep;
+}
+
+/** A module whose `endSchemaBatch` threw, in firing order (reverse registration order). */
+interface BatchEndRefusal {
+	readonly name: string;
+	readonly error: unknown;
+}
+
 /**
  * Drives the per-DDL migration loop wrapped in module-level batch hooks.
  * Modules that opt in via `beginSchemaBatch` may fold the entire
@@ -550,6 +570,14 @@ interface MigrationFailure {
  * happened). Otherwise the error is wrapped: the original message first, then why the
  * schema is partially migrated, with the original as `cause` — and the events stay, because
  * the steps that landed really happened.
+ *
+ * ## Refused commit: end the batch, then unwind in a second one
+ *
+ * A module that throws from `endSchemaBatch` after a clean loop has refused to commit, so the
+ * apply failed even though every step ran. `unwindRefusedBatchEnd` takes it back with the
+ * same journal, verification and verdict, and the first refusal in firing order is the error
+ * reported. Without this the catalog would keep a migration the store never received, and the
+ * next apply would diff clean and report success with nothing written.
  *
  * ## Executing a step
  *
@@ -593,33 +621,84 @@ async function runBatchedMigrationLoop(
 	restore: RestoreContext,
 ): Promise<void> {
 	const startedModules = await beginSchemaBatchAll(db, schemaName);
-	let failure: MigrationFailure | undefined;
-	// `runStepsWithUndoJournal` reports every step and undo failure as data, so `loopError`
-	// is normally `failure?.error`. The catch is for a throw it did not anticipate: the
-	// batch must still end with SOME error, or a module would commit an overlay whose
-	// migration is propagating as failed.
-	let loopError: unknown;
+	let steps: StepsOutcome;
 	try {
-		failure = await runStepsWithUndoJournal(db, schemaName, migrationStatements, restore.preApplyFingerprint);
-		loopError = failure?.error;
+		steps = await runStepsWithUndoJournal(db, schemaName, migrationStatements, restore.preApplyFingerprint);
 	} catch (e) {
-		loopError = e;
+		// `runStepsWithUndoJournal` reports every step and undo failure as data, so this is a
+		// throw it did not anticipate: the batch must still end with SOME error, or a module
+		// would commit an overlay whose migration is propagating as failed.
+		await endSchemaBatchAll(startedModules, db, schemaName, e);
 		throw e;
-	} finally {
-		await endSchemaBatchAll(startedModules, db, schemaName, loopError);
 	}
-	if (!failure) return;
-	if (failure.notRestored === undefined) {
-		db._getEventEmitter().discardSchemaEventsSince(restore.eventWatermark);
-		throw failure.error;
+	if (!steps.clean) {
+		// A refusal here is only logged, so the step's own error is the one the caller sees.
+		await endSchemaBatchAll(startedModules, db, schemaName, steps.failure.error);
+		throwFailedApply(db, restore, steps.failure.error, steps.failure.notRestored);
 	}
-	throw new QuereusError(`${failure.error.message}\n${failure.notRestored}`, StatusCode.ERROR, failure.error);
+	const refusals = await endSchemaBatchAll(startedModules, db, schemaName, undefined);
+	if (refusals.length === 0) return;
+	const notRestored = await unwindRefusedBatchEnd(db, schemaName, steps, refusals, restore.preApplyFingerprint);
+	throwFailedApply(db, restore, refusals[0].error, notRestored);
 }
 
 /**
- * Runs the plan's steps in order under an undo journal. Returns undefined when every step
- * ran; otherwise the failure, with the catalog already unwound (or the reason it could not
- * be). Never throws: the caller must still end the module batch with the original error.
+ * Reports a failed apply. A verified restore rethrows `error` unchanged and retracts the
+ * apply's schema events, since nothing happened. Otherwise the steps that landed really did,
+ * so their events stay and the error is wrapped with the reason as its second line. A thrown
+ * value that is not an `Error` cannot ride as `cause`, so only its text survives.
+ */
+function throwFailedApply(db: Database, restore: RestoreContext, error: unknown, notRestored: string | undefined): never {
+	if (notRestored === undefined) {
+		db._getEventEmitter().discardSchemaEventsSince(restore.eventWatermark);
+		throw error;
+	}
+	throw new QuereusError(`${errorText(error)}\n${notRestored}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
+}
+
+/**
+ * Takes back a migration whose every step ran but whose batch end was refused. Returns
+ * undefined on a verified restore, otherwise why the schema is left partially migrated.
+ *
+ * The first batch is already closed, so the undo DDL runs in a second one. That batch always
+ * ends with no error, even after an undo statement failed: a module whose first commit landed
+ * has to commit the undo that did run, so its store matches the catalog as far as the unwind
+ * got, and an error would tell a discarding module to throw that away.
+ *
+ * A second refusal is judged against the first. A module that refused both times still holds
+ * the pre-apply state, per the `endSchemaBatch` contract, so it is tolerated. A module that
+ * committed the migration and then refused its undo holds the forward change under a restored
+ * catalog, which the fingerprint check cannot see, so that module is what fails the restore.
+ */
+async function unwindRefusedBatchEnd(
+	db: Database,
+	schemaName: string,
+	steps: CleanSteps,
+	firstRefusals: readonly BatchEndRefusal[],
+	preApplyFingerprint: string,
+): Promise<string | undefined> {
+	if (steps.poisonedBy !== undefined) return describeIrreversible(steps.poisonedBy);
+	let reopened: StartedModule[];
+	try {
+		reopened = await beginSchemaBatchAll(db, schemaName);
+	} catch (e) {
+		return `${NOT_RESTORED}: the module batch could not be reopened for the unwind (${errorText(e)}).`;
+	}
+	const undoFailure = await unwindJournal(db, schemaName, steps.journal, preApplyFingerprint);
+	const secondRefusals = await endSchemaBatchAll(reopened, db, schemaName, undefined);
+	if (undoFailure !== undefined) return undoFailure;
+	const refusedFirst = new Set(firstRefusals.map(r => r.name));
+	const stranded = secondRefusals.find(r => !refusedFirst.has(r.name));
+	return stranded === undefined
+		? undefined
+		: `${NOT_RESTORED}: module '${stranded.name}' committed the migration and then refused to commit its undo (${errorText(stranded.error)}).`;
+}
+
+/**
+ * Runs the plan's steps in order under an undo journal. When every step ran, returns the
+ * journal, because a module can still refuse the batch end; otherwise the failure, with the
+ * catalog already unwound (or the reason it could not be). Never throws: the caller must
+ * still end the module batch with the original error.
  *
  * The journal holds the `undo` of every step that succeeded. A step the differ marked
  * `irreversible` poisons the journal BEFORE it runs — the step may apply partially before it
@@ -630,19 +709,21 @@ async function runStepsWithUndoJournal(
 	schemaName: string,
 	migrationStatements: readonly MigrationStep[],
 	preApplyFingerprint: string,
-): Promise<MigrationFailure | undefined> {
+): Promise<StepsOutcome> {
 	const journal: Array<readonly string[]> = [];
 	let poisonedBy: MigrationStep | undefined;
 	for (const step of migrationStatements) {
 		if (poisonedBy === undefined && step.undo === undefined) poisonedBy = step;
 		const error = await executeMigrationStep(db, step);
 		if (error) {
-			if (poisonedBy !== undefined) return { error, notRestored: describeIrreversible(poisonedBy, step) };
-			return { error, notRestored: await unwindJournal(db, schemaName, journal, preApplyFingerprint) };
+			const notRestored = poisonedBy !== undefined
+				? describeIrreversible(poisonedBy, step)
+				: await unwindJournal(db, schemaName, journal, preApplyFingerprint);
+			return { clean: false, failure: { error, notRestored } };
 		}
 		if (poisonedBy === undefined && step.undo !== undefined && step.undo.length > 0) journal.push(step.undo);
 	}
-	return undefined;
+	return { clean: true, journal, poisonedBy };
 }
 
 /** Runs one migration step; returns its wrapped error instead of throwing, so the loop can unwind. */
@@ -710,11 +791,11 @@ async function unwindJournal(
 
 const NOT_RESTORED = 'The schema is partially migrated and could not be restored';
 
-/** The reason text when an irreversible step ran — either before the failing step, or as it. */
-function describeIrreversible(poisonedBy: MigrationStep, failing: MigrationStep): string {
+/** The reason text when an irreversible step ran: before the failing step, as it, or (no `failing`) before a refused batch end. */
+function describeIrreversible(poisonedBy: MigrationStep, failing?: MigrationStep): string {
 	const why = poisonedBy.irreversible ?? 'no undo was recorded for it';
 	return poisonedBy === failing
-		? `The schema could not be restored: the failing step \`${failing.sql}\` cannot be undone (${why}), so any partial effect of it stands.`
+		? `The schema could not be restored: the failing step \`${poisonedBy.sql}\` cannot be undone (${why}), so any partial effect of it stands.`
 		: `${NOT_RESTORED}: the earlier step \`${poisonedBy.sql}\` cannot be undone (${why}).`;
 }
 
@@ -731,7 +812,8 @@ interface StartedModule {
  * Calls `beginSchemaBatch` on every module that defines it, in registration
  * order. Returns the modules that successfully began. If any module's
  * begin throws, already-started modules are torn down (in reverse order)
- * with the begin-time error and the original failure is rethrown.
+ * with the begin-time error, any refusal of that teardown is only logged,
+ * and the original failure is rethrown.
  */
 async function beginSchemaBatchAll(
 	db: Database,
@@ -753,37 +835,28 @@ async function beginSchemaBatchAll(
 }
 
 /**
- * Calls `endSchemaBatch` on previously-started modules in reverse order.
- * On success path (`loopError === undefined`), the first end-error is
- * captured and rethrown after every remaining end fires. On failure path,
- * end-errors are logged but never shadow the original loop error.
+ * Calls `endSchemaBatch` on previously-started modules in reverse order, every one of them
+ * regardless of earlier refusals, and returns the refusals for the caller to judge. An array
+ * rather than a first error, so a module that throws `undefined` is still seen as refusing.
  */
 async function endSchemaBatchAll(
 	startedModules: readonly StartedModule[],
 	db: Database,
 	schemaName: string,
 	loopError: unknown,
-): Promise<void> {
-	let firstEndError: unknown;
+): Promise<readonly BatchEndRefusal[]> {
+	const refusals: BatchEndRefusal[] = [];
 	for (let i = startedModules.length - 1; i >= 0; i--) {
 		const { name, module } = startedModules[i];
 		if (typeof module.endSchemaBatch !== 'function') continue;
 		try {
 			await module.endSchemaBatch(db, schemaName, loopError);
 		} catch (e) {
-			if (loopError !== undefined) {
-				log('endSchemaBatch failed for module %s after loop error; swallowing: %O', name, e);
-			} else if (firstEndError === undefined) {
-				log('endSchemaBatch failed for module %s: %O', name, e);
-				firstEndError = e;
-			} else {
-				log('endSchemaBatch failed for module %s (subsequent): %O', name, e);
-			}
+			log('endSchemaBatch failed for module %s: %O', name, e);
+			refusals.push({ name, error: e });
 		}
 	}
-	if (loopError === undefined && firstEndError !== undefined) {
-		throw firstEndError;
-	}
+	return refusals;
 }
 
 /**
