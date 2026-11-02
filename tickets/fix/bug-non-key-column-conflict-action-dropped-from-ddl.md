@@ -145,3 +145,9 @@ is dropped by the re-key itself: `x integer not null on conflict rollback` comes
 No new root cause — the fix is still `formatColumnDef` emitting the action — but it widens the
 impact from "store-backed tables after a reopen" to "any table re-keyed on the rebuild path",
 and it is a second reason the forced-nullability-annotation tradeoff is worth paying.
+
+## Gardener note (2026-11-02)
+
+Promoted because arm 2 leaves a table unwritable after a reload, and arm 1 now also bites in-session on the re-key rebuild path. Fix both arms in one pass over `generateTableDDL`.
+
+The `tradeoffs:` question is settled: force the nullability annotation whenever a conflict action is present, including in the session-elided form. The added text appears only on the rare columns that declare an action, and the third-consumer section above already argues it is worth paying.

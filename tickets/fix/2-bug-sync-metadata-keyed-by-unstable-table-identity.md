@@ -9,6 +9,7 @@ files:
   - packages/quereus-sync/src/sync/snapshot-stream.ts      # clearExistingMetadata — the existing per-table metadata wipe, for reference
   - packages/quereus/src/runtime/emit/alter-table.ts       # runRenameTable, runAlterPrimaryKey — the statements that cause it
 repro: verified
+difficulty: hard
 severity: corruption
 likelihood: normal-use
 tradeoffs: Introducing a stable table identity changes the on-disk metadata key layout, which means a migration for every device already syncing — a maintainer may prefer the far cheaper partial answers (wipe the table's metadata on rename, stamp tombstones with a table generation) even though those lose history rather than carry it.
@@ -91,3 +92,11 @@ not sync metadata.
   would trigger a re-key under the cheap answer for arm A.
 - Arm B is verified; arm A is read from the key layout and has no reproduction yet. A
   two-peer test that renames and then relays is what would confirm it.
+
+## Gardener note (2026-11-02)
+
+Promoted as the highest-priority backlog bug: corruption in normal use, with arm B verified.
+
+The `tradeoffs:` question is settled by the project rule "Backwards compat: don't worry yet" (AGENTS.md). Build the stable-identity fix. No on-disk migration is needed, but the implement ticket must say plainly that the metadata key layout changes, so the release notes can flag it as a breaking change for existing synced stores.
+
+Still to settle in this stage, by research: whether the identity is local to each peer or shared on the wire. Changes between peers address tables by name today. Pick the option that keeps peers converging and document the tradeoff. Split into `prereq:`-chained implement tickets sized for one agent run. Write a two-peer reproduction for arm A first, since it has none.

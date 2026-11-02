@@ -36,3 +36,7 @@ Afterwards `t` has columns `id, b, d` — the added column stays.
 Expected: the failed apply restores `t` to `id, b`.
 
 Likely the same for an inline named CHECK (`d integer null constraint dpos check (d > 0)`) and possibly inline FK / UNIQUE, depending on what `DROP COLUMN` refuses. Fix direction (not decided): the undo of an ADD COLUMN drops the constraints its inline clauses created (by their stored names — `_check_<col>` etc., which the undo renderer would need to predict or read back) before the DROP COLUMN, mirroring the engine's own `revertAddColumn` in `runtime/emit/alter-table.ts`.
+
+## Gardener note (2026-11-02)
+
+Promoted as the same failed-apply guarantee that `apply-schema-unwinds-a-refused-end-batch` just tightened; read that ticket in `tickets/complete/` first. Also settle the "likely the same" cases above by running them: inline named CHECK, inline FK, inline UNIQUE.

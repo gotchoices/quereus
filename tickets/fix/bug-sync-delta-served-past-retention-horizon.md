@@ -104,3 +104,12 @@ writes. Silent divergence is strictly worse than an index larger than it needs t
 Arm A is reachable today and should not wait for Arm B's optimisation question to settle. Arm B
 is not urgent: revisit when a deployment shows the change log is materially larger than the
 data it indexes, or once the refusal path makes it cheap to add.
+
+## Gardener note (2026-11-02)
+
+Promoted because this is live silent divergence. Corrections to the text above:
+
+- **The prereq has landed.** `feat-sync-client-snapshot-bootstrap` completed 2026-08-04 (see `tickets/.pruned-tickets.jsonl`), so it is no longer in `tickets/plan/`. Design the refusal against the client recovery path that now exists.
+- **Scope is arm A only:** the server refuses a too-old `get_changes`, and the client recovers with a full copy. This also answers the "decision about the interim" above, so no opt-in sweep is needed.
+- **Arm B stays parked.** Move horizon pruning to a new `backlog/feat-` ticket at this stage, carrying its open questions (time versus watermark axis, sweep chunking).
+- **Backwards compat:** project rule is "don't worry yet", so the protocol addition needs no version negotiation. Say so in the implement ticket so the release notes can flag it.
