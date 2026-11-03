@@ -199,9 +199,9 @@ Sync keeps a `cv:` cell record for each cell it knows about. A row written befor
 - **Broader than what the snapshot would delete.** A table the server does not have is left alone by a snapshot, but the client cannot know the server's tables until the stream starts, and by then the header has cleared the metadata the check needs. So a table only this device has, with unrecorded rows, also refuses.
 - **Only never-recorded rows count.** A row with any cell record counts as recorded, so its first edit takes a row out of the check, and a row already holding only some of its cells is not repaired. An update made while sync was detached, to a row that has records, is still a silent divergence and is not detected.
 - **The first edit records the whole row.** An update that changes a value in such a row records every column with no before-image, as an insert does, so other devices receive the whole row rather than one with its other columns empty.
-  - Its cells take the time of the edit, so like adopted rows they win over older server values for the same key, untouched columns included.
+  - Its cells take the time of the edit, so like adopted rows they win over older server values for the same key, untouched columns included. Two devices seeded with the same row that each edit a different column therefore keep only the later edit: the earlier device's column returns to its seeded value.
   - An update that changes no value records nothing, so the row stays unrecorded and the check still finds it.
-  - The device's other unrecorded rows stay local. A device with any recorded change is not empty, so no bootstrap or check runs for them until a `snapshot_required`, which refuses under the default.
+  - The device's other unrecorded rows stay local. A device with any recorded change is not empty, so no bootstrap or check runs for them until a `snapshot_required`, which refuses under the default. `'adopt'` still records them on first contact.
   - An edit announces no table, any more than an insert does, so a table only this device has still fails a new device's snapshot (`bug-sync-write-to-unannounced-table-strands-new-devices`).
 
 ##### Adopting rows

@@ -1106,8 +1106,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	}
 
 	/**
-	 * Record one local data-change event: a tombstone (delete) or the changed
-	 * column versions (insert/update). Each recorded fact consumes one `opSeq`.
+	 * Record one local data-change event: a tombstone (delete) or column versions
+	 * (every column of an insert or of the first edit of an unrecorded row, otherwise
+	 * the changed ones). Each recorded fact consumes one `opSeq`.
 	 *
 	 * All reads of the row's current metadata go overlay-first (`staged`), so a
 	 * transaction that touches one row more than once records the same metadata
@@ -1295,6 +1296,15 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * transfer answers yes here too. A row the snapshot carries is overwritten by its table's
 	 * flush, and one it lacks survives as it did before and is pushed whole, not as a
 	 * fragment. Writes during a transfer stay the gap `feat-sync-bootstrap-write-gate` tracks.
+	 *
+	 * NOTE: a recorded row's first write of an added column also reaches the committed read,
+	 * so a backfill pays one range read per row: 5000 rows took about 350 ms without it and
+	 * 360-730 ms with it on LevelDB. If backfills show up in profiles, try the key cell with a
+	 * `get` first, since nearly every recorded row has one.
+	 *
+	 * NOTE: every cell takes the edit's time, so when two devices hold the same seeded row and
+	 * edit different columns, the later edit's untouched cells overwrite the earlier edit. If
+	 * apps that seed shared rows report lost edits, make untouched cells lose to any real edit.
 	 */
 	private async isFirstEditOfUnrecordedRow(
 		schemaName: string,

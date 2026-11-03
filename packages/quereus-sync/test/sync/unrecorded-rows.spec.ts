@@ -127,10 +127,10 @@ describe('findTablesWithUnrecordedRows', () => {
 			// Fired from inside the scan of `orders`, which holds the execution mutex, so the
 			// insert lands as that scan closes and ahead of the scan of `later`.
 			const versions = receiver.manager.columnVersions;
-			const readVersions = versions.getRowVersions.bind(versions);
+			const readVersions = versions.hasRowVersions.bind(versions);
 			let release: (() => void) | undefined;
 			let inserting: Promise<void> | undefined;
-			versions.getRowVersions = async (schema, table, pk) => {
+			versions.hasRowVersions = async (schema, table, pk) => {
 				if (!inserting) {
 					release = holdBatchWrites(receiver.manager.kv);
 					inserting = receiver.db.exec('insert into later values (1)');

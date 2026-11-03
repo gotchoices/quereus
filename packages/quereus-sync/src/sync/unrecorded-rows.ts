@@ -5,7 +5,7 @@
  * for, and can record them as local changes instead (docs/sync.md § Rows sync has never
  * recorded).
  *
- * Finding them is strictly read-only. In particular `getRowVersions` resolves a table's
+ * Finding them is strictly read-only. In particular `hasRowVersions` resolves a table's
  * generation without minting one, so a table with no `tg:` record simply reads as
  * unrecorded.
  */
@@ -133,8 +133,7 @@ async function firstUnrecordedKey(
 	keyColumns: readonly string[],
 ): Promise<SqlValue[] | undefined> {
 	for await (const pk of scanLiveColumns(db, schema, table, keyColumns)) {
-		const versions = await ctx.columnVersions.getRowVersions(schema, table, pk);
-		if (versions.size === 0) return pk;
+		if (!(await ctx.columnVersions.hasRowVersions(schema, table, pk))) return pk;
 	}
 	return undefined;
 }
@@ -228,8 +227,7 @@ async function adoptTable(
 	for await (const row of scanLiveColumns(db, table.schemaName, table.name, columns)) {
 		assertNoExplicitTransaction(db);
 		const pk = table.primaryKeyDefinition.map(({ index }) => row[index]);
-		const versions = await ctx.columnVersions.getRowVersions(table.schemaName, table.name, pk);
-		if (versions.size > 0) continue;
+		if (await ctx.columnVersions.hasRowVersions(table.schemaName, table.name, pk)) continue;
 		pending.push(insertEvent(table, pk, row));
 		if (pending.length >= DATA_FLUSH_SIZE) await flush();
 	}
