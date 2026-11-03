@@ -63,6 +63,14 @@ import {
  * All four guards must run **before** `requireVtabModule` / `module.alterTable`, so a
  * refused statement never reaches a persisting module and the table is left untouched
  * rather than reverted.
+ *
+ * Everything above is about a drop a user issued. The undo journal of a failed
+ * `apply schema` issues drops too, and there the two expression guards and the foreign key
+ * guard stand down (`Database._setSchemaUnwinding`): the unwind is returning to the pre-apply
+ * catalog, so the reference it leaves dangling belongs to an object a later undo removes or
+ * was already dangling before the apply. The assertion guard stays on, because `CREATE
+ * ASSERTION` plans its body when it runs, so an assertion holds no forward reference, and
+ * assertions are created last, so their undo runs first.
  */
 
 /**
@@ -144,6 +152,7 @@ function refuseColumnExpressionDependent(
 	columnName: string,
 	arm: ColumnExpressionArm,
 ): void {
+	if (db._isSchemaUnwinding()) return;
 	const dependent = findColumnExpressionDependent(db, tableSchema, columnName, arm);
 	if (!dependent) return;
 	if (dependent.breaksEntirely) {
@@ -304,6 +313,7 @@ export function assertNoForeignKeyReferencesColumn(
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
+	if (db._isSchemaUnwinding()) return;
 	const lowerColumn = columnName.toLowerCase();
 	const droppedIndex = tableSchema.columnIndexMap.get(lowerColumn);
 

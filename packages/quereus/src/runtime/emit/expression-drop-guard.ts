@@ -57,6 +57,10 @@ import type { DroppableObjectKind } from './assertion-drop-guard.js';
  * cannot disagree about what "reaches" means. The refusal names the chain, because a user
  * told to fix a constraint whose body does not mention the dropped object has nothing to
  * act on otherwise.
+ *
+ * Stands down during a failed `apply schema`'s unwind (`Database._setSchemaUnwinding`). That
+ * drop is not a user's: it returns to the pre-apply catalog, where the referring table either
+ * does not exist yet or was already dangling.
  */
 export function assertNoExpressionDependsOn(
 	db: Database,
@@ -64,6 +68,7 @@ export function assertNoExpressionDependsOn(
 	objectName: string,
 	objectKind: DroppableObjectKind,
 ): void {
+	if (db._isSchemaUnwinding()) return;
 	const dependent = findTableExpressionDependent(db, schemaName, objectName);
 	if (!dependent) return;
 	// The catalog's spelling of the schema rather than the caller's: DROP emitters pass the

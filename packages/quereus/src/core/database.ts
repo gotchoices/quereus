@@ -2828,6 +2828,30 @@ export class Database implements TransactionManagerContext, AssertionEvaluatorCo
 		return this._fkRestrictSuppressed;
 	}
 
+	/** @internal Apply-schema unwind flag — see {@link _setSchemaUnwinding}. */
+	private _schemaUnwinding = false;
+
+	/** @internal Marks that the DDL re-entering the executor is the undo journal of a
+	 *  failed `apply schema`. While set, the reference guards on DROP COLUMN, DROP TABLE and
+	 *  DROP VIEW stand down: they keep a user's drop from breaking a working reference, and
+	 *  an unwind is returning to the pre-apply catalog, so a reference it leaves dangling
+	 *  belongs to an object a later undo removes or was already dangling before the apply.
+	 *  `unwindJournal` compares the catalog with its pre-apply rendering afterwards. Set
+	 *  only around the journal's statements, with the statement mutex held, so no other
+	 *  statement observes it. Returns the prior value so the caller restores it in a
+	 *  `finally`. Docs: `docs/schema-undo-plan.md` § Restoring a failed apply. */
+	public _setSchemaUnwinding(value: boolean): boolean {
+		const prior = this._schemaUnwinding;
+		this._schemaUnwinding = value;
+		return prior;
+	}
+
+	/** @internal Whether an `apply schema` unwind is running — see
+	 *  {@link _setSchemaUnwinding}. */
+	public _isSchemaUnwinding(): boolean {
+		return this._schemaUnwinding;
+	}
+
 	/** @internal FK cascade re-entry flag — see {@link _setFkCascadeReentry}. */
 	private _fkCascadeReentry = false;
 

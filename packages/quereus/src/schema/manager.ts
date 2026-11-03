@@ -1489,6 +1489,9 @@ export class SchemaManager {
 		// trust-the-origin posture — the origin enforced the drop at its own commit — is the
 		// same reason it skips the row-level RESTRICT pre-checks.
 		if (this.db._isFkRestrictSuppressed()) return;
+		// A failed apply's unwind (see Database._setSchemaUnwinding) drops a table this apply
+		// created. Rows pointing at it were left dangling before the apply and go back to that.
+		if (this.db._isSchemaUnwinding()) return;
 
 		const parentSchemaLower = parentSchemaName.toLowerCase();
 		const parentTableLower = parentTableName.toLowerCase();

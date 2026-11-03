@@ -368,6 +368,32 @@ describe('APPLY SCHEMA batch hooks', () => {
 			expect(events, 'the step that landed really happened').to.not.be.empty;
 		});
 
+		it('the unwind gets past a guard that refuses a user drop of the added column', async () => {
+			db = new Database();
+			const recording = new RecordingMemoryModule();
+			useModule('recording', recording);
+			await db.exec('create table t (id integer primary key)');
+			await db.exec(`
+				declare schema main {
+					table t {
+						id integer primary key,
+						d integer null unique
+					}
+					table n {
+						id integer primary key,
+						x integer null references t(d)
+					}
+				}
+			`);
+			const before = restoreFingerprint();
+			recording.failEnd = true;
+
+			const err = await refusedApply();
+
+			expect(err).to.equal(recording.endErrors[0]);
+			expect(restoreFingerprint()).to.equal(before);
+		});
+
 		it('a module that committed the migration and then refuses its undo is reported as not restored', async () => {
 			db = new Database();
 			const refuser = new RecordingMemoryModule();

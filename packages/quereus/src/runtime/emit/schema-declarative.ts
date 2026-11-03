@@ -770,17 +770,8 @@ async function unwindJournal(
 	journal: ReadonlyArray<readonly string[]>,
 	preApplyFingerprint: string,
 ): Promise<string | undefined> {
-	for (let i = journal.length - 1; i >= 0; i--) {
-		for (const sql of journal[i]) {
-			log('Unwinding migration step: %s', sql);
-			try {
-				await db._execWithinTransaction(sql);
-			} catch (e) {
-				log('Undo failed for DDL: %s: %O', sql, e);
-				return `${NOT_RESTORED}: undo statement \`${sql}\` failed (${errorText(e)}).`;
-			}
-		}
-	}
+	const undoFailure = await runJournalInReverse(db, journal);
+	if (undoFailure !== undefined) return undoFailure;
 	let afterUnwind: string;
 	try {
 		afterUnwind = renderCatalogForRestoreCheck(collectSchemaCatalog(db, schemaName));
@@ -791,6 +782,32 @@ async function unwindJournal(
 	if (afterUnwind === preApplyFingerprint) return undefined;
 	log('Post-unwind catalog does not match the pre-apply fingerprint.\nbefore:\n%s\nafter:\n%s', preApplyFingerprint, afterUnwind);
 	return `${NOT_RESTORED}: after unwinding, the catalog does not match its pre-apply state.`;
+}
+
+/**
+ * Runs the undo statements with the drop reference guards stood down (see
+ * `Database._setSchemaUnwinding`). `CREATE TABLE` does not validate what it refers to, so the
+ * plan can create a table naming a column or table a later step adds, and undoing in exact
+ * reverse removes that target while the referring table still exists.
+ */
+async function runJournalInReverse(db: Database, journal: ReadonlyArray<readonly string[]>): Promise<string | undefined> {
+	const priorUnwinding = db._setSchemaUnwinding(true);
+	try {
+		for (let i = journal.length - 1; i >= 0; i--) {
+			for (const sql of journal[i]) {
+				log('Unwinding migration step: %s', sql);
+				try {
+					await db._execWithinTransaction(sql);
+				} catch (e) {
+					log('Undo failed for DDL: %s: %O', sql, e);
+					return `${NOT_RESTORED}: undo statement \`${sql}\` failed (${errorText(e)}).`;
+				}
+			}
+		}
+		return undefined;
+	} finally {
+		db._setSchemaUnwinding(priorUnwinding);
+	}
 }
 
 const NOT_RESTORED = 'The schema is partially migrated and could not be restored';

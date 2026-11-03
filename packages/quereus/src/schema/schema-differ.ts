@@ -3570,9 +3570,10 @@ class UndoRenderer {
 	}
 
 	/**
-	 * `DROP COLUMN` refuses a column a CHECK names, its own inline ones included, so those
-	 * go first, newest first. An inline UNIQUE or FK needs no statement: the module's
-	 * `DROP COLUMN` prunes it (`shiftSchemaIndicesForDrop`).
+	 * The module's `DROP COLUMN` does not prune a CHECK over the column, and the guard that
+	 * would refuse a user's drop stands down during an unwind, so an inline CHECK left in place
+	 * would outlive its column. Those go first, newest first. An inline UNIQUE or FK needs no
+	 * statement: the module's `DROP COLUMN` prunes it (`shiftSchemaIndicesForDrop`).
 	 */
 	dropAddedColumn(table: string, quotedTable: string, colDef: string): StepUndo {
 		const parsed = parseStatement(`alter table "x" add column ${colDef}`);

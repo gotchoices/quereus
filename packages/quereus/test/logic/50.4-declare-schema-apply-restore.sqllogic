@@ -195,8 +195,8 @@ drop table t;
 -- 6. An added column's inline constraints are taken back with it
 -- ===================================
 
--- DROP COLUMN refuses a column a CHECK names, even its own, so undoing this ADD COLUMN has to
--- drop both CHECKs first. The inline UNIQUE goes with the column.
+-- DROP COLUMN does not remove a CHECK that names the column, even its own, so undoing this ADD
+-- COLUMN has to drop both CHECKs first. The inline UNIQUE goes with the column.
 create table t_inl (id integer primary key, b integer null);
 insert into t_inl values (1, 1), (2, 1);
 
@@ -225,3 +225,127 @@ diff schema main;
 → [{"ddl": "ALTER TABLE t_inl ADD COLUMN d integer null check (d > 0) constraint d_lt check (d < 100) unique"}, {"ddl": "ALTER TABLE t_inl ADD constraint ub unique (b)"}]
 
 drop table t_inl;
+
+-- ===================================
+-- 7. New tables that refer to objects the same migration adds do not block the unwind
+-- ===================================
+
+-- CREATE TABLE does not check what it refers to, so these forward references are accepted, and
+-- the exact-reverse unwind removes t.d, zz and v while n, aa and k still refer to them.
+create table t (id integer primary key, b integer null);
+insert into t values (1, 1), (2, 1);
+
+declare schema main {
+	table t {
+		id integer primary key,
+		b integer null,
+		d integer null unique,
+		constraint ub unique (b)
+	}
+	table n {
+		id integer primary key,
+		x integer null references t(d),
+		y integer null check (y > (select max(d) from t)),
+		z integer null default ((select max(d) from t))
+	}
+	table aa {
+		id integer primary key,
+		x integer null check (x > (select max(id) from zz))
+	}
+	view v as select id from t
+	table k {
+		id integer primary key,
+		x integer null check (x > (select max(id) from v))
+	}
+	table zz {
+		id integer primary key
+	}
+}
+
+-- run
+
+apply schema main;
+-- error: ub
+
+select * from t order by id;
+→ [{"id": 1, "b": 1}, {"id": 2, "b": 1}]
+
+select * from n;
+-- error: not found
+
+select * from zz;
+-- error: not found
+
+-- Once the duplicate is gone the same declaration applies, and its references resolve.
+update t set b = 2 where id = 2;
+apply schema main;
+insert into t (id, b, d) values (3, 3, 30);
+insert into n (id, x, y) values (1, 30, 31);
+
+-- run
+
+select id, x, y, z from n;
+→ [{"id": 1, "x": 30, "y": 31, "z": 30}]
+
+-- The guards the unwind stood down are back on.
+drop view v;
+-- error: on table 'k'
+
+drop table k;
+drop view v;
+drop table n;
+drop table aa;
+drop table zz;
+drop table t;
+
+-- ===================================
+-- 8. A reference that was already dangling before the apply does not block the unwind
+-- ===================================
+
+-- e's CHECK names t.d and f's foreign key names zz, neither of which exists yet. The apply adds
+-- both, then fails, and taking them back returns e and f to the dangling state they started in.
+create table t (id integer primary key, b integer null);
+insert into t values (1, 1), (2, 1);
+create table e (id integer primary key, x integer null check (x > (select max(d) from t)));
+create table f (id integer primary key, z integer null references zz(id));
+pragma foreign_keys = off;
+insert into f values (1, 1);
+pragma foreign_keys = on;
+
+declare schema main {
+	table t {
+		id integer primary key,
+		b integer null,
+		d integer null,
+		constraint ub unique (b)
+	}
+	table e {
+		id integer primary key,
+		x integer null check (x > (select max(d) from t))
+	}
+	table f {
+		id integer primary key,
+		z integer null references zz(id)
+	}
+	table zz {
+		id integer primary key
+	}
+}
+
+-- run
+
+apply schema main;
+-- error: ub
+
+select * from t order by id;
+→ [{"id": 1, "b": 1}, {"id": 2, "b": 1}]
+
+select * from f;
+→ [{"id": 1, "z": 1}]
+
+select * from zz;
+-- error: not found
+
+drop table f;
+drop table e;
+drop table t;

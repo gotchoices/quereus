@@ -21,7 +21,7 @@ The planner tracks the renames in force as it pushes the plan (`UndoRenderer` in
 | `ALTER TABLE t DROP MAINTAINED` | `alter table t set maintained [(cols)] as <body>` from the catalog's derivation body and recorded column list |
 | `CREATE TABLE` / `VIEW` / `INDEX` / `ASSERTION` (incl. the materialized-view sugar) | `DROP … IF EXISTS` of the object the statement names |
 | `RENAME COLUMN a TO b` / `RENAME CONSTRAINT a TO b` | the reverse rename |
-| `ADD COLUMN c …` | `DROP CONSTRAINT` of each inline CHECK, newest first, then `DROP COLUMN c`. `DROP COLUMN` refuses a column a CHECK names, its own included, while the module's `DROP COLUMN` already prunes an inline UNIQUE or foreign key. A stored CHECK name is predicted by running the forward step's own mint (`extractColumnLevelCheckConstraints`) over a per-table set of taken names, seeded from the catalog and kept across the plan's `ADD COLUMN` steps. A name a `create unique index` took is the one miss, because the catalog does not record it: the undo then fails and the apply reports the schema as not restored |
+| `ADD COLUMN c …` | `DROP CONSTRAINT` of each inline CHECK, newest first, then `DROP COLUMN c`. The module's `DROP COLUMN` prunes an inline UNIQUE or foreign key but not a CHECK, and the guard that refuses a user's drop of such a column stands down during an unwind, so a CHECK left in place would outlive its column. A stored CHECK name is predicted by running the forward step's own mint (`extractColumnLevelCheckConstraints`) over a per-table set of taken names, seeded from the catalog and kept across the plan's `ADD COLUMN` steps. A name a `create unique index` took is the one miss, because the catalog does not record it: the undo then fails and the apply reports the schema as not restored |
 | `ADD constraint c …` | `DROP CONSTRAINT c` (the name parsed from the fragment) |
 | `DROP DEFAULT` / `SET DEFAULT e` / `SET COLLATE x` / `SET NOT NULL` / `DROP NOT NULL` | restore the catalog's default (or `DROP DEFAULT` when there was none — and after a `dropStaleDefaultFirst` clear, the column reaches `SET DEFAULT` with no default, so that undo is `DROP DEFAULT`), collation, or the opposite nullability |
 | `DROP CONSTRAINT c` | `ADD constraint c <body> [with tags]` from the catalog's full-fidelity constraint lift (`namedConstraints[].bodyAst`, or `unnamedConstraints[].bodyAst` for an unnamed constraint dropped by its stored auto-name, which the re-add restores — deferrability survives; the canonical `definition` has dropped it) |
@@ -43,6 +43,23 @@ Exactly three steps are irreversible, and they are the data-destroying ones: no 
 4. **The error is thrown.** A verified restore rethrows the step's own `Failed to execute DDL: …` error unchanged and retracts every schema event batched since the apply began. Otherwise the error is wrapped: the original message first, then one of three reasons — *the earlier step `X` cannot be undone (…)* (or *the failing step `X` cannot be undone*, when the irreversible step is the one that failed), *undo statement `Y` failed (…)*, or *after unwinding, the catalog does not match its pre-apply state* — with the original error as `cause`, and the schema events of the landed steps are kept — delivered at commit inside an explicit transaction; in autocommit the failed statement's implicit transaction rolls back and drops them, as it does for any failed DDL statement whose catalog change escaped (see [Usage](usage.md)).
 
 An undo statement that throws stops the unwind where it is: the schema is then in a state neither the user nor the plan asked for, and continuing past a failed undo would only compound it. A failure on the first step has an empty journal and passes its error through untouched. If `beginSchemaBatch` itself throws, no step ran and nothing is unwound. Seeding runs after the loop and is outside the guarantee.
+
+### Guards during an unwind
+
+`CREATE TABLE` does not check what its foreign keys and CHECK / DEFAULT subqueries refer to, so a table the plan creates may refer to a column, table or view a later step adds. The unwind runs in exact reverse, so it removes that target while the referring table still exists. The guards on `DROP COLUMN`, `DROP TABLE` and `DROP VIEW` exist to stop a user's drop from breaking a working reference, and that reason does not apply here: the target state is the pre-apply catalog, so a reference the unwind leaves dangling belongs to an object a later undo removes or was already dangling before the apply.
+
+`unwindJournal` therefore sets a scope (`Database._setSchemaUnwinding`) around its undo statements, on both paths (a failed step and a refused commit). The scope does not cover the fingerprint comparison. Inside it these stand down:
+
+- the DEFAULT / generated and CHECK guards on `DROP COLUMN`, and the guard for a foreign key pointing at the column;
+- the expression guard on `DROP TABLE`, `DROP VIEW` and `DROP MATERIALIZED VIEW`;
+- the row guard on `DROP TABLE` (`assertNoReferencingChildrenForDrop`).
+
+These stay on:
+
+- **The assertion guards.** `CREATE ASSERTION` plans its body when it runs and assertions are created last, so an assertion holds no forward reference, and its undo runs before any table or column undo.
+- **The other `DROP COLUMN` validations** (primary key, last column, own generated column, partial index). These are structural to the altered table and are undone in order.
+
+The fingerprint comparison is the backstop: an undo the guards would have stopped and that leaves the wrong catalog is reported as *after unwinding, the catalog does not match its pre-apply state*. `renderCatalogForRestoreCheck` renders only the applying schema, so a dependent in another schema is outside that comparison, but this plan cannot have created it: it is the already-dangling case and returns to the state it was in.
 
 ### A refused commit
 
