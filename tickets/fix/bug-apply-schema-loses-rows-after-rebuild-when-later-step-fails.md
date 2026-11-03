@@ -34,3 +34,7 @@ The same `alter table t alter primary key (c)` in autocommit keeps its rows, and
 ## Expected behavior
 
 A failed apply either keeps the table's rows or says it did not. Refusing up front is acceptable, as the explicit-transaction case does: a plan that needs a rebuild and has any other step cannot be taken back on such a backend.
+
+## Gardener note (2026-11-02)
+
+Promoted because this is a silent loss of committed rows that reports the schema as restored. The ticket's expected behaviour settles the design unless research finds better: refuse up front, as the explicit-transaction case does, when a plan needs a rebuild and has any other step. Keep the single-statement rebuild working.
