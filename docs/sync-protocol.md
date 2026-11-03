@@ -133,7 +133,11 @@ interface SyncManager {
   /** A full snapshot, for initial sync or TTL-expiration recovery. */
   getSnapshot(): Promise<Snapshot>;
 
-  /** Apply a full snapshot (replaces all local data). */
+  /**
+   * Apply a full snapshot. Replaces rows as well as metadata: each table the
+   * snapshot has a section for ends up holding exactly the snapshot's rows, and a
+   * table with no section is left alone (docs/sync.md § Snapshots replace rows).
+   */
   applySnapshot(snapshot: Snapshot): Promise<void>;
 }
 
@@ -149,6 +153,8 @@ interface Snapshot {
   siteId: SiteId;
   hlc: HLC;
   snapshotFormat: number;  // wire-format stamp; see § Snapshot wire-format version
+  // One section per covered table, including a table with no rows left: it is
+  // the table's whole contents, so an empty one empties the receiver's table.
   tables: TableSnapshot[];
   schemaMigrations: SchemaMigration[];
   // Global tombstone pass (table-independent) so a fully-deleted row — a
@@ -188,6 +194,10 @@ interface SyncManager {
    * through the clear — otherwise their CRDT state would be wiped and never
    * rewritten, diverging from the row data still in the store. (Tombstones are
    * re-emitted wholesale on resume and re-written idempotently.)
+   *
+   * Rows are replaced too: the footer deletes each row of a covered table that the
+   * snapshot does not carry, tables completed by an earlier session included, ahead
+   * of `bootstrapFinalize` (docs/sync.md § Snapshots replace rows).
    *
    * The header HLC is drift-validated before the clear (see docs/sync.md § Hybrid
    * Logical Clock (HLC)): a far-future snapshot is rejected before any local
@@ -240,6 +250,10 @@ interface SyncManager {
  * flush they already triggered, and on a receiver that lacks the table each of those
  * rows fails with "Table not found for external write". The receiver correspondingly
  * flushes its pending DDL — re-sorted causally — at the first `table-start`.
+ *
+ * A `table-start` / `table-end` pair with no `column-versions` between them is
+ * meaningful: the table is covered and empty, so the receiver empties its copy. A
+ * table with no pair at all is unmentioned and left alone.
  */
 type SnapshotChunk =
   | SnapshotHeaderChunk      // First; snapshotFormat gated + HLC drift-validated here
@@ -494,23 +508,24 @@ local-change subscription, push) starts:
 - An empty replica on first connect (`bootstrapOnEmpty`, default `true`). "Empty"
   requires **both** no peer sync state for this server and no local change facts of our
   own — the first alone also matches a device holding real local data that merely never
-  met this server, and bootstrapping that clears its sync metadata while leaving its
-  rows (divergence). A locally pre-created schema still counts as empty; replicated DDL
-  applies idempotently.
+  met this server, and bootstrapping that deletes every row the server's copy lacks. A
+  locally pre-created schema still counts as empty; replicated DDL applies idempotently.
+  So does a device whose rows were written before sync attached, since they have no
+  change facts: the bootstrap deletes them if the server's copy covers their table and
+  lacks them ([sync.md § Snapshots replace rows](sync.md#snapshots-replace-rows)).
 - A `snapshot_required` reply to `get_changes`: the device has been away longer than the
   server kept its deletion history, so no delta can be complete. This one runs on a
   device that may hold **unpushed offline work**, and the snapshot apply would destroy it
-  (an unpushed local delete undone, an unpushed insert left as a row with no sync
-  metadata, invisible to sync forever). So the rule is **push first**: unless `readOnly`,
+  (an unpushed local delete undone, an unpushed insert deleted). So the rule is **push
+  first**: unless `readOnly`,
   the client waits for any push already in flight, pushes everything since `lastSentHLC`,
   and waits for *that* `apply_result` — only then `get_snapshot`, then `get_changes` from
   the snapshot's HLC (at or above the floor by construction). A push that fails or a
   socket that drops stops the sequence; the reconnect re-sends `get_changes`, is refused
   again, and retries — pushes are idempotent, so this converges. Local writes made
-  *during* the transfer remain the gap noted below. Known limit: a snapshot apply
-  upserts rows but never deletes a local row absent from the snapshot, so the ghost rows
-  such a device holds survive the recovery (they stop diverging further); that is a
-  snapshot-apply defect tracked separately.
+  *during* the transfer remain the gap noted below. The rows such a device holds that the
+  server deleted long ago are what the apply removes: nothing else in the sync protocol
+  can reach them.
 
 Chunks stream through a push-to-pull adapter (`SnapshotStreamReader`) into
 `applySnapshotStream`. On success the client records the header's HLC as the received
@@ -520,7 +535,8 @@ status, and a sync event throttled to table boundaries.
 
 **Do not write locally while a snapshot lands.** The apply clears sync metadata and
 rewrites cell records unconditionally, so a concurrent write is silently overwritten and
-never pushed; the client cannot block application writes (engine-level barrier:
+never pushed, or deleted if it lands just as the footer reconciles its table; the client
+cannot block application writes (engine-level barrier:
 `backlog/feat-sync-bootstrap-write-gate`). It holds what it does control — local pushes
 and the peer-relay `request_changes` wait — and *drops* incoming `changes` /
 `push_changes` rather than interleaving them with the rewrite. Nothing is lost: the

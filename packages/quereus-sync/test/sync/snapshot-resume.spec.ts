@@ -200,9 +200,10 @@ describe('checkpoint invariant probe', () => {
 			'at least one saved checkpoint names a completed table',
 		).to.equal(true);
 
-		// Full row count of every table this scenario streams rows for. A table named
-		// complete by a checkpoint must already have ALL of these durable.
-		const expectedRows = new Map<string, number>([['main.big', ROWS]]);
+		// Full row count of every table this scenario streams a section for (`ghost`'s
+		// has no rows). A table named complete by a checkpoint must already have ALL of
+		// these durable.
+		const expectedRows = new Map<string, number>([['main.big', ROWS], ['main.ghost', 0]]);
 		for (const save of checkpointSaves) {
 			for (const table of save.completedTables) {
 				const expected = expectedRows.get(table);

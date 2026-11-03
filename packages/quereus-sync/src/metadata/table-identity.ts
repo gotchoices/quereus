@@ -147,6 +147,11 @@ export class TableIdentityStore implements TableIdentityResolver {
 		return this.byGeneration.get(generation);
 	}
 
+	/** Every name with a live generation, which outlives the table's rows and is retired by a drop. */
+	liveTables(): Array<{ generation: string; schema: string; table: string }> {
+		return [...this.byGeneration].map(([generation, name]) => ({ generation, ...name }));
+	}
+
 	/**
 	 * The generation for `(schema, table)`, minting and staging a `tg:` record into
 	 * `batch` when the name has none. Idempotent: a name that already resolves keeps

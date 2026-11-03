@@ -37,9 +37,48 @@ import {
 	tableScopedRowKey,
 	compareTableNames,
 	type ReconciledRow,
+	type SnapshotKeyingResolver,
 } from './snapshot-identity.js';
+import { removeRowsAbsentFromSnapshot, tablesToAnnounce } from './snapshot-coverage.js';
 import { admitGroup } from './admission.js';
 import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
+import type { PkKeying } from '../metadata/keys.js';
+
+/** One snapshot section's cells, grouped into rows under the RECEIVER's identity. */
+interface ReconciledSection {
+	readonly schema: string;
+	readonly table: string;
+	readonly keying: PkKeying;
+	readonly rows: Map<string, ReconciledRow>;
+}
+
+/**
+ * Group each section's cells under the receiver's derived identity. A sender with
+ * different keying (a raw-keyed relay) can carry several records for what this
+ * receiver considers ONE row; reconciling per (identity, column) by greatest HLC
+ * leaves exactly one cell per cell position — last-writer-wins, not entry order.
+ *
+ * A section with no cells, for a table this replica does not have and no migration
+ * created, is skipped: there is nothing to file, no keying to resolve and no row to
+ * remove. A section WITH cells for such a table still throws, as its data apply would.
+ */
+function reconcileSections(
+	ctx: SyncContext,
+	tables: readonly TableSnapshot[],
+	resolveKeying: SnapshotKeyingResolver,
+): ReconciledSection[] {
+	const sections: ReconciledSection[] = [];
+	for (const { schema, table, columnVersions } of tables) {
+		if (columnVersions.length === 0 && !ctx.isTableInBasis(schema, table)) continue;
+		const keying = resolveKeying(schema, table);
+		const rows = new Map<string, ReconciledRow>();
+		for (const cvEntry of columnVersions) {
+			reconcileCell(rows, cvEntry, keying);
+		}
+		sections.push({ schema, table, keying, rows });
+	}
+	return sections;
+}
 
 /**
  * Get a full snapshot of all data and schema state.
@@ -79,6 +118,10 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 		rowVersions.set(parsed.column, cv);
 	}
 
+	for (const { generation, schema, table } of tablesToAnnounce(ctx)) {
+		if (!tableData.has(generation)) tableData.set(generation, { schema, table, rows: new Map() });
+	}
+
 	// Build table snapshots, in name order (the scan's generation order is random
 	// per peer; see the streaming producer for why a deterministic order matters).
 	const tables: TableSnapshot[] = [];
@@ -103,8 +146,8 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 
 	// Collect all tombstones — a GLOBAL pass (not keyed off `tables`), mirroring the
 	// streaming producer: a fully-deleted row has a tombstone but no live
-	// column-versions, so its `(schema, table)` may be absent from `tables`. The
-	// global scan carries it regardless.
+	// column-versions, and its table may be outside the local basis and so absent
+	// from `tables`. The global scan carries it regardless.
 	const tombstones: SnapshotTombstone[] = [];
 	for await (const entry of ctx.kv.iterate(buildAllTombstonesScanBounds())) {
 		const parsed = parseTombstoneKey(entry.key);
@@ -237,6 +280,14 @@ export async function applySnapshot(
 				await identityBatch.write();
 			}
 
+			// Replace the rows ahead of the metadata: a failure here leaves the prior
+			// metadata intact and the snapshot retries wholesale. Each section's
+			// reconciled rows ARE what the table must keep.
+			const sections = reconcileSections(ctx, snapshot.tables, resolveKeying);
+			for (const { schema, table, keying, rows } of sections) {
+				await removeRowsAbsentFromSnapshot(ctx, schema, table, keying, rows);
+			}
+
 			// Clear existing CRDT metadata and apply new
 			const clearBatch = ctx.kv.batch();
 
@@ -259,26 +310,21 @@ export async function applySnapshot(
 			await clearBatch.write();
 
 			// Apply snapshot's column versions and rebuild change log, filed under the
-			// RECEIVER's derived identity. A sender with different keying (a raw-keyed
-			// relay) can carry several records for what this receiver considers ONE
-			// row; reconcile per (identity, column) by greatest HLC so exactly one
-			// cell record + one change-log entry survive per cell — last-writer-wins,
-			// not entry order.
+			// RECEIVER's derived identity: one cell record + one change-log entry per
+			// reconciled cell.
 			const applyBatch = ctx.kv.batch();
 
-			for (const tableSnapshot of snapshot.tables) {
-				const keying = resolveKeying(tableSnapshot.schema, tableSnapshot.table);
-				const rows = new Map<string, ReconciledRow>();
-				for (const cvEntry of tableSnapshot.columnVersions) {
-					reconcileCell(rows, cvEntry, keying);
-				}
+			for (const { schema, table, rows } of sections) {
+				// A section with no cells has nothing to mint this replica's `tg:` record,
+				// and without one it could not announce the table to the next peer.
+				ctx.tableIdentity.ensure(schema, table, applyBatch);
 
 				for (const row of rows.values()) {
 					for (const [column, cell] of row.cells) {
 						ctx.columnVersions.setColumnVersionBatch(
 							applyBatch,
-							tableSnapshot.schema,
-							tableSnapshot.table,
+							schema,
+							table,
 							row.pk,
 							column,
 							{ hlc: cell.hlc, value: cell.value },
@@ -286,8 +332,8 @@ export async function applySnapshot(
 						ctx.changeLog.recordColumnChangeBatch(
 							applyBatch,
 							cell.hlc,
-							tableSnapshot.schema,
-							tableSnapshot.table,
+							schema,
+							table,
 							row.pk,
 							column,
 						);

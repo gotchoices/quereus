@@ -713,9 +713,11 @@ export class SyncClient {
    * concurrent local write is silently overwritten and never pushed. Hold
    * application writes until this resolves (watch {@link isBootstrapping} /
    * the `bootstrapping` status). The same fate meets local work that is still
-   * UNPUSHED when this is called (its metadata is wiped, so it is never sent);
-   * the `snapshot_required` recovery pushes first for that reason — this
-   * explicit path does not, so call it only on a replica with nothing pending.
+   * UNPUSHED when this is called: its metadata is wiped, so it is never sent,
+   * and an unpushed row is DELETED if the server's copy covers its table and
+   * lacks the row. The `snapshot_required` recovery pushes first for that reason
+   * — this explicit path does not, so call it only on a replica with nothing
+   * pending.
    *
    * Idempotent while a transfer is in flight: a second call joins the same
    * transfer instead of starting another stream. Rejects when not connected /
@@ -739,10 +741,9 @@ export class SyncClient {
    * The server refused our `get_changes`: its delta floor is above our
    * received watermark, so deletes we need have been pruned and no incremental
    * reply can be complete. Recover by taking a full copy — but only AFTER our
-   * own unsent work has landed on the server. The snapshot apply clears local
-   * sync metadata and rewrites it from the server's copy: an unpushed local
-   * delete would be undone and an unpushed local insert would become a row
-   * with no sync metadata, invisible to sync forever.
+   * own unsent work has landed on the server. The snapshot apply makes each
+   * table the server's copy covers hold exactly that copy's rows: an unpushed
+   * local delete would be undone and an unpushed local insert would be deleted.
    *
    * Order: (1) wait for any push already in flight (the handshake-time push),
    * then push whatever is still unsent and wait for THAT ack; (2) stream the
@@ -865,11 +866,16 @@ export class SyncClient {
    *
    * The first alone would also match a device holding real local data that is
    * merely meeting this server for the first time — bootstrapping it would
-   * clear its sync metadata while leaving its rows in place (divergence). The
-   * second alone would match a device whose entire contents came from this
+   * delete every row the server's copy lacks, from each table that copy covers.
+   * The second alone would match a device whose entire contents came from this
    * server. Requiring both admits only the genuinely new device. A device that
    * pre-created its schema locally still counts as empty: schema migration
    * records are not consulted, and replicated DDL applies idempotently.
+   *
+   * A device whose rows were written BEFORE sync attached also passes: those
+   * rows have no change facts. The bootstrap deletes them if the server's copy
+   * covers their table and lacks them (they used to survive as rows no sync path
+   * could see).
    */
   private async isReplicaEmpty(): Promise<boolean> {
     if (!this.serverSiteId) return false;

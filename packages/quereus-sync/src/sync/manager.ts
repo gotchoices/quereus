@@ -86,7 +86,10 @@ export interface SyncManager {
   getSnapshot(): Promise<Snapshot>;
 
   /**
-   * Apply a full snapshot (replaces all local data).
+   * Apply a full snapshot, replacing rows as well as metadata: each table the
+   * snapshot has a section for ends up holding exactly the snapshot's rows, so a
+   * local row it does not carry is deleted, and a table with no section is left
+   * alone. See docs/sync.md § Snapshots replace rows.
    *
    * Used for initial sync or when delta sync is not possible.
    *
@@ -274,7 +277,8 @@ export interface SyncManager {
    * Apply a streamed snapshot.
    *
    * Processes chunks as they arrive, minimizing memory usage.
-   * Supports resumption via checkpoint tracking.
+   * Supports resumption via checkpoint tracking. Replaces rows the same way
+   * {@link applySnapshot} does, once, at the footer.
    *
    * @param chunks - Async iterable of snapshot chunks
    * @param onProgress - Optional progress callback

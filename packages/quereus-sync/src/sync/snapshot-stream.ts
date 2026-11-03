@@ -53,20 +53,16 @@ import {
 	reconcileCell,
 	compareTableNames,
 	type ReconciledRow,
+	type SnapshotKeyingResolver,
 } from './snapshot-identity.js';
+import { DATA_FLUSH_SIZE, removeRowsAbsentFromSnapshot, tablesToAnnounce } from './snapshot-coverage.js';
 import { applyDataToStore, executedSchemaChanges } from './admission.js';
 import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
 
+export { DATA_FLUSH_SIZE };
+
 /** Default chunk size for streaming snapshots. */
 const DEFAULT_SNAPSHOT_CHUNK_SIZE = 1000;
-
-/**
- * Row changes `applySnapshotStream` accumulates before pushing them to the store.
- *
- * Exported so specs that must exceed this bound (to exercise a mid-table flush)
- * derive their row counts from it rather than restating the literal.
- */
-export const DATA_FLUSH_SIZE = 100;
 
 /**
  * One replicated migration held between the chunk that carried it and the flush
@@ -131,7 +127,8 @@ async function* streamSnapshotChunks(
 	// scan visits tables in generation order, which is random per peer, so the
 	// tables are streamed sorted by name instead: a deterministic order is what a
 	// resumed transfer's `completedTables` and anyone reading a stored snapshot
-	// expect, and the table count bounds the sort.
+	// expect, and the table count bounds the sort. A table with no cells left still
+	// gets a section: the receiver reads a section as the table's whole contents.
 	const byName = new Map<string, { generation: string; schema: string; table: string }>();
 	const cvBounds = buildAllColumnVersionsScanBounds();
 	for await (const entry of ctx.kv.iterate(cvBounds)) {
@@ -140,6 +137,9 @@ async function* streamSnapshotChunks(
 		const name = ctx.tableIdentity.nameOf(parsed.generation);
 		if (!name) continue;
 		byName.set(`${name.schema}.${name.table}`, { generation: parsed.generation, ...name });
+	}
+	for (const { generation, schema, table } of tablesToAnnounce(ctx)) {
+		byName.set(`${schema}.${table}`, { generation, schema, table });
 	}
 	const tableKeys = new Map([...byName].sort(([, a], [, b]) => compareTableNames(a, b)));
 
@@ -248,8 +248,9 @@ async function* streamSnapshotChunks(
 
 	// Stream tombstones — a GLOBAL pass over every tombstone (not a per-`tableKeys`
 	// pass), batched by `(schema, table)` into `chunkSize` chunks. A row whose columns
-	// were all deleted has a tombstone but no live column-versions, so its table may be
-	// absent from `tableKeys`; the global pass carries it regardless. The scan is
+	// were all deleted has a tombstone but no live column-versions, and its table may be
+	// outside the local basis and so absent from `tableKeys`; the global pass carries it
+	// regardless. The scan is
 	// key-sorted, so all tombstones for one table GENERATION are contiguous: every
 	// `tb:` key opens with the generation LENGTH-PREFIXED (`tb:{n}:{generation}…`),
 	// so one table's keys share an exact byte prefix that no other table's key can
@@ -369,6 +370,53 @@ function parseBootstrapTables(
 		if (dot === -1) return { schema: key, table: '' };
 		return { schema: key.slice(0, dot), table: key.slice(dot + 1) };
 	});
+}
+
+/**
+ * Make every table the stream covered hold exactly the snapshot's rows. Runs once,
+ * in the footer, after every flush: the table's `cv:` records then ARE the set of
+ * rows to keep. The header's clear wiped everything but this snapshot's own earlier
+ * work, so they survive mid-table flushes and an interrupted transfer's resume with
+ * no extra state, and a failure here leaves the checkpoint in place for a retry that
+ * runs this again.
+ *
+ * `covered` is the full set even on a resumed transfer. A section for a table this
+ * replica does not have, with no migration creating it, has no rows to remove.
+ *
+ * NOTE: costs one `cv:` scan and one table scan per covered table, and one key per
+ * row of the table being reconciled, even on a brand-new replica where it removes
+ * nothing (cost not measured). If bootstrap time shows it, skip the pass for a
+ * replica known to be empty before the header's clear.
+ *
+ * NOTE: a local write committing between a table's `cv:` scan and its table scan is
+ * removed as absent; one committed before the drain below keeps its cell record and
+ * survives. Local writes during a transfer are the gap backlog/feat-sync-bootstrap-write-gate
+ * tracks; if that gate lands, this drain can go.
+ */
+async function removeRowsAbsentFromCoveredTables(
+	ctx: SyncContext,
+	covered: ReadonlyArray<{ schema: string; table: string }>,
+	resolveKeying: SnapshotKeyingResolver,
+): Promise<void> {
+	for (const { schema, table } of covered) {
+		if (!ctx.isTableInBasis(schema, table)) continue;
+		await ctx.whenCommitsSettled();
+		const keep = await filedRowIdentities(ctx, schema, table);
+		await removeRowsAbsentFromSnapshot(ctx, schema, table, resolveKeying(schema, table), keep);
+	}
+}
+
+/** The pk identity of every row with a `cv:` record under the table's current generation. */
+async function filedRowIdentities(ctx: SyncContext, schema: string, table: string): Promise<Set<string>> {
+	const identities = new Set<string>();
+	const generation = ctx.tableIdentity.generationOf(schema, table);
+	if (generation === undefined) return identities;
+
+	for await (const entry of ctx.kv.iterate(buildTableColumnVersionScanBounds(generation))) {
+		const parsed = parseColumnVersionKey(entry.key);
+		if (parsed) identities.add(parsed.identity);
+	}
+	return identities;
 }
 
 /**
@@ -666,6 +714,15 @@ export async function applySnapshotStream(
 				// (recovery: regenerate the snapshot) instead of it failing obscurely here.
 				await flushDataToStore();
 
+				// A section with no cells has nothing to mint this replica's `tg:` record,
+				// and without one it could not announce the table to the next peer. A table
+				// this replica does not have stays unnamed: a section with cells for it
+				// throws at `resolveKeying`, one without is skipped by the footer's pass.
+				if (ctx.isTableInBasis(chunk.schema, chunk.table)) {
+					ctx.tableIdentity.ensure(chunk.schema, chunk.table, batch);
+					batchSize++;
+				}
+
 				currentTable = `${chunk.schema}.${chunk.table}`;
 				currentTableSchema = chunk.schema;
 				currentTableName = chunk.table;
@@ -708,9 +765,10 @@ export async function applySnapshotStream(
 				// in the stream (see the accumulator's declaration).
 				//
 				// Push pending DDL (and the last table's un-flushed row tail) first: a
-				// fully-deleted table has NO `table-start`, so a stream of only migrations
-				// + tombstones would otherwise reach `resolveKeying` before its
-				// `create table` ran. Only the FIRST tombstone chunk can have anything
+				// fully-deleted table has no `table-start` in a stream stored before empty
+				// sections existed, or when it is outside the sender's basis, so a stream of
+				// only migrations + tombstones would otherwise reach `resolveKeying` before
+				// its `create table` ran. Only the FIRST tombstone chunk can have anything
 				// pending; later ones no-op (both pending arrays stay empty).
 				await flushDataToStore();
 
@@ -846,10 +904,12 @@ export async function applySnapshotStream(
 				// `completedTables` is the full set even on a resumed transfer (seeded
 				// from the checkpoint in the `header` case).
 				if (ctx.applyToStore) {
+					const bootstrapTables = parseBootstrapTables(completedTables);
+					await removeRowsAbsentFromCoveredTables(ctx, bootstrapTables, resolveKeying);
 					await ctx.applyToStore([], [], {
 						remote: true,
 						bootstrapFinalize: true,
-						bootstrapTables: parseBootstrapTables(completedTables),
+						bootstrapTables,
 					});
 				}
 
