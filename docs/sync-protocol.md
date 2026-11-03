@@ -460,7 +460,9 @@ the client calls `getChangesSince(serverSiteId, lastSentHLC)` for per-transactio
 ChangeSets, sends `apply_changes { requestId: apply-N, changes }`, and records
 `pendingSentHLCs[requestId] = max ChangeSet.hlc of sent txns`; the server replies
 `apply_result { requestId, ... }` with the id echoed verbatim; on a matching id the
-client sets `lastSentHLC` to that HLC (forward-only) and persists it per peer.
+client sets `lastSentHLC` to that HLC (forward-only) and persists it per peer. One read
+returns at most one `batchSize` batch, so when an ack moves the watermark the client reads
+and pushes again, ending when nothing is left past it.
 
 ### Reconnection with Exponential Backoff
 
@@ -518,10 +520,11 @@ local-change subscription, push) starts:
   device that may hold **unpushed offline work**, and the snapshot apply would destroy it
   (an unpushed local delete undone, an unpushed insert deleted). So the rule is **push
   first**: unless `readOnly`,
-  the client waits for any push already in flight, pushes everything since `lastSentHLC`,
-  and waits for *that* `apply_result` — only then `get_snapshot`, then `get_changes` from
-  the snapshot's HLC (at or above the floor by construction). A push that fails or a
-  socket that drops stops the sequence; the reconnect re-sends `get_changes`, is refused
+  the client pushes everything since `lastSentHLC` one batch at a time, waiting for each
+  `apply_result`, until nothing is left past the acknowledged watermark — only then
+  `get_snapshot`, then `get_changes` from the snapshot's HLC (at or above the floor by
+  construction). A push that fails or cannot be sent, or a socket that drops, stops the
+  sequence with no snapshot taken; the reconnect re-sends `get_changes`, is refused
   again, and retries — pushes are idempotent, so this converges. Local writes made
   *during* the transfer remain the gap noted below. The rows such a device holds that the
   server deleted long ago are what the apply removes: nothing else in the sync protocol

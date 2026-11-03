@@ -161,7 +161,7 @@ A snapshot apply replaces what the replica holds, one table at a time: afterward
 - **What is covered.** The sender gives a section to every table it has a cell for, plus every table with a live `tg:` name → generation record in its local basis (`tablesToAnnounce`). The record outlives the rows and is retired by a drop, so an emptied table gets a section with no cells while a table the sender never hosted, or dropped, gets none. The basis check stops a stale record (a table dropped while sync was detached) from wiping a receiver's table.
 - **How rows leave.** For each covered table the receiver reads its live keys through the engine and deletes each row whose derived identity is not among the snapshot's, in `DATA_FLUSH_SIZE` chunks through the same data seam as the snapshot's other writes (`removeRowsAbsentFromSnapshot`): indexes and stats follow, events are `remote: true`, and materialized views and watchers converge at `bootstrapFinalize`. A tombstoned row has no live cell, so it leaves the same way.
 - **Streaming** does this once, in the footer, after the last flush. The set of rows to keep is the table's `cv:` records: the header's clear left only this snapshot's own work there, so that set survives mid-table flushes and an interrupted transfer's resume with no extra state, and a failure leaves the checkpoint in place for a retry that runs the pass again. **Non-streaming** does it inside the metadata commit, ahead of the clear, so a failure leaves the prior metadata intact and the snapshot retries wholesale.
-- **Rows with no sync metadata are deleted too.** In a covered table that includes unpushed local inserts under an explicit `requestSnapshot()` (`snapshot_required` recovery pushes first, so it is unaffected) and rows written before sync attached, on a device `SyncClient` treats as empty for `bootstrapOnEmpty`. Both used to survive as rows no sync path could see.
+- **Rows with no sync metadata are deleted too.** In a covered table that includes unpushed local inserts under an explicit `requestSnapshot()` (`snapshot_required` recovery pushes all of them first, so it is unaffected) and rows written before sync attached, on a device `SyncClient` treats as empty for `bootstrapOnEmpty`. Both used to survive as rows no sync path could see.
 - **A materialized view is never replaced.** Its rows are derived and never carry cells, so its section is always empty. A catalog peer and a relay both announce it, so the receiver skips it and `bootstrapFinalize` rebuilds it from the replaced rows.
 - **A section for a table the receiver does not have**, with no migration creating it, is skipped if it has no cells. One with cells still fails as described under [Unknown-Table Disposition](#unknown-table-disposition).
 - **Where the pass cannot run.** A relay-only peer (no `applyToStore`) holds no row data, so it skips silently. A peer with `applyToStore` but no engine or schema to read the table through logs a warning naming the table and leaves its rows in place.
@@ -1024,6 +1024,8 @@ syncEvents.onConflictResolved((event) => { /* event.table/column/winner */ });
 
 // 7. Implement your transport layer
 async function syncWithServer(ws: WebSocket) {
+  // One batch of at most `batchSize`: read again from this batch's max hlc until
+  // the result is empty, or the rest is never sent.
   const localChanges = await syncManager.getChangesSince(serverSiteId, lastServerHLC);
   ws.send(JSON.stringify({ type: 'changes', data: localChanges }));
 

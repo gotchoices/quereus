@@ -4,6 +4,7 @@ import type { SyncStatus, SyncEvent } from '../src/types.js';
 import {
   generateSiteId,
   siteIdToBase64,
+  compareHLC,
   SyncEventEmitterImpl,
   serializeChangeSet,
   serializeHLCForTransport,
@@ -121,6 +122,8 @@ function uninstallMockWebSocket(): void {
 class MockSyncManager implements SyncManager {
   siteId = generateSiteId();
   getChangesSinceResult: ChangeSet[] = [];
+  /** Transactions returned per call, standing in for `batchSize`. Unset means no bound. */
+  changesPerCall: number | undefined = undefined;
   applyChangesResult: ApplyResult = { applied: 0, skipped: 0, conflicts: 0, transactions: 0 };
   peerSyncState: HLC | undefined = undefined;
   peerSentState: HLC | undefined = undefined;
@@ -146,7 +149,12 @@ class MockSyncManager implements SyncManager {
 
   async getChangesSince(peerSiteId: SiteId, sinceHLC?: HLC): Promise<ChangeSet[]> {
     this.getChangesSinceCalls.push({ peerSiteId, sinceHLC });
-    return this.getChangesSinceResult;
+    // Strictly after the watermark, like the real manager, so an ack ends the
+    // client's push chain once nothing is left past it.
+    const unsent = sinceHLC
+      ? this.getChangesSinceResult.filter(cs => compareHLC(cs.hlc, sinceHLC) > 0)
+      : this.getChangesSinceResult;
+    return unsent.slice(0, this.changesPerCall);
   }
 
   async applyChanges(changes: ChangeSet[]): Promise<ApplyResult> {
@@ -1239,6 +1247,33 @@ describe('SyncClient', () => {
       expect((client as any).lastSentHLC).to.deep.equal(hlc2);
     });
 
+    it('keeps pushing after each ack until no batch is left', async () => {
+      const syncManager = new MockSyncManager();
+      const { client } = createClient({ syncManager });
+      const ws = await connectAndHandshake(client);
+      ws.sentMessages.length = 0;
+
+      const site = syncManager.getSiteId();
+      syncManager.changesPerCall = 1;
+      syncManager.getChangesSinceResult = [
+        changeSet(site, 'tx1', { wallTime: 1000n, counter: 1, siteId: site, opSeq: 0 }),
+        changeSet(site, 'tx2', { wallTime: 2000n, counter: 1, siteId: site, opSeq: 0 }),
+      ];
+      const pushes = () => ws.getSentMessages().filter(m => m.type === 'apply_changes') as Array<{ requestId: string }>;
+
+      await (client as any).pushLocalChanges();
+      expect(pushes()).to.have.length(1);
+
+      ws.simulateMessage({ type: 'apply_result', requestId: pushes()[0].requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 5));
+      expect(pushes()).to.have.length(2);
+
+      // The last ack finds nothing past the watermark, so the chain ends itself.
+      ws.simulateMessage({ type: 'apply_result', requestId: pushes()[1].requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 5));
+      expect(pushes()).to.have.length(2);
+    });
+
     it('relays a peer request as an apply_changes with no requestId, whose ack never promotes', async () => {
       const syncManager = new MockSyncManager();
       const { client } = createClient({ syncManager });
@@ -1574,6 +1609,72 @@ describe('SyncClient', () => {
       const last = messages[messages.length - 1] as { type: string; sinceHLC?: string };
       expect(last.type).to.equal('get_changes');
       expect(last.sinceHLC).to.equal(serializeHLCForTransport(snapshotHlc));
+    });
+
+    it('on snapshot_required: sends every batch of unsent work before taking the snapshot', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      const serverSite = generateSiteId();
+      syncManager.peerSyncState = hlcAt(5000n, serverSite);
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      syncManager.changesPerCall = 1;
+      syncManager.getChangesSinceResult = [
+        changeSet(site, 'tx-batch-1', hlcAt(6000n, site)),
+        changeSet(site, 'tx-batch-2', hlcAt(6100n, site)),
+      ];
+      const pushes = () => ws.getSentMessages().filter(m => m.type === 'apply_changes') as Array<{ requestId: string }>;
+      const snapshotRequested = () => ws.getSentMessages().some(m => m.type === 'get_snapshot');
+
+      ws.simulateMessage({
+        type: 'snapshot_required',
+        sinceHLC: serializeHLCForTransport(hlcAt(5000n, serverSite)),
+        deltaFloor: serializeHLCForTransport(hlcAt(7000n, serverSite)),
+      });
+      await new Promise(r => setTimeout(r, 10));
+      expect(pushes()).to.have.length(1);
+      expect(snapshotRequested()).to.be.false;
+
+      ws.simulateMessage({ type: 'apply_result', requestId: pushes()[0].requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 10));
+      expect(pushes()).to.have.length(2);
+      expect(snapshotRequested()).to.be.false;
+
+      ws.simulateMessage({ type: 'apply_result', requestId: pushes()[1].requestId, applied: 1 });
+      await new Promise(r => setTimeout(r, 10));
+      expect(snapshotRequested()).to.be.true;
+      // The ack-driven chain stayed out of the recovery's way: no batch went twice.
+      expect(pushes()).to.have.length(2);
+    });
+
+    it('on snapshot_required: a push that could not be sent holds the snapshot back', async () => {
+      const syncManager = new MockSyncManager();
+      const site = syncManager.getSiteId();
+      const serverSite = generateSiteId();
+      syncManager.peerSyncState = hlcAt(5000n, serverSite);
+      const { client } = createClient({ syncManager, bootstrapOnEmpty: true });
+      const ws = await connectAndHandshake(client, serverSite);
+
+      // The socket stays open and only the push fails, so a snapshot request
+      // would still get out. Treating the dropped send as "nothing left" deletes
+      // the row this batch carries.
+      const realSend = ws.send.bind(ws);
+      ws.send = (data: string) => {
+        if (data.includes('"apply_changes"')) throw new Error('socket write failed');
+        realSend(data);
+      };
+      syncManager.getChangesSinceResult = [changeSet(site, 'tx-offline', hlcAt(6000n, site))];
+
+      ws.simulateMessage({
+        type: 'snapshot_required',
+        sinceHLC: serializeHLCForTransport(hlcAt(5000n, serverSite)),
+        deltaFloor: serializeHLCForTransport(hlcAt(7000n, serverSite)),
+      });
+      await new Promise(r => setTimeout(r, 10));
+
+      expect(ws.getSentMessages().map(m => m.type)).to.not.include('get_snapshot');
+      expect(client.isBootstrapping).to.be.false;
     });
 
     it('on snapshot_required in readOnly mode: takes the snapshot at once, pushing nothing', async () => {

@@ -46,6 +46,16 @@ const DEFAULT_LOCAL_CHANGE_DEBOUNCE_MS = 50;
 const DEFAULT_SNAPSHOT_CHUNK_TIMEOUT_MS = 60_000;
 
 /**
+ * What one push attempt did. `drained` and `held` both mean nothing left the
+ * socket, but only `drained` means nothing remains to send: a snapshot taken
+ * after `held` would destroy the work still waiting.
+ */
+type PushOutcome =
+  | { status: 'sent'; requestId: string }
+  | { status: 'drained' }
+  | { status: 'held' };
+
+/**
  * WebSocket sync client for Quereus.
  *
  * Connects to a sync server and handles bidirectional synchronization
@@ -117,6 +127,10 @@ export class SyncClient {
   // ack redelivered after a reconnect carries an id we no longer hold (dropped)
   // rather than colliding with a freshly-reused id and crediting the wrong batch.
   private applyRequestSeq = 0;
+  // True while snapshot_required recovery is draining local changes. That loop
+  // sends the next batch itself after each ack, so handleApplyResult must not
+  // start one too; both would read the same range and every batch would go twice.
+  private recoveryOwnsPush = false;
 
   // Local change debouncing
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -227,6 +241,10 @@ export class SyncClient {
       this.detachSocketHandlers(this.ws);
       this.ws.close();
       this.ws = null;
+      // onclose is detached, so it cannot release these, and their acks will
+      // never come. A recovery parked here would otherwise hold recoveryOwnsPush
+      // and resume on the new socket.
+      this.rejectAckWaiters(new Error('Connection replaced before the push was acknowledged'));
     }
 
     this.setStatus({ status: 'connecting' });
@@ -522,7 +540,8 @@ export class SyncClient {
       // Subscribe to local changes for pushing to server
       this.subscribeToLocalChanges();
 
-      // Push any existing local changes to server (changes made while offline)
+      // Push any existing local changes to server (changes made while offline).
+      // This sends the first batch; each ack sends the next (handleApplyResult).
       await this.pushLocalChanges();
     }
   }
@@ -587,7 +606,7 @@ export class SyncClient {
     applied?: number;
     rejected?: Array<{ reason: string; code?: string }>;
   }): Promise<void> {
-    await this.promoteWatermark(message.requestId);
+    const advanced = await this.promoteWatermark(message.requestId);
     this.settleAckWaiters();
 
     this.emitSyncEvent('info', `Server applied ${message.applied ?? 0} change(s)`);
@@ -596,6 +615,16 @@ export class SyncClient {
       for (const r of message.rejected) {
         this.emitSyncEvent('rejected', r.reason, { rejections: [r] });
       }
+    }
+
+    // A push carries one bounded batch, so an ack does not mean we are caught up.
+    // Only a real advance continues the chain: the watermark can only climb so
+    // far, whereas re-reading after a stale ack would send the same batch again.
+    // NOTE: a push that fails or is dropped ends the chain, so the remainder waits
+    // (durably) for the next local write or reconnect. If that stall ever shows
+    // up on a device that goes quiet, retry on a backoff timer.
+    if (advanced && !this.recoveryOwnsPush) {
+      await this.pushLocalChanges();
     }
   }
 
@@ -609,22 +638,26 @@ export class SyncClient {
    *    across a reconnect, or the server double-acked); logged, then ignored.
    *  - no `requestId` → an untracked push (a peer-relay `apply_changes`) or a
    *    legacy coordinator that doesn't echo the id; nothing to promote.
+   *
+   * @returns true only when `lastSentHLC` moved forward.
    */
-  private async promoteWatermark(requestId: string | undefined): Promise<void> {
-    if (requestId === undefined) return;
+  private async promoteWatermark(requestId: string | undefined): Promise<boolean> {
+    if (requestId === undefined) return false;
 
     const promoted = this.pendingSentHLCs.get(requestId);
     if (!promoted) {
       this.emitSyncEvent('info', `Ignoring apply_result for unknown push (requestId: ${requestId})`);
-      return;
+      return false;
     }
 
     this.pendingSentHLCs.delete(requestId);
+    let advanced = false;
 
     // Never move the watermark backward: an out-of-order ack for an older batch
     // must not undo a newer batch a prior ack already promoted.
     if (!this.lastSentHLC || compareHLC(promoted, this.lastSentHLC) > 0) {
       this.lastSentHLC = promoted;
+      advanced = true;
       // Persist the confirmed watermark per peer so a restart resumes delta-push
       // from here instead of replaying local history. Only written on a real
       // forward advance, and only for a correlated ack (so we persist a
@@ -634,14 +667,16 @@ export class SyncClient {
       }
     }
 
-    // Drop any still-pending batches the new watermark now subsumes (a later
-    // push re-sends everything since the last ack, so its range covers theirs),
-    // so their late/duplicate acks can't re-promote an already-covered HLC.
+    // Drop any still-pending batches the new watermark now subsumes (every push
+    // starts from an acknowledged watermark, so all at or below the new one has
+    // landed), so their late/duplicate acks can't re-promote an already-covered HLC.
     for (const [id, hlc] of this.pendingSentHLCs) {
       if (compareHLC(hlc, this.lastSentHLC) <= 0) {
         this.pendingSentHLCs.delete(id);
       }
     }
+
+    return advanced;
   }
 
   /**
@@ -745,13 +780,12 @@ export class SyncClient {
    * table the server's copy covers hold exactly that copy's rows: an unpushed
    * local delete would be undone and an unpushed local insert would be deleted.
    *
-   * Order: (1) wait for any push already in flight (the handshake-time push),
-   * then push whatever is still unsent and wait for THAT ack; (2) stream the
-   * snapshot; (3) catch up from the snapshot's HLC, which the transfer recorded
-   * as the received watermark and which is at or above the floor by
-   * construction. A push that fails or a socket that drops stops the sequence:
-   * the reconnect re-sends `get_changes`, is refused again, and lands back
-   * here — pushes are idempotent, so the loop converges.
+   * Order: (1) send all unsent work, every batch ({@link pushUntilDrained});
+   * (2) stream the snapshot; (3) catch up from the snapshot's HLC, which the
+   * transfer recorded as the received watermark and which is at or above the
+   * floor by construction. A push that fails or a socket that drops stops the
+   * sequence: the reconnect re-sends `get_changes`, is refused again, and lands
+   * back here — pushes are idempotent, so the loop converges.
    *
    * Local writes made DURING the transfer remain the gap tracked by
    * backlog/feat-sync-bootstrap-write-gate; this path does not widen it.
@@ -773,24 +807,15 @@ export class SyncClient {
 
     if (!this.options.readOnly) {
       try {
-        // NOTE: `pendingSentHLCs` survives an auto-reconnect (only disconnect()
-        // clears it), so this can wait on a push from the PREVIOUS socket whose
-        // ack will never come. It is rescued because the handshake-time push
-        // re-sends everything since the un-promoted lastSentHLC, and its ack
-        // subsumes the stale id (promoteWatermark drops it, settleAckWaiters
-        // releases us). If pending ids are ever cleared or kept differently on
-        // reconnect, scope this wait to the current socket's pushes instead.
-        await Promise.all([...this.pendingSentHLCs.keys()].map(id => this.waitForAck(id)));
-        const requestId = await this.pushLocalChanges();
-        if (requestId) await this.waitForAck(requestId);
+        await this.pushUntilDrained();
       } catch (err) {
         // Not an error to surface: the reconnect path retries the whole
         // sequence, and the refusal that brought us here will repeat.
         // NOTE: only a reconnect retries. A push the server answers with
-        // APPLY_CHANGES_ERROR leaves the socket open, so the recovery stays
-        // parked (broadcasts still land; the gap does not) until the socket
-        // next drops. If that shows up, re-send get_changes after the
-        // reconnect backoff instead of returning here.
+        // APPLY_CHANGES_ERROR, or one that could not be sent, leaves the socket
+        // open, so the recovery stays parked (broadcasts still land; the gap
+        // does not) until the socket next drops. If that shows up, re-send
+        // get_changes after the reconnect backoff instead of returning here.
         this.emitSyncEvent(
           'info',
           `Snapshot recovery deferred: ${err instanceof Error ? err.message : String(err)}`,
@@ -803,6 +828,32 @@ export class SyncClient {
     if (error) return;
 
     await this.requestChangesFromServer();
+  }
+
+  /**
+   * Send local changes one batch at a time, waiting for each ack, until a read
+   * past the acknowledged watermark finds nothing. That read is the whole safety
+   * condition, so a push already in flight (the handshake-time one) needs no
+   * wait of its own: its range is at worst re-sent once, and whichever ack lands
+   * first subsumes the other.
+   *
+   * @throws when a batch could not be sent or its ack will not come — unsent work
+   *         remains, so the caller must not go on to take a snapshot.
+   */
+  private async pushUntilDrained(): Promise<void> {
+    this.recoveryOwnsPush = true;
+    try {
+      let push = await this.pushLocalChanges();
+      while (push.status === 'sent') {
+        await this.waitForAck(push.requestId);
+        push = await this.pushLocalChanges();
+      }
+      if (push.status === 'held') {
+        throw new Error('Unsent local changes could not be pushed');
+      }
+    } finally {
+      this.recoveryOwnsPush = false;
+    }
   }
 
   /**
@@ -1188,17 +1239,19 @@ export class SyncClient {
   }
 
   /**
-   * Push every local change since `lastSentHLC`.
+   * Push the next batch of local changes past `lastSentHLC`. `getChangesSince`
+   * bounds what one read returns, so this is not everything: the ack continues
+   * from here (handleApplyResult, or {@link pushUntilDrained} during recovery).
    *
-   * @returns the push's request id when a tracked batch left the socket, else
-   *          null (nothing to send, not connected, bootstrapping, or the send
-   *          was dropped).
+   * @returns `sent` when a tracked batch left the socket, `drained` when nothing
+   *          is left past the watermark, and `held` when nothing was attempted
+   *          or the send was dropped (read-only, not connected, bootstrapping).
    */
-  private async pushLocalChanges(): Promise<string | null> {
-    if (this.options.readOnly) return null;
-    if (!this.isConnected || !this.serverSiteId) return null;
+  private async pushLocalChanges(): Promise<PushOutcome> {
+    if (this.options.readOnly) return { status: 'held' };
+    if (!this.isConnected || !this.serverSiteId) return { status: 'held' };
     // No pushes while a snapshot is landing — local data is partial.
-    if (this.isBootstrapping) return null;
+    if (this.isBootstrapping) return { status: 'held' };
 
     // Get changes since lastSentHLC (delta sync)
     // Use serverSiteId to filter out changes that originated from the server
@@ -1208,7 +1261,7 @@ export class SyncClient {
       this.lastSentHLC ?? undefined
     );
 
-    if (changes.length === 0) return null;
+    if (changes.length === 0) return { status: 'drained' };
 
     // Serialize and send
     const serialized = changes.map(cs => serializeChangeSet(cs));
@@ -1229,7 +1282,7 @@ export class SyncClient {
     // Only advance delta-sync state if the bytes actually left. A dropped send
     // must be retried on the next push, so register no pending watermark and
     // leave the pending count untouched.
-    if (!sent) return null;
+    if (!sent) return { status: 'held' };
 
     // Record the max HLC this batch carries against its request id; the matching
     // apply_result promotes lastSentHLC to it (see promoteWatermark).
@@ -1238,7 +1291,7 @@ export class SyncClient {
       this.pendingSentHLCs.set(requestId, batchHLC);
     }
     this.pendingLocalChangeCount = 0;
-    return requestId;
+    return { status: 'sent', requestId };
   }
 
   /** Next monotonic apply-request id. Deterministic for test predictability. */
