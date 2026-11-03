@@ -528,7 +528,9 @@ local-change subscription, push) starts:
   again, and retries — pushes are idempotent, so this converges. Local writes made
   *during* the transfer remain the gap noted below. The rows such a device holds that the
   server deleted long ago are what the apply removes: nothing else in the sync protocol
-  can reach them.
+  can reach them. Known exception: a row the device pulled but has not pushed past its
+  watermark is pushed back first and returns to the server, so the snapshot keeps it
+  (`fix/sync-client-pushes-back-server-changes`).
 
 Chunks stream through a push-to-pull adapter (`SnapshotStreamReader`) into
 `applySnapshotStream`. On success the client records the header's HLC as the received

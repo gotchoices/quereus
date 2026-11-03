@@ -734,7 +734,7 @@ export class SyncClient {
   // Snapshot bootstrap
   // ==========================================================================
   //
-  // NOTE: this file is ~1170 lines; this section is ~300 of them and is the
+  // NOTE: this file is ~1370 lines; this section is ~300 of them and is the
   // natural extraction seam — it touches the rest of the client only through
   // `send`, `setStatus`, `emitSyncEvent`, `syncManager` and `ws`. If the file
   // grows much further, lift it into a `SnapshotBootstrap` collaborator that
@@ -843,6 +843,10 @@ export class SyncClient {
   private async pushUntilDrained(): Promise<void> {
     this.recoveryOwnsPush = true;
     try {
+      // NOTE: progress relies on every read's max hlc exceeding the watermark, which
+      // getChangesSince guarantees today. Unlike the ack chain this loop has no
+      // "did it advance" check; if a read could ever return facts at or below the
+      // watermark, stop here on a non-advancing ack or it re-sends them forever.
       let push = await this.pushLocalChanges();
       while (push.status === 'sent') {
         await this.waitForAck(push.requestId);
