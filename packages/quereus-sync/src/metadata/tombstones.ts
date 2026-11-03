@@ -11,7 +11,7 @@ import { type HLC, serializeHLC, deserializeHLC, compareHLC } from '../clock/hlc
 import { encodeSqlValue, decodeSqlValue } from './column-version.js';
 import { buildTombstoneKey, buildTombstoneScanBounds, encodePkIdentity } from './keys.js';
 import type { PkKeyingResolver } from './pk-identity.js';
-import type { TableIdentityResolver } from './table-identity.js';
+import { writeIdentityBatch, type TableIdentityResolver } from './table-identity.js';
 
 /** Fixed-size head of a serialized tombstone: 30 bytes HLC + 8 bytes createdAt. */
 const TOMBSTONE_HEAD_BYTES = 38;
@@ -156,9 +156,8 @@ export class TombstoneStore {
     hlc: HLC,
     priorRow?: Row
   ): Promise<void> {
-    const batch = this.kv.batch();
-    this.setTombstoneBatch(batch, schemaName, tableName, pk, hlc, priorRow);
-    await batch.write();
+    await writeIdentityBatch(this.kv, this.tables, batch =>
+      this.setTombstoneBatch(batch, schemaName, tableName, pk, hlc, priorRow));
   }
 
   /**

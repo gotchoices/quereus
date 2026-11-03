@@ -456,6 +456,12 @@ export async function applyChanges(
 			// NOTE: drains the commit chain again first — Phase 2 ran engine statements,
 			// and a local commit that slipped in between must have its own transition
 			// recorded before this one files anything under the same names.
+			// NOTE: a crash between Phase 2's engine commit and this write loses the
+			// transition for good: on retry the rename/drop decides `already-applied`
+			// and is absent from `executed`, so the generation stays at the old name
+			// (the re-apply is NOT idempotent here, unlike the row records — docs/sync.md
+			// § Write Order). Closing it means deciding the transition against the
+			// catalog rather than the executed list; see docs/sync.md § Table identity.
 			await ctx.whenCommitsSettled();
 			if (executed.length > 0) {
 				const identityBatch = ctx.kv.batch();

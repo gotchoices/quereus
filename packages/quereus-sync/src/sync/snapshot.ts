@@ -15,7 +15,6 @@ import {
 	parseColumnVersionKey,
 	parseTombstoneKey,
 	encodePkIdentity,
-	joinKeyParts,
 } from '../metadata/keys.js';
 import {
 	SNAPSHOT_WIRE_FORMAT_VERSION,
@@ -36,6 +35,7 @@ import {
 	keepMaxHLC,
 	reconcileCell,
 	tableScopedRowKey,
+	compareTableNames,
 	type ReconciledRow,
 } from './snapshot-identity.js';
 import { admitGroup } from './admission.js';
@@ -82,8 +82,7 @@ export async function getSnapshot(ctx: SyncContext): Promise<Snapshot> {
 	// Build table snapshots, in name order (the scan's generation order is random
 	// per peer; see the streaming producer for why a deterministic order matters).
 	const tables: TableSnapshot[] = [];
-	const ordered = [...tableData.values()]
-		.sort((a, b) => joinKeyParts(a.schema, a.table).localeCompare(joinKeyParts(b.schema, b.table)));
+	const ordered = [...tableData.values()].sort(compareTableNames);
 	for (const { schema, table, rows } of ordered) {
 		const columnVersions: ColumnVersionEntry[] = [];
 

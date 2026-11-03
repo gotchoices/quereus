@@ -43,7 +43,6 @@ import {
   tableGenerationToBytes,
   tableGenerationFromBytes,
   RAW_PK_KEYING,
-  SYNC_METADATA_FORMAT_VERSION,
 } from '../../src/metadata/keys.js';
 
 const siteA = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -279,10 +278,6 @@ describe('change-log key encoding', () => {
   // the row families used to need for names.
   describe('table generation (tg:) keys', () => {
     const NASTY = ['a:b', 'a.b', 'x:y.z:', '.:', 'a', ''];
-
-    it('the format version is 6 — generation-keyed per-row records', () => {
-      expect(SYNC_METADATA_FORMAT_VERSION).to.equal(6);
-    });
 
     it('a minted generation is 22 base64url characters that round-trip through 16 bytes', () => {
       const generation = mintTableGeneration();

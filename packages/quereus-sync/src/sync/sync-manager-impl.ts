@@ -57,7 +57,7 @@ import {
 } from '../metadata/keys.js';
 import { migrationObjectKind } from './protocol.js';
 import { createPkKeyingResolver, type PkKeyingResolver } from '../metadata/pk-identity.js';
-import { TableIdentityStore } from '../metadata/table-identity.js';
+import { TableIdentityStore, withIdentityRecovery } from '../metadata/table-identity.js';
 import type { SyncManager, SnapshotCheckpoint } from './manager.js';
 import type {
 	SyncConfig,
@@ -809,6 +809,14 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				status: 'error',
 				error: toError(error),
 			});
+			// The abandoned batch may have staged identity transitions and lazy mints
+			// the in-memory index already reflects; re-read it from disk. This handler
+			// swallows its own errors (the chain must stay usable), so the re-read's too.
+			try {
+				await this.tableIdentity.load();
+			} catch (reloadError) {
+				console.error('[Sync] Table identity index could not be re-read after the failed capture:', reloadError);
+			}
 		}
 	}
 
@@ -1638,7 +1646,9 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		chunks: AsyncIterable<SnapshotChunk>,
 		onProgress?: (progress: SnapshotProgress) => void
 	): Promise<void> {
-		return applySnapshotStreamImpl(this, chunks, onProgress);
+		// Every flush stages identity transitions and lazy mints; a mid-stream throw
+		// must not leave the index ahead of what committed.
+		return withIdentityRecovery(this.tableIdentity, () => applySnapshotStreamImpl(this, chunks, onProgress));
 	}
 
 	async getSnapshotCheckpoint(snapshotId: string): Promise<SnapshotCheckpoint | undefined> {

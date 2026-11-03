@@ -24,6 +24,7 @@ import type {
 } from './protocol.js';
 import type { SyncContext } from './sync-context.js';
 import { persistHLCState, throwIfApplyErrors, toError } from './sync-context.js';
+import { withIdentityRecovery } from '../metadata/table-identity.js';
 
 /**
  * Data-first half of the admission invariant: apply this unit's data + schema to
@@ -147,7 +148,10 @@ export interface AdmissionGroup {
  */
 export async function admitGroup(ctx: SyncContext, group: AdmissionGroup): Promise<void> {
 	const result = await applyDataToStore(ctx, group.dataChanges, group.schemaChanges, group.applyOptions);
-	await group.commitMetadata(executedSchemaChanges(group.schemaChanges, result)); // metadata SECOND
+	// metadata SECOND; a failed commit leaves staged identity transitions and lazy
+	// mints that never landed, which the wrapper re-reads away.
+	await withIdentityRecovery(ctx.tableIdentity, () =>
+		group.commitMetadata(executedSchemaChanges(group.schemaChanges, result)));
 	if (group.watermarkHLC) {
 		ctx.hlcManager.receive(group.watermarkHLC);    // monotonic merge, idempotent
 		await persistHLCState(ctx);

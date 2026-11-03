@@ -39,11 +39,22 @@ async function makeManager(): Promise<{
 	syncEvents: SyncEventEmitterImpl;
 	localChanges: LocalChangeEvent[];
 	batchCount: () => number;
+	/** Make the NEXT KV batch's write reject, once. */
+	failNextWrite: () => void;
 }> {
 	const kv = new InMemoryKVStore();
 	let batches = 0;
+	let failNext = false;
 	const origBatch = kv.batch.bind(kv);
-	kv.batch = () => { batches++; return origBatch(); };
+	kv.batch = () => {
+		batches++;
+		const batch = origBatch();
+		if (failNext) {
+			failNext = false;
+			batch.write = async () => { throw new Error('simulated storage failure'); };
+		}
+		return batch;
+	};
 
 	const source = new FakeTransactionSource();
 	const syncEvents = new SyncEventEmitterImpl();
@@ -59,7 +70,7 @@ async function makeManager(): Promise<{
 		(_schema, table) => SCHEMAS[table],
 	);
 
-	return { manager, kv, source, syncEvents, localChanges, batchCount: () => batches };
+	return { manager, kv, source, syncEvents, localChanges, batchCount: () => batches, failNextWrite: () => { failNext = true; } };
 }
 
 /** Assert every fact shares one base `(wallTime, counter, siteId)`. */
@@ -363,6 +374,37 @@ describe('commit recording is serialized (no interleave)', () => {
 		expect(nameChanges, 'no duplicate change-log entry for (pk=[1], name)').to.have.length(1);
 		// Commit 2's dedup observed commit 1's write: the survivor is the latest value.
 		expect(nameChanges[0].value).to.equal('Alice2');
+	});
+});
+
+// The table-identity index (`metadata/table-identity.ts`) is updated when a transition
+// is STAGED, so a capture whose batch never commits leaves it ahead of disk; `ensure`
+// never re-persists a mapping the index already holds. The capture's catch must re-read
+// the index, or every later record for that name lands under a generation no `tg:`
+// record names and a reopened replica resolves none of them.
+describe('table identity index after a failed commit capture', () => {
+	it('re-reads the index so later commits persist the mapping a reopened replica resolves', async () => {
+		const { manager, kv, source, syncEvents, failNextWrite } = await makeManager();
+		const errors: SyncState[] = [];
+		syncEvents.onSyncStateChange(s => { if (s.status === 'error') errors.push(s); });
+
+		// First commit for `users` mints its generation; the batch write then fails.
+		failNextWrite();
+		source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [1], newRow: [1, 'Alice'] });
+		await manager.whenCommitsSettled();
+		expect(errors, 'the failed capture is telemetered').to.have.length(1);
+
+		// The next commit must land the mapping together with its records.
+		source.commitData({ type: 'insert', schemaName: 'main', tableName: 'users', key: [2], newRow: [2, 'Bob'] });
+		await manager.whenCommitsSettled();
+
+		const reopened = await SyncManagerImpl.create(
+			kv, new FakeTransactionSource(), { ...DEFAULT_SYNC_CONFIG }, new SyncEventEmitterImpl(),
+			undefined, (_schema, table) => SCHEMAS[table],
+		);
+		const changes = (await reopened.getChangesSince(generateSiteId())).flatMap(s => s.changes);
+		expect(changes, 'both cells of row 2 resolve by name on the reopened replica').to.have.length(2);
+		expect(changes.every(c => c.table === 'users' && c.pk[0] === 2)).to.equal(true);
 	});
 });
 

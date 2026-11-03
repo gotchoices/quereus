@@ -24,7 +24,6 @@ import {
 	parseTombstoneKey,
 	parseChangeLogKey,
 	encodePkIdentity,
-	joinKeyParts,
 } from '../metadata/keys.js';
 import type { SnapshotCheckpoint } from './manager.js';
 import {
@@ -52,6 +51,7 @@ import {
 	createSnapshotKeyingResolver,
 	keepMaxHLC,
 	reconcileCell,
+	compareTableNames,
 	type ReconciledRow,
 } from './snapshot-identity.js';
 import { applyDataToStore, executedSchemaChanges } from './admission.js';
@@ -141,9 +141,7 @@ async function* streamSnapshotChunks(
 		if (!name) continue;
 		byName.set(`${name.schema}.${name.table}`, { generation: parsed.generation, ...name });
 	}
-	const tableKeys = new Map(
-		[...byName].sort(([, a], [, b]) => joinKeyParts(a.schema, a.table).localeCompare(joinKeyParts(b.schema, b.table))),
-	);
+	const tableKeys = new Map([...byName].sort(([, a], [, b]) => compareTableNames(a, b)));
 
 	// Collect migrations up front — the header needs their count anyway, and they must
 	// be emitted in causal order rather than `sm:` scan order (see `listAllMigrations`).

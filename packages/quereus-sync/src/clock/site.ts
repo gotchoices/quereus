@@ -14,20 +14,27 @@
 export type SiteId = Uint8Array;
 
 /**
+ * `length` random bytes — `crypto.getRandomValues` where it exists (browser and
+ * Node 19+), `Math.random` otherwise. Shared by the site id and the table
+ * generation (`metadata/keys.ts`), the two random identities this package mints.
+ */
+export function randomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return bytes;
+}
+
+/**
  * Generate a new random site ID (UUID v4).
  */
 export function generateSiteId(): SiteId {
-  const id = new Uint8Array(16);
-
-  // Use crypto.getRandomValues if available (browser and Node 19+)
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(id);
-  } else {
-    // Fallback for older Node.js
-    for (let i = 0; i < 16; i++) {
-      id[i] = Math.floor(Math.random() * 256);
-    }
-  }
+  const id = randomBytes(16);
 
   // Set version to 4 (random UUID)
   id[6] = (id[6] & 0x0f) | 0x40;

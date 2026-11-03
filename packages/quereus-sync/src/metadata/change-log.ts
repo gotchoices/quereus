@@ -17,7 +17,7 @@ import {
   type ChangeLogEntryType,
 } from './keys.js';
 import type { PkKeyingResolver } from './pk-identity.js';
-import type { TableIdentityResolver } from './table-identity.js';
+import { writeIdentityBatch, type TableIdentityResolver } from './table-identity.js';
 
 /**
  * Change log entry stored in KV.
@@ -72,9 +72,8 @@ export class ChangeLogStore {
     pk: SqlValue[],
     column: string
   ): Promise<void> {
-    const batch = this.kv.batch();
-    this.recordColumnChangeBatch(batch, hlc, schema, table, pk, column);
-    await batch.write();
+    await writeIdentityBatch(this.kv, this.tables, batch =>
+      this.recordColumnChangeBatch(batch, hlc, schema, table, pk, column));
   }
 
   /**
@@ -107,9 +106,8 @@ export class ChangeLogStore {
     table: string,
     pk: SqlValue[]
   ): Promise<void> {
-    const batch = this.kv.batch();
-    this.recordDeletionBatch(batch, hlc, schema, table, pk);
-    await batch.write();
+    await writeIdentityBatch(this.kv, this.tables, batch =>
+      this.recordDeletionBatch(batch, hlc, schema, table, pk));
   }
 
   /**

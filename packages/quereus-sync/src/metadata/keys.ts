@@ -23,7 +23,7 @@
 import type { SqlValue } from '@quereus/quereus';
 import { serializeKeyNullGrouping } from '@quereus/quereus';
 import { assertNoUnpairedSurrogate } from '@quereus/store';
-import { type SiteId, siteIdToBase64, siteIdFromBase64, toBase64Url, fromBase64Url } from '../clock/site.js';
+import { type SiteId, siteIdToBase64, siteIdFromBase64, toBase64Url, fromBase64Url, randomBytes } from '../clock/site.js';
 import type { HLC } from '../clock/hlc.js';
 import type { SchemaObjectKind } from '../sync/protocol.js';
 
@@ -221,13 +221,7 @@ export const TABLE_GENERATION_BYTES = 16;
  * generation never appears on the wire. See `metadata/table-identity.ts`.
  */
 export function mintTableGeneration(): string {
-  const bytes = new Uint8Array(TABLE_GENERATION_BYTES);
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  return toBase64Url(bytes);
+  return toBase64Url(randomBytes(TABLE_GENERATION_BYTES));
 }
 
 /** Decode a generation string back to its 16 bytes — the record VALUE's form. */

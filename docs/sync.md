@@ -651,12 +651,24 @@ the name (`metadata/table-identity.ts`):
   again before filing its metadata (`applyChanges`, `drainHeldChanges`): a local rename
   whose `move` had not landed yet would otherwise let the inbound batch mint a second
   generation for the new name.
+- The in-memory index is updated when a transition is **staged**, not when its batch
+  commits, so the rest of the same batch resolves the new state. A batch that then fails
+  to commit leaves the index ahead of disk, and nothing re-persists a mapping the index
+  already holds — so every site that stages transitions re-reads the index from disk on
+  failure (`withIdentityRecovery`: the admission unit's metadata commit, the streaming
+  snapshot apply, the stores' standalone writers, and the local commit capture's catch).
 
 **What this does not solve.** A change recorded against one incarnation on peer X and
 applied to a different same-named incarnation on peer Y — X writes to `orders` while Y
 has already dropped and re-created it — lands in Y's new table. The receiver cannot tell
 which incarnation the sender addressed; that is a concurrent-DDL-versus-data race, the
-same class as the rename collision `decideRenameTable` refuses, and pre-existing.
+same class as the rename collision `decideRenameTable` refuses, and pre-existing. Two
+narrower gaps share the crash/detached class already noted under *Write Order* and
+*Known Limitations*: a crash between a replicated rename's engine commit and its identity
+transition strands the generation at the old name (the retry decides `already-applied`
+and moves nothing — the one step of the apply that is not idempotent), and DDL run while
+sync is detached leaves a `tg:` record whose table is gone, which a later same-name
+create inherits (its migration is lost the same way).
 
 ### Metadata format version
 

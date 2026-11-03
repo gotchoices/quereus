@@ -10,7 +10,7 @@ import type { KVStore, WriteBatch } from '@quereus/store';
 import { type HLC, type SerializedHLC, serializeHLC, deserializeHLC, compareHLC, hlcToJson, hlcFromJson } from '../clock/hlc.js';
 import { buildColumnVersionKey, buildColumnVersionScanBounds, encodePkIdentity, parseColumnVersionKey } from './keys.js';
 import type { PkKeyingResolver } from './pk-identity.js';
-import type { TableIdentityResolver } from './table-identity.js';
+import { writeIdentityBatch, type TableIdentityResolver } from './table-identity.js';
 
 /**
  * Column version record stored in the KV store.
@@ -213,7 +213,8 @@ export class ColumnVersionStore {
 
   /**
    * Set the version of a specific column (standalone write — one batch, so the
-   * generation mint, when needed, lands with the record).
+   * generation mint, when needed, lands with the record, and the identity index is
+   * re-read if it does not).
    */
   async setColumnVersion(
     schemaName: string,
@@ -222,9 +223,8 @@ export class ColumnVersionStore {
     column: string,
     version: ColumnVersionData
   ): Promise<void> {
-    const batch = this.kv.batch();
-    this.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version);
-    await batch.write();
+    await writeIdentityBatch(this.kv, this.tables, batch =>
+      this.setColumnVersionBatch(batch, schemaName, tableName, pk, column, version));
   }
 
   /**

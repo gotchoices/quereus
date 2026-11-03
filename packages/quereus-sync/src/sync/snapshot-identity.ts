@@ -64,6 +64,21 @@ export function tableScopedRowKey(schema: string, table: string, identity: strin
 }
 
 /**
+ * Sort comparator over `(schema, table)` names in code-unit order — the same on
+ * every peer and runtime, unlike `localeCompare`. The snapshot producers stream
+ * tables in this order because the `cv:` scan visits them by generation, which is
+ * random per peer (see `metadata/table-identity.ts`).
+ */
+export function compareTableNames(
+	a: { readonly schema: string; readonly table: string },
+	b: { readonly schema: string; readonly table: string },
+): number {
+	const ka = joinKeyParts(a.schema, a.table);
+	const kb = joinKeyParts(b.schema, b.table);
+	return ka < kb ? -1 : ka > kb ? 1 : 0;
+}
+
+/**
  * Merge one snapshot cell into `rows` under the RECEIVER's derived identity.
  *
  * A sender with different keying (e.g. a raw-keyed relay with no schema oracle)

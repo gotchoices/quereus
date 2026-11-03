@@ -29,6 +29,17 @@
  * explicit transitions (create / drop / rename) are driven by the two DDL paths —
  * local capture (`SyncManagerImpl.handleTransactionCommit`) and replicated DDL the
  * store adapter reports as executed (`change-applicator.ts`'s `commitMetadata`).
+ *
+ * The in-memory index is updated the moment a transition is STAGED, not when its
+ * batch commits, so later stages of the same batch resolve the new state (`drop t;
+ * create t; insert into t` files the rows under the fresh generation). The price is
+ * that a batch which never commits — abandoned by a throw mid-staging, or refused by
+ * the store — leaves the index ahead of disk, and nothing re-persists a mapping the
+ * index already holds. So every site that stages transitions and then fails to
+ * commit them re-reads the index with {@link TableIdentityStore.load}, through
+ * {@link withIdentityRecovery}: `admitGroup`'s metadata commit, the streaming
+ * snapshot apply, the stores' standalone writers ({@link writeIdentityBatch}), and
+ * the local commit capture's own catch.
  */
 
 import type { KVStore, WriteBatch } from '@quereus/store';
@@ -60,6 +71,8 @@ export interface TableGeneration {
 export interface TableIdentityResolver {
 	generationOf(schema: string, table: string): string | undefined;
 	ensure(schema: string, table: string, batch: WriteBatch): string;
+	/** Re-read the mapping from disk — the recovery after a batch that staged a transition failed to commit. */
+	load(): Promise<void>;
 }
 
 /**
@@ -88,9 +101,8 @@ export function deserializeTableGeneration(buffer: Uint8Array): TableGeneration 
  * (bounded by the table count). Every write is staged into a caller-supplied
  * `WriteBatch` so it commits atomically with the records that depend on it; the
  * in-memory maps update eagerly so later stages of the same batch resolve the new
- * state. A batch that never commits leaves the maps ahead of disk — harmless for a
- * mint (the unused generation is re-persisted by the next write) and self-healing
- * for a retire (the next write mints afresh and overwrites the stale record).
+ * state, and a batch that fails to commit must be followed by {@link load} (see the
+ * file header) or the maps stay ahead of disk.
  */
 export class TableIdentityStore implements TableIdentityResolver {
 	/** `joinKeyParts(schema, table)` → generation. */
@@ -100,8 +112,14 @@ export class TableIdentityStore implements TableIdentityResolver {
 
 	constructor(private readonly kv: KVStore) {}
 
-	/** Load every `tg:` record. Called once by `SyncManagerImpl.create` before any store is used. */
+	/**
+	 * (Re)load every `tg:` record, replacing whatever the maps hold. Called once by
+	 * `SyncManagerImpl.create` before any store is used, and again by any site whose
+	 * batch staged a transition and then failed to commit.
+	 */
 	async load(): Promise<void> {
+		this.byName.clear();
+		this.byGeneration.clear();
 		for await (const entry of this.kv.iterate(buildAllTableGenerationScanBounds())) {
 			const parsed = parseTableGenerationKey(entry.key);
 			if (!parsed) {
@@ -133,6 +151,10 @@ export class TableIdentityStore implements TableIdentityResolver {
 	 * that table's).
 	 */
 	ensure(schema: string, table: string, batch: WriteBatch): string {
+		// NOTE: a `tg:` record can outlive its table when the drop ran while sync was
+		// detached (the drop's migration is lost the same way), and a later same-name
+		// create then inherits the dropped incarnation's generation here. If DDL while
+		// detached ever becomes supported, reconcile `tg:` against the catalog in `load`.
 		const existing = this.generationOf(schema, table);
 		if (existing !== undefined) return existing;
 
@@ -168,6 +190,9 @@ export class TableIdentityStore implements TableIdentityResolver {
 		const generation = this.generationOf(schema, from);
 		if (generation === undefined) return;
 
+		// NOTE: on a catalog peer the engine (local) or `decideRenameTable` (replicated)
+		// already refused a rename onto an existing table, so an occupant here is a
+		// stale `tg:` record of a table dropped while sync was detached (see `ensure`).
 		const occupant = this.generationOf(schema, to);
 		if (occupant !== undefined) {
 			throw new Error(
@@ -186,6 +211,37 @@ export class TableIdentityStore implements TableIdentityResolver {
 		this.byName.set(joinKeyParts(schema, table), generation);
 		this.byGeneration.set(generation, { schema, table });
 	}
+}
+
+/**
+ * Run `body` — anything that stages identity transitions or lazy mints into batches
+ * — and re-read the identity index from disk if it throws, so the index never stays
+ * ahead of what committed (see the file header). The error is rethrown unchanged.
+ */
+export async function withIdentityRecovery<T>(tables: TableIdentityResolver, body: () => Promise<T>): Promise<T> {
+	try {
+		return await body();
+	} catch (error) {
+		await tables.load();
+		throw error;
+	}
+}
+
+/**
+ * Stage one standalone write through `stage` and commit it under
+ * {@link withIdentityRecovery} — `stage` may mint a generation into the batch. For
+ * the record stores' non-batch writers.
+ */
+export function writeIdentityBatch(
+	kv: KVStore,
+	tables: TableIdentityResolver,
+	stage: (batch: WriteBatch) => void,
+): Promise<void> {
+	return withIdentityRecovery(tables, async () => {
+		const batch = kv.batch();
+		stage(batch);
+		await batch.write();
+	});
 }
 
 /** The subset of a schema change the identity transitions read. */
