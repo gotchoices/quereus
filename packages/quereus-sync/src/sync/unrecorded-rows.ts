@@ -38,8 +38,9 @@ export async function findTablesWithUnrecordedRows(ctx: SyncContext): Promise<Ar
  *
  * NOTE: memory is excluded by name rather than store modules included by name, so a
  * wrapped or renamed store module is still checked and a wrong guess costs a refusal
- * instead of lost data. A custom module's rows therefore refuse too. If a local-only
- * module becomes common, let tables opt out rather than widening this name check.
+ * instead of lost data. A custom module's rows therefore refuse too, engine-managed
+ * tables (`quereus.engine_managed`) included. If a local-only module becomes common, let
+ * tables opt out rather than widening this name check.
  */
 function tablesToCheck(ctx: SyncContext, db: Database): Array<{ schema: string; table: string; keyColumns: readonly string[] }> {
 	const tables: Array<{ schema: string; table: string; keyColumns: readonly string[] }> = [];
@@ -72,12 +73,11 @@ async function holdsUnrecordedRow(
 	table: string,
 	keyColumns: readonly string[],
 ): Promise<boolean> {
-	const keying = ctx.getPkKeying(schema, table);
 	let suspect: string | undefined;
 	for (;;) {
 		const pk = await firstUnrecordedKey(ctx, db, schema, table, keyColumns);
 		if (!pk) return false;
-		const identity = encodePkIdentity(pk, keying);
+		const identity = encodePkIdentity(pk, ctx.getPkKeying(schema, table));
 		if (identity === suspect) return true;
 		suspect = identity;
 		await writesSettled(ctx);

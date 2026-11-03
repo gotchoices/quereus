@@ -71,6 +71,11 @@ Reuse local capture rather than writing a second recorder. Split `handleTransact
 
 Emit one `state-change` sync event with the row and table counts when any were adopted.
 
+## Constraints from the prereq's review
+
+- Adoption runs on the commit chain, so it must not call `findTablesWithUnrecordedRows`, `whenCommitsSettled` or `whenAppliesSettled` from inside its chain entry. It would wait on itself, and an apply in flight waits on the chain too.
+- `unrecordedRowsAllowSnapshot` in the client returns true while a snapshot transfer is running, so `await connect(); await requestSnapshot()` is not stopped by a scan already under way. Adoption must make the same exception: a transfer that has started clears the metadata, so every row would look unrecorded and be stamped as new.
+
 ## Quoomb Web
 
 `connectSync` in `quereus.worker.ts` passes `unrecordedRows: 'adopt'`.

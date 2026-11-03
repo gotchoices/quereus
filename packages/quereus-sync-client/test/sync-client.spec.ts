@@ -143,10 +143,15 @@ class MockSyncManager implements SyncManager {
   /** When set, findTablesWithUnrecordedRows throws this, as a scan that failed would. */
   unrecordedScanError: Error | null = null;
   unrecordedScanCalls = 0;
+  /** When set, findTablesWithUnrecordedRows stays in flight until this settles. */
+  unrecordedScanGate: Promise<void> | null = null;
+  /** When set, applyChanges stays in flight until this settles. */
+  applyChangesGate: Promise<void> | null = null;
 
   async findTablesWithUnrecordedRows(): Promise<Array<{ schema: string; table: string }>> {
     this.unrecordedScanCalls++;
     if (this.unrecordedScanError) throw this.unrecordedScanError;
+    await this.unrecordedScanGate;
     return this.unrecordedTables;
   }
 
@@ -170,6 +175,7 @@ class MockSyncManager implements SyncManager {
 
   async applyChanges(changes: ChangeSet[]): Promise<ApplyResult> {
     this.applyChangesCalls.push(changes);
+    await this.applyChangesGate;
     return this.applyChangesResult;
   }
 
@@ -2161,7 +2167,7 @@ describe('SyncClient', () => {
       /** Longer than the harness's reconnectDelayMs, so a scheduled reconnect would have fired. */
       const RECONNECT_WINDOW_MS = 150;
 
-      function refuseSnapshot(ws: MockWebSocket, serverSite: SiteId): void {
+      function sendSnapshotRequired(ws: MockWebSocket, serverSite: SiteId): void {
         ws.simulateMessage({
           type: 'snapshot_required',
           sinceHLC: serializeHLCForTransport(hlcAt(5000n, serverSite)),
@@ -2196,7 +2202,7 @@ describe('SyncClient', () => {
 
         syncManager.getChangesSinceResult = [changeSet(site, 'tx-offline', hlcAt(6000n, site))];
         syncManager.unrecordedTables = TABLES;
-        refuseSnapshot(ws, serverSite);
+        sendSnapshotRequired(ws, serverSite);
         await new Promise(r => setTimeout(r, 10));
 
         const types = ws.getSentMessages().map(m => m.type);
@@ -2217,7 +2223,7 @@ describe('SyncClient', () => {
           snapshotId: 'snap-A', siteId: serverSite, hlc: hlcAt(7000n, serverSite),
           lastTableIndex: 0, lastEntryIndex: 0, completedTables: [], entriesProcessed: 0, createdAt: 1000,
         });
-        refuseSnapshot(ws, serverSite);
+        sendSnapshotRequired(ws, serverSite);
         await new Promise(r => setTimeout(r, 10));
 
         expect(syncManager.unrecordedScanCalls).to.equal(0);
@@ -2237,6 +2243,46 @@ describe('SyncClient', () => {
         expect(ws.getSentMessages().map(m => m.type)).to.not.include('get_snapshot');
         expect(errors).to.deep.equal([scanError]);
         expect(MockWebSocket.instances).to.have.length(2);
+      });
+
+      it('an explicit requestSnapshot() started during the scan is not stopped by its verdict', async () => {
+        const syncManager = new MockSyncManager();
+        syncManager.unrecordedTables = TABLES;
+        let finishScan!: () => void;
+        syncManager.unrecordedScanGate = new Promise(resolve => { finishScan = resolve; });
+        const serverSite = generateSiteId();
+        const { client, errors } = createClient({ syncManager, bootstrapOnEmpty: true });
+        const ws = await connectAndHandshake(client, serverSite);
+        expect(syncManager.unrecordedScanCalls).to.equal(1);
+
+        const requested = client.requestSnapshot();
+        finishScan();
+        await new Promise(r => setTimeout(r, 10));
+        streamSnapshot(ws, snapshotChunks(serverSite, hlcAt(9000n, serverSite)));
+        await requested;
+
+        expect(errors).to.have.length(0);
+        expect(ws.getSentMessages().filter(m => m.type === 'get_snapshot')).to.have.length(1);
+      });
+
+      it('an apply that finishes after the refusal does not report the stopped client as synced', async () => {
+        const syncManager = new MockSyncManager();
+        const serverSite = generateSiteId();
+        syncManager.peerSyncState = hlcAt(5000n, serverSite);
+        const { client } = createClient({ syncManager });
+        const ws = await connectAndHandshake(client, serverSite);
+
+        let finishApply!: () => void;
+        syncManager.applyChangesGate = new Promise(resolve => { finishApply = resolve; });
+        ws.simulateMessage({ type: 'push_changes', changeSets: [] });
+        syncManager.unrecordedTables = TABLES;
+        sendSnapshotRequired(ws, serverSite);
+        await new Promise(r => setTimeout(r, 10));
+        expect(client.status.status).to.equal('error');
+
+        finishApply();
+        await new Promise(r => setTimeout(r, 10));
+        expect(client.status.status).to.equal('error');
       });
 
       it("'replace' takes the snapshot without scanning", async () => {

@@ -331,15 +331,8 @@ export class SyncClient {
     // Reject any pending connect() promise
     this.settleConnect(new Error('Disconnected'));
 
-    // Clear timers
     this.clearReconnectTimer();
-    this.clearDebounceTimer();
-
-    // Remove local change listener
-    if (this.localChangeUnsubscribe) {
-      this.localChangeUnsubscribe();
-      this.localChangeUnsubscribe = null;
-    }
+    this.stopWatchingLocalChanges();
 
     // Close WebSocket. Detach handlers first so its deferred onclose can't
     // fire back into the client after we've torn down.
@@ -538,11 +531,14 @@ export class SyncClient {
    * Stop for good, until the next explicit connect(): a lasting `error` status, no
    * reconnect, and the pending connect() (if any) rejected. For a condition a bare
    * reconnect cannot fix. A pending reconnect timer is cancelled too, since the
-   * connect() it fires would clear stopReconnect.
+   * connect() it fires would clear stopReconnect. The local-change listener goes as
+   * well: nothing can be pushed from here, an app may replace this client without
+   * disconnecting it, and the next handshake subscribes again.
    */
   private stopWithError(error: Error): void {
     this.stopReconnect = true;
     this.clearReconnectTimer();
+    this.stopWatchingLocalChanges();
     this.setStatus({ status: 'error', message: error.message });
     this.emitSyncEvent('error', error.message);
     this.options.onError?.(error);
@@ -612,7 +608,10 @@ export class SyncClient {
     }
 
     this.options.onRemoteChanges?.(result, changeSets);
-    this.setStatus({ status: 'synced', lastSyncTime: Date.now() });
+    // A stop that landed while this apply finished outranks it: the socket is gone.
+    if (!this.stopReconnect) {
+      this.setStatus({ status: 'synced', lastSyncTime: Date.now() });
+    }
   }
 
   private async handleApplyResult(message: {
@@ -748,7 +747,7 @@ export class SyncClient {
   // Snapshot bootstrap
   // ==========================================================================
   //
-  // NOTE: this file is ~1370 lines; this section is ~300 of them and is the
+  // NOTE: this file is ~1450 lines; this section is ~300 of them and is the
   // natural extraction seam — it touches the rest of the client only through
   // `send`, `setStatus`, `emitSyncEvent`, `syncManager` and `ws`. If the file
   // grows much further, lift it into a `SnapshotBootstrap` collaborator that
@@ -814,7 +813,8 @@ export class SyncClient {
       return;
     }
 
-    // Ahead of the push, so a device that is about to stop has sent nothing.
+    // Ahead of the push, so a device that is about to stop does not first drain its
+    // work to the server. (The handshake's own first push has already gone by now.)
     if (!await this.unrecordedRowsAllowSnapshot()) return;
 
     this.emitSyncEvent(
@@ -976,9 +976,15 @@ export class SyncClient {
    *
    * A scan that fails is not a verdict, so it retries through the reconnect rather
    * than stopping for good. Either way no snapshot follows.
+   *
+   * A transfer already running settles it the other way, whether it was there first or
+   * started during the scan: in practice an explicit {@link requestSnapshot} starts one
+   * meanwhile (`await connect(); await requestSnapshot()` does), the caller asked for
+   * that full replace, its header makes the scan's answer meaningless, and the caller
+   * here simply joins it.
    */
   private async unrecordedRowsAllowSnapshot(): Promise<boolean> {
-    if (this.options.unrecordedRows === 'replace') return true;
+    if (this.options.unrecordedRows === 'replace' || this.snapshotTransferPromise) return true;
 
     // A reconnect or disconnect can replace `this.ws` during the scan. The verdict
     // then belongs to nobody: the new socket's handshake decides for itself.
@@ -992,7 +998,7 @@ export class SyncClient {
       return false;
     }
     if (this.ws !== socket) return false;
-    if (tables.length === 0) return true;
+    if (tables.length === 0 || this.snapshotTransferPromise) return true;
 
     this.stopWithError(new UnrecordedRowsError(tables));
     return false;
@@ -1280,6 +1286,12 @@ export class SyncClient {
   // ==========================================================================
   // Private: Local Change Handling
   // ==========================================================================
+
+  private stopWatchingLocalChanges(): void {
+    this.clearDebounceTimer();
+    this.localChangeUnsubscribe?.();
+    this.localChangeUnsubscribe = null;
+  }
 
   private subscribeToLocalChanges(): void {
     // Unsubscribe from previous if any
