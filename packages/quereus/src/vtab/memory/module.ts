@@ -1206,6 +1206,8 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 			throw new QuereusError(`Memory table '${tableName}' not found in schema '${schemaName}'. Cannot alter.`, StatusCode.ERROR);
 		}
 
+		// The pre-ALTER schema: the event below names the key an ALTER PRIMARY KEY retires.
+		const before = manager.tableSchema;
 		switch (change.type) {
 			case 'addColumn':
 				await manager.addColumn(change.columnDef, change.backfillEvaluator, change.insertAtIndex);
@@ -1250,7 +1252,7 @@ export class MemoryTableModule implements VirtualTableModule<MemoryTable, Memory
 		// announce nothing. See `SchemaChangeInfo.ddl`; mirrors the store module's gate.
 		if (change.ddl !== undefined) {
 			this.eventEmitter?.emitSchemaChange?.({
-				...alterEventShape(change),
+				...alterEventShape(change, before),
 				schemaName,
 				objectName: tableName,
 				ddl: change.ddl,

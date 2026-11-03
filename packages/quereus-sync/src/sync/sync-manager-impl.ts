@@ -5,7 +5,7 @@
  * Delegates to focused sub-modules for snapshot, streaming, and change application.
  */
 
-import type { KVStore, WriteBatch } from '@quereus/store';
+import { BUILTIN_KEY_NORMALIZER_RESOLVER, type KVStore, type WriteBatch } from '@quereus/store';
 import type {
 	SqlValue,
 	Row,
@@ -56,7 +56,7 @@ import {
 	type PkKeying,
 } from '../metadata/keys.js';
 import { migrationObjectKind } from './protocol.js';
-import { createPkKeyingResolver, type PkKeyingResolver } from '../metadata/pk-identity.js';
+import { createPkKeyingResolver, resolvePkKeying, type PkKeyingResolver } from '../metadata/pk-identity.js';
 import { TableIdentityStore, withIdentityRecovery } from '../metadata/table-identity.js';
 import type { SyncManager, SnapshotCheckpoint } from './manager.js';
 import type {
@@ -81,6 +81,8 @@ import { persistHLCStateBatch, toError, deleteRowVersionsAndLogEntries } from '.
 import { StagedTransactionMetadata } from './staged-transaction-metadata.js';
 import { applyChanges as applyChangesImpl, drainHeldChanges as drainHeldChangesImpl, drainReappearedTables } from './change-applicator.js';
 import { buildTransactionChangeSets } from './change-grouping.js';
+import { isAlterPrimaryKeyDDL } from './migration-ddl.js';
+import { rekeyTableBookkeeping, reportRekeyOutcome, type RekeyCounts } from './rekey-on-pk-change.js';
 import { getSnapshot as getSnapshotImpl, applySnapshot as applySnapshotImpl } from './snapshot.js';
 import {
 	getSnapshotStream as getSnapshotStreamImpl,
@@ -159,6 +161,18 @@ export function mapSchemaMigrationType(event: DatabaseSchemaChangeEvent): Schema
 }
 
 /**
+ * The engine behind a transaction source, when it is one. `TransactionCommitSource` is
+ * the narrow slice the capture subscribes to; the primary-key re-key pass also has to
+ * READ the table (`rekey-on-pk-change.ts`), which only a full `Database` can do.
+ * Structural rather than `instanceof`, so a second copy of the engine package in a
+ * host bundle does not hide the database.
+ */
+function databaseOf(source: TransactionCommitSource | undefined): Database | undefined {
+	const candidate = source as Partial<Database> | undefined;
+	return typeof candidate?.eval === 'function' && typeof candidate.exec === 'function' ? (source as Database) : undefined;
+}
+
+/**
  * Implementation of SyncManager.
  *
  * Acts as a coordinator/facade that delegates snapshot, streaming,
@@ -188,6 +202,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 * `getTableSchema` oracle was wired (relay-only deployment).
 	 */
 	private readonly pkKeying: PkKeyingResolver;
+	/** The collation resolver the keying is built with — re-used to derive a RETIRED key's keying. */
+	private readonly keyNormalizerResolver: KeyNormalizerResolver;
+	/** See {@link SyncContext.db}. */
+	readonly db?: Database;
 
 	// Tail-promise chain serializing commit recording. Each commit chains onto the
 	// prior handler's completion so N+1's dedup reads see N's durable writes,
@@ -222,6 +240,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		getTableSchema?: GetTableSchemaCallback,
 		dropLocalTable?: DropLocalTableCallback,
 		keyNormalizerResolver?: KeyNormalizerResolver,
+		db?: Database,
 	) {
 		this.kv = kv;
 		this.config = config;
@@ -230,7 +249,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		this.applyToStore = applyToStore;
 		this.getTableSchema = getTableSchema;
 		this.dropLocalTable = dropLocalTable;
+		this.db = db;
 		this.pkKeying = createPkKeyingResolver(getTableSchema, keyNormalizerResolver);
+		// Same default `createPkKeyingResolver` applies, so a retired key resolves exactly as the live one did.
+		this.keyNormalizerResolver = keyNormalizerResolver ?? BUILTIN_KEY_NORMALIZER_RESOLVER;
 		// Loaded by `create()` before any store is used; every per-row record store
 		// resolves its key's table component through it.
 		this.tableIdentity = new TableIdentityStore(kv);
@@ -328,7 +350,10 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 		}
 
 		const hlcManager = new HLCManager(siteId, hlcState);
-		const manager = new SyncManagerImpl(kv, config, hlcManager, syncEvents, applyToStore, getTableSchema, dropLocalTable, keyNormalizerResolver);
+		const manager = new SyncManagerImpl(
+			kv, config, hlcManager, syncEvents, applyToStore, getTableSchema, dropLocalTable, keyNormalizerResolver,
+			databaseOf(transactionSource),
+		);
 
 		// The name ↔ generation map is bounded by the table count, so it is held whole
 		// in memory; load it before the first commit can be captured below.
@@ -382,6 +407,27 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 	 */
 	getTableColumnNames(schema: string, table: string): readonly string[] | undefined {
 		return this.getTableSchema?.(schema, table)?.columns?.map(c => c.name);
+	}
+
+	/** See {@link SyncContext.getTableKeyColumns}. */
+	getTableKeyColumns(schema: string, table: string): readonly string[] | undefined {
+		const tableSchema = this.getTableSchema?.(schema, table);
+		// `?.` on a non-optional field: test oracles stub `{ columns }`-only schemas.
+		return tableSchema?.primaryKeyDefinition?.map(def => tableSchema.columns[def.index].name);
+	}
+
+	/** See {@link SyncContext.getRetiredPkKeying}. */
+	getRetiredPkKeying(schema: string, table: string, keyColumns: readonly string[]): PkKeying | undefined {
+		const tableSchema = this.getTableSchema?.(schema, table);
+		if (!tableSchema) return undefined;
+		const primaryKeyDefinition: Array<{ index: number }> = [];
+		for (const name of keyColumns) {
+			const index = tableSchema.columnIndexMap.get(name.toLowerCase());
+			if (index === undefined) return undefined;
+			primaryKeyDefinition.push({ index });
+		}
+		// The same per-column recipe the live keying uses, over the retired key's columns.
+		return resolvePkKeying({ ...tableSchema, primaryKeyDefinition }, this.keyNormalizerResolver);
 	}
 
 	/**
@@ -783,10 +829,16 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 			// depend on it commit together.
 			this.applyLocalTableTransitions(kvBatch, localSchema);
 
-			// DDL before DML: migrations take the lowest opSeqs.
+			// DDL before DML: migrations take the lowest opSeqs. A primary-key change also
+			// re-files the table's existing records here, BEFORE the data events below — the
+			// engine already re-keyed those, so they must overwrite re-filed records, not the
+			// reverse — and is reported only once the batch has committed.
 			const versionCounters = new Map<string, number>();
+			const rekeyed: Array<{ schema: string; table: string; counts: RekeyCounts }> = [];
 			for (const event of localSchema) {
 				await this.recordSchemaMigration(kvBatch, event, nextHlc, versionCounters);
+				const counts = await this.rekeyOnLocalKeyChange(kvBatch, event, staged);
+				if (counts) rekeyed.push({ schema: event.schemaName, table: event.objectName, counts });
 			}
 
 			for (const event of localData) {
@@ -798,6 +850,7 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 
 			await kvBatch.write();
 
+			for (const { schema, table, counts } of rekeyed) reportRekeyOutcome(this, schema, table, counts);
 			this.syncEvents.emitLocalChange({
 				transactionId,
 				changes,
@@ -842,6 +895,30 @@ export class SyncManagerImpl implements SyncManager, SyncContext {
 				this.tableIdentity.move(event.schemaName, event.oldObjectName, event.objectName, batch);
 			}
 		}
+	}
+
+	/**
+	 * Re-file a table's bookkeeping when a LOCAL `alter`/`table` event is an ALTER
+	 * PRIMARY KEY (`rekey-on-pk-change.ts`): staged into the transaction's own `batch`,
+	 * and noted into `staged` so a later event of the same transaction reads the re-filed
+	 * version rather than committed storage. The retired key comes from the event itself
+	 * (`oldKeyColumns`) — the catalog has already swapped by the time the capture runs.
+	 */
+	private async rekeyOnLocalKeyChange(
+		batch: WriteBatch,
+		event: DatabaseSchemaChangeEvent,
+		staged: StagedTransactionMetadata,
+	): Promise<RekeyCounts | undefined> {
+		if (event.objectType !== 'table' || event.type !== 'alter' || event.oldObjectName !== undefined) return undefined;
+		if (!isAlterPrimaryKeyDDL(event.ddl)) return undefined;
+		if (event.oldKeyColumns === undefined) {
+			console.warn(
+				`[Sync] ${event.schemaName}.${event.objectName}: primary key changed but the event does not name the retired key `
+					+ `(a module announcing without the pre-ALTER schema) — sync bookkeeping for its existing rows cannot be re-filed`,
+			);
+			return undefined;
+		}
+		return rekeyTableBookkeeping(this, event.schemaName, event.objectName, event.oldKeyColumns, batch, staged);
 	}
 
 	/**

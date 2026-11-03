@@ -103,6 +103,7 @@ interface DatabaseSchemaChangeEvent {
   oldObjectName?: string;   // Pre-rename table name (ALTER TABLE ... RENAME TO only)
   columnName?: string;      // For column operations
   oldColumnName?: string;   // Pre-rename column name (RENAME COLUMN only)
+  oldKeyColumns?: string[]; // Retired key's column names, in key order (ALTER PRIMARY KEY only)
   ddl?: string;             // DDL statement if available — always set for ALTER TABLE
   remote: boolean;          // true if from sync/remote source
 }
@@ -187,15 +188,17 @@ A subscriber must see the same facts whichever backend holds the table, so the p
 `type` / `objectType` / `columnName` / `oldColumnName` of an `ALTER TABLE` announcement is a
 contract, not a module's choice — see [usage.md § What each `ALTER TABLE` arm
 reports](usage.md#what-each-alter-table-arm-reports) for the table. Derive it from the
-`SchemaChangeInfo` you were handed with the exported `alterEventShape(change)` instead of
-writing the triple out per arm; you supply only the rest of the event:
+`SchemaChangeInfo` you were handed with the exported `alterEventShape(change, before)` instead
+of writing the triple out per arm — `before` is the table's schema as it was when you were
+called, which is how an ALTER PRIMARY KEY announcement comes to name the key it retired
+(`oldKeyColumns`); you supply only the rest of the event:
 
 ```typescript
 import { alterEventShape } from '@quereus/quereus';
 
 if (change.ddl !== undefined) {
   this.eventEmitter?.emitSchemaChange?.({
-    ...alterEventShape(change),
+    ...alterEventShape(change, oldSchema),
     schemaName,
     objectName: tableName,   // the TABLE, even for a column arm
     ddl: change.ddl,

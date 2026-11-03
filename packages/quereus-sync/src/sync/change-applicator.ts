@@ -14,6 +14,8 @@ import type { ColumnVersion } from '../metadata/column-version.js';
 import type { Tombstone } from '../metadata/tombstones.js';
 import { encodePkIdentity, joinKeyParts, RAW_PK_KEYING } from '../metadata/keys.js';
 import { applySchemaChangeTransitions } from '../metadata/table-identity.js';
+import { isAlterPrimaryKeyDDL } from './migration-ddl.js';
+import { rekeyTableBookkeeping, reportRekeyOutcome } from './rekey-on-pk-change.js';
 import type {
 	ChangeSet,
 	Change,
@@ -331,6 +333,11 @@ export async function applyChanges(
 		applied++;
 	}
 
+	// The key definitions this batch's ALTER PRIMARY KEY migrations are about to RETIRE,
+	// read before Phase 2 swaps the catalog: the re-key pass in Phase 3 needs them to
+	// find each existing record's row (`rekey-on-pk-change.ts`).
+	const retiredKeys = captureRetiredKeyColumns(ctx, schemaChangesToApply);
+
 	// What the batch's schema steps leave behind, simulated over the migrations Phase 1a
 	// actually KEPT and seeded from what the receiver has now — so the verdict below
 	// agrees with the catalog the DDL will be decided against.
@@ -469,6 +476,11 @@ export async function applyChanges(
 				await identityBatch.write();
 			}
 
+			// Every table whose primary key Phase 2 actually REDEFINED has its existing
+			// records re-filed under the new key now — before this batch's own records are
+			// filed below, so those overwrite re-filed ones, never the reverse.
+			await rekeyAfterReplicatedKeyChange(ctx, executed, retiredKeys, resolvedDataChanges);
+
 			await commitChangeMetadata(ctx, resolvedDataChanges);
 
 			// Commit schema migration metadata
@@ -574,6 +586,74 @@ export async function applyChanges(
 		transactions: changes.length,
 		...(unknownTableCount > 0 ? { unknownTable: unknownTableCount } : {}),
 	};
+}
+
+/**
+ * The primary-key column names each table's records are filed under, for every table
+ * this batch carries an `alter primary key` migration for — read from the catalog
+ * BEFORE Phase 2 runs that DDL. A table the batch also creates has no records and no
+ * schema yet, and resolves to nothing; two key changes for one table in a batch share
+ * the first retired key (that is where the records are).
+ */
+function captureRetiredKeyColumns(
+	ctx: SyncContext,
+	changes: readonly SchemaChangeToApply[],
+): Map<string, readonly string[]> {
+	const retired = new Map<string, readonly string[]>();
+	for (const change of changes) {
+		if (change.type !== 'alter_column' || !isAlterPrimaryKeyDDL(change.ddl)) continue;
+		const key = tableKey(change.schema, change.table);
+		if (retired.has(key)) continue;
+		const columns = ctx.getTableKeyColumns(change.schema, change.table);
+		if (columns) retired.set(key, columns);
+	}
+	return retired;
+}
+
+/**
+ * Phase 3 step for the `alter primary key` migrations Phase 2 actually RAN: re-file
+ * each such table's bookkeeping (`rekey-on-pk-change.ts`) in its own batch, then
+ * re-read the prior version / tombstone of every applied change on those tables.
+ *
+ * Phase 1 resolved the batch's changes under the PRE-change keying while their pks —
+ * recorded by the sender after its own key change — are under the new one, so it found
+ * no prior for any of them. The pass has just made those priors addressable; without
+ * re-reading them `commitChangeMetadata` would leave each prior's `cl:` entry behind,
+ * pointing at a record whose HLC it no longer matches (the LOAD-BEARING INVARIANT of
+ * `collectChangesSince`). The last-writer decision itself is not revisited — the data
+ * is already written — which is the concurrent-DDL-versus-data race docs/sync.md
+ * § Tombstones leaves open.
+ */
+async function rekeyAfterReplicatedKeyChange(
+	ctx: SyncContext,
+	executed: readonly SchemaChangeToApply[],
+	retiredKeys: ReadonlyMap<string, readonly string[]>,
+	resolved: ResolvedChange[],
+): Promise<void> {
+	const rekeyedTables = new Set<string>();
+	for (const change of executed) {
+		if (change.type !== 'alter_column' || !isAlterPrimaryKeyDDL(change.ddl)) continue;
+		const key = tableKey(change.schema, change.table);
+		const oldKeyColumns = retiredKeys.get(key);
+		if (oldKeyColumns === undefined || rekeyedTables.has(key)) continue;
+		const batch = ctx.kv.batch();
+		const counts = await rekeyTableBookkeeping(ctx, change.schema, change.table, oldKeyColumns, batch);
+		if (!counts) continue;
+		await batch.write();
+		rekeyedTables.add(key);
+		reportRekeyOutcome(ctx, change.schema, change.table, counts);
+	}
+	if (rekeyedTables.size === 0) return;
+
+	for (const entry of resolved) {
+		if (entry.outcome !== 'applied' || !rekeyedTables.has(tableKey(entry.change.schema, entry.change.table))) continue;
+		const { change } = entry;
+		if (change.type === 'delete') {
+			entry.oldTombstone = await ctx.tombstones.getTombstone(change.schema, change.table, change.pk);
+		} else {
+			entry.oldColumnVersion = await ctx.columnVersions.getColumnVersion(change.schema, change.table, change.pk, change.column);
+		}
+	}
 }
 
 /**

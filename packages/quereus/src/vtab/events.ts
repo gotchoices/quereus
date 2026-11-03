@@ -67,6 +67,14 @@ export interface VTableSchemaChangeEvent {
 	columnName?: string;
 	/** Old column name (for column rename) */
 	oldColumnName?: string;
+	/**
+	 * ALTER PRIMARY KEY only: the column names of the key being RETIRED, in key order
+	 * (`ddl` carries the new one). The event is delivered after the catalog has
+	 * swapped, so this is the only place the old key is still named — a subscriber
+	 * that files anything under the row key (the sync engine's per-row bookkeeping)
+	 * re-files from it.
+	 */
+	oldKeyColumns?: string[];
 	/** DDL statement if available */
 	ddl?: string;
 	/** True if event originated from sync/remote source */

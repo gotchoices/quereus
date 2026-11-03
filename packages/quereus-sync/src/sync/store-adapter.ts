@@ -124,6 +124,7 @@ import type {
   SchemaChangeToApply,
 } from './protocol.js';
 import { toError } from './sync-context.js';
+import { parseMigrationDDL } from './migration-ddl.js';
 
 /**
  * Options for creating a SyncStoreAdapter.
@@ -664,25 +665,6 @@ type AlterTableStmt = Extract<ReturnType<Parser['parse']>, { type: 'alterTable' 
 type ColumnDef = Extract<AlterTableStmt['action'], { type: 'addColumn' }>['column'];
 
 /**
- * Parse one replicated migration's DDL with the engine's own parser, returning
- * either the statement or the parse failure — never throwing, and never deciding
- * what a failure means: each caller does that for itself ({@link decideAlterTable}
- * logs it and executes the text as-is; {@link validatesExistingRows} treats an
- * unparseable migration as non-validating). Shared so the idempotency decision and
- * the apply-phase classifier read one migration the same way.
- */
-function parseMigrationDDL(ddl: string): {
-  stmt?: ReturnType<Parser['parse']>;
-  parseError?: Error;
-} {
-  try {
-    return { stmt: new Parser().parse(ddl) };
-  } catch (e) {
-    return { parseError: toError(e) };
-  }
-}
-
-/**
  * Does this migration VALIDATE the rows the receiver already holds — i.e. is it
  * legal only against a row set the same batch may still be delivering?
  *
@@ -973,13 +955,11 @@ function decideAlterTable(db: Database, change: SchemaChangeToApply): SchemaChan
       return 'execute';
     }
     case 'alterPrimaryKey': {
-      // NOTE: replicating a PK change re-keys the table on EVERY peer, and sync's
-      // cv:/tb:/cl: metadata is filed under the row's old pk identity — so conflict
-      // resolution for existing rows silently restarts from empty. The table
-      // component of those keys now survives (it is the table's generation, not its
-      // name), but the row component does not; re-filing it is the sibling ticket
-      // `sync-rekey-bookkeeping-on-primary-key-change`, which runs its pass from the
-      // executed list this adapter returns.
+      // Replicating a PK change re-keys the table on EVERY peer; the per-row sync
+      // bookkeeping filed under the old key is re-filed by the applicator's Phase 3
+      // pass (`rekey-on-pk-change.ts`), driven by the executed list this adapter
+      // returns — so an `already-applied` verdict here (the receiver's own local DDL
+      // did it, and its capture re-filed) correctly runs no pass.
       const wanted = action.columns;
       const current = local.primaryKeyDefinition;
       const same = wanted.length === current.length && wanted.every((w, i) => {
@@ -1195,6 +1175,16 @@ async function mergeColumnUpdates(
     row = [...existing];
   } else {
     row = new Array<SqlValue>(tableSchema.columns.length).fill(null);
+    // NOTE: `pk` is projected onto the CURRENT key definition, which is the only one
+    // this receiver knows. A change recorded by a peer that had not yet applied an
+    // `alter primary key` this receiver has — or already on the wire when it landed
+    // here — carries pk values under the OLD definition and is mis-addressed here (a
+    // short pk leaves `undefined` cells; a same-length one names the wrong row). The
+    // receiver cannot tell which definition the sender used: the concurrent-DDL-
+    // versus-data race docs/sync.md § Tombstones leaves open. A change that carried
+    // the sender's schema version for the table (the `sm:` version counters exist)
+    // would make it detectable; until then the sync peers must quiesce writes to a
+    // table around a key change.
     for (let i = 0; i < tableSchema.primaryKeyDefinition.length; i++) {
       row[tableSchema.primaryKeyDefinition[i].index] = pk[i];
     }

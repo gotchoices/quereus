@@ -19,6 +19,8 @@ export interface AlterSchemaEventShape {
 	columnName?: string;
 	/** RENAME COLUMN only: the name it had before. */
 	oldColumnName?: string;
+	/** ALTER PRIMARY KEY only: the retired key's column names, in key order. */
+	oldKeyColumns?: string[];
 	/** Canonical, fully-qualified SQL of the statement — the node's plan-build
 	 *  rendering (`AlterTableNode.sql` / `AddConstraintNode.sql`), so the auto
 	 *  path announces the identical text an emitter-backed module does. */

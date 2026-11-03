@@ -54,6 +54,8 @@ function shape(e: DatabaseSchemaChangeEvent): string {
 	const parts = [e.type, e.objectType, e.objectName];
 	if (e.columnName !== undefined) parts.push(e.columnName);
 	if (e.oldColumnName !== undefined) parts.push(e.oldColumnName);
+	// The retired key an ALTER PRIMARY KEY names — part of the cross-backend contract too.
+	if (e.oldKeyColumns !== undefined) parts.push(`key(${e.oldKeyColumns.join(',')})`);
 	return parts.join('/');
 }
 
@@ -453,7 +455,7 @@ describe('Store-backed ALTER TABLE: the schema-change event describes the altera
 		await assertSingleEvent(
 			'alter table orders alter primary key (id)',
 			'alter table orders alter primary key (id)',
-			'alter/table/orders');
+			'alter/table/orders/key(id)');
 		await assertSingleEvent(
 			'alter table orders drop column w',
 			'alter table orders drop column w',
@@ -668,7 +670,7 @@ describe('Store-backed and memory-backed ALTER TABLE deliver the same schema-eve
 			'alter/table/orders',
 			'alter/table/orders',
 			'alter/table/orders',
-			'alter/table/orders',
+			'alter/table/orders/key(id)',
 			'drop/column/orders/w',
 			'alter/table/orders2',
 		]);

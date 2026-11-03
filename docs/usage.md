@@ -503,6 +503,7 @@ The `DatabaseSchemaChangeEvent` interface:
 | `oldObjectName` | `string` | Previous table name (`alter table … rename to` only) |
 | `columnName` | `string` | Column name (for column operations) |
 | `oldColumnName` | `string` | Previous column name (for renames) |
+| `oldKeyColumns` | `string[]` | Column names of the retired key, in key order (`alter table … alter primary key` only) |
 | `ddl` | `string` | DDL statement if available |
 | `remote` | `boolean` | `true` if the change originated from a remote source |
 
@@ -554,6 +555,11 @@ fallback, so a subscriber sees the same facts either way:
 | `rename constraint` | `alter` | `table` | table | — | — |
 
 Note `drop column` reports `type: 'drop'`, not `'alter'` — the arm removes an object.
+
+`alter primary key` additionally carries `oldKeyColumns` — the retired key's column names, in
+key order. `ddl` names only the new key, and the catalog has already swapped by the time the
+event is delivered, so this is the one place the old key is still named; a subscriber that
+files anything under the row key (the sync engine's per-row bookkeeping) re-files from it.
 
 Every arm above also sets `ddl` to the statement's **canonical, schema-qualified SQL** — the
 text a replicating peer re-executes to reproduce the alteration. The engine renders it once at

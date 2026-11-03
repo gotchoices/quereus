@@ -14,6 +14,7 @@
  */
 
 import { expect } from 'chai';
+import type { PrimaryKeyRekeyedEvent } from '../../src/sync/events.js';
 import {
 	closePeer,
 	collect,
@@ -56,7 +57,7 @@ async function runDeleteVsStaleEditRace(
 	await relayAll(b, a);
 }
 
-describe('sync bookkeeping follows the table across a rename', () => {
+describe('sync bookkeeping follows the table across a rename and its rows across a primary-key change', () => {
 	let a: Peer;
 	let b: Peer;
 
@@ -83,6 +84,42 @@ describe('sync bookkeeping follows the table across a rename', () => {
 
 		expect(await collect(a.db, 'select id from orders2'), 'a has no row 1').to.deep.equal([]);
 		expect(await collect(b.db, 'select id from orders2'), 'b has no row 1').to.deep.equal([]);
+	});
+
+	it('a primary-key change between the delete and the exchange still lets the delete win on both peers', async () => {
+		await runDeleteVsStaleEditRace(a, b, async () => {
+			await localWrite(a, 'alter table orders alter primary key (id, extra)');
+		});
+
+		expect(await collect(a.db, 'select id from orders'), 'a has no row 1').to.deep.equal([]);
+		expect(await collect(b.db, 'select id from orders'), 'b has no row 1').to.deep.equal([]);
+	});
+
+	// The live-row arm: a's newer edit must beat b's older one on both peers, and the
+	// key change must not leave b anything stale to ship. Without the re-key pass b's
+	// stale cell stays filed under the old key and travels back to a addressed by a
+	// one-column pk a's re-keyed table cannot resolve.
+	it('a primary-key change between a newer edit and the exchange still lets the newer edit win on both peers', async () => {
+		await localWrite(a, "insert into orders (id, note, extra) values (1, 'one', 'x')");
+		await localWrite(a, "insert into orders (id, note, extra) values (2, 'two', 'y')");
+		await relayAll(a, b);
+		await localWrite(b, "update orders set note = 'stale' where id = 2");
+		await localWrite(a, "update orders set note = 'fresh' where id = 2");
+
+		const rekeys: PrimaryKeyRekeyedEvent[] = [];
+		a.manager.getEventEmitter().onPrimaryKeyRekeyed(e => rekeys.push(e));
+		await localWrite(a, 'alter table orders alter primary key (id, extra)');
+		expect(rekeys, 'a re-filed every cell of both rows and dropped nothing').to.deep.equal([{
+			schema: 'main', table: 'orders',
+			cellsRekeyed: 6, rowsRekeyed: 2, rowsDropped: 0, tombstonesRekeyed: 0, tombstonesDropped: 0,
+		}]);
+
+		await relayAll(a, b);
+		await relayAll(b, a);
+
+		const expected = [{ id: 1, note: 'one' }, { id: 2, note: 'fresh' }];
+		expect(await collect(a.db, 'select id, note from orders order by id'), 'a').to.deep.equal(expected);
+		expect(await collect(b.db, 'select id, note from orders order by id'), 'b').to.deep.equal(expected);
 	});
 });
 

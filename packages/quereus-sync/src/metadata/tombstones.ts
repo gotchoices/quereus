@@ -165,7 +165,9 @@ export class TombstoneStore {
    * persisted as best-effort audit/undo metadata. The key's pk IDENTITY is always
    * derived locally — no caller-supplied-identity variant exists (see
    * `ColumnVersionStore.setColumnVersionBatch`). The table generation is ensured
-   * into the same batch.
+   * into the same batch. `createdAt` is only for a tombstone being RE-FILED under a
+   * new key (`sync/rekey-on-pk-change.ts`), which keeps its original TTL clock; every
+   * other caller omits it and the tombstone is dated now.
    */
   setTombstoneBatch(
     batch: WriteBatch,
@@ -173,11 +175,12 @@ export class TombstoneStore {
     tableName: string,
     pk: SqlValue[],
     hlc: HLC,
-    priorRow?: Row
+    priorRow?: Row,
+    createdAt: number = Date.now()
   ): void {
     const identity = this.identity(schemaName, tableName, pk);
     const generation = this.tables.ensure(schemaName, tableName, batch);
-    const tombstone: Tombstone = { hlc, createdAt: Date.now(), pk, ...(priorRow !== undefined ? { priorRow } : {}) };
+    const tombstone: Tombstone = { hlc, createdAt, pk, ...(priorRow !== undefined ? { priorRow } : {}) };
     batch.put(buildTombstoneKey(generation, identity), serializeTombstone(tombstone));
   }
 

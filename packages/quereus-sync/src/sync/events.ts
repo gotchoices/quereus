@@ -181,6 +181,30 @@ export interface HeldChangesDrainedEvent {
 }
 
 /**
+ * Fired once per table whose per-row sync bookkeeping was re-filed after its primary
+ * key was redefined (`alter table … alter primary key`), by local DDL or replicated
+ * DDL alike — see `sync/rekey-on-pk-change.ts` and docs/sync.md § Tombstones. The
+ * dropped counts are the key change's cost: cell versions of rows the table no longer
+ * held, and tombstones whose new key could not be determined (no usable before-image,
+ * or a key a live row now owns) — those deletions no longer protect against a stale
+ * write from a peer.
+ */
+export interface PrimaryKeyRekeyedEvent {
+  readonly schema: string;
+  readonly table: string;
+  /** Cell versions re-filed under their row's new key. */
+  readonly cellsRekeyed: number;
+  /** Live rows whose cell versions were re-filed. */
+  readonly rowsRekeyed: number;
+  /** Rows whose cell versions were dropped because the table no longer holds them. */
+  readonly rowsDropped: number;
+  /** Tombstones re-filed under the deleted row's new key, projected from its before-image. */
+  readonly tombstonesRekeyed: number;
+  /** Tombstones dropped: no usable before-image, or a new key a live row now owns. */
+  readonly tombstonesDropped: number;
+}
+
+/**
  * Sync connection state.
  */
 export type SyncState =
@@ -261,6 +285,13 @@ export interface SyncEventEmitter {
    * after the table reappeared in the local basis (the drain sweep).
    */
   onHeldChangesDrained(listener: (event: HeldChangesDrainedEvent) => void): Unsubscribe;
+
+  /**
+   * Subscribe to primary-key re-key events.
+   * Fired once per table whose sync bookkeeping was re-filed after its primary key
+   * was redefined, with what was re-filed and what the change cost.
+   */
+  onPrimaryKeyRekeyed(listener: (event: PrimaryKeyRekeyedEvent) => void): Unsubscribe;
 }
 
 // ============================================================================
@@ -280,6 +311,7 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   private basisTableLifecycleListeners = new Set<(event: BasisTableLifecycleEvent) => void>();
   private basisTableEvictedListeners = new Set<(event: BasisTableEvictedEvent) => void>();
   private heldChangesDrainedListeners = new Set<(event: HeldChangesDrainedEvent) => void>();
+  private primaryKeyRekeyedListeners = new Set<(event: PrimaryKeyRekeyedEvent) => void>();
 
   onRemoteChange(listener: (event: RemoteChangeEvent) => void): Unsubscribe {
     this.remoteChangeListeners.add(listener);
@@ -324,6 +356,11 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
   onHeldChangesDrained(listener: (event: HeldChangesDrainedEvent) => void): Unsubscribe {
     this.heldChangesDrainedListeners.add(listener);
     return () => this.heldChangesDrainedListeners.delete(listener);
+  }
+
+  onPrimaryKeyRekeyed(listener: (event: PrimaryKeyRekeyedEvent) => void): Unsubscribe {
+    this.primaryKeyRekeyedListeners.add(listener);
+    return () => this.primaryKeyRekeyedListeners.delete(listener);
   }
 
   // Internal emit methods
@@ -378,6 +415,12 @@ export class SyncEventEmitterImpl implements SyncEventEmitter {
 
   emitHeldChangesDrained(event: HeldChangesDrainedEvent): void {
     for (const listener of this.heldChangesDrainedListeners) {
+      listener(event);
+    }
+  }
+
+  emitPrimaryKeyRekeyed(event: PrimaryKeyRekeyedEvent): void {
+    for (const listener of this.primaryKeyRekeyedListeners) {
       listener(event);
     }
   }

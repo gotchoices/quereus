@@ -6,12 +6,16 @@
 
 import type { SchemaChangeInfo } from './module.js';
 import type { VTableSchemaChangeEvent } from './events.js';
+import type { TableSchema } from '../schema/table.js';
 
 /** The fields of a schema-change event that an ALTER TABLE arm decides. */
 export type AlterEventShape = Pick<
 	VTableSchemaChangeEvent,
-	'type' | 'objectType' | 'columnName' | 'oldColumnName'
+	'type' | 'objectType' | 'columnName' | 'oldColumnName' | 'oldKeyColumns'
 >;
+
+/** What {@link alterEventShape} reads off the pre-ALTER schema: the key an ALTER PRIMARY KEY retires. */
+export type AlterEventShapeBefore = Pick<TableSchema, 'columns' | 'primaryKeyDefinition'>;
 
 /**
  * Derive the `type` / `objectType` / column naming of an `ALTER TABLE` announcement:
@@ -23,6 +27,12 @@ export type AlterEventShape = Pick<
  * The caller supplies the rest of the event (`schemaName`, `objectName`, `ddl`) and owns
  * the emit-iff-`change.ddl` gate. `RENAME TO` is not an arm of this union — it goes
  * through `renameTable` and reports `alter`/`table` with `oldObjectName`.
+ *
+ * `before` is the table's schema as it was when the arm was called. Only the
+ * `alterPrimaryKey` arm reads it — the event names the key being RETIRED
+ * (`oldKeyColumns`), which nothing else can recover once the catalog swaps. Omitting it
+ * leaves that field off, and a subscriber keyed by the row key (the sync engine) can then
+ * not re-file the table's bookkeeping; every in-tree producer passes it.
  *
  * The `switch` is exhaustive over the union so a new arm fails the build here rather
  * than silently announcing the wrong shape.
@@ -37,7 +47,7 @@ export type AlterEventShape = Pick<
  * every arm, thread the `SchemaChangeInfo` down to those emit sites and delete the hand-written
  * triples.
  */
-export function alterEventShape(change: SchemaChangeInfo): AlterEventShape {
+export function alterEventShape(change: SchemaChangeInfo, before?: AlterEventShapeBefore): AlterEventShape {
 	switch (change.type) {
 		case 'addColumn':
 			return { type: 'alter', objectType: 'column', columnName: change.columnDef.name };
@@ -48,6 +58,10 @@ export function alterEventShape(change: SchemaChangeInfo): AlterEventShape {
 		case 'alterColumn':
 			return { type: 'alter', objectType: 'column', columnName: change.columnName };
 		case 'alterPrimaryKey':
+			return {
+				type: 'alter', objectType: 'table',
+				...(before ? { oldKeyColumns: before.primaryKeyDefinition.map(def => before.columns[def.index].name) } : {}),
+			};
 		case 'addConstraint':
 		case 'dropConstraint':
 		case 'renameConstraint':

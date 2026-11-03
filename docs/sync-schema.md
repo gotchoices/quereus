@@ -284,7 +284,10 @@ Two alterations look like they belong in the validating set and deliberately **d
   carry primary-key values, and the key definition in force decides how those rows are
   *addressed*; applying the re-key after the rows would file them under the old key. It
   stays early, so its own tightening failure (duplicate values under the new key,
-  arriving with the rows that resolve them) still costs a retry.
+  arriving with the rows that resolve them) still costs a retry. Sync's own per-row
+  bookkeeping for the table is re-filed under the new key in Phase 3, from the
+  executed-DDL list, before the batch's metadata is committed
+  ([sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)).
 - **`alter column … set data type`** — a type change rewrites stored values, so rows
   applied before it would be stored under the old type and then converted, which is not
   the history the origin has. Stays early, same tradeoff.
@@ -396,12 +399,13 @@ replays the statement. That converges only because non-deterministic defaults ar
 rejected at plan-build time and a per-row backfill is a function of the row it fills; the
 backfilled values themselves never cross the wire.
 
-**Re-keying strands CRDT metadata.** Sync's `cv:` / `tb:` / `cl:` keys are filed under
-the row's primary-key identity, so `alter primary key` abandons the metadata of every
-existing row and later conflict resolution silently starts from empty (the table
-component of those keys — the generation — survives the change; the row component does
-not). Pre-existing for a *local* primary-key change; replicating the statement makes it
-happen on every peer. Tracked as `sync-rekey-bookkeeping-on-primary-key-change`.
+**Re-keying re-files CRDT metadata.** Sync's `cv:` / `tb:` / `cl:` keys are filed under
+the row's primary-key identity, so `alter primary key` would abandon the metadata of every
+existing row. The origin re-files it in its own commit capture, and each receiver does the
+same once the replayed statement has executed — the table component of those keys, the
+generation, is untouched. See [sync.md § Tombstones and Deletions](sync.md#tombstones-and-deletions)
+for what the pass recovers (live rows from the table, deleted rows from their tombstone's
+before-image) and what it cannot (a change already on the wire under the old key).
 
 The receiver still warns in `applySchemaChange`'s blank-DDL early return, naming
 migration type, schema and table — a blank migration can now only come from an

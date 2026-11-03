@@ -6,7 +6,7 @@
  */
 
 import type { KVStore, WriteBatch } from '@quereus/store';
-import type { SqlValue } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
 import type { HLCManager, HLC } from '../clock/hlc.js';
 import type { SiteId } from '../clock/site.js';
 import type { ColumnVersionStore } from '../metadata/column-version.js';
@@ -46,6 +46,13 @@ export interface SyncContext {
 	readonly tableIdentity: TableIdentityStore;
 	readonly syncEvents: SyncEventEmitterImpl;
 	readonly applyToStore?: ApplyToStoreCallback;
+	/**
+	 * The engine, when the transaction source `create()` received is a full `Database`
+	 * (the usual wiring — see `TransactionCommitSource`). The primary-key re-key pass
+	 * reads live rows through it (`rekey-on-pk-change.ts`); absent — a relay-only
+	 * deployment, or a bare emitter source — that pass cannot run here and says so.
+	 */
+	readonly db?: Database;
 
 	getSiteId(): SiteId;
 	getCurrentHLC(): HLC;
@@ -85,6 +92,21 @@ export interface SyncContext {
 	 * `SyncManagerImpl`.
 	 */
 	getTableColumnNames(schema: string, table: string): readonly string[] | undefined;
+
+	/**
+	 * Current primary-key column names of an in-basis table, in key order — `undefined`
+	 * exactly when {@link getTableColumnNames} is. Read before a replicated ALTER PRIMARY
+	 * KEY runs, this is the key its records are filed under (`rekey-on-pk-change.ts`).
+	 */
+	getTableKeyColumns(schema: string, table: string): readonly string[] | undefined;
+
+	/**
+	 * The pk keying a table's records were filed under while `keyColumns` was its key.
+	 * Derivable from the CURRENT columns because ALTER PRIMARY KEY adds and drops none —
+	 * each key column keeps its collation and type. `undefined` off-basis, with no
+	 * oracle, or when a name is not one of the table's columns.
+	 */
+	getRetiredPkKeying(schema: string, table: string, keyColumns: readonly string[]): PkKeying | undefined;
 
 	/**
 	 * Record cumulative unknown-table disposition stats (surfaced via

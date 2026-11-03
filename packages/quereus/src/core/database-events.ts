@@ -71,6 +71,9 @@ export interface DatabaseSchemaChangeEvent {
 	columnName?: string;
 	/** Old column name (for column rename) */
 	oldColumnName?: string;
+	/** ALTER PRIMARY KEY only: the retired key's column names, in key order (`ddl` carries
+	 *  the new key). See `VTableSchemaChangeEvent.oldKeyColumns`. */
+	oldKeyColumns?: string[];
 	/** DDL statement if available */
 	ddl?: string;
 	/** True if event originated from sync/remote source, false for local changes */
@@ -909,6 +912,7 @@ export class DatabaseEventEmitter {
 			oldObjectName: event.oldObjectName,
 			columnName: event.columnName,
 			oldColumnName: event.oldColumnName,
+			oldKeyColumns: event.oldKeyColumns,
 			ddl: event.ddl,
 			remote: event.remote ?? false,
 		};

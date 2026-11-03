@@ -203,6 +203,7 @@ export {
   type BasisTableLifecycleEvent,
   type BasisTableEvictedEvent,
   type HeldChangesDrainedEvent,
+  type PrimaryKeyRekeyedEvent,
   type SyncState,
   type Unsubscribe,
   type SyncEventEmitter,

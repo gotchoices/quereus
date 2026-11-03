@@ -1848,6 +1848,8 @@ async function runAlterPrimaryKey(
 	// transaction has already remapped to that layout.
 	const oldPkIndices = tableSchema.primaryKeyDefinition.map(pk => pk.index);
 	const newPkIndices = newPkDef.map(pk => pk.index);
+	// Named on the event: once the catalog swaps, nothing else says which key was retired.
+	const oldKeyColumns = oldPkIndices.map(i => tableSchema.columns[i].name);
 
 	// Try native module re-key first
 	const module = requireVtabModule(tableSchema);
@@ -1891,6 +1893,7 @@ async function runAlterPrimaryKey(
 			emitAlterSchemaEvent(rctx, tableSchema, {
 				type: 'alter', objectType: 'table',
 				objectName: tableSchema.name,
+				oldKeyColumns,
 				ddl: sql,
 			});
 
@@ -1988,6 +1991,7 @@ async function runAlterPrimaryKey(
 	emitAlterSchemaEvent(rctx, tableSchema, {
 		type: 'alter', objectType: 'table',
 		objectName: tableSchema.name,
+		oldKeyColumns,
 		ddl: sql,
 	});
 

@@ -152,7 +152,7 @@ export abstract class StoreModuleAlter extends StoreModuleAlterColumn {
 		// exactly one announced event. See `SchemaChangeInfo.ddl`.
 		if (change.ddl !== undefined) {
 			this.eventEmitter?.emitSchemaChange({
-				...alterEventShape(change),
+				...alterEventShape(change, oldSchema),
 				schemaName,
 				objectName: tableName,
 				ddl: change.ddl,
