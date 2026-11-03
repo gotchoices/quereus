@@ -53,6 +53,10 @@ export type DroppableObjectKind = 'table' | 'view' | 'materialized view';
  * The scan itself — one snapshot, home schema first, bodiless assertions
  * skipped, one walk per assertion — is
  * {@link assertionReachesHomeSchemaFirst}, shared with the DROP COLUMN verb.
+ *
+ * Stands down during a failed `apply schema`'s unwind (`Database._setSchemaUnwinding`). That
+ * drop is not a user's: an assertion it appears to break was written against the pre-apply
+ * catalog, and a bare name the plan's new object captured binds back once it is gone.
  */
 export function assertNoAssertionDependsOn(
 	db: Database,
@@ -60,6 +64,7 @@ export function assertNoAssertionDependsOn(
 	objectName: string,
 	objectKind: DroppableObjectKind,
 ): void {
+	if (db._isSchemaUnwinding()) return;
 	const schema = db.schemaManager.getSchema(schemaName);
 	if (!schema) return;
 	const targetKey = objectRefKey(schema.name, objectName);

@@ -46,18 +46,15 @@ An undo statement that throws stops the unwind where it is: the schema is then i
 
 ### Guards during an unwind
 
-`CREATE TABLE` does not check what its foreign keys and CHECK / DEFAULT subqueries refer to, so a table the plan creates may refer to a column, table or view a later step adds. The unwind runs in exact reverse, so it removes that target while the referring table still exists. The guards on `DROP COLUMN`, `DROP TABLE` and `DROP VIEW` exist to stop a user's drop from breaking a working reference, and that reason does not apply here: the target state is the pre-apply catalog, so a reference the unwind leaves dangling belongs to an object a later undo removes or was already dangling before the apply.
+`CREATE TABLE` does not check what its foreign keys and CHECK / DEFAULT subqueries refer to, so a table the plan creates may refer to a column, table or view a later step adds. The unwind runs in exact reverse, so it removes that target while the referring table still exists. An existing assertion can also come to name what the plan added without being edited: a new column can capture a bare name in its body, or widen a `*` under a view it reads, and a new table can capture a name that used to resolve further down the schema path. The guards on `DROP COLUMN`, `DROP TABLE` and `DROP VIEW` exist to stop a user's drop from breaking a working reference, and that reason does not apply here: the target state is the pre-apply catalog, so a reference the unwind breaks belongs to an object a later undo removes, was already dangling before the apply, or goes back to what it named before the apply.
 
 `unwindJournal` therefore sets a scope (`Database._setSchemaUnwinding`) around its undo statements, on both paths (a failed step and a refused commit). The scope does not cover the fingerprint comparison. Inside it these stand down:
 
-- the DEFAULT / generated and CHECK guards on `DROP COLUMN`, and the guard for a foreign key pointing at the column;
-- the expression guard on `DROP TABLE`, `DROP VIEW` and `DROP MATERIALIZED VIEW`;
+- the DEFAULT / generated, CHECK and assertion guards on `DROP COLUMN`, and the guard for a foreign key pointing at the column;
+- the assertion and expression guards on `DROP TABLE`, `DROP VIEW` and `DROP MATERIALIZED VIEW`;
 - the row guard on `DROP TABLE` (`assertNoReferencingChildrenForDrop`).
 
-These stay on:
-
-- **The assertion guards.** `CREATE ASSERTION` plans its body when it runs and assertions are created last, so an assertion holds no forward reference, and its undo runs before any table or column undo.
-- **The other `DROP COLUMN` validations** (primary key, last column, own generated column, partial index). These are structural to the altered table and are undone in order.
+The other `DROP COLUMN` validations stay on (primary key, last column, own generated column, partial index). These are structural to the altered table, cannot name a column the table does not yet have, and are undone in order. Validation of a re-added constraint stays on too, so an undo that re-adds a constraint the existing rows do not satisfy still fails the unwind.
 
 The fingerprint comparison is the backstop: an undo the guards would have stopped and that leaves the wrong catalog is reported as *after unwinding, the catalog does not match its pre-apply state*. `renderCatalogForRestoreCheck` renders only the applying schema, so a dependent in another schema is outside that comparison, but this plan cannot have created it: it is the already-dangling case and returns to the state it was in.
 

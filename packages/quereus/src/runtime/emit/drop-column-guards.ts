@@ -65,12 +65,12 @@ import {
  * rather than reverted.
  *
  * Everything above is about a drop a user issued. The undo journal of a failed
- * `apply schema` issues drops too, and there the two expression guards and the foreign key
- * guard stand down (`Database._setSchemaUnwinding`): the unwind is returning to the pre-apply
- * catalog, so the reference it leaves dangling belongs to an object a later undo removes or
- * was already dangling before the apply. The assertion guard stays on, because `CREATE
- * ASSERTION` plans its body when it runs, so an assertion holds no forward reference, and
- * assertions are created last, so their undo runs first.
+ * `apply schema` issues drops too, and there all four guards stand down
+ * (`Database._setSchemaUnwinding`): the unwind is returning to the pre-apply catalog, so the
+ * reference it breaks belongs to an object a later undo removes, was already dangling before
+ * the apply, or goes back to the object it named before the apply. An assertion can hold
+ * that last kind without being edited: an added column can capture a bare name in its body,
+ * or widen a `*` under a view it reads.
  */
 
 /**
@@ -235,6 +235,7 @@ export function assertNoAssertionNamesColumn(
 	tableSchema: TableSchema,
 	columnName: string,
 ): void {
+	if (db._isSchemaUnwinding()) return;
 	const resolveColumnInSource = buildColumnSourceResolver(db);
 	const tableKey = objectRefKey(tableSchema.schemaName, tableSchema.name);
 	const republication = collectColumnRepublication(db,

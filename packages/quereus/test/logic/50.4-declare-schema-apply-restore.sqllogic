@@ -349,3 +349,75 @@ select * from zz;
 drop table f;
 drop table e;
 drop table t;
+
+-- ===================================
+-- 9. An existing assertion that comes to name what the plan added does not block the unwind
+-- ===================================
+
+-- a's bare d means u.d until t gains a d, which the inner scope then binds first. The assertion
+-- was never edited, and undoing the ADD COLUMN is what makes it mean u.d again.
+create table t (id integer primary key, b integer null);
+insert into t values (1, 1), (2, 1);
+create table u (id integer primary key, d integer null);
+create assertion a check (not exists (select 1 from u where exists (select 1 from t where t.id = u.id and d < 0)));
+
+declare schema main {
+	table t {
+		id integer primary key,
+		b integer null,
+		d integer null,
+		constraint ub unique (b)
+	}
+	table u {
+		id integer primary key,
+		d integer null
+	}
+	assertion a check (not exists (select 1 from u where exists (select 1 from t where t.id = u.id and d < 0)))
+}
+
+-- run
+
+apply schema main;
+-- error: ub
+
+select * from t order by id;
+→ [{"id": 1, "b": 1}, {"id": 2, "b": 1}]
+
+insert into u values (1, -1);
+-- error: Integrity assertion failed: a
+
+drop assertion a;
+drop table u;
+drop table t;
+
+-- Same for the table verb: a's bare zz means temp.zz until main gains a zz, earlier on its path.
+pragma schema_path = 'main,temp';
+create table t (id integer primary key, b integer null);
+insert into t values (1, 1), (2, 1);
+create table temp.zz (id integer primary key);
+create assertion a check (not exists (select 1 from zz where id < 0));
+
+declare schema main {
+	table t {
+		id integer primary key,
+		b integer null,
+		constraint ub unique (b)
+	}
+	table zz {
+		id integer primary key
+	}
+	assertion a check (not exists (select 1 from zz where id < 0))
+}
+
+-- run
+
+apply schema main;
+-- error: ub
+
+select * from main.zz;
+-- error: not found
+
+drop assertion a;
+drop table temp.zz;
+drop table t;
+pragma schema_path = 'main';

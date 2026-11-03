@@ -74,4 +74,4 @@ force afterwards — the assertion still rejecting a violating write, the CHECK 
 Plus one arm pinning that a collision during the copy reports the user's table name, not the
 hidden one.
 
-Related: `bug-apply-undo-of-add-column-blocked-by-new-table` adds a `Database` scope that stands reference guards down during an `apply schema` unwind. It leaves the assertion guards on, which this ticket also needs off, so check on pickup whether to share or extend that scope rather than adding a second one.
+Related: `bug-apply-undo-of-add-column-blocked-by-new-table` adds a `Database` scope that stands every reference guard on the drop path down during an `apply schema` unwind, the assertion guards included. Check on pickup whether to share or extend that scope rather than adding a second one.
