@@ -17,7 +17,7 @@
 
 import type { Database } from '../core/database.js';
 import type { TableSchema, UniqueConstraintSchema, ForeignKeyConstraintSchema, RowConstraintSchema } from './table.js';
-import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, disambiguateAutoConstraintName } from './table.js';
+import { resolveReferencedColumns, resolveReferencedColumnsForEnforcement, opsToMask, collectDeclaredConstraintNames, disambiguateAutoConstraintName } from './table.js';
 import { QuereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue } from '../common/types.js';
 import type * as AST from '../parser/ast.js';
@@ -196,21 +196,23 @@ function mintCheckConstraintName(existingCount: number, takenNames: ReadonlySet<
  * the table-level `ADD CONSTRAINT` convention): the inline-CREATE-TABLE spelling
  * of the same declaration is named `_check_<column>`, and the two paths must agree.
  *
- * `takenNames` (when provided) is the disambiguation set the CREATE TABLE mint
- * sites share — the table's existing constraint names plus this statement's
- * user-written inline names — so two unnamed CHECKs on one new column (legal;
- * see `assertInlineConstraintNamesFree`) mint `_check_<col>` / `_check_<col>_2`
- * exactly as the CREATE TABLE spelling does, instead of two constraints one
- * name addresses. The mint is registered into the set as it is chosen.
+ * `takenNames` holds the table's existing constraint names. This column's
+ * user-written inline names join it before any mint runs, and each mint is
+ * registered as it is chosen, so two unnamed CHECKs on one new column (legal; see
+ * `assertInlineConstraintNamesFree`) mint `_check_<col>` / `_check_<col>_2` exactly
+ * as the CREATE TABLE spelling does, instead of two constraints one name addresses.
+ *
+ * The undo of `ADD COLUMN` calls this too (`UndoRenderer.dropAddedColumn`): it has
+ * to name the stored CHECKs at plan time, before the forward step has run.
  */
-export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef, takenNames?: Set<string>): AST.TableConstraint[] {
-	const result: AST.TableConstraint[] = [];
+export function extractColumnLevelCheckConstraints(columnDef: AST.ColumnDef, takenNames: Set<string>): Array<AST.TableConstraint & { name: string }> {
+	for (const declared of collectDeclaredConstraintNames([columnDef], undefined)) takenNames.add(declared);
+	const result: Array<AST.TableConstraint & { name: string }> = [];
 	for (const con of columnDef.constraints ?? []) {
 		if (con.type !== 'check' || !con.expr) continue;
-		const mint = `_check_${columnDef.name}`;
 		result.push({
 			type: 'check',
-			name: con.name ?? (takenNames !== undefined ? disambiguateAutoConstraintName(mint, takenNames) : mint),
+			name: con.name ?? disambiguateAutoConstraintName(`_check_${columnDef.name}`, takenNames),
 			expr: con.expr,
 			operations: con.operations,
 			tags: con.tags,

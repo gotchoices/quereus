@@ -193,6 +193,16 @@ describe('generateMigrationPlan undo', () => {
 			expectUndo(plan, 'ALTER TABLE t ADD COLUMN extra', ['ALTER TABLE t DROP COLUMN extra']);
 		});
 
+		it('add column drops its inline CHECKs first, under the names the forward step mints', async () => {
+			const db = await databaseWith(['create table t (id integer primary key, b integer, constraint _check_d check (b > 0))']);
+			const plan = planFor(db, 'table t { id integer primary key, b integer, d integer check (d > 0) check (d < 100), constraint _check_d check (b > 0) }');
+			expectUndo(plan, 'ALTER TABLE t ADD COLUMN d', [
+				'ALTER TABLE t DROP CONSTRAINT _check_d_3',
+				'ALTER TABLE t DROP CONSTRAINT _check_d_2',
+				'ALTER TABLE t DROP COLUMN d',
+			]);
+		});
+
 		it('drop default → the prior default; set default → the prior default or DROP DEFAULT when there was none', async () => {
 			const db = await databaseWith(['create table t (id integer primary key, a integer default 7, b integer, c integer default 1)']);
 			const plan = planFor(db, 'table t { id integer primary key, a integer, b integer default 5, c integer default 2 }');
@@ -445,6 +455,10 @@ describe('generateMigrationPlan undo', () => {
 			'create table p (id integer primary key)',
 			`create table t (id integer primary key, qty integer, code text, pid integer, constraint ck_qty check (qty >= 0) with tags (owner = 'c'), constraint uq_code unique (code), constraint fk_p foreign key (pid) references p (id) on delete cascade deferrable initially deferred)`,
 		], 'table p { id integer primary key } table t { id integer primary key, qty integer, code text, pid integer, constraint ck_new check (qty < 100) }'));
+
+		it('an added column whose CHECK mint collides with a name an earlier added column took', () => expectRoundTrip(
+			['create table t (id integer primary key)'],
+			'table t { id integer primary key, e integer constraint _check_f unique, f integer check (f > 0) }'));
 
 		it('a column rename with a CHECK over it dropped (Rule 2)', () => expectRoundTrip(
 			['create table t (id integer primary key, qty integer, constraint ck_qty check (qty > 0))'],

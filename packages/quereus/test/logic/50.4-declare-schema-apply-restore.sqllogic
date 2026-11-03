@@ -190,3 +190,38 @@ diff schema main;
 
 drop table n1;
 drop table t;
+
+-- ===================================
+-- 6. An added column's inline constraints are taken back with it
+-- ===================================
+
+-- DROP COLUMN refuses a column a CHECK names, even its own, so undoing this ADD COLUMN has to
+-- drop both CHECKs first. The inline UNIQUE goes with the column.
+create table t_inl (id integer primary key, b integer null);
+insert into t_inl values (1, 1), (2, 1);
+
+declare schema main {
+	table t_inl {
+		id integer primary key,
+		b integer null,
+		d integer null check (d > 0) constraint d_lt check (d < 100) unique,
+		constraint ub unique (b)
+	}
+}
+
+-- run
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t_inl ADD COLUMN d integer null check (d > 0) constraint d_lt check (d < 100) unique"}, {"ddl": "ALTER TABLE t_inl ADD constraint ub unique (b)"}]
+
+-- ADD constraint ub fails over the duplicate b, after the column has landed.
+apply schema main;
+-- error: ub
+
+select * from t_inl order by id;
+→ [{"id": 1, "b": 1}, {"id": 2, "b": 1}]
+
+diff schema main;
+→ [{"ddl": "ALTER TABLE t_inl ADD COLUMN d integer null check (d > 0) constraint d_lt check (d < 100) unique"}, {"ddl": "ALTER TABLE t_inl ADD constraint ub unique (b)"}]
+
+drop table t_inl;

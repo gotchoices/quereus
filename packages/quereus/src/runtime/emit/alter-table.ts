@@ -8,7 +8,7 @@ import { QuereusError, RelationNotFoundError } from '../../common/errors.js';
 import { type SqlValue, type Row, type SubProgram, StatusCode } from '../../common/types.js';
 import { createLogger } from '../../common/logger.js';
 import type { TableSchema, PrimaryKeyColumnDefinition, IndexSchema } from '../../schema/table.js';
-import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, collectTableConstraintNames, collectDeclaredConstraintNames } from '../../schema/table.js';
+import { buildColumnIndexMap, withGeneratedColumnGraph, requireVtabModule, resolveNamedConstraintClass, namedConstraintExists, assertConstraintNameFree, validateCollationForType, columnDefToSchema, collectTableConstraintNames } from '../../schema/table.js';
 import { validateForeignKeyCollations, buildForeignKeyConstraintSchema, buildCheckConstraintSchema, extractColumnLevelCheckConstraints, extractColumnLevelForeignKeys, extractColumnLevelUniqueConstraints, validateRowInvariantChecksOverExistingRows } from '../../schema/constraint-builder.js';
 import type * as AST from '../../parser/ast.js';
 import type { ColumnDef, Expression, QueryExpr } from '../../parser/ast.js';
@@ -733,9 +733,7 @@ async function runAddColumn(
 	// new column (legal — see assertInlineConstraintNamesFree below) mint
 	// `_check_<col>` / `_check_<col>_2` exactly as the CREATE TABLE spelling does,
 	// and a re-added `_check_<col>` never collides with one already on the table.
-	const inlineTakenNames = collectTableConstraintNames(tableSchema);
-	for (const declared of collectDeclaredConstraintNames([columnDef], undefined)) inlineTakenNames.add(declared);
-	const inlineChecks = extractColumnLevelCheckConstraints(columnDef, inlineTakenNames);
+	const inlineChecks = extractColumnLevelCheckConstraints(columnDef, collectTableConstraintNames(tableSchema));
 	const inlineConstraints: AST.TableConstraint[] = [
 		...extractColumnLevelUniqueConstraints(columnDef),
 		...inlineChecks,
@@ -951,7 +949,7 @@ async function runAddColumn(
 			// A CHECK / FK is dropped by NAME on the revert path, so resolve the name the
 			// module will store BEFORE handing the constraint over. UNIQUE needs no entry:
 			// an unnamed one has no name to drop by, and the module's own DROP COLUMN
-			// prunes a UNIQUE over the dropped column (which CHECK / FK are not).
+			// prunes a UNIQUE over the dropped column (as it does an FK, but not a CHECK).
 			let installedName: string | undefined;
 			if (constraint.type === 'foreignKey') {
 				// Reject a same-rank child/parent collation conflict (which enforcement would
@@ -1029,10 +1027,11 @@ async function runAddColumn(
  * inline CHECK / FK the module already accepted back to `dropConstraint` (newest first),
  * drops the column, un-remaps the batched events, and restores the original catalog entry.
  *
- * The constraints must go before the column: neither built-in module prunes a CHECK / FK
- * over a dropped column, so a stranded one would keep naming a column the table no longer
- * has. (An inline UNIQUE needs no explicit drop — both modules prune a UNIQUE over the
- * dropped column, and an unnamed one has no name to drop by.)
+ * The CHECKs must go before the column: neither built-in module prunes a CHECK over a
+ * dropped column, so a stranded one would keep naming a column the table no longer has.
+ * Both modules do prune a UNIQUE or FK over it (`shiftSchemaIndicesForDrop`), so an inline
+ * UNIQUE needs no explicit drop, and an unnamed one has no name to drop by. The FK's drop
+ * by name is redundant and harmless.
  *
  * Best-effort on the module half: a revert failure is logged, never thrown, so it cannot
  * mask the original violation. Restoring the catalog entry is a no-op when the ALTER failed

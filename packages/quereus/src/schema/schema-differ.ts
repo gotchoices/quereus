@@ -15,6 +15,7 @@ import { cloneExpr, cloneQueryExpr } from '../planner/mutation/scope-transform.j
 import { normalizeCollationName } from '../util/comparison.js';
 import { inferType } from '../types/registry.js';
 import { resolveDefaultCollation, disambiguateAutoConstraintName } from './table.js';
+import { extractColumnLevelCheckConstraints } from './constraint-builder.js';
 
 const log = createLogger('schema:differ');
 const warnLog = log.extend('warn');
@@ -3195,7 +3196,7 @@ export function generateMigrationPlan(diff: SchemaDiff, schemaName?: string, act
 			undo?.columnRenameLanded(alter.tableName, r);
 		}
 		for (const colDef of alter.columnsToAdd) {
-			pushText(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`, u => u.dropAddedColumn(quotedTable, colDef));
+			pushText(`ALTER TABLE ${quotedTable} ADD COLUMN ${colDef}`, u => u.dropAddedColumn(alter.tableName, quotedTable, colDef));
 		}
 		for (const colAlter of alter.columnsToAlter) {
 			const quotedCol = quoteIdentifier(colAlter.columnName);
@@ -3420,6 +3421,7 @@ class UndoRenderer {
 	private tableRenames: ReadonlyArray<RenameOp> = [];
 	private readonly columnRenames: InTableRename[] = [];
 	private readonly constraintRenames: InTableRename[] = [];
+	private readonly constraintNamesHeldByTable = new Map<string, Set<string>>();
 
 	constructor(
 		private readonly schemaName: string,
@@ -3567,12 +3569,20 @@ class UndoRenderer {
 		return { undo: [`ALTER TABLE ${quotedTable} ALTER PRIMARY KEY (${cols})`] };
 	}
 
-	dropAddedColumn(quotedTable: string, colDef: string): StepUndo {
+	/**
+	 * `DROP COLUMN` refuses a column a CHECK names, its own inline ones included, so those
+	 * go first, newest first. An inline UNIQUE or FK needs no statement: the module's
+	 * `DROP COLUMN` prunes it (`shiftSchemaIndicesForDrop`).
+	 */
+	dropAddedColumn(table: string, quotedTable: string, colDef: string): StepUndo {
 		const parsed = parseStatement(`alter table "x" add column ${colDef}`);
 		if (!parsed.ok) return this.cannotUndo(`ADD COLUMN ${colDef}`, `the column definition does not parse (${parsed.reason})`);
 		const action = parsed.stmt.type === 'alterTable' ? parsed.stmt.action : undefined;
 		if (action?.type !== 'addColumn') return this.cannotUndo(`ADD COLUMN ${colDef}`, 'the column definition does not parse as one');
-		return { undo: [`ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(action.column.name)}`] };
+		const dropChecks = extractColumnLevelCheckConstraints(action.column, this.constraintNamesHeld(table))
+			.reverse()
+			.map(check => `ALTER TABLE ${quotedTable} DROP CONSTRAINT ${quoteIdentifier(check.name)}`);
+		return { undo: [...dropChecks, `ALTER TABLE ${quotedTable} DROP COLUMN ${quoteIdentifier(action.column.name)}`] };
 	}
 
 	dropAddedConstraint(quotedTable: string, fragment: string): StepUndo {
@@ -3629,6 +3639,30 @@ class UndoRenderer {
 	}
 
 	// --- Catalog lookups through the renames in force (Rule 1) ---
+
+	/**
+	 * The lowercased constraint names a table holds at its next `ADD COLUMN` step: what that
+	 * step's CHECK mint disambiguates against. The pre-apply catalog is still accurate there,
+	 * because every phase that renames, drops or adds a constraint comes after `ADD COLUMN`.
+	 * The set then lives for the plan, so a later `ADD COLUMN` sees what earlier ones installed.
+	 *
+	 * NOTE: a `create unique index _check_d` also takes that name from the forward mint, but
+	 * the UNIQUE it derives is in neither catalog constraint list and `CatalogIndex` has no
+	 * unique flag. The prediction then misses, the undo fails, and the apply reports the schema
+	 * as not restored, which is honest. If `CatalogIndex` gains a unique flag, seed from it.
+	 */
+	private constraintNamesHeld(currentTable: string): Set<string> {
+		const key = currentTable.toLowerCase();
+		const existing = this.constraintNamesHeldByTable.get(key);
+		if (existing) return existing;
+		const held = new Set<string>();
+		const actual = this.tableNow(currentTable);
+		for (const c of [...(actual?.namedConstraints ?? []), ...(actual?.unnamedConstraints ?? [])]) {
+			if (c.name) held.add(c.name.toLowerCase());
+		}
+		this.constraintNamesHeldByTable.set(key, held);
+		return held;
+	}
 
 	/**
 	 * The pre-apply table a CURRENT table name denotes. A name a rename in force
